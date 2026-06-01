@@ -1,0 +1,648 @@
+-- ============================================================
+-- MariaDB FINAL BOSS script for query-tool validation
+-- Target: MariaDB 10.6+
+-- ============================================================
+
+DELIMITER ;
+
+DROP DATABASE IF EXISTS mdb_finalboss;
+
+CREATE DATABASE mdb_finalboss CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+USE mdb_finalboss;
+
+SET NAMES utf8mb4;
+
+SET SESSION sql_mode = 'STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION';
+
+-- ============================================================
+-- 1) Schema
+-- ============================================================
+
+CREATE TABLE departments (
+    dept_id        INT          NOT NULL AUTO_INCREMENT,
+    parent_dept_id INT          NULL,
+    dept_code      VARCHAR(30)  NOT NULL,
+    dept_name      VARCHAR(100) NOT NULL,
+    PRIMARY KEY (dept_id),
+    UNIQUE KEY uk_departments_code(dept_code),
+    CONSTRAINT fk_departments_parent FOREIGN KEY (parent_dept_id) REFERENCES departments(dept_id)
+)
+ENGINE = InnoDB;
+
+CREATE TABLE employees (
+    employee_id INT                              NOT NULL AUTO_INCREMENT,
+    dept_id     INT                              NOT NULL,
+    manager_id  INT                              NULL,
+    emp_code    VARCHAR(30)                      NOT NULL,
+    first_name  VARCHAR(50)                      NOT NULL,
+    last_name   VARCHAR(50)                      NOT NULL,
+    email       VARCHAR(200)                     NOT NULL,
+    hired_on    DATE                             NOT NULL,
+    salary      DECIMAL(12, 2)                   NOT NULL,
+    is_active   TINYINT(1)                       NOT NULL DEFAULT 1,
+    PRIMARY KEY (employee_id),
+    UNIQUE KEY uk_employees_code(emp_code),
+    UNIQUE KEY uk_employees_email(email),
+    KEY         ix_employees_dept(dept_id),
+    KEY         ix_employees_manager(manager_id),
+    CONSTRAINT fk_employees_dept FOREIGN KEY (dept_id) REFERENCES departments(dept_id),
+    CONSTRAINT fk_employees_manager FOREIGN KEY (manager_id) REFERENCES employees(employee_id)
+)
+ENGINE = InnoDB;
+
+CREATE TABLE projects (
+    project_id        INT                                  NOT NULL AUTO_INCREMENT,
+    project_code      VARCHAR(30)                          NOT NULL,
+    project_name      VARCHAR(200)                         NOT NULL,
+    owner_employee_id INT                                  NOT NULL,
+    start_date        DATE                                 NOT NULL,
+    end_date          DATE                                 NULL,
+    budget_amount     DECIMAL(14, 2)                       NOT NULL,
+    priority_no       INT                                  NOT NULL,
+    meta              LONGTEXT                             NOT NULL,
+    last_rollup_at    DATETIME(6)                          NULL,
+    PRIMARY KEY (project_id),
+    UNIQUE KEY uk_projects_code(project_code),
+    KEY               ix_projects_owner(owner_employee_id),
+    CONSTRAINT fk_projects_owner FOREIGN KEY (owner_employee_id) REFERENCES employees(employee_id)
+)
+ENGINE = InnoDB;
+
+CREATE TABLE project_members (
+    project_id     INT                         NOT NULL,
+    employee_id    INT                         NOT NULL,
+    role_name      VARCHAR(40)                 NOT NULL,
+    allocation_pct DECIMAL(5, 2)               NOT NULL,
+    joined_on      DATE                        NOT NULL,
+    PRIMARY KEY (project_id, employee_id),
+    KEY            ix_pm_employee(employee_id),
+    CONSTRAINT fk_pm_project FOREIGN KEY (project_id) REFERENCES projects(project_id),
+    CONSTRAINT fk_pm_employee FOREIGN KEY (employee_id) REFERENCES employees(employee_id)
+)
+ENGINE = InnoDB;
+
+CREATE TABLE task_log (
+    log_id      BIGINT                                            NOT NULL AUTO_INCREMENT,
+    project_id  INT                                               NOT NULL,
+    employee_id INT                                               NOT NULL,
+    work_date   DATE                                              NOT NULL,
+    hours       DECIMAL(8, 2)                                     NOT NULL,
+    note        VARCHAR(200)                                      NULL,
+    payload     LONGTEXT                                          NOT NULL,
+    created_at  DATETIME(6)                                       NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (log_id),
+    KEY         ix_task_log_project_date(project_id, work_date),
+    KEY         ix_task_log_employee_date(employee_id, work_date),
+    CONSTRAINT fk_task_log_project FOREIGN KEY (project_id) REFERENCES projects(project_id),
+    CONSTRAINT fk_task_log_employee FOREIGN KEY (employee_id) REFERENCES employees(employee_id)
+)
+ENGINE = InnoDB;
+
+CREATE TABLE monthly_rollup (
+    ym             CHAR(7)                         NOT NULL,
+    project_id     INT                             NOT NULL,
+    employee_id    INT                             NOT NULL,
+    log_count      INT                             NOT NULL,
+    total_hours    DECIMAL(12, 2)                  NOT NULL,
+    avg_hours      DECIMAL(10, 2)                  NOT NULL,
+    last_work_date DATE                            NOT NULL,
+    rebuilt_at     DATETIME(6)                     NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (ym, project_id, employee_id),
+    KEY            ix_rollup_project(project_id),
+    KEY            ix_rollup_employee(employee_id),
+    CONSTRAINT fk_rollup_project FOREIGN KEY (project_id) REFERENCES projects(project_id),
+    CONSTRAINT fk_rollup_employee FOREIGN KEY (employee_id) REFERENCES employees(employee_id)
+)
+ENGINE = InnoDB;
+
+CREATE TABLE audit_events (
+    audit_id    BIGINT                                        NOT NULL AUTO_INCREMENT,
+    event_type  VARCHAR(40)                                   NOT NULL,
+    entity_name VARCHAR(40)                                   NOT NULL,
+    entity_id   BIGINT                                        NOT NULL,
+    detail      LONGTEXT                                      NOT NULL,
+    created_at  DATETIME(6)                                   NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (audit_id),
+    KEY         ix_audit_entity(entity_name, entity_id),
+    KEY         ix_audit_type_created(event_type, created_at)
+)
+ENGINE = InnoDB;
+
+CREATE OR REPLACE VIEW v_employee_workload AS
+    SELECT e.employee_id,
+        e.emp_code,
+        CONCAT(e.last_name, ', ', e.first_name) AS display_name,
+        d.dept_name,
+        COUNT(t.log_id) AS total_logs,
+        ROUND(COALESCE(SUM(t.hours), 0), 2) AS total_hours,
+        ROUND(COALESCE(AVG(t.hours), 0), 2) AS avg_hours
+    FROM employees e
+    JOIN departments d
+        ON d.dept_id = e.dept_id
+    LEFT JOIN task_log t
+        ON t.employee_id = e.employee_id
+    GROUP BY e.employee_id,
+        e.emp_code,
+        CONCAT(e.last_name, ', ', e.first_name),
+        d.dept_name;
+
+-- ============================================================
+-- 2) Triggers / Function / Procedures
+-- ============================================================
+
+DELIMITER $$
+
+CREATE TRIGGER bi_task_log
+    BEFORE INSERT
+    ON task_log
+    FOR EACH ROW
+BEGIN
+    IF NEW.hours IS NULL
+            OR NEW.hours <= 0
+            OR NEW.hours > 24 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'hours must be > 0 and <= 24';
+    END IF;
+    IF NEW.payload IS NULL
+            OR JSON_VALID(NEW.payload) = 0 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'payload must be valid JSON';
+    END IF;
+    IF NEW.note IS NULL
+            OR CHAR_LENGTH(TRIM(NEW.note)) = 0 THEN
+        SET NEW.note = CONCAT('auto-note:', NEW.employee_id, ':', DATE_FORMAT(NEW.work_date, '%Y%m%d'));
+    END IF;
+END$$
+
+CREATE TRIGGER ai_task_log
+    AFTER INSERT
+    ON task_log
+    FOR EACH ROW
+BEGIN
+    INSERT INTO audit_events (event_type, entity_name, entity_id, detail)
+    VALUES ('TASK_INSERT', 'task_log', NEW.log_id, JSON_OBJECT('project_id', NEW.project_id, 'employee_id', NEW.employee_id, 'hours', NEW.hours, 'work_date', DATE_FORMAT(NEW.work_date, '%Y-%m-%d'), 'note', NEW.note));
+END$$
+
+CREATE FUNCTION fn_efficiency_band(
+    p_hours DECIMAL(12, 2),
+    p_budget DECIMAL(14, 2)
+)
+RETURNS VARCHAR(16)
+DETERMINISTIC
+BEGIN
+    DECLARE v_score DECIMAL(12, 4);
+    SET v_score = IFNULL(p_hours / NULLIF(p_budget / 1000, 0), 0);
+    RETURN
+    CASE
+        WHEN v_score >= 1.20 THEN
+            'critical'
+        WHEN v_score >= 0.80 THEN
+            'watch'
+        ELSE
+            'ok'
+    END;
+END$$
+
+CREATE PROCEDURE sp_assert_eq_bigint(
+    IN p_expected BIGINT,
+    IN p_actual BIGINT,
+    IN p_message VARCHAR(255)
+)
+BEGIN
+    IF NOT (p_expected <=> p_actual) THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = p_message;
+    END IF;
+END$$
+
+CREATE PROCEDURE sp_seed_monster_data()
+BEGIN
+    DECLARE v_day INT DEFAULT 0;
+    DECLARE v_emp INT;
+    DECLARE v_project INT;
+    DECLARE v_hours DECIMAL(8, 2);
+    DECLARE v_work_date DATE;
+    -- departments (self-FK safe order)
+    INSERT INTO departments (parent_dept_id, dept_code, dept_name)
+    VALUES (NULL, 'HQ', 'Headquarters');
+    INSERT INTO departments (parent_dept_id, dept_code, dept_name)
+    VALUES (1, 'PLATFORM', 'Platform');
+    INSERT INTO departments (parent_dept_id, dept_code, dept_name)
+    VALUES (2, 'QUERY', 'Query Tools');
+    INSERT INTO departments (parent_dept_id, dept_code, dept_name)
+    VALUES (3, 'RUNNER', 'Runner Lab');
+    INSERT INTO departments (parent_dept_id, dept_code, dept_name)
+    VALUES (1, 'ANALYTICS', 'Analytics');
+    -- employees (self-FK safe order)
+    INSERT INTO employees (dept_id, manager_id, emp_code, first_name, last_name, email, hired_on, salary, is_active)
+    VALUES (1, NULL, 'E001', 'Min', 'Kim', 'min.kim@example.com', '2021-01-10', 150000.00, 1);
+    INSERT INTO employees (dept_id, manager_id, emp_code, first_name, last_name, email, hired_on, salary, is_active)
+    VALUES (2, 1, 'E002', 'Jin', 'Park', 'jin.park@example.com', '2021-03-15', 120000.00, 1);
+    INSERT INTO employees (dept_id, manager_id, emp_code, first_name, last_name, email, hired_on, salary, is_active)
+    VALUES (3, 2, 'E003', 'Su', 'Lee', 'su.lee@example.com', '2021-07-01', 118000.00, 1);
+    INSERT INTO employees (dept_id, manager_id, emp_code, first_name, last_name, email, hired_on, salary, is_active)
+    VALUES (4, 3, 'E004', 'Ara', 'Choi', 'ara.choi@example.com', '2022-02-11', 110000.00, 1);
+    INSERT INTO employees (dept_id, manager_id, emp_code, first_name, last_name, email, hired_on, salary, is_active)
+    VALUES (5, 1, 'E005', 'Do', 'Han', 'do.han@example.com', '2022-08-20', 105000.00, 1);
+    INSERT INTO employees (dept_id, manager_id, emp_code, first_name, last_name, email, hired_on, salary, is_active)
+    VALUES (3, 2, 'E006', 'Iseul', 'Yoon', 'iseul.yoon@example.com', '2023-04-09', 99000.00, 1);
+    INSERT INTO projects (project_code, project_name, owner_employee_id, start_date, end_date, budget_amount, priority_no, meta)
+    VALUES ('MARS', 'Maria Query Tool Core', 2, '2025-01-01', NULL, 150000.00, 1, JSON_OBJECT('tier', 'core', 'labels', JSON_ARRAY('parser', 'runner', 'optimizer'))),
+        ('EUROPA', 'Grid + Window Analytics Pack', 3, '2025-01-03', NULL, 210000.00, 2, JSON_OBJECT('tier', 'analytics', 'labels', JSON_ARRAY('grid', 'window', 'cte'))),
+        ('TITAN', 'JSON + Routine Stress Pack', 4, '2025-01-05', NULL, 180000.00, 3, JSON_OBJECT('tier', 'integration', 'labels', JSON_ARRAY('json', 'trigger', 'procedure')));
+    INSERT INTO project_members (project_id, employee_id, role_name, allocation_pct, joined_on)
+    VALUES (1, 1, 'architect', 30.00, '2025-01-01'),
+        (1, 2, 'lead', 50.00, '2025-01-01'),
+        (1, 3, 'dev', 60.00, '2025-01-01'),
+        (2, 2, 'lead', 40.00, '2025-01-03'),
+        (2, 4, 'dev', 70.00, '2025-01-03'),
+        (2, 5, 'qa', 30.00, '2025-01-03'),
+        (3, 3, 'lead', 45.00, '2025-01-05'),
+        (3, 6, 'ops', 55.00, '2025-01-05')
+        ON DUPLICATE KEY UPDATE role_name = VALUES(role_name),
+        allocation_pct = VALUES(allocation_pct),
+        joined_on = VALUES(joined_on);
+    WHILE v_day < 35 DO
+        SET v_work_date = DATE_ADD('2025-01-01', INTERVAL v_day DAY);
+        SET v_emp = 1;
+        WHILE v_emp <= 6 DO
+            SET v_project = ((v_day + v_emp) MOD 3) + 1;
+            SET v_hours =
+                CASE
+                    WHEN ((v_day + v_emp) MOD 11) = 0 THEN
+                        0.50
+                    WHEN ((v_day + v_emp) MOD 7) = 0 THEN
+                        10.50
+                    ELSE
+                        ((v_day * v_emp) MOD 8) + 1
+                END;
+            INSERT INTO task_log (project_id, employee_id, work_date, hours, note, payload)
+            VALUES (v_project, v_emp, v_work_date, v_hours, CONCAT('작업-', LPAD(v_day + 1, 2, '0'), '-', LPAD(v_emp, 2, '0'), ' 🚀'), JSON_OBJECT('source', 'seed', 'tags', JSON_ARRAY(CONCAT('p', v_project), CONCAT('e', v_emp), 
+                            CASE
+                                WHEN (v_day MOD 2) = 0 THEN
+                                    'even-day'
+                                ELSE
+                                    'odd-day'
+                            END
+            ), 'metrics', JSON_OBJECT('day_no', v_day, 'emp_no', v_emp, 'project_no', v_project, 'story_points', ((v_day + v_emp) MOD 13) + 1)));
+            SET v_emp = v_emp + 1;
+        END WHILE;
+        SET v_day = v_day + 1;
+    END WHILE;
+END$$
+
+CREATE PROCEDURE sp_build_monthly_rollup(
+    IN p_ym CHAR(7)
+)
+BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+        BEGIN
+            ROLLBACK;
+            RESIGNAL;
+        END;
+    DROP TEMPORARY TABLE IF EXISTS tmp_rollup;
+    SET @SQL = CONCAT('CREATE TEMPORARY TABLE tmp_rollup AS ', 'SELECT ', '  DATE_FORMAT(work_date, ''%Y-%m'') AS ym, ', '  project_id, ', '  employee_id, ', '  COUNT(*) AS log_count, ', '  ROUND(SUM(hours), 2) AS total_hours, ', '  ROUND(AVG(hours), 2) AS avg_hours, ', '  MAX(work_date) AS last_work_date ', 'FROM task_log ', 'WHERE DATE_FORMAT(work_date, ''%Y-%m'') = ', QUOTE(p_ym), ' ', 'GROUP BY DATE_FORMAT(work_date, ''%Y-%m''), project_id, employee_id');
+    PREPARE stmt
+    FROM @sql;
+    EXECUTE stmt;
+    DEALLOCATE PREPARE stmt;
+    START TRANSACTION;
+    INSERT INTO monthly_rollup (ym, project_id, employee_id, log_count, total_hours, avg_hours, last_work_date, rebuilt_at)
+    SELECT ym,
+        project_id,
+        employee_id,
+        log_count,
+        total_hours,
+        avg_hours,
+        last_work_date,
+        CURRENT_TIMESTAMP(6)
+    FROM tmp_rollup
+        ON DUPLICATE KEY UPDATE log_count = VALUES(log_count),
+        total_hours = VALUES(total_hours),
+        avg_hours = VALUES(avg_hours),
+        last_work_date = VALUES(last_work_date),
+        rebuilt_at = VALUES(rebuilt_at);
+    UPDATE projects p
+    JOIN (
+        SELECT DISTINCT project_id
+        FROM tmp_rollup
+    ) x
+        ON x.project_id = p.project_id
+    SET p.last_rollup_at = CURRENT_TIMESTAMP(6);
+    COMMIT;
+    DROP TEMPORARY TABLE IF EXISTS tmp_rollup;
+END$$
+
+DELIMITER ;
+
+-- ============================================================
+-- 3) Execute seed + rollups
+-- ============================================================
+
+CALL sp_seed_monster_data();
+
+CALL sp_build_monthly_rollup('2025-01');
+
+CALL sp_build_monthly_rollup('2025-02');
+
+CALL sp_build_monthly_rollup('2025-01'); -- duplicate-key update path re-test
+
+-- ============================================================
+-- 4) Assertions
+-- ============================================================
+
+CALL sp_assert_eq_bigint(
+    210,
+    (
+        SELECT COUNT(*)
+        FROM task_log
+    ),
+    'task_log row count'
+);
+
+CALL sp_assert_eq_bigint(
+    210,
+    (
+        SELECT COUNT(*)
+        FROM audit_events
+        WHERE event_type = 'TASK_INSERT'
+    ),
+    'audit row count'
+);
+
+CALL sp_assert_eq_bigint(
+    36,
+    (
+        SELECT COUNT(*)
+        FROM monthly_rollup
+    ),
+    'monthly_rollup row count'
+);
+
+CALL sp_assert_eq_bigint(
+    6,
+    (
+        SELECT COUNT(*)
+        FROM v_employee_workload
+        WHERE total_logs = 35
+    ),
+    'each employee should have 35 logs'
+);
+
+CALL sp_assert_eq_bigint(
+    (
+        SELECT COUNT(*)
+        FROM task_log
+    ),
+    (
+        SELECT COALESCE(SUM(log_count), 0)
+        FROM monthly_rollup
+    ),
+    'rollup log_count sum mismatch'
+);
+
+CALL sp_assert_eq_bigint(
+    CAST(ROUND(
+            (
+                SELECT COALESCE(SUM(hours), 0)
+                FROM task_log
+            ) * 100, 0) AS SIGNED),
+    CAST(ROUND(
+            (
+                SELECT COALESCE(SUM(total_hours), 0)
+                FROM monthly_rollup
+            ) * 100, 0) AS SIGNED),
+    'rollup total_hours sum mismatch'
+);
+
+CALL sp_assert_eq_bigint(
+    (
+        SELECT COUNT(*) * 3
+        FROM task_log
+    ),
+    (
+        SELECT COUNT(*)
+        FROM task_log t
+        JOIN JSON_TABLE(t.payload, '$.tags[*]' COLUMNS(
+            tag VARCHAR(50) PATH '$'
+        )) jt
+    ),
+    'JSON tag expansion count mismatch'
+);
+
+CALL sp_assert_eq_bigint(
+    3,
+    (
+        SELECT COUNT(*)
+        FROM projects
+        WHERE last_rollup_at IS NOT NULL
+    ),
+    'project rollup stamp mismatch'
+);
+
+SELECT 'ALL ASSERTIONS PASSED' AS status;
+
+-- ============================================================
+-- 5) Monster query #1
+--    recursive CTE + hierarchy
+-- ============================================================
+
+WITH RECURSIVE dept_tree AS (
+    SELECT
+        d.dept_id,
+        d.parent_dept_id,
+        d.dept_code,
+        d.dept_name,
+        CAST(d.dept_name AS CHAR(1000)) AS path_text,
+        1 AS lvl
+    FROM departments d
+    WHERE d.parent_dept_id IS NULL
+    UNION ALL
+    SELECT
+        c.dept_id,
+        c.parent_dept_id,
+        c.dept_code,
+        c.dept_name,
+        CONCAT(t.path_text, ' > ', c.dept_name) AS path_text,
+        t.lvl + 1 AS lvl
+    FROM departments c
+    JOIN dept_tree t
+        ON t.dept_id = c.parent_dept_id
+)
+SELECT
+    dept_id,
+    dept_code,
+    dept_name,
+    lvl,
+    path_text
+FROM dept_tree
+ORDER BY lvl,
+    dept_id;
+
+-- ============================================================
+-- 6) Monster query #2
+--    recursive CTE + window + correlated subquery + CASE + function
+-- ============================================================
+
+WITH RECURSIVE dept_tree AS (
+    SELECT
+        d.dept_id,
+        d.parent_dept_id,
+        d.dept_name,
+        CAST(d.dept_name AS CHAR(1000)) AS path_text
+    FROM departments d
+    WHERE d.parent_dept_id IS NULL
+    UNION ALL
+    SELECT
+        c.dept_id,
+        c.parent_dept_id,
+        c.dept_name,
+        CONCAT(t.path_text, ' > ', c.dept_name) AS path_text
+    FROM departments c
+    JOIN dept_tree t
+        ON t.dept_id = c.parent_dept_id
+),
+daily AS (
+    SELECT
+        t.project_id,
+        p.project_code,
+        t.work_date,
+        SUM(t.hours) AS day_hours,
+        COUNT(*) AS day_entries
+    FROM task_log t
+    JOIN projects p
+        ON p.project_id = t.project_id
+    GROUP BY t.project_id,
+        p.project_code,
+        t.work_date
+),
+ranked AS (
+    SELECT
+        d.*,
+    ROW_NUMBER() OVER (
+        PARTITION BY d.project_id
+        ORDER BY d.day_hours DESC,
+                d.work_date
+    ) AS rn,
+    DENSE_RANK() OVER (
+        PARTITION BY d.project_id
+        ORDER BY d.day_hours DESC
+    ) AS dense_rnk,
+    SUM(d.day_hours) OVER (
+        PARTITION BY d.project_id
+        ORDER BY d.work_date
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS running_hours,
+    AVG(d.day_hours) OVER (
+        PARTITION BY d.project_id
+        ORDER BY d.work_date
+        ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+    ) AS moving_avg_3d,
+    LAG(d.day_hours) OVER (
+        PARTITION BY d.project_id
+        ORDER BY d.work_date
+    ) AS prev_day_hours
+    FROM daily d
+),
+member_stats AS (
+    SELECT
+        pm.project_id,
+        GROUP_CONCAT(CONCAT(e.emp_code, ':', pm.role_name, '@', pm.allocation_pct) ORDER BY pm.allocation_pct DESC, e.emp_code SEPARATOR ' | ') AS members
+    FROM project_members pm
+    JOIN employees e
+        ON e.employee_id = pm.employee_id
+    GROUP BY pm.project_id
+),
+owner_chain AS (
+    SELECT
+        e.employee_id,
+        dt.path_text AS dept_path
+    FROM employees e
+    JOIN dept_tree dt
+        ON dt.dept_id = e.dept_id
+)
+SELECT
+    r.project_code,
+    r.work_date,
+    r.day_hours,
+    r.day_entries,
+    r.rn,
+    r.dense_rnk,
+    r.running_hours,
+    ROUND(r.moving_avg_3d, 2) AS moving_avg_3d,
+    COALESCE(r.prev_day_hours, 0) AS prev_day_hours,
+    p.budget_amount,
+    fn_efficiency_band(r.running_hours, p.budget_amount) AS budget_band,
+    (
+        SELECT ROUND(AVG(t2.hours), 2)
+        FROM task_log t2
+        WHERE t2.employee_id = p.owner_employee_id
+            AND t2.work_date BETWEEN DATE_SUB(r.work_date, INTERVAL 7 DAY) AND r.work_date
+    ) AS owner_7d_avg_hours,
+    oc.dept_path AS owner_dept_path,
+    ms.members
+FROM ranked r
+JOIN projects p
+    ON p.project_id = r.project_id
+LEFT JOIN member_stats ms
+    ON ms.project_id = r.project_id
+LEFT JOIN owner_chain oc
+    ON oc.employee_id = p.owner_employee_id
+WHERE r.rn <= 3
+ORDER BY r.project_code,
+    r.rn,
+    r.work_date;
+
+-- ============================================================
+-- 7) Monster query #3
+--    JSON_TABLE + aggregation + window ranking
+-- ============================================================
+
+WITH tag_usage AS (
+    SELECT
+        p.project_code,
+        jt.tag,
+        COUNT(*) AS tag_uses,
+        ROUND(SUM(t.hours), 2) AS tag_hours
+    FROM task_log t
+    JOIN projects p
+        ON p.project_id = t.project_id
+    JOIN JSON_TABLE(t.payload, '$.tags[*]' COLUMNS(
+        tag VARCHAR(50) PATH '$'
+    )) jt
+    GROUP BY p.project_code,
+        jt.tag
+)
+SELECT
+    project_code,
+    tag,
+    tag_uses,
+    tag_hours,
+    ROW_NUMBER() OVER (
+        PARTITION BY project_code
+        ORDER BY tag_uses DESC,
+            tag
+    ) AS tag_rank
+FROM tag_usage
+ORDER BY project_code,
+    tag_rank,
+    tag;
+
+-- ============================================================
+-- 8) Final inspection query
+-- ============================================================
+
+SELECT mr.ym,
+    p.project_code,
+    e.emp_code,
+    mr.log_count,
+    mr.total_hours,
+    mr.avg_hours,
+    mr.last_work_date,
+    mr.rebuilt_at
+FROM monthly_rollup mr
+JOIN projects p
+    ON p.project_id = mr.project_id
+JOIN employees e
+    ON e.employee_id = mr.employee_id
+ORDER BY mr.ym,
+    p.project_code,
+    e.emp_code;

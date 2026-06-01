@@ -1,0 +1,1163 @@
+/* ========================================================================
+   MARIA DB FINAL BOSS SCRIPT
+   - 목적:
+     1) SQL splitter / delimiter 처리
+     2) DDL / DML / FK / trigger / function / procedure / cursor / handler
+     3) JSON / window function / recursive CTE / dynamic SQL
+     4) 다중 result set / 복합 SELECT / nested query / EXISTS / HAVING
+   - 권장 버전: MariaDB 10.6+
+   ======================================================================== */
+
+SET SESSION sql_mode = 'STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION';
+SET SESSION group_concat_max_len = 1048576;
+SET SESSION max_recursive_iterations = 2000;
+
+SELECT 'splitter torture ; -- not comment /* not comment */ // $$ # end' AS literal_splitter_test;
+
+/* ------------------------------------------------------------------------
+   CLEANUP
+   ------------------------------------------------------------------------ */
+DROP TABLE IF EXISTS boss_monthly_stats;
+DROP TABLE IF EXISTS boss_payment;
+DROP TABLE IF EXISTS boss_order_item;
+DROP TABLE IF EXISTS boss_order;
+DROP TABLE IF EXISTS boss_product;
+DROP TABLE IF EXISTS boss_customer;
+DROP TABLE IF EXISTS boss_region;
+DROP TABLE IF EXISTS boss_audit;
+
+/* ------------------------------------------------------------------------
+   BASE TABLES
+   ------------------------------------------------------------------------ */
+CREATE TABLE boss_region (
+    region_id          INT NOT NULL,
+    parent_region_id   INT NULL,
+    region_name        VARCHAR(100) NOT NULL,
+    region_code        VARCHAR(30) NOT NULL,
+    created_at         DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (region_id),
+    UNIQUE KEY uq_boss_region_code (region_code),
+    UNIQUE KEY uq_boss_region_parent_name (parent_region_id, region_name),
+    CONSTRAINT fk_boss_region_parent
+        FOREIGN KEY (parent_region_id) REFERENCES boss_region(region_id)
+) ENGINE=InnoDB;
+
+CREATE TABLE boss_customer (
+    customer_id        INT NOT NULL,
+    region_id          INT NOT NULL,
+    customer_name      VARCHAR(120) NOT NULL,
+    segment            VARCHAR(20) NOT NULL,
+    email              VARCHAR(150) NOT NULL,
+    profile_json       JSON NOT NULL,
+    created_at         DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (customer_id),
+    UNIQUE KEY uq_boss_customer_email (email),
+    KEY ix_boss_customer_region_segment (region_id, segment),
+    CONSTRAINT fk_boss_customer_region
+        FOREIGN KEY (region_id) REFERENCES boss_region(region_id)
+) ENGINE=InnoDB;
+
+CREATE TABLE boss_product (
+    product_id         INT NOT NULL,
+    sku                VARCHAR(40) NOT NULL,
+    category           VARCHAR(30) NOT NULL,
+    product_name       VARCHAR(150) NOT NULL,
+    unit_price         DECIMAL(18,2) NOT NULL,
+    attrs_json         JSON NOT NULL,
+    active_yn          CHAR(1) NOT NULL DEFAULT 'Y',
+    created_at         DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (product_id),
+    UNIQUE KEY uq_boss_product_sku (sku),
+    KEY ix_boss_product_category_active (category, active_yn)
+) ENGINE=InnoDB;
+
+CREATE TABLE boss_order (
+    order_id           INT NOT NULL,
+    customer_id        INT NOT NULL,
+    order_no           VARCHAR(60) NOT NULL,
+    order_date         DATE NOT NULL,
+    status             VARCHAR(20) NOT NULL,
+    payment_status     VARCHAR(20) NOT NULL DEFAULT 'UNPAID',
+    subtotal           DECIMAL(18,2) NOT NULL DEFAULT 0.00,
+    discount_total     DECIMAL(18,2) NOT NULL DEFAULT 0.00,
+    tax_total          DECIMAL(18,2) NOT NULL DEFAULT 0.00,
+    grand_total        DECIMAL(18,2) NOT NULL DEFAULT 0.00,
+    paid_total         DECIMAL(18,2) NOT NULL DEFAULT 0.00,
+    meta_json          JSON NOT NULL,
+    created_at         DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (order_id),
+    UNIQUE KEY uq_boss_order_no (order_no),
+    KEY ix_boss_order_customer_date (customer_id, order_date),
+    KEY ix_boss_order_status_date (status, order_date),
+    CONSTRAINT fk_boss_order_customer
+        FOREIGN KEY (customer_id) REFERENCES boss_customer(customer_id)
+) ENGINE=InnoDB;
+
+CREATE TABLE boss_order_item (
+    order_item_id      BIGINT NOT NULL AUTO_INCREMENT,
+    order_id           INT NOT NULL,
+    line_no            INT NOT NULL,
+    product_id         INT NOT NULL,
+    quantity           INT NOT NULL,
+    unit_price         DECIMAL(18,2) NULL,
+    discount_rate      DECIMAL(9,4) NULL,
+    tax_rate           DECIMAL(9,4) NULL,
+    line_subtotal      DECIMAL(18,2) NOT NULL DEFAULT 0.00,
+    line_discount      DECIMAL(18,2) NOT NULL DEFAULT 0.00,
+    line_tax           DECIMAL(18,2) NOT NULL DEFAULT 0.00,
+    line_total         DECIMAL(18,2) NOT NULL DEFAULT 0.00,
+    note               VARCHAR(255) NULL,
+    details_json       JSON NOT NULL,
+    created_at         DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (order_item_id),
+    UNIQUE KEY uq_boss_order_item (order_id, line_no),
+    KEY ix_boss_order_item_product (product_id),
+    KEY ix_boss_order_item_order (order_id),
+    CONSTRAINT fk_boss_order_item_order
+        FOREIGN KEY (order_id) REFERENCES boss_order(order_id),
+    CONSTRAINT fk_boss_order_item_product
+        FOREIGN KEY (product_id) REFERENCES boss_product(product_id)
+) ENGINE=InnoDB;
+
+CREATE TABLE boss_payment (
+    payment_id         BIGINT NOT NULL AUTO_INCREMENT,
+    order_id           INT NOT NULL,
+    payment_date       DATETIME NOT NULL,
+    amount             DECIMAL(18,2) NOT NULL,
+    method             VARCHAR(30) NOT NULL,
+    payload_json       JSON NOT NULL,
+    created_at         DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (payment_id),
+    KEY ix_boss_payment_order_date (order_id, payment_date),
+    CONSTRAINT fk_boss_payment_order
+        FOREIGN KEY (order_id) REFERENCES boss_order(order_id)
+) ENGINE=InnoDB;
+
+CREATE TABLE boss_monthly_stats (
+    month_key          CHAR(7) NOT NULL,
+    region_id          INT NOT NULL,
+    segment            VARCHAR(20) NOT NULL,
+    orders_cnt         BIGINT NOT NULL,
+    customers_cnt      BIGINT NOT NULL,
+    gross_sales        DECIMAL(18,2) NOT NULL,
+    discount_amount    DECIMAL(18,2) NOT NULL,
+    tax_amount         DECIMAL(18,2) NOT NULL,
+    net_sales          DECIMAL(18,2) NOT NULL,
+    paid_amount        DECIMAL(18,2) NOT NULL,
+    unpaid_amount      DECIMAL(18,2) NOT NULL,
+    top_category       VARCHAR(30) NULL,
+    metrics_json       JSON NOT NULL,
+    updated_at         DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (month_key, region_id, segment),
+    KEY ix_boss_monthly_stats_region_segment (region_id, segment)
+) ENGINE=InnoDB;
+
+CREATE TABLE boss_audit (
+    audit_id           BIGINT NOT NULL AUTO_INCREMENT,
+    event_time         DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    entity_type        VARCHAR(30) NOT NULL,
+    entity_id          VARCHAR(60) NOT NULL,
+    action_name        VARCHAR(60) NOT NULL,
+    payload_json       JSON NOT NULL,
+    PRIMARY KEY (audit_id),
+    KEY ix_boss_audit_entity (entity_type, entity_id),
+    KEY ix_boss_audit_action_time (action_name, event_time)
+) ENGINE=InnoDB;
+
+/* ------------------------------------------------------------------------
+   ROUTINES / TRIGGERS
+   ------------------------------------------------------------------------ */
+DROP FUNCTION IF EXISTS fn_month_key;
+DROP FUNCTION IF EXISTS fn_order_risk;
+DROP PROCEDURE IF EXISTS sp_seed_final_boss;
+DROP PROCEDURE IF EXISTS sp_rebuild_monthly_stats;
+DROP PROCEDURE IF EXISTS sp_validate_final_boss;
+DROP PROCEDURE IF EXISTS sp_dynamic_month_pivot;
+DROP TRIGGER IF EXISTS bi_boss_order_item;
+DROP TRIGGER IF EXISTS bu_boss_order_item;
+DROP TRIGGER IF EXISTS ai_boss_order_item;
+DROP TRIGGER IF EXISTS au_boss_order_item;
+DROP TRIGGER IF EXISTS ad_boss_order_item;
+DROP TRIGGER IF EXISTS ai_boss_payment;
+
+DELIMITER $$
+
+CREATE FUNCTION fn_month_key(p_date DATE)
+RETURNS CHAR(7)
+DETERMINISTIC
+RETURN DATE_FORMAT(p_date, '%Y-%m')$$
+
+CREATE FUNCTION fn_order_risk(p_order_id INT)
+RETURNS VARCHAR(20)
+READS SQL DATA
+BEGIN
+    DECLARE v_exists INT DEFAULT 0;
+    DECLARE v_due DECIMAL(18,2) DEFAULT 0.00;
+    DECLARE v_days INT DEFAULT 0;
+
+    SELECT COUNT(*)
+      INTO v_exists
+      FROM boss_order
+     WHERE order_id = p_order_id;
+
+    IF v_exists = 0 THEN
+        RETURN 'UNKNOWN';
+    END IF;
+
+    SELECT
+        GREATEST(IFNULL(grand_total, 0) - IFNULL(paid_total, 0), 0),
+        DATEDIFF(CURDATE(), order_date)
+      INTO v_due, v_days
+      FROM boss_order
+     WHERE order_id = p_order_id;
+
+    RETURN CASE
+        WHEN v_due = 0 THEN 'CLEAR'
+        WHEN v_days >= 120 THEN 'CRITICAL'
+        WHEN v_days >= 60 THEN 'HIGH'
+        WHEN v_days >= 30 THEN 'MEDIUM'
+        ELSE 'LOW'
+    END;
+END$$
+
+CREATE TRIGGER bi_boss_order_item
+BEFORE INSERT ON boss_order_item
+FOR EACH ROW
+BEGIN
+    DECLARE v_unit_price DECIMAL(18,2);
+
+    IF NEW.quantity IS NULL OR NEW.quantity < 1 THEN
+        SET NEW.quantity = 1;
+    END IF;
+
+    IF NEW.unit_price IS NULL THEN
+        SELECT unit_price
+          INTO v_unit_price
+          FROM boss_product
+         WHERE product_id = NEW.product_id;
+        SET NEW.unit_price = v_unit_price;
+    END IF;
+
+    SET NEW.discount_rate = IFNULL(NEW.discount_rate, 0.0000);
+    SET NEW.tax_rate = IFNULL(NEW.tax_rate, 0.1000);
+
+    SET NEW.line_subtotal = ROUND(NEW.quantity * NEW.unit_price, 2);
+    SET NEW.line_discount = ROUND(NEW.line_subtotal * NEW.discount_rate, 2);
+    SET NEW.line_tax      = ROUND((NEW.line_subtotal - NEW.line_discount) * NEW.tax_rate, 2);
+    SET NEW.line_total    = ROUND(NEW.line_subtotal - NEW.line_discount + NEW.line_tax, 2);
+END$$
+
+CREATE TRIGGER bu_boss_order_item
+BEFORE UPDATE ON boss_order_item
+FOR EACH ROW
+BEGIN
+    DECLARE v_unit_price DECIMAL(18,2);
+
+    IF NEW.quantity IS NULL OR NEW.quantity < 1 THEN
+        SET NEW.quantity = 1;
+    END IF;
+
+    IF NEW.unit_price IS NULL THEN
+        SELECT unit_price
+          INTO v_unit_price
+          FROM boss_product
+         WHERE product_id = NEW.product_id;
+        SET NEW.unit_price = v_unit_price;
+    END IF;
+
+    SET NEW.discount_rate = IFNULL(NEW.discount_rate, 0.0000);
+    SET NEW.tax_rate = IFNULL(NEW.tax_rate, 0.1000);
+
+    SET NEW.line_subtotal = ROUND(NEW.quantity * NEW.unit_price, 2);
+    SET NEW.line_discount = ROUND(NEW.line_subtotal * NEW.discount_rate, 2);
+    SET NEW.line_tax      = ROUND((NEW.line_subtotal - NEW.line_discount) * NEW.tax_rate, 2);
+    SET NEW.line_total    = ROUND(NEW.line_subtotal - NEW.line_discount + NEW.line_tax, 2);
+END$$
+
+CREATE TRIGGER ai_boss_order_item
+AFTER INSERT ON boss_order_item
+FOR EACH ROW
+BEGIN
+    UPDATE boss_order o
+    LEFT JOIN (
+        SELECT
+            order_id,
+            ROUND(SUM(line_subtotal), 2) AS subtotal,
+            ROUND(SUM(line_discount), 2) AS discount_total,
+            ROUND(SUM(line_tax), 2) AS tax_total,
+            ROUND(SUM(line_total), 2) AS grand_total
+        FROM boss_order_item
+        WHERE order_id = NEW.order_id
+        GROUP BY order_id
+    ) x
+      ON x.order_id = o.order_id
+       SET o.subtotal       = IFNULL(x.subtotal, 0),
+           o.discount_total = IFNULL(x.discount_total, 0),
+           o.tax_total      = IFNULL(x.tax_total, 0),
+           o.grand_total    = IFNULL(x.grand_total, 0)
+     WHERE o.order_id = NEW.order_id;
+END$$
+
+CREATE TRIGGER au_boss_order_item
+AFTER UPDATE ON boss_order_item
+FOR EACH ROW
+BEGIN
+    IF OLD.order_id <> NEW.order_id THEN
+        UPDATE boss_order o
+        LEFT JOIN (
+            SELECT
+                order_id,
+                ROUND(SUM(line_subtotal), 2) AS subtotal,
+                ROUND(SUM(line_discount), 2) AS discount_total,
+                ROUND(SUM(line_tax), 2) AS tax_total,
+                ROUND(SUM(line_total), 2) AS grand_total
+            FROM boss_order_item
+            WHERE order_id = OLD.order_id
+            GROUP BY order_id
+        ) x
+          ON x.order_id = o.order_id
+           SET o.subtotal       = IFNULL(x.subtotal, 0),
+               o.discount_total = IFNULL(x.discount_total, 0),
+               o.tax_total      = IFNULL(x.tax_total, 0),
+               o.grand_total    = IFNULL(x.grand_total, 0)
+         WHERE o.order_id = OLD.order_id;
+    END IF;
+
+    UPDATE boss_order o
+    LEFT JOIN (
+        SELECT
+            order_id,
+            ROUND(SUM(line_subtotal), 2) AS subtotal,
+            ROUND(SUM(line_discount), 2) AS discount_total,
+            ROUND(SUM(line_tax), 2) AS tax_total,
+            ROUND(SUM(line_total), 2) AS grand_total
+        FROM boss_order_item
+        WHERE order_id = NEW.order_id
+        GROUP BY order_id
+    ) x
+      ON x.order_id = o.order_id
+       SET o.subtotal       = IFNULL(x.subtotal, 0),
+           o.discount_total = IFNULL(x.discount_total, 0),
+           o.tax_total      = IFNULL(x.tax_total, 0),
+           o.grand_total    = IFNULL(x.grand_total, 0)
+     WHERE o.order_id = NEW.order_id;
+END$$
+
+CREATE TRIGGER ad_boss_order_item
+AFTER DELETE ON boss_order_item
+FOR EACH ROW
+BEGIN
+    UPDATE boss_order o
+    LEFT JOIN (
+        SELECT
+            order_id,
+            ROUND(SUM(line_subtotal), 2) AS subtotal,
+            ROUND(SUM(line_discount), 2) AS discount_total,
+            ROUND(SUM(line_tax), 2) AS tax_total,
+            ROUND(SUM(line_total), 2) AS grand_total
+        FROM boss_order_item
+        WHERE order_id = OLD.order_id
+        GROUP BY order_id
+    ) x
+      ON x.order_id = o.order_id
+       SET o.subtotal       = IFNULL(x.subtotal, 0),
+           o.discount_total = IFNULL(x.discount_total, 0),
+           o.tax_total      = IFNULL(x.tax_total, 0),
+           o.grand_total    = IFNULL(x.grand_total, 0)
+     WHERE o.order_id = OLD.order_id;
+END$$
+
+CREATE TRIGGER ai_boss_payment
+AFTER INSERT ON boss_payment
+FOR EACH ROW
+BEGIN
+    UPDATE boss_order o
+    LEFT JOIN (
+        SELECT
+            order_id,
+            ROUND(SUM(amount), 2) AS total_paid
+        FROM boss_payment
+        WHERE order_id = NEW.order_id
+        GROUP BY order_id
+    ) p
+      ON p.order_id = o.order_id
+       SET o.paid_total = IFNULL(p.total_paid, 0),
+           o.payment_status =
+               CASE
+                   WHEN IFNULL(p.total_paid, 0) >= o.grand_total AND o.grand_total > 0 THEN 'PAID'
+                   WHEN IFNULL(p.total_paid, 0) > 0 THEN 'PARTIAL'
+                   ELSE 'UNPAID'
+               END
+     WHERE o.order_id = NEW.order_id;
+
+    INSERT INTO boss_audit (
+        event_time, entity_type, entity_id, action_name, payload_json
+    )
+    VALUES (
+        NOW(),
+        'ORDER',
+        CAST(NEW.order_id AS CHAR),
+        'PAYMENT_INSERT',
+        JSON_OBJECT(
+            'payment_id', NEW.payment_id,
+            'amount', NEW.amount,
+            'method', NEW.method,
+            'note', 'json; // trigger ; audit'
+        )
+    );
+END$$
+
+CREATE PROCEDURE sp_seed_final_boss()
+BEGIN
+    DECLARE v_customer_id INT DEFAULT 1;
+    DECLARE v_product_id INT DEFAULT 1;
+    DECLARE v_order_id INT DEFAULT 1;
+    DECLARE v_item_no INT DEFAULT 1;
+    DECLARE v_item_cnt INT DEFAULT 1;
+    DECLARE v_prod_id INT DEFAULT 1;
+    DECLARE v_order_total DECIMAL(18,2) DEFAULT 0.00;
+    DECLARE v_order_date DATE;
+    DECLARE v_status VARCHAR(20);
+
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        RESIGNAL;
+    END;
+
+    START TRANSACTION;
+
+    INSERT INTO boss_region (region_id, parent_region_id, region_name, region_code) VALUES
+        (1,  NULL, 'GLOBAL',   'GLOBAL'),
+        (2,  1,    'APAC',     'APAC'),
+        (3,  1,    'EMEA',     'EMEA'),
+        (4,  1,    'AMER',     'AMER'),
+        (5,  2,    'KOREA',    'KR'),
+        (6,  2,    'JAPAN',    'JP'),
+        (7,  2,    'SINGAPORE','SG'),
+        (8,  3,    'GERMANY',  'DE'),
+        (9,  3,    'UK',       'UK'),
+        (10, 3,    'FRANCE',   'FR'),
+        (11, 4,    'USA_EAST', 'USE'),
+        (12, 4,    'USA_WEST', 'USW'),
+        (13, 4,    'CANADA',   'CA');
+
+    WHILE v_customer_id <= 36 DO
+        INSERT INTO boss_customer (
+            customer_id, region_id, customer_name, segment, email, profile_json, created_at
+        )
+        VALUES (
+            v_customer_id,
+            5 + MOD(v_customer_id - 1, 9),
+            CONCAT('CUST_', LPAD(v_customer_id, 3, '0')),
+            ELT(1 + MOD(v_customer_id - 1, 3), 'ENTERPRISE', 'SMB', 'PUBLIC'),
+            CONCAT('cust', LPAD(v_customer_id, 3, '0'), '@boss.test'),
+            JSON_OBJECT(
+                'tier', ELT(1 + MOD(v_customer_id - 1, 4), 'BRONZE', 'SILVER', 'GOLD', 'PLATINUM'),
+                'flags', JSON_ARRAY(
+                    CONCAT('f', MOD(v_customer_id, 5)),
+                    'split;test',
+                    '//slash',
+                    '한글'
+                ),
+                'credits', v_customer_id * 111,
+                'memo', CONCAT('memo ; ', v_customer_id, ' -- not comment')
+            ),
+            DATE_ADD('2024-01-01 08:00:00', INTERVAL v_customer_id DAY)
+        );
+
+        SET v_customer_id = v_customer_id + 1;
+    END WHILE;
+
+    WHILE v_product_id <= 36 DO
+        INSERT INTO boss_product (
+            product_id, sku, category, product_name, unit_price, attrs_json, active_yn
+        )
+        VALUES (
+            v_product_id,
+            CONCAT('SKU-', LPAD(v_product_id, 4, '0')),
+            ELT(1 + MOD(v_product_id - 1, 3), 'HW', 'SW', 'SV'),
+            CONCAT(
+                ELT(1 + MOD(v_product_id - 1, 3), 'HW', 'SW', 'SV'),
+                '_PRODUCT_',
+                LPAD(v_product_id, 2, '0')
+            ),
+            ROUND(19 + (v_product_id * 7.35) + (MOD(v_product_id, 5) * 3.70), 2),
+            JSON_OBJECT(
+                'color', ELT(1 + MOD(v_product_id - 1, 4), 'red', 'blue', 'black', 'silver'),
+                'weight', ROUND(0.5 + (v_product_id * 0.13), 2),
+                'tags', JSON_ARRAY(
+                    CONCAT('p', v_product_id),
+                    'boss',
+                    'json;test',
+                    CONCAT('cat:', ELT(1 + MOD(v_product_id - 1, 3), 'HW', 'SW', 'SV'))
+                )
+            ),
+            IF(MOD(v_product_id, 17) = 0, 'N', 'Y')
+        );
+
+        SET v_product_id = v_product_id + 1;
+    END WHILE;
+
+    WHILE v_order_id <= 240 DO
+        SET v_status =
+            CASE
+                WHEN MOD(v_order_id, 17) = 0 THEN 'CANCELLED'
+                WHEN MOD(v_order_id, 11) = 0 THEN 'HOLD'
+                WHEN MOD(v_order_id, 3) = 0 THEN 'OPEN'
+                ELSE 'COMPLETE'
+            END;
+
+        INSERT INTO boss_order (
+            order_id, customer_id, order_no, order_date, status, meta_json
+        )
+        VALUES (
+            v_order_id,
+            1 + MOD(v_order_id * 7, 36),
+            CONCAT(
+                'ORD',
+                DATE_FORMAT(DATE_ADD('2024-01-01', INTERVAL MOD(v_order_id * 5, 720) DAY), '%Y%m%d'),
+                '-',
+                LPAD(v_order_id, 5, '0')
+            ),
+            DATE_ADD('2024-01-01', INTERVAL MOD(v_order_id * 5, 720) DAY),
+            v_status,
+            JSON_OBJECT(
+                'channel', ELT(1 + MOD(v_order_id, 4), 'WEB', 'PARTNER', 'DIRECT', 'MOBILE'),
+                'priority', MOD(v_order_id, 5),
+                'memo', CONCAT('semi; // ', v_order_id, ' /* literal */'),
+                'flag', IF(MOD(v_order_id, 2) = 0, 'Y', 'N')
+            )
+        );
+
+        SET v_item_cnt = 1 + MOD(v_order_id, 5);
+        SET v_item_no = 1;
+
+        WHILE v_item_no <= v_item_cnt DO
+            SET v_prod_id = 1 + MOD(v_order_id * 7 + v_item_no * 11, 36);
+
+            INSERT INTO boss_order_item (
+                order_id,
+                line_no,
+                product_id,
+                quantity,
+                unit_price,
+                discount_rate,
+                tax_rate,
+                note,
+                details_json
+            )
+            VALUES (
+                v_order_id,
+                v_item_no,
+                v_prod_id,
+                1 + MOD(v_order_id + v_item_no, 4),
+                CASE
+                    WHEN MOD(v_item_no, 2) = 0 THEN NULL
+                    ELSE ROUND(19 + (v_prod_id * 7.35) + (MOD(v_prod_id, 5) * 3.70), 2)
+                END,
+                CASE
+                    WHEN MOD(v_item_no, 5) = 0 THEN 0.2000
+                    WHEN MOD(v_item_no, 3) = 0 THEN 0.0700
+                    ELSE ROUND((MOD(v_item_no + v_order_id, 4) * 0.0200), 4)
+                END,
+                CASE
+                    WHEN MOD(v_prod_id, 7) = 0 THEN 0.0500
+                    ELSE 0.1000
+                END,
+                CONCAT('note ; ', v_order_id, '/', v_item_no, ' // not delimiter'),
+                JSON_OBJECT(
+                    'gift', IF(MOD(v_order_id + v_item_no, 6) = 0, 'Y', 'N'),
+                    'tags', JSON_ARRAY(
+                        CONCAT('o', v_order_id),
+                        CONCAT('i', v_item_no),
+                        'semi;colon',
+                        'slash//slash'
+                    ),
+                    'payload', CONCAT('payload-', v_order_id, '-', v_item_no)
+                )
+            );
+
+            SET v_item_no = v_item_no + 1;
+        END WHILE;
+
+        SELECT order_date, grand_total
+          INTO v_order_date, v_order_total
+          FROM boss_order
+         WHERE order_id = v_order_id;
+
+        IF v_status <> 'CANCELLED' THEN
+            IF MOD(v_order_id, 4) = 0 THEN
+                INSERT INTO boss_payment (order_id, payment_date, amount, method, payload_json)
+                VALUES (
+                    v_order_id,
+                    DATE_ADD(CAST(CONCAT(v_order_date, ' 09:00:00') AS DATETIME), INTERVAL MOD(v_order_id, 48) HOUR),
+                    v_order_total,
+                    'CARD',
+                    JSON_OBJECT('gateway', 'G1', 'memo', 'full payment ; // ok')
+                );
+            ELSEIF MOD(v_order_id, 4) = 1 THEN
+                INSERT INTO boss_payment (order_id, payment_date, amount, method, payload_json)
+                VALUES (
+                    v_order_id,
+                    DATE_ADD(CAST(CONCAT(v_order_date, ' 10:00:00') AS DATETIME), INTERVAL MOD(v_order_id, 48) HOUR),
+                    ROUND(v_order_total * 0.35, 2),
+                    'BANK',
+                    JSON_OBJECT('gateway', 'G2', 'memo', 'partial-1')
+                );
+
+                INSERT INTO boss_payment (order_id, payment_date, amount, method, payload_json)
+                VALUES (
+                    v_order_id,
+                    DATE_ADD(CAST(CONCAT(v_order_date, ' 18:00:00') AS DATETIME), INTERVAL MOD(v_order_id, 72) HOUR),
+                    ROUND(v_order_total - ROUND(v_order_total * 0.35, 2), 2),
+                    'BANK',
+                    JSON_OBJECT('gateway', 'G2', 'memo', 'partial-2')
+                );
+            ELSEIF MOD(v_order_id, 4) = 2 THEN
+                INSERT INTO boss_payment (order_id, payment_date, amount, method, payload_json)
+                VALUES (
+                    v_order_id,
+                    DATE_ADD(CAST(CONCAT(v_order_date, ' 14:00:00') AS DATETIME), INTERVAL MOD(v_order_id, 36) HOUR),
+                    ROUND(v_order_total * 0.60, 2),
+                    'CASH',
+                    JSON_OBJECT('gateway', 'G3', 'memo', '60% only')
+                );
+            END IF;
+        END IF;
+
+        SET v_order_id = v_order_id + 1;
+    END WHILE;
+
+    UPDATE boss_customer c
+    JOIN (
+        SELECT
+            o.customer_id,
+            COUNT(*) AS lifetime_orders,
+            ROUND(SUM(o.grand_total), 2) AS lifetime_net_sales,
+            MAX(o.order_date) AS last_order_date
+        FROM boss_order o
+        WHERE o.status <> 'CANCELLED'
+        GROUP BY o.customer_id
+    ) s
+      ON s.customer_id = c.customer_id
+       SET c.profile_json = JSON_SET(
+           c.profile_json,
+           '$.lifetime_orders', s.lifetime_orders,
+           '$.lifetime_net_sales', s.lifetime_net_sales,
+           '$.last_order_date', DATE_FORMAT(s.last_order_date, '%Y-%m-%d')
+       );
+
+    INSERT INTO boss_audit (
+        event_time, entity_type, entity_id, action_name, payload_json
+    )
+    SELECT
+        NOW(),
+        'SYSTEM',
+        '0',
+        'SEED_COMPLETE',
+        JSON_OBJECT(
+            'regions',   (SELECT COUNT(*) FROM boss_region),
+            'customers', (SELECT COUNT(*) FROM boss_customer),
+            'products',  (SELECT COUNT(*) FROM boss_product),
+            'orders',    (SELECT COUNT(*) FROM boss_order),
+            'items',     (SELECT COUNT(*) FROM boss_order_item),
+            'payments',  (SELECT COUNT(*) FROM boss_payment)
+        );
+
+    COMMIT;
+END$$
+
+CREATE PROCEDURE sp_rebuild_monthly_stats(IN p_from DATE, IN p_to DATE)
+BEGIN
+    DECLARE v_msg VARCHAR(255);
+
+    IF p_from IS NULL OR p_to IS NULL OR p_from > p_to THEN
+        SET v_msg = 'p_from / p_to is invalid';
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = v_msg;
+    END IF;
+
+    DELETE
+      FROM boss_monthly_stats
+     WHERE STR_TO_DATE(CONCAT(month_key, '-01'), '%Y-%m-%d')
+           BETWEEN STR_TO_DATE(DATE_FORMAT(p_from, '%Y-%m-01'), '%Y-%m-%d')
+               AND STR_TO_DATE(DATE_FORMAT(p_to, '%Y-%m-01'), '%Y-%m-%d');
+
+    INSERT INTO boss_monthly_stats (
+        month_key,
+        region_id,
+        segment,
+        orders_cnt,
+        customers_cnt,
+        gross_sales,
+        discount_amount,
+        tax_amount,
+        net_sales,
+        paid_amount,
+        unpaid_amount,
+        top_category,
+        metrics_json,
+        updated_at
+    )
+    SELECT
+        b.month_key,
+        b.region_id,
+        b.segment,
+        b.orders_cnt,
+        b.customers_cnt,
+        b.gross_sales,
+        b.discount_amount,
+        b.tax_amount,
+        b.net_sales,
+        b.paid_amount,
+        b.unpaid_amount,
+        IFNULL(tc.top_category, 'N/A') AS top_category,
+        JSON_OBJECT(
+            'avg_order_value', ROUND(b.net_sales / NULLIF(b.orders_cnt, 0), 2),
+            'avg_customer_value', ROUND(b.net_sales / NULLIF(b.customers_cnt, 0), 2),
+            'paid_ratio', ROUND(b.paid_amount / NULLIF(b.net_sales, 0), 4),
+            'range', JSON_ARRAY(DATE_FORMAT(p_from, '%Y-%m-%d'), DATE_FORMAT(p_to, '%Y-%m-%d'))
+        ),
+        NOW()
+    FROM (
+        SELECT
+            fn_month_key(o.order_date) AS month_key,
+            c.region_id,
+            c.segment,
+            COUNT(DISTINCT o.order_id) AS orders_cnt,
+            COUNT(DISTINCT o.customer_id) AS customers_cnt,
+            ROUND(SUM(o.subtotal), 2) AS gross_sales,
+            ROUND(SUM(o.discount_total), 2) AS discount_amount,
+            ROUND(SUM(o.tax_total), 2) AS tax_amount,
+            ROUND(SUM(o.grand_total), 2) AS net_sales,
+            ROUND(SUM(o.paid_total), 2) AS paid_amount,
+            ROUND(SUM(GREATEST(o.grand_total - o.paid_total, 0)), 2) AS unpaid_amount
+        FROM boss_order o
+        JOIN boss_customer c
+          ON c.customer_id = o.customer_id
+        WHERE o.order_date BETWEEN p_from AND p_to
+          AND o.status <> 'CANCELLED'
+        GROUP BY
+            fn_month_key(o.order_date),
+            c.region_id,
+            c.segment
+    ) b
+    LEFT JOIN (
+        SELECT
+            ranked.month_key,
+            ranked.region_id,
+            ranked.segment,
+            ranked.category AS top_category
+        FROM (
+            SELECT
+                cb.month_key,
+                cb.region_id,
+                cb.segment,
+                cb.category,
+                cb.category_total,
+                ROW_NUMBER() OVER (
+                    PARTITION BY cb.month_key, cb.region_id, cb.segment
+                    ORDER BY cb.category_total DESC, cb.category
+                ) AS rn
+            FROM (
+                SELECT
+                    fn_month_key(o.order_date) AS month_key,
+                    c.region_id,
+                    c.segment,
+                    p.category,
+                    ROUND(SUM(oi.line_total), 2) AS category_total
+                FROM boss_order o
+                JOIN boss_customer c
+                  ON c.customer_id = o.customer_id
+                JOIN boss_order_item oi
+                  ON oi.order_id = o.order_id
+                JOIN boss_product p
+                  ON p.product_id = oi.product_id
+                WHERE o.order_date BETWEEN p_from AND p_to
+                  AND o.status <> 'CANCELLED'
+                GROUP BY
+                    fn_month_key(o.order_date),
+                    c.region_id,
+                    c.segment,
+                    p.category
+            ) cb
+        ) ranked
+        WHERE ranked.rn = 1
+    ) tc
+      ON tc.month_key = b.month_key
+     AND tc.region_id = b.region_id
+     AND tc.segment = b.segment
+    ON DUPLICATE KEY UPDATE
+        orders_cnt       = VALUES(orders_cnt),
+        customers_cnt    = VALUES(customers_cnt),
+        gross_sales      = VALUES(gross_sales),
+        discount_amount  = VALUES(discount_amount),
+        tax_amount       = VALUES(tax_amount),
+        net_sales        = VALUES(net_sales),
+        paid_amount      = VALUES(paid_amount),
+        unpaid_amount    = VALUES(unpaid_amount),
+        top_category     = VALUES(top_category),
+        metrics_json     = VALUES(metrics_json),
+        updated_at       = VALUES(updated_at);
+END$$
+
+CREATE PROCEDURE sp_validate_final_boss()
+BEGIN
+    DECLARE done INT DEFAULT 0;
+    DECLARE v_bad_count INT DEFAULT 0;
+    DECLARE v_msg VARCHAR(255);
+    DECLARE v_month_key CHAR(7);
+    DECLARE v_region_id INT;
+    DECLARE v_segment VARCHAR(20);
+    DECLARE v_net_sales DECIMAL(18,2);
+    DECLARE v_orders_cnt BIGINT;
+    DECLARE v_top_category VARCHAR(30);
+
+    DECLARE cur CURSOR FOR
+        SELECT month_key, region_id, segment, net_sales, orders_cnt, top_category
+        FROM boss_monthly_stats
+        ORDER BY month_key, region_id, segment;
+
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = 1;
+
+    SELECT COUNT(*)
+      INTO v_bad_count
+      FROM (
+          SELECT o.order_id
+          FROM boss_order o
+          LEFT JOIN (
+              SELECT
+                  order_id,
+                  ROUND(SUM(line_subtotal), 2) AS subtotal,
+                  ROUND(SUM(line_discount), 2) AS discount_total,
+                  ROUND(SUM(line_tax), 2) AS tax_total,
+                  ROUND(SUM(line_total), 2) AS grand_total
+              FROM boss_order_item
+              GROUP BY order_id
+          ) x
+            ON x.order_id = o.order_id
+          WHERE ROUND(IFNULL(o.subtotal, 0), 2)       <> ROUND(IFNULL(x.subtotal, 0), 2)
+             OR ROUND(IFNULL(o.discount_total, 0), 2) <> ROUND(IFNULL(x.discount_total, 0), 2)
+             OR ROUND(IFNULL(o.tax_total, 0), 2)      <> ROUND(IFNULL(x.tax_total, 0), 2)
+             OR ROUND(IFNULL(o.grand_total, 0), 2)    <> ROUND(IFNULL(x.grand_total, 0), 2)
+      ) z;
+
+    IF v_bad_count > 0 THEN
+        SET v_msg = CONCAT('order total mismatch count = ', v_bad_count);
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = v_msg;
+    END IF;
+
+    OPEN cur;
+
+    read_loop: LOOP
+        FETCH cur INTO v_month_key, v_region_id, v_segment, v_net_sales, v_orders_cnt, v_top_category;
+
+        IF done = 1 THEN
+            LEAVE read_loop;
+        END IF;
+
+        IF v_net_sales < 0 THEN
+            SET v_msg = CONCAT('negative net sales at ', v_month_key, '/', v_region_id, '/', v_segment);
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = v_msg;
+        END IF;
+
+        IF v_orders_cnt > 0 AND (v_top_category IS NULL OR v_top_category = '') THEN
+            SET v_msg = CONCAT('missing top category at ', v_month_key, '/', v_region_id, '/', v_segment);
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = v_msg;
+        END IF;
+    END LOOP;
+
+    CLOSE cur;
+
+    SELECT
+        (SELECT COUNT(*) FROM boss_region)       AS regions,
+        (SELECT COUNT(*) FROM boss_customer)     AS customers,
+        (SELECT COUNT(*) FROM boss_product)      AS products,
+        (SELECT COUNT(*) FROM boss_order)        AS orders_cnt,
+        (SELECT COUNT(*) FROM boss_order_item)   AS items_cnt,
+        (SELECT COUNT(*) FROM boss_payment)      AS payments_cnt,
+        (SELECT COUNT(*) FROM boss_monthly_stats) AS monthly_rows,
+        (SELECT COUNT(*) FROM boss_audit)        AS audit_rows;
+END$$
+
+CREATE PROCEDURE sp_dynamic_month_pivot(IN p_from DATE, IN p_to DATE)
+BEGIN
+    DECLARE v_cols LONGTEXT;
+    DECLARE v_sql LONGTEXT;
+
+    SELECT GROUP_CONCAT(
+               DISTINCT CONCAT(
+                   'ROUND(SUM(CASE WHEN ms.month_key = ''',
+                   ms.month_key,
+                   ''' THEN ms.net_sales ELSE 0 END), 2) AS `',
+                   REPLACE(ms.month_key, '-', '_'),
+                   '`'
+               )
+               ORDER BY ms.month_key SEPARATOR ', '
+           )
+      INTO v_cols
+      FROM boss_monthly_stats ms
+     WHERE STR_TO_DATE(CONCAT(ms.month_key, '-01'), '%Y-%m-%d')
+           BETWEEN STR_TO_DATE(DATE_FORMAT(p_from, '%Y-%m-01'), '%Y-%m-%d')
+               AND STR_TO_DATE(DATE_FORMAT(p_to, '%Y-%m-01'), '%Y-%m-%d');
+
+    IF v_cols IS NULL THEN
+        SET v_cols = '0 AS no_data';
+    END IF;
+
+    SET v_sql = CONCAT(
+        'SELECT ms.segment, ',
+        v_cols,
+        ' FROM boss_monthly_stats ms',
+        ' WHERE STR_TO_DATE(CONCAT(ms.month_key, ''-01''), ''%Y-%m-%d'') BETWEEN ''',
+        DATE_FORMAT(p_from, '%Y-%m-01'),
+        ''' AND ''',
+        DATE_FORMAT(p_to, '%Y-%m-01'),
+        '''',
+        ' GROUP BY ms.segment',
+        ' ORDER BY ms.segment'
+    );
+
+    SET @pivot_sql = v_sql;
+    PREPARE stmt_pivot FROM @pivot_sql;
+    EXECUTE stmt_pivot;
+    DEALLOCATE PREPARE stmt_pivot;
+END$$
+
+DELIMITER ;
+
+/* ------------------------------------------------------------------------
+   EXECUTION
+   ------------------------------------------------------------------------ */
+CALL sp_seed_final_boss();
+CALL sp_rebuild_monthly_stats('2024-01-01', '2025-12-31');
+CALL sp_validate_final_boss();
+
+/* ------------------------------------------------------------------------
+   FINAL BOSS QUERY #1
+   recursive CTE + hierarchy path + window function + JSON + function
+   ------------------------------------------------------------------------ */
+WITH RECURSIVE region_tree AS (
+    SELECT
+        region_id,
+        parent_region_id,
+        region_name,
+        CAST(region_name AS CHAR(500)) AS region_path,
+        0 AS depth
+    FROM boss_region
+    WHERE parent_region_id IS NULL
+
+    UNION ALL
+
+    SELECT
+        r.region_id,
+        r.parent_region_id,
+        r.region_name,
+        CONCAT(rt.region_path, ' > ', r.region_name) AS region_path,
+        rt.depth + 1
+    FROM boss_region r
+    JOIN region_tree rt
+      ON rt.region_id = r.parent_region_id
+),
+customer_spend AS (
+    SELECT
+        c.customer_id,
+        c.customer_name,
+        c.region_id,
+        COUNT(DISTINCT o.order_id) AS order_count,
+        ROUND(SUM(CASE WHEN o.status <> 'CANCELLED' THEN o.grand_total ELSE 0 END), 2) AS total_spent,
+        MAX(o.order_date) AS last_order_date
+    FROM boss_customer c
+    LEFT JOIN boss_order o
+      ON o.customer_id = c.customer_id
+    GROUP BY
+        c.customer_id,
+        c.customer_name,
+        c.region_id
+),
+ranked AS (
+    SELECT
+        cs.*,
+        DENSE_RANK() OVER (
+            PARTITION BY cs.region_id
+            ORDER BY cs.total_spent DESC, cs.customer_id
+        ) AS region_rank
+    FROM customer_spend cs
+)
+SELECT
+    rt.region_path,
+    r.customer_id,
+    r.customer_name,
+    r.order_count,
+    r.total_spent,
+    r.last_order_date,
+    r.region_rank,
+    JSON_OBJECT(
+        'tier', JSON_EXTRACT(c.profile_json, '$.tier'),
+        'risk', fn_order_risk(
+            (
+                SELECT o2.order_id
+                FROM boss_order o2
+                WHERE o2.customer_id = r.customer_id
+                ORDER BY o2.order_date DESC, o2.order_id DESC
+                LIMIT 1
+            )
+        )
+    ) AS customer_snapshot
+FROM ranked r
+JOIN boss_customer c
+  ON c.customer_id = r.customer_id
+JOIN region_tree rt
+  ON rt.region_id = r.region_id
+WHERE r.region_rank <= 3
+ORDER BY
+    rt.region_path,
+    r.region_rank,
+    r.customer_id;
+
+/* ------------------------------------------------------------------------
+   FINAL BOSS QUERY #2
+   monthly analytic + LAG + rolling window + dense rank
+   ------------------------------------------------------------------------ */
+WITH monthly AS (
+    SELECT
+        month_key,
+        segment,
+        ROUND(SUM(net_sales), 2) AS net_sales,
+        ROUND(SUM(paid_amount), 2) AS paid_amount,
+        ROUND(SUM(unpaid_amount), 2) AS unpaid_amount
+    FROM boss_monthly_stats
+    GROUP BY
+        month_key,
+        segment
+)
+SELECT
+    month_key,
+    segment,
+    net_sales,
+    paid_amount,
+    unpaid_amount,
+    LAG(net_sales, 1) OVER (
+        PARTITION BY segment
+        ORDER BY month_key
+    ) AS prev_month_net_sales,
+    ROUND(
+        net_sales
+        - IFNULL(
+            LAG(net_sales, 1) OVER (
+                PARTITION BY segment
+                ORDER BY month_key
+            ),
+            0
+        ),
+        2
+    ) AS mom_diff,
+    ROUND(
+        SUM(net_sales) OVER (
+            PARTITION BY segment
+            ORDER BY month_key
+            ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+        ),
+        2
+    ) AS rolling_3m_net_sales,
+    DENSE_RANK() OVER (
+        PARTITION BY month_key
+        ORDER BY net_sales DESC, segment
+    ) AS month_rank
+FROM monthly
+ORDER BY
+    month_key,
+    segment;
+
+/* ------------------------------------------------------------------------
+   FINAL BOSS QUERY #3
+   EXISTS + HAVING + JSON_ARRAYAGG + correlated subquery
+   ------------------------------------------------------------------------ */
+SELECT
+    c.customer_id,
+    c.customer_name,
+    JSON_OBJECT(
+        'segment', c.segment,
+        'region', (
+            SELECT r.region_name
+            FROM boss_region r
+            WHERE r.region_id = c.region_id
+        ),
+        'stats', JSON_OBJECT(
+            'orders', COUNT(DISTINCT o.order_id),
+            'gross', ROUND(SUM(o.grand_total), 2),
+            'avg', ROUND(AVG(o.grand_total), 2),
+            'paid_ratio', ROUND(SUM(o.paid_total) / NULLIF(SUM(o.grand_total), 0), 4)
+        ),
+        'latest_orders', JSON_ARRAYAGG(
+            JSON_OBJECT(
+                'order_no', o.order_no,
+                'date', DATE_FORMAT(o.order_date, '%Y-%m-%d'),
+                'grand_total', o.grand_total,
+                'risk', fn_order_risk(o.order_id)
+            )
+        )
+    ) AS customer_doc
+FROM boss_customer c
+JOIN boss_order o
+  ON o.customer_id = c.customer_id
+WHERE o.status <> 'CANCELLED'
+  AND EXISTS (
+      SELECT 1
+      FROM boss_order_item oi
+      WHERE oi.order_id = o.order_id
+        AND oi.discount_rate >= 0.0700
+  )
+GROUP BY
+    c.customer_id,
+    c.customer_name,
+    c.segment,
+    c.region_id
+HAVING COUNT(DISTINCT o.order_id) >= 2
+ORDER BY
+    SUM(o.grand_total) DESC,
+    c.customer_id
+LIMIT 10;
+
+/* ------------------------------------------------------------------------
+   FINAL BOSS QUERY #4
+   JSON_OBJECTAGG monthly pivot-ish document
+   ------------------------------------------------------------------------ */
+SELECT
+    x.month_key,
+    JSON_OBJECTAGG(x.segment, x.net_sales) AS segment_to_net_sales
+FROM (
+    SELECT
+        month_key,
+        segment,
+        ROUND(SUM(net_sales), 2) AS net_sales
+    FROM boss_monthly_stats
+    GROUP BY
+        month_key,
+        segment
+) x
+GROUP BY
+    x.month_key
+ORDER BY
+    x.month_key;
+
+/* ------------------------------------------------------------------------
+   FINAL BOSS QUERY #5
+   dynamic pivot by month
+   ------------------------------------------------------------------------ */
+CALL sp_dynamic_month_pivot('2024-01-01', '2025-12-31');
+
+/* ------------------------------------------------------------------------
+   OPTIONAL INSPECTION
+   ------------------------------------------------------------------------ */
+SELECT
+    o.order_id,
+    o.order_no,
+    o.status,
+    o.payment_status,
+    o.grand_total,
+    o.paid_total,
+    fn_order_risk(o.order_id) AS risk
+FROM boss_order o
+ORDER BY o.order_id DESC
+LIMIT 20;

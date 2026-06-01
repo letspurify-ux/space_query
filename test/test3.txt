@@ -1,0 +1,366 @@
+Prompt 프로시저 테스트3
+
+--------------------------------------------------------------------------------
+-- OQT (Oracle Query Tool) Compatibility Test Script (TOAD-like)
+-- 목적: 문장 분리/실행 문법 호환성 검증
+-- 권장: SERVEROUTPUT ON (가능하면)
+--------------------------------------------------------------------------------
+
+-- [A] SQL*Plus/TOAD 유틸(미지원이면 무시/스킵 가능)
+PROMPT === [A] 환경 설정 (미지원이면 스킵) ===
+SET SERVEROUTPUT ON SIZE UNLIMITED
+SET DEFINE OFF
+
+--------------------------------------------------------------------------------
+-- [B] 정리(CLEANUP): 있으면 지우고, 없으면 무시
+--------------------------------------------------------------------------------
+PROMPT === [B] Cleanup ===
+BEGIN
+  EXECUTE IMMEDIATE 'DROP PACKAGE oqt_pkg';
+EXCEPTION WHEN OTHERS THEN NULL;
+END;
+/
+
+BEGIN
+  EXECUTE IMMEDIATE 'DROP PROCEDURE oqt_p_basic';
+EXCEPTION WHEN OTHERS THEN NULL;
+END;
+/
+
+BEGIN
+  EXECUTE IMMEDIATE 'DROP FUNCTION oqt_f_add';
+EXCEPTION WHEN OTHERS THEN NULL;
+END;
+/
+
+BEGIN
+  EXECUTE IMMEDIATE 'DROP TABLE oqt_call_log PURGE';
+EXCEPTION WHEN OTHERS THEN NULL;
+END;
+/
+
+BEGIN
+  EXECUTE IMMEDIATE 'DROP TABLE oqt_emp PURGE';
+EXCEPTION WHEN OTHERS THEN NULL;
+END;
+/
+
+BEGIN
+  EXECUTE IMMEDIATE 'DROP SEQUENCE oqt_call_log_seq';
+EXCEPTION WHEN OTHERS THEN NULL;
+END;
+/
+
+--------------------------------------------------------------------------------
+-- [C] DDL + COMMENT + SEQUENCE 생성
+--------------------------------------------------------------------------------
+PROMPT === [C] DDL 생성 ===
+
+CREATE TABLE oqt_emp (
+  empno      NUMBER       CONSTRAINT oqt_emp_pk PRIMARY KEY,
+  ename      VARCHAR2(50)  NOT NULL,
+  deptno     NUMBER,
+  salary     NUMBER,
+  created_at DATE DEFAULT SYSDATE
+);
+
+COMMENT ON TABLE oqt_emp IS 'OQT test table';
+COMMENT ON COLUMN oqt_emp.ename IS 'employee name';
+
+CREATE TABLE oqt_call_log (
+  id         NUMBER PRIMARY KEY,
+  tag        VARCHAR2(50),
+  msg        VARCHAR2(4000),
+  n1         NUMBER,
+  created_at DATE DEFAULT SYSDATE
+);
+
+CREATE SEQUENCE oqt_call_log_seq START WITH 1 INCREMENT BY 1;
+
+--------------------------------------------------------------------------------
+-- [D] 기본 데이터 입력 + 커밋/롤백 테스트
+--------------------------------------------------------------------------------
+PROMPT === [D] DML/트랜잭션 ===
+
+INSERT INTO oqt_emp(empno, ename, deptno, salary) VALUES (100, 'ALICE', 10, 3000);
+INSERT INTO oqt_emp(empno, ename, deptno, salary) VALUES (101, 'BOB',   20, 2500);
+INSERT INTO oqt_emp(empno, ename, deptno, salary) VALUES (102, 'CHRIS', 10, 3200);
+
+COMMIT;
+
+-- 롤백 검증(임시 insert 후 rollback)
+INSERT INTO oqt_emp(empno, ename, deptno, salary) VALUES (199, 'TEMP', 99, 1);
+ROLLBACK;
+
+--------------------------------------------------------------------------------
+-- [E] SELECT 변형(힌트/주석/멀티라인) - 분류/파싱 테스트용
+--------------------------------------------------------------------------------
+PROMPT === [E] SELECT 변형(힌트/주석) ===
+
+-- 단일 라인 SELECT
+SELECT COUNT(*) AS cnt FROM oqt_emp;
+
+-- 힌트 + 주석 섞인 SELECT (SELECT 감지 로직 테스트)
+SELECT /*+ FULL(e) */  e.empno, e.ename
+FROM oqt_emp e
+WHERE e.deptno = 10
+ORDER BY e.empno;
+
+-- 주석으로 시작하는 SELECT (앞 주석 제거/판별 테스트)
+/* leading comment */
+SELECT empno, ename, salary
+FROM oqt_emp
+WHERE salary >= 2500
+ORDER BY salary DESC;
+
+--------------------------------------------------------------------------------
+-- [F] 함수/프로시저 생성 + 다양한 호출 문법
+--------------------------------------------------------------------------------
+PROMPT === [F] 함수/프로시저 생성 및 호출 ===
+
+CREATE OR REPLACE FUNCTION oqt_f_add(p_a NUMBER, p_b NUMBER)
+RETURN NUMBER
+IS
+BEGIN
+  RETURN NVL(p_a,0) + NVL(p_b,0);
+END;
+/
+SHOW ERRORS
+
+CREATE OR REPLACE PROCEDURE oqt_p_basic(
+  p_in_num   IN  NUMBER,
+  p_in_txt   IN  VARCHAR2 DEFAULT 'DEF',
+  p_out_txt  OUT VARCHAR2,
+  p_inout_n  IN OUT NUMBER
+)
+IS
+BEGIN
+  p_out_txt := 'IN_NUM='||p_in_num||', IN_TXT='||p_in_txt||', INOUT='||p_inout_n;
+  p_inout_n := NVL(p_inout_n,0) + p_in_num;
+
+  INSERT INTO oqt_call_log(id, tag, msg, n1)
+  VALUES(oqt_call_log_seq.NEXTVAL, 'P_BASIC', p_out_txt, p_in_num);
+
+  DBMS_OUTPUT.PUT_LINE('[oqt_p_basic] out='||p_out_txt||' / inout='||p_inout_n);
+END;
+/
+SHOW ERRORS
+
+-- 1) SELECT로 함수 호출
+SELECT oqt_f_add(10, 20) AS add_10_20 FROM dual;
+
+-- 2) BEGIN..END로 프로시저 호출(OUT/INOUT)
+DECLARE
+  v_out   VARCHAR2(4000);
+  v_inout NUMBER := 7;
+BEGIN
+  oqt_p_basic(5, 'HELLO', v_out, v_inout);
+  DBMS_OUTPUT.PUT_LINE('[caller] v_out='||v_out);
+  DBMS_OUTPUT.PUT_LINE('[caller] v_inout='||v_inout);
+END;
+/
+
+-- 3) CALL 문(TOAD/Oracle 지원) - OUT/INOUT는 문법 지원 여부 확인용
+--    네 툴이 CALL을 지원하지 않으면 에러가 날 수 있음.
+--    지원 목표라면 파서/바인드 처리 범위에 넣어야 함.
+DECLARE
+  v_out   VARCHAR2(4000);
+  v_inout NUMBER := 1;
+BEGIN
+  -- CALL 자체는 SQL 레벨 문장이지만, 워크시트에선 아래처럼 블록으로 감싸는 편이 안전
+  oqt_p_basic(2, 'CALL_STYLE', v_out, v_inout);
+  DBMS_OUTPUT.PUT_LINE('[call-style] out='||v_out||' inout='||v_inout);
+END;
+/
+
+-- 4) EXEC 문(TOAD/SQL*Plus 계열)
+--    미지원이면 스킵 가능.
+VARIABLE b_out   VARCHAR2(4000);
+VARIABLE b_inout NUMBER;
+EXEC :b_inout := 10;
+EXEC oqt_p_basic(3, 'EXEC_STYLE', :b_out, :b_inout);
+PRINT b_out
+PRINT b_inout
+
+--------------------------------------------------------------------------------
+-- [G] 패키지 + 오버로드 + 동적 SQL + 예외 처리
+--------------------------------------------------------------------------------
+PROMPT === [G] PACKAGE 테스트 ===
+
+CREATE OR REPLACE PACKAGE oqt_pkg AS
+  PROCEDURE log_msg(p_tag IN VARCHAR2, p_msg IN VARCHAR2, p_n1 IN NUMBER DEFAULT NULL);
+
+  PROCEDURE p_over(p_txt IN VARCHAR2);
+  PROCEDURE p_over(p_n  IN NUMBER);
+
+  FUNCTION  f_name(p_empno IN NUMBER) RETURN VARCHAR2;
+
+  PROCEDURE p_dyn_update(p_empno IN NUMBER, p_delta IN NUMBER);
+
+  -- REF CURSOR 반환(클라이언트가 커서 fetch 처리 가능한지)
+  PROCEDURE p_rc(p_deptno IN NUMBER, p_rc OUT SYS_REFCURSOR);
+
+  -- Implicit Result (12c+): DBMS_SQL.RETURN_RESULT 지원 여부 확인
+  PROCEDURE p_implicit(p_deptno IN NUMBER);
+END oqt_pkg;
+/
+SHOW ERRORS
+
+CREATE OR REPLACE PACKAGE BODY oqt_pkg AS
+  PROCEDURE log_msg(p_tag IN VARCHAR2, p_msg IN VARCHAR2, p_n1 IN NUMBER DEFAULT NULL) IS
+  BEGIN
+    INSERT INTO oqt_call_log(id, tag, msg, n1)
+    VALUES (oqt_call_log_seq.NEXTVAL, p_tag, p_msg, p_n1);
+  END;
+
+  PROCEDURE p_over(p_txt IN VARCHAR2) IS
+  BEGIN
+    DBMS_OUTPUT.PUT_LINE('[p_over txt] '||p_txt);
+    log_msg('P_OVER_TXT', p_txt, NULL);
+  END;
+
+  PROCEDURE p_over(p_n IN NUMBER) IS
+  BEGIN
+    DBMS_OUTPUT.PUT_LINE('[p_over num] '||p_n);
+    log_msg('P_OVER_NUM', 'num='||p_n, p_n);
+  END;
+
+  FUNCTION f_name(p_empno IN NUMBER) RETURN VARCHAR2 IS
+    v_name oqt_emp.ename%TYPE;
+  BEGIN
+    SELECT ename INTO v_name FROM oqt_emp WHERE empno = p_empno;
+    RETURN v_name;
+  EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+      RETURN NULL;
+  END;
+
+  PROCEDURE p_dyn_update(p_empno IN NUMBER, p_delta IN NUMBER) IS
+  BEGIN
+    EXECUTE IMMEDIATE
+      'UPDATE oqt_emp SET salary = NVL(salary,0) + :1 WHERE empno = :2'
+      USING p_delta, p_empno;
+    DBMS_OUTPUT.PUT_LINE('[p_dyn_update] updated empno='||p_empno||' delta='||p_delta||' rows='||SQL%ROWCOUNT);
+    log_msg('P_DYN_UPDATE', 'empno='||p_empno||', delta='||p_delta, p_delta);
+  END;
+
+  PROCEDURE p_rc(p_deptno IN NUMBER, p_rc OUT SYS_REFCURSOR) IS
+  BEGIN
+    OPEN p_rc FOR
+      SELECT empno, ename, deptno, salary
+      FROM oqt_emp
+      WHERE deptno = p_deptno
+      ORDER BY empno;
+    DBMS_OUTPUT.PUT_LINE('[p_rc] opened ref cursor for deptno='||p_deptno);
+  END;
+
+  PROCEDURE p_implicit(p_deptno IN NUMBER) IS
+    c SYS_REFCURSOR;
+  BEGIN
+    OPEN c FOR
+      SELECT empno, ename, deptno, salary
+      FROM oqt_emp
+      WHERE deptno = p_deptno
+      ORDER BY empno;
+
+    -- 클라이언트가 implicit result를 지원하면 결과셋이 바로 내려감
+    DBMS_SQL.RETURN_RESULT(c);
+    DBMS_OUTPUT.PUT_LINE('[p_implicit] returned implicit result for deptno='||p_deptno);
+  END;
+
+END oqt_pkg;
+/
+SHOW ERRORS
+
+-- 오버로드 호출
+BEGIN
+  oqt_pkg.p_over('TEXT_OVERLOAD');
+  oqt_pkg.p_over(12345);
+END;
+/
+
+-- 함수 호출
+SELECT oqt_pkg.f_name(100) AS name_100 FROM dual;
+
+-- 동적 SQL 업데이트 후 확인
+BEGIN
+  oqt_pkg.p_dyn_update(101, 100);
+END;
+/
+SELECT empno, ename, salary FROM oqt_emp WHERE empno=101;
+
+-- REF CURSOR OUT 파라미터: 클라이언트가 커서 fetch/표시를 지원하는지
+DECLARE
+  c SYS_REFCURSOR;
+  v_empno NUMBER;
+  v_ename VARCHAR2(50);
+  v_dept  NUMBER;
+  v_sal   NUMBER;
+BEGIN
+  oqt_pkg.p_rc(10, c);
+  LOOP
+    FETCH c INTO v_empno, v_ename, v_dept, v_sal;
+    EXIT WHEN c%NOTFOUND;
+    DBMS_OUTPUT.PUT_LINE('[rc-row] '||v_empno||','||v_ename||','||v_dept||','||v_sal);
+  END LOOP;
+  CLOSE c;
+END;
+/
+
+-- Implicit Result(12c+): 툴이 결과 그리드로 받을 수 있으면 OK
+BEGIN
+  oqt_pkg.p_implicit(10);
+END;
+/
+
+--------------------------------------------------------------------------------
+-- [H] 예외 처리 / RAISE_APPLICATION_ERROR / 0으로 나누기 등
+--------------------------------------------------------------------------------
+PROMPT === [H] 예외 처리 테스트 ===
+
+
+-- 위 블록은 의도적으로 실패해야 정상(툴이 에러 메시지/라인을 잘 보여주는지)
+
+--------------------------------------------------------------------------------
+-- [I] MERGE / PL/SQL bulk / 커밋 로그 확인
+--------------------------------------------------------------------------------
+PROMPT === [I] MERGE/BULK ===
+
+MERGE INTO oqt_emp t
+USING (SELECT 100 AS empno, 'ALICE2' AS ename, 10 AS deptno, 3333 AS salary FROM dual) s
+ON (t.empno = s.empno)
+WHEN MATCHED THEN
+  UPDATE SET t.ename = s.ename, t.salary = s.salary
+WHEN NOT MATCHED THEN
+  INSERT (empno, ename, deptno, salary) VALUES (s.empno, s.ename, s.deptno, s.salary);
+
+COMMIT;
+
+DECLARE
+  TYPE t_nums IS TABLE OF NUMBER;
+  l_ids t_nums := t_nums();
+BEGIN
+  SELECT id BULK COLLECT INTO l_ids FROM oqt_call_log ORDER BY id;
+
+  DBMS_OUTPUT.PUT_LINE('[call_log count]='||l_ids.COUNT);
+  IF l_ids.COUNT > 0 THEN
+    DBMS_OUTPUT.PUT_LINE('[first id]='||l_ids(1));
+  END IF;
+END;
+/
+
+--------------------------------------------------------------------------------
+-- [J] 최종 결과 확인
+--------------------------------------------------------------------------------
+PROMPT === [J] 최종 결과 확인 ===
+
+SELECT empno, ename, deptno, salary, TO_CHAR(created_at,'YYYY-MM-DD HH24:MI:SS') created_at
+FROM oqt_emp
+ORDER BY empno;
+
+SELECT id, tag, SUBSTR(msg,1,80) AS msg80, n1, TO_CHAR(created_at,'YYYY-MM-DD HH24:MI:SS') created_at
+FROM oqt_call_log
+ORDER BY id;
+
+PROMPT === DONE ===
+--------------------------------------------------------------------------------

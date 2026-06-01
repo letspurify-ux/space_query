@@ -1,0 +1,1255 @@
+-- ============================================================
+-- MariaDB ULTRA FINAL BOSS
+-- Target: MariaDB 10.6+
+-- Purpose:
+--   - DELIMITER 변경
+--   - trigger / function / procedure / cursor / handler / diagnostics
+--   - savepoint / rollback to savepoint / resignal
+--   - prepare / execute / temporary table / upsert
+--   - recursive CTE / window function / JSON_TABLE
+--   - multi result sets
+--   - handled fault injection
+-- ============================================================
+
+DROP DATABASE IF EXISTS mdb_ultra_boss;
+
+CREATE DATABASE mdb_ultra_boss CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+USE mdb_ultra_boss;
+
+#SET NAMES utf8mb4;
+
+SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+SET SESSION sql_mode = 'STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION';
+
+SET SESSION group_concat_max_len = 1024 * 1024;
+
+# ============================================================
+# 1) Schema
+# ============================================================
+
+CREATE TABLE org_unit (
+    org_unit_id        INT          NOT NULL AUTO_INCREMENT,
+    parent_org_unit_id INT          NULL,
+    unit_code          VARCHAR(30)  NOT NULL,
+    unit_name          VARCHAR(100) NOT NULL,
+    PRIMARY KEY (org_unit_id),
+    UNIQUE KEY uk_org_unit_code(unit_code),
+    CONSTRAINT fk_org_unit_parent FOREIGN KEY (parent_org_unit_id) REFERENCES org_unit(org_unit_id)
+)
+ENGINE = InnoDB;
+
+CREATE TABLE app_user (
+    user_id         INT                                  NOT NULL AUTO_INCREMENT,
+    org_unit_id     INT                                  NOT NULL,
+    manager_user_id INT                                  NULL,
+    user_code       VARCHAR(30)                          NOT NULL,
+    display_name    VARCHAR(100)                         NOT NULL,
+    email           VARCHAR(200)                         NOT NULL,
+    hired_on        DATE                                 NOT NULL,
+    active_flag     TINYINT(1)                           NOT NULL DEFAULT 1,
+    PRIMARY KEY (user_id),
+    UNIQUE KEY uk_app_user_code(user_code),
+    UNIQUE KEY uk_app_user_email(email),
+    KEY             ix_app_user_org(org_unit_id),
+    KEY             ix_app_user_manager(manager_user_id),
+    CONSTRAINT fk_app_user_org FOREIGN KEY (org_unit_id) REFERENCES org_unit(org_unit_id),
+    CONSTRAINT fk_app_user_manager FOREIGN KEY (manager_user_id) REFERENCES app_user(user_id)
+)
+ENGINE = InnoDB;
+
+CREATE TABLE project (
+    project_id    INT                             NOT NULL AUTO_INCREMENT,
+    project_code  VARCHAR(30)                     NOT NULL,
+    project_name  VARCHAR(200)                    NOT NULL,
+    owner_user_id INT                             NOT NULL,
+    spec_json     LONGTEXT                        NOT NULL,
+    created_at    DATETIME(6)                     NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (project_id),
+    UNIQUE KEY uk_project_code(project_code),
+    KEY           ix_project_owner(owner_user_id),
+    CONSTRAINT fk_project_owner FOREIGN KEY (owner_user_id) REFERENCES app_user(user_id)
+)
+ENGINE = InnoDB;
+
+CREATE TABLE project_member (
+    project_id     INT                             NOT NULL,
+    user_id        INT                             NOT NULL,
+    role_name      VARCHAR(40)                     NOT NULL,
+    allocation_pct DECIMAL(5, 2)                   NOT NULL,
+    joined_on      DATE                            NOT NULL,
+    PRIMARY KEY (project_id, user_id),
+    KEY            ix_project_member_user(user_id),
+    CONSTRAINT fk_project_member_project FOREIGN KEY (project_id) REFERENCES project(project_id),
+    CONSTRAINT fk_project_member_user FOREIGN KEY (user_id) REFERENCES app_user(user_id)
+)
+ENGINE = InnoDB;
+
+CREATE TABLE sprint (
+    sprint_id  INT                           NOT NULL AUTO_INCREMENT,
+    project_id INT                           NOT NULL,
+    sprint_no  INT                           NOT NULL,
+    start_date DATE                          NOT NULL,
+    end_date   DATE                          NOT NULL,
+    PRIMARY KEY (sprint_id),
+    UNIQUE KEY uk_sprint_project_no(project_id, sprint_no),
+    KEY        ix_sprint_project(project_id),
+    CONSTRAINT fk_sprint_project FOREIGN KEY (project_id) REFERENCES project(project_id)
+)
+ENGINE = InnoDB;
+
+CREATE TABLE work_item (
+    item_id          BIGINT                                  NOT NULL AUTO_INCREMENT,
+    project_id       INT                                     NOT NULL,
+    sprint_id        INT                                     NOT NULL,
+    assignee_user_id INT                                     NOT NULL,
+    reporter_user_id INT                                     NOT NULL,
+    item_code        VARCHAR(50)                             NOT NULL,
+    title            VARCHAR(200)                            NOT NULL,
+    status           VARCHAR(20)                             NOT NULL,
+    points           INT                                     NOT NULL,
+    detail_doc       LONGTEXT                                NOT NULL,
+    revision_no      INT                                     NOT NULL DEFAULT 0,
+    created_at       DATETIME(6)                             NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at       DATETIME(6)                             NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (item_id),
+    UNIQUE KEY uk_work_item_code(item_code),
+    KEY              ix_work_item_project(project_id),
+    KEY              ix_work_item_sprint(sprint_id),
+    KEY              ix_work_item_assignee(assignee_user_id),
+    KEY              ix_work_item_status(status),
+    CONSTRAINT fk_work_item_project FOREIGN KEY (project_id) REFERENCES project(project_id),
+    CONSTRAINT fk_work_item_sprint FOREIGN KEY (sprint_id) REFERENCES sprint(sprint_id),
+    CONSTRAINT fk_work_item_assignee FOREIGN KEY (assignee_user_id) REFERENCES app_user(user_id),
+    CONSTRAINT fk_work_item_reporter FOREIGN KEY (reporter_user_id) REFERENCES app_user(user_id)
+)
+ENGINE = InnoDB;
+
+CREATE TABLE work_event (
+    event_id      BIGINT                             NOT NULL AUTO_INCREMENT,
+    item_id       BIGINT                             NOT NULL,
+    actor_user_id INT                                NOT NULL,
+    event_type    VARCHAR(20)                        NOT NULL,
+    event_at      DATETIME(6)                        NOT NULL,
+    delta_hours   DECIMAL(7, 2)                      NOT NULL,
+    note          VARCHAR(200)                       NULL,
+    event_doc     LONGTEXT                           NOT NULL,
+    PRIMARY KEY (event_id),
+    KEY           ix_work_event_item(item_id),
+    KEY           ix_work_event_actor(actor_user_id),
+    KEY           ix_work_event_at(event_at),
+    KEY           ix_work_event_type(event_type),
+    CONSTRAINT fk_work_event_item FOREIGN KEY (item_id) REFERENCES work_item(item_id),
+    CONSTRAINT fk_work_event_actor FOREIGN KEY (actor_user_id) REFERENCES app_user(user_id)
+)
+ENGINE = InnoDB;
+
+CREATE TABLE monthly_project_stats (
+    ym                CHAR(7)                                       NOT NULL,
+    project_id        INT                                           NOT NULL,
+    item_count        INT                                           NOT NULL,
+    event_count       INT                                           NOT NULL,
+    total_hours       DECIMAL(12, 2)                                NOT NULL,
+    avg_item_hours    DECIMAL(12, 2)                                NOT NULL,
+    completed_items   INT                                           NOT NULL,
+    blocked_items     INT                                           NOT NULL,
+    top_actor_user_id INT                                           NULL,
+    anomaly_count     INT                                           NOT NULL,
+    rebuilt_at        DATETIME(6)                                   NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (ym, project_id),
+    KEY               ix_monthly_stats_project(project_id),
+    KEY               ix_monthly_stats_top_actor(top_actor_user_id),
+    CONSTRAINT fk_monthly_stats_project FOREIGN KEY (project_id) REFERENCES project(project_id),
+    CONSTRAINT fk_monthly_stats_top_actor FOREIGN KEY (top_actor_user_id) REFERENCES app_user(user_id)
+)
+ENGINE = InnoDB;
+
+CREATE TABLE audit_log (
+    audit_id    BIGINT                                           NOT NULL AUTO_INCREMENT,
+    entity_name VARCHAR(40)                                      NOT NULL,
+    entity_id   BIGINT                                           NOT NULL,
+    action_name VARCHAR(40)                                      NOT NULL,
+    payload     LONGTEXT                                         NOT NULL,
+    created_at  DATETIME(6)                                      NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (audit_id),
+    KEY         ix_audit_entity(entity_name, entity_id),
+    KEY         ix_audit_action_created(action_name, created_at)
+)
+ENGINE = InnoDB;
+
+CREATE TABLE qa_error_capture (
+    capture_id    BIGINT                                            NOT NULL AUTO_INCREMENT,
+    phase_name    VARCHAR(40)                                       NOT NULL,
+    sqlstate_char CHAR(5)                                           NOT NULL,
+    mysql_errno   INT                                               NOT NULL,
+    message_text  VARCHAR(512)                                      NOT NULL,
+    ctx           LONGTEXT                                          NOT NULL,
+    created_at    DATETIME(6)                                       NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (capture_id),
+    KEY           ix_qa_error_phase_created(phase_name, created_at)
+)
+ENGINE = InnoDB;
+
+/* ============================================================
+   2) View
+   ============================================================ */
+
+CREATE OR REPLACE VIEW v_item_rollup AS
+    SELECT wi.item_id,
+        wi.project_id,
+        wi.sprint_id,
+        wi.assignee_user_id,
+        wi.item_code,
+        wi.status,
+        wi.points,
+        COUNT(we.event_id) AS event_count,
+        ROUND(COALESCE(SUM(we.delta_hours), 0), 2) AS total_hours,
+        MAX(we.event_at) AS last_event_at
+    FROM work_item wi
+    LEFT JOIN work_event we
+        ON we.item_id = wi.item_id
+    GROUP BY wi.item_id,
+        wi.project_id,
+        wi.sprint_id,
+        wi.assignee_user_id,
+        wi.item_code,
+        wi.status,
+        wi.points;
+
+-- ============================================================
+-- 3) Triggers + Function
+-- ============================================================
+
+DELIMITER $$
+
+CREATE TRIGGER bi_work_item
+    BEFORE INSERT
+    ON work_item
+    FOR EACH ROW
+BEGIN
+    IF NEW.STATUS NOT IN ('NEW', 'IN_PROGRESS', 'REVIEW', 'DONE', 'BLOCKED') THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'invalid work_item.status';
+    END IF;
+    IF NEW.points IS NULL
+            OR NEW.points <= 0 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'work_item.points must be > 0';
+    END IF;
+    IF NEW.detail_doc IS NULL
+            OR JSON_VALID(NEW.detail_doc) = 0 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'work_item.detail_doc must be valid JSON';
+    END IF;
+    SET NEW.title = TRIM(NEW.title);
+    IF CHAR_LENGTH(NEW.title) = 0 THEN
+        SET NEW.title = CONCAT('UNTITLED-', NEW.item_code);
+    END IF;
+    SET NEW.created_at = COALESCE(NEW.created_at, CURRENT_TIMESTAMP(6));
+    SET NEW.updated_at = COALESCE(NEW.updated_at, NEW.created_at);
+END$$
+
+CREATE TRIGGER bu_work_item
+    BEFORE UPDATE
+    ON work_item
+    FOR EACH ROW
+BEGIN
+    IF NEW.STATUS NOT IN ('NEW', 'IN_PROGRESS', 'REVIEW', 'DONE', 'BLOCKED') THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'invalid work_item.status on update';
+    END IF;
+    IF NEW.detail_doc IS NULL
+            OR JSON_VALID(NEW.detail_doc) = 0 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'work_item.detail_doc must remain valid JSON';
+    END IF;
+    SET NEW.updated_at = CURRENT_TIMESTAMP(6);
+    SET NEW.revision_no = OLD.revision_no + 1;
+END$$
+
+CREATE TRIGGER ai_work_item
+    AFTER INSERT
+    ON work_item
+    FOR EACH ROW
+BEGIN
+    INSERT INTO audit_log (entity_name, entity_id, action_name, payload)
+    VALUES ('work_item', NEW.item_id, 'WORK_ITEM_INSERT', JSON_OBJECT('item_code', NEW.item_code, 'status', NEW.status, 'points', NEW.points, 'revision_no', NEW.revision_no));
+END$$
+
+CREATE TRIGGER au_work_item
+    AFTER UPDATE
+    ON work_item
+    FOR EACH ROW
+BEGIN
+    INSERT INTO audit_log (entity_name, entity_id, action_name, payload)
+    VALUES ('work_item', NEW.item_id, 'WORK_ITEM_UPDATE', JSON_OBJECT('item_code', NEW.item_code, 'old_status', OLD.status, 'new_status', NEW.status, 'old_revision_no', OLD.revision_no, 'new_revision_no', NEW.revision_no, 'updated_at', DATE_FORMAT(NEW.updated_at, '%Y-%m-%d %H:%i:%s.%f')));
+END$$
+
+CREATE TRIGGER bi_work_event
+    BEFORE INSERT
+    ON work_event
+    FOR EACH ROW
+BEGIN
+    IF NEW.event_type NOT IN ('CREATED', 'STARTED', 'PROGRESSED', 'REVIEWED', 'CLOSED') THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'invalid work_event.event_type';
+    END IF;
+    IF NEW.delta_hours IS NULL
+            OR NEW.delta_hours < 0
+            OR NEW.delta_hours > 24 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'work_event.delta_hours must be between 0 and 24';
+    END IF;
+    IF NEW.event_doc IS NULL
+            OR JSON_VALID(NEW.event_doc) = 0 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'work_event.event_doc must be valid JSON';
+    END IF;
+    IF NEW.note IS NULL
+            OR CHAR_LENGTH(TRIM(NEW.note)) = 0 THEN
+        SET NEW.note = CONCAT('auto-note:', NEW.actor_user_id, ':', DATE_FORMAT(NEW.event_at, '%Y%m%d%H%i%s'));
+    END IF;
+END$$
+
+CREATE TRIGGER ai_work_event
+    AFTER INSERT
+    ON work_event
+    FOR EACH ROW
+BEGIN
+    INSERT INTO audit_log (entity_name, entity_id, action_name, payload)
+    VALUES ('work_event', NEW.event_id, 'WORK_EVENT_INSERT', JSON_OBJECT('item_id', NEW.item_id, 'actor_user_id', NEW.actor_user_id, 'event_type', NEW.event_type, 'delta_hours', NEW.delta_hours, 'event_at', DATE_FORMAT(NEW.event_at, '%Y-%m-%d %H:%i:%s.%f'), 'note', NEW.note));
+END$$
+
+CREATE FUNCTION fn_complexity_band(
+    p_points INT,
+    p_hours DECIMAL(12, 2)
+)
+RETURNS VARCHAR(20)
+DETERMINISTIC
+BEGIN
+    DECLARE v_score DECIMAL(12, 4);
+    SET v_score = IFNULL(p_hours / NULLIF(p_points, 0), 0);
+    RETURN
+    CASE
+        WHEN v_score >= 2.50 THEN
+            'critical'
+        WHEN v_score >= 1.25 THEN
+            'watch'
+        ELSE
+            'ok'
+    END;
+END$$
+
+DELIMITER ;
+
+-- ============================================================
+-- 4) Procedures
+-- ============================================================
+
+DELIMITER //
+
+CREATE PROCEDURE sp_assert_eq_bigint(
+    IN p_expected BIGINT,
+    IN p_actual BIGINT,
+    IN p_message VARCHAR(255)
+)
+BEGIN
+    IF NOT (p_expected <=> p_actual) THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = p_message;
+    END IF;
+END//
+
+CREATE PROCEDURE sp_assert_eq_decimal(
+    IN p_expected DECIMAL(20, 6),
+    IN p_actual DECIMAL(20, 6),
+    IN p_scale INT,
+    IN p_message VARCHAR(255)
+)
+BEGIN
+    IF ROUND(IFNULL(p_expected, 0), p_scale) <> ROUND(IFNULL(p_actual, 0), p_scale) THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = p_message;
+    END IF;
+END//
+
+CREATE PROCEDURE sp_seed_ultra_data()
+BEGIN
+    DECLARE v_project_id INT DEFAULT 1;
+    DECLARE v_sprint_no INT;
+    DECLARE v_seq INT;
+    DECLARE v_sprint_id INT;
+    DECLARE v_item_id BIGINT;
+    DECLARE v_owner_user_id INT;
+    DECLARE v_assignee_user_id INT;
+    DECLARE v_project_code VARCHAR(30);
+    DECLARE v_start_date DATE;
+    DECLARE v_final_status VARCHAR(20);
+    DECLARE v_last_event_type VARCHAR(20);
+    INSERT INTO org_unit (parent_org_unit_id, unit_code, unit_name)
+    VALUES (NULL, 'HQ', 'Headquarters'),
+        (1, 'ENG', 'Engineering'),
+        (2, 'DBTOOLS', 'DB Tools'),
+        (2, 'ANALYTICS', 'Analytics'),
+        (2, 'QA', 'Quality Assurance');
+    INSERT INTO app_user (org_unit_id, manager_user_id, user_code, display_name, email, hired_on, active_flag)
+    VALUES (1, NULL, 'U001', 'Ari Kim', 'ari.kim@example.com', '2021-01-10', 1),
+        (2, 1, 'U002', 'Bora Park', 'bora.park@example.com', '2021-03-10', 1),
+        (3, 2, 'U003', 'Chan Lee', 'chan.lee@example.com', '2021-05-11', 1),
+        (3, 2, 'U004', 'Duri Choi', 'duri.choi@example.com', '2021-06-12', 1),
+        (4, 2, 'U005', 'Eun Seo', 'eun.seo@example.com', '2021-07-13', 1),
+        (5, 2, 'U006', 'Fia Han', 'fia.han@example.com', '2021-08-14', 1),
+        (3, 2, 'U007', 'Garam Yoon', 'garam.yoon@example.com', '2021-09-15', 1),
+        (2, 2, 'U008', 'Haru Jung', 'haru.jung@example.com', '2021-10-16', 1);
+    INSERT INTO project (project_code, project_name, owner_user_id, spec_json)
+    VALUES ('ORBIT', 'Maria Query Runner Core', 2, JSON_OBJECT('tier', 'core', 'labels', JSON_ARRAY('parser', 'runner', 'optimizer'), 'limits', JSON_OBJECT('target_ms', 50, 'batch', 1000))),
+        ('QUASAR', 'Window + CTE Analytics Pack', 3, JSON_OBJECT('tier', 'analytics', 'labels', JSON_ARRAY('window', 'cte', 'grid'), 'limits', JSON_OBJECT('target_ms', 75, 'batch', 800))),
+        ('NEBULA', 'JSON + Routine Integration', 5, JSON_OBJECT('tier', 'integration', 'labels', JSON_ARRAY('json', 'procedure', 'trigger'), 'limits', JSON_OBJECT('target_ms', 90, 'batch', 600))),
+        ('CHAOS', 'Recovery + Fault Tolerance Pack', 4, JSON_OBJECT('tier', 'chaos', 'labels', JSON_ARRAY('savepoint', 'recovery', 'diagnostics'), 'limits', JSON_OBJECT('target_ms', 120, 'batch', 500)));
+    INSERT INTO project_member (project_id, user_id, role_name, allocation_pct, joined_on)
+    VALUES (1, 2, 'lead', 60.00, '2025-01-01'),
+        (1, 3, 'dev', 70.00, '2025-01-01'),
+        (1, 4, 'dev', 55.00, '2025-01-01'),
+        (1, 6, 'qa', 30.00, '2025-01-01'),
+        (2, 3, 'lead', 55.00, '2025-01-01'),
+        (2, 4, 'dev', 60.00, '2025-01-01'),
+        (2, 7, 'dev', 50.00, '2025-01-01'),
+        (2, 6, 'qa', 25.00, '2025-01-01'),
+        (3, 5, 'lead', 50.00, '2025-01-01'),
+        (3, 3, 'dev', 40.00, '2025-01-01'),
+        (3, 8, 'ops', 35.00, '2025-01-01'),
+        (3, 6, 'qa', 30.00, '2025-01-01'),
+        (4, 4, 'lead', 65.00, '2025-01-01'),
+        (4, 7, 'dev', 55.00, '2025-01-01'),
+        (4, 8, 'ops', 45.00, '2025-01-01'),
+        (4, 6, 'qa', 35.00, '2025-01-01')
+        ON DUPLICATE KEY UPDATE role_name = VALUES(role_name),
+        allocation_pct = VALUES(allocation_pct),
+        joined_on = VALUES(joined_on);
+    SET v_project_id = 1;
+    WHILE v_project_id <= 4 DO
+        SET v_sprint_no = 1;
+        WHILE v_sprint_no <= 3 DO
+            SET v_start_date =
+                CASE v_sprint_no
+                    WHEN 1 THEN
+                        '2025-01-01'
+                    WHEN 2 THEN
+                        '2025-02-01'
+                    ELSE
+                        '2025-03-01'
+                END;
+            INSERT INTO sprint (project_id, sprint_no, start_date, end_date)
+            VALUES (v_project_id, v_sprint_no, v_start_date, DATE_ADD(v_start_date, INTERVAL 13 DAY));
+            SET v_sprint_no = v_sprint_no + 1;
+        END WHILE;
+        SET v_project_id = v_project_id + 1;
+    END WHILE;
+    SET v_project_id = 1;
+    WHILE v_project_id <= 4 DO
+        SELECT p.project_code,
+            p.owner_user_id
+        INTO v_project_code,
+            v_owner_user_id
+        FROM project p
+        WHERE p.project_id = v_project_id;
+        SET v_seq = 1;
+        WHILE v_seq <= 12 DO
+            SET v_sprint_id = ((v_project_id - 1) * 3) + (((v_seq - 1) MOD 3) + 1);
+            SELECT s.start_date
+            INTO v_start_date
+            FROM sprint s
+            WHERE s.sprint_id = v_sprint_id;
+            SET v_assignee_user_id = ((v_seq - 1) MOD 6) + 3;
+            SET v_final_status =
+                CASE
+                    WHEN MOD(v_seq, 7) = 0 THEN
+                        'BLOCKED'
+                    WHEN MOD(v_seq, 5) = 0 THEN
+                        'REVIEW'
+                    ELSE
+                        'DONE'
+                END;
+            SET v_last_event_type =
+                CASE
+                    WHEN v_final_status = 'REVIEW' THEN
+                        'REVIEWED'
+                    WHEN v_final_status = 'BLOCKED' THEN
+                        'PROGRESSED'
+                    ELSE
+                        'CLOSED'
+                END;
+            INSERT INTO work_item (project_id, sprint_id, assignee_user_id, reporter_user_id, item_code, title, status, points, detail_doc)
+            VALUES (v_project_id, v_sprint_id, v_assignee_user_id, v_owner_user_id, CONCAT(v_project_code, '-', LPAD(v_seq, 3, '0')), CONCAT('   ', v_project_code, ' item ', LPAD(v_seq, 2, '0'), '   '), 'NEW', ((v_project_id * v_seq) MOD 8) + 1, JSON_OBJECT('seq', v_seq, 'project_code', v_project_code, 'components', JSON_ARRAY('parser', 'runner', 
+                            CASE
+                                WHEN MOD(v_seq, 2) = 0 THEN
+                                    'json'
+                                ELSE
+                                    'window'
+                            END
+            ), 'labels', JSON_ARRAY(CONCAT('p', v_project_id), CONCAT('s', ((v_seq - 1) MOD 3) + 1), 
+                            CASE
+                                WHEN MOD(v_seq, 2) = 0 THEN
+                                    'even'
+                                ELSE
+                                    'odd'
+                            END
+            ), 'estimate', JSON_OBJECT('hours', ((v_project_id * v_seq) MOD 8) + 2, 'risk', 
+                            CASE
+                                WHEN MOD(v_seq, 4) = 0 THEN
+                                    'high'
+                                ELSE
+                                    'normal'
+                            END
+            )));
+            SET v_item_id = LAST_INSERT_ID();
+            INSERT INTO work_event (item_id, actor_user_id, event_type, event_at, delta_hours, note, event_doc)
+            VALUES (v_item_id, v_owner_user_id, 'CREATED', CONCAT(v_start_date, ' 09:00:00.000000'), 0.25, NULL, JSON_OBJECT('stage', 'created', 'meta', JSON_OBJECT('source', 'seed', 'seq', v_seq), 'tags', JSON_ARRAY('create', v_project_code)));
+            INSERT INTO work_event (item_id, actor_user_id, event_type, event_at, delta_hours, note, event_doc)
+            VALUES (v_item_id, v_assignee_user_id, 'STARTED', CONCAT(DATE_ADD(v_start_date, INTERVAL 1 DAY), ' 10:15:00.000000'), ((v_seq + v_project_id) MOD 5) + 0.50, '   ', JSON_OBJECT('stage', 'started', 'meta', JSON_OBJECT('source', 'seed', 'seq', v_seq), 'tags', JSON_ARRAY('start', CONCAT('u', v_assignee_user_id))));
+            INSERT INTO work_event (item_id, actor_user_id, event_type, event_at, delta_hours, note, event_doc)
+            VALUES (v_item_id, v_assignee_user_id, 'PROGRESSED', CONCAT(DATE_ADD(v_start_date, INTERVAL 2 DAY), ' 14:30:00.000000'), ((v_seq * v_project_id) MOD 7) + 1.25, CONCAT('진행-', v_project_code, '-', LPAD(v_seq, 2, '0'), ' 🚀'), JSON_OBJECT('stage', 'progressed', 'meta', JSON_OBJECT('source', 'seed', 'seq', v_seq), 'tags', JSON_ARRAY('progress', 
+                            CASE
+                                WHEN MOD(v_seq, 3) = 0 THEN
+                                    'burst'
+                                ELSE
+                                    'steady'
+                            END
+            )));
+            INSERT INTO work_event (item_id, actor_user_id, event_type, event_at, delta_hours, note, event_doc)
+            VALUES (v_item_id, v_owner_user_id, v_last_event_type, CONCAT(DATE_ADD(v_start_date, INTERVAL 3 DAY), ' 18:45:00.000000'), (MOD(v_seq, 3) + 0.75), CONCAT('마감/리뷰-', v_final_status), JSON_OBJECT('stage', LOWER(v_final_status), 'meta', JSON_OBJECT('owner', v_owner_user_id, 'seq', v_seq), 'tags', JSON_ARRAY('final', LOWER(v_final_status))));
+            UPDATE work_item
+            SET status = 'IN_PROGRESS',
+                detail_doc = JSON_SET(detail_doc, '$.phase', 'in_progress')
+            WHERE item_id = v_item_id;
+            UPDATE work_item
+            SET status = v_final_status,
+                detail_doc = JSON_SET(detail_doc, '$.phase', LOWER(v_final_status), '$.closed_by', v_owner_user_id)
+            WHERE item_id = v_item_id;
+            SET v_seq = v_seq + 1;
+        END WHILE;
+        SET v_project_id = v_project_id + 1;
+    END WHILE;
+END//
+
+CREATE PROCEDURE sp_fault_injection_handled()
+BEGIN
+    DECLARE v_step VARCHAR(50) DEFAULT NULL;
+    DECLARE v_sqlstate CHAR(5);
+    DECLARE v_errno INT;
+    DECLARE v_message TEXT;
+    DECLARE user_error CONDITION
+    FOR SQLSTATE '45000';
+    DECLARE CONTINUE HANDLER FOR user_error
+        BEGIN
+            GET DIAGNOSTICS CONDITION 1 v_sqlstate = RETURNED_SQLSTATE,
+            v_errno = MYSQL_ERRNO,
+            v_message = MESSAGE_TEXT;
+            INSERT INTO qa_error_capture (phase_name, sqlstate_char, mysql_errno, message_text, ctx)
+            VALUES ('fault_injection', v_sqlstate, v_errno, LEFT(v_message, 512), JSON_OBJECT('step', v_step));
+        END;
+    SET v_step = 'bad_work_item_json';
+    INSERT INTO work_item (project_id, sprint_id, assignee_user_id, reporter_user_id, item_code, title, status, points, detail_doc)
+    VALUES (1, 1, 3, 2, 'BAD-JSON-001', 'broken item', 'NEW', 3, 'not valid json');
+    SET v_step = 'bad_work_item_status_update';
+    UPDATE work_item
+    SET status = 'NOT_A_STATUS'
+    WHERE item_id = 1;
+    SET v_step = 'bad_work_event_type_and_hours';
+    INSERT INTO work_event (item_id, actor_user_id, event_type, event_at, delta_hours, note, event_doc)
+    VALUES (1, 3, 'BROKEN_EVENT', '2025-01-02 11:00:00.000000', 99.99, NULL, '{]');
+END//
+
+CREATE PROCEDURE sp_upsert_one_month_stat(
+    IN p_ym CHAR(7),
+    IN p_project_id INT
+)
+BEGIN
+    INSERT INTO monthly_project_stats (ym, project_id, item_count, event_count, total_hours, avg_item_hours, completed_items, blocked_items, top_actor_user_id, anomaly_count, rebuilt_at)
+    SELECT t.ym,
+        t.project_id,
+        t.item_count,
+        t.event_count,
+        t.total_hours,
+        t.avg_item_hours,
+        t.completed_items,
+        t.blocked_items,
+        t.top_actor_user_id,
+        t.anomaly_count,
+        CURRENT_TIMESTAMP(6)
+    FROM tmp_monthly_stats t
+    WHERE t.ym = p_ym
+        AND t.project_id = p_project_id
+        ON DUPLICATE KEY UPDATE item_count = VALUES(item_count),
+        event_count = VALUES(event_count),
+        total_hours = VALUES(total_hours),
+        avg_item_hours = VALUES(avg_item_hours),
+        completed_items = VALUES(completed_items),
+        blocked_items = VALUES(blocked_items),
+        top_actor_user_id = VALUES(top_actor_user_id),
+        anomaly_count = VALUES(anomaly_count),
+        rebuilt_at = VALUES(rebuilt_at);
+END//
+
+CREATE PROCEDURE sp_rebuild_monthly_stats(
+    IN p_from_ym CHAR(7),
+    IN p_to_ym CHAR(7)
+)
+BEGIN
+    DECLARE v_done INT DEFAULT 0;
+    DECLARE v_ym CHAR(7);
+    DECLARE v_project_id INT;
+    DECLARE v_project_code VARCHAR(30);
+    DECLARE cur CURSOR FOR
+        SELECT t.ym,
+        t.project_id,
+        p.project_code
+        FROM tmp_monthly_stats t
+        JOIN project p
+            ON p.project_id = t.project_id
+        ORDER BY t.ym,
+            t.project_id;
+    DECLARE CONTINUE HANDLER FOR NOT FOUND
+        SET v_done = 1;
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+        BEGIN
+            ROLLBACK;
+            RESIGNAL;
+        END;
+    DROP TEMPORARY TABLE IF EXISTS tmp_monthly_stats;
+    SET @SQL = CONCAT('CREATE TEMPORARY TABLE tmp_monthly_stats AS ', 'SELECT m.ym, m.project_id, m.item_count, m.event_count, m.total_hours, m.avg_item_hours, ', '       m.completed_items, m.blocked_items, at.top_actor_user_id, m.anomaly_count ', 'FROM (', '    SELECT DATE_FORMAT(we.event_at, ''%Y-%m'') AS ym, wi.project_id, ', '           COUNT(DISTINCT wi.item_id) AS item_count, ', '           COUNT(*) AS event_count, ', '           ROUND(SUM(we.delta_hours), 2) AS total_hours, ', '           ROUND(SUM(we.delta_hours) / NULLIF(COUNT(DISTINCT wi.item_id), 0), 2) AS avg_item_hours, ', '           COUNT(DISTINCT CASE WHEN wi.status = ''DONE'' THEN wi.item_id END) AS completed_items, ', '           COUNT(DISTINCT CASE WHEN wi.status = ''BLOCKED'' THEN wi.item_id END) AS blocked_items, ', '           COUNT(DISTINCT CASE WHEN we.delta_hours >= 6 THEN wi.item_id END) AS anomaly_count ', '    FROM work_event we ', '    JOIN work_item wi ON wi.item_id = we.item_id ', '    WHERE DATE_FORMAT(we.event_at, ''%Y-%m'') BETWEEN ', QUOTE(p_from_ym), ' AND ', QUOTE(p_to_ym), ' ', '    GROUP BY DATE_FORMAT(we.event_at, ''%Y-%m''), wi.project_id', ') m ', 'LEFT JOIN (', '    SELECT ranked.ym, ranked.project_id, ranked.actor_user_id AS top_actor_user_id ', '    FROM (', '        SELECT x.ym, x.project_id, x.actor_user_id, x.actor_hours, ', '               ROW_NUMBER() OVER (PARTITION BY x.ym, x.project_id ORDER BY x.actor_hours DESC, x.actor_user_id) AS rn ', '        FROM (', '            SELECT DATE_FORMAT(we.event_at, ''%Y-%m'') AS ym, wi.project_id, we.actor_user_id, ROUND(SUM(we.delta_hours), 2) AS actor_hours ', '            FROM work_event we ', '            JOIN work_item wi ON wi.item_id = we.item_id ', '            WHERE DATE_FORMAT(we.event_at, ''%Y-%m'') BETWEEN ', QUOTE(p_from_ym), ' AND ', QUOTE(p_to_ym), ' ', '            GROUP BY DATE_FORMAT(we.event_at, ''%Y-%m''), wi.project_id, we.actor_user_id', '        ) x', '    ) ranked ', '    WHERE ranked.rn = 1', ') at ON at.ym = m.ym AND at.project_id = m.project_id');
+    PREPARE stmt
+    FROM @sql;
+    EXECUTE stmt;
+    DEALLOCATE PREPARE stmt;
+    START TRANSACTION;
+    OPEN cur;
+    read_loop: LOOP
+        FETCH cur
+        INTO v_ym,
+            v_project_id,
+            v_project_code;
+        IF v_done = 1 THEN
+            LEAVE read_loop;
+        END IF;
+        SAVEPOINT sp_one;
+        BEGIN
+            DECLARE inner_sqlstate CHAR(5);
+            DECLARE inner_errno INT;
+            DECLARE inner_message TEXT;
+            DECLARE EXIT HANDLER FOR SQLEXCEPTION
+                BEGIN
+                    GET DIAGNOSTICS CONDITION 1 inner_sqlstate = RETURNED_SQLSTATE,
+                    inner_errno = MYSQL_ERRNO,
+                    inner_message = MESSAGE_TEXT;
+                    ROLLBACK TO SAVEPOINT sp_one;
+                    INSERT INTO qa_error_capture (phase_name, sqlstate_char, mysql_errno, message_text, ctx)
+                    VALUES ('rollup', inner_sqlstate, inner_errno, LEFT(inner_message, 512), JSON_OBJECT('ym', v_ym, 'project_code', v_project_code, 'path', 'savepoint-recovery'));
+                    CALL sp_upsert_one_month_stat(v_ym, v_project_id);
+                END;
+            IF v_project_code = 'CHAOS'
+                    AND v_ym = '2025-02' THEN
+                INSERT INTO work_event (item_id, actor_user_id, event_type, event_at, delta_hours, note, event_doc)
+                VALUES (
+                    (
+                        SELECT MIN(item_id)
+                        FROM work_item
+                        WHERE project_id = v_project_id
+                    ),
+                        6,
+                        'BROKEN_EVENT',
+                        '2025-02-10 10:00:00.000000',
+                        999.00,
+                        NULL,
+                        'not json'
+                );
+            END IF;
+            CALL sp_upsert_one_month_stat(v_ym, v_project_id);
+        END;
+        RELEASE SAVEPOINT sp_one;
+    END LOOP;
+    CLOSE cur;
+    COMMIT;
+    DROP TEMPORARY TABLE IF EXISTS tmp_monthly_stats;
+END//
+
+CREATE PROCEDURE sp_emit_result_sets()
+BEGIN
+    SELECT
+        (
+        SELECT COUNT(*)
+        FROM org_unit
+        ) AS org_unit_count,
+        (
+        SELECT COUNT(*)
+        FROM app_user
+        ) AS app_user_count,
+        (
+        SELECT COUNT(*)
+        FROM project
+        ) AS project_count,
+        (
+        SELECT COUNT(*)
+        FROM sprint
+        ) AS sprint_count,
+        (
+        SELECT COUNT(*)
+        FROM work_item
+        ) AS work_item_count,
+        (
+        SELECT COUNT(*)
+        FROM work_event
+        ) AS work_event_count,
+        (
+        SELECT COUNT(*)
+        FROM monthly_project_stats
+        ) AS monthly_project_stats_count,
+        (
+        SELECT COUNT(*)
+        FROM qa_error_capture
+        ) AS qa_error_capture_count,
+        (
+        SELECT COUNT(*)
+        FROM audit_log
+        ) AS audit_log_count;
+    SELECT capture_id,
+        phase_name,
+        sqlstate_char,
+        mysql_errno,
+        message_text,
+        ctx,
+        created_at
+    FROM qa_error_capture
+    ORDER BY capture_id;
+    SELECT m.ym,
+        p.project_code,
+        m.item_count,
+        m.event_count,
+        m.total_hours,
+        m.avg_item_hours,
+        m.completed_items,
+        m.blocked_items,
+        m.top_actor_user_id,
+        m.anomaly_count,
+        m.rebuilt_at
+    FROM monthly_project_stats m
+    JOIN project p
+        ON p.project_id = m.project_id
+    ORDER BY m.ym,
+        p.project_code;
+END//
+
+DELIMITER ;
+
+-- ============================================================
+-- 5) Execute
+-- ============================================================
+
+CALL sp_seed_ultra_data();
+
+CALL sp_fault_injection_handled();
+
+CALL sp_rebuild_monthly_stats('2025-01', '2025-03');
+
+CALL sp_rebuild_monthly_stats('2025-01', '2025-03');
+
+-- ============================================================
+-- 6) Assertions
+-- ============================================================
+
+CALL sp_assert_eq_bigint(
+    5,
+    (
+        SELECT COUNT(*)
+        FROM org_unit
+    ),
+    'org_unit count'
+);
+
+CALL sp_assert_eq_bigint(
+    8,
+    (
+        SELECT COUNT(*)
+        FROM app_user
+    ),
+    'app_user count'
+);
+
+CALL sp_assert_eq_bigint(
+    4,
+    (
+        SELECT COUNT(*)
+        FROM project
+    ),
+    'project count'
+);
+
+CALL sp_assert_eq_bigint(
+    16,
+    (
+        SELECT COUNT(*)
+        FROM project_member
+    ),
+    'project_member count'
+);
+
+CALL sp_assert_eq_bigint(
+    12,
+    (
+        SELECT COUNT(*)
+        FROM sprint
+    ),
+    'sprint count'
+);
+
+CALL sp_assert_eq_bigint(
+    48,
+    (
+        SELECT COUNT(*)
+        FROM work_item
+    ),
+    'work_item count'
+);
+
+CALL sp_assert_eq_bigint(
+    192,
+    (
+        SELECT COUNT(*)
+        FROM work_event
+    ),
+    'work_event count'
+);
+
+CALL sp_assert_eq_bigint(
+    36,
+    (
+        SELECT COUNT(*)
+        FROM work_item
+        WHERE status = 'DONE'
+    ),
+    'DONE item count'
+);
+
+CALL sp_assert_eq_bigint(
+    8,
+    (
+        SELECT COUNT(*)
+        FROM work_item
+        WHERE status = 'REVIEW'
+    ),
+    'REVIEW item count'
+);
+
+CALL sp_assert_eq_bigint(
+    4,
+    (
+        SELECT COUNT(*)
+        FROM work_item
+        WHERE status = 'BLOCKED'
+    ),
+    'BLOCKED item count'
+);
+
+CALL sp_assert_eq_bigint(
+    48,
+    (
+        SELECT COUNT(*)
+        FROM work_item
+        WHERE revision_no = 2
+    ),
+    'revision_no should be 2 for all items'
+);
+
+CALL sp_assert_eq_bigint(
+    0,
+    (
+        SELECT COUNT(*)
+        FROM work_item
+        WHERE title <> TRIM(title)
+    ),
+    'title trimming failed'
+);
+
+CALL sp_assert_eq_bigint(
+    96,
+    (
+        SELECT COUNT(*)
+        FROM work_event
+        WHERE note LIKE 'auto-note:%'
+    ),
+    'auto note count'
+);
+
+CALL sp_assert_eq_bigint(
+    48,
+    (
+        SELECT COUNT(*)
+        FROM audit_log
+        WHERE action_name = 'WORK_ITEM_INSERT'
+    ),
+    'WORK_ITEM_INSERT audit count'
+);
+
+CALL sp_assert_eq_bigint(
+    96,
+    (
+        SELECT COUNT(*)
+        FROM audit_log
+        WHERE action_name = 'WORK_ITEM_UPDATE'
+    ),
+    'WORK_ITEM_UPDATE audit count'
+);
+
+CALL sp_assert_eq_bigint(
+    192,
+    (
+        SELECT COUNT(*)
+        FROM audit_log
+        WHERE action_name = 'WORK_EVENT_INSERT'
+    ),
+    'WORK_EVENT_INSERT audit count'
+);
+
+CALL sp_assert_eq_bigint(
+    336,
+    (
+        SELECT COUNT(*)
+        FROM audit_log
+    ),
+    'total audit count'
+);
+
+CALL sp_assert_eq_bigint(
+    3,
+    (
+        SELECT COUNT(*)
+        FROM qa_error_capture
+        WHERE phase_name = 'fault_injection'
+    ),
+    'fault_injection capture count'
+);
+
+CALL sp_assert_eq_bigint(
+    2,
+    (
+        SELECT COUNT(*)
+        FROM qa_error_capture
+        WHERE phase_name = 'rollup'
+    ),
+    'rollup capture count'
+);
+
+CALL sp_assert_eq_bigint(
+    5,
+    (
+        SELECT COUNT(*)
+        FROM qa_error_capture
+    ),
+    'total qa_error_capture count'
+);
+
+CALL sp_assert_eq_bigint(
+    12,
+    (
+        SELECT COUNT(*)
+        FROM monthly_project_stats
+    ),
+    'monthly_project_stats row count'
+);
+
+CALL sp_assert_eq_bigint(
+    12,
+    (
+        SELECT COUNT(*)
+        FROM monthly_project_stats
+        WHERE top_actor_user_id IS NOT NULL
+    ),
+    'top_actor_user_id should be present'
+);
+
+CALL sp_assert_eq_bigint(
+    48,
+    (
+        SELECT SUM(item_count)
+        FROM monthly_project_stats
+    ),
+    'monthly item_count sum'
+);
+
+CALL sp_assert_eq_bigint(
+    192,
+    (
+        SELECT SUM(event_count)
+        FROM monthly_project_stats
+    ),
+    'monthly event_count sum'
+);
+
+CALL sp_assert_eq_decimal(
+    (
+        SELECT SUM(delta_hours)
+        FROM work_event
+    ),
+    (
+        SELECT SUM(total_hours)
+        FROM monthly_project_stats
+    ),
+    2,
+    'monthly total_hours sum mismatch'
+);
+
+SELECT 'ALL ULTRA ASSERTIONS PASSED' AS status;
+
+-- ============================================================
+-- 7) Multi result set procedure
+-- ============================================================
+
+CALL sp_emit_result_sets();
+
+-- ============================================================
+-- 8) Monster query #1
+--    recursive org tree + JSON_TABLE + member rollup
+-- ============================================================
+
+WITH RECURSIVE org_tree AS (
+    SELECT
+        ou.org_unit_id,
+        ou.parent_org_unit_id,
+        ou.unit_code,
+        ou.unit_name,
+        CAST(ou.unit_name AS CHAR(1000)) AS unit_path,
+        1 AS lvl
+    FROM org_unit ou
+    WHERE ou.parent_org_unit_id IS NULL
+    UNION ALL
+    SELECT
+        c.org_unit_id,
+        c.parent_org_unit_id,
+        c.unit_code,
+        c.unit_name,
+        CONCAT(t.unit_path, ' > ', c.unit_name) AS unit_path,
+        t.lvl + 1 AS lvl
+    FROM org_unit c
+    JOIN org_tree t
+        ON t.org_unit_id = c.parent_org_unit_id
+),
+member_rollup AS (
+    SELECT
+        pm.project_id,
+        GROUP_CONCAT(CONCAT(u.user_code, ':', pm.role_name, '@', pm.allocation_pct) ORDER BY pm.allocation_pct DESC, u.user_code SEPARATOR ' | ') AS members
+    FROM project_member pm
+    JOIN app_user u
+        ON u.user_id = pm.user_id
+    GROUP BY pm.project_id
+)
+SELECT
+    p.project_code,
+    p.project_name,
+    owner.display_name AS owner_name,
+    ot.unit_path AS owner_unit_path,
+    mr.members,
+    jt.label AS spec_label
+FROM project p
+JOIN app_user owner
+    ON owner.user_id = p.owner_user_id
+JOIN org_tree ot
+    ON ot.org_unit_id = owner.org_unit_id
+JOIN member_rollup mr
+    ON mr.project_id = p.project_id
+CROSS JOIN JSON_TABLE(p.spec_json, '$.labels[*]' COLUMNS(
+    label VARCHAR(40) PATH '$'
+)) AS jt
+ORDER BY p.project_code,
+    jt.label;
+
+-- ============================================================
+-- 9) Monster query #2
+--    recursive calendar + window + correlated subquery + function
+-- ============================================================
+
+WITH RECURSIVE month_dim AS (
+    SELECT CAST('2025-01-01' AS DATE) AS month_start
+    UNION ALL
+    SELECT DATE_ADD(month_start, INTERVAL 1 MONTH)
+    FROM month_dim
+    WHERE month_start < '2025-03-01'
+),
+daily_project AS (
+    SELECT
+        DATE(we.event_at) AS event_day,
+        wi.project_id,
+        p.project_code,
+        ROUND(SUM(we.delta_hours), 2) AS day_hours,
+        COUNT(*) AS event_count
+    FROM work_event we
+    JOIN work_item wi
+        ON wi.item_id = we.item_id
+    JOIN project p
+        ON p.project_id = wi.project_id
+    GROUP BY DATE(we.event_at),
+        wi.project_id,
+        p.project_code
+),
+calendarized AS (
+    SELECT
+        md.month_start,
+        dp.project_id,
+        dp.project_code,
+        dp.event_day,
+        dp.day_hours,
+        dp.event_count
+    FROM month_dim md
+    LEFT JOIN daily_project dp
+        ON DATE_FORMAT(dp.event_day, '%Y-%m-01') = DATE_FORMAT(md.month_start, '%Y-%m-01')
+),
+ranked AS (
+    SELECT
+        c.*,
+    ROW_NUMBER() OVER (
+        PARTITION BY c.project_id,
+            DATE_FORMAT(c.event_day, '%Y-%m')
+        ORDER BY c.day_hours DESC,
+                c.event_day
+    ) AS rn,
+    DENSE_RANK() OVER (
+        PARTITION BY c.project_id,
+            DATE_FORMAT(c.event_day, '%Y-%m')
+        ORDER BY c.day_hours DESC
+    ) AS dense_rnk,
+    SUM(c.day_hours) OVER (
+        PARTITION BY c.project_id,
+            DATE_FORMAT(c.event_day, '%Y-%m')
+        ORDER BY c.event_day
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS running_hours,
+    AVG(c.day_hours) OVER (
+        PARTITION BY c.project_id
+        ORDER BY c.event_day
+        ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+    ) AS moving_avg_3d,
+    LAG(c.day_hours) OVER (
+        PARTITION BY c.project_id
+        ORDER BY c.event_day
+    ) AS prev_hours
+    FROM calendarized c
+    WHERE c.event_day IS NOT NULL
+)
+SELECT
+    r.project_code,
+    DATE_FORMAT(r.event_day, '%Y-%m') AS ym,
+    r.event_day,
+    r.day_hours,
+    r.event_count,
+    r.rn,
+    r.dense_rnk,
+    ROUND(r.running_hours, 2) AS running_hours,
+    ROUND(r.moving_avg_3d, 2) AS moving_avg_3d,
+    COALESCE(r.prev_hours, 0) AS prev_hours,
+    fn_complexity_band(
+        (
+            SELECT ROUND(AVG(wi.points), 0)
+            FROM work_item wi
+            WHERE wi.project_id = r.project_id
+        ),
+        r.running_hours) AS risk_band,
+    (
+        SELECT ROUND(AVG(we2.delta_hours), 2)
+        FROM work_event we2
+        JOIN work_item wi2
+            ON wi2.item_id = we2.item_id
+        WHERE wi2.project_id = r.project_id
+            AND we2.event_at BETWEEN DATE_SUB(r.event_day, INTERVAL 7 DAY) AND DATE_ADD(r.event_day, INTERVAL 1 DAY)
+    ) AS trailing_7d_avg
+FROM ranked r
+WHERE r.rn <= 3
+ORDER BY r.project_code,
+    ym,
+    r.rn,
+    r.event_day;
+
+-- ============================================================
+-- 10) Monster query #3
+--     JSON_TABLE + window rank + correlated subquery
+-- ============================================================
+
+WITH component_usage AS (
+    SELECT
+        p.project_code,
+        comp.component_name,
+        COUNT(*) AS item_hits,
+        ROUND(SUM(v.total_hours), 2) AS total_hours,
+        ROUND(AVG(v.total_hours), 2) AS avg_item_hours,
+        SUM(
+            CASE
+                WHEN wi.status = 'BLOCKED' THEN 1
+                ELSE 0
+            END
+        ) AS blocked_hits
+    FROM work_item wi
+    JOIN project p
+        ON p.project_id = wi.project_id
+    JOIN v_item_rollup v
+        ON v.item_id = wi.item_id
+    CROSS JOIN JSON_TABLE(wi.detail_doc, '$.components[*]' COLUMNS(
+        component_name VARCHAR(40) PATH '$'
+    )) AS comp
+    GROUP BY p.project_code,
+        comp.component_name
+),
+ranked AS (
+    SELECT
+        cu.*,
+    ROW_NUMBER() OVER (
+        PARTITION BY cu.project_code
+        ORDER BY cu.item_hits DESC,
+                cu.total_hours DESC,
+            cu.component_name
+    ) AS component_rank,
+    SUM(cu.total_hours) OVER (
+        PARTITION BY cu.project_code
+        ORDER BY cu.total_hours DESC,
+                cu.component_name
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS cumulative_component_hours
+    FROM component_usage cu
+)
+SELECT
+    r.project_code,
+    r.component_name,
+    r.item_hits,
+    r.total_hours,
+    r.avg_item_hours,
+    r.blocked_hits,
+    r.component_rank,
+    ROUND(r.cumulative_component_hours, 2) AS cumulative_component_hours,
+    (
+        SELECT COUNT(*)
+        FROM work_item wi2
+        CROSS JOIN JSON_TABLE(wi2.detail_doc, '$.labels[*]' COLUMNS(
+            label_name VARCHAR(40) PATH '$'
+        )) AS lab
+        WHERE wi2.project_id = (
+            SELECT p2.project_id
+            FROM project p2
+            WHERE p2.project_code = r.project_code
+        )
+            AND lab.label_name = CONCAT('s', r.component_rank)
+    ) AS matching_rank_label_items
+FROM ranked r
+ORDER BY r.project_code,
+    r.component_rank,
+    r.component_name;
+
+-- ============================================================
+-- 11) Final inspection
+-- ============================================================
+
+SELECT m.ym,
+    p.project_code,
+    m.item_count,
+    m.event_count,
+    m.total_hours,
+    m.avg_item_hours,
+    m.completed_items,
+    m.blocked_items,
+    u.user_code AS top_actor_code,
+    m.anomaly_count,
+    m.rebuilt_at
+FROM monthly_project_stats m
+JOIN project p
+    ON p.project_id = m.project_id
+LEFT JOIN app_user u
+    ON u.user_id = m.top_actor_user_id
+ORDER BY m.ym,
+    p.project_code;

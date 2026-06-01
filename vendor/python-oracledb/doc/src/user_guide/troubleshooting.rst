@@ -1,0 +1,587 @@
+.. _troubleshooting:
+
+.. currentmodule:: oracledb
+
+**********************
+Troubleshooting Errors
+**********************
+
+Use the troubleshooting information documented in this section to address
+common errors that may appear while :ref:`installing <instllntroubleshooting>`
+or :ref:`using <runtimetroubleshooting>` python-oracledb.
+
+This chapter does not list all possible errors.
+
+.. _instllntroubleshooting:
+
+Installation Errors
+===================
+
+You may encounter issues while installing python-oracledb. Review the
+python-oracledb :ref:`instreq`. To understand the problem better, you can
+display more output by using the ``-v`` option with the pip install command.
+Review your output and logs.
+
+If you need to modify your system version of Python and do not have the
+necessary access to modify it, then use:
+
+.. code-block:: shell
+
+    python -m pip install oracledb --upgrade --user
+
+Or you can use the venv module (built into Python 3.x).
+
+This section covers some specific errors or problems that you may run into
+during python-oracledb installation, and possible solutions to resolve them.
+
+If the installation problem still persists, then try to install
+python-oracledb using a different method. **Google anything that looks like an
+error.** Try some potential solutions.
+
+.. _wheelerr:
+
+"Not a supported wheel on this platform" Error
+----------------------------------------------
+
+**Cause:**  The python-oracledb installation failed with this error because
+you may be using an older version of ``pip``.
+
+**Action:** Upgrade your pip version with the following command:
+
+.. code-block:: shell
+
+    python -m pip install pip --upgrade --user
+
+.. _networkerr:
+
+Network Connection Error
+------------------------
+
+**Cause:**  The python-oracledb installation failed because of a network
+connection error.
+
+**Action:** To resolve this issue:
+
+- Check if you need to set the environment variables ``http_proxy`` and/or
+  ``https_proxy``.
+
+- Or try the following command:
+
+  .. code-block:: shell
+
+        python -m pip install --proxy=http://proxy.example.com:80 oracledb --upgrade
+
+.. _upgradeerr:
+
+Upgrade to Latest Version Failed Without Any Errors
+---------------------------------------------------
+
+**Cause:**  The upgrade to the latest python-oracledb version failed without
+any errors because the old version is still installed.
+
+**Action:** To reinstall the latest version, try the following command:
+
+.. code-block:: shell
+
+    python -m pip install oracledb --upgrade --force-reinstall
+
+.. _nomodpiperr:
+
+"No module named pip" Error
+---------------------------
+
+**Cause:**  The python-oracledb installation failed with this error because
+the pip module that is built into Python may sometimes be removed by the OS.
+
+**Action:** Instead, use the venv module (built into Python 3.x) or virtualenv
+module.
+
+.. _dpiherr:
+
+"fatal error: dpi.h: No such file or directory" Error
+-----------------------------------------------------
+
+**Cause:**  The python-oracledb installation from source code failed because a
+subdirectory called "odpi" may be missing.
+
+**Action:** Check if your source installation has a subdirectory called
+"odpi" containing files. If this is missing, review the section on
+:ref:`installgh`.
+
+.. _warningmsgs:
+
+Warning Messages
+================
+
+Some warnings may appear while using python-oracledb in Thick or Thin mode.
+
+.. _pythwarning:
+
+Deprecated Python Version Warning
+---------------------------------
+
+**Warning:** ``Python 3.6 is no longer supported by the Python core team.
+Therefore, support for it is deprecated in python-oracledb and will be removed
+in a future release.`` (A similar warning will also be displayed for Python
+versions 3.7 and 3.8.)
+
+**Cause:** ``import oracledb`` gives this warning because you are using a
+version of Python that is longer maintained by the Python core team.
+
+**Action:**  You can either:
+
+- Upgrade your Python version to 3.9 or later.
+
+- Or you can temporarily suppress the warning by importing the
+  `warnings <https://docs.python.org/3/library/warnings.html>`__ module and
+  adding a call like ``warnings.filterwarnings(action='ignore',
+  module="oracledb")`` *before* importing ``oracledb``.
+
+- Install an older version of python-oracledb
+
+.. _runtimetroubleshooting:
+
+Error Messages
+==============
+
+While using python-oracledb in Thin or Thick mode, you may encounter
+errors. Some common :ref:`DPI <dpierr>`, :ref:`DPY <dpyerr>`, and :ref:`ORA
+<oraerr>` errors are detailed in this section with information about the
+probable cause of the error, and the recommended action which may resolve the
+error.
+
+If you have multiple versions of Python installed, ensure that you are
+using the correct python and pip (or python3 and pip3) executables.
+
+.. _dpierr:
+
+DPI Error Messages
+------------------
+
+The error messages with prefix ``DPI`` are generated by the
+`ODPI-C <https://oracle.github.io/odpi/>`_ code which is used by the
+python-oracledb Thick mode.
+
+Some common DPI error messages are discussed below.
+
+.. _dpi1047:
+
+DPI-1047
+++++++++
+
+**Message:** ``DPI-1047: Oracle Client library cannot be loaded``
+
+**Cause:**   The connection to Oracle Database failed because the Oracle Client
+library could not be loaded.
+
+**Action:**  Perform the following steps:
+
+- Review the :ref:`features available in python-oracledb's default Thin mode
+  <featuresummary>`. If Thin mode suits your requirements, then remove the
+  calls in your application to :meth:`oracledb.init_oracle_client()` since
+  this loads the Oracle Client library to :ref:`enable Thick mode
+  <enablingthick>`.
+
+- On Windows and macOS, pass the ``lib_dir`` library directory parameter
+  in your :meth:`oracledb.init_oracle_client()` call. The parameter
+  should be the location of your Oracle Client libraries. Do not pass
+  this parameter on Linux.
+
+- Check if the Python process has permission to open the Oracle Client
+  libraries. OS restrictions may prevent the opening of libraries installed
+  in unsafe paths, such as from a user directory. On Linux you may need to
+  install the Oracle Client libraries under a directory like ``/opt`` or
+  ``/usr/local``.
+
+- Check if Python and your Oracle Client libraries are both 64-bit or
+  both 32-bit. The ``DPI-1047`` message will tell you whether the 64-bit
+  or 32-bit Oracle Client is needed for your Python.
+
+- If you are using Oracle Instant Client libraries (and not using a full
+  Oracle Database installation or a full Oracle Instant Client installation
+  such as installed by Oracle's GUI installer), check whether the
+  ``ORACLE_HOME`` environment variable is set. If it is, unset this variable.
+
+- Set the environment variable ``DPI_DEBUG_LEVEL`` to 64 and restart
+  python-oracledb. The trace messages will show how and where
+  python-oracledb is looking for the Oracle Client libraries.
+
+  At a Windows command prompt, this could be done with::
+
+        set DPI_DEBUG_LEVEL=64
+
+  On Linux and macOS, you might use::
+
+        export DPI_DEBUG_LEVEL=64
+
+- On Windows:
+
+  - If you have a full database installation, ensure that this database is the
+    `currently configured database <https://docs.oracle.com/pls/topic/lookup?
+    ctx=db21&id=RIWIN-GUID-33D575DD-47FF-42B1-A82F-049D3F2A8791>`__.
+
+  - If you are not passing a library directory parameter to
+    :meth:`oracledb.init_oracle_client()`, then restart your command prompt
+    and use ``set PATH`` to check if the environment variable has the correct
+    Oracle Client listed before any other Oracle directories.
+
+  - Use the ``DIR`` command to verify that ``OCI.DLL`` exists in the directory
+    passed to :meth:`oracledb.init_oracle_client()` or set in ``PATH``.
+
+  - Check if the correct `Windows Redistributables <https://oracle.github.io/odpi/
+    doc/installation.html#windows>`__ have been installed.
+
+- On Linux:
+
+  - Check if the ``LD_LIBRARY_PATH`` environment variable contains the Oracle
+    Client library directory. Some environments such as web servers and
+    daemons reset environment variables.
+
+  - If you are using Oracle Instant Client, a preferred alternative to
+    ``LD_LIBRARY_PATH`` is to ensure that a file in the ``/etc/ld.so.conf.d``
+    directory contains the path to the Instant Client directory, and then run
+    ``ldconfig``.
+
+DPI-1072
+++++++++
+
+**Message:** ``DPI-1072: the Oracle Client library version is unsupported``
+
+**Cause:**  The connection to Oracle Database failed because the Oracle Client
+library version used is not supported by python-oracledb Thick mode. The Thick
+mode needs Oracle Client library 19 or later.
+
+**Action:** Review the :ref:`instreq`. You can either:
+
+- Follow the steps documented in :ref:`DPI-1047 <dpi1047>` which may help.
+
+- Or may be use python-oracledb Thin mode which can be done by removing calls
+  to :meth:`oracledb.init_oracle_client()` from your code.
+
+.. _dpyerr:
+
+DPY Error Messages
+------------------
+
+The python-oracledb Thin mode code and python-oracledb Thick mode code
+generates error messages with the prefix ``DPY``.
+
+Some common DPY error messages are discussed below.
+
+.. _dpy3001:
+
+DPY-3001
+++++++++
+
+**Message:** ``DPY-3001: <feature> is only supported in python-oracledb <mode>``
+
+This error is diplayed when you attempt to use a feature in a python-oracledb
+driver mode that does not support it.
+
+Some common examples are listed below.
+
+Native Network Encryption and Data Integrity Error
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+**Message:** ``DPY-3001: Native Network Encryption and Data Integrity is only
+supported in python-oracledb thick mode``
+
+**Cause:** The connection to Oracle Database failed because NNE or checksumming
+may be enabled in your Oracle Database and python-oracledb Thin mode does not
+support NNE.
+
+**Action:** To verify if NNE or checksumming are enabled, you can use the
+following query::
+
+    SELECT network_service_banner FROM v$session_connect_info;
+
+If NNE is enabled, then this query prints output that includes the
+available encryption service, the crypto-checksumming service, and the
+algorithms in use, such as::
+
+    NETWORK_SERVICE_BANNER
+    -------------------------------------------------------------------------------------
+    TCP/IP NT Protocol Adapter for Linux: Version 19.0.0.0.0 - Production
+    Encryption service for Linux: Version 19.0.1.0.0 - Production
+    AES256 Encryption service adapter for Linux: Version 19.0.1.0.0 - Production
+    Crypto-checksumming service for Linux: Version 19.0.1.0.0 - Production
+    SHA256 Crypto-checksumming service adapter for Linux: Version 19.0.1.0.0 - Production
+
+If NNE is not enabled, then the query will only print the available encryption
+and crypto-checksumming services in the output. For example::
+
+    NETWORK_SERVICE_BANNER
+    -------------------------------------------------------------------------------------
+    TCP/IP NT Protocol Adapter for Linux: Version 19.0.0.0.0 - Production
+    Encryption service for Linux: Version 19.0.1.0.0 - Production
+
+If NNE or checksumming are enabled, you can resolve this error by either:
+
+- Changing the architecture to use Transport Layer Security (TLS), which is
+  supported in python-oracledb Thin and Thick modes. See `Configuring
+  Transport Layer Security Encryption
+  <https://www.oracle.com/pls/topic/lookup?ctx=dblatest&id=GUID-8B82DD7E-7189-4FE9-8F3B-4E521706E1E4>`__.
+- Or :ref:`enabling python-oracledb Thick mode <enablingthick>`.
+
+.. seealso::
+
+    `Oracle AI Database Security Guide <https://www.oracle.com/pls/topic/lookup?
+    ctx=dblatest&id=DBSEG>`__ for more information about Oracle Data Network
+    Encryption and Integrity, and for information about configuring TLS
+    network encryption.
+
+Bequeath Error
+^^^^^^^^^^^^^^
+
+**Message:** ``DPY-3001: Bequeath is only supported in python-oracledb thick
+mode``
+
+**Cause:** The connection to Oracle Database failed because python-oracledb
+Thin mode does not support bequeath connections or because the connection
+string was not specified in the  ``dsn`` parameter during connection creation.
+
+**Action:** You can either:
+
+- Specify a valid connection string in the ``dsn`` parameter during connection
+  creation to continue using python-oracledb Thin mode.
+
+- Or :ref:`enable python-oracledb Thick mode <enablingthick>` since this mode
+  can use bequeath connections. For Thick mode, you need to install Oracle
+  Client libraries and call :meth:`oracledb.init_oracle_client()` in your code.
+
+DPY-3010
+++++++++
+
+**Message:** ``DPY-3010: connections to this database server version are not
+supported by python-oracledb in thin mode``
+
+**Cause:**  The connection to Oracle Database with python-oracledb Thin mode
+failed because you are using Oracle Database version 11.2 or earlier. Using
+python-oracledb Thin mode, you can connect directly to Oracle Database 12.1
+or later.
+
+**Action:** You can either:
+
+- :ref:`Enable python-oracledb Thick mode <enablingthick>` since this mode can
+  connect to Oracle Database 9.2 or later. For Thick mode, you need to install
+  Oracle Client libraries and call :meth:`oracledb.init_oracle_client()` in
+  your code.
+
+- Upgrade Oracle Database to 12.1, or later, if you want to use python-oracledb
+  Thin mode.
+
+DPY-3015
+++++++++
+
+**Message:** ``DPY-3015: password verifier type 0x939 is not supported by
+python-oracledb in thin mode``
+
+**Cause:** The connection to Oracle Database with python-oracledb Thin mode
+failed because your database user account was only created with the Oracle
+Database 10G password verifier. Python-oracledb Thin mode supports password
+verifiers 11G and later.
+
+**Action:** You can either:
+
+- :ref:`Enable Thick mode <enablingthick>` since python-oracledb Thick mode
+  supports password verifiers 10G and later.
+
+- Or you can:
+
+  1. Ensure that the database initialization parameter
+     ``sec_case_sensitive_logon`` is not *FALSE*. To check the value, connect
+     as SYSDBA in SQL*Plus and run::
+
+        show parameter sec_case_sensitive_logon
+
+    Note this parameter was `removed in Oracle Database 21c
+    <https://docs.oracle.com/en/database/oracle/oracle-database/21/nfcon/
+    security-solutions.html#GUID-FAF4C7A6-A2CD-4B9B-9A64-3705F693ECF0>`__
+    so only step 2 is required for this, or subsequent, database versions.
+
+  2. Regenerate passwords for users who have old password verifiers. You can
+     find such users with the query:
+
+     .. code-block:: sql
+
+        select username from dba_users
+        where (password_versions = '10G ' or password_versions = '10G HTTP ')
+        and username <> 'ANONYMOUS';
+
+     You can reset passwords for these users with commands like::
+
+        alter user x identified by y;
+
+     .. seealso::
+
+        `Finding and Resetting User Passwords That Use the 10G Password
+        Version <https://www.oracle.com/pls/topic/lookup?ctx=dblatest&id=
+        GUID-D7B09DFE-F55D-449A-8F8A-174D89936304>`__ for more information.
+
+DPY-3029
+++++++++
+
+**Message:** ``DPY-3029: "{name}" includes characters that are not allowed``
+
+**Cause:** Characters were used that are not supported by Oracle Net in the
+shown connection or configuration parameter or attribute.
+
+**Action:** Values should be ASCII letters or digits. Allowed special
+characters are ``'<>/,.:;-_$+*#&!%?@``. Values should not contain enclosing
+quotes. Also remove trailing commas and trailing backslashes.
+
+.. _dpy4011:
+
+DPY-4011
+++++++++
+
+**Message:** ``DPY-4011: the database or network closed the connection``
+
+**Cause:** If this occurs when using an already opened connection, additional
+messages may indicate a reason.
+
+If the error occurs when creating a connection or connection pool with
+python-oracledb 2 or earlier in Thin mode, the common cause is that Oracle
+Database has Native Network Encryption (NNE) enabled. Later versions of
+python-oracledb give the error :ref:`dpy3001` for this scenario. NNE and Oracle
+Net checksumming are only supported in python-oracledb Thick mode.
+
+The error has been seen to occur if the database cannot handle the number of
+connections being opened.
+
+**Action:** Review if NNE or checksumming are enabled. See
+:ref:`DPY-3001 <dpy3001>` for solutions.
+
+If connection load is an issue, then reconfigure the database or reduce
+connection load. Review the :ref:`connpoolsize` best practices and keep pool
+sizes small. When multiple python process need to open connection pools, then
+:ref:`drcp` may be a solution.
+
+If additional messages indicate a reason, follow their guidance.
+
+DPY-4027
+++++++++
+
+**Message:** ``DPY-4027: no configuration directory specified``
+
+**Cause:** The :ref:`connection string <connstr>` specified in your connection
+or pool creation ``dsn`` parameter was interpreted by python-oracledb to be a
+:ref:`TNS Alias <netservice>` which it needed to look up in a
+:ref:`tnsnames.ora <optnetfiles>` file. However, python-oracledb did not know
+where to find that file.
+
+**Action:** You need to either tell python-oracledb where to find the
+:ref:`tnsnames.ora <optnetfiles>` file, or use a different connection string
+syntax. Perform one of the following:
+
+- Use the equivalent :ref:`Easy Connect syntax <easyconnect>` or :ref:`Connect
+  Descriptor <conndescriptor>`:
+
+  .. code-block:: python
+
+      c = oracledb.connect(user="hr", password=userpw, dsn="localhost:1521/orclpdb")
+
+  Or:
+
+  .. code-block:: python
+
+      c = oracledb.connect(user="hr", password=userpw, dsn="(DESCRIPTION=(ADDRESS=(...))")
+
+- Review the :attr:`oracledb.defaults.config_dir <Defaults.config_dir>`
+  documentation for the heuristics used by python-oracledb to automatically
+  locate :ref:`tnsnames.ora <optnetfiles>`. Ensure that your file is in an
+  expected location, that the file is readable by Python, and that any
+  necessary environment variables such as ``TNS_ADMIN`` are accessible by the
+  Python process.
+
+- If you have problems with the heuristics, then you can explicitly specify the
+  location of :ref:`tnsnames.ora <optnetfiles>`. For example, if the file is at
+  ``/opt/myconfigdir/tnsnames.ora``, then:
+
+  - In python-oracledb's default Thin mode, or when
+    :attr:`oracledb.defaults.thick_mode_dsn_passthrough
+    <Defaults.thick_mode_dsn_passthrough>` is *False*, you can use:
+
+    .. code-block:: python
+
+        c = oracledb.connect(user="hr", password=userpw, dsn="MYDB",
+                             config_dir="/opt/myconfigdir")
+
+  - In python-oracledb's :ref:`Thick mode <enablingthick>` (which is the mode
+    when your application calls :func:`oracledb.init_oracle_client()`), then you
+    can use:
+
+    .. code-block:: python
+
+        oracledb.init_oracle_client(config_dir="/opt/myconfigdir")
+        c = oracledb.connect(user="hr", password=userpw, dsn="MYDB")
+
+.. _oraerr:
+
+ORA Error Messages
+------------------
+
+Some common ORA error messages are discussed below.
+
+ORA-00933
++++++++++
+
+**Message:** ``ORA-00933: SQL command not properly ended`` or
+``ORA-00933: unexpected keyword at or near <keyword_value>``
+
+**Cause:** Commonly this error occurs when the SQL statement passed to Oracle
+Database contains a trailing semicolon.
+
+**Action:** If your code is like:
+
+.. code-block:: python
+
+    cursor.execute("select * from dept;")
+
+Then remove the trailing semi-colon:
+
+.. code-block:: python
+
+    cursor.execute("select * from dept")
+
+Note with Oracle Database 26ai this incorrect usage gives the message
+``ORA-03048: SQL reserved word ';' is not syntactically valid following
+'select * from dept'``.
+
+.. seealso::
+
+   For other causes and solutions see `Database Error Messages ORA-00933
+   <https://docs.oracle.com/error-help/db/ora-00933/>`__
+
+ORA-01805
++++++++++
+
+**Message:** ``ORA-01805: possible error in date/time operation``
+
+**Cause:** This error occurs in python-oracledb Thick mode when you use the
+TIMESTAMP WITH TIMEZONE data type, and use a named time zone offset, and the
+time zone file version of the client libraries and the database are different.
+
+**Action:** Use the same time zone file version with the client libraries and
+the database, see :ref:`timezonefiles`.
+
+The use of a numeric time zone offset can be a workaround to the problem, but
+this can lead to undesired values being used when Daylight Savings Time begins
+or ends.
+
+ORA-28009
++++++++++
+
+**Message:** ``ORA-28009: connection as SYS should be as SYSDBA or SYSOPER``
+
+**Cause:** Commonly this error occurs when you try to create a connection pool
+using :data:`oracledb.AUTH_MODE_SYSDBA` in python-oracledb Thick mode.
+
+**Action:** Use a :ref:`standalone connection <standaloneconnection>`.
+Alternatively, use python-oracledb Thin mode by removing all calls to
+:func:`oracledb.init_oracle_client()`.
+
+.. seealso::
+
+   For other causes and solutions see `Database Error Messages ORA-28009
+   <https://docs.oracle.com/error-help/db/ora-28009/>`__

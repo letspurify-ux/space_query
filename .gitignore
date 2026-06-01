@@ -1,0 +1,8 @@
+/target
+crates/*/target/
+vendor/*/target/
+vendor/go-ora/
+.cargo/
+.env
+.claude/
+toad_manual_features.json

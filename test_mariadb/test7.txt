@@ -1,0 +1,1015 @@
+-- =========================================================
+-- MariaDB Query Tool - FINAL BOSS SCRIPT
+-- Self-contained / self-validating / parser-killer edition
+-- Recommended: MariaDB 10.5+ or newer
+-- =========================================================
+-- -----------------------------
+-- 0. Clean up old objects
+-- -----------------------------
+
+DROP VIEW IF EXISTS qb_v_customer_rollup;
+
+DROP TABLE IF EXISTS qb_audit_log;
+
+DROP TABLE IF EXISTS qb_monthly_summary;
+
+DROP TABLE IF EXISTS qb_order_item;
+
+DROP TABLE IF EXISTS qb_orders;
+
+DROP TABLE IF EXISTS qb_inventory;
+
+DROP TABLE IF EXISTS qb_product;
+
+DROP TABLE IF EXISTS qb_customer;
+
+DROP TABLE IF EXISTS qb_category;
+
+DROP TABLE IF EXISTS qb_assert_log;
+
+DROP TABLE IF EXISTS qb_numbers;
+
+DROP PROCEDURE IF EXISTS qb_fail;
+
+DROP PROCEDURE IF EXISTS qb_assert_true;
+
+DROP PROCEDURE IF EXISTS qb_assert_eq_int;
+
+DROP PROCEDURE IF EXISTS qb_assert_eq_decimal;
+
+DROP FUNCTION IF EXISTS qb_fn_order_item_net;
+
+DROP FUNCTION IF EXISTS qb_fn_customer_grade;
+
+DROP PROCEDURE IF EXISTS qb_rebuild_monthly_summary;
+
+DROP PROCEDURE IF EXISTS qb_cursor_inventory_scan;
+
+DROP PROCEDURE IF EXISTS qb_make_test_order;
+
+-- -----------------------------
+-- 1. Base schema
+-- -----------------------------
+
+CREATE TABLE qb_numbers (
+    n INT NOT NULL PRIMARY KEY
+);
+
+INSERT INTO qb_numbers (n)
+VALUES (0),
+    (1),
+    (2),
+    (3),
+    (4),
+    (5),
+    (6),
+    (7),
+    (8),
+    (9),
+    (10),
+    (11),
+    (12),
+    (13),
+    (14),
+    (15),
+    (16),
+    (17),
+    (18),
+    (19),
+    (20),
+    (21),
+    (22),
+    (23),
+    (24),
+    (25),
+    (26),
+    (27),
+    (28),
+    (29),
+    (30),
+    (31),
+    (32),
+    (33),
+    (34),
+    (35),
+    (36),
+    (37),
+    (38),
+    (39),
+    (40),
+    (41),
+    (42),
+    (43),
+    (44),
+    (45),
+    (46),
+    (47),
+    (48),
+    (49),
+    (50),
+    (51),
+    (52),
+    (53),
+    (54),
+    (55),
+    (56),
+    (57),
+    (58),
+    (59),
+    (60),
+    (61),
+    (62),
+    (63),
+    (64),
+    (65),
+    (66),
+    (67),
+    (68),
+    (69),
+    (70),
+    (71),
+    (72),
+    (73),
+    (74),
+    (75),
+    (76),
+    (77),
+    (78),
+    (79),
+    (80),
+    (81),
+    (82),
+    (83),
+    (84),
+    (85),
+    (86),
+    (87),
+    (88),
+    (89),
+    (90),
+    (91),
+    (92),
+    (93),
+    (94),
+    (95),
+    (96),
+    (97),
+    (98),
+    (99);
+
+CREATE TABLE qb_assert_log (
+    id          BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    test_name   VARCHAR(200) NOT NULL,
+    detail_text TEXT         NULL,
+    created_at  DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+);
+
+CREATE TABLE qb_category (
+    category_id        INT          NOT NULL PRIMARY KEY,
+    parent_category_id INT          NULL,
+    category_name      VARCHAR(100) NOT NULL,
+    category_path      VARCHAR(500) NULL,
+    is_active          TINYINT(1)   NOT NULL DEFAULT 1,
+    created_at         DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    CONSTRAINT fk_qb_category_parent FOREIGN KEY (parent_category_id) REFERENCES qb_category(category_id)
+);
+
+CREATE TABLE qb_customer (
+    customer_id   INT                                          NOT NULL PRIMARY KEY,
+    customer_code VARCHAR(30)                                  NOT NULL UNIQUE,
+    customer_name VARCHAR(200)                                 NOT NULL,
+    tier          ENUM('BRONZE', 'SILVER', 'GOLD', 'PLATINUM') NOT NULL DEFAULT 'BRONZE',
+    status_code   CHAR(1)                                      NOT NULL DEFAULT 'A',
+    credit_limit  DECIMAL(18, 2)                               NOT NULL DEFAULT 0,
+    meta_json     LONGTEXT                                     NULL,
+    note_text     TEXT                                         NULL,
+    created_at    DATETIME(6)                                  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at    DATETIME(6)                                  NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    CHECK (status_code IN ('A', 'I'))
+);
+
+CREATE TABLE qb_product (
+    product_id   INT            NOT NULL PRIMARY KEY,
+    category_id  INT            NOT NULL,
+    sku          VARCHAR(50)    NOT NULL UNIQUE,
+    product_name VARCHAR(200)   NOT NULL,
+    base_price   DECIMAL(18, 2) NOT NULL,
+    tax_rate     DECIMAL(9, 4)  NOT NULL DEFAULT 0.10,
+    attr_json    LONGTEXT       NULL,
+    is_active    TINYINT(1)     NOT NULL DEFAULT 1,
+    created_at   DATETIME(6)    NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    CONSTRAINT fk_qb_product_category FOREIGN KEY (category_id) REFERENCES qb_category(category_id),
+    CHECK (base_price >= 0),
+    CHECK (tax_rate >= 0)
+);
+
+CREATE TABLE qb_inventory (
+    product_id     INT         NOT NULL PRIMARY KEY,
+    qty_on_hand    INT         NOT NULL,
+    reorder_point  INT         NOT NULL,
+    warehouse_code VARCHAR(20) NOT NULL,
+    updated_at     DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    CONSTRAINT fk_qb_inventory_product FOREIGN KEY (product_id) REFERENCES qb_product(product_id),
+    CHECK (qty_on_hand >= 0),
+    CHECK (reorder_point >= 0)
+);
+
+CREATE TABLE qb_orders (
+    order_id     BIGINT                                                NOT NULL PRIMARY KEY,
+    customer_id  INT                                                   NOT NULL,
+    order_no     VARCHAR(40)                                           NOT NULL UNIQUE,
+    order_status ENUM('NEW', 'PAID', 'CANCELLED', 'SHIPPED', 'CLOSED') NOT NULL DEFAULT 'NEW',
+    ordered_at   DATETIME(6)                                           NOT NULL,
+    paid_at      DATETIME(6)                                           NULL,
+    cancelled_at DATETIME(6)                                           NULL,
+    memo_text    TEXT                                                  NULL,
+    extra_json   LONGTEXT                                              NULL,
+    created_at   DATETIME(6)                                           NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at   DATETIME(6)                                           NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    CONSTRAINT fk_qb_orders_customer FOREIGN KEY (customer_id) REFERENCES qb_customer(customer_id)
+);
+
+CREATE TABLE qb_order_item (
+    order_item_id BIGINT         NOT NULL PRIMARY KEY,
+    order_id      BIGINT         NOT NULL,
+    line_no       INT            NOT NULL,
+    product_id    INT            NOT NULL,
+    qty           INT            NOT NULL,
+    unit_price    DECIMAL(18, 2) NOT NULL,
+    discount_rate DECIMAL(9, 4)  NOT NULL DEFAULT 0,
+    note_text     TEXT           NULL,
+    created_at    DATETIME(6)    NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    CONSTRAINT uq_qb_order_item UNIQUE (order_id, line_no),
+    CONSTRAINT fk_qb_order_item_order FOREIGN KEY (order_id) REFERENCES qb_orders(order_id),
+    CONSTRAINT fk_qb_order_item_product FOREIGN KEY (product_id) REFERENCES qb_product(product_id),
+    CHECK (qty > 0),
+    CHECK (unit_price >= 0),
+    CHECK (discount_rate >= 0 AND discount_rate <= 1)
+);
+
+CREATE TABLE qb_monthly_summary (
+    ym              CHAR(7)        NOT NULL,
+    customer_id     INT            NOT NULL,
+    order_count     INT            NOT NULL,
+    gross_amount    DECIMAL(18, 2) NOT NULL,
+    discount_amount DECIMAL(18, 2) NOT NULL,
+    net_amount      DECIMAL(18, 2) NOT NULL,
+    tax_amount      DECIMAL(18, 2) NOT NULL,
+    final_amount    DECIMAL(18, 2) NOT NULL,
+    running_rank    INT            NOT NULL,
+    payload_json    LONGTEXT       NULL,
+    created_at      DATETIME(6)    NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (ym, customer_id),
+    CONSTRAINT fk_qb_monthly_summary_customer FOREIGN KEY (customer_id) REFERENCES qb_customer(customer_id)
+);
+
+CREATE TABLE qb_audit_log (
+    audit_id    BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    entity_name VARCHAR(50)  NOT NULL,
+    entity_pk   VARCHAR(100) NOT NULL,
+    action_name VARCHAR(50)  NOT NULL,
+    detail_text LONGTEXT     NULL,
+    created_at  DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+);
+
+-- -----------------------------
+-- 2. Seed data
+-- -----------------------------
+
+INSERT INTO qb_category (category_id, parent_category_id, category_name, category_path)
+VALUES (1, NULL, 'ROOT', '/ROOT'),
+    (10, 1, 'HARDWARE', '/ROOT/HARDWARE'),
+    (11, 10, 'CPU', '/ROOT/HARDWARE/CPU'),
+    (12, 10, 'MEMORY', '/ROOT/HARDWARE/MEMORY'),
+    (20, 1, 'SOFTWARE', '/ROOT/SOFTWARE'),
+    (21, 20, 'DB', '/ROOT/SOFTWARE/DB'),
+    (22, 20, 'TOOL', '/ROOT/SOFTWARE/TOOL'),
+    (30, 1, 'SERVICE', '/ROOT/SERVICE');
+
+INSERT INTO qb_customer (customer_id, customer_code, customer_name, tier, status_code, credit_limit, meta_json, note_text)
+VALUES (1, 'CUST-001', 'Alpha Corp', 'GOLD', 'A', 100000.00, JSON_OBJECT('region', 'KR', 'tags', JSON_ARRAY('b2b', 'priority'), 'memo', 'semi;colon test'), 'Line1\nLine2\nLine3'),
+    (2, 'CUST-002', 'Beta Labs', 'SILVER', 'A', 50000.00, JSON_OBJECT('region', 'US', 'tags', JSON_ARRAY('startup', 'db')), 'Contains quotes: "double", ''single'''),
+    (3, 'CUST-003', 'Gamma Retail', 'PLATINUM', 'A', 250000.00, JSON_OBJECT('region', 'JP', 'channels', JSON_ARRAY('offline', 'online')), 'Unicode test: 한글, 日本語, emoji 😀'),
+    (4, 'CUST-004', 'Dormant Co', 'BRONZE', 'I', 1000.00, JSON_OBJECT('region', 'KR', 'state', 'inactive'), 'inactive customer');
+
+INSERT INTO qb_product (product_id, category_id, sku, product_name, base_price, tax_rate, attr_json, is_active)
+VALUES (100, 11, 'CPU-001', 'Falcon X1 CPU', 300.00, 0.10, JSON_OBJECT('vendor', 'A', 'cores', 8), 1),
+    (101, 11, 'CPU-002', 'Falcon X2 CPU', 550.00, 0.10, JSON_OBJECT('vendor', 'A', 'cores', 16), 1),
+    (102, 12, 'MEM-001', 'Nebula RAM 32GB', 180.00, 0.10, JSON_OBJECT('vendor', 'B', 'size_gb', 32), 1),
+    (103, 21, 'DB-001', 'Orion DB License', 1200.00, 0.10, JSON_OBJECT('type', 'license', 'term', 'annual'), 1),
+    (104, 22, 'TOOL-01', 'Query Tool Pro', 700.00, 0.10, JSON_OBJECT('edition', 'pro', 'platforms', JSON_ARRAY('win', 'mac')), 1),
+    (105, 30, 'SVC-001', 'Premium Support', 250.00, 0.10, JSON_OBJECT('sla', '24x7'), 1);
+
+INSERT INTO qb_inventory (product_id, qty_on_hand, reorder_point, warehouse_code)
+VALUES (100, 100, 20, 'WH-A'),
+    (101, 50, 15, 'WH-A'),
+    (102, 120, 30, 'WH-B'),
+    (103, 999, 50, 'LIC'),
+    (104, 999, 50, 'LIC'),
+    (105, 999, 50, 'SVC');
+
+INSERT INTO qb_orders (order_id, customer_id, order_no, order_status, ordered_at, paid_at, cancelled_at, memo_text, extra_json)
+VALUES (1000, 1, 'ORD-202501-0001', 'PAID', '2025-01-03 10:11:12.123456', '2025-01-03 11:00:00.000000', NULL, 'urgent order', JSON_OBJECT('channel', 'online', 'priority', 1)),
+    (1001, 1, 'ORD-202501-0002', 'SHIPPED', '2025-01-15 09:00:00.000001', '2025-01-15 09:10:00.000002', NULL, 'ship ASAP; fragile', JSON_OBJECT('channel', 'reseller', 'priority', 2)),
+    (1002, 2, 'ORD-202502-0001', 'PAID', '2025-02-05 15:00:00.222222', '2025-02-05 16:00:00.333333', NULL, 'normal', JSON_OBJECT('channel', 'online', 'coupon', 'BETA10')),
+    (1003, 2, 'ORD-202502-0002', 'CANCELLED', '2025-02-20 08:30:45.000000', NULL, '2025-02-20 08:35:00.000000', 'customer cancelled', JSON_OBJECT('reason', 'budget')),
+    (1004, 3, 'ORD-202503-0001', 'PAID', '2025-03-01 12:00:00.000000', '2025-03-01 12:10:00.000000', NULL, 'VIP deal', JSON_OBJECT('channel', 'partner', 'priority', 1)),
+    (1005, 3, 'ORD-202503-0002', 'NEW', '2025-03-10 19:19:19.999999', NULL, NULL, 'not paid yet', JSON_OBJECT('channel', 'online'));
+
+INSERT INTO qb_order_item (order_item_id, order_id, line_no, product_id, qty, unit_price, discount_rate, note_text)
+VALUES (10000, 1000, 1, 100, 2, 300.00, 0.05, 'CPU promo'),
+    (10001, 1000, 2, 102, 4, 180.00, 0.00, 'RAM bundle'),
+    (10002, 1001, 1, 104, 1, 700.00, 0.10, 'license with discount'),
+    (10003, 1001, 2, 105, 1, 250.00, 0.00, 'support'),
+    (10004, 1002, 1, 103, 1, 1200.00, 0.15, 'coupon applied'),
+    (10005, 1002, 2, 105, 2, 250.00, 0.00, 'support x2'),
+    (10006, 1003, 1, 101, 1, 550.00, 0.00, 'cancelled order line'),
+    (10007, 1004, 1, 100, 3, 300.00, 0.02, 'VIP cpu'),
+    (10008, 1004, 2, 104, 2, 700.00, 0.20, 'VIP tool'),
+    (10009, 1005, 1, 102, 10, 175.00, 0.00, 'pending order');
+
+-- -----------------------------
+-- 3. Triggers
+-- -----------------------------
+
+DELIMITER //
+
+CREATE TRIGGER trg_qb_order_item_ai
+    AFTER INSERT
+    ON qb_order_item
+    FOR EACH ROW
+BEGIN
+    INSERT INTO qb_audit_log (entity_name, entity_pk, action_name, detail_text)
+    VALUES ('qb_order_item', CAST(NEW.order_item_id AS CHAR), 'INSERT', CONCAT('order_id=', NEW.order_id, ',line_no=', NEW.line_no, ',product_id=', NEW.product_id, ',qty=', NEW.qty));
+    UPDATE qb_inventory
+    SET qty_on_hand = qty_on_hand - NEW.qty
+    WHERE product_id = NEW.product_id;
+END//
+
+CREATE TRIGGER trg_qb_order_item_au
+    AFTER UPDATE
+    ON qb_order_item
+    FOR EACH ROW
+BEGIN
+    INSERT INTO qb_audit_log (entity_name, entity_pk, action_name, detail_text)
+    VALUES ('qb_order_item', CAST(NEW.order_item_id AS CHAR), 'UPDATE', CONCAT('old_qty=', OLD.qty, ',new_qty=', NEW.qty, ',old_discount=', OLD.discount_rate, ',new_discount=', NEW.discount_rate));
+    UPDATE qb_inventory
+    SET qty_on_hand = qty_on_hand + OLD.qty - NEW.qty
+    WHERE product_id = NEW.product_id;
+END//
+
+CREATE TRIGGER trg_qb_order_item_ad
+    AFTER DELETE
+    ON qb_order_item
+    FOR EACH ROW
+BEGIN
+    INSERT INTO qb_audit_log (entity_name, entity_pk, action_name, detail_text)
+    VALUES ('qb_order_item', CAST(OLD.order_item_id AS CHAR), 'DELETE', CONCAT('order_id=', OLD.order_id, ',line_no=', OLD.line_no, ',qty=', OLD.qty));
+    UPDATE qb_inventory
+    SET qty_on_hand = qty_on_hand + OLD.qty
+    WHERE product_id = OLD.product_id;
+END//
+
+-- -----------------------------
+-- 4. Helper procedures/functions
+-- -----------------------------
+CREATE PROCEDURE qb_fail(IN p_message TEXT)
+BEGIN
+    SET @qb_fail_msg = LEFT(COALESCE(p_message, 'UNKNOWN FAILURE'), 128);
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = @qb_fail_msg;
+END//
+
+CREATE PROCEDURE qb_assert_true(IN p_condition BOOLEAN, IN p_message TEXT)
+BEGIN
+    INSERT INTO qb_assert_log (test_name, detail_text)
+    VALUES ('ASSERT_TRUE', CONCAT('condition=', IFNULL(CAST(p_condition AS CHAR), 'NULL'), ', message=', p_message));
+    IF COALESCE(p_condition, 0) = 0 THEN
+        CALL qb_fail(CONCAT('ASSERT_TRUE FAILED: ', p_message));
+    END IF;
+END//
+
+CREATE PROCEDURE qb_assert_eq_int(IN p_expected BIGINT, IN p_actual BIGINT, IN p_message TEXT)
+BEGIN
+    INSERT INTO qb_assert_log (test_name, detail_text)
+    VALUES ('ASSERT_EQ_INT', CONCAT('expected=', p_expected, ', actual=', p_actual, ', message=', p_message));
+    IF COALESCE(p_expected, - 999999999999999) <> COALESCE(p_actual, - 999999999999999) THEN
+        CALL qb_fail(CONCAT('ASSERT_EQ_INT FAILED: ', p_message, ' [expected=', p_expected, ', actual=', p_actual, ']'));
+    END IF;
+END//
+
+CREATE PROCEDURE qb_assert_eq_decimal(
+    IN p_expected DECIMAL(30, 8),
+    IN p_actual DECIMAL(30, 8),
+    IN p_scale INT,
+    IN p_message TEXT
+)
+BEGIN
+    DECLARE v_expected DECIMAL(30, 8);
+    DECLARE v_actual DECIMAL(30, 8);
+    SET v_expected = ROUND(COALESCE(p_expected, 0), p_scale);
+    SET v_actual = ROUND(COALESCE(p_actual, 0), p_scale);
+    INSERT INTO qb_assert_log (test_name, detail_text)
+    VALUES ('ASSERT_EQ_DECIMAL', CONCAT('expected=', v_expected, ', actual=', v_actual, ', scale=', p_scale, ', message=', p_message));
+    IF v_expected <> v_actual THEN
+        CALL qb_fail(CONCAT('ASSERT_EQ_DECIMAL FAILED: ', p_message, ' [expected=', v_expected, ', actual=', v_actual, ']'));
+    END IF;
+END//
+
+CREATE FUNCTION qb_fn_order_item_net(
+    p_qty INT,
+    p_unit_price DECIMAL(18, 2),
+    p_discount_rate DECIMAL(9, 4)
+)
+RETURNS DECIMAL(18, 2)
+DETERMINISTIC
+BEGIN
+    RETURN ROUND(p_qty * p_unit_price * (1 - p_discount_rate), 2);
+END//
+
+CREATE FUNCTION qb_fn_customer_grade(
+    p_credit_limit DECIMAL(18, 2),
+    p_tier VARCHAR(20)
+)
+RETURNS VARCHAR(20)
+DETERMINISTIC
+BEGIN
+    DECLARE v_grade VARCHAR(20);
+    SET v_grade =
+        CASE
+            WHEN p_tier = 'PLATINUM'
+                AND p_credit_limit >= 200000 THEN
+                    'S++'
+            WHEN p_tier = 'GOLD'
+                AND p_credit_limit >= 100000 THEN
+                    'S'
+            WHEN p_tier = 'SILVER'
+                AND p_credit_limit >= 50000 THEN
+                    'A'
+            WHEN p_tier = 'BRONZE' THEN
+                'B'
+            ELSE
+                'C'
+        END;
+    RETURN v_grade;
+END//
+
+CREATE PROCEDURE qb_rebuild_monthly_summary(
+    IN p_from_ym CHAR(7),
+    IN p_to_ym CHAR(7)
+)
+BEGIN
+    DECLARE v_sql LONGTEXT;
+    DELETE FROM qb_monthly_summary
+    WHERE ym BETWEEN p_from_ym AND p_to_ym;
+    SET v_sql = '
+        INSERT INTO qb_monthly_summary
+        (
+            ym, customer_id, order_count, gross_amount, discount_amount,
+            net_amount, tax_amount, final_amount, running_rank, payload_json
+        )
+        WITH base AS
+        (
+            SELECT
+                DATE_FORMAT(o.ordered_at, ''%Y-%m'') AS ym,
+                o.customer_id,
+                o.order_id,
+                SUM(oi.qty * oi.unit_price) AS gross_amount,
+                SUM(oi.qty * oi.unit_price * oi.discount_rate) AS discount_amount,
+                SUM(ROUND(oi.qty * oi.unit_price * (1 - oi.discount_rate), 2)) AS net_amount,
+                SUM(ROUND(oi.qty * oi.unit_price * (1 - oi.discount_rate) * p.tax_rate, 2)) AS tax_amount
+            FROM qb_orders o
+            JOIN qb_order_item oi
+              ON oi.order_id = o.order_id
+            JOIN qb_product p
+              ON p.product_id = oi.product_id
+            WHERE DATE_FORMAT(o.ordered_at, ''%Y-%m'') BETWEEN ? AND ?
+              AND o.order_status IN (''PAID'', ''SHIPPED'', ''CLOSED'')
+            GROUP BY DATE_FORMAT(o.ordered_at, ''%Y-%m''), o.customer_id, o.order_id
+        ),
+        rolled AS
+        (
+            SELECT
+                ym,
+                customer_id,
+                COUNT(*) AS order_count,
+                ROUND(SUM(gross_amount), 2) AS gross_amount,
+                ROUND(SUM(discount_amount), 2) AS discount_amount,
+                ROUND(SUM(net_amount), 2) AS net_amount,
+                ROUND(SUM(tax_amount), 2) AS tax_amount,
+                ROUND(SUM(net_amount + tax_amount), 2) AS final_amount
+            FROM base
+            GROUP BY ym, customer_id
+        )
+        SELECT
+            r.ym,
+            r.customer_id,
+            r.order_count,
+            r.gross_amount,
+            r.discount_amount,
+            r.net_amount,
+            r.tax_amount,
+            r.final_amount,
+            DENSE_RANK() OVER (PARTITION BY r.ym ORDER BY r.final_amount DESC, r.customer_id) AS running_rank,
+            JSON_OBJECT(
+                ''customer_id'', r.customer_id,
+                ''ym'', r.ym,
+                ''order_count'', r.order_count,
+                ''gross_amount'', r.gross_amount,
+                ''discount_amount'', r.discount_amount,
+                ''net_amount'', r.net_amount,
+                ''tax_amount'', r.tax_amount,
+                ''final_amount'', r.final_amount
+            ) AS payload_json
+        FROM rolled r
+    ';
+    PREPARE stmt
+    FROM v_sql;
+    EXECUTE stmt
+    USING p_from_ym,
+        p_to_ym;
+    DEALLOCATE PREPARE stmt;
+END//
+
+CREATE PROCEDURE qb_cursor_inventory_scan(OUT p_low_stock_count INT)
+BEGIN
+    DECLARE v_done INT DEFAULT 0;
+    DECLARE v_product_id INT;
+    DECLARE v_qty INT;
+    DECLARE v_reorder INT;
+    DECLARE cur CURSOR FOR
+        SELECT product_id,
+            qty_on_hand,
+            reorder_point
+        FROM qb_inventory
+        ORDER BY product_id;
+    DECLARE CONTINUE HANDLER FOR NOT FOUND
+        SET v_done = 1;
+    SET p_low_stock_count = 0;
+    OPEN cur;
+    read_loop: LOOP
+        FETCH cur
+        INTO v_product_id,
+            v_qty,
+            v_reorder;
+        IF v_done = 1 THEN
+            LEAVE read_loop;
+        END IF;
+        IF v_qty <= v_reorder THEN
+            SET p_low_stock_count = p_low_stock_count + 1;
+        END IF;
+    END LOOP;
+    CLOSE cur;
+END//
+
+CREATE PROCEDURE qb_make_test_order(
+    IN p_order_id BIGINT,
+    IN p_customer_id INT,
+    IN p_order_no VARCHAR(40),
+    IN p_ordered_at DATETIME(6),
+    IN p_product_id INT,
+    IN p_qty INT,
+    IN p_unit_price DECIMAL(18, 2),
+    IN p_discount_rate DECIMAL(9, 4)
+)
+BEGIN
+    DECLARE v_exists INT DEFAULT 0;
+    SELECT COUNT(*)
+    INTO v_exists
+    FROM qb_customer
+    WHERE customer_id = p_customer_id
+        AND status_code = 'A';
+    IF v_exists = 0 THEN
+        CALL qb_fail(CONCAT('customer invalid or inactive: ', p_customer_id));
+    END IF;
+    START TRANSACTION;
+    INSERT INTO qb_orders (order_id, customer_id, order_no, order_status, ordered_at, paid_at, cancelled_at, memo_text, extra_json)
+    VALUES (p_order_id, p_customer_id, p_order_no, 'PAID', p_ordered_at, p_ordered_at, NULL, 'generated by qb_make_test_order; contains ; and ''quotes''', JSON_OBJECT('source', 'proc', 'product_id', p_product_id));
+    INSERT INTO qb_order_item (order_item_id, order_id, line_no, product_id, qty, unit_price, discount_rate, note_text)
+    VALUES (p_order_id * 10, p_order_id, 1, p_product_id, p_qty, p_unit_price, p_discount_rate, CONCAT('auto line for order=', p_order_id));
+    COMMIT;
+END//
+
+DELIMITER ;
+
+-- -----------------------------
+-- 5. View with CTE-ish complexity pushed into subqueries
+-- -----------------------------
+
+CREATE OR REPLACE VIEW qb_v_customer_rollup AS
+    SELECT c.customer_id,
+        c.customer_code,
+        c.customer_name,
+        c.tier,
+        qb_fn_customer_grade(c.credit_limit, c.tier) AS customer_grade,
+        COALESCE(o.order_count, 0) AS order_count,
+        COALESCE(o.total_net_amount, 0.00) AS total_net_amount,
+        COALESCE(o.avg_order_amount, 0.00) AS avg_order_amount,
+        COALESCE(j.tag_count, 0) AS tag_count,
+    CASE
+        WHEN COALESCE(o.total_net_amount, 0) >= 3000 THEN 'VIP'
+        WHEN COALESCE(o.total_net_amount, 0) >= 1000 THEN 'CORE'
+        WHEN COALESCE(o.total_net_amount, 0) > 0 THEN 'ACTIVE'
+        ELSE 'NO_PAID_ORDER'
+    END AS spending_band
+    FROM qb_customer c
+    LEFT JOIN (
+        SELECT o.customer_id,
+            COUNT(DISTINCT o.order_id) AS order_count,
+            ROUND(SUM(qb_fn_order_item_net(oi.qty, oi.unit_price, oi.discount_rate)), 2) AS total_net_amount,
+            ROUND(SUM(qb_fn_order_item_net(oi.qty, oi.unit_price, oi.discount_rate)) / COUNT(DISTINCT o.order_id), 2) AS avg_order_amount
+        FROM qb_orders o
+        JOIN qb_order_item oi
+            ON oi.order_id = o.order_id
+        WHERE o.order_status IN ('PAID', 'SHIPPED', 'CLOSED')
+        GROUP BY o.customer_id
+    ) o
+    ON o.customer_id = c.customer_id
+    LEFT JOIN (
+        SELECT c2.customer_id,
+            JSON_LENGTH(JSON_EXTRACT(c2.meta_json, '$.tags')) AS tag_count
+        FROM qb_customer c2
+    ) j
+    ON j.customer_id = c.customer_id;
+
+-- -----------------------------
+-- 6. Trigger sanity smoke using explicit DML
+-- -----------------------------
+
+@TRANSACTION
+
+INSERT INTO qb_orders (order_id, customer_id, order_no, order_status, ordered_at, paid_at, cancelled_at, memo_text, extra_json)
+VALUES (2000, 1, 'ORD-202503-TRG-01', 'PAID', '2025-03-20 10:00:00.100000', '2025-03-20 10:00:01.100000', NULL, 'trigger smoke order', JSON_OBJECT('source', 'manual insert'));
+
+INSERT INTO qb_order_item (order_item_id, order_id, line_no, product_id, qty, unit_price, discount_rate, note_text)
+VALUES (20000, 2000, 1, 100, 5, 300.00, 0.00, 'trigger insert');
+
+UPDATE qb_order_item
+SET qty = 7,
+    discount_rate = 0.10,
+    note_text = 'trigger update'
+WHERE order_item_id = 20000;
+
+DELETE FROM qb_order_item
+WHERE order_item_id = 20000;
+
+ROLLBACK;
+
+-- -----------------------------
+-- 7. Procedural test order generation
+-- -----------------------------
+
+CALL qb_make_test_order(3000, 1, 'ORD-202503-PROC-01', '2025-03-25 09:30:00.111111', 104, 2, 700.00, 0.15);
+
+CALL qb_make_test_order(3001, 2, 'ORD-202503-PROC-02', '2025-03-26 10:45:00.222222', 103, 1, 1200.00, 0.05);
+
+CALL qb_make_test_order(3002, 3, 'ORD-202503-PROC-03', '2025-03-27 17:05:00.333333', 100, 4, 300.00, 0.10);
+
+-- -----------------------------
+-- 8. Rebuild summary using dynamic SQL + window function
+-- -----------------------------
+
+CALL qb_rebuild_monthly_summary('2025-01', '2025-03');
+
+-- -----------------------------
+-- 9. Assertions
+-- -----------------------------
+-- 9-1. Base counts
+
+CALL qb_assert_eq_int(
+    4,
+    (
+        SELECT COUNT(*)
+        FROM qb_customer
+    ),
+    'customer count'
+);
+
+CALL qb_assert_eq_int(
+    6,
+    (
+        SELECT COUNT(*)
+        FROM qb_product
+    ),
+    'product count'
+);
+
+CALL qb_assert_true(
+    (
+        SELECT COUNT(*)
+        FROM qb_orders
+    ) >= 9,
+    'orders should include generated procedure orders'
+);
+
+CALL qb_assert_true(
+    (
+        SELECT COUNT(*)
+        FROM qb_order_item
+    ) >= 10,
+    'order items should exist'
+);
+
+-- 9-2. Trigger logs for rolled-back transaction should not persist after rollback
+
+CALL qb_assert_eq_int(
+    0,
+    (
+        SELECT COUNT(*)
+        FROM qb_audit_log
+        WHERE entity_pk = '20000'
+    ),
+    'rollback should remove audit rows from smoke transaction'
+);
+
+-- 9-3. Generated procedure orders must exist
+
+CALL qb_assert_eq_int(
+    3,
+    (
+        SELECT COUNT(*)
+        FROM qb_orders
+        WHERE order_id IN (3000, 3001, 3002)
+                AND order_status = 'PAID'
+    ),
+    'generated paid orders count'
+);
+
+-- 9-4. Inventory check after generated orders
+
+CALL qb_assert_eq_int(
+    96,
+    (
+        SELECT qty_on_hand
+        FROM qb_inventory
+        WHERE product_id = 100
+    ),
+    'inventory product 100 after generated orders'
+);
+
+CALL qb_assert_eq_int(
+    998,
+    (
+        SELECT qty_on_hand
+        FROM qb_inventory
+        WHERE product_id = 103
+    ),
+    'inventory product 103 after generated orders'
+);
+
+CALL qb_assert_eq_int(
+    997,
+    (
+        SELECT qty_on_hand
+        FROM qb_inventory
+        WHERE product_id = 104
+    ),
+    'inventory product 104 after generated orders'
+);
+
+-- 9-5. Function test
+
+CALL qb_assert_eq_decimal(
+    570.00,
+    qb_fn_order_item_net(2, 300.00, 0.05),
+    2,
+    'qb_fn_order_item_net basic case'
+);
+
+CALL qb_assert_true(
+    (
+        SELECT qb_fn_customer_grade(250000.00, 'PLATINUM')
+    ) = 'S++',
+    'customer grade function'
+);
+
+-- 9-6. Recursive CTE test
+
+WITH RECURSIVE cat_tree AS (
+    SELECT
+        category_id,
+        parent_category_id,
+        category_name,
+        CAST(category_name AS CHAR(500)) AS full_path,
+        0 AS lvl
+    FROM qb_category
+    WHERE parent_category_id IS NULL
+    UNION ALL
+    SELECT
+        c.category_id,
+        c.parent_category_id,
+        c.category_name,
+        CONCAT(t.full_path, ' > ', c.category_name) AS full_path,
+        t.lvl + 1 AS lvl
+    FROM qb_category c
+    JOIN cat_tree t
+        ON c.parent_category_id = t.category_id
+)
+SELECT COUNT(*)
+INTO @cat_tree_count
+FROM cat_tree;
+
+CALL qb_assert_eq_int(8, @cat_tree_count, 'recursive cte category count');
+
+-- 9-7. Window function ranking test
+
+SELECT running_rank
+INTO @march_top_rank
+FROM qb_monthly_summary
+WHERE ym = '2025-03'
+ORDER BY final_amount DESC,
+    customer_id
+LIMIT 1;
+
+CALL qb_assert_eq_int(1, @march_top_rank, 'window ranking top rank should be 1');
+
+-- 9-8. JSON function test
+
+SELECT JSON_UNQUOTE(JSON_EXTRACT(meta_json, '$.region'))
+INTO @alpha_region
+FROM qb_customer
+WHERE customer_id = 1;
+
+CALL qb_assert_true(@alpha_region = 'KR', 'json extract region');
+
+SELECT JSON_LENGTH(JSON_EXTRACT(meta_json, '$.tags'))
+INTO @alpha_tag_count
+FROM qb_customer
+WHERE customer_id = 1;
+
+CALL qb_assert_eq_int(2, @alpha_tag_count, 'json tag count');
+
+-- 9-9. View test
+
+CALL qb_assert_true(
+    EXISTS (
+        SELECT 1
+        FROM qb_v_customer_rollup
+        WHERE customer_id = 1
+                AND spending_band IN ('CORE', 'VIP')
+    ),
+    'view should classify customer 1 as active spender'
+);
+
+-- 9-10. Cursor test
+
+CALL qb_cursor_inventory_scan(@low_stock_count);
+
+CALL qb_assert_eq_int(0, @low_stock_count, 'no product should be at or below reorder point');
+
+-- 9-11. Complex query result test
+
+WITH paid_order_line AS (
+    SELECT
+        o.customer_id,
+        o.order_id,
+        oi.order_item_id,
+        oi.product_id,
+        oi.qty,
+        oi.unit_price,
+        oi.discount_rate,
+        qb_fn_order_item_net(oi.qty, oi.unit_price, oi.discount_rate) AS net_amount
+    FROM qb_orders o
+    JOIN qb_order_item oi
+        ON oi.order_id = o.order_id
+    WHERE o.order_status IN ('PAID', 'SHIPPED', 'CLOSED')
+),
+ranked AS (
+    SELECT
+        pol.*,
+        ROW_NUMBER() OVER (
+            PARTITION BY pol.customer_id
+            ORDER BY pol.net_amount DESC,
+            pol.order_item_id
+        ) AS rn
+    FROM paid_order_line pol
+)
+SELECT COUNT(*)
+INTO @top_line_count
+FROM ranked
+WHERE rn = 1;
+
+CALL qb_assert_eq_int(3, @top_line_count, 'top line per active purchasing customer');
+
+-- 9-12. Dynamic temp table test
+
+SET @dyn_sql = '
+    CREATE TEMPORARY TABLE tmp_qb_matrix AS
+    SELECT
+        c.customer_id,
+        DATE_FORMAT(o.ordered_at, ''%Y-%m'') AS ym,
+        SUM(qb_fn_order_item_net(oi.qty, oi.unit_price, oi.discount_rate)) AS net_amount
+    FROM qb_customer c
+    JOIN qb_orders o
+      ON o.customer_id = c.customer_id
+    JOIN qb_order_item oi
+      ON oi.order_id = o.order_id
+    WHERE o.order_status IN (''PAID'',''SHIPPED'',''CLOSED'')
+    GROUP BY c.customer_id, DATE_FORMAT(o.ordered_at, ''%Y-%m'')
+';
+
+PREPARE stmt_tmp
+FROM @dyn_sql;
+
+EXECUTE stmt_tmp;
+
+DEALLOCATE PREPARE stmt_tmp;
+
+CALL qb_assert_true(
+    (
+        SELECT COUNT(*)
+        FROM tmp_qb_matrix
+    ) >= 5,
+    'temporary matrix should contain grouped rows'
+);
+
+DROP TEMPORARY TABLE IF EXISTS tmp_qb_matrix;
+
+-- 9-13. String/comment/semicolon safety test
+
+SET @weird_text = 'This string has ; semicolon, ''single quote'', "double quote", backslash \\ and newline\nEND';
+
+CALL qb_assert_true(LOCATE(';', @weird_text) > 0, 'string literal with semicolon');
+
+CALL qb_assert_true(LOCATE('END', @weird_text) > 0, 'string literal with END');
+
+-- -----------------------------
+-- 10. Output result sets for UI testing
+-- Multiple result sets on purpose
+-- -----------------------------
+
+SELECT 'SUMMARY_BY_MONTH' AS section_name,
+    ym,
+    customer_id,
+    order_count,
+    gross_amount,
+    discount_amount,
+    net_amount,
+    tax_amount,
+    final_amount,
+    running_rank
+FROM qb_monthly_summary
+ORDER BY ym,
+    running_rank,
+    customer_id;
+
+SELECT 'CUSTOMER_ROLLUP' AS section_name,
+    customer_id,
+    customer_code,
+    customer_name,
+    tier,
+    customer_grade,
+    order_count,
+    total_net_amount,
+    avg_order_amount,
+    tag_count,
+    spending_band
+FROM qb_v_customer_rollup
+ORDER BY customer_id;
+
+WITH RECURSIVE cat_tree AS (
+    SELECT
+        category_id,
+        parent_category_id,
+        category_name,
+        CAST(category_name AS CHAR(500)) AS full_path,
+        0 AS lvl
+    FROM qb_category
+    WHERE parent_category_id IS NULL
+    UNION ALL
+    SELECT
+        c.category_id,
+        c.parent_category_id,
+        c.category_name,
+        CONCAT(t.full_path, ' > ', c.category_name) AS full_path,
+        t.lvl + 1 AS lvl
+    FROM qb_category c
+    JOIN cat_tree t
+        ON c.parent_category_id = t.category_id
+)
+SELECT
+    'CATEGORY_TREE' AS section_name,
+    category_id,
+    parent_category_id,
+    REPEAT('  ', lvl) AS indent_prefix,
+    category_name,
+    full_path,
+    lvl
+FROM cat_tree
+ORDER BY full_path;
+
+SELECT
+    'FINAL_STATUS' AS section_name,
+    'PASS' AS result_status,
+    NOW(6) AS executed_at,
+    (
+        SELECT COUNT(*)
+        FROM qb_assert_log
+    ) AS assertion_log_rows,
+    (
+        SELECT COUNT(*)
+        FROM qb_audit_log
+    ) AS audit_rows_after_commit_orders,
+    (
+        SELECT COUNT(*)
+        FROM qb_monthly_summary
+    ) AS monthly_summary_rows;

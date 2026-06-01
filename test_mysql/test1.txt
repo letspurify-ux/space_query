@@ -1,0 +1,861 @@
+-- FINAL BOSS SCRIPT FOR A MYSQL QUERY TOOL
+-- Target: MySQL 8.0+ / 8.4
+-- If you do not have CREATE DATABASE privilege, remove the first 3 lines and run in an existing schema.
+
+DROP DATABASE IF EXISTS qt_mysql_final_boss;
+CREATE DATABASE qt_mysql_final_boss CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+USE qt_mysql_final_boss;
+
+SET NAMES utf8mb4;
+
+SET @versioned_comment_executed = 0;
+/*!80000 SET @versioned_comment_executed = 1 */;
+
+# line comment torture: ; ; ; DELIMITER $$ should not matter here
+
+/*
+  block comment torture:
+  ; ; ;
+  DELIMITER $$
+  CREATE PROCEDURE fake_proc() BEGIN SELECT 1; END$$
+*/
+
+CREATE TABLE dept (
+    dept_id INT NOT NULL,
+    parent_dept_id INT NULL,
+    dept_code VARCHAR(20) NOT NULL,
+    dept_name VARCHAR(100) NOT NULL,
+    sort_no INT NOT NULL,
+    PRIMARY KEY (dept_id),
+    UNIQUE KEY uk_dept_code (dept_code),
+    KEY idx_dept_parent (parent_dept_id),
+    CONSTRAINT fk_dept_parent
+        FOREIGN KEY (parent_dept_id) REFERENCES dept (dept_id),
+    CONSTRAINT chk_dept_self
+        CHECK (parent_dept_id IS NULL OR parent_dept_id <> dept_id)
+) ENGINE = InnoDB;
+
+CREATE TABLE emp (
+    emp_id INT NOT NULL,
+    dept_id INT NOT NULL,
+    manager_emp_id INT NULL,
+    emp_name VARCHAR(100) NOT NULL,
+    email VARCHAR(200) NOT NULL,
+    base_salary DECIMAL(12, 2) NOT NULL,
+    profile JSON NOT NULL,
+    locale_code VARCHAR(20)
+        GENERATED ALWAYS AS (JSON_UNQUOTE(JSON_EXTRACT(profile, '$.locale'))) STORED,
+    skill_count INT
+        GENERATED ALWAYS AS (JSON_LENGTH(JSON_EXTRACT(profile, '$.skills'))) STORED,
+    hired_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (emp_id),
+    UNIQUE KEY uk_emp_email (email),
+    KEY idx_emp_dept_salary (dept_id, base_salary DESC),
+    KEY idx_emp_manager (manager_emp_id),
+    CONSTRAINT fk_emp_dept
+        FOREIGN KEY (dept_id) REFERENCES dept (dept_id),
+    CONSTRAINT fk_emp_manager
+        FOREIGN KEY (manager_emp_id) REFERENCES emp (emp_id),
+    CONSTRAINT chk_emp_salary
+        CHECK (base_salary >= 0)
+) ENGINE = InnoDB;
+
+CREATE TABLE orders (
+    order_id BIGINT NOT NULL,
+    emp_id INT NOT NULL,
+    order_code VARCHAR(40) NOT NULL,
+    order_status VARCHAR(20) NOT NULL,
+    currency_code CHAR(3) NOT NULL,
+    total_amount DECIMAL(14, 2) NOT NULL,
+    payload JSON NOT NULL,
+    created_at DATETIME(6) NOT NULL,
+    customer_tier VARCHAR(20)
+        GENERATED ALWAYS AS (JSON_UNQUOTE(JSON_EXTRACT(payload, '$.customer.tier'))) STORED,
+    item_count INT
+        GENERATED ALWAYS AS (JSON_LENGTH(JSON_EXTRACT(payload, '$.items'))) STORED,
+    note_text VARCHAR(255)
+        GENERATED ALWAYS AS (JSON_UNQUOTE(JSON_EXTRACT(payload, '$.note'))) VIRTUAL,
+    PRIMARY KEY (order_id),
+    UNIQUE KEY uk_order_code (order_code),
+    KEY idx_orders_emp_created (emp_id, created_at),
+    KEY idx_orders_tier_status (customer_tier, order_status),
+    CONSTRAINT fk_orders_emp
+        FOREIGN KEY (emp_id) REFERENCES emp (emp_id),
+    CONSTRAINT chk_orders_amount
+        CHECK (total_amount >= 0)
+) ENGINE = InnoDB;
+
+CREATE TABLE order_audit (
+    audit_id BIGINT NOT NULL AUTO_INCREMENT,
+    order_id BIGINT NOT NULL,
+    action_type VARCHAR(30) NOT NULL,
+    action_note VARCHAR(255) NOT NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (audit_id),
+    KEY idx_order_audit_order (order_id),
+    CONSTRAINT fk_order_audit_order
+        FOREIGN KEY (order_id) REFERENCES orders (order_id)
+) ENGINE = InnoDB;
+
+CREATE TABLE sales_summary (
+    summary_key VARCHAR(100) NOT NULL,
+    `group` VARCHAR(30) NOT NULL,
+    summary_value_decimal DECIMAL(18, 2) NULL,
+    summary_value_text VARCHAR(500) NULL,
+    summary_json JSON NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (summary_key)
+) ENGINE = InnoDB;
+
+CREATE TABLE error_log (
+    log_id BIGINT NOT NULL AUTO_INCREMENT,
+    step_name VARCHAR(100) NOT NULL,
+    sql_state CHAR(5) NULL,
+    mysql_errno INT NULL,
+    message_text VARCHAR(512) NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (log_id)
+) ENGINE = InnoDB;
+
+DELIMITER $$
+
+CREATE FUNCTION fn_currency_rate (p_currency_code CHAR(3))
+RETURNS DECIMAL(10, 5)
+DETERMINISTIC
+BEGIN
+    RETURN CASE UPPER(TRIM(p_currency_code))
+        WHEN 'USD' THEN 1.0000
+        WHEN 'EUR' THEN 1.1000
+        WHEN 'KRW' THEN 0.00075
+        WHEN 'JPY' THEN 0.00680
+        ELSE 1.0000
+    END;
+END$$
+
+CREATE PROCEDURE sp_assert (
+    IN p_condition BOOLEAN,
+    IN p_message VARCHAR(255)
+)
+BEGIN
+    IF NOT p_condition THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = p_message;
+    END IF;
+END$$
+
+CREATE TRIGGER trg_orders_bi
+BEFORE INSERT ON orders
+FOR EACH ROW
+BEGIN
+    SET NEW.order_status = UPPER(TRIM(NEW.order_status));
+    SET NEW.currency_code = UPPER(TRIM(NEW.currency_code));
+
+    IF NEW.total_amount < 0 THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'negative total_amount is not allowed';
+    END IF;
+END$$
+
+CREATE TRIGGER trg_orders_bu
+BEFORE UPDATE ON orders
+FOR EACH ROW
+BEGIN
+    SET NEW.order_status = UPPER(TRIM(NEW.order_status));
+    SET NEW.currency_code = UPPER(TRIM(NEW.currency_code));
+END$$
+
+CREATE TRIGGER trg_orders_ai
+AFTER INSERT ON orders
+FOR EACH ROW
+BEGIN
+    INSERT INTO order_audit (
+        order_id,
+        action_type,
+        action_note
+    )
+    VALUES (
+        NEW.order_id,
+        'INSERT',
+        CONCAT(
+            'created tier=',
+            COALESCE(JSON_UNQUOTE(JSON_EXTRACT(NEW.payload, '$.customer.tier')), 'null')
+        )
+    );
+END$$
+
+CREATE TRIGGER trg_orders_au
+AFTER UPDATE ON orders
+FOR EACH ROW
+BEGIN
+    IF NOT (OLD.order_status <=> NEW.order_status) THEN
+        INSERT INTO order_audit (
+            order_id,
+            action_type,
+            action_note
+        )
+        VALUES (
+            NEW.order_id,
+            'UPDATE_STATUS',
+            CONCAT(OLD.order_status, ' -> ', NEW.order_status)
+        );
+    END IF;
+END$$
+
+CREATE PROCEDURE sp_run_final_boss ()
+BEGIN
+    DECLARE v_done INT DEFAULT 0;
+    DECLARE v_emp_id INT;
+    DECLARE v_emp_name VARCHAR(100);
+    DECLARE v_base_salary DECIMAL(12, 2);
+    DECLARE v_emp_count INT DEFAULT 0;
+    DECLARE v_salary_sum DECIMAL(18, 2) DEFAULT 0.00;
+    DECLARE v_cnt INT DEFAULT 0;
+    DECLARE v_max_depth INT DEFAULT 0;
+    DECLARE v_total_usd DECIMAL(18, 2) DEFAULT 0.00;
+    DECLARE v_top_emp_id INT DEFAULT NULL;
+    DECLARE v_state CHAR(5) DEFAULT NULL;
+    DECLARE v_errno INT DEFAULT NULL;
+    DECLARE v_msg TEXT DEFAULT NULL;
+
+    DECLARE cur_emp CURSOR FOR
+        SELECT
+            emp_id,
+            emp_name,
+            base_salary
+        FROM emp
+        ORDER BY emp_id;
+
+    DECLARE CONTINUE HANDLER FOR NOT FOUND
+        SET v_done = 1;
+
+    DECLARE CONTINUE HANDLER FOR 1062
+    BEGIN
+        GET DIAGNOSTICS CONDITION 1
+            v_state = RETURNED_SQLSTATE,
+            v_errno = MYSQL_ERRNO,
+            v_msg = MESSAGE_TEXT;
+
+        INSERT INTO error_log (
+            step_name,
+            sql_state,
+            mysql_errno,
+            message_text
+        )
+        VALUES (
+            'EXPECTED_DUPLICATE',
+            v_state,
+            v_errno,
+            LEFT(v_msg, 512)
+        );
+    END;
+
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        GET DIAGNOSTICS CONDITION 1
+            v_state = RETURNED_SQLSTATE,
+            v_errno = MYSQL_ERRNO,
+            v_msg = MESSAGE_TEXT;
+
+        ROLLBACK;
+
+        INSERT INTO error_log (
+            step_name,
+            sql_state,
+            mysql_errno,
+            message_text
+        )
+        VALUES (
+            'UNEXPECTED_EXCEPTION',
+            v_state,
+            v_errno,
+            LEFT(v_msg, 512)
+        );
+
+        RESIGNAL;
+    END;
+
+    START TRANSACTION;
+
+    CALL sp_assert(@versioned_comment_executed = 1, 'versioned comment handling failed');
+
+    INSERT INTO dept (
+        dept_id,
+        parent_dept_id,
+        dept_code,
+        dept_name,
+        sort_no
+    )
+    VALUES (
+        10,
+        NULL,
+        'HQ',
+        'Headquarters',
+        1
+    );
+
+    INSERT INTO dept (
+        dept_id,
+        parent_dept_id,
+        dept_code,
+        dept_name,
+        sort_no
+    )
+    VALUES
+        (20, 10, 'SALES', 'Sales', 2),
+        (30, 10, 'ENG', 'Engineering', 3);
+
+    INSERT INTO dept (
+        dept_id,
+        parent_dept_id,
+        dept_code,
+        dept_name,
+        sort_no
+    )
+    VALUES (
+        40,
+        30,
+        'DATA',
+        'Data Platform',
+        4
+    );
+
+    INSERT INTO dept (
+        dept_id,
+        parent_dept_id,
+        dept_code,
+        dept_name,
+        sort_no
+    )
+    VALUES (
+        20,
+        10,
+        'SALES',
+        'Sales-upsert-check',
+        2
+    )
+    ON DUPLICATE KEY UPDATE
+        dept_name = CONCAT(VALUES(dept_name), ' / touched'),
+        sort_no = VALUES(sort_no);
+
+    INSERT INTO emp (
+        emp_id,
+        dept_id,
+        manager_emp_id,
+        emp_name,
+        email,
+        base_salary,
+        profile,
+        hired_at
+    )
+    VALUES (
+        100,
+        10,
+        NULL,
+        'CEO Root',
+        'ceo@example.com',
+        300000.00,
+        JSON_OBJECT(
+            'locale', 'en-US',
+            'skills', JSON_ARRAY('leadership', 'finance', 'strategy')
+        ),
+        '2024-01-01 09:00:00.000001'
+    );
+
+    INSERT INTO emp (
+        emp_id,
+        dept_id,
+        manager_emp_id,
+        emp_name,
+        email,
+        base_salary,
+        profile,
+        hired_at
+    )
+    VALUES
+        (
+            110,
+            20,
+            100,
+            'Alice Kim',
+            'alice@example.com',
+            120000.00,
+            JSON_OBJECT(
+                'locale', 'ko-KR',
+                'skills', JSON_ARRAY('sql', 'sales', 'analysis')
+            ),
+            '2024-02-01 09:00:00.000001'
+        ),
+        (
+            120,
+            20,
+            100,
+            'Bob Stone',
+            'bob@example.com',
+            110000.00,
+            JSON_OBJECT(
+                'locale', 'en-US',
+                'skills', JSON_ARRAY('ops', 'crm')
+            ),
+            '2024-02-02 09:00:00.000001'
+        ),
+        (
+            130,
+            30,
+            100,
+            'Zoë O''Connor',
+            'zoe@example.com',
+            180000.00,
+            JSON_OBJECT(
+                'locale', 'en-GB',
+                'skills', JSON_ARRAY('mysql', 'rust', 'json')
+            ),
+            '2024-02-03 09:00:00.000001'
+        ),
+        (
+            140,
+            40,
+            130,
+            '홍길동',
+            'hong@example.com',
+            160000.00,
+            JSON_OBJECT(
+                'locale', 'ko-KR',
+                'skills', JSON_ARRAY('etl', 'ml', 'mysql')
+            ),
+            '2024-02-04 09:00:00.000001'
+        );
+
+    INSERT INTO orders (
+        order_id,
+        emp_id,
+        order_code,
+        order_status,
+        currency_code,
+        total_amount,
+        payload,
+        created_at
+    )
+    VALUES
+        (
+            1001,
+            110,
+            'ORD-1001',
+            'new',
+            'usd',
+            120.50,
+            JSON_OBJECT(
+                'customer', JSON_OBJECT(
+                    'id', 'C001',
+                    'tier', 'gold',
+                    'name', 'O''Connor "Global"'
+                ),
+                'note', 'contains ; semicolon, ''quote'', backslash \\\\, text -- not comment, text /* not comment */, token DELIMITER $$, emoji 😊',
+                'gift', TRUE,
+                'items', JSON_ARRAY(
+                    JSON_OBJECT('sku', 'A-1', 'qty', 2, 'unit_price', 30.00, 'tags', JSON_ARRAY('hot', 'new')),
+                    JSON_OBJECT('sku', 'B-2', 'qty', 1, 'unit_price', 60.50, 'tags', JSON_ARRAY('bundle', '한글'))
+                )
+            ),
+            '2026-01-05 10:00:00.123456'
+        ),
+        (
+            1002,
+            110,
+            'ORD-1002',
+            ' paid ',
+            'krw',
+            130000.00,
+            JSON_OBJECT(
+                'customer', JSON_OBJECT(
+                    'id', 'C002',
+                    'tier', 'silver',
+                    'name', 'Seoul Branch'
+                ),
+                'note', 'KRW order',
+                'gift', FALSE,
+                'items', JSON_ARRAY(
+                    JSON_OBJECT('sku', 'K-1', 'qty', 1, 'unit_price', 50000.00),
+                    JSON_OBJECT('sku', 'K-2', 'qty', 2, 'unit_price', 40000.00)
+                )
+            ),
+            '2026-01-06 11:00:00.123456'
+        ),
+        (
+            1003,
+            130,
+            'ORD-1003',
+            'new',
+            'eur',
+            310.00,
+            JSON_OBJECT(
+                'customer', JSON_OBJECT(
+                    'id', 'C003',
+                    'tier', 'platinum',
+                    'name', 'Berlin Labs'
+                ),
+                'note', 'EUR order',
+                'gift', FALSE,
+                'items', JSON_ARRAY(
+                    JSON_OBJECT('sku', 'S-1', 'qty', 1, 'unit_price', 200.00),
+                    JSON_OBJECT('sku', 'S-2', 'qty', 2, 'unit_price', 55.00)
+                )
+            ),
+            '2026-01-07 12:00:00.123456'
+        ),
+        (
+            1004,
+            140,
+            'ORD-1004',
+            'shipped',
+            'usd',
+            99.99,
+            JSON_OBJECT(
+                'customer', JSON_OBJECT(
+                    'id', 'C004',
+                    'tier', 'gold',
+                    'name', 'Data Ops'
+                ),
+                'note', 'single line item',
+                'gift', FALSE,
+                'items', JSON_ARRAY(
+                    JSON_OBJECT('sku', 'M-1', 'qty', 3, 'unit_price', 33.33)
+                )
+            ),
+            '2026-01-08 13:00:00.123456'
+        ),
+        (
+            1005,
+            140,
+            'ORD-1005',
+            'new',
+            'jpy',
+            22000.00,
+            JSON_OBJECT(
+                'customer', JSON_OBJECT(
+                    'id', 'C005',
+                    'tier', 'bronze',
+                    'name', 'Tokyo Ops'
+                ),
+                'note', 'JPY order',
+                'gift', TRUE,
+                'items', JSON_ARRAY(
+                    JSON_OBJECT('sku', 'J-1', 'qty', 1, 'unit_price', 12000.00),
+                    JSON_OBJECT('sku', 'J-2', 'qty', 2, 'unit_price', 5000.00)
+                )
+            ),
+            '2026-01-09 14:00:00.123456'
+        );
+
+    UPDATE orders
+       SET order_status = ' paid '
+     WHERE order_id = 1001;
+
+    SAVEPOINT sp_before_rollback_test;
+
+    INSERT INTO sales_summary (
+        summary_key,
+        `group`,
+        summary_value_decimal,
+        summary_value_text,
+        summary_json
+    )
+    VALUES (
+        'ROLLBACK_MARK',
+        'TEMP',
+        999.99,
+        'this row must disappear after rollback to savepoint',
+        JSON_OBJECT('temp', TRUE)
+    );
+
+    ROLLBACK TO SAVEPOINT sp_before_rollback_test;
+    RELEASE SAVEPOINT sp_before_rollback_test;
+
+    SELECT COUNT(*)
+      INTO v_cnt
+      FROM sales_summary
+     WHERE summary_key = 'ROLLBACK_MARK';
+
+    CALL sp_assert(v_cnt = 0, 'savepoint rollback mismatch');
+
+    -- expected duplicate: should be logged by handler, not kill the run
+    INSERT INTO orders (
+        order_id,
+        emp_id,
+        order_code,
+        order_status,
+        currency_code,
+        total_amount,
+        payload,
+        created_at
+    )
+    VALUES (
+        1001,
+        110,
+        'ORD-1001',
+        'new',
+        'USD',
+        120.50,
+        JSON_OBJECT(
+            'customer', JSON_OBJECT('id', 'DUP', 'tier', 'gold'),
+            'note', 'duplicate row should never be inserted',
+            'items', JSON_ARRAY(
+                JSON_OBJECT('sku', 'X-1', 'qty', 1, 'unit_price', 120.50)
+            )
+        ),
+        '2026-01-10 15:00:00.123456'
+    );
+
+    OPEN cur_emp;
+
+    read_loop: LOOP
+        FETCH cur_emp INTO v_emp_id, v_emp_name, v_base_salary;
+
+        IF v_done = 1 THEN
+            LEAVE read_loop;
+        END IF;
+
+        SET v_emp_count = v_emp_count + 1;
+        SET v_salary_sum = v_salary_sum + v_base_salary;
+    END LOOP;
+
+    CLOSE cur_emp;
+
+    CALL sp_assert(v_emp_count = 5, 'cursor employee count mismatch');
+    CALL sp_assert(v_salary_sum = 870000.00, 'cursor salary sum mismatch');
+
+    DROP TEMPORARY TABLE IF EXISTS tmp_order_flat;
+
+    SET @sql = '
+        CREATE TEMPORARY TABLE tmp_order_flat AS
+        SELECT
+            o.order_id,
+            o.emp_id,
+            jt.sku,
+            jt.qty,
+            jt.unit_price,
+            ROUND(jt.qty * jt.unit_price, 2) AS line_amount
+        FROM orders AS o
+        JOIN JSON_TABLE(
+            o.payload,
+            ''$.items[*]''
+            COLUMNS (
+                sku VARCHAR(30) PATH ''$.sku'',
+                qty INT PATH ''$.qty'',
+                unit_price DECIMAL(10,2) PATH ''$.unit_price''
+            )
+        ) AS jt ON TRUE
+    ';
+
+    PREPARE stmt_flat FROM @sql;
+    EXECUTE stmt_flat;
+    DEALLOCATE PREPARE stmt_flat;
+
+    SELECT COUNT(*)
+      INTO v_cnt
+      FROM tmp_order_flat;
+
+    CALL sp_assert(v_cnt = 9, 'JSON_TABLE flatten row count mismatch');
+
+    SELECT COUNT(*)
+      INTO v_cnt
+      FROM (
+            SELECT
+                o.order_id
+            FROM orders AS o
+            JOIN (
+                SELECT
+                    order_id,
+                    ROUND(SUM(line_amount), 2) AS line_total
+                FROM tmp_order_flat
+                GROUP BY order_id
+            ) AS x
+              ON x.order_id = o.order_id
+             AND x.line_total = o.total_amount
+      ) AS matched_orders;
+
+    CALL sp_assert(v_cnt = 5, 'JSON_TABLE line-total verification mismatch');
+
+    WITH RECURSIVE dept_tree AS (
+        SELECT
+            d.dept_id,
+            d.parent_dept_id,
+            d.dept_code,
+            CAST(d.dept_code AS CHAR(200)) AS path_txt,
+            1 AS lvl
+        FROM dept AS d
+        WHERE d.parent_dept_id IS NULL
+
+        UNION ALL
+
+        SELECT
+            c.dept_id,
+            c.parent_dept_id,
+            c.dept_code,
+            CONCAT(p.path_txt, ' > ', c.dept_code) AS path_txt,
+            p.lvl + 1 AS lvl
+        FROM dept AS c
+        JOIN dept_tree AS p
+          ON c.parent_dept_id = p.dept_id
+    )
+    SELECT MAX(lvl)
+      INTO v_max_depth
+      FROM dept_tree;
+
+    CALL sp_assert(v_max_depth = 3, 'recursive CTE depth mismatch');
+
+    WITH order_base AS (
+        SELECT
+            o.order_id,
+            o.emp_id,
+            ROUND(o.total_amount * fn_currency_rate(o.currency_code), 2) AS total_usd,
+            o.created_at
+        FROM orders AS o
+    ),
+    ranked AS (
+        SELECT
+            ob.*,
+            ROW_NUMBER() OVER w_emp AS rn_in_emp,
+            DENSE_RANK() OVER w_global AS global_rank,
+            SUM(ob.total_usd) OVER w_emp_running AS running_emp_total
+        FROM order_base AS ob
+        WINDOW
+            w_emp AS (
+                PARTITION BY ob.emp_id
+                ORDER BY ob.created_at, ob.order_id
+            ),
+            w_emp_running AS (
+                PARTITION BY ob.emp_id
+                ORDER BY ob.created_at, ob.order_id
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            ),
+            w_global AS (
+                ORDER BY ob.total_usd DESC
+            )
+    )
+    SELECT ROUND(MAX(running_emp_total), 2)
+      INTO v_total_usd
+      FROM ranked
+     WHERE emp_id = 110;
+
+    CALL sp_assert(v_total_usd = 218.00, 'window running total mismatch');
+
+    WITH order_base AS (
+        SELECT
+            o.order_id,
+            o.emp_id,
+            ROUND(o.total_amount * fn_currency_rate(o.currency_code), 2) AS total_usd,
+            o.created_at
+        FROM orders AS o
+    ),
+    ranked AS (
+        SELECT
+            ob.*,
+            DENSE_RANK() OVER (ORDER BY ob.total_usd DESC) AS global_rank
+        FROM order_base AS ob
+    )
+    SELECT emp_id
+      INTO v_top_emp_id
+      FROM ranked
+     WHERE global_rank = 1
+     ORDER BY order_id
+     LIMIT 1;
+
+    CALL sp_assert(v_top_emp_id = 130, 'window ranking mismatch');
+
+    SELECT ROUND(SUM(total_amount * fn_currency_rate(currency_code)), 2)
+      INTO v_total_usd
+      FROM orders;
+
+    CALL sp_assert(v_total_usd = 808.59, 'normalized USD total mismatch');
+
+    SELECT COUNT(*)
+      INTO v_cnt
+      FROM order_audit;
+
+    CALL sp_assert(v_cnt = 6, 'audit row count mismatch');
+
+    INSERT INTO sales_summary (
+        summary_key,
+        `group`,
+        summary_value_decimal,
+        summary_value_text,
+        summary_json
+    )
+    VALUES (
+        'TOTAL_USD',
+        'METRIC',
+        0.00,
+        'seed row',
+        JSON_OBJECT('stage', 'seed')
+    )
+    ON DUPLICATE KEY UPDATE
+        `group` = VALUES(`group`),
+        summary_value_decimal = VALUES(summary_value_decimal),
+        summary_value_text = VALUES(summary_value_text),
+        summary_json = VALUES(summary_json);
+
+    INSERT INTO sales_summary (
+        summary_key,
+        `group`,
+        summary_value_decimal,
+        summary_value_text,
+        summary_json
+    )
+    VALUES (
+        'TOTAL_USD',
+        'METRIC',
+        v_total_usd,
+        'contains ; semicolon, ''quote'', backslash \\\\, text -- not comment, text /* not comment */, token DELIMITER $$, emoji 😊',
+        JSON_OBJECT(
+            'top_emp_id', v_top_emp_id,
+            'audit_rows', v_cnt,
+            'employee_count', v_emp_count
+        )
+    )
+    ON DUPLICATE KEY UPDATE
+        `group` = VALUES(`group`),
+        summary_value_decimal = VALUES(summary_value_decimal),
+        summary_value_text = VALUES(summary_value_text),
+        summary_json = VALUES(summary_json);
+
+    COMMIT;
+END$$
+
+DELIMITER ;
+
+CALL sp_run_final_boss();
+
+SELECT
+    'PASS' AS status,
+    (SELECT summary_value_decimal
+       FROM sales_summary
+      WHERE summary_key = 'TOTAL_USD') AS total_usd,
+    (SELECT COUNT(*)
+       FROM error_log
+      WHERE step_name = 'EXPECTED_DUPLICATE') AS expected_duplicate_errors,
+    (SELECT COUNT(*)
+       FROM order_audit) AS audit_row_count;
+
+SELECT
+    summary_key,
+    `group`,
+    summary_value_decimal,
+    summary_value_text,
+    summary_json
+FROM sales_summary
+ORDER BY summary_key;
+
+SELECT
+    step_name,
+    sql_state,
+    mysql_errno,
+    message_text
+FROM error_log
+ORDER BY log_id;
+
+SELECT
+    order_id,
+    action_type,
+    action_note
+FROM order_audit
+ORDER BY audit_id;

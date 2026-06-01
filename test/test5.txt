@@ -1,0 +1,395 @@
+--------------------------------------------------------------------------------
+-- OQT/TOAD/SQL*Plus 호환 쿼리툴 "depth + 구문 분리 + 실행" 종합 테스트 스크립트
+-- 목적: 중첩(블록/루프/CASE/IF), CREATE 객체, REFCURSOR, 동적SQL, 예외처리, / 트리거 검증
+--------------------------------------------------------------------------------
+
+PROMPT =======================================================================
+PROMPT [START] Complex depth / nested structures / SQL*Plus delimiters test
+PROMPT =======================================================================
+
+-- (툴이 지원한다면) 오류 시 중단/계속 옵션도 확인
+--WHENEVER SQLERROR CONTINUE
+--WHENEVER OSERROR CONTINUE
+
+PROMPT [1] Cleanup previous objects (ignore errors)
+BEGIN
+  FOR r IN (
+    SELECT object_name, object_type
+    FROM user_objects
+    WHERE object_name IN (
+      'OQT_T_DEPTH',
+      'OQT_T_LOG',
+      'OQT_SEQ_LOG',
+      'OQT_DEEP_PKG',
+      'OQT_DEEP_OBJ',
+      'OQT_DEEP_TAB'
+    )
+  ) LOOP
+    BEGIN
+      IF r.object_type = 'TABLE' THEN
+        EXECUTE IMMEDIATE 'DROP TABLE ' || r.object_name || ' PURGE';
+      ELSIF r.object_type = 'SEQUENCE' THEN
+        EXECUTE IMMEDIATE 'DROP SEQUENCE ' || r.object_name;
+      ELSIF r.object_type = 'PACKAGE' THEN
+        EXECUTE IMMEDIATE 'DROP PACKAGE ' || r.object_name;
+      ELSIF r.object_type = 'TYPE' THEN
+        EXECUTE IMMEDIATE 'DROP TYPE ' || r.object_name || ' FORCE';
+      ELSE
+        NULL;
+      END IF;
+    EXCEPTION
+      WHEN OTHERS THEN
+        NULL;
+    END;
+  END LOOP;
+END;
+/
+PROMPT [1] Cleanup done.
+
+--------------------------------------------------------------------------------
+PROMPT [2] Create tables/sequence/type (DDL statements)
+--------------------------------------------------------------------------------
+
+CREATE TABLE oqt_t_depth (
+  id         NUMBER PRIMARY KEY,
+  grp        NUMBER NOT NULL,
+  name       VARCHAR2(100),
+  created_at DATE DEFAULT SYSDATE
+);
+
+CREATE TABLE oqt_t_log (
+  log_id     NUMBER PRIMARY KEY,
+  tag        VARCHAR2(30),
+  msg        VARCHAR2(4000),
+  depth      NUMBER,
+  created_at DATE DEFAULT SYSDATE
+);
+
+CREATE SEQUENCE oqt_seq_log START WITH 1 INCREMENT BY 1 NOCACHE;
+
+-- Object + Nested Table Type (TYPE end; / 처리 확인)
+CREATE OR REPLACE TYPE oqt_deep_obj AS OBJECT (
+  k NUMBER,
+  v VARCHAR2(50)
+);
+/
+
+CREATE OR REPLACE TYPE oqt_deep_tab AS TABLE OF oqt_deep_obj;
+/
+
+--------------------------------------------------------------------------------
+PROMPT [3] Seed data (DML + COMMIT)
+--------------------------------------------------------------------------------
+BEGIN
+  FOR i IN 1..30 LOOP
+    INSERT INTO oqt_t_depth(id, grp, name)
+    VALUES (i, MOD(i, 3), 'NAME_' || TO_CHAR(i));
+  END LOOP;
+  COMMIT;
+END;
+/
+PROMPT [3] Seed done.
+
+--------------------------------------------------------------------------------
+PROMPT [4] Create package spec/body (nested procedure/function, refcursor, dynamic sql)
+--------------------------------------------------------------------------------
+
+CREATE OR REPLACE PACKAGE oqt_deep_pkg AS
+  -- REFCURSOR type
+  TYPE t_rc IS REF CURSOR;
+
+  -- simple log
+  PROCEDURE log_msg(p_tag IN VARCHAR2, p_msg IN VARCHAR2, p_depth IN NUMBER);
+
+  -- returns scalar with nested control flows
+  FUNCTION f_calc(p_n IN NUMBER) RETURN NUMBER;
+
+  -- opens refcursor with dynamic SQL and returns it via OUT
+  PROCEDURE p_open_rc(p_grp IN NUMBER, p_rc OUT t_rc);
+
+  -- heavy nested block for depth/parsing test
+  PROCEDURE p_deep_run(p_limit IN NUMBER DEFAULT 7);
+END oqt_deep_pkg;
+/
+SHOW ERRORS
+
+CREATE OR REPLACE PACKAGE BODY oqt_deep_pkg AS
+
+  PROCEDURE log_msg(p_tag IN VARCHAR2, p_msg IN VARCHAR2, p_depth IN NUMBER) IS
+  BEGIN
+    INSERT INTO oqt_t_log(log_id, tag, msg, depth)
+    VALUES (oqt_seq_log.NEXTVAL, SUBSTR(p_tag,1,30), SUBSTR(p_msg,1,4000), p_depth);
+    DBMS_OUTPUT.PUT_LINE('[LOG]['||p_tag||'][depth='||p_depth||'] '||p_msg);
+  END;
+
+  FUNCTION f_calc(p_n IN NUMBER) RETURN NUMBER IS
+    v NUMBER := 0;
+  BEGIN
+    -- Nested IF + CASE + inner block
+    IF p_n IS NULL THEN
+      v := -1;
+    ELSE
+      CASE
+        WHEN p_n < 0 THEN
+          v := p_n * p_n;
+        WHEN p_n BETWEEN 0 AND 10 THEN
+          DECLARE
+            x NUMBER := p_n + 100;
+          BEGIN
+            v := x - 50;
+          END;
+        ELSE
+          v := p_n + 999;
+      END CASE;
+    END IF;
+
+    RETURN v;
+  EXCEPTION
+    WHEN OTHERS THEN
+      log_msg('F_CALC', 'error='||SQLERRM, 999);
+      RETURN NULL;
+  END;
+
+  PROCEDURE p_open_rc(p_grp IN NUMBER, p_rc OUT t_rc) IS
+    v_sql VARCHAR2(32767);
+  BEGIN
+    -- Dynamic SQL + bind
+    v_sql := 'SELECT id, grp, name, created_at
+              FROM oqt_t_depth
+              WHERE grp = :b1
+              ORDER BY id';
+
+    OPEN p_rc FOR v_sql USING p_grp;
+    log_msg('P_OPEN_RC', 'opened rc for grp='||p_grp, 1);
+  END;
+
+  PROCEDURE p_deep_run(p_limit IN NUMBER DEFAULT 7) IS
+    v_depth NUMBER := 0;
+
+    -- Local nested procedure (scope/depth)
+    PROCEDURE p_inner(p_i NUMBER, p_j NUMBER) IS
+      v_local NUMBER := 0;
+    BEGIN
+      v_depth := v_depth + 1;
+      v_local := f_calc(p_i - p_j);
+
+      -- Nested CASE + LOOP + labeled exit/continue
+      <<outer_loop>>
+      FOR k IN 1..3 LOOP
+        v_depth := v_depth + 1;
+
+        CASE MOD(k + p_i + p_j, 4)
+          WHEN 0 THEN
+            log_msg('INNER', 'case0 k='||k||' local='||v_local, v_depth);
+          WHEN 1 THEN
+            -- inner block with exception
+            DECLARE
+              z NUMBER := 10;
+            BEGIN
+              IF z = 10 THEN
+                log_msg('INNER', 'case1 -> raise user error', v_depth);
+                RAISE_APPLICATION_ERROR(-20001, 'forced error in inner block');
+              END IF;
+            EXCEPTION
+              WHEN OTHERS THEN
+                log_msg('INNER', 'handled inner exception: '||SQLERRM, v_depth);
+            END;
+          WHEN 2 THEN
+            log_msg('INNER', 'case2 -> continue outer_loop', v_depth);
+            CONTINUE outer_loop;
+          ELSE
+            log_msg('INNER', 'case3 -> exit outer_loop', v_depth);
+            EXIT outer_loop;
+        END CASE;
+
+        -- While loop nested
+        DECLARE
+          w NUMBER := 0;
+        BEGIN
+          WHILE w < 2 LOOP
+            w := w + 1;
+            log_msg('INNER', 'while w='||w, v_depth+1);
+          END LOOP;
+        END;
+
+      END LOOP outer_loop;
+
+      v_depth := v_depth - 1;
+    END p_inner;
+
+  BEGIN
+    log_msg('P_DEEP_RUN', 'start limit='||p_limit, v_depth);
+
+    -- Cursor FOR loop + nested blocks
+    FOR r IN (SELECT id, grp, name FROM oqt_t_depth WHERE id <= p_limit ORDER BY id) LOOP
+      v_depth := v_depth + 1;
+
+      BEGIN
+        -- IF + CASE nesting
+        IF r.grp = 0 THEN
+          log_msg('RUN', 'grp=0 id='||r.id||' name='||r.name, v_depth);
+
+          CASE
+            WHEN r.id IN (1,2) THEN
+              p_inner(r.id, 1);
+            WHEN r.id BETWEEN 3 AND 5 THEN
+              p_inner(r.id, 2);
+            ELSE
+              p_inner(r.id, 3);
+          END CASE;
+
+        ELSIF r.grp = 1 THEN
+          log_msg('RUN', 'grp=1 id='||r.id||' (dynamic insert)', v_depth);
+
+          -- Dynamic SQL insert
+          EXECUTE IMMEDIATE
+            'INSERT INTO oqt_t_log(log_id, tag, msg, depth)
+             VALUES (oqt_seq_log.NEXTVAL, :t, :m, :d)'
+          USING 'DYN', 'insert from dyn sql id='||r.id, v_depth;
+
+        ELSE
+          log_msg('RUN', 'grp=2 id='||r.id||' (raise & catch)', v_depth);
+          BEGIN
+            IF r.id = 6 THEN
+              -- 문자열 안에 END; / BEGIN 등 포함 (파서가 문자열과 키워드 구분 잘 하는지)
+              log_msg('RUN', 'string contains tokens: "BEGIN END; / CASE WHEN"', v_depth);
+            END IF;
+
+            IF r.id = 7 THEN
+              RAISE NO_DATA_FOUND;
+            END IF;
+
+          EXCEPTION
+            WHEN NO_DATA_FOUND THEN
+              log_msg('RUN', 'caught NO_DATA_FOUND for id='||r.id, v_depth);
+          END;
+        END IF;
+
+      EXCEPTION
+        WHEN OTHERS THEN
+          log_msg('RUN', 'outer exception caught: '||SQLERRM, v_depth);
+      END;
+
+      v_depth := v_depth - 1;
+    END LOOP;
+
+    -- Nested collection/type usage
+    DECLARE
+      t oqt_deep_tab := oqt_deep_tab();
+    BEGIN
+      t.EXTEND(3);
+      t(1) := oqt_deep_obj(1, 'A');
+      t(2) := oqt_deep_obj(2, 'B');
+      t(3) := oqt_deep_obj(3, 'C');
+
+      FOR i IN 1..t.COUNT LOOP
+        log_msg('COLL', 't('||i||')='||t(i).k||','||t(i).v, 77);
+      END LOOP;
+    END;
+
+    log_msg('P_DEEP_RUN', 'done', v_depth);
+  END p_deep_run;
+
+END oqt_deep_pkg;
+/
+SHOW ERRORS
+
+--------------------------------------------------------------------------------
+PROMPT [5] REFCURSOR test (VARIABLE/PRINT + OUT refcursor)
+--------------------------------------------------------------------------------
+
+VAR v_rc REFCURSOR
+
+BEGIN
+  oqt_deep_pkg.p_open_rc(1, :v_rc);
+END;
+/
+PRINT v_rc
+
+--------------------------------------------------------------------------------
+PROMPT [6] Run the deep nested procedure (default parameter + explicit)
+--------------------------------------------------------------------------------
+
+BEGIN
+  oqt_deep_pkg.p_deep_run;      -- default
+  oqt_deep_pkg.p_deep_run(9);   -- explicit
+END;
+/
+
+--------------------------------------------------------------------------------
+PROMPT [7] Anonymous block with extreme nesting + labeled blocks + exception re-raise
+--------------------------------------------------------------------------------
+
+DECLARE
+  v NUMBER := 0;
+  PROCEDURE bump(p IN OUT NUMBER) IS
+  BEGIN
+    p := p + 1;
+  END;
+BEGIN
+  <<blk1>>
+  DECLARE
+    a NUMBER := 0;
+  BEGIN
+    FOR i IN 1..3 LOOP
+      bump(a);
+
+      <<blk2>>
+      DECLARE
+        b NUMBER := 0;
+      BEGIN
+        WHILE b < 3 LOOP
+          b := b + 1;
+
+          BEGIN
+            IF (i = 2 AND b = 2) THEN
+              RAISE_APPLICATION_ERROR(-20002, 'forced nested error i=2 b=2');
+            END IF;
+
+            CASE
+              WHEN MOD(i+b,2)=0 THEN
+                v := v + 10;
+              ELSE
+                v := v + 1;
+            END CASE;
+
+          EXCEPTION
+            WHEN OTHERS THEN
+              DBMS_OUTPUT.PUT_LINE('[ANON] caught='||SQLERRM||' -> re-raise once');
+              -- re-raise test
+              IF i = 2 AND b = 2 THEN
+                RAISE;
+              END IF;
+          END;
+
+        END LOOP;
+      END blk2;
+
+    END LOOP;
+  END blk1;
+
+EXCEPTION
+  WHEN OTHERS THEN
+    DBMS_OUTPUT.PUT_LINE('[ANON] top exception handled: '||SQLERRM);
+END;
+/
+--------------------------------------------------------------------------------
+PROMPT [8] Summary queries (SQL statements)
+--------------------------------------------------------------------------------
+
+SELECT tag, COUNT(*) cnt, MIN(depth) min_depth, MAX(depth) max_depth
+FROM oqt_t_log
+GROUP BY tag
+ORDER BY tag;
+
+SELECT *
+FROM (
+  SELECT log_id, tag, depth, SUBSTR(msg,1,120) msg
+  FROM oqt_t_log
+  ORDER BY log_id DESC
+)
+WHERE ROWNUM <= 20;
+
+PROMPT =======================================================================
+PROMPT [END] If you saw outputs + cursor print + summary selects, parsing/execution is OK
+PROMPT =======================================================================

@@ -1,0 +1,1137 @@
+-- MYSQL QUERY TOOL ULTRA FINAL BOSS
+-- Target: MySQL 8.0+
+-- If you do not have CREATE DATABASE privilege, remove the first 3 lines and run in an existing schema.
+
+DROP DATABASE IF EXISTS qt_mysql_ultra_final_boss;
+CREATE DATABASE qt_mysql_ultra_final_boss CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+USE qt_mysql_ultra_final_boss;
+
+SET NAMES utf8mb4;
+
+SET @versioned_comment_ok = 0;
+/*!80000 SET @versioned_comment_ok = 1 */;
+
+# line comment torture ; ; ; DELIMITER $$ // END ; should do nothing
+
+/*
+  block comment torture
+  DELIMITER //
+  CREATE PROCEDURE fake_proc() BEGIN SELECT 1; END//
+  BEGIN
+  END;
+  $$ //
+*/
+
+CREATE TABLE stage_node (
+    node_id INT NOT NULL,
+    parent_node_id INT NULL,
+    `group` VARCHAR(20) NOT NULL,
+    node_name VARCHAR(100) NOT NULL,
+    sort_no INT NOT NULL,
+    meta JSON NOT NULL,
+    path_hint VARCHAR(300)
+        GENERATED ALWAYS AS (JSON_UNQUOTE(JSON_EXTRACT(meta, '$.pathHint'))) VIRTUAL,
+    PRIMARY KEY (node_id),
+    UNIQUE KEY uk_stage_node_group_name (`group`, node_name),
+    KEY idx_stage_node_parent (parent_node_id),
+    CONSTRAINT fk_stage_node_parent
+        FOREIGN KEY (parent_node_id) REFERENCES stage_node (node_id),
+    CONSTRAINT chk_stage_node_self
+        CHECK (parent_node_id IS NULL OR parent_node_id <> node_id)
+) ENGINE = InnoDB;
+
+CREATE TABLE run_case (
+    run_id BIGINT NOT NULL,
+    node_id INT NOT NULL,
+    owner_name VARCHAR(100) NOT NULL,
+    status_code VARCHAR(20) NOT NULL,
+    priority INT NOT NULL,
+    `rank` INT NOT NULL,
+    payload JSON NOT NULL,
+    created_at DATETIME(6) NOT NULL,
+    locale_code VARCHAR(20)
+        GENERATED ALWAYS AS (JSON_UNQUOTE(JSON_EXTRACT(payload, '$.locale'))) STORED,
+    step_count INT
+        GENERATED ALWAYS AS (JSON_LENGTH(JSON_EXTRACT(payload, '$.steps'))) STORED,
+    note_text VARCHAR(255)
+        GENERATED ALWAYS AS (JSON_UNQUOTE(JSON_EXTRACT(payload, '$.note'))) VIRTUAL,
+    PRIMARY KEY (run_id),
+    UNIQUE KEY uk_run_case_owner_rank (owner_name, `rank`),
+    KEY idx_run_case_node_status (node_id, status_code),
+    KEY idx_run_case_owner_priority (owner_name, priority DESC),
+    CONSTRAINT fk_run_case_node
+        FOREIGN KEY (node_id) REFERENCES stage_node (node_id),
+    CONSTRAINT chk_run_case_priority
+        CHECK (priority BETWEEN 1 AND 9)
+) ENGINE = InnoDB;
+
+CREATE TABLE run_audit (
+    audit_id BIGINT NOT NULL AUTO_INCREMENT,
+    run_id BIGINT NOT NULL,
+    audit_type VARCHAR(30) NOT NULL,
+    old_status VARCHAR(20) NULL,
+    new_status VARCHAR(20) NULL,
+    audit_note VARCHAR(255) NOT NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (audit_id),
+    KEY idx_run_audit_run (run_id)
+) ENGINE = InnoDB;
+
+CREATE TABLE qa_summary (
+    summary_key VARCHAR(100) NOT NULL,
+    `group` VARCHAR(20) NOT NULL,
+    `rank` INT NOT NULL,
+    summary_num DECIMAL(18, 4) NULL,
+    summary_text VARCHAR(500) NULL,
+    summary_json JSON NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (summary_key)
+) ENGINE = InnoDB;
+
+CREATE TABLE error_log (
+    log_id BIGINT NOT NULL AUTO_INCREMENT,
+    step_name VARCHAR(100) NOT NULL,
+    sql_state CHAR(5) NULL,
+    mysql_errno INT NULL,
+    message_text VARCHAR(512) NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (log_id)
+) ENGINE = InnoDB;
+
+DELIMITER $$
+
+CREATE FUNCTION fn_priority_factor (p_priority INT)
+RETURNS DECIMAL(10, 2)
+DETERMINISTIC
+BEGIN
+    RETURN CASE
+        WHEN p_priority >= 9 THEN 4.00
+        WHEN p_priority >= 8 THEN 3.00
+        WHEN p_priority >= 7 THEN 2.50
+        WHEN p_priority >= 6 THEN 2.00
+        WHEN p_priority >= 5 THEN 1.50
+        ELSE 1.00
+    END;
+END$$
+
+CREATE PROCEDURE sp_assert (
+    IN p_condition BOOLEAN,
+    IN p_message VARCHAR(255)
+)
+BEGIN
+    IF NOT p_condition THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = p_message;
+    END IF;
+END$$
+
+CREATE PROCEDURE sp_shift_rank (
+    INOUT p_rank INT,
+    IN p_delta INT
+)
+BEGIN
+    SET p_rank = p_rank + p_delta;
+END$$
+
+CREATE PROCEDURE sp_collect_status_counts (
+    OUT p_done_cnt INT,
+    OUT p_running_cnt INT,
+    OUT p_other_cnt INT
+)
+BEGIN
+    SELECT
+        SUM(CASE WHEN status_code = 'DONE' THEN 1 ELSE 0 END),
+        SUM(CASE WHEN status_code = 'RUNNING' THEN 1 ELSE 0 END),
+        SUM(CASE WHEN status_code NOT IN ('DONE', 'RUNNING') THEN 1 ELSE 0 END)
+    INTO
+        p_done_cnt,
+        p_running_cnt,
+        p_other_cnt
+    FROM run_case;
+END$$
+
+CREATE TRIGGER trg_run_case_bi
+BEFORE INSERT ON run_case
+FOR EACH ROW
+BEGIN
+    SET NEW.owner_name = LOWER(TRIM(NEW.owner_name));
+    SET NEW.status_code = UPPER(TRIM(NEW.status_code));
+
+    IF NEW.priority NOT BETWEEN 1 AND 9 THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'priority must be between 1 and 9';
+    END IF;
+END$$
+
+CREATE TRIGGER trg_run_case_bu
+BEFORE UPDATE ON run_case
+FOR EACH ROW
+BEGIN
+    SET NEW.owner_name = LOWER(TRIM(NEW.owner_name));
+    SET NEW.status_code = UPPER(TRIM(NEW.status_code));
+END$$
+
+CREATE TRIGGER trg_run_case_ai
+AFTER INSERT ON run_case
+FOR EACH ROW
+BEGIN
+    INSERT INTO run_audit (
+        run_id,
+        audit_type,
+        old_status,
+        new_status,
+        audit_note
+    )
+    VALUES (
+        NEW.run_id,
+        'INSERT',
+        NULL,
+        NEW.status_code,
+        CONCAT(
+            'inserted step_count=',
+            COALESCE(CAST(JSON_LENGTH(JSON_EXTRACT(NEW.payload, '$.steps')) AS CHAR), 'null')
+        )
+    );
+END$$
+
+CREATE TRIGGER trg_run_case_au
+AFTER UPDATE ON run_case
+FOR EACH ROW
+BEGIN
+    IF NOT (OLD.status_code <=> NEW.status_code) THEN
+        INSERT INTO run_audit (
+            run_id,
+            audit_type,
+            old_status,
+            new_status,
+            audit_note
+        )
+        VALUES (
+            NEW.run_id,
+            'STATUS_CHANGE',
+            OLD.status_code,
+            NEW.status_code,
+            CONCAT(OLD.status_code, ' -> ', NEW.status_code)
+        );
+    END IF;
+END$$
+
+DELIMITER //
+
+CREATE PROCEDURE sp_run_ultra_final_boss ()
+main_block: BEGIN
+    DECLARE v_fetch_done INT DEFAULT 0;
+    DECLARE v_run_id BIGINT;
+    DECLARE v_priority INT;
+    DECLARE v_owner_name VARCHAR(100);
+    DECLARE v_status_code VARCHAR(20);
+
+    DECLARE v_i INT DEFAULT 0;
+    DECLARE v_sum_while INT DEFAULT 0;
+    DECLARE v_mul_repeat INT DEFAULT 1;
+    DECLARE v_even_sum INT DEFAULT 0;
+
+    DECLARE v_run_count INT DEFAULT 0;
+    DECLARE v_done_count INT DEFAULT 0;
+    DECLARE v_running_count INT DEFAULT 0;
+    DECLARE v_other_count INT DEFAULT 0;
+    DECLARE v_cnt INT DEFAULT 0;
+    DECLARE v_tree_depth INT DEFAULT 0;
+    DECLARE v_leaf_count INT DEFAULT 0;
+    DECLARE v_done_node_count INT DEFAULT 0;
+    DECLARE v_total_step_rows INT DEFAULT 0;
+    DECLARE v_total_step_minutes DECIMAL(18, 2) DEFAULT 0.00;
+    DECLARE v_total_metric_rows INT DEFAULT 0;
+    DECLARE v_total_metric_sum DECIMAL(18, 2) DEFAULT 0.00;
+    DECLARE v_factor_sum DECIMAL(18, 2) DEFAULT 0.00;
+    DECLARE v_top_owner VARCHAR(100) DEFAULT NULL;
+    DECLARE v_top_owner_weighted DECIMAL(18, 2) DEFAULT 0.00;
+    DECLARE v_alice_running_weighted DECIMAL(18, 2) DEFAULT 0.00;
+    DECLARE v_top_run_id BIGINT DEFAULT NULL;
+
+    DECLARE v_state CHAR(5) DEFAULT NULL;
+    DECLARE v_errno INT DEFAULT NULL;
+    DECLARE v_msg TEXT DEFAULT NULL;
+
+    DECLARE cur_run CURSOR FOR
+        SELECT
+            run_id,
+            priority,
+            owner_name,
+            status_code
+        FROM run_case
+        ORDER BY run_id;
+
+    DECLARE CONTINUE HANDLER FOR NOT FOUND
+        SET v_fetch_done = 1;
+
+    DECLARE CONTINUE HANDLER FOR 1062
+    BEGIN
+        GET DIAGNOSTICS CONDITION 1
+            v_state = RETURNED_SQLSTATE,
+            v_errno = MYSQL_ERRNO,
+            v_msg = MESSAGE_TEXT;
+
+        INSERT INTO error_log (
+            step_name,
+            sql_state,
+            mysql_errno,
+            message_text
+        )
+        VALUES (
+            'EXPECTED_DUPLICATE',
+            v_state,
+            v_errno,
+            LEFT(v_msg, 512)
+        );
+    END;
+
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        GET DIAGNOSTICS CONDITION 1
+            v_state = RETURNED_SQLSTATE,
+            v_errno = MYSQL_ERRNO,
+            v_msg = MESSAGE_TEXT;
+
+        ROLLBACK;
+
+        INSERT INTO error_log (
+            step_name,
+            sql_state,
+            mysql_errno,
+            message_text
+        )
+        VALUES (
+            'UNEXPECTED_EXCEPTION',
+            v_state,
+            v_errno,
+            LEFT(v_msg, 512)
+        );
+
+        RESIGNAL;
+    END;
+
+    START TRANSACTION;
+
+    -- comment torture inside routine ; END ; DELIMITER // $$ should not matter
+    /*
+       nested block comment inside routine
+       BEGIN
+       END;
+       ; ; ; // $$
+    */
+
+    CALL sp_assert(@versioned_comment_ok = 1, 'versioned comment handling failed');
+
+    INSERT INTO stage_node (
+        node_id,
+        parent_node_id,
+        `group`,
+        node_name,
+        sort_no,
+        meta
+    )
+    VALUES (
+        1,
+        NULL,
+        'ROOT',
+        'Root',
+        1,
+        JSON_OBJECT('pathHint', 'ROOT')
+    );
+
+    INSERT INTO stage_node (
+        node_id,
+        parent_node_id,
+        `group`,
+        node_name,
+        sort_no,
+        meta
+    )
+    VALUES
+        (
+            2,
+            1,
+            'PLATFORM',
+            'Platform',
+            2,
+            JSON_OBJECT('pathHint', 'ROOT > PLATFORM')
+        ),
+        (
+            3,
+            2,
+            'INGEST',
+            'Ingest',
+            3,
+            JSON_OBJECT('pathHint', 'ROOT > PLATFORM > INGEST')
+        ),
+        (
+            4,
+            3,
+            'BATCH',
+            'Batch',
+            4,
+            JSON_OBJECT('pathHint', 'ROOT > PLATFORM > INGEST > BATCH')
+        ),
+        (
+            5,
+            4,
+            'WORKER',
+            'Worker',
+            5,
+            JSON_OBJECT('pathHint', 'ROOT > PLATFORM > INGEST > BATCH > WORKER')
+        ),
+        (
+            6,
+            2,
+            'ANALYTICS',
+            'Analytics',
+            6,
+            JSON_OBJECT('pathHint', 'ROOT > PLATFORM > ANALYTICS')
+        );
+
+    INSERT INTO stage_node (
+        node_id,
+        parent_node_id,
+        `group`,
+        node_name,
+        sort_no,
+        meta
+    )
+    VALUES (
+        6,
+        2,
+        'ANALYTICS',
+        'AnalyticsTouched',
+        66,
+        JSON_OBJECT('pathHint', 'ROOT > PLATFORM > ANALYTICS')
+    )
+    ON DUPLICATE KEY UPDATE
+        node_name = VALUES(node_name),
+        sort_no = VALUES(sort_no);
+
+    INSERT INTO run_case (
+        run_id,
+        node_id,
+        owner_name,
+        status_code,
+        priority,
+        `rank`,
+        payload,
+        created_at
+    )
+    VALUES
+        (
+            4001,
+            3,
+            ' Alice ',
+            ' new ',
+            9,
+            1,
+            JSON_OBJECT(
+                'locale', 'ko-KR',
+                'note', 'contains ; semicolon, quote ''x'', backslash \\\\, text -- not comment, text /* not comment */, token DELIMITER $$, token //, emoji 🤖, 한글',
+                'attrs', JSON_OBJECT('batch', TRUE, 'mode', 'full'),
+                'metrics', JSON_ARRAY(3, 5),
+                'steps', JSON_ARRAY(
+                    JSON_OBJECT('name', 'extract', 'minutes', 10, 'tags', JSON_ARRAY('etl', 'raw')),
+                    JSON_OBJECT('name', 'load', 'minutes', 20, 'tags', JSON_ARRAY('dml'))
+                )
+            ),
+            '2026-03-01 09:00:00.000001'
+        ),
+        (
+            4002,
+            3,
+            'ALICE',
+            ' running ',
+            7,
+            2,
+            JSON_OBJECT(
+                'locale', 'en-US',
+                'note', 'json_table and window',
+                'attrs', JSON_OBJECT('batch', FALSE, 'mode', 'delta'),
+                'metrics', JSON_ARRAY(2, 4, 6),
+                'steps', JSON_ARRAY(
+                    JSON_OBJECT('name', 'validate', 'minutes', 15, 'tags', JSON_ARRAY('quality'))
+                )
+            ),
+            '2026-03-01 09:05:00.000001'
+        ),
+        (
+            4003,
+            4,
+            ' Bob ',
+            ' hold ',
+            8,
+            1,
+            JSON_OBJECT(
+                'locale', 'en-GB',
+                'note', 'nested loops / handlers / cte',
+                'attrs', JSON_OBJECT('batch', TRUE, 'mode', 'full'),
+                'metrics', JSON_ARRAY(7),
+                'steps', JSON_ARRAY(
+                    JSON_OBJECT('name', 'plan', 'minutes', 5, 'tags', JSON_ARRAY('spec', 'review', 'api')),
+                    JSON_OBJECT('name', 'build', 'minutes', 25, 'tags', JSON_ARRAY('code'))
+                )
+            ),
+            '2026-03-01 09:10:00.000001'
+        ),
+        (
+            4004,
+            5,
+            'Bob',
+            ' done ',
+            6,
+            2,
+            JSON_OBJECT(
+                'locale', 'en-US',
+                'note', 'release pipeline',
+                'attrs', JSON_OBJECT('batch', FALSE, 'mode', 'final'),
+                'metrics', JSON_ARRAY(1, 1),
+                'steps', JSON_ARRAY(
+                    JSON_OBJECT('name', 'release', 'minutes', 12, 'tags', JSON_ARRAY('ops'))
+                )
+            ),
+            '2026-03-01 09:15:00.000001'
+        ),
+        (
+            4005,
+            6,
+            ' Zoe ',
+            ' new ',
+            5,
+            1,
+            JSON_OBJECT(
+                'locale', 'ko-KR',
+                'note', 'dashboard / sql / utf8',
+                'attrs', JSON_OBJECT('batch', FALSE, 'mode', 'dash'),
+                'metrics', JSON_ARRAY(9, 3),
+                'steps', JSON_ARRAY(
+                    JSON_OBJECT('name', 'monitor', 'minutes', 18, 'tags', JSON_ARRAY('dash', 'sql'))
+                )
+            ),
+            '2026-03-01 09:20:00.000001'
+        ),
+        (
+            4006,
+            6,
+            'ZOE',
+            ' blocked ',
+            4,
+            2,
+            JSON_OBJECT(
+                'locale', 'ja-JP',
+                'note', 'retry and alert',
+                'attrs', JSON_OBJECT('batch', TRUE, 'mode', 'recover'),
+                'metrics', JSON_ARRAY(5),
+                'steps', JSON_ARRAY(
+                    JSON_OBJECT('name', 'retry', 'minutes', 7, 'tags', JSON_ARRAY('queue')),
+                    JSON_OBJECT('name', 'alert', 'minutes', 8, 'tags', JSON_ARRAY('notify'))
+                )
+            ),
+            '2026-03-01 09:25:00.000001'
+        );
+
+    UPDATE run_case
+       SET status_code = CASE
+               WHEN run_id = 4003 THEN ' done '
+               WHEN run_id = 4005 THEN ' running '
+               ELSE status_code
+           END,
+           `rank` = CASE
+               WHEN run_id = 4002 THEN `rank` + 1
+               ELSE `rank`
+           END
+     WHERE run_id IN (4002, 4003, 4005);
+
+    SAVEPOINT sp_before_temp_check;
+
+    INSERT INTO qa_summary (
+        summary_key,
+        `group`,
+        `rank`,
+        summary_num,
+        summary_text,
+        summary_json
+    )
+    VALUES (
+        'TEMP_ROLLBACK',
+        'TEMP',
+        999,
+        999.0000,
+        'this row must disappear after rollback',
+        JSON_OBJECT('temp', TRUE)
+    );
+
+    ROLLBACK TO SAVEPOINT sp_before_temp_check;
+    RELEASE SAVEPOINT sp_before_temp_check;
+
+    SELECT COUNT(*)
+      INTO v_cnt
+      FROM qa_summary
+     WHERE summary_key = 'TEMP_ROLLBACK';
+
+    CALL sp_assert(v_cnt = 0, 'savepoint rollback mismatch');
+
+    INSERT INTO run_case (
+        run_id,
+        node_id,
+        owner_name,
+        status_code,
+        priority,
+        `rank`,
+        payload,
+        created_at
+    )
+    VALUES (
+        4001,
+        3,
+        'Alice',
+        'NEW',
+        9,
+        9,
+        JSON_OBJECT(
+            'locale', 'en-US',
+            'note', 'duplicate row should not be inserted',
+            'attrs', JSON_OBJECT('batch', TRUE, 'mode', 'dup'),
+            'metrics', JSON_ARRAY(1),
+            'steps', JSON_ARRAY(
+                JSON_OBJECT('name', 'dup', 'minutes', 1, 'tags', JSON_ARRAY('dup'))
+            )
+        ),
+        '2026-03-01 10:00:00.000001'
+    );
+
+    SET @rank_var = 11;
+    CALL sp_shift_rank(@rank_var, 4);
+    CALL sp_assert(@rank_var = 15, 'INOUT parameter mismatch');
+
+    nested_block: BEGIN
+        DECLARE v_local INT DEFAULT 0;
+        DECLARE v_local_txt VARCHAR(100) DEFAULT 'X';
+
+        SET v_local = 1;
+
+        CASE
+            WHEN v_local = 1 THEN
+                SET v_local = v_local + 9;
+            ELSE
+                SET v_local = -1;
+        END CASE;
+
+        SET v_local_txt = CONCAT(v_local_txt, ';', '--', '/*', '*/', '$$', '//');
+
+        CALL sp_assert(v_local = 10, 'nested block / CASE mismatch');
+        CALL sp_assert(CHAR_LENGTH(v_local_txt) > 0, 'nested block text mismatch');
+    END;
+
+    SET v_i = 1;
+    SET v_sum_while = 0;
+
+    WHILE v_i <= 7 DO
+        SET v_sum_while = v_sum_while + v_i;
+        SET v_i = v_i + 1;
+    END WHILE;
+
+    CALL sp_assert(v_sum_while = 28, 'WHILE loop mismatch');
+
+    SET v_i = 0;
+    SET v_mul_repeat = 1;
+
+    REPEAT
+        SET v_i = v_i + 1;
+        SET v_mul_repeat = v_mul_repeat * v_i;
+    UNTIL v_i = 5
+    END REPEAT;
+
+    CALL sp_assert(v_mul_repeat = 120, 'REPEAT loop mismatch');
+
+    SET v_i = 0;
+    SET v_even_sum = 0;
+
+    even_loop: LOOP
+        SET v_i = v_i + 1;
+
+        IF v_i > 8 THEN
+            LEAVE even_loop;
+        END IF;
+
+        IF MOD(v_i, 2) = 1 THEN
+            ITERATE even_loop;
+        END IF;
+
+        SET v_even_sum = v_even_sum + v_i;
+    END LOOP;
+
+    CALL sp_assert(v_even_sum = 20, 'LOOP / ITERATE / LEAVE mismatch');
+
+    CALL sp_collect_status_counts(@done_cnt, @running_cnt, @other_cnt);
+    CALL sp_assert(@done_cnt = 2, 'OUT parameter done count mismatch');
+    CALL sp_assert(@running_cnt = 2, 'OUT parameter running count mismatch');
+    CALL sp_assert(@other_cnt = 2, 'OUT parameter other count mismatch');
+
+    OPEN cur_run;
+
+    read_loop: LOOP
+        FETCH cur_run INTO v_run_id, v_priority, v_owner_name, v_status_code;
+
+        IF v_fetch_done = 1 THEN
+            LEAVE read_loop;
+        END IF;
+
+        SET v_run_count = v_run_count + 1;
+        SET v_factor_sum = v_factor_sum + fn_priority_factor(v_priority);
+
+        CASE v_status_code
+            WHEN 'DONE' THEN
+                SET v_done_count = v_done_count + 1;
+            WHEN 'RUNNING' THEN
+                SET v_running_count = v_running_count + 1;
+            ELSE
+                SET v_other_count = v_other_count + 1;
+        END CASE;
+    END LOOP;
+
+    CLOSE cur_run;
+
+    CALL sp_assert(v_run_count = 6, 'cursor run count mismatch');
+    CALL sp_assert(v_done_count = 2, 'cursor done count mismatch');
+    CALL sp_assert(v_running_count = 2, 'cursor running count mismatch');
+    CALL sp_assert(v_other_count = 2, 'cursor other count mismatch');
+    CALL sp_assert(v_factor_sum = 14.00, 'cursor factor sum mismatch');
+
+    DROP TEMPORARY TABLE IF EXISTS tmp_step_tag;
+    DROP TEMPORARY TABLE IF EXISTS tmp_step_agg;
+    DROP TEMPORARY TABLE IF EXISTS tmp_metric;
+
+    SET @sql_step = '
+        CREATE TEMPORARY TABLE tmp_step_tag AS
+        SELECT
+            r.run_id,
+            r.owner_name,
+            jt.step_no,
+            jt.step_name,
+            jt.minutes,
+            jt.tag
+        FROM run_case AS r
+        JOIN JSON_TABLE(
+            r.payload,
+            ''$''
+            COLUMNS (
+                NESTED PATH ''$.steps[*]''
+                COLUMNS (
+                    step_no FOR ORDINALITY,
+                    step_name VARCHAR(50) PATH ''$.name'',
+                    minutes INT PATH ''$.minutes'',
+                    NESTED PATH ''$.tags[*]''
+                    COLUMNS (
+                        tag VARCHAR(50) PATH ''$''
+                    )
+                )
+            )
+        ) AS jt ON TRUE
+    ';
+
+    PREPARE stmt_step FROM @sql_step;
+    EXECUTE stmt_step;
+    DEALLOCATE PREPARE stmt_step;
+
+    SET @sql_metric = '
+        CREATE TEMPORARY TABLE tmp_metric AS
+        SELECT
+            r.run_id,
+            r.owner_name,
+            jt.metric_no,
+            jt.metric_value
+        FROM run_case AS r
+        JOIN JSON_TABLE(
+            r.payload,
+            ''$.metrics[*]''
+            COLUMNS (
+                metric_no FOR ORDINALITY,
+                metric_value INT PATH ''$''
+            )
+        ) AS jt ON TRUE
+    ';
+
+    PREPARE stmt_metric FROM @sql_metric;
+    EXECUTE stmt_metric;
+    DEALLOCATE PREPARE stmt_metric;
+
+    CREATE TEMPORARY TABLE tmp_step_agg AS
+    SELECT
+        run_id,
+        owner_name,
+        step_no,
+        MAX(step_name) AS step_name,
+        MAX(minutes) AS minutes
+    FROM tmp_step_tag
+    GROUP BY
+        run_id,
+        owner_name,
+        step_no;
+
+    SELECT COUNT(*)
+      INTO v_total_step_rows
+      FROM tmp_step_tag;
+
+    CALL sp_assert(v_total_step_rows = 13, 'JSON_TABLE nested tag row count mismatch');
+
+    SELECT ROUND(SUM(minutes), 2)
+      INTO v_total_step_minutes
+      FROM tmp_step_agg;
+
+    CALL sp_assert(v_total_step_minutes = 120.00, 'step minute sum mismatch');
+
+    SELECT COUNT(*)
+      INTO v_cnt
+      FROM tmp_step_agg;
+
+    CALL sp_assert(v_cnt = 9, 'distinct step row count mismatch');
+
+    SELECT COUNT(*)
+      INTO v_total_metric_rows
+      FROM tmp_metric;
+
+    CALL sp_assert(v_total_metric_rows = 11, 'metric row count mismatch');
+
+    SELECT ROUND(SUM(metric_value), 2)
+      INTO v_total_metric_sum
+      FROM tmp_metric;
+
+    CALL sp_assert(v_total_metric_sum = 46.00, 'metric sum mismatch');
+
+    WITH RECURSIVE node_tree AS (
+        SELECT
+            n.node_id,
+            n.parent_node_id,
+            n.node_name,
+            CAST(n.node_name AS CHAR(400)) AS path_txt,
+            1 AS depth
+        FROM stage_node AS n
+        WHERE n.parent_node_id IS NULL
+
+        UNION ALL
+
+        SELECT
+            c.node_id,
+            c.parent_node_id,
+            c.node_name,
+            CONCAT(p.path_txt, ' > ', c.node_name) AS path_txt,
+            p.depth + 1 AS depth
+        FROM stage_node AS c
+        JOIN node_tree AS p
+          ON c.parent_node_id = p.node_id
+    )
+    SELECT MAX(depth)
+      INTO v_tree_depth
+      FROM node_tree;
+
+    CALL sp_assert(v_tree_depth = 5, 'recursive CTE depth mismatch');
+
+    SELECT COUNT(*)
+      INTO v_leaf_count
+      FROM stage_node AS n
+     WHERE NOT EXISTS (
+            SELECT 1
+              FROM stage_node AS c
+             WHERE c.parent_node_id = n.node_id
+      );
+
+    CALL sp_assert(v_leaf_count = 2, 'leaf node count mismatch');
+
+    SELECT COUNT(*)
+      INTO v_done_node_count
+      FROM stage_node AS n
+     WHERE EXISTS (
+            SELECT 1
+              FROM run_case AS r
+             WHERE r.node_id = n.node_id
+               AND r.status_code = 'DONE'
+      );
+
+    CALL sp_assert(v_done_node_count = 2, 'EXISTS done-node count mismatch');
+
+    WITH run_minutes AS (
+        SELECT
+            a.run_id,
+            a.owner_name,
+            r.created_at,
+            r.priority,
+            ROUND(SUM(a.minutes), 2) AS total_minutes
+        FROM tmp_step_agg AS a
+        JOIN run_case AS r
+          ON r.run_id = a.run_id
+        GROUP BY
+            a.run_id,
+            a.owner_name,
+            r.created_at,
+            r.priority
+    ),
+    scored AS (
+        SELECT
+            rm.run_id,
+            rm.owner_name,
+            rm.created_at,
+            rm.priority,
+            rm.total_minutes,
+            fn_priority_factor(rm.priority) AS priority_factor,
+            ROUND(rm.total_minutes * fn_priority_factor(rm.priority), 2) AS weighted_minutes
+        FROM run_minutes AS rm
+    ),
+    ranked AS (
+        SELECT
+            s.*,
+            ROW_NUMBER() OVER w_owner AS rn_in_owner,
+            LAG(s.weighted_minutes) OVER w_owner AS prev_weighted_minutes,
+            SUM(s.weighted_minutes) OVER w_owner_running AS running_owner_weighted,
+            DENSE_RANK() OVER w_global AS global_rank
+        FROM scored AS s
+        WINDOW
+            w_owner AS (
+                PARTITION BY s.owner_name
+                ORDER BY s.created_at, s.run_id
+            ),
+            w_owner_running AS (
+                PARTITION BY s.owner_name
+                ORDER BY s.created_at, s.run_id
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            ),
+            w_global AS (
+                ORDER BY s.weighted_minutes DESC, s.owner_name, s.run_id
+            )
+    )
+    SELECT MAX(running_owner_weighted)
+      INTO v_alice_running_weighted
+      FROM ranked
+     WHERE owner_name = 'alice';
+
+    CALL sp_assert(v_alice_running_weighted = 157.50, 'window running weighted sum mismatch');
+
+    WITH run_minutes AS (
+        SELECT
+            a.run_id,
+            a.owner_name,
+            r.created_at,
+            r.priority,
+            ROUND(SUM(a.minutes), 2) AS total_minutes
+        FROM tmp_step_agg AS a
+        JOIN run_case AS r
+          ON r.run_id = a.run_id
+        GROUP BY
+            a.run_id,
+            a.owner_name,
+            r.created_at,
+            r.priority
+    ),
+    owner_rollup AS (
+        SELECT
+            owner_name,
+            ROUND(SUM(total_minutes * fn_priority_factor(priority)), 2) AS owner_weighted
+        FROM run_minutes
+        GROUP BY owner_name
+    ),
+    owner_ranked AS (
+        SELECT
+            owner_name,
+            owner_weighted,
+            ROW_NUMBER() OVER (
+                ORDER BY owner_weighted DESC, owner_name
+            ) AS rn
+        FROM owner_rollup
+    )
+    SELECT
+        owner_name,
+        owner_weighted
+    INTO
+        v_top_owner,
+        v_top_owner_weighted
+    FROM owner_ranked
+    WHERE rn = 1;
+
+    CALL sp_assert(v_top_owner = 'alice', 'top owner mismatch');
+    CALL sp_assert(v_top_owner_weighted = 157.50, 'top owner weighted mismatch');
+
+    WITH run_minutes AS (
+        SELECT
+            a.run_id,
+            a.owner_name,
+            r.created_at,
+            r.priority,
+            ROUND(SUM(a.minutes), 2) AS total_minutes
+        FROM tmp_step_agg AS a
+        JOIN run_case AS r
+          ON r.run_id = a.run_id
+        GROUP BY
+            a.run_id,
+            a.owner_name,
+            r.created_at,
+            r.priority
+    ),
+    scored AS (
+        SELECT
+            rm.run_id,
+            ROUND(rm.total_minutes * fn_priority_factor(rm.priority), 2) AS weighted_minutes
+        FROM run_minutes AS rm
+    ),
+    ranked AS (
+        SELECT
+            run_id,
+            weighted_minutes,
+            ROW_NUMBER() OVER (
+                ORDER BY weighted_minutes DESC, run_id
+            ) AS rn
+        FROM scored
+    )
+    SELECT run_id
+      INTO v_top_run_id
+      FROM ranked
+     WHERE rn = 1;
+
+    CALL sp_assert(v_top_run_id = 4001, 'top run id mismatch');
+
+    INSERT INTO qa_summary (
+        summary_key,
+        `group`,
+        `rank`,
+        summary_num,
+        summary_text,
+        summary_json
+    )
+    VALUES
+        (
+            'TOP_OWNER_WEIGHTED',
+            'METRIC',
+            1,
+            v_top_owner_weighted,
+            v_top_owner,
+            JSON_OBJECT(
+                'owner', v_top_owner,
+                'weighted', v_top_owner_weighted
+            )
+        ),
+        (
+            'ALICE_RUNNING_WEIGHTED',
+            'METRIC',
+            2,
+            v_alice_running_weighted,
+            'running owner weighted max',
+            JSON_OBJECT(
+                'owner', 'alice',
+                'value', v_alice_running_weighted
+            )
+        ),
+        (
+            'TREE_DEPTH',
+            'METRIC',
+            3,
+            v_tree_depth,
+            'recursive cte max depth',
+            JSON_OBJECT('depth', v_tree_depth)
+        ),
+        (
+            'STEP_TAG_ROWS',
+            'METRIC',
+            4,
+            v_total_step_rows,
+            'json_table nested tag rows',
+            JSON_OBJECT('rows', v_total_step_rows)
+        ),
+        (
+            'STEP_TOTAL_MINUTES',
+            'METRIC',
+            5,
+            v_total_step_minutes,
+            'sum of distinct step minutes',
+            JSON_OBJECT('minutes', v_total_step_minutes)
+        ),
+        (
+            'METRIC_SUM',
+            'METRIC',
+            6,
+            v_total_metric_sum,
+            'sum of metrics array',
+            JSON_OBJECT('sum', v_total_metric_sum)
+        ),
+        (
+            'FACTOR_SUM',
+            'METRIC',
+            7,
+            v_factor_sum,
+            'cursor accumulated factor sum',
+            JSON_OBJECT('factor_sum', v_factor_sum)
+        ),
+        (
+            'TOP_RUN_ID',
+            'METRIC',
+            8,
+            v_top_run_id,
+            'top single weighted run',
+            JSON_OBJECT('run_id', v_top_run_id)
+        )
+    ON DUPLICATE KEY UPDATE
+        `group` = VALUES(`group`),
+        `rank` = VALUES(`rank`),
+        summary_num = VALUES(summary_num),
+        summary_text = VALUES(summary_text),
+        summary_json = VALUES(summary_json);
+
+    COMMIT;
+END//
+
+DELIMITER ;
+
+CALL sp_run_ultra_final_boss();
+
+SELECT
+    'PASS' AS status,
+    (SELECT summary_text FROM qa_summary WHERE summary_key = 'TOP_OWNER_WEIGHTED') AS top_owner,
+    (SELECT summary_num FROM qa_summary WHERE summary_key = 'TOP_OWNER_WEIGHTED') AS top_owner_weighted,
+    (SELECT summary_num FROM qa_summary WHERE summary_key = 'ALICE_RUNNING_WEIGHTED') AS alice_running_weighted,
+    (SELECT summary_num FROM qa_summary WHERE summary_key = 'TREE_DEPTH') AS tree_depth,
+    (SELECT summary_num FROM qa_summary WHERE summary_key = 'STEP_TAG_ROWS') AS step_tag_rows,
+    (SELECT summary_num FROM qa_summary WHERE summary_key = 'STEP_TOTAL_MINUTES') AS step_total_minutes,
+    (SELECT summary_num FROM qa_summary WHERE summary_key = 'METRIC_SUM') AS metric_sum,
+    (SELECT summary_num FROM qa_summary WHERE summary_key = 'FACTOR_SUM') AS factor_sum,
+    (SELECT summary_num FROM qa_summary WHERE summary_key = 'TOP_RUN_ID') AS top_run_id,
+    (SELECT COUNT(*) FROM error_log WHERE step_name = 'EXPECTED_DUPLICATE') AS expected_duplicate_errors,
+    (SELECT COUNT(*) FROM run_audit) AS audit_rows;
+
+SELECT
+    run_id,
+    owner_name,
+    status_code,
+    priority,
+    `rank`,
+    locale_code,
+    step_count
+FROM run_case
+ORDER BY run_id;
+
+SELECT
+    summary_key,
+    `group`,
+    `rank`,
+    summary_num,
+    summary_text,
+    summary_json
+FROM qa_summary
+ORDER BY `rank`, summary_key;
+
+SELECT
+    step_name,
+    sql_state,
+    mysql_errno,
+    message_text
+FROM error_log
+ORDER BY log_id;
+
+SELECT
+    run_id,
+    audit_type,
+    old_status,
+    new_status,
+    audit_note
+FROM run_audit
+ORDER BY audit_id;

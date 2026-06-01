@@ -1,0 +1,548 @@
+--------------------------------------------------------------------------------
+-- Hardcore SELECT / WITH / Nested / Analytic / Pivot / JSON / XML / Hierarchical
+-- Purpose: query tool parser + executor stress test (Oracle)
+--------------------------------------------------------------------------------
+
+-- (선택) SQL*Plus/TOAD 계열 명령어를 흉내내고 싶으면 주석 해제
+-- SET SERVEROUTPUT ON
+-- SET PAGESIZE 500
+-- SET LINESIZE 200
+-- SET TRIMSPOOL ON
+-- SET FEEDBACK ON
+-- SET HEADING ON
+-- SET TIMING ON
+
+PROMPT [0] Cleanup (ignore errors if objects do not exist)
+
+BEGIN
+  EXECUTE IMMEDIATE 'DROP TABLE oqt_t_order_item PURGE';
+EXCEPTION WHEN OTHERS THEN NULL; END;
+/
+BEGIN
+  EXECUTE IMMEDIATE 'DROP TABLE oqt_t_order_hdr PURGE';
+EXCEPTION WHEN OTHERS THEN NULL; END;
+/
+BEGIN
+  EXECUTE IMMEDIATE 'DROP TABLE oqt_t_emp PURGE';
+EXCEPTION WHEN OTHERS THEN NULL; END;
+/
+BEGIN
+  EXECUTE IMMEDIATE 'DROP TABLE oqt_t_dept PURGE';
+EXCEPTION WHEN OTHERS THEN NULL; END;
+/
+BEGIN
+  EXECUTE IMMEDIATE 'DROP TABLE oqt_t_tree PURGE';
+EXCEPTION WHEN OTHERS THEN NULL; END;
+/
+BEGIN
+  EXECUTE IMMEDIATE 'DROP TABLE oqt_t_json PURGE';
+EXCEPTION WHEN OTHERS THEN NULL; END;
+/
+BEGIN
+  EXECUTE IMMEDIATE 'DROP TABLE oqt_t_xml PURGE';
+EXCEPTION WHEN OTHERS THEN NULL; END;
+/
+
+PROMPT [1] Create tables
+
+CREATE TABLE oqt_t_dept (
+  deptno     NUMBER       CONSTRAINT pk_oqt_dept PRIMARY KEY,
+  dname      VARCHAR2(30)  NOT NULL,
+  loc        VARCHAR2(30)
+);
+
+CREATE TABLE oqt_t_emp (
+  empno      NUMBER       CONSTRAINT pk_oqt_emp PRIMARY KEY,
+  ename      VARCHAR2(30)  NOT NULL,
+  job        VARCHAR2(30),
+  mgr        NUMBER,
+  hiredate   DATE,
+  sal        NUMBER(10,2),
+  comm       NUMBER(10,2),
+  deptno     NUMBER       CONSTRAINT fk_oqt_emp_dept REFERENCES oqt_t_dept(deptno)
+);
+
+CREATE TABLE oqt_t_order_hdr (
+  order_id   NUMBER       CONSTRAINT pk_oqt_oh PRIMARY KEY,
+  cust_name  VARCHAR2(50) NOT NULL,
+  order_dt   DATE         NOT NULL,
+  status     VARCHAR2(10) NOT NULL
+);
+
+CREATE TABLE oqt_t_order_item (
+  order_id   NUMBER       CONSTRAINT fk_oqt_oi_oh REFERENCES oqt_t_order_hdr(order_id),
+  line_no    NUMBER       NOT NULL,
+  sku        VARCHAR2(30) NOT NULL,
+  qty        NUMBER       NOT NULL,
+  unit_price NUMBER(10,2) NOT NULL,
+  CONSTRAINT pk_oqt_oi PRIMARY KEY (order_id, line_no)
+);
+
+CREATE TABLE oqt_t_tree (
+  node_id    NUMBER CONSTRAINT pk_oqt_tree PRIMARY KEY,
+  parent_id  NUMBER,
+  node_name  VARCHAR2(50) NOT NULL
+);
+
+-- JSON / XML payload tables
+CREATE TABLE oqt_t_json (
+  id         NUMBER CONSTRAINT pk_oqt_json PRIMARY KEY,
+  payload    CLOB CHECK (payload IS JSON)
+);
+
+CREATE TABLE oqt_t_xml (
+  id         NUMBER CONSTRAINT pk_oqt_xml PRIMARY KEY,
+  payload    XMLTYPE
+) TABLESPACE users;
+
+PROMPT [2] Seed data
+
+INSERT INTO oqt_t_dept(deptno, dname, loc) VALUES (10, 'ACCOUNTING', 'SEOUL');
+INSERT INTO oqt_t_dept(deptno, dname, loc) VALUES (20, 'RESEARCH',   'BUSAN');
+INSERT INTO oqt_t_dept(deptno, dname, loc) VALUES (30, 'SALES',      'DAEGU');
+INSERT INTO oqt_t_dept(deptno, dname, loc) VALUES (40, 'OPERATIONS', 'JEJU');
+
+INSERT INTO oqt_t_emp(empno, ename, job, mgr, hiredate, sal, comm, deptno) VALUES (7839,'KING','PRESIDENT',NULL, DATE '2015-01-01',5000,NULL,10);
+INSERT INTO oqt_t_emp(empno, ename, job, mgr, hiredate, sal, comm, deptno) VALUES (7566,'JONES','MANAGER',7839, DATE '2016-03-15',2975,NULL,20);
+INSERT INTO oqt_t_emp(empno, ename, job, mgr, hiredate, sal, comm, deptno) VALUES (7698,'BLAKE','MANAGER',7839, DATE '2017-06-10',2850,NULL,30);
+INSERT INTO oqt_t_emp(empno, ename, job, mgr, hiredate, sal, comm, deptno) VALUES (7782,'CLARK','MANAGER',7839, DATE '2018-11-25',2450,NULL,10);
+INSERT INTO oqt_t_emp(empno, ename, job, mgr, hiredate, sal, comm, deptno) VALUES (7902,'FORD','ANALYST',7566, DATE '2019-12-03',3000,NULL,20);
+INSERT INTO oqt_t_emp(empno, ename, job, mgr, hiredate, sal, comm, deptno) VALUES (7369,'SMITH','CLERK',7902, DATE '2020-02-20', 800,NULL,20);
+INSERT INTO oqt_t_emp(empno, ename, job, mgr, hiredate, sal, comm, deptno) VALUES (7499,'ALLEN','SALESMAN',7698, DATE '2020-07-01',1600,300,30);
+INSERT INTO oqt_t_emp(empno, ename, job, mgr, hiredate, sal, comm, deptno) VALUES (7521,'WARD','SALESMAN',7698, DATE '2021-01-14',1250,500,30);
+INSERT INTO oqt_t_emp(empno, ename, job, mgr, hiredate, sal, comm, deptno) VALUES (7654,'MARTIN','SALESMAN',7698, DATE '2021-09-09',1250,1400,30);
+INSERT INTO oqt_t_emp(empno, ename, job, mgr, hiredate, sal, comm, deptno) VALUES (7844,'TURNER','SALESMAN',7698, DATE '2022-05-05',1500,0,30);
+
+INSERT INTO oqt_t_order_hdr(order_id, cust_name, order_dt, status) VALUES (1001,'alice',  SYSDATE-40, 'NEW');
+INSERT INTO oqt_t_order_hdr(order_id, cust_name, order_dt, status) VALUES (1002,'alice',  SYSDATE-10, 'PAID');
+INSERT INTO oqt_t_order_hdr(order_id, cust_name, order_dt, status) VALUES (1003,'bob',    SYSDATE-9,  'PAID');
+INSERT INTO oqt_t_order_hdr(order_id, cust_name, order_dt, status) VALUES (1004,'charlie',SYSDATE-2,  'CANC');
+
+INSERT INTO oqt_t_order_item(order_id, line_no, sku, qty, unit_price) VALUES (1001,1,'SKU-A',2,  10);
+INSERT INTO oqt_t_order_item(order_id, line_no, sku, qty, unit_price) VALUES (1001,2,'SKU-B',1,  25);
+INSERT INTO oqt_t_order_item(order_id, line_no, sku, qty, unit_price) VALUES (1002,1,'SKU-A',5,  10);
+INSERT INTO oqt_t_order_item(order_id, line_no, sku, qty, unit_price) VALUES (1002,2,'SKU-C',2,  70);
+INSERT INTO oqt_t_order_item(order_id, line_no, sku, qty, unit_price) VALUES (1003,1,'SKU-D',1, 120);
+INSERT INTO oqt_t_order_item(order_id, line_no, sku, qty, unit_price) VALUES (1004,1,'SKU-A',1,  10);
+
+-- tree (hierarchy)
+INSERT INTO oqt_t_tree(node_id, parent_id, node_name) VALUES (1, NULL, 'root');
+INSERT INTO oqt_t_tree(node_id, parent_id, node_name) VALUES (2, 1,    'A');
+INSERT INTO oqt_t_tree(node_id, parent_id, node_name) VALUES (3, 1,    'B');
+INSERT INTO oqt_t_tree(node_id, parent_id, node_name) VALUES (4, 2,    'A-1');
+INSERT INTO oqt_t_tree(node_id, parent_id, node_name) VALUES (5, 2,    'A-2');
+INSERT INTO oqt_t_tree(node_id, parent_id, node_name) VALUES (6, 4,    'A-1-x');
+
+-- JSON payload
+INSERT INTO oqt_t_json(id, payload) VALUES (1,
+'{
+  "order_id": 1002,
+  "customer": {"name":"alice","tier":"GOLD"},
+  "items":[
+    {"sku":"SKU-A","qty":5,"price":10},
+    {"sku":"SKU-C","qty":2,"price":70}
+  ],
+  "tags":["promo","fragile"],
+  "meta":{"channel":"web","coupon":null}
+}'
+);
+
+-- XML payload
+INSERT INTO oqt_t_xml(id, payload) VALUES (1,
+XMLTYPE('<root>
+  <dept deptno="10"><name>ACCOUNTING</name><loc>SEOUL</loc></dept>
+  <dept deptno="20"><name>RESEARCH</name><loc>BUSAN</loc></dept>
+  <dept deptno="30"><name>SALES</name><loc>DAEGU</loc></dept>
+</root>')
+);
+
+COMMIT;
+
+--------------------------------------------------------------------------------
+PROMPT [3] WITH basic + multiple CTE + join + scalar subquery + nested expressions
+--------------------------------------------------------------------------------
+
+WITH
+  e AS (
+    SELECT empno, ename, job, mgr, hiredate, sal, comm, deptno
+    FROM oqt_t_emp
+  ),
+  d AS (
+    SELECT deptno, dname, loc
+    FROM oqt_t_dept
+  ),
+  stats AS (
+    SELECT deptno,
+           COUNT(*) cnt,
+           AVG(sal) avg_sal,
+           SUM(NVL(comm,0)) sum_comm
+    FROM e
+    GROUP BY deptno
+  )
+SELECT
+  d.deptno,
+  d.dname,
+  d.loc,
+  s.cnt,
+  ROUND(s.avg_sal, 2) AS avg_sal,
+  s.sum_comm,
+  -- scalar subquery (correlated)
+  (SELECT MAX(e2.sal) FROM e e2 WHERE e2.deptno = d.deptno) AS max_sal_in_dept,
+  -- case + analytic in select list via scalar subquery
+  CASE
+    WHEN s.cnt = 0 THEN 'EMPTY'
+    WHEN s.avg_sal >= 2500 THEN 'HIGH'
+    ELSE 'NORMAL'
+  END AS dept_grade
+FROM d
+LEFT JOIN stats s ON s.deptno = d.deptno
+ORDER BY d.deptno;
+
+--------------------------------------------------------------------------------
+PROMPT [4] Nested WITH + inline view + complex predicates + EXISTS/NOT EXISTS
+--------------------------------------------------------------------------------
+
+WITH
+  paid_orders AS (
+    SELECT oh.order_id, oh.cust_name, oh.order_dt
+    FROM oqt_t_order_hdr oh
+    WHERE oh.status = 'PAID'
+  ),
+  order_amount AS (
+    SELECT oi.order_id,
+           SUM(oi.qty * oi.unit_price) AS amt
+    FROM oqt_t_order_item oi
+    GROUP BY oi.order_id
+  )
+SELECT *
+FROM (
+  WITH
+    x AS (
+      SELECT p.order_id, p.cust_name, p.order_dt, a.amt
+      FROM paid_orders p
+      JOIN order_amount a ON a.order_id = p.order_id
+      WHERE a.amt > 50
+    )
+  SELECT
+    x.*,
+    (SELECT COUNT(*) FROM oqt_t_order_item oi WHERE oi.order_id = x.order_id) AS line_cnt
+  FROM x
+) v
+WHERE EXISTS (SELECT 1 FROM oqt_t_order_item oi WHERE oi.order_id = v.order_id AND oi.sku LIKE 'SKU-%')
+  AND NOT EXISTS (SELECT 1 FROM oqt_t_order_item oi WHERE oi.order_id = v.order_id AND oi.qty <= 0)
+ORDER BY v.amt DESC, v.order_dt;
+
+--------------------------------------------------------------------------------
+PROMPT [5] Analytic/window functions: rank/dense_rank/percentile/listagg over window
+--------------------------------------------------------------------------------
+
+WITH base AS (
+  SELECT e.empno, e.ename, e.deptno, e.sal, e.hiredate
+  FROM oqt_t_emp e
+)
+SELECT
+  b.*,
+  RANK()       OVER (PARTITION BY deptno ORDER BY sal DESC) AS rnk,
+  DENSE_RANK() OVER (PARTITION BY deptno ORDER BY sal DESC) AS drnk,
+  ROW_NUMBER() OVER (PARTITION BY deptno ORDER BY hiredate, empno) AS rn,
+  SUM(sal)     OVER (PARTITION BY deptno) AS sum_sal_dept,
+  AVG(sal)     OVER (PARTITION BY deptno) AS avg_sal_dept,
+  PERCENT_RANK() OVER (PARTITION BY deptno ORDER BY sal) AS pct_rank,
+  CUME_DIST()    OVER (PARTITION BY deptno ORDER BY sal) AS cume_dist,
+  -- running total with frame
+  SUM(sal) OVER (
+    PARTITION BY deptno
+    ORDER BY hiredate
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS running_sal,
+  -- windowed listagg
+  LISTAGG(ename, ',') WITHIN GROUP (ORDER BY ename)
+    OVER (PARTITION BY deptno) AS names_in_dept
+FROM base b
+ORDER BY deptno, rnk, empno;
+
+--------------------------------------------------------------------------------
+PROMPT [6] GROUPING SETS / ROLLUP / CUBE + GROUPING_ID
+--------------------------------------------------------------------------------
+
+SELECT
+  deptno,
+  job,
+  COUNT(*) AS cnt,
+  ROUND(AVG(sal), 2) AS avg_sal,
+  GROUPING_ID(deptno, job) AS gid
+FROM oqt_t_emp
+GROUP BY CUBE(deptno, job)
+ORDER BY deptno NULLS LAST, job NULLS LAST, gid;
+
+--------------------------------------------------------------------------------
+PROMPT [7] PIVOT / UNPIVOT (sales by dept/job)
+--------------------------------------------------------------------------------
+
+WITH s AS (
+  SELECT deptno, job, sal
+  FROM oqt_t_emp
+)
+SELECT *
+FROM s
+PIVOT (
+  SUM(sal) AS sum_sal
+  FOR deptno IN (10 AS D10, 20 AS D20, 30 AS D30, 40 AS D40)
+)
+ORDER BY job;
+
+WITH p AS (
+  SELECT *
+  FROM (
+    SELECT deptno, job, sal FROM oqt_t_emp
+  )
+  PIVOT (
+    SUM(sal) FOR deptno IN (10 AS D10, 20 AS D20, 30 AS D30)
+  )
+)
+SELECT job, dept_tag, sum_sal
+FROM p
+UNPIVOT (
+  sum_sal FOR dept_tag IN (D10 AS '10', D20 AS '20', D30 AS '30')
+)
+ORDER BY job, dept_tag;
+
+--------------------------------------------------------------------------------
+PROMPT [8] Hierarchical query: CONNECT BY + SYS_CONNECT_BY_PATH + cycle-safe pattern
+--------------------------------------------------------------------------------
+
+SELECT
+  node_id,
+  parent_id,
+  node_name,
+  LEVEL AS lvl,
+  SYS_CONNECT_BY_PATH(node_name, '/') AS path
+FROM oqt_t_tree
+START WITH parent_id IS NULL
+CONNECT BY PRIOR node_id = parent_id
+ORDER SIBLINGS BY node_id;
+
+--------------------------------------------------------------------------------
+PROMPT [9] Recursive WITH (subquery factoring) to traverse hierarchy
+--------------------------------------------------------------------------------
+
+WITH r (node_id, parent_id, node_name, lvl, path) AS (
+  SELECT node_id, parent_id, node_name, 1 AS lvl, '/'||node_name AS path
+  FROM oqt_t_tree
+  WHERE parent_id IS NULL
+  UNION ALL
+  SELECT t.node_id, t.parent_id, t.node_name, r.lvl + 1,
+         r.path || '/' || t.node_name
+  FROM oqt_t_tree t
+  JOIN r ON t.parent_id = r.node_id
+)
+SELECT * FROM r
+ORDER BY lvl, node_id;
+
+--------------------------------------------------------------------------------
+PROMPT [10] LATERAL / OUTER APPLY style (12c+): per-row derived table
+--------------------------------------------------------------------------------
+
+SELECT
+  oh.order_id,
+  oh.cust_name,
+  oh.status,
+  x.amt,
+  x.max_unit_price
+FROM oqt_t_order_hdr oh
+OUTER APPLY (
+  SELECT
+    SUM(oi.qty * oi.unit_price) AS amt,
+    MAX(oi.unit_price) AS max_unit_price
+  FROM oqt_t_order_item oi
+  WHERE oi.order_id = oh.order_id
+) x
+ORDER BY oh.order_id;
+
+--------------------------------------------------------------------------------
+PROMPT [11] MATCH_RECOGNIZE (12c+): pattern over ordered rows
+--------------------------------------------------------------------------------
+-- Find sequences of increasing salaries within a dept (toy pattern)
+
+SELECT *
+FROM oqt_t_emp
+MATCH_RECOGNIZE (
+  PARTITION BY deptno
+  ORDER BY hiredate, empno
+  MEASURES
+    FIRST(ename) AS start_name,
+    LAST(ename)  AS end_name,
+    COUNT(*)     AS run_len
+  ONE ROW PER MATCH
+  PATTERN (a b+)
+  DEFINE
+    b AS b.sal > PREV(b.sal)
+);
+
+--------------------------------------------------------------------------------
+PROMPT [12] JSON_TABLE (12c+): relationalize JSON payload
+--------------------------------------------------------------------------------
+
+SELECT
+  jt.order_id,
+  jt.cust_name,
+  jt.tier,
+  it.sku,
+  it.qty,
+  it.price,
+  (it.qty * it.price) AS line_amt
+FROM oqt_t_json j
+CROSS JOIN JSON_TABLE(
+  j.payload,
+  '$'
+  COLUMNS (
+    order_id   NUMBER       PATH '$.order_id',
+    cust_name  VARCHAR2(50) PATH '$.customer.name',
+    tier       VARCHAR2(20) PATH '$.customer.tier',
+    NESTED PATH '$.items[*]'
+    COLUMNS (
+      sku   VARCHAR2(30) PATH '$.sku',
+      qty   NUMBER       PATH '$.qty',
+      price NUMBER       PATH '$.price'
+    )
+  )
+) jt
+CROSS APPLY (
+  SELECT jt.sku, jt.qty, jt.price FROM dual
+) it
+ORDER BY jt.order_id, it.sku;
+
+--------------------------------------------------------------------------------
+PROMPT [13] XMLTABLE: relationalize XML payload
+--------------------------------------------------------------------------------
+
+SELECT
+  x.deptno,
+  x.name,
+  x.loc
+FROM oqt_t_xml t,
+     XMLTABLE(
+       '/root/dept'
+       PASSING t.payload
+       COLUMNS
+         deptno NUMBER       PATH '@deptno',
+         name   VARCHAR2(30) PATH 'name/text()',
+         loc    VARCHAR2(30) PATH 'loc/text()'
+     ) x
+ORDER BY x.deptno;
+
+--------------------------------------------------------------------------------
+PROMPT [14] MODEL clause (advanced): compute derived metrics per dept
+--------------------------------------------------------------------------------
+
+WITH m AS (
+  SELECT deptno, SUM(sal) AS sum_sal, COUNT(*) AS cnt
+  FROM oqt_t_emp
+  GROUP BY deptno
+)
+SELECT deptno, sum_sal, cnt, avg_sal_calc, sum_plus_100
+FROM m
+MODEL
+  DIMENSION BY (deptno)
+  MEASURES (sum_sal, cnt, 0 AS avg_sal_calc, 0 AS sum_plus_100)
+  RULES (
+    avg_sal_calc[ANY] = ROUND(sum_sal[CV()] / NULLIF(cnt[CV()], 0), 2),
+    sum_plus_100[ANY] = sum_sal[CV()] + 100
+  )
+ORDER BY deptno;
+
+--------------------------------------------------------------------------------
+PROMPT [15] Deep nesting: WITH + multiple inline views + scalar + analytic + regexp
+--------------------------------------------------------------------------------
+
+WITH
+  base AS (
+    SELECT e.empno, e.ename, e.job, e.deptno, e.sal,
+           REGEXP_REPLACE(e.ename, '[AEIOU]', '*') AS masked_name
+    FROM oqt_t_emp e
+  ),
+  enriched AS (
+    SELECT
+      b.*,
+      (SELECT d.dname FROM oqt_t_dept d WHERE d.deptno = b.deptno) AS dname,
+      NTILE(3) OVER (PARTITION BY b.deptno ORDER BY b.sal DESC) AS sal_band
+    FROM base b
+  ),
+  filtered AS (
+    SELECT *
+    FROM enriched
+    WHERE (sal > (SELECT AVG(sal) FROM oqt_t_emp WHERE deptno = enriched.deptno))
+       OR (job IN ('MANAGER','ANALYST') AND sal >= 2500)
+  )
+SELECT
+  f.deptno,
+  f.dname,
+  f.empno,
+  f.ename,
+  f.masked_name,
+  f.job,
+  f.sal,
+  f.sal_band,
+  -- window frame with last_value (needs careful frame)
+  LAST_VALUE(f.sal) OVER (
+    PARTITION BY f.deptno
+    ORDER BY f.sal
+    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+  ) AS max_sal_via_last_value
+FROM filtered f
+ORDER BY f.deptno, f.sal DESC, f.empno;
+
+--------------------------------------------------------------------------------
+PROMPT [16] Correlated subquery in ORDER BY + FETCH FIRST (12c+)
+--------------------------------------------------------------------------------
+
+SELECT
+  oh.order_id,
+  oh.cust_name,
+  oh.order_dt,
+  (SELECT SUM(oi.qty*oi.unit_price) FROM oqt_t_order_item oi WHERE oi.order_id = oh.order_id) AS amt
+FROM oqt_t_order_hdr oh
+ORDER BY
+  (SELECT COUNT(*) FROM oqt_t_order_item oi WHERE oi.order_id = oh.order_id) DESC,
+  amt DESC NULLS LAST
+FETCH FIRST 3 ROWS ONLY;
+
+--------------------------------------------------------------------------------
+PROMPT [17] UNION/INTERSECT/MINUS + WITH
+--------------------------------------------------------------------------------
+
+WITH a AS (
+  SELECT empno, ename, deptno FROM oqt_t_emp WHERE deptno IN (10,20)
+),
+b AS (
+  SELECT empno, ename, deptno FROM oqt_t_emp WHERE deptno IN (20,30)
+)
+SELECT * FROM a
+UNION
+SELECT * FROM b
+ORDER BY deptno, empno;
+
+WITH a AS (
+  SELECT empno FROM oqt_t_emp WHERE job = 'MANAGER'
+),
+b AS (
+  SELECT empno FROM oqt_t_emp WHERE sal >= 2500
+)
+SELECT empno FROM a
+INTERSECT
+SELECT empno FROM b
+ORDER BY empno;
+
+WITH a AS (
+  SELECT empno FROM oqt_t_emp WHERE deptno = 30
+),
+b AS (
+  SELECT empno FROM oqt_t_emp WHERE comm IS NOT NULL
+)
+SELECT empno FROM a
+MINUS
+SELECT empno FROM b
+ORDER BY empno;
+
+PROMPT [DONE] Hardcore SELECT tests finished.
+--------------------------------------------------------------------------------
