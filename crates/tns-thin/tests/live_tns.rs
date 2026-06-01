@@ -2,8 +2,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use oracle_thin::exec::{OracleValue, StatementRequest};
-use oracle_thin::{ConnectTarget, OracleThinConfig, OracleThinSession};
+use tns_thin::exec::{OracleValue, StatementRequest};
+use tns_thin::{ConnectTarget, OracleThinConfig, OracleThinSession};
 
 static OBJECT_COUNTER: AtomicUsize = AtomicUsize::new(1);
 

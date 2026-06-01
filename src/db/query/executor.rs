@@ -1,14 +1,14 @@
 use oracle::sql_type::{OracleType, RefCursor, ToSql};
 use oracle::{Connection, Error as OracleError, Row, Statement};
-use oracle_thin::exec::{
-    BindValue as OracleThinBindValue, OracleColumnType as OracleThinColumnType,
-    OracleValue as OracleThinValue, StatementRequest as OracleThinStatementRequest,
-};
-use oracle_thin::OracleThinSession;
 use serde::Serialize;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
+use tns_thin::exec::{
+    BindValue as OracleThinBindValue, OracleColumnType as OracleThinColumnType,
+    OracleValue as OracleThinValue, StatementRequest as OracleThinStatementRequest,
+};
+use tns_thin::OracleThinSession;
 
 use crate::db::session::{BindDataType, BindValue, CompiledObject, SessionState};
 use crate::sql_parser_engine::{LineBoundaryAction, SqlParserEngine};
@@ -10626,12 +10626,12 @@ pub struct ForeignKeyInfo {
 #[cfg(test)]
 mod oracle_thin_object_metadata_live_tests {
     use super::{ObjectBrowser, QueryExecutor};
-    use oracle_thin::exec::{
+    use std::time::Duration;
+    use tns_thin::exec::{
         BindValue as OracleThinBindValue, OracleColumnType as OracleThinColumnType,
         StatementRequest,
     };
-    use oracle_thin::{ConnectTarget, OracleThinConfig, OracleThinSession};
-    use std::time::Duration;
+    use tns_thin::{ConnectTarget, OracleThinConfig, OracleThinSession};
 
     fn live_protocol_env(name: &str) -> Option<u16> {
         let value = std::env::var(name).ok()?;

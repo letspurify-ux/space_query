@@ -1793,22 +1793,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "oracle_thin"
-version = "0.1.0"
-dependencies = [
- "aes",
- "cbc",
- "hmac",
- "libc",
- "md-5",
- "once_cell",
- "pbkdf2",
- "rand",
- "sha1",
- "sha2",
-]
-
-[[package]]
 name = "ordered-stream"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2386,12 +2370,12 @@ dependencies = [
  "mysql",
  "once_cell",
  "oracle",
- "oracle_thin",
  "proc-macro2",
  "quote",
  "serde",
  "serde_json",
  "syn 2.0.117",
+ "tns-thin",
  "windows-sys 0.61.2",
  "winres",
 ]
@@ -2590,6 +2574,22 @@ name = "tinyvec_macros"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
+
+[[package]]
+name = "tns-thin"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "cbc",
+ "hmac",
+ "libc",
+ "md-5",
+ "once_cell",
+ "pbkdf2",
+ "rand",
+ "sha1",
+ "sha2",
+]
 
 [[package]]
 name = "toml"

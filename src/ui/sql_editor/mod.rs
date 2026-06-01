@@ -43,7 +43,7 @@ use crate::ui::theme;
 use crate::ui::{QueryTabId, ResultMessageKind, ResultTabRequest};
 use crate::utils::{AppConfig, QueryHistoryEntry};
 use oracle::Connection;
-use oracle_thin::OracleThinCancelHandle;
+use tns_thin::OracleThinCancelHandle;
 
 mod execution;
 mod formatter;
@@ -730,7 +730,7 @@ impl CloseSessionAction {
         }
     }
 
-    fn apply_oracle_thin(self, db_conn: &mut oracle_thin::OracleThinSession) -> Result<(), String> {
+    fn apply_oracle_thin(self, db_conn: &mut tns_thin::OracleThinSession) -> Result<(), String> {
         match self {
             CloseSessionAction::Commit => db_conn.commit().map_err(|err| err.to_string()),
             CloseSessionAction::Rollback => db_conn.rollback().map_err(|err| err.to_string()),

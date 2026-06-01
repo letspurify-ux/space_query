@@ -149,22 +149,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
-name = "oracle_thin"
-version = "0.1.0"
-dependencies = [
- "aes",
- "cbc",
- "hmac",
- "libc",
- "md-5",
- "once_cell",
- "pbkdf2",
- "rand",
- "sha1",
- "sha2",
-]
-
-[[package]]
 name = "pbkdf2"
 version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -268,6 +252,22 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "tns-thin"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "cbc",
+ "hmac",
+ "libc",
+ "md-5",
+ "once_cell",
+ "pbkdf2",
+ "rand",
+ "sha1",
+ "sha2",
 ]
 
 [[package]]

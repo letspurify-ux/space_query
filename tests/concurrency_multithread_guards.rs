@@ -35,9 +35,13 @@ fn read_source(relative_path: &str) -> String {
         .unwrap_or_else(|err| panic!("failed to read source file {}: {err}", file.display()))
 }
 
+fn compact_for_pattern(value: &str) -> String {
+    value.chars().filter(|ch| !ch.is_whitespace()).collect()
+}
+
 #[test]
 fn oracle_thin_pool_acquire_drops_pool_lock_before_connection_hooks() {
-    let content = read_source("crates/oracle-thin/src/pool.rs");
+    let content = read_source("crates/tns-thin/src/pool.rs");
     let start = content
         .find("while let Some(conn) = guard.idle.pop_front()")
         .expect("Oracle Thin idle checkout loop should exist");
@@ -55,20 +59,19 @@ fn oracle_thin_pool_acquire_drops_pool_lock_before_connection_hooks() {
     let drop_conn = loop_body
         .find("drop(conn);")
         .expect("Oracle Thin idle connection discard should drop explicitly");
-    let relock_after_drop = loop_body[drop_conn..]
+    let _relock_after_drop = compact_for_pattern(&loop_body[drop_conn..])
         .find("self.inner.mutex.lock()")
-        .map(|offset| drop_conn + offset)
         .expect("Oracle Thin idle connection discard should relock after dropping");
 
     assert!(
-        drop_guard < health_check && health_check < drop_conn && drop_conn < relock_after_drop,
+        drop_guard < health_check && health_check < drop_conn,
         "Oracle Thin pool must not call connection health/drop hooks while holding the pool mutex"
     );
 }
 
 #[test]
 fn oracle_thin_pool_drop_checks_health_before_pool_lock() {
-    let content = read_source("crates/oracle-thin/src/pool.rs");
+    let content = read_source("crates/tns-thin/src/pool.rs");
     let start = content
         .find("impl<T: PoolableConnection> Drop for PooledThinConnection<T>")
         .expect("Oracle Thin pooled connection Drop impl should exist");
@@ -86,13 +89,12 @@ fn oracle_thin_pool_drop_checks_health_before_pool_lock() {
     let reset = drop_impl
         .find("conn.reset_before_reuse()")
         .expect("Oracle Thin Drop reset should exist");
-    let pool_lock_after_reset = drop_impl[reset..]
+    let _pool_lock_after_reset = compact_for_pattern(&drop_impl[reset..])
         .find("self.state.mutex.lock()")
-        .map(|offset| reset + offset)
         .expect("Oracle Thin Drop should lock pool state before returning the connection");
 
     assert!(
-        take_conn < health_check && health_check < reset && reset < pool_lock_after_reset,
+        take_conn < health_check && health_check < reset,
         "Oracle Thin pooled connection Drop must not call connection health/reset hooks while holding the pool mutex"
     );
 }
@@ -1078,7 +1080,7 @@ fn oracle_thin_get_ddl_uses_same_direct_query_for_all_protocol_versions() {
 
 #[test]
 fn oracle_thin_described_lazy_paths_remember_last_row_for_no_eor_fetches() {
-    let content = read_source("crates/oracle-thin/src/session.rs");
+    let content = read_source("crates/tns-thin/src/session.rs");
     for (start_marker, end_marker) in [
         (
             "pub fn execute_typed_with_implicit(",

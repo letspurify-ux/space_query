@@ -754,7 +754,7 @@ impl SqlEditorWidget {
     }
 
     fn describe_thin_object(
-        conn: &mut oracle_thin::OracleThinSession,
+        conn: &mut tns_thin::OracleThinSession,
         object_name: &str,
         qualifier: Option<&str>,
         tracked_schema: Option<&str>,

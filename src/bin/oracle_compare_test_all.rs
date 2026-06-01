@@ -1,9 +1,5 @@
 use chrono::NaiveDateTime;
 use fltk::{app, input::IntInput};
-use oracle_thin::exec::{
-    OracleColumnType as ThinOracleColumnType, OracleValue as ThinOracleValue,
-    StatementRequest as ThinStatementRequest,
-};
 use serde::{Deserialize, Serialize};
 use space_query::db::{ConnectionInfo, DatabaseConnection, DatabaseType, OracleDriverMode};
 use space_query::ui::sql_editor::{QueryProgress, SqlEditorWidget};
@@ -14,6 +10,10 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tns_thin::exec::{
+    OracleColumnType as ThinOracleColumnType, OracleValue as ThinOracleValue,
+    StatementRequest as ThinStatementRequest,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct GridSnapshot {

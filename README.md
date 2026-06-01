@@ -231,6 +231,14 @@ Apple Silicon에서는 앱과 Instant Client의 CPU 아키텍처가 같아야 �
 - 비밀번호는 설정 JSON에 저장하지 않습니다.
 - 쿼리 히스토리는 현재 실행 중인 앱 프로세스의 메모리에서 관리됩니다.
 
+## 라이선스와 상표
+
+이 프로젝트는 `MIT OR Apache-2.0`으로 배포됩니다. 전체 라이선스는 `LICENSE-MIT`, `LICENSE-APACHE`를 보세요.
+
+TNS thin 구현은 `python-oracledb`와 `go-ora`의 permissive-licensed 구현을 참고했습니다. 관련 고지는 `THIRD_PARTY_NOTICES.md`와 `crates/tns-thin/THIRD_PARTY_NOTICES.md`에 유지합니다.
+
+Oracle, Java, MySQL, and NetSuite are registered trademarks of Oracle and/or its affiliates. Other names may be trademarks of their respective owners. 이 프로젝트는 Oracle과 제휴, 승인, 후원 관계가 아닙니다.
+
 ## 소스 구조
 
 ```text
@@ -274,6 +282,7 @@ src/
 
 추가 파일과 디렉터리:
 
+- `crates/tns-thin/`: Oracle Database와 통신하기 위한 thin TNS client crate
 - `tests/`: 스레드 안전성, panic guard, 회귀 가드 테스트
 - `test/`, `test_mysql/`, `test_mariadb/`: 파서/포매터/스크립트 회귀용 SQL 샘플
 - `oracle.md`, `mysql.md`, `mariadb.md`: DB별 참고 문서

@@ -4,10 +4,10 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  ./test_oracle_thin.sh [protocol ...]
+  ./test_tns_thin.sh [protocol ...]
 
 Defaults:
-  Runs Oracle Thin live DB tests and test/test_all.sql compare tests for protocols: 314 315 318 319
+  Runs TNS thin live DB tests and test/test_all.sql compare tests for protocols: 314 315 318 319
 
 Environment:
   ORACLE_TEST_HOST             default: 127.0.0.1
@@ -21,8 +21,8 @@ Environment:
   CARGO_BUILD_TARGET           default: aarch64-apple-darwin on macOS for aarch64 OCI
   ORACLE_THIN_LIVE_PROTOCOLS   optional space-separated protocol list
   INCLUDE_LARGE_TYPES=1        include large_chunk_candidate_types live_tns tests
-  RUN_MAIN_CRATE=0             skip space_query oracle_thin ignored live tests
-  RUN_LIVE_TNS=0               skip oracle_thin crate live_tns ignored live tests
+  RUN_MAIN_CRATE=0             skip space_query TNS thin ignored live tests
+  RUN_LIVE_TNS=0               skip tns-thin crate live_tns ignored live tests
   RUN_UNIT_REGRESSION=0        skip focused non-live regression tests
   RUN_COMPARE=0                skip oracle_compare_test_all live test for each protocol
   SKIP_PREFLIGHT=1             skip listener/client-library preflight checks
@@ -30,10 +30,10 @@ Environment:
   ORACLE_COMPARE_TIMEOUT_SECS  default used by harness if set
 
 Examples:
-  ./test_oracle_thin.sh
-  ./test_oracle_thin.sh 314
-  INCLUDE_LARGE_TYPES=1 ./test_oracle_thin.sh 318
-  RUN_COMPARE=0 ./test_oracle_thin.sh 314 315 318 319
+  ./test_tns_thin.sh
+  ./test_tns_thin.sh 314
+  INCLUDE_LARGE_TYPES=1 ./test_tns_thin.sh 318
+  RUN_COMPARE=0 ./test_tns_thin.sh 314 315 318 319
 USAGE
 }
 
@@ -210,7 +210,7 @@ fi
 
 print_config() {
   cat <<CONFIG
-Oracle Thin live test configuration
+TNS thin live test configuration
   protocols: ${PROTOCOLS[*]}
   host: $ORACLE_TEST_HOST
   port: $ORACLE_TEST_PORT
@@ -220,8 +220,8 @@ Oracle Thin live test configuration
   client lib: $ORACLE_CLIENT_LIB_DIR
   cargo target: ${CARGO_BUILD_TARGET:-host default}
   include large types: ${INCLUDE_LARGE_TYPES:-0}
-  run oracle_thin live_tns: $RUN_LIVE_TNS
-  run space_query oracle_thin: $RUN_MAIN_CRATE
+  run tns-thin live_tns: $RUN_LIVE_TNS
+  run space_query TNS thin: $RUN_MAIN_CRATE
   run unit regression: $RUN_UNIT_REGRESSION
   run compare harness: $RUN_COMPARE
   compare SQL: $ORACLE_COMPARE_SQL
@@ -285,15 +285,15 @@ check_prereqs() {
 run_unit_regression() {
   echo
   echo "== Unit regression: described bind projection =="
-  cargo test --manifest-path crates/oracle-thin/Cargo.toml described_
+  cargo test --manifest-path crates/tns-thin/Cargo.toml described_
 }
 
 run_live_tns_for_protocol() {
   local protocol="$1"
   echo
-  echo "== oracle_thin live_tns protocol $protocol =="
+  echo "== tns-thin live_tns protocol $protocol =="
   ORACLE_THIN_DESIRED_PROTOCOL="$protocol" \
-    cargo test --manifest-path crates/oracle-thin/Cargo.toml --test live_tns -- \
+    cargo test --manifest-path crates/tns-thin/Cargo.toml --test live_tns -- \
       --ignored \
       --nocapture \
       --test-threads=1 \
@@ -303,7 +303,7 @@ run_live_tns_for_protocol() {
 run_main_crate_for_protocol() {
   local protocol="$1"
   echo
-  echo "== space_query oracle_thin ignored live tests protocol $protocol =="
+  echo "== space_query TNS thin ignored live tests protocol $protocol =="
   ORACLE_THIN_DESIRED_PROTOCOL="$protocol" \
     cargo test oracle_thin --lib -- \
       --ignored \
@@ -353,4 +353,4 @@ for protocol in "${PROTOCOLS[@]}"; do
 done
 
 echo
-echo "All requested Oracle Thin tests passed."
+echo "All requested TNS thin tests passed."

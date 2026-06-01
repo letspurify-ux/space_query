@@ -2,9 +2,9 @@ use std::env;
 use std::fmt::Display;
 use std::str::FromStr;
 
-use oracle_thin::connect::{ConnectOptions, ConnectTarget, OracleNetConnector};
-use oracle_thin::exec::StatementRequest;
-use oracle_thin::session::{OracleThinConfig, OracleThinSession};
+use tns_thin::connect::{ConnectOptions, ConnectTarget, OracleNetConnector};
+use tns_thin::exec::StatementRequest;
+use tns_thin::session::{OracleThinConfig, OracleThinSession};
 
 fn parse_env_value<T>(name: &str) -> Option<T>
 where

@@ -11,15 +11,6 @@ use fltk::{
 use mysql::prelude::Queryable;
 use mysql::Error as MysqlError;
 use oracle::{Connection, Error as OracleError, ErrorKind as OracleErrorKind};
-use oracle_thin::exec::{
-    BindInputValue as OracleThinBindInputValue, BindValue as OracleThinBindValue,
-    ColumnMetadata as OracleThinColumnMetadata,
-    DescribedQueryResult as OracleThinDescribedQueryResult, OracleColumnType, OracleValue,
-    QueryResult as OracleThinQueryResult, RefCursorValue as OracleThinRefCursorValue,
-    StatementRequest,
-};
-use oracle_thin::pool::PooledThinConnection;
-use oracle_thin::{OracleDateTime, OracleThinCancelHandle, OracleThinSession};
 use std::collections::VecDeque;
 use std::env;
 use std::fs;
@@ -31,6 +22,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use tns_thin::exec::{
+    BindInputValue as OracleThinBindInputValue, BindValue as OracleThinBindValue,
+    ColumnMetadata as OracleThinColumnMetadata,
+    DescribedQueryResult as OracleThinDescribedQueryResult, OracleColumnType, OracleValue,
+    QueryResult as OracleThinQueryResult, RefCursorValue as OracleThinRefCursorValue,
+    StatementRequest,
+};
+use tns_thin::pool::PooledThinConnection;
+use tns_thin::{OracleDateTime, OracleThinCancelHandle, OracleThinSession};
 
 use crate::db::{
     cache_pool_session_context_for_shared_connection,
@@ -29191,7 +29191,7 @@ mod mysql_transaction_feedback_tests {
         );
     }
 
-    fn oracle_thin_live_config() -> oracle_thin::OracleThinConfig {
+    fn oracle_thin_live_config() -> tns_thin::OracleThinConfig {
         let host = std::env::var("ORACLE_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
         let port = std::env::var("ORACLE_TEST_PORT")
             .ok()
@@ -29202,8 +29202,8 @@ mod mysql_transaction_feedback_tests {
             std::env::var("ORACLE_TEST_USERNAME").unwrap_or_else(|_| "system".to_string());
         let password =
             std::env::var("ORACLE_TEST_PASSWORD").unwrap_or_else(|_| "password".to_string());
-        let mut config = oracle_thin::OracleThinConfig::new(
-            oracle_thin::ConnectTarget::service_name(host, port, service),
+        let mut config = tns_thin::OracleThinConfig::new(
+            tns_thin::ConnectTarget::service_name(host, port, service),
             username,
             password,
         );
@@ -29223,7 +29223,7 @@ mod mysql_transaction_feedback_tests {
     fn oracle_thin_live_config_with_protocol(
         protocol_version: u16,
         ttc_field_version: u8,
-    ) -> oracle_thin::OracleThinConfig {
+    ) -> tns_thin::OracleThinConfig {
         let mut config = oracle_thin_live_config();
         config.connect_options.desired_protocol_version = protocol_version;
         config.connect_options.minimum_protocol_version = protocol_version;
@@ -29231,7 +29231,7 @@ mod mysql_transaction_feedback_tests {
         config
     }
 
-    fn assert_oracle_thin_protocol_318_fv12_no_eor(conn: &oracle_thin::OracleThinSession) {
+    fn assert_oracle_thin_protocol_318_fv12_no_eor(conn: &tns_thin::OracleThinSession) {
         let caps = conn.capabilities();
         assert_eq!(caps.protocol_version, Some(318));
         assert_eq!(caps.ttc_field_version, 12);
@@ -29278,7 +29278,7 @@ mod mysql_transaction_feedback_tests {
     }
 
     fn oracle_thin_live_supports_implicit_resultsets() -> bool {
-        oracle_thin::OracleThinSession::connect(oracle_thin_live_config())
+        tns_thin::OracleThinSession::connect(oracle_thin_live_config())
             .expect("thin login")
             .capabilities()
             .supports_implicit_resultsets
@@ -29311,10 +29311,10 @@ mod mysql_transaction_feedback_tests {
 
     fn oracle_thin_run_script_with_config(
         sql_text: &str,
-        config: oracle_thin::OracleThinConfig,
+        config: tns_thin::OracleThinConfig,
     ) -> Vec<QueryProgress> {
         let _oracle_schema_guard = oracle_thin_shared_schema_test_guard();
-        let mut conn = oracle_thin::OracleThinSession::connect(config).expect("thin login");
+        let mut conn = tns_thin::OracleThinSession::connect(config).expect("thin login");
         let session = Arc::new(Mutex::new(SessionState {
             db_type: DatabaseType::Oracle,
             ..SessionState::default()
@@ -29498,7 +29498,7 @@ mod mysql_transaction_feedback_tests {
         sql: &str,
         lazy_fetch_batch_size: u32,
         drive: OracleLazyFetchDrive,
-        thin_config: Option<oracle_thin::OracleThinConfig>,
+        thin_config: Option<tns_thin::OracleThinConfig>,
     ) -> Vec<QueryProgress> {
         oracle_lazy_worker_run_for_sql_with_config_and_drive(
             mode,
@@ -29515,7 +29515,7 @@ mod mysql_transaction_feedback_tests {
         sql: &str,
         lazy_fetch_batch_size: u32,
         drive: OracleLazyFetchDrive,
-        thin_config: Option<oracle_thin::OracleThinConfig>,
+        thin_config: Option<tns_thin::OracleThinConfig>,
     ) -> OracleLazyWorkerRun {
         let (sender, receiver) = mpsc::channel();
         let session = Arc::new(Mutex::new(SessionState {
@@ -29527,9 +29527,9 @@ mod mysql_transaction_feedback_tests {
         let session_id = 42;
         match mode {
             OracleDriverMode::Thin => {
-                let pool = oracle_thin::OracleThinSessionPool::new(
+                let pool = tns_thin::OracleThinSessionPool::new(
                     thin_config.unwrap_or_else(oracle_thin_live_config),
-                    oracle_thin::pool::PoolOptions {
+                    tns_thin::pool::PoolOptions {
                         max_size: 2,
                         acquire_timeout: Duration::from_secs(5),
                     },
@@ -29732,7 +29732,7 @@ mod mysql_transaction_feedback_tests {
     }
 
     fn oracle_thin_lazy_fetch_cancel_during_fetch_all_progress_with_config(
-        config: oracle_thin::OracleThinConfig,
+        config: tns_thin::OracleThinConfig,
         sql: &str,
         lazy_fetch_batch_size: u32,
     ) -> Vec<QueryProgress> {
@@ -29744,9 +29744,9 @@ mod mysql_transaction_feedback_tests {
         let active_lazy_fetch = Arc::new(Mutex::new(None));
         let pooled_db_session = SharedDbSessionLease::new();
         let session_id = 43;
-        let pool = oracle_thin::OracleThinSessionPool::new(
+        let pool = tns_thin::OracleThinSessionPool::new(
             config,
-            oracle_thin::pool::PoolOptions {
+            tns_thin::pool::PoolOptions {
                 max_size: 2,
                 acquire_timeout: Duration::from_secs(5),
             },
@@ -29850,9 +29850,9 @@ mod mysql_transaction_feedback_tests {
         let active_lazy_fetch = Arc::new(Mutex::new(None));
         let pooled_db_session = SharedDbSessionLease::new();
         let session_id = 44;
-        let pool = oracle_thin::OracleThinSessionPool::new(
+        let pool = tns_thin::OracleThinSessionPool::new(
             oracle_thin_live_config(),
-            oracle_thin::pool::PoolOptions {
+            tns_thin::pool::PoolOptions {
                 max_size: 2,
                 acquire_timeout: Duration::from_secs(5),
             },
@@ -30103,7 +30103,7 @@ mod mysql_transaction_feedback_tests {
     #[ignore = "requires local Oracle listener"]
     fn oracle_thin_query_tool_runtime_selects_cells() {
         let mut conn =
-            oracle_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
+            tns_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
         SqlEditorWidget::ensure_oracle_thin_runtime(&mut conn).expect("install runtime");
 
         let (columns, rows) = SqlEditorWidget::oracle_thin_select_cells(
@@ -30120,7 +30120,7 @@ mod mysql_transaction_feedback_tests {
     #[ignore = "requires local Oracle listener"]
     fn oracle_thin_query_tool_runtime_previews_multibyte_clob_without_ora_22835() {
         let mut conn =
-            oracle_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
+            tns_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
         SqlEditorWidget::ensure_oracle_thin_runtime(&mut conn).expect("install runtime");
 
         let (columns, rows) = SqlEditorWidget::oracle_thin_select_cells(
@@ -30141,7 +30141,7 @@ mod mysql_transaction_feedback_tests {
     #[ignore = "requires local Oracle listener"]
     fn oracle_thin_query_tool_runtime_previews_clob_function_without_ora_03120() {
         let mut conn =
-            oracle_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
+            tns_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
         SqlEditorWidget::ensure_oracle_thin_runtime(&mut conn).expect("install runtime");
         let function_name = format!("OQT_UI_CLOB_FN_{}", std::process::id());
         let _ = SqlEditorWidget::execute_oracle_thin_statement(
@@ -30182,7 +30182,7 @@ mod mysql_transaction_feedback_tests {
     #[ignore = "requires local Oracle listener"]
     fn oracle_thin_query_tool_runtime_fetches_all_rowid_injected_rows() {
         let mut conn =
-            oracle_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
+            tns_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
         SqlEditorWidget::ensure_oracle_thin_runtime(&mut conn).expect("install runtime");
         let table = format!("oqt_thin_ui_rowid_{}", std::process::id());
         let _ = SqlEditorWidget::execute_oracle_thin_statement(
@@ -30230,7 +30230,7 @@ mod mysql_transaction_feedback_tests {
     #[ignore = "requires local Oracle listener"]
     fn oracle_thin_query_tool_runtime_handles_transaction_and_autocommit() {
         let mut conn =
-            oracle_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
+            tns_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
         SqlEditorWidget::ensure_oracle_thin_runtime(&mut conn).expect("install runtime");
         let table = format!("OQT_THIN_TX_{}", std::process::id());
         let _ = SqlEditorWidget::execute_oracle_thin_statement(
@@ -30285,7 +30285,7 @@ mod mysql_transaction_feedback_tests {
     #[ignore = "requires local Oracle listener"]
     fn oracle_thin_query_tool_runtime_drains_dbms_output() {
         let mut conn =
-            oracle_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
+            tns_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
         SqlEditorWidget::ensure_oracle_thin_runtime(&mut conn).expect("install runtime");
         SqlEditorWidget::execute_oracle_thin_statement(
             &mut conn,
@@ -30324,7 +30324,7 @@ mod mysql_transaction_feedback_tests {
     fn oracle_thin_query_tool_dynamic_ddl_cleanup_drops_table() {
         let _oracle_schema_guard = oracle_thin_shared_schema_test_guard();
         let mut conn =
-            oracle_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
+            tns_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
         SqlEditorWidget::ensure_oracle_thin_runtime(&mut conn).expect("install runtime");
         let _ = SqlEditorWidget::execute_oracle_thin_statement(
             &mut conn,
@@ -30552,7 +30552,7 @@ mod mysql_transaction_feedback_tests {
     fn oracle_thin_lazy_fetch_help_fetch_all_reaches_direct_row_count() {
         let sql = "select * from help";
         let mut direct =
-            oracle_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
+            tns_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
         let direct_rows = direct
             .query_described_fetch_all(sql, 25)
             .expect("direct HELP fetch all")
@@ -30602,7 +30602,7 @@ mod mysql_transaction_feedback_tests {
         let sql = "select * from help";
         let config = oracle_thin_live_config_with_protocol(318, 12);
         let mut direct =
-            oracle_thin::OracleThinSession::connect(config.clone()).expect("thin 318/FV12 login");
+            tns_thin::OracleThinSession::connect(config.clone()).expect("thin 318/FV12 login");
         assert_oracle_thin_protocol_318_fv12_no_eor(&direct);
         direct
             .set_call_timeout(Some(Duration::from_secs(30)))
@@ -30669,7 +30669,7 @@ mod mysql_transaction_feedback_tests {
         let sql = "select * from help";
         let config = oracle_thin_live_config_with_protocol(318, 12);
         let mut direct =
-            oracle_thin::OracleThinSession::connect(config.clone()).expect("thin 318/FV12 login");
+            tns_thin::OracleThinSession::connect(config.clone()).expect("thin 318/FV12 login");
         assert_oracle_thin_protocol_318_fv12_no_eor(&direct);
         direct
             .set_call_timeout(Some(Duration::from_secs(30)))
@@ -30747,7 +30747,7 @@ mod mysql_transaction_feedback_tests {
         let sql = "select level as n, mod(level, 10) as bucket from dual connect by level <= 20050";
         let config = oracle_thin_live_config_with_protocol(318, 12);
         let mut direct =
-            oracle_thin::OracleThinSession::connect(config.clone()).expect("thin 318/FV12 login");
+            tns_thin::OracleThinSession::connect(config.clone()).expect("thin 318/FV12 login");
         assert_oracle_thin_protocol_318_fv12_no_eor(&direct);
         direct
             .set_call_timeout(Some(Duration::from_secs(30)))
@@ -30813,7 +30813,7 @@ mod mysql_transaction_feedback_tests {
         let sql = "select level as n, mod(level, 10) as bucket from dual connect by level <= 20050";
         let config = oracle_thin_live_config_with_protocol(318, 12);
         let caps_conn =
-            oracle_thin::OracleThinSession::connect(config.clone()).expect("thin 318/FV12 login");
+            tns_thin::OracleThinSession::connect(config.clone()).expect("thin 318/FV12 login");
         assert_oracle_thin_protocol_318_fv12_no_eor(&caps_conn);
         drop(caps_conn);
 
@@ -30880,7 +30880,7 @@ mod mysql_transaction_feedback_tests {
             "select level as n, mod(level, 10) as bucket from dual connect by level <= 200000";
         let config = oracle_thin_live_config_with_protocol(318, 12);
         let caps_conn =
-            oracle_thin::OracleThinSession::connect(config.clone()).expect("thin 318/FV12 login");
+            tns_thin::OracleThinSession::connect(config.clone()).expect("thin 318/FV12 login");
         assert_oracle_thin_protocol_318_fv12_no_eor(&caps_conn);
         drop(caps_conn);
 
@@ -30988,7 +30988,7 @@ mod mysql_transaction_feedback_tests {
         let sql = "select * from help";
         let config = oracle_thin_live_config_with_protocol(318, 12);
         let mut direct =
-            oracle_thin::OracleThinSession::connect(config.clone()).expect("thin 318/FV12 login");
+            tns_thin::OracleThinSession::connect(config.clone()).expect("thin 318/FV12 login");
         assert_oracle_thin_protocol_318_fv12_no_eor(&direct);
         direct
             .set_call_timeout(Some(Duration::from_secs(30)))
@@ -31109,7 +31109,7 @@ mod mysql_transaction_feedback_tests {
         }
         let config = oracle_thin_live_config_with_protocol(318, 12);
         let caps_conn =
-            oracle_thin::OracleThinSession::connect(config.clone()).expect("thin 318/FV12 login");
+            tns_thin::OracleThinSession::connect(config.clone()).expect("thin 318/FV12 login");
         assert_oracle_thin_protocol_318_fv12_no_eor(&caps_conn);
 
         let sql = "select a.object_id from all_objects a, all_objects b, all_objects c";
@@ -31178,9 +31178,9 @@ mod mysql_transaction_feedback_tests {
         }));
         let active_lazy_fetch = Arc::new(Mutex::new(None));
         let pooled_db_session = SharedDbSessionLease::new();
-        let pool = oracle_thin::OracleThinSessionPool::new(
+        let pool = tns_thin::OracleThinSessionPool::new(
             oracle_thin_live_config(),
-            oracle_thin::pool::PoolOptions {
+            tns_thin::pool::PoolOptions {
                 max_size: 2,
                 acquire_timeout: Duration::from_secs(5),
             },
@@ -31316,9 +31316,9 @@ mod mysql_transaction_feedback_tests {
     #[test]
     #[ignore = "requires local Oracle listener"]
     fn oracle_thin_cancel_error_discards_session_and_same_tab_can_query() {
-        let pool = oracle_thin::OracleThinSessionPool::new(
+        let pool = tns_thin::OracleThinSessionPool::new(
             oracle_thin_live_config(),
-            oracle_thin::pool::PoolOptions {
+            tns_thin::pool::PoolOptions {
                 max_size: 1,
                 acquire_timeout: Duration::from_secs(5),
             },
@@ -31409,7 +31409,7 @@ mod mysql_transaction_feedback_tests {
     #[ignore = "requires local Oracle listener"]
     fn oracle_thin_pooled_session_health_check_uses_text_value() {
         let mut conn =
-            oracle_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
+            tns_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
 
         assert!(SqlEditorWidget::oracle_thin_pooled_session_health_check(
             &mut conn,
@@ -31469,7 +31469,7 @@ mod mysql_transaction_feedback_tests {
         let call_sql = format!("BEGIN :v_result := {function_name}(); END;");
 
         let mut thin_conn =
-            oracle_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
+            tns_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
         let _ = SqlEditorWidget::execute_oracle_thin_statement(
             &mut thin_conn,
             format!("DROP FUNCTION {function_name}"),
@@ -31584,7 +31584,7 @@ mod mysql_transaction_feedback_tests {
              END;";
 
         let mut thin_conn =
-            oracle_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
+            tns_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
         let thin_session = Arc::new(Mutex::new(SessionState {
             db_type: DatabaseType::Oracle,
             ..SessionState::default()
@@ -31752,7 +31752,7 @@ mod mysql_transaction_feedback_tests {
     #[ignore = "requires local Oracle listener"]
     fn oracle_thin_query_tool_runtime_uses_scalar_bind_values_in_select() {
         let mut conn =
-            oracle_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
+            tns_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
         let session = Arc::new(Mutex::new(SessionState::default()));
         {
             let mut guard = session.lock().expect("session lock");
@@ -31776,7 +31776,7 @@ mod mysql_transaction_feedback_tests {
     #[ignore = "requires local Oracle listener"]
     fn oracle_thin_query_tool_runtime_updates_scalar_inout_binds() {
         let mut conn =
-            oracle_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
+            tns_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
         let session = Arc::new(Mutex::new(SessionState::default()));
         {
             let mut guard = session.lock().expect("session lock");
@@ -31822,7 +31822,7 @@ mod mysql_transaction_feedback_tests {
     #[ignore = "requires local Oracle listener"]
     fn oracle_thin_query_tool_runtime_stores_refcursor_bind_rows_for_print() {
         let mut conn =
-            oracle_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
+            tns_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
         let session = Arc::new(Mutex::new(SessionState::default()));
         {
             let mut guard = session.lock().expect("session lock");
@@ -31853,7 +31853,7 @@ mod mysql_transaction_feedback_tests {
     #[ignore = "requires local Oracle listener"]
     fn oracle_thin_query_tool_runtime_stores_empty_refcursor_columns_for_print() {
         let mut conn =
-            oracle_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
+            tns_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
         let session = Arc::new(Mutex::new(SessionState::default()));
         {
             let mut guard = session.lock().expect("session lock");
@@ -31944,7 +31944,7 @@ mod mysql_transaction_feedback_tests {
     #[ignore = "requires local Oracle listener"]
     fn oracle_thin_query_tool_cancel_breaks_long_select() {
         let mut conn =
-            oracle_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
+            tns_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
         let cancel = conn.cancel_handle();
         let handle = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(300));

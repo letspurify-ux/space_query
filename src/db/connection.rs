@@ -3,9 +3,6 @@ use oracle::{
     pool::GetMode, sql_type::OracleType, Connection, Connector, Error as OracleError,
     ErrorKind as OracleErrorKind, InitParams,
 };
-use oracle_thin::exec::{OracleValue, StatementRequest};
-use oracle_thin::pool::{PoolOptions as OracleThinPoolOptions, PooledThinConnection};
-use oracle_thin::{ConnectTarget, OracleThinConfig, OracleThinSession, OracleThinSessionPool};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
@@ -16,6 +13,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::{Duration, Instant};
+use tns_thin::exec::{OracleValue, StatementRequest};
+use tns_thin::pool::{PoolOptions as OracleThinPoolOptions, PooledThinConnection};
+use tns_thin::{ConnectTarget, OracleThinConfig, OracleThinSession, OracleThinSessionPool};
 
 use crate::db::session::SessionState;
 use crate::db::session_policy::{
@@ -53,7 +53,7 @@ fn ensure_oracle_thin_connect_logger_installed() {
     use std::sync::Once;
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        let _ = oracle_thin::set_connect_phase_logger(Box::new(|phase, detail| {
+        let _ = tns_thin::set_connect_phase_logger(Box::new(|phase, detail| {
             let message = if detail.is_empty() {
                 phase.to_string()
             } else {
@@ -1246,7 +1246,7 @@ impl DbConnectionPool {
         )
     }
 
-    fn format_oracle_thin_pool_acquire_error(err: &oracle_thin::OracleThinError) -> String {
+    fn format_oracle_thin_pool_acquire_error(err: &tns_thin::OracleThinError) -> String {
         let message = err.to_string();
         if !message
             .to_ascii_lowercase()

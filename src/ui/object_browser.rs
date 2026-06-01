@@ -3309,7 +3309,7 @@ impl ObjectBrowserWidget {
 
     fn acquire_oracle_thin_metadata_session(
         context: &crate::db::DbPoolSessionContext,
-    ) -> Option<oracle_thin::pool::PooledThinConnection<oracle_thin::OracleThinSession>> {
+    ) -> Option<tns_thin::pool::PooledThinConnection<tns_thin::OracleThinSession>> {
         context.ensure_current().ok()?;
         match context.acquire_session_for_current_scope() {
             Ok(crate::db::DbPoolSession::OracleThin(conn)) => Some(*conn),

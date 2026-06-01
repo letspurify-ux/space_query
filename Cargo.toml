@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 description = "SPACE Query: a Toad-like SQL Query Tool built with Rust and FLTK (Oracle, MySQL, MariaDB)"
 authors = ["Developer"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/letspurify-ux/space_query"
 build = "build.rs"
 
 [[bin]]
@@ -15,7 +17,7 @@ test = false
 fltk = { version = "1.5", features = ["no-pango"] }
 oracle = "0.6"
 mysql = "25"
-oracle_thin = { path = "crates/oracle-thin" }
+tns_thin = { package = "tns-thin", path = "crates/tns-thin" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chrono = "0.4"

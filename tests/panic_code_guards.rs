@@ -272,7 +272,7 @@ fn non_test_source_does_not_use_panic_prone_syntax() {
 #[test]
 fn oracle_thin_non_test_source_does_not_use_panic_prone_syntax() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let src_root = manifest_dir.join("crates/oracle-thin/src");
+    let src_root = manifest_dir.join("crates/tns-thin/src");
     let offenders = collect_panic_syntax_offenders(&src_root, manifest_dir);
 
     assert!(
