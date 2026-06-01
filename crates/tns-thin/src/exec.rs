@@ -18,6 +18,7 @@ pub enum OracleColumnType {
     IntervalDaySecond,
     Vector,
     Json,
+    Xml,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

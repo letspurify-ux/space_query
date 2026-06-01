@@ -12984,6 +12984,7 @@ impl SqlEditorWidget {
             second: second_text.parse::<u8>().map_err(|err| err.to_string())?,
             nanosecond: nanos,
             timezone_offset_minutes: None,
+            timezone_region_id: None,
         })
     }
 
@@ -13411,7 +13412,10 @@ impl SqlEditorWidget {
         if !columns.iter().any(|column| {
             matches!(
                 column.column_type,
-                OracleColumnType::Clob | OracleColumnType::Nclob | OracleColumnType::Blob
+                OracleColumnType::Clob
+                    | OracleColumnType::Nclob
+                    | OracleColumnType::Blob
+                    | OracleColumnType::Xml
             )
         }) {
             return None;
@@ -13428,6 +13432,11 @@ impl SqlEditorWidget {
                     }
                     OracleColumnType::Blob => {
                         format!("RAWTOHEX(DBMS_LOB.SUBSTR({source}, 2000, 1)) AS {quoted}")
+                    }
+                    OracleColumnType::Xml => {
+                        format!(
+                            "DBMS_LOB.SUBSTR(XMLSERIALIZE(CONTENT {source} AS CLOB), 900, 1) AS {quoted}"
+                        )
                     }
                     _ => format!("{source} AS {quoted}"),
                 }

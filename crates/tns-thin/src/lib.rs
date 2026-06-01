@@ -1,5 +1,6 @@
 pub mod connect;
 pub mod exec;
+mod oracle_zones;
 pub mod pool;
 pub mod session;
 
@@ -87,13 +88,20 @@ pub struct OracleDateTime {
     pub second: u8,
     pub nanosecond: u32,
     pub timezone_offset_minutes: Option<i16>,
+    pub timezone_region_id: Option<u16>,
 }
 
 impl OracleDateTime {
     pub fn timezone_suffix(&self) -> Option<String> {
-        let offset = self.timezone_offset_minutes?;
-        let sign = if offset < 0 { '-' } else { '+' };
-        let abs = offset.unsigned_abs();
-        Some(format!("{sign}{:02}:{:02}", abs / 60, abs % 60))
+        if let Some(offset) = self.timezone_offset_minutes {
+            let sign = if offset < 0 { '-' } else { '+' };
+            let abs = offset.unsigned_abs();
+            return Some(format!("{sign}{:02}:{:02}", abs / 60, abs % 60));
+        }
+        let region_id = self.timezone_region_id?;
+        Some(match oracle_zones::oracle_zone_name(region_id) {
+            Some(name) => format!(" {name}"),
+            None => format!(" TZR#{region_id}"),
+        })
     }
 }

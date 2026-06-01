@@ -25,6 +25,18 @@ fn negotiated_protocol_matches_requested_protocol() {
 
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn auth_alter_session_sets_initial_time_zone() {
+    let mut conn = connect();
+    let expected = std::env::var("ORA_SDTZ").unwrap_or_else(|_| "+09:00".to_string());
+    let result = conn
+        .query_described_fetch_all("SELECT SESSIONTIMEZONE AS tz FROM dual", 1)
+        .expect("fetch session timezone after login");
+
+    assert_eq!(rows_to_strings(&result.result.rows), vec![vec![expected]]);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn fetch_and_fetch_all_return_all_rows() {
     let mut conn = connect();
     let sql = "SELECT level AS n, 'R' || TO_CHAR(level) AS label FROM dual CONNECT BY level <= 7";
@@ -308,6 +320,34 @@ fn fetch_json_column_decodes_oson_payload_as_json_text() {
 
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn fetch_xmltype_column_decodes_text_across_batches() {
+    let mut conn = connect();
+    let result = conn
+        .query_described_fetch_all(
+            "SELECT XMLTYPE('<root><n>' || level || '</n><txt>' || UNISTR('\\D55C\\AE00') || '</txt></root>') AS doc \
+             FROM dual CONNECT BY level <= 3",
+            1,
+        )
+        .expect("fetch XMLTYPE column");
+
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Xml]
+    );
+    let rows = rows_to_strings(&result.result.rows);
+    assert_eq!(rows.len(), 3);
+    assert!(rows[0][0].contains("<n>1</n>"));
+    assert!(rows[1][0].contains("<n>2</n>"));
+    assert!(rows[2][0].contains("<n>3</n>"));
+    assert!(rows.iter().all(|row| row[0].contains("한글")));
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn plsql_json_out_bind_decodes_oson_payload_as_json_text() {
     let mut conn = connect();
     let mut request = StatementRequest::statement(
@@ -413,6 +453,43 @@ fn fetch_timestamp_tz_fixed_offset_decodes_offset() {
         "2024-01-02 03:04:05.123456"
     );
     assert_eq!(timestamp_value_timezone_suffix(value), Some("+05:45".to_string()));
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn fetch_timestamp_tz_named_region_decodes_region() {
+    let mut conn = connect();
+    let result = conn
+        .query_described_fetch_all(
+            "SELECT \
+             TIMESTAMP '2024-01-02 03:04:05.123456' AT TIME ZONE 'Asia/Seoul' AS ts_tz \
+             FROM dual",
+            1,
+        )
+        .expect("fetch named-region timestamp with time zone column");
+
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Timestamp]
+    );
+    let value = result
+        .result
+        .rows
+        .first()
+        .and_then(|row| row.first())
+        .expect("named-region timestamp with time zone row");
+    assert_eq!(
+        timestamp_value_to_string(value),
+        "2024-01-02 03:04:05.123456"
+    );
+    assert_eq!(
+        timestamp_value_timezone_suffix(value),
+        Some(" Asia/Seoul".to_string())
+    );
 }
 
 #[test]
@@ -965,6 +1042,84 @@ fn plsql_date_and_timestamp_out_and_inout_binds_return_values() {
             OracleValue::Timestamp(oracle_datetime(2024, 2, 29, 1, 2, 5, 123_456_000)),
         ]
     );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn timestamptz_bind_round_trips_fixed_offset() {
+    let mut conn = connect();
+    let mut request = StatementRequest::query(
+        "SELECT TO_CHAR(:1, 'YYYY-MM-DD HH24:MI:SS.FF6 TZH:TZM') FROM dual",
+        1,
+    );
+    let mut value = oracle_datetime(2024, 1, 2, 3, 4, 5, 123_456_000);
+    value.timezone_offset_minutes = Some(345);
+    request.binds.push(BindValue::Timestamp(value));
+
+    let result = conn
+        .query_described_fetch_all_request(&request)
+        .expect("round-trip TIMESTAMP WITH TIME ZONE bind");
+
+    assert_eq!(
+        rows_to_strings(&result.result.rows),
+        vec![vec!["2024-01-02 03:04:05.123456 +05:45".to_string()]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn timestamptz_bind_round_trips_named_region() {
+    let mut conn = connect();
+    let mut request = StatementRequest::query(
+        "SELECT \
+         TO_CHAR(:1, 'YYYY-MM-DD HH24:MI:SS.FF6 TZH:TZM'), \
+         TO_CHAR(:1, 'TZR') \
+         FROM dual",
+        1,
+    );
+    let mut value = oracle_datetime(2024, 1, 2, 3, 4, 5, 123_456_000);
+    value.timezone_region_id = Some(273);
+    request.binds.push(BindValue::Timestamp(value));
+
+    let result = conn
+        .query_described_fetch_all_request(&request)
+        .expect("round-trip named-region TIMESTAMP WITH TIME ZONE bind");
+    let rows = rows_to_strings(&result.result.rows);
+
+    assert_eq!(rows[0][0], "2024-01-02 03:04:05.123456 +09:00");
+    assert!(
+        rows[0][1].to_ascii_uppercase().contains("SEOUL"),
+        "unexpected TIMESTAMP WITH TIME ZONE region: {}",
+        rows[0][1]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn plsql_timestamptz_out_bind_returns_fixed_offset() {
+    let mut conn = connect();
+    let mut request = StatementRequest::statement(
+        "BEGIN \
+         :1 := FROM_TZ(TIMESTAMP '2024-01-02 03:04:05.123456', '+05:45'); \
+         END;",
+    );
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Timestamp,
+        max_len: 13,
+    });
+
+    let values = conn
+        .execute_out_binds(&request, &[])
+        .expect("PL/SQL TIMESTAMP WITH TIME ZONE OUT bind");
+    let value = values
+        .first()
+        .expect("TIMESTAMP WITH TIME ZONE OUT bind value");
+
+    assert_eq!(
+        timestamp_value_to_string(value),
+        "2024-01-02 03:04:05.123456"
+    );
+    assert_eq!(timestamp_value_timezone_suffix(value), Some("+05:45".to_string()));
 }
 
 #[test]
@@ -1550,6 +1705,7 @@ fn oracle_datetime(
         second,
         nanosecond,
         timezone_offset_minutes: None,
+        timezone_region_id: None,
     }
 }
 
