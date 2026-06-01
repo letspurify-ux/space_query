@@ -16,12 +16,15 @@ pub enum OracleColumnType {
     Cursor,
     IntervalYearMonth,
     IntervalDaySecond,
+    Vector,
+    Json,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindInputValue {
     Number(String),
     Text(String),
+    Bytes(Vec<u8>),
     Boolean(bool),
     Date(OracleDateTime),
     Timestamp(OracleDateTime),
@@ -32,6 +35,7 @@ pub enum BindValue {
     Null(OracleColumnType),
     Number(String),
     Text(String),
+    Bytes(Vec<u8>),
     Boolean(bool),
     Date(OracleDateTime),
     Timestamp(OracleDateTime),
@@ -50,6 +54,7 @@ pub enum BindValue {
 pub struct ColumnMetadata {
     pub name: String,
     pub column_type: OracleColumnType,
+    pub charset_form: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -3199,11 +3199,7 @@ impl SqlEditorWidget {
         } else {
             cursor_closed
         };
-        if cleanup_failed
-            && db_cancel_requested
-            && close_cancelled
-            && matches!(error_kind, InterruptKind::Cancelled)
-        {
+        if cleanup_failed && close_cancelled && matches!(error_kind, InterruptKind::Cancelled) {
             return (true, false, InterruptKind::Cancelled);
         }
         if !cleanup_failed {
@@ -4212,8 +4208,19 @@ impl SqlEditorWidget {
                         {
                             request.sql = lob_sql;
                         }
+                        let vector_needs_define_fetch = preview_columns
+                            .iter()
+                            .any(|column| column.column_type == OracleColumnType::Vector);
+                        if vector_needs_define_fetch {
+                            request.prefetch_rows = 0;
+                        }
 
-                        let described = match conn.query_described_initial_request(&request) {
+                        let described_result = if vector_needs_define_fetch {
+                            conn.query_described_initial_without_prefetch_request(&request)
+                        } else {
+                            conn.query_described_initial_request(&request)
+                        };
+                        let described = match described_result {
                             Ok(described) => described,
                             Err(err)
                                 if sql_for_execution != sql_to_execute
@@ -4223,8 +4230,13 @@ impl SqlEditorWidget {
                             {
                                 normalize_internal_rowid_alias = false;
                                 request.sql = sql_to_execute.clone();
-                                conn.query_described_initial_request(&request)
-                                    .map_err(|retry_err| retry_err.to_string())?
+                                if vector_needs_define_fetch {
+                                    conn.query_described_initial_without_prefetch_request(&request)
+                                        .map_err(|retry_err| retry_err.to_string())?
+                                } else {
+                                    conn.query_described_initial_request(&request)
+                                        .map_err(|retry_err| retry_err.to_string())?
+                                }
                             }
                             Err(err) => return Err(err.to_string()),
                         };
@@ -4267,7 +4279,7 @@ impl SqlEditorWidget {
 
                         let initial_eof = Self::oracle_thin_result_reached_eof(&described.result);
                         let open_cursor_id = described.result.cursor_id;
-                        let mut needs_define_fetch = false;
+                        let mut needs_define_fetch = vector_needs_define_fetch;
                         let rows = Self::oracle_thin_result_rows_to_cells(
                             conn,
                             described.result.rows,
@@ -4404,12 +4416,12 @@ impl SqlEditorWidget {
                                             query_timeout,
                                             fetched_rows,
                                         );
+                                    Self::set_lazy_fetch_in_progress(
+                                        &active_lazy_fetch,
+                                        session_id,
+                                        true,
+                                    );
                                     loop {
-                                        Self::set_lazy_fetch_in_progress(
-                                            &active_lazy_fetch,
-                                            session_id,
-                                            true,
-                                        );
                                         let fetch_result = Self::oracle_thin_fetch_lazy_rows(
                                             conn,
                                             cursor_id,
@@ -4422,12 +4434,17 @@ impl SqlEditorWidget {
                                             query_timeout,
                                             Some(&mut fetch_all_timeout),
                                         );
-                                        Self::set_lazy_fetch_in_progress(
-                                            &active_lazy_fetch,
-                                            session_id,
-                                            false,
-                                        );
-                                        let (rows, eof) = fetch_result?;
+                                        let (rows, eof) = match fetch_result {
+                                            Ok(result) => result,
+                                            Err(err) => {
+                                                Self::set_lazy_fetch_in_progress(
+                                                    &active_lazy_fetch,
+                                                    session_id,
+                                                    false,
+                                                );
+                                                return Err(err);
+                                            }
+                                        };
                                         let no_rows = rows.is_empty();
                                         Self::append_spool_rows(&session, &rows);
                                         Self::emit_lazy_rows(&sender, index, rows);
@@ -4435,6 +4452,11 @@ impl SqlEditorWidget {
                                             &command_receiver,
                                             &mut pending_commands,
                                         ) {
+                                            Self::set_lazy_fetch_in_progress(
+                                                &active_lazy_fetch,
+                                                session_id,
+                                                false,
+                                            );
                                             return Ok(LazyFetchWorkerOutcome::Interrupted(
                                                 Self::lazy_fetch_interrupt_kind_for_command(
                                                     &command,
@@ -4445,11 +4467,21 @@ impl SqlEditorWidget {
                                             &active_lazy_fetch,
                                             session_id,
                                         ) {
+                                            Self::set_lazy_fetch_in_progress(
+                                                &active_lazy_fetch,
+                                                session_id,
+                                                false,
+                                            );
                                             return Ok(LazyFetchWorkerOutcome::Interrupted(
                                                 InterruptKind::Cancelled,
                                             ));
                                         }
-                                        if eof {
+                                        if eof || no_rows {
+                                            Self::set_lazy_fetch_in_progress(
+                                                &active_lazy_fetch,
+                                                session_id,
+                                                false,
+                                            );
                                             keep_session = true;
                                             success_result = Some(finish_success(
                                                 fetched_rows,
@@ -4457,12 +4489,6 @@ impl SqlEditorWidget {
                                                 column_info,
                                             ));
                                             return Ok(LazyFetchWorkerOutcome::Completed);
-                                        }
-                                        if no_rows {
-                                            conn.set_call_timeout(None)
-                                                .map_err(|err| err.to_string())?;
-                                            Self::emit_lazy_waiting(&sender, index, session_id);
-                                            break;
                                         }
                                     }
                                 }
@@ -4529,6 +4555,14 @@ impl SqlEditorWidget {
 
                     let db_cancel_requested =
                         Self::lazy_fetch_db_cancel_requested(&active_lazy_fetch, session_id);
+                    let lazy_cancel_requested_for_close =
+                        Self::lazy_fetch_cancel_requested(&active_lazy_fetch, session_id);
+                    if close_cancelled
+                        && (db_cancel_requested || lazy_cancel_requested_for_close)
+                        && matches!(close_error_kind, InterruptKind::UnsafeOrUnknown)
+                    {
+                        close_error_kind = InterruptKind::Cancelled;
+                    }
                     let timeout_reset_ok = match conn.set_call_timeout(None) {
                         Ok(()) => true,
                         Err(err) => {
@@ -4736,7 +4770,7 @@ impl SqlEditorWidget {
                         let _ = sender.send(success_result);
                         app::awake();
                     }
-                    let (close_cancelled, cursor_closed, close_error_kind) =
+                    let (close_cancelled, cursor_closed, mut close_error_kind) =
                         Self::oracle_thin_lazy_cleanup_close_flags(
                             close_cancelled,
                             cursor_closed,
@@ -4744,6 +4778,12 @@ impl SqlEditorWidget {
                             cleanup_failed,
                             db_cancel_requested,
                         );
+                    if close_cancelled
+                        && !cursor_closed
+                        && matches!(close_error_kind, InterruptKind::UnsafeOrUnknown)
+                    {
+                        close_error_kind = InterruptKind::Cancelled;
+                    }
                     Self::emit_lazy_closed_result(
                         &sender,
                         index,
@@ -12868,6 +12908,7 @@ impl SqlEditorWidget {
         Ok(match value {
             OracleThinBindInputValue::Number(value) => OracleThinBindValue::Number(value),
             OracleThinBindInputValue::Text(value) => OracleThinBindValue::Text(value),
+            OracleThinBindInputValue::Bytes(value) => OracleThinBindValue::Bytes(value),
             OracleThinBindInputValue::Boolean(value) => OracleThinBindValue::Boolean(value),
             OracleThinBindInputValue::Date(value) => OracleThinBindValue::Date(value),
             OracleThinBindInputValue::Timestamp(value) => OracleThinBindValue::Timestamp(value),
@@ -22592,7 +22633,7 @@ mod query_execution_cleanup_tests {
                 true,
                 false,
             ),
-            (true, false, InterruptKind::UnsafeOrUnknown)
+            (true, false, InterruptKind::Cancelled)
         );
         assert_eq!(
             SqlEditorWidget::oracle_thin_lazy_cleanup_close_flags(
@@ -30925,6 +30966,77 @@ mod mysql_transaction_feedback_tests {
 
     #[test]
     #[ignore = "requires local Oracle listener"]
+    fn oracle_thin_protocol_matrix_lazy_fetch_all_exact_batches_complete() {
+        let protocols = oracle_thin_protocol_env("ORACLE_THIN_DESIRED_PROTOCOL")
+            .map(|protocol| vec![protocol])
+            .unwrap_or_else(|| (314..=319).collect::<Vec<_>>());
+        let sql = "select level as n, mod(level, 10) as bucket from dual connect by level <= 20250";
+
+        for protocol in protocols {
+            if !(314..=319).contains(&protocol) {
+                eprintln!("skipping exact-batch FetchAll matrix: unsupported protocol {protocol}");
+                continue;
+            }
+            let ttc_field_version = if protocol <= 314 { 6 } else { 24 };
+            let config = oracle_thin_live_config_with_protocol(protocol, ttc_field_version);
+            let mut direct = tns_thin::OracleThinSession::connect(config.clone())
+                .unwrap_or_else(|err| panic!("thin {protocol} login: {err}"));
+            assert_eq!(direct.capabilities().protocol_version, Some(protocol));
+            direct
+                .set_call_timeout(Some(Duration::from_secs(30)))
+                .expect("set direct fetch timeout");
+            let direct_rows = direct
+                .query_described_fetch_all(sql, 250)
+                .unwrap_or_else(|err| panic!("direct {protocol} exact-batch fetch all: {err}"))
+                .result
+                .rows
+                .len();
+            assert_eq!(direct_rows, 20_250);
+
+            let run = oracle_lazy_worker_run_for_sql_with_config_and_drive(
+                OracleDriverMode::Thin,
+                sql,
+                250,
+                OracleLazyFetchDrive::FetchAll,
+                Some(config),
+            );
+            let failures = oracle_thin_progress_failures(&run.events);
+            let snapshot = oracle_grid_snapshot(&run.events);
+            let finished_rows = run.events.iter().find_map(|event| match event {
+                QueryProgress::StatementFinished { result, .. } if result.success => {
+                    Some(result.row_count)
+                }
+                _ => None,
+            });
+            let close_events = run
+                .events
+                .iter()
+                .filter(|event| matches!(event, QueryProgress::LazyFetchClosed { .. }))
+                .count();
+
+            assert!(
+                failures.is_empty(),
+                "Oracle Thin {protocol} exact-batch FetchAll failures: {failures:?}"
+            );
+            assert_eq!(
+                snapshot.rows.len(),
+                direct_rows,
+                "Oracle Thin {protocol} exact-batch FetchAll should fetch all rows"
+            );
+            assert_eq!(
+                finished_rows,
+                Some(direct_rows),
+                "Oracle Thin {protocol} exact-batch FetchAll should finish successfully"
+            );
+            assert_eq!(
+                close_events, 1,
+                "Oracle Thin {protocol} exact-batch FetchAll should close the lazy worker once"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle listener"]
     fn oracle_thin_lazy_fetch_help_fetch_more_reaches_direct_row_count() {
         let sql = "select * from help";
         let progress = oracle_lazy_worker_progress_for_sql_with_drive(
@@ -31116,6 +31228,21 @@ mod mysql_transaction_feedback_tests {
         let progress =
             oracle_thin_lazy_fetch_cancel_during_fetch_all_progress_with_config(config, sql, 1);
         let failures = oracle_thin_progress_failures(&progress);
+        let close_events = progress
+            .iter()
+            .filter_map(|event| match event {
+                QueryProgress::LazyFetchClosed {
+                    cancelled,
+                    cursor_closed,
+                    fetch_worker_done,
+                    error_kind,
+                    ..
+                } => Some(format!(
+                    "cancelled={cancelled} cursor_closed={cursor_closed} fetch_worker_done={fetch_worker_done} error_kind={error_kind:?}"
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
 
         assert!(
             failures.is_empty(),
@@ -31134,7 +31261,7 @@ mod mysql_transaction_feedback_tests {
                     }
                 )
             }),
-            "318/FV12 lazy cancel should close the UI worker without waiting for cursor cleanup; events={}",
+            "318/FV12 lazy cancel should close the UI worker without waiting for cursor cleanup; events={} close_events={close_events:?}",
             progress.len()
         );
     }

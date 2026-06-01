@@ -5939,12 +5939,12 @@ mod tests {
     #[test]
     fn oracle_thin_protocol_acceptance_log_shows_default_range_and_unknown_accept() {
         assert_eq!(
-            DatabaseConnection::format_oracle_thin_protocol_acceptance_log(Some(319), 300, 319, 24),
-            "Oracle Thin accepted TNS protocol version 319 (requested 300..319); TTC field version 24"
+            DatabaseConnection::format_oracle_thin_protocol_acceptance_log(Some(319), 314, 319, 24),
+            "Oracle Thin accepted TNS protocol version 319 (requested 314..319); TTC field version 24"
         );
         assert_eq!(
-            DatabaseConnection::format_oracle_thin_protocol_acceptance_log(None, 300, 319, 17),
-            "Oracle Thin accepted TNS protocol version unknown (requested 300..319); TTC field version 17"
+            DatabaseConnection::format_oracle_thin_protocol_acceptance_log(None, 314, 319, 17),
+            "Oracle Thin accepted TNS protocol version unknown (requested 314..319); TTC field version 17"
         );
     }
 

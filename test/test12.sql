@@ -530,7 +530,23 @@ ORDER BY 1;
 /
 
 --------------------------------------------------------------------------------
--- 13. FINAL SANITY
+-- 13. LARGE VARCHAR2 FETCH BOUNDARIES
+--------------------------------------------------------------------------------
+
+SELECT
+    CAST (RPAD ('x', 4000, 'x') AS VARCHAR2 (4000)) AS payload_4000,
+    LENGTH (CAST (RPAD ('x', 4000, 'x') AS VARCHAR2 (4000))) AS payload_len
+FROM dual;
+/
+
+SELECT
+    CAST (REPLACE (RPAD ('x', 1333, 'x'), 'x', UNISTR ('\D55C')) AS VARCHAR2 (4000)) AS payload_ko,
+    LENGTHB (CAST (REPLACE (RPAD ('x', 1333, 'x'), 'x', UNISTR ('\D55C')) AS VARCHAR2 (4000))) AS payload_bytes
+FROM dual;
+/
+
+--------------------------------------------------------------------------------
+-- 14. FINAL SANITY
 --------------------------------------------------------------------------------
 
 SELECT COUNT (*) AS total_base
