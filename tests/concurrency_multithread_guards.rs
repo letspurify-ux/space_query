@@ -908,7 +908,7 @@ fn column_loader_applies_global_scope_before_unqualified_metadata_queries() {
 
     assert!(
         content.contains("context.acquire_session_for_current_scope()")
-            && content.contains("Self::send_empty_column_load_update(&sender, &table_key);"),
+            && content.contains("Self::send_empty_column_load_update(&sender, &table_key, foreign_keys);"),
         "Column loading should abort with an empty update when current-scope session acquire/apply fails"
     );
 }
@@ -934,7 +934,7 @@ fn oracle_thin_column_loader_uses_thin_metadata_query() {
 
     assert!(
         backend.contains("DbPoolSession::OracleThin")
-            && backend.contains("ObjectBrowser::get_thin_table_columns"),
+            && backend.contains("ObjectBrowser::get_thin_table_structure"),
         "Oracle Thin IntelliSense column loading must use a thin metadata query instead of falling through to the non-Oracle session branch"
     );
 

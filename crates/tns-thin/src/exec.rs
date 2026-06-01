@@ -12,7 +12,10 @@ pub enum OracleColumnType {
     Clob,
     Nclob,
     Blob,
+    Bfile,
     Cursor,
+    IntervalYearMonth,
+    IntervalDaySecond,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

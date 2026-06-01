@@ -95,11 +95,24 @@ const TNS_CCAP_FIELD_VERSION_20_1: u8 = 14;
 const TNS_CCAP_FIELD_VERSION_23_1: u8 = 17;
 const TNS_CCAP_FIELD_VERSION_23_1_EXT_3: u8 = 20;
 const TNS_CCAP_FIELD_VERSION_23_4: u8 = 24;
+const TNS_CCAP_FIELD_VERSION_MAX: u8 = TNS_CCAP_FIELD_VERSION_23_4;
+const TNS_CCAP_TTC1: usize = 15;
+const TNS_CCAP_END_OF_CALL_STATUS: u8 = 0x01;
+const TNS_CCAP_OCI1: usize = 16;
+const TNS_CCAP_LEGACY_FAST_SESSION_ATTRIBUTES: u8 = 0x01;
+const TNS_CCAP_TTC3: usize = 37;
+const TNS_CCAP_BIG_CHUNK_CLR: u8 = 0x20;
 const TNS_CCAP_TTC4: usize = 40;
 const TNS_CCAP_EXPLICIT_BOUNDARY: u8 = 0x40;
 const TNS_CCAP_END_OF_RESPONSE: u8 = 0x20;
 const TNS_RCAP_TTC: usize = 6;
 const TNS_RCAP_TTC_32K: u8 = 0x04;
+const TNS_RCAP_TTC_SESSION_STATE_OPS: u8 = 0x10;
+const TNS_VERSION_MIN_ACCEPTED: u16 = 315;
+const TNS_VERSION_MIN_END_OF_RESPONSE: u16 = 319;
+const TNS_LEGACY_CLR_CHUNK_SIZE: usize = 0x40;
+const TNS_BIG_CLR_CHUNK_SIZE: usize = 32_767;
+const TNS_LEGACY_NULL_LENGTH_INDICATOR: u8 = 0xfd;
 const ORA_TYPE_NUM_VARCHAR: u8 = 1;
 const ORA_TYPE_NUM_NUMBER: u8 = 2;
 const ORA_TYPE_NUM_LONG: u8 = 8;
@@ -113,11 +126,21 @@ const ORA_TYPE_NUM_BINARY_DOUBLE: u8 = 101;
 const ORA_TYPE_NUM_CURSOR: u8 = 102;
 const ORA_TYPE_NUM_CLOB: u8 = 112;
 const ORA_TYPE_NUM_BLOB: u8 = 113;
+const ORA_TYPE_NUM_BFILE: u8 = 114;
 const ORA_TYPE_NUM_TIMESTAMP: u8 = 180;
 const ORA_TYPE_NUM_TIMESTAMP_TZ: u8 = 181;
+const ORA_TYPE_NUM_INTERVAL_YM: u8 = 182;
+const ORA_TYPE_NUM_INTERVAL_DS: u8 = 183;
 const ORA_TYPE_NUM_TIMESTAMP_DTY: u8 = 187;
+const ORA_TYPE_NUM_INTERVAL_YM_DTY: u8 = 189;
+const ORA_TYPE_NUM_INTERVAL_DS_DTY: u8 = 190;
+const ORA_TYPE_NUM_DBFILE: u8 = 197;
 const ORA_TYPE_NUM_UROWID: u8 = 208;
+const ORA_TYPE_NUM_TIMESTAMP_LTZ_DTY: u8 = 231;
+const ORA_TYPE_NUM_TIMESTAMP_LTZ: u8 = 232;
 const ORA_TYPE_NUM_BOOLEAN: u8 = 252;
+const TNS_DURATION_MID: i64 = 0x8000_0000;
+const TNS_DURATION_OFFSET: i32 = 60;
 const CS_FORM_NCHAR: u8 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,6 +185,9 @@ pub struct OracleThinCapabilities {
     pub supports_fast_auth: bool,
     pub supports_oob: bool,
     pub supports_big_clr_chunks: bool,
+    server_ttc_field_version: u8,
+    supports_end_of_call_status: bool,
+    supports_fast_session_attributes: bool,
     pub supports_implicit_resultsets: bool,
 }
 
@@ -179,6 +205,9 @@ impl Default for OracleThinCapabilities {
             supports_fast_auth: false,
             supports_oob: false,
             supports_big_clr_chunks: false,
+            server_ttc_field_version: 0,
+            supports_end_of_call_status: true,
+            supports_fast_session_attributes: true,
             supports_implicit_resultsets: false,
         }
     }
@@ -228,6 +257,7 @@ pub struct OracleThinSession {
     broken: bool,
     call_timeout: Option<Duration>,
     pending_cursor_closes: Vec<u32>,
+    last_rows_by_cursor: HashMap<u32, Vec<OracleValue>>,
     cancel_flag: Arc<AtomicBool>,
     ttc_sequence: u8,
 }
@@ -249,6 +279,7 @@ impl OracleThinSession {
             broken: false,
             call_timeout: None,
             pending_cursor_closes: Vec::new(),
+            last_rows_by_cursor: HashMap::new(),
             cancel_flag: Arc::new(AtomicBool::new(false)),
             ttc_sequence: 3,
         })
@@ -324,6 +355,7 @@ impl OracleThinSession {
         self.call_timeout = None;
         if self.broken {
             self.pending_cursor_closes.clear();
+            self.last_rows_by_cursor.clear();
             Err(OracleThinError::new("Oracle thin session is broken"))
         } else {
             self.flush_pending_cursor_closes()?;
@@ -381,8 +413,9 @@ impl OracleThinSession {
         request: &StatementRequest,
         _column_types: &[OracleColumnType],
     ) -> Result<QueryResult, OracleThinError> {
-        self.execute_request(request)
-            .map(|response| response.result)
+        let result = self.execute_request(request)?.result;
+        self.remember_last_row_for_open_fetch(&result);
+        Ok(result)
     }
 
     pub fn execute_typed_with_implicit(
@@ -415,6 +448,7 @@ impl OracleThinSession {
                     | OracleColumnType::Clob
                     | OracleColumnType::Nclob
                     | OracleColumnType::Blob
+                    | OracleColumnType::Bfile
             )
         });
         while !result.exhausted {
@@ -428,6 +462,7 @@ impl OracleThinSession {
             result.rows.extend(batch.rows);
             result.exhausted = batch.exhausted || batch.cursor_id.is_none() || no_rows;
         }
+        self.last_rows_by_cursor.remove(&cursor_id);
         result.cursor_id = None;
         Ok(result)
     }
@@ -501,6 +536,7 @@ impl OracleThinSession {
             result.result.rows.extend(batch.rows);
             result.result.exhausted = batch.exhausted || batch.cursor_id.is_none() || no_rows;
         }
+        self.last_rows_by_cursor.remove(&cursor_id);
         result.result.cursor_id = None;
         Ok(result)
     }
@@ -611,15 +647,22 @@ impl OracleThinSession {
             .iter()
             .map(thin_column_from_column_metadata)
             .collect();
+        state.last_row = self.last_rows_by_cursor.get(&cursor_id).cloned();
         let request = StatementRequest::query("", row_count);
-        read_execute_response_with_state(
+        let result = read_execute_response_with_state(
             &mut self.stream,
             &self.capabilities,
             &request,
             state,
             close_sequence.is_some(),
         )
-        .map(|response| response.result)
+        .map(|response| response.result)?;
+        if result.exhausted || result.cursor_id.is_none() {
+            self.last_rows_by_cursor.remove(&cursor_id);
+        } else {
+            self.remember_last_row_for_open_fetch(&result);
+        }
+        Ok(result)
     }
 
     pub fn define_and_fetch_typed(
@@ -658,6 +701,7 @@ impl OracleThinSession {
 
     pub fn close_cursor_later(&mut self, cursor_id: Option<u32>) {
         if let Some(cursor_id) = cursor_id {
+            self.last_rows_by_cursor.remove(&cursor_id);
             self.pending_cursor_closes.push(cursor_id);
         }
     }
@@ -702,12 +746,25 @@ impl OracleThinSession {
                     | OracleColumnType::Clob
                     | OracleColumnType::Nclob
                     | OracleColumnType::Blob
+                    | OracleColumnType::Bfile
                     | OracleColumnType::Cursor
             )
         })
     }
 
-    fn remember_last_row_for_open_fetch<T>(&mut self, _result: &T) {}
+    fn remember_last_row_for_open_fetch<T: LastRowSource>(&mut self, result: &T) {
+        let result = result.query_result();
+        let Some(cursor_id) = result.cursor_id else {
+            return;
+        };
+        if result.exhausted {
+            self.last_rows_by_cursor.remove(&cursor_id);
+            return;
+        }
+        if let Some(row) = result.rows.last() {
+            self.last_rows_by_cursor.insert(cursor_id, row.clone());
+        }
+    }
 
     fn execute_request(
         &mut self,
@@ -844,19 +901,29 @@ fn capabilities_from_accept(
     let ttc_field_version = options
         .desired_ttc_field_version
         .unwrap_or_else(|| default_ttc_field_version(accept.protocol_version));
+    let supports_end_of_response = accept.protocol_version >= TNS_VERSION_MIN_END_OF_RESPONSE
+        && accept.supports_end_of_response();
+    let supports_sql_boolean = if accept.protocol_version < TNS_VERSION_MIN_ACCEPTED {
+        ttc_field_version >= 23
+    } else {
+        ttc_field_version >= TNS_CCAP_FIELD_VERSION_23_1
+    };
     OracleThinCapabilities {
         protocol_version: Some(accept.protocol_version),
         ttc_field_version,
         charset_id: 0,
         ncharset_id: 0,
         max_string_size: 4000,
-        supports_sql_boolean: ttc_field_version >= 23,
-        supports_end_of_response: accept.supports_end_of_response(),
+        supports_sql_boolean,
+        supports_end_of_response,
         supports_request_boundaries: false,
         supports_fast_auth: accept.supports_fast_auth(),
         supports_oob: accept.supports_oob_check(),
-        supports_big_clr_chunks: false,
-        supports_implicit_resultsets: accept.protocol_version >= 315,
+        supports_big_clr_chunks: accept.protocol_version >= TNS_VERSION_MIN_ACCEPTED,
+        server_ttc_field_version: 0,
+        supports_end_of_call_status: true,
+        supports_fast_session_attributes: true,
+        supports_implicit_resultsets: accept.protocol_version >= TNS_VERSION_MIN_ACCEPTED,
     }
 }
 
@@ -876,7 +943,7 @@ fn negotiate_protocol(
 
     log_connect_phase("ttc-protocol-read", "");
     let packet = read_data_packet(stream, capabilities.protocol_version.unwrap_or(319))?;
-    let mut cursor = PacketCursor::new(&packet);
+    let mut cursor = PacketCursor::with_capabilities(&packet, capabilities);
     let message_type = cursor.read_u8()?;
     if message_type != TNS_MSG_TYPE_PROTOCOL {
         return Err(OracleThinError::new(format!(
@@ -920,8 +987,7 @@ fn negotiate_data_types(
 
     log_connect_phase("ttc-data-types-read", "");
     let packet = read_data_packet(stream, capabilities.protocol_version.unwrap_or(319))?;
-    let mut cursor =
-        PacketCursor::with_big_clr_chunks(&packet, capabilities.supports_big_clr_chunks);
+    let mut cursor = PacketCursor::with_capabilities(&packet, capabilities);
     let message_type = cursor.read_u8()?;
     if message_type != TNS_MSG_TYPE_DATA_TYPES {
         return Err(OracleThinError::new(format!(
@@ -972,6 +1038,22 @@ struct ExecuteReadState {
     cursor_id: Option<u32>,
     exhausted: bool,
     done: bool,
+}
+
+trait LastRowSource {
+    fn query_result(&self) -> &QueryResult;
+}
+
+impl LastRowSource for QueryResult {
+    fn query_result(&self) -> &QueryResult {
+        self
+    }
+}
+
+impl LastRowSource for DescribedQueryResult {
+    fn query_result(&self) -> &QueryResult {
+        &self.result
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1101,7 +1183,7 @@ fn write_execute_request(
             write_ub4(&mut payload, 0);
         }
     }
-    write_bytes_with_length(&mut payload, sql_bytes)?;
+    write_bytes_with_length_for_capabilities(&mut payload, sql_bytes, capabilities)?;
     write_ub4(&mut payload, 1);
     if request.is_query {
         write_ub4(&mut payload, 0);
@@ -1121,7 +1203,7 @@ fn write_execute_request(
     write_ub4(&mut payload, 0);
     if num_params > 0 {
         write_bind_metadata(&mut payload, capabilities, &request.binds)?;
-        write_bind_rows(&mut payload, &request.binds)?;
+        write_bind_rows(&mut payload, capabilities, &request.binds)?;
     }
     if std::env::var_os("ORACLE_THIN_TRACE_EXEC").is_some() {
         eprintln!(
@@ -1229,7 +1311,7 @@ fn write_legacy_execute_request(
     payload.push(0);
     payload.push(0);
     payload.push(0);
-    write_bytes_with_length(&mut payload, sql_bytes)?;
+    write_bytes_with_length_for_capabilities(&mut payload, sql_bytes, capabilities)?;
 
     let mut al8i4 = [0u32; 13];
     al8i4[0] = 1;
@@ -1245,7 +1327,7 @@ fn write_legacy_execute_request(
     }
     if num_params > 0 {
         write_bind_metadata(&mut payload, capabilities, &request.binds)?;
-        write_bind_rows(&mut payload, &request.binds)?;
+        write_bind_rows(&mut payload, capabilities, &request.binds)?;
     }
     if std::env::var_os("ORACLE_THIN_TRACE_EXEC").is_some() {
         eprintln!(
@@ -1499,22 +1581,32 @@ fn write_column_metadata(
     Ok(())
 }
 
-fn write_bind_rows(payload: &mut Vec<u8>, binds: &[BindValue]) -> Result<(), OracleThinError> {
+fn write_bind_rows(
+    payload: &mut Vec<u8>,
+    capabilities: &OracleThinCapabilities,
+    binds: &[BindValue],
+) -> Result<(), OracleThinError> {
     payload.push(TNS_MSG_TYPE_ROW_DATA);
     for bind in binds {
-        write_bind_value(payload, bind)?;
+        write_bind_value(payload, capabilities, bind)?;
     }
     Ok(())
 }
 
-fn write_bind_value(payload: &mut Vec<u8>, bind: &BindValue) -> Result<(), OracleThinError> {
+fn write_bind_value(
+    payload: &mut Vec<u8>,
+    capabilities: &OracleThinCapabilities,
+    bind: &BindValue,
+) -> Result<(), OracleThinError> {
     match bind {
         BindValue::Null(_) | BindValue::Out { .. } => {
             payload.push(0);
             Ok(())
         }
         BindValue::Number(value) => write_oracle_number(payload, value),
-        BindValue::Text(value) => write_bytes_with_length(payload, value.as_bytes()),
+        BindValue::Text(value) => {
+            write_bytes_with_length_for_capabilities(payload, value.as_bytes(), capabilities)
+        }
         BindValue::Boolean(value) => {
             if *value {
                 write_bytes_with_length(payload, &[1, 1])
@@ -1528,7 +1620,9 @@ fn write_bind_value(payload: &mut Vec<u8>, bind: &BindValue) -> Result<(), Oracl
         }
         BindValue::InOut { value, .. } => match value {
             Some(BindInputValue::Number(value)) => write_oracle_number(payload, value),
-            Some(BindInputValue::Text(value)) => write_bytes_with_length(payload, value.as_bytes()),
+            Some(BindInputValue::Text(value)) => {
+                write_bytes_with_length_for_capabilities(payload, value.as_bytes(), capabilities)
+            }
             Some(BindInputValue::Boolean(value)) => {
                 if *value {
                     write_bytes_with_length(payload, &[1, 1])
@@ -1580,8 +1674,11 @@ fn bind_column_metadata(bind: &BindValue) -> ThinColumn {
         OracleColumnType::Timestamp => ORA_TYPE_NUM_TIMESTAMP,
         OracleColumnType::Boolean => ORA_TYPE_NUM_BOOLEAN,
         OracleColumnType::Raw | OracleColumnType::Blob => ORA_TYPE_NUM_RAW,
+        OracleColumnType::Bfile => ORA_TYPE_NUM_BFILE,
         OracleColumnType::Nclob => ORA_TYPE_NUM_VARCHAR,
         OracleColumnType::Cursor => ORA_TYPE_NUM_CURSOR,
+        OracleColumnType::IntervalYearMonth => ORA_TYPE_NUM_INTERVAL_YM,
+        OracleColumnType::IntervalDaySecond => ORA_TYPE_NUM_INTERVAL_DS,
     };
     let charset_form = if matches!(
         column_type,
@@ -1612,7 +1709,14 @@ fn thin_column_from_column_metadata(column: &ColumnMetadata) -> ThinColumn {
         OracleColumnType::Clob => BindValue::Null(OracleColumnType::Clob),
         OracleColumnType::Nclob => BindValue::Null(OracleColumnType::Nclob),
         OracleColumnType::Blob => BindValue::Null(OracleColumnType::Blob),
+        OracleColumnType::Bfile => BindValue::Null(OracleColumnType::Bfile),
         OracleColumnType::Cursor => BindValue::Null(OracleColumnType::Cursor),
+        OracleColumnType::IntervalYearMonth => {
+            BindValue::Null(OracleColumnType::IntervalYearMonth)
+        }
+        OracleColumnType::IntervalDaySecond => {
+            BindValue::Null(OracleColumnType::IntervalDaySecond)
+        }
     };
     let mut thin = bind_column_metadata(&bind_like);
     thin.name = column.name.clone();
@@ -1641,6 +1745,7 @@ fn define_column_metadata(column: &ColumnMetadata) -> ThinColumn {
             thin.buffer_size = TNS_MAX_LONG_LENGTH;
             thin.column_type = OracleColumnType::Raw;
         }
+        OracleColumnType::Bfile => {}
         _ => {}
     }
     thin
@@ -1654,8 +1759,11 @@ fn default_bind_len(column_type: OracleColumnType) -> u32 {
         OracleColumnType::Timestamp => 11,
         OracleColumnType::Boolean => 4,
         OracleColumnType::Raw | OracleColumnType::Blob => 2000,
+        OracleColumnType::Bfile => 1,
         OracleColumnType::Nclob => 4000,
         OracleColumnType::Cursor => 1,
+        OracleColumnType::IntervalYearMonth => 5,
+        OracleColumnType::IntervalDaySecond => 11,
     }
 }
 
@@ -1874,8 +1982,7 @@ fn read_execute_response_with_state(
             pending_fragment.extend_from_slice(&packet);
             std::mem::take(&mut pending_fragment)
         };
-        let mut cursor =
-            PacketCursor::with_big_clr_chunks(&packet, capabilities.supports_big_clr_chunks);
+        let mut cursor = PacketCursor::with_capabilities(&packet, capabilities);
         let mut skipped_empty_end_of_response = false;
         while cursor.remaining() > 0 && !state.done {
             let message_offset = cursor.pos;
@@ -2054,8 +2161,7 @@ fn read_simple_response(
     while !done {
         let (data_flags, packet) =
             read_data_packet_with_flags(stream, capabilities.protocol_version.unwrap_or(319))?;
-        let mut cursor =
-            PacketCursor::with_big_clr_chunks(&packet, capabilities.supports_big_clr_chunks);
+        let mut cursor = PacketCursor::with_capabilities(&packet, capabilities);
         let mut skipped_empty_end_of_response = false;
         while cursor.remaining() > 0 && !done {
             let message_type = cursor.read_u8()?;
@@ -2143,11 +2249,17 @@ fn process_describe_body(
     }
     adjust_columns_after_define(&previous_columns, &mut columns);
     cursor.skip_bytes_with_ub4_length()?;
-    let _ = cursor.read_ub4()?;
-    let _ = cursor.read_ub4()?;
-    let _ = cursor.read_ub4()?;
-    let _ = cursor.read_ub4()?;
-    cursor.skip_bytes_with_ub4_length()?;
+    if capabilities.ttc_field_version >= 3 {
+        let _ = cursor.read_ub4()?;
+        let _ = cursor.read_ub4()?;
+    }
+    if capabilities.ttc_field_version >= 4 {
+        let _ = cursor.read_ub4()?;
+        let _ = cursor.read_ub4()?;
+    }
+    if capabilities.ttc_field_version >= 5 {
+        cursor.skip_bytes_with_ub4_length()?;
+    }
     state.columns = columns;
     Ok(())
 }
@@ -2379,6 +2491,8 @@ fn read_column_value(
         && !matches!(
             column.ora_type_num,
             ORA_TYPE_NUM_LONG | ORA_TYPE_NUM_LONG_RAW | ORA_TYPE_NUM_UROWID
+                | ORA_TYPE_NUM_BFILE
+                | ORA_TYPE_NUM_DBFILE
         ) {
         OracleValue::Null
     } else {
@@ -2415,7 +2529,11 @@ fn read_column_value(
                 };
                 OracleValue::DateTime(decode_oracle_datetime(&bytes)?)
             }
-            ORA_TYPE_NUM_TIMESTAMP | ORA_TYPE_NUM_TIMESTAMP_TZ | ORA_TYPE_NUM_TIMESTAMP_DTY => {
+            ORA_TYPE_NUM_TIMESTAMP
+            | ORA_TYPE_NUM_TIMESTAMP_TZ
+            | ORA_TYPE_NUM_TIMESTAMP_DTY
+            | ORA_TYPE_NUM_TIMESTAMP_LTZ_DTY
+            | ORA_TYPE_NUM_TIMESTAMP_LTZ => {
                 let Some(bytes) = cursor.read_bytes()? else {
                     return finish_column_value(cursor, OracleValue::Null, out_bind);
                 };
@@ -2447,17 +2565,36 @@ fn read_column_value(
                 .read_bytes()?
                 .map(OracleValue::Lob)
                 .unwrap_or(OracleValue::Null),
+            ORA_TYPE_NUM_BFILE | ORA_TYPE_NUM_DBFILE => read_bfile_locator(cursor)?,
             ORA_TYPE_NUM_ROWID | ORA_TYPE_NUM_UROWID => {
                 let Some(bytes) = cursor.read_bytes()? else {
                     return finish_column_value(cursor, OracleValue::Null, out_bind);
                 };
                 OracleValue::Text(String::from_utf8_lossy(&bytes).into_owned())
             }
-            ORA_TYPE_NUM_BINARY_FLOAT | ORA_TYPE_NUM_BINARY_DOUBLE => {
+            ORA_TYPE_NUM_BINARY_FLOAT => {
                 let Some(bytes) = cursor.read_bytes()? else {
                     return finish_column_value(cursor, OracleValue::Null, out_bind);
                 };
-                OracleValue::Bytes(bytes)
+                OracleValue::Number(decode_oracle_binary_float(&bytes)?)
+            }
+            ORA_TYPE_NUM_BINARY_DOUBLE => {
+                let Some(bytes) = cursor.read_bytes()? else {
+                    return finish_column_value(cursor, OracleValue::Null, out_bind);
+                };
+                OracleValue::Number(decode_oracle_binary_double(&bytes)?)
+            }
+            ORA_TYPE_NUM_INTERVAL_YM | ORA_TYPE_NUM_INTERVAL_YM_DTY => {
+                let Some(bytes) = cursor.read_bytes()? else {
+                    return finish_column_value(cursor, OracleValue::Null, out_bind);
+                };
+                OracleValue::Text(decode_oracle_interval_ym(&bytes)?)
+            }
+            ORA_TYPE_NUM_INTERVAL_DS | ORA_TYPE_NUM_INTERVAL_DS_DTY => {
+                let Some(bytes) = cursor.read_bytes()? else {
+                    return finish_column_value(cursor, OracleValue::Null, out_bind);
+                };
+                OracleValue::Text(decode_oracle_interval_ds(&bytes)?)
             }
             ORA_TYPE_NUM_CURSOR => {
                 let _ = cursor.read_u8()?;
@@ -2495,19 +2632,40 @@ fn finish_column_value(
     Ok(value)
 }
 
+fn read_bfile_locator(cursor: &mut PacketCursor<'_>) -> Result<OracleValue, OracleThinError> {
+    let num_bytes = cursor.read_ub4()?;
+    if num_bytes == 0 {
+        return Ok(OracleValue::Null);
+    }
+    Ok(cursor
+        .read_bytes()?
+        .map(OracleValue::Lob)
+        .unwrap_or(OracleValue::Null))
+}
+
 fn oracle_column_type_from_ora_type(ora_type_num: u8) -> OracleColumnType {
     match ora_type_num {
         ORA_TYPE_NUM_NUMBER => OracleColumnType::Number,
         ORA_TYPE_NUM_DATE => OracleColumnType::Date,
-        ORA_TYPE_NUM_TIMESTAMP | ORA_TYPE_NUM_TIMESTAMP_TZ | ORA_TYPE_NUM_TIMESTAMP_DTY => {
-            OracleColumnType::Timestamp
-        }
+        ORA_TYPE_NUM_TIMESTAMP
+        | ORA_TYPE_NUM_TIMESTAMP_TZ
+        | ORA_TYPE_NUM_TIMESTAMP_DTY
+        | ORA_TYPE_NUM_TIMESTAMP_LTZ_DTY
+        | ORA_TYPE_NUM_TIMESTAMP_LTZ => OracleColumnType::Timestamp,
         ORA_TYPE_NUM_RAW | ORA_TYPE_NUM_LONG_RAW => OracleColumnType::Raw,
+        ORA_TYPE_NUM_BINARY_FLOAT | ORA_TYPE_NUM_BINARY_DOUBLE => OracleColumnType::Number,
         ORA_TYPE_NUM_LONG => OracleColumnType::Long,
         ORA_TYPE_NUM_CLOB => OracleColumnType::Clob,
         ORA_TYPE_NUM_BLOB => OracleColumnType::Blob,
+        ORA_TYPE_NUM_BFILE | ORA_TYPE_NUM_DBFILE => OracleColumnType::Bfile,
         ORA_TYPE_NUM_CURSOR => OracleColumnType::Cursor,
         ORA_TYPE_NUM_BOOLEAN => OracleColumnType::Boolean,
+        ORA_TYPE_NUM_INTERVAL_YM | ORA_TYPE_NUM_INTERVAL_YM_DTY => {
+            OracleColumnType::IntervalYearMonth
+        }
+        ORA_TYPE_NUM_INTERVAL_DS | ORA_TYPE_NUM_INTERVAL_DS_DTY => {
+            OracleColumnType::IntervalDaySecond
+        }
         _ => OracleColumnType::Varchar,
     }
 }
@@ -2526,6 +2684,92 @@ fn decode_oracle_text(bytes: &[u8], charset_form: u8) -> Result<String, OracleTh
         String::from_utf8(bytes.to_vec())
             .map_err(|err| OracleThinError::new(format!("invalid UTF-8 Oracle text: {err}")))
     }
+}
+
+fn decode_oracle_binary_float(bytes: &[u8]) -> Result<String, OracleThinError> {
+    let bytes: [u8; 4] = bytes.try_into().map_err(|_| {
+        OracleThinError::new(format!(
+            "invalid Oracle BINARY_FLOAT length {}",
+            bytes.len()
+        ))
+    })?;
+    Ok(f32::from_bits(decode_oracle_binary_float_bits(bytes)).to_string())
+}
+
+fn decode_oracle_binary_double(bytes: &[u8]) -> Result<String, OracleThinError> {
+    let bytes: [u8; 8] = bytes.try_into().map_err(|_| {
+        OracleThinError::new(format!(
+            "invalid Oracle BINARY_DOUBLE length {}",
+            bytes.len()
+        ))
+    })?;
+    Ok(f64::from_bits(decode_oracle_binary_double_bits(bytes)).to_string())
+}
+
+fn decode_oracle_binary_float_bits(mut bytes: [u8; 4]) -> u32 {
+    if bytes[0] & 0x80 != 0 {
+        bytes[0] &= 0x7f;
+    } else {
+        for byte in &mut bytes {
+            *byte = !*byte;
+        }
+    }
+    u32::from_be_bytes(bytes)
+}
+
+fn decode_oracle_binary_double_bits(mut bytes: [u8; 8]) -> u64 {
+    if bytes[0] & 0x80 != 0 {
+        bytes[0] &= 0x7f;
+    } else {
+        for byte in &mut bytes {
+            *byte = !*byte;
+        }
+    }
+    u64::from_be_bytes(bytes)
+}
+
+fn decode_oracle_interval_ym(bytes: &[u8]) -> Result<String, OracleThinError> {
+    if bytes.len() != 5 {
+        return Err(OracleThinError::new(format!(
+            "invalid Oracle INTERVAL YEAR TO MONTH length {}",
+            bytes.len()
+        )));
+    }
+    let years = i64::from(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        - TNS_DURATION_MID;
+    let months = i32::from(bytes[4]) - TNS_DURATION_OFFSET;
+    let sign = if years < 0 || months < 0 { '-' } else { '+' };
+    Ok(format!("{sign}{:02}-{:02}", years.abs(), months.abs()))
+}
+
+fn decode_oracle_interval_ds(bytes: &[u8]) -> Result<String, OracleThinError> {
+    if bytes.len() != 11 {
+        return Err(OracleThinError::new(format!(
+            "invalid Oracle INTERVAL DAY TO SECOND length {}",
+            bytes.len()
+        )));
+    }
+    let days = i64::from(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        - TNS_DURATION_MID;
+    let hours = i32::from(bytes[4]) - TNS_DURATION_OFFSET;
+    let minutes = i32::from(bytes[5]) - TNS_DURATION_OFFSET;
+    let seconds = i32::from(bytes[6]) - TNS_DURATION_OFFSET;
+    let fseconds = i64::from(u32::from_be_bytes([bytes[7], bytes[8], bytes[9], bytes[10]]))
+        - TNS_DURATION_MID;
+    let sign =
+        if days < 0 || hours < 0 || minutes < 0 || seconds < 0 || fseconds < 0 {
+            '-'
+        } else {
+            '+'
+        };
+    Ok(format!(
+        "{sign}{:02} {:02}:{:02}:{:02}.{:06}",
+        days.abs(),
+        hours.abs(),
+        minutes.abs(),
+        seconds.abs(),
+        (fseconds / 1_000).abs()
+    ))
 }
 
 fn decode_oracle_datetime(bytes: &[u8]) -> Result<crate::OracleDateTime, OracleThinError> {
@@ -2756,6 +3000,13 @@ fn process_execute_error(
     cursor: &mut PacketCursor<'_>,
     capabilities: &OracleThinCapabilities,
 ) -> Result<ExecuteError, OracleThinError> {
+    if capabilities
+        .protocol_version
+        .is_some_and(|version| version < TNS_VERSION_MIN_ACCEPTED)
+    {
+        return process_legacy_execute_error(cursor, capabilities);
+    }
+
     let _ = cursor.read_ub4()?;
     let _ = cursor.read_ub2()?;
     let _ = cursor.read_ub4()?;
@@ -2820,35 +3071,162 @@ fn process_execute_error(
         let _ = cursor.read_ub4()?;
         let _ = cursor.read_ub4()?;
     }
-    let message = if code != 0 {
-        let raw_message = cursor.read_str()?.unwrap_or_default();
-        let has_visible_message = raw_message
-            .chars()
-            .any(|ch| !ch.is_control() && !ch.is_whitespace());
-        let mut message = if has_visible_message {
-            raw_message
-        } else {
-            format!("ORA-{:05}", code)
-        };
-        while message.ends_with(char::is_whitespace) {
-            message.pop();
-        }
-        if !message.contains("ORA-") {
-            message = format!("ORA-{:05}: {message}", code);
-        }
-        if error_pos > 0 && !message.contains("position") {
-            message.push_str(&format!(" (position {error_pos})"));
-        }
-        Some(message)
-    } else {
-        None
-    };
+    let message = execute_error_message(cursor, code, error_pos)?;
     Ok(ExecuteError {
         code,
         cursor_id,
         _rowcount: rowcount,
         message,
     })
+}
+
+fn process_legacy_execute_error(
+    cursor: &mut PacketCursor<'_>,
+    capabilities: &OracleThinCapabilities,
+) -> Result<ExecuteError, OracleThinError> {
+    if capabilities.supports_end_of_call_status {
+        let _ = cursor.read_ub4()?;
+    }
+    if capabilities.ttc_field_version >= 3 && capabilities.supports_fast_session_attributes {
+        let _ = cursor.read_ub2()?;
+    }
+    let cur_row_number = u64::from(cursor.read_ub4()?);
+    let initial_code = cursor.read_ub2()? as u32;
+    let _ = cursor.read_ub2()?;
+    let _ = cursor.read_ub2()?;
+    let cursor_id = cursor.read_ub2()? as u32;
+    let _error_pos = cursor.read_sb2()?;
+    cursor.skip(2)?;
+    cursor.skip(2)?;
+    cursor.skip(2)?;
+    let _ = cursor.read_ub4()?;
+    let _ = cursor.read_ub2()?;
+    cursor.skip(1)?;
+    let _ = cursor.read_ub4()?;
+    let _ = cursor.read_ub2()?;
+    let _ = cursor.read_ub4()?;
+    cursor.skip(2)?;
+    let _ = cursor.read_ub2()?;
+    let _ = cursor.read_ub4()?;
+    cursor.skip_bytes_with_ub4_length()?;
+
+    let (mut code, mut rowcount) = if capabilities.ttc_field_version < 7 {
+        cursor.skip_bytes_with_ub4_length()?;
+        cursor.skip_bytes_with_ub4_length()?;
+        cursor.skip_bytes_with_ub4_length()?;
+        (initial_code, cur_row_number)
+    } else {
+        let num_errors = cursor.read_ub2()? as usize;
+        if num_errors > 0 {
+            let first_byte = cursor.read_u8()?;
+            for _ in 0..num_errors {
+                if first_byte == 0xfe {
+                    if capabilities.supports_big_clr_chunks {
+                        let _ = cursor.read_ub4()?;
+                    } else {
+                        let _ = cursor.read_u8()?;
+                    }
+                }
+                let _ = cursor.read_ub2()?;
+            }
+            if first_byte == 0xfe {
+                cursor.skip(1)?;
+            }
+        }
+
+        let num_offsets = cursor.read_ub4()? as usize;
+        if num_offsets > 0 {
+            let first_byte = cursor.read_u8()?;
+            for _ in 0..num_offsets {
+                if first_byte == 0xfe {
+                    if capabilities.supports_big_clr_chunks {
+                        let _ = cursor.read_ub4()?;
+                    } else {
+                        let _ = cursor.read_u8()?;
+                    }
+                }
+                let _ = cursor.read_ub4()?;
+            }
+            if first_byte == 0xfe {
+                cursor.skip(1)?;
+            }
+        }
+
+        let num_messages = cursor.read_ub2()? as usize;
+        if num_messages > 0 {
+            cursor.skip(1)?;
+            for _ in 0..num_messages {
+                let _ = cursor.read_ub2()?;
+                let _ = cursor.read_bytes()?;
+                cursor.skip(2)?;
+            }
+        }
+
+        (cursor.read_ub4()?, cursor.read_ub8()?)
+    };
+    if capabilities.ttc_field_version < 7 && code != 0 && capabilities.server_ttc_field_version >= 7
+    {
+        code = cursor.read_ub4()?;
+        rowcount = cursor.read_ub8()?;
+    }
+    if capabilities.ttc_field_version >= TNS_CCAP_FIELD_VERSION_20_1
+        || (capabilities.ttc_field_version < 7
+            && code != 0
+            && capabilities.server_ttc_field_version >= TNS_CCAP_FIELD_VERSION_20_1)
+    {
+        let _ = cursor.read_ub4()?;
+        let _ = cursor.read_ub4()?;
+    }
+    let message = execute_legacy_error_message(cursor, code)?;
+    Ok(ExecuteError {
+        code,
+        cursor_id,
+        _rowcount: rowcount,
+        message,
+    })
+}
+
+fn execute_error_message(
+    cursor: &mut PacketCursor<'_>,
+    code: u32,
+    error_pos: i16,
+) -> Result<Option<String>, OracleThinError> {
+    if code == 0 {
+        return Ok(None);
+    }
+    let raw_message = cursor.read_str()?.unwrap_or_default();
+    let has_visible_message = raw_message
+        .chars()
+        .any(|ch| !ch.is_control() && !ch.is_whitespace());
+    let mut message = if has_visible_message {
+        raw_message
+    } else {
+        format!("ORA-{:05}", code)
+    };
+    while message.ends_with(char::is_whitespace) {
+        message.pop();
+    }
+    if !message.contains("ORA-") {
+        message = format!("ORA-{:05}: {message}", code);
+    }
+    if error_pos > 0 && !message.contains("position") {
+        message.push_str(&format!(" (position {error_pos})"));
+    }
+    Ok(Some(message))
+}
+
+fn execute_legacy_error_message(
+    cursor: &mut PacketCursor<'_>,
+    code: u32,
+) -> Result<Option<String>, OracleThinError> {
+    if code == 0 {
+        return Ok(None);
+    }
+    let mut message = cursor.read_str()?.unwrap_or_default();
+    while message.ends_with(char::is_whitespace) {
+        message.pop();
+    }
+    Ok(Some(message))
 }
 
 #[derive(Debug, Default)]
@@ -3145,8 +3523,7 @@ fn process_auth_response(
     state: &mut AuthState,
 ) -> Result<(), OracleThinError> {
     let packet = read_data_packet(stream, capabilities.protocol_version.unwrap_or(319))?;
-    let mut cursor =
-        PacketCursor::with_big_clr_chunks(&packet, capabilities.supports_big_clr_chunks);
+    let mut cursor = PacketCursor::with_capabilities(&packet, capabilities);
     while cursor.remaining() > 0 {
         let message_type = cursor.read_u8()?;
         match message_type {
@@ -3449,20 +3826,42 @@ fn process_protocol_message(
     capabilities.charset_id = cursor.read_u16_le()?;
     let server_flags = cursor.read_u8()?;
     let num_elements = cursor.read_u16_le()? as usize;
-    cursor.skip(num_elements.saturating_mul(5))?;
+    let element_bytes = num_elements.checked_mul(5).ok_or_else(|| {
+        OracleThinError::new(format!(
+            "Oracle protocol FDO element count is too large: {num_elements}"
+        ))
+    })?;
+    cursor.skip(element_bytes)?;
     let fdo_length = cursor.read_u16_be()? as usize;
     let fdo = cursor.read_raw(fdo_length)?;
-    if fdo.len() >= 7 {
-        let ix = 6usize
-            .saturating_add(usize::from(fdo[5]))
-            .saturating_add(usize::from(fdo[6]));
-        if fdo.len() >= ix + 5 {
-            capabilities.ncharset_id = u16::from_be_bytes([fdo[ix + 3], fdo[ix + 4]]);
-        }
+    if fdo.len() < 7 {
+        return Err(OracleThinError::new(format!(
+            "short Oracle protocol FDO: {} bytes",
+            fdo.len()
+        )));
     }
-    if let Some(server_compile_caps) = cursor.read_bytes()? {
-        adjust_for_server_compile_caps(capabilities, &server_compile_caps);
+    let ix = 6usize
+        .checked_add(usize::from(fdo[5]))
+        .and_then(|value| value.checked_add(usize::from(fdo[6])))
+        .ok_or_else(|| OracleThinError::new("Oracle protocol FDO offset overflow"))?;
+    if fdo.len() < ix + 5 {
+        return Err(OracleThinError::new(format!(
+            "short Oracle protocol FDO for ncharset: {} bytes, need {}",
+            fdo.len(),
+            ix + 5
+        )));
     }
+    capabilities.ncharset_id = u16::from_be_bytes([fdo[ix + 3], fdo[ix + 4]]);
+    let server_compile_caps = cursor
+        .read_bytes()?
+        .ok_or_else(|| OracleThinError::new("missing Oracle server compile capabilities"))?;
+    if server_compile_caps.len() <= TNS_CCAP_FIELD_VERSION {
+        return Err(OracleThinError::new(format!(
+            "short Oracle server compile capabilities: {} bytes",
+            server_compile_caps.len()
+        )));
+    }
+    adjust_for_server_compile_caps(capabilities, &server_compile_caps);
     if let Some(server_runtime_caps) = cursor.read_bytes()? {
         adjust_for_server_runtime_caps(capabilities, &server_runtime_caps);
     }
@@ -3482,18 +3881,28 @@ fn process_protocol_message(
 
 fn adjust_for_server_compile_caps(capabilities: &mut OracleThinCapabilities, server_caps: &[u8]) {
     if let Some(server_field_version) = server_caps.get(TNS_CCAP_FIELD_VERSION).copied() {
+        capabilities.server_ttc_field_version = server_field_version;
         if server_field_version < capabilities.ttc_field_version {
             capabilities.ttc_field_version = server_field_version;
         }
     }
     capabilities.supports_sql_boolean = capabilities.ttc_field_version >= 17;
+    capabilities.supports_end_of_call_status = server_caps
+        .get(TNS_CCAP_TTC1)
+        .is_some_and(|value| value & TNS_CCAP_END_OF_CALL_STATUS != 0);
+    capabilities.supports_fast_session_attributes = server_caps
+        .get(TNS_CCAP_OCI1)
+        .is_some_and(|value| value & TNS_CCAP_LEGACY_FAST_SESSION_ATTRIBUTES != 0);
     if server_caps
         .get(TNS_CCAP_TTC4)
         .is_some_and(|value| value & TNS_CCAP_EXPLICIT_BOUNDARY != 0)
     {
         capabilities.supports_request_boundaries = true;
     }
-    if server_caps.get(37).is_some_and(|value| value & 0x20 != 0) {
+    if server_caps
+        .get(TNS_CCAP_TTC3)
+        .is_some_and(|value| value & TNS_CCAP_BIG_CHUNK_CLR != 0)
+    {
         capabilities.supports_big_clr_chunks = true;
     }
 }
@@ -3507,6 +3916,12 @@ fn adjust_for_server_runtime_caps(capabilities: &mut OracleThinCapabilities, ser
     } else {
         4000
     };
+    if !server_caps
+        .get(TNS_RCAP_TTC)
+        .is_some_and(|value| value & TNS_RCAP_TTC_SESSION_STATE_OPS != 0)
+    {
+        capabilities.supports_request_boundaries = false;
+    }
 }
 
 fn client_compile_caps(capabilities: &OracleThinCapabilities) -> Result<Vec<u8>, OracleThinError> {
@@ -3565,17 +3980,41 @@ fn write_len_bytes(out: &mut Vec<u8>, value: &[u8]) -> Result<(), OracleThinErro
 }
 
 fn write_bytes_with_length(out: &mut Vec<u8>, value: &[u8]) -> Result<(), OracleThinError> {
+    write_bytes_with_length_with_big_chunks(out, value, true)
+}
+
+fn write_bytes_with_length_for_capabilities(
+    out: &mut Vec<u8>,
+    value: &[u8],
+    capabilities: &OracleThinCapabilities,
+) -> Result<(), OracleThinError> {
+    write_bytes_with_length_with_big_chunks(out, value, capabilities.supports_big_clr_chunks)
+}
+
+fn write_bytes_with_length_with_big_chunks(
+    out: &mut Vec<u8>,
+    value: &[u8],
+    big_clr_chunks: bool,
+) -> Result<(), OracleThinError> {
     if value.len() <= 252 {
         out.push(value.len() as u8);
         out.extend_from_slice(value);
         return Ok(());
     }
     out.push(0xfe);
-    for chunk in value.chunks(32_767) {
-        write_ub4(out, chunk.len() as u32);
-        out.extend_from_slice(chunk);
+    if big_clr_chunks {
+        for chunk in value.chunks(TNS_BIG_CLR_CHUNK_SIZE) {
+            write_ub4(out, chunk.len() as u32);
+            out.extend_from_slice(chunk);
+        }
+        write_ub4(out, 0);
+    } else {
+        for chunk in value.chunks(TNS_LEGACY_CLR_CHUNK_SIZE) {
+            out.push(chunk.len() as u8);
+            out.extend_from_slice(chunk);
+        }
+        out.push(0);
     }
-    write_ub4(out, 0);
     Ok(())
 }
 
@@ -3941,22 +4380,18 @@ struct PacketCursor<'a> {
     data: &'a [u8],
     pos: usize,
     big_clr_chunks: bool,
+    legacy_null_clr: bool,
 }
 
 impl<'a> PacketCursor<'a> {
-    fn new(data: &'a [u8]) -> Self {
+    fn with_capabilities(data: &'a [u8], capabilities: &OracleThinCapabilities) -> Self {
         Self {
             data,
             pos: 0,
-            big_clr_chunks: true,
-        }
-    }
-
-    fn with_big_clr_chunks(data: &'a [u8], big_clr_chunks: bool) -> Self {
-        Self {
-            data,
-            pos: 0,
-            big_clr_chunks,
+            big_clr_chunks: capabilities.supports_big_clr_chunks,
+            legacy_null_clr: capabilities
+                .protocol_version
+                .is_some_and(|version| version < TNS_VERSION_MIN_ACCEPTED),
         }
     }
 
@@ -4020,6 +4455,7 @@ impl<'a> PacketCursor<'a> {
         let len = self.read_u8()?;
         match len {
             0 | 0xff => Ok(None),
+            TNS_LEGACY_NULL_LENGTH_INDICATOR if self.legacy_null_clr => Ok(None),
             0xfe => {
                 let mut out = Vec::new();
                 loop {
@@ -4175,10 +4611,7 @@ fn put_u32(buf: &mut [u8], offset: usize, value: u32) {
 fn default_ttc_field_version(protocol_version: u16) -> u8 {
     match protocol_version {
         0..=314 => 6,
-        315 => 12,
-        316 | 317 => 18,
-        318 => 21,
-        _ => 24,
+        _ => TNS_CCAP_FIELD_VERSION_MAX,
     }
 }
 
@@ -4193,11 +4626,662 @@ fn bind_count(request: &StatementRequest) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_oracle_number;
+    use super::{
+        adjust_for_server_compile_caps, adjust_for_server_runtime_caps, capabilities_from_accept,
+        decode_oracle_binary_double, decode_oracle_binary_float, decode_oracle_interval_ds,
+        decode_oracle_interval_ym, decode_oracle_number, default_ttc_field_version,
+        process_describe_body, process_legacy_execute_error, process_protocol_message,
+        process_row_data, write_bytes_with_length_for_capabilities, write_ub2, write_ub4,
+        write_ub8, OracleThinCapabilities, OracleValue, PacketCursor, ThinColumn,
+        TNS_CCAP_END_OF_CALL_STATUS, TNS_CCAP_EXPLICIT_BOUNDARY, TNS_CCAP_FIELD_VERSION_20_1,
+        TNS_CCAP_LEGACY_FAST_SESSION_ATTRIBUTES, TNS_CCAP_OCI1, TNS_CCAP_TTC1, TNS_CCAP_TTC4,
+        TNS_LEGACY_CLR_CHUNK_SIZE, TNS_RCAP_TTC, TNS_RCAP_TTC_SESSION_STATE_OPS,
+    };
+    use super::{
+        ExecuteReadState, ORA_TYPE_NUM_BINARY_FLOAT, ORA_TYPE_NUM_INTERVAL_DS,
+        ORA_TYPE_NUM_TIMESTAMP_LTZ, ORA_TYPE_NUM_VARCHAR,
+    };
+    use crate::connect::{AcceptInfo, ConnectOptions};
+    use crate::exec::OracleColumnType;
 
     #[test]
     fn decode_oracle_number_trims_fractional_trailing_zeros() {
         assert_eq!(decode_oracle_number(&[0xc0, 0x33]).unwrap(), "0.5");
         assert_eq!(decode_oracle_number(&[0xc0, 0x51]).unwrap(), "0.8");
+    }
+
+    #[test]
+    fn decodes_vendor_binary_float_and_double_bytes() {
+        assert_eq!(
+            decode_oracle_binary_float(&[195, 6, 115, 51]).unwrap(),
+            "134.45"
+        );
+        assert_eq!(
+            decode_oracle_binary_float(&[60, 249, 140, 204]).unwrap(),
+            "-134.45"
+        );
+        assert_eq!(
+            decode_oracle_binary_double(&[192, 96, 206, 102, 102, 102, 102, 102]).unwrap(),
+            "134.45"
+        );
+        assert_eq!(
+            decode_oracle_binary_double(&[63, 159, 49, 153, 153, 153, 153, 153]).unwrap(),
+            "-134.45"
+        );
+    }
+
+    #[test]
+    fn decodes_vendor_interval_year_month_bytes() {
+        assert_eq!(
+            decode_oracle_interval_ym(&[128, 0, 7, 229, 70]).unwrap(),
+            "+2021-10"
+        );
+        assert_eq!(
+            decode_oracle_interval_ym(&[127, 255, 255, 251, 57]).unwrap(),
+            "-05-03"
+        );
+    }
+
+    #[test]
+    fn decodes_vendor_interval_day_second_bytes() {
+        assert_eq!(
+            decode_oracle_interval_ds(&[128, 0, 0, 2, 72, 83, 94, 155, 46, 2, 0]).unwrap(),
+            "+02 12:23:34.456000"
+        );
+        assert_eq!(
+            decode_oracle_interval_ds(&[128, 0, 0, 0, 50, 40, 30, 100, 197, 243, 248]).unwrap(),
+            "-00 10:20:30.456789"
+        );
+    }
+
+    #[test]
+    fn row_scanner_decodes_interval_day_second_columns() {
+        let mut state = ExecuteReadState::default();
+        state.columns = vec![ThinColumn {
+            name: "DURATION".to_string(),
+            column_type: OracleColumnType::IntervalDaySecond,
+            ora_type_num: ORA_TYPE_NUM_INTERVAL_DS,
+            charset_form: 0,
+            buffer_size: 11,
+        }];
+        let mut row = vec![11];
+        row.extend_from_slice(&[128, 0, 0, 2, 72, 83, 94, 155, 46, 2, 0]);
+        let mut cursor =
+            PacketCursor::with_capabilities(&row, &OracleThinCapabilities::default());
+
+        process_row_data(&mut cursor, &OracleThinCapabilities::default(), &mut state).unwrap();
+
+        assert_eq!(
+            state.rows,
+            vec![vec![OracleValue::Text("+02 12:23:34.456000".to_string())]]
+        );
+    }
+
+    #[test]
+    fn row_scanner_decodes_binary_float_columns_as_numbers() {
+        let mut state = ExecuteReadState::default();
+        state.columns = vec![ThinColumn {
+            name: "VALUE".to_string(),
+            column_type: OracleColumnType::Number,
+            ora_type_num: ORA_TYPE_NUM_BINARY_FLOAT,
+            charset_form: 0,
+            buffer_size: 4,
+        }];
+        let mut row = vec![4];
+        row.extend_from_slice(&[195, 6, 115, 51]);
+        let mut cursor =
+            PacketCursor::with_capabilities(&row, &OracleThinCapabilities::default());
+
+        process_row_data(&mut cursor, &OracleThinCapabilities::default(), &mut state).unwrap();
+
+        assert_eq!(
+            state.rows,
+            vec![vec![OracleValue::Number("134.45".to_string())]]
+        );
+    }
+
+    #[test]
+    fn row_scanner_decodes_timestamp_ltz_columns_as_timestamps() {
+        let mut state = ExecuteReadState::default();
+        state.columns = vec![ThinColumn {
+            name: "TS_LTZ".to_string(),
+            column_type: OracleColumnType::Timestamp,
+            ora_type_num: ORA_TYPE_NUM_TIMESTAMP_LTZ,
+            charset_form: 0,
+            buffer_size: 11,
+        }];
+        let row = [
+            11, 120, 124, 1, 2, 4, 5, 6, 0, 1, 226, 64,
+        ];
+        let mut cursor =
+            PacketCursor::with_capabilities(&row, &OracleThinCapabilities::default());
+
+        process_row_data(&mut cursor, &OracleThinCapabilities::default(), &mut state).unwrap();
+
+        assert_eq!(
+            state.rows,
+            vec![vec![OracleValue::Timestamp(crate::OracleDateTime {
+                year: 2024,
+                month: 1,
+                day: 2,
+                hour: 3,
+                minute: 4,
+                second: 5,
+                nanosecond: 123_456,
+                timezone_offset_minutes: None,
+            })]]
+        );
+    }
+
+    #[test]
+    fn modern_protocols_start_with_python_oracledb_max_ttc_field_version() {
+        assert_eq!(default_ttc_field_version(314), 6);
+        assert_eq!(default_ttc_field_version(315), 24);
+        assert_eq!(default_ttc_field_version(318), 24);
+        assert_eq!(default_ttc_field_version(319), 24);
+    }
+
+    #[test]
+    fn protocol_314_sql_boolean_threshold_remains_legacy() {
+        let options = ConnectOptions {
+            desired_ttc_field_version: Some(20),
+            ..ConnectOptions::default()
+        };
+        let accept = AcceptInfo {
+            protocol_version: 314,
+            sdu: 8192,
+            supports_full_packet_size: true,
+            flags2: 0,
+        };
+        let caps = capabilities_from_accept(&options, &accept);
+        assert!(!caps.supports_sql_boolean);
+
+        let accept = AcceptInfo {
+            protocol_version: 315,
+            ..accept
+        };
+        let caps = capabilities_from_accept(&options, &accept);
+        assert!(caps.supports_sql_boolean);
+    }
+
+    #[test]
+    fn end_of_response_requires_protocol_319() {
+        let options = ConnectOptions::default();
+        let accept = AcceptInfo {
+            protocol_version: 318,
+            sdu: 8192,
+            supports_full_packet_size: true,
+            flags2: 0x0200_0000,
+        };
+        let caps = capabilities_from_accept(&options, &accept);
+        assert!(!caps.supports_end_of_response);
+
+        let accept = AcceptInfo {
+            protocol_version: 319,
+            ..accept
+        };
+        let caps = capabilities_from_accept(&options, &accept);
+        assert!(caps.supports_end_of_response);
+    }
+
+    #[test]
+    fn runtime_caps_can_disable_request_boundaries_after_compile_caps_enable_them() {
+        let mut caps = OracleThinCapabilities::default();
+        let mut compile_caps = vec![0u8; 53];
+        compile_caps[TNS_CCAP_TTC4] = TNS_CCAP_EXPLICIT_BOUNDARY;
+        adjust_for_server_compile_caps(&mut caps, &compile_caps);
+        assert!(caps.supports_request_boundaries);
+
+        let runtime_caps = vec![0u8; 11];
+        adjust_for_server_runtime_caps(&mut caps, &runtime_caps);
+        assert!(!caps.supports_request_boundaries);
+
+        adjust_for_server_compile_caps(&mut caps, &compile_caps);
+        let mut runtime_caps = vec![0u8; 11];
+        runtime_caps[TNS_RCAP_TTC] = TNS_RCAP_TTC_SESSION_STATE_OPS;
+        adjust_for_server_runtime_caps(&mut caps, &runtime_caps);
+        assert!(caps.supports_request_boundaries);
+    }
+
+    #[test]
+    fn protocol_314_summary_caps_follow_go_ora_server_compile_bits() {
+        let mut caps = OracleThinCapabilities::default();
+        let compile_caps = vec![0u8; 17];
+        adjust_for_server_compile_caps(&mut caps, &compile_caps);
+        assert!(!caps.supports_end_of_call_status);
+        assert!(!caps.supports_fast_session_attributes);
+
+        let mut compile_caps = vec![0u8; 17];
+        compile_caps[TNS_CCAP_TTC1] = TNS_CCAP_END_OF_CALL_STATUS;
+        compile_caps[TNS_CCAP_OCI1] = TNS_CCAP_LEGACY_FAST_SESSION_ATTRIBUTES;
+        adjust_for_server_compile_caps(&mut caps, &compile_caps);
+        assert!(caps.supports_end_of_call_status);
+        assert!(caps.supports_fast_session_attributes);
+    }
+
+    #[test]
+    fn modern_protocols_scan_long_clr_chunks_with_python_oracledb_ub4_lengths() {
+        let options = ConnectOptions::default();
+        let accept = AcceptInfo {
+            protocol_version: 315,
+            sdu: 8192,
+            supports_full_packet_size: true,
+            flags2: 0,
+        };
+        let caps = capabilities_from_accept(&options, &accept);
+        assert!(caps.supports_big_clr_chunks);
+
+        let data = [0xfe, 1, 4, b't', b'e', b's', b't', 0];
+        let mut cursor = PacketCursor::with_capabilities(&data, &caps);
+        assert_eq!(cursor.read_bytes().unwrap(), Some(b"test".to_vec()));
+    }
+
+    #[test]
+    fn protocol_314_scans_go_ora_legacy_clr_chunks_and_null_indicator() {
+        let caps = OracleThinCapabilities {
+            protocol_version: Some(314),
+            supports_big_clr_chunks: false,
+            ..OracleThinCapabilities::default()
+        };
+
+        let mut cursor =
+            PacketCursor::with_capabilities(&[0xfe, 4, b't', b'e', b's', b't', 0], &caps);
+        assert_eq!(cursor.read_bytes().unwrap(), Some(b"test".to_vec()));
+
+        let mut cursor = PacketCursor::with_capabilities(&[0xfd], &caps);
+        assert_eq!(cursor.read_bytes().unwrap(), None);
+    }
+
+    #[test]
+    fn modern_protocols_do_not_treat_go_ora_legacy_null_indicator_as_null() {
+        let caps = OracleThinCapabilities {
+            protocol_version: Some(315),
+            supports_big_clr_chunks: true,
+            ..OracleThinCapabilities::default()
+        };
+        let mut cursor = PacketCursor::with_capabilities(&[0xfd], &caps);
+        assert!(cursor.read_bytes().is_err());
+    }
+
+    #[test]
+    fn protocol_314_writes_go_ora_legacy_clr_chunks_without_big_clr_capability() {
+        let caps = OracleThinCapabilities {
+            protocol_version: Some(314),
+            supports_big_clr_chunks: false,
+            ..OracleThinCapabilities::default()
+        };
+        let value = vec![b'x'; 253];
+        let mut out = Vec::new();
+        write_bytes_with_length_for_capabilities(&mut out, &value, &caps).unwrap();
+
+        assert_eq!(out.first().copied(), Some(0xfe));
+        let mut pos = 1;
+        let mut chunks = 0;
+        while out[pos] != 0 {
+            let len = usize::from(out[pos]);
+            assert!(len <= TNS_LEGACY_CLR_CHUNK_SIZE);
+            pos += 1 + len;
+            chunks += 1;
+        }
+        assert_eq!(chunks, 4);
+        assert_eq!(pos, out.len() - 1);
+
+        let mut cursor = PacketCursor::with_capabilities(&out, &caps);
+        assert_eq!(cursor.read_bytes().unwrap(), Some(value));
+    }
+
+    #[test]
+    fn modern_protocols_keep_existing_big_clr_write_format() {
+        let caps = OracleThinCapabilities {
+            protocol_version: Some(315),
+            supports_big_clr_chunks: true,
+            ..OracleThinCapabilities::default()
+        };
+        let value = vec![b'x'; 253];
+        let mut out = Vec::new();
+        write_bytes_with_length_for_capabilities(&mut out, &value, &caps).unwrap();
+
+        assert_eq!(out[0], 0xfe);
+        assert_eq!(&out[1..3], &[1, 253]);
+        let mut cursor = PacketCursor::with_capabilities(&out, &caps);
+        assert_eq!(cursor.read_bytes().unwrap(), Some(value));
+    }
+
+    #[test]
+    fn describe_body_uses_go_ora_ttc_version_tail_gates_for_protocol_314() {
+        let mut caps = OracleThinCapabilities {
+            protocol_version: Some(314),
+            ttc_field_version: 2,
+            ..OracleThinCapabilities::default()
+        };
+        let mut state = ExecuteReadState::default();
+        let mut cursor = PacketCursor::with_capabilities(&[0, 0, 0], &caps);
+        process_describe_body(&mut cursor, &caps, &mut state).unwrap();
+        assert_eq!(cursor.remaining(), 0);
+
+        caps.ttc_field_version = 6;
+        let mut cursor = PacketCursor::with_capabilities(&[0, 0, 0, 0, 0, 0, 0, 0], &caps);
+        process_describe_body(&mut cursor, &caps, &mut state).unwrap();
+        assert_eq!(cursor.remaining(), 0);
+    }
+
+    #[test]
+    fn protocol_negotiation_rejects_short_fdo_instead_of_guessing_ncharset() {
+        let mut caps = OracleThinCapabilities {
+            protocol_version: Some(314),
+            ..OracleThinCapabilities::default()
+        };
+        let mut packet = vec![6, 0, b'x', 0, 1, 0, 0, 0, 0];
+        packet.extend_from_slice(&6u16.to_be_bytes());
+        packet.extend_from_slice(&[0; 6]);
+        let mut cursor = PacketCursor::with_capabilities(&packet, &caps);
+
+        assert!(process_protocol_message(&mut cursor, &mut caps).is_err());
+    }
+
+    #[test]
+    fn protocol_negotiation_requires_go_ora_minimum_compile_caps_length() {
+        let mut caps = OracleThinCapabilities {
+            protocol_version: Some(314),
+            ..OracleThinCapabilities::default()
+        };
+        let mut packet = vec![6, 0, b'x', 0, 1, 0, 0, 0, 0];
+        packet.extend_from_slice(&11u16.to_be_bytes());
+        packet.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 232]);
+        packet.extend_from_slice(&[7, 0, 0, 0, 0, 0, 0, 6]);
+        let mut cursor = PacketCursor::with_capabilities(&packet, &caps);
+
+        assert!(process_protocol_message(&mut cursor, &mut caps).is_err());
+    }
+
+    #[test]
+    fn protocol_314_summary_ttc6_uses_go_ora_initial_retcode_tail() {
+        let caps = OracleThinCapabilities {
+            protocol_version: Some(314),
+            ttc_field_version: 6,
+            supports_end_of_call_status: false,
+            supports_fast_session_attributes: false,
+            supports_big_clr_chunks: false,
+            ..OracleThinCapabilities::default()
+        };
+        let mut packet = Vec::new();
+        push_legacy_summary_prefix(&mut packet, 12, 942, 77, 5);
+        for _ in 0..4 {
+            write_ub4(&mut packet, 0);
+        }
+        write_bytes_with_length_for_capabilities(
+            &mut packet,
+            b"ORA-00942: table or view does not exist\n",
+            &caps,
+        )
+        .unwrap();
+
+        let mut cursor = PacketCursor::with_capabilities(&packet, &caps);
+        let error = process_legacy_execute_error(&mut cursor, &caps).unwrap();
+        assert_eq!(error.code, 942);
+        assert_eq!(error.cursor_id, 77);
+        assert_eq!(error._rowcount, 12);
+        assert_eq!(
+            error.message.as_deref(),
+            Some("ORA-00942: table or view does not exist")
+        );
+        assert_eq!(cursor.remaining(), 0);
+    }
+
+    #[test]
+    fn protocol_314_summary_consumes_go_ora_eos_and_fsap_prefixes() {
+        let caps = OracleThinCapabilities {
+            protocol_version: Some(314),
+            ttc_field_version: 6,
+            supports_end_of_call_status: true,
+            supports_fast_session_attributes: true,
+            supports_big_clr_chunks: false,
+            ..OracleThinCapabilities::default()
+        };
+        let mut packet = Vec::new();
+        write_ub4(&mut packet, 0x0102_0304);
+        write_ub2(&mut packet, 0x1234);
+        push_legacy_summary_prefix(&mut packet, 3, 0, 42, 0);
+        for _ in 0..4 {
+            write_ub4(&mut packet, 0);
+        }
+
+        let mut cursor = PacketCursor::with_capabilities(&packet, &caps);
+        let error = process_legacy_execute_error(&mut cursor, &caps).unwrap();
+        assert_eq!(error.code, 0);
+        assert_eq!(error.cursor_id, 42);
+        assert_eq!(error._rowcount, 3);
+        assert_eq!(error.message, None);
+        assert_eq!(cursor.remaining(), 0);
+    }
+
+    #[test]
+    fn protocol_314_summary_ttc7_uses_go_ora_extended_retcode_tail() {
+        let caps = OracleThinCapabilities {
+            protocol_version: Some(314),
+            ttc_field_version: 7,
+            supports_end_of_call_status: false,
+            supports_fast_session_attributes: false,
+            supports_big_clr_chunks: false,
+            ..OracleThinCapabilities::default()
+        };
+        let mut packet = Vec::new();
+        push_legacy_summary_prefix(&mut packet, 1, 999, 13, 0);
+        write_ub4(&mut packet, 0);
+        write_ub2(&mut packet, 1);
+        packet.push(0xfe);
+        packet.push(2);
+        write_ub2(&mut packet, 1);
+        packet.push(0);
+        write_ub4(&mut packet, 1);
+        packet.push(0xfe);
+        packet.push(4);
+        write_ub4(&mut packet, 25);
+        packet.push(0);
+        write_ub2(&mut packet, 1);
+        packet.push(0xfe);
+        write_ub2(&mut packet, 123);
+        write_bytes_with_length_for_capabilities(&mut packet, b"bind", &caps).unwrap();
+        packet.extend_from_slice(&[0, 0]);
+        write_ub4(&mut packet, 1555);
+        write_ub8(&mut packet, 25);
+        write_bytes_with_length_for_capabilities(&mut packet, b"ORA-01555: forced error\n", &caps)
+            .unwrap();
+
+        let mut cursor = PacketCursor::with_capabilities(&packet, &caps);
+        let error = process_legacy_execute_error(&mut cursor, &caps).unwrap();
+        assert_eq!(error.code, 1555);
+        assert_eq!(error.cursor_id, 13);
+        assert_eq!(error._rowcount, 25);
+        assert_eq!(error.message.as_deref(), Some("ORA-01555: forced error"));
+        assert_eq!(cursor.remaining(), 0);
+    }
+
+    #[test]
+    fn protocol_314_summary_ttc14_skips_python_oracledb_20c_tail_fields() {
+        let caps = OracleThinCapabilities {
+            protocol_version: Some(314),
+            ttc_field_version: TNS_CCAP_FIELD_VERSION_20_1,
+            supports_end_of_call_status: false,
+            supports_fast_session_attributes: false,
+            supports_big_clr_chunks: false,
+            ..OracleThinCapabilities::default()
+        };
+        let mut packet = Vec::new();
+        push_legacy_summary_prefix(&mut packet, 0, 1445, 174, 19);
+        write_ub4(&mut packet, 0);
+        write_ub2(&mut packet, 0);
+        write_ub4(&mut packet, 0);
+        write_ub2(&mut packet, 0);
+        write_ub4(&mut packet, 1445);
+        write_ub8(&mut packet, 0);
+        write_ub4(&mut packet, 3);
+        write_ub4(&mut packet, 0);
+        write_bytes_with_length_for_capabilities(
+            &mut packet,
+            b"ORA-01445: cannot select ROWID from a join view\n",
+            &caps,
+        )
+        .unwrap();
+
+        let mut cursor = PacketCursor::with_capabilities(&packet, &caps);
+        let error = process_legacy_execute_error(&mut cursor, &caps).unwrap();
+        assert_eq!(error.code, 1445);
+        assert_eq!(error.cursor_id, 174);
+        assert_eq!(error._rowcount, 0);
+        assert_eq!(
+            error.message.as_deref(),
+            Some("ORA-01445: cannot select ROWID from a join view")
+        );
+        assert_eq!(cursor.remaining(), 0);
+    }
+
+    #[test]
+    fn protocol_314_summary_ttc6_uses_server_field_version_for_error_tail() {
+        let caps = OracleThinCapabilities {
+            protocol_version: Some(314),
+            ttc_field_version: 6,
+            server_ttc_field_version: TNS_CCAP_FIELD_VERSION_20_1,
+            supports_end_of_call_status: true,
+            supports_fast_session_attributes: true,
+            supports_big_clr_chunks: false,
+            ..OracleThinCapabilities::default()
+        };
+        let mut packet = vec![
+            0x01, 0x01, 0x02, 0xf3, 0xae, 0x00, 0x02, 0x05, 0xa5, 0x00, 0x00, 0x01, 0xae, 0x01,
+            0x13, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x86, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x05, 0xa5, 0x00, 0x01, 0x03, 0x00,
+            0x5a,
+        ];
+        packet.extend_from_slice(
+            b"ORA-01445: cannot select ROWID from, or sample, \
+              a join view without a key-preserved table\n",
+        );
+
+        let mut cursor = PacketCursor::with_capabilities(&packet, &caps);
+        let error = process_legacy_execute_error(&mut cursor, &caps).unwrap();
+        assert_eq!(error.code, 1445);
+        assert_eq!(error.cursor_id, 174);
+        assert_eq!(error._rowcount, 0);
+        assert_eq!(
+            error.message.as_deref(),
+            Some(
+                "ORA-01445: cannot select ROWID from, or sample, \
+                 a join view without a key-preserved table"
+            )
+        );
+        assert_eq!(cursor.remaining(), 0);
+    }
+
+    #[test]
+    fn protocol_314_summary_ttc6_keeps_go_ora_success_tail_with_modern_server_caps() {
+        let caps = OracleThinCapabilities {
+            protocol_version: Some(314),
+            ttc_field_version: 6,
+            server_ttc_field_version: TNS_CCAP_FIELD_VERSION_20_1,
+            supports_end_of_call_status: false,
+            supports_fast_session_attributes: false,
+            supports_big_clr_chunks: false,
+            ..OracleThinCapabilities::default()
+        };
+        let mut packet = Vec::new();
+        push_legacy_summary_prefix(&mut packet, 3, 0, 42, 0);
+        for _ in 0..4 {
+            write_ub4(&mut packet, 0);
+        }
+
+        let mut cursor = PacketCursor::with_capabilities(&packet, &caps);
+        let error = process_legacy_execute_error(&mut cursor, &caps).unwrap();
+        assert_eq!(error.code, 0);
+        assert_eq!(error.cursor_id, 42);
+        assert_eq!(error._rowcount, 3);
+        assert_eq!(error.message, None);
+        assert_eq!(cursor.remaining(), 0);
+    }
+
+    #[test]
+    fn row_scanner_reuses_previous_batch_row_for_duplicate_bit_vector_columns() {
+        let mut state = ExecuteReadState::default();
+        state.columns = vec![
+            ThinColumn {
+                name: "A".to_string(),
+                column_type: OracleColumnType::Varchar,
+                ora_type_num: ORA_TYPE_NUM_VARCHAR,
+                charset_form: 1,
+                buffer_size: 10,
+            },
+            ThinColumn {
+                name: "B".to_string(),
+                column_type: OracleColumnType::Varchar,
+                ora_type_num: ORA_TYPE_NUM_VARCHAR,
+                charset_form: 1,
+                buffer_size: 10,
+            },
+        ];
+        state.last_row = Some(vec![
+            OracleValue::Text("old-a".to_string()),
+            OracleValue::Text("old-b".to_string()),
+        ]);
+        state.bit_vector = Some(vec![0b0000_0010]);
+
+        let mut cursor = PacketCursor::with_capabilities(
+            &[3, b'n', b'e', b'w'],
+            &OracleThinCapabilities::default(),
+        );
+        process_row_data(&mut cursor, &OracleThinCapabilities::default(), &mut state).unwrap();
+
+        assert_eq!(
+            state.rows,
+            vec![vec![
+                OracleValue::Text("old-a".to_string()),
+                OracleValue::Text("new".to_string())
+            ]]
+        );
+    }
+
+    fn push_legacy_summary_prefix(
+        out: &mut Vec<u8>,
+        row_number: u32,
+        ret_code: u16,
+        cursor_id: u16,
+        error_pos: i16,
+    ) {
+        write_ub4(out, row_number);
+        write_ub2(out, ret_code);
+        write_ub2(out, 0);
+        write_ub2(out, 0);
+        write_ub2(out, cursor_id);
+        write_sb2(out, error_pos);
+        out.extend_from_slice(&[0x2a, 0]);
+        out.extend_from_slice(&[0x20, 0]);
+        out.extend_from_slice(&[0, 0]);
+        write_ub4(out, 0);
+        write_ub2(out, 0);
+        out.push(0);
+        write_ub4(out, 0);
+        write_ub2(out, 0);
+        write_ub4(out, 0);
+        out.extend_from_slice(&[0, 0]);
+        write_ub2(out, 0);
+        write_ub4(out, 0);
+    }
+
+    fn write_sb2(out: &mut Vec<u8>, value: i16) {
+        if value == 0 {
+            out.push(0);
+            return;
+        }
+        let magnitude = value.unsigned_abs();
+        let mut bytes = if magnitude <= u16::from(u8::MAX) {
+            vec![magnitude as u8]
+        } else {
+            magnitude.to_be_bytes().to_vec()
+        };
+        while bytes.first() == Some(&0) {
+            bytes.remove(0);
+        }
+        let len = bytes.len() as u8;
+        out.push(if value < 0 { len | 0x80 } else { len });
+        out.extend(bytes);
     }
 }

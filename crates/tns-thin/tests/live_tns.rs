@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use tns_thin::exec::{OracleValue, StatementRequest};
+use tns_thin::exec::{OracleColumnType, OracleValue, StatementRequest};
 use tns_thin::{ConnectTarget, OracleThinConfig, OracleThinSession};
 
 static OBJECT_COUNTER: AtomicUsize = AtomicUsize::new(1);
@@ -63,6 +63,121 @@ fn fetch_and_fetch_all_return_all_rows() {
         .expect("fetch all remaining rows");
     assert!(remaining.result.exhausted);
     assert_eq!(rows_to_strings(&remaining.result.rows), expected_rows(5, 7));
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn fetch_interval_columns_decodes_vendor_formats() {
+    let mut conn = connect();
+    let result = conn
+        .query_described_fetch_all(
+            "SELECT \
+             TO_YMINTERVAL('2021-10') AS ym_pos, \
+             TO_YMINTERVAL('-05-03') AS ym_neg, \
+             TO_DSINTERVAL('2 12:23:34.456') AS ds_pos, \
+             TO_DSINTERVAL('-0 10:20:30.456789') AS ds_neg \
+             FROM dual",
+            1,
+        )
+        .expect("fetch interval columns");
+
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![
+            OracleColumnType::IntervalYearMonth,
+            OracleColumnType::IntervalYearMonth,
+            OracleColumnType::IntervalDaySecond,
+            OracleColumnType::IntervalDaySecond,
+        ]
+    );
+    assert_eq!(
+        rows_to_strings(&result.result.rows),
+        vec![vec![
+            "+2021-10".to_string(),
+            "-05-03".to_string(),
+            "+02 12:23:34.456000".to_string(),
+            "-00 10:20:30.456789".to_string(),
+        ]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn fetch_binary_float_and_double_decodes_vendor_formats() {
+    let mut conn = connect();
+    let result = conn
+        .query_described_fetch_all(
+            "SELECT \
+             CAST(134.45 AS BINARY_FLOAT) AS bf_pos, \
+             CAST(-134.45 AS BINARY_FLOAT) AS bf_neg, \
+             CAST(134.45 AS BINARY_DOUBLE) AS bd_pos, \
+             CAST(-134.45 AS BINARY_DOUBLE) AS bd_neg \
+             FROM dual",
+            1,
+        )
+        .expect("fetch binary float and double columns");
+
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![
+            OracleColumnType::Number,
+            OracleColumnType::Number,
+            OracleColumnType::Number,
+            OracleColumnType::Number,
+        ]
+    );
+    assert_eq!(
+        rows_to_strings(&result.result.rows),
+        vec![vec![
+            "134.45".to_string(),
+            "-134.45".to_string(),
+            "134.45".to_string(),
+            "-134.45".to_string(),
+        ]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn fetch_timestamp_ltz_decodes_like_python_oracledb_timestamp() {
+    let mut conn = connect();
+    conn.query_drop("ALTER SESSION SET TIME_ZONE = '+00:00'")
+        .expect("set deterministic session time zone");
+    let result = conn
+        .query_described_fetch_all(
+            "SELECT \
+             CAST(TIMESTAMP '2024-01-02 03:04:05.123456' \
+             AS TIMESTAMP WITH LOCAL TIME ZONE) AS ts_ltz \
+             FROM dual",
+            1,
+        )
+        .expect("fetch timestamp with local time zone column");
+
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Timestamp]
+    );
+    assert_eq!(
+        result
+            .result
+            .rows
+            .first()
+            .and_then(|row| row.first())
+            .map(timestamp_value_to_string),
+        Some("2024-01-02 03:04:05.123456".to_string())
+    );
 }
 
 #[test]
@@ -260,6 +375,22 @@ fn value_to_string(value: &OracleValue) -> String {
     match value {
         OracleValue::Number(value) | OracleValue::Text(value) => value.clone(),
         other => panic!("unexpected test value {other:?}"),
+    }
+}
+
+fn timestamp_value_to_string(value: &OracleValue) -> String {
+    match value {
+        OracleValue::Timestamp(value) => format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}",
+            value.year,
+            value.month,
+            value.day,
+            value.hour,
+            value.minute,
+            value.second,
+            value.nanosecond / 1_000
+        ),
+        other => panic!("unexpected timestamp test value {other:?}"),
     }
 }
 
