@@ -1,3 +1,10 @@
+// Portions of this file are derived from the thin protocol implementation in
+// python-oracledb (https://github.com/oracle/python-oracledb),
+// Copyright (c) 2016, 2026, Oracle and/or its affiliates, used under the
+// Apache License, Version 2.0. Protocol constants were also cross-checked
+// against go-ora (MIT License, Copyright (c) 2020 Samy Sultan).
+// See THIRD_PARTY_NOTICES.md.
+
 use std::collections::{HashMap, HashSet};
 #[cfg(unix)]
 use std::ffi::CString;

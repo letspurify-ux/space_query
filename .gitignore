@@ -2,7 +2,9 @@
 crates/*/target/
 .DS_Store
 vendor/*/target/
-vendor/go-ora/
+# go-ora 소스는 추적하지 않되, 라이센스 고지 파일은 컴플라이언스용으로 유지
+vendor/go-ora/*
+!vendor/go-ora/LICENSE
 # python-oracledb 소스는 추적하지 않되, 라이센스/고지 파일은 컴플라이언스용으로 유지
 vendor/python-oracledb/*
 !vendor/python-oracledb/LICENSE.txt

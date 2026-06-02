@@ -14,9 +14,10 @@ Copyright (c) 2016, 2026, Oracle and/or its affiliates.
 
 `python-oracledb` is dual licensed under the Universal Permissive License
 Version 1.0 or the Apache License Version 2.0. For the portions referenced by
-this project, this project elects the UPL-1.0 option. The UPL is available at:
+this project, this project elects the Apache License, Version 2.0 option,
+available at:
 
-https://oss.oracle.com/licenses/upl/
+https://www.apache.org/licenses/LICENSE-2.0
 
 The upstream license, notice, and third-party license files are preserved in:
 
@@ -27,7 +28,9 @@ The upstream license, notice, and third-party license files are preserved in:
 ## go-ora
 
 The TNS thin implementation was also checked against `go-ora` behavior and
-protocol constants.
+protocol constants. The upstream license file is preserved in:
+
+- `vendor/go-ora/LICENSE`
 
 MIT License
 
