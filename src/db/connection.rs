@@ -3439,7 +3439,8 @@ impl DatabaseConnection {
                 Some(OracleValue::Null) | None => None,
                 Some(OracleValue::Lob(_))
                 | Some(OracleValue::Bytes(_))
-                | Some(OracleValue::Cursor(_)) => None,
+                | Some(OracleValue::Cursor(_))
+                | Some(OracleValue::Object(_)) => None,
             }))
     }
 

@@ -3278,6 +3278,13 @@ fn plsql_procedure_ref_cursor_out_bind_preserves_udt_metadata() {
         !column.schema_name.is_empty(),
         "UDT metadata should preserve the owning schema"
     );
+    if conn.capabilities().protocol_version != Some(319) {
+        conn.close_cursor_on_next_call(Some(cursor.cursor_id));
+        conn.query_drop("SELECT 1 FROM dual")
+            .expect("close UDT metadata cursor");
+        drop_procedure_ignore(&mut conn, &procedure_name);
+        return;
+    }
 
     let rows = conn
         .fetch_ref_cursor_all(cursor.cursor_id, cursor.columns, 1)
