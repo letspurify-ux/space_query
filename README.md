@@ -1,21 +1,18 @@
 # SPACE Query
 
-SPACE Query는 Rust와 FLTK로 만든 데스크톱 SQL 클라이언트입니다. 현재 코드는 Oracle, MySQL, MariaDB 연결을 지원하고, SQL 편집기, 스크립트 실행, 오브젝트 브라우저, 결과 그리드, 쿼리 히스토리, 세션 활동 보기, 로그/크래시 진단 기능을 한 앱 안에 묶습니다.
-
-이 문서는 현재 소스 기준의 개발자용 요약입니다. 세부 구현은 각 모듈과 보조 문서를 함께 확인하세요.
+SPACE Query는 Rust와 FLTK로 만든 데스크톱 SQL 클라이언트입니다. Oracle, MySQL, MariaDB 연결을 지원하고, SQL 편집기, 스크립트 실행, 오브젝트 브라우저, 결과 그리드, 쿼리 히스토리, 세션 활동 보기, 로그/크래시 진단 기능을 한 앱 안에 묶습니다.
 
 ## 지원 데이터베이스
 
 - Oracle
-  - `oracle` crate 사용
+  - Thin 모드(내장 TNS 클라이언트)와 OCI(thick) 모드 선택 지원
+  - Thin 모드는 Oracle Instant Client 없이 연결, OCI 모드는 Instant Client 또는 Full Client 필요
   - Host/Port/Service 연결과 TNS alias 연결 지원
-  - Oracle Instant Client 필요
   - TCP/TCPS, NLS date/timestamp format, session time zone, 기본 트랜잭션 옵션 설정 지원
 - MySQL
-  - `mysql` crate 사용
   - 데이터베이스 선택, SSL 옵션, SQL mode, charset/collation, session time zone 설정 지원
 - MariaDB
-  - MySQL 계열 실행 백엔드와 SQL dialect를 공유하지만 앱 내부에서는 별도 `DatabaseType`으로 관리
+  - MySQL 계열 실행 백엔드와 SQL dialect를 공유하되 별도 데이터베이스 종류로 구분 관리
   - MariaDB time zone 범위와 일부 메시지 처리를 분리
 
 ## 주요 기능
@@ -63,7 +60,7 @@ SPACE Query는 Rust와 FLTK로 만든 데스크톱 SQL 클라이언트입니다.
 
 ### 스크립트와 툴 명령
 
-스크립트 실행은 단순 세미콜론 분리가 아니라 `src/db/query/script.rs`의 파서와 `SessionState`를 함께 사용합니다.
+스크립트 실행은 단순 세미콜론 분리가 아니라 전용 파서와 세션 상태를 함께 사용합니다.
 
 Oracle / SQL*Plus 계열:
 
@@ -188,15 +185,16 @@ cargo check
 
 일부 테스트는 외부 DB나 환경 변수가 필요할 수 있습니다. Oracle/MySQL/MariaDB 실제 연결 테스트를 돌릴 때는 로컬 DB, 계정, 클라이언트 라이브러리 설정을 먼저 맞춰야 합니다.
 
-## Oracle Instant Client
+## Oracle 클라이언트 (OCI 모드)
 
-Oracle OCI(thick) 연결은 Instant Client가 필요합니다.
+Thin 모드는 추가 클라이언트 없이 연결됩니다. OCI(thick) 모드에서만 Oracle Instant Client 또는 Full Client가 필요하며, 클라이언트 라이브러리를 다음 순서로 자동 탐색합니다.
 
-플랫폼별로 다음 위치의 `instantclient_*` 디렉터리를 자동 탐색합니다.
-
-- macOS: `/opt/oracle`
-- Linux: `/opt/oracle`, `/usr/local/oracle`
-- Windows: `C:\oracle`, `%ProgramFiles%\Oracle`
+1. `ORACLE_CLIENT_LIB_DIR` 환경변수가 가리키는 디렉터리
+2. `ORACLE_HOME` 환경변수 (Windows: `%ORACLE_HOME%\bin`, Linux/macOS: `$ORACLE_HOME/lib`)
+3. 플랫폼별 기본 위치의 `instantclient_*` 디렉터리
+   - macOS: `/opt/oracle`
+   - Linux: `/opt/oracle`, `/usr/local/oracle`
+   - Windows: `C:\oracle`, `%ProgramFiles%\Oracle`
 
 자동 탐색이 맞지 않으면 `ORACLE_CLIENT_LIB_DIR`를 직접 지정하세요.
 
@@ -205,13 +203,21 @@ export ORACLE_CLIENT_LIB_DIR=/opt/oracle/instantclient_23_3
 cargo run --release --bin space_query
 ```
 
-Apple Silicon에서는 앱과 Instant Client의 CPU 아키텍처가 같아야 합니다.
+Apple Silicon에서는 앱과 클라이언트 라이브러리의 CPU 아키텍처가 같아야 합니다.
+
+### TNS alias 연결
+
+TNS alias 연결은 OCI 모드에서만 지원하며, alias 해석은 Oracle Net이 `tnsnames.ora`를 읽어 수행합니다. `TNS_ADMIN` 환경변수를 `tnsnames.ora`가 있는 디렉터리로 지정하세요. 지정하지 않으면 `$ORACLE_HOME/network/admin`을 사용하며, Instant Client에는 이 기본 경로가 없으므로 `TNS_ADMIN`이 사실상 필수입니다.
+
+```bash
+export TNS_ADMIN=/opt/oracle/network/admin
+```
+
+Thin 모드는 Host/Port/Service 연결만 지원하며 TNS alias는 지원하지 않습니다.
 
 ## Linux 빌드 참고
 
-`build.rs`는 Linux에서 일부 X11 개발 라이브러리(`xinerama`, `xcursor`, `xfixes`, `xft`)가 없는 제한된 환경을 감지하면 테스트/빌드가 진행되도록 stub 라이브러리를 연결할 수 있습니다.
-
-이 처리는 빌드 편의를 위한 보조 장치입니다. 실제 GUI 실행 환경에는 일반적인 FLTK/X11 런타임 의존성이 필요합니다.
+GUI 실행에는 FLTK/X11 런타임 의존성이 필요합니다. 빌드 전 해당 개발 패키지(`libxinerama`, `libxcursor`, `libxfixes`, `libxft` 등)를 설치하세요.
 
 ## 저장 위치
 
@@ -240,56 +246,12 @@ Oracle, Java, MySQL, and NetSuite are registered trademarks of Oracle and/or its
 
 ```text
 src/
-├── main.rs                  # panic hook, logging flush, 앱 시작/종료
-├── app.rs                   # 설정/크래시 리포트 로드, FLTK 초기화
-├── db/
-│   ├── connection.rs        # DB 타입, 연결 정보, Oracle/MySQL/MariaDB 연결과 풀
-│   ├── session.rs           # bind/define/spool/break/compute/delimiter 등 세션 상태
-│   ├── session_policy.rs    # 세션 유지/교체 판단
-│   ├── transaction.rs       # 트랜잭션 모드와 상태 추적
-│   └── query/
-│       ├── executor.rs      # Oracle 실행, describe, show errors, DDL/관리성 쿼리
-│       ├── mysql_executor.rs
-│       ├── script.rs        # 스크립트 분리와 툴 명령 파서
-│       └── types.rs         # QueryResult, ToolCommand 등 공통 타입
-├── ui/
-│   ├── main_window.rs       # 메인 창, 연결/파일/실행/결과 탭 오케스트레이션
-│   ├── menu.rs
-│   ├── connection_dialog.rs
-│   ├── object_browser.rs
-│   ├── result_table.rs
-│   ├── result_tabs.rs
-│   ├── query_tabs.rs
-│   ├── query_history.rs
-│   ├── log_viewer.rs
-│   ├── settings_dialog.rs
-│   ├── find_replace.rs
-│   └── sql_editor/          # 편집기, 실행, 포매터, IntelliSense
-├── sql_text.rs              # SQL 토큰/키워드/문자열/주석 규칙
-├── sql_parser_engine/       # 구조 인식용 파서 엔진
-├── sql_delimiter.rs         # SQL delimiter/frame 보조 로직
-├── sql_format.rs            # 포맷 context 유틸
-├── utils/
-│   ├── config.rs
-│   ├── credential_store.rs
-│   ├── logging.rs
-│   └── memory.rs
-└── version.rs               # 빌드 시 계산된 표시 버전
+├── app.rs / main.rs   # 앱 시작/종료, 설정·크래시 로드, FLTK 초기화
+├── db/                # DB 연결·세션·트랜잭션, 쿼리 실행과 스크립트 파서
+├── ui/                # 메인 창, 편집기, 오브젝트 브라우저, 결과 그리드 등 FLTK UI
+├── sql_*              # SQL 토큰/파서/포맷/구분 처리
+└── utils/             # 설정, 자격 증명 저장, 로깅
 ```
 
-추가 파일과 디렉터리:
-
-- `crates/tns-thin/`: Oracle Database와 통신하기 위한 thin TNS client crate
-- `tests/`: 스레드 안전성, panic guard, 회귀 가드 테스트
-- `test/`, `test_mysql/`, `test_mariadb/`: 파서/포매터/스크립트 회귀용 SQL 샘플
-- `oracle.md`, `mysql.md`, `mariadb.md`: DB별 참고 문서
-- `formatting.md`, `highlighting.md`, `session.md`, `transaction.md`: 기능별 참고 문서
-- `scripts/`: 포매터/파서/IntelliSense 자동 수정 루프 스크립트
-
-## 변경 시 확인 포인트
-
-- UI 동작 변경: `src/ui/`, 특히 `main_window.rs`, `sql_editor/`, `result_table.rs`
-- 실행/세션 변경: `src/db/connection.rs`, `src/db/session.rs`, `src/db/query/`
-- 파싱/포맷 변경: `src/sql_text.rs`, `src/sql_parser_engine/`, `src/ui/sql_editor/formatter.rs`
-- 저장/로그/키링 변경: `src/utils/config.rs`, `src/utils/credential_store.rs`, `src/utils/logging.rs`
-- 회귀 확인: 변경 범위에 맞는 `cargo test` 또는 더 좁은 테스트 타겟
+- `crates/tns-thin/`: Oracle Database와 통신하는 thin TNS client crate
+- `tests/`: 스레드 안전성·panic guard·회귀 가드 테스트

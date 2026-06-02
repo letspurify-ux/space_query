@@ -4571,6 +4571,10 @@ fn oracle_client_lib_dir_candidates() -> Vec<PathBuf> {
         push_oracle_client_dir_candidate(&mut candidates, PathBuf::from(env_dir));
     }
 
+    if let Some(home_dir) = oracle_home_lib_dir() {
+        push_oracle_client_dir_candidate(&mut candidates, home_dir);
+    }
+
     for root in oracle_client_search_roots() {
         for dir in collect_instantclient_dirs(&root) {
             push_oracle_client_dir_candidate(&mut candidates, dir);
@@ -4578,6 +4582,23 @@ fn oracle_client_lib_dir_candidates() -> Vec<PathBuf> {
     }
 
     candidates
+}
+
+/// Library directory for a full Oracle Client / Database install exposed via
+/// the `ORACLE_HOME` environment variable. On Windows `oci.dll` lives in
+/// `%ORACLE_HOME%\bin`; on Unix `libclntsh` lives in `$ORACLE_HOME/lib`.
+fn oracle_home_lib_dir() -> Option<PathBuf> {
+    let home = PathBuf::from(env::var_os("ORACLE_HOME")?);
+
+    #[cfg(target_os = "windows")]
+    {
+        Some(home.join("bin"))
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Some(home.join("lib"))
+    }
 }
 
 fn oracle_client_search_roots() -> Vec<PathBuf> {
