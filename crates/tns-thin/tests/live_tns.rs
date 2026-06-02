@@ -1616,6 +1616,192 @@ fn plsql_out_ref_cursor_fetches_rows() {
 
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn dml_returning_single_row_out_binds_return_values() {
+    let config = live_config();
+    let table = unique_table_name("RET");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, name VARCHAR2(30))"
+    ))
+    .expect("create DML RETURNING test table");
+
+    let mut request = StatementRequest::statement(format!(
+        "INSERT INTO {table} (id, name) VALUES (:1, :2) RETURNING id, name INTO :3, :4"
+    ));
+    request.binds.push(BindValue::Number("1".to_string()));
+    request.binds.push(BindValue::Text("alpha".to_string()));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Number,
+        max_len: 22,
+    });
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Varchar,
+        max_len: 30,
+    });
+
+    let values = conn
+        .execute_out_binds(&request, &[])
+        .expect("DML RETURNING OUT binds");
+
+    assert_eq!(
+        rows_to_strings(&[values]),
+        vec![vec!["1".to_string(), "alpha".to_string()]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn dml_returning_expression_can_use_input_bind_before_into() {
+    let config = live_config();
+    let table = unique_table_name("RET_EXPR");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    conn.query_drop(&format!("CREATE TABLE {table} (id NUMBER PRIMARY KEY)"))
+        .expect("create DML RETURNING expression test table");
+
+    let mut request = StatementRequest::statement(format!(
+        "INSERT INTO {table} (id) VALUES (:1) RETURNING id + :2 INTO :3"
+    ));
+    request.binds.push(BindValue::Number("5".to_string()));
+    request.binds.push(BindValue::Number("18".to_string()));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Number,
+        max_len: 22,
+    });
+
+    let values = conn
+        .execute_out_binds(&request, &[])
+        .expect("DML RETURNING expression with input bind");
+
+    assert_eq!(rows_to_strings(&[values]), vec![vec!["23".to_string()]]);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn dml_returning_supports_quoted_bind_names() {
+    let config = live_config();
+    let table = unique_table_name("RET_QUOTED");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, name VARCHAR2(30))"
+    ))
+    .expect("create quoted DML RETURNING test table");
+
+    let mut request = StatementRequest::statement(format!(
+        r#"INSERT INTO {table} (id, name) VALUES (:int_val, :str_val)
+           RETURNING id, name INTO :"_val1", :"VaL_2""#
+    ));
+    request.binds.push(BindValue::Number("1".to_string()));
+    request.binds.push(BindValue::Text("alpha".to_string()));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Number,
+        max_len: 22,
+    });
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Varchar,
+        max_len: 30,
+    });
+
+    let values = conn
+        .execute_out_binds(&request, &[])
+        .expect("DML RETURNING quoted OUT binds");
+
+    assert_eq!(
+        rows_to_strings(&[values]),
+        vec![vec!["1".to_string(), "alpha".to_string()]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn dml_returning_multiple_rows_preserves_all_out_bind_rows() {
+    let config = live_config();
+    let table = unique_table_name("RET_MULTI");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, name VARCHAR2(30))"
+    ))
+    .expect("create multi-row DML RETURNING test table");
+    for (id, name) in [(1, "alpha"), (2, "beta"), (3, "gamma")] {
+        conn.query_drop(&format!(
+            "INSERT INTO {table} (id, name) VALUES ({id}, '{name}')"
+        ))
+        .expect("insert DML RETURNING source row");
+    }
+
+    let mut request = StatementRequest::statement(format!(
+        "UPDATE {table} SET name = name || '_x' WHERE id <= 3 RETURNING id, name INTO :1, :2"
+    ));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Number,
+        max_len: 22,
+    });
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Varchar,
+        max_len: 30,
+    });
+
+    let result = conn
+        .execute_out_binds_with_implicit(&request, &[])
+        .expect("multi-row DML RETURNING OUT binds");
+    let mut rows = rows_to_strings(&result.rows);
+    rows.sort();
+
+    assert_eq!(
+        rows,
+        vec![
+            vec!["1".to_string(), "alpha_x".to_string()],
+            vec!["2".to_string(), "beta_x".to_string()],
+            vec!["3".to_string(), "gamma_x".to_string()],
+        ]
+    );
+    let values_row = rows_to_strings(&[result.values])
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    assert!(
+        rows.contains(&values_row),
+        "compatibility values should contain the first returned row"
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn dml_returning_no_rows_returns_empty_out_bind_rows() {
+    let config = live_config();
+    let table = unique_table_name("RET_NONE");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, name VARCHAR2(30))"
+    ))
+    .expect("create no-row DML RETURNING test table");
+
+    let mut request = StatementRequest::statement(format!(
+        "UPDATE {table} SET name = 'unused' WHERE id = -1 RETURNING id, name INTO :1, :2"
+    ));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Number,
+        max_len: 22,
+    });
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Varchar,
+        max_len: 30,
+    });
+
+    let result = conn
+        .execute_out_binds_with_implicit(&request, &[])
+        .expect("no-row DML RETURNING OUT binds");
+
+    assert!(result.rows.is_empty());
+    assert!(result.values.is_empty());
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn plsql_function_scalar_return_bind_returns_value() {
     let function_name = unique_object_name("FUNC_SCALAR");
     let mut conn = connect();

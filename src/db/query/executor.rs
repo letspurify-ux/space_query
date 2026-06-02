@@ -446,6 +446,35 @@ impl QueryExecutor {
                 }
 
                 if let Some(nc) = next {
+                    if nc == '"' {
+                        let mut j = i + 2;
+                        let mut name = String::new();
+                        let mut closed = false;
+                        while j < len {
+                            let ch = chars[j];
+                            if ch == '"' {
+                                if j + 1 < len && chars[j + 1] == '"' {
+                                    name.push('"');
+                                    j += 2;
+                                    continue;
+                                }
+                                closed = true;
+                                j += 1;
+                                break;
+                            }
+                            name.push(ch);
+                            j += 1;
+                        }
+                        if closed && !name.is_empty() {
+                            let normalized = SessionState::normalize_name(&name);
+                            if seen.insert(normalized.clone()) {
+                                names.push(normalized);
+                            }
+                            i = j;
+                            continue;
+                        }
+                    }
+
                     if nc.is_ascii_digit() {
                         let mut j = i + 1;
                         while j < len && chars[j].is_ascii_digit() {

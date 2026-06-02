@@ -6275,6 +6275,24 @@ END;"#;
 }
 
 #[test]
+fn test_extract_bind_names_supports_quoted_bind_names() {
+    let sql = r#"INSERT INTO t(id, name)
+VALUES (:int_val, :str_val)
+RETURNING id, name INTO :"_val1", :"VaL_2""#;
+    let names = QueryExecutor::extract_bind_names(sql);
+
+    assert_eq!(
+        names,
+        vec![
+            "INT_VAL".to_string(),
+            "STR_VAL".to_string(),
+            "_VAL1".to_string(),
+            "VAL_2".to_string(),
+        ]
+    );
+}
+
+#[test]
 fn test_is_create_trigger() {
     // Positive cases
     assert!(QueryExecutor::is_create_trigger(

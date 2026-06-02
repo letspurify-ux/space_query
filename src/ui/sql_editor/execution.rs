@@ -11,7 +11,7 @@ use fltk::{
 use mysql::prelude::Queryable;
 use mysql::Error as MysqlError;
 use oracle::{Connection, Error as OracleError, ErrorKind as OracleErrorKind};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::fs::OpenOptions;
@@ -23,8 +23,8 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tns_thin::exec::{
-    BindInputValue as OracleThinBindInputValue, BindValue as OracleThinBindValue,
-    ColumnMetadata as OracleThinColumnMetadata,
+    sql_dml_returning_into_tail, BindInputValue as OracleThinBindInputValue,
+    BindValue as OracleThinBindValue, ColumnMetadata as OracleThinColumnMetadata,
     DescribedQueryResult as OracleThinDescribedQueryResult, OracleColumnType, OracleValue,
     QueryResult as OracleThinQueryResult, RefCursorValue as OracleThinRefCursorValue,
     StatementRequest,
@@ -12778,6 +12778,64 @@ impl SqlEditorWidget {
             });
         }
 
+        let dml_returning_out_positions =
+            Self::oracle_thin_dml_returning_out_bind_positions(&request.sql, &resolved)?;
+        if dml_returning_out_positions.iter().any(|is_out| *is_out) {
+            request.binds = resolved
+                .iter()
+                .zip(dml_returning_out_positions.iter())
+                .map(|(bind, is_out)| {
+                    if *is_out {
+                        Self::oracle_thin_returning_out_bind_value(bind)
+                    } else {
+                        Self::oracle_thin_input_bind_value(bind)
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let out_resolved = resolved
+                .iter()
+                .zip(dml_returning_out_positions.iter())
+                .filter_map(|(bind, is_out)| is_out.then_some(bind.clone()))
+                .collect::<Vec<_>>();
+            let bind_types = out_resolved
+                .iter()
+                .map(|bind| Self::oracle_thin_column_type_for_bind(&bind.data_type))
+                .collect::<Vec<_>>();
+            let execution = conn
+                .execute_out_binds_with_implicit(&request, &bind_types)
+                .map_err(|err| err.to_string())?;
+            let statement_cursor_id = execution.statement_cursor_id;
+            let bind_updates = match Self::oracle_thin_apply_bind_updates(
+                conn,
+                session,
+                &out_resolved,
+                execution.values,
+                cancel_flag,
+            ) {
+                Ok(updates) => updates,
+                Err(err) => {
+                    conn.close_cursor_on_next_call(statement_cursor_id);
+                    return Err(err);
+                }
+            };
+            if Self::execute_oracle_thin_cancel_requested(cancel_flag) {
+                conn.close_cursor_on_next_call(statement_cursor_id);
+                return Err(Self::cancel_message());
+            }
+            let statement_cursor_id = Self::oracle_thin_defer_or_close_statement_cursor(
+                conn,
+                statement_cursor_id,
+                bind_updates.ref_cursor_results.len(),
+                execution.implicit_results.len(),
+            );
+            return Ok(OracleThinStatementOutcome {
+                out_messages: bind_updates.out_messages,
+                ref_cursor_results: bind_updates.ref_cursor_results,
+                implicit_results: execution.implicit_results,
+                statement_cursor_id,
+            });
+        }
+
         request.binds = resolved
             .iter()
             .map(Self::oracle_thin_input_bind_value)
@@ -12955,6 +13013,54 @@ impl SqlEditorWidget {
             column_type,
             max_len,
             value: Self::oracle_thin_input_payload(bind)?,
+        })
+    }
+
+    fn oracle_thin_dml_returning_out_bind_positions(
+        sql: &str,
+        resolved: &[ResolvedBind],
+    ) -> Result<Vec<bool>, String> {
+        let mut positions = vec![false; resolved.len()];
+        let Some(into_tail) = sql_dml_returning_into_tail(sql) else {
+            return Ok(positions);
+        };
+        let into_offset = into_tail.as_ptr() as usize - sql.as_ptr() as usize;
+        let before_into = &sql[..into_offset];
+        let before_names = QueryExecutor::extract_bind_names(before_into)
+            .into_iter()
+            .map(|name| SessionState::normalize_name(&name))
+            .collect::<HashSet<_>>();
+        let out_names = QueryExecutor::extract_bind_names(into_tail)
+            .into_iter()
+            .map(|name| SessionState::normalize_name(&name))
+            .collect::<Vec<_>>();
+        if out_names.is_empty() || out_names.len() > resolved.len() {
+            return Ok(positions);
+        }
+        if let Some(name) = out_names.iter().find(|name| before_names.contains(*name)) {
+            return Err(format!(
+                "the bind variable placeholder \":{name}\" cannot be used both before and after the RETURNING clause in a DML RETURNING statement"
+            ));
+        }
+        let start = resolved.len() - out_names.len();
+        for (offset, name) in out_names.iter().enumerate() {
+            let index = start + offset;
+            if resolved.get(index).is_some_and(|bind| bind.name == *name) {
+                positions[index] = true;
+            }
+        }
+        Ok(positions)
+    }
+
+    fn oracle_thin_returning_out_bind_value(
+        bind: &ResolvedBind,
+    ) -> Result<OracleThinBindValue, String> {
+        if matches!(bind.data_type, BindDataType::RefCursor) {
+            return Err("REFCURSOR bind is not supported for DML RETURNING".to_string());
+        }
+        Ok(OracleThinBindValue::Out {
+            column_type: Self::oracle_thin_column_type_for_bind(&bind.data_type),
+            max_len: Self::oracle_thin_max_bind_len(bind),
         })
     }
 
@@ -29050,7 +29156,8 @@ mod mysql_transaction_feedback_tests {
     };
     use crate::db::{
         BindDataType, BindValue, BindVar, ConnectionInfo, DatabaseType, OracleDriverMode,
-        QueryExecutor, QueryResult, SessionState, SharedDbSessionLease, TransactionMode,
+        QueryExecutor, QueryResult, ResolvedBind, SessionState, SharedDbSessionLease,
+        TransactionMode,
     };
     use crate::ui::{result_pane_routes_for_progress, ResultPaneRoute};
     use std::sync::atomic::Ordering;
@@ -29199,6 +29306,145 @@ mod mysql_transaction_feedback_tests {
             QueryExecutor::extract_bind_names(sql),
             vec!["V_NUM".to_string(), "V_TXT".to_string()]
         );
+    }
+
+    #[test]
+    fn oracle_thin_dml_returning_marks_only_into_binds_as_out() {
+        let sql = "INSERT INTO users(id, name) VALUES (:id_in, :name_in)
+                   RETURNING id, name INTO :id_out, :name_out";
+        let resolved = vec![
+            ResolvedBind {
+                name: "ID_IN".to_string(),
+                data_type: BindDataType::Number,
+                value: Some("1".to_string()),
+            },
+            ResolvedBind {
+                name: "NAME_IN".to_string(),
+                data_type: BindDataType::Varchar2(30),
+                value: Some("alpha".to_string()),
+            },
+            ResolvedBind {
+                name: "ID_OUT".to_string(),
+                data_type: BindDataType::Number,
+                value: None,
+            },
+            ResolvedBind {
+                name: "NAME_OUT".to_string(),
+                data_type: BindDataType::Varchar2(30),
+                value: None,
+            },
+        ];
+
+        assert_eq!(
+            SqlEditorWidget::oracle_thin_dml_returning_out_bind_positions(sql, &resolved)
+                .expect("DML RETURNING bind positions"),
+            vec![false, false, true, true]
+        );
+        let expression_sql = "INSERT INTO users(id) VALUES (:id_in)
+                              RETURNING id + :add_val INTO :id_out";
+        let expression_resolved = vec![
+            ResolvedBind {
+                name: "ID_IN".to_string(),
+                data_type: BindDataType::Number,
+                value: Some("5".to_string()),
+            },
+            ResolvedBind {
+                name: "ADD_VAL".to_string(),
+                data_type: BindDataType::Number,
+                value: Some("18".to_string()),
+            },
+            ResolvedBind {
+                name: "ID_OUT".to_string(),
+                data_type: BindDataType::Number,
+                value: None,
+            },
+        ];
+        assert_eq!(
+            SqlEditorWidget::oracle_thin_dml_returning_out_bind_positions(
+                expression_sql,
+                &expression_resolved,
+            )
+            .expect("DML RETURNING expression bind positions"),
+            vec![false, false, true]
+        );
+        let quoted_sql = r#"INSERT INTO users(id, name) VALUES (:id_in, :name_in)
+                            RETURNING id, name INTO :"_val1", :"VaL_2""#;
+        let quoted_resolved = vec![
+            ResolvedBind {
+                name: "ID_IN".to_string(),
+                data_type: BindDataType::Number,
+                value: Some("1".to_string()),
+            },
+            ResolvedBind {
+                name: "NAME_IN".to_string(),
+                data_type: BindDataType::Varchar2(30),
+                value: Some("alpha".to_string()),
+            },
+            ResolvedBind {
+                name: "_VAL1".to_string(),
+                data_type: BindDataType::Number,
+                value: None,
+            },
+            ResolvedBind {
+                name: "VAL_2".to_string(),
+                data_type: BindDataType::Varchar2(30),
+                value: None,
+            },
+        ];
+        assert_eq!(
+            QueryExecutor::extract_bind_names(quoted_sql),
+            vec![
+                "ID_IN".to_string(),
+                "NAME_IN".to_string(),
+                "_VAL1".to_string(),
+                "VAL_2".to_string()
+            ]
+        );
+        assert_eq!(
+            SqlEditorWidget::oracle_thin_dml_returning_out_bind_positions(
+                quoted_sql,
+                &quoted_resolved,
+            )
+            .expect("DML RETURNING quoted bind positions"),
+            vec![false, false, true, true]
+        );
+        assert_eq!(
+            SqlEditorWidget::oracle_thin_dml_returning_out_bind_positions(
+                "INSERT INTO t(doc) SELECT JSON_OBJECT(KEY 'id' VALUE :id RETURNING CLOB) FROM dual",
+                &resolved[..1],
+            )
+            .expect("JSON RETURNING is not DML RETURNING"),
+            vec![false]
+        );
+    }
+
+    #[test]
+    fn oracle_thin_dml_returning_rejects_duplicate_bind_names_before_and_after_returning() {
+        let sql = "INSERT INTO users(id, name) VALUES (:id, :name)
+                   RETURNING id, name INTO :id, :name_out";
+        let resolved = vec![
+            ResolvedBind {
+                name: "ID".to_string(),
+                data_type: BindDataType::Number,
+                value: Some("1".to_string()),
+            },
+            ResolvedBind {
+                name: "NAME".to_string(),
+                data_type: BindDataType::Varchar2(30),
+                value: Some("alpha".to_string()),
+            },
+            ResolvedBind {
+                name: "NAME_OUT".to_string(),
+                data_type: BindDataType::Varchar2(30),
+                value: None,
+            },
+        ];
+
+        let err = SqlEditorWidget::oracle_thin_dml_returning_out_bind_positions(sql, &resolved)
+            .expect_err("duplicate RETURNING bind should be rejected");
+        assert!(err.contains(
+            "the bind variable placeholder \":ID\" cannot be used both before and after the RETURNING clause"
+        ));
     }
 
     #[test]
@@ -32014,6 +32260,192 @@ mod mysql_transaction_feedback_tests {
         assert!(matches!(
             guard.binds.get("V_TXT").map(|bind| &bind.value),
             Some(BindValue::Scalar(Some(value))) if value == "txt-15"
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle listener"]
+    fn oracle_thin_query_tool_runtime_updates_dml_returning_binds() {
+        let mut conn =
+            tns_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
+        SqlEditorWidget::ensure_oracle_thin_runtime(&mut conn).expect("install runtime");
+        let table = format!("OQT_THIN_RET_{}", std::process::id());
+        let _ = SqlEditorWidget::execute_oracle_thin_statement(
+            &mut conn,
+            format!("DROP TABLE {table} PURGE"),
+            false,
+        );
+        SqlEditorWidget::execute_oracle_thin_statement(
+            &mut conn,
+            format!("CREATE TABLE {table} (id NUMBER PRIMARY KEY, name VARCHAR2(30))"),
+            false,
+        )
+        .expect("create table");
+
+        let session = Arc::new(Mutex::new(SessionState::default()));
+        {
+            let mut guard = session.lock().expect("session lock");
+            let mut id_in = BindVar::new(BindDataType::Number);
+            id_in.value = BindValue::Scalar(Some("1".to_string()));
+            guard.binds.insert("ID_IN".to_string(), id_in);
+            guard
+                .binds
+                .insert("ID_OUT".to_string(), BindVar::new(BindDataType::Number));
+            guard.binds.insert(
+                "NAME_OUT".to_string(),
+                BindVar::new(BindDataType::Varchar2(30)),
+            );
+        }
+
+        let messages = SqlEditorWidget::execute_oracle_thin_statement_with_binds(
+            &mut conn,
+            &format!(
+                "INSERT INTO {table} (id, name) VALUES (:id_in, 'alpha')
+                 RETURNING id, name INTO :id_out, :name_out"
+            ),
+            &session,
+            false,
+        )
+        .expect("execute DML RETURNING with binds");
+        let _ = SqlEditorWidget::execute_oracle_thin_statement(
+            &mut conn,
+            format!("DROP TABLE {table} PURGE"),
+            false,
+        );
+
+        assert!(messages.iter().any(|line| line == ":ID_OUT = 1"));
+        assert!(messages.iter().any(|line| line == ":NAME_OUT = alpha"));
+        let guard = session.lock().expect("session lock");
+        assert!(matches!(
+            guard.binds.get("ID_OUT").map(|bind| &bind.value),
+            Some(BindValue::Scalar(Some(value))) if value == "1"
+        ));
+        assert!(matches!(
+            guard.binds.get("NAME_OUT").map(|bind| &bind.value),
+            Some(BindValue::Scalar(Some(value))) if value == "alpha"
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle listener"]
+    fn oracle_thin_query_tool_runtime_uses_input_bind_in_dml_returning_expression() {
+        let mut conn =
+            tns_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
+        SqlEditorWidget::ensure_oracle_thin_runtime(&mut conn).expect("install runtime");
+        let table = format!("OQT_THIN_RET_EXPR_{}", std::process::id());
+        let _ = SqlEditorWidget::execute_oracle_thin_statement(
+            &mut conn,
+            format!("DROP TABLE {table} PURGE"),
+            false,
+        );
+        SqlEditorWidget::execute_oracle_thin_statement(
+            &mut conn,
+            format!("CREATE TABLE {table} (id NUMBER PRIMARY KEY)"),
+            false,
+        )
+        .expect("create table");
+
+        let session = Arc::new(Mutex::new(SessionState::default()));
+        {
+            let mut guard = session.lock().expect("session lock");
+            let mut id_in = BindVar::new(BindDataType::Number);
+            id_in.value = BindValue::Scalar(Some("5".to_string()));
+            guard.binds.insert("ID_IN".to_string(), id_in);
+            let mut add_val = BindVar::new(BindDataType::Number);
+            add_val.value = BindValue::Scalar(Some("18".to_string()));
+            guard.binds.insert("ADD_VAL".to_string(), add_val);
+            guard
+                .binds
+                .insert("ID_OUT".to_string(), BindVar::new(BindDataType::Number));
+        }
+
+        let messages = SqlEditorWidget::execute_oracle_thin_statement_with_binds(
+            &mut conn,
+            &format!(
+                "INSERT INTO {table} (id) VALUES (:id_in)
+                 RETURNING id + :add_val INTO :id_out"
+            ),
+            &session,
+            false,
+        )
+        .expect("execute DML RETURNING expression with input bind");
+        let _ = SqlEditorWidget::execute_oracle_thin_statement(
+            &mut conn,
+            format!("DROP TABLE {table} PURGE"),
+            false,
+        );
+
+        assert!(messages.iter().any(|line| line == ":ID_OUT = 23"));
+        let guard = session.lock().expect("session lock");
+        assert!(matches!(
+            guard.binds.get("ID_OUT").map(|bind| &bind.value),
+            Some(BindValue::Scalar(Some(value))) if value == "23"
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle listener"]
+    fn oracle_thin_query_tool_runtime_updates_quoted_dml_returning_binds() {
+        let mut conn =
+            tns_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
+        SqlEditorWidget::ensure_oracle_thin_runtime(&mut conn).expect("install runtime");
+        let table = format!("OQT_THIN_RET_QUOTED_{}", std::process::id());
+        let _ = SqlEditorWidget::execute_oracle_thin_statement(
+            &mut conn,
+            format!("DROP TABLE {table} PURGE"),
+            false,
+        );
+        SqlEditorWidget::execute_oracle_thin_statement(
+            &mut conn,
+            format!("CREATE TABLE {table} (id NUMBER PRIMARY KEY, name VARCHAR2(30))"),
+            false,
+        )
+        .expect("create table");
+
+        let session = Arc::new(Mutex::new(SessionState::default()));
+        {
+            let mut guard = session.lock().expect("session lock");
+            let mut id_in = BindVar::new(BindDataType::Number);
+            id_in.value = BindValue::Scalar(Some("1".to_string()));
+            guard.binds.insert("ID_IN".to_string(), id_in);
+            let mut name_in = BindVar::new(BindDataType::Varchar2(30));
+            name_in.value = BindValue::Scalar(Some("alpha".to_string()));
+            guard.binds.insert("NAME_IN".to_string(), name_in);
+            guard
+                .binds
+                .insert("_VAL1".to_string(), BindVar::new(BindDataType::Number));
+            guard.binds.insert(
+                "VAL_2".to_string(),
+                BindVar::new(BindDataType::Varchar2(30)),
+            );
+        }
+
+        let messages = SqlEditorWidget::execute_oracle_thin_statement_with_binds(
+            &mut conn,
+            &format!(
+                r#"INSERT INTO {table} (id, name) VALUES (:id_in, :name_in)
+                   RETURNING id, name INTO :"_val1", :"VaL_2""#
+            ),
+            &session,
+            false,
+        )
+        .expect("execute DML RETURNING with quoted binds");
+        let _ = SqlEditorWidget::execute_oracle_thin_statement(
+            &mut conn,
+            format!("DROP TABLE {table} PURGE"),
+            false,
+        );
+
+        assert!(messages.iter().any(|line| line == ":_VAL1 = 1"));
+        assert!(messages.iter().any(|line| line == ":VAL_2 = alpha"));
+        let guard = session.lock().expect("session lock");
+        assert!(matches!(
+            guard.binds.get("_VAL1").map(|bind| &bind.value),
+            Some(BindValue::Scalar(Some(value))) if value == "1"
+        ));
+        assert!(matches!(
+            guard.binds.get("VAL_2").map(|bind| &bind.value),
+            Some(BindValue::Scalar(Some(value))) if value == "alpha"
         ));
     }
 

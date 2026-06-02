@@ -31,8 +31,9 @@ use crate::connect::{
     TNS_MIN_SUPPORTED_PROTOCOL,
 };
 use crate::exec::{
-    BindInputValue, BindValue, ColumnMetadata, DescribedQueryResult, ExecuteWithImplicitResult,
-    OracleColumnType, OracleValue, OutBindResult, QueryResult, RefCursorValue, StatementRequest,
+    sql_is_dml_returning, BindInputValue, BindValue, ColumnMetadata, DescribedQueryResult,
+    ExecuteWithImplicitResult, OracleColumnType, OracleValue, OutBindResult, QueryResult,
+    RefCursorValue, StatementRequest,
 };
 use crate::{log_connect_phase, OracleThinError};
 
@@ -719,12 +720,21 @@ impl OracleThinSession {
         _bind_types: &[OracleColumnType],
     ) -> Result<OutBindResult, OracleThinError> {
         let response = self.execute_request(request)?;
-        let values = response
-            .out_bind_values
-            .or_else(|| response.result.rows.first().cloned())
-            .unwrap_or_default();
+        let rows = if response.out_bind_rows.is_empty() {
+            response
+                .result
+                .rows
+                .first()
+                .cloned()
+                .map(|row| vec![row])
+                .unwrap_or_default()
+        } else {
+            response.out_bind_rows
+        };
+        let values = rows.first().cloned().unwrap_or_default();
         Ok(OutBindResult {
             values,
+            rows,
             statement_cursor_id: response.result.cursor_id,
             implicit_results: response.implicit_results,
         })
@@ -1390,7 +1400,7 @@ fn write_data_type_representations(payload: &mut Vec<u8>) {
 struct ExecuteResponse {
     columns: Vec<ColumnMetadata>,
     result: QueryResult,
-    out_bind_values: Option<Vec<OracleValue>>,
+    out_bind_rows: Vec<Vec<OracleValue>>,
     implicit_results: Vec<RefCursorValue>,
 }
 
@@ -1413,6 +1423,7 @@ struct ExecuteReadState {
     last_row: Option<Vec<OracleValue>>,
     bit_vector: Option<Vec<u8>>,
     reading_out_binds: bool,
+    reading_dml_returning: bool,
     cursor_id: Option<u32>,
     exhausted: bool,
     done: bool,
@@ -1478,6 +1489,10 @@ fn request_allows_implicit_resultsets(request: &StatementRequest) -> bool {
                 .sql
                 .to_ascii_uppercase()
                 .contains("DBMS_SQL.RETURN_RESULT"))
+}
+
+fn request_is_dml_returning(request: &StatementRequest) -> bool {
+    !request.is_query && !request.is_plsql && sql_is_dml_returning(&request.sql)
 }
 
 fn write_execute_request(
@@ -1618,7 +1633,7 @@ fn write_execute_request(
     write_ub4(&mut payload, 0);
     if num_params > 0 {
         write_bind_metadata(&mut payload, capabilities, &request.binds)?;
-        write_bind_rows(&mut payload, capabilities, &request.binds)?;
+        write_bind_rows_for_request(&mut payload, capabilities, request)?;
     }
     if std::env::var_os("ORACLE_THIN_TRACE_EXEC").is_some() {
         eprintln!(
@@ -1741,7 +1756,7 @@ fn write_legacy_execute_request(
     }
     if num_params > 0 {
         write_bind_metadata(&mut payload, capabilities, &request.binds)?;
-        write_bind_rows(&mut payload, capabilities, &request.binds)?;
+        write_bind_rows_for_request(&mut payload, capabilities, request)?;
     }
     if std::env::var_os("ORACLE_THIN_TRACE_EXEC").is_some() {
         eprintln!(
@@ -2016,6 +2031,33 @@ fn write_bind_rows(
         write_bind_value(payload, capabilities, bind)?;
     }
     Ok(())
+}
+
+fn write_bind_rows_for_request(
+    payload: &mut Vec<u8>,
+    capabilities: &OracleThinCapabilities,
+    request: &StatementRequest,
+) -> Result<(), OracleThinError> {
+    if !request_is_dml_returning(request) {
+        return write_bind_rows(payload, capabilities, &request.binds);
+    }
+    let input_binds = request
+        .binds
+        .iter()
+        .filter(|bind| !bind_can_return_value(bind))
+        .collect::<Vec<_>>();
+    if input_binds.is_empty() {
+        return Ok(());
+    }
+    payload.push(TNS_MSG_TYPE_ROW_DATA);
+    for bind in input_binds {
+        write_bind_value(payload, capabilities, bind)?;
+    }
+    Ok(())
+}
+
+fn bind_can_return_value(bind: &BindValue) -> bool {
+    matches!(bind, BindValue::Out { .. } | BindValue::InOut { .. })
 }
 
 fn write_bind_value(
@@ -2654,6 +2696,16 @@ fn read_execute_response_with_state(
     mut state: ExecuteReadState,
     mut skip_empty_end_of_response: bool,
 ) -> Result<ExecuteResponse, OracleThinError> {
+    if request_is_dml_returning(request) && state.out_bind_columns.is_empty() {
+        state.out_bind_columns = request
+            .binds
+            .iter()
+            .filter(|bind| bind_can_return_value(bind))
+            .map(bind_column_metadata)
+            .collect();
+        state.reading_out_binds = !state.out_bind_columns.is_empty();
+        state.reading_dml_returning = state.reading_out_binds;
+    }
     let mut pending_error = None;
     let mut pending_fragment = Vec::new();
     let mut pending_fragment_error = None;
@@ -2829,7 +2881,7 @@ fn read_execute_response_with_state(
             exhausted: state.exhausted || !request.is_query,
             rows: state.rows,
         },
-        out_bind_values: state.out_bind_rows.into_iter().next(),
+        out_bind_rows: state.out_bind_rows,
         implicit_results: state.implicit_results,
     })
 }
@@ -3139,6 +3191,9 @@ fn process_row_data(
     capabilities: &OracleThinCapabilities,
     state: &mut ExecuteReadState,
 ) -> Result<(), OracleThinError> {
+    if state.reading_dml_returning {
+        return process_dml_returning_row_data(cursor, capabilities, state);
+    }
     let columns = if state.reading_out_binds {
         &state.out_bind_columns
     } else {
@@ -3168,6 +3223,39 @@ fn process_row_data(
         state.out_bind_rows.push(row);
     } else {
         state.rows.push(row);
+    }
+    state.bit_vector = None;
+    Ok(())
+}
+
+fn process_dml_returning_row_data(
+    cursor: &mut PacketCursor<'_>,
+    capabilities: &OracleThinCapabilities,
+    state: &mut ExecuteReadState,
+) -> Result<(), OracleThinError> {
+    let mut returned_by_column = Vec::with_capacity(state.out_bind_columns.len());
+    let mut max_rows = 0usize;
+    for column in &state.out_bind_columns {
+        let num_rows = cursor.read_ub4()? as usize;
+        max_rows = max_rows.max(num_rows);
+        let mut values = Vec::with_capacity(num_rows);
+        for _ in 0..num_rows {
+            values.push(read_column_value(cursor, capabilities, column, true)?);
+        }
+        returned_by_column.push(values);
+    }
+
+    for row_index in 0..max_rows {
+        let row = returned_by_column
+            .iter()
+            .map(|values| {
+                values
+                    .get(row_index)
+                    .cloned()
+                    .unwrap_or(OracleValue::Null)
+            })
+            .collect();
+        state.out_bind_rows.push(row);
     }
     state.bit_vector = None;
     Ok(())
@@ -7802,15 +7890,15 @@ mod tests {
         generate_auth_credentials_from_session_key_parts, hex_encode_upper,
         legacy_json_serialized_query, local_timezone_offset_string, oracle_column_type_from_ora_type,
         process_auth_payload, process_describe_body, process_legacy_execute_error,
-        process_protocol_message, process_row_data,
-        execute_flags_for_request, read_boolean_value, read_data_packet_with_control,
-        read_data_packet_with_flags, read_rowid_value, read_urowid_value,
+        process_protocol_message, process_row_data, execute_flags_for_request,
+        read_boolean_value, read_data_packet_with_control, read_data_packet_with_flags,
+        read_rowid_value, read_urowid_value, request_is_dml_returning,
         thin_column_from_column_metadata, validate_supported_protocol, verify_server_response,
         windows_code_pages_for_encoding, write_bind_value, write_bytes_with_length_for_capabilities,
-        write_bytes_with_two_lengths, write_column_metadata, write_data_type_representations,
-        write_ub2, write_ub4, write_ub8, AuthState, OracleThinCapabilities, OracleThinConfig,
-        OracleThinSession, OracleValue, PacketCursor, ThinColumn, CS_FORM_IMPLICIT, CS_FORM_NCHAR,
-        ORACLE_CHARSET_AL32UTF8,
+        write_bind_rows_for_request, write_bytes_with_two_lengths, write_column_metadata,
+        write_data_type_representations, write_ub2, write_ub4, write_ub8, AuthState,
+        OracleThinCapabilities, OracleThinConfig, OracleThinSession, OracleValue, PacketCursor,
+        ThinColumn, CS_FORM_IMPLICIT, CS_FORM_NCHAR, ORACLE_CHARSET_AL32UTF8,
         ORACLE_CHARSET_JA16SJIS, ORACLE_CHARSET_KO16KSC5601, ORACLE_CHARSET_KO16MSWIN949,
         ORACLE_CHARSET_UTF8, ORACLE_CHARSET_ZHS16GBK, ORACLE_CHARSET_ZHT16BIG5,
         TNS_CCAP_END_OF_CALL_STATUS, TNS_CCAP_END_OF_RESPONSE, TNS_CCAP_EXPLICIT_BOUNDARY,
@@ -8114,6 +8202,57 @@ mod tests {
             execute_flags_for_request(false, &request),
             TNS_EXEC_FLAGS_IMPLICIT_RESULTSET
         );
+    }
+
+    #[test]
+    fn detects_dml_returning_without_matching_json_returning() {
+        let returning = StatementRequest::statement(
+            "INSERT INTO t(id, name) VALUES (:1, :2) RETURNING id INTO :3",
+        );
+        assert!(request_is_dml_returning(&returning));
+
+        let json_returning = StatementRequest::statement(
+            "INSERT INTO t(doc) SELECT JSON_OBJECT(KEY 'id' VALUE :1 RETURNING CLOB) FROM dual",
+        );
+        assert!(!request_is_dml_returning(&json_returning));
+
+        let commented = StatementRequest::statement(
+            "UPDATE t SET note = 'RETURNING id INTO :x' /* RETURNING y INTO :z */ WHERE id = :1",
+        );
+        assert!(!request_is_dml_returning(&commented));
+
+        let q_quoted = StatementRequest::statement(
+            "UPDATE t SET note = q'[RETURNING id INTO :x]' WHERE id = :1",
+        );
+        assert!(!request_is_dml_returning(&q_quoted));
+
+        let nq_quoted = StatementRequest::statement(
+            "UPDATE t SET note = nq'{RETURNING id INTO :x}' WHERE id = :1",
+        );
+        assert!(!request_is_dml_returning(&nq_quoted));
+
+        let returning_after_q_quote = StatementRequest::statement(
+            "UPDATE t SET note = q'[RETURNING id INTO :x]' WHERE id = :1 RETURNING id INTO :2",
+        );
+        assert!(request_is_dml_returning(&returning_after_q_quote));
+    }
+
+    #[test]
+    fn dml_returning_bind_rows_skip_output_capable_return_binds() {
+        let mut request =
+            StatementRequest::statement("INSERT INTO t(id) VALUES (:1) RETURNING id INTO :2");
+        request.binds.push(BindValue::Number("1".to_string()));
+        request.binds.push(BindValue::InOut {
+            column_type: OracleColumnType::Number,
+            max_len: 22,
+            value: Some(BindInputValue::Number("999".to_string())),
+        });
+
+        let mut payload = Vec::new();
+        write_bind_rows_for_request(&mut payload, &OracleThinCapabilities::default(), &request)
+            .expect("write DML RETURNING bind rows");
+
+        assert_eq!(hex_encode_upper(&payload), "0702C102");
     }
 
     #[test]
