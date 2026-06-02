@@ -1320,12 +1320,6 @@ impl OracleThinSession {
                 charset_form,
             )?);
         }
-        if std::env::var_os("ORACLE_THIN_TRACE_OBJECT").is_some() {
-            eprintln!(
-                "oracle-thin object attrs {}.{} = {:?}",
-                schema_name, type_name, attrs
-            );
-        }
         for attr in &attrs {
             if is_decodable_object_column(attr) {
                 let key = object_type_key(&attr.schema_name, &attr.type_name);
@@ -4351,24 +4345,6 @@ fn read_object_value(
     column: &ThinColumn,
     object_attrs_by_type: &HashMap<(String, String), Vec<ThinColumn>>,
 ) -> Result<OracleValue, OracleThinError> {
-    if std::env::var_os("ORACLE_THIN_TRACE_OBJECT").is_some() {
-        let remaining = &cursor.data[cursor.pos..];
-        eprintln!(
-            "oracle-thin object {}.{} raw remaining len={} bytes={:02x?}",
-            column.schema_name,
-            column.type_name,
-            remaining.len(),
-            &remaining[..remaining.len().min(96)]
-        );
-        if remaining.len() > 96 {
-            eprintln!(
-                "oracle-thin object {}.{} raw tail bytes={:02x?}",
-                column.schema_name,
-                column.type_name,
-                &remaining[remaining.len().saturating_sub(96)..]
-            );
-        }
-    }
     let remaining = &cursor.data[cursor.pos..];
     let Some((image_offset, image_len)) = find_object_image(remaining) else {
         let _ = cursor.read_bytes()?;
@@ -4437,17 +4413,6 @@ fn read_object_attrs(
 ) -> Result<OracleValue, OracleThinError> {
     let mut values = Vec::with_capacity(attrs.len());
     for attr in attrs {
-        if std::env::var_os("ORACLE_THIN_TRACE_OBJECT").is_some() {
-            let remaining = &cursor.data[cursor.pos..];
-            eprintln!(
-                "oracle-thin object attr {} type={:?}/{} pos={} next={:02x?}",
-                attr.name,
-                attr.column_type,
-                attr.ora_type_num,
-                cursor.pos,
-                &remaining[..remaining.len().min(24)]
-            );
-        }
         let value = read_object_attr_value(cursor, capabilities, attr, object_attrs_by_type)?;
         values.push((attr.name.clone(), value));
     }
@@ -4467,21 +4432,6 @@ fn read_object_attr_value(
             .map(|value| value.unwrap_or(OracleValue::Null)),
         ORA_TYPE_NUM_VARCHAR | ORA_TYPE_NUM_CHAR => read_object_pickle_bytes(cursor)?
             .map(|bytes| {
-                if std::env::var_os("ORACLE_THIN_TRACE_OBJECT").is_some() {
-                    let non_ascii = bytes
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, byte)| **byte != b'U')
-                        .take(24)
-                        .map(|(index, byte)| (index, *byte))
-                        .collect::<Vec<_>>();
-                    eprintln!(
-                        "oracle-thin object attr {} text bytes len={} non_u={:02x?}",
-                        attr.name,
-                        bytes.len(),
-                        non_ascii
-                    );
-                }
                 decode_oracle_text(&bytes, attr.charset_form, capabilities).map(OracleValue::Text)
             })
             .transpose()
