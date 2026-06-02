@@ -13772,6 +13772,7 @@ impl SqlEditorWidget {
             OracleValue::Lob(_) => Some("[LOB]".to_string()),
             OracleValue::Cursor(_) => Some("[CURSOR]".to_string()),
             OracleValue::Object(_) => Some("[OBJECT]".to_string()),
+            OracleValue::Array(_) => Some("[ARRAY]".to_string()),
         }
     }
 

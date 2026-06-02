@@ -81,6 +81,7 @@ pub enum OracleValue {
     Lob(Vec<u8>),
     Cursor(RefCursorValue),
     Object(Vec<(String, OracleValue)>),
+    Array(Vec<OracleValue>),
 }
 
 #[derive(Debug, Clone, PartialEq)]

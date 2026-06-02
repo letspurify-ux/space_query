@@ -284,7 +284,6 @@ const TNS_VECTOR_FORMAT_INT8: u8 = 4;
 const TNS_VECTOR_FORMAT_BINARY: u8 = 5;
 const TNS_OBJ_IS_DEGENERATE: u8 = 0x10;
 const TNS_OBJ_NO_PREFIX_SEG: u8 = 0x04;
-const TNS_OBJECT_VALUE_POSTAMBLE_LENGTH: usize = 60;
 const TNS_XML_TYPE_LOB: u32 = 0x0001;
 const TNS_XML_TYPE_STRING: u32 = 0x0004;
 const TNS_XML_TYPE_FLAG_SKIP_NEXT_4: u32 = 0x0010_0000;
@@ -483,6 +482,7 @@ pub struct OracleThinSession {
     cursor_columns_by_cursor: HashMap<u32, Vec<ThinColumn>>,
     ref_cursor_ids: HashSet<u32>,
     object_attrs_by_type: HashMap<(String, String), Vec<ThinColumn>>,
+    collection_element_by_type: HashMap<(String, String), ThinColumn>,
     deferred_cursor_closes: HashMap<u32, HashSet<u32>>,
     deferred_cursor_parent_by_child: HashMap<u32, u32>,
     cancel_flag: Arc<AtomicBool>,
@@ -512,6 +512,7 @@ impl OracleThinSession {
             cursor_columns_by_cursor: HashMap::new(),
             ref_cursor_ids: HashSet::new(),
             object_attrs_by_type: HashMap::new(),
+            collection_element_by_type: HashMap::new(),
             deferred_cursor_closes: HashMap::new(),
             deferred_cursor_parent_by_child: HashMap::new(),
             cancel_flag: Arc::new(AtomicBool::new(false)),
@@ -608,6 +609,7 @@ impl OracleThinSession {
             self.cursor_columns_by_cursor.clear();
             self.ref_cursor_ids.clear();
             self.object_attrs_by_type.clear();
+            self.collection_element_by_type.clear();
             self.deferred_cursor_closes.clear();
             self.deferred_cursor_parent_by_child.clear();
             Err(OracleThinError::new("Oracle thin session is broken"))
@@ -1008,6 +1010,7 @@ impl OracleThinSession {
         let mut state = ExecuteReadState::default();
         state.columns = fetch_columns;
         state.object_attrs_by_type = self.object_attrs_by_type.clone();
+        state.collection_element_by_type = self.collection_element_by_type.clone();
         state.last_row = self.last_rows_by_cursor.get(&cursor_id).cloned();
         let request = StatementRequest::query("", row_count);
         let response = read_execute_response_with_state(
@@ -1243,17 +1246,144 @@ impl OracleThinSession {
         columns: &[ThinColumn],
     ) -> Result<(), OracleThinError> {
         for column in columns {
-            if !is_decodable_object_column(column) {
-                continue;
-            }
-            let key = object_type_key(&column.schema_name, &column.type_name);
-            if self.object_attrs_by_type.contains_key(&key) {
-                continue;
-            }
-            let attrs = self.load_object_type_attrs(&key.0, &key.1)?;
-            self.object_attrs_by_type.insert(key, attrs);
+            self.ensure_object_or_collection_metadata_for_column(column)?;
         }
         Ok(())
+    }
+
+    fn ensure_object_or_collection_metadata_for_column(
+        &mut self,
+        column: &ThinColumn,
+    ) -> Result<(), OracleThinError> {
+        if !is_decodable_object_column(column) {
+            return Ok(());
+        }
+        let key = object_type_key(&column.schema_name, &column.type_name);
+        if self.object_attrs_by_type.contains_key(&key)
+            || self.collection_element_by_type.contains_key(&key)
+        {
+            return Ok(());
+        }
+        match self.load_named_typecode(&key.0, &key.1)?.as_deref() {
+            Some("OBJECT") => {
+                let attrs = self.load_object_type_attrs(&key.0, &key.1)?;
+                self.object_attrs_by_type.insert(key, attrs);
+                Ok(())
+            }
+            Some("COLLECTION") => {
+                let element = self.load_collection_element_type(&key.0, &key.1)?;
+                self.collection_element_by_type.insert(key, element);
+                Ok(())
+            }
+            Some(typecode) => Err(OracleThinError::new(format!(
+                "Oracle thin TTC cannot decode named type {}.{} with TYPECODE {typecode}",
+                key.0, key.1
+            ))),
+            None => Err(OracleThinError::new(format!(
+                "Oracle thin TTC cannot verify named type {}.{}",
+                key.0, key.1
+            ))),
+        }
+    }
+
+    fn load_named_typecode(
+        &mut self,
+        schema_name: &str,
+        type_name: &str,
+    ) -> Result<Option<String>, OracleThinError> {
+        let sql = format!(
+            "SELECT typecode \
+             FROM all_types \
+             WHERE owner = '{}' AND type_name = '{}'",
+            sql_string_literal(schema_name),
+            sql_string_literal(type_name)
+        );
+        let result = self.query_described_fetch_all(sql, 1)?;
+        let Some(row) = result.result.rows.first() else {
+            return Ok(None);
+        };
+        match row.first() {
+            Some(OracleValue::Text(value)) => Ok(Some(value.to_ascii_uppercase())),
+            Some(OracleValue::Null) | None => Ok(None),
+            other => Err(OracleThinError::new(format!(
+                "unexpected Oracle named typecode metadata value {other:?}"
+            ))),
+        }
+    }
+
+    fn load_collection_element_type(
+        &mut self,
+        schema_name: &str,
+        type_name: &str,
+    ) -> Result<ThinColumn, OracleThinError> {
+        let sql = format!(
+            "SELECT c.elem_type_name, c.elem_type_owner, c.length, \
+                    c.character_set_name, t.typecode \
+             FROM all_coll_types c \
+             LEFT JOIN all_types t \
+               ON t.owner = c.elem_type_owner \
+              AND t.type_name = c.elem_type_name \
+             WHERE c.owner = '{}' AND c.type_name = '{}'",
+            sql_string_literal(schema_name),
+            sql_string_literal(type_name)
+        );
+        let result = self.query_described_fetch_all(sql, 1)?;
+        let row = result.result.rows.first().ok_or_else(|| {
+            OracleThinError::new(format!(
+                "Oracle thin TTC cannot load collection element metadata for {schema_name}.{type_name}"
+            ))
+        })?;
+        let elem_type_name = match row.first() {
+            Some(OracleValue::Text(value)) => value.clone(),
+            other => {
+                return Err(OracleThinError::new(format!(
+                    "unexpected collection elem_type_name metadata value {other:?}"
+                )))
+            }
+        };
+        let elem_type_owner = match row.get(1) {
+            Some(OracleValue::Text(value)) => value.clone(),
+            Some(OracleValue::Null) | None => String::new(),
+            other => {
+                return Err(OracleThinError::new(format!(
+                    "unexpected collection elem_type_owner metadata value {other:?}"
+                )))
+            }
+        };
+        let buffer_size = match row.get(2) {
+            Some(OracleValue::Number(value)) => value.parse::<u32>().unwrap_or(0),
+            Some(OracleValue::Null) | None => 0,
+            other => {
+                return Err(OracleThinError::new(format!(
+                    "unexpected collection length metadata value {other:?}"
+                )))
+            }
+        };
+        let charset_form = match row.get(3) {
+            Some(OracleValue::Text(value)) if value.eq_ignore_ascii_case("NCHAR_CS") => {
+                CS_FORM_NCHAR
+            }
+            _ => CS_FORM_IMPLICIT,
+        };
+        let elem_typecode = match row.get(4) {
+            Some(OracleValue::Text(value)) => Some(value.clone()),
+            Some(OracleValue::Null) | None => None,
+            other => {
+                return Err(OracleThinError::new(format!(
+                    "unexpected collection element typecode metadata value {other:?}"
+                )))
+            }
+        };
+        let element = thin_column_from_object_attr(
+            "ELEMENT".to_string(),
+            elem_type_name,
+            elem_type_owner,
+            elem_typecode,
+            buffer_size,
+            charset_form,
+        )?;
+        self.ensure_object_or_collection_metadata_for_column(&element)?;
+        Ok(element)
     }
 
     fn load_object_type_attrs(
@@ -1262,10 +1392,14 @@ impl OracleThinSession {
         type_name: &str,
     ) -> Result<Vec<ThinColumn>, OracleThinError> {
         let sql = format!(
-            "SELECT attr_name, attr_type_name, attr_type_owner, length, character_set_name \
-             FROM all_type_attrs \
-             WHERE owner = '{}' AND type_name = '{}' \
-             ORDER BY attr_no",
+            "SELECT a.attr_name, a.attr_type_name, a.attr_type_owner, a.length, \
+                    a.character_set_name, t.typecode \
+             FROM all_type_attrs a \
+             LEFT JOIN all_types t \
+               ON t.owner = a.attr_type_owner \
+              AND t.type_name = a.attr_type_name \
+             WHERE a.owner = '{}' AND a.type_name = '{}' \
+             ORDER BY a.attr_no",
             sql_string_literal(schema_name),
             sql_string_literal(type_name)
         );
@@ -1312,22 +1446,26 @@ impl OracleThinSession {
                 }
                 _ => CS_FORM_IMPLICIT,
             };
+            let attr_typecode = match row.get(5) {
+                Some(OracleValue::Text(value)) => Some(value.clone()),
+                Some(OracleValue::Null) | None => None,
+                other => {
+                    return Err(OracleThinError::new(format!(
+                        "unexpected UDT typecode metadata value {other:?}"
+                    )))
+                }
+            };
             attrs.push(thin_column_from_object_attr(
                 attr_name,
                 attr_type_name,
                 attr_type_owner,
+                attr_typecode,
                 buffer_size,
                 charset_form,
             )?);
         }
         for attr in &attrs {
-            if is_decodable_object_column(attr) {
-                let key = object_type_key(&attr.schema_name, &attr.type_name);
-                if !self.object_attrs_by_type.contains_key(&key) {
-                    let nested_attrs = self.load_object_type_attrs(&key.0, &key.1)?;
-                    self.object_attrs_by_type.insert(key, nested_attrs);
-                }
-            }
+            self.ensure_object_or_collection_metadata_for_column(attr)?;
         }
         Ok(attrs)
     }
@@ -1701,6 +1839,7 @@ struct ExecuteReadState {
     implicit_results: Vec<RefCursorValue>,
     cursor_columns: Vec<(u32, Vec<ThinColumn>)>,
     object_attrs_by_type: HashMap<(String, String), Vec<ThinColumn>>,
+    collection_element_by_type: HashMap<(String, String), ThinColumn>,
     last_row: Option<Vec<OracleValue>>,
     bit_vector: Option<Vec<u8>>,
     reading_out_binds: bool,
@@ -1803,10 +1942,12 @@ fn thin_column_from_object_attr(
     name: String,
     attr_type_name: String,
     attr_type_owner: String,
+    attr_typecode: Option<String>,
     buffer_size: u32,
     charset_form: u8,
 ) -> Result<ThinColumn, OracleThinError> {
     let attr_type = attr_type_name.to_ascii_uppercase();
+    let attr_typecode = attr_typecode.map(|value| value.to_ascii_uppercase());
     let (column_type, ora_type_num, schema_name, type_name) = match attr_type.as_str() {
         "VARCHAR2" | "VARCHAR" => (
             OracleColumnType::Varchar,
@@ -1886,6 +2027,18 @@ fn thin_column_from_object_attr(
             String::new(),
             String::new(),
         ),
+        "BFILE" => (
+            OracleColumnType::Bfile,
+            ORA_TYPE_NUM_BFILE,
+            String::new(),
+            String::new(),
+        ),
+        "XMLTYPE" => (
+            OracleColumnType::Xml,
+            ORA_TYPE_NUM_OBJECT,
+            attr_type_owner,
+            attr_type,
+        ),
         "BINARY_FLOAT" => (
             OracleColumnType::Number,
             ORA_TYPE_NUM_BINARY_FLOAT,
@@ -1898,12 +2051,48 @@ fn thin_column_from_object_attr(
             String::new(),
             String::new(),
         ),
-        other if !attr_type_owner.is_empty() => (
-            OracleColumnType::Unsupported(ORA_TYPE_NUM_OBJECT),
-            ORA_TYPE_NUM_OBJECT,
-            attr_type_owner,
-            other.to_string(),
+        "BOOLEAN" => (
+            OracleColumnType::Boolean,
+            ORA_TYPE_NUM_BOOLEAN,
+            String::new(),
+            String::new(),
         ),
+        "INTERVAL YEAR TO MONTH" => (
+            OracleColumnType::IntervalYearMonth,
+            ORA_TYPE_NUM_INTERVAL_YM,
+            String::new(),
+            String::new(),
+        ),
+        "INTERVAL DAY TO SECOND" => (
+            OracleColumnType::IntervalDaySecond,
+            ORA_TYPE_NUM_INTERVAL_DS,
+            String::new(),
+            String::new(),
+        ),
+        other if !attr_type_owner.is_empty() => match attr_typecode.as_deref() {
+            Some("OBJECT") => (
+                OracleColumnType::Unsupported(ORA_TYPE_NUM_OBJECT),
+                ORA_TYPE_NUM_OBJECT,
+                attr_type_owner,
+                other.to_string(),
+            ),
+            Some("COLLECTION") => (
+                OracleColumnType::Unsupported(ORA_TYPE_NUM_OBJECT),
+                ORA_TYPE_NUM_OBJECT,
+                attr_type_owner,
+                other.to_string(),
+            ),
+            Some(typecode) => {
+                return Err(OracleThinError::new(format!(
+                    "Oracle thin TTC cannot decode UDT attribute {name} named type {other} with TYPECODE {typecode}"
+                )))
+            }
+            None => {
+                return Err(OracleThinError::new(format!(
+                    "Oracle thin TTC cannot verify UDT attribute {name} named type {other}"
+                )))
+            }
+        },
         other => {
             return Err(OracleThinError::new(format!(
                 "Oracle thin TTC cannot map UDT attribute {name} type {other}"
@@ -1934,6 +2123,10 @@ fn default_object_attr_buffer_size(ora_type_num: u8) -> u32 {
         ORA_TYPE_NUM_TIMESTAMP_TZ => 13,
         ORA_TYPE_NUM_BINARY_FLOAT => 4,
         ORA_TYPE_NUM_BINARY_DOUBLE => 8,
+        ORA_TYPE_NUM_BOOLEAN => 4,
+        ORA_TYPE_NUM_INTERVAL_YM => 5,
+        ORA_TYPE_NUM_INTERVAL_DS => 11,
+        ORA_TYPE_NUM_BFILE => 1,
         ORA_TYPE_NUM_OBJECT => 1,
         _ => 0,
     }
@@ -3894,6 +4087,7 @@ fn process_row_data(
                 state.reading_out_binds,
                 &mut state.cursor_columns,
                 &state.object_attrs_by_type,
+                &state.collection_element_by_type,
             )?);
         }
     }
@@ -3926,6 +4120,7 @@ fn process_dml_returning_row_data(
                 true,
                 &mut state.cursor_columns,
                 &state.object_attrs_by_type,
+                &state.collection_element_by_type,
             )?);
         }
         returned_by_column.push(values);
@@ -3957,6 +4152,7 @@ fn read_column_value(
     out_bind: bool,
     cursor_columns: &mut Vec<(u32, Vec<ThinColumn>)>,
     object_attrs_by_type: &HashMap<(String, String), Vec<ThinColumn>>,
+    collection_element_by_type: &HashMap<(String, String), ThinColumn>,
 ) -> Result<OracleValue, OracleThinError> {
     let value = if column.buffer_size == 0
         && !matches!(
@@ -4084,7 +4280,13 @@ fn read_column_value(
                 read_xmltype_value(cursor, capabilities)?
             }
             ORA_TYPE_NUM_OBJECT | TNS_DATA_TYPE_EXT_NAMED | TNS_DATA_TYPE_PNTY => {
-                read_object_value(cursor, capabilities, column, object_attrs_by_type)?
+                read_object_value(
+                    cursor,
+                    capabilities,
+                    column,
+                    object_attrs_by_type,
+                    collection_element_by_type,
+                )?
             }
             ORA_TYPE_NUM_VECTOR => read_vector_value(cursor)?,
             ORA_TYPE_NUM_BFILE | TNS_DATA_TYPE_CFILE | ORA_TYPE_NUM_DBFILE => {
@@ -4344,38 +4546,37 @@ fn read_object_value(
     capabilities: &OracleThinCapabilities,
     column: &ThinColumn,
     object_attrs_by_type: &HashMap<(String, String), Vec<ThinColumn>>,
+    collection_element_by_type: &HashMap<(String, String), ThinColumn>,
 ) -> Result<OracleValue, OracleThinError> {
-    let remaining = &cursor.data[cursor.pos..];
-    let Some((image_offset, image_len)) = find_object_image(remaining) else {
-        let _ = cursor.read_bytes()?;
+    cursor.skip_bytes_with_ub4_length()?; // type OID
+    cursor.skip_bytes_with_ub4_length()?; // object OID
+    cursor.skip_bytes_with_ub4_length()?; // snapshot
+    let _ = cursor.read_ub2()?; // version
+    let num_bytes = cursor.read_ub4()? as usize;
+    let _ = cursor.read_ub2()?; // flags
+    if num_bytes == 0 {
+        return Ok(OracleValue::Null);
+    }
+    let Some(packed_data) = cursor.read_bytes()? else {
         return Ok(OracleValue::Null);
     };
-    let image_end = image_offset + image_len;
-    let value_end = (image_end + TNS_OBJECT_VALUE_POSTAMBLE_LENGTH).min(remaining.len());
-    let packed_data = remaining
-        .get(image_offset..image_end)
-        .ok_or_else(|| OracleThinError::new("short Oracle object image"))?
-        .to_vec();
-    cursor.skip(value_end)?;
-    decode_object_payload(&packed_data, capabilities, column, object_attrs_by_type)
-}
-
-fn find_object_image(bytes: &[u8]) -> Option<(usize, usize)> {
-    for offset in 0..bytes.len().saturating_sub(2) {
-        if !matches!(bytes[offset], 0x84 | 0x88) || bytes[offset + 1] != 0x01 {
-            continue;
-        }
-        let len = if bytes[offset + 2] == TNS_LONG_LENGTH_INDICATOR {
-            let len_bytes = bytes.get(offset + 3..offset + 7)?;
-            u32::from_be_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) as usize
-        } else {
-            usize::from(bytes[offset + 2])
-        };
-        if len > 0 && offset + len <= bytes.len() {
-            return Some((offset, len));
-        }
+    let key = object_type_key(&column.schema_name, &column.type_name);
+    if let Some(element) = collection_element_by_type.get(&key) {
+        return decode_collection_payload(
+            &packed_data,
+            capabilities,
+            element,
+            object_attrs_by_type,
+            collection_element_by_type,
+        );
     }
-    None
+    decode_object_payload(
+        &packed_data,
+        capabilities,
+        column,
+        object_attrs_by_type,
+        collection_element_by_type,
+    )
 }
 
 fn decode_object_payload(
@@ -4383,6 +4584,7 @@ fn decode_object_payload(
     capabilities: &OracleThinCapabilities,
     column: &ThinColumn,
     object_attrs_by_type: &HashMap<(String, String), Vec<ThinColumn>>,
+    collection_element_by_type: &HashMap<(String, String), ThinColumn>,
 ) -> Result<OracleValue, OracleThinError> {
     let key = object_type_key(&column.schema_name, &column.type_name);
     let attrs = object_attrs_by_type.get(&key).ok_or_else(|| {
@@ -4402,7 +4604,13 @@ fn decode_object_payload(
         let prefix_seg_length = read_pickle_length(&mut cursor)?;
         cursor.skip(prefix_seg_length)?;
     }
-    read_object_attrs(&mut cursor, capabilities, attrs, object_attrs_by_type)
+    read_object_attrs(
+        &mut cursor,
+        capabilities,
+        attrs,
+        object_attrs_by_type,
+        collection_element_by_type,
+    )
 }
 
 fn read_object_attrs(
@@ -4410,10 +4618,18 @@ fn read_object_attrs(
     capabilities: &OracleThinCapabilities,
     attrs: &[ThinColumn],
     object_attrs_by_type: &HashMap<(String, String), Vec<ThinColumn>>,
+    collection_element_by_type: &HashMap<(String, String), ThinColumn>,
 ) -> Result<OracleValue, OracleThinError> {
     let mut values = Vec::with_capacity(attrs.len());
     for attr in attrs {
-        let value = read_object_attr_value(cursor, capabilities, attr, object_attrs_by_type)?;
+        let value = read_object_attr_value(
+            cursor,
+            capabilities,
+            attr,
+            object_attrs_by_type,
+            collection_element_by_type,
+            false,
+        )?;
         values.push((attr.name.clone(), value));
     }
     Ok(OracleValue::Object(values))
@@ -4424,6 +4640,8 @@ fn read_object_attr_value(
     capabilities: &OracleThinCapabilities,
     attr: &ThinColumn,
     object_attrs_by_type: &HashMap<(String, String), Vec<ThinColumn>>,
+    collection_element_by_type: &HashMap<(String, String), ThinColumn>,
+    object_values_are_wrapped: bool,
 ) -> Result<OracleValue, OracleThinError> {
     match attr.ora_type_num {
         ORA_TYPE_NUM_NUMBER => read_object_pickle_bytes(cursor)?
@@ -4457,11 +4675,56 @@ fn read_object_attr_value(
             .map(|bytes| decode_oracle_binary_double(&bytes).map(OracleValue::Number))
             .transpose()
             .map(|value| value.unwrap_or(OracleValue::Null)),
-        ORA_TYPE_NUM_CLOB | ORA_TYPE_NUM_BLOB => Ok(read_object_pickle_bytes(cursor)?
+        ORA_TYPE_NUM_BOOLEAN => Ok(read_object_pickle_bytes(cursor)?
+            .map(|bytes| OracleValue::Boolean(bytes.iter().any(|byte| *byte != 0)))
+            .unwrap_or(OracleValue::Null)),
+        ORA_TYPE_NUM_INTERVAL_YM | ORA_TYPE_NUM_INTERVAL_YM_DTY => read_object_pickle_bytes(cursor)?
+            .map(|bytes| decode_oracle_interval_ym(&bytes).map(OracleValue::Text))
+            .transpose()
+            .map(|value| value.unwrap_or(OracleValue::Null)),
+        ORA_TYPE_NUM_INTERVAL_DS | ORA_TYPE_NUM_INTERVAL_DS_DTY => read_object_pickle_bytes(cursor)?
+            .map(|bytes| decode_oracle_interval_ds(&bytes).map(OracleValue::Text))
+            .transpose()
+            .map(|value| value.unwrap_or(OracleValue::Null)),
+        ORA_TYPE_NUM_CLOB | ORA_TYPE_NUM_BLOB | ORA_TYPE_NUM_BFILE => Ok(read_object_pickle_bytes(cursor)?
             .map(OracleValue::Lob)
             .unwrap_or(OracleValue::Null)),
+        ORA_TYPE_NUM_OBJECT if attr.column_type == OracleColumnType::Xml => {
+            read_object_pickle_bytes(cursor)?
+                .map(|bytes| decode_xmltype_payload(&bytes, capabilities))
+                .transpose()
+                .map(|value| value.unwrap_or(OracleValue::Null))
+        }
         ORA_TYPE_NUM_OBJECT => {
             let key = object_type_key(&attr.schema_name, &attr.type_name);
+            if let Some(element) = collection_element_by_type.get(&key) {
+                return read_object_pickle_bytes(cursor)?
+                    .map(|bytes| {
+                        decode_collection_payload(
+                            &bytes,
+                            capabilities,
+                            element,
+                            object_attrs_by_type,
+                            collection_element_by_type,
+                        )
+                    })
+                    .transpose()
+                    .map(|value| value.unwrap_or(OracleValue::Null));
+            }
+            if object_values_are_wrapped {
+                return read_object_pickle_bytes(cursor)?
+                    .map(|bytes| {
+                        decode_object_payload(
+                            &bytes,
+                            capabilities,
+                            attr,
+                            object_attrs_by_type,
+                            collection_element_by_type,
+                        )
+                    })
+                    .transpose()
+                    .map(|value| value.unwrap_or(OracleValue::Null));
+            }
             let attrs = object_attrs_by_type.get(&key).ok_or_else(|| {
                 OracleThinError::new(format!(
                     "Oracle thin TTC cannot decode nested Oracle object {}.{} without type metadata",
@@ -4475,7 +4738,13 @@ fn read_object_attr_value(
             if marker != 0 {
                 cursor.pos = cursor.pos.saturating_sub(1);
             }
-            read_object_attrs(cursor, capabilities, attrs, object_attrs_by_type)
+            read_object_attrs(
+                cursor,
+                capabilities,
+                attrs,
+                object_attrs_by_type,
+                collection_element_by_type,
+            )
         }
         other => Err(OracleThinError::new(format!(
             "Oracle thin TTC cannot decode Oracle object attribute {} type {other}",
@@ -4484,12 +4753,46 @@ fn read_object_attr_value(
     }
 }
 
+fn decode_collection_payload(
+    bytes: &[u8],
+    capabilities: &OracleThinCapabilities,
+    element: &ThinColumn,
+    object_attrs_by_type: &HashMap<(String, String), Vec<ThinColumn>>,
+    collection_element_by_type: &HashMap<(String, String), ThinColumn>,
+) -> Result<OracleValue, OracleThinError> {
+    let mut cursor = PacketCursor::with_capabilities(bytes, capabilities);
+    let image_flags = cursor.read_u8()?;
+    let _image_version = cursor.read_u8()?;
+    skip_pickle_length(&mut cursor)?;
+    if image_flags & TNS_OBJ_IS_DEGENERATE != 0 {
+        return Ok(OracleValue::Null);
+    }
+    if image_flags & TNS_OBJ_NO_PREFIX_SEG == 0 {
+        let prefix_seg_length = read_pickle_length(&mut cursor)?;
+        cursor.skip(prefix_seg_length)?;
+    }
+    let _collection_flags = cursor.read_u8()?;
+    let num_elements = read_pickle_length(&mut cursor)?;
+    let mut values = Vec::with_capacity(num_elements);
+    for _ in 0..num_elements {
+        values.push(read_object_attr_value(
+            &mut cursor,
+            capabilities,
+            element,
+            object_attrs_by_type,
+            collection_element_by_type,
+            true,
+        )?);
+    }
+    Ok(OracleValue::Array(values))
+}
+
 fn read_object_pickle_bytes(
     cursor: &mut PacketCursor<'_>,
 ) -> Result<Option<Vec<u8>>, OracleThinError> {
     let len = cursor.read_u8()?;
     match len {
-        0xff => Ok(None),
+        0 | 0xff => Ok(None),
         TNS_LEGACY_NULL_LENGTH_INDICATOR if cursor.legacy_null_clr => Ok(None),
         TNS_LONG_LENGTH_INDICATOR => {
             let len = cursor.read_u32_be()? as usize;
@@ -8865,6 +9168,7 @@ mod tests {
             cursor_columns_by_cursor: HashMap::new(),
             ref_cursor_ids: HashSet::new(),
             object_attrs_by_type: HashMap::new(),
+            collection_element_by_type: HashMap::new(),
             deferred_cursor_closes: HashMap::new(),
             deferred_cursor_parent_by_child: HashMap::new(),
             cancel_flag: Arc::new(AtomicBool::new(false)),

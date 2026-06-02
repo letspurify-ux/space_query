@@ -7923,6 +7923,7 @@ impl ObjectBrowser {
             OracleThinValue::Bytes(value) => format!("{value:?}"),
             OracleThinValue::Cursor(_) => "[CURSOR]".to_string(),
             OracleThinValue::Object(_) => "[OBJECT]".to_string(),
+            OracleThinValue::Array(_) => "[ARRAY]".to_string(),
         }
     }
 

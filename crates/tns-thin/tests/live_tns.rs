@@ -3237,24 +3237,72 @@ fn plsql_procedure_ref_cursor_out_bind_fetches_extended_wire_types() {
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn plsql_procedure_ref_cursor_out_bind_preserves_udt_metadata() {
     let config = live_config();
+    let nested_type_name = unique_object_name("RCUDT_CHILD");
     let type_name = unique_object_name("RCUDT_OBJ");
     let procedure_name = unique_object_name("RCUDT");
+    let _nested_guard = TypeDropGuard::new(config.clone(), nested_type_name.clone());
     let _guard = TypeDropGuard::new(config.clone(), type_name.clone());
     let mut conn = connect_with_config(config);
     drop_procedure_ignore(&mut conn, &procedure_name);
     drop_type_ignore(&mut conn, &type_name);
+    drop_type_ignore(&mut conn, &nested_type_name);
+    conn.query_drop(&format!(
+        "CREATE TYPE {nested_type_name} AS OBJECT (\
+         child_id NUMBER, \
+         child_label VARCHAR2(30))"
+    ))
+    .expect("create nested UDT type");
     conn.query_drop(&format!(
         "CREATE TYPE {type_name} AS OBJECT (\
          id NUMBER, \
-         payload VARCHAR2(1000))"
+         payload VARCHAR2(4000), \
+         raw_payload RAW(4), \
+         created_on DATE, \
+         stamped_at TIMESTAMP, \
+         score_float BINARY_FLOAT, \
+         score_double BINARY_DOUBLE, \
+         active BOOLEAN, \
+         inactive BOOLEAN, \
+         period_ym INTERVAL YEAR(4) TO MONTH, \
+         period_ds INTERVAL DAY TO SECOND, \
+         clob_payload CLOB, \
+         blob_payload BLOB, \
+         file_payload BFILE, \
+         xml_payload XMLTYPE, \
+         child {nested_type_name})"
     ))
     .expect("create UDT type");
     conn.query_drop(&format!(
         "CREATE OR REPLACE PROCEDURE {procedure_name}(p_rc OUT SYS_REFCURSOR) IS \
          BEGIN \
          OPEN p_rc FOR \
-         SELECT {type_name}(7, CAST(RPAD('U', 1000, 'U') AS VARCHAR2(1000))) AS obj \
-         FROM dual; \
+         SELECT obj \
+         FROM (\
+             SELECT 1 AS sort_key, \
+                    {type_name}(\
+                        7, \
+                        CAST(RPAD('U', 4000, 'U') AS VARCHAR2(4000)), \
+                        HEXTORAW('CAFE'), \
+                        DATE '2024-02-29', \
+                        TIMESTAMP '2024-01-02 03:04:05.123456', \
+                        CAST(3.5 AS BINARY_FLOAT), \
+                        CAST(-2.25 AS BINARY_DOUBLE), \
+                        TRUE, \
+                        FALSE, \
+                        TO_YMINTERVAL('2021-10'), \
+                        TO_DSINTERVAL('2 12:23:34.456789'), \
+                        TO_CLOB('OBJECT-CLOB'), \
+                        TO_BLOB(HEXTORAW('BEEF')), \
+                        BFILENAME('DATA_PUMP_DIR', 'space_query_bfile_probe.bin'), \
+                        XMLTYPE('<root><kind>object</kind><txt>' || UNISTR('\\D55C') || '</txt></root>'), \
+                        {nested_type_name}(99, 'nested child')\
+                    ) AS obj \
+             FROM dual \
+             UNION ALL \
+             SELECT 2 AS sort_key, CAST(NULL AS {type_name}) AS obj \
+             FROM dual\
+         ) \
+         ORDER BY sort_key; \
          END;"
     ))
     .expect("create UDT REF CURSOR procedure");
@@ -3278,17 +3326,11 @@ fn plsql_procedure_ref_cursor_out_bind_preserves_udt_metadata() {
         !column.schema_name.is_empty(),
         "UDT metadata should preserve the owning schema"
     );
-    if conn.capabilities().protocol_version != Some(319) {
-        conn.close_cursor_on_next_call(Some(cursor.cursor_id));
-        conn.query_drop("SELECT 1 FROM dual")
-            .expect("close UDT metadata cursor");
-        drop_procedure_ignore(&mut conn, &procedure_name);
-        return;
-    }
 
     let rows = conn
         .fetch_ref_cursor_all(cursor.cursor_id, cursor.columns, 1)
         .expect("fetch UDT REF CURSOR rows");
+    assert_eq!(rows.result.rows.len(), 2);
     let object_attrs = match &rows.result.rows[0][0] {
         OracleValue::Object(attrs) => attrs,
         other => panic!("expected decoded UDT object, got {other:?}"),
@@ -3297,8 +3339,193 @@ fn plsql_procedure_ref_cursor_out_bind_preserves_udt_metadata() {
     assert_eq!(object_attrs[0].1, OracleValue::Number("7".to_string()));
     assert_eq!(object_attrs[1].0, "PAYLOAD");
     let payload = value_to_string(&object_attrs[1].1);
-    assert_eq!(payload.len(), 1000);
+    assert_eq!(payload.len(), 4000);
     assert!(payload.chars().all(|ch| ch == 'U'));
+    assert_eq!(object_attrs[2].0, "RAW_PAYLOAD");
+    assert_eq!(object_attrs[2].1, OracleValue::Bytes(vec![0xca, 0xfe]));
+    assert_eq!(object_attrs[3].0, "CREATED_ON");
+    assert_eq!(date_value_to_string(&object_attrs[3].1), "2024-02-29 00:00:00");
+    assert_eq!(object_attrs[4].0, "STAMPED_AT");
+    assert_eq!(
+        timestamp_value_to_string(&object_attrs[4].1),
+        "2024-01-02 03:04:05.123456"
+    );
+    assert_eq!(object_attrs[5].0, "SCORE_FLOAT");
+    assert_eq!(value_to_string(&object_attrs[5].1), "3.5");
+    assert_eq!(object_attrs[6].0, "SCORE_DOUBLE");
+    assert_eq!(value_to_string(&object_attrs[6].1), "-2.25");
+    assert_eq!(object_attrs[7].0, "ACTIVE");
+    assert_eq!(object_attrs[7].1, OracleValue::Boolean(true));
+    assert_eq!(object_attrs[8].0, "INACTIVE");
+    assert_eq!(object_attrs[8].1, OracleValue::Boolean(false));
+    assert_eq!(object_attrs[9].0, "PERIOD_YM");
+    assert_eq!(value_to_string(&object_attrs[9].1), "+2021-10");
+    assert_eq!(object_attrs[10].0, "PERIOD_DS");
+    assert_eq!(value_to_string(&object_attrs[10].1), "+02 12:23:34.456789");
+    assert_eq!(object_attrs[11].0, "CLOB_PAYLOAD");
+    assert_lob_value_not_empty(&object_attrs[11].1);
+    assert_eq!(object_attrs[12].0, "BLOB_PAYLOAD");
+    assert_lob_value_not_empty(&object_attrs[12].1);
+    assert_eq!(object_attrs[13].0, "FILE_PAYLOAD");
+    assert_lob_value_not_empty(&object_attrs[13].1);
+    assert_eq!(object_attrs[14].0, "XML_PAYLOAD");
+    let xml_payload = value_to_string(&object_attrs[14].1);
+    assert!(xml_payload.contains("<kind>object</kind>"));
+    assert!(xml_payload.contains("\u{D55C}"));
+    assert_eq!(object_attrs[15].0, "CHILD");
+    let child_attrs = match &object_attrs[15].1 {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected decoded nested UDT object, got {other:?}"),
+    };
+    assert_eq!(child_attrs[0].0, "CHILD_ID");
+    assert_eq!(child_attrs[0].1, OracleValue::Number("99".to_string()));
+    assert_eq!(child_attrs[1].0, "CHILD_LABEL");
+    assert_eq!(value_to_string(&child_attrs[1].1), "nested child");
+    assert_eq!(rows.result.rows[1][0], OracleValue::Null);
+
+    drop_procedure_ignore(&mut conn, &procedure_name);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn plsql_procedure_ref_cursor_out_bind_decodes_udt_collection_attribute() {
+    let config = live_config();
+    let child_type_name = unique_object_name("RCUDT_COLL_CHILD");
+    let collection_type_name = unique_object_name("RCUDT_COLL_TAB");
+    let parent_type_name = unique_object_name("RCUDT_COLL_PARENT");
+    let procedure_name = unique_object_name("RCUDT_COLL");
+    let _child_guard = TypeDropGuard::new(config.clone(), child_type_name.clone());
+    let _collection_guard = TypeDropGuard::new(config.clone(), collection_type_name.clone());
+    let _parent_guard = TypeDropGuard::new(config.clone(), parent_type_name.clone());
+    let mut conn = connect_with_config(config);
+    drop_procedure_ignore(&mut conn, &procedure_name);
+    drop_type_ignore(&mut conn, &parent_type_name);
+    drop_type_ignore(&mut conn, &collection_type_name);
+    drop_type_ignore(&mut conn, &child_type_name);
+    conn.query_drop(&format!(
+        "CREATE TYPE {child_type_name} AS OBJECT (child_id NUMBER)"
+    ))
+    .expect("create collection element UDT type");
+    conn.query_drop(&format!(
+        "CREATE TYPE {collection_type_name} AS TABLE OF {child_type_name}"
+    ))
+    .expect("create UDT collection type");
+    conn.query_drop(&format!(
+        "CREATE TYPE {parent_type_name} AS OBJECT (items {collection_type_name})"
+    ))
+    .expect("create UDT parent type with collection attribute");
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE PROCEDURE {procedure_name}(p_rc OUT SYS_REFCURSOR) IS \
+         BEGIN \
+         OPEN p_rc FOR \
+         SELECT {parent_type_name}({collection_type_name}({child_type_name}(1))) AS obj \
+         FROM dual; \
+         END;"
+    ))
+    .expect("create UDT collection REF CURSOR procedure");
+
+    let mut request = StatementRequest::statement(format!("BEGIN {procedure_name}(:1); END;"));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Cursor,
+        max_len: 1,
+    });
+    let values = conn
+        .execute_out_binds(&request, &[])
+        .expect("PL/SQL UDT collection REF CURSOR OUT bind");
+    let cursor = match values.first() {
+        Some(OracleValue::Cursor(cursor)) => cursor.clone(),
+        other => panic!("expected UDT collection OUT REF CURSOR, got {other:?}"),
+    };
+    let rows = conn
+        .fetch_ref_cursor_all(cursor.cursor_id, cursor.columns, 1)
+        .expect("fetch UDT collection REF CURSOR rows");
+    assert_eq!(rows.result.rows.len(), 1);
+    let object_attrs = match &rows.result.rows[0][0] {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected decoded UDT parent object, got {other:?}"),
+    };
+    assert_eq!(object_attrs[0].0, "ITEMS");
+    let collection_values = match &object_attrs[0].1 {
+        OracleValue::Array(values) => values,
+        other => panic!("expected decoded UDT collection attribute, got {other:?}"),
+    };
+    assert_eq!(collection_values.len(), 1);
+    let child_attrs = match &collection_values[0] {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected decoded UDT collection element object, got {other:?}"),
+    };
+    assert_eq!(child_attrs[0].0, "CHILD_ID");
+    assert_eq!(child_attrs[0].1, OracleValue::Number("1".to_string()));
+
+    drop_procedure_ignore(&mut conn, &procedure_name);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn plsql_procedure_ref_cursor_out_bind_decodes_top_level_scalar_collection() {
+    let config = live_config();
+    let collection_type_name = unique_object_name("RCUDT_VC_TAB");
+    let procedure_name = unique_object_name("RCUDT_VC_TAB");
+    let _collection_guard = TypeDropGuard::new(config.clone(), collection_type_name.clone());
+    let mut conn = connect_with_config(config);
+    drop_procedure_ignore(&mut conn, &procedure_name);
+    drop_type_ignore(&mut conn, &collection_type_name);
+    conn.query_drop(&format!(
+        "CREATE TYPE {collection_type_name} AS TABLE OF VARCHAR2(4000)"
+    ))
+    .expect("create VARCHAR2 collection type");
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE PROCEDURE {procedure_name}(p_rc OUT SYS_REFCURSOR) IS \
+         BEGIN \
+         OPEN p_rc FOR \
+         SELECT items \
+         FROM (\
+             SELECT 1 AS sort_key, \
+                    {collection_type_name}(\
+                        CAST(RPAD('C', 4000, 'C') AS VARCHAR2(4000)), \
+                        NULL, \
+                        'tail'\
+                    ) AS items \
+             FROM dual \
+             UNION ALL \
+             SELECT 2 AS sort_key, CAST(NULL AS {collection_type_name}) AS items \
+             FROM dual\
+         ) \
+         ORDER BY sort_key; \
+         END;"
+    ))
+    .expect("create scalar collection REF CURSOR procedure");
+
+    let mut request = StatementRequest::statement(format!("BEGIN {procedure_name}(:1); END;"));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Cursor,
+        max_len: 1,
+    });
+    let values = conn
+        .execute_out_binds(&request, &[])
+        .expect("PL/SQL scalar collection REF CURSOR OUT bind");
+    let cursor = match values.first() {
+        Some(OracleValue::Cursor(cursor)) => cursor.clone(),
+        other => panic!("expected scalar collection OUT REF CURSOR, got {other:?}"),
+    };
+    let column = cursor.columns.first().expect("scalar collection cursor column");
+    assert_eq!(column.ora_type_num, 109);
+    assert_eq!(column.type_name, collection_type_name);
+    let rows = conn
+        .fetch_ref_cursor_all(cursor.cursor_id, cursor.columns, 1)
+        .expect("fetch scalar collection REF CURSOR rows");
+    assert_eq!(rows.result.rows.len(), 2);
+    let collection_values = match &rows.result.rows[0][0] {
+        OracleValue::Array(values) => values,
+        other => panic!("expected decoded scalar collection, got {other:?}"),
+    };
+    assert_eq!(collection_values.len(), 3);
+    let payload = value_to_string(&collection_values[0]);
+    assert_eq!(payload.len(), 4000);
+    assert!(payload.chars().all(|ch| ch == 'C'));
+    assert_eq!(collection_values[1], OracleValue::Null);
+    assert_eq!(collection_values[2], OracleValue::Text("tail".to_string()));
+    assert_eq!(rows.result.rows[1][0], OracleValue::Null);
 
     drop_procedure_ignore(&mut conn, &procedure_name);
 }
@@ -3686,6 +3913,16 @@ fn value_to_string(value: &OracleValue) -> String {
     match value {
         OracleValue::Number(value) | OracleValue::Text(value) => value.clone(),
         other => panic!("unexpected test value {other:?}"),
+    }
+}
+
+fn assert_lob_value_not_empty(value: &OracleValue) {
+    match value {
+        OracleValue::Lob(bytes) => assert!(
+            !bytes.is_empty(),
+            "expected non-empty object LOB/BFILE payload"
+        ),
+        other => panic!("expected object LOB/BFILE value, got {other:?}"),
     }
 }
 
