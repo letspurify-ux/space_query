@@ -955,7 +955,7 @@ impl OracleThinSession {
             Some(self.next_ttc_sequence())
         };
         let sequence = self.next_ttc_sequence();
-        if needs_define_fetch {
+        let write_result = if needs_define_fetch {
             log_connect_phase("ttc-define-fetch-write", "");
             write_define_fetch_request(
                 &mut self.stream,
@@ -966,7 +966,7 @@ impl OracleThinSession {
                 close_sequence,
                 &pending_cursor_closes,
                 columns,
-            )?;
+            )
         } else {
             log_connect_phase("ttc-fetch-write", "");
             write_fetch_request(
@@ -977,7 +977,11 @@ impl OracleThinSession {
                 sequence,
                 close_sequence,
                 &pending_cursor_closes,
-            )?;
+            )
+        };
+        if let Err(error) = write_result {
+            self.requeue_pending_cursor_closes(&pending_cursor_closes);
+            return Err(error);
         }
         log_connect_phase("ttc-fetch-read", "");
         let mut state = ExecuteReadState::default();
@@ -1089,24 +1093,30 @@ impl OracleThinSession {
         let close_sequence = self.next_ttc_sequence();
         let ping_sequence = self.next_ttc_sequence();
         let mut payload = Vec::new();
-        write_close_cursors_piggyback(
+        if let Err(error) = write_close_cursors_piggyback(
             &mut payload,
             &self.capabilities,
             close_sequence,
             &cursor_ids,
-        )?;
+        ) {
+            self.requeue_pending_cursor_closes(&cursor_ids);
+            return Err(error);
+        }
         write_function_code(
             &mut payload,
             TNS_FUNC_PING,
             ping_sequence,
             &self.capabilities,
         );
-        write_data_packet(
+        if let Err(error) = write_data_packet(
             &mut self.stream,
             self.capabilities.protocol_version.unwrap_or(319),
             self.capabilities.data_packet_chunk_size(),
             &payload,
-        )?;
+        ) {
+            self.requeue_pending_cursor_closes(&cursor_ids);
+            return Err(error);
+        }
         read_simple_response(&mut self.stream, &self.capabilities, true)
     }
 
@@ -1155,7 +1165,7 @@ impl OracleThinSession {
             Some(self.next_ttc_sequence())
         };
         let sequence = self.next_ttc_sequence();
-        write_execute_request(
+        if let Err(error) = write_execute_request(
             &mut self.stream,
             &self.capabilities,
             request,
@@ -1164,7 +1174,10 @@ impl OracleThinSession {
             close_sequence,
             &pending_cursor_closes,
             execute_without_prefetch,
-        )?;
+        ) {
+            self.requeue_pending_cursor_closes(&pending_cursor_closes);
+            return Err(error);
+        }
         log_connect_phase("ttc-execute-read", "");
         let skip_empty_end_of_response = close_sequence.is_some()
             || (request.is_query
@@ -1204,21 +1217,27 @@ impl OracleThinSession {
         let pending_cursor_closes = self.drain_pending_cursor_closes();
         if !pending_cursor_closes.is_empty() {
             let close_sequence = self.next_ttc_sequence();
-            write_close_cursors_piggyback(
+            if let Err(error) = write_close_cursors_piggyback(
                 &mut payload,
                 &self.capabilities,
                 close_sequence,
                 &pending_cursor_closes,
-            )?;
+            ) {
+                self.requeue_pending_cursor_closes(&pending_cursor_closes);
+                return Err(error);
+            }
         }
         let sequence = self.next_ttc_sequence();
         write_function_code(&mut payload, function_code, sequence, &self.capabilities);
-        write_data_packet(
+        if let Err(error) = write_data_packet(
             &mut self.stream,
             self.capabilities.protocol_version.unwrap_or(319),
             self.capabilities.data_packet_chunk_size(),
             &payload,
-        )?;
+        ) {
+            self.requeue_pending_cursor_closes(&pending_cursor_closes);
+            return Err(error);
+        }
         log_connect_phase(&format!("ttc-{operation}-read"), "");
         let response = read_simple_response(
             &mut self.stream,
@@ -1253,12 +1272,27 @@ impl OracleThinSession {
         if self.pending_cursor_closes.is_empty() {
             return Vec::new();
         }
-        let mut cursor_ids = std::mem::take(&mut self.pending_cursor_closes);
-        cursor_ids.retain(|cursor_id| *cursor_id != 0);
-        cursor_ids.sort_unstable();
-        cursor_ids.dedup();
-        cursor_ids
+        normalize_cursor_ids(std::mem::take(&mut self.pending_cursor_closes))
     }
+
+    fn requeue_pending_cursor_closes(&mut self, cursor_ids: &[u32]) {
+        if cursor_ids.is_empty() {
+            return;
+        }
+        let mut merged = self.pending_cursor_closes.clone();
+        merged.extend_from_slice(cursor_ids);
+        self.pending_cursor_closes = normalize_cursor_ids(merged);
+    }
+}
+
+fn normalize_cursor_ids(mut cursor_ids: Vec<u32>) -> Vec<u32> {
+    if cursor_ids.is_empty() {
+        return Vec::new();
+    }
+    cursor_ids.retain(|cursor_id| *cursor_id != 0);
+    cursor_ids.sort_unstable();
+    cursor_ids.dedup();
+    cursor_ids
 }
 
 #[cfg(unix)]
@@ -8061,12 +8095,13 @@ mod tests {
         generate_10g_password_hash, generate_11g_password_hash,
         generate_auth_credentials_from_session_key_parts, hex_encode_upper,
         legacy_json_serialized_query, local_timezone_offset_string,
-        oracle_column_type_from_ora_type, process_auth_payload, process_describe_body,
-        process_legacy_execute_error, process_protocol_message, process_row_data,
-        execute_flags_for_request, read_boolean_value, read_data_packet_with_control,
-        read_data_packet_with_flags, read_rowid_value, read_urowid_value, request_is_dml_returning,
-        request_with_out_bind_types, thin_column_from_column_metadata, validate_supported_protocol,
-        verify_server_response, windows_code_pages_for_encoding, write_bind_value,
+        normalize_cursor_ids, oracle_column_type_from_ora_type, process_auth_payload,
+        process_describe_body, process_legacy_execute_error, process_protocol_message,
+        process_row_data, execute_flags_for_request, read_boolean_value,
+        read_data_packet_with_control, read_data_packet_with_flags, read_rowid_value,
+        read_urowid_value, request_is_dml_returning, request_with_out_bind_types,
+        thin_column_from_column_metadata, validate_supported_protocol, verify_server_response,
+        windows_code_pages_for_encoding, write_bind_value,
         write_bytes_with_length_for_capabilities, write_bind_rows_for_request,
         write_bytes_with_two_lengths, write_column_metadata, write_data_packet,
         write_data_type_representations, write_ub2, write_ub4, write_ub8, AuthState,
@@ -8364,6 +8399,59 @@ mod tests {
             "unexpected cancel error: {err}"
         );
         assert!(session.is_broken());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn pending_cursor_close_ids_are_normalized_when_drained_and_requeued() {
+        assert_eq!(normalize_cursor_ids(vec![0, 9, 3, 9, 1]), vec![1, 3, 9]);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            drop(stream);
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut session = test_session_with_stream(stream);
+
+        session.pending_cursor_closes = vec![3, 0, 3, 1];
+        assert_eq!(session.drain_pending_cursor_closes(), vec![1, 3]);
+        assert!(session.pending_cursor_closes.is_empty());
+
+        session.pending_cursor_closes = vec![7, 5];
+        session.requeue_pending_cursor_closes(&[0, 3, 7, 3]);
+        assert_eq!(session.pending_cursor_closes, vec![3, 5, 7]);
+
+        drop(session);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn execute_request_requeues_pending_closes_when_payload_build_fails() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            drop(stream);
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut session = test_session_with_stream(stream);
+        session.pending_cursor_closes = vec![9, 3, 9];
+
+        let mut request = StatementRequest::statement("BEGIN NULL; END;");
+        request.binds.push(BindValue::Number(String::new()));
+        let err = session
+            .execute_request(&request)
+            .expect_err("invalid bind should fail before request write");
+
+        assert!(
+            err.to_string().contains("empty Oracle NUMBER bind value"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(session.pending_cursor_closes, vec![3, 9]);
+
+        drop(session);
         server.join().unwrap();
     }
 
