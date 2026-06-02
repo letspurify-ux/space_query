@@ -54,8 +54,11 @@ SOFTWARE.
 ## Rust Dependencies
 
 Rust dependency licenses are recorded in package metadata and locked in
-`Cargo.lock`. Generate a release-time dependency notice with a tool such as
-`cargo about` or `cargo deny` before distributing standalone binaries.
+`Cargo.lock`. The full license texts for the dependencies linked into the
+binaries are collected in `THIRD_PARTY_DEPENDENCIES.md`, generated with
+`cargo about generate about.hbs -o THIRD_PARTY_DEPENDENCIES.md` (config in
+`about.toml` / `about.hbs`). Regenerate this file before distributing standalone
+binaries when dependencies change.
 
 ## Trademarks
 

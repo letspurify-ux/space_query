@@ -17,6 +17,12 @@ this crate, this crate elects the UPL-1.0 option. The UPL is available at:
 
 https://oss.oracle.com/licenses/upl/
 
+The full upstream license, notice, and third-party license files are preserved
+in the project repository under `vendor/python-oracledb/` (`LICENSE.txt`,
+`NOTICE.txt`, `THIRD_PARTY_LICENSES.txt`):
+
+https://github.com/letspurify-ux/space_query
+
 ## go-ora
 
 The TNS thin implementation was also checked against `go-ora` behavior and
