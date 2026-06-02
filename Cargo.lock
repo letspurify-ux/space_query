@@ -2588,6 +2588,7 @@ dependencies = [
  "once_cell",
  "pbkdf2",
  "rand",
+ "serde_json",
  "sha1",
  "sha2",
 ]
