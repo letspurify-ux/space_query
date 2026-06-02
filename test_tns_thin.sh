@@ -20,7 +20,6 @@ Environment:
   ORACLE_AARCH64_CLIENT_LIB_DIR default: /tmp/oqt_instantclient_23_26
   CARGO_BUILD_TARGET           default: aarch64-apple-darwin on macOS for aarch64 OCI
   ORACLE_THIN_LIVE_PROTOCOLS   optional space-separated protocol list
-  INCLUDE_LARGE_TYPES=1        include large_chunk_candidate_types live_tns tests
   RUN_MAIN_CRATE=0             skip space_query TNS thin ignored live tests
   RUN_LIVE_TNS=0               skip tns-thin crate live_tns ignored live tests
   RUN_UNIT_REGRESSION=0        skip focused non-live regression tests
@@ -32,7 +31,6 @@ Environment:
 Examples:
   ./test_tns_thin.sh
   ./test_tns_thin.sh 314
-  INCLUDE_LARGE_TYPES=1 ./test_tns_thin.sh 318
   RUN_COMPARE=0 ./test_tns_thin.sh 314 315 318 319
 USAGE
 }
@@ -203,11 +201,6 @@ RUN_COMPARE="${RUN_COMPARE:-1}"
 SKIP_PREFLIGHT="${SKIP_PREFLIGHT:-0}"
 ORACLE_COMPARE_SQL="${ORACLE_COMPARE_SQL:-test/test_all.sql}"
 
-LIVE_TNS_SKIP_ARGS=()
-if [[ "${INCLUDE_LARGE_TYPES:-0}" != "1" ]]; then
-  LIVE_TNS_SKIP_ARGS+=(--skip large_chunk_candidate_types)
-fi
-
 print_config() {
   cat <<CONFIG
 TNS thin live test configuration
@@ -219,7 +212,6 @@ TNS thin live test configuration
   OCI arch: $ORACLE_OCI_ARCH
   client lib: $ORACLE_CLIENT_LIB_DIR
   cargo target: ${CARGO_BUILD_TARGET:-host default}
-  include large types: ${INCLUDE_LARGE_TYPES:-0}
   run tns-thin live_tns: $RUN_LIVE_TNS
   run space_query TNS thin: $RUN_MAIN_CRATE
   run unit regression: $RUN_UNIT_REGRESSION
@@ -296,9 +288,6 @@ run_live_tns_for_protocol() {
     --nocapture
     --test-threads=1
   )
-  if [[ "${#LIVE_TNS_SKIP_ARGS[@]}" -gt 0 ]]; then
-    args+=("${LIVE_TNS_SKIP_ARGS[@]}")
-  fi
   echo
   echo "== tns-thin live_tns protocol $protocol =="
   ORACLE_THIN_DESIRED_PROTOCOL="$protocol" "${args[@]}"

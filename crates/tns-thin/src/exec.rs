@@ -19,6 +19,7 @@ pub enum OracleColumnType {
     Vector,
     Json,
     Xml,
+    Unsupported(u8),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

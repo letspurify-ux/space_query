@@ -12932,7 +12932,8 @@ impl SqlEditorWidget {
             BindDataType::Date => OracleColumnType::Date,
             BindDataType::Timestamp(_) => OracleColumnType::Timestamp,
             BindDataType::RefCursor => OracleColumnType::Cursor,
-            BindDataType::Varchar2(_) | BindDataType::Clob => OracleColumnType::Varchar,
+            BindDataType::Varchar2(_) => OracleColumnType::Varchar,
+            BindDataType::Clob => OracleColumnType::Clob,
         }
     }
 
@@ -29408,6 +29409,53 @@ mod mysql_transaction_feedback_tests {
             .expect("DML RETURNING quoted bind positions"),
             vec![false, false, true, true]
         );
+        let non_ascii_sql =
+            "INSERT INTO users(id) VALUES (:int_val) RETURNING id INTO :m\u{00E9}il";
+        let non_ascii_resolved = vec![
+            ResolvedBind {
+                name: "INT_VAL".to_string(),
+                data_type: BindDataType::Number,
+                value: Some("7".to_string()),
+            },
+            ResolvedBind {
+                name: "M\u{00C9}IL".to_string(),
+                data_type: BindDataType::Number,
+                value: None,
+            },
+        ];
+        assert_eq!(
+            QueryExecutor::extract_bind_names(non_ascii_sql),
+            vec!["INT_VAL".to_string(), "M\u{00C9}IL".to_string()]
+        );
+        assert_eq!(
+            SqlEditorWidget::oracle_thin_dml_returning_out_bind_positions(
+                non_ascii_sql,
+                &non_ascii_resolved,
+            )
+            .expect("DML RETURNING non-ASCII bind positions"),
+            vec![false, true]
+        );
+        let no_space_sql = "INSERT INTO users(id) VALUES (:id_in)returning(id)into :id_out";
+        let no_space_resolved = vec![
+            ResolvedBind {
+                name: "ID_IN".to_string(),
+                data_type: BindDataType::Number,
+                value: Some("25".to_string()),
+            },
+            ResolvedBind {
+                name: "ID_OUT".to_string(),
+                data_type: BindDataType::Number,
+                value: None,
+            },
+        ];
+        assert_eq!(
+            SqlEditorWidget::oracle_thin_dml_returning_out_bind_positions(
+                no_space_sql,
+                &no_space_resolved,
+            )
+            .expect("DML RETURNING no-space bind positions"),
+            vec![false, true]
+        );
         assert_eq!(
             SqlEditorWidget::oracle_thin_dml_returning_out_bind_positions(
                 "INSERT INTO t(doc) SELECT JSON_OBJECT(KEY 'id' VALUE :id RETURNING CLOB) FROM dual",
@@ -32195,6 +32243,88 @@ mod mysql_transaction_feedback_tests {
 
     #[test]
     #[ignore = "requires local Oracle listener"]
+    fn oracle_thin_batch_prints_refcursor_with_mixed_scalar_columns() {
+        let procedure_name = format!("OQT_UI_RC_MIXED_{}", std::process::id());
+        let sql = format!(
+            "CREATE OR REPLACE PROCEDURE {procedure_name}(p_rc OUT SYS_REFCURSOR) IS
+             BEGIN
+               OPEN p_rc FOR
+                 SELECT TO_CHAR(DATE '2024-01-02', 'YYYY-MM-DD') AS c_text_func,
+                        CAST('plain varchar' AS VARCHAR2(30)) AS c_varchar,
+                        CAST(42 AS NUMBER) AS c_number,
+                        TIMESTAMP '2024-01-02 03:04:05.123456' AS c_timestamp,
+                        DATE '2024-01-03' AS c_date
+                 FROM dual;
+             END;
+             /
+             VAR v_rc REFCURSOR
+             BEGIN
+               {procedure_name}(:v_rc);
+             END;
+             /
+             PRINT v_rc
+             DROP PROCEDURE {procedure_name}
+             /
+             "
+        );
+        let progress = oracle_thin_run_script(&sql);
+        let failures = oracle_thin_progress_failures(&progress);
+        assert!(failures.is_empty(), "failures: {failures:?}");
+
+        let index = progress
+            .iter()
+            .find_map(|event| match event {
+                QueryProgress::StatementFinished { index, result, .. }
+                    if result.success
+                        && result.is_select
+                        && result.sql.trim() == "REFCURSOR :V_RC" =>
+                {
+                    Some(*index)
+                }
+                _ => None,
+            })
+            .expect("PRINT v_rc should emit refcursor grid");
+        let mut columns = Vec::new();
+        let mut rows = Vec::new();
+        for event in &progress {
+            match event {
+                QueryProgress::SelectStart {
+                    index: row_index,
+                    columns: event_columns,
+                    ..
+                } if *row_index == index => columns = event_columns.clone(),
+                QueryProgress::Rows {
+                    index: row_index,
+                    rows: event_rows,
+                } if *row_index == index => rows.extend(event_rows.clone()),
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            columns,
+            vec![
+                "C_TEXT_FUNC".to_string(),
+                "C_VARCHAR".to_string(),
+                "C_NUMBER".to_string(),
+                "C_TIMESTAMP".to_string(),
+                "C_DATE".to_string(),
+            ]
+        );
+        assert_eq!(
+            rows,
+            vec![vec![
+                "2024-01-02".to_string(),
+                "plain varchar".to_string(),
+                "42".to_string(),
+                "2024-01-02 03:04:05.123456".to_string(),
+                "2024-01-03 00:00:00".to_string(),
+            ]]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle listener"]
     fn oracle_thin_query_tool_runtime_uses_scalar_bind_values_in_select() {
         let mut conn =
             tns_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
@@ -32446,6 +32576,118 @@ mod mysql_transaction_feedback_tests {
         assert!(matches!(
             guard.binds.get("VAL_2").map(|bind| &bind.value),
             Some(BindValue::Scalar(Some(value))) if value == "alpha"
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle listener"]
+    fn oracle_thin_query_tool_runtime_updates_non_ascii_dml_returning_bind() {
+        let mut conn =
+            tns_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
+        SqlEditorWidget::ensure_oracle_thin_runtime(&mut conn).expect("install runtime");
+        let table = format!("OQT_THIN_RET_NONASCII_{}", std::process::id());
+        let _ = SqlEditorWidget::execute_oracle_thin_statement(
+            &mut conn,
+            format!("DROP TABLE {table} PURGE"),
+            false,
+        );
+        SqlEditorWidget::execute_oracle_thin_statement(
+            &mut conn,
+            format!("CREATE TABLE {table} (id NUMBER PRIMARY KEY)"),
+            false,
+        )
+        .expect("create table");
+
+        let session = Arc::new(Mutex::new(SessionState::default()));
+        {
+            let mut guard = session.lock().expect("session lock");
+            let mut id_in = BindVar::new(BindDataType::Number);
+            id_in.value = BindValue::Scalar(Some("7".to_string()));
+            guard.binds.insert("INT_VAL".to_string(), id_in);
+            guard.binds.insert(
+                "M\u{00C9}IL".to_string(),
+                BindVar::new(BindDataType::Number),
+            );
+        }
+
+        let messages = SqlEditorWidget::execute_oracle_thin_statement_with_binds(
+            &mut conn,
+            &format!("INSERT INTO {table} (id) VALUES (:int_val) RETURNING id INTO :m\u{00E9}il"),
+            &session,
+            false,
+        )
+        .expect("execute DML RETURNING with non-ASCII bind");
+        let _ = SqlEditorWidget::execute_oracle_thin_statement(
+            &mut conn,
+            format!("DROP TABLE {table} PURGE"),
+            false,
+        );
+
+        assert!(messages.iter().any(|line| line == ":M\u{00C9}IL = 7"));
+        let guard = session.lock().expect("session lock");
+        assert!(matches!(
+            guard.binds.get("M\u{00C9}IL").map(|bind| &bind.value),
+            Some(BindValue::Scalar(Some(value))) if value == "7"
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle listener"]
+    fn oracle_thin_query_tool_runtime_updates_clob_dml_returning_bind() {
+        let mut conn =
+            tns_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
+        SqlEditorWidget::ensure_oracle_thin_runtime(&mut conn).expect("install runtime");
+        let table = format!("OQT_THIN_RET_CLOB_{}", std::process::id());
+        let _ = SqlEditorWidget::execute_oracle_thin_statement(
+            &mut conn,
+            format!("DROP TABLE {table} PURGE"),
+            false,
+        );
+        SqlEditorWidget::execute_oracle_thin_statement(
+            &mut conn,
+            format!("CREATE TABLE {table} (id NUMBER PRIMARY KEY, clob_col CLOB)"),
+            false,
+        )
+        .expect("create table");
+
+        let clob_value = "A short CLOB - UI RETURNING";
+        let session = Arc::new(Mutex::new(SessionState::default()));
+        {
+            let mut guard = session.lock().expect("session lock");
+            let mut id_in = BindVar::new(BindDataType::Number);
+            id_in.value = BindValue::Scalar(Some("1".to_string()));
+            guard.binds.insert("ID_IN".to_string(), id_in);
+            let mut clob_in = BindVar::new(BindDataType::Clob);
+            clob_in.value = BindValue::Scalar(Some(clob_value.to_string()));
+            guard.binds.insert("CLOB_IN".to_string(), clob_in);
+            guard
+                .binds
+                .insert("CLOB_OUT".to_string(), BindVar::new(BindDataType::Clob));
+        }
+
+        let messages = SqlEditorWidget::execute_oracle_thin_statement_with_binds(
+            &mut conn,
+            &format!(
+                "INSERT INTO {table} (id, clob_col) VALUES (:id_in, :clob_in) \
+                 RETURNING clob_col INTO :clob_out"
+            ),
+            &session,
+            false,
+        )
+        .expect("execute DML RETURNING with CLOB bind");
+        let _ = SqlEditorWidget::execute_oracle_thin_statement(
+            &mut conn,
+            format!("DROP TABLE {table} PURGE"),
+            false,
+        );
+
+        assert!(messages
+            .iter()
+            .any(|line| line == &format!(":CLOB_OUT = {clob_value}")));
+        let guard = session.lock().expect("session lock");
+        assert!(matches!(
+            guard.binds.get("CLOB_OUT").map(|bind| &bind.value),
+            Some(BindValue::Scalar(Some(value))) if value == clob_value
         ));
     }
 

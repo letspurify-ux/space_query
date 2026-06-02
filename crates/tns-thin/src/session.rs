@@ -395,6 +395,7 @@ pub struct OracleThinCapabilities {
     pub supports_oob: bool,
     pub supports_oob_check: bool,
     pub supports_big_clr_chunks: bool,
+    auth_uses_pbkdf2_key_derivation: bool,
     sdu: usize,
     server_ttc_field_version: u8,
     supports_end_of_call_status: bool,
@@ -417,6 +418,7 @@ impl Default for OracleThinCapabilities {
             supports_oob: false,
             supports_oob_check: false,
             supports_big_clr_chunks: false,
+            auth_uses_pbkdf2_key_derivation: false,
             sdu: TNS_DEFAULT_SDU,
             server_ttc_field_version: 0,
             supports_end_of_call_status: true,
@@ -647,9 +649,9 @@ impl OracleThinSession {
     pub fn execute_typed(
         &mut self,
         request: &StatementRequest,
-        _column_types: &[OracleColumnType],
+        column_types: &[OracleColumnType],
     ) -> Result<QueryResult, OracleThinError> {
-        let result = self.execute_request(request)?.result;
+        let result = self.execute_typed_response(request, column_types)?.result;
         self.remember_last_row_for_open_fetch(&result);
         Ok(result)
     }
@@ -657,9 +659,9 @@ impl OracleThinSession {
     pub fn execute_typed_with_implicit(
         &mut self,
         request: &StatementRequest,
-        _column_types: &[OracleColumnType],
+        column_types: &[OracleColumnType],
     ) -> Result<ExecuteWithImplicitResult, OracleThinError> {
-        let response = self.execute_request(request)?;
+        let response = self.execute_typed_response(request, column_types)?;
         let result = response.result;
         self.remember_last_row_for_open_fetch(&result);
         Ok(ExecuteWithImplicitResult {
@@ -668,27 +670,50 @@ impl OracleThinSession {
         })
     }
 
+    fn execute_typed_response(
+        &mut self,
+        request: &StatementRequest,
+        column_types: &[OracleColumnType],
+    ) -> Result<ExecuteResponse, OracleThinError> {
+        if !column_types_require_define_fetch_for_values(column_types) {
+            return self.execute_request(request);
+        }
+
+        let mut request_without_prefetch = request.clone();
+        request_without_prefetch.prefetch_rows = 0;
+        let mut response = self.execute_request_without_prefetch(&request_without_prefetch)?;
+        let Some(cursor_id) = response.result.cursor_id else {
+            return Ok(response);
+        };
+        if response.result.exhausted {
+            return Ok(response);
+        }
+
+        let batch = self.define_and_fetch_typed(cursor_id, request.fetch_array_size, column_types)?;
+        let no_rows = batch.rows.is_empty();
+        response.result.rows.extend(batch.rows);
+        response.result.exhausted = batch.exhausted || batch.cursor_id.is_none() || no_rows;
+        response.result.cursor_id = batch.cursor_id;
+        Ok(response)
+    }
+
     pub fn execute_typed_fetch_all(
         &mut self,
         request: &StatementRequest,
         column_types: &[OracleColumnType],
     ) -> Result<QueryResult, OracleThinError> {
-        let mut result = self.execute_typed(request, column_types)?;
+        let requires_define_fetch = column_types_require_define_fetch_for_values(column_types);
+        let mut result = if requires_define_fetch {
+            let mut request = request.clone();
+            request.prefetch_rows = 0;
+            self.execute_request_without_prefetch(&request)?.result
+        } else {
+            self.execute_typed(request, column_types)?
+        };
         let Some(cursor_id) = result.cursor_id else {
             return Ok(result);
         };
-        let mut needs_define_fetch = column_types.iter().any(|column_type| {
-            matches!(
-                column_type,
-                OracleColumnType::Long
-                    | OracleColumnType::Clob
-                    | OracleColumnType::Nclob
-                    | OracleColumnType::Blob
-                    | OracleColumnType::Bfile
-                    | OracleColumnType::Vector
-                    | OracleColumnType::Json
-            )
-        });
+        let mut needs_define_fetch = requires_define_fetch;
         while !result.exhausted {
             let batch = if needs_define_fetch {
                 needs_define_fetch = false;
@@ -717,8 +742,15 @@ impl OracleThinSession {
     pub fn execute_out_binds_with_implicit(
         &mut self,
         request: &StatementRequest,
-        _bind_types: &[OracleColumnType],
+        bind_types: &[OracleColumnType],
     ) -> Result<OutBindResult, OracleThinError> {
+        let typed_request;
+        let request = if request.binds.is_empty() && !bind_types.is_empty() {
+            typed_request = request_with_out_bind_types(request, bind_types);
+            &typed_request
+        } else {
+            request
+        };
         let response = self.execute_request(request)?;
         let rows = if response.out_bind_rows.is_empty() {
             response
@@ -1188,11 +1220,24 @@ impl OracleThinSession {
             &payload,
         )?;
         log_connect_phase(&format!("ttc-{operation}-read"), "");
-        read_simple_response(
+        let response = read_simple_response(
             &mut self.stream,
             &self.capabilities,
             !pending_cursor_closes.is_empty(),
-        )
+        );
+        match response {
+            Ok(()) => {
+                self.cancel_flag.store(false, Ordering::SeqCst);
+                Ok(())
+            }
+            Err(error) if self.cancel_flag.swap(false, Ordering::SeqCst) => {
+                self.broken = true;
+                Err(OracleThinError::new(
+                    "ORA-01013: user requested cancel of current operation",
+                ))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn next_ttc_sequence(&mut self) -> u8 {
@@ -1268,6 +1313,7 @@ fn capabilities_from_accept(
         supports_oob: accept.supports_oob_attention(),
         supports_oob_check: accept.supports_oob_check(),
         supports_big_clr_chunks: accept.protocol_version >= TNS_VERSION_MIN_ACCEPTED,
+        auth_uses_pbkdf2_key_derivation: false,
         sdu: usize::try_from(accept.sdu).unwrap_or(TNS_DEFAULT_SDU),
         server_ttc_field_version: 0,
         supports_end_of_call_status: true,
@@ -1453,16 +1499,27 @@ fn rows_contain_ref_cursor(rows: &[Vec<OracleValue>]) -> bool {
 
 fn columns_require_define_fetch_for_values(columns: &[ColumnMetadata]) -> bool {
     columns.iter().any(|column| {
-        matches!(
-            column.column_type,
-            OracleColumnType::Long
-                | OracleColumnType::Clob
-                | OracleColumnType::Nclob
-                | OracleColumnType::Blob
-                | OracleColumnType::Vector
-                | OracleColumnType::Json
-        )
+        column_type_requires_define_fetch_for_value(column.column_type)
     })
+}
+
+fn column_types_require_define_fetch_for_values(column_types: &[OracleColumnType]) -> bool {
+    column_types
+        .iter()
+        .copied()
+        .any(column_type_requires_define_fetch_for_value)
+}
+
+fn column_type_requires_define_fetch_for_value(column_type: OracleColumnType) -> bool {
+    matches!(
+        column_type,
+        OracleColumnType::Long
+            | OracleColumnType::Clob
+            | OracleColumnType::Nclob
+            | OracleColumnType::Blob
+            | OracleColumnType::Vector
+            | OracleColumnType::Json
+    )
 }
 
 #[derive(Debug, Default)]
@@ -2024,13 +2081,46 @@ fn write_column_metadata(
 fn write_bind_rows(
     payload: &mut Vec<u8>,
     capabilities: &OracleThinCapabilities,
+    is_plsql: bool,
     binds: &[BindValue],
 ) -> Result<(), OracleThinError> {
     payload.push(TNS_MSG_TYPE_ROW_DATA);
-    for bind in binds {
+    write_bind_values_for_row(payload, capabilities, is_plsql, binds.iter())
+}
+
+fn write_bind_values_for_row<'a, I>(
+    payload: &mut Vec<u8>,
+    capabilities: &OracleThinCapabilities,
+    is_plsql: bool,
+    binds: I,
+) -> Result<(), OracleThinError>
+where
+    I: IntoIterator<Item = &'a BindValue>,
+{
+    let binds = binds.into_iter().collect::<Vec<_>>();
+    for bind in binds
+        .iter()
+        .copied()
+        .filter(|bind| !bind_is_deferred_long_for_sql(capabilities, is_plsql, bind))
+    {
+        write_bind_value(payload, capabilities, bind)?;
+    }
+    for bind in binds
+        .iter()
+        .copied()
+        .filter(|bind| bind_is_deferred_long_for_sql(capabilities, is_plsql, bind))
+    {
         write_bind_value(payload, capabilities, bind)?;
     }
     Ok(())
+}
+
+fn bind_is_deferred_long_for_sql(
+    capabilities: &OracleThinCapabilities,
+    is_plsql: bool,
+    bind: &BindValue,
+) -> bool {
+    !is_plsql && bind_column_metadata(bind).buffer_size > capabilities.max_string_size
 }
 
 fn write_bind_rows_for_request(
@@ -2039,7 +2129,7 @@ fn write_bind_rows_for_request(
     request: &StatementRequest,
 ) -> Result<(), OracleThinError> {
     if !request_is_dml_returning(request) {
-        return write_bind_rows(payload, capabilities, &request.binds);
+        return write_bind_rows(payload, capabilities, request.is_plsql, &request.binds);
     }
     let input_binds = request
         .binds
@@ -2050,10 +2140,7 @@ fn write_bind_rows_for_request(
         return Ok(());
     }
     payload.push(TNS_MSG_TYPE_ROW_DATA);
-    for bind in input_binds {
-        write_bind_value(payload, capabilities, bind)?;
-    }
-    Ok(())
+    write_bind_values_for_row(payload, capabilities, request.is_plsql, input_binds)
 }
 
 fn bind_can_return_value(bind: &BindValue) -> bool {
@@ -2071,6 +2158,14 @@ fn write_bind_value(
             column_type: OracleColumnType::Boolean,
             ..
         } => write_null_boolean(payload),
+        BindValue::Out {
+            column_type: OracleColumnType::Cursor,
+            ..
+        } => {
+            payload.push(1);
+            payload.push(0);
+            Ok(())
+        }
         BindValue::Null(_) | BindValue::Out { .. } => {
             payload.push(0);
             Ok(())
@@ -2251,6 +2346,7 @@ fn bind_column_metadata(bind: &BindValue) -> ThinColumn {
         OracleColumnType::Cursor => ORA_TYPE_NUM_CURSOR,
         OracleColumnType::IntervalYearMonth => ORA_TYPE_NUM_INTERVAL_YM,
         OracleColumnType::IntervalDaySecond => ORA_TYPE_NUM_INTERVAL_DS,
+        OracleColumnType::Unsupported(ora_type_num) => ora_type_num,
     };
     if bind_uses_timestamp_tz(bind) {
         ora_type_num = ORA_TYPE_NUM_TIMESTAMP_TZ;
@@ -2316,6 +2412,9 @@ fn thin_column_from_column_metadata(column: &ColumnMetadata) -> ThinColumn {
         OracleColumnType::Cursor => BindValue::Null(OracleColumnType::Cursor),
         OracleColumnType::IntervalYearMonth => BindValue::Null(OracleColumnType::IntervalYearMonth),
         OracleColumnType::IntervalDaySecond => BindValue::Null(OracleColumnType::IntervalDaySecond),
+        OracleColumnType::Unsupported(ora_type_num) => {
+            BindValue::Null(OracleColumnType::Unsupported(ora_type_num))
+        }
     };
     let mut thin = bind_column_metadata(&bind_like);
     thin.name = column.name.clone();
@@ -2453,10 +2552,26 @@ fn default_bind_len(column_type: OracleColumnType) -> u32 {
         OracleColumnType::Json => TNS_JSON_MAX_LENGTH,
         OracleColumnType::Xml => TNS_MAX_LONG_LENGTH,
         OracleColumnType::Nclob => 4000,
-        OracleColumnType::Cursor => 1,
+        OracleColumnType::Cursor => 4,
         OracleColumnType::IntervalYearMonth => 5,
         OracleColumnType::IntervalDaySecond => 11,
+        OracleColumnType::Unsupported(_) => 1,
     }
+}
+
+fn request_with_out_bind_types(
+    request: &StatementRequest,
+    bind_types: &[OracleColumnType],
+) -> StatementRequest {
+    let mut request = request.clone();
+    request.binds = bind_types
+        .iter()
+        .map(|column_type| BindValue::Out {
+            column_type: *column_type,
+            max_len: default_bind_len(*column_type),
+        })
+        .collect();
+    request
 }
 
 fn write_oracle_number(payload: &mut Vec<u8>, value: &str) -> Result<(), OracleThinError> {
@@ -3008,12 +3123,15 @@ fn process_describe_body(
 fn adjust_columns_after_define(previous_columns: &[ThinColumn], columns: &mut [ThinColumn]) {
     for (previous, column) in previous_columns.iter().zip(columns.iter_mut()) {
         match (previous.ora_type_num, column.ora_type_num) {
-            (ORA_TYPE_NUM_LONG, ORA_TYPE_NUM_CLOB) => {
+            (
+                ORA_TYPE_NUM_CHAR | ORA_TYPE_NUM_LONG | ORA_TYPE_NUM_VARCHAR,
+                ORA_TYPE_NUM_CLOB,
+            ) => {
                 column.ora_type_num = ORA_TYPE_NUM_LONG;
                 column.column_type = OracleColumnType::Long;
                 column.charset_form = previous.charset_form;
             }
-            (ORA_TYPE_NUM_LONG_RAW, ORA_TYPE_NUM_BLOB) => {
+            (ORA_TYPE_NUM_RAW | ORA_TYPE_NUM_LONG_RAW, ORA_TYPE_NUM_BLOB) => {
                 column.ora_type_num = ORA_TYPE_NUM_LONG_RAW;
                 column.column_type = OracleColumnType::Raw;
             }
@@ -4588,7 +4706,12 @@ fn oracle_column_type_from_ora_type(ora_type_num: u8) -> OracleColumnType {
         ORA_TYPE_NUM_INTERVAL_DS | ORA_TYPE_NUM_INTERVAL_DS_DTY => {
             OracleColumnType::IntervalDaySecond
         }
+        ORA_TYPE_NUM_ROWID | TNS_DATA_TYPE_RDD | ORA_TYPE_NUM_UROWID => OracleColumnType::Varchar,
+        ORA_TYPE_NUM_OBJECT | TNS_DATA_TYPE_EXT_NAMED | TNS_DATA_TYPE_PNTY => {
+            OracleColumnType::Unsupported(ora_type_num)
+        }
         TNS_DATA_TYPE_STR
+        | ORA_TYPE_NUM_VARCHAR
         | TNS_DATA_TYPE_VCS
         | TNS_DATA_TYPE_VBI
         | TNS_DATA_TYPE_LVC
@@ -4600,7 +4723,7 @@ fn oracle_column_type_from_ora_type(ora_type_num: u8) -> OracleColumnType {
         | TNS_DATA_TYPE_ETTZ
         | ORA_TYPE_NUM_CHAR
         | TNS_DATA_TYPE_CHARZ => OracleColumnType::Varchar,
-        _ => OracleColumnType::Varchar,
+        _ => OracleColumnType::Unsupported(ora_type_num),
     }
 }
 
@@ -6107,6 +6230,7 @@ struct AuthState {
     verifier_type: u32,
     combo_key: Option<Vec<u8>>,
     server_version: Option<String>,
+    auth_uses_pbkdf2_key_derivation: bool,
 }
 
 fn authenticate(
@@ -6114,7 +6238,10 @@ fn authenticate(
     config: &OracleThinConfig,
     capabilities: &OracleThinCapabilities,
 ) -> Result<AuthResult, OracleThinError> {
-    let mut state = AuthState::default();
+    let mut state = AuthState {
+        auth_uses_pbkdf2_key_derivation: capabilities.auth_uses_pbkdf2_key_derivation,
+        ..AuthState::default()
+    };
     log_connect_phase("ttc-auth-phase-one-write", "");
     write_auth_phase_one(stream, config, capabilities)?;
     log_connect_phase("ttc-auth-phase-one-read", "");
@@ -6529,37 +6656,80 @@ fn derive_auth_combo_key(
     session_key_part_b: &[u8],
     key_len: usize,
 ) -> Result<Vec<u8>, OracleThinError> {
-    if session_key_part_a.len() == 48 {
-        if session_key_part_b.len() < 40 {
-            return Err(OracleThinError::new(
-                "Oracle authentication session key is shorter than expected",
-            ));
-        }
-        let mut xor_bytes = Vec::with_capacity(24);
-        for i in 16..40 {
-            xor_bytes.push(session_key_part_a[i] ^ session_key_part_b[i]);
-        }
-        let part1 = Md5::digest(&xor_bytes[..16]);
-        let part2 = Md5::digest(&xor_bytes[16..]);
-        let mut combo_key = Vec::with_capacity(32);
-        combo_key.extend_from_slice(&part1);
-        combo_key.extend_from_slice(&part2);
-        combo_key.truncate(key_len);
-        return Ok(combo_key);
+    if state.auth_uses_pbkdf2_key_derivation {
+        return derive_auth_combo_key_pbkdf2(state, session_key_part_a, session_key_part_b, key_len);
     }
+    derive_auth_combo_key_legacy_md5(session_key_part_a, session_key_part_b, key_len)
+}
 
-    if session_key_part_a.len() < key_len || session_key_part_b.len() < key_len {
+fn derive_auth_combo_key_legacy_md5(
+    session_key_part_a: &[u8],
+    session_key_part_b: &[u8],
+    key_len: usize,
+) -> Result<Vec<u8>, OracleThinError> {
+    let start = 16;
+    let xor_len = if key_len > 16 { 24 } else { 16 };
+    if session_key_part_a.len() < start + xor_len || session_key_part_b.len() < start + xor_len {
         return Err(OracleThinError::new(
             "Oracle authentication session key is shorter than expected",
         ));
     }
+
+    let mut xor_bytes = Vec::with_capacity(xor_len);
+    for i in start..start + xor_len {
+        xor_bytes.push(session_key_part_a[i] ^ session_key_part_b[i]);
+    }
+    let part1 = Md5::digest(&xor_bytes[..16]);
+    let mut combo_key = Vec::with_capacity(32);
+    combo_key.extend_from_slice(&part1);
+    if key_len > 16 {
+        let part2 = Md5::digest(&xor_bytes[16..]);
+        combo_key.extend_from_slice(&part2);
+    }
+    combo_key.truncate(key_len);
+    Ok(combo_key)
+}
+
+fn derive_auth_combo_key_pbkdf2(
+    state: &AuthState,
+    session_key_part_a: &[u8],
+    session_key_part_b: &[u8],
+    key_len: usize,
+) -> Result<Vec<u8>, OracleThinError> {
+    let temp_key = match state.verifier_type {
+        TNS_VERIFIER_TYPE_10G => {
+            let half_len = session_key_part_a.len() / 2;
+            if half_len == 0 || session_key_part_b.len() < half_len {
+                return Err(OracleThinError::new(
+                    "Oracle authentication session key is shorter than expected",
+                ));
+            }
+            let mut temp_key = Vec::with_capacity(half_len * 2);
+            temp_key.extend_from_slice(&session_key_part_b[..half_len]);
+            temp_key.extend_from_slice(&session_key_part_a[..half_len]);
+            temp_key
+        }
+        TNS_VERIFIER_TYPE_11G_1 | TNS_VERIFIER_TYPE_11G_2 | TNS_VERIFIER_TYPE_12C => {
+            if session_key_part_a.len() < key_len || session_key_part_b.len() < key_len {
+                return Err(OracleThinError::new(
+                    "Oracle authentication session key is shorter than expected",
+                ));
+            }
+            let mut temp_key = Vec::with_capacity(key_len * 2);
+            temp_key.extend_from_slice(&session_key_part_b[..key_len]);
+            temp_key.extend_from_slice(&session_key_part_a[..key_len]);
+            temp_key
+        }
+        other => {
+            return Err(OracleThinError::new(format!(
+                "unsupported Oracle password verifier type 0x{other:x}"
+            )))
+        }
+    };
     let csk_salt = hex_decode(required_session_value(state, "AUTH_PBKDF2_CSK_SALT")?)?;
     let sder_count = required_session_value(state, "AUTH_PBKDF2_SDER_COUNT")?
         .parse::<u32>()
         .map_err(|err| OracleThinError::new(format!("invalid AUTH_PBKDF2_SDER_COUNT: {err}")))?;
-    let mut temp_key = Vec::with_capacity(key_len * 2);
-    temp_key.extend_from_slice(&session_key_part_b[..key_len]);
-    temp_key.extend_from_slice(&session_key_part_a[..key_len]);
     let temp_key_hex = hex_encode_upper(&temp_key);
     let mut combo_key = vec![0u8; key_len];
     pbkdf2_hmac::<Sha512>(
@@ -7086,6 +7256,8 @@ fn adjust_for_server_compile_caps(capabilities: &mut OracleThinCapabilities, ser
     capabilities.supports_fast_session_attributes = server_caps
         .get(TNS_CCAP_OCI1)
         .is_some_and(|value| value & TNS_CCAP_LEGACY_FAST_SESSION_ATTRIBUTES != 0);
+    capabilities.auth_uses_pbkdf2_key_derivation =
+        server_caps.get(4).is_some_and(|value| value & 0x20 != 0);
     if server_caps
         .get(TNS_CCAP_TTC4)
         .is_some_and(|value| value & TNS_CCAP_EXPLICIT_BOUNDARY != 0)
@@ -7873,7 +8045,7 @@ fn bind_count(request: &StatementRequest) -> usize {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::{atomic::AtomicBool, Arc};
     use std::time::{Duration, Instant};
@@ -7888,41 +8060,55 @@ mod tests {
         encode_oracle_timestamp_bind, encode_oson_json, encode_physical_rowid,
         generate_10g_password_hash, generate_11g_password_hash,
         generate_auth_credentials_from_session_key_parts, hex_encode_upper,
-        legacy_json_serialized_query, local_timezone_offset_string, oracle_column_type_from_ora_type,
-        process_auth_payload, process_describe_body, process_legacy_execute_error,
-        process_protocol_message, process_row_data, execute_flags_for_request,
-        read_boolean_value, read_data_packet_with_control, read_data_packet_with_flags,
-        read_rowid_value, read_urowid_value, request_is_dml_returning,
-        thin_column_from_column_metadata, validate_supported_protocol, verify_server_response,
-        windows_code_pages_for_encoding, write_bind_value, write_bytes_with_length_for_capabilities,
-        write_bind_rows_for_request, write_bytes_with_two_lengths, write_column_metadata,
+        legacy_json_serialized_query, local_timezone_offset_string,
+        oracle_column_type_from_ora_type, process_auth_payload, process_describe_body,
+        process_legacy_execute_error, process_protocol_message, process_row_data,
+        execute_flags_for_request, read_boolean_value, read_data_packet_with_control,
+        read_data_packet_with_flags, read_rowid_value, read_urowid_value, request_is_dml_returning,
+        request_with_out_bind_types, thin_column_from_column_metadata, validate_supported_protocol,
+        verify_server_response, windows_code_pages_for_encoding, write_bind_value,
+        write_bytes_with_length_for_capabilities, write_bind_rows_for_request,
+        write_bytes_with_two_lengths, write_column_metadata, write_data_packet,
         write_data_type_representations, write_ub2, write_ub4, write_ub8, AuthState,
         OracleThinCapabilities, OracleThinConfig, OracleThinSession, OracleValue, PacketCursor,
-        ThinColumn, CS_FORM_IMPLICIT, CS_FORM_NCHAR, ORACLE_CHARSET_AL32UTF8,
+        ThinColumn, CS_FORM_IMPLICIT,
+        CS_FORM_NCHAR, ORACLE_CHARSET_AL32UTF8,
         ORACLE_CHARSET_JA16SJIS, ORACLE_CHARSET_KO16KSC5601, ORACLE_CHARSET_KO16MSWIN949,
         ORACLE_CHARSET_UTF8, ORACLE_CHARSET_ZHS16GBK, ORACLE_CHARSET_ZHT16BIG5,
         TNS_CCAP_END_OF_CALL_STATUS, TNS_CCAP_END_OF_RESPONSE, TNS_CCAP_EXPLICIT_BOUNDARY,
         TNS_CCAP_FIELD_VERSION, TNS_CCAP_FIELD_VERSION_20_1,
         TNS_CCAP_LEGACY_FAST_SESSION_ATTRIBUTES, TNS_CCAP_OCI1, TNS_CCAP_TTC1, TNS_CCAP_TTC4,
-        TNS_ESCAPE_CHAR, TNS_JSON_BIND_TYPE_OID, TNS_JSON_MAX_LENGTH, TNS_LEGACY_CLR_CHUNK_SIZE,
-        TNS_MSG_TYPE_ERROR, TNS_MSG_TYPE_PARAMETER, TNS_MSG_TYPE_PROTOCOL,
-        TNS_MSG_TYPE_SERVER_SIDE_PIGGYBACK, TNS_OBJ_NO_PREFIX_SEG, TNS_RCAP_TTC, TNS_RCAP_TTC_32K,
-        TNS_RCAP_TTC_SESSION_STATE_OPS, TNS_RCAP_TTC_ZERO_COPY, TNS_SERVER_PIGGYBACK_TRACE_EVENT,
-        TNS_VERIFIER_TYPE_10G, TNS_VERIFIER_TYPE_11G_2, TNS_XML_TYPE_STRING,
+        TNS_ESCAPE_CHAR, TNS_FUNC_COMMIT, TNS_JSON_BIND_TYPE_OID, TNS_JSON_MAX_LENGTH,
+        TNS_LEGACY_CLR_CHUNK_SIZE, TNS_MSG_TYPE_ERROR, TNS_MSG_TYPE_PARAMETER,
+        TNS_MSG_TYPE_PROTOCOL, TNS_MSG_TYPE_ROW_DATA, TNS_MSG_TYPE_SERVER_SIDE_PIGGYBACK,
+        TNS_OBJ_NO_PREFIX_SEG, TNS_RCAP_TTC, TNS_RCAP_TTC_32K, TNS_RCAP_TTC_SESSION_STATE_OPS,
+        TNS_RCAP_TTC_ZERO_COPY, TNS_SERVER_PIGGYBACK_TRACE_EVENT, TNS_VERIFIER_TYPE_10G,
+        TNS_VERIFIER_TYPE_11G_1, TNS_VERIFIER_TYPE_11G_2, TNS_VERIFIER_TYPE_12C,
+        TNS_XML_TYPE_STRING,
     };
     use super::{
-        bind_column_metadata, ExecuteReadState, DATA_TYPE_REPRESENTATIONS, ORA_TYPE_NUM_BFILE,
-        ORA_TYPE_NUM_BINARY_FLOAT, ORA_TYPE_NUM_BLOB, ORA_TYPE_NUM_CLOB, ORA_TYPE_NUM_DJSON,
-        ORA_TYPE_NUM_INTERVAL_DS, ORA_TYPE_NUM_JSON, ORA_TYPE_NUM_LONG, ORA_TYPE_NUM_OBJECT,
-        ORA_TYPE_NUM_ROWID, ORA_TYPE_NUM_TIMESTAMP_LTZ, ORA_TYPE_NUM_TIMESTAMP_TZ,
+        adjust_columns_after_define, bind_column_metadata,
+        column_types_require_define_fetch_for_values, ExecuteReadState, DATA_TYPE_REPRESENTATIONS,
+        ORA_TYPE_NUM_BFILE, ORA_TYPE_NUM_BINARY_FLOAT, ORA_TYPE_NUM_BLOB, ORA_TYPE_NUM_CLOB,
+        ORA_TYPE_NUM_CURSOR, ORA_TYPE_NUM_DATE, ORA_TYPE_NUM_DBFILE, ORA_TYPE_NUM_DJSON,
+        ORA_TYPE_NUM_CHAR, ORA_TYPE_NUM_INTERVAL_DS, ORA_TYPE_NUM_JSON, ORA_TYPE_NUM_LONG,
+        ORA_TYPE_NUM_LONG_RAW, ORA_TYPE_NUM_OBJECT, ORA_TYPE_NUM_RAW, ORA_TYPE_NUM_ROWID,
+        ORA_TYPE_NUM_NUMBER, ORA_TYPE_NUM_TIMESTAMP_LTZ, ORA_TYPE_NUM_TIMESTAMP_TZ,
         ORA_TYPE_NUM_TIMESTAMP_TZ_EXT, ORA_TYPE_NUM_UROWID, ORA_TYPE_NUM_VARCHAR,
-        ORA_TYPE_NUM_VECTOR, TNS_BIND_USE_INDICATORS, TNS_CONTROL_TYPE_INBAND_NOTIFICATION,
-        TNS_CONTROL_TYPE_RESET_OOB, TNS_DATA_FLAGS_EOF, TNS_DATA_TYPE_CFILE, TNS_DATA_TYPE_CLV,
-        TNS_DATA_TYPE_DBLOB, TNS_DATA_TYPE_DCLOB, TNS_DATA_TYPE_DTR, TNS_DATA_TYPE_LVB,
-        TNS_DATA_TYPE_ODT, TNS_DATA_TYPE_RDD, TNS_DATA_TYPE_RSET, TNS_DATA_TYPE_TIME,
-        TNS_DATA_TYPE_TIME_TZ, TNS_DATA_TYPE_UB8, TNS_DATA_TYPE_VCS, TNS_ERR_INBAND_MESSAGE,
-        TNS_EXEC_FLAGS_IMPLICIT_RESULTSET, TNS_LOB_PREFETCH_FLAG, TNS_MAX_LONG_LENGTH,
-        TNS_PACKET_TYPE_CONTROL, TNS_PACKET_TYPE_DATA,
+        ORA_TYPE_NUM_VECTOR,
+        TNS_BIND_USE_INDICATORS, TNS_CONTROL_TYPE_INBAND_NOTIFICATION, TNS_CONTROL_TYPE_RESET_OOB,
+        TNS_DATA_FLAGS_EOF, TNS_DATA_TYPE_BINARY_INTEGER, TNS_DATA_TYPE_CFILE,
+        TNS_DATA_TYPE_CLV, TNS_DATA_TYPE_DBLOB, TNS_DATA_TYPE_DCLOB, TNS_DATA_TYPE_DOL,
+        TNS_DATA_TYPE_DOP, TNS_DATA_TYPE_DTR, TNS_DATA_TYPE_DUN, TNS_DATA_TYPE_EDATE,
+        TNS_DATA_TYPE_EXT_NAMED, TNS_DATA_TYPE_FLOAT, TNS_DATA_TYPE_LVB, TNS_DATA_TYPE_LVC,
+        TNS_DATA_TYPE_ODT, TNS_DATA_TYPE_PDN, TNS_DATA_TYPE_PNTY, TNS_DATA_TYPE_RDD,
+        TNS_DATA_TYPE_RSET, TNS_DATA_TYPE_SLS, TNS_DATA_TYPE_STR, TNS_DATA_TYPE_TIME,
+        TNS_DATA_TYPE_TIME_TZ, TNS_DATA_TYPE_UB8, TNS_DATA_TYPE_UIN, TNS_DATA_TYPE_VBI,
+        TNS_DATA_TYPE_VCS, TNS_DATA_TYPE_VNU, TNS_DATA_TYPE_VST,
+        TNS_DATA_FLAGS_END_OF_RESPONSE, TNS_ERR_INBAND_MESSAGE,
+        TNS_EXEC_FLAGS_IMPLICIT_RESULTSET, TNS_LOB_PREFETCH_FLAG, TNS_MARKER_TYPE_BREAK,
+        TNS_MARKER_TYPE_RESET, TNS_MAX_LONG_LENGTH, TNS_MSG_TYPE_END_OF_RESPONSE,
+        TNS_PACKET_TYPE_CONTROL, TNS_PACKET_TYPE_DATA, TNS_PACKET_TYPE_MARKER,
     };
     use crate::connect::{AcceptInfo, ConnectOptions, ConnectTarget};
     use crate::exec::{
@@ -7959,6 +8145,226 @@ mod tests {
         packet[4] = packet_type;
         packet.extend_from_slice(body);
         packet
+    }
+
+    fn read_one_tns_test_packet(stream: &mut TcpStream, protocol_version: u16) {
+        let mut header = [0u8; 8];
+        stream.read_exact(&mut header).unwrap();
+        let size = if protocol_version >= 315 {
+            u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize
+        } else {
+            u16::from_be_bytes([header[0], header[1]]) as usize
+        };
+        let mut body = vec![0u8; size - 8];
+        stream.read_exact(&mut body).unwrap();
+    }
+
+    #[test]
+    fn write_data_packet_uses_protocol_specific_length_and_data_flags_for_chunks() {
+        for protocol_version in [314, 315, 318, 319] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut packets = Vec::new();
+                for _ in 0..3 {
+                    let mut header = [0u8; 8];
+                    stream.read_exact(&mut header).unwrap();
+                    let size = if protocol_version >= 315 {
+                        u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize
+                    } else {
+                        u16::from_be_bytes([header[0], header[1]]) as usize
+                    };
+                    let mut body = vec![0u8; size - 8];
+                    stream.read_exact(&mut body).unwrap();
+                    packets.push((header, body));
+                }
+                packets
+            });
+            let mut stream = TcpStream::connect(addr).unwrap();
+
+            write_data_packet(&mut stream, protocol_version, 2, &[1, 2, 3, 4, 5]).unwrap();
+            drop(stream);
+            let packets = server.join().unwrap();
+
+            for (index, ((header, body), expected_payload)) in
+                packets.iter().zip([&[1, 2][..], &[3, 4][..], &[5][..]]).enumerate()
+            {
+                let expected_size = 10 + expected_payload.len();
+                if protocol_version >= 315 {
+                    assert_eq!(
+                        u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize,
+                        expected_size,
+                        "{protocol_version} packet {index}"
+                    );
+                } else {
+                    assert_eq!(
+                        u16::from_be_bytes([header[0], header[1]]) as usize,
+                        expected_size,
+                        "{protocol_version} packet {index}"
+                    );
+                }
+                assert_eq!(header[4], TNS_PACKET_TYPE_DATA, "{protocol_version} packet {index}");
+                assert_eq!(&body[0..2], &[0, 0], "{protocol_version} packet {index}");
+                assert_eq!(&body[2..], expected_payload, "{protocol_version} packet {index}");
+            }
+        }
+    }
+
+    #[test]
+    fn read_data_packet_converts_reset_marker_to_end_of_response_for_all_protocols() {
+        for protocol_version in [314, 315, 318, 319] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .write_all(&tns_test_packet(
+                        protocol_version,
+                        TNS_PACKET_TYPE_MARKER,
+                        &[1, 0, TNS_MARKER_TYPE_RESET],
+                    ))
+                    .unwrap();
+            });
+            let stream = TcpStream::connect(addr).unwrap();
+            let mut session = test_session_with_stream(stream);
+
+            let (flags, payload) =
+                read_data_packet_with_flags(&mut session.stream, protocol_version).unwrap();
+
+            assert_eq!(
+                flags, TNS_DATA_FLAGS_END_OF_RESPONSE,
+                "{protocol_version}"
+            );
+            assert_eq!(
+                payload,
+                vec![TNS_MSG_TYPE_END_OF_RESPONSE],
+                "{protocol_version}"
+            );
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn read_data_packet_replies_to_break_marker_and_continues_for_all_protocols() {
+        for protocol_version in [314, 315, 318, 319] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .write_all(&tns_test_packet(
+                        protocol_version,
+                        TNS_PACKET_TYPE_MARKER,
+                        &[1, 0, TNS_MARKER_TYPE_BREAK],
+                    ))
+                    .unwrap();
+
+                let mut header = [0u8; 8];
+                stream.read_exact(&mut header).unwrap();
+                let size = if protocol_version >= 315 {
+                    u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize
+                } else {
+                    u16::from_be_bytes([header[0], header[1]]) as usize
+                };
+                let mut body = vec![0u8; size - 8];
+                stream.read_exact(&mut body).unwrap();
+                assert_eq!(header[4], TNS_PACKET_TYPE_MARKER, "{protocol_version}");
+                assert_eq!(body, vec![1, 0, TNS_MARKER_TYPE_RESET], "{protocol_version}");
+
+                let mut data_body = Vec::new();
+                data_body.extend_from_slice(&TNS_DATA_FLAGS_EOF.to_be_bytes());
+                data_body.extend_from_slice(&[0xaa, 0xbb]);
+                stream
+                    .write_all(&tns_test_packet(
+                        protocol_version,
+                        TNS_PACKET_TYPE_DATA,
+                        &data_body,
+                    ))
+                    .unwrap();
+            });
+            let stream = TcpStream::connect(addr).unwrap();
+            let mut session = test_session_with_stream(stream);
+
+            let (flags, payload) =
+                read_data_packet_with_flags(&mut session.stream, protocol_version).unwrap();
+
+            assert_eq!(flags, TNS_DATA_FLAGS_EOF, "{protocol_version}");
+            assert_eq!(payload, vec![0xaa, 0xbb], "{protocol_version}");
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn cancelled_execute_read_error_marks_session_broken_and_returns_ora_01013() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_one_tns_test_packet(&mut stream, 319);
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut session = test_session_with_stream(stream);
+        session.cancel_handle().force_close();
+
+        let err = session
+            .execute_request(&StatementRequest::query("SELECT * FROM dual", 1))
+            .expect_err("cancelled execute read should fail");
+
+        assert!(
+            err.to_string().contains("ORA-01013"),
+            "unexpected cancel error: {err}"
+        );
+        assert!(session.is_broken());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn cancelled_fetch_read_error_marks_session_broken_and_returns_ora_01013() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_one_tns_test_packet(&mut stream, 319);
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut session = test_session_with_stream(stream);
+        session.cancel_handle().force_close();
+
+        let err = session
+            .fetch_ref_cursor_batch(7, &[], 1, false)
+            .expect_err("cancelled fetch read should fail");
+
+        assert!(
+            err.to_string().contains("ORA-01013"),
+            "unexpected cancel error: {err}"
+        );
+        assert!(session.is_broken());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn cancelled_simple_ttc_call_read_error_marks_session_broken_and_returns_ora_01013() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_one_tns_test_packet(&mut stream, 319);
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut session = test_session_with_stream(stream);
+        session.cancel_handle().force_close();
+
+        let err = session
+            .simple_ttc_call(TNS_FUNC_COMMIT, "commit")
+            .expect_err("cancelled simple TTC call should fail");
+
+        assert!(
+            err.to_string().contains("ORA-01013"),
+            "unexpected cancel error: {err}"
+        );
+        assert!(session.is_broken());
+        server.join().unwrap();
     }
 
     #[test]
@@ -8178,6 +8584,155 @@ mod tests {
     }
 
     #[test]
+    fn ref_cursor_out_bind_rows_use_vendor_empty_cursor_handle() {
+        let mut request = StatementRequest::statement("BEGIN p(:1); END;");
+        request.binds.push(BindValue::Out {
+            column_type: OracleColumnType::Cursor,
+            max_len: 4,
+        });
+
+        let mut payload = Vec::new();
+        write_bind_rows_for_request(&mut payload, &OracleThinCapabilities::default(), &request)
+            .expect("write REF CURSOR OUT bind rows");
+
+        assert_eq!(payload, vec![TNS_MSG_TYPE_ROW_DATA, 1, 0]);
+    }
+
+    #[test]
+    fn ref_cursor_out_bind_metadata_uses_vendor_cursor_shape() {
+        let column = bind_column_metadata(&BindValue::Out {
+            column_type: OracleColumnType::Cursor,
+            max_len: 1,
+        });
+
+        assert_eq!(column.ora_type_num, ORA_TYPE_NUM_CURSOR);
+        assert_eq!(column.buffer_size, 4);
+        assert_eq!(column.charset_form, 0);
+    }
+
+    #[test]
+    fn out_bind_type_fallback_builds_out_binds_when_request_has_none() {
+        let request = StatementRequest::statement("BEGIN p(:1, :2); END;");
+        let request = request_with_out_bind_types(
+            &request,
+            &[OracleColumnType::Varchar, OracleColumnType::Cursor],
+        );
+
+        assert_eq!(
+            request.binds,
+            vec![
+                BindValue::Out {
+                    column_type: OracleColumnType::Varchar,
+                    max_len: 4000,
+                },
+                BindValue::Out {
+                    column_type: OracleColumnType::Cursor,
+                    max_len: 4,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn typed_value_fetch_define_requirements_match_vendor_no_prefetch_types() {
+        assert!(column_types_require_define_fetch_for_values(&[
+            OracleColumnType::Varchar,
+            OracleColumnType::Clob,
+        ]));
+        assert!(column_types_require_define_fetch_for_values(&[
+            OracleColumnType::Blob,
+            OracleColumnType::Json,
+            OracleColumnType::Vector,
+        ]));
+        assert!(!column_types_require_define_fetch_for_values(&[
+            OracleColumnType::Varchar,
+            OracleColumnType::Number,
+            OracleColumnType::Timestamp,
+            OracleColumnType::Bfile,
+            OracleColumnType::Cursor,
+        ]));
+    }
+
+    #[test]
+    fn adjust_columns_after_define_matches_vendor_lob_redescribe_rules() {
+        let previous_columns = vec![
+            ThinColumn {
+                name: "C_CHAR".to_string(),
+                column_type: OracleColumnType::Varchar,
+                ora_type_num: ORA_TYPE_NUM_CHAR,
+                charset_form: CS_FORM_NCHAR,
+                buffer_size: 10,
+            },
+            ThinColumn {
+                name: "C_VARCHAR".to_string(),
+                column_type: OracleColumnType::Varchar,
+                ora_type_num: ORA_TYPE_NUM_VARCHAR,
+                charset_form: CS_FORM_IMPLICIT,
+                buffer_size: 10,
+            },
+            ThinColumn {
+                name: "B_RAW".to_string(),
+                column_type: OracleColumnType::Raw,
+                ora_type_num: ORA_TYPE_NUM_RAW,
+                charset_form: 0,
+                buffer_size: 10,
+            },
+            ThinColumn {
+                name: "B_LONG_RAW".to_string(),
+                column_type: OracleColumnType::Raw,
+                ora_type_num: ORA_TYPE_NUM_LONG_RAW,
+                charset_form: 0,
+                buffer_size: 10,
+            },
+        ];
+        let mut columns = vec![
+            ThinColumn {
+                name: "C_CHAR".to_string(),
+                column_type: OracleColumnType::Clob,
+                ora_type_num: ORA_TYPE_NUM_CLOB,
+                charset_form: CS_FORM_IMPLICIT,
+                buffer_size: 112,
+            },
+            ThinColumn {
+                name: "C_VARCHAR".to_string(),
+                column_type: OracleColumnType::Clob,
+                ora_type_num: ORA_TYPE_NUM_CLOB,
+                charset_form: CS_FORM_NCHAR,
+                buffer_size: 112,
+            },
+            ThinColumn {
+                name: "B_RAW".to_string(),
+                column_type: OracleColumnType::Blob,
+                ora_type_num: ORA_TYPE_NUM_BLOB,
+                charset_form: 0,
+                buffer_size: 112,
+            },
+            ThinColumn {
+                name: "B_LONG_RAW".to_string(),
+                column_type: OracleColumnType::Blob,
+                ora_type_num: ORA_TYPE_NUM_BLOB,
+                charset_form: 0,
+                buffer_size: 112,
+            },
+        ];
+
+        adjust_columns_after_define(&previous_columns, &mut columns);
+
+        assert_eq!(
+            columns
+                .iter()
+                .map(|column| (column.ora_type_num, column.column_type, column.charset_form))
+                .collect::<Vec<_>>(),
+            vec![
+                (ORA_TYPE_NUM_LONG, OracleColumnType::Long, CS_FORM_NCHAR),
+                (ORA_TYPE_NUM_LONG, OracleColumnType::Long, CS_FORM_IMPLICIT),
+                (ORA_TYPE_NUM_LONG_RAW, OracleColumnType::Raw, 0),
+                (ORA_TYPE_NUM_LONG_RAW, OracleColumnType::Raw, 0),
+            ]
+        );
+    }
+
+    #[test]
     fn execute_flags_follow_implicit_resultset_request() {
         let mut request = StatementRequest::statement("BEGIN NULL; END;");
         request.implicit_resultsets = false;
@@ -8235,6 +8790,10 @@ mod tests {
             "UPDATE t SET note = q'[RETURNING id INTO :x]' WHERE id = :1 RETURNING id INTO :2",
         );
         assert!(request_is_dml_returning(&returning_after_q_quote));
+
+        let no_space_returning =
+            StatementRequest::statement("INSERT INTO t(id) VALUES (:1)returning(id)into :2");
+        assert!(request_is_dml_returning(&no_space_returning));
     }
 
     #[test]
@@ -8253,6 +8812,45 @@ mod tests {
             .expect("write DML RETURNING bind rows");
 
         assert_eq!(hex_encode_upper(&payload), "0702C102");
+    }
+
+    #[test]
+    fn non_plsql_bind_rows_write_long_values_after_non_long_values() {
+        let caps = OracleThinCapabilities::default();
+        let large = BindValue::Text("x".repeat(1001));
+        let small = BindValue::Text("S".to_string());
+        let mut request = StatementRequest::query("SELECT :1, :2 FROM dual", 1);
+        request.binds.push(large.clone());
+        request.binds.push(small.clone());
+
+        let mut expected = vec![TNS_MSG_TYPE_ROW_DATA];
+        write_bind_value(&mut expected, &caps, &small).expect("write small bind");
+        write_bind_value(&mut expected, &caps, &large).expect("write large bind");
+
+        let mut payload = Vec::new();
+        write_bind_rows_for_request(&mut payload, &caps, &request)
+            .expect("write non-PL/SQL bind rows");
+
+        assert_eq!(payload, expected);
+    }
+
+    #[test]
+    fn plsql_bind_rows_keep_declared_order_for_long_values() {
+        let caps = OracleThinCapabilities::default();
+        let large = BindValue::Text("x".repeat(1001));
+        let small = BindValue::Text("S".to_string());
+        let mut request = StatementRequest::statement("BEGIN p(:1, :2); END;");
+        request.binds.push(large.clone());
+        request.binds.push(small.clone());
+
+        let mut expected = vec![TNS_MSG_TYPE_ROW_DATA];
+        write_bind_value(&mut expected, &caps, &large).expect("write large bind");
+        write_bind_value(&mut expected, &caps, &small).expect("write small bind");
+
+        let mut payload = Vec::new();
+        write_bind_rows_for_request(&mut payload, &caps, &request).expect("write PL/SQL bind rows");
+
+        assert_eq!(payload, expected);
     }
 
     #[test]
@@ -8599,6 +9197,10 @@ mod tests {
             OracleColumnType::Number
         );
         assert_eq!(
+            oracle_column_type_from_ora_type(ORA_TYPE_NUM_VARCHAR),
+            OracleColumnType::Varchar
+        );
+        assert_eq!(
             oracle_column_type_from_ora_type(TNS_DATA_TYPE_VCS),
             OracleColumnType::Varchar
         );
@@ -8619,6 +9221,18 @@ mod tests {
             OracleColumnType::Cursor
         );
         assert_eq!(
+            oracle_column_type_from_ora_type(ORA_TYPE_NUM_ROWID),
+            OracleColumnType::Varchar
+        );
+        assert_eq!(
+            oracle_column_type_from_ora_type(TNS_DATA_TYPE_RDD),
+            OracleColumnType::Varchar
+        );
+        assert_eq!(
+            oracle_column_type_from_ora_type(ORA_TYPE_NUM_UROWID),
+            OracleColumnType::Varchar
+        );
+        assert_eq!(
             oracle_column_type_from_ora_type(TNS_DATA_TYPE_CFILE),
             OracleColumnType::Bfile
         );
@@ -8637,6 +9251,22 @@ mod tests {
         assert_eq!(
             oracle_column_type_from_ora_type(TNS_DATA_TYPE_UB8),
             OracleColumnType::Number
+        );
+        assert_eq!(
+            oracle_column_type_from_ora_type(ORA_TYPE_NUM_OBJECT),
+            OracleColumnType::Unsupported(ORA_TYPE_NUM_OBJECT)
+        );
+        assert_eq!(
+            oracle_column_type_from_ora_type(TNS_DATA_TYPE_EXT_NAMED),
+            OracleColumnType::Unsupported(TNS_DATA_TYPE_EXT_NAMED)
+        );
+        assert_eq!(
+            oracle_column_type_from_ora_type(TNS_DATA_TYPE_PNTY),
+            OracleColumnType::Unsupported(TNS_DATA_TYPE_PNTY)
+        );
+        assert_eq!(
+            oracle_column_type_from_ora_type(250),
+            OracleColumnType::Unsupported(250)
         );
     }
 
@@ -8663,6 +9293,65 @@ mod tests {
                 "missing data type negotiation entry {expected:?}"
             );
         }
+    }
+
+    #[test]
+    fn data_type_negotiation_keeps_python_oracledb_decoder_mappings() {
+        for expected in [
+            (
+                u16::from(TNS_DATA_TYPE_BINARY_INTEGER),
+                u16::from(ORA_TYPE_NUM_NUMBER),
+                10,
+            ),
+            (u16::from(TNS_DATA_TYPE_FLOAT), u16::from(ORA_TYPE_NUM_NUMBER), 10),
+            (u16::from(TNS_DATA_TYPE_STR), u16::from(ORA_TYPE_NUM_VARCHAR), 1),
+            (u16::from(TNS_DATA_TYPE_VNU), u16::from(ORA_TYPE_NUM_NUMBER), 10),
+            (u16::from(TNS_DATA_TYPE_PDN), u16::from(ORA_TYPE_NUM_NUMBER), 10),
+            (u16::from(TNS_DATA_TYPE_VCS), u16::from(ORA_TYPE_NUM_VARCHAR), 1),
+            (u16::from(TNS_DATA_TYPE_VBI), u16::from(ORA_TYPE_NUM_VARCHAR), 1),
+            (u16::from(TNS_DATA_TYPE_UIN), u16::from(ORA_TYPE_NUM_NUMBER), 10),
+            (u16::from(TNS_DATA_TYPE_SLS), u16::from(ORA_TYPE_NUM_NUMBER), 10),
+            (u16::from(TNS_DATA_TYPE_LVC), u16::from(ORA_TYPE_NUM_VARCHAR), 1),
+            (u16::from(TNS_DATA_TYPE_LVB), u16::from(ORA_TYPE_NUM_RAW), 1),
+            (27, 27, 10),
+            (39, 39, 1),
+            (u16::from(TNS_DATA_TYPE_RDD), u16::from(ORA_TYPE_NUM_ROWID), 1),
+            (
+                u16::from(TNS_DATA_TYPE_EXT_NAMED),
+                u16::from(ORA_TYPE_NUM_OBJECT),
+                1,
+            ),
+            (u16::from(TNS_DATA_TYPE_CFILE), u16::from(TNS_DATA_TYPE_CFILE), 1),
+            (u16::from(TNS_DATA_TYPE_RSET), u16::from(ORA_TYPE_NUM_CURSOR), 1),
+            (u16::from(ORA_TYPE_NUM_JSON), u16::from(ORA_TYPE_NUM_JSON), 1),
+            (u16::from(ORA_TYPE_NUM_DJSON), u16::from(ORA_TYPE_NUM_DJSON), 1),
+            (u16::from(TNS_DATA_TYPE_CLV), u16::from(TNS_DATA_TYPE_CLV), 1),
+            (u16::from(TNS_DATA_TYPE_DTR), u16::from(ORA_TYPE_NUM_NUMBER), 10),
+            (u16::from(TNS_DATA_TYPE_DUN), u16::from(ORA_TYPE_NUM_NUMBER), 10),
+            (u16::from(TNS_DATA_TYPE_DOP), u16::from(ORA_TYPE_NUM_NUMBER), 10),
+            (u16::from(TNS_DATA_TYPE_VST), u16::from(ORA_TYPE_NUM_VARCHAR), 1),
+            (u16::from(TNS_DATA_TYPE_ODT), u16::from(ORA_TYPE_NUM_DATE), 10),
+            (u16::from(TNS_DATA_TYPE_DOL), u16::from(ORA_TYPE_NUM_NUMBER), 10),
+            (u16::from(TNS_DATA_TYPE_EDATE), u16::from(ORA_TYPE_NUM_DATE), 10),
+            (u16::from(TNS_DATA_TYPE_DCLOB), u16::from(ORA_TYPE_NUM_CLOB), 1),
+            (u16::from(TNS_DATA_TYPE_DBLOB), u16::from(ORA_TYPE_NUM_BLOB), 1),
+            (u16::from(ORA_TYPE_NUM_DBFILE), u16::from(ORA_TYPE_NUM_BFILE), 1),
+            (u16::from(TNS_DATA_TYPE_PNTY), u16::from(ORA_TYPE_NUM_OBJECT), 1),
+            (u16::from(ORA_TYPE_NUM_VECTOR), u16::from(ORA_TYPE_NUM_VECTOR), 1),
+        ] {
+            assert!(
+                DATA_TYPE_REPRESENTATIONS.contains(&expected),
+                "missing python-oracledb data type negotiation entry {expected:?}"
+            );
+        }
+        assert!(
+            !DATA_TYPE_REPRESENTATIONS.contains(&(
+                u16::from(ORA_TYPE_NUM_DJSON),
+                u16::from(ORA_TYPE_NUM_VECTOR),
+                1,
+            )),
+            "DJSON must negotiate as JSON; VECTOR has its own Oracle type 127"
+        );
     }
 
     #[test]
@@ -9575,6 +10264,83 @@ mod tests {
             hex_encode_upper(&combo_12c),
             "1C011309F405946F1DF826604313B4E6E8E4E5B0B909CFE76053A79413131711"
         );
+    }
+
+    #[test]
+    fn auth_10g_legacy_32_byte_session_key_uses_go_ora_md5_xor_combo_key() {
+        let state = AuthState {
+            verifier_type: TNS_VERIFIER_TYPE_10G,
+            ..AuthState::default()
+        };
+        let session_key_part_a = (0u8..32).collect::<Vec<_>>();
+        let session_key_part_b = (0u8..32).rev().collect::<Vec<_>>();
+
+        let combo_key =
+            derive_auth_combo_key(&state, &session_key_part_a, &session_key_part_b, 16).unwrap();
+
+        assert_eq!(
+            hex_encode_upper(&combo_key),
+            "6A1E2C6EB1B7AA9C4380252AEA8C215E"
+        );
+    }
+
+    #[test]
+    fn auth_combo_key_uses_server_compile_cap_pbkdf2_bit() {
+        let mut caps = OracleThinCapabilities::default();
+        let mut compile_caps = vec![0u8; 8];
+        adjust_for_server_compile_caps(&mut caps, &compile_caps);
+        assert!(!caps.auth_uses_pbkdf2_key_derivation);
+
+        compile_caps[4] = 0x20;
+        adjust_for_server_compile_caps(&mut caps, &compile_caps);
+        assert!(caps.auth_uses_pbkdf2_key_derivation);
+    }
+
+    #[test]
+    fn auth_pbkdf2_combo_keys_match_vendor_temp_key_ordering() {
+        let session_key_part_a = (0u8..32).collect::<Vec<_>>();
+        let session_key_part_b = (0u8..32).rev().collect::<Vec<_>>();
+
+        for (verifier_type, key_len, expected) in [
+            (
+                TNS_VERIFIER_TYPE_10G,
+                16,
+                "9E0D7F59932149D8E55CDB73F6A83E70",
+            ),
+            (
+                TNS_VERIFIER_TYPE_11G_1,
+                24,
+                "B7083D2369C40839C6F1D83DB460A878ED240A923A44EDB1",
+            ),
+            (
+                TNS_VERIFIER_TYPE_12C,
+                32,
+                "B42122FDFA6546989A46FAC166F52B2F02FD1B37E6CE14A1DFB2D923988187F7",
+            ),
+        ] {
+            let state = AuthState {
+                verifier_type,
+                session_data: HashMap::from([
+                    (
+                        "AUTH_PBKDF2_CSK_SALT".to_string(),
+                        "0102030405060708".to_string(),
+                    ),
+                    ("AUTH_PBKDF2_SDER_COUNT".to_string(), "7".to_string()),
+                ]),
+                auth_uses_pbkdf2_key_derivation: true,
+                ..AuthState::default()
+            };
+
+            let combo_key = derive_auth_combo_key(
+                &state,
+                &session_key_part_a,
+                &session_key_part_b,
+                key_len,
+            )
+            .unwrap();
+
+            assert_eq!(hex_encode_upper(&combo_key), expected);
+        }
     }
 
     #[test]

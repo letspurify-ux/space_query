@@ -816,6 +816,44 @@ fn fetch_lob_columns_define_as_full_values() {
 
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn execute_typed_fetch_all_defines_lob_before_first_fetch() {
+    let mut conn = connect();
+    let request = StatementRequest::query(
+        "SELECT TO_CLOB(RPAD('x', 4000, 'x')) || TO_CLOB(RPAD('y', 4000, 'y')) FROM dual",
+        1,
+    );
+    let result = conn
+        .execute_typed_fetch_all(&request, &[OracleColumnType::Clob])
+        .expect("typed CLOB fetch all");
+
+    let row = result.rows.first().expect("typed CLOB row");
+    let clob = value_to_string(&row[0]);
+    assert_eq!(clob.len(), 8000);
+    assert!(clob.starts_with('x'));
+    assert!(clob.ends_with('y'));
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn execute_typed_defines_lob_before_initial_fetch() {
+    let mut conn = connect();
+    let request = StatementRequest::query(
+        "SELECT TO_CLOB(RPAD('a', 4000, 'a')) || TO_CLOB(RPAD('b', 4000, 'b')) FROM dual",
+        1,
+    );
+    let result = conn
+        .execute_typed(&request, &[OracleColumnType::Clob])
+        .expect("typed CLOB initial execute");
+
+    let row = result.rows.first().expect("typed CLOB row");
+    let clob = value_to_string(&row[0]);
+    assert_eq!(clob.len(), 8000);
+    assert!(clob.starts_with('a'));
+    assert!(clob.ends_with('b'));
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn fetch_nchar_and_nvarchar_lazy_batches_keep_charset_form() {
     let mut conn = connect();
     let request = StatementRequest::query(
@@ -989,6 +1027,32 @@ fn bind_varchar2_4000_boundary_round_trips_full_value() {
     );
 
     assert_eq!(value, payload);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn bind_large_sql_value_before_small_value_round_trips_positions() {
+    let mut conn = connect();
+    let large_payload = "x".repeat(1001);
+    let small_payload = "tail".to_string();
+    let mut request = StatementRequest::query(
+        "SELECT :1 AS large_payload, :2 AS small_payload FROM dual",
+        1,
+    );
+    request.binds.push(BindValue::Text(large_payload.clone()));
+    request.binds.push(BindValue::Text(small_payload.clone()));
+
+    let result = conn
+        .query_described_fetch_all_request(&request)
+        .expect("round-trip mixed large and small SQL binds");
+    let row = result
+        .result
+        .rows
+        .first()
+        .expect("mixed large and small bind row");
+
+    assert_eq!(value_to_string(&row[0]), large_payload);
+    assert_eq!(value_to_string(&row[1]), small_payload);
 }
 
 #[test]
@@ -1174,6 +1238,30 @@ fn plsql_scalar_out_and_inout_binds_return_values() {
             "42".to_string(),
             "IN-IO".to_string(),
         ]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn plsql_out_bind_types_fill_empty_request_binds() {
+    let mut conn = connect();
+    let request = StatementRequest::statement(
+        "BEGIN \
+         :1 := 'TYPE-FALLBACK'; \
+         :2 := 42; \
+         END;",
+    );
+
+    let values = conn
+        .execute_out_binds(
+            &request,
+            &[OracleColumnType::Varchar, OracleColumnType::Number],
+        )
+        .expect("PL/SQL OUT bind types should fill empty request binds");
+
+    assert_eq!(
+        rows_to_strings(&[values]),
+        vec![vec!["TYPE-FALLBACK".to_string(), "42".to_string()]]
     );
 }
 
@@ -1616,6 +1704,49 @@ fn plsql_out_ref_cursor_fetches_rows() {
 
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn plsql_out_ref_cursor_between_scalar_out_binds_preserves_alignment() {
+    let mut conn = connect();
+    let mut request = StatementRequest::statement(
+        "BEGIN \
+         :1 := 101; \
+         OPEN :2 FOR SELECT 8 AS n, 'middle cursor' AS label FROM dual; \
+         :3 := 'after cursor'; \
+         END;",
+    );
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Number,
+        max_len: 22,
+    });
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Cursor,
+        max_len: 4,
+    });
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Varchar,
+        max_len: 100,
+    });
+
+    let values = conn
+        .execute_out_binds(&request, &[])
+        .expect("PL/SQL OUT bind row with middle REF CURSOR");
+    assert_eq!(value_to_string(&values[0]), "101");
+    assert_eq!(value_to_string(&values[2]), "after cursor");
+    let cursor = match values.get(1) {
+        Some(OracleValue::Cursor(cursor)) => cursor.clone(),
+        other => panic!("expected middle OUT REF CURSOR, got {other:?}"),
+    };
+    let rows = conn
+        .fetch_ref_cursor_all(cursor.cursor_id, cursor.columns, 10)
+        .expect("fetch middle OUT REF CURSOR rows");
+
+    assert_eq!(
+        rows_to_strings(&rows.result.rows),
+        vec![vec!["8".to_string(), "middle cursor".to_string()]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn dml_returning_single_row_out_binds_return_values() {
     let config = live_config();
     let table = unique_table_name("RET");
@@ -1711,6 +1842,436 @@ fn dml_returning_supports_quoted_bind_names() {
     assert_eq!(
         rows_to_strings(&[values]),
         vec![vec!["1".to_string(), "alpha".to_string()]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn dml_returning_supports_non_ascii_bind_names() {
+    let config = live_config();
+    let table = unique_table_name("RET_NONASCII");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    conn.query_drop(&format!("CREATE TABLE {table} (id NUMBER PRIMARY KEY)"))
+        .expect("create non-ASCII DML RETURNING test table");
+
+    let mut request = StatementRequest::statement(format!(
+        "INSERT INTO {table} (id) VALUES (:int_val) RETURNING id INTO :m\u{00E9}il"
+    ));
+    request.binds.push(BindValue::Number("7".to_string()));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Number,
+        max_len: 22,
+    });
+
+    let values = conn
+        .execute_out_binds(&request, &[])
+        .expect("DML RETURNING non-ASCII OUT bind");
+
+    assert_eq!(rows_to_strings(&[values]), vec![vec!["7".to_string()]]);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn dml_returning_rejects_invalid_rowid_bind_name() {
+    let config = live_config();
+    let table = unique_table_name("RET_BAD_BIND");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    conn.query_drop(&format!("CREATE TABLE {table} (id NUMBER PRIMARY KEY)"))
+        .expect("create invalid DML RETURNING bind test table");
+
+    let mut request = StatementRequest::statement(format!(
+        "INSERT INTO {table} (id) VALUES (:1) RETURNING id INTO :ROWID"
+    ));
+    request.binds.push(BindValue::Number("1".to_string()));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Number,
+        max_len: 22,
+    });
+
+    let err = conn
+        .execute_out_binds(&request, &[])
+        .expect_err("invalid ROWID bind name should fail");
+    let message = err.to_string();
+    assert!(
+        message.contains("ORA-01745") || message.contains("invalid host/bind variable name"),
+        "unexpected error: {message}"
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn dml_returning_parses_without_spaces_around_returning_into() {
+    let config = live_config();
+    let table = unique_table_name("RET_NOSPACE");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    conn.query_drop(&format!("CREATE TABLE {table} (id NUMBER PRIMARY KEY)"))
+        .expect("create no-space DML RETURNING test table");
+
+    let mut request = StatementRequest::statement(format!(
+        "INSERT INTO {table} (id) VALUES (:1)returning(id)into :2"
+    ));
+    request.binds.push(BindValue::Number("25".to_string()));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Number,
+        max_len: 22,
+    });
+
+    let values = conn
+        .execute_out_binds(&request, &[])
+        .expect("DML RETURNING without spaces");
+
+    assert_eq!(rows_to_strings(&[values]), vec![vec!["25".to_string()]]);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn dml_returning_rowid_can_be_used_to_fetch_inserted_row() {
+    let config = live_config();
+    let table = unique_table_name("RET_ROWID");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, name VARCHAR2(30))"
+    ))
+    .expect("create ROWID DML RETURNING test table");
+
+    let mut request = StatementRequest::statement(format!(
+        "INSERT INTO {table} (id, name) VALUES (:1, :2) RETURNING ROWID INTO :3"
+    ));
+    request.binds.push(BindValue::Number("278".to_string()));
+    request.binds.push(BindValue::Text("String 278".to_string()));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Varchar,
+        max_len: 64,
+    });
+
+    let values = conn
+        .execute_out_binds(&request, &[])
+        .expect("DML RETURNING ROWID");
+    let rowid = match values.first() {
+        Some(OracleValue::Text(value)) => value,
+        other => panic!("expected ROWID text, got {other:?}"),
+    };
+
+    let mut fetch_request =
+        StatementRequest::query(format!("SELECT id, name FROM {table} WHERE ROWID = :1"), 10);
+    fetch_request.binds.push(BindValue::Text(rowid.clone()));
+    let result = conn
+        .query_described_fetch_all_request(&fetch_request)
+        .expect("fetch row by returned ROWID");
+
+    assert_eq!(
+        rows_to_strings(&result.result.rows),
+        vec![vec!["278".to_string(), "String 278".to_string()]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn dml_returning_iot_rowid_can_be_used_to_fetch_inserted_row() {
+    let config = live_config();
+    let table = unique_table_name("RET_IOT_RID");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, name VARCHAR2(30), created_at DATE) \
+         ORGANIZATION INDEX"
+    ))
+    .expect("create IOT ROWID DML RETURNING test table");
+
+    let mut request = StatementRequest::statement(format!(
+        "INSERT INTO {table} (id, name, created_at) \
+         VALUES (:1, :2, TO_DATE(:3, 'YYYY-MM-DD')) \
+         RETURNING ROWID INTO :4"
+    ));
+    request.binds.push(BindValue::Number("1".to_string()));
+    request.binds.push(BindValue::Text("ABC".to_string()));
+    request.binds.push(BindValue::Text("2017-04-11".to_string()));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Varchar,
+        max_len: 4000,
+    });
+
+    let values = conn
+        .execute_out_binds(&request, &[])
+        .expect("DML RETURNING IOT ROWID");
+    let rowid = match values.first() {
+        Some(OracleValue::Text(value)) => value,
+        other => panic!("expected IOT ROWID text, got {other:?}"),
+    };
+
+    let mut fetch_request = StatementRequest::query(
+        format!("SELECT id, name, TO_CHAR(created_at, 'YYYY-MM-DD') FROM {table} WHERE ROWID = :1"),
+        10,
+    );
+    fetch_request.binds.push(BindValue::Text(rowid.clone()));
+    let result = conn
+        .query_described_fetch_all_request(&fetch_request)
+        .expect("fetch IOT row by returned ROWID");
+
+    assert_eq!(
+        rows_to_strings(&result.result.rows),
+        vec![vec![
+            "1".to_string(),
+            "ABC".to_string(),
+            "2017-04-11".to_string()
+        ]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn plsql_dml_returning_iot_rowid_can_be_used_to_fetch_inserted_row() {
+    let config = live_config();
+    let table = unique_table_name("RET_IOT_PLSQL");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, name VARCHAR2(30), created_at DATE) \
+         ORGANIZATION INDEX"
+    ))
+    .expect("create PL/SQL IOT ROWID DML RETURNING test table");
+
+    let mut request = StatementRequest::statement(format!(
+        "BEGIN \
+         INSERT INTO {table} (id, name, created_at) \
+         VALUES (:1, :2, TO_DATE(:3, 'YYYY-MM-DD')) \
+         RETURNING ROWID INTO :4; \
+         END;"
+    ));
+    request.is_plsql = true;
+    request.binds.push(BindValue::Number("1".to_string()));
+    request.binds.push(BindValue::Text("ABC".to_string()));
+    request.binds.push(BindValue::Text("2017-04-11".to_string()));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Varchar,
+        max_len: 4000,
+    });
+
+    let values = conn
+        .execute_out_binds(&request, &[])
+        .expect("PL/SQL DML RETURNING IOT ROWID");
+    let rowid = match values.first() {
+        Some(OracleValue::Text(value)) => value,
+        other => panic!("expected PL/SQL IOT ROWID text, got {other:?}"),
+    };
+
+    let mut fetch_request = StatementRequest::query(
+        format!("SELECT id, name, TO_CHAR(created_at, 'YYYY-MM-DD') FROM {table} WHERE ROWID = :1"),
+        10,
+    );
+    fetch_request.binds.push(BindValue::Text(rowid.clone()));
+    let result = conn
+        .query_described_fetch_all_request(&fetch_request)
+        .expect("fetch PL/SQL IOT row by returned ROWID");
+
+    assert_eq!(
+        rows_to_strings(&result.result.rows),
+        vec![vec![
+            "1".to_string(),
+            "ABC".to_string(),
+            "2017-04-11".to_string()
+        ]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn dml_returning_lob_out_binds_return_values() {
+    let config = live_config();
+    let table = unique_table_name("RET_LOB");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, clob_col CLOB, blob_col BLOB)"
+    ))
+    .expect("create LOB DML RETURNING test table");
+
+    let mut request = StatementRequest::statement(format!(
+        "INSERT INTO {table} (id, clob_col, blob_col) \
+         VALUES (:1, :2, HEXTORAW(:3)) \
+         RETURNING clob_col, blob_col INTO :4, :5"
+    ));
+    request.binds.push(BindValue::Number("1".to_string()));
+    request
+        .binds
+        .push(BindValue::Text("A short CLOB - 1618".to_string()));
+    request.binds.push(BindValue::Text("CAFE".to_string()));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Clob,
+        max_len: 200,
+    });
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Blob,
+        max_len: 2,
+    });
+
+    let values = conn
+        .execute_out_binds(&request, &[])
+        .expect("DML RETURNING LOB OUT binds");
+
+    assert_eq!(
+        value_to_string(values.first().expect("CLOB RETURNING value")),
+        "A short CLOB - 1618"
+    );
+    assert_eq!(
+        values.get(1),
+        Some(&OracleValue::Bytes(vec![0xca, 0xfe]))
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn dml_returning_multiple_clobs_preserves_all_rows() {
+    let config = live_config();
+    let table = unique_table_name("RET_CLOBS");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, clob_col CLOB, touched NUMBER)"
+    ))
+    .expect("create multi-CLOB DML RETURNING test table");
+    let clob_data = [
+        "Short CLOB - 1625a",
+        "Short CLOB - 1625b",
+        "Short CLOB - 1625c",
+        "Short CLOB - 1625d",
+    ];
+    for (index, value) in clob_data.iter().enumerate() {
+        let mut insert_request = StatementRequest::statement(format!(
+            "INSERT INTO {table} (id, clob_col) VALUES (:1, :2)"
+        ));
+        insert_request
+            .binds
+            .push(BindValue::Number((index + 1).to_string()));
+        insert_request.binds.push(BindValue::Text((*value).to_string()));
+        conn.execute_typed_with_implicit(&insert_request, &[])
+            .expect("insert CLOB source row");
+    }
+
+    let mut request = StatementRequest::statement(format!(
+        "UPDATE {table} SET touched = 1 WHERE touched IS NULL RETURNING clob_col INTO :1"
+    ));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Clob,
+        max_len: 200,
+    });
+
+    let result = conn
+        .execute_out_binds_with_implicit(&request, &[])
+        .expect("multi-row DML RETURNING CLOB OUT bind");
+    let mut returned = result
+        .rows
+        .iter()
+        .map(|row| value_to_string(row.first().expect("CLOB row value")))
+        .collect::<Vec<_>>();
+    returned.sort();
+
+    assert_eq!(returned, clob_data);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn dml_returning_repeated_deletes_clear_previous_out_rows() {
+    let config = live_config();
+    let table = unique_table_name("RET_REPEAT");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, name VARCHAR2(30))"
+    ))
+    .expect("create repeated DML RETURNING test table");
+    for id in 1..=10 {
+        conn.query_drop(&format!(
+            "INSERT INTO {table} (id, name) VALUES ({id}, 'Test String {id}')"
+        ))
+        .expect("insert repeated DML RETURNING source row");
+    }
+
+    let mut results = Vec::new();
+    for threshold in [5, 8, 10, 4] {
+        let mut request = StatementRequest::statement(format!(
+            "DELETE FROM {table} WHERE id < :1 RETURNING id INTO :2"
+        ));
+        request.binds.push(BindValue::Number(threshold.to_string()));
+        request.binds.push(BindValue::Out {
+            column_type: OracleColumnType::Number,
+            max_len: 22,
+        });
+        let result = conn
+            .execute_out_binds_with_implicit(&request, &[])
+            .expect("repeated DML RETURNING delete");
+        let mut values = result
+            .rows
+            .iter()
+            .map(|row| value_to_string(row.first().expect("RETURNING id")))
+            .collect::<Vec<_>>();
+        values.sort();
+        results.push(values);
+    }
+
+    assert_eq!(
+        results,
+        vec![
+            vec![
+                "1".to_string(),
+                "2".to_string(),
+                "3".to_string(),
+                "4".to_string()
+            ],
+            vec!["5".to_string(), "6".to_string(), "7".to_string()],
+            vec!["8".to_string(), "9".to_string()],
+            Vec::<String>::new(),
+        ]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn dml_returning_followed_by_plsql_out_bind_uses_fresh_state() {
+    let config = live_config();
+    let table = unique_table_name("RET_REUSE");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    conn.query_drop(&format!("CREATE TABLE {table} (id NUMBER PRIMARY KEY)"))
+        .expect("create DML RETURNING reuse test table");
+
+    let mut returning_request = StatementRequest::statement(format!(
+        "INSERT INTO {table} (id) VALUES (:1) RETURNING id + 15 INTO :2"
+    ));
+    returning_request
+        .binds
+        .push(BindValue::Number("25".to_string()));
+    returning_request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Number,
+        max_len: 22,
+    });
+    let returning_values = conn
+        .execute_out_binds(&returning_request, &[])
+        .expect("DML RETURNING before PL/SQL OUT bind");
+    assert_eq!(
+        rows_to_strings(&[returning_values]),
+        vec![vec!["40".to_string()]]
+    );
+
+    let mut plsql_request = StatementRequest::statement("BEGIN :1 := :2 + 35; END;");
+    plsql_request.is_plsql = true;
+    plsql_request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Number,
+        max_len: 22,
+    });
+    plsql_request
+        .binds
+        .push(BindValue::Number("35".to_string()));
+    let plsql_values = conn
+        .execute_out_binds(&plsql_request, &[])
+        .expect("PL/SQL OUT bind after DML RETURNING");
+    assert_eq!(
+        rows_to_strings(&[plsql_values]),
+        vec![vec!["70".to_string()]]
     );
 }
 
@@ -1875,6 +2436,66 @@ fn plsql_function_ref_cursor_return_bind_fetches_rows() {
 
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn plsql_procedure_ref_cursor_out_bind_fetches_mixed_scalar_columns() {
+    let procedure_name = unique_object_name("PROC_RC_MIXED");
+    let mut conn = connect();
+    drop_procedure_ignore(&mut conn, &procedure_name);
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE PROCEDURE {procedure_name}(p_rc OUT SYS_REFCURSOR) IS \
+         BEGIN \
+         OPEN p_rc FOR \
+         SELECT TO_CHAR(DATE '2024-01-02', 'YYYY-MM-DD') AS c_text_func, \
+                CAST('plain varchar' AS VARCHAR2(30)) AS c_varchar, \
+                CAST(42 AS NUMBER) AS c_number, \
+                TIMESTAMP '2024-01-02 03:04:05.123456' AS c_timestamp, \
+                DATE '2024-01-03' AS c_date \
+         FROM dual; \
+         END;"
+    ))
+    .expect("create mixed scalar ref cursor procedure");
+
+    let mut request = StatementRequest::statement(format!("BEGIN {procedure_name}(:1); END;"));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Cursor,
+        max_len: 1,
+    });
+
+    let values = conn
+        .execute_out_binds(&request, &[])
+        .expect("PL/SQL procedure REF CURSOR OUT bind");
+    let cursor = match values.first() {
+        Some(OracleValue::Cursor(cursor)) => cursor.clone(),
+        other => panic!("expected procedure OUT REF CURSOR, got {other:?}"),
+    };
+    assert_eq!(
+        cursor
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![
+            OracleColumnType::Varchar,
+            OracleColumnType::Varchar,
+            OracleColumnType::Number,
+            OracleColumnType::Timestamp,
+            OracleColumnType::Date,
+        ]
+    );
+
+    let rows = conn
+        .fetch_ref_cursor_all(cursor.cursor_id, cursor.columns, 10)
+        .expect("fetch mixed scalar REF CURSOR rows");
+    let row = rows.result.rows.first().expect("mixed scalar row");
+    assert_eq!(value_to_string(&row[0]), "2024-01-02");
+    assert_eq!(value_to_string(&row[1]), "plain varchar");
+    assert_eq!(value_to_string(&row[2]), "42");
+    assert_eq!(timestamp_value_to_string(&row[3]), "2024-01-02 03:04:05.123456");
+    assert_eq!(date_value_to_string(&row[4]), "2024-01-03 00:00:00");
+    drop_procedure_ignore(&mut conn, &procedure_name);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn plsql_implicit_resultset_fetches_rows_when_supported() {
     let mut conn = connect();
     if !conn.capabilities().supports_implicit_resultsets {
@@ -1986,6 +2607,18 @@ fn fetch_rowid_and_urowid_match_oracle_text_encoding() {
             1,
         )
         .expect("fetch ROWID and UROWID");
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![
+            OracleColumnType::Varchar,
+            OracleColumnType::Varchar,
+            OracleColumnType::Varchar
+        ]
+    );
     let row = result.result.rows.first().expect("ROWID row");
     let rowid = value_to_string(&row[0]);
     let rowid_text = value_to_string(&row[1]);
@@ -2185,6 +2818,10 @@ fn drop_function_ignore(conn: &mut OracleThinSession, function_name: &str) {
     let _ = conn.query_drop(&format!("DROP FUNCTION {function_name}"));
 }
 
+fn drop_procedure_ignore(conn: &mut OracleThinSession, procedure_name: &str) {
+    let _ = conn.query_drop(&format!("DROP PROCEDURE {procedure_name}"));
+}
+
 fn select_count(conn: &mut OracleThinSession, table: &str) -> i64 {
     let result = conn
         .query_described_fetch_all(format!("SELECT COUNT(*) FROM {table}"), 1)
@@ -2235,6 +2872,16 @@ fn timestamp_value_to_string(value: &OracleValue) -> String {
             value.nanosecond / 1_000
         ),
         other => panic!("unexpected timestamp test value {other:?}"),
+    }
+}
+
+fn date_value_to_string(value: &OracleValue) -> String {
+    match value {
+        OracleValue::DateTime(value) => format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            value.year, value.month, value.day, value.hour, value.minute, value.second
+        ),
+        other => panic!("unexpected date test value {other:?}"),
     }
 }
 

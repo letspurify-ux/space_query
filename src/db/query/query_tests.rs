@@ -6293,6 +6293,17 @@ RETURNING id, name INTO :"_val1", :"VaL_2""#;
 }
 
 #[test]
+fn test_extract_bind_names_supports_non_ascii_bind_names() {
+    let sql = "INSERT INTO t(id) VALUES (:int_val) RETURNING id INTO :m\u{00E9}il";
+    let names = QueryExecutor::extract_bind_names(sql);
+
+    assert_eq!(
+        names,
+        vec!["INT_VAL".to_string(), "M\u{00C9}IL".to_string()]
+    );
+}
+
+#[test]
 fn test_is_create_trigger() {
     // Positive cases
     assert!(QueryExecutor::is_create_trigger(
