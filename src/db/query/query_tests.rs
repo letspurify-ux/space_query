@@ -433,7 +433,7 @@ fn test_split_script_items_test12_if_alias_regression() {
         "unexpected tool command split: {items:?}"
     );
     assert_eq!(
-        statement_count, 44,
+        statement_count, 46,
         "unexpected SQL statement split: {items:?}"
     );
 

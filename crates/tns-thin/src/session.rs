@@ -13,7 +13,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use aes::{Aes192, Aes256};
+use aes::{Aes128, Aes192, Aes256};
 use cbc::cipher::{
     block_padding::{NoPadding, Pkcs7},
     BlockDecryptMut, BlockEncryptMut, KeyIvInit,
@@ -103,9 +103,81 @@ const TNS_CHARSET_UTF8: u16 = 873;
 const TNS_ERR_NO_DATA_FOUND: u32 = 1403;
 const TNS_AUTH_MODE_LOGON: u32 = 0x0000_0001;
 const TNS_AUTH_MODE_WITH_PASSWORD: u32 = 0x0000_0100;
+const TNS_VERIFIER_TYPE_10G: u32 = 0x0939;
 const TNS_VERIFIER_TYPE_11G_1: u32 = 0xb152;
 const TNS_VERIFIER_TYPE_11G_2: u32 = 0x1b25;
 const TNS_VERIFIER_TYPE_12C: u32 = 0x4815;
+const TNS_LEGACY_DES_KEY: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
+const DES_INITIAL_PERMUTATION: [u8; 64] = [
+    58, 50, 42, 34, 26, 18, 10, 2, 60, 52, 44, 36, 28, 20, 12, 4, 62, 54, 46, 38, 30, 22, 14,
+    6, 64, 56, 48, 40, 32, 24, 16, 8, 57, 49, 41, 33, 25, 17, 9, 1, 59, 51, 43, 35, 27, 19, 11,
+    3, 61, 53, 45, 37, 29, 21, 13, 5, 63, 55, 47, 39, 31, 23, 15, 7,
+];
+const DES_FINAL_PERMUTATION: [u8; 64] = [
+    40, 8, 48, 16, 56, 24, 64, 32, 39, 7, 47, 15, 55, 23, 63, 31, 38, 6, 46, 14, 54, 22, 62,
+    30, 37, 5, 45, 13, 53, 21, 61, 29, 36, 4, 44, 12, 52, 20, 60, 28, 35, 3, 43, 11, 51, 19,
+    59, 27, 34, 2, 42, 10, 50, 18, 58, 26, 33, 1, 41, 9, 49, 17, 57, 25,
+];
+const DES_PC1: [u8; 56] = [
+    57, 49, 41, 33, 25, 17, 9, 1, 58, 50, 42, 34, 26, 18, 10, 2, 59, 51, 43, 35, 27, 19, 11, 3,
+    60, 52, 44, 36, 63, 55, 47, 39, 31, 23, 15, 7, 62, 54, 46, 38, 30, 22, 14, 6, 61, 53, 45,
+    37, 29, 21, 13, 5, 28, 20, 12, 4,
+];
+const DES_PC2: [u8; 48] = [
+    14, 17, 11, 24, 1, 5, 3, 28, 15, 6, 21, 10, 23, 19, 12, 4, 26, 8, 16, 7, 27, 20, 13, 2, 41,
+    52, 31, 37, 47, 55, 30, 40, 51, 45, 33, 48, 44, 49, 39, 56, 34, 53, 46, 42, 50, 36, 29, 32,
+];
+const DES_KEY_SHIFTS: [u8; 16] = [1, 1, 2, 2, 2, 2, 2, 2, 1, 2, 2, 2, 2, 2, 2, 1];
+const DES_EXPANSION: [u8; 48] = [
+    32, 1, 2, 3, 4, 5, 4, 5, 6, 7, 8, 9, 8, 9, 10, 11, 12, 13, 12, 13, 14, 15, 16, 17, 16, 17,
+    18, 19, 20, 21, 20, 21, 22, 23, 24, 25, 24, 25, 26, 27, 28, 29, 28, 29, 30, 31, 32, 1,
+];
+const DES_P_PERMUTATION: [u8; 32] = [
+    16, 7, 20, 21, 29, 12, 28, 17, 1, 15, 23, 26, 5, 18, 31, 10, 2, 8, 24, 14, 32, 27, 3, 9, 19,
+    13, 30, 6, 22, 11, 4, 25,
+];
+const DES_S_BOXES: [[u8; 64]; 8] = [
+    [
+        14, 4, 13, 1, 2, 15, 11, 8, 3, 10, 6, 12, 5, 9, 0, 7, 0, 15, 7, 4, 14, 2, 13, 1, 10,
+        6, 12, 11, 9, 5, 3, 8, 4, 1, 14, 8, 13, 6, 2, 11, 15, 12, 9, 7, 3, 10, 5, 0, 15, 12,
+        8, 2, 4, 9, 1, 7, 5, 11, 3, 14, 10, 0, 6, 13,
+    ],
+    [
+        15, 1, 8, 14, 6, 11, 3, 4, 9, 7, 2, 13, 12, 0, 5, 10, 3, 13, 4, 7, 15, 2, 8, 14, 12,
+        0, 1, 10, 6, 9, 11, 5, 0, 14, 7, 11, 10, 4, 13, 1, 5, 8, 12, 6, 9, 3, 2, 15, 13, 8,
+        10, 1, 3, 15, 4, 2, 11, 6, 7, 12, 0, 5, 14, 9,
+    ],
+    [
+        10, 0, 9, 14, 6, 3, 15, 5, 1, 13, 12, 7, 11, 4, 2, 8, 13, 7, 0, 9, 3, 4, 6, 10, 2, 8,
+        5, 14, 12, 11, 15, 1, 13, 6, 4, 9, 8, 15, 3, 0, 11, 1, 2, 12, 5, 10, 14, 7, 1, 10,
+        13, 0, 6, 9, 8, 7, 4, 15, 14, 3, 11, 5, 2, 12,
+    ],
+    [
+        7, 13, 14, 3, 0, 6, 9, 10, 1, 2, 8, 5, 11, 12, 4, 15, 13, 8, 11, 5, 6, 15, 0, 3, 4,
+        7, 2, 12, 1, 10, 14, 9, 10, 6, 9, 0, 12, 11, 7, 13, 15, 1, 3, 14, 5, 2, 8, 4, 3, 15,
+        0, 6, 10, 1, 13, 8, 9, 4, 5, 11, 12, 7, 2, 14,
+    ],
+    [
+        2, 12, 4, 1, 7, 10, 11, 6, 8, 5, 3, 15, 13, 0, 14, 9, 14, 11, 2, 12, 4, 7, 13, 1, 5,
+        0, 15, 10, 3, 9, 8, 6, 4, 2, 1, 11, 10, 13, 7, 8, 15, 9, 12, 5, 6, 3, 0, 14, 11, 8,
+        12, 7, 1, 14, 2, 13, 6, 15, 0, 9, 10, 4, 5, 3,
+    ],
+    [
+        12, 1, 10, 15, 9, 2, 6, 8, 0, 13, 3, 4, 14, 7, 5, 11, 10, 15, 4, 2, 7, 12, 9, 5, 6,
+        1, 13, 14, 0, 11, 3, 8, 9, 14, 15, 5, 2, 8, 12, 3, 7, 0, 4, 10, 1, 13, 11, 6, 4, 3,
+        2, 12, 9, 5, 15, 10, 11, 14, 1, 7, 6, 0, 8, 13,
+    ],
+    [
+        4, 11, 2, 14, 15, 0, 8, 13, 3, 12, 9, 7, 5, 10, 6, 1, 13, 0, 11, 7, 4, 9, 1, 10, 14,
+        3, 5, 12, 2, 15, 8, 6, 1, 4, 11, 13, 12, 3, 7, 14, 10, 15, 6, 8, 0, 5, 9, 2, 6, 11,
+        13, 8, 1, 4, 10, 7, 9, 5, 0, 15, 14, 2, 3, 12,
+    ],
+    [
+        13, 2, 8, 4, 6, 15, 11, 1, 10, 9, 3, 14, 5, 0, 12, 7, 1, 15, 13, 8, 10, 3, 7, 4, 12,
+        5, 6, 11, 0, 14, 9, 2, 7, 11, 4, 1, 9, 12, 14, 2, 0, 6, 10, 13, 15, 3, 5, 8, 2, 1,
+        14, 7, 4, 10, 8, 13, 15, 12, 9, 0, 3, 5, 6, 11,
+    ],
+];
 const TNS_CCAP_FIELD_VERSION: usize = 7;
 const TNS_CCAP_FIELD_VERSION_12_2: u8 = 8;
 const TNS_CCAP_FIELD_VERSION_12_2_EXT1: u8 = 9;
@@ -3410,7 +3482,9 @@ fn encode_rowid_base64_value(mut value: u64, size: usize, output: &mut String) {
         bytes[offset] = TNS_BASE64_ALPHABET[(value & 0x3f) as usize];
         value >>= 6;
     }
-    output.push_str(std::str::from_utf8(&bytes).expect("rowid alphabet is ASCII"));
+    for byte in bytes {
+        output.push(byte as char);
+    }
 }
 
 fn base64_unpadded_len(input_len: usize) -> usize {
@@ -4587,7 +4661,28 @@ fn encode_with_iconv_any(
     Err(last_error.unwrap_or_else(|| OracleThinError::new("missing iconv encoding candidate")))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn decode_with_iconv_any(
+    bytes: &[u8],
+    encodings: &[&'static str],
+) -> Result<String, OracleThinError> {
+    let mut last_error = None;
+    for encoding in encodings {
+        let Some(code_page) = windows_code_page_for_encoding(encoding) else {
+            last_error = Some(OracleThinError::new(format!(
+                "Windows does not support Oracle text decoding for encoding {encoding}"
+            )));
+            continue;
+        };
+        match decode_with_windows_code_page(bytes, encoding, code_page) {
+            Ok(text) => return Ok(text),
+            Err(err) => last_error = Some(err),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| OracleThinError::new("missing Windows encoding candidate")))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn decode_with_iconv_any(
     _bytes: &[u8],
     encodings: &[&'static str],
@@ -4612,7 +4707,33 @@ fn encode_with_iconv(bytes: &[u8], encoding: &str) -> Result<Vec<u8>, OracleThin
     transcode_with_iconv(bytes, "UTF-8", encoding)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn encode_with_iconv_any(
+    bytes: &[u8],
+    encodings: &[&'static str],
+) -> Result<Vec<u8>, OracleThinError> {
+    let text = std::str::from_utf8(bytes).map_err(|err| {
+        OracleThinError::new(format!(
+            "Oracle native character set encoding input is not UTF-8: {err}"
+        ))
+    })?;
+    let mut last_error = None;
+    for encoding in encodings {
+        let Some(code_page) = windows_code_page_for_encoding(encoding) else {
+            last_error = Some(OracleThinError::new(format!(
+                "Windows does not support Oracle text encoding for encoding {encoding}"
+            )));
+            continue;
+        };
+        match encode_with_windows_code_page(text, encoding, code_page) {
+            Ok(text) => return Ok(text),
+            Err(err) => last_error = Some(err),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| OracleThinError::new("missing Windows encoding candidate")))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn encode_with_iconv_any(
     _bytes: &[u8],
     encodings: &[&'static str],
@@ -4623,6 +4744,187 @@ fn encode_with_iconv_any(
     )))
 }
 
+#[cfg(any(windows, test))]
+fn windows_code_page_for_encoding(encoding: &str) -> Option<u32> {
+    let normalized = encoding
+        .trim()
+        .to_ascii_uppercase()
+        .replace('_', "-");
+    match normalized.as_str() {
+        "US-ASCII" | "ASCII" => Some(20127),
+        "ISO-8859-1" => Some(28591),
+        "ISO-8859-2" => Some(28592),
+        "ISO-8859-3" => Some(28593),
+        "ISO-8859-4" => Some(28594),
+        "ISO-8859-5" => Some(28595),
+        "ISO-8859-6" => Some(28596),
+        "ISO-8859-7" => Some(28597),
+        "ISO-8859-8" => Some(28598),
+        "ISO-8859-9" => Some(28599),
+        "ISO-8859-10" => Some(28600),
+        "ISO-8859-13" => Some(28603),
+        "ISO-8859-15" => Some(28605),
+        "TIS-620" => Some(874),
+        "CP1250" | "WINDOWS-1250" => Some(1250),
+        "CP1251" | "WINDOWS-1251" => Some(1251),
+        "CP1252" | "WINDOWS-1252" => Some(1252),
+        "CP1253" | "WINDOWS-1253" => Some(1253),
+        "CP1254" | "WINDOWS-1254" => Some(1254),
+        "CP1255" | "WINDOWS-1255" => Some(1255),
+        "CP1256" | "WINDOWS-1256" => Some(1256),
+        "CP1257" | "WINDOWS-1257" => Some(1257),
+        "CP1258" | "WINDOWS-1258" => Some(1258),
+        "CP437" => Some(437),
+        "CP850" => Some(850),
+        "CP852" => Some(852),
+        "CP866" => Some(866),
+        "EUC-JP" | "EUCJP" => Some(51932),
+        "CP932" | "WINDOWS-31J" | "SHIFT-JIS" => Some(932),
+        "EUC-KR" | "CP949" | "MS949" => Some(949),
+        "GBK" | "CP936" => Some(936),
+        "BIG5" | "BIG5-HKSCS" => Some(950),
+        "UTF-16BE" => Some(1201),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn decode_with_windows_code_page(
+    bytes: &[u8],
+    encoding: &str,
+    code_page: u32,
+) -> Result<String, OracleThinError> {
+    use windows_sys::Win32::Globalization::{MultiByteToWideChar, MB_ERR_INVALID_CHARS};
+
+    if code_page == 1201 {
+        return decode_utf16be_oracle_text(bytes);
+    }
+    if bytes.is_empty() {
+        return Ok(String::new());
+    }
+    let input_len = i32::try_from(bytes.len()).map_err(|_| {
+        OracleThinError::new(format!(
+            "Oracle text for {encoding} is too large for Windows code page conversion"
+        ))
+    })?;
+    let needed = unsafe {
+        MultiByteToWideChar(
+            code_page,
+            MB_ERR_INVALID_CHARS,
+            bytes.as_ptr(),
+            input_len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if needed <= 0 {
+        return Err(OracleThinError::new(format!(
+            "Windows failed to decode Oracle text as {encoding}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let mut wide = vec![0u16; needed as usize];
+    let written = unsafe {
+        MultiByteToWideChar(
+            code_page,
+            MB_ERR_INVALID_CHARS,
+            bytes.as_ptr(),
+            input_len,
+            wide.as_mut_ptr(),
+            needed,
+        )
+    };
+    if written <= 0 {
+        return Err(OracleThinError::new(format!(
+            "Windows failed to decode Oracle text as {encoding}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    wide.truncate(written as usize);
+    String::from_utf16(&wide).map_err(|err| {
+        OracleThinError::new(format!(
+            "Windows decoded invalid UTF-16 Oracle text for {encoding}: {err}"
+        ))
+    })
+}
+
+#[cfg(windows)]
+fn encode_with_windows_code_page(
+    text: &str,
+    encoding: &str,
+    code_page: u32,
+) -> Result<Vec<u8>, OracleThinError> {
+    use windows_sys::Win32::Globalization::WideCharToMultiByte;
+
+    if code_page == 1201 {
+        let mut output = Vec::with_capacity(text.len() * 2);
+        for unit in text.encode_utf16() {
+            output.extend_from_slice(&unit.to_be_bytes());
+        }
+        return Ok(output);
+    }
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    let wide_len = i32::try_from(wide.len()).map_err(|_| {
+        OracleThinError::new(format!(
+            "Oracle bind text for {encoding} is too large for Windows code page conversion"
+        ))
+    })?;
+    let mut used_default_char = 0;
+    let needed = unsafe {
+        WideCharToMultiByte(
+            code_page,
+            0,
+            wide.as_ptr(),
+            wide_len,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+            &mut used_default_char,
+        )
+    };
+    if needed <= 0 {
+        return Err(OracleThinError::new(format!(
+            "Windows failed to encode Oracle text as {encoding}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    if used_default_char != 0 {
+        return Err(OracleThinError::new(format!(
+            "Oracle text contains characters not representable in {encoding}"
+        )));
+    }
+    let mut output = vec![0u8; needed as usize];
+    let mut used_default_char = 0;
+    let written = unsafe {
+        WideCharToMultiByte(
+            code_page,
+            0,
+            wide.as_ptr(),
+            wide_len,
+            output.as_mut_ptr(),
+            needed,
+            std::ptr::null(),
+            &mut used_default_char,
+        )
+    };
+    if written <= 0 {
+        return Err(OracleThinError::new(format!(
+            "Windows failed to encode Oracle text as {encoding}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    if used_default_char != 0 {
+        return Err(OracleThinError::new(format!(
+            "Oracle text contains characters not representable in {encoding}"
+        )));
+    }
+    output.truncate(written as usize);
+    Ok(output)
+}
+
 #[cfg(unix)]
 #[allow(deprecated)]
 fn transcode_with_iconv(
@@ -4630,8 +4932,10 @@ fn transcode_with_iconv(
     from_encoding: &str,
     to_encoding: &str,
 ) -> Result<Vec<u8>, OracleThinError> {
-    let to_encoding = CString::new(to_encoding).expect("static iconv encoding name");
-    let from_encoding = CString::new(from_encoding).expect("static iconv encoding name");
+    let to_encoding = CString::new(to_encoding)
+        .map_err(|_| OracleThinError::new("iconv target encoding contains a NUL byte"))?;
+    let from_encoding = CString::new(from_encoding)
+        .map_err(|_| OracleThinError::new("iconv source encoding contains a NUL byte"))?;
     let cd = unsafe { libc::iconv_open(to_encoding.as_ptr(), from_encoding.as_ptr()) };
     if cd == (-1isize as libc::iconv_t) {
         return Err(OracleThinError::new(format!(
@@ -5835,11 +6139,12 @@ fn generate_auth_credentials(
 ) -> Result<AuthCredentials, OracleThinError> {
     match state.verifier_type {
         TNS_VERIFIER_TYPE_12C => generate_12c_auth_credentials(config, state),
+        TNS_VERIFIER_TYPE_10G => generate_10g_auth_credentials(config, state),
         TNS_VERIFIER_TYPE_11G_1 | TNS_VERIFIER_TYPE_11G_2 => {
             generate_11g_auth_credentials(config, state)
         }
         other => Err(OracleThinError::new(format!(
-            "unsupported Oracle password verifier type 0x{other:x}"
+            "unsupported Oracle password verifier type 0x{other:x}; supported types are 0x939, 0x1b25, 0xb152, and 0x4815"
         ))),
     }
 }
@@ -5887,6 +6192,20 @@ fn generate_11g_auth_credentials(
         state,
         &password_hash,
         24,
+        None,
+    )
+}
+
+fn generate_10g_auth_credentials(
+    config: &OracleThinConfig,
+    state: &mut AuthState,
+) -> Result<AuthCredentials, OracleThinError> {
+    let password_hash = generate_10g_password_hash(&config.username, &config.password);
+    generate_auth_credentials_from_password_hash(
+        config.password.as_bytes(),
+        state,
+        &password_hash,
+        16,
         None,
     )
 }
@@ -5960,6 +6279,95 @@ fn generate_11g_password_hash(password: &[u8], verifier_data: &[u8]) -> Vec<u8> 
     let mut password_hash = hasher.finalize().to_vec();
     password_hash.extend_from_slice(&[0, 0, 0, 0]);
     password_hash
+}
+
+fn generate_10g_password_hash(username: &str, password: &str) -> Vec<u8> {
+    let mut buffer = Vec::with_capacity((username.len() + password.len()) * 2 + 8);
+    append_10g_password_part(&mut buffer, username);
+    append_10g_password_part(&mut buffer, password);
+    while buffer.len() % 8 != 0 {
+        buffer.push(0);
+    }
+
+    let first_key = des_cbc_checksum(&buffer, TNS_LEGACY_DES_KEY);
+    let second_key = des_cbc_checksum(&buffer, first_key);
+    let mut password_hash = Vec::with_capacity(16);
+    password_hash.extend_from_slice(&second_key);
+    password_hash.extend_from_slice(&[0; 8]);
+    password_hash
+}
+
+fn append_10g_password_part(buffer: &mut Vec<u8>, value: &str) {
+    for byte in value.bytes() {
+        buffer.push(0);
+        buffer.push(byte.to_ascii_uppercase());
+    }
+}
+
+fn des_cbc_checksum(input: &[u8], key: [u8; 8]) -> [u8; 8] {
+    let mut block = [0u8; 8];
+    for chunk in input.chunks_exact(8) {
+        for i in 0..8 {
+            block[i] ^= chunk[i];
+        }
+        block = des_encrypt_block(block, key);
+    }
+    block
+}
+
+fn des_encrypt_block(block: [u8; 8], key: [u8; 8]) -> [u8; 8] {
+    let subkeys = des_subkeys(key);
+    let permuted = des_permute(u64::from_be_bytes(block), 64, &DES_INITIAL_PERMUTATION);
+    let mut left = (permuted >> 32) as u32;
+    let mut right = permuted as u32;
+    for subkey in subkeys {
+        let next_left = right;
+        right = left ^ des_round(right, subkey);
+        left = next_left;
+    }
+    let preoutput = (u64::from(right) << 32) | u64::from(left);
+    des_permute(preoutput, 64, &DES_FINAL_PERMUTATION).to_be_bytes()
+}
+
+fn des_subkeys(key: [u8; 8]) -> [u64; 16] {
+    let mut subkeys = [0u64; 16];
+    let permuted = des_permute(u64::from_be_bytes(key), 64, &DES_PC1);
+    let mut left = ((permuted >> 28) & 0x0fff_ffff) as u32;
+    let mut right = (permuted & 0x0fff_ffff) as u32;
+    for (index, shift) in DES_KEY_SHIFTS.iter().enumerate() {
+        left = des_rotate_28(left, *shift);
+        right = des_rotate_28(right, *shift);
+        let joined = (u64::from(left) << 28) | u64::from(right);
+        subkeys[index] = des_permute(joined, 56, &DES_PC2);
+    }
+    subkeys
+}
+
+fn des_rotate_28(value: u32, shift: u8) -> u32 {
+    ((value << shift) | (value >> (28 - shift))) & 0x0fff_ffff
+}
+
+fn des_round(right: u32, subkey: u64) -> u32 {
+    let expanded = des_permute(u64::from(right), 32, &DES_EXPANSION) ^ subkey;
+    let mut substituted = 0u32;
+    for box_index in 0..8 {
+        let shift = 42 - (box_index * 6);
+        let chunk = ((expanded >> shift) & 0x3f) as u8;
+        let row = ((chunk & 0x20) >> 4) | (chunk & 0x01);
+        let column = (chunk >> 1) & 0x0f;
+        let value = DES_S_BOXES[box_index][usize::from(row * 16 + column)];
+        substituted = (substituted << 4) | u32::from(value);
+    }
+    des_permute(u64::from(substituted), 32, &DES_P_PERMUTATION) as u32
+}
+
+fn des_permute(input: u64, input_bits: u8, table: &[u8]) -> u64 {
+    let mut output = 0u64;
+    for position in table {
+        output <<= 1;
+        output |= (input >> (input_bits - position)) & 1;
+    }
+    output
 }
 
 fn derive_auth_combo_key(
@@ -6124,6 +6532,10 @@ fn aes_encrypt_cbc_pkcs7(key: &[u8], plain_text: &[u8]) -> Result<Vec<u8>, Oracl
     let mut buf = plain_text.to_vec();
     buf.resize(pos + 16, 0);
     let encrypted = match key.len() {
+        16 => cbc::Encryptor::<Aes128>::new_from_slices(key, &iv)
+            .map_err(|err| OracleThinError::new(format!("invalid AES-128 key: {err}")))?
+            .encrypt_padded_mut::<Pkcs7>(&mut buf, pos)
+            .map_err(|err| OracleThinError::new(format!("AES-CBC encrypt failed: {err}")))?,
         24 => cbc::Encryptor::<Aes192>::new_from_slices(key, &iv)
             .map_err(|err| OracleThinError::new(format!("invalid AES-192 key: {err}")))?
             .encrypt_padded_mut::<Pkcs7>(&mut buf, pos)
@@ -6148,6 +6560,10 @@ fn aes_decrypt_cbc_no_padding(
     let iv = [0u8; 16];
     let mut buf = encrypted_text.to_vec();
     let decrypted = match key.len() {
+        16 => cbc::Decryptor::<Aes128>::new_from_slices(key, &iv)
+            .map_err(|err| OracleThinError::new(format!("invalid AES-128 key: {err}")))?
+            .decrypt_padded_mut::<NoPadding>(&mut buf)
+            .map_err(|err| OracleThinError::new(format!("AES-CBC decrypt failed: {err}")))?,
         24 => cbc::Decryptor::<Aes192>::new_from_slices(key, &iv)
             .map_err(|err| OracleThinError::new(format!("invalid AES-192 key: {err}")))?
             .decrypt_padded_mut::<NoPadding>(&mut buf)
@@ -7315,15 +7731,16 @@ mod tests {
         decode_oracle_binary_float, decode_oracle_datetime, decode_oracle_interval_ds,
         decode_oracle_interval_ym, decode_oracle_number, decode_oracle_text, decode_oracle_vector,
         decode_oson_to_json, default_ttc_field_version, define_column_metadata,
-        derive_auth_combo_key, encode_oracle_bind_text, encode_oracle_number,
+        derive_auth_combo_key, des_encrypt_block, encode_oracle_bind_text, encode_oracle_number,
         encode_oracle_timestamp_bind, encode_oson_json, encode_physical_rowid,
-        generate_11g_password_hash, generate_auth_credentials_from_session_key_parts,
-        hex_encode_upper, legacy_json_serialized_query, local_timezone_offset_string,
-        oracle_column_type_from_ora_type, process_auth_payload, process_describe_body,
-        process_legacy_execute_error, process_protocol_message, process_row_data,
+        generate_10g_password_hash, generate_11g_password_hash,
+        generate_auth_credentials_from_session_key_parts, hex_encode_upper,
+        legacy_json_serialized_query, local_timezone_offset_string, oracle_column_type_from_ora_type,
+        process_auth_payload, process_describe_body, process_legacy_execute_error,
+        process_protocol_message, process_row_data,
         read_boolean_value, read_data_packet_with_control, read_data_packet_with_flags,
         read_rowid_value, read_urowid_value, thin_column_from_column_metadata,
-        validate_supported_protocol, verify_server_response, write_bind_value,
+        validate_supported_protocol, verify_server_response, windows_code_page_for_encoding, write_bind_value,
         write_bytes_with_length_for_capabilities, write_bytes_with_two_lengths,
         write_column_metadata, write_data_type_representations, write_ub2, write_ub4, write_ub8,
         AuthState, OracleThinCapabilities, OracleThinConfig, OracleThinSession, OracleValue,
@@ -7337,7 +7754,7 @@ mod tests {
         TNS_MSG_TYPE_ERROR, TNS_MSG_TYPE_PARAMETER, TNS_MSG_TYPE_PROTOCOL,
         TNS_MSG_TYPE_SERVER_SIDE_PIGGYBACK, TNS_OBJ_NO_PREFIX_SEG, TNS_RCAP_TTC, TNS_RCAP_TTC_32K,
         TNS_RCAP_TTC_SESSION_STATE_OPS, TNS_RCAP_TTC_ZERO_COPY, TNS_SERVER_PIGGYBACK_TRACE_EVENT,
-        TNS_VERIFIER_TYPE_11G_2, TNS_XML_TYPE_STRING,
+        TNS_VERIFIER_TYPE_10G, TNS_VERIFIER_TYPE_11G_2, TNS_XML_TYPE_STRING,
     };
     use super::{
         bind_column_metadata, ExecuteReadState, DATA_TYPE_REPRESENTATIONS, ORA_TYPE_NUM_BFILE,
@@ -7727,6 +8144,18 @@ mod tests {
             .expect_err("native KO16 bytes should not decode without a matching server charset");
 
         assert!(err.to_string().contains("invalid UTF-8"));
+    }
+
+    #[test]
+    fn native_charset_windows_code_page_mapping_covers_oracle_candidates() {
+        assert_eq!(windows_code_page_for_encoding("EUC-KR"), Some(949));
+        assert_eq!(windows_code_page_for_encoding("MS949"), Some(949));
+        assert_eq!(windows_code_page_for_encoding("CP932"), Some(932));
+        assert_eq!(windows_code_page_for_encoding("GBK"), Some(936));
+        assert_eq!(windows_code_page_for_encoding("BIG5"), Some(950));
+        assert_eq!(windows_code_page_for_encoding("WINDOWS-1252"), Some(1252));
+        assert_eq!(windows_code_page_for_encoding("UTF-16BE"), Some(1201));
+        assert_eq!(windows_code_page_for_encoding("unknown"), None);
     }
 
     #[cfg(unix)]
@@ -8853,6 +9282,26 @@ mod tests {
     }
 
     #[test]
+    fn auth_legacy_des_block_matches_standard_vector() {
+        let encrypted = des_encrypt_block(
+            [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef],
+            [0x13, 0x34, 0x57, 0x79, 0x9b, 0xbc, 0xdf, 0xf1],
+        );
+
+        assert_eq!(hex_encode_upper(&encrypted), "85E813540F0AB405");
+    }
+
+    #[test]
+    fn auth_10g_password_hash_matches_go_ora_legacy_algorithm() {
+        let password_hash = generate_10g_password_hash("scott", "tiger");
+
+        assert_eq!(
+            hex_encode_upper(&password_hash),
+            "F894844C34402B670000000000000000"
+        );
+    }
+
+    #[test]
     fn auth_48_byte_session_key_uses_md5_xor_combo_key() {
         let state = AuthState::default();
         let session_key_part_a = (0u8..48).collect::<Vec<_>>();
@@ -8898,6 +9347,33 @@ mod tests {
         assert!(credentials.speedy_key.is_none());
         assert!(!credentials.password.is_empty());
         assert_eq!(state.combo_key.as_ref().unwrap().len(), 24);
+    }
+
+    #[test]
+    fn auth_10g_credentials_use_aes128_and_do_not_send_speedy_key() {
+        let password_hash = generate_10g_password_hash("scott", "tiger");
+        let session_key_part_a = (0u8..48).collect::<Vec<_>>();
+        let session_key_part_b = (0u8..48).rev().collect::<Vec<_>>();
+        let mut state = AuthState {
+            verifier_type: TNS_VERIFIER_TYPE_10G,
+            ..AuthState::default()
+        };
+
+        let credentials = generate_auth_credentials_from_session_key_parts(
+            b"tiger",
+            &mut state,
+            &password_hash,
+            16,
+            None,
+            &session_key_part_a,
+            &session_key_part_b,
+        )
+        .unwrap();
+
+        assert_eq!(credentials.session_key.len(), 96);
+        assert!(credentials.speedy_key.is_none());
+        assert!(!credentials.password.is_empty());
+        assert_eq!(state.combo_key.as_ref().unwrap().len(), 16);
     }
 
     #[test]

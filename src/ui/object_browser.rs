@@ -7427,11 +7427,68 @@ mod tests {
         ObjectItem, ScopeSwitchPreflightCallback, SCOPE_SELECTOR_ROW_HEIGHT,
         SCOPE_SELECTOR_TABLE_VERTICAL_PADDING,
     };
-    use crate::db::DatabaseType;
+    use crate::db::{DatabaseType, OracleDriverMode};
     use crate::db::{PackageRoutine, ProcedureArgument};
     use crate::ui::{IntellisenseData, QualifiedMemberKind};
     use fltk::enums::Key;
     use std::sync::{Arc, Mutex};
+    use tns_thin::exec::StatementRequest as OracleThinStatementRequest;
+
+    fn oracle_thin_live_connection_info() -> crate::db::ConnectionInfo {
+        let host = std::env::var("ORACLE_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+        let port = std::env::var("ORACLE_TEST_PORT")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(1521);
+        let service_name = std::env::var("ORACLE_TEST_SERVICE")
+            .or_else(|_| std::env::var("ORACLE_TEST_SERVICE_NAME"))
+            .unwrap_or_else(|_| "FREE".to_string());
+        let username =
+            std::env::var("ORACLE_TEST_USERNAME").unwrap_or_else(|_| "system".to_string());
+        let password =
+            std::env::var("ORACLE_TEST_PASSWORD").unwrap_or_else(|_| "password".to_string());
+        let mut info = crate::db::ConnectionInfo::new_with_type(
+            "oracle-thin-live",
+            &username,
+            &password,
+            &host,
+            port,
+            &service_name,
+            DatabaseType::Oracle,
+        );
+        info.advanced.oracle_driver_mode = OracleDriverMode::Thin;
+        info
+    }
+
+    fn oracle_thin_live_config() -> tns_thin::OracleThinConfig {
+        let info = oracle_thin_live_connection_info();
+        let mut config = tns_thin::OracleThinConfig::new(
+            tns_thin::ConnectTarget::service_name(info.host, info.port, info.service_name),
+            info.username,
+            info.password,
+        );
+        if let Ok(version) = std::env::var("ORACLE_THIN_DESIRED_PROTOCOL") {
+            if let Ok(version) = version.trim().parse::<u16>() {
+                config.connect_options.desired_protocol_version = version;
+            }
+        }
+        if let Ok(version) = std::env::var("ORACLE_THIN_MINIMUM_PROTOCOL") {
+            if let Ok(version) = version.trim().parse::<u16>() {
+                config.connect_options.minimum_protocol_version = version;
+            }
+        }
+        config.connect_options.disable_oob_probe = true;
+        config
+    }
+
+    fn execute_oracle_thin_live_sql(
+        session: &mut tns_thin::OracleThinSession,
+        sql: impl Into<String>,
+    ) {
+        session
+            .execute(&OracleThinStatementRequest::statement(sql), 0)
+            .expect("execute Oracle Thin object-browser UI metadata setup SQL");
+    }
 
     fn procedure_argument(
         name: Option<&str>,
@@ -7479,6 +7536,164 @@ mod tests {
             _ => panic!("expected simple object"),
         }
         assert_eq!(resolved.selected_scope.as_deref(), expected_scope);
+    }
+
+    #[test]
+    #[ignore = "requires a reachable Oracle listener"]
+    fn oracle_thin_ui_metadata_cache_loads_all_object_categories() {
+        let suffix = std::process::id();
+        let table = format!("OQT_UI_META_{suffix}");
+        let view = format!("OQT_UI_META_V_{suffix}");
+        let procedure = format!("OQT_UI_META_P_{suffix}");
+        let function = format!("OQT_UI_META_F_{suffix}");
+        let sequence = format!("OQT_UI_META_S_{suffix}");
+        let trigger = format!("OQT_UI_META_T_{suffix}");
+        let synonym = format!("OQT_UI_META_Y_{suffix}");
+        let package = format!("OQT_UI_META_G_{suffix}");
+
+        let mut setup_session =
+            tns_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
+        let _ = setup_session.execute(
+            &OracleThinStatementRequest::statement(format!("DROP SYNONYM {synonym}")),
+            0,
+        );
+        let _ = setup_session.execute(
+            &OracleThinStatementRequest::statement(format!("DROP PACKAGE {package}")),
+            0,
+        );
+        let _ = setup_session.execute(
+            &OracleThinStatementRequest::statement(format!("DROP FUNCTION {function}")),
+            0,
+        );
+        let _ = setup_session.execute(
+            &OracleThinStatementRequest::statement(format!("DROP PROCEDURE {procedure}")),
+            0,
+        );
+        let _ = setup_session.execute(
+            &OracleThinStatementRequest::statement(format!("DROP SEQUENCE {sequence}")),
+            0,
+        );
+        let _ = setup_session.execute(
+            &OracleThinStatementRequest::statement(format!("DROP VIEW {view}")),
+            0,
+        );
+        let _ = setup_session.execute(
+            &OracleThinStatementRequest::statement(format!("DROP TRIGGER {trigger}")),
+            0,
+        );
+        let _ = setup_session.execute(
+            &OracleThinStatementRequest::statement(format!("DROP TABLE {table} PURGE")),
+            0,
+        );
+
+        execute_oracle_thin_live_sql(
+            &mut setup_session,
+            format!("CREATE TABLE {table} (id NUMBER PRIMARY KEY, name VARCHAR2(30))"),
+        );
+        execute_oracle_thin_live_sql(
+            &mut setup_session,
+            format!("CREATE VIEW {view} AS SELECT id, name FROM {table}"),
+        );
+        execute_oracle_thin_live_sql(
+            &mut setup_session,
+            format!("CREATE OR REPLACE PROCEDURE {procedure} IS BEGIN NULL; END;"),
+        );
+        execute_oracle_thin_live_sql(
+            &mut setup_session,
+            format!("CREATE OR REPLACE FUNCTION {function} RETURN NUMBER IS BEGIN RETURN 1; END;"),
+        );
+        execute_oracle_thin_live_sql(
+            &mut setup_session,
+            format!("CREATE SEQUENCE {sequence} START WITH 1"),
+        );
+        execute_oracle_thin_live_sql(
+            &mut setup_session,
+            format!(
+                "CREATE OR REPLACE TRIGGER {trigger} BEFORE INSERT ON {table} \
+                 FOR EACH ROW BEGIN NULL; END;"
+            ),
+        );
+        execute_oracle_thin_live_sql(
+            &mut setup_session,
+            format!("CREATE SYNONYM {synonym} FOR {table}"),
+        );
+        execute_oracle_thin_live_sql(
+            &mut setup_session,
+            format!("CREATE OR REPLACE PACKAGE {package} AS PROCEDURE P; END;"),
+        );
+
+        let shared_connection = crate::db::create_shared_connection();
+        {
+            let mut connection = crate::db::lock_connection(&shared_connection);
+            connection
+                .connect(oracle_thin_live_connection_info())
+                .expect("connect through UI Oracle Thin connection info");
+        }
+        let context = crate::db::pool_session_context_for_shared_connection(
+            &shared_connection,
+            Some("Load object browser metadata"),
+        )
+        .expect("load UI object browser pool context");
+        let (db_type, cache, available_scopes, selected_scope) =
+            ObjectBrowserWidget::load_metadata_cache(context, None)
+                .expect("load UI object browser metadata cache");
+
+        assert_eq!(db_type, DatabaseType::Oracle);
+        let selected_scope = selected_scope.expect("selected Oracle scope");
+        assert!(
+            available_scopes.contains(&selected_scope),
+            "selected scope should be listed in available scopes"
+        );
+        assert!(cache.tables.contains(&table), "table should load");
+        assert!(cache.views.contains(&view), "view should load");
+        assert!(
+            cache.procedures.contains(&procedure),
+            "procedure should load"
+        );
+        assert!(cache.functions.contains(&function), "function should load");
+        assert!(cache.sequences.contains(&sequence), "sequence should load");
+        assert!(cache.triggers.contains(&trigger), "trigger should load");
+        assert!(cache.synonyms.contains(&synonym), "synonym should load");
+        assert!(cache.packages.contains(&package), "package should load");
+
+        {
+            let mut connection = crate::db::lock_connection(&shared_connection);
+            connection.disconnect();
+        }
+        crate::db::clear_pool_session_context_for_shared_connection(&shared_connection);
+
+        let _ = setup_session.execute(
+            &OracleThinStatementRequest::statement(format!("DROP SYNONYM {synonym}")),
+            0,
+        );
+        let _ = setup_session.execute(
+            &OracleThinStatementRequest::statement(format!("DROP PACKAGE {package}")),
+            0,
+        );
+        let _ = setup_session.execute(
+            &OracleThinStatementRequest::statement(format!("DROP FUNCTION {function}")),
+            0,
+        );
+        let _ = setup_session.execute(
+            &OracleThinStatementRequest::statement(format!("DROP PROCEDURE {procedure}")),
+            0,
+        );
+        let _ = setup_session.execute(
+            &OracleThinStatementRequest::statement(format!("DROP SEQUENCE {sequence}")),
+            0,
+        );
+        let _ = setup_session.execute(
+            &OracleThinStatementRequest::statement(format!("DROP VIEW {view}")),
+            0,
+        );
+        let _ = setup_session.execute(
+            &OracleThinStatementRequest::statement(format!("DROP TRIGGER {trigger}")),
+            0,
+        );
+        let _ = setup_session.execute(
+            &OracleThinStatementRequest::statement(format!("DROP TABLE {table} PURGE")),
+            0,
+        );
     }
 
     #[test]
