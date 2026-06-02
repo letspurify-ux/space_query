@@ -153,6 +153,11 @@ MySQL / MariaDB 루트 카테고리:
 - 다음 실행 시 이전 크래시 리포트 표시
 - 레거시 `oracle_query_tool` 설정/키링 네임스페이스 마이그레이션
 
+## 요구사항
+
+- Rust toolchain (stable) — 소스에서 빌드할 때 필요합니다.
+- 지원 플랫폼: macOS, Linux, Windows.
+
 ## 실행
 
 이 워크스페이스에는 여러 바이너리가 있으므로 실행 시 `--bin space_query`를 지정해야 합니다.
@@ -168,6 +173,16 @@ cargo run --bin space_query
 ```bash
 cargo run --release --bin space_query
 ```
+
+## 빌드
+
+배포용 바이너리는 릴리스 빌드로 생성합니다.
+
+```bash
+cargo build --release --bin space_query
+```
+
+산출물은 `target/release/space_query`(Windows는 `space_query.exe`)에 생성됩니다.
 
 ## 테스트
 
@@ -221,7 +236,7 @@ GUI 실행에는 FLTK/X11 런타임 의존성이 필요합니다. 빌드 전 해
 
 ## 저장 위치
 
-경로의 OS별 루트는 `dirs` crate가 결정하고, 앱 디렉터리 이름은 `space_query`입니다.
+경로의 OS별 루트는 각 OS의 표준 디렉터리 규칙을 따르며, 앱 디렉터리 이름은 `space_query`입니다.
 
 - 설정 파일: `config_dir()/space_query/config.json`
 - 앱 로그: `data_dir()/space_query/app.log.json`

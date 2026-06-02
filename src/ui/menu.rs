@@ -97,12 +97,11 @@ Highlights\n\
 - Explain Plan / EXPLAIN, SQL*Plus-style script execution, and transaction controls\n\
 - Saved connections, OS keyring password storage, and application log viewer\n\
 \n\
-Session Policy\n\
-- Each query tab owns its logical session and connection profile\n\
-- Cancel/timeout does not immediately mean Disconnected; the tab stays Connected when possible\n\
-- Physical DB sessions are reused only after cleanup, transaction safety, timeout restore, and health check succeed\n\
-- DML/DDL, PL/SQL, scripts, open transactions, failed cleanup, and unknown errors are handled conservatively with a fresh physical session on the next execution\n\
-- Commit/Rollback targets the tab selected when the command was requested\n\
+Copyright (c) 2026 SPACE Query contributors\n\
+Licensed under MIT OR Apache-2.0\n\
+\n\
+Oracle and MySQL are trademarks of Oracle and/or its affiliates.\n\
+This project is not affiliated with or endorsed by Oracle.\n\
 \n\
 Runtime\n\
 - Build: {build_profile}\n\
@@ -525,7 +524,7 @@ impl MenuBarBuilder {
         // Help menu
         menu.add("&Help/&About", Shortcut::None, MenuFlag::Normal, |_| {
             let content = build_about_dialog_content();
-            show_info_dialog("About", &content, 640, 420);
+            show_info_dialog("About", &content, 640, 360);
         });
         menu.add(
             "&Help/&Keyboard Shortcuts",
