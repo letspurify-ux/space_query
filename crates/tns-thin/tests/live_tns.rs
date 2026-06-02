@@ -1616,6 +1616,79 @@ fn plsql_out_ref_cursor_fetches_rows() {
 
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn plsql_function_scalar_return_bind_returns_value() {
+    let function_name = unique_object_name("FUNC_SCALAR");
+    let mut conn = connect();
+    drop_function_ignore(&mut conn, &function_name);
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE FUNCTION {function_name}(p_value VARCHAR2) RETURN VARCHAR2 IS \
+         BEGIN \
+         RETURN 'FN-' || p_value; \
+         END;"
+    ))
+    .expect("create scalar return function");
+
+    let mut request =
+        StatementRequest::statement(format!("BEGIN :1 := {function_name}(:2); END;"));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Varchar,
+        max_len: 50,
+    });
+    request.binds.push(BindValue::Text("TXT".to_string()));
+
+    let values = conn
+        .execute_out_binds(&request, &[])
+        .expect("PL/SQL function scalar return bind");
+
+    assert_eq!(rows_to_strings(&[values]), vec![vec!["FN-TXT".to_string()]]);
+    drop_function_ignore(&mut conn, &function_name);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn plsql_function_ref_cursor_return_bind_fetches_rows() {
+    let function_name = unique_object_name("FUNC_RC");
+    let mut conn = connect();
+    drop_function_ignore(&mut conn, &function_name);
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE FUNCTION {function_name} RETURN SYS_REFCURSOR IS \
+         rc SYS_REFCURSOR; \
+         BEGIN \
+         OPEN rc FOR SELECT 11 AS n, 'function ref cursor' AS label FROM dual; \
+         RETURN rc; \
+         END;"
+    ))
+    .expect("create ref cursor return function");
+
+    let mut request = StatementRequest::statement(format!("BEGIN :1 := {function_name}(); END;"));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Cursor,
+        max_len: 1,
+    });
+
+    let values = conn
+        .execute_out_binds(&request, &[])
+        .expect("PL/SQL function REF CURSOR return bind");
+    let cursor = match values.first() {
+        Some(OracleValue::Cursor(cursor)) => cursor.clone(),
+        other => panic!("expected function return REF CURSOR, got {other:?}"),
+    };
+    let rows = conn
+        .fetch_ref_cursor_all(cursor.cursor_id, cursor.columns, 10)
+        .expect("fetch function return REF CURSOR rows");
+
+    assert_eq!(
+        rows_to_strings(&rows.result.rows),
+        vec![vec![
+            "11".to_string(),
+            "function ref cursor".to_string()
+        ]]
+    );
+    drop_function_ignore(&mut conn, &function_name);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn plsql_implicit_resultset_fetches_rows_when_supported() {
     let mut conn = connect();
     if !conn.capabilities().supports_implicit_resultsets {
@@ -1905,6 +1978,10 @@ fn ttc_field_version_env(name: &str) -> Option<u8> {
 }
 
 fn unique_table_name(prefix: &str) -> String {
+    unique_object_name(prefix)
+}
+
+fn unique_object_name(prefix: &str) -> String {
     let counter = OBJECT_COUNTER.fetch_add(1, Ordering::SeqCst);
     format!(
         "OQT_{}_{}_{}",
@@ -1916,6 +1993,10 @@ fn unique_table_name(prefix: &str) -> String {
 
 fn drop_table_ignore(conn: &mut OracleThinSession, table: &str) {
     let _ = conn.query_drop(&format!("DROP TABLE {table} PURGE"));
+}
+
+fn drop_function_ignore(conn: &mut OracleThinSession, function_name: &str) {
+    let _ = conn.query_drop(&format!("DROP FUNCTION {function_name}"));
 }
 
 fn select_count(conn: &mut OracleThinSession, table: &str) -> i64 {

@@ -1462,6 +1462,24 @@ struct ExecuteError {
     message: Option<String>,
 }
 
+fn execute_flags_for_request(parse_only_describe: bool, request: &StatementRequest) -> u32 {
+    if parse_only_describe || !request_allows_implicit_resultsets(request) {
+        0
+    } else {
+        TNS_EXEC_FLAGS_IMPLICIT_RESULTSET
+    }
+}
+
+fn request_allows_implicit_resultsets(request: &StatementRequest) -> bool {
+    request.implicit_resultsets
+        && request.is_plsql
+        && (request.binds.is_empty()
+            || request
+                .sql
+                .to_ascii_uppercase()
+                .contains("DBMS_SQL.RETURN_RESULT"))
+}
+
 fn write_execute_request(
     stream: &mut TcpStream,
     capabilities: &OracleThinCapabilities,
@@ -1521,11 +1539,7 @@ fn write_execute_request(
     if request.auto_commit && !parse_only_describe {
         options |= TNS_EXEC_OPTION_COMMIT;
     }
-    let exec_flags = if !parse_only_describe {
-        TNS_EXEC_FLAGS_IMPLICIT_RESULTSET
-    } else {
-        0
-    };
+    let exec_flags = execute_flags_for_request(parse_only_describe, request);
 
     let mut payload = Vec::new();
     if let Some(close_sequence) = close_sequence {
@@ -1721,11 +1735,7 @@ fn write_legacy_execute_request(
     al8i4[0] = 1;
     al8i4[1] = if request.is_query { 0 } else { 1 };
     al8i4[7] = u32::from(request.is_query);
-    al8i4[9] = if !parse_only_describe {
-        TNS_EXEC_FLAGS_IMPLICIT_RESULTSET
-    } else {
-        0
-    };
+    al8i4[9] = execute_flags_for_request(parse_only_describe, request);
     for value in al8i4 {
         write_ub4(&mut payload, value);
     }
@@ -7793,13 +7803,14 @@ mod tests {
         legacy_json_serialized_query, local_timezone_offset_string, oracle_column_type_from_ora_type,
         process_auth_payload, process_describe_body, process_legacy_execute_error,
         process_protocol_message, process_row_data,
-        read_boolean_value, read_data_packet_with_control, read_data_packet_with_flags,
-        read_rowid_value, read_urowid_value, thin_column_from_column_metadata,
-        validate_supported_protocol, verify_server_response, windows_code_pages_for_encoding, write_bind_value,
-        write_bytes_with_length_for_capabilities, write_bytes_with_two_lengths,
-        write_column_metadata, write_data_type_representations, write_ub2, write_ub4, write_ub8,
-        AuthState, OracleThinCapabilities, OracleThinConfig, OracleThinSession, OracleValue,
-        PacketCursor, ThinColumn, CS_FORM_IMPLICIT, CS_FORM_NCHAR, ORACLE_CHARSET_AL32UTF8,
+        execute_flags_for_request, read_boolean_value, read_data_packet_with_control,
+        read_data_packet_with_flags, read_rowid_value, read_urowid_value,
+        thin_column_from_column_metadata, validate_supported_protocol, verify_server_response,
+        windows_code_pages_for_encoding, write_bind_value, write_bytes_with_length_for_capabilities,
+        write_bytes_with_two_lengths, write_column_metadata, write_data_type_representations,
+        write_ub2, write_ub4, write_ub8, AuthState, OracleThinCapabilities, OracleThinConfig,
+        OracleThinSession, OracleValue, PacketCursor, ThinColumn, CS_FORM_IMPLICIT, CS_FORM_NCHAR,
+        ORACLE_CHARSET_AL32UTF8,
         ORACLE_CHARSET_JA16SJIS, ORACLE_CHARSET_KO16KSC5601, ORACLE_CHARSET_KO16MSWIN949,
         ORACLE_CHARSET_UTF8, ORACLE_CHARSET_ZHS16GBK, ORACLE_CHARSET_ZHT16BIG5,
         TNS_CCAP_END_OF_CALL_STATUS, TNS_CCAP_END_OF_RESPONSE, TNS_CCAP_EXPLICIT_BOUNDARY,
@@ -7822,10 +7833,13 @@ mod tests {
         TNS_DATA_TYPE_DBLOB, TNS_DATA_TYPE_DCLOB, TNS_DATA_TYPE_DTR, TNS_DATA_TYPE_LVB,
         TNS_DATA_TYPE_ODT, TNS_DATA_TYPE_RDD, TNS_DATA_TYPE_RSET, TNS_DATA_TYPE_TIME,
         TNS_DATA_TYPE_TIME_TZ, TNS_DATA_TYPE_UB8, TNS_DATA_TYPE_VCS, TNS_ERR_INBAND_MESSAGE,
-        TNS_LOB_PREFETCH_FLAG, TNS_MAX_LONG_LENGTH, TNS_PACKET_TYPE_CONTROL, TNS_PACKET_TYPE_DATA,
+        TNS_EXEC_FLAGS_IMPLICIT_RESULTSET, TNS_LOB_PREFETCH_FLAG, TNS_MAX_LONG_LENGTH,
+        TNS_PACKET_TYPE_CONTROL, TNS_PACKET_TYPE_DATA,
     };
     use crate::connect::{AcceptInfo, ConnectOptions, ConnectTarget};
-    use crate::exec::{BindInputValue, BindValue, ColumnMetadata, OracleColumnType};
+    use crate::exec::{
+        BindInputValue, BindValue, ColumnMetadata, OracleColumnType, StatementRequest,
+    };
 
     fn test_session_with_stream(stream: TcpStream) -> OracleThinSession {
         OracleThinSession {
@@ -8073,6 +8087,33 @@ mod tests {
             write_bind_value(&mut out, &caps, &bind).unwrap();
             assert_eq!(out, vec![TNS_ESCAPE_CHAR, 1]);
         }
+    }
+
+    #[test]
+    fn execute_flags_follow_implicit_resultset_request() {
+        let mut request = StatementRequest::statement("BEGIN NULL; END;");
+        request.implicit_resultsets = false;
+
+        assert_eq!(execute_flags_for_request(false, &request), 0);
+
+        request.implicit_resultsets = true;
+        assert_eq!(
+            execute_flags_for_request(false, &request),
+            TNS_EXEC_FLAGS_IMPLICIT_RESULTSET
+        );
+        assert_eq!(execute_flags_for_request(true, &request), 0);
+
+        request.binds.push(BindValue::Out {
+            column_type: OracleColumnType::Varchar,
+            max_len: 10,
+        });
+        assert_eq!(execute_flags_for_request(false, &request), 0);
+
+        request.sql = "DECLARE rc SYS_REFCURSOR; BEGIN DBMS_SQL.RETURN_RESULT(rc); END;".to_string();
+        assert_eq!(
+            execute_flags_for_request(false, &request),
+            TNS_EXEC_FLAGS_IMPLICIT_RESULTSET
+        );
     }
 
     #[test]

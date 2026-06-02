@@ -12530,8 +12530,20 @@ impl SqlEditorWidget {
         request.is_plsql =
             head.starts_with("begin") || head.starts_with("declare") || head.starts_with("call");
         request.auto_commit = auto_commit;
-        request.implicit_resultsets = request.is_plsql;
+        request.implicit_resultsets = Self::oracle_thin_should_request_implicit_resultsets(
+            &request.sql,
+            request.is_plsql,
+            false,
+        );
         request
+    }
+
+    fn oracle_thin_should_request_implicit_resultsets(
+        sql: &str,
+        is_plsql: bool,
+        has_binds: bool,
+    ) -> bool {
+        is_plsql && (!has_binds || sql.to_ascii_uppercase().contains("DBMS_SQL.RETURN_RESULT"))
     }
 
     fn execute_oracle_thin_cancel_requested(cancel_flag: Option<&Arc<Mutex<bool>>>) -> bool {
@@ -12715,6 +12727,12 @@ impl SqlEditorWidget {
         let mut request = Self::oracle_thin_statement_request(sql.to_string(), auto_commit);
         if !conn.capabilities().supports_implicit_resultsets {
             request.implicit_resultsets = false;
+        } else {
+            request.implicit_resultsets = Self::oracle_thin_should_request_implicit_resultsets(
+                &request.sql,
+                request.is_plsql,
+                true,
+            );
         }
         if request.is_plsql {
             request.binds = resolved
@@ -29203,6 +29221,38 @@ mod mysql_transaction_feedback_tests {
         assert!(SqlEditorWidget::oracle_thin_is_ddl_or_dcl(
             &SqlEditorWidget::oracle_thin_statement_head("-- ddl\nCREATE TABLE t (id NUMBER)")
         ));
+    }
+
+    #[test]
+    fn oracle_thin_implicit_resultset_policy_skips_plain_bound_plsql() {
+        assert!(
+            SqlEditorWidget::oracle_thin_should_request_implicit_resultsets(
+                "BEGIN NULL; END;",
+                true,
+                false
+            )
+        );
+        assert!(
+            !SqlEditorWidget::oracle_thin_should_request_implicit_resultsets(
+                "BEGIN :v_out := 1; END;",
+                true,
+                true
+            )
+        );
+        assert!(
+            SqlEditorWidget::oracle_thin_should_request_implicit_resultsets(
+                "DECLARE rc SYS_REFCURSOR; BEGIN DBMS_SQL.RETURN_RESULT(rc); END;",
+                true,
+                true
+            )
+        );
+        assert!(
+            !SqlEditorWidget::oracle_thin_should_request_implicit_resultsets(
+                "SELECT 1 FROM dual",
+                false,
+                false
+            )
+        );
     }
 
     #[test]
