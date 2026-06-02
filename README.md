@@ -158,22 +158,18 @@ MySQL / MariaDB 루트 카테고리:
 
 ## 실행
 
+이 워크스페이스에는 여러 바이너리가 있으므로 실행 시 `--bin space_query`를 지정해야 합니다.
+
 개발 실행:
 
 ```bash
-cargo run
+cargo run --bin space_query
 ```
 
 릴리스 실행:
 
 ```bash
-cargo run --release
-```
-
-명시적으로 바이너리를 지정하려면:
-
-```bash
-cargo run --bin space_query
+cargo run --release --bin space_query
 ```
 
 ## 테스트
@@ -206,7 +202,7 @@ Oracle OCI(thick) 연결은 Instant Client가 필요합니다.
 
 ```bash
 export ORACLE_CLIENT_LIB_DIR=/opt/oracle/instantclient_23_3
-cargo run --release
+cargo run --release --bin space_query
 ```
 
 Apple Silicon에서는 앱과 Instant Client의 CPU 아키텍처가 같아야 합니다.
