@@ -103,6 +103,11 @@ Licensed under MIT OR Apache-2.0\n\
 Oracle and MySQL are trademarks of Oracle and/or its affiliates.\n\
 This project is not affiliated with or endorsed by Oracle.\n\
 \n\
+Third-Party Software\n\
+- TNS thin client: based on python-oracledb (Apache-2.0) and go-ora (MIT).\n\
+  See THIRD_PARTY_NOTICES.md.\n\
+- Rust dependency licenses: see THIRD_PARTY_DEPENDENCIES.md.\n\
+\n\
 Runtime\n\
 - Build: {build_profile}\n\
 - Platform: {platform}"
@@ -524,7 +529,7 @@ impl MenuBarBuilder {
         // Help menu
         menu.add("&Help/&About", Shortcut::None, MenuFlag::Normal, |_| {
             let content = build_about_dialog_content();
-            show_info_dialog("About", &content, 640, 360);
+            show_info_dialog("About", &content, 640, 430);
         });
         menu.add(
             "&Help/&Keyboard Shortcuts",
