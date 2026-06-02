@@ -1747,6 +1747,92 @@ fn plsql_out_ref_cursor_between_scalar_out_binds_preserves_alignment() {
 
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn plsql_multiple_out_ref_cursors_keep_independent_metadata() {
+    let mut conn = connect();
+    let mut request = StatementRequest::statement(
+        "BEGIN \
+         OPEN :1 FOR \
+             SELECT CAST(RPAD('A', 4000, 'A') AS VARCHAR2(4000)) AS payload, \
+                    CAST('first' AS VARCHAR2(10)) AS label \
+             FROM dual; \
+         OPEN :2 FOR \
+             SELECT TO_CLOB('CLOB-') || TO_CLOB(RPAD('x', 4000, 'x')) AS doc, \
+                    HEXTORAW('CAFE') AS raw_value, \
+                    FROM_TZ(TIMESTAMP '2024-01-02 03:04:05.123456', '+05:45') AS ts_tz \
+             FROM dual; \
+         END;",
+    );
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Cursor,
+        max_len: 1,
+    });
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Cursor,
+        max_len: 1,
+    });
+
+    let values = conn
+        .execute_out_binds(&request, &[])
+        .expect("PL/SQL multiple OUT REF CURSOR binds");
+    let first_cursor = match values.first() {
+        Some(OracleValue::Cursor(cursor)) => cursor.clone(),
+        other => panic!("expected first OUT REF CURSOR, got {other:?}"),
+    };
+    let second_cursor = match values.get(1) {
+        Some(OracleValue::Cursor(cursor)) => cursor.clone(),
+        other => panic!("expected second OUT REF CURSOR, got {other:?}"),
+    };
+    assert_ne!(first_cursor.cursor_id, second_cursor.cursor_id);
+    assert_eq!(
+        first_cursor
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Varchar, OracleColumnType::Varchar]
+    );
+    assert_eq!(
+        second_cursor
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![
+            OracleColumnType::Clob,
+            OracleColumnType::Raw,
+            OracleColumnType::Timestamp,
+        ]
+    );
+
+    let second_rows = conn
+        .fetch_ref_cursor_all(second_cursor.cursor_id, second_cursor.columns, 1)
+        .expect("fetch second OUT REF CURSOR first");
+    let second_row = second_rows.result.rows.first().expect("second cursor row");
+    assert_eq!(value_to_string(&second_row[0]).len(), 4005);
+    assert!(value_to_string(&second_row[0]).starts_with("CLOB-"));
+    assert_eq!(second_row[1], OracleValue::Bytes(vec![0xca, 0xfe]));
+    assert_eq!(
+        timestamp_value_to_string(&second_row[2]),
+        "2024-01-02 03:04:05.123456"
+    );
+    assert_eq!(
+        timestamp_value_timezone_suffix(&second_row[2]),
+        Some("+05:45".to_string())
+    );
+
+    let first_rows = conn
+        .fetch_ref_cursor_all(first_cursor.cursor_id, first_cursor.columns, 1)
+        .expect("fetch first OUT REF CURSOR after second");
+    let first_row = first_rows.result.rows.first().expect("first cursor row");
+    assert_eq!(value_to_string(&first_row[0]).len(), 4000);
+    assert!(value_to_string(&first_row[0])
+        .chars()
+        .all(|ch| ch == 'A'));
+    assert_eq!(value_to_string(&first_row[1]), "first");
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn dml_returning_single_row_out_binds_return_values() {
     let config = live_config();
     let table = unique_table_name("RET");
@@ -2496,6 +2582,722 @@ fn plsql_procedure_ref_cursor_out_bind_fetches_mixed_scalar_columns() {
 
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn plsql_procedure_ref_cursor_out_bind_fetches_mixed_wire_types() {
+    let config = live_config();
+    let table = unique_table_name("PROC_RC_TYPES_TAB");
+    let procedure_name = unique_object_name("PROC_RC_TYPES");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    drop_procedure_ignore(&mut conn, &procedure_name);
+    conn.query_drop(&format!(
+        "CREATE TABLE {table} (\
+         id NUMBER PRIMARY KEY, \
+         vc VARCHAR2(30), \
+         nv NVARCHAR2(10), \
+         raw_col RAW(4), \
+         clob_col CLOB, \
+         nclob_col NCLOB, \
+         blob_col BLOB)"
+    ))
+    .expect("create mixed REF CURSOR type table");
+    conn.query_drop(&format!(
+        "INSERT INTO {table} \
+         (id, vc, nv, raw_col, clob_col, nclob_col, blob_col) VALUES \
+         (42, 'plain varchar', UNISTR('\\D55C\\AE00'), HEXTORAW('CAFE'), \
+          TO_CLOB('CLOB-') || TO_CLOB(RPAD('x', 4000, 'x')), \
+          TO_NCLOB(UNISTR('\\D55C\\AE00')), \
+          TO_BLOB(HEXTORAW('DEADBEEF')))"
+    ))
+    .expect("insert mixed REF CURSOR type row");
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE PROCEDURE {procedure_name}(p_rc OUT SYS_REFCURSOR) IS \
+         BEGIN \
+         OPEN p_rc FOR \
+         SELECT id AS c_number, \
+                vc AS c_varchar, \
+                nv AS c_nvarchar, \
+                DATE '2024-02-29' AS c_date, \
+                TIMESTAMP '2024-01-02 03:04:05.123456' AS c_timestamp, \
+                FROM_TZ(TIMESTAMP '2024-01-02 03:04:05.123456', '+05:45') AS c_tstz, \
+                TO_YMINTERVAL('2021-10') AS c_iym, \
+                TO_DSINTERVAL('2 12:23:34.456789') AS c_ids, \
+                raw_col AS c_raw, \
+                clob_col AS c_clob, \
+                nclob_col AS c_nclob, \
+                blob_col AS c_blob, \
+                ROWID AS c_rowid, \
+                CAST(ROWID AS UROWID) AS c_urowid \
+         FROM {table} WHERE id = 42; \
+         END;"
+    ))
+    .expect("create mixed REF CURSOR type procedure");
+
+    let mut request = StatementRequest::statement(format!("BEGIN {procedure_name}(:1); END;"));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Cursor,
+        max_len: 1,
+    });
+    let values = conn
+        .execute_out_binds(&request, &[])
+        .expect("PL/SQL mixed type REF CURSOR OUT bind");
+    let cursor = match values.first() {
+        Some(OracleValue::Cursor(cursor)) => cursor.clone(),
+        other => panic!("expected mixed type OUT REF CURSOR, got {other:?}"),
+    };
+    assert_eq!(
+        cursor
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![
+            OracleColumnType::Number,
+            OracleColumnType::Varchar,
+            OracleColumnType::Varchar,
+            OracleColumnType::Date,
+            OracleColumnType::Timestamp,
+            OracleColumnType::Timestamp,
+            OracleColumnType::IntervalYearMonth,
+            OracleColumnType::IntervalDaySecond,
+            OracleColumnType::Raw,
+            OracleColumnType::Clob,
+            OracleColumnType::Clob,
+            OracleColumnType::Blob,
+            OracleColumnType::Varchar,
+            OracleColumnType::Varchar,
+        ]
+    );
+
+    let rows = conn
+        .fetch_ref_cursor_all(cursor.cursor_id, cursor.columns, 10)
+        .expect("fetch mixed type REF CURSOR rows");
+    let row = rows.result.rows.first().expect("mixed type row");
+    assert_eq!(value_to_string(&row[0]), "42");
+    assert_eq!(value_to_string(&row[1]), "plain varchar");
+    assert_eq!(value_to_string(&row[2]), "\u{D55C}\u{AE00}");
+    assert_eq!(date_value_to_string(&row[3]), "2024-02-29 00:00:00");
+    assert_eq!(timestamp_value_to_string(&row[4]), "2024-01-02 03:04:05.123456");
+    assert_eq!(timestamp_value_to_string(&row[5]), "2024-01-02 03:04:05.123456");
+    assert_eq!(
+        timestamp_value_timezone_suffix(&row[5]),
+        Some("+05:45".to_string())
+    );
+    assert_eq!(value_to_string(&row[6]), "+2021-10");
+    assert_eq!(value_to_string(&row[7]), "+02 12:23:34.456789");
+    assert_eq!(row[8], OracleValue::Bytes(vec![0xca, 0xfe]));
+    assert_eq!(value_to_string(&row[9]).len(), 4005);
+    assert!(value_to_string(&row[9]).starts_with("CLOB-"));
+    assert_eq!(value_to_string(&row[10]), "\u{D55C}\u{AE00}");
+    assert_eq!(
+        row[11],
+        OracleValue::Bytes(vec![0xde, 0xad, 0xbe, 0xef])
+    );
+    let rowid = value_to_string(&row[12]);
+    let urowid = value_to_string(&row[13]);
+    assert_eq!(rowid, urowid);
+    assert_eq!(rowid.len(), 18);
+
+    drop_procedure_ignore(&mut conn, &procedure_name);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn plsql_procedure_ref_cursor_out_bind_fetches_boolean_columns_when_supported() {
+    let procedure_name = unique_object_name("PROC_RC_BOOL");
+    let mut conn = connect();
+    if !conn.capabilities().supports_sql_boolean {
+        return;
+    }
+    drop_procedure_ignore(&mut conn, &procedure_name);
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE PROCEDURE {procedure_name}(p_rc OUT SYS_REFCURSOR) IS \
+         BEGIN \
+         OPEN p_rc FOR \
+         SELECT TRUE AS c_true, FALSE AS c_false, CAST(NULL AS BOOLEAN) AS c_null \
+         FROM dual; \
+         END;"
+    ))
+    .expect("create BOOLEAN REF CURSOR procedure");
+
+    let mut request = StatementRequest::statement(format!("BEGIN {procedure_name}(:1); END;"));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Cursor,
+        max_len: 1,
+    });
+    let values = conn
+        .execute_out_binds(&request, &[])
+        .expect("PL/SQL BOOLEAN REF CURSOR OUT bind");
+    let cursor = match values.first() {
+        Some(OracleValue::Cursor(cursor)) => cursor.clone(),
+        other => panic!("expected BOOLEAN OUT REF CURSOR, got {other:?}"),
+    };
+    assert_eq!(
+        cursor
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![
+            OracleColumnType::Boolean,
+            OracleColumnType::Boolean,
+            OracleColumnType::Boolean,
+        ]
+    );
+
+    let rows = conn
+        .fetch_ref_cursor_all(cursor.cursor_id, cursor.columns, 1)
+        .expect("fetch BOOLEAN REF CURSOR rows");
+    assert_eq!(
+        rows.result.rows,
+        vec![vec![
+            OracleValue::Boolean(true),
+            OracleValue::Boolean(false),
+            OracleValue::Null,
+        ]]
+    );
+
+    drop_procedure_ignore(&mut conn, &procedure_name);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn plsql_procedure_ref_cursor_out_bind_fetches_long_wire_types() {
+    let config = live_config();
+    let long_table = unique_table_name("PROC_RC_LONG_TAB");
+    let long_raw_table = unique_table_name("PROC_RC_LRAW_TAB");
+    let procedure_name = unique_object_name("PROC_RC_LONGS");
+    let _long_guard = TableDropGuard::new(config.clone(), long_table.clone());
+    let _long_raw_guard = TableDropGuard::new(config.clone(), long_raw_table.clone());
+    let mut conn = connect_with_config(config);
+    drop_procedure_ignore(&mut conn, &procedure_name);
+    conn.query_drop(&format!(
+        "CREATE TABLE {long_table} (id NUMBER PRIMARY KEY, payload LONG)"
+    ))
+    .expect("create LONG REF CURSOR test table");
+    conn.query_drop(&format!(
+        "CREATE TABLE {long_raw_table} (id NUMBER PRIMARY KEY, payload LONG RAW)"
+    ))
+    .expect("create LONG RAW REF CURSOR test table");
+    conn.query_drop(&format!(
+        "INSERT INTO {long_table} (id, payload) VALUES (1, RPAD('L', 4000, 'L'))"
+    ))
+    .expect("insert LONG REF CURSOR test row");
+    conn.query_drop(&format!(
+        "INSERT INTO {long_raw_table} (id, payload) VALUES (1, HEXTORAW('DEADBEEF'))"
+    ))
+    .expect("insert LONG RAW REF CURSOR test row");
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE PROCEDURE {procedure_name}(\
+         p_long OUT SYS_REFCURSOR, p_long_raw OUT SYS_REFCURSOR) IS \
+         BEGIN \
+         OPEN p_long FOR SELECT payload FROM {long_table} WHERE id = 1; \
+         OPEN p_long_raw FOR SELECT payload FROM {long_raw_table} WHERE id = 1; \
+         END;"
+    ))
+    .expect("create LONG REF CURSOR procedure");
+
+    let mut request = StatementRequest::statement(format!("BEGIN {procedure_name}(:1, :2); END;"));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Cursor,
+        max_len: 1,
+    });
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Cursor,
+        max_len: 1,
+    });
+
+    let values = conn
+        .execute_out_binds(&request, &[])
+        .expect("PL/SQL LONG REF CURSOR OUT binds");
+    let long_cursor = match values.first() {
+        Some(OracleValue::Cursor(cursor)) => cursor.clone(),
+        other => panic!("expected LONG OUT REF CURSOR, got {other:?}"),
+    };
+    let long_raw_cursor = match values.get(1) {
+        Some(OracleValue::Cursor(cursor)) => cursor.clone(),
+        other => panic!("expected LONG RAW OUT REF CURSOR, got {other:?}"),
+    };
+    assert_eq!(
+        long_cursor
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Long]
+    );
+    assert_eq!(
+        long_raw_cursor
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Raw]
+    );
+
+    let long_rows = conn
+        .fetch_ref_cursor_all(long_cursor.cursor_id, long_cursor.columns, 1)
+        .expect("fetch LONG REF CURSOR rows");
+    let long_payload = value_to_string(&long_rows.result.rows[0][0]);
+    assert_eq!(long_payload.len(), 4000);
+    assert!(long_payload.chars().all(|ch| ch == 'L'));
+
+    let long_raw_rows = conn
+        .fetch_ref_cursor_all(long_raw_cursor.cursor_id, long_raw_cursor.columns, 1)
+        .expect("fetch LONG RAW REF CURSOR rows");
+    assert_eq!(
+        long_raw_rows.result.rows[0][0],
+        OracleValue::Bytes(vec![0xde, 0xad, 0xbe, 0xef])
+    );
+
+    drop_procedure_ignore(&mut conn, &procedure_name);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn plsql_procedure_ref_cursor_out_bind_fetches_nested_cursor_value() {
+    let procedure_name = unique_object_name("PROC_RC_NESTED");
+    let mut conn = connect();
+    drop_procedure_ignore(&mut conn, &procedure_name);
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE PROCEDURE {procedure_name}(p_rc OUT SYS_REFCURSOR) IS \
+         BEGIN \
+         OPEN p_rc FOR \
+         SELECT 7 AS parent_id, \
+                CURSOR(\
+                    SELECT CAST('child' AS VARCHAR2(20)) AS child_label, \
+                           CAST(RPAD('N', 4000, 'N') AS VARCHAR2(4000)) AS child_payload \
+                    FROM dual\
+                ) AS child_cursor \
+         FROM dual; \
+         END;"
+    ))
+    .expect("create nested cursor REF CURSOR procedure");
+
+    let mut request = StatementRequest::statement(format!("BEGIN {procedure_name}(:1); END;"));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Cursor,
+        max_len: 1,
+    });
+
+    let values = conn
+        .execute_out_binds(&request, &[])
+        .expect("PL/SQL nested cursor REF CURSOR OUT bind");
+    let outer_cursor = match values.first() {
+        Some(OracleValue::Cursor(cursor)) => cursor.clone(),
+        other => panic!("expected nested OUT REF CURSOR, got {other:?}"),
+    };
+    assert_eq!(
+        outer_cursor
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Number, OracleColumnType::Cursor]
+    );
+
+    let outer_rows = conn
+        .fetch_ref_cursor_all(outer_cursor.cursor_id, outer_cursor.columns, 1)
+        .expect("fetch outer REF CURSOR with nested cursor");
+    let outer_row = outer_rows
+        .result
+        .rows
+        .first()
+        .expect("outer nested cursor row");
+    assert_eq!(value_to_string(&outer_row[0]), "7");
+    let child_cursor = match &outer_row[1] {
+        OracleValue::Cursor(cursor) => cursor.clone(),
+        other => panic!("expected nested cursor value, got {other:?}"),
+    };
+    assert_eq!(
+        child_cursor
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Varchar, OracleColumnType::Varchar]
+    );
+    assert!(
+        child_cursor.columns[1].buffer_size >= 4000,
+        "nested VARCHAR2(4000) describe should preserve buffer, got {}",
+        child_cursor.columns[1].buffer_size
+    );
+
+    let child_rows = conn
+        .fetch_ref_cursor_all(child_cursor.cursor_id, child_cursor.columns, 1)
+        .expect("fetch nested child cursor after parent close piggyback");
+    let child_row = child_rows
+        .result
+        .rows
+        .first()
+        .expect("nested child cursor row");
+    assert_eq!(value_to_string(&child_row[0]), "child");
+    assert_eq!(value_to_string(&child_row[1]).len(), 4000);
+    assert!(value_to_string(&child_row[1]).chars().all(|ch| ch == 'N'));
+
+    drop_procedure_ignore(&mut conn, &procedure_name);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn plsql_nested_cursor_manual_close_releases_parent_on_next_call() {
+    let procedure_name = unique_object_name("PROC_RC_NCLOSE");
+    let mut conn = connect();
+    drop_procedure_ignore(&mut conn, &procedure_name);
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE PROCEDURE {procedure_name}(p_rc OUT SYS_REFCURSOR) IS \
+         BEGIN \
+         OPEN p_rc FOR \
+         SELECT CURSOR(SELECT 99 AS child_value FROM dual) AS child_cursor \
+         FROM dual; \
+         END;"
+    ))
+    .expect("create nested cursor manual close procedure");
+
+    let mut request = StatementRequest::statement(format!("BEGIN {procedure_name}(:1); END;"));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Cursor,
+        max_len: 1,
+    });
+    let values = conn
+        .execute_out_binds(&request, &[])
+        .expect("PL/SQL nested cursor manual close OUT bind");
+    let outer_cursor = match values.first() {
+        Some(OracleValue::Cursor(cursor)) => cursor.clone(),
+        other => panic!("expected nested close OUT REF CURSOR, got {other:?}"),
+    };
+    let outer_rows = conn
+        .fetch_ref_cursor_all(outer_cursor.cursor_id, outer_cursor.columns, 1)
+        .expect("fetch outer cursor for manual nested close");
+    let child_cursor = match &outer_rows.result.rows[0][0] {
+        OracleValue::Cursor(cursor) => cursor.clone(),
+        other => panic!("expected nested child cursor, got {other:?}"),
+    };
+
+    conn.close_cursor_on_next_call(Some(child_cursor.cursor_id));
+    conn.query_drop("SELECT 1 FROM dual")
+        .expect("next call should close child and deferred parent without ORA-01001");
+
+    drop_procedure_ignore(&mut conn, &procedure_name);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn plsql_procedure_ref_cursor_out_bind_fetches_varchar2_4000_batches() {
+    let procedure_name = unique_object_name("PROC_RC_VC4000");
+    let mut conn = connect();
+    drop_procedure_ignore(&mut conn, &procedure_name);
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE PROCEDURE {procedure_name}(p_rc OUT SYS_REFCURSOR) IS \
+         BEGIN \
+         OPEN p_rc FOR \
+         SELECT level AS n, \
+                CAST(RPAD(TO_CHAR(level), 4000, TO_CHAR(level)) AS VARCHAR2(4000)) AS ascii_payload, \
+                CAST(REPLACE(RPAD('x', 1333, 'x'), 'x', UNISTR('\\D55C')) AS VARCHAR2(4000)) AS utf8_payload, \
+                CAST('tail-' || TO_CHAR(level) AS VARCHAR2(20)) AS tail \
+         FROM dual CONNECT BY level <= 3; \
+         END;"
+    ))
+    .expect("create VARCHAR2(4000) REF CURSOR procedure");
+
+    let mut request = StatementRequest::statement(format!("BEGIN {procedure_name}(:1); END;"));
+    request.fetch_array_size = 1;
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Cursor,
+        max_len: 1,
+    });
+    let values = conn
+        .execute_out_binds(&request, &[])
+        .expect("PL/SQL VARCHAR2(4000) REF CURSOR OUT bind");
+    let cursor = match values.first() {
+        Some(OracleValue::Cursor(cursor)) => cursor.clone(),
+        other => panic!("expected VARCHAR2(4000) OUT REF CURSOR, got {other:?}"),
+    };
+    assert_eq!(
+        cursor
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![
+            OracleColumnType::Number,
+            OracleColumnType::Varchar,
+            OracleColumnType::Varchar,
+            OracleColumnType::Varchar,
+        ]
+    );
+    assert!(
+        cursor.columns[1].buffer_size >= 4000,
+        "VARCHAR2(4000) describe should preserve a large enough buffer, got {}",
+        cursor.columns[1].buffer_size
+    );
+
+    let first = conn
+        .fetch_ref_cursor_batch(cursor.cursor_id, &cursor.columns, 1, false)
+        .expect("fetch first VARCHAR2(4000) REF CURSOR batch");
+    assert_ref_cursor_varchar2_4000_row(&first.rows[0], "1");
+
+    let second = conn
+        .fetch_ref_cursor_batch(cursor.cursor_id, &cursor.columns, 1, false)
+        .expect("fetch second VARCHAR2(4000) REF CURSOR batch");
+    assert_ref_cursor_varchar2_4000_row(&second.rows[0], "2");
+
+    let remaining = conn
+        .fetch_ref_cursor_all(cursor.cursor_id, cursor.columns, 1)
+        .expect("fetch remaining VARCHAR2(4000) REF CURSOR rows");
+    assert_eq!(remaining.result.rows.len(), 1);
+    assert_ref_cursor_varchar2_4000_row(&remaining.result.rows[0], "3");
+
+    drop_procedure_ignore(&mut conn, &procedure_name);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn plsql_procedure_ref_cursor_out_bind_fetches_json_column() {
+    let config = live_config();
+    let table = unique_table_name("RCJSON");
+    let procedure_name = unique_object_name("RCJSONP");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    drop_procedure_ignore(&mut conn, &procedure_name);
+
+    match conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, doc JSON) TABLESPACE USERS"
+    )) {
+        Ok(()) => {}
+        Err(err)
+            if err.to_string().contains("ORA-00902")
+                || err.to_string().contains("ORA-00959")
+                || err.to_string().contains("ORA-03001")
+                || err.to_string().contains("ORA-43853") =>
+        {
+            eprintln!("skipping JSON REF CURSOR test: database does not support native JSON");
+            return;
+        }
+        Err(err) => panic!("create JSON REF CURSOR test table: {err}"),
+    }
+    conn.query_drop(&format!(
+        "INSERT INTO {table} (id, doc) \
+         SELECT 1, JSON_OBJECT(\
+             KEY 'a' VALUE 1, \
+             KEY 'b' VALUE JSON_ARRAY(2, 'x'), \
+             KEY 'flag' VALUE 'true' FORMAT JSON \
+             RETURNING JSON\
+         ) FROM dual"
+    ))
+    .expect("insert JSON REF CURSOR test row");
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE PROCEDURE {procedure_name}(p_rc OUT SYS_REFCURSOR) IS \
+         BEGIN \
+         OPEN p_rc FOR SELECT doc FROM {table} WHERE id = 1; \
+         END;"
+    ))
+    .expect("create JSON REF CURSOR procedure");
+
+    let mut request = StatementRequest::statement(format!("BEGIN {procedure_name}(:1); END;"));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Cursor,
+        max_len: 1,
+    });
+    let values = conn
+        .execute_out_binds(&request, &[])
+        .expect("PL/SQL JSON REF CURSOR OUT bind");
+    let cursor = match values.first() {
+        Some(OracleValue::Cursor(cursor)) => cursor.clone(),
+        other => panic!("expected JSON OUT REF CURSOR, got {other:?}"),
+    };
+    assert_eq!(
+        cursor
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Json]
+    );
+
+    let rows = match conn.fetch_ref_cursor_all(cursor.cursor_id, cursor.columns, 1) {
+        Ok(rows) => rows,
+        Err(err)
+            if conn.capabilities().protocol_version == Some(314)
+                && err.to_string().contains("ORA-40569") =>
+        {
+            eprintln!(
+                "skipping JSON REF CURSOR fetch test: protocol 314 server rejected native JSON REF CURSOR fetch"
+            );
+            return;
+        }
+        Err(err) => panic!("fetch JSON REF CURSOR rows: {err}"),
+    };
+    assert_eq!(
+        rows_to_strings(&rows.result.rows),
+        vec![vec![r#"{"a":1,"b":[2,"x"],"flag":true}"#.to_string()]]
+    );
+
+    drop_procedure_ignore(&mut conn, &procedure_name);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn plsql_procedure_ref_cursor_out_bind_fetches_extended_wire_types() {
+    let procedure_name = unique_object_name("RCEXT");
+    let mut conn = connect();
+    conn.query_drop("ALTER SESSION SET TIME_ZONE = '+00:00'")
+        .expect("set deterministic session time zone");
+    drop_procedure_ignore(&mut conn, &procedure_name);
+    match conn.query_drop(&format!(
+        "CREATE OR REPLACE PROCEDURE {procedure_name}(p_rc OUT SYS_REFCURSOR) IS \
+         BEGIN \
+         OPEN p_rc FOR \
+         SELECT CAST(3.5 AS BINARY_FLOAT) AS c_bfloat, \
+                CAST(-2.25 AS BINARY_DOUBLE) AS c_bdouble, \
+                CAST('abc' AS CHAR(5)) AS c_char, \
+                CAST(UNISTR('\\D55C\\AE00') AS NCHAR(2)) AS c_nchar, \
+                CAST(TIMESTAMP '2024-01-02 03:04:05.123456' AS TIMESTAMP WITH LOCAL TIME ZONE) AS c_tsltz, \
+                XMLTYPE('<root><n>7</n><txt>' || UNISTR('\\D55C\\AE00') || '</txt></root>') AS c_xml, \
+                TO_VECTOR('[1, 2, 3]', 3, FLOAT32) AS c_vector, \
+                TO_VECTOR('[16, [1, 3, 5], [1, 0, 5]]', 16, FLOAT32, SPARSE) AS c_sparse_vector, \
+                BFILENAME('DATA_PUMP_DIR', 'space_query_bfile_probe.bin') AS c_bfile \
+         FROM dual; \
+         END;"
+    )) {
+        Ok(()) => {}
+        Err(err)
+            if err.to_string().contains("ORA-00902")
+                || err.to_string().contains("ORA-00904")
+                || err.to_string().contains("ORA-03001")
+                || err.to_string().contains("ORA-06550")
+                || err.to_string().contains("ORA-518") =>
+        {
+            eprintln!(
+                "skipping extended REF CURSOR type test: database does not support one of XML/VECTOR/BFILE/TSLTZ"
+            );
+            return;
+        }
+        Err(err) => panic!("create extended REF CURSOR type procedure: {err}"),
+    }
+
+    let mut request = StatementRequest::statement(format!("BEGIN {procedure_name}(:1); END;"));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Cursor,
+        max_len: 1,
+    });
+    let values = conn
+        .execute_out_binds(&request, &[])
+        .expect("PL/SQL extended type REF CURSOR OUT bind");
+    let cursor = match values.first() {
+        Some(OracleValue::Cursor(cursor)) => cursor.clone(),
+        other => panic!("expected extended type OUT REF CURSOR, got {other:?}"),
+    };
+    assert_eq!(
+        cursor
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![
+            OracleColumnType::Number,
+            OracleColumnType::Number,
+            OracleColumnType::Varchar,
+            OracleColumnType::Varchar,
+            OracleColumnType::Timestamp,
+            OracleColumnType::Xml,
+            OracleColumnType::Vector,
+            OracleColumnType::Vector,
+            OracleColumnType::Bfile,
+        ]
+    );
+
+    let rows = conn
+        .fetch_ref_cursor_all(cursor.cursor_id, cursor.columns, 1)
+        .expect("fetch extended type REF CURSOR rows");
+    let row = rows.result.rows.first().expect("extended type row");
+    assert_eq!(value_to_string(&row[0]), "3.5");
+    assert_eq!(value_to_string(&row[1]), "-2.25");
+    assert_eq!(value_to_string(&row[2]), "abc  ");
+    assert_eq!(value_to_string(&row[3]), "\u{D55C}\u{AE00}");
+    assert_eq!(timestamp_value_to_string(&row[4]), "2024-01-02 03:04:05.123456");
+    assert!(value_to_string(&row[5]).contains("<n>7</n>"));
+    assert!(value_to_string(&row[5]).contains("\u{D55C}\u{AE00}"));
+    assert_eq!(value_to_string(&row[6]), "[1, 2, 3]");
+    assert_eq!(
+        value_to_string(&row[7]),
+        "SparseVector(dimensions=16, indices=[1, 3, 5], values=[1, 0, 5])"
+    );
+    match &row[8] {
+        OracleValue::Lob(locator) => assert!(
+            !locator.is_empty(),
+            "BFILE REF CURSOR locator should include non-empty locator bytes"
+        ),
+        other => panic!("expected BFILE REF CURSOR locator, got {other:?}"),
+    }
+
+    drop_procedure_ignore(&mut conn, &procedure_name);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn plsql_procedure_ref_cursor_out_bind_preserves_udt_metadata() {
+    let config = live_config();
+    let type_name = unique_object_name("RCUDT_OBJ");
+    let procedure_name = unique_object_name("RCUDT");
+    let _guard = TypeDropGuard::new(config.clone(), type_name.clone());
+    let mut conn = connect_with_config(config);
+    drop_procedure_ignore(&mut conn, &procedure_name);
+    drop_type_ignore(&mut conn, &type_name);
+    conn.query_drop(&format!(
+        "CREATE TYPE {type_name} AS OBJECT (\
+         id NUMBER, \
+         payload VARCHAR2(1000))"
+    ))
+    .expect("create UDT type");
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE PROCEDURE {procedure_name}(p_rc OUT SYS_REFCURSOR) IS \
+         BEGIN \
+         OPEN p_rc FOR \
+         SELECT {type_name}(7, CAST(RPAD('U', 1000, 'U') AS VARCHAR2(1000))) AS obj \
+         FROM dual; \
+         END;"
+    ))
+    .expect("create UDT REF CURSOR procedure");
+
+    let mut request = StatementRequest::statement(format!("BEGIN {procedure_name}(:1); END;"));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Cursor,
+        max_len: 1,
+    });
+    let values = conn
+        .execute_out_binds(&request, &[])
+        .expect("PL/SQL UDT REF CURSOR OUT bind");
+    let cursor = match values.first() {
+        Some(OracleValue::Cursor(cursor)) => cursor.clone(),
+        other => panic!("expected UDT OUT REF CURSOR, got {other:?}"),
+    };
+    let column = cursor.columns.first().expect("UDT cursor column");
+    assert_eq!(column.ora_type_num, 109);
+    assert_eq!(column.type_name, type_name);
+    assert!(
+        !column.schema_name.is_empty(),
+        "UDT metadata should preserve the owning schema"
+    );
+
+    let rows = conn
+        .fetch_ref_cursor_all(cursor.cursor_id, cursor.columns, 1)
+        .expect("fetch UDT REF CURSOR rows");
+    let object_attrs = match &rows.result.rows[0][0] {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected decoded UDT object, got {other:?}"),
+    };
+    assert_eq!(object_attrs[0].0, "ID");
+    assert_eq!(object_attrs[0].1, OracleValue::Number("7".to_string()));
+    assert_eq!(object_attrs[1].0, "PAYLOAD");
+    let payload = value_to_string(&object_attrs[1].1);
+    assert_eq!(payload.len(), 1000);
+    assert!(payload.chars().all(|ch| ch == 'U'));
+
+    drop_procedure_ignore(&mut conn, &procedure_name);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn plsql_implicit_resultset_fetches_rows_when_supported() {
     let mut conn = connect();
     if !conn.capabilities().supports_implicit_resultsets {
@@ -2822,6 +3624,10 @@ fn drop_procedure_ignore(conn: &mut OracleThinSession, procedure_name: &str) {
     let _ = conn.query_drop(&format!("DROP PROCEDURE {procedure_name}"));
 }
 
+fn drop_type_ignore(conn: &mut OracleThinSession, type_name: &str) {
+    let _ = conn.query_drop(&format!("DROP TYPE {type_name} FORCE"));
+}
+
 fn select_count(conn: &mut OracleThinSession, table: &str) -> i64 {
     let result = conn
         .query_described_fetch_all(format!("SELECT COUNT(*) FROM {table}"), 1)
@@ -2850,6 +3656,23 @@ fn assert_large_digit_row(row: &[OracleValue], digit: &str) {
     let expected = digit.chars().next().expect("single digit test value");
     assert_eq!(payload.len(), 4000);
     assert!(payload.chars().all(|ch| ch == expected));
+}
+
+fn assert_ref_cursor_varchar2_4000_row(row: &[OracleValue], digit: &str) {
+    assert_eq!(value_to_string(&row[0]), digit);
+
+    let ascii_payload = value_to_string(&row[1]);
+    let expected = digit.chars().next().expect("single digit test value");
+    assert_eq!(ascii_payload.len(), 4000);
+    assert!(ascii_payload.chars().all(|ch| ch == expected));
+
+    let utf8_payload = value_to_string(&row[2]);
+    assert_eq!(utf8_payload.chars().count(), 1333);
+    assert_eq!(utf8_payload.len(), 3999);
+    assert!(utf8_payload.starts_with('\u{D55C}'));
+    assert!(utf8_payload.ends_with('\u{D55C}'));
+
+    assert_eq!(value_to_string(&row[3]), format!("tail-{digit}"));
 }
 
 fn value_to_string(value: &OracleValue) -> String {
@@ -2935,6 +3758,25 @@ impl Drop for TableDropGuard {
     fn drop(&mut self) {
         if let Ok(mut conn) = OracleThinSession::connect(self.config.clone()) {
             drop_table_ignore(&mut conn, &self.table);
+        }
+    }
+}
+
+struct TypeDropGuard {
+    config: OracleThinConfig,
+    type_name: String,
+}
+
+impl TypeDropGuard {
+    fn new(config: OracleThinConfig, type_name: String) -> Self {
+        Self { config, type_name }
+    }
+}
+
+impl Drop for TypeDropGuard {
+    fn drop(&mut self) {
+        if let Ok(mut conn) = OracleThinSession::connect(self.config.clone()) {
+            drop_type_ignore(&mut conn, &self.type_name);
         }
     }
 }

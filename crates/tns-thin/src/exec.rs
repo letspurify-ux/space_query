@@ -57,6 +57,10 @@ pub struct ColumnMetadata {
     pub name: String,
     pub column_type: OracleColumnType,
     pub charset_form: u8,
+    pub ora_type_num: u8,
+    pub buffer_size: u32,
+    pub schema_name: String,
+    pub type_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +80,7 @@ pub enum OracleValue {
     Bytes(Vec<u8>),
     Lob(Vec<u8>),
     Cursor(RefCursorValue),
+    Object(Vec<(String, OracleValue)>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
