@@ -4668,15 +4668,28 @@ fn decode_with_iconv_any(
 ) -> Result<String, OracleThinError> {
     let mut last_error = None;
     for encoding in encodings {
-        let Some(code_page) = windows_code_page_for_encoding(encoding) else {
+        let Some(code_pages) = windows_code_pages_for_encoding(encoding) else {
             last_error = Some(OracleThinError::new(format!(
                 "Windows does not support Oracle text decoding for encoding {encoding}"
             )));
             continue;
         };
-        match decode_with_windows_code_page(bytes, encoding, code_page) {
-            Ok(text) => return Ok(text),
-            Err(err) => last_error = Some(err),
+        for code_page in code_pages {
+            match decode_with_windows_code_page(bytes, encoding, *code_page) {
+                Ok(text) => return Ok(text),
+                Err(err) => last_error = Some(err),
+            }
+        }
+    }
+    for encoding in encodings {
+        let Some(code_pages) = windows_code_pages_for_encoding(encoding) else {
+            continue;
+        };
+        for code_page in code_pages {
+            match decode_with_windows_code_page_lossy(bytes, encoding, *code_page) {
+                Ok(text) => return Ok(text),
+                Err(err) => last_error = Some(err),
+            }
         }
     }
     Err(last_error.unwrap_or_else(|| OracleThinError::new("missing Windows encoding candidate")))
@@ -4719,15 +4732,17 @@ fn encode_with_iconv_any(
     })?;
     let mut last_error = None;
     for encoding in encodings {
-        let Some(code_page) = windows_code_page_for_encoding(encoding) else {
+        let Some(code_pages) = windows_code_pages_for_encoding(encoding) else {
             last_error = Some(OracleThinError::new(format!(
                 "Windows does not support Oracle text encoding for encoding {encoding}"
             )));
             continue;
         };
-        match encode_with_windows_code_page(text, encoding, code_page) {
-            Ok(text) => return Ok(text),
-            Err(err) => last_error = Some(err),
+        for code_page in code_pages {
+            match encode_with_windows_code_page(text, encoding, *code_page) {
+                Ok(text) => return Ok(text),
+                Err(err) => last_error = Some(err),
+            }
         }
     }
     Err(last_error.unwrap_or_else(|| OracleThinError::new("missing Windows encoding candidate")))
@@ -4745,45 +4760,46 @@ fn encode_with_iconv_any(
 }
 
 #[cfg(any(windows, test))]
-fn windows_code_page_for_encoding(encoding: &str) -> Option<u32> {
+fn windows_code_pages_for_encoding(encoding: &str) -> Option<&'static [u32]> {
     let normalized = encoding
         .trim()
         .to_ascii_uppercase()
         .replace('_', "-");
     match normalized.as_str() {
-        "US-ASCII" | "ASCII" => Some(20127),
-        "ISO-8859-1" => Some(28591),
-        "ISO-8859-2" => Some(28592),
-        "ISO-8859-3" => Some(28593),
-        "ISO-8859-4" => Some(28594),
-        "ISO-8859-5" => Some(28595),
-        "ISO-8859-6" => Some(28596),
-        "ISO-8859-7" => Some(28597),
-        "ISO-8859-8" => Some(28598),
-        "ISO-8859-9" => Some(28599),
-        "ISO-8859-10" => Some(28600),
-        "ISO-8859-13" => Some(28603),
-        "ISO-8859-15" => Some(28605),
-        "TIS-620" => Some(874),
-        "CP1250" | "WINDOWS-1250" => Some(1250),
-        "CP1251" | "WINDOWS-1251" => Some(1251),
-        "CP1252" | "WINDOWS-1252" => Some(1252),
-        "CP1253" | "WINDOWS-1253" => Some(1253),
-        "CP1254" | "WINDOWS-1254" => Some(1254),
-        "CP1255" | "WINDOWS-1255" => Some(1255),
-        "CP1256" | "WINDOWS-1256" => Some(1256),
-        "CP1257" | "WINDOWS-1257" => Some(1257),
-        "CP1258" | "WINDOWS-1258" => Some(1258),
-        "CP437" => Some(437),
-        "CP850" => Some(850),
-        "CP852" => Some(852),
-        "CP866" => Some(866),
-        "EUC-JP" | "EUCJP" => Some(51932),
-        "CP932" | "WINDOWS-31J" | "SHIFT-JIS" => Some(932),
-        "EUC-KR" | "CP949" | "MS949" => Some(949),
-        "GBK" | "CP936" => Some(936),
-        "BIG5" | "BIG5-HKSCS" => Some(950),
-        "UTF-16BE" => Some(1201),
+        "US-ASCII" | "ASCII" => Some(&[20127]),
+        "ISO-8859-1" => Some(&[28591]),
+        "ISO-8859-2" => Some(&[28592]),
+        "ISO-8859-3" => Some(&[28593]),
+        "ISO-8859-4" => Some(&[28594]),
+        "ISO-8859-5" => Some(&[28595]),
+        "ISO-8859-6" => Some(&[28596]),
+        "ISO-8859-7" => Some(&[28597]),
+        "ISO-8859-8" => Some(&[28598]),
+        "ISO-8859-9" => Some(&[28599]),
+        "ISO-8859-10" => Some(&[28600]),
+        "ISO-8859-13" => Some(&[28603]),
+        "ISO-8859-15" => Some(&[28605]),
+        "TIS-620" => Some(&[874]),
+        "CP1250" | "WINDOWS-1250" => Some(&[1250]),
+        "CP1251" | "WINDOWS-1251" => Some(&[1251]),
+        "CP1252" | "WINDOWS-1252" => Some(&[1252]),
+        "CP1253" | "WINDOWS-1253" => Some(&[1253]),
+        "CP1254" | "WINDOWS-1254" => Some(&[1254]),
+        "CP1255" | "WINDOWS-1255" => Some(&[1255]),
+        "CP1256" | "WINDOWS-1256" => Some(&[1256]),
+        "CP1257" | "WINDOWS-1257" => Some(&[1257]),
+        "CP1258" | "WINDOWS-1258" => Some(&[1258]),
+        "CP437" => Some(&[437]),
+        "CP850" => Some(&[850]),
+        "CP852" => Some(&[852]),
+        "CP866" => Some(&[866]),
+        "EUC-JP" | "EUCJP" => Some(&[51932, 932]),
+        "CP932" | "WINDOWS-31J" | "SHIFT-JIS" => Some(&[932]),
+        "EUC-KR" => Some(&[51949, 949]),
+        "CP949" | "MS949" => Some(&[949, 51949]),
+        "GBK" | "CP936" => Some(&[936]),
+        "BIG5" | "BIG5-HKSCS" => Some(&[950]),
+        "UTF-16BE" => Some(&[1201]),
         _ => None,
     }
 }
@@ -4819,7 +4835,7 @@ fn decode_with_windows_code_page(
     };
     if needed <= 0 {
         return Err(OracleThinError::new(format!(
-            "Windows failed to decode Oracle text as {encoding}: {}",
+            "Windows failed to decode Oracle text as {encoding} with code page {code_page}: {}",
             std::io::Error::last_os_error()
         )));
     }
@@ -4836,7 +4852,7 @@ fn decode_with_windows_code_page(
     };
     if written <= 0 {
         return Err(OracleThinError::new(format!(
-            "Windows failed to decode Oracle text as {encoding}: {}",
+            "Windows failed to decode Oracle text as {encoding} with code page {code_page}: {}",
             std::io::Error::last_os_error()
         )));
     }
@@ -4846,6 +4862,62 @@ fn decode_with_windows_code_page(
             "Windows decoded invalid UTF-16 Oracle text for {encoding}: {err}"
         ))
     })
+}
+
+#[cfg(windows)]
+fn decode_with_windows_code_page_lossy(
+    bytes: &[u8],
+    encoding: &str,
+    code_page: u32,
+) -> Result<String, OracleThinError> {
+    use windows_sys::Win32::Globalization::MultiByteToWideChar;
+
+    if code_page == 1201 {
+        return decode_utf16be_oracle_text(bytes);
+    }
+    if bytes.is_empty() {
+        return Ok(String::new());
+    }
+    let input_len = i32::try_from(bytes.len()).map_err(|_| {
+        OracleThinError::new(format!(
+            "Oracle text for {encoding} is too large for Windows code page conversion"
+        ))
+    })?;
+    let needed = unsafe {
+        MultiByteToWideChar(
+            code_page,
+            0,
+            bytes.as_ptr(),
+            input_len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if needed <= 0 {
+        return Err(OracleThinError::new(format!(
+            "Windows failed to decode Oracle text as {encoding} with code page {code_page}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let mut wide = vec![0u16; needed as usize];
+    let written = unsafe {
+        MultiByteToWideChar(
+            code_page,
+            0,
+            bytes.as_ptr(),
+            input_len,
+            wide.as_mut_ptr(),
+            needed,
+        )
+    };
+    if written <= 0 {
+        return Err(OracleThinError::new(format!(
+            "Windows failed to decode Oracle text as {encoding} with code page {code_page}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    wide.truncate(written as usize);
+    Ok(String::from_utf16_lossy(&wide))
 }
 
 #[cfg(windows)]
@@ -7740,7 +7812,7 @@ mod tests {
         process_protocol_message, process_row_data,
         read_boolean_value, read_data_packet_with_control, read_data_packet_with_flags,
         read_rowid_value, read_urowid_value, thin_column_from_column_metadata,
-        validate_supported_protocol, verify_server_response, windows_code_page_for_encoding, write_bind_value,
+        validate_supported_protocol, verify_server_response, windows_code_pages_for_encoding, write_bind_value,
         write_bytes_with_length_for_capabilities, write_bytes_with_two_lengths,
         write_column_metadata, write_data_type_representations, write_ub2, write_ub4, write_ub8,
         AuthState, OracleThinCapabilities, OracleThinConfig, OracleThinSession, OracleValue,
@@ -8148,14 +8220,26 @@ mod tests {
 
     #[test]
     fn native_charset_windows_code_page_mapping_covers_oracle_candidates() {
-        assert_eq!(windows_code_page_for_encoding("EUC-KR"), Some(949));
-        assert_eq!(windows_code_page_for_encoding("MS949"), Some(949));
-        assert_eq!(windows_code_page_for_encoding("CP932"), Some(932));
-        assert_eq!(windows_code_page_for_encoding("GBK"), Some(936));
-        assert_eq!(windows_code_page_for_encoding("BIG5"), Some(950));
-        assert_eq!(windows_code_page_for_encoding("WINDOWS-1252"), Some(1252));
-        assert_eq!(windows_code_page_for_encoding("UTF-16BE"), Some(1201));
-        assert_eq!(windows_code_page_for_encoding("unknown"), None);
+        assert_eq!(
+            windows_code_pages_for_encoding("EUC-KR"),
+            Some(&[51949, 949][..])
+        );
+        assert_eq!(
+            windows_code_pages_for_encoding("MS949"),
+            Some(&[949, 51949][..])
+        );
+        assert_eq!(windows_code_pages_for_encoding("CP932"), Some(&[932][..]));
+        assert_eq!(windows_code_pages_for_encoding("GBK"), Some(&[936][..]));
+        assert_eq!(windows_code_pages_for_encoding("BIG5"), Some(&[950][..]));
+        assert_eq!(
+            windows_code_pages_for_encoding("WINDOWS-1252"),
+            Some(&[1252][..])
+        );
+        assert_eq!(
+            windows_code_pages_for_encoding("UTF-16BE"),
+            Some(&[1201][..])
+        );
+        assert_eq!(windows_code_pages_for_encoding("unknown"), None);
     }
 
     #[cfg(unix)]
