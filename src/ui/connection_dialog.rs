@@ -30,8 +30,18 @@ const SAVED_CONNECTIONS_COLUMN_WIDTH: i32 = 200;
 const CONNECTION_DETAILS_COLUMN_WIDTH: i32 = 300;
 const ADVANCED_SETTINGS_COLUMN_WIDTH: i32 = CONNECTION_DETAILS_COLUMN_WIDTH;
 const CONNECTION_DIALOG_COLUMN_SPACING: i32 = DIALOG_SPACING + 4;
-const DB_SELECTION_SECTION_HEIGHT: i32 =
-    LABEL_ROW_HEIGHT + INPUT_ROW_HEIGHT * 2 + DIALOG_SPACING * 2;
+/// Height of the DB Selection section for the rows currently visible. Oracle
+/// shows the driver row, and the Oracle Mode row is only shown when the driver
+/// is not Thin (Thin is Host + Port + Service only), so the section shrinks when
+/// those rows are hidden.
+fn db_selection_section_height(db_type: DatabaseType, driver_mode: OracleDriverMode) -> i32 {
+    let is_oracle = db_type == DatabaseType::Oracle;
+    let show_driver_row = is_oracle;
+    let show_oracle_mode_row = is_oracle && driver_mode != OracleDriverMode::Thin;
+    let input_rows = 1 + i32::from(show_driver_row) + i32::from(show_oracle_mode_row);
+    let visible_rows = 1 + input_rows; // header + input rows
+    LABEL_ROW_HEIGHT + INPUT_ROW_HEIGHT * input_rows + DIALOG_SPACING * (visible_rows - 1)
+}
 const SAVE_CONNECTION_BUTTON_WIDTH: i32 = 170;
 const CONNECTION_ACTION_BUTTONS_WIDTH: i32 =
     SAVE_CONNECTION_BUTTON_WIDTH + BUTTON_WIDTH * 3 + DIALOG_SPACING * 3;
@@ -532,7 +542,8 @@ fn apply_advanced_form_mode(
     advanced_col: &mut Flex,
     db_type: DatabaseType,
     using_oracle_tns_alias: bool,
-    oracle_driver_row: &mut Flex,
+    driver_mode: OracleDriverMode,
+    ssl_row: &mut Flex,
     oracle_thin_protocol_row: &mut Flex,
     oracle_protocol_row: &mut Flex,
     oracle_nls_date_row: &mut Flex,
@@ -545,17 +556,25 @@ fn apply_advanced_form_mode(
     ssl_choice: &mut Choice,
 ) {
     let form = db_type.advanced_settings_form_spec();
-    set_form_row_visible(
-        advanced_col,
-        oracle_driver_row,
-        db_type == DatabaseType::Oracle,
-    );
+    // Oracle Thin uses a plain TCP socket: SSL/TCPS are unavailable, so hide the
+    // SSL and protocol rows and pin them to safe values while Thin is selected.
+    let oracle_thin = db_type == DatabaseType::Oracle && driver_mode == OracleDriverMode::Thin;
+    if oracle_thin {
+        ssl_choice.set_value(choice_index_from_ssl_mode(db_type, ConnectionSslMode::Disabled));
+        oracle_protocol_choice
+            .set_value(choice_index_from_oracle_protocol(OracleNetworkProtocol::Tcp));
+    }
+    set_form_row_visible(advanced_col, ssl_row, !oracle_thin);
     set_form_row_visible(
         advanced_col,
         oracle_thin_protocol_row,
-        cfg!(debug_assertions) && db_type == DatabaseType::Oracle,
+        cfg!(debug_assertions) && oracle_thin,
     );
-    set_form_row_visible(advanced_col, oracle_protocol_row, form.show_oracle_protocol);
+    set_form_row_visible(
+        advanced_col,
+        oracle_protocol_row,
+        form.show_oracle_protocol && !oracle_thin,
+    );
     set_form_row_visible(
         advanced_col,
         oracle_nls_date_row,
@@ -598,10 +617,13 @@ fn apply_advanced_form_mode(
 
 fn apply_connection_form_mode(
     form_col: &mut Flex,
+    details_col: &mut Flex,
     oracle_mode_col: &mut Flex,
     db_type: DatabaseType,
     oracle_mode: OracleConnectMode,
+    driver_mode: OracleDriverMode,
     mode_choice: &mut Choice,
+    oracle_driver_row: &mut Flex,
     oracle_mode_row: &mut Flex,
     host_row: &mut Flex,
     port_row: &mut Flex,
@@ -611,9 +633,32 @@ fn apply_connection_form_mode(
     service_input: &mut Input,
     memory: &Arc<Mutex<OracleModeFieldMemory>>,
 ) {
+    // The Oracle driver selector only applies to Oracle connections.
+    set_form_row_visible(
+        oracle_mode_col,
+        oracle_driver_row,
+        db_type == DatabaseType::Oracle,
+    );
+
+    // Oracle Thin only supports Host + Port + Service, so hide the Oracle Mode
+    // selector and force Direct mode while Thin is selected.
+    let oracle_thin = db_type == DatabaseType::Oracle && driver_mode == OracleDriverMode::Thin;
+    let oracle_mode = if oracle_thin {
+        OracleConnectMode::Direct
+    } else {
+        oracle_mode
+    };
+
     if db_type.supports_tns_alias() {
-        set_form_row_visible(oracle_mode_col, oracle_mode_row, true);
-        mode_choice.activate();
+        set_form_row_visible(oracle_mode_col, oracle_mode_row, !oracle_thin);
+        if oracle_thin {
+            mode_choice.set_value(choice_index_from_oracle_connect_mode(
+                OracleConnectMode::Direct,
+            ));
+            mode_choice.deactivate();
+        } else {
+            mode_choice.activate();
+        }
         let mut memory = memory
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -656,6 +701,10 @@ fn apply_connection_form_mode(
             port_input.set_value(&form.default_port.to_string());
         }
     }
+
+    // Shrink the DB Selection section to fit only the rows that remain visible.
+    details_col.fixed(&*oracle_mode_col, db_selection_section_height(db_type, driver_mode));
+    details_col.layout();
 }
 
 fn build_connection_info(
@@ -907,6 +956,25 @@ impl ConnectionDialog {
         dbtype_flex.end();
         db_col.fixed(&dbtype_flex, INPUT_ROW_HEIGHT);
 
+        let initial_advanced = ConnectionAdvancedSettings::default_for(initial_db_type);
+
+        // Oracle driver selector sits directly under DB Type so the choice that
+        // drives which connection fields are available is right next to it.
+        let mut oracle_driver_flex = Flex::default();
+        oracle_driver_flex.set_type(fltk::group::FlexType::Row);
+        let mut oracle_driver_label = Frame::default().with_label("Oracle Driver:");
+        oracle_driver_label.set_label_color(theme::text_primary());
+        oracle_driver_flex.fixed(&oracle_driver_label, FORM_LABEL_WIDTH);
+        let mut oracle_driver_choice = Choice::default();
+        oracle_driver_choice.add_choice("OCI|Thin");
+        oracle_driver_choice.set_value(choice_index_from_oracle_driver_mode(
+            initial_advanced.oracle_driver_mode,
+        ));
+        oracle_driver_choice.set_color(theme::input_bg());
+        oracle_driver_choice.set_text_color(theme::text_primary());
+        oracle_driver_flex.end();
+        db_col.fixed(&oracle_driver_flex, INPUT_ROW_HEIGHT);
+
         let mut oracle_mode_flex = Flex::default();
         oracle_mode_flex.set_type(fltk::group::FlexType::Row);
         let mut oracle_mode_label = Frame::default().with_label("Oracle Mode:");
@@ -921,7 +989,10 @@ impl ConnectionDialog {
         db_col.fixed(&oracle_mode_flex, INPUT_ROW_HEIGHT);
 
         db_col.end();
-        connection_details_col.fixed(&db_col, DB_SELECTION_SECTION_HEIGHT);
+        connection_details_col.fixed(
+            &db_col,
+            db_selection_section_height(initial_db_type, initial_advanced.oracle_driver_mode),
+        );
 
         // Connection form section
         let mut right_col = Flex::default();
@@ -1026,8 +1097,6 @@ impl ConnectionDialog {
         advanced_header.set_label_color(theme::text_secondary());
         advanced_col.fixed(&advanced_header, LABEL_ROW_HEIGHT);
 
-        let initial_advanced = ConnectionAdvancedSettings::default_for(initial_db_type);
-
         let mut ssl_flex = Flex::default();
         ssl_flex.set_type(fltk::group::FlexType::Row);
         let mut ssl_label = Frame::default().with_label("SSL:");
@@ -1089,21 +1158,6 @@ impl ConnectionDialog {
         style_input_choice(&mut timezone_input);
         timezone_flex.end();
         advanced_col.fixed(&timezone_flex, INPUT_ROW_HEIGHT);
-
-        let mut oracle_driver_flex = Flex::default();
-        oracle_driver_flex.set_type(fltk::group::FlexType::Row);
-        let mut oracle_driver_label = Frame::default().with_label("Oracle Driver:");
-        oracle_driver_label.set_label_color(theme::text_primary());
-        oracle_driver_flex.fixed(&oracle_driver_label, FORM_LABEL_WIDTH);
-        let mut oracle_driver_choice = Choice::default();
-        oracle_driver_choice.add_choice("OCI|Thin");
-        oracle_driver_choice.set_value(choice_index_from_oracle_driver_mode(
-            initial_advanced.oracle_driver_mode,
-        ));
-        oracle_driver_choice.set_color(theme::input_bg());
-        oracle_driver_choice.set_text_color(theme::text_primary());
-        oracle_driver_flex.end();
-        advanced_col.fixed(&oracle_driver_flex, INPUT_ROW_HEIGHT);
 
         let mut oracle_thin_protocol_flex = Flex::default();
         oracle_thin_protocol_flex.set_type(fltk::group::FlexType::Row);
@@ -1301,6 +1355,7 @@ impl ConnectionDialog {
             let current_oracle_mode_dt = Arc::clone(&current_oracle_mode);
             let current_db_type_dt = Arc::clone(&current_db_type);
             let mut right_col_dt = right_col.clone();
+            let mut details_col_dt = connection_details_col.clone();
             let mut db_col_dt = db_col.clone();
             let mut oracle_mode_choice_dt = oracle_mode_choice.clone();
             let mut oracle_mode_flex_dt = oracle_mode_flex.clone();
@@ -1312,6 +1367,7 @@ impl ConnectionDialog {
             let mut svc_label_dt = svc_label.clone();
             let mut advanced_col_dt = advanced_col.clone();
             let mut ssl_choice_dt = ssl_choice.clone();
+            let mut ssl_flex_dt = ssl_flex.clone();
             let mut isolation_choice_dt = isolation_choice.clone();
             let mut access_choice_dt = access_choice.clone();
             let mut timezone_input_dt = timezone_input.clone();
@@ -1362,21 +1418,6 @@ impl ConnectionDialog {
                         &mut service_input_dt,
                     );
                 }
-                apply_connection_form_mode(
-                    &mut right_col_dt,
-                    &mut db_col_dt,
-                    db_type,
-                    oracle_connect_mode_from_choice_index(oracle_mode_choice_dt.value()),
-                    &mut oracle_mode_choice_dt,
-                    &mut oracle_mode_flex_dt,
-                    &mut host_flex_dt,
-                    &mut port_flex_dt,
-                    &mut svc_label_dt,
-                    &mut host_input_dt,
-                    &mut port_input_dt,
-                    &mut service_input_dt,
-                    &oracle_mode_memory_dt,
-                );
                 let previous_advanced = advanced_settings_from_form(
                     previous_db_type,
                     &ssl_choice_dt,
@@ -1393,6 +1434,25 @@ impl ConnectionDialog {
                     &oracle_nls_timestamp_input_dt,
                 );
                 let advanced = previous_advanced.migrate_for_db_type(previous_db_type, db_type);
+                let driver_mode = advanced.oracle_driver_mode;
+                apply_connection_form_mode(
+                    &mut right_col_dt,
+                    &mut details_col_dt,
+                    &mut db_col_dt,
+                    db_type,
+                    oracle_connect_mode_from_choice_index(oracle_mode_choice_dt.value()),
+                    driver_mode,
+                    &mut oracle_mode_choice_dt,
+                    &mut oracle_driver_flex_dt,
+                    &mut oracle_mode_flex_dt,
+                    &mut host_flex_dt,
+                    &mut port_flex_dt,
+                    &mut svc_label_dt,
+                    &mut host_input_dt,
+                    &mut port_input_dt,
+                    &mut service_input_dt,
+                    &oracle_mode_memory_dt,
+                );
                 set_advanced_form_values(
                     &advanced,
                     db_type,
@@ -1417,7 +1477,8 @@ impl ConnectionDialog {
                     db_type.supports_tns_alias()
                         && oracle_connect_mode_from_choice_index(oracle_mode_choice_dt.value())
                             == OracleConnectMode::TnsAlias,
-                    &mut oracle_driver_flex_dt,
+                    driver_mode,
+                    &mut ssl_flex_dt,
                     &mut oracle_thin_protocol_flex_dt,
                     &mut oracle_protocol_flex_dt,
                     &mut oracle_nls_date_flex_dt,
@@ -1439,6 +1500,7 @@ impl ConnectionDialog {
             let oracle_mode_memory_cb = Arc::clone(&oracle_mode_memory);
             let current_oracle_mode_cb = Arc::clone(&current_oracle_mode);
             let mut right_col_cb = right_col.clone();
+            let mut details_col_cb = connection_details_col.clone();
             let mut db_col_cb = db_col.clone();
             let mut oracle_mode_choice_cb = oracle_mode_choice.clone();
             let mut oracle_mode_flex_cb = oracle_mode_flex.clone();
@@ -1461,12 +1523,16 @@ impl ConnectionDialog {
             let mut mysql_ssl_ca_flex_cb = mysql_ssl_ca_flex.clone();
             let mut oracle_protocol_choice_cb = oracle_protocol_choice.clone();
             let mut ssl_choice_cb = ssl_choice.clone();
+            let mut ssl_flex_cb = ssl_flex.clone();
+            let oracle_driver_choice_cb = oracle_driver_choice.clone();
             oracle_mode_choice.set_callback(move |_| {
                 let previous_mode = *current_oracle_mode_cb
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let next_mode =
                     oracle_connect_mode_from_choice_index(oracle_mode_choice_cb.value());
+                let driver_mode =
+                    oracle_driver_mode_from_choice_index(oracle_driver_choice_cb.value());
                 sync_oracle_mode_memory_from_form(
                     &oracle_mode_memory_cb,
                     previous_mode,
@@ -1476,10 +1542,13 @@ impl ConnectionDialog {
                 );
                 apply_connection_form_mode(
                     &mut right_col_cb,
+                    &mut details_col_cb,
                     &mut db_col_cb,
                     db_type_from_choice_index(dbtype_choice_cb.value()),
                     next_mode,
+                    driver_mode,
                     &mut oracle_mode_choice_cb,
+                    &mut oracle_driver_flex_cb,
                     &mut oracle_mode_flex_cb,
                     &mut host_flex_cb,
                     &mut port_flex_cb,
@@ -1494,7 +1563,8 @@ impl ConnectionDialog {
                     &mut advanced_col_cb,
                     db_type,
                     db_type.supports_tns_alias() && next_mode == OracleConnectMode::TnsAlias,
-                    &mut oracle_driver_flex_cb,
+                    driver_mode,
+                    &mut ssl_flex_cb,
                     &mut oracle_thin_protocol_flex_cb,
                     &mut oracle_protocol_flex_cb,
                     &mut oracle_nls_date_flex_cb,
@@ -1527,12 +1597,103 @@ impl ConnectionDialog {
             });
         }
 
+        // Oracle driver change callback: re-apply form visibility so switching to
+        // Thin hides the options it cannot use (TNS alias, SSL, protocol).
+        {
+            let oracle_mode_memory_dr = Arc::clone(&oracle_mode_memory);
+            let current_oracle_mode_dr = Arc::clone(&current_oracle_mode);
+            let dbtype_choice_dr = dbtype_choice.clone();
+            let mut right_col_dr = right_col.clone();
+            let mut details_col_dr = connection_details_col.clone();
+            let mut db_col_dr = db_col.clone();
+            let mut oracle_mode_choice_dr = oracle_mode_choice.clone();
+            let mut oracle_driver_flex_dr = oracle_driver_flex.clone();
+            let mut oracle_mode_flex_dr = oracle_mode_flex.clone();
+            let mut host_flex_dr = host_flex.clone();
+            let mut port_flex_dr = port_flex.clone();
+            let mut host_input_dr = host_input.clone();
+            let mut port_input_dr = port_input.clone();
+            let mut service_input_dr = service_input.clone();
+            let mut svc_label_dr = svc_label.clone();
+            let mut advanced_col_dr = advanced_col.clone();
+            let mut ssl_flex_dr = ssl_flex.clone();
+            let mut ssl_choice_dr = ssl_choice.clone();
+            let mut oracle_thin_protocol_flex_dr = oracle_thin_protocol_flex.clone();
+            let mut oracle_protocol_flex_dr = oracle_protocol_flex.clone();
+            let mut oracle_protocol_choice_dr = oracle_protocol_choice.clone();
+            let mut oracle_nls_date_flex_dr = oracle_nls_date_flex.clone();
+            let mut oracle_nls_timestamp_flex_dr = oracle_nls_timestamp_flex.clone();
+            let mut mysql_sql_mode_flex_dr = mysql_sql_mode_flex.clone();
+            let mut mysql_charset_flex_dr = mysql_charset_flex.clone();
+            let mut mysql_collation_flex_dr = mysql_collation_flex.clone();
+            let mut mysql_ssl_ca_flex_dr = mysql_ssl_ca_flex.clone();
+            oracle_driver_choice.set_callback(move |choice| {
+                let db_type = db_type_from_choice_index(dbtype_choice_dr.value());
+                let driver_mode = oracle_driver_mode_from_choice_index(choice.value());
+                let current_mode = *current_oracle_mode_dr
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                // Preserve the values currently shown before Thin forces Direct mode.
+                sync_oracle_mode_memory_from_form(
+                    &oracle_mode_memory_dr,
+                    current_mode,
+                    &host_input_dr,
+                    &port_input_dr,
+                    &service_input_dr,
+                );
+                apply_connection_form_mode(
+                    &mut right_col_dr,
+                    &mut details_col_dr,
+                    &mut db_col_dr,
+                    db_type,
+                    current_mode,
+                    driver_mode,
+                    &mut oracle_mode_choice_dr,
+                    &mut oracle_driver_flex_dr,
+                    &mut oracle_mode_flex_dr,
+                    &mut host_flex_dr,
+                    &mut port_flex_dr,
+                    &mut svc_label_dr,
+                    &mut host_input_dr,
+                    &mut port_input_dr,
+                    &mut service_input_dr,
+                    &oracle_mode_memory_dr,
+                );
+                apply_advanced_form_mode(
+                    &mut advanced_col_dr,
+                    db_type,
+                    db_type.supports_tns_alias()
+                        && oracle_connect_mode_from_choice_index(oracle_mode_choice_dr.value())
+                            == OracleConnectMode::TnsAlias,
+                    driver_mode,
+                    &mut ssl_flex_dr,
+                    &mut oracle_thin_protocol_flex_dr,
+                    &mut oracle_protocol_flex_dr,
+                    &mut oracle_nls_date_flex_dr,
+                    &mut oracle_nls_timestamp_flex_dr,
+                    &mut mysql_sql_mode_flex_dr,
+                    &mut mysql_charset_flex_dr,
+                    &mut mysql_collation_flex_dr,
+                    &mut mysql_ssl_ca_flex_dr,
+                    &mut oracle_protocol_choice_dr,
+                    &mut ssl_choice_dr,
+                );
+                *current_oracle_mode_dr
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    oracle_connect_mode_from_choice_index(oracle_mode_choice_dr.value());
+            });
+        }
+
         apply_connection_form_mode(
             &mut right_col,
+            &mut connection_details_col,
             &mut db_col,
             initial_db_type,
             OracleConnectMode::Direct,
+            initial_advanced.oracle_driver_mode,
             &mut oracle_mode_choice,
+            &mut oracle_driver_flex,
             &mut oracle_mode_flex,
             &mut host_flex,
             &mut port_flex,
@@ -1546,7 +1707,8 @@ impl ConnectionDialog {
             &mut advanced_col,
             initial_db_type,
             false,
-            &mut oracle_driver_flex,
+            initial_advanced.oracle_driver_mode,
+            &mut ssl_flex,
             &mut oracle_thin_protocol_flex,
             &mut oracle_protocol_flex,
             &mut oracle_nls_date_flex,
@@ -1588,6 +1750,7 @@ impl ConnectionDialog {
         let mut dbtype_choice_cb = dbtype_choice.clone();
         let mut oracle_mode_choice_cb = oracle_mode_choice.clone();
         let mut right_col_saved = right_col.clone();
+        let mut details_col_saved = connection_details_col.clone();
         let mut db_col_saved = db_col.clone();
         let mut oracle_mode_flex_saved = oracle_mode_flex.clone();
         let mut host_flex_saved = host_flex.clone();
@@ -1595,6 +1758,7 @@ impl ConnectionDialog {
         let mut svc_label_cb = svc_label.clone();
         let mut advanced_col_saved = advanced_col.clone();
         let mut ssl_choice_saved = ssl_choice.clone();
+        let mut ssl_flex_saved = ssl_flex.clone();
         let mut isolation_choice_saved = isolation_choice.clone();
         let mut access_choice_saved = access_choice.clone();
         let mut timezone_input_saved = timezone_input.clone();
@@ -1680,10 +1844,13 @@ impl ConnectionDialog {
                     }
                     apply_connection_form_mode(
                         &mut right_col_saved,
+                        &mut details_col_saved,
                         &mut db_col_saved,
                         conn.db_type,
                         oracle_mode,
+                        conn.advanced.oracle_driver_mode,
                         &mut oracle_mode_choice_cb,
+                        &mut oracle_driver_flex_saved,
                         &mut oracle_mode_flex_saved,
                         &mut host_flex_saved,
                         &mut port_flex_saved,
@@ -1716,7 +1883,8 @@ impl ConnectionDialog {
                         conn.db_type,
                         conn.db_type.supports_tns_alias()
                             && oracle_mode == OracleConnectMode::TnsAlias,
-                        &mut oracle_driver_flex_saved,
+                        conn.advanced.oracle_driver_mode,
+                        &mut ssl_flex_saved,
                         &mut oracle_thin_protocol_flex_saved,
                         &mut oracle_protocol_flex_saved,
                         &mut oracle_nls_date_flex_saved,
