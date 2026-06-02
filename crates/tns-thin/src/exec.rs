@@ -174,7 +174,9 @@ pub fn sql_dml_returning_into_tail(sql: &str) -> Option<&str> {
             returning_seen = true;
         } else if returning_seen && keyword == "INTO" {
             return first_keyword
-                .is_some_and(|head| matches!(head.as_str(), "INSERT" | "UPDATE" | "DELETE" | "MERGE"))
+                .is_some_and(|head| {
+                    matches!(head.as_str(), "INSERT" | "UPDATE" | "DELETE" | "MERGE")
+                })
                 .then_some(&sql[end..]);
         }
     }

@@ -1825,9 +1825,7 @@ fn plsql_multiple_out_ref_cursors_keep_independent_metadata() {
         .expect("fetch first OUT REF CURSOR after second");
     let first_row = first_rows.result.rows.first().expect("first cursor row");
     assert_eq!(value_to_string(&first_row[0]).len(), 4000);
-    assert!(value_to_string(&first_row[0])
-        .chars()
-        .all(|ch| ch == 'A'));
+    assert!(value_to_string(&first_row[0]).chars().all(|ch| ch == 'A'));
     assert_eq!(value_to_string(&first_row[1]), "first");
 }
 
@@ -2028,7 +2026,9 @@ fn dml_returning_rowid_can_be_used_to_fetch_inserted_row() {
         "INSERT INTO {table} (id, name) VALUES (:1, :2) RETURNING ROWID INTO :3"
     ));
     request.binds.push(BindValue::Number("278".to_string()));
-    request.binds.push(BindValue::Text("String 278".to_string()));
+    request
+        .binds
+        .push(BindValue::Text("String 278".to_string()));
     request.binds.push(BindValue::Out {
         column_type: OracleColumnType::Varchar,
         max_len: 64,
@@ -2075,7 +2075,9 @@ fn dml_returning_iot_rowid_can_be_used_to_fetch_inserted_row() {
     ));
     request.binds.push(BindValue::Number("1".to_string()));
     request.binds.push(BindValue::Text("ABC".to_string()));
-    request.binds.push(BindValue::Text("2017-04-11".to_string()));
+    request
+        .binds
+        .push(BindValue::Text("2017-04-11".to_string()));
     request.binds.push(BindValue::Out {
         column_type: OracleColumnType::Varchar,
         max_len: 4000,
@@ -2131,7 +2133,9 @@ fn plsql_dml_returning_iot_rowid_can_be_used_to_fetch_inserted_row() {
     request.is_plsql = true;
     request.binds.push(BindValue::Number("1".to_string()));
     request.binds.push(BindValue::Text("ABC".to_string()));
-    request.binds.push(BindValue::Text("2017-04-11".to_string()));
+    request
+        .binds
+        .push(BindValue::Text("2017-04-11".to_string()));
     request.binds.push(BindValue::Out {
         column_type: OracleColumnType::Varchar,
         max_len: 4000,
@@ -2203,10 +2207,7 @@ fn dml_returning_lob_out_binds_return_values() {
         value_to_string(values.first().expect("CLOB RETURNING value")),
         "A short CLOB - 1618"
     );
-    assert_eq!(
-        values.get(1),
-        Some(&OracleValue::Bytes(vec![0xca, 0xfe]))
-    );
+    assert_eq!(values.get(1), Some(&OracleValue::Bytes(vec![0xca, 0xfe])));
 }
 
 #[test]
@@ -2233,7 +2234,9 @@ fn dml_returning_multiple_clobs_preserves_all_rows() {
         insert_request
             .binds
             .push(BindValue::Number((index + 1).to_string()));
-        insert_request.binds.push(BindValue::Text((*value).to_string()));
+        insert_request
+            .binds
+            .push(BindValue::Text((*value).to_string()));
         conn.execute_typed_with_implicit(&insert_request, &[])
             .expect("insert CLOB source row");
     }
@@ -2461,8 +2464,7 @@ fn plsql_function_scalar_return_bind_returns_value() {
     ))
     .expect("create scalar return function");
 
-    let mut request =
-        StatementRequest::statement(format!("BEGIN :1 := {function_name}(:2); END;"));
+    let mut request = StatementRequest::statement(format!("BEGIN :1 := {function_name}(:2); END;"));
     request.binds.push(BindValue::Out {
         column_type: OracleColumnType::Varchar,
         max_len: 50,
@@ -2512,10 +2514,7 @@ fn plsql_function_ref_cursor_return_bind_fetches_rows() {
 
     assert_eq!(
         rows_to_strings(&rows.result.rows),
-        vec![vec![
-            "11".to_string(),
-            "function ref cursor".to_string()
-        ]]
+        vec![vec!["11".to_string(), "function ref cursor".to_string()]]
     );
     drop_function_ignore(&mut conn, &function_name);
 }
@@ -2575,7 +2574,10 @@ fn plsql_procedure_ref_cursor_out_bind_fetches_mixed_scalar_columns() {
     assert_eq!(value_to_string(&row[0]), "2024-01-02");
     assert_eq!(value_to_string(&row[1]), "plain varchar");
     assert_eq!(value_to_string(&row[2]), "42");
-    assert_eq!(timestamp_value_to_string(&row[3]), "2024-01-02 03:04:05.123456");
+    assert_eq!(
+        timestamp_value_to_string(&row[3]),
+        "2024-01-02 03:04:05.123456"
+    );
     assert_eq!(date_value_to_string(&row[4]), "2024-01-03 00:00:00");
     drop_procedure_ignore(&mut conn, &procedure_name);
 }
@@ -2676,8 +2678,14 @@ fn plsql_procedure_ref_cursor_out_bind_fetches_mixed_wire_types() {
     assert_eq!(value_to_string(&row[1]), "plain varchar");
     assert_eq!(value_to_string(&row[2]), "\u{D55C}\u{AE00}");
     assert_eq!(date_value_to_string(&row[3]), "2024-02-29 00:00:00");
-    assert_eq!(timestamp_value_to_string(&row[4]), "2024-01-02 03:04:05.123456");
-    assert_eq!(timestamp_value_to_string(&row[5]), "2024-01-02 03:04:05.123456");
+    assert_eq!(
+        timestamp_value_to_string(&row[4]),
+        "2024-01-02 03:04:05.123456"
+    );
+    assert_eq!(
+        timestamp_value_to_string(&row[5]),
+        "2024-01-02 03:04:05.123456"
+    );
     assert_eq!(
         timestamp_value_timezone_suffix(&row[5]),
         Some("+05:45".to_string())
@@ -2688,10 +2696,7 @@ fn plsql_procedure_ref_cursor_out_bind_fetches_mixed_wire_types() {
     assert_eq!(value_to_string(&row[9]).len(), 4005);
     assert!(value_to_string(&row[9]).starts_with("CLOB-"));
     assert_eq!(value_to_string(&row[10]), "\u{D55C}\u{AE00}");
-    assert_eq!(
-        row[11],
-        OracleValue::Bytes(vec![0xde, 0xad, 0xbe, 0xef])
-    );
+    assert_eq!(row[11], OracleValue::Bytes(vec![0xde, 0xad, 0xbe, 0xef]));
     let rowid = value_to_string(&row[12]);
     let urowid = value_to_string(&row[13]);
     assert_eq!(rowid, urowid);
@@ -3214,7 +3219,10 @@ fn plsql_procedure_ref_cursor_out_bind_fetches_extended_wire_types() {
     assert_eq!(value_to_string(&row[1]), "-2.25");
     assert_eq!(value_to_string(&row[2]), "abc  ");
     assert_eq!(value_to_string(&row[3]), "\u{D55C}\u{AE00}");
-    assert_eq!(timestamp_value_to_string(&row[4]), "2024-01-02 03:04:05.123456");
+    assert_eq!(
+        timestamp_value_to_string(&row[4]),
+        "2024-01-02 03:04:05.123456"
+    );
     assert!(value_to_string(&row[5]).contains("<n>7</n>"));
     assert!(value_to_string(&row[5]).contains("\u{D55C}\u{AE00}"));
     assert_eq!(value_to_string(&row[6]), "[1, 2, 3]");
@@ -3344,7 +3352,10 @@ fn plsql_procedure_ref_cursor_out_bind_preserves_udt_metadata() {
     assert_eq!(object_attrs[2].0, "RAW_PAYLOAD");
     assert_eq!(object_attrs[2].1, OracleValue::Bytes(vec![0xca, 0xfe]));
     assert_eq!(object_attrs[3].0, "CREATED_ON");
-    assert_eq!(date_value_to_string(&object_attrs[3].1), "2024-02-29 00:00:00");
+    assert_eq!(
+        date_value_to_string(&object_attrs[3].1),
+        "2024-02-29 00:00:00"
+    );
     assert_eq!(object_attrs[4].0, "STAMPED_AT");
     assert_eq!(
         timestamp_value_to_string(&object_attrs[4].1),
@@ -3508,7 +3519,10 @@ fn plsql_procedure_ref_cursor_out_bind_decodes_top_level_scalar_collection() {
         Some(OracleValue::Cursor(cursor)) => cursor.clone(),
         other => panic!("expected scalar collection OUT REF CURSOR, got {other:?}"),
     };
-    let column = cursor.columns.first().expect("scalar collection cursor column");
+    let column = cursor
+        .columns
+        .first()
+        .expect("scalar collection cursor column");
     assert_eq!(column.ora_type_num, 109);
     assert_eq!(column.type_name, collection_type_name);
     let rows = conn
@@ -3732,10 +3746,7 @@ fn ddl_statements_execute_and_take_effect() {
     ))
     .expect("insert through sequence after DDL");
     let result = conn
-        .query_described_fetch_all(
-            format!("SELECT id, name, {function_name}() FROM {view}"),
-            1,
-        )
+        .query_described_fetch_all(format!("SELECT id, name, {function_name}() FROM {view}"), 1)
         .expect("fetch objects created by DDL");
     assert_eq!(
         rows_to_strings(&result.result.rows),

@@ -887,7 +887,11 @@ impl OracleThinSession {
             result.result.rows.extend(batch.rows);
             result.result.exhausted = batch.exhausted || batch.cursor_id.is_none() || no_rows;
         }
-        self.close_fully_fetched_cursor(cursor_id, &result.result.rows, rows_may_contain_ref_cursors)?;
+        self.close_fully_fetched_cursor(
+            cursor_id,
+            &result.result.rows,
+            rows_may_contain_ref_cursors,
+        )?;
         result.result.cursor_id = None;
         Ok(result)
     }
@@ -1958,7 +1962,10 @@ fn ref_cursor_ids_in_rows(rows: &[Vec<OracleValue>]) -> HashSet<u32> {
 fn columns_may_contain_ref_cursors(columns: &[ColumnMetadata]) -> bool {
     columns.iter().any(|column| {
         column.column_type == OracleColumnType::Cursor
-            || matches!(column.ora_type_num, ORA_TYPE_NUM_CURSOR | TNS_DATA_TYPE_RSET)
+            || matches!(
+                column.ora_type_num,
+                ORA_TYPE_NUM_CURSOR | TNS_DATA_TYPE_RSET
+            )
     })
 }
 
@@ -4772,17 +4779,23 @@ fn read_object_attr_value(
         ORA_TYPE_NUM_BOOLEAN => Ok(read_object_pickle_bytes(cursor)?
             .map(|bytes| OracleValue::Boolean(bytes.iter().any(|byte| *byte != 0)))
             .unwrap_or(OracleValue::Null)),
-        ORA_TYPE_NUM_INTERVAL_YM | ORA_TYPE_NUM_INTERVAL_YM_DTY => read_object_pickle_bytes(cursor)?
-            .map(|bytes| decode_oracle_interval_ym(&bytes).map(OracleValue::Text))
-            .transpose()
-            .map(|value| value.unwrap_or(OracleValue::Null)),
-        ORA_TYPE_NUM_INTERVAL_DS | ORA_TYPE_NUM_INTERVAL_DS_DTY => read_object_pickle_bytes(cursor)?
-            .map(|bytes| decode_oracle_interval_ds(&bytes).map(OracleValue::Text))
-            .transpose()
-            .map(|value| value.unwrap_or(OracleValue::Null)),
-        ORA_TYPE_NUM_CLOB | ORA_TYPE_NUM_BLOB | ORA_TYPE_NUM_BFILE => Ok(read_object_pickle_bytes(cursor)?
-            .map(OracleValue::Lob)
-            .unwrap_or(OracleValue::Null)),
+        ORA_TYPE_NUM_INTERVAL_YM | ORA_TYPE_NUM_INTERVAL_YM_DTY => {
+            read_object_pickle_bytes(cursor)?
+                .map(|bytes| decode_oracle_interval_ym(&bytes).map(OracleValue::Text))
+                .transpose()
+                .map(|value| value.unwrap_or(OracleValue::Null))
+        }
+        ORA_TYPE_NUM_INTERVAL_DS | ORA_TYPE_NUM_INTERVAL_DS_DTY => {
+            read_object_pickle_bytes(cursor)?
+                .map(|bytes| decode_oracle_interval_ds(&bytes).map(OracleValue::Text))
+                .transpose()
+                .map(|value| value.unwrap_or(OracleValue::Null))
+        }
+        ORA_TYPE_NUM_CLOB | ORA_TYPE_NUM_BLOB | ORA_TYPE_NUM_BFILE => {
+            Ok(read_object_pickle_bytes(cursor)?
+                .map(OracleValue::Lob)
+                .unwrap_or(OracleValue::Null))
+        }
         ORA_TYPE_NUM_OBJECT if attr.column_type == OracleColumnType::Xml => {
             read_object_pickle_bytes(cursor)?
                 .map(|bytes| decode_xmltype_payload(&bytes, capabilities))
@@ -9667,11 +9680,7 @@ mod tests {
                 .fetch_ref_cursor_batch(7, &[], 1, false)
                 .expect_err("fetch read error should fail");
 
-            assert_eq!(
-                session.pending_cursor_closes,
-                vec![7],
-                "{protocol_version}"
-            );
+            assert_eq!(session.pending_cursor_closes, vec![7], "{protocol_version}");
             drop(session);
             server.join().unwrap();
         }
