@@ -2,9 +2,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use tns_thin::exec::{
-    BindInputValue, BindValue, OracleColumnType, OracleValue, StatementRequest,
-};
+use tns_thin::exec::{BindInputValue, BindValue, OracleColumnType, OracleValue, StatementRequest};
 use tns_thin::{ConnectTarget, OracleDateTime, OracleThinConfig, OracleThinSession};
 
 static OBJECT_COUNTER: AtomicUsize = AtomicUsize::new(1);
@@ -27,7 +25,7 @@ fn negotiated_protocol_matches_requested_protocol() {
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn auth_alter_session_sets_initial_time_zone() {
     let mut conn = connect();
-    let expected = std::env::var("ORA_SDTZ").unwrap_or_else(|_| "+09:00".to_string());
+    let expected = std::env::var("ORA_SDTZ").unwrap_or_else(|_| local_timezone_offset_string());
     let result = conn
         .query_described_fetch_all("SELECT SESSIONTIMEZONE AS tz FROM dual", 1)
         .expect("fetch session timezone after login");
@@ -94,7 +92,10 @@ fn large_exact_fetch_batches_complete_without_read_wait() {
         )
         .expect("large exact direct fetch batches");
     assert_eq!(direct.result.rows.len(), 5000);
-    assert_eq!(rows_to_strings(&direct.result.rows[..2]), expected_rows(1, 2));
+    assert_eq!(
+        rows_to_strings(&direct.result.rows[..2]),
+        expected_rows(1, 2)
+    );
     assert_eq!(
         rows_to_strings(&direct.result.rows[4998..]),
         expected_rows(4999, 5000)
@@ -234,8 +235,7 @@ fn fetch_vector_columns_decode_vendor_formats() {
     ) {
         Ok(result) => result,
         Err(err)
-            if err.to_string().contains("ORA-00904")
-                || err.to_string().contains("ORA-00902") =>
+            if err.to_string().contains("ORA-00904") || err.to_string().contains("ORA-00902") =>
         {
             eprintln!("skipping vector fetch test: database does not support VECTOR");
             return;
@@ -263,6 +263,53 @@ fn fetch_vector_columns_decode_vendor_formats() {
             "[34.6, 77.8]".to_string(),
             "[34, -77]".to_string(),
             "[3, 2, 3]".to_string(),
+        ]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn fetch_sparse_vector_columns_decode_vendor_formats() {
+    let mut conn = connect();
+    let result = match conn.query_described_fetch_all(
+        "SELECT \
+         TO_VECTOR('[16, [1, 3, 5], [1, 0, 5]]', 16, FLOAT32, SPARSE) AS sv32, \
+         TO_VECTOR('[16, [1, 3, 5], [1, 0, 5]]', 16, FLOAT64, SPARSE) AS sv64, \
+         TO_VECTOR('[16, [1, 3, 5], [1, 0, 5]]', 16, INT8, SPARSE) AS svi8 \
+         FROM dual",
+        1,
+    ) {
+        Ok(result) => result,
+        Err(err)
+            if err.to_string().contains("ORA-00904")
+                || err.to_string().contains("ORA-00902")
+                || err.to_string().contains("ORA-03001")
+                || err.to_string().contains("ORA-518") =>
+        {
+            eprintln!("skipping sparse vector fetch test: database does not support sparse VECTOR");
+            return;
+        }
+        Err(err) => panic!("fetch sparse vector columns: {err}"),
+    };
+
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![
+            OracleColumnType::Vector,
+            OracleColumnType::Vector,
+            OracleColumnType::Vector,
+        ]
+    );
+    assert_eq!(
+        rows_to_strings(&result.result.rows),
+        vec![vec![
+            "SparseVector(dimensions=16, indices=[1, 3, 5], values=[1, 0, 5])".to_string(),
+            "SparseVector(dimensions=16, indices=[1, 3, 5], values=[1, 0, 5])".to_string(),
+            "SparseVector(dimensions=16, indices=[1, 3, 5], values=[1, 0, 5])".to_string(),
         ]]
     );
 }
@@ -315,6 +362,140 @@ fn fetch_json_column_decodes_oson_payload_as_json_text() {
     assert_eq!(
         rows_to_strings(&result.result.rows),
         vec![vec![r#"{"a":1,"b":[2,"x"],"flag":true}"#.to_string()]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn fetch_json_extended_scalars_decode_oson_payload_as_json_text() {
+    let mut conn = connect();
+    let result = match conn.query_described_fetch_all(
+        "SELECT JSON_OBJECT(\
+             KEY 'date' VALUE DATE '2024-02-29', \
+             KEY 'ts' VALUE TIMESTAMP '2024-01-02 03:04:05.123456', \
+             KEY 'bf' VALUE CAST(3.5 AS BINARY_FLOAT), \
+             KEY 'bd' VALUE CAST(-2.25 AS BINARY_DOUBLE) \
+             RETURNING JSON\
+         ) AS doc FROM dual",
+        1,
+    ) {
+        Ok(result) => result,
+        Err(err)
+            if err.to_string().contains("ORA-00902")
+                || err.to_string().contains("ORA-03001")
+                || err.to_string().contains("ORA-40449") =>
+        {
+            eprintln!(
+                "skipping JSON extended scalar fetch test: database does not support native JSON"
+            );
+            return;
+        }
+        Err(err) => panic!("fetch JSON extended scalar document: {err}"),
+    };
+
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Json]
+    );
+    assert_eq!(
+        rows_to_strings(&result.result.rows),
+        vec![vec![
+            r#"{"date":"2024-02-29T00:00:00","ts":"2024-01-02T03:04:05.123456","bf":3.5,"bd":-2.25}"#
+                .to_string()
+        ]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn fetch_json_extended_raw_decodes_oson_payload_as_json_text() {
+    let mut conn = connect();
+    let result = match conn.query_described_fetch_all(
+        r#"SELECT JSON('{"short_raw":{"$rawhex":"73686f72745f726177"}}' EXTENDED) AS doc FROM dual"#,
+        1,
+    ) {
+        Ok(result) => result,
+        Err(err)
+            if err.to_string().contains("ORA-00902")
+                || err.to_string().contains("ORA-03001")
+                || err.to_string().contains("ORA-40441")
+                || err.to_string().contains("ORA-40449") =>
+        {
+            eprintln!(
+                "skipping JSON extended raw fetch test: database does not support native JSON"
+            );
+            return;
+        }
+        Err(err) => panic!("fetch JSON extended raw document: {err}"),
+    };
+
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Json]
+    );
+    let expected = if conn.capabilities().protocol_version == Some(314) {
+        r#"{"short_raw":"73686F72745F726177"}"#
+    } else {
+        r#"{"short_raw":{"$rawhex":"73686f72745f726177"}}"#
+    };
+    assert_eq!(
+        rows_to_strings(&result.result.rows),
+        vec![vec![expected.to_string()]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn fetch_json_embedded_vector_decodes_oson_payload_as_json_text() {
+    let mut conn = connect();
+    let result = match conn.query_described_fetch_all(
+        "SELECT JSON_OBJECT(\
+             KEY 'id' VALUE 6432, \
+             KEY 'vector' VALUE TO_VECTOR('[1, 2, 3]') \
+             RETURNING JSON\
+         ) AS doc FROM dual",
+        1,
+    ) {
+        Ok(result) => result,
+        Err(err)
+            if err.to_string().contains("ORA-00902")
+                || err.to_string().contains("ORA-00904")
+                || err.to_string().contains("ORA-03001")
+                || err.to_string().contains("ORA-40449")
+                || err.to_string().contains("ORA-518") =>
+        {
+            eprintln!(
+                "skipping JSON embedded vector fetch test: database does not support JSON VECTOR"
+            );
+            return;
+        }
+        Err(err) => panic!("fetch JSON embedded vector document: {err}"),
+    };
+
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Json]
+    );
+    let expected = if conn.capabilities().protocol_version == Some(314) {
+        r#"{"id":6432,"vector":[1.0E+00,2.0E+00,3.0E+00]}"#
+    } else {
+        r#"{"id":6432,"vector":[1, 2, 3]}"#
+    };
+    assert_eq!(
+        rows_to_strings(&result.result.rows),
+        vec![vec![expected.to_string()]]
     );
 }
 
@@ -388,6 +569,46 @@ fn plsql_json_out_bind_decodes_oson_payload_as_json_text() {
 
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn plsql_json_inout_bind_round_trips_native_json() {
+    let mut conn = connect();
+    let mut request = StatementRequest::statement(
+        "BEGIN \
+         :1 := JSON_OBJECT(\
+             KEY 'input' VALUE JSON_VALUE(:1, '$.input'), \
+             KEY 'added' VALUE 2 \
+             RETURNING JSON\
+         ); \
+         END;",
+    );
+    request.binds.push(BindValue::InOut {
+        column_type: OracleColumnType::Json,
+        max_len: 1024,
+        value: Some(BindInputValue::Text(r#"{"input":"ok"}"#.to_string())),
+    });
+
+    let values = match conn.execute_out_binds(&request, &[]) {
+        Ok(values) => values,
+        Err(err)
+            if err.to_string().contains("ORA-00902")
+                || err.to_string().contains("ORA-00932")
+                || err.to_string().contains("ORA-03001")
+                || err.to_string().contains("ORA-06550")
+                || err.to_string().contains("ORA-43853") =>
+        {
+            eprintln!("skipping JSON IN OUT bind test: database does not support native JSON bind");
+            return;
+        }
+        Err(err) => panic!("PL/SQL JSON IN OUT bind: {err}"),
+    };
+
+    assert_eq!(
+        rows_to_strings(&[values]),
+        vec![vec![r#"{"input":"ok","added":2}"#.to_string()]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn fetch_timestamp_ltz_decodes_like_python_oracledb_timestamp() {
     let mut conn = connect();
     conn.query_drop("ALTER SESSION SET TIME_ZONE = '+00:00'")
@@ -452,7 +673,10 @@ fn fetch_timestamp_tz_fixed_offset_decodes_offset() {
         timestamp_value_to_string(value),
         "2024-01-02 03:04:05.123456"
     );
-    assert_eq!(timestamp_value_timezone_suffix(value), Some("+05:45".to_string()));
+    assert_eq!(
+        timestamp_value_timezone_suffix(value),
+        Some("+05:45".to_string())
+    );
 }
 
 #[test]
@@ -568,7 +792,11 @@ fn fetch_lob_columns_define_as_full_values() {
             .iter()
             .map(|column| column.column_type)
             .collect::<Vec<_>>(),
-        vec![OracleColumnType::Clob, OracleColumnType::Clob, OracleColumnType::Blob]
+        vec![
+            OracleColumnType::Clob,
+            OracleColumnType::Clob,
+            OracleColumnType::Blob
+        ]
     );
     let row = result.result.rows.first().expect("LOB row");
     let clob = value_to_string(&row[0]);
@@ -606,7 +834,10 @@ fn fetch_nchar_and_nvarchar_lazy_batches_keep_charset_form() {
             .iter()
             .map(|column| (column.column_type, column.charset_form))
             .collect::<Vec<_>>(),
-        vec![(OracleColumnType::Varchar, 2), (OracleColumnType::Varchar, 2)]
+        vec![
+            (OracleColumnType::Varchar, 2),
+            (OracleColumnType::Varchar, 2)
+        ]
     );
     assert_eq!(
         rows_to_strings(&initial.result.rows),
@@ -844,9 +1075,9 @@ fn bind_date_and_timestamp_round_trip_values() {
          FROM dual",
         1,
     );
-    request.binds.push(BindValue::Date(oracle_datetime(
-        2024, 2, 29, 13, 14, 15, 0,
-    )));
+    request
+        .binds
+        .push(BindValue::Date(oracle_datetime(2024, 2, 29, 13, 14, 15, 0)));
     request.binds.push(BindValue::Timestamp(oracle_datetime(
         2024,
         2,
@@ -1119,7 +1350,10 @@ fn plsql_timestamptz_out_bind_returns_fixed_offset() {
         timestamp_value_to_string(value),
         "2024-01-02 03:04:05.123456"
     );
-    assert_eq!(timestamp_value_timezone_suffix(value), Some("+05:45".to_string()));
+    assert_eq!(
+        timestamp_value_timezone_suffix(value),
+        Some("+05:45".to_string())
+    );
 }
 
 #[test]
@@ -1419,6 +1653,58 @@ fn plsql_implicit_resultset_fetches_rows_when_supported() {
 
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn plsql_multiple_implicit_resultsets_fetch_in_order_when_supported() {
+    let mut conn = connect();
+    if !conn.capabilities().supports_implicit_resultsets {
+        return;
+    }
+    let request = StatementRequest::statement(
+        "DECLARE \
+         rc1 SYS_REFCURSOR; \
+         rc2 SYS_REFCURSOR; \
+         BEGIN \
+         OPEN rc1 FOR SELECT 1 AS id, 'first' AS label FROM dual; \
+         DBMS_SQL.RETURN_RESULT(rc1); \
+         OPEN rc2 FOR SELECT 2 AS id, 'second' AS label FROM dual; \
+         DBMS_SQL.RETURN_RESULT(rc2); \
+         END;",
+    );
+
+    let outcome = conn
+        .execute_typed_with_implicit(&request, &[])
+        .expect("PL/SQL multiple implicit resultsets");
+    assert!(
+        outcome.result.rows.is_empty(),
+        "implicit result call should not emit statement rows"
+    );
+    assert_eq!(
+        outcome.implicit_results.len(),
+        2,
+        "expected two implicit result cursors"
+    );
+    let mut cursors = outcome.implicit_results.into_iter();
+    let first = cursors.next().expect("first implicit cursor");
+    let second = cursors.next().expect("second implicit cursor");
+
+    let first_rows = conn
+        .fetch_ref_cursor_all(first.cursor_id, first.columns, 10)
+        .expect("fetch first implicit resultset rows");
+    let second_rows = conn
+        .fetch_ref_cursor_all(second.cursor_id, second.columns, 10)
+        .expect("fetch second implicit resultset rows");
+
+    assert_eq!(
+        rows_to_strings(&first_rows.result.rows),
+        vec![vec!["1".to_string(), "first".to_string()]]
+    );
+    assert_eq!(
+        rows_to_strings(&second_rows.result.rows),
+        vec![vec!["2".to_string(), "second".to_string()]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn fetch_rowid_and_urowid_match_oracle_text_encoding() {
     let config = live_config();
     let table = unique_table_name("RID");
@@ -1449,7 +1735,9 @@ fn fetch_rowid_and_urowid_match_oracle_text_encoding() {
     assert_eq!(rowid, rowid_text);
     assert_eq!(urowid, rowid_text);
     assert_eq!(rowid.len(), 18);
-    assert!(rowid.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/'));
+    assert!(rowid
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/'));
 }
 
 #[test]
@@ -1579,6 +1867,15 @@ fn env_or(primary: &str, fallback: &str, default: &str) -> String {
     std::env::var(primary)
         .or_else(|_| std::env::var(fallback))
         .unwrap_or_else(|_| default.to_string())
+}
+
+fn local_timezone_offset_string() -> String {
+    let seconds = chrono::Local::now().offset().local_minus_utc();
+    let sign = if seconds < 0 { '-' } else { '+' };
+    let absolute = seconds.abs();
+    let hours = absolute / 3600;
+    let minutes = (absolute % 3600) / 60;
+    format!("{sign}{hours:02}:{minutes:02}")
 }
 
 fn protocol_env(name: &str) -> Option<u16> {

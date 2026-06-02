@@ -284,20 +284,24 @@ check_prereqs() {
 
 run_unit_regression() {
   echo
-  echo "== Unit regression: described bind projection =="
-  cargo test --manifest-path crates/tns-thin/Cargo.toml described_
+  echo "== Unit regression: tns-thin core =="
+  cargo test --manifest-path crates/tns-thin/Cargo.toml --lib
 }
 
 run_live_tns_for_protocol() {
   local protocol="$1"
+  local args=(
+    cargo test --manifest-path crates/tns-thin/Cargo.toml --test live_tns --
+    --ignored
+    --nocapture
+    --test-threads=1
+  )
+  if [[ "${#LIVE_TNS_SKIP_ARGS[@]}" -gt 0 ]]; then
+    args+=("${LIVE_TNS_SKIP_ARGS[@]}")
+  fi
   echo
   echo "== tns-thin live_tns protocol $protocol =="
-  ORACLE_THIN_DESIRED_PROTOCOL="$protocol" \
-    cargo test --manifest-path crates/tns-thin/Cargo.toml --test live_tns -- \
-      --ignored \
-      --nocapture \
-      --test-threads=1 \
-      "${LIVE_TNS_SKIP_ARGS[@]}"
+  ORACLE_THIN_DESIRED_PROTOCOL="$protocol" "${args[@]}"
 }
 
 run_main_crate_for_protocol() {

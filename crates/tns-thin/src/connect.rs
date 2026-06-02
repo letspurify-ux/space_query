@@ -73,6 +73,7 @@ impl Default for ConnectOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptInfo {
     pub protocol_version: u16,
+    pub protocol_options: u16,
     pub sdu: u32,
     pub supports_full_packet_size: bool,
     pub flags2: u32,
@@ -308,7 +309,9 @@ fn parse_redirect_data(value: &str) -> Result<RedirectInfo, OracleThinError> {
         .parse::<u16>()
         .map_err(|err| OracleThinError::new(format!("invalid TNS redirect PORT: {err}")))?;
     if connect_data.is_empty() {
-        return Err(OracleThinError::new("TNS redirect reconnect payload is empty"));
+        return Err(OracleThinError::new(
+            "TNS redirect reconnect payload is empty",
+        ));
     }
     Ok(RedirectInfo {
         host,
@@ -374,7 +377,10 @@ fn parse_accept_packet(data: &[u8]) -> Result<AcceptInfo, OracleThinError> {
     }
     let protocol_version = read_u16(data, 0)?;
     let options = read_u16(data, 2)?;
-    if data.get(14).is_some_and(|flags| flags & TNS_NSI_NA_REQUIRED != 0) {
+    if data
+        .get(14)
+        .is_some_and(|flags| flags & TNS_NSI_NA_REQUIRED != 0)
+    {
         return Err(OracleThinError::new(
             "Oracle listener requires Native Network Encryption/Data Integrity, which Oracle Thin does not support yet",
         ));
@@ -394,14 +400,10 @@ fn parse_accept_packet(data: &[u8]) -> Result<AcceptInfo, OracleThinError> {
     };
     Ok(AcceptInfo {
         protocol_version,
+        protocol_options: options,
         sdu,
         supports_full_packet_size: true,
-        flags2: flags2
-            | if options & TNS_GSO_CAN_RECV_ATTENTION != 0 {
-                TNS_ACCEPT_FLAG_CHECK_OOB
-            } else {
-                0
-            },
+        flags2,
     })
 }
 
@@ -428,6 +430,10 @@ fn read_u32(buf: &[u8], offset: usize) -> Result<u32, OracleThinError> {
 }
 
 impl AcceptInfo {
+    pub fn supports_oob_attention(&self) -> bool {
+        self.protocol_options & TNS_GSO_CAN_RECV_ATTENTION != 0
+    }
+
     pub fn supports_oob_check(&self) -> bool {
         self.flags2 & TNS_ACCEPT_FLAG_CHECK_OOB != 0
     }
@@ -449,8 +455,8 @@ mod tests {
 
     use super::{
         build_connect_packet, parse_accept_packet, parse_redirect_data, put_u16, put_u32,
-        ConnectOptions, OracleNetConnector, TNS_NSI_NA_REQUIRED, TNS_PACKET_FLAG_REDIRECT,
-        TNS_MIN_SUPPORTED_PROTOCOL, TNS_PACKET_TYPE_ACCEPT, TNS_PACKET_TYPE_CONNECT,
+        ConnectOptions, OracleNetConnector, TNS_MIN_SUPPORTED_PROTOCOL, TNS_NSI_NA_REQUIRED,
+        TNS_PACKET_FLAG_REDIRECT, TNS_PACKET_TYPE_ACCEPT, TNS_PACKET_TYPE_CONNECT,
         TNS_PACKET_TYPE_RESEND,
     };
 

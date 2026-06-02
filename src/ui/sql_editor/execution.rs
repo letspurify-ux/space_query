@@ -3199,6 +3199,15 @@ impl SqlEditorWidget {
         } else {
             cursor_closed
         };
+        if db_cancel_requested
+            && close_cancelled
+            && matches!(
+                error_kind,
+                InterruptKind::Cancelled | InterruptKind::UnsafeOrUnknown
+            )
+        {
+            return (true, false, InterruptKind::Cancelled);
+        }
         if cleanup_failed && close_cancelled && matches!(error_kind, InterruptKind::Cancelled) {
             return (true, false, InterruptKind::Cancelled);
         }
@@ -4770,7 +4779,7 @@ impl SqlEditorWidget {
                         let _ = sender.send(success_result);
                         app::awake();
                     }
-                    let (close_cancelled, cursor_closed, mut close_error_kind) =
+                    let (close_cancelled, cursor_closed, close_error_kind) =
                         Self::oracle_thin_lazy_cleanup_close_flags(
                             close_cancelled,
                             cursor_closed,
@@ -4778,12 +4787,6 @@ impl SqlEditorWidget {
                             cleanup_failed,
                             db_cancel_requested,
                         );
-                    if close_cancelled
-                        && !cursor_closed
-                        && matches!(close_error_kind, InterruptKind::UnsafeOrUnknown)
-                    {
-                        close_error_kind = InterruptKind::Cancelled;
-                    }
                     Self::emit_lazy_closed_result(
                         &sender,
                         index,
@@ -22659,6 +22662,16 @@ mod query_execution_cleanup_tests {
                 true,
                 true,
                 InterruptKind::Cancelled,
+                true,
+                true,
+            ),
+            (true, false, InterruptKind::Cancelled)
+        );
+        assert_eq!(
+            SqlEditorWidget::oracle_thin_lazy_cleanup_close_flags(
+                true,
+                false,
+                InterruptKind::UnsafeOrUnknown,
                 true,
                 true,
             ),
