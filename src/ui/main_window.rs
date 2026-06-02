@@ -984,6 +984,7 @@ pub struct AppState {
     result_grid_execution_target: Option<usize>,
     progress_contexts: HashMap<QueryTabId, QueryProgressContext>,
     abandoned_query_operations: HashSet<QueryOperationToken>,
+    pending_query_canceling_tabs: HashSet<QueryTabId>,
     pending_lazy_fetch_canceling_sessions: HashSet<u64>,
     pub object_browser: ObjectBrowserWidget,
     pub status_bar: Frame,
@@ -1379,6 +1380,7 @@ impl AppState {
     }
 
     fn finish_progress_context(&mut self, tab_id: QueryTabId) {
+        self.pending_query_canceling_tabs.remove(&tab_id);
         if let Some(context) = self.progress_contexts.remove(&tab_id) {
             for session_id in context.lazy_fetch_sessions.keys() {
                 self.pending_lazy_fetch_canceling_sessions
@@ -1428,6 +1430,7 @@ impl AppState {
         token: QueryOperationToken,
     ) {
         self.abandoned_query_operations.insert(token);
+        self.pending_query_canceling_tabs.remove(&tab_id);
         let tab_index = self.progress_contexts.get(&tab_id).and_then(|context| {
             if context.operation_token != Some(token) {
                 return None;
@@ -1444,9 +1447,7 @@ impl AppState {
             .get(&tab_id)
             .is_some_and(|context| context.operation_token == Some(token))
         {
-            self.progress_contexts.remove(&tab_id);
-            self.result_grid_execution_target = None;
-            self.result_tab_offset = self.result_tabs.tab_count();
+            self.finish_progress_context(tab_id);
         }
     }
 
@@ -1537,6 +1538,7 @@ impl AppState {
 
     fn mark_canceling_progress_contexts_cancelled(&mut self) {
         let mut tab_indices = Vec::new();
+        self.pending_query_canceling_tabs.clear();
         for context in self.progress_contexts.values_mut() {
             if context.state_label != ResultTabStatus::Canceling.label() {
                 continue;
@@ -1563,6 +1565,7 @@ impl AppState {
                 finished_contexts.push(*tab_id);
             }
         }
+        self.pending_query_canceling_tabs.clear();
         self.pending_lazy_fetch_canceling_sessions.clear();
         for tab_id in finished_contexts {
             self.finish_progress_context(tab_id);
@@ -1600,6 +1603,7 @@ impl AppState {
     }
 
     fn mark_progress_context_canceling(&mut self, tab_id: QueryTabId) -> bool {
+        self.pending_query_canceling_tabs.insert(tab_id);
         let Some(context) = self.progress_contexts.get_mut(&tab_id) else {
             return false;
         };
@@ -1614,30 +1618,17 @@ impl AppState {
         true
     }
 
-    fn mark_running_progress_contexts_canceling(&mut self) {
-        let mut tab_indices = Vec::new();
-        for context in self.progress_contexts.values_mut() {
-            context.state_label = ResultTabStatus::Canceling.label().to_string();
-            if let Some(statement_index) = context.active_statement_index {
-                if let Some(tab_index) = context.result_tab_index_for_statement(statement_index) {
-                    tab_indices.push(tab_index);
-                }
-            }
-        }
-        tab_indices.sort_unstable();
-        tab_indices.dedup();
-        for tab_index in tab_indices {
-            self.result_tabs.mark_statement_canceling(tab_index);
-        }
-    }
-
     fn mark_lazy_fetch_canceling(&mut self, session_id: u64) -> bool {
         self.pending_lazy_fetch_canceling_sessions
             .insert(session_id);
         let mut tab_indices = Vec::new();
-        for context in self.progress_contexts.values_mut() {
-            let Some(statement_index) = context.lazy_fetch_sessions.get(&session_id).copied()
-            else {
+        let active_lazy_fetch_tab_id = self.active_lazy_fetch_tab_id(session_id);
+        for (tab_id, context) in self.progress_contexts.iter_mut() {
+            let Some(statement_index) = lazy_fetch_canceling_statement_index(
+                context,
+                session_id,
+                active_lazy_fetch_tab_id == Some(*tab_id),
+            ) else {
                 continue;
             };
             context.active_statement_index = Some(statement_index);
@@ -1654,6 +1645,16 @@ impl AppState {
             marked = true;
         }
         self.result_tabs.mark_lazy_fetch_canceling(session_id) || marked
+    }
+
+    fn active_lazy_fetch_tab_id(&self, session_id: u64) -> Option<QueryTabId> {
+        if self.sql_editor.active_lazy_fetch_session() == Some(session_id) {
+            return Some(self.active_editor_tab_id);
+        }
+        self.editor_tabs
+            .iter()
+            .find(|tab| tab.sql_editor.active_lazy_fetch_session() == Some(session_id))
+            .map(|tab| tab.tab_id)
     }
 
     fn lazy_fetch_canceling_is_pending(&self, session_id: u64) -> bool {
@@ -2717,6 +2718,32 @@ fn statement_finished_status(result: &QueryResult, context_was_canceling: bool) 
     }
 }
 
+fn statement_start_status(current_label: &str, query_canceling_pending: bool) -> ResultTabStatus {
+    if query_canceling_pending || current_label == ResultTabStatus::Canceling.label() {
+        ResultTabStatus::Canceling
+    } else {
+        ResultTabStatus::Running
+    }
+}
+
+fn lazy_fetch_canceling_statement_index(
+    context: &QueryProgressContext,
+    session_id: u64,
+    fallback_to_active_statement: bool,
+) -> Option<usize> {
+    context
+        .lazy_fetch_sessions
+        .get(&session_id)
+        .copied()
+        .or_else(|| {
+            if fallback_to_active_statement {
+                context.active_statement_index
+            } else {
+                None
+            }
+        })
+}
+
 fn lazy_fetch_close_should_abort_result_tab(
     cancelled: bool,
     cursor_closed: bool,
@@ -3549,11 +3576,11 @@ impl MainWindow {
                 .editor_tabs
                 .iter()
                 .filter(|tab| tab.sql_editor.is_query_running())
-                .map(|tab| tab.sql_editor.clone())
+                .map(|tab| (tab.tab_id, tab.sql_editor.clone()))
                 .collect::<Vec<_>>();
             if s.find_tab_index(s.active_editor_tab_id).is_none() && s.sql_editor.is_query_running()
             {
-                running_editors.push(s.sql_editor.clone());
+                running_editors.push((s.active_editor_tab_id, s.sql_editor.clone()));
             }
             (running_editors, s.lazy_fetch_sessions_for_abort())
         };
@@ -3574,7 +3601,7 @@ impl MainWindow {
             return;
         }
 
-        for editor in &running_editors {
+        for (_, editor) in &running_editors {
             editor.cancel_current();
         }
 
@@ -3582,7 +3609,9 @@ impl MainWindow {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !running_editors.is_empty() {
-            s.mark_running_progress_contexts_canceling();
+            for (tab_id, _) in &running_editors {
+                s.mark_progress_context_canceling(*tab_id);
+            }
         }
         if !lazy_fetch_requests.is_empty() {
             for (session_id, requested) in &lazy_fetch_requests {
@@ -4575,6 +4604,7 @@ impl MainWindow {
             result_grid_execution_target: None,
             progress_contexts: HashMap::new(),
             abandoned_query_operations: HashSet::new(),
+            pending_query_canceling_tabs: HashSet::new(),
             pending_lazy_fetch_canceling_sessions: HashSet::new(),
             object_browser,
             status_bar,
@@ -5520,7 +5550,7 @@ impl MainWindow {
                 s.refresh_result_edit_controls();
             }
             s.editor_tabs.remove(index);
-            s.progress_contexts.remove(&tab_id);
+            s.finish_progress_context(tab_id);
 
             let mut created_tab_id = None;
             let mut deferred_display_tab_id = None;
@@ -6060,12 +6090,15 @@ impl MainWindow {
                         return;
                     }
                     let tab_count = s.result_tabs.tab_count();
-                    let context = QueryProgressContext::new(
+                    let mut context = QueryProgressContext::new(
                         resolve_result_tab_offset(tab_count, s.result_grid_execution_target),
                         s.result_grid_execution_target,
                         activity,
                         operation_token,
                     );
+                    if s.pending_query_canceling_tabs.contains(&tab_id) {
+                        context.state_label = ResultTabStatus::Canceling.label().to_string();
+                    }
                     s.progress_contexts.insert(tab_id, context);
                     s.sync_transaction_mode_controls();
                 }
@@ -6081,18 +6114,31 @@ impl MainWindow {
                     ) {
                         return;
                     }
-                    {
+                    let query_canceling_pending = s.pending_query_canceling_tabs.contains(&tab_id);
+                    let status = {
                         let Some(context) = s.progress_contexts.get_mut(&tab_id) else {
                             return;
                         };
                         context.fetch_row_counts.remove(&index);
                         context.active_statement_index = Some(index);
-                        context.state_label = ResultTabStatus::Running.label().to_string();
-                    }
-                    let was_running = s.status_animation_running;
-                    s.start_status_animation(ResultTabStatus::Running.status_bar_message());
-                    if !was_running {
-                        MainWindow::start_status_animation_timer(&state_for_progress);
+                        let status =
+                            statement_start_status(&context.state_label, query_canceling_pending);
+                        context.state_label = status.label().to_string();
+                        status
+                    };
+                    if status == ResultTabStatus::Canceling {
+                        if s.should_show_progress_status_for_tab(tab_id) {
+                            s.set_status_message(&format!(
+                                "{} running query...",
+                                ResultTabStatus::Canceling.label()
+                            ));
+                        }
+                    } else {
+                        let was_running = s.status_animation_running;
+                        s.start_status_animation(ResultTabStatus::Running.status_bar_message());
+                        if !was_running {
+                            MainWindow::start_status_animation_timer(&state_for_progress);
+                        }
                     }
                     s.refresh_result_edit_controls();
                 }
@@ -6869,7 +6915,7 @@ impl MainWindow {
                     if let Some(tab_index) = canceling_tab_index {
                         s.result_tabs.mark_statement_cancelled(tab_index);
                     }
-                    s.progress_contexts.remove(&tab_id);
+                    s.finish_progress_context(tab_id);
                     let has_running_queries = s.sql_editor.is_query_running()
                         || s.editor_tabs
                             .iter()
@@ -9767,6 +9813,43 @@ mod tests {
         assert_eq!(
             statement_finished_status(&success, true),
             ResultTabStatus::Done
+        );
+    }
+
+    #[test]
+    fn statement_start_preserves_pending_canceling_status() {
+        assert_eq!(
+            statement_start_status(ResultTabStatus::Running.label(), true),
+            ResultTabStatus::Canceling
+        );
+        assert_eq!(
+            statement_start_status(ResultTabStatus::Canceling.label(), false),
+            ResultTabStatus::Canceling
+        );
+        assert_eq!(
+            statement_start_status(ResultTabStatus::Running.label(), false),
+            ResultTabStatus::Running
+        );
+    }
+
+    #[test]
+    fn lazy_fetch_canceling_falls_back_to_active_statement_for_active_editor_session() {
+        let mut context = QueryProgressContext::new(0, None, "Fetching".to_string(), None);
+        context.active_statement_index = Some(2);
+
+        assert_eq!(
+            lazy_fetch_canceling_statement_index(&context, 77, true),
+            Some(2)
+        );
+        assert_eq!(
+            lazy_fetch_canceling_statement_index(&context, 77, false),
+            None
+        );
+
+        context.register_lazy_fetch_session(77, 3, 77, 1);
+        assert_eq!(
+            lazy_fetch_canceling_statement_index(&context, 77, true),
+            Some(3)
         );
     }
 
