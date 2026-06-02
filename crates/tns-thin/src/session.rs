@@ -2118,11 +2118,6 @@ fn encode_oracle_bind_text(
     if charset_form == CS_FORM_NCHAR {
         return encode_oracle_nchar_text(value, capabilities.ncharset_id);
     }
-    if !oracle_charset_is_utf8(capabilities.charset_id) {
-        if let Some(bytes) = encode_oracle_native_text(value, capabilities.charset_id)? {
-            return Ok(bytes);
-        }
-    }
     Ok(value.as_bytes().to_vec())
 }
 
@@ -4519,11 +4514,6 @@ fn decode_oracle_text(
     if charset_form == CS_FORM_NCHAR {
         return decode_oracle_nchar_text(bytes, capabilities.ncharset_id);
     }
-    if !oracle_charset_is_utf8(capabilities.charset_id) {
-        if let Some(text) = decode_oracle_native_text(bytes, capabilities.charset_id)? {
-            return Ok(text);
-        }
-    }
     match String::from_utf8(bytes.to_vec()) {
         Ok(text) => Ok(text),
         Err(err) => {
@@ -4579,13 +4569,6 @@ fn encode_oracle_native_text(
         return Ok(None);
     };
     encode_with_iconv_any(value.as_bytes(), encodings).map(Some)
-}
-
-fn oracle_charset_is_utf8(charset_id: u16) -> bool {
-    matches!(
-        charset_id,
-        0 | ORACLE_CHARSET_UTF8 | ORACLE_CHARSET_AL32UTF8
-    )
 }
 
 fn oracle_native_iconv_encodings(charset_id: u16) -> Option<&'static [&'static str]> {
@@ -8248,12 +8231,20 @@ mod tests {
         let mut ksc_caps = OracleThinCapabilities::default();
         ksc_caps.charset_id = ORACLE_CHARSET_KO16KSC5601;
         assert_eq!(
+            decode_oracle_text("한글".as_bytes(), CS_FORM_IMPLICIT, &ksc_caps).unwrap(),
+            "한글"
+        );
+        assert_eq!(
             decode_oracle_text(&[0xc7, 0xd1, 0xb1, 0xdb], CS_FORM_IMPLICIT, &ksc_caps).unwrap(),
             "한글"
         );
 
         let mut mswin_caps = OracleThinCapabilities::default();
         mswin_caps.charset_id = ORACLE_CHARSET_KO16MSWIN949;
+        assert_eq!(
+            decode_oracle_text("한글".as_bytes(), CS_FORM_IMPLICIT, &mswin_caps).unwrap(),
+            "한글"
+        );
         assert_eq!(
             decode_oracle_text(&[0xc7, 0xd1, 0xb1, 0xdb], CS_FORM_IMPLICIT, &mswin_caps).unwrap(),
             "한글"
@@ -8266,19 +8257,19 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn encodes_korean_varchar_binds_with_negotiated_server_charset() {
+    fn encodes_korean_varchar_binds_as_utf8_even_with_native_server_charset() {
         let mut ksc_caps = OracleThinCapabilities::default();
         ksc_caps.charset_id = ORACLE_CHARSET_KO16KSC5601;
         assert_eq!(
             encode_oracle_bind_text("한글", CS_FORM_IMPLICIT, &ksc_caps).unwrap(),
-            vec![0xc7, 0xd1, 0xb1, 0xdb]
+            "한글".as_bytes()
         );
 
         let mut mswin_caps = OracleThinCapabilities::default();
         mswin_caps.charset_id = ORACLE_CHARSET_KO16MSWIN949;
         assert_eq!(
             encode_oracle_bind_text("힣", CS_FORM_IMPLICIT, &mswin_caps).unwrap(),
-            vec![0xc6, 0x52]
+            "힣".as_bytes()
         );
     }
 
@@ -8289,7 +8280,7 @@ mod tests {
         cp1252_caps.charset_id = 178;
         assert_eq!(
             decode_oracle_text(&[0xc3, 0xa9], CS_FORM_IMPLICIT, &cp1252_caps).unwrap(),
-            "Ã©"
+            "é"
         );
         assert_eq!(
             decode_oracle_text(&[0x93, b'H', b'i', 0x94], CS_FORM_IMPLICIT, &cp1252_caps).unwrap(),
