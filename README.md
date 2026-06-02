@@ -194,12 +194,13 @@ cargo check
 
 ## Oracle Instant Client
 
-Oracle 연결은 Instant Client가 필요합니다.
+Oracle OCI(thick) 연결은 Instant Client가 필요합니다.
 
-macOS에서는 다음 위치의 `instantclient_*` 디렉터리를 자동 탐색합니다.
+플랫폼별로 다음 위치의 `instantclient_*` 디렉터리를 자동 탐색합니다.
 
-- `/opt/oracle`
-- `~/Downloads`
+- macOS: `/opt/oracle`
+- Linux: `/opt/oracle`, `/usr/local/oracle`
+- Windows: `C:\oracle`, `%ProgramFiles%\Oracle`
 
 자동 탐색이 맞지 않으면 `ORACLE_CLIENT_LIB_DIR`를 직접 지정하세요.
 

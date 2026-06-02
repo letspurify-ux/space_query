@@ -4541,7 +4541,7 @@ fn init_oracle_client() -> Result<(), OracleError> {
     let mut last_error: Option<OracleError> = None;
 
     for dir in candidate_dirs {
-        if !dir.join("libclntsh.dylib").is_file() {
+        if !dir_has_oracle_client_lib(&dir) {
             continue;
         }
 
@@ -4583,14 +4583,27 @@ fn oracle_client_lib_dir_candidates() -> Vec<PathBuf> {
 fn oracle_client_search_roots() -> Vec<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        let mut roots = vec![PathBuf::from("/opt/oracle")];
-        if let Some(home) = env::var_os("HOME") {
-            roots.push(PathBuf::from(home).join("Downloads"));
+        vec![PathBuf::from("/opt/oracle")]
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        vec![
+            PathBuf::from("/opt/oracle"),
+            PathBuf::from("/usr/local/oracle"),
+        ]
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let mut roots = vec![PathBuf::from(r"C:\oracle")];
+        if let Some(program_files) = env::var_os("ProgramFiles") {
+            roots.push(PathBuf::from(program_files).join("Oracle"));
         }
         roots
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         Vec::new()
     }
@@ -4629,6 +4642,34 @@ fn push_oracle_client_dir_candidate(candidates: &mut Vec<PathBuf>, dir: PathBuf)
     candidates.push(dir);
 }
 
+/// Whether `dir` contains an Oracle client shared library for the current
+/// platform. Linux ships versioned files (e.g. `libclntsh.so.23.1`) and the
+/// unversioned symlink may be absent in zip installs, so match by prefix there.
+fn dir_has_oracle_client_lib(dir: &Path) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        dir.join("oci.dll").is_file()
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        dir.join("libclntsh.dylib").is_file()
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return false;
+        };
+        entries.flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("libclntsh.so"))
+        })
+    }
+}
+
 fn format_oracle_client_init_error(err: &OracleError) -> String {
     let err_text = err.to_string();
     let mut message = format!("Failed to initialize Oracle client library: {err_text}");
@@ -4639,7 +4680,7 @@ fn format_oracle_client_init_error(err: &OracleError) -> String {
         );
     } else if err_text.contains("DPI-1047") {
         message.push_str(
-            " Set ORACLE_CLIENT_LIB_DIR to the directory containing libclntsh.dylib if the client is installed in a non-default location.",
+            " Set ORACLE_CLIENT_LIB_DIR to the directory that contains the Oracle Client library (oci.dll on Windows, libclntsh.so on Linux, libclntsh.dylib on macOS) if the client is installed in a non-default location.",
         );
     }
 
