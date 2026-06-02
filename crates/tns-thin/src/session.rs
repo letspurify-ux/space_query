@@ -644,8 +644,9 @@ impl OracleThinSession {
     }
 
     pub fn query_drop(&mut self, sql: &str) -> Result<(), OracleThinError> {
-        self.execute_typed(&StatementRequest::statement(sql), &[])
-            .map(|_| ())
+        let result = self.execute_typed(&StatementRequest::statement(sql), &[])?;
+        self.close_cursor_later(result.cursor_id);
+        Ok(())
     }
 
     pub fn query(
@@ -708,7 +709,17 @@ impl OracleThinSession {
         }
 
         let batch =
-            self.define_and_fetch_typed(cursor_id, request.fetch_array_size, column_types)?;
+            match self.define_and_fetch_typed(cursor_id, request.fetch_array_size, column_types) {
+                Ok(batch) => batch,
+                Err(error) => {
+                    self.close_cursor_after_partial_rows(
+                        cursor_id,
+                        &response.result.rows,
+                        column_types_may_contain_ref_cursors(column_types),
+                    );
+                    return Err(error);
+                }
+            };
         let no_rows = batch.rows.is_empty();
         response.result.rows.extend(batch.rows);
         response.result.exhausted = batch.exhausted || batch.cursor_id.is_none() || no_rows;
@@ -733,18 +744,40 @@ impl OracleThinSession {
             return Ok(result);
         };
         let mut needs_define_fetch = requires_define_fetch;
+        let rows_may_contain_ref_cursors = column_types_may_contain_ref_cursors(column_types);
         while !result.exhausted {
             let batch = if needs_define_fetch {
                 needs_define_fetch = false;
-                self.define_and_fetch_typed(cursor_id, request.fetch_array_size, column_types)?
+                match self.define_and_fetch_typed(cursor_id, request.fetch_array_size, column_types)
+                {
+                    Ok(batch) => batch,
+                    Err(error) => {
+                        self.close_cursor_after_partial_rows(
+                            cursor_id,
+                            &result.rows,
+                            rows_may_contain_ref_cursors,
+                        );
+                        return Err(error);
+                    }
+                }
             } else {
-                self.fetch_typed(cursor_id, request.fetch_array_size, column_types)?
+                match self.fetch_typed(cursor_id, request.fetch_array_size, column_types) {
+                    Ok(batch) => batch,
+                    Err(error) => {
+                        self.close_cursor_after_partial_rows(
+                            cursor_id,
+                            &result.rows,
+                            rows_may_contain_ref_cursors,
+                        );
+                        return Err(error);
+                    }
+                }
             };
             let no_rows = batch.rows.is_empty();
             result.rows.extend(batch.rows);
             result.exhausted = batch.exhausted || batch.cursor_id.is_none() || no_rows;
         }
-        self.close_fully_fetched_cursor(cursor_id, &result.rows)?;
+        self.close_fully_fetched_cursor(cursor_id, &result.rows, rows_may_contain_ref_cursors)?;
         result.cursor_id = None;
         Ok(result)
     }
@@ -831,19 +864,30 @@ impl OracleThinSession {
             return Ok(result);
         };
         let mut needs_define_fetch = requires_define_fetch;
+        let rows_may_contain_ref_cursors = columns_may_contain_ref_cursors(&result.columns);
         while !result.result.exhausted {
-            let batch = self.fetch_ref_cursor_batch(
+            let batch = match self.fetch_ref_cursor_batch(
                 cursor_id,
                 &result.columns,
                 request.fetch_array_size,
                 needs_define_fetch,
-            )?;
+            ) {
+                Ok(batch) => batch,
+                Err(error) => {
+                    self.close_cursor_after_partial_rows(
+                        cursor_id,
+                        &result.result.rows,
+                        rows_may_contain_ref_cursors,
+                    );
+                    return Err(error);
+                }
+            };
             needs_define_fetch = false;
             let no_rows = batch.rows.is_empty();
             result.result.rows.extend(batch.rows);
             result.result.exhausted = batch.exhausted || batch.cursor_id.is_none() || no_rows;
         }
-        self.close_fully_fetched_cursor(cursor_id, &result.result.rows)?;
+        self.close_fully_fetched_cursor(cursor_id, &result.result.rows, rows_may_contain_ref_cursors)?;
         result.result.cursor_id = None;
         Ok(result)
     }
@@ -913,13 +957,24 @@ impl OracleThinSession {
     ) -> Result<DescribedQueryResult, OracleThinError> {
         let mut rows = Vec::new();
         let mut needs_define_fetch = columns_require_define_fetch_for_values(&columns);
+        let rows_may_contain_ref_cursors = columns_may_contain_ref_cursors(&columns);
         loop {
-            let result = self.fetch_ref_cursor_batch(
+            let result = match self.fetch_ref_cursor_batch(
                 cursor_id,
                 &columns,
                 fetch_array_size,
                 needs_define_fetch,
-            )?;
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    self.close_cursor_after_partial_rows(
+                        cursor_id,
+                        &rows,
+                        rows_may_contain_ref_cursors,
+                    );
+                    return Err(error);
+                }
+            };
             needs_define_fetch = false;
             let no_rows = result.rows.is_empty();
             rows.extend(result.rows);
@@ -927,7 +982,7 @@ impl OracleThinSession {
                 break;
             }
         }
-        self.close_fully_fetched_cursor(cursor_id, &rows)?;
+        self.close_fully_fetched_cursor(cursor_id, &rows, rows_may_contain_ref_cursors)?;
         Ok(DescribedQueryResult {
             columns,
             result: QueryResult {
@@ -1004,6 +1059,7 @@ impl OracleThinSession {
         };
         if let Err(error) = write_result {
             self.requeue_pending_cursor_closes(&pending_cursor_closes);
+            self.close_cursor_later(Some(cursor_id));
             return Err(error);
         }
         log_connect_phase("ttc-fetch-read", "");
@@ -1032,7 +1088,14 @@ impl OracleThinSession {
                     "ORA-01013: user requested cancel of current operation",
                 ));
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                let error_cursor_id = error.cursor_id();
+                self.close_cursor_later(error_cursor_id);
+                if error_cursor_id != Some(cursor_id) {
+                    self.close_cursor_later(Some(cursor_id));
+                }
+                return Err(error);
+            }
         };
         if result.exhausted || result.cursor_id.is_none() {
             self.last_rows_by_cursor.remove(&cursor_id);
@@ -1134,19 +1197,22 @@ impl OracleThinSession {
         &mut self,
         cursor_id: u32,
         rows: &[Vec<OracleValue>],
+        rows_may_contain_ref_cursors: bool,
     ) -> Result<(), OracleThinError> {
         self.last_rows_by_cursor.remove(&cursor_id);
         self.cursor_columns_by_cursor.remove(&cursor_id);
         self.ref_cursor_ids.remove(&cursor_id);
-        let child_cursor_ids = ref_cursor_ids_in_rows(rows);
-        if !child_cursor_ids.is_empty() {
-            for child_cursor_id in &child_cursor_ids {
-                self.deferred_cursor_parent_by_child
-                    .insert(*child_cursor_id, cursor_id);
+        if rows_may_contain_ref_cursors {
+            let child_cursor_ids = ref_cursor_ids_in_rows(rows);
+            if !child_cursor_ids.is_empty() {
+                for child_cursor_id in &child_cursor_ids {
+                    self.deferred_cursor_parent_by_child
+                        .insert(*child_cursor_id, cursor_id);
+                }
+                self.deferred_cursor_closes
+                    .insert(cursor_id, child_cursor_ids);
+                return Ok(());
             }
-            self.deferred_cursor_closes
-                .insert(cursor_id, child_cursor_ids);
-            return Ok(());
         }
         self.close_cursor_later(Some(cursor_id));
         self.flush_pending_cursor_closes()
@@ -1223,6 +1289,20 @@ impl OracleThinSession {
         if let Some(row) = result.rows.last() {
             self.last_rows_by_cursor.insert(cursor_id, row.clone());
         }
+    }
+
+    fn close_cursor_after_partial_rows(
+        &mut self,
+        cursor_id: u32,
+        rows: &[Vec<OracleValue>],
+        rows_may_contain_ref_cursors: bool,
+    ) {
+        if rows_may_contain_ref_cursors {
+            for child_cursor_id in ref_cursor_ids_in_rows(rows) {
+                self.close_cursor_later(Some(child_cursor_id));
+            }
+        }
+        self.close_cursor_later(Some(cursor_id));
     }
 
     fn remember_cursor_columns_from_response(&mut self, response: &ExecuteResponse) {
@@ -1873,6 +1953,20 @@ fn ref_cursor_ids_in_rows(rows: &[Vec<OracleValue>]) -> HashSet<u32> {
             _ => None,
         })
         .collect()
+}
+
+fn columns_may_contain_ref_cursors(columns: &[ColumnMetadata]) -> bool {
+    columns.iter().any(|column| {
+        column.column_type == OracleColumnType::Cursor
+            || matches!(column.ora_type_num, ORA_TYPE_NUM_CURSOR | TNS_DATA_TYPE_RSET)
+    })
+}
+
+fn column_types_may_contain_ref_cursors(column_types: &[OracleColumnType]) -> bool {
+    column_types.is_empty()
+        || column_types
+            .iter()
+            .any(|column_type| *column_type == OracleColumnType::Cursor)
 }
 
 fn columns_require_define_fetch_for_values(columns: &[ColumnMetadata]) -> bool {
@@ -4063,12 +4157,12 @@ fn process_row_data(
     if state.reading_dml_returning {
         return process_dml_returning_row_data(cursor, capabilities, state);
     }
-    let columns = if state.reading_out_binds {
+    let reading_out_binds = state.reading_out_binds;
+    let columns = if reading_out_binds {
         &state.out_bind_columns
     } else {
         &state.columns
-    }
-    .clone();
+    };
     let mut row = Vec::with_capacity(columns.len());
     for (index, column) in columns.iter().enumerate() {
         if is_duplicate_column(index, state.bit_vector.as_deref()) {
@@ -4084,7 +4178,7 @@ fn process_row_data(
                 cursor,
                 capabilities,
                 column,
-                state.reading_out_binds,
+                reading_out_binds,
                 &mut state.cursor_columns,
                 &state.object_attrs_by_type,
                 &state.collection_element_by_type,
@@ -4092,7 +4186,7 @@ fn process_row_data(
         }
     }
     state.last_row = Some(row.clone());
-    if state.reading_out_binds {
+    if reading_out_binds {
         state.out_bind_rows.push(row);
     } else {
         state.rows.push(row);
@@ -9090,8 +9184,9 @@ mod tests {
 
     use super::{
         adjust_columns_after_define, bind_column_metadata, column_metadata_from_thin,
-        column_types_require_define_fetch_for_values, columns_require_define_fetch_for_values,
-        ExecuteReadState, DATA_TYPE_REPRESENTATIONS, ORA_TYPE_NUM_BFILE, ORA_TYPE_NUM_BINARY_FLOAT,
+        column_types_may_contain_ref_cursors, column_types_require_define_fetch_for_values,
+        columns_may_contain_ref_cursors, columns_require_define_fetch_for_values, ExecuteReadState,
+        DATA_TYPE_REPRESENTATIONS, ORA_TYPE_NUM_BFILE, ORA_TYPE_NUM_BINARY_FLOAT,
         ORA_TYPE_NUM_BLOB, ORA_TYPE_NUM_CHAR, ORA_TYPE_NUM_CLOB, ORA_TYPE_NUM_CURSOR,
         ORA_TYPE_NUM_DATE, ORA_TYPE_NUM_DBFILE, ORA_TYPE_NUM_DJSON, ORA_TYPE_NUM_INTERVAL_DS,
         ORA_TYPE_NUM_JSON, ORA_TYPE_NUM_LONG, ORA_TYPE_NUM_LONG_RAW, ORA_TYPE_NUM_NUMBER,
@@ -9148,7 +9243,8 @@ mod tests {
     };
     use crate::connect::{AcceptInfo, ConnectOptions, ConnectTarget};
     use crate::exec::{
-        BindInputValue, BindValue, ColumnMetadata, OracleColumnType, StatementRequest,
+        BindInputValue, BindValue, ColumnMetadata, OracleColumnType, RefCursorValue,
+        StatementRequest,
     };
 
     fn test_session_with_stream(stream: TcpStream) -> OracleThinSession {
@@ -9471,6 +9567,114 @@ mod tests {
 
         drop(session);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn partial_fetch_error_queues_child_cursors_before_parent_close() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            drop(stream);
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut session = test_session_with_stream(stream);
+        let rows = vec![vec![OracleValue::Cursor(RefCursorValue {
+            cursor_id: 11,
+            columns: Vec::new(),
+        })]];
+
+        session.close_cursor_after_partial_rows(10, &rows, true);
+
+        assert_eq!(session.pending_cursor_closes, vec![11, 10]);
+        drop(session);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn scalar_cursor_close_skips_ref_cursor_row_scan() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            drop(stream);
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut session = test_session_with_stream(stream);
+        let rows = vec![vec![OracleValue::Cursor(RefCursorValue {
+            cursor_id: 11,
+            columns: Vec::new(),
+        })]];
+
+        let _ = session.close_fully_fetched_cursor(10, &rows, false);
+
+        assert!(session.deferred_cursor_closes.is_empty());
+        assert!(session.deferred_cursor_parent_by_child.is_empty());
+        assert!(!session.pending_cursor_closes.contains(&11));
+        drop(session);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn ref_cursor_column_detection_controls_row_scan_fast_path() {
+        let scalar_columns = [ColumnMetadata {
+            name: "N".to_string(),
+            column_type: OracleColumnType::Number,
+            charset_form: 0,
+            ora_type_num: ORA_TYPE_NUM_NUMBER,
+            buffer_size: 22,
+            schema_name: String::new(),
+            type_name: String::new(),
+        }];
+        let ref_cursor_columns = [ColumnMetadata {
+            name: "RC".to_string(),
+            column_type: OracleColumnType::Cursor,
+            charset_form: 0,
+            ora_type_num: ORA_TYPE_NUM_CURSOR,
+            buffer_size: 4,
+            schema_name: String::new(),
+            type_name: String::new(),
+        }];
+
+        assert!(!columns_may_contain_ref_cursors(&scalar_columns));
+        assert!(columns_may_contain_ref_cursors(&ref_cursor_columns));
+        assert!(!column_types_may_contain_ref_cursors(&[
+            OracleColumnType::Number,
+            OracleColumnType::Varchar,
+        ]));
+        assert!(column_types_may_contain_ref_cursors(&[]));
+        assert!(column_types_may_contain_ref_cursors(&[
+            OracleColumnType::Number,
+            OracleColumnType::Cursor,
+        ]));
+    }
+
+    #[test]
+    fn fetch_read_error_queues_active_cursor_close_for_all_protocols() {
+        for protocol_version in [314, 315, 318, 319] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                read_one_tns_test_packet(&mut stream, protocol_version);
+            });
+            let stream = TcpStream::connect(addr).unwrap();
+            let mut session = test_session_with_stream(stream);
+            session.capabilities.protocol_version = Some(protocol_version);
+            session.capabilities.ttc_field_version = default_ttc_field_version(protocol_version);
+
+            let _err = session
+                .fetch_ref_cursor_batch(7, &[], 1, false)
+                .expect_err("fetch read error should fail");
+
+            assert_eq!(
+                session.pending_cursor_closes,
+                vec![7],
+                "{protocol_version}"
+            );
+            drop(session);
+            server.join().unwrap();
+        }
     }
 
     #[test]

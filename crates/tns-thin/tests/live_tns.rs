@@ -3670,6 +3670,104 @@ fn fetch_rowid_and_urowid_match_oracle_text_encoding() {
 
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn ddl_statements_execute_and_take_effect() {
+    let config = live_config();
+    let table = unique_table_name("DDL_T");
+    let index = unique_object_name("DDL_I");
+    let view = unique_object_name("DDL_V");
+    let sequence = unique_object_name("DDL_S");
+    let function_name = unique_object_name("DDL_F");
+    let procedure_name = unique_object_name("DDL_P");
+    let package_name = unique_object_name("DDL_PKG");
+    let _guard = DdlDropGuard::new(
+        config.clone(),
+        vec![
+            format!("DROP PACKAGE {package_name}"),
+            format!("DROP PROCEDURE {procedure_name}"),
+            format!("DROP FUNCTION {function_name}"),
+            format!("DROP VIEW {view}"),
+            format!("DROP SEQUENCE {sequence}"),
+            format!("DROP TABLE {table} PURGE"),
+        ],
+    );
+    let mut conn = connect_with_config(config);
+
+    conn.query_drop(&format!("CREATE TABLE {table} (id NUMBER PRIMARY KEY)"))
+        .expect("create DDL test table");
+    conn.query_drop(&format!("ALTER TABLE {table} ADD (name VARCHAR2(30))"))
+        .expect("alter DDL test table");
+    conn.query_drop(&format!("CREATE INDEX {index} ON {table} (name)"))
+        .expect("create DDL test index");
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE VIEW {view} AS SELECT id, name FROM {table}"
+    ))
+    .expect("create DDL test view");
+    conn.query_drop(&format!("CREATE SEQUENCE {sequence} START WITH 10"))
+        .expect("create DDL test sequence");
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE FUNCTION {function_name} RETURN NUMBER AS \
+         BEGIN RETURN 42; END;"
+    ))
+    .expect("create DDL test function");
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE PROCEDURE {procedure_name} AS \
+         BEGIN NULL; END;"
+    ))
+    .expect("create DDL test procedure");
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE PACKAGE {package_name} AS \
+         PROCEDURE p; \
+         END;"
+    ))
+    .expect("create DDL test package spec");
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE PACKAGE BODY {package_name} AS \
+         PROCEDURE p IS BEGIN NULL; END; \
+         END;"
+    ))
+    .expect("create DDL test package body");
+
+    conn.query_drop(&format!(
+        "INSERT INTO {table} (id, name) VALUES ({sequence}.NEXTVAL, 'created')"
+    ))
+    .expect("insert through sequence after DDL");
+    let result = conn
+        .query_described_fetch_all(
+            format!("SELECT id, name, {function_name}() FROM {view}"),
+            1,
+        )
+        .expect("fetch objects created by DDL");
+    assert_eq!(
+        rows_to_strings(&result.result.rows),
+        vec![vec![
+            "10".to_string(),
+            "created".to_string(),
+            "42".to_string(),
+        ]]
+    );
+
+    conn.query_drop(&format!("ALTER TABLE {table} MODIFY (name VARCHAR2(40))"))
+        .expect("modify DDL test table");
+    conn.query_drop(&format!("TRUNCATE TABLE {table}"))
+        .expect("truncate DDL test table");
+    assert_eq!(select_count(&mut conn, &table), 0);
+
+    conn.query_drop(&format!("DROP PACKAGE {package_name}"))
+        .expect("drop DDL test package");
+    conn.query_drop(&format!("DROP PROCEDURE {procedure_name}"))
+        .expect("drop DDL test procedure");
+    conn.query_drop(&format!("DROP FUNCTION {function_name}"))
+        .expect("drop DDL test function");
+    conn.query_drop(&format!("DROP VIEW {view}"))
+        .expect("drop DDL test view");
+    conn.query_drop(&format!("DROP SEQUENCE {sequence}"))
+        .expect("drop DDL test sequence");
+    conn.query_drop(&format!("DROP TABLE {table} PURGE"))
+        .expect("drop DDL test table");
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn commit_and_auto_commit_make_changes_visible() {
     let config = live_config();
     let table = unique_table_name("TX");
@@ -4021,6 +4119,27 @@ impl Drop for TypeDropGuard {
     fn drop(&mut self) {
         if let Ok(mut conn) = OracleThinSession::connect(self.config.clone()) {
             drop_type_ignore(&mut conn, &self.type_name);
+        }
+    }
+}
+
+struct DdlDropGuard {
+    config: OracleThinConfig,
+    drop_sql: Vec<String>,
+}
+
+impl DdlDropGuard {
+    fn new(config: OracleThinConfig, drop_sql: Vec<String>) -> Self {
+        Self { config, drop_sql }
+    }
+}
+
+impl Drop for DdlDropGuard {
+    fn drop(&mut self) {
+        if let Ok(mut conn) = OracleThinSession::connect(self.config.clone()) {
+            for sql in &self.drop_sql {
+                let _ = conn.query_drop(sql);
+            }
         }
     }
 }
