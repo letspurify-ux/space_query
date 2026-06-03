@@ -1,34 +1,49 @@
 # Third Party Notices
 
-This crate is licensed under `MIT OR Apache-2.0`. Some implementation details
-were developed with reference to permissively licensed upstream projects. Keep
-this file with source and binary redistributions.
+This crate (`tns-thin`) is licensed under `MIT OR Apache-2.0`. Some
+implementation details were developed with reference to, and reimplemented in
+Rust from, permissively licensed upstream projects. This crate is an
+independent, modified work and contains none of the original upstream source
+files. Keep this file with source and binary redistributions.
+
+The complete text of the licenses referenced below is included with this crate:
+the Apache License, Version 2.0 in `LICENSE-APACHE`, and the MIT License in
+`LICENSE-MIT`.
 
 ## python-oracledb
 
-Portions of the TNS thin implementation are based on or derived from the thin
-protocol implementation in `python-oracledb`.
-
-Copyright (c) 2016, 2026, Oracle and/or its affiliates.
+Portions of the TNS thin implementation have been modified from, and
+reimplemented in Rust based on, the thin protocol implementation in
+`python-oracledb` (https://github.com/oracle/python-oracledb). The reimplemented
+portions are modified works; this crate does not include the original
+python-oracledb source files.
 
 `python-oracledb` is dual licensed under the Universal Permissive License
 Version 1.0 or the Apache License Version 2.0. For the portions referenced by
-this crate, this crate elects the Apache License, Version 2.0 option,
-available at:
+this crate, this crate elects the **Apache License, Version 2.0** option. The
+full text of the Apache License, Version 2.0 is included with this crate in
+`LICENSE-APACHE` and is also available at:
 
 https://www.apache.org/licenses/LICENSE-2.0
 
-The full upstream license, notice, and third-party license files are preserved
-in the project repository under `vendor/python-oracledb/` (`LICENSE.txt`,
-`NOTICE.txt`, `THIRD_PARTY_LICENSES.txt`):
+The following required attribution notice is reproduced from the upstream
+`NOTICE.txt`:
+
+> Copyright (c) 2016, 2026, Oracle and/or its affiliates.
+
+The unmodified upstream license, notice, and third-party license files
+(`LICENSE.txt`, `NOTICE.txt`, `THIRD_PARTY_LICENSES.txt`) are additionally
+preserved in the source repository under `vendor/python-oracledb/`:
 
 https://github.com/letspurify-ux/space_query
 
 ## go-ora
 
 The TNS thin implementation was also checked against `go-ora` behavior and
-protocol constants. The upstream license file is preserved in the project
-repository under `vendor/go-ora/LICENSE`:
+protocol constants, and the time-zone region table was derived from its data.
+These portions are modified works; this crate does not include the original
+go-ora source files. The unmodified upstream license file is additionally
+preserved in the source repository under `vendor/go-ora/LICENSE`:
 
 https://github.com/letspurify-ux/space_query
 

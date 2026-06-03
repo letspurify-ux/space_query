@@ -1,4 +1,4 @@
-// Generated from vendor/go-ora/v3/type_coder/oracle_zones.go.
+// Derived from go-ora's v3/type_coder/oracle_zones.go (modified work).
 // Source: go-ora, MIT License, Copyright (c) 2020 Samy Sultan. See THIRD_PARTY_NOTICES.md.
 pub(crate) fn oracle_zone_name(region_id: u16) -> Option<&'static str> {
     match region_id {
