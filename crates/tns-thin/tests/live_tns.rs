@@ -3823,6 +3823,48 @@ fn commit_and_auto_commit_make_changes_visible() {
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn cancel_interrupts_long_running_query() {
+    // Mirrors the app's cancel watchdog: a tier-1 graceful break first, then a
+    // tier-2 force close if the statement has not stopped. This guarantees a
+    // prompt ORA-01013 even when the listener does not honour out-of-band breaks
+    // (supports_oob == false), which is the case on the local test database.
+    let mut conn = connect();
+    conn.set_call_timeout(Some(Duration::from_secs(30)))
+        .expect("set cancel test timeout");
+    let cancel = conn.cancel_handle();
+    let cancel_thread = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(300));
+        let _ = cancel.break_execution();
+        thread::sleep(Duration::from_millis(700));
+        cancel.force_close();
+    });
+
+    let started = Instant::now();
+    let result = conn.query(
+        "SELECT COUNT(*) FROM all_objects a, all_objects b, all_objects c",
+        1,
+    );
+    cancel_thread
+        .join()
+        .expect("cancel thread should not panic");
+
+    let message = result
+        .expect_err("cancelled query should fail with ORA-01013")
+        .to_string()
+        .to_ascii_lowercase();
+    assert!(
+        message.contains("ora-01013") || message.contains("user requested cancel"),
+        "expected ORA-01013 cancel error, got {message}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "escalated cancel took {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn cancel_keeps_connection_reusable() {
     let mut conn = connect();
     conn.set_call_timeout(Some(Duration::from_secs(10)))
         .expect("set cancel test timeout");
@@ -3832,7 +3874,6 @@ fn cancel_interrupts_long_running_query() {
         cancel.break_execution()
     });
 
-    let started = Instant::now();
     let result = conn.query(
         "SELECT COUNT(*) FROM all_objects a, all_objects b, all_objects c",
         1,
@@ -3850,10 +3891,50 @@ fn cancel_interrupts_long_running_query() {
         message.contains("ora-01013") || message.contains("user requested cancel"),
         "expected ORA-01013 cancel error, got {message}"
     );
+
+    // A graceful (tier-1) cancel must leave the connection reusable, matching
+    // the OCI and MySQL/MariaDB cancel flow.
     assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "cancel took {:?}",
-        started.elapsed()
+        !conn.is_broken(),
+        "graceful cancel must keep the connection reusable"
+    );
+    let reuse = conn
+        .query_described_fetch_all("SELECT 1 AS one FROM dual", 1)
+        .expect("connection should be reusable after a graceful cancel");
+    assert_eq!(
+        rows_to_strings(&reuse.result.rows),
+        vec![vec!["1".to_string()]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn force_close_marks_connection_broken() {
+    let mut conn = connect();
+    conn.set_call_timeout(Some(Duration::from_secs(10)))
+        .expect("set cancel test timeout");
+    let cancel = conn.cancel_handle();
+    let cancel_thread = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(300));
+        cancel.force_close();
+    });
+
+    let result = conn.query(
+        "SELECT COUNT(*) FROM all_objects a, all_objects b, all_objects c",
+        1,
+    );
+    cancel_thread
+        .join()
+        .expect("force cancel thread should not panic");
+
+    assert!(
+        result.is_err(),
+        "tier-2 force close should abort the running query"
+    );
+    // A force close tears the socket down, so the connection cannot be reused.
+    assert!(
+        conn.is_broken(),
+        "force close must mark the connection broken"
     );
 }
 

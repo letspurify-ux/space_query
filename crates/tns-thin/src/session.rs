@@ -58,6 +58,11 @@ const TNS_DEFAULT_SDU: usize = 8192;
 const TNS_DATA_PACKET_OVERHEAD: usize = 64;
 const TNS_DATA_FLAGS_EOF: u16 = 0x0040;
 const TNS_DATA_FLAGS_END_OF_RESPONSE: u16 = 0x2000;
+/// Per-read timeout while draining the server's break/reset response during a
+/// graceful cancel. Bounded so a server that ignores the break cannot hang us.
+const CANCEL_RESET_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+/// Safety bound on packets drained during a cancel reset handshake.
+const CANCEL_RESET_MAX_PACKETS: usize = 64;
 const TNS_MSG_TYPE_PROTOCOL: u8 = 1;
 const TNS_MSG_TYPE_DATA_TYPES: u8 = 2;
 const TNS_MSG_TYPE_FUNCTION: u8 = 3;
@@ -452,6 +457,10 @@ pub struct OracleThinCancelHandle {
 }
 
 impl OracleThinCancelHandle {
+    /// Tier 1 (graceful): ask the server to abort the running call but keep the
+    /// socket open so the reader can run the break/reset handshake and the
+    /// connection stays reusable. Mirrors python-oracledb `_break_external` and
+    /// go-ora `BreakConnection`, neither of which closes the socket here.
     pub fn break_execution(&self) -> Result<(), OracleThinError> {
         self.cancelled.store(true, Ordering::SeqCst);
         if let Some(stream) = &self.break_stream {
@@ -466,13 +475,20 @@ impl OracleThinCancelHandle {
                 self.protocol_version,
                 TNS_MARKER_TYPE_INTERRUPT,
             )?;
-            let _ = stream.shutdown(Shutdown::Both);
         }
         Ok(())
     }
 
+    /// Tier 2 (force): tear down the socket. Used only when tier 1 fails to
+    /// release the call within the cancel timeout. The blocked reader unblocks
+    /// with a socket error and the connection is marked broken/discarded.
     pub fn force_close(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
+        if let Some(stream) = &self.break_stream {
+            if let Ok(stream) = stream.lock() {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+        }
     }
 }
 
@@ -558,6 +574,8 @@ impl OracleThinSession {
         self.cancel_flag.store(false, Ordering::SeqCst);
     }
 
+    /// Tier 1 (graceful) break. See [`OracleThinCancelHandle::break_execution`];
+    /// the socket is left open so the reader can run the break/reset handshake.
     pub fn break_execution(&self) -> Result<(), OracleThinError> {
         self.cancel_flag.store(true, Ordering::SeqCst);
         if self.capabilities.supports_oob {
@@ -569,8 +587,87 @@ impl OracleThinSession {
             self.capabilities.protocol_version.unwrap_or(319),
             TNS_MARKER_TYPE_INTERRUPT,
         )?;
-        let _ = stream.shutdown(Shutdown::Both);
         Ok(())
+    }
+
+    /// Finishes a cancelled call. A tier-1 break leaves the server's break/reset
+    /// response pending on the socket; this completes the handshake and drains
+    /// it so the connection stays at a clean request boundary and can be reused
+    /// (matching the OCI/MySQL cancel flow). If the handshake cannot complete
+    /// cleanly — e.g. a tier-2 `force_close` already shut the socket down — the
+    /// session is marked broken so the pool discards it. Always reports
+    /// ORA-01013 to the caller.
+    fn finish_cancelled_read(&mut self) -> OracleThinError {
+        if self.perform_cancel_reset().is_err() {
+            self.broken = true;
+        }
+        OracleThinError::new("ORA-01013: user requested cancel of current operation")
+    }
+
+    /// Runs the break/reset handshake: sends a reset marker and drains the
+    /// server's response until the socket is quiet at a request boundary.
+    /// Mirrors python-oracledb `_reset` (protocols 315/318/319) and go-ora
+    /// `processMarker` (protocol 314); both send a reset marker and read the
+    /// trailing markers/error before the connection is reused. OOB is only an
+    /// optimisation — the handshake completes over in-band markers alone.
+    fn perform_cancel_reset(&mut self) -> Result<(), OracleThinError> {
+        let protocol_version = self.capabilities.protocol_version.unwrap_or(319);
+        write_marker_packet(&mut self.stream, protocol_version, TNS_MARKER_TYPE_RESET)?;
+
+        let prior_timeout = self.stream.read_timeout().ok().flatten();
+        self.stream
+            .set_read_timeout(Some(CANCEL_RESET_DRAIN_TIMEOUT))
+            .map_err(|err| {
+                OracleThinError::new(format!("failed to set Oracle cancel reset timeout: {err}"))
+            })?;
+        let outcome = self.drain_cancel_reset(protocol_version);
+        let _ = self.stream.set_read_timeout(prior_timeout);
+        outcome
+    }
+
+    fn drain_cancel_reset(&mut self, protocol_version: u16) -> Result<(), OracleThinError> {
+        // The server answers a break with marker packets followed by the
+        // trailing ORA-01013 error data. python-oracledb `_reset` reads until it
+        // sees the server's reset marker, then stops at the next data packet;
+        // go-ora `processMarker` reads the reset then the error. We mirror that:
+        // once the server reset marker is seen, the next data packet completes
+        // the handshake. A quiet socket (read timeout at a boundary) is the
+        // fallback terminator when the inline reader already consumed the reset.
+        let mut saw_server_reset = false;
+        for _ in 0..CANCEL_RESET_MAX_PACKETS {
+            match read_cancel_reset_packet(&mut self.stream, protocol_version)? {
+                CancelResetPacket::Quiet => return Ok(()),
+                CancelResetPacket::Packet(TNS_PACKET_TYPE_MARKER, data) => {
+                    match data.last().copied() {
+                        // Server still breaking: acknowledge with a reset marker.
+                        Some(TNS_MARKER_TYPE_BREAK) => {
+                            write_marker_packet(
+                                &mut self.stream,
+                                protocol_version,
+                                TNS_MARKER_TYPE_RESET,
+                            )?;
+                        }
+                        Some(TNS_MARKER_TYPE_RESET) => saw_server_reset = true,
+                        _ => {}
+                    }
+                }
+                CancelResetPacket::Packet(TNS_PACKET_TYPE_CONTROL, _) => {}
+                CancelResetPacket::Packet(TNS_PACKET_TYPE_DATA, _) => {
+                    // Trailing error/end-of-response packet after the reset.
+                    if saw_server_reset {
+                        return Ok(());
+                    }
+                }
+                CancelResetPacket::Packet(other, _) => {
+                    return Err(OracleThinError::new(format!(
+                        "unexpected TNS packet type {other} during cancel reset"
+                    )));
+                }
+            }
+        }
+        Err(OracleThinError::new(
+            "Oracle thin cancel reset did not reach a clean boundary",
+        ))
     }
 
     pub fn set_call_timeout(&mut self, timeout: Option<Duration>) -> Result<(), OracleThinError> {
@@ -1089,17 +1186,13 @@ impl OracleThinSession {
             state,
             close_sequence.is_some(),
         );
+        if self.cancel_flag.swap(false, Ordering::SeqCst) {
+            return Err(self.finish_cancelled_read());
+        }
         let result = match response {
             Ok(response) => {
-                self.cancel_flag.store(false, Ordering::SeqCst);
                 self.remember_cursor_columns_from_response(&response);
                 response.result
-            }
-            Err(error) if self.cancel_flag.swap(false, Ordering::SeqCst) => {
-                self.broken = true;
-                return Err(OracleThinError::new(
-                    "ORA-01013: user requested cancel of current operation",
-                ));
             }
             Err(error) => {
                 let error_cursor_id = error.cursor_id();
@@ -1614,17 +1707,13 @@ impl OracleThinSession {
             request,
             skip_empty_end_of_response,
         );
+        if self.cancel_flag.swap(false, Ordering::SeqCst) {
+            return Err(self.finish_cancelled_read());
+        }
         match response {
             Ok(response) => {
-                self.cancel_flag.store(false, Ordering::SeqCst);
                 self.remember_cursor_columns_from_response(&response);
                 Ok(response)
-            }
-            Err(error) if self.cancel_flag.swap(false, Ordering::SeqCst) => {
-                self.broken = true;
-                Err(OracleThinError::new(
-                    "ORA-01013: user requested cancel of current operation",
-                ))
             }
             Err(error) => {
                 self.close_cursor_later(error.cursor_id());
@@ -1670,19 +1759,10 @@ impl OracleThinSession {
             &self.capabilities,
             !pending_cursor_closes.is_empty(),
         );
-        match response {
-            Ok(()) => {
-                self.cancel_flag.store(false, Ordering::SeqCst);
-                Ok(())
-            }
-            Err(error) if self.cancel_flag.swap(false, Ordering::SeqCst) => {
-                self.broken = true;
-                Err(OracleThinError::new(
-                    "ORA-01013: user requested cancel of current operation",
-                ))
-            }
-            Err(error) => Err(error),
+        if self.cancel_flag.swap(false, Ordering::SeqCst) {
+            return Err(self.finish_cancelled_read());
         }
+        response
     }
 
     fn next_ttc_sequence(&mut self) -> u8 {
@@ -8314,6 +8394,44 @@ fn read_packet_body_error(
     }
 }
 
+/// One packet read while draining a cancel reset, or `Quiet` when the read
+/// timed out at a packet boundary (no bytes pending — the socket is idle).
+enum CancelResetPacket {
+    Packet(u8, Vec<u8>),
+    Quiet,
+}
+
+/// Reads a single whole TNS packet during a cancel reset drain. A read timeout
+/// on the packet header means the socket is quiet at a request boundary, which
+/// is the normal way the drain terminates.
+fn read_cancel_reset_packet(
+    stream: &mut TcpStream,
+    protocol_version: u16,
+) -> Result<CancelResetPacket, OracleThinError> {
+    let mut header = [0u8; 8];
+    if let Err(err) = stream.read_exact(&mut header) {
+        if matches!(err.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) {
+            return Ok(CancelResetPacket::Quiet);
+        }
+        return Err(read_packet_error("TNS cancel reset header", err));
+    }
+    let size = if protocol_version >= 315 {
+        u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize
+    } else {
+        u16::from_be_bytes([header[0], header[1]]) as usize
+    };
+    if size < 8 {
+        return Err(OracleThinError::new(format!(
+            "invalid TNS packet length {size} during cancel reset"
+        )));
+    }
+    let mut data = vec![0u8; size - 8];
+    stream
+        .read_exact(&mut data)
+        .map_err(|err| read_packet_body_error(err, header[4], size, &header))?;
+    Ok(CancelResetPacket::Packet(header[4], data))
+}
+
 fn write_marker_packet(
     stream: &mut TcpStream,
     protocol_version: u16,
@@ -9475,7 +9593,11 @@ mod tests {
         });
         let stream = TcpStream::connect(addr).unwrap();
         let mut session = test_session_with_stream(stream);
-        session.cancel_handle().force_close();
+        // Tier-1 cancel pending; the mock server drops the socket so the reset
+        // handshake cannot complete and the session must be marked broken.
+        session
+            .cancel_flag
+            .store(true, std::sync::atomic::Ordering::SeqCst);
 
         let err = session
             .execute_request(&StatementRequest::query("SELECT * FROM dual", 1))
@@ -9499,7 +9621,11 @@ mod tests {
         });
         let stream = TcpStream::connect(addr).unwrap();
         let mut session = test_session_with_stream(stream);
-        session.cancel_handle().force_close();
+        // Tier-1 cancel pending; the mock server drops the socket so the reset
+        // handshake cannot complete and the session must be marked broken.
+        session
+            .cancel_flag
+            .store(true, std::sync::atomic::Ordering::SeqCst);
 
         let err = session
             .fetch_ref_cursor_batch(7, &[], 1, false)
@@ -9523,7 +9649,11 @@ mod tests {
         });
         let stream = TcpStream::connect(addr).unwrap();
         let mut session = test_session_with_stream(stream);
-        session.cancel_handle().force_close();
+        // Tier-1 cancel pending; the mock server drops the socket so the reset
+        // handshake cannot complete and the session must be marked broken.
+        session
+            .cancel_flag
+            .store(true, std::sync::atomic::Ordering::SeqCst);
 
         let err = session
             .simple_ttc_call(TNS_FUNC_COMMIT, "commit")
@@ -9535,6 +9665,52 @@ mod tests {
         );
         assert!(session.is_broken());
         server.join().unwrap();
+    }
+
+    #[test]
+    fn cancel_reset_drains_break_response_and_keeps_connection_reusable() {
+        for protocol_version in [314, 315, 318, 319] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                // Read the client's reset marker that opens the handshake.
+                read_one_tns_test_packet(&mut stream, protocol_version);
+                // Acknowledge the break with a reset marker, then send the
+                // trailing ORA-01013 error/end-of-response data packet.
+                stream
+                    .write_all(&tns_test_packet(
+                        protocol_version,
+                        TNS_PACKET_TYPE_MARKER,
+                        &[1, 0, TNS_MARKER_TYPE_RESET],
+                    ))
+                    .unwrap();
+                let mut data_body = Vec::new();
+                data_body.extend_from_slice(&TNS_DATA_FLAGS_END_OF_RESPONSE.to_be_bytes());
+                data_body.extend_from_slice(&[TNS_MSG_TYPE_ERROR]);
+                stream
+                    .write_all(&tns_test_packet(
+                        protocol_version,
+                        TNS_PACKET_TYPE_DATA,
+                        &data_body,
+                    ))
+                    .unwrap();
+                // Connection stays open after a graceful cancel (reused).
+                std::thread::sleep(Duration::from_millis(200));
+            });
+            let stream = TcpStream::connect(addr).unwrap();
+            let mut session = test_session_with_stream(stream);
+            session.capabilities.protocol_version = Some(protocol_version);
+
+            session
+                .perform_cancel_reset()
+                .unwrap_or_else(|err| panic!("protocol {protocol_version} reset failed: {err}"));
+            assert!(
+                !session.is_broken(),
+                "protocol {protocol_version}: connection should remain reusable"
+            );
+            server.join().unwrap();
+        }
     }
 
     #[test]

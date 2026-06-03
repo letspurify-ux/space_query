@@ -1418,6 +1418,83 @@ impl ExplainPlanBackend for MysqlExplainPlanBackend {
     }
 }
 
+/// Two-tier cancellation contract shared by every DB backend.
+///
+/// - [`QueryCanceler::interrupt`] (tier 1, graceful): ask the server to abort
+///   the running statement while keeping the client connection usable/reusable.
+/// - [`QueryCanceler::terminate`] (tier 2, force): tear down the physical
+///   connection. Only used when tier 1 fails to release the call within the
+///   cancel timeout.
+///
+/// OCI does `OCIBreak` then a drop-close; Oracle thin sends an in-band break and
+/// finishes the reset handshake on the reader (force-closing the socket only on
+/// terminate); MySQL/MariaDB issue `KILL QUERY` then `KILL CONNECTION` over a
+/// separate control connection.
+trait QueryCanceler {
+    fn interrupt(&self) -> Result<(), String>;
+    fn terminate(self);
+}
+
+impl QueryCanceler for Arc<Connection> {
+    fn interrupt(&self) -> Result<(), String> {
+        self.break_execution().map_err(|err| err.to_string())
+    }
+
+    fn terminate(self) {
+        if let Err(err) = self.break_execution() {
+            crate::utils::logging::log_error(
+                "query cancel",
+                &format!("Oracle force break_execution failed: {err}"),
+            );
+        }
+        if let Err(err) = self.close_with_mode(oracle::conn::CloseMode::Drop) {
+            crate::utils::logging::log_error(
+                "query cancel",
+                &format!("Oracle force close failed: {err}"),
+            );
+        }
+    }
+}
+
+impl QueryCanceler for OracleThinCancelHandle {
+    fn interrupt(&self) -> Result<(), String> {
+        self.break_execution().map_err(|err| err.to_string())
+    }
+
+    fn terminate(self) {
+        if let Err(err) = self.break_execution() {
+            crate::utils::logging::log_error(
+                "query cancel",
+                &format!("Oracle thin force break_execution failed: {err}"),
+            );
+        }
+        self.force_close();
+    }
+}
+
+impl QueryCanceler for MySqlQueryCancelContext {
+    fn interrupt(&self) -> Result<(), String> {
+        crate::db::query::mysql_executor::MysqlExecutor::cancel_running_query(
+            &self.connection_info,
+            self.connection_id,
+        )
+        .map_err(|err| err.to_string())
+    }
+
+    fn terminate(mut self) {
+        if let Err(err) = crate::db::query::mysql_executor::MysqlExecutor::cancel_connection(
+            &self.connection_info,
+            self.connection_id,
+        ) {
+            crate::utils::logging::log_error(
+                "query cancel",
+                &format!("MySQL KILL CONNECTION {} failed: {err}", self.connection_id),
+            );
+        }
+        self.connection_info.clear_password();
+    }
+}
+
 impl QueryCancelHandle {
     fn cancel(self) {
         let fallback = self.clone();
@@ -1444,28 +1521,17 @@ impl QueryCancelHandle {
 
     fn cancel_interrupt(&self) -> Result<(), String> {
         match self {
-            QueryCancelHandle::Oracle(conn) => {
-                conn.break_execution().map_err(|err| err.to_string())
-            }
-            QueryCancelHandle::OracleThin(cancel_handle) => cancel_handle
-                .break_execution()
-                .map_err(|err| err.to_string()),
-            QueryCancelHandle::MySql(context) => {
-                crate::db::query::mysql_executor::MysqlExecutor::cancel_running_query(
-                    &context.connection_info,
-                    context.connection_id,
-                )
-                .map_err(|err| err.to_string())
-            }
+            QueryCancelHandle::Oracle(conn) => conn.interrupt(),
+            QueryCancelHandle::OracleThin(cancel_handle) => cancel_handle.interrupt(),
+            QueryCancelHandle::MySql(context) => context.interrupt(),
             QueryCancelHandle::MySqlShared(context) => {
                 let cancel_context = context
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clone();
-                if let Some(cancel_context) = cancel_context {
-                    QueryCancelHandle::MySql(Box::new(cancel_context)).cancel_interrupt()
-                } else {
-                    Ok(())
+                match cancel_context {
+                    Some(cancel_context) => cancel_context.interrupt(),
+                    None => Ok(()),
                 }
             }
             #[cfg(test)]
@@ -1495,51 +1561,16 @@ impl QueryCancelHandle {
 
     fn force_cancel_blocking(self) {
         match self {
-            QueryCancelHandle::Oracle(conn) => {
-                if let Err(err) = conn.break_execution() {
-                    crate::utils::logging::log_error(
-                        "query cancel",
-                        &format!("Oracle force break_execution failed: {err}"),
-                    );
-                }
-                if let Err(err) = conn.close_with_mode(oracle::conn::CloseMode::Drop) {
-                    crate::utils::logging::log_error(
-                        "query cancel",
-                        &format!("Oracle force close failed: {err}"),
-                    );
-                }
-            }
-            QueryCancelHandle::OracleThin(cancel_handle) => {
-                if let Err(err) = cancel_handle.break_execution() {
-                    crate::utils::logging::log_error(
-                        "query cancel",
-                        &format!("Oracle thin force break_execution failed: {err}"),
-                    );
-                }
-                cancel_handle.force_close();
-            }
-            QueryCancelHandle::MySql(mut context) => {
-                if let Err(err) = crate::db::query::mysql_executor::MysqlExecutor::cancel_connection(
-                    &context.connection_info,
-                    context.connection_id,
-                ) {
-                    crate::utils::logging::log_error(
-                        "query cancel",
-                        &format!(
-                            "MySQL KILL CONNECTION {} failed: {err}",
-                            context.connection_id
-                        ),
-                    );
-                }
-                context.connection_info.clear_password();
-            }
+            QueryCancelHandle::Oracle(conn) => conn.terminate(),
+            QueryCancelHandle::OracleThin(cancel_handle) => cancel_handle.terminate(),
+            QueryCancelHandle::MySql(context) => (*context).terminate(),
             QueryCancelHandle::MySqlShared(context) => {
                 let cancel_context = context
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clone();
                 if let Some(cancel_context) = cancel_context {
-                    QueryCancelHandle::MySql(Box::new(cancel_context)).force_cancel_blocking();
+                    cancel_context.terminate();
                 }
             }
             #[cfg(test)]
