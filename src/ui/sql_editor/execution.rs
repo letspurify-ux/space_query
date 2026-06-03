@@ -590,6 +590,7 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             cancel_flag,
             script_mode,
             auto_commit,
+            prior_retained_state,
             selected_transaction_mode,
             db_activity,
             current_operation_autocommit,
@@ -13520,6 +13521,7 @@ impl SqlEditorWidget {
             .to_ascii_lowercase()
     }
 
+    #[cfg(test)]
     fn oracle_thin_is_ddl_or_dcl(head: &str) -> bool {
         head.starts_with("create")
             || head.starts_with("alter")
@@ -13527,6 +13529,38 @@ impl SqlEditorWidget {
             || head.starts_with("truncate")
             || head.starts_with("grant")
             || head.starts_with("revoke")
+    }
+
+    fn oracle_retained_state_after_statement_effects(
+        prior_state: RetainedSessionState,
+        statement_effects: crate::db::StatementSessionEffects,
+        auto_commit: bool,
+        statement_failed: bool,
+        server_reports_uncommitted_work: bool,
+        interruption_requires_transaction_decision: bool,
+    ) -> RetainedSessionState {
+        let server_reports_uncommitted_work = server_reports_uncommitted_work
+            || (!auto_commit
+                && (statement_effects.may_leave_uncommitted_work()
+                    || statement_effects.opens_or_preserves_transaction_state()));
+        let mut retained_state = crate::db::retained_session_state_after_statement(
+            crate::db::statement_session_post_processor_for(crate::db::DatabaseType::Oracle),
+            prior_state,
+            statement_effects,
+            server_reports_uncommitted_work,
+            statement_failed,
+            false,
+            interruption_requires_transaction_decision,
+        );
+        if !statement_failed
+            && auto_commit
+            && !statement_effects.skip_auto_commit()
+            && (statement_effects.may_leave_uncommitted_work()
+                || statement_effects.opens_or_preserves_transaction_state())
+        {
+            retained_state = retained_state.with_transaction_state(TransactionSessionState::Clean);
+        }
+        retained_state
     }
 
     fn oracle_thin_quote_identifier(identifier: &str) -> String {
@@ -14008,6 +14042,7 @@ impl SqlEditorWidget {
         cancel_flag: &Arc<Mutex<bool>>,
         script_mode: bool,
         initial_auto_commit: bool,
+        prior_retained_state: RetainedSessionState,
         selected_transaction_mode: crate::db::TransactionMode,
         db_activity: &str,
         current_operation_autocommit: &Arc<Mutex<bool>>,
@@ -14020,7 +14055,7 @@ impl SqlEditorWidget {
         );
         if items.is_empty() {
             return OracleThinBatchOutcome {
-                retained_state: RetainedSessionState::default(),
+                retained_state: prior_retained_state,
                 had_error: false,
                 timed_out: false,
             };
@@ -14061,7 +14096,9 @@ impl SqlEditorWidget {
         };
         let mut result_index = 0usize;
         let mut stop_execution = false;
-        let mut may_have_uncommitted_work = false;
+        let post_processor =
+            crate::db::statement_session_post_processor_for(crate::db::DatabaseType::Oracle);
+        let mut retained_state = prior_retained_state;
         let mut invalid_session = false;
         let mut had_error = false;
         let mut timed_out = false;
@@ -14961,6 +14998,7 @@ impl SqlEditorWidget {
                     let has_exec_call = exec_call.is_some();
                     let execution_sql = exec_call.unwrap_or_else(|| sql_to_execute.clone());
                     let head = Self::oracle_thin_statement_head(&execution_sql);
+                    let statement_effects = post_processor.effects_for_sql(&execution_sql);
                     if head.starts_with("set serveroutput") {
                         let mut statement_error = None::<String>;
                         match QueryExecutor::parse_tool_command(&execution_sql) {
@@ -15040,7 +15078,7 @@ impl SqlEditorWidget {
                             .unwrap_or_default()
                         {
                             if let Err(message) =
-                                Self::execute_oracle_thin_statement(conn, tx_sql, false)
+                                Self::execute_oracle_thin_statement(conn, &tx_sql, false)
                             {
                                 had_error = true;
                                 let (error_message, statement_timed_out) =
@@ -15067,6 +15105,16 @@ impl SqlEditorWidget {
                                     stop_execution = true;
                                 }
                                 break;
+                            } else {
+                                retained_state =
+                                    Self::oracle_retained_state_after_statement_effects(
+                                        retained_state,
+                                        post_processor.effects_for_sql(&tx_sql),
+                                        false,
+                                        false,
+                                        false,
+                                        false,
+                                    );
                             }
                         }
                         transaction_mode_applied = true;
@@ -15079,7 +15127,8 @@ impl SqlEditorWidget {
                     if let Some(action) = CloseSessionAction::from_plain_sql(&execution_sql) {
                         match action.apply_oracle_thin(conn) {
                             Ok(()) => {
-                                may_have_uncommitted_work = false;
+                                retained_state = retained_state
+                                    .with_transaction_state(TransactionSessionState::Clean);
                                 Self::emit_non_select_result(
                                     sender,
                                     session,
@@ -15103,21 +15152,54 @@ impl SqlEditorWidget {
                             Some(cancel_flag),
                         ) {
                             Ok((columns, rows)) => {
-                                Self::apply_column_new_value_from_row(
-                                    session,
-                                    &columns,
-                                    rows.last().map(Vec::as_slice),
-                                );
-                                Self::emit_oracle_thin_select_result(
-                                    sender,
-                                    session,
-                                    conn_name,
-                                    result_index,
-                                    &display_sql,
-                                    columns,
-                                    rows,
-                                );
-                                result_index += 1;
+                                retained_state =
+                                    Self::oracle_retained_state_after_statement_effects(
+                                        retained_state,
+                                        statement_effects,
+                                        auto_commit,
+                                        false,
+                                        false,
+                                        false,
+                                    );
+                                if auto_commit
+                                    && Self::oracle_select_effects_need_auto_commit(
+                                        statement_effects,
+                                    )
+                                {
+                                    match conn.commit() {
+                                        Ok(()) => {
+                                            retained_state = retained_state.with_transaction_state(
+                                                TransactionSessionState::Clean,
+                                            );
+                                        }
+                                        Err(err) => {
+                                            let message = format!("Auto-commit failed: {err}");
+                                            had_error = true;
+                                            invalid_session |= conn.is_broken();
+                                            retained_state = retained_state.with_transaction_state(
+                                                TransactionSessionState::DecisionRequired,
+                                            );
+                                            statement_error = Some(message);
+                                        }
+                                    }
+                                }
+                                if statement_error.is_none() {
+                                    Self::apply_column_new_value_from_row(
+                                        session,
+                                        &columns,
+                                        rows.last().map(Vec::as_slice),
+                                    );
+                                    Self::emit_oracle_thin_select_result(
+                                        sender,
+                                        session,
+                                        conn_name,
+                                        result_index,
+                                        &display_sql,
+                                        columns,
+                                        rows,
+                                    );
+                                    result_index += 1;
+                                }
                             }
                             Err(message) => statement_error = Some(message),
                         }
@@ -15135,8 +15217,15 @@ impl SqlEditorWidget {
                                 let mut ref_cursor_results =
                                     VecDeque::from(outcome.ref_cursor_results);
                                 let mut implicit_results = VecDeque::from(outcome.implicit_results);
-                                let ddl = Self::oracle_thin_is_ddl_or_dcl(&head);
-                                may_have_uncommitted_work = !(auto_commit || ddl);
+                                retained_state =
+                                    Self::oracle_retained_state_after_statement_effects(
+                                        retained_state,
+                                        statement_effects,
+                                        auto_commit,
+                                        false,
+                                        false,
+                                        false,
+                                    );
                                 let mut message = Self::oracle_thin_non_query_success_message(
                                     &head,
                                     has_exec_call,
@@ -15342,6 +15431,17 @@ impl SqlEditorWidget {
                             );
                         timed_out |= statement_timed_out;
                         invalid_session |= statement_timed_out || conn.is_broken();
+                        retained_state = Self::oracle_retained_state_after_statement_effects(
+                            retained_state,
+                            statement_effects,
+                            auto_commit,
+                            true,
+                            false,
+                            !auto_commit
+                                && (load_mutex_bool(cancel_flag) || statement_timed_out)
+                                && (statement_effects.may_leave_uncommitted_work()
+                                    || statement_effects.opens_or_preserves_transaction_state()),
+                        );
                         Self::emit_non_select_result(
                             sender,
                             session,
@@ -15399,15 +15499,19 @@ impl SqlEditorWidget {
 
         let retained_state = if invalid_session {
             RetainedSessionState::from_transaction_state(TransactionSessionState::InvalidSession)
-        } else if may_have_uncommitted_work
-            || crate::db::DatabaseConnection::oracle_thin_session_may_have_uncommitted_work(
-                conn,
-                "oracle thin batch",
-            )
-        {
-            RetainedSessionState::from_transaction_state(TransactionSessionState::MaybeDirty)
         } else {
-            RetainedSessionState::default()
+            let live_state =
+                if crate::db::DatabaseConnection::oracle_thin_session_may_have_uncommitted_work(
+                    conn,
+                    "oracle thin batch",
+                ) {
+                    RetainedSessionState::from_transaction_state(
+                        TransactionSessionState::MaybeDirty,
+                    )
+                } else {
+                    RetainedSessionState::default()
+                };
+            retained_state.conservative_merge(live_state)
         };
         OracleThinBatchOutcome {
             retained_state,
@@ -21298,6 +21402,124 @@ mod query_execution_cleanup_tests {
         assert_eq!(commit_calls, 0);
         assert!(cleanup.oracle_pooled_session_forced_maybe_dirty);
         assert!(!cleanup.oracle_pooled_session_transaction_decision_required);
+    }
+
+    #[test]
+    fn oracle_thin_retained_state_tracks_transactional_select_for_close() {
+        let effects =
+            crate::db::statement_session_post_processor_for(crate::db::DatabaseType::Oracle)
+                .effects_for_sql("SELECT * FROM accounts FOR UPDATE");
+
+        let manual_commit_state = SqlEditorWidget::oracle_retained_state_after_statement_effects(
+            RetainedSessionState::default(),
+            effects,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(
+            manual_commit_state.transaction_state(),
+            TransactionSessionState::MaybeDirty
+        );
+        assert_eq!(
+            crate::db::retained_session_state_preflight_decision(
+                crate::db::RetainedSessionPreflightAction::Close,
+                manual_commit_state,
+            ),
+            crate::db::RetainedSessionPreflightDecision::RequireResolution
+        );
+
+        let auto_commit_state = SqlEditorWidget::oracle_retained_state_after_statement_effects(
+            RetainedSessionState::default(),
+            effects,
+            true,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(
+            auto_commit_state.transaction_state(),
+            TransactionSessionState::Clean
+        );
+        assert_eq!(
+            crate::db::retained_session_state_preflight_decision(
+                crate::db::RetainedSessionPreflightAction::Close,
+                auto_commit_state,
+            ),
+            crate::db::RetainedSessionPreflightDecision::Allow
+        );
+    }
+
+    #[test]
+    fn oracle_thin_retained_state_tracks_session_residue_for_close() {
+        let effects =
+            crate::db::statement_session_post_processor_for(crate::db::DatabaseType::Oracle)
+                .effects_for_sql("ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD'");
+
+        let retained_state = SqlEditorWidget::oracle_retained_state_after_statement_effects(
+            RetainedSessionState::default(),
+            effects,
+            true,
+            false,
+            false,
+            false,
+        );
+
+        assert_eq!(retained_state.label(), "session state");
+        assert!(!retained_state.transaction_resolution_action_allowed());
+        assert_eq!(
+            crate::db::retained_session_state_preflight_decision(
+                crate::db::RetainedSessionPreflightAction::Close,
+                retained_state,
+            ),
+            crate::db::RetainedSessionPreflightDecision::RequireResolution
+        );
+    }
+
+    #[test]
+    fn close_preflight_requires_resolution_for_dirty_state_on_all_db_types() {
+        for db_type in [
+            crate::db::DatabaseType::Oracle,
+            crate::db::DatabaseType::MySQL,
+            crate::db::DatabaseType::MariaDB,
+        ] {
+            let post_processor = crate::db::statement_session_post_processor_for(db_type);
+            let effects = post_processor.effects_for_sql("INSERT INTO t VALUES (1)");
+            let retained_state = if db_type == crate::db::DatabaseType::Oracle {
+                SqlEditorWidget::oracle_retained_state_after_statement_effects(
+                    RetainedSessionState::default(),
+                    effects,
+                    false,
+                    false,
+                    false,
+                    false,
+                )
+            } else {
+                crate::db::retained_session_state_after_statement(
+                    post_processor,
+                    RetainedSessionState::default(),
+                    effects,
+                    true,
+                    false,
+                    false,
+                    false,
+                )
+            };
+
+            assert!(
+                retained_state.may_have_uncommitted_work(),
+                "{db_type} should be maybe dirty after manual-commit DML"
+            );
+            assert_eq!(
+                crate::db::retained_session_state_preflight_decision(
+                    crate::db::RetainedSessionPreflightAction::Close,
+                    retained_state,
+                ),
+                crate::db::RetainedSessionPreflightDecision::RequireResolution,
+                "{db_type} close preflight must ask for resolution"
+            );
+        }
     }
 
     #[test]
@@ -29159,8 +29381,8 @@ mod mysql_transaction_feedback_tests {
     };
     use crate::db::{
         BindDataType, BindValue, BindVar, ConnectionInfo, DatabaseType, OracleDriverMode,
-        QueryExecutor, QueryResult, ResolvedBind, SessionState, SharedDbSessionLease,
-        TransactionMode,
+        QueryExecutor, QueryResult, ResolvedBind, RetainedSessionState, SessionState,
+        SharedDbSessionLease, TransactionMode, TransactionSessionState,
     };
     use crate::ui::{result_pane_routes_for_progress, ResultPaneRoute};
     use std::sync::atomic::Ordering;
@@ -29767,6 +29989,7 @@ mod mysql_transaction_feedback_tests {
             &cancel_flag,
             true,
             true,
+            RetainedSessionState::default(),
             TransactionMode::default(),
             "oracle thin script live test",
             &current_operation_autocommit,
@@ -30425,6 +30648,81 @@ mod mysql_transaction_feedback_tests {
                 "Oracle Thin SELECT #{idx} should reach Data Grid and Messages Info"
             );
         }
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle listener"]
+    fn oracle_thin_live_select_for_update_retained_state_requires_close_resolution() {
+        let _oracle_schema_guard = oracle_thin_shared_schema_test_guard();
+        let mut conn =
+            tns_thin::OracleThinSession::connect(oracle_thin_live_config()).expect("thin login");
+        let table = format!("OQT_THIN_DIRTY_{}", std::process::id());
+        let _ = SqlEditorWidget::execute_oracle_thin_statement(
+            &mut conn,
+            format!("DROP TABLE {table} PURGE"),
+            false,
+        );
+        SqlEditorWidget::execute_oracle_thin_statement(
+            &mut conn,
+            format!("CREATE TABLE {table} (id NUMBER PRIMARY KEY)"),
+            false,
+        )
+        .expect("create thin dirty-state table");
+        SqlEditorWidget::execute_oracle_thin_statement(
+            &mut conn,
+            format!("INSERT INTO {table} (id) VALUES (1)"),
+            false,
+        )
+        .expect("seed thin dirty-state table");
+        conn.commit().expect("commit thin dirty-state setup");
+
+        let session = Arc::new(Mutex::new(SessionState {
+            db_type: DatabaseType::Oracle,
+            ..SessionState::default()
+        }));
+        let cancel_flag = Arc::new(Mutex::new(false));
+        let current_operation_autocommit = Arc::new(Mutex::new(false));
+        let (sender, receiver) = mpsc::channel();
+        let outcome = SqlEditorWidget::execute_oracle_thin_batch(
+            &mut conn,
+            &sender,
+            &format!("SELECT id FROM {table} WHERE id = 1 FOR UPDATE"),
+            "ORACLE_THIN_DIRTY_LIVE_TEST",
+            &session,
+            &cancel_flag,
+            false,
+            false,
+            RetainedSessionState::default(),
+            TransactionMode::default(),
+            "oracle thin dirty-state live test",
+            &current_operation_autocommit,
+            None,
+            None,
+        );
+        drop(sender);
+        let progress = receiver.iter().collect::<Vec<_>>();
+
+        conn.rollback()
+            .expect("rollback thin dirty-state transaction");
+        let _ = SqlEditorWidget::execute_oracle_thin_statement(
+            &mut conn,
+            format!("DROP TABLE {table} PURGE"),
+            false,
+        );
+
+        let failures = oracle_thin_progress_failures(&progress);
+        assert!(failures.is_empty(), "failures: {failures:?}");
+        assert_eq!(
+            outcome.retained_state.transaction_state(),
+            TransactionSessionState::MaybeDirty
+        );
+        assert_eq!(
+            crate::db::retained_session_state_preflight_decision(
+                crate::db::RetainedSessionPreflightAction::Close,
+                outcome.retained_state,
+            ),
+            crate::db::RetainedSessionPreflightDecision::RequireResolution
+        );
     }
 
     #[test]
@@ -31842,6 +32140,7 @@ mod mysql_transaction_feedback_tests {
             &cancel_flag,
             true,
             true,
+            RetainedSessionState::default(),
             TransactionMode::default(),
             "oracle thin cancel live test",
             &current_operation_autocommit,

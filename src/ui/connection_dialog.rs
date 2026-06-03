@@ -560,9 +560,13 @@ fn apply_advanced_form_mode(
     // SSL and protocol rows and pin them to safe values while Thin is selected.
     let oracle_thin = db_type == DatabaseType::Oracle && driver_mode == OracleDriverMode::Thin;
     if oracle_thin {
-        ssl_choice.set_value(choice_index_from_ssl_mode(db_type, ConnectionSslMode::Disabled));
-        oracle_protocol_choice
-            .set_value(choice_index_from_oracle_protocol(OracleNetworkProtocol::Tcp));
+        ssl_choice.set_value(choice_index_from_ssl_mode(
+            db_type,
+            ConnectionSslMode::Disabled,
+        ));
+        oracle_protocol_choice.set_value(choice_index_from_oracle_protocol(
+            OracleNetworkProtocol::Tcp,
+        ));
     }
     set_form_row_visible(advanced_col, ssl_row, !oracle_thin);
     set_form_row_visible(
@@ -703,7 +707,10 @@ fn apply_connection_form_mode(
     }
 
     // Shrink the DB Selection section to fit only the rows that remain visible.
-    details_col.fixed(&*oracle_mode_col, db_selection_section_height(db_type, driver_mode));
+    details_col.fixed(
+        &*oracle_mode_col,
+        db_selection_section_height(db_type, driver_mode),
+    );
     details_col.layout();
 }
 
