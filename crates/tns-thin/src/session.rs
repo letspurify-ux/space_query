@@ -469,14 +469,19 @@ impl OracleThinCancelHandle {
             let mut stream = stream
                 .lock()
                 .map_err(|_| OracleThinError::new("Oracle thin cancel stream lock poisoned"))?;
+            // Mirror python-oracledb `_break_external`: out-of-band urgent data
+            // and the in-band INTERRUPT marker are mutually exclusive. When OOB
+            // is available the server is notified via the urgent byte alone;
+            // otherwise an in-band marker is the only signal it will see.
             if self.supports_oob {
                 let _ = send_oob_break(&stream);
+            } else {
+                write_marker_packet(
+                    &mut stream,
+                    self.protocol_version,
+                    TNS_MARKER_TYPE_INTERRUPT,
+                )?;
             }
-            write_marker_packet(
-                &mut stream,
-                self.protocol_version,
-                TNS_MARKER_TYPE_INTERRUPT,
-            )?;
         }
         Ok(())
     }
@@ -580,15 +585,19 @@ impl OracleThinSession {
     /// the socket is left open so the reader can run the break/reset handshake.
     pub fn break_execution(&self) -> Result<(), OracleThinError> {
         self.cancel_flag.store(true, Ordering::SeqCst);
+        // Mirror python-oracledb `_break_external`: OOB urgent data and the
+        // in-band INTERRUPT marker are mutually exclusive (see
+        // [`OracleThinCancelHandle::break_execution`]).
         if self.capabilities.supports_oob {
             let _ = send_oob_break(&self.stream);
+        } else {
+            let mut stream = self.stream.try_clone()?;
+            write_marker_packet(
+                &mut stream,
+                self.capabilities.protocol_version.unwrap_or(319),
+                TNS_MARKER_TYPE_INTERRUPT,
+            )?;
         }
-        let mut stream = self.stream.try_clone()?;
-        write_marker_packet(
-            &mut stream,
-            self.capabilities.protocol_version.unwrap_or(319),
-            TNS_MARKER_TYPE_INTERRUPT,
-        )?;
         Ok(())
     }
 
@@ -9342,7 +9351,8 @@ mod tests {
         TNS_DATA_TYPE_TIME, TNS_DATA_TYPE_TIME_TZ, TNS_DATA_TYPE_UB8, TNS_DATA_TYPE_UIN,
         TNS_DATA_TYPE_VBI, TNS_DATA_TYPE_VCS, TNS_DATA_TYPE_VNU, TNS_DATA_TYPE_VST,
         TNS_ERR_INBAND_MESSAGE, TNS_EXEC_FLAGS_IMPLICIT_RESULTSET, TNS_LOB_PREFETCH_FLAG,
-        TNS_MARKER_TYPE_BREAK, TNS_MARKER_TYPE_RESET, TNS_MAX_LONG_LENGTH,
+        TNS_MARKER_TYPE_BREAK, TNS_MARKER_TYPE_INTERRUPT, TNS_MARKER_TYPE_RESET,
+        TNS_MAX_LONG_LENGTH,
         TNS_MSG_TYPE_END_OF_RESPONSE, TNS_PACKET_TYPE_CONTROL, TNS_PACKET_TYPE_DATA,
         TNS_PACKET_TYPE_MARKER,
     };
@@ -9710,6 +9720,58 @@ mod tests {
                 "protocol {protocol_version}: connection should remain reusable"
             );
             server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn break_execution_without_oob_sends_single_interrupt_marker() {
+        // Mirrors python-oracledb `_break_external`: with OOB unavailable the
+        // graceful break is signalled by exactly one in-band INTERRUPT marker.
+        for protocol_version in [314, 315, 318, 319] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut header = [0u8; 8];
+                stream.read_exact(&mut header).unwrap();
+                let size = if protocol_version >= 315 {
+                    u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize
+                } else {
+                    u16::from_be_bytes([header[0], header[1]]) as usize
+                };
+                let mut body = vec![0u8; size - 8];
+                stream.read_exact(&mut body).unwrap();
+                // No further bytes should follow the single marker packet.
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(100)))
+                    .unwrap();
+                let mut extra = [0u8; 1];
+                let trailing = stream.read(&mut extra);
+                (header[4], body, trailing.unwrap_or(0))
+            });
+            let stream = TcpStream::connect(addr).unwrap();
+            let mut session = test_session_with_stream(stream);
+            session.capabilities.protocol_version = Some(protocol_version);
+            session.capabilities.supports_oob = false;
+
+            session
+                .break_execution()
+                .unwrap_or_else(|err| panic!("protocol {protocol_version} break failed: {err}"));
+
+            let (packet_type, body, trailing) = server.join().unwrap();
+            assert_eq!(
+                packet_type, TNS_PACKET_TYPE_MARKER,
+                "protocol {protocol_version}: expected a marker packet"
+            );
+            assert_eq!(
+                body.last().copied(),
+                Some(TNS_MARKER_TYPE_INTERRUPT),
+                "protocol {protocol_version}: expected an INTERRUPT marker"
+            );
+            assert_eq!(
+                trailing, 0,
+                "protocol {protocol_version}: only the marker should be sent"
+            );
         }
     }
 
