@@ -791,6 +791,100 @@ fn fetch_xmltype_column_decodes_large_clob_input() {
 
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn bind_xmltype_column_round_trips_string_like_python_oracledb() {
+    let config = live_config();
+    let table = unique_table_name("XML_BIND");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, doc XMLTYPE) \
+         XMLTYPE COLUMN doc STORE AS BASICFILE CLOB"
+    ))
+    .expect("create XMLTYPE bind test table");
+
+    let payload = format!("<data>{}</data>", "AbCdEfGhIjKlMnOp".repeat(64));
+    let mut insert =
+        StatementRequest::statement(format!("INSERT INTO {table} (id, doc) VALUES (:1, :2)"));
+    insert.binds.push(BindValue::Number("1".to_string()));
+    insert.binds.push(BindValue::Text(payload.clone()));
+    conn.execute(&insert, 0)
+        .expect("insert XMLTYPE from string bind");
+
+    let result = conn
+        .query_described_fetch_all(format!("SELECT doc FROM {table} WHERE id = 1"), 1)
+        .expect("fetch XMLTYPE inserted from string bind");
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Xml]
+    );
+    assert_eq!(rows_to_strings(&result.result.rows), vec![vec![payload]]);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn bind_xmltype_column_round_trips_large_clob_like_python_oracledb() {
+    let config = live_config();
+    let table = unique_table_name("XML_CLOB_BIND");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, doc XMLTYPE) \
+         XMLTYPE COLUMN doc STORE AS BASICFILE CLOB"
+    ))
+    .expect("create large XMLTYPE bind test table");
+
+    let payload = format!("<data>{}</data>", "AbCdEfGhIjKlMnOp".repeat(2048));
+    let mut insert = StatementRequest::statement(format!(
+        "BEGIN \
+         INSERT INTO {table} (id, doc) VALUES (:1, SYS.XMLTYPE(:2)); \
+         END;"
+    ));
+    insert.binds.push(BindValue::Number("1".to_string()));
+    insert.binds.push(BindValue::Clob(payload.clone()));
+    conn.execute(&insert, 0)
+        .expect("insert XMLTYPE from large CLOB bind");
+
+    let result = conn
+        .query_described_fetch_all(format!("SELECT doc FROM {table} WHERE id = 1"), 1)
+        .expect("fetch XMLTYPE inserted from large CLOB bind");
+    assert_eq!(
+        rows_to_strings(&result.result.rows),
+        vec![vec![payload.clone()]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn bind_clob_column_round_trips_large_text() {
+    let config = live_config();
+    let table = unique_table_name("CLOB_BIND");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, doc CLOB)"
+    ))
+    .expect("create CLOB bind test table");
+
+    let payload = "AbCdEfGhIjKlMnOp".repeat(2048);
+    let mut insert =
+        StatementRequest::statement(format!("INSERT INTO {table} (id, doc) VALUES (:1, :2)"));
+    insert.binds.push(BindValue::Number("1".to_string()));
+    insert.binds.push(BindValue::Clob(payload.clone()));
+    conn.execute(&insert, 0)
+        .expect("insert CLOB from large CLOB bind");
+
+    let result = conn
+        .query_described_fetch_all(format!("SELECT doc FROM {table} WHERE id = 1"), 1)
+        .expect("fetch CLOB inserted from large CLOB bind");
+    assert_eq!(rows_to_strings(&result.result.rows), vec![vec![payload]]);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn plsql_json_out_bind_decodes_oson_payload_as_json_text() {
     let mut conn = connect();
     let mut request = StatementRequest::statement(
@@ -3561,7 +3655,7 @@ fn plsql_procedure_ref_cursor_out_bind_fetches_extended_wire_types() {
     assert_eq!(value_to_string(&row[6]), "[1.0, 2.0, 3.0]");
     assert_eq!(
         value_to_string(&row[7]),
-        "SparseVector(dimensions=16, indices=[1, 3, 5], values=[1, 0, 5])"
+        "SparseVector(dimensions=16, indices=[1, 3, 5], values=[1.0, 0.0, 5.0])"
     );
     match &row[8] {
         OracleValue::Lob(locator) => assert!(

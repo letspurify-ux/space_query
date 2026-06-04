@@ -68,6 +68,11 @@ pub enum BindValue {
     IntervalYearMonth(OracleIntervalYearMonth),
     IntervalDaySecond(OracleIntervalDaySecond),
     Vector(OracleVectorValue),
+    Clob(String),
+    LobLocator {
+        column_type: OracleColumnType,
+        locator: Vec<u8>,
+    },
     Out {
         column_type: OracleColumnType,
         max_len: u32,
