@@ -3277,9 +3277,24 @@ impl SqlEditorWidget {
         prior_retained_state: RetainedSessionState,
         may_have_uncommitted_work: bool,
     ) -> RetainedSessionState {
+        // A SELECT (lazy fetch) never commits or rolls back, so it must not
+        // downgrade a prior dirty transaction to clean. Conservatively merge the
+        // probe result with the prior state: escalate to dirty when the probe
+        // detects uncommitted work, but never clear an existing MaybeDirty /
+        // decision-required state. This mirrors the non-lazy batch path
+        // (`conservative_merge`) and guards against `transaction_in_progress()`
+        // under-reporting on the thin driver, which would otherwise strand an
+        // earlier uncommitted UPDATE as a "clean" retained session that the
+        // Commit/Rollback buttons then refuse to resolve.
+        let merged_transaction_state = prior_retained_state
+            .transaction_state()
+            .conservative_merge(TransactionSessionState::from_flags(
+                may_have_uncommitted_work,
+                false,
+            ));
         OracleCleanupSessionDecisionApplier::retained_state_after_cleanup_update(
             prior_retained_state,
-            TransactionSessionState::from_flags(may_have_uncommitted_work, false),
+            merged_transaction_state,
             RetainedSessionState::default(),
             false,
         )
@@ -20996,6 +21011,39 @@ mod query_execution_cleanup_tests {
         );
         assert!(dirty_after_fetch.may_have_untracked_session_state());
         assert!(dirty_after_fetch.may_hold_named_lock());
+    }
+
+    #[test]
+    fn oracle_lazy_fetch_cleanup_preserves_prior_uncommitted_transaction() {
+        // A SELECT (lazy fetch) never commits or rolls back, and the thin
+        // driver's uncommitted-work probe can under-report (it currently always
+        // returns false). The cleanup must not downgrade a prior MaybeDirty
+        // transaction to Clean, or the Commit/Rollback buttons would refuse to
+        // resolve an UPDATE that is still uncommitted on the server.
+        for prior_state in [
+            TransactionSessionState::MaybeDirty,
+            TransactionSessionState::BlockedDirty,
+            TransactionSessionState::DecisionRequired,
+        ] {
+            let prior = RetainedSessionState::from_transaction_state(prior_state);
+            let after_select =
+                SqlEditorWidget::oracle_lazy_fetch_retained_state_after_cleanup(prior, false);
+            assert_eq!(
+                after_select.transaction_state(),
+                prior_state,
+                "a SELECT must not clear a prior {prior_state:?} transaction"
+            );
+        }
+
+        // The probe escalating to dirty is still honored.
+        let escalated = SqlEditorWidget::oracle_lazy_fetch_retained_state_after_cleanup(
+            RetainedSessionState::default(),
+            true,
+        );
+        assert_eq!(
+            escalated.transaction_state(),
+            TransactionSessionState::MaybeDirty
+        );
     }
 
     #[test]

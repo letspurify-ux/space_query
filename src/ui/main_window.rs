@@ -6675,7 +6675,13 @@ impl MainWindow {
                     }
                     let tab_count = s.result_tabs.tab_count();
                     let mut result_tabs = s.result_tabs.clone();
-                    let (tab_index, script_transcript, has_fetched_rows, context_was_canceling) = {
+                    let (
+                        tab_index,
+                        script_transcript,
+                        has_fetched_rows,
+                        context_was_canceling,
+                        grid_execution_target,
+                    ) = {
                         let Some(context) = s.progress_contexts.get_mut(&tab_id) else {
                             return;
                         };
@@ -6700,6 +6706,7 @@ impl MainWindow {
                             script_transcript_owns_success_message(Some(context)),
                             context.fetch_row_counts.get(&index).copied().unwrap_or(0) > 0,
                             context.state_label == ResultTabStatus::Canceling.label(),
+                            context.execution_target.filter(|idx| *idx < tab_count),
                         )
                     };
                     let result_status = statement_finished_status(&result, context_was_canceling);
@@ -6755,6 +6762,15 @@ impl MainWindow {
                         );
                         result_tabs.finish_streaming(tab_index);
                         result_tabs.display_result(tab_index, &result);
+                    } else if let Some(target) = grid_execution_target {
+                        // Result-grid edit saves execute only DML, so the
+                        // terminal result is non-select and would otherwise be
+                        // dropped here (no result-tab index is mapped for it).
+                        // Deliver it to the editable tab's table so its
+                        // pending-save matching can clear the save and keep the
+                        // staged rows; without this the save stays pending and
+                        // is later recovered as "Save was interrupted".
+                        result_tabs.deliver_result_grid_execution_result(target, &result);
                     } else if let Some(tab_index) = tab_index {
                         result_tabs.finish_result_status(tab_index, &result);
                     }

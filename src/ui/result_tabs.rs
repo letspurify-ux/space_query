@@ -1591,6 +1591,30 @@ impl ResultTabsWidget {
         self.fire_on_change_callback();
     }
 
+    /// Deliver a result-grid edit execution's terminal (DML) result to the
+    /// editable tab's table so its pending-save matching runs: clearing the
+    /// save on success while keeping the staged rows, or preserving staged
+    /// edits on failure. Unlike `display_result` this does not overwrite the
+    /// tab's status/row-count badge, because the editable grid keeps showing
+    /// the original result set rather than the DML's affected-row summary.
+    pub fn deliver_result_grid_execution_result(
+        &mut self,
+        index: usize,
+        result: &crate::db::QueryResult,
+    ) {
+        let table = {
+            let data = self
+                .data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            data.get(index).map(|tab| tab.table.clone())
+        };
+        if let Some(mut table) = table {
+            table.display_result(result);
+        }
+        self.fire_on_change_callback();
+    }
+
     pub fn set_execute_sql_callback(&mut self, callback: ResultGridSqlExecuteCallback) {
         *self
             .execute_sql_callback
