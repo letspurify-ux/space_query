@@ -50,6 +50,7 @@ pub enum BindInputValue {
     IntervalYearMonth(OracleIntervalYearMonth),
     IntervalDaySecond(OracleIntervalDaySecond),
     Vector(OracleVectorValue),
+    LobLocator(Vec<u8>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -68,7 +69,23 @@ pub enum BindValue {
     IntervalYearMonth(OracleIntervalYearMonth),
     IntervalDaySecond(OracleIntervalDaySecond),
     Vector(OracleVectorValue),
+    Json(String),
+    JsonBool(bool),
+    JsonNumber(String),
+    JsonString(String),
+    JsonRaw(Vec<u8>),
+    JsonDate(OracleDateTime),
+    JsonTimestamp(OracleDateTime),
+    JsonIntervalYearMonth(OracleIntervalYearMonth),
+    JsonIntervalDaySecond(OracleIntervalDaySecond),
+    JsonVector(OracleVectorValue),
+    Blob(Vec<u8>),
     Clob(String),
+    Nclob(String),
+    Bfile {
+        directory_alias: String,
+        file_name: String,
+    },
     LobLocator {
         column_type: OracleColumnType,
         locator: Vec<u8>,

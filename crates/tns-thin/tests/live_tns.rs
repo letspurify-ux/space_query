@@ -600,6 +600,687 @@ fn fetch_json_column_decodes_oson_payload_as_json_text() {
 
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn dml_returning_json_out_bind_decodes_oson_payload_like_python_oracledb() {
+    let config = live_config();
+    let table = unique_table_name("JSON_RET");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+
+    match conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, doc JSON) TABLESPACE USERS"
+    )) {
+        Ok(()) => {}
+        Err(err)
+            if err.to_string().contains("ORA-00902")
+                || err.to_string().contains("ORA-00959")
+                || err.to_string().contains("ORA-03001")
+                || err.to_string().contains("ORA-43853") =>
+        {
+            eprintln!("skipping JSON DML RETURNING test: database does not support native JSON");
+            return;
+        }
+        Err(err) => panic!("create JSON DML RETURNING test table: {err}"),
+    }
+
+    let mut request = StatementRequest::statement(format!(
+        "INSERT INTO {table} (id, doc) \
+         VALUES (:1, JSON_OBJECT(\
+             KEY 'id' VALUE :2, \
+             KEY 'label' VALUE 'single', \
+             KEY 'flag' VALUE 'true' FORMAT JSON \
+             RETURNING JSON\
+         )) \
+         RETURNING doc INTO :3"
+    ));
+    request.binds.push(BindValue::Number("1".to_string()));
+    request.binds.push(BindValue::Number("1".to_string()));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Json,
+        max_len: 1024,
+    });
+
+    let values = match conn.execute_out_binds(&request, &[]) {
+        Ok(values) => values,
+        Err(err)
+            if err.to_string().contains("ORA-00902")
+                || err.to_string().contains("ORA-00932")
+                || err.to_string().contains("ORA-03001")
+                || err.to_string().contains("ORA-06550")
+                || err.to_string().contains("ORA-43853") =>
+        {
+            eprintln!(
+                "skipping JSON DML RETURNING test: database does not support native JSON bind"
+            );
+            return;
+        }
+        Err(err) => panic!("DML RETURNING JSON OUT bind: {err}"),
+    };
+
+    assert_eq!(
+        rows_to_strings(&[values]),
+        vec![vec![r#"{"id":1,"label":"single","flag":true}"#.to_string()]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn dml_returning_json_input_bind_round_trips_like_python_oracledb() {
+    let config = live_config();
+    let table = unique_table_name("JSON_BIND_RET");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+
+    match conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, doc JSON) TABLESPACE USERS"
+    )) {
+        Ok(()) => {}
+        Err(err)
+            if err.to_string().contains("ORA-00902")
+                || err.to_string().contains("ORA-00959")
+                || err.to_string().contains("ORA-03001")
+                || err.to_string().contains("ORA-43853") =>
+        {
+            eprintln!(
+                "skipping JSON input DML RETURNING test: database does not support native JSON"
+            );
+            return;
+        }
+        Err(err) => panic!("create JSON input DML RETURNING test table: {err}"),
+    }
+
+    let json_value = r#"{"employee":{"name":"John","city":"Sydney"},"tags":[1,true,null]}"#;
+    let mut request = StatementRequest::statement(format!(
+        "INSERT INTO {table} (id, doc) VALUES (:1, :2) RETURNING doc INTO :3"
+    ));
+    request.binds.push(BindValue::Number("1".to_string()));
+    request.binds.push(BindValue::Json(json_value.to_string()));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Json,
+        max_len: 1024,
+    });
+
+    let values = match conn.execute_out_binds(&request, &[]) {
+        Ok(values) => values,
+        Err(err)
+            if err.to_string().contains("ORA-00902")
+                || err.to_string().contains("ORA-00932")
+                || err.to_string().contains("ORA-03001")
+                || err.to_string().contains("ORA-06550")
+                || err.to_string().contains("ORA-43853") =>
+        {
+            eprintln!(
+                "skipping JSON input DML RETURNING test: database does not support native JSON bind"
+            );
+            return;
+        }
+        Err(err) => panic!("DML RETURNING JSON input bind: {err}"),
+    };
+
+    let rows = rows_to_strings(&[values]);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].len(), 1);
+    let returned: serde_json::Value =
+        serde_json::from_str(&rows[0][0]).expect("JSON input DML RETURNING output");
+    let expected: serde_json::Value =
+        serde_json::from_str(json_value).expect("JSON input DML RETURNING expected");
+    assert_eq!(returned, expected);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn update_json_input_binds_round_trip_like_python_oracledb() {
+    let config = live_config();
+    let table = unique_table_name("JSON_UPDATE");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+
+    match conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, doc JSON) TABLESPACE USERS"
+    )) {
+        Ok(()) => {}
+        Err(err)
+            if err.to_string().contains("ORA-00902")
+                || err.to_string().contains("ORA-00959")
+                || err.to_string().contains("ORA-03001")
+                || err.to_string().contains("ORA-43853") =>
+        {
+            eprintln!("skipping JSON update bind test: database does not support native JSON");
+            return;
+        }
+        Err(err) => panic!("create JSON update bind test table: {err}"),
+    }
+
+    for id in 0..3 {
+        conn.query_drop(&format!(
+            "INSERT INTO {table} (id, doc) VALUES ({id}, JSON_OBJECT(KEY 'seed' VALUE {id} RETURNING JSON))"
+        ))
+        .expect("insert JSON update source row");
+    }
+
+    let cases = [
+        (0, r#"{"a":0,"items":[true,null,"x"]}"#),
+        (1, r#"{"a":1,"nested":{"name":"John","age":30}}"#),
+        (2, r#"{"a":2,"bytes":{"$rawhex":"73686f7274"}}"#),
+    ];
+    for (id, json_value) in cases {
+        let mut request =
+            StatementRequest::statement(format!("UPDATE {table} SET doc = :1 WHERE id = :2"));
+        request.binds.push(BindValue::Json(json_value.to_string()));
+        request.binds.push(BindValue::Number(id.to_string()));
+        if let Err(err) = conn.execute(&request, 0) {
+            if err.to_string().contains("ORA-00902")
+                || err.to_string().contains("ORA-00932")
+                || err.to_string().contains("ORA-03001")
+                || err.to_string().contains("ORA-06550")
+                || err.to_string().contains("ORA-43853")
+            {
+                eprintln!(
+                    "skipping JSON update bind test: database does not support native JSON bind"
+                );
+                return;
+            }
+            panic!("JSON update bind for row {id}: {err}");
+        }
+    }
+
+    let rows = conn
+        .query_described_fetch_all(format!("SELECT doc FROM {table} ORDER BY id"), 1)
+        .expect("fetch JSON update rows");
+    let returned = rows_to_strings(&rows.result.rows);
+    assert_eq!(returned.len(), cases.len());
+    for ((_, expected), row) in cases.iter().zip(returned.iter()) {
+        let returned_json: serde_json::Value =
+            serde_json::from_str(&row[0]).expect("JSON update bind output");
+        let expected_json: serde_json::Value =
+            serde_json::from_str(expected).expect("JSON update bind expected");
+        assert_eq!(returned_json, expected_json);
+    }
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn dml_returning_scalar_json_input_binds_round_trip_like_python_oracledb() {
+    let config = live_config();
+    let table = unique_table_name("JSON_SCALAR_RET");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+
+    match conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, doc JSON) TABLESPACE USERS"
+    )) {
+        Ok(()) => {}
+        Err(err)
+            if err.to_string().contains("ORA-00902")
+                || err.to_string().contains("ORA-00959")
+                || err.to_string().contains("ORA-03001")
+                || err.to_string().contains("ORA-43853") =>
+        {
+            eprintln!(
+                "skipping scalar JSON input DML RETURNING test: database does not support native JSON"
+            );
+            return;
+        }
+        Err(err) => panic!("create scalar JSON input DML RETURNING test table: {err}"),
+    }
+
+    let cases = [
+        ("1", "true"),
+        ("2", "false"),
+        ("3", r#""String 1""#),
+        ("4", "25.25"),
+        ("5", "null"),
+    ];
+
+    for (id, json_value) in cases {
+        let mut request = StatementRequest::statement(format!(
+            "INSERT INTO {table} (id, doc) VALUES (:1, :2) RETURNING doc INTO :3"
+        ));
+        request.binds.push(BindValue::Number(id.to_string()));
+        request.binds.push(BindValue::Json(json_value.to_string()));
+        request.binds.push(BindValue::Out {
+            column_type: OracleColumnType::Json,
+            max_len: 1024,
+        });
+
+        let values = match conn.execute_out_binds(&request, &[]) {
+            Ok(values) => values,
+            Err(err)
+                if err.to_string().contains("ORA-00902")
+                    || err.to_string().contains("ORA-00932")
+                    || err.to_string().contains("ORA-03001")
+                    || err.to_string().contains("ORA-06550")
+                    || err.to_string().contains("ORA-43853") =>
+            {
+                eprintln!(
+                    "skipping scalar JSON input DML RETURNING test: database does not support native JSON bind"
+                );
+                return;
+            }
+            Err(err) => panic!("scalar JSON input bind for row {id}: {err}"),
+        };
+
+        let rows = rows_to_strings(&[values]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].len(), 1);
+        let returned: serde_json::Value =
+            serde_json::from_str(&rows[0][0]).expect("scalar JSON input DML RETURNING output");
+        let expected: serde_json::Value =
+            serde_json::from_str(json_value).expect("scalar JSON input DML RETURNING expected");
+        assert_eq!(returned, expected);
+    }
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn dml_returning_typed_scalar_json_input_binds_round_trip_like_python_oracledb() {
+    let config = live_config();
+    let table = unique_table_name("JSON_TYPED_RET");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+
+    match conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, doc JSON) TABLESPACE USERS"
+    )) {
+        Ok(()) => {}
+        Err(err)
+            if err.to_string().contains("ORA-00902")
+                || err.to_string().contains("ORA-00959")
+                || err.to_string().contains("ORA-03001")
+                || err.to_string().contains("ORA-43853") =>
+        {
+            eprintln!(
+                "skipping typed scalar JSON input DML RETURNING test: database does not support native JSON"
+            );
+            return;
+        }
+        Err(err) => panic!("create typed scalar JSON input DML RETURNING test table: {err}"),
+    }
+
+    let cases = vec![
+        ("1", BindValue::JsonBool(true), "true"),
+        ("2", BindValue::JsonBool(false), "false"),
+        (
+            "3",
+            BindValue::JsonString("String 1".to_string()),
+            r#""String 1""#,
+        ),
+        (
+            "4",
+            BindValue::JsonString("A much longer string".to_string()),
+            r#""A much longer string""#,
+        ),
+        ("5", BindValue::JsonNumber("0".to_string()), "0"),
+        ("6", BindValue::JsonNumber("25.25".to_string()), "25.25"),
+        (
+            "7",
+            BindValue::JsonNumber("6088343244".to_string()),
+            "6088343244",
+        ),
+    ];
+
+    for (id, bind, expected) in cases {
+        let mut request = StatementRequest::statement(format!(
+            "INSERT INTO {table} (id, doc) VALUES (:1, :2) RETURNING doc INTO :3"
+        ));
+        request.binds.push(BindValue::Number(id.to_string()));
+        request.binds.push(bind);
+        request.binds.push(BindValue::Out {
+            column_type: OracleColumnType::Json,
+            max_len: 1024,
+        });
+
+        let values = match conn.execute_out_binds(&request, &[]) {
+            Ok(values) => values,
+            Err(err)
+                if err.to_string().contains("ORA-00902")
+                    || err.to_string().contains("ORA-00932")
+                    || err.to_string().contains("ORA-03001")
+                    || err.to_string().contains("ORA-06550")
+                    || err.to_string().contains("ORA-43853") =>
+            {
+                eprintln!(
+                    "skipping typed scalar JSON input DML RETURNING test: database does not support native JSON bind"
+                );
+                return;
+            }
+            Err(err) => panic!("DML RETURNING typed scalar JSON input bind for row {id}: {err}"),
+        };
+
+        assert_eq!(rows_to_strings(&[values]), vec![vec![expected.to_string()]]);
+    }
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn dml_returning_raw_json_input_bind_round_trips_like_python_oracledb() {
+    let config = live_config();
+    let table = unique_table_name("JSON_RAW_RET");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+
+    match conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, doc JSON) TABLESPACE USERS"
+    )) {
+        Ok(()) => {}
+        Err(err)
+            if err.to_string().contains("ORA-00902")
+                || err.to_string().contains("ORA-00959")
+                || err.to_string().contains("ORA-03001")
+                || err.to_string().contains("ORA-43853") =>
+        {
+            eprintln!(
+                "skipping raw JSON input DML RETURNING test: database does not support native JSON"
+            );
+            return;
+        }
+        Err(err) => panic!("create raw JSON input DML RETURNING test table: {err}"),
+    }
+
+    let mut request = StatementRequest::statement(format!(
+        "INSERT INTO {table} (id, doc) VALUES (:1, :2) RETURNING doc INTO :3"
+    ));
+    request.binds.push(BindValue::Number("1".to_string()));
+    request
+        .binds
+        .push(BindValue::JsonRaw(b"A raw value".to_vec()));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Json,
+        max_len: 1024,
+    });
+
+    let values = match conn.execute_out_binds(&request, &[]) {
+        Ok(values) => values,
+        Err(err)
+            if err.to_string().contains("ORA-00902")
+                || err.to_string().contains("ORA-00932")
+                || err.to_string().contains("ORA-03001")
+                || err.to_string().contains("ORA-06550")
+                || err.to_string().contains("ORA-43853") =>
+        {
+            eprintln!(
+                "skipping raw JSON input DML RETURNING test: database does not support native JSON bind"
+            );
+            return;
+        }
+        Err(err) => panic!("DML RETURNING raw JSON input bind: {err}"),
+    };
+
+    let expected = r#"{"$rawhex":"41207261772076616c7565"}"#;
+    assert_eq!(rows_to_strings(&[values]), vec![vec![expected.to_string()]]);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn dml_returning_datetime_json_input_binds_round_trip_like_python_oracledb() {
+    let config = live_config();
+    let table = unique_table_name("JSON_TIME_RET");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+
+    match conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, doc JSON) TABLESPACE USERS"
+    )) {
+        Ok(()) => {}
+        Err(err)
+            if err.to_string().contains("ORA-00902")
+                || err.to_string().contains("ORA-00959")
+                || err.to_string().contains("ORA-03001")
+                || err.to_string().contains("ORA-43853") =>
+        {
+            eprintln!(
+                "skipping datetime JSON input DML RETURNING test: database does not support native JSON"
+            );
+            return;
+        }
+        Err(err) => panic!("create datetime JSON input DML RETURNING test table: {err}"),
+    }
+
+    let cases = vec![
+        (
+            "1",
+            BindValue::JsonTimestamp(OracleDateTime {
+                year: 2004,
+                month: 2,
+                day: 1,
+                hour: 3,
+                minute: 4,
+                second: 5,
+                nanosecond: 0,
+                timezone_offset_minutes: None,
+                timezone_region_id: None,
+            }),
+            r#""2004-02-01T03:04:05""#,
+        ),
+        (
+            "2",
+            BindValue::JsonTimestamp(OracleDateTime {
+                year: 2020,
+                month: 12,
+                day: 2,
+                hour: 13,
+                minute: 29,
+                second: 14,
+                nanosecond: 123_456_000,
+                timezone_offset_minutes: None,
+                timezone_region_id: None,
+            }),
+            r#""2020-12-02T13:29:14.123456""#,
+        ),
+        (
+            "3",
+            BindValue::JsonDate(OracleDateTime {
+                year: 2002,
+                month: 12,
+                day: 13,
+                hour: 0,
+                minute: 0,
+                second: 0,
+                nanosecond: 0,
+                timezone_offset_minutes: None,
+                timezone_region_id: None,
+            }),
+            r#""2002-12-13T00:00:00""#,
+        ),
+        (
+            "4",
+            BindValue::JsonIntervalDaySecond(OracleIntervalDaySecond {
+                days: 8,
+                hours: 12,
+                minutes: 0,
+                seconds: 0,
+                nanoseconds: 0,
+            }),
+            r#""+08 12:00:00.000000""#,
+        ),
+        (
+            "5",
+            BindValue::JsonIntervalYearMonth(OracleIntervalYearMonth {
+                years: 2,
+                months: 3,
+            }),
+            r#""+02-03""#,
+        ),
+    ];
+
+    for (id, bind, expected) in cases {
+        let mut request = StatementRequest::statement(format!(
+            "INSERT INTO {table} (id, doc) VALUES (:1, :2) RETURNING doc INTO :3"
+        ));
+        request.binds.push(BindValue::Number(id.to_string()));
+        request.binds.push(bind);
+        request.binds.push(BindValue::Out {
+            column_type: OracleColumnType::Json,
+            max_len: 1024,
+        });
+
+        let values = match conn.execute_out_binds(&request, &[]) {
+            Ok(values) => values,
+            Err(err)
+                if err.to_string().contains("ORA-00902")
+                    || err.to_string().contains("ORA-00932")
+                    || err.to_string().contains("ORA-03001")
+                    || err.to_string().contains("ORA-06550")
+                    || err.to_string().contains("ORA-43853") =>
+            {
+                eprintln!(
+                    "skipping datetime JSON input DML RETURNING test: database does not support native JSON bind"
+                );
+                return;
+            }
+            Err(err) => panic!("DML RETURNING datetime JSON input bind for row {id}: {err}"),
+        };
+
+        assert_eq!(rows_to_strings(&[values]), vec![vec![expected.to_string()]]);
+    }
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn dml_returning_vector_json_input_bind_round_trips_like_python_oracledb() {
+    let config = live_config();
+    let table = unique_table_name("JSON_VECTOR_RET");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+
+    match conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, doc JSON) TABLESPACE USERS"
+    )) {
+        Ok(()) => {}
+        Err(err)
+            if err.to_string().contains("ORA-00902")
+                || err.to_string().contains("ORA-00959")
+                || err.to_string().contains("ORA-03001")
+                || err.to_string().contains("ORA-43853") =>
+        {
+            eprintln!(
+                "skipping vector JSON input DML RETURNING test: database does not support native JSON"
+            );
+            return;
+        }
+        Err(err) => panic!("create vector JSON input DML RETURNING test table: {err}"),
+    }
+
+    let mut request = StatementRequest::statement(format!(
+        "INSERT INTO {table} (id, doc) VALUES (:1, :2) RETURNING doc INTO :3"
+    ));
+    request.binds.push(BindValue::Number("1".to_string()));
+    request
+        .binds
+        .push(BindValue::JsonVector(OracleVectorValue::Float32(vec![
+            34.6, 77.8,
+        ])));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Json,
+        max_len: 1024,
+    });
+
+    let values = match conn.execute_out_binds(&request, &[]) {
+        Ok(values) => values,
+        Err(err)
+            if err.to_string().contains("ORA-00902")
+                || err.to_string().contains("ORA-00932")
+                || err.to_string().contains("ORA-03001")
+                || err.to_string().contains("ORA-06550")
+                || err.to_string().contains("ORA-43853")
+                || err.to_string().contains("ORA-51803") =>
+        {
+            eprintln!(
+                "skipping vector JSON input DML RETURNING test: database does not support native JSON vector bind"
+            );
+            return;
+        }
+        Err(err) => panic!("DML RETURNING vector JSON input bind: {err}"),
+    };
+
+    assert_eq!(
+        rows_to_strings(&[values]),
+        vec![vec!["[34.6, 77.8]".to_string()]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn dml_returning_multiple_json_rows_preserves_all_rows() {
+    let config = live_config();
+    let table = unique_table_name("JSON_RET_MULTI");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+
+    match conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, doc JSON) TABLESPACE USERS"
+    )) {
+        Ok(()) => {}
+        Err(err)
+            if err.to_string().contains("ORA-00902")
+                || err.to_string().contains("ORA-00959")
+                || err.to_string().contains("ORA-03001")
+                || err.to_string().contains("ORA-43853") =>
+        {
+            eprintln!(
+                "skipping multi-row JSON DML RETURNING test: database does not support native JSON"
+            );
+            return;
+        }
+        Err(err) => panic!("create multi-row JSON DML RETURNING test table: {err}"),
+    }
+    for id in 1..=3 {
+        conn.query_drop(&format!(
+            "INSERT INTO {table} (id, doc) \
+             SELECT {id}, JSON_OBJECT(KEY 'id' VALUE {id} RETURNING JSON) FROM dual"
+        ))
+        .expect("insert JSON DML RETURNING source row");
+    }
+
+    let mut request = StatementRequest::statement(format!(
+        "UPDATE {table} \
+         SET doc = JSON_OBJECT(\
+             KEY 'id' VALUE id, \
+             KEY 'updated' VALUE 'true' FORMAT JSON \
+             RETURNING JSON\
+         ) \
+         WHERE id <= 3 \
+         RETURNING id, doc INTO :1, :2"
+    ));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Number,
+        max_len: 22,
+    });
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Json,
+        max_len: 1024,
+    });
+
+    let result = match conn.execute_out_binds_with_implicit(&request, &[]) {
+        Ok(result) => result,
+        Err(err)
+            if err.to_string().contains("ORA-00902")
+                || err.to_string().contains("ORA-00932")
+                || err.to_string().contains("ORA-03001")
+                || err.to_string().contains("ORA-06550")
+                || err.to_string().contains("ORA-43853") =>
+        {
+            eprintln!(
+                "skipping multi-row JSON DML RETURNING test: database does not support native JSON bind"
+            );
+            return;
+        }
+        Err(err) => panic!("multi-row DML RETURNING JSON OUT bind: {err}"),
+    };
+    let mut rows = rows_to_strings(&result.rows);
+    rows.sort();
+
+    assert_eq!(
+        rows,
+        vec![
+            vec!["1".to_string(), r#"{"id":1,"updated":true}"#.to_string()],
+            vec!["2".to_string(), r#"{"id":2,"updated":true}"#.to_string()],
+            vec!["3".to_string(), r#"{"id":3,"updated":true}"#.to_string()],
+        ]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn fetch_json_extended_scalars_decode_oson_payload_as_json_text() {
     let mut conn = connect();
     let result = match conn.query_described_fetch_all(
@@ -762,6 +1443,31 @@ fn fetch_xmltype_column_decodes_text_across_batches() {
 
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn fetch_xmltype_column_decodes_xmlelement_like_python_oracledb() {
+    let mut conn = connect();
+    let result = conn
+        .query_described_fetch_all(
+            "SELECT XMLElement(\"string\", 'String 1') AS xml FROM dual",
+            1,
+        )
+        .expect("fetch XMLElement XMLTYPE column");
+
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Xml]
+    );
+    assert_eq!(
+        rows_to_strings(&result.result.rows),
+        vec![vec!["<string>String 1</string>".to_string()]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn fetch_xmltype_column_decodes_large_clob_input() {
     let mut conn = connect();
     let result = conn
@@ -885,6 +1591,132 @@ fn bind_clob_column_round_trips_large_text() {
 
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn bind_blob_column_round_trips_large_bytes() {
+    let config = live_config();
+    let table = unique_table_name("BLOB_BIND");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, doc BLOB)"
+    ))
+    .expect("create BLOB bind test table");
+
+    let payload = (0..=255).cycle().take(32768).collect::<Vec<_>>();
+    let mut insert =
+        StatementRequest::statement(format!("INSERT INTO {table} (id, doc) VALUES (:1, :2)"));
+    insert.binds.push(BindValue::Number("1".to_string()));
+    insert.binds.push(BindValue::Blob(payload.clone()));
+    conn.execute(&insert, 0)
+        .expect("insert BLOB from large BLOB bind");
+
+    let result = conn
+        .query_described_fetch_all(format!("SELECT doc FROM {table} WHERE id = 1"), 1)
+        .expect("fetch BLOB inserted from large BLOB bind");
+    match result.result.rows.first().and_then(|row| row.first()) {
+        Some(OracleValue::Bytes(bytes)) => assert_eq!(bytes, &payload),
+        other => panic!("expected BLOB bytes, got {other:?}"),
+    }
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn bind_nclob_column_round_trips_large_text() {
+    let config = live_config();
+    let table = unique_table_name("NCLOB_BIND");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, doc NCLOB)"
+    ))
+    .expect("create NCLOB bind test table");
+
+    let payload = "\u{D55C}\u{AE00}AbCd".repeat(2048);
+    let mut insert =
+        StatementRequest::statement(format!("INSERT INTO {table} (id, doc) VALUES (:1, :2)"));
+    insert.binds.push(BindValue::Number("1".to_string()));
+    insert.binds.push(BindValue::Nclob(payload.clone()));
+    conn.execute(&insert, 0)
+        .expect("insert NCLOB from large NCLOB bind");
+
+    let result = conn
+        .query_described_fetch_all(format!("SELECT doc FROM {table} WHERE id = 1"), 1)
+        .expect("fetch NCLOB inserted from large NCLOB bind");
+    assert_eq!(rows_to_strings(&result.result.rows), vec![vec![payload]]);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn bind_empty_lob_columns_store_zero_length_values() {
+    let config = live_config();
+    let table = unique_table_name("EMPTY_LOB_BIND");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, blob_doc BLOB, clob_doc CLOB, nclob_doc NCLOB)"
+    ))
+    .expect("create empty LOB bind test table");
+
+    let mut insert = StatementRequest::statement(format!(
+        "INSERT INTO {table} (id, blob_doc, clob_doc, nclob_doc) VALUES (:1, :2, :3, :4)"
+    ));
+    insert.binds.push(BindValue::Number("1".to_string()));
+    insert.binds.push(BindValue::Blob(Vec::new()));
+    insert.binds.push(BindValue::Clob(String::new()));
+    insert.binds.push(BindValue::Nclob(String::new()));
+    conn.execute(&insert, 0)
+        .expect("insert empty BLOB/CLOB/NCLOB binds");
+
+    let result = conn
+        .query_described_fetch_all(
+            format!(
+                "SELECT \
+                   NVL(DBMS_LOB.GETLENGTH(blob_doc), -1), \
+                   NVL(DBMS_LOB.GETLENGTH(clob_doc), -1), \
+                   NVL(DBMS_LOB.GETLENGTH(nclob_doc), -1) \
+                 FROM {table} \
+                 WHERE id = 1"
+            ),
+            1,
+        )
+        .expect("fetch empty LOB lengths");
+    assert_eq!(
+        rows_to_strings(&result.result.rows),
+        vec![vec!["0".to_string(), "0".to_string(), "0".to_string()]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn large_lob_binds_release_temporary_lobs() {
+    let config = live_config();
+    let table = unique_table_name("TEMP_LOB_FREE");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, blob_doc BLOB, clob_doc CLOB, nclob_doc NCLOB)"
+    ))
+    .expect("create temporary LOB free test table");
+
+    let before = current_temp_lob_count(&mut conn);
+    let blob_payload = (0..=255).cycle().take(32768).collect::<Vec<_>>();
+    let clob_payload = "AbCdEfGhIjKlMnOp".repeat(2048);
+    let nclob_payload = "\u{D55C}\u{AE00}AbCd".repeat(2048);
+    for id in 1..=3 {
+        let mut insert = StatementRequest::statement(format!(
+            "INSERT INTO {table} (id, blob_doc, clob_doc, nclob_doc) VALUES (:1, :2, :3, :4)"
+        ));
+        insert.binds.push(BindValue::Number(id.to_string()));
+        insert.binds.push(BindValue::Blob(blob_payload.clone()));
+        insert.binds.push(BindValue::Clob(clob_payload.clone()));
+        insert.binds.push(BindValue::Nclob(nclob_payload.clone()));
+        conn.execute(&insert, 0)
+            .expect("insert row with large temporary LOB binds");
+        assert_eq!(current_temp_lob_count(&mut conn), before);
+    }
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn plsql_json_out_bind_decodes_oson_payload_as_json_text() {
     let mut conn = connect();
     let mut request = StatementRequest::statement(
@@ -961,6 +1793,51 @@ fn plsql_json_inout_bind_round_trips_native_json() {
         rows_to_strings(&[values]),
         vec![vec![r#"{"input":"ok","added":2}"#.to_string()]]
     );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn plsql_json_inout_scalar_number_and_bool_round_trip_like_python_oracledb() {
+    let mut conn = connect();
+    let cases = [
+        (
+            BindInputValue::Number("25.25".to_string()),
+            "25.25".to_string(),
+        ),
+        (BindInputValue::Boolean(true), "true".to_string()),
+    ];
+
+    for (input, expected) in cases {
+        let mut request = StatementRequest::statement(
+            "BEGIN \
+             SELECT :1 INTO :1 FROM dual; \
+             END;",
+        );
+        request.binds.push(BindValue::InOut {
+            column_type: OracleColumnType::Json,
+            max_len: 1024,
+            value: Some(input),
+        });
+
+        let values = match conn.execute_out_binds(&request, &[]) {
+            Ok(values) => values,
+            Err(err)
+                if err.to_string().contains("ORA-00902")
+                    || err.to_string().contains("ORA-00932")
+                    || err.to_string().contains("ORA-03001")
+                    || err.to_string().contains("ORA-06550")
+                    || err.to_string().contains("ORA-43853") =>
+            {
+                eprintln!(
+                    "skipping scalar JSON IN OUT bind test: database does not support native JSON bind"
+                );
+                return;
+            }
+            Err(err) => panic!("PL/SQL scalar JSON IN OUT bind: {err}"),
+        };
+
+        assert_eq!(rows_to_strings(&[values]), vec![vec![expected]]);
+    }
 }
 
 #[test]
@@ -1200,6 +2077,88 @@ fn plsql_bfile_out_bind_returns_locator() {
 
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn bind_bfile_value_and_locator_round_trip_file_name() {
+    let config = live_config();
+    let table = unique_table_name("BFILE_BIND");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    let directory_alias = "DATA_PUMP_DIR".to_string();
+    let file_name = "space_query_bfile_probe.bin".to_string();
+
+    let mut direct = StatementRequest::statement(
+        "BEGIN \
+         DBMS_LOB.FILEGETNAME(:1, :2, :3); \
+         END;",
+    );
+    direct.binds.push(BindValue::Bfile {
+        directory_alias: directory_alias.clone(),
+        file_name: file_name.clone(),
+    });
+    direct.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Varchar,
+        max_len: 128,
+    });
+    direct.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Varchar,
+        max_len: 256,
+    });
+    let values = conn
+        .execute_out_binds(&direct, &[])
+        .expect("BFILE direct bind FILEGETNAME");
+    assert_eq!(value_to_string(&values[0]), directory_alias);
+    assert_eq!(value_to_string(&values[1]), file_name);
+
+    let fetched = conn
+        .query_described_fetch_all(
+            "SELECT BFILENAME('DATA_PUMP_DIR', 'space_query_bfile_probe.bin') FROM dual",
+            1,
+        )
+        .expect("fetch BFILE locator for rebind");
+    let locator = match fetched.result.rows.first().and_then(|row| row.first()) {
+        Some(OracleValue::Lob(locator)) => locator.clone(),
+        other => panic!("expected fetched BFILE locator, got {other:?}"),
+    };
+
+    conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, file_data BFILE)"
+    ))
+    .expect("create BFILE bind table");
+    let mut insert = StatementRequest::statement(format!(
+        "INSERT INTO {table} (id, file_data) VALUES (:1, :2)"
+    ));
+    insert.binds.push(BindValue::Number("1".to_string()));
+    insert.binds.push(BindValue::LobLocator {
+        column_type: OracleColumnType::Bfile,
+        locator,
+    });
+    conn.execute(&insert, 0)
+        .expect("insert fetched BFILE locator bind");
+
+    let mut get_name = StatementRequest::statement(format!(
+        "DECLARE \
+         l_file BFILE; \
+         BEGIN \
+         SELECT file_data INTO l_file FROM {table} WHERE id = 1; \
+         DBMS_LOB.FILEGETNAME(l_file, :1, :2); \
+         END;"
+    ));
+    get_name.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Varchar,
+        max_len: 128,
+    });
+    get_name.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Varchar,
+        max_len: 256,
+    });
+    let values = conn
+        .execute_out_binds(&get_name, &[])
+        .expect("BFILE locator bind FILEGETNAME");
+    assert_eq!(value_to_string(&values[0]), directory_alias);
+    assert_eq!(value_to_string(&values[1]), file_name);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn fetch_lob_columns_define_as_full_values() {
     let mut conn = connect();
     let result = conn
@@ -1239,6 +2198,121 @@ fn fetch_lob_columns_define_as_full_values() {
         }
         other => panic!("expected BLOB bytes, got {other:?}"),
     }
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn redefined_view_type_changes_from_scalar_to_lob_like_python_oracledb() {
+    let view_name = unique_object_name("TYPE_CHANGE");
+    let mut conn = connect();
+    drop_view_ignore(&mut conn, &view_name);
+
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE VIEW {view_name} AS \
+         SELECT CAST('string_4600' AS VARCHAR2(15)) AS value FROM dual"
+    ))
+    .expect("create VARCHAR type-change view");
+    let result = conn
+        .query_described_fetch_all(format!("SELECT * FROM {view_name}"), 1)
+        .expect("fetch VARCHAR type-change view");
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Varchar]
+    );
+    assert_eq!(
+        rows_to_strings(&result.result.rows),
+        vec![vec!["string_4600".to_string()]]
+    );
+
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE VIEW {view_name} AS \
+         SELECT TO_CLOB('clob_4600') AS value FROM dual"
+    ))
+    .expect("replace type-change view with CLOB");
+    let result = conn
+        .query_described_fetch_all(format!("SELECT * FROM {view_name}"), 1)
+        .expect("fetch CLOB type-change view");
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Clob]
+    );
+    assert_eq!(
+        rows_to_strings(&result.result.rows),
+        vec![vec!["clob_4600".to_string()]]
+    );
+
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE VIEW {view_name} AS \
+         SELECT UTL_RAW.CAST_TO_RAW('raw_4605') AS value FROM dual"
+    ))
+    .expect("replace type-change view with RAW");
+    let result = conn
+        .query_described_fetch_all(format!("SELECT * FROM {view_name}"), 1)
+        .expect("fetch RAW type-change view");
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Raw]
+    );
+    assert_eq!(
+        result.result.rows,
+        vec![vec![OracleValue::Bytes(b"raw_4605".to_vec())]]
+    );
+
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE VIEW {view_name} AS \
+         SELECT TO_BLOB(UTL_RAW.CAST_TO_RAW('blob_4605')) AS value FROM dual"
+    ))
+    .expect("replace type-change view with BLOB");
+    let result = conn
+        .query_described_fetch_all(format!("SELECT * FROM {view_name}"), 1)
+        .expect("fetch BLOB type-change view");
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Blob]
+    );
+    assert_eq!(
+        result.result.rows,
+        vec![vec![OracleValue::Bytes(b"blob_4605".to_vec())]]
+    );
+
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE VIEW {view_name} AS \
+         SELECT TO_NCLOB(UNISTR('\\D55C\\AE00')) AS value FROM dual"
+    ))
+    .expect("replace type-change view with NCLOB");
+    let result = conn
+        .query_described_fetch_all(format!("SELECT * FROM {view_name}"), 1)
+        .expect("fetch NCLOB type-change view");
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Clob]
+    );
+    assert_eq!(
+        rows_to_strings(&result.result.rows),
+        vec![vec!["\u{D55C}\u{AE00}".to_string()]]
+    );
+
+    drop_view_ignore(&mut conn, &view_name);
 }
 
 #[test]
@@ -1524,6 +2598,61 @@ fn bind_raw_bytes_round_trips_as_raw() {
         rows_to_strings(&result.result.rows),
         vec![vec!["CAFEBABE".to_string()]]
     );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn bind_long_column_round_trips_large_text() {
+    let config = live_config();
+    let table = unique_table_name("LONG_BIND");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, payload LONG)"
+    ))
+    .expect("create LONG bind test table");
+
+    let payload = "LongPayload".repeat(5000);
+    let mut insert =
+        StatementRequest::statement(format!("INSERT INTO {table} (id, payload) VALUES (:1, :2)"));
+    insert.binds.push(BindValue::Number("1".to_string()));
+    insert.binds.push(BindValue::Text(payload.clone()));
+    conn.execute(&insert, 0)
+        .expect("insert LONG from large text bind");
+
+    let result = conn
+        .query_described_fetch_all(format!("SELECT payload FROM {table} WHERE id = 1"), 1)
+        .expect("fetch LONG inserted from large text bind");
+    assert_eq!(rows_to_strings(&result.result.rows), vec![vec![payload]]);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn bind_long_raw_column_round_trips_large_bytes() {
+    let config = live_config();
+    let table = unique_table_name("LONG_RAW_BIND");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, payload LONG RAW)"
+    ))
+    .expect("create LONG RAW bind test table");
+
+    let payload = (0..=255).cycle().take(50000).collect::<Vec<_>>();
+    let mut insert =
+        StatementRequest::statement(format!("INSERT INTO {table} (id, payload) VALUES (:1, :2)"));
+    insert.binds.push(BindValue::Number("1".to_string()));
+    insert.binds.push(BindValue::Bytes(payload.clone()));
+    conn.execute(&insert, 0)
+        .expect("insert LONG RAW from large bytes bind");
+
+    let result = conn
+        .query_described_fetch_all(format!("SELECT payload FROM {table} WHERE id = 1"), 1)
+        .expect("fetch LONG RAW inserted from large bytes bind");
+    match result.result.rows.first().and_then(|row| row.first()) {
+        Some(OracleValue::Bytes(bytes)) => assert_eq!(bytes, &payload),
+        other => panic!("expected LONG RAW bytes, got {other:?}"),
+    }
 }
 
 #[test]
@@ -2050,6 +3179,30 @@ fn plsql_clob_inout_bind_keeps_large_text() {
 
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn plsql_clob_inout_bind_keeps_very_large_text() {
+    let mut conn = connect();
+    let payload = "xYz!".repeat(10_000);
+    let mut request = StatementRequest::statement(
+        "BEGIN \
+         :1 := :1 || TO_CLOB('tail'); \
+         END;",
+    );
+    request.binds.push(BindValue::InOut {
+        column_type: OracleColumnType::Clob,
+        max_len: payload.len() as u32 + 8,
+        value: Some(BindInputValue::Text(payload.clone())),
+    });
+
+    let values = conn
+        .execute_out_binds(&request, &[])
+        .expect("PL/SQL very large CLOB IN OUT bind");
+    let value = value_to_string(values.first().expect("very large CLOB IN OUT value"));
+
+    assert_eq!(value, format!("{payload}tail"));
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn plsql_nclob_inout_bind_keeps_korean_text() {
     let mut conn = connect();
     let mut request = StatementRequest::statement(
@@ -2070,6 +3223,32 @@ fn plsql_nclob_inout_bind_keeps_korean_text() {
     assert_eq!(
         value_to_string(values.first().expect("NCLOB IN OUT value")),
         "\u{D55C}\u{AE00}"
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn plsql_nclob_inout_bind_keeps_large_korean_text() {
+    let mut conn = connect();
+    let payload = "\u{D55C}\u{AE00}AbCd".repeat(2048);
+    let mut request = StatementRequest::statement(
+        "BEGIN \
+         :1 := :1 || TO_NCLOB(UNISTR('\\B05D')); \
+         END;",
+    );
+    request.binds.push(BindValue::InOut {
+        column_type: OracleColumnType::Nclob,
+        max_len: (payload.len() as u32).saturating_add(8),
+        value: Some(BindInputValue::Text(payload.clone())),
+    });
+
+    let values = conn
+        .execute_out_binds(&request, &[])
+        .expect("PL/SQL large NCLOB IN OUT bind");
+
+    assert_eq!(
+        value_to_string(values.first().expect("large NCLOB IN OUT value")),
+        format!("{payload}\u{B05D}")
     );
 }
 
@@ -2096,6 +3275,56 @@ fn plsql_blob_inout_bind_returns_bytes() {
         values,
         vec![OracleValue::Bytes(vec![0xca, 0xfe, 0xbe, 0xef])]
     );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn plsql_blob_inout_bind_returns_large_bytes() {
+    let mut conn = connect();
+    let payload = (0..=255).cycle().take(8192).collect::<Vec<_>>();
+    let mut request = StatementRequest::statement(
+        "BEGIN \
+         :1 := TO_BLOB(UTL_RAW.CONCAT(:1, HEXTORAW('BEEF'))); \
+         END;",
+    );
+    request.binds.push(BindValue::InOut {
+        column_type: OracleColumnType::Blob,
+        max_len: payload.len() as u32 + 2,
+        value: Some(BindInputValue::Bytes(payload.clone())),
+    });
+
+    let values = conn
+        .execute_out_binds(&request, &[])
+        .expect("PL/SQL large BLOB IN OUT bind");
+
+    let mut expected = payload;
+    expected.extend_from_slice(&[0xbe, 0xef]);
+    assert_eq!(values, vec![OracleValue::Bytes(expected)]);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn plsql_blob_inout_bind_returns_very_large_bytes() {
+    let mut conn = connect();
+    let payload = (0..=255).cycle().take(40_000).collect::<Vec<_>>();
+    let mut request = StatementRequest::statement(
+        "BEGIN \
+         DBMS_LOB.WRITEAPPEND(:1, 2, HEXTORAW('BEEF')); \
+         END;",
+    );
+    request.binds.push(BindValue::InOut {
+        column_type: OracleColumnType::Blob,
+        max_len: payload.len() as u32 + 2,
+        value: Some(BindInputValue::Bytes(payload.clone())),
+    });
+
+    let values = conn
+        .execute_out_binds(&request, &[])
+        .expect("PL/SQL very large BLOB IN OUT bind");
+
+    let mut expected = payload;
+    expected.extend_from_slice(&[0xbe, 0xef]);
+    assert_eq!(values, vec![OracleValue::Bytes(expected)]);
 }
 
 #[test]
@@ -2603,14 +3832,25 @@ fn dml_returning_lob_out_binds_return_values() {
     let _guard = TableDropGuard::new(config.clone(), table.clone());
     let mut conn = connect_with_config(config);
     conn.query_drop(&format!(
-        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, clob_col CLOB, blob_col BLOB)"
+        "CREATE TABLE {table} (\
+         id NUMBER PRIMARY KEY, \
+         clob_col CLOB, \
+         blob_col BLOB, \
+         nclob_col NCLOB, \
+         bfile_col BFILE)"
     ))
     .expect("create LOB DML RETURNING test table");
 
     let mut request = StatementRequest::statement(format!(
-        "INSERT INTO {table} (id, clob_col, blob_col) \
-         VALUES (:1, :2, HEXTORAW(:3)) \
-         RETURNING clob_col, blob_col INTO :4, :5"
+        "INSERT INTO {table} (id, clob_col, blob_col, nclob_col, bfile_col) \
+         VALUES (\
+             :1, \
+             :2, \
+             HEXTORAW(:3), \
+             TO_NCLOB(UNISTR('\\D55C\\AE00')), \
+             BFILENAME('DATA_PUMP_DIR', 'space_query_bfile_probe.bin')\
+         ) \
+         RETURNING clob_col, blob_col, nclob_col, bfile_col INTO :4, :5, :6, :7"
     ));
     request.binds.push(BindValue::Number("1".to_string()));
     request
@@ -2625,6 +3865,14 @@ fn dml_returning_lob_out_binds_return_values() {
         column_type: OracleColumnType::Blob,
         max_len: 2,
     });
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Nclob,
+        max_len: 20,
+    });
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Bfile,
+        max_len: 256,
+    });
 
     let values = conn
         .execute_out_binds(&request, &[])
@@ -2635,6 +3883,39 @@ fn dml_returning_lob_out_binds_return_values() {
         "A short CLOB - 1618"
     );
     assert_eq!(values.get(1), Some(&OracleValue::Bytes(vec![0xca, 0xfe])));
+    assert_eq!(
+        value_to_string(values.get(2).expect("NCLOB RETURNING value")),
+        "\u{D55C}\u{AE00}"
+    );
+    let bfile_locator = match values.get(3) {
+        Some(OracleValue::Lob(locator)) => locator.clone(),
+        other => panic!("expected BFILE RETURNING locator, got {other:?}"),
+    };
+    let mut get_name = StatementRequest::statement(
+        "BEGIN \
+         DBMS_LOB.FILEGETNAME(:1, :2, :3); \
+         END;",
+    );
+    get_name.binds.push(BindValue::LobLocator {
+        column_type: OracleColumnType::Bfile,
+        locator: bfile_locator,
+    });
+    get_name.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Varchar,
+        max_len: 128,
+    });
+    get_name.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Varchar,
+        max_len: 256,
+    });
+    let bfile_name = conn
+        .execute_out_binds(&get_name, &[])
+        .expect("BFILE DML RETURNING locator FILEGETNAME");
+    assert_eq!(value_to_string(&bfile_name[0]), "DATA_PUMP_DIR");
+    assert_eq!(
+        value_to_string(&bfile_name[1]),
+        "space_query_bfile_probe.bin"
+    );
 }
 
 #[test]
@@ -3830,6 +5111,65 @@ fn plsql_procedure_ref_cursor_out_bind_preserves_udt_metadata() {
 
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn plsql_procedure_ref_cursor_out_bind_decodes_null_xmltype_udt_attribute_like_python_oracledb() {
+    let config = live_config();
+    let type_name = unique_object_name("RCUDT_XML_NULL");
+    let procedure_name = unique_object_name("RCUDT_XMLN");
+    let _guard = TypeDropGuard::new(config.clone(), type_name.clone());
+    let mut conn = connect_with_config(config);
+    drop_procedure_ignore(&mut conn, &procedure_name);
+    drop_type_ignore(&mut conn, &type_name);
+    conn.query_drop(&format!(
+        "CREATE TYPE {type_name} AS OBJECT (\
+         number_value NUMBER, \
+         xml_value XMLTYPE, \
+         string_value VARCHAR2(60))"
+    ))
+    .expect("create XMLTYPE null UDT type");
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE PROCEDURE {procedure_name}(p_rc OUT SYS_REFCURSOR) IS \
+         BEGIN \
+         OPEN p_rc FOR \
+         SELECT {type_name}(2349, NULL, 'A string for test 2349') AS obj FROM dual; \
+         END;"
+    ))
+    .expect("create XMLTYPE null UDT REF CURSOR procedure");
+
+    let mut request = StatementRequest::statement(format!("BEGIN {procedure_name}(:1); END;"));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Cursor,
+        max_len: 1,
+    });
+    let values = conn
+        .execute_out_binds(&request, &[])
+        .expect("PL/SQL XMLTYPE null UDT REF CURSOR OUT bind");
+    let cursor = match values.first() {
+        Some(OracleValue::Cursor(cursor)) => cursor.clone(),
+        other => panic!("expected XMLTYPE UDT OUT REF CURSOR, got {other:?}"),
+    };
+    let rows = conn
+        .fetch_ref_cursor_all(cursor.cursor_id, cursor.columns, 1)
+        .expect("fetch XMLTYPE null UDT REF CURSOR rows");
+    let object_attrs = match &rows.result.rows[0][0] {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected decoded XMLTYPE UDT object, got {other:?}"),
+    };
+
+    assert_eq!(object_attrs[0].0, "NUMBER_VALUE");
+    assert_eq!(object_attrs[0].1, OracleValue::Number("2349".to_string()));
+    assert_eq!(object_attrs[1].0, "XML_VALUE");
+    assert_eq!(object_attrs[1].1, OracleValue::Null);
+    assert_eq!(object_attrs[2].0, "STRING_VALUE");
+    assert_eq!(
+        object_attrs[2].1,
+        OracleValue::Text("A string for test 2349".to_string())
+    );
+
+    drop_procedure_ignore(&mut conn, &procedure_name);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn plsql_procedure_ref_cursor_out_bind_decodes_number_synonym_udt_attributes() {
     let config = live_config();
     let type_name = unique_object_name("RCUDT_NUMSYN");
@@ -3987,7 +5327,11 @@ fn plsql_procedure_ref_cursor_out_bind_decodes_udt_collection_attribute() {
         "CREATE OR REPLACE PROCEDURE {procedure_name}(p_rc OUT SYS_REFCURSOR) IS \
          BEGIN \
          OPEN p_rc FOR \
-         SELECT {parent_type_name}({collection_type_name}({child_type_name}(1))) AS obj \
+         SELECT {parent_type_name}({collection_type_name}(\
+             {child_type_name}(1), \
+             NULL, \
+             {child_type_name}(3)\
+         )) AS obj \
          FROM dual; \
          END;"
     ))
@@ -4018,13 +5362,20 @@ fn plsql_procedure_ref_cursor_out_bind_decodes_udt_collection_attribute() {
         OracleValue::Array(values) => values,
         other => panic!("expected decoded UDT collection attribute, got {other:?}"),
     };
-    assert_eq!(collection_values.len(), 1);
+    assert_eq!(collection_values.len(), 3);
     let child_attrs = match &collection_values[0] {
         OracleValue::Object(attrs) => attrs,
         other => panic!("expected decoded UDT collection element object, got {other:?}"),
     };
     assert_eq!(child_attrs[0].0, "CHILD_ID");
     assert_eq!(child_attrs[0].1, OracleValue::Number("1".to_string()));
+    assert_eq!(collection_values[1], OracleValue::Null);
+    let child_attrs = match &collection_values[2] {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected decoded trailing UDT collection element object, got {other:?}"),
+    };
+    assert_eq!(child_attrs[0].0, "CHILD_ID");
+    assert_eq!(child_attrs[0].1, OracleValue::Number("3".to_string()));
 
     drop_procedure_ignore(&mut conn, &procedure_name);
 }
@@ -4176,6 +5527,324 @@ fn plsql_procedure_ref_cursor_out_bind_decodes_top_level_scalar_collection() {
     assert_eq!(rows.result.rows[1][0], OracleValue::Null);
 
     drop_procedure_ignore(&mut conn, &procedure_name);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn select_udt_object_and_collection_columns_decode_like_python_oracledb() {
+    let config = live_config();
+    let object_type_name = unique_object_name("SEL_UDT_XML");
+    let collection_type_name = unique_object_name("SEL_UDT_TAB");
+    let _object_guard = TypeDropGuard::new(config.clone(), object_type_name.clone());
+    let _collection_guard = TypeDropGuard::new(config.clone(), collection_type_name.clone());
+    let mut conn = connect_with_config(config);
+    drop_type_ignore(&mut conn, &object_type_name);
+    drop_type_ignore(&mut conn, &collection_type_name);
+    conn.query_drop(&format!(
+        "CREATE TYPE {object_type_name} AS OBJECT (\
+         number_value NUMBER, \
+         xml_value XMLTYPE, \
+         string_value VARCHAR2(60))"
+    ))
+    .expect("create direct SELECT XMLTYPE UDT type");
+    conn.query_drop(&format!(
+        "CREATE TYPE {collection_type_name} AS TABLE OF VARCHAR2(4000)"
+    ))
+    .expect("create direct SELECT collection type");
+
+    let sql = format!(
+        "SELECT obj, items \
+         FROM (\
+             SELECT 1 AS sort_key, \
+                    {object_type_name}(\
+                        2339, \
+                        SYS.XMLTYPE('<item>test_2339</item>'), \
+                        'A string for test 2339'\
+                    ) AS obj, \
+                    {collection_type_name}(\
+                        CAST(RPAD('D', 4000, 'D') AS VARCHAR2(4000)), \
+                        NULL, \
+                        'tail'\
+                    ) AS items \
+             FROM dual \
+             UNION ALL \
+             SELECT 2 AS sort_key, \
+                    {object_type_name}(2349, NULL, 'A string for test 2349') AS obj, \
+                    CAST(NULL AS {collection_type_name}) AS items \
+             FROM dual\
+         ) \
+         ORDER BY sort_key"
+    );
+
+    let rows = conn
+        .query_described_fetch_all(sql.clone(), 1)
+        .expect("fetch direct SELECT UDT object and collection rows");
+    assert_eq!(rows.result.rows.len(), 2);
+    assert_eq!(
+        rows.columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Unsupported(109), OracleColumnType::Unsupported(109)]
+    );
+
+    let first_object_attrs = match &rows.result.rows[0][0] {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected direct SELECT decoded UDT object, got {other:?}"),
+    };
+    assert_eq!(first_object_attrs[0].0, "NUMBER_VALUE");
+    assert_eq!(
+        first_object_attrs[0].1,
+        OracleValue::Number("2339".to_string())
+    );
+    assert_eq!(first_object_attrs[1].0, "XML_VALUE");
+    assert_eq!(
+        value_to_string(&first_object_attrs[1].1),
+        "<item>test_2339</item>"
+    );
+    assert_eq!(first_object_attrs[2].0, "STRING_VALUE");
+    assert_eq!(
+        first_object_attrs[2].1,
+        OracleValue::Text("A string for test 2339".to_string())
+    );
+
+    let collection_values = match &rows.result.rows[0][1] {
+        OracleValue::Array(values) => values,
+        other => panic!("expected direct SELECT decoded collection, got {other:?}"),
+    };
+    assert_eq!(collection_values.len(), 3);
+    let payload = value_to_string(&collection_values[0]);
+    assert_eq!(payload.len(), 4000);
+    assert!(payload.chars().all(|ch| ch == 'D'));
+    assert_eq!(collection_values[1], OracleValue::Null);
+    assert_eq!(collection_values[2], OracleValue::Text("tail".to_string()));
+
+    let second_object_attrs = match &rows.result.rows[1][0] {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected direct SELECT decoded null-XML UDT object, got {other:?}"),
+    };
+    assert_eq!(
+        second_object_attrs[0].1,
+        OracleValue::Number("2349".to_string())
+    );
+    assert_eq!(second_object_attrs[1].0, "XML_VALUE");
+    assert_eq!(second_object_attrs[1].1, OracleValue::Null);
+    assert_eq!(
+        second_object_attrs[2].1,
+        OracleValue::Text("A string for test 2349".to_string())
+    );
+    assert_eq!(rows.result.rows[1][1], OracleValue::Null);
+
+    let initial = conn
+        .query_described_initial_request(&StatementRequest::query(sql, 1))
+        .expect("initial direct SELECT UDT object and collection query");
+    assert_eq!(
+        initial
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Unsupported(109), OracleColumnType::Unsupported(109)]
+    );
+    assert!(
+        initial.result.rows.is_empty(),
+        "object metadata queries should use no-prefetch initial execution"
+    );
+    let cursor_id = initial
+        .result
+        .cursor_id
+        .expect("initial UDT query cursor id");
+    let fetched = conn
+        .fetch_ref_cursor_all(cursor_id, initial.columns, 1)
+        .expect("fetch initial direct SELECT UDT object and collection rows");
+    assert_eq!(fetched.result.rows.len(), 2);
+    assert!(matches!(fetched.result.rows[0][0], OracleValue::Object(_)));
+    assert!(matches!(fetched.result.rows[0][1], OracleValue::Array(_)));
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn select_nested_udt_object_attribute_decodes_null_like_python_oracledb() {
+    let config = live_config();
+    let child_type_name = unique_object_name("SEL_CHILD_OBJ");
+    let parent_type_name = unique_object_name("SEL_PARENT_OBJ");
+    let _child_guard = TypeDropGuard::new(config.clone(), child_type_name.clone());
+    let _parent_guard = TypeDropGuard::new(config.clone(), parent_type_name.clone());
+    let mut conn = connect_with_config(config);
+    drop_type_ignore(&mut conn, &parent_type_name);
+    drop_type_ignore(&mut conn, &child_type_name);
+    conn.query_drop(&format!(
+        "CREATE TYPE {child_type_name} AS OBJECT (\
+         child_id NUMBER, \
+         child_label VARCHAR2(30))"
+    ))
+    .expect("create direct SELECT nested child UDT type");
+    conn.query_drop(&format!(
+        "CREATE TYPE {parent_type_name} AS OBJECT (\
+         id NUMBER, \
+         child {child_type_name})"
+    ))
+    .expect("create direct SELECT nested parent UDT type");
+
+    let sql = format!(
+        "SELECT obj \
+         FROM (\
+             SELECT 1 AS sort_key, \
+                    {parent_type_name}(1, {child_type_name}(7, 'nested child')) AS obj \
+             FROM dual \
+             UNION ALL \
+             SELECT 2 AS sort_key, \
+                    {parent_type_name}(2, NULL) AS obj \
+             FROM dual\
+         ) \
+         ORDER BY sort_key"
+    );
+    let rows = conn
+        .query_described_fetch_all(sql.clone(), 1)
+        .expect("fetch direct SELECT nested UDT object rows");
+    assert_eq!(rows.result.rows.len(), 2);
+    assert_nested_object_attribute_rows(&rows.result.rows);
+
+    let initial = conn
+        .query_described_initial_request(&StatementRequest::query(sql, 1))
+        .expect("initial direct SELECT nested UDT object query");
+    assert!(
+        initial.result.rows.is_empty(),
+        "nested object metadata queries should use no-prefetch initial execution"
+    );
+    let cursor_id = initial
+        .result
+        .cursor_id
+        .expect("initial nested UDT object query cursor id");
+    let fetched = conn
+        .fetch_ref_cursor_all(cursor_id, initial.columns, 1)
+        .expect("fetch initial direct SELECT nested UDT object rows");
+    assert_eq!(fetched.result.rows.len(), 2);
+    assert_nested_object_attribute_rows(&fetched.result.rows);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn select_udt_collection_attribute_decodes_null_like_python_oracledb() {
+    let config = live_config();
+    let collection_type_name = unique_object_name("SEL_ATTR_TAB");
+    let parent_type_name = unique_object_name("SEL_ATTR_PARENT");
+    let _collection_guard = TypeDropGuard::new(config.clone(), collection_type_name.clone());
+    let _parent_guard = TypeDropGuard::new(config.clone(), parent_type_name.clone());
+    let mut conn = connect_with_config(config);
+    drop_type_ignore(&mut conn, &parent_type_name);
+    drop_type_ignore(&mut conn, &collection_type_name);
+    conn.query_drop(&format!(
+        "CREATE TYPE {collection_type_name} AS TABLE OF VARCHAR2(20)"
+    ))
+    .expect("create direct SELECT collection attribute type");
+    conn.query_drop(&format!(
+        "CREATE TYPE {parent_type_name} AS OBJECT (\
+         id NUMBER, \
+         items {collection_type_name})"
+    ))
+    .expect("create direct SELECT collection attribute parent type");
+
+    let sql = format!(
+        "SELECT obj \
+         FROM (\
+             SELECT 1 AS sort_key, \
+                    {parent_type_name}(\
+                        1, \
+                        {collection_type_name}('first', NULL, 'tail')\
+                    ) AS obj \
+             FROM dual \
+             UNION ALL \
+             SELECT 2 AS sort_key, \
+                    {parent_type_name}(\
+                        2, \
+                        CAST(NULL AS {collection_type_name})\
+                    ) AS obj \
+             FROM dual\
+         ) \
+         ORDER BY sort_key"
+    );
+    let rows = conn
+        .query_described_fetch_all(sql.clone(), 1)
+        .expect("fetch direct SELECT UDT collection attribute rows");
+    assert_eq!(rows.result.rows.len(), 2);
+    assert_collection_attribute_rows(&rows.result.rows);
+
+    let initial = conn
+        .query_described_initial_request(&StatementRequest::query(sql, 1))
+        .expect("initial direct SELECT UDT collection attribute query");
+    assert!(
+        initial.result.rows.is_empty(),
+        "collection attribute metadata queries should use no-prefetch initial execution"
+    );
+    let cursor_id = initial
+        .result
+        .cursor_id
+        .expect("initial UDT collection attribute query cursor id");
+    let fetched = conn
+        .fetch_ref_cursor_all(cursor_id, initial.columns, 1)
+        .expect("fetch initial direct SELECT UDT collection attribute rows");
+    assert_eq!(fetched.result.rows.len(), 2);
+    assert_collection_attribute_rows(&fetched.result.rows);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn select_nested_collection_column_decodes_like_python_oracledb() {
+    let config = live_config();
+    let inner_collection_type_name = unique_object_name("SEL_NUM_TAB");
+    let outer_collection_type_name = unique_object_name("SEL_TAB_TAB");
+    let _inner_guard = TypeDropGuard::new(config.clone(), inner_collection_type_name.clone());
+    let _outer_guard = TypeDropGuard::new(config.clone(), outer_collection_type_name.clone());
+    let mut conn = connect_with_config(config);
+    drop_type_ignore(&mut conn, &outer_collection_type_name);
+    drop_type_ignore(&mut conn, &inner_collection_type_name);
+    conn.query_drop(&format!(
+        "CREATE TYPE {inner_collection_type_name} AS TABLE OF NUMBER"
+    ))
+    .expect("create inner numeric collection type");
+    conn.query_drop(&format!(
+        "CREATE TYPE {outer_collection_type_name} AS TABLE OF {inner_collection_type_name}"
+    ))
+    .expect("create outer nested collection type");
+
+    let sql = format!(
+        "SELECT {outer_collection_type_name}(\
+             {inner_collection_type_name}(1, 2), \
+             NULL, \
+             {inner_collection_type_name}(3, 4, 5)\
+         ) AS items \
+         FROM dual"
+    );
+    let rows = conn
+        .query_described_fetch_all(sql.clone(), 1)
+        .expect("fetch direct SELECT nested collection rows");
+    assert_eq!(
+        rows.columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Unsupported(109)]
+    );
+    assert_eq!(rows.result.rows.len(), 1);
+    assert_nested_number_collection(&rows.result.rows[0][0]);
+
+    let initial = conn
+        .query_described_initial_request(&StatementRequest::query(sql, 1))
+        .expect("initial direct SELECT nested collection query");
+    assert!(
+        initial.result.rows.is_empty(),
+        "nested collection metadata queries should use no-prefetch initial execution"
+    );
+    let cursor_id = initial
+        .result
+        .cursor_id
+        .expect("initial nested collection query cursor id");
+    let fetched = conn
+        .fetch_ref_cursor_all(cursor_id, initial.columns, 1)
+        .expect("fetch initial direct SELECT nested collection rows");
+    assert_eq!(fetched.result.rows.len(), 1);
+    assert_nested_number_collection(&fetched.result.rows[0][0]);
 }
 
 #[test]
@@ -4714,6 +6383,10 @@ fn drop_procedure_ignore(conn: &mut OracleThinSession, procedure_name: &str) {
     let _ = conn.query_drop(&format!("DROP PROCEDURE {procedure_name}"));
 }
 
+fn drop_view_ignore(conn: &mut OracleThinSession, view_name: &str) {
+    let _ = conn.query_drop(&format!("DROP VIEW {view_name}"));
+}
+
 fn drop_type_ignore(conn: &mut OracleThinSession, type_name: &str) {
     let _ = conn.query_drop(&format!("DROP TYPE {type_name} FORCE"));
 }
@@ -4731,6 +6404,27 @@ fn select_count(conn: &mut OracleThinSession, table: &str) -> i64 {
     match value {
         OracleValue::Number(value) => value.parse::<i64>().expect("numeric count"),
         other => panic!("expected NUMBER count, got {other:?}"),
+    }
+}
+
+fn current_temp_lob_count(conn: &mut OracleThinSession) -> i64 {
+    let result = conn
+        .query_described_fetch_all(
+            "SELECT NVL(SUM(cache_lobs + nocache_lobs + abstract_lobs), 0) \
+             FROM v$temporary_lobs l, v$session s \
+             WHERE s.sid = l.sid AND s.sid = userenv('SID')",
+            1,
+        )
+        .expect("query current temporary LOB count");
+    let value = result
+        .result
+        .rows
+        .first()
+        .and_then(|row| row.first())
+        .expect("temporary LOB count row");
+    match value {
+        OracleValue::Number(value) => value.parse::<i64>().expect("numeric temporary LOB count"),
+        other => panic!("expected NUMBER temporary LOB count, got {other:?}"),
     }
 }
 
@@ -4769,6 +6463,85 @@ fn value_to_string(value: &OracleValue) -> String {
     match value {
         OracleValue::Number(value) | OracleValue::Text(value) => value.clone(),
         other => panic!("unexpected test value {other:?}"),
+    }
+}
+
+fn assert_nested_object_attribute_rows(rows: &[Vec<OracleValue>]) {
+    let first_attrs = match &rows[0][0] {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected direct SELECT nested parent object, got {other:?}"),
+    };
+    assert_eq!(first_attrs[0].0, "ID");
+    assert_eq!(first_attrs[0].1, OracleValue::Number("1".to_string()));
+    assert_eq!(first_attrs[1].0, "CHILD");
+    let child_attrs = match &first_attrs[1].1 {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected direct SELECT nested child object, got {other:?}"),
+    };
+    assert_eq!(child_attrs[0].0, "CHILD_ID");
+    assert_eq!(child_attrs[0].1, OracleValue::Number("7".to_string()));
+    assert_eq!(child_attrs[1].0, "CHILD_LABEL");
+    assert_eq!(
+        child_attrs[1].1,
+        OracleValue::Text("nested child".to_string())
+    );
+
+    let second_attrs = match &rows[1][0] {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected direct SELECT parent object with null child, got {other:?}"),
+    };
+    assert_eq!(second_attrs[0].0, "ID");
+    assert_eq!(second_attrs[0].1, OracleValue::Number("2".to_string()));
+    assert_eq!(second_attrs[1].0, "CHILD");
+    assert_eq!(second_attrs[1].1, OracleValue::Null);
+}
+
+fn assert_collection_attribute_rows(rows: &[Vec<OracleValue>]) {
+    let first_attrs = match &rows[0][0] {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected direct SELECT parent object with collection, got {other:?}"),
+    };
+    assert_eq!(first_attrs[0].0, "ID");
+    assert_eq!(first_attrs[0].1, OracleValue::Number("1".to_string()));
+    assert_eq!(first_attrs[1].0, "ITEMS");
+    let items = match &first_attrs[1].1 {
+        OracleValue::Array(values) => values,
+        other => panic!("expected direct SELECT collection attribute, got {other:?}"),
+    };
+    assert_eq!(items.len(), 3);
+    assert_eq!(items[0], OracleValue::Text("first".to_string()));
+    assert_eq!(items[1], OracleValue::Null);
+    assert_eq!(items[2], OracleValue::Text("tail".to_string()));
+
+    let second_attrs = match &rows[1][0] {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected direct SELECT parent object with null collection, got {other:?}"),
+    };
+    assert_eq!(second_attrs[0].0, "ID");
+    assert_eq!(second_attrs[0].1, OracleValue::Number("2".to_string()));
+    assert_eq!(second_attrs[1].0, "ITEMS");
+    assert_eq!(second_attrs[1].1, OracleValue::Null);
+}
+
+fn assert_nested_number_collection(value: &OracleValue) {
+    let outer_values = match value {
+        OracleValue::Array(values) => values,
+        other => panic!("expected decoded nested collection, got {other:?}"),
+    };
+    assert_eq!(outer_values.len(), 3);
+    assert_number_collection(&outer_values[0], &["1", "2"]);
+    assert_eq!(outer_values[1], OracleValue::Null);
+    assert_number_collection(&outer_values[2], &["3", "4", "5"]);
+}
+
+fn assert_number_collection(value: &OracleValue, expected: &[&str]) {
+    let values = match value {
+        OracleValue::Array(values) => values,
+        other => panic!("expected decoded numeric collection, got {other:?}"),
+    };
+    assert_eq!(values.len(), expected.len());
+    for (value, expected) in values.iter().zip(expected.iter()) {
+        assert_eq!(value_to_string(value), *expected);
     }
 }
 

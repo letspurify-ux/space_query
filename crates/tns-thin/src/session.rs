@@ -284,8 +284,8 @@ const TNS_DATA_TYPE_DBLOB: u8 = 196;
 const ORA_TYPE_NUM_DBFILE: u8 = 197;
 const ORA_TYPE_NUM_DJSON: u8 = 198;
 const ORA_TYPE_NUM_UROWID: u8 = 208;
-const ORA_TYPE_NUM_TIMESTAMP_LTZ_DTY: u8 = 231;
-const ORA_TYPE_NUM_TIMESTAMP_LTZ: u8 = 232;
+const ORA_TYPE_NUM_TIMESTAMP_LTZ: u8 = 231;
+const TNS_DATA_TYPE_ESITZ: u8 = 232;
 const TNS_DATA_TYPE_UB8: u8 = 233;
 const TNS_DATA_TYPE_PNTY: u8 = 241;
 const ORA_TYPE_NUM_BOOLEAN: u8 = 252;
@@ -296,6 +296,8 @@ const TNS_LOB_PREFETCH_FLAG: u64 = 0x0200_0000;
 const TNS_LOB_OP_READ: u32 = 0x0002;
 const TNS_LOB_OP_WRITE: u32 = 0x0040;
 const TNS_LOB_OP_CREATE_TEMP: u32 = 0x0110;
+const TNS_LOB_OP_FREE_TEMP: u32 = 0x0111;
+const TNS_LOB_OP_ARRAY: u32 = 0x80000;
 const TNS_VECTOR_MAGIC_BYTE: u8 = 0xdb;
 const TNS_VECTOR_VERSION_BASE: u8 = 0;
 const TNS_VECTOR_VERSION_WITH_BINARY: u8 = 1;
@@ -359,6 +361,7 @@ const TNS_LOB_LOC_OFFSET_FLAG_3: usize = 6;
 const TNS_LOB_LOC_OFFSET_FLAG_4: usize = 7;
 const TNS_LOB_LOC_FLAGS_VAR_LENGTH_CHARSET: u8 = 0x80;
 const TNS_LOB_LOC_FLAGS_LITTLE_ENDIAN: u8 = 0x40;
+const TNS_MAX_SHORT_LOB_INOUT_SIZE: usize = 32_767;
 const TNS_JSON_TYPE_NULL: u8 = 0x30;
 const TNS_JSON_TYPE_TRUE: u8 = 0x31;
 const TNS_JSON_TYPE_FALSE: u8 = 0x32;
@@ -983,8 +986,14 @@ impl OracleThinSession {
     ) -> Result<DescribedQueryResult, OracleThinError> {
         let described_columns = self.describe_request(request)?;
         let requires_define_fetch = columns_require_define_fetch_for_values(&described_columns);
+        let requires_deferred_fetch =
+            requires_define_fetch || columns_require_object_metadata_for_values(&described_columns);
         let mut result = if requires_define_fetch {
             self.query_described_without_prefetch_request(request)?
+        } else if requires_deferred_fetch {
+            let mut result = self.query_described_without_prefetch_request(request)?;
+            result.columns = described_columns;
+            result
         } else {
             self.query_described_fetch_all_request_legacy(request)?
         };
@@ -1053,7 +1062,14 @@ impl OracleThinSession {
         &mut self,
         request: &StatementRequest,
     ) -> Result<DescribedQueryResult, OracleThinError> {
-        let result = self.query_described_initial_request_legacy(request)?;
+        let described_columns = self.describe_request(request)?;
+        let result = if columns_require_object_metadata_for_values(&described_columns) {
+            let mut result = self.query_described_initial_without_prefetch_request(request)?;
+            result.columns = described_columns;
+            result
+        } else {
+            self.query_described_initial_request_legacy(request)?
+        };
         self.remember_last_row_for_open_fetch(&result);
         Ok(result)
     }
@@ -1442,6 +1458,41 @@ impl OracleThinSession {
         self.resolve_xml_lob_values(&response.thin_columns, &mut response.result.rows)
     }
 
+    fn resolve_lob_out_bind_values(
+        &mut self,
+        request: &StatementRequest,
+        response: &mut ExecuteResponse,
+    ) -> Result<(), OracleThinError> {
+        if response.out_bind_rows.is_empty() {
+            return Ok(());
+        }
+        let columns = request
+            .binds
+            .iter()
+            .filter(|bind| bind_can_return_value(bind))
+            .map(bind_column_metadata)
+            .collect::<Vec<_>>();
+        for row in &mut response.out_bind_rows {
+            for (column, value) in columns.iter().zip(row.iter_mut()) {
+                let OracleValue::Lob(locator) = value else {
+                    continue;
+                };
+                match column.column_type {
+                    OracleColumnType::Blob => {
+                        *value =
+                            OracleValue::Bytes(self.read_blob_locator_as_bytes(&locator.clone())?);
+                    }
+                    OracleColumnType::Clob | OracleColumnType::Nclob => {
+                        *value =
+                            OracleValue::Text(self.read_clob_locator_as_text(&locator.clone())?);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn resolve_xml_lob_values(
         &mut self,
         columns: &[ThinColumn],
@@ -1517,6 +1568,24 @@ impl OracleThinSession {
         decode_xml_clob_lob_text(&bytes, &self.capabilities)
     }
 
+    fn read_blob_locator_as_bytes(&mut self, locator: &[u8]) -> Result<Vec<u8>, OracleThinError> {
+        let mut offset = 1;
+        let mut bytes = Vec::new();
+        loop {
+            let response =
+                self.read_lob_locator(locator, offset, u64::from(TNS_MAX_LONG_LENGTH))?;
+            if response.data.is_empty() {
+                break;
+            }
+            bytes.extend_from_slice(&response.data);
+            let Some(amount) = response.amount.filter(|amount| *amount > 0) else {
+                break;
+            };
+            offset += amount as u64;
+        }
+        Ok(bytes)
+    }
+
     fn read_vector_locator_as_text(&mut self, locator: &[u8]) -> Result<String, OracleThinError> {
         let mut offset = 1;
         let mut bytes = Vec::new();
@@ -1535,21 +1604,72 @@ impl OracleThinSession {
         decode_oracle_vector(&bytes)
     }
 
+    fn create_temp_blob(&mut self, value: &[u8]) -> Result<Vec<u8>, OracleThinError> {
+        self.create_temp_lob(OracleColumnType::Blob, value.to_vec())
+    }
+
     fn create_temp_clob(&mut self, value: &str) -> Result<Vec<u8>, OracleThinError> {
+        let locator = self.create_temp_lob_locator(OracleColumnType::Clob)?;
+        if value.is_empty() {
+            return Ok(locator);
+        }
+        let bytes = match encode_temp_clob_text(value, &locator, &self.capabilities) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let _ = self.free_temp_lobs(&[locator]);
+                return Err(error);
+            }
+        };
+        self.write_temp_lob_or_free(locator, &bytes)
+    }
+
+    fn create_temp_nclob(&mut self, value: &str) -> Result<Vec<u8>, OracleThinError> {
+        let locator = self.create_temp_lob_locator(OracleColumnType::Nclob)?;
+        if value.is_empty() {
+            return Ok(locator);
+        }
+        let bytes = match encode_oracle_nchar_text(value, self.capabilities.ncharset_id) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let _ = self.free_temp_lobs(&[locator]);
+                return Err(error);
+            }
+        };
+        self.write_temp_lob_or_free(locator, &bytes)
+    }
+
+    fn create_temp_lob(
+        &mut self,
+        column_type: OracleColumnType,
+        bytes: Vec<u8>,
+    ) -> Result<Vec<u8>, OracleThinError> {
+        let locator = self.create_temp_lob_locator(column_type)?;
+        if bytes.is_empty() {
+            return Ok(locator);
+        }
+        self.write_temp_lob_or_free(locator, &bytes)
+    }
+
+    fn create_temp_lob_locator(
+        &mut self,
+        column_type: OracleColumnType,
+    ) -> Result<Vec<u8>, OracleThinError> {
         let mut locator = vec![0; 40];
         let sequence = self.next_ttc_sequence();
         let mut payload = Vec::new();
+        let (charset_form, ora_type_num, charset_id) =
+            temp_lob_type_metadata(column_type, &self.capabilities);
         write_lob_operation_request(
             &mut payload,
             &self.capabilities,
             sequence,
             &locator,
             TNS_LOB_OP_CREATE_TEMP,
-            u64::from(CS_FORM_IMPLICIT),
-            u64::from(ORA_TYPE_NUM_CLOB),
+            u64::from(charset_form),
+            u64::from(ora_type_num),
             TNS_DURATION_SESSION,
             None,
-            true,
+            Some(charset_id.unwrap_or(TNS_CHARSET_UTF8)),
         )?;
         write_data_packet(
             &mut self.stream,
@@ -1566,10 +1686,17 @@ impl OracleThinSession {
         )?
         .locator
         .ok_or_else(|| {
-            OracleThinError::new("Oracle temporary CLOB create did not return locator")
+            OracleThinError::new("Oracle temporary LOB create did not return locator")
         })?;
 
-        let bytes = encode_temp_clob_text(value, &locator, &self.capabilities)?;
+        Ok(locator)
+    }
+
+    fn write_temp_lob(
+        &mut self,
+        mut locator: Vec<u8>,
+        bytes: &[u8],
+    ) -> Result<Vec<u8>, OracleThinError> {
         let sequence = self.next_ttc_sequence();
         let mut payload = Vec::new();
         write_lob_operation_request(
@@ -1581,8 +1708,8 @@ impl OracleThinSession {
             1,
             0,
             0,
-            Some(&bytes),
-            false,
+            Some(bytes),
+            None,
         )?;
         write_data_packet(
             &mut self.stream,
@@ -1602,6 +1729,20 @@ impl OracleThinSession {
             locator = updated_locator;
         }
         Ok(locator)
+    }
+
+    fn write_temp_lob_or_free(
+        &mut self,
+        locator: Vec<u8>,
+        bytes: &[u8],
+    ) -> Result<Vec<u8>, OracleThinError> {
+        match self.write_temp_lob(locator.clone(), bytes) {
+            Ok(locator) => Ok(locator),
+            Err(error) => {
+                let _ = self.free_temp_lobs(&[locator]);
+                Err(error)
+            }
+        }
     }
 
     fn read_lob_locator(
@@ -1909,16 +2050,19 @@ impl OracleThinSession {
         execute_without_prefetch: bool,
     ) -> Result<ExecuteResponse, OracleThinError> {
         log_connect_phase("ttc-execute-write", &request.sql);
-        let materialized_request = if request
-            .binds
-            .iter()
-            .any(|bind| matches!(bind, BindValue::Clob(_)))
-        {
+        let materialized_lobs = if request.binds.iter().any(bind_needs_lob_materialization) {
             Some(self.materialize_large_lob_binds(request)?)
         } else {
             None
         };
-        let request = materialized_request.as_ref().unwrap_or(request);
+        let temp_lob_locators = materialized_lobs
+            .as_ref()
+            .map(|(_, locators)| locators.clone())
+            .unwrap_or_default();
+        let request = materialized_lobs
+            .as_ref()
+            .map(|(request, _)| request)
+            .unwrap_or(request);
         let pending_cursor_closes = self.drain_pending_cursor_closes();
         let close_sequence = if pending_cursor_closes.is_empty() {
             None
@@ -1937,6 +2081,7 @@ impl OracleThinSession {
             execute_without_prefetch,
         ) {
             self.requeue_pending_cursor_closes(&pending_cursor_closes);
+            let _ = self.free_temp_lobs(&temp_lob_locators);
             return Err(error);
         }
         log_connect_phase("ttc-execute-read", "");
@@ -1951,16 +2096,32 @@ impl OracleThinSession {
             skip_empty_end_of_response,
         );
         if self.cancel_flag.swap(false, Ordering::SeqCst) {
-            return Err(self.finish_cancelled_read());
+            let error = self.finish_cancelled_read();
+            let _ = self.free_temp_lobs(&temp_lob_locators);
+            return Err(error);
         }
         match response {
             Ok(mut response) => {
-                self.resolve_xml_lob_values_in_response(&mut response)?;
-                self.remember_cursor_columns_from_response(&response);
-                Ok(response)
+                let result = match self.resolve_xml_lob_values_in_response(&mut response) {
+                    Ok(()) => match self.resolve_lob_out_bind_values(request, &mut response) {
+                        Ok(()) => {
+                            self.remember_cursor_columns_from_response(&response);
+                            Ok(response)
+                        }
+                        Err(error) => Err(error),
+                    },
+                    Err(error) => Err(error),
+                };
+                let free_result = self.free_temp_lobs(&temp_lob_locators);
+                match (result, free_result) {
+                    (Ok(response), Ok(())) => Ok(response),
+                    (Err(error), _) => Err(error),
+                    (Ok(_), Err(error)) => Err(error),
+                }
             }
             Err(error) => {
                 self.close_cursor_later(error.cursor_id());
+                let _ = self.free_temp_lobs(&temp_lob_locators);
                 Err(error)
             }
         }
@@ -1969,18 +2130,117 @@ impl OracleThinSession {
     fn materialize_large_lob_binds(
         &mut self,
         request: &StatementRequest,
-    ) -> Result<StatementRequest, OracleThinError> {
+    ) -> Result<(StatementRequest, Vec<Vec<u8>>), OracleThinError> {
         let mut materialized = request.clone();
+        let mut temp_lob_locators = Vec::new();
         for bind in &mut materialized.binds {
-            if let BindValue::Clob(text) = bind {
-                let locator = self.create_temp_clob(text)?;
-                *bind = BindValue::LobLocator {
+            match bind {
+                BindValue::Blob(bytes) => {
+                    let locator = match self.create_temp_blob(bytes) {
+                        Ok(locator) => locator,
+                        Err(error) => {
+                            let _ = self.free_temp_lobs(&temp_lob_locators);
+                            return Err(error);
+                        }
+                    };
+                    temp_lob_locators.push(locator.clone());
+                    *bind = BindValue::LobLocator {
+                        column_type: OracleColumnType::Blob,
+                        locator,
+                    };
+                }
+                BindValue::Clob(text) => {
+                    let locator = match self.create_temp_clob(text) {
+                        Ok(locator) => locator,
+                        Err(error) => {
+                            let _ = self.free_temp_lobs(&temp_lob_locators);
+                            return Err(error);
+                        }
+                    };
+                    temp_lob_locators.push(locator.clone());
+                    *bind = BindValue::LobLocator {
+                        column_type: OracleColumnType::Clob,
+                        locator,
+                    };
+                }
+                BindValue::Nclob(text) => {
+                    let locator = match self.create_temp_nclob(text) {
+                        Ok(locator) => locator,
+                        Err(error) => {
+                            let _ = self.free_temp_lobs(&temp_lob_locators);
+                            return Err(error);
+                        }
+                    };
+                    temp_lob_locators.push(locator.clone());
+                    *bind = BindValue::LobLocator {
+                        column_type: OracleColumnType::Nclob,
+                        locator,
+                    };
+                }
+                BindValue::InOut {
+                    column_type: OracleColumnType::Blob,
+                    max_len,
+                    value: Some(BindInputValue::Bytes(bytes)),
+                } if bytes.len() > TNS_MAX_SHORT_LOB_INOUT_SIZE => {
+                    let max_len = *max_len;
+                    let locator = match self.create_temp_blob(bytes) {
+                        Ok(locator) => locator,
+                        Err(error) => {
+                            let _ = self.free_temp_lobs(&temp_lob_locators);
+                            return Err(error);
+                        }
+                    };
+                    temp_lob_locators.push(locator.clone());
+                    *bind = BindValue::InOut {
+                        column_type: OracleColumnType::Blob,
+                        max_len,
+                        value: Some(BindInputValue::LobLocator(locator)),
+                    };
+                }
+                BindValue::InOut {
                     column_type: OracleColumnType::Clob,
-                    locator,
-                };
+                    max_len,
+                    value: Some(BindInputValue::Text(text)),
+                } if text.len() > TNS_MAX_SHORT_LOB_INOUT_SIZE => {
+                    let max_len = *max_len;
+                    let locator = match self.create_temp_clob(text) {
+                        Ok(locator) => locator,
+                        Err(error) => {
+                            let _ = self.free_temp_lobs(&temp_lob_locators);
+                            return Err(error);
+                        }
+                    };
+                    temp_lob_locators.push(locator.clone());
+                    *bind = BindValue::InOut {
+                        column_type: OracleColumnType::Clob,
+                        max_len,
+                        value: Some(BindInputValue::LobLocator(locator)),
+                    };
+                }
+                BindValue::InOut {
+                    column_type: OracleColumnType::Nclob,
+                    max_len,
+                    value: Some(BindInputValue::Text(text)),
+                } if text.len() > 4000 => {
+                    let max_len = *max_len;
+                    let locator = match self.create_temp_nclob(text) {
+                        Ok(locator) => locator,
+                        Err(error) => {
+                            let _ = self.free_temp_lobs(&temp_lob_locators);
+                            return Err(error);
+                        }
+                    };
+                    temp_lob_locators.push(locator.clone());
+                    *bind = BindValue::InOut {
+                        column_type: OracleColumnType::Nclob,
+                        max_len,
+                        value: Some(BindInputValue::LobLocator(locator)),
+                    };
+                }
+                _ => {}
             }
         }
-        Ok(materialized)
+        Ok((materialized, temp_lob_locators))
     }
 
     fn simple_ttc_call(
@@ -2049,6 +2309,57 @@ impl OracleThinSession {
         let mut merged = self.pending_cursor_closes.clone();
         merged.extend_from_slice(cursor_ids);
         self.pending_cursor_closes = normalize_cursor_ids(merged);
+    }
+
+    fn free_temp_lobs(&mut self, locators: &[Vec<u8>]) -> Result<(), OracleThinError> {
+        if locators.is_empty() {
+            return Ok(());
+        }
+        let mut payload = Vec::new();
+        let pending_cursor_closes = self.drain_pending_cursor_closes();
+        if !pending_cursor_closes.is_empty() {
+            let close_sequence = self.next_ttc_sequence();
+            if let Err(error) = write_close_cursors_piggyback(
+                &mut payload,
+                &self.capabilities,
+                close_sequence,
+                &pending_cursor_closes,
+            ) {
+                self.requeue_pending_cursor_closes(&pending_cursor_closes);
+                return Err(error);
+            }
+        }
+        let free_sequence = self.next_ttc_sequence();
+        if let Err(error) = write_close_temp_lobs_piggyback(
+            &mut payload,
+            &self.capabilities,
+            free_sequence,
+            locators,
+        ) {
+            self.requeue_pending_cursor_closes(&pending_cursor_closes);
+            return Err(error);
+        }
+        let ping_sequence = self.next_ttc_sequence();
+        write_function_code(
+            &mut payload,
+            TNS_FUNC_PING,
+            ping_sequence,
+            &self.capabilities,
+        );
+        if let Err(error) = write_data_packet(
+            &mut self.stream,
+            self.capabilities.protocol_version.unwrap_or(319),
+            self.capabilities.data_packet_chunk_size(),
+            &payload,
+        ) {
+            self.requeue_pending_cursor_closes(&pending_cursor_closes);
+            return Err(error);
+        }
+        read_simple_response(
+            &mut self.stream,
+            &self.capabilities,
+            !pending_cursor_closes.is_empty(),
+        )
     }
 }
 
@@ -2338,6 +2649,10 @@ fn columns_require_define_fetch_for_values(columns: &[ColumnMetadata]) -> bool {
     columns.iter().any(column_requires_define_fetch_for_value)
 }
 
+fn columns_require_object_metadata_for_values(columns: &[ColumnMetadata]) -> bool {
+    columns.iter().any(column_requires_object_metadata_for_value)
+}
+
 fn column_types_require_define_fetch_for_values(column_types: &[OracleColumnType]) -> bool {
     column_types
         .iter()
@@ -2360,6 +2675,15 @@ fn column_type_requires_define_fetch_for_value(column_type: OracleColumnType) ->
 fn column_requires_define_fetch_for_value(column: &ColumnMetadata) -> bool {
     wire_type_requires_define_fetch_for_value(column.ora_type_num)
         || column_type_requires_define_fetch_for_value(column.column_type)
+}
+
+fn column_requires_object_metadata_for_value(column: &ColumnMetadata) -> bool {
+    matches!(
+        column.ora_type_num,
+        ORA_TYPE_NUM_OBJECT | TNS_DATA_TYPE_EXT_NAMED | TNS_DATA_TYPE_PNTY
+    ) && column.column_type != OracleColumnType::Xml
+        && !column.schema_name.is_empty()
+        && !column.type_name.is_empty()
 }
 
 fn wire_type_requires_define_fetch_for_value(ora_type_num: u8) -> bool {
@@ -3227,7 +3551,7 @@ fn write_lob_operation_request(
     dest_offset: u64,
     dest_length: u32,
     data: Option<&[u8]>,
-    include_charset: bool,
+    charset_id: Option<u16>,
 ) -> Result<(), OracleThinError> {
     write_function_code(payload, TNS_FUNC_LOB_OP, sequence, capabilities);
     payload.push(1);
@@ -3236,7 +3560,7 @@ fn write_lob_operation_request(
     write_ub4(payload, dest_length);
     write_ub4(payload, 0);
     write_ub4(payload, 0);
-    payload.push(u8::from(include_charset));
+    payload.push(u8::from(charset_id.is_some()));
     payload.push(0);
     payload.push(u8::from(operation == TNS_LOB_OP_CREATE_TEMP));
     write_ub4(payload, operation);
@@ -3249,8 +3573,8 @@ fn write_lob_operation_request(
     put_u16_be_vec(payload, 0);
     put_u16_be_vec(payload, 0);
     payload.extend_from_slice(locator);
-    if include_charset {
-        write_ub4(payload, u32::from(TNS_CHARSET_UTF8));
+    if let Some(charset_id) = charset_id {
+        write_ub4(payload, u32::from(charset_id));
     }
     if let Some(data) = data {
         payload.push(TNS_MSG_TYPE_LOB_DATA);
@@ -3273,6 +3597,43 @@ fn write_close_cursors_piggyback(
     write_ub4(payload, cursor_ids.len() as u32);
     for cursor_id in cursor_ids {
         write_ub4(payload, *cursor_id);
+    }
+    Ok(())
+}
+
+fn write_close_temp_lobs_piggyback(
+    payload: &mut Vec<u8>,
+    capabilities: &OracleThinCapabilities,
+    sequence: u8,
+    locators: &[Vec<u8>],
+) -> Result<(), OracleThinError> {
+    if locators.is_empty() {
+        return Ok(());
+    }
+    write_piggyback_code(payload, TNS_FUNC_LOB_OP, sequence, capabilities);
+    payload.push(1);
+    write_ub4(payload, locators.iter().map(Vec::len).sum::<usize>() as u32);
+    payload.push(0);
+    write_ub4(payload, 0);
+    write_ub4(payload, 0);
+    write_ub4(payload, 0);
+    payload.push(0);
+    payload.push(0);
+    payload.push(0);
+    write_ub4(payload, TNS_LOB_OP_FREE_TEMP | TNS_LOB_OP_ARRAY);
+    payload.push(0);
+    write_ub4(payload, 0);
+    write_ub8(payload, 0);
+    write_ub8(payload, 0);
+    payload.push(0);
+    payload.push(0);
+    write_ub4(payload, 0);
+    payload.push(0);
+    write_ub4(payload, 0);
+    payload.push(0);
+    write_ub4(payload, 0);
+    for locator in locators {
+        payload.extend_from_slice(locator);
     }
     Ok(())
 }
@@ -3388,7 +3749,26 @@ fn bind_is_deferred_long_for_sql(
     is_plsql: bool,
     bind: &BindValue,
 ) -> bool {
-    !is_plsql && bind_column_metadata(bind).buffer_size > capabilities.max_string_size
+    !is_plsql
+        && !bind_is_value_based_lob_payload(bind)
+        && bind_column_metadata(bind).buffer_size > capabilities.max_string_size
+}
+
+fn bind_is_value_based_lob_payload(bind: &BindValue) -> bool {
+    matches!(
+        bind,
+        BindValue::Vector(_)
+            | BindValue::Json(_)
+            | BindValue::JsonBool(_)
+            | BindValue::JsonNumber(_)
+            | BindValue::JsonString(_)
+            | BindValue::JsonRaw(_)
+            | BindValue::JsonDate(_)
+            | BindValue::JsonTimestamp(_)
+            | BindValue::JsonIntervalYearMonth(_)
+            | BindValue::JsonIntervalDaySecond(_)
+            | BindValue::JsonVector(_)
+    )
 }
 
 fn write_bind_rows_for_request(
@@ -3413,6 +3793,28 @@ fn write_bind_rows_for_request(
 
 fn bind_can_return_value(bind: &BindValue) -> bool {
     matches!(bind, BindValue::Out { .. } | BindValue::InOut { .. })
+}
+
+fn bind_needs_lob_materialization(bind: &BindValue) -> bool {
+    match bind {
+        BindValue::Blob(_) | BindValue::Clob(_) | BindValue::Nclob(_) => true,
+        BindValue::InOut {
+            column_type: OracleColumnType::Blob,
+            value: Some(BindInputValue::Bytes(bytes)),
+            ..
+        } => bytes.len() > TNS_MAX_SHORT_LOB_INOUT_SIZE,
+        BindValue::InOut {
+            column_type: OracleColumnType::Clob,
+            value: Some(BindInputValue::Text(text)),
+            ..
+        } => text.len() > TNS_MAX_SHORT_LOB_INOUT_SIZE,
+        BindValue::InOut {
+            column_type: OracleColumnType::Nclob,
+            value: Some(BindInputValue::Text(text)),
+            ..
+        } => text.len() > 4000,
+        _ => false,
+    }
 }
 
 fn write_bind_value(
@@ -3474,13 +3876,43 @@ fn write_bind_value(
             write_bytes_with_length(payload, &bytes)
         }
         BindValue::Vector(value) => write_vector_bind_value(payload, capabilities, value),
+        BindValue::Json(value) => write_json_bind_text(payload, capabilities, value),
+        BindValue::JsonBool(value) => write_json_bind_bool(payload, capabilities, *value),
+        BindValue::JsonNumber(value) => write_json_bind_number(payload, capabilities, value),
+        BindValue::JsonString(value) => write_json_bind_string(payload, capabilities, value),
+        BindValue::JsonRaw(value) => write_json_bind_raw(payload, capabilities, value),
+        BindValue::JsonDate(value) => write_json_bind_date(payload, capabilities, value),
+        BindValue::JsonTimestamp(value) => write_json_bind_timestamp(payload, capabilities, value),
+        BindValue::JsonIntervalYearMonth(value) => {
+            write_json_bind_interval_ym(payload, capabilities, value)
+        }
+        BindValue::JsonIntervalDaySecond(value) => {
+            write_json_bind_interval_ds(payload, capabilities, value)
+        }
+        BindValue::JsonVector(value) => write_json_bind_vector(payload, capabilities, value),
+        BindValue::Blob(value) => {
+            write_bytes_with_length_for_capabilities(payload, value, capabilities)
+        }
         BindValue::Clob(value) => {
             write_text_bind_value(payload, capabilities, value, CS_FORM_IMPLICIT)
+        }
+        BindValue::Nclob(value) => {
+            write_text_bind_value(payload, capabilities, value, CS_FORM_NCHAR)
+        }
+        BindValue::Bfile {
+            directory_alias,
+            file_name,
+        } => {
+            let locator = encode_bfile_locator(directory_alias, file_name, capabilities)?;
+            write_bytes_with_two_lengths(payload, &locator)
         }
         BindValue::LobLocator { locator, .. } => write_bytes_with_two_lengths(payload, locator),
         BindValue::InOut {
             column_type, value, ..
         } => match value {
+            Some(BindInputValue::Number(value)) if *column_type == OracleColumnType::Json => {
+                write_json_bind_number(payload, capabilities, value)
+            }
             Some(BindInputValue::Number(value)) => write_oracle_number(payload, value),
             Some(BindInputValue::BinaryFloat(value)) => {
                 if *column_type != OracleColumnType::BinaryFloat {
@@ -3507,6 +3939,9 @@ fn write_bind_value(
                 value,
                 bind_text_charset_form(*column_type),
             ),
+            Some(BindInputValue::Bytes(value)) if *column_type == OracleColumnType::Json => {
+                write_json_bind_raw(payload, capabilities, value)
+            }
             Some(BindInputValue::Bytes(value)) => {
                 write_bytes_with_length_for_capabilities(payload, value, capabilities)
             }
@@ -3526,6 +3961,9 @@ fn write_bind_value(
                 }
                 write_bytes_with_length_for_capabilities(payload, value.as_bytes(), capabilities)
             }
+            Some(BindInputValue::Boolean(value)) if *column_type == OracleColumnType::Json => {
+                write_json_bind_bool(payload, capabilities, *value)
+            }
             Some(BindInputValue::Boolean(value)) => {
                 if *value {
                     write_bytes_with_length(payload, &[1, 1])
@@ -3533,11 +3971,22 @@ fn write_bind_value(
                     write_bytes_with_length(payload, &[0])
                 }
             }
+            Some(BindInputValue::Date(value)) if *column_type == OracleColumnType::Json => {
+                write_json_bind_date(payload, capabilities, value)
+            }
             Some(BindInputValue::Date(value)) => {
                 write_bytes_with_length(payload, &encode_oracle_date(value, 7))
             }
+            Some(BindInputValue::Timestamp(value)) if *column_type == OracleColumnType::Json => {
+                write_json_bind_timestamp(payload, capabilities, value)
+            }
             Some(BindInputValue::Timestamp(value)) => {
                 write_bytes_with_length(payload, &encode_oracle_timestamp_bind(value))
+            }
+            Some(BindInputValue::IntervalYearMonth(value))
+                if *column_type == OracleColumnType::Json =>
+            {
+                write_json_bind_interval_ym(payload, capabilities, value)
             }
             Some(BindInputValue::IntervalYearMonth(value)) => {
                 if *column_type != OracleColumnType::IntervalYearMonth {
@@ -3547,6 +3996,11 @@ fn write_bind_value(
                 }
                 let bytes = encode_oracle_interval_ym(value)?;
                 write_bytes_with_length(payload, &bytes)
+            }
+            Some(BindInputValue::IntervalDaySecond(value))
+                if *column_type == OracleColumnType::Json =>
+            {
+                write_json_bind_interval_ds(payload, capabilities, value)
             }
             Some(BindInputValue::IntervalDaySecond(value)) => {
                 if *column_type != OracleColumnType::IntervalDaySecond {
@@ -3558,12 +4012,26 @@ fn write_bind_value(
                 write_bytes_with_length(payload, &bytes)
             }
             Some(BindInputValue::Vector(value)) => {
+                if *column_type == OracleColumnType::Json {
+                    return write_json_bind_vector(payload, capabilities, value);
+                }
                 if *column_type != OracleColumnType::Vector {
                     return Err(OracleThinError::new(
                         "Oracle VECTOR bind input requires VECTOR column type",
                     ));
                 }
                 write_vector_bind_value(payload, capabilities, value)
+            }
+            Some(BindInputValue::LobLocator(locator)) => {
+                if !matches!(
+                    *column_type,
+                    OracleColumnType::Blob | OracleColumnType::Clob | OracleColumnType::Nclob
+                ) {
+                    return Err(OracleThinError::new(
+                        "Oracle LOB locator bind input requires LOB column type",
+                    ));
+                }
+                write_bytes_with_two_lengths(payload, locator)
             }
             None if matches!(
                 bind,
@@ -3601,6 +4069,96 @@ fn write_json_bind_text(
     let json = serde_json::from_str::<JsonValue>(value)
         .map_err(|err| OracleThinError::new(format!("invalid JSON bind value: {err}")))?;
     let bytes = encode_oson_json(&json, capabilities.supports_oson_long_field_names)?;
+    write_value_based_blob_qlocator(payload, bytes.len())?;
+    write_bytes_with_length_for_capabilities(payload, &bytes, capabilities)
+}
+
+fn write_json_bind_raw(
+    payload: &mut Vec<u8>,
+    capabilities: &OracleThinCapabilities,
+    value: &[u8],
+) -> Result<(), OracleThinError> {
+    let bytes = encode_oson_raw_json(value)?;
+    write_value_based_blob_qlocator(payload, bytes.len())?;
+    write_bytes_with_length_for_capabilities(payload, &bytes, capabilities)
+}
+
+fn write_json_bind_bool(
+    payload: &mut Vec<u8>,
+    capabilities: &OracleThinCapabilities,
+    value: bool,
+) -> Result<(), OracleThinError> {
+    let bytes = encode_oson_bool_json(value)?;
+    write_value_based_blob_qlocator(payload, bytes.len())?;
+    write_bytes_with_length_for_capabilities(payload, &bytes, capabilities)
+}
+
+fn write_json_bind_number(
+    payload: &mut Vec<u8>,
+    capabilities: &OracleThinCapabilities,
+    value: &str,
+) -> Result<(), OracleThinError> {
+    let bytes = encode_oson_number_json(value)?;
+    write_value_based_blob_qlocator(payload, bytes.len())?;
+    write_bytes_with_length_for_capabilities(payload, &bytes, capabilities)
+}
+
+fn write_json_bind_string(
+    payload: &mut Vec<u8>,
+    capabilities: &OracleThinCapabilities,
+    value: &str,
+) -> Result<(), OracleThinError> {
+    let bytes = encode_oson_string_json(value)?;
+    write_value_based_blob_qlocator(payload, bytes.len())?;
+    write_bytes_with_length_for_capabilities(payload, &bytes, capabilities)
+}
+
+fn write_json_bind_date(
+    payload: &mut Vec<u8>,
+    capabilities: &OracleThinCapabilities,
+    value: &crate::OracleDateTime,
+) -> Result<(), OracleThinError> {
+    let bytes = encode_oson_date_json(value)?;
+    write_value_based_blob_qlocator(payload, bytes.len())?;
+    write_bytes_with_length_for_capabilities(payload, &bytes, capabilities)
+}
+
+fn write_json_bind_timestamp(
+    payload: &mut Vec<u8>,
+    capabilities: &OracleThinCapabilities,
+    value: &crate::OracleDateTime,
+) -> Result<(), OracleThinError> {
+    let bytes = encode_oson_timestamp_json(value)?;
+    write_value_based_blob_qlocator(payload, bytes.len())?;
+    write_bytes_with_length_for_capabilities(payload, &bytes, capabilities)
+}
+
+fn write_json_bind_interval_ym(
+    payload: &mut Vec<u8>,
+    capabilities: &OracleThinCapabilities,
+    value: &OracleIntervalYearMonth,
+) -> Result<(), OracleThinError> {
+    let bytes = encode_oson_interval_ym_json(value)?;
+    write_value_based_blob_qlocator(payload, bytes.len())?;
+    write_bytes_with_length_for_capabilities(payload, &bytes, capabilities)
+}
+
+fn write_json_bind_interval_ds(
+    payload: &mut Vec<u8>,
+    capabilities: &OracleThinCapabilities,
+    value: &OracleIntervalDaySecond,
+) -> Result<(), OracleThinError> {
+    let bytes = encode_oson_interval_ds_json(value)?;
+    write_value_based_blob_qlocator(payload, bytes.len())?;
+    write_bytes_with_length_for_capabilities(payload, &bytes, capabilities)
+}
+
+fn write_json_bind_vector(
+    payload: &mut Vec<u8>,
+    capabilities: &OracleThinCapabilities,
+    value: &OracleVectorValue,
+) -> Result<(), OracleThinError> {
+    let bytes = encode_oson_vector_json(value)?;
     write_value_based_blob_qlocator(payload, bytes.len())?;
     write_bytes_with_length_for_capabilities(payload, &bytes, capabilities)
 }
@@ -3650,6 +4208,24 @@ fn encode_oracle_bind_text(
     Ok(value.as_bytes().to_vec())
 }
 
+fn temp_lob_type_metadata(
+    column_type: OracleColumnType,
+    capabilities: &OracleThinCapabilities,
+) -> (u8, u8, Option<u16>) {
+    match column_type {
+        OracleColumnType::Blob => (0, ORA_TYPE_NUM_BLOB, None),
+        OracleColumnType::Nclob => (
+            CS_FORM_NCHAR,
+            ORA_TYPE_NUM_CLOB,
+            Some(match capabilities.ncharset_id {
+                0 => ORACLE_CHARSET_AL16UTF16,
+                charset_id => charset_id,
+            }),
+        ),
+        _ => (CS_FORM_IMPLICIT, ORA_TYPE_NUM_CLOB, Some(TNS_CHARSET_UTF8)),
+    }
+}
+
 fn encode_oracle_nchar_text(value: &str, ncharset_id: u16) -> Result<Vec<u8>, OracleThinError> {
     match ncharset_id {
         0 | ORACLE_CHARSET_AL16UTF16 => Ok(encode_utf16be_oracle_text(value)),
@@ -3693,6 +4269,34 @@ fn encode_temp_clob_text(
     encode_oracle_bind_text(value, CS_FORM_IMPLICIT, capabilities)
 }
 
+fn encode_bfile_locator(
+    directory_alias: &str,
+    file_name: &str,
+    capabilities: &OracleThinCapabilities,
+) -> Result<Vec<u8>, OracleThinError> {
+    let directory_alias = encode_oracle_bind_text(directory_alias, CS_FORM_IMPLICIT, capabilities)?;
+    let file_name = encode_oracle_bind_text(file_name, CS_FORM_IMPLICIT, capabilities)?;
+    let total_len = 20usize
+        .checked_add(directory_alias.len())
+        .and_then(|len| len.checked_add(file_name.len()))
+        .ok_or_else(|| OracleThinError::new("Oracle BFILE locator is too large"))?;
+    let locator_len = u16::try_from(total_len.saturating_sub(2))
+        .map_err(|_| OracleThinError::new("Oracle BFILE locator is too large"))?;
+    let directory_len = u16::try_from(directory_alias.len())
+        .map_err(|_| OracleThinError::new("Oracle BFILE directory alias is too large"))?;
+    let file_name_len = u16::try_from(file_name.len())
+        .map_err(|_| OracleThinError::new("Oracle BFILE file name is too large"))?;
+
+    let mut locator = Vec::with_capacity(total_len);
+    locator.extend_from_slice(&locator_len.to_be_bytes());
+    locator.extend_from_slice(&[0, 1, 8, 8, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+    locator.extend_from_slice(&directory_len.to_be_bytes());
+    locator.extend_from_slice(&directory_alias);
+    locator.extend_from_slice(&file_name_len.to_be_bytes());
+    locator.extend_from_slice(&file_name);
+    Ok(locator)
+}
+
 fn bind_text_charset_form(column_type: OracleColumnType) -> u8 {
     match column_type {
         OracleColumnType::Nclob => CS_FORM_NCHAR,
@@ -3724,9 +4328,32 @@ fn bind_column_metadata(bind: &BindValue) -> ThinColumn {
         BindValue::IntervalYearMonth(_) => (OracleColumnType::IntervalYearMonth, 5),
         BindValue::IntervalDaySecond(_) => (OracleColumnType::IntervalDaySecond, 11),
         BindValue::Vector(_) => (OracleColumnType::Vector, TNS_VECTOR_MAX_LENGTH),
+        BindValue::Json(_)
+        | BindValue::JsonBool(_)
+        | BindValue::JsonNumber(_)
+        | BindValue::JsonString(_)
+        | BindValue::JsonRaw(_)
+        | BindValue::JsonDate(_)
+        | BindValue::JsonTimestamp(_)
+        | BindValue::JsonIntervalYearMonth(_)
+        | BindValue::JsonIntervalDaySecond(_)
+        | BindValue::JsonVector(_) => (OracleColumnType::Json, TNS_JSON_MAX_LENGTH),
+        BindValue::Blob(value) => (OracleColumnType::Blob, value.len().max(1) as u32),
         BindValue::Clob(value) => (
             OracleColumnType::Clob,
             value.len().saturating_mul(4).max(1) as u32,
+        ),
+        BindValue::Nclob(value) => (
+            OracleColumnType::Nclob,
+            value.len().saturating_mul(4).max(1) as u32,
+        ),
+        BindValue::Bfile {
+            directory_alias,
+            file_name,
+        } => (
+            OracleColumnType::Bfile,
+            (20 + directory_alias.len().saturating_mul(4) + file_name.len().saturating_mul(4))
+                .max(1) as u32,
         ),
         BindValue::LobLocator {
             column_type,
@@ -3782,6 +4409,7 @@ fn bind_column_metadata(bind: &BindValue) -> ThinColumn {
     if let Some(lob_type) = bind_lob_locator_type(bind) {
         ora_type_num = match lob_type {
             OracleColumnType::Blob => ORA_TYPE_NUM_BLOB,
+            OracleColumnType::Bfile => ORA_TYPE_NUM_BFILE,
             _ => ORA_TYPE_NUM_CLOB,
         };
     }
@@ -3828,7 +4456,13 @@ fn bind_uses_timestamp_tz(bind: &BindValue) -> bool {
 
 fn bind_lob_locator_type(bind: &BindValue) -> Option<OracleColumnType> {
     match bind {
+        BindValue::Bfile { .. } => Some(OracleColumnType::Bfile),
         BindValue::LobLocator { column_type, .. } => Some(*column_type),
+        BindValue::InOut {
+            column_type,
+            value: Some(BindInputValue::LobLocator(_)),
+            ..
+        } => Some(*column_type),
         _ => None,
     }
 }
@@ -5130,8 +5764,8 @@ fn read_column_value(
             | ORA_TYPE_NUM_TIMESTAMP_TZ
             | ORA_TYPE_NUM_TIMESTAMP_DTY
             | ORA_TYPE_NUM_TIMESTAMP_TZ_EXT
-            | ORA_TYPE_NUM_TIMESTAMP_LTZ_DTY
-            | ORA_TYPE_NUM_TIMESTAMP_LTZ => {
+            | ORA_TYPE_NUM_TIMESTAMP_LTZ
+            | TNS_DATA_TYPE_ESITZ => {
                 let Some(bytes) = cursor.read_bytes()? else {
                     return finish_column_value(cursor, OracleValue::Null, out_bind);
                 };
@@ -5158,10 +5792,14 @@ fn read_column_value(
             }
             ORA_TYPE_NUM_BOOLEAN => read_boolean_value(cursor)?,
             ORA_TYPE_NUM_CLOB | TNS_DATA_TYPE_DCLOB | ORA_TYPE_NUM_BLOB | TNS_DATA_TYPE_DBLOB => {
-                cursor
-                    .read_bytes()?
-                    .map(OracleValue::Lob)
-                    .unwrap_or(OracleValue::Null)
+                if out_bind {
+                    read_lob_with_length(cursor, column)?
+                } else {
+                    cursor
+                        .read_bytes()?
+                        .map(OracleValue::Lob)
+                        .unwrap_or(OracleValue::Null)
+                }
             }
             ORA_TYPE_NUM_JSON => read_json_value(cursor)?,
             ORA_TYPE_NUM_DJSON => read_json_value(cursor)?,
@@ -5739,6 +6377,27 @@ fn read_xmltype_value(
     decode_xmltype_payload(&packed_data, capabilities)
 }
 
+fn read_lob_with_length(
+    cursor: &mut PacketCursor<'_>,
+    column: &ThinColumn,
+) -> Result<OracleValue, OracleThinError> {
+    let num_bytes = cursor.read_ub4()?;
+    if num_bytes == 0 {
+        return Ok(OracleValue::Null);
+    }
+    if !matches!(
+        column.ora_type_num,
+        ORA_TYPE_NUM_BFILE | TNS_DATA_TYPE_CFILE | ORA_TYPE_NUM_DBFILE
+    ) {
+        let _size = cursor.read_ub8()?;
+        let _chunk_size = cursor.read_ub4()?;
+    }
+    let Some(locator) = cursor.read_bytes()? else {
+        return Ok(OracleValue::Null);
+    };
+    Ok(OracleValue::Lob(locator))
+}
+
 fn decode_xmltype_payload(
     bytes: &[u8],
     capabilities: &OracleThinCapabilities,
@@ -5950,6 +6609,119 @@ fn encode_oson_json(
         out.extend_from_slice(&short_field_segment);
         out.extend_from_slice(&long_field_segment);
     }
+    out.extend_from_slice(&tree);
+    Ok(out)
+}
+
+fn encode_oson_raw_json(value: &[u8]) -> Result<Vec<u8>, OracleThinError> {
+    let mut tree = Vec::with_capacity(value.len().saturating_add(5));
+    if value.len() < 65536 {
+        tree.push(TNS_JSON_TYPE_BINARY_LENGTH_UINT16);
+        push_be_u16(&mut tree, value.len() as u16);
+    } else {
+        let len = u32::try_from(value.len())
+            .map_err(|_| OracleThinError::new("Oracle JSON raw bind value is too large"))?;
+        tree.push(TNS_JSON_TYPE_BINARY_LENGTH_UINT32);
+        push_be_u32(&mut tree, len);
+    }
+    tree.extend_from_slice(value);
+    encode_oson_scalar_tree(&tree)
+}
+
+fn encode_oson_bool_json(value: bool) -> Result<Vec<u8>, OracleThinError> {
+    let tree = if value {
+        [TNS_JSON_TYPE_TRUE]
+    } else {
+        [TNS_JSON_TYPE_FALSE]
+    };
+    encode_oson_scalar_tree(&tree)
+}
+
+fn encode_oson_number_json(value: &str) -> Result<Vec<u8>, OracleThinError> {
+    let bytes = encode_oracle_number(value)?;
+    let len = u8::try_from(bytes.len())
+        .map_err(|_| OracleThinError::new("Oracle JSON number bind is too large"))?;
+    let mut tree = Vec::with_capacity(bytes.len().saturating_add(2));
+    tree.push(TNS_JSON_TYPE_NUMBER_LENGTH_UINT8);
+    tree.push(len);
+    tree.extend_from_slice(&bytes);
+    encode_oson_scalar_tree(&tree)
+}
+
+fn encode_oson_string_json(value: &str) -> Result<Vec<u8>, OracleThinError> {
+    let mut tree = Vec::with_capacity(value.len().saturating_add(5));
+    encode_oson_string(value, &mut tree)?;
+    encode_oson_scalar_tree(&tree)
+}
+
+fn encode_oson_date_json(value: &crate::OracleDateTime) -> Result<Vec<u8>, OracleThinError> {
+    let mut tree = Vec::with_capacity(8);
+    tree.push(TNS_JSON_TYPE_DATE);
+    tree.extend_from_slice(&encode_oracle_date(value, 7));
+    encode_oson_scalar_tree(&tree)
+}
+
+fn encode_oson_timestamp_json(value: &crate::OracleDateTime) -> Result<Vec<u8>, OracleThinError> {
+    let mut tree = Vec::with_capacity(12);
+    if value.nanosecond == 0 {
+        tree.push(TNS_JSON_TYPE_TIMESTAMP7);
+        tree.extend_from_slice(&encode_oracle_date(value, 7));
+    } else {
+        tree.push(TNS_JSON_TYPE_TIMESTAMP);
+        tree.extend_from_slice(&encode_oracle_date(value, 11));
+    }
+    encode_oson_scalar_tree(&tree)
+}
+
+fn encode_oson_interval_ym_json(
+    value: &OracleIntervalYearMonth,
+) -> Result<Vec<u8>, OracleThinError> {
+    let mut tree = Vec::with_capacity(6);
+    tree.push(TNS_JSON_TYPE_INTERVAL_YM);
+    tree.extend_from_slice(&encode_oracle_interval_ym(value)?);
+    encode_oson_scalar_tree(&tree)
+}
+
+fn encode_oson_interval_ds_json(
+    value: &OracleIntervalDaySecond,
+) -> Result<Vec<u8>, OracleThinError> {
+    let mut tree = Vec::with_capacity(12);
+    tree.push(TNS_JSON_TYPE_INTERVAL_DS);
+    tree.extend_from_slice(&encode_oracle_interval_ds(value)?);
+    encode_oson_scalar_tree(&tree)
+}
+
+fn encode_oson_vector_json(value: &OracleVectorValue) -> Result<Vec<u8>, OracleThinError> {
+    let vector = encode_vector(value)?;
+    let len = u32::try_from(vector.len())
+        .map_err(|_| OracleThinError::new("Oracle JSON vector bind value is too large"))?;
+    let mut tree = Vec::with_capacity(vector.len().saturating_add(6));
+    tree.push(TNS_JSON_TYPE_EXTENDED);
+    tree.push(TNS_JSON_TYPE_VECTOR);
+    push_be_u32(&mut tree, len);
+    tree.extend_from_slice(&vector);
+    encode_oson_scalar_tree(&tree)
+}
+
+fn encode_oson_scalar_tree(tree: &[u8]) -> Result<Vec<u8>, OracleThinError> {
+    let mut flags = TNS_JSON_FLAG_INLINE_LEAF | TNS_JSON_FLAG_IS_SCALAR;
+    if tree.len() > u16::MAX as usize {
+        flags |= TNS_JSON_FLAG_TREE_SEG_UINT32;
+    }
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&[
+        TNS_JSON_MAGIC_BYTE_1,
+        TNS_JSON_MAGIC_BYTE_2,
+        TNS_JSON_MAGIC_BYTE_3,
+        TNS_JSON_VERSION_MAX_FNAME_255,
+    ]);
+    push_be_u16(&mut out, flags);
+    push_oson_segment_len(
+        &mut out,
+        tree.len(),
+        flags & TNS_JSON_FLAG_TREE_SEG_UINT32 != 0,
+    )?;
     out.extend_from_slice(&tree);
     Ok(out)
 }
@@ -6745,8 +7517,8 @@ fn oracle_column_type_from_ora_type(ora_type_num: u8) -> OracleColumnType {
         | ORA_TYPE_NUM_TIMESTAMP_TZ
         | ORA_TYPE_NUM_TIMESTAMP_DTY
         | ORA_TYPE_NUM_TIMESTAMP_TZ_EXT
-        | ORA_TYPE_NUM_TIMESTAMP_LTZ_DTY
-        | ORA_TYPE_NUM_TIMESTAMP_LTZ => OracleColumnType::Timestamp,
+        | ORA_TYPE_NUM_TIMESTAMP_LTZ
+        | TNS_DATA_TYPE_ESITZ => OracleColumnType::Timestamp,
         ORA_TYPE_NUM_RAW | TNS_DATA_TYPE_LVB | ORA_TYPE_NUM_LONG_RAW => OracleColumnType::Raw,
         ORA_TYPE_NUM_BINARY_FLOAT => OracleColumnType::BinaryFloat,
         ORA_TYPE_NUM_BINARY_DOUBLE => OracleColumnType::BinaryDouble,
@@ -10449,7 +11221,8 @@ mod tests {
     use super::{
         adjust_columns_after_define, bind_column_metadata, column_metadata_from_thin,
         column_types_may_contain_ref_cursors, column_types_require_define_fetch_for_values,
-        columns_may_contain_ref_cursors, columns_require_define_fetch_for_values, ExecuteReadState,
+        columns_may_contain_ref_cursors, columns_require_define_fetch_for_values, put_u16_be_vec,
+        write_close_temp_lobs_piggyback, write_lob_operation_request, ExecuteReadState,
         DATA_TYPE_REPRESENTATIONS, ORA_TYPE_NUM_BFILE, ORA_TYPE_NUM_BINARY_DOUBLE,
         ORA_TYPE_NUM_BINARY_FLOAT, ORA_TYPE_NUM_BLOB, ORA_TYPE_NUM_CHAR, ORA_TYPE_NUM_CLOB,
         ORA_TYPE_NUM_CURSOR, ORA_TYPE_NUM_DATE, ORA_TYPE_NUM_DBFILE, ORA_TYPE_NUM_DJSON,
@@ -10457,25 +11230,28 @@ mod tests {
         ORA_TYPE_NUM_LONG_RAW, ORA_TYPE_NUM_NUMBER, ORA_TYPE_NUM_OBJECT, ORA_TYPE_NUM_RAW,
         ORA_TYPE_NUM_ROWID, ORA_TYPE_NUM_TIMESTAMP_LTZ, ORA_TYPE_NUM_TIMESTAMP_TZ,
         ORA_TYPE_NUM_TIMESTAMP_TZ_EXT, ORA_TYPE_NUM_UROWID, ORA_TYPE_NUM_VARCHAR,
-        ORA_TYPE_NUM_VECTOR, TNS_BIND_USE_INDICATORS, TNS_CONTROL_TYPE_INBAND_NOTIFICATION,
-        TNS_CONTROL_TYPE_RESET_OOB, TNS_DATA_FLAGS_END_OF_RESPONSE, TNS_DATA_FLAGS_EOF,
-        TNS_DATA_TYPE_BINARY_INTEGER, TNS_DATA_TYPE_CFILE, TNS_DATA_TYPE_CLV, TNS_DATA_TYPE_DBLOB,
-        TNS_DATA_TYPE_DCLOB, TNS_DATA_TYPE_DOL, TNS_DATA_TYPE_DOP, TNS_DATA_TYPE_DTR,
-        TNS_DATA_TYPE_DUN, TNS_DATA_TYPE_EDATE, TNS_DATA_TYPE_EXT_NAMED, TNS_DATA_TYPE_FLOAT,
+        ORA_TYPE_NUM_VECTOR, TNS_BIND_USE_INDICATORS, TNS_CHARSET_UTF8,
+        TNS_CONTROL_TYPE_INBAND_NOTIFICATION, TNS_CONTROL_TYPE_RESET_OOB,
+        TNS_DATA_FLAGS_END_OF_RESPONSE, TNS_DATA_FLAGS_EOF, TNS_DATA_TYPE_BINARY_INTEGER,
+        TNS_DATA_TYPE_CFILE, TNS_DATA_TYPE_CLV, TNS_DATA_TYPE_DBLOB, TNS_DATA_TYPE_DCLOB,
+        TNS_DATA_TYPE_DOL, TNS_DATA_TYPE_DOP, TNS_DATA_TYPE_DTR, TNS_DATA_TYPE_DUN,
+        TNS_DATA_TYPE_EDATE, TNS_DATA_TYPE_ESITZ, TNS_DATA_TYPE_EXT_NAMED, TNS_DATA_TYPE_FLOAT,
         TNS_DATA_TYPE_LVB, TNS_DATA_TYPE_LVC, TNS_DATA_TYPE_ODT, TNS_DATA_TYPE_PDN,
         TNS_DATA_TYPE_PNTY, TNS_DATA_TYPE_RDD, TNS_DATA_TYPE_RSET, TNS_DATA_TYPE_SLS,
         TNS_DATA_TYPE_STR, TNS_DATA_TYPE_TIME, TNS_DATA_TYPE_TIME_TZ, TNS_DATA_TYPE_UB8,
         TNS_DATA_TYPE_UIN, TNS_DATA_TYPE_VBI, TNS_DATA_TYPE_VCS, TNS_DATA_TYPE_VNU,
-        TNS_DATA_TYPE_VST, TNS_ERR_INBAND_MESSAGE, TNS_EXEC_FLAGS_IMPLICIT_RESULTSET,
+        TNS_DATA_TYPE_VST, TNS_DEFAULT_SDU, TNS_DURATION_SESSION, TNS_ERR_INBAND_MESSAGE,
+        TNS_EXEC_FLAGS_IMPLICIT_RESULTSET, TNS_FUNC_LOB_OP, TNS_FUNC_PING,
         TNS_LOB_LOC_FLAGS_LITTLE_ENDIAN, TNS_LOB_LOC_FLAGS_VAR_LENGTH_CHARSET,
-        TNS_LOB_LOC_OFFSET_FLAG_3, TNS_LOB_LOC_OFFSET_FLAG_4, TNS_LOB_PREFETCH_FLAG,
-        TNS_MARKER_TYPE_BREAK, TNS_MARKER_TYPE_INTERRUPT, TNS_MARKER_TYPE_RESET,
-        TNS_MAX_LONG_LENGTH, TNS_MSG_TYPE_END_OF_RESPONSE, TNS_PACKET_TYPE_CONTROL,
-        TNS_PACKET_TYPE_DATA, TNS_PACKET_TYPE_MARKER, TNS_VECTOR_FLAG_NORM,
-        TNS_VECTOR_FLAG_NORM_RESERVED, TNS_VECTOR_FLAG_SPARSE, TNS_VECTOR_FORMAT_BINARY,
-        TNS_VECTOR_FORMAT_FLOAT32, TNS_VECTOR_FORMAT_FLOAT64, TNS_VECTOR_FORMAT_INT8,
-        TNS_VECTOR_MAGIC_BYTE, TNS_VECTOR_VERSION_BASE, TNS_VECTOR_VERSION_WITH_BINARY,
-        TNS_VECTOR_VERSION_WITH_SPARSE,
+        TNS_LOB_LOC_OFFSET_FLAG_3, TNS_LOB_LOC_OFFSET_FLAG_4, TNS_LOB_OP_ARRAY,
+        TNS_LOB_OP_CREATE_TEMP, TNS_LOB_OP_FREE_TEMP, TNS_LOB_PREFETCH_FLAG, TNS_MARKER_TYPE_BREAK,
+        TNS_MARKER_TYPE_INTERRUPT, TNS_MARKER_TYPE_RESET, TNS_MAX_LONG_LENGTH,
+        TNS_MSG_TYPE_END_OF_RESPONSE, TNS_MSG_TYPE_FUNCTION, TNS_MSG_TYPE_PIGGYBACK,
+        TNS_MSG_TYPE_STATUS, TNS_PACKET_TYPE_CONTROL, TNS_PACKET_TYPE_DATA, TNS_PACKET_TYPE_MARKER,
+        TNS_VECTOR_FLAG_NORM, TNS_VECTOR_FLAG_NORM_RESERVED, TNS_VECTOR_FLAG_SPARSE,
+        TNS_VECTOR_FORMAT_BINARY, TNS_VECTOR_FORMAT_FLOAT32, TNS_VECTOR_FORMAT_FLOAT64,
+        TNS_VECTOR_FORMAT_INT8, TNS_VECTOR_MAGIC_BYTE, TNS_VECTOR_VERSION_BASE,
+        TNS_VECTOR_VERSION_WITH_BINARY, TNS_VECTOR_VERSION_WITH_SPARSE,
     };
     use super::{
         adjust_for_server_compile_caps, adjust_for_server_runtime_caps, capabilities_from_accept,
@@ -10483,9 +11259,12 @@ mod tests {
         decode_oracle_binary_float, decode_oracle_datetime, decode_oracle_interval_ds,
         decode_oracle_interval_ym, decode_oracle_number, decode_oracle_text, decode_oracle_vector,
         decode_oson_to_json, default_ttc_field_version, define_column_metadata,
-        derive_auth_combo_key, des_encrypt_block, encode_oracle_binary_double,
-        encode_oracle_binary_float, encode_oracle_bind_text, encode_oracle_number,
-        encode_oracle_timestamp_bind, encode_oson_json, encode_physical_rowid,
+        derive_auth_combo_key, des_encrypt_block, encode_bfile_locator,
+        encode_oracle_binary_double, encode_oracle_binary_float, encode_oracle_bind_text,
+        encode_oracle_number, encode_oracle_timestamp_bind, encode_oson_bool_json,
+        encode_oson_date_json, encode_oson_interval_ds_json, encode_oson_interval_ym_json,
+        encode_oson_json, encode_oson_number_json, encode_oson_raw_json, encode_oson_string_json,
+        encode_oson_timestamp_json, encode_oson_vector_json, encode_physical_rowid,
         encode_temp_clob_text, encode_vector, execute_flags_for_request,
         generate_10g_password_hash, generate_11g_password_hash,
         generate_auth_credentials_from_session_key_parts, hex_encode_upper,
@@ -10511,7 +11290,7 @@ mod tests {
         TNS_MSG_TYPE_PROTOCOL, TNS_MSG_TYPE_ROW_DATA, TNS_MSG_TYPE_SERVER_SIDE_PIGGYBACK,
         TNS_OBJ_NO_PREFIX_SEG, TNS_RCAP_TTC, TNS_RCAP_TTC_32K, TNS_RCAP_TTC_SESSION_STATE_OPS,
         TNS_RCAP_TTC_ZERO_COPY, TNS_SERVER_PIGGYBACK_TRACE_EVENT, TNS_VERIFIER_TYPE_10G,
-        TNS_VERIFIER_TYPE_11G_1, TNS_VERIFIER_TYPE_11G_2, TNS_VERIFIER_TYPE_12C,
+        TNS_VERIFIER_TYPE_11G_1, TNS_VERIFIER_TYPE_11G_2, TNS_VERIFIER_TYPE_12C, TNS_XML_TYPE_LOB,
         TNS_XML_TYPE_STRING,
     };
     use crate::connect::{AcceptInfo, ConnectOptions, ConnectTarget};
@@ -10559,6 +11338,10 @@ mod tests {
     }
 
     fn read_one_tns_test_packet(stream: &mut TcpStream, protocol_version: u16) {
+        let _ = read_tns_test_packet(stream, protocol_version);
+    }
+
+    fn read_tns_test_packet(stream: &mut TcpStream, protocol_version: u16) -> Vec<u8> {
         let mut header = [0u8; 8];
         stream.read_exact(&mut header).unwrap();
         let size = if protocol_version >= 315 {
@@ -10568,6 +11351,7 @@ mod tests {
         };
         let mut body = vec![0u8; size - 8];
         stream.read_exact(&mut body).unwrap();
+        body
     }
 
     #[test]
@@ -10966,6 +11750,145 @@ mod tests {
 
         drop(session);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn close_temp_lobs_piggyback_uses_free_temp_array_operation() {
+        let mut payload = Vec::new();
+        let locators = [vec![1, 2, 3], vec![4, 5]];
+        write_close_temp_lobs_piggyback(
+            &mut payload,
+            &OracleThinCapabilities::default(),
+            7,
+            &locators,
+        )
+        .unwrap();
+        let mut expected = vec![TNS_MSG_TYPE_PIGGYBACK, TNS_FUNC_LOB_OP, 7, 1];
+        write_ub4(&mut expected, 5);
+        expected.push(0);
+        write_ub4(&mut expected, 0);
+        write_ub4(&mut expected, 0);
+        write_ub4(&mut expected, 0);
+        expected.extend_from_slice(&[0, 0, 0]);
+        write_ub4(&mut expected, TNS_LOB_OP_FREE_TEMP | TNS_LOB_OP_ARRAY);
+        expected.push(0);
+        write_ub4(&mut expected, 0);
+        write_ub8(&mut expected, 0);
+        write_ub8(&mut expected, 0);
+        expected.extend_from_slice(&[0, 0]);
+        write_ub4(&mut expected, 0);
+        expected.push(0);
+        write_ub4(&mut expected, 0);
+        expected.push(0);
+        write_ub4(&mut expected, 0);
+        expected.extend_from_slice(&[1, 2, 3, 4, 5]);
+
+        assert_eq!(payload, expected);
+    }
+
+    #[test]
+    fn create_temp_lob_request_includes_charset_pointer_like_python_oracledb() {
+        let locator = vec![0; 40];
+        let mut payload = Vec::new();
+        write_lob_operation_request(
+            &mut payload,
+            &OracleThinCapabilities::default(),
+            9,
+            &locator,
+            TNS_LOB_OP_CREATE_TEMP,
+            u64::from(CS_FORM_IMPLICIT),
+            u64::from(ORA_TYPE_NUM_BLOB),
+            TNS_DURATION_SESSION,
+            None,
+            Some(TNS_CHARSET_UTF8),
+        )
+        .unwrap();
+
+        let mut expected = vec![TNS_MSG_TYPE_FUNCTION, TNS_FUNC_LOB_OP, 9, 1];
+        write_ub4(&mut expected, locator.len() as u32);
+        expected.push(0);
+        write_ub4(&mut expected, TNS_DURATION_SESSION);
+        write_ub4(&mut expected, 0);
+        write_ub4(&mut expected, 0);
+        expected.extend_from_slice(&[1, 0, 1]);
+        write_ub4(&mut expected, TNS_LOB_OP_CREATE_TEMP);
+        expected.extend_from_slice(&[0, 0]);
+        write_ub8(&mut expected, u64::from(CS_FORM_IMPLICIT));
+        write_ub8(&mut expected, u64::from(ORA_TYPE_NUM_BLOB));
+        expected.push(0);
+        put_u16_be_vec(&mut expected, 0);
+        put_u16_be_vec(&mut expected, 0);
+        put_u16_be_vec(&mut expected, 0);
+        expected.extend_from_slice(&locator);
+        write_ub4(&mut expected, u32::from(TNS_CHARSET_UTF8));
+
+        assert_eq!(payload, expected);
+    }
+
+    #[test]
+    fn temp_lob_create_failure_frees_created_locator() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let locator = vec![0x42; 40];
+        let expected_locator = locator.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _create_request = read_tns_test_packet(&mut stream, 319);
+
+            let mut create_response = vec![TNS_MSG_TYPE_PARAMETER];
+            create_response.extend_from_slice(&locator);
+            write_ub2(&mut create_response, 0);
+            create_response.push(0);
+            create_response.push(TNS_MSG_TYPE_STATUS);
+            write_ub4(&mut create_response, 0);
+            write_ub2(&mut create_response, 0);
+            write_data_packet(&mut stream, 319, TNS_DEFAULT_SDU, &create_response).unwrap();
+
+            let free_request = read_tns_test_packet(&mut stream, 319);
+            let mut free_response = vec![TNS_MSG_TYPE_STATUS];
+            write_ub4(&mut free_response, 0);
+            write_ub2(&mut free_response, 0);
+            write_data_packet(&mut stream, 319, TNS_DEFAULT_SDU, &free_response).unwrap();
+            free_request
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut session = test_session_with_stream(stream);
+        session.capabilities.protocol_version = Some(319);
+        session.capabilities.ncharset_id = 9999;
+
+        let err = session
+            .create_temp_nclob("\u{D55C}")
+            .expect_err("unsupported ncharset should fail after temp LOB create");
+        assert!(err
+            .to_string()
+            .contains("national character set id 9999 is not supported"));
+        drop(session);
+
+        let free_request = server.join().unwrap();
+        let mut cursor =
+            PacketCursor::with_capabilities(&free_request[2..], &OracleThinCapabilities::default());
+        assert_eq!(cursor.read_u8().unwrap(), TNS_MSG_TYPE_PIGGYBACK);
+        assert_eq!(cursor.read_u8().unwrap(), TNS_FUNC_LOB_OP);
+        let _sequence = cursor.read_u8().unwrap();
+        assert_eq!(cursor.read_u8().unwrap(), 1);
+        assert_eq!(cursor.read_ub4().unwrap(), expected_locator.len() as u32);
+        assert_eq!(cursor.read_u8().unwrap(), 0);
+        assert_eq!(cursor.read_ub4().unwrap(), 0);
+        assert_eq!(cursor.read_ub4().unwrap(), 0);
+        assert_eq!(cursor.read_ub4().unwrap(), 0);
+        assert_eq!(cursor.read_u8().unwrap(), 0);
+        assert_eq!(cursor.read_u8().unwrap(), 0);
+        assert_eq!(cursor.read_u8().unwrap(), 0);
+        assert_eq!(
+            cursor.read_ub4().unwrap(),
+            TNS_LOB_OP_FREE_TEMP | TNS_LOB_OP_ARRAY
+        );
+        assert!(free_request
+            .windows(expected_locator.len())
+            .any(|window| window == expected_locator.as_slice()));
+        assert!(free_request
+            .windows(2)
+            .any(|window| { window == [TNS_MSG_TYPE_FUNCTION, TNS_FUNC_PING] }));
     }
 
     #[test]
@@ -11445,17 +12368,32 @@ mod tests {
             assert_eq!(&encoded[5..9], &expected_count.to_be_bytes());
             assert_eq!(&encoded[9..17], &0u64.to_be_bytes());
             assert_eq!(decode_oracle_vector(&encoded).unwrap(), expected);
+            assert_eq!(
+                decode_oson_to_json(&encode_oson_vector_json(&value).unwrap()).unwrap(),
+                expected
+            );
 
             let mut payload = Vec::new();
             write_bind_value(
                 &mut payload,
                 &OracleThinCapabilities::default(),
-                &BindValue::Vector(value),
+                &BindValue::Vector(value.clone()),
             )
             .unwrap();
             assert!(payload.starts_with(&[1, 40, 40]));
             assert_eq!(&payload[3..7], &[0, 38, 0, 4]);
             assert_eq!(decode_oracle_vector(&payload[44..]).unwrap(), expected);
+
+            let mut payload = Vec::new();
+            write_bind_value(
+                &mut payload,
+                &OracleThinCapabilities::default(),
+                &BindValue::JsonVector(value),
+            )
+            .unwrap();
+            assert!(payload.starts_with(&[1, 40, 40]));
+            assert_eq!(&payload[3..7], &[0, 38, 0, 4]);
+            assert_eq!(decode_oson_to_json(&payload[44..]).unwrap(), expected);
         }
     }
 
@@ -11628,6 +12566,46 @@ mod tests {
         .unwrap();
         assert_eq!(payload[0], rowid.len() as u8);
         assert_eq!(&payload[1..], rowid.as_bytes());
+    }
+
+    #[test]
+    fn encodes_bfile_binds_like_go_ora_locator_shape() {
+        let caps = OracleThinCapabilities::default();
+        let bind = BindValue::Bfile {
+            directory_alias: "dir".to_string(),
+            file_name: "file".to_string(),
+        };
+        let locator = encode_bfile_locator("dir", "file", &caps).unwrap();
+
+        assert_eq!(
+            locator,
+            vec![
+                0, 25, 0, 1, 8, 8, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, b'd', b'i', b'r', 0, 4,
+                b'f', b'i', b'l', b'e',
+            ]
+        );
+        let metadata = bind_column_metadata(&bind);
+        assert_eq!(metadata.column_type, OracleColumnType::Bfile);
+        assert_eq!(metadata.ora_type_num, ORA_TYPE_NUM_BFILE);
+
+        let mut expected = Vec::new();
+        write_bytes_with_two_lengths(&mut expected, &locator).unwrap();
+        let mut payload = Vec::new();
+        write_bind_value(&mut payload, &caps, &bind).unwrap();
+        assert_eq!(payload, expected);
+    }
+
+    #[test]
+    fn bfile_lob_locator_bind_metadata_uses_bfile_type() {
+        let bind = BindValue::LobLocator {
+            column_type: OracleColumnType::Bfile,
+            locator: vec![1, 2, 3],
+        };
+        let metadata = bind_column_metadata(&bind);
+
+        assert_eq!(metadata.column_type, OracleColumnType::Bfile);
+        assert_eq!(metadata.ora_type_num, ORA_TYPE_NUM_BFILE);
+        assert_eq!(metadata.buffer_size, 3);
     }
 
     #[test]
@@ -11915,6 +12893,29 @@ mod tests {
         let mut payload = Vec::new();
         write_bind_rows_for_request(&mut payload, &caps, &request)
             .expect("write non-PL/SQL bind rows");
+
+        assert_eq!(payload, expected);
+    }
+
+    #[test]
+    fn non_plsql_bind_rows_keep_value_based_lob_payloads_with_their_locators() {
+        let caps = OracleThinCapabilities::default();
+        let json = BindValue::Json(r#"{"a":1}"#.to_string());
+        let small = BindValue::Number("2".to_string());
+        let vector = BindValue::Vector(OracleVectorValue::Float32(vec![1.0, 2.0]));
+        let mut request = StatementRequest::statement("UPDATE t SET j = :1, v = :3 WHERE id = :2");
+        request.binds.push(json.clone());
+        request.binds.push(small.clone());
+        request.binds.push(vector.clone());
+
+        let mut expected = vec![TNS_MSG_TYPE_ROW_DATA];
+        write_bind_value(&mut expected, &caps, &json).expect("write JSON bind");
+        write_bind_value(&mut expected, &caps, &small).expect("write small bind");
+        write_bind_value(&mut expected, &caps, &vector).expect("write VECTOR bind");
+
+        let mut payload = Vec::new();
+        write_bind_rows_for_request(&mut payload, &caps, &request)
+            .expect("write non-PL/SQL value-based LOB bind rows");
 
         assert_eq!(payload, expected);
     }
@@ -12595,6 +13596,16 @@ mod tests {
                 10,
             ),
             (
+                u16::from(ORA_TYPE_NUM_TIMESTAMP_LTZ),
+                u16::from(ORA_TYPE_NUM_TIMESTAMP_LTZ),
+                1,
+            ),
+            (
+                u16::from(TNS_DATA_TYPE_ESITZ),
+                u16::from(ORA_TYPE_NUM_TIMESTAMP_LTZ),
+                1,
+            ),
+            (
                 u16::from(TNS_DATA_TYPE_DCLOB),
                 u16::from(ORA_TYPE_NUM_CLOB),
                 1,
@@ -12660,6 +13671,36 @@ mod tests {
         assert!(entries.contains(&(515, 0)));
         assert!(entries.contains(&(899, 899)));
         assert_eq!(pos, payload.len());
+    }
+
+    #[test]
+    fn data_type_negotiation_keeps_timestamp_ltz_alias_like_vendors() {
+        let mut payload = Vec::new();
+        write_data_type_representations(&mut payload);
+        let mut pos = 0;
+        let mut entries = Vec::new();
+        loop {
+            let data_type = u16::from_be_bytes([payload[pos], payload[pos + 1]]);
+            pos += 2;
+            if data_type == 0 {
+                break;
+            }
+            let conv_data_type = u16::from_be_bytes([payload[pos], payload[pos + 1]]);
+            pos += 2;
+            entries.push((data_type, conv_data_type));
+            if conv_data_type != 0 {
+                pos += 4;
+            }
+        }
+
+        assert!(entries.contains(&(
+            u16::from(ORA_TYPE_NUM_TIMESTAMP_LTZ),
+            u16::from(ORA_TYPE_NUM_TIMESTAMP_LTZ)
+        )));
+        assert!(entries.contains(&(
+            u16::from(TNS_DATA_TYPE_ESITZ),
+            u16::from(ORA_TYPE_NUM_TIMESTAMP_LTZ)
+        )));
     }
 
     #[test]
@@ -13260,6 +14301,86 @@ mod tests {
             r#"{"added":2,"input":"ok","nested":[true,false,null]}"#
         );
 
+        let raw = b"A raw value";
+        let raw_encoded = encode_oson_raw_json(raw).unwrap();
+        assert_eq!(
+            decode_oson_to_json(&raw_encoded).unwrap(),
+            r#"{"$rawhex":"41207261772076616c7565"}"#
+        );
+        assert_eq!(
+            raw_encoded,
+            vec![
+                0xff, 0x4a, 0x5a, 0x01, 0x00, 0x12, 0x00, 0x0e, 0x3a, 0x00, 0x0b, b'A', b' ', b'r',
+                b'a', b'w', b' ', b'v', b'a', b'l', b'u', b'e',
+            ]
+        );
+
+        assert_eq!(
+            decode_oson_to_json(&encode_oson_bool_json(true).unwrap()).unwrap(),
+            "true"
+        );
+        assert_eq!(
+            decode_oson_to_json(&encode_oson_number_json("25.25").unwrap()).unwrap(),
+            "25.25"
+        );
+        assert_eq!(
+            decode_oson_to_json(&encode_oson_string_json("String 1").unwrap()).unwrap(),
+            r#""String 1""#
+        );
+
+        let date = crate::OracleDateTime {
+            year: 2002,
+            month: 12,
+            day: 13,
+            hour: 0,
+            minute: 0,
+            second: 0,
+            nanosecond: 0,
+            timezone_offset_minutes: None,
+            timezone_region_id: None,
+        };
+        assert_eq!(
+            decode_oson_to_json(&encode_oson_date_json(&date).unwrap()).unwrap(),
+            r#""2002-12-13T00:00:00""#
+        );
+
+        let timestamp = crate::OracleDateTime {
+            year: 2020,
+            month: 12,
+            day: 2,
+            hour: 13,
+            minute: 29,
+            second: 14,
+            nanosecond: 123_456_000,
+            timezone_offset_minutes: None,
+            timezone_region_id: None,
+        };
+        assert_eq!(
+            decode_oson_to_json(&encode_oson_timestamp_json(&timestamp).unwrap()).unwrap(),
+            r#""2020-12-02T13:29:14.123456""#
+        );
+
+        let interval_ym = OracleIntervalYearMonth {
+            years: 2,
+            months: 3,
+        };
+        assert_eq!(
+            decode_oson_to_json(&encode_oson_interval_ym_json(&interval_ym).unwrap()).unwrap(),
+            r#""+02-03""#
+        );
+
+        let interval_ds = OracleIntervalDaySecond {
+            days: 8,
+            hours: 12,
+            minutes: 0,
+            seconds: 0,
+            nanoseconds: 0,
+        };
+        assert_eq!(
+            decode_oson_to_json(&encode_oson_interval_ds_json(&interval_ds).unwrap()).unwrap(),
+            r#""+08 12:00:00.000000""#
+        );
+
         let long_name = "k".repeat(300);
         let long_name_value = serde_json::json!({
             long_name.clone(): "ok",
@@ -13298,6 +14419,150 @@ mod tests {
         assert_eq!(
             decode_oson_to_json(&bind_payload[44..]).unwrap(),
             r#"{"input":"ok"}"#
+        );
+
+        let bind = BindValue::Json(r#"{"input":"ok"}"#.to_string());
+        let metadata = bind_column_metadata(&bind);
+        assert_eq!(metadata.column_type, OracleColumnType::Json);
+        assert_eq!(metadata.ora_type_num, ORA_TYPE_NUM_JSON);
+        assert_eq!(metadata.buffer_size, TNS_JSON_MAX_LENGTH);
+        let mut bind_payload = Vec::new();
+        write_bind_value(&mut bind_payload, &OracleThinCapabilities::default(), &bind).unwrap();
+        assert!(bind_payload.starts_with(&[1, 40, 40]));
+        assert_eq!(&bind_payload[3..7], &[0, 38, 0, 4]);
+        assert_eq!(
+            decode_oson_to_json(&bind_payload[44..]).unwrap(),
+            r#"{"input":"ok"}"#
+        );
+
+        let bind = BindValue::JsonRaw(raw.to_vec());
+        let metadata = bind_column_metadata(&bind);
+        assert_eq!(metadata.column_type, OracleColumnType::Json);
+        assert_eq!(metadata.ora_type_num, ORA_TYPE_NUM_JSON);
+        assert_eq!(metadata.buffer_size, TNS_JSON_MAX_LENGTH);
+        let mut bind_payload = Vec::new();
+        write_bind_value(&mut bind_payload, &OracleThinCapabilities::default(), &bind).unwrap();
+        assert!(bind_payload.starts_with(&[1, 40, 40]));
+        assert_eq!(&bind_payload[3..7], &[0, 38, 0, 4]);
+        assert_eq!(
+            decode_oson_to_json(&bind_payload[44..]).unwrap(),
+            r#"{"$rawhex":"41207261772076616c7565"}"#
+        );
+
+        let bind = BindValue::JsonString("String 1".to_string());
+        let metadata = bind_column_metadata(&bind);
+        assert_eq!(metadata.column_type, OracleColumnType::Json);
+        assert_eq!(metadata.ora_type_num, ORA_TYPE_NUM_JSON);
+        assert_eq!(metadata.buffer_size, TNS_JSON_MAX_LENGTH);
+        let mut bind_payload = Vec::new();
+        write_bind_value(&mut bind_payload, &OracleThinCapabilities::default(), &bind).unwrap();
+        assert!(bind_payload.starts_with(&[1, 40, 40]));
+        assert_eq!(&bind_payload[3..7], &[0, 38, 0, 4]);
+        assert_eq!(
+            decode_oson_to_json(&bind_payload[44..]).unwrap(),
+            r#""String 1""#
+        );
+
+        let bind = BindValue::JsonNumber("25.25".to_string());
+        let metadata = bind_column_metadata(&bind);
+        assert_eq!(metadata.column_type, OracleColumnType::Json);
+        assert_eq!(metadata.ora_type_num, ORA_TYPE_NUM_JSON);
+        assert_eq!(metadata.buffer_size, TNS_JSON_MAX_LENGTH);
+        let mut bind_payload = Vec::new();
+        write_bind_value(&mut bind_payload, &OracleThinCapabilities::default(), &bind).unwrap();
+        assert!(bind_payload.starts_with(&[1, 40, 40]));
+        assert_eq!(&bind_payload[3..7], &[0, 38, 0, 4]);
+        assert_eq!(decode_oson_to_json(&bind_payload[44..]).unwrap(), "25.25");
+
+        let bind = BindValue::JsonBool(false);
+        let metadata = bind_column_metadata(&bind);
+        assert_eq!(metadata.column_type, OracleColumnType::Json);
+        assert_eq!(metadata.ora_type_num, ORA_TYPE_NUM_JSON);
+        assert_eq!(metadata.buffer_size, TNS_JSON_MAX_LENGTH);
+        let mut bind_payload = Vec::new();
+        write_bind_value(&mut bind_payload, &OracleThinCapabilities::default(), &bind).unwrap();
+        assert!(bind_payload.starts_with(&[1, 40, 40]));
+        assert_eq!(&bind_payload[3..7], &[0, 38, 0, 4]);
+        assert_eq!(decode_oson_to_json(&bind_payload[44..]).unwrap(), "false");
+
+        let bind = BindValue::JsonTimestamp(timestamp);
+        let metadata = bind_column_metadata(&bind);
+        assert_eq!(metadata.column_type, OracleColumnType::Json);
+        assert_eq!(metadata.ora_type_num, ORA_TYPE_NUM_JSON);
+        assert_eq!(metadata.buffer_size, TNS_JSON_MAX_LENGTH);
+        let mut bind_payload = Vec::new();
+        write_bind_value(&mut bind_payload, &OracleThinCapabilities::default(), &bind).unwrap();
+        assert!(bind_payload.starts_with(&[1, 40, 40]));
+        assert_eq!(&bind_payload[3..7], &[0, 38, 0, 4]);
+        assert_eq!(
+            decode_oson_to_json(&bind_payload[44..]).unwrap(),
+            r#""2020-12-02T13:29:14.123456""#
+        );
+
+        let mut bind_payload = Vec::new();
+        write_bind_value(
+            &mut bind_payload,
+            &OracleThinCapabilities::default(),
+            &BindValue::InOut {
+                column_type: OracleColumnType::Json,
+                max_len: 1024,
+                value: Some(BindInputValue::Bytes(raw.to_vec())),
+            },
+        )
+        .unwrap();
+        assert!(bind_payload.starts_with(&[1, 40, 40]));
+        assert_eq!(&bind_payload[3..7], &[0, 38, 0, 4]);
+        assert_eq!(
+            decode_oson_to_json(&bind_payload[44..]).unwrap(),
+            r#"{"$rawhex":"41207261772076616c7565"}"#
+        );
+
+        let mut bind_payload = Vec::new();
+        write_bind_value(
+            &mut bind_payload,
+            &OracleThinCapabilities::default(),
+            &BindValue::InOut {
+                column_type: OracleColumnType::Json,
+                max_len: 1024,
+                value: Some(BindInputValue::Number("25.25".to_string())),
+            },
+        )
+        .unwrap();
+        assert!(bind_payload.starts_with(&[1, 40, 40]));
+        assert_eq!(&bind_payload[3..7], &[0, 38, 0, 4]);
+        assert_eq!(decode_oson_to_json(&bind_payload[44..]).unwrap(), "25.25");
+
+        let mut bind_payload = Vec::new();
+        write_bind_value(
+            &mut bind_payload,
+            &OracleThinCapabilities::default(),
+            &BindValue::InOut {
+                column_type: OracleColumnType::Json,
+                max_len: 1024,
+                value: Some(BindInputValue::Boolean(true)),
+            },
+        )
+        .unwrap();
+        assert!(bind_payload.starts_with(&[1, 40, 40]));
+        assert_eq!(&bind_payload[3..7], &[0, 38, 0, 4]);
+        assert_eq!(decode_oson_to_json(&bind_payload[44..]).unwrap(), "true");
+
+        let mut bind_payload = Vec::new();
+        write_bind_value(
+            &mut bind_payload,
+            &OracleThinCapabilities::default(),
+            &BindValue::InOut {
+                column_type: OracleColumnType::Json,
+                max_len: 1024,
+                value: Some(BindInputValue::IntervalDaySecond(interval_ds)),
+            },
+        )
+        .unwrap();
+        assert!(bind_payload.starts_with(&[1, 40, 40]));
+        assert_eq!(&bind_payload[3..7], &[0, 38, 0, 4]);
+        assert_eq!(
+            decode_oson_to_json(&bind_payload[44..]).unwrap(),
+            r#""+08 12:00:00.000000""#
         );
     }
 
@@ -13425,6 +14690,45 @@ mod tests {
         assert_eq!(
             state.rows,
             vec![vec![OracleValue::Text("<root>ok</root>".to_string())]]
+        );
+    }
+
+    #[test]
+    fn row_scanner_decodes_xmltype_lob_payload_as_locator() {
+        let mut state = ExecuteReadState::default();
+        state.columns = vec![ThinColumn {
+            name: "X".to_string(),
+            column_type: OracleColumnType::Xml,
+            ora_type_num: ORA_TYPE_NUM_OBJECT,
+            charset_form: 0,
+            buffer_size: TNS_MAX_LONG_LENGTH,
+            schema_name: String::new(),
+            type_name: String::new(),
+        }];
+        let mut xml_payload = vec![TNS_OBJ_NO_PREFIX_SEG, 1, 0, 1];
+        xml_payload.extend_from_slice(&TNS_XML_TYPE_LOB.to_be_bytes());
+        xml_payload.extend_from_slice(b"xml-locator");
+
+        let mut row = Vec::new();
+        write_ub4(&mut row, 0);
+        write_ub4(&mut row, 0);
+        write_ub4(&mut row, 0);
+        write_ub2(&mut row, 0);
+        write_ub4(&mut row, xml_payload.len() as u32);
+        write_ub2(&mut row, 0);
+        write_bytes_with_length_for_capabilities(
+            &mut row,
+            &xml_payload,
+            &OracleThinCapabilities::default(),
+        )
+        .unwrap();
+        let mut cursor = PacketCursor::with_capabilities(&row, &OracleThinCapabilities::default());
+
+        process_row_data(&mut cursor, &OracleThinCapabilities::default(), &mut state).unwrap();
+
+        assert_eq!(
+            state.rows,
+            vec![vec![OracleValue::Lob(b"xml-locator".to_vec())]]
         );
     }
 

@@ -138,7 +138,10 @@ impl Target {
             vec![
                 ("anonymous PL/SQL block (no DML)", "BEGIN NULL; END;"),
                 ("EXEC procedure", "BEGIN SQ_NOOP_PROC; END;"),
-                ("function via SELECT", "SELECT SQ_NOOP_FUNC() AS V FROM dual"),
+                (
+                    "function via SELECT",
+                    "SELECT SQ_NOOP_FUNC() AS V FROM dual",
+                ),
                 (
                     "function via PL/SQL OUT bind",
                     "DECLARE v NUMBER; BEGIN v := SQ_NOOP_FUNC(); END;",
