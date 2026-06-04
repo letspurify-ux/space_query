@@ -13,10 +13,14 @@ use crate::OracleDateTime;
 pub enum OracleColumnType {
     Varchar,
     Number,
+    BinaryFloat,
+    BinaryDouble,
     Date,
     Timestamp,
     Boolean,
     Raw,
+    Rowid,
+    Urowid,
     Long,
     Clob,
     Nclob,
@@ -31,25 +35,39 @@ pub enum OracleColumnType {
     Unsupported(u8),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum BindInputValue {
     Number(String),
+    BinaryFloat(f32),
+    BinaryDouble(f64),
     Text(String),
     Bytes(Vec<u8>),
+    Rowid(String),
+    Urowid(String),
     Boolean(bool),
     Date(OracleDateTime),
     Timestamp(OracleDateTime),
+    IntervalYearMonth(OracleIntervalYearMonth),
+    IntervalDaySecond(OracleIntervalDaySecond),
+    Vector(OracleVectorValue),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum BindValue {
     Null(OracleColumnType),
     Number(String),
+    BinaryFloat(f32),
+    BinaryDouble(f64),
     Text(String),
     Bytes(Vec<u8>),
+    Rowid(String),
+    Urowid(String),
     Boolean(bool),
     Date(OracleDateTime),
     Timestamp(OracleDateTime),
+    IntervalYearMonth(OracleIntervalYearMonth),
+    IntervalDaySecond(OracleIntervalDaySecond),
+    Vector(OracleVectorValue),
     Out {
         column_type: OracleColumnType,
         max_len: u32,
@@ -58,6 +76,44 @@ pub enum BindValue {
         column_type: OracleColumnType,
         max_len: u32,
         value: Option<BindInputValue>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OracleIntervalYearMonth {
+    pub years: i32,
+    pub months: i8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OracleIntervalDaySecond {
+    pub days: i32,
+    pub hours: i8,
+    pub minutes: i8,
+    pub seconds: i8,
+    pub nanoseconds: i32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum OracleVectorValue {
+    Float32(Vec<f32>),
+    Float64(Vec<f64>),
+    Int8(Vec<i8>),
+    Binary(Vec<u8>),
+    SparseFloat32 {
+        num_dimensions: u32,
+        indices: Vec<u32>,
+        values: Vec<f32>,
+    },
+    SparseFloat64 {
+        num_dimensions: u32,
+        indices: Vec<u32>,
+        values: Vec<f64>,
+    },
+    SparseInt8 {
+        num_dimensions: u32,
+        indices: Vec<u32>,
+        values: Vec<i8>,
     },
 }
 

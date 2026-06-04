@@ -2,7 +2,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use tns_thin::exec::{BindInputValue, BindValue, OracleColumnType, OracleValue, StatementRequest};
+use tns_thin::exec::{
+    BindInputValue, BindValue, OracleColumnType, OracleIntervalDaySecond, OracleIntervalYearMonth,
+    OracleValue, OracleVectorValue, StatementRequest,
+};
 use tns_thin::{ConnectTarget, OracleDateTime, OracleThinConfig, OracleThinSession};
 
 static OBJECT_COUNTER: AtomicUsize = AtomicUsize::new(1);
@@ -182,6 +185,57 @@ fn fetch_interval_columns_decodes_vendor_formats() {
 
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn bind_interval_values_round_trip_vendor_formats() {
+    let mut conn = connect();
+    let mut request = StatementRequest::query("SELECT :1, :2, :3, :4 FROM dual", 1);
+    request
+        .binds
+        .push(BindValue::IntervalYearMonth(OracleIntervalYearMonth {
+            years: 2021,
+            months: 10,
+        }));
+    request
+        .binds
+        .push(BindValue::IntervalYearMonth(OracleIntervalYearMonth {
+            years: -5,
+            months: -3,
+        }));
+    request
+        .binds
+        .push(BindValue::IntervalDaySecond(OracleIntervalDaySecond {
+            days: 2,
+            hours: 12,
+            minutes: 23,
+            seconds: 34,
+            nanoseconds: 456_000_000,
+        }));
+    request
+        .binds
+        .push(BindValue::IntervalDaySecond(OracleIntervalDaySecond {
+            days: 0,
+            hours: -10,
+            minutes: -20,
+            seconds: -30,
+            nanoseconds: -456_789_000,
+        }));
+
+    let result = conn
+        .execute_typed_fetch_all(&request, &[])
+        .expect("bind interval columns");
+
+    assert_eq!(
+        rows_to_strings(&result.rows),
+        vec![vec![
+            "+2021-10".to_string(),
+            "-05-03".to_string(),
+            "+02 12:23:34.456000".to_string(),
+            "-00 10:20:30.456789".to_string(),
+        ]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn fetch_binary_float_and_double_decodes_vendor_formats() {
     let mut conn = connect();
     let result = conn
@@ -189,8 +243,18 @@ fn fetch_binary_float_and_double_decodes_vendor_formats() {
             "SELECT \
              CAST(134.45 AS BINARY_FLOAT) AS bf_pos, \
              CAST(-134.45 AS BINARY_FLOAT) AS bf_neg, \
+             CAST(5 AS BINARY_FLOAT) AS bf_int, \
+             CAST(0 AS BINARY_FLOAT) AS bf_zero, \
+             BINARY_FLOAT_NAN AS bf_nan, \
+             BINARY_FLOAT_INFINITY AS bf_inf, \
+             -BINARY_FLOAT_INFINITY AS bf_neg_inf, \
              CAST(134.45 AS BINARY_DOUBLE) AS bd_pos, \
-             CAST(-134.45 AS BINARY_DOUBLE) AS bd_neg \
+             CAST(-134.45 AS BINARY_DOUBLE) AS bd_neg, \
+             CAST(5 AS BINARY_DOUBLE) AS bd_int, \
+             CAST(0 AS BINARY_DOUBLE) AS bd_zero, \
+             BINARY_DOUBLE_NAN AS bd_nan, \
+             BINARY_DOUBLE_INFINITY AS bd_inf, \
+             -BINARY_DOUBLE_INFINITY AS bd_neg_inf \
              FROM dual",
             1,
         )
@@ -203,10 +267,20 @@ fn fetch_binary_float_and_double_decodes_vendor_formats() {
             .map(|column| column.column_type)
             .collect::<Vec<_>>(),
         vec![
-            OracleColumnType::Number,
-            OracleColumnType::Number,
-            OracleColumnType::Number,
-            OracleColumnType::Number,
+            OracleColumnType::BinaryFloat,
+            OracleColumnType::BinaryFloat,
+            OracleColumnType::BinaryFloat,
+            OracleColumnType::BinaryFloat,
+            OracleColumnType::BinaryFloat,
+            OracleColumnType::BinaryFloat,
+            OracleColumnType::BinaryFloat,
+            OracleColumnType::BinaryDouble,
+            OracleColumnType::BinaryDouble,
+            OracleColumnType::BinaryDouble,
+            OracleColumnType::BinaryDouble,
+            OracleColumnType::BinaryDouble,
+            OracleColumnType::BinaryDouble,
+            OracleColumnType::BinaryDouble,
         ]
     );
     assert_eq!(
@@ -214,8 +288,60 @@ fn fetch_binary_float_and_double_decodes_vendor_formats() {
         vec![vec![
             "134.45".to_string(),
             "-134.45".to_string(),
+            "5.0".to_string(),
+            "0.0".to_string(),
+            "nan".to_string(),
+            "inf".to_string(),
+            "-inf".to_string(),
             "134.45".to_string(),
             "-134.45".to_string(),
+            "5.0".to_string(),
+            "0.0".to_string(),
+            "nan".to_string(),
+            "inf".to_string(),
+            "-inf".to_string(),
+        ]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn bind_binary_float_and_double_round_trips_vendor_formats() {
+    let mut conn = connect();
+    let mut request = StatementRequest::query(
+        "SELECT :1, :2, :3, :4, :5, :6, :7, :8, :9, :10 FROM dual",
+        1,
+    );
+    request.binds.push(BindValue::BinaryFloat(134.45));
+    request.binds.push(BindValue::BinaryFloat(5.0));
+    request.binds.push(BindValue::BinaryFloat(0.0));
+    request.binds.push(BindValue::BinaryFloat(f32::NAN));
+    request.binds.push(BindValue::BinaryFloat(f32::INFINITY));
+    request.binds.push(BindValue::BinaryDouble(-134.45));
+    request.binds.push(BindValue::BinaryDouble(5.0));
+    request.binds.push(BindValue::BinaryDouble(0.0));
+    request.binds.push(BindValue::BinaryDouble(f64::NAN));
+    request
+        .binds
+        .push(BindValue::BinaryDouble(f64::NEG_INFINITY));
+
+    let result = conn
+        .execute_typed_fetch_all(&request, &[])
+        .expect("bind binary float and double columns");
+
+    assert_eq!(
+        rows_to_strings(&result.rows),
+        vec![vec![
+            "134.45".to_string(),
+            "5.0".to_string(),
+            "0.0".to_string(),
+            "nan".to_string(),
+            "inf".to_string(),
+            "-134.45".to_string(),
+            "5.0".to_string(),
+            "0.0".to_string(),
+            "nan".to_string(),
+            "-inf".to_string(),
         ]]
     );
 }
@@ -228,8 +354,12 @@ fn fetch_vector_columns_decode_vendor_formats() {
         "SELECT \
          TO_VECTOR('[34.6, 77.8]', 2, FLOAT32) AS v32, \
          TO_VECTOR('[34.6, 77.8]', 2, FLOAT64) AS v64, \
+         TO_VECTOR('[5, 1]', 2, FLOAT32) AS v32_ints, \
+         TO_VECTOR('[5, 1]', 2, FLOAT64) AS v64_ints, \
          TO_VECTOR('[34, -77]', 2, INT8) AS vi8, \
-         TO_VECTOR('[3, 2, 3]', 24, BINARY) AS vb \
+         TO_VECTOR('[3, 2, 3]', 24, BINARY) AS vb, \
+         TO_VECTOR('[255, 255, 255]', 24, BINARY) AS vb_max, \
+         TO_VECTOR('[255, 0, 255]', 24, BINARY) AS vb_mixed \
          FROM dual",
         1,
     ) {
@@ -254,6 +384,10 @@ fn fetch_vector_columns_decode_vendor_formats() {
             OracleColumnType::Vector,
             OracleColumnType::Vector,
             OracleColumnType::Vector,
+            OracleColumnType::Vector,
+            OracleColumnType::Vector,
+            OracleColumnType::Vector,
+            OracleColumnType::Vector,
         ]
     );
     assert_eq!(
@@ -261,8 +395,58 @@ fn fetch_vector_columns_decode_vendor_formats() {
         vec![vec![
             "[34.6, 77.8]".to_string(),
             "[34.6, 77.8]".to_string(),
+            "[5.0, 1.0]".to_string(),
+            "[5.0, 1.0]".to_string(),
             "[34, -77]".to_string(),
             "[3, 2, 3]".to_string(),
+            "[255, 255, 255]".to_string(),
+            "[255, 0, 255]".to_string(),
+        ]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn plsql_vector_inout_bind_round_trips_dense_formats() {
+    let mut conn = connect();
+    let mut request = StatementRequest::statement(
+        "BEGIN SELECT :1, :2, :3, :4, :5 INTO :1, :2, :3, :4, :5 FROM dual; END;",
+    );
+    for value in [
+        OracleVectorValue::Float32(vec![34.6, 77.8]),
+        OracleVectorValue::Float64(vec![34.6, 77.8]),
+        OracleVectorValue::Int8(vec![34, -77]),
+        OracleVectorValue::Binary(vec![3, 2, 3]),
+        OracleVectorValue::Binary(vec![255, 0, 255]),
+    ] {
+        request.binds.push(BindValue::InOut {
+            column_type: OracleColumnType::Vector,
+            max_len: 1_048_576,
+            value: Some(BindInputValue::Vector(value)),
+        });
+    }
+
+    let values = match conn.execute_out_binds(&request, &[]) {
+        Ok(values) => values,
+        Err(err)
+            if err.to_string().contains("ORA-00904")
+                || err.to_string().contains("ORA-00902")
+                || err.to_string().contains("ORA-06550") =>
+        {
+            eprintln!("skipping VECTOR IN OUT bind test: database does not support VECTOR");
+            return;
+        }
+        Err(err) => panic!("PL/SQL VECTOR IN OUT bind: {err}"),
+    };
+
+    assert_eq!(
+        rows_to_strings(&[values]),
+        vec![vec![
+            "[34.6, 77.8]".to_string(),
+            "[34.6, 77.8]".to_string(),
+            "[34, -77]".to_string(),
+            "[3, 2, 3]".to_string(),
+            "[255, 0, 255]".to_string(),
         ]]
     );
 }
@@ -307,8 +491,57 @@ fn fetch_sparse_vector_columns_decode_vendor_formats() {
     assert_eq!(
         rows_to_strings(&result.result.rows),
         vec![vec![
+            "SparseVector(dimensions=16, indices=[1, 3, 5], values=[1.0, 0.0, 5.0])".to_string(),
+            "SparseVector(dimensions=16, indices=[1, 3, 5], values=[1.0, 0.0, 5.0])".to_string(),
             "SparseVector(dimensions=16, indices=[1, 3, 5], values=[1, 0, 5])".to_string(),
-            "SparseVector(dimensions=16, indices=[1, 3, 5], values=[1, 0, 5])".to_string(),
+        ]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn bind_sparse_vector_round_trips_vendor_formats() {
+    let mut conn = connect();
+    let mut request = StatementRequest::query("SELECT :1, :2, :3 FROM dual", 1);
+    for value in [
+        OracleVectorValue::SparseFloat32 {
+            num_dimensions: 16,
+            indices: vec![1, 3, 5],
+            values: vec![1.0, 0.0, 5.0],
+        },
+        OracleVectorValue::SparseFloat64 {
+            num_dimensions: 16,
+            indices: vec![1, 3, 5],
+            values: vec![1.0, 0.0, 5.0],
+        },
+        OracleVectorValue::SparseInt8 {
+            num_dimensions: 16,
+            indices: vec![1, 3, 5],
+            values: vec![1, 0, 5],
+        },
+    ] {
+        request.binds.push(BindValue::Vector(value));
+    }
+
+    let result = match conn.execute_typed_fetch_all(&request, &[]) {
+        Ok(result) => result,
+        Err(err)
+            if err.to_string().contains("ORA-00904")
+                || err.to_string().contains("ORA-00902")
+                || err.to_string().contains("ORA-03001")
+                || err.to_string().contains("ORA-518") =>
+        {
+            eprintln!("skipping sparse vector bind test: database does not support sparse VECTOR");
+            return;
+        }
+        Err(err) => panic!("bind sparse vector: {err}"),
+    };
+
+    assert_eq!(
+        rows_to_strings(&result.rows),
+        vec![vec![
+            "SparseVector(dimensions=16, indices=[1, 3, 5], values=[1.0, 0.0, 5.0])".to_string(),
+            "SparseVector(dimensions=16, indices=[1, 3, 5], values=[1.0, 0.0, 5.0])".to_string(),
             "SparseVector(dimensions=16, indices=[1, 3, 5], values=[1, 0, 5])".to_string(),
         ]]
     );
@@ -491,7 +724,7 @@ fn fetch_json_embedded_vector_decodes_oson_payload_as_json_text() {
     let expected = if conn.capabilities().protocol_version == Some(314) {
         r#"{"id":6432,"vector":[1.0E+00,2.0E+00,3.0E+00]}"#
     } else {
-        r#"{"id":6432,"vector":[1, 2, 3]}"#
+        r#"{"id":6432,"vector":[1.0, 2.0, 3.0]}"#
     };
     assert_eq!(
         rows_to_strings(&result.result.rows),
@@ -525,6 +758,35 @@ fn fetch_xmltype_column_decodes_text_across_batches() {
     assert!(rows[1][0].contains("<n>2</n>"));
     assert!(rows[2][0].contains("<n>3</n>"));
     assert!(rows.iter().all(|row| row[0].contains("한글")));
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn fetch_xmltype_column_decodes_large_clob_input() {
+    let mut conn = connect();
+    let result = conn
+        .query_described_fetch_all(
+            "SELECT XMLTYPE(TO_CLOB('<root><payload>') || TO_CLOB(RPAD('x', 3000, 'x')) || TO_CLOB(RPAD('y', 3000, 'y')) || TO_CLOB('</payload></root>')) AS doc FROM dual",
+            1,
+        )
+        .expect("fetch large XMLTYPE column");
+
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Xml]
+    );
+    let rows = rows_to_strings(&result.result.rows);
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0][0].starts_with("<root><payload>"));
+    assert!(rows[0][0].ends_with("</payload></root>"));
+    assert!(
+        rows[0][0].len() >= 6000,
+        "large XMLTYPE payload should not be truncated"
+    );
 }
 
 #[test]
@@ -604,6 +866,77 @@ fn plsql_json_inout_bind_round_trips_native_json() {
     assert_eq!(
         rows_to_strings(&[values]),
         vec![vec![r#"{"input":"ok","added":2}"#.to_string()]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn fetch_bc_date_returns_error_like_python_oracledb() {
+    let mut conn = connect();
+    let err = conn
+        .query_described_fetch_all("SELECT TO_DATE('-4712-01-01', 'SYYYY-MM-DD') FROM dual", 1)
+        .expect_err("BC DATE fetch should be outside supported OracleDateTime range");
+
+    assert!(
+        err.to_string().contains("outside supported range 1..=9999"),
+        "unexpected BC DATE fetch error: {err}"
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn plsql_json_inout_bind_round_trips_long_field_name() {
+    let mut conn = connect();
+    if !conn.capabilities().supports_oson_long_field_names {
+        eprintln!("skipping JSON long field name bind test: negotiated protocol does not support OSON long field names");
+        return;
+    }
+    let long_name = "k".repeat(300);
+    let input = format!(r#"{{"{long_name}":"ok","short":1}}"#);
+    let mut request = StatementRequest::statement(
+        "BEGIN \
+         SELECT JSON_MERGEPATCH(JSON('{\"base\":0}'), :1 RETURNING JSON) \
+         INTO :1 FROM dual; \
+         END;",
+    );
+    request.binds.push(BindValue::InOut {
+        column_type: OracleColumnType::Json,
+        max_len: 1024,
+        value: Some(BindInputValue::Text(input)),
+    });
+
+    let values = match conn.execute_out_binds(&request, &[]) {
+        Ok(values) => values,
+        Err(err)
+            if err.to_string().contains("ORA-00902")
+                || err.to_string().contains("ORA-00932")
+                || err.to_string().contains("ORA-03001")
+                || err.to_string().contains("ORA-06550")
+                || err.to_string().contains("ORA-43853") =>
+        {
+            eprintln!(
+                "skipping JSON long field name bind test: database does not support native JSON bind"
+            );
+            return;
+        }
+        Err(err) => panic!("PL/SQL JSON long field name IN OUT bind: {err}"),
+    };
+
+    let rows = rows_to_strings(&[values]);
+    assert_eq!(rows.len(), 1);
+    let returned: serde_json::Value =
+        serde_json::from_str(&rows[0][0]).expect("JSON long field name bind output");
+    assert_eq!(
+        returned.get(&long_name).and_then(|value| value.as_str()),
+        Some("ok")
+    );
+    assert_eq!(
+        returned.get("short").and_then(|value| value.as_i64()),
+        Some(1)
+    );
+    assert_eq!(
+        returned.get("base").and_then(|value| value.as_i64()),
+        Some(0)
     );
 }
 
@@ -2044,7 +2377,7 @@ fn dml_returning_rowid_can_be_used_to_fetch_inserted_row() {
 
     let mut fetch_request =
         StatementRequest::query(format!("SELECT id, name FROM {table} WHERE ROWID = :1"), 10);
-    fetch_request.binds.push(BindValue::Text(rowid.clone()));
+    fetch_request.binds.push(BindValue::Rowid(rowid.clone()));
     let result = conn
         .query_described_fetch_all_request(&fetch_request)
         .expect("fetch row by returned ROWID");
@@ -2095,7 +2428,7 @@ fn dml_returning_iot_rowid_can_be_used_to_fetch_inserted_row() {
         format!("SELECT id, name, TO_CHAR(created_at, 'YYYY-MM-DD') FROM {table} WHERE ROWID = :1"),
         10,
     );
-    fetch_request.binds.push(BindValue::Text(rowid.clone()));
+    fetch_request.binds.push(BindValue::Urowid(rowid.clone()));
     let result = conn
         .query_described_fetch_all_request(&fetch_request)
         .expect("fetch IOT row by returned ROWID");
@@ -2153,7 +2486,7 @@ fn plsql_dml_returning_iot_rowid_can_be_used_to_fetch_inserted_row() {
         format!("SELECT id, name, TO_CHAR(created_at, 'YYYY-MM-DD') FROM {table} WHERE ROWID = :1"),
         10,
     );
-    fetch_request.binds.push(BindValue::Text(rowid.clone()));
+    fetch_request.binds.push(BindValue::Urowid(rowid.clone()));
     let result = conn
         .query_described_fetch_all_request(&fetch_request)
         .expect("fetch PL/SQL IOT row by returned ROWID");
@@ -2665,8 +2998,8 @@ fn plsql_procedure_ref_cursor_out_bind_fetches_mixed_wire_types() {
             OracleColumnType::Clob,
             OracleColumnType::Clob,
             OracleColumnType::Blob,
-            OracleColumnType::Varchar,
-            OracleColumnType::Varchar,
+            OracleColumnType::Rowid,
+            OracleColumnType::Urowid,
         ]
     );
 
@@ -3199,8 +3532,8 @@ fn plsql_procedure_ref_cursor_out_bind_fetches_extended_wire_types() {
             .map(|column| column.column_type)
             .collect::<Vec<_>>(),
         vec![
-            OracleColumnType::Number,
-            OracleColumnType::Number,
+            OracleColumnType::BinaryFloat,
+            OracleColumnType::BinaryDouble,
             OracleColumnType::Varchar,
             OracleColumnType::Varchar,
             OracleColumnType::Timestamp,
@@ -3225,7 +3558,7 @@ fn plsql_procedure_ref_cursor_out_bind_fetches_extended_wire_types() {
     );
     assert!(value_to_string(&row[5]).contains("<n>7</n>"));
     assert!(value_to_string(&row[5]).contains("\u{D55C}\u{AE00}"));
-    assert_eq!(value_to_string(&row[6]), "[1, 2, 3]");
+    assert_eq!(value_to_string(&row[6]), "[1.0, 2.0, 3.0]");
     assert_eq!(
         value_to_string(&row[7]),
         "SparseVector(dimensions=16, indices=[1, 3, 5], values=[1, 0, 5])"
@@ -3302,7 +3635,7 @@ fn plsql_procedure_ref_cursor_out_bind_preserves_udt_metadata() {
                         TO_CLOB('OBJECT-CLOB'), \
                         TO_BLOB(HEXTORAW('BEEF')), \
                         BFILENAME('DATA_PUMP_DIR', 'space_query_bfile_probe.bin'), \
-                        XMLTYPE('<root><kind>object</kind><txt>' || UNISTR('\\D55C') || '</txt></root>'), \
+                        XMLTYPE(TO_CLOB('<root><kind>object</kind><txt>') || UNISTR('\\D55C') || TO_CLOB('</txt><payload>') || TO_CLOB(RPAD('x', 3000, 'x')) || TO_CLOB(RPAD('y', 3000, 'y')) || TO_CLOB('</payload></root>')), \
                         {nested_type_name}(99, 'nested child')\
                     ) AS obj \
              FROM dual \
@@ -3383,6 +3716,10 @@ fn plsql_procedure_ref_cursor_out_bind_preserves_udt_metadata() {
     let xml_payload = value_to_string(&object_attrs[14].1);
     assert!(xml_payload.contains("<kind>object</kind>"));
     assert!(xml_payload.contains("\u{D55C}"));
+    assert!(
+        xml_payload.len() >= 6000,
+        "large XMLTYPE object attribute should not be truncated"
+    );
     assert_eq!(object_attrs[15].0, "CHILD");
     let child_attrs = match &object_attrs[15].1 {
         OracleValue::Object(attrs) => attrs,
@@ -3393,6 +3730,133 @@ fn plsql_procedure_ref_cursor_out_bind_preserves_udt_metadata() {
     assert_eq!(child_attrs[1].0, "CHILD_LABEL");
     assert_eq!(value_to_string(&child_attrs[1].1), "nested child");
     assert_eq!(rows.result.rows[1][0], OracleValue::Null);
+
+    drop_procedure_ignore(&mut conn, &procedure_name);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn plsql_procedure_ref_cursor_out_bind_decodes_number_synonym_udt_attributes() {
+    let config = live_config();
+    let type_name = unique_object_name("RCUDT_NUMSYN");
+    let procedure_name = unique_object_name("RCUDTNS");
+    let _guard = TypeDropGuard::new(config.clone(), type_name.clone());
+    let mut conn = connect_with_config(config);
+    drop_procedure_ignore(&mut conn, &procedure_name);
+    drop_type_ignore(&mut conn, &type_name);
+    conn.query_drop(&format!(
+        "CREATE TYPE {type_name} AS OBJECT (\
+         decimal_value DECIMAL, \
+         smallint_value SMALLINT, \
+         float_value FLOAT, \
+         double_value DOUBLE PRECISION)"
+    ))
+    .expect("create NUMBER synonym UDT type");
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE PROCEDURE {procedure_name}(p_rc OUT SYS_REFCURSOR) IS \
+         BEGIN \
+         OPEN p_rc FOR SELECT {type_name}(12, 7, 1.25, -2.5) AS obj FROM dual; \
+         END;"
+    ))
+    .expect("create NUMBER synonym UDT REF CURSOR procedure");
+
+    let mut request = StatementRequest::statement(format!("BEGIN {procedure_name}(:1); END;"));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Cursor,
+        max_len: 1,
+    });
+    let values = conn
+        .execute_out_binds(&request, &[])
+        .expect("PL/SQL NUMBER synonym UDT REF CURSOR OUT bind");
+    let cursor = match values.first() {
+        Some(OracleValue::Cursor(cursor)) => cursor.clone(),
+        other => panic!("expected NUMBER synonym UDT OUT REF CURSOR, got {other:?}"),
+    };
+    let rows = conn
+        .fetch_ref_cursor_all(cursor.cursor_id, cursor.columns, 1)
+        .expect("fetch NUMBER synonym UDT REF CURSOR rows");
+    let object_attrs = match &rows.result.rows[0][0] {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected decoded NUMBER synonym UDT object, got {other:?}"),
+    };
+
+    assert_eq!(object_attrs[0].0, "DECIMAL_VALUE");
+    assert_eq!(object_attrs[0].1, OracleValue::Number("12".to_string()));
+    assert_eq!(object_attrs[1].0, "SMALLINT_VALUE");
+    assert_eq!(object_attrs[1].1, OracleValue::Number("7".to_string()));
+    assert_eq!(object_attrs[2].0, "FLOAT_VALUE");
+    assert_eq!(object_attrs[2].1, OracleValue::Number("1.25".to_string()));
+    assert_eq!(object_attrs[3].0, "DOUBLE_VALUE");
+    assert_eq!(object_attrs[3].1, OracleValue::Number("-2.5".to_string()));
+
+    drop_procedure_ignore(&mut conn, &procedure_name);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn plsql_procedure_ref_cursor_out_bind_decodes_timestamp_tz_udt_attributes() {
+    let config = live_config();
+    let type_name = unique_object_name("RCUDT_TSTZ");
+    let procedure_name = unique_object_name("RCUDTTZ");
+    let _guard = TypeDropGuard::new(config.clone(), type_name.clone());
+    let mut conn = connect_with_config(config);
+    drop_procedure_ignore(&mut conn, &procedure_name);
+    drop_type_ignore(&mut conn, &type_name);
+    conn.query_drop("ALTER SESSION SET TIME_ZONE = '+00:00'")
+        .expect("set deterministic session time zone");
+    conn.query_drop(&format!(
+        "CREATE TYPE {type_name} AS OBJECT (\
+         stamped_tz TIMESTAMP WITH TIME ZONE, \
+         stamped_ltz TIMESTAMP WITH LOCAL TIME ZONE)"
+    ))
+    .expect("create TIMESTAMP TZ UDT type");
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE PROCEDURE {procedure_name}(p_rc OUT SYS_REFCURSOR) IS \
+         BEGIN \
+         OPEN p_rc FOR \
+         SELECT {type_name}(\
+             TO_TIMESTAMP_TZ('2024-01-02 03:04:05.123456 +09:00', 'YYYY-MM-DD HH24:MI:SS.FF TZH:TZM'), \
+             CAST(TIMESTAMP '2024-01-02 03:04:05.654321' AS TIMESTAMP WITH LOCAL TIME ZONE)\
+         ) AS obj FROM dual; \
+         END;"
+    ))
+    .expect("create TIMESTAMP TZ UDT REF CURSOR procedure");
+
+    let mut request = StatementRequest::statement(format!("BEGIN {procedure_name}(:1); END;"));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Cursor,
+        max_len: 1,
+    });
+    let values = conn
+        .execute_out_binds(&request, &[])
+        .expect("PL/SQL TIMESTAMP TZ UDT REF CURSOR OUT bind");
+    let cursor = match values.first() {
+        Some(OracleValue::Cursor(cursor)) => cursor.clone(),
+        other => panic!("expected TIMESTAMP TZ UDT OUT REF CURSOR, got {other:?}"),
+    };
+    let rows = conn
+        .fetch_ref_cursor_all(cursor.cursor_id, cursor.columns, 1)
+        .expect("fetch TIMESTAMP TZ UDT REF CURSOR rows");
+    let object_attrs = match &rows.result.rows[0][0] {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected decoded TIMESTAMP TZ UDT object, got {other:?}"),
+    };
+
+    assert_eq!(object_attrs[0].0, "STAMPED_TZ");
+    assert_eq!(
+        timestamp_value_to_string(&object_attrs[0].1),
+        "2024-01-02 03:04:05.123456"
+    );
+    assert_eq!(
+        timestamp_value_timezone_suffix(&object_attrs[0].1).as_deref(),
+        Some("+09:00")
+    );
+    assert_eq!(object_attrs[1].0, "STAMPED_LTZ");
+    assert_eq!(
+        timestamp_value_to_string(&object_attrs[1].1),
+        "2024-01-02 03:04:05.654321"
+    );
+    assert_eq!(timestamp_value_timezone_suffix(&object_attrs[1].1), None);
 
     drop_procedure_ignore(&mut conn, &procedure_name);
 }
@@ -3467,6 +3931,82 @@ fn plsql_procedure_ref_cursor_out_bind_decodes_udt_collection_attribute() {
     };
     assert_eq!(child_attrs[0].0, "CHILD_ID");
     assert_eq!(child_attrs[0].1, OracleValue::Number("1".to_string()));
+
+    drop_procedure_ignore(&mut conn, &procedure_name);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn plsql_procedure_ref_cursor_out_bind_decodes_nchar_udt_attributes_and_collection() {
+    let config = live_config();
+    let collection_type_name = unique_object_name("RCUDT_NV_TAB");
+    let parent_type_name = unique_object_name("RCUDT_NCHAR");
+    let procedure_name = unique_object_name("RCUDTNC");
+    let _collection_guard = TypeDropGuard::new(config.clone(), collection_type_name.clone());
+    let _parent_guard = TypeDropGuard::new(config.clone(), parent_type_name.clone());
+    let mut conn = connect_with_config(config);
+    drop_procedure_ignore(&mut conn, &procedure_name);
+    drop_type_ignore(&mut conn, &parent_type_name);
+    drop_type_ignore(&mut conn, &collection_type_name);
+    conn.query_drop(&format!(
+        "CREATE TYPE {collection_type_name} AS TABLE OF NVARCHAR2(10)"
+    ))
+    .expect("create NVARCHAR2 collection type");
+    conn.query_drop(&format!(
+        "CREATE TYPE {parent_type_name} AS OBJECT (\
+         nchar_value NCHAR(2), \
+         nvarchar_value NVARCHAR2(10), \
+         items {collection_type_name})"
+    ))
+    .expect("create NCHAR UDT parent type");
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE PROCEDURE {procedure_name}(p_rc OUT SYS_REFCURSOR) IS \
+         BEGIN \
+         OPEN p_rc FOR \
+         SELECT {parent_type_name}(\
+             CAST(UNISTR('\\D55C\\AE00') AS NCHAR(2)), \
+             CAST(UNISTR('\\B098\\B2E4') AS NVARCHAR2(10)), \
+             {collection_type_name}(\
+                 CAST(UNISTR('\\AC00') AS NVARCHAR2(10)), \
+                 CAST(UNISTR('\\B098') AS NVARCHAR2(10))\
+             )\
+         ) AS obj FROM dual; \
+         END;"
+    ))
+    .expect("create NCHAR UDT REF CURSOR procedure");
+
+    let mut request = StatementRequest::statement(format!("BEGIN {procedure_name}(:1); END;"));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Cursor,
+        max_len: 1,
+    });
+    let values = conn
+        .execute_out_binds(&request, &[])
+        .expect("PL/SQL NCHAR UDT REF CURSOR OUT bind");
+    let cursor = match values.first() {
+        Some(OracleValue::Cursor(cursor)) => cursor.clone(),
+        other => panic!("expected NCHAR UDT OUT REF CURSOR, got {other:?}"),
+    };
+    let rows = conn
+        .fetch_ref_cursor_all(cursor.cursor_id, cursor.columns, 1)
+        .expect("fetch NCHAR UDT REF CURSOR rows");
+    let object_attrs = match &rows.result.rows[0][0] {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected decoded NCHAR UDT object, got {other:?}"),
+    };
+
+    assert_eq!(object_attrs[0].0, "NCHAR_VALUE");
+    assert_eq!(value_to_string(&object_attrs[0].1), "\u{D55C}\u{AE00}");
+    assert_eq!(object_attrs[1].0, "NVARCHAR_VALUE");
+    assert_eq!(value_to_string(&object_attrs[1].1), "\u{B098}\u{B2E4}");
+    assert_eq!(object_attrs[2].0, "ITEMS");
+    let collection_values = match &object_attrs[2].1 {
+        OracleValue::Array(values) => values,
+        other => panic!("expected decoded NVARCHAR2 collection attribute, got {other:?}"),
+    };
+    assert_eq!(collection_values.len(), 2);
+    assert_eq!(value_to_string(&collection_values[0]), "\u{AC00}");
+    assert_eq!(value_to_string(&collection_values[1]), "\u{B098}");
 
     drop_procedure_ignore(&mut conn, &procedure_name);
 }
@@ -3664,9 +4204,9 @@ fn fetch_rowid_and_urowid_match_oracle_text_encoding() {
             .map(|column| column.column_type)
             .collect::<Vec<_>>(),
         vec![
+            OracleColumnType::Rowid,
             OracleColumnType::Varchar,
-            OracleColumnType::Varchar,
-            OracleColumnType::Varchar
+            OracleColumnType::Urowid
         ]
     );
     let row = result.result.rows.first().expect("ROWID row");
@@ -3680,6 +4220,38 @@ fn fetch_rowid_and_urowid_match_oracle_text_encoding() {
     assert!(rowid
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/'));
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn fetch_null_rowid_and_urowid_columns_return_nulls() {
+    let config = live_config();
+    let table = unique_table_name("RID_NULL");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+
+    conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, rid ROWID, urid UROWID)"
+    ))
+    .expect("create null ROWID test table");
+    conn.query_drop(&format!("INSERT INTO {table} (id) VALUES (1)"))
+        .expect("insert null ROWID test row");
+
+    let result = conn
+        .query_described_fetch_all(format!("SELECT rid, urid FROM {table} WHERE id = 1"), 1)
+        .expect("fetch null ROWID and UROWID columns");
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Rowid, OracleColumnType::Urowid]
+    );
+    assert_eq!(
+        result.result.rows,
+        vec![vec![OracleValue::Null, OracleValue::Null]]
+    );
 }
 
 #[test]

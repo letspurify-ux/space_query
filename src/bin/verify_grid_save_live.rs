@@ -149,12 +149,19 @@ impl Harness {
     }
 
     fn run(&mut self, sql: &str) -> Result<Vec<QueryProgress>, String> {
-        self.events.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        self.events
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
         self.done.store(false, Ordering::SeqCst);
         self.editor.execute_sql_text(sql);
         let done = Arc::clone(&self.done);
         self.pump_until("statement to finish", || done.load(Ordering::SeqCst))?;
-        Ok(self.events.lock().unwrap_or_else(|p| p.into_inner()).clone())
+        Ok(self
+            .events
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone())
     }
 
     fn rollback(&mut self) -> Result<(), String> {
@@ -223,7 +230,11 @@ fn verify(target: Target) -> Result<(), String> {
             events.lock().unwrap_or_else(|p| p.into_inner()).push(event);
         });
     }
-    let mut h = Harness { editor, events, done };
+    let mut h = Harness {
+        editor,
+        events,
+        done,
+    };
 
     let t = "OQT_GRID_SAVE_TEST";
 
@@ -236,22 +247,35 @@ fn verify(target: Target) -> Result<(), String> {
                 .map_err(|e| format!("set_auto_commit(false): {e}"))?;
         }
     }
-    println!("(manual mode; auto_commit={})", shared.lock().unwrap_or_else(|p| p.into_inner()).auto_commit());
+    println!(
+        "(manual mode; auto_commit={})",
+        shared
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .auto_commit()
+    );
 
     // Setup baseline and commit it explicitly (we are in manual mode).
     let _ = h.run(&target.drop_sql(t));
-    h.run(&target.create_sql(t)).map_err(|e| format!("create: {e}"))?;
+    h.run(&target.create_sql(t))
+        .map_err(|e| format!("create: {e}"))?;
     h.run(&format!("INSERT INTO {t} (ID, NAME) VALUES (1, 'SMITH')"))
         .map_err(|e| format!("insert: {e}"))?;
-    h.run("COMMIT").map_err(|e| format!("commit baseline: {e}"))?;
+    h.run("COMMIT")
+        .map_err(|e| format!("commit baseline: {e}"))?;
 
     // (1) The grid-save tagged single-statement DML (mirrors save_edit_mode shape).
     let tag = "SQ_SAVE_REQUEST:42";
     let save_sql = format!("/* {tag} */\nUPDATE {t} SET NAME = 'SCOTT' WHERE ID = 1;");
-    let save_events = h.run(&save_sql).map_err(|e| format!("grid-save UPDATE: {e}"))?;
+    let save_events = h
+        .run(&save_sql)
+        .map_err(|e| format!("grid-save UPDATE: {e}"))?;
     let r = last_result(&save_events).ok_or("grid-save produced no terminal result")?;
 
-    println!("(1) terminal result: success={} is_select={} msg={:?}", r.success, r.is_select, r.message);
+    println!(
+        "(1) terminal result: success={} is_select={} msg={:?}",
+        r.success, r.is_select, r.message
+    );
     println!("    result.sql = {:?}", r.sql);
     if !r.success {
         return Err("grid-save result not success".into());
@@ -261,7 +285,9 @@ fn verify(target: Target) -> Result<(), String> {
     }
     let matchable = r.sql.contains(tag)
         || r.message.contains(tag)
-        || r.sql.to_ascii_uppercase().contains(&format!("UPDATE {t}").to_ascii_uppercase());
+        || r.sql
+            .to_ascii_uppercase()
+            .contains(&format!("UPDATE {t}").to_ascii_uppercase());
     if !matchable {
         return Err("terminal result not matchable by pending-save matcher (would orphan)".into());
     }
@@ -277,7 +303,9 @@ fn verify(target: Target) -> Result<(), String> {
             | Some(TransactionSessionState::DecisionRequired)
     );
     if !dirty {
-        return Err(format!("session NOT dirty after manual UPDATE (state={state:?}) -> Rollback rejected"));
+        return Err(format!(
+            "session NOT dirty after manual UPDATE (state={state:?}) -> Rollback rejected"
+        ));
     }
     println!("    PASS(2): session dirty -> Rollback button allowed");
 
@@ -286,7 +314,9 @@ fn verify(target: Target) -> Result<(), String> {
     let name_mid = cell_by_col(&mid, "NAME").unwrap_or_default();
     println!("    in-session NAME = {name_mid:?}");
     if name_mid != "SCOTT" {
-        return Err(format!("UPDATE not visible in-session (NAME={name_mid:?}, expected SCOTT)"));
+        return Err(format!(
+            "UPDATE not visible in-session (NAME={name_mid:?}, expected SCOTT)"
+        ));
     }
     let state_after_select = h.retained_state();
     println!("(2b) retained state after a SELECT (still uncommitted!) = {state_after_select:?}");
@@ -314,7 +344,9 @@ fn verify(target: Target) -> Result<(), String> {
     let name_after = cell_by_col(&after, "NAME").unwrap_or_default();
     println!("    NAME after Rollback = {name_after:?}");
     if name_after != "SMITH" {
-        return Err(format!("Rollback did not revert UPDATE (NAME={name_after:?}, expected SMITH)"));
+        return Err(format!(
+            "Rollback did not revert UPDATE (NAME={name_after:?}, expected SMITH)"
+        ));
     }
     println!("    PASS(3): editor Rollback resolved session and reverted change");
 
@@ -334,7 +366,12 @@ fn main() {
         "oci" => vec![Target::OracleOci],
         "mysql" => vec![Target::MySql],
         "mariadb" => vec![Target::MariaDb],
-        "all" => vec![Target::OracleThin, Target::OracleOci, Target::MySql, Target::MariaDb],
+        "all" => vec![
+            Target::OracleThin,
+            Target::OracleOci,
+            Target::MySql,
+            Target::MariaDb,
+        ],
         other => {
             eprintln!("unknown target: {other} (use thin|oci|mysql|mariadb|all)");
             std::process::exit(2);

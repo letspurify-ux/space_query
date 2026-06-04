@@ -13003,11 +13003,24 @@ impl SqlEditorWidget {
         };
         Ok(match value {
             OracleThinBindInputValue::Number(value) => OracleThinBindValue::Number(value),
+            OracleThinBindInputValue::BinaryFloat(value) => OracleThinBindValue::BinaryFloat(value),
+            OracleThinBindInputValue::BinaryDouble(value) => {
+                OracleThinBindValue::BinaryDouble(value)
+            }
             OracleThinBindInputValue::Text(value) => OracleThinBindValue::Text(value),
             OracleThinBindInputValue::Bytes(value) => OracleThinBindValue::Bytes(value),
+            OracleThinBindInputValue::Rowid(value) => OracleThinBindValue::Rowid(value),
+            OracleThinBindInputValue::Urowid(value) => OracleThinBindValue::Urowid(value),
             OracleThinBindInputValue::Boolean(value) => OracleThinBindValue::Boolean(value),
             OracleThinBindInputValue::Date(value) => OracleThinBindValue::Date(value),
             OracleThinBindInputValue::Timestamp(value) => OracleThinBindValue::Timestamp(value),
+            OracleThinBindInputValue::IntervalYearMonth(value) => {
+                OracleThinBindValue::IntervalYearMonth(value)
+            }
+            OracleThinBindInputValue::IntervalDaySecond(value) => {
+                OracleThinBindValue::IntervalDaySecond(value)
+            }
+            OracleThinBindInputValue::Vector(value) => OracleThinBindValue::Vector(value),
         })
     }
 
@@ -32171,7 +32184,10 @@ mod mysql_transaction_feedback_tests {
         let cancel_thread = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(300));
             store_mutex_bool(&cancel_flag_for_thread, true);
-            cancel_handle.break_execution()
+            let result = cancel_handle.break_execution();
+            std::thread::sleep(Duration::from_millis(700));
+            cancel_handle.force_close();
+            result
         });
         let session = Arc::new(Mutex::new(SessionState {
             db_type: DatabaseType::Oracle,
@@ -33170,7 +33186,10 @@ mod mysql_transaction_feedback_tests {
         let cancel = conn.cancel_handle();
         let handle = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(300));
-            cancel.break_execution()
+            let result = cancel.break_execution();
+            std::thread::sleep(Duration::from_millis(700));
+            cancel.force_close();
+            result
         });
 
         let started = std::time::Instant::now();
