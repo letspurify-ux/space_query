@@ -5585,7 +5585,10 @@ fn select_udt_object_and_collection_columns_decode_like_python_oracledb() {
             .iter()
             .map(|column| column.column_type)
             .collect::<Vec<_>>(),
-        vec![OracleColumnType::Unsupported(109), OracleColumnType::Unsupported(109)]
+        vec![
+            OracleColumnType::Unsupported(109),
+            OracleColumnType::Unsupported(109)
+        ]
     );
 
     let first_object_attrs = match &rows.result.rows[0][0] {
@@ -5644,7 +5647,10 @@ fn select_udt_object_and_collection_columns_decode_like_python_oracledb() {
             .iter()
             .map(|column| column.column_type)
             .collect::<Vec<_>>(),
-        vec![OracleColumnType::Unsupported(109), OracleColumnType::Unsupported(109)]
+        vec![
+            OracleColumnType::Unsupported(109),
+            OracleColumnType::Unsupported(109)
+        ]
     );
     assert!(
         initial.result.rows.is_empty(),
@@ -5760,6 +5766,7 @@ fn select_udt_lob_attributes_decode_like_python_oracledb() {
         "CREATE TYPE {type_name} AS OBJECT (\
          id NUMBER, \
          clob_payload CLOB, \
+         nclob_payload NCLOB, \
          blob_payload BLOB, \
          file_payload BFILE)"
     ))
@@ -5772,13 +5779,14 @@ fn select_udt_lob_attributes_decode_like_python_oracledb() {
                     {type_name}(\
                         1, \
                         TO_CLOB('DIRECT-CLOB-PAYLOAD'), \
+                        TO_NCLOB(UNISTR('\\D55C\\AE00')), \
                         TO_BLOB(HEXTORAW('BEEF')), \
                         BFILENAME('DATA_PUMP_DIR', 'space_query_bfile_probe.bin')\
                     ) AS obj \
              FROM dual \
              UNION ALL \
              SELECT 2 AS sort_key, \
-                    {type_name}(2, NULL, NULL, NULL) AS obj \
+                    {type_name}(2, NULL, NULL, NULL, NULL) AS obj \
              FROM dual\
          ) \
          ORDER BY sort_key"
@@ -5812,6 +5820,81 @@ fn select_udt_lob_attributes_decode_like_python_oracledb() {
         .expect("fetch initial direct SELECT LOB UDT rows");
     assert_eq!(fetched.result.rows.len(), 2);
     assert_lob_object_attribute_rows(&fetched.result.rows);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn select_udt_nchar_attributes_decode_like_python_oracledb() {
+    let config = live_config();
+    let collection_type_name = unique_object_name("SEL_NCHAR_TAB");
+    let parent_type_name = unique_object_name("SEL_NCHAR_OBJ");
+    let _collection_guard = TypeDropGuard::new(config.clone(), collection_type_name.clone());
+    let _parent_guard = TypeDropGuard::new(config.clone(), parent_type_name.clone());
+    let mut conn = connect_with_config(config);
+    drop_type_ignore(&mut conn, &parent_type_name);
+    drop_type_ignore(&mut conn, &collection_type_name);
+    conn.query_drop(&format!(
+        "CREATE TYPE {collection_type_name} AS TABLE OF NVARCHAR2(10)"
+    ))
+    .expect("create direct SELECT NVARCHAR2 collection type");
+    conn.query_drop(&format!(
+        "CREATE TYPE {parent_type_name} AS OBJECT (\
+         nchar_value NCHAR(2), \
+         nvarchar_value NVARCHAR2(10), \
+         items {collection_type_name})"
+    ))
+    .expect("create direct SELECT NCHAR UDT type");
+
+    let sql = format!(
+        "SELECT obj \
+         FROM (\
+             SELECT 1 AS sort_key, \
+                    {parent_type_name}(\
+                        CAST(UNISTR('\\D55C\\AE00') AS NCHAR(2)), \
+                        CAST(UNISTR('\\B098\\B2E4') AS NVARCHAR2(10)), \
+                        {collection_type_name}(\
+                            CAST(UNISTR('\\AC00') AS NVARCHAR2(10)), \
+                            NULL, \
+                            CAST(UNISTR('\\B098') AS NVARCHAR2(10))\
+                        )\
+                    ) AS obj \
+             FROM dual \
+             UNION ALL \
+             SELECT 2 AS sort_key, \
+                    {parent_type_name}(NULL, NULL, NULL) AS obj \
+             FROM dual\
+         ) \
+         ORDER BY sort_key"
+    );
+    let rows = conn
+        .query_described_fetch_all(sql.clone(), 1)
+        .expect("fetch direct SELECT NCHAR UDT rows");
+    assert_eq!(
+        rows.columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Unsupported(109)]
+    );
+    assert_eq!(rows.result.rows.len(), 2);
+    assert_nchar_object_attribute_rows(&rows.result.rows);
+
+    let initial = conn
+        .query_described_initial_request(&StatementRequest::query(sql, 1))
+        .expect("initial direct SELECT NCHAR UDT query");
+    assert!(
+        initial.result.rows.is_empty(),
+        "NCHAR object metadata queries should use no-prefetch initial execution"
+    );
+    let cursor_id = initial
+        .result
+        .cursor_id
+        .expect("initial NCHAR UDT query cursor id");
+    let fetched = conn
+        .fetch_ref_cursor_all(cursor_id, initial.columns, 1)
+        .expect("fetch initial direct SELECT NCHAR UDT rows");
+    assert_eq!(fetched.result.rows.len(), 2);
+    assert_nchar_object_attribute_rows(&fetched.result.rows);
 }
 
 #[test]
@@ -6676,15 +6759,17 @@ fn assert_lob_object_attribute_rows(rows: &[Vec<OracleValue>]) {
         OracleValue::Object(attrs) => attrs,
         other => panic!("expected direct SELECT LOB object, got {other:?}"),
     };
-    assert_eq!(first_attrs.len(), 4);
+    assert_eq!(first_attrs.len(), 5);
     assert_eq!(first_attrs[0].0, "ID");
     assert_eq!(first_attrs[0].1, OracleValue::Number("1".to_string()));
     assert_eq!(first_attrs[1].0, "CLOB_PAYLOAD");
     assert_lob_value_not_empty(&first_attrs[1].1);
-    assert_eq!(first_attrs[2].0, "BLOB_PAYLOAD");
+    assert_eq!(first_attrs[2].0, "NCLOB_PAYLOAD");
     assert_lob_value_not_empty(&first_attrs[2].1);
-    assert_eq!(first_attrs[3].0, "FILE_PAYLOAD");
+    assert_eq!(first_attrs[3].0, "BLOB_PAYLOAD");
     assert_lob_value_not_empty(&first_attrs[3].1);
+    assert_eq!(first_attrs[4].0, "FILE_PAYLOAD");
+    assert_lob_value_not_empty(&first_attrs[4].1);
 
     let second_attrs = match &rows[1][0] {
         OracleValue::Object(attrs) => attrs,
@@ -6694,10 +6779,44 @@ fn assert_lob_object_attribute_rows(rows: &[Vec<OracleValue>]) {
     assert_eq!(second_attrs[0].1, OracleValue::Number("2".to_string()));
     assert_eq!(second_attrs[1].0, "CLOB_PAYLOAD");
     assert_eq!(second_attrs[1].1, OracleValue::Null);
-    assert_eq!(second_attrs[2].0, "BLOB_PAYLOAD");
+    assert_eq!(second_attrs[2].0, "NCLOB_PAYLOAD");
     assert_eq!(second_attrs[2].1, OracleValue::Null);
-    assert_eq!(second_attrs[3].0, "FILE_PAYLOAD");
+    assert_eq!(second_attrs[3].0, "BLOB_PAYLOAD");
     assert_eq!(second_attrs[3].1, OracleValue::Null);
+    assert_eq!(second_attrs[4].0, "FILE_PAYLOAD");
+    assert_eq!(second_attrs[4].1, OracleValue::Null);
+}
+
+fn assert_nchar_object_attribute_rows(rows: &[Vec<OracleValue>]) {
+    let first_attrs = match &rows[0][0] {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected direct SELECT NCHAR object, got {other:?}"),
+    };
+    assert_eq!(first_attrs.len(), 3);
+    assert_eq!(first_attrs[0].0, "NCHAR_VALUE");
+    assert_eq!(value_to_string(&first_attrs[0].1), "\u{D55C}\u{AE00}");
+    assert_eq!(first_attrs[1].0, "NVARCHAR_VALUE");
+    assert_eq!(value_to_string(&first_attrs[1].1), "\u{B098}\u{B2E4}");
+    assert_eq!(first_attrs[2].0, "ITEMS");
+    let collection_values = match &first_attrs[2].1 {
+        OracleValue::Array(values) => values,
+        other => panic!("expected direct SELECT NVARCHAR2 collection attribute, got {other:?}"),
+    };
+    assert_eq!(collection_values.len(), 3);
+    assert_eq!(value_to_string(&collection_values[0]), "\u{AC00}");
+    assert_eq!(collection_values[1], OracleValue::Null);
+    assert_eq!(value_to_string(&collection_values[2]), "\u{B098}");
+
+    let second_attrs = match &rows[1][0] {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected direct SELECT NCHAR object with nulls, got {other:?}"),
+    };
+    assert_eq!(second_attrs[0].0, "NCHAR_VALUE");
+    assert_eq!(second_attrs[0].1, OracleValue::Null);
+    assert_eq!(second_attrs[1].0, "NVARCHAR_VALUE");
+    assert_eq!(second_attrs[1].1, OracleValue::Null);
+    assert_eq!(second_attrs[2].0, "ITEMS");
+    assert_eq!(second_attrs[2].1, OracleValue::Null);
 }
 
 fn assert_nested_object_attribute_rows(rows: &[Vec<OracleValue>]) {

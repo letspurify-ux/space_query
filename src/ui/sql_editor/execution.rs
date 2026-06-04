@@ -3286,12 +3286,9 @@ impl SqlEditorWidget {
         // under-reporting on the thin driver, which would otherwise strand an
         // earlier uncommitted UPDATE as a "clean" retained session that the
         // Commit/Rollback buttons then refuse to resolve.
-        let merged_transaction_state = prior_retained_state
-            .transaction_state()
-            .conservative_merge(TransactionSessionState::from_flags(
-                may_have_uncommitted_work,
-                false,
-            ));
+        let merged_transaction_state = prior_retained_state.transaction_state().conservative_merge(
+            TransactionSessionState::from_flags(may_have_uncommitted_work, false),
+        );
         OracleCleanupSessionDecisionApplier::retained_state_after_cleanup_update(
             prior_retained_state,
             merged_transaction_state,
