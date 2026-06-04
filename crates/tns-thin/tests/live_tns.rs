@@ -5664,6 +5664,158 @@ fn select_udt_object_and_collection_columns_decode_like_python_oracledb() {
 
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn select_udt_scalar_attributes_decode_like_python_oracledb() {
+    let config = live_config();
+    let type_name = unique_object_name("SEL_SCALAR_OBJ");
+    let _guard = TypeDropGuard::new(config.clone(), type_name.clone());
+    let mut conn = connect_with_config(config);
+    drop_type_ignore(&mut conn, &type_name);
+    conn.query_drop(&format!(
+        "CREATE TYPE {type_name} AS OBJECT (\
+         id NUMBER, \
+         raw_payload RAW(4), \
+         created_on DATE, \
+         stamped_at TIMESTAMP, \
+         stamped_tz TIMESTAMP WITH TIME ZONE, \
+         score_float BINARY_FLOAT, \
+         score_double BINARY_DOUBLE, \
+         active BOOLEAN, \
+         inactive BOOLEAN, \
+         period_ym INTERVAL YEAR(4) TO MONTH, \
+         period_ds INTERVAL DAY TO SECOND)"
+    ))
+    .expect("create direct SELECT scalar UDT type");
+
+    let sql = format!(
+        "SELECT obj \
+         FROM (\
+             SELECT 1 AS sort_key, \
+                    {type_name}(\
+                        7, \
+                        HEXTORAW('CAFE'), \
+                        DATE '2024-02-29', \
+                        TIMESTAMP '2024-01-02 03:04:05.123456', \
+                        TO_TIMESTAMP_TZ(\
+                            '2024-01-02 03:04:05.123456 +09:00', \
+                            'YYYY-MM-DD HH24:MI:SS.FF TZH:TZM'\
+                        ), \
+                        CAST(3.5 AS BINARY_FLOAT), \
+                        CAST(-2.25 AS BINARY_DOUBLE), \
+                        TRUE, \
+                        FALSE, \
+                        TO_YMINTERVAL('2021-10'), \
+                        TO_DSINTERVAL('2 12:23:34.456789')\
+                    ) AS obj \
+             FROM dual \
+             UNION ALL \
+             SELECT 2 AS sort_key, \
+                    {type_name}(\
+                        8, \
+                        NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL\
+                    ) AS obj \
+             FROM dual\
+         ) \
+         ORDER BY sort_key"
+    );
+    let rows = conn
+        .query_described_fetch_all(sql.clone(), 1)
+        .expect("fetch direct SELECT scalar UDT rows");
+    assert_eq!(
+        rows.columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Unsupported(109)]
+    );
+    assert_eq!(rows.result.rows.len(), 2);
+    assert_scalar_object_attribute_rows(&rows.result.rows);
+
+    let initial = conn
+        .query_described_initial_request(&StatementRequest::query(sql, 1))
+        .expect("initial direct SELECT scalar UDT query");
+    assert!(
+        initial.result.rows.is_empty(),
+        "scalar object metadata queries should use no-prefetch initial execution"
+    );
+    let cursor_id = initial
+        .result
+        .cursor_id
+        .expect("initial scalar UDT query cursor id");
+    let fetched = conn
+        .fetch_ref_cursor_all(cursor_id, initial.columns, 1)
+        .expect("fetch initial direct SELECT scalar UDT rows");
+    assert_eq!(fetched.result.rows.len(), 2);
+    assert_scalar_object_attribute_rows(&fetched.result.rows);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn select_udt_lob_attributes_decode_like_python_oracledb() {
+    let config = live_config();
+    let type_name = unique_object_name("SEL_LOB_OBJ");
+    let _guard = TypeDropGuard::new(config.clone(), type_name.clone());
+    let mut conn = connect_with_config(config);
+    drop_type_ignore(&mut conn, &type_name);
+    conn.query_drop(&format!(
+        "CREATE TYPE {type_name} AS OBJECT (\
+         id NUMBER, \
+         clob_payload CLOB, \
+         blob_payload BLOB, \
+         file_payload BFILE)"
+    ))
+    .expect("create direct SELECT LOB UDT type");
+
+    let sql = format!(
+        "SELECT obj \
+         FROM (\
+             SELECT 1 AS sort_key, \
+                    {type_name}(\
+                        1, \
+                        TO_CLOB('DIRECT-CLOB-PAYLOAD'), \
+                        TO_BLOB(HEXTORAW('BEEF')), \
+                        BFILENAME('DATA_PUMP_DIR', 'space_query_bfile_probe.bin')\
+                    ) AS obj \
+             FROM dual \
+             UNION ALL \
+             SELECT 2 AS sort_key, \
+                    {type_name}(2, NULL, NULL, NULL) AS obj \
+             FROM dual\
+         ) \
+         ORDER BY sort_key"
+    );
+    let rows = conn
+        .query_described_fetch_all(sql.clone(), 1)
+        .expect("fetch direct SELECT LOB UDT rows");
+    assert_eq!(
+        rows.columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Unsupported(109)]
+    );
+    assert_eq!(rows.result.rows.len(), 2);
+    assert_lob_object_attribute_rows(&rows.result.rows);
+
+    let initial = conn
+        .query_described_initial_request(&StatementRequest::query(sql, 1))
+        .expect("initial direct SELECT LOB UDT query");
+    assert!(
+        initial.result.rows.is_empty(),
+        "LOB object metadata queries should use no-prefetch initial execution"
+    );
+    let cursor_id = initial
+        .result
+        .cursor_id
+        .expect("initial LOB UDT query cursor id");
+    let fetched = conn
+        .fetch_ref_cursor_all(cursor_id, initial.columns, 1)
+        .expect("fetch initial direct SELECT LOB UDT rows");
+    assert_eq!(fetched.result.rows.len(), 2);
+    assert_lob_object_attribute_rows(&fetched.result.rows);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn select_nested_udt_object_attribute_decodes_null_like_python_oracledb() {
     let config = live_config();
     let child_type_name = unique_object_name("SEL_CHILD_OBJ");
@@ -6464,6 +6616,88 @@ fn value_to_string(value: &OracleValue) -> String {
         OracleValue::Number(value) | OracleValue::Text(value) => value.clone(),
         other => panic!("unexpected test value {other:?}"),
     }
+}
+
+fn assert_scalar_object_attribute_rows(rows: &[Vec<OracleValue>]) {
+    let first_attrs = match &rows[0][0] {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected direct SELECT scalar object, got {other:?}"),
+    };
+    assert_eq!(first_attrs.len(), 11);
+    assert_eq!(first_attrs[0].0, "ID");
+    assert_eq!(first_attrs[0].1, OracleValue::Number("7".to_string()));
+    assert_eq!(first_attrs[1].0, "RAW_PAYLOAD");
+    assert_eq!(first_attrs[1].1, OracleValue::Bytes(vec![0xca, 0xfe]));
+    assert_eq!(first_attrs[2].0, "CREATED_ON");
+    assert_eq!(
+        date_value_to_string(&first_attrs[2].1),
+        "2024-02-29 00:00:00"
+    );
+    assert_eq!(first_attrs[3].0, "STAMPED_AT");
+    assert_eq!(
+        timestamp_value_to_string(&first_attrs[3].1),
+        "2024-01-02 03:04:05.123456"
+    );
+    assert_eq!(first_attrs[4].0, "STAMPED_TZ");
+    assert_eq!(
+        timestamp_value_to_string(&first_attrs[4].1),
+        "2024-01-02 03:04:05.123456"
+    );
+    assert_eq!(
+        timestamp_value_timezone_suffix(&first_attrs[4].1).as_deref(),
+        Some("+09:00")
+    );
+    assert_eq!(first_attrs[5].0, "SCORE_FLOAT");
+    assert_eq!(value_to_string(&first_attrs[5].1), "3.5");
+    assert_eq!(first_attrs[6].0, "SCORE_DOUBLE");
+    assert_eq!(value_to_string(&first_attrs[6].1), "-2.25");
+    assert_eq!(first_attrs[7].0, "ACTIVE");
+    assert_eq!(first_attrs[7].1, OracleValue::Boolean(true));
+    assert_eq!(first_attrs[8].0, "INACTIVE");
+    assert_eq!(first_attrs[8].1, OracleValue::Boolean(false));
+    assert_eq!(first_attrs[9].0, "PERIOD_YM");
+    assert_eq!(value_to_string(&first_attrs[9].1), "+2021-10");
+    assert_eq!(first_attrs[10].0, "PERIOD_DS");
+    assert_eq!(value_to_string(&first_attrs[10].1), "+02 12:23:34.456789");
+
+    let second_attrs = match &rows[1][0] {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected direct SELECT scalar object with nulls, got {other:?}"),
+    };
+    assert_eq!(second_attrs[0].0, "ID");
+    assert_eq!(second_attrs[0].1, OracleValue::Number("8".to_string()));
+    for (attr_name, value) in second_attrs.iter().skip(1) {
+        assert_eq!(*value, OracleValue::Null, "{attr_name} should be NULL");
+    }
+}
+
+fn assert_lob_object_attribute_rows(rows: &[Vec<OracleValue>]) {
+    let first_attrs = match &rows[0][0] {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected direct SELECT LOB object, got {other:?}"),
+    };
+    assert_eq!(first_attrs.len(), 4);
+    assert_eq!(first_attrs[0].0, "ID");
+    assert_eq!(first_attrs[0].1, OracleValue::Number("1".to_string()));
+    assert_eq!(first_attrs[1].0, "CLOB_PAYLOAD");
+    assert_lob_value_not_empty(&first_attrs[1].1);
+    assert_eq!(first_attrs[2].0, "BLOB_PAYLOAD");
+    assert_lob_value_not_empty(&first_attrs[2].1);
+    assert_eq!(first_attrs[3].0, "FILE_PAYLOAD");
+    assert_lob_value_not_empty(&first_attrs[3].1);
+
+    let second_attrs = match &rows[1][0] {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected direct SELECT LOB object with nulls, got {other:?}"),
+    };
+    assert_eq!(second_attrs[0].0, "ID");
+    assert_eq!(second_attrs[0].1, OracleValue::Number("2".to_string()));
+    assert_eq!(second_attrs[1].0, "CLOB_PAYLOAD");
+    assert_eq!(second_attrs[1].1, OracleValue::Null);
+    assert_eq!(second_attrs[2].0, "BLOB_PAYLOAD");
+    assert_eq!(second_attrs[2].1, OracleValue::Null);
+    assert_eq!(second_attrs[3].0, "FILE_PAYLOAD");
+    assert_eq!(second_attrs[3].1, OracleValue::Null);
 }
 
 fn assert_nested_object_attribute_rows(rows: &[Vec<OracleValue>]) {
