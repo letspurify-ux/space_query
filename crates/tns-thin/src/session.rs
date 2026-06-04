@@ -2650,7 +2650,9 @@ fn columns_require_define_fetch_for_values(columns: &[ColumnMetadata]) -> bool {
 }
 
 fn columns_require_object_metadata_for_values(columns: &[ColumnMetadata]) -> bool {
-    columns.iter().any(column_requires_object_metadata_for_value)
+    columns
+        .iter()
+        .any(column_requires_object_metadata_for_value)
 }
 
 fn column_types_require_define_fetch_for_values(column_types: &[OracleColumnType]) -> bool {
