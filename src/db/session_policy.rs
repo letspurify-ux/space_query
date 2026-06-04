@@ -2466,8 +2466,12 @@ mod tests {
             crate::db::SessionResidueState::new(true),
             crate::db::SessionLockState::default(),
         );
+        // A genuinely blocking transaction state (decision_required) must not be
+        // bypassed by a cleanup statement: the user still has to commit/rollback
+        // first. (Plain MaybeDirty no longer forces a decision — the user may
+        // keep working and the choice is deferred to tab close.)
         let dirty_unknown_state = unknown_residue_state.conservative_merge(
-            RetainedSessionState::from_transaction_state(TransactionSessionState::MaybeDirty),
+            RetainedSessionState::from_transaction_state(TransactionSessionState::DecisionRequired),
         );
 
         assert_eq!(
@@ -2762,32 +2766,35 @@ mod tests {
     }
 
     /// session.md §15 Execute precondition: blocked / decision_required /
-    /// invalid sessions must require resolution. Typed session residue is
-    /// retained so the same editor can keep using it; unknown residue and
-    /// locks still block generic Execute because only SQL-specific cleanup
-    /// preflight can prove a safe next statement.
+    /// invalid sessions must require resolution. Session residue — typed *or*
+    /// unknown — is retained so the same editor can keep using the preserved
+    /// session, so it does NOT block generic Execute. Only locks (whose next
+    /// statement needs SQL-specific cleanup) and ambiguous transaction states
+    /// still block.
     #[test]
-    fn execute_preflight_blocks_blocked_transaction_states_unknown_residue_and_locks() {
+    fn execute_preflight_blocks_blocked_transaction_states_and_locks_not_residue() {
         let clean_with_typed_residue = RetainedSessionState::from_parts(
             TransactionSessionState::Clean,
             crate::db::SessionResidueState::user_variable_for_test(),
             crate::db::SessionLockState::default(),
         );
-        assert!(clean_with_typed_residue.requires_resolution());
-        assert_eq!(
-            retained_session_state_preflight_decision(
-                RetainedSessionPreflightAction::Execute,
-                clean_with_typed_residue,
-            ),
-            RetainedSessionPreflightDecision::Allow,
-            "typed residue must remain usable by the next statement in the same editor",
-        );
-
         let clean_with_unknown_residue = RetainedSessionState::from_parts(
             TransactionSessionState::Clean,
             crate::db::SessionResidueState::new(true),
             crate::db::SessionLockState::default(),
         );
+        for state in [clean_with_typed_residue, clean_with_unknown_residue] {
+            assert!(state.requires_resolution());
+            assert_eq!(
+                retained_session_state_preflight_decision(
+                    RetainedSessionPreflightAction::Execute,
+                    state,
+                ),
+                RetainedSessionPreflightDecision::Allow,
+                "session residue must remain usable by the next statement, not block it: {state:?}",
+            );
+        }
+
         let clean_with_table_lock = RetainedSessionState::from_parts(
             TransactionSessionState::Clean,
             crate::db::SessionResidueState::default(),
@@ -2799,11 +2806,7 @@ mod tests {
             crate::db::SessionLockState::new(false, true),
         );
 
-        for state in [
-            clean_with_unknown_residue,
-            clean_with_table_lock,
-            clean_with_named_lock,
-        ] {
+        for state in [clean_with_table_lock, clean_with_named_lock] {
             assert!(state.requires_resolution());
             assert_eq!(
                 retained_session_state_preflight_decision(
@@ -2986,21 +2989,23 @@ mod tests {
     }
 
     #[test]
-    fn mysql_execute_preflight_allows_known_full_residue_cleanup() {
+    fn mysql_execute_preflight_allows_ordinary_and_cleanup_sql_with_unknown_residue() {
         let clean_with_unknown_residue = RetainedSessionState::from_parts(
             TransactionSessionState::Clean,
             crate::db::SessionResidueState::new(true),
             crate::db::SessionLockState::default(),
         );
 
+        // Unknown residue keeps the session bound but no longer blocks the next
+        // query: ordinary SQL runs on the same preserved session.
         assert_eq!(
             retained_session_state_execute_preflight_decision_for_sql(
                 DatabaseType::MySQL,
                 "SELECT 1",
                 clean_with_unknown_residue,
             ),
-            RetainedSessionPreflightDecision::RequireResolution,
-            "unknown retained residue must still block ordinary SQL",
+            RetainedSessionPreflightDecision::Allow,
+            "unknown retained residue must not block ordinary SQL",
         );
         assert_eq!(
             retained_session_state_execute_preflight_decision_for_sql(
@@ -3009,7 +3014,7 @@ mod tests {
                 clean_with_unknown_residue,
             ),
             RetainedSessionPreflightDecision::Allow,
-            "known full cleanup SQL must be executable while unknown residue is blocking",
+            "explicit full cleanup SQL is also allowed",
         );
     }
 

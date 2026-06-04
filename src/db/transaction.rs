@@ -395,15 +395,16 @@ impl RetainedSessionState {
                 // session changes that alter transaction semantics. Block the
                 // toggle until the user discards or explicitly cleans it.
                 && !self.may_have_unknown_session_state(),
-            // Typed residue such as temp tables, prepared statements, and
-            // user variables is exactly why this physical session is retained:
-            // the next statement in the same editor must be able to use or
-            // clean it. Unknown residue, locks, and transaction-mode overrides
-            // still block generic Execute because their next-statement
-            // semantics cannot be inferred safely without SQL-specific cleanup
-            // preflight.
+            // Session residue (typed *or* unknown) is exactly why this physical
+            // session is retained: the next statement in the same editor runs on
+            // the same preserved session and can use or clean it. Unknown residue
+            // (e.g. a successful PL/SQL block or MySQL CALL that may have touched
+            // session state) therefore must NOT block the next query — a
+            // *successful* statement should never pop the commit/rollback/discard
+            // modal. The genuine blockers remain: an ambiguous/invalid transaction
+            // state, a held session lock, and a pending one-shot transaction-mode
+            // override that the next statement must consume in order.
             blocks_execution: self.transaction_state.blocks_execution()
-                || self.may_have_unknown_session_state()
                 || self.may_hold_session_lock()
                 || self.may_have_transaction_mode_override(),
         }
@@ -4581,6 +4582,11 @@ mod tests {
 
     #[test]
     fn oracle_plsql_and_procedure_track_untracked_session_state() {
+        // PL/SQL blocks / procedure calls may touch package or session state, so
+        // the physical session is still preserved (untracked residue). But a
+        // *successful* call must NOT block the next query: otherwise the next
+        // Ctrl+Enter pops the commit/rollback/discard modal even though nothing
+        // was cancelled. Session preservation and non-blocking are now decoupled.
         let post_processor = statement_session_post_processor_for(DatabaseType::Oracle);
 
         for sql in [
@@ -4604,7 +4610,10 @@ mod tests {
                 "{sql} can leave package or other Oracle session state"
             );
             assert!(retained.requires_physical_session_preservation(), "{sql}");
-            assert_eq!(retained.label(), "session state", "{sql}");
+            assert!(
+                !retained.blocks_execution(),
+                "{sql} succeeded; it must not block the next query"
+            );
         }
     }
 
@@ -5839,8 +5848,12 @@ mod tests {
             false,
             false,
         );
+        // Untracked SESSION residue keeps the physical session bound (resolution
+        // is required at close/connection-transition) but does not block the next
+        // query: the next statement runs on the same preserved session.
         assert!(retained.requires_resolution());
-        assert!(retained.blocks_execution());
+        assert!(retained.requires_physical_session_preservation());
+        assert!(!retained.blocks_execution());
     }
 
     #[test]
