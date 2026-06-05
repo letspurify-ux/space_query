@@ -1565,6 +1565,60 @@ fn bind_xmltype_column_round_trips_large_clob_like_python_oracledb() {
 
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn fetch_binary_xmltype_storage_decodes_like_python_oracledb() {
+    let config = live_config();
+    let table = unique_table_name("XML_BIN");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    match conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, doc XMLTYPE) \
+         TABLESPACE USERS XMLTYPE COLUMN doc STORE AS BINARY XML"
+    )) {
+        Ok(()) => {}
+        Err(err)
+            if err.to_string().contains("ORA-00902")
+                || err.to_string().contains("ORA-03001")
+                || err.to_string().contains("ORA-43853") =>
+        {
+            eprintln!(
+                "skipping BINARY XMLTYPE storage test: database tablespace does not support it"
+            );
+            return;
+        }
+        Err(err) => panic!("create BINARY XMLTYPE storage test table: {err}"),
+    }
+
+    let payload = format!("<root><payload>{}</payload></root>", "x".repeat(9000));
+    let mut insert = StatementRequest::statement(format!(
+        "BEGIN \
+         INSERT INTO {table} (id, doc) VALUES (:1, SYS.XMLTYPE(:2)); \
+         END;"
+    ));
+    insert.binds.push(BindValue::Number("1".to_string()));
+    insert.binds.push(BindValue::Clob(payload.clone()));
+    conn.execute(&insert, 0)
+        .expect("insert BINARY XMLTYPE storage row");
+
+    let result = conn
+        .query_described_fetch_all(format!("SELECT doc FROM {table} WHERE id = 1"), 1)
+        .expect("fetch BINARY XMLTYPE storage row");
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Xml]
+    );
+    let expected = format!(
+        "<root>\n  <payload>{}</payload>\n</root>\n",
+        "x".repeat(9000)
+    );
+    assert_eq!(rows_to_strings(&result.result.rows), vec![vec![expected]]);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn bind_clob_column_round_trips_large_text() {
     let config = live_config();
     let table = unique_table_name("CLOB_BIND");
@@ -5544,7 +5598,8 @@ fn select_udt_object_and_collection_columns_decode_like_python_oracledb() {
         "CREATE TYPE {object_type_name} AS OBJECT (\
          number_value NUMBER, \
          xml_value XMLTYPE, \
-         string_value VARCHAR2(60))"
+         string_value VARCHAR2(60), \
+         fixed_char_value CHAR(5))"
     ))
     .expect("create direct SELECT XMLTYPE UDT type");
     conn.query_drop(&format!(
@@ -5559,7 +5614,8 @@ fn select_udt_object_and_collection_columns_decode_like_python_oracledb() {
                     {object_type_name}(\
                         2339, \
                         SYS.XMLTYPE('<item>test_2339</item>'), \
-                        'A string for test 2339'\
+                        'A string for test 2339', \
+                        CAST('abc' AS CHAR(5))\
                     ) AS obj, \
                     {collection_type_name}(\
                         CAST(RPAD('D', 4000, 'D') AS VARCHAR2(4000)), \
@@ -5569,7 +5625,7 @@ fn select_udt_object_and_collection_columns_decode_like_python_oracledb() {
              FROM dual \
              UNION ALL \
              SELECT 2 AS sort_key, \
-                    {object_type_name}(2349, NULL, 'A string for test 2349') AS obj, \
+                    {object_type_name}(2349, NULL, 'A string for test 2349', NULL) AS obj, \
                     CAST(NULL AS {collection_type_name}) AS items \
              FROM dual\
          ) \
@@ -5610,6 +5666,11 @@ fn select_udt_object_and_collection_columns_decode_like_python_oracledb() {
         first_object_attrs[2].1,
         OracleValue::Text("A string for test 2339".to_string())
     );
+    assert_eq!(first_object_attrs[3].0, "FIXED_CHAR_VALUE");
+    assert_eq!(
+        first_object_attrs[3].1,
+        OracleValue::Text("abc  ".to_string())
+    );
 
     let collection_values = match &rows.result.rows[0][1] {
         OracleValue::Array(values) => values,
@@ -5636,6 +5697,8 @@ fn select_udt_object_and_collection_columns_decode_like_python_oracledb() {
         second_object_attrs[2].1,
         OracleValue::Text("A string for test 2349".to_string())
     );
+    assert_eq!(second_object_attrs[3].0, "FIXED_CHAR_VALUE");
+    assert_eq!(second_object_attrs[3].1, OracleValue::Null);
     assert_eq!(rows.result.rows[1][1], OracleValue::Null);
 
     let initial = conn
@@ -5670,12 +5733,156 @@ fn select_udt_object_and_collection_columns_decode_like_python_oracledb() {
 
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn select_xmltype_collection_column_decodes_like_python_oracledb() {
+    let config = live_config();
+    let collection_type_name = unique_object_name("SEL_XML_TAB");
+    let _collection_guard = TypeDropGuard::new(config.clone(), collection_type_name.clone());
+    let mut conn = connect_with_config(config);
+    drop_type_ignore(&mut conn, &collection_type_name);
+    conn.query_drop(&format!(
+        "CREATE TYPE {collection_type_name} AS TABLE OF SYS.XMLTYPE"
+    ))
+    .expect("create direct SELECT XMLTYPE collection type");
+
+    let sql = format!(
+        "SELECT items \
+         FROM (\
+             SELECT 1 AS sort_key, \
+                    {collection_type_name}(\
+                        SYS.XMLTYPE('<item>small</item>'), \
+                        SYS.XMLTYPE(\
+                            TO_CLOB('<root><payload>') || \
+                            TO_CLOB(RPAD('x', 3000, 'x')) || \
+                            TO_CLOB('</payload></root>')\
+                        ), \
+                        NULL\
+                    ) AS items \
+             FROM dual \
+             UNION ALL \
+             SELECT 2 AS sort_key, CAST(NULL AS {collection_type_name}) AS items \
+             FROM dual\
+         ) \
+         ORDER BY sort_key"
+    );
+
+    let rows = conn
+        .query_described_fetch_all(sql.clone(), 1)
+        .expect("fetch direct SELECT XMLTYPE collection rows");
+    assert_eq!(
+        rows.columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Unsupported(109)]
+    );
+    assert_eq!(rows.result.rows.len(), 2);
+    assert_xmltype_collection_rows(&rows.result.rows);
+
+    let initial = conn
+        .query_described_initial_request(&StatementRequest::query(sql, 1))
+        .expect("initial direct SELECT XMLTYPE collection query");
+    assert!(
+        initial.result.rows.is_empty(),
+        "XMLTYPE collection metadata queries should use no-prefetch initial execution"
+    );
+    let cursor_id = initial
+        .result
+        .cursor_id
+        .expect("initial XMLTYPE collection query cursor id");
+    let fetched = conn
+        .fetch_ref_cursor_all(cursor_id, initial.columns, 1)
+        .expect("fetch initial direct SELECT XMLTYPE collection rows");
+    assert_eq!(fetched.result.rows.len(), 2);
+    assert_xmltype_collection_rows(&fetched.result.rows);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn select_udt_xmltype_collection_attribute_decodes_like_python_oracledb() {
+    let config = live_config();
+    let collection_type_name = unique_object_name("SEL_XML_ATTR_TAB");
+    let parent_type_name = unique_object_name("SEL_XML_ATTR_OBJ");
+    let _collection_guard = TypeDropGuard::new(config.clone(), collection_type_name.clone());
+    let _parent_guard = TypeDropGuard::new(config.clone(), parent_type_name.clone());
+    let mut conn = connect_with_config(config);
+    drop_type_ignore(&mut conn, &parent_type_name);
+    drop_type_ignore(&mut conn, &collection_type_name);
+    conn.query_drop(&format!(
+        "CREATE TYPE {collection_type_name} AS TABLE OF SYS.XMLTYPE"
+    ))
+    .expect("create XMLTYPE collection attribute type");
+    conn.query_drop(&format!(
+        "CREATE TYPE {parent_type_name} AS OBJECT (\
+         id NUMBER, \
+         items {collection_type_name})"
+    ))
+    .expect("create XMLTYPE collection attribute parent type");
+
+    let sql = format!(
+        "SELECT obj \
+         FROM (\
+             SELECT 1 AS sort_key, \
+                    {parent_type_name}(\
+                        1, \
+                        {collection_type_name}(\
+                            SYS.XMLTYPE('<item>attr</item>'), \
+                            SYS.XMLTYPE(\
+                                TO_CLOB('<root><payload>') || \
+                                TO_CLOB(RPAD('x', 3000, 'x')) || \
+                                TO_CLOB('</payload></root>')\
+                            ), \
+                            NULL\
+                        )\
+                    ) AS obj \
+             FROM dual \
+             UNION ALL \
+             SELECT 2 AS sort_key, {parent_type_name}(2, NULL) AS obj \
+             FROM dual\
+         ) \
+         ORDER BY sort_key"
+    );
+
+    let rows = conn
+        .query_described_fetch_all(sql.clone(), 1)
+        .expect("fetch direct SELECT XMLTYPE collection attribute rows");
+    assert_eq!(
+        rows.columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Unsupported(109)]
+    );
+    assert_eq!(rows.result.rows.len(), 2);
+    assert_xmltype_collection_object_rows(&rows.result.rows);
+
+    let initial = conn
+        .query_described_initial_request(&StatementRequest::query(sql, 1))
+        .expect("initial direct SELECT XMLTYPE collection attribute query");
+    assert!(
+        initial.result.rows.is_empty(),
+        "XMLTYPE collection attribute metadata queries should use no-prefetch initial execution"
+    );
+    let cursor_id = initial
+        .result
+        .cursor_id
+        .expect("initial XMLTYPE collection attribute query cursor id");
+    let fetched = conn
+        .fetch_ref_cursor_all(cursor_id, initial.columns, 1)
+        .expect("fetch initial direct SELECT XMLTYPE collection attribute rows");
+    assert_eq!(fetched.result.rows.len(), 2);
+    assert_xmltype_collection_object_rows(&fetched.result.rows);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn select_udt_scalar_attributes_decode_like_python_oracledb() {
     let config = live_config();
     let type_name = unique_object_name("SEL_SCALAR_OBJ");
     let _guard = TypeDropGuard::new(config.clone(), type_name.clone());
     let mut conn = connect_with_config(config);
     drop_type_ignore(&mut conn, &type_name);
+    conn.query_drop("ALTER SESSION SET TIME_ZONE = '+00:00'")
+        .expect("set deterministic session time zone");
     conn.query_drop(&format!(
         "CREATE TYPE {type_name} AS OBJECT (\
          id NUMBER, \
@@ -5683,6 +5890,12 @@ fn select_udt_scalar_attributes_decode_like_python_oracledb() {
          created_on DATE, \
          stamped_at TIMESTAMP, \
          stamped_tz TIMESTAMP WITH TIME ZONE, \
+         stamped_ltz TIMESTAMP WITH LOCAL TIME ZONE, \
+         int_value INTEGER, \
+         smallint_value SMALLINT, \
+         real_value REAL, \
+         double_precision_value DOUBLE PRECISION, \
+         float_value FLOAT, \
          score_float BINARY_FLOAT, \
          score_double BINARY_DOUBLE, \
          active BOOLEAN, \
@@ -5705,6 +5918,13 @@ fn select_udt_scalar_attributes_decode_like_python_oracledb() {
                             '2024-01-02 03:04:05.123456 +09:00', \
                             'YYYY-MM-DD HH24:MI:SS.FF TZH:TZM'\
                         ), \
+                        CAST(TIMESTAMP '2024-01-02 03:04:05.654321' \
+                            AS TIMESTAMP WITH LOCAL TIME ZONE), \
+                        27, \
+                        13, \
+                        184.875, \
+                        1.375, \
+                        23.0, \
                         CAST(3.5 AS BINARY_FLOAT), \
                         CAST(-2.25 AS BINARY_DOUBLE), \
                         TRUE, \
@@ -5717,7 +5937,18 @@ fn select_udt_scalar_attributes_decode_like_python_oracledb() {
              SELECT 2 AS sort_key, \
                     {type_name}(\
                         8, \
-                        NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL\
+                        NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
+                        NULL, NULL, NULL, NULL, NULL\
+                    ) AS obj \
+             FROM dual \
+             UNION ALL \
+             SELECT 3 AS sort_key, \
+                    {type_name}(\
+                        9, \
+                        NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
+                        BINARY_FLOAT_NAN, \
+                        BINARY_DOUBLE_INFINITY, \
+                        NULL, NULL, NULL, NULL\
                     ) AS obj \
              FROM dual\
          ) \
@@ -5733,7 +5964,7 @@ fn select_udt_scalar_attributes_decode_like_python_oracledb() {
             .collect::<Vec<_>>(),
         vec![OracleColumnType::Unsupported(109)]
     );
-    assert_eq!(rows.result.rows.len(), 2);
+    assert_eq!(rows.result.rows.len(), 3);
     assert_scalar_object_attribute_rows(&rows.result.rows);
 
     let initial = conn
@@ -5750,7 +5981,7 @@ fn select_udt_scalar_attributes_decode_like_python_oracledb() {
     let fetched = conn
         .fetch_ref_cursor_all(cursor_id, initial.columns, 1)
         .expect("fetch initial direct SELECT scalar UDT rows");
-    assert_eq!(fetched.result.rows.len(), 2);
+    assert_eq!(fetched.result.rows.len(), 3);
     assert_scalar_object_attribute_rows(&fetched.result.rows);
 }
 
@@ -5899,6 +6130,277 @@ fn select_udt_nchar_attributes_decode_like_python_oracledb() {
 
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn select_quoted_udt_object_decodes_like_python_oracledb() {
+    let config = live_config();
+    let type_name = format!("\"{}\"", unique_object_name("Q_OBJ").to_ascii_lowercase());
+    let _guard = TypeDropGuard::new(config.clone(), type_name.clone());
+    let mut conn = connect_with_config(config);
+    drop_type_ignore(&mut conn, &type_name);
+    conn.query_drop(&format!(
+        "CREATE TYPE {type_name} AS OBJECT (\
+         \"idAttr\" NUMBER, \
+         \"labelAttr\" VARCHAR2(20))"
+    ))
+    .expect("create quoted direct SELECT UDT type");
+
+    let sql = format!("SELECT {type_name}(7, 'quoted') AS obj FROM dual");
+    let rows = conn
+        .query_described_fetch_all(sql.clone(), 1)
+        .expect("fetch quoted direct SELECT UDT rows");
+    assert_eq!(
+        rows.columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Unsupported(109)]
+    );
+    assert_quoted_object_rows(&rows.result.rows);
+
+    let initial = conn
+        .query_described_initial_request(&StatementRequest::query(sql, 1))
+        .expect("initial quoted direct SELECT UDT query");
+    assert!(
+        initial.result.rows.is_empty(),
+        "quoted object metadata queries should use no-prefetch initial execution"
+    );
+    let cursor_id = initial
+        .result
+        .cursor_id
+        .expect("initial quoted UDT query cursor id");
+    let fetched = conn
+        .fetch_ref_cursor_all(cursor_id, initial.columns, 1)
+        .expect("fetch initial quoted direct SELECT UDT rows");
+    assert_quoted_object_rows(&fetched.result.rows);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn select_quoted_udt_object_collection_attribute_decodes_like_python_oracledb() {
+    let config = live_config();
+    let child_type_name = format!(
+        "\"{}\"",
+        unique_object_name("Q_OCA_CHILD").to_ascii_lowercase()
+    );
+    let collection_type_name = format!(
+        "\"{}\"",
+        unique_object_name("Q_OCA_TAB").to_ascii_lowercase()
+    );
+    let parent_type_name = format!(
+        "\"{}\"",
+        unique_object_name("Q_OCA_PARENT").to_ascii_lowercase()
+    );
+    let _child_guard = TypeDropGuard::new(config.clone(), child_type_name.clone());
+    let _collection_guard = TypeDropGuard::new(config.clone(), collection_type_name.clone());
+    let _parent_guard = TypeDropGuard::new(config.clone(), parent_type_name.clone());
+    let mut conn = connect_with_config(config);
+    drop_type_ignore(&mut conn, &parent_type_name);
+    drop_type_ignore(&mut conn, &collection_type_name);
+    drop_type_ignore(&mut conn, &child_type_name);
+    conn.query_drop(&format!(
+        "CREATE TYPE {child_type_name} AS OBJECT (\
+         \"childId\" NUMBER, \
+         \"childLabel\" VARCHAR2(30), \
+         \"fixedLabel\" CHAR(5))"
+    ))
+    .expect("create quoted object collection attribute element type");
+    conn.query_drop(&format!(
+        "CREATE TYPE {collection_type_name} AS TABLE OF {child_type_name}"
+    ))
+    .expect("create quoted object collection attribute type");
+    conn.query_drop(&format!(
+        "CREATE TYPE {parent_type_name} AS OBJECT (\
+         \"parentId\" NUMBER, \
+         \"items\" {collection_type_name}, \
+         \"labelAttr\" VARCHAR2(20))"
+    ))
+    .expect("create quoted object collection attribute parent type");
+
+    let sql = format!(
+        "SELECT obj \
+         FROM (\
+             SELECT 1 AS sort_key, \
+                    {parent_type_name}(\
+                        1, \
+                        {collection_type_name}(\
+                            {child_type_name}(10, 'first', CAST('ab' AS CHAR(5))), \
+                            NULL, \
+                            {child_type_name}(20, 'tail', CAST('xy' AS CHAR(5)))\
+                        ), \
+                        'has_items'\
+                    ) AS obj \
+             FROM dual \
+             UNION ALL \
+             SELECT 2 AS sort_key, \
+                    {parent_type_name}(2, CAST(NULL AS {collection_type_name}), 'null_items') AS obj \
+             FROM dual\
+         ) \
+         ORDER BY sort_key"
+    );
+    let rows = conn
+        .query_described_fetch_all(sql.clone(), 1)
+        .expect("fetch quoted direct SELECT UDT object collection attribute rows");
+    assert_eq!(
+        rows.columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Unsupported(109)]
+    );
+    assert_quoted_object_collection_attribute_rows(&rows.result.rows);
+
+    let initial = conn
+        .query_described_initial_request(&StatementRequest::query(sql, 1))
+        .expect("initial quoted direct SELECT UDT object collection attribute query");
+    assert!(
+        initial.result.rows.is_empty(),
+        "quoted object collection attribute metadata queries should use no-prefetch initial execution"
+    );
+    let cursor_id = initial
+        .result
+        .cursor_id
+        .expect("initial quoted UDT object collection attribute query cursor id");
+    let fetched = conn
+        .fetch_ref_cursor_all(cursor_id, initial.columns, 1)
+        .expect("fetch initial quoted direct SELECT UDT object collection attribute rows");
+    assert_quoted_object_collection_attribute_rows(&fetched.result.rows);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn select_quoted_builtin_name_udt_attribute_decodes_like_python_oracledb() {
+    let config = live_config();
+    let child_type_name = "\"number\"".to_string();
+    let parent_type_name = format!(
+        "\"{}\"",
+        unique_object_name("Q_BUILTIN_PARENT").to_ascii_lowercase()
+    );
+    let _child_guard = TypeDropGuard::new(config.clone(), child_type_name.clone());
+    let _parent_guard = TypeDropGuard::new(config.clone(), parent_type_name.clone());
+    let mut conn = connect_with_config(config);
+    drop_type_ignore(&mut conn, &parent_type_name);
+    drop_type_ignore(&mut conn, &child_type_name);
+    conn.query_drop(&format!(
+        "CREATE TYPE {child_type_name} AS OBJECT (\
+         \"valueAttr\" NUMBER, \
+         \"labelAttr\" VARCHAR2(20))"
+    ))
+    .expect("create quoted builtin-name child UDT type");
+    conn.query_drop(&format!(
+        "CREATE TYPE {parent_type_name} AS OBJECT (\
+         \"idAttr\" NUMBER, \
+         \"payload\" {child_type_name})"
+    ))
+    .expect("create quoted builtin-name parent UDT type");
+
+    let sql = format!(
+        "SELECT obj \
+         FROM (\
+             SELECT 1 AS sort_key, \
+                    {parent_type_name}(1, {child_type_name}(42, 'nested')) AS obj \
+             FROM dual \
+             UNION ALL \
+             SELECT 2 AS sort_key, {parent_type_name}(2, NULL) AS obj \
+             FROM dual\
+         ) \
+         ORDER BY sort_key"
+    );
+    let rows = conn
+        .query_described_fetch_all(sql.clone(), 1)
+        .expect("fetch quoted builtin-name direct SELECT UDT rows");
+    assert_eq!(
+        rows.columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Unsupported(109)]
+    );
+    assert_quoted_builtin_name_object_rows(&rows.result.rows);
+
+    let initial = conn
+        .query_described_initial_request(&StatementRequest::query(sql, 1))
+        .expect("initial quoted builtin-name direct SELECT UDT query");
+    assert!(
+        initial.result.rows.is_empty(),
+        "quoted builtin-name object metadata queries should use no-prefetch initial execution"
+    );
+    let cursor_id = initial
+        .result
+        .cursor_id
+        .expect("initial quoted builtin-name UDT query cursor id");
+    let fetched = conn
+        .fetch_ref_cursor_all(cursor_id, initial.columns, 1)
+        .expect("fetch initial quoted builtin-name direct SELECT UDT rows");
+    assert_quoted_builtin_name_object_rows(&fetched.result.rows);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn select_quoted_builtin_name_collection_attribute_decodes_like_python_oracledb() {
+    let config = live_config();
+    let collection_type_name = "\"varchar2\"".to_string();
+    let parent_type_name = format!(
+        "\"{}\"",
+        unique_object_name("Q_BUILTIN_COLL_PARENT").to_ascii_lowercase()
+    );
+    let _collection_guard = TypeDropGuard::new(config.clone(), collection_type_name.clone());
+    let _parent_guard = TypeDropGuard::new(config.clone(), parent_type_name.clone());
+    let mut conn = connect_with_config(config);
+    drop_type_ignore(&mut conn, &parent_type_name);
+    drop_type_ignore(&mut conn, &collection_type_name);
+    conn.query_drop(&format!(
+        "CREATE TYPE {collection_type_name} AS TABLE OF NUMBER"
+    ))
+    .expect("create quoted builtin-name collection UDT type");
+    conn.query_drop(&format!(
+        "CREATE TYPE {parent_type_name} AS OBJECT (\
+         \"idAttr\" NUMBER, \
+         \"items\" {collection_type_name})"
+    ))
+    .expect("create quoted builtin-name collection parent UDT type");
+
+    let sql = format!(
+        "SELECT obj \
+         FROM (\
+             SELECT 1 AS sort_key, \
+                    {parent_type_name}(1, {collection_type_name}(10, NULL, 30)) AS obj \
+             FROM dual \
+             UNION ALL \
+             SELECT 2 AS sort_key, {parent_type_name}(2, NULL) AS obj \
+             FROM dual\
+         ) \
+         ORDER BY sort_key"
+    );
+    let rows = conn
+        .query_described_fetch_all(sql.clone(), 1)
+        .expect("fetch quoted builtin-name collection direct SELECT UDT rows");
+    assert_eq!(
+        rows.columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Unsupported(109)]
+    );
+    assert_quoted_builtin_name_collection_rows(&rows.result.rows);
+
+    let initial = conn
+        .query_described_initial_request(&StatementRequest::query(sql, 1))
+        .expect("initial quoted builtin-name collection direct SELECT UDT query");
+    assert!(
+        initial.result.rows.is_empty(),
+        "quoted builtin-name collection metadata queries should use no-prefetch initial execution"
+    );
+    let cursor_id = initial
+        .result
+        .cursor_id
+        .expect("initial quoted builtin-name collection UDT query cursor id");
+    let fetched = conn
+        .fetch_ref_cursor_all(cursor_id, initial.columns, 1)
+        .expect("fetch initial quoted builtin-name collection direct SELECT UDT rows");
+    assert_quoted_builtin_name_collection_rows(&fetched.result.rows);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn select_nested_udt_object_attribute_decodes_null_like_python_oracledb() {
     let config = live_config();
     let child_type_name = unique_object_name("SEL_CHILD_OBJ");
@@ -5963,20 +6465,38 @@ fn select_nested_udt_object_attribute_decodes_null_like_python_oracledb() {
 fn select_udt_collection_attribute_decodes_null_like_python_oracledb() {
     let config = live_config();
     let collection_type_name = unique_object_name("SEL_ATTR_TAB");
+    let char_collection_type_name = unique_object_name("SEL_ATTR_CHAR_TAB");
+    let nchar_collection_type_name = unique_object_name("SEL_ATTR_NCHAR_TAB");
     let parent_type_name = unique_object_name("SEL_ATTR_PARENT");
     let _collection_guard = TypeDropGuard::new(config.clone(), collection_type_name.clone());
+    let _char_collection_guard =
+        TypeDropGuard::new(config.clone(), char_collection_type_name.clone());
+    let _nchar_collection_guard =
+        TypeDropGuard::new(config.clone(), nchar_collection_type_name.clone());
     let _parent_guard = TypeDropGuard::new(config.clone(), parent_type_name.clone());
     let mut conn = connect_with_config(config);
     drop_type_ignore(&mut conn, &parent_type_name);
+    drop_type_ignore(&mut conn, &nchar_collection_type_name);
+    drop_type_ignore(&mut conn, &char_collection_type_name);
     drop_type_ignore(&mut conn, &collection_type_name);
     conn.query_drop(&format!(
         "CREATE TYPE {collection_type_name} AS TABLE OF VARCHAR2(20)"
     ))
     .expect("create direct SELECT collection attribute type");
     conn.query_drop(&format!(
+        "CREATE TYPE {char_collection_type_name} AS TABLE OF CHAR(5)"
+    ))
+    .expect("create direct SELECT CHAR collection attribute type");
+    conn.query_drop(&format!(
+        "CREATE TYPE {nchar_collection_type_name} AS TABLE OF NCHAR(3)"
+    ))
+    .expect("create direct SELECT NCHAR collection attribute type");
+    conn.query_drop(&format!(
         "CREATE TYPE {parent_type_name} AS OBJECT (\
          id NUMBER, \
-         items {collection_type_name})"
+         items {collection_type_name}, \
+         char_items {char_collection_type_name}, \
+         nchar_items {nchar_collection_type_name})"
     ))
     .expect("create direct SELECT collection attribute parent type");
 
@@ -5986,14 +6506,22 @@ fn select_udt_collection_attribute_decodes_null_like_python_oracledb() {
              SELECT 1 AS sort_key, \
                     {parent_type_name}(\
                         1, \
-                        {collection_type_name}('first', NULL, 'tail')\
+                        {collection_type_name}('first', NULL, 'tail'), \
+                        {char_collection_type_name}(CAST('ab' AS CHAR(5)), NULL, CAST('xyz' AS CHAR(5))), \
+                        {nchar_collection_type_name}(\
+                            CAST(UNISTR('\\D55C') AS NCHAR(3)), \
+                            NULL, \
+                            CAST(UNISTR('\\AE00\\B098') AS NCHAR(3))\
+                        )\
                     ) AS obj \
              FROM dual \
              UNION ALL \
              SELECT 2 AS sort_key, \
                     {parent_type_name}(\
                         2, \
-                        CAST(NULL AS {collection_type_name})\
+                        CAST(NULL AS {collection_type_name}), \
+                        CAST(NULL AS {char_collection_type_name}), \
+                        CAST(NULL AS {nchar_collection_type_name})\
                     ) AS obj \
              FROM dual\
          ) \
@@ -6021,6 +6549,157 @@ fn select_udt_collection_attribute_decodes_null_like_python_oracledb() {
         .expect("fetch initial direct SELECT UDT collection attribute rows");
     assert_eq!(fetched.result.rows.len(), 2);
     assert_collection_attribute_rows(&fetched.result.rows);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn select_udt_object_collection_attribute_decodes_like_python_oracledb() {
+    let config = live_config();
+    let child_type_name = unique_object_name("SEL_OCA_CHILD");
+    let collection_type_name = unique_object_name("SEL_OCA_TAB");
+    let parent_type_name = unique_object_name("SEL_OCA_PARENT");
+    let _child_guard = TypeDropGuard::new(config.clone(), child_type_name.clone());
+    let _collection_guard = TypeDropGuard::new(config.clone(), collection_type_name.clone());
+    let _parent_guard = TypeDropGuard::new(config.clone(), parent_type_name.clone());
+    let mut conn = connect_with_config(config);
+    drop_type_ignore(&mut conn, &parent_type_name);
+    drop_type_ignore(&mut conn, &collection_type_name);
+    drop_type_ignore(&mut conn, &child_type_name);
+    conn.query_drop(&format!(
+        "CREATE TYPE {child_type_name} AS OBJECT (\
+         child_id NUMBER, \
+         child_label VARCHAR2(30), \
+         fixed_label CHAR(5))"
+    ))
+    .expect("create direct SELECT object collection attribute element type");
+    conn.query_drop(&format!(
+        "CREATE TYPE {collection_type_name} AS TABLE OF {child_type_name}"
+    ))
+    .expect("create direct SELECT object collection attribute type");
+    conn.query_drop(&format!(
+        "CREATE TYPE {parent_type_name} AS OBJECT (\
+         id NUMBER, \
+         items {collection_type_name}, \
+         label VARCHAR2(20))"
+    ))
+    .expect("create direct SELECT object collection attribute parent type");
+
+    let sql = format!(
+        "SELECT obj \
+         FROM (\
+             SELECT 1 AS sort_key, \
+                    {parent_type_name}(\
+                        1, \
+                        {collection_type_name}(\
+                            {child_type_name}(10, 'first', CAST('ab' AS CHAR(5))), \
+                            NULL, \
+                            {child_type_name}(20, 'tail', CAST('xy' AS CHAR(5)))\
+                        ), \
+                        'has_items'\
+                    ) AS obj \
+             FROM dual \
+             UNION ALL \
+             SELECT 2 AS sort_key, \
+                    {parent_type_name}(2, CAST(NULL AS {collection_type_name}), 'null_items') AS obj \
+             FROM dual\
+         ) \
+         ORDER BY sort_key"
+    );
+    let rows = conn
+        .query_described_fetch_all(sql.clone(), 1)
+        .expect("fetch direct SELECT UDT object collection attribute rows");
+    assert_eq!(
+        rows.columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Unsupported(109)]
+    );
+    assert_object_collection_attribute_rows(&rows.result.rows);
+
+    let initial = conn
+        .query_described_initial_request(&StatementRequest::query(sql, 1))
+        .expect("initial direct SELECT UDT object collection attribute query");
+    assert!(
+        initial.result.rows.is_empty(),
+        "object collection attribute metadata queries should use no-prefetch initial execution"
+    );
+    let cursor_id = initial
+        .result
+        .cursor_id
+        .expect("initial UDT object collection attribute query cursor id");
+    let fetched = conn
+        .fetch_ref_cursor_all(cursor_id, initial.columns, 1)
+        .expect("fetch initial direct SELECT UDT object collection attribute rows");
+    assert_object_collection_attribute_rows(&fetched.result.rows);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn select_udt_object_collection_column_decodes_like_python_oracledb() {
+    let config = live_config();
+    let child_type_name = unique_object_name("SEL_OC_CHILD");
+    let collection_type_name = unique_object_name("SEL_OC_TAB");
+    let _child_guard = TypeDropGuard::new(config.clone(), child_type_name.clone());
+    let _collection_guard = TypeDropGuard::new(config.clone(), collection_type_name.clone());
+    let mut conn = connect_with_config(config);
+    drop_type_ignore(&mut conn, &collection_type_name);
+    drop_type_ignore(&mut conn, &child_type_name);
+    conn.query_drop(&format!(
+        "CREATE TYPE {child_type_name} AS OBJECT (\
+         child_id NUMBER, \
+         child_label VARCHAR2(30), \
+         fixed_label CHAR(5))"
+    ))
+    .expect("create direct SELECT object collection element type");
+    conn.query_drop(&format!(
+        "CREATE TYPE {collection_type_name} AS TABLE OF {child_type_name}"
+    ))
+    .expect("create direct SELECT object collection type");
+
+    let sql = format!(
+        "SELECT items \
+         FROM (\
+             SELECT 1 AS sort_key, \
+                    {collection_type_name}(\
+                        {child_type_name}(1, 'first', CAST('ab' AS CHAR(5))), \
+                        NULL, \
+                        {child_type_name}(3, 'tail', CAST('xy' AS CHAR(5)))\
+                    ) AS items \
+             FROM dual \
+             UNION ALL \
+             SELECT 2 AS sort_key, CAST(NULL AS {collection_type_name}) AS items \
+             FROM dual\
+         ) \
+         ORDER BY sort_key"
+    );
+    let rows = conn
+        .query_described_fetch_all(sql.clone(), 1)
+        .expect("fetch direct SELECT UDT object collection rows");
+    assert_eq!(
+        rows.columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Unsupported(109)]
+    );
+    assert_object_collection_column_rows(&rows.result.rows);
+
+    let initial = conn
+        .query_described_initial_request(&StatementRequest::query(sql, 1))
+        .expect("initial direct SELECT UDT object collection query");
+    assert!(
+        initial.result.rows.is_empty(),
+        "object collection metadata queries should use no-prefetch initial execution"
+    );
+    let cursor_id = initial
+        .result
+        .cursor_id
+        .expect("initial UDT object collection query cursor id");
+    let fetched = conn
+        .fetch_ref_cursor_all(cursor_id, initial.columns, 1)
+        .expect("fetch initial direct SELECT UDT object collection rows");
+    assert_object_collection_column_rows(&fetched.result.rows);
 }
 
 #[test]
@@ -6080,6 +6759,402 @@ fn select_nested_collection_column_decodes_like_python_oracledb() {
         .expect("fetch initial direct SELECT nested collection rows");
     assert_eq!(fetched.result.rows.len(), 1);
     assert_nested_number_collection(&fetched.result.rows[0][0]);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn select_fixed_string_collection_columns_decode_like_python_oracledb() {
+    let config = live_config();
+    let char_type_name = unique_object_name("SC_CHAR");
+    let nchar_type_name = unique_object_name("SC_NCHAR");
+    let varchar_type_name = unique_object_name("SC_VARCHAR");
+    let nvarchar_type_name = unique_object_name("SC_NVARCHAR");
+    let type_names = [
+        char_type_name.clone(),
+        nchar_type_name.clone(),
+        varchar_type_name.clone(),
+        nvarchar_type_name.clone(),
+    ];
+    let _guards = type_names
+        .iter()
+        .cloned()
+        .map(|type_name| TypeDropGuard::new(config.clone(), type_name))
+        .collect::<Vec<_>>();
+    let mut conn = connect_with_config(config);
+    for type_name in &type_names {
+        drop_type_ignore(&mut conn, type_name);
+    }
+    conn.query_drop(&format!("CREATE TYPE {char_type_name} AS TABLE OF CHAR(5)"))
+        .expect("create CHAR collection type");
+    conn.query_drop(&format!(
+        "CREATE TYPE {nchar_type_name} AS TABLE OF NCHAR(3)"
+    ))
+    .expect("create NCHAR collection type");
+    conn.query_drop(&format!(
+        "CREATE TYPE {varchar_type_name} AS TABLE OF VARCHAR2(10)"
+    ))
+    .expect("create VARCHAR2 collection type");
+    conn.query_drop(&format!(
+        "CREATE TYPE {nvarchar_type_name} AS TABLE OF NVARCHAR2(10)"
+    ))
+    .expect("create NVARCHAR2 collection type");
+
+    let sql = format!(
+        "SELECT char_items, nchar_items, varchar_items, nvarchar_items \
+         FROM (\
+             SELECT 1 AS sort_key, \
+                    {char_type_name}(CAST('ab' AS CHAR(5)), NULL, CAST('xyz' AS CHAR(5))) AS char_items, \
+                    {nchar_type_name}(\
+                        CAST(UNISTR('\\D55C') AS NCHAR(3)), \
+                        NULL, \
+                        CAST(UNISTR('\\AE00\\B098') AS NCHAR(3))\
+                    ) AS nchar_items, \
+                    {varchar_type_name}('ab', NULL, 'xyz') AS varchar_items, \
+                    {nvarchar_type_name}(\
+                        CAST(UNISTR('\\D55C') AS NVARCHAR2(10)), \
+                        NULL, \
+                        CAST(UNISTR('\\AE00\\B098') AS NVARCHAR2(10))\
+                    ) AS nvarchar_items \
+             FROM dual \
+             UNION ALL \
+             SELECT 2 AS sort_key, \
+                    CAST(NULL AS {char_type_name}), \
+                    CAST(NULL AS {nchar_type_name}), \
+                    CAST(NULL AS {varchar_type_name}), \
+                    CAST(NULL AS {nvarchar_type_name}) \
+             FROM dual\
+         ) \
+         ORDER BY sort_key"
+    );
+
+    let rows = conn
+        .query_described_fetch_all(sql.clone(), 1)
+        .expect("fetch direct SELECT fixed string collection rows");
+    assert_eq!(
+        rows.columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Unsupported(109); 4]
+    );
+    assert_fixed_string_collection_column_rows(&rows.result.rows);
+
+    let initial = conn
+        .query_described_initial_request(&StatementRequest::query(sql, 1))
+        .expect("initial direct SELECT fixed string collection query");
+    assert!(
+        initial.result.rows.is_empty(),
+        "fixed string collection metadata queries should use no-prefetch initial execution"
+    );
+    let cursor_id = initial
+        .result
+        .cursor_id
+        .expect("initial fixed string collection query cursor id");
+    let fetched = conn
+        .fetch_ref_cursor_all(cursor_id, initial.columns, 1)
+        .expect("fetch initial direct SELECT fixed string collection rows");
+    assert_fixed_string_collection_column_rows(&fetched.result.rows);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn select_scalar_collection_columns_decode_like_python_oracledb() {
+    let config = live_config();
+    let raw_type_name = unique_object_name("SC_RAW");
+    let date_type_name = unique_object_name("SC_DATE");
+    let timestamp_type_name = unique_object_name("SC_TS");
+    let timestamptz_type_name = unique_object_name("SC_TSTZ");
+    let timestampltz_type_name = unique_object_name("SC_TSLTZ");
+    let binary_float_type_name = unique_object_name("SC_BF");
+    let binary_double_type_name = unique_object_name("SC_BD");
+    let boolean_type_name = unique_object_name("SC_BOOL");
+    let interval_ym_type_name = unique_object_name("SC_IYM");
+    let interval_ds_type_name = unique_object_name("SC_IDS");
+    let type_names = [
+        raw_type_name.clone(),
+        date_type_name.clone(),
+        timestamp_type_name.clone(),
+        timestamptz_type_name.clone(),
+        timestampltz_type_name.clone(),
+        binary_float_type_name.clone(),
+        binary_double_type_name.clone(),
+        boolean_type_name.clone(),
+        interval_ym_type_name.clone(),
+        interval_ds_type_name.clone(),
+    ];
+    let _guards = type_names
+        .iter()
+        .cloned()
+        .map(|type_name| TypeDropGuard::new(config.clone(), type_name))
+        .collect::<Vec<_>>();
+    let mut conn = connect_with_config(config);
+    for type_name in &type_names {
+        drop_type_ignore(&mut conn, type_name);
+    }
+    conn.query_drop("ALTER SESSION SET TIME_ZONE = '+00:00'")
+        .expect("set deterministic session time zone");
+    conn.query_drop(&format!("CREATE TYPE {raw_type_name} AS TABLE OF RAW(4)"))
+        .expect("create RAW collection type");
+    conn.query_drop(&format!("CREATE TYPE {date_type_name} AS TABLE OF DATE"))
+        .expect("create DATE collection type");
+    conn.query_drop(&format!(
+        "CREATE TYPE {timestamp_type_name} AS TABLE OF TIMESTAMP"
+    ))
+    .expect("create TIMESTAMP collection type");
+    conn.query_drop(&format!(
+        "CREATE TYPE {timestamptz_type_name} AS TABLE OF TIMESTAMP WITH TIME ZONE"
+    ))
+    .expect("create TIMESTAMP WITH TIME ZONE collection type");
+    conn.query_drop(&format!(
+        "CREATE TYPE {timestampltz_type_name} AS TABLE OF TIMESTAMP WITH LOCAL TIME ZONE"
+    ))
+    .expect("create TIMESTAMP WITH LOCAL TIME ZONE collection type");
+    conn.query_drop(&format!(
+        "CREATE TYPE {binary_float_type_name} AS TABLE OF BINARY_FLOAT"
+    ))
+    .expect("create BINARY_FLOAT collection type");
+    conn.query_drop(&format!(
+        "CREATE TYPE {binary_double_type_name} AS TABLE OF BINARY_DOUBLE"
+    ))
+    .expect("create BINARY_DOUBLE collection type");
+    conn.query_drop(&format!(
+        "CREATE TYPE {boolean_type_name} AS TABLE OF BOOLEAN"
+    ))
+    .expect("create BOOLEAN collection type");
+    conn.query_drop(&format!(
+        "CREATE TYPE {interval_ym_type_name} AS TABLE OF INTERVAL YEAR TO MONTH"
+    ))
+    .expect("create INTERVAL YEAR TO MONTH collection type");
+    conn.query_drop(&format!(
+        "CREATE TYPE {interval_ds_type_name} AS TABLE OF INTERVAL DAY TO SECOND"
+    ))
+    .expect("create INTERVAL DAY TO SECOND collection type");
+
+    let sql = format!(
+        "SELECT raw_items, date_items, timestamp_items, timestamptz_items, \
+                timestampltz_items, binary_float_items, binary_double_items, \
+                boolean_items, interval_ym_items, interval_ds_items \
+         FROM (\
+             SELECT 1 AS sort_key, \
+                    {raw_type_name}(HEXTORAW('CAFE'), NULL) AS raw_items, \
+                    {date_type_name}(DATE '2024-02-29', NULL) AS date_items, \
+                    {timestamp_type_name}(TIMESTAMP '2024-01-02 03:04:05.123456', NULL) AS timestamp_items, \
+                    {timestamptz_type_name}(\
+                        TO_TIMESTAMP_TZ('2024-01-02 03:04:05.123456 +09:00', 'YYYY-MM-DD HH24:MI:SS.FF TZH:TZM'), \
+                        NULL\
+                    ) AS timestamptz_items, \
+                    {timestampltz_type_name}(\
+                        CAST(TIMESTAMP '2024-01-02 03:04:05.654321' AS TIMESTAMP WITH LOCAL TIME ZONE), \
+                        NULL\
+                    ) AS timestampltz_items, \
+                    {binary_float_type_name}(CAST(3.5 AS BINARY_FLOAT), NULL) AS binary_float_items, \
+                    {binary_double_type_name}(CAST(-2.25 AS BINARY_DOUBLE), NULL) AS binary_double_items, \
+                    {boolean_type_name}(TRUE, FALSE, NULL) AS boolean_items, \
+                    {interval_ym_type_name}(INTERVAL '2-10' YEAR TO MONTH, NULL) AS interval_ym_items, \
+                    {interval_ds_type_name}(INTERVAL '2 12:23:34.456789' DAY TO SECOND, NULL) AS interval_ds_items \
+             FROM dual \
+             UNION ALL \
+             SELECT 2 AS sort_key, \
+                    CAST(NULL AS {raw_type_name}), \
+                    CAST(NULL AS {date_type_name}), \
+                    CAST(NULL AS {timestamp_type_name}), \
+                    CAST(NULL AS {timestamptz_type_name}), \
+                    CAST(NULL AS {timestampltz_type_name}), \
+                    CAST(NULL AS {binary_float_type_name}), \
+                    CAST(NULL AS {binary_double_type_name}), \
+                    CAST(NULL AS {boolean_type_name}), \
+                    CAST(NULL AS {interval_ym_type_name}), \
+                    CAST(NULL AS {interval_ds_type_name}) \
+             FROM dual\
+         ) \
+         ORDER BY sort_key"
+    );
+
+    let rows = conn
+        .query_described_fetch_all(sql.clone(), 1)
+        .expect("fetch direct SELECT scalar collection rows");
+    assert_eq!(
+        rows.columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Unsupported(109); 10]
+    );
+    assert_scalar_collection_column_rows(&rows.result.rows);
+
+    let initial = conn
+        .query_described_initial_request(&StatementRequest::query(sql, 1))
+        .expect("initial direct SELECT scalar collection query");
+    assert!(
+        initial.result.rows.is_empty(),
+        "scalar collection metadata queries should use no-prefetch initial execution"
+    );
+    let cursor_id = initial
+        .result
+        .cursor_id
+        .expect("initial scalar collection query cursor id");
+    let fetched = conn
+        .fetch_ref_cursor_all(cursor_id, initial.columns, 1)
+        .expect("fetch initial direct SELECT scalar collection rows");
+    assert_scalar_collection_column_rows(&fetched.result.rows);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn select_varray_columns_decode_like_python_oracledb() {
+    let config = live_config();
+    let varray_type_name = unique_object_name("SEL_NUM_VARRAY");
+    let table_type_name = unique_object_name("SEL_TAB_VARRAY");
+    let _varray_guard = TypeDropGuard::new(config.clone(), varray_type_name.clone());
+    let _table_guard = TypeDropGuard::new(config.clone(), table_type_name.clone());
+    let mut conn = connect_with_config(config);
+    drop_type_ignore(&mut conn, &table_type_name);
+    drop_type_ignore(&mut conn, &varray_type_name);
+    conn.query_drop(&format!(
+        "CREATE TYPE {varray_type_name} AS VARRAY(5) OF NUMBER"
+    ))
+    .expect("create numeric VARRAY type");
+    conn.query_drop(&format!(
+        "CREATE TYPE {table_type_name} AS TABLE OF {varray_type_name}"
+    ))
+    .expect("create table of numeric VARRAY type");
+
+    let sql = format!(
+        "SELECT numbers, nested \
+         FROM (\
+             SELECT 1 AS sort_key, \
+                    {varray_type_name}(10, NULL, 30) AS numbers, \
+                    {table_type_name}(\
+                        {varray_type_name}(1, 2), \
+                        NULL, \
+                        {varray_type_name}(3, 4, 5)\
+                    ) AS nested \
+             FROM dual \
+             UNION ALL \
+             SELECT 2 AS sort_key, \
+                    CAST(NULL AS {varray_type_name}) AS numbers, \
+                    CAST(NULL AS {table_type_name}) AS nested \
+             FROM dual\
+         ) \
+         ORDER BY sort_key"
+    );
+    let rows = conn
+        .query_described_fetch_all(sql.clone(), 1)
+        .expect("fetch direct SELECT VARRAY rows");
+    assert_eq!(
+        rows.columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![
+            OracleColumnType::Unsupported(109),
+            OracleColumnType::Unsupported(109)
+        ]
+    );
+    assert_eq!(rows.result.rows.len(), 2);
+    assert_varray_column_rows(&rows.result.rows);
+
+    let initial = conn
+        .query_described_initial_request(&StatementRequest::query(sql, 1))
+        .expect("initial direct SELECT VARRAY query");
+    assert!(
+        initial.result.rows.is_empty(),
+        "VARRAY metadata queries should use no-prefetch initial execution"
+    );
+    let cursor_id = initial
+        .result
+        .cursor_id
+        .expect("initial VARRAY query cursor id");
+    let fetched = conn
+        .fetch_ref_cursor_all(cursor_id, initial.columns, 1)
+        .expect("fetch initial direct SELECT VARRAY rows");
+    assert_eq!(fetched.result.rows.len(), 2);
+    assert_varray_column_rows(&fetched.result.rows);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn select_lob_collection_columns_decode_like_python_oracledb() {
+    let config = live_config();
+    let clob_type_name = unique_object_name("SEL_CLOB_TAB");
+    let nclob_type_name = unique_object_name("SEL_NCLOB_TAB");
+    let blob_type_name = unique_object_name("SEL_BLOB_TAB");
+    let bfile_type_name = unique_object_name("SEL_BFILE_TAB");
+    let _clob_guard = TypeDropGuard::new(config.clone(), clob_type_name.clone());
+    let _nclob_guard = TypeDropGuard::new(config.clone(), nclob_type_name.clone());
+    let _blob_guard = TypeDropGuard::new(config.clone(), blob_type_name.clone());
+    let _bfile_guard = TypeDropGuard::new(config.clone(), bfile_type_name.clone());
+    let mut conn = connect_with_config(config);
+    drop_type_ignore(&mut conn, &bfile_type_name);
+    drop_type_ignore(&mut conn, &blob_type_name);
+    drop_type_ignore(&mut conn, &nclob_type_name);
+    drop_type_ignore(&mut conn, &clob_type_name);
+    conn.query_drop(&format!("CREATE TYPE {clob_type_name} AS TABLE OF CLOB"))
+        .expect("create CLOB collection type");
+    conn.query_drop(&format!("CREATE TYPE {nclob_type_name} AS TABLE OF NCLOB"))
+        .expect("create NCLOB collection type");
+    conn.query_drop(&format!("CREATE TYPE {blob_type_name} AS TABLE OF BLOB"))
+        .expect("create BLOB collection type");
+    conn.query_drop(&format!("CREATE TYPE {bfile_type_name} AS TABLE OF BFILE"))
+        .expect("create BFILE collection type");
+
+    let sql = format!(
+        "SELECT clobs, nclobs, blobs, bfiles \
+         FROM (\
+             SELECT 1 AS sort_key, \
+                    {clob_type_name}(TO_CLOB('clob-one'), NULL, TO_CLOB('clob-two')) AS clobs, \
+                    {nclob_type_name}(TO_NCLOB(UNISTR('\\D55C')), NULL, TO_NCLOB(UNISTR('\\AE00'))) AS nclobs, \
+                    {blob_type_name}(TO_BLOB(HEXTORAW('CAFE')), NULL, TO_BLOB(HEXTORAW('BEEF'))) AS blobs, \
+                    {bfile_type_name}(\
+                        BFILENAME('DATA_PUMP_DIR', 'space_query_bfile_probe.bin'), \
+                        NULL, \
+                        BFILENAME('DATA_PUMP_DIR', 'space_query_bfile_probe.bin')\
+                    ) AS bfiles \
+             FROM dual \
+             UNION ALL \
+             SELECT 2 AS sort_key, \
+                    CAST(NULL AS {clob_type_name}) AS clobs, \
+                    CAST(NULL AS {nclob_type_name}) AS nclobs, \
+                    CAST(NULL AS {blob_type_name}) AS blobs, \
+                    CAST(NULL AS {bfile_type_name}) AS bfiles \
+             FROM dual\
+         ) \
+         ORDER BY sort_key"
+    );
+    let rows = conn
+        .query_described_fetch_all(sql.clone(), 1)
+        .expect("fetch direct SELECT LOB collection rows");
+    assert_eq!(
+        rows.columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![
+            OracleColumnType::Unsupported(109),
+            OracleColumnType::Unsupported(109),
+            OracleColumnType::Unsupported(109),
+            OracleColumnType::Unsupported(109)
+        ]
+    );
+    assert_eq!(rows.result.rows.len(), 2);
+    assert_lob_collection_column_rows(&rows.result.rows);
+
+    let initial = conn
+        .query_described_initial_request(&StatementRequest::query(sql, 1))
+        .expect("initial direct SELECT LOB collection query");
+    assert!(
+        initial.result.rows.is_empty(),
+        "LOB collection metadata queries should use no-prefetch initial execution"
+    );
+    let cursor_id = initial
+        .result
+        .cursor_id
+        .expect("initial LOB collection query cursor id");
+    let fetched = conn
+        .fetch_ref_cursor_all(cursor_id, initial.columns, 1)
+        .expect("fetch initial direct SELECT LOB collection rows");
+    assert_eq!(fetched.result.rows.len(), 2);
+    assert_lob_collection_column_rows(&fetched.result.rows);
 }
 
 #[test]
@@ -6706,7 +7781,7 @@ fn assert_scalar_object_attribute_rows(rows: &[Vec<OracleValue>]) {
         OracleValue::Object(attrs) => attrs,
         other => panic!("expected direct SELECT scalar object, got {other:?}"),
     };
-    assert_eq!(first_attrs.len(), 11);
+    assert_eq!(first_attrs.len(), 17);
     assert_eq!(first_attrs[0].0, "ID");
     assert_eq!(first_attrs[0].1, OracleValue::Number("7".to_string()));
     assert_eq!(first_attrs[1].0, "RAW_PAYLOAD");
@@ -6730,18 +7805,33 @@ fn assert_scalar_object_attribute_rows(rows: &[Vec<OracleValue>]) {
         timestamp_value_timezone_suffix(&first_attrs[4].1).as_deref(),
         Some("+09:00")
     );
-    assert_eq!(first_attrs[5].0, "SCORE_FLOAT");
-    assert_eq!(value_to_string(&first_attrs[5].1), "3.5");
-    assert_eq!(first_attrs[6].0, "SCORE_DOUBLE");
-    assert_eq!(value_to_string(&first_attrs[6].1), "-2.25");
-    assert_eq!(first_attrs[7].0, "ACTIVE");
-    assert_eq!(first_attrs[7].1, OracleValue::Boolean(true));
-    assert_eq!(first_attrs[8].0, "INACTIVE");
-    assert_eq!(first_attrs[8].1, OracleValue::Boolean(false));
-    assert_eq!(first_attrs[9].0, "PERIOD_YM");
-    assert_eq!(value_to_string(&first_attrs[9].1), "+2021-10");
-    assert_eq!(first_attrs[10].0, "PERIOD_DS");
-    assert_eq!(value_to_string(&first_attrs[10].1), "+02 12:23:34.456789");
+    assert_eq!(first_attrs[5].0, "STAMPED_LTZ");
+    assert_eq!(
+        timestamp_value_to_string(&first_attrs[5].1),
+        "2024-01-02 03:04:05.654321"
+    );
+    assert_eq!(first_attrs[6].0, "INT_VALUE");
+    assert_eq!(value_to_string(&first_attrs[6].1), "27");
+    assert_eq!(first_attrs[7].0, "SMALLINT_VALUE");
+    assert_eq!(value_to_string(&first_attrs[7].1), "13");
+    assert_eq!(first_attrs[8].0, "REAL_VALUE");
+    assert_eq!(value_to_string(&first_attrs[8].1), "184.875");
+    assert_eq!(first_attrs[9].0, "DOUBLE_PRECISION_VALUE");
+    assert_eq!(value_to_string(&first_attrs[9].1), "1.375");
+    assert_eq!(first_attrs[10].0, "FLOAT_VALUE");
+    assert_eq!(value_to_string(&first_attrs[10].1), "23");
+    assert_eq!(first_attrs[11].0, "SCORE_FLOAT");
+    assert_eq!(value_to_string(&first_attrs[11].1), "3.5");
+    assert_eq!(first_attrs[12].0, "SCORE_DOUBLE");
+    assert_eq!(value_to_string(&first_attrs[12].1), "-2.25");
+    assert_eq!(first_attrs[13].0, "ACTIVE");
+    assert_eq!(first_attrs[13].1, OracleValue::Boolean(true));
+    assert_eq!(first_attrs[14].0, "INACTIVE");
+    assert_eq!(first_attrs[14].1, OracleValue::Boolean(false));
+    assert_eq!(first_attrs[15].0, "PERIOD_YM");
+    assert_eq!(value_to_string(&first_attrs[15].1), "+2021-10");
+    assert_eq!(first_attrs[16].0, "PERIOD_DS");
+    assert_eq!(value_to_string(&first_attrs[16].1), "+02 12:23:34.456789");
 
     let second_attrs = match &rows[1][0] {
         OracleValue::Object(attrs) => attrs,
@@ -6751,6 +7841,20 @@ fn assert_scalar_object_attribute_rows(rows: &[Vec<OracleValue>]) {
     assert_eq!(second_attrs[0].1, OracleValue::Number("8".to_string()));
     for (attr_name, value) in second_attrs.iter().skip(1) {
         assert_eq!(*value, OracleValue::Null, "{attr_name} should be NULL");
+    }
+
+    let third_attrs = match &rows[2][0] {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected direct SELECT scalar object with float specials, got {other:?}"),
+    };
+    assert_eq!(third_attrs[0].0, "ID");
+    assert_eq!(third_attrs[0].1, OracleValue::Number("9".to_string()));
+    for (index, (attr_name, value)) in third_attrs.iter().enumerate().skip(1) {
+        match index {
+            11 => assert_eq!(value_to_string(value), "nan"),
+            12 => assert_eq!(value_to_string(value), "inf"),
+            _ => assert_eq!(*value, OracleValue::Null, "{attr_name} should be NULL"),
+        }
     }
 }
 
@@ -6849,6 +7953,152 @@ fn assert_nested_object_attribute_rows(rows: &[Vec<OracleValue>]) {
     assert_eq!(second_attrs[1].1, OracleValue::Null);
 }
 
+fn assert_quoted_object_rows(rows: &[Vec<OracleValue>]) {
+    assert_eq!(rows.len(), 1);
+    let attrs = match &rows[0][0] {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected quoted direct SELECT object, got {other:?}"),
+    };
+    assert_eq!(attrs.len(), 2);
+    assert_eq!(attrs[0].0, "idAttr");
+    assert_eq!(attrs[0].1, OracleValue::Number("7".to_string()));
+    assert_eq!(attrs[1].0, "labelAttr");
+    assert_eq!(attrs[1].1, OracleValue::Text("quoted".to_string()));
+}
+
+fn assert_quoted_object_collection_attribute_rows(rows: &[Vec<OracleValue>]) {
+    assert_eq!(rows.len(), 2);
+    let first_attrs = match &rows[0][0] {
+        OracleValue::Object(attrs) => attrs,
+        other => {
+            panic!("expected quoted direct SELECT parent object with collection, got {other:?}")
+        }
+    };
+    assert_eq!(first_attrs.len(), 3);
+    assert_eq!(first_attrs[0].0, "parentId");
+    assert_eq!(first_attrs[0].1, OracleValue::Number("1".to_string()));
+    assert_eq!(first_attrs[1].0, "items");
+    let items = collection_values(&first_attrs[1].1, "quoted object attribute");
+    assert_eq!(items.len(), 3);
+
+    let first_child_attrs = match &items[0] {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected first quoted object collection element, got {other:?}"),
+    };
+    assert_eq!(first_child_attrs[0].0, "childId");
+    assert_eq!(
+        first_child_attrs[0].1,
+        OracleValue::Number("10".to_string())
+    );
+    assert_eq!(first_child_attrs[1].0, "childLabel");
+    assert_eq!(
+        first_child_attrs[1].1,
+        OracleValue::Text("first".to_string())
+    );
+    assert_eq!(first_child_attrs[2].0, "fixedLabel");
+    assert_eq!(
+        first_child_attrs[2].1,
+        OracleValue::Text("ab   ".to_string())
+    );
+
+    assert_eq!(items[1], OracleValue::Null);
+
+    let third_child_attrs = match &items[2] {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected third quoted object collection element, got {other:?}"),
+    };
+    assert_eq!(third_child_attrs[0].0, "childId");
+    assert_eq!(
+        third_child_attrs[0].1,
+        OracleValue::Number("20".to_string())
+    );
+    assert_eq!(third_child_attrs[1].0, "childLabel");
+    assert_eq!(
+        third_child_attrs[1].1,
+        OracleValue::Text("tail".to_string())
+    );
+    assert_eq!(third_child_attrs[2].0, "fixedLabel");
+    assert_eq!(
+        third_child_attrs[2].1,
+        OracleValue::Text("xy   ".to_string())
+    );
+    assert_eq!(first_attrs[2].0, "labelAttr");
+    assert_eq!(first_attrs[2].1, OracleValue::Text("has_items".to_string()));
+
+    let second_attrs = match &rows[1][0] {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!(
+            "expected quoted direct SELECT parent object with null collection, got {other:?}"
+        ),
+    };
+    assert_eq!(second_attrs.len(), 3);
+    assert_eq!(second_attrs[0].0, "parentId");
+    assert_eq!(second_attrs[0].1, OracleValue::Number("2".to_string()));
+    assert_eq!(second_attrs[1].0, "items");
+    assert_eq!(second_attrs[1].1, OracleValue::Null);
+    assert_eq!(second_attrs[2].0, "labelAttr");
+    assert_eq!(
+        second_attrs[2].1,
+        OracleValue::Text("null_items".to_string())
+    );
+}
+
+fn assert_quoted_builtin_name_object_rows(rows: &[Vec<OracleValue>]) {
+    assert_eq!(rows.len(), 2);
+    let first_attrs = match &rows[0][0] {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected quoted builtin-name parent object, got {other:?}"),
+    };
+    assert_eq!(first_attrs.len(), 2);
+    assert_eq!(first_attrs[0].0, "idAttr");
+    assert_eq!(first_attrs[0].1, OracleValue::Number("1".to_string()));
+    assert_eq!(first_attrs[1].0, "payload");
+    let child_attrs = match &first_attrs[1].1 {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected quoted builtin-name nested object, got {other:?}"),
+    };
+    assert_eq!(child_attrs.len(), 2);
+    assert_eq!(child_attrs[0].0, "valueAttr");
+    assert_eq!(child_attrs[0].1, OracleValue::Number("42".to_string()));
+    assert_eq!(child_attrs[1].0, "labelAttr");
+    assert_eq!(child_attrs[1].1, OracleValue::Text("nested".to_string()));
+
+    let second_attrs = match &rows[1][0] {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected quoted builtin-name parent object with null, got {other:?}"),
+    };
+    assert_eq!(second_attrs.len(), 2);
+    assert_eq!(second_attrs[0].0, "idAttr");
+    assert_eq!(second_attrs[0].1, OracleValue::Number("2".to_string()));
+    assert_eq!(second_attrs[1].0, "payload");
+    assert_eq!(second_attrs[1].1, OracleValue::Null);
+}
+
+fn assert_quoted_builtin_name_collection_rows(rows: &[Vec<OracleValue>]) {
+    assert_eq!(rows.len(), 2);
+    let first_attrs = match &rows[0][0] {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected quoted builtin-name collection parent object, got {other:?}"),
+    };
+    assert_eq!(first_attrs.len(), 2);
+    assert_eq!(first_attrs[0].0, "idAttr");
+    assert_eq!(first_attrs[0].1, OracleValue::Number("1".to_string()));
+    assert_eq!(first_attrs[1].0, "items");
+    assert_nullable_number_collection(&first_attrs[1].1, &[Some("10"), None, Some("30")]);
+
+    let second_attrs = match &rows[1][0] {
+        OracleValue::Object(attrs) => attrs,
+        other => {
+            panic!("expected quoted builtin-name collection parent object with null, got {other:?}")
+        }
+    };
+    assert_eq!(second_attrs.len(), 2);
+    assert_eq!(second_attrs[0].0, "idAttr");
+    assert_eq!(second_attrs[0].1, OracleValue::Number("2".to_string()));
+    assert_eq!(second_attrs[1].0, "items");
+    assert_eq!(second_attrs[1].1, OracleValue::Null);
+}
+
 fn assert_collection_attribute_rows(rows: &[Vec<OracleValue>]) {
     let first_attrs = match &rows[0][0] {
         OracleValue::Object(attrs) => attrs,
@@ -6865,6 +8115,21 @@ fn assert_collection_attribute_rows(rows: &[Vec<OracleValue>]) {
     assert_eq!(items[0], OracleValue::Text("first".to_string()));
     assert_eq!(items[1], OracleValue::Null);
     assert_eq!(items[2], OracleValue::Text("tail".to_string()));
+    assert_eq!(first_attrs[2].0, "CHAR_ITEMS");
+    let char_items = collection_values(&first_attrs[2].1, "CHAR attribute");
+    assert_eq!(char_items.len(), 3);
+    assert_eq!(char_items[0], OracleValue::Text("ab   ".to_string()));
+    assert_eq!(char_items[1], OracleValue::Null);
+    assert_eq!(char_items[2], OracleValue::Text("xyz  ".to_string()));
+    assert_eq!(first_attrs[3].0, "NCHAR_ITEMS");
+    let nchar_items = collection_values(&first_attrs[3].1, "NCHAR attribute");
+    assert_eq!(nchar_items.len(), 3);
+    assert_eq!(nchar_items[0], OracleValue::Text("\u{D55C}  ".to_string()));
+    assert_eq!(nchar_items[1], OracleValue::Null);
+    assert_eq!(
+        nchar_items[2],
+        OracleValue::Text("\u{AE00}\u{B098} ".to_string())
+    );
 
     let second_attrs = match &rows[1][0] {
         OracleValue::Object(attrs) => attrs,
@@ -6874,6 +8139,10 @@ fn assert_collection_attribute_rows(rows: &[Vec<OracleValue>]) {
     assert_eq!(second_attrs[0].1, OracleValue::Number("2".to_string()));
     assert_eq!(second_attrs[1].0, "ITEMS");
     assert_eq!(second_attrs[1].1, OracleValue::Null);
+    assert_eq!(second_attrs[2].0, "CHAR_ITEMS");
+    assert_eq!(second_attrs[2].1, OracleValue::Null);
+    assert_eq!(second_attrs[3].0, "NCHAR_ITEMS");
+    assert_eq!(second_attrs[3].1, OracleValue::Null);
 }
 
 fn assert_nested_number_collection(value: &OracleValue) {
@@ -6887,6 +8156,262 @@ fn assert_nested_number_collection(value: &OracleValue) {
     assert_number_collection(&outer_values[2], &["3", "4", "5"]);
 }
 
+fn assert_object_collection_column_rows(rows: &[Vec<OracleValue>]) {
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].len(), 1);
+
+    let values = collection_values(&rows[0][0], "object");
+    assert_eq!(values.len(), 3);
+
+    let first_attrs = match &values[0] {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected first object collection element, got {other:?}"),
+    };
+    assert_eq!(first_attrs[0].0, "CHILD_ID");
+    assert_eq!(first_attrs[0].1, OracleValue::Number("1".to_string()));
+    assert_eq!(first_attrs[1].0, "CHILD_LABEL");
+    assert_eq!(first_attrs[1].1, OracleValue::Text("first".to_string()));
+    assert_eq!(first_attrs[2].0, "FIXED_LABEL");
+    assert_eq!(first_attrs[2].1, OracleValue::Text("ab   ".to_string()));
+
+    assert_eq!(values[1], OracleValue::Null);
+
+    let third_attrs = match &values[2] {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected third object collection element, got {other:?}"),
+    };
+    assert_eq!(third_attrs[0].0, "CHILD_ID");
+    assert_eq!(third_attrs[0].1, OracleValue::Number("3".to_string()));
+    assert_eq!(third_attrs[1].0, "CHILD_LABEL");
+    assert_eq!(third_attrs[1].1, OracleValue::Text("tail".to_string()));
+    assert_eq!(third_attrs[2].0, "FIXED_LABEL");
+    assert_eq!(third_attrs[2].1, OracleValue::Text("xy   ".to_string()));
+
+    assert_eq!(rows[1][0], OracleValue::Null);
+}
+
+fn assert_object_collection_attribute_rows(rows: &[Vec<OracleValue>]) {
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].len(), 1);
+
+    let first_attrs = match &rows[0][0] {
+        OracleValue::Object(attrs) => attrs,
+        other => {
+            panic!("expected direct SELECT parent object with object collection, got {other:?}")
+        }
+    };
+    assert_eq!(first_attrs[0].0, "ID");
+    assert_eq!(first_attrs[0].1, OracleValue::Number("1".to_string()));
+    assert_eq!(first_attrs[1].0, "ITEMS");
+    let values = collection_values(&first_attrs[1].1, "object attribute");
+    assert_eq!(values.len(), 3);
+
+    let first_child_attrs = match &values[0] {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected first object collection attribute element, got {other:?}"),
+    };
+    assert_eq!(first_child_attrs[0].0, "CHILD_ID");
+    assert_eq!(
+        first_child_attrs[0].1,
+        OracleValue::Number("10".to_string())
+    );
+    assert_eq!(first_child_attrs[1].0, "CHILD_LABEL");
+    assert_eq!(
+        first_child_attrs[1].1,
+        OracleValue::Text("first".to_string())
+    );
+    assert_eq!(first_child_attrs[2].0, "FIXED_LABEL");
+    assert_eq!(
+        first_child_attrs[2].1,
+        OracleValue::Text("ab   ".to_string())
+    );
+
+    assert_eq!(values[1], OracleValue::Null);
+
+    let third_child_attrs = match &values[2] {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected third object collection attribute element, got {other:?}"),
+    };
+    assert_eq!(third_child_attrs[0].0, "CHILD_ID");
+    assert_eq!(
+        third_child_attrs[0].1,
+        OracleValue::Number("20".to_string())
+    );
+    assert_eq!(third_child_attrs[1].0, "CHILD_LABEL");
+    assert_eq!(
+        third_child_attrs[1].1,
+        OracleValue::Text("tail".to_string())
+    );
+    assert_eq!(third_child_attrs[2].0, "FIXED_LABEL");
+    assert_eq!(
+        third_child_attrs[2].1,
+        OracleValue::Text("xy   ".to_string())
+    );
+    assert_eq!(first_attrs[2].0, "LABEL");
+    assert_eq!(first_attrs[2].1, OracleValue::Text("has_items".to_string()));
+
+    let second_attrs = match &rows[1][0] {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!(
+            "expected direct SELECT parent object with null object collection, got {other:?}"
+        ),
+    };
+    assert_eq!(second_attrs[0].0, "ID");
+    assert_eq!(second_attrs[0].1, OracleValue::Number("2".to_string()));
+    assert_eq!(second_attrs[1].0, "ITEMS");
+    assert_eq!(second_attrs[1].1, OracleValue::Null);
+    assert_eq!(second_attrs[2].0, "LABEL");
+    assert_eq!(
+        second_attrs[2].1,
+        OracleValue::Text("null_items".to_string())
+    );
+}
+
+fn assert_fixed_string_collection_column_rows(rows: &[Vec<OracleValue>]) {
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].len(), 4);
+
+    let char_values = collection_values(&rows[0][0], "CHAR");
+    assert_eq!(char_values.len(), 3);
+    assert_eq!(char_values[0], OracleValue::Text("ab   ".to_string()));
+    assert_eq!(char_values[1], OracleValue::Null);
+    assert_eq!(char_values[2], OracleValue::Text("xyz  ".to_string()));
+
+    let nchar_values = collection_values(&rows[0][1], "NCHAR");
+    assert_eq!(nchar_values.len(), 3);
+    assert_eq!(nchar_values[0], OracleValue::Text("\u{D55C}  ".to_string()));
+    assert_eq!(nchar_values[1], OracleValue::Null);
+    assert_eq!(
+        nchar_values[2],
+        OracleValue::Text("\u{AE00}\u{B098} ".to_string())
+    );
+
+    let varchar_values = collection_values(&rows[0][2], "VARCHAR2");
+    assert_eq!(varchar_values.len(), 3);
+    assert_eq!(varchar_values[0], OracleValue::Text("ab".to_string()));
+    assert_eq!(varchar_values[1], OracleValue::Null);
+    assert_eq!(varchar_values[2], OracleValue::Text("xyz".to_string()));
+
+    let nvarchar_values = collection_values(&rows[0][3], "NVARCHAR2");
+    assert_eq!(nvarchar_values.len(), 3);
+    assert_eq!(
+        nvarchar_values[0],
+        OracleValue::Text("\u{D55C}".to_string())
+    );
+    assert_eq!(nvarchar_values[1], OracleValue::Null);
+    assert_eq!(
+        nvarchar_values[2],
+        OracleValue::Text("\u{AE00}\u{B098}".to_string())
+    );
+
+    for value in &rows[1] {
+        assert_eq!(*value, OracleValue::Null);
+    }
+}
+
+fn assert_scalar_collection_column_rows(rows: &[Vec<OracleValue>]) {
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].len(), 10);
+
+    let raw_values = collection_values(&rows[0][0], "RAW");
+    assert_eq!(raw_values.len(), 2);
+    assert_eq!(raw_values[0], OracleValue::Bytes(vec![0xca, 0xfe]));
+    assert_eq!(raw_values[1], OracleValue::Null);
+
+    let date_values = collection_values(&rows[0][1], "DATE");
+    assert_eq!(date_values.len(), 2);
+    assert_eq!(date_value_to_string(&date_values[0]), "2024-02-29 00:00:00");
+    assert_eq!(date_values[1], OracleValue::Null);
+
+    let timestamp_values = collection_values(&rows[0][2], "TIMESTAMP");
+    assert_eq!(timestamp_values.len(), 2);
+    assert_eq!(
+        timestamp_value_to_string(&timestamp_values[0]),
+        "2024-01-02 03:04:05.123456"
+    );
+    assert_eq!(timestamp_values[1], OracleValue::Null);
+
+    let timestamptz_values = collection_values(&rows[0][3], "TIMESTAMP WITH TIME ZONE");
+    assert_eq!(timestamptz_values.len(), 2);
+    assert_eq!(
+        timestamp_value_to_string(&timestamptz_values[0]),
+        "2024-01-02 03:04:05.123456"
+    );
+    assert_eq!(
+        timestamp_value_timezone_suffix(&timestamptz_values[0]).as_deref(),
+        Some("+09:00")
+    );
+    assert_eq!(timestamptz_values[1], OracleValue::Null);
+
+    let timestampltz_values = collection_values(&rows[0][4], "TIMESTAMP WITH LOCAL TIME ZONE");
+    assert_eq!(timestampltz_values.len(), 2);
+    assert_eq!(
+        timestamp_value_to_string(&timestampltz_values[0]),
+        "2024-01-02 03:04:05.654321"
+    );
+    assert_eq!(timestampltz_values[1], OracleValue::Null);
+
+    let binary_float_values = collection_values(&rows[0][5], "BINARY_FLOAT");
+    assert_eq!(binary_float_values.len(), 2);
+    assert_eq!(value_to_string(&binary_float_values[0]), "3.5");
+    assert_eq!(binary_float_values[1], OracleValue::Null);
+
+    let binary_double_values = collection_values(&rows[0][6], "BINARY_DOUBLE");
+    assert_eq!(binary_double_values.len(), 2);
+    assert_eq!(value_to_string(&binary_double_values[0]), "-2.25");
+    assert_eq!(binary_double_values[1], OracleValue::Null);
+
+    let boolean_values = collection_values(&rows[0][7], "BOOLEAN");
+    assert_eq!(
+        boolean_values.as_slice(),
+        [
+            OracleValue::Boolean(true),
+            OracleValue::Boolean(false),
+            OracleValue::Null
+        ]
+    );
+
+    let interval_ym_values = collection_values(&rows[0][8], "INTERVAL YEAR TO MONTH");
+    assert_eq!(interval_ym_values.len(), 2);
+    assert_eq!(value_to_string(&interval_ym_values[0]), "+02-10");
+    assert_eq!(interval_ym_values[1], OracleValue::Null);
+
+    let interval_ds_values = collection_values(&rows[0][9], "INTERVAL DAY TO SECOND");
+    assert_eq!(interval_ds_values.len(), 2);
+    assert_eq!(
+        value_to_string(&interval_ds_values[0]),
+        "+02 12:23:34.456789"
+    );
+    assert_eq!(interval_ds_values[1], OracleValue::Null);
+
+    for value in &rows[1] {
+        assert_eq!(*value, OracleValue::Null);
+    }
+}
+
+fn assert_varray_column_rows(rows: &[Vec<OracleValue>]) {
+    assert_nullable_number_collection(&rows[0][0], &[Some("10"), None, Some("30")]);
+    assert_nested_number_collection(&rows[0][1]);
+    assert_eq!(rows[1][0], OracleValue::Null);
+    assert_eq!(rows[1][1], OracleValue::Null);
+}
+
+fn assert_lob_collection_column_rows(rows: &[Vec<OracleValue>]) {
+    for value in &rows[0] {
+        assert_lob_collection_value(value);
+    }
+    for value in &rows[1] {
+        assert_eq!(*value, OracleValue::Null);
+    }
+}
+
+fn collection_values<'a>(value: &'a OracleValue, label: &str) -> &'a Vec<OracleValue> {
+    match value {
+        OracleValue::Array(values) => values,
+        other => panic!("expected decoded {label} collection, got {other:?}"),
+    }
+}
+
 fn assert_number_collection(value: &OracleValue, expected: &[&str]) {
     let values = match value {
         OracleValue::Array(values) => values,
@@ -6896,6 +8421,77 @@ fn assert_number_collection(value: &OracleValue, expected: &[&str]) {
     for (value, expected) in values.iter().zip(expected.iter()) {
         assert_eq!(value_to_string(value), *expected);
     }
+}
+
+fn assert_nullable_number_collection(value: &OracleValue, expected: &[Option<&str>]) {
+    let values = match value {
+        OracleValue::Array(values) => values,
+        other => panic!("expected decoded nullable numeric collection, got {other:?}"),
+    };
+    assert_eq!(values.len(), expected.len());
+    for (value, expected) in values.iter().zip(expected.iter()) {
+        match expected {
+            Some(expected) => assert_eq!(value_to_string(value), *expected),
+            None => assert_eq!(*value, OracleValue::Null),
+        }
+    }
+}
+
+fn assert_lob_collection_value(value: &OracleValue) {
+    let values = match value {
+        OracleValue::Array(values) => values,
+        other => panic!("expected decoded LOB collection, got {other:?}"),
+    };
+    assert_eq!(values.len(), 3);
+    assert_lob_value_not_empty(&values[0]);
+    assert_eq!(values[1], OracleValue::Null);
+    assert_lob_value_not_empty(&values[2]);
+}
+
+fn assert_xmltype_collection_rows(rows: &[Vec<OracleValue>]) {
+    assert_xmltype_collection_value(&rows[0][0], "<item>small</item>");
+    assert_eq!(rows[1][0], OracleValue::Null);
+}
+
+fn assert_xmltype_collection_object_rows(rows: &[Vec<OracleValue>]) {
+    let first_attrs = match &rows[0][0] {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected direct SELECT XMLTYPE collection parent object, got {other:?}"),
+    };
+    assert_eq!(first_attrs[0].0, "ID");
+    assert_eq!(first_attrs[0].1, OracleValue::Number("1".to_string()));
+    assert_eq!(first_attrs[1].0, "ITEMS");
+    assert_xmltype_collection_value(&first_attrs[1].1, "<item>attr</item>");
+
+    let second_attrs = match &rows[1][0] {
+        OracleValue::Object(attrs) => attrs,
+        other => {
+            panic!(
+                "expected direct SELECT XMLTYPE collection parent object with nulls, got {other:?}"
+            )
+        }
+    };
+    assert_eq!(second_attrs[0].0, "ID");
+    assert_eq!(second_attrs[0].1, OracleValue::Number("2".to_string()));
+    assert_eq!(second_attrs[1].0, "ITEMS");
+    assert_eq!(second_attrs[1].1, OracleValue::Null);
+}
+
+fn assert_xmltype_collection_value(value: &OracleValue, expected_small_xml: &str) {
+    let values = match value {
+        OracleValue::Array(values) => values,
+        other => panic!("expected decoded XMLTYPE collection, got {other:?}"),
+    };
+    assert_eq!(values.len(), 3);
+    assert_eq!(value_to_string(&values[0]), expected_small_xml);
+    let large_xml = value_to_string(&values[1]);
+    assert!(large_xml.starts_with("<root><payload>"));
+    assert!(large_xml.ends_with("</payload></root>"));
+    assert!(
+        large_xml.len() >= 3000,
+        "large XMLTYPE collection element should not be truncated"
+    );
+    assert_eq!(values[2], OracleValue::Null);
 }
 
 fn assert_lob_value_not_empty(value: &OracleValue) {

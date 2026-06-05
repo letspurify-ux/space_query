@@ -2714,8 +2714,8 @@ fn is_decodable_object_column(column: &ThinColumn) -> bool {
 
 fn object_type_key(schema_name: &str, type_name: &str) -> (String, String) {
     (
-        schema_name.trim_matches('"').to_ascii_uppercase(),
-        type_name.trim_matches('"').to_ascii_uppercase(),
+        schema_name.trim_matches('"').to_string(),
+        type_name.trim_matches('"').to_string(),
     )
 }
 
@@ -2731,8 +2731,52 @@ fn thin_column_from_object_attr(
     buffer_size: u32,
     charset_form: u8,
 ) -> Result<ThinColumn, OracleThinError> {
+    let attr_type_name = attr_type_name.trim_matches('"').to_string();
+    let attr_type_owner = attr_type_owner.trim_matches('"').to_string();
     let attr_type = attr_type_name.to_ascii_uppercase();
     let attr_typecode = attr_typecode.map(|value| value.to_ascii_uppercase());
+    let is_xmltype =
+        matches!(attr_type_owner.as_str(), "PUBLIC" | "SYS") && attr_type_name == "XMLTYPE";
+    if !attr_type_owner.is_empty() && !is_xmltype {
+        let (column_type, ora_type_num, schema_name, type_name) = match attr_typecode.as_deref() {
+            Some("OBJECT") => (
+                OracleColumnType::Unsupported(ORA_TYPE_NUM_OBJECT),
+                ORA_TYPE_NUM_OBJECT,
+                attr_type_owner,
+                attr_type_name,
+            ),
+            Some("COLLECTION") => (
+                OracleColumnType::Unsupported(ORA_TYPE_NUM_OBJECT),
+                ORA_TYPE_NUM_OBJECT,
+                attr_type_owner,
+                attr_type_name,
+            ),
+            Some(typecode) => {
+                return Err(OracleThinError::new(format!(
+                    "Oracle thin TTC cannot decode UDT attribute {name} named type {attr_type_name} with TYPECODE {typecode}"
+                )))
+            }
+            None => {
+                return Err(OracleThinError::new(format!(
+                    "Oracle thin TTC cannot verify UDT attribute {name} named type {attr_type_name}"
+                )))
+            }
+        };
+        let buffer_size = if buffer_size == 0 {
+            default_object_attr_buffer_size(ora_type_num)
+        } else {
+            buffer_size
+        };
+        return Ok(ThinColumn {
+            name,
+            column_type,
+            ora_type_num,
+            charset_form,
+            buffer_size,
+            schema_name,
+            type_name,
+        });
+    }
     let (column_type, ora_type_num, schema_name, type_name) = match attr_type.as_str() {
         "VARCHAR2" | "VARCHAR" => (
             OracleColumnType::Varchar,
@@ -2855,30 +2899,6 @@ fn thin_column_from_object_attr(
             String::new(),
             String::new(),
         ),
-        other if !attr_type_owner.is_empty() => match attr_typecode.as_deref() {
-            Some("OBJECT") => (
-                OracleColumnType::Unsupported(ORA_TYPE_NUM_OBJECT),
-                ORA_TYPE_NUM_OBJECT,
-                attr_type_owner,
-                other.to_string(),
-            ),
-            Some("COLLECTION") => (
-                OracleColumnType::Unsupported(ORA_TYPE_NUM_OBJECT),
-                ORA_TYPE_NUM_OBJECT,
-                attr_type_owner,
-                other.to_string(),
-            ),
-            Some(typecode) => {
-                return Err(OracleThinError::new(format!(
-                    "Oracle thin TTC cannot decode UDT attribute {name} named type {other} with TYPECODE {typecode}"
-                )))
-            }
-            None => {
-                return Err(OracleThinError::new(format!(
-                    "Oracle thin TTC cannot verify UDT attribute {name} named type {other}"
-                )))
-            }
-        },
         other => {
             return Err(OracleThinError::new(format!(
                 "Oracle thin TTC cannot map UDT attribute {name} type {other}"
@@ -13411,6 +13431,71 @@ mod tests {
             assert_eq!(column.column_type, OracleColumnType::Number, "{attr_type}");
             assert_eq!(column.ora_type_num, ORA_TYPE_NUM_NUMBER, "{attr_type}");
             assert_eq!(column.buffer_size, 22, "{attr_type}");
+        }
+    }
+
+    #[test]
+    fn object_attr_named_type_takes_precedence_over_builtin_name_collision() {
+        let column = thin_column_from_object_attr(
+            "PAYLOAD".to_string(),
+            "number".to_string(),
+            "SYSTEM".to_string(),
+            Some("OBJECT".to_string()),
+            0,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(
+            column.column_type,
+            OracleColumnType::Unsupported(ORA_TYPE_NUM_OBJECT)
+        );
+        assert_eq!(column.ora_type_num, ORA_TYPE_NUM_OBJECT);
+        assert_eq!(column.schema_name, "SYSTEM");
+        assert_eq!(column.type_name, "number");
+        assert_eq!(column.buffer_size, 1);
+    }
+
+    #[test]
+    fn object_attr_named_collection_takes_precedence_over_builtin_name_collision() {
+        let column = thin_column_from_object_attr(
+            "ITEMS".to_string(),
+            "varchar2".to_string(),
+            "SYSTEM".to_string(),
+            Some("COLLECTION".to_string()),
+            0,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(
+            column.column_type,
+            OracleColumnType::Unsupported(ORA_TYPE_NUM_OBJECT)
+        );
+        assert_eq!(column.ora_type_num, ORA_TYPE_NUM_OBJECT);
+        assert_eq!(column.schema_name, "SYSTEM");
+        assert_eq!(column.type_name, "varchar2");
+        assert_eq!(column.buffer_size, 1);
+    }
+
+    #[test]
+    fn object_attr_sys_xmltype_keeps_xmltype_special_case() {
+        for owner in ["PUBLIC", "SYS"] {
+            let column = thin_column_from_object_attr(
+                "DOC".to_string(),
+                "XMLTYPE".to_string(),
+                owner.to_string(),
+                Some("OBJECT".to_string()),
+                0,
+                0,
+            )
+            .unwrap();
+
+            assert_eq!(column.column_type, OracleColumnType::Xml, "{owner}");
+            assert_eq!(column.ora_type_num, ORA_TYPE_NUM_OBJECT, "{owner}");
+            assert_eq!(column.schema_name, owner, "{owner}");
+            assert_eq!(column.type_name, "XMLTYPE", "{owner}");
+            assert_eq!(column.buffer_size, 1, "{owner}");
         }
     }
 
