@@ -429,21 +429,6 @@ impl SqlEditorWidget {
                         return true;
                     }
 
-                    if alt && matches!(key, Key::Up | Key::Down) {
-                        if popup_visible {
-                            intellisense_popup_for_handle
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .hide();
-                        }
-                        Self::invalidate_and_clear_pending_intellisense_state(
-                            &intellisense_runtime_for_handle,
-                        );
-                        let direction = if key == Key::Up { 1 } else { -1 };
-                        widget_for_shortcuts.navigate_history(direction);
-                        return true;
-                    }
-
                     if shortcut_key == Key::Escape {
                         if popup_visible {
                             intellisense_popup_for_handle
@@ -591,11 +576,6 @@ impl SqlEditorWidget {
                     if ctrl_or_cmd {
                         if shift && Self::matches_alpha_shortcut(shortcut_key, 'f') {
                             widget_for_shortcuts.format_selected_sql();
-                            return true;
-                        }
-
-                        if shift && Self::matches_alpha_shortcut(shortcut_key, 'z') {
-                            widget_for_shortcuts.redo();
                             return true;
                         }
 

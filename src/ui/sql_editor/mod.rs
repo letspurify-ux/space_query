@@ -4609,6 +4609,9 @@ impl SqlEditorWidget {
                 text_buffer_access::line_start(buffer, Some(text_shadow), prev_pos).max(0);
             let prev_end =
                 text_buffer_access::line_end(buffer, Some(text_shadow), prev_pos).max(prev_start);
+            if prev_start >= scan {
+                break;
+            }
             if is_blank(prev_start, prev_end) != blank {
                 break;
             }
@@ -4618,11 +4621,17 @@ impl SqlEditorWidget {
 
         let mut scan = end;
         while scan < buffer_len {
-            let next_pos = (scan + 1).min(buffer_len.saturating_sub(1));
+            let next_pos = scan.saturating_add(1);
+            if next_pos >= buffer_len {
+                break;
+            }
             let next_start =
                 text_buffer_access::line_start(buffer, Some(text_shadow), next_pos).max(0);
             let next_end =
                 text_buffer_access::line_end(buffer, Some(text_shadow), next_pos).max(next_start);
+            if next_start <= scan || next_end <= scan {
+                break;
+            }
             if is_blank(next_start, next_end) != blank {
                 break;
             }
@@ -4797,6 +4806,48 @@ mod execution_state_tests {
             inserted_text: inserted_text.to_string(),
             deleted_text: deleted_text.to_string(),
         }
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK TextBuffer tests require the process main thread on macOS"
+    )]
+    fn block_bounds_fallback_stops_at_last_line() {
+        let text = "SELECT 1;\nSELECT 2";
+        let mut buffer = TextBuffer::default();
+        buffer.set_text(text);
+        let shadow = Arc::new(Mutex::new(HighlightShadowState::default()));
+
+        let pos = text.len().saturating_sub(1) as i32;
+        let (start, end) = SqlEditorWidget::block_bounds(&buffer, &shadow, pos);
+
+        assert!(start <= end);
+        assert!(end <= text.len() as i32);
+        assert_eq!(
+            buffer.text_range(start, end).unwrap_or_default(),
+            "SELECT 2"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK TextBuffer tests require the process main thread on macOS"
+    )]
+    fn block_bounds_fallback_stops_at_first_line() {
+        let text = "SELECT 1\n\nSELECT 2";
+        let mut buffer = TextBuffer::default();
+        buffer.set_text(text);
+        let shadow = Arc::new(Mutex::new(HighlightShadowState::default()));
+
+        let (start, end) = SqlEditorWidget::block_bounds(&buffer, &shadow, 0);
+
+        assert_eq!(start, 0);
+        assert_eq!(
+            buffer.text_range(start, end).unwrap_or_default(),
+            "SELECT 1"
+        );
     }
 
     #[test]
