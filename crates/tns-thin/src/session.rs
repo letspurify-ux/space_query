@@ -36,8 +36,8 @@ use sha1::Sha1;
 use sha2::{Digest, Sha512};
 
 use crate::connect::{
-    AcceptInfo, ConnectOptions, ConnectTarget, OracleNetConnector, TNS_DEFAULT_SOCKET_TIMEOUT,
-    TNS_MIN_SUPPORTED_PROTOCOL,
+    validate_connect_descriptor_value, AcceptInfo, ConnectOptions, ConnectTarget,
+    OracleNetConnector, TNS_DEFAULT_SOCKET_TIMEOUT, TNS_MIN_SUPPORTED_PROTOCOL,
 };
 use crate::exec::{
     sql_is_dml_returning, BindInputValue, BindValue, ColumnMetadata, DescribedQueryResult,
@@ -98,6 +98,7 @@ const TNS_SERVER_PIGGYBACK_EXT_SYNC: u8 = 9;
 const TNS_SERVER_PIGGYBACK_SESS_SIGNATURE: u8 = 10;
 const TNS_FUNC_COMMIT: u8 = 14;
 const TNS_FUNC_ROLLBACK: u8 = 15;
+const TNS_FUNC_LOGOFF: u8 = 9;
 const TNS_FUNC_FETCH: u8 = 5;
 const TNS_FUNC_EXECUTE: u8 = 94;
 const TNS_FUNC_LOB_OP: u8 = 96;
@@ -130,6 +131,7 @@ const TNS_MAX_UROWID_LENGTH: u32 = 5267;
 const TNS_CHARSET_UTF8: u16 = 873;
 const TNS_ERR_NO_DATA_FOUND: u32 = 1403;
 const TNS_AUTH_MODE_LOGON: u32 = 0x0000_0001;
+const TNS_AUTH_MODE_CHANGE_PASSWORD: u32 = 0x0000_0002;
 const TNS_AUTH_MODE_SYSDBA: u32 = 0x0000_0020;
 const TNS_AUTH_MODE_SYSOPER: u32 = 0x0000_0040;
 const TNS_AUTH_MODE_WITH_PASSWORD: u32 = 0x0000_0100;
@@ -418,9 +420,33 @@ pub struct OracleThinConfig {
     pub connection_class: Option<String>,
     pub purity: OracleThinPurity,
     pub driver_name: Option<String>,
+    pub app_context: Vec<OracleThinAppContext>,
+    pub debug_jdwp: Option<String>,
+    pub terminal: String,
     pub program: String,
     pub machine: String,
     pub os_user: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OracleThinAppContext {
+    pub namespace: String,
+    pub name: String,
+    pub value: String,
+}
+
+impl OracleThinAppContext {
+    pub fn new(
+        namespace: impl Into<String>,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        Self {
+            namespace: namespace.into(),
+            name: name.into(),
+            value: value.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -484,6 +510,9 @@ impl OracleThinConfig {
             connection_class: None,
             purity: OracleThinPurity::Default,
             driver_name: None,
+            app_context: Vec::new(),
+            debug_jdwp: None,
+            terminal: "unknown".to_string(),
             program: "space-query-thin".to_string(),
             machine: "localhost".to_string(),
             os_user: "space-query".to_string(),
@@ -611,12 +640,14 @@ pub struct OracleThinSession {
     ref_cursor_ids: HashSet<u32>,
     object_attrs_by_type: HashMap<(String, String), Vec<ThinColumn>>,
     collection_element_by_type: HashMap<(String, String), ThinColumn>,
+    combo_key: Option<Vec<u8>>,
     deferred_cursor_closes: HashMap<u32, HashSet<u32>>,
     deferred_cursor_parent_by_child: HashMap<u32, u32>,
     pending_current_schema: Option<String>,
     pending_end_to_end: EndToEndAttributes,
     cancel_flag: Arc<AtomicBool>,
     ttc_sequence: u8,
+    closed: bool,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -662,12 +693,14 @@ impl OracleThinSession {
             ref_cursor_ids: HashSet::new(),
             object_attrs_by_type: HashMap::new(),
             collection_element_by_type: HashMap::new(),
+            combo_key: auth.combo_key,
             deferred_cursor_closes: HashMap::new(),
             deferred_cursor_parent_by_child: HashMap::new(),
             pending_current_schema: None,
             pending_end_to_end: EndToEndAttributes::default(),
             cancel_flag: Arc::new(AtomicBool::new(false)),
             ttc_sequence: 3,
+            closed: false,
         })
     }
 
@@ -684,18 +717,30 @@ impl OracleThinSession {
     }
 
     pub fn set_action(&mut self, value: Option<String>) {
+        if !self.supports_end_to_end_piggyback() {
+            return;
+        }
         self.pending_end_to_end.action = Some(value);
     }
 
     pub fn set_client_identifier(&mut self, value: Option<String>) {
+        if !self.supports_end_to_end_piggyback() {
+            return;
+        }
         self.pending_end_to_end.client_identifier = Some(value);
     }
 
     pub fn set_client_info(&mut self, value: Option<String>) {
+        if !self.supports_end_to_end_piggyback() {
+            return;
+        }
         self.pending_end_to_end.client_info = Some(value);
     }
 
     pub fn set_dbop(&mut self, value: Option<String>) {
+        if !self.supports_end_to_end_piggyback() {
+            return;
+        }
         self.pending_end_to_end.dbop = Some(value);
     }
 
@@ -704,10 +749,17 @@ impl OracleThinSession {
     }
 
     pub fn set_module(&mut self, value: Option<String>) {
+        if !self.supports_end_to_end_piggyback() {
+            return;
+        }
         self.pending_end_to_end.module = Some(value);
         if self.pending_end_to_end.action.is_none() {
             self.pending_end_to_end.action = Some(None);
         }
+    }
+
+    fn supports_end_to_end_piggyback(&self) -> bool {
+        self.capabilities.protocol_version.unwrap_or(319) >= 315
     }
 
     pub fn cancel_handle(&self) -> OracleThinCancelHandle {
@@ -882,7 +934,7 @@ impl OracleThinSession {
         if self.broken {
             Err(OracleThinError::new("Oracle thin session is broken"))
         } else {
-            Ok(())
+            self.simple_ttc_call(TNS_FUNC_PING, "ping")
         }
     }
 
@@ -896,6 +948,59 @@ impl OracleThinSession {
 
     pub fn rollback(&mut self) -> Result<(), OracleThinError> {
         self.simple_ttc_call(TNS_FUNC_ROLLBACK, "rollback")
+    }
+
+    pub fn change_password(
+        &mut self,
+        old_password: impl AsRef<str>,
+        new_password: impl AsRef<str>,
+    ) -> Result<(), OracleThinError> {
+        let combo_key = self.combo_key.clone().ok_or_else(|| {
+            OracleThinError::new("Oracle thin session does not have an authentication combo key")
+        })?;
+        let mut salt = [0u8; 16];
+        OsRng.fill_bytes(&mut salt);
+        let sequence = self.next_ttc_sequence();
+        let payload = auth_change_password_payload(
+            &self.config.username,
+            old_password.as_ref(),
+            new_password.as_ref(),
+            &combo_key,
+            &salt,
+            &self.capabilities,
+            sequence,
+        )?;
+        write_data_packet(
+            &mut self.stream,
+            self.capabilities.protocol_version.unwrap_or(319),
+            self.capabilities.data_packet_chunk_size(),
+            &payload,
+        )?;
+        let mut state = AuthState::default();
+        process_auth_response(&mut self.stream, &self.capabilities, &mut state)
+    }
+
+    pub fn close(&mut self) -> Result<(), OracleThinError> {
+        if self.closed {
+            return Ok(());
+        }
+        if self.broken {
+            self.closed = true;
+            let _ = self.stream.shutdown(Shutdown::Both);
+            return Ok(());
+        }
+
+        let result = self
+            .simple_ttc_call(TNS_FUNC_LOGOFF, "logoff")
+            .and_then(|_| {
+                write_eof_data_packet(
+                    &mut self.stream,
+                    self.capabilities.protocol_version.unwrap_or(319),
+                )
+            });
+        self.closed = true;
+        let _ = self.stream.shutdown(Shutdown::Both);
+        result
     }
 
     pub fn transaction_in_progress(&self) -> bool {
@@ -2613,6 +2718,12 @@ impl OracleThinSession {
             &self.capabilities,
             !pending_cursor_closes.is_empty(),
         )
+    }
+}
+
+impl Drop for OracleThinSession {
+    fn drop(&mut self) {
+        let _ = self.close();
     }
 }
 
@@ -10174,6 +10285,7 @@ fn execute_legacy_error_message(
 #[derive(Debug, Default)]
 struct AuthResult {
     server_version: Option<String>,
+    combo_key: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Default)]
@@ -10215,6 +10327,7 @@ fn authenticate(
     log_connect_phase("ttc-auth-accept", "");
     Ok(AuthResult {
         server_version: state.server_version,
+        combo_key: state.combo_key,
     })
 }
 
@@ -10223,6 +10336,19 @@ fn write_auth_phase_one(
     config: &OracleThinConfig,
     capabilities: &OracleThinCapabilities,
 ) -> Result<(), OracleThinError> {
+    let payload = auth_phase_one_payload(config, capabilities)?;
+    write_data_packet(
+        stream,
+        capabilities.protocol_version.unwrap_or(319),
+        capabilities.data_packet_chunk_size(),
+        &payload,
+    )
+}
+
+fn auth_phase_one_payload(
+    config: &OracleThinConfig,
+    capabilities: &OracleThinCapabilities,
+) -> Result<Vec<u8>, OracleThinError> {
     let mut payload = Vec::new();
     write_function_code(&mut payload, TNS_FUNC_AUTH_PHASE_ONE, 1, capabilities);
     write_auth_header(
@@ -10231,17 +10357,12 @@ fn write_auth_phase_one(
         TNS_AUTH_MODE_LOGON | config.auth_mode.tns_bits(),
         5,
     )?;
-    write_key_value(&mut payload, "AUTH_TERMINAL", "unknown", 0)?;
+    write_key_value(&mut payload, "AUTH_TERMINAL", &config.terminal, 0)?;
     write_key_value(&mut payload, "AUTH_PROGRAM_NM", &config.program, 0)?;
     write_key_value(&mut payload, "AUTH_MACHINE", &config.machine, 0)?;
     write_key_value(&mut payload, "AUTH_PID", &std::process::id().to_string(), 0)?;
     write_key_value(&mut payload, "AUTH_SID", &config.os_user, 0)?;
-    write_data_packet(
-        stream,
-        capabilities.protocol_version.unwrap_or(319),
-        capabilities.data_packet_chunk_size(),
-        &payload,
-    )
+    Ok(payload)
 }
 
 fn write_auth_phase_two(
@@ -10282,6 +10403,10 @@ fn auth_phase_two_payload(
     if config.edition.is_some() {
         num_pairs += 1;
     }
+    num_pairs += (config.app_context.len() * 3) as u32;
+    if credentials.debug_jdwp_data.is_some() {
+        num_pairs += 1;
+    }
     write_auth_header(
         &mut payload,
         &config.username,
@@ -10319,12 +10444,49 @@ fn auth_phase_two_payload(
     if let Some(edition) = config.edition.as_deref() {
         write_key_value(&mut payload, "AUTH_ORA_EDITION", edition, 0)?;
     }
+    for entry in &config.app_context {
+        write_key_value(&mut payload, "AUTH_APPCTX_NSPACE\0", &entry.namespace, 0)?;
+        write_key_value(&mut payload, "AUTH_APPCTX_ATTR\0", &entry.name, 0)?;
+        write_key_value(&mut payload, "AUTH_APPCTX_VALUE\0", &entry.value, 0)?;
+    }
+    if let Some(debug_jdwp_data) = credentials.debug_jdwp_data.as_deref() {
+        write_key_value(&mut payload, "AUTH_ORA_DEBUG_JDWP", debug_jdwp_data, 0)?;
+    }
     write_key_value(
         &mut payload,
         "AUTH_CONNECT_STRING",
-        &auth_connect_string(&config.target),
+        &auth_connect_string(config)?,
         0,
     )?;
+    Ok(payload)
+}
+
+fn auth_change_password_payload(
+    username: &str,
+    old_password: &str,
+    new_password: &str,
+    combo_key: &[u8],
+    salt: &[u8; 16],
+    capabilities: &OracleThinCapabilities,
+    sequence: u8,
+) -> Result<Vec<u8>, OracleThinError> {
+    let mut payload = Vec::new();
+    write_function_code(
+        &mut payload,
+        TNS_FUNC_AUTH_PHASE_TWO,
+        sequence,
+        capabilities,
+    );
+    write_auth_header(
+        &mut payload,
+        username,
+        TNS_AUTH_MODE_WITH_PASSWORD | TNS_AUTH_MODE_CHANGE_PASSWORD,
+        2,
+    )?;
+    let encoded_password = encode_auth_password(combo_key, old_password.as_bytes(), salt)?;
+    let encoded_new_password = encode_auth_password(combo_key, new_password.as_bytes(), salt)?;
+    write_key_value(&mut payload, "AUTH_PASSWORD", &encoded_password, 0)?;
+    write_key_value(&mut payload, "AUTH_NEWPASSWORD", &encoded_new_password, 0)?;
     Ok(payload)
 }
 
@@ -10405,6 +10567,7 @@ struct AuthCredentials {
     session_key: String,
     speedy_key: Option<String>,
     password: String,
+    debug_jdwp_data: Option<String>,
 }
 
 fn generate_auth_credentials(
@@ -10448,6 +10611,7 @@ fn generate_12c_auth_credentials(
 
     generate_auth_credentials_from_password_hash(
         config.password.as_bytes(),
+        config.debug_jdwp.as_deref(),
         state,
         &password_hash,
         32,
@@ -10463,6 +10627,7 @@ fn generate_11g_auth_credentials(
     let password_hash = generate_11g_password_hash(config.password.as_bytes(), &verifier_data);
     generate_auth_credentials_from_password_hash(
         config.password.as_bytes(),
+        config.debug_jdwp.as_deref(),
         state,
         &password_hash,
         24,
@@ -10477,6 +10642,7 @@ fn generate_10g_auth_credentials(
     let password_hash = generate_10g_password_hash(&config.username, &config.password);
     generate_auth_credentials_from_password_hash(
         config.password.as_bytes(),
+        config.debug_jdwp.as_deref(),
         state,
         &password_hash,
         16,
@@ -10486,6 +10652,7 @@ fn generate_10g_auth_credentials(
 
 fn generate_auth_credentials_from_password_hash(
     password: &[u8],
+    debug_jdwp: Option<&str>,
     state: &mut AuthState,
     password_hash: &[u8],
     key_len: usize,
@@ -10497,6 +10664,7 @@ fn generate_auth_credentials_from_password_hash(
     OsRng.fill_bytes(&mut session_key_part_b);
     generate_auth_credentials_from_session_key_parts(
         password,
+        debug_jdwp,
         state,
         password_hash,
         key_len,
@@ -10508,6 +10676,7 @@ fn generate_auth_credentials_from_password_hash(
 
 fn generate_auth_credentials_from_session_key_parts(
     password: &[u8],
+    debug_jdwp: Option<&str>,
     state: &mut AuthState,
     password_hash: &[u8],
     key_len: usize,
@@ -10538,12 +10707,37 @@ fn generate_auth_credentials_from_session_key_parts(
     password_plain.extend_from_slice(&password_salt);
     password_plain.extend_from_slice(password);
     let encrypted_password = aes_encrypt_cbc_pkcs7(&combo_key, &password_plain)?;
+    let debug_jdwp_data = encode_debug_jdwp_data(debug_jdwp, &combo_key)?;
 
     Ok(AuthCredentials {
         session_key,
         speedy_key,
         password: hex_encode_upper(&encrypted_password),
+        debug_jdwp_data,
     })
+}
+
+fn encode_debug_jdwp_data(
+    debug_jdwp: Option<&str>,
+    combo_key: &[u8],
+) -> Result<Option<String>, OracleThinError> {
+    let Some(debug_jdwp) = debug_jdwp else {
+        return Ok(None);
+    };
+    let encrypted = aes_encrypt_cbc_zero_padding(combo_key, debug_jdwp.as_bytes())?;
+    Ok(Some(format!("{}01", hex_encode_upper(&encrypted))))
+}
+
+fn encode_auth_password(
+    combo_key: &[u8],
+    password: &[u8],
+    salt: &[u8; 16],
+) -> Result<String, OracleThinError> {
+    let mut plain = Vec::with_capacity(salt.len() + password.len());
+    plain.extend_from_slice(salt);
+    plain.extend_from_slice(password);
+    let encrypted = aes_encrypt_cbc_pkcs7(combo_key, &plain)?;
+    Ok(hex_encode_upper(&encrypted))
 }
 
 fn generate_11g_password_hash(password: &[u8], verifier_data: &[u8]) -> Vec<u8> {
@@ -10875,6 +11069,34 @@ fn aes_encrypt_cbc_pkcs7(key: &[u8], plain_text: &[u8]) -> Result<Vec<u8>, Oracl
     Ok(encrypted.to_vec())
 }
 
+fn aes_encrypt_cbc_zero_padding(key: &[u8], plain_text: &[u8]) -> Result<Vec<u8>, OracleThinError> {
+    let iv = [0u8; 16];
+    let pos = plain_text.len();
+    let padded_len = pos + (16 - (pos % 16));
+    let mut buf = plain_text.to_vec();
+    buf.resize(padded_len, 0);
+    let encrypted = match key.len() {
+        16 => cbc::Encryptor::<Aes128>::new_from_slices(key, &iv)
+            .map_err(|err| OracleThinError::new(format!("invalid AES-128 key: {err}")))?
+            .encrypt_padded_mut::<NoPadding>(&mut buf, padded_len)
+            .map_err(|err| OracleThinError::new(format!("AES-CBC encrypt failed: {err}")))?,
+        24 => cbc::Encryptor::<Aes192>::new_from_slices(key, &iv)
+            .map_err(|err| OracleThinError::new(format!("invalid AES-192 key: {err}")))?
+            .encrypt_padded_mut::<NoPadding>(&mut buf, padded_len)
+            .map_err(|err| OracleThinError::new(format!("AES-CBC encrypt failed: {err}")))?,
+        32 => cbc::Encryptor::<Aes256>::new_from_slices(key, &iv)
+            .map_err(|err| OracleThinError::new(format!("invalid AES-256 key: {err}")))?
+            .encrypt_padded_mut::<NoPadding>(&mut buf, padded_len)
+            .map_err(|err| OracleThinError::new(format!("AES-CBC encrypt failed: {err}")))?,
+        len => {
+            return Err(OracleThinError::new(format!(
+                "unsupported AES key length {len}"
+            )));
+        }
+    };
+    Ok(encrypted.to_vec())
+}
+
 fn aes_decrypt_cbc_no_padding(
     key: &[u8],
     encrypted_text: &[u8],
@@ -10936,11 +11158,22 @@ fn hex_encode_upper(bytes: &[u8]) -> String {
     out
 }
 
-fn auth_connect_string(target: &ConnectTarget) -> String {
-    format!(
-        "(DESCRIPTION=(ADDRESS=(PROTOCOL=tcp)(HOST={})(PORT={}))(CONNECT_DATA=(SERVICE_NAME={})))",
-        target.host, target.port, target.service_name
-    )
+fn auth_connect_string(config: &OracleThinConfig) -> Result<String, OracleThinError> {
+    let target = &config.target;
+    validate_connect_descriptor_value("host", &target.host)?;
+    validate_connect_descriptor_value("service_name", &target.service_name)?;
+    validate_connect_descriptor_value("program", &config.program)?;
+    validate_connect_descriptor_value("machine", &config.machine)?;
+    validate_connect_descriptor_value("os_user", &config.os_user)?;
+    Ok(format!(
+        "(DESCRIPTION=(ADDRESS=(PROTOCOL=tcp)(HOST={})(PORT={}))(CONNECT_DATA=(SERVICE_NAME={})(CID=(PROGRAM={})(HOST={})(USER={}))))",
+        target.host,
+        target.port,
+        target.service_name,
+        config.program,
+        config.machine,
+        config.os_user
+    ))
 }
 
 fn alter_session_timezone_statement() -> String {
@@ -10998,6 +11231,24 @@ fn write_single_data_packet(
     }
     packet[4] = TNS_PACKET_TYPE_DATA;
     packet[10..].copy_from_slice(payload);
+    stream.write_all(&packet)?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn write_eof_data_packet(
+    stream: &mut TcpStream,
+    protocol_version: u16,
+) -> Result<(), OracleThinError> {
+    let size = 10usize;
+    let mut packet = vec![0u8; size];
+    if protocol_version >= 315 {
+        put_u32(&mut packet, 0, size as u32);
+    } else {
+        put_u16(&mut packet, 0, size as u16);
+    }
+    packet[4] = TNS_PACKET_TYPE_DATA;
+    packet[8..10].copy_from_slice(&TNS_DATA_FLAGS_EOF.to_be_bytes());
     stream.write_all(&packet)?;
     stream.flush()?;
     Ok(())
@@ -12275,9 +12526,9 @@ mod tests {
         ORA_TYPE_NUM_RAW, ORA_TYPE_NUM_ROWID, ORA_TYPE_NUM_TIMESTAMP_LTZ,
         ORA_TYPE_NUM_TIMESTAMP_TZ, ORA_TYPE_NUM_TIMESTAMP_TZ_EXT, ORA_TYPE_NUM_UROWID,
         ORA_TYPE_NUM_VARCHAR, ORA_TYPE_NUM_VECTOR,
-        PYTHON_ORACLEDB_MODERN_DATA_TYPE_REPRESENTATIONS, TNS_AUTH_MODE_LOGON,
-        TNS_AUTH_MODE_SYSASM, TNS_AUTH_MODE_SYSBKP, TNS_AUTH_MODE_SYSDBA, TNS_AUTH_MODE_SYSDGD,
-        TNS_AUTH_MODE_SYSKMT, TNS_AUTH_MODE_SYSOPER, TNS_AUTH_MODE_SYSRAC,
+        PYTHON_ORACLEDB_MODERN_DATA_TYPE_REPRESENTATIONS, TNS_AUTH_MODE_CHANGE_PASSWORD,
+        TNS_AUTH_MODE_LOGON, TNS_AUTH_MODE_SYSASM, TNS_AUTH_MODE_SYSBKP, TNS_AUTH_MODE_SYSDBA,
+        TNS_AUTH_MODE_SYSDGD, TNS_AUTH_MODE_SYSKMT, TNS_AUTH_MODE_SYSOPER, TNS_AUTH_MODE_SYSRAC,
         TNS_AUTH_MODE_WITH_PASSWORD, TNS_BIND_USE_INDICATORS, TNS_CHARSET_UTF8,
         TNS_CONTROL_TYPE_INBAND_NOTIFICATION, TNS_CONTROL_TYPE_RESET_OOB,
         TNS_DATA_FLAGS_END_OF_RESPONSE, TNS_DATA_FLAGS_EOF, TNS_DATA_TYPE_BDOUBLE,
@@ -12292,28 +12543,29 @@ mod tests {
         TNS_DATA_TYPE_VCS, TNS_DATA_TYPE_VNU, TNS_DATA_TYPE_VST, TNS_DEFAULT_SDU,
         TNS_DURATION_SESSION, TNS_END_TO_END_ACTION, TNS_END_TO_END_CLIENT_IDENTIFIER,
         TNS_END_TO_END_CLIENT_INFO, TNS_END_TO_END_DBOP, TNS_END_TO_END_MODULE,
-        TNS_ERR_INBAND_MESSAGE, TNS_EXEC_FLAGS_IMPLICIT_RESULTSET, TNS_FUNC_AUTH_PHASE_TWO,
-        TNS_FUNC_LOB_OP, TNS_FUNC_PING, TNS_FUNC_SET_END_TO_END_ATTR, TNS_FUNC_SET_SCHEMA,
-        TNS_JSON_TYPE_ID, TNS_LOB_LOC_FLAGS_LITTLE_ENDIAN, TNS_LOB_LOC_FLAGS_VAR_LENGTH_CHARSET,
-        TNS_LOB_LOC_OFFSET_FLAG_3, TNS_LOB_LOC_OFFSET_FLAG_4, TNS_LOB_OP_ARRAY,
-        TNS_LOB_OP_CREATE_TEMP, TNS_LOB_OP_FREE_TEMP, TNS_LOB_PREFETCH_FLAG, TNS_MARKER_TYPE_BREAK,
-        TNS_MARKER_TYPE_INTERRUPT, TNS_MARKER_TYPE_RESET, TNS_MAX_LONG_LENGTH,
-        TNS_MSG_TYPE_END_OF_RESPONSE, TNS_MSG_TYPE_FUNCTION, TNS_MSG_TYPE_PIGGYBACK,
-        TNS_MSG_TYPE_STATUS, TNS_PACKET_TYPE_CONTROL, TNS_PACKET_TYPE_DATA, TNS_PACKET_TYPE_MARKER,
-        TNS_VECTOR_FLAG_NORM, TNS_VECTOR_FLAG_NORM_RESERVED, TNS_VECTOR_FLAG_SPARSE,
-        TNS_VECTOR_FORMAT_BINARY, TNS_VECTOR_FORMAT_FLOAT32, TNS_VECTOR_FORMAT_FLOAT64,
-        TNS_VECTOR_FORMAT_INT8, TNS_VECTOR_MAGIC_BYTE, TNS_VECTOR_VERSION_BASE,
-        TNS_VECTOR_VERSION_WITH_BINARY, TNS_VECTOR_VERSION_WITH_SPARSE,
+        TNS_ERR_INBAND_MESSAGE, TNS_EXEC_FLAGS_IMPLICIT_RESULTSET, TNS_FUNC_AUTH_PHASE_ONE,
+        TNS_FUNC_AUTH_PHASE_TWO, TNS_FUNC_LOB_OP, TNS_FUNC_PING, TNS_FUNC_SET_END_TO_END_ATTR,
+        TNS_FUNC_SET_SCHEMA, TNS_JSON_TYPE_ID, TNS_LOB_LOC_FLAGS_LITTLE_ENDIAN,
+        TNS_LOB_LOC_FLAGS_VAR_LENGTH_CHARSET, TNS_LOB_LOC_OFFSET_FLAG_3, TNS_LOB_LOC_OFFSET_FLAG_4,
+        TNS_LOB_OP_ARRAY, TNS_LOB_OP_CREATE_TEMP, TNS_LOB_OP_FREE_TEMP, TNS_LOB_PREFETCH_FLAG,
+        TNS_MARKER_TYPE_BREAK, TNS_MARKER_TYPE_INTERRUPT, TNS_MARKER_TYPE_RESET,
+        TNS_MAX_LONG_LENGTH, TNS_MSG_TYPE_END_OF_RESPONSE, TNS_MSG_TYPE_FUNCTION,
+        TNS_MSG_TYPE_PIGGYBACK, TNS_MSG_TYPE_STATUS, TNS_PACKET_TYPE_CONTROL, TNS_PACKET_TYPE_DATA,
+        TNS_PACKET_TYPE_MARKER, TNS_VECTOR_FLAG_NORM, TNS_VECTOR_FLAG_NORM_RESERVED,
+        TNS_VECTOR_FLAG_SPARSE, TNS_VECTOR_FORMAT_BINARY, TNS_VECTOR_FORMAT_FLOAT32,
+        TNS_VECTOR_FORMAT_FLOAT64, TNS_VECTOR_FORMAT_INT8, TNS_VECTOR_MAGIC_BYTE,
+        TNS_VECTOR_VERSION_BASE, TNS_VECTOR_VERSION_WITH_BINARY, TNS_VECTOR_VERSION_WITH_SPARSE,
     };
     use super::{
         adjust_for_server_compile_caps, adjust_for_server_runtime_caps,
-        alter_session_timezone_statement, auth_phase_two_payload, capabilities_from_accept,
-        client_compile_caps, client_runtime_caps, decode_collection_payload, decode_json_payload,
-        decode_json_payload_value, decode_object_payload, decode_oracle_binary_double,
-        decode_oracle_binary_float, decode_oracle_datetime, decode_oracle_interval_ds,
-        decode_oracle_interval_ym, decode_oracle_number, decode_oracle_text, decode_oracle_vector,
-        decode_oson_to_json, default_ttc_field_version, define_column_metadata,
-        derive_auth_combo_key, des_encrypt_block, encode_bfile_locator,
+        alter_session_timezone_statement, auth_change_password_payload, auth_phase_one_payload,
+        auth_phase_two_payload, capabilities_from_accept, client_compile_caps, client_runtime_caps,
+        decode_collection_payload, decode_json_payload, decode_json_payload_value,
+        decode_object_payload, decode_oracle_binary_double, decode_oracle_binary_float,
+        decode_oracle_datetime, decode_oracle_interval_ds, decode_oracle_interval_ym,
+        decode_oracle_number, decode_oracle_text, decode_oracle_vector, decode_oson_to_json,
+        default_ttc_field_version, define_column_metadata, derive_auth_combo_key,
+        des_encrypt_block, encode_auth_password, encode_bfile_locator, encode_debug_jdwp_data,
         encode_oracle_binary_double, encode_oracle_binary_float, encode_oracle_bind_text,
         encode_oracle_number, encode_oracle_timestamp_bind, encode_oson_bool_json,
         encode_oson_date_json, encode_oson_id_json, encode_oson_interval_ds_json,
@@ -12332,22 +12584,24 @@ mod tests {
         validate_supported_protocol, verify_server_response, windows_code_pages_for_encoding,
         write_bind_rows_for_request, write_bind_value, write_bytes_with_length_for_capabilities,
         write_bytes_with_two_lengths, write_column_metadata, write_current_schema_piggyback,
-        write_data_packet, write_data_type_representations, write_end_to_end_piggyback, write_ub2,
-        write_ub4, write_ub8, AuthCredentials, AuthState, EndToEndAttributes, OracleThinAuthMode,
-        OracleThinCapabilities, OracleThinConfig, OracleThinPurity, OracleThinSession, OracleValue,
-        PacketCursor, ThinColumn, CS_FORM_IMPLICIT, CS_FORM_NCHAR, ORACLE_CHARSET_AL32UTF8,
+        write_data_packet, write_data_type_representations, write_end_to_end_piggyback,
+        write_eof_data_packet, write_ub2, write_ub4, write_ub8, AuthCredentials, AuthState,
+        EndToEndAttributes, OracleThinAppContext, OracleThinAuthMode, OracleThinCapabilities,
+        OracleThinConfig, OracleThinPurity, OracleThinSession, OracleValue, PacketCursor,
+        ThinColumn, CS_FORM_IMPLICIT, CS_FORM_NCHAR, ORACLE_CHARSET_AL32UTF8,
         ORACLE_CHARSET_JA16SJIS, ORACLE_CHARSET_KO16KSC5601, ORACLE_CHARSET_KO16MSWIN949,
         ORACLE_CHARSET_UTF8, ORACLE_CHARSET_ZHS16GBK, ORACLE_CHARSET_ZHT16BIG5,
         TNS_CCAP_END_OF_CALL_STATUS, TNS_CCAP_END_OF_RESPONSE, TNS_CCAP_EXPLICIT_BOUNDARY,
         TNS_CCAP_FIELD_VERSION, TNS_CCAP_FIELD_VERSION_20_1,
         TNS_CCAP_LEGACY_FAST_SESSION_ATTRIBUTES, TNS_CCAP_OCI1, TNS_CCAP_TTC1, TNS_CCAP_TTC4,
-        TNS_ESCAPE_CHAR, TNS_FUNC_COMMIT, TNS_JSON_MAX_LENGTH, TNS_LEGACY_CLR_CHUNK_SIZE,
-        TNS_MAX_ROWID_LENGTH, TNS_MAX_UROWID_LENGTH, TNS_MSG_TYPE_ERROR, TNS_MSG_TYPE_PARAMETER,
-        TNS_MSG_TYPE_PROTOCOL, TNS_MSG_TYPE_ROW_DATA, TNS_MSG_TYPE_SERVER_SIDE_PIGGYBACK,
-        TNS_OBJ_HAS_INDEXES, TNS_OBJ_IS_DEGENERATE, TNS_OBJ_NO_PREFIX_SEG, TNS_RCAP_TTC,
-        TNS_RCAP_TTC_32K, TNS_RCAP_TTC_SESSION_STATE_OPS, TNS_RCAP_TTC_ZERO_COPY,
-        TNS_SERVER_PIGGYBACK_TRACE_EVENT, TNS_VERIFIER_TYPE_10G, TNS_VERIFIER_TYPE_11G_1,
-        TNS_VERIFIER_TYPE_11G_2, TNS_VERIFIER_TYPE_12C, TNS_XML_TYPE_LOB, TNS_XML_TYPE_STRING,
+        TNS_ESCAPE_CHAR, TNS_FUNC_COMMIT, TNS_FUNC_LOGOFF, TNS_JSON_MAX_LENGTH,
+        TNS_LEGACY_CLR_CHUNK_SIZE, TNS_MAX_ROWID_LENGTH, TNS_MAX_UROWID_LENGTH, TNS_MSG_TYPE_ERROR,
+        TNS_MSG_TYPE_PARAMETER, TNS_MSG_TYPE_PROTOCOL, TNS_MSG_TYPE_ROW_DATA,
+        TNS_MSG_TYPE_SERVER_SIDE_PIGGYBACK, TNS_OBJ_HAS_INDEXES, TNS_OBJ_IS_DEGENERATE,
+        TNS_OBJ_NO_PREFIX_SEG, TNS_RCAP_TTC, TNS_RCAP_TTC_32K, TNS_RCAP_TTC_SESSION_STATE_OPS,
+        TNS_RCAP_TTC_ZERO_COPY, TNS_SERVER_PIGGYBACK_TRACE_EVENT, TNS_VERIFIER_TYPE_10G,
+        TNS_VERIFIER_TYPE_11G_1, TNS_VERIFIER_TYPE_11G_2, TNS_VERIFIER_TYPE_12C, TNS_XML_TYPE_LOB,
+        TNS_XML_TYPE_STRING,
     };
     use crate::connect::{AcceptInfo, ConnectOptions, ConnectTarget};
     use crate::exec::{
@@ -12373,12 +12627,14 @@ mod tests {
             ref_cursor_ids: HashSet::new(),
             object_attrs_by_type: HashMap::new(),
             collection_element_by_type: HashMap::new(),
+            combo_key: Some(vec![0; 16]),
             deferred_cursor_closes: HashMap::new(),
             deferred_cursor_parent_by_child: HashMap::new(),
             pending_current_schema: None,
             pending_end_to_end: EndToEndAttributes::default(),
             cancel_flag: Arc::new(AtomicBool::new(false)),
             ttc_sequence: 3,
+            closed: true,
         }
     }
 
@@ -12402,6 +12658,14 @@ mod tests {
     fn read_tns_test_packet(stream: &mut TcpStream, protocol_version: u16) -> Vec<u8> {
         let mut header = [0u8; 8];
         stream.read_exact(&mut header).unwrap();
+        read_tns_test_packet_body_after_header(stream, protocol_version, header)
+    }
+
+    fn read_tns_test_packet_body_after_header(
+        stream: &mut TcpStream,
+        protocol_version: u16,
+        header: [u8; 8],
+    ) -> Vec<u8> {
         let size = if protocol_version >= 315 {
             u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize
         } else {
@@ -12471,6 +12735,95 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn write_eof_data_packet_matches_python_oracledb_logoff_close_packet() {
+        for protocol_version in [314, 315, 318, 319] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut header = [0u8; 8];
+                stream.read_exact(&mut header).unwrap();
+                let body =
+                    read_tns_test_packet_body_after_header(&mut stream, protocol_version, header);
+                (header, body)
+            });
+            let mut stream = TcpStream::connect(addr).unwrap();
+
+            write_eof_data_packet(&mut stream, protocol_version).unwrap();
+            drop(stream);
+            let (header, body) = server.join().unwrap();
+
+            let size = if protocol_version >= 315 {
+                u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize
+            } else {
+                u16::from_be_bytes([header[0], header[1]]) as usize
+            };
+            assert_eq!(size, 10, "{protocol_version}");
+            assert_eq!(header[4], TNS_PACKET_TYPE_DATA, "{protocol_version}");
+            assert_eq!(body, TNS_DATA_FLAGS_EOF.to_be_bytes(), "{protocol_version}");
+        }
+    }
+
+    #[test]
+    fn close_sends_logoff_then_eof_like_python_oracledb() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let logoff_body = read_tns_test_packet(&mut stream, 319);
+            assert_eq!(&logoff_body[..2], &[0, 0]);
+            assert_eq!(
+                &logoff_body[2..],
+                &[TNS_MSG_TYPE_FUNCTION, TNS_FUNC_LOGOFF, 3]
+            );
+
+            let mut response = vec![0, 0, TNS_MSG_TYPE_STATUS];
+            response.extend_from_slice(&0u32.to_be_bytes());
+            response.extend_from_slice(&0u16.to_be_bytes());
+            let packet = tns_test_packet(319, TNS_PACKET_TYPE_DATA, &response);
+            stream.write_all(&packet).unwrap();
+
+            read_tns_test_packet(&mut stream, 319)
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut session = test_session_with_stream(stream);
+        session.closed = false;
+
+        session.close().unwrap();
+        let eof_body = server.join().unwrap();
+
+        assert_eq!(eof_body, TNS_DATA_FLAGS_EOF.to_be_bytes());
+    }
+
+    #[test]
+    fn ping_sends_tns_ping_function_like_python_oracledb() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let ping_body = read_tns_test_packet(&mut stream, 319);
+
+            let mut response = vec![0, 0, TNS_MSG_TYPE_STATUS];
+            response.extend_from_slice(&0u32.to_be_bytes());
+            response.extend_from_slice(&0u16.to_be_bytes());
+            let packet = tns_test_packet(319, TNS_PACKET_TYPE_DATA, &response);
+            stream.write_all(&packet).unwrap();
+
+            ping_body
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut session = test_session_with_stream(stream);
+
+        session.ping().unwrap();
+        let ping_body = server.join().unwrap();
+
+        assert_eq!(
+            &ping_body[..],
+            &[0, 0, TNS_MSG_TYPE_FUNCTION, TNS_FUNC_PING, 3]
+        );
     }
 
     #[test]
@@ -12942,6 +13295,28 @@ mod tests {
             "dashboard"
         );
         assert_eq!(cursor.remaining(), 0);
+    }
+
+    #[test]
+    fn end_to_end_setters_are_noop_for_go_ora_protocol_314() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let _ = listener.accept().unwrap();
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut session = test_session_with_stream(stream);
+        session.capabilities.protocol_version = Some(314);
+
+        session.set_module(Some("module".to_string()));
+        session.set_action(Some("action".to_string()));
+        session.set_client_identifier(Some("client".to_string()));
+        session.set_client_info(Some("info".to_string()));
+        session.set_dbop(Some("dbop".to_string()));
+
+        assert!(session.pending_end_to_end.is_empty());
+        drop(session);
+        server.join().unwrap();
     }
 
     #[test]
@@ -17333,11 +17708,13 @@ mod tests {
     fn read_auth_key_values(
         payload: &[u8],
         capabilities: &OracleThinCapabilities,
+        expected_function_code: u8,
+        expected_sequence: u8,
     ) -> (u32, Vec<(String, String, u32)>) {
         let mut cursor = PacketCursor::with_capabilities(payload, capabilities);
         assert_eq!(cursor.read_u8().unwrap(), TNS_MSG_TYPE_FUNCTION);
-        assert_eq!(cursor.read_u8().unwrap(), TNS_FUNC_AUTH_PHASE_TWO);
-        assert_eq!(cursor.read_u8().unwrap(), 2);
+        assert_eq!(cursor.read_u8().unwrap(), expected_function_code);
+        assert_eq!(cursor.read_u8().unwrap(), expected_sequence);
         if capabilities.ttc_field_version >= 18 {
             assert_eq!(cursor.read_ub8().unwrap(), 0);
         }
@@ -17371,6 +17748,39 @@ mod tests {
     }
 
     #[test]
+    fn auth_phase_one_writes_terminal_and_process_metadata_like_python_oracledb() {
+        let mut config = OracleThinConfig::new(
+            ConnectTarget::service_name("dbhost", 1521, "XE"),
+            "system",
+            "",
+        );
+        config.terminal = "tty001".to_string();
+        config.program = "space-query".to_string();
+        config.machine = "devhost".to_string();
+        config.os_user = "iceblue".to_string();
+
+        let payload = auth_phase_one_payload(&config, &OracleThinCapabilities::default()).unwrap();
+        let (auth_mode, pairs) = read_auth_key_values(
+            &payload,
+            &OracleThinCapabilities::default(),
+            TNS_FUNC_AUTH_PHASE_ONE,
+            1,
+        );
+
+        assert_eq!(auth_mode, TNS_AUTH_MODE_LOGON);
+        assert_eq!(
+            pairs,
+            vec![
+                ("AUTH_TERMINAL".to_string(), "tty001".to_string(), 0),
+                ("AUTH_PROGRAM_NM".to_string(), "space-query".to_string(), 0),
+                ("AUTH_MACHINE".to_string(), "devhost".to_string(), 0),
+                ("AUTH_PID".to_string(), std::process::id().to_string(), 0),
+                ("AUTH_SID".to_string(), "iceblue".to_string(), 0),
+            ]
+        );
+    }
+
+    #[test]
     fn auth_phase_two_writes_optional_connection_metadata_like_python_oracledb() {
         let mut config = OracleThinConfig::new(
             ConnectTarget::service_name("dbhost", 1521, "FREEPDB1"),
@@ -17382,16 +17792,27 @@ mod tests {
         config.connection_class = Some("SPACE_QUERY".to_string());
         config.purity = OracleThinPurity::SelfConnection;
         config.driver_name = Some("custom thin driver".to_string());
+        config.app_context.push(OracleThinAppContext::new(
+            "SPACE_CTX",
+            "tenant_id",
+            "tenant-42",
+        ));
         let credentials = AuthCredentials {
             session_key: "session-key".to_string(),
             speedy_key: Some("speedy-key".to_string()),
             password: "encoded-password".to_string(),
+            debug_jdwp_data: Some("JDWPHEX01".to_string()),
         };
 
         let payload =
             auth_phase_two_payload(&config, &OracleThinCapabilities::default(), &credentials)
                 .unwrap();
-        let (auth_mode, pairs) = read_auth_key_values(&payload, &OracleThinCapabilities::default());
+        let (auth_mode, pairs) = read_auth_key_values(
+            &payload,
+            &OracleThinCapabilities::default(),
+            TNS_FUNC_AUTH_PHASE_TWO,
+            2,
+        );
 
         assert_eq!(auth_mode, TNS_AUTH_MODE_LOGON | TNS_AUTH_MODE_WITH_PASSWORD);
         assert_eq!(
@@ -17437,11 +17858,116 @@ mod tests {
                     0
                 ),
                 (
+                    "AUTH_APPCTX_NSPACE\0".to_string(),
+                    "SPACE_CTX".to_string(),
+                    0
+                ),
+                (
+                    "AUTH_APPCTX_ATTR\0".to_string(),
+                    "tenant_id".to_string(),
+                    0
+                ),
+                (
+                    "AUTH_APPCTX_VALUE\0".to_string(),
+                    "tenant-42".to_string(),
+                    0
+                ),
+                (
+                    "AUTH_ORA_DEBUG_JDWP".to_string(),
+                    "JDWPHEX01".to_string(),
+                    0
+                ),
+                (
                     "AUTH_CONNECT_STRING".to_string(),
-                    "(DESCRIPTION=(ADDRESS=(PROTOCOL=tcp)(HOST=dbhost)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=FREEPDB1)))".to_string(),
+                    "(DESCRIPTION=(ADDRESS=(PROTOCOL=tcp)(HOST=dbhost)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=FREEPDB1)(CID=(PROGRAM=space-query-thin)(HOST=localhost)(USER=space-query))))".to_string(),
                     0
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn auth_connect_string_rejects_descriptor_injection_characters() {
+        let mut config = OracleThinConfig::new(
+            ConnectTarget::service_name("dbhost", 1521, "FREEPDB1"),
+            "system",
+            "password",
+        );
+        config.program = "space-query)(SERVER=shared".to_string();
+        let credentials = AuthCredentials {
+            session_key: "session-key".to_string(),
+            speedy_key: None,
+            password: "encoded-password".to_string(),
+            debug_jdwp_data: None,
+        };
+
+        let err = auth_phase_two_payload(&config, &OracleThinCapabilities::default(), &credentials)
+            .expect_err("invalid program should fail before writing auth connect string");
+
+        assert!(err.to_string().contains("program"));
+    }
+
+    #[test]
+    fn auth_change_password_payload_matches_python_oracledb_wire_shape() {
+        let combo_key = (0u8..16).collect::<Vec<_>>();
+        let salt: [u8; 16] = (16u8..32).collect::<Vec<_>>().try_into().unwrap();
+
+        assert_eq!(
+            encode_auth_password(&combo_key, b"old-password", &salt).unwrap(),
+            "07FEEF74E1D5036E900EEE118E949293A3451F5DF2C27E7F102F3647E8D21800"
+        );
+        assert_eq!(
+            encode_auth_password(&combo_key, b"new-password", &salt).unwrap(),
+            "07FEEF74E1D5036E900EEE118E9492932B5C4F512DAC2BBF74BAA0FF8B09425F"
+        );
+
+        let payload = auth_change_password_payload(
+            "system",
+            "old-password",
+            "new-password",
+            &combo_key,
+            &salt,
+            &OracleThinCapabilities::default(),
+            7,
+        )
+        .unwrap();
+        let (auth_mode, pairs) = read_auth_key_values(
+            &payload,
+            &OracleThinCapabilities::default(),
+            TNS_FUNC_AUTH_PHASE_TWO,
+            7,
+        );
+
+        assert_eq!(
+            auth_mode,
+            TNS_AUTH_MODE_WITH_PASSWORD | TNS_AUTH_MODE_CHANGE_PASSWORD
+        );
+        assert_eq!(
+            pairs,
+            vec![
+                (
+                    "AUTH_PASSWORD".to_string(),
+                    "07FEEF74E1D5036E900EEE118E949293A3451F5DF2C27E7F102F3647E8D21800".to_string(),
+                    0
+                ),
+                (
+                    "AUTH_NEWPASSWORD".to_string(),
+                    "07FEEF74E1D5036E900EEE118E9492932B5C4F512DAC2BBF74BAA0FF8B09425F".to_string(),
+                    0
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn auth_debug_jdwp_uses_python_oracledb_zero_padding_and_aes_marker() {
+        let combo_key = (0u8..16).collect::<Vec<_>>();
+
+        let encoded = encode_debug_jdwp_data(Some("host=127.0.0.1;port=4000"), &combo_key).unwrap();
+
+        assert_eq!(
+            encoded.as_deref(),
+            Some("25221BA4D3ECB5E62FEA070A1DB49A1CF8169B61FBA147DD978AA340D093CE2E01")
         );
     }
 
@@ -17552,6 +18078,7 @@ mod tests {
 
         let credentials = generate_auth_credentials_from_session_key_parts(
             b"password",
+            None,
             &mut state,
             &password_hash,
             24,
@@ -17579,6 +18106,7 @@ mod tests {
 
         let credentials = generate_auth_credentials_from_session_key_parts(
             b"tiger",
+            None,
             &mut state,
             &password_hash,
             16,

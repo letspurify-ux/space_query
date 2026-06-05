@@ -6,7 +6,9 @@ use tns_thin::exec::{
     BindInputValue, BindValue, OracleColumnType, OracleIntervalDaySecond, OracleIntervalYearMonth,
     OracleValue, OracleVectorValue, StatementRequest,
 };
-use tns_thin::{ConnectTarget, OracleDateTime, OracleThinConfig, OracleThinSession};
+use tns_thin::{
+    ConnectTarget, OracleDateTime, OracleThinAppContext, OracleThinConfig, OracleThinSession,
+};
 
 static OBJECT_COUNTER: AtomicUsize = AtomicUsize::new(1);
 
@@ -38,8 +40,28 @@ fn auth_alter_session_sets_initial_time_zone() {
 
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn ping_sends_server_round_trip_and_keeps_session_reusable() {
+    let mut conn = connect();
+
+    conn.ping().expect("thin ping");
+    let result = conn
+        .query_described_fetch_all("SELECT 1 AS value FROM dual", 1)
+        .expect("query after thin ping");
+
+    assert_eq!(
+        rows_to_strings(&result.result.rows),
+        vec![vec!["1".to_string()]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn end_to_end_attributes_are_sent_before_next_statement_like_python_oracledb() {
     let mut conn = connect();
+    if conn.capabilities().protocol_version.unwrap_or(319) < 315 {
+        eprintln!("skipping end-to-end attribute test: protocol 314 follows go-ora and does not send python-oracledb end-to-end piggyback");
+        return;
+    }
     conn.set_module(Some("space_query_module".to_string()));
     conn.set_action(Some("open_dashboard".to_string()));
     conn.set_client_identifier(Some("space_query_client".to_string()));
@@ -85,6 +107,35 @@ fn current_schema_piggyback_is_sent_before_next_statement_like_python_oracledb()
         rows_to_strings(&result.result.rows),
         vec![vec!["SYS".to_string()]]
     );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn app_context_auth_metadata_is_visible_like_python_oracledb() {
+    let mut config = live_config();
+    let entries = [
+        ("CLIENTCONTEXT", "ATTR1", "VALUE1"),
+        ("CLIENTCONTEXT", "ATTR2", "VALUE2"),
+        ("CLIENTCONTEXT", "ATTR3", "VALUE3"),
+    ];
+    config.app_context = entries
+        .iter()
+        .map(|(namespace, name, value)| OracleThinAppContext::new(*namespace, *name, *value))
+        .collect();
+    let mut conn = connect_with_config(config);
+
+    for (namespace, name, value) in entries {
+        let sql = format!("SELECT SYS_CONTEXT('{namespace}', '{name}') AS value FROM dual");
+        let result = conn
+            .query_described_fetch_all(sql, 1)
+            .expect("fetch application context");
+
+        assert_eq!(
+            rows_to_strings(&result.result.rows),
+            vec![vec![value.to_string()]],
+            "{namespace}.{name} should match application context value",
+        );
+    }
 }
 
 #[test]

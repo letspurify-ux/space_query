@@ -12,8 +12,8 @@ use once_cell::sync::OnceCell;
 pub use connect::{ConnectOptions, ConnectTarget, OracleNetConnector};
 pub use pool::OracleThinSessionPool;
 pub use session::{
-    OracleThinAuthMode, OracleThinCancelHandle, OracleThinConfig, OracleThinPurity,
-    OracleThinSession,
+    OracleThinAppContext, OracleThinAuthMode, OracleThinCancelHandle, OracleThinConfig,
+    OracleThinPurity, OracleThinSession,
 };
 
 type ConnectPhaseLogger = Box<dyn Fn(&str, &str) + Send + Sync + 'static>;

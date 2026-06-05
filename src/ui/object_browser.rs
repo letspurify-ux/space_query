@@ -3825,7 +3825,6 @@ impl ObjectBrowserWidget {
         let mut local_decls: Vec<String> = Vec::new();
         let mut call_args: Vec<String> = Vec::new();
         let mut bind_decls: Vec<(String, String)> = Vec::new();
-        let mut print_binds: Vec<String> = Vec::new();
         // Function return value (position=0, name=NULL) must be assigned
         // via ':=' rather than passed as a call argument.
         let mut return_var: Option<String> = None;
@@ -3855,12 +3854,9 @@ impl ObjectBrowserWidget {
                 let type_str = Self::format_argument_type(arg);
                 if Self::is_ref_cursor(arg) {
                     bind_decls.push((var_name.clone(), "REFCURSOR".to_string()));
-                    print_binds.push(var_name.clone());
                     return_var = Some(format!(":{}", var_name));
                 } else if let Some(bind_type) = Self::bind_type_for_return(&type_str) {
-                    // Use bind variable for return value so PRINT can show it in results.
                     bind_decls.push((var_name.clone(), bind_type));
-                    print_binds.push(var_name.clone());
                     return_var = Some(format!(":{}", var_name));
                 } else {
                     // Fallback for unsupported return types: keep local variable assignment.
@@ -3869,7 +3865,6 @@ impl ObjectBrowserWidget {
                 }
             } else if is_out && Self::is_ref_cursor(arg) {
                 bind_decls.push((var_name.clone(), "REFCURSOR".to_string()));
-                print_binds.push(var_name.clone());
                 let target = format!(":{}", var_name);
                 let call_expr = match &arg_label {
                     Some(label) => format!("{} => {}", label, target),
@@ -3929,10 +3924,6 @@ impl ObjectBrowserWidget {
         }
 
         script.push_str("END;\n/\n");
-
-        for bind_name in print_binds {
-            script.push_str(&format!("PRINT {}\n", bind_name));
-        }
 
         script
     }
@@ -8240,7 +8231,7 @@ mod tests {
     }
 
     #[test]
-    fn build_oracle_function_sys_refcursor_return_uses_printable_bind() {
+    fn build_oracle_function_sys_refcursor_return_uses_bind_without_print() {
         let arguments = vec![
             procedure_argument(None, 0, Some("SYS_REFCURSOR"), "OUT"),
             procedure_argument(Some("p_min_sal"), 1, Some("NUMBER"), "IN"),
@@ -8251,7 +8242,7 @@ mod tests {
         assert!(sql.starts_with("VAR v_result REFCURSOR\n"));
         assert!(sql.contains("  :v_result := DEMO_PKG.GET_ROWS(\n"));
         assert!(sql.contains("p_min_sal => v_p_min_sal"));
-        assert!(sql.contains("PRINT v_result\n"));
+        assert!(!sql.contains("PRINT"));
         assert!(!sql.contains("v_result SYS_REFCURSOR"));
     }
 

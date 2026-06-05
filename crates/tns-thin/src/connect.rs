@@ -30,6 +30,7 @@ const TNS_CHECK_OOB: u32 = 0x01;
 const TNS_ACCEPT_FLAG_CHECK_OOB: u32 = 0x00000001;
 const TNS_ACCEPT_FLAG_FAST_AUTH: u32 = 0x10000000;
 const TNS_ACCEPT_FLAG_HAS_END_OF_RESPONSE: u32 = 0x02000000;
+const TNS_MAX_CONNECT_DATA: usize = 230;
 const TNS_MAX_REDIRECTS: usize = 5;
 const TNS_MAX_RESENDS: usize = 3;
 pub(crate) const TNS_MIN_SUPPORTED_PROTOCOL: u16 = 314;
@@ -104,7 +105,7 @@ impl OracleNetConnector {
     ) -> Result<(TcpStream, AcceptInfo), OracleThinError> {
         let mut host = target.host.clone();
         let mut port = target.port;
-        let mut connect_data = build_connect_data(target);
+        let mut connect_data = build_connect_data(target)?;
         let mut packet_flags = 0;
 
         for _ in 0..=TNS_MAX_REDIRECTS {
@@ -220,11 +221,26 @@ struct TnsPacket {
     data: Vec<u8>,
 }
 
-fn build_connect_data(target: &ConnectTarget) -> String {
-    format!(
+fn build_connect_data(target: &ConnectTarget) -> Result<String, OracleThinError> {
+    validate_connect_descriptor_value("host", &target.host)?;
+    validate_connect_descriptor_value("service_name", &target.service_name)?;
+    Ok(format!(
         "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST={})(PORT={}))(CONNECT_DATA=(SERVICE_NAME={})(CID=(PROGRAM=space-query-thin)(HOST=localhost)(USER=space-query))))",
         target.host, target.port, target.service_name
-    )
+    ))
+}
+
+pub(crate) fn validate_connect_descriptor_value(
+    name: &str,
+    value: &str,
+) -> Result<(), OracleThinError> {
+    if value.bytes().any(|byte| matches!(byte, b'(' | b')' | b'=')) {
+        Err(OracleThinError::new(format!(
+            "Oracle connect descriptor {name} contains invalid characters"
+        )))
+    } else {
+        Ok(())
+    }
 }
 
 fn build_connect_packet(
@@ -239,7 +255,12 @@ fn build_connect_packet(
         ))
     })?;
     let data_offset = 74u16;
-    let packet_len = usize::from(data_offset) + connect_data.len();
+    let inline_connect_data = connect_data.len() <= TNS_MAX_CONNECT_DATA;
+    let packet_len = if inline_connect_data {
+        usize::from(data_offset) + connect_data.len()
+    } else {
+        usize::from(data_offset)
+    };
     let packet_len_u16 = u16::try_from(packet_len).map_err(|_| {
         OracleThinError::new(format!(
             "Oracle connect packet is too large: {packet_len} bytes"
@@ -272,7 +293,21 @@ fn build_connect_packet(
     put_u32(&mut packet, 58, u32::from(sdu));
     put_u32(&mut packet, 62, u32::from(sdu));
     put_u32(&mut packet, 70, connect_flags_2);
-    packet[usize::from(data_offset)..].copy_from_slice(connect_data);
+    if inline_connect_data {
+        packet[usize::from(data_offset)..].copy_from_slice(connect_data);
+    } else {
+        let data_packet_len = 8 + connect_data.len();
+        let data_packet_len_u16 = u16::try_from(data_packet_len).map_err(|_| {
+            OracleThinError::new(format!(
+                "Oracle connect data packet is too large: {data_packet_len} bytes"
+            ))
+        })?;
+        let mut data_packet = vec![0u8; data_packet_len];
+        put_u16(&mut data_packet, 0, data_packet_len_u16);
+        data_packet[4] = TNS_PACKET_TYPE_DATA;
+        data_packet[8..].copy_from_slice(connect_data);
+        packet.extend_from_slice(&data_packet);
+    }
     Ok(packet)
 }
 
@@ -463,9 +498,10 @@ mod tests {
     use std::thread;
 
     use super::{
-        build_connect_packet, parse_accept_packet, parse_redirect_data, put_u16, put_u32,
-        ConnectOptions, OracleNetConnector, TNS_MIN_SUPPORTED_PROTOCOL, TNS_NSI_NA_REQUIRED,
-        TNS_PACKET_FLAG_REDIRECT, TNS_PACKET_TYPE_ACCEPT, TNS_PACKET_TYPE_CONNECT,
+        build_connect_data, build_connect_packet, parse_accept_packet, parse_redirect_data,
+        put_u16, put_u32, ConnectOptions, ConnectTarget, OracleNetConnector, TNS_MAX_CONNECT_DATA,
+        TNS_MIN_SUPPORTED_PROTOCOL, TNS_NSI_NA_REQUIRED, TNS_PACKET_FLAG_REDIRECT,
+        TNS_PACKET_TYPE_ACCEPT, TNS_PACKET_TYPE_CONNECT, TNS_PACKET_TYPE_DATA,
         TNS_PACKET_TYPE_RESEND,
     };
 
@@ -487,6 +523,41 @@ mod tests {
         .unwrap();
 
         assert_eq!(packet[5], TNS_PACKET_FLAG_REDIRECT);
+    }
+
+    #[test]
+    fn short_connect_data_stays_inline_in_connect_packet() {
+        let connect_data = b"(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=FREE)))";
+        let packet = build_connect_packet(&ConnectOptions::default(), connect_data, 0).unwrap();
+        let packet_len = u16::from_be_bytes([packet[0], packet[1]]) as usize;
+
+        assert_eq!(packet[4], TNS_PACKET_TYPE_CONNECT);
+        assert_eq!(packet_len, 74 + connect_data.len());
+        assert_eq!(&packet[74..], connect_data);
+    }
+
+    #[test]
+    fn connect_data_rejects_descriptor_injection_characters_like_python_oracledb() {
+        let target = ConnectTarget::service_name("dbhost", 1521, "FREE)(SERVER=shared");
+
+        let err = build_connect_data(&target).expect_err("invalid service name should fail");
+
+        assert!(err.to_string().contains("service_name"));
+    }
+
+    #[test]
+    fn long_connect_data_uses_following_data_packet_like_python_oracledb() {
+        let connect_data = vec![b'A'; TNS_MAX_CONNECT_DATA + 1];
+        let packet = build_connect_packet(&ConnectOptions::default(), &connect_data, 0).unwrap();
+        let connect_packet_len = u16::from_be_bytes([packet[0], packet[1]]) as usize;
+        let data_packet = &packet[connect_packet_len..];
+        let data_packet_len = u16::from_be_bytes([data_packet[0], data_packet[1]]) as usize;
+
+        assert_eq!(connect_packet_len, 74);
+        assert_eq!(packet[4], TNS_PACKET_TYPE_CONNECT);
+        assert_eq!(data_packet[4], TNS_PACKET_TYPE_DATA);
+        assert_eq!(data_packet_len, 8 + connect_data.len());
+        assert_eq!(&data_packet[8..], connect_data);
     }
 
     #[test]
@@ -514,6 +585,39 @@ mod tests {
         let outcome = connector.connect_tns(stream, "(DESCRIPTION=)", 0).unwrap();
         let super::ConnectOutcome::Accepted(_, accept) = outcome else {
             panic!("expected connect accept after resend");
+        };
+
+        assert_eq!(accept.protocol_version, 319);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn tns_connect_sends_long_connect_data_as_following_data_packet() {
+        let connect_data = "A".repeat(TNS_MAX_CONNECT_DATA + 1);
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let expected = connect_data.clone();
+        let handle = thread::spawn(move || {
+            let (mut server, _) = listener.accept().unwrap();
+            let connect_packet = read_wire_packet(&mut server);
+            assert_eq!(connect_packet[4], TNS_PACKET_TYPE_CONNECT);
+            assert_eq!(connect_packet.len(), 74);
+
+            let data_packet = read_wire_packet(&mut server);
+            assert_eq!(data_packet[4], TNS_PACKET_TYPE_DATA);
+            assert_eq!(&data_packet[8..], expected.as_bytes());
+
+            let mut accept_data = [0u8; 37];
+            put_u16(&mut accept_data, 0, 319);
+            put_u32(&mut accept_data, 24, 8192);
+            write_wire_packet(&mut server, TNS_PACKET_TYPE_ACCEPT, &accept_data);
+        });
+
+        let stream = TcpStream::connect(addr).unwrap();
+        let connector = OracleNetConnector::new(ConnectOptions::default());
+        let outcome = connector.connect_tns(stream, &connect_data, 0).unwrap();
+        let super::ConnectOutcome::Accepted(_, accept) = outcome else {
+            panic!("expected connect accept after long connect data");
         };
 
         assert_eq!(accept.protocol_version, 319);
