@@ -3146,11 +3146,48 @@ impl ResultTableWidget {
         if clipboard_text.is_empty() {
             return Vec::new();
         }
-        let normalized = clipboard_text.replace("\r\n", "\n").replace('\r', "\n");
-        let mut rows: Vec<Vec<String>> = normalized
-            .split('\n')
-            .map(|line| line.split('\t').map(|cell| cell.to_string()).collect())
-            .collect();
+        // Tab-separated parse that honors double-quoted fields, so values
+        // containing tabs/newlines (escaped by `escape_cell_for_clipboard` or by
+        // spreadsheet apps) round-trip back into a single cell.
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        let mut current_row: Vec<String> = Vec::new();
+        let mut field = String::new();
+        let mut in_quotes = false;
+        let mut chars = clipboard_text.chars().peekable();
+        while let Some(c) = chars.next() {
+            if in_quotes {
+                match c {
+                    '"' => {
+                        if chars.peek() == Some(&'"') {
+                            field.push('"');
+                            chars.next();
+                        } else {
+                            in_quotes = false;
+                        }
+                    }
+                    _ => field.push(c),
+                }
+            } else {
+                match c {
+                    '"' if field.is_empty() => in_quotes = true,
+                    '\t' => current_row.push(std::mem::take(&mut field)),
+                    '\r' => {
+                        if chars.peek() == Some(&'\n') {
+                            chars.next();
+                        }
+                        current_row.push(std::mem::take(&mut field));
+                        rows.push(std::mem::take(&mut current_row));
+                    }
+                    '\n' => {
+                        current_row.push(std::mem::take(&mut field));
+                        rows.push(std::mem::take(&mut current_row));
+                    }
+                    _ => field.push(c),
+                }
+            }
+        }
+        current_row.push(field);
+        rows.push(current_row);
         while rows.len() > 1
             && rows
                 .last()
@@ -6251,7 +6288,7 @@ impl ResultTableWidget {
                     result.push('\t');
                 }
                 if let Some(val) = full_data.get(row).and_then(|r| r.get(*col)) {
-                    result.push_str(val);
+                    result.push_str(&Self::escape_cell_for_clipboard(val));
                 }
             }
         }
@@ -6297,7 +6334,7 @@ impl ResultTableWidget {
                     result.push('\t');
                 }
                 if let Some(h) = headers.get(*col) {
-                    result.push_str(h);
+                    result.push_str(&Self::escape_cell_for_clipboard(h));
                 }
             }
         }
@@ -6316,7 +6353,7 @@ impl ResultTableWidget {
                         result.push('\t');
                     }
                     if let Some(val) = full_data.get(row).and_then(|r| r.get(*col)) {
-                        result.push_str(val);
+                        result.push_str(&Self::escape_cell_for_clipboard(val));
                     }
                 }
             }
@@ -6341,7 +6378,11 @@ impl ResultTableWidget {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             Self::visible_headers(&headers, hidden_col)
         };
-        let header_line = header_values.join("\t");
+        let header_line = header_values
+            .iter()
+            .map(|h| Self::escape_cell_for_clipboard(h))
+            .collect::<Vec<_>>()
+            .join("\t");
 
         let row_count = full_data
             .lock()
@@ -6361,7 +6402,7 @@ impl ResultTableWidget {
                 if i > 0 {
                     result.push('\t');
                 }
-                result.push_str(cell);
+                result.push_str(&Self::escape_cell_for_clipboard(cell));
             }
             result.push('\n');
         }
@@ -7302,8 +7343,11 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .len();
-        let mut csv = String::with_capacity(row_count * 20 + header_line.len() + 1);
+        let mut csv = String::with_capacity(row_count * 20 + header_line.len() + 4);
 
+        // UTF-8 BOM so Excel detects the encoding and renders non-ASCII text
+        // (e.g. Korean) correctly instead of falling back to the system locale.
+        csv.push('\u{FEFF}');
         csv.push_str(&header_line);
         csv.push_str(line_ending);
 
@@ -7354,6 +7398,23 @@ impl ResultTableWidget {
             || field.contains('"')
             || field.contains('\n')
             || field.contains('\r')
+        {
+            format!("\"{}\"", field.replace('"', "\"\""))
+        } else {
+            field.to_string()
+        }
+    }
+
+    /// Escape a cell for tab-separated clipboard output so spreadsheet apps
+    /// (Excel/Sheets) keep multiline and tab-containing values in a single cell.
+    /// Fields containing a tab, newline, carriage return, or quote are wrapped
+    /// in double quotes with embedded quotes doubled, matching the convention
+    /// those apps use when parsing pasted TSV text.
+    fn escape_cell_for_clipboard(field: &str) -> String {
+        if field.contains('\t')
+            || field.contains('\n')
+            || field.contains('\r')
+            || field.contains('"')
         {
             format!("\"{}\"", field.replace('"', "\"\""))
         } else {
@@ -8623,6 +8684,37 @@ mod row_edit_sql_tests {
                 Some(2)
             )
         );
+    }
+
+    #[test]
+    fn escape_cell_for_clipboard_quotes_multiline_and_special_chars() {
+        // Plain values pass through untouched.
+        assert_eq!(ResultTableWidget::escape_cell_for_clipboard("abc"), "abc");
+        assert_eq!(ResultTableWidget::escape_cell_for_clipboard("a,b"), "a,b");
+        // Newlines, carriage returns, tabs and quotes force quoting.
+        assert_eq!(
+            ResultTableWidget::escape_cell_for_clipboard("line1\nline2"),
+            "\"line1\nline2\""
+        );
+        assert_eq!(
+            ResultTableWidget::escape_cell_for_clipboard("a\tb"),
+            "\"a\tb\""
+        );
+        assert_eq!(
+            ResultTableWidget::escape_cell_for_clipboard("say \"hi\""),
+            "\"say \"\"hi\"\"\""
+        );
+    }
+
+    #[test]
+    fn parse_clipboard_rows_round_trips_escaped_multiline_cell() {
+        // A two-column row where the second cell spans multiple lines and
+        // contains a tab and a quote, escaped as a spreadsheet would expect.
+        let cell = "line1\nline2\twith \"quote\"";
+        let escaped = ResultTableWidget::escape_cell_for_clipboard(cell);
+        let clipboard = format!("A\t{}\n", escaped);
+        let rows = ResultTableWidget::parse_clipboard_rows(&clipboard);
+        assert_eq!(rows, vec![vec!["A".to_string(), cell.to_string()]]);
     }
 
     #[test]
