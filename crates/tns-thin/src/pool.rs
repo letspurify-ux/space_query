@@ -39,7 +39,9 @@ pub trait PoolableConnection: Sized {
 
 impl PoolableConnection for OracleThinSession {
     fn connect_for_pool(config: OracleThinConfig) -> Result<Self, OracleThinError> {
-        OracleThinSession::connect(config)
+        let mut conn = OracleThinSession::connect(config)?;
+        conn.mark_pool_managed();
+        Ok(conn)
     }
 
     fn begin_request_for_pool(&mut self) -> Result<(), OracleThinError> {

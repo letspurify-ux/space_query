@@ -38,7 +38,8 @@ use sha2::{Digest, Sha512};
 use crate::connect::{
     connect_data_descriptor_parts, connect_description_option_parts,
     validate_connect_descriptor_value, AcceptInfo, ConnectOptions, ConnectTarget,
-    OracleNetConnector, TNS_DEFAULT_SOCKET_TIMEOUT, TNS_MIN_SUPPORTED_PROTOCOL,
+    OracleNetConnector, OracleNetServerType, TNS_DEFAULT_SOCKET_TIMEOUT,
+    TNS_MIN_SUPPORTED_PROTOCOL,
 };
 use crate::exec::{
     sql_is_dml_returning, BindInputValue, BindValue, ColumnMetadata, DescribedQueryResult,
@@ -82,6 +83,7 @@ const TNS_MSG_TYPE_PIGGYBACK: u8 = 17;
 const TNS_MSG_TYPE_FLUSH_OUT_BINDS: u8 = 19;
 const TNS_MSG_TYPE_BIT_VECTOR: u8 = 21;
 const TNS_MSG_TYPE_SERVER_SIDE_PIGGYBACK: u8 = 23;
+const TNS_MSG_TYPE_ONEWAY_FN: u8 = 26;
 const TNS_MSG_TYPE_IMPLICIT_RESULTSET: u8 = 27;
 const TNS_MSG_TYPE_END_OF_RESPONSE: u8 = 29;
 const TNS_MSG_TYPE_TOKEN: u8 = 33;
@@ -121,7 +123,9 @@ const TNS_FUNC_AUTH_PHASE_TWO: u8 = 115;
 const TNS_FUNC_SET_END_TO_END_ATTR: u8 = 135;
 const TNS_FUNC_PING: u8 = 147;
 const TNS_FUNC_SET_SCHEMA: u8 = 152;
+const TNS_FUNC_SESSION_RELEASE: u8 = 163;
 const TNS_FUNC_SESSION_STATE: u8 = 176;
+const TNS_DRCP_DEAUTHENTICATE: u32 = 0x00000002;
 const TNS_EXEC_OPTION_PARSE: u32 = 0x0000_0001;
 const TNS_EXEC_OPTION_BIND: u32 = 0x0000_0008;
 const TNS_EXEC_OPTION_DEFINE: u32 = 0x0000_0010;
@@ -675,6 +679,8 @@ pub struct OracleThinSession {
     in_request: bool,
     cancel_flag: Arc<AtomicBool>,
     ttc_sequence: u8,
+    pool_managed: bool,
+    drcp_establish_session: bool,
     closed: bool,
 }
 
@@ -736,6 +742,8 @@ impl OracleThinSession {
             in_request: false,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             ttc_sequence: 3,
+            pool_managed: false,
+            drcp_establish_session: false,
             closed: false,
         })
     }
@@ -971,6 +979,10 @@ impl OracleThinSession {
         self.broken = true;
     }
 
+    pub(crate) fn mark_pool_managed(&mut self) {
+        self.pool_managed = true;
+    }
+
     pub fn is_healthy(&mut self) -> bool {
         !self.broken
     }
@@ -993,6 +1005,7 @@ impl OracleThinSession {
             self.flush_pending_cursor_closes()?;
             self.rollback()?;
             self.end_request()?;
+            self.release_drcp_session_if_needed()?;
             Ok(())
         }
     }
@@ -1081,17 +1094,33 @@ impl OracleThinSession {
             return Ok(());
         }
 
-        let result = self
-            .simple_ttc_call(TNS_FUNC_LOGOFF, "logoff")
-            .and_then(|_| {
-                write_eof_data_packet(
-                    &mut self.stream,
-                    self.capabilities.protocol_version.unwrap_or(319),
-                )
-            });
+        let result = if self.config.target.server_type == Some(OracleNetServerType::Pooled) {
+            self.close_drcp_session()
+        } else {
+            self.simple_ttc_call(TNS_FUNC_LOGOFF, "logoff")
+                .and_then(|_| {
+                    write_eof_data_packet(
+                        &mut self.stream,
+                        self.capabilities.protocol_version.unwrap_or(319),
+                    )
+                })
+        };
         self.closed = true;
         let _ = self.stream.shutdown(Shutdown::Both);
         result
+    }
+
+    fn close_drcp_session(&mut self) -> Result<(), OracleThinError> {
+        self.flush_pending_cursor_closes()?;
+        if self.server_state.transaction_in_progress || self.in_request {
+            self.rollback()?;
+            self.in_request = false;
+        }
+        self.release_drcp_session_if_needed()?;
+        write_eof_data_packet(
+            &mut self.stream,
+            self.capabilities.protocol_version.unwrap_or(319),
+        )
     }
 
     pub fn transaction_in_progress(&self) -> bool {
@@ -1491,7 +1520,7 @@ impl OracleThinSession {
         let fetch_columns =
             self.fetch_columns_for_cursor(cursor_id, columns, effective_needs_define_fetch);
         self.ensure_object_type_attrs_for_columns(&fetch_columns)?;
-        let pending_cursor_closes = self.drain_pending_cursor_closes();
+        let pending_cursor_closes = self.drain_pending_cursor_closes_for_write();
         let current_schema = self.pending_current_schema_for_write();
         let current_schema_sequence = if current_schema.is_some() {
             Some(self.next_ttc_sequence())
@@ -1739,10 +1768,10 @@ impl OracleThinSession {
     }
 
     pub fn flush_pending_cursor_closes(&mut self) -> Result<(), OracleThinError> {
-        if self.pending_cursor_closes.is_empty() {
+        let cursor_ids = self.drain_pending_cursor_closes_for_write();
+        if cursor_ids.is_empty() {
             return Ok(());
         }
-        let cursor_ids = self.drain_pending_cursor_closes();
         let close_sequence = self.next_ttc_sequence();
         let ping_sequence = self.next_ttc_sequence();
         let mut payload = Vec::new();
@@ -2439,7 +2468,7 @@ impl OracleThinSession {
             .as_ref()
             .map(|(request, _)| request)
             .unwrap_or(request);
-        let pending_cursor_closes = self.drain_pending_cursor_closes();
+        let pending_cursor_closes = self.drain_pending_cursor_closes_for_write();
         let current_schema = self.pending_current_schema_for_write();
         let current_schema_sequence = if current_schema.is_some() {
             Some(self.next_ttc_sequence())
@@ -2645,7 +2674,7 @@ impl OracleThinSession {
     ) -> Result<(), OracleThinError> {
         log_connect_phase(&format!("ttc-{operation}-write"), "");
         let mut payload = Vec::new();
-        let pending_cursor_closes = self.drain_pending_cursor_closes();
+        let pending_cursor_closes = self.drain_pending_cursor_closes_for_write();
         let current_schema = self.pending_current_schema_for_write();
         if let Some(schema) = current_schema.as_deref() {
             let sequence = self.next_ttc_sequence();
@@ -2734,6 +2763,40 @@ impl OracleThinSession {
         )
     }
 
+    fn release_drcp_session_if_needed(&mut self) -> Result<(), OracleThinError> {
+        if self.config.target.server_type != Some(OracleNetServerType::Pooled) {
+            return Ok(());
+        }
+        let release_mode = if self.pool_managed {
+            0
+        } else {
+            TNS_DRCP_DEAUTHENTICATE
+        };
+        let sequence = self.next_ttc_sequence();
+        let mut payload = Vec::new();
+        write_function_code_with_type(
+            &mut payload,
+            TNS_MSG_TYPE_ONEWAY_FN,
+            TNS_FUNC_SESSION_RELEASE,
+            sequence,
+            &self.capabilities,
+        );
+        payload.push(0);
+        payload.push(0);
+        write_ub4(&mut payload, release_mode);
+        let result = write_data_packet(
+            &mut self.stream,
+            self.capabilities.protocol_version.unwrap_or(319),
+            self.capabilities.data_packet_chunk_size(),
+            &payload,
+        );
+        if result.is_ok() {
+            self.server_state.last_warning = None;
+            self.drcp_establish_session = true;
+        }
+        result
+    }
+
     fn next_ttc_sequence(&mut self) -> u8 {
         if self.ttc_sequence == 0 || self.ttc_sequence == u8::MAX {
             self.ttc_sequence = 1;
@@ -2774,6 +2837,17 @@ impl OracleThinSession {
         normalize_cursor_ids(std::mem::take(&mut self.pending_cursor_closes))
     }
 
+    fn drain_pending_cursor_closes_for_write(&mut self) -> Vec<u32> {
+        if self.drcp_establish_session {
+            self.drcp_establish_session = false;
+            self.pending_cursor_closes.clear();
+            self.deferred_cursor_closes.clear();
+            self.deferred_cursor_parent_by_child.clear();
+            return Vec::new();
+        }
+        self.drain_pending_cursor_closes()
+    }
+
     fn requeue_pending_cursor_closes(&mut self, cursor_ids: &[u32]) {
         if cursor_ids.is_empty() {
             return;
@@ -2788,7 +2862,7 @@ impl OracleThinSession {
             return Ok(());
         }
         let mut payload = Vec::new();
-        let pending_cursor_closes = self.drain_pending_cursor_closes();
+        let pending_cursor_closes = self.drain_pending_cursor_closes_for_write();
         let current_schema = self.pending_current_schema_for_write();
         if let Some(schema) = current_schema.as_deref() {
             let sequence = self.next_ttc_sequence();
@@ -10848,7 +10922,23 @@ fn write_function_code(
     sequence: u8,
     capabilities: &OracleThinCapabilities,
 ) {
-    payload.push(TNS_MSG_TYPE_FUNCTION);
+    write_function_code_with_type(
+        payload,
+        TNS_MSG_TYPE_FUNCTION,
+        function_code,
+        sequence,
+        capabilities,
+    );
+}
+
+fn write_function_code_with_type(
+    payload: &mut Vec<u8>,
+    message_type: u8,
+    function_code: u8,
+    sequence: u8,
+    capabilities: &OracleThinCapabilities,
+) {
+    payload.push(message_type);
     payload.push(function_code);
     payload.push(sequence);
     if capabilities.ttc_field_version >= TNS_CCAP_FIELD_VERSION_23_1_EXT_1 {
@@ -12956,17 +13046,18 @@ mod tests {
         TNS_CCAP_END_OF_RESPONSE, TNS_CCAP_EXPLICIT_BOUNDARY, TNS_CCAP_FIELD_VERSION,
         TNS_CCAP_FIELD_VERSION_20_1, TNS_CCAP_FIELD_VERSION_23_1,
         TNS_CCAP_FIELD_VERSION_23_1_EXT_1, TNS_CCAP_LEGACY_FAST_SESSION_ATTRIBUTES, TNS_CCAP_OCI1,
-        TNS_CCAP_TTC1, TNS_CCAP_TTC4, TNS_ESCAPE_CHAR, TNS_FUNC_COMMIT, TNS_FUNC_LOGOFF,
-        TNS_FUNC_ROLLBACK, TNS_JSON_MAX_LENGTH, TNS_KEYWORD_NUM_CURRENT_SCHEMA,
-        TNS_KEYWORD_NUM_EDITION, TNS_KEYWORD_NUM_TRANSACTION_ID, TNS_LEGACY_CLR_CHUNK_SIZE,
-        TNS_MAX_ROWID_LENGTH, TNS_MAX_UROWID_LENGTH, TNS_MSG_TYPE_ERROR, TNS_MSG_TYPE_PARAMETER,
-        TNS_MSG_TYPE_PROTOCOL, TNS_MSG_TYPE_ROW_DATA, TNS_MSG_TYPE_SERVER_SIDE_PIGGYBACK,
-        TNS_OBJ_HAS_INDEXES, TNS_OBJ_IS_DEGENERATE, TNS_OBJ_NO_PREFIX_SEG, TNS_RCAP_TTC,
-        TNS_RCAP_TTC_32K, TNS_RCAP_TTC_SESSION_STATE_OPS, TNS_RCAP_TTC_ZERO_COPY,
-        TNS_SERVER_PIGGYBACK_LTXID, TNS_SERVER_PIGGYBACK_SESS_RET,
-        TNS_SERVER_PIGGYBACK_TRACE_EVENT, TNS_TPC_TXNID_SYNC_SERVER, TNS_TPC_TXNID_SYNC_SET,
-        TNS_TPC_TXNID_SYNC_UNSET, TNS_VERIFIER_TYPE_10G, TNS_VERIFIER_TYPE_11G_1,
-        TNS_VERIFIER_TYPE_11G_2, TNS_VERIFIER_TYPE_12C, TNS_XML_TYPE_LOB, TNS_XML_TYPE_STRING,
+        TNS_CCAP_TTC1, TNS_CCAP_TTC4, TNS_DRCP_DEAUTHENTICATE, TNS_ESCAPE_CHAR, TNS_FUNC_COMMIT,
+        TNS_FUNC_LOGOFF, TNS_FUNC_ROLLBACK, TNS_FUNC_SESSION_RELEASE, TNS_JSON_MAX_LENGTH,
+        TNS_KEYWORD_NUM_CURRENT_SCHEMA, TNS_KEYWORD_NUM_EDITION, TNS_KEYWORD_NUM_TRANSACTION_ID,
+        TNS_LEGACY_CLR_CHUNK_SIZE, TNS_MAX_ROWID_LENGTH, TNS_MAX_UROWID_LENGTH, TNS_MSG_TYPE_ERROR,
+        TNS_MSG_TYPE_ONEWAY_FN, TNS_MSG_TYPE_PARAMETER, TNS_MSG_TYPE_PROTOCOL,
+        TNS_MSG_TYPE_ROW_DATA, TNS_MSG_TYPE_SERVER_SIDE_PIGGYBACK, TNS_OBJ_HAS_INDEXES,
+        TNS_OBJ_IS_DEGENERATE, TNS_OBJ_NO_PREFIX_SEG, TNS_RCAP_TTC, TNS_RCAP_TTC_32K,
+        TNS_RCAP_TTC_SESSION_STATE_OPS, TNS_RCAP_TTC_ZERO_COPY, TNS_SERVER_PIGGYBACK_LTXID,
+        TNS_SERVER_PIGGYBACK_SESS_RET, TNS_SERVER_PIGGYBACK_TRACE_EVENT, TNS_TPC_TXNID_SYNC_SERVER,
+        TNS_TPC_TXNID_SYNC_SET, TNS_TPC_TXNID_SYNC_UNSET, TNS_VERIFIER_TYPE_10G,
+        TNS_VERIFIER_TYPE_11G_1, TNS_VERIFIER_TYPE_11G_2, TNS_VERIFIER_TYPE_12C, TNS_XML_TYPE_LOB,
+        TNS_XML_TYPE_STRING,
     };
     use crate::connect::{AcceptInfo, ConnectOptions, ConnectTarget, OracleNetServerType};
     use crate::exec::{
@@ -13001,6 +13092,8 @@ mod tests {
             in_request: false,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             ttc_sequence: 3,
+            pool_managed: false,
+            drcp_establish_session: false,
             closed: true,
         }
     }
@@ -13178,6 +13271,39 @@ mod tests {
         session.close().unwrap();
         let eof_body = server.join().unwrap();
 
+        assert_eq!(eof_body, TNS_DATA_FLAGS_EOF.to_be_bytes());
+    }
+
+    #[test]
+    fn close_drcp_releases_session_without_logoff_like_python_oracledb() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let release_body = read_tns_test_packet(&mut stream, 319);
+            let eof_body = read_tns_test_packet(&mut stream, 319);
+            (release_body, eof_body)
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut session = test_session_with_stream(stream);
+        session.config.target = ConnectTarget::service_name("127.0.0.1", 1521, "XE")
+            .with_server_type(OracleNetServerType::Pooled);
+        session.closed = false;
+
+        session.close().unwrap();
+        let (release_body, eof_body) = server.join().unwrap();
+
+        let mut expected = vec![
+            0,
+            0,
+            TNS_MSG_TYPE_ONEWAY_FN,
+            TNS_FUNC_SESSION_RELEASE,
+            3,
+            0,
+            0,
+        ];
+        write_ub4(&mut expected, TNS_DRCP_DEAUTHENTICATE);
+        assert_eq!(release_body, expected);
         assert_eq!(eof_body, TNS_DATA_FLAGS_EOF.to_be_bytes());
     }
 
@@ -13366,6 +13492,69 @@ mod tests {
                 5
             ]
         );
+    }
+
+    #[test]
+    fn reset_before_reuse_releases_drcp_session_like_python_oracledb_pool() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let rollback_body = read_tns_test_packet(&mut stream, 319);
+            write_tns_status_response(&mut stream, 319);
+            let release_body = read_tns_test_packet(&mut stream, 319);
+            (rollback_body, release_body)
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut session = test_session_with_stream(stream);
+        session.config.target = ConnectTarget::service_name("127.0.0.1", 1521, "XE")
+            .with_server_type(OracleNetServerType::Pooled);
+        session.pool_managed = true;
+
+        session.reset_before_reuse().unwrap();
+        assert!(session.drcp_establish_session);
+        let (rollback_body, release_body) = server.join().unwrap();
+
+        assert_eq!(
+            rollback_body,
+            vec![0, 0, TNS_MSG_TYPE_FUNCTION, TNS_FUNC_ROLLBACK, 3]
+        );
+        let mut expected = vec![
+            0,
+            0,
+            TNS_MSG_TYPE_ONEWAY_FN,
+            TNS_FUNC_SESSION_RELEASE,
+            4,
+            0,
+            0,
+        ];
+        write_ub4(&mut expected, 0);
+        assert_eq!(release_body, expected);
+    }
+
+    #[test]
+    fn drcp_establish_session_discards_stale_cursor_closes_like_python_oracledb() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            drop(stream);
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut session = test_session_with_stream(stream);
+        session.drcp_establish_session = true;
+        session.pending_cursor_closes = vec![9, 3, 9];
+        session.deferred_cursor_closes.insert(7, HashSet::from([8]));
+        session.deferred_cursor_parent_by_child.insert(8, 7);
+
+        assert!(session.drain_pending_cursor_closes_for_write().is_empty());
+        assert!(!session.drcp_establish_session);
+        assert!(session.pending_cursor_closes.is_empty());
+        assert!(session.deferred_cursor_closes.is_empty());
+        assert!(session.deferred_cursor_parent_by_child.is_empty());
+
+        drop(session);
+        server.join().unwrap();
     }
 
     #[test]
