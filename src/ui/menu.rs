@@ -581,7 +581,10 @@ impl MenuBarBuilder {
                     Results Table:\n\
                     Ctrl+C - Copy Selected Cells\n\
                     Ctrl+Shift+C - Copy with Headers\n\
-                    Ctrl+A - Select All\n\n\
+                    Ctrl+A - Select All\n\
+                    Shift+Click - Extend Cell Selection\n\
+                    Ctrl+Arrow - Move to Result Edge\n\
+                    Ctrl+Shift+Arrow - Extend Selection to Result Edge\n\n\
                     Object Browser:\n\
                     Enter - Generate SELECT (tables/views)",
                     640,

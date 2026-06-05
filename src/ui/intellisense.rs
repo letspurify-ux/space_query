@@ -2821,7 +2821,7 @@ pub fn enclosing_call_at_cursor(text: &str, cursor_pos: usize) -> Option<Enclosi
                 }
             }
             '"' => {
-                while let Some((_, c)) = iter.next() {
+                for (_, c) in iter.by_ref() {
                     if c == '"' {
                         break;
                     }

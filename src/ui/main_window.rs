@@ -2621,6 +2621,12 @@ fn script_transcript_owns_success_message(context: Option<&QueryProgressContext>
     context.is_some_and(|context| context.activity_label.starts_with("Executing script:"))
 }
 
+fn should_select_support_result_pane(context: Option<&QueryProgressContext>) -> bool {
+    !context.is_some_and(|context| {
+        context.execution_target.is_some() || !context.result_tab_indices.is_empty()
+    })
+}
+
 fn should_run_global_batch_cleanup(has_running_queries: bool) -> bool {
     !has_running_queries
 }
@@ -2731,17 +2737,13 @@ fn lazy_fetch_canceling_statement_index(
     session_id: u64,
     fallback_to_active_statement: bool,
 ) -> Option<usize> {
-    context
-        .lazy_fetch_sessions
-        .get(&session_id)
-        .copied()
-        .or_else(|| {
-            if fallback_to_active_statement {
-                context.active_statement_index
-            } else {
-                None
-            }
-        })
+    context.lazy_fetch_sessions.get(&session_id).copied().or({
+        if fallback_to_active_statement {
+            context.active_statement_index
+        } else {
+            None
+        }
+    })
 }
 
 fn lazy_fetch_close_should_abort_result_tab(
@@ -6490,21 +6492,42 @@ impl MainWindow {
                     }
                 }
                 QueryProgress::ScriptOutput { lines } => {
+                    let should_select =
+                        !lines.is_empty()
+                            && should_select_support_result_pane(
+                                s.progress_contexts.get(&tab_id),
+                            );
                     let mut result_tabs = s.result_tabs.clone();
                     drop(s);
                     result_tabs.append_script_output_lines(&lines);
+                    if should_select {
+                        result_tabs.select_script_output();
+                    }
                 }
                 QueryProgress::DbmsOutput { lines } => {
+                    let should_select =
+                        !lines.is_empty()
+                            && should_select_support_result_pane(
+                                s.progress_contexts.get(&tab_id),
+                            );
                     let mut result_tabs = s.result_tabs.clone();
                     drop(s);
                     result_tabs.append_dbms_output_lines(&lines);
+                    if should_select {
+                        result_tabs.select_dbms_output();
+                    }
                 }
                 QueryProgress::Message { kind, lines } => {
+                    let should_select_info = kind == ResultMessageKind::Info
+                        && !lines.is_empty()
+                        && should_select_support_result_pane(s.progress_contexts.get(&tab_id));
                     let mut result_tabs = s.result_tabs.clone();
                     drop(s);
                     result_tabs.append_message_lines(kind, &lines);
                     if kind == ResultMessageKind::Error {
                         result_tabs.select_messages_errors();
+                    } else if should_select_info {
+                        result_tabs.select_messages_info();
                     }
                 }
                 QueryProgress::ExplainPlanOutput { text } => {
@@ -6681,6 +6704,7 @@ impl MainWindow {
                         has_fetched_rows,
                         context_was_canceling,
                         grid_execution_target,
+                        should_select_info_pane,
                     ) = {
                         let Some(context) = s.progress_contexts.get_mut(&tab_id) else {
                             return;
@@ -6707,6 +6731,7 @@ impl MainWindow {
                             context.fetch_row_counts.get(&index).copied().unwrap_or(0) > 0,
                             context.state_label == ResultTabStatus::Canceling.label(),
                             context.execution_target.filter(|idx| *idx < tab_count),
+                            should_select_support_result_pane(Some(context)),
                         )
                     };
                     let result_status = statement_finished_status(&result, context_was_canceling);
@@ -6784,6 +6809,9 @@ impl MainWindow {
                         result_tabs.select_messages_errors();
                     } else if !info_lines.is_empty() {
                         result_tabs.append_message_lines(ResultMessageKind::Info, &info_lines);
+                        if should_select_info_pane {
+                            result_tabs.select_messages_info();
+                        }
                     }
                     if deferred_lazy_batch_done {
                         let mut s = state_for_progress
@@ -9453,6 +9481,25 @@ mod tests {
         assert!(should_send_success_message_to_info(&select, false));
         assert!(!should_send_success_message_to_info(&dml, true));
         assert!(!should_send_success_message_to_info(&error, false));
+    }
+
+    #[test]
+    fn support_result_panes_select_only_without_current_data_grid_destination() {
+        assert!(should_select_support_result_pane(None));
+
+        let context = QueryProgressContext::new(3, None, "Executing query".to_string(), None);
+        assert!(should_select_support_result_pane(Some(&context)));
+
+        let mut context_with_grid =
+            QueryProgressContext::new(3, None, "Executing query".to_string(), None);
+        context_with_grid.result_tab_indices.insert(0, 3);
+        assert!(!should_select_support_result_pane(Some(&context_with_grid)));
+
+        let context_with_grid_target =
+            QueryProgressContext::new(3, Some(1), "Saving result grid".to_string(), None);
+        assert!(!should_select_support_result_pane(Some(
+            &context_with_grid_target
+        )));
     }
 
     fn assert_progress_routes_only(

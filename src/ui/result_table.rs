@@ -98,6 +98,7 @@ enum LazyFetchPendingAction {
     CopyAll,
     SelectAll,
     MoveToEdge(ResultTableEdge),
+    ExtendSelectionToEdge(ResultTableEdge),
     ExportCsv(Box<dyn FnMut(String, usize)>),
 }
 
@@ -283,6 +284,7 @@ struct DragState {
     header_sort_requires_double_click: bool,
     header_sort_start_x: i32,
     header_sort_start_y: i32,
+    last_selection: Option<(i32, i32, i32, i32)>,
 }
 
 #[derive(Clone)]
@@ -1120,6 +1122,65 @@ impl ResultTableWidget {
         true
     }
 
+    fn extend_table_selection_to_edge(
+        table: &mut Table,
+        edge: ResultTableEdge,
+        hidden_col: Option<usize>,
+    ) -> bool {
+        let max_rows = table.rows().max(0) as usize;
+        let max_cols = table.cols().max(0) as usize;
+        let Some((row_start, col_start, row_end, col_end)) =
+            Self::extended_selection_bounds_to_edge(
+                table.get_selection(),
+                max_rows,
+                max_cols,
+                hidden_col,
+                edge,
+            )
+        else {
+            return false;
+        };
+
+        table.set_selection(
+            row_start as i32,
+            col_start as i32,
+            row_end as i32,
+            col_end as i32,
+        );
+        match edge {
+            ResultTableEdge::Left => table.set_col_position(col_start as i32),
+            ResultTableEdge::Right => table.set_col_position(col_end as i32),
+            ResultTableEdge::Up => table.set_row_position(row_start as i32),
+            ResultTableEdge::Down => table.set_row_position(row_end as i32),
+        }
+        table.redraw();
+        true
+    }
+
+    fn extended_selection_bounds_to_edge(
+        selection: (i32, i32, i32, i32),
+        max_rows: usize,
+        max_cols: usize,
+        hidden_col: Option<usize>,
+        edge: ResultTableEdge,
+    ) -> Option<(usize, usize, usize, usize)> {
+        let (mut row_start, mut col_start, mut row_end, mut col_end) =
+            Self::selection_bounds_excluding_hidden_column(
+                selection, max_rows, max_cols, hidden_col,
+            )?;
+        let (first_visible_col, last_visible_col) =
+            Self::visible_column_bounds(max_cols, hidden_col)?;
+
+        match edge {
+            ResultTableEdge::Left => col_start = first_visible_col,
+            ResultTableEdge::Right => col_end = last_visible_col,
+            ResultTableEdge::Up => row_start = 0,
+            ResultTableEdge::Down => row_end = max_rows.saturating_sub(1),
+        }
+
+        Some((row_start, col_start, row_end, col_end))
+    }
+
     fn handle_ctrl_arrow_navigation(
         table: &mut Table,
         key: Key,
@@ -1145,6 +1206,34 @@ impl ResultTableWidget {
         }
 
         Self::move_table_selection_to_edge(table, edge, hidden_col);
+        true
+    }
+
+    fn handle_ctrl_shift_arrow_selection(
+        table: &mut Table,
+        key: Key,
+        original_key: Key,
+        hidden_col: Option<usize>,
+        lazy_fetch_session: &Arc<Mutex<Option<u64>>>,
+        lazy_fetch_callback: &LazyFetchCallback,
+        pending_lazy_actions: &Arc<Mutex<VecDeque<(u64, LazyFetchPendingAction)>>>,
+    ) -> bool {
+        let Some(edge) = Self::edge_for_arrow_key(key, original_key) else {
+            return false;
+        };
+
+        if edge == ResultTableEdge::Down
+            && Self::queue_lazy_action_if_active(
+                lazy_fetch_session,
+                lazy_fetch_callback,
+                pending_lazy_actions,
+                LazyFetchPendingAction::ExtendSelectionToEdge(edge),
+            )
+        {
+            return true;
+        }
+
+        Self::extend_table_selection_to_edge(table, edge, hidden_col);
         true
     }
 
@@ -1246,6 +1335,29 @@ impl ResultTableWidget {
             hidden_col,
             key,
         )
+    }
+
+    fn current_table_selection_bounds(table: &Table) -> Option<(i32, i32, i32, i32)> {
+        let (row_start, col_start, row_end, col_end) =
+            Self::normalized_selection_bounds_with_limits(
+                table.get_selection(),
+                table.rows().max(0) as usize,
+                table.cols().max(0) as usize,
+            )?;
+        Some((
+            row_start as i32,
+            col_start as i32,
+            row_end as i32,
+            col_end as i32,
+        ))
+    }
+
+    fn sync_drag_selection_snapshot(table: &Table, drag_state: &Arc<Mutex<DragState>>) {
+        let selection = Self::current_table_selection_bounds(table);
+        drag_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .last_selection = selection;
     }
 
     fn apply_table_metrics_for_current_font(&mut self) {
@@ -1875,11 +1987,15 @@ impl ResultTableWidget {
                             let max_rows = table_for_handle.rows().max(0) as usize;
                             let max_cols = table_for_handle.cols().max(0) as usize;
                             let base_selection_bounds = if shift {
-                                Self::normalized_selection_bounds_with_limits(
-                                    table_for_handle.get_selection(),
-                                    max_rows,
-                                    max_cols,
-                                )
+                                drag_state_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .last_selection
+                                    .and_then(|selection| {
+                                        Self::normalized_selection_bounds_with_limits(
+                                            selection, max_rows, max_cols,
+                                        )
+                                    })
                             } else {
                                 None
                             };
@@ -1902,6 +2018,10 @@ impl ResultTableWidget {
                             if let Some((row_start, col_start, row_end, col_end)) = next_selection {
                                 table_for_handle
                                     .set_selection(row_start, col_start, row_end, col_end);
+                                Self::sync_drag_selection_snapshot(
+                                    &table_for_handle,
+                                    &drag_state_for_handle,
+                                );
                                 return true;
                             }
                         }
@@ -1932,6 +2052,10 @@ impl ResultTableWidget {
 
                             if table_for_handle.try_get_selection().is_some() {
                                 table_for_handle.unset_selection();
+                                drag_state_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .last_selection = None;
                                 table_for_handle.redraw();
                             }
                             return true;
@@ -2099,6 +2223,12 @@ impl ResultTableWidget {
                         return true;
                     }
                     if was_dragging || consumed_background_pointer_sequence {
+                        if was_dragging {
+                            Self::sync_drag_selection_snapshot(
+                                &table_for_handle,
+                                &drag_state_for_handle,
+                            );
+                        }
                         return true;
                     }
                     false
@@ -2115,15 +2245,32 @@ impl ResultTableWidget {
                         let hidden_col = *hidden_auto_rowid_col_for_handle
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        if Self::handle_ctrl_arrow_navigation(
-                            &mut table_for_handle,
-                            key,
-                            original_key,
-                            hidden_col,
-                            &lazy_fetch_session_for_handle,
-                            &lazy_fetch_callback_for_handle,
-                            &pending_lazy_actions_for_handle,
-                        ) {
+                        let handled = if shift {
+                            Self::handle_ctrl_shift_arrow_selection(
+                                &mut table_for_handle,
+                                key,
+                                original_key,
+                                hidden_col,
+                                &lazy_fetch_session_for_handle,
+                                &lazy_fetch_callback_for_handle,
+                                &pending_lazy_actions_for_handle,
+                            )
+                        } else {
+                            Self::handle_ctrl_arrow_navigation(
+                                &mut table_for_handle,
+                                key,
+                                original_key,
+                                hidden_col,
+                                &lazy_fetch_session_for_handle,
+                                &lazy_fetch_callback_for_handle,
+                                &pending_lazy_actions_for_handle,
+                            )
+                        };
+                        if handled {
+                            Self::sync_drag_selection_snapshot(
+                                &table_for_handle,
+                                &drag_state_for_handle,
+                            );
                             return true;
                         }
                     }
@@ -2155,9 +2302,17 @@ impl ResultTableWidget {
                             &mut table_for_handle,
                             hidden_col,
                         ) {
+                            Self::sync_drag_selection_snapshot(
+                                &table_for_handle,
+                                &drag_state_for_handle,
+                            );
                             table_for_handle.redraw();
                             return true;
                         }
+                        Self::sync_drag_selection_snapshot(
+                            &table_for_handle,
+                            &drag_state_for_handle,
+                        );
                         return Self::should_consume_boundary_arrow(
                             &table_for_handle,
                             key,
@@ -2208,6 +2363,10 @@ impl ResultTableWidget {
                             let cols = table_for_handle.cols();
                             if rows > 0 && cols > 0 {
                                 table_for_handle.set_selection(0, 0, rows - 1, cols - 1);
+                                Self::sync_drag_selection_snapshot(
+                                    &table_for_handle,
+                                    &drag_state_for_handle,
+                                );
                                 table_for_handle.redraw();
                             }
                             return true;
@@ -2283,15 +2442,32 @@ impl ResultTableWidget {
                         let hidden_col = *hidden_auto_rowid_col_for_handle
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        if Self::handle_ctrl_arrow_navigation(
-                            &mut table_for_handle,
-                            key,
-                            original_key,
-                            hidden_col,
-                            &lazy_fetch_session_for_handle,
-                            &lazy_fetch_callback_for_handle,
-                            &pending_lazy_actions_for_handle,
-                        ) {
+                        let handled = if shift {
+                            Self::handle_ctrl_shift_arrow_selection(
+                                &mut table_for_handle,
+                                key,
+                                original_key,
+                                hidden_col,
+                                &lazy_fetch_session_for_handle,
+                                &lazy_fetch_callback_for_handle,
+                                &pending_lazy_actions_for_handle,
+                            )
+                        } else {
+                            Self::handle_ctrl_arrow_navigation(
+                                &mut table_for_handle,
+                                key,
+                                original_key,
+                                hidden_col,
+                                &lazy_fetch_session_for_handle,
+                                &lazy_fetch_callback_for_handle,
+                                &pending_lazy_actions_for_handle,
+                            )
+                        };
+                        if handled {
+                            Self::sync_drag_selection_snapshot(
+                                &table_for_handle,
+                                &drag_state_for_handle,
+                            );
                             return true;
                         }
                     }
@@ -2357,6 +2533,10 @@ impl ResultTableWidget {
                         let cols = table_for_handle.cols();
                         if rows > 0 && cols > 0 {
                             table_for_handle.set_selection(0, 0, rows - 1, cols - 1);
+                            Self::sync_drag_selection_snapshot(
+                                &table_for_handle,
+                                &drag_state_for_handle,
+                            );
                             table_for_handle.redraw();
                         }
                         return true;
@@ -7092,6 +7272,12 @@ impl ResultTableWidget {
                 LazyFetchPendingAction::MoveToEdge(edge) => {
                     let hidden_col = self.hidden_auto_rowid_col_value();
                     Self::move_table_selection_to_edge(&mut self.table, edge, hidden_col);
+                    Self::sync_drag_selection_snapshot(&self.table, &self.drag_state);
+                }
+                LazyFetchPendingAction::ExtendSelectionToEdge(edge) => {
+                    let hidden_col = self.hidden_auto_rowid_col_value();
+                    Self::extend_table_selection_to_edge(&mut self.table, edge, hidden_col);
+                    Self::sync_drag_selection_snapshot(&self.table, &self.drag_state);
                 }
                 LazyFetchPendingAction::ExportCsv(mut callback) => {
                     let (csv, row_count) = self.current_csv_snapshot();
@@ -7273,6 +7459,7 @@ impl ResultTableWidget {
         let cols = self.table.cols();
         if rows > 0 && cols > 0 {
             self.table.set_selection(0, 0, rows - 1, cols - 1);
+            Self::sync_drag_selection_snapshot(&self.table, &self.drag_state);
             self.table.redraw();
         }
     }
@@ -7981,6 +8168,34 @@ mod row_edit_sql_tests {
                 0,
             ),
             Some((5, 1))
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_left_extension_stops_at_first_visible_column_when_rowid_is_hidden() {
+        assert_eq!(
+            ResultTableWidget::extended_selection_bounds_to_edge(
+                (2, 3, 4, 3),
+                6,
+                4,
+                Some(0),
+                ResultTableEdge::Left,
+            ),
+            Some((2, 1, 4, 3))
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_down_extension_keeps_current_columns_and_extends_to_last_row() {
+        assert_eq!(
+            ResultTableWidget::extended_selection_bounds_to_edge(
+                (2, 1, 4, 2),
+                8,
+                4,
+                Some(0),
+                ResultTableEdge::Down,
+            ),
+            Some((2, 1, 7, 2))
         );
     }
 

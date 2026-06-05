@@ -1154,23 +1154,14 @@ impl ResultTabsWidget {
         if lines.is_empty() {
             return;
         }
-        let should_select = self.tab_count() == 0;
         Self::append_lines_to_pane(&self.script_output, lines);
-        if should_select {
-            self.select_script_output();
-        }
     }
 
     pub fn append_dbms_output_lines(&mut self, lines: &[String]) {
         if lines.is_empty() {
             return;
         }
-        let should_select = self.tab_count() == 0;
         Self::append_lines_to_pane(&self.dbms_output, lines);
-        if should_select {
-            self.select_top_group(&self.sections.dbms_output.clone());
-            self.fire_on_change_callback();
-        }
     }
 
     pub fn append_message_lines(&mut self, kind: ResultMessageKind, lines: &[String]) {
@@ -1971,6 +1962,17 @@ impl ResultTabsWidget {
             .active_index
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(index);
+        self.fire_on_change_callback();
+    }
+
+    pub fn select_dbms_output(&mut self) {
+        self.select_top_group(&self.sections.dbms_output.clone());
+        self.fire_on_change_callback();
+    }
+
+    pub fn select_messages_info(&mut self) {
+        self.select_top_group(&self.sections.messages.clone());
+        Self::select_text_tab(&mut self.messages_tabs, &self.messages_info);
         self.fire_on_change_callback();
     }
 

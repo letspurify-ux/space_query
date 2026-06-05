@@ -6756,11 +6756,11 @@ impl QueryExecutor {
 
     fn with_clause_cte_names(with_prefix: &str) -> Vec<String> {
         let mut names = Vec::new();
-        let mut scanner = TopLevelScanner::new(with_prefix);
+        let scanner = TopLevelScanner::new(with_prefix);
         let mut expect_name = false;
         let mut saw_with = false;
 
-        while let Some(token) = scanner.next() {
+        for token in scanner {
             match token {
                 ScanToken::Word { text, .. } if text.eq_ignore_ascii_case("WITH") => {
                     saw_with = true;
