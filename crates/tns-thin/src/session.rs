@@ -5574,21 +5574,32 @@ fn process_column_metadata(
         let _ = cursor.read_ub4()?;
         cursor.skip(2)?;
     }
+    let column_type = if is_xmltype_metadata(ora_type_num, &schema_name, &type_name) {
+        OracleColumnType::Xml
+    } else if uds_flags & (TNS_UDS_FLAGS_IS_JSON | TNS_UDS_FLAGS_IS_OSON) != 0 {
+        OracleColumnType::Json
+    } else {
+        oracle_column_type_from_ora_type(ora_type_num)
+    };
     Ok(ThinColumn {
         name,
-        column_type: if is_xmltype_metadata(ora_type_num, &schema_name, &type_name) {
-            OracleColumnType::Xml
-        } else if uds_flags & (TNS_UDS_FLAGS_IS_JSON | TNS_UDS_FLAGS_IS_OSON) != 0 {
-            OracleColumnType::Json
-        } else {
-            oracle_column_type_from_ora_type(ora_type_num)
-        },
+        column_type,
+        charset_form: normalize_metadata_charset_form(column_type, charset_form),
         ora_type_num,
-        charset_form,
         buffer_size,
         schema_name,
         type_name,
     })
+}
+
+fn normalize_metadata_charset_form(column_type: OracleColumnType, charset_form: u8) -> u8 {
+    match column_type {
+        OracleColumnType::Varchar
+        | OracleColumnType::Long
+        | OracleColumnType::Clob
+        | OracleColumnType::Nclob => charset_form,
+        _ => 0,
+    }
 }
 
 fn process_row_header(
@@ -11315,11 +11326,11 @@ mod tests {
         encode_temp_clob_text, encode_vector, execute_flags_for_request,
         generate_10g_password_hash, generate_11g_password_hash,
         generate_auth_credentials_from_session_key_parts, hex_encode_upper,
-        local_timezone_offset_string, normalize_cursor_ids, oracle_column_type_from_ora_type,
-        process_auth_payload, process_describe_body, process_legacy_execute_error,
-        process_protocol_message, process_row_data, read_boolean_value,
-        read_data_packet_with_control, read_data_packet_with_flags, read_rowid_value,
-        read_urowid_value, request_is_dml_returning, request_with_out_bind_types,
+        local_timezone_offset_string, normalize_cursor_ids, normalize_metadata_charset_form,
+        oracle_column_type_from_ora_type, process_auth_payload, process_describe_body,
+        process_legacy_execute_error, process_protocol_message, process_row_data,
+        read_boolean_value, read_data_packet_with_control, read_data_packet_with_flags,
+        read_rowid_value, read_urowid_value, request_is_dml_returning, request_with_out_bind_types,
         thin_column_from_column_metadata, thin_column_from_object_attr,
         validate_supported_protocol, verify_server_response, windows_code_pages_for_encoding,
         write_bind_rows_for_request, write_bind_value, write_bytes_with_length_for_capabilities,
@@ -14068,6 +14079,34 @@ mod tests {
         assert_eq!(thin.charset_form, CS_FORM_NCHAR);
         assert_eq!(thin.ora_type_num, ORA_TYPE_NUM_LONG);
         assert_eq!(thin.column_type, OracleColumnType::Long);
+    }
+
+    #[test]
+    fn metadata_charset_form_is_ignored_for_non_character_types_like_python_oracledb() {
+        assert_eq!(
+            normalize_metadata_charset_form(OracleColumnType::Number, CS_FORM_NCHAR),
+            0
+        );
+        assert_eq!(
+            normalize_metadata_charset_form(OracleColumnType::Object, CS_FORM_NCHAR),
+            0
+        );
+        assert_eq!(
+            normalize_metadata_charset_form(OracleColumnType::Cursor, CS_FORM_IMPLICIT),
+            0
+        );
+        assert_eq!(
+            normalize_metadata_charset_form(OracleColumnType::Varchar, CS_FORM_NCHAR),
+            CS_FORM_NCHAR
+        );
+        assert_eq!(
+            normalize_metadata_charset_form(OracleColumnType::Clob, CS_FORM_NCHAR),
+            CS_FORM_NCHAR
+        );
+        assert_eq!(
+            normalize_metadata_charset_form(OracleColumnType::Nclob, CS_FORM_NCHAR),
+            CS_FORM_NCHAR
+        );
     }
 
     #[test]
