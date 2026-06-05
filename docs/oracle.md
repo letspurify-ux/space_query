@@ -58,6 +58,7 @@ export ORACLE_CLIENT_LIB_DIR=/tmp/oqt_instantclient_23_26
 - Host: `127.0.0.1`
 - Port: `1521`
 - Service: `FREE`
+- SID: `FREE`
 - Username: `system`
 - Password: `password`
 - 앱 DB 타입: `Oracle`
@@ -123,6 +124,7 @@ export ORACLE_TEST_PASSWORD=password
 export ORACLE_TEST_HOST=127.0.0.1
 export ORACLE_TEST_PORT=1521
 export ORACLE_TEST_SERVICE_NAME=FREE
+export ORACLE_TEST_SID=FREE
 export ORACLE_TEST_TNS_ALIAS=FREE_LOCAL
 unset ORACLE_TEST_TARGET
 

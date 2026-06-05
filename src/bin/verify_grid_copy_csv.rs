@@ -45,11 +45,11 @@ fn sample_result() -> QueryResult {
     }
 }
 
-fn read_clipboard() -> String {
-    let out = Command::new("pbpaste")
+fn read_clipboard() -> Result<String, String> {
+    Command::new("pbpaste")
         .output()
-        .expect("pbpaste should run on macOS");
-    String::from_utf8_lossy(&out.stdout).to_string()
+        .map(|out| String::from_utf8_lossy(&out.stdout).to_string())
+        .map_err(|err| format!("pbpaste should run on macOS: {err}"))
 }
 
 fn main() {
@@ -70,51 +70,61 @@ fn main() {
     grid.select_all();
     let copied = grid.copy();
     app::wait_for(0.2).ok();
-    let clip = read_clipboard();
+    match read_clipboard() {
+        Ok(clip) => {
+            println!("--- clipboard after Ctrl+C (copy) ---");
+            println!("{:?}", clip);
+            println!("copied cell count = {}", copied);
 
-    println!("--- clipboard after Ctrl+C (copy) ---");
-    println!("{:?}", clip);
-    println!("copied cell count = {}", copied);
-
-    let expected_quoted = "\"한국어\n둘째 줄\t탭과 \"\"따옴표\"\"\"";
-    if clip.contains(expected_quoted) {
-        println!("PASS: multiline/special cell is quoted as a single Excel cell");
-    } else {
-        failures.push("clipboard did not contain the expected quoted multiline cell".into());
-    }
-    // The plain Korean cell must NOT be quoted (no special chars).
-    if clip.contains(KOREAN_PLAIN) {
-        println!("PASS: plain Korean cell preserved unquoted");
-    } else {
-        failures.push("clipboard missing plain Korean cell".into());
+            let expected_quoted = "\"한국어\n둘째 줄\t탭과 \"\"따옴표\"\"\"";
+            if clip.contains(expected_quoted) {
+                println!("PASS: multiline/special cell is quoted as a single Excel cell");
+            } else {
+                failures
+                    .push("clipboard did not contain the expected quoted multiline cell".into());
+            }
+            // The plain Korean cell must NOT be quoted (no special chars).
+            if clip.contains(KOREAN_PLAIN) {
+                println!("PASS: plain Korean cell preserved unquoted");
+            } else {
+                failures.push("clipboard missing plain Korean cell".into());
+            }
+        }
+        Err(err) => failures.push(err),
     }
 
     // (2) CSV export: write the exact string the UI writes to disk, read bytes.
     let csv = grid.export_to_csv();
     let tmp = std::env::temp_dir().join("verify_grid_copy_csv_export.csv");
-    std::fs::write(&tmp, &csv).expect("write temp csv");
-    let bytes = std::fs::read(&tmp).expect("read temp csv");
+    match std::fs::write(&tmp, &csv).and_then(|_| std::fs::read(&tmp)) {
+        Ok(bytes) => {
+            println!("\n--- CSV export ({}) ---", tmp.display());
+            println!("first 3 bytes = {:02X?}", &bytes[..3.min(bytes.len())]);
 
-    println!("\n--- CSV export ({}) ---", tmp.display());
-    println!("first 3 bytes = {:02X?}", &bytes[..3.min(bytes.len())]);
-
-    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        println!("PASS: CSV begins with UTF-8 BOM (Excel reads Korean correctly)");
-    } else {
-        failures.push("CSV is missing the UTF-8 BOM".into());
-    }
-    // Round-trip the bytes as UTF-8 and confirm Korean + quoting survived.
-    let text = String::from_utf8(bytes).expect("CSV must be valid UTF-8");
-    if text.contains(KOREAN_PLAIN) && text.contains("이름") {
-        println!("PASS: Korean header + data preserved in CSV");
-    } else {
-        failures.push("CSV lost Korean text".into());
-    }
-    let expected_csv_cell = "\"한국어\n둘째 줄\t탭과 \"\"따옴표\"\"\"";
-    if text.contains(expected_csv_cell) {
-        println!("PASS: multiline cell quoted in CSV (single field)");
-    } else {
-        failures.push("CSV did not quote the multiline cell".into());
+            if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+                println!("PASS: CSV begins with UTF-8 BOM (Excel reads Korean correctly)");
+            } else {
+                failures.push("CSV is missing the UTF-8 BOM".into());
+            }
+            // Round-trip the bytes as UTF-8 and confirm Korean + quoting survived.
+            match String::from_utf8(bytes) {
+                Ok(text) => {
+                    if text.contains(KOREAN_PLAIN) && text.contains("이름") {
+                        println!("PASS: Korean header + data preserved in CSV");
+                    } else {
+                        failures.push("CSV lost Korean text".into());
+                    }
+                    let expected_csv_cell = "\"한국어\n둘째 줄\t탭과 \"\"따옴표\"\"\"";
+                    if text.contains(expected_csv_cell) {
+                        println!("PASS: multiline cell quoted in CSV (single field)");
+                    } else {
+                        failures.push("CSV did not quote the multiline cell".into());
+                    }
+                }
+                Err(err) => failures.push(format!("CSV must be valid UTF-8: {err}")),
+            }
+        }
+        Err(err) => failures.push(format!("failed to write/read {}: {err}", tmp.display())),
     }
 
     win.hide();

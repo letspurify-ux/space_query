@@ -840,7 +840,7 @@ fn parse_accept_packet(data: &[u8]) -> Result<AcceptInfo, OracleThinError> {
         .is_some_and(|flags| flags & TNS_NSI_NA_REQUIRED != 0)
     {
         return Err(OracleThinError::new(
-            "Oracle listener requires Native Network Encryption/Data Integrity, which Oracle Thin does not support yet",
+            "Oracle listener requires Native Network Encryption/Data Integrity, which is outside the supported Oracle Thin target scope",
         ));
     }
     let mut sdu = if protocol_version >= 315 {
