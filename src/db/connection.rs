@@ -3439,9 +3439,11 @@ impl DatabaseConnection {
                 Some(OracleValue::Null) | None => None,
                 Some(OracleValue::Lob(_))
                 | Some(OracleValue::Bytes(_))
+                | Some(OracleValue::JsonId(_))
                 | Some(OracleValue::Cursor(_))
                 | Some(OracleValue::Object(_))
-                | Some(OracleValue::Array(_)) => None,
+                | Some(OracleValue::Array(_))
+                | Some(OracleValue::IndexedArray(_)) => None,
             }))
     }
 

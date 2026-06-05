@@ -76,6 +76,7 @@ pub enum BindValue {
     JsonNumber(String),
     JsonString(String),
     JsonRaw(Vec<u8>),
+    JsonId(Vec<u8>),
     JsonDate(OracleDateTime),
     JsonTimestamp(OracleDateTime),
     JsonIntervalYearMonth(OracleIntervalYearMonth),
@@ -167,10 +168,12 @@ pub enum OracleValue {
     DateTime(OracleDateTime),
     Timestamp(OracleDateTime),
     Bytes(Vec<u8>),
+    JsonId(Vec<u8>),
     Lob(Vec<u8>),
     Cursor(RefCursorValue),
     Object(Vec<(String, OracleValue)>),
     Array(Vec<OracleValue>),
+    IndexedArray(Vec<(i32, OracleValue)>),
 }
 
 #[derive(Debug, Clone, PartialEq)]

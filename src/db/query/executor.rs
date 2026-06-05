@@ -7934,9 +7934,14 @@ impl ObjectBrowser {
             }
             OracleThinValue::Lob(_) => "[LOB]".to_string(),
             OracleThinValue::Bytes(value) => format!("{value:?}"),
+            OracleThinValue::JsonId(value) => value
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<String>(),
             OracleThinValue::Cursor(_) => "[CURSOR]".to_string(),
             OracleThinValue::Object(_) => "[OBJECT]".to_string(),
             OracleThinValue::Array(_) => "[ARRAY]".to_string(),
+            OracleThinValue::IndexedArray(_) => "[INDEXED ARRAY]".to_string(),
         }
     }
 

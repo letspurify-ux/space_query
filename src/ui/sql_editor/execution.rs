@@ -13833,10 +13833,17 @@ impl SqlEditorWidget {
                     .map(|byte| format!("{byte:02X}"))
                     .collect::<String>(),
             ),
+            OracleValue::JsonId(bytes) => Some(
+                bytes
+                    .iter()
+                    .map(|byte| format!("{byte:02X}"))
+                    .collect::<String>(),
+            ),
             OracleValue::Lob(_) => Some("[LOB]".to_string()),
             OracleValue::Cursor(_) => Some("[CURSOR]".to_string()),
             OracleValue::Object(_) => Some("[OBJECT]".to_string()),
             OracleValue::Array(_) => Some("[ARRAY]".to_string()),
+            OracleValue::IndexedArray(_) => Some("[INDEXED ARRAY]".to_string()),
         }
     }
 

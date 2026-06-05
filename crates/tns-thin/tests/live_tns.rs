@@ -38,6 +38,57 @@ fn auth_alter_session_sets_initial_time_zone() {
 
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn end_to_end_attributes_are_sent_before_next_statement_like_python_oracledb() {
+    let mut conn = connect();
+    conn.set_module(Some("space_query_module".to_string()));
+    conn.set_action(Some("open_dashboard".to_string()));
+    conn.set_client_identifier(Some("space_query_client".to_string()));
+    conn.set_client_info(Some("thin_info".to_string()));
+
+    let result = conn
+        .query_described_fetch_all(
+            "SELECT \
+             SYS_CONTEXT('USERENV', 'MODULE') AS module_name, \
+             SYS_CONTEXT('USERENV', 'ACTION') AS action_name, \
+             SYS_CONTEXT('USERENV', 'CLIENT_IDENTIFIER') AS client_identifier, \
+             SYS_CONTEXT('USERENV', 'CLIENT_INFO') AS client_info \
+             FROM dual",
+            1,
+        )
+        .expect("fetch end-to-end attributes");
+
+    assert_eq!(
+        rows_to_strings(&result.result.rows),
+        vec![vec![
+            "space_query_module".to_string(),
+            "open_dashboard".to_string(),
+            "space_query_client".to_string(),
+            "thin_info".to_string(),
+        ]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn current_schema_piggyback_is_sent_before_next_statement_like_python_oracledb() {
+    let mut conn = connect();
+    conn.set_current_schema("SYS");
+
+    let result = conn
+        .query_described_fetch_all(
+            "SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') AS current_schema FROM dual",
+            1,
+        )
+        .expect("fetch current schema after piggyback");
+
+    assert_eq!(
+        rows_to_strings(&result.result.rows),
+        vec![vec!["SYS".to_string()]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn fetch_and_fetch_all_return_all_rows() {
     let mut conn = connect();
     let sql = "SELECT level AS n, 'R' || TO_CHAR(level) AS label FROM dual CONNECT BY level <= 7";
@@ -1005,8 +1056,65 @@ fn dml_returning_raw_json_input_bind_round_trips_like_python_oracledb() {
         Err(err) => panic!("DML RETURNING raw JSON input bind: {err}"),
     };
 
-    let expected = r#"{"$rawhex":"41207261772076616c7565"}"#;
-    assert_eq!(rows_to_strings(&[values]), vec![vec![expected.to_string()]]);
+    assert_eq!(values, vec![OracleValue::Bytes(b"A raw value".to_vec())]);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn dml_returning_json_id_input_bind_round_trips_like_python_oracledb() {
+    let config = live_config();
+    let table = unique_table_name("JSON_ID_RET");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+
+    match conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, doc JSON) TABLESPACE USERS"
+    )) {
+        Ok(()) => {}
+        Err(err)
+            if err.to_string().contains("ORA-00902")
+                || err.to_string().contains("ORA-00959")
+                || err.to_string().contains("ORA-03001")
+                || err.to_string().contains("ORA-43853") =>
+        {
+            eprintln!(
+                "skipping JSON ID input DML RETURNING test: database does not support native JSON"
+            );
+            return;
+        }
+        Err(err) => panic!("create JSON ID input DML RETURNING test table: {err}"),
+    }
+
+    let mut request = StatementRequest::statement(format!(
+        "INSERT INTO {table} (id, doc) VALUES (:1, :2) RETURNING doc INTO :3"
+    ));
+    request.binds.push(BindValue::Number("1".to_string()));
+    request
+        .binds
+        .push(BindValue::JsonId(vec![0x01, 0x23, 0xab]));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Json,
+        max_len: 1024,
+    });
+
+    let values = match conn.execute_out_binds(&request, &[]) {
+        Ok(values) => values,
+        Err(err)
+            if err.to_string().contains("ORA-00902")
+                || err.to_string().contains("ORA-00932")
+                || err.to_string().contains("ORA-03001")
+                || err.to_string().contains("ORA-06550")
+                || err.to_string().contains("ORA-43853") =>
+        {
+            eprintln!(
+                "skipping JSON ID input DML RETURNING test: database does not support native JSON ID bind"
+            );
+            return;
+        }
+        Err(err) => panic!("DML RETURNING JSON ID input bind: {err}"),
+    };
+
+    assert_eq!(rows_to_strings(&[values]), vec![vec!["0123ab".to_string()]]);
 }
 
 #[test]
@@ -7925,6 +8033,10 @@ fn assert_ref_cursor_varchar2_4000_row(row: &[OracleValue], digit: &str) {
 fn value_to_string(value: &OracleValue) -> String {
     match value {
         OracleValue::Number(value) | OracleValue::Text(value) => value.clone(),
+        OracleValue::JsonId(value) => value
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
         other => panic!("unexpected test value {other:?}"),
     }
 }
