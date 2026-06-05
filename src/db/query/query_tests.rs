@@ -6304,6 +6304,49 @@ fn test_extract_bind_names_supports_non_ascii_bind_names() {
 }
 
 #[test]
+fn test_extract_bind_names_supports_whitespace_after_colon() {
+    let sql = r#"SELECT : value, : 1, : "MiXeD" FROM dual"#;
+    let names = QueryExecutor::extract_bind_names(sql);
+
+    assert_eq!(
+        names,
+        vec!["VALUE".to_string(), "1".to_string(), "MIXED".to_string()]
+    );
+}
+
+#[test]
+fn test_extract_bind_names_requires_alpha_start_for_named_binds() {
+    let sql = r#"SELECT :_bad, :$bad, :#bad, : good_1$#, : méil, : 1, : "_quoted" FROM dual"#;
+    let names = QueryExecutor::extract_bind_names(sql);
+
+    assert_eq!(
+        names,
+        vec![
+            "GOOD_1$#".to_string(),
+            "M\u{00C9}IL".to_string(),
+            "1".to_string(),
+            "_QUOTED".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn test_extract_bind_names_skips_json_key_colons() {
+    let sql = r#"
+SELECT JSON_OBJECT(
+         'id' : : id,
+         'staticNumber' : 1,
+         'staticText':'value',
+         'derived'::bv2,
+         'nested': JSON {'count':2, 'label':'ok'}
+       RETURNING JSON)
+FROM dual"#;
+    let names = QueryExecutor::extract_bind_names(sql);
+
+    assert_eq!(names, vec!["ID".to_string(), "BV2".to_string()]);
+}
+
+#[test]
 fn test_is_create_trigger() {
     // Positive cases
     assert!(QueryExecutor::is_create_trigger(

@@ -319,6 +319,7 @@ impl QueryExecutor {
         let mut in_block_comment = false;
         let mut in_q_quote = false;
         let mut q_quote_end: Option<char> = None;
+        let mut last_token_was_string = false;
 
         let chars: Vec<char> = sql.chars().collect();
         let len = chars.len();
@@ -359,6 +360,7 @@ impl QueryExecutor {
                 if Some(c) == q_quote_end && next == Some('\'') {
                     in_q_quote = false;
                     q_quote_end = None;
+                    last_token_was_string = true;
                     i += 2;
                     continue;
                 }
@@ -373,6 +375,7 @@ impl QueryExecutor {
                         continue;
                     }
                     in_single_quote = false;
+                    last_token_was_string = true;
                 }
                 i += 1;
                 continue;
@@ -439,15 +442,19 @@ impl QueryExecutor {
             }
 
             if c == ':' {
-                let prev = if i > 0 { Some(chars[i - 1]) } else { None };
-                if prev == Some(':') {
+                if last_token_was_string {
+                    last_token_was_string = false;
                     i += 1;
                     continue;
                 }
+                let mut bind_start = i + 1;
+                while bind_start < len && chars[bind_start].is_whitespace() {
+                    bind_start += 1;
+                }
 
-                if let Some(nc) = next {
+                if let Some(nc) = chars.get(bind_start).copied() {
                     if nc == '"' {
-                        let mut j = i + 2;
+                        let mut j = bind_start + 1;
                         let mut name = String::new();
                         let mut closed = false;
                         while j < len {
@@ -476,11 +483,11 @@ impl QueryExecutor {
                     }
 
                     if nc.is_ascii_digit() {
-                        let mut j = i + 1;
+                        let mut j = bind_start;
                         while j < len && chars[j].is_ascii_digit() {
                             j += 1;
                         }
-                        let name = chars[i + 1..j].iter().collect::<String>();
+                        let name = chars[bind_start..j].iter().collect::<String>();
                         let normalized = SessionState::normalize_name(&name);
                         if seen.insert(normalized.clone()) {
                             names.push(normalized);
@@ -489,8 +496,8 @@ impl QueryExecutor {
                         continue;
                     }
 
-                    if sql_text::is_identifier_char(nc) {
-                        let mut j = i + 1;
+                    if nc.is_alphabetic() {
+                        let mut j = bind_start;
                         while j < len {
                             let ch = chars[j];
                             if sql_text::is_identifier_char(ch) {
@@ -499,7 +506,7 @@ impl QueryExecutor {
                                 break;
                             }
                         }
-                        let name = chars[i + 1..j].iter().collect::<String>();
+                        let name = chars[bind_start..j].iter().collect::<String>();
                         let normalized = SessionState::normalize_name(&name);
 
                         // In CREATE TRIGGER, skip :NEW and :OLD pseudo-records
@@ -520,6 +527,9 @@ impl QueryExecutor {
                 }
             }
 
+            if !c.is_whitespace() {
+                last_token_was_string = false;
+            }
             i += 1;
         }
 

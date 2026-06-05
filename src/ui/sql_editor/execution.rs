@@ -29751,6 +29751,29 @@ mod mysql_transaction_feedback_tests {
             .expect("JSON RETURNING is not DML RETURNING"),
             vec![false]
         );
+        let json_colon_sql = "INSERT INTO users(id, doc)
+                              VALUES (: id_in, JSON_OBJECT('id' : : id_in RETURNING JSON))
+                              RETURNING id INTO : id_out";
+        let json_colon_resolved = vec![
+            ResolvedBind {
+                name: "ID_IN".to_string(),
+                data_type: BindDataType::Number,
+                value: Some("25".to_string()),
+            },
+            ResolvedBind {
+                name: "ID_OUT".to_string(),
+                data_type: BindDataType::Number,
+                value: None,
+            },
+        ];
+        assert_eq!(
+            SqlEditorWidget::oracle_thin_dml_returning_out_bind_positions(
+                json_colon_sql,
+                &json_colon_resolved,
+            )
+            .expect("DML RETURNING JSON colon bind positions"),
+            vec![false, true]
+        );
     }
 
     #[test]
