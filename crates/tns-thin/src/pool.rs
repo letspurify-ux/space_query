@@ -31,6 +31,7 @@ impl Default for PoolOptions {
 
 pub trait PoolableConnection: Sized {
     fn connect_for_pool(config: OracleThinConfig) -> Result<Self, OracleThinError>;
+    fn begin_request_for_pool(&mut self) -> Result<(), OracleThinError>;
     fn is_healthy(&mut self) -> bool;
     fn reset_before_reuse(&mut self) -> Result<(), OracleThinError>;
     fn mark_broken(&mut self);
@@ -39,6 +40,10 @@ pub trait PoolableConnection: Sized {
 impl PoolableConnection for OracleThinSession {
     fn connect_for_pool(config: OracleThinConfig) -> Result<Self, OracleThinError> {
         OracleThinSession::connect(config)
+    }
+
+    fn begin_request_for_pool(&mut self) -> Result<(), OracleThinError> {
+        OracleThinSession::begin_request(self)
     }
 
     fn is_healthy(&mut self) -> bool {
@@ -110,6 +115,15 @@ impl OracleThinSessionPool {
                 let mut conn = conn;
                 let healthy = conn.is_healthy();
                 if healthy {
+                    if conn.begin_request_for_pool().is_err() {
+                        drop(conn);
+                        guard =
+                            self.inner.mutex.lock().map_err(|_| {
+                                OracleThinError::new("Oracle thin pool lock poisoned")
+                            })?;
+                        guard.open_count = guard.open_count.saturating_sub(1);
+                        continue;
+                    }
                     return Ok(PooledThinConnection::new(Arc::clone(&self.inner), conn));
                 }
                 drop(conn);
@@ -126,8 +140,16 @@ impl OracleThinSessionPool {
                 let config = self.inner.config.clone();
                 drop(guard);
                 match OracleThinSession::connect_for_pool(config) {
-                    Ok(conn) => {
-                        return Ok(PooledThinConnection::new(Arc::clone(&self.inner), conn))
+                    Ok(mut conn) => {
+                        if let Err(err) = conn.begin_request_for_pool() {
+                            guard = self.inner.mutex.lock().map_err(|_| {
+                                OracleThinError::new("Oracle thin pool lock poisoned")
+                            })?;
+                            guard.open_count = guard.open_count.saturating_sub(1);
+                            self.inner.condvar.notify_one();
+                            return Err(err);
+                        }
+                        return Ok(PooledThinConnection::new(Arc::clone(&self.inner), conn));
                     }
                     Err(err) => {
                         guard =
@@ -194,6 +216,15 @@ fn acquire_from_pool<T: PoolableConnection>(
             let mut conn = conn;
             let healthy = conn.is_healthy();
             if healthy {
+                if conn.begin_request_for_pool().is_err() {
+                    drop(conn);
+                    guard = state
+                        .mutex
+                        .lock()
+                        .map_err(|_| OracleThinError::new("Oracle thin pool lock poisoned"))?;
+                    guard.open_count = guard.open_count.saturating_sub(1);
+                    continue;
+                }
                 return Ok(PooledThinConnection::new(Arc::clone(&state), conn));
             }
             drop(conn);
@@ -209,7 +240,18 @@ fn acquire_from_pool<T: PoolableConnection>(
             let config = state.config.clone();
             drop(guard);
             match T::connect_for_pool(config) {
-                Ok(conn) => return Ok(PooledThinConnection::new(Arc::clone(&state), conn)),
+                Ok(mut conn) => {
+                    if let Err(err) = conn.begin_request_for_pool() {
+                        guard = state
+                            .mutex
+                            .lock()
+                            .map_err(|_| OracleThinError::new("Oracle thin pool lock poisoned"))?;
+                        guard.open_count = guard.open_count.saturating_sub(1);
+                        state.condvar.notify_one();
+                        return Err(err);
+                    }
+                    return Ok(PooledThinConnection::new(Arc::clone(&state), conn));
+                }
                 Err(err) => {
                     guard = state
                         .mutex

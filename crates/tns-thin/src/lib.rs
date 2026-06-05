@@ -9,11 +9,11 @@ use std::sync::Mutex;
 
 use once_cell::sync::OnceCell;
 
-pub use connect::{ConnectOptions, ConnectTarget, OracleNetConnector};
+pub use connect::{ConnectOptions, ConnectTarget, OracleNetConnector, OracleNetServerType};
 pub use pool::OracleThinSessionPool;
 pub use session::{
     OracleThinAppContext, OracleThinAuthMode, OracleThinCancelHandle, OracleThinConfig,
-    OracleThinPurity, OracleThinSession,
+    OracleThinPurity, OracleThinSession, OracleThinWarning,
 };
 
 type ConnectPhaseLogger = Box<dyn Fn(&str, &str) + Send + Sync + 'static>;

@@ -6,8 +6,10 @@ use tns_thin::exec::{
     BindInputValue, BindValue, OracleColumnType, OracleIntervalDaySecond, OracleIntervalYearMonth,
     OracleValue, OracleVectorValue, StatementRequest,
 };
+use tns_thin::pool::PoolOptions;
 use tns_thin::{
-    ConnectTarget, OracleDateTime, OracleThinAppContext, OracleThinConfig, OracleThinSession,
+    ConnectTarget, OracleDateTime, OracleNetServerType, OracleThinAppContext, OracleThinConfig,
+    OracleThinSession, OracleThinSessionPool,
 };
 
 static OBJECT_COUNTER: AtomicUsize = AtomicUsize::new(1);
@@ -47,6 +49,143 @@ fn ping_sends_server_round_trip_and_keeps_session_reusable() {
     let result = conn
         .query_described_fetch_all("SELECT 1 AS value FROM dual", 1)
         .expect("query after thin ping");
+
+    assert_eq!(
+        rows_to_strings(&result.result.rows),
+        vec![vec!["1".to_string()]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn request_boundaries_begin_and_end_round_trip_like_python_oracledb() {
+    let mut conn = connect();
+    if !conn.capabilities().supports_request_boundaries {
+        eprintln!("skipping request boundary test: negotiated protocol does not support it");
+        return;
+    }
+
+    conn.begin_request().expect("begin request boundary");
+    let result = conn
+        .query_described_fetch_all("SELECT 1 AS value FROM dual", 1)
+        .expect("query inside request boundary");
+    conn.end_request().expect("end request boundary");
+    conn.ping()
+        .expect("connection reusable after request boundary");
+
+    assert_eq!(
+        rows_to_strings(&result.result.rows),
+        vec![vec!["1".to_string()]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn dedicated_server_type_connects_like_python_oracledb_descriptor() {
+    let mut config = live_config();
+    config.target = config
+        .target
+        .with_server_type(OracleNetServerType::Dedicated);
+    let mut conn = connect_with_config(config);
+    let result = conn
+        .query_described_fetch_all("SELECT 1 AS value FROM dual", 1)
+        .expect("query through dedicated server type descriptor");
+
+    assert_eq!(
+        rows_to_strings(&result.result.rows),
+        vec![vec!["1".to_string()]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn configured_network_options_connect_like_python_oracledb_descriptor() {
+    let mut config = live_config();
+    config.connect_options.expire_time = 1;
+    config.connect_options.tcp_connect_timeout = Duration::from_secs(5);
+    config.connect_options.sdu = 16_384;
+    let mut conn = connect_with_config(config);
+    let result = conn
+        .query_described_fetch_all("SELECT 1 AS value FROM dual", 1)
+        .expect("query through configured network connect options");
+
+    assert_eq!(
+        rows_to_strings(&result.result.rows),
+        vec![vec!["1".to_string()]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn connection_id_connects_like_python_oracledb_descriptor() {
+    let mut config = live_config();
+    config.connect_options.connection_id = Some("spacequerylive".to_string());
+    config.connect_options.connection_id_prefix = Some("sq-".to_string());
+    let mut conn = connect_with_config(config);
+    let result = conn
+        .query_described_fetch_all("SELECT 1 AS value FROM dual", 1)
+        .expect("query through connection id descriptor");
+
+    assert_eq!(
+        rows_to_strings(&result.result.rows),
+        vec![vec!["1".to_string()]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn invalid_service_refuse_reports_ora_12514_like_python_oracledb() {
+    let mut config = live_config();
+    config.target = ConnectTarget::service_name(
+        config.target.host.clone(),
+        config.target.port,
+        "SPACE_QUERY_NO_SUCH_SERVICE",
+    );
+    config.connect_options.retry_count = 0;
+    config.connect_options.tcp_connect_timeout = Duration::from_secs(5);
+
+    let err = OracleThinSession::connect(config).expect_err("invalid service should be refused");
+
+    assert!(
+        err.to_string().contains("ORA-12514"),
+        "unexpected invalid service refuse error: {err}"
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn invalid_sid_refuse_reports_ora_12505_like_python_oracledb() {
+    let mut config = live_config();
+    config.target = ConnectTarget::sid(
+        config.target.host.clone(),
+        config.target.port,
+        "SPACE_QUERY_NO_SUCH_SID",
+    );
+    config.connect_options.retry_count = 0;
+    config.connect_options.tcp_connect_timeout = Duration::from_secs(5);
+
+    let err = OracleThinSession::connect(config).expect_err("invalid SID should be refused");
+
+    assert!(
+        err.to_string().contains("ORA-12505"),
+        "unexpected invalid SID refuse error: {err}"
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn sid_target_connects_when_sid_env_is_set_like_go_ora_descriptor() {
+    let Some(sid) = std::env::var("ORACLE_THIN_TEST_SID").ok() else {
+        eprintln!("skipping SID connect test: ORACLE_THIN_TEST_SID is not set");
+        return;
+    };
+    let mut config = live_config();
+    let target = ConnectTarget::sid(config.target.host.clone(), config.target.port, sid);
+    config.target = target;
+    let mut conn = connect_with_config(config);
+    let result = conn
+        .query_described_fetch_all("SELECT 1 AS value FROM dual", 1)
+        .expect("query through SID descriptor");
 
     assert_eq!(
         rows_to_strings(&result.result.rows),
@@ -7736,6 +7875,51 @@ fn ddl_statements_execute_and_take_effect() {
 
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn compilation_warning_is_preserved_and_cleared_like_python_oracledb() {
+    let config = live_config();
+    let function_name = unique_object_name("WARN_F");
+    let mut conn = connect_with_config(config);
+    if conn
+        .capabilities()
+        .protocol_version
+        .is_some_and(|version| version < 315)
+    {
+        eprintln!(
+            "skipping compilation warning test: protocol 314 follows go-ora warning handling"
+        );
+        return;
+    }
+    drop_function_ignore(&mut conn, &function_name);
+
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE FUNCTION {function_name} RETURN NUMBER AS \
+         BEGIN RETURN missing_identifier; END;"
+    ))
+    .expect("create invalid function with compilation warning");
+
+    let warning = conn
+        .last_warning()
+        .expect("invalid PL/SQL creation should preserve warning");
+    assert_eq!(warning.code, 24344);
+    assert!(warning.message.contains("compilation errors"));
+
+    let result = conn
+        .query_described_fetch_all("SELECT 1 FROM dual", 1)
+        .expect("run a successful query after warning");
+    assert_eq!(
+        rows_to_strings(&result.result.rows),
+        vec![vec!["1".to_string()]]
+    );
+    assert!(
+        conn.last_warning().is_none(),
+        "successful calls without warnings should clear the previous warning"
+    );
+
+    drop_function_ignore(&mut conn, &function_name);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn commit_and_auto_commit_make_changes_visible() {
     let config = live_config();
     let table = unique_table_name("TX");
@@ -7775,6 +7959,66 @@ fn commit_and_auto_commit_make_changes_visible() {
         2,
         "auto-committed row must survive a later rollback"
     );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn transaction_in_progress_tracks_dml_and_rollback_like_python_oracledb() {
+    let config = live_config();
+    let table = unique_table_name("TX_STATE");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+
+    conn.query_drop(&format!("CREATE TABLE {table} (id NUMBER PRIMARY KEY)"))
+        .expect("create transaction state table");
+    assert!(!conn.transaction_in_progress());
+
+    conn.query_drop(&format!("INSERT INTO {table} VALUES (1)"))
+        .expect("insert transaction state row");
+    assert!(
+        conn.transaction_in_progress(),
+        "DML should set transaction-in-progress from end-of-call status"
+    );
+
+    conn.rollback().expect("rollback transaction state row");
+    assert!(
+        !conn.transaction_in_progress(),
+        "rollback should clear transaction-in-progress from end-of-call status"
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn pool_return_rolls_back_uncommitted_work_before_reuse() {
+    let config = live_config();
+    let table = unique_table_name("POOL_TX");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut setup = connect_with_config(config.clone());
+    setup
+        .query_drop(&format!("CREATE TABLE {table} (id NUMBER PRIMARY KEY)"))
+        .expect("create pool transaction table");
+
+    let pool = OracleThinSessionPool::new(
+        config,
+        PoolOptions {
+            max_size: 1,
+            acquire_timeout: Duration::from_secs(5),
+        },
+    );
+
+    {
+        let mut conn = pool.acquire().expect("acquire pooled connection");
+        conn.query_drop(&format!("INSERT INTO {table} VALUES (1)"))
+            .expect("insert uncommitted row in pooled connection");
+    }
+
+    let mut conn = pool.acquire().expect("reacquire pooled connection");
+    assert_eq!(
+        select_count(&mut conn, &table),
+        0,
+        "pool reset must rollback uncommitted work before reusing a session"
+    );
+    pool.close();
 }
 
 #[test]

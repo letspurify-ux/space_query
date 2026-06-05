@@ -36,6 +36,7 @@ use sha1::Sha1;
 use sha2::{Digest, Sha512};
 
 use crate::connect::{
+    connect_data_descriptor_parts, connect_description_option_parts,
     validate_connect_descriptor_value, AcceptInfo, ConnectOptions, ConnectTarget,
     OracleNetConnector, TNS_DEFAULT_SOCKET_TIMEOUT, TNS_MIN_SUPPORTED_PROTOCOL,
 };
@@ -84,9 +85,12 @@ const TNS_MSG_TYPE_SERVER_SIDE_PIGGYBACK: u8 = 23;
 const TNS_MSG_TYPE_IMPLICIT_RESULTSET: u8 = 27;
 const TNS_MSG_TYPE_END_OF_RESPONSE: u8 = 29;
 const TNS_MSG_TYPE_TOKEN: u8 = 33;
+const TNS_DEFAULT_TOKEN_NUM: u64 = 0;
 const TNS_ERR_EXCEEDED_IDLE_TIME: u32 = 2396;
 const TNS_ERR_SESSION_SHUTDOWN: u32 = 12572;
 const TNS_ERR_INBAND_MESSAGE: u32 = 12573;
+const TNS_EOCS_FLAGS_TXN_IN_PROGRESS: u32 = 0x00000002;
+const TNS_WARN_COMPILATION_ERROR: u32 = 24344;
 const TNS_SERVER_PIGGYBACK_QUERY_CACHE_INVALIDATION: u8 = 1;
 const TNS_SERVER_PIGGYBACK_OS_PID_MTS: u8 = 2;
 const TNS_SERVER_PIGGYBACK_TRACE_EVENT: u8 = 3;
@@ -96,6 +100,15 @@ const TNS_SERVER_PIGGYBACK_LTXID: u8 = 7;
 const TNS_SERVER_PIGGYBACK_AC_REPLAY_CONTEXT: u8 = 8;
 const TNS_SERVER_PIGGYBACK_EXT_SYNC: u8 = 9;
 const TNS_SERVER_PIGGYBACK_SESS_SIGNATURE: u8 = 10;
+const TNS_KEYWORD_NUM_CURRENT_SCHEMA: u16 = 168;
+const TNS_KEYWORD_NUM_EDITION: u16 = 172;
+const TNS_KEYWORD_NUM_TRANSACTION_ID: u16 = 201;
+const TNS_TPC_TXNID_SYNC_SERVER: u8 = 0x01;
+const TNS_TPC_TXNID_SYNC_SET: u8 = 0x40;
+const TNS_TPC_TXNID_SYNC_UNSET: u8 = 0x80;
+const TNS_SESSION_STATE_REQUEST_BEGIN: u8 = 0x04;
+const TNS_SESSION_STATE_REQUEST_END: u8 = 0x08;
+const TNS_SESSION_STATE_EXPLICIT_BOUNDARY: u8 = 0x40;
 const TNS_FUNC_COMMIT: u8 = 14;
 const TNS_FUNC_ROLLBACK: u8 = 15;
 const TNS_FUNC_LOGOFF: u8 = 9;
@@ -108,6 +121,7 @@ const TNS_FUNC_AUTH_PHASE_TWO: u8 = 115;
 const TNS_FUNC_SET_END_TO_END_ATTR: u8 = 135;
 const TNS_FUNC_PING: u8 = 147;
 const TNS_FUNC_SET_SCHEMA: u8 = 152;
+const TNS_FUNC_SESSION_STATE: u8 = 176;
 const TNS_EXEC_OPTION_PARSE: u32 = 0x0000_0001;
 const TNS_EXEC_OPTION_BIND: u32 = 0x0000_0008;
 const TNS_EXEC_OPTION_DEFINE: u32 = 0x0000_0010;
@@ -220,6 +234,7 @@ const TNS_CCAP_FIELD_VERSION_12_2: u8 = 8;
 const TNS_CCAP_FIELD_VERSION_12_2_EXT1: u8 = 9;
 const TNS_CCAP_FIELD_VERSION_20_1: u8 = 14;
 const TNS_CCAP_FIELD_VERSION_23_1: u8 = 17;
+const TNS_CCAP_FIELD_VERSION_23_1_EXT_1: u8 = 18;
 const TNS_CCAP_FIELD_VERSION_23_1_EXT_3: u8 = 20;
 const TNS_CCAP_FIELD_VERSION_23_4: u8 = 24;
 const TNS_CCAP_FIELD_VERSION_MAX: u8 = TNS_CCAP_FIELD_VERSION_23_4;
@@ -499,13 +514,14 @@ impl OracleThinConfig {
         username: impl Into<String>,
         password: impl Into<String>,
     ) -> Self {
+        let (username, proxy_user) = parse_user_and_proxy(username.into());
         Self {
             target,
-            username: username.into(),
+            username,
             password: password.into(),
             connect_options: ConnectOptions::default(),
             auth_mode: OracleThinAuthMode::Default,
-            proxy_user: None,
+            proxy_user,
             edition: None,
             connection_class: None,
             purity: OracleThinPurity::Default,
@@ -518,6 +534,16 @@ impl OracleThinConfig {
             os_user: "space-query".to_string(),
         }
     }
+}
+
+fn parse_user_and_proxy(username: String) -> (String, Option<String>) {
+    if let Some(start_pos) = username.find('[') {
+        if start_pos > 0 && username.ends_with(']') {
+            let proxy_user = username[start_pos + 1..username.len() - 1].to_string();
+            return (username[..start_pos].to_string(), Some(proxy_user));
+        }
+    }
+    (username, None)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -645,9 +671,17 @@ pub struct OracleThinSession {
     deferred_cursor_parent_by_child: HashMap<u32, u32>,
     pending_current_schema: Option<String>,
     pending_end_to_end: EndToEndAttributes,
+    server_state: ServerSidePiggybackState,
+    in_request: bool,
     cancel_flag: Arc<AtomicBool>,
     ttc_sequence: u8,
     closed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OracleThinWarning {
+    pub code: u32,
+    pub message: String,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -698,6 +732,8 @@ impl OracleThinSession {
             deferred_cursor_parent_by_child: HashMap::new(),
             pending_current_schema: None,
             pending_end_to_end: EndToEndAttributes::default(),
+            server_state: auth.server_state,
+            in_request: false,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             ttc_sequence: 3,
             closed: false,
@@ -714,6 +750,34 @@ impl OracleThinSession {
 
     pub fn connection_id(&self) -> u64 {
         self as *const Self as usize as u64
+    }
+
+    pub fn ltxid(&self) -> &[u8] {
+        &self.server_state.ltxid
+    }
+
+    pub fn server_session_id(&self) -> Option<u32> {
+        self.server_state.session_id
+    }
+
+    pub fn server_serial_num(&self) -> Option<u16> {
+        self.server_state.serial_num
+    }
+
+    pub fn server_current_schema(&self) -> Option<&str> {
+        self.server_state.current_schema.as_deref()
+    }
+
+    pub fn server_edition(&self) -> Option<&str> {
+        self.server_state.edition.as_deref()
+    }
+
+    pub fn sessionless_transaction_id(&self) -> Option<&[u8]> {
+        self.server_state.sessionless_transaction_id.as_deref()
+    }
+
+    pub fn sessionless_transaction_started_on_server(&self) -> bool {
+        self.server_state.sessionless_started_on_server
     }
 
     pub fn set_action(&mut self, value: Option<String>) {
@@ -923,9 +987,12 @@ impl OracleThinSession {
             self.collection_element_by_type.clear();
             self.deferred_cursor_closes.clear();
             self.deferred_cursor_parent_by_child.clear();
+            self.in_request = false;
             Err(OracleThinError::new("Oracle thin session is broken"))
         } else {
             self.flush_pending_cursor_closes()?;
+            self.rollback()?;
+            self.end_request()?;
             Ok(())
         }
     }
@@ -940,6 +1007,30 @@ impl OracleThinSession {
 
     pub fn status(&mut self) -> Result<(), OracleThinError> {
         self.ping()
+    }
+
+    pub fn begin_request(&mut self) -> Result<(), OracleThinError> {
+        if !self.capabilities.supports_request_boundaries || self.in_request {
+            return Ok(());
+        }
+        if self.broken {
+            return Err(OracleThinError::new("Oracle thin session is broken"));
+        }
+        self.send_session_state(TNS_SESSION_STATE_REQUEST_BEGIN)?;
+        self.in_request = true;
+        Ok(())
+    }
+
+    pub fn end_request(&mut self) -> Result<(), OracleThinError> {
+        if !self.capabilities.supports_request_boundaries || !self.in_request {
+            return Ok(());
+        }
+        if self.broken {
+            return Err(OracleThinError::new("Oracle thin session is broken"));
+        }
+        self.send_session_state(TNS_SESSION_STATE_REQUEST_END)?;
+        self.in_request = false;
+        Ok(())
     }
 
     pub fn commit(&mut self) -> Result<(), OracleThinError> {
@@ -1004,7 +1095,11 @@ impl OracleThinSession {
     }
 
     pub fn transaction_in_progress(&self) -> bool {
-        false
+        self.server_state.transaction_in_progress
+    }
+
+    pub fn last_warning(&self) -> Option<&OracleThinWarning> {
+        self.server_state.last_warning.as_ref()
     }
 
     pub fn query_drop(&mut self, sql: &str) -> Result<(), OracleThinError> {
@@ -1480,6 +1575,7 @@ impl OracleThinSession {
             &mut self.stream,
             &self.capabilities,
             &request,
+            &mut self.server_state,
             state,
             close_sequence.is_some(),
         );
@@ -1674,7 +1770,12 @@ impl OracleThinSession {
             self.requeue_pending_cursor_closes(&cursor_ids);
             return Err(error);
         }
-        read_simple_response(&mut self.stream, &self.capabilities, true)
+        read_simple_response(
+            &mut self.stream,
+            &self.capabilities,
+            &mut self.server_state,
+            true,
+        )
     }
 
     pub fn described_columns_require_define_fetch(columns: &[ColumnMetadata]) -> bool {
@@ -1952,6 +2053,7 @@ impl OracleThinSession {
         locator = read_lob_operation_response(
             &mut self.stream,
             &self.capabilities,
+            &mut self.server_state,
             locator.len(),
             false,
             true,
@@ -1992,6 +2094,7 @@ impl OracleThinSession {
         if let Some(updated_locator) = read_lob_operation_response(
             &mut self.stream,
             &self.capabilities,
+            &mut self.server_state,
             locator.len(),
             false,
             false,
@@ -2051,6 +2154,7 @@ impl OracleThinSession {
         read_lob_operation_response(
             &mut self.stream,
             &self.capabilities,
+            &mut self.server_state,
             locator.len(),
             true,
             false,
@@ -2383,6 +2487,7 @@ impl OracleThinSession {
             &mut self.stream,
             &self.capabilities,
             request,
+            &mut self.server_state,
             skip_empty_end_of_response,
         );
         if self.cancel_flag.swap(false, Ordering::SeqCst) {
@@ -2590,12 +2695,43 @@ impl OracleThinSession {
         let response = read_simple_response(
             &mut self.stream,
             &self.capabilities,
+            &mut self.server_state,
             !pending_cursor_closes.is_empty(),
         );
         if self.cancel_flag.swap(false, Ordering::SeqCst) {
             return Err(self.finish_cancelled_read());
         }
         response
+    }
+
+    fn send_session_state(&mut self, session_state: u8) -> Result<(), OracleThinError> {
+        let mut payload = Vec::new();
+        let state_sequence = self.next_ttc_sequence();
+        write_session_state_piggyback(
+            &mut payload,
+            &self.capabilities,
+            state_sequence,
+            session_state,
+        );
+        let ping_sequence = self.next_ttc_sequence();
+        write_function_code(
+            &mut payload,
+            TNS_FUNC_PING,
+            ping_sequence,
+            &self.capabilities,
+        );
+        write_data_packet(
+            &mut self.stream,
+            self.capabilities.protocol_version.unwrap_or(319),
+            self.capabilities.data_packet_chunk_size(),
+            &payload,
+        )?;
+        read_simple_response(
+            &mut self.stream,
+            &self.capabilities,
+            &mut self.server_state,
+            false,
+        )
     }
 
     fn next_ttc_sequence(&mut self) -> u8 {
@@ -2716,6 +2852,7 @@ impl OracleThinSession {
         read_simple_response(
             &mut self.stream,
             &self.capabilities,
+            &mut self.server_state,
             !pending_cursor_closes.is_empty(),
         )
     }
@@ -2993,6 +3130,20 @@ struct ExecuteReadState {
     cursor_id: Option<u32>,
     exhausted: bool,
     done: bool,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ServerSidePiggybackState {
+    ltxid: Vec<u8>,
+    session_id: Option<u32>,
+    serial_num: Option<u16>,
+    session_changed: bool,
+    current_schema: Option<String>,
+    edition: Option<String>,
+    sessionless_transaction_id: Option<Vec<u8>>,
+    sessionless_started_on_server: bool,
+    transaction_in_progress: bool,
+    last_warning: Option<OracleThinWarning>,
 }
 
 trait LastRowSource {
@@ -3355,8 +3506,10 @@ fn default_object_attr_buffer_size(ora_type_num: u8) -> u32 {
 struct ExecuteError {
     code: u32,
     cursor_id: u32,
+    call_status: u32,
     _rowcount: u64,
     message: Option<String>,
+    warning: Option<OracleThinWarning>,
 }
 
 fn execute_flags_for_request(parse_only_describe: bool, request: &StatementRequest) -> u32 {
@@ -5532,12 +5685,14 @@ fn read_execute_response(
     stream: &mut TcpStream,
     capabilities: &OracleThinCapabilities,
     request: &StatementRequest,
+    server_state: &mut ServerSidePiggybackState,
     skip_empty_end_of_response: bool,
 ) -> Result<ExecuteResponse, OracleThinError> {
     read_execute_response_with_state(
         stream,
         capabilities,
         request,
+        server_state,
         ExecuteReadState::default(),
         skip_empty_end_of_response,
     )
@@ -5547,9 +5702,11 @@ fn read_execute_response_with_state(
     stream: &mut TcpStream,
     capabilities: &OracleThinCapabilities,
     request: &StatementRequest,
+    server_state: &mut ServerSidePiggybackState,
     mut state: ExecuteReadState,
     mut skip_empty_end_of_response: bool,
 ) -> Result<ExecuteResponse, OracleThinError> {
+    server_state.last_warning = None;
     if request_is_dml_returning(request) && state.out_bind_columns.is_empty() {
         state.out_bind_columns = request
             .binds
@@ -5623,22 +5780,33 @@ fn read_execute_response_with_state(
                     TNS_MSG_TYPE_IMPLICIT_RESULTSET => {
                         process_implicit_results(&mut cursor, capabilities, &mut state)
                     }
-                    TNS_MSG_TYPE_PARAMETER => process_return_parameters(&mut cursor),
+                    TNS_MSG_TYPE_PARAMETER => {
+                        process_return_parameters(&mut cursor, capabilities, server_state)
+                    }
                     TNS_MSG_TYPE_STATUS => {
-                        let _ = cursor.read_ub4()?;
-                        let _ = cursor.read_ub2()?;
+                        process_status(&mut cursor, capabilities, server_state)?;
                         if !capabilities.supports_end_of_response {
                             state.done = true;
                         }
                         Ok(())
                     }
-                    TNS_MSG_TYPE_TOKEN => {
-                        let _ = cursor.read_ub8()?;
+                    TNS_MSG_TYPE_TOKEN => process_token(&mut cursor, TNS_DEFAULT_TOKEN_NUM),
+                    TNS_MSG_TYPE_WARNING => {
+                        if let Some(warning) = process_warning(&mut cursor, capabilities)? {
+                            server_state.last_warning = Some(warning);
+                        }
                         Ok(())
                     }
-                    TNS_MSG_TYPE_WARNING => process_warning(&mut cursor),
                     TNS_MSG_TYPE_ERROR => {
                         let error = process_execute_error(&mut cursor, capabilities)?;
+                        update_transaction_status_from_call_status(
+                            server_state,
+                            capabilities,
+                            error.call_status,
+                        );
+                        if let Some(warning) = error.warning.clone() {
+                            server_state.last_warning = Some(warning);
+                        }
                         if error.cursor_id != 0 {
                             state.cursor_id = Some(error.cursor_id);
                         }
@@ -5670,7 +5838,7 @@ fn read_execute_response_with_state(
                         Ok(())
                     }
                     TNS_MSG_TYPE_SERVER_SIDE_PIGGYBACK => {
-                        process_server_side_piggyback(&mut cursor)
+                        process_server_side_piggyback(&mut cursor, capabilities, server_state)
                     }
                     TNS_MSG_TYPE_END_OF_RESPONSE => {
                         if !response_had_content {
@@ -5752,8 +5920,10 @@ fn is_incomplete_ttc_packet_error(error: &OracleThinError) -> bool {
 fn read_simple_response(
     stream: &mut TcpStream,
     capabilities: &OracleThinCapabilities,
+    server_state: &mut ServerSidePiggybackState,
     mut skip_empty_end_of_response: bool,
 ) -> Result<(), OracleThinError> {
+    server_state.last_warning = None;
     let mut done = false;
     let mut response_had_content = false;
     while !done {
@@ -5768,14 +5938,21 @@ fn read_simple_response(
             }
             match message_type {
                 TNS_MSG_TYPE_STATUS => {
-                    let _ = cursor.read_ub4()?;
-                    let _ = cursor.read_ub2()?;
+                    process_status(&mut cursor, capabilities, server_state)?;
                     if !capabilities.supports_end_of_response {
                         done = true;
                     }
                 }
                 TNS_MSG_TYPE_ERROR => {
                     let error = process_execute_error(&mut cursor, capabilities)?;
+                    update_transaction_status_from_call_status(
+                        server_state,
+                        capabilities,
+                        error.call_status,
+                    );
+                    if let Some(warning) = error.warning.clone() {
+                        server_state.last_warning = Some(warning);
+                    }
                     if error.code != 0 {
                         return Err(OracleThinError::new(
                             error
@@ -5788,11 +5965,19 @@ fn read_simple_response(
                     }
                 }
                 TNS_MSG_TYPE_TOKEN => {
-                    let _ = cursor.read_ub8()?;
+                    process_token(&mut cursor, TNS_DEFAULT_TOKEN_NUM)?;
                 }
-                TNS_MSG_TYPE_WARNING => process_warning(&mut cursor)?,
-                TNS_MSG_TYPE_PARAMETER => process_return_parameters(&mut cursor)?,
-                TNS_MSG_TYPE_SERVER_SIDE_PIGGYBACK => process_server_side_piggyback(&mut cursor)?,
+                TNS_MSG_TYPE_WARNING => {
+                    if let Some(warning) = process_warning(&mut cursor, capabilities)? {
+                        server_state.last_warning = Some(warning);
+                    }
+                }
+                TNS_MSG_TYPE_PARAMETER => {
+                    process_return_parameters(&mut cursor, capabilities, server_state)?
+                }
+                TNS_MSG_TYPE_SERVER_SIDE_PIGGYBACK => {
+                    process_server_side_piggyback(&mut cursor, capabilities, server_state)?
+                }
                 TNS_MSG_TYPE_END_OF_RESPONSE => {
                     if !response_had_content {
                         skip_empty_end_of_response = false;
@@ -5824,10 +6009,12 @@ fn read_simple_response(
 fn read_lob_operation_response(
     stream: &mut TcpStream,
     capabilities: &OracleThinCapabilities,
+    server_state: &mut ServerSidePiggybackState,
     locator_len: usize,
     read_amount: bool,
     read_create_temp_tail: bool,
 ) -> Result<LobReadResponse, OracleThinError> {
+    server_state.last_warning = None;
     let mut done = false;
     let mut response_had_content = false;
     let mut data = Vec::new();
@@ -5897,8 +6084,7 @@ fn read_lob_operation_response(
                         Ok(())
                     }
                     TNS_MSG_TYPE_STATUS => {
-                        let _ = cursor.read_ub4()?;
-                        let _ = cursor.read_ub2()?;
+                        process_status(&mut cursor, capabilities, server_state)?;
                         if !capabilities.supports_end_of_response {
                             done = true;
                         }
@@ -5906,6 +6092,14 @@ fn read_lob_operation_response(
                     }
                     TNS_MSG_TYPE_ERROR => {
                         let error = process_execute_error(&mut cursor, capabilities)?;
+                        update_transaction_status_from_call_status(
+                            server_state,
+                            capabilities,
+                            error.call_status,
+                        );
+                        if let Some(warning) = error.warning.clone() {
+                            server_state.last_warning = Some(warning);
+                        }
                         if error.code != 0 {
                             Err(OracleThinError::new(error.message.unwrap_or_else(|| {
                                 format!("Oracle error ORA-{:05}", error.code)
@@ -5917,13 +6111,15 @@ fn read_lob_operation_response(
                             Ok(())
                         }
                     }
-                    TNS_MSG_TYPE_TOKEN => {
-                        let _ = cursor.read_ub8()?;
+                    TNS_MSG_TYPE_TOKEN => process_token(&mut cursor, TNS_DEFAULT_TOKEN_NUM),
+                    TNS_MSG_TYPE_WARNING => {
+                        if let Some(warning) = process_warning(&mut cursor, capabilities)? {
+                            server_state.last_warning = Some(warning);
+                        }
                         Ok(())
                     }
-                    TNS_MSG_TYPE_WARNING => process_warning(&mut cursor),
                     TNS_MSG_TYPE_SERVER_SIDE_PIGGYBACK => {
-                        process_server_side_piggyback(&mut cursor)
+                        process_server_side_piggyback(&mut cursor, capabilities, server_state)
                     }
                     TNS_MSG_TYPE_END_OF_RESPONSE => {
                         if response_had_content {
@@ -9928,7 +10124,11 @@ fn decode_oracle_number(bytes: &[u8]) -> Result<String, OracleThinError> {
     Ok(digits)
 }
 
-fn process_return_parameters(cursor: &mut PacketCursor<'_>) -> Result<(), OracleThinError> {
+fn process_return_parameters(
+    cursor: &mut PacketCursor<'_>,
+    capabilities: &OracleThinCapabilities,
+    state: &mut ServerSidePiggybackState,
+) -> Result<(), OracleThinError> {
     let num_params = cursor.read_ub2()? as usize;
     for _ in 0..num_params {
         let _ = cursor.read_ub4()?;
@@ -9939,15 +10139,33 @@ fn process_return_parameters(cursor: &mut PacketCursor<'_>) -> Result<(), Oracle
     }
     let num_pairs = cursor.read_ub2()? as usize;
     for _ in 0..num_pairs {
+        let mut text_value = None;
+        let mut binary_value = None;
         let text_len = cursor.read_ub2()?;
         if text_len > 0 {
-            let _ = cursor.read_bytes()?;
+            if let Some(bytes) = cursor.read_bytes()? {
+                text_value = Some(decode_oracle_text(&bytes, CS_FORM_IMPLICIT, capabilities)?);
+            }
         }
         let binary_len = cursor.read_ub2()?;
         if binary_len > 0 {
-            let _ = cursor.read_bytes()?;
+            binary_value = cursor.read_bytes()?;
         }
-        let _ = cursor.read_ub2()?;
+        let keyword_num = cursor.read_ub2()?;
+        match keyword_num {
+            TNS_KEYWORD_NUM_CURRENT_SCHEMA => {
+                state.current_schema = text_value;
+            }
+            TNS_KEYWORD_NUM_EDITION => {
+                state.edition = text_value;
+            }
+            TNS_KEYWORD_NUM_TRANSACTION_ID => {
+                if let Some(value) = binary_value {
+                    update_sessionless_transaction_state(state, &value)?;
+                }
+            }
+            _ => {}
+        }
     }
     let num_bytes = cursor.read_ub2()? as usize;
     if num_bytes > 0 {
@@ -9956,11 +10174,44 @@ fn process_return_parameters(cursor: &mut PacketCursor<'_>) -> Result<(), Oracle
     Ok(())
 }
 
-fn process_server_side_piggyback(cursor: &mut PacketCursor<'_>) -> Result<(), OracleThinError> {
+fn update_sessionless_transaction_state(
+    state: &mut ServerSidePiggybackState,
+    data: &[u8],
+) -> Result<(), OracleThinError> {
+    if data.len() < 2 {
+        return Err(OracleThinError::new(
+            "short Oracle sessionless transaction sync data",
+        ));
+    }
+    let transaction_id = &data[..data.len() - 2];
+    let sessionless_state = data[data.len() - 2];
+    let sync_version = data[data.len() - 1];
+    if sync_version != 1 {
+        return Err(OracleThinError::new(format!(
+            "unknown Oracle sessionless transaction sync version {sync_version}"
+        )));
+    }
+    if sessionless_state & TNS_TPC_TXNID_SYNC_UNSET != 0 {
+        state.sessionless_transaction_id = None;
+        state.sessionless_started_on_server = false;
+        state.transaction_in_progress = false;
+    } else if sessionless_state & TNS_TPC_TXNID_SYNC_SET != 0 {
+        state.sessionless_transaction_id = Some(transaction_id.to_vec());
+        state.sessionless_started_on_server = sessionless_state & TNS_TPC_TXNID_SYNC_SERVER != 0;
+        state.transaction_in_progress = true;
+    }
+    Ok(())
+}
+
+fn process_server_side_piggyback(
+    cursor: &mut PacketCursor<'_>,
+    capabilities: &OracleThinCapabilities,
+    state: &mut ServerSidePiggybackState,
+) -> Result<(), OracleThinError> {
     let opcode = cursor.read_u8()?;
     match opcode {
         TNS_SERVER_PIGGYBACK_LTXID => {
-            cursor.skip_bytes_with_ub4_length()?;
+            state.ltxid = cursor.read_bytes_with_ub4_length()?.unwrap_or_default();
         }
         TNS_SERVER_PIGGYBACK_QUERY_CACHE_INVALIDATION | TNS_SERVER_PIGGYBACK_TRACE_EVENT => {}
         TNS_SERVER_PIGGYBACK_OS_PID_MTS => {
@@ -9972,7 +10223,7 @@ fn process_server_side_piggyback(cursor: &mut PacketCursor<'_>) -> Result<(), Or
             cursor.skip(1)?;
             let num_elements = cursor.read_ub2()? as usize;
             cursor.skip(1)?;
-            process_keyword_value_pairs(cursor, num_elements)?;
+            process_keyword_value_pairs(cursor, num_elements, capabilities, state)?;
             let _ = cursor.read_ub4()?;
         }
         TNS_SERVER_PIGGYBACK_EXT_SYNC => {
@@ -10003,9 +10254,10 @@ fn process_server_side_piggyback(cursor: &mut PacketCursor<'_>) -> Result<(), Or
                     let _ = cursor.read_ub2()?;
                 }
             }
-            let _ = cursor.read_ub4()?;
-            let _ = cursor.read_ub4()?;
-            let _ = cursor.read_ub2()?;
+            let flags = cursor.read_ub4()?;
+            state.session_changed = flags & 4 != 0;
+            state.session_id = Some(cursor.read_ub4()?);
+            state.serial_num = Some(cursor.read_ub2()?);
         }
         TNS_SERVER_PIGGYBACK_SESS_SIGNATURE => {
             let _ = cursor.read_ub2()?;
@@ -10026,25 +10278,83 @@ fn process_server_side_piggyback(cursor: &mut PacketCursor<'_>) -> Result<(), Or
 fn process_keyword_value_pairs(
     cursor: &mut PacketCursor<'_>,
     num_pairs: usize,
+    capabilities: &OracleThinCapabilities,
+    state: &mut ServerSidePiggybackState,
 ) -> Result<(), OracleThinError> {
     for _ in 0..num_pairs {
+        let mut text_value = None;
+        let mut binary_value = None;
         if cursor.read_ub2()? > 0 {
-            cursor.skip_bytes()?;
+            if let Some(bytes) = cursor.read_bytes()? {
+                text_value = Some(decode_oracle_text(&bytes, CS_FORM_IMPLICIT, capabilities)?);
+            }
         }
         if cursor.read_ub2()? > 0 {
-            cursor.skip_bytes()?;
+            binary_value = cursor.read_bytes()?;
         }
-        let _ = cursor.read_ub2()?;
+        let keyword_num = cursor.read_ub2()?;
+        match keyword_num {
+            TNS_KEYWORD_NUM_CURRENT_SCHEMA => {
+                state.current_schema = text_value;
+            }
+            TNS_KEYWORD_NUM_EDITION => {
+                state.edition = text_value;
+            }
+            TNS_KEYWORD_NUM_TRANSACTION_ID => {
+                if let Some(value) = binary_value {
+                    update_sessionless_transaction_state(state, &value)?;
+                }
+            }
+            _ => {}
+        }
     }
     Ok(())
 }
 
-fn process_warning(cursor: &mut PacketCursor<'_>) -> Result<(), OracleThinError> {
-    let _ = cursor.read_ub2()?;
+fn process_warning(
+    cursor: &mut PacketCursor<'_>,
+    capabilities: &OracleThinCapabilities,
+) -> Result<Option<OracleThinWarning>, OracleThinError> {
+    let code = u32::from(cursor.read_ub2()?);
     let num_bytes = cursor.read_ub2()?;
     let _ = cursor.read_ub2()?;
-    if num_bytes > 0 {
-        let _ = cursor.read_bytes()?;
+    if code == 0 || num_bytes == 0 {
+        return Ok(None);
+    }
+    let bytes = cursor.read_raw(num_bytes as usize)?;
+    let message = decode_oracle_text(bytes, CS_FORM_IMPLICIT, capabilities)?
+        .trim_end()
+        .to_string();
+    Ok(Some(OracleThinWarning { code, message }))
+}
+
+fn process_status(
+    cursor: &mut PacketCursor<'_>,
+    capabilities: &OracleThinCapabilities,
+    state: &mut ServerSidePiggybackState,
+) -> Result<(), OracleThinError> {
+    let call_status = cursor.read_ub4()?;
+    let _ = cursor.read_ub2()?;
+    update_transaction_status_from_call_status(state, capabilities, call_status);
+    Ok(())
+}
+
+fn update_transaction_status_from_call_status(
+    state: &mut ServerSidePiggybackState,
+    capabilities: &OracleThinCapabilities,
+    call_status: u32,
+) {
+    if capabilities.supports_end_of_call_status {
+        state.transaction_in_progress = call_status & TNS_EOCS_FLAGS_TXN_IN_PROGRESS != 0;
+    }
+}
+
+fn process_token(cursor: &mut PacketCursor<'_>, expected: u64) -> Result<(), OracleThinError> {
+    let token = cursor.read_ub8()?;
+    if token != expected {
+        return Err(OracleThinError::new(format!(
+            "mismatched Oracle token number {token}; expected {expected}"
+        )));
     }
     Ok(())
 }
@@ -10060,7 +10370,7 @@ fn process_execute_error(
         return process_legacy_execute_error(cursor, capabilities);
     }
 
-    let _ = cursor.read_ub4()?;
+    let call_status = cursor.read_ub4()?;
     let _ = cursor.read_ub2()?;
     let _ = cursor.read_ub4()?;
     let _ = cursor.read_ub2()?;
@@ -10068,7 +10378,8 @@ fn process_execute_error(
     let _ = cursor.read_ub2()?;
     let cursor_id = cursor.read_ub2()? as u32;
     let error_pos = cursor.read_sb2()?;
-    cursor.skip(6)?;
+    cursor.skip(5)?;
+    let flags = cursor.read_u8()?;
     let _ = cursor.read_ub4()?;
     let _ = cursor.read_ub2()?;
     cursor.skip(1)?;
@@ -10125,11 +10436,21 @@ fn process_execute_error(
         let _ = cursor.read_ub4()?;
     }
     let message = execute_error_message(cursor, code, error_pos)?;
+    let warning = if flags & 0x20 != 0 {
+        Some(OracleThinWarning {
+            code: TNS_WARN_COMPILATION_ERROR,
+            message: "creation succeeded with compilation errors".to_string(),
+        })
+    } else {
+        None
+    };
     Ok(ExecuteError {
         code,
         cursor_id,
+        call_status,
         _rowcount: rowcount,
         message,
+        warning,
     })
 }
 
@@ -10137,9 +10458,11 @@ fn process_legacy_execute_error(
     cursor: &mut PacketCursor<'_>,
     capabilities: &OracleThinCapabilities,
 ) -> Result<ExecuteError, OracleThinError> {
-    if capabilities.supports_end_of_call_status {
-        let _ = cursor.read_ub4()?;
-    }
+    let call_status = if capabilities.supports_end_of_call_status {
+        cursor.read_ub4()?
+    } else {
+        0
+    };
     if capabilities.ttc_field_version >= 3 && capabilities.supports_fast_session_attributes {
         let _ = cursor.read_ub2()?;
     }
@@ -10234,8 +10557,10 @@ fn process_legacy_execute_error(
     Ok(ExecuteError {
         code,
         cursor_id,
+        call_status,
         _rowcount: rowcount,
         message,
+        warning: None,
     })
 }
 
@@ -10286,6 +10611,7 @@ fn execute_legacy_error_message(
 struct AuthResult {
     server_version: Option<String>,
     combo_key: Option<Vec<u8>>,
+    server_state: ServerSidePiggybackState,
 }
 
 #[derive(Debug, Default)]
@@ -10294,6 +10620,7 @@ struct AuthState {
     verifier_type: u32,
     combo_key: Option<Vec<u8>>,
     server_version: Option<String>,
+    server_state: ServerSidePiggybackState,
     auth_uses_pbkdf2_key_derivation: bool,
 }
 
@@ -10328,6 +10655,7 @@ fn authenticate(
     Ok(AuthResult {
         server_version: state.server_version,
         combo_key: state.combo_key,
+        server_state: state.server_state,
     })
 }
 
@@ -10523,7 +10851,7 @@ fn write_function_code(
     payload.push(TNS_MSG_TYPE_FUNCTION);
     payload.push(function_code);
     payload.push(sequence);
-    if capabilities.ttc_field_version >= 18 {
+    if capabilities.ttc_field_version >= TNS_CCAP_FIELD_VERSION_23_1_EXT_1 {
         write_ub8(payload, 0);
     }
 }
@@ -10537,9 +10865,22 @@ fn write_piggyback_code(
     payload.push(TNS_MSG_TYPE_PIGGYBACK);
     payload.push(function_code);
     payload.push(sequence);
-    if capabilities.ttc_field_version >= 18 {
+    if capabilities.ttc_field_version >= TNS_CCAP_FIELD_VERSION_23_1_EXT_1 {
         write_ub8(payload, 0);
     }
+}
+
+fn write_session_state_piggyback(
+    payload: &mut Vec<u8>,
+    capabilities: &OracleThinCapabilities,
+    sequence: u8,
+    state: u8,
+) {
+    write_piggyback_code(payload, TNS_FUNC_SESSION_STATE, sequence, capabilities);
+    write_ub8(
+        payload,
+        u64::from(state | TNS_SESSION_STATE_EXPLICIT_BOUNDARY),
+    );
 }
 
 fn write_key_value(
@@ -10975,14 +11316,21 @@ fn process_auth_payload(
         match message_type {
             TNS_MSG_TYPE_PARAMETER => process_auth_parameters(&mut cursor, state)?,
             TNS_MSG_TYPE_STATUS => {
-                let _ = cursor.read_ub4()?;
-                let _ = cursor.read_ub2()?;
+                process_status(&mut cursor, capabilities, &mut state.server_state)?;
             }
             TNS_MSG_TYPE_TOKEN => {
-                let _ = cursor.read_ub8()?;
+                process_token(&mut cursor, TNS_DEFAULT_TOKEN_NUM)?;
             }
             TNS_MSG_TYPE_ERROR => {
                 let error = process_execute_error(&mut cursor, capabilities)?;
+                update_transaction_status_from_call_status(
+                    &mut state.server_state,
+                    capabilities,
+                    error.call_status,
+                );
+                if let Some(warning) = error.warning.clone() {
+                    state.server_state.last_warning = Some(warning);
+                }
                 if error.code != 0 {
                     return Err(OracleThinError::new(
                         error
@@ -10992,8 +11340,14 @@ fn process_auth_payload(
                 }
                 break;
             }
-            TNS_MSG_TYPE_WARNING => process_warning(&mut cursor)?,
-            TNS_MSG_TYPE_SERVER_SIDE_PIGGYBACK => process_server_side_piggyback(&mut cursor)?,
+            TNS_MSG_TYPE_WARNING => {
+                if let Some(warning) = process_warning(&mut cursor, capabilities)? {
+                    state.server_state.last_warning = Some(warning);
+                }
+            }
+            TNS_MSG_TYPE_SERVER_SIDE_PIGGYBACK => {
+                process_server_side_piggyback(&mut cursor, capabilities, &mut state.server_state)?
+            }
             TNS_MSG_TYPE_END_OF_RESPONSE => break,
             other => {
                 return Err(OracleThinError::new(format!(
@@ -11161,15 +11515,18 @@ fn hex_encode_upper(bytes: &[u8]) -> String {
 fn auth_connect_string(config: &OracleThinConfig) -> Result<String, OracleThinError> {
     let target = &config.target;
     validate_connect_descriptor_value("host", &target.host)?;
-    validate_connect_descriptor_value("service_name", &target.service_name)?;
     validate_connect_descriptor_value("program", &config.program)?;
     validate_connect_descriptor_value("machine", &config.machine)?;
     validate_connect_descriptor_value("os_user", &config.os_user)?;
+    let description_options = connect_description_option_parts(&config.connect_options);
+    let connect_data =
+        connect_data_descriptor_parts(target, config.connect_options.desired_protocol_version)?;
     Ok(format!(
-        "(DESCRIPTION=(ADDRESS=(PROTOCOL=tcp)(HOST={})(PORT={}))(CONNECT_DATA=(SERVICE_NAME={})(CID=(PROGRAM={})(HOST={})(USER={}))))",
+        "(DESCRIPTION={}(ADDRESS=(PROTOCOL=tcp)(HOST={})(PORT={}))(CONNECT_DATA={}(CID=(PROGRAM={})(HOST={})(USER={}))))",
+        description_options,
         target.host,
         target.port,
-        target.service_name,
+        connect_data,
         config.program,
         config.machine,
         config.os_user
@@ -12543,41 +12900,45 @@ mod tests {
         TNS_DATA_TYPE_VCS, TNS_DATA_TYPE_VNU, TNS_DATA_TYPE_VST, TNS_DEFAULT_SDU,
         TNS_DURATION_SESSION, TNS_END_TO_END_ACTION, TNS_END_TO_END_CLIENT_IDENTIFIER,
         TNS_END_TO_END_CLIENT_INFO, TNS_END_TO_END_DBOP, TNS_END_TO_END_MODULE,
-        TNS_ERR_INBAND_MESSAGE, TNS_EXEC_FLAGS_IMPLICIT_RESULTSET, TNS_FUNC_AUTH_PHASE_ONE,
-        TNS_FUNC_AUTH_PHASE_TWO, TNS_FUNC_LOB_OP, TNS_FUNC_PING, TNS_FUNC_SET_END_TO_END_ATTR,
-        TNS_FUNC_SET_SCHEMA, TNS_JSON_TYPE_ID, TNS_LOB_LOC_FLAGS_LITTLE_ENDIAN,
-        TNS_LOB_LOC_FLAGS_VAR_LENGTH_CHARSET, TNS_LOB_LOC_OFFSET_FLAG_3, TNS_LOB_LOC_OFFSET_FLAG_4,
-        TNS_LOB_OP_ARRAY, TNS_LOB_OP_CREATE_TEMP, TNS_LOB_OP_FREE_TEMP, TNS_LOB_PREFETCH_FLAG,
-        TNS_MARKER_TYPE_BREAK, TNS_MARKER_TYPE_INTERRUPT, TNS_MARKER_TYPE_RESET,
-        TNS_MAX_LONG_LENGTH, TNS_MSG_TYPE_END_OF_RESPONSE, TNS_MSG_TYPE_FUNCTION,
-        TNS_MSG_TYPE_PIGGYBACK, TNS_MSG_TYPE_STATUS, TNS_PACKET_TYPE_CONTROL, TNS_PACKET_TYPE_DATA,
-        TNS_PACKET_TYPE_MARKER, TNS_VECTOR_FLAG_NORM, TNS_VECTOR_FLAG_NORM_RESERVED,
+        TNS_EOCS_FLAGS_TXN_IN_PROGRESS, TNS_ERR_INBAND_MESSAGE, TNS_EXEC_FLAGS_IMPLICIT_RESULTSET,
+        TNS_FUNC_AUTH_PHASE_ONE, TNS_FUNC_AUTH_PHASE_TWO, TNS_FUNC_LOB_OP, TNS_FUNC_PING,
+        TNS_FUNC_SESSION_STATE, TNS_FUNC_SET_END_TO_END_ATTR, TNS_FUNC_SET_SCHEMA,
+        TNS_JSON_TYPE_ID, TNS_LOB_LOC_FLAGS_LITTLE_ENDIAN, TNS_LOB_LOC_FLAGS_VAR_LENGTH_CHARSET,
+        TNS_LOB_LOC_OFFSET_FLAG_3, TNS_LOB_LOC_OFFSET_FLAG_4, TNS_LOB_OP_ARRAY,
+        TNS_LOB_OP_CREATE_TEMP, TNS_LOB_OP_FREE_TEMP, TNS_LOB_PREFETCH_FLAG, TNS_MARKER_TYPE_BREAK,
+        TNS_MARKER_TYPE_INTERRUPT, TNS_MARKER_TYPE_RESET, TNS_MAX_LONG_LENGTH,
+        TNS_MSG_TYPE_END_OF_RESPONSE, TNS_MSG_TYPE_FUNCTION, TNS_MSG_TYPE_PIGGYBACK,
+        TNS_MSG_TYPE_STATUS, TNS_PACKET_TYPE_CONTROL, TNS_PACKET_TYPE_DATA, TNS_PACKET_TYPE_MARKER,
+        TNS_SESSION_STATE_EXPLICIT_BOUNDARY, TNS_SESSION_STATE_REQUEST_BEGIN,
+        TNS_SESSION_STATE_REQUEST_END, TNS_VECTOR_FLAG_NORM, TNS_VECTOR_FLAG_NORM_RESERVED,
         TNS_VECTOR_FLAG_SPARSE, TNS_VECTOR_FORMAT_BINARY, TNS_VECTOR_FORMAT_FLOAT32,
         TNS_VECTOR_FORMAT_FLOAT64, TNS_VECTOR_FORMAT_INT8, TNS_VECTOR_MAGIC_BYTE,
         TNS_VECTOR_VERSION_BASE, TNS_VECTOR_VERSION_WITH_BINARY, TNS_VECTOR_VERSION_WITH_SPARSE,
     };
     use super::{
         adjust_for_server_compile_caps, adjust_for_server_runtime_caps,
-        alter_session_timezone_statement, auth_change_password_payload, auth_phase_one_payload,
-        auth_phase_two_payload, capabilities_from_accept, client_compile_caps, client_runtime_caps,
-        decode_collection_payload, decode_json_payload, decode_json_payload_value,
-        decode_object_payload, decode_oracle_binary_double, decode_oracle_binary_float,
-        decode_oracle_datetime, decode_oracle_interval_ds, decode_oracle_interval_ym,
-        decode_oracle_number, decode_oracle_text, decode_oracle_vector, decode_oson_to_json,
-        default_ttc_field_version, define_column_metadata, derive_auth_combo_key,
-        des_encrypt_block, encode_auth_password, encode_bfile_locator, encode_debug_jdwp_data,
-        encode_oracle_binary_double, encode_oracle_binary_float, encode_oracle_bind_text,
-        encode_oracle_number, encode_oracle_timestamp_bind, encode_oson_bool_json,
-        encode_oson_date_json, encode_oson_id_json, encode_oson_interval_ds_json,
-        encode_oson_interval_ym_json, encode_oson_json, encode_oson_number_json,
-        encode_oson_raw_json, encode_oson_string_json, encode_oson_timestamp_json,
-        encode_oson_vector_json, encode_physical_rowid, encode_temp_clob_text, encode_vector,
-        execute_flags_for_request, generate_10g_password_hash, generate_11g_password_hash,
+        alter_session_timezone_statement, auth_change_password_payload, auth_connect_string,
+        auth_phase_one_payload, auth_phase_two_payload, capabilities_from_accept,
+        client_compile_caps, client_runtime_caps, decode_collection_payload, decode_json_payload,
+        decode_json_payload_value, decode_object_payload, decode_oracle_binary_double,
+        decode_oracle_binary_float, decode_oracle_datetime, decode_oracle_interval_ds,
+        decode_oracle_interval_ym, decode_oracle_number, decode_oracle_text, decode_oracle_vector,
+        decode_oson_to_json, default_ttc_field_version, define_column_metadata,
+        derive_auth_combo_key, des_encrypt_block, encode_auth_password, encode_bfile_locator,
+        encode_debug_jdwp_data, encode_oracle_binary_double, encode_oracle_binary_float,
+        encode_oracle_bind_text, encode_oracle_number, encode_oracle_timestamp_bind,
+        encode_oson_bool_json, encode_oson_date_json, encode_oson_id_json,
+        encode_oson_interval_ds_json, encode_oson_interval_ym_json, encode_oson_json,
+        encode_oson_number_json, encode_oson_raw_json, encode_oson_string_json,
+        encode_oson_timestamp_json, encode_oson_vector_json, encode_physical_rowid,
+        encode_temp_clob_text, encode_vector, execute_flags_for_request,
+        generate_10g_password_hash, generate_11g_password_hash,
         generate_auth_credentials_from_session_key_parts, hex_encode_upper,
         local_timezone_offset_string, normalize_cursor_ids, normalize_metadata_charset_form,
         oracle_column_type_from_ora_type, oracle_column_type_from_ora_type_for_protocol,
         process_auth_payload, process_describe_body, process_legacy_execute_error,
-        process_protocol_message, process_row_data, read_boolean_value,
+        process_protocol_message, process_return_parameters, process_row_data,
+        process_server_side_piggyback, process_token, process_warning, read_boolean_value,
         read_data_packet_with_control, read_data_packet_with_flags, read_rowid_value,
         read_urowid_value, request_is_dml_returning, request_with_out_bind_types,
         thin_column_from_column_metadata, thin_column_from_object_attr,
@@ -12585,25 +12946,29 @@ mod tests {
         write_bind_rows_for_request, write_bind_value, write_bytes_with_length_for_capabilities,
         write_bytes_with_two_lengths, write_column_metadata, write_current_schema_piggyback,
         write_data_packet, write_data_type_representations, write_end_to_end_piggyback,
-        write_eof_data_packet, write_ub2, write_ub4, write_ub8, AuthCredentials, AuthState,
-        EndToEndAttributes, OracleThinAppContext, OracleThinAuthMode, OracleThinCapabilities,
-        OracleThinConfig, OracleThinPurity, OracleThinSession, OracleValue, PacketCursor,
-        ThinColumn, CS_FORM_IMPLICIT, CS_FORM_NCHAR, ORACLE_CHARSET_AL32UTF8,
-        ORACLE_CHARSET_JA16SJIS, ORACLE_CHARSET_KO16KSC5601, ORACLE_CHARSET_KO16MSWIN949,
-        ORACLE_CHARSET_UTF8, ORACLE_CHARSET_ZHS16GBK, ORACLE_CHARSET_ZHT16BIG5,
-        TNS_CCAP_END_OF_CALL_STATUS, TNS_CCAP_END_OF_RESPONSE, TNS_CCAP_EXPLICIT_BOUNDARY,
-        TNS_CCAP_FIELD_VERSION, TNS_CCAP_FIELD_VERSION_20_1,
-        TNS_CCAP_LEGACY_FAST_SESSION_ATTRIBUTES, TNS_CCAP_OCI1, TNS_CCAP_TTC1, TNS_CCAP_TTC4,
-        TNS_ESCAPE_CHAR, TNS_FUNC_COMMIT, TNS_FUNC_LOGOFF, TNS_JSON_MAX_LENGTH,
-        TNS_LEGACY_CLR_CHUNK_SIZE, TNS_MAX_ROWID_LENGTH, TNS_MAX_UROWID_LENGTH, TNS_MSG_TYPE_ERROR,
-        TNS_MSG_TYPE_PARAMETER, TNS_MSG_TYPE_PROTOCOL, TNS_MSG_TYPE_ROW_DATA,
-        TNS_MSG_TYPE_SERVER_SIDE_PIGGYBACK, TNS_OBJ_HAS_INDEXES, TNS_OBJ_IS_DEGENERATE,
-        TNS_OBJ_NO_PREFIX_SEG, TNS_RCAP_TTC, TNS_RCAP_TTC_32K, TNS_RCAP_TTC_SESSION_STATE_OPS,
-        TNS_RCAP_TTC_ZERO_COPY, TNS_SERVER_PIGGYBACK_TRACE_EVENT, TNS_VERIFIER_TYPE_10G,
-        TNS_VERIFIER_TYPE_11G_1, TNS_VERIFIER_TYPE_11G_2, TNS_VERIFIER_TYPE_12C, TNS_XML_TYPE_LOB,
-        TNS_XML_TYPE_STRING,
+        write_eof_data_packet, write_function_code, write_session_state_piggyback, write_ub2,
+        write_ub4, write_ub8, AuthCredentials, AuthState, EndToEndAttributes, OracleThinAppContext,
+        OracleThinAuthMode, OracleThinCapabilities, OracleThinConfig, OracleThinPurity,
+        OracleThinSession, OracleValue, PacketCursor, ServerSidePiggybackState, ThinColumn,
+        CS_FORM_IMPLICIT, CS_FORM_NCHAR, ORACLE_CHARSET_AL32UTF8, ORACLE_CHARSET_JA16SJIS,
+        ORACLE_CHARSET_KO16KSC5601, ORACLE_CHARSET_KO16MSWIN949, ORACLE_CHARSET_UTF8,
+        ORACLE_CHARSET_ZHS16GBK, ORACLE_CHARSET_ZHT16BIG5, TNS_CCAP_END_OF_CALL_STATUS,
+        TNS_CCAP_END_OF_RESPONSE, TNS_CCAP_EXPLICIT_BOUNDARY, TNS_CCAP_FIELD_VERSION,
+        TNS_CCAP_FIELD_VERSION_20_1, TNS_CCAP_FIELD_VERSION_23_1,
+        TNS_CCAP_FIELD_VERSION_23_1_EXT_1, TNS_CCAP_LEGACY_FAST_SESSION_ATTRIBUTES, TNS_CCAP_OCI1,
+        TNS_CCAP_TTC1, TNS_CCAP_TTC4, TNS_ESCAPE_CHAR, TNS_FUNC_COMMIT, TNS_FUNC_LOGOFF,
+        TNS_FUNC_ROLLBACK, TNS_JSON_MAX_LENGTH, TNS_KEYWORD_NUM_CURRENT_SCHEMA,
+        TNS_KEYWORD_NUM_EDITION, TNS_KEYWORD_NUM_TRANSACTION_ID, TNS_LEGACY_CLR_CHUNK_SIZE,
+        TNS_MAX_ROWID_LENGTH, TNS_MAX_UROWID_LENGTH, TNS_MSG_TYPE_ERROR, TNS_MSG_TYPE_PARAMETER,
+        TNS_MSG_TYPE_PROTOCOL, TNS_MSG_TYPE_ROW_DATA, TNS_MSG_TYPE_SERVER_SIDE_PIGGYBACK,
+        TNS_OBJ_HAS_INDEXES, TNS_OBJ_IS_DEGENERATE, TNS_OBJ_NO_PREFIX_SEG, TNS_RCAP_TTC,
+        TNS_RCAP_TTC_32K, TNS_RCAP_TTC_SESSION_STATE_OPS, TNS_RCAP_TTC_ZERO_COPY,
+        TNS_SERVER_PIGGYBACK_LTXID, TNS_SERVER_PIGGYBACK_SESS_RET,
+        TNS_SERVER_PIGGYBACK_TRACE_EVENT, TNS_TPC_TXNID_SYNC_SERVER, TNS_TPC_TXNID_SYNC_SET,
+        TNS_TPC_TXNID_SYNC_UNSET, TNS_VERIFIER_TYPE_10G, TNS_VERIFIER_TYPE_11G_1,
+        TNS_VERIFIER_TYPE_11G_2, TNS_VERIFIER_TYPE_12C, TNS_XML_TYPE_LOB, TNS_XML_TYPE_STRING,
     };
-    use crate::connect::{AcceptInfo, ConnectOptions, ConnectTarget};
+    use crate::connect::{AcceptInfo, ConnectOptions, ConnectTarget, OracleNetServerType};
     use crate::exec::{
         BindInputValue, BindValue, ColumnMetadata, OracleColumnType, OracleIntervalDaySecond,
         OracleIntervalYearMonth, OracleVectorValue, RefCursorValue, StatementRequest,
@@ -12632,6 +12997,8 @@ mod tests {
             deferred_cursor_parent_by_child: HashMap::new(),
             pending_current_schema: None,
             pending_end_to_end: EndToEndAttributes::default(),
+            server_state: ServerSidePiggybackState::default(),
+            in_request: false,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             ttc_sequence: 3,
             closed: true,
@@ -12674,6 +13041,22 @@ mod tests {
         let mut body = vec![0u8; size - 8];
         stream.read_exact(&mut body).unwrap();
         body
+    }
+
+    fn write_tns_status_response(stream: &mut TcpStream, protocol_version: u16) {
+        write_tns_status_response_with_call_status(stream, protocol_version, 0);
+    }
+
+    fn write_tns_status_response_with_call_status(
+        stream: &mut TcpStream,
+        protocol_version: u16,
+        call_status: u32,
+    ) {
+        let mut response = vec![0, 0, TNS_MSG_TYPE_STATUS];
+        write_ub4(&mut response, call_status);
+        write_ub2(&mut response, 0);
+        let packet = tns_test_packet(protocol_version, TNS_PACKET_TYPE_DATA, &response);
+        stream.write_all(&packet).unwrap();
     }
 
     #[test]
@@ -12823,6 +13206,165 @@ mod tests {
         assert_eq!(
             &ping_body[..],
             &[0, 0, TNS_MSG_TYPE_FUNCTION, TNS_FUNC_PING, 3]
+        );
+    }
+
+    #[test]
+    fn status_call_status_updates_transaction_in_progress_like_python_oracledb() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_one_tns_test_packet(&mut stream, 319);
+            write_tns_status_response_with_call_status(
+                &mut stream,
+                319,
+                TNS_EOCS_FLAGS_TXN_IN_PROGRESS,
+            );
+            read_one_tns_test_packet(&mut stream, 319);
+            write_tns_status_response_with_call_status(&mut stream, 319, 0);
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut session = test_session_with_stream(stream);
+        session.capabilities.supports_end_of_call_status = true;
+
+        session.ping().unwrap();
+        assert!(session.transaction_in_progress());
+        session.ping().unwrap();
+        assert!(!session.transaction_in_progress());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn warning_message_is_preserved_like_python_oracledb() {
+        let caps = OracleThinCapabilities::default();
+        let mut packet = Vec::new();
+        write_ub2(&mut packet, 28002);
+        let message = b"ORA-28002: password will expire soon   ";
+        write_ub2(&mut packet, message.len() as u16);
+        write_ub2(&mut packet, 0);
+        packet.extend_from_slice(message);
+        let mut cursor = PacketCursor::with_capabilities(&packet, &caps);
+
+        let warning = process_warning(&mut cursor, &caps).unwrap().unwrap();
+
+        assert_eq!(warning.code, 28002);
+        assert_eq!(warning.message, "ORA-28002: password will expire soon");
+        assert_eq!(cursor.remaining(), 0);
+    }
+
+    #[test]
+    fn session_state_piggyback_matches_python_oracledb_wire_shape() {
+        let caps = OracleThinCapabilities::default();
+        let mut payload = Vec::new();
+
+        write_session_state_piggyback(&mut payload, &caps, 7, TNS_SESSION_STATE_REQUEST_BEGIN);
+
+        assert_eq!(
+            payload,
+            vec![
+                TNS_MSG_TYPE_PIGGYBACK,
+                TNS_FUNC_SESSION_STATE,
+                7,
+                1,
+                TNS_SESSION_STATE_REQUEST_BEGIN | TNS_SESSION_STATE_EXPLICIT_BOUNDARY
+            ]
+        );
+    }
+
+    #[test]
+    fn begin_and_end_request_send_session_state_piggybacks_like_python_oracledb() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let begin_body = read_tns_test_packet(&mut stream, 319);
+            write_tns_status_response(&mut stream, 319);
+            let end_body = read_tns_test_packet(&mut stream, 319);
+            write_tns_status_response(&mut stream, 319);
+            (begin_body, end_body)
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut session = test_session_with_stream(stream);
+        session.capabilities.supports_request_boundaries = true;
+
+        session.begin_request().unwrap();
+        assert!(session.in_request);
+        session.end_request().unwrap();
+        assert!(!session.in_request);
+        let (begin_body, end_body) = server.join().unwrap();
+
+        assert_eq!(
+            begin_body,
+            vec![
+                0,
+                0,
+                TNS_MSG_TYPE_PIGGYBACK,
+                TNS_FUNC_SESSION_STATE,
+                3,
+                1,
+                TNS_SESSION_STATE_REQUEST_BEGIN | TNS_SESSION_STATE_EXPLICIT_BOUNDARY,
+                TNS_MSG_TYPE_FUNCTION,
+                TNS_FUNC_PING,
+                4
+            ]
+        );
+        assert_eq!(
+            end_body,
+            vec![
+                0,
+                0,
+                TNS_MSG_TYPE_PIGGYBACK,
+                TNS_FUNC_SESSION_STATE,
+                5,
+                1,
+                TNS_SESSION_STATE_REQUEST_END | TNS_SESSION_STATE_EXPLICIT_BOUNDARY,
+                TNS_MSG_TYPE_FUNCTION,
+                TNS_FUNC_PING,
+                6
+            ]
+        );
+    }
+
+    #[test]
+    fn reset_before_reuse_rolls_back_before_ending_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let rollback_body = read_tns_test_packet(&mut stream, 319);
+            write_tns_status_response(&mut stream, 319);
+            let end_body = read_tns_test_packet(&mut stream, 319);
+            write_tns_status_response(&mut stream, 319);
+            (rollback_body, end_body)
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut session = test_session_with_stream(stream);
+        session.capabilities.supports_request_boundaries = true;
+        session.in_request = true;
+
+        session.reset_before_reuse().unwrap();
+        assert!(!session.in_request);
+        let (rollback_body, end_body) = server.join().unwrap();
+
+        assert_eq!(
+            rollback_body,
+            vec![0, 0, TNS_MSG_TYPE_FUNCTION, TNS_FUNC_ROLLBACK, 3]
+        );
+        assert_eq!(
+            end_body,
+            vec![
+                0,
+                0,
+                TNS_MSG_TYPE_PIGGYBACK,
+                TNS_FUNC_SESSION_STATE,
+                4,
+                1,
+                TNS_SESSION_STATE_REQUEST_END | TNS_SESSION_STATE_EXPLICIT_BOUNDARY,
+                TNS_MSG_TYPE_FUNCTION,
+                TNS_FUNC_PING,
+                5
+            ]
         );
     }
 
@@ -17715,7 +18257,7 @@ mod tests {
         assert_eq!(cursor.read_u8().unwrap(), TNS_MSG_TYPE_FUNCTION);
         assert_eq!(cursor.read_u8().unwrap(), expected_function_code);
         assert_eq!(cursor.read_u8().unwrap(), expected_sequence);
-        if capabilities.ttc_field_version >= 18 {
+        if capabilities.ttc_field_version >= TNS_CCAP_FIELD_VERSION_23_1_EXT_1 {
             assert_eq!(cursor.read_ub8().unwrap(), 0);
         }
         assert_eq!(cursor.read_u8().unwrap(), 1);
@@ -17748,6 +18290,25 @@ mod tests {
     }
 
     #[test]
+    fn function_code_writes_token_slot_starting_at_python_oracledb_23_1_ext1() {
+        let mut before_caps = OracleThinCapabilities {
+            ttc_field_version: TNS_CCAP_FIELD_VERSION_23_1,
+            ..OracleThinCapabilities::default()
+        };
+        let mut payload = Vec::new();
+        write_function_code(&mut payload, TNS_FUNC_PING, 7, &before_caps);
+        assert_eq!(payload, vec![TNS_MSG_TYPE_FUNCTION, TNS_FUNC_PING, 7]);
+
+        before_caps.ttc_field_version = TNS_CCAP_FIELD_VERSION_23_1_EXT_1;
+        let mut payload = Vec::new();
+        write_function_code(&mut payload, TNS_FUNC_PING, 7, &before_caps);
+
+        assert_eq!(payload.len(), 4);
+        assert_eq!(&payload[..3], &[TNS_MSG_TYPE_FUNCTION, TNS_FUNC_PING, 7]);
+        assert_eq!(payload[3], 0);
+    }
+
+    #[test]
     fn auth_phase_one_writes_terminal_and_process_metadata_like_python_oracledb() {
         let mut config = OracleThinConfig::new(
             ConnectTarget::service_name("dbhost", 1521, "XE"),
@@ -17777,6 +18338,53 @@ mod tests {
                 ("AUTH_PID".to_string(), std::process::id().to_string(), 0),
                 ("AUTH_SID".to_string(), "iceblue".to_string(), 0),
             ]
+        );
+    }
+
+    #[test]
+    fn config_new_parses_proxy_user_suffix_like_python_oracledb() {
+        let config = OracleThinConfig::new(
+            ConnectTarget::service_name("dbhost", 1521, "FREEPDB1"),
+            "app_user[real_user]",
+            "password",
+        );
+
+        assert_eq!(config.username, "app_user");
+        assert_eq!(config.proxy_user.as_deref(), Some("real_user"));
+    }
+
+    #[test]
+    fn auth_payload_uses_parsed_proxy_user_suffix_like_python_oracledb() {
+        let config = OracleThinConfig::new(
+            ConnectTarget::service_name("dbhost", 1521, "FREEPDB1"),
+            "app_user[real_user]",
+            "password",
+        );
+        let credentials = AuthCredentials {
+            session_key: "session-key".to_string(),
+            speedy_key: Some("speedy-key".to_string()),
+            password: "encoded-password".to_string(),
+            debug_jdwp_data: None,
+        };
+
+        let payload =
+            auth_phase_two_payload(&config, &OracleThinCapabilities::default(), &credentials)
+                .unwrap();
+        let (auth_mode, pairs) = read_auth_key_values(
+            &payload,
+            &OracleThinCapabilities::default(),
+            TNS_FUNC_AUTH_PHASE_TWO,
+            2,
+        );
+
+        assert_eq!(auth_mode, TNS_AUTH_MODE_LOGON | TNS_AUTH_MODE_WITH_PASSWORD);
+        assert_eq!(config.username, "app_user");
+        assert_eq!(
+            pairs
+                .iter()
+                .find(|(key, _, _)| key == "PROXY_CLIENT_NAME")
+                .map(|(_, value, flags)| (value.as_str(), *flags)),
+            Some(("real_user", 0))
         );
     }
 
@@ -17905,6 +18513,119 @@ mod tests {
             .expect_err("invalid program should fail before writing auth connect string");
 
         assert!(err.to_string().contains("program"));
+    }
+
+    #[test]
+    fn auth_connect_string_includes_description_options_like_python_oracledb() {
+        let mut config = OracleThinConfig::new(
+            ConnectTarget::service_name("dbhost", 1521, "FREEPDB1"),
+            "system",
+            "password",
+        );
+        config.connect_options.expire_time = 10;
+        config.connect_options.tcp_connect_timeout = Duration::from_millis(1500);
+        config.connect_options.sdu = 131_072;
+
+        let connect_string = auth_connect_string(&config).unwrap();
+
+        assert!(connect_string.starts_with(
+            "(DESCRIPTION=(EXPIRE_TIME=10)\
+             (TRANSPORT_CONNECT_TIMEOUT=1500ms)(SDU=131072)"
+        ));
+        assert!(!connect_string.contains("RETRY_COUNT="));
+        assert!(connect_string.contains("(CONNECT_DATA=(SERVICE_NAME=FREEPDB1)(CID="));
+    }
+
+    #[test]
+    fn auth_connect_string_keeps_connection_id_out_of_auth_payload() {
+        let mut config = OracleThinConfig::new(
+            ConnectTarget::service_name("dbhost", 1521, "FREEPDB1"),
+            "system",
+            "password",
+        );
+        config.connect_options.connection_id = Some("abc123".to_string());
+        config.connect_options.connection_id_prefix = Some("space-".to_string());
+
+        let connect_string = auth_connect_string(&config).unwrap();
+
+        assert!(connect_string.contains(
+            "(CONNECT_DATA=(SERVICE_NAME=FREEPDB1)\
+             (CID=(PROGRAM=space-query-thin)(HOST=localhost)(USER=space-query)))"
+        ));
+        assert!(!connect_string.contains("CONNECTION_ID="));
+    }
+
+    #[test]
+    fn modern_auth_connect_string_prefers_instance_over_sid_like_python_oracledb() {
+        let config = OracleThinConfig::new(
+            ConnectTarget::sid("dbhost", 1521, "ORCL")
+                .with_instance_name("inst1")
+                .with_server_type(OracleNetServerType::Pooled),
+            "system",
+            "password",
+        );
+        let credentials = AuthCredentials {
+            session_key: "session-key".to_string(),
+            speedy_key: None,
+            password: "encoded-password".to_string(),
+            debug_jdwp_data: None,
+        };
+
+        let payload =
+            auth_phase_two_payload(&config, &OracleThinCapabilities::default(), &credentials)
+                .unwrap();
+        let (_, pairs) = read_auth_key_values(
+            &payload,
+            &OracleThinCapabilities::default(),
+            TNS_FUNC_AUTH_PHASE_TWO,
+            2,
+        );
+        let (_, connect_string, _) = pairs
+            .into_iter()
+            .find(|(key, _, _)| key == "AUTH_CONNECT_STRING")
+            .expect("AUTH_CONNECT_STRING should be present");
+
+        assert!(connect_string.contains("(INSTANCE_NAME=inst1)"));
+        assert!(connect_string.contains("(SERVER=pooled)"));
+        assert!(!connect_string.contains("(SID=ORCL)"));
+        assert!(!connect_string.contains("SERVICE_NAME="));
+    }
+
+    #[test]
+    fn protocol_314_auth_connect_string_keeps_sid_and_instance_like_go_ora() {
+        let mut config = OracleThinConfig::new(
+            ConnectTarget::sid("dbhost", 1521, "ORCL")
+                .with_instance_name("inst1")
+                .with_server_type(OracleNetServerType::Pooled),
+            "system",
+            "password",
+        );
+        config.connect_options.desired_protocol_version = 314;
+        let credentials = AuthCredentials {
+            session_key: "session-key".to_string(),
+            speedy_key: None,
+            password: "encoded-password".to_string(),
+            debug_jdwp_data: None,
+        };
+
+        let payload =
+            auth_phase_two_payload(&config, &OracleThinCapabilities::default(), &credentials)
+                .unwrap();
+        let (_, pairs) = read_auth_key_values(
+            &payload,
+            &OracleThinCapabilities::default(),
+            TNS_FUNC_AUTH_PHASE_TWO,
+            2,
+        );
+        let (_, connect_string, _) = pairs
+            .into_iter()
+            .find(|(key, _, _)| key == "AUTH_CONNECT_STRING")
+            .expect("AUTH_CONNECT_STRING should be present");
+
+        assert!(connect_string.contains("(SID=ORCL)"));
+        assert!(connect_string.contains("(INSTANCE_NAME=inst1)"));
+        assert!(connect_string.contains("(SERVER=pooled)"));
+        assert!(!connect_string.contains("SERVICE_NAME="));
     }
 
     #[test]
@@ -18168,6 +18889,193 @@ mod tests {
                 .map(String::as_str),
             Some("23.0.0.0.0")
         );
+    }
+
+    #[test]
+    fn server_side_piggyback_stores_ltxid_like_python_oracledb() {
+        let mut packet = vec![TNS_SERVER_PIGGYBACK_LTXID];
+        write_bytes_with_two_lengths(&mut packet, b"ltxid-123").unwrap();
+        let mut cursor =
+            PacketCursor::with_capabilities(&packet, &OracleThinCapabilities::default());
+        let mut state = ServerSidePiggybackState::default();
+
+        process_server_side_piggyback(&mut cursor, &OracleThinCapabilities::default(), &mut state)
+            .unwrap();
+
+        assert_eq!(state.ltxid, b"ltxid-123");
+        assert_eq!(cursor.remaining(), 0);
+    }
+
+    #[test]
+    fn server_side_piggyback_stores_session_return_state_like_python_oracledb() {
+        let mut packet = vec![TNS_SERVER_PIGGYBACK_SESS_RET];
+        write_ub2(&mut packet, 0);
+        packet.push(0);
+        write_ub2(&mut packet, 1);
+        packet.push(1);
+        write_ub2(&mut packet, 3);
+        packet.extend_from_slice(&[3, b'k', b'e', b'y']);
+        write_ub2(&mut packet, 5);
+        packet.extend_from_slice(&[5, b'v', b'a', b'l', b'u', b'e']);
+        write_ub2(&mut packet, 0);
+        write_ub4(&mut packet, 4);
+        write_ub4(&mut packet, 0x0102_0304);
+        write_ub2(&mut packet, 0x1122);
+        let mut cursor =
+            PacketCursor::with_capabilities(&packet, &OracleThinCapabilities::default());
+        let mut state = ServerSidePiggybackState::default();
+
+        process_server_side_piggyback(&mut cursor, &OracleThinCapabilities::default(), &mut state)
+            .unwrap();
+
+        assert!(state.session_changed);
+        assert_eq!(state.session_id, Some(0x0102_0304));
+        assert_eq!(state.serial_num, Some(0x1122));
+        assert_eq!(cursor.remaining(), 0);
+    }
+
+    #[test]
+    fn return_parameters_update_schema_edition_and_sessionless_state_like_python_oracledb() {
+        let mut transaction_value = b"txn-123".to_vec();
+        transaction_value
+            .extend_from_slice(&[TNS_TPC_TXNID_SYNC_SET | TNS_TPC_TXNID_SYNC_SERVER, 1]);
+        let mut packet = Vec::new();
+        push_return_parameter_prefix(&mut packet, 3);
+        push_keyword_pair(
+            &mut packet,
+            Some("APP_SCHEMA"),
+            None,
+            TNS_KEYWORD_NUM_CURRENT_SCHEMA,
+        );
+        push_keyword_pair(&mut packet, Some("ORA$BASE"), None, TNS_KEYWORD_NUM_EDITION);
+        push_keyword_pair(
+            &mut packet,
+            None,
+            Some(&transaction_value),
+            TNS_KEYWORD_NUM_TRANSACTION_ID,
+        );
+        write_ub2(&mut packet, 0);
+        let mut cursor =
+            PacketCursor::with_capabilities(&packet, &OracleThinCapabilities::default());
+        let mut state = ServerSidePiggybackState::default();
+
+        process_return_parameters(&mut cursor, &OracleThinCapabilities::default(), &mut state)
+            .unwrap();
+
+        assert_eq!(state.current_schema.as_deref(), Some("APP_SCHEMA"));
+        assert_eq!(state.edition.as_deref(), Some("ORA$BASE"));
+        assert_eq!(
+            state.sessionless_transaction_id.as_deref(),
+            Some(&b"txn-123"[..])
+        );
+        assert!(state.sessionless_started_on_server);
+        assert!(state.transaction_in_progress);
+        assert_eq!(cursor.remaining(), 0);
+    }
+
+    #[test]
+    fn return_parameters_clear_sessionless_state_like_python_oracledb() {
+        let mut transaction_value = b"txn-123".to_vec();
+        transaction_value.extend_from_slice(&[TNS_TPC_TXNID_SYNC_UNSET, 1]);
+        let mut packet = Vec::new();
+        push_return_parameter_prefix(&mut packet, 1);
+        push_keyword_pair(
+            &mut packet,
+            None,
+            Some(&transaction_value),
+            TNS_KEYWORD_NUM_TRANSACTION_ID,
+        );
+        write_ub2(&mut packet, 0);
+        let mut cursor =
+            PacketCursor::with_capabilities(&packet, &OracleThinCapabilities::default());
+        let mut state = ServerSidePiggybackState {
+            sessionless_transaction_id: Some(b"txn-123".to_vec()),
+            sessionless_started_on_server: true,
+            transaction_in_progress: true,
+            ..ServerSidePiggybackState::default()
+        };
+
+        process_return_parameters(&mut cursor, &OracleThinCapabilities::default(), &mut state)
+            .unwrap();
+
+        assert!(state.sessionless_transaction_id.is_none());
+        assert!(!state.sessionless_started_on_server);
+        assert!(!state.transaction_in_progress);
+        assert_eq!(cursor.remaining(), 0);
+    }
+
+    #[test]
+    fn return_parameters_reject_unknown_sessionless_sync_version_like_python_oracledb() {
+        let mut transaction_value = b"txn-123".to_vec();
+        transaction_value.extend_from_slice(&[TNS_TPC_TXNID_SYNC_SET, 2]);
+        let mut packet = Vec::new();
+        push_return_parameter_prefix(&mut packet, 1);
+        push_keyword_pair(
+            &mut packet,
+            None,
+            Some(&transaction_value),
+            TNS_KEYWORD_NUM_TRANSACTION_ID,
+        );
+        write_ub2(&mut packet, 0);
+        let mut cursor =
+            PacketCursor::with_capabilities(&packet, &OracleThinCapabilities::default());
+        let mut state = ServerSidePiggybackState::default();
+
+        let err =
+            process_return_parameters(&mut cursor, &OracleThinCapabilities::default(), &mut state)
+                .expect_err("unknown sync version should fail");
+
+        assert!(
+            err.to_string()
+                .contains("unknown Oracle sessionless transaction sync version 2"),
+            "{err}"
+        );
+    }
+
+    fn push_return_parameter_prefix(out: &mut Vec<u8>, num_pairs: u16) {
+        write_ub2(out, 0);
+        write_ub2(out, 0);
+        write_ub2(out, num_pairs);
+    }
+
+    fn push_keyword_pair(
+        out: &mut Vec<u8>,
+        text: Option<&str>,
+        binary: Option<&[u8]>,
+        keyword_num: u16,
+    ) {
+        if let Some(text) = text {
+            write_ub2(out, text.len() as u16);
+            out.push(text.len() as u8);
+            out.extend_from_slice(text.as_bytes());
+        } else {
+            write_ub2(out, 0);
+        }
+        if let Some(binary) = binary {
+            write_ub2(out, binary.len() as u16);
+            out.push(binary.len() as u8);
+            out.extend_from_slice(binary);
+        } else {
+            write_ub2(out, 0);
+        }
+        write_ub2(out, keyword_num);
+    }
+
+    #[test]
+    fn token_message_rejects_mismatched_token_like_python_oracledb() {
+        let caps = OracleThinCapabilities::default();
+        let mut matching = Vec::new();
+        write_ub8(&mut matching, 0);
+        let mut cursor = PacketCursor::with_capabilities(&matching, &caps);
+
+        process_token(&mut cursor, 0).unwrap();
+
+        let mut mismatched = Vec::new();
+        write_ub8(&mut mismatched, 7);
+        let mut cursor = PacketCursor::with_capabilities(&mismatched, &caps);
+        let err = process_token(&mut cursor, 0).expect_err("mismatched token should fail");
+
+        assert!(err.to_string().contains("mismatched Oracle token"));
     }
 
     #[test]
