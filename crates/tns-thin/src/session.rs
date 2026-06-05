@@ -252,6 +252,8 @@ const ORA_TYPE_NUM_CURSOR: u8 = 102;
 const TNS_DATA_TYPE_RDD: u8 = 104;
 const TNS_DATA_TYPE_EXT_NAMED: u8 = 108;
 const ORA_TYPE_NUM_OBJECT: u8 = 109;
+const TNS_DATA_TYPE_EXT_REF: u8 = 110;
+const TNS_DATA_TYPE_INT_REF: u8 = 111;
 const ORA_TYPE_NUM_CLOB: u8 = 112;
 const ORA_TYPE_NUM_BLOB: u8 = 113;
 const ORA_TYPE_NUM_BFILE: u8 = 114;
@@ -2740,13 +2742,13 @@ fn thin_column_from_object_attr(
     if !attr_type_owner.is_empty() && !is_xmltype {
         let (column_type, ora_type_num, schema_name, type_name) = match attr_typecode.as_deref() {
             Some("OBJECT") => (
-                OracleColumnType::Unsupported(ORA_TYPE_NUM_OBJECT),
+                OracleColumnType::Object,
                 ORA_TYPE_NUM_OBJECT,
                 attr_type_owner,
                 attr_type_name,
             ),
             Some("COLLECTION") => (
-                OracleColumnType::Unsupported(ORA_TYPE_NUM_OBJECT),
+                OracleColumnType::Object,
                 ORA_TYPE_NUM_OBJECT,
                 attr_type_owner,
                 attr_type_name,
@@ -4419,6 +4421,8 @@ fn bind_column_metadata(bind: &BindValue) -> ThinColumn {
         OracleColumnType::Vector => ORA_TYPE_NUM_VECTOR,
         OracleColumnType::Json => ORA_TYPE_NUM_JSON,
         OracleColumnType::Xml => ORA_TYPE_NUM_OBJECT,
+        OracleColumnType::Object => ORA_TYPE_NUM_OBJECT,
+        OracleColumnType::ObjectRef => TNS_DATA_TYPE_INT_REF,
         OracleColumnType::Nclob => ORA_TYPE_NUM_VARCHAR,
         OracleColumnType::Cursor => ORA_TYPE_NUM_CURSOR,
         OracleColumnType::IntervalYearMonth => ORA_TYPE_NUM_INTERVAL_YM,
@@ -4524,6 +4528,8 @@ fn thin_column_from_column_metadata(column: &ColumnMetadata) -> ThinColumn {
         OracleColumnType::Vector => BindValue::Null(OracleColumnType::Vector),
         OracleColumnType::Json => BindValue::Null(OracleColumnType::Json),
         OracleColumnType::Xml => BindValue::Null(OracleColumnType::Xml),
+        OracleColumnType::Object => BindValue::Null(OracleColumnType::Object),
+        OracleColumnType::ObjectRef => BindValue::Null(OracleColumnType::ObjectRef),
         OracleColumnType::Cursor => BindValue::Null(OracleColumnType::Cursor),
         OracleColumnType::IntervalYearMonth => BindValue::Null(OracleColumnType::IntervalYearMonth),
         OracleColumnType::IntervalDaySecond => BindValue::Null(OracleColumnType::IntervalDaySecond),
@@ -4588,6 +4594,12 @@ fn define_column_metadata(column: &ColumnMetadata) -> ThinColumn {
         OracleColumnType::Xml => {
             thin.ora_type_num = ORA_TYPE_NUM_OBJECT;
         }
+        OracleColumnType::Object => {
+            thin.ora_type_num = ORA_TYPE_NUM_OBJECT;
+        }
+        OracleColumnType::ObjectRef => {
+            thin.ora_type_num = TNS_DATA_TYPE_INT_REF;
+        }
         _ => {}
     }
     thin
@@ -4646,6 +4658,12 @@ fn define_thin_column_metadata_for_capabilities(
         OracleColumnType::Xml => {
             thin.ora_type_num = ORA_TYPE_NUM_OBJECT;
         }
+        OracleColumnType::Object => {
+            thin.ora_type_num = ORA_TYPE_NUM_OBJECT;
+        }
+        OracleColumnType::ObjectRef => {
+            thin.ora_type_num = TNS_DATA_TYPE_INT_REF;
+        }
         _ => {}
     }
     thin
@@ -4674,6 +4692,8 @@ fn default_bind_len(column_type: OracleColumnType) -> u32 {
         OracleColumnType::Vector => TNS_VECTOR_MAX_LENGTH,
         OracleColumnType::Json => TNS_JSON_MAX_LENGTH,
         OracleColumnType::Xml => TNS_MAX_LONG_LENGTH,
+        OracleColumnType::Object => 1,
+        OracleColumnType::ObjectRef => 2000,
         OracleColumnType::Nclob => 4000,
         OracleColumnType::Cursor => 4,
         OracleColumnType::IntervalYearMonth => 5,
@@ -5839,6 +5859,10 @@ fn read_column_value(
                     collection_element_by_type,
                 )?
             }
+            TNS_DATA_TYPE_EXT_REF | TNS_DATA_TYPE_INT_REF => cursor
+                .read_bytes()?
+                .map(OracleValue::Bytes)
+                .unwrap_or(OracleValue::Null),
             ORA_TYPE_NUM_VECTOR => read_vector_value(cursor)?,
             ORA_TYPE_NUM_BFILE | TNS_DATA_TYPE_CFILE | ORA_TYPE_NUM_DBFILE => {
                 read_bfile_locator(cursor)?
@@ -7561,8 +7585,9 @@ fn oracle_column_type_from_ora_type(ora_type_num: u8) -> OracleColumnType {
         ORA_TYPE_NUM_ROWID | TNS_DATA_TYPE_RDD => OracleColumnType::Rowid,
         ORA_TYPE_NUM_UROWID => OracleColumnType::Urowid,
         ORA_TYPE_NUM_OBJECT | TNS_DATA_TYPE_EXT_NAMED | TNS_DATA_TYPE_PNTY => {
-            OracleColumnType::Unsupported(ora_type_num)
+            OracleColumnType::Object
         }
+        TNS_DATA_TYPE_EXT_REF | TNS_DATA_TYPE_INT_REF => OracleColumnType::ObjectRef,
         TNS_DATA_TYPE_STR
         | ORA_TYPE_NUM_VARCHAR
         | TNS_DATA_TYPE_VCS
@@ -11257,23 +11282,23 @@ mod tests {
         TNS_DATA_FLAGS_END_OF_RESPONSE, TNS_DATA_FLAGS_EOF, TNS_DATA_TYPE_BINARY_INTEGER,
         TNS_DATA_TYPE_CFILE, TNS_DATA_TYPE_CLV, TNS_DATA_TYPE_DBLOB, TNS_DATA_TYPE_DCLOB,
         TNS_DATA_TYPE_DOL, TNS_DATA_TYPE_DOP, TNS_DATA_TYPE_DTR, TNS_DATA_TYPE_DUN,
-        TNS_DATA_TYPE_EDATE, TNS_DATA_TYPE_ESITZ, TNS_DATA_TYPE_EXT_NAMED, TNS_DATA_TYPE_FLOAT,
-        TNS_DATA_TYPE_LVB, TNS_DATA_TYPE_LVC, TNS_DATA_TYPE_ODT, TNS_DATA_TYPE_PDN,
-        TNS_DATA_TYPE_PNTY, TNS_DATA_TYPE_RDD, TNS_DATA_TYPE_RSET, TNS_DATA_TYPE_SLS,
-        TNS_DATA_TYPE_STR, TNS_DATA_TYPE_TIME, TNS_DATA_TYPE_TIME_TZ, TNS_DATA_TYPE_UB8,
-        TNS_DATA_TYPE_UIN, TNS_DATA_TYPE_VBI, TNS_DATA_TYPE_VCS, TNS_DATA_TYPE_VNU,
-        TNS_DATA_TYPE_VST, TNS_DEFAULT_SDU, TNS_DURATION_SESSION, TNS_ERR_INBAND_MESSAGE,
-        TNS_EXEC_FLAGS_IMPLICIT_RESULTSET, TNS_FUNC_LOB_OP, TNS_FUNC_PING,
-        TNS_LOB_LOC_FLAGS_LITTLE_ENDIAN, TNS_LOB_LOC_FLAGS_VAR_LENGTH_CHARSET,
-        TNS_LOB_LOC_OFFSET_FLAG_3, TNS_LOB_LOC_OFFSET_FLAG_4, TNS_LOB_OP_ARRAY,
-        TNS_LOB_OP_CREATE_TEMP, TNS_LOB_OP_FREE_TEMP, TNS_LOB_PREFETCH_FLAG, TNS_MARKER_TYPE_BREAK,
-        TNS_MARKER_TYPE_INTERRUPT, TNS_MARKER_TYPE_RESET, TNS_MAX_LONG_LENGTH,
-        TNS_MSG_TYPE_END_OF_RESPONSE, TNS_MSG_TYPE_FUNCTION, TNS_MSG_TYPE_PIGGYBACK,
-        TNS_MSG_TYPE_STATUS, TNS_PACKET_TYPE_CONTROL, TNS_PACKET_TYPE_DATA, TNS_PACKET_TYPE_MARKER,
-        TNS_VECTOR_FLAG_NORM, TNS_VECTOR_FLAG_NORM_RESERVED, TNS_VECTOR_FLAG_SPARSE,
-        TNS_VECTOR_FORMAT_BINARY, TNS_VECTOR_FORMAT_FLOAT32, TNS_VECTOR_FORMAT_FLOAT64,
-        TNS_VECTOR_FORMAT_INT8, TNS_VECTOR_MAGIC_BYTE, TNS_VECTOR_VERSION_BASE,
-        TNS_VECTOR_VERSION_WITH_BINARY, TNS_VECTOR_VERSION_WITH_SPARSE,
+        TNS_DATA_TYPE_EDATE, TNS_DATA_TYPE_ESITZ, TNS_DATA_TYPE_EXT_NAMED, TNS_DATA_TYPE_EXT_REF,
+        TNS_DATA_TYPE_FLOAT, TNS_DATA_TYPE_INT_REF, TNS_DATA_TYPE_LVB, TNS_DATA_TYPE_LVC,
+        TNS_DATA_TYPE_ODT, TNS_DATA_TYPE_PDN, TNS_DATA_TYPE_PNTY, TNS_DATA_TYPE_RDD,
+        TNS_DATA_TYPE_RSET, TNS_DATA_TYPE_SLS, TNS_DATA_TYPE_STR, TNS_DATA_TYPE_TIME,
+        TNS_DATA_TYPE_TIME_TZ, TNS_DATA_TYPE_UB8, TNS_DATA_TYPE_UIN, TNS_DATA_TYPE_VBI,
+        TNS_DATA_TYPE_VCS, TNS_DATA_TYPE_VNU, TNS_DATA_TYPE_VST, TNS_DEFAULT_SDU,
+        TNS_DURATION_SESSION, TNS_ERR_INBAND_MESSAGE, TNS_EXEC_FLAGS_IMPLICIT_RESULTSET,
+        TNS_FUNC_LOB_OP, TNS_FUNC_PING, TNS_LOB_LOC_FLAGS_LITTLE_ENDIAN,
+        TNS_LOB_LOC_FLAGS_VAR_LENGTH_CHARSET, TNS_LOB_LOC_OFFSET_FLAG_3, TNS_LOB_LOC_OFFSET_FLAG_4,
+        TNS_LOB_OP_ARRAY, TNS_LOB_OP_CREATE_TEMP, TNS_LOB_OP_FREE_TEMP, TNS_LOB_PREFETCH_FLAG,
+        TNS_MARKER_TYPE_BREAK, TNS_MARKER_TYPE_INTERRUPT, TNS_MARKER_TYPE_RESET,
+        TNS_MAX_LONG_LENGTH, TNS_MSG_TYPE_END_OF_RESPONSE, TNS_MSG_TYPE_FUNCTION,
+        TNS_MSG_TYPE_PIGGYBACK, TNS_MSG_TYPE_STATUS, TNS_PACKET_TYPE_CONTROL, TNS_PACKET_TYPE_DATA,
+        TNS_PACKET_TYPE_MARKER, TNS_VECTOR_FLAG_NORM, TNS_VECTOR_FLAG_NORM_RESERVED,
+        TNS_VECTOR_FLAG_SPARSE, TNS_VECTOR_FORMAT_BINARY, TNS_VECTOR_FORMAT_FLOAT32,
+        TNS_VECTOR_FORMAT_FLOAT64, TNS_VECTOR_FORMAT_INT8, TNS_VECTOR_MAGIC_BYTE,
+        TNS_VECTOR_VERSION_BASE, TNS_VECTOR_VERSION_WITH_BINARY, TNS_VECTOR_VERSION_WITH_SPARSE,
     };
     use super::{
         adjust_for_server_compile_caps, adjust_for_server_runtime_caps, capabilities_from_accept,
@@ -13389,15 +13414,23 @@ mod tests {
         );
         assert_eq!(
             oracle_column_type_from_ora_type(ORA_TYPE_NUM_OBJECT),
-            OracleColumnType::Unsupported(ORA_TYPE_NUM_OBJECT)
+            OracleColumnType::Object
         );
         assert_eq!(
             oracle_column_type_from_ora_type(TNS_DATA_TYPE_EXT_NAMED),
-            OracleColumnType::Unsupported(TNS_DATA_TYPE_EXT_NAMED)
+            OracleColumnType::Object
         );
         assert_eq!(
             oracle_column_type_from_ora_type(TNS_DATA_TYPE_PNTY),
-            OracleColumnType::Unsupported(TNS_DATA_TYPE_PNTY)
+            OracleColumnType::Object
+        );
+        assert_eq!(
+            oracle_column_type_from_ora_type(TNS_DATA_TYPE_EXT_REF),
+            OracleColumnType::ObjectRef
+        );
+        assert_eq!(
+            oracle_column_type_from_ora_type(TNS_DATA_TYPE_INT_REF),
+            OracleColumnType::ObjectRef
         );
         assert_eq!(
             oracle_column_type_from_ora_type(250),
@@ -13446,10 +13479,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            column.column_type,
-            OracleColumnType::Unsupported(ORA_TYPE_NUM_OBJECT)
-        );
+        assert_eq!(column.column_type, OracleColumnType::Object);
         assert_eq!(column.ora_type_num, ORA_TYPE_NUM_OBJECT);
         assert_eq!(column.schema_name, "SYSTEM");
         assert_eq!(column.type_name, "number");
@@ -13468,10 +13498,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            column.column_type,
-            OracleColumnType::Unsupported(ORA_TYPE_NUM_OBJECT)
-        );
+        assert_eq!(column.column_type, OracleColumnType::Object);
         assert_eq!(column.ora_type_num, ORA_TYPE_NUM_OBJECT);
         assert_eq!(column.schema_name, "SYSTEM");
         assert_eq!(column.type_name, "varchar2");

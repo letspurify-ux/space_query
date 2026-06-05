@@ -6347,6 +6347,26 @@ FROM dual"#;
 }
 
 #[test]
+fn test_extract_bind_names_resets_json_string_state_on_comments_and_identifiers() {
+    let sql = r#"
+SELECT 'key' /* block comment */ :after_block,
+       'key' -- line comment
+       :after_line,
+       'key' "quoted_identifier" :after_identifier
+FROM dual"#;
+    let names = QueryExecutor::extract_bind_names(sql);
+
+    assert_eq!(
+        names,
+        vec![
+            "AFTER_BLOCK".to_string(),
+            "AFTER_LINE".to_string(),
+            "AFTER_IDENTIFIER".to_string(),
+        ]
+    );
+}
+
+#[test]
 fn test_is_create_trigger() {
     // Positive cases
     assert!(QueryExecutor::is_create_trigger(

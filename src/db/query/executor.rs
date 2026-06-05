@@ -394,12 +394,14 @@ impl QueryExecutor {
             }
 
             if c == '-' && next == Some('-') {
+                last_token_was_string = false;
                 in_line_comment = true;
                 i += 2;
                 continue;
             }
 
             if c == '/' && next == Some('*') {
+                last_token_was_string = false;
                 in_block_comment = true;
                 i += 2;
                 continue;
@@ -436,6 +438,7 @@ impl QueryExecutor {
             }
 
             if c == '"' {
+                last_token_was_string = false;
                 in_double_quote = true;
                 i += 1;
                 continue;

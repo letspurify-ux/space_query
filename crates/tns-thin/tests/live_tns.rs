@@ -2390,6 +2390,49 @@ fn execute_typed_fetch_all_defines_lob_before_first_fetch() {
 
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn execute_typed_fetch_all_defines_blob_before_first_fetch() {
+    let mut conn = connect();
+    let request = StatementRequest::query(
+        "SELECT TO_BLOB(HEXTORAW(RPAD('AB', 4000, 'CD'))) FROM dual",
+        1,
+    );
+    let result = conn
+        .execute_typed_fetch_all(&request, &[OracleColumnType::Blob])
+        .expect("typed BLOB fetch all");
+
+    let row = result.rows.first().expect("typed BLOB row");
+    match &row[0] {
+        OracleValue::Bytes(bytes) => {
+            assert_eq!(bytes.len(), 2000);
+            assert_eq!(bytes.first().copied(), Some(0xab));
+            assert_eq!(bytes.last().copied(), Some(0xcd));
+        }
+        other => panic!("expected typed BLOB bytes, got {other:?}"),
+    }
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn execute_typed_fetch_all_defines_nclob_before_first_fetch() {
+    let mut conn = connect();
+    let request = StatementRequest::query(
+        "SELECT TO_NCLOB(UNISTR('\\D55C\\AE00')) || \
+         TO_NCLOB(RPAD('x', 3000, 'x')) || TO_NCLOB(RPAD('y', 3000, 'y')) FROM dual",
+        1,
+    );
+    let result = conn
+        .execute_typed_fetch_all(&request, &[OracleColumnType::Nclob])
+        .expect("typed NCLOB fetch all");
+
+    let row = result.rows.first().expect("typed NCLOB row");
+    let value = value_to_string(&row[0]);
+    assert!(value.starts_with("한글"));
+    assert_eq!(value.chars().count(), 6002);
+    assert!(value.ends_with('y'));
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn execute_typed_defines_lob_before_initial_fetch() {
     let mut conn = connect();
     let request = StatementRequest::query(
@@ -5641,10 +5684,7 @@ fn select_udt_object_and_collection_columns_decode_like_python_oracledb() {
             .iter()
             .map(|column| column.column_type)
             .collect::<Vec<_>>(),
-        vec![
-            OracleColumnType::Unsupported(109),
-            OracleColumnType::Unsupported(109)
-        ]
+        vec![OracleColumnType::Object, OracleColumnType::Object]
     );
 
     let first_object_attrs = match &rows.result.rows[0][0] {
@@ -5710,10 +5750,7 @@ fn select_udt_object_and_collection_columns_decode_like_python_oracledb() {
             .iter()
             .map(|column| column.column_type)
             .collect::<Vec<_>>(),
-        vec![
-            OracleColumnType::Unsupported(109),
-            OracleColumnType::Unsupported(109)
-        ]
+        vec![OracleColumnType::Object, OracleColumnType::Object]
     );
     assert!(
         initial.result.rows.is_empty(),
@@ -5729,6 +5766,125 @@ fn select_udt_object_and_collection_columns_decode_like_python_oracledb() {
     assert_eq!(fetched.result.rows.len(), 2);
     assert!(matches!(fetched.result.rows[0][0], OracleValue::Object(_)));
     assert!(matches!(fetched.result.rows[0][1], OracleValue::Array(_)));
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn select_object_ref_column_reports_vendor_ref_metadata() {
+    let config = live_config();
+    let type_name = unique_object_name("SEL_REF_OBJ");
+    let table = unique_table_name("SEL_REF_TAB");
+    let _type_guard = TypeDropGuard::new(config.clone(), type_name.clone());
+    let _table_guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    drop_table_ignore(&mut conn, &table);
+    drop_type_ignore(&mut conn, &type_name);
+    conn.query_drop(&format!(
+        "CREATE TYPE {type_name} AS OBJECT (id NUMBER, name VARCHAR2(30))"
+    ))
+    .expect("create REF object type");
+    conn.query_drop(&format!(
+        "CREATE TABLE {table} OF {type_name} \
+         (PRIMARY KEY (id)) OBJECT IDENTIFIER IS PRIMARY KEY"
+    ))
+    .expect("create REF object table");
+    conn.query_drop(&format!(
+        "INSERT INTO {table} VALUES ({type_name}(1, 'alpha'))"
+    ))
+    .expect("insert REF object row");
+
+    let columns = conn
+        .describe(&format!("SELECT REF(t) AS person_ref FROM {table} t"))
+        .expect("describe REF object column");
+    assert_eq!(columns.len(), 1);
+    assert_eq!(columns[0].name, "PERSON_REF");
+    assert_eq!(columns[0].column_type, OracleColumnType::ObjectRef);
+    assert_eq!(columns[0].ora_type_num, 111);
+
+    let rows = conn
+        .query_described_fetch_all(format!("SELECT REF(t) AS person_ref FROM {table} t"), 1)
+        .expect("fetch REF object column");
+    assert_eq!(rows.columns[0].column_type, OracleColumnType::ObjectRef);
+    match &rows.result.rows[0][0] {
+        OracleValue::Bytes(bytes) => assert!(!bytes.is_empty(), "REF bytes should be non-empty"),
+        other => panic!("expected REF bytes, got {other:?}"),
+    }
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn select_builtin_nested_object_decodes_like_python_oracledb() {
+    let mut conn = connect();
+    let result = match conn.query_described_fetch_all(
+        "SELECT MDSYS.SDO_GEOMETRY(\
+             2001, \
+             4326, \
+             MDSYS.SDO_POINT_TYPE(1.5, 2.5, NULL), \
+             MDSYS.SDO_ELEM_INFO_ARRAY(1, 1, 1), \
+             MDSYS.SDO_ORDINATE_ARRAY(1.5, 2.5)\
+         ) AS geom \
+         FROM dual",
+        1,
+    ) {
+        Ok(result) => result,
+        Err(err)
+            if err.to_string().contains("ORA-00904")
+                || err.to_string().contains("ORA-04043")
+                || err.to_string().contains("ORA-06550") =>
+        {
+            eprintln!("skipping SDO_GEOMETRY object test: MDSYS spatial types are unavailable");
+            return;
+        }
+        Err(err) => panic!("fetch SDO_GEOMETRY object: {err}"),
+    };
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![OracleColumnType::Object]
+    );
+    let attrs = match &result.result.rows[0][0] {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected SDO_GEOMETRY object, got {other:?}"),
+    };
+    assert_eq!(attrs[0].0, "SDO_GTYPE");
+    assert_eq!(attrs[0].1, OracleValue::Number("2001".to_string()));
+    assert_eq!(attrs[1].0, "SDO_SRID");
+    assert_eq!(attrs[1].1, OracleValue::Number("4326".to_string()));
+
+    let point_attrs = match &attrs[2].1 {
+        OracleValue::Object(attrs) => attrs,
+        other => panic!("expected SDO_POINT_TYPE object, got {other:?}"),
+    };
+    assert_eq!(point_attrs[0].1, OracleValue::Number("1.5".to_string()));
+    assert_eq!(point_attrs[1].1, OracleValue::Number("2.5".to_string()));
+    assert_eq!(point_attrs[2].1, OracleValue::Null);
+
+    let elem_info_values = match &attrs[3].1 {
+        OracleValue::Array(values) => values,
+        other => panic!("expected SDO_ELEM_INFO_ARRAY, got {other:?}"),
+    };
+    assert_eq!(
+        elem_info_values,
+        &vec![
+            OracleValue::Number("1".to_string()),
+            OracleValue::Number("1".to_string()),
+            OracleValue::Number("1".to_string())
+        ]
+    );
+    let ordinate_values = match &attrs[4].1 {
+        OracleValue::Array(values) => values,
+        other => panic!("expected SDO_ORDINATE_ARRAY, got {other:?}"),
+    };
+    assert_eq!(
+        ordinate_values,
+        &vec![
+            OracleValue::Number("1.5".to_string()),
+            OracleValue::Number("2.5".to_string())
+        ]
+    );
 }
 
 #[test]
@@ -5773,7 +5929,7 @@ fn select_xmltype_collection_column_decodes_like_python_oracledb() {
             .iter()
             .map(|column| column.column_type)
             .collect::<Vec<_>>(),
-        vec![OracleColumnType::Unsupported(109)]
+        vec![OracleColumnType::Object]
     );
     assert_eq!(rows.result.rows.len(), 2);
     assert_xmltype_collection_rows(&rows.result.rows);
@@ -5850,7 +6006,7 @@ fn select_udt_xmltype_collection_attribute_decodes_like_python_oracledb() {
             .iter()
             .map(|column| column.column_type)
             .collect::<Vec<_>>(),
-        vec![OracleColumnType::Unsupported(109)]
+        vec![OracleColumnType::Object]
     );
     assert_eq!(rows.result.rows.len(), 2);
     assert_xmltype_collection_object_rows(&rows.result.rows);
@@ -5962,7 +6118,7 @@ fn select_udt_scalar_attributes_decode_like_python_oracledb() {
             .iter()
             .map(|column| column.column_type)
             .collect::<Vec<_>>(),
-        vec![OracleColumnType::Unsupported(109)]
+        vec![OracleColumnType::Object]
     );
     assert_eq!(rows.result.rows.len(), 3);
     assert_scalar_object_attribute_rows(&rows.result.rows);
@@ -6030,7 +6186,7 @@ fn select_udt_lob_attributes_decode_like_python_oracledb() {
             .iter()
             .map(|column| column.column_type)
             .collect::<Vec<_>>(),
-        vec![OracleColumnType::Unsupported(109)]
+        vec![OracleColumnType::Object]
     );
     assert_eq!(rows.result.rows.len(), 2);
     assert_lob_object_attribute_rows(&rows.result.rows);
@@ -6105,7 +6261,7 @@ fn select_udt_nchar_attributes_decode_like_python_oracledb() {
             .iter()
             .map(|column| column.column_type)
             .collect::<Vec<_>>(),
-        vec![OracleColumnType::Unsupported(109)]
+        vec![OracleColumnType::Object]
     );
     assert_eq!(rows.result.rows.len(), 2);
     assert_nchar_object_attribute_rows(&rows.result.rows);
@@ -6152,7 +6308,7 @@ fn select_quoted_udt_object_decodes_like_python_oracledb() {
             .iter()
             .map(|column| column.column_type)
             .collect::<Vec<_>>(),
-        vec![OracleColumnType::Unsupported(109)]
+        vec![OracleColumnType::Object]
     );
     assert_quoted_object_rows(&rows.result.rows);
 
@@ -6244,7 +6400,7 @@ fn select_quoted_udt_object_collection_attribute_decodes_like_python_oracledb() 
             .iter()
             .map(|column| column.column_type)
             .collect::<Vec<_>>(),
-        vec![OracleColumnType::Unsupported(109)]
+        vec![OracleColumnType::Object]
     );
     assert_quoted_object_collection_attribute_rows(&rows.result.rows);
 
@@ -6312,7 +6468,7 @@ fn select_quoted_builtin_name_udt_attribute_decodes_like_python_oracledb() {
             .iter()
             .map(|column| column.column_type)
             .collect::<Vec<_>>(),
-        vec![OracleColumnType::Unsupported(109)]
+        vec![OracleColumnType::Object]
     );
     assert_quoted_builtin_name_object_rows(&rows.result.rows);
 
@@ -6378,7 +6534,7 @@ fn select_quoted_builtin_name_collection_attribute_decodes_like_python_oracledb(
             .iter()
             .map(|column| column.column_type)
             .collect::<Vec<_>>(),
-        vec![OracleColumnType::Unsupported(109)]
+        vec![OracleColumnType::Object]
     );
     assert_quoted_builtin_name_collection_rows(&rows.result.rows);
 
@@ -6613,7 +6769,7 @@ fn select_udt_object_collection_attribute_decodes_like_python_oracledb() {
             .iter()
             .map(|column| column.column_type)
             .collect::<Vec<_>>(),
-        vec![OracleColumnType::Unsupported(109)]
+        vec![OracleColumnType::Object]
     );
     assert_object_collection_attribute_rows(&rows.result.rows);
 
@@ -6681,7 +6837,7 @@ fn select_udt_object_collection_column_decodes_like_python_oracledb() {
             .iter()
             .map(|column| column.column_type)
             .collect::<Vec<_>>(),
-        vec![OracleColumnType::Unsupported(109)]
+        vec![OracleColumnType::Object]
     );
     assert_object_collection_column_rows(&rows.result.rows);
 
@@ -6738,7 +6894,7 @@ fn select_nested_collection_column_decodes_like_python_oracledb() {
             .iter()
             .map(|column| column.column_type)
             .collect::<Vec<_>>(),
-        vec![OracleColumnType::Unsupported(109)]
+        vec![OracleColumnType::Object]
     );
     assert_eq!(rows.result.rows.len(), 1);
     assert_nested_number_collection(&rows.result.rows[0][0]);
@@ -6835,7 +6991,7 @@ fn select_fixed_string_collection_columns_decode_like_python_oracledb() {
             .iter()
             .map(|column| column.column_type)
             .collect::<Vec<_>>(),
-        vec![OracleColumnType::Unsupported(109); 4]
+        vec![OracleColumnType::Object; 4]
     );
     assert_fixed_string_collection_column_rows(&rows.result.rows);
 
@@ -6978,7 +7134,7 @@ fn select_scalar_collection_columns_decode_like_python_oracledb() {
             .iter()
             .map(|column| column.column_type)
             .collect::<Vec<_>>(),
-        vec![OracleColumnType::Unsupported(109); 10]
+        vec![OracleColumnType::Object; 10]
     );
     assert_scalar_collection_column_rows(&rows.result.rows);
 
@@ -7046,10 +7202,7 @@ fn select_varray_columns_decode_like_python_oracledb() {
             .iter()
             .map(|column| column.column_type)
             .collect::<Vec<_>>(),
-        vec![
-            OracleColumnType::Unsupported(109),
-            OracleColumnType::Unsupported(109)
-        ]
+        vec![OracleColumnType::Object, OracleColumnType::Object]
     );
     assert_eq!(rows.result.rows.len(), 2);
     assert_varray_column_rows(&rows.result.rows);
@@ -7130,10 +7283,10 @@ fn select_lob_collection_columns_decode_like_python_oracledb() {
             .map(|column| column.column_type)
             .collect::<Vec<_>>(),
         vec![
-            OracleColumnType::Unsupported(109),
-            OracleColumnType::Unsupported(109),
-            OracleColumnType::Unsupported(109),
-            OracleColumnType::Unsupported(109)
+            OracleColumnType::Object,
+            OracleColumnType::Object,
+            OracleColumnType::Object,
+            OracleColumnType::Object
         ]
     );
     assert_eq!(rows.result.rows.len(), 2);

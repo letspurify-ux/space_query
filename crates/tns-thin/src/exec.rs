@@ -32,6 +32,8 @@ pub enum OracleColumnType {
     Vector,
     Json,
     Xml,
+    Object,
+    ObjectRef,
     Unsupported(u8),
 }
 
