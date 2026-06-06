@@ -1127,25 +1127,27 @@ impl ResultTableWidget {
         edge: ResultTableEdge,
         hidden_col: Option<usize>,
     ) -> bool {
-        let max_rows = table.rows().max(0) as usize;
-        let max_cols = table.cols().max(0) as usize;
-        let Some((row_start, col_start, row_end, col_end)) =
-            Self::extended_selection_bounds_to_edge(
-                table.get_selection(),
-                max_rows,
-                max_cols,
-                hidden_col,
-                edge,
-            )
-        else {
-            return false;
-        };
+        Self::extend_table_selection_to_edge_from_selection(
+            table,
+            table.get_selection(),
+            edge,
+            hidden_col,
+        )
+    }
 
+    fn set_table_selection_bounds(
+        table: &mut Table,
+        bounds: (usize, usize, usize, usize),
+        edge: ResultTableEdge,
+    ) {
+        let (row_start, col_start, row_end, col_end) = bounds;
+        let (select_row_start, select_col_start, select_row_end, select_col_end) =
+            Self::oriented_selection_for_edge(bounds, edge);
         table.set_selection(
-            row_start as i32,
-            col_start as i32,
-            row_end as i32,
-            col_end as i32,
+            select_row_start,
+            select_col_start,
+            select_row_end,
+            select_col_end,
         );
         match edge {
             ResultTableEdge::Left => table.set_col_position(col_start as i32),
@@ -1154,6 +1156,43 @@ impl ResultTableWidget {
             ResultTableEdge::Down => table.set_row_position(row_end as i32),
         }
         table.redraw();
+    }
+
+    fn oriented_selection_for_edge(
+        bounds: (usize, usize, usize, usize),
+        edge: ResultTableEdge,
+    ) -> (i32, i32, i32, i32) {
+        let (row_start, col_start, row_end, col_end) = (
+            bounds.0 as i32,
+            bounds.1 as i32,
+            bounds.2 as i32,
+            bounds.3 as i32,
+        );
+        match edge {
+            ResultTableEdge::Left => (row_start, col_end, row_end, col_start),
+            ResultTableEdge::Right => (row_start, col_start, row_end, col_end),
+            ResultTableEdge::Up => (row_end, col_start, row_start, col_end),
+            ResultTableEdge::Down => (row_start, col_start, row_end, col_end),
+        }
+    }
+
+    fn extend_table_selection_to_edge_from_selection(
+        table: &mut Table,
+        selection: (i32, i32, i32, i32),
+        edge: ResultTableEdge,
+        hidden_col: Option<usize>,
+    ) -> bool {
+        let max_rows = table.rows().max(0) as usize;
+        let max_cols = table.cols().max(0) as usize;
+        let Some((row_start, col_start, row_end, col_end)) =
+            Self::extended_selection_bounds_to_edge(
+                selection, max_rows, max_cols, hidden_col, edge,
+            )
+        else {
+            return false;
+        };
+
+        Self::set_table_selection_bounds(table, (row_start, col_start, row_end, col_end), edge);
         true
     }
 
@@ -1214,6 +1253,7 @@ impl ResultTableWidget {
         key: Key,
         original_key: Key,
         hidden_col: Option<usize>,
+        previous_selection: Option<(i32, i32, i32, i32)>,
         lazy_fetch_session: &Arc<Mutex<Option<u64>>>,
         lazy_fetch_callback: &LazyFetchCallback,
         pending_lazy_actions: &Arc<Mutex<VecDeque<(u64, LazyFetchPendingAction)>>>,
@@ -1233,7 +1273,23 @@ impl ResultTableWidget {
             return true;
         }
 
-        Self::extend_table_selection_to_edge(table, edge, hidden_col);
+        let max_rows = table.rows().max(0) as usize;
+        let max_cols = table.cols().max(0) as usize;
+        if let Some(bounds) = Self::hidden_left_boundary_shift_restore_bounds(
+            previous_selection,
+            table.get_selection(),
+            max_rows,
+            max_cols,
+            hidden_col,
+            key,
+            original_key,
+        ) {
+            Self::set_table_selection_bounds(table, bounds, edge);
+            return true;
+        }
+
+        let selection = table.get_selection();
+        Self::extend_table_selection_to_edge_from_selection(table, selection, edge, hidden_col);
         true
     }
 
@@ -1335,6 +1391,54 @@ impl ResultTableWidget {
             hidden_col,
             key,
         )
+    }
+
+    fn hidden_left_boundary_shift_restore_bounds(
+        previous_selection: Option<(i32, i32, i32, i32)>,
+        current_selection: (i32, i32, i32, i32),
+        max_rows: usize,
+        max_cols: usize,
+        hidden_col: Option<usize>,
+        key: Key,
+        original_key: Key,
+    ) -> Option<(usize, usize, usize, usize)> {
+        let hidden_col = hidden_col?;
+        if Self::edge_for_arrow_key(key, original_key)? != ResultTableEdge::Left {
+            return None;
+        }
+
+        let (first_visible_col, _) = Self::visible_column_bounds(max_cols, Some(hidden_col))?;
+        if hidden_col >= first_visible_col {
+            return None;
+        }
+
+        let current_raw_bounds =
+            Self::normalized_selection_bounds_with_limits(current_selection, max_rows, max_cols)?;
+        if current_raw_bounds.1 > hidden_col {
+            return None;
+        }
+
+        let previous_bounds = Self::selection_bounds_excluding_hidden_column(
+            previous_selection?,
+            max_rows,
+            max_cols,
+            Some(hidden_col),
+        )?;
+        if previous_bounds.1 > first_visible_col {
+            return None;
+        }
+
+        let current_bounds = Self::selection_bounds_excluding_hidden_column(
+            current_selection,
+            max_rows,
+            max_cols,
+            Some(hidden_col),
+        )?;
+        if current_bounds.1 > first_visible_col {
+            return None;
+        }
+
+        Some(previous_bounds)
     }
 
     fn current_table_selection_bounds(table: &Table) -> Option<(i32, i32, i32, i32)> {
@@ -2245,12 +2349,21 @@ impl ResultTableWidget {
                         let hidden_col = *hidden_auto_rowid_col_for_handle
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let previous_selection = if shift {
+                            drag_state_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .last_selection
+                        } else {
+                            None
+                        };
                         let handled = if shift {
                             Self::handle_ctrl_shift_arrow_selection(
                                 &mut table_for_handle,
                                 key,
                                 original_key,
                                 hidden_col,
+                                previous_selection,
                                 &lazy_fetch_session_for_handle,
                                 &lazy_fetch_callback_for_handle,
                                 &pending_lazy_actions_for_handle,
@@ -2298,6 +2411,34 @@ impl ResultTableWidget {
                         let hidden_col = *hidden_auto_rowid_col_for_handle
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if shift && !ctrl_or_cmd {
+                            let previous_selection = drag_state_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .last_selection;
+                            let max_rows = table_for_handle.rows().max(0) as usize;
+                            let max_cols = table_for_handle.cols().max(0) as usize;
+                            if let Some(bounds) = Self::hidden_left_boundary_shift_restore_bounds(
+                                previous_selection,
+                                table_for_handle.get_selection(),
+                                max_rows,
+                                max_cols,
+                                hidden_col,
+                                key,
+                                original_key,
+                            ) {
+                                Self::set_table_selection_bounds(
+                                    &mut table_for_handle,
+                                    bounds,
+                                    ResultTableEdge::Left,
+                                );
+                                Self::sync_drag_selection_snapshot(
+                                    &table_for_handle,
+                                    &drag_state_for_handle,
+                                );
+                                return true;
+                            }
+                        }
                         if Self::clamp_selection_to_visible_columns(
                             &mut table_for_handle,
                             hidden_col,
@@ -2442,12 +2583,21 @@ impl ResultTableWidget {
                         let hidden_col = *hidden_auto_rowid_col_for_handle
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let previous_selection = if shift {
+                            drag_state_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .last_selection
+                        } else {
+                            None
+                        };
                         let handled = if shift {
                             Self::handle_ctrl_shift_arrow_selection(
                                 &mut table_for_handle,
                                 key,
                                 original_key,
                                 hidden_col,
+                                previous_selection,
                                 &lazy_fetch_session_for_handle,
                                 &lazy_fetch_callback_for_handle,
                                 &pending_lazy_actions_for_handle,
@@ -8114,6 +8264,62 @@ mod row_edit_sql_tests {
                 Some(0)
             ),
             Some((1, 1, 1, 3))
+        );
+    }
+
+    #[test]
+    fn oriented_selection_for_left_edge_keeps_left_side_as_moving_endpoint() {
+        assert_eq!(
+            ResultTableWidget::oriented_selection_for_edge((2, 1, 5, 3), ResultTableEdge::Left),
+            (2, 3, 5, 1)
+        );
+    }
+
+    #[test]
+    fn hidden_left_boundary_shift_restore_keeps_previous_multirow_selection() {
+        assert_eq!(
+            ResultTableWidget::hidden_left_boundary_shift_restore_bounds(
+                Some((2, 1, 5, 3)),
+                (5, 0, 5, 0),
+                8,
+                4,
+                Some(0),
+                Key::Left,
+                Key::Left,
+            ),
+            Some((2, 1, 5, 3))
+        );
+    }
+
+    #[test]
+    fn hidden_left_boundary_shift_restore_ignores_visible_right_edge_shrink() {
+        assert_eq!(
+            ResultTableWidget::hidden_left_boundary_shift_restore_bounds(
+                Some((2, 1, 5, 3)),
+                (2, 1, 5, 2),
+                8,
+                4,
+                Some(0),
+                Key::Left,
+                Key::Left,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn hidden_left_boundary_shift_restore_ignores_non_boundary_selection() {
+        assert_eq!(
+            ResultTableWidget::hidden_left_boundary_shift_restore_bounds(
+                Some((2, 2, 5, 3)),
+                (2, 1, 5, 3),
+                8,
+                4,
+                Some(0),
+                Key::Left,
+                Key::Left,
+            ),
+            None
         );
     }
 
