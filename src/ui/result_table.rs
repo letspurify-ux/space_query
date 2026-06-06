@@ -2049,7 +2049,7 @@ impl ResultTableWidget {
                             Self::resolve_double_click_target_cell(&table_for_handle)
                                 .or_else(|| Self::get_cell_at_mouse(&table_for_handle))
                         } else {
-                            Self::get_cell_at_mouse(&table_for_handle)
+                            Self::native_selected_cell_after_push(&table_for_handle)
                         };
 
                         if let Some((row, col)) = target_cell {
@@ -4261,12 +4261,24 @@ impl ResultTableWidget {
     }
 
     fn resolve_double_click_target_cell(table: &Table) -> Option<(i32, i32)> {
-        let rows = usize::try_from(table.rows().max(0)).ok()?;
-        let cols = usize::try_from(table.cols().max(0)).ok()?;
-        let (row, col) = Self::resolve_update_target_cell(table.get_selection(), rows, cols, None)?;
-        let row = i32::try_from(row).ok()?;
-        let col = i32::try_from(col).ok()?;
-        Some((row, col))
+        Self::native_selected_cell_after_push(table)
+    }
+
+    fn native_selected_cell_after_push(table: &Table) -> Option<(i32, i32)> {
+        Self::single_cell_from_selection(
+            table.get_selection(),
+            table.rows().max(0) as usize,
+            table.cols().max(0) as usize,
+        )
+    }
+
+    fn single_cell_from_selection(
+        selection: (i32, i32, i32, i32),
+        max_rows: usize,
+        max_cols: usize,
+    ) -> Option<(i32, i32)> {
+        let (row, col) = Self::resolve_update_target_cell(selection, max_rows, max_cols, None)?;
+        Some((i32::try_from(row).ok()?, i32::try_from(col).ok()?))
     }
 
     fn visible_cell_bounds(table: &Table, start_row: i32, start_col: i32) -> Option<(i32, i32)> {
@@ -8222,6 +8234,22 @@ mod row_edit_sql_tests {
         );
         assert_eq!(
             ResultTableWidget::resolve_update_target_cell((2, 3, 4, 3), 10, 10, None),
+            None
+        );
+    }
+
+    #[test]
+    fn single_cell_from_selection_accepts_only_native_single_cell_selection() {
+        assert_eq!(
+            ResultTableWidget::single_cell_from_selection((2, 3, 2, 3), 10, 10),
+            Some((2, 3))
+        );
+        assert_eq!(
+            ResultTableWidget::single_cell_from_selection((2, 0, 2, 9), 10, 10),
+            None
+        );
+        assert_eq!(
+            ResultTableWidget::single_cell_from_selection((0, 3, 9, 3), 10, 10),
             None
         );
     }
