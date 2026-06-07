@@ -1116,7 +1116,11 @@ impl ResultTableWidget {
         let target_row = target_row as i32;
         let target_col = target_col as i32;
         table.set_selection(target_row, target_col, target_row, target_col);
-        table.set_row_position(target_row);
+        table.set_row_position(Self::row_position_for_edge_target(
+            table,
+            target_row as usize,
+            edge,
+        ));
         table.set_col_position(target_col);
         table.redraw();
         true
@@ -1153,9 +1157,70 @@ impl ResultTableWidget {
             ResultTableEdge::Left => table.set_col_position(col_start as i32),
             ResultTableEdge::Right => table.set_col_position(col_end as i32),
             ResultTableEdge::Up => table.set_row_position(row_start as i32),
-            ResultTableEdge::Down => table.set_row_position(row_end as i32),
+            ResultTableEdge::Down => {
+                table.set_row_position(Self::row_position_for_edge_target(table, row_end, edge))
+            }
         }
         table.redraw();
+    }
+
+    fn row_position_for_edge_target(
+        table: &Table,
+        target_row: usize,
+        edge: ResultTableEdge,
+    ) -> i32 {
+        let rows = table.rows().max(0) as usize;
+        if rows == 0 {
+            return 0;
+        }
+        let target_row = target_row.min(rows.saturating_sub(1));
+        let visible_rows =
+            Self::fully_visible_row_count_for_table(table, target_row as i32, rows as i32);
+        Self::bounded_row_position_for_edge_target(target_row, rows, visible_rows, edge)
+    }
+
+    fn bounded_row_position_for_edge_target(
+        target_row: usize,
+        rows: usize,
+        visible_rows: usize,
+        edge: ResultTableEdge,
+    ) -> i32 {
+        if rows == 0 {
+            return 0;
+        }
+        let target_row = target_row.min(rows.saturating_sub(1));
+        let visible_rows = visible_rows.max(1).min(rows);
+        let row_position = if edge == ResultTableEdge::Down {
+            target_row.saturating_sub(visible_rows.saturating_sub(1))
+        } else {
+            target_row
+        };
+        row_position.min(rows.saturating_sub(1)) as i32
+    }
+
+    fn fully_visible_row_count_for_table(table: &Table, anchor_row: i32, rows: i32) -> usize {
+        if rows <= 0 {
+            return 1;
+        }
+        let anchor_row = anchor_row.max(0).min(rows.saturating_sub(1));
+        let row_h = Self::uniform_row_height_near_viewport(table, anchor_row, rows)
+            .unwrap_or_else(|| table.row_height(anchor_row));
+        if row_h <= 0 {
+            return 1;
+        }
+        let data_top = table.y().saturating_add(table.col_header_height());
+        let data_bottom = Self::table_row_viewport_bottom(table);
+        let visible_height = data_bottom.saturating_sub(data_top);
+        safe_div(visible_height, row_h).max(1) as usize
+    }
+
+    fn table_row_viewport_bottom(table: &Table) -> i32 {
+        let hsb = table.hscrollbar();
+        if hsb.visible() {
+            hsb.y()
+        } else {
+            table.y().saturating_add(table.h())
+        }
     }
 
     fn oriented_selection_for_edge(
@@ -8430,6 +8495,58 @@ mod row_edit_sql_tests {
                 ResultTableEdge::Down,
             ),
             Some((2, 1, 7, 2))
+        );
+    }
+
+    #[test]
+    fn down_edge_row_position_keeps_last_row_visible_without_overshooting_scroll_range() {
+        assert_eq!(
+            ResultTableWidget::bounded_row_position_for_edge_target(
+                99,
+                100,
+                20,
+                ResultTableEdge::Down,
+            ),
+            80
+        );
+    }
+
+    #[test]
+    fn down_edge_row_position_uses_zero_when_all_rows_are_visible() {
+        assert_eq!(
+            ResultTableWidget::bounded_row_position_for_edge_target(
+                7,
+                8,
+                20,
+                ResultTableEdge::Down,
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn down_edge_row_position_uses_full_visible_rows_for_bottom_alignment() {
+        assert_eq!(
+            ResultTableWidget::bounded_row_position_for_edge_target(
+                9999,
+                10000,
+                19,
+                ResultTableEdge::Down,
+            ),
+            9981
+        );
+    }
+
+    #[test]
+    fn up_edge_row_position_keeps_target_row_as_view_start() {
+        assert_eq!(
+            ResultTableWidget::bounded_row_position_for_edge_target(
+                42,
+                100,
+                20,
+                ResultTableEdge::Up,
+            ),
+            42
         );
     }
 
