@@ -138,12 +138,27 @@ pub fn retained_session_resolution_action_allowed(
     }
 }
 
+pub fn retained_session_transaction_action_allowed(
+    state: RetainedSessionState,
+    action: RetainedSessionResolutionAction,
+) -> bool {
+    match action {
+        RetainedSessionResolutionAction::Commit | RetainedSessionResolutionAction::Rollback => {
+            state.transaction_state() != TransactionSessionState::InvalidSession
+        }
+        RetainedSessionResolutionAction::DiscardPhysical => {
+            state.capabilities().can_discard_physical
+        }
+    }
+}
+
 pub fn retained_session_transaction_resolution_should_discard_after_success(
     state: RetainedSessionState,
 ) -> bool {
     state.capabilities().discard_after_transaction_resolution
 }
 
+#[cfg(test)]
 pub(crate) fn retained_session_outcome_after_transaction_resolution_success(
     prior_state: RetainedSessionState,
     retained_state_after_success: RetainedSessionState,
@@ -160,6 +175,15 @@ pub fn retained_session_transaction_resolution_unavailable_message(
 ) -> String {
     format!(
         "A {} DB session cannot be resolved with commit/rollback. Discard the session or run an explicit cleanup first.",
+        state.label()
+    )
+}
+
+pub fn retained_session_transaction_action_unavailable_message(
+    state: RetainedSessionState,
+) -> String {
+    format!(
+        "Cannot run commit/rollback on a {} retained DB session. Discard the session or reconnect first.",
         state.label()
     )
 }
@@ -9357,6 +9381,35 @@ mod tests {
         assert!(retained_session_resolution_action_allowed(
             lock_only,
             RetainedSessionResolutionAction::DiscardPhysical
+        ));
+    }
+
+    #[test]
+    fn retained_transaction_action_policy_allows_valid_clean_sessions() {
+        let clean = RetainedSessionState::default();
+        let residue_only = RetainedSessionState::from_parts(
+            TransactionSessionState::Clean,
+            SessionResidueState::new(true),
+            SessionLockState::default(),
+        );
+        let lock_only = RetainedSessionState::new(TransactionSessionState::Clean, false, true);
+
+        for state in [clean, residue_only, lock_only] {
+            assert!(retained_session_transaction_action_allowed(
+                state,
+                RetainedSessionResolutionAction::Commit
+            ));
+            assert!(retained_session_transaction_action_allowed(
+                state,
+                RetainedSessionResolutionAction::Rollback
+            ));
+        }
+
+        let invalid =
+            RetainedSessionState::from_transaction_state(TransactionSessionState::InvalidSession);
+        assert!(!retained_session_transaction_action_allowed(
+            invalid,
+            RetainedSessionResolutionAction::Commit
         ));
     }
 

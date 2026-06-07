@@ -749,21 +749,21 @@ fn ensure_retained_session_resolution_action_allowed(
     }
 }
 
-fn retained_session_disposition_after_transaction_resolution_success(
-    prior_retained_state: RetainedSessionState,
+fn ensure_retained_session_transaction_action_allowed(
+    retained_state: RetainedSessionState,
+    action: RetainedSessionResolutionAction,
+) -> Result<(), String> {
+    if crate::db::retained_session_transaction_action_allowed(retained_state, action) {
+        Ok(())
+    } else {
+        Err(crate::db::retained_session_transaction_action_unavailable_message(retained_state))
+    }
+}
+
+fn retained_session_disposition_after_transaction_action_success(
     retained_state_after_success: RetainedSessionState,
 ) -> RetainedSessionDisposition {
-    match crate::db::retained_session_outcome_after_transaction_resolution_success(
-        prior_retained_state,
-        retained_state_after_success,
-    ) {
-        crate::db::RetainedSessionOutcome::Retain(retained_state) => {
-            RetainedSessionDisposition::Retain(retained_state)
-        }
-        crate::db::RetainedSessionOutcome::DiscardPhysical => {
-            RetainedSessionDisposition::DiscardPhysical
-        }
-    }
+    RetainedSessionDisposition::Retain(retained_state_after_success)
 }
 
 fn retained_session_disposition_after_late_cancelled_transaction_action(
@@ -771,8 +771,7 @@ fn retained_session_disposition_after_late_cancelled_transaction_action(
     result: &Result<(), String>,
 ) -> RetainedSessionDisposition {
     match result {
-        Ok(()) => retained_session_disposition_after_transaction_resolution_success(
-            prior_retained_state,
+        Ok(()) => retained_session_disposition_after_transaction_action_success(
             prior_retained_state.with_transaction_state(TransactionSessionState::Clean),
         ),
         Err(message) if SqlEditorWidget::oracle_error_message_allows_session_reuse(message) => {
@@ -832,7 +831,7 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
         let db_conn = match lease {
             DbSessionLease::Oracle(db_conn) => db_conn,
             DbSessionLease::OracleThin(mut thin_conn) => {
-                if let Err(message) = ensure_retained_session_resolution_action_allowed(
+                if let Err(message) = ensure_retained_session_transaction_action_allowed(
                     prior_retained_state,
                     resolution_action,
                 ) {
@@ -919,8 +918,7 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
                     let retained_state_after_success =
                         prior_retained_state.with_transaction_state(transaction_state);
                     let disposition = if result.is_ok() {
-                        retained_session_disposition_after_transaction_resolution_success(
-                            prior_retained_state,
+                        retained_session_disposition_after_transaction_action_success(
                             retained_state_after_success,
                         )
                     } else {
@@ -954,7 +952,7 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
                 return Err("Expected Oracle retained session".to_string());
             }
         };
-        if let Err(message) = ensure_retained_session_resolution_action_allowed(
+        if let Err(message) = ensure_retained_session_transaction_action_allowed(
             prior_retained_state,
             resolution_action,
         ) {
@@ -1030,8 +1028,7 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
             let retained_state_after_success =
                 prior_retained_state.with_transaction_state(transaction_state);
             let disposition = if result.is_ok() {
-                retained_session_disposition_after_transaction_resolution_success(
-                    prior_retained_state,
+                retained_session_disposition_after_transaction_action_success(
                     retained_state_after_success,
                 )
             } else {
@@ -4647,6 +4644,7 @@ impl SqlEditorWidget {
 mod transaction_action_tests {
     use super::{
         ensure_retained_session_resolution_action_allowed,
+        ensure_retained_session_transaction_action_allowed,
         retained_session_disposition_after_late_cancelled_transaction_action, SqlEditorWidget,
     };
     use crate::db::{
@@ -4674,6 +4672,47 @@ mod transaction_action_tests {
             )
             .is_ok());
         }
+    }
+
+    #[test]
+    fn transaction_action_preflight_allows_clean_retained_session_state() {
+        let clean = RetainedSessionState::default();
+        let session_residue = RetainedSessionState::from_parts(
+            TransactionSessionState::Clean,
+            SessionResidueState::new(true),
+            SessionLockState::default(),
+        );
+        let session_lock = RetainedSessionState::new(TransactionSessionState::Clean, true, false);
+
+        for retained_state in [clean, session_residue, session_lock] {
+            assert!(ensure_retained_session_transaction_action_allowed(
+                retained_state,
+                RetainedSessionResolutionAction::Commit
+            )
+            .is_ok());
+            assert!(ensure_retained_session_transaction_action_allowed(
+                retained_state,
+                RetainedSessionResolutionAction::Rollback
+            )
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn transaction_action_preflight_rejects_invalid_session() {
+        let invalid =
+            RetainedSessionState::from_transaction_state(TransactionSessionState::InvalidSession);
+
+        let message = ensure_retained_session_transaction_action_allowed(
+            invalid,
+            RetainedSessionResolutionAction::Commit,
+        )
+        .expect_err("commit/rollback must not run on an invalid retained session");
+
+        assert!(
+            message.contains("Cannot run commit/rollback"),
+            "unexpected message: {message}"
+        );
     }
 
     #[test]
@@ -4725,7 +4764,9 @@ mod transaction_action_tests {
                 dirty_with_session_residue,
                 &success,
             ),
-            RetainedSessionDisposition::DiscardPhysical
+            RetainedSessionDisposition::Retain(
+                dirty_with_session_residue.with_transaction_state(TransactionSessionState::Clean)
+            )
         );
     }
 

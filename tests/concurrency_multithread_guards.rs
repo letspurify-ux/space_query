@@ -251,17 +251,18 @@ fn transaction_actions_require_current_tab_session() {
         "MySQL/MariaDB commit/rollback must require an existing tab session and use the retained DB type"
     );
     assert!(
-        backends.contains("ensure_retained_session_resolution_action_allowed"),
-        "Commit/rollback must not run against retained sessions that commit/rollback cannot resolve"
+        backends.contains("ensure_retained_session_transaction_action_allowed"),
+        "Toolbar commit/rollback must run as a transaction-only action against valid retained sessions"
     );
     assert!(
         !backends.contains("Ok(()) => Err(SqlEditorWidget::cancel_message())"),
         "Oracle commit/rollback success must not be reported as cancelled when a cancel flag arrives after the action completed"
     );
     assert!(
-        backends.contains("retained_session_disposition_after_transaction_resolution_success")
-            && execution.contains("discard_after_successful_transaction_resolution"),
-        "Successful toolbar commit/rollback must discard retained sessions whose non-transaction state cannot be resolved by commit/rollback"
+        backends.contains("retained_session_disposition_after_transaction_action_success")
+            && execution.contains("transaction_action_succeeded")
+            && !execution.contains("discard_after_successful_transaction_resolution"),
+        "Successful toolbar commit/rollback must preserve non-transaction retained session state"
     );
 }
 
@@ -388,10 +389,8 @@ fn mysql_reused_tab_session_reselects_global_database_before_execution() {
         "Global database reselection should run even when the retained tab session has transaction state"
     );
     let resolution_preflight = helper
-        .find("ensure_retained_session_resolution_action_allowed")
-        .expect(
-            "MySQL retained session acquisition should preflight transaction resolution actions",
-        );
+        .find("ensure_retained_session_transaction_action_allowed")
+        .expect("MySQL retained session acquisition should preflight transaction actions");
     let reusable_readiness_check = helper
         .find("Self::reusable_mysql_pooled_session_is_ready")
         .expect(
@@ -1660,13 +1659,14 @@ fn regression_08_commit_rollback_require_retained_tab_session_not_live_fallback(
         "MySQL/MariaDB commit/rollback must require an existing retained tab session"
     );
     assert!(
-        backends.contains("ensure_retained_session_resolution_action_allowed"),
-        "Commit/rollback must reject retained sessions that commit/rollback cannot resolve"
+        backends.contains("ensure_retained_session_transaction_action_allowed"),
+        "Commit/rollback must reject invalid retained sessions while allowing clean transaction actions"
     );
     assert!(
-        backends.contains("retained_session_disposition_after_transaction_resolution_success")
-            && execution.contains("discard_after_successful_transaction_resolution"),
-        "Commit/rollback must discard retained sessions that still need physical-session cleanup after transaction resolution"
+        backends.contains("retained_session_disposition_after_transaction_action_success")
+            && execution.contains("transaction_action_succeeded")
+            && !execution.contains("discard_after_successful_transaction_resolution"),
+        "Commit/rollback must preserve session residue while clearing only transaction state"
     );
 }
 

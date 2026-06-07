@@ -17954,7 +17954,7 @@ impl SqlEditorWidget {
                     return Err("Expected MySQL pool session".to_string());
                 };
                 if let Some(resolution_action) = required_resolution_action {
-                    if let Err(message) = ensure_retained_session_resolution_action_allowed(
+                    if let Err(message) = ensure_retained_session_transaction_action_allowed(
                         prior_retained_state,
                         resolution_action,
                     ) {
@@ -19437,7 +19437,7 @@ impl SqlEditorWidget {
         }
 
         if let Some(resolution_action) = required_resolution_action {
-            if let Err(err) = ensure_retained_session_resolution_action_allowed(
+            if let Err(err) = ensure_retained_session_transaction_action_allowed(
                 prior_retained_state,
                 resolution_action,
             ) {
@@ -19823,14 +19823,11 @@ impl SqlEditorWidget {
             current_query_cancel_handle,
             None,
         );
-        let discard_after_successful_transaction_resolution = required_resolution_action.is_some()
-            && matches!(&result, Ok(Ok(_)))
-            && crate::db::retained_session_transaction_resolution_should_discard_after_success(
-                prior_retained_state,
-            );
-        let disposition = if discard_after_successful_transaction_resolution {
-            crate::db::RetainedSessionOutcome::DiscardPhysical
-        } else if should_retain_session {
+        let transaction_action_succeeded =
+            required_resolution_action.is_some() && matches!(&result, Ok(Ok(_)));
+        let transaction_action_may_discard_without_error = transaction_action_succeeded
+            && !prior_retained_state.requires_physical_session_preservation();
+        let disposition = if should_retain_session {
             let fallback_on_error = crate::db::mysql_transaction_probe_fallback_on_error(
                 prior_retained_state,
                 statement_effects,
@@ -19885,7 +19882,7 @@ impl SqlEditorWidget {
         }
         if matches!(&result, Ok(Ok(_)))
             && !should_retain_session
-            && !discard_after_successful_transaction_resolution
+            && !transaction_action_may_discard_without_error
             && Self::mysql_success_requires_retained_session_after_action(
                 db_type,
                 prior_retained_state,
