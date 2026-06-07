@@ -292,6 +292,8 @@ struct DragState {
     header_sort_start_y: i32,
     last_selection: Option<(i32, i32, i32, i32)>,
     last_col_position: Option<i32>,
+    shift_click_base_selection: Option<(i32, i32, i32, i32)>,
+    pending_shift_click_selection: Option<(i32, i32, i32, i32)>,
 }
 
 #[derive(Clone)]
@@ -1294,15 +1296,61 @@ impl ResultTableWidget {
             ResultTableEdge::Left => table.set_col_position(col_start as i32),
             ResultTableEdge::Right => table.set_col_position(col_end as i32),
             ResultTableEdge::Up => {
-                table.set_row_position(row_start as i32);
+                let target_row_position = row_start as i32;
+                table.set_row_position(target_row_position);
                 Self::restore_table_col_position(table, preserve_col_position);
+                Self::schedule_table_row_position_restore(
+                    table.clone(),
+                    target_row_position,
+                    preserve_col_position,
+                );
             }
             ResultTableEdge::Down => {
-                table.set_row_position(Self::row_position_for_edge_target(table, row_end, edge));
+                let target_row_position = Self::row_position_for_edge_target(table, row_end, edge);
+                table.set_row_position(target_row_position);
                 Self::restore_table_col_position(table, preserve_col_position);
+                Self::schedule_table_row_position_restore(
+                    table.clone(),
+                    target_row_position,
+                    preserve_col_position,
+                );
             }
         }
         table.redraw();
+    }
+
+    fn schedule_table_row_position_restore(
+        mut table: Table,
+        target_row_position: i32,
+        preserve_col_position: Option<i32>,
+    ) {
+        app::add_timeout3(0.0, move |_| {
+            if table.was_deleted() {
+                return;
+            }
+            Self::force_table_row_position(&mut table, target_row_position);
+            Self::restore_table_col_position(&mut table, preserve_col_position);
+            table.redraw();
+        });
+    }
+
+    fn force_table_row_position(table: &mut Table, target_row_position: i32) {
+        let rows = table.rows().max(0);
+        if rows <= 0 {
+            table.set_row_position(0);
+            return;
+        }
+
+        let target_row_position = target_row_position.max(0).min(rows.saturating_sub(1));
+        if table.row_position() == target_row_position && rows > 1 {
+            let nudge_row = if target_row_position > 0 {
+                target_row_position - 1
+            } else {
+                1
+            };
+            table.set_row_position(nudge_row);
+        }
+        table.set_row_position(target_row_position);
     }
 
     fn restore_table_col_position(table: &mut Table, col_position: Option<i32>) {
@@ -1725,16 +1773,30 @@ impl ResultTableWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.last_selection = selection;
         state.last_col_position = col_position;
+        state.shift_click_base_selection = None;
     }
 
     fn store_drag_selection_snapshot(
         drag_state: &Arc<Mutex<DragState>>,
         selection: Option<(i32, i32, i32, i32)>,
     ) {
-        drag_state
+        let mut state = drag_state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .last_selection = selection;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.last_selection = selection;
+        state.shift_click_base_selection = None;
+    }
+
+    fn store_oriented_selection_snapshot(
+        table: &Table,
+        drag_state: &Arc<Mutex<DragState>>,
+        selection: (i32, i32, i32, i32),
+    ) {
+        let mut state = drag_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.last_selection = Some(selection);
+        state.last_col_position = Some(table.col_position().max(0));
     }
 
     fn apply_table_metrics_for_current_font(&mut self) {
@@ -2233,6 +2295,8 @@ impl ResultTableWidget {
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
                             state.vertical_scrollbar_sequence = true;
                             state.vertical_scrollbar_fetch_requested = false;
+                            state.shift_click_base_selection = None;
+                            state.pending_shift_click_selection = None;
                             if state.vertical_scrollbar_polling {
                                 false
                             } else {
@@ -2265,10 +2329,19 @@ impl ResultTableWidget {
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                         state.vertical_scrollbar_sequence = false;
                         state.vertical_scrollbar_fetch_requested = false;
+                        state.shift_click_base_selection = None;
+                        state.pending_shift_click_selection = None;
                         return false;
                     }
                     let button = app::event_button();
                     if button == app::MouseButton::Right as i32 {
+                        {
+                            let mut state = drag_state_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            state.shift_click_base_selection = None;
+                            state.pending_shift_click_selection = None;
+                        }
                         Self::show_context_menu(
                             &table_for_handle,
                             &headers_for_handle,
@@ -2303,6 +2376,8 @@ impl ResultTableWidget {
                                 state.consume_background_pointer_sequence = false;
                                 state.vertical_scrollbar_sequence = false;
                                 state.vertical_scrollbar_fetch_requested = false;
+                                state.shift_click_base_selection = None;
+                                state.pending_shift_click_selection = None;
                                 return true;
                             }
                         }
@@ -2315,12 +2390,18 @@ impl ResultTableWidget {
                             state.consume_background_pointer_sequence = false;
                             state.vertical_scrollbar_sequence = false;
                             state.vertical_scrollbar_fetch_requested = false;
+                            if !shift {
+                                state.shift_click_base_selection = None;
+                            }
+                            state.pending_shift_click_selection = None;
                         }
                         let target_cell = if app::event_clicks() {
                             // On double-click, prefer the already-selected single cell.
                             // This avoids running a full mouse hit-test scan twice.
                             Self::resolve_double_click_target_cell(&table_for_handle)
                                 .or_else(|| Self::get_cell_at_mouse(&table_for_handle))
+                        } else if shift {
+                            Self::get_cell_at_mouse(&table_for_handle)
                         } else {
                             Self::native_selected_cell_after_push(&table_for_handle)
                         };
@@ -2363,21 +2444,21 @@ impl ResultTableWidget {
                             }
                             let max_rows = table_for_handle.rows().max(0) as usize;
                             let max_cols = table_for_handle.cols().max(0) as usize;
-                            let base_selection_bounds = if shift {
-                                drag_state_for_handle
+                            let base_selection = if shift {
+                                let mut state = drag_state_for_handle
                                     .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    .last_selection
-                                    .and_then(|selection| {
-                                        Self::normalized_selection_bounds_with_limits(
-                                            selection, max_rows, max_cols,
-                                        )
-                                    })
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                let base_selection =
+                                    state.shift_click_base_selection.or(state.last_selection);
+                                if state.shift_click_base_selection.is_none() {
+                                    state.shift_click_base_selection = state.last_selection;
+                                }
+                                base_selection
                             } else {
                                 None
                             };
-                            let next_selection = Self::expanded_selection_bounds_with_cell(
-                                base_selection_bounds,
+                            let next_selection = Self::shift_click_selection_with_cell(
+                                base_selection,
                                 row,
                                 col,
                                 max_rows,
@@ -2390,14 +2471,17 @@ impl ResultTableWidget {
                             state.consume_background_pointer_sequence = false;
                             state.vertical_scrollbar_sequence = false;
                             state.vertical_scrollbar_fetch_requested = false;
+                            state.pending_shift_click_selection =
+                                if shift { next_selection } else { None };
                             drop(state);
 
                             if let Some((row_start, col_start, row_end, col_end)) = next_selection {
                                 table_for_handle
                                     .set_selection(row_start, col_start, row_end, col_end);
-                                Self::sync_drag_selection_snapshot(
+                                Self::store_oriented_selection_snapshot(
                                     &table_for_handle,
                                     &drag_state_for_handle,
+                                    (row_start, col_start, row_end, col_end),
                                 );
                                 return true;
                             }
@@ -2425,6 +2509,8 @@ impl ResultTableWidget {
                             state.consume_background_pointer_sequence = true;
                             state.vertical_scrollbar_sequence = false;
                             state.vertical_scrollbar_fetch_requested = false;
+                            state.shift_click_base_selection = None;
+                            state.pending_shift_click_selection = None;
                             drop(state);
 
                             if table_for_handle.try_get_selection().is_some() {
@@ -2519,6 +2605,7 @@ impl ResultTableWidget {
                         consumed_background_pointer_sequence,
                         vertical_scrollbar_sequence,
                         vertical_scrollbar_fetch_requested,
+                        pending_shift_click_selection,
                     ) = {
                         let mut state = drag_state_for_handle
                             .lock()
@@ -2529,6 +2616,8 @@ impl ResultTableWidget {
                         let vertical_scrollbar_sequence = state.vertical_scrollbar_sequence;
                         let vertical_scrollbar_fetch_requested =
                             state.vertical_scrollbar_fetch_requested;
+                        let pending_shift_click_selection =
+                            state.pending_shift_click_selection.take();
                         state.vertical_scrollbar_sequence = false;
                         state.vertical_scrollbar_polling = false;
                         state.vertical_scrollbar_fetch_requested = false;
@@ -2545,6 +2634,7 @@ impl ResultTableWidget {
                             consumed_background,
                             vertical_scrollbar_sequence,
                             vertical_scrollbar_fetch_requested,
+                            pending_shift_click_selection,
                         )
                     };
                     if vertical_scrollbar_sequence {
@@ -2602,10 +2692,25 @@ impl ResultTableWidget {
                     }
                     if was_dragging || consumed_background_pointer_sequence {
                         if was_dragging {
-                            Self::sync_drag_selection_snapshot(
-                                &table_for_handle,
-                                &drag_state_for_handle,
-                            );
+                            if let Some(selection) = pending_shift_click_selection {
+                                table_for_handle.set_selection(
+                                    selection.0,
+                                    selection.1,
+                                    selection.2,
+                                    selection.3,
+                                );
+                                table_for_handle.redraw();
+                                Self::store_oriented_selection_snapshot(
+                                    &table_for_handle,
+                                    &drag_state_for_handle,
+                                    selection,
+                                );
+                            } else {
+                                Self::sync_drag_selection_snapshot(
+                                    &table_for_handle,
+                                    &drag_state_for_handle,
+                                );
+                            }
                         }
                         return true;
                     }
@@ -5491,6 +5596,64 @@ impl ResultTableWidget {
         let row = row as usize;
         let col = col as usize;
         row >= row_start && row <= row_end && col >= col_start && col <= col_end
+    }
+
+    fn oriented_selection_with_cell(
+        base_selection: Option<(i32, i32, i32, i32)>,
+        row: i32,
+        col: i32,
+        max_rows: usize,
+        max_cols: usize,
+    ) -> Option<(i32, i32, i32, i32)> {
+        if row < 0 || col < 0 || max_rows == 0 || max_cols == 0 {
+            return None;
+        }
+
+        let row = usize::try_from(row).ok()?;
+        let col = usize::try_from(col).ok()?;
+        if row >= max_rows || col >= max_cols {
+            return None;
+        }
+
+        let (anchor_row, anchor_col) = base_selection
+            .and_then(|selection| {
+                Self::oriented_selection_with_limits(selection, max_rows, max_cols)
+            })
+            .map(|(anchor_row, anchor_col, _, _)| (anchor_row, anchor_col))
+            .unwrap_or((row, col));
+
+        Some((
+            i32::try_from(anchor_row).ok()?,
+            i32::try_from(anchor_col).ok()?,
+            i32::try_from(row).ok()?,
+            i32::try_from(col).ok()?,
+        ))
+    }
+
+    fn shift_click_selection_with_cell(
+        base_selection: Option<(i32, i32, i32, i32)>,
+        row: i32,
+        col: i32,
+        max_rows: usize,
+        max_cols: usize,
+    ) -> Option<(i32, i32, i32, i32)> {
+        let Some(base_selection) = base_selection else {
+            return Self::oriented_selection_with_cell(None, row, col, max_rows, max_cols);
+        };
+
+        let base_bounds =
+            Self::normalized_selection_bounds_with_limits(base_selection, max_rows, max_cols)?;
+        if base_bounds.0 == base_bounds.2 && base_bounds.1 == base_bounds.3 {
+            return Self::oriented_selection_with_cell(
+                Some(base_selection),
+                row,
+                col,
+                max_rows,
+                max_cols,
+            );
+        }
+
+        Self::expanded_selection_bounds_with_cell(Some(base_bounds), row, col, max_rows, max_cols)
     }
 
     fn expanded_selection_bounds_with_cell(
@@ -9399,6 +9562,71 @@ mod row_edit_sql_tests {
             -1,
             0
         ));
+    }
+
+    #[test]
+    fn oriented_selection_with_cell_keeps_shift_click_anchor() {
+        let first =
+            ResultTableWidget::oriented_selection_with_cell(Some((2, 2, 2, 2)), 1, 1, 10, 10);
+        assert_eq!(first, Some((2, 2, 1, 1)));
+        assert_eq!(
+            first.and_then(ResultTableWidget::normalized_selection_bounds),
+            Some((1, 1, 2, 2))
+        );
+
+        let second = ResultTableWidget::oriented_selection_with_cell(first, 3, 3, 10, 10);
+        assert_eq!(second, Some((2, 2, 3, 3)));
+        assert_eq!(
+            second.and_then(ResultTableWidget::normalized_selection_bounds),
+            Some((2, 2, 3, 3))
+        );
+    }
+
+    #[test]
+    fn oriented_selection_with_cell_keeps_anchor_after_reversing_direction() {
+        let after_down =
+            ResultTableWidget::oriented_selection_with_cell(Some((2, 2, 2, 2)), 3, 3, 10, 10)
+                .expect("shift-click down-right selection");
+        assert_eq!(after_down, (2, 2, 3, 3));
+
+        let after_up =
+            ResultTableWidget::oriented_selection_with_cell(Some(after_down), 1, 1, 10, 10)
+                .expect("shift-click up-left selection");
+        assert_eq!(after_up, (2, 2, 1, 1));
+        assert_eq!(
+            ResultTableWidget::normalized_selection_bounds(after_up),
+            Some((1, 1, 2, 2))
+        );
+
+        let after_down_again =
+            ResultTableWidget::oriented_selection_with_cell(Some(after_up), 3, 3, 10, 10)
+                .expect("shift-click down-right again selection");
+        assert_eq!(after_down_again, (2, 2, 3, 3));
+        assert_eq!(
+            ResultTableWidget::normalized_selection_bounds(after_down_again),
+            Some((2, 2, 3, 3))
+        );
+    }
+
+    #[test]
+    fn shift_click_selection_with_cell_preserves_initial_multi_cell_base() {
+        let base_selection = Some((2, 2, 3, 3));
+
+        let after_up_left =
+            ResultTableWidget::shift_click_selection_with_cell(base_selection, 1, 1, 10, 10)
+                .expect("shift-click up-left from multi-cell base");
+        assert_eq!(
+            ResultTableWidget::normalized_selection_bounds(after_up_left),
+            Some((1, 1, 3, 3))
+        );
+
+        let after_down_right =
+            ResultTableWidget::shift_click_selection_with_cell(base_selection, 4, 4, 10, 10)
+                .expect("shift-click down-right from same multi-cell base");
+        assert_eq!(
+            ResultTableWidget::normalized_selection_bounds(after_down_right),
+            Some((2, 2, 4, 4))
+        );
     }
 
     #[test]
