@@ -97,8 +97,14 @@ enum LazyFetchPendingAction {
     HeaderSort(usize),
     CopyAll,
     SelectAll,
-    MoveToEdge(ResultTableEdge),
-    ExtendSelectionToEdge(ResultTableEdge),
+    MoveToEdge {
+        edge: ResultTableEdge,
+        selection: Option<(i32, i32, i32, i32)>,
+    },
+    ExtendSelectionToEdge {
+        edge: ResultTableEdge,
+        selection: Option<(i32, i32, i32, i32)>,
+    },
     ExportCsv(Box<dyn FnMut(String, usize)>),
 }
 
@@ -285,6 +291,7 @@ struct DragState {
     header_sort_start_x: i32,
     header_sort_start_y: i32,
     last_selection: Option<(i32, i32, i32, i32)>,
+    last_col_position: Option<i32>,
 }
 
 #[derive(Clone)]
@@ -1092,17 +1099,19 @@ impl ResultTableWidget {
         }
     }
 
-    fn move_table_selection_to_edge(
+    fn move_table_selection_to_edge_from_selection(
         table: &mut Table,
+        selection: (i32, i32, i32, i32),
         edge: ResultTableEdge,
         hidden_col: Option<usize>,
+        preserve_col_position: Option<i32>,
     ) -> bool {
         let rows = table.rows().max(0) as usize;
         let cols = table.cols().max(0) as usize;
         let fallback_row = table.row_position().max(0) as usize;
         let fallback_col = table.col_position().max(0) as usize;
         let Some((target_row, target_col)) = Self::target_cell_for_edge(
-            table.get_selection(),
+            selection,
             rows,
             cols,
             hidden_col,
@@ -1121,29 +1130,22 @@ impl ResultTableWidget {
             target_row as usize,
             edge,
         ));
-        table.set_col_position(target_col);
+        match edge {
+            ResultTableEdge::Left | ResultTableEdge::Right => table.set_col_position(target_col),
+            ResultTableEdge::Up | ResultTableEdge::Down => {
+                Self::restore_table_col_position(table, preserve_col_position)
+            }
+        }
         table.redraw();
         true
-    }
-
-    fn extend_table_selection_to_edge(
-        table: &mut Table,
-        edge: ResultTableEdge,
-        hidden_col: Option<usize>,
-    ) -> bool {
-        Self::extend_table_selection_to_edge_from_selection(
-            table,
-            table.get_selection(),
-            edge,
-            hidden_col,
-        )
     }
 
     fn set_table_selection_bounds(
         table: &mut Table,
         bounds: (usize, usize, usize, usize),
         edge: ResultTableEdge,
-    ) {
+        preserve_col_position: Option<i32>,
+    ) -> (i32, i32, i32, i32) {
         let (row_start, col_start, row_end, col_end) = bounds;
         let (select_row_start, select_col_start, select_row_end, select_col_end) =
             Self::oriented_selection_for_edge(bounds, edge);
@@ -1156,12 +1158,22 @@ impl ResultTableWidget {
         match edge {
             ResultTableEdge::Left => table.set_col_position(col_start as i32),
             ResultTableEdge::Right => table.set_col_position(col_end as i32),
-            ResultTableEdge::Up => table.set_row_position(row_start as i32),
+            ResultTableEdge::Up => {
+                table.set_row_position(row_start as i32);
+                Self::restore_table_col_position(table, preserve_col_position);
+            }
             ResultTableEdge::Down => {
-                table.set_row_position(Self::row_position_for_edge_target(table, row_end, edge))
+                table.set_row_position(Self::row_position_for_edge_target(table, row_end, edge));
+                Self::restore_table_col_position(table, preserve_col_position);
             }
         }
         table.redraw();
+        (
+            select_row_start,
+            select_col_start,
+            select_row_end,
+            select_col_end,
+        )
     }
 
     fn row_position_for_edge_target(
@@ -1246,21 +1258,159 @@ impl ResultTableWidget {
         selection: (i32, i32, i32, i32),
         edge: ResultTableEdge,
         hidden_col: Option<usize>,
-    ) -> bool {
+        preserve_col_position: Option<i32>,
+    ) -> Option<(i32, i32, i32, i32)> {
         let max_rows = table.rows().max(0) as usize;
         let max_cols = table.cols().max(0) as usize;
-        let Some((row_start, col_start, row_end, col_end)) =
-            Self::extended_selection_bounds_to_edge(
-                selection, max_rows, max_cols, hidden_col, edge,
-            )
+        let Some(next_selection) =
+            Self::oriented_selection_to_edge(selection, max_rows, max_cols, hidden_col, edge)
         else {
-            return false;
+            return None;
         };
 
-        Self::set_table_selection_bounds(table, (row_start, col_start, row_end, col_end), edge);
-        true
+        Self::set_table_oriented_selection(table, next_selection, edge, preserve_col_position);
+        Some(next_selection)
     }
 
+    fn set_table_oriented_selection(
+        table: &mut Table,
+        selection: (i32, i32, i32, i32),
+        edge: ResultTableEdge,
+        preserve_col_position: Option<i32>,
+    ) {
+        table.set_selection(selection.0, selection.1, selection.2, selection.3);
+        let Some((row_start, col_start, row_end, col_end)) =
+            Self::normalized_selection_bounds_with_limits(
+                selection,
+                table.rows().max(0) as usize,
+                table.cols().max(0) as usize,
+            )
+        else {
+            table.redraw();
+            return;
+        };
+
+        match edge {
+            ResultTableEdge::Left => table.set_col_position(col_start as i32),
+            ResultTableEdge::Right => table.set_col_position(col_end as i32),
+            ResultTableEdge::Up => {
+                table.set_row_position(row_start as i32);
+                Self::restore_table_col_position(table, preserve_col_position);
+            }
+            ResultTableEdge::Down => {
+                table.set_row_position(Self::row_position_for_edge_target(table, row_end, edge));
+                Self::restore_table_col_position(table, preserve_col_position);
+            }
+        }
+        table.redraw();
+    }
+
+    fn restore_table_col_position(table: &mut Table, col_position: Option<i32>) {
+        let Some(col_position) = col_position else {
+            return;
+        };
+        let cols = table.cols();
+        if cols <= 0 {
+            table.set_col_position(0);
+            return;
+        }
+        table.set_col_position(col_position.max(0).min(cols.saturating_sub(1)));
+    }
+
+    fn preserved_col_position_for_edge(
+        edge: ResultTableEdge,
+        previous_col_position: Option<i32>,
+    ) -> Option<i32> {
+        match edge {
+            ResultTableEdge::Up | ResultTableEdge::Down => previous_col_position,
+            ResultTableEdge::Left | ResultTableEdge::Right => None,
+        }
+    }
+
+    fn oriented_selection_with_limits(
+        selection: (i32, i32, i32, i32),
+        max_rows: usize,
+        max_cols: usize,
+    ) -> Option<(usize, usize, usize, usize)> {
+        if max_rows == 0 || max_cols == 0 {
+            return None;
+        }
+        let (anchor_row, anchor_col, focus_row, focus_col) = selection;
+        if anchor_row < 0 || anchor_col < 0 || focus_row < 0 || focus_col < 0 {
+            return None;
+        }
+        Self::normalized_selection_bounds_with_limits(selection, max_rows, max_cols)?;
+
+        let max_row = max_rows.saturating_sub(1);
+        let max_col = max_cols.saturating_sub(1);
+        Some((
+            (anchor_row as usize).min(max_row),
+            (anchor_col as usize).min(max_col),
+            (focus_row as usize).min(max_row),
+            (focus_col as usize).min(max_col),
+        ))
+    }
+
+    fn oriented_selection_to_edge(
+        selection: (i32, i32, i32, i32),
+        max_rows: usize,
+        max_cols: usize,
+        hidden_col: Option<usize>,
+        edge: ResultTableEdge,
+    ) -> Option<(i32, i32, i32, i32)> {
+        let (anchor_row, raw_anchor_col, focus_row, raw_focus_col) =
+            Self::oriented_selection_with_limits(selection, max_rows, max_cols)?;
+        let (row_start, col_start, row_end, col_end) =
+            Self::selection_bounds_excluding_hidden_column(
+                selection, max_rows, max_cols, hidden_col,
+            )?;
+        let (first_visible_col, last_visible_col) =
+            Self::visible_column_bounds(max_cols, hidden_col)?;
+
+        let anchor_col = Self::nearest_visible_column(max_cols, raw_anchor_col, hidden_col)?;
+        let focus_col = Self::nearest_visible_column(max_cols, raw_focus_col, hidden_col)?;
+        let focus_col_for_vertical = if anchor_col <= focus_col {
+            col_end
+        } else {
+            col_start
+        };
+        let focus_row_for_horizontal = if anchor_row <= focus_row {
+            row_end
+        } else {
+            row_start
+        };
+
+        let (anchor_row, anchor_col, focus_row, focus_col) = match edge {
+            ResultTableEdge::Left => (
+                anchor_row,
+                anchor_col,
+                focus_row_for_horizontal,
+                first_visible_col,
+            ),
+            ResultTableEdge::Right => (
+                anchor_row,
+                anchor_col,
+                focus_row_for_horizontal,
+                last_visible_col,
+            ),
+            ResultTableEdge::Up => (anchor_row, anchor_col, 0, focus_col_for_vertical),
+            ResultTableEdge::Down => (
+                anchor_row,
+                anchor_col,
+                max_rows.saturating_sub(1),
+                focus_col_for_vertical,
+            ),
+        };
+
+        Some((
+            anchor_row as i32,
+            anchor_col as i32,
+            focus_row as i32,
+            focus_col as i32,
+        ))
+    }
+
+    #[cfg(test)]
     fn extended_selection_bounds_to_edge(
         selection: (i32, i32, i32, i32),
         max_rows: usize,
@@ -1290,6 +1440,8 @@ impl ResultTableWidget {
         key: Key,
         original_key: Key,
         hidden_col: Option<usize>,
+        previous_selection: Option<(i32, i32, i32, i32)>,
+        previous_col_position: Option<i32>,
         lazy_fetch_session: &Arc<Mutex<Option<u64>>>,
         lazy_fetch_callback: &LazyFetchCallback,
         pending_lazy_actions: &Arc<Mutex<VecDeque<(u64, LazyFetchPendingAction)>>>,
@@ -1298,18 +1450,37 @@ impl ResultTableWidget {
             return false;
         };
 
+        let selection = previous_selection.unwrap_or_else(|| table.get_selection());
+        let preserve_col_position =
+            Self::preserved_col_position_for_edge(edge, previous_col_position);
         if edge == ResultTableEdge::Down
             && Self::queue_lazy_action_if_active(
                 lazy_fetch_session,
                 lazy_fetch_callback,
                 pending_lazy_actions,
-                LazyFetchPendingAction::MoveToEdge(edge),
+                LazyFetchPendingAction::MoveToEdge {
+                    edge,
+                    selection: Some(selection),
+                },
             )
         {
+            Self::move_table_selection_to_edge_from_selection(
+                table,
+                selection,
+                edge,
+                hidden_col,
+                preserve_col_position,
+            );
             return true;
         }
 
-        Self::move_table_selection_to_edge(table, edge, hidden_col);
+        Self::move_table_selection_to_edge_from_selection(
+            table,
+            selection,
+            edge,
+            hidden_col,
+            preserve_col_position,
+        );
         true
     }
 
@@ -1319,6 +1490,8 @@ impl ResultTableWidget {
         original_key: Key,
         hidden_col: Option<usize>,
         previous_selection: Option<(i32, i32, i32, i32)>,
+        previous_col_position: Option<i32>,
+        drag_state: &Arc<Mutex<DragState>>,
         lazy_fetch_session: &Arc<Mutex<Option<u64>>>,
         lazy_fetch_callback: &LazyFetchCallback,
         pending_lazy_actions: &Arc<Mutex<VecDeque<(u64, LazyFetchPendingAction)>>>,
@@ -1327,14 +1500,29 @@ impl ResultTableWidget {
             return false;
         };
 
+        let selection = previous_selection.unwrap_or_else(|| table.get_selection());
+        let preserve_col_position =
+            Self::preserved_col_position_for_edge(edge, previous_col_position);
         if edge == ResultTableEdge::Down
             && Self::queue_lazy_action_if_active(
                 lazy_fetch_session,
                 lazy_fetch_callback,
                 pending_lazy_actions,
-                LazyFetchPendingAction::ExtendSelectionToEdge(edge),
+                LazyFetchPendingAction::ExtendSelectionToEdge {
+                    edge,
+                    selection: Some(selection),
+                },
             )
         {
+            if let Some(next_selection) = Self::extend_table_selection_to_edge_from_selection(
+                table,
+                selection,
+                edge,
+                hidden_col,
+                preserve_col_position,
+            ) {
+                Self::store_drag_selection_snapshot(drag_state, Some(next_selection));
+            }
             return true;
         }
 
@@ -1349,12 +1537,21 @@ impl ResultTableWidget {
             key,
             original_key,
         ) {
-            Self::set_table_selection_bounds(table, bounds, edge);
+            let next_selection =
+                Self::set_table_selection_bounds(table, bounds, edge, preserve_col_position);
+            Self::store_drag_selection_snapshot(drag_state, Some(next_selection));
             return true;
         }
 
-        let selection = table.get_selection();
-        Self::extend_table_selection_to_edge_from_selection(table, selection, edge, hidden_col);
+        if let Some(next_selection) = Self::extend_table_selection_to_edge_from_selection(
+            table,
+            selection,
+            edge,
+            hidden_col,
+            preserve_col_position,
+        ) {
+            Self::store_drag_selection_snapshot(drag_state, Some(next_selection));
+        }
         true
     }
 
@@ -1507,12 +1704,11 @@ impl ResultTableWidget {
     }
 
     fn current_table_selection_bounds(table: &Table) -> Option<(i32, i32, i32, i32)> {
-        let (row_start, col_start, row_end, col_end) =
-            Self::normalized_selection_bounds_with_limits(
-                table.get_selection(),
-                table.rows().max(0) as usize,
-                table.cols().max(0) as usize,
-            )?;
+        let (row_start, col_start, row_end, col_end) = Self::oriented_selection_with_limits(
+            table.get_selection(),
+            table.rows().max(0) as usize,
+            table.cols().max(0) as usize,
+        )?;
         Some((
             row_start as i32,
             col_start as i32,
@@ -1523,6 +1719,18 @@ impl ResultTableWidget {
 
     fn sync_drag_selection_snapshot(table: &Table, drag_state: &Arc<Mutex<DragState>>) {
         let selection = Self::current_table_selection_bounds(table);
+        let col_position = Some(table.col_position().max(0));
+        let mut state = drag_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.last_selection = selection;
+        state.last_col_position = col_position;
+    }
+
+    fn store_drag_selection_snapshot(
+        drag_state: &Arc<Mutex<DragState>>,
+        selection: Option<(i32, i32, i32, i32)>,
+    ) {
         drag_state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2221,10 +2429,11 @@ impl ResultTableWidget {
 
                             if table_for_handle.try_get_selection().is_some() {
                                 table_for_handle.unset_selection();
-                                drag_state_for_handle
+                                let mut state = drag_state_for_handle
                                     .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    .last_selection = None;
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                state.last_selection = None;
+                                state.last_col_position = None;
                                 table_for_handle.redraw();
                             }
                             return true;
@@ -2414,13 +2623,11 @@ impl ResultTableWidget {
                         let hidden_col = *hidden_auto_rowid_col_for_handle
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let previous_selection = if shift {
-                            drag_state_for_handle
+                        let (previous_selection, previous_col_position) = {
+                            let state = drag_state_for_handle
                                 .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .last_selection
-                        } else {
-                            None
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            (state.last_selection, state.last_col_position)
                         };
                         let handled = if shift {
                             Self::handle_ctrl_shift_arrow_selection(
@@ -2429,6 +2636,8 @@ impl ResultTableWidget {
                                 original_key,
                                 hidden_col,
                                 previous_selection,
+                                previous_col_position,
+                                &drag_state_for_handle,
                                 &lazy_fetch_session_for_handle,
                                 &lazy_fetch_callback_for_handle,
                                 &pending_lazy_actions_for_handle,
@@ -2439,16 +2648,20 @@ impl ResultTableWidget {
                                 key,
                                 original_key,
                                 hidden_col,
+                                previous_selection,
+                                previous_col_position,
                                 &lazy_fetch_session_for_handle,
                                 &lazy_fetch_callback_for_handle,
                                 &pending_lazy_actions_for_handle,
                             )
                         };
                         if handled {
-                            Self::sync_drag_selection_snapshot(
-                                &table_for_handle,
-                                &drag_state_for_handle,
-                            );
+                            if !shift {
+                                Self::sync_drag_selection_snapshot(
+                                    &table_for_handle,
+                                    &drag_state_for_handle,
+                                );
+                            }
                             return true;
                         }
                     }
@@ -2496,6 +2709,7 @@ impl ResultTableWidget {
                                     &mut table_for_handle,
                                     bounds,
                                     ResultTableEdge::Left,
+                                    None,
                                 );
                                 Self::sync_drag_selection_snapshot(
                                     &table_for_handle,
@@ -2648,13 +2862,11 @@ impl ResultTableWidget {
                         let hidden_col = *hidden_auto_rowid_col_for_handle
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let previous_selection = if shift {
-                            drag_state_for_handle
+                        let (previous_selection, previous_col_position) = {
+                            let state = drag_state_for_handle
                                 .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .last_selection
-                        } else {
-                            None
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            (state.last_selection, state.last_col_position)
                         };
                         let handled = if shift {
                             Self::handle_ctrl_shift_arrow_selection(
@@ -2663,6 +2875,8 @@ impl ResultTableWidget {
                                 original_key,
                                 hidden_col,
                                 previous_selection,
+                                previous_col_position,
+                                &drag_state_for_handle,
                                 &lazy_fetch_session_for_handle,
                                 &lazy_fetch_callback_for_handle,
                                 &pending_lazy_actions_for_handle,
@@ -2673,16 +2887,20 @@ impl ResultTableWidget {
                                 key,
                                 original_key,
                                 hidden_col,
+                                previous_selection,
+                                previous_col_position,
                                 &lazy_fetch_session_for_handle,
                                 &lazy_fetch_callback_for_handle,
                                 &pending_lazy_actions_for_handle,
                             )
                         };
                         if handled {
-                            Self::sync_drag_selection_snapshot(
-                                &table_for_handle,
-                                &drag_state_for_handle,
-                            );
+                            if !shift {
+                                Self::sync_drag_selection_snapshot(
+                                    &table_for_handle,
+                                    &drag_state_for_handle,
+                                );
+                            }
                             return true;
                         }
                     }
@@ -7496,15 +7714,34 @@ impl ResultTableWidget {
                     Self::copy_all_to_clipboard(&self.headers, &self.full_data, hidden_col);
                 }
                 LazyFetchPendingAction::SelectAll => self.select_all(),
-                LazyFetchPendingAction::MoveToEdge(edge) => {
+                LazyFetchPendingAction::MoveToEdge { edge, selection } => {
                     let hidden_col = self.hidden_auto_rowid_col_value();
-                    Self::move_table_selection_to_edge(&mut self.table, edge, hidden_col);
+                    let selection = selection.unwrap_or_else(|| self.table.get_selection());
+                    let col_position = Some(self.table.col_position());
+                    Self::move_table_selection_to_edge_from_selection(
+                        &mut self.table,
+                        selection,
+                        edge,
+                        hidden_col,
+                        col_position,
+                    );
                     Self::sync_drag_selection_snapshot(&self.table, &self.drag_state);
                 }
-                LazyFetchPendingAction::ExtendSelectionToEdge(edge) => {
+                LazyFetchPendingAction::ExtendSelectionToEdge { edge, selection } => {
                     let hidden_col = self.hidden_auto_rowid_col_value();
-                    Self::extend_table_selection_to_edge(&mut self.table, edge, hidden_col);
-                    Self::sync_drag_selection_snapshot(&self.table, &self.drag_state);
+                    let selection = selection.unwrap_or_else(|| self.table.get_selection());
+                    let col_position = Some(self.table.col_position());
+                    if let Some(next_selection) =
+                        Self::extend_table_selection_to_edge_from_selection(
+                            &mut self.table,
+                            selection,
+                            edge,
+                            hidden_col,
+                            col_position,
+                        )
+                    {
+                        Self::store_drag_selection_snapshot(&self.drag_state, Some(next_selection));
+                    }
                 }
                 LazyFetchPendingAction::ExportCsv(mut callback) => {
                     let (csv, row_count) = self.current_csv_snapshot();
@@ -8365,6 +8602,126 @@ mod row_edit_sql_tests {
         assert_eq!(
             ResultTableWidget::oriented_selection_for_edge((2, 1, 5, 3), ResultTableEdge::Left),
             (2, 3, 5, 1)
+        );
+    }
+
+    #[test]
+    fn oriented_selection_with_limits_preserves_direction_while_clamping() {
+        assert_eq!(
+            ResultTableWidget::oriented_selection_with_limits((8, 3, 2, 1), 5, 3),
+            Some((4, 2, 2, 1))
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_up_after_down_preserves_vertical_anchor() {
+        assert_eq!(
+            ResultTableWidget::oriented_selection_to_edge(
+                (5, 2, 7, 2),
+                10,
+                4,
+                None,
+                ResultTableEdge::Up,
+            ),
+            Some((5, 2, 0, 2))
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_down_after_up_preserves_vertical_anchor() {
+        assert_eq!(
+            ResultTableWidget::oriented_selection_to_edge(
+                (5, 2, 0, 2),
+                10,
+                4,
+                None,
+                ResultTableEdge::Down,
+            ),
+            Some((5, 2, 9, 2))
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_vertical_edges_toggle_around_initial_row_anchor() {
+        let after_down = ResultTableWidget::oriented_selection_to_edge(
+            (2, 1, 2, 1),
+            10,
+            4,
+            None,
+            ResultTableEdge::Down,
+        );
+        assert_eq!(after_down, Some((2, 1, 9, 1)));
+
+        let after_up = ResultTableWidget::oriented_selection_to_edge(
+            after_down.unwrap(),
+            10,
+            4,
+            None,
+            ResultTableEdge::Up,
+        );
+        assert_eq!(after_up, Some((2, 1, 0, 1)));
+
+        assert_eq!(
+            ResultTableWidget::oriented_selection_to_edge(
+                after_up.unwrap(),
+                10,
+                4,
+                None,
+                ResultTableEdge::Down,
+            ),
+            Some((2, 1, 9, 1))
+        );
+    }
+
+    #[test]
+    fn vertical_edges_preserve_previous_horizontal_scroll_position() {
+        assert_eq!(
+            ResultTableWidget::preserved_col_position_for_edge(ResultTableEdge::Up, Some(7)),
+            Some(7)
+        );
+        assert_eq!(
+            ResultTableWidget::preserved_col_position_for_edge(ResultTableEdge::Down, Some(7)),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn horizontal_edges_do_not_preserve_previous_horizontal_scroll_position() {
+        assert_eq!(
+            ResultTableWidget::preserved_col_position_for_edge(ResultTableEdge::Left, Some(7)),
+            None
+        );
+        assert_eq!(
+            ResultTableWidget::preserved_col_position_for_edge(ResultTableEdge::Right, Some(7)),
+            None
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_vertical_edge_preserves_column_direction() {
+        assert_eq!(
+            ResultTableWidget::oriented_selection_to_edge(
+                (5, 3, 7, 1),
+                10,
+                4,
+                None,
+                ResultTableEdge::Down,
+            ),
+            Some((5, 3, 9, 1))
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_vertical_edge_maps_hidden_rowid_endpoint_to_first_visible_column() {
+        assert_eq!(
+            ResultTableWidget::oriented_selection_to_edge(
+                (5, 0, 5, 0),
+                10,
+                4,
+                Some(0),
+                ResultTableEdge::Down,
+            ),
+            Some((5, 1, 9, 1))
         );
     }
 
