@@ -567,7 +567,7 @@ fn connect_duration_descriptor_value(value: Duration) -> String {
         return format!("{}ms", value.as_millis());
     }
     let seconds = value.as_secs();
-    if seconds % 60 == 0 {
+    if seconds.is_multiple_of(60) {
         return format!("{}min", seconds / 60);
     }
     seconds.to_string()

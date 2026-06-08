@@ -18,6 +18,8 @@ use space_query::db::{ColumnInfo, QueryResult};
 #[cfg(target_os = "macos")]
 use space_query::ui::ResultTableWidget;
 #[cfg(target_os = "macos")]
+use space_query::utils::arithmetic::safe_div;
+#[cfg(target_os = "macos")]
 use std::ffi::c_void;
 #[cfg(target_os = "macos")]
 use std::os::raw::c_int;
@@ -237,7 +239,7 @@ fn click_cell(
         return Err(format!("find_cell failed for row {row}, col {col}"));
     };
 
-    let direct = (cell_x + cell_w / 2, cell_y + cell_h / 2);
+    let direct = (cell_x + safe_div(cell_w, 2), cell_y + safe_div(cell_h, 2));
     let window_relative = (win.x() + direct.0, win.y() + direct.1);
     let window_with_titlebar = (window_relative.0, window_relative.1 + 28);
     let (_, screen_y, _, screen_h) = app::screen_xywh(0);

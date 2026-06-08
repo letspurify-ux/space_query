@@ -1264,11 +1264,8 @@ impl ResultTableWidget {
     ) -> Option<(i32, i32, i32, i32)> {
         let max_rows = table.rows().max(0) as usize;
         let max_cols = table.cols().max(0) as usize;
-        let Some(next_selection) =
-            Self::oriented_selection_to_edge(selection, max_rows, max_cols, hidden_col, edge)
-        else {
-            return None;
-        };
+        let next_selection =
+            Self::oriented_selection_to_edge(selection, max_rows, max_cols, hidden_col, edge)?;
 
         Self::set_table_oriented_selection(table, next_selection, edge, preserve_col_position);
         Some(next_selection)

@@ -286,7 +286,10 @@ fn sql_keyword_positions(sql: &str) -> Vec<(String, usize)> {
             continue;
         }
         if ch == '\'' {
-            while let Some((_, next)) = chars.next() {
+            loop {
+                let Some((_, next)) = chars.next() else {
+                    break;
+                };
                 if next == '\'' {
                     if chars.peek().is_some_and(|(_, peek)| *peek == '\'') {
                         let _ = chars.next();
@@ -298,7 +301,7 @@ fn sql_keyword_positions(sql: &str) -> Vec<(String, usize)> {
             continue;
         }
         if ch == '"' {
-            while let Some((_, next)) = chars.next() {
+            for (_, next) in chars.by_ref() {
                 if next == '"' {
                     break;
                 }
@@ -307,7 +310,7 @@ fn sql_keyword_positions(sql: &str) -> Vec<(String, usize)> {
         }
         if ch == '-' && chars.peek().is_some_and(|(_, next)| *next == '-') {
             let _ = chars.next();
-            while let Some((_, next)) = chars.next() {
+            for (_, next) in chars.by_ref() {
                 if next == '\n' || next == '\r' {
                     break;
                 }
@@ -317,7 +320,7 @@ fn sql_keyword_positions(sql: &str) -> Vec<(String, usize)> {
         if ch == '/' && chars.peek().is_some_and(|(_, next)| *next == '*') {
             let _ = chars.next();
             let mut previous = '\0';
-            while let Some((_, next)) = chars.next() {
+            for (_, next) in chars.by_ref() {
                 if previous == '*' && next == '/' {
                     break;
                 }
@@ -411,8 +414,7 @@ fn q_quote_closing(delimiter: char) -> char {
 }
 
 fn normalized_head(sql: &str) -> String {
-    sql.trim_start()
-        .split_whitespace()
+    sql.split_whitespace()
         .next()
         .unwrap_or_default()
         .to_ascii_lowercase()

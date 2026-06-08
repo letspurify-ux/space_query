@@ -1539,52 +1539,47 @@ impl OracleThinSession {
             None
         };
         let sequence = self.next_ttc_sequence();
+        let piggybacks = WritePiggybacks {
+            current_schema_sequence,
+            current_schema: current_schema.as_deref(),
+            close_sequence,
+            close_cursor_ids: &pending_cursor_closes,
+            end_to_end_sequence,
+            end_to_end: end_to_end.as_ref(),
+        };
         let write_result = if effective_needs_define_fetch {
             log_connect_phase("ttc-define-fetch-write", "");
-            write_define_fetch_request(
-                &mut self.stream,
-                &self.capabilities,
-                cursor_id,
-                row_count,
-                sequence,
-                current_schema_sequence,
-                current_schema.as_deref(),
-                close_sequence,
-                &pending_cursor_closes,
-                end_to_end_sequence,
-                end_to_end.as_ref(),
-                &fetch_columns,
-            )
+            write_define_fetch_request(WriteDefineFetchRequestArgs {
+                cursor: WriteCursorRequestArgs {
+                    stream: &mut self.stream,
+                    capabilities: &self.capabilities,
+                    cursor_id,
+                    row_count,
+                    sequence,
+                    piggybacks,
+                },
+                columns: &fetch_columns,
+            })
         } else if use_ref_cursor_execute_fetch {
             log_connect_phase("ttc-ref-cursor-execute-fetch-write", "");
-            write_ref_cursor_execute_fetch_request(
-                &mut self.stream,
-                &self.capabilities,
+            write_ref_cursor_execute_fetch_request(WriteCursorRequestArgs {
+                stream: &mut self.stream,
+                capabilities: &self.capabilities,
                 cursor_id,
                 row_count,
                 sequence,
-                current_schema_sequence,
-                current_schema.as_deref(),
-                close_sequence,
-                &pending_cursor_closes,
-                end_to_end_sequence,
-                end_to_end.as_ref(),
-            )
+                piggybacks,
+            })
         } else {
             log_connect_phase("ttc-fetch-write", "");
-            write_fetch_request(
-                &mut self.stream,
-                &self.capabilities,
+            write_fetch_request(WriteCursorRequestArgs {
+                stream: &mut self.stream,
+                capabilities: &self.capabilities,
                 cursor_id,
                 row_count,
                 sequence,
-                current_schema_sequence,
-                current_schema.as_deref(),
-                close_sequence,
-                &pending_cursor_closes,
-                end_to_end_sequence,
-                end_to_end.as_ref(),
-            )
+                piggybacks,
+            })
         };
         if let Err(error) = write_result {
             self.requeue_pending_cursor_closes(&pending_cursor_closes);
@@ -1594,11 +1589,13 @@ impl OracleThinSession {
         self.clear_pending_current_schema_if_written(current_schema.as_deref());
         self.clear_pending_end_to_end_if_written(end_to_end.as_ref());
         log_connect_phase("ttc-fetch-read", "");
-        let mut state = ExecuteReadState::default();
-        state.columns = fetch_columns;
-        state.object_attrs_by_type = self.object_attrs_by_type.clone();
-        state.collection_element_by_type = self.collection_element_by_type.clone();
-        state.last_row = self.last_rows_by_cursor.get(&cursor_id).cloned();
+        let state = ExecuteReadState {
+            columns: fetch_columns,
+            object_attrs_by_type: self.object_attrs_by_type.clone(),
+            collection_element_by_type: self.collection_element_by_type.clone(),
+            last_row: self.last_rows_by_cursor.get(&cursor_id).cloned(),
+            ..ExecuteReadState::default()
+        };
         let request = StatementRequest::query("", row_count);
         let response = read_execute_response_with_state(
             &mut self.stream,
@@ -2064,14 +2061,16 @@ impl OracleThinSession {
         write_lob_operation_request(
             &mut payload,
             &self.capabilities,
-            sequence,
-            &locator,
-            TNS_LOB_OP_CREATE_TEMP,
-            u64::from(charset_form),
-            u64::from(ora_type_num),
-            TNS_DURATION_SESSION,
-            None,
-            Some(charset_id.unwrap_or(TNS_CHARSET_UTF8)),
+            WriteLobOperationArgs {
+                sequence,
+                locator: &locator,
+                operation: TNS_LOB_OP_CREATE_TEMP,
+                source_offset: u64::from(charset_form),
+                dest_offset: u64::from(ora_type_num),
+                dest_length: TNS_DURATION_SESSION,
+                data: None,
+                charset_id: Some(charset_id.unwrap_or(TNS_CHARSET_UTF8)),
+            },
         )?;
         write_data_packet(
             &mut self.stream,
@@ -2105,14 +2104,16 @@ impl OracleThinSession {
         write_lob_operation_request(
             &mut payload,
             &self.capabilities,
-            sequence,
-            &locator,
-            TNS_LOB_OP_WRITE,
-            1,
-            0,
-            0,
-            Some(bytes),
-            None,
+            WriteLobOperationArgs {
+                sequence,
+                locator: &locator,
+                operation: TNS_LOB_OP_WRITE,
+                source_offset: 1,
+                dest_offset: 0,
+                dest_length: 0,
+                data: Some(bytes),
+                charset_id: None,
+            },
         )?;
         write_data_packet(
             &mut self.stream,
@@ -2487,20 +2488,22 @@ impl OracleThinSession {
             None
         };
         let sequence = self.next_ttc_sequence();
-        if let Err(error) = write_execute_request(
-            &mut self.stream,
-            &self.capabilities,
+        if let Err(error) = write_execute_request(WriteExecuteRequestArgs {
+            stream: &mut self.stream,
+            capabilities: &self.capabilities,
             request,
             sequence,
-            0,
-            current_schema_sequence,
-            current_schema.as_deref(),
-            close_sequence,
-            &pending_cursor_closes,
-            end_to_end_sequence,
-            end_to_end.as_ref(),
+            cursor_id: 0,
+            piggybacks: WritePiggybacks {
+                current_schema_sequence,
+                current_schema: current_schema.as_deref(),
+                close_sequence,
+                close_cursor_ids: &pending_cursor_closes,
+                end_to_end_sequence,
+                end_to_end: end_to_end.as_ref(),
+            },
             execute_without_prefetch,
-        ) {
+        }) {
             self.requeue_pending_cursor_closes(&pending_cursor_closes);
             let _ = self.free_temp_lobs(&temp_lob_locators);
             return Err(error);
@@ -3257,10 +3260,7 @@ fn columns_may_contain_ref_cursors(columns: &[ColumnMetadata]) -> bool {
 }
 
 fn column_types_may_contain_ref_cursors(column_types: &[OracleColumnType]) -> bool {
-    column_types.is_empty()
-        || column_types
-            .iter()
-            .any(|column_type| *column_type == OracleColumnType::Cursor)
+    column_types.is_empty() || column_types.contains(&OracleColumnType::Cursor)
 }
 
 fn columns_require_define_fetch_for_values(columns: &[ColumnMetadata]) -> bool {
@@ -3608,36 +3608,94 @@ fn request_is_dml_returning(request: &StatementRequest) -> bool {
     !request.is_query && !request.is_plsql && sql_is_dml_returning(&request.sql)
 }
 
-fn write_execute_request(
-    stream: &mut TcpStream,
-    capabilities: &OracleThinCapabilities,
-    request: &StatementRequest,
+#[derive(Clone, Copy)]
+struct WritePiggybacks<'a> {
+    current_schema_sequence: Option<u8>,
+    current_schema: Option<&'a str>,
+    close_sequence: Option<u8>,
+    close_cursor_ids: &'a [u32],
+    end_to_end_sequence: Option<u8>,
+    end_to_end: Option<&'a EndToEndAttributes>,
+}
+
+struct WriteExecuteRequestArgs<'a> {
+    stream: &'a mut TcpStream,
+    capabilities: &'a OracleThinCapabilities,
+    request: &'a StatementRequest,
     sequence: u8,
     cursor_id: u32,
-    current_schema_sequence: Option<u8>,
-    current_schema: Option<&str>,
-    close_sequence: Option<u8>,
-    close_cursor_ids: &[u32],
-    end_to_end_sequence: Option<u8>,
-    end_to_end: Option<&EndToEndAttributes>,
+    piggybacks: WritePiggybacks<'a>,
     execute_without_prefetch: bool,
+}
+
+struct WriteCursorRequestArgs<'a> {
+    stream: &'a mut TcpStream,
+    capabilities: &'a OracleThinCapabilities,
+    cursor_id: u32,
+    row_count: u32,
+    sequence: u8,
+    piggybacks: WritePiggybacks<'a>,
+}
+
+struct WriteDefineFetchRequestArgs<'a> {
+    cursor: WriteCursorRequestArgs<'a>,
+    columns: &'a [ThinColumn],
+}
+
+struct WriteLobOperationArgs<'a> {
+    sequence: u8,
+    locator: &'a [u8],
+    operation: u32,
+    source_offset: u64,
+    dest_offset: u64,
+    dest_length: u32,
+    data: Option<&'a [u8]>,
+    charset_id: Option<u16>,
+}
+
+struct AuthSessionKeyParts<'a> {
+    part_a: &'a [u8],
+    part_b: &'a [u8],
+}
+
+fn write_pending_piggybacks(
+    payload: &mut Vec<u8>,
+    capabilities: &OracleThinCapabilities,
+    piggybacks: &WritePiggybacks<'_>,
 ) -> Result<(), OracleThinError> {
-    if capabilities.ttc_field_version <= 6 {
-        return write_legacy_execute_request(
-            stream,
-            capabilities,
-            request,
-            sequence,
-            cursor_id,
-            current_schema_sequence,
-            current_schema,
-            close_sequence,
-            close_cursor_ids,
-            end_to_end_sequence,
-            end_to_end,
-            execute_without_prefetch,
-        );
+    if let (Some(sequence), Some(schema)) = (
+        piggybacks.current_schema_sequence,
+        piggybacks.current_schema,
+    ) {
+        write_current_schema_piggyback(payload, capabilities, sequence, schema)?;
     }
+    if let Some(close_sequence) = piggybacks.close_sequence {
+        write_close_cursors_piggyback(
+            payload,
+            capabilities,
+            close_sequence,
+            piggybacks.close_cursor_ids,
+        )?;
+    }
+    if let (Some(sequence), Some(attrs)) = (piggybacks.end_to_end_sequence, piggybacks.end_to_end) {
+        write_end_to_end_piggyback(payload, capabilities, sequence, attrs)?;
+    }
+    Ok(())
+}
+
+fn write_execute_request(args: WriteExecuteRequestArgs<'_>) -> Result<(), OracleThinError> {
+    if args.capabilities.ttc_field_version <= 6 {
+        return write_legacy_execute_request(args);
+    }
+    let WriteExecuteRequestArgs {
+        stream,
+        capabilities,
+        request,
+        sequence,
+        cursor_id,
+        piggybacks,
+        execute_without_prefetch,
+    } = args;
 
     let sql_bytes = request.sql.as_bytes();
     let parse_only_describe =
@@ -3678,20 +3736,7 @@ fn write_execute_request(
     let exec_flags = execute_flags_for_request(parse_only_describe, request);
 
     let mut payload = Vec::new();
-    if let (Some(sequence), Some(schema)) = (current_schema_sequence, current_schema) {
-        write_current_schema_piggyback(&mut payload, capabilities, sequence, schema)?;
-    }
-    if let Some(close_sequence) = close_sequence {
-        write_close_cursors_piggyback(
-            &mut payload,
-            capabilities,
-            close_sequence,
-            close_cursor_ids,
-        )?;
-    }
-    if let (Some(sequence), Some(attrs)) = (end_to_end_sequence, end_to_end) {
-        write_end_to_end_piggyback(&mut payload, capabilities, sequence, attrs)?;
-    }
+    write_pending_piggybacks(&mut payload, capabilities, &piggybacks)?;
     write_function_code(&mut payload, TNS_FUNC_EXECUTE, sequence, capabilities);
     write_ub4(&mut payload, options);
     write_ub4(&mut payload, cursor_id);
@@ -3778,20 +3823,16 @@ fn write_execute_request(
     )
 }
 
-fn write_legacy_execute_request(
-    stream: &mut TcpStream,
-    capabilities: &OracleThinCapabilities,
-    request: &StatementRequest,
-    sequence: u8,
-    cursor_id: u32,
-    current_schema_sequence: Option<u8>,
-    current_schema: Option<&str>,
-    close_sequence: Option<u8>,
-    close_cursor_ids: &[u32],
-    end_to_end_sequence: Option<u8>,
-    end_to_end: Option<&EndToEndAttributes>,
-    execute_without_prefetch: bool,
-) -> Result<(), OracleThinError> {
+fn write_legacy_execute_request(args: WriteExecuteRequestArgs<'_>) -> Result<(), OracleThinError> {
+    let WriteExecuteRequestArgs {
+        stream,
+        capabilities,
+        request,
+        sequence,
+        cursor_id,
+        piggybacks,
+        execute_without_prefetch,
+    } = args;
     let sql_bytes = request.sql.as_bytes();
     let parse_only_describe =
         request.is_query && request.prefetch_rows == 0 && !execute_without_prefetch;
@@ -3828,20 +3869,7 @@ fn write_legacy_execute_request(
     }
 
     let mut payload = Vec::new();
-    if let (Some(sequence), Some(schema)) = (current_schema_sequence, current_schema) {
-        write_current_schema_piggyback(&mut payload, capabilities, sequence, schema)?;
-    }
-    if let Some(close_sequence) = close_sequence {
-        write_close_cursors_piggyback(
-            &mut payload,
-            capabilities,
-            close_sequence,
-            close_cursor_ids,
-        )?;
-    }
-    if let (Some(sequence), Some(attrs)) = (end_to_end_sequence, end_to_end) {
-        write_end_to_end_piggyback(&mut payload, capabilities, sequence, attrs)?;
-    }
+    write_pending_piggybacks(&mut payload, capabilities, &piggybacks)?;
     write_function_code(&mut payload, TNS_FUNC_EXECUTE, sequence, capabilities);
     write_ub4(&mut payload, options);
     write_ub2(&mut payload, cursor_id as u16);
@@ -3911,34 +3939,17 @@ fn write_legacy_execute_request(
     )
 }
 
-fn write_fetch_request(
-    stream: &mut TcpStream,
-    capabilities: &OracleThinCapabilities,
-    cursor_id: u32,
-    row_count: u32,
-    sequence: u8,
-    current_schema_sequence: Option<u8>,
-    current_schema: Option<&str>,
-    close_sequence: Option<u8>,
-    close_cursor_ids: &[u32],
-    end_to_end_sequence: Option<u8>,
-    end_to_end: Option<&EndToEndAttributes>,
-) -> Result<(), OracleThinError> {
+fn write_fetch_request(args: WriteCursorRequestArgs<'_>) -> Result<(), OracleThinError> {
+    let WriteCursorRequestArgs {
+        stream,
+        capabilities,
+        cursor_id,
+        row_count,
+        sequence,
+        piggybacks,
+    } = args;
     let mut payload = Vec::new();
-    if let (Some(sequence), Some(schema)) = (current_schema_sequence, current_schema) {
-        write_current_schema_piggyback(&mut payload, capabilities, sequence, schema)?;
-    }
-    if let Some(close_sequence) = close_sequence {
-        write_close_cursors_piggyback(
-            &mut payload,
-            capabilities,
-            close_sequence,
-            close_cursor_ids,
-        )?;
-    }
-    if let (Some(sequence), Some(attrs)) = (end_to_end_sequence, end_to_end) {
-        write_end_to_end_piggyback(&mut payload, capabilities, sequence, attrs)?;
-    }
+    write_pending_piggybacks(&mut payload, capabilities, &piggybacks)?;
     write_function_code(&mut payload, TNS_FUNC_FETCH, sequence, capabilities);
     if capabilities.ttc_field_version <= 6 {
         write_ub2(&mut payload, cursor_id as u16);
@@ -3964,33 +3975,18 @@ fn write_fetch_request(
 }
 
 fn write_ref_cursor_execute_fetch_request(
-    stream: &mut TcpStream,
-    capabilities: &OracleThinCapabilities,
-    cursor_id: u32,
-    row_count: u32,
-    sequence: u8,
-    current_schema_sequence: Option<u8>,
-    current_schema: Option<&str>,
-    close_sequence: Option<u8>,
-    close_cursor_ids: &[u32],
-    end_to_end_sequence: Option<u8>,
-    end_to_end: Option<&EndToEndAttributes>,
+    args: WriteCursorRequestArgs<'_>,
 ) -> Result<(), OracleThinError> {
+    let WriteCursorRequestArgs {
+        stream,
+        capabilities,
+        cursor_id,
+        row_count,
+        sequence,
+        piggybacks,
+    } = args;
     let mut payload = Vec::new();
-    if let (Some(sequence), Some(schema)) = (current_schema_sequence, current_schema) {
-        write_current_schema_piggyback(&mut payload, capabilities, sequence, schema)?;
-    }
-    if let Some(close_sequence) = close_sequence {
-        write_close_cursors_piggyback(
-            &mut payload,
-            capabilities,
-            close_sequence,
-            close_cursor_ids,
-        )?;
-    }
-    if let (Some(sequence), Some(attrs)) = (end_to_end_sequence, end_to_end) {
-        write_end_to_end_piggyback(&mut payload, capabilities, sequence, attrs)?;
-    }
+    write_pending_piggybacks(&mut payload, capabilities, &piggybacks)?;
     write_function_code(&mut payload, TNS_FUNC_EXECUTE, sequence, capabilities);
     let options = TNS_EXEC_OPTION_NOT_PLSQL | TNS_EXEC_OPTION_FETCH;
     write_ub4(&mut payload, options);
@@ -4094,34 +4090,19 @@ fn write_ref_cursor_execute_fetch_request(
 }
 
 fn write_define_fetch_request(
-    stream: &mut TcpStream,
-    capabilities: &OracleThinCapabilities,
-    cursor_id: u32,
-    row_count: u32,
-    sequence: u8,
-    current_schema_sequence: Option<u8>,
-    current_schema: Option<&str>,
-    close_sequence: Option<u8>,
-    close_cursor_ids: &[u32],
-    end_to_end_sequence: Option<u8>,
-    end_to_end: Option<&EndToEndAttributes>,
-    columns: &[ThinColumn],
+    args: WriteDefineFetchRequestArgs<'_>,
 ) -> Result<(), OracleThinError> {
+    let WriteDefineFetchRequestArgs { cursor, columns } = args;
+    let WriteCursorRequestArgs {
+        stream,
+        capabilities,
+        cursor_id,
+        row_count,
+        sequence,
+        piggybacks,
+    } = cursor;
     let mut payload = Vec::new();
-    if let (Some(sequence), Some(schema)) = (current_schema_sequence, current_schema) {
-        write_current_schema_piggyback(&mut payload, capabilities, sequence, schema)?;
-    }
-    if let Some(close_sequence) = close_sequence {
-        write_close_cursors_piggyback(
-            &mut payload,
-            capabilities,
-            close_sequence,
-            close_cursor_ids,
-        )?;
-    }
-    if let (Some(sequence), Some(attrs)) = (end_to_end_sequence, end_to_end) {
-        write_end_to_end_piggyback(&mut payload, capabilities, sequence, attrs)?;
-    }
+    write_pending_piggybacks(&mut payload, capabilities, &piggybacks)?;
     write_function_code(&mut payload, TNS_FUNC_EXECUTE, sequence, capabilities);
     let options = TNS_EXEC_OPTION_NOT_PLSQL | TNS_EXEC_OPTION_DEFINE | TNS_EXEC_OPTION_FETCH;
     write_ub4(&mut payload, options);
@@ -4260,15 +4241,18 @@ fn write_lob_read_request(
 fn write_lob_operation_request(
     payload: &mut Vec<u8>,
     capabilities: &OracleThinCapabilities,
-    sequence: u8,
-    locator: &[u8],
-    operation: u32,
-    source_offset: u64,
-    dest_offset: u64,
-    dest_length: u32,
-    data: Option<&[u8]>,
-    charset_id: Option<u16>,
+    args: WriteLobOperationArgs<'_>,
 ) -> Result<(), OracleThinError> {
+    let WriteLobOperationArgs {
+        sequence,
+        locator,
+        operation,
+        source_offset,
+        dest_offset,
+        dest_length,
+        data,
+        charset_id,
+    } = args;
     write_function_code(payload, TNS_FUNC_LOB_OP, sequence, capabilities);
     payload.push(1);
     write_ub4(payload, locator.len() as u32);
@@ -5706,7 +5690,7 @@ fn encode_oracle_number(value: &str) -> Result<Vec<u8>, OracleThinError> {
     if digits.is_empty() {
         return Ok(vec![0x80]);
     }
-    if digits.len() > 38 || decimal_point_index > 126 || decimal_point_index < -129 {
+    if digits.len() > 38 || !(-129..=126).contains(&decimal_point_index) {
         return Err(OracleThinError::new(format!(
             "Oracle NUMBER bind value out of range: {value}"
         )));
@@ -6493,7 +6477,7 @@ fn process_bit_vector(
     state: &mut ExecuteReadState,
 ) -> Result<(), OracleThinError> {
     let _ = cursor.read_ub2()?;
-    let num_bytes = (state.columns.len() + 7) / 8;
+    let num_bytes = state.columns.len().div_ceil(8);
     let bit_vector = cursor.read_raw(num_bytes)?.to_vec();
     state.bit_vector = Some(bit_vector);
     Ok(())
@@ -7496,7 +7480,7 @@ fn decode_xml_clob_lob_text(
 
 fn looks_like_utf16be_text(bytes: &[u8]) -> bool {
     bytes.len() >= 2
-        && bytes.len() % 2 == 0
+        && bytes.len().is_multiple_of(2)
         && bytes
             .chunks_exact(2)
             .take(16)
@@ -7729,7 +7713,7 @@ fn encode_oson_json(
         out.extend_from_slice(&short_field_segment);
         out.extend_from_slice(&long_field_segment);
     }
-    out.extend_from_slice(&tree);
+    out.extend(tree);
     Ok(out)
 }
 
@@ -7852,7 +7836,7 @@ fn encode_oson_scalar_tree(tree: &[u8]) -> Result<Vec<u8>, OracleThinError> {
         tree.len(),
         flags & TNS_JSON_FLAG_TREE_SEG_UINT32 != 0,
     )?;
-    out.extend_from_slice(&tree);
+    out.extend_from_slice(tree);
     Ok(out)
 }
 
@@ -8747,7 +8731,7 @@ fn decode_oracle_nchar_text(
 }
 
 fn decode_utf16be_oracle_text(bytes: &[u8]) -> Result<String, OracleThinError> {
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err(OracleThinError::new("odd-length Oracle NCHAR data"));
     }
     let units = bytes
@@ -10122,7 +10106,7 @@ fn days_in_month(year: u16, month: u8) -> u8 {
 }
 
 fn is_leap_year(year: u16) -> bool {
-    year % 4 == 0 && year % 100 != 0 || year % 400 == 0
+    year.is_multiple_of(4) && !year.is_multiple_of(100) || year.is_multiple_of(400)
 }
 
 fn decode_oracle_number(bytes: &[u8]) -> Result<String, OracleThinError> {
@@ -11100,8 +11084,10 @@ fn generate_auth_credentials_from_password_hash(
         password_hash,
         key_len,
         password_key_for_speedy,
-        &session_key_part_a,
-        &session_key_part_b,
+        AuthSessionKeyParts {
+            part_a: &session_key_part_a,
+            part_b: &session_key_part_b,
+        },
     )
 }
 
@@ -11112,9 +11098,12 @@ fn generate_auth_credentials_from_session_key_parts(
     password_hash: &[u8],
     key_len: usize,
     password_key_for_speedy: Option<&[u8]>,
-    session_key_part_a: &[u8],
-    session_key_part_b: &[u8],
+    session_key_parts: AuthSessionKeyParts<'_>,
 ) -> Result<AuthCredentials, OracleThinError> {
+    let AuthSessionKeyParts {
+        part_a: session_key_part_a,
+        part_b: session_key_part_b,
+    } = session_key_parts;
     let encoded_client_key = aes_encrypt_cbc_pkcs7(password_hash, session_key_part_b)?;
     let session_key = client_session_key_hex(&encoded_client_key, session_key_part_a.len())?;
     let combo_key = derive_auth_combo_key(state, session_key_part_a, session_key_part_b, key_len)?;
@@ -11249,12 +11238,12 @@ fn des_rotate_28(value: u32, shift: u8) -> u32 {
 fn des_round(right: u32, subkey: u64) -> u32 {
     let expanded = des_permute(u64::from(right), 32, &DES_EXPANSION) ^ subkey;
     let mut substituted = 0u32;
-    for box_index in 0..8 {
+    for (box_index, s_box) in DES_S_BOXES.iter().enumerate() {
         let shift = 42 - (box_index * 6);
         let chunk = ((expanded >> shift) & 0x3f) as u8;
         let row = ((chunk & 0x20) >> 4) | (chunk & 0x01);
         let column = (chunk >> 1) & 0x0f;
-        let value = DES_S_BOXES[box_index][usize::from(row * 16 + column)];
+        let value = s_box[usize::from(row * 16 + column)];
         substituted = (substituted << 4) | u32::from(value);
     }
     des_permute(u64::from(substituted), 32, &DES_P_PERMUTATION) as u32
@@ -11457,7 +11446,7 @@ fn process_auth_parameters(
     for _ in 0..num_params {
         let key = cursor.read_str_with_ub4_length()?.unwrap_or_default();
         let value = cursor.read_str_with_ub4_length()?.unwrap_or_default();
-        let flags = cursor.read_ub4()? as u32;
+        let flags = cursor.read_ub4()?;
         if key == "AUTH_VFR_DATA" {
             state.verifier_type = flags;
         } else if key == "AUTH_VERSION_NO" {
@@ -11571,7 +11560,7 @@ fn aes_decrypt_cbc_no_padding(
 
 fn hex_decode(value: &str) -> Result<Vec<u8>, OracleThinError> {
     let bytes = value.as_bytes();
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err(OracleThinError::new("hex string has odd length"));
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);
@@ -11971,7 +11960,7 @@ fn process_protocol_message(
             server_flags,
             capabilities.charset_id,
             capabilities.ncharset_id,
-            String::from_utf8_lossy(&banner)
+            String::from_utf8_lossy(banner)
         ),
     );
     Ok(())
@@ -12018,9 +12007,9 @@ fn adjust_for_server_runtime_caps(capabilities: &mut OracleThinCapabilities, ser
     } else {
         4000
     };
-    if !server_caps
+    if server_caps
         .get(TNS_RCAP_TTC)
-        .is_some_and(|value| value & TNS_RCAP_TTC_SESSION_STATE_OPS != 0)
+        .is_none_or(|value| value & TNS_RCAP_TTC_SESSION_STATE_OPS == 0)
     {
         capabilities.supports_request_boundaries = false;
     }
@@ -12964,15 +12953,15 @@ mod tests {
         column_types_may_contain_ref_cursors, column_types_require_define_fetch_for_values,
         columns_may_contain_ref_cursors, columns_require_define_fetch_for_values,
         oracle_thin_driver_name, put_u16_be_vec, write_auth_header,
-        write_close_temp_lobs_piggyback, write_lob_operation_request, ExecuteReadState,
-        DATA_TYPE_REPRESENTATIONS, ORA_TYPE_NUM_BFILE, ORA_TYPE_NUM_BINARY_DOUBLE,
-        ORA_TYPE_NUM_BINARY_FLOAT, ORA_TYPE_NUM_BLOB, ORA_TYPE_NUM_BOOLEAN, ORA_TYPE_NUM_CHAR,
-        ORA_TYPE_NUM_CLOB, ORA_TYPE_NUM_CURSOR, ORA_TYPE_NUM_DATE, ORA_TYPE_NUM_DBFILE,
-        ORA_TYPE_NUM_DJSON, ORA_TYPE_NUM_INTERVAL_DS, ORA_TYPE_NUM_INTERVAL_YM, ORA_TYPE_NUM_JSON,
-        ORA_TYPE_NUM_LONG, ORA_TYPE_NUM_LONG_RAW, ORA_TYPE_NUM_NUMBER, ORA_TYPE_NUM_OBJECT,
-        ORA_TYPE_NUM_RAW, ORA_TYPE_NUM_ROWID, ORA_TYPE_NUM_TIMESTAMP_LTZ,
-        ORA_TYPE_NUM_TIMESTAMP_TZ, ORA_TYPE_NUM_TIMESTAMP_TZ_EXT, ORA_TYPE_NUM_UROWID,
-        ORA_TYPE_NUM_VARCHAR, ORA_TYPE_NUM_VECTOR,
+        write_close_temp_lobs_piggyback, write_lob_operation_request, AuthSessionKeyParts,
+        ExecuteReadState, WriteLobOperationArgs, DATA_TYPE_REPRESENTATIONS, ORA_TYPE_NUM_BFILE,
+        ORA_TYPE_NUM_BINARY_DOUBLE, ORA_TYPE_NUM_BINARY_FLOAT, ORA_TYPE_NUM_BLOB,
+        ORA_TYPE_NUM_BOOLEAN, ORA_TYPE_NUM_CHAR, ORA_TYPE_NUM_CLOB, ORA_TYPE_NUM_CURSOR,
+        ORA_TYPE_NUM_DATE, ORA_TYPE_NUM_DBFILE, ORA_TYPE_NUM_DJSON, ORA_TYPE_NUM_INTERVAL_DS,
+        ORA_TYPE_NUM_INTERVAL_YM, ORA_TYPE_NUM_JSON, ORA_TYPE_NUM_LONG, ORA_TYPE_NUM_LONG_RAW,
+        ORA_TYPE_NUM_NUMBER, ORA_TYPE_NUM_OBJECT, ORA_TYPE_NUM_RAW, ORA_TYPE_NUM_ROWID,
+        ORA_TYPE_NUM_TIMESTAMP_LTZ, ORA_TYPE_NUM_TIMESTAMP_TZ, ORA_TYPE_NUM_TIMESTAMP_TZ_EXT,
+        ORA_TYPE_NUM_UROWID, ORA_TYPE_NUM_VARCHAR, ORA_TYPE_NUM_VECTOR,
         PYTHON_ORACLEDB_MODERN_DATA_TYPE_REPRESENTATIONS, TNS_AUTH_MODE_CHANGE_PASSWORD,
         TNS_AUTH_MODE_LOGON, TNS_AUTH_MODE_SYSASM, TNS_AUTH_MODE_SYSBKP, TNS_AUTH_MODE_SYSDBA,
         TNS_AUTH_MODE_SYSDGD, TNS_AUTH_MODE_SYSKMT, TNS_AUTH_MODE_SYSOPER, TNS_AUTH_MODE_SYSRAC,
@@ -14057,14 +14046,16 @@ mod tests {
         write_lob_operation_request(
             &mut payload,
             &OracleThinCapabilities::default(),
-            9,
-            &locator,
-            TNS_LOB_OP_CREATE_TEMP,
-            u64::from(CS_FORM_IMPLICIT),
-            u64::from(ORA_TYPE_NUM_BLOB),
-            TNS_DURATION_SESSION,
-            None,
-            Some(TNS_CHARSET_UTF8),
+            WriteLobOperationArgs {
+                sequence: 9,
+                locator: &locator,
+                operation: TNS_LOB_OP_CREATE_TEMP,
+                source_offset: u64::from(CS_FORM_IMPLICIT),
+                dest_offset: u64::from(ORA_TYPE_NUM_BLOB),
+                dest_length: TNS_DURATION_SESSION,
+                data: None,
+                charset_id: Some(TNS_CHARSET_UTF8),
+            },
         )
         .unwrap();
 
@@ -18993,8 +18984,10 @@ mod tests {
             &password_hash,
             24,
             None,
-            &session_key_part_a,
-            &session_key_part_b,
+            AuthSessionKeyParts {
+                part_a: &session_key_part_a,
+                part_b: &session_key_part_b,
+            },
         )
         .unwrap();
 
@@ -19021,8 +19014,10 @@ mod tests {
             &password_hash,
             16,
             None,
-            &session_key_part_a,
-            &session_key_part_b,
+            AuthSessionKeyParts {
+                part_a: &session_key_part_a,
+                part_b: &session_key_part_b,
+            },
         )
         .unwrap();
 
