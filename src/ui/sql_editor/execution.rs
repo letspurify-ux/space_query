@@ -134,7 +134,7 @@ const ORACLE_THIN_MAX_NESTED_CURSOR_DEPTH: usize = 8;
 
 #[derive(Clone, Copy)]
 struct ExecutionStartupPolicy {
-    has_connect_command: bool,
+    allows_disconnected_start: bool,
     requires_connected_session: bool,
 }
 
@@ -386,16 +386,11 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             }
         };
         let pool_context_epoch = pool_context.pool_context_epoch();
-        let retained = if startup_policy.has_connect_command {
-            pooled_db_session.clear();
-            crate::db::RetainedSessionTakeOutcome::NoSession
-        } else {
-            pooled_db_session.take_reusable_lease(
-                connection_generation,
-                pool_context_epoch,
-                db_type,
-            )
-        };
+        let retained = pooled_db_session.take_reusable_lease(
+            connection_generation,
+            pool_context_epoch,
+            db_type,
+        );
         drop(conn_guard);
 
         let (mut thin_conn, prior_retained_state) = match retained {
@@ -2159,23 +2154,21 @@ impl SqlEditorWidget {
         })
     }
 
-    fn requires_connected_session_for_precheck(
-        has_connection_bootstrap_command: bool,
-        can_run_while_disconnected: bool,
-    ) -> bool {
-        !has_connection_bootstrap_command && !can_run_while_disconnected
+    fn requires_connected_session_for_precheck(allows_disconnected_start: bool) -> bool {
+        !allows_disconnected_start
     }
 
     fn execution_startup_policy(sql: &str) -> ExecutionStartupPolicy {
-        let has_connect_command = super::query_text::has_connection_bootstrap_command(sql);
+        let has_connection_bootstrap_command =
+            super::query_text::has_connection_bootstrap_command(sql);
         let can_run_while_disconnected = super::query_text::can_execute_while_disconnected(sql);
-        let requires_connected_session = Self::requires_connected_session_for_precheck(
-            has_connect_command,
-            can_run_while_disconnected,
-        );
+        let allows_disconnected_start =
+            has_connection_bootstrap_command || can_run_while_disconnected;
+        let requires_connected_session =
+            Self::requires_connected_session_for_precheck(allows_disconnected_start);
 
         ExecutionStartupPolicy {
-            has_connect_command,
+            allows_disconnected_start,
             requires_connected_session,
         }
     }
@@ -2183,9 +2176,9 @@ impl SqlEditorWidget {
     fn acquire_execution_connection(
         conn_guard: &mut crate::db::ConnectionLockGuard<'_>,
         sender: &mpsc::Sender<QueryProgress>,
-        has_connect_command: bool,
+        allows_disconnected_start: bool,
     ) -> Result<Option<Arc<Connection>>, String> {
-        if has_connect_command {
+        if allows_disconnected_start {
             if conn_guard.is_connected() {
                 match conn_guard.require_live_connection() {
                     Ok(conn) => Ok(Some(conn)),
@@ -2461,29 +2454,23 @@ impl SqlEditorWidget {
         shared_connection: &'a crate::db::SharedConnection,
         db_activity: &str,
         sender: &mpsc::Sender<QueryProgress>,
-        has_connect_command: bool,
+        allows_disconnected_start: bool,
         pooled_db_session: &SharedDbSessionLease,
     ) -> (
         crate::db::ConnectionLockGuard<'a>,
         Result<Option<(Arc<Connection>, RetainedSessionState, u64)>, String>,
     ) {
-        if has_connect_command {
-            pooled_db_session.clear();
-            let pool_context_epoch = conn_guard.pool_context_epoch();
-            let result =
-                Self::acquire_execution_connection(&mut conn_guard, sender, true).map(|conn| {
-                    conn.map(|conn| (conn, RetainedSessionState::default(), pool_context_epoch))
-                });
-            return (conn_guard, result);
-        }
-
         if !conn_guard.is_connected() || !conn_guard.has_connection_handle() {
             pooled_db_session.clear();
             let pool_context_epoch = conn_guard.pool_context_epoch();
-            let result =
-                Self::acquire_execution_connection(&mut conn_guard, sender, false).map(|conn| {
-                    conn.map(|conn| (conn, RetainedSessionState::default(), pool_context_epoch))
-                });
+            let result = Self::acquire_execution_connection(
+                &mut conn_guard,
+                sender,
+                allows_disconnected_start,
+            )
+            .map(|conn| {
+                conn.map(|conn| (conn, RetainedSessionState::default(), pool_context_epoch))
+            });
             return (conn_guard, result);
         }
 
@@ -3381,11 +3368,15 @@ impl SqlEditorWidget {
         last_select_row: &mut Option<Vec<String>>,
     ) -> Result<Vec<Vec<String>>, String> {
         let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            let row_data = row
-                .into_iter()
-                .map(|value| Self::oracle_thin_display_cell(conn, value, null_text, 0))
-                .collect::<Result<Vec<_>, _>>()?;
+        let mut source_rows = VecDeque::from(rows);
+        while let Some(row) = source_rows.pop_front() {
+            let row_data = match Self::oracle_thin_display_row_cells(conn, row, null_text, 0) {
+                Ok(row) => row,
+                Err(err) => {
+                    Self::oracle_thin_close_owned_cursor_rows(conn, source_rows);
+                    return Err(err);
+                }
+            };
             out.push(row_data);
             *fetched_rows = fetched_rows.saturating_add(1);
         }
@@ -7517,17 +7508,6 @@ impl SqlEditorWidget {
 
         // Build an execution policy once and reuse it for both UI pre-check and worker startup.
         let startup_policy = Self::execution_startup_policy(sql);
-        if startup_policy.has_connect_command
-            && Self::connection_transition_requires_transaction_resolution(
-                false,
-                self.pooled_db_session.snapshot(),
-            )
-        {
-            SqlEditorWidget::show_alert_dialog(&Self::connection_transition_dirty_session_message(
-                "CONNECT",
-            ));
-            return;
-        }
 
         let operation_autocommit;
         let operation_db_type;
@@ -7710,7 +7690,7 @@ impl SqlEditorWidget {
                         &shared_connection,
                         &db_activity,
                         &sender,
-                        startup_policy.has_connect_command,
+                        startup_policy.allows_disconnected_start,
                         &pooled_db_session,
                     );
                 let conn_guard = guard_after_acquire;
@@ -7810,18 +7790,14 @@ impl SqlEditorWidget {
 
                 if let Some(conn) = conn_opt.as_ref() {
                     cleanup.track_timeout(Arc::clone(conn), previous_timeout);
-                    if !startup_policy.has_connect_command {
-                        cleanup.track_oracle_pooled_session(
-                            pooled_db_session.clone(),
-                            connection_generation,
-                            oracle_pool_context_epoch,
-                            Arc::clone(conn),
-                            oracle_prior_retained_state,
-                        );
-                        cleanup.track_oracle_pooled_session_scope_connection(
-                            shared_connection.clone(),
-                        );
-                    }
+                    cleanup.track_oracle_pooled_session(
+                        pooled_db_session.clone(),
+                        connection_generation,
+                        oracle_pool_context_epoch,
+                        Arc::clone(conn),
+                        oracle_prior_retained_state,
+                    );
+                    cleanup.track_oracle_pooled_session_scope_connection(shared_connection.clone());
                 }
                 if script_mode && auto_commit {
                     cleanup.invalidate_oracle_pooled_session_on_cancel();
@@ -13376,27 +13352,26 @@ impl SqlEditorWidget {
 
             emit_select_start!();
             let stop_fetching = Self::oracle_thin_result_should_stop_fetch_all_batch(&result);
-            for row in result.rows {
+            let mut result_rows = VecDeque::from(result.rows);
+            while let Some(row) = result_rows.pop_front() {
                 if Self::execute_oracle_thin_cancel_requested(cancel_flag) {
+                    Self::oracle_thin_close_owned_cursor_values(conn, row);
+                    Self::oracle_thin_close_owned_cursor_rows(conn, result_rows);
                     finish_cancelled!();
                 }
-                let row_data = match row
-                    .into_iter()
-                    .map(|value| {
-                        Self::oracle_thin_ref_cursor_cell_result_text(conn, value, &null_text, 0)
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                {
-                    Ok(row) => row,
-                    Err(err) => {
-                        Self::oracle_thin_close_ref_cursor(
-                            conn,
-                            initial_cursor_id,
-                            active_cursor_id,
-                        );
-                        return Err(err);
-                    }
-                };
+                let row_data =
+                    match Self::oracle_thin_ref_cursor_row_cells(conn, row, &null_text, 0) {
+                        Ok(row) => row,
+                        Err(err) => {
+                            Self::oracle_thin_close_owned_cursor_rows(conn, result_rows);
+                            Self::oracle_thin_close_ref_cursor(
+                                conn,
+                                initial_cursor_id,
+                                active_cursor_id,
+                            );
+                            return Err(err);
+                        }
+                    };
                 cursor_rows.push(row_data.clone());
                 let mut display_row = row_data;
                 Self::apply_null_text_to_row(&mut display_row, &null_text);
@@ -13515,20 +13490,29 @@ impl SqlEditorWidget {
             .collect::<Vec<_>>();
         if Self::execute_oracle_thin_cancel_requested(cancel_flag) {
             conn.close_cursor_later(parent_cursor_id);
+            Self::oracle_thin_close_owned_cursor_rows(conn, result.result.rows);
             return Err(Self::cancel_message());
         }
         let mut rows = Vec::new();
-        for row in result.result.rows {
+        let mut source_rows = VecDeque::from(result.result.rows);
+        while let Some(row) = source_rows.pop_front() {
             if Self::execute_oracle_thin_cancel_requested(cancel_flag) {
                 conn.close_cursor_later(parent_cursor_id);
+                Self::oracle_thin_close_owned_cursor_values(conn, row);
+                Self::oracle_thin_close_owned_cursor_rows(conn, source_rows);
                 return Err(Self::cancel_message());
             }
-            let row = row
-                .into_iter()
-                .map(|value| Self::oracle_thin_display_cell(conn, value, null_text, 0))
-                .collect::<Result<Vec<_>, _>>()?;
+            let row = match Self::oracle_thin_display_row_cells(conn, row, null_text, 0) {
+                Ok(row) => row,
+                Err(err) => {
+                    conn.close_cursor_later(parent_cursor_id);
+                    Self::oracle_thin_close_owned_cursor_rows(conn, source_rows);
+                    return Err(err);
+                }
+            };
             if Self::execute_oracle_thin_cancel_requested(cancel_flag) {
                 conn.close_cursor_later(parent_cursor_id);
+                Self::oracle_thin_close_owned_cursor_rows(conn, source_rows);
                 return Err(Self::cancel_message());
             }
             rows.push(row);
@@ -13860,9 +13844,32 @@ impl SqlEditorWidget {
                     .map_err(|err| format!("Failed to serialize nested cursor result: {err}"))
             }
             value => {
-                Ok(Self::oracle_thin_string_cell(&value).unwrap_or_else(|| null_text.to_string()))
+                let text =
+                    Self::oracle_thin_string_cell(&value).unwrap_or_else(|| null_text.to_string());
+                Self::oracle_thin_close_owned_cursor_value(conn, value);
+                Ok(text)
             }
         }
+    }
+
+    fn oracle_thin_display_row_cells(
+        conn: &mut OracleThinSession,
+        row: Vec<OracleValue>,
+        null_text: &str,
+        depth: usize,
+    ) -> Result<Vec<String>, String> {
+        let mut cells = Vec::with_capacity(row.len());
+        let mut values = row.into_iter();
+        while let Some(value) = values.next() {
+            match Self::oracle_thin_display_cell(conn, value, null_text, depth) {
+                Ok(cell) => cells.push(cell),
+                Err(err) => {
+                    Self::oracle_thin_close_owned_cursor_values(conn, values);
+                    return Err(err);
+                }
+            }
+        }
+        Ok(cells)
     }
 
     fn oracle_thin_ref_cursor_cell_result_text(
@@ -13879,10 +13886,32 @@ impl SqlEditorWidget {
             }
             OracleValue::Null => Ok(QueryCell::null_result_text()),
             value => {
-                Ok(Self::oracle_thin_string_cell(&value)
-                    .unwrap_or_else(QueryCell::null_result_text))
+                let text = Self::oracle_thin_string_cell(&value)
+                    .unwrap_or_else(QueryCell::null_result_text);
+                Self::oracle_thin_close_owned_cursor_value(conn, value);
+                Ok(text)
             }
         }
+    }
+
+    fn oracle_thin_ref_cursor_row_cells(
+        conn: &mut OracleThinSession,
+        row: Vec<OracleValue>,
+        null_text: &str,
+        depth: usize,
+    ) -> Result<Vec<String>, String> {
+        let mut cells = Vec::with_capacity(row.len());
+        let mut values = row.into_iter();
+        while let Some(value) = values.next() {
+            match Self::oracle_thin_ref_cursor_cell_result_text(conn, value, null_text, depth) {
+                Ok(cell) => cells.push(cell),
+                Err(err) => {
+                    Self::oracle_thin_close_owned_cursor_values(conn, values);
+                    return Err(err);
+                }
+            }
+        }
+        Ok(cells)
     }
 
     fn oracle_thin_cursor_display_json(
@@ -13892,6 +13921,7 @@ impl SqlEditorWidget {
         depth: usize,
     ) -> Result<serde_json::Value, String> {
         if depth >= ORACLE_THIN_MAX_NESTED_CURSOR_DEPTH {
+            conn.close_cursor_later(Some(cursor.cursor_id));
             return Ok(serde_json::Value::String(
                 "REFCURSOR (depth limit exceeded)".to_string(),
             ));
@@ -13904,23 +13934,28 @@ impl SqlEditorWidget {
             .into_iter()
             .map(|column| column.name)
             .collect::<Vec<_>>();
-        let rows = result
-            .result
-            .rows
-            .into_iter()
-            .map(|row| {
-                row.into_iter()
-                    .map(|value| {
-                        Self::oracle_thin_nested_cursor_value_json(
-                            conn,
-                            value,
-                            null_text,
-                            depth.saturating_add(1),
-                        )
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut rows = Vec::with_capacity(result.result.rows.len());
+        let mut source_rows = VecDeque::from(result.result.rows);
+        while let Some(row) = source_rows.pop_front() {
+            let mut row_json = Vec::with_capacity(row.len());
+            let mut values = row.into_iter();
+            while let Some(value) = values.next() {
+                match Self::oracle_thin_nested_cursor_value_json(
+                    conn,
+                    value,
+                    null_text,
+                    depth.saturating_add(1),
+                ) {
+                    Ok(value) => row_json.push(value),
+                    Err(err) => {
+                        Self::oracle_thin_close_owned_cursor_values(conn, values);
+                        Self::oracle_thin_close_owned_cursor_rows(conn, source_rows);
+                        return Err(err);
+                    }
+                }
+            }
+            rows.push(row_json);
+        }
         Ok(serde_json::json!({
             "columns": columns,
             "rows": rows,
@@ -13937,9 +13972,58 @@ impl SqlEditorWidget {
             OracleValue::Cursor(cursor) => {
                 Self::oracle_thin_cursor_display_json(conn, cursor, null_text, depth)
             }
-            value => Ok(serde_json::Value::String(
-                Self::oracle_thin_string_cell(&value).unwrap_or_else(|| null_text.to_string()),
-            )),
+            value => {
+                let text =
+                    Self::oracle_thin_string_cell(&value).unwrap_or_else(|| null_text.to_string());
+                Self::oracle_thin_close_owned_cursor_value(conn, value);
+                Ok(serde_json::Value::String(text))
+            }
+        }
+    }
+
+    fn oracle_thin_close_owned_cursor_value(conn: &mut OracleThinSession, value: OracleValue) {
+        match value {
+            OracleValue::Cursor(cursor) => conn.close_cursor_later(Some(cursor.cursor_id)),
+            OracleValue::Object(values) => {
+                for (_, value) in values {
+                    Self::oracle_thin_close_owned_cursor_value(conn, value);
+                }
+            }
+            OracleValue::Array(values) => {
+                Self::oracle_thin_close_owned_cursor_values(conn, values);
+            }
+            OracleValue::IndexedArray(values) => {
+                for (_, value) in values {
+                    Self::oracle_thin_close_owned_cursor_value(conn, value);
+                }
+            }
+            OracleValue::Null
+            | OracleValue::Number(_)
+            | OracleValue::Text(_)
+            | OracleValue::Boolean(_)
+            | OracleValue::DateTime(_)
+            | OracleValue::Timestamp(_)
+            | OracleValue::Bytes(_)
+            | OracleValue::JsonId(_)
+            | OracleValue::Lob(_) => {}
+        }
+    }
+
+    fn oracle_thin_close_owned_cursor_values(
+        conn: &mut OracleThinSession,
+        values: impl IntoIterator<Item = OracleValue>,
+    ) {
+        for value in values {
+            Self::oracle_thin_close_owned_cursor_value(conn, value);
+        }
+    }
+
+    fn oracle_thin_close_owned_cursor_rows(
+        conn: &mut OracleThinSession,
+        rows: impl IntoIterator<Item = Vec<OracleValue>>,
+    ) {
+        for row in rows {
+            Self::oracle_thin_close_owned_cursor_values(conn, row);
         }
     }
 
@@ -21519,7 +21603,7 @@ mod query_execution_cleanup_tests {
     }
 
     #[test]
-    fn oracle_thin_retained_state_tracks_session_residue_for_close() {
+    fn oracle_thin_retained_state_allows_session_residue_close_discard() {
         let effects =
             crate::db::statement_session_post_processor_for(crate::db::DatabaseType::Oracle)
                 .effects_for_sql("ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD'");
@@ -21540,7 +21624,7 @@ mod query_execution_cleanup_tests {
                 crate::db::RetainedSessionPreflightAction::Close,
                 retained_state,
             ),
-            crate::db::RetainedSessionPreflightDecision::RequireResolution
+            crate::db::RetainedSessionPreflightDecision::Allow
         );
     }
 
@@ -28919,21 +29003,21 @@ mod disconnected_precheck_gate_tests {
     #[test]
     fn precheck_requires_connection_for_non_bootstrap_db_work() {
         assert!(SqlEditorWidget::requires_connected_session_for_precheck(
-            false, false
+            false
         ));
     }
 
     #[test]
     fn precheck_allows_connect_bootstrap_while_disconnected() {
         assert!(!SqlEditorWidget::requires_connected_session_for_precheck(
-            true, false
+            true
         ));
     }
 
     #[test]
     fn precheck_allows_local_only_commands_while_disconnected() {
         assert!(!SqlEditorWidget::requires_connected_session_for_precheck(
-            false, true
+            true
         ));
     }
 
@@ -28941,7 +29025,15 @@ mod disconnected_precheck_gate_tests {
     fn execution_startup_policy_marks_bootstrap_queries_as_disconnected_safe() {
         let policy = SqlEditorWidget::execution_startup_policy("connect user/pass@db");
 
-        assert!(policy.has_connect_command);
+        assert!(policy.allows_disconnected_start);
+        assert!(!policy.requires_connected_session);
+    }
+
+    #[test]
+    fn execution_startup_policy_allows_script_includes_without_connection_precheck() {
+        let policy = SqlEditorWidget::execution_startup_policy("@test/test_all.sql");
+
+        assert!(policy.allows_disconnected_start);
         assert!(!policy.requires_connected_session);
     }
 
@@ -28949,7 +29041,7 @@ mod disconnected_precheck_gate_tests {
     fn execution_startup_policy_requires_connection_for_regular_sql() {
         let policy = SqlEditorWidget::execution_startup_policy("select * from dual");
 
-        assert!(!policy.has_connect_command);
+        assert!(!policy.allows_disconnected_start);
         assert!(policy.requires_connected_session);
     }
 

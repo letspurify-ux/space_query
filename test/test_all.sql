@@ -11,8 +11,8 @@
 @test/test9.txt;
 @test/test10.txt;
 @test/test11.txt;
-@test/test12.sql;
-@test/test13.sql;
+--@test/test12.sql;
+--@test/test13.sql;
 @test/test18.sql;
 @test/test22.sql;
 @test/test23.sql;

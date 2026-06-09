@@ -141,9 +141,15 @@ pub fn retained_session_state_preflight_decision(
         }
         RetainedSessionPreflightAction::ConnectionTransition
         | RetainedSessionPreflightAction::PoolResize
-        | RetainedSessionPreflightAction::Close
         | RetainedSessionPreflightAction::ReleaseClean => {
             if state.requires_physical_session_preservation() {
+                RetainedSessionPreflightDecision::RequireResolution
+            } else {
+                RetainedSessionPreflightDecision::Allow
+            }
+        }
+        RetainedSessionPreflightAction::Close => {
+            if state.transaction_resolution_action_allowed() {
                 RetainedSessionPreflightDecision::RequireResolution
             } else {
                 RetainedSessionPreflightDecision::Allow
@@ -2265,7 +2271,6 @@ mod tests {
             RetainedSessionPreflightAction::ConnectionTransition,
             RetainedSessionPreflightAction::PoolResize,
             RetainedSessionPreflightAction::ScopeChange,
-            RetainedSessionPreflightAction::Close,
             RetainedSessionPreflightAction::ReleaseClean,
         ] {
             assert_eq!(
@@ -2273,6 +2278,10 @@ mod tests {
                 RetainedSessionPreflightDecision::RequireResolution
             );
         }
+        assert_eq!(
+            retained_session_state_preflight_decision(RetainedSessionPreflightAction::Close, state),
+            RetainedSessionPreflightDecision::Allow
+        );
         assert_eq!(
             retained_session_state_preflight_decision(
                 RetainedSessionPreflightAction::Discard,
@@ -2690,7 +2699,6 @@ mod tests {
         for action in [
             RetainedSessionPreflightAction::ConnectionTransition,
             RetainedSessionPreflightAction::PoolResize,
-            RetainedSessionPreflightAction::Close,
             RetainedSessionPreflightAction::ReleaseClean,
         ] {
             assert_eq!(
@@ -2720,15 +2728,50 @@ mod tests {
                 RetainedSessionPreflightDecision::RequireResolution
             );
         }
+        assert_eq!(
+            retained_session_preflight_decision(
+                RetainedSessionPreflightAction::Close,
+                TransactionSessionState::Clean
+            ),
+            RetainedSessionPreflightDecision::Allow
+        );
+        assert_eq!(
+            retained_session_preflight_decision(
+                RetainedSessionPreflightAction::Close,
+                TransactionSessionState::MaybeDirty
+            ),
+            RetainedSessionPreflightDecision::RequireResolution
+        );
+        assert_eq!(
+            retained_session_preflight_decision(
+                RetainedSessionPreflightAction::Close,
+                TransactionSessionState::BlockedDirty
+            ),
+            RetainedSessionPreflightDecision::RequireResolution
+        );
+        assert_eq!(
+            retained_session_preflight_decision(
+                RetainedSessionPreflightAction::Close,
+                TransactionSessionState::DecisionRequired
+            ),
+            RetainedSessionPreflightDecision::RequireResolution
+        );
+        assert_eq!(
+            retained_session_preflight_decision(
+                RetainedSessionPreflightAction::Close,
+                TransactionSessionState::InvalidSession
+            ),
+            RetainedSessionPreflightDecision::Allow
+        );
     }
 
     /// session.md §27.3 / transaction.md §10: a Clean transaction state that
     /// still holds a session-level lock (LOCK TABLES, GET_LOCK(...), FLUSH
-    /// TABLES WITH READ LOCK, ...) must NOT silently slip through tab-close,
-    /// app-exit, pool-resize, or connection-switch preflights — the lock
-    /// would otherwise outlive the editor that took it.
+    /// TABLES WITH READ LOCK, ...) must NOT silently slip through pool-resize,
+    /// auto-release, or connection-switch preflights. Query-tab close is allowed
+    /// because it explicitly discards the tab-owned retained session.
     #[test]
-    fn clean_transaction_with_session_lock_still_blocks_destructive_auto_release() {
+    fn clean_transaction_with_session_lock_blocks_auto_release_but_allows_close_discard() {
         for &(table_lock, named_lock) in &[(true, false), (false, true), (true, true)] {
             let state = RetainedSessionState::from_parts(
                 TransactionSessionState::Clean,
@@ -2742,7 +2785,6 @@ mod tests {
             for action in [
                 RetainedSessionPreflightAction::ConnectionTransition,
                 RetainedSessionPreflightAction::PoolResize,
-                RetainedSessionPreflightAction::Close,
                 RetainedSessionPreflightAction::ReleaseClean,
             ] {
                 assert_eq!(
@@ -2753,6 +2795,13 @@ mod tests {
                     action,
                 );
             }
+            assert_eq!(
+                retained_session_state_preflight_decision(
+                    RetainedSessionPreflightAction::Close,
+                    state
+                ),
+                RetainedSessionPreflightDecision::Allow,
+            );
 
             // Explicit Discard must still be allowed so users can recover.
             assert_eq!(

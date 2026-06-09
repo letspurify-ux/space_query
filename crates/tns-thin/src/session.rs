@@ -1324,6 +1324,7 @@ impl OracleThinSession {
         describe_request.prefetch_rows = 0;
         let response = self.execute_request(&describe_request)?;
         self.close_cursor_later(response.result.cursor_id);
+        self.flush_pending_cursor_closes()?;
         Ok(response.columns)
     }
 

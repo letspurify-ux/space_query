@@ -3446,6 +3446,57 @@ impl MainWindow {
         }
     }
 
+    fn clear_current_result_view(state: &Arc<Mutex<AppState>>) {
+        let result_target = {
+            let s = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            s.result_tabs
+                .active_result_index()
+                .map(ResultTabCloseTarget::Result)
+        };
+        if let Some(target) = result_target {
+            Self::close_result_tab_by_target(state, target);
+            return;
+        }
+
+        Self::clear_current_result_support_section(state);
+    }
+
+    fn clear_all_result_views(state: &Arc<Mutex<AppState>>) {
+        let query_running = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_any_query_running();
+        if query_running {
+            fltk::dialog::alert_default("A query is running. Stop it before clearing results.");
+            return;
+        }
+        let lazy_fetch_sessions = {
+            let mut s = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let had_tabs = s.result_tabs.tab_count() > 0;
+            let lazy_fetch_sessions = s.lazy_fetch_sessions_for_abort();
+            s.result_tabs.clear();
+            s.mark_lazy_fetch_result_tabs_closed(lazy_fetch_sessions.clone());
+            s.mark_all_result_tabs_closed_for_clear();
+            if had_tabs {
+                malloc_trim_process();
+            }
+            s.refresh_result_edit_controls();
+            app::redraw();
+            lazy_fetch_sessions
+        };
+        for session_id in lazy_fetch_sessions {
+            AppState::request_lazy_fetch_on_editors(
+                state,
+                session_id,
+                crate::ui::sql_editor::LazyFetchRequest::CancelAndDiscard,
+            );
+        }
+    }
+
     fn clear_current_result_support_section(state: &Arc<Mutex<AppState>>) {
         let mut s = state
             .lock()
@@ -3453,7 +3504,7 @@ impl MainWindow {
         if s.result_tabs.clear_current_support_section() {
             s.set_status_message("Cleared current result view");
         } else {
-            s.set_status_message("Use Close Grid to remove data grid results");
+            s.set_status_message("Nothing to clear");
         }
         s.refresh_result_edit_controls();
         app::redraw();
@@ -4300,33 +4351,24 @@ impl MainWindow {
         result_toolbar.set_margin(TOOLBAR_SPACING);
         result_toolbar.set_spacing(TOOLBAR_SPACING);
 
-        let mut close_tab_btn = Button::default()
-            .with_size(BUTTON_WIDTH_LARGE, BUTTON_HEIGHT)
-            .with_label("Close Grid");
-        close_tab_btn.set_color(theme::button_subtle());
-        close_tab_btn.set_label_color(theme::text_secondary());
-        close_tab_btn.set_frame(FrameType::RFlatBox);
-        close_tab_btn.set_tooltip("Close the current data grid result tab");
-        result_toolbar.fixed(&close_tab_btn, BUTTON_WIDTH_LARGE);
-
-        let close_all_grids_width = BUTTON_WIDTH_LARGE + 45;
-        let mut clear_tabs_btn = Button::default()
-            .with_size(close_all_grids_width, BUTTON_HEIGHT)
-            .with_label("Close All Grids");
-        clear_tabs_btn.set_color(theme::button_subtle());
-        clear_tabs_btn.set_label_color(theme::text_secondary());
-        clear_tabs_btn.set_frame(FrameType::RFlatBox);
-        clear_tabs_btn.set_tooltip("Close all data grid result tabs");
-        result_toolbar.fixed(&clear_tabs_btn, close_all_grids_width);
-
         let mut clear_current_btn = Button::default()
             .with_size(BUTTON_WIDTH_LARGE + 10, BUTTON_HEIGHT)
             .with_label("Clear Current");
         clear_current_btn.set_color(theme::button_subtle());
         clear_current_btn.set_label_color(theme::text_secondary());
         clear_current_btn.set_frame(FrameType::RFlatBox);
-        clear_current_btn.set_tooltip("Clear the current output, message, or plan view");
+        clear_current_btn
+            .set_tooltip("Clear the current result grid, output, message, or plan view");
         result_toolbar.fixed(&clear_current_btn, BUTTON_WIDTH_LARGE + 10);
+
+        let mut clear_all_btn = Button::default()
+            .with_size(BUTTON_WIDTH_LARGE, BUTTON_HEIGHT)
+            .with_label("Clear All");
+        clear_all_btn.set_color(theme::button_subtle());
+        clear_all_btn.set_label_color(theme::text_secondary());
+        clear_all_btn.set_frame(FrameType::RFlatBox);
+        clear_all_btn.set_tooltip("Clear all result grids, output, messages, and plans");
+        result_toolbar.fixed(&clear_all_btn, BUTTON_WIDTH_LARGE);
 
         let spacer = Frame::default();
         result_toolbar.resizable(&spacer);
@@ -4752,22 +4794,6 @@ impl MainWindow {
             }
         });
 
-        let weak_state_for_result_close = Arc::downgrade(&state);
-        close_tab_btn.set_callback(move |_| {
-            let Some(state_for_result_close) = weak_state_for_result_close.upgrade() else {
-                return;
-            };
-            MainWindow::close_current_result_tab(&state_for_result_close);
-        });
-
-        let weak_state_for_result_clear = Arc::downgrade(&state);
-        clear_tabs_btn.set_callback(move |_| {
-            let Some(state_for_result_clear) = weak_state_for_result_clear.upgrade() else {
-                return;
-            };
-            MainWindow::close_all_result_tabs(&state_for_result_clear);
-        });
-
         let weak_state_for_result_clear_current = Arc::downgrade(&state);
         clear_current_btn.set_callback(move |_| {
             let Some(state_for_result_clear_current) =
@@ -4775,7 +4801,15 @@ impl MainWindow {
             else {
                 return;
             };
-            MainWindow::clear_current_result_support_section(&state_for_result_clear_current);
+            MainWindow::clear_current_result_view(&state_for_result_clear_current);
+        });
+
+        let weak_state_for_result_clear_all = Arc::downgrade(&state);
+        clear_all_btn.set_callback(move |_| {
+            let Some(state_for_result_clear_all) = weak_state_for_result_clear_all.upgrade() else {
+                return;
+            };
+            MainWindow::clear_all_result_views(&state_for_result_clear_all);
         });
 
         let weak_state_for_query_close = Arc::downgrade(&state);

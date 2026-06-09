@@ -83,24 +83,32 @@ fn run_script(mode: OracleDriverMode, sql: &str) -> Result<(Vec<QueryProgress>, 
         });
     }
 
-    widget.execute_script_for_harness(sql);
     let timeout_secs = env::var("ORACLE_COMPARE_TIMEOUT_SECS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(300);
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    while !done.load(Ordering::SeqCst) && Instant::now() < deadline {
-        if !app::wait() {
-            app::check();
-            std::thread::sleep(Duration::from_millis(10));
+    let repeat_count = env::var("ORACLE_COMPARE_REPEAT_SAME_SESSION")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1);
+    for _ in 0..repeat_count {
+        done.store(false, Ordering::SeqCst);
+        widget.execute_script_for_harness(sql);
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        while !done.load(Ordering::SeqCst) && Instant::now() < deadline {
+            if !app::wait() {
+                app::check();
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
-    }
-    if !done.load(Ordering::SeqCst) {
-        return Err(format!(
-            "Oracle {} script execution timed out after {timeout_secs}s",
-            mode.label(),
-        ));
+        if !done.load(Ordering::SeqCst) {
+            return Err(format!(
+                "Oracle {} script execution timed out after {timeout_secs}s",
+                mode.label(),
+            ));
+        }
     }
     let drain_deadline = Instant::now() + Duration::from_millis(750);
     while Instant::now() < drain_deadline {
@@ -202,7 +210,12 @@ fn read_open_cursor_count_for_sid(mode: OracleDriverMode, sid: &str) -> Result<u
         .trim()
         .parse::<u32>()
         .map_err(|err| format!("invalid Oracle SID `{sid}`: {err}"))?;
-    let sql = format!("select count(*) from v$open_cursor where sid = {sid}");
+    let sql = format!(
+        "select s.value \
+         from v$sesstat s \
+         join v$statname n on n.statistic# = s.statistic# \
+         where s.sid = {sid} and n.name = 'opened cursors current'"
+    );
     let mut monitor = DatabaseConnection::new();
     monitor.connect(oracle_connection_info(mode))?;
 

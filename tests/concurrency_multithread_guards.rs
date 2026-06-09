@@ -1155,6 +1155,36 @@ fn oracle_thin_lazy_fetch_all_applies_fetch_all_timeout() {
 }
 
 #[test]
+fn oracle_thin_nested_cursor_display_closes_unrendered_cursor_values() {
+    let content = read_source("src/ui/sql_editor/execution.rs");
+    let start = content
+        .find("fn oracle_thin_cursor_display_json(")
+        .expect("Oracle Thin nested cursor display helper should exist");
+    let end = content[start..]
+        .find("fn oracle_thin_drain_dbms_output(")
+        .map(|offset| start + offset)
+        .expect("DBMS_OUTPUT helper should follow nested cursor display helpers");
+    let body = &content[start..end];
+
+    assert!(
+        body.contains("depth >= ORACLE_THIN_MAX_NESTED_CURSOR_DEPTH")
+            && body.contains("conn.close_cursor_later(Some(cursor.cursor_id))"),
+        "Oracle Thin nested cursor display must close cursors skipped by the depth limit"
+    );
+    assert!(
+        body.contains("Self::oracle_thin_close_owned_cursor_values(conn, values)")
+            && body.contains("Self::oracle_thin_close_owned_cursor_rows(conn, source_rows)"),
+        "Oracle Thin nested cursor display must close unprocessed cursor values when conversion stops early"
+    );
+    assert!(
+        body.contains("OracleValue::Object(values)")
+            && body.contains("OracleValue::Array(values)")
+            && body.contains("OracleValue::IndexedArray(values)"),
+        "Oracle Thin cursor cleanup must scan nested OracleValue containers for cursor values"
+    );
+}
+
+#[test]
 fn primary_mysql_actions_reselect_global_database_before_use() {
     let execution_file =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/sql_editor/execution.rs");
