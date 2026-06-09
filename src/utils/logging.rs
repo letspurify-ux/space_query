@@ -14,6 +14,7 @@ const LOG_FILE_NAME: &str = "app.log.json";
 const CRASH_LOG_FILE_NAME: &str = "crash.log";
 const MAX_LOG_ENTRIES: usize = 100;
 const LOG_WRITER_RESPONSE_TIMEOUT_DEFAULT_SECS: u64 = 15;
+const LOG_WRITER_BATCH_DRAIN_LIMIT: usize = 64;
 
 fn app_data_base_dir() -> Option<PathBuf> {
     if let Some(path) = dirs::data_dir() {
@@ -191,33 +192,73 @@ enum LogCommand {
     Flush(mpsc::Sender<Result<(), String>>),
 }
 
+struct LogWriterState {
+    log: AppLog,
+    dirty: bool,
+}
+
+impl LogWriterState {
+    fn new(log: AppLog) -> Self {
+        Self { log, dirty: false }
+    }
+
+    fn persist_if_dirty<F>(&mut self, persist: &mut F) -> Result<(), String>
+    where
+        F: FnMut(&AppLog) -> Result<(), String>,
+    {
+        if !self.dirty {
+            return Ok(());
+        }
+        persist(&self.log)?;
+        self.dirty = false;
+        Ok(())
+    }
+
+    fn process_command<F>(&mut self, command: LogCommand, persist: &mut F)
+    where
+        F: FnMut(&AppLog) -> Result<(), String>,
+    {
+        match command {
+            LogCommand::Write(entry) => {
+                self.log.add_entry(entry);
+                self.dirty = true;
+            }
+            LogCommand::Clear => {
+                self.log.entries.clear();
+                self.dirty = true;
+            }
+            LogCommand::Flush(reply) => {
+                let _ = reply.send(self.persist_if_dirty(persist));
+            }
+        }
+    }
+}
+
 fn spawn_log_writer() -> mpsc::Sender<LogCommand> {
     let (sender, receiver) = mpsc::channel::<LogCommand>();
     thread::spawn(move || {
-        let mut log = AppLog::load();
+        let mut state = LogWriterState::new(AppLog::load());
+        let mut persist = |log: &AppLog| log.save().map_err(|err| err.to_string());
         loop {
             let cmd = match receiver.recv() {
                 Ok(cmd) => cmd,
                 Err(_) => break,
             };
 
-            match cmd {
-                LogCommand::Write(entry) => {
-                    log.add_entry(entry);
-                    if let Err(err) = log.save() {
-                        eprintln!("Log save error: {err}");
-                    }
-                }
-                LogCommand::Clear => {
-                    log.entries.clear();
-                    if let Err(err) = log.save() {
-                        eprintln!("Log clear save error: {err}");
-                    }
-                }
-                LogCommand::Flush(reply) => {
-                    let _ = reply.send(Ok(()));
-                }
+            state.process_command(cmd, &mut persist);
+            for _ in 0..LOG_WRITER_BATCH_DRAIN_LIMIT {
+                let cmd = match receiver.try_recv() {
+                    Ok(cmd) => cmd,
+                    Err(_) => break,
+                };
+                state.process_command(cmd, &mut persist);
             }
+            if let Err(err) = state.persist_if_dirty(&mut persist) {
+                eprintln!("Log save error: {err}");
+            }
+        }
+        if let Err(err) = state.persist_if_dirty(&mut persist) {
+            eprintln!("Log save error: {err}");
         }
     });
     sender
@@ -428,6 +469,15 @@ pub fn take_crash_log() -> Option<String> {
 mod logging_tests {
     use super::*;
 
+    fn test_log_entry(message: &str) -> LogEntry {
+        LogEntry {
+            timestamp: "t".to_string(),
+            level: LogLevel::Info,
+            source: "test".to_string(),
+            message: message.to_string(),
+        }
+    }
+
     #[test]
     fn log_level_label_returns_expected_strings() {
         assert_eq!(LogLevel::Debug.label(), "DEBUG");
@@ -437,15 +487,49 @@ mod logging_tests {
     }
 
     #[test]
+    fn log_writer_flush_persists_batched_writes_once() {
+        let mut state = LogWriterState::new(AppLog::new());
+        let mut save_count = 0usize;
+        let mut saved_messages = Vec::new();
+        let mut persist = |log: &AppLog| {
+            save_count += 1;
+            saved_messages = log
+                .entries
+                .iter()
+                .map(|entry| entry.message.clone())
+                .collect::<Vec<_>>();
+            Ok(())
+        };
+
+        state.process_command(LogCommand::Write(test_log_entry("first")), &mut persist);
+        state.process_command(LogCommand::Write(test_log_entry("second")), &mut persist);
+        let (tx, rx) = mpsc::channel();
+        state.process_command(LogCommand::Flush(tx), &mut persist);
+
+        assert_eq!(rx.recv().unwrap(), Ok(()));
+        assert_eq!(save_count, 1);
+        assert_eq!(saved_messages, vec!["second", "first"]);
+        assert!(!state.dirty);
+    }
+
+    #[test]
+    fn log_writer_flush_reports_persist_error() {
+        let mut state = LogWriterState::new(AppLog::new());
+        let mut persist = |_log: &AppLog| Err("disk unavailable".to_string());
+
+        state.process_command(LogCommand::Write(test_log_entry("pending")), &mut persist);
+        let (tx, rx) = mpsc::channel();
+        state.process_command(LogCommand::Flush(tx), &mut persist);
+
+        assert_eq!(rx.recv().unwrap(), Err("disk unavailable".to_string()));
+        assert!(state.dirty);
+    }
+
+    #[test]
     fn app_log_add_entry_inserts_at_front_and_truncates() {
         let mut log = AppLog::new();
         for i in 0..10 {
-            log.add_entry(LogEntry {
-                timestamp: format!("t{i}"),
-                level: LogLevel::Info,
-                source: "test".to_string(),
-                message: format!("msg{i}"),
-            });
+            log.add_entry(test_log_entry(&format!("msg{i}")));
         }
         assert_eq!(log.entries.len(), 10);
         assert_eq!(log.entries[0].message, "msg9");
@@ -465,12 +549,7 @@ mod logging_tests {
         ));
         let path = dir.join(LOG_FILE_NAME);
         let mut log = AppLog::new();
-        log.add_entry(LogEntry {
-            timestamp: "t".to_string(),
-            level: LogLevel::Info,
-            source: "test".to_string(),
-            message: "saved".to_string(),
-        });
+        log.add_entry(test_log_entry("saved"));
 
         log.save_to_path(&path).expect("log save should succeed");
 
