@@ -4306,17 +4306,17 @@ impl MainWindow {
 
         let mut query_close_tab_btn = Button::default()
             .with_size(BUTTON_WIDTH_LARGE, BUTTON_HEIGHT)
-            .with_label("Close Query");
+            .with_label("Close Current");
         query_close_tab_btn.set_color(theme::button_subtle());
         query_close_tab_btn.set_label_color(theme::text_secondary());
         query_close_tab_btn.set_frame(FrameType::RFlatBox);
         query_close_tab_btn.set_tooltip("Close the current query tab (Cmd/Ctrl+W)");
         query_tab_toolbar.fixed(&query_close_tab_btn, BUTTON_WIDTH_LARGE);
 
-        let close_all_queries_width = BUTTON_WIDTH_LARGE + 55;
+        let close_all_queries_width = BUTTON_WIDTH_LARGE;
         let mut query_close_all_tabs_btn = Button::default()
             .with_size(close_all_queries_width, BUTTON_HEIGHT)
-            .with_label("Close All Queries");
+            .with_label("Close All");
         query_close_all_tabs_btn.set_color(theme::button_subtle());
         query_close_all_tabs_btn.set_label_color(theme::text_secondary());
         query_close_all_tabs_btn.set_frame(FrameType::RFlatBox);

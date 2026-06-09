@@ -42,7 +42,9 @@ pub(crate) const TNS_DEFAULT_TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs
 pub(crate) const TNS_DEFAULT_SDU: u32 = 8192;
 const TNS_MIN_SDU: u32 = 512;
 const TNS_MAX_SDU: u32 = 2_097_152;
+#[cfg(unix)]
 const TNS_KEEPALIVE_INTERVAL_SECS: u32 = 6;
+#[cfg(unix)]
 const TNS_KEEPALIVE_COUNT: u32 = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

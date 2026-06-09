@@ -13010,13 +13010,12 @@ mod tests {
         decode_oson_to_json, default_ttc_field_version, define_column_metadata,
         derive_auth_combo_key, des_encrypt_block, encode_auth_password, encode_bfile_locator,
         encode_debug_jdwp_data, encode_oracle_binary_double, encode_oracle_binary_float,
-        encode_oracle_bind_text, encode_oracle_number, encode_oracle_timestamp_bind,
-        encode_oson_bool_json, encode_oson_date_json, encode_oson_id_json,
-        encode_oson_interval_ds_json, encode_oson_interval_ym_json, encode_oson_json,
-        encode_oson_number_json, encode_oson_raw_json, encode_oson_string_json,
-        encode_oson_timestamp_json, encode_oson_vector_json, encode_physical_rowid,
-        encode_temp_clob_text, encode_vector, execute_flags_for_request,
-        generate_10g_password_hash, generate_11g_password_hash,
+        encode_oracle_number, encode_oracle_timestamp_bind, encode_oson_bool_json,
+        encode_oson_date_json, encode_oson_id_json, encode_oson_interval_ds_json,
+        encode_oson_interval_ym_json, encode_oson_json, encode_oson_number_json,
+        encode_oson_raw_json, encode_oson_string_json, encode_oson_timestamp_json,
+        encode_oson_vector_json, encode_physical_rowid, encode_temp_clob_text, encode_vector,
+        execute_flags_for_request, generate_10g_password_hash, generate_11g_password_hash,
         generate_auth_credentials_from_session_key_parts, hex_encode_upper,
         local_timezone_offset_string, normalize_cursor_ids, normalize_metadata_charset_form,
         oracle_column_type_from_ora_type, oracle_column_type_from_ora_type_for_protocol,
@@ -13034,11 +13033,9 @@ mod tests {
         write_ub4, write_ub8, AuthCredentials, AuthState, EndToEndAttributes, OracleThinAppContext,
         OracleThinAuthMode, OracleThinCapabilities, OracleThinConfig, OracleThinPurity,
         OracleThinSession, OracleValue, PacketCursor, ServerSidePiggybackState, ThinColumn,
-        CS_FORM_IMPLICIT, CS_FORM_NCHAR, ORACLE_CHARSET_AL32UTF8, ORACLE_CHARSET_JA16SJIS,
-        ORACLE_CHARSET_KO16KSC5601, ORACLE_CHARSET_KO16MSWIN949, ORACLE_CHARSET_UTF8,
-        ORACLE_CHARSET_ZHS16GBK, ORACLE_CHARSET_ZHT16BIG5, TNS_CCAP_END_OF_CALL_STATUS,
-        TNS_CCAP_END_OF_RESPONSE, TNS_CCAP_EXPLICIT_BOUNDARY, TNS_CCAP_FIELD_VERSION,
-        TNS_CCAP_FIELD_VERSION_20_1, TNS_CCAP_FIELD_VERSION_23_1,
+        CS_FORM_IMPLICIT, CS_FORM_NCHAR, ORACLE_CHARSET_AL32UTF8, ORACLE_CHARSET_UTF8,
+        TNS_CCAP_END_OF_CALL_STATUS, TNS_CCAP_END_OF_RESPONSE, TNS_CCAP_EXPLICIT_BOUNDARY,
+        TNS_CCAP_FIELD_VERSION, TNS_CCAP_FIELD_VERSION_20_1, TNS_CCAP_FIELD_VERSION_23_1,
         TNS_CCAP_FIELD_VERSION_23_1_EXT_1, TNS_CCAP_LEGACY_FAST_SESSION_ATTRIBUTES, TNS_CCAP_OCI1,
         TNS_CCAP_TTC1, TNS_CCAP_TTC4, TNS_DRCP_DEAUTHENTICATE, TNS_ERR_NO_DATA_FOUND,
         TNS_ESCAPE_CHAR, TNS_FUNC_COMMIT, TNS_FUNC_LOGOFF, TNS_FUNC_ROLLBACK,
@@ -13052,6 +13049,11 @@ mod tests {
         TNS_SERVER_PIGGYBACK_TRACE_EVENT, TNS_TPC_TXNID_SYNC_SERVER, TNS_TPC_TXNID_SYNC_SET,
         TNS_TPC_TXNID_SYNC_UNSET, TNS_VERIFIER_TYPE_10G, TNS_VERIFIER_TYPE_11G_1,
         TNS_VERIFIER_TYPE_11G_2, TNS_VERIFIER_TYPE_12C, TNS_XML_TYPE_LOB, TNS_XML_TYPE_STRING,
+    };
+    #[cfg(unix)]
+    use super::{
+        encode_oracle_bind_text, ORACLE_CHARSET_JA16SJIS, ORACLE_CHARSET_KO16KSC5601,
+        ORACLE_CHARSET_KO16MSWIN949, ORACLE_CHARSET_ZHS16GBK, ORACLE_CHARSET_ZHT16BIG5,
     };
     use crate::connect::{AcceptInfo, ConnectOptions, ConnectTarget, OracleNetServerType};
     use crate::exec::{
