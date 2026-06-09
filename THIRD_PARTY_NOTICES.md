@@ -27,8 +27,9 @@ The upstream license, notice, and third-party license files are preserved in:
 
 ## go-ora
 
-The TNS thin implementation was also checked against `go-ora` behavior and
-protocol constants. The upstream license file is preserved in:
+Portions of the TNS thin implementation are based on or derived from
+`go-ora`, and were also checked against its behavior and protocol constants.
+The upstream license file is preserved in:
 
 - `vendor/go-ora/LICENSE`
 
