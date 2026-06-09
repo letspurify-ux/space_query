@@ -35,9 +35,9 @@ use tns_thin::{OracleDateTime, OracleThinCancelHandle, OracleThinSession};
 use crate::db::{
     cache_pool_session_context_for_shared_connection,
     clear_pool_session_context_for_shared_connection, lock_connection_with_activity, BindDataType,
-    BindValue, BindVar, ColumnInfo, CursorResult, DbPoolSession, DbSessionLease, QueryCell,
-    QueryExecutor, QueryResult, ResolvedBind, RetainedSessionState, ScriptItem, SessionState,
-    SharedDbSessionLease, ToolCommand, TransactionSessionState,
+    BindValue, BindVar, ColumnInfo, CursorResult, DbPoolSession, DbSessionLease, ObjectBrowser,
+    QueryCell, QueryExecutor, QueryResult, ResolvedBind, RetainedSessionState, ScriptItem,
+    SessionState, SharedDbSessionLease, ToolCommand, TransactionSessionState,
 };
 use crate::sql_text;
 use crate::utils::arithmetic::{safe_div, safe_rem};
@@ -112,6 +112,7 @@ struct OracleThinStatementOutcome {
     ref_cursor_results: Vec<(String, OracleThinRefCursorValue)>,
     implicit_results: Vec<OracleThinRefCursorValue>,
     statement_cursor_id: Option<u32>,
+    row_count: Option<u64>,
 }
 
 struct OracleThinBatchOutcome {
@@ -12585,6 +12586,7 @@ impl SqlEditorWidget {
             .execute_typed_with_implicit(&request, &[])
             .map_err(|err| err.to_string())?;
         let statement_cursor_id = result.result.cursor_id;
+        let row_count = result.result.row_count;
         if Self::execute_oracle_thin_cancel_requested(cancel_flag) {
             if !request.is_query {
                 conn.close_cursor_on_next_call(statement_cursor_id);
@@ -12606,6 +12608,7 @@ impl SqlEditorWidget {
             ref_cursor_results: Vec::new(),
             implicit_results: result.implicit_results,
             statement_cursor_id,
+            row_count,
         })
     }
 
@@ -12655,26 +12658,58 @@ impl SqlEditorWidget {
         }
     }
 
+    /// Maps a lowercased statement head to the DML keyword whose affected-row
+    /// count the server reports, matching the OCI/MySQL "row(s) affected" path.
+    fn oracle_thin_dml_statement_type(head: &str) -> Option<&'static str> {
+        if head.starts_with("update") {
+            Some("UPDATE")
+        } else if head.starts_with("delete") {
+            Some("DELETE")
+        } else if head.starts_with("insert") {
+            Some("INSERT")
+        } else if head.starts_with("merge") {
+            Some("MERGE")
+        } else {
+            None
+        }
+    }
+
     fn oracle_thin_non_query_success_message(
         head: &str,
         has_exec_call: bool,
         auto_commit: bool,
         out_messages: &[String],
+        row_count: Option<u64>,
     ) -> String {
         let is_plsql_block =
             !has_exec_call && (head.starts_with("begin") || head.starts_with("declare"));
         let is_call = has_exec_call || head.starts_with("call");
-        let mut message = if is_plsql_block {
+        let dml_type = (!has_exec_call)
+            .then(|| Self::oracle_thin_dml_statement_type(head))
+            .flatten();
+        let mut message = if let (Some(statement_type), Some(affected_rows)) = (dml_type, row_count)
+        {
+            format!("{} {} row(s) affected", statement_type, affected_rows)
+        } else if is_plsql_block {
             "PL/SQL block executed successfully".to_string()
         } else if is_call {
             "Call executed successfully".to_string()
         } else {
-            "Statement executed successfully".to_string()
+            // Mirror the OCI path's object-specific DDL feedback
+            // ("Table created", "View dropped", "Session altered", ...).
+            Self::ddl_message(head)
         };
         if !out_messages.is_empty() {
             message = format!("{} | OUT: {}", message, out_messages.join(", "));
         }
-        if auto_commit && (is_plsql_block || is_call) {
+        if dml_type.is_some() {
+            // Match the OCI/MySQL DML transaction feedback.
+            message = if auto_commit {
+                format!("{} | Auto-commit applied", message)
+            } else {
+                format!("{} | Commit required", message)
+            };
+        } else if auto_commit && (is_plsql_block || is_call) {
             message = format!("{} | Auto-commit applied", message);
         }
         message
@@ -12764,6 +12799,7 @@ impl SqlEditorWidget {
                 ref_cursor_results: bind_updates.ref_cursor_results,
                 implicit_results: execution.implicit_results,
                 statement_cursor_id,
+                row_count: execution.row_count,
             });
         }
 
@@ -12822,6 +12858,7 @@ impl SqlEditorWidget {
                 ref_cursor_results: bind_updates.ref_cursor_results,
                 implicit_results: execution.implicit_results,
                 statement_cursor_id,
+                row_count: execution.row_count,
             });
         }
 
@@ -12833,6 +12870,7 @@ impl SqlEditorWidget {
             .execute_typed_with_implicit(&request, &[])
             .map_err(|err| err.to_string())?;
         let statement_cursor_id = execution.result.cursor_id;
+        let row_count = execution.result.row_count;
         if Self::execute_oracle_thin_cancel_requested(cancel_flag) {
             if !request.is_query {
                 conn.close_cursor_on_next_call(statement_cursor_id);
@@ -12854,6 +12892,7 @@ impl SqlEditorWidget {
             ref_cursor_results: Vec::new(),
             implicit_results: execution.implicit_results,
             statement_cursor_id,
+            row_count,
         })
     }
 
@@ -15334,6 +15373,7 @@ impl SqlEditorWidget {
                         ) {
                             Ok(outcome) => {
                                 let statement_cursor_id = outcome.statement_cursor_id;
+                                let row_count = outcome.row_count;
                                 let out_messages = outcome.out_messages;
                                 let mut ref_cursor_results =
                                     VecDeque::from(outcome.ref_cursor_results);
@@ -15352,6 +15392,7 @@ impl SqlEditorWidget {
                                     has_exec_call,
                                     auto_commit,
                                     &out_messages,
+                                    row_count,
                                 );
                                 if Self::oracle_statement_sets_current_schema(&execution_sql) {
                                     let synced_current_schema = scope_sync_context.and_then(
@@ -15385,6 +15426,56 @@ impl SqlEditorWidget {
                                     }
                                 }
                                 if statement_error.is_none() {
+                                    // Surface PL/SQL compilation errors like the OCI path:
+                                    // a CREATE that compiles with errors reports failure and
+                                    // emits the LINE/POSITION/TEXT rows as a separate result.
+                                    let mut statement_success = true;
+                                    let mut compile_errors: Option<Vec<Vec<String>>> = None;
+                                    if let Some(object) =
+                                        QueryExecutor::parse_compiled_object(&execution_sql)
+                                    {
+                                        let object_name = match object.owner.as_ref() {
+                                            Some(owner) => format!("{}.{}", owner, object.name),
+                                            None => object.name.clone(),
+                                        };
+                                        match ObjectBrowser::get_thin_compilation_errors(
+                                            conn,
+                                            &object_name,
+                                            &object.object_type,
+                                        ) {
+                                            Ok(errors) if !errors.is_empty() => {
+                                                message =
+                                                    format!("{} | Compiled with errors", message);
+                                                statement_success = false;
+                                                compile_errors = Some(
+                                                    errors
+                                                        .into_iter()
+                                                        .map(|error| {
+                                                            vec![
+                                                                error.line.to_string(),
+                                                                error.position.to_string(),
+                                                                error.text,
+                                                            ]
+                                                        })
+                                                        .collect(),
+                                                );
+                                            }
+                                            Ok(_) => {}
+                                            Err(err) => {
+                                                message = format!(
+                                                    "{} | Failed to fetch compilation errors: {}",
+                                                    message, err
+                                                );
+                                                statement_success = false;
+                                            }
+                                        }
+                                    }
+                                    if !statement_success {
+                                        had_error = true;
+                                        if !continue_on_error {
+                                            stop_execution = true;
+                                        }
+                                    }
                                     let emitted = Self::emit_non_select_result(
                                         sender,
                                         session,
@@ -15392,11 +15483,34 @@ impl SqlEditorWidget {
                                         result_index,
                                         &display_sql,
                                         message,
-                                        true,
+                                        statement_success,
                                         false,
                                         script_mode,
                                     );
                                     if emitted {
+                                        result_index += 1;
+                                    }
+                                    if let Some(rows) = compile_errors {
+                                        let (heading_enabled, feedback_enabled) =
+                                            Self::current_output_settings(session);
+                                        Self::emit_select_result(
+                                            sender,
+                                            session,
+                                            conn_name,
+                                            result_index,
+                                            "COMPILE ERRORS",
+                                            Self::apply_heading_setting(
+                                                vec![
+                                                    "LINE".to_string(),
+                                                    "POSITION".to_string(),
+                                                    "TEXT".to_string(),
+                                                ],
+                                                heading_enabled,
+                                            ),
+                                            rows,
+                                            false,
+                                            feedback_enabled,
+                                        );
                                         result_index += 1;
                                     }
                                     while let Some((cursor_name, cursor)) =
@@ -22818,6 +22932,7 @@ mod query_execution_cleanup_tests {
             cursor_id: Some(42),
             exhausted: false,
             rows: Vec::new(),
+            row_count: None,
         };
 
         assert!(!SqlEditorWidget::oracle_thin_result_reached_eof(&result));
@@ -29966,11 +30081,17 @@ mod mysql_transaction_feedback_tests {
     #[test]
     fn oracle_thin_plsql_success_messages_match_oci_call_path() {
         assert_eq!(
-            SqlEditorWidget::oracle_thin_non_query_success_message("begin", false, false, &[]),
+            SqlEditorWidget::oracle_thin_non_query_success_message(
+                "begin",
+                false,
+                false,
+                &[],
+                None
+            ),
             "PL/SQL block executed successfully"
         );
         assert_eq!(
-            SqlEditorWidget::oracle_thin_non_query_success_message("call", false, false, &[]),
+            SqlEditorWidget::oracle_thin_non_query_success_message("call", false, false, &[], None),
             "Call executed successfully"
         );
         assert_eq!(
@@ -29978,9 +30099,82 @@ mod mysql_transaction_feedback_tests {
                 "begin",
                 true,
                 true,
-                &[":V = 1".to_string()]
+                &[":V = 1".to_string()],
+                None
             ),
             "Call executed successfully | OUT: :V = 1 | Auto-commit applied"
+        );
+    }
+
+    #[test]
+    fn oracle_thin_dml_success_message_reports_rows_affected() {
+        // Manual transaction: row count plus "Commit required" like the OCI path.
+        assert_eq!(
+            SqlEditorWidget::oracle_thin_non_query_success_message(
+                "update emp set sal = sal + 1",
+                false,
+                false,
+                &[],
+                Some(7),
+            ),
+            "UPDATE 7 row(s) affected | Commit required"
+        );
+        // Auto-commit reports "Auto-commit applied" instead.
+        assert_eq!(
+            SqlEditorWidget::oracle_thin_non_query_success_message(
+                "delete from emp where deptno = 10",
+                false,
+                true,
+                &[],
+                Some(0),
+            ),
+            "DELETE 0 row(s) affected | Auto-commit applied"
+        );
+        // Without a server-reported count we keep the generic body but still
+        // attach the transaction feedback for the DML statement.
+        assert_eq!(
+            SqlEditorWidget::oracle_thin_non_query_success_message(
+                "update emp set sal = 1",
+                false,
+                false,
+                &[],
+                None,
+            ),
+            "Statement executed successfully | Commit required"
+        );
+    }
+
+    #[test]
+    fn oracle_thin_ddl_success_message_matches_oci_object_feedback() {
+        assert_eq!(
+            SqlEditorWidget::oracle_thin_non_query_success_message(
+                "create table t (id number)",
+                false,
+                false,
+                &[],
+                None,
+            ),
+            "Table created"
+        );
+        assert_eq!(
+            SqlEditorWidget::oracle_thin_non_query_success_message(
+                "drop view v",
+                false,
+                false,
+                &[],
+                None,
+            ),
+            "View dropped"
+        );
+        assert_eq!(
+            SqlEditorWidget::oracle_thin_non_query_success_message(
+                "truncate table t",
+                false,
+                false,
+                &[],
+                None,
+            ),
+            "Table truncated"
         );
     }
 

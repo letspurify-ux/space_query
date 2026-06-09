@@ -1309,6 +1309,7 @@ impl OracleThinSession {
             rows,
             statement_cursor_id: response.result.cursor_id,
             implicit_results: response.implicit_results,
+            row_count: response.result.row_count,
         })
     }
 
@@ -1495,6 +1496,7 @@ impl OracleThinSession {
                 cursor_id: None,
                 exhausted: true,
                 rows,
+                row_count: None,
             },
         })
     }
@@ -3208,6 +3210,7 @@ struct ExecuteReadState {
     cursor_id: Option<u32>,
     exhausted: bool,
     done: bool,
+    row_count: Option<u64>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -3582,7 +3585,7 @@ struct ExecuteError {
     code: u32,
     cursor_id: u32,
     call_status: u32,
-    _rowcount: u64,
+    rowcount: u64,
     message: Option<String>,
     warning: Option<OracleThinWarning>,
 }
@@ -5869,6 +5872,11 @@ fn read_execute_response_with_state(
                         if error.cursor_id != 0 {
                             state.cursor_id = Some(error.cursor_id);
                         }
+                        // The end-of-call message carries the rows affected for
+                        // non-query statements (UPDATE/DELETE/INSERT/MERGE).
+                        if error.code == 0 && !request.is_query {
+                            state.row_count = Some(error.rowcount);
+                        }
                         if error.code == TNS_ERR_NO_DATA_FOUND && request.is_query {
                             state.exhausted = true;
                             if !capabilities.supports_end_of_response {
@@ -5967,6 +5975,7 @@ fn read_execute_response_with_state(
             },
             exhausted: state.exhausted || !request.is_query,
             rows: state.rows,
+            row_count: state.row_count,
         },
         out_bind_rows: state.out_bind_rows,
         implicit_results: state.implicit_results,
@@ -10511,7 +10520,7 @@ fn process_execute_error(
         code,
         cursor_id,
         call_status,
-        _rowcount: rowcount,
+        rowcount,
         message,
         warning,
     })
@@ -10621,7 +10630,7 @@ fn process_legacy_execute_error(
         code,
         cursor_id,
         call_status,
-        _rowcount: rowcount,
+        rowcount,
         message,
         warning: None,
     })
@@ -19543,7 +19552,7 @@ mod tests {
         let error = process_legacy_execute_error(&mut cursor, &caps).unwrap();
         assert_eq!(error.code, 942);
         assert_eq!(error.cursor_id, 77);
-        assert_eq!(error._rowcount, 12);
+        assert_eq!(error.rowcount, 12);
         assert_eq!(
             error.message.as_deref(),
             Some("ORA-00942: table or view does not exist")
@@ -19620,7 +19629,7 @@ mod tests {
         let error = process_legacy_execute_error(&mut cursor, &caps).unwrap();
         assert_eq!(error.code, 0);
         assert_eq!(error.cursor_id, 42);
-        assert_eq!(error._rowcount, 3);
+        assert_eq!(error.rowcount, 3);
         assert_eq!(error.message, None);
         assert_eq!(cursor.remaining(), 0);
     }
@@ -19662,7 +19671,7 @@ mod tests {
         let error = process_legacy_execute_error(&mut cursor, &caps).unwrap();
         assert_eq!(error.code, 1555);
         assert_eq!(error.cursor_id, 13);
-        assert_eq!(error._rowcount, 25);
+        assert_eq!(error.rowcount, 25);
         assert_eq!(error.message.as_deref(), Some("ORA-01555: forced error"));
         assert_eq!(cursor.remaining(), 0);
     }
@@ -19698,7 +19707,7 @@ mod tests {
         let error = process_legacy_execute_error(&mut cursor, &caps).unwrap();
         assert_eq!(error.code, 1445);
         assert_eq!(error.cursor_id, 174);
-        assert_eq!(error._rowcount, 0);
+        assert_eq!(error.rowcount, 0);
         assert_eq!(
             error.message.as_deref(),
             Some("ORA-01445: cannot select ROWID from a join view")
@@ -19732,7 +19741,7 @@ mod tests {
         let error = process_legacy_execute_error(&mut cursor, &caps).unwrap();
         assert_eq!(error.code, 1445);
         assert_eq!(error.cursor_id, 174);
-        assert_eq!(error._rowcount, 0);
+        assert_eq!(error.rowcount, 0);
         assert_eq!(
             error.message.as_deref(),
             Some(
@@ -19764,7 +19773,7 @@ mod tests {
         let error = process_legacy_execute_error(&mut cursor, &caps).unwrap();
         assert_eq!(error.code, 0);
         assert_eq!(error.cursor_id, 42);
-        assert_eq!(error._rowcount, 3);
+        assert_eq!(error.rowcount, 3);
         assert_eq!(error.message, None);
         assert_eq!(cursor.remaining(), 0);
     }

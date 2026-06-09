@@ -181,6 +181,10 @@ pub struct QueryResult {
     pub cursor_id: Option<u32>,
     pub exhausted: bool,
     pub rows: Vec<Vec<OracleValue>>,
+    /// Rows affected reported by the server for non-query statements
+    /// (UPDATE/DELETE/INSERT/MERGE). `None` for queries or when the server
+    /// did not report a count.
+    pub row_count: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -201,6 +205,7 @@ pub struct OutBindResult {
     pub rows: Vec<Vec<OracleValue>>,
     pub statement_cursor_id: Option<u32>,
     pub implicit_results: Vec<RefCursorValue>,
+    pub row_count: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
