@@ -5960,7 +5960,11 @@ fn read_execute_response_with_state(
         columns,
         thin_columns,
         result: QueryResult {
-            cursor_id: state.cursor_id.filter(|_| !state.exhausted),
+            cursor_id: if request.is_query {
+                state.cursor_id
+            } else {
+                state.cursor_id.filter(|_| !state.exhausted)
+            },
             exhausted: state.exhausted || !request.is_query,
             rows: state.rows,
         },
@@ -13036,18 +13040,18 @@ mod tests {
         TNS_CCAP_END_OF_RESPONSE, TNS_CCAP_EXPLICIT_BOUNDARY, TNS_CCAP_FIELD_VERSION,
         TNS_CCAP_FIELD_VERSION_20_1, TNS_CCAP_FIELD_VERSION_23_1,
         TNS_CCAP_FIELD_VERSION_23_1_EXT_1, TNS_CCAP_LEGACY_FAST_SESSION_ATTRIBUTES, TNS_CCAP_OCI1,
-        TNS_CCAP_TTC1, TNS_CCAP_TTC4, TNS_DRCP_DEAUTHENTICATE, TNS_ESCAPE_CHAR, TNS_FUNC_COMMIT,
-        TNS_FUNC_LOGOFF, TNS_FUNC_ROLLBACK, TNS_FUNC_SESSION_RELEASE, TNS_JSON_MAX_LENGTH,
-        TNS_KEYWORD_NUM_CURRENT_SCHEMA, TNS_KEYWORD_NUM_EDITION, TNS_KEYWORD_NUM_TRANSACTION_ID,
-        TNS_LEGACY_CLR_CHUNK_SIZE, TNS_MAX_ROWID_LENGTH, TNS_MAX_UROWID_LENGTH, TNS_MSG_TYPE_ERROR,
-        TNS_MSG_TYPE_ONEWAY_FN, TNS_MSG_TYPE_PARAMETER, TNS_MSG_TYPE_PROTOCOL,
-        TNS_MSG_TYPE_ROW_DATA, TNS_MSG_TYPE_SERVER_SIDE_PIGGYBACK, TNS_OBJ_HAS_INDEXES,
-        TNS_OBJ_IS_DEGENERATE, TNS_OBJ_NO_PREFIX_SEG, TNS_RCAP_TTC, TNS_RCAP_TTC_32K,
-        TNS_RCAP_TTC_SESSION_STATE_OPS, TNS_RCAP_TTC_ZERO_COPY, TNS_SERVER_PIGGYBACK_LTXID,
-        TNS_SERVER_PIGGYBACK_SESS_RET, TNS_SERVER_PIGGYBACK_TRACE_EVENT, TNS_TPC_TXNID_SYNC_SERVER,
-        TNS_TPC_TXNID_SYNC_SET, TNS_TPC_TXNID_SYNC_UNSET, TNS_VERIFIER_TYPE_10G,
-        TNS_VERIFIER_TYPE_11G_1, TNS_VERIFIER_TYPE_11G_2, TNS_VERIFIER_TYPE_12C, TNS_XML_TYPE_LOB,
-        TNS_XML_TYPE_STRING,
+        TNS_CCAP_TTC1, TNS_CCAP_TTC4, TNS_DRCP_DEAUTHENTICATE, TNS_ERR_NO_DATA_FOUND,
+        TNS_ESCAPE_CHAR, TNS_FUNC_COMMIT, TNS_FUNC_LOGOFF, TNS_FUNC_ROLLBACK,
+        TNS_FUNC_SESSION_RELEASE, TNS_JSON_MAX_LENGTH, TNS_KEYWORD_NUM_CURRENT_SCHEMA,
+        TNS_KEYWORD_NUM_EDITION, TNS_KEYWORD_NUM_TRANSACTION_ID, TNS_LEGACY_CLR_CHUNK_SIZE,
+        TNS_MAX_ROWID_LENGTH, TNS_MAX_UROWID_LENGTH, TNS_MSG_TYPE_ERROR, TNS_MSG_TYPE_ONEWAY_FN,
+        TNS_MSG_TYPE_PARAMETER, TNS_MSG_TYPE_PROTOCOL, TNS_MSG_TYPE_ROW_DATA,
+        TNS_MSG_TYPE_SERVER_SIDE_PIGGYBACK, TNS_OBJ_HAS_INDEXES, TNS_OBJ_IS_DEGENERATE,
+        TNS_OBJ_NO_PREFIX_SEG, TNS_RCAP_TTC, TNS_RCAP_TTC_32K, TNS_RCAP_TTC_SESSION_STATE_OPS,
+        TNS_RCAP_TTC_ZERO_COPY, TNS_SERVER_PIGGYBACK_LTXID, TNS_SERVER_PIGGYBACK_SESS_RET,
+        TNS_SERVER_PIGGYBACK_TRACE_EVENT, TNS_TPC_TXNID_SYNC_SERVER, TNS_TPC_TXNID_SYNC_SET,
+        TNS_TPC_TXNID_SYNC_UNSET, TNS_VERIFIER_TYPE_10G, TNS_VERIFIER_TYPE_11G_1,
+        TNS_VERIFIER_TYPE_11G_2, TNS_VERIFIER_TYPE_12C, TNS_XML_TYPE_LOB, TNS_XML_TYPE_STRING,
     };
     use crate::connect::{AcceptInfo, ConnectOptions, ConnectTarget, OracleNetServerType};
     use crate::exec::{
@@ -19543,6 +19547,53 @@ mod tests {
             Some("ORA-00942: table or view does not exist")
         );
         assert_eq!(cursor.remaining(), 0);
+    }
+
+    #[test]
+    fn exhausted_query_response_keeps_cursor_id_for_close() {
+        let caps = OracleThinCapabilities {
+            protocol_version: Some(314),
+            ttc_field_version: 6,
+            supports_end_of_call_status: false,
+            supports_fast_session_attributes: false,
+            supports_big_clr_chunks: false,
+            ..OracleThinCapabilities::default()
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_caps = caps.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut payload = vec![TNS_MSG_TYPE_ERROR];
+            push_legacy_summary_prefix(&mut payload, 0, TNS_ERR_NO_DATA_FOUND as u16, 77, 0);
+            for _ in 0..4 {
+                write_ub4(&mut payload, 0);
+            }
+            write_bytes_with_length_for_capabilities(
+                &mut payload,
+                b"ORA-01403: no data found\n",
+                &server_caps,
+            )
+            .unwrap();
+            write_data_packet(&mut stream, 314, TNS_DEFAULT_SDU, &payload).unwrap();
+        });
+        let mut stream = TcpStream::connect(addr).unwrap();
+        let mut server_state = ServerSidePiggybackState::default();
+        let response = super::read_execute_response_with_state(
+            &mut stream,
+            &caps,
+            &StatementRequest::query("select * from dual where 1 = 0", 1),
+            &mut server_state,
+            ExecuteReadState::default(),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(response.result.cursor_id, Some(77));
+        assert!(response.result.exhausted);
+        assert!(response.result.rows.is_empty());
+
+        server.join().unwrap();
     }
 
     #[test]
