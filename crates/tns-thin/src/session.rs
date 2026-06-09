@@ -399,6 +399,8 @@ const TNS_LOB_LOC_FLAGS_BLOB: u8 = 0x01;
 const TNS_LOB_LOC_FLAGS_VALUE_BASED: u8 = 0x20;
 const TNS_LOB_LOC_FLAGS_ABSTRACT: u8 = 0x40;
 const TNS_LOB_LOC_FLAGS_INIT: u8 = 0x08;
+const TNS_LOB_LOC_FLAGS_TEMP: u8 = 0x01;
+const TNS_LOB_LOC_OFFSET_FLAG_1: usize = 4;
 const TNS_LOB_LOC_OFFSET_FLAG_3: usize = 6;
 const TNS_LOB_LOC_OFFSET_FLAG_4: usize = 7;
 const TNS_LOB_LOC_FLAGS_VAR_LENGTH_CHARSET: u8 = 0x80;
@@ -665,6 +667,7 @@ pub struct OracleThinSession {
     broken: bool,
     call_timeout: Option<Duration>,
     pending_cursor_closes: Vec<u32>,
+    fetched_temp_lobs_to_free: Vec<Vec<u8>>,
     last_rows_by_cursor: HashMap<u32, Vec<OracleValue>>,
     cursor_columns_by_cursor: HashMap<u32, Vec<ThinColumn>>,
     ref_cursor_ids: HashSet<u32>,
@@ -728,6 +731,7 @@ impl OracleThinSession {
             broken: false,
             call_timeout: None,
             pending_cursor_closes: Vec::new(),
+            fetched_temp_lobs_to_free: Vec::new(),
             last_rows_by_cursor: HashMap::new(),
             cursor_columns_by_cursor: HashMap::new(),
             ref_cursor_ids: HashSet::new(),
@@ -984,7 +988,7 @@ impl OracleThinSession {
     }
 
     pub fn is_healthy(&mut self) -> bool {
-        !self.broken
+        !self.broken && stream_is_idle_and_alive(&self.stream)
     }
 
     pub fn reset_before_reuse(&mut self) -> Result<(), OracleThinError> {
@@ -992,6 +996,7 @@ impl OracleThinSession {
         self.set_call_timeout(None)?;
         if self.broken {
             self.pending_cursor_closes.clear();
+            self.fetched_temp_lobs_to_free.clear();
             self.last_rows_by_cursor.clear();
             self.cursor_columns_by_cursor.clear();
             self.ref_cursor_ids.clear();
@@ -1002,12 +1007,31 @@ impl OracleThinSession {
             self.in_request = false;
             Err(OracleThinError::new("Oracle thin session is broken"))
         } else {
+            self.queue_tracked_cursor_closes_for_reuse();
+            // Frees any leftover fetched temp LOBs; piggybacks the queued
+            // cursor closes on the same round trip when it runs.
+            self.free_fetched_temp_lobs()?;
             self.flush_pending_cursor_closes()?;
             self.rollback()?;
             self.end_request()?;
             self.release_drcp_session_if_needed()?;
             Ok(())
         }
+    }
+
+    /// Queues a close for every cursor this session still tracks as open, and
+    /// drops the per-cursor bookkeeping. Called when the connection returns to
+    /// the pool so cursors the caller abandoned do not stay open server-side
+    /// for the connection's lifetime (ORA-01000) and stale ids cannot collide
+    /// with server-side cursor id reuse on the next checkout.
+    fn queue_tracked_cursor_closes_for_reuse(&mut self) {
+        let mut cursor_ids = std::mem::take(&mut self.pending_cursor_closes);
+        cursor_ids.extend(std::mem::take(&mut self.last_rows_by_cursor).into_keys());
+        cursor_ids.extend(std::mem::take(&mut self.cursor_columns_by_cursor).into_keys());
+        cursor_ids.extend(std::mem::take(&mut self.ref_cursor_ids));
+        cursor_ids.extend(std::mem::take(&mut self.deferred_cursor_closes).into_keys());
+        cursor_ids.extend(std::mem::take(&mut self.deferred_cursor_parent_by_child).into_keys());
+        self.pending_cursor_closes = cursor_ids;
     }
 
     pub fn ping(&mut self) -> Result<(), OracleThinError> {
@@ -1626,6 +1650,7 @@ impl OracleThinSession {
                 return Err(error);
             }
         };
+        self.free_fetched_temp_lobs()?;
         if result.exhausted || result.cursor_id.is_none() {
             self.last_rows_by_cursor.remove(&cursor_id);
         } else {
@@ -1867,12 +1892,14 @@ impl OracleThinSession {
                 };
                 match column.column_type {
                     OracleColumnType::Blob => {
-                        *value =
-                            OracleValue::Bytes(self.read_blob_locator_as_bytes(&locator.clone())?);
+                        let locator = locator.clone();
+                        self.queue_fetched_lob_free(&locator);
+                        *value = OracleValue::Bytes(self.read_blob_locator_as_bytes(&locator)?);
                     }
                     OracleColumnType::Clob | OracleColumnType::Nclob => {
-                        *value =
-                            OracleValue::Text(self.read_clob_locator_as_text(&locator.clone())?);
+                        let locator = locator.clone();
+                        self.queue_fetched_lob_free(&locator);
+                        *value = OracleValue::Text(self.read_clob_locator_as_text(&locator)?);
                     }
                     _ => {}
                 }
@@ -1901,10 +1928,14 @@ impl OracleThinSession {
     ) -> Result<(), OracleThinError> {
         match value {
             OracleValue::Lob(locator) if column.column_type == OracleColumnType::Xml => {
-                *value = OracleValue::Text(self.read_clob_locator_as_text(&locator.clone())?);
+                let locator = locator.clone();
+                self.queue_fetched_lob_free(&locator);
+                *value = OracleValue::Text(self.read_clob_locator_as_text(&locator)?);
             }
             OracleValue::Lob(locator) if column.column_type == OracleColumnType::Vector => {
-                *value = OracleValue::Text(self.read_vector_locator_as_text(&locator.clone())?);
+                let locator = locator.clone();
+                self.queue_fetched_lob_free(&locator);
+                *value = OracleValue::Text(self.read_vector_locator_as_text(&locator)?);
             }
             OracleValue::Object(attrs) => {
                 let key = object_type_key(&column.schema_name, &column.type_name);
@@ -2508,7 +2539,7 @@ impl OracleThinSession {
             execute_without_prefetch,
         }) {
             self.requeue_pending_cursor_closes(&pending_cursor_closes);
-            let _ = self.free_temp_lobs(&temp_lob_locators);
+            let _ = self.free_temp_lobs_and_fetched(&temp_lob_locators);
             return Err(error);
         }
         self.clear_pending_current_schema_if_written(current_schema.as_deref());
@@ -2527,7 +2558,7 @@ impl OracleThinSession {
         );
         if self.cancel_flag.swap(false, Ordering::SeqCst) {
             let error = self.finish_cancelled_read();
-            let _ = self.free_temp_lobs(&temp_lob_locators);
+            let _ = self.free_temp_lobs_and_fetched(&temp_lob_locators);
             return Err(error);
         }
         match response {
@@ -2542,7 +2573,7 @@ impl OracleThinSession {
                     },
                     Err(error) => Err(error),
                 };
-                let free_result = self.free_temp_lobs(&temp_lob_locators);
+                let free_result = self.free_temp_lobs_and_fetched(&temp_lob_locators);
                 match (result, free_result) {
                     (Ok(response), Ok(())) => Ok(response),
                     (Err(error), _) => Err(error),
@@ -2551,7 +2582,7 @@ impl OracleThinSession {
             }
             Err(error) => {
                 self.close_cursor_later(error.cursor_id());
-                let _ = self.free_temp_lobs(&temp_lob_locators);
+                let _ = self.free_temp_lobs_and_fetched(&temp_lob_locators);
                 Err(error)
             }
         }
@@ -2863,6 +2894,33 @@ impl OracleThinSession {
         self.pending_cursor_closes = normalize_cursor_ids(merged);
     }
 
+    /// Queues a fetched locator for a server-side free if it refers to an
+    /// abstract (e.g. XMLTYPE image) or temporary LOB. Mirrors python-oracledb
+    /// `free_lob`, which frees such locators on the next piggyback; without the
+    /// free they accumulate in the server session (V$TEMPORARY_LOBS).
+    fn queue_fetched_lob_free(&mut self, locator: &[u8]) {
+        if fetched_lob_locator_needs_free(locator) {
+            self.fetched_temp_lobs_to_free.push(locator.to_vec());
+        }
+    }
+
+    fn free_fetched_temp_lobs(&mut self) -> Result<(), OracleThinError> {
+        if self.fetched_temp_lobs_to_free.is_empty() {
+            return Ok(());
+        }
+        let locators = std::mem::take(&mut self.fetched_temp_lobs_to_free);
+        self.free_temp_lobs(&locators)
+    }
+
+    fn free_temp_lobs_and_fetched(&mut self, locators: &[Vec<u8>]) -> Result<(), OracleThinError> {
+        if self.fetched_temp_lobs_to_free.is_empty() {
+            return self.free_temp_lobs(locators);
+        }
+        let mut all = std::mem::take(&mut self.fetched_temp_lobs_to_free);
+        all.extend_from_slice(locators);
+        self.free_temp_lobs(&all)
+    }
+
     fn free_temp_lobs(&mut self, locators: &[Vec<u8>]) -> Result<(), OracleThinError> {
         if locators.is_empty() {
             return Ok(());
@@ -2942,6 +3000,50 @@ impl Drop for OracleThinSession {
     fn drop(&mut self) {
         let _ = self.close();
     }
+}
+
+/// Cheap liveness probe for a session expected to be idle at a request
+/// boundary: peeks the socket without blocking. A clean idle session has no
+/// pending bytes, so EOF or a socket error means the server dropped the
+/// connection, and unexpected pending data means the previous call left the
+/// protocol desynchronized — either way the session is unsafe to reuse.
+#[cfg(unix)]
+fn stream_is_idle_and_alive(stream: &TcpStream) -> bool {
+    let mut probe = [0u8; 1];
+    let received = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            probe.as_mut_ptr().cast(),
+            probe.len(),
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    if received < 0 {
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        errno == Some(libc::EWOULDBLOCK)
+            || errno == Some(libc::EAGAIN)
+            || errno == Some(libc::EINTR)
+    } else {
+        false
+    }
+}
+
+#[cfg(not(unix))]
+fn stream_is_idle_and_alive(_stream: &TcpStream) -> bool {
+    true
+}
+
+/// Mirrors the flag check in python-oracledb `free_lob`: abstract LOBs
+/// (flag byte 1, e.g. XMLTYPE images) and temporary LOBs (flag byte 4) must be
+/// explicitly freed; persistent table LOB locators need no free.
+fn fetched_lob_locator_needs_free(locator: &[u8]) -> bool {
+    let abstract_lob = locator
+        .get(TNS_LOB_LOC_OFFSET_FLAG_1)
+        .is_some_and(|flags| flags & TNS_LOB_LOC_FLAGS_ABSTRACT != 0);
+    let temp_lob = locator
+        .get(TNS_LOB_LOC_OFFSET_FLAG_4)
+        .is_some_and(|flags| flags & TNS_LOB_LOC_FLAGS_TEMP != 0);
+    abstract_lob || temp_lob
 }
 
 fn normalize_cursor_ids(mut cursor_ids: Vec<u32>) -> Vec<u32> {
@@ -12996,7 +13098,8 @@ mod tests {
         TNS_EOCS_FLAGS_TXN_IN_PROGRESS, TNS_ERR_INBAND_MESSAGE, TNS_EXEC_FLAGS_IMPLICIT_RESULTSET,
         TNS_FUNC_AUTH_PHASE_ONE, TNS_FUNC_AUTH_PHASE_TWO, TNS_FUNC_LOB_OP, TNS_FUNC_PING,
         TNS_FUNC_SESSION_STATE, TNS_FUNC_SET_END_TO_END_ATTR, TNS_FUNC_SET_SCHEMA,
-        TNS_JSON_TYPE_ID, TNS_LOB_LOC_FLAGS_LITTLE_ENDIAN, TNS_LOB_LOC_FLAGS_VAR_LENGTH_CHARSET,
+        TNS_JSON_TYPE_ID, TNS_LOB_LOC_FLAGS_ABSTRACT, TNS_LOB_LOC_FLAGS_LITTLE_ENDIAN,
+        TNS_LOB_LOC_FLAGS_TEMP, TNS_LOB_LOC_FLAGS_VAR_LENGTH_CHARSET, TNS_LOB_LOC_OFFSET_FLAG_1,
         TNS_LOB_LOC_OFFSET_FLAG_3, TNS_LOB_LOC_OFFSET_FLAG_4, TNS_LOB_OP_ARRAY,
         TNS_LOB_OP_CREATE_TEMP, TNS_LOB_OP_FREE_TEMP, TNS_LOB_PREFETCH_FLAG, TNS_MARKER_TYPE_BREAK,
         TNS_MARKER_TYPE_INTERRUPT, TNS_MARKER_TYPE_RESET, TNS_MAX_LONG_LENGTH,
@@ -13024,27 +13127,28 @@ mod tests {
         encode_oson_interval_ym_json, encode_oson_json, encode_oson_number_json,
         encode_oson_raw_json, encode_oson_string_json, encode_oson_timestamp_json,
         encode_oson_vector_json, encode_physical_rowid, encode_temp_clob_text, encode_vector,
-        execute_flags_for_request, generate_10g_password_hash, generate_11g_password_hash,
-        generate_auth_credentials_from_session_key_parts, hex_encode_upper,
-        local_timezone_offset_string, normalize_cursor_ids, normalize_metadata_charset_form,
-        oracle_column_type_from_ora_type, oracle_column_type_from_ora_type_for_protocol,
-        process_auth_payload, process_describe_body, process_legacy_execute_error,
-        process_protocol_message, process_return_parameters, process_row_data,
-        process_server_side_piggyback, process_token, process_warning, read_boolean_value,
-        read_data_packet_with_control, read_data_packet_with_flags, read_rowid_value,
-        read_urowid_value, request_is_dml_returning, request_with_out_bind_types,
+        execute_flags_for_request, fetched_lob_locator_needs_free, generate_10g_password_hash,
+        generate_11g_password_hash, generate_auth_credentials_from_session_key_parts,
+        hex_encode_upper, local_timezone_offset_string, normalize_cursor_ids,
+        normalize_metadata_charset_form, oracle_column_type_from_ora_type,
+        oracle_column_type_from_ora_type_for_protocol, process_auth_payload, process_describe_body,
+        process_legacy_execute_error, process_protocol_message, process_return_parameters,
+        process_row_data, process_server_side_piggyback, process_token, process_warning,
+        read_boolean_value, read_data_packet_with_control, read_data_packet_with_flags,
+        read_rowid_value, read_urowid_value, request_is_dml_returning, request_with_out_bind_types,
         thin_column_from_column_metadata, thin_column_from_object_attr,
         validate_supported_protocol, verify_server_response, windows_code_pages_for_encoding,
         write_bind_rows_for_request, write_bind_value, write_bytes_with_length_for_capabilities,
-        write_bytes_with_two_lengths, write_column_metadata, write_current_schema_piggyback,
-        write_data_packet, write_data_type_representations, write_end_to_end_piggyback,
-        write_eof_data_packet, write_function_code, write_session_state_piggyback, write_ub2,
-        write_ub4, write_ub8, AuthCredentials, AuthState, EndToEndAttributes, OracleThinAppContext,
-        OracleThinAuthMode, OracleThinCapabilities, OracleThinConfig, OracleThinPurity,
-        OracleThinSession, OracleValue, PacketCursor, ServerSidePiggybackState, ThinColumn,
-        CS_FORM_IMPLICIT, CS_FORM_NCHAR, ORACLE_CHARSET_AL32UTF8, ORACLE_CHARSET_UTF8,
-        TNS_CCAP_END_OF_CALL_STATUS, TNS_CCAP_END_OF_RESPONSE, TNS_CCAP_EXPLICIT_BOUNDARY,
-        TNS_CCAP_FIELD_VERSION, TNS_CCAP_FIELD_VERSION_20_1, TNS_CCAP_FIELD_VERSION_23_1,
+        write_bytes_with_two_lengths, write_close_cursors_piggyback, write_column_metadata,
+        write_current_schema_piggyback, write_data_packet, write_data_type_representations,
+        write_end_to_end_piggyback, write_eof_data_packet, write_function_code,
+        write_session_state_piggyback, write_ub2, write_ub4, write_ub8, AuthCredentials, AuthState,
+        EndToEndAttributes, OracleThinAppContext, OracleThinAuthMode, OracleThinCapabilities,
+        OracleThinConfig, OracleThinPurity, OracleThinSession, OracleValue, PacketCursor,
+        ServerSidePiggybackState, ThinColumn, CS_FORM_IMPLICIT, CS_FORM_NCHAR,
+        ORACLE_CHARSET_AL32UTF8, ORACLE_CHARSET_UTF8, TNS_CCAP_END_OF_CALL_STATUS,
+        TNS_CCAP_END_OF_RESPONSE, TNS_CCAP_EXPLICIT_BOUNDARY, TNS_CCAP_FIELD_VERSION,
+        TNS_CCAP_FIELD_VERSION_20_1, TNS_CCAP_FIELD_VERSION_23_1,
         TNS_CCAP_FIELD_VERSION_23_1_EXT_1, TNS_CCAP_LEGACY_FAST_SESSION_ATTRIBUTES, TNS_CCAP_OCI1,
         TNS_CCAP_TTC1, TNS_CCAP_TTC4, TNS_DRCP_DEAUTHENTICATE, TNS_ERR_NO_DATA_FOUND,
         TNS_ESCAPE_CHAR, TNS_FUNC_COMMIT, TNS_FUNC_LOGOFF, TNS_FUNC_ROLLBACK,
@@ -13083,6 +13187,7 @@ mod tests {
             broken: false,
             call_timeout: None,
             pending_cursor_closes: Vec::new(),
+            fetched_temp_lobs_to_free: Vec::new(),
             last_rows_by_cursor: HashMap::new(),
             cursor_columns_by_cursor: HashMap::new(),
             ref_cursor_ids: HashSet::new(),
@@ -13535,6 +13640,124 @@ mod tests {
         ];
         write_ub4(&mut expected, 0);
         assert_eq!(release_body, expected);
+    }
+
+    #[test]
+    fn is_healthy_detects_server_disconnect_on_idle_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let mut session = test_session_with_stream(client);
+
+        assert!(session.is_healthy());
+
+        drop(server);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while session.is_healthy() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!session.is_healthy());
+    }
+
+    #[test]
+    fn is_healthy_detects_pending_bytes_as_desync_on_idle_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let mut session = test_session_with_stream(client);
+
+        assert!(session.is_healthy());
+
+        server.write_all(&[0x01]).unwrap();
+        server.flush().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while session.is_healthy() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!session.is_healthy());
+    }
+
+    #[test]
+    fn fetched_lob_locator_needs_free_matches_python_oracledb_flags() {
+        let mut abstract_locator = vec![0u8; 40];
+        abstract_locator[TNS_LOB_LOC_OFFSET_FLAG_1] = TNS_LOB_LOC_FLAGS_ABSTRACT;
+        assert!(fetched_lob_locator_needs_free(&abstract_locator));
+
+        let mut temp_locator = vec![0u8; 40];
+        temp_locator[TNS_LOB_LOC_OFFSET_FLAG_4] = TNS_LOB_LOC_FLAGS_TEMP;
+        assert!(fetched_lob_locator_needs_free(&temp_locator));
+
+        let persistent_locator = vec![0u8; 40];
+        assert!(!fetched_lob_locator_needs_free(&persistent_locator));
+
+        assert!(!fetched_lob_locator_needs_free(b"abc"));
+    }
+
+    #[test]
+    fn queue_fetched_lob_free_keeps_only_abstract_or_temp_locators() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            drop(stream);
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut session = test_session_with_stream(stream);
+        let mut abstract_locator = vec![0u8; 40];
+        abstract_locator[TNS_LOB_LOC_OFFSET_FLAG_1] = TNS_LOB_LOC_FLAGS_ABSTRACT;
+        let persistent_locator = vec![0u8; 40];
+
+        session.queue_fetched_lob_free(&abstract_locator);
+        session.queue_fetched_lob_free(&persistent_locator);
+
+        assert_eq!(session.fetched_temp_lobs_to_free, vec![abstract_locator]);
+        drop(session);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn reset_before_reuse_closes_abandoned_cursors() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let close_body = read_tns_test_packet(&mut stream, 319);
+            write_tns_status_response(&mut stream, 319);
+            let rollback_body = read_tns_test_packet(&mut stream, 319);
+            write_tns_status_response(&mut stream, 319);
+            (close_body, rollback_body)
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut session = test_session_with_stream(stream);
+        session.last_rows_by_cursor.insert(17, Vec::new());
+        session.cursor_columns_by_cursor.insert(17, Vec::new());
+        session.ref_cursor_ids.insert(23);
+        session
+            .deferred_cursor_closes
+            .insert(11, HashSet::from([23]));
+        session.deferred_cursor_parent_by_child.insert(23, 11);
+
+        session.reset_before_reuse().unwrap();
+        let (close_body, rollback_body) = server.join().unwrap();
+
+        assert!(session.pending_cursor_closes.is_empty());
+        assert!(session.last_rows_by_cursor.is_empty());
+        assert!(session.cursor_columns_by_cursor.is_empty());
+        assert!(session.ref_cursor_ids.is_empty());
+        assert!(session.deferred_cursor_closes.is_empty());
+        assert!(session.deferred_cursor_parent_by_child.is_empty());
+
+        let caps = OracleThinCapabilities::default();
+        let mut expected_close = vec![0, 0];
+        write_close_cursors_piggyback(&mut expected_close, &caps, 3, &[11, 17, 23]).unwrap();
+        write_function_code(&mut expected_close, TNS_FUNC_PING, 4, &caps);
+        assert_eq!(close_body, expected_close);
+        assert_eq!(
+            rollback_body,
+            vec![0, 0, TNS_MSG_TYPE_FUNCTION, TNS_FUNC_ROLLBACK, 5]
+        );
     }
 
     #[test]

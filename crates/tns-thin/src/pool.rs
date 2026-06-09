@@ -187,15 +187,22 @@ impl OracleThinSessionPool {
     }
 
     pub fn close(&self) {
-        let mut guard = self
-            .inner
-            .mutex
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.closed = true;
-        guard.idle.clear();
-        guard.open_count = 0;
-        self.inner.condvar.notify_all();
+        let idle: VecDeque<OracleThinSession>;
+        {
+            let mut guard = self
+                .inner
+                .mutex
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.closed = true;
+            idle = std::mem::take(&mut guard.idle);
+            guard.open_count = guard.open_count.saturating_sub(idle.len());
+            self.inner.condvar.notify_all();
+        }
+        // Dropping a session runs its logoff handshake on the wire; do it
+        // outside the pool mutex so a slow or dead server cannot block other
+        // threads touching the pool.
+        drop(idle);
     }
 }
 

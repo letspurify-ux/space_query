@@ -3087,13 +3087,15 @@ impl DatabaseConnection {
         let statements = Self::oracle_session_setting_statements(advanced);
 
         for statement in statements {
-            let request = StatementRequest::statement(statement.clone());
-            if let Err(err) = session.execute_typed(&request, &[]) {
+            if let Err(err) = session.query_drop(&statement) {
                 return Err(format!(
                     "Failed to apply Oracle thin session setting `{statement}`: {err}"
                 ));
             }
         }
+        session
+            .flush_pending_cursor_closes()
+            .map_err(|err| format!("Failed to close Oracle thin session setting cursors: {err}"))?;
         Ok(())
     }
 
@@ -3389,10 +3391,11 @@ impl DatabaseConnection {
         };
 
         let statement = Self::oracle_set_current_schema_statement(&schema);
-        let request = StatementRequest::statement(statement);
         session
-            .execute_typed(&request, &[])
-            .map(|_| ())
+            .query_drop(&statement)
+            .map_err(|err| err.to_string())?;
+        session
+            .flush_pending_cursor_closes()
             .map_err(|err| err.to_string())
     }
 
