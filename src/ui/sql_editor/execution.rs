@@ -4183,7 +4183,6 @@ impl SqlEditorWidget {
                             QueryExecutor::rowid_safe_execution_sql(&sql_to_execute, &sql_for_editing);
                         let mut normalize_internal_rowid_alias =
                             sql_for_execution != sql_to_execute;
-                        let mut executed_sql = sql_for_execution.clone();
                         let mut request = StatementRequest::query(
                             sql_for_execution.clone(),
                             Self::oracle_thin_fetch_row_count(lazy_fetch_batch_size),
@@ -4202,7 +4201,6 @@ impl SqlEditorWidget {
                                     ) =>
                             {
                                 normalize_internal_rowid_alias = false;
-                                executed_sql = sql_to_execute.clone();
                                 request.sql = sql_to_execute.clone();
                                 conn.describe_request(&request)
                                     .map_err(|retry_err| retry_err.to_string())?
@@ -4211,23 +4209,15 @@ impl SqlEditorWidget {
                         };
                         if sql_for_execution != sql_to_execute && preview_columns.is_empty() {
                             normalize_internal_rowid_alias = false;
-                            executed_sql = sql_to_execute.clone();
                             request.sql = sql_to_execute.clone();
                             preview_columns = conn
                                 .describe_request(&request)
                                 .map_err(|retry_err| retry_err.to_string())?;
                         }
-                        let lob_display_sql =
-                            Self::oracle_thin_lob_display_sql(&executed_sql, &preview_columns);
-                        // The XML display rewrite turns XMLTYPE columns into CLOBs,
-                        // so it needs the define-fetch path just like native LOB columns.
-                        let lob_needs_define_fetch = lob_display_sql.is_some()
-                            || OracleThinSession::described_columns_require_define_fetch(
+                        let lob_needs_define_fetch =
+                            OracleThinSession::described_columns_require_define_fetch(
                                 &preview_columns,
                             );
-                        if let Some(lob_sql) = lob_display_sql {
-                            request.sql = lob_sql;
-                        }
                         if lob_needs_define_fetch {
                             request.prefetch_rows = 0;
                         }
@@ -13619,39 +13609,6 @@ impl SqlEditorWidget {
         retained_state
     }
 
-    fn oracle_thin_quote_identifier(identifier: &str) -> String {
-        format!("\"{}\"", identifier.replace('"', "\"\""))
-    }
-
-    fn oracle_thin_lob_display_sql(
-        sql: &str,
-        columns: &[OracleThinColumnMetadata],
-    ) -> Option<String> {
-        if !columns
-            .iter()
-            .any(|column| column.column_type == OracleColumnType::Xml)
-        {
-            return None;
-        }
-
-        let select_list = columns
-            .iter()
-            .map(|column| {
-                let quoted = Self::oracle_thin_quote_identifier(&column.name);
-                let source = format!("oqt_lob_src.{quoted}");
-                match column.column_type {
-                    OracleColumnType::Xml => {
-                        format!("XMLSERIALIZE(CONTENT {source} AS CLOB) AS {quoted}")
-                    }
-                    _ => format!("{source} AS {quoted}"),
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        Some(format!("SELECT {select_list} FROM ({sql}) oqt_lob_src"))
-    }
-
     fn oracle_thin_select_cells(
         conn: &mut OracleThinSession,
         sql: &str,
@@ -13671,11 +13628,8 @@ impl SqlEditorWidget {
         conn: &mut OracleThinSession,
         sql: &str,
     ) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
-        let columns = conn.describe(sql).map_err(|err| err.to_string())?;
-        let sql_to_fetch =
-            Self::oracle_thin_lob_display_sql(sql, &columns).unwrap_or_else(|| sql.to_string());
         let result = conn
-            .query_described_fetch_all(sql_to_fetch, 200)
+            .query_described_fetch_all(sql, 200)
             .map_err(|err| err.to_string())?;
         Self::oracle_thin_described_result_to_cells(conn, result, false, "NULL", None)
     }
@@ -13690,7 +13644,7 @@ impl SqlEditorWidget {
         let sql_for_execution = QueryExecutor::rowid_safe_execution_sql(sql, &sql_for_editing);
         let mut normalize_internal_rowid_alias = sql_for_execution != sql;
         let mut executed_sql = sql_for_execution.clone();
-        let mut columns = match conn.describe(&sql_for_execution) {
+        let columns = match conn.describe(&sql_for_execution) {
             Ok(columns) => columns,
             Err(err)
                 if sql_for_execution != sql
@@ -13706,13 +13660,8 @@ impl SqlEditorWidget {
         if sql_for_execution != sql && columns.is_empty() {
             normalize_internal_rowid_alias = false;
             executed_sql = sql.to_string();
-            columns = conn
-                .describe(sql)
-                .map_err(|retry_err| retry_err.to_string())?;
         }
-        let sql_to_fetch = Self::oracle_thin_lob_display_sql(&executed_sql, &columns)
-            .unwrap_or_else(|| executed_sql.clone());
-        let result = match conn.query_described_fetch_all(sql_to_fetch, 200) {
+        let result = match conn.query_described_fetch_all(executed_sql, 200) {
             Ok(result) => result,
             Err(err)
                 if sql_for_execution != sql
@@ -13762,20 +13711,18 @@ impl SqlEditorWidget {
         let sql_for_editing = QueryExecutor::maybe_inject_rowid_for_editing(sql);
         let sql_for_execution = QueryExecutor::rowid_safe_execution_sql(sql, &sql_for_editing);
         let mut normalize_internal_rowid_alias = sql_for_execution != sql;
-        let mut executed_sql = sql_for_execution.clone();
         let mut request = StatementRequest::query(sql_for_execution.clone(), 200);
         request.binds = resolved
             .iter()
             .map(Self::oracle_thin_input_bind_value)
             .collect::<Result<Vec<_>, _>>()?;
-        let mut columns = match conn.describe_request(&request) {
+        let columns = match conn.describe_request(&request) {
             Ok(columns) => columns,
             Err(err)
                 if sql_for_execution != sql
                     && QueryExecutor::is_retryable_rowid_injection_error(&err.to_string()) =>
             {
                 normalize_internal_rowid_alias = false;
-                executed_sql = sql.to_string();
                 request.sql = sql.to_string();
                 conn.describe_request(&request)
                     .map_err(|retry_err| retry_err.to_string())?
@@ -13784,14 +13731,7 @@ impl SqlEditorWidget {
         };
         if sql_for_execution != sql && columns.is_empty() {
             normalize_internal_rowid_alias = false;
-            executed_sql = sql.to_string();
             request.sql = sql.to_string();
-            columns = conn
-                .describe_request(&request)
-                .map_err(|retry_err| retry_err.to_string())?;
-        }
-        if let Some(lob_sql) = Self::oracle_thin_lob_display_sql(&executed_sql, &columns) {
-            request.sql = lob_sql;
         }
         let result = match conn.query_described_fetch_all_request(&request) {
             Ok(result) => result,
