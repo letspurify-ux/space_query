@@ -1638,7 +1638,13 @@ impl OracleThinSession {
         let result = match response {
             Ok(mut response) => {
                 self.remember_cursor_columns_from_response(&response);
-                self.resolve_xml_lob_values(&response.thin_columns, &mut response.result.rows)?;
+                if let Err(error) =
+                    self.resolve_xml_lob_values(&response.thin_columns, &mut response.result.rows)
+                {
+                    self.close_unresolved_response_cursors(&response);
+                    self.close_cursor_later(Some(cursor_id));
+                    return Err(error);
+                }
                 response.result
             }
             Err(error) => {
@@ -1650,7 +1656,10 @@ impl OracleThinSession {
                 return Err(error);
             }
         };
-        self.free_fetched_temp_lobs()?;
+        if let Err(error) = self.free_fetched_temp_lobs() {
+            self.close_cursor_after_partial_rows(cursor_id, &result.rows, true);
+            return Err(error);
+        }
         if result.exhausted || result.cursor_id.is_none() {
             self.last_rows_by_cursor.remove(&cursor_id);
         } else {
@@ -1862,6 +1871,24 @@ impl OracleThinSession {
             }
         }
         self.close_cursor_later(Some(cursor_id));
+    }
+
+    /// Queues closes for every server cursor carried by a response whose
+    /// values could not be resolved: the statement cursor, ref-cursor children
+    /// in the rows and out binds, and implicit result cursors. The response is
+    /// discarded on a resolve failure, so without this the cursors are neither
+    /// returned to the caller nor tracked and would stay open server-side
+    /// until logoff.
+    fn close_unresolved_response_cursors(&mut self, response: &ExecuteResponse) {
+        for rows in [&response.result.rows, &response.out_bind_rows] {
+            for child_cursor_id in ref_cursor_ids_in_rows(rows) {
+                self.close_cursor_later(Some(child_cursor_id));
+            }
+        }
+        for implicit in &response.implicit_results {
+            self.close_cursor_later(Some(implicit.cursor_id));
+        }
+        self.close_cursor_later(response.result.cursor_id);
     }
 
     fn resolve_xml_lob_values_in_response(
@@ -2569,9 +2596,15 @@ impl OracleThinSession {
                             self.remember_cursor_columns_from_response(&response);
                             Ok(response)
                         }
-                        Err(error) => Err(error),
+                        Err(error) => {
+                            self.close_unresolved_response_cursors(&response);
+                            Err(error)
+                        }
                     },
-                    Err(error) => Err(error),
+                    Err(error) => {
+                        self.close_unresolved_response_cursors(&response);
+                        Err(error)
+                    }
                 };
                 let free_result = self.free_temp_lobs_and_fetched(&temp_lob_locators);
                 match (result, free_result) {
