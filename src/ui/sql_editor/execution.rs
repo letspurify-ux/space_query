@@ -4217,19 +4217,22 @@ impl SqlEditorWidget {
                                 .describe_request(&request)
                                 .map_err(|retry_err| retry_err.to_string())?;
                         }
-                        if let Some(lob_sql) =
-                            Self::oracle_thin_lob_display_sql(&executed_sql, &preview_columns)
-                        {
+                        let lob_display_sql =
+                            Self::oracle_thin_lob_display_sql(&executed_sql, &preview_columns);
+                        // The XML display rewrite turns XMLTYPE columns into CLOBs,
+                        // so it needs the define-fetch path just like native LOB columns.
+                        let lob_needs_define_fetch = lob_display_sql.is_some()
+                            || OracleThinSession::described_columns_require_define_fetch(
+                                &preview_columns,
+                            );
+                        if let Some(lob_sql) = lob_display_sql {
                             request.sql = lob_sql;
                         }
-                        let vector_needs_define_fetch = preview_columns
-                            .iter()
-                            .any(|column| column.column_type == OracleColumnType::Vector);
-                        if vector_needs_define_fetch {
+                        if lob_needs_define_fetch {
                             request.prefetch_rows = 0;
                         }
 
-                        let described_result = if vector_needs_define_fetch {
+                        let described_result = if lob_needs_define_fetch {
                             conn.query_described_initial_without_prefetch_request(&request)
                         } else {
                             conn.query_described_initial_request(&request)
@@ -4244,7 +4247,7 @@ impl SqlEditorWidget {
                             {
                                 normalize_internal_rowid_alias = false;
                                 request.sql = sql_to_execute.clone();
-                                if vector_needs_define_fetch {
+                                if lob_needs_define_fetch {
                                     conn.query_described_initial_without_prefetch_request(&request)
                                         .map_err(|retry_err| retry_err.to_string())?
                                 } else {
@@ -4293,7 +4296,7 @@ impl SqlEditorWidget {
 
                         let initial_eof = Self::oracle_thin_result_reached_eof(&described.result);
                         let open_cursor_id = described.result.cursor_id;
-                        let mut needs_define_fetch = vector_needs_define_fetch;
+                        let mut needs_define_fetch = lob_needs_define_fetch;
                         let rows = Self::oracle_thin_result_rows_to_cells(
                             conn,
                             described.result.rows,
@@ -13624,15 +13627,10 @@ impl SqlEditorWidget {
         sql: &str,
         columns: &[OracleThinColumnMetadata],
     ) -> Option<String> {
-        if !columns.iter().any(|column| {
-            matches!(
-                column.column_type,
-                OracleColumnType::Clob
-                    | OracleColumnType::Nclob
-                    | OracleColumnType::Blob
-                    | OracleColumnType::Xml
-            )
-        }) {
+        if !columns
+            .iter()
+            .any(|column| column.column_type == OracleColumnType::Xml)
+        {
             return None;
         }
 
@@ -13642,16 +13640,8 @@ impl SqlEditorWidget {
                 let quoted = Self::oracle_thin_quote_identifier(&column.name);
                 let source = format!("oqt_lob_src.{quoted}");
                 match column.column_type {
-                    OracleColumnType::Clob | OracleColumnType::Nclob => {
-                        format!("DBMS_LOB.SUBSTR({source}, 900, 1) AS {quoted}")
-                    }
-                    OracleColumnType::Blob => {
-                        format!("RAWTOHEX(DBMS_LOB.SUBSTR({source}, 2000, 1)) AS {quoted}")
-                    }
                     OracleColumnType::Xml => {
-                        format!(
-                            "DBMS_LOB.SUBSTR(XMLSERIALIZE(CONTENT {source} AS CLOB), 900, 1) AS {quoted}"
-                        )
+                        format!("XMLSERIALIZE(CONTENT {source} AS CLOB) AS {quoted}")
                     }
                     _ => format!("{source} AS {quoted}"),
                 }
@@ -31214,9 +31204,12 @@ mod mysql_transaction_feedback_tests {
 
         assert_eq!(columns, vec!["TXT".to_string()]);
         assert_eq!(rows.len(), 1);
-        assert!(
-            !rows[0][0].is_empty() && rows[0][0].len() <= 4_000,
-            "CLOB preview should be non-empty and stay within Oracle VARCHAR2 byte limits"
+        // RPAD counts display width (wide chars = 2), so the server-side
+        // value is 750 chars; the full CLOB text must come through.
+        assert_eq!(
+            rows[0][0],
+            "가".repeat(750),
+            "CLOB preview should return the full multibyte text"
         );
     }
 

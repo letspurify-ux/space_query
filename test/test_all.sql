@@ -16,5 +16,6 @@
 @test/test18.sql;
 @test/test22.sql;
 @test/test23.sql;
+@test/test26.sql;
 
 -- intelli : 7,8,10,11

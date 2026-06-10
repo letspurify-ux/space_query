@@ -1,37 +1,28 @@
-PROCEDURE A (B IN NUMBER) AS
-BEGIN
-    SELECT D --4
-    FROM E --4
-    WHERE F IN (
-            --4
-            SELECT G -- 12
-            FROM ( -- 12
-                    SELECT H -- 20
-                    FROM J -- 20
-                    INNER JOIN K -- 20
-                        ON 1 = 1 -- 24
-                            AND 2 = 2 -- 28
-                            OR 3 = 3 -- 28
-                    OUTER JOIN K -- 20
-                        ON 1 = 1 -- 24
-                            AND 2 = 2 -- 28
-                            OR 3 = 3 -- 28
-                ) I -- 16
-        ); -- 8
-END A;
+CREATE TABLE OQT_CLOB_FIX_T (id NUMBER PRIMARY KEY, doc CLOB, ndoc NCLOB, xdoc XMLTYPE)
+LOB (doc) STORE AS BASICFILE
+LOB (ndoc) STORE AS BASICFILE
+XMLTYPE COLUMN xdoc STORE AS BASICFILE CLOB;
 
-SELECT D
-FROM E
-WHERE F IN (
-        SELECT G --8
-        FROM ( --8
-                SELECT H --16
-                FROM J --16
-                INNER JOIN K --16
-                    ON 1 = 1 --20
-                        AND 2 = 2 -- 24
-                OUTER JOIN K -- 16
-                    ON 1 = 1 --20
-                        AND 2 = 2 -- 24
-            ) I --12
-    ); --4
+DECLARE
+  v CLOB;
+BEGIN
+  DBMS_LOB.CREATETEMPORARY(v, TRUE);
+  FOR i IN 1..40 LOOP
+    DBMS_LOB.WRITEAPPEND(v, 3200, RPAD('0123456789AbCdEfGhIjKlMnOpQrStUv', 3200, '0123456789AbCdEfGhIjKlMnOpQrStUv'));
+  END LOOP;
+  INSERT INTO OQT_CLOB_FIX_T (id, doc, ndoc, xdoc)
+  VALUES (1, v, TO_NCLOB(v), XMLTYPE('<root><payload>' || RPAD('x', 3000, 'x') || '</payload></root>'));
+  COMMIT;
+  DBMS_LOB.FREETEMPORARY(v);
+END;
+/
+
+SELECT id, LENGTH(doc) AS doc_len FROM OQT_CLOB_FIX_T ORDER BY id;
+
+SELECT id, doc FROM OQT_CLOB_FIX_T ORDER BY id;
+
+SELECT id, ndoc FROM OQT_CLOB_FIX_T ORDER BY id;
+
+SELECT id, xdoc FROM OQT_CLOB_FIX_T ORDER BY id;
+
+DROP TABLE OQT_CLOB_FIX_T PURGE;

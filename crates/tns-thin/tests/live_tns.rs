@@ -1943,6 +1943,112 @@ fn bind_clob_column_round_trips_large_text() {
 
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn lazy_style_define_fetch_returns_full_clob_rows() {
+    let config = live_config();
+    let table = unique_table_name("CLOB_LAZY");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, doc CLOB)"
+    ))
+    .expect("create lazy CLOB fetch test table");
+
+    let payloads = (1..=3)
+        .map(|id| format!("row{id}-").repeat(4000))
+        .collect::<Vec<_>>();
+    for (index, payload) in payloads.iter().enumerate() {
+        let mut insert =
+            StatementRequest::statement(format!("INSERT INTO {table} (id, doc) VALUES (:1, :2)"));
+        insert
+            .binds
+            .push(BindValue::Number((index + 1).to_string()));
+        insert.binds.push(BindValue::Clob(payload.clone()));
+        conn.execute(&insert, 0).expect("insert lazy CLOB row");
+    }
+
+    // Mirrors the UI lazy-grid flow: describe, execute without prefetch,
+    // then define-fetch the first batch and plain-fetch the rest.
+    let request = StatementRequest::query(format!("SELECT doc FROM {table} ORDER BY id"), 2);
+    let described = conn
+        .query_described_initial_without_prefetch_request(&request)
+        .expect("initial lazy CLOB request");
+    let cursor_id = described.result.cursor_id.expect("lazy CLOB cursor id");
+    let column_types = described
+        .columns
+        .iter()
+        .map(|column| column.column_type)
+        .collect::<Vec<_>>();
+    assert_eq!(column_types, vec![OracleColumnType::Clob]);
+
+    let mut rows = described.result.rows;
+    let mut exhausted = described.result.exhausted;
+    let mut needs_define_fetch = true;
+    while !exhausted {
+        let batch = if needs_define_fetch {
+            conn.define_and_fetch_typed(cursor_id, 2, &column_types)
+        } else {
+            conn.fetch_typed(cursor_id, 2, &column_types)
+        }
+        .expect("lazy CLOB fetch batch");
+        needs_define_fetch = false;
+        exhausted = batch.exhausted || batch.cursor_id.is_none() || batch.rows.is_empty();
+        rows.extend(batch.rows);
+    }
+    conn.close_cursor_later(Some(cursor_id));
+
+    assert_eq!(
+        rows_to_strings(&rows),
+        payloads
+            .into_iter()
+            .map(|payload| vec![payload])
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn fetch_megabyte_clob_column_returns_full_text() {
+    let config = live_config();
+    let table = unique_table_name("CLOB_BIG");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, doc CLOB)"
+    ))
+    .expect("create large CLOB fetch test table");
+
+    let chunk = "0123456789AbCdEfGhIjKlMnOpQrStUv";
+    let chunks_per_append = 100;
+    let append_count = 300;
+    conn.query_drop(&format!(
+        "DECLARE v CLOB; BEGIN \
+           DBMS_LOB.CREATETEMPORARY(v, TRUE); \
+           FOR i IN 1..{append_count} LOOP \
+             DBMS_LOB.WRITEAPPEND(v, {}, RPAD('{chunk}', {}, '{chunk}')); \
+           END LOOP; \
+           INSERT INTO {table} (id, doc) VALUES (1, v); \
+           COMMIT; \
+           DBMS_LOB.FREETEMPORARY(v); \
+         END;",
+        chunk.len() * chunks_per_append,
+        chunk.len() * chunks_per_append,
+    ))
+    .expect("build megabyte CLOB row server-side");
+
+    let expected = chunk.repeat(chunks_per_append * append_count);
+    let result = conn
+        .query_described_fetch_all(format!("SELECT doc FROM {table} WHERE id = 1"), 1)
+        .expect("fetch megabyte CLOB row");
+    let value = match result.result.rows.first().and_then(|row| row.first()) {
+        Some(OracleValue::Text(value)) => value,
+        other => panic!("expected CLOB text, got {other:?}"),
+    };
+    assert_eq!(value.len(), expected.len(), "CLOB text length mismatch");
+    assert_eq!(value, &expected);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn bind_blob_column_round_trips_large_bytes() {
     let config = live_config();
     let table = unique_table_name("BLOB_BIND");
