@@ -94,9 +94,11 @@ pub fn query_timeout_for_statement_for_db_type(
     sql: &str,
     query_timeout: Option<Duration>,
 ) -> Option<Duration> {
-    if query_timeout.is_some()
-        && db_type.backend_kind() == DatabaseBackendKind::MySql
-        && mysql_statement_sets_session_timeout_variable(sql)
+    let mysql_family = match db_type.backend_kind() {
+        DatabaseBackendKind::MySql => true,
+        DatabaseBackendKind::Oracle => false,
+    };
+    if query_timeout.is_some() && mysql_family && mysql_statement_sets_session_timeout_variable(sql)
     {
         None
     } else {

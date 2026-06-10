@@ -2423,7 +2423,11 @@ impl SqlEditorWidget {
         advanced: &ConnectionAdvancedSettings,
     ) -> RetainedSessionMutationOutcome {
         let target_scope = target_scope.trim();
-        if target_scope.is_empty() && db_type.backend_kind() != DatabaseBackendKind::MySql {
+        let mysql_family = match db_type.backend_kind() {
+            DatabaseBackendKind::MySql => true,
+            DatabaseBackendKind::Oracle => false,
+        };
+        if target_scope.is_empty() && !mysql_family {
             return RetainedSessionMutationOutcome::NoSession;
         }
 

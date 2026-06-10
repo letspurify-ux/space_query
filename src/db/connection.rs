@@ -153,15 +153,6 @@ pub enum SqlDialect {
     MySql,
 }
 
-impl SqlDialect {
-    pub fn uses_mysql_syntax(self) -> bool {
-        match self {
-            Self::Oracle => false,
-            Self::MySql => true,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DatabaseBackendKind {
     Oracle,
@@ -635,10 +626,6 @@ impl DatabaseType {
 
     pub fn backend_kind(self) -> DatabaseBackendKind {
         backend_for(self).backend_kind()
-    }
-
-    pub fn uses_mysql_sql_dialect(self) -> bool {
-        self.sql_dialect().uses_mysql_syntax()
     }
 
     pub fn cache_key(self) -> u8 {
@@ -1893,7 +1880,12 @@ pub(crate) trait DbBackend: Sync {
         Ok(())
     }
     fn test_connection(&self, info: &ConnectionInfo) -> Result<(), String>;
-    fn after_connect(&self, _connection: &mut DatabaseConnection) {}
+    // Transaction/session behavior methods below have no default bodies on
+    // purpose: a silent no-op default (e.g. auto-commit toggles that do
+    // nothing) is exactly the kind of omission a new backend must not be able
+    // to compile with. Each backend states its behavior explicitly, even when
+    // that behavior is "nothing to do".
+    fn after_connect(&self, connection: &mut DatabaseConnection);
     fn current_scope_name(&self, _connection: &DatabaseConnection) -> Option<String> {
         None
     }
@@ -1973,53 +1965,23 @@ pub(crate) trait DbBackend: Sync {
             ConnectionSslMode::Disabled
         }
     }
-    fn is_recoverable_timeout_message(&self, _trimmed: &str, _lower: &str) -> bool {
-        false
-    }
-    fn apply_auto_commit(
-        &self,
-        _connection: &mut DbConnection,
-        _enabled: bool,
-    ) -> Result<(), String> {
-        Ok(())
-    }
-    fn supported_transaction_isolations(&self) -> &'static [TransactionIsolation] {
-        &DEFAULT_TRANSACTION_ISOLATIONS
-    }
-    fn fallback_default_transaction_isolation(&self) -> TransactionIsolation {
-        TransactionIsolation::ReadCommitted
-    }
+    fn is_recoverable_timeout_message(&self, trimmed: &str, lower: &str) -> bool;
+    fn apply_auto_commit(&self, connection: &mut DbConnection, enabled: bool)
+        -> Result<(), String>;
+    fn supported_transaction_isolations(&self) -> &'static [TransactionIsolation];
+    fn fallback_default_transaction_isolation(&self) -> TransactionIsolation;
     fn read_current_default_transaction_isolation(
         &self,
-        _connection: &mut Option<DbConnection>,
-    ) -> Result<Option<TransactionIsolation>, String> {
-        Ok(None)
-    }
+        connection: &mut Option<DbConnection>,
+    ) -> Result<Option<TransactionIsolation>, String>;
     fn apply_transaction_mode_to_live_connection(
         &self,
-        _connection: &mut Option<DbConnection>,
-        _mode: TransactionMode,
-        _default_isolation: TransactionIsolation,
-    ) -> Result<(), String> {
-        Ok(())
-    }
-    fn transaction_mode_requires_first_statement(&self, _mode: TransactionMode) -> bool {
-        false
-    }
-    fn transaction_mode_statements(&self, mode: TransactionMode) -> Result<Vec<String>, String> {
-        if self
-            .supported_transaction_isolations()
-            .contains(&mode.isolation)
-        {
-            Ok(Vec::new())
-        } else {
-            Err(format!(
-                "{} does not support {} transaction isolation",
-                self.display_name(),
-                mode.isolation.label()
-            ))
-        }
-    }
+        connection: &mut Option<DbConnection>,
+        mode: TransactionMode,
+        default_isolation: TransactionIsolation,
+    ) -> Result<(), String>;
+    fn transaction_mode_requires_first_statement(&self, mode: TransactionMode) -> bool;
+    fn transaction_mode_statements(&self, mode: TransactionMode) -> Result<Vec<String>, String>;
 }
 
 struct OracleBackend;
@@ -2037,7 +1999,6 @@ const ORACLE_TRANSACTION_ISOLATIONS: [TransactionIsolation; 3] = [
     TransactionIsolation::ReadCommitted,
     TransactionIsolation::Serializable,
 ];
-const DEFAULT_TRANSACTION_ISOLATIONS: [TransactionIsolation; 1] = [TransactionIsolation::Default];
 const MYSQL_TRANSACTION_ISOLATIONS: [TransactionIsolation; 5] = [
     TransactionIsolation::Default,
     TransactionIsolation::ReadUncommitted,
@@ -2390,8 +2351,36 @@ impl DbBackend for OracleBackend {
         trimmed.contains("DPI-1067") || lower.contains("dpi-1067")
     }
 
+    fn after_connect(&self, _connection: &mut DatabaseConnection) {}
+
+    fn apply_auto_commit(
+        &self,
+        _connection: &mut DbConnection,
+        _enabled: bool,
+    ) -> Result<(), String> {
+        // Oracle has no session-level autocommit flag to push; the executor
+        // consults the logical auto-commit setting per statement.
+        Ok(())
+    }
+
     fn supported_transaction_isolations(&self) -> &'static [TransactionIsolation] {
         &ORACLE_TRANSACTION_ISOLATIONS
+    }
+
+    fn fallback_default_transaction_isolation(&self) -> TransactionIsolation {
+        TransactionIsolation::ReadCommitted
+    }
+
+    fn apply_transaction_mode_to_live_connection(
+        &self,
+        _connection: &mut Option<DbConnection>,
+        _mode: TransactionMode,
+        _default_isolation: TransactionIsolation,
+    ) -> Result<(), String> {
+        // Oracle applies transaction mode through SET TRANSACTION as the
+        // first statement of each transaction (`transaction_mode_statements`),
+        // never against the live session.
+        Ok(())
     }
 
     fn read_current_default_transaction_isolation(
@@ -2749,6 +2738,14 @@ impl DbBackend for MysqlBackend {
 
     fn supported_transaction_isolations(&self) -> &'static [TransactionIsolation] {
         &MYSQL_TRANSACTION_ISOLATIONS
+    }
+
+    fn fallback_default_transaction_isolation(&self) -> TransactionIsolation {
+        TransactionIsolation::ReadCommitted
+    }
+
+    fn transaction_mode_requires_first_statement(&self, _mode: TransactionMode) -> bool {
+        false
     }
 
     fn read_current_default_transaction_isolation(
@@ -4031,7 +4028,11 @@ impl DatabaseConnection {
         mode: TransactionMode,
         default_isolation: TransactionIsolation,
     ) -> Result<Vec<String>, String> {
-        let mode = if matches!(db_type.backend_kind(), DatabaseBackendKind::MySql)
+        let mysql_family = match db_type.backend_kind() {
+            DatabaseBackendKind::MySql => true,
+            DatabaseBackendKind::Oracle => false,
+        };
+        let mode = if mysql_family
             && mode.isolation == TransactionIsolation::Default
             && default_isolation != TransactionIsolation::Default
         {
@@ -6033,8 +6034,6 @@ mod tests {
             DatabaseType::Oracle.backend_kind(),
             DatabaseBackendKind::Oracle
         );
-        assert!(!DatabaseType::Oracle.sql_dialect().uses_mysql_syntax());
-        assert!(!DatabaseType::Oracle.uses_mysql_sql_dialect());
         assert_eq!(
             DatabaseType::from_cache_key(DatabaseType::Oracle.cache_key()),
             DatabaseType::Oracle
@@ -6045,8 +6044,6 @@ mod tests {
             DatabaseType::MySQL.backend_kind(),
             DatabaseBackendKind::MySql
         );
-        assert!(DatabaseType::MySQL.sql_dialect().uses_mysql_syntax());
-        assert!(DatabaseType::MySQL.uses_mysql_sql_dialect());
         assert_eq!(
             DatabaseType::from_cache_key(DatabaseType::MySQL.cache_key()),
             DatabaseType::MySQL
@@ -6057,8 +6054,6 @@ mod tests {
             DatabaseType::MariaDB.backend_kind(),
             DatabaseBackendKind::MySql
         );
-        assert!(DatabaseType::MariaDB.sql_dialect().uses_mysql_syntax());
-        assert!(DatabaseType::MariaDB.uses_mysql_sql_dialect());
         assert_eq!(
             DatabaseType::from_cache_key(DatabaseType::MariaDB.cache_key()),
             DatabaseType::MariaDB

@@ -772,9 +772,7 @@ fn empty_mysql_scope_with_preserved_session_requires_resolution() {
         "Empty MySQL/MariaDB scope should reset clean sessions but block preserved retained sessions"
     );
     assert!(
-        editor_content.contains(
-            "target_scope.is_empty() && db_type.backend_kind() != DatabaseBackendKind::MySql"
-        ),
+        editor_content.contains("target_scope.is_empty() && !mysql_family"),
         "Immediate retained-scope apply should still run for empty MySQL/MariaDB scope"
     );
 }

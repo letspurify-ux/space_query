@@ -178,9 +178,11 @@ pub fn retained_session_state_transaction_mode_change_preflight_decision(
     db_type: DatabaseType,
     state: RetainedSessionState,
 ) -> RetainedSessionPreflightDecision {
-    if db_type.backend_kind() == DatabaseBackendKind::MySql
-        && state.allows_transaction_mode_replacement()
-    {
+    let mysql_family = match db_type.backend_kind() {
+        DatabaseBackendKind::MySql => true,
+        DatabaseBackendKind::Oracle => false,
+    };
+    if mysql_family && state.allows_transaction_mode_replacement() {
         RetainedSessionPreflightDecision::Allow
     } else {
         retained_session_state_preflight_decision(
@@ -199,7 +201,11 @@ fn retained_session_execute_can_consume_pending_transaction_mode(
     // MySQL/MariaDB session. Allow only statements that start that next
     // transaction, or release the physical session, through this preflight;
     // plain COMMIT/ROLLBACK leave the next-transaction override pending.
-    db_type.backend_kind() == DatabaseBackendKind::MySql
+    let mysql_family = match db_type.backend_kind() {
+        DatabaseBackendKind::MySql => true,
+        DatabaseBackendKind::Oracle => false,
+    };
+    mysql_family
         && state.has_only_next_transaction_mode_override()
         && mysql_statement_consumes_pending_transaction_mode_override_for_preflight(db_type, sql)
 }
@@ -685,9 +691,11 @@ pub fn is_recoverable_timeout_message(db_type: DatabaseType, err_msg: &str) -> b
     if is_lock_wait_timeout_message(&lower) {
         return false;
     }
-    if db_type.backend_kind() == DatabaseBackendKind::MySql
-        && has_structured_mysql_recoverable_timeout_marker(&lower)
-    {
+    let mysql_family = match db_type.backend_kind() {
+        DatabaseBackendKind::MySql => true,
+        DatabaseBackendKind::Oracle => false,
+    };
+    if mysql_family && has_structured_mysql_recoverable_timeout_marker(&lower) {
         // Numeric/symbolic server timeout markers are stronger evidence than
         // broad prose such as "operation timed out"; otherwise ERROR 3024 can
         // be discarded just because a driver includes generic timeout text.

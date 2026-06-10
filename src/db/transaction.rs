@@ -653,8 +653,11 @@ pub(crate) fn statement_can_cleanup_retained_session_for_preflight(
     sql: &str,
     state: RetainedSessionState,
 ) -> bool {
-    if db_type.backend_kind() == crate::db::connection::DatabaseBackendKind::MySql {
-        return mysql_statement_can_cleanup_retained_session_for_preflight(db_type, sql, state);
+    match db_type.backend_kind() {
+        crate::db::connection::DatabaseBackendKind::MySql => {
+            return mysql_statement_can_cleanup_retained_session_for_preflight(db_type, sql, state);
+        }
+        crate::db::connection::DatabaseBackendKind::Oracle => {}
     }
 
     if state.may_have_uncommitted_work() || state.transaction_state().blocks_execution() {

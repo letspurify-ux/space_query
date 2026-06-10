@@ -245,7 +245,11 @@ impl RetainedSessionOptionChangePlan {
                     snapshot.retained_state().label()
                 ));
             }
-            if self.db_type.backend_kind() == DatabaseBackendKind::MySql
+            let mysql_family = match self.db_type.backend_kind() {
+                DatabaseBackendKind::MySql => true,
+                DatabaseBackendKind::Oracle => false,
+            };
+            if mysql_family
                 && action == "transaction mode"
                 && snapshot
                     .retained_state()

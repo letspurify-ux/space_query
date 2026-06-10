@@ -582,8 +582,10 @@ impl SqlHighlighter {
         let mut expect_alias_identifier = false;
         let mut exit_state = LexerState::Normal;
         let mut scan_context = HighlightScanContext::default();
-        let dialect = self.db_type.sql_dialect();
-        let mysql_compatible = dialect.uses_mysql_syntax();
+        let mysql_compatible = match self.db_type.sql_dialect() {
+            SqlDialect::MySql => true,
+            SqlDialect::Oracle => false,
+        };
         let local_aliases = crate::ui::sql_editor::query_text::collect_local_alias_context(text);
 
         // ── Handle continuation of unclosed multi-line tokens ──────────
