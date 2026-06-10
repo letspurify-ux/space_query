@@ -5915,38 +5915,23 @@ fn read_execute_response_with_state(
         state.reading_dml_returning = state.reading_out_binds;
     }
     let mut pending_error = None;
-    let mut pending_fragment = Vec::new();
-    let mut pending_fragment_error = None;
     let mut response_had_content = false;
+    let trace = std::env::var_os("ORACLE_THIN_TRACE_EXEC").is_some();
     while !state.done {
         let (data_flags, packet) =
             read_data_packet_with_flags(stream, capabilities.protocol_version.unwrap_or(319))?;
-        if std::env::var_os("ORACLE_THIN_TRACE_EXEC").is_some() {
+        if trace {
             eprintln!(
                 "thin exec response data_flags=0x{data_flags:04x} packet={}",
                 hex_encode_upper(&packet)
             );
         }
-        let packet = if pending_fragment.is_empty() {
-            packet
-        } else {
-            pending_fragment.extend_from_slice(&packet);
-            std::mem::take(&mut pending_fragment)
-        };
-        let mut cursor = PacketCursor::with_capabilities(&packet, capabilities);
+        let mut cursor = PacketCursor::streaming(packet, data_flags, &mut *stream, capabilities);
         let mut skipped_empty_end_of_response = false;
         while cursor.remaining() > 0 && !state.done {
             let message_offset = cursor.pos;
-            let message_type = match cursor.read_u8() {
-                Ok(message_type) => message_type,
-                Err(error) if is_incomplete_ttc_packet_error(&error) => {
-                    pending_fragment = packet[message_offset..].to_vec();
-                    pending_fragment_error = Some(error);
-                    break;
-                }
-                Err(error) => return Err(error),
-            };
-            if std::env::var_os("ORACLE_THIN_TRACE_EXEC").is_some() {
+            let message_type = cursor.read_u8()?;
+            if trace {
                 eprintln!(
                     "thin exec response message type={} offset={} remaining={}",
                     message_type,
@@ -5964,12 +5949,21 @@ fn read_execute_response_with_state(
                         process_row_data(&mut cursor, capabilities, &mut state)
                     }
                     TNS_MSG_TYPE_IO_VECTOR => process_io_vector(&mut cursor, request, &mut state),
-                    TNS_MSG_TYPE_FLUSH_OUT_BINDS => write_data_packet(
-                        stream,
-                        capabilities.protocol_version.unwrap_or(319),
-                        capabilities.data_packet_chunk_size(),
-                        &[TNS_MSG_TYPE_FLUSH_OUT_BINDS],
-                    ),
+                    TNS_MSG_TYPE_FLUSH_OUT_BINDS => {
+                        let protocol_version = capabilities.protocol_version.unwrap_or(319);
+                        let chunk_size = capabilities.data_packet_chunk_size();
+                        let stream = cursor.stream_mut().ok_or_else(|| {
+                            OracleThinError::new(
+                                "flush out binds requires a streaming packet cursor",
+                            )
+                        })?;
+                        write_data_packet(
+                            stream,
+                            protocol_version,
+                            chunk_size,
+                            &[TNS_MSG_TYPE_FLUSH_OUT_BINDS],
+                        )
+                    }
                     TNS_MSG_TYPE_DESCRIBE_INFO => {
                         process_describe_info(&mut cursor, capabilities, &mut state)
                     }
@@ -6052,33 +6046,17 @@ fn read_execute_response_with_state(
                         Ok(())
                     }
                     other => {
-                        let context_end = packet.len().min(message_offset + 32);
+                        let context_end = cursor.data().len().min(message_offset + 32);
                         Err(OracleThinError::new(format!(
                             "unexpected Oracle execute response message type {other} at offset {message_offset}; context={}",
-                            hex_encode_upper(&packet[message_offset..context_end])
+                            hex_encode_upper(&cursor.data()[message_offset..context_end])
                         )))
                     }
                 }
             })();
-            if let Err(error) = result {
-                if is_incomplete_ttc_packet_error(&error) {
-                    pending_fragment = packet[message_offset..].to_vec();
-                    pending_fragment_error = Some(error);
-                    break;
-                }
-                return Err(error);
-            }
+            result?;
         }
-        let has_end_flag = data_flags & (TNS_DATA_FLAGS_END_OF_RESPONSE | TNS_DATA_FLAGS_EOF) != 0;
-        if !pending_fragment.is_empty() {
-            if has_end_flag {
-                return Err(pending_fragment_error.take().unwrap_or_else(|| {
-                    OracleThinError::new("incomplete TTC message at end of response")
-                }));
-            }
-            continue;
-        }
-        if has_end_flag {
+        if cursor.end_of_response_seen() {
             if skip_empty_end_of_response && !response_had_content {
                 skip_empty_end_of_response = false;
                 skipped_empty_end_of_response = true;
@@ -6118,12 +6096,6 @@ fn read_execute_response_with_state(
     })
 }
 
-fn is_incomplete_ttc_packet_error(error: &OracleThinError) -> bool {
-    let message = error.to_string();
-    message.starts_with("short TTC packet")
-        || message.starts_with("unterminated TTC null-terminated byte field")
-}
-
 fn read_simple_response(
     stream: &mut TcpStream,
     capabilities: &OracleThinCapabilities,
@@ -6136,7 +6108,7 @@ fn read_simple_response(
     while !done {
         let (data_flags, packet) =
             read_data_packet_with_flags(stream, capabilities.protocol_version.unwrap_or(319))?;
-        let mut cursor = PacketCursor::with_capabilities(&packet, capabilities);
+        let mut cursor = PacketCursor::streaming(packet, data_flags, &mut *stream, capabilities);
         let mut skipped_empty_end_of_response = false;
         while cursor.remaining() > 0 && !done {
             let message_type = cursor.read_u8()?;
@@ -6200,7 +6172,7 @@ fn read_simple_response(
                 }
             }
         }
-        if data_flags & (TNS_DATA_FLAGS_END_OF_RESPONSE | TNS_DATA_FLAGS_EOF) != 0 {
+        if cursor.end_of_response_seen() {
             if skip_empty_end_of_response && !response_had_content {
                 skip_empty_end_of_response = false;
                 skipped_empty_end_of_response = true;
@@ -6227,36 +6199,21 @@ fn read_lob_operation_response(
     let mut data = Vec::new();
     let mut amount = None;
     let mut locator = None;
-    let mut pending_fragment = Vec::new();
-    let mut pending_fragment_error = None;
+    let trace = std::env::var_os("ORACLE_THIN_TRACE_EXEC").is_some();
     while !done {
         let (data_flags, packet) =
             read_data_packet_with_flags(stream, capabilities.protocol_version.unwrap_or(319))?;
-        if std::env::var_os("ORACLE_THIN_TRACE_EXEC").is_some() {
+        if trace {
             eprintln!(
                 "thin lob response data_flags=0x{data_flags:04x} packet={}",
                 hex_encode_upper(&packet)
             );
         }
-        let packet = if pending_fragment.is_empty() {
-            packet
-        } else {
-            pending_fragment.extend_from_slice(&packet);
-            std::mem::take(&mut pending_fragment)
-        };
-        let mut cursor = PacketCursor::with_capabilities(&packet, capabilities);
+        let mut cursor = PacketCursor::streaming(packet, data_flags, &mut *stream, capabilities);
         while cursor.remaining() > 0 && !done {
             let message_offset = cursor.pos;
-            let message_type = match cursor.read_u8() {
-                Ok(message_type) => message_type,
-                Err(error) if is_incomplete_ttc_packet_error(&error) => {
-                    pending_fragment = packet[message_offset..].to_vec();
-                    pending_fragment_error = Some(error);
-                    break;
-                }
-                Err(error) => return Err(error),
-            };
-            if std::env::var_os("ORACLE_THIN_TRACE_EXEC").is_some() {
+            let message_type = cursor.read_u8()?;
+            if trace {
                 eprintln!(
                     "thin lob response message type={} offset={} remaining={}",
                     message_type,
@@ -6339,25 +6296,9 @@ fn read_lob_operation_response(
                     ))),
                 }
             })();
-            if let Err(error) = result {
-                if is_incomplete_ttc_packet_error(&error) {
-                    pending_fragment = packet[message_offset..].to_vec();
-                    pending_fragment_error = Some(error);
-                    break;
-                }
-                return Err(error);
-            }
+            result?;
         }
-        let has_end_flag = data_flags & (TNS_DATA_FLAGS_END_OF_RESPONSE | TNS_DATA_FLAGS_EOF) != 0;
-        if !pending_fragment.is_empty() {
-            if has_end_flag {
-                return Err(pending_fragment_error.take().unwrap_or_else(|| {
-                    OracleThinError::new("incomplete Oracle LOB response at end of response")
-                }));
-            }
-            continue;
-        }
-        if has_end_flag {
+        if cursor.end_of_response_seen() {
             done = true;
         }
     }
@@ -6649,9 +6590,15 @@ fn process_row_data(
     let mut row = Vec::with_capacity(columns.len());
     for (index, column) in columns.iter().enumerate() {
         if is_duplicate_column(index, state.bit_vector.as_deref()) {
-            let value = state
-                .last_row
-                .as_ref()
+            // The previous row of the same response, falling back to the
+            // last row remembered across fetch calls for this cursor.
+            let last_row = if reading_out_binds {
+                state.out_bind_rows.last()
+            } else {
+                state.rows.last()
+            }
+            .or(state.last_row.as_ref());
+            let value = last_row
                 .and_then(|last_row| last_row.get(index))
                 .cloned()
                 .unwrap_or(OracleValue::Null);
@@ -6668,7 +6615,6 @@ fn process_row_data(
             )?);
         }
     }
-    state.last_row = Some(row.clone());
     if reading_out_binds {
         state.out_bind_rows.push(row);
     } else {
@@ -6778,8 +6724,8 @@ fn read_column_value(
             }
             ORA_TYPE_NUM_LONG => {
                 let value = match cursor.read_bytes()? {
-                    Some(bytes) => OracleValue::Text(decode_oracle_text(
-                        &bytes,
+                    Some(bytes) => OracleValue::Text(decode_oracle_text_vec(
+                        bytes,
                         column.charset_form,
                         capabilities,
                     )?),
@@ -6811,8 +6757,8 @@ fn read_column_value(
                         column.ora_type_num,
                     );
                 };
-                OracleValue::Text(decode_oracle_text(
-                    &bytes,
+                OracleValue::Text(decode_oracle_text_vec(
+                    bytes,
                     column.charset_form,
                     capabilities,
                 )?)
@@ -7174,7 +7120,7 @@ fn read_bfile_locator(cursor: &mut PacketCursor<'_>) -> Result<OracleValue, Orac
 }
 
 fn read_vector_value(cursor: &mut PacketCursor<'_>) -> Result<OracleValue, OracleThinError> {
-    if cursor.peek_u8().is_some_and(|len| usize::from(len) > 8) {
+    if cursor.peek_u8()?.is_some_and(|len| usize::from(len) > 8) {
         return Ok(cursor
             .read_bytes()?
             .map(OracleValue::Lob)
@@ -7184,7 +7130,7 @@ fn read_vector_value(cursor: &mut PacketCursor<'_>) -> Result<OracleValue, Oracl
     if num_bytes == 0 {
         return Ok(OracleValue::Null);
     }
-    if cursor.peek_u8().is_some_and(|len| usize::from(len) > 8) {
+    if cursor.peek_u8()?.is_some_and(|len| usize::from(len) > 8) {
         return Ok(cursor
             .read_bytes()?
             .map(OracleValue::Lob)
@@ -8838,25 +8784,34 @@ fn decode_oracle_text(
     charset_form: u8,
     capabilities: &OracleThinCapabilities,
 ) -> Result<String, OracleThinError> {
+    decode_oracle_text_vec(bytes.to_vec(), charset_form, capabilities)
+}
+
+fn decode_oracle_text_vec(
+    bytes: Vec<u8>,
+    charset_form: u8,
+    capabilities: &OracleThinCapabilities,
+) -> Result<String, OracleThinError> {
     if charset_form == CS_FORM_NCHAR {
         return decode_oracle_nchar_text(
-            bytes,
+            &bytes,
             capabilities.ncharset_id,
             capabilities.protocol_version,
         );
     }
-    match String::from_utf8(bytes.to_vec()) {
+    match String::from_utf8(bytes) {
         Ok(text) => Ok(text),
         Err(err) => {
+            let utf8_error = err.utf8_error();
             if let Some(text) = decode_oracle_native_text(
-                bytes,
+                err.as_bytes(),
                 capabilities.charset_id,
                 capabilities.protocol_version,
             )? {
                 return Ok(text);
             }
             Err(OracleThinError::new(format!(
-                "invalid UTF-8 Oracle text: {err}"
+                "invalid UTF-8 Oracle text: {utf8_error}"
             )))
         }
     }
@@ -10033,18 +9988,20 @@ struct ZoneInfo {
 
 impl ZoneInfo {
     fn offset_at(&self, unix_seconds: i64) -> Option<i32> {
-        let mut type_index = 0;
-        for (transition, index) in &self.transitions {
-            if unix_seconds < *transition {
-                break;
-            }
-            type_index = *index;
-        }
+        let after = self
+            .transitions
+            .partition_point(|(transition, _)| *transition <= unix_seconds);
+        let type_index = if after == 0 {
+            0
+        } else {
+            self.transitions[after - 1].1
+        };
         self.offsets.get(type_index).copied()
     }
 }
 
-static ZONE_INFO_CACHE: OnceCell<Mutex<HashMap<&'static str, Option<ZoneInfo>>>> = OnceCell::new();
+static ZONE_INFO_CACHE: OnceCell<Mutex<HashMap<&'static str, Option<Arc<ZoneInfo>>>>> =
+    OnceCell::new();
 
 fn timezone_region_offset_minutes(region_id: u16, value: &crate::OracleDateTime) -> Option<i16> {
     let zone_name = crate::oracle_zones::oracle_zone_name(region_id)?;
@@ -10071,13 +10028,13 @@ fn timezone_region_local_offset_minutes(
     i16::try_from(offset_seconds / 60).ok()
 }
 
-fn cached_zone_info(zone_name: &'static str) -> Option<ZoneInfo> {
+fn cached_zone_info(zone_name: &'static str) -> Option<Arc<ZoneInfo>> {
     let cache = ZONE_INFO_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = cache.lock().ok()?;
     if let Some(zone_info) = guard.get(zone_name) {
         return zone_info.clone();
     }
-    let zone_info = load_zone_info(zone_name);
+    let zone_info = load_zone_info(zone_name).map(Arc::new);
     guard.insert(zone_name, zone_info.clone());
     zone_info
 }
@@ -12058,7 +12015,7 @@ fn process_protocol_message(
 ) -> Result<(), OracleThinError> {
     let server_version = cursor.read_u8()?;
     cursor.skip(1)?;
-    let banner = cursor.read_null_terminated_bytes()?;
+    let banner = cursor.read_null_terminated_bytes()?.to_vec();
     capabilities.charset_id = cursor.read_u16_le()?;
     let server_flags = cursor.read_u8()?;
     let num_elements = cursor.read_u16_le()? as usize;
@@ -12069,7 +12026,7 @@ fn process_protocol_message(
     })?;
     cursor.skip(element_bytes)?;
     let fdo_length = cursor.read_u16_be()? as usize;
-    let fdo = cursor.read_raw(fdo_length)?;
+    let fdo = cursor.read_raw(fdo_length)?.to_vec();
     if fdo.len() < 7 {
         return Err(OracleThinError::new(format!(
             "short Oracle protocol FDO: {} bytes",
@@ -12109,7 +12066,7 @@ fn process_protocol_message(
             server_flags,
             capabilities.charset_id,
             capabilities.ncharset_id,
-            String::from_utf8_lossy(banner)
+            String::from_utf8_lossy(&banner)
         ),
     );
     Ok(())
@@ -12794,8 +12751,31 @@ const PYTHON_ORACLEDB_MODERN_DATA_TYPE_REPRESENTATIONS: &[(u16, u16, u16)] = &[
     (254, 254, 1),
 ];
 
+/// Number of trailing bytes below which the consumed prefix is compacted away
+/// when fetching a continuation packet, so the buffer does not grow with the
+/// response while large values stream in.
+const PACKET_CURSOR_COMPACT_THRESHOLD: usize = 16 * 1024;
+
+enum PacketCursorSource<'a> {
+    Slice(&'a [u8]),
+    Stream(StreamingPacketSource<'a>),
+}
+
+/// On-demand packet source: when a TTC message spans packets, the cursor
+/// fetches the next data packet and appends it instead of failing, matching
+/// go-ora's session reader and python-oracledb's ReadBuffer. This keeps
+/// parsing of values that span many packets linear instead of re-parsing the
+/// accumulated fragment per packet.
+struct StreamingPacketSource<'a> {
+    buf: Vec<u8>,
+    stream: &'a mut TcpStream,
+    protocol_version: u16,
+    end_flags_seen: bool,
+    trace: bool,
+}
+
 struct PacketCursor<'a> {
-    data: &'a [u8],
+    source: PacketCursorSource<'a>,
     pos: usize,
     big_clr_chunks: bool,
     legacy_null_clr: bool,
@@ -12804,7 +12784,7 @@ struct PacketCursor<'a> {
 impl<'a> PacketCursor<'a> {
     fn with_capabilities(data: &'a [u8], capabilities: &OracleThinCapabilities) -> Self {
         Self {
-            data,
+            source: PacketCursorSource::Slice(data),
             pos: 0,
             big_clr_chunks: capabilities.supports_big_clr_chunks,
             legacy_null_clr: capabilities
@@ -12813,19 +12793,114 @@ impl<'a> PacketCursor<'a> {
         }
     }
 
-    fn remaining(&self) -> usize {
-        self.data.len().saturating_sub(self.pos)
+    fn streaming(
+        packet: Vec<u8>,
+        data_flags: u16,
+        stream: &'a mut TcpStream,
+        capabilities: &OracleThinCapabilities,
+    ) -> Self {
+        Self {
+            source: PacketCursorSource::Stream(StreamingPacketSource {
+                buf: packet,
+                stream,
+                protocol_version: capabilities.protocol_version.unwrap_or(319),
+                end_flags_seen: data_flags & (TNS_DATA_FLAGS_END_OF_RESPONSE | TNS_DATA_FLAGS_EOF)
+                    != 0,
+                trace: std::env::var_os("ORACLE_THIN_TRACE_EXEC").is_some(),
+            }),
+            pos: 0,
+            big_clr_chunks: capabilities.supports_big_clr_chunks,
+            legacy_null_clr: capabilities
+                .protocol_version
+                .is_some_and(|version| version < TNS_VERSION_MIN_ACCEPTED),
+        }
     }
 
-    fn peek_u8(&self) -> Option<u8> {
-        self.data.get(self.pos).copied()
+    fn data(&self) -> &[u8] {
+        match &self.source {
+            PacketCursorSource::Slice(data) => data,
+            PacketCursorSource::Stream(source) => &source.buf,
+        }
+    }
+
+    fn end_of_response_seen(&self) -> bool {
+        match &self.source {
+            PacketCursorSource::Slice(_) => false,
+            PacketCursorSource::Stream(source) => source.end_flags_seen,
+        }
+    }
+
+    fn stream_mut(&mut self) -> Option<&mut TcpStream> {
+        match &mut self.source {
+            PacketCursorSource::Slice(_) => None,
+            PacketCursorSource::Stream(source) => Some(source.stream),
+        }
+    }
+
+    /// Fetches the next data packet into the buffer. Only valid mid-message,
+    /// when the server is guaranteed to send the remainder of the message.
+    fn fetch_next_packet(&mut self, short_context: &'static str) -> Result<(), OracleThinError> {
+        let PacketCursorSource::Stream(source) = &mut self.source else {
+            return Err(OracleThinError::new(short_context));
+        };
+        if source.end_flags_seen {
+            return Err(OracleThinError::new(
+                "incomplete TTC message at end of response",
+            ));
+        }
+        if self.pos > 0 && source.buf.len() - self.pos <= PACKET_CURSOR_COMPACT_THRESHOLD {
+            source.buf.drain(..self.pos);
+            self.pos = 0;
+        }
+        let (data_flags, packet) =
+            read_data_packet_with_flags(source.stream, source.protocol_version)?;
+        if source.trace {
+            eprintln!(
+                "thin response continuation data_flags=0x{data_flags:04x} packet={}",
+                hex_encode_upper(&packet)
+            );
+        }
+        source.end_flags_seen |=
+            data_flags & (TNS_DATA_FLAGS_END_OF_RESPONSE | TNS_DATA_FLAGS_EOF) != 0;
+        if source.buf.is_empty() {
+            source.buf = packet;
+        } else {
+            source.buf.extend_from_slice(&packet);
+        }
+        Ok(())
+    }
+
+    fn ensure_available(
+        &mut self,
+        len: usize,
+        short_context: &'static str,
+    ) -> Result<(), OracleThinError> {
+        while self.remaining() < len {
+            self.fetch_next_packet(short_context)?;
+        }
+        Ok(())
+    }
+
+    fn remaining(&self) -> usize {
+        self.data().len().saturating_sub(self.pos)
+    }
+
+    fn peek_u8(&mut self) -> Result<Option<u8>, OracleThinError> {
+        if self.remaining() == 0 {
+            match &self.source {
+                PacketCursorSource::Slice(_) => return Ok(None),
+                PacketCursorSource::Stream(source) if source.end_flags_seen => return Ok(None),
+                PacketCursorSource::Stream(_) => {
+                    self.fetch_next_packet("short TTC packet while reading u8")?;
+                }
+            }
+        }
+        Ok(self.data().get(self.pos).copied())
     }
 
     fn read_u8(&mut self) -> Result<u8, OracleThinError> {
-        let value = *self
-            .data
-            .get(self.pos)
-            .ok_or_else(|| OracleThinError::new("short TTC packet while reading u8"))?;
+        self.ensure_available(1, "short TTC packet while reading u8")?;
+        let value = self.data()[self.pos];
         self.pos += 1;
         Ok(value)
     }
@@ -12849,33 +12924,34 @@ impl<'a> PacketCursor<'a> {
         Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
     }
 
-    fn read_raw(&mut self, len: usize) -> Result<&'a [u8], OracleThinError> {
-        let end = self.pos.saturating_add(len);
-        let bytes = self
-            .data
-            .get(self.pos..end)
-            .ok_or_else(|| OracleThinError::new("short TTC packet while reading bytes"))?;
-        self.pos = end;
-        Ok(bytes)
+    fn read_raw(&mut self, len: usize) -> Result<&[u8], OracleThinError> {
+        self.ensure_available(len, "short TTC packet while reading bytes")?;
+        let start = self.pos;
+        self.pos += len;
+        Ok(&self.data()[start..start + len])
     }
 
     fn skip(&mut self, len: usize) -> Result<(), OracleThinError> {
         self.read_raw(len).map(|_| ())
     }
 
-    fn read_null_terminated_bytes(&mut self) -> Result<&'a [u8], OracleThinError> {
-        let start = self.pos;
-        while self.pos < self.data.len() {
-            if self.data[self.pos] == 0 {
-                let bytes = &self.data[start..self.pos];
-                self.pos += 1;
-                return Ok(bytes);
+    fn read_null_terminated_bytes(&mut self) -> Result<&[u8], OracleThinError> {
+        // `scanned` is relative to `self.pos` so it survives buffer
+        // compaction inside fetch_next_packet.
+        let mut scanned = 0usize;
+        let terminator = loop {
+            if let Some(offset) = self.data()[self.pos + scanned..]
+                .iter()
+                .position(|byte| *byte == 0)
+            {
+                break self.pos + scanned + offset;
             }
-            self.pos += 1;
-        }
-        Err(OracleThinError::new(
-            "unterminated TTC null-terminated byte field",
-        ))
+            scanned = self.remaining();
+            self.fetch_next_packet("unterminated TTC null-terminated byte field")?;
+        };
+        let start = self.pos;
+        self.pos = terminator + 1;
+        Ok(&self.data()[start..terminator])
     }
 
     fn read_bytes(&mut self) -> Result<Option<Vec<u8>>, OracleThinError> {
@@ -12985,10 +13061,11 @@ impl<'a> PacketCursor<'a> {
             return Ok(0);
         }
         if len > max_len || len > 8 {
-            let context_end = self.data.len().min(start + 16);
+            let context_start = self.pos.saturating_sub(1);
+            let context_end = self.data().len().min(context_start + 16);
             return Err(OracleThinError::new(format!(
                 "invalid TTC universal integer length {len} at offset {start}; context={:02x?}",
-                &self.data[start..context_end]
+                &self.data()[context_start..context_end]
             )));
         }
         let bytes = self.read_raw(len)?;
@@ -20075,6 +20152,22 @@ mod tests {
                 OracleValue::Text("old-a".to_string()),
                 OracleValue::Text("new".to_string())
             ]]
+        );
+
+        // A second row in the same batch reuses the previous in-batch row.
+        state.bit_vector = Some(vec![0b0000_0001]);
+        let mut cursor = PacketCursor::with_capabilities(
+            &[4, b'n', b'e', b'x', b't'],
+            &OracleThinCapabilities::default(),
+        );
+        process_row_data(&mut cursor, &OracleThinCapabilities::default(), &mut state).unwrap();
+
+        assert_eq!(
+            state.rows[1],
+            vec![
+                OracleValue::Text("next".to_string()),
+                OracleValue::Text("new".to_string())
+            ]
         );
     }
 
