@@ -5144,9 +5144,7 @@ impl SqlEditorWidget {
         source: &str,
         preferred_db_type: Option<DatabaseType>,
     ) -> Option<DatabaseType> {
-        preferred_db_type.or_else(|| {
-            (!sql_text::sql_uses_mysql_compatible_syntax(source)).then_some(DatabaseType::Oracle)
-        })
+        preferred_db_type.or_else(|| sql_text::format_preferred_db_type_for_sql(source))
     }
 
     fn paren_opens_analytic_layout(

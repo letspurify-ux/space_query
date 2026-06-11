@@ -20,8 +20,13 @@
 
 - **기존 family 재사용** (예: MariaDB가 `DatabaseBackendKind::MySql`을
   재사용): `DatabaseType` variant만 추가하면 되고 비용이 작다.
-  family 내부의 차이는 `db_type == DatabaseType::MariaDB` 같은 구체 타입
-  비교로 처리한다(새 variant에 false로 떨어지는 것이 베이스 동작이므로 안전).
+  family 내부의 차이는 `src/db`의 SQL/프로토콜 의미 차이에만 둔다. 이때도
+  `db_type == DatabaseType::MariaDB` 같은 직접 비교가 아니라 wildcard 없는
+  exhaustive `match db_type { ... }`를 사용한다. UI 동작은 `DatabaseType`
+  직접 비교가 아니라 backend spec/registry를 통해 노출해야 한다
+  (`tests/db_dispatch_guards.rs`가 `src/ui` 직접 비교와 `src/db` 비exhaustive
+  구체 타입 분기를 금지한다. `is_same_type_as(DatabaseType::...)` 같은 메서드형
+  구체 타입 비교도 직접 비교로 본다).
 - **새 family** (예: PostgreSQL): `DatabaseBackendKind`와 `SqlDialect`에
   variant를 추가한다. 이 경우 아래 모든 단계가 필요하다.
 
@@ -43,17 +48,32 @@ variant 추가 후 컴파일 에러가 발생하는 디스패치 레지스트리
 | `signature_backend_for` | `src/ui/sql_editor/intellisense/popup.rs` | 프로시저 시그니처 |
 | `column_load_backend_for` | `src/ui/sql_editor/intellisense/helpers.rs` | 컬럼 로드 |
 
-그 외 exhaustive match로 컴파일 에러가 나는 곳: `DatabaseType::ALL`,
-`DbConnection`/`DbConnectionPool`/`DbPoolSession`/`DbSessionLease` enum
-(`src/db/connection.rs` 내부에 격리됨), `sql_classification.rs`의 family
-bool 바인딩들, dialect별 키워드/함수 카탈로그(`sql_text.rs`,
-`syntax_highlight.rs`, `intellisense.rs`).
+UI의 `*_backend_for`/`*_behavior_for`/`*_loader_for` registry 함수는 예외적으로
+concrete `DatabaseType` exhaustive match를 사용한다. 새 DB가 기존
+`DatabaseBackendKind`를 공유하더라도 이 registry들이 컴파일 에러를 내며, 그 DB가
+정말 기존 UI backend를 공유해도 되는지 직접 확인하게 하기 위해서다. 일반 UI
+코드는 여전히 `DatabaseType` 직접 분기 대신 backend spec/registry를 사용한다.
+
+그 외 exhaustive match 또는 guard로 누락이 드러나는 곳: `DatabaseType::ALL`
+(`tests/db_dispatch_guards.rs`가 enum variant와 배열을 비교),
+`DbConnection`/`DbConnectionPool`/`DbPoolSession`/`DbSessionLease` enum의 물리
+세션 생명주기 분기(`tests/db_dispatch_guards.rs`가 `matches!`/`if let`/wildcard
+arm을 금지),
+`sql_classification.rs`의 family bool 바인딩들, dialect별 키워드/함수
+카탈로그(`sql_text.rs`, `syntax_highlight.rs`, `intellisense.rs`).
 
 ## 3. 컴파일러가 잡지 못하는 것 (수동 확인 필수)
 
 ### 3.1 `DbBackend` 구현
 
-트랜잭션/세션 동작 메서드(`after_connect`, `apply_auto_commit`,
+advanced 설정과 스코프/트랜잭션/세션 동작 메서드(`default_advanced_settings`,
+`validate_advanced_settings`, `apply_current_scope_to_session`, `current_scope_name`,
+`switch_scope`, `apply_scope_to_lease`, `has_connection_scope`,
+`can_apply_empty_scope_to_retained_session`,
+`retained_session_blocks_transaction_mode_change`,
+`can_replace_retained_transaction_mode`, `metadata_scope_noun`, `switch_scope_noun`,
+`after_connect`, `apply_auto_commit`,
+`supports_mysql_delimiter_commands`,
 `apply_transaction_mode_to_live_connection`,
 `read_current_default_transaction_isolation`,
 `transaction_mode_requires_first_statement`, `transaction_mode_statements`,
@@ -61,10 +81,17 @@ bool 바인딩들, dialect별 키워드/함수 카탈로그(`sql_text.rs`,
 강제되지만, **"동작이 없음"도 명시적 결정이어야 한다.** no-op으로 구현할
 때는 왜 no-op이 올바른지 주석으로 남긴다(예: Oracle은 auto-commit을
 세션 플래그가 아니라 실행 시점에 적용).
+`DbBackend`의 default method body는 label/message formatting처럼 다른 required
+method에서 계산되는 파생 helper만 허용한다. 새 정책 default를 추가하면
+`tests/db_dispatch_guards.rs`가 실패해야 한다.
 
 ### 3.2 SQL 분류 (`src/db/sql_classification.rs`)
 
-`SqlKind` 분류는 트랜잭션 상태 추적·세션 재사용 정책의 입력이다. 새 family는
+`DbExecutionBackend::profile_statement`와 `SqlKind` 분류는 결과 라우팅,
+트랜잭션 상태 추적, 세션 재사용 정책의 입력이다. `query_timeout_for_statement`는
+statement 자체가 timeout/session 변수를 만지는 경우와 UI timeout 적용이 충돌하지
+않도록 정한다. 두 메서드는 default 구현이 없으므로 새 backend가 직접 정책을
+확인해야 한다. 새 family는
 키워드별로 직접 결정해야 한다:
 
 - 어떤 문장이 implicit commit을 유발하는가 (DDL 등)
@@ -102,13 +129,34 @@ cancel/timeout/lazy fetch/세션 유지 정책을 항목별로 대조한다.
 family를 추가하면 이 함수에서 컴파일 에러로 피드백 정책 결정이 강제된다.
 실행기에서 이 텍스트들을 인라인으로 조립하지 않는다.
 
+커밋/롤백/폐기 액션은 retained physical session 정책을 직접 재구현하지 말고
+`ensure_retained_session_resolution_action_allowed`,
+`ensure_retained_session_transaction_action_allowed`,
+`retained_session_transaction_resolution_should_discard_after_success`를 사용한다. 이
+함수들이 transaction-only action과 cleanup/discard-only session state의 차이를
+한 곳에서 유지한다.
+`StatementSessionPostProcessor`의 default method body도 공통 보존/결정 계산
+helper만 허용된다. backend별 효과 산출(`effects_for_sql`)은 반드시 직접
+구현한다.
+
 ### 3.5 설정/UI
 
 - `ConnectionAdvancedSettings`에 백엔드 전용 필드 추가 (serde 저장 포맷이므로
   기존 필드는 건드리지 않는다. `#[serde(default)]` 필수)
 - `DbConnectionFormSpec` / `DbAdvancedSettingsFormSpec`에 표시 플래그 추가
+  (예: driver row, TNS alias, DB별 advanced row). UI 코드에서
+  `DatabaseType::Oracle` 같은 직접 비교로 행 표시를 결정하지 않는다.
 - `cache_key()`는 기존 값과 충돌하지 않는 새 값 할당 (Oracle=0, MySQL=1,
   MariaDB=2)
+- object browser 동작(`ObjectBrowserDbBehavior`)은 package routine,
+  compilation status, DDL/action 메뉴 지원 여부까지 backend별로 직접 구현한다.
+  지원하지 않는 기능도 default 상속이 아니라 명시적인 unsupported 메시지로 둔다.
+- UI backend registry 함수에 새 variant를 추가한다. 기존 family backend를
+  공유하는 경우에도 `DatabaseType::NewDb => &MYSQL_...`처럼 명시적으로 매핑한다.
+- formatter의 DB 추론 fallback은 UI에서 직접 고르지 말고
+  `sql_text::format_preferred_db_type_for_sql`에 둔다. 새 dialect를 추가하면 이
+  helper의 대표 DB 매핑과 "preferred DB가 없을 때 어떤 formatter를 쓰는가"를
+  함께 검토한다.
 
 ### 3.6 테스트
 

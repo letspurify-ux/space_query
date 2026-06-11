@@ -1124,9 +1124,9 @@ pub(crate) fn active_mysql_delimiter_before_offset(
     preferred_db_type: Option<crate::db::connection::DatabaseType>,
     initial_mysql_delimiter: Option<&str>,
 ) -> Option<String> {
-    match preferred_db_type.map(|db_type| db_type.sql_dialect()) {
-        Some(crate::db::connection::SqlDialect::MySql) => {}
-        Some(crate::db::connection::SqlDialect::Oracle) | None => return None,
+    match preferred_db_type {
+        Some(db_type) if db_type.supports_mysql_delimiter_commands() => {}
+        Some(_) | None => return None,
     }
 
     let safe_offset = clamp_cursor_to_char_boundary(sql, offset);

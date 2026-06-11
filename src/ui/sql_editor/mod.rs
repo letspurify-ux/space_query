@@ -21,8 +21,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::db::{
-    ColumnInfo, ConnectionAdvancedSettings, ConnectionInfo, DatabaseBackendKind, DatabaseType,
-    DbConnection, DbSessionLease, QueryExecutor, QueryResult, RetainedSessionDisposition,
+    ColumnInfo, ConnectionAdvancedSettings, ConnectionInfo, DatabaseType, DbConnection,
+    DbSessionLease, QueryExecutor, QueryResult, RetainedSessionDisposition,
     RetainedSessionMutationOutcome, RetainedSessionPreflightAction,
     RetainedSessionPreflightDecision, RetainedSessionResolutionAction, RetainedSessionState,
     SharedConnection, SharedDbSessionLease, TableColumnDetail, TransactionMode,
@@ -627,9 +627,9 @@ static ORACLE_EXPLAIN_PLAN_BACKEND: OracleExplainPlanBackend = OracleExplainPlan
 static MYSQL_EXPLAIN_PLAN_BACKEND: MysqlExplainPlanBackend = MysqlExplainPlanBackend;
 
 fn explain_plan_backend_for(db_type: DatabaseType) -> &'static dyn ExplainPlanBackend {
-    match db_type.backend_kind() {
-        DatabaseBackendKind::Oracle => &ORACLE_EXPLAIN_PLAN_BACKEND,
-        DatabaseBackendKind::MySql => &MYSQL_EXPLAIN_PLAN_BACKEND,
+    match db_type {
+        DatabaseType::Oracle => &ORACLE_EXPLAIN_PLAN_BACKEND,
+        DatabaseType::MySQL | DatabaseType::MariaDB => &MYSQL_EXPLAIN_PLAN_BACKEND,
     }
 }
 
@@ -654,6 +654,8 @@ struct TransactionActionRequest<'a> {
 }
 
 trait TransactionActionBackend: Sync {
+    fn retained_scope_error_allows_session_reuse(&self, message: &str) -> bool;
+
     fn run_transaction_action(
         &self,
         conn_guard: crate::db::ConnectionLockGuard<'_>,
@@ -742,22 +744,14 @@ fn ensure_retained_session_resolution_action_allowed(
     retained_state: RetainedSessionState,
     action: RetainedSessionResolutionAction,
 ) -> Result<(), String> {
-    if crate::db::retained_session_resolution_action_allowed(retained_state, action) {
-        Ok(())
-    } else {
-        Err(crate::db::retained_session_transaction_resolution_unavailable_message(retained_state))
-    }
+    crate::db::ensure_retained_session_resolution_action_allowed(retained_state, action)
 }
 
 fn ensure_retained_session_transaction_action_allowed(
     retained_state: RetainedSessionState,
     action: RetainedSessionResolutionAction,
 ) -> Result<(), String> {
-    if crate::db::retained_session_transaction_action_allowed(retained_state, action) {
-        Ok(())
-    } else {
-        Err(crate::db::retained_session_transaction_action_unavailable_message(retained_state))
-    }
+    crate::db::ensure_retained_session_transaction_action_allowed(retained_state, action)
 }
 
 fn retained_session_disposition_after_transaction_action_success(
@@ -790,13 +784,17 @@ static MYSQL_TRANSACTION_ACTION_BACKEND: MysqlTransactionActionBackend =
     MysqlTransactionActionBackend;
 
 fn transaction_action_backend_for(db_type: DatabaseType) -> &'static dyn TransactionActionBackend {
-    match db_type.backend_kind() {
-        DatabaseBackendKind::Oracle => &ORACLE_TRANSACTION_ACTION_BACKEND,
-        DatabaseBackendKind::MySql => &MYSQL_TRANSACTION_ACTION_BACKEND,
+    match db_type {
+        DatabaseType::Oracle => &ORACLE_TRANSACTION_ACTION_BACKEND,
+        DatabaseType::MySQL | DatabaseType::MariaDB => &MYSQL_TRANSACTION_ACTION_BACKEND,
     }
 }
 
 impl TransactionActionBackend for OracleTransactionActionBackend {
+    fn retained_scope_error_allows_session_reuse(&self, message: &str) -> bool {
+        SqlEditorWidget::oracle_error_message_allows_session_reuse(message)
+    }
+
     fn run_transaction_action(
         &self,
         conn_guard: crate::db::ConnectionLockGuard<'_>,
@@ -1151,6 +1149,10 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
 }
 
 impl TransactionActionBackend for MysqlTransactionActionBackend {
+    fn retained_scope_error_allows_session_reuse(&self, message: &str) -> bool {
+        SqlEditorWidget::mysql_error_allows_session_reuse(message)
+    }
+
     fn run_transaction_action(
         &self,
         conn_guard: crate::db::ConnectionLockGuard<'_>,
@@ -2393,10 +2395,7 @@ impl SqlEditorWidget {
     }
 
     fn retained_scope_error_allows_session_reuse(db_type: DatabaseType, message: &str) -> bool {
-        match db_type.backend_kind() {
-            DatabaseBackendKind::Oracle => Self::oracle_error_message_allows_session_reuse(message),
-            DatabaseBackendKind::MySql => Self::mysql_error_allows_session_reuse(message),
-        }
+        transaction_action_backend_for(db_type).retained_scope_error_allows_session_reuse(message)
     }
 
     fn retained_scope_change_block_message(retained_state: RetainedSessionState) -> Option<String> {
@@ -2423,11 +2422,7 @@ impl SqlEditorWidget {
         advanced: &ConnectionAdvancedSettings,
     ) -> RetainedSessionMutationOutcome {
         let target_scope = target_scope.trim();
-        let mysql_family = match db_type.backend_kind() {
-            DatabaseBackendKind::MySql => true,
-            DatabaseBackendKind::Oracle => false,
-        };
-        if target_scope.is_empty() && !mysql_family {
+        if target_scope.is_empty() && !db_type.can_apply_empty_scope_to_retained_session() {
             return RetainedSessionMutationOutcome::NoSession;
         }
 
@@ -4460,16 +4455,18 @@ impl SqlEditorWidget {
 
     fn current_mysql_delimiter(&self) -> Option<String> {
         let session = match self.connection.lock() {
-            Ok(conn_guard) => match conn_guard.db_type().sql_dialect() {
-                crate::db::SqlDialect::MySql => conn_guard.session_state(),
-                crate::db::SqlDialect::Oracle => return None,
-            },
+            Ok(conn_guard) => {
+                if !conn_guard.db_type().supports_mysql_delimiter_commands() {
+                    return None;
+                }
+                conn_guard.session_state()
+            }
             Err(poisoned) => {
                 let conn_guard = poisoned.into_inner();
-                match conn_guard.db_type().sql_dialect() {
-                    crate::db::SqlDialect::MySql => conn_guard.session_state(),
-                    crate::db::SqlDialect::Oracle => return None,
+                if !conn_guard.db_type().supports_mysql_delimiter_commands() {
+                    return None;
                 }
+                conn_guard.session_state()
             }
         };
 

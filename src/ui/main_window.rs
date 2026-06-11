@@ -26,10 +26,10 @@ use std::time::{Duration, Instant};
 use crate::app_icon;
 use crate::db::{
     create_shared_connection, format_connection_busy_message, try_lock_connection_with_activity,
-    ColumnInfo, DatabaseBackendKind, DatabaseType, ObjectBrowser, QueryResult,
-    RetainedSessionMutationOutcome, RetainedSessionPreflightAction,
-    RetainedSessionPreflightDecision, RetainedSessionResolutionAction, SharedConnection,
-    TransactionAccessMode, TransactionIsolation, TransactionMode,
+    ColumnInfo, DatabaseType, ObjectBrowser, QueryResult, RetainedSessionMutationOutcome,
+    RetainedSessionPreflightAction, RetainedSessionPreflightDecision,
+    RetainedSessionResolutionAction, SharedConnection, TransactionAccessMode, TransactionIsolation,
+    TransactionMode,
 };
 use crate::ui::constants::*;
 use crate::ui::result_table::{ResultGridSqlExecuteCallback, ResultTableContextAction};
@@ -234,16 +234,10 @@ impl RetainedSessionOptionChangePlan {
             let Some(snapshot) = editor.pooled_session_activity_snapshot() else {
                 continue;
             };
-            let preserved_session_blocks_transaction_mode_change = match self.db_type.backend_kind()
-            {
-                DatabaseBackendKind::Oracle => true,
-                DatabaseBackendKind::MySql => false,
-            };
-            if preserved_session_blocks_transaction_mode_change
+            if self
+                .db_type
+                .retained_session_blocks_transaction_mode_change(snapshot.retained_state())
                 && action == "transaction mode"
-                && snapshot
-                    .retained_state()
-                    .requires_physical_session_preservation()
             {
                 return Err(format!(
                     "Cannot change {action} while a retained {} DB session is {}. Resolve or discard it first.",
@@ -251,15 +245,10 @@ impl RetainedSessionOptionChangePlan {
                     snapshot.retained_state().label()
                 ));
             }
-            let mysql_family = match self.db_type.backend_kind() {
-                DatabaseBackendKind::MySql => true,
-                DatabaseBackendKind::Oracle => false,
-            };
-            if mysql_family
+            if self
+                .db_type
+                .can_replace_retained_transaction_mode(snapshot.retained_state())
                 && action == "transaction mode"
-                && snapshot
-                    .retained_state()
-                    .allows_transaction_mode_replacement()
             {
                 continue;
             }
@@ -302,9 +291,9 @@ static ORACLE_SCHEMA_METADATA_LOADER: OracleSchemaMetadataLoader = OracleSchemaM
 static MYSQL_SCHEMA_METADATA_LOADER: MysqlSchemaMetadataLoader = MysqlSchemaMetadataLoader;
 
 fn schema_metadata_loader_for(db_type: DatabaseType) -> &'static dyn SchemaMetadataLoader {
-    match db_type.backend_kind() {
-        DatabaseBackendKind::Oracle => &ORACLE_SCHEMA_METADATA_LOADER,
-        DatabaseBackendKind::MySql => &MYSQL_SCHEMA_METADATA_LOADER,
+    match db_type {
+        DatabaseType::Oracle => &ORACLE_SCHEMA_METADATA_LOADER,
+        DatabaseType::MySQL | DatabaseType::MariaDB => &MYSQL_SCHEMA_METADATA_LOADER,
     }
 }
 
@@ -1136,7 +1125,7 @@ impl AppState {
     ) -> Option<String> {
         conn_guard
             .db_type()
-            .matches(db_type)
+            .is_same_type_as(db_type)
             .then(|| conn_guard.current_scope_name())
             .flatten()
             .and_then(|scope| Self::normalize_scope_name(Some(scope)))

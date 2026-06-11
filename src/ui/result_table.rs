@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::db::query::result_messages;
 use crate::db::{QueryExecutor, QueryResult};
 use crate::ui::constants::*;
 use crate::ui::font_settings::{configured_editor_profile, FontProfile};
@@ -5356,13 +5357,17 @@ impl ResultTableWidget {
 
     fn is_non_select_success_completion_message(message: &str) -> bool {
         let lowered = message.trim().to_ascii_lowercase();
-        lowered.contains("row(s) affected")
-            || lowered.contains("statement executed successfully")
-            || lowered.contains("commit complete")
-            || lowered.contains("rollback complete")
-            || lowered.contains("pl/sql block executed successfully")
-            || lowered.contains("call executed successfully")
-            || lowered.contains("auto-commit applied")
+        [
+            result_messages::ROWS_AFFECTED_FRAGMENT,
+            result_messages::STATEMENT_EXECUTED,
+            result_messages::COMMIT_COMPLETE,
+            result_messages::ROLLBACK_COMPLETE,
+            result_messages::PLSQL_BLOCK_EXECUTED,
+            result_messages::CALL_EXECUTED,
+            result_messages::AUTO_COMMIT_APPLIED,
+        ]
+        .iter()
+        .any(|fragment| lowered.contains(&fragment.to_ascii_lowercase()))
     }
 
     fn normalize_header_for_lookup(header: &str) -> String {

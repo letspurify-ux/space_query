@@ -279,7 +279,7 @@ impl ConnectionAdvancedSettings {
         previous_db_type: DatabaseType,
         new_db_type: DatabaseType,
     ) -> Self {
-        if previous_db_type.matches(new_db_type) {
+        if previous_db_type.is_same_type_as(new_db_type) {
             return self.clone();
         }
 
@@ -522,6 +522,7 @@ fn mysql_collation_matches_charset(collation: &str, charset: &str) -> bool {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DbConnectionFormSpec {
+    pub show_driver_mode: bool,
     pub service_name_form_label: &'static str,
     pub service_name_value_label: &'static str,
     pub service_name_required: bool,
@@ -628,6 +629,10 @@ impl DatabaseType {
         backend_for(self).sql_dialect()
     }
 
+    pub(crate) fn supports_mysql_delimiter_commands(self) -> bool {
+        backend_for(self).supports_mysql_delimiter_commands()
+    }
+
     pub fn backend_kind(self) -> DatabaseBackendKind {
         backend_for(self).backend_kind()
     }
@@ -638,6 +643,24 @@ impl DatabaseType {
 
     pub(crate) fn has_connection_scope(self) -> bool {
         backend_for(self).has_connection_scope()
+    }
+
+    pub(crate) fn can_apply_empty_scope_to_retained_session(self) -> bool {
+        backend_for(self).can_apply_empty_scope_to_retained_session()
+    }
+
+    pub(crate) fn retained_session_blocks_transaction_mode_change(
+        self,
+        retained_state: RetainedSessionState,
+    ) -> bool {
+        backend_for(self).retained_session_blocks_transaction_mode_change(retained_state)
+    }
+
+    pub(crate) fn can_replace_retained_transaction_mode(
+        self,
+        retained_state: RetainedSessionState,
+    ) -> bool {
+        backend_for(self).can_replace_retained_transaction_mode(retained_state)
     }
 
     pub(crate) fn scope_values_match(self, left: Option<&str>, right: Option<&str>) -> bool {
@@ -700,7 +723,7 @@ impl DatabaseType {
         backend_for(self).is_recoverable_timeout_message(trimmed, lower)
     }
 
-    pub(crate) fn matches(self, expected: Self) -> bool {
+    pub(crate) fn is_same_type_as(self, expected: Self) -> bool {
         self == expected
     }
 
@@ -1156,7 +1179,7 @@ impl DbPoolSessionContext {
                 let conn = *conn;
                 conn.discard();
             }
-            other => drop(other),
+            DbPoolSession::Oracle(_) | DbPoolSession::MySQL { .. } => {}
         }
     }
 }
@@ -1253,8 +1276,11 @@ impl DbConnectionPool {
     }
 
     fn close(&self) {
-        if let DbConnectionPool::OracleThin { pool, .. } = self {
-            pool.close();
+        match self {
+            DbConnectionPool::Oracle { .. } | DbConnectionPool::MySQL { .. } => {}
+            DbConnectionPool::OracleThin { pool, .. } => {
+                pool.close();
+            }
         }
     }
 }
@@ -1268,7 +1294,7 @@ impl DbPoolSession {
     }
 
     pub fn is_db_type(&self, expected: DatabaseType) -> bool {
-        self.db_type().matches(expected)
+        self.db_type().is_same_type_as(expected)
     }
 
     pub fn ensure_db_type(self, expected: DatabaseType) -> Result<Self, String> {
@@ -1301,7 +1327,7 @@ impl DbSessionLease {
     }
 
     pub fn is_db_type(&self, expected: DatabaseType) -> bool {
-        self.db_type().matches(expected)
+        self.db_type().is_same_type_as(expected)
     }
 
     pub fn into_oracle_connection(self) -> Option<Arc<Connection>> {
@@ -1705,10 +1731,10 @@ impl SharedDbSessionLease {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let should_clear = lease.as_ref().is_some_and(|existing| {
                 existing.connection_generation == connection_generation
-                    && matches!(
-                        &existing.lease,
-                        DbSessionLease::Oracle(conn) if Arc::ptr_eq(conn, expected_conn)
-                    )
+                    && match &existing.lease {
+                        DbSessionLease::Oracle(conn) => Arc::ptr_eq(conn, expected_conn),
+                        DbSessionLease::OracleThin(_) | DbSessionLease::MySQL { .. } => false,
+                    }
             });
             if should_clear {
                 lease.take()
@@ -1833,21 +1859,18 @@ pub(crate) trait DbBackend: Sync {
     fn connection_form_spec(&self) -> DbConnectionFormSpec;
     fn advanced_settings_form_spec(&self) -> DbAdvancedSettingsFormSpec;
     fn sql_dialect(&self) -> SqlDialect;
+    fn supports_mysql_delimiter_commands(&self) -> bool;
     fn backend_kind(&self) -> DatabaseBackendKind;
     fn cache_key(&self) -> u8;
     fn default_connection_info(&self) -> ConnectionInfo;
-    fn default_advanced_settings(&self) -> ConnectionAdvancedSettings {
-        ConnectionAdvancedSettings::default()
-    }
+    fn default_advanced_settings(&self) -> ConnectionAdvancedSettings;
     fn connection_string(&self, info: &ConnectionInfo) -> String;
     fn service_name_label(&self) -> &'static str;
     fn validate_advanced_settings(
         &self,
-        _settings: &ConnectionAdvancedSettings,
-        _using_tns_alias: bool,
-    ) -> Result<(), String> {
-        Ok(())
-    }
+        settings: &ConnectionAdvancedSettings,
+        using_tns_alias: bool,
+    ) -> Result<(), String>;
     fn validate_session_time_zone(&self, value: &str) -> Result<(), String> {
         let Some(offset) = parse_session_time_zone_offset(value) else {
             return Err(
@@ -1878,11 +1901,9 @@ pub(crate) trait DbBackend: Sync {
     ) -> Result<(), String>;
     fn apply_current_scope_to_session(
         &self,
-        _context: &DbPoolSessionContext,
-        _session: &mut DbPoolSession,
-    ) -> Result<(), String> {
-        Ok(())
-    }
+        context: &DbPoolSessionContext,
+        session: &mut DbPoolSession,
+    ) -> Result<(), String>;
     fn test_connection(&self, info: &ConnectionInfo) -> Result<(), String>;
     // Transaction/session behavior methods below have no default bodies on
     // purpose: a silent no-op default (e.g. auto-commit toggles that do
@@ -1890,41 +1911,29 @@ pub(crate) trait DbBackend: Sync {
     // to compile with. Each backend states its behavior explicitly, even when
     // that behavior is "nothing to do".
     fn after_connect(&self, connection: &mut DatabaseConnection);
-    fn current_scope_name(&self, _connection: &DatabaseConnection) -> Option<String> {
-        None
-    }
+    fn current_scope_name(&self, connection: &DatabaseConnection) -> Option<String>;
     fn switch_scope(
         &self,
-        _connection: &mut DatabaseConnection,
-        _target_scope: &str,
-    ) -> Result<(), String> {
-        Err(format!(
-            "{} does not support scope switching",
-            self.display_name()
-        ))
-    }
+        connection: &mut DatabaseConnection,
+        target_scope: &str,
+    ) -> Result<(), String>;
     fn apply_scope_to_lease(
         &self,
-        _lease: &mut DbSessionLease,
-        _target_scope: &str,
-        _advanced: &ConnectionAdvancedSettings,
-        _preserve_existing_session_state: bool,
-    ) -> Result<(), String> {
-        Err(format!(
-            "{} does not support scoped sessions",
-            self.display_name()
-        ))
-    }
-    fn has_connection_scope(&self) -> bool {
-        false
-    }
+        lease: &mut DbSessionLease,
+        target_scope: &str,
+        advanced: &ConnectionAdvancedSettings,
+        preserve_existing_session_state: bool,
+    ) -> Result<(), String>;
+    fn has_connection_scope(&self) -> bool;
+    fn can_apply_empty_scope_to_retained_session(&self) -> bool;
+    fn retained_session_blocks_transaction_mode_change(
+        &self,
+        retained_state: RetainedSessionState,
+    ) -> bool;
+    fn can_replace_retained_transaction_mode(&self, retained_state: RetainedSessionState) -> bool;
     fn scope_values_match(&self, left: Option<&str>, right: Option<&str>) -> bool;
-    fn metadata_scope_noun(&self) -> &'static str {
-        "scope"
-    }
-    fn switch_scope_noun(&self) -> &'static str {
-        "scope"
-    }
+    fn metadata_scope_noun(&self) -> &'static str;
+    fn switch_scope_noun(&self) -> &'static str;
     fn metadata_refresh_activity(&self, requested_scope: Option<&str>) -> String {
         self.metadata_refresh_activity_with_base("Loading schema metadata", requested_scope)
     }
@@ -2068,6 +2077,7 @@ impl DbBackend for OracleBackend {
 
     fn connection_form_spec(&self) -> DbConnectionFormSpec {
         DbConnectionFormSpec {
+            show_driver_mode: true,
             service_name_form_label: "Service:",
             service_name_value_label: "Service name",
             service_name_required: true,
@@ -2091,6 +2101,10 @@ impl DbBackend for OracleBackend {
         SqlDialect::Oracle
     }
 
+    fn supports_mysql_delimiter_commands(&self) -> bool {
+        false
+    }
+
     fn backend_kind(&self) -> DatabaseBackendKind {
         DatabaseBackendKind::Oracle
     }
@@ -2112,6 +2126,10 @@ impl DbBackend for OracleBackend {
             advanced: ConnectionAdvancedSettings::default_for(self.db_type()),
             debug_oracle_thin_protocol_version: None,
         }
+    }
+
+    fn default_advanced_settings(&self) -> ConnectionAdvancedSettings {
+        ConnectionAdvancedSettings::default()
     }
 
     fn validate_advanced_settings(
@@ -2326,6 +2344,21 @@ impl DbBackend for OracleBackend {
         true
     }
 
+    fn can_apply_empty_scope_to_retained_session(&self) -> bool {
+        false
+    }
+
+    fn retained_session_blocks_transaction_mode_change(
+        &self,
+        retained_state: RetainedSessionState,
+    ) -> bool {
+        retained_state.requires_physical_session_preservation()
+    }
+
+    fn can_replace_retained_transaction_mode(&self, _retained_state: RetainedSessionState) -> bool {
+        false
+    }
+
     fn scope_values_match(&self, left: Option<&str>, right: Option<&str>) -> bool {
         scope_values_match_exact(left, right)
     }
@@ -2359,12 +2392,20 @@ impl DbBackend for OracleBackend {
 
     fn apply_auto_commit(
         &self,
-        _connection: &mut DbConnection,
+        connection: &mut DbConnection,
         _enabled: bool,
     ) -> Result<(), String> {
-        // Oracle has no session-level autocommit flag to push; the executor
-        // consults the logical auto-commit setting per statement.
-        Ok(())
+        match connection {
+            DbConnection::Oracle(_) | DbConnection::OracleThin(_) => {
+                // Oracle has no session-level autocommit flag to push; the
+                // executor consults the logical auto-commit setting per statement.
+                Ok(())
+            }
+            unexpected @ DbConnection::MySQL { .. } => Err(format!(
+                "Expected Oracle live connection but found {}",
+                unexpected.db_type()
+            )),
+        }
     }
 
     fn supported_transaction_isolations(&self) -> &'static [TransactionIsolation] {
@@ -2377,35 +2418,49 @@ impl DbBackend for OracleBackend {
 
     fn apply_transaction_mode_to_live_connection(
         &self,
-        _connection: &mut Option<DbConnection>,
+        connection: &mut Option<DbConnection>,
         _mode: TransactionMode,
         _default_isolation: TransactionIsolation,
     ) -> Result<(), String> {
-        // Oracle applies transaction mode through SET TRANSACTION as the
-        // first statement of each transaction (`transaction_mode_statements`),
-        // never against the live session.
-        Ok(())
+        match connection.as_mut() {
+            Some(DbConnection::Oracle(_)) | Some(DbConnection::OracleThin(_)) | None => {
+                // Oracle applies transaction mode through SET TRANSACTION as the
+                // first statement of each transaction (`transaction_mode_statements`),
+                // never against the live session.
+                Ok(())
+            }
+            Some(unexpected @ DbConnection::MySQL { .. }) => Err(format!(
+                "Expected Oracle live connection but found {}",
+                unexpected.db_type()
+            )),
+        }
     }
 
     fn read_current_default_transaction_isolation(
         &self,
         connection: &mut Option<DbConnection>,
     ) -> Result<Option<TransactionIsolation>, String> {
-        if let Some(DbConnection::Oracle(conn)) = connection.as_mut() {
-            DatabaseConnection::read_oracle_default_transaction_isolation(conn.as_ref())
-        } else if let Some(DbConnection::OracleThin(conn)) = connection.as_mut() {
-            let mut guard = conn
-                .lock()
-                .map_err(|_| "Oracle thin connection mutex poisoned".to_string())?;
-            let raw = DatabaseConnection::oracle_thin_select_one_text(
-                &mut guard,
-                "SELECT value FROM v$ses_optimizer_env WHERE sid = SYS_CONTEXT('USERENV', 'SID') AND name = 'transaction_isolation_level'",
-            )?;
-            Ok(raw
-                .as_deref()
-                .and_then(TransactionIsolation::from_sql_level))
-        } else {
-            Ok(None)
+        match connection.as_mut() {
+            Some(DbConnection::Oracle(conn)) => {
+                DatabaseConnection::read_oracle_default_transaction_isolation(conn.as_ref())
+            }
+            Some(DbConnection::OracleThin(conn)) => {
+                let mut guard = conn
+                    .lock()
+                    .map_err(|_| "Oracle thin connection mutex poisoned".to_string())?;
+                let raw = DatabaseConnection::oracle_thin_select_one_text(
+                    &mut guard,
+                    "SELECT value FROM v$ses_optimizer_env WHERE sid = SYS_CONTEXT('USERENV', 'SID') AND name = 'transaction_isolation_level'",
+                )?;
+                Ok(raw
+                    .as_deref()
+                    .and_then(TransactionIsolation::from_sql_level))
+            }
+            Some(unexpected @ DbConnection::MySQL { .. }) => Err(format!(
+                "Expected Oracle live connection but found {}",
+                unexpected.db_type()
+            )),
+            None => Ok(None),
         }
     }
 
@@ -2460,6 +2515,7 @@ impl DbBackend for MysqlBackend {
 
     fn connection_form_spec(&self) -> DbConnectionFormSpec {
         DbConnectionFormSpec {
+            show_driver_mode: false,
             service_name_form_label: "Database:",
             service_name_value_label: "Database name",
             service_name_required: false,
@@ -2481,6 +2537,13 @@ impl DbBackend for MysqlBackend {
 
     fn sql_dialect(&self) -> SqlDialect {
         SqlDialect::MySql
+    }
+
+    fn supports_mysql_delimiter_commands(&self) -> bool {
+        match self.db_type {
+            DatabaseType::MySQL | DatabaseType::MariaDB => true,
+            DatabaseType::Oracle => unreachable!("Oracle does not use MysqlBackend"),
+        }
     }
 
     fn backend_kind(&self) -> DatabaseBackendKind {
@@ -2698,6 +2761,21 @@ impl DbBackend for MysqlBackend {
         true
     }
 
+    fn can_apply_empty_scope_to_retained_session(&self) -> bool {
+        true
+    }
+
+    fn retained_session_blocks_transaction_mode_change(
+        &self,
+        _retained_state: RetainedSessionState,
+    ) -> bool {
+        false
+    }
+
+    fn can_replace_retained_transaction_mode(&self, retained_state: RetainedSessionState) -> bool {
+        retained_state.allows_transaction_mode_replacement()
+    }
+
     fn scope_values_match(&self, left: Option<&str>, right: Option<&str>) -> bool {
         scope_values_match_exact(left, right)
     }
@@ -2734,10 +2812,15 @@ impl DbBackend for MysqlBackend {
         connection: &mut DbConnection,
         enabled: bool,
     ) -> Result<(), String> {
-        if let DbConnection::MySQL { conn, .. } = connection {
-            DatabaseConnection::apply_mysql_autocommit_setting(conn, enabled)?;
+        match connection {
+            DbConnection::MySQL { conn, .. } => {
+                DatabaseConnection::apply_mysql_autocommit_setting(conn, enabled)
+            }
+            unexpected @ (DbConnection::Oracle(_) | DbConnection::OracleThin(_)) => Err(format!(
+                "Expected MySQL live connection but found {}",
+                unexpected.db_type()
+            )),
         }
-        Ok(())
     }
 
     fn supported_transaction_isolations(&self) -> &'static [TransactionIsolation] {
@@ -2756,10 +2839,17 @@ impl DbBackend for MysqlBackend {
         &self,
         connection: &mut Option<DbConnection>,
     ) -> Result<Option<TransactionIsolation>, String> {
-        if let Some(DbConnection::MySQL { conn, .. }) = connection.as_mut() {
-            DatabaseConnection::read_mysql_default_transaction_isolation(conn)
-        } else {
-            Ok(None)
+        match connection.as_mut() {
+            Some(DbConnection::MySQL { conn, .. }) => {
+                DatabaseConnection::read_mysql_default_transaction_isolation(conn)
+            }
+            Some(unexpected @ (DbConnection::Oracle(_) | DbConnection::OracleThin(_))) => {
+                Err(format!(
+                    "Expected MySQL live connection but found {}",
+                    unexpected.db_type()
+                ))
+            }
+            None => Ok(None),
         }
     }
 
@@ -2769,15 +2859,23 @@ impl DbBackend for MysqlBackend {
         mode: TransactionMode,
         default_isolation: TransactionIsolation,
     ) -> Result<(), String> {
-        if let Some(DbConnection::MySQL { conn, .. }) = connection.as_mut() {
-            DatabaseConnection::apply_mysql_transaction_mode_for_db_with_default(
-                conn,
-                mode,
-                self.db_type,
-                default_isolation,
-            )?;
+        match connection.as_mut() {
+            Some(DbConnection::MySQL { conn, .. }) => {
+                DatabaseConnection::apply_mysql_transaction_mode_for_db_with_default(
+                    conn,
+                    mode,
+                    self.db_type,
+                    default_isolation,
+                )
+            }
+            Some(unexpected @ (DbConnection::Oracle(_) | DbConnection::OracleThin(_))) => {
+                Err(format!(
+                    "Expected MySQL live connection but found {}",
+                    unexpected.db_type()
+                ))
+            }
+            None => Ok(()),
         }
-        Ok(())
     }
 
     fn transaction_mode_statements(&self, mode: TransactionMode) -> Result<Vec<String>, String> {
@@ -3744,14 +3842,14 @@ impl DatabaseConnection {
     pub fn get_connection(&self) -> Option<Arc<Connection>> {
         match &self.connection {
             Some(DbConnection::Oracle(conn)) => Some(Arc::clone(conn)),
-            _ => None,
+            Some(DbConnection::OracleThin(_)) | Some(DbConnection::MySQL { .. }) | None => None,
         }
     }
 
     pub fn get_oracle_thin_connection(&self) -> Option<Arc<Mutex<OracleThinSession>>> {
         match &self.connection {
             Some(DbConnection::OracleThin(conn)) => Some(Arc::clone(conn)),
-            _ => None,
+            Some(DbConnection::Oracle(_)) | Some(DbConnection::MySQL { .. }) | None => None,
         }
     }
 
@@ -3775,7 +3873,7 @@ impl DatabaseConnection {
     pub fn get_mysql_connection_mut(&mut self) -> Option<&mut mysql::Conn> {
         match &mut self.connection {
             Some(DbConnection::MySQL { conn, .. }) => Some(conn),
-            _ => None,
+            Some(DbConnection::Oracle(_)) | Some(DbConnection::OracleThin(_)) | None => None,
         }
     }
 
@@ -3801,7 +3899,7 @@ impl DatabaseConnection {
     }
 
     pub fn runtime_connection_info_for(&self, db_type: DatabaseType) -> Option<ConnectionInfo> {
-        if !self.info.db_type.matches(db_type) {
+        if !self.info.db_type.is_same_type_as(db_type) {
             return None;
         }
 
@@ -3912,7 +4010,7 @@ impl DatabaseConnection {
         connection_generation: u64,
         db_type: DatabaseType,
     ) -> bool {
-        self.info.db_type.matches(db_type)
+        self.info.db_type.is_same_type_as(db_type)
             && self.connected
             && self.connection.is_some()
             && self.connection_generation == connection_generation
@@ -3970,7 +4068,7 @@ impl DatabaseConnection {
             ));
         }
 
-        if self.info.db_type.matches(expected) {
+        if self.info.db_type.is_same_type_as(expected) {
             Ok(())
         } else {
             Err(format!(
@@ -4442,7 +4540,7 @@ fn pool_session_context_identity_matches(
         && left
             .connection_info
             .db_type
-            .matches(right.connection_info.db_type)
+            .is_same_type_as(right.connection_info.db_type)
         && left.connection_pool_size == right.connection_pool_size
         && left.current_service_name == right.current_service_name
         && left.oracle_current_schema == right.oracle_current_schema
@@ -5889,6 +5987,7 @@ mod tests {
     fn database_form_specs_keep_connection_defaults_in_backend_metadata() {
         let oracle = DatabaseType::Oracle.connection_form_spec();
         assert_eq!(oracle.default_port, 1521);
+        assert!(oracle.show_driver_mode);
         assert!(oracle.service_name_required);
         assert!(oracle.supports_tns_alias);
         let oracle_advanced = DatabaseType::Oracle.advanced_settings_form_spec();
@@ -5899,6 +5998,7 @@ mod tests {
 
         let mysql = DatabaseType::MySQL.connection_form_spec();
         assert_eq!(mysql.default_port, 3306);
+        assert!(!mysql.show_driver_mode);
         assert!(!mysql.service_name_required);
         assert!(!mysql.supports_tns_alias);
         let mysql_advanced = DatabaseType::MySQL.advanced_settings_form_spec();
@@ -5909,6 +6009,7 @@ mod tests {
 
         let mariadb = DatabaseType::MariaDB.connection_form_spec();
         assert_eq!(mariadb.default_port, 3306);
+        assert!(!mariadb.show_driver_mode);
         assert!(!mariadb.service_name_required);
         assert!(!mariadb.supports_tns_alias);
         let mariadb_advanced = DatabaseType::MariaDB.advanced_settings_form_spec();
@@ -6032,6 +6133,16 @@ mod tests {
                 DatabaseType::MariaDB
             ]
         );
+        let mut cache_keys = std::collections::HashSet::new();
+        for db_type in DatabaseType::supported().iter().copied() {
+            assert!(
+                cache_keys.insert(db_type.cache_key()),
+                "duplicate cache key {} for {}",
+                db_type.cache_key(),
+                db_type
+            );
+            assert_eq!(DatabaseType::from_cache_key(db_type.cache_key()), db_type);
+        }
 
         assert_eq!(DatabaseType::Oracle.sql_dialect(), SqlDialect::Oracle);
         assert_eq!(
@@ -6063,6 +6174,40 @@ mod tests {
             DatabaseType::MariaDB
         );
         assert_eq!(DatabaseType::MariaDB.choice_label(), "MariaDB");
+    }
+
+    #[test]
+    fn backend_retained_session_policies_are_explicit_per_database_type() {
+        let clean = RetainedSessionState::default();
+        let dirty_transaction =
+            RetainedSessionState::from_transaction_state(TransactionSessionState::DecisionRequired);
+        let post_processor = crate::db::statement_session_post_processor_for(DatabaseType::MySQL);
+        let transaction_mode_override = crate::db::retained_session_state_after_statement(
+            post_processor,
+            clean,
+            post_processor.effects_for_sql("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"),
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert!(!DatabaseType::Oracle.can_apply_empty_scope_to_retained_session());
+        assert!(!DatabaseType::Oracle.supports_mysql_delimiter_commands());
+        assert!(
+            DatabaseType::Oracle.retained_session_blocks_transaction_mode_change(dirty_transaction)
+        );
+        assert!(
+            !DatabaseType::Oracle.can_replace_retained_transaction_mode(transaction_mode_override)
+        );
+
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            assert!(db_type.can_apply_empty_scope_to_retained_session());
+            assert!(db_type.supports_mysql_delimiter_commands());
+            assert!(!db_type.retained_session_blocks_transaction_mode_change(dirty_transaction));
+            assert!(db_type.can_replace_retained_transaction_mode(transaction_mode_override));
+            assert!(!db_type.can_replace_retained_transaction_mode(dirty_transaction));
+        }
     }
 
     #[test]

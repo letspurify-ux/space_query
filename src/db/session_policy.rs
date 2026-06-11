@@ -8,7 +8,7 @@ use mysql::prelude::Queryable;
 use oracle::Connection as OracleConnection;
 
 use crate::{
-    db::connection::{DatabaseBackendKind, DatabaseType},
+    db::connection::DatabaseType,
     db::transaction::{
         mysql_statement_consumes_pending_transaction_mode_override_for_preflight,
         statement_can_cleanup_retained_session_for_preflight, statement_cancel_can_reuse_session,
@@ -178,11 +178,7 @@ pub fn retained_session_state_transaction_mode_change_preflight_decision(
     db_type: DatabaseType,
     state: RetainedSessionState,
 ) -> RetainedSessionPreflightDecision {
-    let mysql_family = match db_type.backend_kind() {
-        DatabaseBackendKind::MySql => true,
-        DatabaseBackendKind::Oracle => false,
-    };
-    if mysql_family && state.allows_transaction_mode_replacement() {
+    if db_type.can_replace_retained_transaction_mode(state) {
         RetainedSessionPreflightDecision::Allow
     } else {
         retained_session_state_preflight_decision(
@@ -201,13 +197,15 @@ fn retained_session_execute_can_consume_pending_transaction_mode(
     // MySQL/MariaDB session. Allow only statements that start that next
     // transaction, or release the physical session, through this preflight;
     // plain COMMIT/ROLLBACK leave the next-transaction override pending.
-    let mysql_family = match db_type.backend_kind() {
-        DatabaseBackendKind::MySql => true,
-        DatabaseBackendKind::Oracle => false,
-    };
-    mysql_family
-        && state.has_only_next_transaction_mode_override()
-        && mysql_statement_consumes_pending_transaction_mode_override_for_preflight(db_type, sql)
+    match db_type {
+        DatabaseType::MySQL | DatabaseType::MariaDB => {
+            state.has_only_next_transaction_mode_override()
+                && mysql_statement_consumes_pending_transaction_mode_override_for_preflight(
+                    db_type, sql,
+                )
+        }
+        DatabaseType::Oracle => false,
+    }
 }
 
 fn retained_session_execute_can_cleanup_session_state(
@@ -691,11 +689,13 @@ pub fn is_recoverable_timeout_message(db_type: DatabaseType, err_msg: &str) -> b
     if is_lock_wait_timeout_message(&lower) {
         return false;
     }
-    let mysql_family = match db_type.backend_kind() {
-        DatabaseBackendKind::MySql => true,
-        DatabaseBackendKind::Oracle => false,
+    let has_structured_recoverable_timeout_marker = match db_type {
+        DatabaseType::MySQL | DatabaseType::MariaDB => {
+            has_structured_mysql_recoverable_timeout_marker(&lower)
+        }
+        DatabaseType::Oracle => false,
     };
-    if mysql_family && has_structured_mysql_recoverable_timeout_marker(&lower) {
+    if has_structured_recoverable_timeout_marker {
         // Numeric/symbolic server timeout markers are stronger evidence than
         // broad prose such as "operation timed out"; otherwise ERROR 3024 can
         // be discarded just because a driver includes generic timeout text.

@@ -74,9 +74,11 @@ static ORACLE_COLUMN_LOAD_BACKEND: OracleColumnLoadBackend = OracleColumnLoadBac
 static MYSQL_COLUMN_LOAD_BACKEND: MysqlColumnLoadBackend = MysqlColumnLoadBackend;
 
 fn column_load_backend_for(db_type: crate::db::DatabaseType) -> &'static dyn ColumnLoadBackend {
-    match db_type.backend_kind() {
-        crate::db::DatabaseBackendKind::Oracle => &ORACLE_COLUMN_LOAD_BACKEND,
-        crate::db::DatabaseBackendKind::MySql => &MYSQL_COLUMN_LOAD_BACKEND,
+    match db_type {
+        crate::db::DatabaseType::Oracle => &ORACLE_COLUMN_LOAD_BACKEND,
+        crate::db::DatabaseType::MySQL | crate::db::DatabaseType::MariaDB => {
+            &MYSQL_COLUMN_LOAD_BACKEND
+        }
     }
 }
 
@@ -100,10 +102,10 @@ impl ColumnLoadBackend for OracleColumnLoadBackend {
                     Err(_) => LoadedColumns::failed(),
                 }
             }
-            other => {
+            unexpected @ crate::db::DbPoolSession::MySQL { .. } => {
                 eprintln!(
                     "Warning: expected Oracle column-load session but acquired {}",
-                    other.db_type()
+                    unexpected.db_type()
                 );
                 LoadedColumns::failed()
             }
@@ -127,10 +129,10 @@ impl ColumnLoadBackend for OracleColumnLoadBackend {
                     .map(foreign_keys_to_meta)
                     .map_err(|_| ())
             }
-            other => {
+            unexpected @ crate::db::DbPoolSession::MySQL { .. } => {
                 eprintln!(
                     "Warning: expected Oracle FK-load session but acquired {}",
-                    other.db_type()
+                    unexpected.db_type()
                 );
                 Err(())
             }
@@ -165,10 +167,11 @@ impl ColumnLoadBackend for MysqlColumnLoadBackend {
                     Err(_) => LoadedColumns::failed(),
                 }
             }
-            other => {
+            unexpected @ (crate::db::DbPoolSession::Oracle(_)
+            | crate::db::DbPoolSession::OracleThin(_)) => {
                 eprintln!(
                     "Warning: expected MySQL column-load session but acquired {}",
-                    other.db_type()
+                    unexpected.db_type()
                 );
                 LoadedColumns::failed()
             }
@@ -198,10 +201,11 @@ impl ColumnLoadBackend for MysqlColumnLoadBackend {
                 };
                 result.map(foreign_keys_to_meta).map_err(|_| ())
             }
-            other => {
+            unexpected @ (crate::db::DbPoolSession::Oracle(_)
+            | crate::db::DbPoolSession::OracleThin(_)) => {
                 eprintln!(
                     "Warning: expected MySQL FK-load session but acquired {}",
-                    other.db_type()
+                    unexpected.db_type()
                 );
                 Err(())
             }

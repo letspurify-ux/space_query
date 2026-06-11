@@ -1406,34 +1406,26 @@ impl QueryExecutor {
         if let Some(mut result) = last_select_result {
             result.execution_time = execution_time;
             if statement_count > 1 {
-                result.message = format!(
-                    "{} (Executed {} of {} statements)",
-                    result.message, executed_count, statement_count
+                result.message = result_messages::script_select_batch_progress(
+                    &result.message,
+                    executed_count,
+                    statement_count,
                 );
             }
             if had_errors {
-                result.message =
-                    format!("{} | Errors: {}", result.message, error_messages.join("; "));
+                result.message = result_messages::with_errors(&result.message, &error_messages);
                 result.success = false;
             }
             return result;
         }
 
         // Return a summary for DML/DDL batch
-        let message = if had_errors {
-            format!(
-                "Executed {} of {} statements, {} row(s) affected | Errors: {}",
-                executed_count,
-                statement_count,
-                total_affected,
-                error_messages.join("; ")
-            )
-        } else {
-            format!(
-                "Executed {} statements, {} row(s) affected",
-                executed_count, total_affected
-            )
-        };
+        let message = result_messages::script_batch_summary(
+            executed_count,
+            statement_count,
+            total_affected,
+            &error_messages,
+        );
 
         QueryResult {
             sql: sql.to_string(),
@@ -3040,7 +3032,7 @@ impl QueryExecutor {
         }
 
         match target.as_str() {
-            "CURRENT_SCHEMA" => "Current schema changed".to_string(),
+            "CURRENT_SCHEMA" => result_messages::current_scope_changed_without_name("schema"),
             "CONTAINER" => "Container changed".to_string(),
             "EDITION" => "Edition changed".to_string(),
             "TIME_ZONE" => "Session time zone changed".to_string(),

@@ -17666,4 +17666,16 @@ fn shared_result_message_formatters_match_executor_output() {
         result_messages::with_out_binds("Call executed successfully", &[]),
         "Call executed successfully"
     );
+    assert_eq!(
+        result_messages::script_select_batch_progress("1 rows fetched", 1, 2),
+        "1 rows fetched (Executed 1 of 2 statements)"
+    );
+    assert_eq!(
+        result_messages::script_batch_summary(2, 2, 7, &[]),
+        "Executed 2 statements, 7 row(s) affected"
+    );
+    assert_eq!(
+        result_messages::script_batch_summary(1, 2, 7, &["Statement 2: ORA-00900".to_string()]),
+        "Executed 1 of 2 statements, 7 row(s) affected | Errors: Statement 2: ORA-00900"
+    );
 }

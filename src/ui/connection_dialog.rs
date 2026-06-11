@@ -35,9 +35,10 @@ const CONNECTION_DIALOG_COLUMN_SPACING: i32 = DIALOG_SPACING + 4;
 /// is not Thin (Thin is Host + Port + Service only), so the section shrinks when
 /// those rows are hidden.
 fn db_selection_section_height(db_type: DatabaseType, driver_mode: OracleDriverMode) -> i32 {
-    let is_oracle = db_type == DatabaseType::Oracle;
-    let show_driver_row = is_oracle;
-    let show_oracle_mode_row = is_oracle && driver_mode != OracleDriverMode::Thin;
+    let form = db_type.connection_form_spec();
+    let show_driver_row = form.show_driver_mode;
+    let show_oracle_mode_row =
+        db_type.supports_tns_alias() && driver_mode != OracleDriverMode::Thin;
     let input_rows = 1 + i32::from(show_driver_row) + i32::from(show_oracle_mode_row);
     let visible_rows = 1 + input_rows; // header + input rows
     LABEL_ROW_HEIGHT + INPUT_ROW_HEIGHT * input_rows + DIALOG_SPACING * (visible_rows - 1)
@@ -556,9 +557,10 @@ fn apply_advanced_form_mode(
     ssl_choice: &mut Choice,
 ) {
     let form = db_type.advanced_settings_form_spec();
+    let connection_form = db_type.connection_form_spec();
     // Oracle Thin uses a plain TCP socket: SSL/TCPS are unavailable, so hide the
     // SSL and protocol rows and pin them to safe values while Thin is selected.
-    let oracle_thin = db_type == DatabaseType::Oracle && driver_mode == OracleDriverMode::Thin;
+    let oracle_thin = connection_form.show_driver_mode && driver_mode == OracleDriverMode::Thin;
     if oracle_thin {
         ssl_choice.set_value(choice_index_from_ssl_mode(
             db_type,
@@ -637,16 +639,12 @@ fn apply_connection_form_mode(
     service_input: &mut Input,
     memory: &Arc<Mutex<OracleModeFieldMemory>>,
 ) {
-    // The Oracle driver selector only applies to Oracle connections.
-    set_form_row_visible(
-        oracle_mode_col,
-        oracle_driver_row,
-        db_type == DatabaseType::Oracle,
-    );
+    let form = db_type.connection_form_spec();
+    set_form_row_visible(oracle_mode_col, oracle_driver_row, form.show_driver_mode);
 
     // Oracle Thin only supports Host + Port + Service, so hide the Oracle Mode
     // selector and force Direct mode while Thin is selected.
-    let oracle_thin = db_type == DatabaseType::Oracle && driver_mode == OracleDriverMode::Thin;
+    let oracle_thin = form.show_driver_mode && driver_mode == OracleDriverMode::Thin;
     let oracle_mode = if oracle_thin {
         OracleConnectMode::Direct
     } else {
@@ -687,7 +685,6 @@ fn apply_connection_form_mode(
             }
         }
     } else {
-        let form = db_type.connection_form_spec();
         set_form_row_visible(oracle_mode_col, oracle_mode_row, false);
         mode_choice.set_value(choice_index_from_oracle_connect_mode(
             OracleConnectMode::Direct,

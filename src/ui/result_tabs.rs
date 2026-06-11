@@ -9,6 +9,7 @@ use std::any::Any;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 
+use crate::db::query::result_messages;
 use crate::ui::constants;
 use crate::ui::font_settings::{configured_editor_profile, FontProfile};
 use crate::ui::result_table::{
@@ -145,7 +146,7 @@ impl ResultTabStatus {
             trimmed
         }
         .trim();
-        normalized.eq_ignore_ascii_case("Query cancelled")
+        normalized.eq_ignore_ascii_case(result_messages::QUERY_CANCELLED)
             || normalized.eq_ignore_ascii_case("Query canceled")
     }
 

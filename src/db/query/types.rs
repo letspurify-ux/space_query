@@ -76,9 +76,16 @@ pub mod result_messages {
     pub const STATEMENT_EXECUTED: &str = "Statement executed successfully";
     pub const QUERY_CANCELLED: &str = "Query cancelled";
     pub const NO_STATEMENTS: &str = "No statements to execute";
+    pub const AUTO_COMMIT_APPLIED: &str = "Auto-commit applied";
+    pub const COMMIT_REQUIRED: &str = "Commit required";
+    pub const ROWS_AFFECTED_FRAGMENT: &str = "row(s) affected";
 
     /// Feedback for session-scope switches: Oracle `ALTER SESSION SET
     /// CURRENT_SCHEMA` ("schema") and MySQL/MariaDB `USE` ("database").
+    pub fn current_scope_changed_without_name(scope: &str) -> String {
+        format!("Current {scope} changed")
+    }
+
     pub fn current_scope_changed(scope: &str, name: &str) -> String {
         format!("Current {scope} changed to {name}.")
     }
@@ -87,9 +94,9 @@ pub mod result_messages {
     /// every backend.
     pub fn with_transaction_feedback(message: &str, auto_commit: bool) -> String {
         if auto_commit {
-            format!("{message} | Auto-commit applied")
+            format!("{message} | {AUTO_COMMIT_APPLIED}")
         } else {
-            format!("{message} | Commit required")
+            format!("{message} | {COMMIT_REQUIRED}")
         }
     }
 
@@ -144,7 +151,41 @@ pub mod result_messages {
     /// Affected-row feedback for DML statements, shared by every executor so
     /// OCI/thin/MySQL report the same text.
     pub fn dml_rows_affected(statement_type: &str, affected_rows: u64) -> String {
-        format!("{statement_type} {affected_rows} row(s) affected")
+        format!("{statement_type} {affected_rows} {ROWS_AFFECTED_FRAGMENT}")
+    }
+
+    pub fn script_select_batch_progress(
+        message: &str,
+        executed_count: usize,
+        statement_count: usize,
+    ) -> String {
+        format!("{message} (Executed {executed_count} of {statement_count} statements)")
+    }
+
+    pub fn script_batch_summary(
+        executed_count: usize,
+        statement_count: usize,
+        affected_rows: u64,
+        error_messages: &[String],
+    ) -> String {
+        let base = if error_messages.is_empty() {
+            format!(
+                "Executed {executed_count} statements, {affected_rows} {ROWS_AFFECTED_FRAGMENT}"
+            )
+        } else {
+            format!(
+                "Executed {executed_count} of {statement_count} statements, {affected_rows} {ROWS_AFFECTED_FRAGMENT}"
+            )
+        };
+        with_errors(&base, error_messages)
+    }
+
+    pub fn with_errors(message: &str, error_messages: &[String]) -> String {
+        if error_messages.is_empty() {
+            message.to_string()
+        } else {
+            format!("{message} | Errors: {}", error_messages.join("; "))
+        }
     }
 
     /// OUT-bind feedback appended to PL/SQL and call results.

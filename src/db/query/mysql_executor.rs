@@ -53,6 +53,12 @@ pub(crate) struct MysqlSessionTimeoutRestore {
     innodb_lock_wait_timeout: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MysqlQueryTimeoutVariable {
+    MaxExecutionTime,
+    MaxStatementTime,
+}
+
 impl MysqlSessionTimeoutRestore {
     fn max_execution_time_statement(&self) -> Option<String> {
         self.max_execution_time
@@ -75,6 +81,13 @@ impl MysqlSessionTimeoutRestore {
             .map(|value| format!("SET SESSION innodb_lock_wait_timeout = {value}"))
     }
 
+    fn query_timeout_statement_for(&self, variable: MysqlQueryTimeoutVariable) -> Option<String> {
+        match variable {
+            MysqlQueryTimeoutVariable::MaxExecutionTime => self.max_execution_time_statement(),
+            MysqlQueryTimeoutVariable::MaxStatementTime => self.max_statement_time_statement(),
+        }
+    }
+
     fn timeout_variable_should_be_applied(&self, variable_name: &str) -> bool {
         match variable_name {
             "lock_wait_timeout" => self.lock_wait_timeout.is_some(),
@@ -88,19 +101,17 @@ impl MysqlSessionTimeoutRestore {
         conn: &mut C,
         db_type: DatabaseType,
     ) -> Result<(), MysqlError> {
-        mysql_timeout_provider_for(db_type)?;
+        let provider = mysql_timeout_provider_for(db_type)?;
         // Restore the exact query-timeout session variable we captured. Calling
         // the generic "timeout = None" reset here would silently erase a user's
         // pre-existing MAX_EXECUTION_TIME / max_statement_time setting.
-        let query_timeout_statement = match db_type {
-            DatabaseType::MySQL => self
-                .max_execution_time_statement()
-                .or_else(|| self.max_statement_time_statement()),
-            DatabaseType::MariaDB => self
-                .max_statement_time_statement()
-                .or_else(|| self.max_execution_time_statement()),
-            DatabaseType::Oracle => None,
-        };
+        let query_timeout_statement = self
+            .query_timeout_statement_for(provider.primary_query_timeout_variable())
+            .or_else(|| {
+                provider
+                    .fallback_query_timeout_variable()
+                    .and_then(|variable| self.query_timeout_statement_for(variable))
+            });
         // Any error from this sequence is a session-safety signal. Earlier
         // variables may already have been restored while later variables remain
         // dirty, so callers must discard the physical session on failure.
@@ -118,6 +129,10 @@ impl MysqlSessionTimeoutRestore {
 }
 
 trait MysqlTimeoutProvider: Sync {
+    fn primary_query_timeout_variable(&self) -> MysqlQueryTimeoutVariable;
+    fn fallback_query_timeout_variable(&self) -> Option<MysqlQueryTimeoutVariable> {
+        None
+    }
     fn query_timeout_statement(&self, timeout: Option<Duration>) -> String;
     fn fallback_query_timeout_statement(&self, _timeout: Option<Duration>) -> Option<String> {
         None
@@ -141,6 +156,14 @@ fn mysql_timeout_provider_for(
 }
 
 impl MysqlTimeoutProvider for MySqlTimeoutProvider {
+    fn primary_query_timeout_variable(&self) -> MysqlQueryTimeoutVariable {
+        MysqlQueryTimeoutVariable::MaxExecutionTime
+    }
+
+    fn fallback_query_timeout_variable(&self) -> Option<MysqlQueryTimeoutVariable> {
+        Some(MysqlQueryTimeoutVariable::MaxStatementTime)
+    }
+
     fn query_timeout_statement(&self, timeout: Option<Duration>) -> String {
         MysqlExecutor::mysql_timeout_statement(timeout)
     }
@@ -151,6 +174,10 @@ impl MysqlTimeoutProvider for MySqlTimeoutProvider {
 }
 
 impl MysqlTimeoutProvider for MariaDbTimeoutProvider {
+    fn primary_query_timeout_variable(&self) -> MysqlQueryTimeoutVariable {
+        MysqlQueryTimeoutVariable::MaxStatementTime
+    }
+
     fn query_timeout_statement(&self, timeout: Option<Duration>) -> String {
         MysqlExecutor::mariadb_timeout_statement(timeout)
     }
@@ -264,39 +291,65 @@ impl MysqlExecutor {
         }
     }
 
+    fn capture_session_query_timeout_restore<C: Queryable>(
+        conn: &mut C,
+        variable: MysqlQueryTimeoutVariable,
+        restore: &mut MysqlSessionTimeoutRestore,
+    ) -> Result<bool, MysqlError> {
+        match variable {
+            MysqlQueryTimeoutVariable::MaxExecutionTime => {
+                let value = Self::optional_timeout_restore_value(
+                    "MAX_EXECUTION_TIME",
+                    Self::read_session_u64_variable(conn, "MAX_EXECUTION_TIME"),
+                )?;
+                let captured = value.is_some();
+                restore.max_execution_time = value;
+                Ok(captured)
+            }
+            MysqlQueryTimeoutVariable::MaxStatementTime => {
+                let value = Self::optional_timeout_restore_string_value(
+                    "max_statement_time",
+                    Self::read_session_string_variable(conn, "max_statement_time"),
+                )?;
+                let captured = value.is_some();
+                restore.max_statement_time = value;
+                Ok(captured)
+            }
+        }
+    }
+
     fn capture_session_timeout_restore<C: Queryable>(
         conn: &mut C,
         db_type: DatabaseType,
     ) -> Result<MysqlSessionTimeoutRestore, MysqlError> {
-        let max_execution_time = if db_type == DatabaseType::MySQL {
-            Self::optional_timeout_restore_value(
-                "MAX_EXECUTION_TIME",
-                Self::read_session_u64_variable(conn, "MAX_EXECUTION_TIME"),
-            )?
-        } else {
-            None
+        let provider = mysql_timeout_provider_for(db_type)?;
+        let mut restore = MysqlSessionTimeoutRestore {
+            max_execution_time: None,
+            max_statement_time: None,
+            lock_wait_timeout: None,
+            innodb_lock_wait_timeout: None,
         };
-        let max_statement_time = if db_type == DatabaseType::MariaDB || max_execution_time.is_none()
-        {
-            Self::optional_timeout_restore_string_value(
-                "max_statement_time",
-                Self::read_session_string_variable(conn, "max_statement_time"),
-            )?
-        } else {
-            None
-        };
-        Ok(MysqlSessionTimeoutRestore {
-            max_execution_time,
-            max_statement_time,
-            lock_wait_timeout: Self::optional_timeout_restore_value(
-                "lock_wait_timeout",
-                Self::read_session_u64_variable(conn, "lock_wait_timeout"),
-            )?,
-            innodb_lock_wait_timeout: Self::optional_timeout_restore_value(
-                "innodb_lock_wait_timeout",
-                Self::read_session_u64_variable(conn, "innodb_lock_wait_timeout"),
-            )?,
-        })
+
+        let primary_captured = Self::capture_session_query_timeout_restore(
+            conn,
+            provider.primary_query_timeout_variable(),
+            &mut restore,
+        )?;
+        if !primary_captured {
+            if let Some(variable) = provider.fallback_query_timeout_variable() {
+                Self::capture_session_query_timeout_restore(conn, variable, &mut restore)?;
+            }
+        }
+
+        restore.lock_wait_timeout = Self::optional_timeout_restore_value(
+            "lock_wait_timeout",
+            Self::read_session_u64_variable(conn, "lock_wait_timeout"),
+        )?;
+        restore.innodb_lock_wait_timeout = Self::optional_timeout_restore_value(
+            "innodb_lock_wait_timeout",
+            Self::read_session_u64_variable(conn, "innodb_lock_wait_timeout"),
+        )?;
+        Ok(restore)
     }
 
     fn is_unknown_system_variable_error(err: &MysqlError, variable_name: &str) -> bool {
@@ -3133,6 +3186,34 @@ mod tests {
 
         assert_eq!(
             conn.statements,
+            vec!["SET SESSION max_statement_time = 2.500".to_string()]
+        );
+    }
+
+    #[test]
+    fn mysql_family_timeout_restore_uses_provider_query_timeout_preference() {
+        let restore = MysqlSessionTimeoutRestore {
+            max_execution_time: Some(5000),
+            max_statement_time: Some("2.500".to_string()),
+            lock_wait_timeout: None,
+            innodb_lock_wait_timeout: None,
+        };
+        let mut mysql_conn = RecordingQueryable::default();
+        let mut mariadb_conn = RecordingQueryable::default();
+
+        restore
+            .restore_for_db(&mut mysql_conn, DatabaseType::MySQL)
+            .expect("MySQL should prefer MAX_EXECUTION_TIME restore");
+        restore
+            .restore_for_db(&mut mariadb_conn, DatabaseType::MariaDB)
+            .expect("MariaDB should prefer max_statement_time restore");
+
+        assert_eq!(
+            mysql_conn.statements,
+            vec!["SET SESSION MAX_EXECUTION_TIME = 5000".to_string()]
+        );
+        assert_eq!(
+            mariadb_conn.statements,
             vec!["SET SESSION max_statement_time = 2.500".to_string()]
         );
     }

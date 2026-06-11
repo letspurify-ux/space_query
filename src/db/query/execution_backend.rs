@@ -26,6 +26,24 @@ pub struct StatementExecutionProfile {
 
 pub trait DbExecutionBackend: Sync {
     fn db_type(&self) -> DatabaseType;
+    fn profile_statement(&self, sql: &str) -> StatementExecutionProfile;
+
+    fn query_timeout_for_statement(
+        &self,
+        sql: &str,
+        query_timeout: Option<Duration>,
+    ) -> Option<Duration>;
+}
+
+struct OracleExecutionBackend;
+struct MysqlExecutionBackend {
+    db_type: DatabaseType,
+}
+
+impl DbExecutionBackend for OracleExecutionBackend {
+    fn db_type(&self) -> DatabaseType {
+        DatabaseType::Oracle
+    }
 
     fn profile_statement(&self, sql: &str) -> StatementExecutionProfile {
         statement_execution_profile_for_db_type(self.db_type(), sql)
@@ -40,20 +58,21 @@ pub trait DbExecutionBackend: Sync {
     }
 }
 
-struct OracleExecutionBackend;
-struct MysqlExecutionBackend {
-    db_type: DatabaseType,
-}
-
-impl DbExecutionBackend for OracleExecutionBackend {
-    fn db_type(&self) -> DatabaseType {
-        DatabaseType::Oracle
-    }
-}
-
 impl DbExecutionBackend for MysqlExecutionBackend {
     fn db_type(&self) -> DatabaseType {
         self.db_type
+    }
+
+    fn profile_statement(&self, sql: &str) -> StatementExecutionProfile {
+        statement_execution_profile_for_db_type(self.db_type, sql)
+    }
+
+    fn query_timeout_for_statement(
+        &self,
+        sql: &str,
+        query_timeout: Option<Duration>,
+    ) -> Option<Duration> {
+        query_timeout_for_statement_for_db_type(self.db_type, sql, query_timeout)
     }
 }
 
@@ -123,11 +142,13 @@ fn classify_mysql_result_kind(db_type: DatabaseType, sql: &str) -> StatementResu
     if normalized.is_empty() {
         return StatementResultKind::Empty;
     }
-    let display_sql = if db_type == DatabaseType::MariaDB {
-        crate::db::sql_classification::mariadb_set_statement_inner_sql(&normalized)
-            .unwrap_or_else(|| normalized.clone())
-    } else {
-        normalized.clone()
+    let display_sql = match db_type {
+        DatabaseType::MariaDB => {
+            crate::db::sql_classification::mariadb_set_statement_inner_sql(&normalized)
+                .unwrap_or_else(|| normalized.clone())
+        }
+        DatabaseType::MySQL => normalized.clone(),
+        DatabaseType::Oracle => unreachable!("Oracle statements are classified by Oracle backend"),
     };
     if QueryExecutor::is_select_statement(&display_sql) {
         return StatementResultKind::Select;

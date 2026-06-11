@@ -354,48 +354,31 @@ trait ObjectBrowserDbBehavior: Sync {
         object_type: &str,
         object_name: &str,
     ) -> Result<String, String>;
-    fn supports_package_routines(&self) -> bool {
-        false
-    }
+    fn supports_package_routines(&self) -> bool;
     fn load_package_routines(
         &self,
-        _connection: &SharedConnection,
-        _activity: String,
-        _selected_scope: Option<&str>,
+        connection: &SharedConnection,
+        activity: String,
+        selected_scope: Option<&str>,
         package_name: &str,
-    ) -> Result<Vec<PackageRoutine>, String> {
-        Err(format!(
-            "Package routines are not supported for {}",
-            package_name
-        ))
-    }
+    ) -> Result<Vec<PackageRoutine>, String>;
     fn load_package_routine_script(
         &self,
-        _connection: &SharedConnection,
-        _activity: String,
-        _selected_scope: Option<&str>,
+        connection: &SharedConnection,
+        activity: String,
+        selected_scope: Option<&str>,
         package_name: &str,
         routine_name: &str,
-        _routine_type: &str,
-    ) -> Result<RoutineScriptData, String> {
-        Err(format!(
-            "Package routine execution is not supported for {}.{}",
-            package_name, routine_name
-        ))
-    }
+        routine_type: &str,
+    ) -> Result<RoutineScriptData, String>;
     fn load_compilation_errors(
         &self,
-        _connection: &SharedConnection,
-        _activity: String,
-        _selected_scope: Option<&str>,
+        connection: &SharedConnection,
+        activity: String,
+        selected_scope: Option<&str>,
         object_name: &str,
         object_type: &str,
-    ) -> Result<(String, Vec<CompilationError>), String> {
-        Err(format!(
-            "Compilation status is not supported for {} {}",
-            object_type, object_name
-        ))
-    }
+    ) -> Result<(String, Vec<CompilationError>), String>;
     fn menu_choices_for_object_item(&self, item_info: &ObjectItem) -> Option<&'static str>;
     fn root_categories(&self, cache: &ObjectCache) -> Vec<&'static str>;
     fn load_metadata_cache(
@@ -419,9 +402,11 @@ static MYSQL_OBJECT_BROWSER_BEHAVIOR: MysqlObjectBrowserBehavior = MysqlObjectBr
 fn object_browser_behavior_for(
     db_type: crate::db::DatabaseType,
 ) -> &'static dyn ObjectBrowserDbBehavior {
-    match db_type.backend_kind() {
-        crate::db::DatabaseBackendKind::Oracle => &ORACLE_OBJECT_BROWSER_BEHAVIOR,
-        crate::db::DatabaseBackendKind::MySql => &MYSQL_OBJECT_BROWSER_BEHAVIOR,
+    match db_type {
+        crate::db::DatabaseType::Oracle => &ORACLE_OBJECT_BROWSER_BEHAVIOR,
+        crate::db::DatabaseType::MySQL | crate::db::DatabaseType::MariaDB => {
+            &MYSQL_OBJECT_BROWSER_BEHAVIOR
+        }
     }
 }
 
@@ -1757,7 +1742,7 @@ impl ObjectBrowserWidget {
                             lock_connection_with_activity(&connection, activity.clone());
                         let result = if conn_guard.connection_generation()
                             != expected_connection_generation
-                            || !conn_guard.db_type().matches(db_type)
+                            || !conn_guard.db_type().is_same_type_as(db_type)
                         {
                             Err("Scope switch was superseded by a connection change.".to_string())
                         } else {
@@ -6140,10 +6125,10 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
             crate::db::DbPoolSession::OracleThin(mut conn) => {
                 ObjectBrowser::get_thin_procedure_arguments(&mut conn, &qualified_name)?
             }
-            other => {
+            unexpected @ crate::db::DbPoolSession::MySQL { .. } => {
                 return Err(format!(
                     "Expected Oracle object action session but acquired {}",
-                    other.db_type()
+                    unexpected.db_type()
                 ))
             }
         };
@@ -6170,9 +6155,9 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
             crate::db::DbPoolSession::OracleThin(mut conn) => {
                 ObjectBrowser::get_thin_table_structure(&mut conn, &qualified_name)
             }
-            other => Err(format!(
+            unexpected @ crate::db::DbPoolSession::MySQL { .. } => Err(format!(
                 "Expected Oracle object action session but acquired {}",
-                other.db_type()
+                unexpected.db_type()
             )),
         }
     }
@@ -6193,9 +6178,9 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
             crate::db::DbPoolSession::OracleThin(mut conn) => {
                 ObjectBrowser::get_thin_table_indexes(&mut conn, &qualified_name)
             }
-            other => Err(format!(
+            unexpected @ crate::db::DbPoolSession::MySQL { .. } => Err(format!(
                 "Expected Oracle object action session but acquired {}",
-                other.db_type()
+                unexpected.db_type()
             )),
         }
     }
@@ -6216,9 +6201,9 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
             crate::db::DbPoolSession::OracleThin(mut conn) => {
                 ObjectBrowser::get_thin_table_constraints(&mut conn, &qualified_name)
             }
-            other => Err(format!(
+            unexpected @ crate::db::DbPoolSession::MySQL { .. } => Err(format!(
                 "Expected Oracle object action session but acquired {}",
-                other.db_type()
+                unexpected.db_type()
             )),
         }
     }
@@ -6249,9 +6234,9 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                     .map(ObjectInfoPayload::Sequence),
                 other => Err(format!("Unexpected object type for View Info: {other}")),
             },
-            other => Err(format!(
+            unexpected @ crate::db::DbPoolSession::MySQL { .. } => Err(format!(
                 "Expected Oracle object action session but acquired {}",
-                other.db_type()
+                unexpected.db_type()
             )),
         }
     }
@@ -6317,9 +6302,9 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                     "{other} DDL is not supported for Oracle connections"
                 )),
             },
-            other => Err(format!(
+            unexpected @ crate::db::DbPoolSession::MySQL { .. } => Err(format!(
                 "Expected Oracle object action session but acquired {}",
-                other.db_type()
+                unexpected.db_type()
             )),
         }
     }
@@ -6347,9 +6332,9 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                 crate::db::DbPoolSession::OracleThin(mut conn) => {
                     ObjectBrowser::get_thin_package_routines(&mut conn, &qualified_package)
                 }
-                other => Err(format!(
+                unexpected @ crate::db::DbPoolSession::MySQL { .. } => Err(format!(
                     "Expected Oracle object action session but acquired {}",
-                    other.db_type()
+                    unexpected.db_type()
                 )),
             },
         )
@@ -6441,9 +6426,9 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                         sql: self.build_routine_script(&qualified_name, &resolved_type, &arguments),
                     })
                 }
-                other => Err(format!(
+                unexpected @ crate::db::DbPoolSession::MySQL { .. } => Err(format!(
                     "Expected Oracle object action session but acquired {}",
-                    other.db_type()
+                    unexpected.db_type()
                 )),
             },
         )
@@ -6524,10 +6509,10 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                         }
                         (status, body_status, errors)
                     }
-                    other => {
+                    unexpected @ crate::db::DbPoolSession::MySQL { .. } => {
                         return Err(format!(
                             "Expected Oracle object action session but acquired {}",
-                            other.db_type()
+                            unexpected.db_type()
                         ))
                     }
                 };
@@ -7104,6 +7089,52 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
             )
             .map_err(|err| err.to_string()),
         }
+    }
+
+    fn supports_package_routines(&self) -> bool {
+        false
+    }
+
+    fn load_package_routines(
+        &self,
+        _connection: &SharedConnection,
+        _activity: String,
+        _selected_scope: Option<&str>,
+        package_name: &str,
+    ) -> Result<Vec<PackageRoutine>, String> {
+        Err(format!(
+            "Package routines are not supported for {}",
+            package_name
+        ))
+    }
+
+    fn load_package_routine_script(
+        &self,
+        _connection: &SharedConnection,
+        _activity: String,
+        _selected_scope: Option<&str>,
+        package_name: &str,
+        routine_name: &str,
+        _routine_type: &str,
+    ) -> Result<RoutineScriptData, String> {
+        Err(format!(
+            "Package routine execution is not supported for {}.{}",
+            package_name, routine_name
+        ))
+    }
+
+    fn load_compilation_errors(
+        &self,
+        _connection: &SharedConnection,
+        _activity: String,
+        _selected_scope: Option<&str>,
+        object_name: &str,
+        object_type: &str,
+    ) -> Result<(String, Vec<CompilationError>), String> {
+        Err(format!(
+            "Compilation status is not supported for {} {}",
+            object_type, object_name
+        ))
     }
 
     fn menu_choices_for_object_item(&self, item_info: &ObjectItem) -> Option<&'static str> {

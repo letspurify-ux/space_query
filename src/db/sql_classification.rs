@@ -52,12 +52,13 @@ impl<'a> SqlStatementAnalysis<'a> {
         } else {
             Cow::Borrowed(stripped_sql)
         };
-        let stripped_sql = if db_type == DatabaseType::MariaDB {
-            mariadb_set_statement_inner_sql_from_prepared(stripped_sql.as_ref())
-                .map(Cow::Owned)
-                .unwrap_or(stripped_sql)
-        } else {
-            stripped_sql
+        let stripped_sql = match db_type {
+            DatabaseType::MariaDB => {
+                mariadb_set_statement_inner_sql_from_prepared(stripped_sql.as_ref())
+                    .map(Cow::Owned)
+                    .unwrap_or(stripped_sql)
+            }
+            DatabaseType::MySQL | DatabaseType::Oracle => stripped_sql,
         };
         Self::from_prepared_sql(stripped_sql, mysql_compatible)
     }
@@ -693,14 +694,15 @@ fn classify_begin_sql_for_db_type(
         && words.get(1).is_some_and(|word| word == "NOT")
         && words.get(2).is_some_and(|word| word == "ATOMIC")
     {
-        if db_type == DatabaseType::MariaDB {
-            // MariaDB `BEGIN NOT ATOMIC` is an executable compound statement,
-            // not a transaction BEGIN. It can run DML, routines, and lock
-            // functions before an interrupt, so route it through the unsafe
-            // procedure/script policy instead of the Unknown discard fallback.
-            SqlKind::PlsqlOrProcedure
-        } else {
-            SqlKind::Unknown
+        match db_type {
+            DatabaseType::MariaDB => {
+                // MariaDB `BEGIN NOT ATOMIC` is an executable compound statement,
+                // not a transaction BEGIN. It can run DML, routines, and lock
+                // functions before an interrupt, so route it through the unsafe
+                // procedure/script policy instead of the Unknown discard fallback.
+                SqlKind::PlsqlOrProcedure
+            }
+            DatabaseType::MySQL | DatabaseType::Oracle => SqlKind::Unknown,
         }
     } else {
         SqlKind::TransactionControl

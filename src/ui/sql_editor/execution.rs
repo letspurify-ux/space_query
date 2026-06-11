@@ -295,9 +295,11 @@ static MYSQL_EXECUTION_WORKER_BACKEND: MysqlExecutionWorkerBackend = MysqlExecut
 fn execution_worker_backend_for(
     db_type: crate::db::DatabaseType,
 ) -> &'static dyn ExecutionWorkerBackend {
-    match db_type.backend_kind() {
-        crate::db::DatabaseBackendKind::Oracle => &ORACLE_EXECUTION_WORKER_BACKEND,
-        crate::db::DatabaseBackendKind::MySql => &MYSQL_EXECUTION_WORKER_BACKEND,
+    match db_type {
+        crate::db::DatabaseType::Oracle => &ORACLE_EXECUTION_WORKER_BACKEND,
+        crate::db::DatabaseType::MySQL | crate::db::DatabaseType::MariaDB => {
+            &MYSQL_EXECUTION_WORKER_BACKEND
+        }
     }
 }
 
@@ -2389,9 +2391,9 @@ impl SqlEditorWidget {
         )?;
         match pool_session {
             DbPoolSession::MySQL { conn, .. } => Ok(conn),
-            other => Err(format!(
+            unexpected @ (DbPoolSession::Oracle(_) | DbPoolSession::OracleThin(_)) => Err(format!(
                 "Expected MySQL pool session but acquired {}",
-                other.db_type()
+                unexpected.db_type()
             )),
         }
     }
@@ -12151,7 +12153,7 @@ impl SqlEditorWidget {
     }
 
     /// Maps a lowercased statement head to the DML keyword whose affected-row
-    /// count the server reports, matching the OCI/MySQL "row(s) affected" path.
+    /// count the server reports, matching the shared DML result-message path.
     fn oracle_thin_dml_statement_type(head: &str) -> Option<&'static str> {
         if head.starts_with("update") {
             Some("UPDATE")

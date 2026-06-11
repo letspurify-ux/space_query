@@ -138,6 +138,19 @@ pub fn retained_session_resolution_action_allowed(
     }
 }
 
+pub fn ensure_retained_session_resolution_action_allowed(
+    state: RetainedSessionState,
+    action: RetainedSessionResolutionAction,
+) -> Result<(), String> {
+    if retained_session_resolution_action_allowed(state, action) {
+        Ok(())
+    } else {
+        Err(retained_session_transaction_resolution_unavailable_message(
+            state,
+        ))
+    }
+}
+
 pub fn retained_session_transaction_action_allowed(
     state: RetainedSessionState,
     action: RetainedSessionResolutionAction,
@@ -149,6 +162,19 @@ pub fn retained_session_transaction_action_allowed(
         RetainedSessionResolutionAction::DiscardPhysical => {
             state.capabilities().can_discard_physical
         }
+    }
+}
+
+pub fn ensure_retained_session_transaction_action_allowed(
+    state: RetainedSessionState,
+    action: RetainedSessionResolutionAction,
+) -> Result<(), String> {
+    if retained_session_transaction_action_allowed(state, action) {
+        Ok(())
+    } else {
+        Err(retained_session_transaction_action_unavailable_message(
+            state,
+        ))
     }
 }
 
@@ -653,11 +679,11 @@ pub(crate) fn statement_can_cleanup_retained_session_for_preflight(
     sql: &str,
     state: RetainedSessionState,
 ) -> bool {
-    match db_type.backend_kind() {
-        crate::db::connection::DatabaseBackendKind::MySql => {
+    match db_type {
+        DatabaseType::MySQL | DatabaseType::MariaDB => {
             return mysql_statement_can_cleanup_retained_session_for_preflight(db_type, sql, state);
         }
-        crate::db::connection::DatabaseBackendKind::Oracle => {}
+        DatabaseType::Oracle => {}
     }
 
     if state.may_have_uncommitted_work() || state.transaction_state().blocks_execution() {
@@ -2632,12 +2658,17 @@ fn mysql_effective_statement_sql_for_db_type<'a>(
     db_type: DatabaseType,
     sql: &'a str,
 ) -> Cow<'a, str> {
-    if db_type == DatabaseType::MariaDB {
-        if let Some(inner_sql) = mariadb_set_statement_inner_sql(sql) {
-            return Cow::Owned(inner_sql);
+    match db_type {
+        DatabaseType::MariaDB => {
+            if let Some(inner_sql) = mariadb_set_statement_inner_sql(sql) {
+                Cow::Owned(inner_sql)
+            } else {
+                Cow::Borrowed(sql)
+            }
         }
+        DatabaseType::MySQL => Cow::Borrowed(sql),
+        DatabaseType::Oracle => unreachable!("Oracle statements are not MySQL-family statements"),
     }
-    Cow::Borrowed(sql)
 }
 
 impl TransactionIsolation {
@@ -9414,6 +9445,44 @@ mod tests {
             invalid,
             RetainedSessionResolutionAction::Commit
         ));
+    }
+
+    #[test]
+    fn retained_resolution_ensure_functions_return_canonical_policy_messages() {
+        let dirty =
+            RetainedSessionState::from_transaction_state(TransactionSessionState::DecisionRequired);
+        assert!(ensure_retained_session_resolution_action_allowed(
+            dirty,
+            RetainedSessionResolutionAction::Commit
+        )
+        .is_ok());
+
+        let residue_only = RetainedSessionState::from_parts(
+            TransactionSessionState::Clean,
+            SessionResidueState::new(true),
+            SessionLockState::default(),
+        );
+        let message = ensure_retained_session_resolution_action_allowed(
+            residue_only,
+            RetainedSessionResolutionAction::Commit,
+        )
+        .expect_err("commit must not resolve session residue without dirty transaction state");
+        assert!(
+            message.contains("cannot be resolved with commit/rollback"),
+            "unexpected message: {message}"
+        );
+
+        let invalid =
+            RetainedSessionState::from_transaction_state(TransactionSessionState::InvalidSession);
+        let message = ensure_retained_session_transaction_action_allowed(
+            invalid,
+            RetainedSessionResolutionAction::Rollback,
+        )
+        .expect_err("rollback must not run on an invalid retained physical session");
+        assert!(
+            message.contains("Cannot run commit/rollback"),
+            "unexpected message: {message}"
+        );
     }
 
     #[test]

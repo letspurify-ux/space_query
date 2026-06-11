@@ -1302,6 +1302,27 @@ fn keyword_lookup_for_dialect(dialect: crate::db::connection::SqlDialect) -> Key
     }
 }
 
+fn representative_db_type_for_format_dialect(
+    dialect: crate::db::connection::SqlDialect,
+) -> crate::db::connection::DatabaseType {
+    match dialect {
+        crate::db::connection::SqlDialect::Oracle => crate::db::connection::DatabaseType::Oracle,
+        crate::db::connection::SqlDialect::MySql => crate::db::connection::DatabaseType::MySQL,
+    }
+}
+
+pub(crate) fn format_preferred_db_type_for_sql(
+    sql: &str,
+) -> Option<crate::db::connection::DatabaseType> {
+    if sql_uses_mysql_compatible_syntax(sql) {
+        None
+    } else {
+        Some(representative_db_type_for_format_dialect(
+            crate::db::connection::SqlDialect::Oracle,
+        ))
+    }
+}
+
 pub(crate) fn is_sql_keyword_for_db(
     word: &str,
     db_type: crate::db::connection::DatabaseType,
@@ -8230,6 +8251,18 @@ mod tests {
             Some(crate::db::connection::DatabaseType::Oracle)
         ));
         assert!(sql_uses_mysql_compatible_syntax("SELECT OLD.c <=> NEW.c"));
+    }
+
+    #[test]
+    fn format_preferred_db_type_falls_back_to_named_policy() {
+        assert_eq!(
+            format_preferred_db_type_for_sql("CREATE OR REPLACE VIEW v AS SELECT * FROM t"),
+            Some(crate::db::connection::DatabaseType::Oracle)
+        );
+        assert_eq!(
+            format_preferred_db_type_for_sql("SELECT OLD.c <=> NEW.c"),
+            None
+        );
     }
 
     #[test]
