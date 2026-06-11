@@ -5323,36 +5323,19 @@ impl ResultTableWidget {
                     && Self::is_non_select_success_completion_message(&result.message)))
     }
 
+    // Message classification is DB-agnostic here (the result table does not
+    // know the originating db_type), so it delegates to the shared per-DB
+    // marker catalogs in `db::session_policy`.
     fn is_execution_abort_message(message: &str) -> bool {
-        let lowered = message.trim().to_ascii_lowercase();
-        lowered.contains("query cancelled")
-            || lowered.contains("query canceled")
-            || lowered.contains("timed out")
-            || lowered.contains("timeout")
-            || lowered.contains("ora-01013")
-            || lowered.contains("user requested cancel")
+        crate::db::session_policy::message_indicates_execution_abort(message)
     }
 
     fn is_query_cancel_message(message: &str) -> bool {
-        let lowered = message.trim().to_ascii_lowercase();
-        lowered.contains("query cancelled")
-            || lowered.contains("query canceled")
-            || lowered.contains("ora-01013")
-            || lowered.contains("user requested cancel")
+        crate::db::session_policy::message_indicates_query_cancel(message)
     }
 
     fn is_connection_loss_message(message: &str) -> bool {
-        let lowered = message.trim().to_ascii_lowercase();
-        lowered.contains("not connected")
-            || lowered.contains("connection was lost")
-            || lowered.contains("connection lost")
-            || lowered.contains("not logged on")
-            || lowered.contains("end-of-file on communication channel")
-            || lowered.contains("ora-03113")
-            || lowered.contains("ora-03114")
-            || lowered.contains("ora-03135")
-            || lowered.contains("ora-01012")
-            || lowered.contains("dpi-1010")
+        crate::db::session_policy::message_indicates_connection_loss(message)
     }
 
     fn is_non_select_success_completion_message(message: &str) -> bool {

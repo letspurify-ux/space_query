@@ -151,14 +151,9 @@ fn send_history_command(command: HistoryCommand) -> Result<(), mpsc::SendError<H
 
 fn parse_error_line(message: &str) -> Option<usize> {
     let lowercase = fold_for_case_insensitive(message);
-    let patterns = [
-        "error at line",
-        "near line",
-        "line:",
-        " at line ",
-        // Keep ORA-06512 lower priority so we prefer primary parser errors.
-        "ora-06512: at line",
-    ];
+    // DB-specific line-number patterns live in the shared per-DB catalog so a
+    // new backend cannot miss this surface.
+    let patterns = crate::db::session_policy::error_line_message_patterns();
 
     let mut best_line: Option<(usize, usize)> = None;
 

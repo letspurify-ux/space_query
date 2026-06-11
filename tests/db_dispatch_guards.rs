@@ -4,9 +4,11 @@
 //! match arms. Equality-style checks compile silently when a new backend kind
 //! or dialect is added and fall through to the wrong dialect family;
 //! exhaustive matches turn every decision site into a compile error that
-//! forces a per-site review. UI code must also avoid direct `DatabaseType`
-//! branching; UI behavior should flow through backend specs/registries so new
-//! database types cannot silently inherit an unrelated branch.
+//! forces a per-site review. Non-UI source must dispatch concrete
+//! `DatabaseType` with wildcard-free exhaustive matches; UI code must avoid
+//! direct `DatabaseType` branching entirely and flow through backend
+//! specs/registries so new database types cannot silently inherit an
+//! unrelated branch.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -221,8 +223,7 @@ fn mentions_database_type(tokens: &impl ToTokens) -> bool {
 
 fn method_call_compares_concrete_database_type(node: &ExprMethodCall) -> bool {
     node.method == "is_same_type_as"
-        && (mentions_database_type(&*node.receiver)
-            || node.args.iter().any(|arg| mentions_database_type(arg)))
+        && (mentions_database_type(&*node.receiver) || node.args.iter().any(mentions_database_type))
 }
 
 fn mentions_physical_session_enum(tokens: &impl ToTokens) -> bool {
@@ -300,6 +301,77 @@ fn pattern_swallows_new_variants(pat: &Pat) -> bool {
 fn database_type_registry_pattern_groups_variants(pat: &Pat) -> bool {
     match pat {
         Pat::Or(pat_or) => pat_or.cases.iter().any(mentions_database_type),
+        _ => false,
+    }
+}
+
+// Recursively finds wildcard/binding sub-patterns (`Some(_)`, `(x, _)`,
+// `Foo { .. }`) that swallow newly added enum variants even though the
+// top-level pattern is neither `_` nor a bare binding. Callers combine this
+// with a "does the arm mention the dispatched enum at all" check so concrete
+// arms with auxiliary wildcards (`(DatabaseType::Oracle, _)`) stay allowed.
+fn pattern_contains_swallowing_binding(pat: &Pat) -> bool {
+    if pattern_swallows_new_variants(pat) {
+        return true;
+    }
+    match pat {
+        Pat::Rest(_) => true,
+        Pat::Tuple(tuple) => tuple.elems.iter().any(pattern_contains_swallowing_binding),
+        Pat::TupleStruct(tuple_struct) => tuple_struct
+            .elems
+            .iter()
+            .any(pattern_contains_swallowing_binding),
+        Pat::Struct(pat_struct) => {
+            pat_struct.rest.is_some()
+                || pat_struct
+                    .fields
+                    .iter()
+                    .any(|field| pattern_contains_swallowing_binding(&field.pat))
+        }
+        Pat::Slice(slice) => slice.elems.iter().any(pattern_contains_swallowing_binding),
+        Pat::Or(pat_or) => pat_or.cases.iter().any(pattern_contains_swallowing_binding),
+        Pat::Paren(paren) => pattern_contains_swallowing_binding(&paren.pat),
+        Pat::Reference(reference) => pattern_contains_swallowing_binding(&reference.pat),
+        Pat::Ident(ident) => ident
+            .subpat
+            .as_ref()
+            .is_some_and(|(_, subpat)| pattern_contains_swallowing_binding(subpat)),
+        _ => false,
+    }
+}
+
+fn local_is_let_else(node: &syn::Local) -> bool {
+    node.init
+        .as_ref()
+        .is_some_and(|init| init.diverge.is_some())
+}
+
+// Physical session matches legitimately bind unexpected variants to a name
+// (`Ok(other) => warn!(other.db_type())`) so backends can reject a
+// mis-routed session with explicit diagnostics, and let-else extraction must
+// diverge. Only anonymous `_` discards silence a newly added session variant,
+// so for session enums just silent wildcards are flagged.
+fn pattern_contains_silent_wildcard(pat: &Pat) -> bool {
+    match pat {
+        Pat::Wild(_) => true,
+        Pat::Rest(_) => true,
+        Pat::Tuple(tuple) => tuple.elems.iter().any(pattern_contains_silent_wildcard),
+        Pat::TupleStruct(tuple_struct) => tuple_struct
+            .elems
+            .iter()
+            .any(pattern_contains_silent_wildcard),
+        Pat::Struct(pat_struct) => pat_struct
+            .fields
+            .iter()
+            .any(|field| pattern_contains_silent_wildcard(&field.pat)),
+        Pat::Slice(slice) => slice.elems.iter().any(pattern_contains_silent_wildcard),
+        Pat::Or(pat_or) => pat_or.cases.iter().any(pattern_contains_silent_wildcard),
+        Pat::Paren(paren) => pattern_contains_silent_wildcard(&paren.pat),
+        Pat::Reference(reference) => pattern_contains_silent_wildcard(&reference.pat),
+        Pat::Ident(ident) => ident
+            .subpat
+            .as_ref()
+            .is_some_and(|(_, subpat)| pattern_contains_silent_wildcard(subpat)),
         _ => false,
     }
 }
@@ -397,10 +469,26 @@ impl Visit<'_> for BackendKindDispatchVisitor<'_> {
         visit::visit_expr_let(self, node);
     }
 
+    fn visit_local(&mut self, node: &syn::Local) {
+        if local_is_let_else(node) && mentions_backend_kind(&node.pat) {
+            self.push_offender(
+                node.span().start().line,
+                "let-else on DatabaseBackendKind/SqlDialect".to_string(),
+            );
+        }
+        visit::visit_local(self, node);
+    }
+
     fn visit_expr_match(&mut self, node: &ExprMatch) {
-        if mentions_backend_kind(&*node.expr) {
+        // Trigger on arm patterns too: `let kind = db_type.backend_kind();
+        // match kind { ... }` must not hide wildcard arms behind an
+        // intermediate binding name the scrutinee text check cannot see.
+        let dispatches_backend_kind = mentions_backend_kind(&*node.expr)
+            || node.arms.iter().any(|arm| mentions_backend_kind(&arm.pat));
+        if dispatches_backend_kind {
             for arm in &node.arms {
-                if pattern_swallows_new_variants(&arm.pat) {
+                if !mentions_backend_kind(&arm.pat) && pattern_contains_swallowing_binding(&arm.pat)
+                {
                     self.push_offender(
                         arm.pat.span().start().line,
                         "wildcard arm in match on DatabaseBackendKind/SqlDialect".to_string(),
@@ -592,21 +680,22 @@ impl<'a> UiDatabaseTypeDispatchVisitor<'a> {
     }
 }
 
+const UI_DATABASE_TYPE_REGISTRY_FUNCTIONS: &[&str] = &[
+    "execution_worker_backend_for",
+    "explain_plan_backend_for",
+    "transaction_action_backend_for",
+    "quick_describe_backend_for",
+    "signature_backend_for",
+    "column_load_backend_for",
+    "object_browser_behavior_for",
+    "schema_metadata_loader_for",
+    "language_catalog_for_db_type",
+    "function_catalog_for_db_type",
+    "mysql_compatible_highlight_mode",
+];
+
 fn ui_database_type_registry_function(name: &str) -> bool {
-    matches!(
-        name,
-        "execution_worker_backend_for"
-            | "explain_plan_backend_for"
-            | "transaction_action_backend_for"
-            | "quick_describe_backend_for"
-            | "signature_backend_for"
-            | "column_load_backend_for"
-            | "object_browser_behavior_for"
-            | "schema_metadata_loader_for"
-            | "language_catalog_for_db_type"
-            | "function_catalog_for_db_type"
-            | "mysql_compatible_highlight_mode"
-    )
+    UI_DATABASE_TYPE_REGISTRY_FUNCTIONS.contains(&name)
 }
 
 impl Visit<'_> for UiDatabaseTypeDispatchVisitor<'_> {
@@ -677,13 +766,25 @@ impl Visit<'_> for UiDatabaseTypeDispatchVisitor<'_> {
         visit::visit_expr_let(self, node);
     }
 
+    fn visit_local(&mut self, node: &syn::Local) {
+        if local_is_let_else(node) && mentions_database_type(&node.pat) {
+            self.push_offender(
+                node.span().start().line,
+                "let-else on DatabaseType in UI code".to_string(),
+            );
+        }
+        visit::visit_local(self, node);
+    }
+
     fn visit_expr_match(&mut self, node: &ExprMatch) {
         let match_mentions_database_type =
             node.arms.iter().any(|arm| mentions_database_type(&arm.pat));
         if match_mentions_database_type {
             if self.database_type_registry_depth > 0 {
                 for arm in &node.arms {
-                    if pattern_swallows_new_variants(&arm.pat) {
+                    if !mentions_database_type(&arm.pat)
+                        && pattern_contains_swallowing_binding(&arm.pat)
+                    {
                         self.push_offender(
                             arm.pat.span().start().line,
                             "wildcard arm in UI DatabaseType backend registry match".to_string(),
@@ -807,12 +908,24 @@ impl Visit<'_> for DbDatabaseTypeDispatchVisitor<'_> {
         visit::visit_expr_let(self, node);
     }
 
+    fn visit_local(&mut self, node: &syn::Local) {
+        if local_is_let_else(node) && mentions_database_type(&node.pat) {
+            self.push_offender(
+                node.span().start().line,
+                "let-else on DatabaseType in db code".to_string(),
+            );
+        }
+        visit::visit_local(self, node);
+    }
+
     fn visit_expr_match(&mut self, node: &ExprMatch) {
         let match_mentions_database_type =
             node.arms.iter().any(|arm| mentions_database_type(&arm.pat));
         if match_mentions_database_type {
             for arm in &node.arms {
-                if pattern_swallows_new_variants(&arm.pat) {
+                if !mentions_database_type(&arm.pat)
+                    && pattern_contains_swallowing_binding(&arm.pat)
+                {
                     self.push_offender(
                         arm.pat.span().start().line,
                         "wildcard arm in match on DatabaseType in db code".to_string(),
@@ -906,7 +1019,10 @@ impl Visit<'_> for PhysicalSessionEnumDispatchVisitor<'_> {
             .any(|arm| mentions_physical_session_enum(&arm.pat));
         if match_mentions_physical_session_enum {
             for arm in &node.arms {
-                if pattern_swallows_new_variants(&arm.pat) {
+                if !mentions_physical_session_enum(&arm.pat)
+                    && (pattern_swallows_new_variants(&arm.pat)
+                        || pattern_contains_silent_wildcard(&arm.pat))
+                {
                     self.push_offender(
                         arm.pat.span().start().line,
                         "wildcard arm in match on physical DB session enum".to_string(),
@@ -992,6 +1108,362 @@ fn collect_shared_result_message_literal_offenders(
     visitor.offenders
 }
 
+// Driver-specific error-code markers (`ORA-`, `DPI-`) hardcoded in generic UI
+// classify only that one backend's errors; a new DB's equivalents would be
+// silently unclassified. Generic UI must delegate message classification to
+// the per-DB marker catalogs in `db::session_policy`
+// (`message_indicates_query_cancel`, `message_indicates_connection_loss`,
+// `error_line_message_patterns`), whose exhaustive `DatabaseType` matches
+// force a decision per backend.
+fn driver_error_marker_prefixes() -> &'static [&'static str] {
+    &["ora-", "dpi-"]
+}
+
+struct DriverErrorMarkerLiteralVisitor<'a> {
+    path: &'a str,
+    offenders: Vec<BackendKindDispatchOffender>,
+}
+
+impl<'a> DriverErrorMarkerLiteralVisitor<'a> {
+    fn new(path: &'a str) -> Self {
+        Self {
+            path,
+            offenders: Vec::new(),
+        }
+    }
+
+    fn push_offender(&mut self, line: usize, value: &str) {
+        self.offenders.push(BackendKindDispatchOffender {
+            path: self.path.to_string(),
+            line,
+            pattern: format!("driver error marker literal `{value}`"),
+        });
+    }
+}
+
+impl Visit<'_> for DriverErrorMarkerLiteralVisitor<'_> {
+    fn visit_item_mod(&mut self, node: &ItemMod) {
+        if attrs_are_test_only(&node.attrs) {
+            return;
+        }
+        visit::visit_item_mod(self, node);
+    }
+
+    fn visit_item_fn(&mut self, node: &ItemFn) {
+        if attrs_are_test_only(&node.attrs) {
+            return;
+        }
+        visit::visit_item_fn(self, node);
+    }
+
+    fn visit_lit_str(&mut self, node: &LitStr) {
+        let value = node.value().to_ascii_lowercase();
+        if driver_error_marker_prefixes()
+            .iter()
+            .any(|marker| value.contains(marker))
+        {
+            self.push_offender(node.span().start().line, &node.value());
+        }
+    }
+}
+
+fn collect_driver_error_marker_literal_offenders(
+    content: &str,
+    path: &str,
+) -> Vec<BackendKindDispatchOffender> {
+    let parsed = match syn::parse_file(content) {
+        Ok(parsed) => parsed,
+        Err(err) => panic!("failed to parse source file {path}: {err}"),
+    };
+    let mut visitor = DriverErrorMarkerLiteralVisitor::new(path);
+    visitor.visit_file(&parsed);
+    visitor.offenders
+}
+
+// The dispatch guards above recognize decision sites textually
+// (`DatabaseType`, `backend_kind`, ...). Renaming the enum at the import or a
+// type alias (`use DatabaseType as Dt`, `type Dt = DatabaseType`) or
+// importing variants directly (`use DatabaseType::Oracle`) would let `match
+// Dt::Oracle`/`match Oracle` bypass every one of them, so those import shapes
+// are banned outright in non-test source.
+fn dispatch_enum_names() -> &'static [&'static str] {
+    &[
+        "DatabaseType",
+        "DatabaseBackendKind",
+        "SqlDialect",
+        "DbConnection",
+        "DbConnectionPool",
+        "DbPoolSession",
+        "DbSessionLease",
+    ]
+}
+
+fn type_path_is_dispatch_enum(ty: &Type) -> Option<String> {
+    let Type::Path(type_path) = ty else {
+        return None;
+    };
+    let segment = type_path.path.segments.last()?;
+    if !segment.arguments.is_none() {
+        return None;
+    }
+    let ident = segment.ident.to_string();
+    dispatch_enum_names()
+        .iter()
+        .any(|name| *name == ident)
+        .then_some(ident)
+}
+
+struct DispatchEnumAliasImportVisitor<'a> {
+    path: &'a str,
+    offenders: Vec<BackendKindDispatchOffender>,
+}
+
+impl<'a> DispatchEnumAliasImportVisitor<'a> {
+    fn new(path: &'a str) -> Self {
+        Self {
+            path,
+            offenders: Vec::new(),
+        }
+    }
+
+    fn push_offender(&mut self, line: usize, pattern: String) {
+        self.offenders.push(BackendKindDispatchOffender {
+            path: self.path.to_string(),
+            line,
+            pattern,
+        });
+    }
+
+    fn check_use_tree(&mut self, tree: &syn::UseTree) {
+        match tree {
+            syn::UseTree::Path(use_path) => {
+                let ident = use_path.ident.to_string();
+                if dispatch_enum_names().iter().any(|name| *name == ident) {
+                    self.push_offender(
+                        use_path.ident.span().start().line,
+                        format!("variant or glob import under `{ident}::`"),
+                    );
+                } else {
+                    self.check_use_tree(&use_path.tree);
+                }
+            }
+            syn::UseTree::Rename(rename) => {
+                let ident = rename.ident.to_string();
+                if dispatch_enum_names().iter().any(|name| *name == ident) {
+                    self.push_offender(
+                        rename.ident.span().start().line,
+                        format!("alias import `{ident} as {}`", rename.rename),
+                    );
+                }
+            }
+            syn::UseTree::Group(group) => {
+                for item in &group.items {
+                    self.check_use_tree(item);
+                }
+            }
+            syn::UseTree::Name(_) | syn::UseTree::Glob(_) => {}
+        }
+    }
+}
+
+impl Visit<'_> for DispatchEnumAliasImportVisitor<'_> {
+    fn visit_item_mod(&mut self, node: &ItemMod) {
+        if attrs_are_test_only(&node.attrs) {
+            return;
+        }
+        visit::visit_item_mod(self, node);
+    }
+
+    fn visit_item_fn(&mut self, node: &ItemFn) {
+        if attrs_are_test_only(&node.attrs) {
+            return;
+        }
+        visit::visit_item_fn(self, node);
+    }
+
+    fn visit_item_use(&mut self, node: &syn::ItemUse) {
+        self.check_use_tree(&node.tree);
+        visit::visit_item_use(self, node);
+    }
+
+    fn visit_item_type(&mut self, node: &syn::ItemType) {
+        if let Some(enum_name) = type_path_is_dispatch_enum(&node.ty) {
+            self.push_offender(
+                node.ident.span().start().line,
+                format!("type alias `{}` of dispatch enum `{enum_name}`", node.ident),
+            );
+        }
+        visit::visit_item_type(self, node);
+    }
+
+    fn visit_impl_item_type(&mut self, node: &syn::ImplItemType) {
+        if let Some(enum_name) = type_path_is_dispatch_enum(&node.ty) {
+            self.push_offender(
+                node.ident.span().start().line,
+                format!(
+                    "associated type `{}` aliasing dispatch enum `{enum_name}`",
+                    node.ident
+                ),
+            );
+        }
+        visit::visit_impl_item_type(self, node);
+    }
+}
+
+fn collect_dispatch_enum_alias_import_offenders(
+    content: &str,
+    path: &str,
+) -> Vec<BackendKindDispatchOffender> {
+    let parsed = match syn::parse_file(content) {
+        Ok(parsed) => parsed,
+        Err(err) => panic!("failed to parse source file {path}: {err}"),
+    };
+    let mut visitor = DispatchEnumAliasImportVisitor::new(path);
+    visitor.visit_file(&parsed);
+    visitor.offenders
+}
+
+// Inside `impl DatabaseType { ... }` (or any dispatch enum impl), variant
+// patterns can be written as `Self::Oracle`, which none of the text-based
+// dispatch guards can attribute to the enum. Such impls must spell out the
+// full enum name in patterns so every other guard keeps seeing them.
+struct DispatchEnumImplSelfPatternVisitor<'a> {
+    path: &'a str,
+    dispatch_enum_impl_depth: usize,
+    offenders: Vec<BackendKindDispatchOffender>,
+}
+
+impl<'a> DispatchEnumImplSelfPatternVisitor<'a> {
+    fn new(path: &'a str) -> Self {
+        Self {
+            path,
+            dispatch_enum_impl_depth: 0,
+            offenders: Vec::new(),
+        }
+    }
+
+    fn push_offender(&mut self, line: usize, pattern: String) {
+        self.offenders.push(BackendKindDispatchOffender {
+            path: self.path.to_string(),
+            line,
+            pattern,
+        });
+    }
+
+    fn in_dispatch_enum_impl(&self) -> bool {
+        self.dispatch_enum_impl_depth > 0
+    }
+}
+
+fn impl_self_ty_is_dispatch_enum(ty: &Type) -> bool {
+    match ty {
+        Type::Path(type_path) => type_path.path.segments.last().is_some_and(|segment| {
+            dispatch_enum_names()
+                .iter()
+                .any(|name| segment.ident == name)
+        }),
+        _ => false,
+    }
+}
+
+fn pattern_mentions_self_path(tokens: &impl ToTokens) -> bool {
+    tokens.to_token_stream().to_string().contains("Self ::")
+}
+
+impl Visit<'_> for DispatchEnumImplSelfPatternVisitor<'_> {
+    fn visit_item_mod(&mut self, node: &ItemMod) {
+        if attrs_are_test_only(&node.attrs) {
+            return;
+        }
+        visit::visit_item_mod(self, node);
+    }
+
+    fn visit_item_fn(&mut self, node: &ItemFn) {
+        if attrs_are_test_only(&node.attrs) {
+            return;
+        }
+        visit::visit_item_fn(self, node);
+    }
+
+    fn visit_item_impl(&mut self, node: &syn::ItemImpl) {
+        if attrs_are_test_only(&node.attrs) {
+            return;
+        }
+        let saved_depth = self.dispatch_enum_impl_depth;
+        if impl_self_ty_is_dispatch_enum(&node.self_ty) {
+            self.dispatch_enum_impl_depth += 1;
+        } else {
+            // A nested impl of another type rebinds `Self`, so its patterns
+            // must not inherit the outer dispatch-enum context.
+            self.dispatch_enum_impl_depth = 0;
+        }
+        visit::visit_item_impl(self, node);
+        self.dispatch_enum_impl_depth = saved_depth;
+    }
+
+    fn visit_arm(&mut self, node: &syn::Arm) {
+        if self.in_dispatch_enum_impl() && pattern_mentions_self_path(&node.pat) {
+            self.push_offender(
+                node.pat.span().start().line,
+                "Self:: match pattern inside dispatch enum impl".to_string(),
+            );
+        }
+        visit::visit_arm(self, node);
+    }
+
+    fn visit_expr_let(&mut self, node: &ExprLet) {
+        if self.in_dispatch_enum_impl() && pattern_mentions_self_path(&node.pat) {
+            self.push_offender(
+                node.span().start().line,
+                "Self:: if-let pattern inside dispatch enum impl".to_string(),
+            );
+        }
+        visit::visit_expr_let(self, node);
+    }
+
+    fn visit_local(&mut self, node: &syn::Local) {
+        if self.in_dispatch_enum_impl()
+            && local_is_let_else(node)
+            && pattern_mentions_self_path(&node.pat)
+        {
+            self.push_offender(
+                node.span().start().line,
+                "Self:: let-else pattern inside dispatch enum impl".to_string(),
+            );
+        }
+        visit::visit_local(self, node);
+    }
+
+    fn visit_macro(&mut self, node: &Macro) {
+        let is_matches = node
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "matches");
+        if self.in_dispatch_enum_impl() && is_matches && node.tokens.to_string().contains("Self ::")
+        {
+            self.push_offender(
+                node.span().start().line,
+                "matches! with Self:: pattern inside dispatch enum impl".to_string(),
+            );
+        }
+        visit::visit_macro(self, node);
+    }
+}
+
+fn collect_dispatch_enum_impl_self_pattern_offenders(
+    content: &str,
+    path: &str,
+) -> Vec<BackendKindDispatchOffender> {
+    let parsed = match syn::parse_file(content) {
+        Ok(parsed) => parsed,
+        Err(err) => panic!("failed to parse source file {path}: {err}"),
+    };
+    let mut visitor = DispatchEnumImplSelfPatternVisitor::new(path);
+    visitor.visit_file(&parsed);
+    visitor.offenders
+}
+
 struct BackendTraitDefaultMethodVisitor<'a> {
     path: &'a str,
     trait_names: &'a [&'a str],
@@ -1025,7 +1497,7 @@ impl<'a> BackendTraitDefaultMethodVisitor<'a> {
         self.allowed_default_methods
             .iter()
             .find(|(allowed_trait, _)| *allowed_trait == trait_name)
-            .is_some_and(|(_, methods)| methods.iter().any(|method| *method == method_name))
+            .is_some_and(|(_, methods)| methods.contains(&method_name))
     }
 }
 
@@ -1078,10 +1550,13 @@ fn collect_backend_trait_default_method_offenders(
     visitor.offenders
 }
 
+/// `(trait name, allowed default method names)` pairs for one source file.
+type TraitDefaultMethodAllowlist<'a> = &'a [(&'a str, &'a [&'a str])];
+
 fn collect_backend_trait_unapproved_default_method_offenders(
     content: &str,
     path: &str,
-    allowed_default_methods: &[(&str, &[&str])],
+    allowed_default_methods: TraitDefaultMethodAllowlist,
 ) -> Vec<BackendKindDispatchOffender> {
     let parsed = match syn::parse_file(content) {
         Ok(parsed) => parsed,
@@ -1368,13 +1843,14 @@ fn non_test_ui_source_uses_backend_specs_instead_of_direct_database_type_dispatc
 }
 
 #[test]
-fn non_test_db_source_dispatches_database_type_with_exhaustive_match_only() {
+fn non_test_non_ui_source_dispatches_database_type_with_exhaustive_match_only() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let db_root = manifest_dir.join("src").join("db");
+    let src_root = manifest_dir.join("src");
+    let ui_root = src_root.join("ui");
 
     let mut offenders = Vec::new();
-    for file in collect_rust_files(&db_root) {
-        if is_test_source_file(&file) {
+    for file in collect_rust_files(&src_root) {
+        if file.starts_with(&ui_root) || is_test_source_file(&file) {
             continue;
         }
 
@@ -1395,12 +1871,106 @@ fn non_test_db_source_dispatches_database_type_with_exhaustive_match_only() {
 
     assert!(
         offenders.is_empty(),
-        "found non-exhaustive DatabaseType dispatch in non-test db source files; \
+        "found non-exhaustive DatabaseType dispatch in non-test non-UI source files; \
          use an exhaustive `match db_type {{ ... }}` without wildcard arms so \
          adding a new database type forces every concrete semantic decision to \
-         be reviewed: {:?}",
+         be reviewed (UI code is held to the stricter backend-spec/registry rule): {:?}",
         offenders
     );
+}
+
+#[test]
+fn non_test_source_does_not_alias_or_variant_import_dispatch_enums() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let src_root = manifest_dir.join("src");
+
+    let mut offenders = Vec::new();
+    for file in collect_rust_files(&src_root) {
+        if is_test_source_file(&file) {
+            continue;
+        }
+
+        let content = match fs::read_to_string(&file) {
+            Ok(content) => content,
+            Err(err) => panic!("failed to read source file {}: {err}", file.display()),
+        };
+        let relative_path = match file.strip_prefix(manifest_dir) {
+            Ok(path) => path.display().to_string(),
+            Err(err) => panic!("failed to relativize {}: {err}", file.display()),
+        };
+
+        offenders.extend(collect_dispatch_enum_alias_import_offenders(
+            &content,
+            &relative_path,
+        ));
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "found alias/variant imports of dispatch enums in non-test source files; \
+         the dispatch guards recognize decision sites by the enum names, so \
+         `use ... as`, `type ... =`, and `use DatabaseType::...` imports would \
+         let new-variant fallthrough bypass every guard: {:?}",
+        offenders
+    );
+}
+
+#[test]
+fn non_test_source_does_not_use_self_patterns_inside_dispatch_enum_impls() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let src_root = manifest_dir.join("src");
+
+    let mut offenders = Vec::new();
+    for file in collect_rust_files(&src_root) {
+        if is_test_source_file(&file) {
+            continue;
+        }
+
+        let content = match fs::read_to_string(&file) {
+            Ok(content) => content,
+            Err(err) => panic!("failed to read source file {}: {err}", file.display()),
+        };
+        let relative_path = match file.strip_prefix(manifest_dir) {
+            Ok(path) => path.display().to_string(),
+            Err(err) => panic!("failed to relativize {}: {err}", file.display()),
+        };
+
+        offenders.extend(collect_dispatch_enum_impl_self_pattern_offenders(
+            &content,
+            &relative_path,
+        ));
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "found `Self::` variant patterns inside dispatch enum impls in non-test source; \
+         spell out the full enum name (`DatabaseType::Oracle`, `DbPoolSession::MySQL`) \
+         so the text-based dispatch guards keep seeing every decision site: {:?}",
+        offenders
+    );
+}
+
+#[test]
+fn database_type_cache_keys_are_unique_and_round_trip() {
+    use space_query::db::DatabaseType;
+
+    let mut seen: Vec<(u8, DatabaseType)> = Vec::new();
+    for db_type in DatabaseType::ALL {
+        let key = db_type.cache_key();
+        if let Some((_, previous)) = seen.iter().find(|(existing, _)| *existing == key) {
+            panic!(
+                "cache_key {key} is shared by {previous:?} and {db_type:?}; \
+                 per-DB intellisense caches and persisted db-type slots would collide, \
+                 so every DatabaseType variant must declare a distinct cache_key"
+            );
+        }
+        seen.push((key, db_type));
+        assert_eq!(
+            DatabaseType::from_cache_key(key),
+            db_type,
+            "from_cache_key must round-trip every DatabaseType variant"
+        );
+    }
 }
 
 #[test]
@@ -1511,7 +2081,7 @@ fn backend_traits_with_required_policy_have_no_default_method_bodies() {
 #[test]
 fn core_backend_traits_allow_only_documented_derived_default_methods() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let checks: &[(&str, &[(&str, &[&str])])] = &[
+    let checks: &[(&str, TraitDefaultMethodAllowlist)] = &[
         (
             "src/db/connection.rs",
             &[(
@@ -1562,41 +2132,66 @@ fn core_backend_traits_allow_only_documented_derived_default_methods() {
     );
 }
 
+const BACKEND_REGISTRY_FILES: &[(&str, &[&str])] = &[
+    ("src/db/connection.rs", &["backend_for"]),
+    (
+        "src/db/query/execution_backend.rs",
+        &["db_execution_backend_for"],
+    ),
+    (
+        "src/db/transaction.rs",
+        &["statement_session_post_processor_for"],
+    ),
+    (
+        "src/ui/sql_editor/execution.rs",
+        &["execution_worker_backend_for"],
+    ),
+    (
+        "src/ui/sql_editor/mod.rs",
+        &["explain_plan_backend_for", "transaction_action_backend_for"],
+    ),
+    ("src/ui/main_window.rs", &["schema_metadata_loader_for"]),
+    (
+        "src/ui/sql_editor/intellisense/popup.rs",
+        &["quick_describe_backend_for", "signature_backend_for"],
+    ),
+    (
+        "src/ui/sql_editor/intellisense/helpers.rs",
+        &["column_load_backend_for"],
+    ),
+    ("src/ui/object_browser.rs", &["object_browser_behavior_for"]),
+    ("src/ui/intellisense.rs", &["language_catalog_for_db_type"]),
+    (
+        "src/ui/syntax_highlight.rs",
+        &[
+            "function_catalog_for_db_type",
+            "mysql_compatible_highlight_mode",
+        ],
+    ),
+];
+
+#[test]
+fn ui_registry_allowlist_functions_are_all_required_registry_functions() {
+    for name in UI_DATABASE_TYPE_REGISTRY_FUNCTIONS {
+        let required = BACKEND_REGISTRY_FILES
+            .iter()
+            .any(|(_, functions)| functions.contains(name));
+        assert!(
+            required,
+            "UI DatabaseType registry allowlist function `{name}` is missing from \
+             BACKEND_REGISTRY_FILES; every allowlisted registry must also be required \
+             to exist and dispatch on concrete DatabaseType, otherwise deleting or \
+             family-shortcutting it would go unnoticed"
+        );
+    }
+}
+
 #[test]
 fn backend_registry_functions_dispatch_on_concrete_database_type() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let registry_files: &[(&str, &[&str])] = &[
-        ("src/db/connection.rs", &["backend_for"]),
-        (
-            "src/db/query/execution_backend.rs",
-            &["db_execution_backend_for"],
-        ),
-        (
-            "src/db/transaction.rs",
-            &["statement_session_post_processor_for"],
-        ),
-        (
-            "src/ui/sql_editor/execution.rs",
-            &["execution_worker_backend_for"],
-        ),
-        (
-            "src/ui/sql_editor/mod.rs",
-            &["explain_plan_backend_for", "transaction_action_backend_for"],
-        ),
-        ("src/ui/main_window.rs", &["schema_metadata_loader_for"]),
-        (
-            "src/ui/sql_editor/intellisense/popup.rs",
-            &["quick_describe_backend_for", "signature_backend_for"],
-        ),
-        (
-            "src/ui/sql_editor/intellisense/helpers.rs",
-            &["column_load_backend_for"],
-        ),
-        ("src/ui/object_browser.rs", &["object_browser_behavior_for"]),
-    ];
 
     let mut offenders = Vec::new();
-    for (relative_path, function_names) in registry_files {
+    for (relative_path, function_names) in BACKEND_REGISTRY_FILES {
         let path = manifest_dir.join(relative_path);
         let content = match fs::read_to_string(&path) {
             Ok(content) => content,
@@ -1896,6 +2491,79 @@ fn shared_result_messages_are_emitted_through_result_messages_module() {
 }
 
 #[test]
+fn ui_source_does_not_hardcode_driver_error_markers() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let ui_root = manifest_dir.join("src/ui");
+
+    let mut offenders = Vec::new();
+    for file in collect_rust_files(&ui_root) {
+        if is_test_source_file(&file) {
+            continue;
+        }
+
+        let relative_path = match file.strip_prefix(manifest_dir) {
+            Ok(path) => path.display().to_string(),
+            Err(err) => panic!("failed to relativize {}: {err}", file.display()),
+        };
+        // The per-backend execution worker implementations live here; their
+        // backend-specific error handling legitimately names driver markers.
+        if relative_path == "src/ui/sql_editor/execution.rs" {
+            continue;
+        }
+
+        let content = match fs::read_to_string(&file) {
+            Ok(content) => content,
+            Err(err) => panic!("failed to read source file {}: {err}", file.display()),
+        };
+
+        offenders.extend(collect_driver_error_marker_literal_offenders(
+            &content,
+            &relative_path,
+        ));
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "found driver-specific error markers hardcoded in generic UI; \
+         delegate message classification to the per-DB catalogs in \
+         db::session_policy (message_indicates_query_cancel, \
+         message_indicates_connection_loss, error_line_message_patterns) so a \
+         new database type cannot be silently unclassified: {:?}",
+        offenders
+    );
+}
+
+#[test]
+fn guard_detects_driver_error_marker_literal() {
+    let offenders = collect_driver_error_marker_literal_offenders(
+        r#"
+        fn is_cancel(message: &str) -> bool {
+            message.to_ascii_lowercase().contains("ora-01013")
+        }
+        "#,
+        "snippet.rs",
+    );
+    assert_eq!(offenders.len(), 1, "offenders: {:?}", offenders);
+}
+
+#[test]
+fn guard_allows_driver_error_marker_literal_in_test_only_items() {
+    let offenders = collect_driver_error_marker_literal_offenders(
+        r#"
+        #[cfg(test)]
+        mod tests {
+            #[test]
+            fn classifies_cancel() {
+                assert!(is_cancel("ORA-01013: user requested cancel"));
+            }
+        }
+        "#,
+        "snippet.rs",
+    );
+    assert!(offenders.is_empty(), "offenders: {:?}", offenders);
+}
+
+#[test]
 fn guard_detects_equality_comparison_on_backend_kind() {
     let offenders = collect_backend_kind_dispatch_offenders(
         r#"
@@ -2178,6 +2846,187 @@ fn db_guard_allows_exhaustive_database_type_match() {
 }
 
 #[test]
+fn db_guard_detects_nested_wildcard_arm_in_option_database_type_match() {
+    let offenders = collect_db_database_type_dispatch_offenders(
+        r#"
+        fn f(db_type: Option<DatabaseType>) -> bool {
+            match db_type {
+                Some(DatabaseType::Oracle) => true,
+                Some(_) => false,
+                None => false,
+            }
+        }
+        "#,
+        "src/db/snippet.rs",
+    );
+    assert_eq!(offenders.len(), 1, "offenders: {:?}", offenders);
+}
+
+#[test]
+fn db_guard_detects_nested_wildcard_arm_in_tuple_database_type_match() {
+    let offenders = collect_db_database_type_dispatch_offenders(
+        r#"
+        fn f(db_type: DatabaseType, flag: bool) -> bool {
+            match (db_type, flag) {
+                (DatabaseType::Oracle, _) => true,
+                (_, true) => false,
+                (other, false) => other.is_relational(),
+            }
+        }
+        "#,
+        "src/db/snippet.rs",
+    );
+    assert_eq!(offenders.len(), 2, "offenders: {:?}", offenders);
+}
+
+#[test]
+fn db_guard_detects_let_else_on_database_type() {
+    let offenders = collect_db_database_type_dispatch_offenders(
+        r#"
+        fn f(db_type: DatabaseType) -> bool {
+            let DatabaseType::Oracle = db_type else {
+                return false;
+            };
+            true
+        }
+        "#,
+        "src/db/snippet.rs",
+    );
+    assert_eq!(offenders.len(), 1, "offenders: {:?}", offenders);
+}
+
+#[test]
+fn db_guard_allows_plain_let_with_database_type_annotation() {
+    let offenders = collect_db_database_type_dispatch_offenders(
+        r#"
+        fn f(info: &ConnectionInfo) -> DatabaseType {
+            let db_type: DatabaseType = info.db_type;
+            db_type
+        }
+        "#,
+        "src/db/snippet.rs",
+    );
+    assert!(offenders.is_empty(), "offenders: {:?}", offenders);
+}
+
+#[test]
+fn alias_guard_detects_alias_variant_and_type_alias_imports() {
+    let offenders = collect_dispatch_enum_alias_import_offenders(
+        r#"
+use crate::db::connection::DatabaseType as Dt;
+use crate::db::connection::DatabaseType::Oracle;
+use crate::db::connection::{
+    DatabaseConnection,
+    DatabaseBackendKind as Kind,
+};
+use crate::db::DbPoolSession::*;
+pub(crate) type Kind2 = crate::db::connection::DatabaseType;
+"#,
+        "src/snippet.rs",
+    );
+    assert_eq!(offenders.len(), 5, "offenders: {:?}", offenders);
+}
+
+#[test]
+fn alias_guard_allows_plain_imports_and_generic_aliases() {
+    let offenders = collect_dispatch_enum_alias_import_offenders(
+        r#"
+use crate::db::connection::DatabaseType;
+use crate::db::connection::DatabaseConnection;
+use crate::db::connection::*;
+type SharedDbTypes = Vec<DatabaseType>;
+
+fn f() {
+    use crate::db::connection::DatabaseType;
+    let _ = DatabaseType::default();
+}
+"#,
+        "src/snippet.rs",
+    );
+    assert!(offenders.is_empty(), "offenders: {:?}", offenders);
+}
+
+#[test]
+fn self_pattern_guard_detects_self_patterns_inside_dispatch_enum_impl() {
+    let offenders = collect_dispatch_enum_impl_self_pattern_offenders(
+        r#"
+        impl DatabaseType {
+            fn is_oracle(self) -> bool {
+                matches!(self, Self::Oracle)
+            }
+
+            fn family(self) -> u8 {
+                match self {
+                    Self::Oracle => 0,
+                    Self::MySQL | Self::MariaDB => 1,
+                }
+            }
+        }
+        "#,
+        "src/db/snippet.rs",
+    );
+    assert_eq!(offenders.len(), 3, "offenders: {:?}", offenders);
+}
+
+#[test]
+fn self_pattern_guard_allows_full_enum_names_and_other_impls() {
+    let offenders = collect_dispatch_enum_impl_self_pattern_offenders(
+        r#"
+        impl DatabaseType {
+            fn family(self) -> u8 {
+                match self {
+                    DatabaseType::Oracle => 0,
+                    DatabaseType::MySQL | DatabaseType::MariaDB => 1,
+                }
+            }
+        }
+
+        impl OracleDriverMode {
+            fn is_thin(self) -> bool {
+                matches!(self, Self::Thin)
+            }
+        }
+        "#,
+        "src/db/snippet.rs",
+    );
+    assert!(offenders.is_empty(), "offenders: {:?}", offenders);
+}
+
+#[test]
+fn guard_detects_wildcard_arm_behind_intermediate_backend_kind_binding() {
+    let offenders = collect_backend_kind_dispatch_offenders(
+        r#"
+        fn f(db_type: DatabaseType) -> bool {
+            let kind = db_type.backend_kind();
+            match kind {
+                DatabaseBackendKind::MySql => true,
+                _ => false,
+            }
+        }
+        "#,
+        "snippet.rs",
+    );
+    assert_eq!(offenders.len(), 1, "offenders: {:?}", offenders);
+}
+
+#[test]
+fn db_guard_detects_rest_pattern_arm_in_option_database_type_match() {
+    let offenders = collect_db_database_type_dispatch_offenders(
+        r#"
+        fn f(db_type: Option<DatabaseType>) -> bool {
+            match db_type {
+                Some(DatabaseType::Oracle) => true,
+                Some(..) => false,
+                None => false,
+            }
+        }
+        "#,
+        "src/db/snippet.rs",
+    );
+    assert_eq!(offenders.len(), 1, "offenders: {:?}", offenders);
+}
+
+#[test]
 fn database_type_all_guard_detects_missing_variant() {
     let content = r#"
         pub enum DatabaseType {
@@ -2240,6 +3089,49 @@ fn physical_session_guard_detects_if_let_on_session_enum() {
         "src/db/snippet.rs",
     );
     assert_eq!(offenders.len(), 1, "offenders: {:?}", offenders);
+}
+
+#[test]
+fn physical_session_guard_detects_silent_nested_wildcard_arm() {
+    let offenders = collect_physical_session_enum_dispatch_offenders(
+        r#"
+        fn f(result: Result<DbPoolSession, String>) -> bool {
+            match result {
+                Ok(DbPoolSession::Oracle(_)) => true,
+                Ok(_) => false,
+                Err(err) => {
+                    log(err);
+                    false
+                }
+            }
+        }
+        "#,
+        "src/db/snippet.rs",
+    );
+    assert_eq!(offenders.len(), 1, "offenders: {:?}", offenders);
+}
+
+#[test]
+fn physical_session_guard_allows_named_binding_mismatch_arm() {
+    let offenders = collect_physical_session_enum_dispatch_offenders(
+        r#"
+        fn f(result: Result<DbPoolSession, String>) -> bool {
+            match result {
+                Ok(DbPoolSession::Oracle(_)) => true,
+                Ok(other) => {
+                    warn(other.db_type());
+                    false
+                }
+                Err(err) => {
+                    log(err);
+                    false
+                }
+            }
+        }
+        "#,
+        "src/db/snippet.rs",
+    );
+    assert!(offenders.is_empty(), "offenders: {:?}", offenders);
 }
 
 #[test]

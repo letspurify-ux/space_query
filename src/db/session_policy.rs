@@ -782,6 +782,112 @@ fn has_fatal_connection_marker(lower: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
+/// Driver-specific markers that identify a user-initiated cancel in raw error
+/// text. Executors normalize confirmed cancels to
+/// `result_messages::QUERY_CANCELLED`, but raw driver messages can still reach
+/// generic UI surfaces (e.g. the result table) that do not know the
+/// originating db_type. Exhaustive per-DB match so adding a backend forces a
+/// marker decision here instead of leaving the new DB's cancels unclassified.
+fn query_cancel_markers_for_db_type(db_type: DatabaseType) -> &'static [&'static str] {
+    match db_type {
+        DatabaseType::Oracle => &["ora-01013", "user requested cancel"],
+        DatabaseType::MySQL | DatabaseType::MariaDB => {
+            // ERROR 1317 (KILL QUERY) and the "query was killed" prose form.
+            &["query execution was interrupted", "query was killed"]
+        }
+    }
+}
+
+/// Driver-specific markers that identify a lost/dead connection in messages
+/// shown to generic UI. Display-level classification: narrower than the
+/// fail-closed session-reuse list in `has_fatal_connection_marker`, which
+/// deliberately also treats timeouts and pool-acquire failures as fatal.
+fn connection_loss_markers_for_db_type(db_type: DatabaseType) -> &'static [&'static str] {
+    match db_type {
+        DatabaseType::Oracle => &[
+            "not logged on",
+            "end-of-file on communication channel",
+            "ora-01012",
+            "ora-03113",
+            "ora-03114",
+            "ora-03135",
+            "dpi-1010",
+        ],
+        DatabaseType::MySQL | DatabaseType::MariaDB => &[
+            "lost connection",
+            "server has gone away",
+            "server has closed the connection",
+            "server closed the connection",
+            "connection was killed",
+            "communications link failure",
+            "error 2006",
+            "error 2013",
+        ],
+    }
+}
+
+/// Driver-specific patterns that locate an error line number in error text.
+/// Per-DB patterns rank below the shared parser patterns returned first by
+/// `error_line_message_patterns`.
+fn error_line_patterns_for_db_type(db_type: DatabaseType) -> &'static [&'static str] {
+    match db_type {
+        // ORA-06512 stack frames stay lower priority than primary parser
+        // errors that also carry a line number.
+        DatabaseType::Oracle => &["ora-06512: at line"],
+        // MySQL/MariaDB report "... at line N", covered by shared patterns.
+        DatabaseType::MySQL | DatabaseType::MariaDB => &[],
+    }
+}
+
+/// Ordered (highest priority first) lowercase patterns for extracting an
+/// error line number from any backend's error message.
+pub fn error_line_message_patterns() -> Vec<&'static str> {
+    let mut patterns = vec!["error at line", "near line", "line:", " at line "];
+    for db_type in DatabaseType::ALL {
+        patterns.extend(error_line_patterns_for_db_type(db_type));
+    }
+    patterns
+}
+
+fn lower_matches_any_db_marker(
+    lower: &str,
+    markers_for: fn(DatabaseType) -> &'static [&'static str],
+) -> bool {
+    DatabaseType::ALL
+        .iter()
+        .flat_map(|db_type| markers_for(*db_type))
+        .any(|marker| lower.contains(marker))
+}
+
+/// DB-agnostic classifier for generic UI: does this message report a
+/// user-initiated cancel on any backend?
+pub fn message_indicates_query_cancel(message: &str) -> bool {
+    let lower = message.trim().to_ascii_lowercase();
+    lower.contains(&crate::db::query::result_messages::QUERY_CANCELLED.to_ascii_lowercase())
+        || lower.contains("query canceled")
+        || lower_matches_any_db_marker(&lower, query_cancel_markers_for_db_type)
+}
+
+/// DB-agnostic classifier for generic UI: cancel or timeout — the statement
+/// was aborted before producing a normal result.
+pub fn message_indicates_execution_abort(message: &str) -> bool {
+    if message_indicates_query_cancel(message) {
+        return true;
+    }
+    let lower = message.trim().to_ascii_lowercase();
+    lower.contains("timed out") || lower.contains("timeout")
+}
+
+/// DB-agnostic classifier for generic UI: does this message report a lost or
+/// dead connection on any backend?
+pub fn message_indicates_connection_loss(message: &str) -> bool {
+    let lower = message.trim().to_ascii_lowercase();
+    lower.contains("not connected")
+        || lower.contains("connection was lost")
+        || lower.contains("connection lost")
+        || lower_matches_any_db_marker(&lower, connection_loss_markers_for_db_type)
+}
+
 /// SQL classifier used to populate `CancelTargetSnapshot::sql_kind` and the
 /// `decide_session_after_interrupt` `sql_kind` field (session.md §6).
 pub fn classify_sql(sql: &str) -> SqlKind {
@@ -3123,5 +3229,72 @@ mod tests {
             DatabaseType::MySQL,
             "Error 3024 (HY000) ER_QUERY_TIMEOUT: query timed out after 1 second",
         ));
+    }
+
+    #[test]
+    fn query_cancel_classifier_covers_every_backend_marker() {
+        assert!(message_indicates_query_cancel("Query cancelled"));
+        assert!(message_indicates_query_cancel(
+            "ORA-01013: user requested cancel of current operation"
+        ));
+        assert!(message_indicates_query_cancel(
+            "ERROR 1317 (70100): Query execution was interrupted"
+        ));
+        assert!(message_indicates_query_cancel("Query was killed"));
+        assert!(!message_indicates_query_cancel(
+            "ORA-00942: table or view does not exist"
+        ));
+        assert!(!message_indicates_query_cancel(
+            "ERROR 1064 (42000): You have an error in your SQL syntax"
+        ));
+    }
+
+    #[test]
+    fn execution_abort_classifier_adds_timeouts_to_cancels() {
+        assert!(message_indicates_execution_abort(
+            "Query timed out after 5 seconds"
+        ));
+        assert!(message_indicates_execution_abort(
+            "ERROR 3024 (HY000): Query execution was interrupted, maximum statement execution time exceeded"
+        ));
+        assert!(!message_indicates_execution_abort(
+            "ORA-00001: unique constraint violated"
+        ));
+    }
+
+    #[test]
+    fn connection_loss_classifier_covers_every_backend_marker() {
+        assert!(message_indicates_connection_loss(
+            "ORA-03114: not connected to ORACLE"
+        ));
+        assert!(message_indicates_connection_loss(
+            "ORA-01012: not logged on"
+        ));
+        assert!(message_indicates_connection_loss(
+            "ERROR 2013 (HY000): Lost connection to MySQL server during query"
+        ));
+        assert!(message_indicates_connection_loss(
+            "ERROR 2006 (HY000): MySQL server has gone away"
+        ));
+        assert!(!message_indicates_connection_loss(
+            "ORA-00942: table or view does not exist"
+        ));
+        assert!(!message_indicates_connection_loss(
+            "ERROR 1205 (HY000): Lock wait timeout exceeded"
+        ));
+    }
+
+    #[test]
+    fn error_line_patterns_rank_shared_parser_patterns_above_db_specific_frames() {
+        let patterns = error_line_message_patterns();
+        let shared_pos = patterns
+            .iter()
+            .position(|pattern| *pattern == " at line ")
+            .expect("shared pattern present");
+        let oracle_pos = patterns
+            .iter()
+            .position(|pattern| *pattern == "ora-06512: at line")
+            .expect("oracle stack-frame pattern present");
+        assert!(shared_pos < oracle_pos);
     }
 }

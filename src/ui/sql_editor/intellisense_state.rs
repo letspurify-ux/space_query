@@ -85,7 +85,7 @@ impl IntellisenseRuntimeState {
             keyup_debounce_generation: Arc::new(Mutex::new(0_u64)),
             keyup_debounce_handle: Arc::new(Mutex::new(None::<app::TimeoutHandle>)),
             cached_db_type: Arc::new(AtomicU8::new(
-                crate::db::connection::DatabaseType::Oracle.cache_key(),
+                crate::db::connection::DatabaseType::default().cache_key(),
             )),
         }
     }
