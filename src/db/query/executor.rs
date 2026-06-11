@@ -16,8 +16,8 @@ use crate::sql_text;
 use crate::utils::logging;
 
 use super::{
-    ColumnInfo, ProcedureArgument, QueryCell, QueryResult, ResolvedBind, ScriptItem,
-    StatementResultKind, ToolCommand,
+    result_messages, ColumnInfo, ProcedureArgument, QueryCell, QueryResult, ResolvedBind,
+    ScriptItem, StatementResultKind, ToolCommand,
 };
 
 pub struct QueryExecutor;
@@ -1196,7 +1196,7 @@ impl QueryExecutor {
         if sql_clean.is_empty() {
             return Ok(QueryResult::new_non_select_success(
                 sql,
-                "No statements to execute",
+                result_messages::NO_STATEMENTS,
                 start.elapsed(),
             ));
         }
@@ -1243,7 +1243,7 @@ impl QueryExecutor {
                 }
                 Ok(QueryResult::new_non_select_success(
                     &sql_clean,
-                    "Commit complete",
+                    result_messages::COMMIT_COMPLETE,
                     start.elapsed(),
                 ))
             }
@@ -1260,7 +1260,7 @@ impl QueryExecutor {
                 }
                 Ok(QueryResult::new_non_select_success(
                     &sql_clean,
-                    "Rollback complete",
+                    result_messages::ROLLBACK_COMPLETE,
                     start.elapsed(),
                 ))
             }
@@ -1346,7 +1346,7 @@ impl QueryExecutor {
         if statements.is_empty() {
             return Ok(QueryResult::new_non_select_success(
                 sql,
-                "No statements to execute",
+                result_messages::NO_STATEMENTS,
                 Duration::from_secs(0),
             ));
         }
@@ -1464,7 +1464,7 @@ impl QueryExecutor {
             return Ok((
                 QueryResult::new_non_select_success(
                     sql,
-                    "No statements to execute",
+                    result_messages::NO_STATEMENTS,
                     Duration::from_secs(0),
                 ),
                 false,
@@ -2974,7 +2974,7 @@ impl QueryExecutor {
         } else if sql_upper.starts_with("COMMENT") {
             "Comment added".to_string()
         } else {
-            "Statement executed successfully".to_string()
+            result_messages::STATEMENT_EXECUTED.to_string()
         }
     }
 
@@ -3262,7 +3262,7 @@ impl QueryExecutor {
         let execution_time = start.elapsed();
         Ok(QueryResult::new_non_select_success(
             sql,
-            "PL/SQL block executed successfully",
+            result_messages::PLSQL_BLOCK_EXECUTED,
             execution_time,
         ))
     }
@@ -3283,7 +3283,7 @@ impl QueryExecutor {
         let execution_time = start.elapsed();
         Ok(QueryResult::new_non_select_success(
             sql,
-            "Call completed",
+            result_messages::CALL_EXECUTED,
             execution_time,
         ))
     }
@@ -3310,7 +3310,7 @@ impl QueryExecutor {
         let execution_time = start.elapsed();
         Ok(QueryResult::new_non_select_success(
             sql,
-            "PL/SQL block executed successfully",
+            result_messages::PLSQL_BLOCK_EXECUTED,
             execution_time,
         ))
     }

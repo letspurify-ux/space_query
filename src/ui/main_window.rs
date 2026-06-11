@@ -9740,7 +9740,7 @@ mod tests {
         let mut no_column_select =
             QueryResult::new_select("select 1 into @v", Vec::new(), Vec::new(), Duration::ZERO);
         no_column_select.row_count = 2;
-        no_column_select.message = "SELECT executed.".to_string();
+        no_column_select.message = "Statement executed successfully".to_string();
         assert_progress_routes_only(
             "select-like completion without columns but with row count",
             QueryProgress::StatementFinished {

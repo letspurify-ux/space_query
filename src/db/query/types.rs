@@ -64,6 +64,34 @@ pub struct ProcedureArgument {
     pub default_value: Option<String>,
 }
 
+/// User-facing result messages shared by every database backend so the same
+/// operation reports the same text regardless of DB type or protocol.
+pub mod result_messages {
+    pub const COMMIT_COMPLETE: &str = "Commit complete";
+    pub const ROLLBACK_COMPLETE: &str = "Rollback complete";
+    pub const CALL_EXECUTED: &str = "Call executed successfully";
+    pub const PLSQL_BLOCK_EXECUTED: &str = "PL/SQL block executed successfully";
+    pub const STATEMENT_EXECUTED: &str = "Statement executed successfully";
+    pub const QUERY_CANCELLED: &str = "Query cancelled";
+    pub const NO_STATEMENTS: &str = "No statements to execute";
+
+    /// Feedback for session-scope switches: Oracle `ALTER SESSION SET
+    /// CURRENT_SCHEMA` ("schema") and MySQL/MariaDB `USE` ("database").
+    pub fn current_scope_changed(scope: &str, name: &str) -> String {
+        format!("Current {scope} changed to {name}.")
+    }
+
+    /// Transaction feedback appended to successful DML/PL-SQL results on
+    /// every backend.
+    pub fn with_transaction_feedback(message: &str, auto_commit: bool) -> String {
+        if auto_commit {
+            format!("{message} | Auto-commit applied")
+        } else {
+            format!("{message} | Commit required")
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct QueryResult {
     #[allow(dead_code)]
@@ -319,6 +347,30 @@ impl QueryResult {
             execution_time,
             message: format!("{} {} row(s) affected", statement_type, affected_rows),
             is_select: false,
+            success: true,
+        }
+    }
+
+    pub fn new_dml_returning(
+        sql: &str,
+        columns: Vec<ColumnInfo>,
+        rows: Vec<Vec<String>>,
+        affected_rows: u64,
+        execution_time: Duration,
+        statement_type: &str,
+    ) -> Self {
+        let returned_rows = rows.len();
+        Self {
+            sql: sql.to_string(),
+            columns,
+            rows,
+            row_count: returned_rows,
+            execution_time,
+            message: format!(
+                "{} {} row(s) affected, {} row(s) returned",
+                statement_type, affected_rows, returned_rows
+            ),
+            is_select: true,
             success: true,
         }
     }

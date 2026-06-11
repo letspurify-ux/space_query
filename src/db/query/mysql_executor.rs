@@ -10,7 +10,7 @@ use crate::sql_text;
 use super::executor::{
     ConstraintInfo, ForeignKeyInfo, IndexInfo, QueryExecutor, TableColumnDetail,
 };
-use super::types::{ColumnInfo, ProcedureArgument, QueryCell, QueryResult};
+use super::types::{result_messages, ColumnInfo, ProcedureArgument, QueryCell, QueryResult};
 
 pub struct MysqlExecutor;
 
@@ -558,7 +558,7 @@ impl MysqlExecutor {
                 conn.query_drop(Self::transaction_control_sql_to_execute(sql, "COMMIT"))?;
                 Ok(vec![QueryResult::new_non_select_success(
                     sql,
-                    "Commit complete.",
+                    result_messages::COMMIT_COMPLETE,
                     start.elapsed(),
                 )])
             }
@@ -567,7 +567,7 @@ impl MysqlExecutor {
                 conn.query_drop(Self::transaction_control_sql_to_execute(sql, "ROLLBACK"))?;
                 Ok(vec![QueryResult::new_non_select_success(
                     sql,
-                    "Rollback complete.",
+                    result_messages::ROLLBACK_COMPLETE,
                     start.elapsed(),
                 )])
             }
@@ -602,7 +602,7 @@ impl MysqlExecutor {
             columns,
             rows,
             execution_time,
-            message: "Query cancelled".to_string(),
+            message: result_messages::QUERY_CANCELLED.to_string(),
             is_select: true,
             success: false,
         }
@@ -653,7 +653,7 @@ impl MysqlExecutor {
             }
             return Ok(QueryResult::new_non_select_success(
                 sql,
-                "SELECT executed.",
+                result_messages::STATEMENT_EXECUTED,
                 start.elapsed(),
             ));
         }
@@ -818,20 +818,14 @@ impl MysqlExecutor {
         }
 
         if let Some((columns, rows)) = returning {
-            let returned_rows = rows.len();
-            return QueryResult {
-                sql: sql.to_string(),
+            return QueryResult::new_dml_returning(
+                sql,
                 columns,
                 rows,
-                row_count: returned_rows,
+                affected_rows,
                 execution_time,
-                message: format!(
-                    "{} {} row(s) affected, {} row(s) returned",
-                    stmt_type, affected_rows, returned_rows
-                ),
-                is_select: true,
-                success: true,
-            };
+                stmt_type,
+            );
         }
 
         QueryResult::new_dml(sql, affected_rows, execution_time, stmt_type)
@@ -840,16 +834,9 @@ impl MysqlExecutor {
     fn execute_ddl<C: Queryable>(conn: &mut C, sql: &str) -> Result<QueryResult, MysqlError> {
         let start = Instant::now();
         conn.query_drop(sql)?;
-        let trimmed = sql.trim();
-        let stmt_type = trimmed
-            .split_whitespace()
-            .take(2)
-            .collect::<Vec<_>>()
-            .join(" ")
-            .to_ascii_uppercase();
         Ok(QueryResult::new_non_select_success(
             sql,
-            format!("{} executed.", stmt_type),
+            QueryExecutor::ddl_message(sql),
             start.elapsed(),
         ))
     }
@@ -881,7 +868,7 @@ impl MysqlExecutor {
         if !info.is_empty() {
             return Some(QueryResult::new_non_select_success(
                 sql,
-                format!("CALL executed. {}", info),
+                format!("{} | {}", result_messages::CALL_EXECUTED, info),
                 execution_time,
             ));
         }
@@ -890,7 +877,7 @@ impl MysqlExecutor {
     }
 
     fn default_call_result(sql: &str, execution_time: Duration) -> QueryResult {
-        QueryResult::new_non_select_success(sql, "CALL executed.", execution_time)
+        QueryResult::new_non_select_success(sql, result_messages::CALL_EXECUTED, execution_time)
     }
 
     fn materialize_call_results(
@@ -1069,7 +1056,7 @@ impl MysqlExecutor {
     }
 
     fn current_database_changed_message(database: &str) -> String {
-        format!("Current database changed to {database}.")
+        result_messages::current_scope_changed("database", database)
     }
 
     fn skip_to_next_line(bytes: &[u8], mut index: usize) -> usize {
@@ -3595,7 +3582,7 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert!(!results[0].is_select);
-        assert_eq!(results[0].message, "CALL executed.");
+        assert_eq!(results[0].message, "Call executed successfully");
     }
 
     #[test]

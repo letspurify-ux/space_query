@@ -34,10 +34,11 @@ use tns_thin::{OracleDateTime, OracleThinCancelHandle, OracleThinSession};
 
 use crate::db::{
     cache_pool_session_context_for_shared_connection,
-    clear_pool_session_context_for_shared_connection, lock_connection_with_activity, BindDataType,
-    BindValue, BindVar, ColumnInfo, CursorResult, DbPoolSession, DbSessionLease, ObjectBrowser,
-    QueryCell, QueryExecutor, QueryResult, ResolvedBind, RetainedSessionState, ScriptItem,
-    SessionState, SharedDbSessionLease, ToolCommand, TransactionSessionState,
+    clear_pool_session_context_for_shared_connection, lock_connection_with_activity,
+    result_messages, BindDataType, BindValue, BindVar, ColumnInfo, CursorResult, DbPoolSession,
+    DbSessionLease, ObjectBrowser, QueryCell, QueryExecutor, QueryResult, ResolvedBind,
+    RetainedSessionState, ScriptItem, SessionState, SharedDbSessionLease, ToolCommand,
+    TransactionSessionState,
 };
 use crate::sql_text;
 use crate::utils::arithmetic::{safe_div, safe_rem};
@@ -5650,11 +5651,7 @@ impl SqlEditorWidget {
             return;
         }
 
-        if auto_commit {
-            result.message = format!("{} | Auto-commit applied", result.message);
-        } else {
-            result.message = format!("{} | Commit required", result.message);
-        }
+        result.message = result_messages::with_transaction_feedback(&result.message, auto_commit);
     }
 
     pub(super) fn mysql_auto_commit_for_execution(
@@ -5926,6 +5923,7 @@ impl SqlEditorWidget {
             match item {
                 ScriptItem::ToolCommand(command) => {
                     let mut command_error = false;
+                    let confirmation = SqlEditorWidget::tool_command_confirmation(&command);
                     match command {
                         ToolCommand::Prompt { text } => {
                             SqlEditorWidget::emit_script_output(sender, session, vec![text]);
@@ -6079,62 +6077,35 @@ impl SqlEditorWidget {
                                     poisoned.into_inner().break_column = Some(key.clone());
                                 }
                             }
-                            SqlEditorWidget::emit_script_message(
-                                sender,
-                                session,
-                                "BREAK",
-                                &format!("BREAK ON {}", key),
-                            );
                         }
-                        ToolCommand::BreakOff | ToolCommand::ClearBreaks => {
-                            match session.lock() {
-                                Ok(mut guard) => guard.break_column = None,
-                                Err(poisoned) => {
-                                    eprintln!(
-                                        "Warning: session state lock was poisoned; recovering."
-                                    );
-                                    poisoned.into_inner().break_column = None;
-                                }
+                        ToolCommand::BreakOff | ToolCommand::ClearBreaks => match session.lock() {
+                            Ok(mut guard) => guard.break_column = None,
+                            Err(poisoned) => {
+                                eprintln!("Warning: session state lock was poisoned; recovering.");
+                                poisoned.into_inner().break_column = None;
                             }
-                            SqlEditorWidget::emit_script_message(
-                                sender,
-                                session,
-                                "BREAK",
-                                "BREAK OFF",
-                            );
-                        }
+                        },
                         ToolCommand::Compute {
                             mode,
                             of_column,
                             on_column,
-                        } => {
-                            match session.lock() {
-                                Ok(mut guard) => {
-                                    guard.compute = Some(crate::db::ComputeConfig {
-                                        mode,
-                                        of_column: of_column.clone(),
-                                        on_column: on_column.clone(),
-                                    });
-                                }
-                                Err(poisoned) => {
-                                    eprintln!(
-                                        "Warning: session state lock was poisoned; recovering."
-                                    );
-                                    poisoned.into_inner().compute =
-                                        Some(crate::db::ComputeConfig {
-                                            mode,
-                                            of_column: of_column.clone(),
-                                            on_column: on_column.clone(),
-                                        });
-                                }
+                        } => match session.lock() {
+                            Ok(mut guard) => {
+                                guard.compute = Some(crate::db::ComputeConfig {
+                                    mode,
+                                    of_column: of_column.clone(),
+                                    on_column: on_column.clone(),
+                                });
                             }
-                            SqlEditorWidget::emit_script_message(
-                                sender,
-                                session,
-                                "COMPUTE",
-                                "COMPUTE configured",
-                            );
-                        }
+                            Err(poisoned) => {
+                                eprintln!("Warning: session state lock was poisoned; recovering.");
+                                poisoned.into_inner().compute = Some(crate::db::ComputeConfig {
+                                    mode,
+                                    of_column: of_column.clone(),
+                                    on_column: on_column.clone(),
+                                });
+                            }
+                        },
                         ToolCommand::ComputeOff | ToolCommand::ClearComputes => {
                             match session.lock() {
                                 Ok(mut guard) => guard.compute = None,
@@ -6145,35 +6116,19 @@ impl SqlEditorWidget {
                                     poisoned.into_inner().compute = None;
                                 }
                             }
-                            SqlEditorWidget::emit_script_message(
-                                sender,
-                                session,
-                                "COMPUTE",
-                                "COMPUTE OFF",
-                            );
                         }
-                        ToolCommand::ClearBreaksComputes => {
-                            match session.lock() {
-                                Ok(mut guard) => {
-                                    guard.break_column = None;
-                                    guard.compute = None;
-                                }
-                                Err(poisoned) => {
-                                    eprintln!(
-                                        "Warning: session state lock was poisoned; recovering."
-                                    );
-                                    let mut guard = poisoned.into_inner();
-                                    guard.break_column = None;
-                                    guard.compute = None;
-                                }
+                        ToolCommand::ClearBreaksComputes => match session.lock() {
+                            Ok(mut guard) => {
+                                guard.break_column = None;
+                                guard.compute = None;
                             }
-                            SqlEditorWidget::emit_script_message(
-                                sender,
-                                session,
-                                "CLEAR",
-                                "BREAKS and COMPUTES cleared",
-                            );
-                        }
+                            Err(poisoned) => {
+                                eprintln!("Warning: session state lock was poisoned; recovering.");
+                                let mut guard = poisoned.into_inner();
+                                guard.break_column = None;
+                                guard.compute = None;
+                            }
+                        },
                         ToolCommand::SetErrorContinue { enabled } => {
                             match session.lock() {
                                 Ok(mut guard) => guard.continue_on_error = enabled,
@@ -6185,12 +6140,6 @@ impl SqlEditorWidget {
                                 }
                             }
                             continue_on_error = enabled;
-                            SqlEditorWidget::emit_script_message(
-                                sender,
-                                session,
-                                "SET ERRORCONTINUE",
-                                &format!("ERRORCONTINUE {}", if enabled { "ON" } else { "OFF" }),
-                            );
                         }
                         ToolCommand::SetAutoCommit { enabled } => {
                             let prior_auto_commit = auto_commit;
@@ -6249,11 +6198,7 @@ impl SqlEditorWidget {
                                         sender,
                                         session,
                                         "SET AUTOCOMMIT",
-                                        if enabled {
-                                            "Auto-commit enabled"
-                                        } else {
-                                            "Auto-commit disabled"
-                                        },
+                                        SqlEditorWidget::autocommit_feedback(enabled),
                                     );
                                     #[rustfmt::skip]
                                     store_mutex_bool_option(mysql_auto_commit_override, Some(enabled));
@@ -6397,65 +6342,27 @@ impl SqlEditorWidget {
                                 poisoned.into_inner().null_text = null_text;
                             }
                         },
-                        ToolCommand::Spool { path, append } => match path {
-                            Some(path) => {
-                                let target_path = if Path::new(&path).is_absolute() {
-                                    PathBuf::from(&path)
-                                } else {
-                                    current_frame_base_dir.join(&path)
-                                };
-                                match session.lock() {
-                                    Ok(mut guard) => {
-                                        guard.spool_path = Some(target_path.clone());
-                                        guard.spool_truncate = !append;
-                                    }
-                                    Err(poisoned) => {
-                                        eprintln!(
-                                            "Warning: session state lock was poisoned; recovering."
-                                        );
-                                        let mut guard = poisoned.into_inner();
-                                        guard.spool_path = Some(target_path.clone());
-                                        guard.spool_truncate = !append;
-                                    }
-                                }
-                                SqlEditorWidget::emit_script_message(
-                                    sender,
-                                    session,
-                                    "SPOOL",
-                                    &format!(
-                                        "Spooling output to {} ({})",
-                                        target_path.display(),
-                                        if append { "append" } else { "replace" }
-                                    ),
-                                );
-                            }
-                            None if append => match SqlEditorWidget::has_spool_target(session) {
-                                true => SqlEditorWidget::emit_script_message(
-                                    sender,
-                                    session,
-                                    "SPOOL",
-                                    "Spool switched to append mode",
+                        ToolCommand::Spool { path, append } => {
+                            match SqlEditorWidget::apply_spool_command(
+                                session,
+                                path,
+                                append,
+                                &current_frame_base_dir,
+                            ) {
+                                Ok(message) => SqlEditorWidget::emit_script_message(
+                                    sender, session, "SPOOL", &message,
                                 ),
-                                false => {
+                                Err(message) => {
                                     SqlEditorWidget::emit_script_message(
                                         sender,
                                         session,
                                         "SPOOL",
-                                        "Error: SPOOL APPEND requires an active spool target.",
+                                        &format!("Error: {message}"),
                                     );
                                     command_error = true;
                                 }
-                            },
-                            None => match session.lock() {
-                                Ok(mut guard) => guard.spool_path = None,
-                                Err(poisoned) => {
-                                    eprintln!(
-                                        "Warning: session state lock was poisoned; recovering."
-                                    );
-                                    poisoned.into_inner().spool_path = None;
-                                }
-                            },
-                        },
+                            }
+                        }
                         ToolCommand::WheneverSqlError { exit, .. } => {
                             match session.lock() {
                                 Ok(mut guard) => guard.continue_on_error = !exit,
@@ -6880,6 +6787,11 @@ impl SqlEditorWidget {
                                 "Error: This command is only supported for Oracle connections.",
                             );
                             command_error = true;
+                        }
+                    }
+                    if !command_error {
+                        if let Some((label, message)) = confirmation {
+                            SqlEditorWidget::emit_script_message(sender, session, label, &message);
                         }
                     }
 
@@ -7947,6 +7859,8 @@ impl SqlEditorWidget {
                     match item {
                         ScriptItem::ToolCommand(command) => {
                             let mut command_error = false;
+                            let confirmation =
+                                SqlEditorWidget::tool_command_confirmation(&command);
                             match command {
                                 ToolCommand::Var { name, data_type } => {
                                     let normalized = SessionState::normalize_name(&name);
@@ -8447,176 +8361,8 @@ impl SqlEditorWidget {
                                     }
                                 }
                                 ToolCommand::ShowAll => {
-                                    let (
-                                        server_output,
-                                        define_enabled,
-                                        define_char,
-                                        scan_enabled,
-                                        verify_enabled,
-                                        echo_enabled,
-                                        timing_enabled,
-                                        feedback_enabled,
-                                        heading_enabled,
-                                        pagesize,
-                                        linesize,
-                                        trimspool_enabled,
-                                        trimout_enabled,
-                                        sqlblanklines_enabled,
-                                        tab_enabled,
-                                        colsep,
-                                        null_text,
-                                        break_column,
-                                        compute_config,
-                                        continue_on_error,
-                                        spool_path,
-                                    ) = match session.lock() {
-                                        Ok(guard) => (
-                                            guard.server_output.clone(),
-                                            guard.define_enabled,
-                                            guard.define_char,
-                                            guard.scan_enabled,
-                                            guard.verify_enabled,
-                                            guard.echo_enabled,
-                                            guard.timing_enabled,
-                                            guard.feedback_enabled,
-                                            guard.heading_enabled,
-                                            guard.pagesize,
-                                            guard.linesize,
-                                            guard.trimspool_enabled,
-                                            guard.trimout_enabled,
-                                            guard.sqlblanklines_enabled,
-                                            guard.tab_enabled,
-                                            guard.colsep.clone(),
-                                            guard.null_text.clone(),
-                                            guard.break_column.clone(),
-                                            guard.compute.clone(),
-                                            guard.continue_on_error,
-                                            guard.spool_path.clone(),
-                                        ),
-                                        Err(poisoned) => {
-                                            eprintln!(
-                                            "Warning: session state lock was poisoned; recovering."
-                                        );
-                                            let guard = poisoned.into_inner();
-                                            (
-                                                guard.server_output.clone(),
-                                                guard.define_enabled,
-                                                guard.define_char,
-                                                guard.scan_enabled,
-                                                guard.verify_enabled,
-                                                guard.echo_enabled,
-                                                guard.timing_enabled,
-                                                guard.feedback_enabled,
-                                                guard.heading_enabled,
-                                                guard.pagesize,
-                                                guard.linesize,
-                                                guard.trimspool_enabled,
-                                                guard.trimout_enabled,
-                                                guard.sqlblanklines_enabled,
-                                                guard.tab_enabled,
-                                                guard.colsep.clone(),
-                                                guard.null_text.clone(),
-                                                guard.break_column.clone(),
-                                                guard.compute.clone(),
-                                                guard.continue_on_error,
-                                                guard.spool_path.clone(),
-                                            )
-                                        }
-                                    };
-
-                                    let autocommit_enabled = auto_commit;
-
-                                    let serveroutput_line = if server_output.enabled {
-                                        if server_output.size == 0 {
-                                            "SERVEROUTPUT ON SIZE UNLIMITED".to_string()
-                                        } else {
-                                            format!("SERVEROUTPUT ON SIZE {}", server_output.size)
-                                        }
-                                    } else {
-                                        "SERVEROUTPUT OFF".to_string()
-                                    };
-
-                                    let spool_line = match spool_path {
-                                        Some(path) => format!("SPOOL {}", path.display()),
-                                        None => "SPOOL OFF".to_string(),
-                                    };
-
-                                    let lines = vec![
-                                        format!(
-                                            "AUTOCOMMIT {}",
-                                            if autocommit_enabled { "ON" } else { "OFF" }
-                                        ),
-                                        serveroutput_line,
-                                        if define_enabled {
-                                            format!("DEFINE '{}'", define_char)
-                                        } else {
-                                            "DEFINE OFF".to_string()
-                                        },
-                                        format!("SCAN {}", if scan_enabled { "ON" } else { "OFF" }),
-                                        format!(
-                                            "VERIFY {}",
-                                            if verify_enabled { "ON" } else { "OFF" }
-                                        ),
-                                        format!("ECHO {}", if echo_enabled { "ON" } else { "OFF" }),
-                                        format!(
-                                            "TIMING {}",
-                                            if timing_enabled { "ON" } else { "OFF" }
-                                        ),
-                                        format!(
-                                            "FEEDBACK {}",
-                                            if feedback_enabled { "ON" } else { "OFF" }
-                                        ),
-                                        format!(
-                                            "HEADING {}",
-                                            if heading_enabled { "ON" } else { "OFF" }
-                                        ),
-                                        format!("PAGESIZE {}", pagesize),
-                                        format!("LINESIZE {}", linesize),
-                                        format!(
-                                            "TRIMSPOOL {}",
-                                            if trimspool_enabled { "ON" } else { "OFF" }
-                                        ),
-                                        format!(
-                                            "TRIMOUT {}",
-                                            if trimout_enabled { "ON" } else { "OFF" }
-                                        ),
-                                        format!(
-                                            "SQLBLANKLINES {}",
-                                            if sqlblanklines_enabled { "ON" } else { "OFF" }
-                                        ),
-                                        format!("TAB {}", if tab_enabled { "ON" } else { "OFF" }),
-                                        format!("COLSEP {}", colsep),
-                                        format!("NULL {}", null_text),
-                                        match break_column {
-                                            Some(column) => format!("BREAK ON {}", column),
-                                            None => "BREAK OFF".to_string(),
-                                        },
-                                        match compute_config {
-                                            Some(config) => {
-                                                let mode_text = match config.mode {
-                                                    crate::db::ComputeMode::Sum => "SUM",
-                                                    crate::db::ComputeMode::Count => "COUNT",
-                                                };
-                                                match (
-                                                    config.of_column.as_deref(),
-                                                    config.on_column.as_deref(),
-                                                ) {
-                                                    (Some(of_col), Some(on_col)) => format!(
-                                                        "COMPUTE {} OF {} ON {}",
-                                                        mode_text, of_col, on_col
-                                                    ),
-                                                    _ => format!("COMPUTE {}", mode_text),
-                                                }
-                                            }
-                                            None => "COMPUTE OFF".to_string(),
-                                        },
-                                        format!(
-                                            "ERRORCONTINUE {}",
-                                            if continue_on_error { "ON" } else { "OFF" }
-                                        ),
-                                        spool_line,
-                                    ];
-
+                                    let lines =
+                                        SqlEditorWidget::show_all_lines(&session, auto_commit);
                                     SqlEditorWidget::emit_script_message(
                                         &sender,
                                         &session,
@@ -9006,12 +8752,6 @@ impl SqlEditorWidget {
                                             guard.break_column = Some(key.clone());
                                         }
                                     }
-                                    SqlEditorWidget::emit_script_message(
-                                        &sender,
-                                        &session,
-                                        "BREAK",
-                                        &format!("BREAK ON {}", key),
-                                    );
                                 }
                                 ToolCommand::BreakOff => {
                                     match session.lock() {
@@ -9026,12 +8766,6 @@ impl SqlEditorWidget {
                                             guard.break_column = None;
                                         }
                                     }
-                                    SqlEditorWidget::emit_script_message(
-                                        &sender,
-                                        &session,
-                                        "BREAK",
-                                        "BREAK OFF",
-                                    );
                                 }
                                 ToolCommand::ClearBreaks => {
                                     match session.lock() {
@@ -9046,12 +8780,6 @@ impl SqlEditorWidget {
                                             guard.break_column = None;
                                         }
                                     }
-                                    SqlEditorWidget::emit_script_message(
-                                        &sender,
-                                        &session,
-                                        "CLEAR",
-                                        "BREAKS cleared",
-                                    );
                                 }
                                 ToolCommand::ClearComputes => {
                                     match session.lock() {
@@ -9066,12 +8794,6 @@ impl SqlEditorWidget {
                                             guard.compute = None;
                                         }
                                     }
-                                    SqlEditorWidget::emit_script_message(
-                                        &sender,
-                                        &session,
-                                        "CLEAR",
-                                        "COMPUTES cleared",
-                                    );
                                 }
                                 ToolCommand::ClearBreaksComputes => {
                                     match session.lock() {
@@ -9088,12 +8810,6 @@ impl SqlEditorWidget {
                                             guard.compute = None;
                                         }
                                     }
-                                    SqlEditorWidget::emit_script_message(
-                                        &sender,
-                                        &session,
-                                        "CLEAR",
-                                        "BREAKS and COMPUTES cleared",
-                                    );
                                 }
                                 ToolCommand::Compute {
                                     mode,
@@ -9120,19 +8836,6 @@ impl SqlEditorWidget {
                                             });
                                         }
                                     }
-                                    let mode_text = match mode {
-                                        crate::db::ComputeMode::Sum => "COMPUTE SUM",
-                                        crate::db::ComputeMode::Count => "COMPUTE COUNT",
-                                    };
-                                    let label = match (of_column.as_deref(), on_column.as_deref()) {
-                                        (Some(of_col), Some(on_col)) => {
-                                            format!("{} OF {} ON {}", mode_text, of_col, on_col)
-                                        }
-                                        _ => mode_text.to_string(),
-                                    };
-                                    SqlEditorWidget::emit_script_message(
-                                        &sender, &session, "COMPUTE", &label,
-                                    );
                                 }
                                 ToolCommand::ComputeOff => {
                                     match session.lock() {
@@ -9147,12 +8850,6 @@ impl SqlEditorWidget {
                                             guard.compute = None;
                                         }
                                     }
-                                    SqlEditorWidget::emit_script_message(
-                                        &sender,
-                                        &session,
-                                        "COMPUTE",
-                                        "COMPUTE OFF",
-                                    );
                                 }
                                 ToolCommand::SetErrorContinue { enabled } => {
                                     {
@@ -9169,15 +8866,6 @@ impl SqlEditorWidget {
                                     }
                                     continue_on_error = enabled;
 
-                                    SqlEditorWidget::emit_script_message(
-                                        &sender,
-                                        &session,
-                                        "SET ERRORCONTINUE",
-                                        &format!(
-                                            "ERRORCONTINUE {}",
-                                            if enabled { "ON" } else { "OFF" }
-                                        ),
-                                    );
                                 }
                                 ToolCommand::SetAutoCommit { enabled } => {
                                     let live_may_have_uncommitted_work =
@@ -9216,11 +8904,7 @@ impl SqlEditorWidget {
                                                     &sender,
                                                     &session,
                                                     "SET AUTOCOMMIT",
-                                                    if enabled {
-                                                        "Auto-commit enabled"
-                                                    } else {
-                                                        "Auto-commit disabled"
-                                                    },
+                                                    SqlEditorWidget::autocommit_feedback(enabled),
                                                 );
                                                 let _ = sender
                                                     .send(QueryProgress::AutoCommitChanged {
@@ -9284,12 +8968,6 @@ impl SqlEditorWidget {
                                         };
                                         guard.scan_enabled = enabled;
                                     }
-                                    SqlEditorWidget::emit_script_message(
-                                        &sender,
-                                        &session,
-                                        "SET SCAN",
-                                        &format!("SCAN {}", if enabled { "ON" } else { "OFF" }),
-                                    );
                                 }
                                 ToolCommand::SetVerify { enabled } => {
                                     {
@@ -9304,12 +8982,6 @@ impl SqlEditorWidget {
                                         };
                                         guard.verify_enabled = enabled;
                                     }
-                                    SqlEditorWidget::emit_script_message(
-                                        &sender,
-                                        &session,
-                                        "SET VERIFY",
-                                        &format!("VERIFY {}", if enabled { "ON" } else { "OFF" }),
-                                    );
                                 }
                                 ToolCommand::SetEcho { enabled } => {
                                     {
@@ -9324,12 +8996,6 @@ impl SqlEditorWidget {
                                         };
                                         guard.echo_enabled = enabled;
                                     }
-                                    SqlEditorWidget::emit_script_message(
-                                        &sender,
-                                        &session,
-                                        "SET ECHO",
-                                        &format!("ECHO {}", if enabled { "ON" } else { "OFF" }),
-                                    );
                                 }
                                 ToolCommand::SetTiming { enabled } => {
                                     {
@@ -9344,12 +9010,6 @@ impl SqlEditorWidget {
                                         };
                                         guard.timing_enabled = enabled;
                                     }
-                                    SqlEditorWidget::emit_script_message(
-                                        &sender,
-                                        &session,
-                                        "SET TIMING",
-                                        &format!("TIMING {}", if enabled { "ON" } else { "OFF" }),
-                                    );
                                 }
                                 ToolCommand::SetFeedback { enabled } => {
                                     {
@@ -9364,12 +9024,6 @@ impl SqlEditorWidget {
                                         };
                                         guard.feedback_enabled = enabled;
                                     }
-                                    SqlEditorWidget::emit_script_message(
-                                        &sender,
-                                        &session,
-                                        "SET FEEDBACK",
-                                        &format!("FEEDBACK {}", if enabled { "ON" } else { "OFF" }),
-                                    );
                                 }
                                 ToolCommand::SetHeading { enabled } => {
                                     {
@@ -9384,12 +9038,6 @@ impl SqlEditorWidget {
                                         };
                                         guard.heading_enabled = enabled;
                                     }
-                                    SqlEditorWidget::emit_script_message(
-                                        &sender,
-                                        &session,
-                                        "SET HEADING",
-                                        &format!("HEADING {}", if enabled { "ON" } else { "OFF" }),
-                                    );
                                 }
                                 ToolCommand::SetPageSize { size } => {
                                     {
@@ -9404,12 +9052,6 @@ impl SqlEditorWidget {
                                         };
                                         guard.pagesize = size;
                                     }
-                                    SqlEditorWidget::emit_script_message(
-                                        &sender,
-                                        &session,
-                                        "SET PAGESIZE",
-                                        &format!("PAGESIZE {}", size),
-                                    );
                                 }
                                 ToolCommand::SetLineSize { size } => {
                                     {
@@ -9424,12 +9066,6 @@ impl SqlEditorWidget {
                                         };
                                         guard.linesize = size;
                                     }
-                                    SqlEditorWidget::emit_script_message(
-                                        &sender,
-                                        &session,
-                                        "SET LINESIZE",
-                                        &format!("LINESIZE {}", size),
-                                    );
                                 }
                                 ToolCommand::SetTrimSpool { enabled } => {
                                     {
@@ -9444,15 +9080,6 @@ impl SqlEditorWidget {
                                         };
                                         guard.trimspool_enabled = enabled;
                                     }
-                                    SqlEditorWidget::emit_script_message(
-                                        &sender,
-                                        &session,
-                                        "SET TRIMSPOOL",
-                                        &format!(
-                                            "TRIMSPOOL {}",
-                                            if enabled { "ON" } else { "OFF" }
-                                        ),
-                                    );
                                 }
                                 ToolCommand::SetTrimOut { enabled } => {
                                     {
@@ -9467,12 +9094,6 @@ impl SqlEditorWidget {
                                         };
                                         guard.trimout_enabled = enabled;
                                     }
-                                    SqlEditorWidget::emit_script_message(
-                                        &sender,
-                                        &session,
-                                        "SET TRIMOUT",
-                                        &format!("TRIMOUT {}", if enabled { "ON" } else { "OFF" }),
-                                    );
                                 }
                                 ToolCommand::SetSqlBlankLines { enabled } => {
                                     {
@@ -9487,15 +9108,6 @@ impl SqlEditorWidget {
                                         };
                                         guard.sqlblanklines_enabled = enabled;
                                     }
-                                    SqlEditorWidget::emit_script_message(
-                                        &sender,
-                                        &session,
-                                        "SET SQLBLANKLINES",
-                                        &format!(
-                                            "SQLBLANKLINES {}",
-                                            if enabled { "ON" } else { "OFF" }
-                                        ),
-                                    );
                                 }
                                 ToolCommand::SetTab { enabled } => {
                                     {
@@ -9510,12 +9122,6 @@ impl SqlEditorWidget {
                                         };
                                         guard.tab_enabled = enabled;
                                     }
-                                    SqlEditorWidget::emit_script_message(
-                                        &sender,
-                                        &session,
-                                        "SET TAB",
-                                        &format!("TAB {}", if enabled { "ON" } else { "OFF" }),
-                                    );
                                 }
                                 ToolCommand::SetColSep { separator } => {
                                     {
@@ -9530,12 +9136,6 @@ impl SqlEditorWidget {
                                         };
                                         guard.colsep = separator.clone();
                                     }
-                                    SqlEditorWidget::emit_script_message(
-                                        &sender,
-                                        &session,
-                                        "SET COLSEP",
-                                        &format!("COLSEP {}", separator),
-                                    );
                                 }
                                 ToolCommand::SetNull { null_text } => {
                                     {
@@ -9550,102 +9150,31 @@ impl SqlEditorWidget {
                                         };
                                         guard.null_text = null_text.clone();
                                     }
-                                    SqlEditorWidget::emit_script_message(
-                                        &sender,
-                                        &session,
-                                        "SET NULL",
-                                        &format!("NULL {}", null_text),
-                                    );
                                 }
-                                ToolCommand::Spool { path, append } => match path {
-                                    Some(path) => {
-                                        let target_path = if Path::new(&path).is_absolute() {
-                                            PathBuf::from(&path)
-                                        } else {
-                                            current_frame_base_dir.join(&path)
-                                        };
-                                        match session.lock() {
-                                            Ok(mut guard) => {
-                                                guard.spool_path = Some(target_path.clone());
-                                                guard.spool_truncate = !append;
-                                            }
-                                            Err(poisoned) => {
-                                                eprintln!(
-                                                "Warning: session state lock was poisoned; recovering."
-                                            );
-                                                let mut guard = poisoned.into_inner();
-                                                guard.spool_path = Some(target_path.clone());
-                                                guard.spool_truncate = !append;
-                                            }
-                                        }
-                                        SqlEditorWidget::emit_script_message(
+                                ToolCommand::Spool { path, append } => {
+                                    match SqlEditorWidget::apply_spool_command(
+                                        &session,
+                                        path,
+                                        append,
+                                        &current_frame_base_dir,
+                                    ) {
+                                        Ok(message) => SqlEditorWidget::emit_script_message(
                                             &sender,
                                             &session,
                                             "SPOOL",
-                                            &format!(
-                                                "Spooling output to {} ({})",
-                                                target_path.display(),
-                                                if append { "append" } else { "replace" }
-                                            ),
-                                        );
-                                    }
-                                    None if append => {
-                                        let has_spool_target = match session.lock() {
-                                            Ok(mut guard) => {
-                                                let has_target = guard.spool_path.is_some();
-                                                guard.spool_truncate = false;
-                                                has_target
-                                            }
-                                            Err(poisoned) => {
-                                                eprintln!(
-                                                "Warning: session state lock was poisoned; recovering."
-                                            );
-                                                let mut guard = poisoned.into_inner();
-                                                let has_target = guard.spool_path.is_some();
-                                                guard.spool_truncate = false;
-                                                has_target
-                                            }
-                                        };
-                                        if has_spool_target {
+                                            &message,
+                                        ),
+                                        Err(message) => {
                                             SqlEditorWidget::emit_script_message(
                                                 &sender,
                                                 &session,
                                                 "SPOOL",
-                                                "Spooling in append mode",
-                                            );
-                                        } else {
-                                            SqlEditorWidget::emit_script_message(
-                                                &sender,
-                                                &session,
-                                                "SPOOL APPEND",
-                                                "Error: No active spool file. Use SPOOL <file> APPEND.",
+                                                &format!("Error: {message}"),
                                             );
                                             command_error = true;
                                         }
                                     }
-                                    None => {
-                                        match session.lock() {
-                                            Ok(mut guard) => {
-                                                guard.spool_path = None;
-                                                guard.spool_truncate = false;
-                                            }
-                                            Err(poisoned) => {
-                                                eprintln!(
-                                                "Warning: session state lock was poisoned; recovering."
-                                            );
-                                                let mut guard = poisoned.into_inner();
-                                                guard.spool_path = None;
-                                                guard.spool_truncate = false;
-                                            }
-                                        }
-                                        SqlEditorWidget::emit_script_message(
-                                            &sender,
-                                            &session,
-                                            "SPOOL",
-                                            "Spooling disabled",
-                                        );
-                                    }
-                                },
+                                }
                                 ToolCommand::WheneverSqlError { exit, action } => {
                                     if exit
                                         && action
@@ -9705,21 +9234,9 @@ impl SqlEditorWidget {
                                     );
                                 }
                                 ToolCommand::Exit => {
-                                    SqlEditorWidget::emit_script_message(
-                                        &sender,
-                                        &session,
-                                        "EXIT",
-                                        "Execution stopped.",
-                                    );
                                     stop_execution = true;
                                 }
                                 ToolCommand::Quit => {
-                                    SqlEditorWidget::emit_script_message(
-                                        &sender,
-                                        &session,
-                                        "QUIT",
-                                        "Execution stopped.",
-                                    );
                                     stop_execution = true;
                                 }
                                 ToolCommand::Connect {
@@ -10239,6 +9756,16 @@ impl SqlEditorWidget {
                                         &sender,
                                         &session,
                                         vec![format!("Delimiter set to '{}'", delimiter)],
+                                    );
+                                }
+                            }
+                            if !command_error {
+                                if let Some((label, message)) = confirmation {
+                                    SqlEditorWidget::emit_script_message(
+                                        &sender,
+                                        &session,
+                                        label,
+                                        &message,
                                     );
                                 }
                             }
@@ -10775,9 +10302,9 @@ impl SqlEditorWidget {
 
                                 let timing_duration = statement_start.elapsed();
                                 let base_message = if is_plsql_block {
-                                    "PL/SQL block executed successfully".to_string()
+                                    result_messages::PLSQL_BLOCK_EXECUTED.to_string()
                                 } else {
-                                    "Call executed successfully".to_string()
+                                    result_messages::CALL_EXECUTED.to_string()
                                 };
                                 let mut result = QueryResult::new_non_select_success(
                                     &sql_text,
@@ -10842,7 +10369,10 @@ impl SqlEditorWidget {
                                     } else {
                                         cleanup.clear_oracle_pooled_session_maybe_dirty();
                                         result.message =
-                                            format!("{} | Auto-commit applied", result.message);
+                                            result_messages::with_transaction_feedback(
+                                                &result.message,
+                                                true,
+                                            );
                                     }
                                 }
 
@@ -12179,7 +11709,7 @@ impl SqlEditorWidget {
                                         {
                                             SqlEditorWidget::ddl_message(&upper)
                                         } else {
-                                            "Statement executed successfully".to_string()
+                                            result_messages::STATEMENT_EXECUTED.to_string()
                                         };
                                     QueryResult::new_non_select_success(
                                         &sql_text,
@@ -12262,8 +11792,10 @@ impl SqlEditorWidget {
                                 }
 
                                 if dml_type.is_some() && !auto_commit && result.success {
-                                    result.message =
-                                        format!("{} | Commit required", result.message);
+                                    result.message = result_messages::with_transaction_feedback(
+                                        &result.message,
+                                        false,
+                                    );
                                 }
 
                                 Self::mark_stop_execution_if_cancelled(
@@ -12286,7 +11818,10 @@ impl SqlEditorWidget {
                                     } else {
                                         cleanup.clear_oracle_pooled_session_maybe_dirty();
                                         result.message =
-                                            format!("{} | Auto-commit applied", result.message);
+                                            result_messages::with_transaction_feedback(
+                                                &result.message,
+                                                true,
+                                            );
                                     }
                                 }
 
@@ -12708,9 +12243,9 @@ impl SqlEditorWidget {
         {
             format!("{} {} row(s) affected", statement_type, affected_rows)
         } else if is_plsql_block {
-            "PL/SQL block executed successfully".to_string()
+            result_messages::PLSQL_BLOCK_EXECUTED.to_string()
         } else if is_call {
-            "Call executed successfully".to_string()
+            result_messages::CALL_EXECUTED.to_string()
         } else {
             // Mirror the OCI path's object-specific DDL feedback
             // ("Table created", "View dropped", "Session altered", ...).
@@ -12721,13 +12256,9 @@ impl SqlEditorWidget {
         }
         if dml_type.is_some() {
             // Match the OCI/MySQL DML transaction feedback.
-            message = if auto_commit {
-                format!("{} | Auto-commit applied", message)
-            } else {
-                format!("{} | Commit required", message)
-            };
+            message = result_messages::with_transaction_feedback(&message, auto_commit);
         } else if auto_commit && (is_plsql_block || is_call) {
-            message = format!("{} | Auto-commit applied", message);
+            message = result_messages::with_transaction_feedback(&message, true);
         }
         message
     }
@@ -14020,9 +13551,74 @@ impl SqlEditorWidget {
         }
     }
 
-    fn oracle_thin_drain_dbms_output(conn: &mut OracleThinSession) -> Result<Vec<String>, String> {
+    /// Maximum DBMS_OUTPUT lines to fetch per drain, derived from the
+    /// SERVEROUTPUT buffer size the same way as the OCI path.
+    fn dbms_output_max_lines(size: u32) -> u32 {
+        if size == 0 {
+            10_000
+        } else {
+            safe_div(size, 80).clamp(1, 10_000)
+        }
+    }
+
+    /// Applies SET SERVEROUTPUT over the thin protocol and returns the same
+    /// confirmation message as the OCI path.
+    fn apply_oracle_thin_serveroutput(
+        conn: &mut OracleThinSession,
+        session: &Arc<Mutex<SessionState>>,
+        enabled: bool,
+        size: Option<u32>,
+        unlimited: bool,
+    ) -> Result<String, String> {
+        if !enabled {
+            Self::execute_oracle_thin_statement(conn, "BEGIN DBMS_OUTPUT.DISABLE; END;", false)?;
+            match session.lock() {
+                Ok(mut guard) => guard.server_output.enabled = false,
+                Err(poisoned) => poisoned.into_inner().server_output.enabled = false,
+            }
+            return Ok("SERVEROUTPUT disabled".to_string());
+        }
+
+        let current_size = match session.lock() {
+            Ok(guard) => guard.server_output.size,
+            Err(poisoned) => poisoned.into_inner().server_output.size,
+        };
+        let (enable_sql, applied_size, message) = if unlimited {
+            (
+                "BEGIN DBMS_OUTPUT.ENABLE(NULL); END;".to_string(),
+                0u32,
+                "SERVEROUTPUT enabled (size UNLIMITED)".to_string(),
+            )
+        } else {
+            let desired_size =
+                Self::resolve_serveroutput_enable_size(size, current_size, 1_000_000);
+            (
+                format!("BEGIN DBMS_OUTPUT.ENABLE({}); END;", desired_size),
+                desired_size,
+                format!("SERVEROUTPUT enabled (size {})", desired_size),
+            )
+        };
+        Self::execute_oracle_thin_statement(conn, enable_sql, false)?;
+        match session.lock() {
+            Ok(mut guard) => {
+                guard.server_output.enabled = true;
+                guard.server_output.size = applied_size;
+            }
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                guard.server_output.enabled = true;
+                guard.server_output.size = applied_size;
+            }
+        }
+        Ok(message)
+    }
+
+    fn oracle_thin_drain_dbms_output(
+        conn: &mut OracleThinSession,
+        max_lines: u32,
+    ) -> Result<Vec<String>, String> {
         let mut lines = Vec::new();
-        for _ in 0..10_000 {
+        for _ in 0..max_lines {
             let mut request =
                 StatementRequest::statement("BEGIN DBMS_OUTPUT.GET_LINE(:line, :status); END;");
             request.is_plsql = true;
@@ -14264,6 +13860,7 @@ impl SqlEditorWidget {
                 ScriptItem::ToolCommand(command) => {
                     let command_text = Self::format_tool_command(&command);
                     let mut command_error = None::<String>;
+                    let confirmation = Self::tool_command_confirmation(&command);
                     match command {
                         ToolCommand::Var { name, data_type } => {
                             let normalized = SessionState::normalize_name(&name);
@@ -14428,29 +14025,36 @@ impl SqlEditorWidget {
                                 }
                             }
                         }
-                        ToolCommand::SetServerOutput { enabled, .. } => {
-                            match session.lock() {
-                                Ok(mut guard) => guard.server_output.enabled = enabled,
-                                Err(poisoned) => {
-                                    poisoned.into_inner().server_output.enabled = enabled;
-                                }
+                        ToolCommand::SetServerOutput {
+                            enabled,
+                            size,
+                            unlimited,
+                        } => match Self::apply_oracle_thin_serveroutput(
+                            conn, session, enabled, size, unlimited,
+                        ) {
+                            Ok(message) => {
+                                Self::emit_script_message(
+                                    sender,
+                                    session,
+                                    "SET SERVEROUTPUT",
+                                    &message,
+                                );
                             }
-                            let sql = if enabled {
-                                "BEGIN DBMS_OUTPUT.ENABLE(NULL); END;"
-                            } else {
-                                "BEGIN DBMS_OUTPUT.DISABLE; END;"
-                            };
-                            if let Err(message) =
-                                Self::execute_oracle_thin_statement(conn, sql, false)
-                            {
+                            Err(message) => {
                                 command_error = Some(message);
                             }
-                        }
+                        },
                         ToolCommand::SetAutoCommit { enabled } => {
                             auto_commit = enabled;
                             store_mutex_bool(current_operation_autocommit, enabled);
                             let _ = sender.send(QueryProgress::AutoCommitChanged { enabled });
                             app::awake();
+                            Self::emit_script_message(
+                                sender,
+                                session,
+                                "SET AUTOCOMMIT",
+                                Self::autocommit_feedback(enabled),
+                            );
                         }
                         ToolCommand::SetErrorContinue { enabled } => {
                             continue_on_error = enabled;
@@ -14823,17 +14427,19 @@ impl SqlEditorWidget {
                                 guard.compute = None;
                             }
                         },
-                        ToolCommand::Spool { path, append } => match session.lock() {
-                            Ok(mut guard) => {
-                                guard.spool_path = path.map(PathBuf::from);
-                                guard.spool_truncate = !append;
+                        ToolCommand::Spool { path, append } => {
+                            match Self::apply_spool_command(
+                                session,
+                                path,
+                                append,
+                                &current_frame_base_dir,
+                            ) {
+                                Ok(message) => {
+                                    Self::emit_script_message(sender, session, "SPOOL", &message);
+                                }
+                                Err(message) => command_error = Some(message),
                             }
-                            Err(poisoned) => {
-                                let mut guard = poisoned.into_inner();
-                                guard.spool_path = path.map(PathBuf::from);
-                                guard.spool_truncate = !append;
-                            }
-                        },
+                        }
                         ToolCommand::WheneverSqlError { exit, .. } => {
                             continue_on_error = !exit;
                             match session.lock() {
@@ -14849,156 +14455,7 @@ impl SqlEditorWidget {
                             }
                         }
                         ToolCommand::ShowAll => {
-                            let (
-                                server_output,
-                                define_enabled,
-                                define_char,
-                                scan_enabled,
-                                verify_enabled,
-                                echo_enabled,
-                                timing_enabled,
-                                feedback_enabled,
-                                heading_enabled,
-                                pagesize,
-                                linesize,
-                                trimspool_enabled,
-                                trimout_enabled,
-                                sqlblanklines_enabled,
-                                tab_enabled,
-                                colsep,
-                                null_text,
-                                break_column,
-                                compute_config,
-                                continue_on_error,
-                                spool_path,
-                            ) = match session.lock() {
-                                Ok(guard) => (
-                                    guard.server_output.clone(),
-                                    guard.define_enabled,
-                                    guard.define_char,
-                                    guard.scan_enabled,
-                                    guard.verify_enabled,
-                                    guard.echo_enabled,
-                                    guard.timing_enabled,
-                                    guard.feedback_enabled,
-                                    guard.heading_enabled,
-                                    guard.pagesize,
-                                    guard.linesize,
-                                    guard.trimspool_enabled,
-                                    guard.trimout_enabled,
-                                    guard.sqlblanklines_enabled,
-                                    guard.tab_enabled,
-                                    guard.colsep.clone(),
-                                    guard.null_text.clone(),
-                                    guard.break_column.clone(),
-                                    guard.compute.clone(),
-                                    guard.continue_on_error,
-                                    guard.spool_path.clone(),
-                                ),
-                                Err(poisoned) => {
-                                    eprintln!(
-                                        "Warning: session state lock was poisoned; recovering."
-                                    );
-                                    let guard = poisoned.into_inner();
-                                    (
-                                        guard.server_output.clone(),
-                                        guard.define_enabled,
-                                        guard.define_char,
-                                        guard.scan_enabled,
-                                        guard.verify_enabled,
-                                        guard.echo_enabled,
-                                        guard.timing_enabled,
-                                        guard.feedback_enabled,
-                                        guard.heading_enabled,
-                                        guard.pagesize,
-                                        guard.linesize,
-                                        guard.trimspool_enabled,
-                                        guard.trimout_enabled,
-                                        guard.sqlblanklines_enabled,
-                                        guard.tab_enabled,
-                                        guard.colsep.clone(),
-                                        guard.null_text.clone(),
-                                        guard.break_column.clone(),
-                                        guard.compute.clone(),
-                                        guard.continue_on_error,
-                                        guard.spool_path.clone(),
-                                    )
-                                }
-                            };
-
-                            let serveroutput_line = if server_output.enabled {
-                                if server_output.size == 0 {
-                                    "SERVEROUTPUT ON SIZE UNLIMITED".to_string()
-                                } else {
-                                    format!("SERVEROUTPUT ON SIZE {}", server_output.size)
-                                }
-                            } else {
-                                "SERVEROUTPUT OFF".to_string()
-                            };
-
-                            let spool_line = match spool_path {
-                                Some(path) => format!("SPOOL {}", path.display()),
-                                None => "SPOOL OFF".to_string(),
-                            };
-
-                            let lines = vec![
-                                format!("AUTOCOMMIT {}", if auto_commit { "ON" } else { "OFF" }),
-                                serveroutput_line,
-                                if define_enabled {
-                                    format!("DEFINE '{}'", define_char)
-                                } else {
-                                    "DEFINE OFF".to_string()
-                                },
-                                format!("SCAN {}", if scan_enabled { "ON" } else { "OFF" }),
-                                format!("VERIFY {}", if verify_enabled { "ON" } else { "OFF" }),
-                                format!("ECHO {}", if echo_enabled { "ON" } else { "OFF" }),
-                                format!("TIMING {}", if timing_enabled { "ON" } else { "OFF" }),
-                                format!("FEEDBACK {}", if feedback_enabled { "ON" } else { "OFF" }),
-                                format!("HEADING {}", if heading_enabled { "ON" } else { "OFF" }),
-                                format!("PAGESIZE {}", pagesize),
-                                format!("LINESIZE {}", linesize),
-                                format!(
-                                    "TRIMSPOOL {}",
-                                    if trimspool_enabled { "ON" } else { "OFF" }
-                                ),
-                                format!("TRIMOUT {}", if trimout_enabled { "ON" } else { "OFF" }),
-                                format!(
-                                    "SQLBLANKLINES {}",
-                                    if sqlblanklines_enabled { "ON" } else { "OFF" }
-                                ),
-                                format!("TAB {}", if tab_enabled { "ON" } else { "OFF" }),
-                                format!("COLSEP {}", colsep),
-                                format!("NULL {}", null_text),
-                                match break_column {
-                                    Some(column) => format!("BREAK ON {}", column),
-                                    None => "BREAK OFF".to_string(),
-                                },
-                                match compute_config {
-                                    Some(config) => {
-                                        let mode_text = match config.mode {
-                                            crate::db::ComputeMode::Sum => "SUM",
-                                            crate::db::ComputeMode::Count => "COUNT",
-                                        };
-                                        match (
-                                            config.of_column.as_deref(),
-                                            config.on_column.as_deref(),
-                                        ) {
-                                            (Some(of_col), Some(on_col)) => format!(
-                                                "COMPUTE {} OF {} ON {}",
-                                                mode_text, of_col, on_col
-                                            ),
-                                            _ => format!("COMPUTE {}", mode_text),
-                                        }
-                                    }
-                                    None => "COMPUTE OFF".to_string(),
-                                },
-                                format!(
-                                    "ERRORCONTINUE {}",
-                                    if continue_on_error { "ON" } else { "OFF" }
-                                ),
-                                spool_line,
-                            ];
-
+                            let lines = Self::show_all_lines(session, auto_commit);
                             Self::emit_script_message(
                                 sender,
                                 session,
@@ -15025,6 +14482,11 @@ impl SqlEditorWidget {
                                 "{} is not implemented for Oracle Thin yet",
                                 Self::format_tool_command(&other)
                             ));
+                        }
+                    }
+                    if command_error.is_none() {
+                        if let Some((label, message)) = confirmation {
+                            Self::emit_script_message(sender, session, label, &message);
                         }
                     }
                     if let Some(message) = command_error {
@@ -15115,26 +14577,21 @@ impl SqlEditorWidget {
                     let statement_effects = post_processor.effects_for_sql(&execution_sql);
                     if head.starts_with("set serveroutput") {
                         let mut statement_error = None::<String>;
+                        let mut confirmation = String::new();
                         match QueryExecutor::parse_tool_command(&execution_sql) {
-                            Some(ToolCommand::SetServerOutput { enabled, .. }) => {
-                                match session.lock() {
-                                    Ok(mut guard) => guard.server_output.enabled = enabled,
-                                    Err(poisoned) => {
-                                        poisoned.into_inner().server_output.enabled = enabled;
-                                    }
-                                }
-                                let sql = if enabled {
-                                    "BEGIN DBMS_OUTPUT.ENABLE(NULL); END;"
-                                } else {
-                                    "BEGIN DBMS_OUTPUT.DISABLE; END;"
-                                };
-                                if let Err(message) =
-                                    Self::execute_oracle_thin_statement(conn, sql, false)
-                                {
+                            Some(ToolCommand::SetServerOutput {
+                                enabled,
+                                size,
+                                unlimited,
+                            }) => match Self::apply_oracle_thin_serveroutput(
+                                conn, session, enabled, size, unlimited,
+                            ) {
+                                Ok(message) => confirmation = message,
+                                Err(message) => {
                                     had_error = true;
                                     statement_error = Some(message);
                                 }
-                            }
+                            },
                             Some(ToolCommand::Unsupported { message, .. }) => {
                                 statement_error = Some(message);
                             }
@@ -15169,16 +14626,7 @@ impl SqlEditorWidget {
                                 break;
                             }
                         } else {
-                            Self::emit_script_message(
-                                sender,
-                                session,
-                                &display_sql,
-                                if head.contains(" off") {
-                                    "SERVEROUTPUT disabled"
-                                } else {
-                                    "SERVEROUTPUT enabled"
-                                },
-                            );
+                            Self::emit_script_message(sender, session, &display_sql, &confirmation);
                         }
                         continue;
                     }
@@ -15647,9 +15095,12 @@ impl SqlEditorWidget {
                             break;
                         }
                     } else {
-                        let output_enabled = match session.lock() {
-                            Ok(guard) => guard.server_output.enabled,
-                            Err(poisoned) => poisoned.into_inner().server_output.enabled,
+                        let (output_enabled, output_size) = match session.lock() {
+                            Ok(guard) => (guard.server_output.enabled, guard.server_output.size),
+                            Err(poisoned) => {
+                                let guard = poisoned.into_inner();
+                                (guard.server_output.enabled, guard.server_output.size)
+                            }
                         };
                         // DBMS_OUTPUT is drained by executing GET_LINE as a
                         // normal PL/SQL out-bind call. Do not gate this by
@@ -15657,13 +15108,12 @@ impl SqlEditorWidget {
                         // the same application-level package flow once the
                         // statement itself has completed.
                         if output_enabled && Self::oracle_thin_can_emit_dbms_output(&head) {
-                            match Self::oracle_thin_drain_dbms_output(conn) {
+                            match Self::oracle_thin_drain_dbms_output(
+                                conn,
+                                Self::dbms_output_max_lines(output_size),
+                            ) {
                                 Ok(lines) if !lines.is_empty() => {
-                                    let _ = sender.send(QueryProgress::DbmsOutput {
-                                        lines: lines.clone(),
-                                    });
-                                    Self::append_spool_output(session, &lines);
-                                    app::awake();
+                                    Self::emit_dbms_output_lines(sender, session, lines);
                                 }
                                 Ok(_) => {}
                                 Err(message) => {
@@ -15854,6 +15304,154 @@ impl SqlEditorWidget {
             Err(poisoned) => {
                 eprintln!("Warning: session state lock was poisoned; recovering.");
                 poisoned.into_inner().spool_path.is_some()
+            }
+        }
+    }
+
+    /// Confirmation feedback for SET AUTOCOMMIT, shared by every runtime.
+    fn autocommit_feedback(enabled: bool) -> &'static str {
+        if enabled {
+            "Auto-commit enabled"
+        } else {
+            "Auto-commit disabled"
+        }
+    }
+
+    /// Confirmation emitted after a settings-style tool command is applied.
+    /// Shared by the OCI, thin, and MySQL runtimes so the same command
+    /// produces the same script output on every DB and protocol. Only
+    /// commands whose feedback derives purely from the command itself (no
+    /// session or connection state, no failure paths) belong here.
+    fn tool_command_confirmation(command: &ToolCommand) -> Option<(&'static str, String)> {
+        fn on_off(enabled: bool) -> &'static str {
+            if enabled {
+                "ON"
+            } else {
+                "OFF"
+            }
+        }
+        match command {
+            ToolCommand::SetErrorContinue { enabled } => Some((
+                "SET ERRORCONTINUE",
+                format!("ERRORCONTINUE {}", on_off(*enabled)),
+            )),
+            ToolCommand::SetScan { enabled } => {
+                Some(("SET SCAN", format!("SCAN {}", on_off(*enabled))))
+            }
+            ToolCommand::SetVerify { enabled } => {
+                Some(("SET VERIFY", format!("VERIFY {}", on_off(*enabled))))
+            }
+            ToolCommand::SetEcho { enabled } => {
+                Some(("SET ECHO", format!("ECHO {}", on_off(*enabled))))
+            }
+            ToolCommand::SetTiming { enabled } => {
+                Some(("SET TIMING", format!("TIMING {}", on_off(*enabled))))
+            }
+            ToolCommand::SetFeedback { enabled } => {
+                Some(("SET FEEDBACK", format!("FEEDBACK {}", on_off(*enabled))))
+            }
+            ToolCommand::SetHeading { enabled } => {
+                Some(("SET HEADING", format!("HEADING {}", on_off(*enabled))))
+            }
+            ToolCommand::SetPageSize { size } => {
+                Some(("SET PAGESIZE", format!("PAGESIZE {}", size)))
+            }
+            ToolCommand::SetLineSize { size } => {
+                Some(("SET LINESIZE", format!("LINESIZE {}", size)))
+            }
+            ToolCommand::SetTrimSpool { enabled } => {
+                Some(("SET TRIMSPOOL", format!("TRIMSPOOL {}", on_off(*enabled))))
+            }
+            ToolCommand::SetTrimOut { enabled } => {
+                Some(("SET TRIMOUT", format!("TRIMOUT {}", on_off(*enabled))))
+            }
+            ToolCommand::SetSqlBlankLines { enabled } => Some((
+                "SET SQLBLANKLINES",
+                format!("SQLBLANKLINES {}", on_off(*enabled)),
+            )),
+            ToolCommand::SetTab { enabled } => {
+                Some(("SET TAB", format!("TAB {}", on_off(*enabled))))
+            }
+            ToolCommand::SetColSep { separator } => {
+                Some(("SET COLSEP", format!("COLSEP {}", separator)))
+            }
+            ToolCommand::SetNull { null_text } => Some(("SET NULL", format!("NULL {}", null_text))),
+            ToolCommand::BreakOn { column_name } => Some((
+                "BREAK",
+                format!("BREAK ON {}", SessionState::normalize_name(column_name)),
+            )),
+            ToolCommand::BreakOff => Some(("BREAK", "BREAK OFF".to_string())),
+            ToolCommand::ClearBreaks => Some(("CLEAR", "BREAKS cleared".to_string())),
+            ToolCommand::ClearComputes => Some(("CLEAR", "COMPUTES cleared".to_string())),
+            ToolCommand::ClearBreaksComputes => {
+                Some(("CLEAR", "BREAKS and COMPUTES cleared".to_string()))
+            }
+            ToolCommand::Compute {
+                mode,
+                of_column,
+                on_column,
+            } => {
+                let mode_text = match mode {
+                    crate::db::ComputeMode::Sum => "COMPUTE SUM",
+                    crate::db::ComputeMode::Count => "COMPUTE COUNT",
+                };
+                let message = match (of_column.as_deref(), on_column.as_deref()) {
+                    (Some(of_col), Some(on_col)) => {
+                        format!("{} OF {} ON {}", mode_text, of_col, on_col)
+                    }
+                    _ => mode_text.to_string(),
+                };
+                Some(("COMPUTE", message))
+            }
+            ToolCommand::ComputeOff => Some(("COMPUTE", "COMPUTE OFF".to_string())),
+            ToolCommand::Exit => Some(("EXIT", "Execution stopped.".to_string())),
+            ToolCommand::Quit => Some(("QUIT", "Execution stopped.".to_string())),
+            _ => None,
+        }
+    }
+
+    /// Applies a SPOOL tool command identically for every runtime and returns
+    /// the confirmation message shown to the user.
+    fn apply_spool_command(
+        session: &Arc<Mutex<SessionState>>,
+        path: Option<String>,
+        append: bool,
+        base_dir: &Path,
+    ) -> Result<String, String> {
+        let mut guard = match session.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                eprintln!("Warning: session state lock was poisoned; recovering.");
+                poisoned.into_inner()
+            }
+        };
+        match path {
+            Some(path) => {
+                let target_path = if Path::new(&path).is_absolute() {
+                    PathBuf::from(&path)
+                } else {
+                    base_dir.join(&path)
+                };
+                guard.spool_path = Some(target_path.clone());
+                guard.spool_truncate = !append;
+                Ok(format!(
+                    "Spooling output to {} ({})",
+                    target_path.display(),
+                    if append { "append" } else { "replace" }
+                ))
+            }
+            None if append => {
+                if guard.spool_path.is_some() {
+                    guard.spool_truncate = false;
+                    Ok("Spooling in append mode".to_string())
+                } else {
+                    Err("No active spool file. Use SPOOL <file> APPEND.".to_string())
+                }
+            }
+            None => {
+                guard.spool_path = None;
+                guard.spool_truncate = false;
+                Ok("Spooling disabled".to_string())
             }
         }
     }
@@ -16246,6 +15844,99 @@ impl SqlEditorWidget {
             timed_out: false,
         });
         app::awake();
+    }
+
+    /// Builds the SHOW ALL settings listing shared by the OCI and thin runtimes.
+    fn show_all_lines(session: &Arc<Mutex<SessionState>>, auto_commit: bool) -> Vec<String> {
+        let guard = match session.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                eprintln!("Warning: session state lock was poisoned; recovering.");
+                poisoned.into_inner()
+            }
+        };
+
+        let serveroutput_line = if guard.server_output.enabled {
+            if guard.server_output.size == 0 {
+                "SERVEROUTPUT ON SIZE UNLIMITED".to_string()
+            } else {
+                format!("SERVEROUTPUT ON SIZE {}", guard.server_output.size)
+            }
+        } else {
+            "SERVEROUTPUT OFF".to_string()
+        };
+
+        let spool_line = match &guard.spool_path {
+            Some(path) => format!("SPOOL {}", path.display()),
+            None => "SPOOL OFF".to_string(),
+        };
+
+        vec![
+            format!("AUTOCOMMIT {}", if auto_commit { "ON" } else { "OFF" }),
+            serveroutput_line,
+            if guard.define_enabled {
+                format!("DEFINE '{}'", guard.define_char)
+            } else {
+                "DEFINE OFF".to_string()
+            },
+            format!("SCAN {}", if guard.scan_enabled { "ON" } else { "OFF" }),
+            format!("VERIFY {}", if guard.verify_enabled { "ON" } else { "OFF" }),
+            format!("ECHO {}", if guard.echo_enabled { "ON" } else { "OFF" }),
+            format!("TIMING {}", if guard.timing_enabled { "ON" } else { "OFF" }),
+            format!(
+                "FEEDBACK {}",
+                if guard.feedback_enabled { "ON" } else { "OFF" }
+            ),
+            format!(
+                "HEADING {}",
+                if guard.heading_enabled { "ON" } else { "OFF" }
+            ),
+            format!("PAGESIZE {}", guard.pagesize),
+            format!("LINESIZE {}", guard.linesize),
+            format!(
+                "TRIMSPOOL {}",
+                if guard.trimspool_enabled { "ON" } else { "OFF" }
+            ),
+            format!(
+                "TRIMOUT {}",
+                if guard.trimout_enabled { "ON" } else { "OFF" }
+            ),
+            format!(
+                "SQLBLANKLINES {}",
+                if guard.sqlblanklines_enabled {
+                    "ON"
+                } else {
+                    "OFF"
+                }
+            ),
+            format!("TAB {}", if guard.tab_enabled { "ON" } else { "OFF" }),
+            format!("COLSEP {}", guard.colsep),
+            format!("NULL {}", guard.null_text),
+            match &guard.break_column {
+                Some(column) => format!("BREAK ON {}", column),
+                None => "BREAK OFF".to_string(),
+            },
+            match &guard.compute {
+                Some(config) => {
+                    let mode_text = match config.mode {
+                        crate::db::ComputeMode::Sum => "SUM",
+                        crate::db::ComputeMode::Count => "COUNT",
+                    };
+                    match (config.of_column.as_deref(), config.on_column.as_deref()) {
+                        (Some(of_col), Some(on_col)) => {
+                            format!("COMPUTE {} OF {} ON {}", mode_text, of_col, on_col)
+                        }
+                        _ => format!("COMPUTE {}", mode_text),
+                    }
+                }
+                None => "COMPUTE OFF".to_string(),
+            },
+            format!(
+                "ERRORCONTINUE {}",
+                if guard.continue_on_error { "ON" } else { "OFF" }
+            ),
+            spool_line,
+        ]
     }
 
     fn emit_script_output(
@@ -16921,7 +16612,7 @@ impl SqlEditorWidget {
     }
 
     fn current_scope_changed_message(scope: &str, name: &str) -> String {
-        format!("Current {scope} changed to {name}.")
+        result_messages::current_scope_changed(scope, name)
     }
 
     fn current_schema_changed_message(schema: &str) -> String {
@@ -16986,12 +16677,7 @@ impl SqlEditorWidget {
             return Ok(());
         }
 
-        let max_lines = if size == 0 {
-            10_000
-        } else {
-            safe_div(size, 80).clamp(1, 10_000)
-        };
-        let lines = QueryExecutor::get_dbms_output(conn, max_lines)?;
+        let lines = QueryExecutor::get_dbms_output(conn, Self::dbms_output_max_lines(size))?;
         if lines.is_empty() {
             return Ok(());
         }
@@ -17711,7 +17397,7 @@ impl SqlEditorWidget {
     }
 
     pub(super) fn cancel_message() -> String {
-        "Query cancelled".to_string()
+        result_messages::QUERY_CANCELLED.to_string()
     }
 
     fn lazy_fetch_query_timeout(_query_timeout: Option<Duration>) -> Option<Duration> {
@@ -31334,8 +31020,8 @@ mod mysql_transaction_feedback_tests {
         )
         .expect("write dbms output");
 
-        let lines =
-            SqlEditorWidget::oracle_thin_drain_dbms_output(&mut conn).expect("drain dbms output");
+        let lines = SqlEditorWidget::oracle_thin_drain_dbms_output(&mut conn, 10_000)
+            .expect("drain dbms output");
 
         assert_eq!(lines, vec!["thin output".to_string()]);
     }

@@ -557,8 +557,8 @@ impl CloseSessionAction {
 
     fn success_message(self) -> &'static str {
         match self {
-            CloseSessionAction::Commit => "Commit complete",
-            CloseSessionAction::Rollback => "Rollback complete",
+            CloseSessionAction::Commit => crate::db::query::result_messages::COMMIT_COMPLETE,
+            CloseSessionAction::Rollback => crate::db::query::result_messages::ROLLBACK_COMPLETE,
         }
     }
 
