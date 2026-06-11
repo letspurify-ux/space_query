@@ -6409,7 +6409,7 @@ impl MainWindow {
                     if preserve_canceling {
                         result_tabs.mark_statement_canceling(tab_index);
                     } else {
-                        result_tabs.mark_lazy_fetch_waiting(tab_index);
+                        result_tabs.mark_lazy_fetch_waiting(tab_index, session_id);
                     }
                 }
                 QueryProgress::LazyFetchCanceling { session_id } => {

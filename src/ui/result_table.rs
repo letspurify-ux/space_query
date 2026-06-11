@@ -7765,6 +7765,21 @@ impl ResultTableWidget {
         mutex_store_bool(&self.streaming_in_progress, true);
     }
 
+    /// A waiting report means the worker is idle, so a fetch-more still marked
+    /// in flight can no longer produce a Rows event (an empty batch emits
+    /// nothing); clear it so scroll-triggered fetches are not permanently
+    /// gated.
+    pub fn note_lazy_fetch_waiting(&mut self, session_id: u64) {
+        Self::clear_lazy_fetch_more_in_flight(&self.lazy_fetch_more_in_flight, session_id);
+    }
+
+    fn clear_lazy_fetch_more_in_flight(in_flight: &Arc<Mutex<HashSet<u64>>>, session_id: u64) {
+        in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&session_id);
+    }
+
     pub fn clear_lazy_fetch_session(&mut self, session_id: u64, run_pending: bool) {
         let mut guard = self
             .lazy_fetch_session
@@ -12896,6 +12911,41 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_empty());
+    }
+
+    #[test]
+    fn lazy_fetch_waiting_clears_stuck_in_flight_gate() {
+        let session = Arc::new(Mutex::new(Some(9)));
+        let in_flight = Arc::new(Mutex::new(HashSet::from([9])));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_for_callback = requests.clone();
+        let callback: LazyFetchCallback =
+            Arc::new(Mutex::new(Some(Box::new(move |id, request| {
+                requests_for_callback
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push((id, request));
+                true
+            }))));
+
+        // A fetch-more that produced no Rows event leaves the gate stuck.
+        assert!(!ResultTableWidget::request_lazy_fetch_more_for_session(
+            9, &session, &callback, &in_flight
+        ));
+
+        // The worker reporting waiting must release the gate.
+        ResultTableWidget::clear_lazy_fetch_more_in_flight(&in_flight, 9);
+
+        assert!(ResultTableWidget::request_lazy_fetch_more_for_session(
+            9, &session, &callback, &in_flight
+        ));
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &[(9, LazyFetchRequest::More)]
+        );
     }
 
     #[test]

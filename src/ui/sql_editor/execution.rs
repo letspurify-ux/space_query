@@ -4308,6 +4308,7 @@ impl SqlEditorWidget {
                             &mut fetched_rows,
                             &mut last_select_row,
                         )?;
+                        let initial_batch_empty = rows.is_empty();
                         Self::set_lazy_fetch_in_progress(&active_lazy_fetch, session_id, false);
                         Self::append_spool_rows(&session, &rows);
                         Self::emit_lazy_rows(&sender, index, rows);
@@ -4365,6 +4366,53 @@ impl SqlEditorWidget {
                                 Some(finish_success(fetched_rows, last_select_row, column_info));
                             return Ok(LazyFetchWorkerOutcome::Completed);
                         };
+
+                        // The UI only requests more rows once it has rows to scroll
+                        // (ResultTableWidget::append_rows), so an empty initial batch —
+                        // the execute runs without prefetch when a column needs a
+                        // define fetch (LOB family) or object metadata — would leave
+                        // the grid stuck at 0 rows. Fetch the first batch here, the
+                        // same way the OCI lazy worker always does.
+                        if initial_batch_empty {
+                            Self::set_lazy_fetch_in_progress(&active_lazy_fetch, session_id, true);
+                            let (rows, eof) = Self::oracle_thin_fetch_lazy_rows(
+                                conn,
+                                cursor_id,
+                                &column_types,
+                                &mut needs_define_fetch,
+                                lazy_fetch_batch_size,
+                                &null_text,
+                                &mut fetched_rows,
+                                &mut last_select_row,
+                                query_timeout,
+                                None,
+                            )?;
+                            Self::set_lazy_fetch_in_progress(&active_lazy_fetch, session_id, false);
+                            Self::append_spool_rows(&session, &rows);
+                            Self::emit_lazy_rows(&sender, index, rows);
+                            if let Some(command) = Self::drain_lazy_cancel_request(
+                                &command_receiver,
+                                &mut pending_commands,
+                            ) {
+                                return Ok(LazyFetchWorkerOutcome::Interrupted(
+                                    Self::lazy_fetch_interrupt_kind_for_command(&command),
+                                ));
+                            }
+                            if Self::lazy_fetch_cancel_requested(&active_lazy_fetch, session_id) {
+                                return Ok(LazyFetchWorkerOutcome::Interrupted(
+                                    InterruptKind::Cancelled,
+                                ));
+                            }
+                            if eof {
+                                keep_session = true;
+                                success_result = Some(finish_success(
+                                    fetched_rows,
+                                    last_select_row,
+                                    column_info,
+                                ));
+                                return Ok(LazyFetchWorkerOutcome::Completed);
+                            }
+                        }
 
                         conn.set_call_timeout(None).map_err(|err| err.to_string())?;
                         Self::emit_lazy_waiting(&sender, index, session_id);
@@ -31536,6 +31584,45 @@ mod mysql_transaction_feedback_tests {
         assert!(
             snapshot.rows.len() > initial_batch_len,
             "FetchMore should append rows after the initial lazy batch"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle listener"]
+    fn oracle_thin_lazy_fetch_clob_emits_initial_batch_before_waiting() {
+        // CLOB columns make the initial execute run without prefetch (define
+        // fetch), so the worker itself must fetch the first batch; otherwise
+        // the grid sits at 0 rows in the lazy-waiting state.
+        let sql = "select topic, seq, to_clob(info) info_clob from help";
+        let progress = oracle_lazy_worker_progress_for_sql(OracleDriverMode::Thin, sql, 25, false);
+        let failures = oracle_thin_progress_failures(&progress);
+        assert!(
+            failures.is_empty(),
+            "Oracle Thin CLOB lazy failures: {failures:?}"
+        );
+        let first_waiting = progress
+            .iter()
+            .position(|event| matches!(event, QueryProgress::LazyFetchWaiting { .. }))
+            .expect("Thin should pause after the initial CLOB grid batch");
+        let first_rows = progress
+            .iter()
+            .position(|event| matches!(event, QueryProgress::Rows { .. }))
+            .expect("CLOB lazy select should emit an initial grid batch without any FetchMore");
+        assert!(
+            first_rows < first_waiting,
+            "initial CLOB batch must reach the grid before the lazy-waiting state \
+             (rows event at {first_rows}, waiting at {first_waiting})"
+        );
+        let initial_batch_len = progress
+            .iter()
+            .find_map(|event| match event {
+                QueryProgress::Rows { rows, .. } => Some(rows.len()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert!(
+            (1..=25).contains(&initial_batch_len),
+            "initial CLOB lazy batch should hold up to one batch of rows: {initial_batch_len}"
         );
     }
 

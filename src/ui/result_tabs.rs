@@ -1355,14 +1355,15 @@ impl ResultTabsWidget {
         self.fire_on_change_callback();
     }
 
-    pub fn mark_lazy_fetch_waiting(&mut self, index: usize) {
-        let row_count = self
+    pub fn mark_lazy_fetch_waiting(&mut self, index: usize, session_id: u64) {
+        let tab_parts = self
             .data
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(index)
-            .map(|tab| tab.row_count);
-        if let Some(row_count) = row_count {
+            .map(|tab| (tab.row_count, tab.table.clone()));
+        if let Some((row_count, mut table)) = tab_parts {
+            table.note_lazy_fetch_waiting(session_id);
             self.set_result_tab_state(index, ResultTabStatus::Waiting, row_count);
         }
         self.fire_on_change_callback();
