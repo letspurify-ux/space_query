@@ -67,7 +67,7 @@ pub struct ProcedureArgument {
 /// User-facing result messages shared by every database backend so the same
 /// operation reports the same text regardless of DB type or protocol.
 pub mod result_messages {
-    use crate::db::{DatabaseBackendKind, DatabaseType};
+    use crate::db::DatabaseType;
 
     pub const COMMIT_COMPLETE: &str = "Commit complete";
     pub const ROLLBACK_COMPLETE: &str = "Rollback complete";
@@ -110,7 +110,7 @@ pub mod result_messages {
     }
 
     /// Single source of truth for which successful statements carry
-    /// transaction feedback per backend family. Returns the flag to pass to
+    /// transaction feedback per database type. Returns the flag to pass to
     /// [`with_transaction_feedback`], or `None` when the statement reports no
     /// feedback on this backend.
     pub fn transaction_feedback_flag(
@@ -118,8 +118,8 @@ pub mod result_messages {
         statement: TransactionFeedbackStatement,
         auto_commit: bool,
     ) -> Option<bool> {
-        match db_type.backend_kind() {
-            DatabaseBackendKind::Oracle => match statement {
+        match db_type {
+            DatabaseType::Oracle => match statement {
                 TransactionFeedbackStatement::Dml => Some(auto_commit),
                 // Oracle reports procedure/PL-SQL feedback only when client
                 // auto-commit actually resolved the work; without auto-commit
@@ -128,7 +128,7 @@ pub mod result_messages {
             },
             // MySQL DML and CALL both leave commit-or-rollback work pending
             // when autocommit is off, so both report either state.
-            DatabaseBackendKind::MySql => Some(auto_commit),
+            DatabaseType::MySQL | DatabaseType::MariaDB => Some(auto_commit),
         }
     }
 

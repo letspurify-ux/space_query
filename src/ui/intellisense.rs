@@ -622,9 +622,11 @@ const MYSQL_LANGUAGE_CATALOG: LanguageCatalog = (sql_text::MYSQL_SQL_KEYWORDS, M
 fn language_catalog_for_db_type(
     db_type: Option<crate::db::DatabaseType>,
 ) -> (&'static [&'static str], &'static [&'static str]) {
-    match db_type.map(|db_type| db_type.sql_dialect()) {
-        Some(crate::db::SqlDialect::Oracle) | None => ORACLE_LANGUAGE_CATALOG,
-        Some(crate::db::SqlDialect::MySql) => MYSQL_LANGUAGE_CATALOG,
+    match db_type {
+        None => ORACLE_LANGUAGE_CATALOG,
+        Some(crate::db::DatabaseType::Oracle) => ORACLE_LANGUAGE_CATALOG,
+        Some(crate::db::DatabaseType::MySQL) => MYSQL_LANGUAGE_CATALOG,
+        Some(crate::db::DatabaseType::MariaDB) => MYSQL_LANGUAGE_CATALOG,
     }
 }
 

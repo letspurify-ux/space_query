@@ -2391,7 +2391,8 @@ impl SqlEditorWidget {
         match pool_session {
             DbPoolSession::MySQL { conn, .. } => Ok(conn),
             unexpected @ (DbPoolSession::Oracle(_) | DbPoolSession::OracleThin(_)) => Err(format!(
-                "Expected MySQL pool session but acquired {}",
+                "Expected {} pool session but acquired {}",
+                context.connection_info.db_type,
                 unexpected.db_type()
             )),
         }
@@ -2408,9 +2409,15 @@ impl SqlEditorWidget {
     fn reset_mysql_pooled_session_to_no_database(
         conn: &mut mysql::PooledConn,
         advanced: &crate::db::ConnectionAdvancedSettings,
+        db_type: crate::db::DatabaseType,
     ) -> Result<(), String> {
-        crate::db::DatabaseConnection::reset_mysql_session_to_no_database(conn.as_mut())?;
-        crate::db::DatabaseConnection::apply_mysql_session_settings(conn, advanced)
+        crate::db::DatabaseConnection::reset_mysql_session_to_no_database_for_db_type(
+            conn.as_mut(),
+            db_type,
+        )?;
+        crate::db::DatabaseConnection::apply_mysql_session_settings_for_db_type(
+            conn, advanced, db_type,
+        )
     }
 
     fn mysql_should_refresh_connection_encoding(preserve_existing_session_state: bool) -> bool {
@@ -2421,6 +2428,7 @@ impl SqlEditorWidget {
         conn: &mut mysql::PooledConn,
         current_service_name: &str,
         advanced: &crate::db::ConnectionAdvancedSettings,
+        db_type: crate::db::DatabaseType,
         preserve_existing_session_state: bool,
     ) -> Result<(), String> {
         let database = current_service_name.trim();
@@ -2428,7 +2436,7 @@ impl SqlEditorWidget {
             if preserve_existing_session_state {
                 return Err(crate::db::DatabaseConnection::mysql_empty_scope_requires_resolved_session_error());
             }
-            return Self::reset_mysql_pooled_session_to_no_database(conn, advanced);
+            return Self::reset_mysql_pooled_session_to_no_database(conn, advanced, db_type);
         }
 
         // Re-select even when SELECT DATABASE() would report the same name.
@@ -2440,8 +2448,8 @@ impl SqlEditorWidget {
                 {
                     return Ok(());
                 }
-                crate::db::DatabaseConnection::apply_mysql_connection_encoding_with_settings(
-                    conn, advanced,
+                crate::db::DatabaseConnection::apply_mysql_connection_encoding_with_settings_for_db_type(
+                    conn, advanced, db_type,
                 )?;
                 Ok(())
             }
@@ -2455,7 +2463,7 @@ impl SqlEditorWidget {
                         "Current database `{database}` is not available; continuing without a default database"
                     ),
                 );
-                Self::reset_mysql_pooled_session_to_no_database(conn, advanced)
+                Self::reset_mysql_pooled_session_to_no_database(conn, advanced, db_type)
             }
             Err(err) => Err(SqlEditorWidget::mysql_error_message(&err, None)),
         }
@@ -4919,6 +4927,7 @@ impl SqlEditorWidget {
             statement_effects,
         );
         let state_hint = statement_effects.state_hint;
+        let db_display_name = connection_info.db_type.display_name();
         let (command_sender, command_receiver) = mpsc::channel::<LazyFetchCommand>();
         let lazy_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>> =
             Arc::new(Mutex::new(None));
@@ -4999,6 +5008,7 @@ impl SqlEditorWidget {
                                     timeout_apply_restore_failed = err.restore_failed();
                                     return Err(SqlEditorWidget::mysql_timeout_apply_error_message(
                                         &err,
+                                        connection_info.db_type,
                                         lazy_fetch_timeout,
                                     ));
                                 }
@@ -5374,7 +5384,7 @@ impl SqlEditorWidget {
                                 crate::utils::logging::log_error(
                                     "mysql lazy fetch cleanup",
                                     &format!(
-                                        "Failed to restore MySQL lazy fetch session timeout: {err}"
+                                        "Failed to restore {db_display_name} lazy fetch session timeout: {err}"
                                     ),
                                 );
                                 should_retain_session = false;
@@ -5538,7 +5548,7 @@ impl SqlEditorWidget {
                 }
             });
         if let Err(err) = spawn_result {
-            let message = format!("Failed to start MySQL lazy fetch worker: {err}");
+            let message = format!("Failed to start {db_display_name} lazy fetch worker: {err}");
             crate::utils::logging::log_error("mysql lazy fetch", &message);
             Self::clear_lazy_fetch_handle(&cleanup_active_lazy_fetch, session_id);
             let mut result = QueryResult::new_error(&cleanup_sql_to_execute, &message);
@@ -5568,13 +5578,14 @@ impl SqlEditorWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         if let Some(context) = context {
+            let display_name = context.connection_info.db_type.display_name();
             if let Err(err) = crate::db::query::mysql_executor::MysqlExecutor::cancel_running_query(
                 &context.connection_info,
                 context.connection_id,
             ) {
                 crate::utils::logging::log_error(
                     log_context,
-                    &format!("Failed to cancel MySQL lazy fetch query: {err}"),
+                    &format!("Failed to cancel {display_name} lazy fetch query: {err}"),
                 );
             }
         }
@@ -5840,7 +5851,9 @@ impl SqlEditorWidget {
             MySqlBatchStatementError,
         > {
             let refresh_encoding_after =
-                crate::db::query::mysql_executor::MysqlExecutor::is_use_statement(sql);
+                crate::db::query::mysql_executor::MysqlExecutor::is_use_statement_for_db_type(
+                    db_type, sql,
+                );
             let statement_effects =
                 SqlEditorWidget::mysql_statement_session_effects_for_sql_for_db_type(db_type, sql);
             if let Err(message) =
@@ -7067,7 +7080,8 @@ impl SqlEditorWidget {
                                     db_type, &sql_text, &results,
                                 );
                             let current_database_notice =
-                                if crate::db::query::mysql_executor::MysqlExecutor::is_use_statement(
+                                if crate::db::query::mysql_executor::MysqlExecutor::is_use_statement_for_db_type(
+                                    db_type,
                                     &sql_text,
                                 ) {
                                     let info = Self::connection_info_snapshot_for_ui(
@@ -7083,8 +7097,14 @@ impl SqlEditorWidget {
                                         .find(|result| result.success && !result.is_select)
                                         .map(|result| {
                                             let parsed_database =
-                                                crate::db::query::mysql_executor::MysqlExecutor::use_statement_database_name(&result.sql)
-                                                    .or_else(|| crate::db::query::mysql_executor::MysqlExecutor::use_statement_database_name(&sql_text));
+                                                crate::db::query::mysql_executor::MysqlExecutor::use_statement_database_name_for_db_type(
+                                                    db_type,
+                                                    &result.sql,
+                                                )
+                                                    .or_else(|| crate::db::query::mysql_executor::MysqlExecutor::use_statement_database_name_for_db_type(
+                                                        db_type,
+                                                        &sql_text,
+                                                    ));
                                             let selected_scope =
                                                 current_database.clone().or(parsed_database);
                                             let message = selected_scope
@@ -9587,6 +9607,7 @@ impl SqlEditorWidget {
                                             &shared_connection,
                                             db_activity.clone(),
                                         );
+                                        let db_type = cg.db_type();
                                         let execute_result = if let Some(mysql_conn) =
                                             cg.get_mysql_connection_mut()
                                         {
@@ -9595,8 +9616,8 @@ impl SqlEditorWidget {
                                                     database: database.clone(),
                                                 },
                                             );
-                                            crate::db::query::mysql_executor::MysqlExecutor::execute(
-                                                mysql_conn, &use_sql,
+                                            crate::db::query::mysql_executor::MysqlExecutor::execute_for_db_type(
+                                                mysql_conn, &use_sql, db_type,
                                             )
                                             .map(|_| ())
                                             .map_err(|err| format!("Error: {err}"))
@@ -16836,15 +16857,17 @@ impl SqlEditorWidget {
     }
 
     fn mysql_session_may_have_uncommitted_work<C: Queryable>(
+        db_type: crate::db::DatabaseType,
         conn: &mut C,
         log_context: &str,
         fallback_on_error: bool,
     ) -> bool {
-        Self::mysql_session_uncommitted_work_probe(conn, log_context, fallback_on_error)
+        Self::mysql_session_uncommitted_work_probe(db_type, conn, log_context, fallback_on_error)
             .may_have_uncommitted_work
     }
 
     fn mysql_session_uncommitted_work_probe<C: Queryable>(
+        db_type: crate::db::DatabaseType,
         conn: &mut C,
         log_context: &str,
         fallback_on_error: bool,
@@ -16853,6 +16876,7 @@ impl SqlEditorWidget {
             conn,
             log_context,
             fallback_on_error,
+            db_type,
         )
     }
 
@@ -16898,8 +16922,12 @@ impl SqlEditorWidget {
         fallback_on_error: bool,
         interruption_requires_transaction_decision: bool,
     ) -> RetainedSessionState {
-        let transaction_probe =
-            Self::mysql_session_uncommitted_work_probe(conn, log_context, fallback_on_error);
+        let transaction_probe = Self::mysql_session_uncommitted_work_probe(
+            db_type,
+            conn,
+            log_context,
+            fallback_on_error,
+        );
         Self::mysql_retained_session_state_after_statement_from_probe(
             db_type,
             prior_state,
@@ -17329,6 +17357,7 @@ impl SqlEditorWidget {
             return;
         }
         let server_reports_uncommitted_work = Self::mysql_session_may_have_uncommitted_work(
+            db_type,
             &mut conn,
             db_activity,
             batch_effects.may_have_uncommitted_work() || prior_may_have_uncommitted_work,
@@ -17743,9 +17772,10 @@ impl SqlEditorWidget {
     ) -> bool {
         if let Some(timeout_restore) = timeout_restore {
             if let Err(err) = timeout_restore.restore_for_db(mysql_conn, db_type) {
+                let display_name = db_type.display_name();
                 crate::utils::logging::log_error(
                     log_context,
-                    &format!("Failed to restore MySQL session timeout: {err}"),
+                    &format!("Failed to restore {display_name} session timeout: {err}"),
                 );
                 return false;
             }
@@ -17773,6 +17803,7 @@ impl SqlEditorWidget {
     fn reusable_mysql_pooled_session_is_ready(
         conn: &mut mysql::PooledConn,
         advanced: &crate::db::ConnectionAdvancedSettings,
+        db_type: crate::db::DatabaseType,
         preserve_existing_session_state: bool,
     ) -> Result<bool, String> {
         if conn.as_mut().ping().is_err() {
@@ -17781,7 +17812,9 @@ impl SqlEditorWidget {
         if preserve_existing_session_state {
             return Ok(true);
         }
-        crate::db::DatabaseConnection::apply_mysql_session_settings(conn, advanced)?;
+        crate::db::DatabaseConnection::apply_mysql_session_settings_for_db_type(
+            conn, advanced, db_type,
+        )?;
         Ok(true)
     }
 
@@ -17794,6 +17827,7 @@ impl SqlEditorWidget {
             &mut conn,
             &context.current_service_name,
             &context.connection_info.advanced,
+            context.connection_info.db_type,
             false,
         ) {
             Ok(()) => Ok(conn),
@@ -17805,6 +17839,7 @@ impl SqlEditorWidget {
                     &mut conn,
                     &context.current_service_name,
                     &context.connection_info.advanced,
+                    context.connection_info.db_type,
                     false,
                 )?;
                 Ok(conn)
@@ -17844,6 +17879,7 @@ impl SqlEditorWidget {
                 lock_connection_with_activity(shared_connection, db_activity.to_string());
             conn_guard.pool_session_context()?
         };
+        let db_display_name = context.connection_info.db_type.display_name();
 
         let (mut conn, prior_retained_state) = match pooled_db_session.take_reusable_lease(
             context.connection_generation,
@@ -17854,7 +17890,10 @@ impl SqlEditorWidget {
                 let Some((mut conn, prior_retained_state)) =
                     retained_session.into_mysql_connection_with_retained_state()
                 else {
-                    return Err("Expected MySQL pool session".to_string());
+                    return Err(format!(
+                        "Expected {} pool session",
+                        context.connection_info.db_type
+                    ));
                 };
                 if let Some(resolution_action) = required_resolution_action {
                     if let Err(message) = ensure_retained_session_transaction_action_allowed(
@@ -17876,6 +17915,7 @@ impl SqlEditorWidget {
                 match Self::reusable_mysql_pooled_session_is_ready(
                     &mut conn,
                     &context.connection_info.advanced,
+                    context.connection_info.db_type,
                     prior_retained_state.requires_physical_session_preservation(),
                 ) {
                     Ok(true) => (conn, prior_retained_state),
@@ -17897,11 +17937,11 @@ impl SqlEditorWidget {
                     }
                     Err(message) if Self::mysql_pool_acquire_error_should_retry_fresh(&message) => {
                         crate::utils::logging::log_warning(
-                        "mysql pool session",
-                        &format!(
-                            "Discarding stale reusable MySQL pooled session and retrying with a fresh session: {message}"
-                        ),
-                    );
+                            "mysql pool session",
+                            &format!(
+                                "Discarding stale reusable {db_display_name} pooled session and retrying with a fresh session: {message}"
+                            ),
+                        );
                         Self::discard_mysql_pooled_connection(conn);
                         if require_existing_session {
                             return Err(message);
@@ -17955,6 +17995,7 @@ impl SqlEditorWidget {
                 &mut conn,
                 &context.current_service_name,
                 &context.connection_info.advanced,
+                context.connection_info.db_type,
                 preserve_existing_session_state,
             ) {
                 if Self::mysql_pool_acquire_error_should_retry_fresh(&message) {
@@ -17975,7 +18016,7 @@ impl SqlEditorWidget {
                     crate::utils::logging::log_warning(
                         "mysql pool session",
                         &format!(
-                            "MySQL pooled session database setup failed with a stale-session error; retrying once: {message}"
+                            "{db_display_name} pooled session database setup failed with a stale-session error; retrying once: {message}"
                         ),
                     );
                     Self::discard_mysql_pooled_connection(conn);
@@ -18033,7 +18074,7 @@ impl SqlEditorWidget {
                 crate::utils::logging::log_warning(
                     "mysql pool session",
                     &format!(
-                        "MySQL pooled session setup failed with a stale-session error; retrying once: {message}"
+                        "{db_display_name} pooled session setup failed with a stale-session error; retrying once: {message}"
                     ),
                 );
                 Self::discard_mysql_pooled_connection(conn);
@@ -18789,7 +18830,10 @@ impl SqlEditorWidget {
 
     fn mysql_pooled_session_ping(conn: &mut mysql::PooledConn, log_context: &str) -> bool {
         if conn.as_mut().ping().is_err() {
-            crate::utils::logging::log_error(log_context, "MySQL pooled session ping failed");
+            crate::utils::logging::log_error(
+                log_context,
+                "MySQL/MariaDB pooled session ping failed",
+            );
             return false;
         }
         true
@@ -18809,6 +18853,7 @@ impl SqlEditorWidget {
     }
 
     fn mysql_known_current_database_after_successful_statement(
+        db_type: crate::db::DatabaseType,
         statement_sql: &str,
         allow_global_database_update: bool,
         preserve_existing_session_state: bool,
@@ -18816,7 +18861,10 @@ impl SqlEditorWidget {
         if !allow_global_database_update || !preserve_existing_session_state {
             return None;
         }
-        crate::db::query::mysql_executor::MysqlExecutor::use_statement_database_name(statement_sql)
+        crate::db::query::mysql_executor::MysqlExecutor::use_statement_database_name_for_db_type(
+            db_type,
+            statement_sql,
+        )
     }
 
     fn sync_mysql_pooled_session_info(
@@ -18847,6 +18895,8 @@ impl SqlEditorWidget {
         if !conn_guard.can_reuse_pool_session(connection_generation, conn_guard.db_type()) {
             return false;
         }
+        let db_type = conn_guard.db_type();
+        let display_name = db_type.display_name();
 
         if allow_global_database_update {
             let refresh_encoding = refresh_encoding
@@ -18871,7 +18921,9 @@ impl SqlEditorWidget {
                 }
                 Err(err) => {
                     clear_pool_session_context_for_shared_connection(shared_connection);
-                    eprintln!("Warning: failed to sync MySQL pooled session metadata: {err}");
+                    eprintln!(
+                        "Warning: failed to sync {display_name} pooled session metadata: {err}"
+                    );
                     false
                 }
             }
@@ -18894,7 +18946,9 @@ impl SqlEditorWidget {
                     .unwrap_or_default(),
                 Err(err) => {
                     clear_pool_session_context_for_shared_connection(shared_connection);
-                    eprintln!("Warning: failed to read MySQL pooled session database: {err}");
+                    eprintln!(
+                        "Warning: failed to read {display_name} pooled session database: {err}"
+                    );
                     return false;
                 }
             };
@@ -18902,22 +18956,22 @@ impl SqlEditorWidget {
             if refresh_encoding
                 && Self::mysql_should_refresh_connection_encoding(preserve_existing_session_state)
             {
-                if let Err(message) =
-                    crate::db::DatabaseConnection::apply_mysql_connection_encoding_with_settings(
-                        conn, &advanced,
+                if let Err(message) = crate::db::DatabaseConnection::
+                    apply_mysql_connection_encoding_with_settings_for_db_type(
+                        conn, &advanced, db_type,
                     )
                 {
                     if !Self::mysql_error_allows_session_reuse(&message) {
                         clear_pool_session_context_for_shared_connection(shared_connection);
                         eprintln!(
-                            "Warning: failed to refresh MySQL pooled session encoding: {message}"
+                            "Warning: failed to refresh {display_name} pooled session encoding: {message}"
                         );
                         return false;
                     }
                     crate::utils::logging::log_warning(
                         "mysql pool session",
                         &format!(
-                            "Failed to refresh MySQL pooled session encoding; keeping session for transaction safety: {message}"
+                            "Failed to refresh {display_name} pooled session encoding; keeping session for transaction safety: {message}"
                         ),
                     );
                 }
@@ -18930,8 +18984,8 @@ impl SqlEditorWidget {
                             preserve_existing_session_state,
                         ) {
                             let encoding_result = {
-                                crate::db::DatabaseConnection::apply_mysql_connection_encoding_with_settings(
-                                    conn, &advanced,
+                                crate::db::DatabaseConnection::apply_mysql_connection_encoding_with_settings_for_db_type(
+                                    conn, &advanced, db_type,
                                 )
                             };
                             if let Err(message) = encoding_result {
@@ -18940,14 +18994,14 @@ impl SqlEditorWidget {
                                         shared_connection,
                                     );
                                     eprintln!(
-                                        "Warning: failed to refresh MySQL pooled session encoding after database switch: {message}"
+                                        "Warning: failed to refresh {display_name} pooled session encoding after database switch: {message}"
                                     );
                                     return false;
                                 }
                                 crate::utils::logging::log_warning(
                                     "mysql pool session",
                                     &format!(
-                                        "Failed to refresh MySQL pooled session encoding after database switch; keeping session for transaction safety: {message}"
+                                        "Failed to refresh {display_name} pooled session encoding after database switch; keeping session for transaction safety: {message}"
                                     ),
                                 );
                             }
@@ -18957,7 +19011,7 @@ impl SqlEditorWidget {
                         let message = SqlEditorWidget::mysql_error_message(&err, None);
                         clear_pool_session_context_for_shared_connection(shared_connection);
                         eprintln!(
-                            "Warning: failed to apply MySQL current database `{target_database}` to pooled session: {message}"
+                            "Warning: failed to apply {display_name} current database `{target_database}` to pooled session: {message}"
                         );
                         return false;
                     }
@@ -19125,15 +19179,17 @@ impl SqlEditorWidget {
                 conn_guard.default_transaction_isolation(),
             )
         };
+        let display_name = db_type.display_name();
 
         let result = Self::prepare_mysql_pooled_session_database(
             conn,
             &target_database,
             &advanced,
+            db_type,
             preserve_existing_session_state,
         )
         .map_err(|message| {
-            format!("Failed to apply MySQL current database before execution: {message}")
+            format!("Failed to apply {display_name} current database before execution: {message}")
         });
 
         match result {
@@ -19149,7 +19205,7 @@ impl SqlEditorWidget {
                     ) {
                         clear_pool_session_context_for_shared_connection(shared_connection);
                         return Err(format!(
-                            "Failed to apply MySQL session options before execution: {message}"
+                            "Failed to apply {display_name} session options before execution: {message}"
                         ));
                     }
                 }
@@ -19228,6 +19284,7 @@ impl SqlEditorWidget {
                     );
                     return Err(SqlEditorWidget::mysql_timeout_apply_error_message(
                         &err,
+                        db_type,
                         query_timeout,
                     ));
                 }
@@ -19312,6 +19369,7 @@ impl SqlEditorWidget {
             required_resolution_action,
         )?;
         let db_type = connection_info.db_type;
+        let db_display_name = db_type.display_name();
         let statement_effects =
             crate::db::mysql_statement_session_effects_for_execution_context_for_db_type(
                 db_type,
@@ -19427,6 +19485,7 @@ impl SqlEditorWidget {
                     let restore_failed = err.restore_failed();
                     let message = SqlEditorWidget::mysql_timeout_apply_error_message(
                         &err,
+                        db_type,
                         effective_query_timeout,
                     );
                     Self::set_current_mysql_cancel_context(
@@ -19464,7 +19523,7 @@ impl SqlEditorWidget {
                         crate::utils::logging::log_error(
                             log_context,
                             &format!(
-                                "Failed to restore MySQL pooled session timeout after cancel: {err}"
+                                "Failed to restore {db_display_name} pooled session timeout after cancel: {err}"
                             ),
                         );
                     })
@@ -19524,7 +19583,7 @@ impl SqlEditorWidget {
                             crate::utils::logging::log_error(
                                 log_context,
                                 &format!(
-                                    "Failed to restore MySQL pooled session timeout after scope check failure: {err}"
+                                    "Failed to restore {db_display_name} pooled session timeout after scope check failure: {err}"
                                 ),
                             );
                         })
@@ -19564,7 +19623,7 @@ impl SqlEditorWidget {
             if let Err(err) = timeout_restore.restore_for_db(&mut conn, db_type) {
                 crate::utils::logging::log_error(
                     log_context,
-                    &format!("Failed to restore MySQL pooled session timeout: {err}"),
+                    &format!("Failed to restore {db_display_name} pooled session timeout: {err}"),
                 );
                 Self::set_current_mysql_cancel_context(
                     current_mysql_cancel_context,
@@ -19667,6 +19726,7 @@ impl SqlEditorWidget {
             crate::db::MySqlPooledSessionReuseDecision::RetainIfSessionInfoSynced => {
                 let known_current_database =
                     Self::mysql_known_current_database_after_successful_statement(
+                        db_type,
                         statement_sql,
                         allow_global_database_update,
                         preserve_session_state_after_action,
@@ -19846,12 +19906,14 @@ impl SqlEditorWidget {
 
     pub(super) fn mysql_timeout_apply_error_message(
         err: &crate::db::query::mysql_executor::MysqlSessionTimeoutApplyError,
+        db_type: crate::db::DatabaseType,
         timeout: Option<Duration>,
     ) -> String {
         let apply_message = Self::mysql_error_message(err.apply_error(), timeout);
         if let Some(restore_error) = err.restore_error() {
+            let db_display_name = db_type.display_name();
             format!(
-                "{apply_message}; failed to restore MySQL session timeout after apply failure: {restore_error}"
+                "{apply_message}; failed to restore {db_display_name} session timeout after apply failure: {restore_error}"
             )
         } else {
             apply_message
@@ -25386,6 +25448,7 @@ mod query_execution_cleanup_tests {
         );
         assert_eq!(
             SqlEditorWidget::mysql_known_current_database_after_successful_statement(
+                DatabaseType::MySQL,
                 "USE `qt reporting`",
                 true,
                 true,
@@ -25394,12 +25457,16 @@ mod query_execution_cleanup_tests {
         );
         assert_eq!(
             SqlEditorWidget::mysql_known_current_database_after_successful_statement(
-                "SELECT 1", true, true,
+                DatabaseType::MySQL,
+                "SELECT 1",
+                true,
+                true,
             ),
             None
         );
         assert_eq!(
             SqlEditorWidget::mysql_known_current_database_after_successful_statement(
+                DatabaseType::MySQL,
                 "USE qt_reporting",
                 true,
                 false,
@@ -26876,8 +26943,14 @@ mod mysql_batch_execution_regression_tests {
             Some(database.as_str())
         );
 
-        SqlEditorWidget::prepare_mysql_pooled_session_database(&mut conn, "", &advanced, false)
-            .expect("empty execution scope should reset stale database state");
+        SqlEditorWidget::prepare_mysql_pooled_session_database(
+            &mut conn,
+            "",
+            &advanced,
+            DatabaseType::MySQL,
+            false,
+        )
+        .expect("empty execution scope should reset stale database state");
         let current_database = conn
             .query_first::<Option<String>, _>("SELECT DATABASE()")
             .expect("read database after empty-scope reset")
@@ -26943,6 +27016,13 @@ mod mysql_batch_execution_regression_tests {
     }
 
     fn mysql_test_connection_with_mode(mode: TransactionMode) -> Option<DatabaseConnection> {
+        mysql_test_connection_with_mode_for_db_type(mode, DatabaseType::MySQL)
+    }
+
+    fn mysql_test_connection_with_mode_for_db_type(
+        mode: TransactionMode,
+        db_type: DatabaseType,
+    ) -> Option<DatabaseConnection> {
         let Some(host) = mysql_test_env("SPACE_QUERY_TEST_MYSQL_HOST") else {
             eprintln!("skipping: SPACE_QUERY_TEST_MYSQL_HOST is not set");
             return None;
@@ -26975,7 +27055,7 @@ mod mysql_batch_execution_regression_tests {
                 &host,
                 port,
                 &database,
-                DatabaseType::MySQL,
+                db_type,
             ))
             .expect("MySQL/MariaDB test connection should succeed");
         connection
@@ -26987,6 +27067,18 @@ mod mysql_batch_execution_regression_tests {
     fn mysql_test_connection_with_advanced_transaction_defaults(
         isolation: TransactionIsolation,
         access_mode: TransactionAccessMode,
+    ) -> Option<DatabaseConnection> {
+        mysql_test_connection_with_advanced_transaction_defaults_for_db_type(
+            isolation,
+            access_mode,
+            DatabaseType::MySQL,
+        )
+    }
+
+    fn mysql_test_connection_with_advanced_transaction_defaults_for_db_type(
+        isolation: TransactionIsolation,
+        access_mode: TransactionAccessMode,
+        db_type: DatabaseType,
     ) -> Option<DatabaseConnection> {
         let Some(host) = mysql_test_env("SPACE_QUERY_TEST_MYSQL_HOST") else {
             eprintln!("skipping: SPACE_QUERY_TEST_MYSQL_HOST is not set");
@@ -27015,7 +27107,7 @@ mod mysql_batch_execution_regression_tests {
             &host,
             port,
             &database,
-            DatabaseType::MySQL,
+            db_type,
         );
         info.advanced.default_transaction_isolation = isolation;
         info.advanced.default_transaction_access_mode = access_mode;
@@ -27039,10 +27131,15 @@ mod mysql_batch_execution_regression_tests {
         cancel_flag: Arc<Mutex<bool>>,
         initial_auto_commit: bool,
         initial_database: String,
+        db_type: DatabaseType,
     }
 
     impl MysqlSessionRuleHarness {
         fn new(initial_auto_commit: bool) -> Option<Self> {
+            Self::new_for_db_type(initial_auto_commit, DatabaseType::MySQL)
+        }
+
+        fn new_for_db_type(initial_auto_commit: bool, db_type: DatabaseType) -> Option<Self> {
             let Some(host) = mysql_test_env("SPACE_QUERY_TEST_MYSQL_HOST") else {
                 eprintln!("skipping: SPACE_QUERY_TEST_MYSQL_HOST is not set");
                 return None;
@@ -27075,14 +27172,14 @@ mod mysql_batch_execution_regression_tests {
                     &host,
                     port,
                     &database,
-                    DatabaseType::MySQL,
+                    db_type,
                 ))
                 .expect("MySQL/MariaDB session-rule test connection should succeed");
 
             Some(Self {
                 shared_connection: Arc::new(Mutex::new(connection)),
                 session: Arc::new(Mutex::new(SessionState {
-                    db_type: DatabaseType::MySQL,
+                    db_type,
                     ..SessionState::default()
                 })),
                 current_mysql_cancel_context: Arc::new(Mutex::new(None)),
@@ -27094,6 +27191,7 @@ mod mysql_batch_execution_regression_tests {
                 cancel_flag: Arc::new(Mutex::new(false)),
                 initial_auto_commit,
                 initial_database: database,
+                db_type,
             })
         }
 
@@ -27102,7 +27200,7 @@ mod mysql_batch_execution_regression_tests {
             SqlEditorWidget::execute_mysql_batch(
                 &self.shared_connection,
                 &sender,
-                DatabaseType::MySQL,
+                self.db_type,
                 script,
                 "MYSQL_TEST",
                 &self.session,
@@ -27172,6 +27270,7 @@ mod mysql_batch_execution_regression_tests {
         session: &Arc<Mutex<SessionState>>,
         pooled_db_session: &crate::db::SharedDbSessionLease,
         mysql_auto_commit_override: &Arc<Mutex<Option<bool>>>,
+        db_type: DatabaseType,
         script: &str,
         initial_auto_commit: bool,
         db_activity: &str,
@@ -27188,7 +27287,7 @@ mod mysql_batch_execution_regression_tests {
         SqlEditorWidget::execute_mysql_batch(
             shared_connection,
             &sender,
-            DatabaseType::MySQL,
+            db_type,
             script,
             "MYSQL_TEST",
             session,
@@ -27543,8 +27642,9 @@ mod mysql_batch_execution_regression_tests {
         }
     }
 
-    fn assert_mysql_live_explain_routes_only_to_explain_plan() {
-        let Some(mut connection) = mysql_test_connection_with_mode(TransactionMode::default())
+    fn assert_mysql_live_explain_routes_only_to_explain_plan(db_type: DatabaseType) {
+        let Some(mut connection) =
+            mysql_test_connection_with_mode_for_db_type(TransactionMode::default(), db_type)
         else {
             return;
         };
@@ -27576,6 +27676,18 @@ mod mysql_batch_execution_regression_tests {
     }
 
     fn assert_mysql_batch_script_reaches_final_status_pass(script: &str, db_activity: &str) {
+        assert_mysql_batch_script_reaches_final_status_pass_for_db_type(
+            script,
+            db_activity,
+            DatabaseType::MySQL,
+        );
+    }
+
+    fn assert_mysql_batch_script_reaches_final_status_pass_for_db_type(
+        script: &str,
+        db_activity: &str,
+        db_type: DatabaseType,
+    ) {
         let Some(host) = mysql_test_env("SPACE_QUERY_TEST_MYSQL_HOST") else {
             eprintln!("skipping: SPACE_QUERY_TEST_MYSQL_HOST is not set");
             return;
@@ -27608,13 +27720,13 @@ mod mysql_batch_execution_regression_tests {
                 &host,
                 port,
                 &database,
-                DatabaseType::MySQL,
+                db_type,
             ))
             .expect("MySQL regression test connection should succeed");
 
         let shared_connection = Arc::new(Mutex::new(connection));
         let session = Arc::new(Mutex::new(SessionState {
-            db_type: DatabaseType::MySQL,
+            db_type,
             ..SessionState::default()
         }));
         let current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>> =
@@ -27631,7 +27743,7 @@ mod mysql_batch_execution_regression_tests {
         SqlEditorWidget::execute_mysql_batch(
             &shared_connection,
             &sender,
-            DatabaseType::MySQL,
+            db_type,
             script,
             "MYSQL_TEST",
             &session,
@@ -27826,7 +27938,21 @@ mod mysql_batch_execution_regression_tests {
         initial_auto_commit: bool,
         db_activity: &str,
     ) -> Option<(Vec<QueryProgress>, crate::db::SharedDbSessionLease)> {
-        let harness = MysqlSessionRuleHarness::new(initial_auto_commit)?;
+        execute_mysql_session_rule_script_for_db_type(
+            script,
+            initial_auto_commit,
+            db_activity,
+            DatabaseType::MySQL,
+        )
+    }
+
+    fn execute_mysql_session_rule_script_for_db_type(
+        script: &str,
+        initial_auto_commit: bool,
+        db_activity: &str,
+        db_type: DatabaseType,
+    ) -> Option<(Vec<QueryProgress>, crate::db::SharedDbSessionLease)> {
+        let harness = MysqlSessionRuleHarness::new_for_db_type(initial_auto_commit, db_type)?;
         let progress = harness.execute(script, db_activity);
         Some((progress, harness.pooled_db_session.clone()))
     }
@@ -28208,7 +28334,17 @@ DROP TABLE IF EXISTS qt_session_rule_result;
     #[test]
     #[ignore = "requires local MySQL or MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
     fn mysql_pooled_session_retains_open_transaction_until_rollback() {
-        let Some((progress, pooled_db_session)) = execute_mysql_session_rule_script(
+        assert_mysql_pooled_session_retains_open_transaction_until_rollback(DatabaseType::MySQL);
+    }
+
+    #[test]
+    #[ignore = "requires local MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn mariadb_pooled_session_retains_open_transaction_until_rollback() {
+        assert_mysql_pooled_session_retains_open_transaction_until_rollback(DatabaseType::MariaDB);
+    }
+
+    fn assert_mysql_pooled_session_retains_open_transaction_until_rollback(db_type: DatabaseType) {
+        let Some((progress, pooled_db_session)) = execute_mysql_session_rule_script_for_db_type(
             "\
 DROP TABLE IF EXISTS qt_session_rule_open_tx;
 CREATE TABLE qt_session_rule_open_tx (id INT PRIMARY KEY);
@@ -28218,6 +28354,7 @@ SELECT 'OPEN_TX' AS section_name, COUNT(*) AS row_count FROM qt_session_rule_ope
 ",
             true,
             "mysql open transaction retention regression",
+            db_type,
         ) else {
             return;
         };
@@ -28226,7 +28363,7 @@ SELECT 'OPEN_TX' AS section_name, COUNT(*) AS row_count FROM qt_session_rule_ope
         let snapshot = pooled_db_session
             .snapshot()
             .expect("open transaction should retain a pooled session");
-        assert_eq!(snapshot.db_type, DatabaseType::MySQL);
+        assert_eq!(snapshot.db_type, db_type);
         assert!(
             snapshot.transaction_state.may_have_uncommitted_work(),
             "open transaction should be visible as retained session state"
@@ -28234,11 +28371,14 @@ SELECT 'OPEN_TX' AS section_name, COUNT(*) AS row_count FROM qt_session_rule_ope
 
         pooled_db_session.clear();
 
-        let Some((cleanup_progress, cleanup_pooled_db_session)) = execute_mysql_session_rule_script(
-            "ROLLBACK; DROP TABLE IF EXISTS qt_session_rule_open_tx;",
-            true,
-            "mysql open transaction cleanup regression",
-        ) else {
+        let Some((cleanup_progress, cleanup_pooled_db_session)) =
+            execute_mysql_session_rule_script_for_db_type(
+                "ROLLBACK; DROP TABLE IF EXISTS qt_session_rule_open_tx;",
+                true,
+                "mysql open transaction cleanup regression",
+                db_type,
+            )
+        else {
             return;
         };
 
@@ -28246,7 +28386,7 @@ SELECT 'OPEN_TX' AS section_name, COUNT(*) AS row_count FROM qt_session_rule_ope
         let snapshot = cleanup_pooled_db_session.snapshot().expect(
             "rollback cleanup should keep the tab pooled session after selected range execution",
         );
-        assert_eq!(snapshot.db_type, DatabaseType::MySQL);
+        assert_eq!(snapshot.db_type, db_type);
         assert!(
             !snapshot.transaction_state.may_have_uncommitted_work(),
             "rollback cleanup should not be marked as transaction or lock state\n{}",
@@ -28395,13 +28535,13 @@ SELECT 'FINAL_STATUS' AS section_name,
                 &host,
                 port,
                 &database,
-                DatabaseType::MySQL,
+                DatabaseType::MariaDB,
             ))
             .expect("MySQL lazy fetch test connection should succeed");
 
         let shared_connection = Arc::new(Mutex::new(connection));
         let session = Arc::new(Mutex::new(SessionState {
-            db_type: DatabaseType::MySQL,
+            db_type: DatabaseType::MariaDB,
             ..SessionState::default()
         }));
         let current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>> =
@@ -28437,7 +28577,7 @@ SELECT 'FINAL_STATUS' AS section_name,
         SqlEditorWidget::execute_mysql_batch(
             &shared_connection,
             &sender,
-            DatabaseType::MySQL,
+            DatabaseType::MariaDB,
             &sql,
             "MYSQL_TEST",
             &session,
@@ -28545,8 +28685,8 @@ SELECT 'FINAL_STATUS' AS section_name,
         assert_eq!(finished_row_count, Some(total_rows));
     }
 
-    fn assert_mysql_or_mariadb_live_result_route_monitor() {
-        let Some(harness) = MysqlSessionRuleHarness::new(true) else {
+    fn assert_mysql_or_mariadb_live_result_route_monitor(db_type: DatabaseType) {
+        let Some(harness) = MysqlSessionRuleHarness::new_for_db_type(true, db_type) else {
             return;
         };
         let script = "\
@@ -28561,7 +28701,7 @@ DROP TEMPORARY TABLE IF EXISTS qt_result_route_monitor;
 ";
         let progress = harness.execute(script, "mysql result tab route monitor");
         assert_mysql_live_result_routes(&progress);
-        assert_mysql_live_explain_routes_only_to_explain_plan();
+        assert_mysql_live_explain_routes_only_to_explain_plan(db_type);
     }
 
     #[test]
@@ -28571,7 +28711,7 @@ DROP TEMPORARY TABLE IF EXISTS qt_result_route_monitor;
             eprintln!("skipping: route monitor requires MySQL 8 or newer");
             return;
         }
-        assert_mysql_or_mariadb_live_result_route_monitor();
+        assert_mysql_or_mariadb_live_result_route_monitor(DatabaseType::MySQL);
     }
 
     #[test]
@@ -28581,7 +28721,7 @@ DROP TEMPORARY TABLE IF EXISTS qt_result_route_monitor;
             eprintln!("skipping: route monitor requires MariaDB");
             return;
         }
-        assert_mysql_or_mariadb_live_result_route_monitor();
+        assert_mysql_or_mariadb_live_result_route_monitor(DatabaseType::MariaDB);
     }
 
     #[test]
@@ -28630,9 +28770,10 @@ DROP TEMPORARY TABLE IF EXISTS qt_result_route_monitor;
             eprintln!("skipping: test_mariadb/test8.txt requires MariaDB");
             return;
         }
-        assert_mysql_batch_script_reaches_final_status_pass(
+        assert_mysql_batch_script_reaches_final_status_pass_for_db_type(
             include_str!("../../../test_mariadb/test8.txt"),
             "mysql test8 regression",
+            DatabaseType::MariaDB,
         );
     }
 
@@ -28643,9 +28784,10 @@ DROP TEMPORARY TABLE IF EXISTS qt_result_route_monitor;
             eprintln!("skipping: test_mariadb/test7.txt requires MariaDB");
             return;
         }
-        assert_mysql_batch_script_reaches_final_status_pass(
+        assert_mysql_batch_script_reaches_final_status_pass_for_db_type(
             include_str!("../../../test_mariadb/test7.txt"),
             "mysql test7 regression",
+            DatabaseType::MariaDB,
         );
     }
 
@@ -28656,7 +28798,8 @@ DROP TEMPORARY TABLE IF EXISTS qt_result_route_monitor;
             eprintln!("skipping: tab session sequence requires MariaDB");
             return;
         }
-        let Some(harness) = MysqlSessionRuleHarness::new(true) else {
+        let Some(harness) = MysqlSessionRuleHarness::new_for_db_type(true, DatabaseType::MariaDB)
+        else {
             return;
         };
 
@@ -28707,6 +28850,7 @@ SELECT @qt_tab_marker AS marker;
                 &harness.session,
                 &pooled_sessions[index],
                 &auto_commit_overrides[index],
+                DatabaseType::MariaDB,
                 script,
                 harness.initial_auto_commit,
                 "mariadb tab session sequence regression",
@@ -28767,6 +28911,7 @@ SELECT @qt_tab_marker AS marker;
                 &harness.session,
                 &pooled_sessions[index],
                 &auto_commit_overrides[index],
+                DatabaseType::MariaDB,
                 cleanup_sql,
                 harness.initial_auto_commit,
                 "mariadb tab session sequence cleanup",
@@ -28775,10 +28920,10 @@ SELECT @qt_tab_marker AS marker;
         }
     }
 
-    #[test]
-    #[ignore = "requires local MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
-    fn mysql_set_autocommit_on_dirty_pooled_transaction_is_blocked() {
-        assert_mysql_batch_script_reaches_final_status_pass(
+    fn assert_set_autocommit_on_dirty_pooled_transaction_is_blocked_for_db_type(
+        db_type: DatabaseType,
+    ) {
+        assert_mysql_batch_script_reaches_final_status_pass_for_db_type(
             "\
 DROP TABLE IF EXISTS qt_pool_autocommit_regression;
 CREATE TABLE qt_pool_autocommit_regression (id INT PRIMARY KEY);
@@ -28793,6 +28938,23 @@ FROM qt_pool_autocommit_regression;
 DROP TABLE IF EXISTS qt_pool_autocommit_regression;
 ",
             "mysql pooled autocommit regression",
+            db_type,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local MySQL test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn mysql_set_autocommit_on_dirty_pooled_transaction_is_blocked() {
+        assert_set_autocommit_on_dirty_pooled_transaction_is_blocked_for_db_type(
+            DatabaseType::MySQL,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn mariadb_set_autocommit_on_dirty_pooled_transaction_is_blocked() {
+        assert_set_autocommit_on_dirty_pooled_transaction_is_blocked_for_db_type(
+            DatabaseType::MariaDB,
         );
     }
 
@@ -28812,6 +28974,26 @@ FROM qt_pool_commit_regression;
 DROP TABLE IF EXISTS qt_pool_commit_regression;
 ",
             "mysql pooled manual transaction commit regression",
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn mariadb_pooled_manual_transaction_commit_preserves_session_until_commit() {
+        assert_mysql_batch_script_reaches_final_status_pass_for_db_type(
+            "\
+DROP TABLE IF EXISTS qt_pool_commit_regression;
+CREATE TABLE qt_pool_commit_regression (id INT PRIMARY KEY);
+SET AUTOCOMMIT OFF;
+INSERT INTO qt_pool_commit_regression (id) VALUES (1);
+COMMIT;
+SELECT 'FINAL_STATUS' AS section_name,
+       CASE WHEN COUNT(*) = 1 THEN 'PASS' ELSE CONCAT('FAIL count=', COUNT(*)) END AS status
+FROM qt_pool_commit_regression;
+DROP TABLE IF EXISTS qt_pool_commit_regression;
+",
+            "mysql pooled manual transaction commit regression",
+            DatabaseType::MariaDB,
         );
     }
 }

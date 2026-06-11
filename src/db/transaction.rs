@@ -2782,10 +2782,14 @@ pub(crate) fn mysql_statement_consumes_pending_transaction_mode_override_for_pre
         // allowed to clear or bypass a pending SET TRANSACTION override.
         TransactionControlOutcome::StartsTransaction | TransactionControlOutcome::ReleasesSession
     ) || mysql_reset_connection_statement(&analysis)
-        || mysql_statement_starts_read_transaction_for_analysis(&effective_sql, &analysis)
+        || mysql_statement_starts_read_transaction_for_analysis(db_type, &effective_sql, &analysis)
         || mysql_statement_acquires_table_lock_for_analysis(&analysis)
         || mysql_statement_consumes_next_transaction_mode_override_via_implicit_commit(&analysis)
-        || (mysql_statement_may_leave_uncommitted_work_for_analysis(&effective_sql, &analysis)
+        || (mysql_statement_may_leave_uncommitted_work_for_analysis(
+            db_type,
+            &effective_sql,
+            &analysis,
+        )
             // SAVEPOINT / ROLLBACK TO / RELEASE SAVEPOINT preserve an already
             // open transaction but do not start the pending MySQL "next
             // transaction" in autocommit-on mode, so preflight must keep them
@@ -3080,6 +3084,7 @@ fn mysql_statement_opens_transaction_state_for_analysis(
 }
 
 fn mysql_statement_consumes_next_transaction_mode_override_for_analysis(
+    db_type: DatabaseType,
     sql: &str,
     analysis: &SqlStatementAnalysis<'_>,
 ) -> bool {
@@ -3090,11 +3095,12 @@ fn mysql_statement_consumes_next_transaction_mode_override_for_analysis(
             // COMMIT/ROLLBACK leave a next-transaction override pending.
             TransactionControlOutcome::ReleasesSession
         ) || mysql_statement_opens_transaction_state_for_analysis(analysis)
-            || mysql_statement_starts_read_transaction_for_analysis(sql, analysis)
-            || mysql_statement_may_leave_uncommitted_work_for_analysis(sql, analysis))
+            || mysql_statement_starts_read_transaction_for_analysis(db_type, sql, analysis)
+            || mysql_statement_may_leave_uncommitted_work_for_analysis(db_type, sql, analysis))
 }
 
 fn mysql_statement_consumes_next_transaction_mode_override_for_execution(
+    db_type: DatabaseType,
     sql: &str,
     analysis: &SqlStatementAnalysis<'_>,
     auto_commit: bool,
@@ -3117,7 +3123,7 @@ fn mysql_statement_consumes_next_transaction_mode_override_for_execution(
         return true;
     }
 
-    if mysql_statement_may_leave_uncommitted_work_for_analysis(sql, analysis) {
+    if mysql_statement_may_leave_uncommitted_work_for_analysis(db_type, sql, analysis) {
         let preserves_current_transaction_without_starting_one =
             mysql_statement_preserves_current_transaction_without_starting_one_for_analysis(
                 analysis,
@@ -3125,7 +3131,7 @@ fn mysql_statement_consumes_next_transaction_mode_override_for_execution(
         return !preserves_current_transaction_without_starting_one || !auto_commit;
     }
 
-    mysql_statement_starts_read_transaction_for_analysis(sql, analysis)
+    mysql_statement_starts_read_transaction_for_analysis(db_type, sql, analysis)
 }
 
 fn mysql_statement_consumes_next_transaction_mode_override_via_implicit_commit(
@@ -3179,6 +3185,7 @@ pub(crate) fn mysql_statement_session_effects_for_execution_context_for_db_type(
         .session_residue
         .consumes_next_transaction_mode_override =
         mysql_statement_consumes_next_transaction_mode_override_for_execution(
+            db_type,
             &effective_sql,
             &analysis,
             auto_commit,
@@ -3201,6 +3208,7 @@ pub(crate) fn mysql_statement_session_effects_for_execution_context(
 }
 
 fn mysql_statement_starts_read_transaction_for_analysis(
+    db_type: DatabaseType,
     sql: &str,
     analysis: &SqlStatementAnalysis<'_>,
 ) -> bool {
@@ -3208,19 +3216,28 @@ fn mysql_statement_starts_read_transaction_for_analysis(
         analysis.leading_keyword(),
         Some("SELECT" | "VALUES" | "TABLE")
     ) || (matches!(analysis.leading_keyword(), Some("WITH"))
-        && crate::db::query::mysql_executor::MysqlExecutor::is_select_statement(sql))
+        && crate::db::query::mysql_executor::MysqlExecutor::is_select_statement_for_db_type(
+            db_type, sql,
+        ))
 }
 
 fn mysql_statement_may_leave_uncommitted_work_for_analysis(
+    db_type: DatabaseType,
     sql: &str,
     analysis: &SqlStatementAnalysis<'_>,
 ) -> bool {
     let read_only_cte = matches!(analysis.leading_keyword(), Some("WITH"))
-        && crate::db::query::mysql_executor::MysqlExecutor::is_select_statement(sql);
+        && crate::db::query::mysql_executor::MysqlExecutor::is_select_statement_for_db_type(
+            db_type, sql,
+        );
     match analysis.leading_keyword() {
         Some("SELECT") if mysql_select_has_locking_clause(sql) => true,
         Some("WITH") if read_only_cte && mysql_select_has_locking_clause(sql) => true,
-        Some("WITH") => !crate::db::query::mysql_executor::MysqlExecutor::is_select_statement(sql),
+        Some("WITH") => {
+            !crate::db::query::mysql_executor::MysqlExecutor::is_select_statement_for_db_type(
+                db_type, sql,
+            )
+        }
         Some("START") if mysql_replication_control_statement(analysis) => false,
         Some("LOAD") if mysql_load_index_statement(analysis) => false,
         Some("RELEASE") if mysql_release_savepoint_statement_for_analysis(analysis) => true,
@@ -3860,17 +3877,20 @@ fn mysql_set_has_untracked_session_assignment(sql: &str) -> bool {
 #[cfg(test)]
 pub(crate) fn mysql_session_state_hint_for_sql(sql: &str) -> TransactionStatementStateHint {
     let analysis = SqlStatementAnalysis::new_for_db_type(DatabaseType::MySQL, sql);
-    mysql_session_state_hint_for_analysis(sql, &analysis)
+    mysql_session_state_hint_for_analysis(DatabaseType::MySQL, sql, &analysis)
 }
 
 fn mysql_session_state_hint_for_analysis(
+    db_type: DatabaseType,
     sql: &str,
     analysis: &SqlStatementAnalysis<'_>,
 ) -> TransactionStatementStateHint {
     let words = analysis.words();
     let leading_keyword = analysis.leading_keyword();
     let read_only_cte = matches!(leading_keyword, Some("WITH"))
-        && crate::db::query::mysql_executor::MysqlExecutor::is_select_statement(sql);
+        && crate::db::query::mysql_executor::MysqlExecutor::is_select_statement_for_db_type(
+            db_type, sql,
+        );
     let select_like = matches!(leading_keyword, Some("SELECT")) || read_only_cte;
     let locking_select = select_like && mysql_select_has_locking_clause(sql);
     let assigns_user_variable = mysql_statement_assigns_user_variable(sql, analysis);
@@ -4087,6 +4107,7 @@ fn mysql_session_state_hint_for_analysis(
 }
 
 fn mysql_session_residue_effects_for_analysis(
+    db_type: DatabaseType,
     sql: &str,
     analysis: &SqlStatementAnalysis<'_>,
     state_hint: TransactionStatementStateHint,
@@ -4134,7 +4155,9 @@ fn mysql_session_residue_effects_for_analysis(
         effects.may_leave_unknown_state = true;
     }
     effects.consumes_next_transaction_mode_override =
-        mysql_statement_consumes_next_transaction_mode_override_for_analysis(sql, analysis);
+        mysql_statement_consumes_next_transaction_mode_override_for_analysis(
+            db_type, sql, analysis,
+        );
     effects
 }
 
@@ -4167,7 +4190,8 @@ impl StatementSessionPostProcessor for MysqlStatementSessionPostProcessor {
     fn effects_for_sql(&self, sql: &str) -> StatementSessionEffects {
         let effective_sql = mysql_effective_statement_sql_for_db_type(self.db_type, sql);
         let analysis = SqlStatementAnalysis::new_for_db_type(self.db_type, &effective_sql);
-        let state_hint = mysql_session_state_hint_for_analysis(&effective_sql, &analysis);
+        let state_hint =
+            mysql_session_state_hint_for_analysis(self.db_type, &effective_sql, &analysis);
         let transaction_control_outcome = mysql_transaction_control_outcome_for_analysis(&analysis);
         let table_lock = if mysql_statement_releases_table_lock_for_analysis(&analysis) {
             StatementTableLockEffect::Releases
@@ -4210,6 +4234,7 @@ impl StatementSessionPostProcessor for MysqlStatementSessionPostProcessor {
                 has_implicit_commit: mysql_statement_has_implicit_commit_for_analysis(&analysis),
                 starts_state: mysql_statement_opens_transaction_state_for_analysis(&analysis),
                 may_leave_uncommitted_work: mysql_statement_may_leave_uncommitted_work_for_analysis(
+                    self.db_type,
                     &effective_sql,
                     &analysis,
                 ),
@@ -4223,6 +4248,7 @@ impl StatementSessionPostProcessor for MysqlStatementSessionPostProcessor {
                 ..StatementTransactionEffects::default()
             },
             session_residue: mysql_session_residue_effects_for_analysis(
+                self.db_type,
                 &effective_sql,
                 &analysis,
                 state_hint,

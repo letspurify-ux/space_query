@@ -442,6 +442,7 @@ impl MysqlExecutor {
         }
     }
 
+    #[cfg(test)]
     fn classify_statement(sql: &str) -> MysqlStatementKind {
         Self::classify_statement_for_db_type(DatabaseType::MySQL, sql)
     }
@@ -472,6 +473,7 @@ impl MysqlExecutor {
         row_values
     }
 
+    #[cfg(test)]
     pub(crate) fn is_select_statement(sql: &str) -> bool {
         matches!(Self::classify_statement(sql), MysqlStatementKind::Select)
     }
@@ -521,12 +523,28 @@ impl MysqlExecutor {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn is_use_statement(sql: &str) -> bool {
-        matches!(Self::classify_statement(sql), MysqlStatementKind::Use)
+        Self::is_use_statement_for_db_type(DatabaseType::MySQL, sql)
     }
 
+    pub(crate) fn is_use_statement_for_db_type(db_type: DatabaseType, sql: &str) -> bool {
+        matches!(
+            Self::classify_statement_for_db_type(db_type, sql),
+            MysqlStatementKind::Use
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn use_statement_database_name(sql: &str) -> Option<String> {
-        if !Self::is_use_statement(sql) {
+        Self::use_statement_database_name_for_db_type(DatabaseType::MySQL, sql)
+    }
+
+    pub(crate) fn use_statement_database_name_for_db_type(
+        db_type: DatabaseType,
+        sql: &str,
+    ) -> Option<String> {
+        if !Self::is_use_statement_for_db_type(db_type, sql) {
             return None;
         }
         Some(Self::extract_use_database_name(sql.trim()))
@@ -3341,6 +3359,12 @@ mod tests {
     }
 
     fn mysql_timeout_restore_test_connection() -> Option<DatabaseConnection> {
+        mysql_timeout_restore_test_connection_for_db_type(DatabaseType::MySQL)
+    }
+
+    fn mysql_timeout_restore_test_connection_for_db_type(
+        db_type: DatabaseType,
+    ) -> Option<DatabaseConnection> {
         let Some(host) = mysql_test_env("SPACE_QUERY_TEST_MYSQL_HOST") else {
             eprintln!("skipping: SPACE_QUERY_TEST_MYSQL_HOST is not set");
             return None;
@@ -3370,7 +3394,7 @@ mod tests {
                 &host,
                 port,
                 &database,
-                DatabaseType::MySQL,
+                db_type,
             ))
             .expect("MySQL/MariaDB timeout restore test connection should succeed");
         Some(connection)
@@ -3379,7 +3403,24 @@ mod tests {
     #[test]
     #[ignore = "requires local MySQL or MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
     fn mysql_session_timeout_restore_round_trips_real_session_variables() {
-        let Some(mut connection) = mysql_timeout_restore_test_connection() else {
+        assert_mysql_session_timeout_restore_round_trips_real_session_variables(
+            DatabaseType::MySQL,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn mariadb_session_timeout_restore_round_trips_real_session_variables() {
+        assert_mysql_session_timeout_restore_round_trips_real_session_variables(
+            DatabaseType::MariaDB,
+        );
+    }
+
+    fn assert_mysql_session_timeout_restore_round_trips_real_session_variables(
+        db_type: DatabaseType,
+    ) {
+        let Some(mut connection) = mysql_timeout_restore_test_connection_for_db_type(db_type)
+        else {
             return;
         };
         let db_type = connection.db_type();

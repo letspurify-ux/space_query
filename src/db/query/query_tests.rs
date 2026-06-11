@@ -17565,11 +17565,11 @@ SELECT 1;
 }
 
 #[test]
-fn transaction_feedback_policy_is_single_sourced_per_backend_family() {
+fn transaction_feedback_policy_is_single_sourced_per_database_type() {
     use crate::db::connection::DatabaseType;
     use result_messages::{transaction_feedback_flag, TransactionFeedbackStatement};
 
-    // Oracle family: DML reports both states; procedure-like work reports
+    // Oracle: DML reports both states; procedure-like work reports
     // feedback only when client auto-commit resolved it.
     assert_eq!(
         transaction_feedback_flag(
@@ -17604,7 +17604,7 @@ fn transaction_feedback_policy_is_single_sourced_per_backend_family() {
         None
     );
 
-    // MySQL family: DML and procedure calls both report either state.
+    // MySQL and MariaDB: DML and procedure calls both report either state.
     for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
         for statement in [
             TransactionFeedbackStatement::Dml,

@@ -652,7 +652,7 @@ fn retained_scope_apply_failures_do_not_keep_mismatched_sessions() {
     );
     assert!(
         mysql_helper.contains(
-            "failed to apply MySQL current database `{target_database}` to pooled session"
+            "failed to apply {display_name} current database `{target_database}` to pooled session"
         ),
         "MySQL/MariaDB scope apply failures should be handled explicitly"
     );
@@ -731,9 +731,12 @@ fn immediate_retained_scope_apply_failures_preserve_sessions_for_next_retry() {
     assert!(
         connection_content.contains("select_db(target_scope)")
             && connection_content.contains("mysql_empty_scope_requires_resolved_session_error()")
-            && connection_content.contains("reset_mysql_session_to_no_database(conn.as_mut())")
-            && connection_content
-                .contains("apply_mysql_connection_encoding_with_settings(conn, advanced)"),
+            && connection_content.contains(
+                "reset_mysql_session_to_no_database_for_db_type(\n                conn.as_mut(),\n                self.db_type,"
+            )
+            && connection_content.contains(
+                "apply_mysql_connection_encoding_with_settings_for_db_type(\n            conn,\n            advanced,\n            self.db_type,"
+            ),
         "MySQL/MariaDB retained sessions should select or clear the global database immediately"
     );
 }
@@ -768,7 +771,7 @@ fn empty_mysql_scope_with_preserved_session_requires_resolution() {
     assert!(
         helper.contains("if preserve_existing_session_state")
             && helper.contains("mysql_empty_scope_requires_resolved_session_error()")
-            && helper.contains("reset_mysql_pooled_session_to_no_database(conn, advanced)"),
+            && helper.contains("reset_mysql_pooled_session_to_no_database(conn, advanced, db_type)"),
         "Empty MySQL/MariaDB scope should reset clean sessions but block preserved retained sessions"
     );
     assert!(
@@ -1232,9 +1235,9 @@ fn primary_mysql_actions_reselect_global_database_before_use() {
     );
     assert!(
         helper.contains(".select_db(target_database.as_str())")
-            && helper.contains("reset_mysql_session_to_no_database(conn)")
-            && helper.contains("apply_mysql_session_settings(conn, &advanced)")
-            && helper.contains("apply_mysql_connection_encoding_with_settings"),
+            && helper.contains("reset_mysql_session_to_no_database_for_db_type(conn, db_type)")
+            && helper.contains("apply_mysql_session_settings_for_db_type(conn, &advanced, db_type)")
+            && helper.contains("apply_mysql_connection_encoding_with_settings_for_db_type"),
         "MySQL current database helper should reselect the global database, clear empty scope, and refresh encoding"
     );
 }
@@ -1259,9 +1262,13 @@ fn pooled_metadata_sessions_apply_current_scope_on_acquire() {
             && content.contains("DatabaseConnection::apply_oracle_current_schema")
             && content.contains("DatabaseConnection::apply_oracle_thin_current_schema")
             && content.contains("context.oracle_current_schema.as_deref()")
-            && content.contains("reset_mysql_session_to_no_database(conn.as_mut())")
+            && content.contains(
+                "reset_mysql_session_to_no_database_for_db_type(\n                conn.as_mut(),\n                self.db_type,"
+            )
             && content.contains("conn.as_mut().select_db(current_database)")
-            && content.contains("DatabaseConnection::apply_mysql_connection_encoding_with_settings")
+            && content.contains(
+                "DatabaseConnection::apply_mysql_connection_encoding_with_settings_for_db_type"
+            )
             && content.contains("&context.connection_info.advanced"),
         "New metadata/intellisense/object pool sessions should apply current Oracle schema or MySQL/MariaDB database, including empty database scope"
     );

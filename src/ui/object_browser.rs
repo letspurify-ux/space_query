@@ -409,6 +409,33 @@ fn object_browser_behavior_for(
     }
 }
 
+impl MysqlObjectBrowserBehavior {
+    fn take_object_action_session(
+        &self,
+        context: &crate::db::DbPoolSessionContext,
+        session: crate::db::DbPoolSession,
+    ) -> Result<mysql::PooledConn, String> {
+        let expected_db_type = context.connection_info.db_type;
+        let actual_db_type = session.db_type();
+        let crate::db::DbPoolSession::MySQL { conn, db_type } = session else {
+            return Err(format!(
+                "Expected {} object action session but acquired {}",
+                expected_db_type.display_name(),
+                actual_db_type
+            ));
+        };
+        if db_type.is_same_type_as(expected_db_type) {
+            Ok(conn)
+        } else {
+            Err(format!(
+                "Expected {} object action session but acquired {}",
+                expected_db_type.display_name(),
+                db_type
+            ))
+        }
+    }
+}
+
 #[derive(Clone)]
 enum RefreshEvent {
     Finished {
@@ -3318,18 +3345,24 @@ impl ObjectBrowserWidget {
         selected_scope: &str,
     ) -> Option<mysql::PooledConn> {
         context.ensure_current().ok()?;
+        let expected_db_type = context.connection_info.db_type;
+        let display_name = expected_db_type.display_name();
         let mut mysql_conn = match context.acquire_session_for_current_scope() {
-            Ok(crate::db::DbPoolSession::MySQL { conn, .. }) => conn,
+            Ok(crate::db::DbPoolSession::MySQL { conn, db_type })
+                if db_type.is_same_type_as(expected_db_type) =>
+            {
+                conn
+            }
             Ok(other) => {
                 eprintln!(
-                    "Warning: expected MySQL object-browser metadata session but acquired {}",
+                    "Warning: expected {display_name} object-browser metadata session but acquired {}",
                     other.db_type()
                 );
                 return None;
             }
             Err(err) => {
                 eprintln!(
-                    "Warning: failed to acquire MySQL object-browser metadata session: {err}"
+                    "Warning: failed to acquire {display_name} object-browser metadata session: {err}"
                 );
                 return None;
             }
@@ -3337,18 +3370,21 @@ impl ObjectBrowserWidget {
 
         if let Err(err) = mysql_conn.as_mut().select_db(selected_scope) {
             eprintln!(
-                "Warning: failed to select MySQL object-browser metadata database `{selected_scope}`: {err}"
+                "Warning: failed to select {display_name} object-browser metadata database `{selected_scope}`: {err}"
             );
             return None;
         }
 
         if let Err(err) =
-            crate::db::DatabaseConnection::apply_mysql_connection_encoding_with_settings(
+            crate::db::DatabaseConnection::apply_mysql_connection_encoding_with_settings_for_db_type(
                 &mut mysql_conn,
                 &context.connection_info.advanced,
+                expected_db_type,
             )
         {
-            eprintln!("Warning: failed to refresh MySQL object-browser metadata encoding: {err}");
+            eprintln!(
+                "Warning: failed to refresh {display_name} object-browser metadata encoding: {err}"
+            );
             return None;
         }
 
@@ -6961,12 +6997,7 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
         object_name: &str,
         routine_type: &str,
     ) -> Result<RoutineScriptData, String> {
-        let crate::db::DbPoolSession::MySQL { mut conn, .. } = session else {
-            return Err(format!(
-                "Expected MySQL object action session but acquired {}",
-                session.db_type()
-            ));
-        };
+        let mut conn = self.take_object_action_session(context, session)?;
         let action_scope = self.action_scope(selected_scope, context);
         let qualified_name = self.qualify_object_name(action_scope, object_name);
         crate::db::query::mysql_executor::MysqlObjectBrowser::get_routine_arguments_in_schema(
@@ -6989,12 +7020,7 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
         selected_scope: Option<&str>,
         table_name: &str,
     ) -> Result<Vec<TableColumnDetail>, String> {
-        let crate::db::DbPoolSession::MySQL { mut conn, .. } = session else {
-            return Err(format!(
-                "Expected MySQL object action session but acquired {}",
-                session.db_type()
-            ));
-        };
+        let mut conn = self.take_object_action_session(context, session)?;
         crate::db::query::mysql_executor::MysqlObjectBrowser::get_table_structure_in_schema(
             conn.as_mut(),
             self.action_scope(selected_scope, context),
@@ -7010,12 +7036,7 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
         selected_scope: Option<&str>,
         table_name: &str,
     ) -> Result<Vec<IndexInfo>, String> {
-        let crate::db::DbPoolSession::MySQL { mut conn, .. } = session else {
-            return Err(format!(
-                "Expected MySQL object action session but acquired {}",
-                session.db_type()
-            ));
-        };
+        let mut conn = self.take_object_action_session(context, session)?;
         crate::db::query::mysql_executor::MysqlObjectBrowser::get_index_details_in_schema(
             conn.as_mut(),
             self.action_scope(selected_scope, context),
@@ -7031,12 +7052,7 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
         selected_scope: Option<&str>,
         table_name: &str,
     ) -> Result<Vec<ConstraintInfo>, String> {
-        let crate::db::DbPoolSession::MySQL { mut conn, .. } = session else {
-            return Err(format!(
-                "Expected MySQL object action session but acquired {}",
-                session.db_type()
-            ));
-        };
+        let mut conn = self.take_object_action_session(context, session)?;
         crate::db::query::mysql_executor::MysqlObjectBrowser::get_table_constraints_in_schema(
             conn.as_mut(),
             self.action_scope(selected_scope, context),
@@ -7067,12 +7083,7 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
         object_type: &str,
         object_name: &str,
     ) -> Result<String, String> {
-        let crate::db::DbPoolSession::MySQL { mut conn, .. } = session else {
-            return Err(format!(
-                "Expected MySQL object action session but acquired {}",
-                session.db_type()
-            ));
-        };
+        let mut conn = self.take_object_action_session(context, session)?;
         match object_type {
             "MATERIALIZED_VIEW" | "SEQUENCE" | "SYNONYM" | "PACKAGE" | "TYPE" | "INDEX" => {
                 Err(format!(
@@ -7203,22 +7214,26 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
         use crate::db::query::mysql_executor::MysqlObjectBrowser;
 
         let db_type = context.connection_info.db_type;
+        let display_name = db_type.display_name();
         context.ensure_current().ok()?;
         let requested_scope = requested_scope
             .map(|scope| scope.trim().to_string())
             .filter(|scope| !scope.is_empty());
         let mut mysql_conn = match context.acquire_session_for_current_scope() {
-            Ok(crate::db::DbPoolSession::MySQL { conn, .. }) => conn,
+            Ok(crate::db::DbPoolSession::MySQL {
+                conn,
+                db_type: session_db_type,
+            }) if session_db_type.is_same_type_as(db_type) => conn,
             Ok(other) => {
                 eprintln!(
-                    "Warning: expected MySQL object-browser metadata session but acquired {}",
+                    "Warning: expected {display_name} object-browser metadata session but acquired {}",
                     other.db_type()
                 );
                 return None;
             }
             Err(err) => {
                 eprintln!(
-                    "Warning: failed to acquire MySQL object-browser metadata session: {err}"
+                    "Warning: failed to acquire {display_name} object-browser metadata session: {err}"
                 );
                 return None;
             }
@@ -7244,19 +7259,20 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
         if let Some(ref selected_scope) = selected_scope {
             if let Err(err) = mysql_conn.as_mut().select_db(selected_scope) {
                 eprintln!(
-                    "Warning: failed to select MySQL object-browser metadata database `{selected_scope}`: {err}"
+                    "Warning: failed to select {display_name} object-browser metadata database `{selected_scope}`: {err}"
                 );
                 return None;
             }
 
             if let Err(err) =
-                crate::db::DatabaseConnection::apply_mysql_connection_encoding_with_settings(
+                crate::db::DatabaseConnection::apply_mysql_connection_encoding_with_settings_for_db_type(
                     &mut mysql_conn,
                     &context.connection_info.advanced,
+                    db_type,
                 )
             {
                 eprintln!(
-                    "Warning: failed to refresh MySQL object-browser metadata encoding: {err}"
+                    "Warning: failed to refresh {display_name} object-browser metadata encoding: {err}"
                 );
                 return None;
             }

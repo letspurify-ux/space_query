@@ -666,6 +666,7 @@ trait TransactionActionBackend: Sync {
     fn run_retained_session_close_action(
         &self,
         lease: DbSessionLease,
+        expected_db_type: DatabaseType,
         action: CloseSessionAction,
         query_timeout: Option<Duration>,
         restore: RetainedSessionRestore<'_>,
@@ -1056,6 +1057,7 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
     fn run_retained_session_close_action(
         &self,
         lease: DbSessionLease,
+        expected_db_type: DatabaseType,
         action: CloseSessionAction,
         query_timeout: Option<Duration>,
         restore: RetainedSessionRestore<'_>,
@@ -1110,7 +1112,7 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
                 }
             }
             DbSessionLease::MySQL { .. } => Err(format!(
-                "Expected Oracle retained session but found {actual_db_type}"
+                "Expected {expected_db_type} retained session but found {actual_db_type}"
             )),
         }
     }
@@ -1205,6 +1207,7 @@ impl TransactionActionBackend for MysqlTransactionActionBackend {
     fn run_retained_session_close_action(
         &self,
         lease: DbSessionLease,
+        expected_db_type: DatabaseType,
         action: CloseSessionAction,
         query_timeout: Option<Duration>,
         restore: RetainedSessionRestore<'_>,
@@ -1216,7 +1219,7 @@ impl TransactionActionBackend for MysqlTransactionActionBackend {
         } = lease
         else {
             return Err(format!(
-                "Expected MySQL retained session but found {actual_db_type}"
+                "Expected {expected_db_type} retained session but found {actual_db_type}"
             ));
         };
         let timeout_restore = match crate::db::query::mysql_executor::MysqlExecutor::apply_session_timeout_with_restore_for_db(
@@ -1229,6 +1232,7 @@ impl TransactionActionBackend for MysqlTransactionActionBackend {
                 let restore_failed = err.restore_failed();
                 let message = SqlEditorWidget::mysql_timeout_apply_error_message(
                     &err,
+                    retained_db_type,
                     query_timeout,
                 );
                 if !restore_failed && SqlEditorWidget::mysql_error_allows_session_reuse(&message) {
@@ -1253,7 +1257,10 @@ impl TransactionActionBackend for MysqlTransactionActionBackend {
             Some(timeout_restore) => timeout_restore
                 .restore_for_db(&mut conn, retained_db_type)
                 .map_err(|err| {
-                    format!("Failed to restore MySQL session timeout while closing tab: {err}")
+                    format!(
+                        "Failed to restore {} session timeout while closing tab: {err}",
+                        retained_db_type.display_name()
+                    )
                 }),
             None => Ok(()),
         };
@@ -2523,6 +2530,7 @@ impl SqlEditorWidget {
 
         transaction_action_backend_for(db_type).run_retained_session_close_action(
             lease,
+            db_type,
             action,
             query_timeout,
             RetainedSessionRestore {

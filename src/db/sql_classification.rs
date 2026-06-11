@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use crate::db::connection::{DatabaseBackendKind, DatabaseType};
+use crate::db::connection::DatabaseType;
 use crate::sql_text;
 
 /// SQL classification for cancel / session-reuse decisions (session.md §6).
@@ -14,6 +14,25 @@ pub enum SqlKind {
     Script,
     TransactionControl,
     Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SqlClassificationProfile {
+    Oracle,
+    MySqlCompatible,
+}
+
+fn classification_profile_for_db_type(db_type: DatabaseType) -> SqlClassificationProfile {
+    match db_type {
+        DatabaseType::Oracle => SqlClassificationProfile::Oracle,
+        DatabaseType::MySQL | DatabaseType::MariaDB => SqlClassificationProfile::MySqlCompatible,
+    }
+}
+
+impl SqlClassificationProfile {
+    fn mysql_compatible_comments(self) -> bool {
+        matches!(self, SqlClassificationProfile::MySqlCompatible)
+    }
 }
 
 impl SqlKind {
@@ -42,10 +61,8 @@ impl<'a> SqlStatementAnalysis<'a> {
     }
 
     pub(crate) fn new_for_db_type(db_type: DatabaseType, sql: &'a str) -> Self {
-        let mysql_compatible = match db_type.backend_kind() {
-            DatabaseBackendKind::MySql => true,
-            DatabaseBackendKind::Oracle => false,
-        };
+        let profile = classification_profile_for_db_type(db_type);
+        let mysql_compatible = profile.mysql_compatible_comments();
         let stripped_sql = strip_leading_comments_and_whitespace_with_mode(sql, mysql_compatible);
         let stripped_sql = if mysql_compatible {
             mysql_sql_with_executable_comments_expanded(stripped_sql)
@@ -117,8 +134,8 @@ impl<'a> SqlStatementAnalysis<'a> {
 
         let first_word = self.leading_keyword().unwrap_or_default();
 
-        match db_type.backend_kind() {
-            DatabaseBackendKind::Oracle => match first_word {
+        match classification_profile_for_db_type(db_type) {
+            SqlClassificationProfile::Oracle => match first_word {
                 "BEGIN" | "DECLARE" => {
                     // PL/SQL blocks contain internal semicolons, but trailing
                     // SQL after the block must still be treated as a script for
@@ -132,7 +149,7 @@ impl<'a> SqlStatementAnalysis<'a> {
                 }
                 _ => {}
             },
-            DatabaseBackendKind::MySql => {}
+            SqlClassificationProfile::MySqlCompatible => {}
         }
 
         if self.has_multiple_statements {
@@ -309,9 +326,9 @@ fn statement_words_any_depth(sql: &str, mysql_compatible_comments: bool) -> Vec<
 }
 
 fn classify_first_word_for_db_type(db_type: DatabaseType, first_word: &str, sql: &str) -> SqlKind {
-    let (oracle_family, mysql_family) = match db_type.backend_kind() {
-        DatabaseBackendKind::Oracle => (true, false),
-        DatabaseBackendKind::MySql => (false, true),
+    let (oracle_family, mysql_family) = match classification_profile_for_db_type(db_type) {
+        SqlClassificationProfile::Oracle => (true, false),
+        SqlClassificationProfile::MySqlCompatible => (false, true),
     };
     let mysql_compatible_comments = mysql_family;
     match first_word {
@@ -561,8 +578,8 @@ fn classify_alter_sql_for_db_type(
     sql: &str,
     mysql_compatible_comments: bool,
 ) -> SqlKind {
-    match db_type.backend_kind() {
-        DatabaseBackendKind::Oracle => {
+    match classification_profile_for_db_type(db_type) {
+        SqlClassificationProfile::Oracle => {
             let words = statement_words(sql, mysql_compatible_comments);
             if words
                 .get(1)
@@ -574,7 +591,7 @@ fn classify_alter_sql_for_db_type(
                 return SqlKind::SessionControl;
             }
         }
-        DatabaseBackendKind::MySql => {}
+        SqlClassificationProfile::MySqlCompatible => {}
     }
     SqlKind::Ddl
 }
@@ -591,9 +608,9 @@ fn classify_oracle_lock_sql(sql: &str) -> SqlKind {
 }
 
 fn classify_explain_sql_for_db_type(db_type: DatabaseType, sql: &str) -> SqlKind {
-    match db_type.backend_kind() {
-        DatabaseBackendKind::MySql => return SqlKind::SelectLike,
-        DatabaseBackendKind::Oracle => {}
+    match classification_profile_for_db_type(db_type) {
+        SqlClassificationProfile::MySqlCompatible => return SqlKind::SelectLike,
+        SqlClassificationProfile::Oracle => {}
     }
 
     let words = statement_words(sql, false);
@@ -611,13 +628,13 @@ fn classify_select_sql_for_db_type(
     sql: &str,
     mysql_compatible_comments: bool,
 ) -> SqlKind {
-    let locking_select = match db_type.backend_kind() {
-        DatabaseBackendKind::Oracle => statement_contains_word_sequence_any_depth(
+    let locking_select = match classification_profile_for_db_type(db_type) {
+        SqlClassificationProfile::Oracle => statement_contains_word_sequence_any_depth(
             sql,
             mysql_compatible_comments,
             &["FOR", "UPDATE"],
         ),
-        DatabaseBackendKind::MySql => {
+        SqlClassificationProfile::MySqlCompatible => {
             statement_contains_word_sequence_any_depth(
                 sql,
                 mysql_compatible_comments,
@@ -645,10 +662,8 @@ pub(crate) fn sql_contains_word_sequence_any_depth_for_db_type(
     sql: &str,
     expected: &[&str],
 ) -> bool {
-    let mysql_compatible_comments = match db_type.backend_kind() {
-        DatabaseBackendKind::MySql => true,
-        DatabaseBackendKind::Oracle => false,
-    };
+    let mysql_compatible_comments =
+        classification_profile_for_db_type(db_type).mysql_compatible_comments();
     let stripped_sql =
         strip_leading_comments_and_whitespace_with_mode(sql, mysql_compatible_comments);
     let expanded_sql = if mysql_compatible_comments {
@@ -714,10 +729,7 @@ fn classify_set_sql_for_db_type(
     sql: &str,
     mysql_compatible_comments: bool,
 ) -> SqlKind {
-    let mysql_family = match db_type.backend_kind() {
-        DatabaseBackendKind::MySql => true,
-        DatabaseBackendKind::Oracle => false,
-    };
+    let mysql_family = classification_profile_for_db_type(db_type).mysql_compatible_comments();
     let words = statement_words(sql, mysql_compatible_comments);
     if words.first().is_none_or(|word| word != "SET") {
         return SqlKind::Unknown;
@@ -1118,10 +1130,7 @@ fn classify_start_sql_for_db_type(
     sql: &str,
     mysql_compatible_comments: bool,
 ) -> SqlKind {
-    let mysql_family = match db_type.backend_kind() {
-        DatabaseBackendKind::MySql => true,
-        DatabaseBackendKind::Oracle => false,
-    };
+    let mysql_family = classification_profile_for_db_type(db_type).mysql_compatible_comments();
     let words = statement_words(sql, mysql_compatible_comments);
     if words.first().is_some_and(|word| word == "START")
         && words.get(1).is_some_and(|word| word == "TRANSACTION")
@@ -1182,10 +1191,8 @@ fn classify_xa_sql(sql: &str, mysql_compatible_comments: bool) -> SqlKind {
 }
 
 fn classify_with_sql_for_db_type(db_type: DatabaseType, sql: &str) -> SqlKind {
-    let mysql_compatible_comments = match db_type.backend_kind() {
-        DatabaseBackendKind::MySql => true,
-        DatabaseBackendKind::Oracle => false,
-    };
+    let mysql_compatible_comments =
+        classification_profile_for_db_type(db_type).mysql_compatible_comments();
     let Some((with_token, _, mut pos)) = next_top_level_word(sql, 0, mysql_compatible_comments)
     else {
         return SqlKind::Unknown;

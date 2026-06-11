@@ -7,7 +7,7 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 
 use super::intellisense::{MYSQL_FUNCTIONS_SET, ORACLE_FUNCTIONS};
-use crate::db::connection::{DatabaseType, SqlDialect};
+use crate::db::connection::DatabaseType;
 use crate::sql_text;
 use crate::ui::font_settings::FontProfile;
 use crate::ui::theme;
@@ -31,10 +31,19 @@ pub const STYLE_QUOTED_IDENTIFIER: char = 'N';
 static ORACLE_FUNCTIONS_SET: Lazy<HashSet<&'static str>> =
     Lazy::new(|| ORACLE_FUNCTIONS.iter().copied().collect());
 
-fn function_catalog_for_dialect(dialect: SqlDialect) -> &'static HashSet<&'static str> {
-    match dialect {
-        SqlDialect::Oracle => &ORACLE_FUNCTIONS_SET,
-        SqlDialect::MySql => &MYSQL_FUNCTIONS_SET,
+fn function_catalog_for_db_type(db_type: DatabaseType) -> &'static HashSet<&'static str> {
+    match db_type {
+        DatabaseType::Oracle => &ORACLE_FUNCTIONS_SET,
+        DatabaseType::MySQL => &MYSQL_FUNCTIONS_SET,
+        DatabaseType::MariaDB => &MYSQL_FUNCTIONS_SET,
+    }
+}
+
+fn mysql_compatible_highlight_mode(db_type: DatabaseType) -> bool {
+    match db_type {
+        DatabaseType::Oracle => false,
+        DatabaseType::MySQL => true,
+        DatabaseType::MariaDB => true,
     }
 }
 
@@ -582,10 +591,7 @@ impl SqlHighlighter {
         let mut expect_alias_identifier = false;
         let mut exit_state = LexerState::Normal;
         let mut scan_context = HighlightScanContext::default();
-        let mysql_compatible = match self.db_type.sql_dialect() {
-            SqlDialect::MySql => true,
-            SqlDialect::Oracle => false,
-        };
+        let mysql_compatible = mysql_compatible_highlight_mode(self.db_type);
         let local_aliases = crate::ui::sql_editor::query_text::collect_local_alias_context(text);
 
         // ── Handle continuation of unclosed multi-line tokens ──────────
@@ -1301,7 +1307,7 @@ impl<'a> FoldedWord<'a> {
                 sql_text::is_oracle_sql_keyword(upper_ref)
                     || sql_text::is_mysql_sql_keyword(upper_ref),
                 sql_text::is_sql_keyword_for_db(upper_ref, db_type),
-                function_catalog_for_dialect(db_type.sql_dialect()).contains(upper_ref),
+                function_catalog_for_db_type(db_type).contains(upper_ref),
                 is_alias_eligible_plsql_control_keyword(upper_ref),
             )
         };

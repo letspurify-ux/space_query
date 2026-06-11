@@ -551,18 +551,24 @@ impl SchemaMetadataLoader for MysqlSchemaMetadataLoader {
         context: crate::db::DbPoolSessionContext,
         requested_scope: Option<String>,
     ) -> Option<IntellisenseData> {
+        let expected_db_type = context.connection_info.db_type;
+        let display_name = expected_db_type.display_name();
         context.ensure_current().ok()?;
         let mut mysql_conn = match context.acquire_session_for_current_scope() {
-            Ok(crate::db::DbPoolSession::MySQL { conn, .. }) => conn,
+            Ok(crate::db::DbPoolSession::MySQL { conn, db_type })
+                if db_type.is_same_type_as(expected_db_type) =>
+            {
+                conn
+            }
             Ok(other) => {
                 eprintln!(
-                    "Warning: expected MySQL metadata session but acquired {}",
+                    "Warning: expected {display_name} metadata session but acquired {}",
                     other.db_type()
                 );
                 return None;
             }
             Err(err) => {
-                eprintln!("Warning: failed to acquire MySQL metadata session: {err}");
+                eprintln!("Warning: failed to acquire {display_name} metadata session: {err}");
                 return None;
             }
         };
@@ -575,7 +581,7 @@ impl SchemaMetadataLoader for MysqlSchemaMetadataLoader {
         ) {
             Ok(schemas) => schemas,
             Err(err) => {
-                eprintln!("Warning: failed to load MySQL schema list: {err}");
+                eprintln!("Warning: failed to load {display_name} schema list: {err}");
                 Vec::new()
             }
         };
@@ -598,8 +604,8 @@ impl SchemaMetadataLoader for MysqlSchemaMetadataLoader {
                 Ok(objects) => objects,
                 Err(err) => {
                     eprintln!(
-                    "Warning: failed to load MySQL schema objects, keeping previous metadata: {err}"
-                );
+                        "Warning: failed to load {display_name} schema objects, keeping previous metadata: {err}"
+                    );
                     return None;
                 }
             };
@@ -612,7 +618,7 @@ impl SchemaMetadataLoader for MysqlSchemaMetadataLoader {
             Ok(members) => members,
             Err(err) => {
                 eprintln!(
-                    "Warning: failed to load MySQL relation members, keeping previous metadata: {err}"
+                    "Warning: failed to load {display_name} relation members, keeping previous metadata: {err}"
                 );
                 return None;
             }

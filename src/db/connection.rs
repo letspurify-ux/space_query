@@ -1198,7 +1198,7 @@ impl DbConnectionPool {
             DbConnectionPool::MySQL { pool, db_type, .. } => DbPoolSession::MySQL {
                 conn: pool
                     .try_get_conn(POOL_SESSION_ACQUIRE_TIMEOUT)
-                    .map_err(|err| Self::format_mysql_pool_acquire_error(&err))?,
+                    .map_err(|err| Self::format_mysql_pool_acquire_error(*db_type, &err))?,
                 db_type: *db_type,
             },
         };
@@ -1246,7 +1246,7 @@ impl DbConnectionPool {
         )
     }
 
-    fn format_mysql_pool_acquire_error(err: &mysql::Error) -> String {
+    fn format_mysql_pool_acquire_error(db_type: DatabaseType, err: &mysql::Error) -> String {
         let message = err.to_string();
         let looks_pool_exhausted =
             matches!(err, mysql::Error::DriverError(mysql::DriverError::Timeout));
@@ -1255,8 +1255,8 @@ impl DbConnectionPool {
         }
 
         format!(
-            "{}. MySQL connection pool appears exhausted. Finish or cancel lazy fetches in other result tabs, close unused query tabs, or increase Settings > Connection pool size.",
-            message
+            "{}. {} connection pool appears exhausted. Finish or cancel lazy fetches in other result tabs, close unused query tabs, or increase Settings > Connection pool size.",
+            message, db_type
         )
     }
 
@@ -2050,6 +2050,19 @@ static MARIADB_BACKEND: MysqlBackend = MysqlBackend {
         "MariaDB session time zone must be blank or an offset from -12:59 through +13:00",
 };
 
+impl MysqlBackend {
+    fn ensure_concrete_db_type(&self, actual: DatabaseType, resource: &str) -> Result<(), String> {
+        if actual.is_same_type_as(self.db_type) {
+            Ok(())
+        } else {
+            Err(format!(
+                "Expected {} {} but found {}",
+                self.display_name, resource, actual
+            ))
+        }
+    }
+}
+
 pub(crate) fn backend_for(db_type: DatabaseType) -> &'static dyn DbBackend {
     match db_type {
         DatabaseType::Oracle => &ORACLE_BACKEND,
@@ -2610,11 +2623,19 @@ impl DbBackend for MysqlBackend {
     ) -> Result<(DbConnection, DbConnectionPool), String> {
         let opts = DatabaseConnection::build_mysql_opts(info);
         let mut conn = mysql::Conn::new(opts).map_err(|err| {
-            eprintln!("MySQL connection error: {err}");
+            eprintln!("{} connection error: {err}", self.display_name());
             err.to_string()
         })?;
-        DatabaseConnection::apply_mysql_session_settings(&mut conn, &info.advanced)?;
-        DatabaseConnection::apply_mysql_autocommit_setting(&mut conn, auto_commit)?;
+        DatabaseConnection::apply_mysql_session_settings_for_db_type(
+            &mut conn,
+            &info.advanced,
+            self.db_type,
+        )?;
+        DatabaseConnection::apply_mysql_autocommit_setting_for_db_type(
+            &mut conn,
+            auto_commit,
+            self.db_type,
+        )?;
         Ok((
             DbConnection::MySQL {
                 conn,
@@ -2641,13 +2662,15 @@ impl DbBackend for MysqlBackend {
         session: &mut DbPoolSession,
         advanced: &ConnectionAdvancedSettings,
     ) -> Result<(), String> {
-        let DbPoolSession::MySQL { conn, .. } = session else {
+        let DbPoolSession::MySQL { conn, db_type } = session else {
             return Err(format!(
-                "Expected MySQL pool session but acquired {}",
+                "Expected {} pool session but acquired {}",
+                self.display_name,
                 session.db_type()
             ));
         };
-        DatabaseConnection::apply_mysql_session_settings(conn, advanced)
+        self.ensure_concrete_db_type(*db_type, "pool session")?;
+        DatabaseConnection::apply_mysql_session_settings_for_db_type(conn, advanced, self.db_type)
     }
 
     fn apply_current_scope_to_session(
@@ -2655,21 +2678,30 @@ impl DbBackend for MysqlBackend {
         context: &DbPoolSessionContext,
         session: &mut DbPoolSession,
     ) -> Result<(), String> {
-        let DbPoolSession::MySQL { conn, .. } = session else {
+        let DbPoolSession::MySQL { conn, db_type } = session else {
             return Err(format!(
-                "Expected MySQL pool session but acquired {}",
+                "Expected {} pool session but acquired {}",
+                self.display_name,
                 session.db_type()
             ));
         };
+        self.ensure_concrete_db_type(*db_type, "pool session")?;
         let current_database = context.current_service_name.trim();
         if current_database.is_empty() {
-            DatabaseConnection::reset_mysql_session_to_no_database(conn.as_mut())?;
-            DatabaseConnection::apply_mysql_session_settings(
+            DatabaseConnection::reset_mysql_session_to_no_database_for_db_type(
+                conn.as_mut(),
+                self.db_type,
+            )?;
+            DatabaseConnection::apply_mysql_session_settings_for_db_type(
                 conn,
                 &context.connection_info.advanced,
+                self.db_type,
             )
             .map_err(|err| {
-                format!("Failed to reapply MySQL session settings after database reset: {err}")
+                format!(
+                    "Failed to reapply {} session settings after database reset: {err}",
+                    self.display_name()
+                )
             })?;
             return DatabaseConnection::apply_mysql_session_transaction_options(
                 conn,
@@ -2681,14 +2713,21 @@ impl DbBackend for MysqlBackend {
         }
 
         conn.as_mut().select_db(current_database).map_err(|err| {
-            format!("Failed to apply MySQL current database `{current_database}`: {err}")
+            format!(
+                "Failed to apply {} current database `{current_database}`: {err}",
+                self.display_name()
+            )
         })?;
-        DatabaseConnection::apply_mysql_connection_encoding_with_settings(
+        DatabaseConnection::apply_mysql_connection_encoding_with_settings_for_db_type(
             conn,
             &context.connection_info.advanced,
+            self.db_type,
         )
         .map_err(|err| {
-            format!("Failed to refresh MySQL session encoding after database switch: {err}")
+            format!(
+                "Failed to refresh {} session encoding after database switch: {err}",
+                self.display_name()
+            )
         })?;
         DatabaseConnection::apply_mysql_session_transaction_options(
             conn,
@@ -2702,10 +2741,14 @@ impl DbBackend for MysqlBackend {
     fn test_connection(&self, info: &ConnectionInfo) -> Result<(), String> {
         let opts = DatabaseConnection::build_mysql_opts(info);
         let mut conn = mysql::Conn::new(opts).map_err(|err| {
-            eprintln!("MySQL connection error: {err}");
+            eprintln!("{} connection error: {err}", self.display_name());
             err.to_string()
         })?;
-        DatabaseConnection::apply_mysql_session_settings(&mut conn, &info.advanced)?;
+        DatabaseConnection::apply_mysql_session_settings_for_db_type(
+            &mut conn,
+            &info.advanced,
+            self.db_type,
+        )?;
         Ok(())
     }
 
@@ -2729,12 +2772,14 @@ impl DbBackend for MysqlBackend {
         advanced: &ConnectionAdvancedSettings,
         preserve_existing_session_state: bool,
     ) -> Result<(), String> {
-        let DbSessionLease::MySQL { conn, .. } = lease else {
+        let actual_db_type = lease.db_type();
+        let DbSessionLease::MySQL { conn, db_type } = lease else {
             return Err(format!(
-                "Expected MySQL retained session but found {}",
-                lease.db_type()
+                "Expected {} retained session but found {}",
+                self.display_name, actual_db_type
             ));
         };
+        self.ensure_concrete_db_type(*db_type, "retained session")?;
         let target_scope = target_scope.trim();
         if target_scope.is_empty() {
             if preserve_existing_session_state {
@@ -2742,8 +2787,15 @@ impl DbBackend for MysqlBackend {
                     DatabaseConnection::mysql_empty_scope_requires_resolved_session_error(),
                 );
             }
-            DatabaseConnection::reset_mysql_session_to_no_database(conn.as_mut())?;
-            return DatabaseConnection::apply_mysql_session_settings(conn, advanced);
+            DatabaseConnection::reset_mysql_session_to_no_database_for_db_type(
+                conn.as_mut(),
+                self.db_type,
+            )?;
+            return DatabaseConnection::apply_mysql_session_settings_for_db_type(
+                conn,
+                advanced,
+                self.db_type,
+            );
         }
         conn.as_mut()
             .select_db(target_scope)
@@ -2751,7 +2803,11 @@ impl DbBackend for MysqlBackend {
         if preserve_existing_session_state {
             return Ok(());
         }
-        DatabaseConnection::apply_mysql_connection_encoding_with_settings(conn, advanced)
+        DatabaseConnection::apply_mysql_connection_encoding_with_settings_for_db_type(
+            conn,
+            advanced,
+            self.db_type,
+        )
     }
 
     fn has_connection_scope(&self) -> bool {
@@ -2800,7 +2856,10 @@ impl DbBackend for MysqlBackend {
 
     fn after_connect(&self, connection: &mut DatabaseConnection) {
         if let Err(err) = connection.sync_mysql_current_database_name() {
-            eprintln!("Warning: failed to sync MySQL current database after connect: {err}");
+            eprintln!(
+                "Warning: failed to sync {} current database after connect: {err}",
+                self.display_name()
+            );
         }
     }
 
@@ -2810,11 +2869,17 @@ impl DbBackend for MysqlBackend {
         enabled: bool,
     ) -> Result<(), String> {
         match connection {
-            DbConnection::MySQL { conn, .. } => {
-                DatabaseConnection::apply_mysql_autocommit_setting(conn, enabled)
+            DbConnection::MySQL { conn, db_type } => {
+                self.ensure_concrete_db_type(*db_type, "live connection")?;
+                DatabaseConnection::apply_mysql_autocommit_setting_for_db_type(
+                    conn,
+                    enabled,
+                    self.db_type,
+                )
             }
             unexpected @ (DbConnection::Oracle(_) | DbConnection::OracleThin(_)) => Err(format!(
-                "Expected MySQL live connection but found {}",
+                "Expected {} live connection but found {}",
+                self.display_name,
                 unexpected.db_type()
             )),
         }
@@ -2837,12 +2902,14 @@ impl DbBackend for MysqlBackend {
         connection: &mut Option<DbConnection>,
     ) -> Result<Option<TransactionIsolation>, String> {
         match connection.as_mut() {
-            Some(DbConnection::MySQL { conn, .. }) => {
+            Some(DbConnection::MySQL { conn, db_type }) => {
+                self.ensure_concrete_db_type(*db_type, "live connection")?;
                 DatabaseConnection::read_mysql_default_transaction_isolation(conn)
             }
             Some(unexpected @ (DbConnection::Oracle(_) | DbConnection::OracleThin(_))) => {
                 Err(format!(
-                    "Expected MySQL live connection but found {}",
+                    "Expected {} live connection but found {}",
+                    self.display_name,
                     unexpected.db_type()
                 ))
             }
@@ -2857,7 +2924,8 @@ impl DbBackend for MysqlBackend {
         default_isolation: TransactionIsolation,
     ) -> Result<(), String> {
         match connection.as_mut() {
-            Some(DbConnection::MySQL { conn, .. }) => {
+            Some(DbConnection::MySQL { conn, db_type }) => {
+                self.ensure_concrete_db_type(*db_type, "live connection")?;
                 DatabaseConnection::apply_mysql_transaction_mode_for_db_with_default(
                     conn,
                     mode,
@@ -2867,7 +2935,8 @@ impl DbBackend for MysqlBackend {
             }
             Some(unexpected @ (DbConnection::Oracle(_) | DbConnection::OracleThin(_))) => {
                 Err(format!(
-                    "Expected MySQL live connection but found {}",
+                    "Expected {} live connection but found {}",
+                    self.display_name,
                     unexpected.db_type()
                 ))
             }
@@ -3236,27 +3305,33 @@ impl DatabaseConnection {
         }
     }
 
-    pub(crate) fn apply_mysql_session_settings<C: Queryable>(
+    pub(crate) fn apply_mysql_session_settings_for_db_type<C: Queryable>(
         conn: &mut C,
         advanced: &ConnectionAdvancedSettings,
+        db_type: DatabaseType,
     ) -> Result<(), String> {
+        let display_name = db_type.display_name();
         Self::validate_mysql_session_time_zone_for_server(conn, advanced.session_time_zone.trim())?;
         let statements = Self::mysql_session_setting_statements(advanced);
 
         for statement in statements {
             if let Err(err) = conn.query_drop(statement.as_str()) {
                 return Err(format!(
-                    "Failed to apply MySQL session setting `{statement}`: {err}"
+                    "Failed to apply {display_name} session setting `{statement}`: {err}"
                 ));
             }
         }
 
-        Self::apply_mysql_connection_encoding_with_settings(conn, advanced)
+        Self::apply_mysql_connection_encoding_with_settings_for_db_type(conn, advanced, db_type)
     }
 
-    pub(crate) fn reset_mysql_session_to_no_database(conn: &mut mysql::Conn) -> Result<(), String> {
+    pub(crate) fn reset_mysql_session_to_no_database_for_db_type(
+        conn: &mut mysql::Conn,
+        db_type: DatabaseType,
+    ) -> Result<(), String> {
+        let display_name = db_type.display_name();
         conn.change_user(mysql::ChangeUserOpts::new().with_db_name(None))
-            .map_err(|err| format!("Failed to reset MySQL session database scope: {err}"))
+            .map_err(|err| format!("Failed to reset {display_name} session database scope: {err}"))
     }
 
     pub(crate) fn mysql_empty_scope_requires_resolved_session_error() -> String {
@@ -3314,23 +3389,29 @@ impl DatabaseConnection {
         statements
     }
 
-    pub(crate) fn apply_mysql_connection_encoding_with_settings<C: Queryable>(
+    pub(crate) fn apply_mysql_connection_encoding_with_settings_for_db_type<C: Queryable>(
         conn: &mut C,
         advanced: &ConnectionAdvancedSettings,
+        db_type: DatabaseType,
     ) -> Result<(), String> {
-        let database_collation = Self::mysql_current_database_collation(conn);
+        let display_name = db_type.display_name();
+        let database_collation = Self::mysql_current_database_collation_for_db_type(conn, db_type);
         let statement =
             Self::mysql_set_names_statement_with_settings(database_collation.as_deref(), advanced);
 
         if let Err(err) = conn.query_drop(statement.as_str()) {
             return Err(format!(
-                "Failed to apply MySQL session setting `{statement}`: {err}"
+                "Failed to apply {display_name} session setting `{statement}`: {err}"
             ));
         }
         Ok(())
     }
 
-    fn mysql_current_database_collation<C: Queryable>(conn: &mut C) -> Option<String> {
+    fn mysql_current_database_collation_for_db_type<C: Queryable>(
+        conn: &mut C,
+        db_type: DatabaseType,
+    ) -> Option<String> {
+        let display_name = db_type.display_name();
         match conn.query_first::<String, _>(
             "SELECT DEFAULT_COLLATION_NAME \
              FROM INFORMATION_SCHEMA.SCHEMATA \
@@ -3340,7 +3421,7 @@ impl DatabaseConnection {
             Ok(None) => {}
             Err(err) => {
                 eprintln!(
-                    "Warning: failed to read MySQL current database collation for session setup: {err}"
+                    "Warning: failed to read {display_name} current database collation for session setup: {err}"
                 );
             }
         }
@@ -3349,7 +3430,7 @@ impl DatabaseConnection {
             Ok(value) => value.map(|collation| collation.trim().to_string()),
             Err(err) => {
                 eprintln!(
-                    "Warning: failed to read MySQL database collation for session setup: {err}"
+                    "Warning: failed to read {display_name} database collation for session setup: {err}"
                 );
                 None
             }
@@ -3546,18 +3627,21 @@ impl DatabaseConnection {
             }))
     }
 
-    fn apply_mysql_autocommit_setting<C: Queryable>(
+    fn apply_mysql_autocommit_setting_for_db_type<C: Queryable>(
         conn: &mut C,
         enabled: bool,
+        db_type: DatabaseType,
     ) -> Result<(), String> {
         let statement = if enabled {
             "SET autocommit = 1"
         } else {
             "SET autocommit = 0"
         };
+        let display_name = db_type.display_name();
 
-        conn.query_drop(statement)
-            .map_err(|err| format!("Failed to apply MySQL autocommit setting `{statement}`: {err}"))
+        conn.query_drop(statement).map_err(|err| {
+            format!("Failed to apply {display_name} autocommit setting `{statement}`: {err}")
+        })
     }
 
     pub(crate) fn apply_mysql_session_transaction_options<C: Queryable>(
@@ -3567,7 +3651,7 @@ impl DatabaseConnection {
         db_type: DatabaseType,
         default_transaction_isolation: TransactionIsolation,
     ) -> Result<(), String> {
-        Self::apply_mysql_autocommit_setting(conn, auto_commit)?;
+        Self::apply_mysql_autocommit_setting_for_db_type(conn, auto_commit, db_type)?;
         Self::apply_mysql_transaction_mode_for_db_with_default(
             conn,
             transaction_mode,
@@ -3622,7 +3706,9 @@ impl DatabaseConnection {
         conn: &mut C,
         log_context: &str,
         fallback_on_error: bool,
+        db_type: DatabaseType,
     ) -> TransactionProbeResult {
+        let display_name = db_type.display_name();
         match conn.query_first::<u64, _>(Self::mysql_session_transaction_probe_sql()) {
             Ok(Some(value)) => TransactionProbeResult {
                 may_have_uncommitted_work: value != 0,
@@ -3646,7 +3732,7 @@ impl DatabaseConnection {
                         logging::log_error(
                             log_context,
                             &format!(
-                                "Failed to inspect MySQL session transaction state: {primary_err}; fallback probe failed: {fallback_err}"
+                                "Failed to inspect {display_name} session transaction state: {primary_err}; fallback probe failed: {fallback_err}"
                             ),
                         );
                         TransactionProbeResult {
@@ -3674,8 +3760,9 @@ impl DatabaseConnection {
         conn: &mut C,
         log_context: &str,
         fallback_on_error: bool,
+        db_type: DatabaseType,
     ) -> bool {
-        Self::mysql_session_uncommitted_work_probe(conn, log_context, fallback_on_error)
+        Self::mysql_session_uncommitted_work_probe(conn, log_context, fallback_on_error, db_type)
             .may_have_uncommitted_work
     }
 
@@ -3732,8 +3819,8 @@ impl DatabaseConnection {
                 };
                 TransactionSessionState::from_flags(has_uncommitted, false)
             }
-            Some(DbConnection::MySQL { conn, .. }) => TransactionSessionState::from_flags(
-                Self::mysql_session_may_have_uncommitted_work(conn, log_context, true),
+            Some(DbConnection::MySQL { conn, db_type }) => TransactionSessionState::from_flags(
+                Self::mysql_session_may_have_uncommitted_work(conn, log_context, true, *db_type),
                 false,
             ),
             None => TransactionSessionState::Clean,
@@ -4077,16 +4164,23 @@ impl DatabaseConnection {
 
     fn ensure_connected_mysql_family(&self) -> Result<(), String> {
         if !self.connected {
-            return Err("Expected MySQL-family connection but none is active".to_string());
+            return Err("Expected MySQL/MariaDB connection but none is active".to_string());
         }
 
-        match self.info.db_type.backend_kind() {
-            DatabaseBackendKind::MySql => Ok(()),
-            DatabaseBackendKind::Oracle => Err(format!(
-                "Expected MySQL-family connection but {} is active",
+        match self.info.db_type {
+            DatabaseType::MySQL | DatabaseType::MariaDB => Ok(()),
+            DatabaseType::Oracle => Err(format!(
+                "Expected MySQL/MariaDB connection but {} is active",
                 self.info.db_type
             )),
         }
+    }
+
+    fn expected_connection_missing_message(&self) -> String {
+        format!(
+            "Expected {} connection but none is active",
+            self.info.db_type
+        )
     }
 
     pub fn set_transaction_mode(&mut self, mode: TransactionMode) -> Result<(), String> {
@@ -4127,9 +4221,9 @@ impl DatabaseConnection {
         mode: TransactionMode,
         default_isolation: TransactionIsolation,
     ) -> Result<Vec<String>, String> {
-        let mysql_family = match db_type.backend_kind() {
-            DatabaseBackendKind::MySql => true,
-            DatabaseBackendKind::Oracle => false,
+        let mysql_family = match db_type {
+            DatabaseType::MySQL | DatabaseType::MariaDB => true,
+            DatabaseType::Oracle => false,
         };
         let mode = if mysql_family
             && mode.isolation == TransactionIsolation::Default
@@ -4223,28 +4317,30 @@ impl DatabaseConnection {
     pub fn apply_tracked_mysql_current_database(&mut self) -> Result<(), String> {
         self.ensure_connected_mysql_family()?;
 
+        let db_type = self.info.db_type;
         let target_database = self.info.service_name.trim().to_string();
         let advanced = self.info.advanced.clone();
         let Some(conn) = self.get_mysql_connection_mut() else {
-            return Err("Expected MySQL connection but none is active".to_string());
+            return Err(self.expected_connection_missing_message());
         };
 
         if target_database.is_empty() {
-            Self::reset_mysql_session_to_no_database(conn)?;
-            return Self::apply_mysql_session_settings(conn, &advanced);
+            Self::reset_mysql_session_to_no_database_for_db_type(conn, db_type)?;
+            return Self::apply_mysql_session_settings_for_db_type(conn, &advanced, db_type);
         }
 
         conn.select_db(target_database.as_str())
             .map_err(|err| err.to_string())?;
-        Self::apply_mysql_connection_encoding_with_settings(conn, &advanced)
+        Self::apply_mysql_connection_encoding_with_settings_for_db_type(conn, &advanced, db_type)
     }
 
     pub fn sync_mysql_current_database_name(&mut self) -> Result<String, String> {
         self.ensure_connected_mysql_family()?;
 
+        let db_type = self.info.db_type;
         let advanced = self.info.advanced.clone();
         let Some(conn) = self.get_mysql_connection_mut() else {
-            return Err("Expected MySQL connection but none is active".to_string());
+            return Err(self.expected_connection_missing_message());
         };
 
         let current_database = conn
@@ -4253,7 +4349,7 @@ impl DatabaseConnection {
             .flatten()
             .map(|database| database.trim().to_string())
             .unwrap_or_default();
-        Self::apply_mysql_connection_encoding_with_settings(conn, &advanced)?;
+        Self::apply_mysql_connection_encoding_with_settings_for_db_type(conn, &advanced, db_type)?;
         if self.info.service_name != current_database {
             self.info.service_name = current_database.clone();
             self.bump_pool_context_epoch();
@@ -4268,6 +4364,7 @@ impl DatabaseConnection {
     ) -> Result<String, String> {
         self.ensure_connected_mysql_family()?;
 
+        let db_type = self.info.db_type;
         let advanced = self.info.advanced.clone();
         let current_database = conn
             .query_first::<Option<String>, _>("SELECT DATABASE()")
@@ -4276,19 +4373,25 @@ impl DatabaseConnection {
             .map(|database| database.trim().to_string())
             .unwrap_or_default();
         if refresh_encoding {
-            Self::apply_mysql_connection_encoding_with_settings(conn, &advanced)?;
+            Self::apply_mysql_connection_encoding_with_settings_for_db_type(
+                conn, &advanced, db_type,
+            )?;
         }
         let Some(primary_conn) = self.get_mysql_connection_mut() else {
-            return Err("Expected MySQL connection but none is active".to_string());
+            return Err(self.expected_connection_missing_message());
         };
         if current_database.is_empty() {
-            Self::reset_mysql_session_to_no_database(primary_conn)?;
+            Self::reset_mysql_session_to_no_database_for_db_type(primary_conn, db_type)?;
         } else {
             primary_conn
                 .select_db(current_database.as_str())
                 .map_err(|err| err.to_string())?;
         }
-        Self::apply_mysql_connection_encoding_with_settings(primary_conn, &advanced)?;
+        Self::apply_mysql_connection_encoding_with_settings_for_db_type(
+            primary_conn,
+            &advanced,
+            db_type,
+        )?;
         if self.info.service_name != current_database {
             self.info.service_name = current_database.clone();
             self.bump_pool_context_epoch();
@@ -4302,19 +4405,24 @@ impl DatabaseConnection {
     ) -> Result<String, String> {
         self.ensure_connected_mysql_family()?;
 
+        let db_type = self.info.db_type;
         let advanced = self.info.advanced.clone();
         let current_database = current_database.trim().to_string();
         let Some(primary_conn) = self.get_mysql_connection_mut() else {
-            return Err("Expected MySQL connection but none is active".to_string());
+            return Err(self.expected_connection_missing_message());
         };
         if current_database.is_empty() {
-            Self::reset_mysql_session_to_no_database(primary_conn)?;
+            Self::reset_mysql_session_to_no_database_for_db_type(primary_conn, db_type)?;
         } else {
             primary_conn
                 .select_db(current_database.as_str())
                 .map_err(|err| err.to_string())?;
         }
-        Self::apply_mysql_connection_encoding_with_settings(primary_conn, &advanced)?;
+        Self::apply_mysql_connection_encoding_with_settings_for_db_type(
+            primary_conn,
+            &advanced,
+            db_type,
+        )?;
         if self.info.service_name != current_database {
             self.info.service_name = current_database.clone();
             self.bump_pool_context_epoch();
@@ -4331,19 +4439,22 @@ impl DatabaseConnection {
     pub fn switch_mysql_database(&mut self, database: &str) -> Result<(), String> {
         self.ensure_connected_mysql_family()?;
 
+        let db_type = self.info.db_type;
         let target_database = database.trim();
         let advanced = self.info.advanced.clone();
         let Some(conn) = self.get_mysql_connection_mut() else {
-            return Err("Expected MySQL connection but none is active".to_string());
+            return Err(self.expected_connection_missing_message());
         };
 
         if target_database.is_empty() {
-            Self::reset_mysql_session_to_no_database(conn)?;
-            Self::apply_mysql_session_settings(conn, &advanced)?;
+            Self::reset_mysql_session_to_no_database_for_db_type(conn, db_type)?;
+            Self::apply_mysql_session_settings_for_db_type(conn, &advanced, db_type)?;
         } else {
             conn.select_db(target_database)
                 .map_err(|err| err.to_string())?;
-            Self::apply_mysql_connection_encoding_with_settings(conn, &advanced)?;
+            Self::apply_mysql_connection_encoding_with_settings_for_db_type(
+                conn, &advanced, db_type,
+            )?;
         }
         if self.info.service_name != target_database {
             self.info.service_name = target_database.to_string();
@@ -5126,6 +5237,10 @@ mod tests {
     }
 
     fn mysql_test_connection_info_from_env() -> ConnectionInfo {
+        mysql_test_connection_info_from_env_for(DatabaseType::MySQL)
+    }
+
+    fn mysql_test_connection_info_from_env_for(db_type: DatabaseType) -> ConnectionInfo {
         let host = std::env::var("SPACE_QUERY_TEST_MYSQL_HOST")
             .expect("SPACE_QUERY_TEST_MYSQL_HOST must be set");
         let database = std::env::var("SPACE_QUERY_TEST_MYSQL_DATABASE")
@@ -5139,15 +5254,7 @@ mod tests {
             .and_then(|value| value.parse::<u16>().ok())
             .unwrap_or(3306);
 
-        ConnectionInfo::new_with_type(
-            "local",
-            &user,
-            &password,
-            &host,
-            port,
-            &database,
-            DatabaseType::MySQL,
-        )
+        ConnectionInfo::new_with_type("local", &user, &password, &host, port, &database, db_type)
     }
 
     fn db_activity_test_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -6208,6 +6315,29 @@ mod tests {
     }
 
     #[test]
+    fn mysql_backend_rejects_concrete_db_type_mismatch() {
+        assert!(MYSQL_BACKEND
+            .ensure_concrete_db_type(DatabaseType::MySQL, "pool session")
+            .is_ok());
+        assert!(MARIADB_BACKEND
+            .ensure_concrete_db_type(DatabaseType::MariaDB, "pool session")
+            .is_ok());
+
+        let mysql_err = MYSQL_BACKEND
+            .ensure_concrete_db_type(DatabaseType::MariaDB, "pool session")
+            .expect_err("MySQL backend must reject a MariaDB session");
+        assert_eq!(mysql_err, "Expected MySQL pool session but found MariaDB");
+
+        let mariadb_err = MARIADB_BACKEND
+            .ensure_concrete_db_type(DatabaseType::MySQL, "live connection")
+            .expect_err("MariaDB backend must reject a MySQL live connection");
+        assert_eq!(
+            mariadb_err,
+            "Expected MariaDB live connection but found MySQL"
+        );
+    }
+
+    #[test]
     fn advanced_defaults_preserve_existing_db_specific_session_settings() {
         let oracle = ConnectionAdvancedSettings::default_for(DatabaseType::Oracle);
         assert_eq!(
@@ -6665,12 +6795,21 @@ mod tests {
     }
 
     #[test]
-    fn mysql_pool_timeout_error_gets_actionable_exhaustion_message() {
+    fn mysql_pool_timeout_error_gets_actionable_exhaustion_message_for_db_type() {
         let message = DbConnectionPool::format_mysql_pool_acquire_error(
+            DatabaseType::MySQL,
             &mysql::Error::DriverError(mysql::DriverError::Timeout),
         );
 
         assert!(message.contains("MySQL connection pool appears exhausted"));
+
+        let message = DbConnectionPool::format_mysql_pool_acquire_error(
+            DatabaseType::MariaDB,
+            &mysql::Error::DriverError(mysql::DriverError::Timeout),
+        );
+
+        assert!(message.contains("MariaDB connection pool appears exhausted"));
+        assert!(!message.contains("MySQL connection pool appears exhausted"));
     }
 
     #[test]
@@ -6679,9 +6818,11 @@ mod tests {
             std::io::ErrorKind::TimedOut,
             "Operation timed out",
         ));
-        let message = DbConnectionPool::format_mysql_pool_acquire_error(&err);
+        let message =
+            DbConnectionPool::format_mysql_pool_acquire_error(DatabaseType::MariaDB, &err);
 
         assert!(!message.contains("MySQL connection pool appears exhausted"));
+        assert!(!message.contains("MariaDB connection pool appears exhausted"));
     }
 
     #[test]
@@ -7377,7 +7518,7 @@ mod tests {
                 &host,
                 port,
                 &database,
-                DatabaseType::MySQL,
+                DatabaseType::MariaDB,
             ))
             .expect("MariaDB connection should succeed");
 
@@ -7412,7 +7553,17 @@ mod tests {
     #[test]
     #[ignore = "requires local MySQL or MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
     fn mysql_pool_session_applies_advanced_session_settings() {
-        let mut info = mysql_test_connection_info_from_env();
+        assert_mysql_pool_session_applies_advanced_session_settings(DatabaseType::MySQL);
+    }
+
+    #[test]
+    #[ignore = "requires local MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn mariadb_pool_session_applies_advanced_session_settings() {
+        assert_mysql_pool_session_applies_advanced_session_settings(DatabaseType::MariaDB);
+    }
+
+    fn assert_mysql_pool_session_applies_advanced_session_settings(db_type: DatabaseType) {
+        let mut info = mysql_test_connection_info_from_env_for(db_type);
         info.advanced.default_transaction_isolation = TransactionIsolation::RepeatableRead;
         info.advanced.session_time_zone = "+09:00".to_string();
         info.advanced.mysql_sql_mode = "ANSI_QUOTES,STRICT_TRANS_TABLES".to_string();
@@ -7495,7 +7646,17 @@ mod tests {
     #[test]
     #[ignore = "requires local MySQL or MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
     fn mysql_connect_applies_advanced_session_settings() {
-        let mut info = mysql_test_connection_info_from_env();
+        assert_mysql_connect_applies_advanced_session_settings(DatabaseType::MySQL);
+    }
+
+    #[test]
+    #[ignore = "requires local MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn mariadb_connect_applies_advanced_session_settings() {
+        assert_mysql_connect_applies_advanced_session_settings(DatabaseType::MariaDB);
+    }
+
+    fn assert_mysql_connect_applies_advanced_session_settings(db_type: DatabaseType) {
+        let mut info = mysql_test_connection_info_from_env_for(db_type);
         info.advanced.default_transaction_isolation = TransactionIsolation::RepeatableRead;
         info.advanced.default_transaction_access_mode = TransactionAccessMode::ReadOnly;
         info.advanced.session_time_zone = "+09:00".to_string();

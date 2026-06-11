@@ -627,7 +627,7 @@ pub fn health_check_oracle_session(conn: &OracleConnection, log_context: &str) -
 /// MySQL/MariaDB health check used by [`health_check_session`].
 pub fn health_check_mysql_session(conn: &mut mysql::PooledConn, log_context: &str) -> bool {
     if conn.as_mut().ping().is_err() {
-        crate::utils::logging::log_error(log_context, "MySQL pooled session ping failed");
+        crate::utils::logging::log_error(log_context, "MySQL/MariaDB pooled session ping failed");
         return false;
     }
     match conn.query_first::<u8, _>("SELECT 1") {
@@ -635,21 +635,21 @@ pub fn health_check_mysql_session(conn: &mut mysql::PooledConn, log_context: &st
         Ok(Some(value)) => {
             crate::utils::logging::log_error(
                 log_context,
-                &format!("MySQL pooled session health check returned {value}"),
+                &format!("MySQL/MariaDB pooled session health check returned {value}"),
             );
             false
         }
         Ok(None) => {
             crate::utils::logging::log_error(
                 log_context,
-                "MySQL pooled session health check returned no rows",
+                "MySQL/MariaDB pooled session health check returned no rows",
             );
             false
         }
         Err(err) => {
             crate::utils::logging::log_error(
                 log_context,
-                &format!("MySQL pooled session health check failed: {err}"),
+                &format!("MySQL/MariaDB pooled session health check failed: {err}"),
             );
             false
         }

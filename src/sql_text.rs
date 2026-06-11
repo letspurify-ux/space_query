@@ -6,6 +6,8 @@ use std::borrow::Cow;
 use std::collections::{HashSet, VecDeque};
 use std::sync::Mutex;
 
+use crate::db::connection::DatabaseType;
+
 /// Shared Oracle SQL keywords used by parser, IntelliSense, and formatter.
 pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "ABSENT",
@@ -1295,39 +1297,24 @@ type KeywordLookup = fn(&str) -> bool;
 const ORACLE_KEYWORD_LOOKUP: KeywordLookup = is_oracle_sql_keyword;
 const MYSQL_KEYWORD_LOOKUP: KeywordLookup = is_mysql_sql_keyword;
 
-fn keyword_lookup_for_dialect(dialect: crate::db::connection::SqlDialect) -> KeywordLookup {
-    match dialect {
-        crate::db::connection::SqlDialect::Oracle => ORACLE_KEYWORD_LOOKUP,
-        crate::db::connection::SqlDialect::MySql => MYSQL_KEYWORD_LOOKUP,
+fn keyword_lookup_for_db_type(db_type: DatabaseType) -> KeywordLookup {
+    match db_type {
+        DatabaseType::Oracle => ORACLE_KEYWORD_LOOKUP,
+        DatabaseType::MySQL => MYSQL_KEYWORD_LOOKUP,
+        DatabaseType::MariaDB => MYSQL_KEYWORD_LOOKUP,
     }
 }
 
-fn representative_db_type_for_format_dialect(
-    dialect: crate::db::connection::SqlDialect,
-) -> crate::db::connection::DatabaseType {
-    match dialect {
-        crate::db::connection::SqlDialect::Oracle => crate::db::connection::DatabaseType::Oracle,
-        crate::db::connection::SqlDialect::MySql => crate::db::connection::DatabaseType::MySQL,
-    }
-}
-
-pub(crate) fn format_preferred_db_type_for_sql(
-    sql: &str,
-) -> Option<crate::db::connection::DatabaseType> {
+pub(crate) fn format_preferred_db_type_for_sql(sql: &str) -> Option<DatabaseType> {
     if sql_uses_mysql_compatible_syntax(sql) {
         None
     } else {
-        Some(representative_db_type_for_format_dialect(
-            crate::db::connection::SqlDialect::Oracle,
-        ))
+        Some(DatabaseType::Oracle)
     }
 }
 
-pub(crate) fn is_sql_keyword_for_db(
-    word: &str,
-    db_type: crate::db::connection::DatabaseType,
-) -> bool {
-    let lookup = keyword_lookup_for_dialect(db_type.sql_dialect());
+pub(crate) fn is_sql_keyword_for_db(word: &str, db_type: DatabaseType) -> bool {
+    let lookup = keyword_lookup_for_db_type(db_type);
     lookup(word)
 }
 
@@ -2197,12 +2184,13 @@ fn should_cache_mysql_compatibility(sql: &str) -> bool {
 
 pub(crate) fn mysql_compatibility_for_sql(
     sql: &str,
-    preferred_db_type: Option<crate::db::connection::DatabaseType>,
+    preferred_db_type: Option<DatabaseType>,
 ) -> bool {
     if let Some(db_type) = preferred_db_type {
-        return match db_type.sql_dialect() {
-            crate::db::connection::SqlDialect::Oracle => false,
-            crate::db::connection::SqlDialect::MySql => true,
+        return match db_type {
+            DatabaseType::Oracle => false,
+            DatabaseType::MySQL => true,
+            DatabaseType::MariaDB => true,
         };
     }
 
@@ -8246,11 +8234,31 @@ mod tests {
             mysql_sql,
             Some(crate::db::connection::DatabaseType::MySQL)
         ));
+        assert!(mysql_compatibility_for_sql(
+            mysql_sql,
+            Some(crate::db::connection::DatabaseType::MariaDB)
+        ));
         assert!(!mysql_compatibility_for_sql(
             mysql_sql,
             Some(crate::db::connection::DatabaseType::Oracle)
         ));
         assert!(sql_uses_mysql_compatible_syntax("SELECT OLD.c <=> NEW.c"));
+    }
+
+    #[test]
+    fn keyword_lookup_uses_concrete_database_type_policy() {
+        assert!(is_sql_keyword_for_db(
+            "ZEROFILL",
+            crate::db::connection::DatabaseType::MySQL
+        ));
+        assert!(is_sql_keyword_for_db(
+            "ZEROFILL",
+            crate::db::connection::DatabaseType::MariaDB
+        ));
+        assert!(!is_sql_keyword_for_db(
+            "ZEROFILL",
+            crate::db::connection::DatabaseType::Oracle
+        ));
     }
 
     #[test]

@@ -52,6 +52,7 @@ fn foreign_keys_to_meta(fks: Vec<crate::db::ForeignKeyInfo>) -> Vec<ForeignKeyMe
 trait ColumnLoadBackend: Sync {
     fn load_columns(
         &self,
+        expected_db_type: crate::db::DatabaseType,
         session: crate::db::DbPoolSession,
         table_key: &str,
         schema_and_table: Option<(&str, &str)>,
@@ -61,6 +62,7 @@ trait ColumnLoadBackend: Sync {
     /// cacheable; `Err` means the fetch failed and should not be cached.
     fn load_foreign_keys(
         &self,
+        expected_db_type: crate::db::DatabaseType,
         session: crate::db::DbPoolSession,
         table_key: &str,
         schema_and_table: Option<(&str, &str)>,
@@ -84,6 +86,7 @@ fn column_load_backend_for(db_type: crate::db::DatabaseType) -> &'static dyn Col
 impl ColumnLoadBackend for OracleColumnLoadBackend {
     fn load_columns(
         &self,
+        _expected_db_type: crate::db::DatabaseType,
         session: crate::db::DbPoolSession,
         table_key: &str,
         _schema_and_table: Option<(&str, &str)>,
@@ -113,6 +116,7 @@ impl ColumnLoadBackend for OracleColumnLoadBackend {
 
     fn load_foreign_keys(
         &self,
+        _expected_db_type: crate::db::DatabaseType,
         session: crate::db::DbPoolSession,
         table_key: &str,
         _schema_and_table: Option<(&str, &str)>,
@@ -142,6 +146,7 @@ impl ColumnLoadBackend for OracleColumnLoadBackend {
 impl ColumnLoadBackend for MysqlColumnLoadBackend {
     fn load_columns(
         &self,
+        expected_db_type: crate::db::DatabaseType,
         session: crate::db::DbPoolSession,
         table_key: &str,
         schema_and_table: Option<(&str, &str)>,
@@ -149,8 +154,16 @@ impl ColumnLoadBackend for MysqlColumnLoadBackend {
         match session {
             crate::db::DbPoolSession::MySQL {
                 conn: mut mysql_conn,
-                ..
+                db_type,
             } => {
+                if !db_type.is_same_type_as(expected_db_type) {
+                    eprintln!(
+                        "Warning: expected {} column-load session but acquired {}",
+                        expected_db_type.display_name(),
+                        db_type.display_name()
+                    );
+                    return LoadedColumns::failed();
+                }
                 use crate::db::query::mysql_executor::MysqlObjectBrowser;
                 let result = if let Some((schema, table)) = schema_and_table {
                     MysqlObjectBrowser::get_table_structure_in_schema(
@@ -166,11 +179,19 @@ impl ColumnLoadBackend for MysqlColumnLoadBackend {
                     Err(_) => LoadedColumns::failed(),
                 }
             }
-            unexpected @ (crate::db::DbPoolSession::Oracle(_)
-            | crate::db::DbPoolSession::OracleThin(_)) => {
+            crate::db::DbPoolSession::Oracle(_) => {
                 eprintln!(
-                    "Warning: expected MySQL column-load session but acquired {}",
-                    unexpected.db_type()
+                    "Warning: expected {} column-load session but acquired {}",
+                    expected_db_type.display_name(),
+                    crate::db::DatabaseType::Oracle.display_name()
+                );
+                LoadedColumns::failed()
+            }
+            crate::db::DbPoolSession::OracleThin(_) => {
+                eprintln!(
+                    "Warning: expected {} column-load session but acquired {}",
+                    expected_db_type.display_name(),
+                    crate::db::DatabaseType::Oracle.display_name()
                 );
                 LoadedColumns::failed()
             }
@@ -179,6 +200,7 @@ impl ColumnLoadBackend for MysqlColumnLoadBackend {
 
     fn load_foreign_keys(
         &self,
+        expected_db_type: crate::db::DatabaseType,
         session: crate::db::DbPoolSession,
         table_key: &str,
         schema_and_table: Option<(&str, &str)>,
@@ -186,8 +208,16 @@ impl ColumnLoadBackend for MysqlColumnLoadBackend {
         match session {
             crate::db::DbPoolSession::MySQL {
                 conn: mut mysql_conn,
-                ..
+                db_type,
             } => {
+                if !db_type.is_same_type_as(expected_db_type) {
+                    eprintln!(
+                        "Warning: expected {} FK-load session but acquired {}",
+                        expected_db_type.display_name(),
+                        db_type.display_name()
+                    );
+                    return Err(());
+                }
                 use crate::db::query::mysql_executor::MysqlObjectBrowser;
                 let result = if let Some((schema, table)) = schema_and_table {
                     MysqlObjectBrowser::get_table_foreign_keys_in_schema(
@@ -200,11 +230,19 @@ impl ColumnLoadBackend for MysqlColumnLoadBackend {
                 };
                 result.map(foreign_keys_to_meta).map_err(|_| ())
             }
-            unexpected @ (crate::db::DbPoolSession::Oracle(_)
-            | crate::db::DbPoolSession::OracleThin(_)) => {
+            crate::db::DbPoolSession::Oracle(_) => {
                 eprintln!(
-                    "Warning: expected MySQL FK-load session but acquired {}",
-                    unexpected.db_type()
+                    "Warning: expected {} FK-load session but acquired {}",
+                    expected_db_type.display_name(),
+                    crate::db::DatabaseType::Oracle.display_name()
+                );
+                Err(())
+            }
+            crate::db::DbPoolSession::OracleThin(_) => {
+                eprintln!(
+                    "Warning: expected {} FK-load session but acquired {}",
+                    expected_db_type.display_name(),
+                    crate::db::DatabaseType::Oracle.display_name()
                 );
                 Err(())
             }
@@ -425,7 +463,12 @@ impl SqlEditorWidget {
         let backend = column_load_backend_for(context.connection_info.db_type);
 
         let update = if foreign_keys {
-            match backend.load_foreign_keys(pool_session, table_key.as_str(), schema_and_table_ref) {
+            match backend.load_foreign_keys(
+                context.connection_info.db_type,
+                pool_session,
+                table_key.as_str(),
+                schema_and_table_ref,
+            ) {
                 Ok(fks) => ColumnLoadUpdate {
                     table: table_key,
                     columns: Vec::new(),
@@ -444,7 +487,12 @@ impl SqlEditorWidget {
                 names: columns,
                 meta,
                 cache: cache_columns,
-            } = backend.load_columns(pool_session, table_key.as_str(), schema_and_table_ref);
+            } = backend.load_columns(
+                context.connection_info.db_type,
+                pool_session,
+                table_key.as_str(),
+                schema_and_table_ref,
+            );
             let column_meta: HashMap<String, ColumnMeta> = columns
                 .iter()
                 .zip(meta)

@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use crate::db::sql_classification::{SqlKind, SqlStatementAnalysis};
-use crate::db::{DatabaseBackendKind, DatabaseType};
+use crate::db::DatabaseType;
 
 use super::QueryExecutor;
 
@@ -98,9 +98,9 @@ pub fn statement_execution_profile_for_db_type(
 ) -> StatementExecutionProfile {
     let analysis = SqlStatementAnalysis::new_for_db_type(db_type, sql);
     let session_kind = analysis.classify_for_db_type(db_type);
-    let result_kind = match db_type.backend_kind() {
-        DatabaseBackendKind::Oracle => classify_oracle_result_kind(sql),
-        DatabaseBackendKind::MySql => classify_mysql_result_kind(db_type, sql),
+    let result_kind = match db_type {
+        DatabaseType::Oracle => classify_oracle_result_kind(sql),
+        DatabaseType::MySQL | DatabaseType::MariaDB => classify_mysql_result_kind(db_type, sql),
     };
     StatementExecutionProfile {
         result_kind,
@@ -113,12 +113,13 @@ pub fn query_timeout_for_statement_for_db_type(
     sql: &str,
     query_timeout: Option<Duration>,
 ) -> Option<Duration> {
-    let mysql_family = match db_type.backend_kind() {
-        DatabaseBackendKind::MySql => true,
-        DatabaseBackendKind::Oracle => false,
+    let statement_sets_session_timeout = match db_type {
+        DatabaseType::Oracle => false,
+        DatabaseType::MySQL | DatabaseType::MariaDB => {
+            mysql_statement_sets_session_timeout_variable(sql)
+        }
     };
-    if query_timeout.is_some() && mysql_family && mysql_statement_sets_session_timeout_variable(sql)
-    {
+    if query_timeout.is_some() && statement_sets_session_timeout {
         None
     } else {
         query_timeout
