@@ -234,14 +234,20 @@ impl RetainedSessionOptionChangePlan {
             let Some(snapshot) = editor.pooled_session_activity_snapshot() else {
                 continue;
             };
-            if self.db_type == DatabaseType::Oracle
+            let preserved_session_blocks_transaction_mode_change = match self.db_type.backend_kind()
+            {
+                DatabaseBackendKind::Oracle => true,
+                DatabaseBackendKind::MySql => false,
+            };
+            if preserved_session_blocks_transaction_mode_change
                 && action == "transaction mode"
                 && snapshot
                     .retained_state()
                     .requires_physical_session_preservation()
             {
                 return Err(format!(
-                    "Cannot change {action} while a retained Oracle DB session is {}. Resolve or discard it first.",
+                    "Cannot change {action} while a retained {} DB session is {}. Resolve or discard it first.",
+                    self.db_type.display_name(),
                     snapshot.retained_state().label()
                 ));
             }

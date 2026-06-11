@@ -67,6 +67,8 @@ pub struct ProcedureArgument {
 /// User-facing result messages shared by every database backend so the same
 /// operation reports the same text regardless of DB type or protocol.
 pub mod result_messages {
+    use crate::db::{DatabaseBackendKind, DatabaseType};
+
     pub const COMMIT_COMPLETE: &str = "Commit complete";
     pub const ROLLBACK_COMPLETE: &str = "Rollback complete";
     pub const CALL_EXECUTED: &str = "Call executed successfully";
@@ -88,6 +90,69 @@ pub mod result_messages {
             format!("{message} | Auto-commit applied")
         } else {
             format!("{message} | Commit required")
+        }
+    }
+
+    /// Statement categories that may carry transaction feedback. Executors map
+    /// their own statement classification onto these; the policy of which
+    /// category reports feedback lives in [`transaction_feedback_flag`].
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum TransactionFeedbackStatement {
+        Dml,
+        ProcedureLike,
+    }
+
+    /// Single source of truth for which successful statements carry
+    /// transaction feedback per backend family. Returns the flag to pass to
+    /// [`with_transaction_feedback`], or `None` when the statement reports no
+    /// feedback on this backend.
+    pub fn transaction_feedback_flag(
+        db_type: DatabaseType,
+        statement: TransactionFeedbackStatement,
+        auto_commit: bool,
+    ) -> Option<bool> {
+        match db_type.backend_kind() {
+            DatabaseBackendKind::Oracle => match statement {
+                TransactionFeedbackStatement::Dml => Some(auto_commit),
+                // Oracle reports procedure/PL-SQL feedback only when client
+                // auto-commit actually resolved the work; without auto-commit
+                // the block may not have touched the transaction at all.
+                TransactionFeedbackStatement::ProcedureLike => auto_commit.then_some(true),
+            },
+            // MySQL DML and CALL both leave commit-or-rollback work pending
+            // when autocommit is off, so both report either state.
+            DatabaseBackendKind::MySql => Some(auto_commit),
+        }
+    }
+
+    /// Append transaction feedback to a successful statement's message when
+    /// the shared policy says the statement carries it.
+    pub fn apply_transaction_feedback(
+        message: &str,
+        db_type: DatabaseType,
+        statement: Option<TransactionFeedbackStatement>,
+        auto_commit: bool,
+    ) -> String {
+        match statement
+            .and_then(|statement| transaction_feedback_flag(db_type, statement, auto_commit))
+        {
+            Some(flag) => with_transaction_feedback(message, flag),
+            None => message.to_string(),
+        }
+    }
+
+    /// Affected-row feedback for DML statements, shared by every executor so
+    /// OCI/thin/MySQL report the same text.
+    pub fn dml_rows_affected(statement_type: &str, affected_rows: u64) -> String {
+        format!("{statement_type} {affected_rows} row(s) affected")
+    }
+
+    /// OUT-bind feedback appended to PL/SQL and call results.
+    pub fn with_out_binds(message: &str, out_messages: &[String]) -> String {
+        if out_messages.is_empty() {
+            message.to_string()
+        } else {
+            format!("{message} | OUT: {}", out_messages.join(", "))
         }
     }
 }
@@ -345,7 +410,7 @@ impl QueryResult {
             rows: vec![],
             row_count: affected_rows as usize,
             execution_time,
-            message: format!("{} {} row(s) affected", statement_type, affected_rows),
+            message: result_messages::dml_rows_affected(statement_type, affected_rows),
             is_select: false,
             success: true,
         }
@@ -367,8 +432,9 @@ impl QueryResult {
             row_count: returned_rows,
             execution_time,
             message: format!(
-                "{} {} row(s) affected, {} row(s) returned",
-                statement_type, affected_rows, returned_rows
+                "{}, {} row(s) returned",
+                result_messages::dml_rows_affected(statement_type, affected_rows),
+                returned_rows
             ),
             is_select: true,
             success: true,

@@ -17563,3 +17563,107 @@ SELECT 1;
         "following statement must not leak into anonymous MariaDB block bounds"
     );
 }
+
+#[test]
+fn transaction_feedback_policy_is_single_sourced_per_backend_family() {
+    use crate::db::connection::DatabaseType;
+    use result_messages::{transaction_feedback_flag, TransactionFeedbackStatement};
+
+    // Oracle family: DML reports both states; procedure-like work reports
+    // feedback only when client auto-commit resolved it.
+    assert_eq!(
+        transaction_feedback_flag(
+            DatabaseType::Oracle,
+            TransactionFeedbackStatement::Dml,
+            true
+        ),
+        Some(true)
+    );
+    assert_eq!(
+        transaction_feedback_flag(
+            DatabaseType::Oracle,
+            TransactionFeedbackStatement::Dml,
+            false
+        ),
+        Some(false)
+    );
+    assert_eq!(
+        transaction_feedback_flag(
+            DatabaseType::Oracle,
+            TransactionFeedbackStatement::ProcedureLike,
+            true
+        ),
+        Some(true)
+    );
+    assert_eq!(
+        transaction_feedback_flag(
+            DatabaseType::Oracle,
+            TransactionFeedbackStatement::ProcedureLike,
+            false
+        ),
+        None
+    );
+
+    // MySQL family: DML and procedure calls both report either state.
+    for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+        for statement in [
+            TransactionFeedbackStatement::Dml,
+            TransactionFeedbackStatement::ProcedureLike,
+        ] {
+            assert_eq!(
+                transaction_feedback_flag(db_type, statement, true),
+                Some(true)
+            );
+            assert_eq!(
+                transaction_feedback_flag(db_type, statement, false),
+                Some(false)
+            );
+        }
+    }
+}
+
+#[test]
+fn apply_transaction_feedback_appends_only_when_policy_selects_the_statement() {
+    use crate::db::connection::DatabaseType;
+    use result_messages::{apply_transaction_feedback, TransactionFeedbackStatement};
+
+    assert_eq!(
+        apply_transaction_feedback(
+            "UPDATE 1 row(s) affected",
+            DatabaseType::Oracle,
+            Some(TransactionFeedbackStatement::Dml),
+            false
+        ),
+        "UPDATE 1 row(s) affected | Commit required"
+    );
+    assert_eq!(
+        apply_transaction_feedback(
+            "PL/SQL block executed successfully",
+            DatabaseType::Oracle,
+            Some(TransactionFeedbackStatement::ProcedureLike),
+            false
+        ),
+        "PL/SQL block executed successfully"
+    );
+    // DDL and other statements carry no feedback on any backend.
+    assert_eq!(
+        apply_transaction_feedback("Table created", DatabaseType::Oracle, None, true),
+        "Table created"
+    );
+}
+
+#[test]
+fn shared_result_message_formatters_match_executor_output() {
+    assert_eq!(
+        result_messages::dml_rows_affected("UPDATE", 7),
+        "UPDATE 7 row(s) affected"
+    );
+    assert_eq!(
+        result_messages::with_out_binds("Call executed successfully", &[":V = 1".to_string()]),
+        "Call executed successfully | OUT: :V = 1"
+    );
+    assert_eq!(
+        result_messages::with_out_binds("Call executed successfully", &[]),
+        "Call executed successfully"
+    );
+}

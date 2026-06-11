@@ -1506,7 +1506,8 @@ fn regression_07_oracle_transaction_mode_change_does_not_silently_clear_preserve
         "Oracle transaction mode changes must block preserved retained sessions before clear()"
     );
     assert!(
-        main_window.contains("self.db_type == DatabaseType::Oracle")
+        main_window.contains("match self.db_type.backend_kind()")
+            && main_window.contains("DatabaseBackendKind::Oracle => true")
             && main_window.contains("action == \"transaction mode\"")
             && main_window.contains("requires_physical_session_preservation()"),
         "main-window option preflight must reject Oracle retained sessions with residue before transaction mode changes"

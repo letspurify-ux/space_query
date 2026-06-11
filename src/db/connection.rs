@@ -550,6 +550,10 @@ impl DatabaseType {
         backend_for(self).choice_label()
     }
 
+    pub fn display_name(self) -> &'static str {
+        backend_for(self).display_name()
+    }
+
     pub fn connection_form_spec(self) -> DbConnectionFormSpec {
         backend_for(self).connection_form_spec()
     }

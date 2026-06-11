@@ -94,6 +94,14 @@ cancel/timeout/lazy fetch/세션 유지 정책을 항목별로 대조한다.
 - lazy fetch 배치 계약
 - auto-commit 의미론 (statement 단위 vs 세션 플래그)
 
+결과 메시지와 트랜잭션 피드백 조립은 `src/db/query/types.rs`의
+`result_messages` 공유 계층을 거친다: `dml_rows_affected`, `with_out_binds`,
+`apply_transaction_feedback`(정책은 `transaction_feedback_flag`).
+어떤 statement가 "| Auto-commit applied" / "| Commit required"를 보고하는지는
+`transaction_feedback_flag`의 exhaustive match 한 곳에만 존재하므로, 새
+family를 추가하면 이 함수에서 컴파일 에러로 피드백 정책 결정이 강제된다.
+실행기에서 이 텍스트들을 인라인으로 조립하지 않는다.
+
 ### 3.5 설정/UI
 
 - `ConnectionAdvancedSettings`에 백엔드 전용 필드 추가 (serde 저장 포맷이므로

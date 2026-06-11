@@ -5615,20 +5615,31 @@ impl SqlEditorWidget {
         )
     }
 
+    #[cfg(test)]
     fn mysql_result_requires_transaction_feedback_for_db_type(
         db_type: crate::db::DatabaseType,
         sql: &str,
         result: &QueryResult,
     ) -> bool {
-        if !result.success {
-            return false;
-        }
+        result.success
+            && Self::mysql_transaction_feedback_statement_for_db_type(db_type, sql).is_some()
+    }
 
-        matches!(
-            crate::db::session_policy::classify_sql_for_db_type(db_type, sql),
-            crate::db::session_policy::SqlKind::Dml
-                | crate::db::session_policy::SqlKind::PlsqlOrProcedure
-        )
+    /// Maps the MySQL-family SQL classification onto the shared transaction
+    /// feedback categories of `result_messages::transaction_feedback_flag`.
+    fn mysql_transaction_feedback_statement_for_db_type(
+        db_type: crate::db::DatabaseType,
+        sql: &str,
+    ) -> Option<result_messages::TransactionFeedbackStatement> {
+        match crate::db::session_policy::classify_sql_for_db_type(db_type, sql) {
+            crate::db::session_policy::SqlKind::Dml => {
+                Some(result_messages::TransactionFeedbackStatement::Dml)
+            }
+            crate::db::session_policy::SqlKind::PlsqlOrProcedure => {
+                Some(result_messages::TransactionFeedbackStatement::ProcedureLike)
+            }
+            _ => None,
+        }
     }
 
     #[cfg(test)]
@@ -5647,11 +5658,16 @@ impl SqlEditorWidget {
         sql: &str,
         auto_commit: bool,
     ) {
-        if !Self::mysql_result_requires_transaction_feedback_for_db_type(db_type, sql, result) {
+        if !result.success {
             return;
         }
 
-        result.message = result_messages::with_transaction_feedback(&result.message, auto_commit);
+        result.message = result_messages::apply_transaction_feedback(
+            &result.message,
+            db_type,
+            Self::mysql_transaction_feedback_statement_for_db_type(db_type, sql),
+            auto_commit,
+        );
     }
 
     pub(super) fn mysql_auto_commit_for_execution(
@@ -10267,13 +10283,8 @@ impl SqlEditorWidget {
                                     }
                                 }
 
-                                if !out_messages.is_empty() {
-                                    result.message = format!(
-                                        "{} | OUT: {}",
-                                        result.message,
-                                        out_messages.join(", ")
-                                    );
-                                }
+                                result.message =
+                                    result_messages::with_out_binds(&result.message, &out_messages);
 
                                 Self::mark_stop_execution_if_cancelled(
                                     &cancel_flag,
@@ -10290,8 +10301,10 @@ impl SqlEditorWidget {
                                     } else {
                                         cleanup.clear_oracle_pooled_session_maybe_dirty();
                                         result.message =
-                                            result_messages::with_transaction_feedback(
+                                            result_messages::apply_transaction_feedback(
                                                 &result.message,
+                                                crate::db::DatabaseType::Oracle,
+                                                Some(result_messages::TransactionFeedbackStatement::ProcedureLike),
                                                 true,
                                             );
                                     }
@@ -11673,13 +11686,8 @@ impl SqlEditorWidget {
                                     }
                                 }
 
-                                if !out_messages.is_empty() {
-                                    result.message = format!(
-                                        "{} | OUT: {}",
-                                        result.message,
-                                        out_messages.join(", ")
-                                    );
-                                }
+                                result.message =
+                                    result_messages::with_out_binds(&result.message, &out_messages);
 
                                 Self::mark_stop_execution_if_cancelled(
                                     &cancel_flag,
@@ -11712,9 +11720,13 @@ impl SqlEditorWidget {
                                     }
                                 }
 
-                                if dml_type.is_some() && !auto_commit && result.success {
-                                    result.message = result_messages::with_transaction_feedback(
+                                if !auto_commit && result.success {
+                                    result.message = result_messages::apply_transaction_feedback(
                                         &result.message,
+                                        crate::db::DatabaseType::Oracle,
+                                        dml_type.is_some().then_some(
+                                            result_messages::TransactionFeedbackStatement::Dml,
+                                        ),
                                         false,
                                     );
                                 }
@@ -11738,9 +11750,16 @@ impl SqlEditorWidget {
                                         );
                                     } else {
                                         cleanup.clear_oracle_pooled_session_maybe_dirty();
+                                        // The commit covers every non-skip statement, but only
+                                        // statements the shared policy selects (DML) report the
+                                        // feedback suffix, matching the thin-driver messages.
                                         result.message =
-                                            result_messages::with_transaction_feedback(
+                                            result_messages::apply_transaction_feedback(
                                                 &result.message,
+                                                crate::db::DatabaseType::Oracle,
+                                                dml_type.is_some().then_some(
+                                                    result_messages::TransactionFeedbackStatement::Dml,
+                                                ),
                                                 true,
                                             );
                                     }
@@ -12160,9 +12179,8 @@ impl SqlEditorWidget {
         let dml_type = (!has_exec_call)
             .then(|| Self::oracle_thin_dml_statement_type(head))
             .flatten();
-        let mut message = if let (Some(statement_type), Some(affected_rows)) = (dml_type, row_count)
-        {
-            format!("{} {} row(s) affected", statement_type, affected_rows)
+        let message = if let (Some(statement_type), Some(affected_rows)) = (dml_type, row_count) {
+            result_messages::dml_rows_affected(statement_type, affected_rows)
         } else if is_plsql_block {
             result_messages::PLSQL_BLOCK_EXECUTED.to_string()
         } else if is_call {
@@ -12172,16 +12190,20 @@ impl SqlEditorWidget {
             // ("Table created", "View dropped", "Session altered", ...).
             Self::ddl_message(head)
         };
-        if !out_messages.is_empty() {
-            message = format!("{} | OUT: {}", message, out_messages.join(", "));
-        }
-        if dml_type.is_some() {
-            // Match the OCI/MySQL DML transaction feedback.
-            message = result_messages::with_transaction_feedback(&message, auto_commit);
-        } else if auto_commit && (is_plsql_block || is_call) {
-            message = result_messages::with_transaction_feedback(&message, true);
-        }
-        message
+        let message = result_messages::with_out_binds(&message, out_messages);
+        let feedback_statement = if dml_type.is_some() {
+            Some(result_messages::TransactionFeedbackStatement::Dml)
+        } else if is_plsql_block || is_call {
+            Some(result_messages::TransactionFeedbackStatement::ProcedureLike)
+        } else {
+            None
+        };
+        result_messages::apply_transaction_feedback(
+            &message,
+            crate::db::DatabaseType::Oracle,
+            feedback_statement,
+            auto_commit,
+        )
     }
 
     #[cfg(test)]
