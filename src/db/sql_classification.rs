@@ -25,7 +25,8 @@ enum SqlClassificationProfile {
 fn classification_profile_for_db_type(db_type: DatabaseType) -> SqlClassificationProfile {
     match db_type {
         DatabaseType::Oracle => SqlClassificationProfile::Oracle,
-        DatabaseType::MySQL | DatabaseType::MariaDB => SqlClassificationProfile::MySqlCompatible,
+        DatabaseType::MySQL => SqlClassificationProfile::MySqlCompatible,
+        DatabaseType::MariaDB => SqlClassificationProfile::MySqlCompatible,
     }
 }
 

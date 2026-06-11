@@ -198,7 +198,13 @@ fn retained_session_execute_can_consume_pending_transaction_mode(
     // transaction, or release the physical session, through this preflight;
     // plain COMMIT/ROLLBACK leave the next-transaction override pending.
     match db_type {
-        DatabaseType::MySQL | DatabaseType::MariaDB => {
+        DatabaseType::MySQL => {
+            state.has_only_next_transaction_mode_override()
+                && mysql_statement_consumes_pending_transaction_mode_override_for_preflight(
+                    db_type, sql,
+                )
+        }
+        DatabaseType::MariaDB => {
             state.has_only_next_transaction_mode_override()
                 && mysql_statement_consumes_pending_transaction_mode_override_for_preflight(
                     db_type, sql,
@@ -690,9 +696,8 @@ pub fn is_recoverable_timeout_message(db_type: DatabaseType, err_msg: &str) -> b
         return false;
     }
     let has_structured_recoverable_timeout_marker = match db_type {
-        DatabaseType::MySQL | DatabaseType::MariaDB => {
-            has_structured_mysql_recoverable_timeout_marker(&lower)
-        }
+        DatabaseType::MySQL => has_structured_mysql_recoverable_timeout_marker(&lower),
+        DatabaseType::MariaDB => has_structured_mysql_recoverable_timeout_marker(&lower),
         DatabaseType::Oracle => false,
     };
     if has_structured_recoverable_timeout_marker {
@@ -788,13 +793,28 @@ fn has_fatal_connection_marker(lower: &str) -> bool {
 /// generic UI surfaces (e.g. the result table) that do not know the
 /// originating db_type. Exhaustive per-DB match so adding a backend forces a
 /// marker decision here instead of leaving the new DB's cancels unclassified.
+const MYSQL_QUERY_CANCEL_MARKERS: &[&str] = &[
+    // ERROR 1317 (KILL QUERY) and the "query was killed" prose form.
+    "query execution was interrupted",
+    "query was killed",
+];
+const MYSQL_CONNECTION_LOSS_MARKERS: &[&str] = &[
+    "lost connection",
+    "server has gone away",
+    "server has closed the connection",
+    "server closed the connection",
+    "connection was killed",
+    "communications link failure",
+    "error 2006",
+    "error 2013",
+];
+const NO_DB_ERROR_LINE_PATTERNS: &[&str] = &[];
+
 fn query_cancel_markers_for_db_type(db_type: DatabaseType) -> &'static [&'static str] {
     match db_type {
         DatabaseType::Oracle => &["ora-01013", "user requested cancel"],
-        DatabaseType::MySQL | DatabaseType::MariaDB => {
-            // ERROR 1317 (KILL QUERY) and the "query was killed" prose form.
-            &["query execution was interrupted", "query was killed"]
-        }
+        DatabaseType::MySQL => MYSQL_QUERY_CANCEL_MARKERS,
+        DatabaseType::MariaDB => MYSQL_QUERY_CANCEL_MARKERS,
     }
 }
 
@@ -813,16 +833,8 @@ fn connection_loss_markers_for_db_type(db_type: DatabaseType) -> &'static [&'sta
             "ora-03135",
             "dpi-1010",
         ],
-        DatabaseType::MySQL | DatabaseType::MariaDB => &[
-            "lost connection",
-            "server has gone away",
-            "server has closed the connection",
-            "server closed the connection",
-            "connection was killed",
-            "communications link failure",
-            "error 2006",
-            "error 2013",
-        ],
+        DatabaseType::MySQL => MYSQL_CONNECTION_LOSS_MARKERS,
+        DatabaseType::MariaDB => MYSQL_CONNECTION_LOSS_MARKERS,
     }
 }
 
@@ -835,7 +847,8 @@ fn error_line_patterns_for_db_type(db_type: DatabaseType) -> &'static [&'static 
         // errors that also carry a line number.
         DatabaseType::Oracle => &["ora-06512: at line"],
         // MySQL/MariaDB report "... at line N", covered by shared patterns.
-        DatabaseType::MySQL | DatabaseType::MariaDB => &[],
+        DatabaseType::MySQL => NO_DB_ERROR_LINE_PATTERNS,
+        DatabaseType::MariaDB => NO_DB_ERROR_LINE_PATTERNS,
     }
 }
 

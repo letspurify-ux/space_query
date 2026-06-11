@@ -680,7 +680,10 @@ pub(crate) fn statement_can_cleanup_retained_session_for_preflight(
     state: RetainedSessionState,
 ) -> bool {
     match db_type {
-        DatabaseType::MySQL | DatabaseType::MariaDB => {
+        DatabaseType::MySQL => {
+            return mysql_statement_can_cleanup_retained_session_for_preflight(db_type, sql, state);
+        }
+        DatabaseType::MariaDB => {
             return mysql_statement_can_cleanup_retained_session_for_preflight(db_type, sql, state);
         }
         DatabaseType::Oracle => {}

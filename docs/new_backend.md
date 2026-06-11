@@ -46,8 +46,12 @@ variant 추가 후 컴파일 에러가 발생하는 디스패치 레지스트리
 | 디스패치 함수 | 위치 | 역할 |
 |---|---|---|
 | `backend_for` | `src/db/connection.rs` | `DbBackend` — 연결/풀/트랜잭션 옵션/scope |
-| `db_execution_backend_for` | `src/db/query/execution_backend.rs` | statement 분류/타임아웃 프로파일 |
-| `statement_session_post_processor_for` | `src/db/transaction.rs` | statement 후 세션 상태 힌트 |
+| `db_execution_backend_for` / `statement_execution_profile_for_db_type` / `query_timeout_for_statement_for_db_type` | `src/db/query/execution_backend.rs` | statement 분류/타임아웃 프로파일 |
+| `classification_profile_for_db_type` | `src/db/sql_classification.rs` | SQL 분류 family 프로파일 |
+| `statement_can_cleanup_retained_session_for_preflight` / `statement_session_post_processor_for` | `src/db/transaction.rs` | retained session preflight와 statement 후 세션 상태 힌트 |
+| `is_recoverable_timeout_message` / `retained_session_execute_can_consume_pending_transaction_mode` / `query_cancel_markers_for_db_type` / `connection_loss_markers_for_db_type` / `error_line_patterns_for_db_type` | `src/db/session_policy.rs` | retained session 실행 preflight, recoverable timeout, 범용 UI 메시지 분류용 드라이버 에러 마커 |
+| `keyword_lookup_for_db_type` / `mysql_compatibility_for_sql` | `src/sql_text.rs` | SQL 키워드/주석 호환성 정책 |
+| `transaction_feedback_flag` | `src/db/query/types.rs` | 사용자 표시용 트랜잭션 피드백 메시지 정책 |
 | `execution_worker_backend_for` | `src/ui/sql_editor/execution.rs` | 실행 워커 진입점 |
 | `transaction_action_backend_for` | `src/ui/sql_editor/mod.rs` | commit/rollback/discard 액션 |
 | `explain_plan_backend_for` | `src/ui/sql_editor/mod.rs` | 실행 계획 |

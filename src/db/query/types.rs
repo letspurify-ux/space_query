@@ -128,7 +128,8 @@ pub mod result_messages {
             },
             // MySQL DML and CALL both leave commit-or-rollback work pending
             // when autocommit is off, so both report either state.
-            DatabaseType::MySQL | DatabaseType::MariaDB => Some(auto_commit),
+            DatabaseType::MySQL => Some(auto_commit),
+            DatabaseType::MariaDB => Some(auto_commit),
         }
     }
 

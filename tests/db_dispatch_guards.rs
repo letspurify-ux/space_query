@@ -1598,6 +1598,46 @@ impl<'a> RegistryFunctionDispatchVisitor<'a> {
     }
 }
 
+#[derive(Default)]
+struct DatabaseTypeRegistryMatchVisitor {
+    found: bool,
+    offenders: Vec<(usize, &'static str)>,
+}
+
+impl Visit<'_> for DatabaseTypeRegistryMatchVisitor {
+    fn visit_expr_match(&mut self, node: &ExprMatch) {
+        let match_mentions_database_type =
+            node.arms.iter().any(|arm| mentions_database_type(&arm.pat));
+        if match_mentions_database_type {
+            self.found = true;
+            for arm in &node.arms {
+                if !mentions_database_type(&arm.pat)
+                    && pattern_contains_swallowing_binding(&arm.pat)
+                {
+                    self.offenders.push((
+                        arm.pat.span().start().line,
+                        "wildcard arm in DatabaseType registry match",
+                    ));
+                } else if database_type_registry_pattern_groups_variants(&arm.pat) {
+                    self.offenders.push((
+                        arm.pat.span().start().line,
+                        "grouped DatabaseType arm in registry match",
+                    ));
+                }
+            }
+        }
+        visit::visit_expr_match(self, node);
+    }
+}
+
+fn collect_database_type_registry_match_offenders(
+    block: &syn::Block,
+) -> (bool, Vec<(usize, &'static str)>) {
+    let mut visitor = DatabaseTypeRegistryMatchVisitor::default();
+    visitor.visit_block(block);
+    (visitor.found, visitor.offenders)
+}
+
 impl Visit<'_> for RegistryFunctionDispatchVisitor<'_> {
     fn visit_item_mod(&mut self, node: &ItemMod) {
         if attrs_are_test_only(&node.attrs) {
@@ -1626,12 +1666,17 @@ impl Visit<'_> for RegistryFunctionDispatchVisitor<'_> {
                     "registry dispatch uses backend_kind()",
                 );
             }
-            if !body.contains("DatabaseType") {
+            let (has_database_type_match, database_type_match_offenders) =
+                collect_database_type_registry_match_offenders(&node.block);
+            if !has_database_type_match {
                 self.push_offender(
                     node.sig.ident.span().start().line,
                     &function_name,
-                    "registry dispatch does not mention concrete DatabaseType",
+                    "registry dispatch does not match on concrete DatabaseType",
                 );
+            }
+            for (line, pattern) in database_type_match_offenders {
+                self.push_offender(line, &function_name, pattern);
             }
         }
         visit::visit_item_fn(self, node);
@@ -2136,12 +2181,38 @@ const BACKEND_REGISTRY_FILES: &[(&str, &[&str])] = &[
     ("src/db/connection.rs", &["backend_for"]),
     (
         "src/db/query/execution_backend.rs",
-        &["db_execution_backend_for"],
+        &[
+            "db_execution_backend_for",
+            "statement_execution_profile_for_db_type",
+            "query_timeout_for_statement_for_db_type",
+        ],
+    ),
+    (
+        "src/db/sql_classification.rs",
+        &["classification_profile_for_db_type"],
     ),
     (
         "src/db/transaction.rs",
-        &["statement_session_post_processor_for"],
+        &[
+            "statement_can_cleanup_retained_session_for_preflight",
+            "statement_session_post_processor_for",
+        ],
     ),
+    (
+        "src/db/session_policy.rs",
+        &[
+            "is_recoverable_timeout_message",
+            "retained_session_execute_can_consume_pending_transaction_mode",
+            "query_cancel_markers_for_db_type",
+            "connection_loss_markers_for_db_type",
+            "error_line_patterns_for_db_type",
+        ],
+    ),
+    (
+        "src/sql_text.rs",
+        &["keyword_lookup_for_db_type", "mysql_compatibility_for_sql"],
+    ),
+    ("src/db/query/types.rs", &["transaction_feedback_flag"]),
     (
         "src/ui/sql_editor/execution.rs",
         &["execution_worker_backend_for"],
@@ -2756,6 +2827,49 @@ fn registry_function_guard_detects_backend_kind_dispatch() {
         offenders
             .iter()
             .any(|offender| offender.pattern.contains("backend_kind")),
+        "offenders: {:?}",
+        offenders
+    );
+}
+
+#[test]
+fn registry_function_guard_detects_grouped_database_type_arm() {
+    let offenders = collect_registry_function_dispatch_offenders(
+        r#"
+        fn classification_profile_for_db_type(db_type: DatabaseType) -> SqlClassificationProfile {
+            match db_type {
+                DatabaseType::Oracle => SqlClassificationProfile::Oracle,
+                DatabaseType::MySQL | DatabaseType::MariaDB => SqlClassificationProfile::MySqlCompatible,
+            }
+        }
+        "#,
+        "src/db/sql_classification.rs",
+        &["classification_profile_for_db_type"],
+    );
+    assert!(
+        offenders
+            .iter()
+            .any(|offender| offender.pattern.contains("grouped")),
+        "offenders: {:?}",
+        offenders
+    );
+}
+
+#[test]
+fn registry_function_guard_detects_missing_database_type_match() {
+    let offenders = collect_registry_function_dispatch_offenders(
+        r#"
+        fn query_cancel_markers_for_db_type(_db_type: DatabaseType) -> &'static [&'static str] {
+            &["query cancelled"]
+        }
+        "#,
+        "src/db/session_policy.rs",
+        &["query_cancel_markers_for_db_type"],
+    );
+    assert!(
+        offenders
+            .iter()
+            .any(|offender| offender.pattern.contains("does not match")),
         "offenders: {:?}",
         offenders
     );
