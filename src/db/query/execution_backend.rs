@@ -148,7 +148,7 @@ fn classify_mysql_result_kind(db_type: DatabaseType, sql: &str) -> StatementResu
                 .unwrap_or_else(|| normalized.clone())
         }
         DatabaseType::MySQL => normalized.clone(),
-        DatabaseType::Oracle => unreachable!("Oracle statements are classified by Oracle backend"),
+        DatabaseType::Oracle => return classify_oracle_result_kind(&normalized),
     };
     if QueryExecutor::is_select_statement(&display_sql) {
         return StatementResultKind::Select;

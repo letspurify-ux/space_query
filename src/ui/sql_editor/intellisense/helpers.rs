@@ -76,9 +76,8 @@ static MYSQL_COLUMN_LOAD_BACKEND: MysqlColumnLoadBackend = MysqlColumnLoadBacken
 fn column_load_backend_for(db_type: crate::db::DatabaseType) -> &'static dyn ColumnLoadBackend {
     match db_type {
         crate::db::DatabaseType::Oracle => &ORACLE_COLUMN_LOAD_BACKEND,
-        crate::db::DatabaseType::MySQL | crate::db::DatabaseType::MariaDB => {
-            &MYSQL_COLUMN_LOAD_BACKEND
-        }
+        crate::db::DatabaseType::MySQL => &MYSQL_COLUMN_LOAD_BACKEND,
+        crate::db::DatabaseType::MariaDB => &MYSQL_COLUMN_LOAD_BACKEND,
     }
 }
 

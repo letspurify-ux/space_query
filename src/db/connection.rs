@@ -2540,10 +2540,7 @@ impl DbBackend for MysqlBackend {
     }
 
     fn supports_mysql_delimiter_commands(&self) -> bool {
-        match self.db_type {
-            DatabaseType::MySQL | DatabaseType::MariaDB => true,
-            DatabaseType::Oracle => unreachable!("Oracle does not use MysqlBackend"),
-        }
+        true
     }
 
     fn backend_kind(&self) -> DatabaseBackendKind {

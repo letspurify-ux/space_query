@@ -2667,7 +2667,7 @@ fn mysql_effective_statement_sql_for_db_type<'a>(
             }
         }
         DatabaseType::MySQL => Cow::Borrowed(sql),
-        DatabaseType::Oracle => unreachable!("Oracle statements are not MySQL-family statements"),
+        DatabaseType::Oracle => Cow::Borrowed(sql),
     }
 }
 

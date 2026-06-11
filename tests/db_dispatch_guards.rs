@@ -264,6 +264,13 @@ fn pattern_swallows_new_variants(pat: &Pat) -> bool {
     }
 }
 
+fn database_type_registry_pattern_groups_variants(pat: &Pat) -> bool {
+    match pat {
+        Pat::Or(pat_or) => pat_or.cases.iter().any(mentions_database_type),
+        _ => false,
+    }
+}
+
 struct BackendKindDispatchVisitor<'a> {
     path: &'a str,
     offenders: Vec<BackendKindDispatchOffender>,
@@ -501,6 +508,11 @@ impl Visit<'_> for UiDatabaseTypeDispatchVisitor<'_> {
                         self.push_offender(
                             arm.pat.span().start().line,
                             "wildcard arm in UI DatabaseType backend registry match".to_string(),
+                        );
+                    } else if database_type_registry_pattern_groups_variants(&arm.pat) {
+                        self.push_offender(
+                            arm.pat.span().start().line,
+                            "grouped DatabaseType arm in UI backend registry match".to_string(),
                         );
                     }
                 }
@@ -1765,13 +1777,30 @@ fn ui_guard_allows_exhaustive_database_type_backend_registry_match() {
         fn execution_worker_backend_for(db_type: DatabaseType) -> &'static dyn ExecutionWorkerBackend {
             match db_type {
                 DatabaseType::Oracle => &ORACLE_EXECUTION_WORKER_BACKEND,
-                DatabaseType::MySQL | DatabaseType::MariaDB => &MYSQL_EXECUTION_WORKER_BACKEND,
+                DatabaseType::MySQL => &MYSQL_EXECUTION_WORKER_BACKEND,
+                DatabaseType::MariaDB => &MYSQL_EXECUTION_WORKER_BACKEND,
             }
         }
         "#,
         "src/ui/snippet.rs",
     );
     assert!(offenders.is_empty(), "offenders: {:?}", offenders);
+}
+
+#[test]
+fn ui_guard_detects_grouped_database_type_backend_registry_match() {
+    let offenders = collect_ui_database_type_dispatch_offenders(
+        r#"
+        fn execution_worker_backend_for(db_type: DatabaseType) -> &'static dyn ExecutionWorkerBackend {
+            match db_type {
+                DatabaseType::Oracle => &ORACLE_EXECUTION_WORKER_BACKEND,
+                DatabaseType::MySQL | DatabaseType::MariaDB => &MYSQL_EXECUTION_WORKER_BACKEND,
+            }
+        }
+        "#,
+        "src/ui/snippet.rs",
+    );
+    assert_eq!(offenders.len(), 1, "offenders: {:?}", offenders);
 }
 
 #[test]

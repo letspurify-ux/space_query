@@ -18,9 +18,8 @@ fn quick_describe_backend_for(
 ) -> &'static dyn QuickDescribeBackend {
     match db_type {
         crate::db::DatabaseType::Oracle => &ORACLE_QUICK_DESCRIBE_BACKEND,
-        crate::db::DatabaseType::MySQL | crate::db::DatabaseType::MariaDB => {
-            &MYSQL_QUICK_DESCRIBE_BACKEND
-        }
+        crate::db::DatabaseType::MySQL => &MYSQL_QUICK_DESCRIBE_BACKEND,
+        crate::db::DatabaseType::MariaDB => &MYSQL_QUICK_DESCRIBE_BACKEND,
     }
 }
 
@@ -101,9 +100,8 @@ static MYSQL_SIGNATURE_BACKEND: MysqlSignatureBackend = MysqlSignatureBackend;
 fn signature_backend_for(db_type: crate::db::DatabaseType) -> &'static dyn SignatureBackend {
     match db_type {
         crate::db::DatabaseType::Oracle => &ORACLE_SIGNATURE_BACKEND,
-        crate::db::DatabaseType::MySQL | crate::db::DatabaseType::MariaDB => {
-            &MYSQL_SIGNATURE_BACKEND
-        }
+        crate::db::DatabaseType::MySQL => &MYSQL_SIGNATURE_BACKEND,
+        crate::db::DatabaseType::MariaDB => &MYSQL_SIGNATURE_BACKEND,
     }
 }
 

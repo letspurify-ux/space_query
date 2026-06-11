@@ -297,9 +297,8 @@ fn execution_worker_backend_for(
 ) -> &'static dyn ExecutionWorkerBackend {
     match db_type {
         crate::db::DatabaseType::Oracle => &ORACLE_EXECUTION_WORKER_BACKEND,
-        crate::db::DatabaseType::MySQL | crate::db::DatabaseType::MariaDB => {
-            &MYSQL_EXECUTION_WORKER_BACKEND
-        }
+        crate::db::DatabaseType::MySQL => &MYSQL_EXECUTION_WORKER_BACKEND,
+        crate::db::DatabaseType::MariaDB => &MYSQL_EXECUTION_WORKER_BACKEND,
     }
 }
 

@@ -293,7 +293,8 @@ static MYSQL_SCHEMA_METADATA_LOADER: MysqlSchemaMetadataLoader = MysqlSchemaMeta
 fn schema_metadata_loader_for(db_type: DatabaseType) -> &'static dyn SchemaMetadataLoader {
     match db_type {
         DatabaseType::Oracle => &ORACLE_SCHEMA_METADATA_LOADER,
-        DatabaseType::MySQL | DatabaseType::MariaDB => &MYSQL_SCHEMA_METADATA_LOADER,
+        DatabaseType::MySQL => &MYSQL_SCHEMA_METADATA_LOADER,
+        DatabaseType::MariaDB => &MYSQL_SCHEMA_METADATA_LOADER,
     }
 }
 

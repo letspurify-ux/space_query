@@ -629,7 +629,8 @@ static MYSQL_EXPLAIN_PLAN_BACKEND: MysqlExplainPlanBackend = MysqlExplainPlanBac
 fn explain_plan_backend_for(db_type: DatabaseType) -> &'static dyn ExplainPlanBackend {
     match db_type {
         DatabaseType::Oracle => &ORACLE_EXPLAIN_PLAN_BACKEND,
-        DatabaseType::MySQL | DatabaseType::MariaDB => &MYSQL_EXPLAIN_PLAN_BACKEND,
+        DatabaseType::MySQL => &MYSQL_EXPLAIN_PLAN_BACKEND,
+        DatabaseType::MariaDB => &MYSQL_EXPLAIN_PLAN_BACKEND,
     }
 }
 
@@ -786,7 +787,8 @@ static MYSQL_TRANSACTION_ACTION_BACKEND: MysqlTransactionActionBackend =
 fn transaction_action_backend_for(db_type: DatabaseType) -> &'static dyn TransactionActionBackend {
     match db_type {
         DatabaseType::Oracle => &ORACLE_TRANSACTION_ACTION_BACKEND,
-        DatabaseType::MySQL | DatabaseType::MariaDB => &MYSQL_TRANSACTION_ACTION_BACKEND,
+        DatabaseType::MySQL => &MYSQL_TRANSACTION_ACTION_BACKEND,
+        DatabaseType::MariaDB => &MYSQL_TRANSACTION_ACTION_BACKEND,
     }
 }
 

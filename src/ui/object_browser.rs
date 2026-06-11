@@ -404,9 +404,8 @@ fn object_browser_behavior_for(
 ) -> &'static dyn ObjectBrowserDbBehavior {
     match db_type {
         crate::db::DatabaseType::Oracle => &ORACLE_OBJECT_BROWSER_BEHAVIOR,
-        crate::db::DatabaseType::MySQL | crate::db::DatabaseType::MariaDB => {
-            &MYSQL_OBJECT_BROWSER_BEHAVIOR
-        }
+        crate::db::DatabaseType::MySQL => &MYSQL_OBJECT_BROWSER_BEHAVIOR,
+        crate::db::DatabaseType::MariaDB => &MYSQL_OBJECT_BROWSER_BEHAVIOR,
     }
 }
 

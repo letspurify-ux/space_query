@@ -772,8 +772,10 @@ fn empty_mysql_scope_with_preserved_session_requires_resolution() {
         "Empty MySQL/MariaDB scope should reset clean sessions but block preserved retained sessions"
     );
     assert!(
-        editor_content.contains("target_scope.is_empty() && !mysql_family"),
-        "Immediate retained-scope apply should still run for empty MySQL/MariaDB scope"
+        editor_content.contains(
+            "target_scope.is_empty() && !db_type.can_apply_empty_scope_to_retained_session()",
+        ),
+        "Immediate retained-scope apply should use the backend empty-scope policy"
     );
 }
 
@@ -1506,11 +1508,13 @@ fn regression_07_oracle_transaction_mode_change_does_not_silently_clear_preserve
         "Oracle transaction mode changes must block preserved retained sessions before clear()"
     );
     assert!(
-        main_window.contains("match self.db_type.backend_kind()")
-            && main_window.contains("DatabaseBackendKind::Oracle => true")
+        main_window.contains("fn retained_session_transaction_option_decision(")
             && main_window.contains("action == \"transaction mode\"")
-            && main_window.contains("requires_physical_session_preservation()"),
-        "main-window option preflight must reject Oracle retained sessions with residue before transaction mode changes"
+            && main_window
+                .contains("retained_session_state_transaction_mode_change_preflight_decision(")
+            && main_window.contains("snapshot.db_type")
+            && main_window.contains("snapshot.retained_state()"),
+        "main-window option preflight must route transaction mode changes through the DB-specific retained-session policy"
     );
 }
 
