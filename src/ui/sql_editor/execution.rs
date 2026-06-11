@@ -5992,27 +5992,24 @@ impl SqlEditorWidget {
                             }
                         }
                         ToolCommand::Define { name, value } => {
-                            let key = SessionState::normalize_name(&name);
-                            match session.lock() {
-                                Ok(mut guard) => {
-                                    guard.define_vars.insert(key.clone(), value.clone());
-                                }
-                                Err(poisoned) => {
-                                    eprintln!(
-                                        "Warning: session state lock was poisoned; recovering."
+                            match SqlEditorWidget::apply_define_command(
+                                sender, session, &name, value,
+                            ) {
+                                Ok((label, message)) => {
+                                    SqlEditorWidget::emit_script_message(
+                                        sender, session, &label, &message,
                                     );
-                                    poisoned
-                                        .into_inner()
-                                        .define_vars
-                                        .insert(key.clone(), value.clone());
+                                }
+                                Err(message) => {
+                                    SqlEditorWidget::emit_script_message(
+                                        sender,
+                                        session,
+                                        &format!("DEFINE {}", name),
+                                        &format!("Error: {}", message),
+                                    );
+                                    command_error = true;
                                 }
                             }
-                            SqlEditorWidget::emit_script_message(
-                                sender,
-                                session,
-                                &format!("DEFINE {}", key),
-                                &format!("Defined {} = {}", key, value),
-                            );
                         }
                         ToolCommand::Undefine { name } => {
                             let key = SessionState::normalize_name(&name);
@@ -6027,12 +6024,6 @@ impl SqlEditorWidget {
                                     poisoned.into_inner().define_vars.remove(&key);
                                 }
                             }
-                            SqlEditorWidget::emit_script_message(
-                                sender,
-                                session,
-                                &format!("UNDEFINE {}", key),
-                                &format!("Undefined {}", key),
-                            );
                         }
                         ToolCommand::ColumnNewValue {
                             column_name,
@@ -6056,15 +6047,6 @@ impl SqlEditorWidget {
                                         .insert(column_key.clone(), variable_key.clone());
                                 }
                             }
-                            SqlEditorWidget::emit_script_message(
-                                sender,
-                                session,
-                                &format!("COLUMN {} NEW_VALUE {}", column_key, variable_key),
-                                &format!(
-                                    "Registered NEW_VALUE mapping: {} -> {}",
-                                    column_key, variable_key
-                                ),
-                            );
                         }
                         ToolCommand::BreakOn { column_name } => {
                             let key = SessionState::normalize_name(&column_name);
@@ -6363,17 +6345,34 @@ impl SqlEditorWidget {
                                 }
                             }
                         }
-                        ToolCommand::WheneverSqlError { exit, .. } => {
-                            match session.lock() {
-                                Ok(mut guard) => guard.continue_on_error = !exit,
-                                Err(poisoned) => {
-                                    eprintln!(
-                                        "Warning: session state lock was poisoned; recovering."
-                                    );
-                                    poisoned.into_inner().continue_on_error = !exit;
+                        ToolCommand::WheneverSqlError { exit, action } => {
+                            if SqlEditorWidget::whenever_sqlcode_requires_script(
+                                exit,
+                                action.as_deref(),
+                                script_mode,
+                            ) {
+                                SqlEditorWidget::emit_script_message(
+                                    sender,
+                                    session,
+                                    "WHENEVER SQLERROR",
+                                    &format!(
+                                        "Error: {}",
+                                        SqlEditorWidget::WHENEVER_SQLCODE_SCRIPT_ONLY
+                                    ),
+                                );
+                                command_error = true;
+                            } else {
+                                match session.lock() {
+                                    Ok(mut guard) => guard.continue_on_error = !exit,
+                                    Err(poisoned) => {
+                                        eprintln!(
+                                            "Warning: session state lock was poisoned; recovering."
+                                        );
+                                        poisoned.into_inner().continue_on_error = !exit;
+                                    }
                                 }
+                                continue_on_error = !exit;
                             }
-                            continue_on_error = !exit;
                         }
                         ToolCommand::WheneverOsError { exit } => {
                             match session.lock() {
@@ -6791,7 +6790,7 @@ impl SqlEditorWidget {
                     }
                     if !command_error {
                         if let Some((label, message)) = confirmation {
-                            SqlEditorWidget::emit_script_message(sender, session, label, &message);
+                            SqlEditorWidget::emit_script_message(sender, session, &label, &message);
                         }
                     }
 
@@ -8625,61 +8624,23 @@ impl SqlEditorWidget {
                                     }
                                 }
                                 ToolCommand::Define { name, value } => {
-                                    let (define_enabled, scan_enabled) = match session.lock() {
-                                        Ok(guard) => (guard.define_enabled, guard.scan_enabled),
-                                        Err(poisoned) => {
-                                            eprintln!(
-                                            "Warning: session state lock was poisoned; recovering."
-                                        );
-                                            let guard = poisoned.into_inner();
-                                            (guard.define_enabled, guard.scan_enabled)
-                                        }
-                                    };
-                                    let mut resolved_value = value;
-                                    if define_enabled && scan_enabled {
-                                        match SqlEditorWidget::apply_define_substitution(
-                                            &resolved_value,
-                                            &session,
-                                            &sender,
-                                        ) {
-                                            Ok(updated) => {
-                                                resolved_value = updated;
-                                            }
-                                            Err(message) => {
-                                                SqlEditorWidget::emit_script_message(
-                                                    &sender,
-                                                    &session,
-                                                    &format!("DEFINE {}", name),
-                                                    &format!("Error: {}", message),
-                                                );
-                                                command_error = true;
-                                            }
-                                        }
-                                    }
-                                    let key = SessionState::normalize_name(&name);
-                                    if !command_error {
-                                        match session.lock() {
-                                            Ok(mut guard) => {
-                                                guard
-                                                    .define_vars
-                                                    .insert(key.clone(), resolved_value.clone());
-                                            }
-                                            Err(poisoned) => {
-                                                eprintln!(
-                                                "Warning: session state lock was poisoned; recovering."
+                                    match SqlEditorWidget::apply_define_command(
+                                        &sender, &session, &name, value,
+                                    ) {
+                                        Ok((label, message)) => {
+                                            SqlEditorWidget::emit_script_message(
+                                                &sender, &session, &label, &message,
                                             );
-                                                let mut guard = poisoned.into_inner();
-                                                guard
-                                                    .define_vars
-                                                    .insert(key.clone(), resolved_value.clone());
-                                            }
                                         }
-                                        SqlEditorWidget::emit_script_message(
-                                            &sender,
-                                            &session,
-                                            &format!("DEFINE {}", key),
-                                            &format!("Defined {} = {}", key, resolved_value),
-                                        );
+                                        Err(message) => {
+                                            SqlEditorWidget::emit_script_message(
+                                                &sender,
+                                                &session,
+                                                &format!("DEFINE {}", name),
+                                                &format!("Error: {}", message),
+                                            );
+                                            command_error = true;
+                                        }
                                     }
                                 }
                                 ToolCommand::Undefine { name } => {
@@ -8696,12 +8657,6 @@ impl SqlEditorWidget {
                                             guard.define_vars.remove(&key);
                                         }
                                     }
-                                    SqlEditorWidget::emit_script_message(
-                                        &sender,
-                                        &session,
-                                        &format!("UNDEFINE {}", key),
-                                        &format!("Undefined {}", key),
-                                    );
                                 }
                                 ToolCommand::ColumnNewValue {
                                     column_name,
@@ -8725,18 +8680,6 @@ impl SqlEditorWidget {
                                                 .insert(column_key.clone(), variable_key.clone());
                                         }
                                     }
-                                    SqlEditorWidget::emit_script_message(
-                                        &sender,
-                                        &session,
-                                        &format!(
-                                            "COLUMN {} NEW_VALUE {}",
-                                            column_key, variable_key
-                                        ),
-                                        &format!(
-                                            "Registered NEW_VALUE mapping: {} -> {}",
-                                            column_key, variable_key
-                                        ),
-                                    );
                                 }
                                 ToolCommand::BreakOn { column_name } => {
                                     let key = SessionState::normalize_name(&column_name);
@@ -8943,17 +8886,6 @@ impl SqlEditorWidget {
                                             guard.define_char = ch;
                                         }
                                     }
-                                    let msg = if let Some(ch) = define_char {
-                                        format!("DEFINE '{}'", ch)
-                                    } else {
-                                        format!("DEFINE {}", if enabled { "ON" } else { "OFF" })
-                                    };
-                                    SqlEditorWidget::emit_script_message(
-                                        &sender,
-                                        &session,
-                                        "SET DEFINE",
-                                        &msg,
-                                    );
                                 }
                                 ToolCommand::SetScan { enabled } => {
                                     {
@@ -9176,18 +9108,19 @@ impl SqlEditorWidget {
                                     }
                                 }
                                 ToolCommand::WheneverSqlError { exit, action } => {
-                                    if exit
-                                        && action
-                                            .as_deref()
-                                            .map(|v| v.trim().eq_ignore_ascii_case("SQL.SQLCODE"))
-                                            .unwrap_or(false)
-                                        && !script_mode
-                                    {
+                                    if SqlEditorWidget::whenever_sqlcode_requires_script(
+                                        exit,
+                                        action.as_deref(),
+                                        script_mode,
+                                    ) {
                                         SqlEditorWidget::emit_script_message(
                                             &sender,
                                             &session,
                                             "WHENEVER SQLERROR",
-                                            "Error: EXIT SQL.SQLCODE is supported only in batch(script) execution.",
+                                            &format!(
+                                                "Error: {}",
+                                                SqlEditorWidget::WHENEVER_SQLCODE_SCRIPT_ONLY
+                                            ),
                                         );
                                         command_error = true;
                                     } else {
@@ -9204,12 +9137,6 @@ impl SqlEditorWidget {
                                             guard.continue_on_error = !exit;
                                         }
                                         continue_on_error = !exit;
-                                        SqlEditorWidget::emit_script_message(
-                                            &sender,
-                                            &session,
-                                            "WHENEVER SQLERROR",
-                                            if exit { "Mode EXIT" } else { "Mode CONTINUE" },
-                                        );
                                     }
                                 }
                                 ToolCommand::WheneverOsError { exit } => {
@@ -9226,12 +9153,6 @@ impl SqlEditorWidget {
                                         guard.continue_on_error = !exit;
                                     }
                                     continue_on_error = !exit;
-                                    SqlEditorWidget::emit_script_message(
-                                        &sender,
-                                        &session,
-                                        "WHENEVER OSERROR",
-                                        if exit { "Mode EXIT" } else { "Mode CONTINUE" },
-                                    );
                                 }
                                 ToolCommand::Exit => {
                                     stop_execution = true;
@@ -9764,7 +9685,7 @@ impl SqlEditorWidget {
                                     SqlEditorWidget::emit_script_message(
                                         &sender,
                                         &session,
-                                        label,
+                                        &label,
                                         &message,
                                     );
                                 }
@@ -14140,14 +14061,11 @@ impl SqlEditorWidget {
                             Err(poisoned) => poisoned.into_inner().null_text = null_text,
                         },
                         ToolCommand::Define { name, value } => {
-                            let key = SessionState::normalize_name(&name);
-                            match session.lock() {
-                                Ok(mut guard) => {
-                                    guard.define_vars.insert(key, value);
+                            match Self::apply_define_command(sender, session, &name, value) {
+                                Ok((label, message)) => {
+                                    Self::emit_script_message(sender, session, &label, &message);
                                 }
-                                Err(poisoned) => {
-                                    poisoned.into_inner().define_vars.insert(key, value);
-                                }
+                                Err(message) => command_error = Some(message),
                             }
                         }
                         ToolCommand::Undefine { name } => {
@@ -14199,12 +14117,21 @@ impl SqlEditorWidget {
                                     let key = SessionState::normalize_name(&name);
                                     match session.lock() {
                                         Ok(mut guard) => {
-                                            guard.define_vars.insert(key, value);
+                                            guard.define_vars.insert(key.clone(), value);
                                         }
                                         Err(poisoned) => {
-                                            poisoned.into_inner().define_vars.insert(key, value);
+                                            poisoned
+                                                .into_inner()
+                                                .define_vars
+                                                .insert(key.clone(), value);
                                         }
                                     }
+                                    Self::emit_script_message(
+                                        sender,
+                                        session,
+                                        &format!("ACCEPT {}", key),
+                                        &format!("Value assigned to {}", key),
+                                    );
                                 }
                                 Err(message) => command_error = Some(message),
                             }
@@ -14440,11 +14367,22 @@ impl SqlEditorWidget {
                                 Err(message) => command_error = Some(message),
                             }
                         }
-                        ToolCommand::WheneverSqlError { exit, .. } => {
-                            continue_on_error = !exit;
-                            match session.lock() {
-                                Ok(mut guard) => guard.continue_on_error = !exit,
-                                Err(poisoned) => poisoned.into_inner().continue_on_error = !exit,
+                        ToolCommand::WheneverSqlError { exit, action } => {
+                            if Self::whenever_sqlcode_requires_script(
+                                exit,
+                                action.as_deref(),
+                                script_mode,
+                            ) {
+                                command_error =
+                                    Some(Self::WHENEVER_SQLCODE_SCRIPT_ONLY.to_string());
+                            } else {
+                                continue_on_error = !exit;
+                                match session.lock() {
+                                    Ok(mut guard) => guard.continue_on_error = !exit,
+                                    Err(poisoned) => {
+                                        poisoned.into_inner().continue_on_error = !exit
+                                    }
+                                }
                             }
                         }
                         ToolCommand::WheneverOsError { exit } => {
@@ -14486,7 +14424,7 @@ impl SqlEditorWidget {
                     }
                     if command_error.is_none() {
                         if let Some((label, message)) = confirmation {
-                            Self::emit_script_message(sender, session, label, &message);
+                            Self::emit_script_message(sender, session, &label, &message);
                         }
                     }
                     if let Some(message) = command_error {
@@ -15322,7 +15260,7 @@ impl SqlEditorWidget {
     /// produces the same script output on every DB and protocol. Only
     /// commands whose feedback derives purely from the command itself (no
     /// session or connection state, no failure paths) belong here.
-    fn tool_command_confirmation(command: &ToolCommand) -> Option<(&'static str, String)> {
+    fn tool_command_confirmation(command: &ToolCommand) -> Option<(String, String)> {
         fn on_off(enabled: bool) -> &'static str {
             if enabled {
                 "ON"
@@ -15330,62 +15268,99 @@ impl SqlEditorWidget {
                 "OFF"
             }
         }
-        match command {
-            ToolCommand::SetErrorContinue { enabled } => Some((
-                "SET ERRORCONTINUE",
+        fn whenever_mode(exit: bool) -> String {
+            if exit { "Mode EXIT" } else { "Mode CONTINUE" }.to_string()
+        }
+        let (label, message) = match command {
+            ToolCommand::SetErrorContinue { enabled } => (
+                "SET ERRORCONTINUE".to_string(),
                 format!("ERRORCONTINUE {}", on_off(*enabled)),
-            )),
+            ),
             ToolCommand::SetScan { enabled } => {
-                Some(("SET SCAN", format!("SCAN {}", on_off(*enabled))))
+                ("SET SCAN".to_string(), format!("SCAN {}", on_off(*enabled)))
             }
-            ToolCommand::SetVerify { enabled } => {
-                Some(("SET VERIFY", format!("VERIFY {}", on_off(*enabled))))
-            }
+            ToolCommand::SetVerify { enabled } => (
+                "SET VERIFY".to_string(),
+                format!("VERIFY {}", on_off(*enabled)),
+            ),
             ToolCommand::SetEcho { enabled } => {
-                Some(("SET ECHO", format!("ECHO {}", on_off(*enabled))))
+                ("SET ECHO".to_string(), format!("ECHO {}", on_off(*enabled)))
             }
-            ToolCommand::SetTiming { enabled } => {
-                Some(("SET TIMING", format!("TIMING {}", on_off(*enabled))))
-            }
-            ToolCommand::SetFeedback { enabled } => {
-                Some(("SET FEEDBACK", format!("FEEDBACK {}", on_off(*enabled))))
-            }
-            ToolCommand::SetHeading { enabled } => {
-                Some(("SET HEADING", format!("HEADING {}", on_off(*enabled))))
-            }
+            ToolCommand::SetTiming { enabled } => (
+                "SET TIMING".to_string(),
+                format!("TIMING {}", on_off(*enabled)),
+            ),
+            ToolCommand::SetFeedback { enabled } => (
+                "SET FEEDBACK".to_string(),
+                format!("FEEDBACK {}", on_off(*enabled)),
+            ),
+            ToolCommand::SetHeading { enabled } => (
+                "SET HEADING".to_string(),
+                format!("HEADING {}", on_off(*enabled)),
+            ),
             ToolCommand::SetPageSize { size } => {
-                Some(("SET PAGESIZE", format!("PAGESIZE {}", size)))
+                ("SET PAGESIZE".to_string(), format!("PAGESIZE {}", size))
             }
             ToolCommand::SetLineSize { size } => {
-                Some(("SET LINESIZE", format!("LINESIZE {}", size)))
+                ("SET LINESIZE".to_string(), format!("LINESIZE {}", size))
             }
-            ToolCommand::SetTrimSpool { enabled } => {
-                Some(("SET TRIMSPOOL", format!("TRIMSPOOL {}", on_off(*enabled))))
-            }
-            ToolCommand::SetTrimOut { enabled } => {
-                Some(("SET TRIMOUT", format!("TRIMOUT {}", on_off(*enabled))))
-            }
-            ToolCommand::SetSqlBlankLines { enabled } => Some((
-                "SET SQLBLANKLINES",
+            ToolCommand::SetTrimSpool { enabled } => (
+                "SET TRIMSPOOL".to_string(),
+                format!("TRIMSPOOL {}", on_off(*enabled)),
+            ),
+            ToolCommand::SetTrimOut { enabled } => (
+                "SET TRIMOUT".to_string(),
+                format!("TRIMOUT {}", on_off(*enabled)),
+            ),
+            ToolCommand::SetSqlBlankLines { enabled } => (
+                "SET SQLBLANKLINES".to_string(),
                 format!("SQLBLANKLINES {}", on_off(*enabled)),
-            )),
+            ),
             ToolCommand::SetTab { enabled } => {
-                Some(("SET TAB", format!("TAB {}", on_off(*enabled))))
+                ("SET TAB".to_string(), format!("TAB {}", on_off(*enabled)))
             }
             ToolCommand::SetColSep { separator } => {
-                Some(("SET COLSEP", format!("COLSEP {}", separator)))
+                ("SET COLSEP".to_string(), format!("COLSEP {}", separator))
             }
-            ToolCommand::SetNull { null_text } => Some(("SET NULL", format!("NULL {}", null_text))),
-            ToolCommand::BreakOn { column_name } => Some((
-                "BREAK",
+            ToolCommand::SetNull { null_text } => {
+                ("SET NULL".to_string(), format!("NULL {}", null_text))
+            }
+            ToolCommand::SetDefine {
+                enabled,
+                define_char,
+            } => {
+                let message = match define_char {
+                    Some(ch) => format!("DEFINE '{}'", ch),
+                    None => format!("DEFINE {}", on_off(*enabled)),
+                };
+                ("SET DEFINE".to_string(), message)
+            }
+            ToolCommand::Undefine { name } => {
+                let key = SessionState::normalize_name(name);
+                (format!("UNDEFINE {}", key), format!("Undefined {}", key))
+            }
+            ToolCommand::ColumnNewValue {
+                column_name,
+                variable_name,
+            } => {
+                let column = SessionState::normalize_name(column_name);
+                let variable = SessionState::normalize_name(variable_name);
+                (
+                    format!("COLUMN {} NEW_VALUE {}", column, variable),
+                    format!("Registered NEW_VALUE mapping: {} -> {}", column, variable),
+                )
+            }
+            ToolCommand::BreakOn { column_name } => (
+                "BREAK".to_string(),
                 format!("BREAK ON {}", SessionState::normalize_name(column_name)),
-            )),
-            ToolCommand::BreakOff => Some(("BREAK", "BREAK OFF".to_string())),
-            ToolCommand::ClearBreaks => Some(("CLEAR", "BREAKS cleared".to_string())),
-            ToolCommand::ClearComputes => Some(("CLEAR", "COMPUTES cleared".to_string())),
-            ToolCommand::ClearBreaksComputes => {
-                Some(("CLEAR", "BREAKS and COMPUTES cleared".to_string()))
-            }
+            ),
+            ToolCommand::BreakOff => ("BREAK".to_string(), "BREAK OFF".to_string()),
+            ToolCommand::ClearBreaks => ("CLEAR".to_string(), "BREAKS cleared".to_string()),
+            ToolCommand::ClearComputes => ("CLEAR".to_string(), "COMPUTES cleared".to_string()),
+            ToolCommand::ClearBreaksComputes => (
+                "CLEAR".to_string(),
+                "BREAKS and COMPUTES cleared".to_string(),
+            ),
             ToolCommand::Compute {
                 mode,
                 of_column,
@@ -15401,13 +15376,80 @@ impl SqlEditorWidget {
                     }
                     _ => mode_text.to_string(),
                 };
-                Some(("COMPUTE", message))
+                ("COMPUTE".to_string(), message)
             }
-            ToolCommand::ComputeOff => Some(("COMPUTE", "COMPUTE OFF".to_string())),
-            ToolCommand::Exit => Some(("EXIT", "Execution stopped.".to_string())),
-            ToolCommand::Quit => Some(("QUIT", "Execution stopped.".to_string())),
-            _ => None,
+            ToolCommand::WheneverSqlError { exit, .. } => {
+                ("WHENEVER SQLERROR".to_string(), whenever_mode(*exit))
+            }
+            ToolCommand::WheneverOsError { exit } => {
+                ("WHENEVER OSERROR".to_string(), whenever_mode(*exit))
+            }
+            ToolCommand::ComputeOff => ("COMPUTE".to_string(), "COMPUTE OFF".to_string()),
+            ToolCommand::Exit => ("EXIT".to_string(), "Execution stopped.".to_string()),
+            ToolCommand::Quit => ("QUIT".to_string(), "Execution stopped.".to_string()),
+            _ => return None,
+        };
+        Some((label, message))
+    }
+
+    /// `WHENEVER SQLERROR EXIT SQL.SQLCODE` only has meaning when a whole
+    /// script runs as a batch; every runtime rejects it the same way outside
+    /// script mode.
+    const WHENEVER_SQLCODE_SCRIPT_ONLY: &'static str =
+        "EXIT SQL.SQLCODE is supported only in batch(script) execution.";
+
+    fn whenever_sqlcode_requires_script(
+        exit: bool,
+        action: Option<&str>,
+        script_mode: bool,
+    ) -> bool {
+        exit && !script_mode
+            && action
+                .map(|v| v.trim().eq_ignore_ascii_case("SQL.SQLCODE"))
+                .unwrap_or(false)
+    }
+
+    /// Applies a DEFINE tool command identically for every runtime: resolves
+    /// &substitution in the value (when DEFINE and SCAN are on), stores the
+    /// variable, and returns the (label, confirmation) pair.
+    fn apply_define_command(
+        sender: &mpsc::Sender<QueryProgress>,
+        session: &Arc<Mutex<SessionState>>,
+        name: &str,
+        value: String,
+    ) -> Result<(String, String), String> {
+        let (define_enabled, scan_enabled) = match session.lock() {
+            Ok(guard) => (guard.define_enabled, guard.scan_enabled),
+            Err(poisoned) => {
+                eprintln!("Warning: session state lock was poisoned; recovering.");
+                let guard = poisoned.into_inner();
+                (guard.define_enabled, guard.scan_enabled)
+            }
+        };
+        let resolved_value = if define_enabled && scan_enabled {
+            Self::apply_define_substitution(&value, session, sender)?
+        } else {
+            value
+        };
+        let key = SessionState::normalize_name(name);
+        match session.lock() {
+            Ok(mut guard) => {
+                guard
+                    .define_vars
+                    .insert(key.clone(), resolved_value.clone());
+            }
+            Err(poisoned) => {
+                eprintln!("Warning: session state lock was poisoned; recovering.");
+                poisoned
+                    .into_inner()
+                    .define_vars
+                    .insert(key.clone(), resolved_value.clone());
+            }
         }
+        Ok((
+            format!("DEFINE {}", key),
+            format!("Defined {} = {}", key, resolved_value),
+        ))
     }
 
     /// Applies a SPOOL tool command identically for every runtime and returns
