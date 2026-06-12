@@ -2267,7 +2267,7 @@ impl DbBackend for OracleBackend {
         context: &DbPoolSessionContext,
         session: &mut DbPoolSession,
     ) -> Result<(), String> {
-        match session {
+        let result = match session {
             DbPoolSession::Oracle(conn) => DatabaseConnection::apply_oracle_current_schema(
                 conn,
                 context.oracle_current_schema.as_deref(),
@@ -2282,8 +2282,23 @@ impl DbBackend for OracleBackend {
                 "Expected Oracle pool session but acquired {}",
                 session.db_type()
             )),
+        };
+        match result {
+            Err(message) if DatabaseConnection::oracle_missing_current_schema_error(&message) => {
+                // Same rule as apply_tracked_oracle_current_schema: a dropped
+                // tracked schema must not make fresh sessions unusable; the
+                // session falls back to the login schema.
+                logging::log_warning(
+                    "oracle pool session",
+                    &format!(
+                        "Tracked Oracle current schema {:?} is not available; acquiring the session without it",
+                        context.oracle_current_schema.as_deref().unwrap_or_default()
+                    ),
+                );
+                Ok(())
+            }
+            other => other.map_err(|err| format!("Failed to apply Oracle current schema: {err}")),
         }
-        .map_err(|err| format!("Failed to apply Oracle current schema: {err}"))
     }
 
     fn test_connection(&self, info: &ConnectionInfo) -> Result<(), String> {
@@ -3576,6 +3591,28 @@ impl DatabaseConnection {
             .map_err(|err| err.to_string())
     }
 
+    /// Tracked-schema variant of `apply_oracle_thin_current_schema`: a
+    /// dropped tracked schema is skipped instead of failing the caller, same
+    /// as `apply_tracked_oracle_current_schema` on the OCI side.
+    pub(crate) fn apply_tracked_oracle_thin_current_schema(
+        session: &mut OracleThinSession,
+        schema: Option<&str>,
+    ) -> Result<(), String> {
+        match Self::apply_oracle_thin_current_schema(session, schema) {
+            Err(message) if Self::oracle_missing_current_schema_error(&message) => {
+                logging::log_warning(
+                    "oracle pool session",
+                    &format!(
+                        "Tracked Oracle current schema {:?} is not available; continuing without re-applying it",
+                        schema.unwrap_or_default()
+                    ),
+                );
+                Ok(())
+            }
+            other => other,
+        }
+    }
+
     pub(crate) fn oracle_thin_select_one_text(
         session: &mut OracleThinSession,
         sql: &str,
@@ -4311,7 +4348,32 @@ impl DatabaseConnection {
     }
 
     pub fn apply_tracked_oracle_current_schema(&self, conn: &Connection) -> Result<(), String> {
-        Self::apply_oracle_current_schema(conn, self.oracle_current_schema.as_deref())
+        match Self::apply_oracle_current_schema(conn, self.oracle_current_schema.as_deref()) {
+            Err(message) if Self::oracle_missing_current_schema_error(&message) => {
+                // The tracked schema's user was dropped. The schema setting is
+                // only a name-resolution namespace and the session itself is
+                // still valid, so keep using it instead of failing every
+                // statement (including the recovery ALTER SESSION) on
+                // ORA-01435.
+                logging::log_warning(
+                    "oracle pool session",
+                    &format!(
+                        "Tracked Oracle current schema {:?} is not available; keeping the session without re-applying it",
+                        self.oracle_current_schema.as_deref().unwrap_or_default()
+                    ),
+                );
+                Ok(())
+            }
+            other => other,
+        }
+    }
+
+    pub(crate) fn oracle_missing_current_schema_error(message: &str) -> bool {
+        message.to_ascii_lowercase().contains("ora-01435")
+    }
+
+    pub fn clear_tracked_oracle_current_schema(&mut self) {
+        self.set_tracked_oracle_current_schema(None);
     }
 
     pub fn apply_tracked_mysql_current_database(&mut self) -> Result<(), String> {

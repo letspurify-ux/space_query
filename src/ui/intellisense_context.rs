@@ -142,6 +142,7 @@ pub struct CteDefinition {
 #[allow(dead_code)]
 pub struct SubqueryDefinition {
     pub alias: String,
+    pub source_relation: Option<String>,
     pub explicit_columns: Vec<String>,
     pub explicit_column_range: Option<TokenRange>,
     pub body_range: TokenRange,
@@ -401,12 +402,12 @@ pub(crate) fn analyze_cursor_context_arc(
 
     let mut phase = parse_result.phase;
     let mut focused_tables = parse_result.focused_tables;
-    if let Some(alias) = subquery_alias_column_list_source_at_cursor(
+    if let Some(source) = subquery_alias_column_list_source_at_cursor(
         &table_analysis.subqueries,
         clamped_cursor_token_len,
     ) {
         phase = SqlPhase::DerivedAliasColumnList;
-        focused_tables = vec![alias];
+        focused_tables = vec![source];
     }
 
     CursorContext {
@@ -430,8 +431,12 @@ fn subquery_alias_column_list_source_at_cursor(
 ) -> Option<String> {
     subqueries.iter().find_map(|subquery| {
         subquery.explicit_column_range.and_then(|range| {
-            (cursor_token_len >= range.start && cursor_token_len <= range.end)
-                .then(|| subquery.alias.clone())
+            (cursor_token_len >= range.start && cursor_token_len <= range.end).then(|| {
+                subquery
+                    .source_relation
+                    .clone()
+                    .unwrap_or_else(|| subquery.alias.clone())
+            })
         })
     })
 }
@@ -2292,6 +2297,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             all_subqueries.push(ParsedSubqueryEntry {
                                 subquery: SubqueryDefinition {
                                     alias: alias.clone(),
+                                    source_relation: None,
                                     explicit_columns,
                                     explicit_column_range,
                                     body_range: TokenRange {
@@ -2342,6 +2348,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         all_subqueries.push(ParsedSubqueryEntry {
                             subquery: SubqueryDefinition {
                                 alias: generated_name.clone(),
+                                source_relation: None,
                                 explicit_columns: Vec::new(),
                                 explicit_column_range: None,
                                 body_range,
@@ -3732,7 +3739,11 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 } else {
                                     table_name.clone()
                                 };
-                                let relation_tracking_name = table_scope_name.clone();
+                                let relation_tracking_name = if !explicit_columns.is_empty() {
+                                    alias.clone().unwrap_or_else(|| table_scope_name.clone())
+                                } else {
+                                    table_scope_name.clone()
+                                };
                                 if let (Some(alias_name), Some(body_range)) =
                                     (alias.as_ref(), virtual_relation_body_range)
                                 {
@@ -3743,6 +3754,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                         all_subqueries.push(ParsedSubqueryEntry {
                                             subquery: SubqueryDefinition {
                                                 alias: alias_name.clone(),
+                                                source_relation: Some(table_scope_name.clone()),
                                                 explicit_columns: explicit_columns.clone(),
                                                 explicit_column_range,
                                                 body_range,
@@ -4062,6 +4074,42 @@ fn extract_parenthesized_range(
         },
         tokens.len(),
     ))
+}
+
+fn extract_preceding_parenthesized_range(
+    tokens: &[SqlToken],
+    before_idx: usize,
+) -> Option<TokenRange> {
+    let mut close_idx = before_idx.min(tokens.len());
+    while close_idx > 0 {
+        close_idx -= 1;
+        match tokens.get(close_idx) {
+            Some(SqlToken::Comment(_)) => continue,
+            Some(SqlToken::Symbol(sym)) if sym == ")" => break,
+            _ => return None,
+        }
+    }
+
+    let mut depth = 1usize;
+    let mut idx = close_idx;
+    while idx > 0 {
+        idx -= 1;
+        match tokens.get(idx) {
+            Some(SqlToken::Symbol(sym)) if sym == ")" => depth = depth.saturating_add(1),
+            Some(SqlToken::Symbol(sym)) if sym == "(" => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(TokenRange {
+                        start: idx + 1,
+                        end: close_idx,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 /// Parse CTE definitions from WITH clause.
@@ -5566,6 +5614,23 @@ pub(crate) fn extract_select_list_wildcard_tables(
     tables
 }
 
+/// Resolve wildcard scope names from a SELECT list while preserving aliases.
+/// This is used by projection expansion, where `alias.*` and duplicate aliases
+/// over the same physical table must remain distinguishable.
+pub(crate) fn extract_select_list_wildcard_scopes(
+    tokens: &[SqlToken],
+    tables_in_scope: &[ScopedTableRef],
+) -> Vec<String> {
+    let mut tables = Vec::new();
+    let mut seen = HashSet::new();
+    let select_list_tokens = extract_select_list_tokens(tokens);
+    for item_tokens in split_top_level_symbol_groups(select_list_tokens, ",") {
+        append_wildcard_item_scopes(&item_tokens, tables_in_scope, &mut tables, &mut seen);
+    }
+
+    tables
+}
+
 /// Extract column names from explicit table-function output clauses such as
 /// `XMLTABLE(... COLUMNS col1 NUMBER PATH '...')` or
 /// `OPENJSON(... WITH (col1 int '$.id'))`.
@@ -5640,18 +5705,7 @@ pub(crate) fn extract_oracle_pivot_unpivot_projection_columns(tokens: &[SqlToken
         return Vec::new();
     }
 
-    let first_clause_idx = match (pivot.as_ref(), unpivot.as_ref()) {
-        (Some(p), Some(u)) => Some(p.clause_index.min(u.clause_index)),
-        (Some(p), None) => Some(p.clause_index),
-        (None, Some(u)) => Some(u.clause_index),
-        (None, None) => None,
-    };
-
-    let mut columns = if let Some(clause_idx) = first_clause_idx {
-        infer_source_columns_before_clause(tokens, clause_idx)
-    } else {
-        Vec::new()
-    };
+    let mut columns = extract_oracle_pivot_unpivot_source_projection_columns(tokens);
 
     if let Some(pivot_info) = pivot {
         remove_columns_case_insensitive(&mut columns, &pivot_info.for_columns);
@@ -5665,6 +5719,21 @@ pub(crate) fn extract_oracle_pivot_unpivot_projection_columns(tokens: &[SqlToken
         columns.extend(unpivot_info.for_columns);
     }
 
+    dedup_columns_case_insensitive(&mut columns);
+    columns
+}
+
+pub(crate) fn extract_oracle_pivot_unpivot_source_projection_columns(
+    tokens: &[SqlToken],
+) -> Vec<String> {
+    let pivot = parse_top_level_pivot_clause(tokens);
+    let unpivot = parse_top_level_unpivot_clause(tokens);
+    let Some(clause_idx) = first_pivot_unpivot_clause_index(pivot.as_ref(), unpivot.as_ref())
+    else {
+        return Vec::new();
+    };
+
+    let mut columns = infer_source_columns_before_clause(tokens, clause_idx);
     dedup_columns_case_insensitive(&mut columns);
     columns
 }
@@ -6051,7 +6120,29 @@ fn top_level_next_word_is(tokens: &[SqlToken], start_idx: usize, keyword: &str) 
     false
 }
 
+fn first_pivot_unpivot_clause_index(
+    pivot: Option<&PivotClauseColumns>,
+    unpivot: Option<&UnpivotClauseColumns>,
+) -> Option<usize> {
+    match (pivot, unpivot) {
+        (Some(p), Some(u)) => Some(p.clause_index.min(u.clause_index)),
+        (Some(p), None) => Some(p.clause_index),
+        (None, Some(u)) => Some(u.clause_index),
+        (None, None) => None,
+    }
+}
+
 fn infer_source_columns_before_clause(tokens: &[SqlToken], clause_idx: usize) -> Vec<String> {
+    if let Some(source_range) = extract_preceding_parenthesized_range(tokens, clause_idx) {
+        let columns = infer_projection_columns_from_query_tokens_allowing_pivot(
+            token_range_slice(tokens, source_range),
+            true,
+        );
+        if !columns.is_empty() {
+            return columns;
+        }
+    }
+
     let analysis = collect_tables_deep(tokens, &[0], tokens.len());
     let mut selected_subquery: Option<&SubqueryDefinition> = None;
 
@@ -6069,26 +6160,26 @@ fn infer_source_columns_before_clause(tokens: &[SqlToken], clause_idx: usize) ->
 
     if let Some(subq) = selected_subquery {
         let body_tokens = token_range_slice(tokens, subq.body_range);
-        let mut columns = extract_select_list_columns(body_tokens);
-        if columns.is_empty() {
-            columns = extract_table_function_columns(body_tokens);
-        }
-        if columns.is_empty() {
-            columns = extract_oracle_pivot_unpivot_projection_columns(body_tokens);
-        }
-        if columns.is_empty() {
-            columns = extract_oracle_model_generated_columns(body_tokens);
-        }
-        if columns.is_empty() {
-            columns = extract_match_recognize_generated_columns(body_tokens);
-        }
-        dedup_columns_case_insensitive(&mut columns);
-        return columns;
+        return infer_projection_columns_from_query_tokens(body_tokens);
     }
 
+    infer_projection_columns_from_query_tokens_allowing_pivot(tokens, false)
+}
+
+fn infer_projection_columns_from_query_tokens(tokens: &[SqlToken]) -> Vec<String> {
+    infer_projection_columns_from_query_tokens_allowing_pivot(tokens, true)
+}
+
+fn infer_projection_columns_from_query_tokens_allowing_pivot(
+    tokens: &[SqlToken],
+    allow_pivot: bool,
+) -> Vec<String> {
     let mut columns = extract_select_list_columns(tokens);
     if columns.is_empty() {
         columns = extract_table_function_columns(tokens);
+    }
+    if allow_pivot && columns.is_empty() {
+        columns = extract_oracle_pivot_unpivot_projection_columns(tokens);
     }
     if columns.is_empty() {
         columns = extract_oracle_model_generated_columns(tokens);
@@ -6122,11 +6213,15 @@ fn parse_top_level_pivot_clause(tokens: &[SqlToken]) -> Option<PivotClauseColumn
     let (for_idx, in_idx) = find_clause_for_in_indices(clause_tokens)?;
 
     let aggregate_columns = parse_pivot_aggregate_columns(&clause_tokens[..for_idx]);
+    let aggregate_aliases = parse_pivot_aggregate_aliases(&clause_tokens[..for_idx]);
     let for_columns = parse_identifier_segment(&clause_tokens[for_idx + 1..in_idx]);
     let generated_columns = if pivot_mode.should_skip_generated_columns() {
         Vec::new()
     } else {
-        parse_pivot_generated_columns_from_in_segment(&clause_tokens[in_idx + 1..])
+        parse_pivot_generated_columns_from_in_segment(
+            &clause_tokens[in_idx + 1..],
+            &aggregate_aliases,
+        )
     };
 
     let mut result = PivotClauseColumns {
@@ -6292,9 +6387,7 @@ fn parse_pivot_aggregate_columns(tokens: &[SqlToken]) -> Vec<String> {
             if let Some((args_range, next_idx)) = extract_parenthesized_range(tokens, open_idx) {
                 let args_tokens = token_range_slice(tokens, args_range);
                 for arg_item in split_top_level_symbol_groups(args_tokens, ",") {
-                    if let Some(column) = parse_identifier_from_expression_tokens(&arg_item) {
-                        columns.push(column);
-                    }
+                    columns.extend(parse_identifiers_from_expression_tokens(&arg_item));
                 }
                 idx = next_idx;
                 continue;
@@ -6308,30 +6401,920 @@ fn parse_pivot_aggregate_columns(tokens: &[SqlToken]) -> Vec<String> {
     columns
 }
 
-fn parse_identifier_from_expression_tokens(tokens: &[&SqlToken]) -> Option<String> {
+fn parse_pivot_aggregate_aliases(tokens: &[SqlToken]) -> Vec<String> {
+    let mut aliases = Vec::new();
+
+    for item_tokens in split_top_level_symbol_groups(tokens, ",") {
+        if let Some(alias) = parse_pivot_aggregate_alias_from_item(&item_tokens) {
+            aliases.push(alias);
+        }
+    }
+
+    dedup_columns_case_insensitive(&mut aliases);
+    aliases
+}
+
+fn parse_pivot_aggregate_alias_from_item(item_tokens: &[&SqlToken]) -> Option<String> {
+    let mut depth = 0usize;
+    let mut first_call_close_idx = None;
+    let mut idx = 0usize;
+
+    while idx < item_tokens.len() {
+        match item_tokens[idx] {
+            SqlToken::Symbol(sym) if sym == "(" => depth = depth.saturating_add(1),
+            SqlToken::Symbol(sym) if sym == ")" => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 && first_call_close_idx.is_none() {
+                    first_call_close_idx = Some(idx);
+                }
+            }
+            SqlToken::Word(word) if depth == 0 && word.eq_ignore_ascii_case("AS") => {
+                return parse_next_identifier_from_token_refs(item_tokens, idx.saturating_add(1));
+            }
+            SqlToken::Word(word)
+                if depth == 0
+                    && first_call_close_idx.is_some_and(|close_idx| idx > close_idx)
+                    && is_identifier_word_token(word)
+                    && !is_expression_keyword(&word.to_ascii_uppercase()) =>
+            {
+                let next_is_call = matches!(
+                    item_tokens.get(idx.saturating_add(1)),
+                    Some(SqlToken::Symbol(sym)) if sym == "("
+                );
+                if !next_is_call {
+                    return Some(output_identifier_suggestion(word));
+                }
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+
+    None
+}
+
+fn parse_next_identifier_from_token_refs(tokens: &[&SqlToken], start: usize) -> Option<String> {
+    let mut idx = start.min(tokens.len());
+    while idx < tokens.len() {
+        match tokens[idx] {
+            SqlToken::Comment(_) => idx += 1,
+            SqlToken::Word(alias) if is_identifier_word_token(alias) => {
+                return Some(output_identifier_suggestion(alias));
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn parse_identifiers_from_expression_tokens(tokens: &[&SqlToken]) -> Vec<String> {
     let meaningful: Vec<&SqlToken> = tokens
         .iter()
         .copied()
         .filter(|token| !matches!(token, SqlToken::Comment(_)))
         .collect();
     if meaningful.is_empty() {
-        return None;
+        return Vec::new();
     }
 
-    for token in meaningful.iter().rev().copied() {
-        if let SqlToken::Word(word) = token {
-            if !is_identifier_word_token(word) {
-                continue;
+    let mut columns = Vec::new();
+    let token_depths = paren_depths_for_token_refs(&meaningful);
+
+    for (idx, token) in meaningful.iter().enumerate() {
+        let SqlToken::Word(word) = token else {
+            continue;
+        };
+        if !is_identifier_word_token(word) {
+            continue;
+        }
+
+        let upper = word.to_ascii_uppercase();
+        if is_expression_keyword(&upper) {
+            continue;
+        }
+
+        if is_cast_type_spec_identifier(&meaningful, &token_depths, idx, &upper)
+            || is_extract_datetime_field_identifier(&meaningful, &token_depths, idx, &upper)
+            || is_extract_from_keyword(&meaningful, &token_depths, idx, &upper)
+            || is_trim_syntax_keyword(&meaningful, &token_depths, idx, &upper)
+            || is_datetime_literal_syntax_word(&meaningful, idx, &upper)
+            || is_json_function_syntax_word(&meaningful, &token_depths, idx, &upper)
+            || is_xmlquery_syntax_word(&meaningful, &token_depths, idx, &upper)
+            || is_at_time_zone_syntax_word(&meaningful, &token_depths, idx, &upper)
+            || is_treat_type_spec_identifier(&meaningful, &token_depths, idx)
+            || is_conversion_default_syntax_word(&meaningful, &token_depths, idx, &upper)
+        {
+            continue;
+        }
+
+        let prev_is_bind_marker = matches!(idx.checked_sub(1).and_then(|prev_idx| meaningful.get(prev_idx)), Some(SqlToken::Symbol(sym)) if sym == ":");
+        if prev_is_bind_marker {
+            continue;
+        }
+
+        let next_is_named_arg_arrow = matches!(
+            meaningful.get(idx + 1),
+            Some(SqlToken::Symbol(sym)) if sym == "=>"
+        ) || (matches!(meaningful.get(idx + 1), Some(SqlToken::Symbol(sym)) if sym == "=")
+            && matches!(meaningful.get(idx + 2), Some(SqlToken::Symbol(sym)) if sym == ">"));
+        if next_is_named_arg_arrow {
+            continue;
+        }
+
+        let next_is_dot =
+            matches!(meaningful.get(idx + 1), Some(SqlToken::Symbol(sym)) if sym == ".");
+        if next_is_dot {
+            continue;
+        }
+
+        let next_is_call =
+            matches!(meaningful.get(idx + 1), Some(SqlToken::Symbol(sym)) if sym == "(");
+        if next_is_call {
+            continue;
+        }
+
+        columns.push(strip_identifier_quotes(word));
+    }
+
+    dedup_columns_case_insensitive(&mut columns);
+    columns
+}
+
+fn paren_depths_for_token_refs(tokens: &[&SqlToken]) -> Vec<usize> {
+    let mut depth = 0usize;
+    let mut depths = Vec::with_capacity(tokens.len());
+
+    for token in tokens {
+        match token {
+            SqlToken::Symbol(sym) if sym == "(" => {
+                depths.push(depth);
+                depth = depth.saturating_add(1);
             }
-            let upper = word.to_ascii_uppercase();
-            if is_expression_keyword(&upper) {
-                continue;
+            SqlToken::Symbol(sym) if sym == ")" => {
+                depth = depth.saturating_sub(1);
+                depths.push(depth);
             }
-            return Some(strip_identifier_quotes(word));
+            _ => depths.push(depth),
+        }
+    }
+
+    depths
+}
+
+fn is_cast_type_spec_identifier(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    word_upper: &str,
+) -> bool {
+    if !is_sql_type_spec_word(word_upper) {
+        return false;
+    }
+
+    let Some(depth) = token_depths.get(idx).copied() else {
+        return false;
+    };
+    if depth == 0 {
+        return false;
+    }
+
+    let mut as_idx = None;
+    let mut scan_idx = idx;
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth {
+            return false;
+        }
+        if scan_depth != depth {
+            continue;
+        }
+
+        match tokens.get(scan_idx).copied() {
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("AS") => {
+                as_idx = Some(scan_idx);
+                break;
+            }
+            Some(SqlToken::Symbol(sym)) if sym == "," => return false,
+            _ => {}
+        }
+    }
+
+    let Some(as_idx) = as_idx else {
+        return false;
+    };
+
+    let mut scan_idx = as_idx;
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth.saturating_sub(1) {
+            return false;
+        }
+        if scan_depth == depth.saturating_sub(1) {
+            if matches!(tokens.get(scan_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
+                let Some(call_idx) = scan_idx.checked_sub(1) else {
+                    return false;
+                };
+                return matches!(
+                    tokens.get(call_idx).copied(),
+                    Some(SqlToken::Word(call_name))
+                        if call_name.eq_ignore_ascii_case("CAST")
+                            || call_name.eq_ignore_ascii_case("CONVERT")
+                            || call_name.eq_ignore_ascii_case("XMLCAST")
+                );
+            }
+        }
+    }
+
+    false
+}
+
+fn is_treat_type_spec_identifier(tokens: &[&SqlToken], token_depths: &[usize], idx: usize) -> bool {
+    let Some(depth) = token_depths.get(idx).copied() else {
+        return false;
+    };
+    if depth == 0 || call_open_index(tokens, token_depths, idx, depth, "TREAT").is_none() {
+        return false;
+    }
+
+    keyword_before_in_same_call(tokens, token_depths, idx, depth, "AS").is_some()
+}
+
+fn is_extract_datetime_field_identifier(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    word_upper: &str,
+) -> bool {
+    if !is_extract_datetime_field_word(word_upper) {
+        return false;
+    }
+
+    let Some(depth) = token_depths.get(idx).copied() else {
+        return false;
+    };
+    let Some(open_idx) = call_open_index(tokens, token_depths, idx, depth, "EXTRACT") else {
+        return false;
+    };
+    if depth == 0 {
+        return false;
+    }
+
+    for scan_idx in open_idx.saturating_add(1)..idx {
+        if token_depths.get(scan_idx).copied() != Some(depth) {
+            continue;
+        }
+        if matches!(
+            tokens.get(scan_idx).copied(),
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("FROM")
+        ) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn is_extract_from_keyword(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    word_upper: &str,
+) -> bool {
+    if word_upper != "FROM" {
+        return false;
+    }
+
+    let Some(depth) = token_depths.get(idx).copied() else {
+        return false;
+    };
+    depth > 0 && call_open_index(tokens, token_depths, idx, depth, "EXTRACT").is_some()
+}
+
+fn call_open_index(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+    call_name: &str,
+) -> Option<usize> {
+    let mut scan_idx = idx;
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth.saturating_sub(1) {
+            return None;
+        }
+        if scan_depth == depth.saturating_sub(1) {
+            if matches!(tokens.get(scan_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
+                let call_idx = scan_idx.checked_sub(1)?;
+                return matches!(
+                    tokens.get(call_idx).copied(),
+                    Some(SqlToken::Word(actual_call_name))
+                        if actual_call_name.eq_ignore_ascii_case(call_name)
+                )
+                .then_some(scan_idx);
+            }
         }
     }
 
     None
+}
+
+fn is_extract_datetime_field_word(word: &str) -> bool {
+    matches!(
+        word,
+        "YEAR"
+            | "MONTH"
+            | "DAY"
+            | "HOUR"
+            | "MINUTE"
+            | "SECOND"
+            | "TIMEZONE_HOUR"
+            | "TIMEZONE_MINUTE"
+            | "TIMEZONE_REGION"
+            | "TIMEZONE_ABBR"
+    )
+}
+
+fn is_trim_syntax_keyword(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    word_upper: &str,
+) -> bool {
+    if !matches!(word_upper, "LEADING" | "TRAILING" | "BOTH" | "FROM") {
+        return false;
+    }
+
+    let Some(depth) = token_depths.get(idx).copied() else {
+        return false;
+    };
+    if depth == 0 {
+        return false;
+    }
+
+    call_open_index(tokens, token_depths, idx, depth, "TRIM").is_some()
+}
+
+fn is_datetime_literal_syntax_word(tokens: &[&SqlToken], idx: usize, word_upper: &str) -> bool {
+    if matches!(word_upper, "DATE" | "TIME" | "TIMESTAMP" | "INTERVAL") {
+        return matches!(tokens.get(idx + 1), Some(SqlToken::String(_)))
+            || datetime_literal_string_index_after_intro(tokens, idx).is_some();
+    }
+
+    if is_extract_datetime_field_word(word_upper) {
+        return datetime_literal_intro_index_before_field(tokens, idx).is_some();
+    }
+
+    matches!(word_upper, "WITH" | "LOCAL" | "ZONE")
+        && datetime_literal_string_index_after_intro(tokens, idx).is_some()
+}
+
+fn datetime_literal_string_index_after_intro(tokens: &[&SqlToken], idx: usize) -> Option<usize> {
+    let mut scan_idx = idx.saturating_add(1);
+    while scan_idx < tokens.len() {
+        match tokens.get(scan_idx).copied() {
+            Some(SqlToken::String(_)) => return Some(scan_idx),
+            Some(SqlToken::Word(word))
+                if matches!(
+                    word.to_ascii_uppercase().as_str(),
+                    "WITH" | "LOCAL" | "TIME" | "ZONE"
+                ) =>
+            {
+                scan_idx += 1;
+            }
+            _ => return None,
+        }
+    }
+
+    None
+}
+
+fn datetime_literal_intro_index_before_field(tokens: &[&SqlToken], idx: usize) -> Option<usize> {
+    let mut scan_idx = idx;
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        match tokens.get(scan_idx).copied() {
+            Some(SqlToken::String(_)) => continue,
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("TO") => continue,
+            Some(SqlToken::Word(word))
+                if is_extract_datetime_field_word(&word.to_ascii_uppercase()) =>
+            {
+                continue
+            }
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("INTERVAL") => {
+                return Some(scan_idx);
+            }
+            _ => return None,
+        }
+    }
+
+    None
+}
+
+fn is_json_function_syntax_word(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    word_upper: &str,
+) -> bool {
+    let Some(depth) = token_depths.get(idx).copied() else {
+        return false;
+    };
+    if depth == 0 || json_call_open_index(tokens, token_depths, idx, depth).is_none() {
+        return false;
+    }
+
+    if matches!(
+        word_upper,
+        "RETURNING" | "DEFAULT" | "ON" | "ERROR" | "EMPTY" | "PASSING"
+    ) {
+        return true;
+    }
+
+    if is_json_function_option_word(tokens, token_depths, idx, depth, word_upper) {
+        return true;
+    }
+
+    is_sql_type_spec_word(word_upper)
+        && json_returning_keyword_before(tokens, token_depths, idx, depth).is_some()
+}
+
+fn is_json_function_option_word(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+    word_upper: &str,
+) -> bool {
+    match word_upper {
+        "FORMAT" => next_word_at_depth_is(tokens, token_depths, idx, depth, "JSON"),
+        "JSON" => {
+            keyword_before_in_same_call(tokens, token_depths, idx, depth, "FORMAT").is_some()
+                || json_returning_keyword_before(tokens, token_depths, idx, depth).is_some()
+        }
+        "WITH" | "WITHOUT" => next_word_at_depth_is(tokens, token_depths, idx, depth, "WRAPPER"),
+        "WRAPPER" => {
+            keyword_before_in_same_call(tokens, token_depths, idx, depth, "WITH").is_some()
+                || keyword_before_in_same_call(tokens, token_depths, idx, depth, "WITHOUT")
+                    .is_some()
+        }
+        "PRETTY" | "ASCII" | "TRUNCATE" => {
+            json_returning_keyword_before(tokens, token_depths, idx, depth).is_some()
+        }
+        "TRUE" | "FALSE" | "UNKNOWN" => {
+            next_word_at_depth_is(tokens, token_depths, idx, depth, "ON")
+                && next_word_index_at_depth(tokens, token_depths, idx, depth).is_some_and(
+                    |on_idx| next_word_at_depth_is(tokens, token_depths, on_idx, depth, "ERROR"),
+                )
+        }
+        _ => false,
+    }
+}
+
+fn next_word_at_depth_is(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+    keyword: &str,
+) -> bool {
+    next_word_index_at_depth(tokens, token_depths, idx, depth).is_some_and(|next_idx| {
+        matches!(
+            tokens.get(next_idx).copied(),
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case(keyword)
+        )
+    })
+}
+
+fn next_word_index_at_depth(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let mut scan_idx = idx.saturating_add(1);
+    while scan_idx < tokens.len() {
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth {
+            return None;
+        }
+        if scan_depth != depth {
+            scan_idx += 1;
+            continue;
+        }
+
+        match tokens.get(scan_idx).copied() {
+            Some(SqlToken::Word(_)) => return Some(scan_idx),
+            Some(SqlToken::Comment(_)) => {
+                scan_idx += 1;
+            }
+            _ => return None,
+        }
+    }
+
+    None
+}
+
+fn previous_word_index_at_depth(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let mut scan_idx = idx;
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth {
+            return None;
+        }
+        if scan_depth != depth {
+            continue;
+        }
+
+        match tokens.get(scan_idx).copied() {
+            Some(SqlToken::Word(_)) => return Some(scan_idx),
+            Some(SqlToken::Comment(_)) => {}
+            _ => return None,
+        }
+    }
+
+    None
+}
+
+fn json_call_open_index(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let mut scan_idx = idx;
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth.saturating_sub(1) {
+            return None;
+        }
+        if scan_depth == depth.saturating_sub(1)
+            && matches!(tokens.get(scan_idx), Some(SqlToken::Symbol(sym)) if sym == "(")
+        {
+            let call_idx = scan_idx.checked_sub(1)?;
+            return matches!(
+                tokens.get(call_idx).copied(),
+                Some(SqlToken::Word(call_name)) if is_json_function_name(call_name)
+            )
+            .then_some(scan_idx);
+        }
+    }
+
+    None
+}
+
+fn json_returning_keyword_before(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let mut scan_idx = idx;
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth {
+            return None;
+        }
+        if scan_depth != depth {
+            continue;
+        }
+
+        match tokens.get(scan_idx).copied() {
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("RETURNING") => {
+                return Some(scan_idx);
+            }
+            Some(SqlToken::Symbol(sym)) if sym == "," => return None,
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn is_json_function_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "JSON_VALUE"
+            | "JSON_EXISTS"
+            | "JSON_QUERY"
+            | "JSON_SERIALIZE"
+            | "JSON_OBJECT"
+            | "JSON_ARRAY"
+            | "JSON_OBJECTAGG"
+            | "JSON_ARRAYAGG"
+    )
+}
+
+fn is_xmlquery_syntax_word(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    word_upper: &str,
+) -> bool {
+    let Some(depth) = token_depths.get(idx).copied() else {
+        return false;
+    };
+    if depth == 0 || call_open_index(tokens, token_depths, idx, depth, "XMLQUERY").is_none() {
+        return false;
+    }
+
+    if matches!(word_upper, "PASSING" | "RETURNING") {
+        return true;
+    }
+
+    word_upper == "CONTENT"
+        && keyword_before_in_same_call(tokens, token_depths, idx, depth, "RETURNING").is_some()
+}
+
+fn keyword_before_in_same_call(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+    keyword: &str,
+) -> Option<usize> {
+    let mut scan_idx = idx;
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth {
+            return None;
+        }
+        if scan_depth != depth {
+            continue;
+        }
+
+        match tokens.get(scan_idx).copied() {
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case(keyword) => {
+                return Some(scan_idx);
+            }
+            Some(SqlToken::Symbol(sym)) if sym == "," => return None,
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn is_at_time_zone_syntax_word(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    word_upper: &str,
+) -> bool {
+    let Some(depth) = token_depths.get(idx).copied() else {
+        return false;
+    };
+
+    match word_upper {
+        "AT" => {
+            let Some(next_idx) = next_word_index_at_depth(tokens, token_depths, idx, depth) else {
+                return false;
+            };
+            match tokens.get(next_idx).copied() {
+                Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("LOCAL") => true,
+                Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("TIME") => {
+                    next_word_at_depth_is(tokens, token_depths, next_idx, depth, "ZONE")
+                }
+                _ => false,
+            }
+        }
+        "TIME" => {
+            previous_word_index_at_depth(tokens, token_depths, idx, depth).is_some_and(|prev_idx| {
+                matches!(
+                    tokens.get(prev_idx).copied(),
+                    Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("AT")
+                )
+            }) && next_word_at_depth_is(tokens, token_depths, idx, depth, "ZONE")
+        }
+        "ZONE" => {
+            let Some(prev_idx) = previous_word_index_at_depth(tokens, token_depths, idx, depth)
+            else {
+                return false;
+            };
+            if !matches!(
+                tokens.get(prev_idx).copied(),
+                Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("TIME")
+            ) {
+                return false;
+            }
+            previous_word_index_at_depth(tokens, token_depths, prev_idx, depth).is_some_and(
+                |at_idx| {
+                    matches!(
+                        tokens.get(at_idx).copied(),
+                        Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("AT")
+                    )
+                },
+            )
+        }
+        "LOCAL" => {
+            previous_word_index_at_depth(tokens, token_depths, idx, depth).is_some_and(|prev_idx| {
+                matches!(
+                    tokens.get(prev_idx).copied(),
+                    Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("AT")
+                )
+            })
+        }
+        _ => false,
+    }
+}
+
+fn is_conversion_default_syntax_word(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    word_upper: &str,
+) -> bool {
+    let Some(depth) = token_depths.get(idx).copied() else {
+        return false;
+    };
+    if depth == 0 || conversion_call_open_index(tokens, token_depths, idx, depth).is_none() {
+        return false;
+    }
+
+    match word_upper {
+        "DEFAULT" => next_word_after_conversion_default(tokens, token_depths, idx, depth).is_some(),
+        "ON" => {
+            previous_conversion_default_index(tokens, token_depths, idx, depth).is_some()
+                && next_word_at_depth_is(tokens, token_depths, idx, depth, "CONVERSION")
+        }
+        "CONVERSION" => {
+            previous_word_index_at_depth(tokens, token_depths, idx, depth).is_some_and(|prev_idx| {
+                matches!(
+                    tokens.get(prev_idx).copied(),
+                    Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("ON")
+                )
+            }) && next_word_at_depth_is(tokens, token_depths, idx, depth, "ERROR")
+                && previous_conversion_default_index(tokens, token_depths, idx, depth).is_some()
+        }
+        "ERROR" => {
+            let Some(prev_idx) = previous_word_index_at_depth(tokens, token_depths, idx, depth)
+            else {
+                return false;
+            };
+            if !matches!(
+                tokens.get(prev_idx).copied(),
+                Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("CONVERSION")
+            ) {
+                return false;
+            }
+            previous_conversion_default_index(tokens, token_depths, prev_idx, depth).is_some()
+        }
+        _ => false,
+    }
+}
+
+fn conversion_call_open_index(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let mut scan_idx = idx;
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth.saturating_sub(1) {
+            return None;
+        }
+        if scan_depth == depth.saturating_sub(1)
+            && matches!(tokens.get(scan_idx), Some(SqlToken::Symbol(sym)) if sym == "(")
+        {
+            let call_idx = scan_idx.checked_sub(1)?;
+            return matches!(
+                tokens.get(call_idx).copied(),
+                Some(SqlToken::Word(call_name)) if is_conversion_function_name(call_name)
+            )
+            .then_some(scan_idx);
+        }
+    }
+
+    None
+}
+
+fn previous_conversion_default_index(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let mut scan_idx = idx;
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth {
+            return None;
+        }
+        if scan_depth != depth {
+            continue;
+        }
+        match tokens.get(scan_idx).copied() {
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("DEFAULT") => {
+                return Some(scan_idx);
+            }
+            Some(SqlToken::Symbol(sym)) if sym == "," => return None,
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn next_word_after_conversion_default(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let mut scan_idx = idx.saturating_add(1);
+    while scan_idx < tokens.len() {
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth {
+            return None;
+        }
+        if scan_depth != depth {
+            scan_idx += 1;
+            continue;
+        }
+        match tokens.get(scan_idx).copied() {
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("ON") => return None,
+            Some(SqlToken::Word(_)) | Some(SqlToken::String(_)) => return Some(scan_idx),
+            Some(SqlToken::Symbol(sym)) if sym == "," => return None,
+            Some(SqlToken::Comment(_)) => {
+                scan_idx += 1;
+            }
+            _ => return None,
+        }
+    }
+
+    None
+}
+
+fn is_conversion_function_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "TO_NUMBER"
+            | "TO_DATE"
+            | "TO_TIMESTAMP"
+            | "TO_TIMESTAMP_TZ"
+            | "TO_BINARY_FLOAT"
+            | "TO_BINARY_DOUBLE"
+    )
+}
+
+fn is_sql_type_spec_word(word: &str) -> bool {
+    matches!(
+        word,
+        "NUMBER"
+            | "NUMERIC"
+            | "DECIMAL"
+            | "DEC"
+            | "INTEGER"
+            | "INT"
+            | "SMALLINT"
+            | "FLOAT"
+            | "DOUBLE"
+            | "PRECISION"
+            | "REAL"
+            | "BINARY_FLOAT"
+            | "BINARY_DOUBLE"
+            | "CHAR"
+            | "CHARACTER"
+            | "VARCHAR"
+            | "VARCHAR2"
+            | "NCHAR"
+            | "NVARCHAR2"
+            | "RAW"
+            | "DATE"
+            | "TIMESTAMP"
+            | "TIME"
+            | "INTERVAL"
+            | "YEAR"
+            | "TO"
+            | "MONTH"
+            | "DAY"
+            | "HOUR"
+            | "MINUTE"
+            | "SECOND"
+            | "WITH"
+            | "LOCAL"
+            | "ZONE"
+            | "CLOB"
+            | "NCLOB"
+            | "BLOB"
+            | "BOOLEAN"
+    )
 }
 
 fn collect_table_function_columns(
@@ -6431,12 +7414,15 @@ fn is_expression_keyword(word: &str) -> bool {
     matches!(
         word,
         "AS" | "DISTINCT"
+            | "ALL"
+            | "UNIQUE"
             | "CASE"
             | "WHEN"
             | "THEN"
             | "ELSE"
             | "END"
             | "NULL"
+            | "WHERE"
             | "AND"
             | "OR"
             | "NOT"
@@ -6448,6 +7434,15 @@ fn is_expression_keyword(word: &str) -> bool {
             | "PARTITION"
             | "ORDER"
             | "BY"
+            | "KEEP"
+            | "DENSE_RANK"
+            | "FIRST"
+            | "LAST"
+            | "WITHIN"
+            | "GROUP"
+            | "ASC"
+            | "DESC"
+            | "NULLS"
             | "ROWS"
             | "RANGE"
             | "CURRENT"
@@ -6524,7 +7519,10 @@ fn parse_identifier_words_top_level(tokens: &[SqlToken]) -> Vec<String> {
     columns
 }
 
-fn parse_pivot_generated_columns_from_in_segment(tokens: &[SqlToken]) -> Vec<String> {
+fn parse_pivot_generated_columns_from_in_segment(
+    tokens: &[SqlToken],
+    aggregate_aliases: &[String],
+) -> Vec<String> {
     let open_idx = next_non_comment_index(tokens, 0);
     let Some(SqlToken::Symbol(sym)) = tokens.get(open_idx) else {
         return Vec::new();
@@ -6541,12 +7539,33 @@ fn parse_pivot_generated_columns_from_in_segment(tokens: &[SqlToken]) -> Vec<Str
 
     for item_tokens in split_top_level_symbol_groups(in_list_tokens, ",") {
         if let Some(column) = parse_pivot_in_item_output_column(&item_tokens) {
-            columns.push(column);
+            if aggregate_aliases.is_empty() {
+                columns.push(column);
+            } else {
+                columns.extend(
+                    aggregate_aliases
+                        .iter()
+                        .map(|alias| combine_pivot_generated_column(&column, alias)),
+                );
+            }
         }
     }
 
     dedup_columns_case_insensitive(&mut columns);
     columns
+}
+
+fn combine_pivot_generated_column(pivot_column: &str, aggregate_alias: &str) -> String {
+    let pivot_trimmed = pivot_column.trim();
+    let aggregate_trimmed = aggregate_alias.trim();
+    if is_quoted_identifier(pivot_trimmed) || is_quoted_identifier(aggregate_trimmed) {
+        let pivot = strip_identifier_quotes(pivot_trimmed);
+        let aggregate = strip_identifier_quotes(aggregate_trimmed);
+        let escaped = format!("{}_{}", pivot, aggregate).replace('"', "\"\"");
+        format!("\"{escaped}\"")
+    } else {
+        format!("{pivot_trimmed}_{aggregate_trimmed}")
+    }
 }
 
 fn parse_pivot_in_item_output_column(item_tokens: &[&SqlToken]) -> Option<String> {
@@ -7038,6 +8057,91 @@ fn append_wildcard_item_tables(
             }
         }
     }
+}
+
+fn append_wildcard_item_scopes(
+    item_tokens: &[&SqlToken],
+    tables_in_scope: &[ScopedTableRef],
+    tables: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    let meaningful: Vec<&SqlToken> = item_tokens
+        .iter()
+        .copied()
+        .filter(|t| !matches!(t, SqlToken::Comment(_)))
+        .collect();
+
+    if meaningful.is_empty() {
+        return;
+    }
+
+    if meaningful.len() == 1 {
+        if let SqlToken::Symbol(s) = meaningful[0] {
+            if s == "*" {
+                for table in resolve_all_scope_wildcard_scopes(tables_in_scope) {
+                    let key = normalize_identifier_for_scope_dedupe(&table);
+                    if seen.insert(key) {
+                        tables.push(table);
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    if meaningful.len() >= 3 {
+        let last = meaningful[meaningful.len() - 1];
+        let dot = meaningful[meaningful.len() - 2];
+        if let (SqlToken::Symbol(star), SqlToken::Symbol(dot_sym)) = (last, dot) {
+            if star == "*" && dot_sym == "." {
+                if let Some(normalized) =
+                    normalize_dotted_identifier_tokens(&meaningful[..meaningful.len() - 2])
+                {
+                    let resolved = tables_in_scope
+                        .iter()
+                        .find_map(|table_ref| {
+                            table_ref
+                                .alias
+                                .as_deref()
+                                .filter(|alias| alias.eq_ignore_ascii_case(&normalized))
+                                .map(str::to_string)
+                        })
+                        .map(|alias| vec![alias])
+                        .unwrap_or_else(|| resolve_qualifier_tables(&normalized, tables_in_scope));
+                    for table in resolved {
+                        let key = normalize_identifier_for_scope_dedupe(&table);
+                        if seen.insert(key) {
+                            tables.push(table);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn resolve_all_scope_wildcard_scopes(tables_in_scope: &[ScopedTableRef]) -> Vec<String> {
+    let mut ordered_tables: Vec<(usize, &ScopedTableRef)> =
+        tables_in_scope.iter().enumerate().collect();
+    ordered_tables.sort_by(|(left_idx, left), (right_idx, right)| {
+        right
+            .depth
+            .cmp(&left.depth)
+            .then_with(|| left_idx.cmp(right_idx))
+    });
+
+    let mut result = Vec::new();
+    let mut seen = HashSet::new();
+
+    for (_, table_ref) in ordered_tables {
+        let scope_name = table_ref.alias.as_ref().unwrap_or(&table_ref.name);
+        let upper = normalize_identifier_for_scope_dedupe(scope_name);
+        if seen.insert(upper) {
+            result.push(scope_name.clone());
+        }
+    }
+
+    result
 }
 
 fn normalize_dotted_identifier_tokens(tokens: &[&SqlToken]) -> Option<String> {

@@ -1838,7 +1838,7 @@ impl SqlEditorWidget {
         column_sender: &mpsc::Sender<ColumnLoadUpdate>,
         connection: &SharedConnection,
     ) -> (Vec<String>, Vec<String>) {
-        let wildcard_tables = intellisense_context::extract_select_list_wildcard_tables(
+        let wildcard_tables = intellisense_context::extract_select_list_wildcard_scopes(
             body_tokens,
             body_tables_in_scope,
         );
@@ -1846,9 +1846,16 @@ impl SqlEditorWidget {
             return (Vec::new(), Vec::new());
         }
 
+        let wildcard_tables = Self::effective_wildcard_column_tables(
+            wildcard_tables,
+            body_tables_in_scope,
+            virtual_table_columns,
+        );
         let mut wildcard_columns = Vec::new();
         for table in &wildcard_tables {
-            Self::request_table_columns(table, intellisense_data, column_sender, connection);
+            if Self::virtual_table_columns_for_lookup(virtual_table_columns, table).is_none() {
+                Self::request_table_columns(table, intellisense_data, column_sender, connection);
+            }
             let columns = Self::columns_for_virtual_or_cached_table(
                 table,
                 virtual_table_columns,
@@ -1858,6 +1865,40 @@ impl SqlEditorWidget {
         }
         Self::dedup_column_names_case_insensitive(&mut wildcard_columns);
         (wildcard_columns, wildcard_tables)
+    }
+
+    fn effective_wildcard_column_tables(
+        wildcard_tables: Vec<String>,
+        body_tables_in_scope: &[intellisense_context::ScopedTableRef],
+        virtual_table_columns: &HashMap<String, Vec<String>>,
+    ) -> Vec<String> {
+        wildcard_tables
+            .into_iter()
+            .map(|table| {
+                if Self::virtual_table_columns_for_lookup(virtual_table_columns, &table).is_some() {
+                    return table;
+                }
+                if let Some(source) = body_tables_in_scope.iter().find_map(|table_ref| {
+                    table_ref
+                        .alias
+                        .as_deref()
+                        .filter(|alias| alias.eq_ignore_ascii_case(&table))
+                        .map(|_| table_ref.name.clone())
+                }) {
+                    return source;
+                }
+                body_tables_in_scope
+                    .iter()
+                    .find_map(|table_ref| {
+                        let alias = table_ref.alias.as_deref()?;
+                        (table_ref.name.eq_ignore_ascii_case(&table)
+                            && Self::virtual_table_columns_for_lookup(virtual_table_columns, alias)
+                                .is_some())
+                        .then(|| alias.to_string())
+                    })
+                    .unwrap_or(table)
+            })
+            .collect()
     }
 
     fn columns_for_virtual_or_cached_table(
@@ -1878,6 +1919,24 @@ impl SqlEditorWidget {
     fn dedup_column_names_case_insensitive(columns: &mut Vec<String>) {
         let mut seen = HashSet::new();
         columns.retain(|column| seen.insert(Self::completion_identifier_lookup_upper(column)));
+    }
+
+    fn column_sets_match_case_insensitive(left: &[String], right: &[String]) -> bool {
+        if left.len() != right.len() {
+            return false;
+        }
+
+        let mut left_keys: Vec<String> = left
+            .iter()
+            .map(|column| Self::completion_identifier_lookup_upper(column))
+            .collect();
+        let mut right_keys: Vec<String> = right
+            .iter()
+            .map(|column| Self::completion_identifier_lookup_upper(column))
+            .collect();
+        left_keys.sort_unstable();
+        right_keys.sort_unstable();
+        left_keys == right_keys
     }
 
     fn dedup_local_member_entries_case_insensitive(entries: &mut Vec<LocalMemberEntry>) {
@@ -2483,7 +2542,21 @@ impl SqlEditorWidget {
             column_sender,
             connection,
         );
+        let pivot_unpivot_columns =
+            intellisense_context::extract_oracle_pivot_unpivot_projection_columns(body_tokens);
         let mut columns = intellisense_context::extract_select_list_columns(body_tokens);
+        let mut use_pivot_unpivot_projection =
+            columns.is_empty() && !pivot_unpivot_columns.is_empty();
+        if !columns.is_empty() && !pivot_unpivot_columns.is_empty() {
+            let pivot_unpivot_source_columns =
+                intellisense_context::extract_oracle_pivot_unpivot_source_projection_columns(
+                    body_tokens,
+                );
+            if Self::column_sets_match_case_insensitive(&columns, &pivot_unpivot_source_columns) {
+                columns.clear();
+                use_pivot_unpivot_projection = true;
+            }
+        }
         if columns.is_empty() {
             columns = intellisense_context::extract_table_function_columns(body_tokens);
         }
@@ -2506,9 +2579,9 @@ impl SqlEditorWidget {
             connection,
         );
         columns.extend(wildcard_columns);
-        columns.extend(
-            intellisense_context::extract_oracle_pivot_unpivot_projection_columns(body_tokens),
-        );
+        if use_pivot_unpivot_projection {
+            columns.extend(pivot_unpivot_columns);
+        }
         columns.extend(intellisense_context::extract_oracle_model_generated_columns(body_tokens));
         columns
             .extend(intellisense_context::extract_match_recognize_generated_columns(body_tokens));
@@ -2685,27 +2758,14 @@ impl SqlEditorWidget {
     ) -> Option<&'a [String]> {
         let candidates = Self::table_lookup_key_candidates(table);
         for candidate in &candidates {
-            if let Some(columns) = virtual_table_columns.get(candidate.as_str()) {
+            let key = Self::completion_identifier_lookup_upper(candidate);
+            if let Some(columns) = virtual_table_columns.get(&key) {
                 return Some(columns.as_slice());
-            }
-
-            let normalized = candidate.to_ascii_uppercase();
-            if normalized != candidate.as_str() {
-                if let Some(columns) = virtual_table_columns.get(&normalized) {
-                    return Some(columns.as_slice());
-                }
             }
         }
 
-        virtual_table_columns
-            .iter()
-            .find(|(name, _)| {
-                name.eq_ignore_ascii_case(table)
-                    || candidates
-                        .iter()
-                        .any(|candidate| name.eq_ignore_ascii_case(candidate))
-            })
-            .map(|(_, cols)| cols.as_slice())
+        let key = Self::completion_identifier_lookup_upper(table);
+        virtual_table_columns.get(&key).map(|cols| cols.as_slice())
     }
 
     fn insert_virtual_table_columns(
@@ -2713,7 +2773,7 @@ impl SqlEditorWidget {
         relation_name: &str,
         columns: Vec<String>,
     ) {
-        virtual_table_columns.insert(relation_name.to_ascii_uppercase(), columns);
+        virtual_table_columns.insert(Self::completion_identifier_lookup_upper(relation_name), columns);
     }
 
     fn is_cursor_inside_subquery_explicit_column_list(
@@ -2743,23 +2803,137 @@ impl SqlEditorWidget {
         (!columns.is_empty()).then_some(columns)
     }
 
+    fn virtual_subquery_replaces_source_columns(
+        deep_ctx: &intellisense_context::CursorContext,
+        subquery: &intellisense_context::SubqueryDefinition,
+    ) -> bool {
+        if Self::explicit_subquery_columns_for_completion(deep_ctx, subquery).is_some() {
+            return true;
+        }
+
+        let body_tokens = intellisense_context::token_range_slice(
+            deep_ctx.statement_tokens.as_ref(),
+            subquery.body_range,
+        );
+        !intellisense_context::extract_oracle_pivot_unpivot_projection_columns(body_tokens)
+            .is_empty()
+    }
+
+    fn column_lookup_table_for_table_ref(
+        table_ref: &intellisense_context::ScopedTableRef,
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> String {
+        if let Some(alias) = table_ref.alias.as_deref() {
+            if let Some(subquery) = deep_ctx
+                .subqueries
+                .iter()
+                .find(|subquery| subquery.alias.eq_ignore_ascii_case(alias))
+            {
+                if Self::virtual_subquery_replaces_source_columns(deep_ctx, subquery) {
+                    return subquery.alias.clone();
+                }
+            }
+        }
+
+        table_ref.name.clone()
+    }
+
+    fn resolve_all_scope_column_lookup_tables(
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> Vec<String> {
+        let mut ordered_tables: Vec<(usize, &intellisense_context::ScopedTableRef)> =
+            deep_ctx.tables_in_scope.iter().enumerate().collect();
+        ordered_tables.sort_by(|(left_idx, left), (right_idx, right)| {
+            right
+                .depth
+                .cmp(&left.depth)
+                .then_with(|| left_idx.cmp(right_idx))
+        });
+
+        let mut tables = Vec::new();
+        let mut seen = HashSet::new();
+
+        for (_, table_ref) in ordered_tables {
+            let lookup_table = Self::column_lookup_table_for_table_ref(table_ref, deep_ctx);
+            let key = Self::completion_identifier_lookup_upper(&lookup_table);
+            if seen.insert(key) {
+                tables.push(lookup_table);
+            }
+        }
+
+        tables
+    }
+
+    fn resolve_focused_column_lookup_tables(
+        focused_tables: &[String],
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> Vec<String> {
+        let mut tables = Vec::new();
+        let mut seen = HashSet::new();
+
+        for focused in focused_tables {
+            let mut matched = false;
+            for table_ref in &deep_ctx.tables_in_scope {
+                let matches_focused = table_ref.name.eq_ignore_ascii_case(focused)
+                    || table_ref
+                        .alias
+                        .as_deref()
+                        .is_some_and(|alias| alias.eq_ignore_ascii_case(focused));
+                if !matches_focused {
+                    continue;
+                }
+
+                matched = true;
+                let lookup_table = Self::column_lookup_table_for_table_ref(table_ref, deep_ctx);
+                let key = Self::completion_identifier_lookup_upper(&lookup_table);
+                if seen.insert(key) {
+                    tables.push(lookup_table);
+                }
+            }
+
+            if !matched {
+                let key = Self::completion_identifier_lookup_upper(focused);
+                if seen.insert(key) {
+                    tables.push(focused.clone());
+                }
+            }
+        }
+
+        tables
+    }
+
     fn resolve_column_tables_for_context(
         qualifier: Option<&str>,
         deep_ctx: &intellisense_context::CursorContext,
     ) -> Vec<String> {
+        fn virtual_alias_for_qualifier<'a>(
+            qualifier: &str,
+            deep_ctx: &'a intellisense_context::CursorContext,
+        ) -> Option<&'a intellisense_context::SubqueryDefinition> {
+            deep_ctx
+                .subqueries
+                .iter()
+                .find(|subq| subq.alias.eq_ignore_ascii_case(qualifier))
+        }
+
+        fn replacement_virtual_alias_scope(
+            qualifier: &str,
+            deep_ctx: &intellisense_context::CursorContext,
+        ) -> Option<Vec<String>> {
+            let subquery = virtual_alias_for_qualifier(qualifier, deep_ctx)?;
+            SqlEditorWidget::virtual_subquery_replaces_source_columns(deep_ctx, subquery)
+                .then(|| vec![subquery.alias.clone()])
+        }
+
         fn prepend_virtual_alias_if_present(
             tables: &mut Vec<String>,
             qualifier: &str,
             deep_ctx: &intellisense_context::CursorContext,
         ) {
-            let Some(alias) = deep_ctx
-                .subqueries
-                .iter()
-                .find(|subq| subq.alias.eq_ignore_ascii_case(qualifier))
-                .map(|subq| subq.alias.clone())
-            else {
+            let Some(subquery) = virtual_alias_for_qualifier(qualifier, deep_ctx) else {
                 return;
             };
+            let alias = subquery.alias.clone();
 
             if tables
                 .iter()
@@ -2792,13 +2966,22 @@ impl SqlEditorWidget {
         }
         let Some(qualifier) = qualifier else {
             if let Some(focused_tables) = focused_tables {
+                if matches!(
+                    deep_ctx.phase,
+                    intellisense_context::SqlPhase::LockingColumnList
+                ) {
+                    return Self::resolve_focused_column_lookup_tables(focused_tables, deep_ctx);
+                }
                 return focused_tables.to_vec();
             }
-            return intellisense_context::resolve_all_scope_tables(&deep_ctx.tables_in_scope);
+            return Self::resolve_all_scope_column_lookup_tables(deep_ctx);
         };
 
         let resolved =
             intellisense_context::resolve_qualifier_tables(qualifier, &deep_ctx.tables_in_scope);
+        if let Some(virtual_scope) = replacement_virtual_alias_scope(qualifier, deep_ctx) {
+            return virtual_scope;
+        }
         if let Some(focused_tables) = focused_tables {
             let filtered: Vec<String> = resolved
                 .iter()
@@ -2997,14 +3180,23 @@ impl SqlEditorWidget {
 
         let mut lookup_tables = Self::resolve_column_tables_for_context(Some(qualifier), deep_ctx);
         for table_ref in comparison_tables {
+            let table_lookup =
+                Self::comparison_column_lookup_table_for_table_ref(&table_ref, deep_ctx);
             if lookup_tables
                 .iter()
-                .all(|existing| !existing.eq_ignore_ascii_case(&table_ref.name))
+                .all(|existing| !existing.eq_ignore_ascii_case(&table_lookup))
             {
-                lookup_tables.push(table_ref.name);
+                lookup_tables.push(table_lookup);
             }
         }
         lookup_tables
+    }
+
+    fn comparison_column_lookup_table_for_table_ref(
+        table_ref: &intellisense_context::ScopedTableRef,
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> String {
+        Self::column_lookup_table_for_table_ref(table_ref, deep_ctx)
     }
 
     fn collect_qualified_condition_comparison_suggestions(
@@ -3130,7 +3322,9 @@ impl SqlEditorWidget {
             }
 
             let mut other_columns_by_upper = HashMap::new();
-            for column in data.get_columns_for_table(&table_ref.name) {
+            let other_lookup_table =
+                Self::comparison_column_lookup_table_for_table_ref(table_ref, deep_ctx);
+            for column in data.get_columns_for_table(&other_lookup_table) {
                 other_columns_by_upper
                     .entry(Self::completion_identifier_lookup_upper(&column))
                     .or_insert(column);

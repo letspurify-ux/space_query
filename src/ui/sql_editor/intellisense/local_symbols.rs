@@ -1042,7 +1042,9 @@ impl SqlEditorWidget {
                             });
                         }
                         "FOR" => {
-                            pending_loop_var = Self::parse_for_loop_record(token_spans, idx);
+                            if pending_loop_var.is_none() {
+                                pending_loop_var = Self::parse_for_loop_record(token_spans, idx);
+                            }
                         }
                         "LOOP" => {
                             if prev_is_end {
@@ -2135,10 +2137,15 @@ impl SqlEditorWidget {
     ) -> (Vec<String>, Vec<String>) {
         let mut columns = intellisense_context::extract_select_list_columns(body_tokens);
         Self::dedup_column_names_case_insensitive(&mut columns);
+        if let Some(transformed_columns) =
+            Self::oracle_pivot_unpivot_replacement_projection(body_tokens, &columns)
+        {
+            return (transformed_columns, Vec::new());
+        }
 
         let tables_in_scope = intellisense_context::collect_tables_in_statement(body_tokens);
         let mut wildcard_tables =
-            intellisense_context::extract_select_list_wildcard_tables(body_tokens, &tables_in_scope);
+            intellisense_context::extract_select_list_wildcard_scopes(body_tokens, &tables_in_scope);
         let virtual_wildcard_columns =
             Self::extract_virtual_wildcard_projection_members(body_tokens, &mut wildcard_tables);
         columns.extend(virtual_wildcard_columns);
@@ -2148,6 +2155,33 @@ impl SqlEditorWidget {
         }
         Self::dedup_column_names_case_insensitive(&mut wildcard_tables);
         (columns, wildcard_tables)
+    }
+
+    fn oracle_pivot_unpivot_replacement_projection(
+        body_tokens: &[SqlToken],
+        columns: &[String],
+    ) -> Option<Vec<String>> {
+        let mut projection =
+            intellisense_context::extract_oracle_pivot_unpivot_projection_columns(body_tokens);
+        if projection.is_empty() {
+            return None;
+        }
+
+        if columns.is_empty() {
+            Self::dedup_column_names_case_insensitive(&mut projection);
+            return Some(projection);
+        }
+
+        let source_columns =
+            intellisense_context::extract_oracle_pivot_unpivot_source_projection_columns(
+                body_tokens,
+            );
+        if Self::local_column_sets_match_case_insensitive(columns, &source_columns) {
+            Self::dedup_column_names_case_insensitive(&mut projection);
+            return Some(projection);
+        }
+
+        None
     }
 
     fn extract_virtual_wildcard_projection_members(
@@ -2189,12 +2223,17 @@ impl SqlEditorWidget {
             }
         }
         for subquery in &ctx.subqueries {
-            let mut members = Self::extract_known_virtual_projection_members(
-                intellisense_context::token_range_slice(
+            let mut members = if subquery.explicit_columns.is_empty() {
+                Self::extract_known_virtual_projection_members(intellisense_context::token_range_slice(
                     ctx.statement_tokens.as_ref(),
                     subquery.body_range,
-                ),
-            );
+                ))
+            } else {
+                VirtualProjectionMembers {
+                    columns: subquery.explicit_columns.clone(),
+                    rowtype_sources: Vec::new(),
+                }
+            };
             for source in &mut members.rowtype_sources {
                 *source = source.to_ascii_uppercase();
             }
@@ -2206,13 +2245,36 @@ impl SqlEditorWidget {
         }
 
         if virtual_members_by_name.is_empty() {
+            Self::normalize_wildcard_scopes_to_rowtype_sources(
+                &ctx.tables_in_scope,
+                wildcard_tables,
+            );
             return Vec::new();
         }
 
         let mut columns = Vec::new();
         let mut remaining_wildcard_tables = Vec::new();
         for table in wildcard_tables.drain(..) {
-            let key = table.to_ascii_uppercase();
+            let key = ctx
+                .tables_in_scope
+                .iter()
+                .find_map(|table_ref| {
+                    if table_ref
+                        .alias
+                        .as_deref()
+                        .is_some_and(|alias| alias.eq_ignore_ascii_case(&table))
+                        && virtual_members_by_name
+                            .contains_key(&table_ref.name.to_ascii_uppercase())
+                    {
+                        return Some(table_ref.name.to_ascii_uppercase());
+                    }
+                    let alias = table_ref.alias.as_deref()?;
+                    (table_ref.name.eq_ignore_ascii_case(&table)
+                        && virtual_members_by_name
+                            .contains_key(&alias.to_ascii_uppercase()))
+                    .then(|| alias.to_ascii_uppercase())
+                })
+                .unwrap_or_else(|| table.to_ascii_uppercase());
             if virtual_members_by_name.contains_key(&key) {
                 let mut visiting = HashSet::new();
                 Self::append_virtual_projection_members_for_key(
@@ -2223,12 +2285,40 @@ impl SqlEditorWidget {
                     &mut visiting,
                 );
             } else {
-                remaining_wildcard_tables.push(table);
+                let source_name = ctx
+                    .tables_in_scope
+                    .iter()
+                    .find_map(|table_ref| {
+                        table_ref
+                            .alias
+                            .as_deref()
+                            .filter(|alias| alias.eq_ignore_ascii_case(&table))
+                            .map(|_| table_ref.name.clone())
+                    })
+                    .unwrap_or(table);
+                remaining_wildcard_tables.push(source_name);
             }
         }
         *wildcard_tables = remaining_wildcard_tables;
         Self::dedup_column_names_case_insensitive(&mut columns);
         columns
+    }
+
+    fn normalize_wildcard_scopes_to_rowtype_sources(
+        tables_in_scope: &[intellisense_context::ScopedTableRef],
+        wildcard_tables: &mut [String],
+    ) {
+        for table in wildcard_tables {
+            if let Some(source_name) = tables_in_scope.iter().find_map(|table_ref| {
+                table_ref
+                    .alias
+                    .as_deref()
+                    .filter(|alias| alias.eq_ignore_ascii_case(table))
+                    .map(|_| table_ref.name.clone())
+            }) {
+                *table = source_name;
+            }
+        }
     }
 
     fn append_virtual_projection_members_for_key(
@@ -2270,9 +2360,14 @@ impl SqlEditorWidget {
         if columns.is_empty() {
             columns = intellisense_context::extract_table_function_columns(body_tokens);
         }
-        columns.extend(intellisense_context::extract_oracle_pivot_unpivot_projection_columns(
-            body_tokens,
-        ));
+        if columns.is_empty() {
+            if let Some(transformed_columns) =
+                Self::oracle_pivot_unpivot_replacement_projection(body_tokens, &columns)
+            {
+                columns = transformed_columns;
+                rowtype_sources.clear();
+            }
+        }
         columns.extend(intellisense_context::extract_oracle_model_generated_columns(
             body_tokens,
         ));
@@ -2914,6 +3009,24 @@ impl SqlEditorWidget {
         } else {
             identifier.to_ascii_uppercase()
         }
+    }
+
+    fn local_column_sets_match_case_insensitive(left: &[String], right: &[String]) -> bool {
+        if left.len() != right.len() {
+            return false;
+        }
+
+        let mut left_keys: Vec<String> = left
+            .iter()
+            .map(|column| Self::local_identifier_lookup_upper(column))
+            .collect();
+        let mut right_keys: Vec<String> = right
+            .iter()
+            .map(|column| Self::local_identifier_lookup_upper(column))
+            .collect();
+        left_keys.sort_unstable();
+        right_keys.sort_unstable();
+        left_keys == right_keys
     }
 
     #[cfg(test)]

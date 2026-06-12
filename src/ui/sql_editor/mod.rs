@@ -1395,7 +1395,7 @@ impl ExplainPlanBackend for OracleExplainPlanBackend {
                 let mut session = db_conn
                     .lock()
                     .map_err(|_| "Oracle Thin connection lock was poisoned".to_string())?;
-                crate::db::DatabaseConnection::apply_oracle_thin_current_schema(
+                crate::db::DatabaseConnection::apply_tracked_oracle_thin_current_schema(
                     &mut session,
                     tracked_schema.as_deref(),
                 )?;

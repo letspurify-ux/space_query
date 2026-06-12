@@ -1200,11 +1200,17 @@ impl MysqlExecutor {
 
         index = Self::skip_use_statement_trivia(trimmed_use_sql, index);
 
-        let after_use = trimmed_use_sql.get(index..).unwrap_or("").trim_start();
-        if after_use.starts_with('`') {
+        Self::leading_identifier_token(trimmed_use_sql.get(index..).unwrap_or(""))
+    }
+
+    /// First identifier token of `after`, honoring backtick quoting with ``
+    /// escapes; unquoted names end at whitespace or `;`.
+    fn leading_identifier_token(after: &str) -> String {
+        let after = after.trim_start();
+        if after.starts_with('`') {
             // Backtick-quoted identifier: scan for the closing backtick,
             // treating `` as an escaped backtick.
-            let bytes = after_use.as_bytes();
+            let bytes = after.as_bytes();
             let mut idx = 1usize;
             while idx < bytes.len() {
                 if bytes[idx] == b'`' {
@@ -1217,17 +1223,50 @@ impl MysqlExecutor {
                     idx += 1;
                 }
             }
-            after_use
-                .get(1..idx)
-                .unwrap_or(after_use)
-                .replace("``", "`")
+            after.get(1..idx).unwrap_or(after).replace("``", "`")
         } else {
             // Unquoted: take the first whitespace/semicolon-delimited token.
-            after_use
+            after
                 .split(|c: char| c.is_ascii_whitespace() || c == ';')
                 .next()
                 .unwrap_or("")
                 .to_string()
+        }
+    }
+
+    fn strip_leading_keyword<'a>(sql: &'a str, keyword: &str) -> Option<&'a str> {
+        let candidate = sql.trim_start();
+        let bytes = candidate.as_bytes();
+        if bytes.len() <= keyword.len() {
+            return None;
+        }
+        if !bytes[..keyword.len()].eq_ignore_ascii_case(keyword.as_bytes()) {
+            return None;
+        }
+        if !bytes[keyword.len()].is_ascii_whitespace() {
+            return None;
+        }
+        Some(&candidate[keyword.len()..])
+    }
+
+    /// Database name dropped by a `DROP DATABASE`/`DROP SCHEMA` statement,
+    /// or `None` when the statement is not one.
+    pub(crate) fn drop_database_statement_database_name_for_db_type(
+        _db_type: DatabaseType,
+        sql: &str,
+    ) -> Option<String> {
+        let rest = Self::strip_leading_keyword(sql, "DROP")?;
+        let rest = Self::strip_leading_keyword(rest, "DATABASE")
+            .or_else(|| Self::strip_leading_keyword(rest, "SCHEMA"))?;
+        let rest = match Self::strip_leading_keyword(rest, "IF") {
+            Some(after_if) => Self::strip_leading_keyword(after_if, "EXISTS")?,
+            None => rest,
+        };
+        let name = Self::leading_identifier_token(rest).trim().to_string();
+        if name.is_empty() {
+            None
+        } else {
+            Some(name)
         }
     }
 
@@ -3860,6 +3899,32 @@ mod tests {
             Some("mydb")
         );
         assert_eq!(MysqlExecutor::use_statement_database_name("SELECT 1"), None);
+    }
+
+    #[test]
+    fn mysql_drop_database_statement_database_name_parses_drop_forms() {
+        let name = |sql: &str| {
+            MysqlExecutor::drop_database_statement_database_name_for_db_type(
+                DatabaseType::MySQL,
+                sql,
+            )
+        };
+        assert_eq!(name("DROP DATABASE mydb").as_deref(), Some("mydb"));
+        assert_eq!(name("drop schema mydb;").as_deref(), Some("mydb"));
+        assert_eq!(
+            name("DROP DATABASE IF EXISTS `my db`").as_deref(),
+            Some("my db")
+        );
+        assert_eq!(
+            name("  DROP\tSCHEMA  IF  EXISTS  mydb ;").as_deref(),
+            Some("mydb")
+        );
+        // A database literally named `if` is not an IF EXISTS clause.
+        assert_eq!(name("DROP DATABASE if").as_deref(), Some("if"));
+        assert_eq!(name("DROP TABLE mydb"), None);
+        assert_eq!(name("DROP DATABASE"), None);
+        assert_eq!(name("SELECT 'DROP DATABASE mydb'"), None);
+        assert_eq!(name("DROPDATABASE mydb"), None);
     }
 
     #[test]

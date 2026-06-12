@@ -120,6 +120,9 @@ struct OracleThinBatchOutcome {
     retained_state: RetainedSessionState,
     had_error: bool,
     timed_out: bool,
+    /// Set when a schema sync/clear inside the batch bumped the pool context
+    /// epoch; the session must be restored under this refreshed epoch.
+    refreshed_pool_context_epoch: Option<u64>,
 }
 
 struct OracleThinCursorStreamOutcome {
@@ -637,7 +640,9 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
         );
         pooled_db_session.apply_retained_session_disposition(
             connection_generation,
-            pool_context_epoch,
+            batch_outcome
+                .refreshed_pool_context_epoch
+                .unwrap_or(pool_context_epoch),
             DbSessionLease::OracleThin(Box::new(thin_conn)),
             disposition,
             "oracle thin execution",
@@ -1113,6 +1118,16 @@ impl QueryExecutionCleanupGuard {
         shared_connection: crate::db::SharedConnection,
     ) {
         self.oracle_pooled_session_scope_connection = Some(shared_connection);
+    }
+
+    /// A schema sync/clear during this execution bumps the pool context
+    /// epoch. The session that performed the change is, by definition,
+    /// current for the new context, so restore it under the new epoch
+    /// instead of letting the stale captured epoch block its reuse.
+    fn refresh_oracle_pooled_session_pool_context_epoch(&mut self, pool_context_epoch: u64) {
+        if let Some((_, _, epoch, _, _)) = self.oracle_pooled_session.as_mut() {
+            *epoch = pool_context_epoch;
+        }
     }
 
     fn invalidate_oracle_pooled_session(&mut self) {
@@ -2434,7 +2449,13 @@ impl SqlEditorWidget {
         let database = current_service_name.trim();
         if database.is_empty() {
             if preserve_existing_session_state {
-                return Err(crate::db::DatabaseConnection::mysql_empty_scope_requires_resolved_session_error());
+                // An empty stored scope with a preserved session only happens
+                // after the session's current database was dropped (explicit
+                // scope changes are blocked while session state must be
+                // preserved). The server already detached the dropped schema,
+                // and resetting would wipe the state this lease must keep, so
+                // leave the session as-is.
+                return Ok(());
             }
             return Self::reset_mysql_pooled_session_to_no_database(conn, advanced, db_type);
         }
@@ -2455,7 +2476,20 @@ impl SqlEditorWidget {
             }
             Err(err) if Self::mysql_missing_current_database_error(&err) => {
                 if preserve_existing_session_state {
-                    return Err(SqlEditorWidget::mysql_error_message(&err, None));
+                    // The stored current database was dropped. Resetting the
+                    // session would lose the transaction/session state this
+                    // lease must preserve, and the server already detached
+                    // the dropped schema, so skip the re-application and keep
+                    // the session running without a default database. This is
+                    // what lets COMMIT/ROLLBACK/USE still execute after
+                    // DROP DATABASE of the current database.
+                    crate::utils::logging::log_warning(
+                        "mysql pool session",
+                        &format!(
+                            "Current database `{database}` is not available; keeping the preserved session without a default database"
+                        ),
+                    );
+                    return Ok(());
                 }
                 crate::utils::logging::log_error(
                     "mysql pool session",
@@ -11797,6 +11831,20 @@ impl SqlEditorWidget {
                                     && SqlEditorWidget::oracle_statement_sets_current_schema(
                                         &sql_to_execute,
                                     );
+                                if result.success && !current_schema_changed {
+                                    if let Some(refreshed_epoch) =
+                                        SqlEditorWidget::clear_tracked_oracle_schema_after_drop_user(
+                                            &shared_connection,
+                                            &db_activity,
+                                            connection_generation,
+                                            &sql_to_execute,
+                                        )
+                                    {
+                                        cleanup.refresh_oracle_pooled_session_pool_context_epoch(
+                                            refreshed_epoch,
+                                        );
+                                    }
+                                }
                                 if current_schema_changed {
                                     let synced_current_schema =
                                         SqlEditorWidget::sync_oracle_pooled_session_current_schema(
@@ -11809,6 +11857,18 @@ impl SqlEditorWidget {
                                         synced_current_schema,
                                     ) {
                                         Ok((notice, current_schema)) => {
+                                            if let Some(refreshed_epoch) =
+                                                SqlEditorWidget::pool_context_epoch_for_generation(
+                                                    &shared_connection,
+                                                    connection_generation,
+                                                    &db_activity,
+                                                )
+                                            {
+                                                cleanup
+                                                    .refresh_oracle_pooled_session_pool_context_epoch(
+                                                        refreshed_epoch,
+                                                    );
+                                            }
                                             result.message = notice.clone();
                                             let _ =
                                                 sender.send(QueryProgress::ScopeChangedNotice {
@@ -13735,6 +13795,7 @@ impl SqlEditorWidget {
                 retained_state: prior_retained_state,
                 had_error: false,
                 timed_out: false,
+                refreshed_pool_context_epoch: None,
             };
         }
 
@@ -13762,9 +13823,11 @@ impl SqlEditorWidget {
                 ),
                 had_error: true,
                 timed_out: false,
+                refreshed_pool_context_epoch: None,
             };
         }
 
+        let mut refreshed_pool_context_epoch: Option<u64> = None;
         let mut auto_commit = initial_auto_commit;
         store_mutex_bool(current_operation_autocommit, auto_commit);
         let mut continue_on_error = match session.lock() {
@@ -14780,7 +14843,22 @@ impl SqlEditorWidget {
                                     &out_messages,
                                     row_count,
                                 );
-                                if Self::oracle_statement_sets_current_schema(&execution_sql) {
+                                if !Self::oracle_statement_sets_current_schema(&execution_sql) {
+                                    if let Some((shared_connection, connection_generation)) =
+                                        scope_sync_context
+                                    {
+                                        if let Some(epoch) =
+                                            Self::clear_tracked_oracle_schema_after_drop_user(
+                                                shared_connection,
+                                                db_activity,
+                                                connection_generation,
+                                                &execution_sql,
+                                            )
+                                        {
+                                            refreshed_pool_context_epoch = Some(epoch);
+                                        }
+                                    }
+                                } else {
                                     let synced_current_schema = scope_sync_context.and_then(
                                         |(shared_connection, connection_generation)| {
                                             Self::sync_oracle_thin_pooled_session_current_schema(
@@ -14795,6 +14873,21 @@ impl SqlEditorWidget {
                                         synced_current_schema,
                                     ) {
                                         Ok((notice, current_schema)) => {
+                                            if let Some((
+                                                shared_connection,
+                                                connection_generation,
+                                            )) = scope_sync_context
+                                            {
+                                                if let Some(epoch) =
+                                                    Self::pool_context_epoch_for_generation(
+                                                        shared_connection,
+                                                        connection_generation,
+                                                        db_activity,
+                                                    )
+                                                {
+                                                    refreshed_pool_context_epoch = Some(epoch);
+                                                }
+                                            }
                                             message = notice.clone();
                                             let _ =
                                                 sender.send(QueryProgress::ScopeChangedNotice {
@@ -15140,6 +15233,7 @@ impl SqlEditorWidget {
             retained_state,
             had_error,
             timed_out,
+            refreshed_pool_context_epoch,
         }
     }
 
@@ -16835,6 +16929,56 @@ impl SqlEditorWidget {
             && words[3] == "CURRENT_SCHEMA"
     }
 
+    fn strip_oracle_leading_keyword<'a>(sql: &'a str, keyword: &str) -> Option<&'a str> {
+        let candidate = sql.trim_start();
+        let bytes = candidate.as_bytes();
+        if bytes.len() <= keyword.len() {
+            return None;
+        }
+        if !bytes[..keyword.len()].eq_ignore_ascii_case(keyword.as_bytes()) {
+            return None;
+        }
+        if !bytes[keyword.len()].is_ascii_whitespace() {
+            return None;
+        }
+        Some(&candidate[keyword.len()..])
+    }
+
+    /// User name dropped by a `DROP USER` statement, normalized the way
+    /// Oracle resolves identifiers (quoted names exact, unquoted uppercased),
+    /// or `None` when the statement is not one.
+    fn oracle_drop_user_statement_user_name(sql: &str) -> Option<String> {
+        let cleaned = Self::strip_leading_comments(sql);
+        let rest = Self::strip_oracle_leading_keyword(&cleaned, "DROP")?;
+        let rest = Self::strip_oracle_leading_keyword(rest, "USER")?;
+        let token = rest.trim_start();
+        let raw = if token.starts_with('"') {
+            let end = token[1..].find('"')? + 2;
+            &token[..end]
+        } else {
+            token
+                .split(|c: char| c.is_ascii_whitespace() || c == ';')
+                .next()
+                .unwrap_or("")
+        };
+        let name = Self::normalize_object_name(raw);
+        if name.is_empty() {
+            None
+        } else {
+            Some(name)
+        }
+    }
+
+    fn oracle_statement_drops_tracked_schema(sql: &str, tracked_schema: Option<&str>) -> bool {
+        let Some(tracked) = tracked_schema
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        else {
+            return false;
+        };
+        Self::oracle_drop_user_statement_user_name(sql).is_some_and(|dropped| dropped == tracked)
+    }
+
     fn oracle_statement_uses_plsql_call_path(upper_sql: &str, exec_call_present: bool) -> bool {
         exec_call_present
             || upper_sql.starts_with("BEGIN")
@@ -18300,7 +18444,7 @@ impl SqlEditorWidget {
             .then_some(db_type)
     }
 
-    fn mysql_pool_context_epoch_for_generation(
+    fn pool_context_epoch_for_generation(
         shared_connection: &crate::db::SharedConnection,
         connection_generation: u64,
         db_activity: &str,
@@ -18863,19 +19007,50 @@ impl SqlEditorWidget {
             || statement_effects.may_leave_uncommitted_work()
     }
 
+    fn mysql_statement_drops_current_database(
+        db_type: crate::db::DatabaseType,
+        statement_sql: &str,
+        stored_current_database: &str,
+    ) -> bool {
+        let stored = stored_current_database.trim();
+        if stored.is_empty() {
+            return false;
+        }
+        crate::db::query::mysql_executor::MysqlExecutor::drop_database_statement_database_name_for_db_type(
+            db_type,
+            statement_sql,
+        )
+        .is_some_and(|dropped| dropped == stored)
+    }
+
     fn mysql_known_current_database_after_successful_statement(
         db_type: crate::db::DatabaseType,
         statement_sql: &str,
         allow_global_database_update: bool,
         preserve_existing_session_state: bool,
+        stored_current_database: &str,
     ) -> Option<String> {
         if !allow_global_database_update || !preserve_existing_session_state {
             return None;
         }
-        crate::db::query::mysql_executor::MysqlExecutor::use_statement_database_name_for_db_type(
+        if let Some(database) =
+            crate::db::query::mysql_executor::MysqlExecutor::use_statement_database_name_for_db_type(
+                db_type,
+                statement_sql,
+            )
+        {
+            return Some(database);
+        }
+        if Self::mysql_statement_drops_current_database(
             db_type,
             statement_sql,
-        )
+            stored_current_database,
+        ) {
+            // Dropping the current database leaves the session without a
+            // default schema; record that instead of keeping the stale name.
+            return Some(String::new());
+        }
+        None
     }
 
     fn sync_mysql_pooled_session_info(
@@ -19070,6 +19245,46 @@ impl SqlEditorWidget {
                 None
             }
         }
+    }
+
+    /// After a successful `DROP USER` of the tracked CURRENT_SCHEMA, clear
+    /// the tracked schema so it is no longer re-applied (it can never succeed
+    /// again). Mirrors the MySQL drop-current-database handling. Returns the
+    /// refreshed pool context epoch when the schema was cleared, so the
+    /// session that performed the drop can be restored under the new epoch.
+    fn clear_tracked_oracle_schema_after_drop_user(
+        shared_connection: &crate::db::SharedConnection,
+        db_activity: &str,
+        connection_generation: u64,
+        statement_sql: &str,
+    ) -> Option<u64> {
+        Self::oracle_drop_user_statement_user_name(statement_sql)?;
+        let mut conn_guard =
+            lock_connection_with_activity(shared_connection, db_activity.to_string());
+        if !conn_guard
+            .can_reuse_pool_session(connection_generation, crate::db::DatabaseType::Oracle)
+        {
+            return None;
+        }
+        let tracked = conn_guard
+            .tracked_oracle_current_schema()
+            .map(str::to_string);
+        if !Self::oracle_statement_drops_tracked_schema(statement_sql, tracked.as_deref()) {
+            return None;
+        }
+        conn_guard.clear_tracked_oracle_current_schema();
+        crate::db::refresh_pool_session_context_cache_for_shared_connection(
+            shared_connection,
+            &conn_guard,
+        );
+        crate::utils::logging::log_warning(
+            db_activity,
+            &format!(
+                "Cleared tracked Oracle current schema {:?} because it was dropped",
+                tracked.unwrap_or_default()
+            ),
+        );
+        Some(conn_guard.pool_context_epoch())
     }
 
     fn sync_oracle_thin_pooled_session_current_schema(
@@ -19381,6 +19596,7 @@ impl SqlEditorWidget {
         )?;
         let db_type = connection_info.db_type;
         let db_display_name = db_type.display_name();
+        let stored_current_database = connection_info.service_name.trim().to_string();
         let statement_effects =
             crate::db::mysql_statement_session_effects_for_execution_context_for_db_type(
                 db_type,
@@ -19696,7 +19912,20 @@ impl SqlEditorWidget {
         let statement_failed = matches!(result, Ok(Err(_)));
         let action_released_physical_session =
             matches!(&result, Ok(Ok(_))) && statement_effects.releases_physical_session();
-        let allow_global_database_update = refresh_encoding_after && matches!(&result, Ok(Ok(_)));
+        let statement_dropped_current_database = matches!(&result, Ok(Ok(_)))
+            && Self::mysql_statement_drops_current_database(
+                db_type,
+                statement_sql,
+                &stored_current_database,
+            );
+        // USE statements require the post-success scope sync to land; a
+        // DROP DATABASE of the current database also needs the stored name
+        // cleared, but losing that sync is recoverable (the missing-database
+        // fallback handles it), so it must not fail the statement.
+        let use_statement_scope_sync_required =
+            refresh_encoding_after && matches!(&result, Ok(Ok(_)));
+        let allow_global_database_update =
+            use_statement_scope_sync_required || statement_dropped_current_database;
         let interruption_requires_transaction_decision =
             crate::db::statement_interruption_requires_transaction_decision(
                 crate::db::StatementInterruption {
@@ -19741,6 +19970,7 @@ impl SqlEditorWidget {
                         statement_sql,
                         allow_global_database_update,
                         preserve_session_state_after_action,
+                        &stored_current_database,
                     );
                 Self::sync_mysql_pooled_session_info(
                     shared_connection,
@@ -19835,7 +20065,7 @@ impl SqlEditorWidget {
             crate::db::RetainedSessionOutcome::DiscardPhysical
         };
         let retain_pool_context_epoch = if should_retain_session && allow_global_database_update {
-            Self::mysql_pool_context_epoch_for_generation(
+            Self::pool_context_epoch_for_generation(
                 shared_connection,
                 connection_generation,
                 log_context,
@@ -19853,7 +20083,7 @@ impl SqlEditorWidget {
             disposition,
             log_context,
         );
-        if allow_global_database_update && !should_retain_session {
+        if use_statement_scope_sync_required && !should_retain_session {
             return Err(Self::mysql_scope_sync_lost_after_success_message());
         }
         if matches!(&result, Ok(Ok(_)))
@@ -19994,6 +20224,48 @@ mod oracle_current_schema_statement_tests {
         ));
         assert!(!SqlEditorWidget::oracle_statement_sets_current_schema(
             "BEGIN NULL; END;"
+        ));
+    }
+
+    #[test]
+    fn oracle_drop_user_statement_user_name_parses_drop_user_forms() {
+        let name = SqlEditorWidget::oracle_drop_user_statement_user_name;
+        assert_eq!(name("DROP USER sq_test").as_deref(), Some("SQ_TEST"));
+        assert_eq!(
+            name("drop user SQ_TEST cascade;").as_deref(),
+            Some("SQ_TEST")
+        );
+        assert_eq!(
+            name("/* lead */ DROP\tUSER \"Mixed Case\" CASCADE").as_deref(),
+            Some("Mixed Case")
+        );
+        assert_eq!(name("DROP TABLE sq_test"), None);
+        assert_eq!(name("DROP USER"), None);
+        assert_eq!(name("DROPUSER sq_test"), None);
+        assert_eq!(name("SELECT 'DROP USER sq_test' FROM dual"), None);
+    }
+
+    #[test]
+    fn oracle_statement_drops_tracked_schema_matches_normalized_names() {
+        assert!(SqlEditorWidget::oracle_statement_drops_tracked_schema(
+            "DROP USER sq_test CASCADE",
+            Some("SQ_TEST"),
+        ));
+        assert!(SqlEditorWidget::oracle_statement_drops_tracked_schema(
+            "DROP USER \"Mixed Case\"",
+            Some("Mixed Case"),
+        ));
+        assert!(!SqlEditorWidget::oracle_statement_drops_tracked_schema(
+            "DROP USER sq_other",
+            Some("SQ_TEST"),
+        ));
+        assert!(!SqlEditorWidget::oracle_statement_drops_tracked_schema(
+            "DROP USER sq_test",
+            None,
+        ));
+        assert!(!SqlEditorWidget::oracle_statement_drops_tracked_schema(
+            "DROP USER sq_test",
+            Some(""),
         ));
     }
 
@@ -25581,6 +25853,7 @@ mod query_execution_cleanup_tests {
                 "USE `qt reporting`",
                 true,
                 true,
+                "qt_sales",
             ),
             Some("qt reporting".to_string())
         );
@@ -25590,6 +25863,7 @@ mod query_execution_cleanup_tests {
                 "SELECT 1",
                 true,
                 true,
+                "qt_sales",
             ),
             None
         );
@@ -25599,9 +25873,51 @@ mod query_execution_cleanup_tests {
                 "USE qt_reporting",
                 true,
                 false,
+                "qt_sales",
             ),
             None
         );
+    }
+
+    #[test]
+    fn mysql_drop_current_database_clears_known_database_name() {
+        // Dropping the current database must record "no default database";
+        // dropping any other database must leave the stored name alone.
+        assert_eq!(
+            SqlEditorWidget::mysql_known_current_database_after_successful_statement(
+                DatabaseType::MySQL,
+                "DROP DATABASE qt_sales",
+                true,
+                true,
+                "qt_sales",
+            ),
+            Some(String::new())
+        );
+        assert_eq!(
+            SqlEditorWidget::mysql_known_current_database_after_successful_statement(
+                DatabaseType::MySQL,
+                "DROP DATABASE qt_other",
+                true,
+                true,
+                "qt_sales",
+            ),
+            None
+        );
+        assert!(SqlEditorWidget::mysql_statement_drops_current_database(
+            DatabaseType::MariaDB,
+            "drop schema if exists `qt sales`;",
+            " qt sales ",
+        ));
+        assert!(!SqlEditorWidget::mysql_statement_drops_current_database(
+            DatabaseType::MySQL,
+            "DROP TABLE qt_sales",
+            "qt_sales",
+        ));
+        assert!(!SqlEditorWidget::mysql_statement_drops_current_database(
+            DatabaseType::MySQL,
+            "DROP DATABASE qt_sales",
+            "",
+        ));
     }
 
     #[test]
