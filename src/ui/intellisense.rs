@@ -638,13 +638,16 @@ struct NameEntry {
 
 impl NameEntry {
     fn new(name: String) -> Self {
-        let lookup_name = if sql_text::is_quoted_identifier(name.trim()) {
-            sql_text::strip_identifier_quotes(name.trim())
-        } else {
-            name.clone()
-        };
-        let upper = lookup_name.to_uppercase();
+        let upper = Self::lookup_upper(&name);
         Self { name, upper }
+    }
+
+    fn lookup_upper(name: &str) -> String {
+        if sql_text::is_quoted_identifier(name.trim()) {
+            sql_text::strip_identifier_quotes(name.trim()).to_uppercase()
+        } else {
+            name.to_uppercase()
+        }
     }
 }
 
@@ -1298,7 +1301,7 @@ impl IntellisenseData {
             names.push(name.clone());
             if let Some(kind) = kind {
                 member_kinds
-                    .entry(name.to_uppercase())
+                    .entry(NameEntry::lookup_upper(&name))
                     .or_default()
                     .insert(kind);
             }
@@ -1357,7 +1360,7 @@ impl IntellisenseData {
             return Some(true);
         }
 
-        let candidate_upper = candidate.to_uppercase();
+        let candidate_upper = NameEntry::lookup_upper(candidate.trim());
         for key in Self::qualifier_lookup_keys(qualifier) {
             let Some(member_kinds) = self.member_kinds_by_qualifier.get(&key) else {
                 continue;
@@ -1377,7 +1380,7 @@ impl IntellisenseData {
         candidate: &str,
         expected_kinds: &[QualifiedMemberKind],
     ) -> Option<String> {
-        let candidate_upper = candidate.trim().to_uppercase();
+        let candidate_upper = NameEntry::lookup_upper(candidate.trim());
         if candidate_upper.is_empty() || expected_kinds.is_empty() {
             return None;
         }
@@ -1521,7 +1524,7 @@ impl IntellisenseData {
         candidate: &str,
         relation_only: bool,
     ) -> bool {
-        let candidate_upper = candidate.trim().to_ascii_uppercase();
+        let candidate_upper = NameEntry::lookup_upper(candidate.trim());
         if candidate_upper.is_empty() {
             return false;
         }
@@ -1530,16 +1533,133 @@ impl IntellisenseData {
             .is_some_and(|entries| entries.iter().any(|entry| entry.upper == candidate_upper))
     }
 
-    fn default_qualified_relation_key(&self, table: &str) -> Option<String> {
-        if table.trim().is_empty() || table.contains('.') {
+    fn unqualified_relation_lookup_segment(table: &str) -> Option<String> {
+        let trimmed = table.trim();
+        if trimmed.is_empty() {
             return None;
         }
 
+        if sql_text::is_quoted_identifier(trimmed) {
+            let unquoted = sql_text::strip_identifier_quotes(trimmed);
+            let segment = unquoted.trim();
+            if segment.is_empty() || segment.contains('.') {
+                return None;
+            }
+            return Some(segment.to_string());
+        }
+
+        if trimmed.contains('.') {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }
+
+    fn relation_lookup_segments(table: &str) -> Option<Vec<String>> {
+        let mut segments = Vec::new();
+        let mut current = String::new();
+        let mut active_quote = None;
+        let mut chars = table.trim().chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            if let Some(delimiter) = active_quote {
+                current.push(ch);
+                if ch == delimiter {
+                    if chars.peek() == Some(&delimiter) {
+                        current.push(chars.next().unwrap_or(delimiter));
+                    } else {
+                        active_quote = None;
+                    }
+                }
+                continue;
+            }
+
+            match ch {
+                '"' | '`' => {
+                    active_quote = Some(ch);
+                    current.push(ch);
+                }
+                '.' => {
+                    segments.push(Self::relation_lookup_segment(current.trim())?);
+                    current.clear();
+                }
+                _ => current.push(ch),
+            }
+        }
+
+        if active_quote.is_some() {
+            return None;
+        }
+
+        segments.push(Self::relation_lookup_segment(current.trim())?);
+        Some(segments)
+    }
+
+    fn relation_lookup_segment(segment: &str) -> Option<String> {
+        let trimmed = segment.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let normalized = if sql_text::is_quoted_identifier(trimmed) {
+            sql_text::strip_identifier_quotes(trimmed)
+        } else {
+            trimmed.to_string()
+        };
+        if normalized.trim().is_empty() {
+            None
+        } else {
+            Some(normalized)
+        }
+    }
+
+    fn has_unquoted_relation_dot(table: &str) -> bool {
+        let mut active_quote = None;
+        let mut chars = table.trim().chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            if let Some(delimiter) = active_quote {
+                if ch == delimiter {
+                    if chars.peek() == Some(&delimiter) {
+                        chars.next();
+                    } else {
+                        active_quote = None;
+                    }
+                }
+                continue;
+            }
+
+            match ch {
+                '"' | '`' => active_quote = Some(ch),
+                '.' => return true,
+                _ => {}
+            }
+        }
+
+        false
+    }
+
+    fn relation_lookup_exact_key(table: &str) -> Option<String> {
+        let segments = Self::relation_lookup_segments(table)?;
+        Some(segments.join(".").to_ascii_uppercase())
+    }
+
+    fn relation_lookup_short_key(table: &str) -> Option<String> {
+        if !Self::has_unquoted_relation_dot(table) {
+            return None;
+        }
+        Self::relation_lookup_segments(table)?
+            .last()
+            .map(|segment| segment.to_ascii_uppercase())
+    }
+
+    fn default_qualified_relation_key(&self, table: &str) -> Option<String> {
+        let table = Self::unqualified_relation_lookup_segment(table)?;
         let qualifier = self.default_qualifier()?;
-        if self.qualifier_has_member(qualifier, table, true)
-            || self.qualifier_has_member(qualifier, table, false)
+        if self.qualifier_has_member(qualifier, &table, true)
+            || self.qualifier_has_member(qualifier, &table, false)
         {
-            Some(format!("{}.{}", qualifier, table.trim()).to_ascii_uppercase())
+            Some(format!("{}.{}", qualifier, table).to_ascii_uppercase())
         } else {
             None
         }
@@ -1550,14 +1670,21 @@ impl IntellisenseData {
         if let Some(entries) = self.column_entries_for_exact_key(&key) {
             return Some(entries);
         }
+        if let Some(exact_key) = Self::relation_lookup_exact_key(table) {
+            if exact_key != key {
+                if let Some(entries) = self.column_entries_for_exact_key(&exact_key) {
+                    return Some(entries);
+                }
+            }
+        }
         if let Some(default_key) = self.default_qualified_relation_key(table) {
             if let Some(entries) = self.column_entries_for_exact_key(&default_key) {
                 return Some(entries);
             }
         }
-        if let Some(short) = key.rsplit('.').next() {
+        if let Some(short) = Self::relation_lookup_short_key(table) {
             if short != key {
-                return self.column_entries_for_exact_key(short);
+                return self.column_entries_for_exact_key(&short);
             }
         }
         None
@@ -1568,6 +1695,13 @@ impl IntellisenseData {
             .get(key)
             .map(Vec::as_slice)
             .or_else(|| self.column_entries_by_table.get(key).map(Vec::as_slice))
+    }
+
+    fn column_names_for_exact_key(&self, key: &str) -> Option<Vec<String>> {
+        if let Some(columns) = self.virtual_column_entries_by_table.get(key) {
+            return Some(columns.iter().map(|entry| entry.name.clone()).collect());
+        }
+        self.columns.get(key).cloned()
     }
 
     fn append_column_suggestions(
@@ -1605,27 +1739,25 @@ impl IntellisenseData {
     #[allow(dead_code)]
     pub fn get_columns_for_table(&self, table_name: &str) -> Vec<String> {
         let key = table_name.to_uppercase();
-        if let Some(columns) = self.virtual_column_entries_by_table.get(&key) {
-            return columns.iter().map(|entry| entry.name.clone()).collect();
+        if let Some(columns) = self.column_names_for_exact_key(&key) {
+            return columns;
         }
-        if let Some(columns) = self.columns.get(&key) {
-            return columns.clone();
+        if let Some(exact_key) = Self::relation_lookup_exact_key(table_name) {
+            if exact_key != key {
+                if let Some(columns) = self.column_names_for_exact_key(&exact_key) {
+                    return columns;
+                }
+            }
         }
         if let Some(default_key) = self.default_qualified_relation_key(table_name) {
-            if let Some(columns) = self.virtual_column_entries_by_table.get(&default_key) {
-                return columns.iter().map(|entry| entry.name.clone()).collect();
-            }
-            if let Some(columns) = self.columns.get(&default_key) {
-                return columns.clone();
+            if let Some(columns) = self.column_names_for_exact_key(&default_key) {
+                return columns;
             }
         }
-        if let Some(short) = key.rsplit('.').next() {
+        if let Some(short) = Self::relation_lookup_short_key(table_name) {
             if short != key {
-                if let Some(columns) = self.virtual_column_entries_by_table.get(short) {
-                    return columns.iter().map(|entry| entry.name.clone()).collect();
-                }
-                if let Some(columns) = self.columns.get(short) {
-                    return columns.clone();
+                if let Some(columns) = self.column_names_for_exact_key(&short) {
+                    return columns;
                 }
             }
         }
@@ -1668,14 +1800,18 @@ impl IntellisenseData {
         self.all_columns_dirty = true;
     }
 
-    /// Store display metadata for a table's columns, keyed by upper-cased
-    /// column name. Replaces any previous metadata for the table.
+    /// Store display metadata for a table's columns, keyed by normalized
+    /// column lookup name. Replaces any previous metadata for the table.
     pub fn set_column_meta_for_table(
         &mut self,
         table_name: &str,
         meta: HashMap<String, ColumnMeta>,
     ) {
         let key = table_name.to_uppercase();
+        let meta = meta
+            .into_iter()
+            .map(|(column, meta)| (NameEntry::lookup_upper(&column), meta))
+            .collect();
         self.column_meta_by_table.insert(key, meta);
     }
 
@@ -1683,7 +1819,7 @@ impl IntellisenseData {
     /// the same way `get_columns_for_table` does (exact, default-qualified,
     /// then unqualified short name).
     pub fn get_column_meta(&self, table_name: &str, column_name: &str) -> Option<&ColumnMeta> {
-        let column_key = column_name.to_uppercase();
+        let column_key = NameEntry::lookup_upper(column_name);
         let table_key = table_name.to_uppercase();
         if let Some(meta) = self
             .column_meta_by_table
@@ -1691,6 +1827,17 @@ impl IntellisenseData {
             .and_then(|cols| cols.get(&column_key))
         {
             return Some(meta);
+        }
+        if let Some(exact_key) = Self::relation_lookup_exact_key(table_name) {
+            if exact_key != table_key {
+                if let Some(meta) = self
+                    .column_meta_by_table
+                    .get(&exact_key)
+                    .and_then(|cols| cols.get(&column_key))
+                {
+                    return Some(meta);
+                }
+            }
         }
         if let Some(default_key) = self.default_qualified_relation_key(table_name) {
             if let Some(meta) = self
@@ -1701,11 +1848,11 @@ impl IntellisenseData {
                 return Some(meta);
             }
         }
-        if let Some(short) = table_key.rsplit('.').next() {
+        if let Some(short) = Self::relation_lookup_short_key(table_name) {
             if short != table_key {
                 if let Some(meta) = self
                     .column_meta_by_table
-                    .get(short)
+                    .get(&short)
                     .and_then(|cols| cols.get(&column_key))
                 {
                     return Some(meta);
@@ -1747,14 +1894,19 @@ impl IntellisenseData {
         if self.foreign_keys_by_table.contains_key(&key) {
             return Some(key);
         }
+        if let Some(exact_key) = Self::relation_lookup_exact_key(table_name) {
+            if exact_key != key && self.foreign_keys_by_table.contains_key(&exact_key) {
+                return Some(exact_key);
+            }
+        }
         if let Some(default_key) = self.default_qualified_relation_key(table_name) {
             if self.foreign_keys_by_table.contains_key(&default_key) {
                 return Some(default_key);
             }
         }
-        if let Some(short) = key.rsplit('.').next() {
-            if short != key && self.foreign_keys_by_table.contains_key(short) {
-                return Some(short.to_string());
+        if let Some(short) = Self::relation_lookup_short_key(table_name) {
+            if short != key && self.foreign_keys_by_table.contains_key(&short) {
+                return Some(short);
             }
         }
         None
@@ -2051,26 +2203,77 @@ impl IntellisenseData {
         }
     }
 
+    fn normalize_qualifier_lookup_segments(qualifier: &str) -> Vec<String> {
+        let mut segments = Vec::new();
+        let mut current = String::new();
+        let mut active_quote = None;
+        let mut chars = qualifier.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            if let Some(delimiter) = active_quote {
+                current.push(ch);
+                if ch == delimiter {
+                    if chars.peek() == Some(&delimiter) {
+                        current.push(chars.next().unwrap_or(delimiter));
+                    } else {
+                        active_quote = None;
+                    }
+                }
+                continue;
+            }
+
+            match ch {
+                '"' | '`' => {
+                    active_quote = Some(ch);
+                    current.push(ch);
+                }
+                '.' => {
+                    let segment = current.trim();
+                    if !segment.is_empty() {
+                        segments.push(Self::normalize_qualifier_lookup_segment(segment));
+                    }
+                    current.clear();
+                }
+                _ => current.push(ch),
+            }
+        }
+
+        let segment = current.trim();
+        if !segment.is_empty() {
+            segments.push(Self::normalize_qualifier_lookup_segment(segment));
+        }
+        segments
+    }
+
+    fn normalize_qualifier_lookup_segment(segment: &str) -> String {
+        if sql_text::is_quoted_identifier(segment) {
+            let unquoted = sql_text::strip_identifier_quotes(segment);
+            if unquoted.contains('.') {
+                segment.to_ascii_uppercase()
+            } else {
+                unquoted.to_ascii_uppercase()
+            }
+        } else {
+            segment.to_ascii_uppercase()
+        }
+    }
+
     fn normalize_qualifier_lookup_key(qualifier: &str) -> String {
-        qualifier
-            .split('.')
-            .map(str::trim)
-            .filter(|segment| !segment.is_empty())
-            .collect::<Vec<_>>()
-            .join(".")
-            .to_ascii_uppercase()
+        Self::normalize_qualifier_lookup_segments(qualifier).join(".")
     }
 
     fn qualifier_lookup_keys(qualifier: &str) -> Vec<String> {
-        let normalized = Self::normalize_qualifier_lookup_key(qualifier);
+        let segments = Self::normalize_qualifier_lookup_segments(qualifier);
+        let normalized = segments.join(".");
         if normalized.is_empty() {
             return Vec::new();
         }
 
-        let mut keys = vec![normalized.clone()];
-        if let Some(last) = normalized.rsplit('.').next() {
-            if last != normalized {
-                keys.push(last.to_string());
+        let mut keys = vec![normalized];
+        for start in 1..segments.len() {
+            let suffix = segments[start..].join(".");
+            if !keys.iter().any(|key| key == &suffix) {
+                keys.push(suffix);
             }
         }
         keys
@@ -2299,7 +2502,7 @@ impl IntellisensePopup {
     }
 
     /// Show suggestions with optional per-item display details (column type /
-    /// PK / NOT NULL / FK badges). `descriptions` is keyed by upper-cased
+    /// PK / NOT NULL / FK badges). `descriptions` is keyed by normalized
     /// suggestion text; entries without a match render as plain names.
     pub fn show_suggestions_with_descriptions(
         &mut self,
@@ -2387,7 +2590,7 @@ impl IntellisensePopup {
         for suggestion in &suggestions {
             let (name_w, _) = fltk::draw::measure(suggestion, false);
             max_name_w = max_name_w.max(name_w);
-            match descriptions.get(&suggestion.to_uppercase()) {
+            match descriptions.get(&NameEntry::lookup_upper(suggestion)) {
                 Some(detail) if !detail.is_empty() => {
                     any_detail = true;
                     let (detail_w, _) = fltk::draw::measure(detail, false);
@@ -2671,9 +2874,73 @@ fn suggestion_matches_completion_prefix(candidate: &str, prefix: &str) -> bool {
 }
 
 fn comparison_lhs_identifier_prefix(candidate: &str) -> Option<&str> {
-    let lhs = candidate.split_once('=')?.0.trim_end();
-    let identifier = lhs.rsplit('.').next()?.trim();
-    Some(identifier)
+    let eq_idx = first_unquoted_condition_equals(candidate)?;
+    let lhs = candidate.get(..eq_idx)?.trim_end();
+    let dot_idx = last_unquoted_identifier_dot(lhs)?;
+    lhs.get(dot_idx + 1..).map(str::trim)
+}
+
+fn first_unquoted_condition_equals(text: &str) -> Option<usize> {
+    let mut active_quote = None;
+    let mut chars = text.char_indices().peekable();
+
+    while let Some((idx, ch)) = chars.next() {
+        if let Some(delimiter) = active_quote {
+            if ch == delimiter {
+                if chars.peek().is_some_and(|(_, next)| *next == delimiter) {
+                    chars.next();
+                } else {
+                    active_quote = None;
+                }
+            }
+            continue;
+        }
+
+        match ch {
+            '"' | '`' => active_quote = Some(ch),
+            '=' if is_spaced_condition_operator(text, idx) => return Some(idx),
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn is_spaced_condition_operator(text: &str, idx: usize) -> bool {
+    text.get(..idx)
+        .and_then(|prefix| prefix.chars().next_back())
+        .is_some_and(char::is_whitespace)
+        && text
+            .get(idx + 1..)
+            .and_then(|suffix| suffix.chars().next())
+            .is_some_and(char::is_whitespace)
+}
+
+fn last_unquoted_identifier_dot(text: &str) -> Option<usize> {
+    let mut last_dot = None;
+    let mut active_quote = None;
+    let mut chars = text.char_indices().peekable();
+
+    while let Some((idx, ch)) = chars.next() {
+        if let Some(delimiter) = active_quote {
+            if ch == delimiter {
+                if chars.peek().is_some_and(|(_, next)| *next == delimiter) {
+                    chars.next();
+                } else {
+                    active_quote = None;
+                }
+            }
+            continue;
+        }
+
+        match ch {
+            '"' | '`' => active_quote = Some(ch),
+            '.' => last_dot = Some(idx),
+            _ => {}
+        }
+    }
+
+    last_dot
 }
 
 fn identifier_matches_completion_prefix(candidate: &str, prefix: &str) -> bool {
@@ -3188,6 +3455,7 @@ pub(crate) fn sql_context_for_phase(
         SqlPhase::UsingBindList => SqlContext::BindValue,
         SqlPhase::SelectList => SqlContext::ColumnOrAll,
         SqlPhase::CteColumnList
+        | SqlPhase::DerivedAliasColumnList
         | SqlPhase::ConflictTargetList
         | SqlPhase::JoinUsingColumnList
         | SqlPhase::RecursiveCteColumnList
@@ -4212,6 +4480,86 @@ mod intellisense_tests {
     }
 
     #[test]
+    fn filter_suggestions_by_prefix_matches_quoted_condition_with_dot_in_column_name() {
+        let suggestions = vec![
+            r#"a."Street.Name" = b."Street.Name""#.to_string(),
+            r#"a."Status.Flag" = b."Status.Flag""#.to_string(),
+        ];
+        let filtered = filter_suggestions_by_prefix(&suggestions, "Street");
+
+        assert_eq!(
+            filtered,
+            vec![r#"a."Street.Name" = b."Street.Name""#.to_string()]
+        );
+    }
+
+    #[test]
+    fn filter_suggestions_by_prefix_matches_quoted_condition_with_dot_by_quoted_prefix() {
+        let suggestions = vec![
+            r#"a."Street.Name" = b."Street.Name""#.to_string(),
+            r#"a."Status.Flag" = b."Status.Flag""#.to_string(),
+        ];
+        let filtered = filter_suggestions_by_prefix(&suggestions, r#""Street"#);
+
+        assert_eq!(
+            filtered,
+            vec![r#"a."Street.Name" = b."Street.Name""#.to_string()]
+        );
+    }
+
+    #[test]
+    fn filter_suggestions_by_prefix_matches_backtick_condition_with_dot_in_column_name() {
+        let suggestions = vec![
+            "a.`Street.Name` = b.`Street.Name`".to_string(),
+            "a.`Status.Flag` = b.`Status.Flag`".to_string(),
+        ];
+        let filtered = filter_suggestions_by_prefix(&suggestions, "`Street");
+
+        assert_eq!(
+            filtered,
+            vec!["a.`Street.Name` = b.`Street.Name`".to_string()]
+        );
+    }
+
+    #[test]
+    fn filter_suggestions_by_prefix_matches_quoted_condition_with_equals_in_column_name() {
+        let suggestions = vec![
+            r#"a."A=B" = b."A=B""#.to_string(),
+            r#"a."A=C" = b."A=C""#.to_string(),
+        ];
+        let filtered = filter_suggestions_by_prefix(&suggestions, r#""A=B"#);
+
+        assert_eq!(filtered, vec![r#"a."A=B" = b."A=B""#.to_string()]);
+    }
+
+    #[test]
+    fn filter_suggestions_by_prefix_matches_backtick_condition_with_equals_in_column_name() {
+        let suggestions = vec![
+            "a.`A=B` = b.`A=B`".to_string(),
+            "a.`A=C` = b.`A=C`".to_string(),
+        ];
+        let filtered = filter_suggestions_by_prefix(&suggestions, "`A=B");
+
+        assert_eq!(filtered, vec!["a.`A=B` = b.`A=B`".to_string()]);
+    }
+
+    #[test]
+    fn filter_suggestions_by_prefix_does_not_treat_named_argument_arrow_as_condition() {
+        let suggestions = vec!["pkg.proc(arg => value)".to_string()];
+        let filtered = filter_suggestions_by_prefix(&suggestions, "proc");
+
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn filter_suggestions_by_prefix_does_not_treat_unspaced_equals_as_condition() {
+        let suggestions = vec!["a.abc=b.abc".to_string()];
+        let filtered = filter_suggestions_by_prefix(&suggestions, "abc");
+
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
     fn popup_page_selection_advances_by_page_size_and_clamps_to_end() {
         assert_eq!(IntellisensePopup::next_page_selection(1, 25), Some(11));
         assert_eq!(IntellisensePopup::next_page_selection(20, 25), Some(25));
@@ -4374,6 +4722,84 @@ mod intellisense_tests {
 
         let columns = data.get_columns_for_table("EMP");
         assert_eq!(columns, vec!["EMPNO".to_string()]);
+    }
+
+    #[test]
+    fn get_columns_for_table_uses_default_qualifier_for_quoted_unqualified_name() {
+        let mut data = IntellisenseData::new();
+        data.set_default_qualifier(Some("SCOTT".to_string()));
+        data.set_relation_members_for_qualifier("SCOTT", vec!["EMP".to_string()]);
+        data.set_columns_for_table("SCOTT.EMP", vec!["EMPNO".to_string()]);
+
+        let columns = data.get_columns_for_table(r#""EMP""#);
+
+        assert_eq!(columns, vec!["EMPNO".to_string()]);
+    }
+
+    #[test]
+    fn get_columns_for_table_does_not_default_fallback_for_quoted_dotted_name() {
+        let mut data = IntellisenseData::new();
+        data.set_default_qualifier(Some("SCOTT".to_string()));
+        data.set_relation_members_for_qualifier("SCOTT", vec!["B".to_string()]);
+        data.set_columns_for_table("SCOTT.B", vec!["LEAK".to_string()]);
+
+        let columns = data.get_columns_for_table(r#""A.B""#);
+
+        assert!(columns.is_empty(), "columns: {:?}", columns);
+    }
+
+    #[test]
+    fn get_columns_for_table_matches_exact_known_quoted_dotted_relation() {
+        let mut data = IntellisenseData::new();
+        data.set_columns_for_table("A.B", vec!["ID".to_string()]);
+
+        let columns = data.get_columns_for_table(r#""A.B""#);
+
+        assert_eq!(columns, vec!["ID".to_string()]);
+    }
+
+    #[test]
+    fn get_column_meta_matches_exact_known_quoted_dotted_relation() {
+        let mut data = IntellisenseData::new();
+        let mut meta = HashMap::new();
+        meta.insert(
+            "ID".to_string(),
+            ColumnMeta {
+                type_display: "NUMBER".to_string(),
+                nullable: false,
+                is_primary_key: true,
+            },
+        );
+        data.set_column_meta_for_table("A.B", meta);
+
+        let column_meta = data.get_column_meta(r#""A.B""#, "ID");
+
+        assert_eq!(
+            column_meta.map(|meta| meta.type_display.as_str()),
+            Some("NUMBER")
+        );
+    }
+
+    #[test]
+    fn get_foreign_keys_matches_exact_known_quoted_dotted_relation() {
+        let mut data = IntellisenseData::new();
+        data.set_foreign_keys_for_table(
+            "A.B",
+            vec![ForeignKeyMeta {
+                columns: vec!["PARENT_ID".to_string()],
+                ref_table: "PARENT".to_string(),
+                ref_columns: vec!["ID".to_string()],
+            }],
+        );
+
+        let foreign_keys = data.get_foreign_keys(r#""A.B""#);
+
+        assert_eq!(
+            foreign_keys
+                .and_then(|fks| fks.first())
+                .map(|fk| fk.ref_table.as_str()),
+            Some("PARENT")
+        );
     }
 
     #[test]
@@ -4645,6 +5071,119 @@ mod intellisense_tests {
         assert!(schema_members.iter().any(|name| name == "EMP_API"));
         assert!(schema_relations.iter().any(|name| name == "EMP_VIEW"));
         assert!(!schema_relations.iter().any(|name| name == "EMP_API"));
+    }
+
+    #[test]
+    fn get_member_suggestions_match_quoted_schema_qualifier() {
+        let mut data = IntellisenseData::new();
+        data.set_members_for_qualifier("SCOTT", vec!["EMP".to_string(), "EMP_API".to_string()]);
+        data.set_relation_members_for_qualifier(
+            "SCOTT",
+            vec!["EMP".to_string(), "EMP_VIEW".to_string()],
+        );
+
+        let schema_members = data.get_member_suggestions(r#""SCOTT""#, "EMP", false);
+        let schema_relations = data.get_member_suggestions(r#""SCOTT""#, "EMP", true);
+        let backtick_members = data.get_member_suggestions("`SCOTT`", "EMP", false);
+        let backtick_relations = data.get_member_suggestions("`SCOTT`", "EMP", true);
+
+        assert!(schema_members.iter().any(|name| name == "EMP_API"));
+        assert!(schema_relations.iter().any(|name| name == "EMP_VIEW"));
+        assert!(!schema_relations.iter().any(|name| name == "EMP_API"));
+        assert!(backtick_members.iter().any(|name| name == "EMP_API"));
+        assert!(backtick_relations.iter().any(|name| name == "EMP_VIEW"));
+        assert!(!backtick_relations.iter().any(|name| name == "EMP_API"));
+    }
+
+    #[test]
+    fn get_member_suggestions_do_not_fallback_from_quoted_dotted_qualifier_suffix() {
+        let mut data = IntellisenseData::new();
+        data.set_members_for_qualifier("B", vec!["LEAK".to_string()]);
+        data.set_relation_members_for_qualifier("B", vec!["LEAK_TABLE".to_string()]);
+
+        let members = data.get_member_suggestions(r#""A.B""#, "LEAK", false);
+        let relations = data.get_member_suggestions(r#""A.B""#, "LEAK", true);
+
+        assert!(members.is_empty(), "members: {:?}", members);
+        assert!(relations.is_empty(), "relations: {:?}", relations);
+    }
+
+    #[test]
+    fn get_member_suggestions_fallback_to_dotted_object_suffix() {
+        let mut data = IntellisenseData::new();
+        data.set_members_for_qualifier(
+            "ORDER.HEADER",
+            vec!["LINE_ID".to_string(), "STATUS".to_string()],
+        );
+
+        let suggestions = data.get_member_suggestions("sales.Order.Header", "LINE", false);
+
+        assert_eq!(suggestions, vec!["LINE_ID".to_string()]);
+    }
+
+    #[test]
+    fn get_relation_member_suggestions_fallback_to_dotted_object_suffix() {
+        let mut data = IntellisenseData::new();
+        data.set_relation_members_for_qualifier(
+            "ORDER.HEADER",
+            vec!["LINE_ITEMS".to_string(), "STATUS_LOG".to_string()],
+        );
+
+        let suggestions = data.get_member_suggestions("sales.Order.Header", "LINE", true);
+
+        assert_eq!(suggestions, vec!["LINE_ITEMS".to_string()]);
+    }
+
+    #[test]
+    fn qualifier_member_kind_lookup_matches_quoted_member_display_names() {
+        let mut data = IntellisenseData::new();
+        data.set_members_for_qualifier_with_kinds(
+            "SCOTT",
+            vec![(
+                r#""Order Header""#.to_string(),
+                Some(QualifiedMemberKind::Table),
+            )],
+        );
+
+        assert_eq!(
+            data.qualifier_member_matches_kinds(
+                "scott",
+                r#""Order Header""#,
+                &[QualifiedMemberKind::Table]
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            data.qualifier_member_matches_kinds(
+                "scott",
+                "Order Header",
+                &[QualifiedMemberKind::Table]
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn activate_default_qualifier_keeps_quoted_schema_members_by_kind() {
+        let mut data = IntellisenseData::new();
+        data.set_members_for_qualifier_with_kinds(
+            "SCOTT",
+            vec![
+                (
+                    r#""Order Header""#.to_string(),
+                    Some(QualifiedMemberKind::Table),
+                ),
+                (
+                    r#""Run Job""#.to_string(),
+                    Some(QualifiedMemberKind::Procedure),
+                ),
+            ],
+        );
+
+        assert!(data.activate_default_qualifier("scott"));
+
+        assert_eq!(data.tables, vec![r#""Order Header""#.to_string()]);
+        assert_eq!(data.procedures, vec![r#""Run Job""#.to_string()]);
     }
 
     #[test]

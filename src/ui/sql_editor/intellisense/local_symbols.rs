@@ -824,7 +824,7 @@ impl SqlEditorWidget {
         merged.extend(locals);
         merged.extend(base);
         let mut seen = HashSet::new();
-        merged.retain(|value| seen.insert(value.to_ascii_uppercase()));
+        merged.retain(|value| seen.insert(Self::local_identifier_lookup_upper(value)));
         merged.truncate(MAX_MERGED_SUGGESTIONS);
         merged
     }

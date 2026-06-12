@@ -46,11 +46,25 @@ struct ClauseCompletionPolicy {
     select_list_wildcard_mode: SelectListWildcardMode,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AutoJoinRelationSegment {
+    text: String,
+    quoted_dotted: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AutoJoinTableMatchKey {
+    full: String,
+    short: String,
+    allow_short_match: bool,
+}
+
 impl ClauseCompletionPolicy {
     fn for_phase(phase: intellisense_context::SqlPhase, has_qualifier: bool) -> Self {
         let restrict_to_relation_columns = matches!(
             phase,
             intellisense_context::SqlPhase::CteColumnList
+                | intellisense_context::SqlPhase::DerivedAliasColumnList
                 | intellisense_context::SqlPhase::ConflictTargetList
                 | intellisense_context::SqlPhase::JoinUsingColumnList
                 | intellisense_context::SqlPhase::RecursiveCteColumnList
@@ -760,6 +774,16 @@ impl SqlEditorWidget {
             }
 
             for subq in &deep_ctx.subqueries {
+                if let Some(columns) =
+                    Self::explicit_subquery_columns_for_completion(deep_ctx, subq)
+                {
+                    Self::insert_virtual_table_columns(
+                        &mut virtual_table_columns,
+                        &subq.alias,
+                        columns,
+                    );
+                    continue;
+                }
                 let body_tokens = intellisense_context::token_range_slice(
                     deep_ctx.statement_tokens.as_ref(),
                     subq.body_range,
@@ -1134,19 +1158,19 @@ impl SqlEditorWidget {
         deep_ctx: &intellisense_context::CursorContext,
     ) -> bool {
         deep_ctx.tables_in_scope.iter().any(|table_ref| {
-            table_ref.name.eq_ignore_ascii_case(qualifier)
+            Self::completion_identifiers_match(&table_ref.name, qualifier)
                 || table_ref
                     .alias
                     .as_deref()
-                    .is_some_and(|alias| alias.eq_ignore_ascii_case(qualifier))
+                    .is_some_and(|alias| Self::completion_identifiers_match(alias, qualifier))
         }) || deep_ctx
             .ctes
             .iter()
-            .any(|cte| cte.name.eq_ignore_ascii_case(qualifier))
+            .any(|cte| Self::completion_identifiers_match(&cte.name, qualifier))
             || deep_ctx
                 .subqueries
                 .iter()
-                .any(|subq| subq.alias.eq_ignore_ascii_case(qualifier))
+                .any(|subq| Self::completion_identifiers_match(&subq.alias, qualifier))
     }
 
     fn resolve_qualified_completion_mode(
@@ -1745,7 +1769,7 @@ impl SqlEditorWidget {
             ) {
                 continue;
             }
-            if seen.insert(suggestion.to_ascii_uppercase()) {
+            if seen.insert(Self::completion_identifier_lookup_upper(&suggestion)) {
                 filtered.push(suggestion);
             }
             if filtered.len() >= MAX_MERGED_SUGGESTIONS {
@@ -1780,7 +1804,7 @@ impl SqlEditorWidget {
                 continue;
             };
             saw_kind_metadata = true;
-            if matches && seen.insert(suggestion.to_ascii_uppercase()) {
+            if matches && seen.insert(Self::completion_identifier_lookup_upper(suggestion)) {
                 filtered.push(suggestion.clone());
             }
             if filtered.len() >= MAX_MERGED_SUGGESTIONS {
@@ -1853,7 +1877,7 @@ impl SqlEditorWidget {
 
     fn dedup_column_names_case_insensitive(columns: &mut Vec<String>) {
         let mut seen = HashSet::new();
-        columns.retain(|column| seen.insert(column.to_ascii_uppercase()));
+        columns.retain(|column| seen.insert(Self::completion_identifier_lookup_upper(column)));
     }
 
     fn dedup_local_member_entries_case_insensitive(entries: &mut Vec<LocalMemberEntry>) {
@@ -1869,26 +1893,109 @@ impl SqlEditorWidget {
                 return alias.to_string();
             }
         }
-        table
-            .name
-            .rsplit('.')
-            .next()
-            .unwrap_or(table.name.as_str())
-            .trim_matches(&['"', '`'][..])
-            .to_string()
+
+        Self::auto_join_relation_segments(&table.name)
+            .and_then(|segments| {
+                segments.last().map(|segment| {
+                    if segment.quoted_dotted {
+                        Self::quote_identifier_segment_for_completion(&segment.text)
+                    } else {
+                        segment.text.clone()
+                    }
+                })
+            })
+            .unwrap_or_else(|| Self::strip_identifier_quotes(&table.name))
     }
 
     /// Compare two table references by their unquoted short (unqualified) name.
     fn auto_join_tables_match(a: &str, b: &str) -> bool {
-        fn short(value: &str) -> String {
-            value
-                .rsplit('.')
-                .next()
-                .unwrap_or(value)
-                .trim_matches(&['"', '`'][..])
-                .to_string()
+        let Some(a_key) = Self::auto_join_table_match_key(a) else {
+            return false;
+        };
+        let Some(b_key) = Self::auto_join_table_match_key(b) else {
+            return false;
+        };
+
+        if a_key.full == b_key.full {
+            return true;
         }
-        short(a).eq_ignore_ascii_case(&short(b))
+
+        a_key.allow_short_match && b_key.allow_short_match && a_key.short == b_key.short
+    }
+
+    fn auto_join_table_match_key(value: &str) -> Option<AutoJoinTableMatchKey> {
+        let segments = Self::auto_join_relation_segments(value)?;
+        let last = segments.last()?;
+        let full = segments
+            .iter()
+            .map(Self::auto_join_relation_segment_match_key)
+            .collect::<Vec<_>>()
+            .join(".");
+        let short = Self::auto_join_relation_segment_match_key(last);
+
+        Some(AutoJoinTableMatchKey {
+            full,
+            short,
+            allow_short_match: !last.quoted_dotted,
+        })
+    }
+
+    fn auto_join_relation_segment_match_key(segment: &AutoJoinRelationSegment) -> String {
+        let kind = if segment.quoted_dotted { "Q" } else { "U" };
+        format!("{kind}:{}", segment.text.to_ascii_uppercase())
+    }
+
+    fn auto_join_relation_segments(value: &str) -> Option<Vec<AutoJoinRelationSegment>> {
+        let mut segments = Vec::new();
+        let mut current = String::new();
+        let mut chars = value.trim().chars().peekable();
+        let mut active_quote: Option<char> = None;
+
+        while let Some(ch) = chars.next() {
+            match ch {
+                '"' | '`' => {
+                    current.push(ch);
+                    if active_quote == Some(ch) {
+                        if chars.peek().copied() == Some(ch) {
+                            current.push(ch);
+                            chars.next();
+                        } else {
+                            active_quote = None;
+                        }
+                    } else if active_quote.is_none() {
+                        active_quote = Some(ch);
+                    }
+                }
+                '.' if active_quote.is_none() => {
+                    segments.push(Self::auto_join_relation_segment(current.trim())?);
+                    current.clear();
+                }
+                _ => current.push(ch),
+            }
+        }
+
+        if active_quote.is_some() {
+            return None;
+        }
+
+        segments.push(Self::auto_join_relation_segment(current.trim())?);
+        Some(segments)
+    }
+
+    fn auto_join_relation_segment(raw: &str) -> Option<AutoJoinRelationSegment> {
+        if raw.trim().is_empty() {
+            return None;
+        }
+
+        let text = Self::strip_identifier_quotes(raw);
+        if text.trim().is_empty() {
+            return None;
+        }
+
+        Some(AutoJoinRelationSegment {
+            quoted_dotted: sql_text::is_quoted_identifier(raw) && text.contains('.'),
+            text,
+        })
     }
 
     fn format_auto_join_pairs(
@@ -1897,10 +2004,20 @@ impl SqlEditorWidget {
         right_q: &str,
         right_cols: &[String],
     ) -> String {
+        let left_scope = Self::render_select_list_wildcard_scope(left_q);
+        let right_scope = Self::render_select_list_wildcard_scope(right_q);
         left_cols
             .iter()
             .zip(right_cols)
-            .map(|(left, right)| format!("{left_q}.{left} = {right_q}.{right}"))
+            .map(|(left, right)| {
+                format!(
+                    "{}.{} = {}.{}",
+                    left_scope,
+                    Self::quote_identifier_segment_for_completion(left),
+                    right_scope,
+                    Self::quote_identifier_segment_for_completion(right)
+                )
+            })
             .collect::<Vec<_>>()
             .join(" AND ")
     }
@@ -1967,14 +2084,14 @@ impl SqlEditorWidget {
                 for fk in fks {
                     for column in &fk.columns {
                         fk_targets
-                            .entry(column.to_uppercase())
+                            .entry(Self::completion_identifier_lookup_upper(column))
                             .or_insert_with(|| fk.ref_table.clone());
                     }
                 }
             }
 
             for column in data.get_columns_for_table(table) {
-                let key = column.to_uppercase();
+                let key = Self::completion_identifier_lookup_upper(&column);
                 if descriptions.contains_key(&key) {
                     continue;
                 }
@@ -2049,7 +2166,7 @@ impl SqlEditorWidget {
         deep_ctx: &intellisense_context::CursorContext,
         context: SqlContext,
     ) -> Vec<String> {
-        let prefix_upper = prefix.to_ascii_uppercase();
+        let prefix_upper = Self::completion_identifier_lookup_upper(prefix);
         let mut suggestions = Vec::new();
         let mut seen = HashSet::new();
         let allow_relation_aliases = !matches!(context, SqlContext::TableName);
@@ -2058,7 +2175,7 @@ impl SqlEditorWidget {
             if candidate.is_empty() {
                 return;
             }
-            let candidate_upper = candidate.to_ascii_uppercase();
+            let candidate_upper = Self::completion_identifier_lookup_upper(candidate);
             if !prefix_upper.is_empty() && !candidate_upper.starts_with(&prefix_upper) {
                 return;
             }
@@ -2094,7 +2211,7 @@ impl SqlEditorWidget {
         deep_ctx: &intellisense_context::CursorContext,
     ) -> Vec<String> {
         let policy = ClauseCompletionPolicy::for_phase(deep_ctx.phase, qualifier.is_some());
-        let prefix_upper = prefix.to_ascii_uppercase();
+        let prefix_upper = Self::completion_wildcard_candidate_lookup_upper(prefix);
         let mut suggestions = Vec::new();
         let mut seen = HashSet::new();
 
@@ -2102,7 +2219,7 @@ impl SqlEditorWidget {
             if candidate.is_empty() {
                 return;
             }
-            let candidate_upper = candidate.to_ascii_uppercase();
+            let candidate_upper = Self::completion_wildcard_candidate_lookup_upper(&candidate);
             if !prefix_upper.is_empty() && !candidate_upper.starts_with(prefix_upper.as_str()) {
                 return;
             }
@@ -2148,10 +2265,13 @@ impl SqlEditorWidget {
             return base;
         }
 
-        let mut seen: HashSet<String> = base.iter().map(|item| item.to_ascii_uppercase()).collect();
+        let mut seen: HashSet<String> = base
+            .iter()
+            .map(|item| Self::completion_identifier_lookup_upper(item))
+            .collect();
         let mut filtered_aliases = Vec::new();
         for alias in aliases {
-            if seen.insert(alias.to_ascii_uppercase()) {
+            if seen.insert(Self::completion_identifier_lookup_upper(&alias)) {
                 filtered_aliases.push(alias);
             }
         }
@@ -2296,6 +2416,10 @@ impl SqlEditorWidget {
         }
 
         for subq in &body_ctx.subqueries {
+            if let Some(columns) = Self::explicit_subquery_columns_for_completion(&body_ctx, subq) {
+                Self::insert_virtual_table_columns(&mut virtual_table_columns, &subq.alias, columns);
+                continue;
+            }
             let relation_tokens = intellisense_context::token_range_slice(
                 body_ctx.statement_tokens.as_ref(),
                 subq.body_range,
@@ -2425,7 +2549,14 @@ impl SqlEditorWidget {
         let Some(first_table) = iter.next() else {
             return Vec::new();
         };
-        let mut common_columns = data.get_columns_for_table(first_table);
+        let mut common_columns: Vec<(String, String)> = data
+            .get_columns_for_table(first_table)
+            .into_iter()
+            .map(|column| {
+                let upper = Self::completion_identifier_lookup_upper(&column);
+                (column, upper)
+            })
+            .collect();
         if common_columns.is_empty() {
             return Vec::new();
         }
@@ -2437,19 +2568,27 @@ impl SqlEditorWidget {
             }
             let allowed: HashSet<String> = table_columns
                 .into_iter()
-                .map(|column| column.to_ascii_uppercase())
+                .map(|column| Self::completion_identifier_lookup_upper(&column))
                 .collect();
-            common_columns.retain(|column| allowed.contains(&column.to_ascii_uppercase()));
+            common_columns
+                .retain(|(_, upper)| allowed.contains(upper));
         }
 
-        let prefix_upper = prefix.to_ascii_uppercase();
-        common_columns.retain(|column| {
-            let upper = column.to_ascii_uppercase();
-            prefix_upper.is_empty() || upper.starts_with(prefix_upper.as_str())
-        });
-        Self::dedup_column_names_case_insensitive(&mut common_columns);
-        common_columns.truncate(MAX_MERGED_SUGGESTIONS);
-        common_columns
+        let prefix_upper = Self::completion_identifier_lookup_upper(prefix);
+        let mut suggestions = Vec::new();
+        let mut seen = HashSet::new();
+        for (column, upper) in common_columns {
+            if !prefix_upper.is_empty() && !upper.starts_with(prefix_upper.as_str()) {
+                continue;
+            }
+            if seen.insert(upper) {
+                suggestions.push(column);
+                if suggestions.len() >= MAX_MERGED_SUGGESTIONS {
+                    break;
+                }
+            }
+        }
+        suggestions
     }
 
     fn current_query_tokens(deep_ctx: &intellisense_context::CursorContext) -> &[SqlToken] {
@@ -2575,6 +2714,33 @@ impl SqlEditorWidget {
         columns: Vec<String>,
     ) {
         virtual_table_columns.insert(relation_name.to_ascii_uppercase(), columns);
+    }
+
+    fn is_cursor_inside_subquery_explicit_column_list(
+        deep_ctx: &intellisense_context::CursorContext,
+        subquery: &intellisense_context::SubqueryDefinition,
+    ) -> bool {
+        let cursor_token_idx = deep_ctx
+            .cursor_token_len
+            .min(deep_ctx.statement_tokens.len());
+        subquery
+            .explicit_column_range
+            .is_some_and(|range| cursor_token_idx >= range.start && cursor_token_idx <= range.end)
+    }
+
+    fn explicit_subquery_columns_for_completion(
+        deep_ctx: &intellisense_context::CursorContext,
+        subquery: &intellisense_context::SubqueryDefinition,
+    ) -> Option<Vec<String>> {
+        if subquery.explicit_columns.is_empty()
+            || Self::is_cursor_inside_subquery_explicit_column_list(deep_ctx, subquery)
+        {
+            return None;
+        }
+
+        let mut columns = subquery.explicit_columns.clone();
+        Self::dedup_column_names_case_insensitive(&mut columns);
+        (!columns.is_empty()).then_some(columns)
     }
 
     fn resolve_column_tables_for_context(
@@ -2869,12 +3035,12 @@ impl SqlEditorWidget {
             return Vec::new();
         }
 
-        let prefix_upper = prefix.to_ascii_uppercase();
+        let prefix_upper = Self::completion_identifier_lookup_upper(prefix);
         let mut target_columns = Vec::new();
         let mut seen_target_columns = HashSet::new();
         for table in &target_tables {
             for column in data.get_columns_for_table(table) {
-                let upper = column.to_ascii_uppercase();
+                let upper = Self::completion_identifier_lookup_upper(&column);
                 if !prefix_upper.is_empty() && !upper.starts_with(prefix_upper.as_str()) {
                     continue;
                 }
@@ -2904,7 +3070,7 @@ impl SqlEditorWidget {
             let mut seen_suggestions = HashSet::new();
 
             for other_pattern in pattern_variables {
-                if other_pattern.eq_ignore_ascii_case(qualifier) {
+                if Self::completion_identifiers_match(&other_pattern, qualifier) {
                     continue;
                 }
 
@@ -2954,7 +3120,7 @@ impl SqlEditorWidget {
                 .alias
                 .as_deref()
                 .unwrap_or(table_ref.name.as_str());
-            if other_scope_name.eq_ignore_ascii_case(qualifier) {
+            if Self::completion_identifiers_match(other_scope_name, qualifier) {
                 continue;
             }
 
@@ -2966,7 +3132,7 @@ impl SqlEditorWidget {
             let mut other_columns_by_upper = HashMap::new();
             for column in data.get_columns_for_table(&table_ref.name) {
                 other_columns_by_upper
-                    .entry(column.to_ascii_uppercase())
+                    .entry(Self::completion_identifier_lookup_upper(&column))
                     .or_insert(column);
             }
             if other_columns_by_upper.is_empty() {
@@ -3006,11 +3172,14 @@ impl SqlEditorWidget {
             return base;
         }
 
-        let prefix_upper = prefix.to_ascii_uppercase();
-        let mut seen: HashSet<String> = base.iter().map(|item| item.to_ascii_uppercase()).collect();
+        let prefix_upper = Self::completion_identifier_lookup_upper(prefix);
+        let mut seen: HashSet<String> = base
+            .iter()
+            .map(|item| Self::completion_identifier_lookup_upper(item))
+            .collect();
 
         for column in derived_columns {
-            let upper = column.to_ascii_uppercase();
+            let upper = Self::completion_identifier_lookup_upper(&column);
             if !prefix_upper.is_empty() && !upper.starts_with(prefix_upper.as_str()) {
                 continue;
             }
@@ -3172,12 +3341,22 @@ impl SqlEditorWidget {
             return None;
         }
 
-        if let Some((qualifier, member)) = normalized.rsplit_once('.') {
-            if data.qualifier_has_member(qualifier, member, true)
-                || data.qualifier_has_member(qualifier, member, false)
-            {
-                return Some(normalized.to_ascii_uppercase());
+        let has_unquoted_dot = Self::has_unquoted_dot(table_name);
+        if has_unquoted_dot {
+            let segments = Self::relation_name_segments(table_name)?;
+            if segments.len() >= 2 {
+                let qualifier = segments[..segments.len() - 1].join(".");
+                let member = segments.last()?;
+                if data.qualifier_has_member(&qualifier, member, true)
+                    || data.qualifier_has_member(&qualifier, member, false)
+                {
+                    return Some(normalized.to_ascii_uppercase());
+                }
             }
+        }
+
+        if !has_unquoted_dot && data.is_known_relation(normalized) {
+            return Some(normalized.to_ascii_uppercase());
         }
 
         if !normalized.contains('.') {
@@ -3320,7 +3499,7 @@ impl SqlEditorWidget {
         if trimmed.is_empty() {
             return "\"\"".to_string();
         }
-        if trimmed.starts_with('"') && trimmed.ends_with('"') {
+        if sql_text::is_quoted_identifier(trimmed) {
             return trimmed.to_string();
         }
         if Self::is_unquoted_completion_identifier(trimmed) {
@@ -3328,6 +3507,28 @@ impl SqlEditorWidget {
         }
 
         format!("\"{}\"", trimmed.replace('"', "\"\""))
+    }
+
+    fn completion_identifier_lookup_upper(text: &str) -> String {
+        let trimmed = text.trim();
+        if sql_text::is_quoted_identifier(trimmed) {
+            return sql_text::strip_identifier_quotes(trimmed).to_ascii_uppercase();
+        }
+
+        match trimmed.chars().next() {
+            Some('"') | Some('`') => trimmed[1..].to_ascii_uppercase(),
+            _ => trimmed.to_ascii_uppercase(),
+        }
+    }
+
+    fn completion_wildcard_candidate_lookup_upper(text: &str) -> String {
+        let trimmed = text.trim();
+        let lookup_text = trimmed.strip_suffix(".*").unwrap_or(trimmed);
+        Self::completion_identifier_lookup_upper(lookup_text)
+    }
+
+    fn completion_identifiers_match(left: &str, right: &str) -> bool {
+        Self::completion_identifier_lookup_upper(left) == Self::completion_identifier_lookup_upper(right)
     }
 
     fn is_unquoted_completion_identifier(text: &str) -> bool {

@@ -15,6 +15,7 @@ pub enum SqlPhase {
     Initial,
     WithClause,
     CteColumnList,
+    DerivedAliasColumnList,
     ConflictTargetList,
     JoinUsingColumnList,
     RecursiveCteColumnList,
@@ -55,6 +56,7 @@ impl SqlPhase {
         matches!(
             self,
             SqlPhase::CteColumnList
+                | SqlPhase::DerivedAliasColumnList
                 | SqlPhase::ConflictTargetList
                 | SqlPhase::JoinUsingColumnList
                 | SqlPhase::RecursiveCteColumnList
@@ -140,6 +142,8 @@ pub struct CteDefinition {
 #[allow(dead_code)]
 pub struct SubqueryDefinition {
     pub alias: String,
+    pub explicit_columns: Vec<String>,
+    pub explicit_column_range: Option<TokenRange>,
     pub body_range: TokenRange,
     pub depth: usize,
 }
@@ -395,19 +399,41 @@ pub(crate) fn analyze_cursor_context_arc(
         }
     }
 
+    let mut phase = parse_result.phase;
+    let mut focused_tables = parse_result.focused_tables;
+    if let Some(alias) = subquery_alias_column_list_source_at_cursor(
+        &table_analysis.subqueries,
+        clamped_cursor_token_len,
+    ) {
+        phase = SqlPhase::DerivedAliasColumnList;
+        focused_tables = vec![alias];
+    }
+
     CursorContext {
         statement_tokens,
         cursor_token_len: clamped_cursor_token_len,
         active_query_range,
-        phase: parse_result.phase,
+        phase,
         depth: parse_result.depth,
         tables_in_scope,
         ctes,
         subqueries: table_analysis.subqueries,
-        focused_tables: parse_result.focused_tables,
+        focused_tables,
         qualifier: None,
         qualifier_tables: Vec::new(),
     }
+}
+
+fn subquery_alias_column_list_source_at_cursor(
+    subqueries: &[SubqueryDefinition],
+    cursor_token_len: usize,
+) -> Option<String> {
+    subqueries.iter().find_map(|subquery| {
+        subquery.explicit_column_range.and_then(|range| {
+            (cursor_token_len >= range.start && cursor_token_len <= range.end)
+                .then(|| subquery.alias.clone())
+        })
+    })
 }
 
 /// Returns true for functions whose syntax includes a FROM keyword as part of
@@ -1266,6 +1292,16 @@ fn nearest_cte_name(depth_frames: &[ParserDepthFrame], depth: usize) -> Option<S
         .find_map(|frame| frame.current_cte_name.clone())
 }
 
+fn nearest_alias_column_list_source(
+    depth_frames: &[ParserDepthFrame],
+    depth: usize,
+) -> Option<String> {
+    depth_frames[..=depth.min(depth_frames.len().saturating_sub(1))]
+        .iter()
+        .rev()
+        .find_map(|frame| frame.current_alias_column_list_source.clone())
+}
+
 fn nearest_join_using_tables(depth_frames: &[ParserDepthFrame], depth: usize) -> Vec<String> {
     depth_frames[..=depth.min(depth_frames.len().saturating_sub(1))]
         .iter()
@@ -1344,6 +1380,9 @@ fn snapshot_cursor_state(
         SqlPhase::CteColumnList | SqlPhase::RecursiveCteColumnList => {
             nearest_cte_name(depth_frames, depth).into_iter().collect()
         }
+        SqlPhase::DerivedAliasColumnList => nearest_alias_column_list_source(depth_frames, depth)
+            .into_iter()
+            .collect(),
         SqlPhase::LockingColumnList => current_scope_relation_tables(parsed_tables, scope_stack),
         _ => Vec::new(),
     };
@@ -1375,6 +1414,7 @@ struct ParserDepthFrame {
     open_cursor_active: bool,
     current_target_table: Option<String>,
     current_cte_name: Option<String>,
+    current_alias_column_list_source: Option<String>,
     dml_set_active: bool,
     recent_relation_tables: Vec<String>,
     join_using_tables: Vec<String>,
@@ -1676,6 +1716,67 @@ fn phase_on_open_paren(
     None
 }
 
+fn alias_column_list_source_before_open_paren(
+    tokens: &[SqlToken],
+    open_paren_idx: usize,
+    current_phase: SqlPhase,
+) -> Option<String> {
+    if !matches!(current_phase, SqlPhase::FromClause) {
+        return None;
+    }
+
+    let (alias_token, alias_idx) = prev_non_comment_token(tokens, open_paren_idx)?;
+    let SqlToken::Word(alias_word) = alias_token else {
+        return None;
+    };
+    if !is_identifier_word_token(alias_word) {
+        return None;
+    }
+
+    let alias_upper = alias_word.to_ascii_uppercase();
+    if !is_quoted_identifier(alias_word)
+        && (is_relation_alias_breaker(&alias_upper)
+            || is_relation_postfix_column_list_keyword(&alias_upper))
+    {
+        return None;
+    }
+
+    let (source_token, _) = prev_non_comment_token(tokens, alias_idx)?;
+    match source_token {
+        SqlToken::Symbol(sym) if sym == ")" => Some(strip_identifier_quotes(alias_word)),
+        SqlToken::Word(word) if is_identifier_word_token(word) => {
+            let upper = word.to_ascii_uppercase();
+            if is_relation_alias_breaker(&upper) || is_relation_postfix_column_list_keyword(&upper)
+            {
+                None
+            } else {
+                Some(strip_identifier_quotes(alias_word))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn is_relation_postfix_column_list_keyword(word: &str) -> bool {
+    matches!(
+        word,
+        "PARTITION"
+            | "SUBPARTITION"
+            | "SAMPLE"
+            | "SEED"
+            | "TABLESAMPLE"
+            | "WITH"
+            | "USE"
+            | "FORCE"
+            | "IGNORE"
+            | "INDEXED"
+            | "MODEL"
+            | "PIVOT"
+            | "UNPIVOT"
+            | "MATCH_RECOGNIZE"
+    )
+}
+
 fn push_recent_relation_table(frame: &mut ParserDepthFrame, table_name: &str) {
     if frame
         .recent_relation_tables
@@ -1916,6 +2017,7 @@ impl Default for ParserDepthFrame {
             open_cursor_active: false,
             current_target_table: None,
             current_cte_name: None,
+            current_alias_column_list_source: None,
             dml_set_active: false,
             recent_relation_tables: Vec::new(),
             join_using_tables: Vec::new(),
@@ -2017,6 +2119,9 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 let parent_cte_name = depth_frames
                     .get(depth)
                     .and_then(|frame| frame.current_cte_name.clone());
+                let parent_alias_column_list_source = depth_frames
+                    .get(depth)
+                    .and_then(|frame| frame.current_alias_column_list_source.clone());
                 let parent_recent_relation_tables = depth_frames
                     .get(depth)
                     .map(|frame| frame.recent_relation_tables.clone())
@@ -2032,11 +2137,15 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 let parent_scope_id = *scope_stack.last().unwrap_or(&0);
                 let entering_cte_column_list = matches!(cte_state, CteState::AfterName);
                 let entering_cte_body = matches!(cte_state, CteState::ExpectBody);
+                let entering_alias_column_list_source =
+                    alias_column_list_source_before_open_paren(tokens, idx, parent_phase);
                 parser_state.push_open_paren('(');
                 depth = parser_state.paren_depth();
 
                 let inherited_phase = if matches!(cte_state, CteState::AfterName) {
                     SqlPhase::CteColumnList
+                } else if entering_alias_column_list_source.is_some() {
+                    SqlPhase::DerivedAliasColumnList
                 } else if let Some(target_column_list_phase) =
                     phase_on_open_paren(tokens, idx, parent_phase, parent_statement_kind)
                 {
@@ -2063,6 +2172,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     frame.open_cursor_active = false;
                     frame.current_target_table = parent_target_table;
                     frame.current_cte_name = parent_cte_name;
+                    frame.current_alias_column_list_source =
+                        entering_alias_column_list_source.or(parent_alias_column_list_source);
                     frame.dml_set_active = false;
                     frame.recent_relation_tables = parent_recent_relation_tables;
                     frame.join_using_tables = parent_join_using_tables;
@@ -2169,13 +2280,20 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             start: start_idx,
                             end: idx,
                         };
-                        if let Some((alias, next_idx, body_end)) =
-                            parse_subquery_alias(tokens, idx + 1)
+                        if let Some((
+                            alias,
+                            next_idx,
+                            body_end,
+                            explicit_columns,
+                            explicit_column_range,
+                        )) = parse_subquery_alias(tokens, idx + 1)
                         {
                             let relation_name_for_tracking = alias.clone();
                             all_subqueries.push(ParsedSubqueryEntry {
                                 subquery: SubqueryDefinition {
                                     alias: alias.clone(),
+                                    explicit_columns,
+                                    explicit_column_range,
                                     body_range: TokenRange {
                                         start: body_range.start,
                                         end: body_end.max(body_range.end),
@@ -2224,6 +2342,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         all_subqueries.push(ParsedSubqueryEntry {
                             subquery: SubqueryDefinition {
                                 alias: generated_name.clone(),
+                                explicit_columns: Vec::new(),
+                                explicit_column_range: None,
                                 body_range,
                                 depth: depth.saturating_sub(1),
                             },
@@ -3547,8 +3667,12 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 });
                                 let relation_arg_tokens = relation_body_range
                                     .map(|range| token_range_slice(tokens, range));
-                                let (direct_alias, direct_after_alias) =
-                                    parse_alias_deep(tokens, relation_arg_end);
+                                let (
+                                    direct_alias,
+                                    direct_after_alias,
+                                    direct_explicit_columns,
+                                    direct_explicit_column_range,
+                                ) = parse_alias_deep_with_columns(tokens, relation_arg_end);
                                 let (direct_alias, direct_after_alias) = sanitize_lock_table_alias(
                                     tokens,
                                     relation_arg_end,
@@ -3561,11 +3685,28 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                     tokens,
                                     relation_arg_end,
                                 );
-                                let (alias, after_alias) =
-                                    if let Some((alias, next_idx, _)) = derived_alias.as_ref() {
-                                        (Some(alias.clone()), *next_idx)
+                                let (alias, after_alias, explicit_columns, explicit_column_range) =
+                                    if let Some((
+                                        alias,
+                                        next_idx,
+                                        _,
+                                        explicit_columns,
+                                        explicit_column_range,
+                                    )) = derived_alias.as_ref()
+                                    {
+                                        (
+                                            Some(alias.clone()),
+                                            *next_idx,
+                                            explicit_columns.clone(),
+                                            *explicit_column_range,
+                                        )
                                     } else {
-                                        (direct_alias, direct_after_alias)
+                                        (
+                                            direct_alias,
+                                            direct_after_alias,
+                                            direct_explicit_columns,
+                                            direct_explicit_column_range,
+                                        )
                                     };
                                 let alias_present = alias.is_some();
                                 let scope_id = *scope_stack.last().unwrap_or(&0);
@@ -3575,11 +3716,17 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                     });
                                 let virtual_relation_body_range = derived_alias
                                     .as_ref()
-                                    .map(|(_, _, body_end)| TokenRange {
+                                    .map(|(_, _, body_end, _, _)| TokenRange {
                                         start: idx,
                                         end: *body_end,
                                     })
-                                    .or(relation_body_range);
+                                    .or(relation_body_range)
+                                    .or_else(|| {
+                                        (!explicit_columns.is_empty()).then_some(TokenRange {
+                                            start: idx,
+                                            end: relation_output_end.max(idx.saturating_add(1)),
+                                        })
+                                    });
                                 let table_scope_name = if uses_virtual_alias_scope {
                                     alias.clone().unwrap_or_else(|| table_name.clone())
                                 } else {
@@ -3589,10 +3736,15 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 if let (Some(alias_name), Some(body_range)) =
                                     (alias.as_ref(), virtual_relation_body_range)
                                 {
-                                    if uses_virtual_alias_scope || derived_alias.is_some() {
+                                    if uses_virtual_alias_scope
+                                        || derived_alias.is_some()
+                                        || !explicit_columns.is_empty()
+                                    {
                                         all_subqueries.push(ParsedSubqueryEntry {
                                             subquery: SubqueryDefinition {
                                                 alias: alias_name.clone(),
+                                                explicit_columns: explicit_columns.clone(),
+                                                explicit_column_range,
                                                 body_range,
                                                 depth,
                                             },
@@ -4195,6 +4347,17 @@ fn normalize_identifier_for_lookup(value: &str) -> String {
     }
 }
 
+fn normalize_identifier_for_scope_dedupe(value: &str) -> String {
+    let trimmed = value.trim();
+    if is_quoted_identifier(trimmed) {
+        let unquoted = strip_identifier_quotes(trimmed);
+        if unquoted.contains('.') {
+            return trimmed.to_ascii_uppercase();
+        }
+    }
+    normalize_identifier_for_lookup(value)
+}
+
 fn split_identifier_parts_for_lookup(value: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
@@ -4400,24 +4563,33 @@ fn parse_relation_wrapper_table_name(
     }
 }
 
-fn consume_optional_alias_column_list(tokens: &[SqlToken], start: usize) -> usize {
+fn parse_optional_alias_column_list(
+    tokens: &[SqlToken],
+    start: usize,
+) -> (Vec<String>, Option<TokenRange>, usize) {
     let idx = skip_comment_tokens(tokens, start);
     match tokens.get(idx) {
         Some(SqlToken::Symbol(sym)) if sym == "(" => extract_parenthesized_range(tokens, idx)
-            .map(|(_, next_idx)| next_idx)
-            .unwrap_or(idx),
-        _ => idx,
+            .map(|(range, next_idx)| {
+                (
+                    extract_cte_explicit_columns(tokens, range),
+                    Some(range),
+                    next_idx,
+                )
+            })
+            .unwrap_or_else(|| (Vec::new(), None, idx)),
+        _ => (Vec::new(), None, idx),
     }
 }
 
-fn parse_relation_alias_at(
+fn parse_relation_alias_at_with_columns(
     tokens: &[SqlToken],
     start: usize,
     allow_alias_column_list: bool,
-) -> (Option<String>, usize) {
+) -> (Option<String>, usize, Vec<String>, Option<TokenRange>) {
     let idx = skip_comment_tokens(tokens, start);
     let Some(SqlToken::Word(word)) = tokens.get(idx) else {
-        return (None, idx);
+        return (None, idx, Vec::new(), None);
     };
 
     let is_quoted = is_quoted_identifier(word);
@@ -4425,61 +4597,82 @@ fn parse_relation_alias_at(
 
     if upper == "AS" {
         if matches!(next_word_upper(tokens, idx + 1), Some((next, _)) if next == "OF") {
-            return (None, idx);
+            return (None, idx, Vec::new(), None);
         }
         let alias_idx = skip_comment_tokens(tokens, idx + 1);
         let Some(SqlToken::Word(alias_word)) = tokens.get(alias_idx) else {
-            return (None, alias_idx);
+            return (None, alias_idx, Vec::new(), None);
         };
         if !is_identifier_word_token(alias_word) {
-            return (None, alias_idx + 1);
+            return (None, alias_idx + 1, Vec::new(), None);
         }
         let alias_is_quoted = is_quoted_identifier(alias_word);
         let alias_upper = alias_word.to_ascii_uppercase();
         if !alias_is_quoted && is_relation_alias_breaker(&alias_upper) {
-            return (None, alias_idx);
+            return (None, alias_idx, Vec::new(), None);
         }
-        let next_idx = if allow_alias_column_list {
-            consume_optional_alias_column_list(tokens, alias_idx + 1)
+        let (explicit_columns, explicit_column_range, next_idx) = if allow_alias_column_list {
+            parse_optional_alias_column_list(tokens, alias_idx + 1)
         } else {
-            alias_idx + 1
+            (Vec::new(), None, alias_idx + 1)
         };
-        return (Some(strip_identifier_quotes(alias_word)), next_idx);
+        return (
+            Some(strip_identifier_quotes(alias_word)),
+            next_idx,
+            explicit_columns,
+            explicit_column_range,
+        );
     }
 
     if !is_identifier_word_token(word) {
-        return (None, idx);
+        return (None, idx, Vec::new(), None);
     }
     if is_quoted || !is_relation_alias_breaker(&upper) {
-        let next_idx = if allow_alias_column_list {
-            consume_optional_alias_column_list(tokens, idx + 1)
+        let (explicit_columns, explicit_column_range, next_idx) = if allow_alias_column_list {
+            parse_optional_alias_column_list(tokens, idx + 1)
         } else {
-            idx + 1
+            (Vec::new(), None, idx + 1)
         };
-        return (Some(strip_identifier_quotes(word)), next_idx);
+        return (
+            Some(strip_identifier_quotes(word)),
+            next_idx,
+            explicit_columns,
+            explicit_column_range,
+        );
     }
 
-    (None, idx)
+    (None, idx, Vec::new(), None)
 }
 
-/// Parse an optional alias after a table name.
-fn parse_alias_deep(tokens: &[SqlToken], start: usize) -> (Option<String>, usize) {
+fn parse_alias_deep_with_columns(
+    tokens: &[SqlToken],
+    start: usize,
+) -> (Option<String>, usize, Vec<String>, Option<TokenRange>) {
     let start = skip_relation_postfix_clauses(tokens, start);
-    parse_relation_alias_at(tokens, start, true)
+    parse_relation_alias_at_with_columns(tokens, start, true)
 }
 
 fn parse_alias_after_derived_relation_clauses(
     tokens: &[SqlToken],
     start: usize,
-) -> Option<(String, usize, usize)> {
+) -> Option<(String, usize, usize, Vec<String>, Option<TokenRange>)> {
     let relation_postfix_end = skip_relation_postfix_clauses(tokens, start);
     let derived_end = skip_derived_relation_postfix_clauses(tokens, relation_postfix_end);
     if derived_end == relation_postfix_end {
         return None;
     }
     let alias_start = skip_relation_postfix_clauses(tokens, derived_end);
-    let (alias, next_idx) = parse_relation_alias_at(tokens, alias_start, true);
-    alias.map(|name| (name, next_idx, derived_end))
+    let (alias, next_idx, explicit_columns, explicit_column_range) =
+        parse_relation_alias_at_with_columns(tokens, alias_start, true);
+    alias.map(|name| {
+        (
+            name,
+            next_idx,
+            derived_end,
+            explicit_columns,
+            explicit_column_range,
+        )
+    })
 }
 
 fn skip_relation_postfix_clauses(tokens: &[SqlToken], start: usize) -> usize {
@@ -5074,7 +5267,10 @@ fn skip_model_clause(tokens: &[SqlToken], start: usize) -> usize {
 
 /// Parse an alias after a subquery closing ')' and capture any trailing derived
 /// relation clauses that remain part of the virtual row source.
-fn parse_subquery_alias(tokens: &[SqlToken], start: usize) -> Option<(String, usize, usize)> {
+fn parse_subquery_alias(
+    tokens: &[SqlToken],
+    start: usize,
+) -> Option<(String, usize, usize, Vec<String>, Option<TokenRange>)> {
     let mut idx = start;
     // Skip comments and stray closing parens to recover from malformed SQL like:
     // `FROM (SELECT ...) ) alias`
@@ -5096,8 +5292,17 @@ fn parse_subquery_alias(tokens: &[SqlToken], start: usize) -> Option<(String, us
     idx = skip_relation_postfix_clauses(tokens, idx);
     let body_end = skip_derived_relation_postfix_clauses(tokens, idx);
     let alias_start = skip_relation_postfix_clauses(tokens, body_end);
-    let (alias, next_idx) = parse_relation_alias_at(tokens, alias_start, true);
-    alias.map(|name| (name, next_idx, body_end))
+    let (alias, next_idx, explicit_columns, explicit_column_range) =
+        parse_relation_alias_at_with_columns(tokens, alias_start, true);
+    alias.map(|name| {
+        (
+            name,
+            next_idx,
+            body_end,
+            explicit_columns,
+            explicit_column_range,
+        )
+    })
 }
 
 fn is_join_keyword(word: &str) -> bool {
@@ -5321,7 +5526,7 @@ pub fn resolve_all_scope_tables(tables_in_scope: &[ScopedTableRef]) -> Vec<Strin
     let mut seen = HashSet::new();
 
     for (_, table_ref) in ordered_tables {
-        let upper = table_ref.name.to_ascii_uppercase();
+        let upper = normalize_identifier_for_scope_dedupe(&table_ref.name);
         if seen.insert(upper) {
             result.push(table_ref.name.clone());
         }
@@ -5638,7 +5843,7 @@ pub(crate) fn extract_match_recognize_pattern_variables(tokens: &[SqlToken]) -> 
             if is_match_recognize_pattern_keyword(&upper) {
                 continue;
             }
-            variables.push(strip_identifier_quotes(word));
+            variables.push(output_identifier_suggestion(word));
         }
     }
 
@@ -5664,7 +5869,7 @@ pub(crate) fn extract_match_recognize_pattern_variables(tokens: &[SqlToken]) -> 
                 if is_identifier_word_token(word)
                     && matches!(clause_tokens.get(assign_idx), Some(SqlToken::Symbol(sym)) if sym == "=")
                 {
-                    variables.push(strip_identifier_quotes(word));
+                    variables.push(output_identifier_suggestion(word));
 
                     let rhs_idx = next_non_comment_index(clause_tokens, assign_idx + 1);
                     idx = if matches!(clause_tokens.get(rhs_idx), Some(SqlToken::Symbol(sym)) if sym == "(")
@@ -5742,7 +5947,7 @@ fn find_recursive_cte_generated_column_after_set(
                     return None;
                 }
                 return Some((
-                    strip_identifier_quotes(column_name),
+                    output_identifier_suggestion(column_name),
                     skip_comment_tokens(tokens, column_idx.saturating_add(1)),
                 ));
             }
@@ -6182,7 +6387,7 @@ fn append_table_function_column_items(
 ) {
     for item_tokens in split_top_level_symbol_groups(tokens, ",") {
         if let Some(column) = resolve_table_function_column_name(&item_tokens) {
-            let key = column.to_ascii_uppercase();
+            let key = column_lookup_key(&column);
             if seen.insert(key) {
                 columns.push(column);
             }
@@ -6362,7 +6567,7 @@ fn parse_pivot_in_item_output_column(item_tokens: &[&SqlToken]) -> Option<String
                 while alias_idx < meaningful.len() {
                     if let SqlToken::Word(alias) = meaningful[alias_idx] {
                         if is_identifier_word_token(alias) {
-                            return Some(strip_identifier_quotes(alias));
+                            return Some(output_identifier_suggestion(alias));
                         }
                     }
                     if !matches!(meaningful[alias_idx], SqlToken::Comment(_)) {
@@ -6390,13 +6595,13 @@ fn parse_pivot_in_item_output_column(item_tokens: &[&SqlToken]) -> Option<String
 
     if let Some(SqlToken::Word(last_word)) = meaningful.last().copied() {
         if is_identifier_word_token(last_word) {
-            return Some(strip_identifier_quotes(last_word));
+            return Some(output_identifier_suggestion(last_word));
         }
     }
 
     if let Some(SqlToken::Word(first_word)) = meaningful.first().copied() {
         if is_identifier_word_token(first_word) {
-            return Some(strip_identifier_quotes(first_word));
+            return Some(output_identifier_suggestion(first_word));
         }
     }
 
@@ -6442,17 +6647,53 @@ fn parse_unpivot_output_segment(tokens: &[SqlToken]) -> Vec<String> {
 
     if matches!(tokens.get(start_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
         if let Some((range, _)) = extract_parenthesized_range(tokens, start_idx) {
-            let mut columns = parse_identifier_words_top_level(token_range_slice(tokens, range));
+            let mut columns =
+                parse_identifier_suggestions_top_level(token_range_slice(tokens, range));
             dedup_columns_case_insensitive(&mut columns);
             return columns;
         }
     }
 
-    if let Some(column) = parse_first_identifier_word(&tokens[start_idx..]) {
+    if let Some(column) = parse_first_identifier_suggestion(&tokens[start_idx..]) {
         return vec![column];
     }
 
     Vec::new()
+}
+
+fn parse_first_identifier_suggestion(tokens: &[SqlToken]) -> Option<String> {
+    for token in tokens {
+        if let SqlToken::Word(word) = token {
+            if is_identifier_word_token(word) {
+                return Some(output_identifier_suggestion(word));
+            }
+        }
+    }
+    None
+}
+
+fn parse_identifier_suggestions_top_level(tokens: &[SqlToken]) -> Vec<String> {
+    let token_depths = paren_depths(tokens);
+    let mut columns = Vec::new();
+
+    for (idx, token) in tokens.iter().enumerate() {
+        if !is_top_level_depth(&token_depths, idx) {
+            continue;
+        }
+        if let SqlToken::Word(word) = token {
+            if !is_identifier_word_token(word) {
+                continue;
+            }
+            let upper = word.to_ascii_uppercase();
+            if upper == "AS" {
+                continue;
+            }
+            columns.push(output_identifier_suggestion(word));
+        }
+    }
+
+    dedup_columns_case_insensitive(&mut columns);
+    columns
 }
 
 fn parse_unpivot_source_columns_from_in_segment(tokens: &[SqlToken]) -> Vec<String> {
@@ -6632,18 +6873,24 @@ fn next_non_comment_index(tokens: &[SqlToken], start: usize) -> usize {
 
 fn dedup_columns_case_insensitive(columns: &mut Vec<String>) {
     let mut seen = HashSet::new();
-    columns.retain(|column| seen.insert(column.to_ascii_uppercase()));
+    columns.retain(|column| seen.insert(column_lookup_key(column)));
 }
 
 fn remove_columns_case_insensitive(columns: &mut Vec<String>, remove: &[String]) {
     if columns.is_empty() || remove.is_empty() {
         return;
     }
-    let remove_set: HashSet<String> = remove
-        .iter()
-        .map(|name| name.to_ascii_uppercase())
-        .collect();
-    columns.retain(|column| !remove_set.contains(&column.to_ascii_uppercase()));
+    let remove_set: HashSet<String> = remove.iter().map(|name| column_lookup_key(name)).collect();
+    columns.retain(|column| !remove_set.contains(&column_lookup_key(column)));
+}
+
+fn column_lookup_key(column: &str) -> String {
+    let trimmed = column.trim();
+    if is_quoted_identifier(trimmed) {
+        strip_identifier_quotes(trimmed).to_ascii_uppercase()
+    } else {
+        column.to_ascii_uppercase()
+    }
 }
 
 fn resolve_table_function_column_name(item_tokens: &[&SqlToken]) -> Option<String> {
@@ -6661,7 +6908,7 @@ fn resolve_table_function_column_name(item_tokens: &[&SqlToken]) -> Option<Strin
         return None;
     }
 
-    Some(strip_identifier_quotes(first_word))
+    Some(output_identifier_suggestion(first_word))
 }
 
 fn is_table_function_item_leading_keyword(word: &str) -> bool {

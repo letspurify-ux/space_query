@@ -267,6 +267,16 @@ fn collect_virtual_columns_from_relations(
         collect_virtual_columns_from_ctes(deep_ctx, data, sender, connection);
 
     for subq in &deep_ctx.subqueries {
+        if let Some(columns) =
+            SqlEditorWidget::explicit_subquery_columns_for_completion(deep_ctx, subq)
+        {
+            SqlEditorWidget::insert_virtual_table_columns(
+                &mut virtual_table_columns,
+                &subq.alias,
+                columns,
+            );
+            continue;
+        }
         let body_tokens = intellisense_context::token_range_slice(
             deep_ctx.statement_tokens.as_ref(),
             subq.body_range,
@@ -3757,6 +3767,74 @@ fn request_table_columns_does_not_fallback_when_dot_is_inside_quoted_identifier(
 }
 
 #[test]
+fn request_table_columns_does_not_treat_quoted_dotted_identifier_as_schema_member() {
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    {
+        let mut guard = lock_or_recover(&data);
+        guard.set_relation_members_for_qualifier("A", vec!["B".to_string()]);
+    }
+
+    let (sender, receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let _conn_guard = connection.lock().ok();
+
+    SqlEditorWidget::request_table_columns("\"A.B\"", &data, &sender, &connection);
+
+    let update = receiver.try_recv();
+    assert!(
+        update.is_err(),
+        "quoted identifier with embedded dot should not be resolved as schema.member"
+    );
+}
+
+#[test]
+fn resolve_table_column_load_key_does_not_treat_quoted_dotted_identifier_as_schema_member() {
+    let mut data = IntellisenseData::new();
+    data.set_relation_members_for_qualifier("A", vec!["B".to_string()]);
+
+    let key = SqlEditorWidget::resolve_table_column_load_key(&data, r#""A.B""#);
+
+    assert_eq!(key, None);
+}
+
+#[test]
+fn resolve_table_column_load_key_keeps_exact_known_quoted_dotted_relation() {
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["A.B".to_string()];
+    data.rebuild_indices();
+
+    let key = SqlEditorWidget::resolve_table_column_load_key(&data, r#""A.B""#);
+
+    assert_eq!(key.as_deref(), Some("A.B"));
+}
+
+#[test]
+fn resolve_table_column_load_key_uses_quote_aware_qualified_segment_boundary() {
+    let mut data = IntellisenseData::new();
+    data.set_relation_members_for_qualifier("SCHEMA", vec!["TABLE.NAME".to_string()]);
+
+    let key = SqlEditorWidget::resolve_table_column_load_key(
+        &data,
+        r#""SCHEMA"."TABLE.NAME""#,
+    );
+
+    assert_eq!(key.as_deref(), Some("SCHEMA.TABLE.NAME"));
+}
+
+#[test]
+fn resolve_table_column_load_key_does_not_split_quoted_table_segment_for_qualifier() {
+    let mut data = IntellisenseData::new();
+    data.set_relation_members_for_qualifier("SCHEMA.TABLE", vec!["NAME".to_string()]);
+
+    let key = SqlEditorWidget::resolve_table_column_load_key(
+        &data,
+        r#""SCHEMA"."TABLE.NAME""#,
+    );
+
+    assert_eq!(key, None);
+}
+
+#[test]
 fn request_table_columns_does_not_fallback_when_dot_is_inside_backtick_quoted_identifier() {
     let data = Arc::new(Mutex::new(IntellisenseData::new()));
     {
@@ -3891,6 +3969,32 @@ fn collect_context_name_suggestions_include_exact_alias_prefix_match() {
 }
 
 #[test]
+fn collect_context_name_suggestions_match_quoted_cte_by_unquoted_prefix() {
+    let full = SqlEditorWidget::tokenize_sql(
+        r#"WITH "Recent Emp" AS (SELECT empno FROM emp) SELECT  FROM "Recent Emp""#,
+    );
+    let ctx = intellisense_context::analyze_cursor_context(&full, full.len());
+
+    let suggestions =
+        SqlEditorWidget::collect_context_name_suggestions("Recent", &ctx, SqlContext::ColumnName);
+
+    assert_eq!(suggestions, vec![r#""Recent Emp""#.to_string()]);
+}
+
+#[test]
+fn collect_context_name_suggestions_match_backtick_cte_by_unquoted_prefix() {
+    let full = SqlEditorWidget::tokenize_sql(
+        "WITH `Recent Emp` AS (SELECT empno FROM emp) SELECT  FROM `Recent Emp`",
+    );
+    let ctx = intellisense_context::analyze_cursor_context(&full, full.len());
+
+    let suggestions =
+        SqlEditorWidget::collect_context_name_suggestions("Recent", &ctx, SqlContext::ColumnName);
+
+    assert_eq!(suggestions, vec!["`Recent Emp`".to_string()]);
+}
+
+#[test]
 fn collect_context_name_suggestions_in_table_context_keep_only_ctes() {
     let script = "WITH recent_emp AS (SELECT empno FROM emp)\nSELECT *\nFROM emp e\nCROSS APPLY (SELECT deptno FROM dept) sub\nJOIN __CODEX_CURSOR__";
     let (_statement, _cursor, deep_ctx) = analyze_full_script_marker(script);
@@ -3934,6 +4038,36 @@ fn collect_clause_wildcard_suggestions_for_select_list_include_star_and_scoped_r
     assert_has_case_insensitive(&suggestions, "e.*");
     assert_has_case_insensitive(&suggestions, "recent_emp.*");
     assert_has_case_insensitive(&suggestions, "sub.*");
+}
+
+#[test]
+fn collect_clause_wildcard_suggestions_match_quoted_alias_by_unquoted_prefix() {
+    let deep_ctx = analyze_inline_cursor_sql(r#"SELECT | FROM emp "Recent Emp""#);
+
+    assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::SelectList);
+
+    let suggestions = SqlEditorWidget::collect_clause_wildcard_suggestions(
+        "Recent",
+        None,
+        &deep_ctx,
+    );
+
+    assert_eq!(suggestions, vec![r#""Recent Emp".*"#.to_string()]);
+}
+
+#[test]
+fn collect_clause_wildcard_suggestions_match_backtick_alias_by_unquoted_prefix() {
+    let deep_ctx = analyze_inline_cursor_sql("SELECT | FROM emp `Recent Emp`");
+
+    assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::SelectList);
+
+    let suggestions = SqlEditorWidget::collect_clause_wildcard_suggestions(
+        "Recent",
+        None,
+        &deep_ctx,
+    );
+
+    assert_eq!(suggestions, vec![r#""Recent Emp".*"#.to_string()]);
 }
 
 #[test]
@@ -4091,6 +4225,32 @@ fn qualified_condition_comparison_suggestions_are_empty_without_other_scope() {
 }
 
 #[test]
+fn qualified_condition_comparison_suggestions_skip_self_when_qualifier_is_quoted_alias() {
+    let deep_ctx = analyze_inline_cursor_sql(
+        r#"SELECT * FROM tb1 "Dept Alias" JOIN tb2 b ON "Dept Alias".|"#,
+    );
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["tb1".to_string(), "tb2".to_string()];
+    data.rebuild_indices();
+    data.set_columns_for_table("tb1", vec!["deptno".to_string()]);
+    data.set_columns_for_table("tb2", vec!["deptno".to_string()]);
+
+    let suggestions = SqlEditorWidget::collect_qualified_condition_comparison_suggestions(
+        &data,
+        "",
+        r#""Dept Alias""#,
+        &deep_ctx,
+    );
+
+    assert_eq!(
+        suggestions,
+        vec![r#""Dept Alias".deptno = b.deptno"#.to_string()],
+        "quoted alias qualifier should not compare a table with itself: {:?}",
+        suggestions
+    );
+}
+
+#[test]
 fn qualified_condition_comparison_suggestions_are_empty_outside_predicate_clause() {
     let deep_ctx = analyze_inline_cursor_sql("SELECT a.| FROM tb1 a JOIN tb2 b ON a.id = b.id");
     let mut data = IntellisenseData::new();
@@ -4126,6 +4286,60 @@ fn qualified_condition_comparison_suggestions_quote_column_identifiers_when_need
     assert_eq!(
         suggestions,
         vec!["a.\"Order Id\" = b.\"Order Id\"".to_string()],
+        "suggestions: {:?}",
+        suggestions
+    );
+}
+
+#[test]
+fn qualified_condition_comparison_suggestions_match_quoted_display_columns_by_unquoted_prefix() {
+    let deep_ctx = analyze_inline_cursor_sql("SELECT * FROM tb1 a JOIN tb2 b ON a.Or|");
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["tb1".to_string(), "tb2".to_string()];
+    data.rebuild_indices();
+    data.set_columns_for_table(
+        "tb1",
+        vec![r#""Order Id""#.to_string(), r#""Only A""#.to_string()],
+    );
+    data.set_columns_for_table(
+        "tb2",
+        vec![r#""Order Id""#.to_string(), r#""Only B""#.to_string()],
+    );
+
+    let suggestions = SqlEditorWidget::collect_qualified_condition_comparison_suggestions(
+        &data, "Or", "a", &deep_ctx,
+    );
+
+    assert_eq!(
+        suggestions,
+        vec![r#"a."Order Id" = b."Order Id""#.to_string()],
+        "suggestions: {:?}",
+        suggestions
+    );
+}
+
+#[test]
+fn qualified_condition_comparison_suggestions_preserve_backtick_display_columns() {
+    let deep_ctx = analyze_inline_cursor_sql("SELECT * FROM tb1 a JOIN tb2 b ON a.Or|");
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["tb1".to_string(), "tb2".to_string()];
+    data.rebuild_indices();
+    data.set_columns_for_table(
+        "tb1",
+        vec!["`Order Id`".to_string(), "`Only A`".to_string()],
+    );
+    data.set_columns_for_table(
+        "tb2",
+        vec!["`Order Id`".to_string(), "`Only B`".to_string()],
+    );
+
+    let suggestions = SqlEditorWidget::collect_qualified_condition_comparison_suggestions(
+        &data, "Or", "a", &deep_ctx,
+    );
+
+    assert_eq!(
+        suggestions,
+        vec!["a.`Order Id` = b.`Order Id`".to_string()],
         "suggestions: {:?}",
         suggestions
     );
@@ -4456,6 +4670,17 @@ fn merge_suggestions_with_context_aliases_prioritizes_context_items_when_request
 }
 
 #[test]
+fn merge_suggestions_with_context_aliases_dedups_quoted_identifier_equivalents() {
+    let merged = SqlEditorWidget::merge_suggestions_with_context_aliases(
+        vec![r#""Recent Emp""#.to_string(), "DEPTNO".to_string()],
+        vec!["Recent Emp".to_string(), "deptno".to_string()],
+        true,
+    );
+
+    assert_eq!(merged, vec![r#""Recent Emp""#.to_string(), "DEPTNO".to_string()]);
+}
+
+#[test]
 fn merge_suggestions_with_context_aliases_limits_to_max_suggestions() {
     let base: Vec<String> = (0..MAX_MERGED_SUGGESTIONS)
         .map(|i| format!("BASE_{:02}", i))
@@ -4479,6 +4704,20 @@ fn merge_suggestions_with_context_aliases_respects_max_without_aliases() {
     let merged = SqlEditorWidget::merge_suggestions_with_context_aliases(base, vec![], false);
 
     assert_eq!(merged.len(), MAX_MERGED_SUGGESTIONS);
+}
+
+#[test]
+fn dedup_column_names_case_insensitive_dedups_quoted_identifier_equivalents() {
+    let mut columns = vec![
+        r#""Dept No""#.to_string(),
+        "Dept No".to_string(),
+        "`Dept No`".to_string(),
+        "ENAME".to_string(),
+    ];
+
+    SqlEditorWidget::dedup_column_names_case_insensitive(&mut columns);
+
+    assert_eq!(columns, vec![r#""Dept No""#.to_string(), "ENAME".to_string()]);
 }
 
 #[test]
@@ -6790,6 +7029,16 @@ fn local_symbol_suggestions_merge_session_binds_without_duplicates() {
 }
 
 #[test]
+fn prepend_local_symbol_suggestions_dedups_quoted_identifier_equivalents() {
+    let merged = SqlEditorWidget::prepend_local_symbol_suggestions(
+        vec!["v total".to_string(), "ENAME".to_string()],
+        vec![r#""v total""#.to_string(), "ename".to_string()],
+    );
+
+    assert_eq!(merged, vec![r#""v total""#.to_string(), "ename".to_string()]);
+}
+
+#[test]
 fn large_routine_cache_analysis_keeps_far_declarations_visible() {
     let mut sql = String::from("CREATE OR REPLACE PROCEDURE demo_proc IS\n");
     sql.push_str("    v_far NUMBER := 1;\n");
@@ -6836,6 +7085,7 @@ FROM oqt_t_xml t,
        PASSING t.payload
        COLUMNS
          deptno NUMBER       PATH '@deptno',
+         "Dept No" NUMBER    PATH '@deptno_text',
          name   VARCHAR2(30) PATH 'name/text()',
          loc    VARCHAR2(30) PATH 'loc/text()'
      ) x
@@ -6895,6 +7145,11 @@ ORDER BY x.deptno
         suggestions
     );
     assert!(
+        suggestions.iter().any(|c| c == r#""Dept No""#),
+        "expected quoted Dept No suggestion, got: {:?}",
+        suggestions
+    );
+    assert!(
         suggestions.iter().any(|c| c.eq_ignore_ascii_case("name")),
         "expected name suggestion, got: {:?}",
         suggestions
@@ -6917,6 +7172,7 @@ CROSS APPLY OPENJSON(
   '$.items'
 ) WITH (
   item_id int '$.id',
+  "Item Id" int '$.itemId',
   item_nm nvarchar(100) '$.name',
   item_qty int '$.qty'
 ) oj
@@ -6975,6 +7231,11 @@ ORDER BY oj.item_id
             .iter()
             .any(|c| c.eq_ignore_ascii_case("item_id")),
         "expected item_id suggestion, got: {:?}",
+        suggestions
+    );
+    assert!(
+        suggestions.iter().any(|c| c == r#""Item Id""#),
+        "expected quoted Item Id suggestion, got: {:?}",
         suggestions
     );
     assert!(
@@ -7152,6 +7413,88 @@ PIVOT (SUM(sal) FOR job IN ('CLERK' AS clerk_sal)) p
 }
 
 #[test]
+fn pivot_clause_alias_qualified_column_suggestions_preserve_quoted_generated_columns() {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, sal FROM oqt_t_emp)
+PIVOT (SUM(sal) FOR job IN ('CLERK' AS "Clerk Sales")) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("Clerk", Some(&column_tables));
+
+    assert_eq!(
+        suggestions,
+        vec![r#""Clerk Sales""#.to_string()],
+        "quoted generated pivot alias should remain insertable: {:?}",
+        suggestions
+    );
+}
+
+#[test]
+fn unpivot_alias_qualified_column_suggestions_preserve_quoted_output_columns() {
+    let sql_with_cursor = r#"
+SELECT
+  un.|
+FROM sales_half
+UNPIVOT (("sales amount") FOR "quarter tag" IN (h1_sales AS 'H1')) un
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("un"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    assert!(
+        suggestions.iter().any(|column| column == r#""sales amount""#),
+        "quoted UNPIVOT measure should remain insertable: {:?}",
+        suggestions
+    );
+    assert!(
+        suggestions.iter().any(|column| column == r#""quarter tag""#),
+        "quoted UNPIVOT FOR column should remain insertable: {:?}",
+        suggestions
+    );
+}
+
+#[test]
 fn match_recognize_alias_qualified_column_suggestions_include_generated_columns() {
     let sql_with_cursor = r#"
 SELECT
@@ -7193,6 +7536,50 @@ MATCH_RECOGNIZE (
             suggestions
                 .iter()
                 .any(|column| column.eq_ignore_ascii_case(expected)),
+            "expected `{expected}` in qualified MATCH_RECOGNIZE suggestions, got: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn match_recognize_alias_qualified_column_suggestions_preserve_quoted_pattern_variables() {
+    let sql_with_cursor = r#"
+SELECT
+  mr.|
+FROM oqt_t_emp
+MATCH_RECOGNIZE (
+  PATTERN ("start row" "end row"+)
+  SUBSET "row group" = ("start row", "end row")
+  DEFINE
+    "end row" AS "end row".sal > PREV("end row".sal)
+) mr
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("mr"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+    for expected in [r#""start row""#, r#""end row""#, r#""row group""#] {
+        assert!(
+            suggestions.iter().any(|column| column == expected),
             "expected `{expected}` in qualified MATCH_RECOGNIZE suggestions, got: {:?}",
             suggestions
         );
@@ -7568,6 +7955,31 @@ fn classify_intellisense_context_treats_with_cte_column_list_as_column_context()
 }
 
 #[test]
+fn classify_intellisense_context_treats_derived_alias_column_list_as_column_context() {
+    let sql_with_cursor = "SELECT * FROM (SELECT empno, ename FROM oqt_t_emp) d(|)";
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+
+    let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    assert_eq!(
+        deep_ctx.phase,
+        intellisense_context::SqlPhase::DerivedAliasColumnList
+    );
+
+    let context = SqlEditorWidget::classify_intellisense_context(
+        &deep_ctx,
+        deep_ctx.statement_tokens.as_ref(),
+    );
+    assert_eq!(context, SqlContext::ColumnName);
+}
+
+#[test]
 fn classify_intellisense_context_treats_with_xmlnamespaces_clause_as_general_context() {
     let sql_with_cursor = "WITH XMLNAMESPACES (DEFAULT | 'urn:emp') SELECT value FROM xml_source";
     let cursor = sql_with_cursor
@@ -7733,10 +8145,10 @@ WITH md AS (
     )
     MODEL
       DIMENSION BY (deptno)
-      MEASURES (sum_sal, 0 AS avg_sal_calc, 0 AS sum_plus_100)
+      MEASURES (sum_sal, 0 AS avg_sal_calc, 0 AS "Avg Sal")
       RULES (
         avg_sal_calc[ANY] = sum_sal[CV()] / 2,
-        sum_plus_100[ANY] = sum_sal[CV()] + 100
+        "Avg Sal"[ANY] = sum_sal[CV()] + 100
       )
 )
 SELECT md.| FROM md
@@ -7770,9 +8182,14 @@ SELECT md.| FROM md
         &connection,
     );
 
-    for expected in ["avg_sal_calc", "sum_plus_100"] {
+    for expected in ["avg_sal_calc"] {
         assert_has_case_insensitive(&columns, expected);
     }
+    assert!(
+        columns.iter().any(|column| column == r#""Avg Sal""#),
+        "expected quoted MODEL measure alias, got: {:?}",
+        columns
+    );
 }
 
 #[test]
@@ -7822,6 +8239,62 @@ SELECT t.| FROM t
     assert_has_case_insensitive(&columns, "n");
     assert_has_case_insensitive(&columns, "ord_seq");
     assert_has_case_insensitive(&columns, "is_cycle");
+}
+
+#[test]
+fn cte_virtual_columns_preserve_quoted_recursive_search_and_cycle_generated_columns() {
+    let sql_with_cursor = r#"
+WITH t(n) AS (
+    SELECT 1 AS n
+    FROM dual
+    UNION ALL
+    SELECT n + 1
+    FROM t
+    WHERE n < 3
+)
+SEARCH DEPTH FIRST BY n SET "ord seq"
+CYCLE n SET "is cycle" TO 'Y' DEFAULT 'N'
+SELECT t.| FROM t
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+
+    let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let cte = deep_ctx
+        .ctes
+        .iter()
+        .find(|cte| cte.name.eq_ignore_ascii_case("t"))
+        .expect("expected CTE t");
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let (columns, _) = SqlEditorWidget::collect_cte_virtual_columns_for_completion(
+        &deep_ctx,
+        cte,
+        &HashMap::new(),
+        &data,
+        &sender,
+        &connection,
+    );
+
+    assert!(
+        columns.iter().any(|column| column == r#""ord seq""#),
+        "quoted SEARCH generated column should remain insertable: {:?}",
+        columns
+    );
+    assert!(
+        columns.iter().any(|column| column == r#""is cycle""#),
+        "quoted CYCLE generated column should remain insertable: {:?}",
+        columns
+    );
 }
 
 #[test]
@@ -8068,6 +8541,28 @@ fn merge_derived_columns_includes_exact_prefix_match() {
     );
 
     assert_has_case_insensitive(&merged, "start_name");
+}
+
+#[test]
+fn merge_derived_columns_matches_quoted_alias_by_unquoted_prefix() {
+    let merged = SqlEditorWidget::merge_suggestions_with_derived_columns(
+        vec!["empno".to_string()],
+        "Order",
+        vec![r#""Order Id""#.to_string(), r#""Other Alias""#.to_string()],
+    );
+
+    assert_eq!(merged, vec!["empno".to_string(), r#""Order Id""#.to_string()]);
+}
+
+#[test]
+fn merge_derived_columns_matches_backtick_alias_by_unquoted_prefix() {
+    let merged = SqlEditorWidget::merge_suggestions_with_derived_columns(
+        vec!["empno".to_string()],
+        "Order",
+        vec!["`Order Id`".to_string(), "`Other Alias`".to_string()],
+    );
+
+    assert_eq!(merged, vec!["empno".to_string(), "`Order Id`".to_string()]);
 }
 
 #[test]
@@ -8363,6 +8858,220 @@ WHEN MATCHED THEN UPDATE SET t.val = src.val
     for expected in ["source_id", "val", "updated_at"] {
         assert_has_case_insensitive(&suggestions, expected);
     }
+}
+
+#[test]
+fn derived_table_alias_column_list_overrides_projection_columns_for_completion() {
+    let sql_with_cursor = r#"
+SELECT d.|
+FROM (
+  SELECT empno, ename
+  FROM oqt_t_emp
+) d(id_alias, "Display Name")
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+
+    let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("d"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    assert_has_case_insensitive(&suggestions, "id_alias");
+    assert!(
+        suggestions.iter().any(|column| column == r#""Display Name""#),
+        "expected quoted alias-list column, got: {:?}",
+        suggestions
+    );
+    assert!(
+        !suggestions
+            .iter()
+            .any(|column| column.eq_ignore_ascii_case("empno")),
+        "projection column should be replaced by alias-list columns: {:?}",
+        suggestions
+    );
+}
+
+#[test]
+fn derived_table_alias_column_list_completion_prefers_projection_columns_while_editing_list() {
+    let sql_with_cursor = r#"
+SELECT *
+FROM (
+  SELECT empno, ename
+  FROM oqt_t_emp
+) d(id_alias, |)
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+
+    let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    assert_has_case_insensitive(&suggestions, "empno");
+    assert_has_case_insensitive(&suggestions, "ename");
+    assert!(
+        !suggestions
+            .iter()
+            .any(|column| column.eq_ignore_ascii_case("id_alias")),
+        "alias-list completion should prefer body projection while editing: {:?}",
+        suggestions
+    );
+}
+
+#[test]
+fn table_function_alias_column_list_provides_virtual_columns_for_completion() {
+    let sql_with_cursor = r#"
+SELECT r.|
+FROM TABLE(get_rows()) r(row_id, "Row Value")
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+
+    let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("r"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    assert_has_case_insensitive(&suggestions, "row_id");
+    assert!(
+        suggestions.iter().any(|column| column == r#""Row Value""#),
+        "expected quoted table-function alias-list column, got: {:?}",
+        suggestions
+    );
+}
+
+#[test]
+fn xmltable_alias_column_list_completion_prefers_columns_clause_while_editing_list() {
+    let sql_with_cursor = r#"
+SELECT *
+FROM XMLTABLE(
+  '/root/dept'
+  COLUMNS
+    deptno NUMBER PATH '@deptno',
+    "Dept No" NUMBER PATH '@deptno_text'
+) x(alias_deptno, |)
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+
+    let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    assert_has_case_insensitive(&suggestions, "deptno");
+    assert!(
+        suggestions.iter().any(|column| column == r#""Dept No""#),
+        "expected quoted XMLTABLE output column while editing alias list, got: {:?}",
+        suggestions
+    );
+    assert!(
+        !suggestions
+            .iter()
+            .any(|column| column.eq_ignore_ascii_case("alias_deptno")),
+        "alias-list completion should prefer XMLTABLE output columns while editing: {:?}",
+        suggestions
+    );
+}
+
+#[test]
+fn openjson_alias_column_list_completion_prefers_with_clause_while_editing_list() {
+    let sql_with_cursor = r#"
+SELECT *
+FROM orders o
+CROSS APPLY OPENJSON(o.payload) WITH (
+  item_id int '$.id',
+  "Item Id" int '$.itemId'
+) oj(alias_item_id, |)
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+
+    let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    assert_has_case_insensitive(&suggestions, "item_id");
+    assert!(
+        suggestions.iter().any(|column| column == r#""Item Id""#),
+        "expected quoted OPENJSON output column while editing alias list, got: {:?}",
+        suggestions
+    );
+    assert!(
+        !suggestions
+            .iter()
+            .any(|column| column.eq_ignore_ascii_case("alias_item_id")),
+        "alias-list completion should prefer OPENJSON output columns while editing: {:?}",
+        suggestions
+    );
 }
 
 #[test]
@@ -9326,6 +10035,66 @@ fn collect_common_column_suggestions_include_exact_prefix_match() {
 }
 
 #[test]
+fn collect_common_column_suggestions_match_quoted_columns_by_unquoted_prefix() {
+    let mut data = IntellisenseData::new();
+    data.set_columns_for_table(
+        "EMPLOYEES",
+        vec![r#""Dept No""#.to_string(), r#""Emp No""#.to_string()],
+    );
+    data.set_columns_for_table(
+        "DEPARTMENTS",
+        vec![r#""Dept No""#.to_string(), r#""Dept Name""#.to_string()],
+    );
+
+    let suggestions = SqlEditorWidget::collect_common_column_suggestions(
+        "Dept",
+        &["EMPLOYEES".to_string(), "DEPARTMENTS".to_string()],
+        &data,
+    );
+
+    assert_eq!(suggestions, vec![r#""Dept No""#.to_string()]);
+}
+
+#[test]
+fn collect_common_column_suggestions_match_backtick_columns_by_unquoted_prefix() {
+    let mut data = IntellisenseData::new();
+    data.set_columns_for_table(
+        "EMPLOYEES",
+        vec!["`Dept No`".to_string(), "`Emp No`".to_string()],
+    );
+    data.set_columns_for_table(
+        "DEPARTMENTS",
+        vec!["`Dept No`".to_string(), "`Dept Name`".to_string()],
+    );
+
+    let suggestions = SqlEditorWidget::collect_common_column_suggestions(
+        "Dept",
+        &["EMPLOYEES".to_string(), "DEPARTMENTS".to_string()],
+        &data,
+    );
+
+    assert_eq!(suggestions, vec!["`Dept No`".to_string()]);
+}
+
+#[test]
+fn collect_common_column_suggestions_dedups_quote_equivalent_columns_after_intersection() {
+    let mut data = IntellisenseData::new();
+    data.set_columns_for_table(
+        "EMPLOYEES",
+        vec![r#""Dept No""#.to_string(), "`Dept No`".to_string()],
+    );
+    data.set_columns_for_table("DEPARTMENTS", vec!["`Dept No`".to_string()]);
+
+    let suggestions = SqlEditorWidget::collect_common_column_suggestions(
+        "Dept",
+        &["EMPLOYEES".to_string(), "DEPARTMENTS".to_string()],
+        &data,
+    );
+
+    assert_eq!(suggestions, vec![r#""Dept No""#.to_string()]);
+}
+
+#[test]
 fn resolve_column_tables_for_cte_explicit_column_list_prefers_current_cte() {
     let sql_with_cursor = "WITH r (|) AS (SELECT node_id FROM oqt_t_tree) SELECT * FROM r";
     let cursor = sql_with_cursor
@@ -9410,6 +10179,25 @@ fn resolve_qualified_completion_mode_prefers_relation_columns_for_visible_alias(
 }
 
 #[test]
+fn resolve_qualified_completion_mode_matches_quoted_visible_alias() {
+    let deep_ctx = analyze_inline_cursor_sql(r#"SELECT "Dept Alias".| FROM emp "Dept Alias""#);
+    let mut data = IntellisenseData::new();
+    data.set_members_for_qualifier(
+        r#""Dept Alias""#,
+        vec!["RUN_JOB".to_string()],
+    );
+
+    let mode = SqlEditorWidget::resolve_qualified_completion_mode(
+        r#""Dept Alias""#,
+        SqlContext::ColumnOrAll,
+        &deep_ctx,
+        &data,
+    );
+
+    assert_eq!(mode, Some(QualifiedCompletionMode::RelationColumns));
+}
+
+#[test]
 fn resolve_qualified_completion_mode_uses_schema_relation_members_in_table_context() {
     let deep_ctx = analyze_inline_cursor_sql("SELECT * FROM scott.|");
     let mut data = IntellisenseData::new();
@@ -9420,6 +10208,25 @@ fn resolve_qualified_completion_mode_uses_schema_relation_members_in_table_conte
 
     let mode =
         SqlEditorWidget::resolve_qualified_completion_mode("scott", SqlContext::TableName, &deep_ctx, &data);
+
+    assert_eq!(mode, Some(QualifiedCompletionMode::RelationMembers));
+}
+
+#[test]
+fn resolve_qualified_completion_mode_uses_quoted_schema_relation_members() {
+    let deep_ctx = analyze_inline_cursor_sql(r#"SELECT * FROM "SCOTT".|"#);
+    let mut data = IntellisenseData::new();
+    data.set_relation_members_for_qualifier(
+        "SCOTT",
+        vec!["EMP".to_string(), "DEPT".to_string()],
+    );
+
+    let mode = SqlEditorWidget::resolve_qualified_completion_mode(
+        r#""SCOTT""#,
+        SqlContext::TableName,
+        &deep_ctx,
+        &data,
+    );
 
     assert_eq!(mode, Some(QualifiedCompletionMode::RelationMembers));
 }
@@ -10013,6 +10820,38 @@ fn completion_insert_text_handles_quoted_multi_part_left_qualifier() {
 }
 
 #[test]
+fn completion_insert_text_ignores_equals_inside_quoted_column_name() {
+    assert_eq!(
+        SqlEditorWidget::completion_insert_text(r#"a."A = B" = b."A = B""#),
+        r#""A = B" = b."A = B""#
+    );
+}
+
+#[test]
+fn completion_insert_text_handles_backtick_quoted_condition_comparison() {
+    assert_eq!(
+        SqlEditorWidget::completion_insert_text("a.`A = B` = b.`A = B`"),
+        "`A = B` = b.`A = B`"
+    );
+}
+
+#[test]
+fn completion_insert_text_does_not_treat_named_argument_arrow_as_condition_comparison() {
+    assert_eq!(
+        SqlEditorWidget::completion_insert_text("pkg.proc(arg => value)"),
+        "pkg.proc(arg => value)"
+    );
+}
+
+#[test]
+fn completion_insert_text_does_not_treat_unspaced_equals_as_condition_comparison() {
+    assert_eq!(
+        SqlEditorWidget::completion_insert_text("a.abc=b.abc"),
+        "a.abc=b.abc"
+    );
+}
+
+#[test]
 fn completion_replacement_range_extends_zero_length_range_over_forward_identifier() {
     let sql_with_cursor = "SELECT * FROM tb1 a JOIN tb2 b ON a.|a";
     let cursor = sql_with_cursor
@@ -10094,6 +10933,56 @@ fn build_column_descriptions_formats_type_pk_nn_and_fk() {
 }
 
 #[test]
+fn build_column_descriptions_match_quoted_column_metadata_and_fk() {
+    use crate::ui::intellisense::{ColumnMeta, ForeignKeyMeta};
+
+    let mut data = IntellisenseData::new();
+    data.set_columns_for_table(
+        "EMP",
+        vec![r#""Dept No""#.to_string(), r#""Emp Name""#.to_string()],
+    );
+
+    let mut meta = HashMap::new();
+    meta.insert(
+        r#""Dept No""#.to_string(),
+        ColumnMeta {
+            type_display: "NUMBER".to_string(),
+            nullable: false,
+            is_primary_key: false,
+        },
+    );
+    meta.insert(
+        r#""Emp Name""#.to_string(),
+        ColumnMeta {
+            type_display: "VARCHAR2(50)".to_string(),
+            nullable: true,
+            is_primary_key: false,
+        },
+    );
+    data.set_column_meta_for_table("EMP", meta);
+    data.set_foreign_keys_for_table(
+        "EMP",
+        vec![ForeignKeyMeta {
+            columns: vec![r#""Dept No""#.to_string()],
+            ref_table: "DEPT".to_string(),
+            ref_columns: vec![r#""Dept No""#.to_string()],
+        }],
+    );
+
+    let descriptions =
+        SqlEditorWidget::build_column_descriptions(&data, &["EMP".to_string()]);
+
+    assert_eq!(
+        descriptions.get("DEPT NO").map(String::as_str),
+        Some("NUMBER  NN  FK\u{2192}DEPT")
+    );
+    assert_eq!(
+        descriptions.get("EMP NAME").map(String::as_str),
+        Some("VARCHAR2(50)")
+    );
+}
+
+#[test]
 fn build_auto_join_condition_uses_fk_in_either_direction() {
     use crate::ui::intellisense::ForeignKeyMeta;
     use crate::ui::intellisense_context::ScopedTableRef;
@@ -10144,6 +11033,111 @@ fn build_auto_join_condition_uses_fk_in_either_direction() {
     assert_eq!(
         SqlEditorWidget::build_auto_join_condition(&data, &bonus, &[&dept]),
         None
+    );
+}
+
+#[test]
+fn build_auto_join_condition_quotes_columns_that_need_identifier_quotes() {
+    use crate::ui::intellisense::ForeignKeyMeta;
+    use crate::ui::intellisense_context::ScopedTableRef;
+
+    let mut data = IntellisenseData::new();
+    data.set_foreign_keys_for_table(
+        "EMP",
+        vec![ForeignKeyMeta {
+            columns: vec!["Dept No".to_string()],
+            ref_table: "DEPT".to_string(),
+            ref_columns: vec!["Dept No".to_string()],
+        }],
+    );
+
+    let emp = ScopedTableRef {
+        name: "EMP".to_string(),
+        alias: Some("e".to_string()),
+        depth: 0,
+        is_cte: false,
+    };
+    let dept = ScopedTableRef {
+        name: "DEPT".to_string(),
+        alias: Some("Dept Alias".to_string()),
+        depth: 0,
+        is_cte: false,
+    };
+
+    let condition = SqlEditorWidget::build_auto_join_condition(&data, &dept, &[&emp]);
+
+    assert_eq!(
+        condition.as_deref(),
+        Some(r#"e."Dept No" = "Dept Alias"."Dept No""#)
+    );
+}
+
+#[test]
+fn build_auto_join_condition_does_not_match_quoted_dotted_table_by_short_suffix() {
+    use crate::ui::intellisense::ForeignKeyMeta;
+    use crate::ui::intellisense_context::ScopedTableRef;
+
+    let mut data = IntellisenseData::new();
+    data.set_foreign_keys_for_table(
+        "ORDERS",
+        vec![ForeignKeyMeta {
+            columns: vec!["DAILY_ID".to_string()],
+            ref_table: r#""sales.daily""#.to_string(),
+            ref_columns: vec!["ID".to_string()],
+        }],
+    );
+
+    let orders = ScopedTableRef {
+        name: "ORDERS".to_string(),
+        alias: Some("o".to_string()),
+        depth: 0,
+        is_cte: false,
+    };
+    let daily = ScopedTableRef {
+        name: "DAILY".to_string(),
+        alias: Some("d".to_string()),
+        depth: 0,
+        is_cte: false,
+    };
+
+    let condition = SqlEditorWidget::build_auto_join_condition(&data, &orders, &[&daily]);
+
+    assert_eq!(condition, None);
+}
+
+#[test]
+fn build_auto_join_condition_preserves_unaliased_quoted_dotted_table_qualifier() {
+    use crate::ui::intellisense::ForeignKeyMeta;
+    use crate::ui::intellisense_context::ScopedTableRef;
+
+    let mut data = IntellisenseData::new();
+    data.set_foreign_keys_for_table(
+        "ORDERS",
+        vec![ForeignKeyMeta {
+            columns: vec!["DAILY_ID".to_string()],
+            ref_table: r#""sales.daily""#.to_string(),
+            ref_columns: vec!["ID".to_string()],
+        }],
+    );
+
+    let orders = ScopedTableRef {
+        name: "ORDERS".to_string(),
+        alias: Some("o".to_string()),
+        depth: 0,
+        is_cte: false,
+    };
+    let quoted_daily = ScopedTableRef {
+        name: r#""sales.daily""#.to_string(),
+        alias: None,
+        depth: 0,
+        is_cte: false,
+    };
+
+    let condition = SqlEditorWidget::build_auto_join_condition(&data, &orders, &[&quoted_daily]);
+
+    assert_eq!(
+        condition.as_deref(),
+        Some(r#"o.DAILY_ID = "sales.daily".ID"#)
     );
 }
 

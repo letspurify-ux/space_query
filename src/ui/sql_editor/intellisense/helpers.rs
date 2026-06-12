@@ -730,36 +730,73 @@ impl SqlEditorWidget {
     }
 
     fn condition_comparison_completion_suffix(selected: &str) -> Option<String> {
-        let eq_idx = selected.find(" = ")?;
+        let eq_idx = Self::condition_comparison_operator_index(selected)?;
         let left_expr = selected.get(..eq_idx)?;
         let dot_idx = Self::last_unquoted_dot(left_expr)?;
         selected.get(dot_idx + 1..).map(ToString::to_string)
     }
 
-    fn last_unquoted_dot(text: &str) -> Option<usize> {
-        let mut last_dot = None;
+    fn condition_comparison_operator_index(text: &str) -> Option<usize> {
         let mut chars = text.char_indices().peekable();
-        let mut in_quotes = false;
+        let mut active_quote = None;
 
         while let Some((idx, ch)) = chars.next() {
-            match ch {
-                '"' => {
-                    if in_quotes {
-                        if chars.peek().is_some_and(|(_, next)| *next == '"') {
-                            chars.next();
-                        } else {
-                            in_quotes = false;
-                        }
+            if let Some(delimiter) = active_quote {
+                if ch == delimiter {
+                    if chars.peek().is_some_and(|(_, next)| *next == delimiter) {
+                        chars.next();
                     } else {
-                        in_quotes = true;
+                        active_quote = None;
                     }
                 }
-                '.' if !in_quotes => last_dot = Some(idx),
+                continue;
+            }
+
+            match ch {
+                '"' | '`' => active_quote = Some(ch),
+                '=' if Self::is_spaced_condition_operator(text, idx) => return Some(idx),
                 _ => {}
             }
         }
 
-        (!in_quotes).then_some(last_dot).flatten()
+        None
+    }
+
+    fn is_spaced_condition_operator(text: &str, idx: usize) -> bool {
+        text.get(..idx)
+            .and_then(|prefix| prefix.chars().next_back())
+            .is_some_and(char::is_whitespace)
+            && text
+                .get(idx + 1..)
+                .and_then(|suffix| suffix.chars().next())
+                .is_some_and(char::is_whitespace)
+    }
+
+    fn last_unquoted_dot(text: &str) -> Option<usize> {
+        let mut last_dot = None;
+        let mut chars = text.char_indices().peekable();
+        let mut active_quote = None;
+
+        while let Some((idx, ch)) = chars.next() {
+            if let Some(delimiter) = active_quote {
+                if ch == delimiter {
+                    if chars.peek().is_some_and(|(_, next)| *next == delimiter) {
+                        chars.next();
+                    } else {
+                        active_quote = None;
+                    }
+                }
+                continue;
+            }
+
+            match ch {
+                '"' | '`' => active_quote = Some(ch),
+                '.' => last_dot = Some(idx),
+                _ => {}
+            }
+        }
+
+        active_quote.is_none().then_some(last_dot).flatten()
     }
 
     #[cfg(test)]

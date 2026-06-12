@@ -5447,6 +5447,54 @@ fn resolve_all_deduplicates() {
     assert_eq!(result.len(), 1);
 }
 
+#[test]
+fn resolve_all_deduplicates_quoted_identifier_equivalents() {
+    let tables = vec![
+        ScopedTableRef {
+            name: r#""employees""#.to_string(),
+            alias: Some("e".to_string()),
+            depth: 0,
+            is_cte: false,
+        },
+        ScopedTableRef {
+            name: "employees".to_string(),
+            alias: Some("e2".to_string()),
+            depth: 0,
+            is_cte: false,
+        },
+        ScopedTableRef {
+            name: r#""sales.daily""#.to_string(),
+            alias: None,
+            depth: 0,
+            is_cte: false,
+        },
+        ScopedTableRef {
+            name: "sales.daily".to_string(),
+            alias: None,
+            depth: 0,
+            is_cte: false,
+        },
+        ScopedTableRef {
+            name: "daily".to_string(),
+            alias: None,
+            depth: 0,
+            is_cte: false,
+        },
+    ];
+
+    let result = resolve_all_scope_tables(&tables);
+
+    assert_eq!(
+        result,
+        vec![
+            r#""employees""#.to_string(),
+            r#""sales.daily""#.to_string(),
+            "sales.daily".to_string(),
+            "daily".to_string()
+        ]
+    );
+}
+
 // ─── MERGE statement ─────────────────────────────────────────────────────
 
 #[test]
@@ -7131,6 +7179,17 @@ fn extract_oracle_pivot_projection_columns_from_subquery_star_select() {
 }
 
 #[test]
+fn extract_oracle_pivot_projection_removes_quoted_for_and_aggregate_columns() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno AS \"dept no\", job, sal AS \"sales amount\" FROM oqt_t_emp) \
+         PIVOT (SUM(\"sales amount\") FOR \"dept no\" IN (10 AS D10))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["job", "D10"]);
+}
+
+#[test]
 fn extract_oracle_pivot_projection_columns_from_string_literals_without_alias() {
     let tokens = tokenize("SELECT * FROM sales PIVOT (SUM(amount) FOR product IN ('A', 'B', 'C'))");
 
@@ -7181,14 +7240,14 @@ fn extract_oracle_model_generated_columns_from_measures_clause() {
          FROM m \
          MODEL \
            DIMENSION BY (deptno) \
-           MEASURES (sum_sal, cnt, 0 AS avg_sal_calc, 0 AS sum_plus_100) \
+           MEASURES (sum_sal, cnt, 0 AS avg_sal_calc, 0 AS \"Avg Sal\") \
            RULES ( \
              avg_sal_calc[ANY] = ROUND(sum_sal[CV()] / NULLIF(cnt[CV()], 0), 2), \
-             sum_plus_100[ANY] = sum_sal[CV()] + 100 \
+             \"Avg Sal\"[ANY] = sum_sal[CV()] + 100 \
            )",
     );
     let cols = extract_oracle_model_generated_columns(&tokens);
-    assert_eq!(cols, vec!["sum_sal", "cnt", "avg_sal_calc", "sum_plus_100"]);
+    assert_eq!(cols, vec!["sum_sal", "cnt", "avg_sal_calc", r#""Avg Sal""#]);
 }
 
 #[test]
@@ -7209,6 +7268,26 @@ fn extract_recursive_cte_generated_columns_from_search_and_cycle_clauses() {
     let cols =
         extract_recursive_cte_generated_columns(ctx.statement_tokens.as_ref(), cte.body_range.end);
     assert_eq!(cols, vec!["ord_seq", "is_cycle"]);
+}
+
+#[test]
+fn extract_recursive_cte_generated_columns_preserve_quoted_names() {
+    let ctx = analyze(
+        "WITH t(n) AS (SELECT 1 FROM dual UNION ALL SELECT n + 1 FROM t WHERE n < 3) \
+         SEARCH DEPTH FIRST BY n SET \"ord seq\" \
+         CYCLE n SET \"is cycle\" TO 'Y' DEFAULT 'N' \
+         SELECT |* FROM t",
+    );
+
+    let cte = ctx
+        .ctes
+        .iter()
+        .find(|cte| cte.name.eq_ignore_ascii_case("t"))
+        .expect("expected recursive CTE t");
+
+    let cols =
+        extract_recursive_cte_generated_columns(ctx.statement_tokens.as_ref(), cte.body_range.end);
+    assert_eq!(cols, vec![r#""ord seq""#, r#""is cycle""#]);
 }
 
 #[test]
@@ -7253,6 +7332,23 @@ fn extract_match_recognize_generated_columns_keeps_pattern_variables_with_subset
 
     let cols = extract_match_recognize_generated_columns(&tokens);
     assert_eq!(cols, vec!["a", "b", "c", "grp1", "grp2"]);
+}
+
+#[test]
+fn extract_match_recognize_generated_columns_preserve_quoted_pattern_and_subset_variables() {
+    let tokens = tokenize(
+        "SELECT * FROM emp MATCH_RECOGNIZE ( \
+            PATTERN (\"start row\" \"end row\"+) \
+            SUBSET \"row group\" = (\"start row\", \"end row\") \
+            DEFINE \"end row\" AS \"end row\".sal > PREV(\"end row\".sal) \
+        )",
+    );
+
+    let cols = extract_match_recognize_generated_columns(&tokens);
+    assert_eq!(
+        cols,
+        vec![r#""start row""#, r#""end row""#, r#""row group""#]
+    );
 }
 
 #[test]
@@ -7344,7 +7440,7 @@ fn extract_oracle_pivot_projection_with_quoted_generated_alias() {
     );
 
     let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
-    assert_eq!(cols, vec!["Q1 SALES"]);
+    assert_eq!(cols, vec![r#""Q1 SALES""#]);
 }
 
 #[test]
@@ -7363,14 +7459,14 @@ fn extract_oracle_unpivot_projection_with_multi_column_output_and_for_clause() {
 }
 
 #[test]
-fn extract_oracle_unpivot_generated_columns_strip_quotes() {
+fn extract_oracle_unpivot_generated_columns_preserve_quoted_output_identifiers() {
     let tokens = tokenize(
         "SELECT * FROM sales_half \
          UNPIVOT ((\"sales amount\") FOR \"quarter tag\" IN (h1_sales AS 'H1'))",
     );
 
     let cols = extract_oracle_unpivot_generated_columns(&tokens);
-    assert_eq!(cols, vec!["sales amount", "quarter tag"]);
+    assert_eq!(cols, vec![r#""sales amount""#, r#""quarter tag""#]);
 }
 
 // ─── SELECT list column extraction tests ─────────────────────────────────
@@ -7484,11 +7580,12 @@ fn extract_table_function_columns_from_xmltable_columns_clause() {
     let tokens = tokenize(
         "'/root/dept' PASSING t.payload COLUMNS \
          deptno NUMBER PATH '@deptno', \
+         \"Dept No\" NUMBER PATH '@deptno_text', \
          name VARCHAR2(30) PATH 'name/text()', \
          loc VARCHAR2(30) PATH 'loc/text()'",
     );
     let cols = extract_table_function_columns(&tokens);
-    assert_eq!(cols, vec!["deptno", "name", "loc"]);
+    assert_eq!(cols, vec!["deptno", r#""Dept No""#, "name", "loc"]);
 }
 
 #[test]
@@ -8172,6 +8269,7 @@ CROSS APPLY JSON_TABLE(
   '$.items[*]'
   COLUMNS (
     item_id NUMBER PATH '$.id',
+    "Item Id" NUMBER PATH '$.itemId',
     item_nm VARCHAR2(100) PATH '$.name'
   )
 ) jt
@@ -8195,6 +8293,11 @@ CROSS APPLY JSON_TABLE(
         columns
     );
     assert!(
+        columns.iter().any(|col| col == r#""Item Id""#),
+        "expected quoted Item Id from JSON_TABLE COLUMNS clause, got {:?}",
+        columns
+    );
+    assert!(
         columns
             .iter()
             .any(|col| col.eq_ignore_ascii_case("item_nm")),
@@ -8214,6 +8317,7 @@ CROSS APPLY OPENJSON(
   '$.items'
 ) WITH (
   item_id int '$.id',
+  "Item Id" int '$.itemId',
   item_nm nvarchar(100) '$.name'
 ) oj
 "#,
@@ -8234,6 +8338,11 @@ CROSS APPLY OPENJSON(
             .iter()
             .any(|col| col.eq_ignore_ascii_case("item_id")),
         "expected item_id from OPENJSON WITH clause, got {:?}",
+        columns
+    );
+    assert!(
+        columns.iter().any(|col| col == r#""Item Id""#),
+        "expected quoted Item Id from OPENJSON WITH clause, got {:?}",
         columns
     );
     assert!(
