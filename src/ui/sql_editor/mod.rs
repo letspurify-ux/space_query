@@ -3280,6 +3280,11 @@ impl SqlEditorWidget {
                             }
                             UiActionResult::Transaction { action, result } => match result {
                                 Ok(()) => {
+                                    let _ = widget.progress_sender.send(QueryProgress::Message {
+                                        kind: ResultMessageKind::Info,
+                                        lines: vec![action.success_message().to_string()],
+                                    });
+                                    app::awake();
                                     widget.emit_status(action.success_status());
                                 }
                                 Err(err) => {
