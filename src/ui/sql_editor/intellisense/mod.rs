@@ -70,6 +70,7 @@ struct IntellisenseTriggerSnapshot {
     prefix: String,
     word_start: usize,
     qualifier: Option<String>,
+    raw_qualifier: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

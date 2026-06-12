@@ -2118,6 +2118,40 @@ fn qualifier_before_word_supports_multi_part_qualifier_chain_with_backticks() {
 }
 
 #[test]
+fn qualifier_before_word_supports_indexed_record_expression() {
+    let sql_with_cursor = "BEGIN v_emps(1).| := 1; END;";
+    let cursor = sql_with_cursor.find('|').unwrap_or(0);
+    let sql = sql_with_cursor.replace('|', "");
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor);
+
+    assert_eq!(qualifier.as_deref(), Some("v_emps"));
+}
+
+#[test]
+fn qualifier_before_word_supports_indexed_record_expression_with_dotted_string_key() {
+    let sql_with_cursor = "BEGIN v_emps('HOME.WORK').| := 1; END;";
+    let cursor = sql_with_cursor.find('|').unwrap_or(0);
+    let sql = sql_with_cursor.replace('|', "");
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor);
+    let raw_qualifier = SqlEditorWidget::raw_qualifier_before_word_in_text(&sql, cursor);
+
+    assert_eq!(qualifier.as_deref(), Some("v_emps"));
+    assert_eq!(raw_qualifier.as_deref(), Some("v_emps('HOME.WORK')"));
+}
+
+#[test]
+fn qualifier_before_word_supports_quoted_record_field_with_dot() {
+    let sql_with_cursor = r#"BEGIN v_emp."Addr.Info".| := 1; END;"#;
+    let cursor = sql_with_cursor.find('|').unwrap_or(0);
+    let sql = sql_with_cursor.replace('|', "");
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor);
+    let raw_qualifier = SqlEditorWidget::raw_qualifier_before_word_in_text(&sql, cursor);
+
+    assert_eq!(qualifier.as_deref(), Some("v_emp.Addr.Info"));
+    assert_eq!(raw_qualifier.as_deref(), Some(r#"v_emp."Addr.Info""#));
+}
+
+#[test]
 fn raw_qualifier_before_word_preserves_quoted_identifier_text() {
     let sql_with_cursor = r#"SELECT "schema A"."Emp Table"."Column X"| FROM dual"#;
     let cursor = sql_with_cursor.find('|').unwrap_or(0);
@@ -4557,6 +4591,1595 @@ END;"#,
 }
 
 #[test]
+fn local_record_member_suggestions_include_cursor_for_loop_projection_fields() {
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        r#"BEGIN
+    FOR rec IN (
+        SELECT
+            empno,
+            ename AS employee_name,
+            sal + NVL(comm, 0) total_comp
+        FROM emp
+    ) LOOP
+        rec.__CODEX_CURSOR__
+    END LOOP;
+END;"#,
+        "rec",
+        "",
+    )
+    .expect("loop record should be visible inside loop body");
+
+    for expected in ["empno", "employee_name", "total_comp"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_record_member_suggestions_preserve_quoted_cursor_projection_aliases() {
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        r#"BEGIN
+    FOR rec IN (
+        SELECT
+            ename AS "Employee Name",
+            sal AS normal_sal
+        FROM emp
+    ) LOOP
+        rec.__CODEX_CURSOR__
+    END LOOP;
+END;"#,
+        "rec",
+        "",
+    )
+    .expect("cursor FOR loop record should expose quoted projection aliases");
+
+    assert_has_case_insensitive(&suggestions, r#""Employee Name""#);
+    assert_has_case_insensitive(&suggestions, "normal_sal");
+    assert!(
+        !suggestions
+            .iter()
+            .any(|suggestion| suggestion == "Employee Name"),
+        "quoted projection alias should remain insertable: {:?}",
+        suggestions
+    );
+}
+
+#[test]
+fn local_record_member_suggestions_match_quoted_cursor_projection_alias_by_unquoted_prefix() {
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        r#"BEGIN
+    FOR rec IN (
+        SELECT
+            ename AS "Employee Name",
+            sal AS normal_sal
+        FROM emp
+    ) LOOP
+        rec.Emp__CODEX_CURSOR__
+    END LOOP;
+END;"#,
+        "rec",
+        "Emp",
+    )
+    .expect("quoted cursor projection alias should match by unquoted prefix");
+
+    assert_eq!(suggestions, vec![r#""Employee Name""#.to_string()]);
+}
+
+#[test]
+fn local_rowtype_member_suggestions_include_cursor_for_loop_select_star_fields() {
+    let suggestions = SqlEditorWidget::collect_local_rowtype_member_suggestions_for_test(
+        r#"BEGIN
+    FOR rec IN (
+        SELECT *
+        FROM emp
+    ) LOOP
+        rec.__CODEX_CURSOR__
+    END LOOP;
+END;"#,
+        "rec",
+        "",
+        "EMP",
+        &["EMPNO", "ENAME", "SAL"],
+    )
+    .expect("SELECT * loop record should expose loaded table columns");
+
+    for expected in ["EMPNO", "ENAME", "SAL"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_rowtype_member_suggestions_include_cursor_for_loop_qualified_star_fields() {
+    let suggestions = SqlEditorWidget::collect_local_rowtype_member_suggestions_for_test(
+        r#"BEGIN
+    FOR rec IN (
+        SELECT e.*
+        FROM emp e
+    ) LOOP
+        rec.__CODEX_CURSOR__
+    END LOOP;
+END;"#,
+        "rec",
+        "",
+        "EMP",
+        &["EMPNO", "ENAME", "SAL"],
+    )
+    .expect("qualified wildcard loop record should expose source table columns");
+
+    for expected in ["EMPNO", "ENAME", "SAL"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_member_suggestions_merge_cursor_for_loop_mixed_wildcard_fields() {
+    let suggestions = SqlEditorWidget::collect_local_member_suggestions_for_test(
+        r#"BEGIN
+    FOR rec IN (
+        SELECT e.*, sal + NVL(comm, 0) total_comp
+        FROM emp e
+    ) LOOP
+        rec.__CODEX_CURSOR__
+    END LOOP;
+END;"#,
+        "rec",
+        "",
+        "EMP",
+        &["EMPNO", "ENAME", "SAL"],
+    )
+    .expect("cursor FOR loop mixed wildcard record should expose aliases and table columns");
+
+    for expected in ["total_comp", "EMPNO", "ENAME", "SAL"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_rowtype_member_suggestions_include_cursor_for_loop_multiple_wildcard_sources() {
+    let suggestions = SqlEditorWidget::collect_local_rowtype_member_suggestions_for_test(
+        r#"BEGIN
+    FOR rec IN (
+        SELECT e.*, d.*
+        FROM emp e
+        JOIN dept d ON d.deptno = e.deptno
+    ) LOOP
+        rec.__CODEX_CURSOR__
+    END LOOP;
+END;"#,
+        "rec",
+        "",
+        "EMP",
+        &["EMPNO", "ENAME", "DEPTNO"],
+    )
+    .expect("multi-wildcard loop record should preserve rowtype sources");
+
+    for expected in ["EMPNO", "ENAME", "DEPTNO"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_rowtype_member_suggestions_include_second_cursor_for_loop_wildcard_source() {
+    let suggestions = SqlEditorWidget::collect_local_rowtype_member_suggestions_for_test(
+        r#"BEGIN
+    FOR rec IN (
+        SELECT e.*, d.*
+        FROM emp e
+        JOIN dept d ON d.deptno = e.deptno
+    ) LOOP
+        rec.__CODEX_CURSOR__
+    END LOOP;
+END;"#,
+        "rec",
+        "",
+        "DEPT",
+        &["DEPTNO", "DNAME", "LOC"],
+    )
+    .expect("multi-wildcard loop record should preserve the second rowtype source");
+
+    for expected in ["DEPTNO", "DNAME", "LOC"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_rowtype_member_suggestions_include_cursor_for_loop_unqualified_star_join_sources() {
+    let suggestions = SqlEditorWidget::collect_local_rowtype_member_suggestions_for_test(
+        r#"BEGIN
+    FOR rec IN (
+        SELECT *
+        FROM emp e
+        JOIN dept d ON d.deptno = e.deptno
+    ) LOOP
+        rec.__CODEX_CURSOR__
+    END LOOP;
+END;"#,
+        "rec",
+        "",
+        "DEPT",
+        &["DEPTNO", "DNAME", "LOC"],
+    )
+    .expect("SELECT * join loop record should preserve every rowtype source");
+
+    for expected in ["DEPTNO", "DNAME", "LOC"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_record_member_suggestions_filter_cursor_for_loop_projection_prefix() {
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        r#"BEGIN
+    FOR rec IN (
+        SELECT empno, ename AS employee_name, hiredate
+        FROM emp
+    ) LOOP
+        rec.employee___CODEX_CURSOR__
+    END LOOP;
+END;"#,
+        "rec",
+        "employee_",
+    )
+    .expect("loop record should be visible inside loop body");
+
+    assert_eq!(suggestions, vec!["employee_name".to_string()]);
+}
+
+#[test]
+fn local_record_member_suggestions_hide_cursor_for_loop_record_after_loop() {
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        r#"BEGIN
+    FOR rec IN (SELECT empno, ename FROM emp) LOOP
+        NULL;
+    END LOOP;
+
+    rec.__CODEX_CURSOR__
+END;"#,
+        "rec",
+        "",
+    );
+
+    assert!(
+        suggestions.is_none(),
+        "loop record members should not remain visible after END LOOP: {:?}",
+        suggestions
+    );
+}
+
+#[test]
+fn local_record_member_suggestions_include_explicit_cursor_projection_fields() {
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        r#"DECLARE
+    CURSOR c_emp IS
+        SELECT
+            empno,
+            ename AS employee_name,
+            sal + NVL(comm, 0) total_comp
+        FROM emp;
+BEGIN
+    FOR rec IN c_emp LOOP
+        rec.__CODEX_CURSOR__
+    END LOOP;
+END;"#,
+        "rec",
+        "",
+    )
+    .expect("explicit cursor loop record should be visible inside loop body");
+
+    for expected in ["empno", "employee_name", "total_comp"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_record_member_suggestions_include_parameterized_explicit_cursor_fields() {
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        r#"DECLARE
+    CURSOR c_emp(p_deptno NUMBER) IS
+        SELECT
+            empno,
+            ename AS employee_name,
+            sal + NVL(comm, 0) total_comp
+        FROM emp
+        WHERE deptno = p_deptno;
+BEGIN
+    FOR rec IN c_emp(10) LOOP
+        rec.__CODEX_CURSOR__
+    END LOOP;
+END;"#,
+        "rec",
+        "",
+    )
+    .expect("parameterized explicit cursor loop record should expose projection fields");
+
+    for expected in ["empno", "employee_name", "total_comp"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_rowtype_member_suggestions_include_explicit_cursor_select_star_loop_fields() {
+    let suggestions = SqlEditorWidget::collect_local_rowtype_member_suggestions_for_test(
+        r#"DECLARE
+    CURSOR c_emp IS
+        SELECT *
+        FROM emp;
+BEGIN
+    FOR rec IN c_emp LOOP
+        rec.__CODEX_CURSOR__
+    END LOOP;
+END;"#,
+        "rec",
+        "",
+        "EMP",
+        &["EMPNO", "ENAME", "SAL"],
+    )
+    .expect("explicit cursor SELECT * loop record should expose loaded table columns");
+
+    for expected in ["EMPNO", "ENAME", "SAL"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_rowtype_member_suggestions_include_parameterized_explicit_cursor_star_fields() {
+    let suggestions = SqlEditorWidget::collect_local_rowtype_member_suggestions_for_test(
+        r#"DECLARE
+    CURSOR c_emp(p_deptno NUMBER) IS
+        SELECT *
+        FROM emp
+        WHERE deptno = p_deptno;
+BEGIN
+    FOR rec IN c_emp(10) LOOP
+        rec.__CODEX_CURSOR__
+    END LOOP;
+END;"#,
+        "rec",
+        "",
+        "EMP",
+        &["EMPNO", "ENAME", "SAL"],
+    )
+    .expect("parameterized explicit cursor SELECT * loop should expose loaded table columns");
+
+    for expected in ["EMPNO", "ENAME", "SAL"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_rowtype_member_suggestions_include_explicit_cursor_loop_unqualified_star_join_sources() {
+    let suggestions = SqlEditorWidget::collect_local_rowtype_member_suggestions_for_test(
+        r#"DECLARE
+    CURSOR c_join IS
+        SELECT *
+        FROM emp e
+        JOIN dept d ON d.deptno = e.deptno;
+BEGIN
+    FOR rec IN c_join LOOP
+        rec.__CODEX_CURSOR__
+    END LOOP;
+END;"#,
+        "rec",
+        "",
+        "DEPT",
+        &["DEPTNO", "DNAME", "LOC"],
+    )
+    .expect("explicit cursor loop over SELECT * join should preserve every rowtype source");
+
+    for expected in ["DEPTNO", "DNAME", "LOC"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_record_member_suggestions_expand_inline_view_wildcard_projection() {
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        r#"BEGIN
+    FOR rec IN (
+        SELECT *
+        FROM (
+            SELECT empno employee_id, ename employee_name
+            FROM emp
+        ) src
+    ) LOOP
+        rec.__CODEX_CURSOR__
+    END LOOP;
+END;"#,
+        "rec",
+        "",
+    )
+    .expect("inline-view wildcard loop record should expose virtual projection fields");
+
+    for expected in ["employee_id", "employee_name"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_record_member_suggestions_expand_cte_wildcard_projection() {
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        r#"BEGIN
+    FOR rec IN (
+        WITH src AS (
+            SELECT empno employee_id, ename employee_name
+            FROM emp
+        )
+        SELECT *
+        FROM src
+    ) LOOP
+        rec.__CODEX_CURSOR__
+    END LOOP;
+END;"#,
+        "rec",
+        "",
+    )
+    .expect("CTE wildcard loop record should expose virtual projection fields");
+
+    for expected in ["employee_id", "employee_name"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_record_member_suggestions_expand_explicit_cursor_inline_view_wildcard_rowtype() {
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        r#"DECLARE
+    CURSOR c_src IS
+        SELECT *
+        FROM (
+            SELECT empno employee_id, ename employee_name
+            FROM emp
+        ) src;
+    v_src c_src%ROWTYPE;
+BEGIN
+    v_src.__CODEX_CURSOR__
+END;"#,
+        "v_src",
+        "",
+    )
+    .expect("cursor %ROWTYPE over inline-view wildcard should expose virtual projection fields");
+
+    for expected in ["employee_id", "employee_name"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_member_suggestions_merge_virtual_wildcard_and_real_rowtype_source() {
+    let suggestions = SqlEditorWidget::collect_local_member_suggestions_for_test(
+        r#"BEGIN
+    FOR rec IN (
+        SELECT *
+        FROM (
+            SELECT empno employee_id
+            FROM emp
+        ) src
+        JOIN dept d ON d.deptno = src.employee_id
+    ) LOOP
+        rec.__CODEX_CURSOR__
+    END LOOP;
+END;"#,
+        "rec",
+        "",
+        "DEPT",
+        &["DEPTNO", "DNAME", "LOC"],
+    )
+    .expect("virtual wildcard columns should merge with remaining real rowtype sources");
+
+    for expected in ["employee_id", "DEPTNO", "DNAME", "LOC"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_member_suggestions_expand_inline_view_wildcard_rowtype_source() {
+    let suggestions = SqlEditorWidget::collect_local_member_suggestions_for_test(
+        r#"BEGIN
+    FOR rec IN (
+        SELECT *
+        FROM (
+            SELECT e.*, sal + NVL(comm, 0) total_comp
+            FROM emp e
+        ) src
+    ) LOOP
+        rec.__CODEX_CURSOR__
+    END LOOP;
+END;"#,
+        "rec",
+        "",
+        "EMP",
+        &["EMPNO", "ENAME", "SAL"],
+    )
+    .expect("inline-view wildcard should expose explicit fields and propagated rowtype columns");
+
+    for expected in ["total_comp", "EMPNO", "ENAME", "SAL"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_rowtype_member_suggestions_expand_cte_wildcard_rowtype_source() {
+    let suggestions = SqlEditorWidget::collect_local_rowtype_member_suggestions_for_test(
+        r#"BEGIN
+    FOR rec IN (
+        WITH src AS (
+            SELECT *
+            FROM emp
+        )
+        SELECT *
+        FROM src
+    ) LOOP
+        rec.__CODEX_CURSOR__
+    END LOOP;
+END;"#,
+        "rec",
+        "",
+        "EMP",
+        &["EMPNO", "ENAME", "SAL"],
+    )
+    .expect("CTE wildcard should propagate the real rowtype source");
+
+    for expected in ["EMPNO", "ENAME", "SAL"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_record_member_suggestions_expand_chained_cte_wildcard_projection() {
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        r#"BEGIN
+    FOR rec IN (
+        WITH base AS (
+            SELECT empno employee_id, ename employee_name
+            FROM emp
+        ),
+        filtered AS (
+            SELECT *
+            FROM base
+        )
+        SELECT *
+        FROM filtered
+    ) LOOP
+        rec.__CODEX_CURSOR__
+    END LOOP;
+END;"#,
+        "rec",
+        "",
+    )
+    .expect("chained CTE wildcard should expose base virtual projection fields");
+
+    for expected in ["employee_id", "employee_name"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_member_suggestions_expand_chained_cte_wildcard_rowtype_source() {
+    let suggestions = SqlEditorWidget::collect_local_member_suggestions_for_test(
+        r#"BEGIN
+    FOR rec IN (
+        WITH base AS (
+            SELECT e.*, sal + NVL(comm, 0) total_comp
+            FROM emp e
+        ),
+        filtered AS (
+            SELECT *
+            FROM base
+        )
+        SELECT *
+        FROM filtered
+    ) LOOP
+        rec.__CODEX_CURSOR__
+    END LOOP;
+END;"#,
+        "rec",
+        "",
+        "EMP",
+        &["EMPNO", "ENAME", "SAL"],
+    )
+    .expect("chained CTE wildcard should expose virtual fields and propagated table columns");
+
+    for expected in ["total_comp", "EMPNO", "ENAME", "SAL"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_rowtype_member_suggestions_include_explicit_cursor_qualified_star_rowtype_fields() {
+    let suggestions = SqlEditorWidget::collect_local_rowtype_member_suggestions_for_test(
+        r#"DECLARE
+    CURSOR c_emp IS
+        SELECT e.*
+        FROM emp e;
+    v_emp c_emp%ROWTYPE;
+BEGIN
+    v_emp.__CODEX_CURSOR__
+END;"#,
+        "v_emp",
+        "",
+        "EMP",
+        &["EMPNO", "ENAME", "SAL"],
+    )
+    .expect("cursor %ROWTYPE over qualified wildcard should expose loaded source table columns");
+
+    for expected in ["EMPNO", "ENAME", "SAL"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_member_suggestions_merge_explicit_cursor_mixed_wildcard_rowtype_fields() {
+    let suggestions = SqlEditorWidget::collect_local_member_suggestions_for_test(
+        r#"DECLARE
+    CURSOR c_emp IS
+        SELECT e.*, sal + NVL(comm, 0) total_comp
+        FROM emp e;
+    v_emp c_emp%ROWTYPE;
+BEGIN
+    v_emp.__CODEX_CURSOR__
+END;"#,
+        "v_emp",
+        "",
+        "EMP",
+        &["EMPNO", "ENAME", "SAL"],
+    )
+    .expect("cursor %ROWTYPE over mixed wildcard should expose aliases and table columns");
+
+    for expected in ["total_comp", "EMPNO", "ENAME", "SAL"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_rowtype_member_suggestions_include_explicit_cursor_multiple_wildcard_sources() {
+    let suggestions = SqlEditorWidget::collect_local_rowtype_member_suggestions_for_test(
+        r#"DECLARE
+    CURSOR c_join IS
+        SELECT e.*, d.*
+        FROM emp e
+        JOIN dept d ON d.deptno = e.deptno;
+    v_join c_join%ROWTYPE;
+BEGIN
+    v_join.__CODEX_CURSOR__
+END;"#,
+        "v_join",
+        "",
+        "DEPT",
+        &["DEPTNO", "DNAME", "LOC"],
+    )
+    .expect("cursor %ROWTYPE over multi-wildcard projection should preserve all rowtype sources");
+
+    for expected in ["DEPTNO", "DNAME", "LOC"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_rowtype_member_suggestions_include_explicit_cursor_unqualified_star_join_sources() {
+    let suggestions = SqlEditorWidget::collect_local_rowtype_member_suggestions_for_test(
+        r#"DECLARE
+    CURSOR c_join IS
+        SELECT *
+        FROM emp e
+        JOIN dept d ON d.deptno = e.deptno;
+    v_join c_join%ROWTYPE;
+BEGIN
+    v_join.__CODEX_CURSOR__
+END;"#,
+        "v_join",
+        "",
+        "DEPT",
+        &["DEPTNO", "DNAME", "LOC"],
+    )
+    .expect("cursor %ROWTYPE over SELECT * join should preserve every rowtype source");
+
+    for expected in ["DEPTNO", "DNAME", "LOC"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_record_member_suggestions_include_explicit_cursor_rowtype_fields() {
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        r#"DECLARE
+    CURSOR c_emp IS
+        SELECT
+            empno,
+            ename AS employee_name,
+            sal + NVL(comm, 0) total_comp
+        FROM emp;
+    v_emp c_emp%ROWTYPE;
+BEGIN
+    v_emp.__CODEX_CURSOR__
+END;"#,
+        "v_emp",
+        "",
+    )
+    .expect("cursor %ROWTYPE variable should expose cursor projection fields");
+
+    for expected in ["empno", "employee_name", "total_comp"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_rowtype_member_suggestions_do_not_query_explicit_cursor_projection_name() {
+    let suggestions = SqlEditorWidget::collect_local_rowtype_member_suggestions_for_test(
+        r#"DECLARE
+    CURSOR c_emp IS
+        SELECT empno, ename AS employee_name
+        FROM emp;
+    v_emp c_emp%ROWTYPE;
+BEGIN
+    v_emp.__CODEX_CURSOR__
+END;"#,
+        "v_emp",
+        "",
+        "C_EMP",
+        &["SHOULD_NOT_APPEAR"],
+    );
+
+    assert!(
+        suggestions.is_none(),
+        "cursor projection %ROWTYPE should not use cursor name as a table source: {:?}",
+        suggestions
+    );
+}
+
+#[test]
+fn local_record_member_suggestions_do_not_treat_cursor_name_type_as_rowtype() {
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        r#"DECLARE
+    CURSOR c_emp IS
+        SELECT empno, ename
+        FROM emp;
+    v_emp c_emp;
+BEGIN
+    v_emp.__CODEX_CURSOR__
+END;"#,
+        "v_emp",
+        "",
+    );
+
+    assert!(
+        suggestions.is_none(),
+        "cursor name without %ROWTYPE should not expose cursor projection fields: {:?}",
+        suggestions
+    );
+}
+
+#[test]
+fn local_record_member_suggestions_include_declared_record_type_fields() {
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        r#"DECLARE
+    TYPE emp_rec IS RECORD (
+        empno emp.empno%TYPE,
+        employee_name emp.ename%TYPE,
+        total_comp NUMBER
+    );
+    v_emp emp_rec;
+BEGIN
+    v_emp.__CODEX_CURSOR__
+END;"#,
+        "v_emp",
+        "",
+    )
+    .expect("record variable should expose fields from its local record type");
+
+    for expected in ["empno", "employee_name", "total_comp"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_record_member_suggestions_include_nested_record_type_fields() {
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        r#"DECLARE
+    TYPE addr_rec IS RECORD (
+        street VARCHAR2(100),
+        city VARCHAR2(100)
+    );
+    TYPE emp_rec IS RECORD (
+        empno NUMBER,
+        addr addr_rec
+    );
+    v_emp emp_rec;
+BEGIN
+    v_emp.addr.__CODEX_CURSOR__
+END;"#,
+        "v_emp.addr",
+        "",
+    )
+    .expect("nested record field should expose fields from its local record type");
+
+    for expected in ["street", "city"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_record_member_suggestions_include_quoted_nested_record_field_with_dot() {
+    const CURSOR_MARKER: &str = "__CODEX_CURSOR__";
+    let script_with_cursor = r#"DECLARE
+    TYPE addr_rec IS RECORD (
+        "Street.Name" VARCHAR2(100),
+        city VARCHAR2(100)
+    );
+    TYPE emp_rec IS RECORD (
+        empno NUMBER,
+        "Addr.Info" addr_rec
+    );
+    v_emp emp_rec;
+BEGIN
+    v_emp."Addr.Info".__CODEX_CURSOR__
+END;"#;
+    let cursor = script_with_cursor.find(CURSOR_MARKER).unwrap();
+    let sql = script_with_cursor.replacen(CURSOR_MARKER, "", 1);
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor)
+        .expect("quoted nested record field with dot should parse its qualifier chain");
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        script_with_cursor,
+        &qualifier,
+        "",
+    )
+    .expect("quoted nested record field with dot should expose nested record fields");
+
+    for expected in [r#""Street.Name""#, "city"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_record_member_suggestions_match_quoted_record_field_by_unquoted_prefix() {
+    const CURSOR_MARKER: &str = "__CODEX_CURSOR__";
+    let script_with_cursor = r#"DECLARE
+    TYPE addr_rec IS RECORD (
+        "Street.Name" VARCHAR2(100),
+        city VARCHAR2(100)
+    );
+    v_addr addr_rec;
+BEGIN
+    v_addr.__CODEX_CURSOR__
+END;"#;
+    let cursor = script_with_cursor.find(CURSOR_MARKER).unwrap();
+    let sql = script_with_cursor.replacen(CURSOR_MARKER, "", 1);
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor)
+        .expect("record qualifier should be available while typing a quoted field prefix");
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        script_with_cursor,
+        &qualifier,
+        "St",
+    )
+    .expect("quoted record field should be matched by its unquoted prefix");
+
+    assert_has_case_insensitive(&suggestions, r#""Street.Name""#);
+    assert!(
+        !suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case("city")),
+        "unexpected `city` in values: {:?}",
+        suggestions
+    );
+}
+
+#[test]
+fn local_record_member_suggestions_include_quoted_record_type_with_dot() {
+    const CURSOR_MARKER: &str = "__CODEX_CURSOR__";
+    let script_with_cursor = r#"DECLARE
+    TYPE "Addr.Info" IS RECORD (
+        street VARCHAR2(100),
+        city VARCHAR2(100)
+    );
+    TYPE emp_rec IS RECORD (
+        addr "Addr.Info"
+    );
+    v_emp emp_rec;
+BEGIN
+    v_emp.addr.__CODEX_CURSOR__
+END;"#;
+    let cursor = script_with_cursor.find(CURSOR_MARKER).unwrap();
+    let sql = script_with_cursor.replacen(CURSOR_MARKER, "", 1);
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor)
+        .expect("record field with quoted dotted type should parse its qualifier chain");
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        script_with_cursor,
+        &qualifier,
+        "",
+    )
+    .expect("record field with quoted dotted type should expose nested record fields");
+
+    for expected in ["street", "city"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_rowtype_member_suggestions_include_nested_record_rowtype_field_columns() {
+    let suggestions = SqlEditorWidget::collect_local_rowtype_member_suggestions_for_test(
+        r#"DECLARE
+    TYPE wrapper_rec IS RECORD (
+        emp emp%ROWTYPE
+    );
+    v_wrapper wrapper_rec;
+BEGIN
+    v_wrapper.emp.__CODEX_CURSOR__
+END;"#,
+        "v_wrapper.emp",
+        "",
+        "EMP",
+        &["EMPNO", "ENAME", "SAL"],
+    )
+    .expect("nested record %ROWTYPE field should expose loaded table columns");
+
+    for expected in ["EMPNO", "ENAME", "SAL"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_record_member_suggestions_include_indexed_collection_nested_record_fields() {
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        r#"DECLARE
+    TYPE addr_rec IS RECORD (
+        street VARCHAR2(100),
+        city VARCHAR2(100)
+    );
+    TYPE emp_rec IS RECORD (
+        empno NUMBER,
+        addr addr_rec
+    );
+    TYPE emp_tab IS TABLE OF emp_rec INDEX BY PLS_INTEGER;
+    v_emps emp_tab;
+BEGIN
+    v_emps(1).addr.__CODEX_CURSOR__
+END;"#,
+        "v_emps.addr",
+        "",
+    )
+    .expect("indexed collection nested record field should expose element field members");
+
+    for expected in ["street", "city"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_record_member_suggestions_include_nested_collection_field_element_fields() {
+    const CURSOR_MARKER: &str = "__CODEX_CURSOR__";
+    let script_with_cursor = r#"DECLARE
+    TYPE addr_rec IS RECORD (
+        street VARCHAR2(100),
+        city VARCHAR2(100)
+    );
+    TYPE addr_tab IS TABLE OF addr_rec INDEX BY PLS_INTEGER;
+    TYPE emp_rec IS RECORD (
+        addrs addr_tab
+    );
+    v_emp emp_rec;
+BEGIN
+    v_emp.addrs(1).__CODEX_CURSOR__
+END;"#;
+    let cursor = script_with_cursor.find(CURSOR_MARKER).unwrap();
+    let sql = script_with_cursor.replacen(CURSOR_MARKER, "", 1);
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor)
+        .expect("indexed nested collection field should parse its qualifier chain");
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        script_with_cursor,
+        &qualifier,
+        "",
+    )
+    .expect("indexed nested collection field should expose element record fields");
+
+    for expected in ["street", "city"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_record_member_suggestions_do_not_treat_nested_record_field_as_indexed_collection() {
+    const CURSOR_MARKER: &str = "__CODEX_CURSOR__";
+    let script_with_cursor = r#"DECLARE
+    TYPE addr_rec IS RECORD (
+        street VARCHAR2(100)
+    );
+    TYPE emp_rec IS RECORD (
+        addr addr_rec
+    );
+    v_emp emp_rec;
+BEGIN
+    v_emp.addr(1).__CODEX_CURSOR__
+END;"#;
+    let cursor = script_with_cursor.find(CURSOR_MARKER).unwrap();
+    let sql = script_with_cursor.replacen(CURSOR_MARKER, "", 1);
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor)
+        .expect("indexed nested record field should still parse its qualifier chain");
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        script_with_cursor,
+        &qualifier,
+        "",
+    );
+
+    assert!(
+        suggestions.is_none(),
+        "plain nested record field should not expose fields through indexed access: {:?}",
+        suggestions
+    );
+}
+
+#[test]
+fn local_record_member_suggestions_include_string_key_nested_collection_field_fields() {
+    const CURSOR_MARKER: &str = "__CODEX_CURSOR__";
+    let script_with_cursor = r#"DECLARE
+    TYPE addr_rec IS RECORD (
+        street VARCHAR2(100),
+        city VARCHAR2(100)
+    );
+    TYPE addr_tab IS TABLE OF addr_rec INDEX BY VARCHAR2(100);
+    TYPE emp_rec IS RECORD (
+        addrs addr_tab
+    );
+    v_emp emp_rec;
+BEGIN
+    v_emp.addrs('HOME.WORK').__CODEX_CURSOR__
+END;"#;
+    let cursor = script_with_cursor.find(CURSOR_MARKER).unwrap();
+    let sql = script_with_cursor.replacen(CURSOR_MARKER, "", 1);
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor)
+        .expect("dotted string-key nested collection field should parse its qualifier chain");
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        script_with_cursor,
+        &qualifier,
+        "",
+    )
+    .expect("dotted string-key nested collection field should expose element record fields");
+
+    for expected in ["street", "city"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_record_member_suggestions_include_quoted_string_key_collection_field_with_dot() {
+    const CURSOR_MARKER: &str = "__CODEX_CURSOR__";
+    let script_with_cursor = r#"DECLARE
+    TYPE addr_rec IS RECORD (
+        street VARCHAR2(100),
+        city VARCHAR2(100)
+    );
+    TYPE addr_tab IS TABLE OF addr_rec INDEX BY VARCHAR2(100);
+    TYPE emp_rec IS RECORD (
+        "Addrs.Info" addr_tab
+    );
+    v_emp emp_rec;
+BEGIN
+    v_emp."Addrs.Info"('HOME.WORK').__CODEX_CURSOR__
+END;"#;
+    let cursor = script_with_cursor.find(CURSOR_MARKER).unwrap();
+    let sql = script_with_cursor.replacen(CURSOR_MARKER, "", 1);
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor)
+        .expect("quoted dotted string-key collection field should parse its qualifier chain");
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        script_with_cursor,
+        &qualifier,
+        "",
+    )
+    .expect("quoted dotted string-key collection field should expose element record fields");
+
+    for expected in ["street", "city"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_record_member_suggestions_do_not_treat_dotted_string_key_plain_record_as_collection() {
+    const CURSOR_MARKER: &str = "__CODEX_CURSOR__";
+    let script_with_cursor = r#"DECLARE
+    TYPE addr_rec IS RECORD (
+        street VARCHAR2(100)
+    );
+    TYPE emp_rec IS RECORD (
+        addr addr_rec
+    );
+    v_emp emp_rec;
+BEGIN
+    v_emp('HOME.WORK').addr.__CODEX_CURSOR__
+END;"#;
+    let cursor = script_with_cursor.find(CURSOR_MARKER).unwrap();
+    let sql = script_with_cursor.replacen(CURSOR_MARKER, "", 1);
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor)
+        .expect("dotted string-key invalid record index should still parse its qualifier chain");
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        script_with_cursor,
+        &qualifier,
+        "",
+    );
+
+    assert!(
+        suggestions.is_none(),
+        "plain record variable should not expose fields through dotted string-key indexed access: {:?}",
+        suggestions
+    );
+}
+
+#[test]
+fn local_rowtype_member_suggestions_include_nested_collection_field_rowtype_columns() {
+    const CURSOR_MARKER: &str = "__CODEX_CURSOR__";
+    let script_with_cursor = r#"DECLARE
+    TYPE emp_tab IS TABLE OF emp%ROWTYPE INDEX BY PLS_INTEGER;
+    TYPE wrapper_rec IS RECORD (
+        emps emp_tab
+    );
+    v_wrapper wrapper_rec;
+BEGIN
+    v_wrapper.emps(1).__CODEX_CURSOR__
+END;"#;
+    let cursor = script_with_cursor.find(CURSOR_MARKER).unwrap();
+    let sql = script_with_cursor.replacen(CURSOR_MARKER, "", 1);
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor)
+        .expect("indexed nested rowtype collection field should parse its qualifier chain");
+    let suggestions = SqlEditorWidget::collect_local_rowtype_member_suggestions_for_test(
+        script_with_cursor,
+        &qualifier,
+        "",
+        "EMP",
+        &["EMPNO", "ENAME", "SAL"],
+    )
+    .expect("indexed nested rowtype collection field should expose loaded table columns");
+
+    for expected in ["EMPNO", "ENAME", "SAL"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_record_member_suggestions_do_not_treat_plain_record_nested_field_as_indexed_collection() {
+    const CURSOR_MARKER: &str = "__CODEX_CURSOR__";
+    let script_with_cursor = r#"DECLARE
+    TYPE addr_rec IS RECORD (
+        street VARCHAR2(100)
+    );
+    TYPE emp_rec IS RECORD (
+        addr addr_rec
+    );
+    v_emp emp_rec;
+BEGIN
+    v_emp(1).addr.__CODEX_CURSOR__
+END;"#;
+    let cursor = script_with_cursor.find(CURSOR_MARKER).unwrap();
+    let sql = script_with_cursor.replacen(CURSOR_MARKER, "", 1);
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor)
+        .expect("indexed nested expression should still parse its base qualifier chain");
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        script_with_cursor,
+        &qualifier,
+        "",
+    );
+
+    assert!(
+        suggestions.is_none(),
+        "plain record variable should not expose nested fields through indexed access: {:?}",
+        suggestions
+    );
+}
+
+#[test]
+fn local_record_member_suggestions_include_collection_element_record_type_fields() {
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        r#"DECLARE
+    TYPE emp_rec IS RECORD (
+        empno NUMBER,
+        employee_name VARCHAR2(100)
+    );
+    TYPE emp_tab IS TABLE OF emp_rec INDEX BY PLS_INTEGER;
+    v_emps emp_tab;
+BEGIN
+    v_emps.__CODEX_CURSOR__
+END;"#,
+        "v_emps",
+        "",
+    )
+    .expect("collection variable should expose element record fields");
+
+    for expected in ["empno", "employee_name"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_record_member_suggestions_include_collection_element_cursor_rowtype_fields() {
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        r#"DECLARE
+    CURSOR c_emp IS
+        SELECT empno, ename AS employee_name
+        FROM emp;
+    TYPE emp_tab IS TABLE OF c_emp%ROWTYPE INDEX BY PLS_INTEGER;
+    v_emps emp_tab;
+BEGIN
+    v_emps(1).__CODEX_CURSOR__
+END;"#,
+        "v_emps",
+        "",
+    )
+    .expect("collection over cursor %ROWTYPE should expose cursor projection fields");
+
+    for expected in ["empno", "employee_name"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_member_suggestions_merge_collection_element_mixed_cursor_rowtype_fields() {
+    let suggestions = SqlEditorWidget::collect_local_member_suggestions_for_test(
+        r#"DECLARE
+    CURSOR c_emp IS
+        SELECT e.*, sal + NVL(comm, 0) total_comp
+        FROM emp e;
+    TYPE emp_tab IS TABLE OF c_emp%ROWTYPE INDEX BY PLS_INTEGER;
+    v_emps emp_tab;
+BEGIN
+    v_emps(1).__CODEX_CURSOR__
+END;"#,
+        "v_emps",
+        "",
+        "EMP",
+        &["EMPNO", "ENAME", "SAL"],
+    )
+    .expect("collection over mixed cursor %ROWTYPE should expose aliases and table columns");
+
+    for expected in ["total_comp", "EMPNO", "ENAME", "SAL"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_record_member_suggestions_do_not_treat_plain_record_as_indexed_collection() {
+    const CURSOR_MARKER: &str = "__CODEX_CURSOR__";
+    let script_with_cursor = r#"DECLARE
+    TYPE emp_rec IS RECORD (
+        empno NUMBER,
+        employee_name VARCHAR2(100)
+    );
+    v_emp emp_rec;
+BEGIN
+    v_emp(1).__CODEX_CURSOR__
+END;"#;
+    let cursor = script_with_cursor.find(CURSOR_MARKER).unwrap();
+    let sql = script_with_cursor.replacen(CURSOR_MARKER, "", 1);
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor)
+        .expect("indexed expression should still parse its base qualifier");
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        script_with_cursor,
+        &qualifier,
+        "",
+    );
+
+    assert!(
+        suggestions.is_none(),
+        "plain record variable should not expose fields through indexed access: {:?}",
+        suggestions
+    );
+}
+
+#[test]
+fn local_rowtype_member_suggestions_include_collection_element_table_rowtype_fields() {
+    let suggestions = SqlEditorWidget::collect_local_rowtype_member_suggestions_for_test(
+        r#"DECLARE
+    TYPE emp_tab IS TABLE OF emp%ROWTYPE INDEX BY PLS_INTEGER;
+    v_emps emp_tab;
+BEGIN
+    v_emps.__CODEX_CURSOR__
+END;"#,
+        "v_emps",
+        "",
+        "EMP",
+        &["EMPNO", "ENAME", "SAL"],
+    )
+    .expect("collection variable should expose table %ROWTYPE element fields");
+
+    for expected in ["EMPNO", "ENAME", "SAL"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_rowtype_member_suggestions_do_not_treat_plain_rowtype_as_indexed_collection() {
+    const CURSOR_MARKER: &str = "__CODEX_CURSOR__";
+    let script_with_cursor = r#"DECLARE
+    v_emp emp%ROWTYPE;
+BEGIN
+    v_emp(1).__CODEX_CURSOR__
+END;"#;
+    let cursor = script_with_cursor.find(CURSOR_MARKER).unwrap();
+    let sql = script_with_cursor.replacen(CURSOR_MARKER, "", 1);
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor)
+        .expect("indexed expression should still parse its base qualifier");
+    let suggestions = SqlEditorWidget::collect_local_rowtype_member_suggestions_for_test(
+        script_with_cursor,
+        &qualifier,
+        "",
+        "EMP",
+        &["EMPNO", "ENAME", "SAL"],
+    );
+
+    assert!(
+        suggestions.is_none(),
+        "plain %ROWTYPE variable should not expose fields through indexed access: {:?}",
+        suggestions
+    );
+}
+
+#[test]
+fn local_rowtype_member_suggestions_support_indexed_collection_expression() {
+    const CURSOR_MARKER: &str = "__CODEX_CURSOR__";
+    let script_with_cursor = r#"DECLARE
+    TYPE emp_tab IS TABLE OF emp%ROWTYPE INDEX BY PLS_INTEGER;
+    v_emps emp_tab;
+BEGIN
+    v_emps(1).__CODEX_CURSOR__
+END;"#;
+    let cursor = script_with_cursor.find(CURSOR_MARKER).unwrap();
+    let sql = script_with_cursor.replacen(CURSOR_MARKER, "", 1);
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor)
+        .expect("indexed collection expression should resolve to base qualifier");
+
+    let suggestions = SqlEditorWidget::collect_local_rowtype_member_suggestions_for_test(
+        script_with_cursor,
+        &qualifier,
+        "",
+        "EMP",
+        &["EMPNO", "ENAME", "SAL"],
+    )
+    .expect("indexed collection element should expose table %ROWTYPE fields");
+
+    for expected in ["EMPNO", "ENAME", "SAL"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_record_member_suggestions_include_routine_parameter_collection_record_fields() {
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        r#"CREATE OR REPLACE PACKAGE BODY pkg AS
+    TYPE emp_rec IS RECORD (
+        empno NUMBER,
+        employee_name VARCHAR2(100)
+    );
+    TYPE emp_tab IS TABLE OF emp_rec INDEX BY PLS_INTEGER;
+
+    PROCEDURE sync_emp(p_emps IN emp_tab) IS
+    BEGIN
+        p_emps(1).__CODEX_CURSOR__
+    END;
+END;"#,
+        "p_emps",
+        "",
+    )
+    .expect("collection-typed routine parameter should expose element record fields");
+
+    for expected in ["empno", "employee_name"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_rowtype_member_suggestions_include_routine_parameter_collection_table_rowtype_fields() {
+    let suggestions = SqlEditorWidget::collect_local_rowtype_member_suggestions_for_test(
+        r#"CREATE OR REPLACE PACKAGE BODY pkg AS
+    TYPE emp_tab IS TABLE OF emp%ROWTYPE INDEX BY PLS_INTEGER;
+
+    PROCEDURE sync_emp(p_emps IN OUT NOCOPY emp_tab) IS
+    BEGIN
+        p_emps(1).__CODEX_CURSOR__
+    END;
+END;"#,
+        "p_emps",
+        "",
+        "EMP",
+        &["EMPNO", "ENAME", "SAL"],
+    )
+    .expect("collection-typed routine parameter should expose table %ROWTYPE element fields");
+
+    for expected in ["EMPNO", "ENAME", "SAL"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_record_member_suggestions_include_routine_parameter_record_type_fields() {
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        r#"CREATE OR REPLACE PACKAGE BODY pkg AS
+    TYPE emp_rec IS RECORD (
+        empno NUMBER,
+        employee_name VARCHAR2(100)
+    );
+
+    PROCEDURE sync_emp(p_emp IN emp_rec) IS
+    BEGIN
+        p_emp.__CODEX_CURSOR__
+    END;
+END;"#,
+        "p_emp",
+        "",
+    )
+    .expect("record-typed routine parameter should expose local record type fields");
+
+    for expected in ["empno", "employee_name"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_rowtype_member_suggestions_include_routine_parameter_table_rowtype_fields() {
+    let suggestions = SqlEditorWidget::collect_local_rowtype_member_suggestions_for_test(
+        r#"CREATE OR REPLACE PROCEDURE sync_emp(p_emp IN emp%ROWTYPE) IS
+BEGIN
+    p_emp.__CODEX_CURSOR__
+END;"#,
+        "p_emp",
+        "",
+        "EMP",
+        &["EMPNO", "ENAME", "SAL"],
+    )
+    .expect("table %ROWTYPE routine parameter should expose loaded table columns");
+
+    for expected in ["EMPNO", "ENAME", "SAL"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_rowtype_member_suggestions_ignore_routine_parameter_scalar_percent_type() {
+    let suggestions = SqlEditorWidget::collect_local_rowtype_member_suggestions_for_test(
+        r#"CREATE OR REPLACE PROCEDURE sync_emp(p_name IN emp.ename%TYPE) IS
+BEGIN
+    p_name.__CODEX_CURSOR__
+END;"#,
+        "p_name",
+        "",
+        "EMP",
+        &["EMPNO", "ENAME", "SAL"],
+    );
+
+    assert!(
+        suggestions.is_none(),
+        "scalar %TYPE routine parameter should not expose table row fields: {:?}",
+        suggestions
+    );
+}
+
+#[test]
+fn local_record_member_suggestions_respect_inner_scalar_shadowing() {
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        r#"DECLARE
+    TYPE emp_rec IS RECORD (
+        empno NUMBER
+    );
+    v_emp emp_rec;
+BEGIN
+    DECLARE
+        v_emp NUMBER;
+    BEGIN
+        v_emp.__CODEX_CURSOR__
+    END;
+END;"#,
+        "v_emp",
+        "",
+    );
+
+    assert!(
+        suggestions.is_none(),
+        "inner scalar variable should shadow outer record members: {:?}",
+        suggestions
+    );
+}
+
+#[test]
+fn local_rowtype_member_suggestions_use_loaded_table_columns() {
+    let suggestions = SqlEditorWidget::collect_local_rowtype_member_suggestions_for_test(
+        r#"DECLARE
+    v_emp scott.emp%ROWTYPE;
+BEGIN
+    v_emp.__CODEX_CURSOR__
+END;"#,
+        "v_emp",
+        "",
+        "SCOTT.EMP",
+        &["EMPNO", "ENAME", "SAL"],
+    )
+    .expect("table %ROWTYPE variable should resolve to loaded table columns");
+
+    for expected in ["EMPNO", "ENAME", "SAL"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_rowtype_member_suggestions_use_default_qualified_table_columns() {
+    let suggestions =
+        SqlEditorWidget::collect_local_rowtype_member_suggestions_with_default_for_test(
+            r#"DECLARE
+    v_emp emp%ROWTYPE;
+BEGIN
+    v_emp.__CODEX_CURSOR__
+END;"#,
+            "v_emp",
+            "",
+            "SCOTT",
+            "SCOTT.EMP",
+            &["EMPNO", "ENAME", "SAL"],
+        )
+        .expect("unqualified table %ROWTYPE should use the default schema cache key");
+
+    for expected in ["EMPNO", "ENAME", "SAL"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_rowtype_member_suggestions_fall_back_to_unqualified_table_columns() {
+    let suggestions = SqlEditorWidget::collect_local_rowtype_member_suggestions_for_test(
+        r#"DECLARE
+    v_emp scott.emp%ROWTYPE;
+BEGIN
+    v_emp.__CODEX_CURSOR__
+END;"#,
+        "v_emp",
+        "",
+        "EMP",
+        &["EMPNO", "ENAME", "SAL"],
+    )
+    .expect("qualified table %ROWTYPE should reuse an unqualified loaded cache key");
+
+    for expected in ["EMPNO", "ENAME", "SAL"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_rowtype_member_suggestions_ignore_scalar_percent_type() {
+    let suggestions = SqlEditorWidget::collect_local_rowtype_member_suggestions_for_test(
+        r#"DECLARE
+    v_ename emp.ename%TYPE;
+BEGIN
+    v_ename.__CODEX_CURSOR__
+END;"#,
+        "v_ename",
+        "",
+        "EMP",
+        &["EMPNO", "ENAME", "SAL"],
+    );
+
+    assert!(
+        suggestions.is_none(),
+        "scalar %TYPE variable should not expose table row fields: {:?}",
+        suggestions
+    );
+}
+
+#[test]
+fn local_symbol_suggestions_do_not_expose_record_type_metadata() {
+    let suggestions = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+        r#"DECLARE
+    TYPE emp_rec IS RECORD (
+        empno NUMBER
+    );
+    v_emp emp_rec;
+BEGIN
+    __CODEX_CURSOR__NULL;
+END;"#,
+        &[],
+    );
+
+    assert_has_case_insensitive(&suggestions, "v_emp");
+    assert!(
+        !suggestions
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("emp_rec")),
+        "record type metadata should not be exposed as a local variable suggestion: {:?}",
+        suggestions
+    );
+}
+
+#[test]
 fn local_symbol_suggestions_include_declared_exceptions() {
     let suggestions = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
         r#"DECLARE
@@ -6417,6 +8040,46 @@ CROSS APPLY (
     let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
 
     for expected in ["order_id", "sku", "qty", "price", "line_amt"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn merge_using_subquery_source_alias_qualified_completion_uses_projection_columns() {
+    let sql_with_cursor = r#"
+MERGE INTO target_table t
+USING (
+  SELECT
+    s.id AS source_id,
+    s.val,
+    s.updated_at
+  FROM staging_source s
+) src
+ON (t.id = src.|)
+WHEN MATCHED THEN UPDATE SET t.val = src.val
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+
+    let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("src"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["source_id", "val", "updated_at"] {
         assert_has_case_insensitive(&suggestions, expected);
     }
 }

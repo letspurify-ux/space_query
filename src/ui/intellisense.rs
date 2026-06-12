@@ -638,7 +638,12 @@ struct NameEntry {
 
 impl NameEntry {
     fn new(name: String) -> Self {
-        let upper = name.to_uppercase();
+        let lookup_name = if sql_text::is_quoted_identifier(name.trim()) {
+            sql_text::strip_identifier_quotes(name.trim())
+        } else {
+            name.clone()
+        };
+        let upper = lookup_name.to_uppercase();
         Self { name, upper }
     }
 }
@@ -4175,6 +4180,20 @@ mod intellisense_tests {
             "expected schema-qualified scope to reuse unqualified cached columns, got: {:?}",
             suggestions
         );
+    }
+
+    #[test]
+    fn get_column_suggestions_match_quoted_columns_by_unquoted_prefix() {
+        let mut data = IntellisenseData::new();
+        data.set_virtual_table_columns(
+            "REC",
+            vec![r#""Employee Name""#.to_string(), "NORMAL_SAL".to_string()],
+        );
+
+        let scope = vec!["REC".to_string()];
+        let suggestions = data.get_column_suggestions("Emp", Some(scope.as_slice()));
+
+        assert_eq!(suggestions, vec![r#""Employee Name""#.to_string()]);
     }
 
     #[test]

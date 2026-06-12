@@ -466,6 +466,25 @@ pub(crate) struct LocalSymbolEntry {
     name: String,
     upper: String,
     declared_at: usize,
+    members: Vec<String>,
+    member_entries: Vec<LocalMemberEntry>,
+    member_source_upper: Option<String>,
+    member_source_uppers: Vec<String>,
+    member_source_is_rowtype: bool,
+    member_source_is_collection_like: bool,
+    member_source_allows_visible_members: bool,
+    suggest_name: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct LocalMemberEntry {
+    name: String,
+    upper: String,
+    member_source_upper: Option<String>,
+    member_source_uppers: Vec<String>,
+    member_source_is_rowtype: bool,
+    member_source_is_collection_like: bool,
+    member_source_allows_visible_members: bool,
 }
 
 #[derive(Clone)]

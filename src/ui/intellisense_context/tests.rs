@@ -8137,7 +8137,7 @@ fn grammar_complex_join_variant_3() {
 fn grammar_quoted_identifier_variant_1() {
     let cols = extract_select_list_columns(&tokenize(r#"SELECT "Employee Name" FROM emp"#));
     assert!(
-        cols.contains(&"Employee Name".to_string()),
+        cols.contains(&r#""Employee Name""#.to_string()),
         "cols: {:?}",
         cols
     );
@@ -8149,7 +8149,7 @@ fn grammar_quoted_identifier_variant_2() {
         r#"SELECT e."Hire Date" AS "Joined Date" FROM emp e"#,
     ));
     assert!(
-        cols.contains(&"Joined Date".to_string()),
+        cols.contains(&r#""Joined Date""#.to_string()),
         "cols: {:?}",
         cols
     );
@@ -8158,7 +8158,7 @@ fn grammar_quoted_identifier_variant_2() {
 #[test]
 fn grammar_quoted_identifier_variant_3() {
     let cols = extract_select_list_columns(&tokenize(r#"SELECT "Dept"."Code" FROM "Dept""#));
-    assert!(cols.contains(&"Code".to_string()), "cols: {:?}", cols);
+    assert!(cols.contains(&r#""Code""#.to_string()), "cols: {:?}", cols);
 }
 
 #[test]

@@ -98,6 +98,7 @@ impl SqlEditorWidget {
         let (cursor_pos, cursor_pos_usize) = Self::editor_cursor_position(editor, buffer);
         let (prefix, word_start, _) = Self::word_at_cursor(buffer, text_shadow, cursor_pos);
         let qualifier = Self::qualifier_before_word(buffer, text_shadow, word_start);
+        let raw_qualifier = Self::raw_qualifier_before_word(buffer, text_shadow, word_start);
         // Avoid blocking the UI thread on the connection mutex (which the
         // schema refresh worker or a running query may be holding). Fall back
         // to the last observed db_type; it only changes on (re)connect.
@@ -137,6 +138,7 @@ impl SqlEditorWidget {
             prefix,
             word_start,
             qualifier,
+            raw_qualifier,
         });
 
         let cached_context = runtime.parse_cache().and_then(|entry| {
@@ -598,30 +600,71 @@ impl SqlEditorWidget {
         } else {
             Vec::new()
         };
-        let qualified_completion_mode = qualifier.and_then(|qualifier| {
-            let data = intellisense_data
+        let local_record_member_suggestions = qualifier
+            .and_then(|qualifier| {
+                Self::collect_local_record_member_suggestions(
+                    qualifier,
+                    &snapshot.prefix,
+                    cursor_in_statement,
+                    snapshot.raw_qualifier.as_deref(),
+                    analysis,
+                )
+            });
+        let has_resolved_local_record_member_scope = local_record_member_suggestions.is_some();
+        let local_rowtype_member_sources = qualifier
+            .map(|qualifier| {
+                Self::local_rowtype_member_sources_for_qualifier(
+                    qualifier,
+                    cursor_in_statement,
+                    snapshot.raw_qualifier.as_deref(),
+                    analysis,
+                )
+            })
+            .unwrap_or_default();
+        for source in &local_rowtype_member_sources {
+            Self::request_table_columns(source, intellisense_data, column_sender, connection);
+        }
+        let local_rowtype_member_suggestions = if !local_rowtype_member_sources.is_empty() {
+            let mut data = intellisense_data
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            Self::resolve_qualified_completion_mode(qualifier, context, deep_ctx, &data)
-        });
-        let column_tables = if matches!(
+            data.get_column_suggestions(&snapshot.prefix, Some(&local_rowtype_member_sources))
+        } else {
+            Vec::new()
+        };
+        let has_local_record_member_scope =
+            has_resolved_local_record_member_scope || !local_rowtype_member_sources.is_empty();
+        let local_record_member_suggestions =
+            local_record_member_suggestions.unwrap_or_default();
+        let local_rowtype_column_tables = local_rowtype_member_sources.clone();
+        let qualified_completion_mode = if has_local_record_member_scope {
+            None
+        } else {
+            qualifier.and_then(|qualifier| {
+                let data = intellisense_data
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                Self::resolve_qualified_completion_mode(qualifier, context, deep_ctx, &data)
+            })
+        };
+        let qualified_mode_uses_members = matches!(
             qualified_completion_mode,
             Some(QualifiedCompletionMode::RelationMembers | QualifiedCompletionMode::ObjectMembers)
-        ) {
+        );
+        let column_tables = if has_local_record_member_scope || qualified_mode_uses_members {
             Vec::new()
         } else {
             Self::resolve_column_tables_for_context(qualifier, deep_ctx)
         };
-        let include_columns = matches!(
-            qualified_completion_mode,
-            Some(QualifiedCompletionMode::RelationColumns)
-        ) || (qualified_completion_mode.is_none()
-            && (qualifier.is_some()
-                || matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll)));
-        let comparison_lookup_tables = if matches!(
-            qualified_completion_mode,
-            Some(QualifiedCompletionMode::RelationMembers | QualifiedCompletionMode::ObjectMembers)
-        ) {
+        let include_columns = !has_local_record_member_scope
+            && (matches!(
+                qualified_completion_mode,
+                Some(QualifiedCompletionMode::RelationColumns)
+            ) || (qualified_completion_mode.is_none()
+                && (qualifier.is_some()
+                    || matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll))));
+        let comparison_lookup_tables = if has_local_record_member_scope || qualified_mode_uses_members
+        {
             Vec::new()
         } else {
             Self::comparison_lookup_tables_for_context(qualifier, deep_ctx)
@@ -681,6 +724,7 @@ impl SqlEditorWidget {
             || include_columns
             || matches!(context, SqlContext::TableName)
             || !local_suggestions.is_empty()
+            || has_local_record_member_scope
             || !qualified_member_suggestions.is_empty()
             || !expected_keyword_suggestions.is_empty()
             || !expected_object_suggestions.is_empty();
@@ -817,11 +861,29 @@ impl SqlEditorWidget {
                 &virtual_wildcard_dependencies,
                 &data,
             )
+        } else if !local_rowtype_column_tables.is_empty() {
+            let data = intellisense_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Self::has_column_loading_for_scope(
+                true,
+                &local_rowtype_column_tables,
+                &HashMap::new(),
+                &data,
+            )
         } else {
             false
         };
 
-        let mut suggestions = if !qualified_member_suggestions.is_empty() {
+        let mut suggestions = if has_resolved_local_record_member_scope {
+            Self::merge_suggestions_with_context_aliases(
+                local_record_member_suggestions,
+                local_rowtype_member_suggestions,
+                false,
+            )
+        } else if !local_rowtype_member_sources.is_empty() {
+            local_rowtype_member_suggestions
+        } else if !qualified_member_suggestions.is_empty() {
             qualified_member_suggestions
         } else {
             let mut data = intellisense_data
@@ -1792,6 +1854,11 @@ impl SqlEditorWidget {
     fn dedup_column_names_case_insensitive(columns: &mut Vec<String>) {
         let mut seen = HashSet::new();
         columns.retain(|column| seen.insert(column.to_ascii_uppercase()));
+    }
+
+    fn dedup_local_member_entries_case_insensitive(entries: &mut Vec<LocalMemberEntry>) {
+        let mut seen = HashSet::new();
+        entries.retain(|entry| seen.insert(entry.upper.clone()));
     }
 
     /// Column qualifier to use in generated SQL: the alias if present,

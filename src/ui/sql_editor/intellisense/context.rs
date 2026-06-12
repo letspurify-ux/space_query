@@ -1351,6 +1351,10 @@ impl SqlEditorWidget {
         }
 
         let last_char = text.get(..segment_end)?.chars().next_back();
+        if matches!(last_char, Some(')')) {
+            let open_idx = Self::find_open_paren_for_qualifier_expression(text, segment_end)?;
+            return Self::parse_qualifier_segment_before_dot(text, open_idx);
+        }
         if let Some(delimiter) = last_char.filter(|ch| matches!(ch, '"' | '`')) {
             let start = Self::find_quoted_segment_start(text, segment_end, delimiter)?;
             let quoted = text.get(start..segment_end)?;
@@ -1383,6 +1387,24 @@ impl SqlEditorWidget {
         }
 
         Some((segment.to_string(), start))
+    }
+
+    fn find_open_paren_for_qualifier_expression(text: &str, segment_end: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        for (pos, ch) in text.get(..segment_end)?.char_indices().rev() {
+            match ch {
+                ')' => depth = depth.saturating_add(1),
+                '(' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some(pos);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        None
     }
 
     fn has_unbalanced_identifier_quotes(text: &str) -> bool {

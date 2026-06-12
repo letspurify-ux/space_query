@@ -6553,7 +6553,7 @@ fn parse_model_measure_output_column(item_tokens: &[&SqlToken]) -> Option<String
                 if let Some(SqlToken::Word(alias)) = meaningful.get(idx.saturating_add(1)).copied()
                 {
                     if is_identifier_word_token(alias) {
-                        return Some(strip_identifier_quotes(alias));
+                        return Some(output_identifier_suggestion(alias));
                     }
                 }
                 return None;
@@ -6573,7 +6573,7 @@ fn parse_model_measure_output_column(item_tokens: &[&SqlToken]) -> Option<String
             {
                 let previous = meaningful[alias_idx.saturating_sub(1)];
                 if !matches!(previous, SqlToken::Symbol(sym) if sym == ".") {
-                    return Some(strip_identifier_quotes(alias));
+                    return Some(output_identifier_suggestion(alias));
                 }
             }
         }
@@ -6594,7 +6594,7 @@ fn parse_simple_identifier_path_output_column(tokens: &[&SqlToken]) -> Option<St
             SqlToken::Word(word)
                 if parser_state.expects_identifier() && is_identifier_word_token(word) =>
             {
-                last_identifier = Some(strip_identifier_quotes(word));
+                last_identifier = Some(output_identifier_suggestion(word));
                 parser_state = IdentifierPathState::ExpectDot;
             }
             SqlToken::Symbol(sym) if parser_state.expects_dot() && sym == "." => {
@@ -6608,6 +6608,15 @@ fn parse_simple_identifier_path_output_column(tokens: &[&SqlToken]) -> Option<St
         return None;
     }
     last_identifier
+}
+
+fn output_identifier_suggestion(word: &str) -> String {
+    let trimmed = word.trim();
+    if is_quoted_identifier(trimmed) {
+        trimmed.to_string()
+    } else {
+        strip_identifier_quotes(trimmed)
+    }
 }
 
 fn next_non_comment_index(tokens: &[SqlToken], start: usize) -> usize {
@@ -6893,7 +6902,7 @@ fn resolve_item_column_name(item_tokens: &[&SqlToken]) -> Option<String> {
         }
         if let Some(SqlToken::Word(kw)) = second_last {
             if kw.eq_ignore_ascii_case("AS") {
-                return Some(strip_identifier_quotes(alias));
+                return Some(output_identifier_suggestion(alias));
             }
         }
     }
@@ -6915,7 +6924,7 @@ fn resolve_item_column_name(item_tokens: &[&SqlToken]) -> Option<String> {
                     _ => false,
                 };
                 if is_implicit {
-                    return Some(strip_identifier_quotes(alias));
+                    return Some(output_identifier_suggestion(alias));
                 }
             }
         }
@@ -6927,7 +6936,7 @@ fn resolve_item_column_name(item_tokens: &[&SqlToken]) -> Option<String> {
             if !is_identifier_word_token(name) {
                 return None;
             }
-            return Some(strip_identifier_quotes(name));
+            return Some(output_identifier_suggestion(name));
         }
     }
 
