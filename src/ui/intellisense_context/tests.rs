@@ -7755,6 +7755,32 @@ fn extract_oracle_pivot_projection_removes_aggregate_input_column_named_at() {
 }
 
 #[test]
+fn extract_oracle_pivot_projection_collate_keeps_grouping_columns_named_like_syntax() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, name, collate, binary_ci FROM emp) \
+         PIVOT (MAX(name COLLATE BINARY_CI) AS max_name \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(
+        cols,
+        vec!["deptno", "collate", "binary_ci", "clerk_max_name"]
+    );
+}
+
+#[test]
+fn extract_oracle_pivot_projection_removes_aggregate_input_column_named_collate() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, collate FROM emp) \
+         PIVOT (SUM(collate) AS total_collate FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "clerk_total_collate"]);
+}
+
+#[test]
 fn extract_oracle_pivot_projection_conversion_default_keeps_grouping_columns_named_like_syntax() {
     let tokens = tokenize(
         "SELECT * FROM (SELECT deptno, job, amount_txt, default, conversion, error FROM emp) \
@@ -7834,6 +7860,18 @@ fn extract_oracle_pivot_projection_json_exists_options_keep_grouping_columns_nam
         cols,
         vec!["deptno", "passing", "true", "error", "clerk_matched_sal"]
     );
+}
+
+#[test]
+fn extract_oracle_pivot_projection_is_json_keeps_grouping_column_named_json() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, payload, json FROM emp) \
+         PIVOT (SUM(CASE WHEN payload IS JSON THEN 1 ELSE 0 END) AS valid_json \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "json", "clerk_valid_json"]);
 }
 
 #[test]

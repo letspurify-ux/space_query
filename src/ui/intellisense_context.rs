@@ -6499,8 +6499,10 @@ fn parse_identifiers_from_expression_tokens(tokens: &[&SqlToken]) -> Vec<String>
             || is_trim_syntax_keyword(&meaningful, &token_depths, idx, &upper)
             || is_datetime_literal_syntax_word(&meaningful, idx, &upper)
             || is_json_function_syntax_word(&meaningful, &token_depths, idx, &upper)
+            || is_json_predicate_syntax_word(&meaningful, &token_depths, idx, &upper)
             || is_xmlquery_syntax_word(&meaningful, &token_depths, idx, &upper)
             || is_at_time_zone_syntax_word(&meaningful, &token_depths, idx, &upper)
+            || is_collate_syntax_word(&meaningful, &token_depths, idx, &upper)
             || is_treat_type_spec_identifier(&meaningful, &token_depths, idx)
             || is_conversion_default_syntax_word(&meaningful, &token_depths, idx, &upper)
         {
@@ -7016,6 +7018,77 @@ fn is_json_function_name(name: &str) -> bool {
     )
 }
 
+fn is_json_predicate_syntax_word(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    word_upper: &str,
+) -> bool {
+    if word_upper != "JSON" {
+        return false;
+    }
+
+    let Some(depth) = token_depths.get(idx).copied() else {
+        return false;
+    };
+    let Some(is_idx) = json_predicate_is_index(tokens, token_depths, idx, depth) else {
+        return false;
+    };
+
+    previous_json_predicate_subject_token_index(tokens, token_depths, is_idx, depth).is_some()
+}
+
+fn json_predicate_is_index(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    json_idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let prev_idx = previous_word_index_at_depth(tokens, token_depths, json_idx, depth)?;
+    match tokens.get(prev_idx).copied() {
+        Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("IS") => Some(prev_idx),
+        Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("NOT") => {
+            previous_word_index_at_depth(tokens, token_depths, prev_idx, depth).and_then(|is_idx| {
+                matches!(
+                    tokens.get(is_idx).copied(),
+                    Some(SqlToken::Word(is_word)) if is_word.eq_ignore_ascii_case("IS")
+                )
+                .then_some(is_idx)
+            })
+        }
+        _ => None,
+    }
+}
+
+fn previous_json_predicate_subject_token_index(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    is_idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let mut scan_idx = is_idx;
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth {
+            return None;
+        }
+        if scan_depth != depth {
+            continue;
+        }
+
+        match tokens.get(scan_idx).copied() {
+            Some(SqlToken::Comment(_)) => {}
+            Some(SqlToken::Symbol(sym)) if sym == "," || sym == "(" => return None,
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("IS") => return None,
+            Some(_) => return Some(scan_idx),
+            None => return None,
+        }
+    }
+
+    None
+}
+
 fn is_xmlquery_syntax_word(
     tokens: &[&SqlToken],
     token_depths: &[usize],
@@ -7128,6 +7201,74 @@ fn is_at_time_zone_syntax_word(
         }
         _ => false,
     }
+}
+
+fn is_collate_syntax_word(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    word_upper: &str,
+) -> bool {
+    let Some(depth) = token_depths.get(idx).copied() else {
+        return false;
+    };
+
+    if word_upper == "COLLATE" {
+        return collate_collation_name_index(tokens, token_depths, idx, depth).is_some()
+            && previous_collate_expression_token_index(tokens, token_depths, idx, depth).is_some();
+    }
+
+    previous_word_index_at_depth(tokens, token_depths, idx, depth).is_some_and(|prev_idx| {
+        matches!(
+            tokens.get(prev_idx).copied(),
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("COLLATE")
+        ) && collate_collation_name_index(tokens, token_depths, prev_idx, depth) == Some(idx)
+            && previous_collate_expression_token_index(tokens, token_depths, prev_idx, depth)
+                .is_some()
+    })
+}
+
+fn collate_collation_name_index(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    collate_idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    next_word_index_at_depth(tokens, token_depths, collate_idx, depth).filter(|next_idx| {
+        matches!(
+            tokens.get(*next_idx).copied(),
+            Some(SqlToken::Word(word)) if is_identifier_word_token(word)
+        )
+    })
+}
+
+fn previous_collate_expression_token_index(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    collate_idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let mut scan_idx = collate_idx;
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth {
+            return None;
+        }
+        if scan_depth != depth {
+            continue;
+        }
+
+        match tokens.get(scan_idx).copied() {
+            Some(SqlToken::Comment(_)) => {}
+            Some(SqlToken::Symbol(sym)) if sym == "," || sym == "(" => return None,
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("COLLATE") => return None,
+            Some(_) => return Some(scan_idx),
+            None => return None,
+        }
+    }
+
+    None
 }
 
 fn is_conversion_default_syntax_word(
