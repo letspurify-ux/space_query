@@ -399,7 +399,7 @@ impl SqlEditorWidget {
         analysis: &IntellisenseAnalysis,
         session_bind_names: &[String],
     ) -> Vec<String> {
-        let prefix_upper = prefix.to_ascii_uppercase();
+        let prefix_upper = Self::local_identifier_lookup_upper(prefix);
         let cursor_in_statement = cursor_in_statement.min(
             analysis
                 .statement_end
@@ -474,7 +474,7 @@ impl SqlEditorWidget {
         raw_qualifier: Option<&str>,
         analysis: &IntellisenseAnalysis,
     ) -> Option<Vec<String>> {
-        let prefix_upper = prefix.to_ascii_uppercase();
+        let prefix_upper = Self::local_member_suggestion_lookup_upper(prefix);
         let scope = Self::resolve_local_member_scope_for_qualifier(
             qualifier,
             cursor_in_statement,
@@ -515,6 +515,8 @@ impl SqlEditorWidget {
         let trimmed = member.trim();
         if sql_text::is_quoted_identifier(trimmed) {
             sql_text::strip_identifier_quotes(trimmed).to_ascii_uppercase()
+        } else if matches!(trimmed.chars().next(), Some('"') | Some('`')) {
+            trimmed[1..].to_ascii_uppercase()
         } else {
             member.to_ascii_uppercase()
         }
@@ -827,12 +829,12 @@ impl SqlEditorWidget {
         merged
     }
 
-    fn local_symbol_matches_prefix(name: &str, upper: &str, prefix_upper: &str) -> bool {
+    fn local_symbol_matches_prefix(_name: &str, upper: &str, prefix_upper: &str) -> bool {
         if prefix_upper.is_empty() {
             return true;
         }
 
-        upper.starts_with(prefix_upper) && !name.eq_ignore_ascii_case(prefix_upper)
+        upper.starts_with(prefix_upper) && upper != prefix_upper
     }
 
     fn deepest_local_scope_at_cursor(scopes: &[LocalScope], cursor_byte: usize) -> usize {
@@ -1399,7 +1401,7 @@ impl SqlEditorWidget {
                 let cursor_name = item[first_idx + 1..]
                     .iter()
                     .find_map(|span| Self::token_word(&span.token))
-                    .and_then(Self::local_identifier_from_word)?;
+                    .and_then(Self::local_identifier_suggestion_from_word)?;
                 let (members, member_source_uppers) =
                     Self::extract_cursor_projection_members_and_source_from_item(item, first_idx);
                 let member_source_upper = member_source_uppers.first().cloned();
@@ -1419,7 +1421,7 @@ impl SqlEditorWidget {
             _ => {}
         }
 
-        let name = Self::local_identifier_from_word(first_word)?;
+        let name = Self::local_identifier_suggestion_from_word(first_word)?;
 
         let next_meaningful = item[first_idx + 1..]
             .iter()
@@ -1837,7 +1839,7 @@ impl SqlEditorWidget {
                         idx += 1;
                         continue;
                     }
-                    if let Some(name) = Self::local_identifier_from_word(word) {
+                    if let Some(name) = Self::local_identifier_suggestion_from_word(word) {
                         names.push(name);
                         expecting_name = false;
                     } else {
@@ -1906,7 +1908,8 @@ impl SqlEditorWidget {
     fn parse_for_loop_record(tokens: &[SqlTokenSpan], idx: usize) -> Option<ParsedForLoopRecord> {
         let name_idx = Self::next_meaningful_token_idx(tokens, idx + 1)?;
         let name =
-            Self::token_word(&tokens[name_idx].token).and_then(Self::local_identifier_from_word)?;
+            Self::token_word(&tokens[name_idx].token)
+                .and_then(Self::local_identifier_suggestion_from_word)?;
         let in_idx = Self::next_meaningful_token_idx(tokens, name_idx + 1)?;
         let in_word = Self::token_word(&tokens[in_idx].token)?;
         if !in_word.eq_ignore_ascii_case("IN") {
@@ -1950,6 +1953,8 @@ impl SqlEditorWidget {
         scopes: &[LocalScope],
         symbols: &mut [LocalSymbolEntry],
     ) {
+        let scope_rank_by_scope = Self::local_scope_rank_maps(scopes);
+
         for _ in 0..symbols.len() {
             let mut candidates_by_upper = HashMap::<String, Vec<usize>>::new();
             for (idx, symbol) in symbols.iter().enumerate() {
@@ -1977,7 +1982,9 @@ impl SqlEditorWidget {
                     continue;
                 }
 
-                let scope_chain = Self::local_scope_chain(scopes, symbol.scope_id);
+                let Some(scope_ranks) = scope_rank_by_scope.get(symbol.scope_id) else {
+                    continue;
+                };
                 let mut best: Option<(usize, usize, usize)> = None;
                 let Some(candidate_indices) = candidates_by_upper.get(source_upper) else {
                     continue;
@@ -1990,10 +1997,7 @@ impl SqlEditorWidget {
                     if candidate.suggest_name && !symbol.member_source_allows_visible_members {
                         continue;
                     }
-                    let Some(scope_rank) = scope_chain
-                        .iter()
-                        .position(|scope_id| *scope_id == candidate.scope_id)
-                    else {
+                    let Some(scope_rank) = scope_ranks.get(&candidate.scope_id).copied() else {
                         continue;
                     };
                     if best.is_none_or(|(best_rank, best_declared_at, _)| {
@@ -2094,6 +2098,18 @@ impl SqlEditorWidget {
                 break;
             }
         }
+    }
+
+    fn local_scope_rank_maps(scopes: &[LocalScope]) -> Vec<HashMap<usize, usize>> {
+        (0..scopes.len())
+            .map(|scope_id| {
+                Self::local_scope_chain(scopes, scope_id)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(rank, visible_scope_id)| (visible_scope_id, rank))
+                    .collect()
+            })
+            .collect()
     }
 
     fn extract_for_loop_select_projection_members_and_source(
@@ -2496,7 +2512,8 @@ impl SqlEditorWidget {
     fn extract_parameter_symbol_from_item(item: &[SqlTokenSpan]) -> Option<ParsedDeclarationSymbol> {
         let name_idx = Self::parameter_name_idx_from_item(item)?;
         let name =
-            Self::token_word(&item[name_idx].token).and_then(Self::local_identifier_from_word)?;
+            Self::token_word(&item[name_idx].token)
+                .and_then(Self::local_identifier_suggestion_from_word)?;
         let (member_source_upper, member_source_is_rowtype) =
             Self::extract_parameter_member_source(item, name_idx);
         let member_source_uppers =
@@ -2794,7 +2811,7 @@ impl SqlEditorWidget {
         member_source_allows_visible_members: bool,
         suggest_name: bool,
     ) {
-        let upper = name.to_ascii_uppercase();
+        let upper = Self::local_identifier_lookup_upper(&name);
         if !seen_symbol_keys.insert((scope_id, declared_at, upper.clone())) {
             return;
         }
@@ -2878,6 +2895,27 @@ impl SqlEditorWidget {
         Some(normalized)
     }
 
+    fn local_identifier_suggestion_from_word(word: &str) -> Option<String> {
+        let normalized = Self::local_identifier_from_word(word)?;
+        let trimmed = word.trim();
+        if sql_text::is_quoted_identifier(trimmed) {
+            Some(trimmed.to_string())
+        } else {
+            Some(normalized)
+        }
+    }
+
+    fn local_identifier_lookup_upper(identifier: &str) -> String {
+        let trimmed = identifier.trim();
+        if sql_text::is_quoted_identifier(trimmed) {
+            sql_text::strip_identifier_quotes(trimmed).to_ascii_uppercase()
+        } else if matches!(trimmed.chars().next(), Some('"') | Some('`')) {
+            trimmed[1..].to_ascii_uppercase()
+        } else {
+            identifier.to_ascii_uppercase()
+        }
+    }
+
     #[cfg(test)]
     fn build_routine_symbol_cache_bundle_for_test(
         full_text: &str,
@@ -2893,6 +2931,19 @@ impl SqlEditorWidget {
     #[cfg(test)]
     fn collect_local_symbol_suggestions_for_test(
         script_with_cursor: &str,
+        session_bind_names: &[&str],
+    ) -> Vec<String> {
+        Self::collect_local_symbol_suggestions_with_prefix_for_test(
+            script_with_cursor,
+            "",
+            session_bind_names,
+        )
+    }
+
+    #[cfg(test)]
+    fn collect_local_symbol_suggestions_with_prefix_for_test(
+        script_with_cursor: &str,
+        prefix: &str,
         session_bind_names: &[&str],
     ) -> Vec<String> {
         const CURSOR_MARKER: &str = "__CODEX_CURSOR__";
@@ -2912,7 +2963,7 @@ impl SqlEditorWidget {
             .map(|name| (*name).to_string())
             .collect();
         Self::collect_local_symbol_suggestions(
-            "",
+            prefix,
             expanded.cursor_in_statement,
             &analysis,
             &session_bind_names,

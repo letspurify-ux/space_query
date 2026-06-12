@@ -3395,6 +3395,48 @@ fn fast_path_delete_hides_popup_when_prefix_too_short_without_qualifier() {
 }
 
 #[test]
+fn fast_path_filter_accepts_identifier_quote_prefix_chars() {
+    assert!(SqlEditorWidget::is_fast_filter_key(
+        Key::from_char('"'),
+        Some('"')
+    ));
+    assert!(SqlEditorWidget::is_fast_filter_key(
+        Key::from_char('`'),
+        Some('`')
+    ));
+    assert!(SqlEditorWidget::is_cursor_within_completion_range(
+        7,
+        5,
+        6,
+        Key::from_char('"'),
+        Some('"')
+    ));
+    assert!(SqlEditorWidget::is_cursor_within_completion_range(
+        7,
+        5,
+        6,
+        Key::from_char('`'),
+        Some('`')
+    ));
+}
+
+#[test]
+fn fast_path_prefix_preserves_quoted_identifier_body() {
+    assert_eq!(
+        SqlEditorWidget::completion_prefix_from_range_text(r#""Order I"#),
+        r#""Order I"#
+    );
+    assert_eq!(
+        SqlEditorWidget::completion_prefix_from_range_text("`Order I"),
+        "`Order I"
+    );
+    assert_eq!(
+        SqlEditorWidget::completion_prefix_from_range_text("Order I"),
+        "OrderI"
+    );
+}
+
+#[test]
 fn auto_trigger_forced_char_requires_qualifier_or_two_chars() {
     assert!(!SqlEditorWidget::should_auto_trigger_intellisense_for_forced_char("", None));
     assert!(!SqlEditorWidget::should_auto_trigger_intellisense_for_forced_char("a", None));
@@ -4510,6 +4552,94 @@ END demo_proc;"#,
 }
 
 #[test]
+fn local_symbol_suggestions_preserve_quoted_local_variable_names() {
+    let suggestions = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+        r#"DECLARE
+    "Employee Name" VARCHAR2(100);
+    "Status.Flag" NUMBER;
+BEGIN
+    __CODEX_CURSOR__NULL;
+END;"#,
+        &[],
+    );
+
+    assert_has_case_insensitive(&suggestions, r#""Employee Name""#);
+    assert_has_case_insensitive(&suggestions, r#""Status.Flag""#);
+    assert!(
+        !suggestions
+            .iter()
+            .any(|name| name == "Employee Name" || name == "Status.Flag"),
+        "quoted local symbols should remain insertable: {:?}",
+        suggestions
+    );
+}
+
+#[test]
+fn local_symbol_suggestions_match_quoted_local_variable_by_unquoted_prefix() {
+    let suggestions = SqlEditorWidget::collect_local_symbol_suggestions_with_prefix_for_test(
+        r#"DECLARE
+    "Employee Name" VARCHAR2(100);
+    normal_name VARCHAR2(100);
+BEGIN
+    __CODEX_CURSOR__NULL;
+END;"#,
+        "Emp",
+        &[],
+    );
+
+    assert_eq!(suggestions, vec![r#""Employee Name""#.to_string()]);
+}
+
+#[test]
+fn local_symbol_suggestions_match_quoted_local_variable_by_quoted_prefix() {
+    let suggestions = SqlEditorWidget::collect_local_symbol_suggestions_with_prefix_for_test(
+        r#"DECLARE
+    "Employee Name" VARCHAR2(100);
+    normal_name VARCHAR2(100);
+BEGIN
+    __CODEX_CURSOR__NULL;
+END;"#,
+        r#""Emp"#,
+        &[],
+    );
+
+    assert_eq!(suggestions, vec![r#""Employee Name""#.to_string()]);
+}
+
+#[test]
+fn local_symbol_suggestions_preserve_quoted_routine_parameter_names() {
+    let suggestions = SqlEditorWidget::collect_local_symbol_suggestions_with_prefix_for_test(
+        r#"CREATE OR REPLACE PROCEDURE demo_proc (
+    "Employee Name" IN VARCHAR2,
+    p_name IN VARCHAR2
+) IS
+BEGIN
+    __CODEX_CURSOR__NULL;
+END demo_proc;"#,
+        r#""Emp"#,
+        &[],
+    );
+
+    assert_eq!(suggestions, vec![r#""Employee Name""#.to_string()]);
+}
+
+#[test]
+fn local_symbol_suggestions_preserve_quoted_cursor_names() {
+    let suggestions = SqlEditorWidget::collect_local_symbol_suggestions_with_prefix_for_test(
+        r#"DECLARE
+    CURSOR "Employee Cursor" IS
+        SELECT empno FROM emp;
+BEGIN
+    __CODEX_CURSOR__NULL;
+END;"#,
+        r#""Emp"#,
+        &[],
+    );
+
+    assert_eq!(suggestions, vec![r#""Employee Cursor""#.to_string()]);
+}
+
+#[test]
 fn local_symbol_suggestions_keep_only_visible_nested_block_symbols() {
     let inner_suggestions = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
         r#"DECLARE
@@ -4660,6 +4790,27 @@ END;"#,
         "Emp",
     )
     .expect("quoted cursor projection alias should match by unquoted prefix");
+
+    assert_eq!(suggestions, vec![r#""Employee Name""#.to_string()]);
+}
+
+#[test]
+fn local_record_member_suggestions_match_quoted_cursor_projection_alias_by_quoted_prefix() {
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        r#"BEGIN
+    FOR rec IN (
+        SELECT
+            ename AS "Employee Name",
+            sal AS normal_sal
+        FROM emp
+    ) LOOP
+        rec."Emp__CODEX_CURSOR__
+    END LOOP;
+END;"#,
+        "rec",
+        r#""Emp"#,
+    )
+    .expect("quoted cursor projection alias should match by an incomplete quoted prefix");
 
     assert_eq!(suggestions, vec![r#""Employee Name""#.to_string()]);
 }
@@ -5462,6 +5613,69 @@ END;"#;
 }
 
 #[test]
+fn local_record_member_suggestions_match_quoted_record_field_by_quoted_prefix() {
+    const CURSOR_MARKER: &str = "__CODEX_CURSOR__";
+    let script_with_cursor = r#"DECLARE
+    TYPE addr_rec IS RECORD (
+        "Street.Name" VARCHAR2(100),
+        city VARCHAR2(100)
+    );
+    v_addr addr_rec;
+BEGIN
+    v_addr.__CODEX_CURSOR__
+END;"#;
+    let cursor = script_with_cursor.find(CURSOR_MARKER).unwrap();
+    let sql = script_with_cursor.replacen(CURSOR_MARKER, "", 1);
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor)
+        .expect("record qualifier should be available while typing a quoted field prefix");
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        script_with_cursor,
+        &qualifier,
+        r#""St"#,
+    )
+    .expect("quoted record field should be matched by an incomplete quoted prefix");
+
+    assert_eq!(suggestions, vec![r#""Street.Name""#.to_string()]);
+}
+
+#[test]
+fn local_record_member_suggestions_match_inline_incomplete_quoted_prefix() {
+    const CURSOR_MARKER: &str = "__CODEX_CURSOR__";
+    let script_with_cursor = r#"DECLARE
+    TYPE addr_rec IS RECORD (
+        "Street.Name" VARCHAR2(100),
+        city VARCHAR2(100)
+    );
+    v_addr addr_rec;
+BEGIN
+    v_addr."St__CODEX_CURSOR__
+END;"#;
+    let cursor = script_with_cursor.find(CURSOR_MARKER).unwrap();
+    let sql = script_with_cursor.replacen(CURSOR_MARKER, "", 1);
+    let (prefix, word_start, word_end) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, word_start)
+        .expect("record qualifier should survive an incomplete quoted field prefix");
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        script_with_cursor,
+        &qualifier,
+        &prefix,
+    )
+    .expect("quoted record field should be matched from the inline editor prefix");
+    let replacement = SqlEditorWidget::completion_replacement_range_from_word_bounds(
+        &prefix,
+        word_start,
+        word_end,
+        cursor,
+        Some((word_start, cursor)),
+    );
+
+    assert_eq!(prefix, r#""St"#);
+    assert_eq!(qualifier, "v_addr");
+    assert_eq!(suggestions, vec![r#""Street.Name""#.to_string()]);
+    assert_eq!(sql.get(replacement.0..replacement.1), Some(r#""St"#));
+}
+
+#[test]
 fn local_record_member_suggestions_include_quoted_record_type_with_dot() {
     const CURSOR_MARKER: &str = "__CODEX_CURSOR__";
     let script_with_cursor = r#"DECLARE
@@ -5785,6 +5999,52 @@ END;"#,
 }
 
 #[test]
+fn local_record_member_suggestions_include_varray_element_record_type_fields() {
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        r#"DECLARE
+    TYPE emp_rec IS RECORD (
+        empno NUMBER,
+        employee_name VARCHAR2(100)
+    );
+    TYPE emp_arr IS VARRAY(10) OF emp_rec;
+    v_emps emp_arr;
+BEGIN
+    v_emps(1).__CODEX_CURSOR__
+END;"#,
+        "v_emps",
+        "",
+    )
+    .expect("VARRAY element should expose local record fields");
+
+    for expected in ["empno", "employee_name"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_record_member_suggestions_include_varying_array_element_record_type_fields() {
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        r#"DECLARE
+    TYPE emp_rec IS RECORD (
+        empno NUMBER,
+        employee_name VARCHAR2(100)
+    );
+    TYPE emp_arr IS VARYING ARRAY(10) OF emp_rec;
+    v_emps emp_arr;
+BEGIN
+    v_emps(1).__CODEX_CURSOR__
+END;"#,
+        "v_emps",
+        "",
+    )
+    .expect("VARYING ARRAY element should expose local record fields");
+
+    for expected in ["empno", "employee_name"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
 fn local_record_member_suggestions_include_collection_element_cursor_rowtype_fields() {
     let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
         r#"DECLARE
@@ -5874,6 +6134,27 @@ END;"#,
         &["EMPNO", "ENAME", "SAL"],
     )
     .expect("collection variable should expose table %ROWTYPE element fields");
+
+    for expected in ["EMPNO", "ENAME", "SAL"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_rowtype_member_suggestions_include_varray_element_table_rowtype_fields() {
+    let suggestions = SqlEditorWidget::collect_local_rowtype_member_suggestions_for_test(
+        r#"DECLARE
+    TYPE emp_arr IS VARRAY(10) OF emp%ROWTYPE;
+    v_emps emp_arr;
+BEGIN
+    v_emps(1).__CODEX_CURSOR__
+END;"#,
+        "v_emps",
+        "",
+        "EMP",
+        &["EMPNO", "ENAME", "SAL"],
+    )
+    .expect("VARRAY element over table %ROWTYPE should expose loaded table columns");
 
     for expected in ["EMPNO", "ENAME", "SAL"] {
         assert_has_case_insensitive(&suggestions, expected);
@@ -6383,7 +6664,7 @@ RETURN __CODEX_CURSOR__p_amount + `p_rate`;"#,
     );
 
     assert_has_case_insensitive(&suggestions, "p_amount");
-    assert_has_case_insensitive(&suggestions, "p_rate");
+    assert_has_case_insensitive(&suggestions, "`p_rate`");
 }
 
 #[test]
@@ -6402,7 +6683,7 @@ END;"#,
     );
 
     assert_has_case_insensitive(&suggestions, "v_count");
-    assert_has_case_insensitive(&suggestions, "v_total");
+    assert_has_case_insensitive(&suggestions, "`v_total`");
     assert_has_case_insensitive(&suggestions, "cur_emp");
     assert!(
         !suggestions

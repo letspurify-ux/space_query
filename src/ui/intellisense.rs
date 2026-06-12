@@ -1255,7 +1255,7 @@ impl IntellisenseData {
     ) -> Vec<String> {
         self.ensure_base_indices();
 
-        let prefix_upper = prefix.to_uppercase();
+        let prefix_upper = Self::entry_lookup_prefix_upper(prefix);
         let mut suggestions = Vec::new();
         let mut seen = HashSet::new();
 
@@ -2000,7 +2000,7 @@ impl IntellisenseData {
     }
 
     fn suggestions_from_entry_groups(prefix: &str, groups: &[&[NameEntry]]) -> Vec<String> {
-        let prefix_upper = prefix.to_uppercase();
+        let prefix_upper = Self::entry_lookup_prefix_upper(prefix);
         let mut suggestions = Vec::new();
         let mut seen = HashSet::new();
 
@@ -2037,6 +2037,18 @@ impl IntellisenseData {
         let mut entries: Vec<NameEntry> = names.iter().cloned().map(NameEntry::new).collect();
         entries.sort_by(|a, b| a.upper.cmp(&b.upper).then_with(|| a.name.cmp(&b.name)));
         entries
+    }
+
+    fn entry_lookup_prefix_upper(prefix: &str) -> String {
+        let trimmed = prefix.trim();
+        if sql_text::is_quoted_identifier(trimmed) {
+            return sql_text::strip_identifier_quotes(trimmed).to_uppercase();
+        }
+
+        match trimmed.chars().next() {
+            Some('"') | Some('`') => trimmed[1..].to_uppercase(),
+            _ => prefix.to_uppercase(),
+        }
     }
 
     fn normalize_qualifier_lookup_key(qualifier: &str) -> String {
@@ -2653,15 +2665,48 @@ pub fn filter_suggestions_by_prefix(suggestions: &[String], prefix: &str) -> Vec
 }
 
 fn suggestion_matches_completion_prefix(candidate: &str, prefix: &str) -> bool {
-    starts_with_ignore_ascii_case(candidate, prefix)
+    identifier_matches_completion_prefix(candidate, prefix)
         || comparison_lhs_identifier_prefix(candidate)
-            .is_some_and(|identifier| starts_with_ignore_ascii_case(identifier, prefix))
+            .is_some_and(|identifier| identifier_matches_completion_prefix(identifier, prefix))
 }
 
 fn comparison_lhs_identifier_prefix(candidate: &str) -> Option<&str> {
     let lhs = candidate.split_once('=')?.0.trim_end();
     let identifier = lhs.rsplit('.').next()?.trim();
-    Some(strip_matching_identifier_quotes(identifier))
+    Some(identifier)
+}
+
+fn identifier_matches_completion_prefix(candidate: &str, prefix: &str) -> bool {
+    if starts_with_ignore_ascii_case(candidate, prefix) {
+        return true;
+    }
+
+    let Some(prefix_delimiter) = identifier_quote_delimiter(prefix) else {
+        return starts_with_ignore_ascii_case(strip_matching_identifier_quotes(candidate), prefix);
+    };
+
+    if identifier_quote_delimiter(candidate) != Some(prefix_delimiter) {
+        return false;
+    }
+
+    starts_with_ignore_ascii_case(
+        strip_matching_identifier_quotes(candidate),
+        strip_incomplete_identifier_quote(prefix),
+    )
+}
+
+fn identifier_quote_delimiter(value: &str) -> Option<char> {
+    match value.chars().next() {
+        Some('"') | Some('`') => value.chars().next(),
+        _ => None,
+    }
+}
+
+fn strip_incomplete_identifier_quote(value: &str) -> &str {
+    match identifier_quote_delimiter(value) {
+        Some(delimiter) => value.get(delimiter.len_utf8()..).unwrap_or(""),
+        None => value,
+    }
 }
 
 fn strip_matching_identifier_quotes(value: &str) -> &str {
@@ -2736,6 +2781,15 @@ pub fn get_word_at_cursor(text: &str, cursor_pos: usize) -> (String, usize, usiz
         pos
     };
 
+    if let Some((start, delimiter)) =
+        incomplete_quoted_identifier_start_before_cursor(text, effective_pos)
+    {
+        let end = quoted_identifier_end_from_cursor(text, effective_pos, delimiter)
+            .unwrap_or(effective_pos);
+        let word = text.get(start..effective_pos).unwrap_or("").to_string();
+        return (word, start, end);
+    }
+
     // Find word start by scanning backwards over identifier characters.
     let mut start = effective_pos;
     while start > 0 {
@@ -2764,6 +2818,79 @@ pub fn get_word_at_cursor(text: &str, cursor_pos: usize) -> (String, usize, usiz
 
     let word = text.get(start..effective_pos).unwrap_or("").to_string();
     (word, start, end)
+}
+
+fn incomplete_quoted_identifier_start_before_cursor(
+    text: &str,
+    cursor_pos: usize,
+) -> Option<(usize, char)> {
+    let mut idx = cursor_pos;
+    while idx > 0 {
+        let (prev_idx, ch) = text.get(..idx)?.char_indices().next_back()?;
+        if matches!(ch, '"' | '`') {
+            if quoted_identifier_start_context(text, prev_idx)
+                && !has_unescaped_identifier_delimiter(
+                    text,
+                    prev_idx + ch.len_utf8(),
+                    cursor_pos,
+                    ch,
+                )
+            {
+                return Some((prev_idx, ch));
+            }
+        }
+        idx = prev_idx;
+    }
+
+    None
+}
+
+fn quoted_identifier_start_context(text: &str, quote_idx: usize) -> bool {
+    text.get(..quote_idx)
+        .and_then(|prefix| prefix.chars().next_back())
+        .is_none_or(|ch| !sql_text::is_identifier_char(ch) && !matches!(ch, '"' | '`' | '\''))
+}
+
+fn has_unescaped_identifier_delimiter(
+    text: &str,
+    start: usize,
+    end: usize,
+    delimiter: char,
+) -> bool {
+    let Some(segment) = text.get(start..end) else {
+        return false;
+    };
+    let mut chars = segment.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == delimiter {
+            if chars.peek().is_some_and(|next| *next == delimiter) {
+                chars.next();
+            } else {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn quoted_identifier_end_from_cursor(
+    text: &str,
+    cursor_pos: usize,
+    delimiter: char,
+) -> Option<usize> {
+    let mut iter = text.get(cursor_pos..)?.char_indices().peekable();
+    while let Some((rel_idx, ch)) = iter.next() {
+        if ch == delimiter {
+            if iter.peek().is_some_and(|(_, next)| *next == delimiter) {
+                iter.next();
+            } else {
+                return Some(cursor_pos + rel_idx + ch.len_utf8());
+            }
+        }
+    }
+
+    None
 }
 
 /// A formatted routine signature for the parameter-hint popup, with the byte
@@ -3475,6 +3602,38 @@ mod intellisense_tests {
     }
 
     #[test]
+    fn get_word_at_cursor_expands_incomplete_double_quoted_identifier() {
+        let sql = r#"SELECT rec."Street N FROM dual"#;
+        let cursor = sql.find(" FROM").expect("expected cursor anchor");
+        let (word, start, end) = get_word_at_cursor(sql, cursor);
+
+        assert_eq!(word, r#""Street N"#);
+        assert_eq!(sql.get(start..cursor), Some(r#""Street N"#));
+        assert_eq!(end, cursor);
+    }
+
+    #[test]
+    fn get_word_at_cursor_expands_incomplete_backtick_identifier() {
+        let sql = "SELECT rec.`Street N FROM dual";
+        let cursor = sql.find(" FROM").expect("expected cursor anchor");
+        let (word, start, end) = get_word_at_cursor(sql, cursor);
+
+        assert_eq!(word, "`Street N");
+        assert_eq!(sql.get(start..cursor), Some("`Street N"));
+        assert_eq!(end, cursor);
+    }
+
+    #[test]
+    fn get_word_at_cursor_ignores_completed_quoted_identifier_before_cursor() {
+        let sql = r#"SELECT rec."Street Name".ci FROM dual"#;
+        let cursor = sql.find(" FROM").expect("expected cursor anchor");
+        let (word, start, _) = get_word_at_cursor(sql, cursor);
+
+        assert_eq!(word, "ci");
+        assert_eq!(sql.get(start..cursor), Some("ci"));
+    }
+
+    #[test]
     fn detect_sql_context_clamps_non_char_boundary_cursor() {
         let sql = "SELECT 한글컬럼 FROM dual";
         let cursor = sql.find("한").unwrap_or(0) + 1;
@@ -3988,6 +4147,71 @@ mod intellisense_tests {
     }
 
     #[test]
+    fn filter_suggestions_by_prefix_matches_quoted_identifier_by_unquoted_prefix() {
+        let suggestions = vec![
+            r#""Street.Name""#.to_string(),
+            "STATUS".to_string(),
+            "city".to_string(),
+        ];
+        let filtered = filter_suggestions_by_prefix(&suggestions, "St");
+
+        assert_eq!(
+            filtered,
+            vec![r#""Street.Name""#.to_string(), "STATUS".to_string()]
+        );
+    }
+
+    #[test]
+    fn filter_suggestions_by_prefix_matches_quoted_identifier_by_incomplete_quoted_prefix() {
+        let suggestions = vec![
+            r#""Street.Name""#.to_string(),
+            "STATUS".to_string(),
+            "city".to_string(),
+        ];
+        let filtered = filter_suggestions_by_prefix(&suggestions, r#""St"#);
+
+        assert_eq!(filtered, vec![r#""Street.Name""#.to_string()]);
+    }
+
+    #[test]
+    fn filter_suggestions_by_prefix_preserves_space_inside_incomplete_quoted_prefix() {
+        let suggestions = vec![
+            r#""Order Id""#.to_string(),
+            r#""Order Date""#.to_string(),
+            "ORDER_TOTAL".to_string(),
+        ];
+        let filtered = filter_suggestions_by_prefix(&suggestions, r#""Order I"#);
+
+        assert_eq!(filtered, vec![r#""Order Id""#.to_string()]);
+    }
+
+    #[test]
+    fn filter_suggestions_by_prefix_matches_backtick_identifier_by_incomplete_prefix() {
+        let suggestions = vec![
+            "`Street.Name`".to_string(),
+            "STATUS".to_string(),
+            "city".to_string(),
+        ];
+        let filtered = filter_suggestions_by_prefix(&suggestions, "`St");
+
+        assert_eq!(filtered, vec!["`Street.Name`".to_string()]);
+    }
+
+    #[test]
+    fn filter_suggestions_by_prefix_matches_quoted_condition_by_incomplete_quoted_prefix() {
+        let suggestions = vec![
+            "a.\"Order Id\" = b.\"Order Id\"".to_string(),
+            "a.order_no = b.order_no".to_string(),
+        ];
+        let filtered = filter_suggestions_by_prefix(&suggestions, r#""Or"#);
+
+        assert_eq!(
+            filtered,
+            vec!["a.\"Order Id\" = b.\"Order Id\"".to_string()]
+        );
+    }
+
+    #[test]
     fn popup_page_selection_advances_by_page_size_and_clamps_to_end() {
         assert_eq!(IntellisensePopup::next_page_selection(1, 25), Some(11));
         assert_eq!(IntellisensePopup::next_page_selection(20, 25), Some(25));
@@ -4192,6 +4416,20 @@ mod intellisense_tests {
 
         let scope = vec!["REC".to_string()];
         let suggestions = data.get_column_suggestions("Emp", Some(scope.as_slice()));
+
+        assert_eq!(suggestions, vec![r#""Employee Name""#.to_string()]);
+    }
+
+    #[test]
+    fn get_column_suggestions_match_quoted_columns_by_incomplete_quoted_prefix() {
+        let mut data = IntellisenseData::new();
+        data.set_virtual_table_columns(
+            "REC",
+            vec![r#""Employee Name""#.to_string(), "NORMAL_SAL".to_string()],
+        );
+
+        let scope = vec!["REC".to_string()];
+        let suggestions = data.get_column_suggestions(r#""Emp"#, Some(scope.as_slice()));
 
         assert_eq!(suggestions, vec![r#""Employee Name""#.to_string()]);
     }

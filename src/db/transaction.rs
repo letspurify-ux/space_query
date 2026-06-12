@@ -1158,6 +1158,7 @@ pub(crate) struct MySqlBatchSessionEffects {
     transaction_state_cleared: bool,
     requires_transaction_decision_after_success: bool,
     preserve_decision_after_failed_implicit_commit: bool,
+    server_transaction_probe_requires_preservation: bool,
     physical_session_released: bool,
     interrupted_statement_requires_physical_discard: bool,
     prior_transaction_effect: BatchPriorTransactionEffect,
@@ -1178,6 +1179,7 @@ impl Default for MySqlBatchSessionEffects {
             transaction_state_cleared: false,
             requires_transaction_decision_after_success: false,
             preserve_decision_after_failed_implicit_commit: false,
+            server_transaction_probe_requires_preservation: false,
             physical_session_released: false,
             interrupted_statement_requires_physical_discard: false,
             prior_transaction_effect: BatchPriorTransactionEffect::default(),
@@ -1326,6 +1328,7 @@ impl MySqlBatchSessionEffects {
         self.physical_session_released = true;
         self.mark_transaction_clean();
         self.requires_transaction_decision_after_success = false;
+        self.server_transaction_probe_requires_preservation = false;
         self.session_residue_state = SessionResidueState::default();
         self.session_residue_cleared = true;
         self.table_lock_delta = BatchTableLockDelta::Released;
@@ -1377,6 +1380,15 @@ impl MySqlBatchSessionEffects {
         );
         let state_hint = effects.state_hint;
         let had_known_table_lock = self.table_lock_delta.may_hold();
+        if mysql_statement_server_probe_requires_transaction_preservation_for_db_type(
+            self.db_type,
+            &effective_sql,
+            RetainedSessionState::default(),
+            effects,
+            auto_commit,
+        ) {
+            self.server_transaction_probe_requires_preservation = true;
+        }
 
         if cleanup_effects_confirmed && effects.releases_physical_session() {
             self.mark_physical_session_released();
@@ -1603,12 +1615,32 @@ impl MySqlBatchSessionEffects {
         }
     }
 
+    fn server_transaction_probe_reports_uncommitted_work_after_batch(
+        &self,
+        prior_state: RetainedSessionState,
+        server_reports_uncommitted_work: bool,
+    ) -> bool {
+        let prior_transaction_state = self.prior_transaction_state_after_batch(prior_state);
+        server_reports_uncommitted_work
+            && (self.server_transaction_probe_requires_preservation
+                || self.may_have_uncommitted_work_after_batch(prior_state)
+                || prior_transaction_state.requires_transaction_decision()
+                || self.requires_transaction_decision_after_success
+                || (self.preserve_decision_after_failed_implicit_commit
+                    && prior_transaction_state.requires_transaction_decision()))
+    }
+
     pub(crate) fn retained_state_after_successful_batch(
         &self,
         prior_state: RetainedSessionState,
         server_reports_uncommitted_work: bool,
     ) -> RetainedSessionState {
         let prior_transaction_state = self.prior_transaction_state_after_batch(prior_state);
+        let server_reports_uncommitted_work = self
+            .server_transaction_probe_reports_uncommitted_work_after_batch(
+                prior_state,
+                server_reports_uncommitted_work,
+            );
         let decision_preserved_after_failed_implicit_commit = server_reports_uncommitted_work
             && self.preserve_decision_after_failed_implicit_commit
             && prior_state
@@ -1994,6 +2026,8 @@ pub(crate) fn retained_session_state_after_statement(
 }
 
 pub(crate) fn mysql_transaction_probe_fallback_on_error(
+    db_type: DatabaseType,
+    sql: &str,
     prior_state: RetainedSessionState,
     effects: StatementSessionEffects,
     auto_commit: bool,
@@ -2009,14 +2043,13 @@ pub(crate) fn mysql_transaction_probe_fallback_on_error(
     } else if state_hint.clears_session_state {
         false
     } else {
-        prior_state.may_have_uncommitted_work()
-            || effects.starts_transaction_state()
-            || effects.opens_or_preserves_transaction_state()
-            || effects.may_leave_uncommitted_work()
-            || effects
-                .session_residue
-                .consumes_next_transaction_mode_override
-            || (state_hint.requires_retention_when_autocommit_off && !auto_commit)
+        mysql_statement_server_probe_requires_transaction_preservation_for_db_type(
+            db_type,
+            sql,
+            prior_state,
+            effects,
+            auto_commit,
+        )
     }
 }
 
@@ -3222,6 +3255,88 @@ fn mysql_statement_starts_read_transaction_for_analysis(
         && crate::db::query::mysql_executor::MysqlExecutor::is_select_statement_for_db_type(
             db_type, sql,
         ))
+}
+
+fn mysql_statement_is_read_only_transaction_probe_noise_for_db_type(
+    db_type: DatabaseType,
+    sql: &str,
+    effects: StatementSessionEffects,
+) -> bool {
+    let effective_sql = mysql_effective_statement_sql_for_db_type(db_type, sql);
+    let analysis = SqlStatementAnalysis::new_for_db_type(db_type, &effective_sql);
+    let hint = effects.state_hint;
+
+    mysql_statement_starts_read_transaction_for_analysis(db_type, &effective_sql, &analysis)
+        && !effects.has_implicit_commit()
+        && !effects.starts_transaction_state()
+        && !effects.opens_or_preserves_transaction_state()
+        && !effects.may_leave_uncommitted_work()
+        && !effects.releases_physical_session()
+        && !effects.may_leave_session_residue()
+        && !effects.acquires_table_lock()
+        && !effects.acquires_flush_table_lock()
+        && !effects.acquires_backup_lock()
+        && !effects.acquires_named_lock()
+        && !hint.clears_session_state
+        && !hint.may_leave_session_bound_state
+        && !hint.may_leave_untracked_session_state
+        && !hint.may_hold_session_lock
+        && !hint.requires_retention_when_autocommit_off
+        && !hint.requires_transaction_decision_after_success
+        && !hint.changes_auto_commit
+}
+
+pub(crate) fn mysql_statement_server_probe_requires_transaction_preservation_for_db_type(
+    db_type: DatabaseType,
+    sql: &str,
+    prior_state: RetainedSessionState,
+    effects: StatementSessionEffects,
+    _auto_commit: bool,
+) -> bool {
+    let hint = effects.state_hint;
+    if prior_state.may_have_uncommitted_work()
+        || effects.starts_transaction_state()
+        || effects.opens_or_preserves_transaction_state()
+        || effects.may_leave_uncommitted_work()
+        || hint.requires_transaction_decision_after_success
+    {
+        return true;
+    }
+
+    if effects.session_residue.clears_all_session_residue
+        || effects.has_implicit_commit()
+        || hint.clears_session_state
+        || effects.clears_transaction_state()
+        || effects.releases_physical_session()
+        || mysql_statement_is_read_only_transaction_probe_noise_for_db_type(db_type, sql, effects)
+    {
+        return false;
+    }
+
+    let effective_sql = mysql_effective_statement_sql_for_db_type(db_type, sql);
+    let analysis = SqlStatementAnalysis::new_for_db_type(db_type, &effective_sql);
+    matches!(
+        analysis.classify_for_db_type(db_type),
+        SqlKind::Dml | SqlKind::PlsqlOrProcedure | SqlKind::Script | SqlKind::Unknown
+    )
+}
+
+pub(crate) fn mysql_server_probe_reports_uncommitted_work_for_statement(
+    db_type: DatabaseType,
+    sql: &str,
+    prior_state: RetainedSessionState,
+    effects: StatementSessionEffects,
+    auto_commit: bool,
+    server_reports_uncommitted_work: bool,
+) -> bool {
+    server_reports_uncommitted_work
+        && mysql_statement_server_probe_requires_transaction_preservation_for_db_type(
+            db_type,
+            sql,
+            prior_state,
+            effects,
+            auto_commit,
+        )
 }
 
 fn mysql_statement_may_leave_uncommitted_work_for_analysis(
@@ -6844,7 +6959,12 @@ mod tests {
         let effects = post_processor.effects_for_sql("CREATE TABLE t (id INT)");
 
         assert!(mysql_transaction_probe_fallback_on_error(
-            prior, effects, true, false
+            DatabaseType::MySQL,
+            "CREATE TABLE t (id INT)",
+            prior,
+            effects,
+            true,
+            false
         ));
     }
 
@@ -6864,6 +6984,8 @@ mod tests {
             );
             assert!(
                 !mysql_transaction_probe_fallback_on_error(
+                    DatabaseType::MySQL,
+                    sql,
                     RetainedSessionState::default(),
                     effects,
                     true,
@@ -6890,7 +7012,7 @@ mod tests {
     }
 
     #[test]
-    fn mysql_probe_fallback_keeps_autocommit_off_read_transaction_risk() {
+    fn mysql_probe_fallback_ignores_autocommit_off_read_only_transaction_noise() {
         let post_processor = statement_session_post_processor_for(DatabaseType::MySQL);
         let effects = mysql_statement_session_effects_for_execution_context(
             "SELECT 1",
@@ -6898,12 +7020,39 @@ mod tests {
             post_processor.effects_for_sql("SELECT 1"),
         );
 
-        assert!(mysql_transaction_probe_fallback_on_error(
+        assert!(!mysql_transaction_probe_fallback_on_error(
+            DatabaseType::MySQL,
+            "SELECT 1",
             RetainedSessionState::default(),
             effects,
             false,
             false,
         ));
+    }
+
+    #[test]
+    fn mysql_probe_fallback_keeps_autocommit_off_write_and_locking_read_risk() {
+        let post_processor = statement_session_post_processor_for(DatabaseType::MySQL);
+
+        for sql in ["UPDATE t SET id = id", "SELECT * FROM t FOR UPDATE"] {
+            let effects = mysql_statement_session_effects_for_execution_context(
+                sql,
+                false,
+                post_processor.effects_for_sql(sql),
+            );
+
+            assert!(
+                mysql_transaction_probe_fallback_on_error(
+                    DatabaseType::MySQL,
+                    sql,
+                    RetainedSessionState::default(),
+                    effects,
+                    false,
+                    false,
+                ),
+                "{sql} still needs commit/rollback preservation"
+            );
+        }
     }
 
     #[test]
@@ -8518,7 +8667,7 @@ mod tests {
                 .retained_state_after_successful_batch(RetainedSessionState::default(), true);
             assert_eq!(
                 retained.transaction_state(),
-                TransactionSessionState::MaybeDirty,
+                TransactionSessionState::Clean,
                 "{sql}"
             );
             assert!(!retained.may_have_transaction_mode_override(), "{sql}");
@@ -8758,7 +8907,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_mysql_batch_clear_does_not_resurrect_prior_decision_on_dirty_probe() {
+    fn successful_mysql_batch_clear_ignores_probe_without_new_dirty_work() {
         let post_processor = statement_session_post_processor_for(DatabaseType::MySQL);
         let mut batch_effects = MySqlBatchSessionEffects::default();
         batch_effects.apply_successful_statement_effects(
@@ -8773,8 +8922,8 @@ mod tests {
 
         assert_eq!(
             retained.transaction_state(),
-            TransactionSessionState::MaybeDirty,
-            "a successful COMMIT clears the old decision; a later dirty probe only means new work may exist",
+            TransactionSessionState::Clean,
+            "a successful COMMIT clears the old decision; a probe alone must not invent work that needs commit/rollback",
         );
         assert!(!retained.requires_transaction_decision());
     }

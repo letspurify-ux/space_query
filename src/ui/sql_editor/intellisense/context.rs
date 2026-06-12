@@ -1534,7 +1534,7 @@ impl SqlEditorWidget {
 
         // Allow forward typing past the previous end only for identifier-extension input.
         cursor > end
-            && typed_char.is_some_and(sql_text::is_identifier_char)
+            && typed_char.is_some_and(Self::is_completion_prefix_char)
             && !matches!(key, Key::BackSpace | Key::Delete)
     }
 
@@ -1542,7 +1542,11 @@ impl SqlEditorWidget {
         if matches!(key, Key::BackSpace | Key::Delete) {
             return true;
         }
-        typed_char.is_some_and(sql_text::is_identifier_char)
+        typed_char.is_some_and(Self::is_completion_prefix_char)
+    }
+
+    fn is_completion_prefix_char(ch: char) -> bool {
+        sql_text::is_identifier_char(ch) || matches!(ch, '"' | '`')
     }
 
     fn should_force_full_analysis(ch: char) -> bool {
@@ -1601,9 +1605,17 @@ impl SqlEditorWidget {
     ) -> String {
         let cursor = cursor_pos.max(0) as usize;
         let end = cursor.max(start);
-        text_buffer_access::text_range(buffer, Some(text_shadow), start as i32, end as i32)
-            .chars()
-            .filter(|ch| sql_text::is_identifier_char(*ch))
+        let text = text_buffer_access::text_range(buffer, Some(text_shadow), start as i32, end as i32);
+        Self::completion_prefix_from_range_text(&text)
+    }
+
+    fn completion_prefix_from_range_text(text: &str) -> String {
+        if matches!(text.chars().next(), Some('"') | Some('`')) {
+            return text.to_string();
+        }
+
+        text.chars()
+            .filter(|ch| Self::is_completion_prefix_char(*ch))
             .collect()
     }
 

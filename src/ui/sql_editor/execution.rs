@@ -5445,6 +5445,8 @@ impl SqlEditorWidget {
                     if should_retain_session {
                         let fallback_on_error =
                             crate::db::mysql_transaction_probe_fallback_on_error(
+                                connection_info.db_type,
+                                &sql_to_execute,
                                 prior_retained_state,
                                 statement_effects,
                                 auto_commit,
@@ -16897,7 +16899,16 @@ impl SqlEditorWidget {
                 auto_commit,
                 statement_effects,
             );
-        let may_have_uncommitted_work = transaction_probe.may_have_uncommitted_work
+        let server_reports_uncommitted_work =
+            crate::db::mysql_server_probe_reports_uncommitted_work_for_statement(
+                db_type,
+                sql,
+                prior_state,
+                statement_effects,
+                auto_commit,
+                transaction_probe.may_have_uncommitted_work,
+            );
+        let may_have_uncommitted_work = server_reports_uncommitted_work
             || (!auto_commit && statement_effects.may_leave_uncommitted_work());
         crate::db::retained_session_state_after_statement(
             crate::db::statement_session_post_processor_for(db_type),
@@ -19792,6 +19803,8 @@ impl SqlEditorWidget {
             && !prior_retained_state.requires_physical_session_preservation();
         let disposition = if should_retain_session {
             let fallback_on_error = crate::db::mysql_transaction_probe_fallback_on_error(
+                db_type,
+                statement_sql,
                 prior_retained_state,
                 statement_effects,
                 auto_commit,
@@ -21550,6 +21563,100 @@ mod query_execution_cleanup_tests {
                 ),
                 crate::db::RetainedSessionPreflightDecision::RequireResolution,
                 "{db_type} close preflight must ask for resolution"
+            );
+        }
+    }
+
+    #[test]
+    fn close_preflight_allows_read_only_select_state_on_all_db_types() {
+        for db_type in [
+            crate::db::DatabaseType::Oracle,
+            crate::db::DatabaseType::MySQL,
+            crate::db::DatabaseType::MariaDB,
+        ] {
+            let post_processor = crate::db::statement_session_post_processor_for(db_type);
+            let sql = if db_type == crate::db::DatabaseType::Oracle {
+                "SELECT 1 FROM dual"
+            } else {
+                "SELECT COUNT(*) FROM qb_customer"
+            };
+            let effects = post_processor.effects_for_sql(sql);
+            let retained_state = if db_type == crate::db::DatabaseType::Oracle {
+                SqlEditorWidget::oracle_retained_state_after_statement_effects(
+                    RetainedSessionState::default(),
+                    effects,
+                    false,
+                    false,
+                    false,
+                    false,
+                )
+            } else {
+                SqlEditorWidget::mysql_retained_session_state_after_statement_from_probe(
+                    db_type,
+                    RetainedSessionState::default(),
+                    sql,
+                    effects,
+                    false,
+                    false,
+                    crate::db::TransactionProbeResult {
+                        may_have_uncommitted_work: true,
+                        used_fallback: false,
+                    },
+                    false,
+                )
+            };
+
+            assert_eq!(
+                retained_state.transaction_state(),
+                TransactionSessionState::Clean,
+                "{db_type} read-only SELECT should not become dirty"
+            );
+            assert_eq!(
+                crate::db::retained_session_state_preflight_decision(
+                    crate::db::RetainedSessionPreflightAction::Close,
+                    retained_state,
+                ),
+                crate::db::RetainedSessionPreflightDecision::Allow,
+                "{db_type} close preflight must not ask for commit/rollback after read-only SELECT"
+            );
+        }
+    }
+
+    #[test]
+    fn close_preflight_requires_resolution_for_mysql_locking_select_on_dirty_probe() {
+        for db_type in [
+            crate::db::DatabaseType::MySQL,
+            crate::db::DatabaseType::MariaDB,
+        ] {
+            let sql = "SELECT * FROM accounts FOR UPDATE";
+            let post_processor = crate::db::statement_session_post_processor_for(db_type);
+            let retained_state =
+                SqlEditorWidget::mysql_retained_session_state_after_statement_from_probe(
+                    db_type,
+                    RetainedSessionState::default(),
+                    sql,
+                    post_processor.effects_for_sql(sql),
+                    false,
+                    false,
+                    crate::db::TransactionProbeResult {
+                        may_have_uncommitted_work: true,
+                        used_fallback: false,
+                    },
+                    false,
+                );
+
+            assert_eq!(
+                retained_state.transaction_state(),
+                TransactionSessionState::MaybeDirty,
+                "{db_type} locking SELECT still needs commit/rollback preservation"
+            );
+            assert_eq!(
+                crate::db::retained_session_state_preflight_decision(
+                    crate::db::RetainedSessionPreflightAction::Close,
+                    retained_state,
+                ),
+                crate::db::RetainedSessionPreflightDecision::RequireResolution,
+                "{db_type} close preflight must ask for resolution after locking SELECT"
             );
         }
     }
@@ -25379,8 +25486,30 @@ mod query_execution_cleanup_tests {
         );
         assert_eq!(
             autocommit_off_retained.transaction_state(),
-            TransactionSessionState::MaybeDirty
+            TransactionSessionState::Clean
         );
+
+        for sql in ["UPDATE t SET id = id", "SELECT * FROM t FOR UPDATE"] {
+            let effects = post_processor.effects_for_sql(sql);
+            let retained = SqlEditorWidget::mysql_retained_session_state_after_statement_from_probe(
+                crate::db::DatabaseType::MySQL,
+                RetainedSessionState::default(),
+                sql,
+                effects,
+                false,
+                false,
+                crate::db::TransactionProbeResult {
+                    may_have_uncommitted_work: true,
+                    used_fallback: false,
+                },
+                false,
+            );
+            assert_eq!(
+                retained.transaction_state(),
+                TransactionSessionState::MaybeDirty,
+                "{sql} must still keep commit/rollback state"
+            );
+        }
     }
 
     #[test]
