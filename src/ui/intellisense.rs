@@ -1384,6 +1384,7 @@ impl IntellisenseData {
                 &mut suggestions,
                 &mut seen,
             );
+            Self::append_fuzzy_entries(&[entries], &prefix_upper, &mut suggestions, &mut seen);
         }
         suggestions.truncate(MAX_SUGGESTIONS);
         suggestions
@@ -1781,6 +1782,11 @@ impl IntellisenseData {
                         }
                     }
                 }
+                let groups: Vec<&[NameEntry]> = tables
+                    .iter()
+                    .filter_map(|table| self.column_entries_for_scope_table(table))
+                    .collect();
+                Self::append_fuzzy_entries(&groups, prefix_upper, suggestions, seen);
             }
             _ => {
                 if allow_empty_prefix_global || !prefix_upper.is_empty() {
@@ -1789,6 +1795,12 @@ impl IntellisenseData {
                         &self.all_columns_entries,
                         prefix_upper,
                         raw_prefix,
+                        suggestions,
+                        seen,
+                    );
+                    Self::append_fuzzy_entries(
+                        &[&self.all_columns_entries],
+                        prefix_upper,
                         suggestions,
                         seen,
                     );
@@ -2228,6 +2240,7 @@ impl IntellisenseData {
                 break;
             }
         }
+        Self::append_fuzzy_entries(groups, &prefix_upper, &mut suggestions, &mut seen);
 
         suggestions.truncate(MAX_SUGGESTIONS);
         suggestions
@@ -2390,6 +2403,87 @@ impl IntellisenseData {
             }
         }
         suggestions.len() >= MAX_SUGGESTIONS
+    }
+
+    /// Fuzzy (ordered-subsequence) relevance score for a candidate that is *not*
+    /// a plain prefix match. Lower is better. Returns `None` when `needle_upper`
+    /// is not an ordered subsequence of `haystack_upper`. Callers exclude empty
+    /// needles and prefix matches before calling. Contiguous (substring) and
+    /// word-boundary aligned matches rank ahead of scattered ones.
+    fn subsequence_match_score(haystack_upper: &str, needle_upper: &str) -> Option<i32> {
+        let haystack = haystack_upper.as_bytes();
+        let needle = needle_upper.as_bytes();
+        let mut hi = 0usize;
+        let mut first: Option<usize> = None;
+        let mut prev: Option<usize> = None;
+        let mut gaps = 0i32;
+        let mut boundary_hits = 0i32;
+        for &nb in needle {
+            let mut matched = false;
+            while hi < haystack.len() {
+                if haystack[hi] == nb {
+                    if first.is_none() {
+                        first = Some(hi);
+                    }
+                    let at_boundary =
+                        hi == 0 || matches!(haystack[hi - 1], b'_' | b' ' | b'.' | b'$' | b'#');
+                    if at_boundary {
+                        boundary_hits += 1;
+                    }
+                    if let Some(p) = prev {
+                        if hi != p + 1 {
+                            gaps += 1;
+                        }
+                    }
+                    prev = Some(hi);
+                    hi += 1;
+                    matched = true;
+                    break;
+                }
+                hi += 1;
+            }
+            if !matched {
+                return None;
+            }
+        }
+        let start = first.unwrap_or(0) as i32;
+        Some(gaps * 64 + start * 4 - boundary_hits * 8 + haystack.len() as i32 / 8)
+    }
+
+    /// Append fuzzy subsequence matches across `groups`, ranked by relevance,
+    /// after the strict-prefix pass has run. Purely additive: never reorders or
+    /// removes existing `suggestions`, and skips anything already in `seen` or
+    /// matching the prefix (those are handled earlier). Gated to prefixes of at
+    /// least two characters to avoid single-letter noise.
+    fn append_fuzzy_entries(
+        groups: &[&[NameEntry]],
+        prefix_upper: &str,
+        suggestions: &mut Vec<String>,
+        seen: &mut HashSet<String>,
+    ) {
+        if prefix_upper.chars().count() < 2 || suggestions.len() >= MAX_SUGGESTIONS {
+            return;
+        }
+        let mut scored: Vec<(i32, &NameEntry)> = Vec::new();
+        for group in groups {
+            for entry in group.iter() {
+                if entry.upper.starts_with(prefix_upper) || seen.contains(&entry.upper) {
+                    continue;
+                }
+                if let Some(score) = Self::subsequence_match_score(&entry.upper, prefix_upper) {
+                    scored.push((score, entry));
+                }
+            }
+        }
+        scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.upper.cmp(&b.1.upper)));
+        for (_, entry) in scored {
+            if suggestions.len() >= MAX_SUGGESTIONS {
+                break;
+            }
+            if seen.insert(entry.upper.clone()) {
+                suggestions.push(entry.name.clone());
+            }
+        }
     }
 }
 
@@ -3954,6 +4048,114 @@ mod intellisense_tests {
         assert!(!suggestions.iter().any(|s| s == "COLUMN"));
         assert!(!suggestions.iter().any(|s| s == "COALESCE()"));
         assert!(!suggestions.iter().any(|s| s == "COUNT()"));
+    }
+
+    #[test]
+    fn fuzzy_subsequence_matches_columns_beyond_prefix() {
+        let mut data = IntellisenseData::new();
+        data.set_columns_for_table(
+            "EMP",
+            vec![
+                "EMPLOYEE_ID".into(),
+                "EMPLOYEE_NAME".into(),
+                "EMAIL".into(),
+                "DEPARTMENT_ID".into(),
+                "SALARY".into(),
+            ],
+        );
+        let scope = vec!["EMP".to_string()];
+
+        // Ordered-subsequence (CamelHump-style) matches that no plain prefix
+        // search would surface.
+        assert!(data
+            .get_column_suggestions("eid", Some(&scope))
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case("EMPLOYEE_ID")));
+        assert!(data
+            .get_column_suggestions("empname", Some(&scope))
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case("EMPLOYEE_NAME")));
+        assert!(data
+            .get_column_suggestions("deptid", Some(&scope))
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case("DEPARTMENT_ID")));
+    }
+
+    #[test]
+    fn fuzzy_does_not_match_unrelated_columns() {
+        let mut data = IntellisenseData::new();
+        data.set_columns_for_table("EMP", vec!["SALARY".into(), "HIRE_DATE".into()]);
+        let scope = vec!["EMP".to_string()];
+
+        // No ordered subsequence "X","Y","Z" exists in either column.
+        let suggestions = data.get_column_suggestions("xyz", Some(&scope));
+        assert!(suggestions.is_empty(), "got {:?}", suggestions);
+    }
+
+    #[test]
+    fn fuzzy_is_gated_to_two_or_more_characters() {
+        let mut data = IntellisenseData::new();
+        // "X" is a subsequence of MAX_RETRIES but a single-char prefix must not
+        // trigger fuzzy noise.
+        data.set_columns_for_table("T", vec!["MAX_RETRIES".into()]);
+        let scope = vec!["T".to_string()];
+
+        let suggestions = data.get_column_suggestions("x", Some(&scope));
+        assert!(
+            !suggestions
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case("MAX_RETRIES")),
+            "single-char fuzzy should not fire: {:?}",
+            suggestions
+        );
+    }
+
+    #[test]
+    fn fuzzy_keeps_prefix_matches_ranked_first() {
+        let mut data = IntellisenseData::new();
+        data.set_columns_for_table("T", vec!["EMP_ID".into(), "TEMPLATE_ID".into()]);
+        let scope = vec!["T".to_string()];
+
+        // "emp" is a prefix of EMP_ID and a subsequence of TEMPLATE_ID; the
+        // prefix match must come first.
+        let suggestions = data.get_column_suggestions("emp", Some(&scope));
+        assert_eq!(suggestions.first().map(String::as_str), Some("EMP_ID"));
+        assert!(suggestions.iter().any(|s| s == "TEMPLATE_ID"));
+    }
+
+    #[test]
+    fn fuzzy_subsequence_matches_relation_names() {
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["CUSTOMER_ORDERS".to_string(), "PRODUCTS".to_string()];
+        data.rebuild_indices();
+
+        let suggestions = data.get_relation_suggestions("custord");
+        assert!(suggestions.iter().any(|s| s == "CUSTOMER_ORDERS"));
+        assert!(!suggestions.iter().any(|s| s == "PRODUCTS"));
+    }
+
+    #[test]
+    fn fuzzy_subsequence_matches_qualifier_members() {
+        let mut data = IntellisenseData::new();
+        data.set_members_for_qualifier("pkg", vec!["CALCULATE_TOTAL".into(), "RESET".into()]);
+
+        let suggestions = data.get_member_suggestions("pkg", "calctot", false);
+        assert!(suggestions
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case("CALCULATE_TOTAL")));
+        assert!(!suggestions.iter().any(|s| s.eq_ignore_ascii_case("RESET")));
+    }
+
+    #[test]
+    fn fuzzy_contiguous_substring_outranks_scattered() {
+        // Lower score is better; a contiguous substring match should beat a
+        // scattered subsequence match for the same needle.
+        let contiguous = IntellisenseData::subsequence_match_score("AMOUNT_DUE", "AMOUNT").unwrap();
+        let scattered = IntellisenseData::subsequence_match_score("A_M_O_U_N_T", "AMOUNT").unwrap();
+        assert!(
+            contiguous < scattered,
+            "contiguous {contiguous} should rank ahead of scattered {scattered}"
+        );
     }
 
     #[test]

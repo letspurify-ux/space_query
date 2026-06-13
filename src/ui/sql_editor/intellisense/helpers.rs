@@ -680,6 +680,19 @@ impl SqlEditorWidget {
             .unwrap_or_else(|| selected.to_string())
     }
 
+    /// Byte offset, relative to the start of just-inserted completion text,
+    /// where the caret should land. Functions are rendered with a trailing
+    /// `()`; placing the caret between the parentheses lets the user type
+    /// arguments immediately (matching DataGrip/Toad). All other completions
+    /// place the caret at the end of the inserted text.
+    fn completion_caret_offset(inserted: &str) -> usize {
+        if inserted.ends_with("()") {
+            inserted.len() - 1
+        } else {
+            inserted.len()
+        }
+    }
+
     fn completion_replacement_range(
         buffer: &TextBuffer,
         text_shadow: &Arc<Mutex<HighlightShadowState>>,

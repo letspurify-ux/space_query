@@ -156,13 +156,14 @@ impl SqlEditorWidget {
                 );
 
                 let inserted = Self::completion_insert_text(&selected);
+                let caret_offset = Self::completion_caret_offset(&inserted);
                 if start != end {
                     buffer_for_insert.replace(start as i32, end as i32, &inserted);
-                    editor_for_insert.set_insert_position((start + inserted.len()) as i32);
+                    editor_for_insert.set_insert_position((start + caret_offset) as i32);
                 } else {
                     buffer_for_insert.insert(cursor_pos, &inserted);
                     editor_for_insert
-                        .set_insert_position((cursor_pos_usize + inserted.len()) as i32);
+                        .set_insert_position((cursor_pos_usize + caret_offset) as i32);
                 }
                 Self::sync_preferred_insert_position_from_editor(
                     &preferred_insert_position_for_insert,

@@ -17888,6 +17888,25 @@ fn completion_insert_text_keeps_existing_left_qualifier_for_condition_comparison
 }
 
 #[test]
+fn completion_caret_offset_lands_between_function_parentheses() {
+    // Function completions end with "()"; caret goes between the parens.
+    assert_eq!(SqlEditorWidget::completion_caret_offset("NVL()"), 4);
+    assert_eq!(SqlEditorWidget::completion_caret_offset("COALESCE()"), 9);
+}
+
+#[test]
+fn completion_caret_offset_lands_at_end_for_plain_identifiers() {
+    assert_eq!(
+        SqlEditorWidget::completion_caret_offset("employee_id"),
+        "employee_id".len()
+    );
+    assert_eq!(
+        SqlEditorWidget::completion_caret_offset("abc = b.abc"),
+        "abc = b.abc".len()
+    );
+}
+
+#[test]
 fn completion_insert_text_handles_quoted_multi_part_left_qualifier() {
     assert_eq!(
         SqlEditorWidget::completion_insert_text(
