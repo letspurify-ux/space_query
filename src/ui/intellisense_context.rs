@@ -6386,8 +6386,11 @@ fn parse_pivot_aggregate_columns(tokens: &[SqlToken]) -> Vec<String> {
 
             if let Some((args_range, next_idx)) = extract_parenthesized_range(tokens, open_idx) {
                 let args_tokens = token_range_slice(tokens, args_range);
+                let is_listagg = func_name.eq_ignore_ascii_case("LISTAGG");
                 for arg_item in split_top_level_symbol_groups(args_tokens, ",") {
-                    columns.extend(parse_identifiers_from_expression_tokens(&arg_item));
+                    columns.extend(parse_identifiers_from_expression_tokens_with_context(
+                        &arg_item, is_listagg,
+                    ));
                 }
                 idx = next_idx;
                 continue;
@@ -6467,7 +6470,10 @@ fn parse_next_identifier_from_token_refs(tokens: &[&SqlToken], start: usize) -> 
     None
 }
 
-fn parse_identifiers_from_expression_tokens(tokens: &[&SqlToken]) -> Vec<String> {
+fn parse_identifiers_from_expression_tokens_with_context(
+    tokens: &[&SqlToken],
+    is_listagg_arg: bool,
+) -> Vec<String> {
     let meaningful: Vec<&SqlToken> = tokens
         .iter()
         .copied()
@@ -6494,12 +6500,36 @@ fn parse_identifiers_from_expression_tokens(tokens: &[&SqlToken]) -> Vec<String>
         }
 
         if is_cast_type_spec_identifier(&meaningful, &token_depths, idx, &upper)
+            || is_cast_type_name_path_identifier(&meaningful, &token_depths, idx)
+            || is_cast_type_length_semantics_keyword(&meaningful, &token_depths, idx, &upper)
+            || is_cast_character_set_syntax_word(&meaningful, &token_depths, idx, &upper)
             || is_extract_datetime_field_identifier(&meaningful, &token_depths, idx, &upper)
             || is_extract_from_keyword(&meaningful, &token_depths, idx, &upper)
             || is_trim_syntax_keyword(&meaningful, &token_depths, idx, &upper)
+            || is_substring_syntax_keyword(&meaningful, &token_depths, idx, &upper)
+            || is_from_consuming_function_syntax_keyword(&meaningful, &token_depths, idx, &upper)
             || is_datetime_literal_syntax_word(&meaningful, idx, &upper)
             || is_json_function_syntax_word(&meaningful, &token_depths, idx, &upper)
             || is_json_predicate_syntax_word(&meaningful, &token_depths, idx, &upper)
+            || (is_listagg_arg
+                && is_listagg_overflow_syntax_word(&meaningful, &token_depths, idx, &upper))
+            || is_xmlparse_syntax_word(&meaningful, &token_depths, idx, &upper)
+            || is_xmlroot_syntax_word(&meaningful, &token_depths, idx, &upper)
+            || is_xmlserialize_syntax_word(&meaningful, &token_depths, idx, &upper)
+            || is_xml_generation_syntax_word(&meaningful, &token_depths, idx, &upper)
+            || is_is_of_type_syntax_word(&meaningful, &token_depths, idx, &upper)
+            || is_member_of_syntax_word(&meaningful, &token_depths, idx, &upper)
+            || is_submultiset_of_syntax_word(&meaningful, &token_depths, idx, &upper)
+            || is_multiset_operator_syntax_word(&meaningful, &token_depths, idx, &upper)
+            || is_collection_condition_syntax_word(&meaningful, &token_depths, idx, &upper)
+            || is_sounds_like_syntax_word(&meaningful, &token_depths, idx, &upper)
+            || is_like_escape_syntax_word(&meaningful, &token_depths, idx, &upper)
+            || is_numeric_condition_syntax_word(&meaningful, &token_depths, idx, &upper)
+            || is_boolean_condition_syntax_word(&meaningful, &token_depths, idx, &upper)
+            || is_distinct_from_syntax_word(&meaningful, &token_depths, idx, &upper)
+            || is_window_frame_syntax_word(&meaningful, &token_depths, idx, &upper)
+            || is_analytic_null_treatment_syntax_word(&meaningful, &token_depths, idx, &upper)
+            || is_nth_value_from_syntax_word(&meaningful, &token_depths, idx, &upper)
             || is_xmlquery_syntax_word(&meaningful, &token_depths, idx, &upper)
             || is_at_time_zone_syntax_word(&meaningful, &token_depths, idx, &upper)
             || is_collate_syntax_word(&meaningful, &token_depths, idx, &upper)
@@ -6624,12 +6654,239 @@ fn is_cast_type_spec_identifier(
                         if call_name.eq_ignore_ascii_case("CAST")
                             || call_name.eq_ignore_ascii_case("CONVERT")
                             || call_name.eq_ignore_ascii_case("XMLCAST")
+                            || call_name.eq_ignore_ascii_case("XMLSERIALIZE")
+                            || call_name.eq_ignore_ascii_case("VALIDATE_CONVERSION")
                 );
             }
         }
     }
 
     false
+}
+
+fn is_cast_type_name_path_identifier(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+) -> bool {
+    let Some(depth) = token_depths.get(idx).copied() else {
+        return false;
+    };
+    if depth == 0 {
+        return false;
+    }
+
+    let Some(as_idx) = cast_type_as_index_before(tokens, token_depths, idx, depth) else {
+        return false;
+    };
+    if !cast_like_call_before_as(tokens, token_depths, as_idx, depth) {
+        return false;
+    }
+
+    type_name_path_contains_identifier(tokens, token_depths, as_idx, idx, depth)
+}
+
+fn cast_type_as_index_before(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let mut scan_idx = idx;
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth {
+            return None;
+        }
+        if scan_depth != depth {
+            continue;
+        }
+
+        match tokens.get(scan_idx).copied() {
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("AS") => {
+                return Some(scan_idx);
+            }
+            Some(SqlToken::Symbol(sym)) if sym == "," => return None,
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn cast_like_call_before_as(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    as_idx: usize,
+    depth: usize,
+) -> bool {
+    let mut scan_idx = as_idx;
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth.saturating_sub(1) {
+            return false;
+        }
+        if scan_depth == depth.saturating_sub(1)
+            && matches!(tokens.get(scan_idx), Some(SqlToken::Symbol(sym)) if sym == "(")
+        {
+            let Some(call_idx) = scan_idx.checked_sub(1) else {
+                return false;
+            };
+            return matches!(
+                tokens.get(call_idx).copied(),
+                Some(SqlToken::Word(call_name))
+                    if call_name.eq_ignore_ascii_case("CAST")
+                        || call_name.eq_ignore_ascii_case("CONVERT")
+                        || call_name.eq_ignore_ascii_case("XMLCAST")
+                        || call_name.eq_ignore_ascii_case("XMLSERIALIZE")
+                        || call_name.eq_ignore_ascii_case("VALIDATE_CONVERSION")
+            );
+        }
+    }
+
+    false
+}
+
+fn type_name_path_contains_identifier(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    as_idx: usize,
+    idx: usize,
+    depth: usize,
+) -> bool {
+    let mut scan_idx = as_idx.saturating_add(1);
+    let mut expect_word = true;
+    let mut saw_word = false;
+
+    while scan_idx <= idx {
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth != depth {
+            return false;
+        }
+
+        match tokens.get(scan_idx).copied() {
+            Some(SqlToken::Comment(_)) => {}
+            Some(SqlToken::Word(word)) if expect_word && is_identifier_word_token(word) => {
+                saw_word = true;
+                if scan_idx == idx {
+                    return true;
+                }
+                expect_word = false;
+            }
+            Some(SqlToken::Symbol(sym)) if saw_word && !expect_word && sym == "." => {
+                expect_word = true;
+            }
+            _ => return false,
+        }
+
+        scan_idx += 1;
+    }
+
+    false
+}
+
+fn is_cast_type_length_semantics_keyword(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    word_upper: &str,
+) -> bool {
+    if !matches!(word_upper, "CHAR" | "BYTE") {
+        return false;
+    }
+
+    let Some(depth) = token_depths.get(idx).copied() else {
+        return false;
+    };
+    if depth == 0 {
+        return false;
+    }
+
+    let Some(type_open_idx) =
+        previous_open_paren_index_at_depth(tokens, token_depths, idx, depth.saturating_sub(1))
+    else {
+        return false;
+    };
+    let Some(type_word_idx) =
+        previous_word_index_at_depth(tokens, token_depths, type_open_idx, depth.saturating_sub(1))
+    else {
+        return false;
+    };
+
+    matches!(
+        tokens.get(type_word_idx).copied(),
+        Some(SqlToken::Word(type_word))
+            if matches!(
+                type_word.to_ascii_uppercase().as_str(),
+                "CHAR" | "CHARACTER" | "VARCHAR" | "VARCHAR2" | "NCHAR" | "NVARCHAR2"
+            ) && is_cast_type_spec_identifier(
+                tokens,
+                token_depths,
+                type_word_idx,
+                &type_word.to_ascii_uppercase(),
+            )
+    )
+}
+
+fn is_cast_character_set_syntax_word(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    word_upper: &str,
+) -> bool {
+    let Some(depth) = token_depths.get(idx).copied() else {
+        return false;
+    };
+    if depth == 0 {
+        return false;
+    }
+
+    if word_upper == "SET" {
+        let Some(character_idx) = previous_word_index_at_depth(tokens, token_depths, idx, depth)
+        else {
+            return false;
+        };
+        return matches!(
+            tokens.get(character_idx).copied(),
+            Some(SqlToken::Word(word))
+                if word.eq_ignore_ascii_case("CHARACTER")
+                    && is_cast_type_spec_identifier(tokens, token_depths, character_idx, "CHARACTER")
+        );
+    }
+
+    previous_word_index_at_depth(tokens, token_depths, idx, depth).is_some_and(|set_idx| {
+        matches!(
+            tokens.get(set_idx).copied(),
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("SET")
+        ) && is_cast_character_set_syntax_word(tokens, token_depths, set_idx, "SET")
+    })
+}
+
+fn previous_open_paren_index_at_depth(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let mut scan_idx = idx;
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth {
+            return None;
+        }
+        if scan_depth != depth {
+            continue;
+        }
+
+        if matches!(tokens.get(scan_idx).copied(), Some(SqlToken::Symbol(sym)) if sym == "(") {
+            return Some(scan_idx);
+        }
+    }
+
+    None
 }
 
 fn is_treat_type_spec_identifier(tokens: &[&SqlToken], token_depths: &[usize], idx: usize) -> bool {
@@ -6760,6 +7017,270 @@ fn is_trim_syntax_keyword(
     call_open_index(tokens, token_depths, idx, depth, "TRIM").is_some()
 }
 
+fn is_substring_syntax_keyword(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    word_upper: &str,
+) -> bool {
+    if !matches!(word_upper, "FROM" | "FOR") {
+        return false;
+    }
+
+    let Some(depth) = token_depths.get(idx).copied() else {
+        return false;
+    };
+    let Some(open_idx) = call_open_index(tokens, token_depths, idx, depth, "SUBSTRING") else {
+        return false;
+    };
+
+    if word_upper == "FROM" {
+        return is_substring_from_keyword(tokens, token_depths, idx, depth, open_idx);
+    }
+
+    previous_substring_from_keyword_index(tokens, token_depths, idx, depth, open_idx).is_some()
+        && next_substring_argument_token_index(tokens, token_depths, idx, depth).is_some()
+}
+
+fn is_substring_from_keyword(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+    open_idx: usize,
+) -> bool {
+    previous_substring_argument_token_index(tokens, token_depths, idx, depth, open_idx).is_some()
+        && next_substring_argument_token_index(tokens, token_depths, idx, depth).is_some()
+}
+
+fn previous_substring_from_keyword_index(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+    open_idx: usize,
+) -> Option<usize> {
+    let mut scan_idx = idx;
+    while scan_idx > open_idx {
+        scan_idx -= 1;
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth {
+            return None;
+        }
+        if scan_depth != depth {
+            continue;
+        }
+
+        match tokens.get(scan_idx).copied() {
+            Some(SqlToken::Comment(_)) => {}
+            Some(SqlToken::Word(word))
+                if word.eq_ignore_ascii_case("FROM")
+                    && is_substring_from_keyword(
+                        tokens,
+                        token_depths,
+                        scan_idx,
+                        depth,
+                        open_idx,
+                    ) =>
+            {
+                return Some(scan_idx);
+            }
+            Some(SqlToken::Symbol(sym)) if sym == "," => return None,
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn previous_substring_argument_token_index(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+    open_idx: usize,
+) -> Option<usize> {
+    let mut scan_idx = idx;
+    while scan_idx > open_idx {
+        scan_idx -= 1;
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth {
+            return None;
+        }
+        if scan_depth != depth {
+            continue;
+        }
+
+        match tokens.get(scan_idx).copied() {
+            Some(SqlToken::Comment(_)) => {}
+            Some(SqlToken::Symbol(sym)) if sym == "," => return None,
+            Some(_) => return Some(scan_idx),
+            None => return None,
+        }
+    }
+
+    None
+}
+
+fn next_substring_argument_token_index(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let mut scan_idx = idx.saturating_add(1);
+    while scan_idx < tokens.len() {
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth {
+            return None;
+        }
+        if scan_depth != depth {
+            scan_idx += 1;
+            continue;
+        }
+
+        match tokens.get(scan_idx).copied() {
+            Some(SqlToken::Comment(_)) => scan_idx += 1,
+            Some(SqlToken::Symbol(sym)) if sym == "," || sym == ")" => return None,
+            Some(_) => return Some(scan_idx),
+            None => return None,
+        }
+    }
+
+    None
+}
+
+fn is_from_consuming_function_syntax_keyword(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    word_upper: &str,
+) -> bool {
+    if !matches!(word_upper, "FROM" | "FOR" | "PLACING") {
+        return false;
+    }
+
+    let Some(depth) = token_depths.get(idx).copied() else {
+        return false;
+    };
+    let Some((call_name, open_idx)) =
+        from_consuming_call_name_and_open_index(tokens, token_depths, idx, depth)
+    else {
+        return false;
+    };
+
+    match word_upper {
+        "FROM" => {
+            is_from_consuming_function_from_keyword(tokens, token_depths, idx, depth, open_idx)
+        }
+        "FOR" => {
+            matches!(call_name.as_str(), "SUBSTRING" | "OVERLAY")
+                && previous_from_consuming_function_from_keyword_index(
+                    tokens,
+                    token_depths,
+                    idx,
+                    depth,
+                    open_idx,
+                )
+                .is_some()
+                && next_substring_argument_token_index(tokens, token_depths, idx, depth).is_some()
+        }
+        "PLACING" => {
+            call_name == "OVERLAY"
+                && previous_substring_argument_token_index(
+                    tokens,
+                    token_depths,
+                    idx,
+                    depth,
+                    open_idx,
+                )
+                .is_some()
+                && next_substring_argument_token_index(tokens, token_depths, idx, depth).is_some()
+        }
+        _ => false,
+    }
+}
+
+fn from_consuming_call_name_and_open_index(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> Option<(String, usize)> {
+    let mut scan_idx = idx;
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth.saturating_sub(1) {
+            return None;
+        }
+        if scan_depth == depth.saturating_sub(1)
+            && matches!(tokens.get(scan_idx), Some(SqlToken::Symbol(sym)) if sym == "(")
+        {
+            let call_idx = scan_idx.checked_sub(1)?;
+            let Some(SqlToken::Word(call_name)) = tokens.get(call_idx).copied() else {
+                return None;
+            };
+            let call_name_upper = call_name.to_ascii_uppercase();
+            return is_from_consuming_function(call_name_upper.as_str())
+                .then_some((call_name_upper, scan_idx));
+        }
+    }
+
+    None
+}
+
+fn is_from_consuming_function_from_keyword(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+    open_idx: usize,
+) -> bool {
+    previous_substring_argument_token_index(tokens, token_depths, idx, depth, open_idx).is_some()
+        && next_substring_argument_token_index(tokens, token_depths, idx, depth).is_some()
+}
+
+fn previous_from_consuming_function_from_keyword_index(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+    open_idx: usize,
+) -> Option<usize> {
+    let mut scan_idx = idx;
+    while scan_idx > open_idx {
+        scan_idx -= 1;
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth {
+            return None;
+        }
+        if scan_depth != depth {
+            continue;
+        }
+
+        match tokens.get(scan_idx).copied() {
+            Some(SqlToken::Comment(_)) => {}
+            Some(SqlToken::Word(word))
+                if word.eq_ignore_ascii_case("FROM")
+                    && is_from_consuming_function_from_keyword(
+                        tokens,
+                        token_depths,
+                        scan_idx,
+                        depth,
+                        open_idx,
+                    ) =>
+            {
+                return Some(scan_idx);
+            }
+            Some(SqlToken::Symbol(sym)) if sym == "," => return None,
+            _ => {}
+        }
+    }
+
+    None
+}
+
 fn is_datetime_literal_syntax_word(tokens: &[&SqlToken], idx: usize, word_upper: &str) -> bool {
     if matches!(word_upper, "DATE" | "TIME" | "TIMESTAMP" | "INTERVAL") {
         return matches!(tokens.get(idx + 1), Some(SqlToken::String(_)))
@@ -6770,8 +7291,32 @@ fn is_datetime_literal_syntax_word(tokens: &[&SqlToken], idx: usize, word_upper:
         return datetime_literal_intro_index_before_field(tokens, idx).is_some();
     }
 
+    if word_upper == "TO" {
+        return is_datetime_literal_to_keyword(tokens, idx);
+    }
+
     matches!(word_upper, "WITH" | "LOCAL" | "ZONE")
         && datetime_literal_string_index_after_intro(tokens, idx).is_some()
+}
+
+fn is_datetime_literal_to_keyword(tokens: &[&SqlToken], idx: usize) -> bool {
+    let Some(prev_idx) = idx.checked_sub(1) else {
+        return false;
+    };
+    let Some(SqlToken::Word(prev_word)) = tokens.get(prev_idx).copied() else {
+        return false;
+    };
+    if !is_extract_datetime_field_word(&prev_word.to_ascii_uppercase())
+        || datetime_literal_intro_index_before_field(tokens, prev_idx).is_none()
+    {
+        return false;
+    }
+
+    matches!(
+        tokens.get(idx.saturating_add(1)).copied(),
+        Some(SqlToken::Word(next_word))
+            if is_extract_datetime_field_word(&next_word.to_ascii_uppercase())
+    )
 }
 
 fn datetime_literal_string_index_after_intro(tokens: &[&SqlToken], idx: usize) -> Option<usize> {
@@ -6857,12 +7402,26 @@ fn is_json_function_option_word(
             keyword_before_in_same_call(tokens, token_depths, idx, depth, "FORMAT").is_some()
                 || json_returning_keyword_before(tokens, token_depths, idx, depth).is_some()
         }
-        "WITH" | "WITHOUT" => next_word_at_depth_is(tokens, token_depths, idx, depth, "WRAPPER"),
+        "SET" | "INSERT" | "REPLACE" | "REMOVE" | "APPEND" | "RENAME" | "KEEP" => {
+            is_json_transform_operation_keyword(tokens, token_depths, idx, depth)
+        }
+        "IGNORE" | "CREATE" => is_json_transform_option_keyword(tokens, token_depths, idx, depth),
+        "MISSING" => is_json_transform_missing_keyword(tokens, token_depths, idx, depth),
+        "KEY" => is_json_object_key_keyword(tokens, token_depths, idx, depth),
+        "VALUE" => is_json_object_value_keyword(tokens, token_depths, idx, depth),
+        "ABSENT" => is_json_absent_on_null_keyword(tokens, token_depths, idx, depth),
+        "WITH" => {
+            next_word_at_depth_is(tokens, token_depths, idx, depth, "WRAPPER")
+                || is_json_unique_keys_with_keyword(tokens, token_depths, idx, depth)
+        }
+        "WITHOUT" => next_word_at_depth_is(tokens, token_depths, idx, depth, "WRAPPER"),
         "WRAPPER" => {
             keyword_before_in_same_call(tokens, token_depths, idx, depth, "WITH").is_some()
                 || keyword_before_in_same_call(tokens, token_depths, idx, depth, "WITHOUT")
                     .is_some()
         }
+        "KEYS" => is_json_unique_keys_keyword(tokens, token_depths, idx, depth),
+        "STRICT" => is_json_strict_option_keyword(tokens, token_depths, idx, depth),
         "PRETTY" | "ASCII" | "TRUNCATE" => {
             json_returning_keyword_before(tokens, token_depths, idx, depth).is_some()
         }
@@ -6874,6 +7433,964 @@ fn is_json_function_option_word(
         }
         _ => false,
     }
+}
+
+fn is_json_object_key_keyword(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> bool {
+    if !is_json_object_function_call(tokens, token_depths, idx, depth) {
+        return false;
+    }
+
+    let Some(next_idx) = next_word_index_at_depth(tokens, token_depths, idx, depth) else {
+        return false;
+    };
+    if matches!(
+        tokens.get(next_idx).copied(),
+        Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("VALUE")
+    ) {
+        return false;
+    }
+
+    json_object_value_keyword_after(tokens, token_depths, next_idx, depth).is_some()
+}
+
+fn is_json_transform_operation_keyword(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> bool {
+    let Some(open_idx) = json_call_open_index(tokens, token_depths, idx, depth) else {
+        return false;
+    };
+    let Some(call_idx) = open_idx.checked_sub(1) else {
+        return false;
+    };
+    if !matches!(
+        tokens.get(call_idx).copied(),
+        Some(SqlToken::Word(call_name)) if call_name.eq_ignore_ascii_case("JSON_TRANSFORM")
+    ) {
+        return false;
+    }
+
+    previous_json_transform_operation_separator(tokens, token_depths, idx, depth).is_some()
+        && next_json_transform_path_string_index(tokens, token_depths, idx, depth).is_some()
+}
+
+fn previous_json_transform_operation_separator(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let mut scan_idx = idx;
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth {
+            return None;
+        }
+        if scan_depth != depth {
+            continue;
+        }
+
+        match tokens.get(scan_idx).copied() {
+            Some(SqlToken::Comment(_)) => {}
+            Some(SqlToken::Symbol(sym)) if sym == "," => return Some(scan_idx),
+            _ => return None,
+        }
+    }
+
+    None
+}
+
+fn next_json_transform_path_string_index(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let mut scan_idx = idx.saturating_add(1);
+    while scan_idx < tokens.len() {
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth {
+            return None;
+        }
+        if scan_depth != depth {
+            scan_idx += 1;
+            continue;
+        }
+
+        match tokens.get(scan_idx).copied() {
+            Some(SqlToken::Comment(_)) => scan_idx += 1,
+            Some(SqlToken::String(_)) => return Some(scan_idx),
+            _ => return None,
+        }
+    }
+
+    None
+}
+
+fn is_json_transform_option_keyword(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> bool {
+    next_word_at_depth_is(tokens, token_depths, idx, depth, "ON")
+        && next_word_index_at_depth(tokens, token_depths, idx, depth).is_some_and(|on_idx| {
+            next_word_at_depth_is(tokens, token_depths, on_idx, depth, "MISSING")
+        })
+        && previous_json_transform_operation_keyword(tokens, token_depths, idx, depth).is_some()
+}
+
+fn is_json_transform_missing_keyword(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> bool {
+    let Some(on_idx) = previous_word_index_at_depth(tokens, token_depths, idx, depth) else {
+        return false;
+    };
+    if !matches!(
+        tokens.get(on_idx).copied(),
+        Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("ON")
+    ) {
+        return false;
+    }
+
+    let Some(option_idx) = previous_word_index_at_depth(tokens, token_depths, on_idx, depth) else {
+        return false;
+    };
+    matches!(
+        tokens.get(option_idx).copied(),
+        Some(SqlToken::Word(word))
+            if word.eq_ignore_ascii_case("IGNORE") || word.eq_ignore_ascii_case("CREATE")
+    ) && is_json_transform_option_keyword(tokens, token_depths, option_idx, depth)
+}
+
+fn previous_json_transform_operation_keyword(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let mut scan_idx = idx;
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth {
+            return None;
+        }
+        if scan_depth != depth {
+            continue;
+        }
+
+        match tokens.get(scan_idx).copied() {
+            Some(SqlToken::Comment(_)) => {}
+            Some(SqlToken::Word(word))
+                if matches!(
+                    word.to_ascii_uppercase().as_str(),
+                    "SET" | "INSERT" | "REPLACE" | "REMOVE" | "APPEND" | "RENAME" | "KEEP"
+                ) && is_json_transform_operation_keyword(
+                    tokens,
+                    token_depths,
+                    scan_idx,
+                    depth,
+                ) =>
+            {
+                return Some(scan_idx);
+            }
+            Some(SqlToken::Symbol(sym)) if sym == "," => return None,
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn is_json_object_value_keyword(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> bool {
+    is_json_object_function_call(tokens, token_depths, idx, depth)
+        && previous_json_object_key_token_index(tokens, token_depths, idx, depth).is_some()
+        && next_member_of_collection_token_index(tokens, token_depths, idx, depth).is_some()
+}
+
+fn is_json_absent_on_null_keyword(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> bool {
+    let Some(on_idx) = next_word_index_at_depth(tokens, token_depths, idx, depth) else {
+        return false;
+    };
+    if !matches!(
+        tokens.get(on_idx).copied(),
+        Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("ON")
+    ) {
+        return false;
+    }
+
+    next_word_at_depth_is(tokens, token_depths, on_idx, depth, "NULL")
+}
+
+fn is_json_unique_keys_with_keyword(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> bool {
+    let Some(unique_idx) = next_word_index_at_depth(tokens, token_depths, idx, depth) else {
+        return false;
+    };
+    if !matches!(
+        tokens.get(unique_idx).copied(),
+        Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("UNIQUE")
+    ) {
+        return false;
+    }
+
+    next_word_at_depth_is(tokens, token_depths, unique_idx, depth, "KEYS")
+}
+
+fn is_json_unique_keys_keyword(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> bool {
+    let Some(unique_idx) = previous_word_index_at_depth(tokens, token_depths, idx, depth) else {
+        return false;
+    };
+    if !matches!(
+        tokens.get(unique_idx).copied(),
+        Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("UNIQUE")
+    ) {
+        return false;
+    }
+
+    previous_word_index_at_depth(tokens, token_depths, unique_idx, depth).is_some_and(|with_idx| {
+        is_json_unique_keys_with_keyword(tokens, token_depths, with_idx, depth)
+    })
+}
+
+fn is_json_strict_option_keyword(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> bool {
+    previous_word_index_at_depth(tokens, token_depths, idx, depth).is_some_and(|prev_idx| {
+        match tokens.get(prev_idx).copied() {
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("KEYS") => {
+                is_json_unique_keys_keyword(tokens, token_depths, prev_idx, depth)
+            }
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("NULL") => {
+                previous_json_null_option_keyword(tokens, token_depths, prev_idx, depth).is_some()
+            }
+            _ => false,
+        }
+    })
+}
+
+fn previous_json_null_option_keyword(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    null_idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let on_idx = previous_word_index_at_depth(tokens, token_depths, null_idx, depth)?;
+    if !matches!(
+        tokens.get(on_idx).copied(),
+        Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("ON")
+    ) {
+        return None;
+    }
+
+    let option_idx = previous_word_index_at_depth(tokens, token_depths, on_idx, depth)?;
+    matches!(
+        tokens.get(option_idx).copied(),
+        Some(SqlToken::Word(word))
+            if word.eq_ignore_ascii_case("ABSENT") || word.eq_ignore_ascii_case("NULL")
+    )
+    .then_some(option_idx)
+}
+
+fn is_json_object_function_call(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> bool {
+    let Some(open_idx) = json_call_open_index(tokens, token_depths, idx, depth) else {
+        return false;
+    };
+    let Some(call_idx) = open_idx.checked_sub(1) else {
+        return false;
+    };
+
+    matches!(
+        tokens.get(call_idx).copied(),
+        Some(SqlToken::Word(call_name))
+            if matches!(
+                call_name.to_ascii_uppercase().as_str(),
+                "JSON_OBJECT" | "JSON_OBJECTAGG"
+            )
+    )
+}
+
+fn json_object_value_keyword_after(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    start_idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let mut scan_idx = start_idx.saturating_add(1);
+    while scan_idx < tokens.len() {
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth {
+            return None;
+        }
+        if scan_depth != depth {
+            scan_idx += 1;
+            continue;
+        }
+
+        match tokens.get(scan_idx).copied() {
+            Some(SqlToken::Comment(_)) => scan_idx += 1,
+            Some(SqlToken::Symbol(sym)) if sym == "," || sym == ")" => return None,
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("VALUE") => {
+                return next_member_of_collection_token_index(
+                    tokens,
+                    token_depths,
+                    scan_idx,
+                    depth,
+                )
+                .map(|_| scan_idx);
+            }
+            _ => scan_idx += 1,
+        }
+    }
+
+    None
+}
+
+fn previous_json_object_key_token_index(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    value_idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let mut scan_idx = value_idx;
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth {
+            return None;
+        }
+        if scan_depth != depth {
+            continue;
+        }
+
+        match tokens.get(scan_idx).copied() {
+            Some(SqlToken::Comment(_)) => {}
+            Some(SqlToken::Symbol(sym)) if sym == "," || sym == "(" => return None,
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("KEY") => return None,
+            Some(SqlToken::Word(_)) | Some(SqlToken::String(_)) => return Some(scan_idx),
+            Some(SqlToken::Symbol(sym)) if sym == ")" => return Some(scan_idx),
+            Some(_) => return None,
+            None => return None,
+        }
+    }
+
+    None
+}
+
+fn is_listagg_overflow_syntax_word(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    word_upper: &str,
+) -> bool {
+    let Some(depth) = token_depths.get(idx).copied() else {
+        return false;
+    };
+
+    match word_upper {
+        "ON" => {
+            next_word_at_depth_is(tokens, token_depths, idx, depth, "OVERFLOW")
+                && listagg_overflow_action_after(tokens, token_depths, idx, depth).is_some()
+        }
+        "OVERFLOW" => {
+            previous_word_index_at_depth(tokens, token_depths, idx, depth).is_some_and(|on_idx| {
+                matches!(
+                    tokens.get(on_idx).copied(),
+                    Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("ON")
+                ) && listagg_overflow_action_after(tokens, token_depths, on_idx, depth).is_some()
+            })
+        }
+        "TRUNCATE" | "ERROR" => previous_listagg_overflow_index(tokens, token_depths, idx, depth)
+            .is_some_and(|overflow_idx| {
+                listagg_overflow_action_after_overflow(tokens, token_depths, overflow_idx, depth)
+                    == Some(idx)
+            }),
+        "WITH" | "WITHOUT" => {
+            next_word_at_depth_is(tokens, token_depths, idx, depth, "COUNT")
+                && previous_listagg_overflow_index(tokens, token_depths, idx, depth).is_some()
+        }
+        "COUNT" => {
+            previous_word_index_at_depth(tokens, token_depths, idx, depth).is_some_and(|prev_idx| {
+                matches!(
+                    tokens.get(prev_idx).copied(),
+                    Some(SqlToken::Word(word))
+                        if word.eq_ignore_ascii_case("WITH")
+                            || word.eq_ignore_ascii_case("WITHOUT")
+                ) && previous_listagg_overflow_index(tokens, token_depths, prev_idx, depth)
+                    .is_some()
+            })
+        }
+        _ => false,
+    }
+}
+
+fn listagg_overflow_action_after(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let overflow_idx = next_word_index_at_depth(tokens, token_depths, idx, depth)?;
+    if !matches!(
+        tokens.get(overflow_idx).copied(),
+        Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("OVERFLOW")
+    ) {
+        return None;
+    }
+
+    listagg_overflow_action_after_overflow(tokens, token_depths, overflow_idx, depth)
+}
+
+fn listagg_overflow_action_after_overflow(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    overflow_idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let action_idx = next_word_index_at_depth(tokens, token_depths, overflow_idx, depth)?;
+    matches!(
+        tokens.get(action_idx).copied(),
+        Some(SqlToken::Word(word))
+            if word.eq_ignore_ascii_case("TRUNCATE") || word.eq_ignore_ascii_case("ERROR")
+    )
+    .then_some(action_idx)
+}
+
+fn previous_listagg_overflow_index(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let mut scan_idx = idx;
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth {
+            return None;
+        }
+        if scan_depth != depth {
+            continue;
+        }
+
+        match tokens.get(scan_idx).copied() {
+            Some(SqlToken::Comment(_)) => {}
+            Some(SqlToken::Symbol(sym)) if sym == "," || sym == "(" => return None,
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("OVERFLOW") => {
+                let on_idx = previous_word_index_at_depth(tokens, token_depths, scan_idx, depth)?;
+                return matches!(
+                    tokens.get(on_idx).copied(),
+                    Some(SqlToken::Word(on_word)) if on_word.eq_ignore_ascii_case("ON")
+                )
+                .then_some(scan_idx);
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn is_xmlparse_syntax_word(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    word_upper: &str,
+) -> bool {
+    let Some(depth) = token_depths.get(idx).copied() else {
+        return false;
+    };
+    if depth == 0 || call_open_index(tokens, token_depths, idx, depth, "XMLPARSE").is_none() {
+        return false;
+    }
+
+    match word_upper {
+        "CONTENT" | "DOCUMENT" => {
+            xmlparse_intro_keyword_index(tokens, token_depths, idx, depth) == Some(idx)
+        }
+        "WELLFORMED" => {
+            previous_xmlparse_intro_keyword_index(tokens, token_depths, idx, depth).is_some()
+        }
+        _ => false,
+    }
+}
+
+fn xmlparse_intro_keyword_index(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let open_idx = call_open_index(tokens, token_depths, idx, depth, "XMLPARSE")?;
+    next_word_index_at_depth(tokens, token_depths, open_idx, depth)
+}
+
+fn previous_xmlparse_intro_keyword_index(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let open_idx = call_open_index(tokens, token_depths, idx, depth, "XMLPARSE")?;
+    let intro_idx = next_word_index_at_depth(tokens, token_depths, open_idx, depth)?;
+    if intro_idx >= idx {
+        return None;
+    }
+
+    matches!(
+        tokens.get(intro_idx).copied(),
+        Some(SqlToken::Word(word))
+            if word.eq_ignore_ascii_case("CONTENT") || word.eq_ignore_ascii_case("DOCUMENT")
+    )
+    .then_some(intro_idx)
+}
+
+fn is_xmlroot_syntax_word(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    word_upper: &str,
+) -> bool {
+    let Some(depth) = token_depths.get(idx).copied() else {
+        return false;
+    };
+    if depth == 0 || call_open_index(tokens, token_depths, idx, depth, "XMLROOT").is_none() {
+        return false;
+    }
+
+    match word_upper {
+        "VERSION" | "STANDALONE" => {
+            xmlroot_has_argument_separator_before(tokens, token_depths, idx, depth)
+        }
+        "YES" => previous_word_index_at_depth(tokens, token_depths, idx, depth).is_some_and(
+            |standalone_idx| {
+                matches!(
+                    tokens.get(standalone_idx).copied(),
+                    Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("STANDALONE")
+                ) && is_xmlroot_syntax_word(tokens, token_depths, standalone_idx, "STANDALONE")
+            },
+        ),
+        "NO" => {
+            let Some(prev_idx) = previous_word_index_at_depth(tokens, token_depths, idx, depth)
+            else {
+                return false;
+            };
+            matches!(
+                tokens.get(prev_idx).copied(),
+                Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("STANDALONE")
+            ) && is_xmlroot_syntax_word(tokens, token_depths, prev_idx, "STANDALONE")
+        }
+        "VALUE" => {
+            let Some(no_idx) = previous_word_index_at_depth(tokens, token_depths, idx, depth)
+            else {
+                return false;
+            };
+            if !matches!(
+                tokens.get(no_idx).copied(),
+                Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("NO")
+            ) {
+                return false;
+            }
+            let Some(standalone_idx) =
+                previous_word_index_at_depth(tokens, token_depths, no_idx, depth)
+            else {
+                return false;
+            };
+            matches!(
+                tokens.get(standalone_idx).copied(),
+                Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("STANDALONE")
+            ) && is_xmlroot_syntax_word(tokens, token_depths, standalone_idx, "STANDALONE")
+        }
+        _ => false,
+    }
+}
+
+fn xmlroot_has_argument_separator_before(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> bool {
+    let mut scan_idx = idx;
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth {
+            return false;
+        }
+        if scan_depth != depth {
+            continue;
+        }
+
+        match tokens.get(scan_idx).copied() {
+            Some(SqlToken::Comment(_)) => {}
+            Some(SqlToken::Symbol(sym)) if sym == "," => return true,
+            _ => return false,
+        }
+    }
+
+    false
+}
+
+fn is_xmlserialize_syntax_word(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    word_upper: &str,
+) -> bool {
+    let Some(depth) = token_depths.get(idx).copied() else {
+        return false;
+    };
+    if depth == 0 || call_open_index(tokens, token_depths, idx, depth, "XMLSERIALIZE").is_none() {
+        return false;
+    }
+
+    match word_upper {
+        "CONTENT" | "DOCUMENT" => {
+            xmlserialize_intro_keyword_index(tokens, token_depths, idx, depth) == Some(idx)
+        }
+        "NO" => {
+            next_word_at_depth_is(tokens, token_depths, idx, depth, "INDENT")
+                && xmlserialize_type_spec_before(tokens, token_depths, idx, depth).is_some()
+        }
+        "INDENT" => {
+            xmlserialize_type_spec_before(tokens, token_depths, idx, depth).is_some()
+                && (previous_word_index_at_depth(tokens, token_depths, idx, depth).is_some_and(
+                    |prev_idx| {
+                        matches!(
+                            tokens.get(prev_idx).copied(),
+                            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("NO")
+                        )
+                    },
+                ) || next_word_at_depth_is(tokens, token_depths, idx, depth, "SIZE"))
+        }
+        "SIZE" => previous_word_index_at_depth(tokens, token_depths, idx, depth).is_some_and(
+            |indent_idx| {
+                matches!(
+                    tokens.get(indent_idx).copied(),
+                    Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("INDENT")
+                ) && xmlserialize_type_spec_before(tokens, token_depths, indent_idx, depth)
+                    .is_some()
+            },
+        ),
+        _ => false,
+    }
+}
+
+fn xmlserialize_intro_keyword_index(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let open_idx = call_open_index(tokens, token_depths, idx, depth, "XMLSERIALIZE")?;
+    next_word_index_at_depth(tokens, token_depths, open_idx, depth)
+}
+
+fn xmlserialize_type_spec_before(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let mut scan_idx = idx;
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth {
+            return None;
+        }
+        if scan_depth != depth {
+            continue;
+        }
+
+        match tokens.get(scan_idx).copied() {
+            Some(SqlToken::Comment(_)) => {}
+            Some(SqlToken::Symbol(sym)) if sym == "," || sym == "(" => return None,
+            Some(SqlToken::Word(word)) if is_sql_type_spec_word(&word.to_ascii_uppercase()) => {
+                let as_idx = previous_word_index_at_depth(tokens, token_depths, scan_idx, depth)?;
+                return matches!(
+                    tokens.get(as_idx).copied(),
+                    Some(SqlToken::Word(as_word)) if as_word.eq_ignore_ascii_case("AS")
+                )
+                .then_some(scan_idx);
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn is_xml_generation_syntax_word(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    word_upper: &str,
+) -> bool {
+    let Some(depth) = token_depths.get(idx).copied() else {
+        return false;
+    };
+
+    if call_open_index(tokens, token_depths, idx, depth, "XMLELEMENT").is_some() {
+        match word_upper {
+            "NAME" => return is_xmlelement_name_keyword(tokens, token_depths, idx, depth),
+            "EVALNAME" => return is_xmlelement_evalname_keyword(tokens, token_depths, idx, depth),
+            "ENTITYESCAPING" | "NONENTITYESCAPING" => {
+                return is_xml_generation_escaping_keyword(tokens, token_depths, idx, depth);
+            }
+            _ => {
+                if is_xmlelement_name_identifier(tokens, token_depths, idx, depth) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    if call_open_index(tokens, token_depths, idx, depth, "XMLPI").is_some() {
+        match word_upper {
+            "NAME" => return is_xmlpi_name_keyword(tokens, token_depths, idx, depth),
+            _ => {
+                if is_xmlpi_name_identifier(tokens, token_depths, idx, depth) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    if call_open_index(tokens, token_depths, idx, depth, "XMLFOREST").is_some()
+        || call_open_index(tokens, token_depths, idx, depth, "XMLATTRIBUTES").is_some()
+    {
+        if matches!(word_upper, "ENTITYESCAPING" | "NONENTITYESCAPING")
+            && is_xml_generation_escaping_keyword(tokens, token_depths, idx, depth)
+        {
+            return true;
+        }
+
+        return is_xml_generation_alias_after_as(tokens, token_depths, idx, depth);
+    }
+
+    false
+}
+
+fn is_xmlelement_name_keyword(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> bool {
+    let Some(open_idx) = call_open_index(tokens, token_depths, idx, depth, "XMLELEMENT") else {
+        return false;
+    };
+    if next_word_index_at_depth(tokens, token_depths, open_idx, depth) != Some(idx) {
+        let Some(prev_idx) = previous_word_index_at_depth(tokens, token_depths, idx, depth) else {
+            return false;
+        };
+        if !is_xml_generation_escaping_keyword(tokens, token_depths, prev_idx, depth) {
+            return false;
+        }
+    }
+
+    next_word_index_at_depth(tokens, token_depths, idx, depth).is_some()
+}
+
+fn is_xmlelement_evalname_keyword(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> bool {
+    let Some(open_idx) = call_open_index(tokens, token_depths, idx, depth, "XMLELEMENT") else {
+        return false;
+    };
+
+    next_word_index_at_depth(tokens, token_depths, open_idx, depth) == Some(idx)
+        && next_member_of_collection_token_index(tokens, token_depths, idx, depth).is_some()
+}
+
+fn is_xml_generation_escaping_keyword(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> bool {
+    if matches!(
+        next_word_index_at_depth(tokens, token_depths, idx, depth).and_then(|next_idx| {
+            tokens.get(next_idx).copied()
+        }),
+        Some(SqlToken::Word(word))
+            if word.eq_ignore_ascii_case("NAME") || word.eq_ignore_ascii_case("EVALNAME")
+    ) {
+        return true;
+    }
+
+    let Some(next_idx) = next_word_index_at_depth(tokens, token_depths, idx, depth) else {
+        return false;
+    };
+
+    xml_generation_alias_after_expression(tokens, token_depths, next_idx, depth).is_some()
+}
+
+fn is_xmlelement_name_identifier(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> bool {
+    previous_word_index_at_depth(tokens, token_depths, idx, depth).is_some_and(|name_idx| {
+        matches!(
+            tokens.get(name_idx).copied(),
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("NAME")
+        ) && is_xmlelement_name_keyword(tokens, token_depths, name_idx, depth)
+    })
+}
+
+fn is_xmlpi_name_keyword(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> bool {
+    let Some(open_idx) = call_open_index(tokens, token_depths, idx, depth, "XMLPI") else {
+        return false;
+    };
+    if next_word_index_at_depth(tokens, token_depths, open_idx, depth) != Some(idx) {
+        return false;
+    }
+
+    next_word_index_at_depth(tokens, token_depths, idx, depth).is_some()
+}
+
+fn is_xmlpi_name_identifier(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> bool {
+    previous_word_index_at_depth(tokens, token_depths, idx, depth).is_some_and(|name_idx| {
+        matches!(
+            tokens.get(name_idx).copied(),
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("NAME")
+        ) && is_xmlpi_name_keyword(tokens, token_depths, name_idx, depth)
+    })
+}
+
+fn is_xml_generation_alias_after_as(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> bool {
+    previous_word_index_at_depth(tokens, token_depths, idx, depth).is_some_and(|as_idx| {
+        matches!(
+            tokens.get(as_idx).copied(),
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("AS")
+        ) && previous_xml_generation_alias_expression_token_index(
+            tokens,
+            token_depths,
+            as_idx,
+            depth,
+        )
+        .is_some()
+    })
+}
+
+fn previous_xml_generation_alias_expression_token_index(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    as_idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let mut scan_idx = as_idx;
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth {
+            return None;
+        }
+        if scan_depth != depth {
+            continue;
+        }
+
+        match tokens.get(scan_idx).copied() {
+            Some(SqlToken::Comment(_)) => {}
+            Some(SqlToken::Symbol(sym)) if sym == "," || sym == "(" => return None,
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("AS") => return None,
+            Some(_) => return Some(scan_idx),
+            None => return None,
+        }
+    }
+
+    None
+}
+
+fn xml_generation_alias_after_expression(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    expr_idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let mut scan_idx = expr_idx.saturating_add(1);
+    while scan_idx < tokens.len() {
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth {
+            return None;
+        }
+        if scan_depth != depth {
+            scan_idx += 1;
+            continue;
+        }
+
+        match tokens.get(scan_idx).copied() {
+            Some(SqlToken::Comment(_)) => scan_idx += 1,
+            Some(SqlToken::Symbol(sym)) if sym == "," || sym == ")" => return None,
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("AS") => {
+                return next_word_index_at_depth(tokens, token_depths, scan_idx, depth);
+            }
+            _ => scan_idx += 1,
+        }
+    }
+
+    None
 }
 
 fn next_word_at_depth_is(
@@ -7015,6 +8532,7 @@ fn is_json_function_name(name: &str) -> bool {
             | "JSON_ARRAY"
             | "JSON_OBJECTAGG"
             | "JSON_ARRAYAGG"
+            | "JSON_TRANSFORM"
     )
 }
 
@@ -7024,13 +8542,14 @@ fn is_json_predicate_syntax_word(
     idx: usize,
     word_upper: &str,
 ) -> bool {
-    if word_upper != "JSON" {
-        return false;
-    }
-
     let Some(depth) = token_depths.get(idx).copied() else {
         return false;
     };
+
+    if word_upper != "JSON" {
+        return is_json_predicate_option_word(tokens, token_depths, idx, depth, word_upper);
+    }
+
     let Some(is_idx) = json_predicate_is_index(tokens, token_depths, idx, depth) else {
         return false;
     };
@@ -7058,6 +8577,113 @@ fn json_predicate_is_index(
         }
         _ => None,
     }
+}
+
+fn is_json_predicate_option_word(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+    word_upper: &str,
+) -> bool {
+    if !matches!(
+        word_upper,
+        "VALUE"
+            | "ARRAY"
+            | "OBJECT"
+            | "SCALAR"
+            | "STRICT"
+            | "LAX"
+            | "WITH"
+            | "WITHOUT"
+            | "UNIQUE"
+            | "KEYS"
+    ) {
+        return false;
+    }
+
+    let Some(json_idx) = previous_json_predicate_json_index(tokens, token_depths, idx, depth)
+    else {
+        return false;
+    };
+    let Some(is_idx) = json_predicate_is_index(tokens, token_depths, json_idx, depth) else {
+        return false;
+    };
+    if previous_json_predicate_subject_token_index(tokens, token_depths, is_idx, depth).is_none() {
+        return false;
+    }
+
+    match word_upper {
+        "VALUE" | "ARRAY" | "OBJECT" | "SCALAR" | "STRICT" | "LAX" => true,
+        "WITH" | "WITHOUT" => next_word_at_depth_is(tokens, token_depths, idx, depth, "UNIQUE"),
+        "UNIQUE" => {
+            let prev_is_with_or_without =
+                previous_word_index_at_depth(tokens, token_depths, idx, depth).is_some_and(
+                    |prev_idx| {
+                        matches!(
+                            tokens.get(prev_idx).copied(),
+                            Some(SqlToken::Word(word))
+                                if word.eq_ignore_ascii_case("WITH")
+                                    || word.eq_ignore_ascii_case("WITHOUT")
+                        )
+                    },
+                );
+            prev_is_with_or_without
+                && next_word_at_depth_is(tokens, token_depths, idx, depth, "KEYS")
+        }
+        "KEYS" => {
+            previous_word_index_at_depth(tokens, token_depths, idx, depth).is_some_and(|prev_idx| {
+                matches!(
+                    tokens.get(prev_idx).copied(),
+                    Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("UNIQUE")
+                )
+            })
+        }
+        _ => false,
+    }
+}
+
+fn previous_json_predicate_json_index(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let mut scan_idx = idx;
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth {
+            return None;
+        }
+        if scan_depth != depth {
+            continue;
+        }
+
+        match tokens.get(scan_idx).copied() {
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("JSON") => {
+                return Some(scan_idx);
+            }
+            Some(SqlToken::Word(word))
+                if matches!(
+                    word.to_ascii_uppercase().as_str(),
+                    "VALUE"
+                        | "ARRAY"
+                        | "OBJECT"
+                        | "SCALAR"
+                        | "STRICT"
+                        | "LAX"
+                        | "WITH"
+                        | "WITHOUT"
+                        | "UNIQUE"
+                        | "KEYS"
+                ) => {}
+            Some(SqlToken::Comment(_)) => {}
+            _ => return None,
+        }
+    }
+
+    None
 }
 
 fn previous_json_predicate_subject_token_index(
@@ -7089,6 +8715,588 @@ fn previous_json_predicate_subject_token_index(
     None
 }
 
+fn is_is_of_type_syntax_word(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    word_upper: &str,
+) -> bool {
+    let Some(depth) = token_depths.get(idx).copied() else {
+        return false;
+    };
+
+    match word_upper {
+        "OF" => is_of_type_of_keyword(tokens, token_depths, idx, depth),
+        "TYPE" => is_of_type_type_keyword(tokens, token_depths, idx, depth),
+        "ONLY" => is_inside_is_of_type_list(tokens, token_depths, idx).is_some(),
+        _ => {
+            if is_inside_is_of_type_list(tokens, token_depths, idx).is_some() {
+                return true;
+            }
+
+            previous_word_index_at_depth(tokens, token_depths, idx, depth).is_some_and(|prev_idx| {
+                match tokens.get(prev_idx).copied() {
+                    Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("TYPE") => {
+                        is_of_type_type_keyword(tokens, token_depths, prev_idx, depth)
+                    }
+                    Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("OF") => {
+                        is_of_type_of_keyword(tokens, token_depths, prev_idx, depth)
+                    }
+                    Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("ONLY") => {
+                        previous_word_index_at_depth(tokens, token_depths, prev_idx, depth)
+                            .is_some_and(|marker_idx| match tokens.get(marker_idx).copied() {
+                                Some(SqlToken::Word(marker))
+                                    if marker.eq_ignore_ascii_case("TYPE") =>
+                                {
+                                    is_of_type_type_keyword(tokens, token_depths, marker_idx, depth)
+                                }
+                                Some(SqlToken::Word(marker))
+                                    if marker.eq_ignore_ascii_case("OF") =>
+                                {
+                                    is_of_type_of_keyword(tokens, token_depths, marker_idx, depth)
+                                }
+                                _ => false,
+                            })
+                    }
+                    _ => false,
+                }
+            })
+        }
+    }
+}
+
+fn is_of_type_type_keyword(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    type_idx: usize,
+    depth: usize,
+) -> bool {
+    previous_word_index_at_depth(tokens, token_depths, type_idx, depth).is_some_and(|of_idx| {
+        matches!(
+            tokens.get(of_idx).copied(),
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("OF")
+        ) && is_of_type_of_keyword(tokens, token_depths, of_idx, depth)
+    })
+}
+
+fn is_of_type_of_keyword(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    of_idx: usize,
+    depth: usize,
+) -> bool {
+    let Some(prev_idx) = previous_word_index_at_depth(tokens, token_depths, of_idx, depth) else {
+        return false;
+    };
+
+    let is_idx = match tokens.get(prev_idx).copied() {
+        Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("IS") => prev_idx,
+        Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("NOT") => {
+            let Some(is_idx) = previous_word_index_at_depth(tokens, token_depths, prev_idx, depth)
+            else {
+                return false;
+            };
+            if !matches!(
+                tokens.get(is_idx).copied(),
+                Some(SqlToken::Word(is_word)) if is_word.eq_ignore_ascii_case("IS")
+            ) {
+                return false;
+            }
+            is_idx
+        }
+        _ => return false,
+    };
+
+    previous_is_of_type_subject_token_index(tokens, token_depths, is_idx, depth).is_some()
+}
+
+fn is_inside_is_of_type_list(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+) -> Option<usize> {
+    let depth = token_depths.get(idx).copied()?;
+    if depth == 0 {
+        return None;
+    }
+
+    let list_depth = depth.saturating_sub(1);
+    let mut scan_idx = idx;
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < list_depth {
+            return None;
+        }
+        if scan_depth != list_depth {
+            continue;
+        }
+
+        if !matches!(tokens.get(scan_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
+            continue;
+        }
+
+        let marker_idx = previous_word_index_at_depth(tokens, token_depths, scan_idx, list_depth)?;
+        return match tokens.get(marker_idx).copied() {
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("TYPE") => {
+                is_of_type_type_keyword(tokens, token_depths, marker_idx, list_depth)
+                    .then_some(marker_idx)
+            }
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("OF") => {
+                is_of_type_of_keyword(tokens, token_depths, marker_idx, list_depth)
+                    .then_some(marker_idx)
+            }
+            _ => None,
+        };
+    }
+
+    None
+}
+
+fn previous_is_of_type_subject_token_index(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    is_idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let mut scan_idx = is_idx;
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth {
+            return None;
+        }
+        if scan_depth != depth {
+            continue;
+        }
+
+        match tokens.get(scan_idx).copied() {
+            Some(SqlToken::Comment(_)) => {}
+            Some(SqlToken::Symbol(sym)) if sym == "," || sym == "(" => return None,
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("IS") => return None,
+            Some(_) => return Some(scan_idx),
+            None => return None,
+        }
+    }
+
+    None
+}
+
+fn is_member_of_syntax_word(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    word_upper: &str,
+) -> bool {
+    let Some(depth) = token_depths.get(idx).copied() else {
+        return false;
+    };
+
+    match word_upper {
+        "MEMBER" => is_member_of_member_keyword(tokens, token_depths, idx, depth),
+        "OF" => previous_word_index_at_depth(tokens, token_depths, idx, depth).is_some_and(
+            |member_idx| {
+                matches!(
+                    tokens.get(member_idx).copied(),
+                    Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("MEMBER")
+                ) && is_member_of_member_keyword(tokens, token_depths, member_idx, depth)
+                    && next_member_of_collection_token_index(tokens, token_depths, idx, depth)
+                        .is_some()
+            },
+        ),
+        _ => false,
+    }
+}
+
+fn is_member_of_member_keyword(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    member_idx: usize,
+    depth: usize,
+) -> bool {
+    if !next_word_at_depth_is(tokens, token_depths, member_idx, depth, "OF") {
+        return false;
+    }
+
+    let subject_before_idx = previous_word_index_at_depth(tokens, token_depths, member_idx, depth)
+        .and_then(|prev_idx| {
+            matches!(
+                tokens.get(prev_idx).copied(),
+                Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("NOT")
+            )
+            .then_some(prev_idx)
+        });
+    let subject_boundary_idx = subject_before_idx.unwrap_or(member_idx);
+
+    previous_member_of_subject_token_index(tokens, token_depths, subject_boundary_idx, depth)
+        .is_some()
+}
+
+fn previous_member_of_subject_token_index(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let mut scan_idx = idx;
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth {
+            return None;
+        }
+        if scan_depth != depth {
+            continue;
+        }
+
+        match tokens.get(scan_idx).copied() {
+            Some(SqlToken::Comment(_)) => {}
+            Some(SqlToken::Symbol(sym)) if sym == "," || sym == "(" => return None,
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("MEMBER") => return None,
+            Some(_) => return Some(scan_idx),
+            None => return None,
+        }
+    }
+
+    None
+}
+
+fn next_member_of_collection_token_index(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    of_idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let mut scan_idx = of_idx.saturating_add(1);
+    while scan_idx < tokens.len() {
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth {
+            return None;
+        }
+        if scan_depth != depth {
+            scan_idx += 1;
+            continue;
+        }
+
+        match tokens.get(scan_idx).copied() {
+            Some(SqlToken::Comment(_)) => scan_idx += 1,
+            Some(SqlToken::Symbol(sym)) if sym == "," || sym == ")" => return None,
+            Some(_) => return Some(scan_idx),
+            None => return None,
+        }
+    }
+
+    None
+}
+
+fn is_submultiset_of_syntax_word(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    word_upper: &str,
+) -> bool {
+    let Some(depth) = token_depths.get(idx).copied() else {
+        return false;
+    };
+
+    match word_upper {
+        "SUBMULTISET" => is_submultiset_of_keyword(tokens, token_depths, idx, depth),
+        "OF" => previous_word_index_at_depth(tokens, token_depths, idx, depth).is_some_and(
+            |submultiset_idx| {
+                matches!(
+                    tokens.get(submultiset_idx).copied(),
+                    Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("SUBMULTISET")
+                ) && is_submultiset_of_keyword(tokens, token_depths, submultiset_idx, depth)
+                    && next_member_of_collection_token_index(tokens, token_depths, idx, depth)
+                        .is_some()
+            },
+        ),
+        _ => false,
+    }
+}
+
+fn is_submultiset_of_keyword(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    submultiset_idx: usize,
+    depth: usize,
+) -> bool {
+    next_word_at_depth_is(tokens, token_depths, submultiset_idx, depth, "OF")
+        && previous_member_of_subject_token_index(tokens, token_depths, submultiset_idx, depth)
+            .is_some()
+}
+
+fn is_multiset_operator_syntax_word(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    word_upper: &str,
+) -> bool {
+    let Some(depth) = token_depths.get(idx).copied() else {
+        return false;
+    };
+
+    match word_upper {
+        "MULTISET" => is_multiset_operator_marker(tokens, token_depths, idx, depth),
+        "UNION" | "EXCEPT" | "INTERSECT" => {
+            previous_word_index_at_depth(tokens, token_depths, idx, depth).is_some_and(
+                |multiset_idx| {
+                    matches!(
+                        tokens.get(multiset_idx).copied(),
+                        Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("MULTISET")
+                    ) && is_multiset_operator_marker(tokens, token_depths, multiset_idx, depth)
+                        && next_member_of_collection_token_index(tokens, token_depths, idx, depth)
+                            .is_some()
+                },
+            )
+        }
+        _ => false,
+    }
+}
+
+fn is_multiset_operator_marker(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    multiset_idx: usize,
+    depth: usize,
+) -> bool {
+    let Some(op_idx) = next_word_index_at_depth(tokens, token_depths, multiset_idx, depth) else {
+        return false;
+    };
+    if !matches!(
+        tokens.get(op_idx).copied(),
+        Some(SqlToken::Word(word))
+            if matches!(
+                word.to_ascii_uppercase().as_str(),
+                "UNION" | "EXCEPT" | "INTERSECT"
+            )
+    ) {
+        return false;
+    }
+
+    previous_member_of_subject_token_index(tokens, token_depths, multiset_idx, depth).is_some()
+}
+
+fn is_collection_condition_syntax_word(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    word_upper: &str,
+) -> bool {
+    let Some(depth) = token_depths.get(idx).copied() else {
+        return false;
+    };
+
+    match word_upper {
+        "EMPTY" => collection_condition_is_index(tokens, token_depths, idx, depth).is_some(),
+        "A" => {
+            next_word_at_depth_is(tokens, token_depths, idx, depth, "SET")
+                && collection_condition_is_index(tokens, token_depths, idx, depth).is_some()
+        }
+        "SET" => {
+            previous_word_index_at_depth(tokens, token_depths, idx, depth).is_some_and(|a_idx| {
+                matches!(
+                    tokens.get(a_idx).copied(),
+                    Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("A")
+                ) && collection_condition_is_index(tokens, token_depths, a_idx, depth).is_some()
+            })
+        }
+        _ => false,
+    }
+}
+
+fn collection_condition_is_index(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let prev_idx = previous_word_index_at_depth(tokens, token_depths, idx, depth)?;
+    let is_idx = match tokens.get(prev_idx).copied() {
+        Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("IS") => prev_idx,
+        Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("NOT") => {
+            let is_idx = previous_word_index_at_depth(tokens, token_depths, prev_idx, depth)?;
+            matches!(
+                tokens.get(is_idx).copied(),
+                Some(SqlToken::Word(is_word)) if is_word.eq_ignore_ascii_case("IS")
+            )
+            .then_some(is_idx)?
+        }
+        _ => return None,
+    };
+
+    previous_is_of_type_subject_token_index(tokens, token_depths, is_idx, depth).map(|_| is_idx)
+}
+
+fn is_like_escape_syntax_word(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    word_upper: &str,
+) -> bool {
+    if word_upper != "ESCAPE" {
+        return false;
+    }
+
+    let Some(depth) = token_depths.get(idx).copied() else {
+        return false;
+    };
+
+    like_operator_before(tokens, token_depths, idx, depth).is_some()
+        && next_member_of_collection_token_index(tokens, token_depths, idx, depth).is_some()
+}
+
+fn like_operator_before(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let mut scan_idx = idx;
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth {
+            return None;
+        }
+        if scan_depth != depth {
+            continue;
+        }
+
+        match tokens.get(scan_idx).copied() {
+            Some(SqlToken::Word(word)) if is_like_operator_word(word) => return Some(scan_idx),
+            Some(SqlToken::Symbol(sym)) if sym == "," => return None,
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn is_like_operator_word(word: &str) -> bool {
+    matches!(
+        word.to_ascii_uppercase().as_str(),
+        "LIKE" | "LIKEC" | "LIKE2" | "LIKE4"
+    )
+}
+
+fn is_sounds_like_syntax_word(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    word_upper: &str,
+) -> bool {
+    if word_upper != "SOUNDS" {
+        return false;
+    }
+
+    let Some(depth) = token_depths.get(idx).copied() else {
+        return false;
+    };
+
+    next_word_at_depth_is(tokens, token_depths, idx, depth, "LIKE")
+        && previous_sounds_like_subject_token_index(tokens, token_depths, idx, depth).is_some()
+}
+
+fn previous_sounds_like_subject_token_index(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    sounds_idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let mut scan_idx = sounds_idx;
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth {
+            return None;
+        }
+        if scan_depth != depth {
+            continue;
+        }
+
+        match tokens.get(scan_idx).copied() {
+            Some(SqlToken::Comment(_)) => {}
+            Some(SqlToken::Symbol(sym)) if sym == "," || sym == "(" => return None,
+            Some(SqlToken::Symbol(sym)) if sym == ")" => return Some(scan_idx),
+            Some(SqlToken::Word(word)) if is_expression_keyword(&word.to_ascii_uppercase()) => {
+                return None;
+            }
+            Some(SqlToken::Word(_)) | Some(SqlToken::String(_)) => return Some(scan_idx),
+            Some(_) => return None,
+            None => return None,
+        }
+    }
+
+    None
+}
+
+fn is_numeric_condition_syntax_word(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    word_upper: &str,
+) -> bool {
+    if !matches!(word_upper, "NAN" | "INFINITE") {
+        return false;
+    }
+
+    let Some(depth) = token_depths.get(idx).copied() else {
+        return false;
+    };
+
+    collection_condition_is_index(tokens, token_depths, idx, depth).is_some()
+}
+
+fn is_boolean_condition_syntax_word(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    word_upper: &str,
+) -> bool {
+    if !matches!(word_upper, "TRUE" | "FALSE" | "UNKNOWN") {
+        return false;
+    }
+
+    let Some(depth) = token_depths.get(idx).copied() else {
+        return false;
+    };
+
+    collection_condition_is_index(tokens, token_depths, idx, depth).is_some()
+}
+
+fn is_distinct_from_syntax_word(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    word_upper: &str,
+) -> bool {
+    if word_upper != "FROM" {
+        return false;
+    }
+
+    let Some(depth) = token_depths.get(idx).copied() else {
+        return false;
+    };
+    let Some(distinct_idx) = previous_word_index_at_depth(tokens, token_depths, idx, depth) else {
+        return false;
+    };
+    if !matches!(
+        tokens.get(distinct_idx).copied(),
+        Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("DISTINCT")
+    ) {
+        return false;
+    }
+
+    let Some(is_idx) = collection_condition_is_index(tokens, token_depths, distinct_idx, depth)
+    else {
+        return false;
+    };
+
+    previous_is_of_type_subject_token_index(tokens, token_depths, is_idx, depth).is_some()
+        && next_member_of_collection_token_index(tokens, token_depths, idx, depth).is_some()
+}
+
 fn is_xmlquery_syntax_word(
     tokens: &[&SqlToken],
     token_depths: &[usize],
@@ -7098,11 +9306,22 @@ fn is_xmlquery_syntax_word(
     let Some(depth) = token_depths.get(idx).copied() else {
         return false;
     };
-    if depth == 0 || call_open_index(tokens, token_depths, idx, depth, "XMLQUERY").is_none() {
+    let is_xmlquery = call_open_index(tokens, token_depths, idx, depth, "XMLQUERY").is_some();
+    let is_xmlexists = call_open_index(tokens, token_depths, idx, depth, "XMLEXISTS").is_some();
+    if depth == 0 || (!is_xmlquery && !is_xmlexists) {
         return false;
     }
 
-    if matches!(word_upper, "PASSING" | "RETURNING") {
+    if word_upper == "PASSING" {
+        return true;
+    }
+
+    if is_xmlexists {
+        return word_upper == "VALUE"
+            && keyword_before_in_same_call(tokens, token_depths, idx, depth, "PASSING").is_some();
+    }
+
+    if word_upper == "RETURNING" {
         return true;
     }
 
@@ -7133,6 +9352,190 @@ fn keyword_before_in_same_call(
                 return Some(scan_idx);
             }
             Some(SqlToken::Symbol(sym)) if sym == "," => return None,
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn is_window_frame_syntax_word(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    word_upper: &str,
+) -> bool {
+    let Some(depth) = token_depths.get(idx).copied() else {
+        return false;
+    };
+    if depth == 0 || call_open_index(tokens, token_depths, idx, depth, "OVER").is_none() {
+        return false;
+    }
+
+    match word_upper {
+        "GROUPS" => next_word_at_depth_is(tokens, token_depths, idx, depth, "BETWEEN"),
+        "EXCLUDE" => {
+            next_word_index_at_depth(tokens, token_depths, idx, depth).is_some_and(|next_idx| {
+                matches!(
+                    tokens.get(next_idx).copied(),
+                    Some(SqlToken::Word(word))
+                        if matches!(
+                            word.to_ascii_uppercase().as_str(),
+                            "CURRENT" | "GROUP" | "TIES" | "NO"
+                        )
+                )
+            })
+        }
+        "TIES" => {
+            previous_word_index_at_depth(tokens, token_depths, idx, depth).is_some_and(|prev_idx| {
+                matches!(
+                    tokens.get(prev_idx).copied(),
+                    Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("EXCLUDE")
+                )
+            })
+        }
+        "NO" => {
+            previous_word_index_at_depth(tokens, token_depths, idx, depth).is_some_and(|prev_idx| {
+                matches!(
+                    tokens.get(prev_idx).copied(),
+                    Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("EXCLUDE")
+                )
+            }) && next_word_at_depth_is(tokens, token_depths, idx, depth, "OTHERS")
+        }
+        "OTHERS" => {
+            let Some(no_idx) = previous_word_index_at_depth(tokens, token_depths, idx, depth)
+            else {
+                return false;
+            };
+            if !matches!(
+                tokens.get(no_idx).copied(),
+                Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("NO")
+            ) {
+                return false;
+            }
+            previous_word_index_at_depth(tokens, token_depths, no_idx, depth).is_some_and(
+                |exclude_idx| {
+                    matches!(
+                        tokens.get(exclude_idx).copied(),
+                        Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("EXCLUDE")
+                    )
+                },
+            )
+        }
+        _ => false,
+    }
+}
+
+fn is_analytic_null_treatment_syntax_word(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    word_upper: &str,
+) -> bool {
+    if !matches!(word_upper, "IGNORE" | "RESPECT") {
+        return false;
+    }
+
+    let Some(depth) = token_depths.get(idx).copied() else {
+        return false;
+    };
+
+    next_word_index_at_depth(tokens, token_depths, idx, depth).is_some_and(|next_idx| {
+        matches!(
+            tokens.get(next_idx).copied(),
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("NULLS")
+        )
+    })
+}
+
+fn is_nth_value_from_syntax_word(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    word_upper: &str,
+) -> bool {
+    if word_upper != "FROM" {
+        return false;
+    }
+
+    let Some(depth) = token_depths.get(idx).copied() else {
+        return false;
+    };
+    if !next_word_index_at_depth(tokens, token_depths, idx, depth).is_some_and(|next_idx| {
+        matches!(
+            tokens.get(next_idx).copied(),
+            Some(SqlToken::Word(word))
+                if matches!(word.to_ascii_uppercase().as_str(), "FIRST" | "LAST")
+        )
+    }) {
+        return false;
+    }
+
+    let Some(close_idx) = previous_token_index_at_depth(tokens, token_depths, idx, depth) else {
+        return false;
+    };
+    if !matches!(tokens.get(close_idx), Some(SqlToken::Symbol(sym)) if sym == ")") {
+        return false;
+    }
+
+    closed_call_name_before(tokens, token_depths, close_idx, depth)
+        .is_some_and(|call_name| call_name.eq_ignore_ascii_case("NTH_VALUE"))
+}
+
+fn previous_token_index_at_depth(
+    tokens: &[&SqlToken],
+    token_depths: &[usize],
+    idx: usize,
+    depth: usize,
+) -> Option<usize> {
+    let mut scan_idx = idx;
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth {
+            return None;
+        }
+        if scan_depth == depth && !matches!(tokens.get(scan_idx), Some(SqlToken::Comment(_))) {
+            return Some(scan_idx);
+        }
+    }
+
+    None
+}
+
+fn closed_call_name_before<'a>(
+    tokens: &[&'a SqlToken],
+    token_depths: &[usize],
+    close_idx: usize,
+    depth: usize,
+) -> Option<&'a str> {
+    let mut nested = 0usize;
+    let mut scan_idx = close_idx;
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        let scan_depth = token_depths.get(scan_idx).copied().unwrap_or(0);
+        if scan_depth < depth {
+            return None;
+        }
+
+        match tokens.get(scan_idx).copied() {
+            Some(SqlToken::Symbol(sym)) if sym == ")" && scan_depth > depth => {
+                nested = nested.saturating_add(1);
+            }
+            Some(SqlToken::Symbol(sym)) if sym == "(" && scan_depth == depth => {
+                if nested > 0 {
+                    nested -= 1;
+                    continue;
+                }
+                let call_idx = scan_idx.checked_sub(1)?;
+                return match tokens.get(call_idx).copied() {
+                    Some(SqlToken::Word(call_name)) => Some(call_name),
+                    _ => None,
+                };
+            }
+            Some(SqlToken::Symbol(sym)) if sym == "(" && nested > 0 => {
+                nested -= 1;
+            }
             _ => {}
         }
     }
@@ -7432,11 +9835,14 @@ fn is_sql_type_spec_word(word: &str) -> bool {
             | "BINARY_DOUBLE"
             | "CHAR"
             | "CHARACTER"
+            | "NATIONAL"
             | "VARCHAR"
             | "VARCHAR2"
             | "NCHAR"
             | "NVARCHAR2"
             | "RAW"
+            | "ROWID"
+            | "UROWID"
             | "DATE"
             | "TIMESTAMP"
             | "TIME"
@@ -7449,12 +9855,15 @@ fn is_sql_type_spec_word(word: &str) -> bool {
             | "MINUTE"
             | "SECOND"
             | "WITH"
+            | "WITHOUT"
             | "LOCAL"
             | "ZONE"
             | "CLOB"
             | "NCLOB"
             | "BLOB"
             | "BOOLEAN"
+            | "SIGNED"
+            | "UNSIGNED"
     )
 }
 
@@ -7570,6 +9979,9 @@ fn is_expression_keyword(word: &str) -> bool {
             | "IN"
             | "IS"
             | "LIKE"
+            | "LIKEC"
+            | "LIKE2"
+            | "LIKE4"
             | "BETWEEN"
             | "OVER"
             | "PARTITION"

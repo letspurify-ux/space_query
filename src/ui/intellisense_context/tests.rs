@@ -7502,6 +7502,35 @@ fn extract_oracle_pivot_projection_does_not_remove_grouping_column_named_like_ke
 }
 
 #[test]
+fn extract_oracle_pivot_projection_keep_dense_rank_first_keeps_grouping_columns_named_like_syntax()
+{
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, sal, hiredate, dense_rank, first, nulls FROM emp) \
+         PIVOT (SUM(sal) KEEP (DENSE_RANK FIRST ORDER BY hiredate NULLS FIRST) AS top_sal \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(
+        cols,
+        vec!["deptno", "dense_rank", "first", "nulls", "clerk_top_sal"]
+    );
+}
+
+#[test]
+fn extract_oracle_pivot_projection_removes_quoted_aggregate_input_columns_named_like_keep_keywords()
+{
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, \"first\", \"last\" FROM emp) \
+         PIVOT (SUM(\"first\" + \"last\") AS total_rank \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "clerk_total_rank"]);
+}
+
+#[test]
 fn extract_oracle_pivot_projection_does_not_remove_grouping_column_named_like_bind() {
     let tokens = tokenize(
         "SELECT * FROM (SELECT deptno, job, sal, adjustment FROM emp) \
@@ -7549,13 +7578,242 @@ fn extract_oracle_pivot_projection_does_not_remove_grouping_columns_named_like_a
 #[test]
 fn extract_oracle_pivot_projection_filter_where_keeps_grouping_column_named_where() {
     let tokens = tokenize(
-        "SELECT * FROM (SELECT deptno, job, sal, status, where FROM emp) \
+        "SELECT * FROM (SELECT deptno, job, sal, status, filter, where FROM emp) \
          PIVOT (SUM(sal) FILTER (WHERE status = 'Y') AS active_sal \
          FOR job IN ('CLERK' AS clerk))",
     );
 
     let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
-    assert_eq!(cols, vec!["deptno", "where", "clerk_active_sal"]);
+    assert_eq!(cols, vec!["deptno", "filter", "where", "clerk_active_sal"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_removes_aggregate_input_column_named_filter() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, \"filter\" FROM emp) \
+         PIVOT (SUM(\"filter\") AS total_filter FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "clerk_total_filter"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_filter_where_removes_condition_column_named_filter() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, sal, \"filter\" FROM emp) \
+         PIVOT (SUM(sal) FILTER (WHERE \"filter\" = 'Y') AS active_sal \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "clerk_active_sal"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_listagg_overflow_keeps_grouping_columns_named_like_syntax() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, name_col, overflow, truncate, with, count FROM emp) \
+         PIVOT (LISTAGG(name_col, ',' ON OVERFLOW TRUNCATE '...' WITH COUNT) AS names \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(
+        cols,
+        vec![
+            "deptno",
+            "overflow",
+            "truncate",
+            "with",
+            "count",
+            "clerk_names"
+        ]
+    );
+}
+
+#[test]
+fn extract_oracle_pivot_projection_listagg_within_group_removes_order_column() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, name_col, sort_col, within, group_col FROM emp) \
+         PIVOT (LISTAGG(name_col, ',') WITHIN GROUP (ORDER BY sort_col DESC NULLS LAST) AS names \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "within", "group_col", "clerk_names"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_percentile_cont_within_group_removes_order_column() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, sal, within, group_col FROM emp) \
+         PIVOT (PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY sal) AS median_sal \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(
+        cols,
+        vec!["deptno", "within", "group_col", "clerk_median_sal"]
+    );
+}
+
+#[test]
+fn extract_oracle_pivot_projection_hypothetical_rank_within_group_removes_input_columns() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, target_sal, sal, within, group_col FROM emp) \
+         PIVOT (RANK(target_sal) WITHIN GROUP (ORDER BY sal) AS sal_rank \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(
+        cols,
+        vec!["deptno", "within", "group_col", "clerk_sal_rank"]
+    );
+}
+
+#[test]
+fn extract_oracle_pivot_projection_window_exclude_ties_keeps_grouping_columns_named_like_syntax() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, sal, \"exclude\", \"ties\" FROM emp) \
+         PIVOT (MAX(SUM(sal) OVER (ORDER BY sal ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE TIES)) AS running_sal \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(
+        cols,
+        vec!["deptno", r#""exclude""#, r#""ties""#, "clerk_running_sal"]
+    );
+}
+
+#[test]
+fn extract_oracle_pivot_projection_removes_aggregate_input_column_named_over() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, \"over\" FROM emp) \
+         PIVOT (SUM(\"over\") AS total_over FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "clerk_total_over"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_window_groups_exclude_no_others_keeps_grouping_columns_named_like_syntax(
+) {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, sal, \"groups\", \"no\", \"others\" FROM emp) \
+         PIVOT (MAX(SUM(sal) OVER (ORDER BY sal GROUPS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE NO OTHERS)) AS running_sal \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(
+        cols,
+        vec![
+            "deptno",
+            r#""groups""#,
+            r#""no""#,
+            r#""others""#,
+            "clerk_running_sal"
+        ]
+    );
+}
+
+#[test]
+fn extract_oracle_pivot_projection_analytic_ignore_nulls_keeps_grouping_column_named_ignore() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, sal, hiredate, \"ignore\" FROM emp) \
+         PIVOT (MAX(FIRST_VALUE(sal) IGNORE NULLS OVER (ORDER BY hiredate)) AS first_sal \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", r#""ignore""#, "clerk_first_sal"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_analytic_respect_nulls_keeps_grouping_column_named_respect() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, sal, hiredate, \"respect\" FROM emp) \
+         PIVOT (MAX(LAST_VALUE(sal) RESPECT NULLS OVER (ORDER BY hiredate)) AS last_sal \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", r#""respect""#, "clerk_last_sal"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_nth_value_from_last_keeps_grouping_column_named_from() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, sal, hiredate, \"from\" FROM emp) \
+         PIVOT (MAX(NTH_VALUE(sal, 1) FROM LAST IGNORE NULLS OVER (ORDER BY hiredate)) AS last_sal \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", r#""from""#, "clerk_last_sal"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_nth_value_nested_arg_from_last_keeps_grouping_column_named_from()
+{
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, sal, hiredate, \"from\" FROM emp) \
+         PIVOT (MAX(NTH_VALUE(NVL(sal, 0), 1) FROM LAST IGNORE NULLS OVER (ORDER BY hiredate)) AS last_sal \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", r#""from""#, "clerk_last_sal"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_nth_value_from_first_keeps_grouping_column_named_from() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, sal, hiredate, \"from\" FROM emp) \
+         PIVOT (MAX(NTH_VALUE(sal, 1) FROM FIRST RESPECT NULLS OVER (ORDER BY hiredate)) AS first_sal \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", r#""from""#, "clerk_first_sal"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_removes_aggregate_input_column_named_ignore() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, \"ignore\" FROM emp) \
+         PIVOT (SUM(\"ignore\") AS total_ignore FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "clerk_total_ignore"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_removes_aggregate_input_column_named_respect() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, \"respect\" FROM emp) \
+         PIVOT (SUM(\"respect\") AS total_respect FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "clerk_total_respect"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_removes_aggregate_input_column_named_from() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, \"from\" FROM emp) \
+         PIVOT (SUM(\"from\") AS total_from FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "clerk_total_from"]);
 }
 
 #[test]
@@ -7567,6 +7825,122 @@ fn extract_oracle_pivot_projection_cast_type_name_keeps_grouping_column_named_nu
 
     let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
     assert_eq!(cols, vec!["deptno", "number", "clerk_total_sal"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_cast_length_semantics_keeps_grouping_columns_named_like_syntax()
+{
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, name_col, \"char\", \"byte\" FROM emp) \
+         PIVOT (COUNT(CAST(name_col AS VARCHAR2(10 CHAR))) AS name_text \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(
+        cols,
+        vec!["deptno", r#""char""#, r#""byte""#, "clerk_name_text"]
+    );
+}
+
+#[test]
+fn extract_oracle_pivot_projection_cast_byte_semantics_keeps_grouping_column_named_byte() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, name_col, \"byte\" FROM emp) \
+         PIVOT (COUNT(CAST(name_col AS VARCHAR2(10 BYTE))) AS name_text \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", r#""byte""#, "clerk_name_text"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_cast_character_set_keeps_grouping_columns_named_like_syntax() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, name_col, \"set\", utf8mb4 FROM emp) \
+         PIVOT (COUNT(CAST(name_col AS CHAR CHARACTER SET utf8mb4)) AS name_text \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(
+        cols,
+        vec!["deptno", r#""set""#, "utf8mb4", "clerk_name_text"]
+    );
+}
+
+#[test]
+fn extract_oracle_pivot_projection_cast_character_varying_keeps_grouping_column_named_varying() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, name_col, \"varying\" FROM emp) \
+         PIVOT (COUNT(CAST(name_col AS CHARACTER VARYING(30))) AS name_text \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", r#""varying""#, "clerk_name_text"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_cast_national_character_keeps_grouping_column_named_national() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, name_col, \"national\" FROM emp) \
+         PIVOT (COUNT(CAST(name_col AS NATIONAL CHARACTER VARYING(30))) AS name_text \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", r#""national""#, "clerk_name_text"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_cast_unsigned_keeps_grouping_column_named_unsigned() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, sal, \"unsigned\" FROM emp) \
+         PIVOT (SUM(CAST(sal AS UNSIGNED INTEGER)) AS total_sal \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", r#""unsigned""#, "clerk_total_sal"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_cast_urowid_keeps_grouping_column_named_urowid() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, rowid_col, \"urowid\" FROM emp) \
+         PIVOT (COUNT(CAST(rowid_col AS UROWID)) AS rowid_count \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", r#""urowid""#, "clerk_rowid_count"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_cast_rowid_keeps_grouping_column_named_rowid() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, rowid_col, \"rowid\" FROM emp) \
+         PIVOT (COUNT(CAST(rowid_col AS ROWID)) AS rowid_count \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", r#""rowid""#, "clerk_rowid_count"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_cast_timestamp_without_time_zone_keeps_grouping_column_named_without(
+) {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, ts_col, \"without\" FROM emp) \
+         PIVOT (COUNT(CAST(ts_col AS TIMESTAMP WITHOUT TIME ZONE)) AS ts_count \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", r#""without""#, "clerk_ts_count"]);
 }
 
 #[test]
@@ -7594,6 +7968,92 @@ fn extract_oracle_pivot_projection_treat_type_name_keeps_grouping_column_named_l
 }
 
 #[test]
+fn extract_oracle_pivot_projection_treat_qualified_type_keeps_grouping_columns_named_like_type_path(
+) {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, obj_col, app_schema, employee_t FROM emp) \
+         PIVOT (COUNT(TREAT(obj_col AS app_schema.employee_t)) AS typed_obj \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(
+        cols,
+        vec!["deptno", "app_schema", "employee_t", "clerk_typed_obj"]
+    );
+}
+
+#[test]
+fn extract_oracle_pivot_projection_treat_quoted_qualified_type_keeps_grouping_columns_named_like_type_path(
+) {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, obj_col, \"App Schema\", \"Employee Type\" FROM emp) \
+         PIVOT (COUNT(TREAT(obj_col AS \"App Schema\".\"Employee Type\")) AS typed_obj \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(
+        cols,
+        vec![
+            "deptno",
+            r#""App Schema""#,
+            r#""Employee Type""#,
+            "clerk_typed_obj"
+        ]
+    );
+}
+
+#[test]
+fn extract_oracle_pivot_projection_cast_user_type_keeps_grouping_column_named_like_type() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, obj_col, employee_t FROM emp) \
+         PIVOT (COUNT(CAST(obj_col AS employee_t)) AS typed_obj \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "employee_t", "clerk_typed_obj"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_cast_qualified_user_type_keeps_grouping_columns_named_like_type_path(
+) {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, obj_col, app_schema, employee_t FROM emp) \
+         PIVOT (COUNT(CAST(obj_col AS app_schema.employee_t)) AS typed_obj \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(
+        cols,
+        vec!["deptno", "app_schema", "employee_t", "clerk_typed_obj"]
+    );
+}
+
+#[test]
+fn extract_oracle_pivot_projection_cast_quoted_qualified_user_type_keeps_grouping_columns_named_like_type_path(
+) {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, obj_col, \"App Schema\", \"Employee Type\" FROM emp) \
+         PIVOT (COUNT(CAST(obj_col AS \"App Schema\".\"Employee Type\")) AS typed_obj \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(
+        cols,
+        vec![
+            "deptno",
+            r#""App Schema""#,
+            r#""Employee Type""#,
+            "clerk_typed_obj"
+        ]
+    );
+}
+
+#[test]
 fn extract_oracle_pivot_projection_xmlquery_syntax_keeps_grouping_columns_named_like_syntax() {
     let tokens = tokenize(
         "SELECT * FROM (SELECT deptno, job, payload_xml, passing, returning, content FROM emp) \
@@ -7612,6 +8072,235 @@ fn extract_oracle_pivot_projection_xmlquery_syntax_keeps_grouping_columns_named_
             "clerk_xml_count"
         ]
     );
+}
+
+#[test]
+fn extract_oracle_pivot_projection_xmlserialize_syntax_keeps_grouping_columns_named_like_syntax() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, payload_xml, content, clob, indent, size FROM emp) \
+         PIVOT (COUNT(XMLSERIALIZE(CONTENT payload_xml AS CLOB INDENT SIZE = 2)) AS xml_doc \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(
+        cols,
+        vec![
+            "deptno",
+            "content",
+            "clob",
+            "indent",
+            "size",
+            "clerk_xml_doc"
+        ]
+    );
+}
+
+#[test]
+fn extract_oracle_pivot_projection_xmlserialize_removes_input_column_named_content() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, content FROM emp) \
+         PIVOT (COUNT(XMLSERIALIZE(CONTENT content AS CLOB)) AS xml_doc \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "clerk_xml_doc"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_xmlelement_name_keeps_grouping_columns_named_like_syntax() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, payload_xml, name, employee FROM emp) \
+         PIVOT (COUNT(XMLELEMENT(NAME employee, payload_xml)) AS xml_elem \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "name", "employee", "clerk_xml_elem"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_xmlelement_evalname_removes_name_expression_column() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, employee, payload_xml, evalname FROM emp) \
+         PIVOT (COUNT(XMLELEMENT(EVALNAME employee, payload_xml)) AS xml_elem \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "evalname", "clerk_xml_elem"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_xmlelement_escaping_name_keeps_grouping_columns_named_like_syntax(
+) {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, payload_xml, entityescaping, name, employee FROM emp) \
+         PIVOT (COUNT(XMLELEMENT(ENTITYESCAPING NAME employee, payload_xml)) AS xml_elem \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(
+        cols,
+        vec![
+            "deptno",
+            "entityescaping",
+            "name",
+            "employee",
+            "clerk_xml_elem"
+        ]
+    );
+}
+
+#[test]
+fn extract_oracle_pivot_projection_xmlforest_alias_keeps_grouping_column_named_like_alias() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, payload_xml, payload_doc FROM emp) \
+         PIVOT (COUNT(XMLFOREST(payload_xml AS payload_doc)) AS xml_forest \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "payload_doc", "clerk_xml_forest"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_xmlforest_escaping_alias_keeps_grouping_columns_named_like_syntax(
+) {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, payload_xml, nonentityescaping, payload_doc FROM emp) \
+         PIVOT (COUNT(XMLFOREST(NONENTITYESCAPING payload_xml AS payload_doc)) AS xml_forest \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(
+        cols,
+        vec![
+            "deptno",
+            "nonentityescaping",
+            "payload_doc",
+            "clerk_xml_forest"
+        ]
+    );
+}
+
+#[test]
+fn extract_oracle_pivot_projection_xmlforest_removes_input_column_named_entityescaping() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, entityescaping, attr_name FROM emp) \
+         PIVOT (COUNT(XMLFOREST(entityescaping AS attr_name)) AS xml_forest \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "attr_name", "clerk_xml_forest"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_xmlpi_name_keeps_grouping_columns_named_like_syntax() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, payload_xml, name, employee FROM emp) \
+         PIVOT (COUNT(XMLPI(NAME employee, payload_xml)) AS xml_pi \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "name", "employee", "clerk_xml_pi"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_xmlpi_removes_value_expression_column() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, employee, payload_xml FROM emp) \
+         PIVOT (COUNT(XMLPI(NAME employee, payload_xml)) AS xml_pi \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "employee", "clerk_xml_pi"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_xmlroot_options_keep_grouping_columns_named_like_syntax() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, payload_xml, version, standalone, yes FROM emp) \
+         PIVOT (COUNT(XMLROOT(payload_xml, VERSION '1.0', STANDALONE YES)) AS rooted_xml \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(
+        cols,
+        vec!["deptno", "version", "standalone", "yes", "clerk_rooted_xml"]
+    );
+}
+
+#[test]
+fn extract_oracle_pivot_projection_xmlroot_removes_version_expression_column() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, payload_xml, version FROM emp) \
+         PIVOT (COUNT(XMLROOT(payload_xml, VERSION version)) AS rooted_xml \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "clerk_rooted_xml"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_xmlparse_syntax_keeps_grouping_columns_named_like_syntax() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, payload_xml, content, wellformed FROM emp) \
+         PIVOT (COUNT(XMLPARSE(CONTENT payload_xml WELLFORMED)) AS parsed_xml \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(
+        cols,
+        vec!["deptno", "content", "wellformed", "clerk_parsed_xml"]
+    );
+}
+
+#[test]
+fn extract_oracle_pivot_projection_xmlparse_removes_input_column_named_content() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, content FROM emp) \
+         PIVOT (COUNT(XMLPARSE(CONTENT content)) AS parsed_xml \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "clerk_parsed_xml"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_xmlexists_syntax_keeps_grouping_columns_named_like_syntax() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, payload_xml, passing, by, value, sal FROM emp) \
+         PIVOT (SUM(CASE WHEN XMLEXISTS('/root' PASSING BY VALUE payload_xml) THEN sal ELSE 0 END) AS xml_exists_sal \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(
+        cols,
+        vec!["deptno", "passing", "by", "value", "clerk_xml_exists_sal"]
+    );
+}
+
+#[test]
+fn extract_oracle_pivot_projection_removes_aggregate_input_column_named_value() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, value FROM emp) \
+         PIVOT (SUM(value) AS total_value FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "clerk_total_value"]);
 }
 
 #[test]
@@ -7634,6 +8323,18 @@ fn extract_oracle_pivot_projection_removes_aggregate_input_column_named_number()
 
     let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
     assert_eq!(cols, vec!["deptno", "clerk_total_num"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_validate_conversion_keeps_grouping_column_named_number() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, amount_txt, sal, number FROM emp) \
+         PIVOT (SUM(CASE WHEN VALIDATE_CONVERSION(amount_txt AS NUMBER) = 1 THEN sal ELSE 0 END) AS valid_sal \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "number", "clerk_valid_sal"]);
 }
 
 #[test]
@@ -7683,6 +8384,54 @@ fn extract_oracle_pivot_projection_trim_spec_keeps_grouping_column_named_leading
 }
 
 #[test]
+fn extract_oracle_pivot_projection_substring_from_for_keeps_grouping_columns_named_like_syntax() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, name_col, start_pos, len_col, \"from\", \"for\" FROM emp) \
+         PIVOT (MAX(SUBSTRING(name_col FROM start_pos FOR len_col)) AS part_name \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(
+        cols,
+        vec!["deptno", r#""from""#, r#""for""#, "clerk_part_name"]
+    );
+}
+
+#[test]
+fn extract_oracle_pivot_projection_overlay_syntax_keeps_grouping_columns_named_like_syntax() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, name_col, repl_col, start_pos, len_col, placing, \"from\", \"for\" FROM emp) \
+         PIVOT (MAX(OVERLAY(name_col PLACING repl_col FROM start_pos FOR len_col)) AS masked_name \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(
+        cols,
+        vec![
+            "deptno",
+            "placing",
+            r#""from""#,
+            r#""for""#,
+            "clerk_masked_name"
+        ]
+    );
+}
+
+#[test]
+fn extract_oracle_pivot_projection_position_from_keeps_grouping_column_named_from() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, name_col, \"from\", sal FROM emp) \
+         PIVOT (SUM(CASE WHEN POSITION('A' FROM name_col) > 0 THEN sal ELSE 0 END) AS matched_sal \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", r#""from""#, "clerk_matched_sal"]);
+}
+
+#[test]
 fn extract_oracle_pivot_projection_removes_aggregate_input_column_named_leading() {
     let tokens = tokenize(
         "SELECT * FROM (SELECT deptno, job, leading FROM emp) \
@@ -7715,6 +8464,18 @@ fn extract_oracle_pivot_projection_interval_literal_keeps_grouping_column_named_
 
     let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
     assert_eq!(cols, vec!["deptno", "day", "clerk_recent_sal"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_interval_year_to_month_keeps_grouping_column_named_to() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, sal, hiredate, to FROM emp) \
+         PIVOT (SUM(CASE WHEN hiredate >= hiredate - INTERVAL '1-2' YEAR TO MONTH THEN sal ELSE 0 END) AS recent_sal \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "to", "clerk_recent_sal"]);
 }
 
 #[test]
@@ -7848,6 +8609,90 @@ fn extract_oracle_pivot_projection_json_query_options_keep_grouping_columns_name
 }
 
 #[test]
+fn extract_oracle_pivot_projection_json_object_options_keep_grouping_columns_named_like_syntax() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, key_col, val_col, key, value, absent, with, keys, strict FROM emp) \
+         PIVOT (COUNT(JSON_OBJECT(KEY key_col VALUE val_col ABSENT ON NULL WITH UNIQUE KEYS STRICT RETURNING CLOB)) AS json_doc \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(
+        cols,
+        vec![
+            "deptno",
+            "key",
+            "value",
+            "absent",
+            "with",
+            "keys",
+            "strict",
+            "clerk_json_doc"
+        ]
+    );
+}
+
+#[test]
+fn extract_oracle_pivot_projection_json_object_removes_input_column_named_key() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, key, val_col FROM emp) \
+         PIVOT (COUNT(JSON_OBJECT(key VALUE val_col)) AS json_doc \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "clerk_json_doc"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_json_transform_options_keep_grouping_columns_named_like_syntax()
+{
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, payload, status_col, set, returning, clob FROM emp) \
+         PIVOT (COUNT(JSON_TRANSFORM(payload, SET '$.status' = status_col RETURNING CLOB)) AS payload_doc \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(
+        cols,
+        vec!["deptno", "set", "returning", "clob", "clerk_payload_doc"]
+    );
+}
+
+#[test]
+fn extract_oracle_pivot_projection_json_transform_operation_options_keep_grouping_columns_named_like_syntax(
+) {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, payload, remove, ignore, missing FROM emp) \
+         PIVOT (COUNT(JSON_TRANSFORM(payload, REMOVE '$.old' IGNORE ON MISSING)) AS payload_doc \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(
+        cols,
+        vec!["deptno", "remove", "ignore", "missing", "clerk_payload_doc"]
+    );
+}
+
+#[test]
+fn extract_oracle_pivot_projection_json_transform_create_on_missing_keeps_grouping_columns_named_like_syntax(
+) {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, payload, status_col, set, create, missing FROM emp) \
+         PIVOT (COUNT(JSON_TRANSFORM(payload, SET '$.status' = status_col CREATE ON MISSING)) AS payload_doc \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(
+        cols,
+        vec!["deptno", "set", "create", "missing", "clerk_payload_doc"]
+    );
+}
+
+#[test]
 fn extract_oracle_pivot_projection_json_exists_options_keep_grouping_columns_named_like_syntax() {
     let tokens = tokenize(
         "SELECT * FROM (SELECT deptno, job, payload, min_amt, sal, passing, true, error FROM emp) \
@@ -7872,6 +8717,318 @@ fn extract_oracle_pivot_projection_is_json_keeps_grouping_column_named_json() {
 
     let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
     assert_eq!(cols, vec!["deptno", "json", "clerk_valid_json"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_is_json_options_keep_grouping_columns_named_like_syntax() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, payload, object, with, keys, sal FROM emp) \
+         PIVOT (SUM(CASE WHEN payload IS JSON OBJECT WITH UNIQUE KEYS THEN sal ELSE 0 END) AS json_object_sal \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(
+        cols,
+        vec!["deptno", "object", "with", "keys", "clerk_json_object_sal"]
+    );
+}
+
+#[test]
+fn extract_oracle_pivot_projection_removes_aggregate_input_column_named_object() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, object FROM emp) \
+         PIVOT (SUM(object) AS total_object FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "clerk_total_object"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_removes_aggregate_input_column_named_keys() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, keys FROM emp) \
+         PIVOT (SUM(keys) AS total_keys FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "clerk_total_keys"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_is_of_type_keeps_grouping_columns_named_like_syntax() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, obj_col, sal, of, type, employee_t FROM emp) \
+         PIVOT (SUM(CASE WHEN obj_col IS OF TYPE (employee_t) THEN sal ELSE 0 END) AS typed_sal \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(
+        cols,
+        vec!["deptno", "of", "type", "employee_t", "clerk_typed_sal"]
+    );
+}
+
+#[test]
+fn extract_oracle_pivot_projection_member_of_keeps_grouping_columns_named_like_syntax() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, elem_col, nested_col, member, of, sal FROM emp) \
+         PIVOT (SUM(CASE WHEN elem_col MEMBER OF nested_col THEN sal ELSE 0 END) AS member_sal \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "member", "of", "clerk_member_sal"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_submultiset_of_keeps_grouping_columns_named_like_syntax() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, child_nt, parent_nt, submultiset, of, sal FROM emp) \
+         PIVOT (SUM(CASE WHEN child_nt SUBMULTISET OF parent_nt THEN sal ELSE 0 END) AS subset_sal \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(
+        cols,
+        vec!["deptno", "submultiset", "of", "clerk_subset_sal"]
+    );
+}
+
+#[test]
+fn extract_oracle_pivot_projection_multiset_except_keeps_grouping_columns_named_like_syntax() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, child_nt, parent_nt, multiset, except, sal FROM emp) \
+         PIVOT (SUM(CASE WHEN child_nt MULTISET EXCEPT DISTINCT parent_nt IS EMPTY THEN sal ELSE 0 END) AS diff_sal \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "multiset", "except", "clerk_diff_sal"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_is_empty_keeps_grouping_column_named_empty() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, nested_col, empty, sal FROM emp) \
+         PIVOT (SUM(CASE WHEN nested_col IS EMPTY THEN sal ELSE 0 END) AS empty_sal \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "empty", "clerk_empty_sal"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_is_a_set_keeps_grouping_column_named_set() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, nested_col, set, sal FROM emp) \
+         PIVOT (SUM(CASE WHEN nested_col IS A SET THEN sal ELSE 0 END) AS set_sal \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "set", "clerk_set_sal"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_like_escape_keeps_grouping_column_named_escape() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, name_col, pattern_col, escape_char, escape, sal FROM emp) \
+         PIVOT (SUM(CASE WHEN name_col LIKE pattern_col ESCAPE escape_char THEN sal ELSE 0 END) AS like_sal \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "escape", "clerk_like_sal"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_likec_escape_keeps_grouping_columns_named_like_syntax() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, name_col, pattern_col, escape_char, likec, escape, sal FROM emp) \
+         PIVOT (SUM(CASE WHEN name_col LIKEC pattern_col ESCAPE escape_char THEN sal ELSE 0 END) AS likec_sal \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "likec", "escape", "clerk_likec_sal"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_sounds_like_keeps_grouping_column_named_sounds() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, name_col, pattern_col, sounds, sal FROM emp) \
+         PIVOT (SUM(CASE WHEN name_col SOUNDS LIKE pattern_col THEN sal ELSE 0 END) AS sounds_sal \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "sounds", "clerk_sounds_sal"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_is_not_distinct_from_keeps_grouping_column_named_from() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, old_val, new_val, sal, \"from\" FROM emp) \
+         PIVOT (SUM(CASE WHEN old_val IS NOT DISTINCT FROM new_val THEN sal ELSE 0 END) AS same_sal \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", r#""from""#, "clerk_same_sal"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_is_nan_keeps_grouping_column_named_nan() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, ratio_col, nan, sal FROM emp) \
+         PIVOT (SUM(CASE WHEN ratio_col IS NAN THEN sal ELSE 0 END) AS nan_sal \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "nan", "clerk_nan_sal"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_is_infinite_keeps_grouping_column_named_infinite() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, ratio_col, infinite, sal FROM emp) \
+         PIVOT (SUM(CASE WHEN ratio_col IS INFINITE THEN sal ELSE 0 END) AS infinite_sal \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "infinite", "clerk_infinite_sal"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_is_true_keeps_grouping_column_named_true() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, flag_col, true, sal FROM emp) \
+         PIVOT (SUM(CASE WHEN flag_col IS TRUE THEN sal ELSE 0 END) AS true_sal \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "true", "clerk_true_sal"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_is_unknown_keeps_grouping_column_named_unknown() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, flag_col, unknown, sal FROM emp) \
+         PIVOT (SUM(CASE WHEN flag_col IS UNKNOWN THEN sal ELSE 0 END) AS unknown_sal \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "unknown", "clerk_unknown_sal"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_overlaps_keeps_grouping_column_named_overlaps() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, start_a, end_a, start_b, end_b, overlaps, sal FROM emp) \
+         PIVOT (SUM(CASE WHEN (start_a, end_a) OVERLAPS (start_b, end_b) THEN sal ELSE 0 END) AS overlap_sal \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "overlaps", "clerk_overlap_sal"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_removes_aggregate_input_column_named_nan() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, nan FROM emp) \
+         PIVOT (SUM(nan) AS total_nan FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "clerk_total_nan"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_like_removes_input_column_named_sounds() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, sounds, pattern_col, sal FROM emp) \
+         PIVOT (SUM(CASE WHEN sounds LIKE pattern_col THEN sal ELSE 0 END) AS like_sal \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "clerk_like_sal"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_removes_aggregate_input_column_named_infinite() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, infinite FROM emp) \
+         PIVOT (SUM(infinite) AS total_infinite FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "clerk_total_infinite"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_removes_aggregate_input_column_named_escape() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, escape FROM emp) \
+         PIVOT (SUM(escape) AS total_escape FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "clerk_total_escape"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_removes_aggregate_input_column_named_empty() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, empty FROM emp) \
+         PIVOT (SUM(empty) AS total_empty FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "clerk_total_empty"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_removes_aggregate_input_column_named_set() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, set FROM emp) \
+         PIVOT (SUM(set) AS total_set FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "clerk_total_set"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_removes_aggregate_input_column_named_submultiset() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, submultiset FROM emp) \
+         PIVOT (SUM(submultiset) AS total_subset FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "clerk_total_subset"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_removes_aggregate_input_column_named_member() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, member FROM emp) \
+         PIVOT (SUM(member) AS total_member FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "clerk_total_member"]);
 }
 
 #[test]
@@ -7905,6 +9062,21 @@ fn extract_oracle_pivot_projection_json_returning_keeps_grouping_columns_named_l
             "empty",
             "clerk_json_amount"
         ]
+    );
+}
+
+#[test]
+fn extract_oracle_pivot_projection_json_default_expression_removes_fallback_column() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, payload, fallback_amt, default, error, empty FROM emp) \
+         PIVOT (SUM(JSON_VALUE(payload, '$.amount' RETURNING NUMBER DEFAULT fallback_amt ON ERROR NULL ON EMPTY)) AS json_amount \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(
+        cols,
+        vec!["deptno", "default", "error", "empty", "clerk_json_amount"]
     );
 }
 

@@ -8017,6 +8017,103 @@ PIVOT (
 }
 
 #[test]
+fn pivot_clause_alias_qualified_column_suggestions_keep_dense_rank_first_keeps_grouping_columns_named_like_syntax(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, sal, hiredate, dense_rank, first, nulls FROM oqt_t_emp)
+PIVOT (
+  SUM(sal) KEEP (DENSE_RANK FIRST ORDER BY hiredate NULLS FIRST) AS top_sal
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "dense_rank", "first", "nulls", "clerk_top_sal"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "sal", "hiredate"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT KEEP DENSE_RANK FIRST output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_removes_quoted_aggregate_input_columns_named_like_keep_keywords(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, "first", "last" FROM oqt_t_emp)
+PIVOT (
+  SUM("first" + "last") AS total_rank
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    assert_has_case_insensitive(&suggestions, "deptno");
+    assert_has_case_insensitive(&suggestions, "clerk_total_rank");
+    for unexpected in ["job", r#""first""#, r#""last""#] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT aggregate input named like KEEP keywords should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
 fn pivot_clause_alias_qualified_column_suggestions_keep_grouping_column_named_like_bind() {
     let sql_with_cursor = r#"
 SELECT
@@ -8174,7 +8271,7 @@ fn pivot_clause_alias_qualified_column_suggestions_filter_where_keeps_grouping_c
     let sql_with_cursor = r#"
 SELECT
   p.|
-FROM (SELECT deptno, job, sal, status, where FROM oqt_t_emp)
+FROM (SELECT deptno, job, sal, status, filter, where FROM oqt_t_emp)
 PIVOT (
   SUM(sal) FILTER (WHERE status = 'Y') AS active_sal
   FOR job IN ('CLERK' AS clerk)
@@ -8204,6 +8301,7 @@ PIVOT (
     let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
 
     assert_has_case_insensitive(&suggestions, "deptno");
+    assert_has_case_insensitive(&suggestions, "filter");
     assert_has_case_insensitive(&suggestions, "where");
     assert_has_case_insensitive(&suggestions, "clerk_active_sal");
     for unexpected in ["job", "sal", "status"] {
@@ -8212,6 +8310,840 @@ PIVOT (
                 .iter()
                 .all(|column| !column.eq_ignore_ascii_case(unexpected)),
             "PIVOT FILTER output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_removes_aggregate_input_column_named_filter() {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, "filter" FROM oqt_t_emp)
+PIVOT (
+  SUM("filter") AS total_filter
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    assert_has_case_insensitive(&suggestions, "deptno");
+    assert_has_case_insensitive(&suggestions, "clerk_total_filter");
+    for unexpected in ["job", r#""filter""#] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT aggregate input named FILTER should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_filter_where_removes_condition_column_named_filter(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, sal, "filter" FROM oqt_t_emp)
+PIVOT (
+  SUM(sal) FILTER (WHERE "filter" = 'Y') AS active_sal
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    assert_has_case_insensitive(&suggestions, "deptno");
+    assert_has_case_insensitive(&suggestions, "clerk_active_sal");
+    for unexpected in ["job", "sal", r#""filter""#] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT FILTER condition named FILTER should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_listagg_overflow_keeps_grouping_columns_named_like_syntax(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, name_col, overflow, truncate, with, count FROM oqt_t_emp)
+PIVOT (
+  LISTAGG(name_col, ',' ON OVERFLOW TRUNCATE '...' WITH COUNT) AS names
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in [
+        "deptno",
+        "overflow",
+        "truncate",
+        "with",
+        "count",
+        "clerk_names",
+    ] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "name_col"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT LISTAGG overflow output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_listagg_within_group_removes_order_column() {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, name_col, sort_col, within, group_col FROM oqt_t_emp)
+PIVOT (
+  LISTAGG(name_col, ',') WITHIN GROUP (ORDER BY sort_col DESC NULLS LAST) AS names
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "within", "group_col", "clerk_names"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "name_col", "sort_col"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT LISTAGG WITHIN GROUP output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_percentile_cont_within_group_removes_order_column(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, sal, within, group_col FROM oqt_t_emp)
+PIVOT (
+  PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY sal) AS median_sal
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "within", "group_col", "clerk_median_sal"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "sal"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT PERCENTILE_CONT WITHIN GROUP output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_hypothetical_rank_within_group_removes_input_columns(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, target_sal, sal, within, group_col FROM oqt_t_emp)
+PIVOT (
+  RANK(target_sal) WITHIN GROUP (ORDER BY sal) AS sal_rank
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "within", "group_col", "clerk_sal_rank"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "target_sal", "sal"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT hypothetical RANK WITHIN GROUP output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_window_exclude_ties_keeps_grouping_columns_named_like_syntax(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, sal, "exclude", "ties" FROM oqt_t_emp)
+PIVOT (
+  MAX(SUM(sal) OVER (ORDER BY sal ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE TIES)) AS running_sal
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", r#""exclude""#, r#""ties""#, "clerk_running_sal"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "sal"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT window EXCLUDE TIES output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_removes_aggregate_input_column_named_over() {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, "over" FROM oqt_t_emp)
+PIVOT (
+  SUM("over") AS total_over
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    assert_has_case_insensitive(&suggestions, "deptno");
+    assert_has_case_insensitive(&suggestions, "clerk_total_over");
+    for unexpected in ["job", r#""over""#] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT aggregate input named OVER should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_window_groups_exclude_no_others_keeps_grouping_columns_named_like_syntax(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, sal, "groups", "no", "others" FROM oqt_t_emp)
+PIVOT (
+  MAX(SUM(sal) OVER (ORDER BY sal GROUPS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE NO OTHERS)) AS running_sal
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in [
+        "deptno",
+        r#""groups""#,
+        r#""no""#,
+        r#""others""#,
+        "clerk_running_sal",
+    ] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "sal"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT window GROUPS EXCLUDE NO OTHERS output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_analytic_ignore_nulls_keeps_grouping_column_named_ignore(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, sal, hiredate, "ignore" FROM oqt_t_emp)
+PIVOT (
+  MAX(FIRST_VALUE(sal) IGNORE NULLS OVER (ORDER BY hiredate)) AS first_sal
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", r#""ignore""#, "clerk_first_sal"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "sal", "hiredate"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT analytic IGNORE NULLS output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_analytic_respect_nulls_keeps_grouping_column_named_respect(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, sal, hiredate, "respect" FROM oqt_t_emp)
+PIVOT (
+  MAX(LAST_VALUE(sal) RESPECT NULLS OVER (ORDER BY hiredate)) AS last_sal
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", r#""respect""#, "clerk_last_sal"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "sal", "hiredate"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT analytic RESPECT NULLS output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_nth_value_from_last_keeps_grouping_column_named_from(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, sal, hiredate, "from" FROM oqt_t_emp)
+PIVOT (
+  MAX(NTH_VALUE(sal, 1) FROM LAST IGNORE NULLS OVER (ORDER BY hiredate)) AS last_sal
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", r#""from""#, "clerk_last_sal"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "sal", "hiredate"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT NTH_VALUE FROM LAST output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_nth_value_nested_arg_from_last_keeps_grouping_column_named_from(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, sal, hiredate, "from" FROM oqt_t_emp)
+PIVOT (
+  MAX(NTH_VALUE(NVL(sal, 0), 1) FROM LAST IGNORE NULLS OVER (ORDER BY hiredate)) AS last_sal
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", r#""from""#, "clerk_last_sal"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "sal", "hiredate"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT NTH_VALUE nested arg FROM LAST output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_nth_value_from_first_keeps_grouping_column_named_from(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, sal, hiredate, "from" FROM oqt_t_emp)
+PIVOT (
+  MAX(NTH_VALUE(sal, 1) FROM FIRST RESPECT NULLS OVER (ORDER BY hiredate)) AS first_sal
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", r#""from""#, "clerk_first_sal"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "sal", "hiredate"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT NTH_VALUE FROM FIRST output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_removes_aggregate_input_column_named_ignore() {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, "ignore" FROM oqt_t_emp)
+PIVOT (
+  SUM("ignore") AS total_ignore
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    assert_has_case_insensitive(&suggestions, "deptno");
+    assert_has_case_insensitive(&suggestions, "clerk_total_ignore");
+    for unexpected in ["job", r#""ignore""#] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT aggregate input named IGNORE should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_removes_aggregate_input_column_named_respect() {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, "respect" FROM oqt_t_emp)
+PIVOT (
+  SUM("respect") AS total_respect
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    assert_has_case_insensitive(&suggestions, "deptno");
+    assert_has_case_insensitive(&suggestions, "clerk_total_respect");
+    for unexpected in ["job", r#""respect""#] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT aggregate input named RESPECT should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_removes_aggregate_input_column_named_from() {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, "from" FROM oqt_t_emp)
+PIVOT (
+  SUM("from") AS total_from
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    assert_has_case_insensitive(&suggestions, "deptno");
+    assert_has_case_insensitive(&suggestions, "clerk_total_from");
+    for unexpected in ["job", r#""from""#] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT aggregate input named FROM should not expose input column `{unexpected}`: {:?}",
             suggestions
         );
     }
@@ -8261,6 +9193,446 @@ PIVOT (
                 .iter()
                 .all(|column| !column.eq_ignore_ascii_case(unexpected)),
             "PIVOT CAST output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_cast_length_semantics_keeps_grouping_columns_named_like_syntax(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, name_col, "char", "byte" FROM oqt_t_emp)
+PIVOT (
+  COUNT(CAST(name_col AS VARCHAR2(10 CHAR))) AS name_text
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", r#""char""#, r#""byte""#, "clerk_name_text"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "name_col"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT CAST length semantics output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_cast_byte_semantics_keeps_grouping_column_named_byte(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, name_col, "byte" FROM oqt_t_emp)
+PIVOT (
+  COUNT(CAST(name_col AS VARCHAR2(10 BYTE))) AS name_text
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", r#""byte""#, "clerk_name_text"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "name_col"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT CAST BYTE semantics output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_cast_character_set_keeps_grouping_columns_named_like_syntax(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, name_col, "set", utf8mb4 FROM oqt_t_emp)
+PIVOT (
+  COUNT(CAST(name_col AS CHAR CHARACTER SET utf8mb4)) AS name_text
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", r#""set""#, "utf8mb4", "clerk_name_text"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "name_col"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT CAST CHARACTER SET output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_cast_character_varying_keeps_grouping_column_named_varying(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, name_col, "varying" FROM oqt_t_emp)
+PIVOT (
+  COUNT(CAST(name_col AS CHARACTER VARYING(30))) AS name_text
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", r#""varying""#, "clerk_name_text"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "name_col"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT CAST CHARACTER VARYING output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_cast_national_character_keeps_grouping_column_named_national(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, name_col, "national" FROM oqt_t_emp)
+PIVOT (
+  COUNT(CAST(name_col AS NATIONAL CHARACTER VARYING(30))) AS name_text
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", r#""national""#, "clerk_name_text"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "name_col"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT CAST NATIONAL CHARACTER output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_cast_unsigned_keeps_grouping_column_named_unsigned(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, sal, "unsigned" FROM oqt_t_emp)
+PIVOT (
+  SUM(CAST(sal AS UNSIGNED INTEGER)) AS total_sal
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", r#""unsigned""#, "clerk_total_sal"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "sal"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT CAST UNSIGNED output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_cast_urowid_keeps_grouping_column_named_urowid()
+{
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, rowid_col, "urowid" FROM oqt_t_emp)
+PIVOT (
+  COUNT(CAST(rowid_col AS UROWID)) AS rowid_count
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", r#""urowid""#, "clerk_rowid_count"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "rowid_col"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT CAST UROWID output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_cast_rowid_keeps_grouping_column_named_rowid() {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, rowid_col, "rowid" FROM oqt_t_emp)
+PIVOT (
+  COUNT(CAST(rowid_col AS ROWID)) AS rowid_count
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", r#""rowid""#, "clerk_rowid_count"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "rowid_col"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT CAST ROWID output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_cast_timestamp_without_time_zone_keeps_grouping_column_named_without(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, ts_col, "without" FROM oqt_t_emp)
+PIVOT (
+  COUNT(CAST(ts_col AS TIMESTAMP WITHOUT TIME ZONE)) AS ts_count
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", r#""without""#, "clerk_ts_count"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "ts_col"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT CAST TIMESTAMP WITHOUT TIME ZONE output should not expose input column `{unexpected}`: {:?}",
             suggestions
         );
     }
@@ -8365,6 +9737,261 @@ PIVOT (
 }
 
 #[test]
+fn pivot_clause_alias_qualified_column_suggestions_treat_qualified_type_keeps_grouping_columns_named_like_type_path(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, obj_col, app_schema, employee_t FROM oqt_t_emp)
+PIVOT (
+  COUNT(TREAT(obj_col AS app_schema.employee_t)) AS typed_obj
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "app_schema", "employee_t", "clerk_typed_obj"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "obj_col"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT TREAT qualified type output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_treat_quoted_qualified_type_keeps_grouping_columns_named_like_type_path(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, obj_col, "App Schema", "Employee Type" FROM oqt_t_emp)
+PIVOT (
+  COUNT(TREAT(obj_col AS "App Schema"."Employee Type")) AS typed_obj
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in [
+        "deptno",
+        r#""App Schema""#,
+        r#""Employee Type""#,
+        "clerk_typed_obj",
+    ] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "obj_col"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT TREAT quoted qualified type output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_cast_user_type_keeps_grouping_column_named_like_type(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, obj_col, employee_t FROM oqt_t_emp)
+PIVOT (
+  COUNT(CAST(obj_col AS employee_t)) AS typed_obj
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    assert_has_case_insensitive(&suggestions, "deptno");
+    assert_has_case_insensitive(&suggestions, "employee_t");
+    assert_has_case_insensitive(&suggestions, "clerk_typed_obj");
+    for unexpected in ["job", "obj_col"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT CAST user type output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_cast_qualified_user_type_keeps_grouping_columns_named_like_type_path(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, obj_col, app_schema, employee_t FROM oqt_t_emp)
+PIVOT (
+  COUNT(CAST(obj_col AS app_schema.employee_t)) AS typed_obj
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "app_schema", "employee_t", "clerk_typed_obj"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "obj_col"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT CAST qualified user type output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_cast_quoted_qualified_user_type_keeps_grouping_columns_named_like_type_path(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, obj_col, "App Schema", "Employee Type" FROM oqt_t_emp)
+PIVOT (
+  COUNT(CAST(obj_col AS "App Schema"."Employee Type")) AS typed_obj
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in [
+        "deptno",
+        r#""App Schema""#,
+        r#""Employee Type""#,
+        "clerk_typed_obj",
+    ] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "obj_col"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT CAST quoted qualified user type output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
 fn pivot_clause_alias_qualified_column_suggestions_xmlquery_syntax_keeps_grouping_columns_named_like_syntax(
 ) {
     let sql_with_cursor = r#"
@@ -8408,6 +10035,768 @@ PIVOT (
                 .iter()
                 .all(|column| !column.eq_ignore_ascii_case(unexpected)),
             "PIVOT XMLQUERY output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_xmlserialize_syntax_keeps_grouping_columns_named_like_syntax(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, payload_xml, content, clob, indent, size FROM oqt_t_emp)
+PIVOT (
+  COUNT(XMLSERIALIZE(CONTENT payload_xml AS CLOB INDENT SIZE = 2)) AS xml_doc
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in [
+        "deptno",
+        "content",
+        "clob",
+        "indent",
+        "size",
+        "clerk_xml_doc",
+    ] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "payload_xml"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT XMLSERIALIZE output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_xmlserialize_removes_input_column_named_content(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, content FROM oqt_t_emp)
+PIVOT (
+  COUNT(XMLSERIALIZE(CONTENT content AS CLOB)) AS xml_doc
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "clerk_xml_doc"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "content"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT XMLSERIALIZE input output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_xmlelement_name_keeps_grouping_columns_named_like_syntax(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, payload_xml, name, employee FROM oqt_t_emp)
+PIVOT (
+  COUNT(XMLELEMENT(NAME employee, payload_xml)) AS xml_elem
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "name", "employee", "clerk_xml_elem"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "payload_xml"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT XMLELEMENT NAME output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_xmlelement_evalname_removes_name_expression_column(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, employee, payload_xml, evalname FROM oqt_t_emp)
+PIVOT (
+  COUNT(XMLELEMENT(EVALNAME employee, payload_xml)) AS xml_elem
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "evalname", "clerk_xml_elem"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "employee", "payload_xml"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT XMLELEMENT EVALNAME output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_xmlelement_escaping_name_keeps_grouping_columns_named_like_syntax(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, payload_xml, entityescaping, name, employee FROM oqt_t_emp)
+PIVOT (
+  COUNT(XMLELEMENT(ENTITYESCAPING NAME employee, payload_xml)) AS xml_elem
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in [
+        "deptno",
+        "entityescaping",
+        "name",
+        "employee",
+        "clerk_xml_elem",
+    ] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "payload_xml"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT XMLELEMENT escaping NAME output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_xmlforest_alias_keeps_grouping_column_named_like_alias(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, payload_xml, payload_doc FROM oqt_t_emp)
+PIVOT (
+  COUNT(XMLFOREST(payload_xml AS payload_doc)) AS xml_forest
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "payload_doc", "clerk_xml_forest"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "payload_xml"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT XMLFOREST output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_xmlforest_escaping_alias_keeps_grouping_columns_named_like_syntax(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, payload_xml, nonentityescaping, payload_doc FROM oqt_t_emp)
+PIVOT (
+  COUNT(XMLFOREST(NONENTITYESCAPING payload_xml AS payload_doc)) AS xml_forest
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in [
+        "deptno",
+        "nonentityescaping",
+        "payload_doc",
+        "clerk_xml_forest",
+    ] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "payload_xml"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT XMLFOREST escaping output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_xmlforest_removes_input_column_named_entityescaping(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, entityescaping, attr_name FROM oqt_t_emp)
+PIVOT (
+  COUNT(XMLFOREST(entityescaping AS attr_name)) AS xml_forest
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "attr_name", "clerk_xml_forest"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "entityescaping"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT XMLFOREST input output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_xmlpi_name_keeps_grouping_columns_named_like_syntax(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, payload_xml, name, employee FROM oqt_t_emp)
+PIVOT (
+  COUNT(XMLPI(NAME employee, payload_xml)) AS xml_pi
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "name", "employee", "clerk_xml_pi"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "payload_xml"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT XMLPI NAME output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_xmlpi_removes_value_expression_column() {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, employee, payload_xml FROM oqt_t_emp)
+PIVOT (
+  COUNT(XMLPI(NAME employee, payload_xml)) AS xml_pi
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "employee", "clerk_xml_pi"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "payload_xml"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT XMLPI value output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_xmlroot_options_keep_grouping_columns_named_like_syntax(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, payload_xml, version, standalone, yes FROM oqt_t_emp)
+PIVOT (
+  COUNT(XMLROOT(payload_xml, VERSION '1.0', STANDALONE YES)) AS rooted_xml
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in [
+        "deptno",
+        "version",
+        "standalone",
+        "yes",
+        "clerk_rooted_xml",
+    ] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "payload_xml"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT XMLROOT options output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_xmlroot_removes_version_expression_column() {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, payload_xml, version FROM oqt_t_emp)
+PIVOT (
+  COUNT(XMLROOT(payload_xml, VERSION version)) AS rooted_xml
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "clerk_rooted_xml"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "payload_xml", "version"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT XMLROOT value output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_xmlparse_syntax_keeps_grouping_columns_named_like_syntax(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, payload_xml, content, wellformed FROM oqt_t_emp)
+PIVOT (
+  COUNT(XMLPARSE(CONTENT payload_xml WELLFORMED)) AS parsed_xml
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "content", "wellformed", "clerk_parsed_xml"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "payload_xml"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT XMLPARSE output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_xmlparse_removes_input_column_named_content() {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, content FROM oqt_t_emp)
+PIVOT (
+  COUNT(XMLPARSE(CONTENT content)) AS parsed_xml
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "clerk_parsed_xml"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "content"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT XMLPARSE input output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_xmlexists_syntax_keeps_grouping_columns_named_like_syntax(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, payload_xml, passing, by, value, sal FROM oqt_t_emp)
+PIVOT (
+  SUM(CASE WHEN XMLEXISTS('/root' PASSING BY VALUE payload_xml) THEN sal ELSE 0 END) AS xml_exists_sal
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in [
+        "deptno",
+        "passing",
+        "by",
+        "value",
+        "clerk_xml_exists_sal",
+    ] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "payload_xml", "sal"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT XMLEXISTS output should not expose input column `{unexpected}`: {:?}",
             suggestions
         );
     }
@@ -8561,6 +10950,208 @@ PIVOT (
 }
 
 #[test]
+fn pivot_clause_alias_qualified_column_suggestions_substring_from_for_keeps_grouping_columns_named_like_syntax(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, name_col, start_pos, len_col, "from", "for" FROM oqt_t_emp)
+PIVOT (
+  MAX(SUBSTRING(name_col FROM start_pos FOR len_col)) AS part_name
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", r#""from""#, r#""for""#, "clerk_part_name"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "name_col", "start_pos", "len_col"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT SUBSTRING FROM/FOR output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_overlay_syntax_keeps_grouping_columns_named_like_syntax(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, name_col, repl_col, start_pos, len_col, placing, "from", "for" FROM oqt_t_emp)
+PIVOT (
+  MAX(OVERLAY(name_col PLACING repl_col FROM start_pos FOR len_col)) AS masked_name
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in [
+        "deptno",
+        "placing",
+        r#""from""#,
+        r#""for""#,
+        "clerk_masked_name",
+    ] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "name_col", "repl_col", "start_pos", "len_col"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT OVERLAY output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_position_from_keeps_grouping_column_named_from()
+{
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, name_col, "from", sal FROM oqt_t_emp)
+PIVOT (
+  SUM(CASE WHEN POSITION('A' FROM name_col) > 0 THEN sal ELSE 0 END) AS matched_sal
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", r#""from""#, "clerk_matched_sal"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "name_col", "sal"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT POSITION FROM output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_interval_year_to_month_keeps_grouping_column_named_to(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, sal, hiredate, to FROM oqt_t_emp)
+PIVOT (
+  SUM(CASE WHEN hiredate >= hiredate - INTERVAL '1-2' YEAR TO MONTH THEN sal ELSE 0 END) AS recent_sal
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    assert_has_case_insensitive(&suggestions, "deptno");
+    assert_has_case_insensitive(&suggestions, "to");
+    assert_has_case_insensitive(&suggestions, "clerk_recent_sal");
+    for unexpected in ["job", "sal", "hiredate"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT interval literal output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
 fn pivot_clause_alias_qualified_column_suggestions_at_time_zone_keeps_grouping_columns_named_like_syntax(
 ) {
     let sql_with_cursor = r#"
@@ -8708,6 +11299,55 @@ PIVOT (
 }
 
 #[test]
+fn pivot_clause_alias_qualified_column_suggestions_validate_conversion_keeps_grouping_column_named_number(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, amount_txt, sal, number FROM oqt_t_emp)
+PIVOT (
+  SUM(CASE WHEN VALIDATE_CONVERSION(amount_txt AS NUMBER) = 1 THEN sal ELSE 0 END) AS valid_sal
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "number", "clerk_valid_sal"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "amount_txt", "sal"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT VALIDATE_CONVERSION output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
 fn pivot_clause_alias_qualified_column_suggestions_json_query_options_keep_grouping_columns_named_like_syntax(
 ) {
     let sql_with_cursor = r#"
@@ -8759,6 +11399,259 @@ PIVOT (
                 .iter()
                 .all(|column| !column.eq_ignore_ascii_case(unexpected)),
             "PIVOT JSON_QUERY output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_json_object_options_keep_grouping_columns_named_like_syntax(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, key_col, val_col, key, value, absent, with, keys, strict FROM oqt_t_emp)
+PIVOT (
+  COUNT(JSON_OBJECT(KEY key_col VALUE val_col ABSENT ON NULL WITH UNIQUE KEYS STRICT RETURNING CLOB)) AS json_doc
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in [
+        "deptno",
+        "key",
+        "value",
+        "absent",
+        "with",
+        "keys",
+        "strict",
+        "clerk_json_doc",
+    ] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "key_col", "val_col"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT JSON_OBJECT output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_json_object_removes_input_column_named_key() {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, key, val_col FROM oqt_t_emp)
+PIVOT (
+  COUNT(JSON_OBJECT(key VALUE val_col)) AS json_doc
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "clerk_json_doc"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "key", "val_col"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT JSON_OBJECT input output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_json_transform_options_keep_grouping_columns_named_like_syntax(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, payload, status_col, set, returning, clob FROM oqt_t_emp)
+PIVOT (
+  COUNT(JSON_TRANSFORM(payload, SET '$.status' = status_col RETURNING CLOB)) AS payload_doc
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "set", "returning", "clob", "clerk_payload_doc"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "payload", "status_col"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT JSON_TRANSFORM output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_json_transform_operation_options_keep_grouping_columns_named_like_syntax(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, payload, remove, ignore, missing FROM oqt_t_emp)
+PIVOT (
+  COUNT(JSON_TRANSFORM(payload, REMOVE '$.old' IGNORE ON MISSING)) AS payload_doc
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "remove", "ignore", "missing", "clerk_payload_doc"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "payload"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT JSON_TRANSFORM operation options output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_json_transform_create_on_missing_keeps_grouping_columns_named_like_syntax(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, payload, status_col, set, create, missing FROM oqt_t_emp)
+PIVOT (
+  COUNT(JSON_TRANSFORM(payload, SET '$.status' = status_col CREATE ON MISSING)) AS payload_doc
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "set", "create", "missing", "clerk_payload_doc"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "payload", "status_col"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT JSON_TRANSFORM CREATE ON MISSING output should not expose input column `{unexpected}`: {:?}",
             suggestions
         );
     }
@@ -8866,6 +11759,833 @@ PIVOT (
 }
 
 #[test]
+fn pivot_clause_alias_qualified_column_suggestions_is_json_options_keep_grouping_columns_named_like_syntax(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, payload, object, with, keys, sal FROM oqt_t_emp)
+PIVOT (
+  SUM(CASE WHEN payload IS JSON OBJECT WITH UNIQUE KEYS THEN sal ELSE 0 END) AS json_object_sal
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "object", "with", "keys", "clerk_json_object_sal"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "payload", "sal"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT IS JSON options output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_is_of_type_keeps_grouping_columns_named_like_syntax(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, obj_col, sal, of, type, employee_t FROM oqt_t_emp)
+PIVOT (
+  SUM(CASE WHEN obj_col IS OF TYPE (employee_t) THEN sal ELSE 0 END) AS typed_sal
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "of", "type", "employee_t", "clerk_typed_sal"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "obj_col", "sal"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT IS OF TYPE output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_member_of_keeps_grouping_columns_named_like_syntax(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, elem_col, nested_col, member, of, sal FROM oqt_t_emp)
+PIVOT (
+  SUM(CASE WHEN elem_col MEMBER OF nested_col THEN sal ELSE 0 END) AS member_sal
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "member", "of", "clerk_member_sal"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "elem_col", "nested_col", "sal"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT MEMBER OF output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_submultiset_of_keeps_grouping_columns_named_like_syntax(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, child_nt, parent_nt, submultiset, of, sal FROM oqt_t_emp)
+PIVOT (
+  SUM(CASE WHEN child_nt SUBMULTISET OF parent_nt THEN sal ELSE 0 END) AS subset_sal
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "submultiset", "of", "clerk_subset_sal"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "child_nt", "parent_nt", "sal"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT SUBMULTISET OF output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_multiset_except_keeps_grouping_columns_named_like_syntax(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, child_nt, parent_nt, multiset, except, sal FROM oqt_t_emp)
+PIVOT (
+  SUM(CASE WHEN child_nt MULTISET EXCEPT DISTINCT parent_nt IS EMPTY THEN sal ELSE 0 END) AS diff_sal
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "multiset", "except", "clerk_diff_sal"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "child_nt", "parent_nt", "sal"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT MULTISET EXCEPT output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_is_empty_keeps_grouping_column_named_empty() {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, nested_col, empty, sal FROM oqt_t_emp)
+PIVOT (
+  SUM(CASE WHEN nested_col IS EMPTY THEN sal ELSE 0 END) AS empty_sal
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "empty", "clerk_empty_sal"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "nested_col", "sal"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT IS EMPTY output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_is_a_set_keeps_grouping_column_named_set() {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, nested_col, set, sal FROM oqt_t_emp)
+PIVOT (
+  SUM(CASE WHEN nested_col IS A SET THEN sal ELSE 0 END) AS set_sal
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "set", "clerk_set_sal"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "nested_col", "sal"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT IS A SET output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_like_escape_keeps_grouping_column_named_escape()
+{
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, name_col, pattern_col, escape_char, escape, sal FROM oqt_t_emp)
+PIVOT (
+  SUM(CASE WHEN name_col LIKE pattern_col ESCAPE escape_char THEN sal ELSE 0 END) AS like_sal
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "escape", "clerk_like_sal"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "name_col", "pattern_col", "escape_char", "sal"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT LIKE ESCAPE output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_likec_escape_keeps_grouping_columns_named_like_syntax(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, name_col, pattern_col, escape_char, likec, escape, sal FROM oqt_t_emp)
+PIVOT (
+  SUM(CASE WHEN name_col LIKEC pattern_col ESCAPE escape_char THEN sal ELSE 0 END) AS likec_sal
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "likec", "escape", "clerk_likec_sal"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "name_col", "pattern_col", "escape_char", "sal"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT LIKEC ESCAPE output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_sounds_like_keeps_grouping_column_named_sounds()
+{
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, name_col, pattern_col, sounds, sal FROM oqt_t_emp)
+PIVOT (
+  SUM(CASE WHEN name_col SOUNDS LIKE pattern_col THEN sal ELSE 0 END) AS sounds_sal
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "sounds", "clerk_sounds_sal"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "name_col", "pattern_col", "sal"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT SOUNDS LIKE output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_like_removes_input_column_named_sounds() {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, sounds, pattern_col, sal FROM oqt_t_emp)
+PIVOT (
+  SUM(CASE WHEN sounds LIKE pattern_col THEN sal ELSE 0 END) AS like_sal
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "clerk_like_sal"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "sounds", "pattern_col", "sal"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT LIKE output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_is_not_distinct_from_keeps_grouping_column_named_from(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, old_val, new_val, sal, "from" FROM oqt_t_emp)
+PIVOT (
+  SUM(CASE WHEN old_val IS NOT DISTINCT FROM new_val THEN sal ELSE 0 END) AS same_sal
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", r#""from""#, "clerk_same_sal"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "old_val", "new_val", "sal"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT IS NOT DISTINCT FROM output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_is_nan_keeps_grouping_column_named_nan() {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, ratio_col, nan, sal FROM oqt_t_emp)
+PIVOT (
+  SUM(CASE WHEN ratio_col IS NAN THEN sal ELSE 0 END) AS nan_sal
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "nan", "clerk_nan_sal"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "ratio_col", "sal"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT IS NAN output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_is_infinite_keeps_grouping_column_named_infinite(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, ratio_col, infinite, sal FROM oqt_t_emp)
+PIVOT (
+  SUM(CASE WHEN ratio_col IS INFINITE THEN sal ELSE 0 END) AS infinite_sal
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "infinite", "clerk_infinite_sal"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "ratio_col", "sal"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT IS INFINITE output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_is_true_keeps_grouping_column_named_true() {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, flag_col, true, sal FROM oqt_t_emp)
+PIVOT (
+  SUM(CASE WHEN flag_col IS TRUE THEN sal ELSE 0 END) AS true_sal
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "true", "clerk_true_sal"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "flag_col", "sal"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT IS TRUE output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_is_unknown_keeps_grouping_column_named_unknown(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, flag_col, unknown, sal FROM oqt_t_emp)
+PIVOT (
+  SUM(CASE WHEN flag_col IS UNKNOWN THEN sal ELSE 0 END) AS unknown_sal
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "unknown", "clerk_unknown_sal"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "flag_col", "sal"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT IS UNKNOWN output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_overlaps_keeps_grouping_column_named_overlaps() {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, start_a, end_a, start_b, end_b, overlaps, sal FROM oqt_t_emp)
+PIVOT (
+  SUM(CASE WHEN (start_a, end_a) OVERLAPS (start_b, end_b) THEN sal ELSE 0 END) AS overlap_sal
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "overlaps", "clerk_overlap_sal"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "start_a", "end_a", "start_b", "end_b", "sal"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT OVERLAPS output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
 fn pivot_clause_alias_qualified_column_suggestions_json_returning_keeps_grouping_columns_named_like_syntax(
 ) {
     let sql_with_cursor = r#"
@@ -8912,6 +12632,55 @@ PIVOT (
                 .iter()
                 .all(|column| !column.eq_ignore_ascii_case(unexpected)),
             "PIVOT JSON_VALUE output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_json_default_expression_removes_fallback_column(
+) {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, payload, fallback_amt, default, error, empty FROM oqt_t_emp)
+PIVOT (
+  SUM(JSON_VALUE(payload, '$.amount' RETURNING NUMBER DEFAULT fallback_amt ON ERROR NULL ON EMPTY)) AS json_amount
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", "default", "error", "empty", "clerk_json_amount"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "payload", "fallback_amt"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT JSON_VALUE DEFAULT output should not expose input column `{unexpected}`: {:?}",
             suggestions
         );
     }
