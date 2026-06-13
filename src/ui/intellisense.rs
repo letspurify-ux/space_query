@@ -2,6 +2,7 @@ use crate::sql_text;
 use crate::ui::theme;
 use fltk::{browser::HoldBrowser, frame::Frame, prelude::*, window::Window};
 use std::any::Any;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
@@ -643,8 +644,13 @@ impl NameEntry {
     }
 
     fn lookup_upper(name: &str) -> String {
-        if sql_text::is_quoted_identifier(name.trim()) {
-            sql_text::strip_identifier_quotes(name.trim()).to_uppercase()
+        let trimmed = name.trim();
+        if sql_text::is_quoted_identifier(trimmed) {
+            sql_text::strip_identifier_quotes(trimmed).to_uppercase()
+        } else if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() >= 2 {
+            trimmed[1..trimmed.len().saturating_sub(1)]
+                .replace("]]", "]")
+                .to_uppercase()
         } else {
             name.to_uppercase()
         }
@@ -852,7 +858,7 @@ impl IntellisenseData {
     ) -> Vec<String> {
         self.ensure_base_indices();
 
-        let prefix_upper = prefix.to_uppercase();
+        let prefix_upper = Self::entry_lookup_prefix_upper(prefix);
         let mut suggestions = Vec::new();
         let mut seen = HashSet::new();
         let relation_only = prefer_relations && prefix_upper.is_empty();
@@ -861,6 +867,7 @@ impl IntellisenseData {
         if prefer_columns && include_columns {
             self.append_column_suggestions(
                 &prefix_upper,
+                prefix,
                 column_tables,
                 false,
                 &mut suggestions,
@@ -874,41 +881,46 @@ impl IntellisenseData {
 
         // In table context, prioritize real relation names first.
         if prefer_relations {
-            if Self::push_entries(
+            if Self::push_matching_entries(
                 &self.table_entries,
                 &prefix_upper,
+                prefix,
                 &mut suggestions,
                 &mut seen,
             ) {
                 return suggestions;
             }
-            if Self::push_entries(
+            if Self::push_matching_entries(
                 &self.view_entries,
                 &prefix_upper,
+                prefix,
                 &mut suggestions,
                 &mut seen,
             ) {
                 return suggestions;
             }
-            if Self::push_entries(
+            if Self::push_matching_entries(
                 &self.materialized_view_entries,
                 &prefix_upper,
+                prefix,
                 &mut suggestions,
                 &mut seen,
             ) {
                 return suggestions;
             }
-            if Self::push_entries(
+            if Self::push_matching_entries(
                 &self.synonym_entries,
                 &prefix_upper,
+                prefix,
                 &mut suggestions,
                 &mut seen,
             ) {
                 return suggestions;
             }
-            if Self::push_entries(
+            if Self::push_matching_entries(
                 &self.public_synonym_entries,
                 &prefix_upper,
+                prefix,
                 &mut suggestions,
                 &mut seen,
             ) {
@@ -933,6 +945,9 @@ impl IntellisenseData {
                     if !keyword.starts_with(prefix_upper.as_str()) {
                         break;
                     }
+                    if !suggestion_matches_completion_prefix(keyword, prefix) {
+                        continue;
+                    }
                     if seen.insert((*keyword).to_string()) {
                         suggestions.push((*keyword).to_string());
                     }
@@ -949,6 +964,9 @@ impl IntellisenseData {
                         break;
                     }
                     let rendered = format!("{func}{FUNCTION_SUFFIX}");
+                    if !suggestion_matches_completion_prefix(&rendered, prefix) {
+                        continue;
+                    }
                     if seen.insert(rendered.to_uppercase()) {
                         suggestions.push(rendered);
                     }
@@ -961,45 +979,50 @@ impl IntellisenseData {
 
         // Add tables/views in non-table context after language items.
         if !prefer_relations {
-            if Self::push_entries(
+            if Self::push_matching_entries(
                 &self.table_entries,
                 &prefix_upper,
+                prefix,
                 &mut suggestions,
                 &mut seen,
             ) {
                 return suggestions;
             }
 
-            if Self::push_entries(
+            if Self::push_matching_entries(
                 &self.view_entries,
                 &prefix_upper,
+                prefix,
                 &mut suggestions,
                 &mut seen,
             ) {
                 return suggestions;
             }
 
-            if Self::push_entries(
+            if Self::push_matching_entries(
                 &self.materialized_view_entries,
                 &prefix_upper,
+                prefix,
                 &mut suggestions,
                 &mut seen,
             ) {
                 return suggestions;
             }
 
-            if Self::push_entries(
+            if Self::push_matching_entries(
                 &self.synonym_entries,
                 &prefix_upper,
+                prefix,
                 &mut suggestions,
                 &mut seen,
             ) {
                 return suggestions;
             }
 
-            if Self::push_entries(
+            if Self::push_matching_entries(
                 &self.public_synonym_entries,
                 &prefix_upper,
+                prefix,
                 &mut suggestions,
                 &mut seen,
             ) {
@@ -1008,9 +1031,10 @@ impl IntellisenseData {
         }
 
         // Add procedures
-        if Self::push_entries(
+        if Self::push_matching_entries(
             &self.procedure_entries,
             &prefix_upper,
+            prefix,
             &mut suggestions,
             &mut seen,
         ) {
@@ -1018,9 +1042,10 @@ impl IntellisenseData {
         }
 
         // Add packages
-        if Self::push_entries(
+        if Self::push_matching_entries(
             &self.package_entries,
             &prefix_upper,
+            prefix,
             &mut suggestions,
             &mut seen,
         ) {
@@ -1028,63 +1053,70 @@ impl IntellisenseData {
         }
 
         // Add functions
-        if Self::push_entries(
+        if Self::push_matching_entries(
             &self.function_entries,
             &prefix_upper,
+            prefix,
             &mut suggestions,
             &mut seen,
         ) {
             return suggestions;
         }
 
-        if Self::push_entries(
+        if Self::push_matching_entries(
             &self.sequence_entries,
             &prefix_upper,
+            prefix,
             &mut suggestions,
             &mut seen,
         ) {
             return suggestions;
         }
 
-        if Self::push_entries(
+        if Self::push_matching_entries(
             &self.type_entries,
             &prefix_upper,
+            prefix,
             &mut suggestions,
             &mut seen,
         ) {
             return suggestions;
         }
 
-        if Self::push_entries(
+        if Self::push_matching_entries(
             &self.trigger_entries,
             &prefix_upper,
+            prefix,
             &mut suggestions,
             &mut seen,
         ) {
             return suggestions;
         }
 
-        if Self::push_entries(
+        if Self::push_matching_entries(
             &self.event_entries,
             &prefix_upper,
+            prefix,
             &mut suggestions,
             &mut seen,
         ) {
             return suggestions;
         }
 
-        if Self::push_entries(
+        if Self::push_matching_entries(
             &self.index_entries,
             &prefix_upper,
+            prefix,
             &mut suggestions,
             &mut seen,
         ) {
             return suggestions;
         }
 
-        let _ = Self::push_entries(
+        let _ = Self::push_matching_entries(
             &self.user_entries,
             &prefix_upper,
+            prefix,
             &mut suggestions,
             &mut seen,
         );
@@ -1092,6 +1124,7 @@ impl IntellisenseData {
         if include_columns && !prefer_columns {
             self.append_column_suggestions(
                 &prefix_upper,
+                prefix,
                 column_tables,
                 false,
                 &mut suggestions,
@@ -1264,6 +1297,7 @@ impl IntellisenseData {
 
         self.append_column_suggestions(
             &prefix_upper,
+            prefix,
             column_tables,
             true,
             &mut suggestions,
@@ -1338,14 +1372,19 @@ impl IntellisenseData {
     ) -> Vec<String> {
         self.ensure_base_indices();
 
-        let prefix_upper = prefix.to_uppercase();
+        let prefix_upper = Self::entry_lookup_prefix_upper(prefix);
         let mut suggestions = Vec::new();
         let mut seen = HashSet::new();
 
         if let Some(entries) = self.member_entries_for_qualifier(qualifier, relation_only) {
-            let _ = Self::push_entries(entries, &prefix_upper, &mut suggestions, &mut seen);
+            let _ = Self::push_matching_entries(
+                entries,
+                &prefix_upper,
+                prefix,
+                &mut suggestions,
+                &mut seen,
+            );
         }
-
         suggestions.truncate(MAX_SUGGESTIONS);
         suggestions
     }
@@ -1547,6 +1586,13 @@ impl IntellisenseData {
             }
             return Some(segment.to_string());
         }
+        if let Some(unquoted) = Self::strip_bracket_identifier(trimmed) {
+            let segment = unquoted.trim();
+            if segment.is_empty() || segment.contains('.') {
+                return None;
+            }
+            return Some(segment.to_string());
+        }
 
         if trimmed.contains('.') {
             None
@@ -1579,6 +1625,10 @@ impl IntellisenseData {
                     active_quote = Some(ch);
                     current.push(ch);
                 }
+                '[' => {
+                    active_quote = Some(']');
+                    current.push(ch);
+                }
                 '.' => {
                     segments.push(Self::relation_lookup_segment(current.trim())?);
                     current.clear();
@@ -1603,6 +1653,8 @@ impl IntellisenseData {
 
         let normalized = if sql_text::is_quoted_identifier(trimmed) {
             sql_text::strip_identifier_quotes(trimmed)
+        } else if let Some(unquoted) = Self::strip_bracket_identifier(trimmed) {
+            unquoted
         } else {
             trimmed.to_string()
         };
@@ -1631,6 +1683,7 @@ impl IntellisenseData {
 
             match ch {
                 '"' | '`' => active_quote = Some(ch),
+                '[' => active_quote = Some(']'),
                 '.' => return true,
                 _ => {}
             }
@@ -1707,6 +1760,7 @@ impl IntellisenseData {
     fn append_column_suggestions(
         &mut self,
         prefix_upper: &str,
+        raw_prefix: &str,
         column_tables: Option<&[String]>,
         allow_empty_prefix_global: bool,
         suggestions: &mut Vec<String>,
@@ -1716,7 +1770,13 @@ impl IntellisenseData {
             Some(tables) if !tables.is_empty() => {
                 for table in tables {
                     if let Some(cols) = self.column_entries_for_scope_table(table) {
-                        if Self::push_entries(cols, prefix_upper, suggestions, seen) {
+                        if Self::push_matching_entries(
+                            cols,
+                            prefix_upper,
+                            raw_prefix,
+                            suggestions,
+                            seen,
+                        ) {
                             break;
                         }
                     }
@@ -1725,9 +1785,10 @@ impl IntellisenseData {
             _ => {
                 if allow_empty_prefix_global || !prefix_upper.is_empty() {
                     self.ensure_all_columns_entries();
-                    let _ = Self::push_entries(
+                    let _ = Self::push_matching_entries(
                         &self.all_columns_entries,
                         prefix_upper,
+                        raw_prefix,
                         suggestions,
                         seen,
                     );
@@ -2157,7 +2218,13 @@ impl IntellisenseData {
         let mut seen = HashSet::new();
 
         for group in groups {
-            if Self::push_entries(group, &prefix_upper, &mut suggestions, &mut seen) {
+            if Self::push_matching_entries(
+                group,
+                &prefix_upper,
+                prefix,
+                &mut suggestions,
+                &mut seen,
+            ) {
                 break;
             }
         }
@@ -2196,9 +2263,14 @@ impl IntellisenseData {
         if sql_text::is_quoted_identifier(trimmed) {
             return sql_text::strip_identifier_quotes(trimmed).to_uppercase();
         }
+        if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() >= 2 {
+            return trimmed[1..trimmed.len().saturating_sub(1)]
+                .replace("]]", "]")
+                .to_uppercase();
+        }
 
         match trimmed.chars().next() {
-            Some('"') | Some('`') => trimmed[1..].to_uppercase(),
+            Some('"') | Some('`') | Some('[') => trimmed[1..].to_uppercase(),
             _ => prefix.to_uppercase(),
         }
     }
@@ -2227,6 +2299,10 @@ impl IntellisenseData {
                     active_quote = Some(ch);
                     current.push(ch);
                 }
+                '[' => {
+                    active_quote = Some(']');
+                    current.push(ch);
+                }
                 '.' => {
                     let segment = current.trim();
                     if !segment.is_empty() {
@@ -2248,13 +2324,20 @@ impl IntellisenseData {
     fn normalize_qualifier_lookup_segment(segment: &str) -> String {
         if sql_text::is_quoted_identifier(segment) {
             let unquoted = sql_text::strip_identifier_quotes(segment);
-            if unquoted.contains('.') {
-                segment.to_ascii_uppercase()
-            } else {
-                unquoted.to_ascii_uppercase()
-            }
+            unquoted.to_ascii_uppercase()
+        } else if let Some(unquoted) = Self::strip_bracket_identifier(segment) {
+            unquoted.to_ascii_uppercase()
         } else {
             segment.to_ascii_uppercase()
+        }
+    }
+
+    fn strip_bracket_identifier(value: &str) -> Option<String> {
+        let trimmed = value.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() >= 2 {
+            Some(trimmed[1..trimmed.len().saturating_sub(1)].replace("]]", "]"))
+        } else {
+            None
         }
     }
 
@@ -2279,9 +2362,10 @@ impl IntellisenseData {
         keys
     }
 
-    fn push_entries(
+    fn push_matching_entries(
         entries: &[NameEntry],
         prefix_upper: &str,
+        raw_prefix: &str,
         suggestions: &mut Vec<String>,
         seen: &mut HashSet<String>,
     ) -> bool {
@@ -2292,6 +2376,11 @@ impl IntellisenseData {
         for entry in entries.iter().skip(start) {
             if !entry.upper.starts_with(prefix_upper) {
                 break;
+            }
+            if !raw_prefix.is_empty()
+                && !suggestion_matches_completion_prefix(&entry.name, raw_prefix)
+            {
+                continue;
             }
             if seen.insert(entry.upper.clone()) {
                 suggestions.push(entry.name.clone());
@@ -2867,7 +2956,7 @@ pub fn filter_suggestions_by_prefix(suggestions: &[String], prefix: &str) -> Vec
         .collect()
 }
 
-fn suggestion_matches_completion_prefix(candidate: &str, prefix: &str) -> bool {
+pub fn suggestion_matches_completion_prefix(candidate: &str, prefix: &str) -> bool {
     identifier_matches_completion_prefix(candidate, prefix)
         || comparison_lhs_identifier_prefix(candidate)
             .is_some_and(|identifier| identifier_matches_completion_prefix(identifier, prefix))
@@ -2898,6 +2987,7 @@ fn first_unquoted_condition_equals(text: &str) -> Option<usize> {
 
         match ch {
             '"' | '`' => active_quote = Some(ch),
+            '[' => active_quote = Some(']'),
             '=' if is_spaced_condition_operator(text, idx) => return Some(idx),
             _ => {}
         }
@@ -2935,6 +3025,7 @@ fn last_unquoted_identifier_dot(text: &str) -> Option<usize> {
 
         match ch {
             '"' | '`' => active_quote = Some(ch),
+            '[' => active_quote = Some(']'),
             '.' => last_dot = Some(idx),
             _ => {}
         }
@@ -2949,7 +3040,8 @@ fn identifier_matches_completion_prefix(candidate: &str, prefix: &str) -> bool {
     }
 
     let Some(prefix_delimiter) = identifier_quote_delimiter(prefix) else {
-        return starts_with_ignore_ascii_case(strip_matching_identifier_quotes(candidate), prefix);
+        let candidate_lookup = strip_matching_identifier_quotes(candidate);
+        return starts_with_ignore_ascii_case(candidate_lookup.as_ref(), prefix);
     };
 
     if identifier_quote_delimiter(candidate) != Some(prefix_delimiter) {
@@ -2957,14 +3049,14 @@ fn identifier_matches_completion_prefix(candidate: &str, prefix: &str) -> bool {
     }
 
     starts_with_ignore_ascii_case(
-        strip_matching_identifier_quotes(candidate),
+        strip_matching_identifier_quotes(candidate).as_ref(),
         strip_incomplete_identifier_quote(prefix),
     )
 }
 
 fn identifier_quote_delimiter(value: &str) -> Option<char> {
     match value.chars().next() {
-        Some('"') | Some('`') => value.chars().next(),
+        Some('"') | Some('`') | Some('[') => value.chars().next(),
         _ => None,
     }
 }
@@ -2976,16 +3068,19 @@ fn strip_incomplete_identifier_quote(value: &str) -> &str {
     }
 }
 
-fn strip_matching_identifier_quotes(value: &str) -> &str {
+fn strip_matching_identifier_quotes(value: &str) -> Cow<'_, str> {
     if value.len() >= 2 {
         let bytes = value.as_bytes();
         let first = bytes[0];
         let last = bytes[value.len() - 1];
         if (first == b'"' && last == b'"') || (first == b'`' && last == b'`') {
-            return &value[1..value.len() - 1];
+            return Cow::Borrowed(&value[1..value.len() - 1]);
+        }
+        if first == b'[' && last == b']' {
+            return Cow::Owned(value[1..value.len() - 1].replace("]]", "]"));
         }
     }
-    value
+    Cow::Borrowed(value)
 }
 
 fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
@@ -3094,13 +3189,13 @@ fn incomplete_quoted_identifier_start_before_cursor(
     let mut idx = cursor_pos;
     while idx > 0 {
         let (prev_idx, ch) = text.get(..idx)?.char_indices().next_back()?;
-        if matches!(ch, '"' | '`') {
+        if matches!(ch, '"' | '`' | '[') {
             if quoted_identifier_start_context(text, prev_idx)
                 && !has_unescaped_identifier_delimiter(
                     text,
                     prev_idx + ch.len_utf8(),
                     cursor_pos,
-                    ch,
+                    identifier_closing_delimiter(ch),
                 )
             {
                 return Some((prev_idx, ch));
@@ -3115,7 +3210,14 @@ fn incomplete_quoted_identifier_start_before_cursor(
 fn quoted_identifier_start_context(text: &str, quote_idx: usize) -> bool {
     text.get(..quote_idx)
         .and_then(|prefix| prefix.chars().next_back())
-        .is_none_or(|ch| !sql_text::is_identifier_char(ch) && !matches!(ch, '"' | '`' | '\''))
+        .is_none_or(|ch| !sql_text::is_identifier_char(ch) && !matches!(ch, '"' | '`' | '[' | '\''))
+}
+
+fn identifier_closing_delimiter(opening: char) -> char {
+    match opening {
+        '[' => ']',
+        _ => opening,
+    }
 }
 
 fn has_unescaped_identifier_delimiter(
@@ -3146,6 +3248,7 @@ fn quoted_identifier_end_from_cursor(
     cursor_pos: usize,
     delimiter: char,
 ) -> Option<usize> {
+    let delimiter = identifier_closing_delimiter(delimiter);
     let mut iter = text.get(cursor_pos..)?.char_indices().peekable();
     while let Some((rel_idx, ch)) = iter.next() {
         if ch == delimiter {
@@ -3892,8 +3995,29 @@ mod intellisense_tests {
     }
 
     #[test]
+    fn get_word_at_cursor_expands_incomplete_bracket_identifier() {
+        let sql = "SELECT rec.[Street N FROM dual";
+        let cursor = sql.find(" FROM").expect("expected cursor anchor");
+        let (word, start, end) = get_word_at_cursor(sql, cursor);
+
+        assert_eq!(word, "[Street N");
+        assert_eq!(sql.get(start..cursor), Some("[Street N"));
+        assert_eq!(end, cursor);
+    }
+
+    #[test]
     fn get_word_at_cursor_ignores_completed_quoted_identifier_before_cursor() {
         let sql = r#"SELECT rec."Street Name".ci FROM dual"#;
+        let cursor = sql.find(" FROM").expect("expected cursor anchor");
+        let (word, start, _) = get_word_at_cursor(sql, cursor);
+
+        assert_eq!(word, "ci");
+        assert_eq!(sql.get(start..cursor), Some("ci"));
+    }
+
+    #[test]
+    fn get_word_at_cursor_ignores_completed_bracket_identifier_before_cursor() {
+        let sql = "SELECT rec.[Street Name].ci FROM dual";
         let cursor = sql.find(" FROM").expect("expected cursor anchor");
         let (word, start, _) = get_word_at_cursor(sql, cursor);
 
@@ -4466,6 +4590,42 @@ mod intellisense_tests {
     }
 
     #[test]
+    fn filter_suggestions_by_prefix_matches_bracket_identifier_by_unquoted_prefix() {
+        let suggestions = vec![
+            "[Item Id]".to_string(),
+            "[order]".to_string(),
+            "plain_name".to_string(),
+        ];
+        let filtered = filter_suggestions_by_prefix(&suggestions, "Item");
+
+        assert_eq!(filtered, vec!["[Item Id]".to_string()]);
+    }
+
+    #[test]
+    fn filter_suggestions_by_prefix_matches_bracket_identifier_by_incomplete_prefix() {
+        let suggestions = vec![
+            "[Item Id]".to_string(),
+            "[order]".to_string(),
+            "plain_name".to_string(),
+        ];
+        let filtered = filter_suggestions_by_prefix(&suggestions, "[It");
+
+        assert_eq!(filtered, vec!["[Item Id]".to_string()]);
+    }
+
+    #[test]
+    fn filter_suggestions_by_prefix_matches_escaped_bracket_identifier_by_unescaped_prefix() {
+        let suggestions = vec![
+            "[Item]]Id]".to_string(),
+            "[order]]line]".to_string(),
+            "plain_name".to_string(),
+        ];
+        let filtered = filter_suggestions_by_prefix(&suggestions, "Item]I");
+
+        assert_eq!(filtered, vec!["[Item]]Id]".to_string()]);
+    }
+
+    #[test]
     fn filter_suggestions_by_prefix_matches_quoted_condition_by_incomplete_quoted_prefix() {
         let suggestions = vec![
             "a.\"Order Id\" = b.\"Order Id\"".to_string(),
@@ -4541,6 +4701,28 @@ mod intellisense_tests {
         let filtered = filter_suggestions_by_prefix(&suggestions, "`A=B");
 
         assert_eq!(filtered, vec!["a.`A=B` = b.`A=B`".to_string()]);
+    }
+
+    #[test]
+    fn filter_suggestions_by_prefix_matches_bracket_condition_column() {
+        let suggestions = vec![
+            "a.[Item Id] = b.[Item Id]".to_string(),
+            "a.[order] = b.[order]".to_string(),
+        ];
+        let filtered = filter_suggestions_by_prefix(&suggestions, "Item");
+
+        assert_eq!(filtered, vec!["a.[Item Id] = b.[Item Id]".to_string()]);
+    }
+
+    #[test]
+    fn filter_suggestions_by_prefix_matches_escaped_bracket_condition_column() {
+        let suggestions = vec![
+            "a.[Item]]Id] = b.[Item]]Id]".to_string(),
+            "a.[order]]line] = b.[order]]line]".to_string(),
+        ];
+        let filtered = filter_suggestions_by_prefix(&suggestions, "Item]I");
+
+        assert_eq!(filtered, vec!["a.[Item]]Id] = b.[Item]]Id]".to_string()]);
     }
 
     #[test]
@@ -4737,6 +4919,18 @@ mod intellisense_tests {
     }
 
     #[test]
+    fn get_columns_for_table_uses_default_qualifier_for_bracket_unqualified_name() {
+        let mut data = IntellisenseData::new();
+        data.set_default_qualifier(Some("SCOTT".to_string()));
+        data.set_relation_members_for_qualifier("SCOTT", vec!["ORDER DETAILS".to_string()]);
+        data.set_columns_for_table("SCOTT.ORDER DETAILS", vec!["ORDER_ID".to_string()]);
+
+        let columns = data.get_columns_for_table("[ORDER DETAILS]");
+
+        assert_eq!(columns, vec!["ORDER_ID".to_string()]);
+    }
+
+    #[test]
     fn get_columns_for_table_does_not_default_fallback_for_quoted_dotted_name() {
         let mut data = IntellisenseData::new();
         data.set_default_qualifier(Some("SCOTT".to_string()));
@@ -4749,11 +4943,33 @@ mod intellisense_tests {
     }
 
     #[test]
+    fn get_columns_for_table_does_not_default_fallback_for_bracket_dotted_name() {
+        let mut data = IntellisenseData::new();
+        data.set_default_qualifier(Some("SCOTT".to_string()));
+        data.set_relation_members_for_qualifier("SCOTT", vec!["B".to_string()]);
+        data.set_columns_for_table("SCOTT.B", vec!["LEAK".to_string()]);
+
+        let columns = data.get_columns_for_table("[A.B]");
+
+        assert!(columns.is_empty(), "columns: {:?}", columns);
+    }
+
+    #[test]
     fn get_columns_for_table_matches_exact_known_quoted_dotted_relation() {
         let mut data = IntellisenseData::new();
         data.set_columns_for_table("A.B", vec!["ID".to_string()]);
 
         let columns = data.get_columns_for_table(r#""A.B""#);
+
+        assert_eq!(columns, vec!["ID".to_string()]);
+    }
+
+    #[test]
+    fn get_columns_for_table_matches_exact_known_bracket_dotted_relation() {
+        let mut data = IntellisenseData::new();
+        data.set_columns_for_table("A.B", vec!["ID".to_string()]);
+
+        let columns = data.get_columns_for_table("[A.B]");
 
         assert_eq!(columns, vec!["ID".to_string()]);
     }
@@ -4861,6 +5077,65 @@ mod intellisense_tests {
     }
 
     #[test]
+    fn get_column_suggestions_match_bracket_quoted_columns_by_unquoted_prefix() {
+        let mut data = IntellisenseData::new();
+        data.set_virtual_table_columns(
+            "REC",
+            vec![
+                "[Item Id]".to_string(),
+                "[order]".to_string(),
+                "NORMAL_SAL".to_string(),
+            ],
+        );
+
+        let scope = vec!["REC".to_string()];
+        let suggestions = data.get_column_suggestions("Item", Some(scope.as_slice()));
+
+        assert_eq!(suggestions, vec!["[Item Id]".to_string()]);
+    }
+
+    #[test]
+    fn get_column_suggestions_match_incomplete_quoted_prefix_delimiter() {
+        let mut data = IntellisenseData::new();
+        data.set_virtual_table_columns(
+            "REC",
+            vec![
+                r#""Emp Name""#.to_string(),
+                "`Emp Name`".to_string(),
+                "[Emp Name]".to_string(),
+            ],
+        );
+
+        let scope = vec!["REC".to_string()];
+
+        assert_eq!(
+            data.get_column_suggestions(r#""Emp"#, Some(scope.as_slice())),
+            vec![r#""Emp Name""#.to_string()]
+        );
+        assert_eq!(
+            data.get_column_suggestions("`Emp", Some(scope.as_slice())),
+            vec!["`Emp Name`".to_string()]
+        );
+        assert_eq!(
+            data.get_column_suggestions("[Emp", Some(scope.as_slice())),
+            vec!["[Emp Name]".to_string()]
+        );
+    }
+
+    #[test]
+    fn get_column_suggestions_applies_quoted_prefix_before_result_limit() {
+        let mut data = IntellisenseData::new();
+        let mut columns: Vec<String> = (0..60).map(|idx| format!("`Emp A{idx:03}`")).collect();
+        columns.push(r#""Emp Target""#.to_string());
+        data.set_virtual_table_columns("REC", columns);
+
+        let scope = vec!["REC".to_string()];
+        let suggestions = data.get_column_suggestions(r#""Emp"#, Some(scope.as_slice()));
+
+        assert_eq!(suggestions, vec![r#""Emp Target""#.to_string()]);
+    }
+
+    #[test]
     fn get_relation_suggestions_include_synonyms() {
         let mut data = IntellisenseData::new();
         data.tables = vec!["EMP".to_string()];
@@ -4915,6 +5190,59 @@ mod intellisense_tests {
         let suggestions = data.get_object_suggestions("SC");
 
         assert_eq!(suggestions, vec!["SCOTT".to_string()]);
+    }
+
+    #[test]
+    fn get_object_suggestions_match_incomplete_quoted_prefix_delimiter() {
+        let mut data = IntellisenseData::new();
+        data.tables = vec![
+            r#""Config Table""#.to_string(),
+            "`Config Table`".to_string(),
+            "[Config Table]".to_string(),
+        ];
+        data.rebuild_indices();
+
+        assert_eq!(
+            data.get_table_object_suggestions(r#""Config"#),
+            vec![r#""Config Table""#.to_string()]
+        );
+        assert_eq!(
+            data.get_table_object_suggestions("`Config"),
+            vec!["`Config Table`".to_string()]
+        );
+        assert_eq!(
+            data.get_table_object_suggestions("[Config"),
+            vec!["[Config Table]".to_string()]
+        );
+    }
+
+    #[test]
+    fn get_object_suggestions_applies_quoted_prefix_before_result_limit() {
+        let mut data = IntellisenseData::new();
+        data.tables = (0..60).map(|idx| format!("`Config A{idx:03}`")).collect();
+        data.tables.push(r#""Config Target""#.to_string());
+        data.rebuild_indices();
+
+        let suggestions = data.get_table_object_suggestions(r#""Config"#);
+
+        assert_eq!(suggestions, vec![r#""Config Target""#.to_string()]);
+    }
+
+    #[test]
+    fn get_suggestions_filters_language_items_for_quoted_prefix() {
+        let mut data = IntellisenseData::new();
+        data.tables = vec![
+            r#""Commit Log""#.to_string(),
+            "`Commit Log`".to_string(),
+            "[Commit Log]".to_string(),
+        ];
+        data.rebuild_indices();
+
+        let suggestions = data.get_suggestions(r#""Com"#, false, None, false, false);
+
+        assert_eq!(suggestions, vec![r#""Commit Log""#.to_string()]);
+        assert!(!suggestions.iter().any(|name| name == "COMMIT"));
+        assert!(!suggestions.iter().any(|name| name == "COUNT()"));
     }
 
     #[test]
@@ -5096,6 +5424,61 @@ mod intellisense_tests {
     }
 
     #[test]
+    fn get_member_suggestions_match_quoted_member_prefix() {
+        let mut data = IntellisenseData::new();
+        data.set_members_for_qualifier(
+            "DEMO_PKG",
+            vec![
+                r#""Run Job""#.to_string(),
+                "`Run Batch`".to_string(),
+                "[Run]]Report]".to_string(),
+                "RESET_JOB".to_string(),
+            ],
+        );
+        data.set_relation_members_for_qualifier(
+            "SCOTT",
+            vec![
+                r#""Order Header""#.to_string(),
+                "`Order Items`".to_string(),
+                "[Order]]Audit]".to_string(),
+                "EMP".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            data.get_member_suggestions("DEMO_PKG", r#""Ru"#, false),
+            vec![r#""Run Job""#.to_string()]
+        );
+        assert_eq!(
+            data.get_member_suggestions("DEMO_PKG", "`Ru", false),
+            vec!["`Run Batch`".to_string()]
+        );
+        assert_eq!(
+            data.get_member_suggestions("DEMO_PKG", "Run]", false),
+            vec!["[Run]]Report]".to_string()]
+        );
+        assert_eq!(
+            data.get_member_suggestions("SCOTT", "Order]", true),
+            vec!["[Order]]Audit]".to_string()]
+        );
+    }
+
+    #[test]
+    fn get_member_suggestions_applies_quoted_prefix_before_result_limit() {
+        let mut members = (0..MAX_SUGGESTIONS + 10)
+            .map(|idx| format!("RUN_{idx:03}"))
+            .collect::<Vec<_>>();
+        members.push(r#""Run Target""#.to_string());
+
+        let mut data = IntellisenseData::new();
+        data.set_members_for_qualifier("DEMO_PKG", members);
+
+        let suggestions = data.get_member_suggestions("DEMO_PKG", r#""Run"#, false);
+
+        assert_eq!(suggestions, vec![r#""Run Target""#.to_string()]);
+    }
+
+    #[test]
     fn get_member_suggestions_do_not_fallback_from_quoted_dotted_qualifier_suffix() {
         let mut data = IntellisenseData::new();
         data.set_members_for_qualifier("B", vec!["LEAK".to_string()]);
@@ -5106,6 +5489,51 @@ mod intellisense_tests {
 
         assert!(members.is_empty(), "members: {:?}", members);
         assert!(relations.is_empty(), "relations: {:?}", relations);
+    }
+
+    #[test]
+    fn get_member_suggestions_match_exact_quoted_dotted_qualifier() {
+        let mut data = IntellisenseData::new();
+        data.set_members_for_qualifier("A.B", vec!["RUN_JOB".to_string()]);
+        data.set_relation_members_for_qualifier("A.B", vec!["EMP".to_string()]);
+
+        let quoted_members = data.get_member_suggestions(r#""A.B""#, "RUN", false);
+        let bracket_members = data.get_member_suggestions("[A.B]", "RUN", false);
+        let quoted_relations = data.get_member_suggestions(r#""A.B""#, "EMP", true);
+        let bracket_relations = data.get_member_suggestions("[A.B]", "EMP", true);
+
+        assert_eq!(quoted_members, vec!["RUN_JOB".to_string()]);
+        assert_eq!(bracket_members, vec!["RUN_JOB".to_string()]);
+        assert_eq!(quoted_relations, vec!["EMP".to_string()]);
+        assert_eq!(bracket_relations, vec!["EMP".to_string()]);
+    }
+
+    #[test]
+    fn qualifier_member_kind_lookup_matches_exact_quoted_dotted_qualifier() {
+        let mut data = IntellisenseData::new();
+        data.set_members_for_qualifier_with_kinds(
+            "A.B",
+            vec![("CALC".to_string(), Some(QualifiedMemberKind::Function))],
+        );
+
+        assert_eq!(
+            data.qualifier_member_name_matching_kinds(
+                r#""A.B""#,
+                "calc",
+                &[QualifiedMemberKind::Function],
+            )
+            .as_deref(),
+            Some("CALC")
+        );
+        assert_eq!(
+            data.qualifier_member_name_matching_kinds(
+                "[A.B]",
+                "calc",
+                &[QualifiedMemberKind::Function],
+            )
+            .as_deref(),
+            Some("CALC")
+        );
     }
 
     #[test]

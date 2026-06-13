@@ -451,12 +451,7 @@ impl SqlEditorWidget {
             return;
         }
 
-        let schema_and_table = table_key.rsplit_once('.').map(|(schema, table)| {
-            (
-                schema.trim_matches(&['`', '"'][..]).to_string(),
-                table.trim_matches(&['`', '"'][..]).to_string(),
-            )
-        });
+        let schema_and_table = Self::column_load_schema_and_table(&table_key);
         let schema_and_table_ref = schema_and_table
             .as_ref()
             .map(|(schema, table)| (schema.as_str(), table.as_str()));
@@ -754,6 +749,7 @@ impl SqlEditorWidget {
 
             match ch {
                 '"' | '`' => active_quote = Some(ch),
+                '[' => active_quote = Some(']'),
                 '=' if Self::is_spaced_condition_operator(text, idx) => return Some(idx),
                 _ => {}
             }
@@ -791,12 +787,27 @@ impl SqlEditorWidget {
 
             match ch {
                 '"' | '`' => active_quote = Some(ch),
+                '[' => active_quote = Some(']'),
                 '.' => last_dot = Some(idx),
                 _ => {}
             }
         }
 
         active_quote.is_none().then_some(last_dot).flatten()
+    }
+
+    fn column_load_schema_and_table(table_key: &str) -> Option<(String, String)> {
+        let dot_idx = Self::last_unquoted_dot(table_key)?;
+        let schema = table_key.get(..dot_idx)?.trim();
+        let table = table_key.get(dot_idx + 1..)?.trim();
+        if schema.is_empty() || table.is_empty() {
+            return None;
+        }
+
+        Some((
+            Self::strip_identifier_quotes(schema),
+            Self::strip_identifier_quotes(table),
+        ))
     }
 
     #[cfg(test)]

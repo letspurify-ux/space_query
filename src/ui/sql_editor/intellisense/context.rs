@@ -43,21 +43,22 @@ impl SqlEditorWidget {
 
         while idx < text.len() {
             let ch = text.get(idx..)?.chars().next()?;
-            if !matches!(ch, '"' | '`') {
+            if !matches!(ch, '"' | '`' | '[') {
                 idx += ch.len_utf8();
                 continue;
             }
             let quote = ch;
+            let closing = if quote == '[' { ']' } else { quote };
 
             let start = idx;
             idx += quote.len_utf8();
 
             while idx < text.len() {
                 let cur = text.get(idx..)?.chars().next()?;
-                if cur == quote {
+                if cur == closing {
                     let next_idx = idx + cur.len_utf8();
-                    if next_idx < text.len() && text.get(next_idx..)?.starts_with(quote) {
-                        idx = next_idx + quote.len_utf8();
+                    if next_idx < text.len() && text.get(next_idx..)?.starts_with(closing) {
+                        idx = next_idx + closing.len_utf8();
                         continue;
                     }
                     let end = next_idx;
@@ -480,6 +481,8 @@ impl SqlEditorWidget {
 
             if matches!(ch, '"' | '`') {
                 active_quote = Some(ch);
+            } else if ch == '[' {
+                active_quote = Some(']');
             } else if ch == '.' {
                 parts.push(trimmed[start..idx].trim());
                 start = idx + ch.len_utf8();
@@ -512,6 +515,10 @@ impl SqlEditorWidget {
             || trimmed.starts_with('`')
             || trimmed.ends_with('`')
             || trimmed.contains('`')
+            || trimmed.starts_with('[')
+            || trimmed.ends_with(']')
+            || trimmed.contains('[')
+            || trimmed.contains(']')
         {
             None
         } else {
@@ -561,6 +568,10 @@ impl SqlEditorWidget {
             || trimmed.starts_with('`')
             || trimmed.ends_with('`')
             || trimmed.contains('`')
+            || trimmed.starts_with('[')
+            || trimmed.ends_with(']')
+            || trimmed.contains('[')
+            || trimmed.contains(']')
         {
             None
         } else if Self::is_canonical_quick_describe_lookup_part(trimmed) {
@@ -1194,6 +1205,10 @@ impl SqlEditorWidget {
     }
 
     fn strip_identifier_quotes(value: &str) -> String {
+        let trimmed = value.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() >= 2 {
+            return trimmed[1..trimmed.len().saturating_sub(1)].replace("]]", "]");
+        }
         sql_text::strip_identifier_quotes(value)
     }
 
@@ -1364,6 +1379,15 @@ impl SqlEditorWidget {
             }
             return Some((qualifier, start));
         }
+        if matches!(last_char, Some(']')) {
+            let start = Self::find_bracket_segment_start(text, segment_end)?;
+            let bracketed = text.get(start..segment_end)?;
+            let qualifier = Self::strip_identifier_quotes(bracketed);
+            if qualifier.is_empty() {
+                return None;
+            }
+            return Some((qualifier, start));
+        }
 
         let mut start = segment_end;
         for (pos, ch) in text.get(..segment_end)?.char_indices().rev() {
@@ -1389,6 +1413,36 @@ impl SqlEditorWidget {
         Some((segment.to_string(), start))
     }
 
+    fn find_bracket_segment_start(text: &str, segment_end: usize) -> Option<usize> {
+        if segment_end == 0 || !text.get(..segment_end)?.ends_with(']') {
+            return None;
+        }
+
+        let mut active_start = None;
+        let mut iter = text.get(..segment_end)?.char_indices().peekable();
+        while let Some((idx, ch)) = iter.next() {
+            if active_start.is_none() {
+                if ch == '[' {
+                    active_start = Some(idx);
+                }
+                continue;
+            }
+
+            if ch == ']' {
+                if iter.peek().is_some_and(|(_, next)| *next == ']') {
+                    iter.next();
+                    continue;
+                }
+                if idx + ch.len_utf8() == segment_end {
+                    return active_start;
+                }
+                active_start = None;
+            }
+        }
+
+        None
+    }
+
     fn find_open_paren_for_qualifier_expression(text: &str, segment_end: usize) -> Option<usize> {
         let mut depth = 0usize;
         for (pos, ch) in text.get(..segment_end)?.char_indices().rev() {
@@ -1411,18 +1465,30 @@ impl SqlEditorWidget {
         let mut chars = text.chars().peekable();
         let mut active_quote: Option<char> = None;
         while let Some(ch) = chars.next() {
-            if !matches!(ch, '"' | '`') {
-                continue;
-            }
-
-            if active_quote == Some(ch) {
-                if chars.peek().copied() == Some(ch) {
-                    chars.next();
-                } else {
-                    active_quote = None;
+            match active_quote {
+                Some(']') => {
+                    if ch == ']' {
+                        if chars.peek().copied() == Some(']') {
+                            chars.next();
+                        } else {
+                            active_quote = None;
+                        }
+                    }
                 }
-            } else if active_quote.is_none() {
-                active_quote = Some(ch);
+                Some(delimiter) => {
+                    if ch == delimiter {
+                        if chars.peek().copied() == Some(delimiter) {
+                            chars.next();
+                        } else {
+                            active_quote = None;
+                        }
+                    }
+                }
+                None => match ch {
+                    '"' | '`' => active_quote = Some(ch),
+                    '[' => active_quote = Some(']'),
+                    _ => {}
+                }
             }
         }
         active_quote.is_some()
@@ -1546,7 +1612,7 @@ impl SqlEditorWidget {
     }
 
     fn is_completion_prefix_char(ch: char) -> bool {
-        sql_text::is_identifier_char(ch) || matches!(ch, '"' | '`')
+        sql_text::is_identifier_char(ch) || matches!(ch, '"' | '`' | '[')
     }
 
     fn should_force_full_analysis(ch: char) -> bool {
@@ -1610,7 +1676,7 @@ impl SqlEditorWidget {
     }
 
     fn completion_prefix_from_range_text(text: &str) -> String {
-        if matches!(text.chars().next(), Some('"') | Some('`')) {
+        if matches!(text.chars().next(), Some('"') | Some('`') | Some('[')) {
             return text.to_string();
         }
 

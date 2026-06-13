@@ -1042,11 +1042,11 @@ impl SqlEditorWidget {
                         Self::build_auto_join_condition(&data, right, lefts)
                     };
                     if let Some(condition) = condition {
-                        let matches_prefix = snapshot.prefix.is_empty()
-                            || condition
-                                .to_uppercase()
-                                .starts_with(&snapshot.prefix.to_uppercase());
-                        if matches_prefix && !suggestions.iter().any(|s| s == &condition) {
+                        if Self::completion_suggestion_matches_prefix(
+                            &condition,
+                            &snapshot.prefix,
+                        ) && !suggestions.iter().any(|s| s == &condition)
+                        {
                             suggestions.insert(0, condition);
                         }
                     }
@@ -1252,6 +1252,11 @@ impl SqlEditorWidget {
         }
 
         suggestions
+    }
+
+    fn completion_suggestion_matches_prefix(suggestion: &str, prefix: &str) -> bool {
+        prefix.is_empty()
+            || crate::ui::intellisense::suggestion_matches_completion_prefix(suggestion, prefix)
     }
 
     fn collect_expected_keyword_suggestions(
@@ -2023,6 +2028,19 @@ impl SqlEditorWidget {
                         }
                     } else if active_quote.is_none() {
                         active_quote = Some(ch);
+                    }
+                }
+                '[' if active_quote.is_none() => {
+                    current.push(ch);
+                    active_quote = Some(']');
+                }
+                ']' if active_quote == Some(']') => {
+                    current.push(ch);
+                    if chars.peek().copied() == Some(']') {
+                        current.push(ch);
+                        chars.next();
+                    } else {
+                        active_quote = None;
                     }
                 }
                 '.' if active_quote.is_none() => {
@@ -3618,6 +3636,19 @@ impl SqlEditorWidget {
                         active_quote = Some(ch);
                     }
                 }
+                '[' if active_quote.is_none() => {
+                    current.push(ch);
+                    active_quote = Some(']');
+                }
+                ']' if active_quote == Some(']') => {
+                    current.push(ch);
+                    if chars.peek().copied() == Some(']') {
+                        current.push(ch);
+                        chars.next();
+                    } else {
+                        active_quote = None;
+                    }
+                }
                 '.' if active_quote.is_none() => {
                     let segment = Self::strip_identifier_quotes(current.trim());
                     if !segment.is_empty() {
@@ -3659,6 +3690,14 @@ impl SqlEditorWidget {
                         }
                     } else if active_quote.is_none() {
                         active_quote = Some(ch);
+                    }
+                }
+                '[' if active_quote.is_none() => active_quote = Some(']'),
+                ']' if active_quote == Some(']') => {
+                    if chars.peek().copied() == Some(']') {
+                        chars.next();
+                    } else {
+                        active_quote = None;
                     }
                 }
                 '.' if active_quote.is_none() => return true,
@@ -3708,9 +3747,14 @@ impl SqlEditorWidget {
         if sql_text::is_quoted_identifier(trimmed) {
             return sql_text::strip_identifier_quotes(trimmed).to_ascii_uppercase();
         }
+        if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() >= 2 {
+            return trimmed[1..trimmed.len().saturating_sub(1)]
+                .replace("]]", "]")
+                .to_ascii_uppercase();
+        }
 
         match trimmed.chars().next() {
-            Some('"') | Some('`') => trimmed[1..].to_ascii_uppercase(),
+            Some('"') | Some('`') | Some('[') => trimmed[1..].to_ascii_uppercase(),
             _ => trimmed.to_ascii_uppercase(),
         }
     }

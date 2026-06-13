@@ -486,16 +486,39 @@ fn is_merge_delete_where_action(
 }
 
 fn relation_function_name_hint(table_name: &str) -> Option<String> {
-    table_name
-        .split('@')
-        .next()
-        .and_then(|name_without_dblink| {
-            name_without_dblink
-                .rsplit('.')
-                .find(|segment| !segment.trim().is_empty())
-        })
-        .map(strip_identifier_quotes)
+    let name_without_dblink = strip_unquoted_dblink_suffix(table_name);
+    split_identifier_parts_for_lookup(name_without_dblink)
+        .into_iter()
+        .next_back()
+        .map(|name| strip_identifier_quotes(&name))
         .map(|name| name.to_ascii_uppercase())
+}
+
+fn strip_unquoted_dblink_suffix(value: &str) -> &str {
+    let mut chars = value.char_indices().peekable();
+    let mut active_quote = None;
+
+    while let Some((idx, ch)) = chars.next() {
+        if let Some(delimiter) = active_quote {
+            if ch == delimiter {
+                if chars.peek().is_some_and(|(_, next)| *next == delimiter) {
+                    chars.next();
+                } else {
+                    active_quote = None;
+                }
+            }
+            continue;
+        }
+
+        match ch {
+            '"' | '`' => active_quote = Some(ch),
+            '[' => active_quote = Some(']'),
+            '@' => return value.get(..idx).unwrap_or(value),
+            _ => {}
+        }
+    }
+
+    value
 }
 
 fn is_table_target_statement_keyword(word: &str) -> bool {
@@ -4383,6 +4406,10 @@ fn is_postgres_on_conflict_do_update(tokens: &[SqlToken], update_idx: usize) -> 
 }
 
 fn strip_identifier_quotes(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() >= 2 {
+        return trimmed[1..trimmed.len().saturating_sub(1)].replace("]]", "]");
+    }
     crate::sql_text::strip_identifier_quotes(value)
 }
 
@@ -4414,7 +4441,7 @@ fn split_identifier_parts_for_lookup(value: &str) -> Vec<String> {
 
     while let Some(ch) = chars.next() {
         match ch {
-            '"' | '`' => {
+            '"' | '`' if active_quote.is_none() || active_quote == Some(ch) => {
                 current.push(ch);
                 if active_quote == Some(ch) {
                     if chars.peek().copied() == Some(ch) {
@@ -4425,6 +4452,19 @@ fn split_identifier_parts_for_lookup(value: &str) -> Vec<String> {
                     }
                 } else if active_quote.is_none() {
                     active_quote = Some(ch);
+                }
+            }
+            '[' if active_quote.is_none() => {
+                current.push(ch);
+                active_quote = Some(']');
+            }
+            ']' if active_quote == Some(']') => {
+                current.push(ch);
+                if chars.peek().copied() == Some(']') {
+                    current.push(ch);
+                    chars.next();
+                } else {
+                    active_quote = None;
                 }
             }
             '.' if active_quote.is_none() => {
@@ -4636,6 +4676,20 @@ fn parse_relation_alias_at_with_columns(
     allow_alias_column_list: bool,
 ) -> (Option<String>, usize, Vec<String>, Option<TokenRange>) {
     let idx = skip_comment_tokens(tokens, start);
+    if let Some((alias_name, after_alias)) = parse_bracket_identifier_at(tokens, idx) {
+        let (explicit_columns, explicit_column_range, next_idx) = if allow_alias_column_list {
+            parse_optional_alias_column_list(tokens, after_alias)
+        } else {
+            (Vec::new(), None, after_alias)
+        };
+        return (
+            Some(alias_name),
+            next_idx,
+            explicit_columns,
+            explicit_column_range,
+        );
+    }
+
     let Some(SqlToken::Word(word)) = tokens.get(idx) else {
         return (None, idx, Vec::new(), None);
     };
@@ -4648,6 +4702,20 @@ fn parse_relation_alias_at_with_columns(
             return (None, idx, Vec::new(), None);
         }
         let alias_idx = skip_comment_tokens(tokens, idx + 1);
+        if let Some((alias_name, after_alias)) = parse_bracket_identifier_at(tokens, alias_idx) {
+            let (explicit_columns, explicit_column_range, next_idx) = if allow_alias_column_list {
+                parse_optional_alias_column_list(tokens, after_alias)
+            } else {
+                (Vec::new(), None, after_alias)
+            };
+            return (
+                Some(alias_name),
+                next_idx,
+                explicit_columns,
+                explicit_column_range,
+            );
+        }
+
         let Some(SqlToken::Word(alias_word)) = tokens.get(alias_idx) else {
             return (None, alias_idx, Vec::new(), None);
         };
@@ -4690,6 +4758,53 @@ fn parse_relation_alias_at_with_columns(
     }
 
     (None, idx, Vec::new(), None)
+}
+
+fn parse_bracket_identifier_at(tokens: &[SqlToken], idx: usize) -> Option<(String, usize)> {
+    if !matches!(tokens.get(idx), Some(SqlToken::Symbol(sym)) if sym == "[") {
+        return None;
+    }
+
+    let mut inner = String::new();
+    let mut cursor = idx + 1;
+    while cursor < tokens.len() {
+        match tokens.get(cursor)? {
+            SqlToken::Symbol(sym) if sym == "]" => {
+                if matches!(tokens.get(cursor + 1), Some(SqlToken::Symbol(next)) if next == "]") {
+                    push_bracket_identifier_part(&mut inner, "]", false);
+                    cursor += 2;
+                    continue;
+                }
+                if inner.is_empty() {
+                    return None;
+                }
+                return Some((inner, cursor + 1));
+            }
+            SqlToken::Word(word) | SqlToken::String(word) => {
+                push_bracket_identifier_part(&mut inner, word, true);
+            }
+            SqlToken::Symbol(symbol) => {
+                push_bracket_identifier_part(&mut inner, symbol, false);
+            }
+            SqlToken::Comment(_) => {}
+        }
+        cursor += 1;
+    }
+
+    None
+}
+
+fn push_bracket_identifier_part(inner: &mut String, part: &str, word_like: bool) {
+    if word_like
+        && !inner.is_empty()
+        && inner
+            .chars()
+            .next_back()
+            .is_some_and(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '$' | '#'))
+    {
+        inner.push(' ');
+    }
+    inner.push_str(part);
 }
 
 fn parse_alias_deep_with_columns(
@@ -5652,7 +5767,7 @@ pub(crate) fn extract_table_function_columns(tokens: &[SqlToken]) -> Vec<String>
 
     let mut columns = Vec::new();
     let mut seen = HashSet::new();
-    collect_table_function_columns(tokens, &mut columns, &mut seen);
+    collect_table_function_columns(tokens, &mut columns, &mut seen, true);
     columns
 }
 
@@ -9871,6 +9986,7 @@ fn collect_table_function_columns(
     tokens: &[SqlToken],
     columns: &mut Vec<String>,
     seen: &mut HashSet<String>,
+    allow_unparenthesized_marker: bool,
 ) {
     let mut idx = 0usize;
     while idx < tokens.len() {
@@ -9880,6 +9996,13 @@ fn collect_table_function_columns(
         };
         let marker_upper = word.to_ascii_uppercase();
         if marker_upper != "COLUMNS" && marker_upper != "WITH" {
+            idx += 1;
+            continue;
+        }
+
+        if marker_upper == "COLUMNS"
+            && matches!(prev_non_comment_token(tokens, idx), Some((SqlToken::Symbol(sym), _)) if sym == ",")
+        {
             idx += 1;
             continue;
         }
@@ -9896,7 +10019,7 @@ fn collect_table_function_columns(
                 let range_tokens = token_range_slice(tokens, range);
                 append_table_function_column_items(range_tokens, columns, seen);
                 // Recurse to capture nested `... COLUMNS (...)` clauses.
-                collect_table_function_columns(range_tokens, columns, seen);
+                collect_table_function_columns(range_tokens, columns, seen, false);
                 idx = after_paren;
                 continue;
             }
@@ -9904,10 +10027,15 @@ fn collect_table_function_columns(
             continue;
         }
 
+        if !allow_unparenthesized_marker {
+            idx += 1;
+            continue;
+        }
+
         if next_idx < tokens.len() {
             let tail = &tokens[next_idx..];
             append_table_function_column_items(tail, columns, seen);
-            collect_table_function_columns(tail, columns, seen);
+            collect_table_function_columns(tail, columns, seen, false);
         }
         break;
     }
@@ -10466,14 +10594,25 @@ fn column_lookup_key(column: &str) -> String {
 }
 
 fn resolve_table_function_column_name(item_tokens: &[&SqlToken]) -> Option<String> {
-    let first_word = item_tokens.iter().copied().find_map(|token| match token {
+    let meaningful: Vec<&SqlToken> = item_tokens
+        .iter()
+        .copied()
+        .filter(|token| !matches!(token, SqlToken::Comment(_)))
+        .collect();
+    if let Some(column) = parse_leading_bracket_identifier(&meaningful) {
+        return Some(column);
+    }
+
+    let first_word = meaningful.iter().copied().find_map(|token| match token {
         SqlToken::Comment(_) => None,
         SqlToken::Word(word) => Some(word.as_str()),
         _ => None,
     })?;
 
     let upper = first_word.to_ascii_uppercase();
-    if is_table_function_item_leading_keyword(&upper) {
+    if is_table_function_item_leading_keyword(&upper)
+        && table_function_leading_keyword_is_syntax(&upper, &meaningful)
+    {
         return None;
     }
     if !is_identifier_word_token(first_word) {
@@ -10481,6 +10620,66 @@ fn resolve_table_function_column_name(item_tokens: &[&SqlToken]) -> Option<Strin
     }
 
     Some(output_identifier_suggestion(first_word))
+}
+
+fn parse_leading_bracket_identifier(tokens: &[&SqlToken]) -> Option<String> {
+    if !matches!(tokens.first(), Some(SqlToken::Symbol(sym)) if sym == "[") {
+        return None;
+    }
+
+    let mut inner = String::new();
+    let mut idx = 1usize;
+    while idx < tokens.len() {
+        match tokens[idx] {
+            SqlToken::Symbol(sym) if sym == "]" => {
+                if matches!(tokens.get(idx + 1), Some(SqlToken::Symbol(next)) if next == "]") {
+                    push_bracket_identifier_part(&mut inner, "]", false);
+                    idx += 2;
+                    continue;
+                }
+                if inner.is_empty() {
+                    return None;
+                }
+                return Some(format!("[{}]", inner.replace("]", "]]")));
+            }
+            SqlToken::Word(word) | SqlToken::String(word) => {
+                push_bracket_identifier_part(&mut inner, word, true);
+            }
+            SqlToken::Symbol(symbol) => {
+                push_bracket_identifier_part(&mut inner, symbol, false);
+            }
+            SqlToken::Comment(_) => {}
+        }
+        idx += 1;
+    }
+
+    None
+}
+
+fn table_function_leading_keyword_is_syntax(first_upper: &str, item_tokens: &[&SqlToken]) -> bool {
+    let Some(next_token) = item_tokens
+        .iter()
+        .copied()
+        .skip(1)
+        .find(|token| !matches!(token, SqlToken::Comment(_)))
+    else {
+        return matches!(first_upper, "FOR" | "NESTED" | "ORDINALITY");
+    };
+
+    let SqlToken::Word(next_word) = next_token else {
+        return matches!(first_upper, "FOR" | "NESTED" | "ORDINALITY");
+    };
+    let next_upper = next_word.to_ascii_uppercase();
+    match first_upper {
+        "NESTED" => matches!(next_upper.as_str(), "PATH" | "COLUMNS"),
+        "FOR" => next_upper == "ORDINALITY",
+        "ORDINALITY" => true,
+        "ON" => is_table_function_item_leading_keyword(&next_upper),
+        "ERROR" | "NULL" | "DEFAULT" => next_upper == "ON",
+        "KEEP" | "OMIT" => next_upper == "QUOTES",
+        "CONDITIONAL" | "UNCONDITIONAL" | "WITH" | "WITHOUT" => next_upper == "WRAPPER",
+        _ => false,
+    }
 }
 
 fn is_table_function_item_leading_keyword(word: &str) -> bool {

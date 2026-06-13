@@ -4972,6 +4972,10 @@ impl ResultTableWidget {
         if trimmed.starts_with('"') && trimmed.ends_with('"') {
             return trimmed.to_string();
         }
+        if crate::sql_text::is_quoted_identifier(trimmed) {
+            let unquoted = crate::sql_text::strip_identifier_quotes(trimmed);
+            return format!("\"{}\"", unquoted.replace('"', "\"\""));
+        }
         // Keep unquoted identifiers unquoted regardless of case so SQL semantics
         // (case-insensitive resolution to upper identifiers) are preserved.
         if Self::is_unquoted_identifier(trimmed) {
@@ -4987,32 +4991,37 @@ impl ResultTableWidget {
         }
 
         let mut segments = Vec::new();
-        let mut in_quotes = false;
+        let mut active_quote: Option<char> = None;
         let mut segment_start = 0usize;
         let mut chars = trimmed.char_indices().peekable();
         while let Some((idx, ch)) = chars.next() {
-            if ch == '"' {
-                if in_quotes {
-                    if let Some((_, next_ch)) = chars.peek() {
-                        if *next_ch == '"' {
-                            chars.next();
-                            continue;
-                        }
+            if let Some(delimiter) = active_quote {
+                if ch == delimiter {
+                    if chars
+                        .peek()
+                        .is_some_and(|(_, next_ch)| *next_ch == delimiter)
+                    {
+                        chars.next();
+                    } else {
+                        active_quote = None;
                     }
-                    in_quotes = false;
-                } else {
-                    in_quotes = true;
                 }
                 continue;
             }
-            if ch == '.' && !in_quotes {
-                if trimmed.is_char_boundary(segment_start) && trimmed.is_char_boundary(idx) {
-                    let segment = trimmed[segment_start..idx].trim();
-                    if !segment.is_empty() {
-                        segments.push(segment);
+
+            match ch {
+                '"' | '`' => active_quote = Some(ch),
+                '[' => active_quote = Some(']'),
+                '.' => {
+                    if trimmed.is_char_boundary(segment_start) && trimmed.is_char_boundary(idx) {
+                        let segment = trimmed[segment_start..idx].trim();
+                        if !segment.is_empty() {
+                            segments.push(segment);
+                        }
                     }
+                    segment_start = idx + ch.len_utf8();
                 }
-                segment_start = idx + ch.len_utf8();
+                _ => {}
             }
         }
 
@@ -5043,26 +5052,29 @@ impl ResultTableWidget {
             return "";
         }
 
-        let mut in_quotes = false;
+        let mut active_quote: Option<char> = None;
         let mut last_dot_idx = None;
         let mut chars = trimmed.char_indices().peekable();
         while let Some((idx, ch)) = chars.next() {
-            if ch == '"' {
-                if in_quotes {
-                    if let Some((_, next_ch)) = chars.peek() {
-                        if *next_ch == '"' {
-                            chars.next();
-                            continue;
-                        }
+            if let Some(delimiter) = active_quote {
+                if ch == delimiter {
+                    if chars
+                        .peek()
+                        .is_some_and(|(_, next_ch)| *next_ch == delimiter)
+                    {
+                        chars.next();
+                    } else {
+                        active_quote = None;
                     }
-                    in_quotes = false;
-                } else {
-                    in_quotes = true;
                 }
                 continue;
             }
-            if ch == '.' && !in_quotes {
-                last_dot_idx = Some(idx);
+
+            match ch {
+                '"' | '`' => active_quote = Some(ch),
+                '[' => active_quote = Some(']'),
+                '.' => last_dot_idx = Some(idx),
+                _ => {}
             }
         }
 
@@ -5092,22 +5104,9 @@ impl ResultTableWidget {
             return false;
         }
 
-        if let Some(inner) = trimmed
-            .strip_prefix('"')
-            .and_then(|value| value.strip_suffix('"'))
-        {
+        if crate::sql_text::is_quoted_identifier(trimmed) {
+            let inner = crate::sql_text::strip_identifier_quotes(trimmed);
             if inner.is_empty() {
-                return false;
-            }
-            let mut chars = inner.chars().peekable();
-            while let Some(ch) = chars.next() {
-                if ch != '"' {
-                    continue;
-                }
-                if chars.peek() == Some(&'"') {
-                    chars.next();
-                    continue;
-                }
                 return false;
             }
             return true;
@@ -8618,6 +8617,10 @@ mod row_edit_sql_tests {
             "\"EMP.NAME\""
         );
         assert_eq!(
+            ResultTableWidget::last_identifier_segment("[E].[EMP.NAME]"),
+            "[EMP.NAME]"
+        );
+        assert_eq!(
             ResultTableWidget::last_identifier_segment("  ENAME  "),
             "ENAME"
         );
@@ -8637,6 +8640,14 @@ mod row_edit_sql_tests {
             ResultTableWidget::editable_column_identifier("SCOTT.\"A.B\""),
             Some("\"A.B\"".to_string())
         );
+        assert_eq!(
+            ResultTableWidget::editable_column_identifier("[E].[User.Name]"),
+            Some("\"User.Name\"".to_string())
+        );
+        assert_eq!(
+            ResultTableWidget::editable_column_identifier("[E].[User]]Name]"),
+            Some("\"User]Name\"".to_string())
+        );
         assert_eq!(ResultTableWidget::editable_column_identifier(""), None);
         assert_eq!(ResultTableWidget::editable_column_identifier("E."), None);
         assert_eq!(
@@ -8651,6 +8662,10 @@ mod row_edit_sql_tests {
             ResultTableWidget::editable_column_identifier("\"BROKEN\"NAME\""),
             None
         );
+        assert_eq!(
+            ResultTableWidget::editable_column_identifier("[BROKEN"),
+            None
+        );
     }
 
     #[test]
@@ -8662,6 +8677,14 @@ mod row_edit_sql_tests {
         assert_eq!(
             ResultTableWidget::quote_qualified_identifier(r#""TABLE.WITH.DOT""#),
             r#""TABLE.WITH.DOT""#
+        );
+        assert_eq!(
+            ResultTableWidget::quote_qualified_identifier("[SCHEMA.WITH.DOT].[TABLE.WITH.DOT]"),
+            r#""SCHEMA.WITH.DOT"."TABLE.WITH.DOT""#
+        );
+        assert_eq!(
+            ResultTableWidget::quote_qualified_identifier("[TABLE]]WITH]]BRACKET]"),
+            r#""TABLE]WITH]BRACKET""#
         );
     }
 

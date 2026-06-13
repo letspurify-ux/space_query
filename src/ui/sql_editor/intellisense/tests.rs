@@ -1862,6 +1862,27 @@ WHERE d.loc = 'SEOUL';
 }
 
 #[test]
+fn bracket_quoted_alias_resolution_matches_bracket_qualified_reference() {
+    let deep_ctx = analyze_inline_cursor_sql("SELECT [Recent Emp].| FROM emp [Recent Emp]");
+
+    assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::SelectList);
+
+    let tables = SqlEditorWidget::resolve_column_tables_for_context(Some("[Recent Emp]"), &deep_ctx);
+    assert_eq!(tables, vec!["emp".to_string()]);
+}
+
+#[test]
+fn bracket_quoted_alias_resolution_unescapes_closing_brackets() {
+    let deep_ctx = analyze_inline_cursor_sql("SELECT [Recent]]Emp].| FROM emp [Recent]]Emp]");
+
+    assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::SelectList);
+
+    let tables =
+        SqlEditorWidget::resolve_column_tables_for_context(Some("[Recent]]Emp]"), &deep_ctx);
+    assert_eq!(tables, vec!["emp".to_string()]);
+}
+
+#[test]
 fn mysql_use_index_alias_resolution_survives_full_script_statement_slicing() {
     let script = "\
 SELECT 'warmup';
@@ -2087,6 +2108,30 @@ fn qualifier_before_word_supports_backtick_quoted_identifier() {
 }
 
 #[test]
+fn qualifier_before_word_supports_bracket_quoted_identifier() {
+    let sql_with_cursor = "SELECT [Recent Emp].| FROM emp [Recent Emp]";
+    let cursor = sql_with_cursor.find('|').unwrap_or(0);
+    let sql = sql_with_cursor.replace('|', "");
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor);
+    let raw_qualifier = SqlEditorWidget::raw_qualifier_before_word_in_text(&sql, cursor);
+
+    assert_eq!(qualifier.as_deref(), Some("Recent Emp"));
+    assert_eq!(raw_qualifier.as_deref(), Some("[Recent Emp]"));
+}
+
+#[test]
+fn qualifier_before_word_supports_escaped_bracket_quoted_identifier() {
+    let sql_with_cursor = "SELECT [Recent]]Emp].| FROM emp [Recent]]Emp]";
+    let cursor = sql_with_cursor.find('|').unwrap_or(0);
+    let sql = sql_with_cursor.replace('|', "");
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor);
+    let raw_qualifier = SqlEditorWidget::raw_qualifier_before_word_in_text(&sql, cursor);
+
+    assert_eq!(qualifier.as_deref(), Some("Recent]Emp"));
+    assert_eq!(raw_qualifier.as_deref(), Some("[Recent]]Emp]"));
+}
+
+#[test]
 fn qualifier_before_word_rejects_whitespace_between_dot_and_cursor() {
     let sql_with_cursor = "SELECT e.   | FROM emp e";
     let cursor = sql_with_cursor.find('|').unwrap_or(0);
@@ -2233,6 +2278,28 @@ fn object_context_reference_at_position_ignores_table_alias_declaration() {
 }
 
 #[test]
+fn object_context_reference_at_position_ignores_bracket_table_alias_declaration() {
+    let line = "SELECT * FROM all_objects [Recent Emp]";
+    let pos = line.find("[Recent Emp]").unwrap() + "[Recent ".len();
+
+    assert!(
+        SqlEditorWidget::object_context_reference_at_position_in_text(line, pos).is_none(),
+        "right-clicking bracket alias declaration should not create an object context candidate"
+    );
+}
+
+#[test]
+fn object_context_reference_at_position_ignores_escaped_bracket_table_alias_declaration() {
+    let line = "SELECT * FROM all_objects [Recent]]Emp]";
+    let pos = line.find("[Recent]]Emp]").unwrap() + "[Recent]]".len();
+
+    assert!(
+        SqlEditorWidget::object_context_reference_at_position_in_text(line, pos).is_none(),
+        "right-clicking escaped bracket alias declaration should not create an object context candidate"
+    );
+}
+
+#[test]
 fn object_context_reference_at_position_ignores_alias_qualifier() {
     let line = "SELECT a.object_id, b.object_id FROM all_objects a JOIN all_objects b ON b.object_id = a.object_id";
     let pos = line.find("a.object_id").unwrap();
@@ -2316,6 +2383,30 @@ fn identifier_at_position_supports_backtick_quoted_identifier() {
 }
 
 #[test]
+fn identifier_at_position_supports_bracket_quoted_identifier() {
+    let sql = "SELECT [사용자].[이름] FROM dual";
+    let cursor = sql.find("[이름]").unwrap_or(0) + "[이름]".len();
+
+    let (word, start, _end) = SqlEditorWidget::identifier_at_position_in_text(sql, cursor)
+        .expect("bracket-quoted identifier should be resolved at cursor");
+    assert_eq!(word, "이름");
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(sql, start);
+    assert_eq!(qualifier.as_deref(), Some("사용자"));
+}
+
+#[test]
+fn identifier_at_position_supports_escaped_bracket_quoted_identifier() {
+    let sql = "SELECT [사용자]].부서].[이름]]값] FROM dual";
+    let cursor = sql.find("[이름]]값]").unwrap_or(0) + "[이름]]값]".len();
+
+    let (word, start, _end) = SqlEditorWidget::identifier_at_position_in_text(sql, cursor)
+        .expect("escaped bracket-quoted identifier should be resolved at cursor");
+    assert_eq!(word, "이름]값");
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(sql, start);
+    assert_eq!(qualifier.as_deref(), Some("사용자].부서"));
+}
+
+#[test]
 fn qualifier_before_word_rejects_numeric_identifier_start() {
     let sql_with_cursor = "SELECT 1emp.| FROM emp";
     let cursor = sql_with_cursor.find('|').unwrap_or(0);
@@ -2382,6 +2473,22 @@ fn quick_describe_lookup_name_converts_backtick_parts_for_oracle_lookup() {
 }
 
 #[test]
+fn quick_describe_lookup_name_converts_bracket_parts_for_oracle_lookup() {
+    assert_eq!(
+        SqlEditorWidget::quick_describe_lookup_name("[Emp Table]", Some("[Sales Ops]"), Some("HR")),
+        r#""Sales Ops"."Emp Table""#
+    );
+}
+
+#[test]
+fn quick_describe_lookup_name_preserves_bracket_dotted_parts() {
+    assert_eq!(
+        SqlEditorWidget::quick_describe_lookup_name("[Emp.Table]", Some("[Sales.Ops]"), Some("HR")),
+        r#""Sales.Ops"."Emp.Table""#
+    );
+}
+
+#[test]
 fn quick_describe_lookup_name_unescapes_quoted_identifier_delimiters() {
     assert_eq!(
         SqlEditorWidget::quick_describe_lookup_name(
@@ -2398,6 +2505,14 @@ fn quick_describe_lookup_name_unescapes_quoted_identifier_delimiters() {
             Some("HR")
         ),
         r#""Sales`Ops"."Emp`Name""#
+    );
+    assert_eq!(
+        SqlEditorWidget::quick_describe_lookup_name(
+            "[Emp]]Name]",
+            Some("[Sales]]Ops]"),
+            Some("HR")
+        ),
+        r#""Sales]Ops"."Emp]Name""#
     );
 }
 
@@ -2417,6 +2532,14 @@ fn quick_describe_lookup_name_rejects_malformed_quoted_identifier() {
     );
     assert_eq!(
         SqlEditorWidget::quick_describe_lookup_name("emp", Some(r#"bad"schema"#), Some("HR")),
+        ""
+    );
+    assert_eq!(
+        SqlEditorWidget::quick_describe_lookup_name("[emp", None, Some("HR")),
+        ""
+    );
+    assert_eq!(
+        SqlEditorWidget::quick_describe_lookup_name("emp", Some("[bad.schema"), Some("HR")),
         ""
     );
 }
@@ -3161,6 +3284,15 @@ fn qualifier_before_word_rejects_unbalanced_backtick_quoted_identifier() {
 }
 
 #[test]
+fn qualifier_before_word_rejects_unbalanced_bracket_quoted_identifier() {
+    let sql_with_cursor = "SELECT [e.| FROM emp e";
+    let cursor = sql_with_cursor.find('|').unwrap_or(0);
+    let sql = sql_with_cursor.replace('|', "");
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor);
+    assert_eq!(qualifier, None);
+}
+
+#[test]
 fn identifier_at_position_rejects_unbalanced_quoted_identifier() {
     let sql = r#"SELECT "사용자 FROM dual"#;
     let cursor = sql.find("사용자").unwrap_or(0) + "사용자".len();
@@ -3181,6 +3313,18 @@ fn identifier_at_position_rejects_unbalanced_backtick_quoted_identifier() {
     assert!(
         resolved.is_none(),
         "unbalanced backtick-quoted identifier should not be resolved"
+    );
+}
+
+#[test]
+fn identifier_at_position_rejects_unbalanced_bracket_quoted_identifier() {
+    let sql = "SELECT [사용자 FROM dual";
+    let cursor = sql.find("사용자").unwrap_or(0) + "사용자".len();
+
+    let resolved = SqlEditorWidget::identifier_at_position_in_text(sql, cursor);
+    assert!(
+        resolved.is_none(),
+        "unbalanced bracket-quoted identifier should not be resolved"
     );
 }
 
@@ -3436,6 +3580,10 @@ fn fast_path_filter_accepts_identifier_quote_prefix_chars() {
         Key::from_char('`'),
         Some('`')
     ));
+    assert!(SqlEditorWidget::is_fast_filter_key(
+        Key::from_char('['),
+        Some('[')
+    ));
     assert!(SqlEditorWidget::is_cursor_within_completion_range(
         7,
         5,
@@ -3450,6 +3598,13 @@ fn fast_path_filter_accepts_identifier_quote_prefix_chars() {
         Key::from_char('`'),
         Some('`')
     ));
+    assert!(SqlEditorWidget::is_cursor_within_completion_range(
+        7,
+        5,
+        6,
+        Key::from_char('['),
+        Some('[')
+    ));
 }
 
 #[test]
@@ -3463,8 +3618,28 @@ fn fast_path_prefix_preserves_quoted_identifier_body() {
         "`Order I"
     );
     assert_eq!(
+        SqlEditorWidget::completion_prefix_from_range_text("[Order I"),
+        "[Order I"
+    );
+    assert_eq!(
         SqlEditorWidget::completion_prefix_from_range_text("Order I"),
         "OrderI"
+    );
+}
+
+#[test]
+fn condition_comparison_suffix_ignores_bracket_identifier_dots() {
+    assert_eq!(
+        SqlEditorWidget::condition_comparison_completion_suffix("[Order.Detail] = 1"),
+        None
+    );
+}
+
+#[test]
+fn condition_comparison_suffix_ignores_bracket_identifier_operators() {
+    assert_eq!(
+        SqlEditorWidget::condition_comparison_completion_suffix("[Odd = Name].status = 1"),
+        Some("status = 1".to_string())
     );
 }
 
@@ -3630,6 +3805,60 @@ fn request_table_columns_handles_backtick_quoted_schema_and_table_names() {
         .expect("backtick-quoted schema/table names should normalize before relation lookup");
     assert_eq!(update.table, "SCHEMA.TABLE.NAME");
     assert!(!update.cache_columns);
+}
+
+#[test]
+fn request_table_columns_handles_bracket_quoted_schema_and_table_names() {
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    {
+        let mut guard = lock_or_recover(&data);
+        guard.tables = vec!["SCHEMA.TABLE.NAME".to_string()];
+        guard.rebuild_indices();
+    }
+
+    let (sender, receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let _conn_guard = connection.lock().ok();
+
+    SqlEditorWidget::request_table_columns("[SCHEMA].[TABLE.NAME]", &data, &sender, &connection);
+
+    let update = receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("bracket-quoted schema/table names should normalize before relation lookup");
+    assert_eq!(update.table, "SCHEMA.TABLE.NAME");
+    assert!(!update.cache_columns);
+}
+
+#[test]
+fn column_load_schema_and_table_does_not_split_quoted_dotted_relation_name() {
+    assert_eq!(
+        SqlEditorWidget::column_load_schema_and_table(r#""SALES.OPS""#),
+        None
+    );
+    assert_eq!(
+        SqlEditorWidget::column_load_schema_and_table("`sales.ops`"),
+        None
+    );
+    assert_eq!(
+        SqlEditorWidget::column_load_schema_and_table("[sales.ops]"),
+        None
+    );
+}
+
+#[test]
+fn column_load_schema_and_table_splits_quoted_schema_and_table_boundary() {
+    assert_eq!(
+        SqlEditorWidget::column_load_schema_and_table(r#""SALES"."ORDER.ITEMS""#),
+        Some(("SALES".to_string(), "ORDER.ITEMS".to_string()))
+    );
+    assert_eq!(
+        SqlEditorWidget::column_load_schema_and_table("`sales`.`order.items`"),
+        Some(("sales".to_string(), "order.items".to_string()))
+    );
+    assert_eq!(
+        SqlEditorWidget::column_load_schema_and_table("[sales].[order.items]"),
+        Some(("sales".to_string(), "order.items".to_string()))
+    );
 }
 
 #[test]
@@ -3844,6 +4073,16 @@ fn resolve_table_column_load_key_uses_quote_aware_qualified_segment_boundary() {
 }
 
 #[test]
+fn resolve_table_column_load_key_uses_bracket_aware_qualified_segment_boundary() {
+    let mut data = IntellisenseData::new();
+    data.set_relation_members_for_qualifier("SCHEMA", vec!["TABLE.NAME".to_string()]);
+
+    let key = SqlEditorWidget::resolve_table_column_load_key(&data, "[SCHEMA].[TABLE.NAME]");
+
+    assert_eq!(key.as_deref(), Some("SCHEMA.TABLE.NAME"));
+}
+
+#[test]
 fn resolve_table_column_load_key_does_not_split_quoted_table_segment_for_qualifier() {
     let mut data = IntellisenseData::new();
     data.set_relation_members_for_qualifier("SCHEMA.TABLE", vec!["NAME".to_string()]);
@@ -3852,6 +4091,16 @@ fn resolve_table_column_load_key_does_not_split_quoted_table_segment_for_qualifi
         &data,
         r#""SCHEMA"."TABLE.NAME""#,
     );
+
+    assert_eq!(key, None);
+}
+
+#[test]
+fn resolve_table_column_load_key_does_not_split_bracket_table_segment_for_qualifier() {
+    let mut data = IntellisenseData::new();
+    data.set_relation_members_for_qualifier("SCHEMA.TABLE", vec!["NAME".to_string()]);
+
+    let key = SqlEditorWidget::resolve_table_column_load_key(&data, "[SCHEMA].[TABLE.NAME]");
 
     assert_eq!(key, None);
 }
@@ -4080,6 +4329,21 @@ fn collect_clause_wildcard_suggestions_match_quoted_alias_by_unquoted_prefix() {
 #[test]
 fn collect_clause_wildcard_suggestions_match_backtick_alias_by_unquoted_prefix() {
     let deep_ctx = analyze_inline_cursor_sql("SELECT | FROM emp `Recent Emp`");
+
+    assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::SelectList);
+
+    let suggestions = SqlEditorWidget::collect_clause_wildcard_suggestions(
+        "Recent",
+        None,
+        &deep_ctx,
+    );
+
+    assert_eq!(suggestions, vec![r#""Recent Emp".*"#.to_string()]);
+}
+
+#[test]
+fn collect_clause_wildcard_suggestions_match_bracket_alias_by_unquoted_prefix() {
+    let deep_ctx = analyze_inline_cursor_sql("SELECT | FROM emp [Recent Emp]");
 
     assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::SelectList);
 
@@ -4954,6 +5218,15 @@ END;"#,
     );
 
     assert_eq!(suggestions, vec![r#""Employee Name""#.to_string()]);
+}
+
+#[test]
+fn local_symbol_lookup_matches_incomplete_bracket_quoted_prefix() {
+    assert_eq!(SqlEditorWidget::local_identifier_lookup_upper("[Emp"), "EMP");
+    assert_eq!(
+        SqlEditorWidget::local_member_suggestion_lookup_upper("[Street"),
+        "STREET"
+    );
 }
 
 #[test]
@@ -6191,6 +6464,14 @@ END;"#;
     .expect("quoted record field should be matched by an incomplete quoted prefix");
 
     assert_eq!(suggestions, vec![r#""Street.Name""#.to_string()]);
+}
+
+#[test]
+fn local_record_member_raw_qualifier_segments_keep_bracket_dots() {
+    assert_eq!(
+        SqlEditorWidget::split_raw_qualifier_segments("[Schema.Name].[Address.Record]"),
+        vec!["[Schema.Name]", "[Address.Record]"]
+    );
 }
 
 #[test]
@@ -9150,6 +9431,54 @@ PIVOT (
 }
 
 #[test]
+fn pivot_clause_alias_qualified_column_suggestions_removes_aggregate_input_columns_named_order_by()
+{
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, "order", "by" FROM oqt_t_emp)
+PIVOT (
+  SUM("order" + "by") AS total_order
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    assert_has_case_insensitive(&suggestions, "deptno");
+    assert_has_case_insensitive(&suggestions, "clerk_total_order");
+    for unexpected in ["job", r#""order""#, r#""by""#] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT aggregate input named ORDER/BY should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
 fn pivot_clause_alias_qualified_column_suggestions_cast_type_name_keeps_grouping_column_named_number(
 ) {
     let sql_with_cursor = r#"
@@ -10342,6 +10671,54 @@ PIVOT (
                 .iter()
                 .all(|column| !column.eq_ignore_ascii_case(unexpected)),
             "PIVOT XMLFOREST output should not expose input column `{unexpected}`: {:?}",
+            suggestions
+        );
+    }
+}
+
+#[test]
+fn pivot_clause_alias_qualified_column_suggestions_xmlagg_order_by_removes_order_column() {
+    let sql_with_cursor = r#"
+SELECT
+  p.|
+FROM (SELECT deptno, job, payload_xml, sort_col, "order", "by" FROM oqt_t_emp)
+PIVOT (
+  COUNT(XMLAGG(XMLELEMENT(NAME item, payload_xml) ORDER BY sort_col)) AS xml_items
+  FOR job IN ('CLERK' AS clerk)
+) p
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+    let cursor_in_statement = cursor.saturating_sub(stmt_start);
+    let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("p"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["deptno", r#""order""#, r#""by""#, "clerk_xml_items"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    for unexpected in ["job", "payload_xml", "sort_col"] {
+        assert!(
+            suggestions
+                .iter()
+                .all(|column| !column.eq_ignore_ascii_case(unexpected)),
+            "PIVOT XMLAGG ORDER BY output should not expose input column `{unexpected}`: {:?}",
             suggestions
         );
     }
@@ -13531,6 +13908,67 @@ SELECT mr.| FROM mr
 }
 
 #[test]
+fn cte_explicit_column_list_completion_preserves_quoted_keyword_projection_aliases() {
+    let sql_with_cursor = r#"
+WITH q(id_alias, |) AS (
+  SELECT
+    empno AS id,
+    ename AS "order",
+    deptno AS "group"
+  FROM oqt_t_emp
+)
+SELECT * FROM q
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+
+    let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let cte = deep_ctx
+        .ctes
+        .iter()
+        .find(|cte| cte.name.eq_ignore_ascii_case("q"))
+        .expect("expected CTE q");
+    assert!(SqlEditorWidget::is_cursor_inside_cte_explicit_column_list(
+        &deep_ctx, cte
+    ));
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+
+    let (columns, _) = SqlEditorWidget::collect_cte_virtual_columns_for_completion(
+        &deep_ctx,
+        cte,
+        &HashMap::new(),
+        &data,
+        &sender,
+        &connection,
+    );
+
+    for expected in ["id", r#""order""#, r#""group""#] {
+        assert!(
+            columns.iter().any(|col| col.eq_ignore_ascii_case(expected)),
+            "expected `{expected}` in CTE explicit-column completion candidates: {:?}",
+            columns
+        );
+    }
+    assert!(
+        columns
+            .iter()
+            .all(|column| !column.eq_ignore_ascii_case("id_alias")),
+        "editing CTE explicit-column list should prefer body projection, got: {:?}",
+        columns
+    );
+}
+
+#[test]
 fn cte_virtual_columns_include_model_generated_columns() {
     let sql_with_cursor = r#"
 WITH md AS (
@@ -14215,6 +14653,119 @@ CROSS APPLY (
     for expected in ["order_id", "sku", "qty", "price", "line_amt"] {
         assert_has_case_insensitive(&suggestions, expected);
     }
+}
+
+#[test]
+fn json_table_alias_qualified_completion_includes_for_ordinality_columns() {
+    let sql_with_cursor = r#"
+SELECT
+  jt.|
+FROM oqt_t_json j
+CROSS JOIN JSON_TABLE(
+  j.payload,
+  '$'
+  COLUMNS (
+    order_id NUMBER PATH '$.order_id',
+    order_pos FOR ORDINALITY,
+    NESTED PATH '$.items[*]'
+    COLUMNS (
+      line_no FOR ORDINALITY,
+      sku VARCHAR2(30) PATH '$.sku'
+    )
+  )
+) jt
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+
+    let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("jt"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["order_id", "order_pos", "line_no", "sku"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn json_table_alias_qualified_completion_preserves_columns_named_like_options() {
+    let sql_with_cursor = r#"
+SELECT
+  jt.|
+FROM oqt_t_json j
+CROSS JOIN JSON_TABLE(
+  j.payload,
+  '$'
+  COLUMNS (
+    columns VARCHAR2(30) PATH '$.columns',
+    path VARCHAR2(30) PATH '$.path',
+    format VARCHAR2(30) PATH '$.format',
+    wrapper VARCHAR2(30) PATH '$.wrapper',
+    "on" VARCHAR2(30) PATH '$.on',
+    keep VARCHAR2(30) PATH '$.keep',
+    omit VARCHAR2(30) PATH '$.omit',
+    quotes VARCHAR2(30) PATH '$.quotes',
+    exists EXISTS PATH '$.exists',
+    payload nvarchar(max) '$.payload' AS JSON
+  )
+) jt
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+
+    let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("jt"), &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in [
+        "columns",
+        "path",
+        "format",
+        "wrapper",
+        r#""on""#,
+        "keep",
+        "omit",
+        "quotes",
+        "exists",
+        "payload",
+    ] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+    assert!(
+        suggestions
+            .iter()
+            .all(|column| !column.eq_ignore_ascii_case("VARCHAR2")),
+        "JSON_TABLE output should not expose datatype token as a column: {:?}",
+        suggestions
+    );
 }
 
 #[test]
@@ -14993,6 +15544,131 @@ CROSS APPLY OPENJSON(o.payload) WITH (
             .iter()
             .any(|column| column.eq_ignore_ascii_case("alias_item_id")),
         "alias-list completion should prefer OPENJSON output columns while editing: {:?}",
+        suggestions
+    );
+}
+
+#[test]
+fn openjson_alias_column_list_completion_preserves_bracket_quoted_with_columns() {
+    let sql_with_cursor = r#"
+SELECT *
+FROM orders o
+CROSS APPLY OPENJSON(o.payload) WITH (
+  [Item Id] int '$.itemId',
+  [order] nvarchar(20) '$.order',
+  plain_name nvarchar(30) '$.plain'
+) oj(alias_item_id, |)
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+
+    let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("", Some(&column_tables));
+
+    for expected in ["[Item Id]", "[order]", "plain_name"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn openjson_alias_column_list_completion_matches_bracket_quoted_columns_by_unquoted_prefix() {
+    let sql_with_cursor = r#"
+SELECT *
+FROM orders o
+CROSS APPLY OPENJSON(o.payload) WITH (
+  [Item Id] int '$.itemId',
+  [order] nvarchar(20) '$.order',
+  plain_name nvarchar(30) '$.plain'
+) oj(alias_item_id, |)
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+
+    let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("I", Some(&column_tables));
+
+    assert!(
+        suggestions.iter().any(|column| column == "[Item Id]"),
+        "expected bracket-quoted OPENJSON column to match unquoted prefix, got: {:?}",
+        suggestions
+    );
+    assert!(
+        suggestions.iter().all(|column| column != "[order]"),
+        "unrelated bracket-quoted OPENJSON column should not match prefix I: {:?}",
+        suggestions
+    );
+}
+
+#[test]
+fn openjson_alias_column_list_completion_preserves_escaped_bracket_quoted_with_columns() {
+    let sql_with_cursor = r#"
+SELECT *
+FROM orders o
+CROSS APPLY OPENJSON(o.payload) WITH (
+  [Item]]Id] int '$.itemId',
+  [order]]line] nvarchar(20) '$.order',
+  plain_name nvarchar(30) '$.plain'
+) oj(alias_item_id, |)
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+
+    let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    lock_or_recover(&data).replace_virtual_table_columns(virtual_table_columns);
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &deep_ctx);
+    let suggestions = lock_or_recover(&data).get_column_suggestions("Item]", Some(&column_tables));
+
+    assert!(
+        suggestions.iter().any(|column| column == "[Item]]Id]"),
+        "expected escaped bracket OPENJSON column to match unescaped prefix, got: {:?}",
+        suggestions
+    );
+    assert!(
+        suggestions.iter().all(|column| column != "[order]]line]"),
+        "unrelated escaped bracket OPENJSON column should not match prefix Item]: {:?}",
         suggestions
     );
 }
@@ -16000,6 +16676,48 @@ fn collect_common_column_suggestions_match_backtick_columns_by_unquoted_prefix()
 }
 
 #[test]
+fn collect_common_column_suggestions_match_bracket_columns_by_unquoted_prefix() {
+    let mut data = IntellisenseData::new();
+    data.set_columns_for_table(
+        "EMPLOYEES",
+        vec!["[Dept No]".to_string(), "[Emp No]".to_string()],
+    );
+    data.set_columns_for_table(
+        "DEPARTMENTS",
+        vec!["[Dept No]".to_string(), "[Dept Name]".to_string()],
+    );
+
+    let suggestions = SqlEditorWidget::collect_common_column_suggestions(
+        "Dept",
+        &["EMPLOYEES".to_string(), "DEPARTMENTS".to_string()],
+        &data,
+    );
+
+    assert_eq!(suggestions, vec!["[Dept No]".to_string()]);
+}
+
+#[test]
+fn collect_common_column_suggestions_dedups_bracket_quote_equivalent_columns() {
+    let mut data = IntellisenseData::new();
+    data.set_columns_for_table(
+        "EMPLOYEES",
+        vec!["[Dept]]No]".to_string(), r#""Dept]No""#.to_string()],
+    );
+    data.set_columns_for_table(
+        "DEPARTMENTS",
+        vec!["[Dept]]No]".to_string(), "`Dept]Name`".to_string()],
+    );
+
+    let suggestions = SqlEditorWidget::collect_common_column_suggestions(
+        "Dept]",
+        &["EMPLOYEES".to_string(), "DEPARTMENTS".to_string()],
+        &data,
+    );
+
+    assert_eq!(suggestions, vec!["[Dept]]No]".to_string()]);
+}
+
+#[test]
 fn collect_common_column_suggestions_dedups_quote_equivalent_columns_after_intersection() {
     let mut data = IntellisenseData::new();
     data.set_columns_for_table(
@@ -16152,6 +16870,35 @@ fn resolve_qualified_completion_mode_uses_quoted_schema_relation_members() {
     );
 
     assert_eq!(mode, Some(QualifiedCompletionMode::RelationMembers));
+}
+
+#[test]
+fn resolve_qualified_completion_mode_uses_quoted_dotted_schema_relation_members() {
+    let deep_ctx = analyze_inline_cursor_sql(r#"SELECT * FROM "SALES.OPS".|"#);
+    let mut data = IntellisenseData::new();
+    data.set_relation_members_for_qualifier(
+        "SALES.OPS",
+        vec!["ORDERS".to_string(), "ORDER_ITEMS".to_string()],
+    );
+
+    let mode = SqlEditorWidget::resolve_qualified_completion_mode(
+        r#""SALES.OPS""#,
+        SqlContext::TableName,
+        &deep_ctx,
+        &data,
+    );
+    let suggestions = SqlEditorWidget::expected_relation_member_suggestions_for_qualifier(
+        &mut data,
+        r#""SALES.OPS""#,
+        "ORDER",
+        &deep_ctx,
+    );
+
+    assert_eq!(mode, Some(QualifiedCompletionMode::RelationMembers));
+    assert_eq!(
+        suggestions,
+        vec!["ORDERS".to_string(), "ORDER_ITEMS".to_string()]
+    );
 }
 
 #[test]
@@ -16775,6 +17522,26 @@ fn completion_insert_text_does_not_treat_unspaced_equals_as_condition_comparison
 }
 
 #[test]
+fn auto_join_condition_prefix_matches_left_column_identifier() {
+    assert!(SqlEditorWidget::completion_suggestion_matches_prefix(
+        r#"e."Dept No" = d."Dept No""#,
+        "Dept"
+    ));
+    assert!(SqlEditorWidget::completion_suggestion_matches_prefix(
+        "e.[Item]]Id] = d.[Item]]Id]",
+        "Item]I"
+    ));
+    assert!(SqlEditorWidget::completion_suggestion_matches_prefix(
+        r#"e."Dept No" = d."Dept No""#,
+        "e."
+    ));
+    assert!(!SqlEditorWidget::completion_suggestion_matches_prefix(
+        r#"e."Dept No" = d."Dept No""#,
+        "Missing"
+    ));
+}
+
+#[test]
 fn completion_replacement_range_extends_zero_length_range_over_forward_identifier() {
     let sql_with_cursor = "SELECT * FROM tb1 a JOIN tb2 b ON a.|a";
     let cursor = sql_with_cursor
@@ -17029,6 +17796,39 @@ fn build_auto_join_condition_does_not_match_quoted_dotted_table_by_short_suffix(
 }
 
 #[test]
+fn build_auto_join_condition_does_not_match_bracket_dotted_table_by_short_suffix() {
+    use crate::ui::intellisense::ForeignKeyMeta;
+    use crate::ui::intellisense_context::ScopedTableRef;
+
+    let mut data = IntellisenseData::new();
+    data.set_foreign_keys_for_table(
+        "ORDERS",
+        vec![ForeignKeyMeta {
+            columns: vec!["DAILY_ID".to_string()],
+            ref_table: "[sales.daily]".to_string(),
+            ref_columns: vec!["ID".to_string()],
+        }],
+    );
+
+    let orders = ScopedTableRef {
+        name: "ORDERS".to_string(),
+        alias: Some("o".to_string()),
+        depth: 0,
+        is_cte: false,
+    };
+    let daily = ScopedTableRef {
+        name: "DAILY".to_string(),
+        alias: Some("d".to_string()),
+        depth: 0,
+        is_cte: false,
+    };
+
+    let condition = SqlEditorWidget::build_auto_join_condition(&data, &orders, &[&daily]);
+
+    assert_eq!(condition, None);
+}
+
+#[test]
 fn build_auto_join_condition_preserves_unaliased_quoted_dotted_table_qualifier() {
     use crate::ui::intellisense::ForeignKeyMeta;
     use crate::ui::intellisense_context::ScopedTableRef;
@@ -17057,6 +17857,42 @@ fn build_auto_join_condition_preserves_unaliased_quoted_dotted_table_qualifier()
     };
 
     let condition = SqlEditorWidget::build_auto_join_condition(&data, &orders, &[&quoted_daily]);
+
+    assert_eq!(
+        condition.as_deref(),
+        Some(r#"o.DAILY_ID = "sales.daily".ID"#)
+    );
+}
+
+#[test]
+fn build_auto_join_condition_preserves_unaliased_bracket_dotted_table_qualifier() {
+    use crate::ui::intellisense::ForeignKeyMeta;
+    use crate::ui::intellisense_context::ScopedTableRef;
+
+    let mut data = IntellisenseData::new();
+    data.set_foreign_keys_for_table(
+        "ORDERS",
+        vec![ForeignKeyMeta {
+            columns: vec!["DAILY_ID".to_string()],
+            ref_table: "[sales.daily]".to_string(),
+            ref_columns: vec!["ID".to_string()],
+        }],
+    );
+
+    let orders = ScopedTableRef {
+        name: "ORDERS".to_string(),
+        alias: Some("o".to_string()),
+        depth: 0,
+        is_cte: false,
+    };
+    let bracket_daily = ScopedTableRef {
+        name: "[sales.daily]".to_string(),
+        alias: None,
+        depth: 0,
+        is_cte: false,
+    };
+
+    let condition = SqlEditorWidget::build_auto_join_condition(&data, &orders, &[&bracket_daily]);
 
     assert_eq!(
         condition.as_deref(),

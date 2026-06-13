@@ -1740,6 +1740,7 @@ pub(crate) fn starts_with_keyword_token(text_upper: &str, keyword: &str) -> bool
 /// Supported delimiters:
 /// - `"` (ANSI SQL / Oracle quoted identifiers)
 /// - `` ` `` (MySQL / MariaDB quoted identifiers)
+/// - `[` ... `]` (SQL Server quoted identifiers)
 fn quoted_identifier_inner_is_well_formed(inner: &str, delimiter: char) -> bool {
     let mut chars = inner.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -1770,20 +1771,18 @@ pub(crate) fn quoted_identifier_delimiter(value: &str) -> Option<char> {
     let first = chars.next()?;
     let last = trimmed.chars().next_back()?;
 
-    if first != last || !matches!(first, '"' | '`') {
-        return None;
-    }
-
-    let delimiter_str = match first {
-        '"' => "\"",
-        '`' => "`",
+    let closing = match first {
+        '"' | '`' if first == last => first,
+        '[' if last == ']' => ']',
         _ => return None,
     };
+    let opening_str = first.to_string();
+    let closing_str = closing.to_string();
     let inner = trimmed
-        .strip_prefix(delimiter_str)
-        .and_then(|v| v.strip_suffix(delimiter_str))?;
+        .strip_prefix(opening_str.as_str())
+        .and_then(|v| v.strip_suffix(closing_str.as_str()))?;
 
-    quoted_identifier_inner_is_well_formed(inner, first).then_some(first)
+    quoted_identifier_inner_is_well_formed(inner, closing).then_some(first)
 }
 
 /// Returns true if `value` is wrapped as a quoted identifier.
@@ -1801,12 +1800,14 @@ pub(crate) fn strip_identifier_quotes(value: &str) -> String {
     let delimiter_str = match delimiter {
         '"' => "\"",
         '`' => "`",
+        '[' => "[",
         _ => return trimmed.to_string(),
     };
+    let closing_str = if delimiter == '[' { "]" } else { delimiter_str };
 
     let Some(inner) = trimmed
         .strip_prefix(delimiter_str)
-        .and_then(|v| v.strip_suffix(delimiter_str))
+        .and_then(|v| v.strip_suffix(closing_str))
     else {
         return trimmed.to_string();
     };
@@ -1814,6 +1815,7 @@ pub(crate) fn strip_identifier_quotes(value: &str) -> String {
     match delimiter {
         '"' => inner.replace("\"\"", "\""),
         '`' => inner.replace("``", "`"),
+        '[' => inner.replace("]]", "]"),
         _ => inner.to_string(),
     }
 }
@@ -8122,6 +8124,17 @@ mod tests {
         assert_eq!(strip_identifier_quotes(r#""Emp""Name""#), "Emp\"Name");
         assert_eq!(strip_identifier_quotes("`emp``name`"), "emp`name");
         assert_eq!(strip_identifier_quotes("  `emp name`  "), "emp name");
+    }
+
+    #[test]
+    fn quoted_identifier_helpers_support_sql_server_brackets() {
+        assert!(is_quoted_identifier("[Emp Name]"));
+        assert!(is_quoted_identifier("[Emp]]Name]"));
+        assert!(!is_quoted_identifier("[Emp]Name]"));
+        assert!(!is_quoted_identifier("[Emp Name"));
+        assert_eq!(strip_identifier_quotes("[Emp Name]"), "Emp Name");
+        assert_eq!(strip_identifier_quotes("[Emp]]Name]"), "Emp]Name");
+        assert_eq!(strip_identifier_quotes("  [Emp.Name]  "), "Emp.Name");
     }
 
     #[test]

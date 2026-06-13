@@ -7162,6 +7162,30 @@ fn dblink_json_table_keeps_left_relation_scope() {
 }
 
 #[test]
+fn relation_function_name_hint_preserves_dots_and_at_inside_quoted_identifier() {
+    assert_eq!(
+        relation_function_name_hint("SYS.JSON_TABLE").as_deref(),
+        Some("JSON_TABLE")
+    );
+    assert_eq!(
+        relation_function_name_hint("JSON_TABLE@REMDB").as_deref(),
+        Some("JSON_TABLE")
+    );
+    assert_eq!(
+        relation_function_name_hint(r#""SYS.JSON_TABLE""#).as_deref(),
+        Some("SYS.JSON_TABLE")
+    );
+    assert_eq!(
+        relation_function_name_hint("[SYS.JSON_TABLE]").as_deref(),
+        Some("SYS.JSON_TABLE")
+    );
+    assert_eq!(
+        relation_function_name_hint(r#""JSON_TABLE@REMDB""#).as_deref(),
+        Some("JSON_TABLE@REMDB")
+    );
+}
+
+#[test]
 fn extract_select_list_leading_qualifiers_reads_incomplete_references() {
     let tokens = tokenize("SELECT jt., jt., jt. FROM dual");
     let qualifiers = extract_select_list_leading_qualifiers(&tokens);
@@ -7817,6 +7841,17 @@ fn extract_oracle_pivot_projection_removes_aggregate_input_column_named_from() {
 }
 
 #[test]
+fn extract_oracle_pivot_projection_removes_aggregate_input_columns_named_order_by() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, \"order\", \"by\" FROM emp) \
+         PIVOT (SUM(\"order\" + \"by\") AS total_order FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "clerk_total_order"]);
+}
+
+#[test]
 fn extract_oracle_pivot_projection_cast_type_name_keeps_grouping_column_named_number() {
     let tokens = tokenize(
         "SELECT * FROM (SELECT deptno, job, sal, number FROM emp) \
@@ -8164,6 +8199,21 @@ fn extract_oracle_pivot_projection_xmlforest_alias_keeps_grouping_column_named_l
 
     let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
     assert_eq!(cols, vec!["deptno", "payload_doc", "clerk_xml_forest"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_xmlagg_order_by_removes_order_column() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT deptno, job, payload_xml, sort_col, \"order\", \"by\" FROM emp) \
+         PIVOT (COUNT(XMLAGG(XMLELEMENT(NAME item, payload_xml) ORDER BY sort_col)) AS xml_items \
+         FOR job IN ('CLERK' AS clerk))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(
+        cols,
+        vec!["deptno", r#""order""#, r#""by""#, "clerk_xml_items"]
+    );
 }
 
 #[test]
@@ -9245,6 +9295,78 @@ fn extract_table_function_columns_from_xmltable_columns_clause() {
     );
     let cols = extract_table_function_columns(&tokens);
     assert_eq!(cols, vec!["deptno", r#""Dept No""#, "name", "loc"]);
+}
+
+#[test]
+fn extract_table_function_columns_includes_for_ordinality_columns() {
+    let tokens = tokenize(
+        "j.payload, '$' COLUMNS ( \
+           order_id NUMBER PATH '$.order_id', \
+           order_pos FOR ORDINALITY, \
+           NESTED PATH '$.items[*]' COLUMNS ( \
+             line_no FOR ORDINALITY, \
+             sku VARCHAR2(30) PATH '$.sku' \
+           ) \
+         )",
+    );
+
+    let cols = extract_table_function_columns(&tokens);
+    assert_eq!(cols, vec!["order_id", "order_pos", "line_no", "sku"]);
+}
+
+#[test]
+fn extract_table_function_columns_preserves_columns_named_like_json_table_options() {
+    let tokens = tokenize(
+        "j.payload, '$' COLUMNS ( \
+           columns VARCHAR2(30) PATH '$.columns', \
+           path VARCHAR2(30) PATH '$.path', \
+           format VARCHAR2(30) PATH '$.format', \
+           wrapper VARCHAR2(30) PATH '$.wrapper', \
+           \"on\" VARCHAR2(30) PATH '$.on', \
+           keep VARCHAR2(30) PATH '$.keep', \
+           omit VARCHAR2(30) PATH '$.omit', \
+           quotes VARCHAR2(30) PATH '$.quotes', \
+           exists EXISTS PATH '$.exists', \
+           payload nvarchar(max) '$.payload' AS JSON \
+         )",
+    );
+
+    let cols = extract_table_function_columns(&tokens);
+    assert_eq!(
+        cols,
+        vec![
+            "columns", "path", "format", "wrapper", r#""on""#, "keep", "omit", "quotes", "exists",
+            "payload"
+        ]
+    );
+}
+
+#[test]
+fn extract_table_function_columns_preserves_sql_server_bracket_quoted_names() {
+    let tokens = tokenize(
+        "o.payload WITH ( \
+           [Item Id] int '$.itemId', \
+           [order] nvarchar(20) '$.order', \
+           plain_name nvarchar(30) '$.plain' \
+         )",
+    );
+
+    let cols = extract_table_function_columns(&tokens);
+    assert_eq!(cols, vec!["[Item Id]", "[order]", "plain_name"]);
+}
+
+#[test]
+fn extract_table_function_columns_preserves_sql_server_escaped_bracket_names() {
+    let tokens = tokenize(
+        "o.payload WITH ( \
+           [Item]]Id] int '$.itemId', \
+           [order]]line] nvarchar(20) '$.order', \
+           plain_name nvarchar(30) '$.plain' \
+         )",
+    );
+
+    let cols = extract_table_function_columns(&tokens);
+    assert_eq!(cols, vec!["[Item]]Id]", "[order]]line]", "plain_name"]);
 }
 
 #[test]

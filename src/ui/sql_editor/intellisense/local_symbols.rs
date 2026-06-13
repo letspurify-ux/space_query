@@ -515,7 +515,7 @@ impl SqlEditorWidget {
         let trimmed = member.trim();
         if sql_text::is_quoted_identifier(trimmed) {
             sql_text::strip_identifier_quotes(trimmed).to_ascii_uppercase()
-        } else if matches!(trimmed.chars().next(), Some('"') | Some('`')) {
+        } else if matches!(trimmed.chars().next(), Some('"') | Some('`') | Some('[')) {
             trimmed[1..].to_ascii_uppercase()
         } else {
             member.to_ascii_uppercase()
@@ -667,6 +667,7 @@ impl SqlEditorWidget {
 
             match ch {
                 '\'' | '"' | '`' => active_quote = Some(ch),
+                '[' => active_quote = Some(']'),
                 '(' => paren_depth = paren_depth.saturating_add(1),
                 ')' => paren_depth = paren_depth.saturating_sub(1),
                 '.' if paren_depth == 0 => {
@@ -3004,7 +3005,7 @@ impl SqlEditorWidget {
         let trimmed = identifier.trim();
         if sql_text::is_quoted_identifier(trimmed) {
             sql_text::strip_identifier_quotes(trimmed).to_ascii_uppercase()
-        } else if matches!(trimmed.chars().next(), Some('"') | Some('`')) {
+        } else if matches!(trimmed.chars().next(), Some('"') | Some('`') | Some('[')) {
             trimmed[1..].to_ascii_uppercase()
         } else {
             identifier.to_ascii_uppercase()

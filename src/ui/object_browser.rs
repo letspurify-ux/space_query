@@ -3041,15 +3041,46 @@ impl ObjectBrowserWidget {
     }
 
     fn quote_mysql_identifier_path(identifier: &str) -> String {
-        identifier
-            .split('.')
-            .filter_map(|segment| {
-                let trimmed = segment.trim().trim_matches('`');
-                if trimmed.is_empty() {
-                    None
+        let mut segments = Vec::new();
+        let mut start = 0usize;
+        let mut active_quote = false;
+        let trimmed = identifier.trim();
+        let mut chars = trimmed.char_indices().peekable();
+
+        while let Some((idx, ch)) = chars.next() {
+            if ch == '`' {
+                if active_quote {
+                    if chars.peek().is_some_and(|(_, next)| *next == '`') {
+                        chars.next();
+                    } else {
+                        active_quote = false;
+                    }
                 } else {
-                    Some(format!("`{}`", trimmed.replace('`', "``")))
+                    active_quote = true;
                 }
+                continue;
+            }
+            if ch == '.' && !active_quote {
+                if let Some(segment) = trimmed.get(start..idx) {
+                    segments.push(segment);
+                }
+                start = idx + ch.len_utf8();
+            }
+        }
+
+        if let Some(segment) = trimmed.get(start..) {
+            segments.push(segment);
+        }
+
+        segments
+            .into_iter()
+            .filter_map(|segment| {
+                let trimmed = segment.trim();
+                if trimmed.is_empty() {
+                    return None;
+                }
+                let unquoted = crate::sql_text::strip_identifier_quotes(trimmed);
+                Some(format!("`{}`", unquoted.replace('`', "``")))
             })
             .collect::<Vec<_>>()
             .join(".")
@@ -4515,6 +4546,8 @@ impl ObjectBrowserWidget {
 
             if matches!(ch, '"' | '`') {
                 active_quote = Some(ch);
+            } else if ch == '[' {
+                active_quote = Some(']');
             } else if ch == '.' {
                 parts.push(selected_text[start..idx].trim());
                 start = idx + ch.len_utf8();
@@ -4545,7 +4578,11 @@ impl ObjectBrowserWidget {
                 || part.contains('"')
                 || part.starts_with('`')
                 || part.ends_with('`')
-                || part.contains('`'))
+                || part.contains('`')
+                || part.starts_with('[')
+                || part.ends_with(']')
+                || part.contains('[')
+                || part.contains(']'))
         {
             return None;
         }
@@ -4804,6 +4841,8 @@ impl ObjectBrowserWidget {
     ) -> Option<(String, String)> {
         let cache = cache?;
         let owner_qualified_package = owner.map(|owner| format!("{owner}.{package_name}"));
+        let package_name_is_literal =
+            Self::selection_name_match(&cache.packages, package_name).is_some();
         cache
             .package_routines
             .iter()
@@ -4811,14 +4850,19 @@ impl ObjectBrowserWidget {
                 if let Some(owner_qualified_package) = owner_qualified_package.as_deref() {
                     cached_package.eq_ignore_ascii_case(owner_qualified_package)
                 } else {
+                    let cached_package_is_literal =
+                        Self::selection_name_match(&cache.packages, cached_package).is_some();
                     cached_package.eq_ignore_ascii_case(package_name)
-                        || package_name.rsplit('.').next().is_some_and(|short_name| {
-                            cached_package.eq_ignore_ascii_case(short_name)
-                        })
-                        || cached_package
-                            .rsplit('.')
-                            .next()
-                            .is_some_and(|short_name| short_name.eq_ignore_ascii_case(package_name))
+                        || (!package_name_is_literal
+                            && package_name.rsplit('.').next().is_some_and(|short_name| {
+                                short_name != package_name
+                                    && cached_package.eq_ignore_ascii_case(short_name)
+                            }))
+                        || (!cached_package_is_literal
+                            && cached_package.rsplit('.').next().is_some_and(|short_name| {
+                                short_name != cached_package.as_str()
+                                    && short_name.eq_ignore_ascii_case(package_name)
+                            }))
                 }
             })
             .and_then(|(_, routines)| {
@@ -7832,6 +7876,17 @@ mod tests {
     }
 
     #[test]
+    fn preview_select_sql_preserves_mysql_quoted_dotted_identifier_segments() {
+        let sql = ObjectBrowserWidget::preview_select_sql(
+            crate::db::DatabaseType::MySQL,
+            None,
+            "`sales.ops`.`order.items`",
+        );
+
+        assert_eq!(sql, "SELECT * FROM `sales.ops`.`order.items` LIMIT 100");
+    }
+
+    #[test]
     fn preview_select_sql_qualifies_oracle_object_name_with_selected_owner() {
         let sql = ObjectBrowserWidget::preview_select_sql(
             crate::db::DatabaseType::Oracle,
@@ -8315,12 +8370,20 @@ mod tests {
             Some(vec!["Sales.Ops".to_string(), "Emp.Table".to_string()])
         );
         assert_eq!(
+            ObjectBrowserWidget::selected_object_reference_parts("[Sales.Ops].[Emp.Table]"),
+            Some(vec!["Sales.Ops".to_string(), "Emp.Table".to_string()])
+        );
+        assert_eq!(
             ObjectBrowserWidget::selected_object_reference_parts(r#""Emp""Name""#),
             Some(vec!["Emp\"Name".to_string()])
         );
         assert_eq!(
             ObjectBrowserWidget::selected_object_reference_parts("`emp``name`"),
             Some(vec!["emp`name".to_string()])
+        );
+        assert_eq!(
+            ObjectBrowserWidget::selected_object_reference_parts("[Emp]]Name]"),
+            Some(vec!["Emp]Name".to_string()])
         );
         assert_eq!(
             ObjectBrowserWidget::selected_object_reference_parts(r#""Bad"Name""#),
@@ -8332,6 +8395,10 @@ mod tests {
         );
         assert_eq!(
             ObjectBrowserWidget::selected_object_reference_parts("bad`name"),
+            None
+        );
+        assert_eq!(
+            ObjectBrowserWidget::selected_object_reference_parts("[bad.name"),
             None
         );
         assert_eq!(
@@ -8828,6 +8895,95 @@ mod tests {
                 routine_type,
             } => {
                 assert_eq!(package_name, "DEMO_PKG");
+                assert_eq!(routine_name, "CALC");
+                assert_eq!(routine_type, "FUNCTION");
+            }
+            _ => panic!("expected package routine"),
+        }
+    }
+
+    #[test]
+    fn package_routine_cache_does_not_short_match_dotted_literal_package() {
+        let mut cache = ObjectCache {
+            packages: vec!["PKG".to_string(), "SALES.PKG".to_string()],
+            ..Default::default()
+        };
+        cache.package_routines.insert(
+            "SALES.PKG".to_string(),
+            vec![PackageRoutine {
+                name: "CALC".to_string(),
+                routine_type: "FUNCTION".to_string(),
+            }],
+        );
+
+        assert_eq!(
+            ObjectBrowserWidget::cached_package_routine_match(Some(&cache), None, "PKG", "CALC"),
+            None
+        );
+        assert_eq!(
+            ObjectBrowserWidget::cached_package_routine_match(
+                Some(&cache),
+                None,
+                "SALES.PKG",
+                "CALC"
+            ),
+            Some(("CALC".to_string(), "FUNCTION".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_sql_selection_does_not_reuse_dotted_literal_package_routine_type_for_short_name() {
+        let data = IntellisenseData::new();
+        let mut cache = ObjectCache {
+            packages: vec!["PKG".to_string(), "SALES.PKG".to_string()],
+            ..Default::default()
+        };
+        cache.package_routines.insert(
+            "SALES.PKG".to_string(),
+            vec![PackageRoutine {
+                name: "CALC".to_string(),
+                routine_type: "FUNCTION".to_string(),
+            }],
+        );
+
+        let resolved = ObjectBrowserWidget::resolve_selected_object_context(
+            "pkg.calc",
+            &data,
+            Some(&cache),
+            DatabaseType::Oracle,
+            None,
+        )
+        .expect("package routine should still resolve with unknown type");
+
+        match resolved.item {
+            ObjectItem::PackageRoutine {
+                package_name,
+                routine_name,
+                routine_type,
+            } => {
+                assert_eq!(package_name, "PKG");
+                assert_eq!(routine_name, "calc");
+                assert_eq!(routine_type, "UNKNOWN");
+            }
+            _ => panic!("expected package routine"),
+        }
+
+        let resolved = ObjectBrowserWidget::resolve_selected_object_context(
+            r#""SALES.PKG".calc"#,
+            &data,
+            Some(&cache),
+            DatabaseType::Oracle,
+            None,
+        )
+        .expect("quoted dotted package routine should resolve from exact cache entry");
+
+        match resolved.item {
+            ObjectItem::PackageRoutine {
+                package_name,
+                routine_name,
+                routine_type,
+            } => {
+                assert_eq!(package_name, "SALES.PKG");
                 assert_eq!(routine_name, "CALC");
                 assert_eq!(routine_type, "FUNCTION");
             }

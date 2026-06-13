@@ -164,6 +164,12 @@ pub(crate) fn tokenize_sql_with_mysql_compat(sql: &str, mysql_compatible: bool) 
 fn collect_local_alias_context_from_spans(spans: &[SqlTokenSpan]) -> LocalAliasContext {
     let mut context = LocalAliasContext::default();
     for idx in 0..spans.len() {
+        if let Some((alias, start, end)) = bracket_alias_declaration_at(spans, idx) {
+            context.names.insert(alias);
+            context.declaration_ranges.insert((start, end));
+            continue;
+        }
+
         if !span_is_word(&spans[idx]) || !span_is_alias_declaration(spans, idx) {
             continue;
         }
@@ -175,6 +181,94 @@ fn collect_local_alias_context_from_spans(spans: &[SqlTokenSpan]) -> LocalAliasC
         }
     }
     context
+}
+
+fn bracket_alias_declaration_at(
+    spans: &[SqlTokenSpan],
+    idx: usize,
+) -> Option<(String, usize, usize)> {
+    let (alias, end_idx) = bracket_identifier_at(spans, idx)?;
+    if !bracket_span_is_alias_declaration(spans, idx, end_idx) {
+        return None;
+    }
+    let start = spans.get(idx)?.start;
+    let end = spans.get(end_idx)?.end;
+    Some((alias.to_ascii_uppercase(), start, end))
+}
+
+fn bracket_identifier_at(spans: &[SqlTokenSpan], idx: usize) -> Option<(String, usize)> {
+    if !span_is_symbol(spans.get(idx), "[") {
+        return None;
+    }
+
+    let mut inner = String::new();
+    let mut cursor = idx + 1;
+    while cursor < spans.len() {
+        match spans.get(cursor).map(|span| &span.token)? {
+            SqlToken::Symbol(sym) if sym == "]" => {
+                if span_is_symbol(spans.get(cursor + 1), "]") {
+                    push_bracket_alias_part(&mut inner, "]", false);
+                    cursor += 2;
+                    continue;
+                }
+                if inner.is_empty() {
+                    return None;
+                }
+                return Some((inner, cursor));
+            }
+            SqlToken::Word(word) | SqlToken::String(word) => {
+                push_bracket_alias_part(&mut inner, word, true);
+            }
+            SqlToken::Symbol(symbol) => {
+                push_bracket_alias_part(&mut inner, symbol, false);
+            }
+            SqlToken::Comment(_) => {}
+        }
+        cursor += 1;
+    }
+
+    None
+}
+
+fn push_bracket_alias_part(inner: &mut String, part: &str, word_like: bool) {
+    if word_like
+        && !inner.is_empty()
+        && inner
+            .chars()
+            .next_back()
+            .is_some_and(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '$' | '#'))
+    {
+        inner.push(' ');
+    }
+    inner.push_str(part);
+}
+
+fn bracket_span_is_alias_declaration(
+    spans: &[SqlTokenSpan],
+    start_idx: usize,
+    end_idx: usize,
+) -> bool {
+    if let Some(as_idx) = previous_significant_idx(spans, start_idx)
+        .filter(|prev| span_word_upper(spans.get(*prev)).is_some_and(|word| word == "AS"))
+    {
+        if as_belongs_to_type_cast_clause(spans, as_idx) {
+            return false;
+        }
+        return next_significant_idx(spans, end_idx)
+            .map(|next| span_can_end_alias_declaration(&spans[next]))
+            .unwrap_or(true);
+    }
+
+    let Some(prev_idx) = previous_significant_idx(spans, start_idx) else {
+        return false;
+    };
+    if !span_before_alias_is_relation_reference(spans, prev_idx) {
+        return false;
+    }
+
+    next_significant_idx(spans, end_idx)
+        .map(|next| span_can_end_alias_declaration(&spans[next]))
+        .unwrap_or(true)
 }
 
 fn span_is_alias_declaration(spans: &[SqlTokenSpan], idx: usize) -> bool {
@@ -379,6 +473,8 @@ fn normalize_alias_lookup_name(word: &str) -> String {
     let trimmed = word.trim();
     let unquoted = if sql_text::is_quoted_identifier(trimmed) {
         sql_text::strip_identifier_quotes(trimmed)
+    } else if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() >= 2 {
+        trimmed[1..trimmed.len().saturating_sub(1)].replace("]]", "]")
     } else {
         trimmed.to_string()
     };
@@ -2375,6 +2471,30 @@ END$$"#;
 
         assert!(aliases.contains_name("if"));
         assert!(aliases.is_declaration_range(if_start, if_start + 2));
+    }
+
+    #[test]
+    fn local_alias_context_collects_bracket_relation_alias_declaration() {
+        let sql = "SELECT [Recent Emp].object_id FROM all_objects [Recent Emp]";
+        let aliases = collect_local_alias_context(sql);
+        let alias_start = sql.rfind("[Recent Emp]").unwrap();
+        let alias_end = alias_start + "[Recent Emp]".len();
+
+        assert!(aliases.contains_name("Recent Emp"));
+        assert!(aliases.contains_name("[Recent Emp]"));
+        assert!(aliases.is_declaration_range(alias_start, alias_end));
+    }
+
+    #[test]
+    fn local_alias_context_collects_escaped_bracket_relation_alias_declaration() {
+        let sql = "SELECT [Recent]]Emp].object_id FROM all_objects [Recent]]Emp]";
+        let aliases = collect_local_alias_context(sql);
+        let alias_start = sql.rfind("[Recent]]Emp]").unwrap();
+        let alias_end = alias_start + "[Recent]]Emp]".len();
+
+        assert!(aliases.contains_name("Recent]Emp"));
+        assert!(aliases.contains_name("[Recent]]Emp]"));
+        assert!(aliases.is_declaration_range(alias_start, alias_end));
     }
 
     #[test]
