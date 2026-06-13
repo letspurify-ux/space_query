@@ -175,6 +175,40 @@ impl SqlEditorWidget {
             return;
         }
 
+        if let Some(routine_cache) = runtime.routine_symbol_cache_covering_cursor(
+            snapshot.buffer_revision,
+            snapshot.cursor_pos_usize,
+        ) {
+            let cursor_in_statement = snapshot
+                .cursor_pos_usize
+                .saturating_sub(routine_cache.statement_start)
+                .min(
+                    routine_cache
+                        .statement_end
+                        .saturating_sub(routine_cache.statement_start),
+                );
+            let analysis = Arc::new(Self::build_intellisense_analysis_from_routine_cache(
+                &routine_cache,
+                cursor_in_statement,
+            ));
+            runtime.set_parse_cache(Some(IntellisenseParseCacheEntry {
+                buffer_revision: snapshot.buffer_revision,
+                cursor_pos: snapshot.cursor_pos,
+                analysis: analysis.clone(),
+            }));
+            Self::apply_intellisense_with_context(
+                editor,
+                intellisense_data,
+                intellisense_popup,
+                column_sender,
+                connection,
+                runtime,
+                snapshot.as_ref(),
+                analysis.as_ref(),
+            );
+            return;
+        }
+
         // Cache miss means full parse is pending on a worker.
         // Hide stale popup/completion state to avoid applying outdated candidates.
         Self::clear_intellisense_ui_state(intellisense_popup, runtime);
@@ -724,7 +758,6 @@ impl SqlEditorWidget {
                     | SqlContext::BindValue
                     | SqlContext::ColumnName
                     | SqlContext::ColumnOrAll
-                    | SqlContext::TableName
             ) {
             let mut data = intellisense_data
                 .lock()
@@ -733,6 +766,11 @@ impl SqlEditorWidget {
         } else {
             Vec::new()
         };
+        let replace_table_context_with_expected_objects =
+            qualifier.is_none()
+                && matches!(context, SqlContext::TableName)
+                && Self::expected_object_suggestion_kind(&snapshot.prefix, None, deep_ctx)
+                    .is_some();
 
         let allow_empty_prefix = qualifier.is_some()
             || include_columns
@@ -909,6 +947,8 @@ impl SqlEditorWidget {
             local_rowtype_member_suggestions
         } else if !qualified_member_suggestions.is_empty() {
             qualified_member_suggestions
+        } else if replace_table_context_with_expected_objects {
+            expected_object_suggestions.clone()
         } else {
             let mut data = intellisense_data
                 .lock()
@@ -938,7 +978,7 @@ impl SqlEditorWidget {
                 )
             }
         };
-        if !expected_object_suggestions.is_empty() {
+        if !expected_object_suggestions.is_empty() && !replace_table_context_with_expected_objects {
             suggestions = Self::merge_suggestions_with_context_aliases(
                 suggestions,
                 expected_object_suggestions,
@@ -1179,6 +1219,17 @@ impl SqlEditorWidget {
         deep_ctx: &intellisense_context::CursorContext,
         data: &IntellisenseData,
     ) -> Option<QualifiedCompletionMode> {
+        if let Some(kind) = Self::expected_object_suggestion_kind("", Some(qualifier), deep_ctx) {
+            if data.has_members_for_qualifier(qualifier, false) {
+                return Some(QualifiedCompletionMode::ObjectMembers);
+            }
+            if Self::expected_qualifier_member_kinds(kind).is_some()
+                && data.has_members_for_qualifier(qualifier, true)
+            {
+                return Some(QualifiedCompletionMode::RelationMembers);
+            }
+        }
+
         if matches!(context, SqlContext::TableName)
             && data.has_members_for_qualifier(qualifier, true)
         {
@@ -1254,6 +1305,53 @@ impl SqlEditorWidget {
         suggestions
     }
 
+    fn is_create_synonym_target_context(words: &[String]) -> bool {
+        if words.last().is_none_or(|word| word != "FOR") {
+            return false;
+        }
+
+        let Some(synonym_idx) = words.iter().rposition(|word| word == "SYNONYM") else {
+            return false;
+        };
+        words
+            .get(..synonym_idx)
+            .is_some_and(|prefix| prefix.iter().any(|word| word == "CREATE"))
+    }
+
+    fn is_create_synonym_name_written_context(words: &[String]) -> bool {
+        if words.last().is_none_or(|word| word == "SYNONYM" || word == "PUBLIC") {
+            return false;
+        }
+        if words.iter().any(|word| word == "FOR") {
+            return false;
+        }
+
+        let Some(synonym_idx) = words.iter().rposition(|word| word == "SYNONYM") else {
+            return false;
+        };
+        words.len() > synonym_idx + 1
+            && words
+                .get(..synonym_idx)
+                .is_some_and(|prefix| prefix.iter().any(|word| word == "CREATE"))
+    }
+
+    fn is_create_on_table_target_context(words: &[String]) -> bool {
+        if words.last().is_none_or(|word| word != "ON") {
+            return false;
+        }
+
+        let Some(create_idx) = words.iter().rposition(|word| word == "CREATE") else {
+            return false;
+        };
+        words
+            .get(create_idx + 1..words.len().saturating_sub(1))
+            .is_some_and(|middle| {
+                middle
+                    .iter()
+                    .any(|word| matches!(word.as_str(), "INDEX" | "TRIGGER"))
+            })
+    }
+
     fn completion_suggestion_matches_prefix(suggestion: &str, prefix: &str) -> bool {
         prefix.is_empty()
             || crate::ui::intellisense::suggestion_matches_completion_prefix(suggestion, prefix)
@@ -1281,6 +1379,21 @@ impl SqlEditorWidget {
             "SYNONYM",
             "USER",
             "PUBLIC",
+        ];
+        const ALTER_OBJECT_TYPE_KEYWORDS: &[&str] = &[
+            "TABLE",
+            "VIEW",
+            "MATERIALIZED",
+            "TYPE",
+            "TRIGGER",
+            "INDEX",
+            "PROCEDURE",
+            "FUNCTION",
+            "PACKAGE",
+            "SEQUENCE",
+            "SYNONYM",
+            "USER",
+            "SESSION",
         ];
         const CREATE_OBJECT_TYPE_KEYWORDS: &[&str] = &[
             "TABLE",
@@ -1311,6 +1424,7 @@ impl SqlEditorWidget {
 
         let candidates: &[&str] = match words.as_slice() {
             [] => TOP_LEVEL_KEYWORDS,
+            _ if Self::is_create_synonym_name_written_context(&words) => &["FOR"],
             [.., last] if *last == "ORDER" || *last == "GROUP" || *last == "CONNECT" => &["BY"],
             [.., last] if *last == "START" => &["WITH"],
             [.., last] if *last == "DELETE" => &["FROM"],
@@ -1327,7 +1441,15 @@ impl SqlEditorWidget {
                 &["SELECT", "ALL"]
             }
             [.., last] if *last == "CREATE" => CREATE_OBJECT_TYPE_KEYWORDS,
-            [.., last] if *last == "DROP" || *last == "ALTER" => OBJECT_TYPE_KEYWORDS,
+            [.., last] if *last == "DROP" => OBJECT_TYPE_KEYWORDS,
+            [.., last] if *last == "ALTER" => ALTER_OBJECT_TYPE_KEYWORDS,
+            [.., prev, last] if *prev == "CREATE" && matches!(last.as_str(), "UNIQUE" | "BITMAP") => {
+                &["INDEX"]
+            }
+            [.., prev, last] if *prev == "CREATE" && *last == "GLOBAL" => &["TEMPORARY"],
+            [.., a, b, c] if *a == "CREATE" && *b == "GLOBAL" && *c == "TEMPORARY" => {
+                &["TABLE"]
+            }
             [.., prev, last]
                 if matches!(prev.as_str(), "CREATE" | "DROP" | "ALTER" | "ON")
                     && *last == "MATERIALIZED" =>
@@ -1356,6 +1478,11 @@ impl SqlEditorWidget {
             }
             [.., prev, last] if *prev == "DROP" && *last == "PUBLIC" => &["SYNONYM"],
             [.., prev, last] if *prev == "CREATE" && *last == "PUBLIC" => &["SYNONYM"],
+            [.., a, b, c, d]
+                if *a == "CREATE" && *b == "OR" && *c == "REPLACE" && *d == "PUBLIC" =>
+            {
+                &["SYNONYM"]
+            }
             [.., prev, last] if *prev == "COMMENT" && *last == "ON" => {
                 COMMENT_OBJECT_TYPE_KEYWORDS
             }
@@ -1364,6 +1491,18 @@ impl SqlEditorWidget {
             }
             [.., last] if *last == "TRUNCATE" || *last == "LOCK" || *last == "FLASHBACK" => {
                 &["TABLE"]
+            }
+            [.., last]
+                if matches!(
+                    last.as_str(),
+                    "ANALYZE" | "OPTIMIZE" | "CHECK" | "REPAIR"
+                ) =>
+            {
+                &["TABLE"]
+            }
+            [.., prev, last] if *prev == "ALTER" && *last == "SESSION" => &["SET"],
+            [.., a, b, c] if *a == "ALTER" && *b == "SESSION" && *c == "SET" => {
+                &["CURRENT_SCHEMA"]
             }
             [.., last] if *last == "COMMENT" => &["ON"],
             [.., last] if *last == "EXECUTE" => &["IMMEDIATE"],
@@ -1402,6 +1541,12 @@ impl SqlEditorWidget {
         if let Some(kind) = Self::expected_grant_revoke_object_suggestion_kind(&words) {
             return Some(kind);
         }
+        if Self::is_create_synonym_target_context(&words) {
+            return Some(ExpectedObjectSuggestionKind::Any);
+        }
+        if Self::is_create_on_table_target_context(&words) {
+            return Some(ExpectedObjectSuggestionKind::Table);
+        }
 
         match words.as_slice() {
             [.., last] if matches!(last.as_str(), "CALL" | "EXEC" | "EXECUTE") => {
@@ -1410,10 +1555,19 @@ impl SqlEditorWidget {
             [.., last] if matches!(last.as_str(), "DESC" | "DESCRIBE") => {
                 Some(ExpectedObjectSuggestionKind::Any)
             }
+            [.., last] if *last == "REFERENCES" => Some(ExpectedObjectSuggestionKind::Table),
             [.., prev, last]
                 if matches!(
                     prev.as_str(),
-                    "ALTER" | "DROP" | "TRUNCATE" | "FLASHBACK" | "LOCK"
+                    "ALTER"
+                        | "DROP"
+                        | "TRUNCATE"
+                        | "FLASHBACK"
+                        | "LOCK"
+                        | "ANALYZE"
+                        | "OPTIMIZE"
+                        | "CHECK"
+                        | "REPAIR"
                 ) && *last == "TABLE" =>
             {
                 Some(ExpectedObjectSuggestionKind::Table)
@@ -1764,24 +1918,37 @@ impl SqlEditorWidget {
         }
 
         let mut filtered = Vec::new();
+        let mut saw_kind_metadata = false;
         let mut seen = HashSet::new();
-        for suggestion in suggestions {
+        for suggestion in &suggestions {
+            if let Some(expected_kinds) = Self::expected_qualifier_member_kinds(kind) {
+                if data
+                    .qualifier_member_matches_kinds(qualifier, suggestion, expected_kinds)
+                    .is_some()
+                {
+                    saw_kind_metadata = true;
+                }
+            }
             if !Self::suggestion_matches_expected_object_kind_for_qualifier(
                 data,
                 qualifier,
-                &suggestion,
+                suggestion,
                 kind,
             ) {
                 continue;
             }
             if seen.insert(Self::completion_identifier_lookup_upper(&suggestion)) {
-                filtered.push(suggestion);
+                filtered.push(suggestion.clone());
             }
             if filtered.len() >= MAX_MERGED_SUGGESTIONS {
                 break;
             }
         }
-        filtered
+        if filtered.is_empty() && !saw_kind_metadata {
+            suggestions
+        } else {
+            filtered
+        }
     }
 
     fn expected_relation_member_suggestions_for_qualifier(
@@ -1795,6 +1962,14 @@ impl SqlEditorWidget {
         else {
             return suggestions;
         };
+        if matches!(kind, ExpectedObjectSuggestionKind::Any) {
+            let all_suggestions = data.get_member_suggestions(qualifier, prefix, false);
+            return if all_suggestions.is_empty() {
+                suggestions
+            } else {
+                all_suggestions
+            };
+        }
         let Some(expected_kinds) = Self::expected_qualifier_member_kinds(kind) else {
             return suggestions;
         };
@@ -1833,6 +2008,17 @@ impl SqlEditorWidget {
             Some(kind) => Self::collect_expected_object_suggestions_for_kind(data, prefix, kind),
             None => Vec::new(),
         }
+    }
+
+    fn table_context_expected_object_suggestions(
+        data: &mut IntellisenseData,
+        prefix: &str,
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> Option<Vec<String>> {
+        let kind = Self::expected_object_suggestion_kind(prefix, None, deep_ctx)?;
+        Some(Self::collect_expected_object_suggestions_for_kind(
+            data, prefix, kind,
+        ))
     }
 
     fn expand_virtual_table_wildcards(

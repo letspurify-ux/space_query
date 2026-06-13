@@ -173,6 +173,24 @@ impl IntellisenseRuntimeState {
         }
     }
 
+    pub(crate) fn routine_symbol_cache_covering_cursor(
+        &self,
+        buffer_revision: u64,
+        cursor_pos: usize,
+    ) -> Option<RoutineSymbolCacheEntry> {
+        self.routine_symbol_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .rev()
+            .find(|entry| {
+                entry.buffer_revision == buffer_revision
+                    && cursor_pos >= entry.statement_start
+                    && cursor_pos <= entry.statement_end
+            })
+            .cloned()
+    }
+
     pub(crate) fn clear_routine_symbol_cache(&self) {
         self.routine_symbol_cache
             .lock()

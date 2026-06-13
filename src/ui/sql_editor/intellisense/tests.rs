@@ -7671,6 +7671,58 @@ fn large_routine_cache_analysis_keeps_far_declarations_visible() {
 }
 
 #[test]
+fn routine_symbol_cache_reanalyzes_cursor_context_inside_cached_statement() {
+    let mut sql = String::from("SELECT e.");
+    let select_cursor = sql.len();
+    sql.push_str("ename FROM emp e WHERE ");
+    let where_cursor = sql.len();
+    sql.push_str("e.deptno = 10;\nSELECT * FROM dept");
+    let other_statement_cursor = sql.rfind("dept").expect("second statement should exist");
+
+    let (routine_cache, _expanded) =
+        SqlEditorWidget::build_routine_symbol_cache_bundle_for_test(&sql, select_cursor);
+    let runtime = IntellisenseRuntimeState::new();
+    runtime.set_routine_symbol_cache(routine_cache);
+
+    let select_cache = runtime
+        .routine_symbol_cache_covering_cursor(0, select_cursor)
+        .expect("same-statement select-list cursor should reuse routine cache");
+    let select_analysis = SqlEditorWidget::build_intellisense_analysis_from_routine_cache(
+        &select_cache,
+        select_cursor.saturating_sub(select_cache.statement_start),
+    );
+    assert_eq!(
+        select_analysis.context.phase,
+        intellisense_context::SqlPhase::SelectList
+    );
+
+    let where_cache = runtime
+        .routine_symbol_cache_covering_cursor(0, where_cursor)
+        .expect("same-statement where cursor should reuse routine cache");
+    let where_analysis = SqlEditorWidget::build_intellisense_analysis_from_routine_cache(
+        &where_cache,
+        where_cursor.saturating_sub(where_cache.statement_start),
+    );
+    assert_eq!(
+        where_analysis.context.phase,
+        intellisense_context::SqlPhase::WhereClause
+    );
+
+    assert!(
+        runtime
+            .routine_symbol_cache_covering_cursor(0, other_statement_cursor)
+            .is_none(),
+        "routine cache must not be reused across statement boundaries"
+    );
+    assert!(
+        runtime
+            .routine_symbol_cache_covering_cursor(1, where_cursor)
+            .is_none(),
+        "routine cache must not be reused across buffer revisions"
+    );
+}
+
+#[test]
 fn xmltable_alias_qualified_column_suggestions_include_columns_clause_names() {
     let sql_with_cursor = r#"
 SELECT
@@ -16956,6 +17008,75 @@ fn resolve_qualified_completion_mode_uses_schema_members_for_oracle_object_ddl_c
 }
 
 #[test]
+fn schema_object_context_prefers_all_members_when_relation_cache_also_exists() {
+    let grant_execute_ctx = analyze_inline_cursor_sql("GRANT EXECUTE ON scott.|");
+    let grant_select_ctx = analyze_inline_cursor_sql("GRANT SELECT ON scott.|");
+    let mut data = IntellisenseData::new();
+    data.set_members_for_qualifier_with_kinds(
+        "SCOTT",
+        vec![
+            ("EMP".to_string(), Some(QualifiedMemberKind::Table)),
+            ("EMP_VIEW".to_string(), Some(QualifiedMemberKind::View)),
+            ("EMP_SEQ".to_string(), Some(QualifiedMemberKind::Sequence)),
+            ("RUN_JOB".to_string(), Some(QualifiedMemberKind::Procedure)),
+            ("UTIL_PKG".to_string(), Some(QualifiedMemberKind::Package)),
+            ("ADDRESS_T".to_string(), Some(QualifiedMemberKind::Type)),
+        ],
+    );
+    data.set_relation_members_for_qualifier(
+        "SCOTT",
+        vec!["EMP".to_string(), "EMP_VIEW".to_string()],
+    );
+
+    let execute_mode = SqlEditorWidget::resolve_qualified_completion_mode(
+        "scott",
+        SqlContext::TableName,
+        &grant_execute_ctx,
+        &data,
+    );
+    assert_eq!(
+        execute_mode,
+        Some(QualifiedCompletionMode::ObjectMembers)
+    );
+    let execute_suggestions = SqlEditorWidget::expected_member_suggestions_for_qualifier(
+        &mut data,
+        "scott",
+        "",
+        &grant_execute_ctx,
+    );
+    assert_eq!(
+        execute_suggestions,
+        vec![
+            "ADDRESS_T".to_string(),
+            "RUN_JOB".to_string(),
+            "UTIL_PKG".to_string(),
+        ]
+    );
+
+    let select_mode = SqlEditorWidget::resolve_qualified_completion_mode(
+        "scott",
+        SqlContext::TableName,
+        &grant_select_ctx,
+        &data,
+    );
+    assert_eq!(select_mode, Some(QualifiedCompletionMode::ObjectMembers));
+    let select_suggestions = SqlEditorWidget::expected_member_suggestions_for_qualifier(
+        &mut data,
+        "scott",
+        "",
+        &grant_select_ctx,
+    );
+    assert_eq!(
+        select_suggestions,
+        vec![
+            "EMP".to_string(),
+            "EMP_SEQ".to_string(),
+            "EMP_VIEW".to_string(),
+        ]
+    );
+}
+
+#[test]
 fn collect_expected_keyword_suggestions_complete_common_clause_tails() {
     let order_ctx = analyze_inline_cursor_sql("SELECT * FROM emp ORDER |");
     let when_ctx = analyze_inline_cursor_sql(
@@ -16981,6 +17102,20 @@ fn collect_expected_keyword_suggestions_include_ddl_object_type_tokens() {
     let create_editioning_ctx = analyze_inline_cursor_sql("CREATE EDITIONING |");
     let drop_public_ctx = analyze_inline_cursor_sql("DROP PUBLIC |");
     let drop_package_body_ctx = analyze_inline_cursor_sql("DROP PACKAGE B|");
+    let create_unique_ctx = analyze_inline_cursor_sql("CREATE UNIQUE |");
+    let create_bitmap_ctx = analyze_inline_cursor_sql("CREATE BITMAP |");
+    let create_global_ctx = analyze_inline_cursor_sql("CREATE GLOBAL |");
+    let create_global_temporary_ctx = analyze_inline_cursor_sql("CREATE GLOBAL TEMPORARY |");
+    let create_public_ctx = analyze_inline_cursor_sql("CREATE PUBLIC |");
+    let create_or_replace_public_ctx = analyze_inline_cursor_sql("CREATE OR REPLACE PUBLIC |");
+    let alter_ctx = analyze_inline_cursor_sql("ALTER |");
+    let alter_session_ctx = analyze_inline_cursor_sql("ALTER SESSION |");
+    let alter_session_set_ctx = analyze_inline_cursor_sql("ALTER SESSION SET |");
+    let analyze_ctx = analyze_inline_cursor_sql("ANALYZE |");
+    let optimize_ctx = analyze_inline_cursor_sql("OPTIMIZE |");
+    let check_ctx = analyze_inline_cursor_sql("CHECK |");
+    let repair_ctx = analyze_inline_cursor_sql("REPAIR |");
+    let create_synonym_name_ctx = analyze_inline_cursor_sql("CREATE SYNONYM emp_syn |");
 
     let create_suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &create_ctx);
     let create_or_replace_suggestions =
@@ -16998,6 +17133,31 @@ fn collect_expected_keyword_suggestions_include_ddl_object_type_tokens() {
         SqlEditorWidget::collect_expected_keyword_suggestions("", &drop_public_ctx);
     let drop_package_body_suggestions =
         SqlEditorWidget::collect_expected_keyword_suggestions("B", &drop_package_body_ctx);
+    let create_unique_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_unique_ctx);
+    let create_bitmap_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_bitmap_ctx);
+    let create_global_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_global_ctx);
+    let create_global_temporary_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_global_temporary_ctx);
+    let create_public_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_public_ctx);
+    let create_or_replace_public_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_or_replace_public_ctx);
+    let alter_suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_ctx);
+    let alter_session_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_session_ctx);
+    let alter_session_set_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_session_set_ctx);
+    let analyze_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &analyze_ctx);
+    let optimize_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &optimize_ctx);
+    let check_suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &check_ctx);
+    let repair_suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &repair_ctx);
+    let create_synonym_name_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_synonym_name_ctx);
 
     assert!(create_suggestions.iter().any(|value| value == "EDITIONING"));
     assert!(create_or_replace_suggestions.iter().any(|value| value == "INDEX"));
@@ -17019,6 +17179,29 @@ fn collect_expected_keyword_suggestions_include_ddl_object_type_tokens() {
     assert_eq!(create_editioning_suggestions, vec!["VIEW".to_string()]);
     assert_eq!(drop_public_suggestions, vec!["SYNONYM".to_string()]);
     assert_eq!(drop_package_body_suggestions, vec!["BODY".to_string()]);
+    assert_eq!(create_unique_suggestions, vec!["INDEX".to_string()]);
+    assert_eq!(create_bitmap_suggestions, vec!["INDEX".to_string()]);
+    assert_eq!(create_global_suggestions, vec!["TEMPORARY".to_string()]);
+    assert_eq!(
+        create_global_temporary_suggestions,
+        vec!["TABLE".to_string()]
+    );
+    assert_eq!(create_public_suggestions, vec!["SYNONYM".to_string()]);
+    assert_eq!(
+        create_or_replace_public_suggestions,
+        vec!["SYNONYM".to_string()]
+    );
+    assert!(alter_suggestions.iter().any(|value| value == "SESSION"));
+    assert_eq!(alter_session_suggestions, vec!["SET".to_string()]);
+    assert_eq!(
+        alter_session_set_suggestions,
+        vec!["CURRENT_SCHEMA".to_string()]
+    );
+    assert_eq!(analyze_suggestions, vec!["TABLE".to_string()]);
+    assert_eq!(optimize_suggestions, vec!["TABLE".to_string()]);
+    assert_eq!(check_suggestions, vec!["TABLE".to_string()]);
+    assert_eq!(repair_suggestions, vec!["TABLE".to_string()]);
+    assert_eq!(create_synonym_name_suggestions, vec!["FOR".to_string()]);
 }
 
 #[test]
@@ -17040,6 +17223,68 @@ fn collect_expected_object_suggestions_prefer_routines_for_call_context() {
     assert!(call_suggestions.iter().any(|value| value == "UTIL_PKG"));
     assert!(!call_suggestions.iter().any(|value| value == "EMP"));
     assert!(describe_suggestions.iter().any(|value| value == "EMP"));
+}
+
+#[test]
+fn collect_expected_object_suggestions_for_create_synonym_target() {
+    let synonym_ctx = analyze_inline_cursor_sql("CREATE SYNONYM emp_syn FOR |");
+    let public_synonym_ctx = analyze_inline_cursor_sql("CREATE PUBLIC SYNONYM emp_syn FOR |");
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["EMP".to_string()];
+    data.views = vec!["EMP_VIEW".to_string()];
+    data.sequences = vec!["EMP_SEQ".to_string()];
+    data.packages = vec!["EMP_API".to_string()];
+    data.rebuild_indices();
+
+    let synonym_suggestions =
+        SqlEditorWidget::collect_expected_object_suggestions(&mut data, "", &synonym_ctx);
+    let public_synonym_suggestions =
+        SqlEditorWidget::collect_expected_object_suggestions(&mut data, "", &public_synonym_ctx);
+
+    for suggestions in [&synonym_suggestions, &public_synonym_suggestions] {
+        assert!(suggestions.iter().any(|value| value == "EMP"));
+        assert!(suggestions.iter().any(|value| value == "EMP_VIEW"));
+        assert!(suggestions.iter().any(|value| value == "EMP_SEQ"));
+        assert!(suggestions.iter().any(|value| value == "EMP_API"));
+    }
+}
+
+#[test]
+fn schema_member_suggestions_for_create_synonym_target_include_all_object_kinds() {
+    let synonym_ctx = analyze_inline_cursor_sql("CREATE SYNONYM emp_syn FOR scott.|");
+    let mut data = IntellisenseData::new();
+    data.set_members_for_qualifier_with_kinds(
+        "SCOTT",
+        vec![
+            ("EMP".to_string(), Some(QualifiedMemberKind::Table)),
+            ("EMP_VIEW".to_string(), Some(QualifiedMemberKind::View)),
+            ("EMP_SEQ".to_string(), Some(QualifiedMemberKind::Sequence)),
+            ("EMP_API".to_string(), Some(QualifiedMemberKind::Package)),
+            ("EMP_T".to_string(), Some(QualifiedMemberKind::Type)),
+        ],
+    );
+    data.set_relation_members_for_qualifier(
+        "SCOTT",
+        vec!["EMP".to_string(), "EMP_VIEW".to_string()],
+    );
+
+    let suggestions = SqlEditorWidget::expected_relation_member_suggestions_for_qualifier(
+        &mut data,
+        "scott",
+        "",
+        &synonym_ctx,
+    );
+
+    assert_eq!(
+        suggestions,
+        vec![
+            "EMP".to_string(),
+            "EMP_API".to_string(),
+            "EMP_SEQ".to_string(),
+            "EMP_T".to_string(),
+            "EMP_VIEW".to_string(),
+        ]
+    );
 }
 
 #[test]
@@ -17137,6 +17382,41 @@ fn collect_expected_object_suggestions_filter_by_object_type_and_include_users()
 }
 
 #[test]
+fn table_context_expected_object_suggestions_filter_maintenance_table_targets() {
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["EMP".to_string()];
+    data.views = vec!["EMP_VIEW".to_string()];
+    data.materialized_views = vec!["EMP_MV".to_string()];
+    data.packages = vec!["EMP_API".to_string()];
+    data.rebuild_indices();
+
+    for sql in [
+        "ANALYZE TABLE |",
+        "OPTIMIZE TABLE |",
+        "CHECK TABLE |",
+        "REPAIR TABLE |",
+        "CREATE TABLE demo (dept_id INT, CONSTRAINT fk_demo FOREIGN KEY (dept_id) REFERENCES |)",
+        "ALTER TABLE orders ADD CONSTRAINT fk_orders_customer FOREIGN KEY (customer_id) REFERENCES |",
+        "CREATE INDEX idx_emp_dept ON |",
+        "CREATE UNIQUE INDEX idx_emp_dept ON |",
+        "CREATE TRIGGER trg_emp_audit ON |",
+        "CREATE OR REPLACE TRIGGER trg_emp_audit BEFORE INSERT ON |",
+    ] {
+        let deep_ctx = analyze_inline_cursor_sql(sql);
+        let suggestions = SqlEditorWidget::table_context_expected_object_suggestions(
+            &mut data, "", &deep_ctx,
+        )
+        .unwrap_or_else(|| panic!("expected table-target object kind for `{sql}`"));
+
+        assert_eq!(
+            suggestions,
+            vec!["EMP".to_string()],
+            "maintenance table target should suggest only tables for `{sql}`"
+        );
+    }
+}
+
+#[test]
 fn expected_member_suggestions_for_qualifier_filter_schema_members_by_context() {
     let call_ctx = analyze_inline_cursor_sql("CALL scott.|");
     let drop_package_ctx = analyze_inline_cursor_sql("DROP PACKAGE scott.|");
@@ -17192,6 +17472,35 @@ fn expected_schema_routine_suggestions_do_not_require_top_level_type_lists() {
 }
 
 #[test]
+fn expected_schema_object_suggestions_fallback_when_member_kinds_are_unknown() {
+    let call_ctx = analyze_inline_cursor_sql("CALL scott.|");
+    let grant_execute_ctx = analyze_inline_cursor_sql("GRANT EXECUTE ON scott.|");
+    let mut data = IntellisenseData::new();
+    data.set_members_for_qualifier(
+        "SCOTT",
+        vec!["RUN_JOB".to_string(), "UTIL_PKG".to_string()],
+    );
+
+    let call_suggestions =
+        SqlEditorWidget::expected_member_suggestions_for_qualifier(&mut data, "scott", "", &call_ctx);
+    let grant_execute_suggestions = SqlEditorWidget::expected_member_suggestions_for_qualifier(
+        &mut data,
+        "scott",
+        "",
+        &grant_execute_ctx,
+    );
+
+    assert_eq!(
+        call_suggestions,
+        vec!["RUN_JOB".to_string(), "UTIL_PKG".to_string()]
+    );
+    assert_eq!(
+        grant_execute_suggestions,
+        vec!["RUN_JOB".to_string(), "UTIL_PKG".to_string()]
+    );
+}
+
+#[test]
 fn expected_schema_package_suggestions_do_not_require_top_level_type_lists() {
     let drop_package_ctx = analyze_inline_cursor_sql("DROP PACKAGE scott.|");
     let mut data = IntellisenseData::new();
@@ -17240,6 +17549,23 @@ fn expected_package_member_routine_suggestions_do_not_require_top_level_type_lis
 #[test]
 fn schema_relation_member_suggestions_filter_by_oracle_object_context() {
     let drop_table_ctx = analyze_inline_cursor_sql("DROP TABLE scott.|");
+    let analyze_table_ctx = analyze_inline_cursor_sql("ANALYZE TABLE scott.|");
+    let optimize_table_ctx = analyze_inline_cursor_sql("OPTIMIZE TABLE scott.|");
+    let check_table_ctx = analyze_inline_cursor_sql("CHECK TABLE scott.|");
+    let repair_table_ctx = analyze_inline_cursor_sql("REPAIR TABLE scott.|");
+    let references_ctx = analyze_inline_cursor_sql(
+        "ALTER TABLE orders ADD CONSTRAINT fk_orders_customer FOREIGN KEY (customer_id) REFERENCES scott.|",
+    );
+    let create_table_references_ctx = analyze_inline_cursor_sql(
+        "CREATE TABLE demo (dept_id INT, CONSTRAINT fk_demo FOREIGN KEY (dept_id) REFERENCES scott.|)",
+    );
+    let create_index_ctx = analyze_inline_cursor_sql("CREATE INDEX idx_emp_dept ON scott.|");
+    let create_unique_index_ctx =
+        analyze_inline_cursor_sql("CREATE UNIQUE INDEX idx_emp_dept ON scott.|");
+    let create_trigger_ctx = analyze_inline_cursor_sql("CREATE TRIGGER trg_emp_audit ON scott.|");
+    let create_or_replace_trigger_ctx = analyze_inline_cursor_sql(
+        "CREATE OR REPLACE TRIGGER trg_emp_audit BEFORE INSERT ON scott.|",
+    );
     let comment_table_ctx = analyze_inline_cursor_sql("COMMENT ON TABLE scott.|");
     let comment_view_ctx = analyze_inline_cursor_sql("COMMENT ON VIEW scott.|");
     let comment_editioning_view_ctx = analyze_inline_cursor_sql("COMMENT ON EDITIONING VIEW scott.|");
@@ -17272,6 +17598,75 @@ fn schema_relation_member_suggestions_filter_by_oracle_object_context() {
         "",
         &drop_table_ctx,
     );
+    let analyze_table_suggestions =
+        SqlEditorWidget::expected_relation_member_suggestions_for_qualifier(
+            &mut data,
+            "scott",
+            "",
+            &analyze_table_ctx,
+        );
+    let optimize_table_suggestions =
+        SqlEditorWidget::expected_relation_member_suggestions_for_qualifier(
+            &mut data,
+            "scott",
+            "",
+            &optimize_table_ctx,
+        );
+    let check_table_suggestions =
+        SqlEditorWidget::expected_relation_member_suggestions_for_qualifier(
+            &mut data,
+            "scott",
+            "",
+            &check_table_ctx,
+        );
+    let repair_table_suggestions =
+        SqlEditorWidget::expected_relation_member_suggestions_for_qualifier(
+            &mut data,
+            "scott",
+            "",
+            &repair_table_ctx,
+        );
+    let references_suggestions = SqlEditorWidget::expected_relation_member_suggestions_for_qualifier(
+        &mut data,
+        "scott",
+        "",
+        &references_ctx,
+    );
+    let create_table_references_suggestions =
+        SqlEditorWidget::expected_relation_member_suggestions_for_qualifier(
+            &mut data,
+            "scott",
+            "",
+            &create_table_references_ctx,
+        );
+    let create_index_suggestions =
+        SqlEditorWidget::expected_relation_member_suggestions_for_qualifier(
+            &mut data,
+            "scott",
+            "",
+            &create_index_ctx,
+        );
+    let create_unique_index_suggestions =
+        SqlEditorWidget::expected_relation_member_suggestions_for_qualifier(
+            &mut data,
+            "scott",
+            "",
+            &create_unique_index_ctx,
+        );
+    let create_trigger_suggestions =
+        SqlEditorWidget::expected_relation_member_suggestions_for_qualifier(
+            &mut data,
+            "scott",
+            "",
+            &create_trigger_ctx,
+        );
+    let create_or_replace_trigger_suggestions =
+        SqlEditorWidget::expected_relation_member_suggestions_for_qualifier(
+            &mut data,
+            "scott",
+            "",
+            &create_or_replace_trigger_ctx,
+        );
     let mv_suggestions = SqlEditorWidget::expected_relation_member_suggestions_for_qualifier(
         &mut data,
         "scott",
@@ -17298,9 +17693,22 @@ fn schema_relation_member_suggestions_filter_by_oracle_object_context() {
             "scott",
             "",
             &comment_editioning_view_ctx,
-        );
+    );
 
     assert_eq!(table_suggestions, vec!["EMP".to_string()]);
+    assert_eq!(analyze_table_suggestions, vec!["EMP".to_string()]);
+    assert_eq!(optimize_table_suggestions, vec!["EMP".to_string()]);
+    assert_eq!(check_table_suggestions, vec!["EMP".to_string()]);
+    assert_eq!(repair_table_suggestions, vec!["EMP".to_string()]);
+    assert_eq!(references_suggestions, vec!["EMP".to_string()]);
+    assert_eq!(create_table_references_suggestions, vec!["EMP".to_string()]);
+    assert_eq!(create_index_suggestions, vec!["EMP".to_string()]);
+    assert_eq!(create_unique_index_suggestions, vec!["EMP".to_string()]);
+    assert_eq!(create_trigger_suggestions, vec!["EMP".to_string()]);
+    assert_eq!(
+        create_or_replace_trigger_suggestions,
+        vec!["EMP".to_string()]
+    );
     assert_eq!(mv_suggestions, vec!["EMP_MV".to_string()]);
     assert_eq!(comment_table_suggestions, vec!["EMP".to_string()]);
     assert_eq!(comment_view_suggestions, vec!["EMP_VIEW".to_string()]);

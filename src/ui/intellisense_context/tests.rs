@@ -102,6 +102,16 @@ fn phase_from_clause() {
 }
 
 #[test]
+fn alter_table_foreign_key_references_target_is_table_context() {
+    let ctx = analyze(
+        "ALTER TABLE orders ADD CONSTRAINT fk_orders_customer FOREIGN KEY (customer_id) REFERENCES |",
+    );
+
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
 fn phase_where_clause() {
     let ctx = analyze("SELECT a FROM t WHERE |");
     assert_eq!(ctx.phase, SqlPhase::WhereClause);
