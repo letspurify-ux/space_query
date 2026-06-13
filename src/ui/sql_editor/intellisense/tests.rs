@@ -5311,6 +5311,62 @@ END;"#,
 }
 
 #[test]
+fn local_symbol_suggestions_prefer_nearest_shadowed_symbol_display() {
+    let cases = [
+        (
+            r#"DECLARE
+    v_shadow NUMBER := 1;
+BEGIN
+    DECLARE
+        "v_shadow" VARCHAR2(10) := 'inner';
+    BEGIN
+        __CODEX_CURSOR__NULL;
+    END;
+END;"#,
+            "v_",
+            r#""v_shadow""#,
+        ),
+        (
+            r#"DECLARE
+    "v_shadow" NUMBER := 1;
+BEGIN
+    DECLARE
+        v_shadow VARCHAR2(10) := 'inner';
+    BEGIN
+        __CODEX_CURSOR__NULL;
+    END;
+END;"#,
+            "v_",
+            "v_shadow",
+        ),
+        (
+            r#"CREATE OR REPLACE PROCEDURE demo_proc (
+    p_shadow IN NUMBER
+) IS
+BEGIN
+    DECLARE
+        "p_shadow" VARCHAR2(10) := 'inner';
+    BEGIN
+        __CODEX_CURSOR__NULL;
+    END;
+END demo_proc;"#,
+            "p_",
+            r#""p_shadow""#,
+        ),
+    ];
+
+    for (sql, prefix, expected) in cases {
+        let suggestions = SqlEditorWidget::collect_local_symbol_suggestions_with_prefix_for_test(
+            sql,
+            prefix,
+            &[],
+        );
+
+        assert_eq!(suggestions, vec![expected.to_string()], "sql: {sql}");
+    }
+}
+
+#[test]
 fn local_symbol_suggestions_include_for_loop_record_only_inside_loop() {
     let loop_suggestions = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
         r#"BEGIN

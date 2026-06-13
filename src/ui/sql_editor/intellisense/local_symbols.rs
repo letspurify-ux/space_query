@@ -406,7 +406,6 @@ impl SqlEditorWidget {
                 .saturating_sub(analysis.statement_start),
         );
         let mut suggestions = Vec::new();
-        let mut seen_local_symbols = HashSet::new();
         let mut seen_dynamic_symbols = HashSet::new();
 
         let active_scope = Self::deepest_local_scope_at_cursor(
@@ -435,13 +434,16 @@ impl SqlEditorWidget {
             if !Self::local_symbol_matches_prefix(&symbol.name, &symbol.upper, &prefix_upper) {
                 continue;
             }
-            if seen_local_symbols.insert(symbol.upper.as_str()) {
-                scoped_suggestions[scope_rank].push(symbol.name.clone());
-            }
+            scoped_suggestions[scope_rank].push((symbol.upper.clone(), symbol.name.clone()));
         }
 
+        let mut seen_local_symbols = HashSet::new();
         for bucket in scoped_suggestions {
-            suggestions.extend(bucket);
+            for (upper, name) in bucket {
+                if seen_local_symbols.insert(upper) {
+                    suggestions.push(name);
+                }
+            }
         }
 
         for name in analysis.text_bind_names.iter() {
@@ -449,7 +451,7 @@ impl SqlEditorWidget {
             if !Self::local_symbol_matches_prefix(name, &upper, &prefix_upper) {
                 continue;
             }
-            if !seen_local_symbols.contains(upper.as_str()) && seen_dynamic_symbols.insert(upper) {
+            if !seen_local_symbols.contains(&upper) && seen_dynamic_symbols.insert(upper) {
                 suggestions.push(name.clone());
             }
         }
@@ -459,7 +461,7 @@ impl SqlEditorWidget {
             if !Self::local_symbol_matches_prefix(name, &upper, &prefix_upper) {
                 continue;
             }
-            if !seen_local_symbols.contains(upper.as_str()) && seen_dynamic_symbols.insert(upper) {
+            if !seen_local_symbols.contains(&upper) && seen_dynamic_symbols.insert(upper) {
                 suggestions.push(name.clone());
             }
         }
