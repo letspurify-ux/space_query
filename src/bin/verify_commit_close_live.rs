@@ -417,7 +417,15 @@ fn verify(target: Target) -> Result<bool, String> {
 
     // The GUI tab-close path with an open lazy fetch: the close flow cancels
     // the lazy fetch first, then re-checks the returned session.
-    println!("  --- DML, open lazy fetch, COMMIT button (fails), lazy CANCEL (as close does) ---");
+    //
+    // Toolbar COMMIT/ROLLBACK is intentionally refused while a lazy fetch is
+    // open (the result grid is still streaming). The DML therefore stays
+    // genuinely uncommitted, so the close prompt SHOULD appear here: this is
+    // a necessary prompt, not a spurious one. The bug would be the opposite -
+    // the close path silently dropping the uncommitted DML without asking.
+    println!(
+        "  --- DML, open lazy fetch, COMMIT button (refused), lazy CANCEL (as close does) ---"
+    );
     h.run(target.dml())?;
     h.run("SELECT * FROM SQ_TXCLOSE_T")?;
     h.toolbar_action("commit")?;
@@ -430,10 +438,10 @@ fn verify(target: Target) -> Result<bool, String> {
     }
     h.report("after lazy cancel (deferred close re-check)");
     if h.close_would_prompt().unwrap_or(false) {
-        println!(">>> CONFIRMED: deferred close re-check prompts because the commit never ran");
-        reproduced = true;
+        println!("    OK: close prompts (commit was intentionally refused while a fetch was open; DML genuinely uncommitted)");
     } else {
-        println!("    OK: close would not prompt");
+        println!(">>> BUG REPRODUCED: close did not prompt although the refused commit left the DML uncommitted");
+        reproduced = true;
     }
     h.editor.clear_pooled_db_session();
     h.run("COMMIT")?;

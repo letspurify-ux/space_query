@@ -2464,18 +2464,34 @@ impl IntellisenseData {
         if prefix_upper.chars().count() < 2 || suggestions.len() >= MAX_SUGGESTIONS {
             return;
         }
-        let mut scored: Vec<(i32, &NameEntry)> = Vec::new();
+        let remaining = MAX_SUGGESTIONS.saturating_sub(suggestions.len());
+        let mut scored: Vec<(i32, &NameEntry)> = Vec::with_capacity(remaining);
+        let mut fuzzy_seen = HashSet::new();
         for group in groups {
             for entry in group.iter() {
                 if entry.upper.starts_with(prefix_upper) || seen.contains(&entry.upper) {
                     continue;
                 }
                 if let Some(score) = Self::subsequence_match_score(&entry.upper, prefix_upper) {
-                    scored.push((score, entry));
+                    if !fuzzy_seen.insert(entry.upper.clone()) {
+                        continue;
+                    }
+                    if scored.len() < remaining {
+                        scored.push((score, entry));
+                    } else if let Some((worst_idx, _)) = scored
+                        .iter()
+                        .enumerate()
+                        .max_by(|(_, a), (_, b)| Self::compare_fuzzy_candidates(a, b))
+                    {
+                        let candidate = (score, entry);
+                        if Self::compare_fuzzy_candidates(&candidate, &scored[worst_idx]).is_lt() {
+                            scored[worst_idx] = candidate;
+                        }
+                    }
                 }
             }
         }
-        scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.upper.cmp(&b.1.upper)));
+        scored.sort_by(Self::compare_fuzzy_candidates);
         for (_, entry) in scored {
             if suggestions.len() >= MAX_SUGGESTIONS {
                 break;
@@ -2484,6 +2500,13 @@ impl IntellisenseData {
                 suggestions.push(entry.name.clone());
             }
         }
+    }
+
+    fn compare_fuzzy_candidates(
+        a: &(i32, &NameEntry),
+        b: &(i32, &NameEntry),
+    ) -> std::cmp::Ordering {
+        a.0.cmp(&b.0).then_with(|| a.1.upper.cmp(&b.1.upper))
     }
 }
 
@@ -4156,6 +4179,22 @@ mod intellisense_tests {
             contiguous < scattered,
             "contiguous {contiguous} should rank ahead of scattered {scattered}"
         );
+    }
+
+    #[test]
+    fn fuzzy_bounded_ranking_keeps_late_better_matches() {
+        let mut data = IntellisenseData::new();
+        let mut columns: Vec<String> = (0..MAX_SUGGESTIONS + 20)
+            .map(|idx| format!("X{:03}_ALPHA_BETA", idx))
+            .collect();
+        columns.push("AB_TOTAL".to_string());
+        data.set_columns_for_table("T", columns);
+        let scope = vec!["T".to_string()];
+
+        let suggestions = data.get_column_suggestions("ab", Some(&scope));
+
+        assert_eq!(suggestions.first().map(String::as_str), Some("AB_TOTAL"));
+        assert_eq!(suggestions.len(), MAX_SUGGESTIONS);
     }
 
     #[test]

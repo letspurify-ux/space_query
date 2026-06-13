@@ -14453,6 +14453,22 @@ fn merge_derived_columns_matches_backtick_alias_by_unquoted_prefix() {
 }
 
 #[test]
+fn merge_prioritized_derived_columns_keeps_order_by_alias_before_result_limit() {
+    let base: Vec<String> = (0..MAX_MERGED_SUGGESTIONS + 20)
+        .map(|idx| format!("TOTAL_BASE_{idx:03}"))
+        .collect();
+
+    let merged = SqlEditorWidget::merge_suggestions_with_prioritized_derived_columns(
+        base,
+        "total",
+        vec!["total_due".to_string()],
+    );
+
+    assert_eq!(merged.first().map(String::as_str), Some("total_due"));
+    assert_eq!(merged.len(), MAX_MERGED_SUGGESTIONS);
+}
+
+#[test]
 fn collect_derived_columns_for_order_by_includes_select_aliases() {
     let sql_with_cursor = "SELECT \
              oh.order_id, \
@@ -17078,15 +17094,74 @@ fn schema_object_context_prefers_all_members_when_relation_cache_also_exists() {
 
 #[test]
 fn collect_expected_keyword_suggestions_complete_common_clause_tails() {
-    let order_ctx = analyze_inline_cursor_sql("SELECT * FROM emp ORDER |");
+    let cases: &[(&str, &[&str])] = &[
+        ("SELECT * FROM emp ORDER |", &["BY"]),
+        (
+            "SELECT * FROM emp CONNECT BY PRIOR empno = mgr ORDER SIBLINGS |",
+            &["BY"],
+        ),
+        (
+            "SELECT * FROM emp ORDER BY empno FETCH FIRST |",
+            &["ROW", "ROWS"],
+        ),
+        (
+            "SELECT * FROM emp ORDER BY empno FETCH FIRST 5 |",
+            &["ROW", "ROWS"],
+        ),
+        (
+            "SELECT * FROM emp ORDER BY empno FETCH FIRST :limit |",
+            &["ROW", "ROWS"],
+        ),
+        (
+            "SELECT * FROM emp ORDER BY empno FETCH NEXT page_size |",
+            &["ROW", "ROWS"],
+        ),
+        (
+            "SELECT * FROM emp ORDER BY empno FETCH FIRST 5 PERCENT |",
+            &["ROW", "ROWS"],
+        ),
+        (
+            "SELECT * FROM emp ORDER BY empno FETCH FIRST :percent PERCENT |",
+            &["ROW", "ROWS"],
+        ),
+        (
+            "SELECT * FROM emp ORDER BY empno FETCH FIRST ROWS |",
+            &["ONLY", "WITH"],
+        ),
+        (
+            "SELECT * FROM emp ORDER BY empno FETCH FIRST 5 ROWS |",
+            &["ONLY", "WITH"],
+        ),
+        (
+            "SELECT * FROM emp ORDER BY empno FETCH FIRST 5 PERCENT ROWS |",
+            &["ONLY", "WITH"],
+        ),
+        (
+            "SELECT * FROM emp ORDER BY empno FETCH FIRST :percent PERCENT ROWS |",
+            &["ONLY", "WITH"],
+        ),
+        (
+            "SELECT * FROM emp ORDER BY empno FETCH FIRST 5 ROWS WITH |",
+            &["TIES"],
+        ),
+        ("SELECT * FROM emp OFFSET 10 |", &["ROW", "ROWS"]),
+        ("SELECT * FROM emp OFFSET :skip |", &["ROW", "ROWS"]),
+        ("SELECT * FROM emp OFFSET 10 ROWS |", &["FETCH"]),
+        ("SELECT * FROM emp OFFSET :skip ROWS |", &["FETCH"]),
+    ];
     let when_ctx = analyze_inline_cursor_sql(
         "MERGE INTO target t USING src s ON (t.id = s.id) WHEN |",
     );
 
-    let order_suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &order_ctx);
+    for (sql, expected) in cases {
+        let ctx = analyze_inline_cursor_sql(sql);
+        let suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &ctx);
+        let expected: Vec<String> = expected.iter().map(|value| (*value).to_string()).collect();
+        assert_eq!(suggestions, expected, "sql: {sql}");
+    }
+
     let when_suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &when_ctx);
 
-    assert_eq!(order_suggestions, vec!["BY".to_string()]);
     assert!(when_suggestions.iter().any(|value| value == "MATCHED"));
     assert!(when_suggestions.iter().any(|value| value == "NOT"));
 }

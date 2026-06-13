@@ -1025,11 +1025,19 @@ impl SqlEditorWidget {
         }
         if include_columns && qualifier.is_none() && !restrict_to_relation_columns {
             let derived_columns = Self::collect_derived_columns_for_context(deep_ctx);
-            suggestions = Self::merge_suggestions_with_derived_columns(
-                suggestions,
-                &snapshot.prefix,
-                derived_columns,
-            );
+            suggestions = if Self::cursor_is_in_query_level_order_by(deep_ctx) {
+                Self::merge_suggestions_with_prioritized_derived_columns(
+                    suggestions,
+                    &snapshot.prefix,
+                    derived_columns,
+                )
+            } else {
+                Self::merge_suggestions_with_derived_columns(
+                    suggestions,
+                    &snapshot.prefix,
+                    derived_columns,
+                )
+            };
         }
         let context_name_suggestions =
             if matches!(context, SqlContext::VariableName | SqlContext::BindValue)
@@ -1284,6 +1292,144 @@ impl SqlEditorWidget {
         words_rev
     }
 
+    fn expected_row_limiting_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> Option<&'static [&'static str]> {
+        const FETCH_KEYWORDS: &[&str] = &["FETCH"];
+        const ROW_UNIT_KEYWORDS: &[&str] = &["ROW", "ROWS"];
+        const ONLY_WITH_KEYWORDS: &[&str] = &["ONLY", "WITH"];
+        const TIES_KEYWORDS: &[&str] = &["TIES"];
+
+        let words = Self::previous_meaningful_words_with_bind_markers_upper(tokens, end, 5);
+        let len = words.len();
+        let tail = |from_end: usize| len.checked_sub(from_end).and_then(|idx| words.get(idx));
+        let word = |from_end: usize| {
+            tail(from_end).map(|(value, _)| value.as_str())
+        };
+        let is_count = |from_end: usize| {
+            tail(from_end)
+                .is_some_and(|(value, is_bind)| Self::is_row_count_tail_word(value, *is_bind))
+        };
+
+        if len >= 2
+            && word(2).is_some_and(Self::is_row_limit_unit)
+            && word(1) == Some("WITH")
+        {
+            return Some(TIES_KEYWORDS);
+        }
+
+        if len >= 5
+            && word(5) == Some("FETCH")
+            && word(4).is_some_and(Self::is_fetch_row_limit_direction)
+            && is_count(3)
+            && word(2) == Some("PERCENT")
+            && word(1).is_some_and(Self::is_row_limit_unit)
+        {
+            return Some(ONLY_WITH_KEYWORDS);
+        }
+
+        if len >= 4
+            && word(4) == Some("FETCH")
+            && word(3).is_some_and(Self::is_fetch_row_limit_direction)
+            && is_count(2)
+            && word(1).is_some_and(Self::is_row_limit_unit)
+        {
+            return Some(ONLY_WITH_KEYWORDS);
+        }
+
+        if len >= 3
+            && word(3) == Some("FETCH")
+            && word(2).is_some_and(Self::is_fetch_row_limit_direction)
+            && word(1).is_some_and(Self::is_row_limit_unit)
+        {
+            return Some(ONLY_WITH_KEYWORDS);
+        }
+
+        if len >= 4
+            && word(4) == Some("FETCH")
+            && word(3).is_some_and(Self::is_fetch_row_limit_direction)
+            && is_count(2)
+            && word(1) == Some("PERCENT")
+        {
+            return Some(ROW_UNIT_KEYWORDS);
+        }
+
+        if len >= 3
+            && word(3) == Some("FETCH")
+            && word(2).is_some_and(Self::is_fetch_row_limit_direction)
+            && is_count(1)
+        {
+            return Some(ROW_UNIT_KEYWORDS);
+        }
+
+        if len >= 2
+            && word(2) == Some("FETCH")
+            && word(1).is_some_and(Self::is_fetch_row_limit_direction)
+        {
+            return Some(ROW_UNIT_KEYWORDS);
+        }
+
+        if len >= 3
+            && word(3) == Some("OFFSET")
+            && is_count(2)
+            && word(1).is_some_and(Self::is_row_limit_unit)
+        {
+            return Some(FETCH_KEYWORDS);
+        }
+
+        if len >= 2 && word(2) == Some("OFFSET") && is_count(1) {
+            return Some(ROW_UNIT_KEYWORDS);
+        }
+
+        None
+    }
+
+    fn previous_meaningful_words_with_bind_markers_upper(
+        tokens: &[SqlToken],
+        end: usize,
+        max_words: usize,
+    ) -> Vec<(String, bool)> {
+        if max_words == 0 {
+            return Vec::new();
+        }
+
+        let mut words_rev = Vec::new();
+        let mut idx = end.min(tokens.len());
+        while idx > 0 {
+            idx -= 1;
+            match &tokens[idx] {
+                SqlToken::Comment(_) => {}
+                SqlToken::Word(word) => {
+                    words_rev.push((
+                        word.to_ascii_uppercase(),
+                        Self::word_is_preceded_by_bind_colon(tokens, idx),
+                    ));
+                    if words_rev.len() >= max_words {
+                        break;
+                    }
+                }
+                SqlToken::Symbol(_) => {}
+                _ => break,
+            }
+        }
+        words_rev.reverse();
+        words_rev
+    }
+
+    fn word_is_preceded_by_bind_colon(tokens: &[SqlToken], word_idx: usize) -> bool {
+        let mut idx = word_idx;
+        while idx > 0 {
+            idx -= 1;
+            match &tokens[idx] {
+                SqlToken::Comment(_) => {}
+                SqlToken::Symbol(symbol) if symbol == ":" => return true,
+                _ => return false,
+            }
+        }
+        false
+    }
+
     fn filter_expected_candidates(prefix: &str, candidates: &[&str]) -> Vec<String> {
         let prefix_upper = prefix.to_ascii_uppercase();
         let mut seen = HashSet::new();
@@ -1416,9 +1562,16 @@ impl SqlEditorWidget {
 
         let tokens = Self::current_query_tokens(deep_ctx);
         let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let context_end =
+            Self::expected_suggestion_context_end(tokens, cursor_token_len, !prefix.is_empty());
+        if let Some(candidates) = Self::expected_row_limiting_keyword_candidates(tokens, context_end)
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+
         let words = Self::previous_meaningful_words_upper(
             tokens,
-            Self::expected_suggestion_context_end(tokens, cursor_token_len, !prefix.is_empty()),
+            context_end,
             4,
         );
 
@@ -1426,6 +1579,7 @@ impl SqlEditorWidget {
             [] => TOP_LEVEL_KEYWORDS,
             _ if Self::is_create_synonym_name_written_context(&words) => &["FOR"],
             [.., last] if *last == "ORDER" || *last == "GROUP" || *last == "CONNECT" => &["BY"],
+            [.., prev, last] if *prev == "ORDER" && *last == "SIBLINGS" => &["BY"],
             [.., last] if *last == "START" => &["WITH"],
             [.., last] if *last == "DELETE" => &["FROM"],
             [.., last] if *last == "INSERT" || *last == "MERGE" => &["INTO"],
@@ -1519,6 +1673,25 @@ impl SqlEditorWidget {
         };
 
         Self::filter_expected_candidates(prefix, candidates)
+    }
+
+    fn is_row_count_tail_word(word: &str, is_bind: bool) -> bool {
+        let trimmed = word.trim();
+        if trimmed.is_empty() || Self::is_fetch_row_limit_direction(trimmed) {
+            return false;
+        }
+        if is_bind {
+            return true;
+        }
+        !Self::is_row_limit_unit(trimmed) && !matches!(trimmed, "PERCENT" | "ONLY" | "WITH" | "TIES")
+    }
+
+    fn is_fetch_row_limit_direction(word: &str) -> bool {
+        matches!(word, "FIRST" | "NEXT")
+    }
+
+    fn is_row_limit_unit(word: &str) -> bool {
+        matches!(word, "ROW" | "ROWS")
     }
 
     fn expected_object_suggestion_kind(
@@ -3588,6 +3761,47 @@ impl SqlEditorWidget {
 
         base.truncate(MAX_MERGED_SUGGESTIONS);
         base
+    }
+
+    fn merge_suggestions_with_prioritized_derived_columns(
+        base: Vec<String>,
+        prefix: &str,
+        derived_columns: Vec<String>,
+    ) -> Vec<String> {
+        if derived_columns.is_empty() {
+            let mut base = base;
+            base.truncate(MAX_MERGED_SUGGESTIONS);
+            return base;
+        }
+
+        let prefix_upper = Self::completion_identifier_lookup_upper(prefix);
+        let mut seen = HashSet::new();
+        let mut merged = Vec::new();
+
+        for column in derived_columns {
+            let upper = Self::completion_identifier_lookup_upper(&column);
+            if !prefix_upper.is_empty() && !upper.starts_with(prefix_upper.as_str()) {
+                continue;
+            }
+            if seen.insert(upper) {
+                merged.push(column);
+                if merged.len() >= MAX_MERGED_SUGGESTIONS {
+                    return merged;
+                }
+            }
+        }
+
+        for item in base {
+            let upper = Self::completion_identifier_lookup_upper(&item);
+            if seen.insert(upper) {
+                merged.push(item);
+                if merged.len() >= MAX_MERGED_SUGGESTIONS {
+                    break;
+                }
+            }
+        }
+
+        merged
     }
 
     fn collect_derived_columns_for_context(
