@@ -17296,12 +17296,12 @@ fn collect_expected_keyword_suggestions_complete_common_clause_tails() {
 
     for (sql, expected) in cases {
         let ctx = analyze_inline_cursor_sql(sql);
-        let suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &ctx);
+        let suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &ctx, None);
         let expected: Vec<String> = expected.iter().map(|value| (*value).to_string()).collect();
         assert_eq!(suggestions, expected, "sql: {sql}");
     }
 
-    let when_suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &when_ctx);
+    let when_suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &when_ctx, None);
 
     assert!(when_suggestions.iter().any(|value| value == "MATCHED"));
     assert!(when_suggestions.iter().any(|value| value == "NOT"));
@@ -17352,82 +17352,83 @@ fn collect_expected_keyword_suggestions_include_ddl_object_type_tokens() {
     let repair_ctx = analyze_inline_cursor_sql("REPAIR |");
     let create_synonym_name_ctx = analyze_inline_cursor_sql("CREATE SYNONYM emp_syn |");
 
-    let create_suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &create_ctx);
+    let create_suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &create_ctx, None);
     let create_or_replace_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_or_replace_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_or_replace_ctx, None);
     let create_or_replace_materialized_suggestions =
         SqlEditorWidget::collect_expected_keyword_suggestions(
             "",
             &create_or_replace_materialized_ctx,
+            None,
         );
     let create_or_replace_editioning_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_or_replace_editioning_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_or_replace_editioning_ctx, None);
     let create_editioning_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_editioning_ctx);
-    let drop_suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &drop_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_editioning_ctx, None);
+    let drop_suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &drop_ctx, None);
     let drop_public_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &drop_public_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &drop_public_ctx, None);
     let drop_package_body_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("B", &drop_package_body_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("B", &drop_package_body_ctx, None);
     let create_unique_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_unique_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_unique_ctx, None);
     let create_bitmap_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_bitmap_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_bitmap_ctx, None);
     let create_global_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_global_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_global_ctx, None);
     let create_global_temporary_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_global_temporary_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_global_temporary_ctx, None);
     let create_public_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_public_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_public_ctx, None);
     let create_or_replace_public_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_or_replace_public_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_or_replace_public_ctx, None);
     let create_database_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_database_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_database_ctx, None);
     let create_or_replace_database_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_or_replace_database_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_or_replace_database_ctx, None);
     let create_public_database_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_public_database_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_public_database_ctx, None);
     let create_shared_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_shared_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_shared_ctx, None);
     let create_or_replace_shared_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_or_replace_shared_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_or_replace_shared_ctx, None);
     let create_shared_database_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_shared_database_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_shared_database_ctx, None);
     let create_shared_public_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_shared_public_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_shared_public_ctx, None);
     let drop_database_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &drop_database_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &drop_database_ctx, None);
     let drop_public_database_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &drop_public_database_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &drop_public_database_ctx, None);
     let drop_shared_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &drop_shared_ctx);
-    let alter_suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &drop_shared_ctx, None);
+    let alter_suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_ctx, None);
     let alter_public_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_public_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_public_ctx, None);
     let alter_database_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_database_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_database_ctx, None);
     let alter_public_database_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_public_database_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_public_database_ctx, None);
     let alter_shared_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_shared_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_shared_ctx, None);
     let alter_shared_database_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_shared_database_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_shared_database_ctx, None);
     let alter_shared_public_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_shared_public_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_shared_public_ctx, None);
     let alter_shared_public_database_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_shared_public_database_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_shared_public_database_ctx, None);
     let alter_session_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_session_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_session_ctx, None);
     let alter_session_set_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_session_set_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_session_set_ctx, None);
     let analyze_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &analyze_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &analyze_ctx, None);
     let optimize_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &optimize_ctx);
-    let check_suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &check_ctx);
-    let repair_suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &repair_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &optimize_ctx, None);
+    let check_suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &check_ctx, None);
+    let repair_suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &repair_ctx, None);
     let create_synonym_name_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_synonym_name_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_synonym_name_ctx, None);
 
     assert!(create_suggestions.iter().any(|value| value == "EDITIONING"));
     for value in [
@@ -17630,7 +17631,7 @@ fn collect_expected_keyword_suggestions_complete_plsql_body_object_tails() {
         "DROP TYPE |",
     ] {
         let ctx = analyze_inline_cursor_sql(sql);
-        let suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &ctx);
+        let suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &ctx, None);
         assert_eq!(
             suggestions,
             vec!["BODY".to_string()],
@@ -17640,12 +17641,12 @@ fn collect_expected_keyword_suggestions_complete_plsql_body_object_tails() {
 
     let drop_package_prefix_ctx = analyze_inline_cursor_sql("DROP PACKAGE B|");
     let drop_package_prefix_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("B", &drop_package_prefix_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("B", &drop_package_prefix_ctx, None);
     assert_eq!(drop_package_prefix_suggestions, vec!["BODY".to_string()]);
 
     for sql in ["ALTER PACKAGE |", "ALTER TYPE |"] {
         let ctx = analyze_inline_cursor_sql(sql);
-        let suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &ctx);
+        let suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &ctx, None);
         assert!(
             !suggestions.iter().any(|value| value == "BODY"),
             "ALTER object-name context should not suggest BODY before the object name for `{sql}`"
@@ -18433,23 +18434,23 @@ fn collect_expected_keyword_suggestions_complete_materialized_view_tail() {
     let drop_mv_log_ctx = analyze_inline_cursor_sql("DROP MATERIALIZED VIEW LOG |");
     let comment_on_ctx = analyze_inline_cursor_sql("COMMENT ON |");
     let comment_editioning_ctx = analyze_inline_cursor_sql("COMMENT ON EDITIONING |");
-    let suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &drop_ctx);
+    let suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &drop_ctx, None);
     let create_mv_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_mv_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_mv_ctx, None);
     let create_mv_log_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_mv_log_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_mv_log_ctx, None);
     let alter_mv_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_mv_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_mv_ctx, None);
     let alter_mv_log_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_mv_log_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_mv_log_ctx, None);
     let drop_mv_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &drop_mv_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &drop_mv_ctx, None);
     let drop_mv_log_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &drop_mv_log_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &drop_mv_log_ctx, None);
     let comment_on_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &comment_on_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &comment_on_ctx, None);
     let comment_editioning_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &comment_editioning_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &comment_editioning_ctx, None);
 
     assert_eq!(suggestions, vec!["VIEW".to_string()]);
     assert_eq!(create_mv_suggestions, vec!["LOG".to_string()]);
@@ -18477,7 +18478,7 @@ fn collect_expected_keyword_suggestions_complete_rollback_and_java_tails() {
         "DROP ROLLBACK |",
     ] {
         let ctx = analyze_inline_cursor_sql(sql);
-        let suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &ctx);
+        let suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &ctx, None);
         assert_eq!(
             suggestions,
             vec!["SEGMENT".to_string()],
@@ -18501,36 +18502,39 @@ fn collect_expected_keyword_suggestions_complete_rollback_and_java_tails() {
     let create_java_class_ctx = analyze_inline_cursor_sql("CREATE JAVA CLASS |");
 
     let create_java_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_java_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_java_ctx, None);
     let create_or_replace_java_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_or_replace_java_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_or_replace_java_ctx, None);
     let create_or_replace_and_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_or_replace_and_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_or_replace_and_ctx, None);
     let create_or_replace_and_compile_suggestions =
         SqlEditorWidget::collect_expected_keyword_suggestions(
             "",
             &create_or_replace_and_compile_ctx,
+            None,
         );
     let create_or_replace_and_resolve_suggestions =
         SqlEditorWidget::collect_expected_keyword_suggestions(
             "",
             &create_or_replace_and_resolve_ctx,
+            None,
         );
     let create_or_replace_and_compile_java_suggestions =
         SqlEditorWidget::collect_expected_keyword_suggestions(
             "",
             &create_or_replace_and_compile_java_ctx,
+            None,
         );
     let alter_java_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_java_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_java_ctx, None);
     let drop_java_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &drop_java_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &drop_java_ctx, None);
     let create_java_source_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_java_source_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_java_source_ctx, None);
     let create_java_resource_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_java_resource_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_java_resource_ctx, None);
     let create_java_class_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_java_class_ctx);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_java_class_ctx, None);
 
     assert_eq!(
         create_java_suggestions,
@@ -19076,4 +19080,587 @@ fn build_signature_label_formats_params_and_spans() {
     let (s1, e1) = label.arg_spans[1];
     assert_eq!(&label.text[s0..e0], "P_ID IN NUMBER");
     assert_eq!(&label.text[s1..e1], "P_NAME IN VARCHAR2(50)");
+}
+
+/// Resolve window-frame keyword candidates at the `|` marker.
+fn window_frame_candidates(sql_with_cursor: &str) -> Option<Vec<String>> {
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+    let tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    SqlEditorWidget::expected_window_frame_keyword_candidates(&tokens, split_idx)
+        .map(|c| c.iter().map(|s| s.to_string()).collect())
+}
+
+#[test]
+fn window_frame_after_unit_suggests_between_and_bounds() {
+    assert_eq!(
+        window_frame_candidates("SELECT sum(x) OVER (ORDER BY d ROWS |) FROM t"),
+        Some(vec!["BETWEEN".into(), "UNBOUNDED".into(), "CURRENT".into()])
+    );
+}
+
+#[test]
+fn window_frame_after_between_suggests_first_bound() {
+    assert_eq!(
+        window_frame_candidates("SELECT sum(x) OVER (ORDER BY d ROWS BETWEEN |) FROM t"),
+        Some(vec!["UNBOUNDED".into(), "CURRENT".into()])
+    );
+}
+
+#[test]
+fn window_frame_after_unbounded_suggests_direction() {
+    assert_eq!(
+        window_frame_candidates(
+            "SELECT sum(x) OVER (ORDER BY d ROWS BETWEEN UNBOUNDED |) FROM t"
+        ),
+        Some(vec!["PRECEDING".into(), "FOLLOWING".into()])
+    );
+}
+
+#[test]
+fn window_frame_after_current_suggests_row() {
+    assert_eq!(
+        window_frame_candidates("SELECT sum(x) OVER (ORDER BY d RANGE CURRENT |) FROM t"),
+        Some(vec!["ROW".into()])
+    );
+}
+
+#[test]
+fn window_frame_after_and_suggests_second_bound() {
+    assert_eq!(
+        window_frame_candidates(
+            "SELECT sum(x) OVER (ORDER BY d ROWS BETWEEN UNBOUNDED PRECEDING AND |) FROM t"
+        ),
+        Some(vec!["UNBOUNDED".into(), "CURRENT".into()])
+    );
+}
+
+#[test]
+fn window_frame_groups_unit_is_recognized() {
+    assert_eq!(
+        window_frame_candidates("SELECT sum(x) OVER (ORDER BY d GROUPS |) FROM t"),
+        Some(vec!["BETWEEN".into(), "UNBOUNDED".into(), "CURRENT".into()])
+    );
+}
+
+#[test]
+fn ordinary_between_predicate_is_not_treated_as_window_frame() {
+    // No OVER -> a normal range predicate must never offer frame keywords.
+    assert_eq!(
+        window_frame_candidates("SELECT * FROM t WHERE x BETWEEN 1 AND |"),
+        None
+    );
+}
+
+#[test]
+fn column_named_range_outside_window_does_not_trigger_frame() {
+    assert_eq!(
+        window_frame_candidates("SELECT t.range | FROM t"),
+        None
+    );
+}
+
+#[test]
+fn case_expression_and_inside_over_is_not_a_frame_bound() {
+    // AND inside OVER but with no frame marker (a boolean in ORDER BY CASE) must
+    // not be mistaken for a frame second-bound position.
+    assert_eq!(
+        window_frame_candidates(
+            "SELECT sum(x) OVER (ORDER BY CASE WHEN a AND |) FROM t"
+        ),
+        None
+    );
+}
+
+#[test]
+fn window_frame_unit_after_closed_over_does_not_trigger() {
+    // `rows` is an ordinary identifier after a *closed* OVER(); the cursor is
+    // not inside any window paren, so no frame keywords.
+    assert_eq!(
+        window_frame_candidates("SELECT count(*) OVER () r, x ROWS | FROM t"),
+        None
+    );
+}
+
+#[test]
+fn window_frame_current_after_closed_over_does_not_trigger() {
+    assert_eq!(
+        window_frame_candidates("SELECT count(*) OVER (), current | FROM t"),
+        None
+    );
+}
+
+#[test]
+fn window_frame_numeric_first_bound_then_and_suggests_second_bound() {
+    assert_eq!(
+        window_frame_candidates(
+            "SELECT avg(x) OVER (ORDER BY d ROWS BETWEEN 5 PRECEDING AND |) FROM t"
+        ),
+        Some(vec!["UNBOUNDED".into(), "CURRENT".into()])
+    );
+}
+
+#[test]
+fn window_frame_inside_subquery_over_is_recognized() {
+    assert_eq!(
+        window_frame_candidates(
+            "SELECT * FROM (SELECT sum(x) OVER (ORDER BY d ROWS |) FROM t) z"
+        ),
+        Some(vec!["BETWEEN".into(), "UNBOUNDED".into(), "CURRENT".into()])
+    );
+}
+
+#[test]
+fn window_frame_prefix_filters_candidates_through_production_path() {
+    // Faithful to runtime wiring: the partial word is trimmed by
+    // `expected_suggestion_context_end`, leaving the cursor at the `ROWS`
+    // position; the `UNB` prefix then narrows the frame candidates.
+    let ctx = analyze_inline_cursor_sql("SELECT avg(x) OVER (ORDER BY d ROWS UNB|) FROM t");
+    let suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("UNB", &ctx, None);
+    assert_eq!(suggestions, vec!["UNBOUNDED".to_string()]);
+}
+
+#[test]
+fn window_frame_inside_named_window_clause_is_recognized() {
+    assert_eq!(
+        window_frame_candidates(
+            "SELECT count(*) OVER w FROM t WINDOW w AS (ORDER BY d ROWS |)"
+        ),
+        Some(vec!["BETWEEN".into(), "UNBOUNDED".into(), "CURRENT".into()])
+    );
+}
+
+#[test]
+fn window_frame_inside_named_window_clause_in_subquery_is_recognized() {
+    assert_eq!(
+        window_frame_candidates(
+            "SELECT * FROM (SELECT count(*) OVER w FROM t WINDOW w AS (ORDER BY d ROWS BETWEEN |)) z"
+        ),
+        Some(vec!["UNBOUNDED".into(), "CURRENT".into()])
+    );
+}
+
+#[test]
+fn cte_body_as_paren_is_not_a_window_spec() {
+    // `WITH c AS (...)` shares the `name AS (` shape with a named window but must
+    // never offer frame keywords for a column called `rows`.
+    assert_eq!(
+        window_frame_candidates("WITH c AS (SELECT x rows | FROM t) SELECT * FROM c"),
+        None
+    );
+}
+
+/// Data-type keyword suggestions at the `|` marker for a given dialect.
+fn data_type_suggestions(
+    sql_with_cursor: &str,
+    prefix: &str,
+    db: crate::db::DatabaseType,
+) -> Vec<String> {
+    let ctx = analyze_inline_cursor_sql(sql_with_cursor);
+    SqlEditorWidget::collect_expected_keyword_suggestions(prefix, &ctx, Some(db))
+}
+
+#[test]
+fn data_type_cast_as_offers_oracle_types() {
+    let s = data_type_suggestions("SELECT CAST(x AS |) FROM t", "", crate::db::DatabaseType::Oracle);
+    assert!(s.contains(&"VARCHAR2".to_string()));
+    assert!(s.contains(&"NUMBER".to_string()));
+    assert!(s.contains(&"TIMESTAMP".to_string()));
+}
+
+#[test]
+fn data_type_cast_as_prefix_filters() {
+    assert_eq!(
+        data_type_suggestions("SELECT CAST(x AS NUMB|) FROM t", "NUMB", crate::db::DatabaseType::Oracle),
+        vec!["NUMBER".to_string()]
+    );
+}
+
+#[test]
+fn data_type_treat_as_is_a_type_position() {
+    let s = data_type_suggestions("SELECT TREAT(x AS |) FROM t", "", crate::db::DatabaseType::Oracle);
+    assert!(s.contains(&"XMLTYPE".to_string()));
+}
+
+#[test]
+fn data_type_mysql_cast_uses_restricted_grammar() {
+    let s = data_type_suggestions("SELECT CAST(x AS |) FROM t", "", crate::db::DatabaseType::MySQL);
+    assert!(s.contains(&"SIGNED".to_string()));
+    assert!(s.contains(&"UNSIGNED".to_string()));
+    // VARCHAR is not valid in a MySQL CAST.
+    assert!(!s.contains(&"VARCHAR".to_string()));
+}
+
+#[test]
+fn data_type_precision_argument_is_not_a_type_position() {
+    assert!(
+        data_type_suggestions("SELECT CAST(x AS NUMBER(|)) FROM t", "", crate::db::DatabaseType::Oracle)
+            .is_empty()
+    );
+}
+
+#[test]
+fn data_type_create_table_column_offers_types() {
+    let s = data_type_suggestions("CREATE TABLE t (id |)", "", crate::db::DatabaseType::Oracle);
+    assert!(s.contains(&"NUMBER".to_string()));
+    let s2 = data_type_suggestions("CREATE TABLE t (id NUMBER, name |)", "", crate::db::DatabaseType::Oracle);
+    assert!(s2.contains(&"VARCHAR2".to_string()));
+}
+
+#[test]
+fn data_type_mysql_column_def_uses_full_type_set() {
+    let s = data_type_suggestions("CREATE TABLE t (id |)", "", crate::db::DatabaseType::MySQL);
+    assert!(s.contains(&"VARCHAR".to_string()));
+    assert!(s.contains(&"TEXT".to_string()));
+    assert!(s.contains(&"DATETIME".to_string()));
+}
+
+#[test]
+fn data_type_alter_add_modify_change_column_offers_types() {
+    for sql in [
+        "ALTER TABLE t ADD col |",
+        "ALTER TABLE t MODIFY col |",
+        "ALTER TABLE t ADD COLUMN col |",
+        "ALTER TABLE t CHANGE old new |",
+    ] {
+        assert!(
+            !data_type_suggestions(sql, "", crate::db::DatabaseType::MySQL).is_empty(),
+            "expected type suggestions for: {sql}"
+        );
+    }
+}
+
+#[test]
+fn data_type_ordinary_as_alias_is_not_a_type_position() {
+    assert!(
+        data_type_suggestions("SELECT x AS | FROM t", "", crate::db::DatabaseType::Oracle).is_empty()
+    );
+}
+
+#[test]
+fn data_type_constraint_and_ctas_and_post_type_are_not_type_positions() {
+    for sql in [
+        "CREATE TABLE t (id NUMBER, CONSTRAINT |)",
+        "CREATE TABLE t AS SELECT col | FROM s",
+        "CREATE TABLE t (id NUMBER |)",
+        "SELECT a, | FROM t",
+    ] {
+        assert!(
+            data_type_suggestions(sql, "", crate::db::DatabaseType::Oracle).is_empty(),
+            "expected no type suggestions for: {sql}"
+        );
+    }
+}
+
+/// True when the given marker SQL yields PL/SQL data-type suggestions.
+fn has_plsql_type_suggestions(sql_with_cursor: &str, db: crate::db::DatabaseType) -> bool {
+    !data_type_suggestions(sql_with_cursor, "", db).is_empty()
+}
+
+#[test]
+fn data_type_plsql_variable_declaration_offers_types() {
+    use crate::db::DatabaseType::Oracle;
+    for sql in [
+        "DECLARE v | BEGIN NULL; END;",
+        "DECLARE v NUMBER; w | BEGIN NULL; END;",
+        "DECLARE v NUMBER; w CONSTANT | BEGIN NULL; END;",
+    ] {
+        assert!(has_plsql_type_suggestions(sql, Oracle), "expected types for: {sql}");
+    }
+}
+
+#[test]
+fn data_type_plsql_variable_type_list_includes_plsql_only_types() {
+    let s = data_type_suggestions("DECLARE v | BEGIN NULL; END;", "", crate::db::DatabaseType::Oracle);
+    assert!(s.contains(&"PLS_INTEGER".to_string()));
+    assert!(s.contains(&"SYS_REFCURSOR".to_string()));
+}
+
+#[test]
+fn data_type_plsql_routine_parameter_offers_types() {
+    use crate::db::DatabaseType::Oracle;
+    for sql in [
+        "CREATE FUNCTION f(p |) RETURN NUMBER IS BEGIN RETURN 1; END;",
+        "CREATE FUNCTION f(p IN |) RETURN NUMBER IS BEGIN RETURN 1; END;",
+        "CREATE FUNCTION f(p IN OUT |) RETURN NUMBER IS BEGIN RETURN 1; END;",
+        "CREATE FUNCTION f(a NUMBER, b |) RETURN NUMBER IS BEGIN RETURN 1; END;",
+        "CREATE PROCEDURE pr(x IN OUT |) IS BEGIN NULL; END;",
+    ] {
+        assert!(has_plsql_type_suggestions(sql, Oracle), "expected types for: {sql}");
+    }
+}
+
+#[test]
+fn data_type_mysql_routine_parameter_uses_mysql_types() {
+    let s = data_type_suggestions("CREATE PROCEDURE pr(x |) BEGIN END", "", crate::db::DatabaseType::MySQL);
+    assert!(s.contains(&"VARCHAR".to_string()));
+    assert!(s.contains(&"INT".to_string()));
+}
+
+#[test]
+fn data_type_plsql_function_return_offers_types() {
+    use crate::db::DatabaseType::Oracle;
+    for sql in [
+        "CREATE FUNCTION f RETURN | IS BEGIN RETURN 1; END;",
+        "CREATE FUNCTION f(p NUMBER) RETURN | IS BEGIN RETURN 1; END;",
+    ] {
+        assert!(has_plsql_type_suggestions(sql, Oracle), "expected return types for: {sql}");
+    }
+}
+
+#[test]
+fn data_type_plsql_collection_element_offers_types() {
+    assert!(has_plsql_type_suggestions(
+        "DECLARE TYPE t IS TABLE OF | ; BEGIN NULL; END;",
+        crate::db::DatabaseType::Oracle
+    ));
+}
+
+#[test]
+fn data_type_plsql_executable_section_is_not_a_type_position() {
+    use crate::db::DatabaseType::Oracle;
+    // None of these are declaration/signature positions; they must not offer types.
+    for sql in [
+        "DECLARE v NUMBER; BEGIN v | END;",
+        "DECLARE v NUMBER; BEGIN x := v | END;",
+        "BEGIN proc | END;",
+        "CREATE FUNCTION f RETURN NUMBER IS BEGIN RETURN | END;",
+        "DECLARE v NUMBER; BEGIN IF x | THEN NULL; END IF; END;",
+        "BEGIN FOR r | IN (SELECT 1 FROM dual) LOOP NULL; END LOOP; END;",
+    ] {
+        assert!(!has_plsql_type_suggestions(sql, Oracle), "unexpected types for: {sql}");
+    }
+}
+
+#[test]
+fn data_type_in_predicate_is_not_a_parameter_mode() {
+    assert!(!has_plsql_type_suggestions(
+        "SELECT * FROM t WHERE x IN | ",
+        crate::db::DatabaseType::Oracle
+    ));
+}
+
+#[test]
+fn data_type_for_update_of_column_is_not_a_type_position() {
+    // `FOR UPDATE OF <col>` is a column list, not a collection element type.
+    assert!(!has_plsql_type_suggestions(
+        "SELECT col FROM emp FOR UPDATE OF |",
+        crate::db::DatabaseType::Oracle
+    ));
+}
+
+#[test]
+fn data_type_create_type_table_of_offers_types() {
+    assert!(has_plsql_type_suggestions(
+        "CREATE TYPE t AS TABLE OF | ",
+        crate::db::DatabaseType::Oracle
+    ));
+}
+
+#[test]
+fn data_type_cursor_body_sql_in_declaration_region_is_not_a_type_position() {
+    use crate::db::DatabaseType::Oracle;
+    // A `CURSOR c IS SELECT ...` body sits inside a declaration region but is
+    // SQL, not a declaration; its clauses must never offer data types.
+    for sql in [
+        "DECLARE CURSOR c IS SELECT | FROM t; BEGIN NULL; END;",
+        "DECLARE CURSOR c IS SELECT a FROM | ; BEGIN NULL; END;",
+        "DECLARE v NUMBER := (SELECT max(x) FROM | ); BEGIN NULL; END;",
+        "CREATE FUNCTION f RETURN NUMBER IS CURSOR c IS SELECT | FROM t; BEGIN RETURN 1; END;",
+    ] {
+        assert!(!has_plsql_type_suggestions(sql, Oracle), "unexpected types for: {sql}");
+    }
+}
+
+#[test]
+fn data_type_declaration_after_cursor_or_subtype_still_offers_types() {
+    use crate::db::DatabaseType::Oracle;
+    for sql in [
+        "DECLARE CURSOR c IS SELECT 1 FROM dual; v | BEGIN NULL; END;",
+        "CREATE PROCEDURE p IS firstvar | BEGIN NULL; END;",
+        "DECLARE SUBTYPE s IS NUMBER; v | BEGIN NULL; END;",
+    ] {
+        assert!(has_plsql_type_suggestions(sql, Oracle), "expected types for: {sql}");
+    }
+}
+
+#[test]
+fn data_type_oracle_parenthesized_alter_offers_types() {
+    use crate::db::DatabaseType::Oracle;
+    for sql in [
+        "ALTER TABLE t ADD (col1 NUMBER, col2 |)",
+        "ALTER TABLE t MODIFY (col1 |)",
+        "CREATE GLOBAL TEMPORARY TABLE t (id |)",
+        "CREATE TABLE t (id NUMBER NOT NULL, name |)",
+    ] {
+        assert!(
+            !data_type_suggestions(sql, "", Oracle).is_empty(),
+            "expected types for: {sql}"
+        );
+    }
+}
+
+#[test]
+fn data_type_ddl_non_type_slots_offer_nothing() {
+    use crate::db::DatabaseType::Oracle;
+    for sql in [
+        "CREATE TABLE t (id NUMBER DEFAULT |)",
+        "ALTER TABLE t DROP COLUMN |",
+        "ALTER TABLE t ADD CONSTRAINT pk PRIMARY KEY (|)",
+        "CREATE TABLE t (a NUMBER, |)",
+        "CREATE TABLE t (id NUMBER, PRIMARY KEY (|))",
+        "CREATE INDEX ix ON t (|)",
+    ] {
+        assert!(
+            data_type_suggestions(sql, "", Oracle).is_empty(),
+            "unexpected types for: {sql}"
+        );
+    }
+}
+
+#[test]
+fn data_type_quoted_column_name_is_a_type_position() {
+    assert!(!data_type_suggestions(r#"CREATE TABLE t ("My Col" |)"#, "", crate::db::DatabaseType::Oracle).is_empty());
+    assert!(!data_type_suggestions("CREATE TABLE t (`my col` |)", "", crate::db::DatabaseType::MySQL).is_empty());
+}
+
+#[test]
+fn data_type_value_positions_after_complete_type_are_not_type_slots() {
+    use crate::db::DatabaseType::Oracle;
+    // A value follows DEFAULT / := , never a type.
+    for sql in [
+        "CREATE FUNCTION f(p NUMBER DEFAULT |) RETURN NUMBER IS BEGIN RETURN 1; END;",
+        "CREATE FUNCTION f(p IN NUMBER := |) RETURN NUMBER IS BEGIN RETURN 1; END;",
+        "CREATE TABLE t (id NUMBER DEFAULT |)",
+        "DECLARE v NUMBER := | BEGIN NULL; END;",
+        "BEGIN UPDATE t SET a=1 RETURNING a INTO | ; END;",
+    ] {
+        assert!(!has_plsql_type_suggestions(sql, Oracle), "unexpected types for: {sql}");
+    }
+}
+
+#[test]
+fn data_type_trigger_declaration_offers_types_but_body_does_not() {
+    use crate::db::DatabaseType::Oracle;
+    assert!(has_plsql_type_suggestions(
+        "CREATE TRIGGER trg BEFORE INSERT ON t FOR EACH ROW DECLARE v | BEGIN NULL; END;",
+        Oracle
+    ));
+    assert!(!has_plsql_type_suggestions(
+        "CREATE TRIGGER trg BEFORE INSERT ON t FOR EACH ROW BEGIN :NEW.col := | ; END;",
+        Oracle
+    ));
+}
+
+#[test]
+fn data_type_declaration_after_rowtype_member_still_offers_types() {
+    use crate::db::DatabaseType::Oracle;
+    assert!(has_plsql_type_suggestions(
+        "DECLARE v emp.sal%TYPE; w | BEGIN NULL; END;",
+        Oracle
+    ));
+}
+
+#[test]
+fn data_type_json_table_columns_clause_offers_types() {
+    use crate::db::DatabaseType::{Oracle, MySQL};
+    assert!(!data_type_suggestions(
+        "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id | PATH '$.id'))", "", Oracle).is_empty());
+    assert!(!data_type_suggestions(
+        "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id NUMBER PATH '$.id', name | PATH '$.n'))", "", Oracle).is_empty());
+    assert!(!data_type_suggestions(
+        "SELECT * FROM XMLTABLE('/r' PASSING x COLUMNS id | PATH 'id')", "", Oracle).is_empty());
+    assert!(!data_type_suggestions(
+        "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id | PATH '$.id'))", "", MySQL).is_empty());
+}
+
+#[test]
+fn data_type_table_named_columns_is_not_a_type_position() {
+    use crate::db::DatabaseType::{Oracle, MySQL};
+    // A table literally named/aliased around "columns" must never offer types.
+    assert!(data_type_suggestions("SELECT * FROM all_tab_columns c |", "", Oracle).is_empty());
+    assert!(data_type_suggestions("SELECT * FROM information_schema.columns x |", "", MySQL).is_empty());
+    // Before the COLUMNS keyword (the JSON expression) is not a type slot either.
+    assert!(data_type_suggestions(
+        "SELECT * FROM JSON_TABLE(d| , '$' COLUMNS (id NUMBER PATH '$.id'))", "", Oracle).is_empty());
+}
+
+#[test]
+fn data_type_prior_statement_does_not_leak_into_next() {
+    use crate::db::DatabaseType::Oracle;
+    // A PL/SQL or DDL statement before the cursor's statement must not push its
+    // declaration/routine/column context into the next statement.
+    for sql in [
+        "DECLARE v NUMBER; BEGIN NULL; END;\nSELECT col | FROM t",
+        "CREATE FUNCTION f RETURN NUMBER IS BEGIN RETURN 1; END;\nSELECT | FROM t",
+        "CREATE TABLE a (x NUMBER);\nSELECT col | FROM t",
+        "CREATE FUNCTION f(p IN NUMBER) RETURN NUMBER IS BEGIN RETURN 1; END;\nUPDATE t SET col = | WHERE id=1",
+        "BEGIN proc(); END;\nSELECT a, | FROM t",
+        "DECLARE CURSOR c IS SELECT 1 FROM dual; BEGIN NULL; END;\nINSERT INTO t (col, |) VALUES (1,2)",
+    ] {
+        assert!(
+            SqlEditorWidget::data_type_position_for_context(&analyze_inline_cursor_sql(sql), false)
+                .is_none(),
+            "prior statement leaked a type position into: {sql}"
+        );
+    }
+    // The current statement is still detected when it genuinely is a type slot.
+    assert!(
+        SqlEditorWidget::data_type_position_for_context(
+            &analyze_inline_cursor_sql("SELECT col FROM t;\nDECLARE v | BEGIN NULL; END;"),
+            false,
+        )
+        .is_some()
+    );
+}
+
+#[test]
+fn row_count_positions_suppress_columns() {
+    let at = |sql: &str| {
+        SqlEditorWidget::cursor_is_at_row_count_position_for_context(
+            &analyze_inline_cursor_sql(sql),
+            false,
+        )
+    };
+    // Row-count / offset slots accept only integers/binds.
+    assert!(at("SELECT * FROM orders ORDER BY id LIMIT |"));
+    assert!(at("SELECT * FROM orders LIMIT 10, |"));
+    assert!(at("SELECT * FROM orders LIMIT 10 OFFSET |"));
+    assert!(at("SELECT a FROM t OFFSET |"));
+    // Ordinary column positions are unaffected, including a `offset_*` column.
+    assert!(!at("SELECT | FROM orders"));
+    assert!(!at("SELECT a, | FROM orders"));
+    assert!(!at("SELECT * FROM orders WHERE | "));
+    assert!(!at("SELECT offset_days, | FROM t"));
+    assert!(!at("SELECT * FROM orders ORDER BY |"));
+}
+
+#[test]
+fn local_record_member_scope_boundary_and_nested_loops() {
+    let members = |sql: &str, q: &str| {
+        SqlEditorWidget::collect_local_record_member_suggestions_for_test(sql, q, "")
+    };
+    // A loop record is not visible outside its own loop.
+    assert!(members(
+        "BEGIN FOR rec IN (SELECT a FROM t) LOOP NULL; END LOOP; rec.__CODEX_CURSOR__ END;",
+        "rec",
+    )
+    .is_none());
+    // Inner loop sees its own record and the enclosing loop's record.
+    let inner = members(
+        "BEGIN FOR a IN (SELECT x FROM t1) LOOP FOR b IN (SELECT y FROM t2) LOOP b.__CODEX_CURSOR__ END LOOP; END LOOP; END;",
+        "b",
+    )
+    .expect("inner loop record visible");
+    assert_has_case_insensitive(&inner, "y");
+    let outer = members(
+        "BEGIN FOR a IN (SELECT x FROM t1) LOOP FOR b IN (SELECT y FROM t2) LOOP a.__CODEX_CURSOR__ END LOOP; END LOOP; END;",
+        "a",
+    )
+    .expect("enclosing loop record visible inside inner loop");
+    assert_has_case_insensitive(&outer, "x");
 }

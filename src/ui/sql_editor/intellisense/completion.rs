@@ -18,6 +18,18 @@ enum QualifiedCompletionMode {
     ObjectMembers,
 }
 
+/// Position kind where a SQL data type is expected. The keyword set differs by
+/// position for some dialects (e.g. MySQL `CAST` accepts a restricted grammar).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DataTypePosition {
+    /// `CAST(expr AS |)` / `TREAT(expr AS |)`.
+    Cast,
+    /// Column definition type slot in `CREATE TABLE` / `ALTER TABLE`.
+    ColumnDef,
+    /// PL/SQL type slot: variable/parameter/return/collection-element type.
+    Plsql,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExpectedObjectSuggestionKind {
     Any,
@@ -716,7 +728,21 @@ impl SqlEditorWidget {
         } else {
             Self::resolve_column_tables_for_context(qualifier, deep_ctx)
         };
+        // A data-type slot (`CAST(x AS |)`, a column definition) expects a type,
+        // not a column; suppress column suggestions there so the type keywords
+        // emitted by `collect_expected_keyword_suggestions` stand alone. A
+        // row-count slot (`LIMIT |`, `OFFSET |`) accepts only an integer/bind.
+        let at_data_type_position = qualifier.is_none()
+            && Self::data_type_position_for_context(deep_ctx, !snapshot.prefix.is_empty())
+                .is_some();
+        let at_row_count_position = qualifier.is_none()
+            && Self::cursor_is_at_row_count_position_for_context(
+                deep_ctx,
+                !snapshot.prefix.is_empty(),
+            );
         let include_columns = !has_local_record_member_scope
+            && !at_data_type_position
+            && !at_row_count_position
             && (matches!(
                 qualified_completion_mode,
                 Some(QualifiedCompletionMode::RelationColumns)
@@ -758,7 +784,11 @@ impl SqlEditorWidget {
             && !restrict_to_relation_columns
             && !matches!(context, SqlContext::VariableName | SqlContext::BindValue)
         {
-            Self::collect_expected_keyword_suggestions(&snapshot.prefix, deep_ctx)
+            Self::collect_expected_keyword_suggestions(
+                &snapshot.prefix,
+                deep_ctx,
+                Some(snapshot.preferred_db_type),
+            )
         } else {
             Vec::new()
         };
@@ -1400,6 +1430,780 @@ impl SqlEditorWidget {
         None
     }
 
+    /// True when the cursor sits directly inside the parentheses of a window
+    /// specification — either an inline `OVER (...)` or a named definition in a
+    /// `WINDOW name AS (...)` clause. Used to gate window-frame keyword hints
+    /// precisely, instead of merely checking that some `OVER` appears earlier in
+    /// the statement (which misfires after a closed `OVER ()` on a column named
+    /// `rows`/`current`/...). Paren depth is tracked so a `WINDOW` clause inside a
+    /// subquery is recognized while a `WITH cte AS (...)` body is not.
+    fn cursor_is_inside_window_spec(tokens: &[SqlToken], end: usize) -> bool {
+        // Stack entry = whether this open paren is a window-specification paren.
+        let mut spec_paren_stack: Vec<bool> = Vec::new();
+        let mut last_word_was_over = false;
+        let mut last_word_was_as = false;
+        // Paren depth at which a `WINDOW` clause is currently open, so only the
+        // `name AS (` parens belonging to that clause count as window specs.
+        let mut window_clause_depth: Option<usize> = None;
+        for token in tokens.get(..end).unwrap_or(tokens) {
+            let depth = spec_paren_stack.len();
+            match token {
+                SqlToken::Comment(_) => {}
+                SqlToken::Symbol(sym) if sym == "(" => {
+                    let is_window_spec = last_word_was_over
+                        || (last_word_was_as && window_clause_depth == Some(depth));
+                    spec_paren_stack.push(is_window_spec);
+                    last_word_was_over = false;
+                    last_word_was_as = false;
+                }
+                SqlToken::Symbol(sym) if sym == ")" => {
+                    spec_paren_stack.pop();
+                    last_word_was_over = false;
+                    last_word_was_as = false;
+                    if window_clause_depth.is_some_and(|d| spec_paren_stack.len() < d) {
+                        window_clause_depth = None;
+                    }
+                }
+                SqlToken::Symbol(sym) if sym == ";" && depth == 0 => {
+                    window_clause_depth = None;
+                    last_word_was_over = false;
+                    last_word_was_as = false;
+                }
+                SqlToken::Word(word) => {
+                    last_word_was_over = word.eq_ignore_ascii_case("OVER");
+                    last_word_was_as = word.eq_ignore_ascii_case("AS");
+                    if word.eq_ignore_ascii_case("WINDOW") {
+                        window_clause_depth = Some(depth);
+                    }
+                }
+                _ => {
+                    last_word_was_over = false;
+                    last_word_was_as = false;
+                }
+            }
+        }
+        spec_paren_stack.last().copied().unwrap_or(false)
+    }
+
+    /// Window-frame keyword hints inside an `OVER (... ROWS|RANGE|GROUPS ...)`
+    /// clause. The sibling of `expected_row_limiting_keyword_candidates`: these
+    /// positions expect frame keywords (`BETWEEN`, `UNBOUNDED PRECEDING`,
+    /// `CURRENT ROW`, `PRECEDING`/`FOLLOWING`) rather than columns. Gated on the
+    /// cursor being inside a window specification (`OVER (...)` or `WINDOW name AS
+    /// (...)`) so a column named `rows`/`range`/`current`/`groups` outside a
+    /// window never triggers it.
+    fn expected_window_frame_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> Option<&'static [&'static str]> {
+        const FRAME_START: &[&str] = &["BETWEEN", "UNBOUNDED", "CURRENT"];
+        const FRAME_BOUND: &[&str] = &["UNBOUNDED", "CURRENT"];
+        const DIRECTION: &[&str] = &["PRECEDING", "FOLLOWING"];
+        const CURRENT_TAIL: &[&str] = &["ROW"];
+
+        if !Self::cursor_is_inside_window_spec(tokens, end) {
+            return None;
+        }
+
+        let words = Self::previous_meaningful_words_upper(tokens, end, 4);
+        let len = words.len();
+        let word = |from_end: usize| {
+            len.checked_sub(from_end)
+                .and_then(|idx| words.get(idx))
+                .map(String::as_str)
+        };
+        let is_frame_unit =
+            |w: Option<&str>| matches!(w, Some("ROWS") | Some("RANGE") | Some("GROUPS"));
+
+        // `UNBOUNDED |` -> PRECEDING / FOLLOWING
+        if word(1) == Some("UNBOUNDED") {
+            return Some(DIRECTION);
+        }
+        // `CURRENT |` -> ROW
+        if word(1) == Some("CURRENT") {
+            return Some(CURRENT_TAIL);
+        }
+        // `ROWS|RANGE|GROUPS BETWEEN |` -> first bound
+        if word(1) == Some("BETWEEN") && is_frame_unit(word(2)) {
+            return Some(FRAME_BOUND);
+        }
+        // `... BETWEEN <bound> AND |` -> second bound. Anchored on a frame-only
+        // marker so an ordinary `x BETWEEN a AND |` predicate is left untouched.
+        if word(1) == Some("AND")
+            && words.iter().any(|w| {
+                matches!(w.as_str(), "UNBOUNDED" | "PRECEDING" | "FOLLOWING" | "CURRENT")
+                    || is_frame_unit(Some(w.as_str()))
+            })
+        {
+            return Some(FRAME_BOUND);
+        }
+        // `ROWS|RANGE|GROUPS |` -> BETWEEN or a single bound
+        if is_frame_unit(word(1)) {
+            return Some(FRAME_START);
+        }
+
+        None
+    }
+
+    /// The word immediately preceding the innermost still-open paren at the
+    /// cursor (e.g. `ADD` for `ADD (col |)`), or `None` at top level.
+    fn innermost_open_paren_preceding_word(tokens: &[SqlToken], end: usize) -> Option<String> {
+        let mut preceding_word_stack: Vec<Option<String>> = Vec::new();
+        let mut last_word: Option<String> = None;
+        for token in tokens.get(..end).unwrap_or(tokens) {
+            match token {
+                SqlToken::Comment(_) => {}
+                SqlToken::Symbol(sym) if sym == "(" => {
+                    preceding_word_stack.push(last_word.take());
+                }
+                SqlToken::Symbol(sym) if sym == ")" => {
+                    preceding_word_stack.pop();
+                    last_word = None;
+                }
+                SqlToken::Word(word) => last_word = Some(word.clone()),
+                _ => last_word = None,
+            }
+        }
+        preceding_word_stack.last().cloned().flatten()
+    }
+
+    /// Non-comment tokens strictly before `end`, in order.
+    fn meaningful_tokens_before(tokens: &[SqlToken], end: usize) -> Vec<&SqlToken> {
+        tokens
+            .get(..end)
+            .unwrap_or(tokens)
+            .iter()
+            .filter(|token| !matches!(token, SqlToken::Comment(_)))
+            .collect()
+    }
+
+    /// Words that occupy a column-name slot in DDL but are not column names, so a
+    /// following cursor is not a data-type position (`CONSTRAINT pk ...`, etc.).
+    fn is_ddl_structural_keyword(word: &str) -> bool {
+        matches!(
+            word.to_ascii_uppercase().as_str(),
+            "CONSTRAINT"
+                | "PRIMARY"
+                | "FOREIGN"
+                | "UNIQUE"
+                | "CHECK"
+                | "KEY"
+                | "INDEX"
+                | "COLUMN"
+                | "ADD"
+                | "MODIFY"
+                | "CHANGE"
+                | "DROP"
+                | "RENAME"
+                | "NOT"
+                | "NULL"
+                | "DEFAULT"
+                | "REFERENCES"
+                | "TABLE"
+                | "AS"
+                | "SELECT"
+                | "PERIOD"
+                | "PARTITION"
+                | "USING"
+                | "ENABLE"
+                | "DISABLE"
+        )
+    }
+
+    /// Classify whether the cursor sits where a SQL data type is expected, and in
+    /// which kind of position (the keyword set differs for some dialects).
+    fn data_type_position(tokens: &[SqlToken], end: usize) -> Option<DataTypePosition> {
+        if Self::cursor_is_after_cast_as(tokens, end) {
+            return Some(DataTypePosition::Cast);
+        }
+        if Self::cursor_is_at_ddl_column_type(tokens, end) {
+            return Some(DataTypePosition::ColumnDef);
+        }
+        if Self::cursor_is_in_table_function_columns_type(tokens, end) {
+            return Some(DataTypePosition::ColumnDef);
+        }
+        if Self::cursor_is_at_plsql_type(tokens, end) {
+            return Some(DataTypePosition::Plsql);
+        }
+        None
+    }
+
+    /// True when the cursor is at a column-type slot inside a `JSON_TABLE`/
+    /// `XMLTABLE` `COLUMNS` clause — `COLUMNS (id | PATH …)` or `COLUMNS id |`.
+    /// Scoped to the table function so an ordinary table named `columns` with an
+    /// alias never triggers it.
+    fn cursor_is_in_table_function_columns_type(tokens: &[SqlToken], end: usize) -> bool {
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        if toks.len() < 2 {
+            return false;
+        }
+        let last = toks.len() - 1;
+        // The cursor must follow a plain column-name identifier.
+        if !matches!(toks.get(last), Some(SqlToken::Word(word)) if !Self::is_ddl_structural_keyword(word))
+        {
+            return false;
+        }
+        let anchored = matches!(toks.get(last - 1), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("COLUMNS"))
+            || matches!(toks.get(last - 1), Some(SqlToken::Symbol(sym)) if sym == "(" || sym == ",");
+        if !anchored {
+            return false;
+        }
+
+        // Confirm the cursor is inside a `JSON_TABLE`/`XMLTABLE` call, past its
+        // `COLUMNS` keyword.
+        struct Frame {
+            follows_table_fn: bool,
+            columns_seen: bool,
+        }
+        let mut stack: Vec<Frame> = Vec::new();
+        let mut last_word: Option<String> = None;
+        for token in tokens.get(..end).unwrap_or(tokens) {
+            match token {
+                SqlToken::Comment(_) => {}
+                SqlToken::Symbol(sym) if sym == "(" => {
+                    let follows_table_fn = last_word.as_deref().is_some_and(|word| {
+                        word.eq_ignore_ascii_case("JSON_TABLE")
+                            || word.eq_ignore_ascii_case("XMLTABLE")
+                    });
+                    stack.push(Frame {
+                        follows_table_fn,
+                        columns_seen: false,
+                    });
+                    last_word = None;
+                }
+                SqlToken::Symbol(sym) if sym == ")" => {
+                    stack.pop();
+                    last_word = None;
+                }
+                SqlToken::Word(word) => {
+                    if word.eq_ignore_ascii_case("COLUMNS") {
+                        if let Some(top) = stack.last_mut() {
+                            if top.follows_table_fn {
+                                top.columns_seen = true;
+                            }
+                        }
+                    }
+                    last_word = Some(word.clone());
+                }
+                _ => last_word = None,
+            }
+        }
+        stack
+            .iter()
+            .any(|frame| frame.follows_table_fn && frame.columns_seen)
+    }
+
+    /// True when the cursor is at a PL/SQL type slot: a routine parameter type
+    /// (`PROCEDURE p(x |)`, `(x IN |)`), a function `RETURN |` type, a collection
+    /// element type (`TABLE OF |`), or a variable declaration type in a
+    /// declaration region (`DECLARE v |`, `…; w |`).
+    fn cursor_is_at_plsql_type(tokens: &[SqlToken], end: usize) -> bool {
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        if toks.len() < 2 {
+            return false;
+        }
+        let last = toks.len() - 1;
+        let is_word = |idx: usize, kw: &str| {
+            matches!(toks.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case(kw))
+        };
+        let is_symbol = |idx: usize, sym: &str| {
+            matches!(toks.get(idx), Some(SqlToken::Symbol(value)) if value == sym)
+        };
+        let is_plain_identifier = |idx: usize| {
+            matches!(toks.get(idx), Some(SqlToken::Word(word)) if !Self::is_plsql_non_type_keyword(word))
+        };
+
+        // Function/cursor `RETURN |` signature type — a `RETURN <expr>` statement
+        // lives inside the body, so it is excluded by the routine-header check
+        // (`REF CURSOR RETURN |` in a type declaration is matched separately).
+        if is_word(last, "RETURN")
+            && (is_word(last - 1, "CURSOR") || Self::cursor_is_in_routine_header(tokens, end))
+        {
+            return true;
+        }
+        // Collection element type — `TABLE OF |`, `VARRAY(n) OF |`. Anchored on
+        // `TABLE` or a declaration region so SQL's `FOR UPDATE OF <col>` (a column
+        // position) never offers types.
+        if is_word(last, "OF")
+            && (is_word(last - 1, "TABLE")
+                || Self::cursor_is_in_plsql_declaration_region(tokens, end))
+        {
+            return true;
+        }
+
+        // Routine parameter type, when the cursor is inside a routine's parameter
+        // parentheses.
+        if Self::cursor_is_inside_routine_param_list(tokens, end) {
+            // After a parameter mode (`IN`, `OUT`, `IN OUT`, `NOCOPY`).
+            if is_word(last, "IN") || is_word(last, "OUT") || is_word(last, "NOCOPY") {
+                return true;
+            }
+            // Right after the parameter name that begins a parameter.
+            if is_plain_identifier(last) && (is_symbol(last - 1, "(") || is_symbol(last - 1, ",")) {
+                return true;
+            }
+        }
+
+        // Variable declaration type inside a declaration region — the var name is
+        // a plain identifier that starts a declaration (`DECLARE`, after `;`, or
+        // after a routine `IS`/`AS`), or `name CONSTANT |`.
+        if Self::cursor_is_in_plsql_declaration_region(tokens, end) {
+            if is_word(last, "CONSTANT") {
+                return true;
+            }
+            if is_plain_identifier(last)
+                && (is_symbol(last - 1, ";")
+                    || is_word(last - 1, "DECLARE")
+                    || is_word(last - 1, "IS")
+                    || is_word(last - 1, "AS"))
+            {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Keywords that occupy an identifier slot in PL/SQL declarations but are not
+    /// a variable name, so a following cursor is not a declaration-type position.
+    fn is_plsql_non_type_keyword(word: &str) -> bool {
+        matches!(
+            word.to_ascii_uppercase().as_str(),
+            "CONSTANT"
+                | "TYPE"
+                | "SUBTYPE"
+                | "CURSOR"
+                | "PRAGMA"
+                | "FUNCTION"
+                | "PROCEDURE"
+                | "BEGIN"
+                | "END"
+                | "DECLARE"
+                | "IS"
+                | "AS"
+                | "EXCEPTION"
+                | "RETURN"
+                | "IN"
+                | "OUT"
+                | "NOCOPY"
+                | "NOT"
+                | "NULL"
+                | "DEFAULT"
+                | "OF"
+                // SQL statement keywords can follow a cursor/routine `IS` (e.g.
+                // `CURSOR c IS SELECT ...`); they are never a declared variable
+                // name, so they must not be treated as a declaration-type slot.
+                | "SELECT"
+                | "INSERT"
+                | "UPDATE"
+                | "DELETE"
+                | "MERGE"
+                | "WITH"
+                | "VALUES"
+        )
+    }
+
+    /// True when the innermost still-open paren at the cursor is a routine or
+    /// cursor parameter list — opened right after `FUNCTION|PROCEDURE|CURSOR name`.
+    fn cursor_is_inside_routine_param_list(tokens: &[SqlToken], end: usize) -> bool {
+        // Stack entry = whether this open paren is a routine/cursor param list,
+        // i.e. opened right after `FUNCTION|PROCEDURE|CURSOR <name>`.
+        let mut param_paren_stack: Vec<bool> = Vec::new();
+        // The two most recent words seen since the last symbol.
+        let mut last_word: Option<String> = None;
+        let mut second_last_word: Option<String> = None;
+        for token in tokens.get(..end).unwrap_or(tokens) {
+            match token {
+                SqlToken::Comment(_) => {}
+                SqlToken::Symbol(sym) if sym == "(" => {
+                    let name_is_identifier = last_word
+                        .as_deref()
+                        .is_some_and(|word| !Self::is_plsql_non_type_keyword(word));
+                    let preceded_by_routine_keyword = second_last_word.as_deref().is_some_and(|word| {
+                        matches!(
+                            word.to_ascii_uppercase().as_str(),
+                            "FUNCTION" | "PROCEDURE" | "CURSOR"
+                        )
+                    });
+                    param_paren_stack.push(name_is_identifier && preceded_by_routine_keyword);
+                    last_word = None;
+                    second_last_word = None;
+                }
+                SqlToken::Symbol(sym) if sym == ")" => {
+                    param_paren_stack.pop();
+                    last_word = None;
+                    second_last_word = None;
+                }
+                SqlToken::Word(word) => {
+                    second_last_word = last_word.take();
+                    last_word = Some(word.clone());
+                }
+                _ => {
+                    last_word = None;
+                    second_last_word = None;
+                }
+            }
+        }
+        param_paren_stack.last().copied().unwrap_or(false)
+    }
+
+    /// True when the cursor is in a routine signature/header — after a
+    /// `FUNCTION`/`PROCEDURE` keyword and before that routine's `IS`/`AS`/`BEGIN`.
+    /// Distinguishes a function-signature `RETURN type` from a body `RETURN expr`.
+    fn cursor_is_in_routine_header(tokens: &[SqlToken], end: usize) -> bool {
+        let mut in_header = false;
+        for token in tokens.get(..end).unwrap_or(tokens) {
+            if let SqlToken::Word(word) = token {
+                match word.to_ascii_uppercase().as_str() {
+                    "FUNCTION" | "PROCEDURE" => in_header = true,
+                    "IS" | "AS" | "BEGIN" => in_header = false,
+                    _ => {}
+                }
+            }
+        }
+        in_header
+    }
+
+    /// True when the cursor sits in a PL/SQL declaration region — after `DECLARE`
+    /// or a routine `IS`/`AS` header and before that block's `BEGIN`.
+    fn cursor_is_in_plsql_declaration_region(tokens: &[SqlToken], end: usize) -> bool {
+        // Stack entry = whether this block frame is still in its declaration phase.
+        let mut block_stack: Vec<bool> = Vec::new();
+        let mut pending_routine_header = false;
+        for token in tokens.get(..end).unwrap_or(tokens) {
+            match token {
+                SqlToken::Comment(_) => {}
+                SqlToken::Word(word) => {
+                    let upper = word.to_ascii_uppercase();
+                    match upper.as_str() {
+                        "FUNCTION" | "PROCEDURE" | "PACKAGE" => pending_routine_header = true,
+                        "DECLARE" => block_stack.push(true),
+                        "IS" | "AS" => {
+                            if pending_routine_header {
+                                block_stack.push(true);
+                                pending_routine_header = false;
+                            }
+                        }
+                        "BEGIN" => {
+                            if matches!(block_stack.last(), Some(true)) {
+                                *block_stack.last_mut().unwrap() = false;
+                            } else {
+                                block_stack.push(false);
+                            }
+                            pending_routine_header = false;
+                        }
+                        "END" => {
+                            block_stack.pop();
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        matches!(block_stack.last(), Some(true))
+    }
+
+    /// True when the cursor is right after the `AS` of a `CAST`/`TREAT`/`XMLCAST`
+    /// call — `CAST(expr AS |)`. Anchored on the enclosing function so precision
+    /// args (`CAST(x AS NUMBER(|))`) and ordinary `AS` aliases never trigger it.
+    fn cursor_is_after_cast_as(tokens: &[SqlToken], end: usize) -> bool {
+        // Stack entry = whether this open paren follows CAST/TREAT/XMLCAST.
+        let mut cast_paren_stack: Vec<bool> = Vec::new();
+        let mut last_word: Option<&str> = None;
+        for token in tokens.get(..end).unwrap_or(tokens) {
+            match token {
+                SqlToken::Comment(_) => {}
+                SqlToken::Symbol(sym) if sym == "(" => {
+                    let follows_cast = last_word.is_some_and(|word| {
+                        word.eq_ignore_ascii_case("CAST")
+                            || word.eq_ignore_ascii_case("TREAT")
+                            || word.eq_ignore_ascii_case("XMLCAST")
+                    });
+                    cast_paren_stack.push(follows_cast);
+                    last_word = None;
+                }
+                SqlToken::Symbol(sym) if sym == ")" => {
+                    cast_paren_stack.pop();
+                    last_word = None;
+                }
+                SqlToken::Word(word) => last_word = Some(word),
+                _ => last_word = None,
+            }
+        }
+        cast_paren_stack.last().copied().unwrap_or(false)
+            && last_word.is_some_and(|word| word.eq_ignore_ascii_case("AS"))
+    }
+
+    /// True when the cursor is at the type slot of a column definition in
+    /// `CREATE TABLE (... col |)` or `ALTER TABLE ... ADD|MODIFY|CHANGE ... col |`.
+    fn cursor_is_at_ddl_column_type(tokens: &[SqlToken], end: usize) -> bool {
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        if toks.len() < 3 {
+            return false;
+        }
+        let word_upper = |idx: usize| match toks.get(idx) {
+            Some(SqlToken::Word(word)) => Some(word.to_ascii_uppercase()),
+            _ => None,
+        };
+        let is_symbol = |idx: usize, sym: &str| {
+            matches!(toks.get(idx), Some(SqlToken::Symbol(value)) if value == sym)
+        };
+        let any_word = |kw: &str| {
+            toks.iter()
+                .any(|token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case(kw)))
+        };
+
+        // The cursor must follow a plain column-name identifier.
+        let last = toks.len() - 1;
+        let last_is_plain_identifier = matches!(toks.get(last), Some(SqlToken::Word(word)) if !Self::is_ddl_structural_keyword(word));
+        if !last_is_plain_identifier {
+            return false;
+        }
+
+        let starts_with = |kw: &str| word_upper(0).as_deref() == Some(kw);
+
+        if starts_with("ALTER") && any_word("TABLE") {
+            // `ADD col |`, `MODIFY col |`, `ADD|MODIFY|CHANGE COLUMN col |`,
+            // `CHANGE old new |`.
+            let w2 = word_upper(last - 1);
+            let w3 = word_upper(last - 2);
+            if matches!(w2.as_deref(), Some("ADD") | Some("MODIFY")) {
+                return true;
+            }
+            if w2.as_deref() == Some("COLUMN")
+                && matches!(w3.as_deref(), Some("ADD") | Some("MODIFY") | Some("CHANGE"))
+            {
+                return true;
+            }
+            if w3.as_deref() == Some("CHANGE") {
+                return true;
+            }
+            // Oracle parenthesized form: `ADD (col |)`, `MODIFY (c1 NUMBER, c2 |)`.
+            // The enclosing paren must directly follow `ADD`/`MODIFY` so that
+            // `ADD CHECK (...)` / `ADD CONSTRAINT ... (...)` are not mistaken.
+            if is_symbol(last - 1, "(") || is_symbol(last - 1, ",") {
+                if let Some(word) = Self::innermost_open_paren_preceding_word(tokens, end) {
+                    if matches!(word.to_ascii_uppercase().as_str(), "ADD" | "MODIFY") {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        if starts_with("CREATE") && any_word("TABLE") && !any_word("SELECT") {
+            // Inside the column-definition list, a column name begins after `(` or
+            // `,`. Exclude CTAS column lists (handled by the `SELECT` guard above).
+            if is_symbol(last - 1, "(") || is_symbol(last - 1, ",") {
+                let open_parens = toks
+                    .iter()
+                    .filter(|token| matches!(token, SqlToken::Symbol(sym) if sym == "("))
+                    .count();
+                let close_parens = toks
+                    .iter()
+                    .filter(|token| matches!(token, SqlToken::Symbol(sym) if sym == ")"))
+                    .count();
+                return open_parens > close_parens;
+            }
+        }
+
+        false
+    }
+
+    /// Data-type keyword set for a dialect and position. MySQL/MariaDB restrict
+    /// the `CAST(... AS type)` grammar to a subset, so that position differs from
+    /// a full column definition; Oracle uses one list for both.
+    fn data_type_keywords_for(
+        db_type: Option<crate::db::DatabaseType>,
+        position: DataTypePosition,
+    ) -> &'static [&'static str] {
+        use crate::db::DatabaseType;
+
+        const ORACLE_TYPES: &[&str] = &[
+            "VARCHAR2",
+            "NVARCHAR2",
+            "CHAR",
+            "NCHAR",
+            "NUMBER",
+            "FLOAT",
+            "BINARY_FLOAT",
+            "BINARY_DOUBLE",
+            "DATE",
+            "TIMESTAMP",
+            "INTERVAL",
+            "CLOB",
+            "NCLOB",
+            "BLOB",
+            "BFILE",
+            "RAW",
+            "LONG",
+            "ROWID",
+            "UROWID",
+            "XMLTYPE",
+            "JSON",
+            "BOOLEAN",
+            "INTEGER",
+            "INT",
+            "SMALLINT",
+            "DECIMAL",
+            "NUMERIC",
+            "REAL",
+        ];
+        const MYSQL_COLUMN_TYPES: &[&str] = &[
+            "TINYINT",
+            "SMALLINT",
+            "MEDIUMINT",
+            "INT",
+            "INTEGER",
+            "BIGINT",
+            "DECIMAL",
+            "NUMERIC",
+            "FLOAT",
+            "DOUBLE",
+            "BIT",
+            "BOOLEAN",
+            "CHAR",
+            "VARCHAR",
+            "BINARY",
+            "VARBINARY",
+            "TINYBLOB",
+            "BLOB",
+            "MEDIUMBLOB",
+            "LONGBLOB",
+            "TINYTEXT",
+            "TEXT",
+            "MEDIUMTEXT",
+            "LONGTEXT",
+            "ENUM",
+            "SET",
+            "DATE",
+            "DATETIME",
+            "TIMESTAMP",
+            "TIME",
+            "YEAR",
+            "JSON",
+        ];
+        // The grammar that `CAST(expr AS type)` accepts in MySQL/MariaDB.
+        const MYSQL_CAST_TYPES: &[&str] = &[
+            "BINARY",
+            "CHAR",
+            "DATE",
+            "DATETIME",
+            "DECIMAL",
+            "DOUBLE",
+            "FLOAT",
+            "JSON",
+            "NCHAR",
+            "REAL",
+            "SIGNED",
+            "TIME",
+            "UNSIGNED",
+            "YEAR",
+        ];
+
+        // PL/SQL adds a handful of types that exist only in stored code.
+        const ORACLE_PLSQL_TYPES: &[&str] = &[
+            "VARCHAR2",
+            "NVARCHAR2",
+            "CHAR",
+            "NCHAR",
+            "NUMBER",
+            "PLS_INTEGER",
+            "BINARY_INTEGER",
+            "SIMPLE_INTEGER",
+            "BINARY_FLOAT",
+            "BINARY_DOUBLE",
+            "FLOAT",
+            "DATE",
+            "TIMESTAMP",
+            "INTERVAL",
+            "CLOB",
+            "NCLOB",
+            "BLOB",
+            "BFILE",
+            "RAW",
+            "ROWID",
+            "UROWID",
+            "XMLTYPE",
+            "BOOLEAN",
+            "INTEGER",
+            "INT",
+            "SMALLINT",
+            "DECIMAL",
+            "NUMERIC",
+            "REAL",
+            "SYS_REFCURSOR",
+        ];
+
+        match db_type.unwrap_or(DatabaseType::Oracle) {
+            DatabaseType::Oracle => match position {
+                DataTypePosition::Plsql => ORACLE_PLSQL_TYPES,
+                _ => ORACLE_TYPES,
+            },
+            DatabaseType::MySQL | DatabaseType::MariaDB => match position {
+                DataTypePosition::Cast => MYSQL_CAST_TYPES,
+                DataTypePosition::ColumnDef | DataTypePosition::Plsql => MYSQL_COLUMN_TYPES,
+            },
+        }
+    }
+
+    /// Whether the cursor in `deep_ctx` is at a data-type position (used to both
+    /// emit type suggestions and suppress column suggestions there).
+    fn data_type_position_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> Option<DataTypePosition> {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::data_type_position(tokens, end)
+    }
+
+    /// True when the cursor is at a row-count / offset argument — `LIMIT |`,
+    /// `LIMIT <offset>, |`, or `OFFSET |`. These accept an integer literal or
+    /// bind only, never a column, so column suggestions are suppressed there.
+    fn cursor_is_at_row_count_position(tokens: &[SqlToken], end: usize) -> bool {
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        let n = toks.len();
+        if n == 0 {
+            return false;
+        }
+        let is_word = |idx: usize, kw: &str| {
+            matches!(toks.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case(kw))
+        };
+        // `LIMIT |` / `OFFSET |`.
+        if is_word(n - 1, "LIMIT") || is_word(n - 1, "OFFSET") {
+            return true;
+        }
+        // MySQL `LIMIT <offset>, |` — the count after the comma.
+        if n >= 3
+            && matches!(toks.get(n - 1), Some(SqlToken::Symbol(sym)) if sym == ",")
+            && is_word(n - 3, "LIMIT")
+        {
+            return true;
+        }
+        false
+    }
+
+    fn cursor_is_at_row_count_position_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::cursor_is_at_row_count_position(tokens, end)
+    }
+
     fn previous_meaningful_words_with_bind_markers_upper(
         tokens: &[SqlToken],
         end: usize,
@@ -1641,6 +2445,7 @@ impl SqlEditorWidget {
     fn collect_expected_keyword_suggestions(
         prefix: &str,
         deep_ctx: &intellisense_context::CursorContext,
+        db_type: Option<crate::db::DatabaseType>,
     ) -> Vec<String> {
         const TOP_LEVEL_KEYWORDS: &[&str] = &[
             "SELECT", "WITH", "INSERT", "UPDATE", "DELETE", "MERGE", "CREATE", "ALTER", "DROP",
@@ -1764,6 +2569,19 @@ impl SqlEditorWidget {
         if let Some(candidates) = Self::expected_row_limiting_keyword_candidates(tokens, context_end)
         {
             return Self::filter_expected_candidates(prefix, candidates);
+        }
+
+        if let Some(candidates) =
+            Self::expected_window_frame_keyword_candidates(tokens, context_end)
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+
+        if let Some(position) = Self::data_type_position(tokens, context_end) {
+            return Self::filter_expected_candidates(
+                prefix,
+                Self::data_type_keywords_for(db_type, position),
+            );
         }
 
         let words = Self::previous_meaningful_words_upper(tokens, context_end, 6);

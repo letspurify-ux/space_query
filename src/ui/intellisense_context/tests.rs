@@ -10430,3 +10430,22 @@ fn unreferenced_cte_still_exposed_as_scope_relation() {
     assert!(scope_descriptors(&ctx).contains(&"C[cte=true]".to_string()));
     assert!(scope_descriptors(&ctx).contains(&"OTHER[cte=false]".to_string()));
 }
+
+#[test]
+fn zzz_probe_typepos() {
+    let p = |sql: &str| {
+        let ctx = analyze(sql);
+        eprintln!("TP phase={:?} d={} :: {}", ctx.phase, ctx.depth, sql);
+    };
+    p("SELECT CAST(x AS |) FROM t");
+    p("SELECT CAST(x AS NUMB|) FROM t");
+    p("SELECT TREAT(x AS |) FROM t");
+    p("SELECT CONVERT(x, |) FROM t");
+    p("CREATE TABLE t (id |)");
+    p("CREATE TABLE t (id NUMBER, name |)");
+    p("ALTER TABLE t ADD col |");
+    p("ALTER TABLE t MODIFY col |");
+    p("DECLARE v | BEGIN NULL; END;");
+    p("DECLARE v NUMBER; x | BEGIN NULL; END;");
+    p("CREATE TABLE t (id NUMBER(|))");
+}
