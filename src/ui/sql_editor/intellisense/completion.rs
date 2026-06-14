@@ -665,6 +665,25 @@ impl SqlEditorWidget {
         let completion_policy =
             ClauseCompletionPolicy::for_phase(deep_ctx.phase, qualifier.is_some());
         let restrict_to_relation_columns = completion_policy.restrict_to_relation_columns;
+        // A pure keyword-only position accepts only a fixed keyword, never an
+        // identifier — either a clause-keyword continuation (`ORDER |`/`GROUP |`/
+        // `<join-type> |` …) or the `IS [NOT] |` null-test operator. The phase
+        // machine leaves the cursor in the surrounding table/column phase there,
+        // so every identifier source (relations, columns, in-scope aliases/CTEs,
+        // local PL/SQL symbols, `*`) must be suppressed; the
+        // `expected_keyword_suggestions` merge below still supplies the lone
+        // `BY`/`WITH`/`JOIN`/`NULL` hints. The flag is also folded into
+        // `at_keyword_only_slot` (via the shared
+        // `cursor_is_at_column_suppressing_keyword_slot` chokepoint) so
+        // column-gated paths stay consistent.
+        let at_pure_keyword_continuation = qualifier.is_none()
+            && (Self::cursor_is_at_pure_clause_keyword_continuation_for_context(
+                deep_ctx,
+                !snapshot.prefix.is_empty(),
+            ) || Self::cursor_is_at_is_null_test_keyword_position_for_context(
+                deep_ctx,
+                !snapshot.prefix.is_empty(),
+            ));
         let cursor_in_statement = snapshot
             .cursor_pos_usize
             .saturating_sub(analysis.statement_start)
@@ -674,6 +693,7 @@ impl SqlEditorWidget {
                     .saturating_sub(analysis.statement_start),
             );
         let session_bind_names = if qualifier.is_none()
+            && !at_pure_keyword_continuation
             && !matches!(context, SqlContext::TableName)
             && !restrict_to_relation_columns
         {
@@ -682,6 +702,7 @@ impl SqlEditorWidget {
             Vec::new()
         };
         let local_suggestions = if qualifier.is_none()
+            && !at_pure_keyword_continuation
             && !matches!(context, SqlContext::TableName)
             && !restrict_to_relation_columns
         {
@@ -1011,6 +1032,10 @@ impl SqlEditorWidget {
             qualified_member_suggestions
         } else if replace_table_context_with_expected_objects {
             expected_object_suggestions.clone()
+        } else if at_pure_keyword_continuation {
+            // Only the trailing clause keyword is grammatical here; the keyword
+            // merge below supplies it, so the identifier base stays empty.
+            Vec::new()
         } else {
             let mut data = intellisense_data
                 .lock()
@@ -1076,8 +1101,11 @@ impl SqlEditorWidget {
                 deep_ctx.phase,
             );
         }
-        let wildcard_suggestions =
-            Self::collect_clause_wildcard_suggestions(&snapshot.prefix, qualifier, deep_ctx);
+        let wildcard_suggestions = if at_pure_keyword_continuation {
+            Vec::new()
+        } else {
+            Self::collect_clause_wildcard_suggestions(&snapshot.prefix, qualifier, deep_ctx)
+        };
         if !wildcard_suggestions.is_empty() {
             suggestions = Self::merge_suggestions_with_context_aliases(
                 suggestions,
@@ -1104,6 +1132,7 @@ impl SqlEditorWidget {
         let context_name_suggestions =
             if matches!(context, SqlContext::VariableName | SqlContext::BindValue)
                 || restrict_to_relation_columns
+                || at_pure_keyword_continuation
             {
                 Vec::new()
             } else {
@@ -2257,6 +2286,118 @@ impl SqlEditorWidget {
                 .is_some()
             || Self::interval_unit_position_for_context(deep_ctx, exclude_current_identifier_chain)
                 .is_some()
+            || Self::cursor_is_at_pure_clause_keyword_continuation_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
+            || Self::cursor_is_at_is_null_test_keyword_position_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
+    }
+
+    /// True when the cursor sits at a "pure clause-keyword continuation" slot:
+    /// immediately after a clause-starter keyword whose only grammatical
+    /// continuation is another fixed keyword, never an identifier. These are the
+    /// multi-word clause openers whose first word the phase machine cannot yet
+    /// resolve (the trailing `BY`/`WITH`/`JOIN` has not been typed), so the
+    /// cursor is left in the surrounding table/column phase and would otherwise
+    /// offer every relation or column there:
+    ///
+    ///   * `ORDER |` / `GROUP |` / `CONNECT |`           → `BY`
+    ///   * `PARTITION |` (inside an `OVER`/`WINDOW` spec) → `BY`
+    ///   * `ORDER SIBLINGS |`                            → `BY`
+    ///   * `START |`                                     → `WITH`
+    ///   * `LEFT|RIGHT|FULL|INNER|CROSS|NATURAL |`       → `JOIN`
+    ///   * `LEFT|RIGHT|FULL OUTER |`                     → `JOIN`
+    ///
+    /// Mirrors the keyword hints `collect_expected_keyword_suggestions` emits for
+    /// the same slots, so identifier suppression cannot drift from keyword
+    /// emission. The join-type slots are gated on a table context (matching the
+    /// emission side) so a column or function named `left`/`right`/… in an
+    /// expression keeps its suggestions; the clause openers are reserved words
+    /// whose bare unqualified use is only a clause start, so they suppress in any
+    /// context (a qualified member like `t.order ` is excluded as a column).
+    fn cursor_is_at_pure_clause_keyword_continuation_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        let words = Self::previous_meaningful_words_upper(tokens, end, 6);
+        let trigger_is_qualified_member = Self::trigger_word_is_qualified_member(tokens, end);
+        let in_table_context = deep_ctx.phase.is_table_context();
+        match words.as_slice() {
+            [.., last]
+                if !trigger_is_qualified_member
+                    && (*last == "ORDER" || *last == "GROUP" || *last == "CONNECT") =>
+            {
+                true
+            }
+            // `PARTITION |` only continues to `BY` inside an analytic window spec
+            // (`OVER (...)` / `WINDOW name AS (...)`); elsewhere `PARTITION` takes a
+            // partition name, so suppression stays scoped to the window context to
+            // match the keyword-emission side.
+            [.., last]
+                if !trigger_is_qualified_member
+                    && *last == "PARTITION"
+                    && Self::cursor_is_inside_window_spec(tokens, end) =>
+            {
+                true
+            }
+            [.., prev, last] if *prev == "ORDER" && *last == "SIBLINGS" => true,
+            [.., last] if !trigger_is_qualified_member && *last == "START" => true,
+            [.., last]
+                if in_table_context
+                    && matches!(
+                        last.as_str(),
+                        "LEFT" | "RIGHT" | "FULL" | "INNER" | "CROSS" | "NATURAL"
+                    ) =>
+            {
+                true
+            }
+            [.., prev, last]
+                if in_table_context
+                    && *last == "OUTER"
+                    && matches!(prev.as_str(), "LEFT" | "RIGHT" | "FULL") =>
+            {
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// True when the cursor sits right after the `IS` null-test operator —
+    /// `<expr> IS |` or `<expr> IS NOT |`. Only keywords (`NOT`, `NULL`, …) are
+    /// grammatical there; a bare identifier is never valid in any dialect or
+    /// clause, so this is a pure keyword position regardless of phase. Mirrors the
+    /// hints `collect_expected_keyword_suggestions` emits for the same slots so
+    /// identifier suppression cannot drift from keyword emission. A qualified
+    /// member written `t.is ` is excluded (there `is` is a column, not the
+    /// operator).
+    fn cursor_is_at_is_null_test_keyword_position_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        let words = Self::previous_meaningful_words_upper(tokens, end, 6);
+        let trigger_is_qualified_member = Self::trigger_word_is_qualified_member(tokens, end);
+        match words.as_slice() {
+            [.., prev, last] if *prev == "IS" && *last == "NOT" => true,
+            [.., last] if !trigger_is_qualified_member && *last == "IS" => true,
+            _ => false,
+        }
     }
 
     /// True when the cursor is at the type slot of a column definition in
@@ -3033,16 +3174,47 @@ impl SqlEditorWidget {
             {
                 &["BY"]
             }
+            // `PARTITION BY` inside an analytic `OVER (...)` / `WINDOW name AS
+            // (...)` spec. Gated on the window context so the non-`BY` uses of
+            // `PARTITION` keep their identifier completion: a partition-extended
+            // table reference (`FROM t PARTITION (p)`) and the DDL partition-
+            // maintenance ops (`ALTER TABLE t DROP PARTITION p`) both expect a
+            // partition name, not `BY`.
+            [.., last]
+                if !trigger_is_qualified_member
+                    && *last == "PARTITION"
+                    && Self::cursor_is_inside_window_spec(tokens, context_end) =>
+            {
+                &["BY"]
+            }
             [.., prev, last] if *prev == "ORDER" && *last == "SIBLINGS" => &["BY"],
             [.., last] if !trigger_is_qualified_member && *last == "START" => &["WITH"],
+            // `<expr> IS NOT |` -> NULL; `<expr> IS |` -> NOT / NULL. Only keywords
+            // are grammatical after `IS`, so the matching suppression predicate
+            // (`cursor_is_at_is_null_test_keyword_position_for_context`) clears the
+            // identifier list there.
+            [.., prev, last] if *prev == "IS" && *last == "NOT" => &["NULL"],
+            [.., last] if !trigger_is_qualified_member && *last == "IS" => &["NOT", "NULL"],
             [.., last] if *last == "DELETE" => &["FROM"],
             [.., last] if *last == "INSERT" || *last == "MERGE" => &["INTO"],
+            // `LEFT`/`RIGHT`/`FULL` may be followed by the optional `OUTER`
+            // before `JOIN`, so both continuations are offered; `INNER`/`CROSS`/
+            // `NATURAL` take only `JOIN`.
+            [.., last]
+                if in_table_context && matches!(last.as_str(), "LEFT" | "RIGHT" | "FULL") =>
+            {
+                &["OUTER", "JOIN"]
+            }
             [.., last]
                 if in_table_context
-                    && matches!(
-                        last.as_str(),
-                        "LEFT" | "RIGHT" | "FULL" | "INNER" | "CROSS" | "NATURAL"
-                    ) =>
+                    && matches!(last.as_str(), "INNER" | "CROSS" | "NATURAL") =>
+            {
+                &["JOIN"]
+            }
+            [.., prev, last]
+                if in_table_context
+                    && *last == "OUTER"
+                    && matches!(prev.as_str(), "LEFT" | "RIGHT" | "FULL") =>
             {
                 &["JOIN"]
             }

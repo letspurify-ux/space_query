@@ -17441,11 +17441,158 @@ fn column_suppressing_keyword_slot_covers_every_family() {
     assert!(at("SELECT sum(x) OVER (ORDER BY d ROWS BETWEEN UNBOUNDED |) FROM t")); // window frame
     assert!(at("SELECT EXTRACT(| FROM hire_date) FROM emp")); // EXTRACT field
     assert!(at("SELECT hire_date - INTERVAL '5' | FROM emp")); // INTERVAL unit
+    assert!(at("SELECT * FROM emp ORDER |")); // pure clause-keyword continuation
+    assert!(at("SELECT * FROM a LEFT |")); // pure join-type continuation
+    assert!(at("SELECT sum(x) OVER (PARTITION |) FROM t")); // window PARTITION BY
+    assert!(at("SELECT * FROM emp WHERE a IS |")); // IS null-test operator
+    assert!(at("SELECT * FROM emp WHERE a IS NOT |"));
     // Ordinary column positions remain column positions.
     assert!(!at("SELECT | FROM emp"));
     assert!(!at("SELECT * FROM emp WHERE | "));
     // Value-bound window-frame slots accept an expression, so they are NOT here.
     assert!(!at("SELECT sum(x) OVER (ORDER BY d ROWS BETWEEN | ) FROM t"));
+}
+
+#[test]
+fn pure_clause_keyword_continuation_covers_every_family() {
+    let at = |sql: &str| {
+        SqlEditorWidget::cursor_is_at_pure_clause_keyword_continuation_for_context(
+            &analyze_inline_cursor_sql(sql),
+            false,
+        )
+    };
+    // Multi-word clause openers whose trailing keyword has not been typed: only
+    // that keyword is grammatical, so every identifier source is suppressed.
+    assert!(at("SELECT * FROM t ORDER |")); // -> BY
+    assert!(at("SELECT * FROM t GROUP |")); // -> BY
+    assert!(at("SELECT * FROM t CONNECT |")); // -> BY
+    assert!(at("SELECT * FROM t ORDER SIBLINGS |")); // -> BY
+    assert!(at("SELECT * FROM t START |")); // -> WITH
+    assert!(at("SELECT * FROM a LEFT |")); // -> JOIN
+    assert!(at("SELECT * FROM a INNER |"));
+    assert!(at("SELECT * FROM a CROSS |"));
+    assert!(at("SELECT * FROM a NATURAL |"));
+    assert!(at("SELECT * FROM a LEFT OUTER |")); // -> JOIN
+    assert!(at("SELECT * FROM a FULL OUTER |"));
+    // The clause openers suppress in a column context too (a complete predicate
+    // precedes the bare ORDER), not only in the FROM table context.
+    assert!(at("SELECT a FROM t WHERE a = 1 ORDER |"));
+    assert!(at("SELECT a FROM t GROUP BY a ORDER |"));
+
+    // `PARTITION |` continues to `BY` only inside an analytic window spec, so it
+    // is a continuation there (`OVER (...)` and `WINDOW name AS (...)`) …
+    assert!(at("SELECT sum(x) OVER (PARTITION |) FROM t"));
+    assert!(at("SELECT count(*) FROM t WINDOW w AS (PARTITION |)"));
+    // … but not where `PARTITION` introduces a partition name: a partition-
+    // extended table reference, a partitioned outer join, or a DDL maintenance op.
+    assert!(!at("SELECT * FROM sales PARTITION |"));
+    assert!(!at("SELECT * FROM sales s PARTITION |"));
+    assert!(!at("ALTER TABLE t DROP PARTITION |"));
+
+    // Not a continuation: the trailing keyword is already present, an ordinary
+    // clause body, a typed prefix, a qualified member column, a join-type word in
+    // an expression, or a completed join target.
+    assert!(!at("SELECT * FROM t ORDER BY |"));
+    assert!(!at("SELECT | FROM t"));
+    assert!(!at("SELECT * FROM t WHERE |"));
+    assert!(!at("SELECT * FROM t |"));
+    assert!(!at("SELECT * FROM t ORD|"));
+    assert!(!at("SELECT left | FROM t"));
+    assert!(!at("SELECT * FROM t e WHERE e.order |"));
+    assert!(!at("SELECT * FROM a LEFT OUTER JOIN b |"));
+}
+
+#[test]
+fn outer_join_continuation_offers_join_keyword() {
+    let suggests_join = |sql: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &analyze_inline_cursor_sql(sql),
+            None,
+        )
+        .iter()
+        .any(|value| value == "JOIN")
+    };
+    // `<side> OUTER` is a join continuation just like the bare join types, so it
+    // must offer `JOIN` (and, via the shared continuation predicate, suppress the
+    // relation list that would otherwise leak there).
+    assert!(suggests_join("SELECT * FROM a LEFT OUTER |"));
+    assert!(suggests_join("SELECT * FROM a RIGHT OUTER |"));
+    assert!(suggests_join("SELECT * FROM a FULL OUTER |"));
+    // Still scoped to a table context.
+    assert!(!suggests_join("SELECT outer | FROM a"));
+
+    // `LEFT`/`RIGHT`/`FULL` additionally offer the optional `OUTER` before
+    // `JOIN`, so typing it mid-keyword (`LEFT O|`) stays useful; `INNER`/`CROSS`/
+    // `NATURAL` do not take `OUTER`.
+    let candidates = |sql: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &analyze_inline_cursor_sql(sql),
+            None,
+        )
+    };
+    assert!(candidates("SELECT * FROM a LEFT |").iter().any(|v| v == "OUTER"));
+    assert!(candidates("SELECT * FROM a FULL |").iter().any(|v| v == "OUTER"));
+    assert!(!candidates("SELECT * FROM a INNER |")
+        .iter()
+        .any(|v| v == "OUTER"));
+}
+
+#[test]
+fn window_partition_continuation_offers_by_and_suppresses_columns() {
+    let suggests_by = |sql: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &analyze_inline_cursor_sql(sql),
+            Some(crate::db::DatabaseType::Oracle),
+        )
+        .iter()
+        .any(|value| value == "BY")
+    };
+    // Inside an analytic spec, `PARTITION |` offers `BY`.
+    assert!(suggests_by("SELECT sum(x) OVER (PARTITION |) FROM t"));
+    assert!(suggests_by("SELECT count(*) FROM t WINDOW w AS (PARTITION |)"));
+    // A non-window `PARTITION` expects a partition name, never `BY`.
+    assert!(!suggests_by("SELECT * FROM sales PARTITION |"));
+    assert!(!suggests_by("ALTER TABLE t DROP PARTITION |"));
+}
+
+#[test]
+fn is_null_test_continuation_offers_keywords_and_suppresses_columns() {
+    let at = |sql: &str| {
+        SqlEditorWidget::cursor_is_at_is_null_test_keyword_position_for_context(
+            &analyze_inline_cursor_sql(sql),
+            false,
+        )
+    };
+    let kw = |sql: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &analyze_inline_cursor_sql(sql),
+            None,
+        )
+    };
+    // `IS |` -> NOT / NULL; `IS NOT |` -> NULL. Identifiers are never valid after
+    // `IS`, so the position routes through the column-suppression chokepoint.
+    assert!(at("SELECT * FROM t WHERE a IS |"));
+    assert_eq!(kw("SELECT * FROM t WHERE a IS |"), vec!["NOT", "NULL"]);
+    assert!(at("SELECT * FROM t WHERE a IS NOT |"));
+    assert_eq!(kw("SELECT * FROM t WHERE a IS NOT |"), vec!["NULL"]);
+    // Works for any operand and in any clause, including a chained predicate and a
+    // boolean expression in the select list.
+    assert!(at("SELECT * FROM t WHERE f(x) IS |"));
+    assert!(at("SELECT * FROM t WHERE a IS NULL AND b IS |"));
+    assert!(at("SELECT a IS | FROM t"));
+
+    // Not the operator: a completed `IS NULL`, an ordinary operand position, the
+    // `<col> NOT` predicate tail, a qualified member column named `is`, and the
+    // continuation after a finished predicate.
+    assert!(!at("SELECT * FROM t WHERE a IS NULL |"));
+    assert!(!at("SELECT * FROM t WHERE a |"));
+    assert!(!at("SELECT * FROM t WHERE a NOT |"));
+    assert!(!at("SELECT * FROM t e WHERE e.is |"));
+    assert!(!at("SELECT * FROM t WHERE a IS NULL AND b |"));
 }
 
 #[test]
@@ -19941,3 +20088,5 @@ fn local_record_member_scope_boundary_and_nested_loops() {
     .expect("enclosing loop record visible inside inner loop");
     assert_has_case_insensitive(&outer, "x");
 }
+
+
