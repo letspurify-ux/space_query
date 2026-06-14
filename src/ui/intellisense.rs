@@ -2760,7 +2760,10 @@ impl IntellisenseData {
             }
         }
         let start = first.unwrap_or(0) as i32;
-        Some(gaps * 64 + start * 4 - boundary_hits * 8 + haystack.len() as i32 / 8)
+        Some(
+            gaps * 64 + start * 4 - boundary_hits * 8
+                + crate::utils::arithmetic::safe_div(haystack.len() as i32, 8),
+        )
     }
 
     /// Append fuzzy subsequence matches across `groups`, ranked by relevance,
@@ -3640,17 +3643,16 @@ fn incomplete_quoted_identifier_start_before_cursor(
     let mut idx = cursor_pos;
     while idx > 0 {
         let (prev_idx, ch) = text.get(..idx)?.char_indices().next_back()?;
-        if matches!(ch, '"' | '`' | '[') {
-            if quoted_identifier_start_context(text, prev_idx)
-                && !has_unescaped_identifier_delimiter(
-                    text,
-                    prev_idx + ch.len_utf8(),
-                    cursor_pos,
-                    identifier_closing_delimiter(ch),
-                )
-            {
-                return Some((prev_idx, ch));
-            }
+        if matches!(ch, '"' | '`' | '[')
+            && quoted_identifier_start_context(text, prev_idx)
+            && !has_unescaped_identifier_delimiter(
+                text,
+                prev_idx + ch.len_utf8(),
+                cursor_pos,
+                identifier_closing_delimiter(ch),
+            )
+        {
+            return Some((prev_idx, ch));
         }
         idx = prev_idx;
     }

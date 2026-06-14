@@ -770,9 +770,10 @@ fn empty_mysql_scope_with_preserved_session_requires_resolution() {
 
     assert!(
         helper.contains("if preserve_existing_session_state")
-            && helper.contains("mysql_empty_scope_requires_resolved_session_error()")
+            && helper.contains("// leave the session as-is.")
             && helper.contains("reset_mysql_pooled_session_to_no_database(conn, advanced, db_type)"),
-        "Empty MySQL/MariaDB scope should reset clean sessions but block preserved retained sessions"
+        "Empty MySQL/MariaDB scope should reset clean sessions but leave preserved sessions as-is \
+         (the dropped schema is already detached, so a re-apply error is not raised on the pooled path)"
     );
     assert!(
         editor_content.contains(

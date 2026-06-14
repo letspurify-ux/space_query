@@ -16952,8 +16952,8 @@ impl SqlEditorWidget {
         let rest = Self::strip_oracle_leading_keyword(&cleaned, "DROP")?;
         let rest = Self::strip_oracle_leading_keyword(rest, "USER")?;
         let token = rest.trim_start();
-        let raw = if token.starts_with('"') {
-            let end = token[1..].find('"')? + 2;
+        let raw = if let Some(stripped) = token.strip_prefix('"') {
+            let end = stripped.find('"')? + 2;
             &token[..end]
         } else {
             token

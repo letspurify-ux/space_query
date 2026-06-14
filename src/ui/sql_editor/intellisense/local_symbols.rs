@@ -2659,9 +2659,7 @@ impl SqlEditorWidget {
             .position(|span| !matches!(span.token, SqlToken::Comment(_)))?;
 
         while idx < item.len() {
-            let Some(word) = Self::token_word(&item[idx].token) else {
-                return None;
-            };
+            let word = Self::token_word(&item[idx].token)?;
             if !Self::is_parameter_mode_keyword(word) {
                 break;
             }

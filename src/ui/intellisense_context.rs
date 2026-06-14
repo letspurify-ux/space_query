@@ -5715,6 +5715,8 @@ pub(crate) fn extract_select_list_columns(tokens: &[SqlToken]) -> Vec<String> {
 
 /// Resolve source table names referenced by wildcard items (`*`, `t.*`) in a
 /// SELECT list. Returned names are deduplicated in appearance order.
+// Exercised by unit tests; not yet wired into a production code path.
+#[allow(dead_code)]
 pub(crate) fn extract_select_list_wildcard_tables(
     tokens: &[SqlToken],
     tables_in_scope: &[ScopedTableRef],
@@ -6758,21 +6760,21 @@ fn is_cast_type_spec_identifier(
         if scan_depth < depth.saturating_sub(1) {
             return false;
         }
-        if scan_depth == depth.saturating_sub(1) {
-            if matches!(tokens.get(scan_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
-                let Some(call_idx) = scan_idx.checked_sub(1) else {
-                    return false;
-                };
-                return matches!(
-                    tokens.get(call_idx).copied(),
-                    Some(SqlToken::Word(call_name))
-                        if call_name.eq_ignore_ascii_case("CAST")
-                            || call_name.eq_ignore_ascii_case("CONVERT")
-                            || call_name.eq_ignore_ascii_case("XMLCAST")
-                            || call_name.eq_ignore_ascii_case("XMLSERIALIZE")
-                            || call_name.eq_ignore_ascii_case("VALIDATE_CONVERSION")
-                );
-            }
+        if scan_depth == depth.saturating_sub(1)
+            && matches!(tokens.get(scan_idx), Some(SqlToken::Symbol(sym)) if sym == "(")
+        {
+            let Some(call_idx) = scan_idx.checked_sub(1) else {
+                return false;
+            };
+            return matches!(
+                tokens.get(call_idx).copied(),
+                Some(SqlToken::Word(call_name))
+                    if call_name.eq_ignore_ascii_case("CAST")
+                        || call_name.eq_ignore_ascii_case("CONVERT")
+                        || call_name.eq_ignore_ascii_case("XMLCAST")
+                        || call_name.eq_ignore_ascii_case("XMLSERIALIZE")
+                        || call_name.eq_ignore_ascii_case("VALIDATE_CONVERSION")
+            );
         }
     }
 
@@ -7080,16 +7082,16 @@ fn call_open_index(
         if scan_depth < depth.saturating_sub(1) {
             return None;
         }
-        if scan_depth == depth.saturating_sub(1) {
-            if matches!(tokens.get(scan_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
-                let call_idx = scan_idx.checked_sub(1)?;
-                return matches!(
-                    tokens.get(call_idx).copied(),
-                    Some(SqlToken::Word(actual_call_name))
-                        if actual_call_name.eq_ignore_ascii_case(call_name)
-                )
-                .then_some(scan_idx);
-            }
+        if scan_depth == depth.saturating_sub(1)
+            && matches!(tokens.get(scan_idx), Some(SqlToken::Symbol(sym)) if sym == "(")
+        {
+            let call_idx = scan_idx.checked_sub(1)?;
+            return matches!(
+                tokens.get(call_idx).copied(),
+                Some(SqlToken::Word(actual_call_name))
+                    if actual_call_name.eq_ignore_ascii_case(call_name)
+            )
+            .then_some(scan_idx);
         }
     }
 
@@ -10759,6 +10761,9 @@ fn select_list_end_index(tokens: &[SqlToken], start: usize) -> usize {
     idx
 }
 
+// Only reached from `extract_select_list_wildcard_tables`, which is itself
+// test-only for now.
+#[allow(dead_code)]
 fn append_wildcard_item_tables(
     item_tokens: &[&SqlToken],
     tables_in_scope: &[ScopedTableRef],

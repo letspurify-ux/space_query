@@ -2495,7 +2495,7 @@ impl SqlEditorWidget {
             ) {
                 continue;
             }
-            if seen.insert(Self::completion_identifier_lookup_upper(&suggestion)) {
+            if seen.insert(Self::completion_identifier_lookup_upper(suggestion)) {
                 filtered.push(suggestion.clone());
             }
             if filtered.len() >= MAX_MERGED_SUGGESTIONS {
@@ -2568,6 +2568,8 @@ impl SqlEditorWidget {
         }
     }
 
+    // Exercised by unit tests; not yet wired into a production code path.
+    #[allow(dead_code)]
     fn table_context_expected_object_suggestions(
         data: &mut IntellisenseData,
         prefix: &str,
