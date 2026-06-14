@@ -18723,13 +18723,16 @@ fn build_column_descriptions_formats_type_pk_nn_and_fk() {
     let descriptions =
         SqlEditorWidget::build_column_descriptions(&data, &["EMP".to_string()]);
 
-    assert_eq!(descriptions.get("EMP_ID").map(String::as_str), Some("NUMBER(10)  PK"));
-    assert_eq!(descriptions.get("ENAME").map(String::as_str), Some("VARCHAR2(50)"));
+    let emp_id = descriptions.get("EMP_ID").expect("EMP_ID detail");
+    assert_eq!(emp_id.type_text, "NUMBER(10)");
+    assert_eq!(emp_id.badges, "PK");
+    let ename = descriptions.get("ENAME").expect("ENAME detail");
+    assert_eq!(ename.type_text, "VARCHAR2(50)");
+    assert_eq!(ename.badges, "");
     // Non-PK NOT NULL column that is also a foreign key shows both badges.
-    assert_eq!(
-        descriptions.get("DEPTNO").map(String::as_str),
-        Some("NUMBER  NN  FK\u{2192}DEPT")
-    );
+    let deptno = descriptions.get("DEPTNO").expect("DEPTNO detail");
+    assert_eq!(deptno.type_text, "NUMBER");
+    assert_eq!(deptno.badges, "NN  FK\u{2192}DEPT");
 }
 
 #[test]
@@ -18772,14 +18775,12 @@ fn build_column_descriptions_match_quoted_column_metadata_and_fk() {
     let descriptions =
         SqlEditorWidget::build_column_descriptions(&data, &["EMP".to_string()]);
 
-    assert_eq!(
-        descriptions.get("DEPT NO").map(String::as_str),
-        Some("NUMBER  NN  FK\u{2192}DEPT")
-    );
-    assert_eq!(
-        descriptions.get("EMP NAME").map(String::as_str),
-        Some("VARCHAR2(50)")
-    );
+    let dept_no = descriptions.get("DEPT NO").expect("DEPT NO detail");
+    assert_eq!(dept_no.type_text, "NUMBER");
+    assert_eq!(dept_no.badges, "NN  FK\u{2192}DEPT");
+    let emp_name = descriptions.get("EMP NAME").expect("EMP NAME detail");
+    assert_eq!(emp_name.type_text, "VARCHAR2(50)");
+    assert_eq!(emp_name.badges, "");
 }
 
 #[test]

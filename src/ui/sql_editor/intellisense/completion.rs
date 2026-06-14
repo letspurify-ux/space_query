@@ -1152,13 +1152,16 @@ impl SqlEditorWidget {
         let _popup_show_reset = PopupShowInProgressReset {
             runtime: runtime.clone(),
         };
-        let descriptions = if include_columns && !column_tables.is_empty() {
+        let descriptions = {
             let data = intellisense_data
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            Self::build_column_descriptions(&data, &column_tables)
-        } else {
-            HashMap::new()
+            Self::build_suggestion_details(
+                &data,
+                &suggestions,
+                &column_tables,
+                Some(snapshot.preferred_db_type),
+            )
         };
         intellisense_popup
             .lock()
@@ -2891,11 +2894,41 @@ impl SqlEditorWidget {
     /// Build the display-detail map (column name upper -> "TYPE  PK/NN  FK→T")
     /// for every column of the in-scope tables. First occurrence of a column
     /// name wins, matching how column suggestions are de-duplicated.
+    /// Build the popup's per-suggestion detail map (type column + PK/NN/FK
+    /// badge column). Column entries carry their data type and constraint
+    /// badges; every other entry (table, view, keyword, …) gets a type label
+    /// via [`IntellisenseData::suggestion_type_label`]. Column details take
+    /// precedence over object-store labels for a shared name.
+    fn build_suggestion_details(
+        data: &IntellisenseData,
+        suggestions: &[String],
+        column_tables: &[String],
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> HashMap<String, SuggestionDetail> {
+        let mut details = Self::build_column_descriptions(data, column_tables);
+        for suggestion in suggestions {
+            let key = Self::completion_identifier_lookup_upper(suggestion);
+            if details.contains_key(&key) {
+                continue;
+            }
+            if let Some(label) = data.suggestion_type_label(suggestion, db_type) {
+                details.insert(
+                    key,
+                    SuggestionDetail {
+                        type_text: label.to_string(),
+                        badges: String::new(),
+                    },
+                );
+            }
+        }
+        details
+    }
+
     fn build_column_descriptions(
         data: &IntellisenseData,
         column_tables: &[String],
-    ) -> HashMap<String, String> {
-        let mut descriptions: HashMap<String, String> = HashMap::new();
+    ) -> HashMap<String, SuggestionDetail> {
+        let mut descriptions: HashMap<String, SuggestionDetail> = HashMap::new();
         for table in column_tables {
             let mut fk_targets: HashMap<String, String> = HashMap::new();
             if let Some(fks) = data.get_foreign_keys(table) {
@@ -2917,18 +2950,27 @@ impl SqlEditorWidget {
                     continue;
                 };
 
-                let mut detail = meta.type_display.clone();
+                let mut badges = String::new();
                 if meta.is_primary_key {
-                    detail.push_str("  PK");
+                    badges.push_str("PK");
                 } else if !meta.nullable {
-                    detail.push_str("  NN");
+                    badges.push_str("NN");
                 }
                 if let Some(ref_table) = fk_targets.get(&key) {
-                    detail.push_str(&format!("  FK\u{2192}{ref_table}"));
+                    if !badges.is_empty() {
+                        badges.push_str("  ");
+                    }
+                    badges.push_str(&format!("FK\u{2192}{ref_table}"));
                 }
 
-                if !detail.trim().is_empty() {
-                    descriptions.insert(key, detail);
+                if !meta.type_display.trim().is_empty() || !badges.is_empty() {
+                    descriptions.insert(
+                        key,
+                        SuggestionDetail {
+                            type_text: meta.type_display.clone(),
+                            badges,
+                        },
+                    );
                 }
             }
         }

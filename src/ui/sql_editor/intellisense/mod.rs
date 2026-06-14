@@ -22,7 +22,7 @@ use crate::sql_text;
 use crate::ui::intellisense::{
     detect_sql_context, get_word_at_cursor, sql_context_for_phase, ColumnMeta, ForeignKeyMeta,
     IntellisenseData, IntellisensePopup, QualifiedMemberKind, SignatureLabel, SignaturePopup,
-    SqlContext,
+    SqlContext, SuggestionDetail,
 };
 use crate::ui::intellisense_context;
 use crate::ui::text_buffer_access;

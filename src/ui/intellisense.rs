@@ -731,6 +731,18 @@ pub struct ColumnMeta {
     pub is_primary_key: bool,
 }
 
+/// Per-suggestion detail rendered in the completion popup's type and badge
+/// columns. Keyed (in the descriptions map) by the suggestion's normalized
+/// uppercase name.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SuggestionDetail {
+    /// Type column: object kind (TABLE / VIEW / KEYWORD / …) or, for columns,
+    /// the data type display (e.g. `NUMBER(10)`).
+    pub type_text: String,
+    /// Badge column: `PK` / `NN` / `FK→TABLE` for columns; empty otherwise.
+    pub badges: String,
+}
+
 /// A foreign-key relationship for a table, with the local and referenced
 /// columns paired by position. Used for FK badges and FK-based auto-join.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2208,6 +2220,66 @@ impl IntellisenseData {
         self.foreign_keys_by_table.get(&key).map(Vec::as_slice)
     }
 
+    /// Best-effort kind label for a completion suggestion, used to fill the
+    /// popup's type column for non-column entries. Checks loaded object stores
+    /// first, then the static keyword/function catalog. Returns `None` for
+    /// names it cannot classify (columns carry their own type via metadata).
+    pub fn suggestion_type_label(
+        &self,
+        name: &str,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static str> {
+        // Built-in functions are rendered with a trailing "()".
+        if let Some(stripped) = name.strip_suffix(FUNCTION_SUFFIX) {
+            if is_builtin_function(stripped) {
+                return Some("FUNCTION");
+            }
+        }
+        let upper = NameEntry::lookup_upper(name);
+        let has = |entries: &[NameEntry]| {
+            entries
+                .binary_search_by(|entry| entry.upper.as_str().cmp(upper.as_str()))
+                .is_ok()
+        };
+        let label = if has(&self.table_entries) {
+            "TABLE"
+        } else if has(&self.view_entries) {
+            "VIEW"
+        } else if has(&self.materialized_view_entries) {
+            "MVIEW"
+        } else if has(&self.synonym_entries) || has(&self.public_synonym_entries) {
+            "SYNONYM"
+        } else if has(&self.procedure_entries) {
+            "PROCEDURE"
+        } else if has(&self.package_entries) {
+            "PACKAGE"
+        } else if has(&self.function_entries) {
+            "FUNCTION"
+        } else if has(&self.sequence_entries) {
+            "SEQUENCE"
+        } else if has(&self.type_entries) {
+            "TYPE"
+        } else if has(&self.trigger_entries) {
+            "TRIGGER"
+        } else if has(&self.event_entries) {
+            "EVENT"
+        } else if has(&self.index_entries) {
+            "INDEX"
+        } else if has(&self.user_entries) {
+            "USER"
+        } else if self.is_catalog_keyword(upper.as_str(), db_type) {
+            "KEYWORD"
+        } else {
+            return None;
+        };
+        Some(label)
+    }
+
+    fn is_catalog_keyword(&self, upper: &str, db_type: Option<crate::db::DatabaseType>) -> bool {
+        let (keywords, _functions) = language_catalog_for_db_type(db_type);
+        keywords.binary_search(&upper).is_ok()
+    }
+
     /// Cached signature for a routine key: `Some(Some(label))` when resolved to
     /// a routine, `Some(None)` when resolved but not callable, `None` when not
     /// yet fetched.
@@ -2766,7 +2838,7 @@ pub struct IntellisensePopup {
     /// Optional display detail per suggestion (e.g. column type + PK/NN/FK
     /// badges), keyed by the upper-cased suggestion text. The suggestion text
     /// itself remains the inserted value; this only enriches rendering.
-    descriptions: Arc<Mutex<HashMap<String, String>>>,
+    descriptions: Arc<Mutex<HashMap<String, SuggestionDetail>>>,
     selected_callback: Arc<Mutex<Option<Box<dyn FnMut(String)>>>>,
     state: Arc<Mutex<PopupState>>,
 }
@@ -2954,7 +3026,7 @@ impl IntellisensePopup {
     pub fn show_suggestions_with_descriptions(
         &mut self,
         suggestions: Vec<String>,
-        descriptions: HashMap<String, String>,
+        descriptions: HashMap<String, SuggestionDetail>,
         x: i32,
         y: i32,
     ) {
@@ -3018,7 +3090,8 @@ impl IntellisensePopup {
         let selected_idx = selected_text
             .and_then(|selected| suggestions.iter().position(|item| item == selected))
             .unwrap_or(0);
-        let detail_color = theme::text_muted().bits();
+        let type_color = theme::text_secondary().bits();
+        let badge_color = theme::accent().bits();
         let descriptions = self
             .descriptions
             .lock()
@@ -3030,28 +3103,41 @@ impl IntellisensePopup {
         let item_size = self.browser.text_size();
         fltk::draw::set_font(fltk::enums::Font::Helvetica, item_size);
         let mut max_name_w = 0;
-        let mut max_detail_w = 0;
-        let mut any_detail = false;
+        let mut max_type_w = 0;
+        let mut max_badge_w = 0;
+        let mut any_type = false;
+        let mut any_badge = false;
 
         self.browser.clear();
         for suggestion in &suggestions {
             let (name_w, _) = fltk::draw::measure(suggestion, false);
             max_name_w = max_name_w.max(name_w);
-            match descriptions.get(&NameEntry::lookup_upper(suggestion)) {
-                Some(detail) if !detail.is_empty() => {
-                    any_detail = true;
-                    let (detail_w, _) = fltk::draw::measure(detail, false);
-                    max_detail_w = max_detail_w.max(detail_w);
-                    // Column 1: name; column 2 (after the tab): dimmed detail.
-                    self.browser.add(&format!(
-                        "@C255 {}\t@C{} {}",
-                        suggestion, detail_color, detail
-                    ));
-                }
-                _ => {
-                    self.browser.add(&format!("@C255 {}", suggestion));
-                }
+            let detail = descriptions.get(&NameEntry::lookup_upper(suggestion));
+            let type_text = detail.map(|d| d.type_text.as_str()).unwrap_or("");
+            let badges = detail.map(|d| d.badges.as_str()).unwrap_or("");
+            if !type_text.is_empty() {
+                any_type = true;
+                let (type_w, _) = fltk::draw::measure(type_text, false);
+                max_type_w = max_type_w.max(type_w);
             }
+            if !badges.is_empty() {
+                any_badge = true;
+                let (badge_w, _) = fltk::draw::measure(badges, false);
+                max_badge_w = max_badge_w.max(badge_w);
+            }
+            // Column 1: name; column 2: type; column 3: PK/NN/FK badges. Empty
+            // trailing columns are dropped so plain entries render as one cell.
+            let row = if !badges.is_empty() {
+                format!(
+                    "@C255 {}\t@C{} {}\t@C{} {}",
+                    suggestion, type_color, type_text, badge_color, badges
+                )
+            } else if !type_text.is_empty() {
+                format!("@C255 {}\t@C{} {}", suggestion, type_color, type_text)
+            } else {
+                format!("@C255 {}", suggestion)
+            };
+            self.browser.add(&row);
         }
         drop(descriptions);
         *self
@@ -3063,11 +3149,12 @@ impl IntellisensePopup {
             self.browser.select((selected_idx + 1) as i32);
         }
 
-        // Width: fit the longest name, plus a detail column when present. The
-        // name column (tab stop) is sized to the widest name so details never
-        // overlap names. Horizontal padding covers the leading-space indent,
-        // right margin, and scrollbar.
+        // Width: fit the longest name, plus a type column and a badge column
+        // when present. Each column's tab stop is sized to its widest entry so
+        // columns never overlap. Horizontal padding covers the leading-space
+        // indent, right margin, and scrollbar.
         const NAME_GAP: i32 = 18;
+        const TYPE_GAP: i32 = 18;
         const H_PADDING: i32 = 28;
         let scrollbar = if suggestion_count > Self::POPUP_PAGE_STEP as usize {
             18
@@ -3075,14 +3162,20 @@ impl IntellisensePopup {
             0
         };
         let name_col = max_name_w.clamp(60, 520);
-        let content_w = if any_detail {
-            name_col + NAME_GAP + max_detail_w
-        } else {
-            max_name_w
-        };
+        let type_col = max_type_w.min(260);
+        let mut content_w = name_col;
+        if any_type {
+            content_w += NAME_GAP + type_col;
+        }
+        if any_badge {
+            content_w += TYPE_GAP + max_badge_w;
+        }
         let width = (content_w + H_PADDING + scrollbar).clamp(160, 900);
 
-        if any_detail {
+        if any_badge {
+            self.browser
+                .set_column_widths(&[name_col + NAME_GAP, type_col + TYPE_GAP]);
+        } else if any_type {
             self.browser.set_column_widths(&[name_col + NAME_GAP]);
         }
         // Row height tracks the font size so larger fonts are not clipped.
@@ -4124,6 +4217,34 @@ mod intellisense_tests {
     #[test]
     fn enclosing_call_none_for_bare_grouping_paren() {
         assert!(call_at("SELECT (a + |) FROM t").is_none());
+    }
+
+    #[test]
+    fn suggestion_type_label_classifies_objects_keywords_and_functions() {
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["EMP".to_string()];
+        data.views = vec!["EMP_VIEW".to_string()];
+        data.procedures = vec!["DO_WORK".to_string()];
+        data.rebuild_indices();
+
+        let oracle = Some(crate::db::DatabaseType::Oracle);
+        assert_eq!(data.suggestion_type_label("EMP", oracle), Some("TABLE"));
+        assert_eq!(data.suggestion_type_label("emp_view", oracle), Some("VIEW"));
+        assert_eq!(
+            data.suggestion_type_label("DO_WORK", oracle),
+            Some("PROCEDURE")
+        );
+        // Static catalog keyword and a built-in function rendered with "()".
+        assert_eq!(
+            data.suggestion_type_label("SELECT", oracle),
+            Some("KEYWORD")
+        );
+        assert_eq!(
+            data.suggestion_type_label("COUNT()", oracle),
+            Some("FUNCTION")
+        );
+        // Unknown identifier stays unclassified (columns are handled elsewhere).
+        assert_eq!(data.suggestion_type_label("NO_SUCH_NAME", oracle), None);
     }
 
     #[test]
