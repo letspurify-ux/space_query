@@ -10412,6 +10412,16 @@ fn test_parse_ddl_object_type_create_database_link() {
 }
 
 #[test]
+fn test_parse_ddl_object_type_create_public_database_link() {
+    assert_eq!(
+        QueryExecutor::parse_ddl_object_type(
+            "CREATE PUBLIC DATABASE LINK MY_LINK CONNECT TO USER IDENTIFIED BY PASS USING 'TNS'"
+        ),
+        "Database Link"
+    );
+}
+
+#[test]
 fn test_parse_ddl_object_type_create_shared_database_link() {
     assert_eq!(
         QueryExecutor::parse_ddl_object_type(
@@ -10422,13 +10432,114 @@ fn test_parse_ddl_object_type_create_shared_database_link() {
 }
 
 #[test]
-fn test_parse_ddl_object_type_create_or_replace_shared_public_database_link() {
+fn test_parse_ddl_object_type_create_shared_public_database_link() {
     assert_eq!(
         QueryExecutor::parse_ddl_object_type(
-            "CREATE OR REPLACE SHARED PUBLIC DATABASE LINK MY_LINK CONNECT TO USER IDENTIFIED BY PASS USING 'TNS'"
+            "CREATE SHARED PUBLIC DATABASE LINK MY_LINK CONNECT TO USER IDENTIFIED BY PASS USING 'TNS'"
         ),
         "Database Link"
     );
+}
+
+#[test]
+fn test_parse_ddl_object_type_alter_database_link_variants() {
+    for sql in [
+        "ALTER DATABASE LINK MY_LINK CONNECT TO USER IDENTIFIED BY PASS",
+        "ALTER PUBLIC DATABASE LINK MY_LINK CONNECT TO USER IDENTIFIED BY PASS",
+        "ALTER SHARED DATABASE LINK MY_LINK CONNECT TO USER IDENTIFIED BY PASS",
+        "ALTER SHARED PUBLIC DATABASE LINK MY_LINK CONNECT TO USER IDENTIFIED BY PASS",
+    ] {
+        assert_eq!(
+            QueryExecutor::parse_ddl_object_type(sql),
+            "Database Link",
+            "DDL type parser should classify `{sql}` as a database link"
+        );
+    }
+}
+
+#[test]
+fn test_parse_ddl_object_type_admin_storage_objects() {
+    for (sql, expected) in [
+        ("CREATE DIRECTORY DATA_PUMP_DIR AS '/tmp'", "Directory"),
+        (
+            "CREATE OR REPLACE DIRECTORY DATA_PUMP_DIR AS '/tmp'",
+            "Directory",
+        ),
+        ("DROP DIRECTORY DATA_PUMP_DIR", "Directory"),
+        (
+            "CREATE TABLESPACE APP_TS DATAFILE 'app01.dbf' SIZE 100M",
+            "Tablespace",
+        ),
+        ("ALTER TABLESPACE APP_TS READ ONLY", "Tablespace"),
+        ("DROP TABLESPACE APP_TS", "Tablespace"),
+        ("CREATE ROLE APP_READONLY", "Role"),
+        ("ALTER ROLE APP_READONLY NOT IDENTIFIED", "Role"),
+        ("DROP ROLE APP_READONLY", "Role"),
+        (
+            "CREATE PROFILE APP_PROFILE LIMIT SESSIONS_PER_USER 4",
+            "Profile",
+        ),
+        (
+            "ALTER PROFILE APP_PROFILE LIMIT SESSIONS_PER_USER 8",
+            "Profile",
+        ),
+        ("DROP PROFILE APP_PROFILE", "Profile"),
+    ] {
+        assert_eq!(
+            QueryExecutor::parse_ddl_object_type(sql),
+            expected,
+            "DDL type parser should classify `{sql}` as {expected}"
+        );
+    }
+}
+
+#[test]
+fn test_parse_ddl_object_type_rollback_segment_variants() {
+    for sql in [
+        "CREATE ROLLBACK SEGMENT RBS_ONE TABLESPACE RBS_TS",
+        "CREATE PUBLIC ROLLBACK SEGMENT RBS_ONE TABLESPACE RBS_TS",
+        "ALTER ROLLBACK SEGMENT RBS_ONE ONLINE",
+        "DROP ROLLBACK SEGMENT RBS_ONE",
+    ] {
+        assert_eq!(
+            QueryExecutor::parse_ddl_object_type(sql),
+            "Rollback Segment",
+            "DDL type parser should classify `{sql}` as a rollback segment"
+        );
+    }
+}
+
+#[test]
+fn test_parse_ddl_object_type_java_variants() {
+    for (sql, expected) in [
+        (
+            r#"CREATE JAVA SOURCE NAMED "Welcome" AS public class Welcome {}"#,
+            "Java Source",
+        ),
+        (
+            r#"CREATE OR REPLACE AND COMPILE JAVA SOURCE NAMED "Welcome" AS public class Welcome {}"#,
+            "Java Source",
+        ),
+        (
+            r#"CREATE OR REPLACE AND RESOLVE JAVA CLASS USING BFILE (java_dir, 'Agent.class')"#,
+            "Java Class",
+        ),
+        (
+            r#"CREATE JAVA RESOURCE NAMED "appText" USING BFILE (java_dir, 'textBundle.dat')"#,
+            "Java Resource",
+        ),
+        (r#"ALTER JAVA SOURCE "Welcome" COMPILE"#, "Java Source"),
+        (r#"ALTER JAVA CLASS "Agent" RESOLVE"#, "Java Class"),
+        (r#"DROP JAVA SOURCE "Welcome""#, "Java Source"),
+        (r#"DROP JAVA CLASS "Agent""#, "Java Class"),
+        (r#"DROP JAVA RESOURCE "appText""#, "Java Resource"),
+    ] {
+        assert_eq!(
+            QueryExecutor::parse_ddl_object_type(sql),
+            expected,
+            "DDL type parser should classify `{sql}` as {expected}"
+        );
+    }
 }
 
 #[test]
@@ -10474,6 +10585,20 @@ fn test_parse_ddl_object_type_create_materialized_view_log() {
 }
 
 #[test]
+fn test_parse_ddl_object_type_alter_drop_materialized_view_log() {
+    for sql in [
+        "ALTER MATERIALIZED VIEW LOG ON SALES ADD ROWID",
+        "DROP MATERIALIZED VIEW LOG ON SALES",
+    ] {
+        assert_eq!(
+            QueryExecutor::parse_ddl_object_type(sql),
+            "Materialized View Log",
+            "DDL type parser should classify `{sql}` as a materialized view log"
+        );
+    }
+}
+
+#[test]
 fn test_ddl_message_alter_session_current_schema() {
     assert_eq!(
         QueryExecutor::ddl_message("ALTER SESSION SET CURRENT_SCHEMA = APP_USER"),
@@ -10503,6 +10628,20 @@ fn test_parse_ddl_object_type_drop_public_synonym() {
         QueryExecutor::parse_ddl_object_type("DROP PUBLIC SYNONYM MY_SYN"),
         "Synonym"
     );
+}
+
+#[test]
+fn test_parse_ddl_object_type_drop_database_link_variants() {
+    for sql in [
+        "DROP DATABASE LINK MY_LINK",
+        "DROP PUBLIC DATABASE LINK MY_LINK",
+    ] {
+        assert_eq!(
+            QueryExecutor::parse_ddl_object_type(sql),
+            "Database Link",
+            "DDL type parser should classify `{sql}` as a database link"
+        );
+    }
 }
 
 /// Regression: CREATE FUNCTION with PROCEDURE keyword in body should return "Function"

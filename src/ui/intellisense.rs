@@ -672,6 +672,18 @@ pub enum QualifiedMemberKind {
     Sequence,
     Synonym,
     PublicSynonym,
+    DatabaseLink,
+    Directory,
+    Library,
+    Cluster,
+    Context,
+    Dimension,
+    Operator,
+    Indextype,
+    Edition,
+    JavaSource,
+    JavaClass,
+    JavaResource,
     User,
 }
 
@@ -691,6 +703,18 @@ impl QualifiedMemberKind {
             "SEQUENCE" => Some(Self::Sequence),
             "SYNONYM" => Some(Self::Synonym),
             "PUBLIC SYNONYM" => Some(Self::PublicSynonym),
+            "DATABASE LINK" => Some(Self::DatabaseLink),
+            "DIRECTORY" => Some(Self::Directory),
+            "LIBRARY" => Some(Self::Library),
+            "CLUSTER" => Some(Self::Cluster),
+            "CONTEXT" => Some(Self::Context),
+            "DIMENSION" => Some(Self::Dimension),
+            "OPERATOR" => Some(Self::Operator),
+            "INDEXTYPE" => Some(Self::Indextype),
+            "EDITION" => Some(Self::Edition),
+            "JAVA SOURCE" => Some(Self::JavaSource),
+            "JAVA CLASS" => Some(Self::JavaClass),
+            "JAVA RESOURCE" => Some(Self::JavaResource),
             "USER" | "SCHEMA" => Some(Self::User),
             _ => None,
         }
@@ -734,6 +758,18 @@ pub struct IntellisenseData {
     pub sequences: Vec<String>,
     pub synonyms: Vec<String>,
     pub public_synonyms: Vec<String>,
+    pub database_links: Vec<String>,
+    pub directories: Vec<String>,
+    pub libraries: Vec<String>,
+    pub clusters: Vec<String>,
+    pub contexts: Vec<String>,
+    pub dimensions: Vec<String>,
+    pub operators: Vec<String>,
+    pub indextypes: Vec<String>,
+    pub editions: Vec<String>,
+    pub java_sources: Vec<String>,
+    pub java_classes: Vec<String>,
+    pub java_resources: Vec<String>,
     pub users: Vec<String>,
     default_qualifier: Option<String>,
     default_qualifier_name: Option<String>,
@@ -750,6 +786,18 @@ pub struct IntellisenseData {
     sequence_entries: Vec<NameEntry>,
     synonym_entries: Vec<NameEntry>,
     public_synonym_entries: Vec<NameEntry>,
+    database_link_entries: Vec<NameEntry>,
+    directory_entries: Vec<NameEntry>,
+    library_entries: Vec<NameEntry>,
+    cluster_entries: Vec<NameEntry>,
+    context_entries: Vec<NameEntry>,
+    dimension_entries: Vec<NameEntry>,
+    operator_entries: Vec<NameEntry>,
+    indextype_entries: Vec<NameEntry>,
+    edition_entries: Vec<NameEntry>,
+    java_source_entries: Vec<NameEntry>,
+    java_class_entries: Vec<NameEntry>,
+    java_resource_entries: Vec<NameEntry>,
     user_entries: Vec<NameEntry>,
     column_entries_by_table: HashMap<String, Vec<NameEntry>>,
     virtual_column_entries_by_table: HashMap<String, Vec<NameEntry>>,
@@ -795,6 +843,18 @@ impl IntellisenseData {
             sequences: Vec::new(),
             synonyms: Vec::new(),
             public_synonyms: Vec::new(),
+            database_links: Vec::new(),
+            directories: Vec::new(),
+            libraries: Vec::new(),
+            clusters: Vec::new(),
+            contexts: Vec::new(),
+            dimensions: Vec::new(),
+            operators: Vec::new(),
+            indextypes: Vec::new(),
+            editions: Vec::new(),
+            java_sources: Vec::new(),
+            java_classes: Vec::new(),
+            java_resources: Vec::new(),
             users: Vec::new(),
             default_qualifier: None,
             default_qualifier_name: None,
@@ -811,6 +871,18 @@ impl IntellisenseData {
             sequence_entries: Vec::new(),
             synonym_entries: Vec::new(),
             public_synonym_entries: Vec::new(),
+            database_link_entries: Vec::new(),
+            directory_entries: Vec::new(),
+            library_entries: Vec::new(),
+            cluster_entries: Vec::new(),
+            context_entries: Vec::new(),
+            dimension_entries: Vec::new(),
+            operator_entries: Vec::new(),
+            indextype_entries: Vec::new(),
+            edition_entries: Vec::new(),
+            java_source_entries: Vec::new(),
+            java_class_entries: Vec::new(),
+            java_resource_entries: Vec::new(),
             user_entries: Vec::new(),
             column_entries_by_table: HashMap::new(),
             virtual_column_entries_by_table: HashMap::new(),
@@ -1113,6 +1185,31 @@ impl IntellisenseData {
             return suggestions;
         }
 
+        for entries in [
+            &self.database_link_entries,
+            &self.directory_entries,
+            &self.library_entries,
+            &self.cluster_entries,
+            &self.context_entries,
+            &self.dimension_entries,
+            &self.operator_entries,
+            &self.indextype_entries,
+            &self.edition_entries,
+            &self.java_source_entries,
+            &self.java_class_entries,
+            &self.java_resource_entries,
+        ] {
+            if Self::push_matching_entries(
+                entries,
+                &prefix_upper,
+                prefix,
+                &mut suggestions,
+                &mut seen,
+            ) {
+                return suggestions;
+            }
+        }
+
         let _ = Self::push_matching_entries(
             &self.user_entries,
             &prefix_upper,
@@ -1169,6 +1266,18 @@ impl IntellisenseData {
                 &self.event_entries,
                 &self.type_entries,
                 &self.index_entries,
+                &self.database_link_entries,
+                &self.directory_entries,
+                &self.library_entries,
+                &self.cluster_entries,
+                &self.context_entries,
+                &self.dimension_entries,
+                &self.operator_entries,
+                &self.indextype_entries,
+                &self.edition_entries,
+                &self.java_source_entries,
+                &self.java_class_entries,
+                &self.java_resource_entries,
                 &self.user_entries,
             ],
         )
@@ -1277,6 +1386,66 @@ impl IntellisenseData {
     pub fn get_public_synonym_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
         self.ensure_base_indices();
         Self::suggestions_from_entry_groups(prefix, &[&self.public_synonym_entries])
+    }
+
+    pub fn get_database_link_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
+        self.ensure_base_indices();
+        Self::suggestions_from_entry_groups(prefix, &[&self.database_link_entries])
+    }
+
+    pub fn get_directory_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
+        self.ensure_base_indices();
+        Self::suggestions_from_entry_groups(prefix, &[&self.directory_entries])
+    }
+
+    pub fn get_library_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
+        self.ensure_base_indices();
+        Self::suggestions_from_entry_groups(prefix, &[&self.library_entries])
+    }
+
+    pub fn get_cluster_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
+        self.ensure_base_indices();
+        Self::suggestions_from_entry_groups(prefix, &[&self.cluster_entries])
+    }
+
+    pub fn get_context_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
+        self.ensure_base_indices();
+        Self::suggestions_from_entry_groups(prefix, &[&self.context_entries])
+    }
+
+    pub fn get_dimension_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
+        self.ensure_base_indices();
+        Self::suggestions_from_entry_groups(prefix, &[&self.dimension_entries])
+    }
+
+    pub fn get_operator_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
+        self.ensure_base_indices();
+        Self::suggestions_from_entry_groups(prefix, &[&self.operator_entries])
+    }
+
+    pub fn get_indextype_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
+        self.ensure_base_indices();
+        Self::suggestions_from_entry_groups(prefix, &[&self.indextype_entries])
+    }
+
+    pub fn get_edition_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
+        self.ensure_base_indices();
+        Self::suggestions_from_entry_groups(prefix, &[&self.edition_entries])
+    }
+
+    pub fn get_java_source_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
+        self.ensure_base_indices();
+        Self::suggestions_from_entry_groups(prefix, &[&self.java_source_entries])
+    }
+
+    pub fn get_java_class_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
+        self.ensure_base_indices();
+        Self::suggestions_from_entry_groups(prefix, &[&self.java_class_entries])
+    }
+
+    pub fn get_java_resource_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
+        self.ensure_base_indices();
+        Self::suggestions_from_entry_groups(prefix, &[&self.java_resource_entries])
     }
 
     pub fn get_user_suggestions(&mut self, prefix: &str) -> Vec<String> {
@@ -1492,6 +1661,18 @@ impl IntellisenseData {
         let mut packages = Vec::new();
         let mut sequences = Vec::new();
         let mut synonyms = Vec::new();
+        let mut database_links = Vec::new();
+        let mut directories = Vec::new();
+        let mut libraries = Vec::new();
+        let mut clusters = Vec::new();
+        let mut contexts = Vec::new();
+        let mut dimensions = Vec::new();
+        let mut operators = Vec::new();
+        let mut indextypes = Vec::new();
+        let mut editions = Vec::new();
+        let mut java_sources = Vec::new();
+        let mut java_classes = Vec::new();
+        let mut java_resources = Vec::new();
 
         for entry in entries {
             let Some(kinds) = member_kinds.get(&entry.upper) else {
@@ -1513,6 +1694,18 @@ impl IntellisenseData {
                     QualifiedMemberKind::Package => packages.push(entry.name.clone()),
                     QualifiedMemberKind::Sequence => sequences.push(entry.name.clone()),
                     QualifiedMemberKind::Synonym => synonyms.push(entry.name.clone()),
+                    QualifiedMemberKind::DatabaseLink => database_links.push(entry.name.clone()),
+                    QualifiedMemberKind::Directory => directories.push(entry.name.clone()),
+                    QualifiedMemberKind::Library => libraries.push(entry.name.clone()),
+                    QualifiedMemberKind::Cluster => clusters.push(entry.name.clone()),
+                    QualifiedMemberKind::Context => contexts.push(entry.name.clone()),
+                    QualifiedMemberKind::Dimension => dimensions.push(entry.name.clone()),
+                    QualifiedMemberKind::Operator => operators.push(entry.name.clone()),
+                    QualifiedMemberKind::Indextype => indextypes.push(entry.name.clone()),
+                    QualifiedMemberKind::Edition => editions.push(entry.name.clone()),
+                    QualifiedMemberKind::JavaSource => java_sources.push(entry.name.clone()),
+                    QualifiedMemberKind::JavaClass => java_classes.push(entry.name.clone()),
+                    QualifiedMemberKind::JavaResource => java_resources.push(entry.name.clone()),
                     QualifiedMemberKind::PublicSynonym | QualifiedMemberKind::User => {}
                 }
             }
@@ -1526,6 +1719,18 @@ impl IntellisenseData {
             && packages.is_empty()
             && sequences.is_empty()
             && synonyms.is_empty()
+            && database_links.is_empty()
+            && directories.is_empty()
+            && libraries.is_empty()
+            && clusters.is_empty()
+            && contexts.is_empty()
+            && dimensions.is_empty()
+            && operators.is_empty()
+            && indextypes.is_empty()
+            && editions.is_empty()
+            && java_sources.is_empty()
+            && java_classes.is_empty()
+            && java_resources.is_empty()
         {
             if let Some(relation_entries) = self.relation_member_entries_by_qualifier.get(&key) {
                 tables.extend(relation_entries.iter().map(|entry| entry.name.clone()));
@@ -1546,6 +1751,18 @@ impl IntellisenseData {
         self.packages = packages;
         self.sequences = sequences;
         self.synonyms = synonyms;
+        self.database_links = database_links;
+        self.directories = directories;
+        self.libraries = libraries;
+        self.clusters = clusters;
+        self.contexts = contexts;
+        self.dimensions = dimensions;
+        self.operators = operators;
+        self.indextypes = indextypes;
+        self.editions = editions;
+        self.java_sources = java_sources;
+        self.java_classes = java_classes;
+        self.java_resources = java_resources;
         self.rebuild_indices();
         true
     }
@@ -2089,6 +2306,18 @@ impl IntellisenseData {
         self.sequence_entries = Self::build_entries(&self.sequences);
         self.synonym_entries = Self::build_entries(&self.synonyms);
         self.public_synonym_entries = Self::build_entries(&self.public_synonyms);
+        self.database_link_entries = Self::build_entries(&self.database_links);
+        self.directory_entries = Self::build_entries(&self.directories);
+        self.library_entries = Self::build_entries(&self.libraries);
+        self.cluster_entries = Self::build_entries(&self.clusters);
+        self.context_entries = Self::build_entries(&self.contexts);
+        self.dimension_entries = Self::build_entries(&self.dimensions);
+        self.operator_entries = Self::build_entries(&self.operators);
+        self.indextype_entries = Self::build_entries(&self.indextypes);
+        self.edition_entries = Self::build_entries(&self.editions);
+        self.java_source_entries = Self::build_entries(&self.java_sources);
+        self.java_class_entries = Self::build_entries(&self.java_classes);
+        self.java_resource_entries = Self::build_entries(&self.java_resources);
         self.user_entries = Self::build_entries(&self.users);
         self.relations_upper = self
             .tables
@@ -2189,6 +2418,18 @@ impl IntellisenseData {
             || self.sequence_entries.len() != self.sequences.len()
             || self.synonym_entries.len() != self.synonyms.len()
             || self.public_synonym_entries.len() != self.public_synonyms.len()
+            || self.database_link_entries.len() != self.database_links.len()
+            || self.directory_entries.len() != self.directories.len()
+            || self.library_entries.len() != self.libraries.len()
+            || self.cluster_entries.len() != self.clusters.len()
+            || self.context_entries.len() != self.contexts.len()
+            || self.dimension_entries.len() != self.dimensions.len()
+            || self.operator_entries.len() != self.operators.len()
+            || self.indextype_entries.len() != self.indextypes.len()
+            || self.edition_entries.len() != self.editions.len()
+            || self.java_source_entries.len() != self.java_sources.len()
+            || self.java_class_entries.len() != self.java_classes.len()
+            || self.java_resource_entries.len() != self.java_resources.len()
             || self.user_entries.len() != self.users.len()
         {
             self.rebuild_indices();
@@ -5516,6 +5757,46 @@ mod intellisense_tests {
     }
 
     #[test]
+    fn get_object_suggestions_include_extended_oracle_schema_objects() {
+        let mut data = IntellisenseData::new();
+        data.database_links = vec!["APP_LINK".to_string()];
+        data.directories = vec!["DATA_PUMP_DIR".to_string()];
+        data.libraries = vec!["APP_LIB".to_string()];
+        data.clusters = vec!["EMP_CLUSTER".to_string()];
+        data.contexts = vec!["APP_CTX".to_string()];
+        data.dimensions = vec!["SALES_DIM".to_string()];
+        data.operators = vec!["EQ_OP".to_string()];
+        data.indextypes = vec!["TEXT_ITYPE".to_string()];
+        data.editions = vec!["V2_EDITION".to_string()];
+        data.java_sources = vec!["Welcome".to_string()];
+        data.java_classes = vec!["Agent".to_string()];
+        data.java_resources = vec!["appText".to_string()];
+        data.rebuild_indices();
+
+        let suggestions = data.get_object_suggestions("");
+
+        for expected in [
+            "APP_LINK",
+            "DATA_PUMP_DIR",
+            "APP_LIB",
+            "EMP_CLUSTER",
+            "APP_CTX",
+            "SALES_DIM",
+            "EQ_OP",
+            "TEXT_ITYPE",
+            "V2_EDITION",
+            "Welcome",
+            "Agent",
+            "appText",
+        ] {
+            assert!(
+                suggestions.iter().any(|name| name == expected),
+                "expected `{expected}` in object suggestions, got {suggestions:?}"
+            );
+        }
+    }
+
+    #[test]
     fn get_suggestions_for_db_general_flow_includes_all_object_types() {
         let mut data = IntellisenseData::new();
         data.tables = vec!["EMP_TBL".to_string()];
@@ -5531,6 +5812,10 @@ mod intellisense_tests {
         data.triggers = vec!["EMP_TRG".to_string()];
         data.events = vec!["EMP_EVT".to_string()];
         data.indexes = vec!["EMP_IDX".to_string()];
+        data.database_links = vec!["EMP_DBLINK".to_string()];
+        data.directories = vec!["EMP_DIR".to_string()];
+        data.libraries = vec!["EMP_LIB".to_string()];
+        data.java_sources = vec!["EMP_JAVA_SRC".to_string()];
         data.users = vec!["EMP_USR".to_string()];
         data.rebuild_indices();
 
@@ -5550,6 +5835,10 @@ mod intellisense_tests {
             "EMP_TRG",
             "EMP_EVT",
             "EMP_IDX",
+            "EMP_DBLINK",
+            "EMP_DIR",
+            "EMP_LIB",
+            "EMP_JAVA_SRC",
             "EMP_USR",
         ] {
             assert!(

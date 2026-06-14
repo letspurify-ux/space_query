@@ -343,6 +343,18 @@ fn add_object_name_to_intellisense_list(
         "SEQUENCE" => data.sequences.push(name.to_string()),
         "SYNONYM" => data.synonyms.push(name.to_string()),
         "EVENT" => data.events.push(name.to_string()),
+        "DATABASE LINK" => data.database_links.push(name.to_string()),
+        "DIRECTORY" => data.directories.push(name.to_string()),
+        "LIBRARY" => data.libraries.push(name.to_string()),
+        "CLUSTER" => data.clusters.push(name.to_string()),
+        "CONTEXT" => data.contexts.push(name.to_string()),
+        "DIMENSION" => data.dimensions.push(name.to_string()),
+        "OPERATOR" => data.operators.push(name.to_string()),
+        "INDEXTYPE" => data.indextypes.push(name.to_string()),
+        "EDITION" => data.editions.push(name.to_string()),
+        "JAVA SOURCE" => data.java_sources.push(name.to_string()),
+        "JAVA CLASS" => data.java_classes.push(name.to_string()),
+        "JAVA RESOURCE" => data.java_resources.push(name.to_string()),
         _ => {}
     }
 }
@@ -9221,6 +9233,9 @@ mod tests {
                 ("OQT_THIN_META_V".to_string(), "VIEW".to_string()),
                 ("OQT_THIN_META_P".to_string(), "PACKAGE".to_string()),
                 ("OQT_THIN_META_S".to_string(), "SYNONYM".to_string()),
+                ("OQT_THIN_META_DIR".to_string(), "DIRECTORY".to_string()),
+                ("OQT_THIN_META_LIB".to_string(), "LIBRARY".to_string()),
+                ("OQT_THIN_META_SRC".to_string(), "JAVA SOURCE".to_string()),
             ],
         );
         schema_objects.insert(
@@ -9245,6 +9260,9 @@ mod tests {
         assert!(data.views.contains(&"OQT_THIN_META_V".to_string()));
         assert!(data.packages.contains(&"OQT_THIN_META_P".to_string()));
         assert!(data.synonyms.contains(&"OQT_THIN_META_S".to_string()));
+        assert!(data.directories.contains(&"OQT_THIN_META_DIR".to_string()));
+        assert!(data.libraries.contains(&"OQT_THIN_META_LIB".to_string()));
+        assert!(data.java_sources.contains(&"OQT_THIN_META_SRC".to_string()));
         assert!(data.public_synonyms.contains(&"DUAL".to_string()));
 
         let mut highlight_data = HighlightData::new();

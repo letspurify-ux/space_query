@@ -920,6 +920,69 @@ fn expanded_statement_window_for_mysql_db_type_keeps_double_dash_arithmetic_as_c
 }
 
 #[test]
+fn expanded_statement_exact_bounds_ignores_plsql_words_inside_identifiers() {
+    let statement = "SELECT begin_date, declared_at, package_body_label FROM audit_log";
+    let expanded = ExpandedStatementWindow {
+        statement_start: 8,
+        statement_end: 8 + statement.len(),
+        text: statement.to_string(),
+        cursor_in_statement: statement.find("begin_date").unwrap_or(0),
+    };
+    let full_text = format!("SELECT 0;\n{statement};\nSELECT 1;");
+
+    assert!(
+        !SqlEditorWidget::expanded_statement_requires_exact_bounds(&full_text, &expanded),
+        "identifier substrings should not force exact full-script statement bounds"
+    );
+}
+
+#[test]
+fn expanded_statement_exact_bounds_ignores_plsql_words_inside_literals_and_comments() {
+    let statement = "SELECT 'BEGIN', col FROM emp -- DECLARE package body";
+    let expanded = ExpandedStatementWindow {
+        statement_start: 8,
+        statement_end: 8 + statement.len(),
+        text: statement.to_string(),
+        cursor_in_statement: statement.find("col").unwrap_or(0),
+    };
+    let full_text = format!("SELECT 0;\n{statement};\nSELECT 1;");
+
+    assert!(
+        !SqlEditorWidget::expanded_statement_requires_exact_bounds(&full_text, &expanded),
+        "literal/comment text should not force exact full-script statement bounds"
+    );
+}
+
+#[test]
+fn expanded_statement_exact_bounds_detects_real_plsql_tokens() {
+    let procedure = "CREATE OR REPLACE PROCEDURE p IS\nBEGIN\n    NULL;\nEND;";
+    let procedure_window = ExpandedStatementWindow {
+        statement_start: 8,
+        statement_end: 8 + procedure.len(),
+        text: procedure.to_string(),
+        cursor_in_statement: procedure.find("NULL").unwrap_or(0),
+    };
+    let full_text = format!("SELECT 0;\n{procedure}\n/\nSELECT 1;");
+    assert!(
+        SqlEditorWidget::expanded_statement_requires_exact_bounds(&full_text, &procedure_window),
+        "real PL/SQL block tokens still require exact full-script statement bounds"
+    );
+
+    let package_body = "CREATE OR REPLACE PACKAGE /* editioned */ BODY p AS\nEND;";
+    let package_window = ExpandedStatementWindow {
+        statement_start: 8,
+        statement_end: 8 + package_body.len(),
+        text: package_body.to_string(),
+        cursor_in_statement: package_body.find("BODY").unwrap_or(0),
+    };
+    let full_text = format!("SELECT 0;\n{package_body}\n/\nSELECT 1;");
+    assert!(
+        SqlEditorWidget::expanded_statement_requires_exact_bounds(&full_text, &package_window),
+        "PACKAGE BODY tokens separated by comments still require exact bounds"
+    );
+}
+
+#[test]
 fn mariadb_final_boss_ranked_cte_completion_context_survives_full_script_split() {
     let script = load_mariadb_intellisense_test_file("test1.txt");
     let (statement, _cursor, deep_ctx) = analyze_full_script_target_replacement(
@@ -17231,6 +17294,7 @@ fn collect_expected_keyword_suggestions_include_ddl_object_type_tokens() {
     let create_or_replace_editioning_ctx =
         analyze_inline_cursor_sql("CREATE OR REPLACE EDITIONING |");
     let create_editioning_ctx = analyze_inline_cursor_sql("CREATE EDITIONING |");
+    let drop_ctx = analyze_inline_cursor_sql("DROP |");
     let drop_public_ctx = analyze_inline_cursor_sql("DROP PUBLIC |");
     let drop_package_body_ctx = analyze_inline_cursor_sql("DROP PACKAGE B|");
     let create_unique_ctx = analyze_inline_cursor_sql("CREATE UNIQUE |");
@@ -17239,7 +17303,25 @@ fn collect_expected_keyword_suggestions_include_ddl_object_type_tokens() {
     let create_global_temporary_ctx = analyze_inline_cursor_sql("CREATE GLOBAL TEMPORARY |");
     let create_public_ctx = analyze_inline_cursor_sql("CREATE PUBLIC |");
     let create_or_replace_public_ctx = analyze_inline_cursor_sql("CREATE OR REPLACE PUBLIC |");
+    let create_database_ctx = analyze_inline_cursor_sql("CREATE DATABASE |");
+    let create_or_replace_database_ctx = analyze_inline_cursor_sql("CREATE OR REPLACE DATABASE |");
+    let create_public_database_ctx = analyze_inline_cursor_sql("CREATE PUBLIC DATABASE |");
+    let create_shared_ctx = analyze_inline_cursor_sql("CREATE SHARED |");
+    let create_or_replace_shared_ctx = analyze_inline_cursor_sql("CREATE OR REPLACE SHARED |");
+    let create_shared_database_ctx = analyze_inline_cursor_sql("CREATE SHARED DATABASE |");
+    let create_shared_public_ctx = analyze_inline_cursor_sql("CREATE SHARED PUBLIC |");
+    let drop_database_ctx = analyze_inline_cursor_sql("DROP DATABASE |");
+    let drop_public_database_ctx = analyze_inline_cursor_sql("DROP PUBLIC DATABASE |");
+    let drop_shared_ctx = analyze_inline_cursor_sql("DROP SHARED |");
     let alter_ctx = analyze_inline_cursor_sql("ALTER |");
+    let alter_public_ctx = analyze_inline_cursor_sql("ALTER PUBLIC |");
+    let alter_database_ctx = analyze_inline_cursor_sql("ALTER DATABASE |");
+    let alter_public_database_ctx = analyze_inline_cursor_sql("ALTER PUBLIC DATABASE |");
+    let alter_shared_ctx = analyze_inline_cursor_sql("ALTER SHARED |");
+    let alter_shared_database_ctx = analyze_inline_cursor_sql("ALTER SHARED DATABASE |");
+    let alter_shared_public_ctx = analyze_inline_cursor_sql("ALTER SHARED PUBLIC |");
+    let alter_shared_public_database_ctx =
+        analyze_inline_cursor_sql("ALTER SHARED PUBLIC DATABASE |");
     let alter_session_ctx = analyze_inline_cursor_sql("ALTER SESSION |");
     let alter_session_set_ctx = analyze_inline_cursor_sql("ALTER SESSION SET |");
     let analyze_ctx = analyze_inline_cursor_sql("ANALYZE |");
@@ -17260,6 +17342,7 @@ fn collect_expected_keyword_suggestions_include_ddl_object_type_tokens() {
         SqlEditorWidget::collect_expected_keyword_suggestions("", &create_or_replace_editioning_ctx);
     let create_editioning_suggestions =
         SqlEditorWidget::collect_expected_keyword_suggestions("", &create_editioning_ctx);
+    let drop_suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &drop_ctx);
     let drop_public_suggestions =
         SqlEditorWidget::collect_expected_keyword_suggestions("", &drop_public_ctx);
     let drop_package_body_suggestions =
@@ -17276,7 +17359,41 @@ fn collect_expected_keyword_suggestions_include_ddl_object_type_tokens() {
         SqlEditorWidget::collect_expected_keyword_suggestions("", &create_public_ctx);
     let create_or_replace_public_suggestions =
         SqlEditorWidget::collect_expected_keyword_suggestions("", &create_or_replace_public_ctx);
+    let create_database_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_database_ctx);
+    let create_or_replace_database_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_or_replace_database_ctx);
+    let create_public_database_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_public_database_ctx);
+    let create_shared_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_shared_ctx);
+    let create_or_replace_shared_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_or_replace_shared_ctx);
+    let create_shared_database_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_shared_database_ctx);
+    let create_shared_public_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_shared_public_ctx);
+    let drop_database_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &drop_database_ctx);
+    let drop_public_database_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &drop_public_database_ctx);
+    let drop_shared_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &drop_shared_ctx);
     let alter_suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_ctx);
+    let alter_public_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_public_ctx);
+    let alter_database_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_database_ctx);
+    let alter_public_database_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_public_database_ctx);
+    let alter_shared_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_shared_ctx);
+    let alter_shared_database_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_shared_database_ctx);
+    let alter_shared_public_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_shared_public_ctx);
+    let alter_shared_public_database_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_shared_public_database_ctx);
     let alter_session_suggestions =
         SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_session_ctx);
     let alter_session_set_suggestions =
@@ -17291,6 +17408,26 @@ fn collect_expected_keyword_suggestions_include_ddl_object_type_tokens() {
         SqlEditorWidget::collect_expected_keyword_suggestions("", &create_synonym_name_ctx);
 
     assert!(create_suggestions.iter().any(|value| value == "EDITIONING"));
+    for value in [
+        "DIRECTORY",
+        "TABLESPACE",
+        "ROLE",
+        "PROFILE",
+        "ROLLBACK",
+        "JAVA",
+        "LIBRARY",
+        "CLUSTER",
+        "CONTEXT",
+        "DIMENSION",
+        "OPERATOR",
+        "INDEXTYPE",
+        "EDITION",
+    ] {
+        assert!(
+            create_suggestions.iter().any(|suggestion| suggestion == value),
+            "CREATE keyword suggestions should include {value}: {create_suggestions:?}"
+        );
+    }
     assert!(create_or_replace_suggestions.iter().any(|value| value == "INDEX"));
     assert!(create_or_replace_suggestions
         .iter()
@@ -17299,6 +17436,21 @@ fn collect_expected_keyword_suggestions_include_ddl_object_type_tokens() {
     assert!(create_or_replace_suggestions.iter().any(|value| value == "TRIGGER"));
     assert!(create_or_replace_suggestions.iter().any(|value| value == "TYPE"));
     assert!(create_or_replace_suggestions.iter().any(|value| value == "USER"));
+    assert!(create_or_replace_suggestions
+        .iter()
+        .any(|value| value == "DIRECTORY"));
+    assert!(create_or_replace_suggestions
+        .iter()
+        .any(|value| value == "JAVA"));
+    assert!(create_or_replace_suggestions
+        .iter()
+        .any(|value| value == "LIBRARY"));
+    assert!(!create_or_replace_suggestions
+        .iter()
+        .any(|value| value == "DATABASE"));
+    assert!(!create_or_replace_suggestions
+        .iter()
+        .any(|value| value == "SHARED"));
     assert_eq!(
         create_or_replace_materialized_suggestions,
         vec!["VIEW".to_string()]
@@ -17308,7 +17460,30 @@ fn collect_expected_keyword_suggestions_include_ddl_object_type_tokens() {
         vec!["VIEW".to_string()]
     );
     assert_eq!(create_editioning_suggestions, vec!["VIEW".to_string()]);
-    assert_eq!(drop_public_suggestions, vec!["SYNONYM".to_string()]);
+    for value in [
+        "DIRECTORY",
+        "TABLESPACE",
+        "ROLE",
+        "PROFILE",
+        "ROLLBACK",
+        "JAVA",
+        "LIBRARY",
+        "CLUSTER",
+        "CONTEXT",
+        "DIMENSION",
+        "OPERATOR",
+        "INDEXTYPE",
+        "EDITION",
+    ] {
+        assert!(
+            drop_suggestions.iter().any(|suggestion| suggestion == value),
+            "DROP keyword suggestions should include {value}: {drop_suggestions:?}"
+        );
+    }
+    assert!(drop_public_suggestions.iter().any(|value| value == "SYNONYM"));
+    assert!(drop_public_suggestions
+        .iter()
+        .any(|value| value == "DATABASE"));
     assert_eq!(drop_package_body_suggestions, vec!["BODY".to_string()]);
     assert_eq!(create_unique_suggestions, vec!["INDEX".to_string()]);
     assert_eq!(create_bitmap_suggestions, vec!["INDEX".to_string()]);
@@ -17317,12 +17492,99 @@ fn collect_expected_keyword_suggestions_include_ddl_object_type_tokens() {
         create_global_temporary_suggestions,
         vec!["TABLE".to_string()]
     );
-    assert_eq!(create_public_suggestions, vec!["SYNONYM".to_string()]);
+    assert!(create_public_suggestions.iter().any(|value| value == "SYNONYM"));
+    assert!(create_public_suggestions
+        .iter()
+        .any(|value| value == "DATABASE"));
+    assert!(create_public_suggestions
+        .iter()
+        .any(|value| value == "ROLLBACK"));
+    assert!(create_or_replace_public_suggestions
+        .iter()
+        .any(|value| value == "SYNONYM"));
+    assert!(!create_or_replace_public_suggestions
+        .iter()
+        .any(|value| value == "DATABASE"));
+    assert_eq!(create_database_suggestions, vec!["LINK".to_string()]);
+    assert!(create_or_replace_database_suggestions.is_empty());
     assert_eq!(
-        create_or_replace_public_suggestions,
-        vec!["SYNONYM".to_string()]
+        create_public_database_suggestions,
+        vec!["LINK".to_string()]
     );
+    assert!(create_shared_suggestions
+        .iter()
+        .any(|value| value == "PUBLIC"));
+    assert!(create_shared_suggestions
+        .iter()
+        .any(|value| value == "DATABASE"));
+    assert!(create_or_replace_shared_suggestions.is_empty());
+    assert_eq!(
+        create_shared_database_suggestions,
+        vec!["LINK".to_string()]
+    );
+    assert_eq!(
+        create_shared_public_suggestions,
+        vec!["DATABASE".to_string()]
+    );
+    assert_eq!(drop_database_suggestions, vec!["LINK".to_string()]);
+    assert_eq!(
+        drop_public_database_suggestions,
+        vec!["LINK".to_string()]
+    );
+    assert!(drop_shared_suggestions.is_empty());
     assert!(alter_suggestions.iter().any(|value| value == "SESSION"));
+    for value in [
+        "TABLESPACE",
+        "ROLE",
+        "PROFILE",
+        "ROLLBACK",
+        "JAVA",
+        "LIBRARY",
+        "CLUSTER",
+        "DIMENSION",
+        "OPERATOR",
+        "INDEXTYPE",
+        "SYSTEM",
+    ] {
+        assert!(
+            alter_suggestions.iter().any(|suggestion| suggestion == value),
+            "ALTER keyword suggestions should include {value}: {alter_suggestions:?}"
+        );
+    }
+    assert!(
+        !alter_suggestions.iter().any(|value| value == "DIRECTORY"),
+        "ALTER keyword suggestions should not include DIRECTORY: {alter_suggestions:?}"
+    );
+    assert!(alter_suggestions.iter().any(|value| value == "PUBLIC"));
+    assert!(alter_suggestions.iter().any(|value| value == "DATABASE"));
+    assert!(alter_suggestions.iter().any(|value| value == "SHARED"));
+    assert!(alter_public_suggestions.iter().any(|value| value == "SYNONYM"));
+    assert!(alter_public_suggestions
+        .iter()
+        .any(|value| value == "DATABASE"));
+    assert_eq!(alter_database_suggestions, vec!["LINK".to_string()]);
+    assert_eq!(
+        alter_public_database_suggestions,
+        vec!["LINK".to_string()]
+    );
+    assert!(alter_shared_suggestions
+        .iter()
+        .any(|value| value == "PUBLIC"));
+    assert!(alter_shared_suggestions
+        .iter()
+        .any(|value| value == "DATABASE"));
+    assert_eq!(
+        alter_shared_database_suggestions,
+        vec!["LINK".to_string()]
+    );
+    assert_eq!(
+        alter_shared_public_suggestions,
+        vec!["DATABASE".to_string()]
+    );
+    assert_eq!(
+        alter_shared_public_database_suggestions,
+        vec!["LINK".to_string()]
+    );
     assert_eq!(alter_session_suggestions, vec!["SET".to_string()]);
     assert_eq!(
         alter_session_set_suggestions,
@@ -17333,6 +17595,40 @@ fn collect_expected_keyword_suggestions_include_ddl_object_type_tokens() {
     assert_eq!(check_suggestions, vec!["TABLE".to_string()]);
     assert_eq!(repair_suggestions, vec!["TABLE".to_string()]);
     assert_eq!(create_synonym_name_suggestions, vec!["FOR".to_string()]);
+}
+
+#[test]
+fn collect_expected_keyword_suggestions_complete_plsql_body_object_tails() {
+    for sql in [
+        "CREATE PACKAGE |",
+        "CREATE OR REPLACE PACKAGE |",
+        "CREATE TYPE |",
+        "CREATE OR REPLACE TYPE |",
+        "DROP PACKAGE |",
+        "DROP TYPE |",
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        let suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &ctx);
+        assert_eq!(
+            suggestions,
+            vec!["BODY".to_string()],
+            "PL/SQL body tail should complete BODY for `{sql}`"
+        );
+    }
+
+    let drop_package_prefix_ctx = analyze_inline_cursor_sql("DROP PACKAGE B|");
+    let drop_package_prefix_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("B", &drop_package_prefix_ctx);
+    assert_eq!(drop_package_prefix_suggestions, vec!["BODY".to_string()]);
+
+    for sql in ["ALTER PACKAGE |", "ALTER TYPE |"] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        let suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &ctx);
+        assert!(
+            !suggestions.iter().any(|value| value == "BODY"),
+            "ALTER object-name context should not suggest BODY before the object name for `{sql}`"
+        );
+    }
 }
 
 #[test]
@@ -17392,6 +17688,12 @@ fn schema_member_suggestions_for_create_synonym_target_include_all_object_kinds(
             ("EMP_SEQ".to_string(), Some(QualifiedMemberKind::Sequence)),
             ("EMP_API".to_string(), Some(QualifiedMemberKind::Package)),
             ("EMP_T".to_string(), Some(QualifiedMemberKind::Type)),
+            (
+                "DATA_PUMP_DIR".to_string(),
+                Some(QualifiedMemberKind::Directory),
+            ),
+            ("APP_LINK".to_string(), Some(QualifiedMemberKind::DatabaseLink)),
+            ("Welcome".to_string(), Some(QualifiedMemberKind::JavaSource)),
         ],
     );
     data.set_relation_members_for_qualifier(
@@ -17409,11 +17711,14 @@ fn schema_member_suggestions_for_create_synonym_target_include_all_object_kinds(
     assert_eq!(
         suggestions,
         vec![
+            "APP_LINK".to_string(),
+            "DATA_PUMP_DIR".to_string(),
             "EMP".to_string(),
             "EMP_API".to_string(),
             "EMP_SEQ".to_string(),
             "EMP_T".to_string(),
             "EMP_VIEW".to_string(),
+            "Welcome".to_string(),
         ]
     );
 }
@@ -17423,8 +17728,11 @@ fn collect_expected_object_suggestions_filter_by_object_type_and_include_users()
     let drop_package_ctx = analyze_inline_cursor_sql("DROP PACKAGE |");
     let drop_package_body_ctx = analyze_inline_cursor_sql("DROP PACKAGE BODY |");
     let drop_type_ctx = analyze_inline_cursor_sql("DROP TYPE |");
+    let drop_type_body_ctx = analyze_inline_cursor_sql("DROP TYPE BODY |");
     let drop_trigger_ctx = analyze_inline_cursor_sql("DROP TRIGGER |");
     let drop_index_ctx = analyze_inline_cursor_sql("DROP INDEX |");
+    let alter_synonym_ctx = analyze_inline_cursor_sql("ALTER SYNONYM |");
+    let alter_public_synonym_ctx = analyze_inline_cursor_sql("ALTER PUBLIC SYNONYM |");
     let grant_execute_ctx = analyze_inline_cursor_sql("GRANT EXECUTE ON |");
     let grant_debug_ctx = analyze_inline_cursor_sql("GRANT DEBUG ON |");
     let grant_multi_relation_ctx =
@@ -17441,6 +17749,8 @@ fn collect_expected_object_suggestions_filter_by_object_type_and_include_users()
     data.procedures = vec!["RUN_JOB".to_string()];
     data.packages = vec!["UTIL_PKG".to_string()];
     data.sequences = vec!["SEQ_ORDER".to_string()];
+    data.synonyms = vec!["EMP_SYN".to_string()];
+    data.public_synonyms = vec!["EMP_PUBLIC_SYN".to_string()];
     data.users = vec!["SCOTT".to_string()];
     data.rebuild_indices();
 
@@ -17453,10 +17763,19 @@ fn collect_expected_object_suggestions_filter_by_object_type_and_include_users()
     );
     let type_suggestions =
         SqlEditorWidget::collect_expected_object_suggestions(&mut data, "", &drop_type_ctx);
+    let type_body_suggestions =
+        SqlEditorWidget::collect_expected_object_suggestions(&mut data, "", &drop_type_body_ctx);
     let trigger_suggestions =
         SqlEditorWidget::collect_expected_object_suggestions(&mut data, "", &drop_trigger_ctx);
     let index_suggestions =
         SqlEditorWidget::collect_expected_object_suggestions(&mut data, "", &drop_index_ctx);
+    let alter_synonym_suggestions =
+        SqlEditorWidget::collect_expected_object_suggestions(&mut data, "", &alter_synonym_ctx);
+    let alter_public_synonym_suggestions = SqlEditorWidget::collect_expected_object_suggestions(
+        &mut data,
+        "",
+        &alter_public_synonym_ctx,
+    );
     let grant_execute_suggestions =
         SqlEditorWidget::collect_expected_object_suggestions(&mut data, "", &grant_execute_ctx);
     let grant_debug_suggestions =
@@ -17476,8 +17795,14 @@ fn collect_expected_object_suggestions_filter_by_object_type_and_include_users()
     assert_eq!(package_suggestions, vec!["UTIL_PKG".to_string()]);
     assert_eq!(package_body_suggestions, vec!["UTIL_PKG".to_string()]);
     assert_eq!(type_suggestions, vec!["ADDRESS_T".to_string()]);
+    assert_eq!(type_body_suggestions, vec!["ADDRESS_T".to_string()]);
     assert_eq!(trigger_suggestions, vec!["EMP_BIU_TRG".to_string()]);
     assert_eq!(index_suggestions, vec!["EMP_PK".to_string()]);
+    assert_eq!(alter_synonym_suggestions, vec!["EMP_SYN".to_string()]);
+    assert_eq!(
+        alter_public_synonym_suggestions,
+        vec!["EMP_PUBLIC_SYN".to_string()]
+    );
     assert!(grant_execute_suggestions.iter().any(|value| value == "ADDRESS_T"));
     assert!(grant_execute_suggestions.iter().any(|value| value == "RUN_JOB"));
     assert!(grant_execute_suggestions.iter().any(|value| value == "UTIL_PKG"));
@@ -17513,6 +17838,62 @@ fn collect_expected_object_suggestions_filter_by_object_type_and_include_users()
 }
 
 #[test]
+fn collect_expected_object_suggestions_filter_extended_oracle_object_types() {
+    let mut data = IntellisenseData::new();
+    data.database_links = vec!["APP_LINK".to_string()];
+    data.directories = vec!["DATA_PUMP_DIR".to_string()];
+    data.libraries = vec!["APP_LIB".to_string()];
+    data.clusters = vec!["EMP_CLUSTER".to_string()];
+    data.contexts = vec!["APP_CTX".to_string()];
+    data.dimensions = vec!["SALES_DIM".to_string()];
+    data.operators = vec!["EQ_OP".to_string()];
+    data.indextypes = vec!["TEXT_ITYPE".to_string()];
+    data.editions = vec!["V2_EDITION".to_string()];
+    data.java_sources = vec!["Welcome".to_string()];
+    data.java_classes = vec!["Agent".to_string()];
+    data.java_resources = vec!["appText".to_string()];
+    data.tables = vec!["EMP".to_string()];
+    data.rebuild_indices();
+
+    for (sql, expected) in [
+        ("DROP DATABASE LINK |", "APP_LINK"),
+        ("DROP PUBLIC DATABASE LINK |", "APP_LINK"),
+        ("ALTER DATABASE LINK |", "APP_LINK"),
+        ("ALTER PUBLIC DATABASE LINK |", "APP_LINK"),
+        ("DROP DIRECTORY |", "DATA_PUMP_DIR"),
+        ("ALTER LIBRARY |", "APP_LIB"),
+        ("DROP LIBRARY |", "APP_LIB"),
+        ("ALTER CLUSTER |", "EMP_CLUSTER"),
+        ("DROP CLUSTER |", "EMP_CLUSTER"),
+        ("DROP CONTEXT |", "APP_CTX"),
+        ("ALTER DIMENSION |", "SALES_DIM"),
+        ("DROP DIMENSION |", "SALES_DIM"),
+        ("ALTER OPERATOR |", "EQ_OP"),
+        ("DROP OPERATOR |", "EQ_OP"),
+        ("ALTER INDEXTYPE |", "TEXT_ITYPE"),
+        ("DROP INDEXTYPE |", "TEXT_ITYPE"),
+        ("DROP EDITION |", "V2_EDITION"),
+        ("ALTER JAVA SOURCE |", "Welcome"),
+        ("DROP JAVA SOURCE |", "Welcome"),
+        ("ALTER JAVA CLASS |", "Agent"),
+        ("DROP JAVA CLASS |", "Agent"),
+        ("DROP JAVA RESOURCE |", "appText"),
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        let suggestions = SqlEditorWidget::collect_expected_object_suggestions(&mut data, "", &ctx);
+        assert_eq!(
+            suggestions,
+            vec![expected.to_string()],
+            "object suggestions should filter to `{expected}` for `{sql}`"
+        );
+        assert!(
+            !suggestions.iter().any(|value| value == "EMP"),
+            "object suggestions for `{sql}` should not include unrelated tables: {suggestions:?}"
+        );
+    }
+}
+
+#[test]
 fn table_context_expected_object_suggestions_filter_maintenance_table_targets() {
     let mut data = IntellisenseData::new();
     data.tables = vec!["EMP".to_string()];
@@ -17530,6 +17911,9 @@ fn table_context_expected_object_suggestions_filter_maintenance_table_targets() 
         "ALTER TABLE orders ADD CONSTRAINT fk_orders_customer FOREIGN KEY (customer_id) REFERENCES |",
         "CREATE INDEX idx_emp_dept ON |",
         "CREATE UNIQUE INDEX idx_emp_dept ON |",
+        "CREATE MATERIALIZED VIEW LOG ON |",
+        "ALTER MATERIALIZED VIEW LOG ON |",
+        "DROP MATERIALIZED VIEW LOG ON |",
         "CREATE TRIGGER trg_emp_audit ON |",
         "CREATE OR REPLACE TRIGGER trg_emp_audit BEFORE INSERT ON |",
     ] {
@@ -17697,6 +18081,9 @@ fn schema_relation_member_suggestions_filter_by_oracle_object_context() {
     let create_or_replace_trigger_ctx = analyze_inline_cursor_sql(
         "CREATE OR REPLACE TRIGGER trg_emp_audit BEFORE INSERT ON scott.|",
     );
+    let create_mv_log_ctx = analyze_inline_cursor_sql("CREATE MATERIALIZED VIEW LOG ON scott.|");
+    let alter_mv_log_ctx = analyze_inline_cursor_sql("ALTER MATERIALIZED VIEW LOG ON scott.|");
+    let drop_mv_log_ctx = analyze_inline_cursor_sql("DROP MATERIALIZED VIEW LOG ON scott.|");
     let comment_table_ctx = analyze_inline_cursor_sql("COMMENT ON TABLE scott.|");
     let comment_view_ctx = analyze_inline_cursor_sql("COMMENT ON VIEW scott.|");
     let comment_editioning_view_ctx = analyze_inline_cursor_sql("COMMENT ON EDITIONING VIEW scott.|");
@@ -17798,6 +18185,26 @@ fn schema_relation_member_suggestions_filter_by_oracle_object_context() {
             "",
             &create_or_replace_trigger_ctx,
         );
+    let create_mv_log_suggestions =
+        SqlEditorWidget::expected_relation_member_suggestions_for_qualifier(
+            &mut data,
+            "scott",
+            "",
+            &create_mv_log_ctx,
+        );
+    let alter_mv_log_suggestions =
+        SqlEditorWidget::expected_relation_member_suggestions_for_qualifier(
+            &mut data,
+            "scott",
+            "",
+            &alter_mv_log_ctx,
+        );
+    let drop_mv_log_suggestions = SqlEditorWidget::expected_relation_member_suggestions_for_qualifier(
+        &mut data,
+        "scott",
+        "",
+        &drop_mv_log_ctx,
+    );
     let mv_suggestions = SqlEditorWidget::expected_relation_member_suggestions_for_qualifier(
         &mut data,
         "scott",
@@ -17840,6 +18247,9 @@ fn schema_relation_member_suggestions_filter_by_oracle_object_context() {
         create_or_replace_trigger_suggestions,
         vec!["EMP".to_string()]
     );
+    assert_eq!(create_mv_log_suggestions, vec!["EMP".to_string()]);
+    assert_eq!(alter_mv_log_suggestions, vec!["EMP".to_string()]);
+    assert_eq!(drop_mv_log_suggestions, vec!["EMP".to_string()]);
     assert_eq!(mv_suggestions, vec!["EMP_MV".to_string()]);
     assert_eq!(comment_table_suggestions, vec!["EMP".to_string()]);
     assert_eq!(comment_view_suggestions, vec!["EMP_VIEW".to_string()]);
@@ -17848,10 +18258,12 @@ fn schema_relation_member_suggestions_filter_by_oracle_object_context() {
 
 #[test]
 fn schema_object_member_suggestions_cover_oracle_ddl_object_types() {
+    let drop_package_ctx = analyze_inline_cursor_sql("DROP PACKAGE scott.|");
     let drop_package_body_ctx = analyze_inline_cursor_sql("DROP PACKAGE BODY scott.|");
     let drop_type_ctx = analyze_inline_cursor_sql("DROP TYPE scott.|");
     let drop_type_body_ctx = analyze_inline_cursor_sql("DROP TYPE BODY scott.|");
     let alter_trigger_ctx = analyze_inline_cursor_sql("ALTER TRIGGER scott.|");
+    let alter_synonym_ctx = analyze_inline_cursor_sql("ALTER SYNONYM scott.|");
     let drop_index_ctx = analyze_inline_cursor_sql("DROP INDEX scott.|");
     let grant_execute_ctx = analyze_inline_cursor_sql("GRANT EXECUTE ON scott.|");
     let grant_debug_ctx = analyze_inline_cursor_sql("GRANT DEBUG ON scott.|");
@@ -17873,9 +18285,16 @@ fn schema_object_member_suggestions_cover_oracle_ddl_object_types() {
             ("ADDRESS_T".to_string(), Some(QualifiedMemberKind::Type)),
             ("EMP_BIU_TRG".to_string(), Some(QualifiedMemberKind::Trigger)),
             ("EMP_PK".to_string(), Some(QualifiedMemberKind::Index)),
+            ("EMP_SYN".to_string(), Some(QualifiedMemberKind::Synonym)),
         ],
     );
 
+    let package_suggestions = SqlEditorWidget::expected_member_suggestions_for_qualifier(
+        &mut data,
+        "scott",
+        "",
+        &drop_package_ctx,
+    );
     let package_body_suggestions = SqlEditorWidget::expected_member_suggestions_for_qualifier(
         &mut data,
         "scott",
@@ -17899,6 +18318,12 @@ fn schema_object_member_suggestions_cover_oracle_ddl_object_types() {
         "scott",
         "",
         &alter_trigger_ctx,
+    );
+    let synonym_suggestions = SqlEditorWidget::expected_member_suggestions_for_qualifier(
+        &mut data,
+        "scott",
+        "",
+        &alter_synonym_ctx,
     );
     let index_suggestions = SqlEditorWidget::expected_member_suggestions_for_qualifier(
         &mut data,
@@ -17932,10 +18357,12 @@ fn schema_object_member_suggestions_cover_oracle_ddl_object_types() {
             &grant_multi_relation_ctx,
         );
 
+    assert_eq!(package_suggestions, vec!["UTIL_PKG".to_string()]);
     assert_eq!(package_body_suggestions, vec!["UTIL_PKG".to_string()]);
     assert_eq!(type_suggestions, vec!["ADDRESS_T".to_string()]);
     assert_eq!(type_body_suggestions, vec!["ADDRESS_T".to_string()]);
     assert_eq!(trigger_suggestions, vec!["EMP_BIU_TRG".to_string()]);
+    assert_eq!(synonym_suggestions, vec!["EMP_SYN".to_string()]);
     assert_eq!(index_suggestions, vec!["EMP_PK".to_string()]);
     assert_eq!(
         grant_execute_suggestions,
@@ -17957,6 +18384,7 @@ fn schema_object_member_suggestions_cover_oracle_ddl_object_types() {
         grant_select_suggestions,
         vec![
             "EMP".to_string(),
+            "EMP_SYN".to_string(),
             "SALES_MV".to_string(),
             "SEQ_ORDER".to_string()
         ]
@@ -17965,6 +18393,7 @@ fn schema_object_member_suggestions_cover_oracle_ddl_object_types() {
         grant_multi_relation_suggestions,
         vec![
             "EMP".to_string(),
+            "EMP_SYN".to_string(),
             "SALES_MV".to_string(),
             "SEQ_ORDER".to_string()
         ]
@@ -17974,15 +18403,39 @@ fn schema_object_member_suggestions_cover_oracle_ddl_object_types() {
 #[test]
 fn collect_expected_keyword_suggestions_complete_materialized_view_tail() {
     let drop_ctx = analyze_inline_cursor_sql("DROP MATERIALIZED |");
+    let create_mv_ctx = analyze_inline_cursor_sql("CREATE MATERIALIZED VIEW |");
+    let create_mv_log_ctx = analyze_inline_cursor_sql("CREATE MATERIALIZED VIEW LOG |");
+    let alter_mv_ctx = analyze_inline_cursor_sql("ALTER MATERIALIZED VIEW |");
+    let alter_mv_log_ctx = analyze_inline_cursor_sql("ALTER MATERIALIZED VIEW LOG |");
+    let drop_mv_ctx = analyze_inline_cursor_sql("DROP MATERIALIZED VIEW |");
+    let drop_mv_log_ctx = analyze_inline_cursor_sql("DROP MATERIALIZED VIEW LOG |");
     let comment_on_ctx = analyze_inline_cursor_sql("COMMENT ON |");
     let comment_editioning_ctx = analyze_inline_cursor_sql("COMMENT ON EDITIONING |");
     let suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &drop_ctx);
+    let create_mv_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_mv_ctx);
+    let create_mv_log_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_mv_log_ctx);
+    let alter_mv_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_mv_ctx);
+    let alter_mv_log_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_mv_log_ctx);
+    let drop_mv_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &drop_mv_ctx);
+    let drop_mv_log_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &drop_mv_log_ctx);
     let comment_on_suggestions =
         SqlEditorWidget::collect_expected_keyword_suggestions("", &comment_on_ctx);
     let comment_editioning_suggestions =
         SqlEditorWidget::collect_expected_keyword_suggestions("", &comment_editioning_ctx);
 
     assert_eq!(suggestions, vec!["VIEW".to_string()]);
+    assert_eq!(create_mv_suggestions, vec!["LOG".to_string()]);
+    assert_eq!(create_mv_log_suggestions, vec!["ON".to_string()]);
+    assert_eq!(alter_mv_suggestions, vec!["LOG".to_string()]);
+    assert_eq!(alter_mv_log_suggestions, vec!["ON".to_string()]);
+    assert_eq!(drop_mv_suggestions, vec!["LOG".to_string()]);
+    assert_eq!(drop_mv_log_suggestions, vec!["ON".to_string()]);
     assert_eq!(comment_editioning_suggestions, vec!["VIEW".to_string()]);
     assert!(comment_on_suggestions.iter().any(|value| value == "COLUMN"));
     assert!(comment_on_suggestions
@@ -17991,6 +18444,105 @@ fn collect_expected_keyword_suggestions_complete_materialized_view_tail() {
     assert!(comment_on_suggestions
         .iter()
         .any(|value| value == "MATERIALIZED"));
+}
+
+#[test]
+fn collect_expected_keyword_suggestions_complete_rollback_and_java_tails() {
+    for sql in [
+        "CREATE ROLLBACK |",
+        "CREATE PUBLIC ROLLBACK |",
+        "ALTER ROLLBACK |",
+        "DROP ROLLBACK |",
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        let suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &ctx);
+        assert_eq!(
+            suggestions,
+            vec!["SEGMENT".to_string()],
+            "ROLLBACK tail should complete SEGMENT for `{sql}`"
+        );
+    }
+
+    let create_java_ctx = analyze_inline_cursor_sql("CREATE JAVA |");
+    let create_or_replace_java_ctx = analyze_inline_cursor_sql("CREATE OR REPLACE JAVA |");
+    let create_or_replace_and_ctx = analyze_inline_cursor_sql("CREATE OR REPLACE AND |");
+    let create_or_replace_and_compile_ctx =
+        analyze_inline_cursor_sql("CREATE OR REPLACE AND COMPILE |");
+    let create_or_replace_and_resolve_ctx =
+        analyze_inline_cursor_sql("CREATE OR REPLACE AND RESOLVE |");
+    let create_or_replace_and_compile_java_ctx =
+        analyze_inline_cursor_sql("CREATE OR REPLACE AND COMPILE JAVA |");
+    let alter_java_ctx = analyze_inline_cursor_sql("ALTER JAVA |");
+    let drop_java_ctx = analyze_inline_cursor_sql("DROP JAVA |");
+    let create_java_source_ctx = analyze_inline_cursor_sql("CREATE JAVA SOURCE |");
+    let create_java_resource_ctx = analyze_inline_cursor_sql("CREATE JAVA RESOURCE |");
+    let create_java_class_ctx = analyze_inline_cursor_sql("CREATE JAVA CLASS |");
+
+    let create_java_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_java_ctx);
+    let create_or_replace_java_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_or_replace_java_ctx);
+    let create_or_replace_and_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_or_replace_and_ctx);
+    let create_or_replace_and_compile_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &create_or_replace_and_compile_ctx,
+        );
+    let create_or_replace_and_resolve_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &create_or_replace_and_resolve_ctx,
+        );
+    let create_or_replace_and_compile_java_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &create_or_replace_and_compile_java_ctx,
+        );
+    let alter_java_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &alter_java_ctx);
+    let drop_java_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &drop_java_ctx);
+    let create_java_source_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_java_source_ctx);
+    let create_java_resource_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_java_resource_ctx);
+    let create_java_class_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_java_class_ctx);
+
+    assert_eq!(
+        create_java_suggestions,
+        vec![
+            "SOURCE".to_string(),
+            "CLASS".to_string(),
+            "RESOURCE".to_string()
+        ]
+    );
+    assert_eq!(create_or_replace_java_suggestions, create_java_suggestions);
+    assert_eq!(
+        create_or_replace_and_suggestions,
+        vec!["COMPILE".to_string(), "RESOLVE".to_string()]
+    );
+    assert_eq!(
+        create_or_replace_and_compile_suggestions,
+        vec!["JAVA".to_string()]
+    );
+    assert_eq!(
+        create_or_replace_and_resolve_suggestions,
+        vec!["JAVA".to_string()]
+    );
+    assert_eq!(
+        create_or_replace_and_compile_java_suggestions,
+        create_java_suggestions
+    );
+    assert_eq!(
+        alter_java_suggestions,
+        vec!["SOURCE".to_string(), "CLASS".to_string()]
+    );
+    assert_eq!(drop_java_suggestions, create_java_suggestions);
+    assert_eq!(create_java_source_suggestions, vec!["NAMED".to_string()]);
+    assert_eq!(create_java_resource_suggestions, vec!["NAMED".to_string()]);
+    assert_eq!(create_java_class_suggestions, vec!["USING".to_string()]);
 }
 
 #[test]

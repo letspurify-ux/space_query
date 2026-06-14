@@ -37,6 +37,18 @@ enum ExpectedObjectSuggestionKind {
     Sequence,
     Synonym,
     PublicSynonym,
+    DatabaseLink,
+    Directory,
+    Library,
+    Cluster,
+    Context,
+    Dimension,
+    Operator,
+    Indextype,
+    Edition,
+    JavaSource,
+    JavaClass,
+    JavaResource,
     User,
 }
 
@@ -1451,6 +1463,126 @@ impl SqlEditorWidget {
         suggestions
     }
 
+    fn expected_database_link_keyword_candidates(words: &[String]) -> Option<&'static [&'static str]> {
+        const LINK_KEYWORDS: &[&str] = &["LINK"];
+        const DATABASE_LINK_MODIFIERS: &[&str] = &["PUBLIC", "DATABASE"];
+        const DATABASE_KEYWORDS: &[&str] = &["DATABASE"];
+
+        let (allows_shared, tail) = match words {
+            [first, rest @ ..] if first == "DROP" => (false, rest),
+            [first, rest @ ..] if matches!(first.as_str(), "ALTER" | "CREATE") => (true, rest),
+            _ => return None,
+        };
+
+        match tail {
+            [database] if database == "DATABASE" => Some(LINK_KEYWORDS),
+            [public, database] if public == "PUBLIC" && database == "DATABASE" => {
+                Some(LINK_KEYWORDS)
+            }
+            [shared] if allows_shared && shared == "SHARED" => Some(DATABASE_LINK_MODIFIERS),
+            [shared, database] if allows_shared && shared == "SHARED" && database == "DATABASE" => {
+                Some(LINK_KEYWORDS)
+            }
+            [shared, public] if allows_shared && shared == "SHARED" && public == "PUBLIC" => {
+                Some(DATABASE_KEYWORDS)
+            }
+            [shared, public, database]
+                if allows_shared
+                    && shared == "SHARED"
+                    && public == "PUBLIC"
+                    && database == "DATABASE" =>
+            {
+                Some(LINK_KEYWORDS)
+            }
+            _ => None,
+        }
+    }
+
+    fn expected_java_keyword_candidates(words: &[String]) -> Option<&'static [&'static str]> {
+        const JAVA_CREATE_DROP_OBJECT_TYPES: &[&str] = &["SOURCE", "CLASS", "RESOURCE"];
+        const JAVA_ALTER_OBJECT_TYPES: &[&str] = &["SOURCE", "CLASS"];
+        const JAVA_COMPILE_OPTIONS: &[&str] = &["COMPILE", "RESOLVE"];
+        const JAVA_KEYWORD: &[&str] = &["JAVA"];
+        const NAMED_KEYWORD: &[&str] = &["NAMED"];
+        const USING_KEYWORD: &[&str] = &["USING"];
+
+        match words {
+            [create, or_kw, replace, and_kw]
+                if *create == "CREATE"
+                    && *or_kw == "OR"
+                    && *replace == "REPLACE"
+                    && *and_kw == "AND" =>
+            {
+                Some(JAVA_COMPILE_OPTIONS)
+            }
+            [create, or_kw, replace, and_kw, compile]
+                if *create == "CREATE"
+                    && *or_kw == "OR"
+                    && *replace == "REPLACE"
+                    && *and_kw == "AND"
+                    && matches!(compile.as_str(), "COMPILE" | "RESOLVE") =>
+            {
+                Some(JAVA_KEYWORD)
+            }
+            [create, or_kw, replace, java]
+                if *create == "CREATE"
+                    && *or_kw == "OR"
+                    && *replace == "REPLACE"
+                    && *java == "JAVA" =>
+            {
+                Some(JAVA_CREATE_DROP_OBJECT_TYPES)
+            }
+            [create, or_kw, replace, and_kw, compile, java]
+                if *create == "CREATE"
+                    && *or_kw == "OR"
+                    && *replace == "REPLACE"
+                    && *and_kw == "AND"
+                    && matches!(compile.as_str(), "COMPILE" | "RESOLVE")
+                    && *java == "JAVA" =>
+            {
+                Some(JAVA_CREATE_DROP_OBJECT_TYPES)
+            }
+            [.., verb, java]
+                if matches!(verb.as_str(), "CREATE" | "DROP") && *java == "JAVA" =>
+            {
+                Some(JAVA_CREATE_DROP_OBJECT_TYPES)
+            }
+            [.., verb, java] if *verb == "ALTER" && *java == "JAVA" => {
+                Some(JAVA_ALTER_OBJECT_TYPES)
+            }
+            [.., java, object_type]
+                if *java == "JAVA" && matches!(object_type.as_str(), "SOURCE" | "RESOURCE") =>
+            {
+                Some(NAMED_KEYWORD)
+            }
+            [.., java, object_type] if *java == "JAVA" && *object_type == "CLASS" => {
+                Some(USING_KEYWORD)
+            }
+            _ => None,
+        }
+    }
+
+    fn expected_rollback_segment_keyword_candidates(
+        words: &[String],
+    ) -> Option<&'static [&'static str]> {
+        const SEGMENT_KEYWORD: &[&str] = &["SEGMENT"];
+
+        match words {
+            [.., verb, rollback]
+                if matches!(verb.as_str(), "ALTER" | "CREATE" | "DROP")
+                    && *rollback == "ROLLBACK" =>
+            {
+                Some(SEGMENT_KEYWORD)
+            }
+            [.., create, public, rollback]
+                if *create == "CREATE" && *public == "PUBLIC" && *rollback == "ROLLBACK" =>
+            {
+                Some(SEGMENT_KEYWORD)
+            }
+            _ => None,
+        }
+    }
+
     fn is_create_synonym_target_context(words: &[String]) -> bool {
         if words.last().is_none_or(|word| word != "FOR") {
             return false;
@@ -1523,7 +1655,21 @@ impl SqlEditorWidget {
             "PACKAGE",
             "SEQUENCE",
             "SYNONYM",
+            "DATABASE",
+            "DIRECTORY",
+            "TABLESPACE",
             "USER",
+            "ROLE",
+            "PROFILE",
+            "ROLLBACK",
+            "JAVA",
+            "LIBRARY",
+            "CLUSTER",
+            "CONTEXT",
+            "DIMENSION",
+            "OPERATOR",
+            "INDEXTYPE",
+            "EDITION",
             "PUBLIC",
         ];
         const ALTER_OBJECT_TYPE_KEYWORDS: &[&str] = &[
@@ -1538,7 +1684,21 @@ impl SqlEditorWidget {
             "PACKAGE",
             "SEQUENCE",
             "SYNONYM",
+            "DATABASE",
+            "TABLESPACE",
             "USER",
+            "ROLE",
+            "PROFILE",
+            "PUBLIC",
+            "SHARED",
+            "ROLLBACK",
+            "JAVA",
+            "LIBRARY",
+            "CLUSTER",
+            "DIMENSION",
+            "OPERATOR",
+            "INDEXTYPE",
+            "SYSTEM",
             "SESSION",
         ];
         const CREATE_OBJECT_TYPE_KEYWORDS: &[&str] = &[
@@ -1554,7 +1714,41 @@ impl SqlEditorWidget {
             "PACKAGE",
             "SEQUENCE",
             "SYNONYM",
+            "DATABASE",
+            "DIRECTORY",
+            "TABLESPACE",
+            "SHARED",
             "USER",
+            "ROLE",
+            "PROFILE",
+            "ROLLBACK",
+            "JAVA",
+            "LIBRARY",
+            "CLUSTER",
+            "CONTEXT",
+            "DIMENSION",
+            "OPERATOR",
+            "INDEXTYPE",
+            "EDITION",
+            "PUBLIC",
+        ];
+        const CREATE_OR_REPLACE_OBJECT_TYPE_KEYWORDS: &[&str] = &[
+            "TABLE",
+            "VIEW",
+            "MATERIALIZED",
+            "EDITIONING",
+            "TYPE",
+            "TRIGGER",
+            "INDEX",
+            "PROCEDURE",
+            "FUNCTION",
+            "PACKAGE",
+            "SEQUENCE",
+            "SYNONYM",
+            "DIRECTORY",
+            "LIBRARY",
+            "USER",
+            "JAVA",
             "PUBLIC",
         ];
         const COMMENT_OBJECT_TYPE_KEYWORDS: &[&str] =
@@ -1569,11 +1763,16 @@ impl SqlEditorWidget {
             return Self::filter_expected_candidates(prefix, candidates);
         }
 
-        let words = Self::previous_meaningful_words_upper(
-            tokens,
-            context_end,
-            4,
-        );
+        let words = Self::previous_meaningful_words_upper(tokens, context_end, 6);
+        if let Some(candidates) = Self::expected_database_link_keyword_candidates(&words) {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(candidates) = Self::expected_java_keyword_candidates(&words) {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(candidates) = Self::expected_rollback_segment_keyword_candidates(&words) {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
 
         let candidates: &[&str] = match words.as_slice() {
             [] => TOP_LEVEL_KEYWORDS,
@@ -1615,6 +1814,21 @@ impl SqlEditorWidget {
             {
                 &["VIEW"]
             }
+            [.., a, b, c]
+                if matches!(a.as_str(), "ALTER" | "CREATE" | "DROP")
+                    && *b == "MATERIALIZED"
+                    && *c == "VIEW" =>
+            {
+                &["LOG"]
+            }
+            [.., a, b, c, d]
+                if matches!(a.as_str(), "ALTER" | "CREATE" | "DROP")
+                    && *b == "MATERIALIZED"
+                    && *c == "VIEW"
+                    && *d == "LOG" =>
+            {
+                &["ON"]
+            }
             [.., prev, last]
                 if matches!(prev.as_str(), "CREATE" | "ON") && *last == "EDITIONING" =>
             {
@@ -1626,12 +1840,27 @@ impl SqlEditorWidget {
                 &["VIEW"]
             }
             [.., prev, last]
-                if !prefix.is_empty() && *prev == "DROP" && matches!(last.as_str(), "PACKAGE" | "TYPE") =>
+                if matches!(prev.as_str(), "CREATE" | "DROP")
+                    && matches!(last.as_str(), "PACKAGE" | "TYPE") =>
             {
                 &["BODY"]
             }
-            [.., prev, last] if *prev == "DROP" && *last == "PUBLIC" => &["SYNONYM"],
-            [.., prev, last] if *prev == "CREATE" && *last == "PUBLIC" => &["SYNONYM"],
+            [.., a, b, c, d]
+                if *a == "CREATE"
+                    && *b == "OR"
+                    && *c == "REPLACE"
+                    && matches!(d.as_str(), "PACKAGE" | "TYPE") =>
+            {
+                &["BODY"]
+            }
+            [.., prev, last] if *prev == "CREATE" && *last == "PUBLIC" => {
+                &["SYNONYM", "DATABASE", "ROLLBACK"]
+            }
+            [.., prev, last]
+                if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "PUBLIC" =>
+            {
+                &["SYNONYM", "DATABASE"]
+            }
             [.., a, b, c, d]
                 if *a == "CREATE" && *b == "OR" && *c == "REPLACE" && *d == "PUBLIC" =>
             {
@@ -1641,7 +1870,7 @@ impl SqlEditorWidget {
                 COMMENT_OBJECT_TYPE_KEYWORDS
             }
             [.., a, b, c] if *a == "CREATE" && *b == "OR" && *c == "REPLACE" => {
-                CREATE_OBJECT_TYPE_KEYWORDS
+                CREATE_OR_REPLACE_OBJECT_TYPE_KEYWORDS
             }
             [.., last] if *last == "TRUNCATE" || *last == "LOCK" || *last == "FLASHBACK" => {
                 &["TABLE"]
@@ -1771,6 +2000,15 @@ impl SqlEditorWidget {
             {
                 Some(ExpectedObjectSuggestionKind::MaterializedView)
             }
+            [.., a, b, c, d, e]
+                if matches!(a.as_str(), "ALTER" | "CREATE" | "DROP")
+                    && *b == "MATERIALIZED"
+                    && *c == "VIEW"
+                    && *d == "LOG"
+                    && *e == "ON" =>
+            {
+                Some(ExpectedObjectSuggestionKind::Table)
+            }
             [.., prev, last] if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "TYPE" => {
                 Some(ExpectedObjectSuggestionKind::Type)
             }
@@ -1809,11 +2047,89 @@ impl SqlEditorWidget {
             {
                 Some(ExpectedObjectSuggestionKind::Sequence)
             }
-            [.., prev, last] if *prev == "DROP" && *last == "SYNONYM" => {
+            [.., prev, last] if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "SYNONYM" => {
                 Some(ExpectedObjectSuggestionKind::Synonym)
             }
-            [.., a, b, c] if *a == "DROP" && *b == "PUBLIC" && *c == "SYNONYM" => {
+            [.., a, b, c]
+                if matches!(a.as_str(), "ALTER" | "DROP") && *b == "PUBLIC" && *c == "SYNONYM" =>
+            {
                 Some(ExpectedObjectSuggestionKind::PublicSynonym)
+            }
+            [.., prev, last]
+                if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "DATABASE" =>
+            {
+                None
+            }
+            [.., prev, last]
+                if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "LINK" =>
+            {
+                Some(ExpectedObjectSuggestionKind::DatabaseLink)
+            }
+            [.., a, b, c]
+                if matches!(a.as_str(), "ALTER" | "DROP") && *b == "DATABASE" && *c == "LINK" =>
+            {
+                Some(ExpectedObjectSuggestionKind::DatabaseLink)
+            }
+            [.., a, b, c, d]
+                if matches!(a.as_str(), "ALTER" | "DROP")
+                    && *b == "PUBLIC"
+                    && *c == "DATABASE"
+                    && *d == "LINK" =>
+            {
+                Some(ExpectedObjectSuggestionKind::DatabaseLink)
+            }
+            [.., prev, last] if *prev == "DROP" && *last == "DIRECTORY" => {
+                Some(ExpectedObjectSuggestionKind::Directory)
+            }
+            [.., prev, last]
+                if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "LIBRARY" =>
+            {
+                Some(ExpectedObjectSuggestionKind::Library)
+            }
+            [.., prev, last]
+                if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "CLUSTER" =>
+            {
+                Some(ExpectedObjectSuggestionKind::Cluster)
+            }
+            [.., prev, last] if *prev == "DROP" && *last == "CONTEXT" => {
+                Some(ExpectedObjectSuggestionKind::Context)
+            }
+            [.., prev, last]
+                if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "DIMENSION" =>
+            {
+                Some(ExpectedObjectSuggestionKind::Dimension)
+            }
+            [.., prev, last]
+                if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "OPERATOR" =>
+            {
+                Some(ExpectedObjectSuggestionKind::Operator)
+            }
+            [.., prev, last]
+                if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "INDEXTYPE" =>
+            {
+                Some(ExpectedObjectSuggestionKind::Indextype)
+            }
+            [.., prev, last] if *prev == "DROP" && *last == "EDITION" => {
+                Some(ExpectedObjectSuggestionKind::Edition)
+            }
+            [.., prev, java, object_type]
+                if matches!(prev.as_str(), "ALTER" | "DROP")
+                    && *java == "JAVA"
+                    && *object_type == "SOURCE" =>
+            {
+                Some(ExpectedObjectSuggestionKind::JavaSource)
+            }
+            [.., prev, java, object_type]
+                if matches!(prev.as_str(), "ALTER" | "DROP")
+                    && *java == "JAVA"
+                    && *object_type == "CLASS" =>
+            {
+                Some(ExpectedObjectSuggestionKind::JavaClass)
+            }
+            [.., prev, java, object_type]
+                if *prev == "DROP" && *java == "JAVA" && *object_type == "RESOURCE" =>
+            {
+                Some(ExpectedObjectSuggestionKind::JavaResource)
             }
             [.., prev, last] if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "USER" => {
                 Some(ExpectedObjectSuggestionKind::User)
@@ -1922,6 +2238,24 @@ impl SqlEditorWidget {
             ExpectedObjectSuggestionKind::PublicSynonym => {
                 data.get_public_synonym_object_suggestions(prefix)
             }
+            ExpectedObjectSuggestionKind::DatabaseLink => {
+                data.get_database_link_object_suggestions(prefix)
+            }
+            ExpectedObjectSuggestionKind::Directory => data.get_directory_object_suggestions(prefix),
+            ExpectedObjectSuggestionKind::Library => data.get_library_object_suggestions(prefix),
+            ExpectedObjectSuggestionKind::Cluster => data.get_cluster_object_suggestions(prefix),
+            ExpectedObjectSuggestionKind::Context => data.get_context_object_suggestions(prefix),
+            ExpectedObjectSuggestionKind::Dimension => data.get_dimension_object_suggestions(prefix),
+            ExpectedObjectSuggestionKind::Operator => data.get_operator_object_suggestions(prefix),
+            ExpectedObjectSuggestionKind::Indextype => data.get_indextype_object_suggestions(prefix),
+            ExpectedObjectSuggestionKind::Edition => data.get_edition_object_suggestions(prefix),
+            ExpectedObjectSuggestionKind::JavaSource => {
+                data.get_java_source_object_suggestions(prefix)
+            }
+            ExpectedObjectSuggestionKind::JavaClass => data.get_java_class_object_suggestions(prefix),
+            ExpectedObjectSuggestionKind::JavaResource => {
+                data.get_java_resource_object_suggestions(prefix)
+            }
             ExpectedObjectSuggestionKind::User => data.get_user_suggestions(prefix),
         };
 
@@ -2007,6 +2341,42 @@ impl SqlEditorWidget {
             ExpectedObjectSuggestionKind::PublicSynonym => {
                 Self::matches_string_list_case_insensitive(&data.public_synonyms, candidate)
             }
+            ExpectedObjectSuggestionKind::DatabaseLink => {
+                Self::matches_string_list_case_insensitive(&data.database_links, candidate)
+            }
+            ExpectedObjectSuggestionKind::Directory => {
+                Self::matches_string_list_case_insensitive(&data.directories, candidate)
+            }
+            ExpectedObjectSuggestionKind::Library => {
+                Self::matches_string_list_case_insensitive(&data.libraries, candidate)
+            }
+            ExpectedObjectSuggestionKind::Cluster => {
+                Self::matches_string_list_case_insensitive(&data.clusters, candidate)
+            }
+            ExpectedObjectSuggestionKind::Context => {
+                Self::matches_string_list_case_insensitive(&data.contexts, candidate)
+            }
+            ExpectedObjectSuggestionKind::Dimension => {
+                Self::matches_string_list_case_insensitive(&data.dimensions, candidate)
+            }
+            ExpectedObjectSuggestionKind::Operator => {
+                Self::matches_string_list_case_insensitive(&data.operators, candidate)
+            }
+            ExpectedObjectSuggestionKind::Indextype => {
+                Self::matches_string_list_case_insensitive(&data.indextypes, candidate)
+            }
+            ExpectedObjectSuggestionKind::Edition => {
+                Self::matches_string_list_case_insensitive(&data.editions, candidate)
+            }
+            ExpectedObjectSuggestionKind::JavaSource => {
+                Self::matches_string_list_case_insensitive(&data.java_sources, candidate)
+            }
+            ExpectedObjectSuggestionKind::JavaClass => {
+                Self::matches_string_list_case_insensitive(&data.java_classes, candidate)
+            }
+            ExpectedObjectSuggestionKind::JavaResource => {
+                Self::matches_string_list_case_insensitive(&data.java_resources, candidate)
+            }
             ExpectedObjectSuggestionKind::User => {
                 Self::matches_string_list_case_insensitive(&data.users, candidate)
             }
@@ -2054,6 +2424,18 @@ impl SqlEditorWidget {
             ExpectedObjectSuggestionKind::PublicSynonym => {
                 Some(&[QualifiedMemberKind::PublicSynonym])
             }
+            ExpectedObjectSuggestionKind::DatabaseLink => Some(&[QualifiedMemberKind::DatabaseLink]),
+            ExpectedObjectSuggestionKind::Directory => Some(&[QualifiedMemberKind::Directory]),
+            ExpectedObjectSuggestionKind::Library => Some(&[QualifiedMemberKind::Library]),
+            ExpectedObjectSuggestionKind::Cluster => Some(&[QualifiedMemberKind::Cluster]),
+            ExpectedObjectSuggestionKind::Context => Some(&[QualifiedMemberKind::Context]),
+            ExpectedObjectSuggestionKind::Dimension => Some(&[QualifiedMemberKind::Dimension]),
+            ExpectedObjectSuggestionKind::Operator => Some(&[QualifiedMemberKind::Operator]),
+            ExpectedObjectSuggestionKind::Indextype => Some(&[QualifiedMemberKind::Indextype]),
+            ExpectedObjectSuggestionKind::Edition => Some(&[QualifiedMemberKind::Edition]),
+            ExpectedObjectSuggestionKind::JavaSource => Some(&[QualifiedMemberKind::JavaSource]),
+            ExpectedObjectSuggestionKind::JavaClass => Some(&[QualifiedMemberKind::JavaClass]),
+            ExpectedObjectSuggestionKind::JavaResource => Some(&[QualifiedMemberKind::JavaResource]),
             ExpectedObjectSuggestionKind::User => Some(&[QualifiedMemberKind::User]),
         }
     }

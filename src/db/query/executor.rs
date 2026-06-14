@@ -3110,8 +3110,17 @@ impl QueryExecutor {
                 idx += 1;
             }
 
-            // Skip SHARED database link modifier.
-            if tokens.get(idx).is_some_and(|t| *t == "SHARED") {
+            // Skip Java schema object compile/resolve modifier.
+            if tokens.get(idx).is_some_and(|t| *t == "AND")
+                && tokens
+                    .get(idx + 1)
+                    .is_some_and(|t| matches!(*t, "COMPILE" | "RESOLVE"))
+            {
+                idx += 2;
+            } else if tokens
+                .get(idx)
+                .is_some_and(|t| matches!(*t, "COMPILE" | "RESOLVE"))
+            {
                 idx += 1;
             }
 
@@ -3139,6 +3148,11 @@ impl QueryExecutor {
             } else if tokens.get(idx).is_some_and(|t| *t == "FORCE") {
                 idx += 1;
             }
+        }
+
+        // Skip SHARED database link modifier.
+        if matches!(verb, "ALTER" | "CREATE") && tokens.get(idx).is_some_and(|t| *t == "SHARED") {
+            idx += 1;
         }
 
         if tokens.get(idx).copied() == Some("MATERIALIZED")
@@ -3182,6 +3196,11 @@ impl QueryExecutor {
                     "Synonym"
                 } else if tokens.get(idx + 1).is_some_and(|t| *t == "DATABASE") {
                     "Database Link"
+                } else if verb == "CREATE"
+                    && tokens.get(idx + 1).is_some_and(|t| *t == "ROLLBACK")
+                    && tokens.get(idx + 2).is_some_and(|t| *t == "SEGMENT")
+                {
+                    "Rollback Segment"
                 } else {
                     "Object"
                 }
@@ -8415,7 +8434,14 @@ impl ObjectBrowser {
         let sql = r#"
             SELECT owner, object_name, object_type
             FROM all_objects
-            WHERE object_type IN ('TABLE', 'VIEW', 'EDITIONING VIEW', 'MATERIALIZED VIEW', 'TYPE', 'TYPE BODY', 'TRIGGER', 'INDEX', 'PROCEDURE', 'FUNCTION', 'PACKAGE', 'PACKAGE BODY', 'SEQUENCE')
+            WHERE object_type IN (
+                'TABLE', 'VIEW', 'EDITIONING VIEW', 'MATERIALIZED VIEW',
+                'TYPE', 'TYPE BODY', 'TRIGGER', 'INDEX', 'PROCEDURE',
+                'FUNCTION', 'PACKAGE', 'PACKAGE BODY', 'SEQUENCE',
+                'DATABASE LINK', 'DIRECTORY', 'LIBRARY', 'CLUSTER',
+                'CONTEXT', 'DIMENSION', 'OPERATOR', 'INDEXTYPE',
+                'EDITION', 'JAVA SOURCE', 'JAVA CLASS', 'JAVA RESOURCE'
+            )
             UNION ALL
             SELECT
                 owner,
@@ -8436,7 +8462,14 @@ impl ObjectBrowser {
         let sql = r#"
             SELECT owner, object_name, object_type
             FROM all_objects
-            WHERE object_type IN ('TABLE', 'VIEW', 'EDITIONING VIEW', 'MATERIALIZED VIEW', 'TYPE', 'TYPE BODY', 'TRIGGER', 'INDEX', 'PROCEDURE', 'FUNCTION', 'PACKAGE', 'PACKAGE BODY', 'SEQUENCE')
+            WHERE object_type IN (
+                'TABLE', 'VIEW', 'EDITIONING VIEW', 'MATERIALIZED VIEW',
+                'TYPE', 'TYPE BODY', 'TRIGGER', 'INDEX', 'PROCEDURE',
+                'FUNCTION', 'PACKAGE', 'PACKAGE BODY', 'SEQUENCE',
+                'DATABASE LINK', 'DIRECTORY', 'LIBRARY', 'CLUSTER',
+                'CONTEXT', 'DIMENSION', 'OPERATOR', 'INDEXTYPE',
+                'EDITION', 'JAVA SOURCE', 'JAVA CLASS', 'JAVA RESOURCE'
+            )
             UNION ALL
             SELECT
                 owner,
@@ -8457,30 +8490,34 @@ impl ObjectBrowser {
     ) -> Result<HashMap<String, Vec<(String, String)>>, String> {
         let owner_name = owner.trim().to_string();
         let mut grouped = HashMap::new();
-        let mut owner_objects = Vec::new();
-        for name in Self::get_thin_tables_by_owner(conn, &owner_name)? {
-            owner_objects.push((name, "TABLE".to_string()));
-        }
-        for name in Self::get_thin_views_by_owner(conn, &owner_name)? {
-            owner_objects.push((name, "VIEW".to_string()));
-        }
-        for name in Self::get_thin_procedures_by_owner(conn, &owner_name)? {
-            owner_objects.push((name, "PROCEDURE".to_string()));
-        }
-        for name in Self::get_thin_functions_by_owner(conn, &owner_name)? {
-            owner_objects.push((name, "FUNCTION".to_string()));
-        }
-        for name in Self::get_thin_sequences_by_owner(conn, &owner_name)? {
-            owner_objects.push((name, "SEQUENCE".to_string()));
-        }
-        for name in Self::get_thin_triggers_by_owner(conn, &owner_name)? {
-            owner_objects.push((name, "TRIGGER".to_string()));
-        }
+        let sql = r#"
+            SELECT object_name, object_type
+            FROM all_objects
+            WHERE owner = :1
+              AND object_type IN (
+                'TABLE', 'VIEW', 'EDITIONING VIEW', 'MATERIALIZED VIEW',
+                'TYPE', 'TYPE BODY', 'TRIGGER', 'INDEX', 'PROCEDURE',
+                'FUNCTION', 'PACKAGE', 'PACKAGE BODY', 'SEQUENCE',
+                'DATABASE LINK', 'DIRECTORY', 'LIBRARY', 'CLUSTER',
+                'CONTEXT', 'DIMENSION', 'OPERATOR', 'INDEXTYPE',
+                'EDITION', 'JAVA SOURCE', 'JAVA CLASS', 'JAVA RESOURCE'
+              )
+            ORDER BY object_name, object_type
+        "#;
+        let mut owner_objects = Self::thin_query_text_rows(
+            conn,
+            sql,
+            2,
+            vec![OracleThinBindValue::Text(owner_name.clone())],
+        )?
+        .into_iter()
+        .filter_map(|row| match (row.first(), row.get(1)) {
+            (Some(name), Some(object_type)) => Some((name.clone(), object_type.clone())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
         for name in Self::get_thin_synonyms_by_owner(conn, &owner_name)? {
             owner_objects.push((name, "SYNONYM".to_string()));
-        }
-        for name in Self::get_thin_packages_by_owner(conn, &owner_name)? {
-            owner_objects.push((name, "PACKAGE".to_string()));
         }
         owner_objects.sort();
         owner_objects.dedup();

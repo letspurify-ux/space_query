@@ -243,12 +243,8 @@ impl SqlEditorWidget {
             return true;
         }
 
-        if Self::expanded_statement_contains_ascii_case_insensitive(&expanded.text, "BEGIN")
-            || Self::expanded_statement_contains_ascii_case_insensitive(&expanded.text, "DECLARE")
-            || Self::expanded_statement_contains_ascii_case_insensitive(
-                &expanded.text,
-                "PACKAGE BODY",
-            )
+        if Self::expanded_statement_may_contain_structural_plsql(&expanded.text)
+            && Self::expanded_statement_has_structural_plsql_tokens(&expanded.text)
         {
             return true;
         }
@@ -295,6 +291,33 @@ impl SqlEditorWidget {
         haystack_bytes
             .windows(needle_bytes.len())
             .any(|window| window.eq_ignore_ascii_case(needle_bytes))
+    }
+
+    fn expanded_statement_may_contain_structural_plsql(text: &str) -> bool {
+        Self::expanded_statement_contains_ascii_case_insensitive(text, "BEGIN")
+            || Self::expanded_statement_contains_ascii_case_insensitive(text, "DECLARE")
+            || Self::expanded_statement_contains_ascii_case_insensitive(text, "PACKAGE")
+    }
+
+    fn expanded_statement_has_structural_plsql_tokens(text: &str) -> bool {
+        let mut previous_word_was_package = false;
+        for span in super::query_text::tokenize_sql_spanned(text) {
+            match span.token {
+                SqlToken::Comment(_) => {}
+                SqlToken::Word(word) => {
+                    let upper = word.to_ascii_uppercase();
+                    if matches!(upper.as_str(), "BEGIN" | "DECLARE") {
+                        return true;
+                    }
+                    if previous_word_was_package && upper == "BODY" {
+                        return true;
+                    }
+                    previous_word_was_package = upper == "PACKAGE";
+                }
+                _ => previous_word_was_package = false,
+            }
+        }
+        false
     }
 
     fn expanded_statement_window_and_text_binds_from_shadow(
