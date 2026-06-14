@@ -49,6 +49,13 @@ pub enum SqlPhase {
     MergeTarget,
     PivotClause,
     ModelClause,
+    /// Cursor is at a position that references an existing column of a single
+    /// target table inside a DDL statement, e.g. the parenthesised column list
+    /// of `CREATE INDEX ... ON t (...)`, or `ALTER TABLE t DROP/MODIFY/RENAME/
+    /// CHANGE/ALTER [COLUMN] ...`. These are column-name positions that DataGrip/
+    /// Toad complete with the target table's columns; the DML state machine
+    /// otherwise leaves them in a table-target phase.
+    DdlColumnList,
 }
 
 impl SqlPhase {
@@ -78,6 +85,7 @@ impl SqlPhase {
                 | SqlPhase::MatchRecognizeClause
                 | SqlPhase::PivotClause
                 | SqlPhase::ModelClause
+                | SqlPhase::DdlColumnList
         )
     }
 
@@ -408,6 +416,13 @@ pub(crate) fn analyze_cursor_context_arc(
     ) {
         phase = SqlPhase::DerivedAliasColumnList;
         focused_tables = vec![source];
+    } else if let Some(ddl_table) =
+        ddl_existing_column_target_table(statement_tokens.as_ref(), clamped_cursor_token_len)
+    {
+        // DDL column-name positions (CREATE INDEX list, ALTER TABLE column ops)
+        // reference the single target table's existing columns.
+        phase = SqlPhase::DdlColumnList;
+        focused_tables = vec![ddl_table];
     }
 
     CursorContext {
@@ -423,6 +438,177 @@ pub(crate) fn analyze_cursor_context_arc(
         qualifier: None,
         qualifier_tables: Vec::new(),
     }
+}
+
+/// Significant (non-comment) tokens of the statement that contains the cursor,
+/// restricted to those strictly before the cursor. The statement is delimited
+/// by the nearest preceding top-level `;`.
+fn significant_statement_tokens_before_cursor(
+    tokens: &[SqlToken],
+    cursor_token_len: usize,
+) -> Vec<&SqlToken> {
+    let end = cursor_token_len.min(tokens.len());
+    let mut start = 0usize;
+    for (idx, token) in tokens.iter().enumerate().take(end) {
+        if let SqlToken::Symbol(sym) = token {
+            if sym == ";" {
+                start = idx + 1;
+            }
+        }
+    }
+    tokens[start..end]
+        .iter()
+        .filter(|token| !matches!(token, SqlToken::Comment(_)))
+        .collect()
+}
+
+/// Reads a dotted identifier name (`schema.table`, `"Schema"."Table"`, …)
+/// beginning at `start` in `sig`. Returns the joined name and the index of the
+/// first token after the name.
+fn read_dotted_name(sig: &[&SqlToken], start: usize) -> Option<(String, usize)> {
+    let mut idx = start;
+    let mut name = String::new();
+    let mut expect_word = true;
+    while idx < sig.len() {
+        match sig[idx] {
+            SqlToken::Word(word) if expect_word => {
+                name.push_str(word);
+                expect_word = false;
+                idx += 1;
+            }
+            SqlToken::Symbol(sym) if !expect_word && sym == "." => {
+                name.push('.');
+                expect_word = true;
+                idx += 1;
+            }
+            _ => break,
+        }
+    }
+    if name.is_empty() {
+        return None;
+    }
+    // A trailing dot (`schema.`) leaves the name harmlessly qualified; callers
+    // that need a complete name reject it via the following token check.
+    Some((name, idx))
+}
+
+fn token_is_word(token: &SqlToken, keyword: &str) -> bool {
+    matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case(keyword))
+}
+
+fn token_is_symbol(token: &SqlToken, symbol: &str) -> bool {
+    matches!(token, SqlToken::Symbol(sym) if sym == symbol)
+}
+
+/// Detects whether the cursor sits at a position that references an existing
+/// column of a single DDL target table, returning that target table name.
+///
+/// Covers the column-name positions of:
+///   * `CREATE [UNIQUE|BITMAP] INDEX ... ON t (...)` — anywhere in the list.
+///   * `ALTER TABLE t DROP [COLUMN] ...` / `DROP (...)`.
+///   * `ALTER TABLE t MODIFY ...` / `MODIFY (...)` (column-name position only).
+///   * `ALTER TABLE t RENAME COLUMN ...` (the source name, before `TO`).
+///   * `ALTER TABLE t CHANGE ...` (MySQL, the source name).
+///   * `ALTER TABLE t ALTER [COLUMN] ...`.
+///
+/// `ADD`/`RENAME TO`/type positions deliberately return `None`: those introduce
+/// new names or expect data types, not existing columns.
+fn ddl_existing_column_target_table(
+    tokens: &[SqlToken],
+    cursor_token_len: usize,
+) -> Option<String> {
+    let sig = significant_statement_tokens_before_cursor(tokens, cursor_token_len);
+    let first = sig.first()?;
+
+    if token_is_word(first, "CREATE") {
+        return ddl_create_index_column_target(&sig);
+    }
+    if token_is_word(first, "ALTER") {
+        return ddl_alter_table_column_target(&sig);
+    }
+    None
+}
+
+fn ddl_create_index_column_target(sig: &[&SqlToken]) -> Option<String> {
+    if !sig.iter().any(|token| token_is_word(token, "INDEX")) {
+        return None;
+    }
+    // Last top-level ON keyword introduces the indexed table.
+    let on_idx = sig.iter().rposition(|token| token_is_word(token, "ON"))?;
+    let (table, after_table) = read_dotted_name(sig, on_idx + 1)?;
+    // Find the column-list opening paren after the table (skipping modifiers
+    // such as `USING btree`).
+    let paren_idx = (after_table..sig.len()).find(|&i| token_is_symbol(sig[i], "("))?;
+    // Cursor is inside the list only while the paren balance stays positive.
+    let mut depth = 0i32;
+    for token in &sig[paren_idx..] {
+        if token_is_symbol(token, "(") {
+            depth += 1;
+        } else if token_is_symbol(token, ")") {
+            depth -= 1;
+        }
+    }
+    (depth >= 1).then_some(table)
+}
+
+fn ddl_alter_table_column_target(sig: &[&SqlToken]) -> Option<String> {
+    if sig.len() < 2 || !token_is_word(sig[1], "TABLE") {
+        return None;
+    }
+    let (table, after_table) = read_dotted_name(sig, 2)?;
+
+    // Walk the clause list after the table, tracking the governing operation
+    // keyword seen at the top level (paren depth 0). The op nearest the cursor
+    // determines the expected completion.
+    let mut depth = 0i32;
+    let mut op: Option<&'static str> = None;
+    for token in &sig[after_table..] {
+        if token_is_symbol(token, "(") {
+            depth += 1;
+        } else if token_is_symbol(token, ")") {
+            depth = (depth - 1).max(0);
+        } else if depth == 0 {
+            if let SqlToken::Word(word) = token {
+                let upper = word.to_ascii_uppercase();
+                if matches!(
+                    upper.as_str(),
+                    "ADD" | "DROP" | "MODIFY" | "RENAME" | "CHANGE" | "ALTER"
+                ) {
+                    op = Some(match upper.as_str() {
+                        "ADD" => "ADD",
+                        "DROP" => "DROP",
+                        "MODIFY" => "MODIFY",
+                        "RENAME" => "RENAME",
+                        "CHANGE" => "CHANGE",
+                        _ => "ALTER",
+                    });
+                }
+            }
+        }
+    }
+
+    let prev = sig.last()?;
+    let prev_is_word = |kw: &str| token_is_word(prev, kw);
+    let prev_is_entry_start =
+        prev_is_word("COLUMN") || token_is_symbol(prev, "(") || token_is_symbol(prev, ",");
+
+    let at_existing_column = match op? {
+        // New column name / data type position — never an existing column.
+        "ADD" => false,
+        "DROP" => prev_is_word("DROP") || prev_is_entry_start,
+        "MODIFY" => {
+            prev_is_word("MODIFY") || token_is_symbol(prev, "(") || token_is_symbol(prev, ",")
+        }
+        "ALTER" => prev_is_word("ALTER") || prev_is_word("COLUMN"),
+        // MySQL `CHANGE old new TYPE`: only the source name references a column.
+        "CHANGE" => prev_is_word("CHANGE"),
+        // `RENAME COLUMN old TO new`: only the source name; `RENAME TO t` is a
+        // new table name.
+        "RENAME" => prev_is_word("COLUMN"),
+        _ => false,
+    };
+
+    at_existing_column.then_some(table)
 }
 
 fn subquery_alias_column_list_source_at_cursor(

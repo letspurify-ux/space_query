@@ -16043,6 +16043,28 @@ fn classify_intellisense_context_keeps_insert_into_target_as_table_context() {
 }
 
 #[test]
+fn classify_intellisense_context_treats_create_index_column_list_as_column_context() {
+    let deep_ctx = analyze_inline_cursor_sql("CREATE INDEX ix ON target (|)");
+    assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::DdlColumnList);
+    let context = SqlEditorWidget::classify_intellisense_context(
+        &deep_ctx,
+        deep_ctx.statement_tokens.as_ref(),
+    );
+    assert_eq!(context, SqlContext::ColumnName);
+}
+
+#[test]
+fn classify_intellisense_context_treats_alter_table_drop_column_as_column_context() {
+    let deep_ctx = analyze_inline_cursor_sql("ALTER TABLE target DROP COLUMN |");
+    assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::DdlColumnList);
+    let context = SqlEditorWidget::classify_intellisense_context(
+        &deep_ctx,
+        deep_ctx.statement_tokens.as_ref(),
+    );
+    assert_eq!(context, SqlContext::ColumnName);
+}
+
+#[test]
 fn classify_intellisense_context_treats_insert_values_expression_as_column_context() {
     let sql_with_cursor = "INSERT INTO target (id) VALUES (|)";
     let cursor = sql_with_cursor

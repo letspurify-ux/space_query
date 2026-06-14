@@ -4031,7 +4031,8 @@ pub(crate) fn sql_context_for_phase(
         | SqlPhase::StartWithClause
         | SqlPhase::PivotClause
         | SqlPhase::MatchRecognizeClause
-        | SqlPhase::ModelClause => SqlContext::ColumnName,
+        | SqlPhase::ModelClause
+        | SqlPhase::DdlColumnList => SqlContext::ColumnName,
         SqlPhase::RecursiveCteGeneratedColumnName | SqlPhase::HierarchicalGeneratedColumnName => {
             SqlContext::GeneratedName
         }

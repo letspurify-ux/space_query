@@ -10246,3 +10246,117 @@ fn extract_select_list_columns_supports_three_part_identifier_in_inline_view() {
         cols
     );
 }
+
+// ─── DDL column-name context (CREATE INDEX / ALTER TABLE) ────────────────────
+
+#[test]
+fn ddl_create_index_column_list_is_column_context() {
+    let ctx = analyze("CREATE INDEX ix ON emp (|)");
+    assert_eq!(ctx.phase, SqlPhase::DdlColumnList);
+    assert!(ctx.phase.is_column_context());
+    assert!(!ctx.phase.is_table_context());
+    assert_eq!(ctx.focused_tables, vec!["emp".to_string()]);
+    assert!(has_name(&table_names(&ctx), "EMP"));
+}
+
+#[test]
+fn ddl_create_unique_index_schema_qualified_second_column_is_column_context() {
+    let ctx = analyze("CREATE UNIQUE INDEX ix ON scott.emp (deptno, |)");
+    assert_eq!(ctx.phase, SqlPhase::DdlColumnList);
+    assert_eq!(ctx.focused_tables, vec!["scott.emp".to_string()]);
+}
+
+#[test]
+fn ddl_create_index_function_based_expression_is_column_context() {
+    let ctx = analyze("CREATE INDEX ix ON emp (UPPER(|))");
+    assert_eq!(ctx.phase, SqlPhase::DdlColumnList);
+    assert_eq!(ctx.focused_tables, vec!["emp".to_string()]);
+}
+
+#[test]
+fn ddl_create_index_using_clause_column_list_is_column_context() {
+    let ctx = analyze("CREATE INDEX ix ON emp USING btree (|)");
+    assert_eq!(ctx.phase, SqlPhase::DdlColumnList);
+}
+
+#[test]
+fn ddl_alter_table_drop_column_is_column_context() {
+    let ctx = analyze("ALTER TABLE emp DROP COLUMN |");
+    assert_eq!(ctx.phase, SqlPhase::DdlColumnList);
+    assert_eq!(ctx.focused_tables, vec!["emp".to_string()]);
+}
+
+#[test]
+fn ddl_alter_table_drop_paren_list_is_column_context() {
+    let ctx = analyze("ALTER TABLE emp DROP (a, |)");
+    assert_eq!(ctx.phase, SqlPhase::DdlColumnList);
+}
+
+#[test]
+fn ddl_alter_table_modify_column_name_is_column_context() {
+    let ctx = analyze("ALTER TABLE emp MODIFY (|)");
+    assert_eq!(ctx.phase, SqlPhase::DdlColumnList);
+    assert_eq!(ctx.focused_tables, vec!["emp".to_string()]);
+}
+
+#[test]
+fn ddl_alter_table_modify_type_position_is_not_ddl_column() {
+    // After the column name, the cursor is at a data-type position, not an
+    // existing-column reference; must not become a DDL column context.
+    let ctx = analyze("ALTER TABLE emp MODIFY (sal |)");
+    assert_ne!(ctx.phase, SqlPhase::DdlColumnList);
+}
+
+#[test]
+fn ddl_alter_table_rename_column_source_is_column_context() {
+    let ctx = analyze("ALTER TABLE emp RENAME COLUMN | TO new_name");
+    assert_eq!(ctx.phase, SqlPhase::DdlColumnList);
+    assert_eq!(ctx.focused_tables, vec!["emp".to_string()]);
+}
+
+#[test]
+fn ddl_alter_table_rename_column_target_is_not_column_context() {
+    // The new name after TO is not an existing column.
+    let ctx = analyze("ALTER TABLE emp RENAME COLUMN sal TO |");
+    assert_ne!(ctx.phase, SqlPhase::DdlColumnList);
+    assert!(!ctx.phase.is_column_context());
+}
+
+#[test]
+fn ddl_alter_table_change_source_is_column_context() {
+    let ctx = analyze("ALTER TABLE emp CHANGE | new_name INT");
+    assert_eq!(ctx.phase, SqlPhase::DdlColumnList);
+}
+
+#[test]
+fn ddl_alter_table_alter_column_is_column_context() {
+    let ctx = analyze("ALTER TABLE emp ALTER COLUMN | SET DEFAULT 0");
+    assert_eq!(ctx.phase, SqlPhase::DdlColumnList);
+}
+
+#[test]
+fn ddl_alter_table_add_column_name_is_not_column_context() {
+    // ADD introduces a new column name, not an existing-column reference.
+    let ctx = analyze("ALTER TABLE emp ADD COLUMN |");
+    assert_ne!(ctx.phase, SqlPhase::DdlColumnList);
+    assert!(!ctx.phase.is_column_context());
+}
+
+#[test]
+fn ddl_alter_table_rename_to_new_table_is_not_column_context() {
+    let ctx = analyze("ALTER TABLE emp RENAME TO |");
+    assert_ne!(ctx.phase, SqlPhase::DdlColumnList);
+}
+
+#[test]
+fn ddl_create_table_column_definition_is_not_ddl_column() {
+    // New column *definitions* must not suggest existing columns.
+    let ctx = analyze("CREATE TABLE t (id NUMBER, |)");
+    assert_ne!(ctx.phase, SqlPhase::DdlColumnList);
+}
+
+#[test]
+fn ddl_multi_clause_alter_governs_by_nearest_op() {
+    let ctx = analyze("ALTER TABLE emp ADD x INT, DROP COLUMN |");
+    assert_eq!(ctx.phase, SqlPhase::DdlColumnList);
+}
