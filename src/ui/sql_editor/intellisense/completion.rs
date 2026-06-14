@@ -3945,8 +3945,12 @@ impl SqlEditorWidget {
 
         for table in &deep_ctx.tables_in_scope {
             let already_present = tables.iter().any(|existing| {
+                // `is_cte` is metadata, not identity: the FROM scope collector
+                // flags every reference `is_cte = false` while `tables_in_scope`
+                // flags CTE references `is_cte = true`. A relation is identified
+                // by name + alias + depth only, so the flag is excluded here to
+                // avoid double-listing a CTE reference.
                 existing.depth == table.depth
-                    && existing.is_cte == table.is_cte
                     && existing.name.eq_ignore_ascii_case(&table.name)
                     && match (&existing.alias, &table.alias) {
                         (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),

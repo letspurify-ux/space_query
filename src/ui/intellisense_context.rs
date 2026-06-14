@@ -369,10 +369,12 @@ pub(crate) fn analyze_cursor_context_arc(
 
     let mut tables_in_scope = table_analysis.tables;
     for cte in &ctes {
-        let existing_idx = tables_in_scope
+        // A CTE already merged in by an earlier iteration (same name, redefined
+        // at a different scope depth) is updated in place to the applicable depth.
+        if let Some(existing_idx) = tables_in_scope
             .iter()
-            .position(|t| t.name.eq_ignore_ascii_case(&cte.name) && t.is_cte);
-        if let Some(existing_idx) = existing_idx {
+            .position(|t| t.is_cte && t.name.eq_ignore_ascii_case(&cte.name))
+        {
             if tables_in_scope[existing_idx].depth <= cte.depth {
                 tables_in_scope[existing_idx] = ScopedTableRef {
                     name: cte.name.clone(),
@@ -381,14 +383,32 @@ pub(crate) fn analyze_cursor_context_arc(
                     is_cte: true,
                 };
             }
-        } else {
-            tables_in_scope.push(ScopedTableRef {
-                name: cte.name.clone(),
-                alias: None,
-                depth: cte.depth,
-                is_cte: true,
-            });
+            continue;
         }
+        // The FROM/JOIN scope collector records every relation reference as a
+        // physical table (`is_cte = false`); it does not cross-check the WITH
+        // list. So a reference to this CTE is already present, mis-flagged. Flag
+        // those references as CTEs in place — preserving their alias and depth —
+        // instead of appending a duplicate bare scope entry. Multiple references
+        // (e.g. `FROM c c1, c c2`) are all corrected.
+        let mut flagged_reference = false;
+        for table_ref in tables_in_scope.iter_mut() {
+            if !table_ref.is_cte && table_ref.name.eq_ignore_ascii_case(&cte.name) {
+                table_ref.is_cte = true;
+                flagged_reference = true;
+            }
+        }
+        if flagged_reference {
+            continue;
+        }
+        // The CTE is in scope but not referenced in this query's FROM; expose it
+        // as a referable relation under its bare name.
+        tables_in_scope.push(ScopedTableRef {
+            name: cte.name.clone(),
+            alias: None,
+            depth: cte.depth,
+            is_cte: true,
+        });
     }
     if let Some(excluded_target_table) = parse_result.excluded_target_table.as_ref() {
         let already = tables_in_scope.iter().any(|table| {

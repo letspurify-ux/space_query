@@ -10360,3 +10360,73 @@ fn ddl_multi_clause_alter_governs_by_nearest_op() {
     let ctx = analyze("ALTER TABLE emp ADD x INT, DROP COLUMN |");
     assert_eq!(ctx.phase, SqlPhase::DdlColumnList);
 }
+
+/// Helper: full `name[cte]` descriptors of every scope table, for assertions.
+fn scope_descriptors(ctx: &CursorContext) -> Vec<String> {
+    ctx.tables_in_scope
+        .iter()
+        .map(|t| {
+            format!(
+                "{}{}[cte={}]",
+                t.name.to_uppercase(),
+                t.alias
+                    .as_deref()
+                    .map(|a| format!(" {}", a.to_uppercase()))
+                    .unwrap_or_default(),
+                t.is_cte
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn cte_referenced_in_from_is_not_duplicated_in_scope() {
+    // Regression: the FROM collector flags every reference `is_cte = false`, so
+    // a referenced CTE used to appear twice (once as the reference, once as the
+    // appended CTE entry). It must appear exactly once, flagged as a CTE.
+    let ctx = analyze("WITH c AS (SELECT 1 x FROM dual) SELECT | FROM c");
+    assert_eq!(scope_descriptors(&ctx), vec!["C[cte=true]".to_string()]);
+}
+
+#[test]
+fn cte_referenced_with_alias_keeps_single_flagged_entry() {
+    let ctx = analyze("WITH c AS (SELECT 1 x FROM dual) SELECT * FROM c cc WHERE |");
+    assert_eq!(scope_descriptors(&ctx), vec!["C CC[cte=true]".to_string()]);
+}
+
+#[test]
+fn cte_referenced_multiple_times_flags_every_reference() {
+    let ctx = analyze("WITH c AS (SELECT 1 x FROM dual) SELECT * FROM c c1, c c2 WHERE |");
+    assert_eq!(
+        scope_descriptors(&ctx),
+        vec!["C C1[cte=true]".to_string(), "C C2[cte=true]".to_string()]
+    );
+}
+
+#[test]
+fn multiple_ctes_referenced_in_from_are_not_duplicated() {
+    let ctx =
+        analyze("WITH a AS (SELECT 1 x FROM dual), b AS (SELECT 2 y FROM dual) SELECT | FROM a, b");
+    assert_eq!(
+        scope_descriptors(&ctx),
+        vec!["A[cte=true]".to_string(), "B[cte=true]".to_string()]
+    );
+}
+
+#[test]
+fn cte_referenced_alongside_physical_table_keeps_table_distinct() {
+    // The CTE reference is flagged; the genuine physical table stays a table.
+    let ctx = analyze("WITH c AS (SELECT 1 x FROM dual) SELECT | FROM c JOIN d ON c.x = d.x");
+    assert_eq!(
+        scope_descriptors(&ctx),
+        vec!["C[cte=true]".to_string(), "D[cte=false]".to_string()]
+    );
+}
+
+#[test]
+fn unreferenced_cte_still_exposed_as_scope_relation() {
+    // A CTE in scope but not in this query's FROM stays available under its name.
+    let ctx = analyze("WITH c AS (SELECT 1 x FROM dual) SELECT | FROM other");
+    assert!(scope_descriptors(&ctx).contains(&"C[cte=true]".to_string()));
+    assert!(scope_descriptors(&ctx).contains(&"OTHER[cte=false]".to_string()));
+}
