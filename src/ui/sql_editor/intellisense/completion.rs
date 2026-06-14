@@ -665,25 +665,24 @@ impl SqlEditorWidget {
         let completion_policy =
             ClauseCompletionPolicy::for_phase(deep_ctx.phase, qualifier.is_some());
         let restrict_to_relation_columns = completion_policy.restrict_to_relation_columns;
-        // A pure keyword-only position accepts only a fixed keyword, never an
-        // identifier — either a clause-keyword continuation (`ORDER |`/`GROUP |`/
-        // `<join-type> |` …) or the `IS [NOT] |` null-test operator. The phase
-        // machine leaves the cursor in the surrounding table/column phase there,
-        // so every identifier source (relations, columns, in-scope aliases/CTEs,
-        // local PL/SQL symbols, `*`) must be suppressed; the
+        // A keyword-only position accepts only a fixed keyword, never an
+        // identifier — a clause-keyword continuation (`ORDER |`/`GROUP |`/
+        // `<join-type> |` …), the `IS [NOT] |` null-test operator, or the slot
+        // right after a complete DML target table (`UPDATE t |` → `SET`, …). The
+        // phase machine leaves the cursor in the surrounding table/column phase
+        // there, so every identifier source (relations, columns, in-scope
+        // aliases/CTEs, local PL/SQL symbols, `*`) must be suppressed; the
         // `expected_keyword_suggestions` merge below still supplies the lone
-        // `BY`/`WITH`/`JOIN`/`NULL` hints. The flag is also folded into
-        // `at_keyword_only_slot` (via the shared
+        // `BY`/`WITH`/`JOIN`/`NULL`/`SET`/`WHERE`/… hints. The keyword-emitting
+        // slots are also folded into `at_keyword_only_slot` (via the shared
         // `cursor_is_at_column_suppressing_keyword_slot` chokepoint) so
         // column-gated paths stay consistent.
-        let at_pure_keyword_continuation = qualifier.is_none()
+        let has_prefix = !snapshot.prefix.is_empty();
+        let at_keyword_only_identifier_slot = qualifier.is_none()
             && (Self::cursor_is_at_pure_clause_keyword_continuation_for_context(
-                deep_ctx,
-                !snapshot.prefix.is_empty(),
-            ) || Self::cursor_is_at_is_null_test_keyword_position_for_context(
-                deep_ctx,
-                !snapshot.prefix.is_empty(),
-            ));
+                deep_ctx, has_prefix,
+            ) || Self::cursor_is_at_is_null_test_keyword_position_for_context(deep_ctx, has_prefix)
+                || Self::cursor_is_after_complete_dml_target_for_context(deep_ctx, has_prefix));
         let cursor_in_statement = snapshot
             .cursor_pos_usize
             .saturating_sub(analysis.statement_start)
@@ -693,7 +692,7 @@ impl SqlEditorWidget {
                     .saturating_sub(analysis.statement_start),
             );
         let session_bind_names = if qualifier.is_none()
-            && !at_pure_keyword_continuation
+            && !at_keyword_only_identifier_slot
             && !matches!(context, SqlContext::TableName)
             && !restrict_to_relation_columns
         {
@@ -702,7 +701,7 @@ impl SqlEditorWidget {
             Vec::new()
         };
         let local_suggestions = if qualifier.is_none()
-            && !at_pure_keyword_continuation
+            && !at_keyword_only_identifier_slot
             && !matches!(context, SqlContext::TableName)
             && !restrict_to_relation_columns
         {
@@ -1032,7 +1031,7 @@ impl SqlEditorWidget {
             qualified_member_suggestions
         } else if replace_table_context_with_expected_objects {
             expected_object_suggestions.clone()
-        } else if at_pure_keyword_continuation {
+        } else if at_keyword_only_identifier_slot {
             // Only the trailing clause keyword is grammatical here; the keyword
             // merge below supplies it, so the identifier base stays empty.
             Vec::new()
@@ -1101,7 +1100,7 @@ impl SqlEditorWidget {
                 deep_ctx.phase,
             );
         }
-        let wildcard_suggestions = if at_pure_keyword_continuation {
+        let wildcard_suggestions = if at_keyword_only_identifier_slot {
             Vec::new()
         } else {
             Self::collect_clause_wildcard_suggestions(&snapshot.prefix, qualifier, deep_ctx)
@@ -1132,7 +1131,7 @@ impl SqlEditorWidget {
         let context_name_suggestions =
             if matches!(context, SqlContext::VariableName | SqlContext::BindValue)
                 || restrict_to_relation_columns
-                || at_pure_keyword_continuation
+                || at_keyword_only_identifier_slot
             {
                 Vec::new()
             } else {
@@ -2400,6 +2399,85 @@ impl SqlEditorWidget {
         }
     }
 
+    /// Structural keyword hint for the position right after a *complete* DML
+    /// target table, where the phase machine still reports a table-target phase
+    /// but a bare relation is no longer grammatical — only the clause keyword that
+    /// follows the target is:
+    ///
+    ///   * `UPDATE t [alias] |`          → `SET`
+    ///   * `DELETE FROM t [alias] |`     → `WHERE`
+    ///   * `INSERT INTO t |`             → `VALUES` / `SELECT`
+    ///   * `MERGE INTO t [alias] |`      → `USING`
+    ///
+    /// Returns `None` while the target is still being typed (the cursor's word is
+    /// excluded by the caller, leaving the leading keyword as the last token) so
+    /// table completion keeps working there. `UPDATE` is recognized by its
+    /// dedicated `UpdateTarget` phase, which excludes post-`JOIN` positions
+    /// (those become `FromClause`); `DELETE` shares `FromClause` with `SELECT`, so
+    /// it is keyed on the leading `DELETE` and limited to the single-table form
+    /// (no `JOIN`/comma) to avoid a MySQL multi-table delete's join targets.
+    fn expected_dml_target_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        phase: intellisense_context::SqlPhase,
+    ) -> Option<&'static [&'static str]> {
+        use intellisense_context::SqlPhase;
+
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        // The target (or its alias) must be complete: the last token is a plain
+        // identifier word, not a leading/connecting keyword and not a separator.
+        let SqlToken::Word(last) = toks.last()? else {
+            return None;
+        };
+        if matches!(
+            last.to_ascii_uppercase().as_str(),
+            "UPDATE" | "DELETE" | "INSERT" | "MERGE" | "INTO" | "FROM" | "USING" | "SET" | "VALUES"
+        ) {
+            return None;
+        }
+
+        let lead = toks.iter().find_map(|token| match token {
+            SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+            _ => None,
+        })?;
+
+        match lead.as_str() {
+            "UPDATE" if matches!(phase, SqlPhase::UpdateTarget) => Some(&["SET"]),
+            "INSERT" if matches!(phase, SqlPhase::IntoClause) => Some(&["VALUES", "SELECT"]),
+            "MERGE" if matches!(phase, SqlPhase::IntoClause | SqlPhase::MergeTarget) => {
+                Some(&["USING"])
+            }
+            "DELETE"
+                if matches!(phase, SqlPhase::FromClause | SqlPhase::DeleteTarget)
+                    && !toks.iter().any(|token| {
+                        matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("JOIN"))
+                            || matches!(token, SqlToken::Symbol(sym) if sym == ",")
+                    }) =>
+            {
+                Some(&["WHERE"])
+            }
+            _ => None,
+        }
+    }
+
+    /// True when the cursor is right after a complete DML target table (see
+    /// [`Self::expected_dml_target_keyword_candidates`]). The position expects a
+    /// structural clause keyword, never another relation, so the identifier list
+    /// is suppressed there.
+    fn cursor_is_after_complete_dml_target_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::expected_dml_target_keyword_candidates(tokens, end, deep_ctx.phase).is_some()
+    }
+
     /// True when the cursor is at the type slot of a column definition in
     /// `CREATE TABLE (... col |)` or `ALTER TABLE ... ADD|MODIFY|CHANGE ... col |`.
     fn cursor_is_at_ddl_column_type(tokens: &[SqlToken], end: usize) -> bool {
@@ -3135,6 +3213,12 @@ impl SqlEditorWidget {
                 prefix,
                 Self::interval_unit_keywords_for(db_type, slot),
             );
+        }
+
+        if let Some(candidates) =
+            Self::expected_dml_target_keyword_candidates(tokens, context_end, deep_ctx.phase)
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
         }
 
         let words = Self::previous_meaningful_words_upper(tokens, context_end, 6);

@@ -17596,6 +17596,65 @@ fn is_null_test_continuation_offers_keywords_and_suppresses_columns() {
 }
 
 #[test]
+fn dml_target_continuation_offers_structural_keyword_and_suppresses_relations() {
+    let det = |sql: &str| {
+        SqlEditorWidget::cursor_is_after_complete_dml_target_for_context(
+            &analyze_inline_cursor_sql(sql),
+            false,
+        )
+    };
+    let kw = |sql: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &analyze_inline_cursor_sql(sql),
+            Some(crate::db::DatabaseType::Oracle),
+        )
+    };
+    // After a complete DML target table, only the following clause keyword is
+    // grammatical — never another relation — so the position both offers that
+    // keyword and routes through the identifier-suppression flag.
+    assert!(det("UPDATE emp |"));
+    assert_eq!(kw("UPDATE emp |"), vec!["SET"]);
+    assert!(det("UPDATE emp e |")); // after the alias too
+    assert!(det("UPDATE schema.emp |")); // schema-qualified target
+    assert!(det("DELETE FROM emp |"));
+    assert_eq!(kw("DELETE FROM emp |"), vec!["WHERE"]);
+    assert!(det("DELETE FROM emp e |"));
+    assert!(det("INSERT INTO emp |"));
+    assert_eq!(kw("INSERT INTO emp |"), vec!["VALUES", "SELECT"]);
+    assert!(det("MERGE INTO emp |"));
+    assert_eq!(kw("MERGE INTO emp |"), vec!["USING"]);
+    assert!(det("MERGE INTO emp e |"));
+
+    // The target is not yet complete (still the leading keyword), so the table
+    // list must keep flowing.
+    assert!(!det("UPDATE |"));
+    assert!(!det("DELETE FROM |"));
+    assert!(!det("INSERT INTO |"));
+    assert!(!det("MERGE INTO |"));
+
+    // A SELECT `FROM` shares the phase but is not a DML target — table completion
+    // (including comma-separated cross joins) stays intact.
+    assert!(!det("SELECT * FROM emp |"));
+    assert!(!det("SELECT * FROM a, |"));
+    assert!(!det("SELECT * FROM t WHERE x IN (SELECT a FROM u |)"));
+
+    // MySQL multi-table / join forms still expect another relation, so the simple
+    // single-target heuristics must not fire: a trailing comma, or a join target.
+    assert!(!det("UPDATE t1, |"));
+    assert!(!det("DELETE t1 FROM t1 JOIN t2 |"));
+    assert!(!det("DELETE FROM emp e JOIN x |"));
+
+    // Once the structural keyword is present the dedicated clause phase takes over.
+    assert!(!det("UPDATE emp SET a = 1 |"));
+    assert!(!det("DELETE FROM emp WHERE |"));
+    assert!(!det("INSERT INTO emp VALUES |"));
+
+    // `CREATE INDEX ... ON t` shares the phase but is not a DML target.
+    assert!(!det("CREATE INDEX i ON t |"));
+}
+
+#[test]
 fn interval_unit_slot_suppresses_columns_and_offers_unit_keywords() {
     let at_unit = |sql: &str| {
         SqlEditorWidget::interval_unit_position_for_context(
@@ -20088,5 +20147,7 @@ fn local_record_member_scope_boundary_and_nested_loops() {
     .expect("enclosing loop record visible inside inner loop");
     assert_has_case_insensitive(&outer, "x");
 }
+
+
 
 
