@@ -1047,6 +1047,13 @@ impl IntellisenseData {
                     if !func.starts_with(prefix_upper.as_str()) {
                         break;
                     }
+                    // Skip functions that are also keywords (e.g. MAX, TO_CHAR,
+                    // SYSDATE); they are emitted by the keyword loop above as the
+                    // bare name, so rendering `NAME()` here too would duplicate
+                    // the entry (e.g. `MAX` and `MAX()`).
+                    if keywords.binary_search(func).is_ok() {
+                        continue;
+                    }
                     let rendered = format!("{func}{FUNCTION_SUFFIX}");
                     if !suggestion_matches_completion_prefix(&rendered, prefix) {
                         continue;
@@ -4251,6 +4258,24 @@ mod intellisense_tests {
     }
 
     #[test]
+    fn suggestions_do_not_duplicate_function_and_keyword() {
+        // MAX is present in both ORACLE_SQL_KEYWORDS and ORACLE_FUNCTIONS; it
+        // must surface only once. When a name is both, the bare keyword form
+        // wins and the `MAX()` function form is suppressed.
+        let mut data = IntellisenseData::new();
+        let oracle = Some(crate::db::DatabaseType::Oracle);
+        let suggestions = data.get_suggestions_for_db("max", false, None, false, false, oracle);
+        assert!(
+            suggestions.iter().any(|s| s == "MAX"),
+            "expected MAX in {suggestions:?}"
+        );
+        assert!(
+            !suggestions.iter().any(|s| s == "MAX()"),
+            "MAX() must not appear when MAX is also a keyword in {suggestions:?}"
+        );
+    }
+
+    #[test]
     fn enclosing_call_handles_quoted_identifier_with_dot() {
         let call = call_at(r#"SELECT "my.func"(a, |) FROM t"#).expect("inside call");
         assert_eq!(call.name, "my.func");
@@ -4314,8 +4339,12 @@ mod intellisense_tests {
         let mut data = IntellisenseData::new();
         let suggestions = data.get_suggestions("TO_", false, None, false, false);
 
+        // TO_CHAR is both a keyword and a function; the bare keyword form wins
+        // and the `TO_CHAR()` duplicate is suppressed. TO_TIMESTAMP is a
+        // function-only name, so it still renders with parentheses.
         assert!(suggestions.iter().any(|s| s == "TO_CHAR"));
-        assert!(suggestions.iter().any(|s| s == "TO_CHAR()"));
+        assert!(!suggestions.iter().any(|s| s == "TO_CHAR()"));
+        assert!(suggestions.iter().any(|s| s == "TO_TIMESTAMP()"));
     }
 
     #[test]
@@ -5091,9 +5120,12 @@ mod intellisense_tests {
     fn get_suggestions_includes_exact_function_prefix_match() {
         let mut data = IntellisenseData::new();
 
-        let suggestions = data.get_suggestions("sum", false, None, false, false);
+        // ABS is a function-only name (not also a keyword), so it renders with
+        // parentheses. SUM, by contrast, is both keyword and function and now
+        // surfaces only as the bare keyword.
+        let suggestions = data.get_suggestions("abs", false, None, false, false);
 
-        assert!(suggestions.iter().any(|s| s.eq_ignore_ascii_case("sum()")));
+        assert!(suggestions.iter().any(|s| s.eq_ignore_ascii_case("abs()")));
     }
 
     #[test]
