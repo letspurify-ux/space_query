@@ -17655,6 +17655,52 @@ fn dml_target_continuation_offers_structural_keyword_and_suppresses_relations() 
 }
 
 #[test]
+fn join_target_continuation_offers_on_using_and_suppresses_relations() {
+    let det = |sql: &str| {
+        SqlEditorWidget::cursor_is_after_complete_join_target_for_context(
+            &analyze_inline_cursor_sql(sql),
+            false,
+        )
+    };
+    let kw = |sql: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &analyze_inline_cursor_sql(sql),
+            Some(crate::db::DatabaseType::Oracle),
+        )
+    };
+    // After a complete JOIN target table, the join condition keywords are
+    // grammatical — never another relation — so the slot offers them and routes
+    // through the identifier-suppression flag.
+    assert!(det("SELECT * FROM a JOIN b |"));
+    assert_eq!(kw("SELECT * FROM a JOIN b |"), vec!["ON", "USING"]);
+    assert!(det("SELECT * FROM a JOIN b x |")); // after the alias too
+    assert!(det("SELECT * FROM a LEFT JOIN b |"));
+    assert!(det("SELECT * FROM a LEFT OUTER JOIN b |"));
+    assert!(det("SELECT * FROM a INNER JOIN b |"));
+    assert!(det("SELECT * FROM a JOIN sch.b |")); // schema-qualified target
+    assert!(det("SELECT * FROM a JOIN b ON a.x = b.y JOIN c |")); // chained join
+    assert!(det("SELECT * FROM (SELECT 1 x) z JOIN b |")); // subquery left side
+    assert!(det("SELECT 1 FROM u JOIN v |")); // inside a subquery scope
+
+    // `CROSS`/`NATURAL` joins take no condition keyword.
+    assert!(!det("SELECT * FROM a CROSS JOIN b |"));
+    assert!(!det("SELECT * FROM a NATURAL JOIN b |"));
+
+    // The target is not yet present, the condition has already started, or the
+    // cursor is in an ordinary FROM/comma position — table completion stays intact.
+    assert!(!det("SELECT * FROM a JOIN |"));
+    assert!(!det("SELECT * FROM a JOIN b ON |"));
+    assert!(!det("SELECT * FROM a JOIN b ON a.x = b.y |"));
+    assert!(!det("SELECT * FROM a JOIN b USING |"));
+    assert!(!det("SELECT * FROM a JOIN b USING (c) |"));
+    assert!(!det("SELECT * FROM a |"));
+    assert!(!det("SELECT * FROM a, b |"));
+    // A bare join-type word routes through the join-continuation family instead.
+    assert!(!det("SELECT * FROM a LEFT |"));
+}
+
+#[test]
 fn interval_unit_slot_suppresses_columns_and_offers_unit_keywords() {
     let at_unit = |sql: &str| {
         SqlEditorWidget::interval_unit_position_for_context(
@@ -20147,6 +20193,8 @@ fn local_record_member_scope_boundary_and_nested_loops() {
     .expect("enclosing loop record visible inside inner loop");
     assert_has_case_insensitive(&outer, "x");
 }
+
+
 
 
 

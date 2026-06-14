@@ -667,22 +667,24 @@ impl SqlEditorWidget {
         let restrict_to_relation_columns = completion_policy.restrict_to_relation_columns;
         // A keyword-only position accepts only a fixed keyword, never an
         // identifier — a clause-keyword continuation (`ORDER |`/`GROUP |`/
-        // `<join-type> |` …), the `IS [NOT] |` null-test operator, or the slot
-        // right after a complete DML target table (`UPDATE t |` → `SET`, …). The
-        // phase machine leaves the cursor in the surrounding table/column phase
-        // there, so every identifier source (relations, columns, in-scope
+        // `<join-type> |` …), the `IS [NOT] |` null-test operator, the slot right
+        // after a complete DML target table (`UPDATE t |` → `SET`, …), or the slot
+        // right after a complete JOIN target table (`… JOIN t |` → `ON`/`USING`).
+        // The phase machine leaves the cursor in the surrounding table/column
+        // phase there, so every identifier source (relations, columns, in-scope
         // aliases/CTEs, local PL/SQL symbols, `*`) must be suppressed; the
         // `expected_keyword_suggestions` merge below still supplies the lone
-        // `BY`/`WITH`/`JOIN`/`NULL`/`SET`/`WHERE`/… hints. The keyword-emitting
-        // slots are also folded into `at_keyword_only_slot` (via the shared
-        // `cursor_is_at_column_suppressing_keyword_slot` chokepoint) so
+        // `BY`/`WITH`/`JOIN`/`NULL`/`SET`/`WHERE`/`ON`/… hints. The keyword-
+        // emitting slots are also folded into `at_keyword_only_slot` (via the
+        // shared `cursor_is_at_column_suppressing_keyword_slot` chokepoint) so
         // column-gated paths stay consistent.
         let has_prefix = !snapshot.prefix.is_empty();
         let at_keyword_only_identifier_slot = qualifier.is_none()
             && (Self::cursor_is_at_pure_clause_keyword_continuation_for_context(
                 deep_ctx, has_prefix,
             ) || Self::cursor_is_at_is_null_test_keyword_position_for_context(deep_ctx, has_prefix)
-                || Self::cursor_is_after_complete_dml_target_for_context(deep_ctx, has_prefix));
+                || Self::cursor_is_after_complete_dml_target_for_context(deep_ctx, has_prefix)
+                || Self::cursor_is_after_complete_join_target_for_context(deep_ctx, has_prefix));
         let cursor_in_statement = snapshot
             .cursor_pos_usize
             .saturating_sub(analysis.statement_start)
@@ -2478,6 +2480,109 @@ impl SqlEditorWidget {
         Self::expected_dml_target_keyword_candidates(tokens, end, deep_ctx.phase).is_some()
     }
 
+    /// Join-condition keyword hint for the position right after a *complete* JOIN
+    /// target table — `… JOIN t [alias] |` → `ON` / `USING`. The phase machine
+    /// keeps the whole `FROM` clause in `FromClause`, so without this the slot
+    /// would offer every relation even though a bare table is not grammatical
+    /// after a join target (only `ON`/`USING`, an alias, a further `JOIN`, or the
+    /// next clause is).
+    ///
+    /// Returns `None` while the target is still being typed (the cursor's word is
+    /// excluded by the caller, leaving `JOIN`/the join type as the last token) so
+    /// table completion keeps working there, and for `CROSS`/`NATURAL` joins,
+    /// which take neither `ON` nor `USING`.
+    fn expected_join_target_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        phase: intellisense_context::SqlPhase,
+    ) -> Option<&'static [&'static str]> {
+        use intellisense_context::SqlPhase;
+
+        if !matches!(phase, SqlPhase::FromClause) {
+            return None;
+        }
+        let is_join_keyword = |word: &str| {
+            matches!(
+                word.to_ascii_uppercase().as_str(),
+                "JOIN"
+                    | "ON"
+                    | "USING"
+                    | "INNER"
+                    | "OUTER"
+                    | "LEFT"
+                    | "RIGHT"
+                    | "FULL"
+                    | "CROSS"
+                    | "NATURAL"
+            )
+        };
+
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        // The join target (or its alias) must be complete: the last token is a
+        // plain identifier word, not a join keyword and not a separator.
+        let SqlToken::Word(last) = toks.last()? else {
+            return None;
+        };
+        if is_join_keyword(last) {
+            return None;
+        }
+
+        // Walk back to the governing `JOIN`; between it and the cursor only the
+        // target name (`schema.table`) and an optional alias word may appear.
+        let mut idx = toks.len() - 1;
+        let join_idx = loop {
+            if idx == 0 {
+                return None;
+            }
+            idx -= 1;
+            match &toks[idx] {
+                SqlToken::Word(word) if word.eq_ignore_ascii_case("JOIN") => break idx,
+                SqlToken::Word(_) => {} // part of the table name or its alias
+                SqlToken::Symbol(sym) if sym == "." => {} // dotted name separator
+                _ => return None, // comma / paren / operator: not a simple target
+            }
+        };
+
+        // `CROSS JOIN` / `NATURAL JOIN` take no join condition.
+        let mut type_idx = join_idx;
+        while type_idx > 0 {
+            type_idx -= 1;
+            match &toks[type_idx] {
+                SqlToken::Word(word)
+                    if matches!(
+                        word.to_ascii_uppercase().as_str(),
+                        "LEFT" | "RIGHT" | "FULL" | "INNER" | "OUTER"
+                    ) => {}
+                SqlToken::Word(word)
+                    if matches!(word.to_ascii_uppercase().as_str(), "CROSS" | "NATURAL") =>
+                {
+                    return None;
+                }
+                _ => break,
+            }
+        }
+
+        Some(&["ON", "USING"])
+    }
+
+    /// True when the cursor is right after a complete JOIN target table (see
+    /// [`Self::expected_join_target_keyword_candidates`]). The position expects a
+    /// join condition keyword, never another relation, so the identifier list is
+    /// suppressed there.
+    fn cursor_is_after_complete_join_target_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::expected_join_target_keyword_candidates(tokens, end, deep_ctx.phase).is_some()
+    }
+
     /// True when the cursor is at the type slot of a column definition in
     /// `CREATE TABLE (... col |)` or `ALTER TABLE ... ADD|MODIFY|CHANGE ... col |`.
     fn cursor_is_at_ddl_column_type(tokens: &[SqlToken], end: usize) -> bool {
@@ -3217,6 +3322,12 @@ impl SqlEditorWidget {
 
         if let Some(candidates) =
             Self::expected_dml_target_keyword_candidates(tokens, context_end, deep_ctx.phase)
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+
+        if let Some(candidates) =
+            Self::expected_join_target_keyword_candidates(tokens, context_end, deep_ctx.phase)
         {
             return Self::filter_expected_candidates(prefix, candidates);
         }
