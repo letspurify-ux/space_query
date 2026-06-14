@@ -17308,6 +17308,224 @@ fn collect_expected_keyword_suggestions_complete_common_clause_tails() {
 }
 
 #[test]
+fn extract_field_slot_suppresses_columns_and_offers_field_keywords() {
+    let at_field = |sql: &str| {
+        SqlEditorWidget::extract_field_position_for_context(
+            &analyze_inline_cursor_sql(sql),
+            false,
+        )
+        .is_some()
+    };
+    // Field slot (`EXTRACT(|`) and the awaiting-FROM slot (`EXTRACT(YEAR |`) both
+    // suppress columns — a column is never valid before the FROM.
+    assert!(at_field("SELECT EXTRACT(| FROM hire_date) FROM emp"));
+    assert!(at_field("SELECT EXTRACT(YEAR | FROM hire_date) FROM emp"));
+    // The source expression after FROM is a real column position.
+    assert!(!at_field("SELECT EXTRACT(YEAR FROM |) FROM emp"));
+    assert!(!at_field("SELECT EXTRACT(YEAR FROM hire_date) , | FROM emp"));
+    // An ordinary column position / a non-EXTRACT function call is unaffected.
+    assert!(!at_field("SELECT | FROM emp"));
+    assert!(!at_field("SELECT TRUNC(| ) FROM emp"));
+
+    // Oracle field keywords are offered at the field slot; MySQL has its own set.
+    let oracle_fields = SqlEditorWidget::collect_expected_keyword_suggestions(
+        "",
+        &analyze_inline_cursor_sql("SELECT EXTRACT(| FROM hire_date) FROM emp"),
+        Some(crate::db::DatabaseType::Oracle),
+    );
+    assert!(oracle_fields.iter().any(|value| value == "YEAR"));
+    assert!(oracle_fields.iter().any(|value| value == "TIMEZONE_HOUR"));
+    let mysql_fields = SqlEditorWidget::collect_expected_keyword_suggestions(
+        "",
+        &analyze_inline_cursor_sql("SELECT EXTRACT(| FROM hire_date) FROM emp"),
+        Some(crate::db::DatabaseType::MySQL),
+    );
+    assert!(mysql_fields.iter().any(|value| value == "QUARTER"));
+    assert!(mysql_fields.iter().any(|value| value == "YEAR_MONTH"));
+    // After the field name, `FROM` is offered.
+    let awaiting_from = SqlEditorWidget::collect_expected_keyword_suggestions(
+        "",
+        &analyze_inline_cursor_sql("SELECT EXTRACT(YEAR | FROM hire_date) FROM emp"),
+        Some(crate::db::DatabaseType::Oracle),
+    );
+    assert_eq!(awaiting_from, vec!["FROM".to_string()]);
+}
+
+#[test]
+fn json_returning_type_slot_offers_types_and_suppresses_columns() {
+    // The JSON `RETURNING` type slot routes through the shared keyword-only
+    // chokepoint, so columns are suppressed there.
+    let at_slot = |sql: &str| {
+        SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(
+            &analyze_inline_cursor_sql(sql),
+            false,
+        )
+    };
+    assert!(at_slot("SELECT JSON_VALUE(doc, '$.a' RETURNING |) FROM t"));
+    assert!(at_slot("SELECT JSON_QUERY(doc, '$.a' RETURNING |) FROM t"));
+    // A statement-level DML RETURNING lists columns, not types — not a type slot.
+    assert!(!at_slot("UPDATE t SET x = 1 RETURNING | INTO :v"));
+    assert!(!at_slot("DELETE FROM t WHERE id = 1 RETURNING |"));
+
+    // Dialect-correct type keywords are offered at the JSON RETURNING slot.
+    let oracle = SqlEditorWidget::collect_expected_keyword_suggestions(
+        "",
+        &analyze_inline_cursor_sql("SELECT JSON_VALUE(doc, '$.a' RETURNING |) FROM t"),
+        Some(crate::db::DatabaseType::Oracle),
+    );
+    assert!(oracle.iter().any(|value| value == "VARCHAR2"));
+    assert!(oracle.iter().any(|value| value == "NUMBER"));
+    let mysql = SqlEditorWidget::collect_expected_keyword_suggestions(
+        "",
+        &analyze_inline_cursor_sql("SELECT JSON_VALUE(doc, '$.a' RETURNING |) FROM t"),
+        Some(crate::db::DatabaseType::MySQL),
+    );
+    assert!(mysql.iter().any(|value| value == "UNSIGNED"));
+}
+
+#[test]
+fn clause_continuation_keyword_is_suppressed_after_qualified_member() {
+    let suggests = |sql: &str, kw: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &analyze_inline_cursor_sql(sql),
+            None,
+        )
+        .iter()
+        .any(|value| value == kw)
+    };
+    // A standalone clause keyword still offers its continuation.
+    assert!(suggests("SELECT * FROM emp ORDER |", "BY"));
+    assert!(suggests("SELECT * FROM emp GROUP |", "BY"));
+    assert!(suggests("SELECT * FROM emp CONNECT |", "BY"));
+    assert!(suggests("SELECT * FROM emp START |", "WITH"));
+    // A qualified member named order/group/start is a column — no continuation.
+    assert!(!suggests("SELECT * FROM emp e WHERE e.order |", "BY"));
+    assert!(!suggests("SELECT * FROM emp e WHERE e.group |", "BY"));
+    assert!(!suggests("SELECT * FROM emp e WHERE e.start |", "WITH"));
+}
+
+#[test]
+fn join_continuation_keyword_is_scoped_to_table_context() {
+    let suggests_join = |sql: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &analyze_inline_cursor_sql(sql),
+            None,
+        )
+        .iter()
+        .any(|value| value == "JOIN")
+    };
+    // In a table position the join continuation is still offered.
+    assert!(suggests_join("SELECT * FROM a LEFT |"));
+    assert!(suggests_join("SELECT * FROM a INNER |"));
+    assert!(suggests_join("SELECT * FROM a NATURAL |"));
+    assert!(suggests_join("SELECT * FROM a CROSS |"));
+    // A column/function named left/right in an expression position must not.
+    assert!(!suggests_join("SELECT left | FROM a"));
+    assert!(!suggests_join("SELECT * FROM a WHERE right | "));
+}
+
+#[test]
+fn column_suppressing_keyword_slot_covers_every_family() {
+    let at = |sql: &str| {
+        SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(
+            &analyze_inline_cursor_sql(sql),
+            false,
+        )
+    };
+    // One representative of each keyword/value-only family routes through the
+    // single chokepoint, so suppression can never drift from keyword emission.
+    assert!(at("SELECT CAST(x AS |) FROM t")); // data type
+    assert!(at("SELECT * FROM t ORDER BY id FETCH FIRST |")); // row limiting
+    assert!(at("SELECT sum(x) OVER (ORDER BY d ROWS BETWEEN UNBOUNDED |) FROM t")); // window frame
+    assert!(at("SELECT EXTRACT(| FROM hire_date) FROM emp")); // EXTRACT field
+    assert!(at("SELECT hire_date - INTERVAL '5' | FROM emp")); // INTERVAL unit
+    // Ordinary column positions remain column positions.
+    assert!(!at("SELECT | FROM emp"));
+    assert!(!at("SELECT * FROM emp WHERE | "));
+    // Value-bound window-frame slots accept an expression, so they are NOT here.
+    assert!(!at("SELECT sum(x) OVER (ORDER BY d ROWS BETWEEN | ) FROM t"));
+}
+
+#[test]
+fn interval_unit_slot_suppresses_columns_and_offers_unit_keywords() {
+    let at_unit = |sql: &str| {
+        SqlEditorWidget::interval_unit_position_for_context(
+            &analyze_inline_cursor_sql(sql),
+            false,
+        )
+        .is_some()
+    };
+    // Every qualifier slot of a quoted INTERVAL literal suppresses columns.
+    assert!(at_unit("SELECT hire_date - INTERVAL '5' | FROM emp"));
+    assert!(at_unit("SELECT hire_date - INTERVAL '5' DAY | FROM emp"));
+    assert!(at_unit("SELECT hire_date - INTERVAL '5' DAY TO | FROM emp"));
+    assert!(at_unit("SELECT hire_date + INTERVAL '1-2' YEAR TO | FROM emp"));
+    // MySQL's unquoted `INTERVAL <expr> <unit>` keeps the expr a column position.
+    assert!(!at_unit("SELECT hire_date - INTERVAL | DAY FROM emp"));
+    // Ordinary expression positions are unaffected.
+    assert!(!at_unit("SELECT | FROM emp"));
+    assert!(!at_unit("SELECT hire_date - | FROM emp"));
+
+    // Oracle leading units, then `TO`, then trailing units.
+    let oracle = |sql: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &analyze_inline_cursor_sql(sql),
+            Some(crate::db::DatabaseType::Oracle),
+        )
+    };
+    let leading = oracle("SELECT hire_date - INTERVAL '5' | FROM emp");
+    assert!(leading.iter().any(|value| value == "DAY"));
+    assert!(leading.iter().any(|value| value == "SECOND"));
+    assert_eq!(
+        oracle("SELECT hire_date - INTERVAL '5' DAY | FROM emp"),
+        vec!["TO".to_string()]
+    );
+    let trailing = oracle("SELECT hire_date - INTERVAL '5' DAY TO | FROM emp");
+    assert!(trailing.iter().any(|value| value == "SECOND"));
+    assert!(!trailing.iter().any(|value| value == "DAY"));
+    // MySQL offers its own unit names at the leading slot and no `TO`.
+    let mysql_leading = SqlEditorWidget::collect_expected_keyword_suggestions(
+        "",
+        &analyze_inline_cursor_sql("SELECT hire_date - INTERVAL '5' | FROM emp"),
+        Some(crate::db::DatabaseType::MySQL),
+    );
+    assert!(mysql_leading.iter().any(|value| value == "QUARTER"));
+}
+
+#[test]
+fn merge_when_matched_keyword_is_scoped_to_merge_action_slot() {
+    let suggests_matched = |sql: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &analyze_inline_cursor_sql(sql),
+            None,
+        )
+        .iter()
+        .any(|value| value == "MATCHED")
+    };
+    // Real MERGE merge-action slots still offer MATCHED.
+    assert!(suggests_matched(
+        "MERGE INTO target t USING src s ON (t.id = s.id) WHEN |"
+    ));
+    assert!(suggests_matched(
+        "MERGE INTO target t USING src s ON (t.id = s.id) WHEN NOT |"
+    ));
+    // A `CASE WHEN` branch is never a merge-action slot: no MATCHED, even when
+    // the CASE lives inside a MERGE's SET/INSERT expression.
+    assert!(!suggests_matched("SELECT CASE WHEN | END FROM t"));
+    assert!(!suggests_matched("SELECT CASE WHEN NOT | END FROM t"));
+    assert!(!suggests_matched(
+        "MERGE INTO target t USING src s ON (t.id = s.id) \
+         WHEN MATCHED THEN UPDATE SET t.v = CASE WHEN |"
+    ));
+    // PL/SQL searched CASE statement is likewise not a merge slot.
+    assert!(!suggests_matched("BEGIN CASE WHEN | THEN NULL; END CASE; END;"));
+}
+
+#[test]
 fn collect_expected_keyword_suggestions_include_ddl_object_type_tokens() {
     let create_ctx = analyze_inline_cursor_sql("CREATE |");
     let create_or_replace_ctx = analyze_inline_cursor_sql("CREATE OR REPLACE |");
@@ -19148,6 +19366,31 @@ fn window_frame_groups_unit_is_recognized() {
 }
 
 #[test]
+fn window_frame_keyword_only_positions_suppress_columns() {
+    let at = |sql: &str| {
+        SqlEditorWidget::cursor_is_at_window_frame_keyword_only_position_for_context(
+            &analyze_inline_cursor_sql(sql),
+            false,
+        )
+    };
+    // `UNBOUNDED |` (-> PRECEDING/FOLLOWING) and `CURRENT |` (-> ROW) only accept
+    // a frame keyword, so columns are suppressed.
+    assert!(at("SELECT sum(x) OVER (ORDER BY d ROWS BETWEEN UNBOUNDED |) FROM t"));
+    assert!(at("SELECT sum(x) OVER (ORDER BY d RANGE CURRENT |) FROM t"));
+    assert!(at(
+        "SELECT sum(x) OVER (ORDER BY d ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED |) FROM t"
+    ));
+    // Value-accepting frame slots keep columns visible (a bound may be an
+    // expression, e.g. `ROWS 5 PRECEDING` / `RANGE BETWEEN x PRECEDING`).
+    assert!(!at("SELECT sum(x) OVER (ORDER BY d ROWS |) FROM t"));
+    assert!(!at("SELECT sum(x) OVER (ORDER BY d ROWS BETWEEN |) FROM t"));
+    assert!(!at("SELECT sum(x) OVER (ORDER BY d ROWS BETWEEN UNBOUNDED PRECEDING AND |) FROM t"));
+    // A column named `unbounded`/`current` outside any window spec is unaffected.
+    assert!(!at("SELECT unbounded | FROM t"));
+    assert!(!at("SELECT current | FROM t"));
+}
+
+#[test]
 fn ordinary_between_predicate_is_not_treated_as_window_frame() {
     // No OVER -> a normal range predicate must never offer frame keywords.
     assert_eq!(
@@ -19284,6 +19527,28 @@ fn data_type_cast_as_prefix_filters() {
 fn data_type_treat_as_is_a_type_position() {
     let s = data_type_suggestions("SELECT TREAT(x AS |) FROM t", "", crate::db::DatabaseType::Oracle);
     assert!(s.contains(&"XMLTYPE".to_string()));
+}
+
+#[test]
+fn data_type_xmlserialize_and_validate_conversion_as_are_type_positions() {
+    // XMLSERIALIZE and VALIDATE_CONVERSION share CAST's `AS <type>` slot.
+    let xs = data_type_suggestions(
+        "SELECT XMLSERIALIZE(DOCUMENT x AS |) FROM t",
+        "",
+        crate::db::DatabaseType::Oracle,
+    );
+    assert!(xs.contains(&"CLOB".to_string()));
+    let vc = data_type_suggestions(
+        "SELECT VALIDATE_CONVERSION(x AS |) FROM t",
+        "",
+        crate::db::DatabaseType::Oracle,
+    );
+    assert!(vc.contains(&"NUMBER".to_string()));
+    // The expression before AS is still a normal column position.
+    assert!(!SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(
+        &analyze_inline_cursor_sql("SELECT XMLSERIALIZE(DOCUMENT | AS CLOB) FROM t"),
+        false,
+    ));
 }
 
 #[test]
@@ -19621,16 +19886,28 @@ fn data_type_prior_statement_does_not_leak_into_next() {
 #[test]
 fn row_count_positions_suppress_columns() {
     let at = |sql: &str| {
-        SqlEditorWidget::cursor_is_at_row_count_position_for_context(
+        SqlEditorWidget::cursor_is_in_row_limiting_clause_for_context(
             &analyze_inline_cursor_sql(sql),
             false,
         )
     };
-    // Row-count / offset slots accept only integers/binds.
+    // Row-count / offset value slots accept only integers/binds.
     assert!(at("SELECT * FROM orders ORDER BY id LIMIT |"));
     assert!(at("SELECT * FROM orders LIMIT 10, |"));
     assert!(at("SELECT * FROM orders LIMIT 10 OFFSET |"));
     assert!(at("SELECT a FROM t OFFSET |"));
+    // The whole Oracle/ANSI FETCH/OFFSET row-limiting tail is a no-column zone:
+    // count slots, unit slots, PERCENT, and the ONLY/WITH/TIES keyword slots all
+    // collapse to OrderByClause yet never accept a column.
+    assert!(at("SELECT * FROM emp ORDER BY empno FETCH FIRST |"));
+    assert!(at("SELECT * FROM emp ORDER BY empno FETCH NEXT |"));
+    assert!(at("SELECT * FROM emp ORDER BY empno FETCH FIRST 5 |"));
+    assert!(at("SELECT * FROM emp ORDER BY empno FETCH NEXT :n |"));
+    assert!(at("SELECT * FROM emp ORDER BY empno FETCH FIRST 5 ROWS |"));
+    assert!(at("SELECT * FROM emp ORDER BY empno FETCH FIRST 5 PERCENT |"));
+    assert!(at("SELECT * FROM emp ORDER BY empno FETCH FIRST 5 ROWS WITH |"));
+    assert!(at("SELECT * FROM emp OFFSET 10 |"));
+    assert!(at("SELECT * FROM emp OFFSET 10 ROWS |"));
     // Ordinary column positions are unaffected, including a `offset_*` column.
     assert!(!at("SELECT | FROM orders"));
     assert!(!at("SELECT a, | FROM orders"));

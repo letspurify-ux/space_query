@@ -30,6 +30,28 @@ enum DataTypePosition {
     Plsql,
 }
 
+/// Argument slot inside an `EXTRACT(<field> FROM <source>)` call, before the
+/// `FROM`. A datetime field keyword is the only thing valid here, never a column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExtractArgPosition {
+    /// Right after `EXTRACT(` — the datetime field name slot.
+    Field,
+    /// After the field name, before `FROM` — only `FROM` follows.
+    AwaitingFrom,
+}
+
+/// Qualifier slot in an `INTERVAL '<value>' <unit> [TO <unit>]` literal. The
+/// value lives in the string, so each slot is keyword-only — never a column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IntervalUnitSlot {
+    /// `INTERVAL '5' |` — the leading qualifier unit.
+    Leading,
+    /// `INTERVAL '5' DAY |` — only `TO` (or end of literal) follows.
+    AwaitingTo,
+    /// `INTERVAL '5' DAY TO |` — the trailing qualifier unit.
+    Trailing,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExpectedObjectSuggestionKind {
     Any,
@@ -728,21 +750,19 @@ impl SqlEditorWidget {
         } else {
             Self::resolve_column_tables_for_context(qualifier, deep_ctx)
         };
-        // A data-type slot (`CAST(x AS |)`, a column definition) expects a type,
-        // not a column; suppress column suggestions there so the type keywords
-        // emitted by `collect_expected_keyword_suggestions` stand alone. A
-        // row-count slot (`LIMIT |`, `OFFSET |`) accepts only an integer/bind.
-        let at_data_type_position = qualifier.is_none()
-            && Self::data_type_position_for_context(deep_ctx, !snapshot.prefix.is_empty())
-                .is_some();
-        let at_row_count_position = qualifier.is_none()
-            && Self::cursor_is_at_row_count_position_for_context(
+        // The cursor may sit in a slot whose grammar is keyword/value-only — a
+        // data type, a row-limiting argument, a pure window-frame keyword, an
+        // EXTRACT field, an INTERVAL unit — where a column is never valid.
+        // `cursor_is_at_column_suppressing_keyword_slot` is the single place those
+        // positions are enumerated, so column suppression cannot drift away from
+        // the matching keyword hints `collect_expected_keyword_suggestions` emits.
+        let at_keyword_only_slot = qualifier.is_none()
+            && Self::cursor_is_at_column_suppressing_keyword_slot(
                 deep_ctx,
                 !snapshot.prefix.is_empty(),
             );
         let include_columns = !has_local_record_member_scope
-            && !at_data_type_position
-            && !at_row_count_position
+            && !at_keyword_only_slot
             && (matches!(
                 qualified_completion_mode,
                 Some(QualifiedCompletionMode::RelationColumns)
@@ -1545,6 +1565,39 @@ impl SqlEditorWidget {
         None
     }
 
+    /// True when the cursor is at a window-frame slot that accepts *only* frame
+    /// keywords — `UNBOUNDED |` (-> PRECEDING/FOLLOWING) or `CURRENT |` (-> ROW).
+    /// A column or value is never valid in either spot in any dialect, so columns
+    /// are suppressed there. The other frame slots (`ROWS|RANGE|GROUPS |`,
+    /// `BETWEEN |`, `... AND |`) also accept a numeric/value bound (e.g. `ROWS 5
+    /// PRECEDING`, `RANGE BETWEEN INTERVAL '1' DAY PRECEDING`), so columns stay
+    /// visible there. Gated through `cursor_is_inside_window_spec` so a column
+    /// named `unbounded`/`current` outside a window never triggers it.
+    fn cursor_is_at_window_frame_keyword_only_position(tokens: &[SqlToken], end: usize) -> bool {
+        if !Self::cursor_is_inside_window_spec(tokens, end) {
+            return false;
+        }
+        let words = Self::previous_meaningful_words_upper(tokens, end, 1);
+        matches!(
+            words.last().map(String::as_str),
+            Some("UNBOUNDED") | Some("CURRENT")
+        )
+    }
+
+    fn cursor_is_at_window_frame_keyword_only_position_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::cursor_is_at_window_frame_keyword_only_position(tokens, end)
+    }
+
     /// The word immediately preceding the innermost still-open paren at the
     /// cursor (e.g. `ADD` for `ADD (col |)`), or `None` at top level.
     fn innermost_open_paren_preceding_word(tokens: &[SqlToken], end: usize) -> Option<String> {
@@ -1625,7 +1678,30 @@ impl SqlEditorWidget {
         if Self::cursor_is_at_plsql_type(tokens, end) {
             return Some(DataTypePosition::Plsql);
         }
+        if Self::cursor_is_at_json_returning_type(tokens, end) {
+            return Some(DataTypePosition::Cast);
+        }
         None
+    }
+
+    /// True when the cursor is at the type slot of a JSON function's `RETURNING`
+    /// clause — `JSON_VALUE(col, '$.a' RETURNING |)`, `JSON_QUERY(... RETURNING |)`,
+    /// etc. (Oracle and MySQL both accept a data type here, the same grammar as
+    /// `CAST(... AS type)`.) Anchored on the innermost open paren following a
+    /// `JSON_*` function so a statement-level DML `RETURNING <col>` — which lists
+    /// columns, not types, and is never inside a function call — is left as a
+    /// column position by the phase machine.
+    fn cursor_is_at_json_returning_type(tokens: &[SqlToken], end: usize) -> bool {
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        let Some(last) = toks.len().checked_sub(1) else {
+            return false;
+        };
+        if !matches!(toks.get(last), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("RETURNING"))
+        {
+            return false;
+        }
+        Self::innermost_open_paren_preceding_word(tokens, end)
+            .is_some_and(|word| word.to_ascii_uppercase().starts_with("JSON_"))
     }
 
     /// True when the cursor is at a column-type slot inside a `JSON_TABLE`/
@@ -1908,7 +1984,10 @@ impl SqlEditorWidget {
     /// call — `CAST(expr AS |)`. Anchored on the enclosing function so precision
     /// args (`CAST(x AS NUMBER(|))`) and ordinary `AS` aliases never trigger it.
     fn cursor_is_after_cast_as(tokens: &[SqlToken], end: usize) -> bool {
-        // Stack entry = whether this open paren follows CAST/TREAT/XMLCAST.
+        // Stack entry = whether this open paren follows an `…(expr AS type)`
+        // function: CAST/TREAT/XMLCAST, plus XMLSERIALIZE (`XMLSERIALIZE(DOCUMENT
+        // x AS |)`) and VALIDATE_CONVERSION (`VALIDATE_CONVERSION(x AS |)`), which
+        // share the same `AS <type>` slot.
         let mut cast_paren_stack: Vec<bool> = Vec::new();
         let mut last_word: Option<&str> = None;
         for token in tokens.get(..end).unwrap_or(tokens) {
@@ -1919,6 +1998,8 @@ impl SqlEditorWidget {
                         word.eq_ignore_ascii_case("CAST")
                             || word.eq_ignore_ascii_case("TREAT")
                             || word.eq_ignore_ascii_case("XMLCAST")
+                            || word.eq_ignore_ascii_case("XMLSERIALIZE")
+                            || word.eq_ignore_ascii_case("VALIDATE_CONVERSION")
                     });
                     cast_paren_stack.push(follows_cast);
                     last_word = None;
@@ -1933,6 +2014,249 @@ impl SqlEditorWidget {
         }
         cast_paren_stack.last().copied().unwrap_or(false)
             && last_word.is_some_and(|word| word.eq_ignore_ascii_case("AS"))
+    }
+
+    /// The `EXTRACT(<field> FROM <source>)` argument slot at the cursor, if any.
+    /// The field slot accepts only a datetime field keyword (`YEAR`, `MONTH`, …),
+    /// never a column, so columns are suppressed and the dialect's field keywords
+    /// are offered there. Anchored on the innermost open paren following `EXTRACT`
+    /// and on `FROM` not yet appearing in that paren, so the source expression
+    /// (`EXTRACT(YEAR FROM |)`, a real column position) is left untouched.
+    fn extract_field_position(tokens: &[SqlToken], end: usize) -> Option<ExtractArgPosition> {
+        struct Frame {
+            follows_extract: bool,
+            seen_from: bool,
+        }
+        let mut stack: Vec<Frame> = Vec::new();
+        // Whether the token immediately before the cursor (within the open paren)
+        // is the paren itself — i.e. no field word has been typed yet.
+        let mut last_was_open_paren = false;
+        let mut last_word: Option<&str> = None;
+        for token in tokens.get(..end).unwrap_or(tokens) {
+            match token {
+                SqlToken::Comment(_) => {}
+                SqlToken::Symbol(sym) if sym == "(" => {
+                    let follows_extract =
+                        last_word.is_some_and(|word| word.eq_ignore_ascii_case("EXTRACT"));
+                    stack.push(Frame {
+                        follows_extract,
+                        seen_from: false,
+                    });
+                    last_word = None;
+                    last_was_open_paren = true;
+                }
+                SqlToken::Symbol(sym) if sym == ")" => {
+                    stack.pop();
+                    last_word = None;
+                    last_was_open_paren = false;
+                }
+                SqlToken::Word(word) => {
+                    if word.eq_ignore_ascii_case("FROM") {
+                        if let Some(top) = stack.last_mut() {
+                            top.seen_from = true;
+                        }
+                    }
+                    last_word = Some(word);
+                    last_was_open_paren = false;
+                }
+                _ => {
+                    last_word = None;
+                    last_was_open_paren = false;
+                }
+            }
+        }
+        match stack.last() {
+            Some(frame) if frame.follows_extract && !frame.seen_from => Some(if last_was_open_paren {
+                ExtractArgPosition::Field
+            } else {
+                ExtractArgPosition::AwaitingFrom
+            }),
+            _ => None,
+        }
+    }
+
+    fn extract_field_position_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> Option<ExtractArgPosition> {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::extract_field_position(tokens, end)
+    }
+
+    /// Datetime field keywords valid in `EXTRACT(<field> FROM …)` for the dialect.
+    fn extract_field_keywords_for(
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> &'static [&'static str] {
+        use crate::db::DatabaseType;
+
+        const ORACLE_FIELDS: &[&str] = &[
+            "YEAR",
+            "MONTH",
+            "DAY",
+            "HOUR",
+            "MINUTE",
+            "SECOND",
+            "TIMEZONE_HOUR",
+            "TIMEZONE_MINUTE",
+            "TIMEZONE_REGION",
+            "TIMEZONE_ABBR",
+        ];
+        const MYSQL_FIELDS: &[&str] = &[
+            "MICROSECOND",
+            "SECOND",
+            "MINUTE",
+            "HOUR",
+            "DAY",
+            "WEEK",
+            "MONTH",
+            "QUARTER",
+            "YEAR",
+            "SECOND_MICROSECOND",
+            "MINUTE_MICROSECOND",
+            "MINUTE_SECOND",
+            "HOUR_MICROSECOND",
+            "HOUR_SECOND",
+            "HOUR_MINUTE",
+            "DAY_MICROSECOND",
+            "DAY_SECOND",
+            "DAY_MINUTE",
+            "DAY_HOUR",
+            "YEAR_MONTH",
+        ];
+
+        match db_type {
+            Some(DatabaseType::MySQL) | Some(DatabaseType::MariaDB) => MYSQL_FIELDS,
+            _ => ORACLE_FIELDS,
+        }
+    }
+
+    fn is_interval_unit_word(word: &str) -> bool {
+        matches!(
+            word.to_ascii_uppercase().as_str(),
+            "YEAR" | "MONTH" | "DAY" | "HOUR" | "MINUTE" | "SECOND"
+        )
+    }
+
+    /// The interval-literal qualifier slot at the cursor, if any. An ANSI/Oracle
+    /// `INTERVAL '<value>' <unit> [TO <unit>]` literal carries its value inside
+    /// the string, so the qualifier that follows is keyword-only — a column is
+    /// never valid. Anchored on `INTERVAL` immediately followed by a string
+    /// literal, so MySQL's unquoted `INTERVAL <expr> <unit>` (where `<expr>` may
+    /// be a column) is deliberately left untouched. The rare precision-paren form
+    /// (`INTERVAL '5' DAY(2) TO …`) is not matched.
+    fn interval_unit_position(tokens: &[SqlToken], end: usize) -> Option<IntervalUnitSlot> {
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        let last = toks.len().checked_sub(1)?;
+        let is_interval = |idx: usize| {
+            matches!(toks.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("INTERVAL"))
+        };
+        let is_string = |idx: usize| matches!(toks.get(idx), Some(SqlToken::String(_)));
+        let is_unit =
+            |idx: usize| matches!(toks.get(idx), Some(SqlToken::Word(word)) if Self::is_interval_unit_word(word));
+        let is_to = |idx: usize| {
+            matches!(toks.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("TO"))
+        };
+
+        // `INTERVAL '<value>' |` -> leading qualifier unit.
+        if is_string(last) && last.checked_sub(1).is_some_and(is_interval) {
+            return Some(IntervalUnitSlot::Leading);
+        }
+        // `INTERVAL '<value>' <unit> |` -> only `TO` (or end) follows.
+        if is_unit(last)
+            && last.checked_sub(1).is_some_and(is_string)
+            && last.checked_sub(2).is_some_and(is_interval)
+        {
+            return Some(IntervalUnitSlot::AwaitingTo);
+        }
+        // `INTERVAL '<value>' <unit> TO |` -> trailing qualifier unit.
+        if is_to(last)
+            && last.checked_sub(1).is_some_and(is_unit)
+            && last.checked_sub(2).is_some_and(is_string)
+            && last.checked_sub(3).is_some_and(is_interval)
+        {
+            return Some(IntervalUnitSlot::Trailing);
+        }
+        None
+    }
+
+    fn interval_unit_position_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> Option<IntervalUnitSlot> {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::interval_unit_position(tokens, end)
+    }
+
+    /// Keyword set offered at an `INTERVAL` qualifier slot. `TO` and the trailing
+    /// units are Oracle-only (MySQL has no `TO` in an interval literal); the
+    /// leading slot offers the dialect's unit names.
+    fn interval_unit_keywords_for(
+        db_type: Option<crate::db::DatabaseType>,
+        slot: IntervalUnitSlot,
+    ) -> &'static [&'static str] {
+        use crate::db::DatabaseType;
+
+        const ORACLE_LEADING_UNITS: &[&str] =
+            &["YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"];
+        // Units valid after `TO`: `YEAR TO MONTH`, `DAY/HOUR/MINUTE TO {…SECOND}`.
+        const ORACLE_TRAILING_UNITS: &[&str] = &["MONTH", "HOUR", "MINUTE", "SECOND"];
+        const TO_KEYWORD: &[&str] = &["TO"];
+
+        let is_mysql = matches!(
+            db_type,
+            Some(DatabaseType::MySQL) | Some(DatabaseType::MariaDB)
+        );
+        match slot {
+            // MySQL's quoted interval reuses the same datetime unit names as
+            // EXTRACT (including compound units like `DAY_HOUR`).
+            IntervalUnitSlot::Leading if is_mysql => Self::extract_field_keywords_for(db_type),
+            IntervalUnitSlot::Leading => ORACLE_LEADING_UNITS,
+            // No `TO` qualifier in a MySQL interval — suppress columns but offer
+            // nothing rather than a wrong keyword.
+            IntervalUnitSlot::AwaitingTo if is_mysql => &[],
+            IntervalUnitSlot::AwaitingTo => TO_KEYWORD,
+            IntervalUnitSlot::Trailing => ORACLE_TRAILING_UNITS,
+        }
+    }
+
+    /// The single enumeration of cursor positions whose grammar is keyword- or
+    /// value-only, where a column is never valid and must be suppressed. Every
+    /// slot here has a matching keyword hint in `collect_expected_keyword_suggestions`;
+    /// keeping the list in one predicate is what prevents column suppression and
+    /// keyword emission from drifting apart as new slots are added. Note window
+    /// frames contribute only their pure-keyword slots (`UNBOUNDED |`/`CURRENT |`):
+    /// the value-bound slots (`ROWS |`, `BETWEEN |`) still accept an expression,
+    /// so they emit keywords without suppressing columns and are intentionally
+    /// absent here.
+    fn cursor_is_at_column_suppressing_keyword_slot(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> bool {
+        Self::data_type_position_for_context(deep_ctx, exclude_current_identifier_chain).is_some()
+            || Self::cursor_is_in_row_limiting_clause_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
+            || Self::cursor_is_at_window_frame_keyword_only_position_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
+            || Self::extract_field_position_for_context(deep_ctx, exclude_current_identifier_chain)
+                .is_some()
+            || Self::interval_unit_position_for_context(deep_ctx, exclude_current_identifier_chain)
+                .is_some()
     }
 
     /// True when the cursor is at the type slot of a column definition in
@@ -2190,7 +2514,21 @@ impl SqlEditorWidget {
         false
     }
 
-    fn cursor_is_at_row_count_position_for_context(
+    /// True when the cursor sits anywhere inside a row-limiting clause slot where
+    /// a column is never valid. This covers both the pure value slots handled by
+    /// `cursor_is_at_row_count_position` (`LIMIT |`, `OFFSET |`, `LIMIT off, |`)
+    /// and every `FETCH FIRST|NEXT …` / `OFFSET <count> …` slot recognized by
+    /// `expected_row_limiting_keyword_candidates` (`FETCH FIRST |`, `FETCH NEXT
+    /// <count> |`, `… ROWS |`, `… PERCENT |`, `… ROWS WITH |`, `OFFSET <count>
+    /// |`). The phase machine collapses all of these onto `OrderByClause`
+    /// (a column context), so without this gate the row-limiting tail would
+    /// wrongly offer columns alongside the row-limiting keyword hints.
+    fn cursor_is_in_row_limiting_clause(tokens: &[SqlToken], end: usize) -> bool {
+        Self::cursor_is_at_row_count_position(tokens, end)
+            || Self::expected_row_limiting_keyword_candidates(tokens, end).is_some()
+    }
+
+    fn cursor_is_in_row_limiting_clause_for_context(
         deep_ctx: &intellisense_context::CursorContext,
         exclude_current_identifier_chain: bool,
     ) -> bool {
@@ -2201,7 +2539,7 @@ impl SqlEditorWidget {
             cursor_token_len,
             exclude_current_identifier_chain,
         );
-        Self::cursor_is_at_row_count_position(tokens, end)
+        Self::cursor_is_in_row_limiting_clause(tokens, end)
     }
 
     fn previous_meaningful_words_with_bind_markers_upper(
@@ -2234,6 +2572,26 @@ impl SqlEditorWidget {
         }
         words_rev.reverse();
         words_rev
+    }
+
+    /// True when the last meaningful token before `end` is a Word that is a
+    /// qualified member — immediately preceded by `.`, e.g. the `order` in
+    /// `t.order`. Such a word is unambiguously a column reference, so a dual-use
+    /// clause keyword (`ORDER BY`, `GROUP BY`, `CONNECT BY`, `START WITH`) can
+    /// never follow it and its continuation keyword must not be offered. (These
+    /// words are reserved, so a bare unqualified use is not valid SQL; the
+    /// qualified `t.order ` form — note the trailing space routes here rather than
+    /// through qualified-member completion — is the only real-SQL misfire.)
+    fn trigger_word_is_qualified_member(tokens: &[SqlToken], end: usize) -> bool {
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        let last = match toks.len() {
+            0 => return false,
+            n => n - 1,
+        };
+        if last == 0 || !matches!(toks.get(last), Some(SqlToken::Word(_))) {
+            return false;
+        }
+        matches!(toks.get(last - 1), Some(SqlToken::Symbol(sym)) if sym == ".")
     }
 
     fn word_is_preceded_by_bind_colon(tokens: &[SqlToken], word_idx: usize) -> bool {
@@ -2442,6 +2800,40 @@ impl SqlEditorWidget {
             || crate::ui::intellisense::suggestion_matches_completion_prefix(suggestion, prefix)
     }
 
+    /// True when the active query's leading keyword is `MERGE`, i.e. the cursor
+    /// is inside a MERGE statement (or its merge-action clauses). Used to gate
+    /// the `WHEN MATCHED`/`WHEN NOT MATCHED` keyword hints, which are MERGE-only:
+    /// a `CASE WHEN |` branch in a SELECT/PL-SQL block must not offer `MATCHED`.
+    fn statement_is_merge(tokens: &[SqlToken]) -> bool {
+        tokens
+            .iter()
+            .find_map(|token| match token {
+                SqlToken::Comment(_) => None,
+                SqlToken::Word(word) => Some(word.eq_ignore_ascii_case("MERGE")),
+                _ => Some(false),
+            })
+            .unwrap_or(false)
+    }
+
+    /// True when the cursor sits inside an unclosed `CASE … END` expression. A
+    /// MERGE statement is pure SQL, so any `CASE` here is a value expression that
+    /// closes with a bare `END` (never PL/SQL's `END CASE`/`END IF`), making a
+    /// plain `CASE`/`END` balance exact. This keeps `MERGE … SET c = CASE WHEN |`
+    /// from being mistaken for a `WHEN MATCHED` merge-action slot.
+    fn cursor_is_inside_unclosed_case(tokens: &[SqlToken], end: usize) -> bool {
+        let mut case_depth: usize = 0;
+        for token in tokens.get(..end).unwrap_or(tokens) {
+            if let SqlToken::Word(word) = token {
+                if word.eq_ignore_ascii_case("CASE") {
+                    case_depth += 1;
+                } else if word.eq_ignore_ascii_case("END") {
+                    case_depth = case_depth.saturating_sub(1);
+                }
+            }
+        }
+        case_depth > 0
+    }
+
     fn collect_expected_keyword_suggestions(
         prefix: &str,
         deep_ctx: &intellisense_context::CursorContext,
@@ -2584,6 +2976,26 @@ impl SqlEditorWidget {
             );
         }
 
+        match Self::extract_field_position(tokens, context_end) {
+            Some(ExtractArgPosition::Field) => {
+                return Self::filter_expected_candidates(
+                    prefix,
+                    Self::extract_field_keywords_for(db_type),
+                );
+            }
+            Some(ExtractArgPosition::AwaitingFrom) => {
+                return Self::filter_expected_candidates(prefix, &["FROM"]);
+            }
+            None => {}
+        }
+
+        if let Some(slot) = Self::interval_unit_position(tokens, context_end) {
+            return Self::filter_expected_candidates(
+                prefix,
+                Self::interval_unit_keywords_for(db_type, slot),
+            );
+        }
+
         let words = Self::previous_meaningful_words_upper(tokens, context_end, 6);
         if let Some(candidates) = Self::expected_database_link_keyword_candidates(&words) {
             return Self::filter_expected_candidates(prefix, candidates);
@@ -2595,19 +3007,42 @@ impl SqlEditorWidget {
             return Self::filter_expected_candidates(prefix, candidates);
         }
 
+        // `WHEN [NOT] MATCHED` is a MERGE-only merge-action slot. Restrict it to a
+        // MERGE statement whose `WHEN` is not nested in a `CASE … END`, so a
+        // `CASE WHEN |` / `CASE WHEN NOT |` branch never offers `MATCHED`.
+        let at_merge_when = Self::statement_is_merge(tokens)
+            && !Self::cursor_is_inside_unclosed_case(tokens, context_end);
+
+        // A join continuation (`LEFT|RIGHT|FULL|INNER|CROSS|NATURAL JOIN`) is only
+        // grammatical in a table position. Gating on the phase keeps a column or
+        // function named `left`/`right`/… (`SELECT left |`, `WHERE right |`) from
+        // wrongly offering `JOIN`, while `FROM a LEFT |` stays in `FromClause`.
+        let in_table_context = deep_ctx.phase.is_table_context();
+        // A dual-use clause keyword (`ORDER`/`GROUP`/`CONNECT`/`START`) used as a
+        // qualified member (`t.order `, `t.start `) is a column, so its `BY`/`WITH`
+        // continuation must not be offered.
+        let trigger_is_qualified_member =
+            Self::trigger_word_is_qualified_member(tokens, context_end);
+
         let candidates: &[&str] = match words.as_slice() {
             [] => TOP_LEVEL_KEYWORDS,
             _ if Self::is_create_synonym_name_written_context(&words) => &["FOR"],
-            [.., last] if *last == "ORDER" || *last == "GROUP" || *last == "CONNECT" => &["BY"],
+            [.., last]
+                if !trigger_is_qualified_member
+                    && (*last == "ORDER" || *last == "GROUP" || *last == "CONNECT") =>
+            {
+                &["BY"]
+            }
             [.., prev, last] if *prev == "ORDER" && *last == "SIBLINGS" => &["BY"],
-            [.., last] if *last == "START" => &["WITH"],
+            [.., last] if !trigger_is_qualified_member && *last == "START" => &["WITH"],
             [.., last] if *last == "DELETE" => &["FROM"],
             [.., last] if *last == "INSERT" || *last == "MERGE" => &["INTO"],
             [.., last]
-                if matches!(
-                    last.as_str(),
-                    "LEFT" | "RIGHT" | "FULL" | "INNER" | "CROSS" | "NATURAL"
-                ) =>
+                if in_table_context
+                    && matches!(
+                        last.as_str(),
+                        "LEFT" | "RIGHT" | "FULL" | "INNER" | "CROSS" | "NATURAL"
+                    ) =>
             {
                 &["JOIN"]
             }
@@ -2710,8 +3145,10 @@ impl SqlEditorWidget {
             }
             [.., last] if *last == "COMMENT" => &["ON"],
             [.., last] if *last == "EXECUTE" => &["IMMEDIATE"],
-            [.., last] if *last == "WHEN" => &["MATCHED", "NOT"],
-            [.., prev, last] if *prev == "WHEN" && *last == "NOT" => &["MATCHED"],
+            [.., last] if *last == "WHEN" && at_merge_when => &["MATCHED", "NOT"],
+            [.., prev, last] if *prev == "WHEN" && *last == "NOT" && at_merge_when => {
+                &["MATCHED"]
+            }
             [.., prev, last] if *prev == "CREATE" && *last == "OR" => &["REPLACE"],
             _ => {
                 if deep_ctx.cursor_token_len == 0 {
