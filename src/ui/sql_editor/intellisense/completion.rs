@@ -138,6 +138,237 @@ impl ClauseCompletionPolicy {
     }
 }
 
+/// Datetime field keywords valid in `EXTRACT(<field> FROM …)` for the dialect.
+fn extract_field_keywords_for(
+    db_type: Option<crate::db::DatabaseType>,
+) -> &'static [&'static str] {
+    use crate::db::DatabaseType;
+
+    const ORACLE_FIELDS: &[&str] = &[
+        "YEAR",
+        "MONTH",
+        "DAY",
+        "HOUR",
+        "MINUTE",
+        "SECOND",
+        "TIMEZONE_HOUR",
+        "TIMEZONE_MINUTE",
+        "TIMEZONE_REGION",
+        "TIMEZONE_ABBR",
+    ];
+    const MYSQL_FIELDS: &[&str] = &[
+        "MICROSECOND",
+        "SECOND",
+        "MINUTE",
+        "HOUR",
+        "DAY",
+        "WEEK",
+        "MONTH",
+        "QUARTER",
+        "YEAR",
+        "SECOND_MICROSECOND",
+        "MINUTE_MICROSECOND",
+        "MINUTE_SECOND",
+        "HOUR_MICROSECOND",
+        "HOUR_SECOND",
+        "HOUR_MINUTE",
+        "DAY_MICROSECOND",
+        "DAY_SECOND",
+        "DAY_MINUTE",
+        "DAY_HOUR",
+        "YEAR_MONTH",
+    ];
+
+    match db_type {
+        None => ORACLE_FIELDS,
+        Some(DatabaseType::Oracle) => ORACLE_FIELDS,
+        Some(DatabaseType::MySQL) => MYSQL_FIELDS,
+        Some(DatabaseType::MariaDB) => MYSQL_FIELDS,
+    }
+}
+
+/// Keyword set offered at an `INTERVAL` qualifier slot. `TO` and the trailing
+/// units are Oracle-only (MySQL has no `TO` in an interval literal); the
+/// leading slot offers the dialect's unit names.
+fn interval_unit_keywords_for(
+    db_type: Option<crate::db::DatabaseType>,
+    slot: IntervalUnitSlot,
+) -> &'static [&'static str] {
+    use crate::db::DatabaseType;
+
+    const ORACLE_LEADING_UNITS: &[&str] = &["YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"];
+    // Units valid after `TO`: `YEAR TO MONTH`, `DAY/HOUR/MINUTE TO {…SECOND}`.
+    const ORACLE_TRAILING_UNITS: &[&str] = &["MONTH", "HOUR", "MINUTE", "SECOND"];
+    const TO_KEYWORD: &[&str] = &["TO"];
+
+    match slot {
+        IntervalUnitSlot::Leading => match db_type {
+            None => ORACLE_LEADING_UNITS,
+            Some(DatabaseType::Oracle) => ORACLE_LEADING_UNITS,
+            // MySQL's quoted interval reuses the same datetime unit names as
+            // EXTRACT (including compound units like `DAY_HOUR`).
+            Some(DatabaseType::MySQL) => extract_field_keywords_for(db_type),
+            Some(DatabaseType::MariaDB) => extract_field_keywords_for(db_type),
+        },
+        IntervalUnitSlot::AwaitingTo => match db_type {
+            None => TO_KEYWORD,
+            Some(DatabaseType::Oracle) => TO_KEYWORD,
+            // No `TO` qualifier in a MySQL interval — suppress columns but offer
+            // nothing rather than a wrong keyword.
+            Some(DatabaseType::MySQL) => &[],
+            Some(DatabaseType::MariaDB) => &[],
+        },
+        IntervalUnitSlot::Trailing => ORACLE_TRAILING_UNITS,
+    }
+}
+
+/// Data-type keyword set for a dialect and position. MySQL/MariaDB restrict
+/// the `CAST(... AS type)` grammar to a subset, so that position differs from
+/// a full column definition; Oracle uses one list for both.
+fn data_type_keywords_for(
+    db_type: Option<crate::db::DatabaseType>,
+    position: DataTypePosition,
+) -> &'static [&'static str] {
+    use crate::db::DatabaseType;
+
+    match db_type {
+        None => oracle_data_type_keywords(position),
+        Some(DatabaseType::Oracle) => oracle_data_type_keywords(position),
+        Some(DatabaseType::MySQL) => mysql_data_type_keywords(position),
+        Some(DatabaseType::MariaDB) => mysql_data_type_keywords(position),
+    }
+}
+
+fn oracle_data_type_keywords(position: DataTypePosition) -> &'static [&'static str] {
+    const ORACLE_TYPES: &[&str] = &[
+        "VARCHAR2",
+        "NVARCHAR2",
+        "CHAR",
+        "NCHAR",
+        "NUMBER",
+        "FLOAT",
+        "BINARY_FLOAT",
+        "BINARY_DOUBLE",
+        "DATE",
+        "TIMESTAMP",
+        "INTERVAL",
+        "CLOB",
+        "NCLOB",
+        "BLOB",
+        "BFILE",
+        "RAW",
+        "LONG",
+        "ROWID",
+        "UROWID",
+        "XMLTYPE",
+        "JSON",
+        "BOOLEAN",
+        "INTEGER",
+        "INT",
+        "SMALLINT",
+        "DECIMAL",
+        "NUMERIC",
+        "REAL",
+    ];
+    // PL/SQL adds a handful of types that exist only in stored code.
+    const ORACLE_PLSQL_TYPES: &[&str] = &[
+        "VARCHAR2",
+        "NVARCHAR2",
+        "CHAR",
+        "NCHAR",
+        "NUMBER",
+        "PLS_INTEGER",
+        "BINARY_INTEGER",
+        "SIMPLE_INTEGER",
+        "BINARY_FLOAT",
+        "BINARY_DOUBLE",
+        "FLOAT",
+        "DATE",
+        "TIMESTAMP",
+        "INTERVAL",
+        "CLOB",
+        "NCLOB",
+        "BLOB",
+        "BFILE",
+        "RAW",
+        "ROWID",
+        "UROWID",
+        "XMLTYPE",
+        "BOOLEAN",
+        "INTEGER",
+        "INT",
+        "SMALLINT",
+        "DECIMAL",
+        "NUMERIC",
+        "REAL",
+        "SYS_REFCURSOR",
+    ];
+
+    match position {
+        DataTypePosition::Plsql => ORACLE_PLSQL_TYPES,
+        _ => ORACLE_TYPES,
+    }
+}
+
+fn mysql_data_type_keywords(position: DataTypePosition) -> &'static [&'static str] {
+    const MYSQL_COLUMN_TYPES: &[&str] = &[
+        "TINYINT",
+        "SMALLINT",
+        "MEDIUMINT",
+        "INT",
+        "INTEGER",
+        "BIGINT",
+        "DECIMAL",
+        "NUMERIC",
+        "FLOAT",
+        "DOUBLE",
+        "BIT",
+        "BOOLEAN",
+        "CHAR",
+        "VARCHAR",
+        "BINARY",
+        "VARBINARY",
+        "TINYBLOB",
+        "BLOB",
+        "MEDIUMBLOB",
+        "LONGBLOB",
+        "TINYTEXT",
+        "TEXT",
+        "MEDIUMTEXT",
+        "LONGTEXT",
+        "ENUM",
+        "SET",
+        "DATE",
+        "DATETIME",
+        "TIMESTAMP",
+        "TIME",
+        "YEAR",
+        "JSON",
+    ];
+    // The grammar that `CAST(expr AS type)` accepts in MySQL/MariaDB.
+    const MYSQL_CAST_TYPES: &[&str] = &[
+        "BINARY",
+        "CHAR",
+        "DATE",
+        "DATETIME",
+        "DECIMAL",
+        "DOUBLE",
+        "FLOAT",
+        "JSON",
+        "NCHAR",
+        "REAL",
+        "SIGNED",
+        "TIME",
+        "UNSIGNED",
+        "YEAR",
+    ];
+
+    match position {
+        DataTypePosition::Cast => MYSQL_CAST_TYPES,
+        DataTypePosition::ColumnDef | DataTypePosition::Plsql => MYSQL_COLUMN_TYPES,
+    }
+}
+
 impl SqlEditorWidget {
     fn context_suppresses_completion(context: SqlContext) -> bool {
         matches!(context, SqlContext::GeneratedName)
@@ -1991,10 +2222,9 @@ impl SqlEditorWidget {
                             }
                         }
                         "BEGIN" => {
-                            if matches!(block_stack.last(), Some(true)) {
-                                *block_stack.last_mut().unwrap() = false;
-                            } else {
-                                block_stack.push(false);
+                            match block_stack.last_mut() {
+                                Some(top) if *top => *top = false,
+                                _ => block_stack.push(false),
                             }
                             pending_routine_header = false;
                         }
@@ -2119,53 +2349,6 @@ impl SqlEditorWidget {
         Self::extract_field_position(tokens, end)
     }
 
-    /// Datetime field keywords valid in `EXTRACT(<field> FROM …)` for the dialect.
-    fn extract_field_keywords_for(
-        db_type: Option<crate::db::DatabaseType>,
-    ) -> &'static [&'static str] {
-        use crate::db::DatabaseType;
-
-        const ORACLE_FIELDS: &[&str] = &[
-            "YEAR",
-            "MONTH",
-            "DAY",
-            "HOUR",
-            "MINUTE",
-            "SECOND",
-            "TIMEZONE_HOUR",
-            "TIMEZONE_MINUTE",
-            "TIMEZONE_REGION",
-            "TIMEZONE_ABBR",
-        ];
-        const MYSQL_FIELDS: &[&str] = &[
-            "MICROSECOND",
-            "SECOND",
-            "MINUTE",
-            "HOUR",
-            "DAY",
-            "WEEK",
-            "MONTH",
-            "QUARTER",
-            "YEAR",
-            "SECOND_MICROSECOND",
-            "MINUTE_MICROSECOND",
-            "MINUTE_SECOND",
-            "HOUR_MICROSECOND",
-            "HOUR_SECOND",
-            "HOUR_MINUTE",
-            "DAY_MICROSECOND",
-            "DAY_SECOND",
-            "DAY_MINUTE",
-            "DAY_HOUR",
-            "YEAR_MONTH",
-        ];
-
-        match db_type {
-            Some(DatabaseType::MySQL) | Some(DatabaseType::MariaDB) => MYSQL_FIELDS,
-            _ => ORACLE_FIELDS,
-        }
-    }
-
     fn is_interval_unit_word(word: &str) -> bool {
         matches!(
             word.to_ascii_uppercase().as_str(),
@@ -2227,38 +2410,6 @@ impl SqlEditorWidget {
             exclude_current_identifier_chain,
         );
         Self::interval_unit_position(tokens, end)
-    }
-
-    /// Keyword set offered at an `INTERVAL` qualifier slot. `TO` and the trailing
-    /// units are Oracle-only (MySQL has no `TO` in an interval literal); the
-    /// leading slot offers the dialect's unit names.
-    fn interval_unit_keywords_for(
-        db_type: Option<crate::db::DatabaseType>,
-        slot: IntervalUnitSlot,
-    ) -> &'static [&'static str] {
-        use crate::db::DatabaseType;
-
-        const ORACLE_LEADING_UNITS: &[&str] =
-            &["YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"];
-        // Units valid after `TO`: `YEAR TO MONTH`, `DAY/HOUR/MINUTE TO {…SECOND}`.
-        const ORACLE_TRAILING_UNITS: &[&str] = &["MONTH", "HOUR", "MINUTE", "SECOND"];
-        const TO_KEYWORD: &[&str] = &["TO"];
-
-        let is_mysql = matches!(
-            db_type,
-            Some(DatabaseType::MySQL) | Some(DatabaseType::MariaDB)
-        );
-        match slot {
-            // MySQL's quoted interval reuses the same datetime unit names as
-            // EXTRACT (including compound units like `DAY_HOUR`).
-            IntervalUnitSlot::Leading if is_mysql => Self::extract_field_keywords_for(db_type),
-            IntervalUnitSlot::Leading => ORACLE_LEADING_UNITS,
-            // No `TO` qualifier in a MySQL interval — suppress columns but offer
-            // nothing rather than a wrong keyword.
-            IntervalUnitSlot::AwaitingTo if is_mysql => &[],
-            IntervalUnitSlot::AwaitingTo => TO_KEYWORD,
-            IntervalUnitSlot::Trailing => ORACLE_TRAILING_UNITS,
-        }
     }
 
     /// The single enumeration of cursor positions whose grammar is keyword- or
@@ -2657,143 +2808,6 @@ impl SqlEditorWidget {
         }
 
         false
-    }
-
-    /// Data-type keyword set for a dialect and position. MySQL/MariaDB restrict
-    /// the `CAST(... AS type)` grammar to a subset, so that position differs from
-    /// a full column definition; Oracle uses one list for both.
-    fn data_type_keywords_for(
-        db_type: Option<crate::db::DatabaseType>,
-        position: DataTypePosition,
-    ) -> &'static [&'static str] {
-        use crate::db::DatabaseType;
-
-        const ORACLE_TYPES: &[&str] = &[
-            "VARCHAR2",
-            "NVARCHAR2",
-            "CHAR",
-            "NCHAR",
-            "NUMBER",
-            "FLOAT",
-            "BINARY_FLOAT",
-            "BINARY_DOUBLE",
-            "DATE",
-            "TIMESTAMP",
-            "INTERVAL",
-            "CLOB",
-            "NCLOB",
-            "BLOB",
-            "BFILE",
-            "RAW",
-            "LONG",
-            "ROWID",
-            "UROWID",
-            "XMLTYPE",
-            "JSON",
-            "BOOLEAN",
-            "INTEGER",
-            "INT",
-            "SMALLINT",
-            "DECIMAL",
-            "NUMERIC",
-            "REAL",
-        ];
-        const MYSQL_COLUMN_TYPES: &[&str] = &[
-            "TINYINT",
-            "SMALLINT",
-            "MEDIUMINT",
-            "INT",
-            "INTEGER",
-            "BIGINT",
-            "DECIMAL",
-            "NUMERIC",
-            "FLOAT",
-            "DOUBLE",
-            "BIT",
-            "BOOLEAN",
-            "CHAR",
-            "VARCHAR",
-            "BINARY",
-            "VARBINARY",
-            "TINYBLOB",
-            "BLOB",
-            "MEDIUMBLOB",
-            "LONGBLOB",
-            "TINYTEXT",
-            "TEXT",
-            "MEDIUMTEXT",
-            "LONGTEXT",
-            "ENUM",
-            "SET",
-            "DATE",
-            "DATETIME",
-            "TIMESTAMP",
-            "TIME",
-            "YEAR",
-            "JSON",
-        ];
-        // The grammar that `CAST(expr AS type)` accepts in MySQL/MariaDB.
-        const MYSQL_CAST_TYPES: &[&str] = &[
-            "BINARY",
-            "CHAR",
-            "DATE",
-            "DATETIME",
-            "DECIMAL",
-            "DOUBLE",
-            "FLOAT",
-            "JSON",
-            "NCHAR",
-            "REAL",
-            "SIGNED",
-            "TIME",
-            "UNSIGNED",
-            "YEAR",
-        ];
-
-        // PL/SQL adds a handful of types that exist only in stored code.
-        const ORACLE_PLSQL_TYPES: &[&str] = &[
-            "VARCHAR2",
-            "NVARCHAR2",
-            "CHAR",
-            "NCHAR",
-            "NUMBER",
-            "PLS_INTEGER",
-            "BINARY_INTEGER",
-            "SIMPLE_INTEGER",
-            "BINARY_FLOAT",
-            "BINARY_DOUBLE",
-            "FLOAT",
-            "DATE",
-            "TIMESTAMP",
-            "INTERVAL",
-            "CLOB",
-            "NCLOB",
-            "BLOB",
-            "BFILE",
-            "RAW",
-            "ROWID",
-            "UROWID",
-            "XMLTYPE",
-            "BOOLEAN",
-            "INTEGER",
-            "INT",
-            "SMALLINT",
-            "DECIMAL",
-            "NUMERIC",
-            "REAL",
-            "SYS_REFCURSOR",
-        ];
-
-        match db_type.unwrap_or(DatabaseType::Oracle) {
-            DatabaseType::Oracle => match position {
-                DataTypePosition::Plsql => ORACLE_PLSQL_TYPES,
-                _ => ORACLE_TYPES,
-            },
-            DatabaseType::MySQL | DatabaseType::MariaDB => match position {
-                DataTypePosition::Cast => MYSQL_CAST_TYPES,
-                DataTypePosition::ColumnDef | DataTypePosition::Plsql => MYSQL_COLUMN_TYPES,
-            },
-        }
     }
 
     /// Whether the cursor in `deep_ctx` is at a data-type position (used to both
@@ -3296,7 +3310,7 @@ impl SqlEditorWidget {
         if let Some(position) = Self::data_type_position(tokens, context_end) {
             return Self::filter_expected_candidates(
                 prefix,
-                Self::data_type_keywords_for(db_type, position),
+                data_type_keywords_for(db_type, position),
             );
         }
 
@@ -3304,7 +3318,7 @@ impl SqlEditorWidget {
             Some(ExtractArgPosition::Field) => {
                 return Self::filter_expected_candidates(
                     prefix,
-                    Self::extract_field_keywords_for(db_type),
+                    extract_field_keywords_for(db_type),
                 );
             }
             Some(ExtractArgPosition::AwaitingFrom) => {
@@ -3316,7 +3330,7 @@ impl SqlEditorWidget {
         if let Some(slot) = Self::interval_unit_position(tokens, context_end) {
             return Self::filter_expected_candidates(
                 prefix,
-                Self::interval_unit_keywords_for(db_type, slot),
+                interval_unit_keywords_for(db_type, slot),
             );
         }
 

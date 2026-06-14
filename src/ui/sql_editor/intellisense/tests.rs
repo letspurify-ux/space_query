@@ -20108,7 +20108,6 @@ fn data_type_table_named_columns_is_not_a_type_position() {
 
 #[test]
 fn data_type_prior_statement_does_not_leak_into_next() {
-    use crate::db::DatabaseType::Oracle;
     // A PL/SQL or DDL statement before the cursor's statement must not push its
     // declaration/routine/column context into the next statement.
     for sql in [

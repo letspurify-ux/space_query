@@ -692,6 +692,9 @@ const UI_DATABASE_TYPE_REGISTRY_FUNCTIONS: &[&str] = &[
     "language_catalog_for_db_type",
     "function_catalog_for_db_type",
     "mysql_compatible_highlight_mode",
+    "extract_field_keywords_for",
+    "interval_unit_keywords_for",
+    "data_type_keywords_for",
 ];
 
 fn ui_database_type_registry_function(name: &str) -> bool {
@@ -2229,6 +2232,14 @@ const BACKEND_REGISTRY_FILES: &[(&str, &[&str])] = &[
     (
         "src/ui/sql_editor/intellisense/helpers.rs",
         &["column_load_backend_for"],
+    ),
+    (
+        "src/ui/sql_editor/intellisense/completion.rs",
+        &[
+            "extract_field_keywords_for",
+            "interval_unit_keywords_for",
+            "data_type_keywords_for",
+        ],
     ),
     ("src/ui/object_browser.rs", &["object_browser_behavior_for"]),
     ("src/ui/intellisense.rs", &["language_catalog_for_db_type"]),
