@@ -2727,14 +2727,25 @@ impl IntellisenseData {
 
     /// Fuzzy (ordered-subsequence) relevance score for a candidate that is *not*
     /// a plain prefix match. Lower is better. Returns `None` when `needle_upper`
-    /// is not an ordered subsequence of `haystack_upper`. Callers exclude empty
-    /// needles and prefix matches before calling. Contiguous (substring) and
-    /// word-boundary aligned matches rank ahead of scattered ones.
+    /// is not an *acceptable* ordered subsequence of `haystack_upper`. Callers
+    /// exclude empty needles and prefix matches before calling. Contiguous
+    /// (substring) and word-boundary aligned matches rank ahead of scattered
+    /// ones.
+    ///
+    /// Acceptance is deliberately tighter than "is a subsequence": a gapped
+    /// match is only accepted when its first matched character sits on a word
+    /// boundary (start of name or after `_`/space/`.`/`$`/`#`). This keeps
+    /// abbreviation/CamelHump matches (`dept`→`DEPARTMENT`, `eid`→`EMPLOYEE_ID`,
+    /// `custord`→`CUSTOMER_ORDERS`) while rejecting mid-word scattered noise
+    /// (`he`→`WAREHOUSE`), which otherwise floods short prefixes with names that
+    /// have no visible relationship to what was typed. A contiguous substring
+    /// (`emp`→`TEMPLATE_ID`) is always accepted, anchored or not.
     fn subsequence_match_score(haystack_upper: &str, needle_upper: &str) -> Option<i32> {
         let haystack = haystack_upper.as_bytes();
         let needle = needle_upper.as_bytes();
         let mut hi = 0usize;
         let mut first: Option<usize> = None;
+        let mut first_at_boundary = false;
         let mut prev: Option<usize> = None;
         let mut gaps = 0i32;
         let mut boundary_hits = 0i32;
@@ -2742,11 +2753,12 @@ impl IntellisenseData {
             let mut matched = false;
             while hi < haystack.len() {
                 if haystack[hi] == nb {
-                    if first.is_none() {
-                        first = Some(hi);
-                    }
                     let at_boundary =
                         hi == 0 || matches!(haystack[hi - 1], b'_' | b' ' | b'.' | b'$' | b'#');
+                    if first.is_none() {
+                        first = Some(hi);
+                        first_at_boundary = at_boundary;
+                    }
                     if at_boundary {
                         boundary_hits += 1;
                     }
@@ -2765,6 +2777,11 @@ impl IntellisenseData {
             if !matched {
                 return None;
             }
+        }
+        // Reject mid-word scattered matches: a gapped match must begin on a word
+        // boundary. Contiguous substrings (no gaps) are always allowed.
+        if gaps > 0 && !first_at_boundary {
+            return None;
         }
         let start = first.unwrap_or(0) as i32;
         Some(
@@ -4507,6 +4524,50 @@ mod intellisense_tests {
         // No ordered subsequence "X","Y","Z" exists in either column.
         let suggestions = data.get_column_suggestions("xyz", Some(&scope));
         assert!(suggestions.is_empty(), "got {:?}", suggestions);
+    }
+
+    #[test]
+    fn fuzzy_rejects_mid_word_scattered_relations() {
+        // `from he|` must stay related to "he": names where "he" only occurs as a
+        // mid-word scattered subsequence (WAREHOUSE: ware-H-ous-E) are noise and
+        // must not surface. A boundary-anchored or contiguous "he" still matches.
+        let mut data = IntellisenseData::new();
+        data.tables = vec![
+            "WAREHOUSE".to_string(),
+            "THRESHOLD".to_string(),
+            "PURCHASE_LOG".to_string(),
+            "HEADER".to_string(),
+            "HIRE_EVENTS".to_string(),
+        ];
+        data.rebuild_indices();
+
+        let suggestions = data.get_relation_suggestions("he");
+
+        assert!(
+            suggestions.iter().any(|s| s == "HEADER"),
+            "prefix match must remain: {:?}",
+            suggestions
+        );
+        assert!(
+            suggestions.iter().any(|s| s == "HIRE_EVENTS"),
+            "boundary-anchored fuzzy (H...E) must remain: {:?}",
+            suggestions
+        );
+        assert!(
+            !suggestions.iter().any(|s| s == "WAREHOUSE"),
+            "mid-word scattered match must be rejected: {:?}",
+            suggestions
+        );
+        assert!(
+            !suggestions.iter().any(|s| s == "THRESHOLD"),
+            "mid-word scattered match must be rejected: {:?}",
+            suggestions
+        );
+        assert!(
+            !suggestions.iter().any(|s| s == "PURCHASE_LOG"),
+            "mid-word scattered match must be rejected: {:?}",
+            suggestions
+        );
     }
 
     #[test]
