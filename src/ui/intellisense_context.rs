@@ -436,7 +436,26 @@ pub(crate) fn analyze_cursor_context_arc(
     let mut phase = parse_result.phase;
     let mut focused_tables = parse_result.focused_tables;
     let mut ddl_new_name_position = false;
-    if let Some(source) = subquery_alias_column_list_source_at_cursor(
+    if let Some(target) =
+        ddl_definition_list_target(statement_tokens.as_ref(), clamped_cursor_token_len)
+    {
+        // Parenthesised DDL table-definition lists (`CREATE TABLE (...)`,
+        // `ALTER TABLE t ADD (...)`, and their `… KEY (...)` / `REFERENCES x (...)`
+        // sub-lists). A new column/constraint name suppresses identifiers; a
+        // constraint/reference column list resolves to the target table's
+        // existing columns. The generic DML machine otherwise leaves these as a
+        // table target (offering relations) or a derived-alias list (offering the
+        // wrong table's columns).
+        match target {
+            DdlDefinitionTarget::NewName => {
+                ddl_new_name_position = true;
+            }
+            DdlDefinitionTarget::ExistingColumns(table) => {
+                phase = SqlPhase::DdlColumnList;
+                focused_tables = vec![table];
+            }
+        }
+    } else if let Some(source) = subquery_alias_column_list_source_at_cursor(
         &table_analysis.subqueries,
         clamped_cursor_token_len,
     ) {
@@ -616,6 +635,10 @@ fn ddl_alter_table_introduces_new_name(tokens: &[SqlToken], cursor_token_len: us
     let mut op: Option<&str> = None;
     let mut saw_references = false;
     let mut saw_to = false;
+    // For MySQL `CHANGE [COLUMN] old_name new_name …`: whether the source column
+    // name has been passed, after which the cursor is at the new-name/data-type
+    // position rather than the (existing) source column.
+    let mut change_source_seen = false;
     for token in &sig[after_table..] {
         if token_is_symbol(token, "(") {
             depth += 1;
@@ -631,6 +654,7 @@ fn ddl_alter_table_introduces_new_name(tokens: &[SqlToken], cursor_token_len: us
         if token_is_symbol(token, ",") {
             saw_references = false;
             saw_to = false;
+            change_source_seen = false;
             continue;
         }
         if let SqlToken::Word(word) = token {
@@ -639,14 +663,22 @@ fn ddl_alter_table_introduces_new_name(tokens: &[SqlToken], cursor_token_len: us
                     op = Some(match kw {
                         "ADD" => "ADD",
                         "RENAME" => "RENAME",
+                        "CHANGE" => "CHANGE",
                         _ => "OTHER",
                     });
                     saw_references = false;
                     saw_to = false;
+                    change_source_seen = false;
                 }
                 "REFERENCES" => saw_references = true,
                 "TO" => saw_to = true,
-                _ => {}
+                // The optional `COLUMN` keyword precedes the source name.
+                "COLUMN" => {}
+                _ => {
+                    if op == Some("CHANGE") {
+                        change_source_seen = true;
+                    }
+                }
             }
         }
     }
@@ -662,7 +694,213 @@ fn ddl_alter_table_introduces_new_name(tokens: &[SqlToken], cursor_token_len: us
         Some("ADD") => !saw_references,
         // `RENAME [COLUMN x] TO <newname>` introduces a new name after `TO`.
         Some("RENAME") => saw_to,
+        // `CHANGE [COLUMN] old new …`: once the source column is named, the rest
+        // of the clause is the new name and its data type.
+        Some("CHANGE") => change_source_seen,
         _ => false,
+    }
+}
+
+/// The kind of position the cursor occupies inside a parenthesised DDL
+/// table-definition list (`CREATE TABLE (...)` or `ALTER TABLE … ADD …`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DdlDefinitionTarget {
+    /// A brand-new column or constraint name — never an existing relation or
+    /// column, so identifier suggestions are suppressed.
+    NewName,
+    /// A constraint / `REFERENCES` column-reference list. The named table's
+    /// existing columns are the only valid completions (the referenced table for
+    /// `REFERENCES x (…)`, otherwise the table being altered/created).
+    ExistingColumns(String),
+}
+
+/// Classifies the cursor when it sits inside a DDL table-definition list — the
+/// parenthesised column/constraint list of `CREATE TABLE …`, or any clause of
+/// `ALTER TABLE … ADD …`. Returns `None` for every position outside such a list
+/// so the ordinary DML/DDL classification still applies (e.g. `ALTER TABLE t
+/// MODIFY …`, the `ALTER TABLE <name>` slot, or a plain `CREATE TABLE t AS
+/// SELECT …`).
+///
+/// Within the list each `(` opens a frame classified from the preceding words:
+///   * `PRIMARY KEY (…)` / `UNIQUE (…)` / `FOREIGN KEY (…)` / `KEY (…)` and a
+///     `CHECK (…)` expression → existing columns of the table being defined;
+///   * `REFERENCES <table> (…)` → existing columns of `<table>`;
+///   * the top `ADD (…)` / `CREATE TABLE … (…)` list → a column-definition list,
+///     where the start of each entry (right after `(` or `,`) is a new name and
+///     a position after the name is a data-type slot left to the caller;
+///   * a nested non-constraint paren in that list (a type precision `NUMBER(…)`,
+///     a `DEFAULT (…)` expression) is a literal slot, suppressed like a new name.
+///
+/// A position outside any definition/constraint list is left unclassified.
+fn ddl_definition_list_target(
+    tokens: &[SqlToken],
+    cursor_token_len: usize,
+) -> Option<DdlDefinitionTarget> {
+    let sig = significant_statement_tokens_before_cursor(tokens, cursor_token_len);
+    if sig.len() < 2 {
+        return None;
+    }
+
+    let is_alter = token_is_word(sig[0], "ALTER") && token_is_word(sig[1], "TABLE");
+    let is_create =
+        token_is_word(sig[0], "CREATE") && sig.iter().take(6).any(|t| token_is_word(t, "TABLE"));
+    if !is_alter && !is_create {
+        return None;
+    }
+
+    let after_keyword = if is_alter {
+        2
+    } else {
+        sig.iter().position(|t| token_is_word(t, "TABLE"))? + 1
+    };
+    let (own_table, mut idx) = read_dotted_name(&sig, after_keyword)?;
+
+    // A `CREATE TABLE` definition list is the parenthesised group immediately
+    // following the table name. When the next token is anything else (`AS` for
+    // `CREATE TABLE t AS SELECT …`, a storage option, …) there is no definition
+    // list, so the statement must keep its ordinary classification — otherwise a
+    // CTAS subquery/expression paren would be misread as a column list.
+    if is_create
+        && !sig
+            .get(idx)
+            .is_some_and(|token| token_is_symbol(token, "("))
+    {
+        return None;
+    }
+
+    #[derive(Clone)]
+    enum Frame {
+        DefinitionList,
+        OwnColumns,
+        RefColumns(String),
+        Other,
+    }
+
+    let mut stack: Vec<Frame> = Vec::new();
+    // For `ALTER`, only an `ADD` clause holds new-name / constraint lists; a
+    // `CREATE TABLE` body is a definition context throughout.
+    let mut op_is_add = is_create;
+    let mut create_def_list_opened = false;
+    let mut last_word: Option<String> = None;
+    let mut references_table: Option<String> = None;
+    // Whether a constraint/index keyword has appeared in the current clause entry
+    // (since the last `(`/`)`/`,`). It must survive an optional constraint or
+    // index name so MySQL's `… KEY idx (col)` / `ADD INDEX idx (col)` still
+    // resolve to a column list rather than being read as a table target.
+    let mut saw_constraint_kw = false;
+    // Whether a `PARTITION BY`/`SUBPARTITION BY` clause is open: its method
+    // argument (`RANGE (…)`, `HASH (…)`, `LIST (…)`, `RANGE COLUMNS (…)`, …) is a
+    // column/expression list over the table's columns, not a table target.
+    let mut saw_partition_by = false;
+
+    while idx < sig.len() {
+        let token = sig[idx];
+        idx += 1;
+
+        if token_is_symbol(token, "(") {
+            let frame = if !op_is_add {
+                Frame::Other
+            } else if let Some(ref_table) = references_table.clone() {
+                Frame::RefColumns(ref_table)
+            } else if saw_constraint_kw {
+                // `[PRIMARY|FOREIGN] KEY [name] (…)`, `UNIQUE [KEY|INDEX] [name]
+                // (…)`, `INDEX [name] (…)` and a `CHECK (…)` expression all
+                // reference the table's own columns.
+                Frame::OwnColumns
+            } else if saw_partition_by && stack.is_empty() {
+                // The partition-method column list (`PARTITION BY RANGE (col)`).
+                // Reset so the following partition-value parens are not mistaken
+                // for further column lists.
+                saw_partition_by = false;
+                Frame::OwnColumns
+            } else if is_create && stack.is_empty() && !create_def_list_opened {
+                create_def_list_opened = true;
+                Frame::DefinitionList
+            } else if is_alter && last_word.as_deref() == Some("ADD") {
+                Frame::DefinitionList
+            } else {
+                Frame::Other
+            };
+            stack.push(frame);
+            last_word = None;
+            references_table = None;
+            saw_constraint_kw = false;
+            continue;
+        }
+        if token_is_symbol(token, ")") {
+            stack.pop();
+            last_word = None;
+            references_table = None;
+            saw_constraint_kw = false;
+            continue;
+        }
+        if token_is_symbol(token, ",") {
+            last_word = None;
+            references_table = None;
+            saw_constraint_kw = false;
+            continue;
+        }
+        if let SqlToken::Word(word) = token {
+            let upper = word.to_ascii_uppercase();
+            if is_alter && stack.is_empty() {
+                match upper.as_str() {
+                    "ADD" => op_is_add = true,
+                    "MODIFY" | "DROP" | "RENAME" | "CHANGE" | "ALTER" => op_is_add = false,
+                    _ => {}
+                }
+            }
+            if matches!(upper.as_str(), "KEY" | "UNIQUE" | "INDEX" | "CHECK") {
+                saw_constraint_kw = true;
+            }
+            if matches!(upper.as_str(), "PARTITION" | "SUBPARTITION") {
+                saw_partition_by = true;
+            }
+            if upper == "REFERENCES" {
+                if let Some((name, _)) = read_dotted_name(&sig, idx) {
+                    references_table = Some(name);
+                }
+            }
+            last_word = Some(upper);
+            continue;
+        }
+        last_word = None;
+    }
+
+    match stack.last() {
+        Some(Frame::DefinitionList) => {
+            // The start of an entry (right after the list `(` or a `,`) is a new
+            // column/constraint name; a later position is a data-type slot the
+            // caller resolves on its own.
+            let prev = sig.last()?;
+            (token_is_symbol(prev, "(") || token_is_symbol(prev, ","))
+                .then_some(DdlDefinitionTarget::NewName)
+        }
+        Some(Frame::OwnColumns) => {
+            // `ALTER TABLE t ADD … KEY (col)` references `t`'s existing catalog
+            // columns. In `CREATE TABLE` the table does not exist yet, so its
+            // constraint columns are the ones being defined in the same
+            // statement — not catalog-resolvable here — and offering the catalog
+            // would be pure noise, so the slot is left a name position.
+            if is_create {
+                Some(DdlDefinitionTarget::NewName)
+            } else {
+                Some(DdlDefinitionTarget::ExistingColumns(own_table))
+            }
+        }
+        Some(Frame::RefColumns(table)) => Some(DdlDefinitionTarget::ExistingColumns(table.clone())),
+        Some(Frame::Other) => {
+            // A non-constraint nested paren inside a column-definition list is a
+            // type precision/size (`NUMBER(…)`, `VARCHAR2(…)`) or a `DEFAULT (…)`
+            // expression — a literal position, never an existing relation or
+            // column, so suppress rather than leak the catalog. A top-level
+            // `Other` (outside any definition list) keeps the default
+            // classification.
+            stack
+                .iter()
+                .any(|frame| matches!(frame, Frame::DefinitionList))
+                .then_some(DdlDefinitionTarget::NewName)
+        }
+        None => None,
     }
 }
 
@@ -715,8 +953,9 @@ fn ddl_alter_table_column_target(sig: &[&SqlToken]) -> Option<String> {
             prev_is_word("MODIFY") || token_is_symbol(prev, "(") || token_is_symbol(prev, ",")
         }
         "ALTER" => prev_is_word("ALTER") || prev_is_word("COLUMN"),
-        // MySQL `CHANGE old new TYPE`: only the source name references a column.
-        "CHANGE" => prev_is_word("CHANGE"),
+        // MySQL `CHANGE [COLUMN] old new TYPE`: only the source name references a
+        // column (right after `CHANGE` or its optional `COLUMN` keyword).
+        "CHANGE" => prev_is_word("CHANGE") || prev_is_word("COLUMN"),
         // `RENAME COLUMN old TO new`: only the source name; `RENAME TO t` is a
         // new table name.
         "RENAME" => prev_is_word("COLUMN"),

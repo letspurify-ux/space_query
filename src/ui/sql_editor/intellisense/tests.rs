@@ -173,6 +173,42 @@ fn analyze_inline_cursor_sql(sql_with_cursor: &str) -> intellisense_context::Cur
     intellisense_context::analyze_cursor_context_owned(full_tokens, split_idx)
 }
 
+/// The definition-list classifier keys off the `TABLE` keyword, so it must not
+/// engage for statements that merely contain `TABLE` without being a
+/// `CREATE TABLE` / `ALTER TABLE` definition (`CREATE TYPE … AS TABLE OF …`),
+/// nor for `ALTER` of a non-table object, nor leak across a statement boundary.
+#[test]
+fn ddl_definition_list_detector_does_not_misfire_on_lookalikes() {
+    // `TABLE` keyword present but not a table-definition list.
+    for sql in [
+        "CREATE TYPE my_type AS TABLE OF |",
+        "CREATE OR REPLACE TYPE t AS TABLE OF | NUMBER",
+        "ALTER INDEX idx REBUILD |",
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        assert!(!ctx.ddl_new_name_position, "{sql}");
+        assert_eq!(
+            ctx.phase,
+            intellisense_context::SqlPhase::Initial,
+            "phase for `{sql}`"
+        );
+    }
+
+    // A prior statement must not bleed into the cursor's statement.
+    let after_semicolon =
+        analyze_inline_cursor_sql("SELECT * FROM dept; ALTER TABLE emp ADD PRIMARY KEY (|)");
+    assert_eq!(
+        after_semicolon.phase,
+        intellisense_context::SqlPhase::DdlColumnList
+    );
+    assert_eq!(after_semicolon.focused_tables, vec!["emp".to_string()]);
+
+    let ddl_then_select =
+        analyze_inline_cursor_sql("ALTER TABLE emp ADD (a NUMBER); SELECT | FROM dept");
+    assert!(!ddl_then_select.ddl_new_name_position);
+    assert_eq!(ddl_then_select.phase, intellisense_context::SqlPhase::SelectList);
+}
+
 fn mysql_context_and_suggestions_for_inline_sql(
     sql_with_cursor: &str,
 ) -> (SqlContext, Vec<String>) {
@@ -16162,6 +16198,240 @@ fn classify_intellisense_context_treats_alter_table_drop_column_as_column_contex
         deep_ctx.statement_tokens.as_ref(),
     );
     assert_eq!(context, SqlContext::ColumnName);
+}
+
+/// `ALTER TABLE t ADD (…)` is a column-definition list, not a table target.
+/// Each entry start is a brand-new column name (suppress identifiers) and a
+/// position after the name is a data-type slot; neither should offer existing
+/// relations or columns. Previously the parenthesised form fell through to the
+/// DML machine's `IntoClause`/`DerivedAliasColumnList`, leaking table names and
+/// the wrong table's columns.
+#[test]
+fn alter_table_add_column_definition_slots_are_new_name_positions() {
+    for sql in [
+        "ALTER TABLE emp ADD (|)",
+        "ALTER TABLE emp ADD (col1 NUMBER, |)",
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        assert!(
+            ctx.ddl_new_name_position,
+            "`{sql}` should be a DDL new-name position"
+        );
+    }
+
+    // The slot after the new column name stays a data-type position (not a
+    // name position), so dialect type keywords still appear there.
+    let type_slot = analyze_inline_cursor_sql("ALTER TABLE emp ADD (col1 |)");
+    assert!(!type_slot.ddl_new_name_position);
+    assert!(SqlEditorWidget::data_type_position_for_context(&type_slot, false).is_some());
+}
+
+/// Constraint and `REFERENCES` column lists inside `ALTER TABLE … ADD …`
+/// reference existing columns of a single table — the altered table for
+/// `PRIMARY KEY`/`UNIQUE`/`FOREIGN KEY`, and the referenced table for
+/// `REFERENCES x (…)`. They must classify as a column context focused on that
+/// table, never offer relations.
+#[test]
+fn alter_table_add_constraint_column_lists_target_existing_columns() {
+    for sql in [
+        "ALTER TABLE emp ADD PRIMARY KEY (|)",
+        "ALTER TABLE emp ADD UNIQUE (|)",
+        "ALTER TABLE emp ADD CONSTRAINT pk PRIMARY KEY (|)",
+        "ALTER TABLE emp ADD FOREIGN KEY (|) REFERENCES dept(id)",
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        assert_eq!(
+            ctx.phase,
+            intellisense_context::SqlPhase::DdlColumnList,
+            "phase for `{sql}`"
+        );
+        assert_eq!(ctx.focused_tables, vec!["emp".to_string()], "{sql}");
+    }
+
+    // The `REFERENCES <table> (…)` list targets the referenced table's columns.
+    let references =
+        analyze_inline_cursor_sql("ALTER TABLE emp ADD FOREIGN KEY (deptno) REFERENCES dept(|)");
+    assert_eq!(references.phase, intellisense_context::SqlPhase::DdlColumnList);
+    assert_eq!(references.focused_tables, vec!["dept".to_string()]);
+
+    // A schema-qualified target keeps the qualifier so the right table's
+    // columns are loaded.
+    let qualified = analyze_inline_cursor_sql("ALTER TABLE scott.emp ADD PRIMARY KEY (|)");
+    assert_eq!(qualified.phase, intellisense_context::SqlPhase::DdlColumnList);
+    assert_eq!(qualified.focused_tables, vec!["scott.emp".to_string()]);
+}
+
+/// A `CHECK (…)` constraint is an expression over the altered table's columns,
+/// so it must offer those columns — never relations. A type precision/size
+/// argument (`NUMBER(…)`) is a numeric-literal slot and must stay suppressed
+/// rather than leak columns. Both previously fell through to the DML machine.
+#[test]
+fn alter_table_add_check_and_type_precision_are_classified_precisely() {
+    for sql in [
+        "ALTER TABLE emp ADD CHECK (| > 0)",
+        "ALTER TABLE emp ADD CONSTRAINT c CHECK (|)",
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        assert_eq!(
+            ctx.phase,
+            intellisense_context::SqlPhase::DdlColumnList,
+            "phase for `{sql}`"
+        );
+        assert_eq!(ctx.focused_tables, vec!["emp".to_string()], "{sql}");
+    }
+
+    // A type precision/size argument inside the definition list is a literal
+    // position: suppressed, never the catalog or the altered table's columns.
+    let precision = analyze_inline_cursor_sql("ALTER TABLE emp ADD (col1 NUMBER(|))");
+    assert!(precision.ddl_new_name_position);
+}
+
+/// MySQL/MariaDB allow an index or constraint name between the `KEY`/`INDEX`
+/// keyword and its column list (`ADD KEY idx (col)`, `ADD INDEX idx (col)`,
+/// `ADD UNIQUE KEY uk (col)`, `ADD … FOREIGN KEY fk (col)`). The intervening
+/// name must not break the column-list classification into a table target.
+#[test]
+fn alter_table_add_named_index_column_lists_target_existing_columns() {
+    for sql in [
+        "ALTER TABLE emp ADD INDEX idx (|)",
+        "ALTER TABLE emp ADD KEY idx (|)",
+        "ALTER TABLE emp ADD UNIQUE KEY uk (|)",
+        "ALTER TABLE emp ADD CONSTRAINT fk FOREIGN KEY fk_name (|) REFERENCES dept(id)",
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        assert_eq!(
+            ctx.phase,
+            intellisense_context::SqlPhase::DdlColumnList,
+            "phase for `{sql}`"
+        );
+        assert_eq!(ctx.focused_tables, vec!["emp".to_string()], "{sql}");
+    }
+}
+
+/// MySQL `CHANGE [COLUMN] old new …` names a brand-new column after the source
+/// name; that slot (and the data type after it) must suppress identifiers
+/// rather than offer existing relations. The source-name slot itself stays an
+/// existing-column position.
+#[test]
+fn alter_table_change_new_name_slot_is_suppressed() {
+    for sql in [
+        "ALTER TABLE emp CHANGE old_col |",
+        "ALTER TABLE emp CHANGE COLUMN old_col |",
+        "ALTER TABLE emp CHANGE old_col new_col |",
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        assert!(ctx.ddl_new_name_position, "`{sql}` should suppress");
+    }
+
+    // The source-column slot is still an existing-column position, not a new
+    // name — including after the optional `COLUMN` keyword.
+    for sql in ["ALTER TABLE emp CHANGE |", "ALTER TABLE emp CHANGE COLUMN |"] {
+        let source = analyze_inline_cursor_sql(sql);
+        assert!(!source.ddl_new_name_position, "{sql}");
+        assert_eq!(
+            source.phase,
+            intellisense_context::SqlPhase::DdlColumnList,
+            "{sql}"
+        );
+        assert_eq!(source.focused_tables, vec!["emp".to_string()], "{sql}");
+    }
+}
+
+/// `CREATE TABLE … PARTITION BY {RANGE|HASH|LIST|RANGE COLUMNS} (…)` lists the
+/// partitioning columns/expressions over the table's own columns — not a table
+/// target. For `CREATE TABLE` the columns are defined in the same statement, so
+/// the slot is suppressed rather than leaking the catalog. The partition-value
+/// parens that follow must keep their ordinary classification.
+#[test]
+fn create_table_partition_column_list_never_offers_relations() {
+    for sql in [
+        "CREATE TABLE t (id NUMBER) PARTITION BY RANGE (|)",
+        "CREATE TABLE t (id INT) PARTITION BY HASH (|)",
+        "CREATE TABLE t (id INT) PARTITION BY LIST (|)",
+        "CREATE TABLE t (a INT, b INT) PARTITION BY RANGE COLUMNS (|)",
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        assert!(
+            ctx.ddl_new_name_position,
+            "`{sql}` partition column list should suppress relations"
+        );
+    }
+
+    // The partition-value paren after the column list is not a column list.
+    let bound = analyze_inline_cursor_sql(
+        "CREATE TABLE t (id INT) PARTITION BY RANGE (id) (PARTITION p VALUES LESS THAN (|))",
+    );
+    assert!(!bound.ddl_new_name_position);
+}
+
+/// `CREATE TABLE … AS SELECT …` (CTAS) has no column-definition list: its
+/// subquery and expression parens are ordinary query positions and must keep
+/// their query classification, not be mistaken for a definition list. Guards
+/// the "first paren after the table name" definition-list heuristic.
+#[test]
+fn create_table_as_select_parens_are_not_definition_lists() {
+    let expr = analyze_inline_cursor_sql("CREATE TABLE t AS SELECT (| ) FROM dept");
+    assert!(!expr.ddl_new_name_position);
+    assert_eq!(expr.phase, intellisense_context::SqlPhase::SelectList);
+
+    let subquery = analyze_inline_cursor_sql(
+        "CREATE TABLE t AS SELECT * FROM dept WHERE deptno IN (SELECT | FROM emp)",
+    );
+    assert!(!subquery.ddl_new_name_position);
+    assert_eq!(subquery.phase, intellisense_context::SqlPhase::SelectList);
+
+    // A real definition list followed by `AS SELECT` still classifies its body
+    // as a query.
+    let mixed = analyze_inline_cursor_sql("CREATE TABLE t (id NUMBER) AS SELECT | FROM dept");
+    assert!(!mixed.ddl_new_name_position);
+    assert_eq!(mixed.phase, intellisense_context::SqlPhase::SelectList);
+}
+
+/// `CREATE TABLE (…)` column definitions name brand-new columns; the position
+/// is a new-name slot, not a table target. Constraint sub-lists reference
+/// columns defined in the same (not-yet-existing) statement, so they are left a
+/// name position rather than leaking the catalog. The data-type slot is
+/// unaffected.
+#[test]
+fn create_table_definition_slots_never_offer_relations() {
+    for sql in [
+        "CREATE TABLE t (|)",
+        "CREATE TABLE t (id NUMBER, |)",
+        "CREATE TABLE t (id NUMBER, PRIMARY KEY (|))",
+        "CREATE TABLE t (id NUMBER, CONSTRAINT pk PRIMARY KEY (|))",
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        assert!(
+            ctx.ddl_new_name_position,
+            "`{sql}` should be a DDL new-name position"
+        );
+    }
+
+    let type_slot = analyze_inline_cursor_sql("CREATE TABLE t (id NUMBER, name |)");
+    assert!(!type_slot.ddl_new_name_position);
+    assert!(SqlEditorWidget::data_type_position_for_context(&type_slot, false).is_some());
+}
+
+/// `ALTER TABLE … MODIFY/DROP/RENAME …` (existing-column operations) and a
+/// plain `CREATE TABLE … AS SELECT` must keep their established classification —
+/// the new definition-list detector only governs `ADD`/`CREATE TABLE (…)` lists.
+#[test]
+fn ddl_definition_list_detector_leaves_other_alter_operations_intact() {
+    for (sql, expected) in [
+        ("ALTER TABLE emp MODIFY (|)", intellisense_context::SqlPhase::DdlColumnList),
+        ("ALTER TABLE emp MODIFY |", intellisense_context::SqlPhase::DdlColumnList),
+        ("ALTER TABLE emp RENAME COLUMN | TO x", intellisense_context::SqlPhase::DdlColumnList),
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        assert_eq!(ctx.phase, expected, "phase for `{sql}`");
+        assert!(!ctx.ddl_new_name_position, "{sql}");
+        assert_eq!(ctx.focused_tables, vec!["emp".to_string()], "{sql}");
+    }
+
+    // CTAS body is an ordinary SELECT list, untouched by the detector.
+    let ctas = analyze_inline_cursor_sql("CREATE TABLE t AS SELECT | FROM emp");
+    assert_eq!(ctas.phase, intellisense_context::SqlPhase::SelectList);
+    assert!(!ctas.ddl_new_name_position);
 }
 
 #[test]
