@@ -20510,6 +20510,57 @@ fn select_list_as_alias_slot_suppresses_completion() {
     }
 }
 
+/// The table-clause alias-name slot after `AS` (`FROM t AS |`) names a
+/// brand-new relation alias, so the identifier base must be suppressed there —
+/// the empty-slot companion of the typed-alias suppression `LocalAliasContext`
+/// already applies (`FROM t AS x|`). Previously only the select-list `AS` slot
+/// was covered, so `FROM t AS |` leaked the whole relation catalog. Suppression
+/// must hold in every table clause (FROM/UPDATE/DELETE/MERGE/JOIN target), and
+/// the slot must NOT fire where `AS` introduces a type (`CAST(x AS |)`) or
+/// after the flashback `OF` keyword (`FROM t AS OF |`).
+#[test]
+fn table_alias_slot_after_as_suppresses_identifier_base() {
+    fn has_prefix(sql_with_cursor: &str) -> bool {
+        sql_with_cursor
+            .split_once('|')
+            .map(|(b, _)| b.ends_with(|ch: char| ch.is_alphanumeric()))
+            .unwrap_or(false)
+    }
+
+    // Empty table-alias slots across every table clause: suppress, and fold into
+    // the shared keyword-only-identifier-slot family.
+    for sql in [
+        "SELECT * FROM emp AS |",
+        "SELECT * FROM emp e1 JOIN dept AS |",
+        "SELECT * FROM (SELECT 1 FROM dual) AS |",
+        "UPDATE emp AS |",
+        "DELETE FROM emp AS |",
+        "MERGE INTO emp AS |",
+        "INSERT INTO emp AS |",
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        assert!(
+            SqlEditorWidget::cursor_is_at_table_alias_name_slot(&ctx, has_prefix(sql)),
+            "table-alias slot should suppress: {sql}"
+        );
+    }
+
+    // Positions where `AS` is not a table-alias slot: a type slot, the flashback
+    // expression after `AS OF`, a select-list alias (handled by its own
+    // predicate, not the table one), and a non-`AS` table position.
+    for sql in [
+        "SELECT * FROM emp AS OF |",        // flashback timestamp expression
+        "SELECT col AS | FROM t",           // select-list alias, not a table slot
+        "SELECT * FROM emp |",              // no `AS`: ambiguous comma/join/clause slot
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        assert!(
+            !SqlEditorWidget::cursor_is_at_table_alias_name_slot(&ctx, has_prefix(sql)),
+            "must not be a table-alias slot: {sql}"
+        );
+    }
+}
+
 /// MERGE merge-action slot after `WHEN [NOT] MATCHED [AND <cond>] THEN |`:
 /// only `UPDATE`/`DELETE` (matched) or `INSERT` (not matched) are grammatical
 /// there — never a column. The `ON (...)` join phase used to bleed into this
@@ -20973,9 +21024,3 @@ fn local_record_member_scope_boundary_and_nested_loops() {
     .expect("enclosing loop record visible inside inner loop");
     assert_has_case_insensitive(&outer, "x");
 }
-
-
-
-
-
-

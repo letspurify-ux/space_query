@@ -917,16 +917,18 @@ impl SqlEditorWidget {
         let completion_policy =
             ClauseCompletionPolicy::for_phase(deep_ctx.phase, qualifier.is_some());
         let restrict_to_relation_columns = completion_policy.restrict_to_relation_columns;
-        // A keyword-only position accepts only a fixed keyword, never an
-        // identifier — a clause-keyword continuation (`ORDER |`/`GROUP |`/
-        // `<join-type> |` …), the `IS [NOT] |` null-test operator, the slot right
-        // after a complete DML target table (`UPDATE t |` → `SET`, …), or the slot
-        // right after a complete JOIN target table (`… JOIN t |` → `ON`/`USING`).
-        // The phase machine leaves the cursor in the surrounding table/column
-        // phase there, so every identifier source (relations, columns, in-scope
-        // aliases/CTEs, local PL/SQL symbols, `*`) must be suppressed; the
-        // `expected_keyword_suggestions` merge below still supplies the lone
-        // `BY`/`WITH`/`JOIN`/`NULL`/`SET`/`WHERE`/`ON`/… hints. The keyword-
+        // A keyword-only position accepts only a fixed keyword (or, for an alias
+        // slot, a brand-new name), never an existing identifier — a clause-keyword
+        // continuation (`ORDER |`/`GROUP |`/`<join-type> |` …), the `IS [NOT] |`
+        // null-test operator, the slot right after a complete DML target table
+        // (`UPDATE t |` → `SET`, …), the slot right after a complete JOIN target
+        // table (`… JOIN t |` → `ON`/`USING`), or a table-clause alias-name slot
+        // (`FROM t AS |`). The phase machine leaves the cursor in the surrounding
+        // table/column phase there, so every identifier source (relations,
+        // columns, in-scope aliases/CTEs, local PL/SQL symbols, `*`) must be
+        // suppressed; the `expected_keyword_suggestions` merge below still supplies
+        // the lone `BY`/`WITH`/`JOIN`/`NULL`/`SET`/`WHERE`/`ON`/… hints (an alias
+        // slot has none, so its popup simply stays empty). The keyword-
         // emitting slots are also folded into `at_keyword_only_slot` (via the
         // shared `cursor_is_at_column_suppressing_keyword_slot` chokepoint) so
         // column-gated paths stay consistent.
@@ -937,6 +939,7 @@ impl SqlEditorWidget {
             ) || Self::cursor_is_at_is_null_test_keyword_position_for_context(deep_ctx, has_prefix)
                 || Self::cursor_is_after_complete_dml_target_for_context(deep_ctx, has_prefix)
                 || Self::cursor_is_after_complete_join_target_for_context(deep_ctx, has_prefix)
+                || Self::cursor_is_at_table_alias_name_slot(deep_ctx, has_prefix)
                 || Self::cursor_is_at_merge_then_action_slot_for_context(deep_ctx, has_prefix)
                 || Self::cursor_is_at_locking_clause_keyword_slot_for_context(deep_ctx, has_prefix));
         let cursor_in_statement = snapshot
@@ -2913,22 +2916,19 @@ impl SqlEditorWidget {
         Self::data_type_position(tokens, end)
     }
 
-    /// True when the cursor sits at the alias-name slot right after `AS` in a
-    /// `SELECT` list (`SELECT expr AS |`). That slot names a brand-new column
-    /// alias — never an existing column/relation/keyword — so identifier
-    /// suggestions are suppressed there, extending the typed-alias suppression
-    /// in `LocalAliasContext` to the still-empty slot. Scoped to the select-list
-    /// column context (where `AS` always introduces an alias) and excluded for
-    /// data-type slots (`CAST(x AS |)`), where `AS` introduces a type. The
-    /// `FROM t AS |` table-alias slot is intentionally left out: there `AS` is
-    /// ambiguous with Oracle/temporal `AS OF`.
-    fn cursor_is_at_select_list_alias_name_slot(
+    /// True when the cursor sits right after a standalone `AS` — an alias-name
+    /// slot that introduces a brand-new identifier (`expr AS |`, `relation
+    /// AS |`). Such a slot is never an existing column/relation/keyword, so
+    /// identifier suggestions are suppressed there, extending the typed-alias
+    /// suppression in `LocalAliasContext` (which only engages once a character is
+    /// typed) to the still-empty slot. Excluded for data-type slots
+    /// (`CAST(x AS |)`), where `AS` introduces a type rather than an alias. The
+    /// caller scopes this to the clause where `AS` actually introduces an alias
+    /// (a select-list column slot, or a table/derived-table slot).
+    fn cursor_word_is_alias_name_after_as(
         deep_ctx: &intellisense_context::CursorContext,
         exclude_current_identifier_chain: bool,
     ) -> bool {
-        if !matches!(sql_context_for_phase(deep_ctx.phase), SqlContext::ColumnOrAll) {
-            return false;
-        }
         if Self::data_type_position_for_context(deep_ctx, exclude_current_identifier_chain)
             .is_some()
         {
@@ -2944,6 +2944,40 @@ impl SqlEditorWidget {
         Self::previous_meaningful_words_upper(tokens, end, 1)
             .last()
             .is_some_and(|word| word == "AS")
+    }
+
+    /// True when the cursor sits at the alias-name slot right after `AS` in a
+    /// `SELECT` list (`SELECT expr AS |`). That slot names a brand-new column
+    /// alias, so identifier suggestions are suppressed there. Scoped to the
+    /// select-list column context, where `AS` always introduces an alias.
+    fn cursor_is_at_select_list_alias_name_slot(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> bool {
+        matches!(sql_context_for_phase(deep_ctx.phase), SqlContext::ColumnOrAll)
+            && Self::cursor_word_is_alias_name_after_as(deep_ctx, exclude_current_identifier_chain)
+    }
+
+    /// True when the cursor sits at the alias-name slot right after `AS` in a
+    /// table clause (`FROM t AS |`, `FROM (subquery) AS |`, `UPDATE t AS |`,
+    /// `MERGE INTO t AS |`, a JOIN target `… JOIN t AS |`). That slot names a
+    /// brand-new relation alias — never an existing relation/column/keyword — so
+    /// the identifier base is suppressed, mirroring the select-list alias slot
+    /// for the table side. This is the empty-slot companion of the typed-alias
+    /// suppression `LocalAliasContext` already applies (`FROM t AS x|`), closing
+    /// the gap where the bare `FROM t AS |` slot dumped the whole relation
+    /// catalog. It stays a column-suppressing slot even for Oracle's flashback
+    /// `AS OF`: only the `OF` keyword or a new alias may follow `AS`, never an
+    /// identifier. Routed through the keyword-only-slot family (not a hard
+    /// suppress) so the clause keywords those target slots still expect —
+    /// `UPDATE t AS |` → `SET`, `DELETE … t AS |` → `WHERE`, `… JOIN t AS |` →
+    /// `ON`/`USING` — keep flowing from the keyword merge.
+    fn cursor_is_at_table_alias_name_slot(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> bool {
+        matches!(sql_context_for_phase(deep_ctx.phase), SqlContext::TableName)
+            && Self::cursor_word_is_alias_name_after_as(deep_ctx, exclude_current_identifier_chain)
     }
 
     /// True when the cursor is at a row-count / offset argument — `LIMIT |`,
