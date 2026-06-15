@@ -19818,6 +19818,357 @@ fn data_type_precision_argument_is_not_a_type_position() {
     );
 }
 
+/// `GRANT`/`REVOKE` privilege lists reuse DML keywords (`SELECT`, `INSERT`,
+/// `UPDATE`, `DELETE`, …) that previously flipped the cursor into a query/DML
+/// phase, so the object slot (`… ON <object>`) wrongly offered columns/`*`
+/// instead of relations, and the grantee slot (`… TO|FROM <user>`) offered
+/// columns/tables. The privilege keyword must never put the cursor in a
+/// column or table phase anywhere in a `GRANT`/`REVOKE` statement.
+#[test]
+fn grant_revoke_privilege_keywords_never_enter_column_or_table_phase() {
+    let object_slots = [
+        "GRANT SELECT ON | TO u",
+        "GRANT SELECT, UPDATE ON | TO u",
+        "REVOKE SELECT ON | FROM u",
+        "REVOKE DELETE ON | FROM u",
+        "GRANT INSERT ON | TO u",
+        "GRANT UPDATE ON | TO u",
+    ];
+    for sql in object_slots {
+        let deep_ctx = analyze_inline_cursor_sql(sql);
+        let context = SqlEditorWidget::classify_intellisense_context(
+            &deep_ctx,
+            deep_ctx.statement_tokens.as_ref(),
+        );
+        assert_eq!(
+            context,
+            SqlContext::General,
+            "object slot should not be a column/table context: {sql}"
+        );
+        // The object name is still surfaced via the expected-object machinery.
+        assert!(
+            SqlEditorWidget::expected_object_suggestion_kind("", None, &deep_ctx).is_some(),
+            "object slot should expect an object kind: {sql}"
+        );
+    }
+
+    // Grantee slots name a user, not a relation/column: neither columns nor
+    // tables may be offered there.
+    for sql in ["GRANT SELECT ON t TO |", "REVOKE SELECT ON t FROM |"] {
+        let deep_ctx = analyze_inline_cursor_sql(sql);
+        let context = SqlEditorWidget::classify_intellisense_context(
+            &deep_ctx,
+            deep_ctx.statement_tokens.as_ref(),
+        );
+        assert_eq!(
+            context,
+            SqlContext::General,
+            "grantee slot should not be a column/table context: {sql}"
+        );
+    }
+}
+
+/// The object slot of a `GRANT SELECT`/`REVOKE SELECT` resolves to relations,
+/// not the columns of an in-scope identifier. Exercises the apply-path gating
+/// end to end: a column context would emit `get_suggestions_for_db` columns.
+#[test]
+fn grant_select_object_slot_offers_relations_not_columns() {
+    let deep_ctx = analyze_inline_cursor_sql("GRANT SELECT ON | TO scott");
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["EMP".to_string()];
+    data.set_columns_for_table("EMP", vec!["EMPNO".to_string(), "ENAME".to_string()]);
+    data.rebuild_indices();
+
+    let context = SqlEditorWidget::classify_intellisense_context(
+        &deep_ctx,
+        deep_ctx.statement_tokens.as_ref(),
+    );
+    assert!(!matches!(
+        context,
+        SqlContext::ColumnName | SqlContext::ColumnOrAll
+    ));
+
+    let objects =
+        SqlEditorWidget::collect_expected_object_suggestions(&mut data, "", &deep_ctx);
+    assert!(objects.iter().any(|value| value == "EMP"));
+    assert!(
+        !objects.iter().any(|value| value == "EMPNO" || value == "ENAME"),
+        "columns must not leak into the GRANT object slot: {:?}",
+        objects
+    );
+}
+
+/// An identifier literally named `grant`/`revoke` inside a query keeps normal
+/// completion — the statement-head guard must not misfire mid-statement.
+#[test]
+fn grant_revoke_guard_does_not_affect_identifier_named_grant() {
+    let deep_ctx = analyze_inline_cursor_sql("SELECT grant, revoke FROM t WHERE |");
+    let context = SqlEditorWidget::classify_intellisense_context(
+        &deep_ctx,
+        deep_ctx.statement_tokens.as_ref(),
+    );
+    assert_eq!(context, SqlContext::ColumnName);
+}
+
+/// `AUDIT`/`NOAUDIT` belong to the same object-privilege family as
+/// `GRANT`/`REVOKE`: their option list reuses DML keywords, so the object slot
+/// (`… ON <object>`) must offer objects, not the columns/`*` of a query phase.
+#[test]
+fn audit_noaudit_object_slot_offers_objects_not_columns() {
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["EMP".to_string()];
+    data.set_columns_for_table("EMP", vec!["EMPNO".to_string()]);
+    data.rebuild_indices();
+
+    for sql in [
+        "AUDIT SELECT ON | BY ACCESS",
+        "AUDIT SELECT, UPDATE ON |",
+        "NOAUDIT SELECT ON |",
+    ] {
+        let deep_ctx = analyze_inline_cursor_sql(sql);
+        let context = SqlEditorWidget::classify_intellisense_context(
+            &deep_ctx,
+            deep_ctx.statement_tokens.as_ref(),
+        );
+        assert_eq!(context, SqlContext::General, "{sql}");
+
+        let objects =
+            SqlEditorWidget::collect_expected_object_suggestions(&mut data, "", &deep_ctx);
+        assert!(objects.iter().any(|value| value == "EMP"), "{sql}: {:?}", objects);
+        assert!(
+            !objects.iter().any(|value| value == "EMPNO"),
+            "columns must not leak into the AUDIT object slot: {sql}: {:?}",
+            objects
+        );
+    }
+}
+
+/// A real query embedded after a non-query head (`EXPLAIN PLAN FOR SELECT`,
+/// `CREATE TABLE … AS SELECT`, `INSERT … SELECT`) must still reach its select
+/// list — the privilege-statement guard only fires for the privilege verbs.
+#[test]
+fn embedded_query_select_lists_stay_column_contexts() {
+    for sql in [
+        "EXPLAIN PLAN FOR SELECT | FROM t",
+        "CREATE TABLE x AS SELECT | FROM t",
+        "INSERT INTO t SELECT | FROM s",
+    ] {
+        let deep_ctx = analyze_inline_cursor_sql(sql);
+        assert_eq!(
+            deep_ctx.phase,
+            intellisense_context::SqlPhase::SelectList,
+            "{sql}"
+        );
+    }
+}
+
+/// Resolves the column scope and base suggestions exactly as the apply path
+/// does for a qualified position: `column_tables` empty ⇒ `column_scope` None.
+fn qualified_base_suggestions_for(
+    data: &mut IntellisenseData,
+    sql_with_cursor: &str,
+    qualifier: &str,
+) -> Vec<String> {
+    let ctx = analyze_inline_cursor_sql(sql_with_cursor);
+    let column_tables =
+        SqlEditorWidget::resolve_column_tables_for_context(Some(qualifier), &ctx);
+    let column_scope = (!column_tables.is_empty()).then(|| column_tables.clone());
+    let context =
+        SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+    SqlEditorWidget::base_suggestions_for_context(
+        data,
+        "",
+        Some(qualifier),
+        column_scope.as_deref(),
+        true,
+        context,
+        ClauseCompletionPolicy::for_phase(ctx.phase, true).restrict_to_relation_columns,
+        None,
+    )
+}
+
+/// A qualified reference must never fall back to the global all-columns list.
+/// In a DML target column list (MERGE INSERT/UPDATE SET, INSERT column list) a
+/// qualifier that resolves to an in-scope relation *outside* the focused target
+/// used to yield an empty scope, which `get_column_suggestions` expands to every
+/// column of every table — an unrelated-item dump. Such positions must suggest
+/// nothing, while ordinary qualified references still resolve their columns.
+#[test]
+fn qualified_position_never_dumps_all_columns() {
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["EMP".to_string(), "DEPT".to_string()];
+    data.set_columns_for_table(
+        "EMP",
+        vec!["EMPNO".to_string(), "ENAME".to_string(), "DEPTNO".to_string()],
+    );
+    data.set_columns_for_table("DEPT", vec!["DEPTNO".to_string(), "DNAME".to_string()]);
+    data.rebuild_indices();
+
+    // Legitimate qualified references still resolve to their relation's columns.
+    let e_cols = qualified_base_suggestions_for(&mut data, "SELECT e.| FROM emp e", "e");
+    assert!(e_cols.iter().any(|c| c == "ENAME"));
+    assert!(!e_cols.iter().any(|c| c == "DNAME"), "{:?}", e_cols);
+
+    let d_cols = qualified_base_suggestions_for(
+        &mut data,
+        "SELECT d.| FROM emp e JOIN dept d ON e.deptno = d.deptno",
+        "d",
+    );
+    assert!(d_cols.iter().any(|c| c == "DNAME"));
+    assert!(!d_cols.iter().any(|c| c == "ENAME"), "{:?}", d_cols);
+
+    // Unknown qualifier: nothing (not every column).
+    assert!(qualified_base_suggestions_for(&mut data, "SELECT zzz.| FROM emp e", "zzz").is_empty());
+
+    // The regression: a cross-scope qualifier inside a focused DML target list
+    // must not dump the whole catalog.
+    for sql in [
+        "MERGE INTO emp e USING dept d ON (e.deptno = d.deptno) WHEN NOT MATCHED THEN INSERT (d.|)",
+        "MERGE INTO emp e USING dept d ON (e.deptno = d.deptno) WHEN MATCHED THEN UPDATE SET d.|",
+        "INSERT INTO emp (d.|)",
+    ] {
+        let cols = qualified_base_suggestions_for(&mut data, sql, "d");
+        assert!(
+            cols.is_empty(),
+            "qualified DML-target slot must not dump all columns: {sql}: {:?}",
+            cols
+        );
+    }
+}
+
+#[test]
+fn select_list_as_alias_slot_suppresses_completion() {
+    // After `AS` in a SELECT list the slot names a brand-new column alias, so
+    // identifier suggestions are suppressed — both at the empty slot and while
+    // the alias is being typed.
+    for sql in [
+        "SELECT col AS | FROM t",
+        "SELECT col AS my| FROM t",
+        "SELECT a, b AS | FROM t",
+        "SELECT (SELECT 1 FROM dual) AS | FROM t",
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        let has_prefix = sql
+            .split_once('|')
+            .map(|(b, _)| b.ends_with(|ch: char| ch.is_alphanumeric()))
+            .unwrap_or(false);
+        assert!(
+            SqlEditorWidget::cursor_is_at_select_list_alias_name_slot(&ctx, has_prefix),
+            "alias slot should suppress: {sql}"
+        );
+    }
+
+    // Positions where `AS` introduces a type, or where the slot is a real
+    // column reference, keep completion.
+    for sql in [
+        "SELECT CAST(x AS |) FROM t",      // data-type slot
+        "SELECT x | FROM t",               // implicit-alias slot (ambiguous)
+        "SELECT a AS x, b | FROM t",       // new column reference after comma
+        "SELECT * FROM t WHERE col AS |",  // not a select-list context
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        let has_prefix = sql
+            .split_once('|')
+            .map(|(b, _)| b.ends_with(|ch: char| ch.is_alphanumeric()))
+            .unwrap_or(false);
+        assert!(
+            !SqlEditorWidget::cursor_is_at_select_list_alias_name_slot(&ctx, has_prefix),
+            "must not suppress: {sql}"
+        );
+    }
+}
+
+/// MERGE merge-action slot after `WHEN [NOT] MATCHED [AND <cond>] THEN |`:
+/// only `UPDATE`/`DELETE` (matched) or `INSERT` (not matched) are grammatical
+/// there — never a column. The `ON (...)` join phase used to bleed into this
+/// slot and offer columns. Columns are suppressed and the action keywords are
+/// emitted, while a `CASE … THEN` branch inside the statement is unaffected.
+#[test]
+fn merge_when_then_action_slot_offers_action_keywords_not_columns() {
+    let matched =
+        "MERGE INTO t USING s ON (t.id = s.id) WHEN MATCHED THEN |";
+    let matched_cond =
+        "MERGE INTO t USING s ON (t.id = s.id) WHEN MATCHED AND s.x > 0 THEN |";
+    let not_matched =
+        "MERGE INTO t USING s ON (t.id = s.id) WHEN NOT MATCHED THEN |";
+    let case_branch =
+        "MERGE INTO t USING s ON (t.id = s.id) WHEN MATCHED THEN UPDATE SET y = CASE WHEN s.z = 1 THEN |";
+
+    for (sql, expected) in [
+        (matched, vec!["UPDATE".to_string(), "DELETE".to_string()]),
+        (matched_cond, vec!["UPDATE".to_string(), "DELETE".to_string()]),
+        (not_matched, vec!["INSERT".to_string()]),
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        assert!(
+            SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(&ctx, false),
+            "columns must be suppressed: {sql}"
+        );
+        assert_eq!(
+            SqlEditorWidget::collect_expected_keyword_suggestions("", &ctx, None),
+            expected,
+            "{sql}"
+        );
+    }
+
+    // A `CASE … THEN` branch inside the MERGE action body is an expression slot,
+    // not a merge-action slot: it must not be suppressed or offer action verbs.
+    let case_ctx = analyze_inline_cursor_sql(case_branch);
+    assert!(!SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(&case_ctx, false));
+    assert!(SqlEditorWidget::collect_expected_keyword_suggestions("", &case_ctx, None).is_empty());
+}
+
+/// The row-locking clause `… FOR |` (→ `UPDATE`/`SHARE`) and `… FOR UPDATE |`
+/// (→ `OF`/`NOWAIT`/…) are keyword-only slots — a column is never valid. The
+/// trailing-clause phase used to leave them in a column context. They are gated
+/// to the statement top level so the SQL-standard `SUBSTRING(x FROM a FOR |)`
+/// operand, the `MODEL`/`PIVOT` `FOR`, and PL/SQL `FOR` loops / `OPEN … FOR`
+/// keep their normal completion.
+#[test]
+fn for_update_locking_clause_is_keyword_only_not_columns() {
+    for (sql, expected) in [
+        ("SELECT * FROM t FOR |", vec!["UPDATE".to_string(), "SHARE".to_string()]),
+        ("SELECT * FROM t WHERE x = 1 FOR |", vec!["UPDATE".to_string(), "SHARE".to_string()]),
+        ("SELECT * FROM t ORDER BY x FOR |", vec!["UPDATE".to_string(), "SHARE".to_string()]),
+        (
+            "SELECT * FROM emp e WHERE e.sal > (SELECT avg(sal) FROM emp) FOR |",
+            vec!["UPDATE".to_string(), "SHARE".to_string()],
+        ),
+        (
+            "SELECT * FROM t FOR UPDATE |",
+            vec!["OF".to_string(), "NOWAIT".to_string(), "WAIT".to_string(), "SKIP".to_string()],
+        ),
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        assert!(
+            SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(&ctx, false),
+            "columns must be suppressed: {sql}"
+        );
+        assert_eq!(
+            SqlEditorWidget::collect_expected_keyword_suggestions("", &ctx, None),
+            expected,
+            "{sql}"
+        );
+    }
+
+    // `FOR UPDATE OF |` is a column list — columns must still be offered.
+    let of_ctx = analyze_inline_cursor_sql("SELECT * FROM t FOR UPDATE OF |");
+    assert!(!SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(&of_ctx, false));
+
+    // Not the locking clause: keep normal completion.
+    for sql in [
+        "SELECT substr(x FROM 1 FOR |) FROM t",        // SUBSTRING operand (in parens)
+        "BEGIN FOR | IN (SELECT * FROM t) LOOP NULL; END LOOP; END;", // PL/SQL loop
+        "DECLARE BEGIN OPEN c FOR | END;",             // ref-cursor OPEN FOR
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        assert!(
+            !SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(&ctx, false),
+            "must not suppress: {sql}"
+        );
+    }
+}
+
 #[test]
 fn data_type_create_table_column_offers_types() {
     let s = data_type_suggestions("CREATE TABLE t (id |)", "", crate::db::DatabaseType::Oracle);

@@ -1754,6 +1754,15 @@ struct ParserDepthFrame {
     locking_clause_active: bool,
     hierarchical_clause_active: bool,
     lock_table_list_active: bool,
+    /// The statement at this depth is an object-privilege statement
+    /// (`GRANT`/`REVOKE`/`AUDIT`/`NOAUDIT`). Its privilege/option list reuses
+    /// DML keywords (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, …) that would
+    /// otherwise flip the phase into a query/DML context, and its `TO`/`FROM`
+    /// grantee slot names a user, not a relation. While set, keyword phase
+    /// dispatch is skipped so the cursor stays in a neutral phase; the lone
+    /// object slot (`… ON <object>`) is supplied downstream by
+    /// `expected_object_suggestion_kind`.
+    privilege_stmt_active: bool,
 }
 
 fn reset_relation_lookbehind(
@@ -2357,6 +2366,7 @@ impl Default for ParserDepthFrame {
             locking_clause_active: false,
             hierarchical_clause_active: false,
             lock_table_list_active: false,
+            privilege_stmt_active: false,
         }
     }
 }
@@ -2970,6 +2980,29 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     .get(depth)
                     .map(|frame| frame.statement_kind)
                     .unwrap_or(StatementKind::Unknown);
+
+                // An object-privilege statement head
+                // (`GRANT`/`REVOKE`/`AUDIT`/`NOAUDIT`): its privilege/option
+                // list and grantee slot must not be parsed as a query/DML, so
+                // the rest of the keyword dispatch is skipped for the whole
+                // statement. The cursor stays in a neutral (General) phase; the
+                // object slot after `ON` is completed downstream from
+                // `expected_object_suggestion_kind`. Gated on a true statement
+                // head (top level, untouched frame) so an identifier named
+                // `grant`/`audit`/… elsewhere is unaffected.
+                if depth == 0
+                    && matches!(current_phase, SqlPhase::Initial)
+                    && matches!(current_statement_kind, StatementKind::Unknown)
+                    && last_word.is_none()
+                    && matches!(upper.as_str(), "GRANT" | "REVOKE" | "AUDIT" | "NOAUDIT")
+                {
+                    depth_frames[depth].privilege_stmt_active = true;
+                }
+                if depth_frames[depth].privilege_stmt_active {
+                    last_word = Some(upper);
+                    idx += 1;
+                    continue;
+                }
 
                 if is_insert_target_modifier_keyword(upper.as_str())
                     && should_promote_insert_modifier_to_target_context(

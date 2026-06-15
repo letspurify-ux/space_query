@@ -905,6 +905,11 @@ impl SqlEditorWidget {
         if Self::context_suppresses_completion(context)
             || (qualifier.is_none() && analysis.cursor_in_alias_declaration)
             || (qualifier.is_none() && deep_ctx.ddl_new_name_position)
+            || (qualifier.is_none()
+                && Self::cursor_is_at_select_list_alias_name_slot(
+                    deep_ctx,
+                    !snapshot.prefix.is_empty(),
+                ))
         {
             Self::clear_intellisense_ui_state(intellisense_popup, runtime);
             return;
@@ -931,7 +936,9 @@ impl SqlEditorWidget {
                 deep_ctx, has_prefix,
             ) || Self::cursor_is_at_is_null_test_keyword_position_for_context(deep_ctx, has_prefix)
                 || Self::cursor_is_after_complete_dml_target_for_context(deep_ctx, has_prefix)
-                || Self::cursor_is_after_complete_join_target_for_context(deep_ctx, has_prefix));
+                || Self::cursor_is_after_complete_join_target_for_context(deep_ctx, has_prefix)
+                || Self::cursor_is_at_merge_then_action_slot_for_context(deep_ctx, has_prefix)
+                || Self::cursor_is_at_locking_clause_keyword_slot_for_context(deep_ctx, has_prefix));
         let cursor_in_statement = snapshot
             .cursor_pos_usize
             .saturating_sub(analysis.statement_start)
@@ -1507,6 +1514,26 @@ impl SqlEditorWidget {
         let _ = editor.take_focus();
     }
 
+    /// Column suggestions for a position that is restricted to a concrete
+    /// relation scope — an explicit `qualifier.` reference, or a clause whose
+    /// grammar only admits a single target relation's columns. When that scope
+    /// is empty (an unresolved/invalid qualifier, or a target table not in
+    /// scope), the lookup must yield nothing: `IntellisenseData::
+    /// get_column_suggestions` treats an empty scope as "every column", and
+    /// dumping the whole catalog is never a valid suggestion at a scoped
+    /// position. This is the single chokepoint guarding against that fallback,
+    /// so every scoped column path stays consistent.
+    fn scoped_column_suggestions(
+        data: &mut IntellisenseData,
+        prefix: &str,
+        column_scope: Option<&[String]>,
+    ) -> Vec<String> {
+        match column_scope {
+            Some(scope) if !scope.is_empty() => data.get_column_suggestions(prefix, Some(scope)),
+            _ => Vec::new(),
+        }
+    }
+
     fn base_suggestions_for_context(
         data: &mut IntellisenseData,
         prefix: &str,
@@ -1518,7 +1545,7 @@ impl SqlEditorWidget {
         db_type: Option<crate::db::DatabaseType>,
     ) -> Vec<String> {
         if qualifier.is_some() {
-            return data.get_column_suggestions(prefix, column_scope);
+            return Self::scoped_column_suggestions(data, prefix, column_scope);
         }
 
         if matches!(context, SqlContext::VariableName | SqlContext::BindValue) {
@@ -1530,7 +1557,7 @@ impl SqlEditorWidget {
         }
 
         if restrict_to_relation_columns {
-            return data.get_column_suggestions(prefix, column_scope);
+            return Self::scoped_column_suggestions(data, prefix, column_scope);
         }
 
         data.get_suggestions_for_db(
@@ -2462,6 +2489,14 @@ impl SqlEditorWidget {
                 deep_ctx,
                 exclude_current_identifier_chain,
             )
+            || Self::cursor_is_at_merge_then_action_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
+            || Self::cursor_is_at_locking_clause_keyword_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
     }
 
     /// True when the cursor sits at a "pure clause-keyword continuation" slot:
@@ -2842,6 +2877,39 @@ impl SqlEditorWidget {
         Self::data_type_position(tokens, end)
     }
 
+    /// True when the cursor sits at the alias-name slot right after `AS` in a
+    /// `SELECT` list (`SELECT expr AS |`). That slot names a brand-new column
+    /// alias — never an existing column/relation/keyword — so identifier
+    /// suggestions are suppressed there, extending the typed-alias suppression
+    /// in `LocalAliasContext` to the still-empty slot. Scoped to the select-list
+    /// column context (where `AS` always introduces an alias) and excluded for
+    /// data-type slots (`CAST(x AS |)`), where `AS` introduces a type. The
+    /// `FROM t AS |` table-alias slot is intentionally left out: there `AS` is
+    /// ambiguous with Oracle/temporal `AS OF`.
+    fn cursor_is_at_select_list_alias_name_slot(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> bool {
+        if !matches!(sql_context_for_phase(deep_ctx.phase), SqlContext::ColumnOrAll) {
+            return false;
+        }
+        if Self::data_type_position_for_context(deep_ctx, exclude_current_identifier_chain)
+            .is_some()
+        {
+            return false;
+        }
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::previous_meaningful_words_upper(tokens, end, 1)
+            .last()
+            .is_some_and(|word| word == "AS")
+    }
+
     /// True when the cursor is at a row-count / offset argument — `LIMIT |`,
     /// `LIMIT <offset>, |`, or `OFFSET |`. These accept an integer literal or
     /// bind only, never a column, so column suggestions are suppressed there.
@@ -3188,6 +3256,127 @@ impl SqlEditorWidget {
         case_depth > 0
     }
 
+    /// MERGE merge-action slot right after `WHEN [NOT] MATCHED [AND <cond>]
+    /// THEN |`: the only grammatical continuations are `UPDATE`/`DELETE`
+    /// (matched) or `INSERT` (not matched) — never a column. Returns the action
+    /// keywords for the slot, or `None` when the cursor is not at it. Gated to a
+    /// MERGE statement whose `THEN` is not a `CASE … THEN` branch, and robust to
+    /// an `AND <condition>` between `MATCHED` and `THEN` by anchoring on the
+    /// nearest preceding `WHEN`.
+    fn merge_then_action_keywords(
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> Option<&'static [&'static str]> {
+        if !Self::statement_is_merge(tokens) || Self::cursor_is_inside_unclosed_case(tokens, end) {
+            return None;
+        }
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        if !matches!(toks.last(), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("THEN")) {
+            return None;
+        }
+        let words: Vec<String> = toks
+            .iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                _ => None,
+            })
+            .collect();
+        let when_idx = words.iter().rposition(|word| word == "WHEN")?;
+        match (
+            words.get(when_idx + 1).map(String::as_str),
+            words.get(when_idx + 2).map(String::as_str),
+        ) {
+            (Some("NOT"), Some("MATCHED")) => Some(&["INSERT"]),
+            (Some("MATCHED"), _) => Some(&["UPDATE", "DELETE"]),
+            _ => None,
+        }
+    }
+
+    fn cursor_is_at_merge_then_action_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::merge_then_action_keywords(tokens, end).is_some()
+    }
+
+    /// Row-locking clause keyword slot — `… FOR |` (→ `UPDATE`/`SHARE`) or
+    /// `… FOR UPDATE|SHARE |` (→ `OF`/`NOWAIT`/`WAIT`/`SKIP`). Only keywords are
+    /// grammatical there, never a column. The caller gates this on a top-level
+    /// (`depth == 0`) query column context so the `FOR` operand slots that live
+    /// inside parentheses — `SUBSTRING(x FROM a FOR |)`, the `MODEL`/`PIVOT`
+    /// `FOR` clauses — and PL/SQL `FOR` loops / `OPEN … FOR` (a neutral phase)
+    /// keep their normal completion. `FOR UPDATE OF |` is a column list, so it
+    /// returns `None` and is unaffected.
+    fn expected_locking_clause_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> Option<&'static [&'static str]> {
+        let words = Self::previous_meaningful_words_upper(tokens, end, 2);
+        let last = words.last().map(String::as_str);
+        let prev = words
+            .len()
+            .checked_sub(2)
+            .and_then(|idx| words.get(idx))
+            .map(String::as_str);
+        if prev == Some("FOR") && matches!(last, Some("UPDATE") | Some("SHARE")) {
+            return Some(&["OF", "NOWAIT", "WAIT", "SKIP"]);
+        }
+        if last == Some("FOR") {
+            return Some(&["UPDATE", "SHARE"]);
+        }
+        None
+    }
+
+    /// Count of `(` not yet closed by `)` in `tokens[..end]`. Used to confirm
+    /// the cursor is at the statement's top level rather than inside a function
+    /// call or sub-expression. Computed from the raw paren tokens because the
+    /// phase machine's `depth` mis-tracks the SQL-standard `SUBSTRING(… FROM …
+    /// FOR …)` / `TRIM` / `OVERLAY` syntax (the inner `FROM` is read as a query
+    /// clause), which would otherwise leak into the locking-clause detection.
+    fn unclosed_paren_count(tokens: &[SqlToken], end: usize) -> usize {
+        let mut depth: i32 = 0;
+        for token in tokens.get(..end).unwrap_or(tokens) {
+            if let SqlToken::Symbol(sym) = token {
+                if sym == "(" {
+                    depth += 1;
+                } else if sym == ")" {
+                    depth = (depth - 1).max(0);
+                }
+            }
+        }
+        depth.max(0) as usize
+    }
+
+    fn cursor_is_at_locking_clause_keyword_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> bool {
+        if !deep_ctx.phase.is_column_context() {
+            return false;
+        }
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        // The row-locking `FOR` clause is only valid at the statement top level;
+        // an open paren means the `FOR` belongs to a function/sub-expression
+        // (`SUBSTRING(x FROM a FOR |)`, `MODEL`/`PIVOT` `FOR`).
+        if Self::unclosed_paren_count(tokens, end) != 0 {
+            return false;
+        }
+        Self::expected_locking_clause_keyword_candidates(tokens, end).is_some()
+    }
+
     fn collect_expected_keyword_suggestions(
         prefix: &str,
         deep_ctx: &intellisense_context::CursorContext,
@@ -3371,6 +3560,16 @@ impl SqlEditorWidget {
         }
         if let Some(candidates) = Self::expected_rollback_segment_keyword_candidates(&words) {
             return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(candidates) = Self::merge_then_action_keywords(tokens, context_end) {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if Self::cursor_is_at_locking_clause_keyword_slot_for_context(deep_ctx, !prefix.is_empty()) {
+            if let Some(candidates) =
+                Self::expected_locking_clause_keyword_candidates(tokens, context_end)
+            {
+                return Self::filter_expected_candidates(prefix, candidates);
+            }
         }
 
         // `WHEN [NOT] MATCHED` is a MERGE-only merge-action slot. Restrict it to a
@@ -3804,12 +4003,19 @@ impl SqlEditorWidget {
         if words.last().is_none_or(|word| word != "ON") {
             return None;
         }
-        let grant_idx = words
+        let verb_idx = words
             .iter()
-            .rposition(|word| matches!(word.as_str(), "GRANT" | "REVOKE"))?;
-        let privilege_words = words.get(grant_idx + 1..words.len().saturating_sub(1))?;
+            .rposition(|word| matches!(word.as_str(), "GRANT" | "REVOKE" | "AUDIT" | "NOAUDIT"))?;
+        let privilege_words = words.get(verb_idx + 1..words.len().saturating_sub(1))?;
         if privilege_words.is_empty() {
             return None;
+        }
+        // `AUDIT`/`NOAUDIT` object options apply to objects of any type
+        // (tables, views, sequences, procedures, …), and their option list is
+        // not restricted to the GRANT privilege sets, so any non-empty option
+        // list resolves the `ON` slot to an object of any kind.
+        if matches!(words[verb_idx].as_str(), "AUDIT" | "NOAUDIT") {
+            return Some(ExpectedObjectSuggestionKind::Any);
         }
         if privilege_words
             .iter()
