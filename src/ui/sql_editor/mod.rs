@@ -495,6 +495,9 @@ pub(crate) struct IntellisenseAnalysis {
     local_scopes: Arc<[LocalScope]>,
     local_symbols: Arc<[LocalSymbolEntry]>,
     text_bind_names: Arc<[String]>,
+    /// The cursor sits on an alias declaration (`t AS x` / `t x` / `[x]`), a
+    /// brand-new-name position where every identifier suggestion is irrelevant.
+    cursor_in_alias_declaration: bool,
 }
 
 #[derive(Clone)]
@@ -507,6 +510,11 @@ pub(crate) struct RoutineSymbolCacheEntry {
     local_scopes: Arc<[LocalScope]>,
     local_symbols: Arc<[LocalSymbolEntry]>,
     text_bind_names: Arc<[String]>,
+    /// Byte ranges (statement-relative) of alias declarations within the
+    /// statement, shared so each cursor position can be classified without
+    /// re-tokenizing. Cursor-independent, unlike the per-cursor flag derived
+    /// from it in `IntellisenseAnalysis`.
+    alias_context: Arc<query_text::LocalAliasContext>,
 }
 
 #[derive(Clone)]

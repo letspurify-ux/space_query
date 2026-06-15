@@ -1,6 +1,7 @@
 use crate::ui::syntax_highlight::{
     encode_fltk_style_bytes, encode_repeated_fltk_style_bytes, replace_text_buffer_with_raw_bytes,
-    set_text_buffer_raw_bytes, LexerState,
+    set_text_buffer_raw_bytes, LexerState, STYLE_BLOCK_COMMENT, STYLE_COMMENT,
+    STYLE_DATETIME_LITERAL, STYLE_Q_QUOTE_STRING,
 };
 
 const DEFERRED_REHIGHLIGHT_IDLE_DELAY_SECONDS: f64 = 0.15;
@@ -171,6 +172,39 @@ impl HighlightShadowState {
             return Some(String::new());
         }
         self.text.get(start..end).map(ToString::to_string)
+    }
+
+    /// Returns true when `pos` (a cursor byte offset) sits inside a string
+    /// literal or comment, as classified by the syntax highlighter. These are
+    /// positions where IntelliSense must stay silent: completing keywords,
+    /// columns or relations inside literal text or a comment only surfaces
+    /// irrelevant suggestions.
+    ///
+    /// The check reuses the already-computed per-byte highlight styles, so it
+    /// stays consistent with the editor's coloring (including unterminated
+    /// literals the user is still typing). Quoted identifiers (`"col"`,
+    /// `` `col` ``) are *not* treated as literals — they are completable.
+    pub(crate) fn cursor_in_string_or_comment(&self, pos: usize) -> bool {
+        // Styles must be aligned 1:1 with text; if they are stale or missing,
+        // do not suppress (better to over-suggest than to silently break it).
+        if self.styles.len() != self.text.len() {
+            return false;
+        }
+        let idx = Self::clamp_boundary(&self.text, pos.min(self.text.len()));
+        // Classify by the character immediately before the cursor: when the
+        // cursor is inside or at the trailing edge of a literal/comment, that
+        // character carries the literal/comment style.
+        let Some(style) = idx.checked_sub(1).and_then(|prev| self.styles.get(prev)) else {
+            return false;
+        };
+        matches!(
+            char::from(*style),
+            STYLE_STRING
+                | STYLE_COMMENT
+                | STYLE_BLOCK_COMMENT
+                | STYLE_Q_QUOTE_STRING
+                | STYLE_DATETIME_LITERAL
+        )
     }
 
     fn style_slice(&self, start: usize, end: usize) -> Option<&str> {
@@ -819,6 +853,75 @@ mod tests {
         assert_eq!(shadow.len(), 0);
         assert_eq!(shadow.line_count(), 0);
         assert!(shadow.line_exit_state(0).is_none());
+    }
+
+    fn shadow_for(text: &str) -> HighlightShadowState {
+        let highlighter = SqlHighlighter::new();
+        let (styles, line_states) = build_logical_styles_and_line_states(&highlighter, text);
+        let mut shadow = HighlightShadowState::default();
+        shadow.rebuild(text.to_string(), &styles, line_states);
+        shadow
+    }
+
+    /// Returns the cursor offset right after `needle` in `text`.
+    fn after(text: &str, needle: &str) -> usize {
+        text.find(needle).expect("needle present") + needle.len()
+    }
+
+    #[test]
+    fn cursor_in_string_or_comment_detects_inside_single_quoted_string() {
+        let sql = "SELECT * FROM emp WHERE name = 'AND'";
+        let shadow = shadow_for(sql);
+        // Cursor between the literal's opening quote and its content / closing
+        // quote is inside the string.
+        assert!(shadow.cursor_in_string_or_comment(after(sql, "'AN")));
+        assert!(shadow.cursor_in_string_or_comment(after(sql, "'AND")));
+    }
+
+    #[test]
+    fn cursor_in_string_or_comment_detects_unterminated_string_tail() {
+        let sql = "SELECT * FROM emp WHERE name = 'AND";
+        let shadow = shadow_for(sql);
+        assert!(shadow.cursor_in_string_or_comment(sql.len()));
+    }
+
+    #[test]
+    fn cursor_in_string_or_comment_detects_line_and_block_comments() {
+        let line = "SELECT * FROM emp -- COUNT";
+        let shadow = shadow_for(line);
+        assert!(shadow.cursor_in_string_or_comment(after(line, "-- COUN")));
+        assert!(shadow.cursor_in_string_or_comment(line.len()));
+
+        let block = "SELECT /* COUNT */ x FROM emp";
+        let shadow = shadow_for(block);
+        assert!(shadow.cursor_in_string_or_comment(after(block, "/* COUN")));
+    }
+
+    #[test]
+    fn cursor_in_string_or_comment_ignores_plain_identifier_positions() {
+        let sql = "SELECT name FROM emp WHERE x = 1";
+        let shadow = shadow_for(sql);
+        assert!(!shadow.cursor_in_string_or_comment(after(sql, "nam")));
+        assert!(!shadow.cursor_in_string_or_comment(after(sql, "WHERE x")));
+        assert!(!shadow.cursor_in_string_or_comment(sql.len()));
+    }
+
+    #[test]
+    fn cursor_in_string_or_comment_allows_quoted_identifiers() {
+        // Double-quoted identifiers are completable, not literals: never suppress.
+        let sql = "SELECT \"col\" FROM emp";
+        let shadow = shadow_for(sql);
+        assert!(!shadow.cursor_in_string_or_comment(after(sql, "\"co")));
+    }
+
+    #[test]
+    fn cursor_in_string_or_comment_is_inert_without_aligned_styles() {
+        // No styles computed (styles empty, not aligned with text): must not suppress.
+        let shadow = HighlightShadowState {
+            text: "SELECT 'AND'".to_string(),
+            ..Default::default()
+        };
+        assert!(!shadow.cursor_in_string_or_comment(shadow.text.len()));
     }
 
     #[test]

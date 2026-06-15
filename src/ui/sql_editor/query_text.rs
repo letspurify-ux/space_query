@@ -22,6 +22,16 @@ impl LocalAliasContext {
     pub(crate) fn is_declaration_range(&self, start: usize, end: usize) -> bool {
         self.declaration_ranges.contains(&(start, end))
     }
+
+    /// True when `pos` (a byte offset) falls within a recorded alias
+    /// declaration — the new name in `t AS x` / `t x` / `[x]`. Such positions
+    /// introduce a brand-new identifier, so IntelliSense must stay silent there
+    /// rather than offering existing keywords, columns or relations.
+    pub(crate) fn cursor_within_declaration(&self, pos: usize) -> bool {
+        self.declaration_ranges
+            .iter()
+            .any(|&(start, end)| pos >= start && pos <= end)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -161,7 +171,7 @@ pub(crate) fn tokenize_sql_with_mysql_compat(sql: &str, mysql_compatible: bool) 
         .collect()
 }
 
-fn collect_local_alias_context_from_spans(spans: &[SqlTokenSpan]) -> LocalAliasContext {
+pub(crate) fn collect_local_alias_context_from_spans(spans: &[SqlTokenSpan]) -> LocalAliasContext {
     let mut context = LocalAliasContext::default();
     for idx in 0..spans.len() {
         if let Some((alias, start, end)) = bracket_alias_declaration_at(spans, idx) {

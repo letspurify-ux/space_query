@@ -349,6 +349,10 @@ impl SqlEditorWidget {
             split_idx,
         );
 
+        let cursor_in_alias_declaration = routine_cache
+            .alias_context
+            .cursor_within_declaration(cursor_in_statement);
+
         IntellisenseAnalysis {
             statement_start: routine_cache.statement_start,
             statement_end: routine_cache.statement_end,
@@ -356,6 +360,7 @@ impl SqlEditorWidget {
             local_scopes: routine_cache.local_scopes.clone(),
             local_symbols: routine_cache.local_symbols.clone(),
             text_bind_names: routine_cache.text_bind_names.clone(),
+            cursor_in_alias_declaration,
         }
     }
 
@@ -375,6 +380,8 @@ impl SqlEditorWidget {
             &token_spans,
             mysql_compatible,
         );
+        let alias_context =
+            super::query_text::collect_local_alias_context_from_spans(&token_spans);
         let mut statement_tokens = Vec::with_capacity(token_spans.len());
         let mut token_ends = Vec::with_capacity(token_spans.len());
         for span in token_spans {
@@ -391,6 +398,7 @@ impl SqlEditorWidget {
             local_scopes: local_scopes.into(),
             local_symbols: local_symbols.into(),
             text_bind_names: text_bind_names.into(),
+            alias_context: Arc::new(alias_context),
         }
     }
 

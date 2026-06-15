@@ -14188,9 +14188,7 @@ SELECT md.| FROM md
         &connection,
     );
 
-    for expected in ["avg_sal_calc"] {
-        assert_has_case_insensitive(&columns, expected);
-    }
+    assert_has_case_insensitive(&columns, "avg_sal_calc");
     assert!(
         columns.iter().any(|column| column == r#""Avg Sal""#),
         "expected quoted MODEL measure alias, got: {:?}",

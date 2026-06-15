@@ -200,6 +200,11 @@ pub struct CursorContext {
     pub qualifier: Option<String>,
     /// Resolved table names for the qualifier
     pub qualifier_tables: Vec<String>,
+    /// The cursor introduces a brand-new DDL name or expects a data type
+    /// (`ALTER TABLE t ADD <col> …`, `RENAME … TO <newname>`), where existing
+    /// relations/columns/keywords are all irrelevant. Drives completion
+    /// suppression, independent of `phase`.
+    pub(crate) ddl_new_name_position: bool,
 }
 
 /// CTE parsing state machine
@@ -430,6 +435,7 @@ pub(crate) fn analyze_cursor_context_arc(
 
     let mut phase = parse_result.phase;
     let mut focused_tables = parse_result.focused_tables;
+    let mut ddl_new_name_position = false;
     if let Some(source) = subquery_alias_column_list_source_at_cursor(
         &table_analysis.subqueries,
         clamped_cursor_token_len,
@@ -443,6 +449,13 @@ pub(crate) fn analyze_cursor_context_arc(
         // reference the single target table's existing columns.
         phase = SqlPhase::DdlColumnList;
         focused_tables = vec![ddl_table];
+    } else if ddl_alter_table_introduces_new_name(
+        statement_tokens.as_ref(),
+        clamped_cursor_token_len,
+    ) {
+        // New column/constraint/rename-target name or data-type position: never
+        // an existing relation, so suppress identifier suggestions entirely.
+        ddl_new_name_position = true;
     }
 
     CursorContext {
@@ -457,6 +470,7 @@ pub(crate) fn analyze_cursor_context_arc(
         focused_tables,
         qualifier: None,
         qualifier_tables: Vec::new(),
+        ddl_new_name_position,
     }
 }
 
@@ -569,6 +583,87 @@ fn ddl_create_index_column_target(sig: &[&SqlToken]) -> Option<String> {
         }
     }
     (depth >= 1).then_some(table)
+}
+
+/// True when the cursor sits at an `ALTER TABLE … ADD …` or `RENAME … TO …`
+/// position that introduces a brand-new name (new column, constraint, or the
+/// rename target) or expects a data type. Such positions never reference an
+/// existing relation, so the default table-target classification — which would
+/// offer existing tables — is wrong there.
+///
+/// Deliberately conservative so legitimate suggestions are preserved:
+///   * positions inside a parenthesised list (e.g. `ADD (col …)`,
+///     `… KEY (col)`) keep their existing classification;
+///   * the `REFERENCES <table>` target stays a relation reference;
+///   * the `ALTER TABLE <name>` and op-keyword (`ALTER TABLE t |`) slots stay
+///     table context (the latter cannot be told apart from typing the table
+///     name at token granularity).
+fn ddl_alter_table_introduces_new_name(tokens: &[SqlToken], cursor_token_len: usize) -> bool {
+    let sig = significant_statement_tokens_before_cursor(tokens, cursor_token_len);
+    if sig.len() < 2 || !token_is_word(sig[0], "ALTER") || !token_is_word(sig[1], "TABLE") {
+        return false;
+    }
+    let Some((_, after_table)) = read_dotted_name(&sig, 2) else {
+        return false;
+    };
+
+    // Walk the clause list after the table at the top level (paren depth 0),
+    // tracking the governing operation and whether the current action has
+    // entered a `REFERENCES <table>` target or passed a `TO` rename target.
+    // `REFERENCES`/`TO` are scoped to their action: a top-level `,` (or a new
+    // op keyword) starts a fresh action and resets them.
+    let mut depth = 0i32;
+    let mut op: Option<&str> = None;
+    let mut saw_references = false;
+    let mut saw_to = false;
+    for token in &sig[after_table..] {
+        if token_is_symbol(token, "(") {
+            depth += 1;
+            continue;
+        }
+        if token_is_symbol(token, ")") {
+            depth = (depth - 1).max(0);
+            continue;
+        }
+        if depth != 0 {
+            continue;
+        }
+        if token_is_symbol(token, ",") {
+            saw_references = false;
+            saw_to = false;
+            continue;
+        }
+        if let SqlToken::Word(word) = token {
+            match word.to_ascii_uppercase().as_str() {
+                kw @ ("ADD" | "DROP" | "MODIFY" | "RENAME" | "CHANGE" | "ALTER") => {
+                    op = Some(match kw {
+                        "ADD" => "ADD",
+                        "RENAME" => "RENAME",
+                        _ => "OTHER",
+                    });
+                    saw_references = false;
+                    saw_to = false;
+                }
+                "REFERENCES" => saw_references = true,
+                "TO" => saw_to = true,
+                _ => {}
+            }
+        }
+    }
+
+    // Inside an unclosed parenthesised list: leave the existing classification.
+    if depth != 0 {
+        return false;
+    }
+
+    match op {
+        // After ADD every top-level name is a new column/constraint name or a
+        // data type — except the `REFERENCES <table>` target.
+        Some("ADD") => !saw_references,
+        // `RENAME [COLUMN x] TO <newname>` introduces a new name after `TO`.
+        Some("RENAME") => saw_to,
+        _ => false,
+    }
 }
 
 fn ddl_alter_table_column_target(sig: &[&SqlToken]) -> Option<String> {

@@ -411,7 +411,16 @@ impl SqlEditorWidget {
             && Self::non_whitespace_char_before_cursor(buffer, text_shadow, cursor_pos)
                 == Some(';');
 
-        if should_hide_after_statement_terminator {
+        // The cursor sitting inside a string literal or comment is never an
+        // identifier position: keywords, columns and relations would all be
+        // irrelevant there. Suppress completion uniformly for every clause by
+        // reusing the syntax highlighter's already-computed styles.
+        let cursor_in_string_or_comment = text_shadow
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .cursor_in_string_or_comment(cursor_pos_usize);
+
+        if should_hide_after_statement_terminator || cursor_in_string_or_comment {
             intellisense_popup
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -889,7 +898,14 @@ impl SqlEditorWidget {
         let qualifier = snapshot.qualifier.as_deref();
         let context =
             Self::classify_intellisense_context(deep_ctx, deep_ctx.statement_tokens.as_ref());
-        if Self::context_suppresses_completion(context) {
+        // An alias declaration (`t AS x` / `t x` / `[x]`) or a DDL new-name /
+        // data-type slot (`ALTER TABLE t ADD col …`, `RENAME … TO new`) names a
+        // brand-new identifier; offering keywords, columns or relations there is
+        // always irrelevant. Suppress uniformly, regardless of the clause.
+        if Self::context_suppresses_completion(context)
+            || (qualifier.is_none() && analysis.cursor_in_alias_declaration)
+            || (qualifier.is_none() && deep_ctx.ddl_new_name_position)
+        {
             Self::clear_intellisense_ui_state(intellisense_popup, runtime);
             return;
         }

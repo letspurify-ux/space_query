@@ -10361,6 +10361,80 @@ fn ddl_multi_clause_alter_governs_by_nearest_op() {
     assert_eq!(ctx.phase, SqlPhase::DdlColumnList);
 }
 
+// ─── DDL new-name / data-type positions suppress identifier suggestions ───────
+
+#[test]
+fn ddl_alter_table_add_positions_are_new_name() {
+    // New column name, MySQL `ADD COLUMN`, the data-type slot, a new constraint
+    // name, and a following column in a multi-add are all brand-new-name or
+    // type positions — never existing relations.
+    for sql in [
+        "ALTER TABLE emp ADD |",
+        "ALTER TABLE emp ADD COLUMN |",
+        "ALTER TABLE emp ADD salary |",
+        "ALTER TABLE emp ADD CONSTRAINT |",
+        "ALTER TABLE emp ADD a INT, ADD b |",
+    ] {
+        let ctx = analyze(sql);
+        assert!(
+            ctx.ddl_new_name_position,
+            "expected new-name suppression for: {sql}"
+        );
+    }
+}
+
+#[test]
+fn ddl_alter_table_rename_target_is_new_name() {
+    for sql in [
+        "ALTER TABLE emp RENAME TO |",
+        "ALTER TABLE emp RENAME COLUMN sal TO |",
+    ] {
+        let ctx = analyze(sql);
+        assert!(
+            ctx.ddl_new_name_position,
+            "expected new-name suppression for: {sql}"
+        );
+    }
+}
+
+#[test]
+fn ddl_alter_table_references_target_is_not_new_name() {
+    // The `REFERENCES <table>` target — including while typing its name and the
+    // empty slot right after the keyword — stays a real relation reference.
+    for sql in [
+        "ALTER TABLE orders ADD CONSTRAINT fk FOREIGN KEY (cid) REFERENCES |",
+        "ALTER TABLE orders ADD CONSTRAINT fk FOREIGN KEY (cid) REFERENCES cust|",
+    ] {
+        let ctx = analyze(sql);
+        assert!(
+            !ctx.ddl_new_name_position,
+            "REFERENCES target must keep relation suggestions: {sql}"
+        );
+        assert!(ctx.phase.is_table_context(), "{sql}");
+    }
+}
+
+#[test]
+fn ddl_new_name_flag_excludes_table_name_and_existing_column_slots() {
+    // The table being altered, the op-keyword slot, existing-column ops, and
+    // the deliberately table-context CREATE name slot must not be suppressed.
+    for sql in [
+        "ALTER TABLE |",
+        "ALTER TABLE emp |",
+        "ALTER TABLE emp DROP COLUMN |",
+        "ALTER TABLE emp MODIFY (|)",
+        "ALTER TABLE emp ADD (col |)",
+        "CREATE TABLE |",
+        "DROP TABLE |",
+    ] {
+        let ctx = analyze(sql);
+        assert!(
+            !ctx.ddl_new_name_position,
+            "must not suppress identifier suggestions for: {sql}"
+        );
+    }
+}
+
 /// Helper: full `name[cte]` descriptors of every scope table, for assertions.
 fn scope_descriptors(ctx: &CursorContext) -> Vec<String> {
     ctx.tables_in_scope
