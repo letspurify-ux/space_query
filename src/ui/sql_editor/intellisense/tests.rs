@@ -204,6 +204,72 @@ fn mysql_context_and_suggestions_for_inline_sql(
     (context, suggestions)
 }
 
+#[test]
+fn constrained_object_slots_replace_base_catalog() {
+    // A constrained DDL object slot resolves to a single object family (kind is
+    // Some and not `Any`), which makes `trigger_intellisense` replace the base
+    // catalog rather than append it — so `DROP TRIGGER`/`CALL`/`GRANT … ON`/
+    // `GRANT … TO` no longer leak the whole catalog. `Any` slots (`AUDIT`) keep
+    // it because every object kind is valid there.
+    let build = || {
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["EMP_T".to_string()];
+        data.views = vec!["EMP_V".to_string()];
+        data.triggers = vec!["EMP_TRG".to_string()];
+        data.indexes = vec!["EMP_IDX".to_string()];
+        data.sequences = vec!["EMP_SEQ".to_string()];
+        data.procedures = vec!["EMP_PROC".to_string()];
+        data.functions = vec!["EMP_FN".to_string()];
+        data.packages = vec!["EMP_PKG".to_string()];
+        data.directories = vec!["EMP_DIR".to_string()];
+        data.users = vec!["EMP_USR".to_string()];
+        data.rebuild_indices();
+        data
+    };
+    let analyze = |sql: &str| {
+        let cursor = sql.find('|').unwrap();
+        let s = sql.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql);
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&s, cursor);
+        let mut data = build();
+        let objs = SqlEditorWidget::collect_expected_object_suggestions(&mut data, &prefix, &ctx);
+        let kind = SqlEditorWidget::expected_object_suggestion_kind(&prefix, None, &ctx);
+        (kind, objs)
+    };
+
+    // Constrained slots: kind present and not Any, objects limited to the family
+    // (+ users for schema qualification), no unrelated catalog kinds.
+    let (k, objs) = analyze("DROP TRIGGER emp|");
+    assert!(matches!(k, Some(kind) if kind != ExpectedObjectSuggestionKind::Any));
+    assert!(objs.iter().any(|s| s == "EMP_TRG"));
+    for leaked in ["EMP_T", "EMP_IDX", "EMP_DIR", "EMP_FN"] {
+        assert!(!objs.iter().any(|s| s == leaked), "DROP TRIGGER leaked {leaked}: {objs:?}");
+    }
+
+    let (k, objs) = analyze("CALL emp|");
+    assert!(matches!(k, Some(kind) if kind != ExpectedObjectSuggestionKind::Any));
+    assert!(objs.iter().any(|s| s == "EMP_PROC") && objs.iter().any(|s| s == "EMP_FN"));
+    assert!(!objs.iter().any(|s| s == "EMP_T"), "CALL leaked a table: {objs:?}");
+
+    let (k, objs) = analyze("GRANT SELECT ON emp|");
+    assert!(matches!(k, Some(kind) if kind != ExpectedObjectSuggestionKind::Any));
+    assert!(objs.iter().any(|s| s == "EMP_T"));
+    for leaked in ["EMP_TRG", "EMP_IDX", "EMP_DIR"] {
+        assert!(!objs.iter().any(|s| s == leaked), "GRANT ON leaked {leaked}: {objs:?}");
+    }
+
+    // Grantee slot resolves to users only (previously dumped the whole catalog).
+    for sql in ["GRANT SELECT ON emp_t TO emp|", "REVOKE SELECT ON emp_t FROM emp|"] {
+        let (k, objs) = analyze(sql);
+        assert_eq!(k, Some(ExpectedObjectSuggestionKind::User), "{sql}");
+        assert_eq!(objs, vec!["EMP_USR".to_string()], "{sql}: {objs:?}");
+    }
+
+    // `AUDIT … ON` is an Any slot → kind is Any → base catalog is kept.
+    let (k, _) = analyze("AUDIT SELECT ON emp|");
+    assert_eq!(k, Some(ExpectedObjectSuggestionKind::Any));
+}
+
 fn assert_has_case_insensitive(values: &[String], expected: &str) {
     assert!(
         values
@@ -5196,6 +5262,42 @@ fn maybe_merge_suggestions_with_context_aliases_skips_aliases_when_qualified() {
     );
 
     assert_eq!(merged, base);
+}
+
+#[test]
+fn local_symbol_suggestions_exclude_sibling_and_post_cursor_scopes() {
+    // Sibling nested block's variable must not leak into a later sibling block.
+    let after_inner = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+        "DECLARE v_outer NUMBER; BEGIN DECLARE v_inner NUMBER; BEGIN NULL; END; __CODEX_CURSOR__NULL; END;",
+        &[],
+    );
+    assert_has_case_insensitive(&after_inner, "v_outer");
+    assert!(
+        !after_inner.iter().any(|s| s.eq_ignore_ascii_case("v_inner")),
+        "closed sibling block local leaked: {after_inner:?}"
+    );
+
+    // A package body's other procedure local must not leak across routines.
+    let proc_b = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+        "CREATE PACKAGE BODY p IS PROCEDURE a IS v_aa NUMBER; BEGIN NULL; END; PROCEDURE b IS v_bb NUMBER; BEGIN __CODEX_CURSOR__NULL; END; END;",
+        &[],
+    );
+    assert_has_case_insensitive(&proc_b, "v_bb");
+    assert!(
+        !proc_b.iter().any(|s| s.eq_ignore_ascii_case("v_aa")),
+        "sibling procedure local leaked: {proc_b:?}"
+    );
+
+    // A variable declared after the cursor is not yet in scope.
+    let pre_decl = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+        "DECLARE v_a NUMBER; BEGIN __CODEX_CURSOR__NULL; v_b := 1; END;",
+        &[],
+    );
+    assert_has_case_insensitive(&pre_decl, "v_a");
+    assert!(
+        !pre_decl.iter().any(|s| s.eq_ignore_ascii_case("v_b")),
+        "post-cursor symbol leaked: {pre_decl:?}"
+    );
 }
 
 #[test]
@@ -19816,6 +19918,66 @@ fn data_type_precision_argument_is_not_a_type_position() {
         data_type_suggestions("SELECT CAST(x AS NUMBER(|)) FROM t", "", crate::db::DatabaseType::Oracle)
             .is_empty()
     );
+}
+
+#[test]
+fn keyword_only_slots_suppress_the_identifier_base() {
+    // `trigger_intellisense` keys the identifier-base branch on these two
+    // predicates: a data-type slot keeps only user TYPE objects, every other
+    // column-suppressing keyword/value slot keeps nothing. Guard both so the
+    // base can never silently start leaking relations/functions/columns again.
+    // `exclude_current_identifier_chain` mirrors the production wiring
+    // (`!prefix.is_empty()`), derived here from the marked word at the cursor.
+    fn exclude_flag(sql_with_cursor: &str) -> bool {
+        let cursor = sql_with_cursor.find('|').expect("cursor marker");
+        let sql = sql_with_cursor.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+        !prefix.is_empty()
+    }
+
+    let type_slots = [
+        "SELECT CAST(x AS |) FROM dual",
+        "SELECT CAST(x AS emp|) FROM dual",
+        "CREATE TABLE t (c |)",
+    ];
+    for sql in type_slots {
+        let ctx = analyze_inline_cursor_sql(sql);
+        let exclude = exclude_flag(sql);
+        assert!(
+            SqlEditorWidget::data_type_position_for_context(&ctx, exclude).is_some(),
+            "expected a data-type position for `{sql}`"
+        );
+        assert!(
+            SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(&ctx, exclude),
+            "data-type position must be a column-suppressing slot for `{sql}`"
+        );
+    }
+
+    // Non-data-type keyword/value-only slots: column-suppressing, and crucially
+    // NOT a data-type position (so the base goes empty rather than to types).
+    let pure_keyword_slots = [
+        "SELECT EXTRACT(yea| FROM d) FROM dual",
+        "SELECT INTERVAL '1' yea| FROM dual",
+        "SELECT SUM(x) OVER (ORDER BY a ROWS UNBOUNDED prec|) FROM t",
+        "SELECT x FROM t FETCH FIRST ro| ROWS ONLY",
+    ];
+    for sql in pure_keyword_slots {
+        let ctx = analyze_inline_cursor_sql(sql);
+        let exclude = exclude_flag(sql);
+        assert!(
+            SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(&ctx, exclude),
+            "expected a column-suppressing slot for `{sql}`"
+        );
+        assert!(
+            SqlEditorWidget::data_type_position_for_context(&ctx, exclude).is_none(),
+            "`{sql}` must not be treated as a data-type position"
+        );
+    }
+
+    // A plain column position is neither, so its identifier base is unaffected.
+    let plain = analyze_inline_cursor_sql("SELECT ename, | FROM emp");
+    assert!(!SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(&plain, false));
+    assert!(SqlEditorWidget::data_type_position_for_context(&plain, false).is_none());
 }
 
 /// `GRANT`/`REVOKE` privilege lists reuse DML keywords (`SELECT`, `INSERT`,

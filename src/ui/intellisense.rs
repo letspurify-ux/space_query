@@ -1029,6 +1029,14 @@ impl IntellisenseData {
                     if !keyword.starts_with(prefix_upper.as_str()) {
                         break;
                     }
+                    // In an expression/column context, keywords that can only
+                    // begin a statement or command (CREATE/DROP/GRANT/SPOOL/
+                    // FLUSH/…) or that only modify a DDL object/storage/
+                    // constraint clause (STORAGE/TABLESPACE/CONSTRAINT/CASCADE/…)
+                    // can never appear, so they are dropped as irrelevant noise.
+                    if prefer_columns && crate::sql_text::is_non_expression_keyword_upper(keyword) {
+                        continue;
+                    }
                     if !suggestion_matches_completion_prefix(keyword, prefix) {
                         continue;
                     }
@@ -1121,14 +1129,23 @@ impl IntellisenseData {
             }
         }
 
-        // Add procedures
-        if Self::push_matching_entries(
-            &self.procedure_entries,
-            &prefix_upper,
-            prefix,
-            &mut suggestions,
-            &mut seen,
-        ) {
+        // Add procedures. A standalone procedure returns no value and can only
+        // be invoked as its own statement (`CALL`/`EXEC`/a PL/SQL call), never
+        // as a token inside a value expression — only functions can. So they
+        // are skipped in an expression/column context (`prefer_columns`), while
+        // packages (a `pkg.func` namespace), functions, sequences and types stay
+        // available. The catalog populates `procedure_entries` strictly from
+        // `object_type = 'PROCEDURE'` (functions land in `function_entries`), so
+        // this never hides a callable function.
+        if !prefer_columns
+            && Self::push_matching_entries(
+                &self.procedure_entries,
+                &prefix_upper,
+                prefix,
+                &mut suggestions,
+                &mut seen,
+            )
+        {
             return suggestions;
         }
 
@@ -1174,52 +1191,19 @@ impl IntellisenseData {
             return suggestions;
         }
 
-        if Self::push_matching_entries(
-            &self.trigger_entries,
-            &prefix_upper,
-            prefix,
-            &mut suggestions,
-            &mut seen,
-        ) {
-            return suggestions;
-        }
-
-        if Self::push_matching_entries(
-            &self.event_entries,
-            &prefix_upper,
-            prefix,
-            &mut suggestions,
-            &mut seen,
-        ) {
-            return suggestions;
-        }
-
-        if Self::push_matching_entries(
-            &self.index_entries,
-            &prefix_upper,
-            prefix,
-            &mut suggestions,
-            &mut seen,
-        ) {
-            return suggestions;
-        }
-
-        for entries in [
-            &self.database_link_entries,
-            &self.directory_entries,
-            &self.library_entries,
-            &self.cluster_entries,
-            &self.context_entries,
-            &self.dimension_entries,
-            &self.operator_entries,
-            &self.indextype_entries,
-            &self.edition_entries,
-            &self.java_source_entries,
-            &self.java_class_entries,
-            &self.java_resource_entries,
-        ] {
+        // Schema/DDL-only object kinds that can never appear as a token in a
+        // value expression (a SELECT item, WHERE/JOIN/HAVING predicate, ORDER/
+        // GROUP BY key, SET/VALUES operand, …). In an expression/column context
+        // (`prefer_columns`) suggesting them is pure noise, so they are skipped
+        // entirely there. They stay available in the General catalog flow
+        // (`prefer_columns == false`, e.g. a `DROP`/`ALTER`/`COMMENT` head),
+        // and the dedicated DDL slots (`DROP TRIGGER …`, `ALTER INDEX …`, the
+        // `GRANT … ON …` object slot) surface the exact kind through
+        // `expected_object_suggestion_kind`. Categorize any newly added object
+        // kind here on purpose so this expression filter cannot silently drift.
+        if !prefer_columns {
             if Self::push_matching_entries(
-                entries,
+                &self.trigger_entries,
                 &prefix_upper,
                 prefix,
                 &mut suggestions,
@@ -1227,15 +1211,60 @@ impl IntellisenseData {
             ) {
                 return suggestions;
             }
-        }
 
-        let _ = Self::push_matching_entries(
-            &self.user_entries,
-            &prefix_upper,
-            prefix,
-            &mut suggestions,
-            &mut seen,
-        );
+            if Self::push_matching_entries(
+                &self.event_entries,
+                &prefix_upper,
+                prefix,
+                &mut suggestions,
+                &mut seen,
+            ) {
+                return suggestions;
+            }
+
+            if Self::push_matching_entries(
+                &self.index_entries,
+                &prefix_upper,
+                prefix,
+                &mut suggestions,
+                &mut seen,
+            ) {
+                return suggestions;
+            }
+
+            for entries in [
+                &self.database_link_entries,
+                &self.directory_entries,
+                &self.library_entries,
+                &self.cluster_entries,
+                &self.context_entries,
+                &self.dimension_entries,
+                &self.operator_entries,
+                &self.indextype_entries,
+                &self.edition_entries,
+                &self.java_source_entries,
+                &self.java_class_entries,
+                &self.java_resource_entries,
+            ] {
+                if Self::push_matching_entries(
+                    entries,
+                    &prefix_upper,
+                    prefix,
+                    &mut suggestions,
+                    &mut seen,
+                ) {
+                    return suggestions;
+                }
+            }
+
+            let _ = Self::push_matching_entries(
+                &self.user_entries,
+                &prefix_upper,
+                prefix,
+                &mut suggestions,
+                &mut seen,
+            );
+        }
 
         if include_columns && !prefer_columns {
             self.append_column_suggestions(
@@ -6062,6 +6091,273 @@ mod intellisense_tests {
                 suggestions.iter().any(|name| name == expected),
                 "expected `{expected}` in get_suggestions_for_db output, got {suggestions:?}"
             );
+        }
+    }
+
+    #[test]
+    fn expression_context_excludes_non_expression_object_kinds() {
+        let mut data = IntellisenseData::new();
+        // Expression-valid kinds (relations for qualification, callable/value
+        // producers, qualifier namespaces).
+        data.tables = vec!["EMP_TBL".to_string()];
+        data.views = vec!["EMP_VIEW".to_string()];
+        data.functions = vec!["EMP_FUNC".to_string()];
+        data.packages = vec!["EMP_PKG".to_string()];
+        data.sequences = vec!["EMP_SEQ".to_string()];
+        data.types = vec!["EMP_TYP".to_string()];
+        // Schema/DDL-only kinds that are never a token in a value expression.
+        data.triggers = vec!["EMP_TRG".to_string()];
+        data.events = vec!["EMP_EVT".to_string()];
+        data.indexes = vec!["EMP_IDX".to_string()];
+        data.database_links = vec!["EMP_DBLINK".to_string()];
+        data.directories = vec!["EMP_DIR".to_string()];
+        data.libraries = vec!["EMP_LIB".to_string()];
+        data.clusters = vec!["EMP_CLUSTER".to_string()];
+        data.contexts = vec!["EMP_CTX".to_string()];
+        data.dimensions = vec!["EMP_DIM".to_string()];
+        data.operators = vec!["EMP_OP".to_string()];
+        data.indextypes = vec!["EMP_ITYPE".to_string()];
+        data.editions = vec!["EMP_EDITION".to_string()];
+        data.java_sources = vec!["EMP_JAVA_SRC".to_string()];
+        data.users = vec!["EMP_USR".to_string()];
+        data.rebuild_indices();
+
+        // `prefer_columns = true` is the column/expression context.
+        let suggestions = data.get_suggestions_for_db(
+            "EMP_",
+            true,
+            None,
+            false,
+            true,
+            Some(crate::db::DatabaseType::Oracle),
+        );
+
+        for expected in [
+            "EMP_TBL", "EMP_VIEW", "EMP_FUNC", "EMP_PKG", "EMP_SEQ", "EMP_TYP",
+        ] {
+            assert!(
+                suggestions.iter().any(|name| name == expected),
+                "expression context should still offer `{expected}`, got {suggestions:?}"
+            );
+        }
+
+        for excluded in [
+            "EMP_TRG",
+            "EMP_EVT",
+            "EMP_IDX",
+            "EMP_DBLINK",
+            "EMP_DIR",
+            "EMP_LIB",
+            "EMP_CLUSTER",
+            "EMP_CTX",
+            "EMP_DIM",
+            "EMP_OP",
+            "EMP_ITYPE",
+            "EMP_EDITION",
+            "EMP_JAVA_SRC",
+            "EMP_USR",
+        ] {
+            assert!(
+                !suggestions.iter().any(|name| name == excluded),
+                "expression context must not offer schema-only `{excluded}`, got {suggestions:?}"
+            );
+        }
+
+        // General context (`prefer_columns = false`) still surfaces every kind.
+        let general = data.get_suggestions_for_db(
+            "EMP_",
+            false,
+            None,
+            false,
+            false,
+            Some(crate::db::DatabaseType::Oracle),
+        );
+        for expected in ["EMP_TRG", "EMP_IDX", "EMP_DBLINK", "EMP_USR"] {
+            assert!(
+                general.iter().any(|name| name == expected),
+                "general context should still offer `{expected}`, got {general:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn expression_context_excludes_mysql_command_keywords() {
+        let mut data = IntellisenseData::new();
+        data.rebuild_indices();
+        let mysql = Some(crate::db::DatabaseType::MySQL);
+
+        // (prefix, forbidden command keyword(s), expression-valid sibling(s))
+        let cases: &[(&str, &[&str], &[&str])] = &[
+            ("fl", &["FLUSH"], &["FLOAT"]),
+            ("ki", &["KILL"], &[]),
+            ("opt", &["OPTIMIZE"], &[]),
+            ("prep", &["PREPARE"], &[]),
+            ("deal", &["DEALLOCATE"], &[]),
+            ("hand", &["HANDLER"], &[]),
+            ("loa", &["LOAD"], &[]),
+            // REPLACE/REPEAT are functions and must survive; REPAIR must drop.
+            ("rep", &["REPAIR"], &["REPLACE", "REPEAT"]),
+            ("cha", &["CHANGE"], &["CHAR", "CHARACTER"]),
+            // MySQL DDL table-option / routine fragments drop; the expression
+            // and clause lookalikes survive.
+            ("auto_", &["AUTO_INCREMENT"], &[]),
+            ("engine", &["ENGINE", "ENGINES"], &[]),
+            ("spat", &["SPATIAL"], &[]),
+            ("algor", &["ALGORITHM"], &[]),
+            ("zero", &["ZEROFILL"], &[]),
+            ("max_r", &["MAX_ROWS"], &[]),
+            ("invok", &["INVOKER"], &[]),
+            ("def", &[], &["DEFAULT"]),
+            ("coll", &[], &["COLLATE"]),
+            ("unsig", &[], &["UNSIGNED"]),
+            ("part", &["PARTITIONS"], &["PARTITION"]),
+            ("ign", &[], &["IGNORE"]),
+            ("coal", &[], &["COALESCE()"]),
+        ];
+
+        for (prefix, forbidden, expected) in cases {
+            let column = data.get_suggestions_for_db(prefix, false, None, false, true, mysql);
+            for word in *forbidden {
+                assert!(
+                    !column.iter().any(|s| s == word),
+                    "mysql expression context must drop `{word}` for `{prefix}`: {column:?}"
+                );
+            }
+            for word in *expected {
+                assert!(
+                    column.iter().any(|s| s == word),
+                    "mysql expression context must keep `{word}` for `{prefix}`: {column:?}"
+                );
+            }
+
+            let general = data.get_suggestions_for_db(prefix, false, None, false, false, mysql);
+            for word in *forbidden {
+                assert!(
+                    general.iter().any(|s| s == word),
+                    "mysql general context should keep `{word}` for `{prefix}`: {general:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn expression_context_excludes_standalone_procedures() {
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["EMP".to_string()];
+        data.functions = vec!["EMP_FN".to_string()];
+        data.procedures = vec!["EMP_PROC".to_string()];
+        data.packages = vec!["EMP_PKG".to_string()];
+        data.sequences = vec!["EMP_SEQ".to_string()];
+        data.rebuild_indices();
+        let oracle = Some(crate::db::DatabaseType::Oracle);
+
+        // Expression/column context (`prefer_columns = true`).
+        let column = data.get_suggestions_for_db("EMP", true, None, false, true, oracle);
+        assert!(
+            !column.iter().any(|s| s == "EMP_PROC"),
+            "expression context must not offer a standalone procedure: {column:?}"
+        );
+        for kept in ["EMP", "EMP_FN", "EMP_PKG", "EMP_SEQ"] {
+            assert!(
+                column.iter().any(|s| s == kept),
+                "expression context should still offer `{kept}`: {column:?}"
+            );
+        }
+
+        // General context still offers the procedure (e.g. a `CALL`/`EXEC` head).
+        let general = data.get_suggestions_for_db("EMP", false, None, false, false, oracle);
+        assert!(
+            general.iter().any(|s| s == "EMP_PROC"),
+            "general context should still offer the procedure: {general:?}"
+        );
+    }
+
+    #[test]
+    fn expression_context_excludes_statement_and_command_keywords() {
+        let mut data = IntellisenseData::new();
+        data.rebuild_indices();
+        let oracle = Some(crate::db::DatabaseType::Oracle);
+
+        // Each prefix matches at least one statement/command-only keyword that
+        // must be dropped in an expression context, plus an expression-valid
+        // keyword (or operator) that must survive.
+        let cases: &[(&str, &[&str], &[&str])] = &[
+            ("cr", &["CREATE"], &["CROSS"]),
+            ("dr", &["DROP"], &[]),
+            ("gr", &["GRANT"], &["GROUP", "GROUPS"]),
+            ("tru", &["TRUNCATE"], &[]),
+            ("al", &["ALTER"], &["ALL"]),
+            ("ins", &["INSERT"], &["INSERTING"]),
+            (
+                "co",
+                &["COMMENT", "COMMIT", "COMPUTE"],
+                &["COALESCE", "COLLATE"],
+            ),
+            ("de", &["DELETE", "DESCRIBE"], &["DESC"]),
+            // DDL-only clause modifiers must drop; their expression-valid
+            // siblings (CASE/CAST, CONSTRUCTOR) and the query/analytic-role
+            // traps (PARTITION, USING, NOCYCLE) must survive.
+            ("cas", &["CASCADE"], &["CASE", "CAST"]),
+            ("constr", &["CONSTRAINT"], &["CONSTRUCTOR"]),
+            ("stor", &["STORAGE"], &[]),
+            ("tablesp", &["TABLESPACE"], &[]),
+            ("ident", &["IDENTIFIED"], &["IDENTITY"]),
+            ("part", &[], &["PARTITION"]),
+            ("us", &[], &["USING"]),
+            ("nocy", &[], &["NOCYCLE"]),
+            // Session/compiler parameters and routine-declaration properties
+            // drop; the NLS *functions* and SESSIONTIMEZONE keep completing.
+            ("nls_d", &["NLS_DATE_FORMAT"], &[]),
+            ("nlss", &[], &["NLSSORT()"]),
+            ("plsql_", &["PLSQL_WARNINGS"], &[]),
+            ("determ", &["DETERMINISTIC"], &[]),
+            ("pipel", &["PIPELINED"], &[]),
+            ("authi", &["AUTHID"], &[]),
+            ("session", &[], &["SESSIONTIMEZONE"]),
+            // SQL*Plus SET options drop, but the expression-token collisions
+            // (NULL/ESCAPE/LONG) must survive.
+            ("serv", &["SERVEROUTPUT"], &[]),
+            ("feed", &["FEEDBACK"], &[]),
+            ("nul", &[], &["NULL"]),
+            ("esc", &[], &["ESCAPE"]),
+            ("lon", &[], &["LONG"]),
+            // Long-tail DDL/object/declaration keywords drop; their expression/
+            // clause-valid lookalikes survive.
+            ("compi", &["COMPILE"], &[]),
+            ("exter", &["EXTERNAL"], &[]),
+            ("langu", &["LANGUAGE"], &[]),
+            ("unlim", &["UNLIMITED"], &[]),
+            ("bod", &["BODY"], &[]),
+            ("doc", &[], &["DOCUMENT"]), // x IS DOCUMENT
+            ("bul", &[], &["BULK"]),     // SELECT ... BULK COLLECT INTO
+            ("per", &[], &["PERIOD"]),   // PERIOD FOR / temporal
+            ("appl", &[], &["APPLY"]),   // CROSS/OUTER APPLY
+        ];
+
+        for (prefix, forbidden, expected) in cases {
+            // prefer_columns = true → expression/column context.
+            let column = data.get_suggestions_for_db(prefix, false, None, false, true, oracle);
+            for word in *forbidden {
+                assert!(
+                    !column.iter().any(|s| s == word),
+                    "expression context must drop `{word}` for prefix `{prefix}`: {column:?}"
+                );
+            }
+            for word in *expected {
+                assert!(
+                    column.iter().any(|s| s == word),
+                    "expression context must keep `{word}` for prefix `{prefix}`: {column:?}"
+                );
+            }
+
+            // General context (prefer_columns = false) keeps every keyword.
+            let general = data.get_suggestions_for_db(prefix, false, None, false, false, oracle);
+            for word in *forbidden {
+                assert!(
+                    general.iter().any(|s| s == word),
+                    "general context should keep `{word}` for prefix `{prefix}`: {general:?}"
+                );
+            }
         }
     }
 

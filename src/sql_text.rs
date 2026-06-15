@@ -2934,6 +2934,309 @@ pub(crate) fn is_statement_head_keyword_upper(word_upper: &str) -> bool {
         || is_password_command_keyword_upper(word_upper)
 }
 
+/// Returns true when an (already ASCII-uppercased) keyword can only begin a
+/// statement or SQL*Plus/tool command and therefore can never be a token inside
+/// a value expression (a SELECT item, WHERE/JOIN/HAVING predicate, GROUP/ORDER
+/// BY key, SET/VALUES operand, …). IntelliSense uses this to drop such keywords
+/// from completion while the cursor sits in an expression/column context, where
+/// offering `CREATE`/`DROP`/`GRANT`/`SPOOL`/… is pure noise.
+///
+/// Derived from [`STATEMENT_HEAD_KEYWORDS`] so any statement head added there is
+/// covered automatically, minus the few heads that double as an expression
+/// operator or a column-clause word and must stay available in an expression:
+///   * `DESC`            → `ORDER BY x DESC`
+///   * `VALUES`          → `INSERT … VALUES (…)` row constructor / clause
+///   * `SET`             → `UPDATE … SET` assignment clause
+///   * `TABLE`           → `TABLE(collection_expr)` in a query
+///   * `START` / `CONNECT` → hierarchical `START WITH` / `CONNECT BY` starters
+///   * `SELECT` / `WITH` → a nested query or set-operator branch
+///   * `COLUMN`          → DDL `ALTER TABLE … [ADD|DROP] COLUMN` slot
+pub(crate) fn is_non_expression_statement_keyword_upper(word_upper: &str) -> bool {
+    STATEMENT_HEAD_KEYWORDS_SET.contains(word_upper)
+        && !matches!(
+            word_upper,
+            "DESC"
+                | "VALUES"
+                | "SET"
+                | "TABLE"
+                | "START"
+                | "CONNECT"
+                | "SELECT"
+                | "WITH"
+                | "COLUMN"
+        )
+}
+
+/// Keywords that only appear inside a DDL object/storage/constraint clause
+/// (`CREATE`/`ALTER`/`DROP …`) and never as a token in a value expression or a
+/// query clause. IntelliSense drops these in an expression/column context, the
+/// same way [`is_non_expression_statement_keyword_upper`] handles statement and
+/// command heads. Kept separate from the statement-head set because these are
+/// mid-clause modifiers rather than statement starters.
+///
+/// Membership is deliberately conservative: a keyword is included only when it
+/// has no role in a query expression, a `SELECT`/`FROM`/`WHERE`/… clause, a
+/// window/analytic spec, or a hierarchical clause. Notably excluded for that
+/// reason — `PARTITION` (`OVER (PARTITION BY …)`), `USING` (`JOIN … USING`),
+/// `NOCYCLE`/`CYCLE` (`CONNECT BY NOCYCLE`, recursive-CTE `CYCLE`), and the data
+/// types (valid in `CAST(… AS <type>)`). When unsure, leave a keyword out: a
+/// missed entry merely stays as today's noise, whereas a wrong entry would hide
+/// a legitimate completion.
+const DDL_ONLY_CLAUSE_KEYWORDS: &[&str] = &[
+    // Physical/storage clauses.
+    "PCTFREE",
+    "PCTUSED",
+    "PCTVERSION",
+    "INITRANS",
+    "MAXTRANS",
+    "STORAGE",
+    "TABLESPACE",
+    "LOGGING",
+    "NOLOGGING",
+    "COMPRESS",
+    "NOCOMPRESS",
+    "NOCACHE",
+    "NOPARALLEL",
+    "MONITORING",
+    "NOMONITORING",
+    "FREEPOOLS",
+    "RETENTION",
+    "SECUREFILE",
+    "BASICFILE",
+    "ENABLE_STORAGE_IN_ROW",
+    "NOSORT",
+    "RECYCLEBIN",
+    "NOARCHIVE",
+    "ORGANIZATION",
+    "OVERFLOW",
+    "HEAP",
+    "IOT",
+    "CHUNK",
+    // Integrity-constraint clauses.
+    "CONSTRAINT",
+    "CASCADE",
+    "DEFERRABLE",
+    "DEFERRED",
+    "INITIALLY",
+    "VALIDATE",
+    "NOVALIDATE",
+    "RELY",
+    "NORELY",
+    // Object/user attribute clauses.
+    "IDENTIFIED",
+    "PROFILE",
+    "EDITIONABLE",
+    "NONEDITIONABLE",
+    "NONEDITIONING",
+    "INVISIBLE",
+    "INVALIDATE",
+    "EXTERNALLY",
+    "EXPIRE",
+    "NOFORCE",
+    "REUSE",
+    "PRESERVE",
+    "ACCOUNT",
+    "COMPILE",
+    "DEDUPLICATE",
+    "ENABLE",
+    "DISABLE",
+    "EXTERNAL",
+    "LANGUAGE",
+    "GLOBALLY",
+    "UNLIMITED",
+    "UNCONDITIONAL",
+    "EVENTS",
+    // PL/SQL declaration-only keywords (a routine/package header, never a value
+    // expression). Kept out as expression/clause-valid: `DOCUMENT`/`CONTENT`
+    // (XML `IS DOCUMENT`/serialize), `PERIOD`/`APPLY`/`UPSERT` (temporal / APPLY
+    // join / MODEL rules), and `BULK` (`SELECT … BULK COLLECT INTO`).
+    "BODY",
+    "SPECIFICATION",
+    "NOCOPY",
+    "NOEXCEPTIONS",
+    "SEQUENTIAL",
+];
+
+/// O(1) lookup set for [`DDL_ONLY_CLAUSE_KEYWORDS`].
+static DDL_ONLY_CLAUSE_KEYWORDS_SET: Lazy<HashSet<&'static str>> =
+    Lazy::new(|| DDL_ONLY_CLAUSE_KEYWORDS.iter().copied().collect());
+
+/// Returns true when an (already ASCII-uppercased) keyword is a DDL-only clause
+/// modifier that can never appear in a value expression. See
+/// [`DDL_ONLY_CLAUSE_KEYWORDS`].
+pub(crate) fn is_ddl_only_clause_keyword_upper(word_upper: &str) -> bool {
+    DDL_ONLY_CLAUSE_KEYWORDS_SET.contains(word_upper)
+}
+
+/// MySQL/MariaDB administrative & utility statement keywords that are absent
+/// from the (Oracle-shaped) [`STATEMENT_HEAD_KEYWORDS`] but are likewise only
+/// valid as their own statement/command head, never inside a value expression.
+/// Kept dialect-specific so the deny check covers MySQL completion too.
+///
+/// Conservative for the same reason as the other sets: words that double as a
+/// function (`REPLACE`, `REPEAT`), a data type (`FLOAT`, `CHAR`), or a query
+/// clause are deliberately excluded so a valid completion is never hidden.
+const MYSQL_NON_EXPRESSION_COMMAND_KEYWORDS: &[&str] = &[
+    "FLUSH",
+    "KILL",
+    "OPTIMIZE",
+    "PREPARE",
+    "DEALLOCATE",
+    "DELIMITER",
+    "HANDLER",
+    "LOAD",
+    "REPAIR",
+    "RESET",
+    "CHANGE",
+    "SIGNAL",
+    "RESIGNAL",
+    "INSTALL",
+    "UNINSTALL",
+    "CHECKSUM",
+    "BINLOG",
+    "RESTART",
+];
+
+/// O(1) lookup set for [`MYSQL_NON_EXPRESSION_COMMAND_KEYWORDS`].
+static MYSQL_NON_EXPRESSION_COMMAND_KEYWORDS_SET: Lazy<HashSet<&'static str>> = Lazy::new(|| {
+    MYSQL_NON_EXPRESSION_COMMAND_KEYWORDS
+        .iter()
+        .copied()
+        .collect()
+});
+
+/// MySQL/MariaDB DDL table-option / index / routine-characteristic keywords that
+/// only appear inside `CREATE`/`ALTER TABLE … <option>` or a routine header, and
+/// never in a value expression. Analogue of [`DDL_ONLY_CLAUSE_KEYWORDS`] for the
+/// MySQL grammar.
+///
+/// Conservative as always — the expression/clause-valid lookalikes are kept out:
+/// `DEFAULT` (`VALUES (DEFAULT)`), `COLLATE` (the collation operator), `UNSIGNED`
+/// /`SIGNED` (`CAST(x AS UNSIGNED)`), `PARTITION` (`OVER (PARTITION BY …)`),
+/// `IGNORE` (Oracle analytic `IGNORE NULLS`), `LOCKED` (`SKIP LOCKED`), and the
+/// `COALESCE` function.
+const MYSQL_DDL_FRAGMENT_KEYWORDS: &[&str] = &[
+    "AUTO_INCREMENT",
+    "ENGINE",
+    "ENGINES",
+    "SPATIAL",
+    "FULLTEXT",
+    "ALGORITHM",
+    "ZEROFILL",
+    "ROW_FORMAT",
+    "CHARSET",
+    "COMPRESSED",
+    "TEMPORARY",
+    "PARTITIONS",
+    "STATS_AUTO_RECALC",
+    "STATS_PERSISTENT",
+    "STATS_SAMPLE_PAGES",
+    "DELAYED",
+    "AVG_ROW_LENGTH",
+    "MAX_ROWS",
+    "MIN_ROWS",
+    "PACK_KEYS",
+    "KEY_BLOCK_SIZE",
+    "INSERT_METHOD",
+    "CONNECTION",
+    "INVOKER",
+    "DEFINER",
+    "MODIFIES",
+    "READS",
+    "LOW_PRIORITY",
+    "IGNORE_DOMAIN_IDS",
+    "IGNORE_SERVER_IDS",
+    "ENCRYPTION",
+    "QUICK",
+];
+
+/// O(1) lookup set for [`MYSQL_DDL_FRAGMENT_KEYWORDS`].
+static MYSQL_DDL_FRAGMENT_KEYWORDS_SET: Lazy<HashSet<&'static str>> =
+    Lazy::new(|| MYSQL_DDL_FRAGMENT_KEYWORDS.iter().copied().collect());
+
+/// Session/compiler parameters and routine/PL-SQL declaration property keywords.
+/// They only ever appear in `ALTER SESSION SET …`, `SET TRANSACTION …`, a
+/// `PRAGMA`, or a `CREATE FUNCTION/PROCEDURE … <property>` header — never as a
+/// token in a value expression.
+///
+/// Conservative as elsewhere: the NLS *functions* (`NLSSORT`, `NLS_UPPER`, …)
+/// and `SESSIONTIMEZONE` are distinct names handled by the function catalog and
+/// are intentionally absent here so they keep completing.
+const SESSION_AND_DECLARATION_KEYWORDS: &[&str] = &[
+    // ALTER SESSION / globalization parameters.
+    "NLS_CALENDAR",
+    "NLS_COMP",
+    "NLS_CURRENCY",
+    "NLS_DATE_FORMAT",
+    "NLS_ISO_CURRENCY",
+    "NLS_LANGUAGE",
+    "NLS_LENGTH_SEMANTICS",
+    "NLS_NCHAR_CONV_EXCP",
+    "NLS_NUMERIC_CHARACTERS",
+    "NLS_SORT",
+    "NLS_TERRITORY",
+    "NLS_TIMESTAMP_FORMAT",
+    "NLS_TIMESTAMP_TZ_FORMAT",
+    "USING_NLS_COMP",
+    // PL/SQL compiler / session parameters.
+    "PLSQL_CCFLAGS",
+    "PLSQL_CODE_TYPE",
+    "PLSQL_DEBUG",
+    "PLSQL_OPTIMIZE_LEVEL",
+    "PLSQL_WARNINGS",
+    "PLSCOPE_SETTINGS",
+    "OPTIMIZER_MODE",
+    "ISOLATION_LEVEL",
+    "STATISTICS_LEVEL",
+    "SQL_TRACE",
+    "TRACEFILE_IDENTIFIER",
+    "SERIALIZABLE",
+    "ADVISE",
+    "CONTAINER",
+    "SHARING",
+    // Routine / PL-SQL declaration properties.
+    "PRAGMA",
+    "AUTONOMOUS_TRANSACTION",
+    "EXCEPTION_INIT",
+    "ACCESSIBLE",
+    "AUTHID",
+    "PIPELINED",
+    "DETERMINISTIC",
+    "RESULT_CACHE",
+    "PARALLEL_ENABLE",
+    "WRAPPED",
+    "WRAPPER",
+];
+
+/// O(1) lookup set for [`SESSION_AND_DECLARATION_KEYWORDS`].
+static SESSION_AND_DECLARATION_KEYWORDS_SET: Lazy<HashSet<&'static str>> =
+    Lazy::new(|| SESSION_AND_DECLARATION_KEYWORDS.iter().copied().collect());
+
+/// SQL*Plus `SET` option keywords that double as a value-expression token and so
+/// must stay available even though they are listed in
+/// [`SQLPLUS_SET_OPTION_KEYWORDS`]: `NULL` (the literal/`IS NULL`), `ESCAPE`
+/// (`LIKE … ESCAPE`), `LONG` (a data type), `CONCAT` (the string function).
+fn is_expression_valid_sqlplus_option_upper(word_upper: &str) -> bool {
+    matches!(word_upper, "NULL" | "ESCAPE" | "LONG" | "CONCAT")
+}
+
+/// Single chokepoint deciding whether an (already ASCII-uppercased) catalog
+/// keyword can never appear in a value expression and must be dropped from
+/// IntelliSense in an expression/column context. Unifies the statement/command
+/// heads, the DDL-only clause modifiers, the MySQL admin/utility commands, the
+/// session/declaration parameters, and the SQL*Plus `SET` options (minus the
+/// few that double as expression tokens) so every caller stays consistent and
+/// new keyword families are added in one place.
+pub(crate) fn is_non_expression_keyword_upper(word_upper: &str) -> bool {
+    is_non_expression_statement_keyword_upper(word_upper)
+        || is_ddl_only_clause_keyword_upper(word_upper)
+        || MYSQL_NON_EXPRESSION_COMMAND_KEYWORDS_SET.contains(word_upper)
+        || MYSQL_DDL_FRAGMENT_KEYWORDS_SET.contains(word_upper)
+        || SESSION_AND_DECLARATION_KEYWORDS_SET.contains(word_upper)
+        || (is_sqlplus_set_option_keyword(word_upper)
+            && !is_expression_valid_sqlplus_option_upper(word_upper))
+}
+
 /// Returns true when `word` is a SQL*Plus `SET` option keyword.
 pub(crate) fn is_sqlplus_set_option_keyword(word: &str) -> bool {
     matches_keyword(word, SQLPLUS_SET_OPTION_KEYWORDS)

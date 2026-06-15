@@ -1037,6 +1037,13 @@ impl SqlEditorWidget {
                 deep_ctx,
                 !snapshot.prefix.is_empty(),
             );
+        // A data-type slot is the one keyword-only slot that still admits an
+        // identifier — a user-defined TYPE object (`CAST(x AS my_type)`,
+        // `col my_type`). It is handled specially below so types survive while
+        // every other identifier source is still suppressed.
+        let at_data_type_position = qualifier.is_none()
+            && Self::data_type_position_for_context(deep_ctx, !snapshot.prefix.is_empty())
+                .is_some();
         let include_columns = !has_local_record_member_scope
             && !at_keyword_only_slot
             && (matches!(
@@ -1104,11 +1111,25 @@ impl SqlEditorWidget {
         } else {
             Vec::new()
         };
-        let replace_table_context_with_expected_objects =
-            qualifier.is_none()
-                && matches!(context, SqlContext::TableName)
-                && Self::expected_object_suggestion_kind(&snapshot.prefix, None, deep_ctx)
-                    .is_some();
+        // Replace (not merge) the base catalog with the kind-specific object
+        // list whenever the slot admits only one object family: a table-context
+        // slot, or any *constrained* DDL object slot (`DROP TRIGGER`, `CALL`,
+        // `GRANT … ON`, `GRANT … TO`, `COMMENT ON`, `REFERENCES`, …). Most of
+        // those classify as the neutral General phase, where the base would
+        // otherwise append the whole catalog (every table, trigger, index,
+        // directory, function) after the correct objects — pure noise. An `Any`
+        // slot (`DESC`/`AUDIT`/`CREATE SYNONYM` target) keeps the full catalog
+        // because every object kind is valid there.
+        let expected_object_kind = if qualifier.is_none() {
+            Self::expected_object_suggestion_kind(&snapshot.prefix, None, deep_ctx)
+        } else {
+            None
+        };
+        let replace_table_context_with_expected_objects = match expected_object_kind {
+            Some(ExpectedObjectSuggestionKind::Any) => matches!(context, SqlContext::TableName),
+            Some(_) => true,
+            None => false,
+        };
 
         let allow_empty_prefix = qualifier.is_some()
             || include_columns
@@ -1287,9 +1308,24 @@ impl SqlEditorWidget {
             qualified_member_suggestions
         } else if replace_table_context_with_expected_objects {
             expected_object_suggestions.clone()
-        } else if at_keyword_only_identifier_slot {
-            // Only the trailing clause keyword is grammatical here; the keyword
-            // merge below supplies it, so the identifier base stays empty.
+        } else if at_data_type_position {
+            // A data-type slot (`CAST(x AS |)`, a column/PL-SQL type) admits
+            // only type names: the dialect type keywords come from the expected-
+            // keyword merge below, and user-defined TYPE objects from here.
+            // Relations, functions, columns and unrelated keywords are all
+            // irrelevant, so the rest of the catalog stays suppressed.
+            let mut data = intellisense_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            data.get_type_object_suggestions(&snapshot.prefix)
+        } else if at_keyword_only_identifier_slot || at_keyword_only_slot {
+            // A pure keyword/value-only slot: a clause-keyword continuation,
+            // `IS [NOT] NULL`, a complete DML/JOIN target tail, a MERGE action,
+            // a `FOR`-locking keyword, an `EXTRACT` field, an `INTERVAL` unit, a
+            // window-frame keyword, or a row-limiting count. Only the slot's
+            // fixed keyword(s) are grammatical — supplied by the keyword merge
+            // below — so the identifier base (every relation, function, column
+            // and unrelated keyword) stays empty.
             Vec::new()
         } else {
             let mut data = intellisense_data
@@ -3797,6 +3833,9 @@ impl SqlEditorWidget {
         if let Some(kind) = Self::expected_grant_revoke_object_suggestion_kind(&words) {
             return Some(kind);
         }
+        if let Some(kind) = Self::expected_grant_revoke_grantee_kind(&words) {
+            return Some(kind);
+        }
         if Self::is_create_synonym_target_context(&words) {
             return Some(ExpectedObjectSuggestionKind::Any);
         }
@@ -3995,6 +4034,27 @@ impl SqlEditorWidget {
             }
             _ => None,
         }
+    }
+
+    /// The grantee slot of `GRANT … TO <grantee>` / `REVOKE … FROM <grantee>`
+    /// (including a role grant, `GRANT role TO <grantee>`) names a user or role,
+    /// never a schema object. Resolves the slot right after the `TO`/`FROM`
+    /// separator to the `User` kind so the whole-catalog dump is suppressed
+    /// there. A multi-grantee continuation after a comma keeps today's behavior
+    /// (the comma is not a meaningful word, so the separator is no longer last).
+    fn expected_grant_revoke_grantee_kind(
+        words: &[String],
+    ) -> Option<ExpectedObjectSuggestionKind> {
+        let separator = words.last()?;
+        if !matches!(separator.as_str(), "TO" | "FROM") {
+            return None;
+        }
+        let verb = words.iter().rev().find_map(|word| match word.as_str() {
+            "GRANT" | "REVOKE" => Some(word.as_str()),
+            _ => None,
+        })?;
+        let expected_separator = if verb == "GRANT" { "TO" } else { "FROM" };
+        (separator == expected_separator).then_some(ExpectedObjectSuggestionKind::User)
     }
 
     fn expected_grant_revoke_object_suggestion_kind(
