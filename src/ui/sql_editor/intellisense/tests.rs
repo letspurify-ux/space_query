@@ -173,6 +173,341 @@ fn analyze_inline_cursor_sql(sql_with_cursor: &str) -> intellisense_context::Cur
     intellisense_context::analyze_cursor_context_owned(full_tokens, split_idx)
 }
 
+/// JOIN-clause completion precision: the join target is a table position, the
+/// slot after a complete target is `ON`/`USING` only (relations suppressed), and
+/// an `ON` condition resolves to the columns of every joined table — qualified
+/// to a single alias when one is given. Guards against the common regressions of
+/// leaking relations into `ON`, or losing one side of the join.
+#[test]
+fn join_clause_completion_is_scoped_to_joined_tables() {
+    let coltabs = |sql: &str| {
+        let ctx = analyze_inline_cursor_sql(sql);
+        let mut tabs = SqlEditorWidget::resolve_column_tables_for_context(None, &ctx);
+        tabs.sort();
+        (ctx.phase, tabs)
+    };
+    use intellisense_context::SqlPhase;
+
+    // Join target is a table position (FromClause), not a column position.
+    for sql in [
+        "SELECT * FROM a JOIN |",
+        "SELECT * FROM a LEFT JOIN |",
+        "SELECT * FROM a NATURAL JOIN |",
+        "SELECT * FROM a CROSS JOIN |",
+    ] {
+        assert_eq!(coltabs(sql).0, SqlPhase::FromClause, "{sql}");
+    }
+
+    // After a complete join target only `ON`/`USING` are grammatical, so the
+    // identifier list is suppressed and those keywords are offered.
+    for sql in [
+        "SELECT * FROM a JOIN b |",
+        "SELECT * FROM a INNER JOIN b |",
+        "SELECT * FROM a JOIN b AS x |",
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        assert!(
+            SqlEditorWidget::cursor_is_after_complete_join_target_for_context(&ctx, false),
+            "complete target for `{sql}`"
+        );
+        let kw = SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &ctx,
+            Some(crate::db::DatabaseType::Oracle),
+        );
+        assert!(kw.iter().any(|k| k == "ON"), "ON for `{sql}`");
+        assert!(kw.iter().any(|k| k == "USING"), "USING for `{sql}`");
+    }
+
+    // An `ON` condition (and its `AND`/value continuations) sees every joined
+    // table — both sides, and all three in a chained join.
+    assert_eq!(
+        coltabs("SELECT * FROM emp e JOIN dept d ON |"),
+        (SqlPhase::JoinCondition, vec!["dept".to_string(), "emp".to_string()])
+    );
+    assert_eq!(
+        coltabs("SELECT * FROM a JOIN b ON a.id = |").1,
+        vec!["a".to_string(), "b".to_string()]
+    );
+    assert_eq!(
+        coltabs("SELECT * FROM a JOIN b ON a.x=b.x JOIN c ON |").1,
+        vec!["a".to_string(), "b".to_string(), "c".to_string()]
+    );
+    // Old-style comma join condition sees both relations too.
+    assert_eq!(
+        coltabs("SELECT * FROM a, b WHERE a.id = |").1,
+        vec!["a".to_string(), "b".to_string()]
+    );
+
+    // A qualified reference inside `ON` resolves to exactly that alias's table.
+    let qualified = |sql: &str, q: &str| {
+        SqlEditorWidget::resolve_column_tables_for_context(
+            Some(q),
+            &analyze_inline_cursor_sql(sql),
+        )
+    };
+    assert_eq!(
+        qualified("SELECT * FROM emp e JOIN dept d ON e.|", "e"),
+        vec!["emp".to_string()]
+    );
+    assert_eq!(
+        qualified("SELECT * FROM emp e JOIN dept d ON e.id = d.|", "d"),
+        vec!["dept".to_string()]
+    );
+    // USING resolves against both relations (common-column intersection).
+    assert_eq!(
+        coltabs("SELECT * FROM a JOIN b USING (|)").0,
+        SqlPhase::JoinUsingColumnList
+    );
+}
+
+/// A PL/SQL `%`-attribute slot (`<var>%|`, `<table>%|`, `<table>.<col>%|`)
+/// accepts only `TYPE`/`ROWTYPE` (a column has no `ROWTYPE`), so every other
+/// identifier source is suppressed and the attributes are offered. The modulo
+/// operator in an expression must stay a value position.
+#[test]
+fn plsql_type_attribute_slot_offers_type_rowtype_and_suppresses_identifiers() {
+    let kw = |sql: &str, prefix: &str, excl: bool| {
+        let ctx = analyze_inline_cursor_sql(sql);
+        (
+            SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(&ctx, excl),
+            SqlEditorWidget::collect_expected_keyword_suggestions(
+                prefix,
+                &ctx,
+                Some(crate::db::DatabaseType::Oracle),
+            ),
+        )
+    };
+    let (s, k) = kw("DECLARE v emp.sal%| BEGIN NULL; END;", "", false);
+    assert!(s);
+    assert_eq!(k, vec!["TYPE".to_string()]);
+    let (s, k) = kw("DECLARE v emp%| BEGIN NULL; END;", "", false);
+    assert!(s);
+    assert_eq!(k, vec!["TYPE".to_string(), "ROWTYPE".to_string()]);
+    // Mid-typed (`%t|`): production excludes the prefix, still recognised.
+    let (s, k) = kw("DECLARE v emp.sal%t| BEGIN NULL; END;", "t", true);
+    assert!(s);
+    assert_eq!(k, vec!["TYPE".to_string()]);
+    // Modulo is never a `%`-attribute: it stays a value position.
+    assert!(!kw("DECLARE v NUMBER := a % | BEGIN NULL; END;", "", false).0);
+    assert!(!kw("SELECT a % | FROM t", "", false).0);
+}
+
+/// The `GRANT |` / `REVOKE |` privilege list offers privilege keywords, but
+/// because a role name is also grantable there the slot is *not* suppressed —
+/// privileges merge alongside the identifier base. The grantee slot has none.
+#[test]
+fn grant_privilege_list_offers_privileges_without_suppressing_roles() {
+    let kw = |sql: &str| {
+        let ctx = analyze_inline_cursor_sql(sql);
+        (
+            SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(&ctx, false),
+            SqlEditorWidget::collect_expected_keyword_suggestions(
+                "",
+                &ctx,
+                Some(crate::db::DatabaseType::Oracle),
+            ),
+        )
+    };
+    for sql in [
+        "GRANT | ON t TO u",
+        "GRANT SELECT, | ON t TO u",
+        "REVOKE | ON t FROM u",
+        "GRANT | TO u",
+    ] {
+        let (suppress, k) = kw(sql);
+        assert!(!suppress, "must not suppress (roles valid) for `{sql}`");
+        assert!(k.iter().any(|p| p == "SELECT"), "SELECT for `{sql}`");
+        assert!(k.iter().any(|p| p == "EXECUTE"), "EXECUTE for `{sql}`");
+    }
+    // The grantee slot is not a privilege position.
+    assert!(!kw("GRANT SELECT ON t TO |").1.iter().any(|p| p == "SELECT"));
+}
+
+/// The brand-new object name of a `CREATE` statement (`CREATE TABLE |`,
+/// `CREATE OR REPLACE PACKAGE |`, `CREATE MATERIALIZED VIEW |`, …) never
+/// references an existing object, so the relation/object catalog is suppressed.
+/// `DROP`/`ALTER <type> <name>` name an existing object and are untouched, as are
+/// the object-type keyword slots themselves (`CREATE |`, `CREATE MATERIALIZED |`).
+#[test]
+fn create_object_new_name_slot_suppresses_existing_objects() {
+    let is_new_name = |sql: &str| {
+        SqlEditorWidget::cursor_is_at_create_object_new_name(
+            &analyze_inline_cursor_sql(sql),
+            true,
+        )
+    };
+    for sql in [
+        "CREATE TABLE my|",
+        "CREATE OR REPLACE PACKAGE p|",
+        "CREATE OR REPLACE PACKAGE BODY p|",
+        "CREATE MATERIALIZED VIEW m|",
+        "CREATE UNIQUE INDEX i|",
+        "CREATE GLOBAL TEMPORARY TABLE t|",
+        "CREATE TABLE IF NOT EXISTS t|",
+    ] {
+        assert!(is_new_name(sql), "new name for `{sql}`");
+    }
+    for sql in [
+        "CREATE |",                 // object-type keyword slot
+        "CREATE MATERIALIZED |",    // -> VIEW keyword
+        "CREATE INDEX i ON t|",     // existing table target
+        "DROP TABLE t|",            // existing object
+        "ALTER TABLE t|",           // existing object
+        "SELECT | FROM t",          // unrelated
+    ] {
+        assert!(!is_new_name(sql), "must not flag `{sql}`");
+    }
+}
+
+/// The start of a window specification (`OVER (|)` / `WINDOW name AS (|)`)
+/// accepts only the clause openers (`PARTITION BY`/`ORDER BY`/frame units) or a
+/// window-name reference, never a bare column. The column list the surrounding
+/// expression phase would offer is suppressed and the openers are emitted; once
+/// the clause body begins (`PARTITION BY |`, `ORDER BY |`) columns return.
+#[test]
+fn window_spec_start_suppresses_columns_and_offers_clause_openers() {
+    let openers = |sql: &str, prefix: &str, exclude: bool| {
+        let ctx = analyze_inline_cursor_sql(sql);
+        (
+            SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(&ctx, exclude),
+            SqlEditorWidget::collect_expected_keyword_suggestions(
+                prefix,
+                &ctx,
+                Some(crate::db::DatabaseType::Oracle),
+            ),
+        )
+    };
+    for sql in [
+        "SELECT sum(x) OVER (|) FROM t",
+        "SELECT count(*) FROM t WINDOW w AS (|)",
+    ] {
+        let (suppress, kw) = openers(sql, "", false);
+        assert!(suppress, "suppress for `{sql}`");
+        assert!(kw.iter().any(|k| k == "PARTITION BY"), "PARTITION BY for `{sql}`");
+        assert!(kw.iter().any(|k| k == "ORDER BY"), "ORDER BY for `{sql}`");
+        assert!(kw.iter().any(|k| k == "ROWS"), "ROWS for `{sql}`");
+    }
+    // Mid-typed opener (`OVER (PART|)`): the production path excludes the typed
+    // prefix, so it is still recognised and narrows to `PARTITION BY`.
+    let (suppress, kw) = openers("SELECT sum(x) OVER (PART|) FROM t", "PART", true);
+    assert!(suppress);
+    assert_eq!(kw, vec!["PARTITION BY".to_string()]);
+
+    // Inside the clause body columns must remain available.
+    for sql in [
+        "SELECT sum(x) OVER (PARTITION BY |) FROM t",
+        "SELECT sum(x) OVER (ORDER BY |) FROM t",
+        "SELECT sum(x) OVER (PARTITION BY a, |) FROM t",
+        // A non-window parenthesised expression is never a window-spec start.
+        "SELECT (|) FROM t",
+        "SELECT coalesce(|) FROM t",
+    ] {
+        assert!(
+            !openers(sql, "", false).0,
+            "must not suppress for `{sql}`"
+        );
+    }
+}
+
+/// An Oracle `TABLESAMPLE` value slot (`FROM t SAMPLE (|)`, `SAMPLE BLOCK (|)`,
+/// `... SEED (|)`) accepts only a numeric sampling percentage / seed, never a
+/// relation, even though the cursor is still in the `FROM` table phase.
+#[test]
+fn table_sample_value_slot_suppresses_relations() {
+    for sql in [
+        "SELECT * FROM t SAMPLE (|)",
+        "SELECT * FROM t SAMPLE BLOCK (|)",
+        "SELECT * FROM t SAMPLE (10) SEED (|)",
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        assert!(
+            SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(&ctx, false),
+            "suppress for `{sql}`"
+        );
+    }
+    // An ordinary FROM relation position is untouched.
+    assert!(!SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(
+        &analyze_inline_cursor_sql("SELECT * FROM |"),
+        false,
+    ));
+}
+
+/// A foreign-key referential action slot (`... REFERENCES t (...) ON DELETE |`
+/// / `ON UPDATE |`) accepts only a fixed action keyword, never a relation. The
+/// `DELETE`/`UPDATE` keyword there must not be mistaken for a DML statement (it
+/// previously fell through to the `DeleteTarget`/`UpdateTarget` table phase and
+/// offered the entire table catalog).
+#[test]
+fn referential_action_slot_suppresses_tables_and_offers_action_keywords() {
+    for sql in [
+        "CREATE TABLE c (id NUMBER REFERENCES p (id) ON DELETE |)",
+        "CREATE TABLE c (id NUMBER REFERENCES p (id) ON UPDATE |)",
+        "ALTER TABLE c ADD CONSTRAINT fk FOREIGN KEY (pid) REFERENCES p (id) ON DELETE |",
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        // Not a table-target phase any more.
+        assert!(!ctx.phase.is_table_context(), "phase for `{sql}`");
+        // Routes through the single column/identifier-suppression chokepoint.
+        assert!(
+            SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(&ctx, false),
+            "suppression for `{sql}`"
+        );
+    }
+
+    let actions = |sql: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &analyze_inline_cursor_sql(sql),
+            Some(crate::db::DatabaseType::Oracle),
+        )
+    };
+    let on_delete = actions("CREATE TABLE c (id NUMBER REFERENCES p (id) ON DELETE |)");
+    assert!(on_delete.iter().any(|k| k == "CASCADE"));
+    assert!(on_delete.iter().any(|k| k == "SET NULL"));
+    // The action slot does not leak the standalone-`DELETE` continuation `FROM`.
+    assert!(!on_delete.iter().any(|k| k == "FROM"));
+    let on_update = actions("CREATE TABLE c (id NUMBER REFERENCES p (id) ON UPDATE |)");
+    assert!(on_update.iter().any(|k| k == "CASCADE"));
+    assert!(on_update.iter().any(|k| k == "CURRENT_TIMESTAMP"));
+
+    // A standalone DML `DELETE`/`UPDATE` (not preceded by `ON`) is untouched.
+    assert!(actions("DELETE |").iter().any(|k| k == "FROM"));
+    assert!(!SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(
+        &analyze_inline_cursor_sql("DELETE |"),
+        false,
+    ));
+}
+
+/// `<sort-key> [ASC|DESC] NULLS |` accepts only `FIRST`/`LAST`, so the ORDER BY
+/// column list is suppressed and the two ordering keywords are offered instead.
+#[test]
+fn order_by_nulls_slot_suppresses_columns_and_offers_first_last() {
+    for sql in [
+        "SELECT * FROM t ORDER BY id NULLS |",
+        "SELECT * FROM t ORDER BY id ASC NULLS |",
+        "SELECT * FROM t ORDER BY id DESC NULLS |",
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        assert!(
+            SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(&ctx, false),
+            "suppression for `{sql}`"
+        );
+        let kw = SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &ctx,
+            Some(crate::db::DatabaseType::Oracle),
+        );
+        assert!(kw.iter().any(|k| k == "FIRST"), "FIRST for `{sql}`");
+        assert!(kw.iter().any(|k| k == "LAST"), "LAST for `{sql}`");
+    }
+    // A qualified member named `nulls` (`t.nulls`) is a column, not the keyword.
+    assert!(!SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(
+        &analyze_inline_cursor_sql("SELECT t.nulls | FROM t"),
+        false,
+    ));
+}
+
 /// The definition-list classifier keys off the `TABLE` keyword, so it must not
 /// engage for statements that merely contain `TABLE` without being a
 /// `CREATE TABLE` / `ALTER TABLE` definition (`CREATE TYPE … AS TABLE OF …`),

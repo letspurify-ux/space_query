@@ -4042,6 +4042,16 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             depth_frames[depth].postgres_conflict_update_active = false;
                             // Inside expressions, UPDATE can be a valid identifier/token.
                             relation_state.clear();
+                        } else if matches!(last_word.as_deref(), Some("ON")) {
+                            // `... REFERENCES t (...) ON UPDATE <action>` (and the MySQL
+                            // column-default `... ON UPDATE CURRENT_TIMESTAMP`) use UPDATE
+                            // as a referential-action keyword, not a DML statement. Only a
+                            // fixed keyword follows, never a relation, so drop any
+                            // table-target expectation for the slot.
+                            depth_frames[depth].locking_clause_active = false;
+                            depth_frames[depth].postgres_conflict_update_active = false;
+                            depth_frames[depth].phase = SqlPhase::Initial;
+                            relation_state.clear();
                         } else {
                             depth_frames[depth].locking_clause_active = false;
                             depth_frames[depth].phase = SqlPhase::UpdateTarget;
@@ -4075,6 +4085,14 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         );
                         if is_expression_context {
                             // Inside expressions, DELETE can be a valid identifier/token.
+                            relation_state.clear();
+                        } else if matches!(last_word.as_deref(), Some("ON")) {
+                            // `... REFERENCES t (...) ON DELETE <action>` is a foreign-key
+                            // referential action, not a standalone DELETE statement: the
+                            // slot accepts only `CASCADE`/`SET NULL`/… keywords, never a
+                            // relation. Drop any table-target expectation so the slot is
+                            // not classified as a table phase.
+                            depth_frames[depth].phase = SqlPhase::Initial;
                             relation_state.clear();
                         } else if is_merge_action_keyword || is_merge_delete_where {
                             // `MERGE ... WHEN MATCHED THEN DELETE WHERE ...` DELETE is an

@@ -910,6 +910,11 @@ impl SqlEditorWidget {
                     deep_ctx,
                     !snapshot.prefix.is_empty(),
                 ))
+            || (qualifier.is_none()
+                && Self::cursor_is_at_create_object_new_name(
+                    deep_ctx,
+                    !snapshot.prefix.is_empty(),
+                ))
         {
             Self::clear_intellisense_ui_state(intellisense_popup, runtime);
             return;
@@ -1848,6 +1853,229 @@ impl SqlEditorWidget {
         spec_paren_stack.last().copied().unwrap_or(false)
     }
 
+    /// True when the cursor sits at the very start of a window specification —
+    /// immediately after the `OVER (` / `WINDOW name AS (` open paren, before any
+    /// `PARTITION`/`ORDER`/frame keyword has been typed. Only the clause openers
+    /// (`PARTITION BY`, `ORDER BY`, `ROWS`/`RANGE`/`GROUPS`) or a window-name
+    /// reference are grammatical there; a bare column is never valid, so the
+    /// column list the surrounding expression phase would offer is suppressed and
+    /// the openers are emitted instead. Gated through `cursor_is_inside_window_spec`
+    /// so a parenthesised expression outside a window never triggers it, and on the
+    /// previous token being the open paren so it stops applying once the clause
+    /// body (`PARTITION BY |`, `ORDER BY |`, …) begins.
+    fn cursor_is_at_window_spec_start(tokens: &[SqlToken], end: usize) -> bool {
+        if !Self::cursor_is_inside_window_spec(tokens, end) {
+            return false;
+        }
+        matches!(
+            Self::meaningful_tokens_before(tokens, end).last(),
+            Some(SqlToken::Symbol(sym)) if sym == "("
+        )
+    }
+
+    fn cursor_is_at_window_spec_start_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::cursor_is_at_window_spec_start(tokens, end)
+    }
+
+    /// Clause-opener hints for the start of a window specification (`OVER (|)` /
+    /// `WINDOW name AS (|)`). Mirrors the suppression arm
+    /// `cursor_is_at_window_spec_start` so identifier suppression cannot drift
+    /// from keyword emission.
+    fn expected_window_spec_start_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> Option<&'static [&'static str]> {
+        const OPENERS: &[&str] = &["PARTITION BY", "ORDER BY", "ROWS", "RANGE", "GROUPS"];
+        if Self::cursor_is_at_window_spec_start(tokens, end) {
+            Some(OPENERS)
+        } else {
+            None
+        }
+    }
+
+    /// The PL/SQL `%`-attribute hints at the cursor, if any — `<var>%|` /
+    /// `<table>%|` -> `TYPE`/`ROWTYPE`, `<table>.<col>%|` -> `TYPE` (a column has
+    /// no row type). Anchored on the `%` being preceded by an identifier chain
+    /// that itself sits at a data-type slot, so the modulo operator in an
+    /// expression (`v := a % |`, never a type slot) is left as a value position.
+    /// Only `TYPE`/`ROWTYPE` are grammatical after the attribute `%`, so the
+    /// matching suppression arm clears every other identifier source there.
+    fn type_attribute_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> Option<&'static [&'static str]> {
+        const DOTTED: &[&str] = &["TYPE"];
+        const SIMPLE: &[&str] = &["TYPE", "ROWTYPE"];
+
+        let indexed: Vec<(usize, &SqlToken)> = tokens
+            .get(..end.min(tokens.len()))
+            .unwrap_or(tokens)
+            .iter()
+            .enumerate()
+            .filter(|(_, token)| !matches!(token, SqlToken::Comment(_)))
+            .collect();
+        let is_word = |token: &SqlToken| matches!(token, SqlToken::Word(_));
+        let is_symbol = |token: &SqlToken, sym: &str| {
+            matches!(token, SqlToken::Symbol(value) if value == sym)
+        };
+
+        let mut i = indexed.len().checked_sub(1)?;
+        if !is_symbol(indexed[i].1, "%") {
+            return None;
+        }
+        // The identifier immediately before `%`.
+        i = i.checked_sub(1)?;
+        if !is_word(indexed[i].1) {
+            return None;
+        }
+        let mut has_dot = false;
+        let mut chain_start = indexed[i].0;
+        // Walk back over any `. <identifier>` qualifier links.
+        while i >= 2 && is_symbol(indexed[i - 1].1, ".") && is_word(indexed[i - 2].1) {
+            has_dot = true;
+            i -= 2;
+            chain_start = indexed[i].0;
+        }
+        // The chain only forms a `%TYPE`/`%ROWTYPE` attribute where the chain
+        // itself began at a data-type slot; reuse the type-position detector at the
+        // slot start so a modulo operand is never mistaken for an attribute.
+        if Self::data_type_position(tokens, chain_start).is_some() {
+            Some(if has_dot { DOTTED } else { SIMPLE })
+        } else {
+            None
+        }
+    }
+
+    fn cursor_is_at_type_attribute_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::type_attribute_candidates(tokens, end).is_some()
+    }
+
+    /// Privilege hints for the `GRANT |` / `REVOKE |` privilege list, before the
+    /// `ON`/`TO`/`FROM` separator. Emission only — a role name is also valid here
+    /// (`GRANT my_role TO u`), so identifiers are NOT suppressed; the privileges
+    /// are merged alongside them. Anchored on the controlling verb with no `ON`/
+    /// `TO`/`FROM` seen yet and the cursor right after the verb or a list comma.
+    fn expected_grant_privilege_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> Option<&'static [&'static str]> {
+        const PRIVILEGES: &[&str] = &[
+            "SELECT",
+            "INSERT",
+            "UPDATE",
+            "DELETE",
+            "REFERENCES",
+            "ALTER",
+            "INDEX",
+            "EXECUTE",
+            "READ",
+            "ALL",
+            "ALL PRIVILEGES",
+        ];
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        // The cursor must sit right after the verb (`GRANT |`) or a privilege-list
+        // comma (`GRANT SELECT, |`).
+        let after_verb_or_comma = matches!(
+            toks.last(),
+            Some(SqlToken::Word(word))
+                if word.eq_ignore_ascii_case("GRANT") || word.eq_ignore_ascii_case("REVOKE")
+        ) || matches!(toks.last(), Some(SqlToken::Symbol(sym)) if sym == ",");
+        if !after_verb_or_comma {
+            return None;
+        }
+        // Scan back to the controlling verb; bail if a clause separator already
+        // moved the cursor past the privilege list.
+        for token in toks.iter().rev() {
+            if let SqlToken::Word(word) = token {
+                let upper = word.to_ascii_uppercase();
+                match upper.as_str() {
+                    "GRANT" | "REVOKE" => return Some(PRIVILEGES),
+                    "ON" | "TO" | "FROM" => return None,
+                    _ => {}
+                }
+            }
+        }
+        None
+    }
+
+    /// True when the cursor is at the brand-new object name of a `CREATE`
+    /// statement — the slot right after the leaf object-type keyword (`CREATE
+    /// TABLE |`, `CREATE OR REPLACE PACKAGE |`, `CREATE MATERIALIZED VIEW |`,
+    /// `CREATE TABLE IF NOT EXISTS |`, …). The name is brand new, so existing
+    /// relations/objects are never valid there and are suppressed. Scoped to a
+    /// `CREATE` statement (so `DROP`/`ALTER <type> <existing>` keep their existing-
+    /// object completion) and to the leaf type keywords that directly introduce a
+    /// name (a non-leaf such as `MATERIALIZED`/`GLOBAL`/`OR REPLACE` still expects
+    /// a following keyword, handled by the keyword merge).
+    fn cursor_is_at_create_object_new_name(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> bool {
+        const NAME_INTRODUCERS: &[&str] = &[
+            "TABLE",
+            "VIEW",
+            "INDEX",
+            "SEQUENCE",
+            "SYNONYM",
+            "PROCEDURE",
+            "FUNCTION",
+            "TRIGGER",
+            "PACKAGE",
+            "TYPE",
+            "BODY",
+            "DATABASE",
+            "TABLESPACE",
+            "USER",
+            "ROLE",
+            "PROFILE",
+            "DIRECTORY",
+            "CONTEXT",
+            "CLUSTER",
+            "DIMENSION",
+            "OPERATOR",
+            "LIBRARY",
+            // MySQL/`CREATE … IF NOT EXISTS <name>`.
+            "EXISTS",
+        ];
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        let words = Self::previous_meaningful_words_upper(tokens, end, 12);
+        // Statement must be a CREATE (not DROP/ALTER, whose `<type> <name>` slots
+        // reference an existing object), and the cursor must be past the type
+        // keyword (`CREATE |` itself still wants an object-type keyword).
+        if words.first().map(String::as_str) != Some("CREATE") || words.len() < 2 {
+            return false;
+        }
+        words
+            .last()
+            .is_some_and(|word| NAME_INTRODUCERS.contains(&word.as_str()))
+    }
+
     /// Window-frame keyword hints inside an `OVER (... ROWS|RANGE|GROUPS ...)`
     /// clause. The sibling of `expected_row_limiting_keyword_candidates`: these
     /// positions expect frame keywords (`BETWEEN`, `UNBOUNDED PRECEDING`,
@@ -2516,6 +2744,14 @@ impl SqlEditorWidget {
                 deep_ctx,
                 exclude_current_identifier_chain,
             )
+            || Self::cursor_is_at_window_spec_start_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
+            || Self::cursor_is_at_type_attribute_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
             || Self::extract_field_position_for_context(deep_ctx, exclude_current_identifier_chain)
                 .is_some()
             || Self::interval_unit_position_for_context(deep_ctx, exclude_current_identifier_chain)
@@ -2536,6 +2772,41 @@ impl SqlEditorWidget {
                 deep_ctx,
                 exclude_current_identifier_chain,
             )
+            || Self::cursor_is_in_table_sample_clause_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
+    }
+
+    /// True when the cursor is inside an Oracle `TABLESAMPLE`/row-sampling clause
+    /// value slot — `FROM t SAMPLE (|)`, `FROM t SAMPLE BLOCK (|)`, or the
+    /// `... SAMPLE (n) SEED (|)` seed slot. These accept only a numeric sampling
+    /// percentage / seed, never a relation or column, but the cursor is still in
+    /// the `FROM` table phase, so the relation list would otherwise leak there.
+    /// Gated on a table context and on the enclosing paren's introducer word so a
+    /// same-named function or column elsewhere is untouched; the slot is
+    /// value-only, so no keyword is emitted (the popup simply stays empty).
+    fn cursor_is_in_table_sample_clause(tokens: &[SqlToken], end: usize) -> bool {
+        Self::innermost_open_paren_preceding_word(tokens, end).is_some_and(|word| {
+            matches!(word.to_ascii_uppercase().as_str(), "SAMPLE" | "SEED" | "BLOCK")
+        })
+    }
+
+    fn cursor_is_in_table_sample_clause_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> bool {
+        if !deep_ctx.phase.is_table_context() {
+            return false;
+        }
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::cursor_is_in_table_sample_clause(tokens, end)
     }
 
     /// True when the cursor sits at a "pure clause-keyword continuation" slot:
@@ -2594,6 +2865,20 @@ impl SqlEditorWidget {
             }
             [.., prev, last] if *prev == "ORDER" && *last == "SIBLINGS" => true,
             [.., last] if !trigger_is_qualified_member && *last == "START" => true,
+            // `<sort-key> [ASC|DESC] NULLS |` -> FIRST / LAST. Only those two
+            // keywords are grammatical after NULLS, so the column list that the
+            // surrounding ORDER BY phase would otherwise offer is suppressed.
+            [.., last] if !trigger_is_qualified_member && *last == "NULLS" => true,
+            // `... REFERENCES t (...) ON DELETE |` / `ON UPDATE |` -> a fixed
+            // referential-action keyword (`CASCADE`, `SET NULL`, …), never a
+            // relation. Anchored on the `ON` immediately before so a DML
+            // `DELETE`/`UPDATE` statement keyword (not preceded by `ON`) is left
+            // alone.
+            [.., prev, last]
+                if *prev == "ON" && matches!(last.as_str(), "DELETE" | "UPDATE") =>
+            {
+                true
+            }
             [.., last]
                 if in_table_context
                     && matches!(
@@ -3582,6 +3867,25 @@ impl SqlEditorWidget {
             return Self::filter_expected_candidates(prefix, candidates);
         }
 
+        if let Some(candidates) =
+            Self::expected_window_spec_start_keyword_candidates(tokens, context_end)
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+
+        if let Some(candidates) = Self::type_attribute_candidates(tokens, context_end) {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+
+        // GRANT/REVOKE privilege keywords. Emission only — these merge with the
+        // identifier base (a role name is also grantable here), so the privilege
+        // slot is deliberately left out of the suppression chokepoint.
+        if let Some(candidates) =
+            Self::expected_grant_privilege_keyword_candidates(tokens, context_end)
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+
         if let Some(position) = Self::data_type_position(tokens, context_end) {
             return Self::filter_expected_candidates(
                 prefix,
@@ -3683,6 +3987,24 @@ impl SqlEditorWidget {
             }
             [.., prev, last] if *prev == "ORDER" && *last == "SIBLINGS" => &["BY"],
             [.., last] if !trigger_is_qualified_member && *last == "START" => &["WITH"],
+            // `<sort-key> [ASC|DESC] NULLS |` -> FIRST / LAST (mirrors the
+            // matching suppression arm in the continuation predicate).
+            [.., last] if !trigger_is_qualified_member && *last == "NULLS" => &["FIRST", "LAST"],
+            // Foreign-key referential actions: `ON DELETE |` / `ON UPDATE |`. The
+            // `ON UPDATE` slot additionally admits the MySQL column-default
+            // `CURRENT_TIMESTAMP`. Anchored on `ON` so a DML `DELETE`/`UPDATE`
+            // statement keyword keeps its own continuation below.
+            [.., prev, last] if *prev == "ON" && *last == "DELETE" => {
+                &["CASCADE", "SET NULL", "SET DEFAULT", "NO ACTION", "RESTRICT"]
+            }
+            [.., prev, last] if *prev == "ON" && *last == "UPDATE" => &[
+                "CASCADE",
+                "SET NULL",
+                "SET DEFAULT",
+                "NO ACTION",
+                "RESTRICT",
+                "CURRENT_TIMESTAMP",
+            ],
             // `<expr> IS NOT |` -> NULL; `<expr> IS |` -> NOT / NULL. Only keywords
             // are grammatical after `IS`, so the matching suppression predicate
             // (`cursor_is_at_is_null_test_keyword_position_for_context`) clears the
