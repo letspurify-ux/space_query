@@ -29,6 +29,15 @@ const LAZY_PREFETCH_ROWS: u32 = LAZY_FETCH_ARRAY_SIZE;
 const MAX_NESTED_CURSOR_DEPTH: usize = 8;
 const ORACLE_OBJECT_DDL_SQL: &str = "SELECT DBMS_METADATA.GET_DDL(:1, :2, :3) FROM DUAL";
 
+/// Session-level DBMS_METADATA transform params applied before GET_DDL so the
+/// generated CREATE statement omits physical storage clauses that the user did
+/// not author (segment attributes, STORAGE, TABLESPACE).
+const ORACLE_DDL_TRANSFORM_PLSQL: &str = "BEGIN \
+DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'SEGMENT_ATTRIBUTES', FALSE); \
+DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'STORAGE', FALSE); \
+DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'TABLESPACE', FALSE); \
+END;";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct NestedCursorDisplay {
     columns: Vec<String>,
@@ -10390,6 +10399,10 @@ impl ObjectBrowser {
     ) -> Result<String, OracleError> {
         let (owner, object_name) =
             QueryExecutor::split_current_schema_owner_object_name(conn, object_name)?;
+        if let Err(err) = conn.execute(ORACLE_DDL_TRANSFORM_PLSQL, &[]) {
+            logging::log_error("executor", &format!("Database operation failed: {err}"));
+            return Err(err);
+        }
         let mut stmt = match conn.statement(ORACLE_OBJECT_DDL_SQL).build() {
             Ok(stmt) => stmt,
             Err(err) => {
@@ -10441,6 +10454,11 @@ impl ObjectBrowser {
     ) -> Result<String, String> {
         let (owner, object_name) =
             Self::thin_split_current_schema_owner_object_name(conn, object_name)?;
+        conn.execute_typed(
+            &OracleThinStatementRequest::statement(ORACLE_DDL_TRANSFORM_PLSQL),
+            &[],
+        )
+        .map_err(|err| err.to_string())?;
         let object_type = Self::metadata_object_type(object_type);
         let binds = || {
             vec![
