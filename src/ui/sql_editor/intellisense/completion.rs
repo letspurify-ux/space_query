@@ -1052,6 +1052,14 @@ impl SqlEditorWidget {
         let at_data_type_position = qualifier.is_none()
             && Self::data_type_position_for_context(deep_ctx, !snapshot.prefix.is_empty())
                 .is_some();
+        let cursor_inside_case = Self::cursor_is_inside_unclosed_case(
+            Self::current_query_tokens(deep_ctx),
+            Self::cursor_token_len_in_current_query(deep_ctx),
+        );
+        let cursor_inside_window_spec = Self::cursor_is_inside_window_spec(
+            Self::current_query_tokens(deep_ctx),
+            Self::cursor_token_len_in_current_query(deep_ctx),
+        );
         let include_columns = !has_local_record_member_scope
             && !at_keyword_only_slot
             && (matches!(
@@ -1361,6 +1369,8 @@ impl SqlEditorWidget {
                     context,
                     restrict_to_relation_columns,
                     Some(snapshot.preferred_db_type),
+                    cursor_inside_case,
+                    cursor_inside_window_spec,
                 )
             }
         };
@@ -1587,6 +1597,8 @@ impl SqlEditorWidget {
         context: SqlContext,
         restrict_to_relation_columns: bool,
         db_type: Option<crate::db::DatabaseType>,
+        cursor_inside_case: bool,
+        cursor_inside_window_spec: bool,
     ) -> Vec<String> {
         if qualifier.is_some() {
             return Self::scoped_column_suggestions(data, prefix, column_scope);
@@ -1604,13 +1616,74 @@ impl SqlEditorWidget {
             return Self::scoped_column_suggestions(data, prefix, column_scope);
         }
 
-        data.get_suggestions_for_db(
+        let prefer_columns = matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll);
+        let mut suggestions = data.get_suggestions_for_db(
             prefix,
             include_columns,
             column_scope,
             false,
-            matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
+            prefer_columns,
             db_type,
+        );
+        // The base keyword catalog is a flat prefix-filtered list, so it offers
+        // construct-scoped keywords at every value/column position even when the
+        // cursor is outside the construct that gives them meaning. Those are pure
+        // noise there and never grammatical:
+        //   * CASE-body keywords (`WHEN`/`THEN`/`ELSE`/`ELSIF`/`END`) outside an
+        //     open `CASE` (`SELECT en|` → `END`, `WHERE th|` → `THEN`).
+        //   * Window-frame keywords (`PRECEDING`/`FOLLOWING`/`UNBOUNDED`) outside
+        //     a window specification (`SELECT pr|` → `PRECEDING`).
+        //   * The MERGE merge-action keyword `MATCHED`, which only follows `WHEN
+        //     [NOT]` in a MERGE statement — never a value/column position. (Its
+        //     legitimate slot is re-supplied by the contextual keyword merge in
+        //     `apply_intellisense_with_context`, so dropping it from the flat base
+        //     catalog here cannot hide it where it belongs.)
+        // Unlike the unconditional DDL-keyword filter the CASE/window families are
+        // context-dependent, so each is gated on the cursor not sitting inside its
+        // construct; all are scoped to a value/column context (PL/SQL block
+        // contexts, where `ELSE`/`END`/`ELSIF` close `IF`/loops/blocks, classify
+        // as `General` and are left untouched). A genuine column named like one of
+        // these keywords is preserved.
+        if prefer_columns {
+            let strip_case = !cursor_inside_case;
+            let strip_frame = !cursor_inside_window_spec;
+            suggestions.retain(|suggestion| {
+                let out_of_context = (strip_case && Self::is_case_clause_keyword(suggestion))
+                    || (strip_frame && Self::is_window_frame_only_keyword(suggestion))
+                    || Self::is_merge_action_only_keyword(suggestion);
+                !out_of_context
+                    || data
+                        .get_column_suggestions(suggestion, column_scope)
+                        .iter()
+                        .any(|column| column.eq_ignore_ascii_case(suggestion))
+            });
+        }
+        suggestions
+    }
+
+    /// The keywords that only occur inside a `CASE` expression's body. Used to
+    /// strip them from value/column completion outside an open `CASE`.
+    fn is_case_clause_keyword(word: &str) -> bool {
+        matches!(
+            word.to_ascii_uppercase().as_str(),
+            "WHEN" | "THEN" | "ELSE" | "ELSIF" | "END"
+        )
+    }
+
+    /// The MERGE merge-action keyword that only follows `WHEN [NOT]` in a MERGE
+    /// statement and is never grammatical in a value/column expression.
+    fn is_merge_action_only_keyword(word: &str) -> bool {
+        word.eq_ignore_ascii_case("MATCHED")
+    }
+
+    /// The window-frame boundary keywords that only occur inside a window
+    /// specification's frame clause (`ROWS/RANGE/GROUPS BETWEEN … PRECEDING/
+    /// FOLLOWING`, `UNBOUNDED …`). They have no meaning anywhere else, so they
+    /// are stripped from value/column completion outside a window spec.
+    fn is_window_frame_only_keyword(word: &str) -> bool {
+        matches!(
+            word.to_ascii_uppercase().as_str(),
+            "PRECEDING" | "FOLLOWING" | "UNBOUNDED"
         )
     }
 

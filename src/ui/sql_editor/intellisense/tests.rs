@@ -560,6 +560,14 @@ fn mysql_context_and_suggestions_for_inline_sql(
         deep_ctx.statement_tokens.as_ref(),
     );
     let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+    let cursor_inside_case = SqlEditorWidget::cursor_is_inside_unclosed_case(
+        SqlEditorWidget::current_query_tokens(&deep_ctx),
+        SqlEditorWidget::cursor_token_len_in_current_query(&deep_ctx),
+    );
+    let cursor_inside_window_spec = SqlEditorWidget::cursor_is_inside_window_spec(
+        SqlEditorWidget::current_query_tokens(&deep_ctx),
+        SqlEditorWidget::cursor_token_len_in_current_query(&deep_ctx),
+    );
     let mut data = IntellisenseData::new();
     let suggestions = SqlEditorWidget::base_suggestions_for_context(
         &mut data,
@@ -570,6 +578,8 @@ fn mysql_context_and_suggestions_for_inline_sql(
         context,
         false,
         Some(crate::db::DatabaseType::MySQL),
+        cursor_inside_case,
+        cursor_inside_window_spec,
     );
 
     (context, suggestions)
@@ -5471,6 +5481,8 @@ fn base_suggestions_for_table_context_with_prefix_stay_relation_only() {
         SqlContext::TableName,
         false,
         None,
+        false,
+        false,
     );
 
     assert_has_case_insensitive(&suggestions, "CONFIG");
@@ -5510,6 +5522,8 @@ fn base_suggestions_for_restricted_column_context_with_prefix_stay_column_only()
         SqlContext::ColumnName,
         true,
         None,
+        false,
+        false,
     );
 
     assert_has_case_insensitive(&suggestions, "CODE");
@@ -20751,6 +20765,8 @@ fn qualified_base_suggestions_for(
         context,
         ClauseCompletionPolicy::for_phase(ctx.phase, true).restrict_to_relation_columns,
         None,
+        false,
+        false,
     )
 }
 
@@ -21358,4 +21374,130 @@ fn local_record_member_scope_boundary_and_nested_loops() {
     )
     .expect("enclosing loop record visible inside inner loop");
     assert_has_case_insensitive(&outer, "x");
+}
+
+
+/// The flat base keyword catalog used to offer the `CASE`-body keywords
+/// (`WHEN`/`THEN`/`ELSE`/`ELSIF`/`END`) at every value/column position, even
+/// with no `CASE` open (`SELECT en|` → `END`, `WHERE th|` → `THEN`). Those are
+/// only grammatical inside an unclosed `CASE`, so they are suppressed in a
+/// value/column context outside one and restored inside it. A column that
+/// happens to be named like one of these keywords is never hidden.
+#[test]
+fn case_clause_keywords_are_scoped_to_open_case() {
+    use crate::db::DatabaseType::Oracle;
+
+    fn suggestions(sql_with_cursor: &str, extra_emp_columns: &[&str]) -> Vec<String> {
+        let cursor = sql_with_cursor.find('|').expect("cursor marker");
+        let sql = sql_with_cursor.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql_with_cursor);
+        let context =
+            SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+        let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &ctx);
+        let column_scope = (!column_tables.is_empty()).then(|| column_tables.clone());
+        let cursor_inside_case = SqlEditorWidget::cursor_is_inside_unclosed_case(
+            SqlEditorWidget::current_query_tokens(&ctx),
+            SqlEditorWidget::cursor_token_len_in_current_query(&ctx),
+        );
+        let cursor_inside_window_spec = SqlEditorWidget::cursor_is_inside_window_spec(
+            SqlEditorWidget::current_query_tokens(&ctx),
+            SqlEditorWidget::cursor_token_len_in_current_query(&ctx),
+        );
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["EMP".to_string()];
+        let mut emp_columns = vec!["ENAME".to_string(), "EMPNO".to_string()];
+        emp_columns.extend(extra_emp_columns.iter().map(|c| c.to_string()));
+        data.set_columns_for_table("EMP", emp_columns);
+        data.rebuild_indices();
+        SqlEditorWidget::base_suggestions_for_context(
+            &mut data,
+            &prefix,
+            None,
+            column_scope.as_deref(),
+            matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
+            context,
+            false,
+            Some(Oracle),
+            cursor_inside_case,
+            cursor_inside_window_spec,
+        )
+    }
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+
+    // Outside a CASE the body keywords are pure noise and must be dropped, while
+    // the real columns of the position still come through.
+    let s = suggestions("SELECT en| FROM emp", &[]);
+    assert!(!has(&s, "END"), "END leaked outside CASE: {s:?}");
+    assert!(has(&s, "ENAME"), "real column dropped: {s:?}");
+    for (sql, kw) in [
+        ("SELECT el| FROM emp", "ELSE"),
+        ("SELECT el| FROM emp", "ELSIF"),
+        ("SELECT * FROM emp WHERE th|", "THEN"),
+        ("SELECT * FROM emp WHERE en| = 1", "END"),
+        ("SELECT ename FROM emp GROUP BY th|", "THEN"),
+    ] {
+        let s = suggestions(sql, &[]);
+        assert!(!has(&s, kw), "{kw} leaked outside CASE for `{sql}`: {s:?}");
+    }
+
+    // Inside an unclosed CASE the body keywords are grammatical again.
+    let s = suggestions("SELECT CASE WHEN empno = 1 th| FROM emp", &[]);
+    assert!(has(&s, "THEN"), "THEN suppressed inside CASE: {s:?}");
+    let s = suggestions("SELECT CASE WHEN empno = 1 THEN 2 en| FROM emp", &[]);
+    assert!(has(&s, "END"), "END suppressed inside CASE: {s:?}");
+    let s = suggestions("SELECT CASE WHEN empno = 1 THEN 2 el| FROM emp", &[]);
+    assert!(has(&s, "ELSE"), "ELSE suppressed inside CASE: {s:?}");
+
+    // A column literally named like a CASE keyword is preserved even outside a
+    // CASE — the filter never hides a legitimate completion.
+    let s = suggestions("SELECT en| FROM emp", &["END"]);
+    assert!(has(&s, "END"), "column named END was hidden: {s:?}");
+
+    // The same flat-catalog problem applies to the window-frame boundary
+    // keywords (`PRECEDING`/`FOLLOWING`/`UNBOUNDED`): they are only grammatical
+    // inside a window specification's frame clause, so outside any window spec
+    // they are stripped, but inside an `OVER (...)` / `WINDOW … AS (...)` they
+    // remain available.
+    for (sql, kw) in [
+        ("SELECT pr| FROM emp", "PRECEDING"),
+        ("SELECT fo| FROM emp", "FOLLOWING"),
+        ("SELECT un| FROM emp", "UNBOUNDED"),
+        ("SELECT * FROM emp WHERE pr| = 1", "PRECEDING"),
+    ] {
+        let s = suggestions(sql, &[]);
+        assert!(!has(&s, kw), "{kw} leaked outside window spec for `{sql}`: {s:?}");
+    }
+    let s = suggestions(
+        "SELECT SUM(empno) OVER (ORDER BY empno ROWS BETWEEN un| FROM emp",
+        &[],
+    );
+    assert!(has(&s, "UNBOUNDED"), "UNBOUNDED suppressed inside window frame: {s:?}");
+    let s = suggestions(
+        "SELECT SUM(empno) OVER (ORDER BY empno ROWS BETWEEN 1 pr| FROM emp",
+        &[],
+    );
+    assert!(has(&s, "PRECEDING"), "PRECEDING suppressed inside window frame: {s:?}");
+    // A column named like a frame keyword is preserved outside a window spec.
+    let s = suggestions("SELECT pr| FROM emp", &["PRECEDING"]);
+    assert!(has(&s, "PRECEDING"), "column named PRECEDING was hidden: {s:?}");
+
+    // The MERGE action keyword `MATCHED` only follows `WHEN [NOT]`; it must not
+    // leak into a value/column position.
+    for sql in ["SELECT ma| FROM emp", "SELECT * FROM emp WHERE ma| = 1"] {
+        let s = suggestions(sql, &[]);
+        assert!(!has(&s, "MATCHED"), "MATCHED leaked into value position for `{sql}`: {s:?}");
+    }
+    // Its legitimate MERGE slot is still served by the contextual keyword merge.
+    let ctx = analyze_inline_cursor_sql(
+        "MERGE INTO emp e USING dept d ON (e.empno = d.deptno) WHEN ma|",
+    );
+    let kw = SqlEditorWidget::collect_expected_keyword_suggestions("ma", &ctx, Some(Oracle));
+    assert!(
+        kw.iter().any(|k| k.eq_ignore_ascii_case("MATCHED")),
+        "MERGE WHEN slot lost MATCHED: {kw:?}"
+    );
+    // A column named MATCHED is preserved in a value position.
+    let s = suggestions("SELECT ma| FROM emp", &["MATCHED"]);
+    assert!(has(&s, "MATCHED"), "column named MATCHED was hidden: {s:?}");
 }
