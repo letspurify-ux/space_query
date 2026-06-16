@@ -2797,6 +2797,19 @@ impl ResultTableWidget {
                         );
                     }
 
+                    // PageUp/PageDown move the selection through the native Fl_Table
+                    // handler (super_handle_first=true) without going through our
+                    // navigation branches, so the snapshot is never refreshed. Sync it
+                    // here so a following Ctrl+Left/Right (or Home/End) navigates from
+                    // the current row, not the pre-paging one.
+                    if matches!(key, Key::PageUp | Key::PageDown) {
+                        Self::sync_drag_selection_snapshot(
+                            &table_for_handle,
+                            &drag_state_for_handle,
+                        );
+                        return false;
+                    }
+
                     if matches!(key, Key::Left | Key::Right | Key::Up | Key::Down) {
                         let hidden_col = *hidden_auto_rowid_col_for_handle
                             .lock()
