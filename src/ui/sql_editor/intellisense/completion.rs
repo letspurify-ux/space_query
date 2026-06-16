@@ -4,6 +4,37 @@ struct AsyncIntellisenseParseResult {
     routine_cache: RoutineSymbolCacheEntry,
 }
 
+/// Cursor-position facts that decide which keywords are grammatical at a
+/// value/column expression slot, so the base catalog can be filtered down to an
+/// allowlist of position-valid keywords instead of dumping the whole catalog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ExpressionKeywordContext {
+    /// Cursor sits inside an unclosed `CASE` (its body keywords are valid).
+    inside_case: bool,
+    /// Cursor sits inside an `OVER (...)` / `WINDOW … AS (...)` specification.
+    inside_window_spec: bool,
+    /// Cursor is in a query-level `ORDER BY` (admits `ASC`/`DESC`/`NULLS`).
+    in_order_by: bool,
+    /// Whether the cursor follows a complete operand: `Some(true)` after one
+    /// (operators are valid), `Some(false)` where a new operand is expected
+    /// (value/expression starters are valid), `None` when ambiguous (both).
+    follows_operand: Option<bool>,
+}
+
+impl ExpressionKeywordContext {
+    /// A non-committal context (used where the expression-keyword filter does not
+    /// run, e.g. table/qualified slots) that admits both keyword families.
+    #[cfg(test)]
+    fn ambiguous() -> Self {
+        Self {
+            inside_case: false,
+            inside_window_spec: false,
+            in_order_by: false,
+            follows_operand: None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SelectListWildcardMode {
     None,
@@ -1052,14 +1083,8 @@ impl SqlEditorWidget {
         let at_data_type_position = qualifier.is_none()
             && Self::data_type_position_for_context(deep_ctx, !snapshot.prefix.is_empty())
                 .is_some();
-        let cursor_inside_case = Self::cursor_is_inside_unclosed_case(
-            Self::current_query_tokens(deep_ctx),
-            Self::cursor_token_len_in_current_query(deep_ctx),
-        );
-        let cursor_inside_window_spec = Self::cursor_is_inside_window_spec(
-            Self::current_query_tokens(deep_ctx),
-            Self::cursor_token_len_in_current_query(deep_ctx),
-        );
+        let expr_keyword_ctx =
+            Self::expression_keyword_context(deep_ctx);
         let include_columns = !has_local_record_member_scope
             && !at_keyword_only_slot
             && (matches!(
@@ -1369,8 +1394,7 @@ impl SqlEditorWidget {
                     context,
                     restrict_to_relation_columns,
                     Some(snapshot.preferred_db_type),
-                    cursor_inside_case,
-                    cursor_inside_window_spec,
+                    expr_keyword_ctx,
                 )
             }
         };
@@ -1597,8 +1621,7 @@ impl SqlEditorWidget {
         context: SqlContext,
         restrict_to_relation_columns: bool,
         db_type: Option<crate::db::DatabaseType>,
-        cursor_inside_case: bool,
-        cursor_inside_window_spec: bool,
+        expr_keyword_ctx: ExpressionKeywordContext,
     ) -> Vec<String> {
         if qualifier.is_some() {
             return Self::scoped_column_suggestions(data, prefix, column_scope);
@@ -1625,66 +1648,230 @@ impl SqlEditorWidget {
             prefer_columns,
             db_type,
         );
-        // The base keyword catalog is a flat prefix-filtered list, so it offers
-        // construct-scoped keywords at every value/column position even when the
-        // cursor is outside the construct that gives them meaning. Those are pure
-        // noise there and never grammatical:
-        //   * CASE-body keywords (`WHEN`/`THEN`/`ELSE`/`ELSIF`/`END`) outside an
-        //     open `CASE` (`SELECT en|` → `END`, `WHERE th|` → `THEN`).
-        //   * Window-frame keywords (`PRECEDING`/`FOLLOWING`/`UNBOUNDED`) outside
-        //     a window specification (`SELECT pr|` → `PRECEDING`).
-        //   * The MERGE merge-action keyword `MATCHED`, which only follows `WHEN
-        //     [NOT]` in a MERGE statement — never a value/column position. (Its
-        //     legitimate slot is re-supplied by the contextual keyword merge in
-        //     `apply_intellisense_with_context`, so dropping it from the flat base
-        //     catalog here cannot hide it where it belongs.)
-        // Unlike the unconditional DDL-keyword filter the CASE/window families are
-        // context-dependent, so each is gated on the cursor not sitting inside its
-        // construct; all are scoped to a value/column context (PL/SQL block
-        // contexts, where `ELSE`/`END`/`ELSIF` close `IF`/loops/blocks, classify
-        // as `General` and are left untouched). A genuine column named like one of
-        // these keywords is preserved.
+        // The base catalog mixes columns, relations, objects and functions (kept
+        // as-is) with a *flat, prefix-only* dump of the entire keyword list. That
+        // dump is the sole source of keyword noise in a value/column expression —
+        // it offers clause/statement/DDL keywords (`FROM`/`CREATE`/`TABLESPACE`),
+        // construct-scoped keywords outside their construct (`END` with no `CASE`,
+        // `PRECEDING` with no window), and operators in the wrong slot (`AND` at an
+        // operand-start). Instead of blocklisting the bad ones (open-ended, risks
+        // hiding a valid keyword) we *allowlist* the keywords that are genuinely
+        // grammatical at the cursor: a keyword survives only when it can appear at
+        // this expression position. Every keyword valid only at a dedicated slot
+        // (data type, EXTRACT field, INTERVAL unit, JSON `RETURNING`, window frame
+        // bound, MERGE `WHEN`, …) is already re-supplied by the grammar-aware
+        // `collect_expected_keyword_suggestions` merge, so dropping it from this
+        // flat dump cannot hide it where it belongs. Columns, relations, objects
+        // and functions are never touched, and a column named like a keyword is
+        // preserved.
         if prefer_columns {
-            let strip_case = !cursor_inside_case;
-            let strip_frame = !cursor_inside_window_spec;
             suggestions.retain(|suggestion| {
-                let out_of_context = (strip_case && Self::is_case_clause_keyword(suggestion))
-                    || (strip_frame && Self::is_window_frame_only_keyword(suggestion))
-                    || Self::is_merge_action_only_keyword(suggestion);
-                !out_of_context
-                    || data
-                        .get_column_suggestions(suggestion, column_scope)
-                        .iter()
-                        .any(|column| column.eq_ignore_ascii_case(suggestion))
+                Self::expression_suggestion_is_relevant(
+                    data,
+                    suggestion,
+                    column_scope,
+                    db_type,
+                    expr_keyword_ctx,
+                )
             });
         }
         suggestions
     }
 
-    /// The keywords that only occur inside a `CASE` expression's body. Used to
-    /// strip them from value/column completion outside an open `CASE`.
+    /// Decide whether a single base-catalog entry is grammatical at the current
+    /// value/column expression position. Operand material (columns, relations,
+    /// objects, rendered functions, value-producing function keywords) passes
+    /// only where an operand is expected; keywords pass only when the position's
+    /// allowlist admits them. A real column named like a keyword is preserved.
+    fn expression_suggestion_is_relevant(
+        data: &mut IntellisenseData,
+        suggestion: &str,
+        column_scope: Option<&[String]>,
+        db_type: Option<crate::db::DatabaseType>,
+        expr_keyword_ctx: ExpressionKeywordContext,
+    ) -> bool {
+        // A rendered function (`NAME()`), a column/relation/object identifier, and
+        // a value-producing function keyword are all *operand material*: they are
+        // grammatical only where a new operand is expected. Right after a complete
+        // operand the only valid continuations are operators (handled below as
+        // keywords); a bare identifier there would be an implicit alias, never an
+        // existing name — so operand material is dropped at that slot. When the
+        // position is ambiguous (`follows_operand == None`) it is kept, so a valid
+        // completion is never hidden.
+        let after_operand = expr_keyword_ctx.follows_operand == Some(true);
+        if suggestion.ends_with("()") {
+            return !after_operand;
+        }
+        let upper = suggestion.to_ascii_uppercase();
+        if !data.is_language_keyword(&upper, db_type) {
+            // Column / relation / object identifier: operand material only.
+            return !after_operand;
+        }
+        if Self::keyword_is_grammatical_in_expression(&upper, expr_keyword_ctx) {
+            return true;
+        }
+        if !after_operand && data.is_language_function(&upper, db_type) {
+            return true;
+        }
+        // Preserve a real column that happens to be named like a keyword (operand
+        // material, so only where an operand is expected).
+        !after_operand
+            && column_scope.is_some_and(|scope| {
+                data.get_column_suggestions(&upper, Some(scope))
+                    .iter()
+                    .any(|column| column.eq_ignore_ascii_case(&upper))
+            })
+    }
+
+    /// The allowlist core: is `upper` (a reserved keyword) grammatical at the
+    /// current expression position? Splits keywords into operand-start vs
+    /// after-operand families and gates the construct-scoped ones (CASE body,
+    /// window spec, ORDER BY direction) on the enclosing construct.
+    fn keyword_is_grammatical_in_expression(
+        upper: &str,
+        ctx: ExpressionKeywordContext,
+    ) -> bool {
+        // Keywords valid where a *new operand/expression* is expected.
+        const OPERAND_START_KEYWORDS: &[&str] = &[
+            "CASE", "CAST", "EXISTS", "NOT", "NULL", "TRUE", "FALSE", "UNKNOWN", "INTERVAL",
+            "DATE", "TIMESTAMP", "TIME", "PRIOR", "LEVEL", "ROWNUM", "ROWID", "DISTINCT",
+            "DISTINCTROW", "UNIQUE", "ALL", "ANY", "SOME", "CURSOR", "MULTISET", "NEW",
+            "DEFAULT", "BINARY", "MATCH", "CONNECT_BY_ROOT", "CONNECT_BY_ISCYCLE",
+            "CONNECT_BY_ISLEAF",
+        ];
+        // Operators/continuations valid *after a complete operand*.
+        const AFTER_OPERAND_KEYWORDS: &[&str] = &[
+            "AND", "OR", "NOT", "IN", "IS", "LIKE", "LIKE2", "LIKE4", "LIKEC", "BETWEEN",
+            "ESCAPE", "MEMBER", "SUBMULTISET", "MULTISET", "AT", "COLLATE", "OVER", "KEEP",
+            "WITHIN", "DIV", "MOD", "XOR", "REGEXP", "RLIKE", "SOUNDS", "AGAINST", "SEPARATOR",
+        ];
+        // Keywords grammatical only inside a window specification.
+        const WINDOW_SPEC_KEYWORDS: &[&str] = &[
+            "PARTITION", "BY", "ORDER", "RANGE", "ROWS", "GROUPS", "BETWEEN", "PRECEDING",
+            "FOLLOWING", "UNBOUNDED", "CURRENT", "ROW", "TIES", "EXCLUDE", "NO", "OTHERS",
+            "GROUP", "NULLS", "FIRST", "LAST", "RESPECT", "IGNORE",
+        ];
+
+        // CASE body: only inside an unclosed CASE.
+        if ctx.inside_case && Self::is_case_clause_keyword(upper) {
+            return true;
+        }
+        // Window-spec keywords: only inside an `OVER (...)` / `WINDOW … AS (...)`.
+        if ctx.inside_window_spec && WINDOW_SPEC_KEYWORDS.contains(&upper) {
+            return true;
+        }
+        // ORDER BY direction / null-ordering continuations follow a sort operand.
+        if ctx.in_order_by
+            && ctx.follows_operand != Some(false)
+            && matches!(upper, "ASC" | "DESC" | "NULLS")
+        {
+            return true;
+        }
+
+        let allow_start = ctx.follows_operand != Some(true);
+        let allow_after = ctx.follows_operand != Some(false);
+
+        if allow_after && AFTER_OPERAND_KEYWORDS.contains(&upper) {
+            return true;
+        }
+        if allow_start && OPERAND_START_KEYWORDS.contains(&upper) {
+            return true;
+        }
+        false
+    }
+
+    /// The keywords that only occur inside a `CASE` expression's body.
     fn is_case_clause_keyword(word: &str) -> bool {
         matches!(
             word.to_ascii_uppercase().as_str(),
-            "WHEN" | "THEN" | "ELSE" | "ELSIF" | "END"
+            "WHEN" | "THEN" | "ELSE" | "ELSIF" | "ELSEIF" | "END"
         )
     }
 
-    /// The MERGE merge-action keyword that only follows `WHEN [NOT]` in a MERGE
-    /// statement and is never grammatical in a value/column expression.
-    fn is_merge_action_only_keyword(word: &str) -> bool {
-        word.eq_ignore_ascii_case("MATCHED")
+    /// Gather the cursor-position facts that drive the expression-keyword
+    /// allowlist for the current query.
+    fn expression_keyword_context(
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> ExpressionKeywordContext {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let inside_case = Self::cursor_is_inside_unclosed_case(tokens, cursor_len);
+        let inside_window_spec = Self::cursor_is_inside_window_spec(tokens, cursor_len);
+        let in_order_by = matches!(
+            deep_ctx.phase,
+            intellisense_context::SqlPhase::OrderByClause
+        );
+        let end = Self::expected_suggestion_context_end(tokens, cursor_len, true);
+        let follows_operand = Self::cursor_follows_complete_operand(tokens, end);
+        ExpressionKeywordContext {
+            inside_case,
+            inside_window_spec,
+            in_order_by,
+            follows_operand,
+        }
     }
 
-    /// The window-frame boundary keywords that only occur inside a window
-    /// specification's frame clause (`ROWS/RANGE/GROUPS BETWEEN … PRECEDING/
-    /// FOLLOWING`, `UNBOUNDED …`). They have no meaning anywhere else, so they
-    /// are stripped from value/column completion outside a window spec.
-    fn is_window_frame_only_keyword(word: &str) -> bool {
-        matches!(
-            word.to_ascii_uppercase().as_str(),
-            "PRECEDING" | "FOLLOWING" | "UNBOUNDED"
-        )
+    /// Classify the token immediately before the cursor word: `Some(true)` when it
+    /// completes an operand (a value/operator may follow), `Some(false)` when an
+    /// operand/expression is expected next, `None` when it cannot be told (so both
+    /// keyword families are kept to avoid hiding a valid completion).
+    fn cursor_follows_complete_operand(tokens: &[SqlToken], end: usize) -> Option<bool> {
+        // Operators and expression-introducing clause keywords after which a fresh
+        // operand is expected (so a binary operator is *not* grammatical).
+        const OPERAND_EXPECTING_PREV: &[&str] = &[
+            "AND", "OR", "NOT", "IN", "IS", "LIKE", "LIKE2", "LIKE4", "LIKEC", "BETWEEN",
+            "ESCAPE", "MEMBER", "SUBMULTISET", "MULTISET", "AT", "COLLATE", "DIV", "MOD", "XOR",
+            "REGEXP", "RLIKE", "SOUNDS", "AGAINST", "SELECT", "WHERE", "HAVING", "ON", "SET",
+            "VALUES", "BY", "WHEN", "THEN", "ELSE", "START", "CONNECT", "RETURNING", "USING",
+            "AS", "CALL", "RETURN",
+        ];
+        // Keywords that themselves complete an operand (a literal/pseudo-column).
+        const VALUE_COMPLETE_PREV: &[&str] = &[
+            "NULL", "TRUE", "FALSE", "UNKNOWN", "LEVEL", "ROWNUM", "ROWID", "SYSDATE",
+            "SYSTIMESTAMP", "DUAL", "DEFAULT",
+        ];
+        match Self::meaningful_tokens_before(tokens, end).last() {
+            None => Some(false),
+            Some(SqlToken::String(_)) => Some(true),
+            Some(SqlToken::Comment(_)) => None,
+            Some(SqlToken::Symbol(sym)) => match sym.as_str() {
+                ")" | "]" => Some(true),
+                "(" | "," => Some(false),
+                "." => None,
+                // Arithmetic/comparison/concatenation operators expect an operand.
+                _ => Some(false),
+            },
+            Some(SqlToken::Word(word)) => {
+                let upper = word.to_ascii_uppercase();
+                if upper.chars().next().is_some_and(|ch| ch.is_ascii_digit()) {
+                    return Some(true);
+                }
+                if VALUE_COMPLETE_PREV.contains(&upper.as_str()) {
+                    return Some(true);
+                }
+                if !Self::token_is_language_keyword(&upper) {
+                    return Some(true);
+                }
+                if OPERAND_EXPECTING_PREV.contains(&upper.as_str()) {
+                    return Some(false);
+                }
+                None
+            }
+        }
+    }
+
+    /// Dialect-agnostic check used only to tell an identifier from a reserved
+    /// word while classifying the previous token. The union of both catalogs is
+    /// deliberate: a word that is a keyword in either dialect is treated as a
+    /// keyword, which at worst leaves the position ambiguous (both keyword
+    /// families kept) and so can never hide a valid completion.
+    fn token_is_language_keyword(upper: &str) -> bool {
+        crate::sql_text::ORACLE_SQL_KEYWORDS
+            .binary_search(&upper)
+            .is_ok()
+            || crate::sql_text::MYSQL_SQL_KEYWORDS
+                .binary_search(&upper)
+                .is_ok()
     }
 
     fn qualifier_matches_visible_relation_scope(

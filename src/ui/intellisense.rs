@@ -2316,6 +2316,28 @@ impl IntellisenseData {
         keywords.binary_search(&upper).is_ok()
     }
 
+    /// True when `upper` (an upper-cased token) is a reserved language keyword for
+    /// the dialect. Lets IntelliSense tell a base-catalog keyword apart from a
+    /// column/object name when filtering expression completions.
+    pub(crate) fn is_language_keyword(
+        &self,
+        upper: &str,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        self.is_catalog_keyword(upper, db_type)
+    }
+
+    /// True when `upper` names a built-in function for the dialect. Such keywords
+    /// are value-producing, so they stay valid wherever an operand is expected.
+    pub(crate) fn is_language_function(
+        &self,
+        upper: &str,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        let (_keywords, functions) = language_catalog_for_db_type(db_type);
+        functions.binary_search(&upper).is_ok()
+    }
+
     /// Cached signature for a routine key: `Some(Some(label))` when resolved to
     /// a routine, `Some(None)` when resolved but not callable, `None` when not
     /// yet fetched.

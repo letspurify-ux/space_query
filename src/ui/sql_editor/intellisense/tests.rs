@@ -560,14 +560,7 @@ fn mysql_context_and_suggestions_for_inline_sql(
         deep_ctx.statement_tokens.as_ref(),
     );
     let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
-    let cursor_inside_case = SqlEditorWidget::cursor_is_inside_unclosed_case(
-        SqlEditorWidget::current_query_tokens(&deep_ctx),
-        SqlEditorWidget::cursor_token_len_in_current_query(&deep_ctx),
-    );
-    let cursor_inside_window_spec = SqlEditorWidget::cursor_is_inside_window_spec(
-        SqlEditorWidget::current_query_tokens(&deep_ctx),
-        SqlEditorWidget::cursor_token_len_in_current_query(&deep_ctx),
-    );
+    let expr_keyword_ctx = SqlEditorWidget::expression_keyword_context(&deep_ctx);
     let mut data = IntellisenseData::new();
     let suggestions = SqlEditorWidget::base_suggestions_for_context(
         &mut data,
@@ -578,8 +571,7 @@ fn mysql_context_and_suggestions_for_inline_sql(
         context,
         false,
         Some(crate::db::DatabaseType::MySQL),
-        cursor_inside_case,
-        cursor_inside_window_spec,
+        expr_keyword_ctx,
     );
 
     (context, suggestions)
@@ -5481,8 +5473,7 @@ fn base_suggestions_for_table_context_with_prefix_stay_relation_only() {
         SqlContext::TableName,
         false,
         None,
-        false,
-        false,
+        ExpressionKeywordContext::ambiguous(),
     );
 
     assert_has_case_insensitive(&suggestions, "CONFIG");
@@ -5522,8 +5513,7 @@ fn base_suggestions_for_restricted_column_context_with_prefix_stay_column_only()
         SqlContext::ColumnName,
         true,
         None,
-        false,
-        false,
+        ExpressionKeywordContext::ambiguous(),
     );
 
     assert_has_case_insensitive(&suggestions, "CODE");
@@ -20765,8 +20755,7 @@ fn qualified_base_suggestions_for(
         context,
         ClauseCompletionPolicy::for_phase(ctx.phase, true).restrict_to_relation_columns,
         None,
-        false,
-        false,
+        ExpressionKeywordContext::ambiguous(),
     )
 }
 
@@ -21377,14 +21366,16 @@ fn local_record_member_scope_boundary_and_nested_loops() {
 }
 
 
-/// The flat base keyword catalog used to offer the `CASE`-body keywords
-/// (`WHEN`/`THEN`/`ELSE`/`ELSIF`/`END`) at every value/column position, even
-/// with no `CASE` open (`SELECT en|` → `END`, `WHERE th|` → `THEN`). Those are
-/// only grammatical inside an unclosed `CASE`, so they are suppressed in a
-/// value/column context outside one and restored inside it. A column that
-/// happens to be named like one of these keywords is never hidden.
+/// The base catalog's flat, prefix-only keyword dump is filtered down to an
+/// allowlist of keywords that are actually grammatical at the cursor's
+/// expression position: clause/statement/DDL keywords never appear in a value
+/// expression, construct-scoped keywords (CASE body, window-frame bounds, MERGE
+/// `MATCHED`) appear only inside their construct, operators appear only after a
+/// complete operand, and value/function keywords only where an operand is
+/// expected. Columns, relations and objects stay scoped to operand positions
+/// too, and a real column named like a keyword is never hidden.
 #[test]
-fn case_clause_keywords_are_scoped_to_open_case() {
+fn expression_keyword_completion_is_position_aware() {
     use crate::db::DatabaseType::Oracle;
 
     fn suggestions(sql_with_cursor: &str, extra_emp_columns: &[&str]) -> Vec<String> {
@@ -21396,14 +21387,7 @@ fn case_clause_keywords_are_scoped_to_open_case() {
         let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
         let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &ctx);
         let column_scope = (!column_tables.is_empty()).then(|| column_tables.clone());
-        let cursor_inside_case = SqlEditorWidget::cursor_is_inside_unclosed_case(
-            SqlEditorWidget::current_query_tokens(&ctx),
-            SqlEditorWidget::cursor_token_len_in_current_query(&ctx),
-        );
-        let cursor_inside_window_spec = SqlEditorWidget::cursor_is_inside_window_spec(
-            SqlEditorWidget::current_query_tokens(&ctx),
-            SqlEditorWidget::cursor_token_len_in_current_query(&ctx),
-        );
+        let expr_keyword_ctx = SqlEditorWidget::expression_keyword_context(&ctx);
         let mut data = IntellisenseData::new();
         data.tables = vec!["EMP".to_string()];
         let mut emp_columns = vec!["ENAME".to_string(), "EMPNO".to_string()];
@@ -21419,8 +21403,7 @@ fn case_clause_keywords_are_scoped_to_open_case() {
             context,
             false,
             Some(Oracle),
-            cursor_inside_case,
-            cursor_inside_window_spec,
+            expr_keyword_ctx,
         )
     }
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
@@ -21500,4 +21483,46 @@ fn case_clause_keywords_are_scoped_to_open_case() {
     // A column named MATCHED is preserved in a value position.
     let s = suggestions("SELECT ma| FROM emp", &["MATCHED"]);
     assert!(has(&s, "MATCHED"), "column named MATCHED was hidden: {s:?}");
+
+    // Clause / statement / DDL keywords never belong in a value expression and
+    // are dropped from the base dump (their real slots are served by the
+    // grammar-aware keyword merge).
+    for (sql, kw) in [
+        ("SELECT cr| FROM emp", "CREATE"),
+        ("SELECT fr| FROM emp", "FROM"),
+        ("SELECT ta| FROM emp", "TABLESPACE"),
+        ("SELECT wh| FROM emp", "WHERE"),
+        ("SELECT * FROM emp WHERE ad| = 1", "ADD"),
+        ("SELECT gr| FROM emp", "GROUP"),
+    ] {
+        let s = suggestions(sql, &[]);
+        assert!(!has(&s, kw), "{kw} leaked into value expression for `{sql}`: {s:?}");
+    }
+
+    // Genuine expression keywords/functions survive where an operand is expected.
+    let s = suggestions("SELECT ca| FROM emp", &[]);
+    assert!(has(&s, "CASE") && has(&s, "CAST"), "expression starters dropped: {s:?}");
+    let s = suggestions("SELECT ex| FROM emp", &[]);
+    assert!(has(&s, "EXISTS"), "EXISTS dropped at operand start: {s:?}");
+    let s = suggestions("SELECT co| FROM emp", &[]);
+    assert!(has(&s, "COALESCE"), "function keyword dropped at operand start: {s:?}");
+
+    // After a complete operand only operators are grammatical: no functions, no
+    // columns, no operand-starters.
+    let s = suggestions("SELECT ename a| FROM emp", &[]);
+    assert!(has(&s, "AND"), "operator dropped after operand: {s:?}");
+    let s = suggestions("SELECT ename ab| FROM emp", &[]);
+    assert!(!has(&s, "ABS()") && !has(&s, "ABS"), "function leaked after operand: {s:?}");
+    // The implicit-alias slot (`<expr> <name>|`) no longer leaks columns/tables.
+    let s = suggestions("SELECT ename e| FROM emp", &[]);
+    for leaked in ["ENAME", "EMPNO", "EMP"] {
+        assert!(!has(&s, leaked), "{leaked} leaked into implicit-alias slot: {s:?}");
+    }
+
+    // Operators are not offered where an operand is expected (statement start).
+    let s = suggestions("SELECT a| FROM emp", &[]);
+    assert!(!has(&s, "AND") && !has(&s, "AT"), "operator offered at operand start: {s:?}");
+    // Columns are still offered where an operand is expected.
+    let s = suggestions("SELECT * FROM emp WHERE en| = 1", &[]);
+    assert!(has(&s, "ENAME"), "column dropped at operand-start: {s:?}");
 }
