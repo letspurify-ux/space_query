@@ -68,7 +68,6 @@ struct SelectTransformState {
 pub(super) const PROGRESS_ROWS_INITIAL_BATCH: usize = 10_000;
 const PROGRESS_ROWS_FLUSH_INTERVAL: Duration = Duration::from_millis(200);
 const PROGRESS_ROWS_MAX_BATCH: usize = 10_000;
-const ORACLE_THIN_FETCH_ALL_MIN_BATCH: usize = 5_000;
 const ORACLE_THIN_LAZY_CLEANUP_FALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_SCRIPT_INCLUDE_DEPTH: usize = 64;
 const SESSION_POOL_CANCEL_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -3362,12 +3361,6 @@ impl SqlEditorWidget {
         u32::try_from(limit.max(1)).unwrap_or(u32::MAX)
     }
 
-    fn oracle_thin_fetch_all_batch_size(lazy_fetch_batch_size: usize) -> usize {
-        lazy_fetch_batch_size
-            .max(ORACLE_THIN_FETCH_ALL_MIN_BATCH)
-            .clamp(1, PROGRESS_ROWS_MAX_BATCH)
-    }
-
     fn oracle_thin_lazy_cleanup_timeout(query_timeout: Option<Duration>) -> Option<Duration> {
         query_timeout
             .filter(|timeout| !timeout.is_zero())
@@ -3910,7 +3903,7 @@ impl SqlEditorWidget {
                                             Self::fetch_lazy_oracle_rows_with_timeout(
                                                 &mut result_set,
                                                 column_count,
-                                                PROGRESS_ROWS_MAX_BATCH,
+                                                lazy_fetch_batch_size,
                                                 &null_text,
                                                 &mut fetched_rows,
                                                 &mut last_select_row,
@@ -4520,10 +4513,7 @@ impl SqlEditorWidget {
                                     Self::emit_lazy_waiting(&sender, index, session_id);
                                 }
                                 Ok(LazyFetchCommand::FetchAll) => {
-                                    let fetch_all_batch_size =
-                                        Self::oracle_thin_fetch_all_batch_size(
-                                            lazy_fetch_batch_size,
-                                        );
+                                    let fetch_all_batch_size = lazy_fetch_batch_size;
                                     let mut fetch_all_timeout =
                                         lazy_fetch_all_timeout_for_fetch_all(
                                             query_timeout,
@@ -5251,7 +5241,7 @@ impl SqlEditorWidget {
                                         true,
                                     );
                                     loop {
-                                        let (rows, eof) = fetch_rows!(PROGRESS_ROWS_MAX_BATCH);
+                                        let (rows, eof) = fetch_rows!(lazy_fetch_batch_size);
                                         SqlEditorWidget::append_spool_rows(&session, &rows);
                                         Self::emit_lazy_rows(&sender, index, rows);
                                         if let Some(command) = Self::drain_lazy_cancel_request(
@@ -29981,10 +29971,7 @@ mod query_running_reservation_tests {
 
 #[cfg(test)]
 mod mysql_transaction_feedback_tests {
-    use super::{
-        load_mutex_bool, store_mutex_bool, InterruptKind, QueryProgress, SqlEditorWidget,
-        ORACLE_THIN_FETCH_ALL_MIN_BATCH, PROGRESS_ROWS_MAX_BATCH,
-    };
+    use super::{load_mutex_bool, store_mutex_bool, InterruptKind, QueryProgress, SqlEditorWidget};
     use crate::db::{
         BindDataType, BindValue, BindVar, ConnectionInfo, DatabaseType, OracleDriverMode,
         QueryExecutor, QueryResult, ResolvedBind, RetainedSessionState, SessionState,
@@ -30507,26 +30494,6 @@ mod mysql_transaction_feedback_tests {
                 None,
             ),
             "Table truncated"
-        );
-    }
-
-    #[test]
-    fn oracle_thin_fetch_all_uses_lazy_batch_size_for_responsive_cancel() {
-        assert_eq!(
-            SqlEditorWidget::oracle_thin_fetch_all_batch_size(0),
-            ORACLE_THIN_FETCH_ALL_MIN_BATCH
-        );
-        assert_eq!(
-            SqlEditorWidget::oracle_thin_fetch_all_batch_size(100),
-            ORACLE_THIN_FETCH_ALL_MIN_BATCH
-        );
-        assert_eq!(
-            SqlEditorWidget::oracle_thin_fetch_all_batch_size(2_000),
-            ORACLE_THIN_FETCH_ALL_MIN_BATCH
-        );
-        assert_eq!(
-            SqlEditorWidget::oracle_thin_fetch_all_batch_size(PROGRESS_ROWS_MAX_BATCH + 1),
-            PROGRESS_ROWS_MAX_BATCH
         );
     }
 

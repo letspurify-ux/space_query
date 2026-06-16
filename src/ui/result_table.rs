@@ -1055,6 +1055,19 @@ impl ResultTableWidget {
             })
     }
 
+    /// Home/End mirror Ctrl+Left / Ctrl+Right; Ctrl+Home / Ctrl+End mirror Ctrl+Up / Ctrl+Down.
+    fn arrow_key_for_home_end(key: Key, original_key: Key, ctrl_or_cmd: bool) -> Option<Key> {
+        [key, original_key]
+            .into_iter()
+            .find_map(|event_key| match event_key {
+                Key::Home if ctrl_or_cmd => Some(Key::Up),
+                Key::Home => Some(Key::Left),
+                Key::End if ctrl_or_cmd => Some(Key::Down),
+                Key::End => Some(Key::Right),
+                _ => None,
+            })
+    }
+
     fn edge_for_arrow_key(key: Key, original_key: Key) -> Option<ResultTableEdge> {
         [key, original_key]
             .into_iter()
@@ -2722,7 +2735,13 @@ impl ResultTableWidget {
                         state.contains(Shortcut::Ctrl) || state.contains(Shortcut::Command);
                     let shift = state.contains(Shortcut::Shift);
 
-                    if ctrl_or_cmd {
+                    let home_end_nav_key =
+                        Self::arrow_key_for_home_end(key, original_key, ctrl_or_cmd);
+                    if ctrl_or_cmd || home_end_nav_key.is_some() {
+                        let (nav_key, nav_original_key) = match home_end_nav_key {
+                            Some(arrow) => (arrow, arrow),
+                            None => (key, original_key),
+                        };
                         let hidden_col = *hidden_auto_rowid_col_for_handle
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2735,8 +2754,8 @@ impl ResultTableWidget {
                         let handled = if shift {
                             Self::handle_ctrl_shift_arrow_selection(
                                 &mut table_for_handle,
-                                key,
-                                original_key,
+                                nav_key,
+                                nav_original_key,
                                 hidden_col,
                                 previous_selection,
                                 previous_col_position,
@@ -2748,8 +2767,8 @@ impl ResultTableWidget {
                         } else {
                             Self::handle_ctrl_arrow_navigation(
                                 &mut table_for_handle,
-                                key,
-                                original_key,
+                                nav_key,
+                                nav_original_key,
                                 hidden_col,
                                 previous_selection,
                                 previous_col_position,
@@ -2767,16 +2786,6 @@ impl ResultTableWidget {
                             }
                             return true;
                         }
-                    }
-
-                    if ctrl_or_cmd
-                        && Self::matches_end_key(key, original_key)
-                        && Self::request_lazy_fetch_all_if_active(
-                            &lazy_fetch_session_for_handle,
-                            &lazy_fetch_callback_for_handle,
-                        )
-                    {
-                        return true;
                     }
 
                     if Self::key_should_request_lazy_fetch_more(key) {
@@ -2961,7 +2970,13 @@ impl ResultTableWidget {
                         state.contains(Shortcut::Ctrl) || state.contains(Shortcut::Command);
                     let shift = state.contains(Shortcut::Shift);
 
-                    if ctrl_or_cmd {
+                    let home_end_nav_key =
+                        Self::arrow_key_for_home_end(key, original_key, ctrl_or_cmd);
+                    if ctrl_or_cmd || home_end_nav_key.is_some() {
+                        let (nav_key, nav_original_key) = match home_end_nav_key {
+                            Some(arrow) => (arrow, arrow),
+                            None => (key, original_key),
+                        };
                         let hidden_col = *hidden_auto_rowid_col_for_handle
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2974,8 +2989,8 @@ impl ResultTableWidget {
                         let handled = if shift {
                             Self::handle_ctrl_shift_arrow_selection(
                                 &mut table_for_handle,
-                                key,
-                                original_key,
+                                nav_key,
+                                nav_original_key,
                                 hidden_col,
                                 previous_selection,
                                 previous_col_position,
@@ -2987,8 +3002,8 @@ impl ResultTableWidget {
                         } else {
                             Self::handle_ctrl_arrow_navigation(
                                 &mut table_for_handle,
-                                key,
-                                original_key,
+                                nav_key,
+                                nav_original_key,
                                 hidden_col,
                                 previous_selection,
                                 previous_col_position,
@@ -3008,15 +3023,6 @@ impl ResultTableWidget {
                         }
                     }
 
-                    if ctrl_or_cmd
-                        && Self::matches_end_key(key, original_key)
-                        && Self::request_lazy_fetch_all_if_active(
-                            &lazy_fetch_session_for_handle,
-                            &lazy_fetch_callback_for_handle,
-                        )
-                    {
-                        return true;
-                    }
                     if ctrl_or_cmd && shift && Self::matches_shortcut_key(key, original_key, 'c') {
                         Self::copy_selected_with_headers(
                             &table_for_handle,
@@ -3241,24 +3247,6 @@ impl ResultTableWidget {
         } else {
             false
         }
-    }
-
-    fn request_lazy_fetch_all_if_active(
-        session: &Arc<Mutex<Option<u64>>>,
-        callback: &LazyFetchCallback,
-    ) -> bool {
-        let session_id = *session
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(session_id) = session_id {
-            Self::invoke_lazy_fetch_callback(callback, session_id, LazyFetchRequest::All)
-        } else {
-            false
-        }
-    }
-
-    fn matches_end_key(key: Key, original_key: Key) -> bool {
-        key == Key::End || original_key == Key::End
     }
 
     fn current_csv_snapshot(&self) -> (String, usize) {
@@ -12800,6 +12788,30 @@ mod tests {
     }
 
     #[test]
+    fn home_end_map_to_horizontal_navigation_and_ctrl_to_vertical() {
+        assert_eq!(
+            ResultTableWidget::arrow_key_for_home_end(Key::Home, Key::from_char('x'), false),
+            Some(Key::Left)
+        );
+        assert_eq!(
+            ResultTableWidget::arrow_key_for_home_end(Key::from_char('x'), Key::End, false),
+            Some(Key::Right)
+        );
+        assert_eq!(
+            ResultTableWidget::arrow_key_for_home_end(Key::Home, Key::from_char('x'), true),
+            Some(Key::Up)
+        );
+        assert_eq!(
+            ResultTableWidget::arrow_key_for_home_end(Key::from_char('x'), Key::End, true),
+            Some(Key::Down)
+        );
+        assert_eq!(
+            ResultTableWidget::arrow_key_for_home_end(Key::Left, Key::Right, true),
+            None
+        );
+    }
+
+    #[test]
     fn context_menu_hit_accepts_column_header_and_empty_column_body() {
         assert!(ResultTableWidget::should_show_context_menu_for_hit(
             Some((0, 0)),
@@ -13041,72 +13053,6 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .vertical_scrollbar_fetch_requested
         );
-    }
-
-    #[test]
-    fn lazy_fetch_all_for_active_session_requests_fetch_all() {
-        let session = Arc::new(Mutex::new(Some(7)));
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let requests_for_callback = requests.clone();
-        let callback: LazyFetchCallback =
-            Arc::new(Mutex::new(Some(Box::new(move |id, request| {
-                requests_for_callback
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .push((id, request));
-                true
-            }))));
-
-        assert!(ResultTableWidget::request_lazy_fetch_all_if_active(
-            &session, &callback
-        ));
-
-        assert_eq!(
-            requests
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .as_slice(),
-            &[(7, LazyFetchRequest::All)]
-        );
-    }
-
-    #[test]
-    fn lazy_fetch_all_without_active_session_returns_false() {
-        let session = Arc::new(Mutex::new(None));
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let requests_for_callback = requests.clone();
-        let callback: LazyFetchCallback =
-            Arc::new(Mutex::new(Some(Box::new(move |id, request| {
-                requests_for_callback
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .push((id, request));
-                true
-            }))));
-
-        assert!(!ResultTableWidget::request_lazy_fetch_all_if_active(
-            &session, &callback
-        ));
-        assert!(requests
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_empty());
-    }
-
-    #[test]
-    fn ctrl_end_shortcut_matches_original_or_current_key() {
-        assert!(ResultTableWidget::matches_end_key(
-            Key::End,
-            Key::from_char('x')
-        ));
-        assert!(ResultTableWidget::matches_end_key(
-            Key::from_char('x'),
-            Key::End
-        ));
-        assert!(!ResultTableWidget::matches_end_key(
-            Key::PageDown,
-            Key::PageDown
-        ));
     }
 
     #[test]
