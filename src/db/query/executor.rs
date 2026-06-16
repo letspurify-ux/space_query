@@ -31,11 +31,14 @@ const ORACLE_OBJECT_DDL_SQL: &str = "SELECT DBMS_METADATA.GET_DDL(:1, :2, :3) FR
 
 /// Session-level DBMS_METADATA transform params applied before GET_DDL so the
 /// generated CREATE statement omits physical storage clauses that the user did
-/// not author (segment attributes, STORAGE, TABLESPACE).
+/// not author (segment attributes, STORAGE, TABLESPACE). SQLTERMINATOR appends a
+/// statement terminator to each emitted statement so multi-statement DDL (a
+/// table plus its CREATE INDEX / ALTER TABLE ... ADD CONSTRAINT) runs as-is.
 const ORACLE_DDL_TRANSFORM_PLSQL: &str = "BEGIN \
 DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'SEGMENT_ATTRIBUTES', FALSE); \
 DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'STORAGE', FALSE); \
 DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'TABLESPACE', FALSE); \
+DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'SQLTERMINATOR', TRUE); \
 END;";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
