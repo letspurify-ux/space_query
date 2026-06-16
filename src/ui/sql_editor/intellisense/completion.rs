@@ -19,6 +19,47 @@ struct ExpressionKeywordContext {
     /// (operators are valid), `Some(false)` where a new operand is expected
     /// (value/expression starters are valid), `None` when ambiguous (both).
     follows_operand: Option<bool>,
+    /// Whether the cursor immediately follows a closed call `…)`. The
+    /// analytic/aggregate continuations (`OVER`, `KEEP`, `WITHIN GROUP`) are only
+    /// grammatical there — `SUM(x) OVER`, `MAX(x) KEEP (...)`,
+    /// `LISTAGG(..) WITHIN GROUP (...)` — never after a plain column or literal.
+    follows_call: bool,
+    /// Whether the cursor follows the pattern of an unclosed `LIKE` comparison
+    /// (`<expr> LIKE <pattern> |`). `ESCAPE` is grammatical only there —
+    /// `name LIKE 'a\_%' ESCAPE '\'` — never after a plain operand.
+    follows_like_pattern: bool,
+    /// Whether the cursor sits at a set-quantifier anchor: right after `SELECT`,
+    /// a set operator, or an opening `(`. `DISTINCT`/`UNIQUE`/`DISTINCTROW` are
+    /// grammatical only there (`SELECT DISTINCT`, `COUNT(DISTINCT x)`), never as a
+    /// general operand (`x = DISTINCT`, `x + DISTINCT`).
+    follows_quantifier_anchor: bool,
+    /// Whether the current query level has a `CONNECT BY` clause. The hierarchical
+    /// pseudo-columns/operators (`LEVEL`, `PRIOR`, `CONNECT_BY_ROOT`,
+    /// `CONNECT_BY_ISCYCLE`, `CONNECT_BY_ISLEAF`) are grammatical only in a
+    /// hierarchical query. (`ROWNUM` is valid in any query, so it is not gated.)
+    has_connect_by: bool,
+    /// Whether the cursor is in a DML value position (`INSERT … VALUES (…|)`,
+    /// `UPDATE … SET col = |`) where the `DEFAULT` value keyword is grammatical.
+    in_dml_value_position: bool,
+    /// Inferred type of the operand immediately before the cursor. Gates the
+    /// type-specific postfix operators: `AT` (datetime), `COLLATE` (character),
+    /// `MEMBER`/`SUBMULTISET`/`MULTISET` (collection).
+    prev_operand_type: PrecedingOperandType,
+}
+
+/// Best-effort type classification of the operand immediately before the cursor,
+/// used to gate the operand-type-specific postfix operators. `Unknown` means the
+/// type could not be determined; the type-specific operators are then withheld
+/// (a never-valid keyword is noise, and an unrecognised operand is treated as
+/// not-of-that-type) rather than dumped after every operand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrecedingOperandType {
+    Datetime,
+    Character,
+    Collection,
+    /// Determined, but none of the type-gated families (e.g. numeric).
+    Other,
+    Unknown,
 }
 
 impl ExpressionKeywordContext {
@@ -31,6 +72,12 @@ impl ExpressionKeywordContext {
             inside_window_spec: false,
             in_order_by: false,
             follows_operand: None,
+            follows_call: false,
+            follows_like_pattern: false,
+            follows_quantifier_anchor: false,
+            has_connect_by: false,
+            in_dml_value_position: false,
+            prev_operand_type: PrecedingOperandType::Unknown,
         }
     }
 }
@@ -1083,8 +1130,12 @@ impl SqlEditorWidget {
         let at_data_type_position = qualifier.is_none()
             && Self::data_type_position_for_context(deep_ctx, !snapshot.prefix.is_empty())
                 .is_some();
-        let expr_keyword_ctx =
-            Self::expression_keyword_context(deep_ctx);
+        let expr_keyword_ctx = {
+            let data = intellisense_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Self::expression_keyword_context(deep_ctx, &data, &column_tables)
+        };
         let include_columns = !has_local_record_member_scope
             && !at_keyword_only_slot
             && (matches!(
@@ -1731,20 +1782,45 @@ impl SqlEditorWidget {
         upper: &str,
         ctx: ExpressionKeywordContext,
     ) -> bool {
-        // Keywords valid where a *new operand/expression* is expected.
+        // Keywords valid where a *new operand/expression* is expected. Excluded
+        // and gated separately below: the set-quantifiers `DISTINCT`/`UNIQUE`/
+        // `DISTINCTROW` (list/aggregate anchor only), the hierarchical pseudo-
+        // columns/operators (CONNECT BY query only), and `DEFAULT` (DML value
+        // position only). `ALL`/`ANY`/`SOME` stay because they are also valid
+        // quantified comparisons (`x = ANY (...)`); `ROWNUM`/`ROWID` stay because
+        // they are valid pseudo-columns in any query.
         const OPERAND_START_KEYWORDS: &[&str] = &[
             "CASE", "CAST", "EXISTS", "NOT", "NULL", "TRUE", "FALSE", "UNKNOWN", "INTERVAL",
-            "DATE", "TIMESTAMP", "TIME", "PRIOR", "LEVEL", "ROWNUM", "ROWID", "DISTINCT",
-            "DISTINCTROW", "UNIQUE", "ALL", "ANY", "SOME", "CURSOR", "MULTISET", "NEW",
-            "DEFAULT", "BINARY", "MATCH", "CONNECT_BY_ROOT", "CONNECT_BY_ISCYCLE",
-            "CONNECT_BY_ISLEAF",
+            "DATE", "TIMESTAMP", "TIME", "ROWNUM", "ROWID", "ALL", "ANY", "SOME", "CURSOR",
+            "MULTISET", "NEW", "BINARY", "MATCH",
         ];
-        // Operators/continuations valid *after a complete operand*.
+        // Set-quantifiers: grammatical only at a select-list/aggregate anchor —
+        // `SELECT DISTINCT`, `UNION DISTINCT`, `COUNT(DISTINCT x)`. They always sit
+        // at such an anchor, so gating on `follows_quantifier_anchor` removes the
+        // noise of offering them as a general operand without hiding a valid one.
+        const SELECT_QUANTIFIER_KEYWORDS: &[&str] = &["DISTINCT", "UNIQUE", "DISTINCTROW"];
+        // Hierarchical pseudo-columns/operators: grammatical only in a query that
+        // has a `CONNECT BY` clause, where an operand is expected.
+        const HIERARCHICAL_KEYWORDS: &[&str] = &[
+            "LEVEL", "PRIOR", "CONNECT_BY_ROOT", "CONNECT_BY_ISCYCLE", "CONNECT_BY_ISLEAF",
+        ];
+        // Operators/continuations valid *after a complete operand*. Continuations
+        // that require a *specific* preceding operand are excluded here and gated
+        // separately below: `OVER`/`KEEP`/`WITHIN`/`AGAINST` (closed call),
+        // `ESCAPE` (`LIKE` pattern), and the operand-type operators `AT`
+        // (datetime), `COLLATE` (character), `MEMBER`/`SUBMULTISET`/`MULTISET`
+        // (collection). Every other operator is grammatical after any operand.
         const AFTER_OPERAND_KEYWORDS: &[&str] = &[
             "AND", "OR", "NOT", "IN", "IS", "LIKE", "LIKE2", "LIKE4", "LIKEC", "BETWEEN",
-            "ESCAPE", "MEMBER", "SUBMULTISET", "MULTISET", "AT", "COLLATE", "OVER", "KEEP",
-            "WITHIN", "DIV", "MOD", "XOR", "REGEXP", "RLIKE", "SOUNDS", "AGAINST", "SEPARATOR",
+            "DIV", "MOD", "XOR", "REGEXP", "RLIKE", "SOUNDS", "SEPARATOR",
         ];
+        // Analytic/aggregate continuations: grammatical only immediately after a
+        // closed call `…)` — `SUM(x) OVER`, `MAX(x) KEEP (...)`,
+        // `LISTAGG(..) WITHIN GROUP (...)`, and the MySQL full-text
+        // `MATCH(..) AGAINST (...)`. They always follow a `)`, so gating on
+        // `follows_call` removes the noise of offering them after a column/literal
+        // without ever hiding a valid completion.
+        const CALL_CONTINUATION_KEYWORDS: &[&str] = &["OVER", "KEEP", "WITHIN", "AGAINST"];
         // Keywords grammatical only inside a window specification.
         const WINDOW_SPEC_KEYWORDS: &[&str] = &[
             "PARTITION", "BY", "ORDER", "RANGE", "ROWS", "GROUPS", "BETWEEN", "PRECEDING",
@@ -1768,6 +1844,65 @@ impl SqlEditorWidget {
             return true;
         }
 
+        // Call continuations: only right after a closed call `…)`.
+        if ctx.follows_call && CALL_CONTINUATION_KEYWORDS.contains(&upper) {
+            return true;
+        }
+        // `ESCAPE`: only right after a `LIKE` pattern. It always follows one, so
+        // gating on `follows_like_pattern` removes the noise of offering it after
+        // a plain operand without ever hiding a valid completion.
+        if ctx.follows_like_pattern && upper == "ESCAPE" {
+            return true;
+        }
+        // Set-quantifiers: only at a select-list/aggregate anchor.
+        if ctx.follows_quantifier_anchor && SELECT_QUANTIFIER_KEYWORDS.contains(&upper) {
+            return true;
+        }
+        // Hierarchical pseudo-columns/operators: only in a CONNECT BY query, where
+        // an operand is expected (never right after a complete operand).
+        if ctx.has_connect_by && HIERARCHICAL_KEYWORDS.contains(&upper) {
+            return ctx.follows_operand != Some(true);
+        }
+        // `DEFAULT` value keyword: only in a DML value position, where an operand
+        // is expected (`VALUES (… , DEFAULT)`, `SET col = DEFAULT`).
+        if ctx.in_dml_value_position && upper == "DEFAULT" {
+            return ctx.follows_operand != Some(true);
+        }
+        // Operand-type postfix operators: grammatical only *after* an operand, and
+        // only of the matching type. `AT` (`… AT TIME ZONE`) needs a datetime,
+        // `COLLATE` a character value. The type is used to *exclude* a provable
+        // mismatch (a number/date before `COLLATE`, a string before `AT`); when it
+        // cannot be determined the operator is kept, so a valid completion after an
+        // operand whose type we could not resolve is never hidden.
+        if upper == "AT" {
+            return ctx.follows_operand == Some(true)
+                && matches!(
+                    ctx.prev_operand_type,
+                    PrecedingOperandType::Datetime | PrecedingOperandType::Unknown
+                );
+        }
+        if upper == "COLLATE" {
+            return ctx.follows_operand == Some(true)
+                && matches!(
+                    ctx.prev_operand_type,
+                    PrecedingOperandType::Character | PrecedingOperandType::Unknown
+                );
+        }
+        // The collection operators (`MEMBER`/`SUBMULTISET`, and `MULTISET` used as
+        // a set-operator after an operand) require a nested-table operand. A
+        // collection type is never inferable from column metadata, so — unlike the
+        // datetime/character operators above — keeping them on an unknown operand
+        // would mean dumping them after *every* operand. They are therefore only
+        // offered when the operand is provably a collection. (`MULTISET` as a
+        // collection *constructor*, where an operand is expected, falls through to
+        // the operand-start list below.)
+        if matches!(upper, "MEMBER" | "SUBMULTISET") {
+            return ctx.prev_operand_type == PrecedingOperandType::Collection;
+        }
+        if upper == "MULTISET" && ctx.follows_operand == Some(true) {
+            return ctx.prev_operand_type == PrecedingOperandType::Collection;
+        }
+
         let allow_start = ctx.follows_operand != Some(true);
         let allow_after = ctx.follows_operand != Some(false);
 
@@ -1789,9 +1924,12 @@ impl SqlEditorWidget {
     }
 
     /// Gather the cursor-position facts that drive the expression-keyword
-    /// allowlist for the current query.
+    /// allowlist for the current query. `data`/`column_scope` are consulted to
+    /// infer the preceding operand's type for the type-gated postfix operators.
     fn expression_keyword_context(
         deep_ctx: &intellisense_context::CursorContext,
+        data: &IntellisenseData,
+        column_scope: &[String],
     ) -> ExpressionKeywordContext {
         let tokens = Self::current_query_tokens(deep_ctx);
         let cursor_len = Self::cursor_token_len_in_current_query(deep_ctx);
@@ -1803,12 +1941,211 @@ impl SqlEditorWidget {
         );
         let end = Self::expected_suggestion_context_end(tokens, cursor_len, true);
         let follows_operand = Self::cursor_follows_complete_operand(tokens, end);
+        let follows_call = matches!(
+            Self::meaningful_tokens_before(tokens, end).last(),
+            Some(SqlToken::Symbol(sym)) if sym == ")"
+        );
+        let follows_like_pattern = Self::cursor_follows_like_pattern(tokens, end);
+        let follows_quantifier_anchor =
+            match Self::meaningful_tokens_before(tokens, end).last() {
+                Some(SqlToken::Symbol(sym)) => sym == "(",
+                Some(SqlToken::Word(word)) => matches!(
+                    word.to_ascii_uppercase().as_str(),
+                    "SELECT" | "UNION" | "EXCEPT" | "INTERSECT" | "MINUS"
+                ),
+                _ => false,
+            };
+        let has_connect_by = Self::cursor_query_has_connect_by(tokens);
+        let in_dml_value_position = matches!(
+            deep_ctx.phase,
+            intellisense_context::SqlPhase::SetClause
+                | intellisense_context::SqlPhase::ValuesClause
+        );
+        let prev_operand_type =
+            Self::preceding_operand_type(tokens, end, data, column_scope);
         ExpressionKeywordContext {
             inside_case,
             inside_window_spec,
             in_order_by,
             follows_operand,
+            follows_call,
+            follows_like_pattern,
+            follows_quantifier_anchor,
+            has_connect_by,
+            in_dml_value_position,
+            prev_operand_type,
         }
+    }
+
+    /// Whether the current query level contains a `CONNECT BY` clause, which makes
+    /// the hierarchical pseudo-columns/operators grammatical. A bare `CONNECT`
+    /// word at the top paren level is the defining marker.
+    fn cursor_query_has_connect_by(tokens: &[SqlToken]) -> bool {
+        tokens.iter().any(|token| {
+            matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("CONNECT"))
+        })
+    }
+
+    /// Best-effort type of the operand immediately before `end`, used to gate the
+    /// operand-type postfix operators. Recognises string/datetime literals,
+    /// datetime niladic functions, the return type of common datetime/character
+    /// built-ins (by the name before a closed call), and the declared type of an
+    /// in-scope column. Everything else is `Unknown`.
+    fn preceding_operand_type(
+        tokens: &[SqlToken],
+        end: usize,
+        data: &IntellisenseData,
+        column_scope: &[String],
+    ) -> PrecedingOperandType {
+        // Niladic datetime value functions / pseudo-columns.
+        const DATETIME_VALUE_WORDS: &[&str] = &[
+            "SYSDATE", "SYSTIMESTAMP", "CURRENT_DATE", "CURRENT_TIMESTAMP", "LOCALTIMESTAMP",
+        ];
+        let before = Self::meaningful_tokens_before(tokens, end);
+        match before.last() {
+            // A string literal is character, unless it is the body of a typed
+            // datetime literal (`DATE '…'` / `TIMESTAMP '…'` / `TIME '…'`).
+            Some(SqlToken::String(_)) => {
+                match before.len().checked_sub(2).and_then(|i| before.get(i)) {
+                    Some(SqlToken::Word(word))
+                        if matches!(
+                            word.to_ascii_uppercase().as_str(),
+                            "DATE" | "TIMESTAMP" | "TIME"
+                        ) =>
+                    {
+                        PrecedingOperandType::Datetime
+                    }
+                    _ => PrecedingOperandType::Character,
+                }
+            }
+            Some(SqlToken::Symbol(sym)) if sym == ")" => {
+                match Self::call_name_before_close(&before) {
+                    Some(name) => Self::function_return_operand_type(&name),
+                    None => PrecedingOperandType::Unknown,
+                }
+            }
+            Some(SqlToken::Word(word)) => {
+                let upper = word.to_ascii_uppercase();
+                if upper.chars().next().is_some_and(|ch| ch.is_ascii_digit()) {
+                    return PrecedingOperandType::Other;
+                }
+                if DATETIME_VALUE_WORDS.contains(&upper.as_str()) {
+                    return PrecedingOperandType::Datetime;
+                }
+                // An in-scope column: classify by its declared type.
+                for table in column_scope {
+                    if let Some(meta) = data.get_column_meta(table, &upper) {
+                        return Self::classify_type_display(&meta.type_display);
+                    }
+                }
+                PrecedingOperandType::Unknown
+            }
+            _ => PrecedingOperandType::Unknown,
+        }
+    }
+
+    /// Map a column's `type_display` (e.g. `NUMBER(10)`, `TIMESTAMP(6) WITH TIME
+    /// ZONE`, `VARCHAR2(100)`) to an operand-type family.
+    fn classify_type_display(type_display: &str) -> PrecedingOperandType {
+        let upper = type_display.to_ascii_uppercase();
+        if upper.starts_with("DATE") || upper.contains("TIMESTAMP") {
+            return PrecedingOperandType::Datetime;
+        }
+        if upper.contains("CHAR") || upper.contains("CLOB") {
+            return PrecedingOperandType::Character;
+        }
+        PrecedingOperandType::Other
+    }
+
+    /// The function/identifier name immediately before the call whose closing `)`
+    /// is the last token of `before`, or `None` when the `)` closes a plain
+    /// parenthesised group rather than a call.
+    fn call_name_before_close(before: &[&SqlToken]) -> Option<String> {
+        let mut depth = 0i32;
+        let mut open_index = None;
+        for (index, token) in before.iter().enumerate().rev() {
+            match token {
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => depth += 1,
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => {
+                    depth -= 1;
+                    if depth == 0 {
+                        open_index = Some(index);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let open_index = open_index?;
+        match open_index.checked_sub(1).and_then(|i| before.get(i)) {
+            Some(SqlToken::Word(word)) => Some(word.to_ascii_uppercase()),
+            _ => None,
+        }
+    }
+
+    /// Operand type produced by a named built-in. Only the unambiguous
+    /// datetime/character producers are listed; anything else is `Unknown` so the
+    /// type-gated operators stay withheld rather than guessed.
+    fn function_return_operand_type(name: &str) -> PrecedingOperandType {
+        const DATETIME_FUNCTIONS: &[&str] = &[
+            "TO_DATE", "TO_TIMESTAMP", "TO_TIMESTAMP_TZ", "FROM_TZ", "ADD_MONTHS", "LAST_DAY",
+            "NEXT_DAY", "NUMTODSINTERVAL", "NUMTOYMINTERVAL",
+        ];
+        const CHARACTER_FUNCTIONS: &[&str] = &[
+            "TO_CHAR", "TO_NCHAR", "SUBSTR", "SUBSTRB", "UPPER", "LOWER", "INITCAP", "TRIM",
+            "LTRIM", "RTRIM", "LPAD", "RPAD", "REPLACE", "CONCAT", "REGEXP_REPLACE",
+            "REGEXP_SUBSTR", "NVL2", "TRANSLATE", "REVERSE", "SOUNDEX",
+        ];
+        if DATETIME_FUNCTIONS.contains(&name) {
+            PrecedingOperandType::Datetime
+        } else if CHARACTER_FUNCTIONS.contains(&name) {
+            PrecedingOperandType::Character
+        } else {
+            PrecedingOperandType::Unknown
+        }
+    }
+
+    /// Whether the cursor sits right after the pattern of an unclosed `LIKE`
+    /// comparison (`<expr> LIKE <pattern> |`), the only place `ESCAPE` is
+    /// grammatical. Scans the current predicate segment back from the cursor at
+    /// paren depth 0: a `LIKE`-family keyword found before any segment boundary
+    /// (a boolean connector, clause keyword or comma) means we are in an `ESCAPE`
+    /// position; a boundary found first means we are not. Tokens nested inside a
+    /// deeper paren level are skipped so a `LIKE` buried in a sub-expression
+    /// (`f(a LIKE b) |`) never counts.
+    fn cursor_follows_like_pattern(tokens: &[SqlToken], end: usize) -> bool {
+        // Keywords that bound the current comparison expression: a `LIKE` before
+        // one of these belongs to a different predicate, so `ESCAPE` is not valid.
+        const SEGMENT_BOUNDARY: &[&str] = &[
+            "AND", "OR", "WHERE", "HAVING", "ON", "WHEN", "THEN", "ELSE", "SELECT", "FROM",
+            "GROUP", "ORDER", "BY", "START", "CONNECT", "SET", "VALUES", "USING", "RETURNING",
+            "CASE", "INTO", "BETWEEN",
+        ];
+        let mut depth = 0i32;
+        for token in Self::meaningful_tokens_before(tokens, end).iter().rev() {
+            match token {
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => depth += 1,
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => {
+                    if depth == 0 {
+                        return false;
+                    }
+                    depth -= 1;
+                }
+                _ if depth > 0 => {}
+                SqlToken::Symbol(sym) if sym == "," => return false,
+                SqlToken::Word(word) => {
+                    let upper = word.to_ascii_uppercase();
+                    if matches!(upper.as_str(), "LIKE" | "LIKE2" | "LIKE4" | "LIKEC") {
+                        return true;
+                    }
+                    if SEGMENT_BOUNDARY.contains(&upper.as_str()) {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     /// Classify the token immediately before the cursor word: `Some(true)` when it

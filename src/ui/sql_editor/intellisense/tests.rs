@@ -560,8 +560,8 @@ fn mysql_context_and_suggestions_for_inline_sql(
         deep_ctx.statement_tokens.as_ref(),
     );
     let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
-    let expr_keyword_ctx = SqlEditorWidget::expression_keyword_context(&deep_ctx);
     let mut data = IntellisenseData::new();
+    let expr_keyword_ctx = SqlEditorWidget::expression_keyword_context(&deep_ctx, &data, &[]);
     let suggestions = SqlEditorWidget::base_suggestions_for_context(
         &mut data,
         &prefix,
@@ -21387,13 +21387,14 @@ fn expression_keyword_completion_is_position_aware() {
         let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
         let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &ctx);
         let column_scope = (!column_tables.is_empty()).then(|| column_tables.clone());
-        let expr_keyword_ctx = SqlEditorWidget::expression_keyword_context(&ctx);
         let mut data = IntellisenseData::new();
         data.tables = vec!["EMP".to_string()];
         let mut emp_columns = vec!["ENAME".to_string(), "EMPNO".to_string()];
         emp_columns.extend(extra_emp_columns.iter().map(|c| c.to_string()));
         data.set_columns_for_table("EMP", emp_columns);
         data.rebuild_indices();
+        let expr_keyword_ctx =
+            SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables);
         SqlEditorWidget::base_suggestions_for_context(
             &mut data,
             &prefix,
@@ -21525,4 +21526,384 @@ fn expression_keyword_completion_is_position_aware() {
     // Columns are still offered where an operand is expected.
     let s = suggestions("SELECT * FROM emp WHERE en| = 1", &[]);
     assert!(has(&s, "ENAME"), "column dropped at operand-start: {s:?}");
+}
+
+/// The analytic/aggregate continuations `OVER`, `KEEP` and `WITHIN` (GROUP) are
+/// only grammatical immediately after a closed call — `SUM(x) OVER (…)`,
+/// `MAX(x) KEEP (DENSE_RANK …)`, `LISTAGG(…) WITHIN GROUP (…)`. After any other
+/// complete operand (a plain column, a literal, a parenthesized value) they are
+/// pure noise. They always follow a `)`, so gating them on a closed call removes
+/// the noise without ever hiding a valid completion.
+#[test]
+fn analytic_continuations_offered_only_after_a_closed_call() {
+    fn suggestions(sql_with_cursor: &str) -> Vec<String> {
+        let cursor = sql_with_cursor.find('|').expect("cursor marker");
+        let sql = sql_with_cursor.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql_with_cursor);
+        let context =
+            SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+        let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &ctx);
+        let column_scope = (!column_tables.is_empty()).then(|| column_tables.clone());
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["EMP".to_string()];
+        data.set_columns_for_table("EMP", vec!["ENAME".to_string(), "EMPNO".to_string()]);
+        data.rebuild_indices();
+        let expr_keyword_ctx =
+            SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables);
+        SqlEditorWidget::base_suggestions_for_context(
+            &mut data,
+            &prefix,
+            None,
+            column_scope.as_deref(),
+            matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
+            context,
+            false,
+            Some(crate::db::DatabaseType::Oracle),
+            expr_keyword_ctx,
+        )
+    }
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+
+    // After a plain column / literal operand the continuations are noise.
+    for (sql, kw) in [
+        ("SELECT ename ov| FROM emp", "OVER"),
+        ("SELECT ename ke| FROM emp", "KEEP"),
+        ("SELECT ename wi| FROM emp", "WITHIN"),
+        ("SELECT * FROM emp WHERE empno ov| = 1", "OVER"),
+        ("SELECT 1 ov| FROM emp", "OVER"),
+    ] {
+        let s = suggestions(sql);
+        assert!(!has(&s, kw), "{kw} leaked after a plain operand for `{sql}`: {s:?}");
+    }
+
+    // Immediately after a closed call they are grammatical again.
+    for (sql, kw) in [
+        ("SELECT sum(empno) ov| FROM emp", "OVER"),
+        ("SELECT max(empno) ke| FROM emp", "KEEP"),
+        ("SELECT count(*) ov| FROM emp", "OVER"),
+        ("SELECT listagg(ename) wi| FROM emp", "WITHIN"),
+    ] {
+        let s = suggestions(sql);
+        assert!(has(&s, kw), "{kw} suppressed after a closed call for `{sql}`: {s:?}");
+    }
+
+    // The MySQL full-text continuation `AGAINST` belongs to the same family:
+    // `MATCH(col) AGAINST ('text')` — a closed call, never a plain operand.
+    let mysql = |sql_with_cursor: &str| -> Vec<String> {
+        let cursor = sql_with_cursor.find('|').expect("cursor marker");
+        let sql = sql_with_cursor.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql_with_cursor);
+        let context =
+            SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+        let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &ctx);
+        let column_scope = (!column_tables.is_empty()).then(|| column_tables.clone());
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["EMP".to_string()];
+        data.set_columns_for_table("EMP", vec!["ENAME".to_string(), "EMPNO".to_string()]);
+        data.rebuild_indices();
+        let expr_keyword_ctx =
+            SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables);
+        SqlEditorWidget::base_suggestions_for_context(
+            &mut data,
+            &prefix,
+            None,
+            column_scope.as_deref(),
+            matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
+            context,
+            false,
+            Some(crate::db::DatabaseType::MySQL),
+            expr_keyword_ctx,
+        )
+    };
+    assert!(
+        !has(&mysql("SELECT ename ag| FROM emp"), "AGAINST"),
+        "AGAINST leaked after a plain operand"
+    );
+    assert!(
+        has(&mysql("SELECT match(ename) ag| FROM emp"), "AGAINST"),
+        "AGAINST suppressed after a closed call"
+    );
+}
+
+/// `ESCAPE` is grammatical only right after a `LIKE` pattern
+/// (`name LIKE 'a\_%' ESCAPE '\'`), never after a plain operand. It is gated on
+/// the same "continuation that needs a specific preceding operand" principle as
+/// `OVER`/`KEEP`/`WITHIN`, so the same noise must not leak.
+#[test]
+fn escape_offered_only_after_a_like_pattern() {
+    fn suggestions(sql_with_cursor: &str) -> Vec<String> {
+        let cursor = sql_with_cursor.find('|').expect("cursor marker");
+        let sql = sql_with_cursor.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql_with_cursor);
+        let context =
+            SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+        let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &ctx);
+        let column_scope = (!column_tables.is_empty()).then(|| column_tables.clone());
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["EMP".to_string()];
+        data.set_columns_for_table("EMP", vec!["ENAME".to_string(), "EMPNO".to_string()]);
+        data.rebuild_indices();
+        let expr_keyword_ctx =
+            SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables);
+        SqlEditorWidget::base_suggestions_for_context(
+            &mut data,
+            &prefix,
+            None,
+            column_scope.as_deref(),
+            matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
+            context,
+            false,
+            Some(crate::db::DatabaseType::Oracle),
+            expr_keyword_ctx,
+        )
+    }
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+
+    // No preceding LIKE in the current predicate segment → ESCAPE is noise.
+    for sql in [
+        "SELECT * FROM emp WHERE ename es| ",
+        "SELECT * FROM emp WHERE ename = 'a' es| ",
+        // A LIKE in a *different* predicate (across an AND) does not carry over.
+        "SELECT * FROM emp WHERE ename LIKE 'a%' AND empno es| ",
+        // A LIKE buried in a deeper paren level does not count.
+        "SELECT * FROM emp WHERE upper(ename) es| ",
+    ] {
+        let s = suggestions(sql);
+        assert!(!has(&s, "ESCAPE"), "ESCAPE leaked without a LIKE pattern for `{sql}`: {s:?}");
+    }
+
+    // Right after a LIKE pattern → ESCAPE is grammatical.
+    for sql in [
+        "SELECT * FROM emp WHERE ename LIKE 'a%' es| ",
+        "SELECT * FROM emp WHERE ename NOT LIKE 'a%' es| ",
+        "SELECT * FROM emp WHERE empno = 1 AND ename LIKE 'a%' es| ",
+    ] {
+        let s = suggestions(sql);
+        assert!(has(&s, "ESCAPE"), "ESCAPE suppressed after a LIKE pattern for `{sql}`: {s:?}");
+    }
+}
+
+/// The set-quantifiers `DISTINCT`/`UNIQUE`/`DISTINCTROW` are grammatical only at
+/// the start of a select list or an aggregate argument — right after `SELECT`, a
+/// set operator, or an opening `(` — never as a general expression operand. The
+/// quantified-comparison keywords `ALL`/`ANY`/`SOME` are deliberately *not*
+/// gated, since `x = ANY (...)` is valid.
+#[test]
+fn set_quantifiers_offered_only_at_a_list_or_aggregate_anchor() {
+    fn suggestions(sql_with_cursor: &str) -> Vec<String> {
+        let cursor = sql_with_cursor.find('|').expect("cursor marker");
+        let sql = sql_with_cursor.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql_with_cursor);
+        let context =
+            SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+        let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &ctx);
+        let column_scope = (!column_tables.is_empty()).then(|| column_tables.clone());
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["EMP".to_string()];
+        data.set_columns_for_table("EMP", vec!["ENAME".to_string(), "EMPNO".to_string()]);
+        data.rebuild_indices();
+        let expr_keyword_ctx =
+            SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables);
+        SqlEditorWidget::base_suggestions_for_context(
+            &mut data, &prefix, None, column_scope.as_deref(),
+            matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
+            context, false, Some(crate::db::DatabaseType::Oracle), expr_keyword_ctx,
+        )
+    }
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+
+    // General operand positions: DISTINCT/UNIQUE are noise.
+    for sql in [
+        "SELECT * FROM emp WHERE empno = dis|",
+        "SELECT empno + dis| FROM emp",
+        "SELECT nvl(empno, dis| FROM emp",
+        "SELECT ename, dis| FROM emp",
+        "SELECT * FROM emp WHERE empno = uni|",
+    ] {
+        let s = suggestions(sql);
+        assert!(!has(&s, "DISTINCT"), "DISTINCT leaked into a general operand for `{sql}`: {s:?}");
+        assert!(!has(&s, "UNIQUE"), "UNIQUE leaked into a general operand for `{sql}`: {s:?}");
+    }
+
+    // List / aggregate anchors: DISTINCT is grammatical.
+    for sql in [
+        "SELECT dis| FROM emp",
+        "SELECT count(dis| FROM emp",
+        "SELECT empno FROM emp UNION dis|",
+    ] {
+        let s = suggestions(sql);
+        assert!(has(&s, "DISTINCT"), "DISTINCT suppressed at a valid anchor for `{sql}`: {s:?}");
+    }
+
+    // `ANY`/`SOME` remain available as quantified comparisons after `=`.
+    let s = suggestions("SELECT * FROM emp WHERE empno = an|");
+    assert!(has(&s, "ANY"), "ANY wrongly suppressed in a quantified comparison: {s:?}");
+    let s = suggestions("SELECT * FROM emp WHERE empno = al|");
+    assert!(has(&s, "ALL"), "ALL wrongly suppressed in a quantified comparison: {s:?}");
+}
+
+/// `EMP` with a typed schema (`ENAME` character, `EMPNO` numeric, `HIREDATE`
+/// datetime) so context-dependent keyword gating can be exercised end to end.
+fn typed_emp_suggestions(sql_with_cursor: &str) -> Vec<String> {
+    let cursor = sql_with_cursor.find('|').expect("cursor marker");
+    let sql = sql_with_cursor.replace('|', "");
+    let ctx = analyze_inline_cursor_sql(sql_with_cursor);
+    let context =
+        SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+    let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &ctx);
+    let column_scope = (!column_tables.is_empty()).then(|| column_tables.clone());
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["EMP".to_string()];
+    data.set_columns_for_table(
+        "EMP",
+        vec!["ENAME".to_string(), "EMPNO".to_string(), "HIREDATE".to_string()],
+    );
+    let meta = HashMap::from([
+        ("ENAME".to_string(), ColumnMeta { type_display: "VARCHAR2(10)".to_string(), nullable: true, is_primary_key: false }),
+        ("EMPNO".to_string(), ColumnMeta { type_display: "NUMBER(4)".to_string(), nullable: false, is_primary_key: true }),
+        ("HIREDATE".to_string(), ColumnMeta { type_display: "DATE".to_string(), nullable: true, is_primary_key: false }),
+    ]);
+    data.set_column_meta_for_table("EMP", meta);
+    data.rebuild_indices();
+    let expr_keyword_ctx =
+        SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables);
+    SqlEditorWidget::base_suggestions_for_context(
+        &mut data, &prefix, None, column_scope.as_deref(),
+        matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
+        context, false, Some(crate::db::DatabaseType::Oracle), expr_keyword_ctx,
+    )
+}
+
+/// Hierarchical pseudo-columns/operators (`LEVEL`, `PRIOR`, `CONNECT_BY_ROOT`,
+/// `CONNECT_BY_ISCYCLE`, `CONNECT_BY_ISLEAF`) are grammatical only in a query that
+/// has a `CONNECT BY` clause. `ROWNUM` stays valid everywhere.
+#[test]
+fn hierarchical_keywords_offered_only_in_a_connect_by_query() {
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+
+    // No CONNECT BY → hierarchical keywords are noise.
+    for (sql, kw) in [
+        ("SELECT lev| FROM emp", "LEVEL"),
+        ("SELECT * FROM emp WHERE empno = lev|", "LEVEL"),
+        ("SELECT conn| FROM emp", "CONNECT_BY_ROOT"),
+    ] {
+        let s = typed_emp_suggestions(sql);
+        assert!(!has(&s, kw), "{kw} leaked outside a CONNECT BY query for `{sql}`: {s:?}");
+    }
+
+    // With CONNECT BY → grammatical.
+    for (sql, kw) in [
+        ("SELECT lev| FROM emp CONNECT BY PRIOR empno = empno", "LEVEL"),
+        ("SELECT empno FROM emp CONNECT BY pri|", "PRIOR"),
+        ("SELECT conn| FROM emp CONNECT BY PRIOR empno = empno", "CONNECT_BY_ROOT"),
+    ] {
+        let s = typed_emp_suggestions(sql);
+        assert!(has(&s, kw), "{kw} suppressed inside a CONNECT BY query for `{sql}`: {s:?}");
+    }
+
+    // ROWNUM stays valid without CONNECT BY.
+    let s = typed_emp_suggestions("SELECT * FROM emp WHERE rown| = 1");
+    assert!(has(&s, "ROWNUM"), "ROWNUM wrongly suppressed: {s:?}");
+}
+
+/// The `DEFAULT` value keyword is grammatical only in a DML value position
+/// (`INSERT … VALUES (…)`, `UPDATE … SET col = …`), never in a query expression.
+#[test]
+fn default_value_keyword_offered_only_in_dml_value_positions() {
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+
+    for sql in [
+        "UPDATE emp SET ename = def|",
+        "INSERT INTO emp VALUES (def|",
+    ] {
+        let s = typed_emp_suggestions(sql);
+        assert!(has(&s, "DEFAULT"), "DEFAULT suppressed in a DML value position for `{sql}`: {s:?}");
+    }
+    for sql in [
+        "SELECT def| FROM emp",
+        "SELECT * FROM emp WHERE empno = def|",
+    ] {
+        let s = typed_emp_suggestions(sql);
+        assert!(!has(&s, "DEFAULT"), "DEFAULT leaked into a query expression for `{sql}`: {s:?}");
+    }
+}
+
+/// The operand-type postfix operators are gated on the inferred type of the
+/// preceding operand: `AT` (`… AT TIME ZONE`) needs a datetime, `COLLATE` a
+/// character value. After an operand of the wrong type — or one whose type is
+/// unknown — they are withheld.
+#[test]
+fn operand_type_operators_match_the_preceding_operand_type() {
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+
+    // AT after a datetime operand (column, literal, or niladic function).
+    for sql in [
+        "SELECT * FROM emp WHERE hiredate a|",
+        "SELECT sysdate a| FROM emp",
+        "SELECT DATE '2020-01-01' a| FROM emp",
+    ] {
+        let s = typed_emp_suggestions(sql);
+        assert!(has(&s, "AT"), "AT suppressed after a datetime operand for `{sql}`: {s:?}");
+    }
+    // AT after a non-datetime operand is noise.
+    for sql in [
+        "SELECT * FROM emp WHERE empno a|",
+        "SELECT ename a| FROM emp",
+        "SELECT 'x' a| FROM emp",
+    ] {
+        let s = typed_emp_suggestions(sql);
+        assert!(!has(&s, "AT"), "AT leaked after a non-datetime operand for `{sql}`: {s:?}");
+    }
+
+    // COLLATE after a character operand only.
+    let s = typed_emp_suggestions("SELECT ename col| FROM emp");
+    assert!(has(&s, "COLLATE"), "COLLATE suppressed after a character operand: {s:?}");
+    let s = typed_emp_suggestions("SELECT empno col| FROM emp");
+    assert!(!has(&s, "COLLATE"), "COLLATE leaked after a numeric operand: {s:?}");
+    let s = typed_emp_suggestions("SELECT hiredate col| FROM emp");
+    assert!(!has(&s, "COLLATE"), "COLLATE leaked after a datetime operand: {s:?}");
+
+    // When the operand's type cannot be resolved (an unknown identifier, not an
+    // in-scope typed column) the operators are kept — a provable mismatch is
+    // required to suppress, so a valid completion is never hidden.
+    let s = typed_emp_suggestions("SELECT unknown_col a| FROM emp");
+    assert!(has(&s, "AT"), "AT wrongly suppressed after an unknown operand: {s:?}");
+    let s = typed_emp_suggestions("SELECT unknown_col col| FROM emp");
+    assert!(has(&s, "COLLATE"), "COLLATE wrongly suppressed after an unknown operand: {s:?}");
+
+    // But never at an operand-start (these are postfix operators).
+    let s = typed_emp_suggestions("SELECT * FROM emp WHERE empno = a|");
+    assert!(!has(&s, "AT"), "AT leaked at an operand-start: {s:?}");
+}
+
+/// `FIRST`/`LAST` are not standalone-callable functions in Oracle — they only
+/// occur as syntax keywords (`… KEEP (DENSE_RANK FIRST …)`, `NULLS FIRST/LAST`).
+/// They must therefore not be treated as value-producing functions and leak into
+/// an operand position, but must stay available where they are grammatical.
+#[test]
+fn first_last_are_not_value_functions() {
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+
+    // Not offered as an operand (the old `is_language_function` leak).
+    let s = typed_emp_suggestions("SELECT * FROM emp WHERE empno = fir|");
+    assert!(!has(&s, "FIRST"), "FIRST leaked into an operand position: {s:?}");
+    let s = typed_emp_suggestions("SELECT las| FROM emp");
+    assert!(!has(&s, "LAST"), "LAST leaked into an operand position: {s:?}");
+
+    // Still served where grammatical: the `NULLS FIRST/LAST` ordering slot.
+    let ctx = analyze_inline_cursor_sql("SELECT * FROM emp ORDER BY ename NULLS fir|");
+    let kw = SqlEditorWidget::collect_expected_keyword_suggestions(
+        "fir",
+        &ctx,
+        Some(crate::db::DatabaseType::Oracle),
+    );
+    assert!(
+        kw.iter().any(|k| k.eq_ignore_ascii_case("FIRST")),
+        "NULLS FIRST ordering slot lost FIRST: {kw:?}"
+    );
 }
