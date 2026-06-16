@@ -22079,3 +22079,88 @@ fn merge_when_introducer_is_a_keyword_only_slot() {
     assert!(!has(&kw(case_when), "MATCHED"), "CASE WHEN must not offer MATCHED");
     assert!(!suppresses(case_when), "CASE WHEN must keep its condition columns");
 }
+
+/// The slot after a set operator (`UNION`/`INTERSECT`/`EXCEPT`/`MINUS` and
+/// `UNION ALL`/`UNION DISTINCT`) only begins a new query block, so it offers
+/// `SELECT`/`ALL` — never a relation, column or function. The keyword emission
+/// and the identifier suppression share one helper so they cannot diverge.
+#[test]
+fn set_operator_slot_offers_only_query_block_keywords() {
+    let kw = |sql: &str, prefix: &str| {
+        let ctx = analyze_inline_cursor_sql(sql);
+        SqlEditorWidget::collect_expected_keyword_suggestions(prefix, &ctx, Some(crate::db::DatabaseType::Oracle))
+    };
+    let suppresses = |sql: &str| {
+        let ctx = analyze_inline_cursor_sql(sql);
+        let has_prefix = sql.find('|').is_some_and(|i| {
+            sql[..i].chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_')
+        });
+        SqlEditorWidget::cursor_is_after_set_operator_for_context(&ctx, has_prefix)
+    };
+
+    assert_eq!(kw("SELECT a FROM t UNION |", ""), vec!["SELECT".to_string(), "ALL".to_string()]);
+    assert_eq!(kw("SELECT a FROM t MINUS |", ""), vec!["SELECT".to_string(), "ALL".to_string()]);
+    assert_eq!(kw("SELECT a FROM t UNION ALL |", ""), vec!["SELECT".to_string()]);
+    // The slot suppresses the relation/identifier base.
+    for sql in ["SELECT a FROM t UNION |", "SELECT a FROM t INTERSECT |", "SELECT a FROM t UNION ALL |"] {
+        assert!(suppresses(sql), "set-operator slot must suppress identifiers: {sql}");
+    }
+    // Inside the following SELECT list the slot is gone (a real column context).
+    assert!(!suppresses("SELECT a FROM t UNION SELECT | FROM s"));
+}
+
+/// In a `FROM` comma-list, a complete relation reference (the first table, a
+/// comma-separated one, with or without an implicit alias) is followed only by a
+/// further `JOIN`/`,`/clause or an implicit alias — never another bare relation.
+/// The relation list is suppressed there; it stays available where a relation is
+/// genuinely expected (`FROM |`, `FROM a, |`, and while a name is being typed).
+#[test]
+fn from_clause_suppresses_relations_after_a_complete_reference() {
+    let after = |sql: &str| {
+        let ctx = analyze_inline_cursor_sql(sql);
+        let has_prefix = sql.find('|').is_some_and(|i| {
+            sql[..i].chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_')
+        });
+        SqlEditorWidget::cursor_is_after_complete_from_relation_for_context(&ctx, has_prefix)
+    };
+
+    // After a complete reference / implicit alias → suppress.
+    for sql in [
+        "SELECT * FROM emp |",
+        "SELECT * FROM emp e |",
+        "SELECT * FROM a, b |",
+        "SELECT * FROM scott.emp |",
+    ] {
+        assert!(after(sql), "expected relation suppression after a complete reference: {sql}");
+    }
+    // Where a relation is genuinely expected → not suppressed.
+    for sql in [
+        "SELECT * FROM |",
+        "SELECT * FROM emp, |",
+        "SELECT * FROM em|",
+        "SELECT * FROM emp JOIN |",
+    ] {
+        assert!(!after(sql), "relation completion must stay available: {sql}");
+    }
+}
+
+/// `ALTER TABLE <name> |` has its target named already, so an alteration clause
+/// (`ADD`/`MODIFY`/`DROP`/…) follows — never another relation. The name slot
+/// itself (`ALTER TABLE |`) and `DROP TABLE |` still complete relations.
+#[test]
+fn alter_table_target_slot_suppresses_a_second_relation() {
+    let after = |sql: &str| {
+        let ctx = analyze_inline_cursor_sql(sql);
+        let has_prefix = sql.find('|').is_some_and(|i| {
+            sql[..i].chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_')
+        });
+        SqlEditorWidget::cursor_is_after_complete_alter_table_target_for_context(&ctx, has_prefix)
+    };
+
+    assert!(after("ALTER TABLE emp |"), "ALTER TABLE target slot must suppress relations");
+    assert!(after("ALTER TABLE scott.emp |"), "qualified ALTER TABLE target slot must suppress relations");
+    // The name slot itself and other statements still complete relations.
+    assert!(!after("ALTER TABLE |"), "ALTER TABLE name slot must still complete relations");
+    assert!(!after("DROP TABLE |"));
+    assert!(!after("ALTER TABLE em|"));
+}

@@ -1025,6 +1025,9 @@ impl SqlEditorWidget {
                 || Self::cursor_is_at_table_alias_name_slot(deep_ctx, has_prefix)
                 || Self::cursor_is_at_merge_then_action_slot_for_context(deep_ctx, has_prefix)
                 || Self::cursor_is_at_merge_when_keyword_slot_for_context(deep_ctx, has_prefix)
+                || Self::cursor_is_after_set_operator_for_context(deep_ctx, has_prefix)
+                || Self::cursor_is_after_complete_from_relation_for_context(deep_ctx, has_prefix)
+                || Self::cursor_is_after_complete_alter_table_target_for_context(deep_ctx, has_prefix)
                 || Self::cursor_is_at_locking_clause_keyword_slot_for_context(deep_ctx, has_prefix));
         let cursor_in_statement = snapshot
             .cursor_pos_usize
@@ -3397,6 +3400,18 @@ impl SqlEditorWidget {
                 deep_ctx,
                 exclude_current_identifier_chain,
             )
+            || Self::cursor_is_after_set_operator_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
+            || Self::cursor_is_after_complete_from_relation_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
+            || Self::cursor_is_after_complete_alter_table_target_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
             || Self::cursor_is_at_locking_clause_keyword_slot_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
@@ -3736,6 +3751,118 @@ impl SqlEditorWidget {
             exclude_current_identifier_chain,
         );
         Self::expected_join_target_keyword_candidates(tokens, end, deep_ctx.phase).is_some()
+    }
+
+    /// True when the cursor sits right after a *complete* relation reference in a
+    /// `FROM` comma-list — the first table (`FROM emp |`) or a comma-separated one
+    /// (`FROM a, b |`), with or without an implicit alias (`FROM emp e |`). The
+    /// phase machine keeps the whole clause in `FromClause`, so without this the
+    /// slot dumps every relation even though a bare relation is not grammatical
+    /// there (a second table needs a leading comma or `JOIN`; the slot itself is
+    /// the implicit-alias position, a brand-new name). It is the comma-list
+    /// companion of [`Self::expected_join_target_keyword_candidates`], which
+    /// covers the `JOIN` side; the join run is deliberately excluded here so that
+    /// predicate keeps emitting its `ON`/`USING` hint. While the relation is still
+    /// being typed the caller excludes the cursor word, leaving `FROM`/`,` as the
+    /// last token, so relation completion keeps working.
+    fn cursor_is_after_complete_from_relation(tokens: &[SqlToken], end: usize) -> bool {
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        // The reference (or its implicit alias) must be complete: the last token
+        // is a plain identifier word, never a separator or a clause keyword.
+        let Some(SqlToken::Word(last)) = toks.last() else {
+            return false;
+        };
+        if Self::token_is_language_keyword(&last.to_ascii_uppercase()) {
+            return false;
+        }
+        // Walk back over the reference's own words / dotted-name separators to the
+        // structural token that introduces the list slot: `FROM` or a `,` means a
+        // complete comma-list reference; anything else (a `JOIN`/join-type word, a
+        // `(`, an operator) belongs to another slot and is left untouched.
+        let mut idx = toks.len() - 1;
+        while idx > 0 {
+            idx -= 1;
+            match &toks[idx] {
+                SqlToken::Word(word) if word.eq_ignore_ascii_case("FROM") => return true,
+                SqlToken::Symbol(sym) if sym == "," => return true,
+                SqlToken::Word(_) => {} // part of the table name or its implicit alias
+                SqlToken::Symbol(sym) if sym == "." => {} // dotted-name separator
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    fn cursor_is_after_complete_from_relation_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> bool {
+        if !matches!(deep_ctx.phase, intellisense_context::SqlPhase::FromClause) {
+            return false;
+        }
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::cursor_is_after_complete_from_relation(tokens, end)
+    }
+
+    /// True when the cursor sits right after the *complete* target name of an
+    /// `ALTER TABLE <name> |` statement (including a qualified `schema.name`). The
+    /// table name is already given, so what follows is an alteration clause
+    /// (`ADD`/`MODIFY`/`DROP`/`RENAME`/…), never another relation; the phase
+    /// machine leaves the cursor in the `ALTER TABLE` target phase (`IntoClause`),
+    /// where the relation list would otherwise be offered a second time. Anchored
+    /// on a leading `ALTER TABLE` so the name slot itself (`ALTER TABLE |`, last
+    /// token `TABLE`) still completes relations, and so the `IntoClause` of an
+    /// `INSERT`/`CREATE TABLE AS`/`COMMENT ON` is untouched.
+    fn cursor_is_after_complete_alter_table_target(tokens: &[SqlToken], end: usize) -> bool {
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        let Some(SqlToken::Word(last)) = toks.last() else {
+            return false;
+        };
+        if Self::token_is_language_keyword(&last.to_ascii_uppercase()) {
+            return false;
+        }
+        // Walk back over the (possibly dotted) target name to the `TABLE` keyword,
+        // which must itself be introduced by `ALTER`.
+        let mut idx = toks.len() - 1;
+        while idx > 0 {
+            idx -= 1;
+            match &toks[idx] {
+                SqlToken::Word(word) if word.eq_ignore_ascii_case("TABLE") => {
+                    return idx > 0
+                        && matches!(
+                            toks.get(idx - 1),
+                            Some(SqlToken::Word(head)) if head.eq_ignore_ascii_case("ALTER")
+                        );
+                }
+                SqlToken::Word(_) => {} // part of the target name
+                SqlToken::Symbol(sym) if sym == "." => {} // dotted-name separator
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    fn cursor_is_after_complete_alter_table_target_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> bool {
+        if !matches!(deep_ctx.phase, intellisense_context::SqlPhase::IntoClause) {
+            return false;
+        }
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::cursor_is_after_complete_alter_table_target(tokens, end)
     }
 
     /// True when the cursor is at the type slot of a column definition in
@@ -4338,6 +4465,50 @@ impl SqlEditorWidget {
         Self::merge_when_action_keywords(tokens, end).is_some()
     }
 
+    /// The slot right after a set operator that joins two query blocks — `UNION
+    /// |` / `INTERSECT |` / `EXCEPT |` / `MINUS |` (→ `SELECT` / `ALL`), and
+    /// `UNION ALL |` / `UNION DISTINCT |` (→ `SELECT`). Only a new query block
+    /// (or a parenthesised one) may follow, never a relation, column or function,
+    /// so the slot suppresses the identifier base while these keyword hints come
+    /// from the same helper — the keyword emission and column suppression cannot
+    /// drift apart.
+    fn expected_set_operator_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> Option<&'static [&'static str]> {
+        const SET_OPERATORS: &[&str] = &["UNION", "INTERSECT", "EXCEPT", "MINUS"];
+        let is_set_op =
+            |word: &str| SET_OPERATORS.iter().any(|op| word.eq_ignore_ascii_case(op));
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        match toks.last() {
+            Some(SqlToken::Word(word)) if is_set_op(word) => Some(&["SELECT", "ALL"]),
+            Some(SqlToken::Word(word))
+                if word.eq_ignore_ascii_case("ALL") || word.eq_ignore_ascii_case("DISTINCT") =>
+            {
+                let prev = toks.len().checked_sub(2).and_then(|idx| toks.get(idx));
+                match prev {
+                    Some(SqlToken::Word(prev_word)) if is_set_op(prev_word) => Some(&["SELECT"]),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn cursor_is_after_set_operator_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::expected_set_operator_keyword_candidates(tokens, end).is_some()
+    }
+
     /// Row-locking clause keyword slot — `… FOR |` (→ `UPDATE`/`SHARE`) or
     /// `… FOR UPDATE|SHARE |` (→ `OF`/`NOWAIT`/`WAIT`/`SKIP`). Only keywords are
     /// grammatical there, never a column. The caller gates this on a top-level
@@ -4618,6 +4789,10 @@ impl SqlEditorWidget {
         if let Some(candidates) = Self::merge_when_action_keywords(tokens, context_end) {
             return Self::filter_expected_candidates(prefix, candidates);
         }
+        if let Some(candidates) = Self::expected_set_operator_keyword_candidates(tokens, context_end)
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
         if Self::cursor_is_at_locking_clause_keyword_slot_for_context(deep_ctx, !prefix.is_empty()) {
             if let Some(candidates) =
                 Self::expected_locking_clause_keyword_candidates(tokens, context_end)
@@ -4720,9 +4895,6 @@ impl SqlEditorWidget {
                     && matches!(prev.as_str(), "LEFT" | "RIGHT" | "FULL") =>
             {
                 &["JOIN"]
-            }
-            [.., last] if matches!(last.as_str(), "UNION" | "INTERSECT" | "EXCEPT" | "MINUS") => {
-                &["SELECT", "ALL"]
             }
             [.., last] if *last == "CREATE" => CREATE_OBJECT_TYPE_KEYWORDS,
             [.., last] if *last == "DROP" => OBJECT_TYPE_KEYWORDS,
