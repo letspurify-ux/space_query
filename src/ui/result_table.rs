@@ -1141,14 +1141,14 @@ impl ResultTableWidget {
         let target_row = target_row as i32;
         let target_col = target_col as i32;
         table.set_selection(target_row, target_col, target_row, target_col);
-        table.set_row_position(Self::row_position_for_edge_target(
-            table,
-            target_row as usize,
-            edge,
-        ));
         match edge {
             ResultTableEdge::Left | ResultTableEdge::Right => table.set_col_position(target_col),
             ResultTableEdge::Up | ResultTableEdge::Down => {
+                table.set_row_position(Self::row_position_for_edge_target(
+                    table,
+                    target_row as usize,
+                    edge,
+                ));
                 Self::restore_table_col_position(table, preserve_col_position)
             }
         }
