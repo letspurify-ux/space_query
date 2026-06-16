@@ -561,7 +561,8 @@ fn mysql_context_and_suggestions_for_inline_sql(
     );
     let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
     let mut data = IntellisenseData::new();
-    let expr_keyword_ctx = SqlEditorWidget::expression_keyword_context(&deep_ctx, &data, &[]);
+    let expr_keyword_ctx =
+        SqlEditorWidget::expression_keyword_context(&deep_ctx, &data, &[], !prefix.is_empty());
     let suggestions = SqlEditorWidget::base_suggestions_for_context(
         &mut data,
         &prefix,
@@ -21394,7 +21395,7 @@ fn expression_keyword_completion_is_position_aware() {
         data.set_columns_for_table("EMP", emp_columns);
         data.rebuild_indices();
         let expr_keyword_ctx =
-            SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables);
+            SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables, !prefix.is_empty());
         SqlEditorWidget::base_suggestions_for_context(
             &mut data,
             &prefix,
@@ -21550,7 +21551,7 @@ fn analytic_continuations_offered_only_after_a_closed_call() {
         data.set_columns_for_table("EMP", vec!["ENAME".to_string(), "EMPNO".to_string()]);
         data.rebuild_indices();
         let expr_keyword_ctx =
-            SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables);
+            SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables, !prefix.is_empty());
         SqlEditorWidget::base_suggestions_for_context(
             &mut data,
             &prefix,
@@ -21604,7 +21605,7 @@ fn analytic_continuations_offered_only_after_a_closed_call() {
         data.set_columns_for_table("EMP", vec!["ENAME".to_string(), "EMPNO".to_string()]);
         data.rebuild_indices();
         let expr_keyword_ctx =
-            SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables);
+            SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables, !prefix.is_empty());
         SqlEditorWidget::base_suggestions_for_context(
             &mut data,
             &prefix,
@@ -21647,7 +21648,7 @@ fn escape_offered_only_after_a_like_pattern() {
         data.set_columns_for_table("EMP", vec!["ENAME".to_string(), "EMPNO".to_string()]);
         data.rebuild_indices();
         let expr_keyword_ctx =
-            SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables);
+            SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables, !prefix.is_empty());
         SqlEditorWidget::base_suggestions_for_context(
             &mut data,
             &prefix,
@@ -21707,7 +21708,7 @@ fn set_quantifiers_offered_only_at_a_list_or_aggregate_anchor() {
         data.set_columns_for_table("EMP", vec!["ENAME".to_string(), "EMPNO".to_string()]);
         data.rebuild_indices();
         let expr_keyword_ctx =
-            SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables);
+            SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables, !prefix.is_empty());
         SqlEditorWidget::base_suggestions_for_context(
             &mut data, &prefix, None, column_scope.as_deref(),
             matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
@@ -21771,7 +21772,7 @@ fn typed_emp_suggestions(sql_with_cursor: &str) -> Vec<String> {
     data.set_column_meta_for_table("EMP", meta);
     data.rebuild_indices();
     let expr_keyword_ctx =
-        SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables);
+        SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables, !prefix.is_empty());
     SqlEditorWidget::base_suggestions_for_context(
         &mut data, &prefix, None, column_scope.as_deref(),
         matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
@@ -21906,4 +21907,175 @@ fn first_last_are_not_value_functions() {
         kw.iter().any(|k| k.eq_ignore_ascii_case("FIRST")),
         "NULLS FIRST ordering slot lost FIRST: {kw:?}"
     );
+}
+
+/// The top-level statement keywords (`SELECT`, `INSERT`, `CREATE`, `BEGIN`, …)
+/// are grammatical only where a new statement can begin. They must never appear
+/// mid-clause. The regression: `previous_meaningful_words_upper` stops at a
+/// value token, so an operand whose last token is a string literal left the
+/// keyword machinery with an empty word list, which it mistook for a statement
+/// start and dumped the statement keywords into a `WHERE`/`VALUES`/`IN` slot.
+#[test]
+fn statement_keywords_offered_only_at_a_real_statement_start() {
+    let kw = |sql: &str| {
+        let ctx = analyze_inline_cursor_sql(sql);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &ctx,
+            Some(crate::db::DatabaseType::Oracle),
+        )
+    };
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+
+    // A genuine statement start still offers them.
+    let s = kw("|");
+    assert!(has(&s, "SELECT") && has(&s, "CREATE") && has(&s, "BEGIN"),
+        "statement start lost the top-level keywords: {s:?}");
+
+    // Mid-expression, right after a value operand — pure noise. A preceding
+    // string literal, a parenthesised value list and a `VALUES` row all used to
+    // leak the statement keywords through the empty-word-list path.
+    for sql in [
+        "SELECT * FROM emp WHERE ename = 'x' |",
+        "SELECT ename FROM emp WHERE ename LIKE 'a%' |",
+        "SELECT * FROM emp WHERE empno IN ('a', |",
+        "INSERT INTO emp VALUES ('a', |",
+    ] {
+        let s = kw(sql);
+        for keyword in ["SELECT", "INSERT", "UPDATE", "CREATE", "ALTER", "DROP", "BEGIN", "MERGE"] {
+            assert!(
+                !has(&s, keyword),
+                "{keyword} leaked mid-clause for `{sql}`: {s:?}"
+            );
+        }
+    }
+}
+
+/// A column wildcard (`*` / `t.*`) is column/operand material. It must be
+/// suppressed in a column-suppressing keyword-only slot (an `EXTRACT` field, a
+/// data-type slot, …) and right after a complete operand, while staying
+/// available at an operand-start select position.
+#[test]
+fn select_wildcard_is_position_aware() {
+    // Mirrors the apply-path wildcard gate.
+    fn wildcard(sql_with_cursor: &str) -> Vec<String> {
+        let cursor = sql_with_cursor.find('|').expect("cursor marker");
+        let sql = sql_with_cursor.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql_with_cursor);
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+        let has_prefix = !prefix.is_empty();
+        let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &ctx);
+        let data = IntellisenseData::new();
+        let expr_keyword_ctx =
+            SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables, has_prefix);
+        let at_keyword_only_slot =
+            SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(&ctx, has_prefix);
+        if at_keyword_only_slot || expr_keyword_ctx.follows_operand == Some(true) {
+            Vec::new()
+        } else {
+            SqlEditorWidget::collect_clause_wildcard_suggestions(&prefix, None, &ctx)
+        }
+    }
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+
+    // Operand-start select positions keep the wildcard.
+    assert!(has(&wildcard("SELECT | FROM emp"), "*"), "wildcard lost at select start");
+    assert!(has(&wildcard("SELECT ename, | FROM emp"), "*"), "wildcard lost after a comma");
+
+    // Right after a complete select item, the wildcard is noise.
+    assert!(wildcard("SELECT ename | FROM emp").is_empty(), "wildcard leaked after a column operand");
+    assert!(wildcard("SELECT 'x' | FROM emp").is_empty(), "wildcard leaked after a literal operand");
+
+    // A keyword-only value slot (EXTRACT field) never admits the wildcard.
+    assert!(wildcard("SELECT EXTRACT(| FROM hiredate) FROM emp").is_empty(),
+        "wildcard leaked into the EXTRACT field slot");
+}
+
+/// Operand material (columns, `*`, bare identifiers) is grammatical only where a
+/// new operand is expected. With an empty prefix the cursor sits *after* the
+/// completed operand, so it must be dropped — the regression was that the
+/// expression-keyword context excluded the finished operand from its window and
+/// misread the position as an operand-start, leaking columns after
+/// `SELECT ename `, `ORDER BY ename `, `WHERE c = 'x' `.
+#[test]
+fn columns_suppressed_immediately_after_a_complete_operand() {
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+
+    // After a complete operand (empty prefix): no operand material.
+    for sql in [
+        "SELECT ename | FROM emp",
+        "SELECT * FROM emp ORDER BY ename |",
+        "SELECT * FROM emp WHERE ename = 'x' |",
+        "SELECT * FROM emp WHERE empno = empno |",
+    ] {
+        let s = typed_emp_suggestions(sql);
+        assert!(
+            !has(&s, "ENAME") && !has(&s, "EMPNO") && !has(&s, "HIREDATE"),
+            "operand material leaked after a complete operand for `{sql}`: {s:?}"
+        );
+    }
+
+    // At an operand-start the same columns are still offered.
+    assert!(has(&typed_emp_suggestions("SELECT | FROM emp"), "ENAME"),
+        "columns lost at an operand-start select position");
+    assert!(has(&typed_emp_suggestions("SELECT * FROM emp WHERE empno = | "), "ENAME"),
+        "columns lost after a comparison operator");
+    // And typing a column prefix still completes it.
+    assert!(has(&typed_emp_suggestions("SELECT en| FROM emp"), "ENAME"),
+        "column prefix completion broke");
+}
+
+/// A MERGE `WHEN |` / `WHEN NOT |` introducer is a keyword-only slot — only
+/// `MATCHED` / `NOT` are grammatical. The `ON (...)` condition before the first
+/// `WHEN` leaves the cursor in a column phase (`JoinCondition`), so without
+/// dedicated handling the slot leaked every joined column. The keyword emission
+/// and the column suppression are driven by the same `merge_when_action_keywords`
+/// helper so they cannot drift apart.
+#[test]
+fn merge_when_introducer_is_a_keyword_only_slot() {
+    const ON: &str = "MERGE INTO emp e USING dept d ON (e.deptno = d.deptno)";
+    let kw = |sql: &str| {
+        let ctx = analyze_inline_cursor_sql(sql);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &ctx,
+            Some(crate::db::DatabaseType::Oracle),
+        )
+    };
+    let suppresses = |sql: &str| {
+        let ctx = analyze_inline_cursor_sql(sql);
+        let has_prefix = sql.find('|').is_some_and(|i| {
+            sql[..i].chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_')
+        });
+        SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(&ctx, has_prefix)
+    };
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+
+    // `WHEN |` → MATCHED / NOT, and columns suppressed.
+    let when = format!("{ON} WHEN |");
+    assert_eq!(kw(&when), vec!["MATCHED".to_string(), "NOT".to_string()]);
+    assert!(suppresses(&when), "WHEN slot must suppress columns");
+
+    // `WHEN NOT |` → MATCHED, columns suppressed.
+    let when_not = format!("{ON} WHEN NOT |");
+    assert_eq!(kw(&when_not), vec!["MATCHED".to_string()]);
+    assert!(suppresses(&when_not), "WHEN NOT slot must suppress columns");
+
+    // Prefix filtering still works.
+    let when_m = format!("{ON} WHEN M|");
+    let ctx = analyze_inline_cursor_sql(&when_m);
+    assert_eq!(
+        SqlEditorWidget::collect_expected_keyword_suggestions("M", &ctx, Some(crate::db::DatabaseType::Oracle)),
+        vec!["MATCHED".to_string()]
+    );
+
+    // `WHEN MATCHED |` still admits a column expression (`AND <cond>` / `THEN`),
+    // so it is NOT a column-suppressing slot.
+    let when_matched = format!("{ON} WHEN MATCHED |");
+    assert!(!suppresses(&when_matched), "WHEN MATCHED must keep its AND-condition columns");
+
+    // A `CASE WHEN |` value expression is not a MERGE action slot.
+    let case_when = "SELECT CASE WHEN | END FROM emp";
+    assert!(!has(&kw(case_when), "MATCHED"), "CASE WHEN must not offer MATCHED");
+    assert!(!suppresses(case_when), "CASE WHEN must keep its condition columns");
 }

@@ -1024,6 +1024,7 @@ impl SqlEditorWidget {
                 || Self::cursor_is_after_complete_join_target_for_context(deep_ctx, has_prefix)
                 || Self::cursor_is_at_table_alias_name_slot(deep_ctx, has_prefix)
                 || Self::cursor_is_at_merge_then_action_slot_for_context(deep_ctx, has_prefix)
+                || Self::cursor_is_at_merge_when_keyword_slot_for_context(deep_ctx, has_prefix)
                 || Self::cursor_is_at_locking_clause_keyword_slot_for_context(deep_ctx, has_prefix));
         let cursor_in_statement = snapshot
             .cursor_pos_usize
@@ -1134,7 +1135,12 @@ impl SqlEditorWidget {
             let data = intellisense_data
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            Self::expression_keyword_context(deep_ctx, &data, &column_tables)
+            Self::expression_keyword_context(
+                deep_ctx,
+                &data,
+                &column_tables,
+                !snapshot.prefix.is_empty(),
+            )
         };
         let include_columns = !has_local_record_member_scope
             && !at_keyword_only_slot
@@ -1485,7 +1491,21 @@ impl SqlEditorWidget {
                 deep_ctx.phase,
             );
         }
-        let wildcard_suggestions = if at_keyword_only_identifier_slot {
+        // A column wildcard (`*` / `t.*`) is column material, so every
+        // column-suppressing keyword-only slot must drop it just like the
+        // identifier base does. `at_keyword_only_identifier_slot` covers the
+        // clause-continuation slots; `at_keyword_only_slot` covers the
+        // value/keyword-only slots enumerated at the suppression chokepoint
+        // (EXTRACT field, data type, INTERVAL unit, window-frame bound,
+        // row-limit count), where `EXTRACT(| FROM d)` previously leaked `*`.
+        // It is also operand material, so it is dropped right after a complete
+        // operand (`SELECT empno |`, `SELECT 'x' |`) where only an operator/
+        // comma/`FROM` can follow; the wildcard still appears at an operand-start
+        // (`SELECT |`, `SELECT a, |`) and for a qualified scope (`t.|`).
+        let wildcard_suggestions = if at_keyword_only_identifier_slot
+            || at_keyword_only_slot
+            || (qualifier.is_none() && expr_keyword_ctx.follows_operand == Some(true))
+        {
             Vec::new()
         } else {
             Self::collect_clause_wildcard_suggestions(&snapshot.prefix, qualifier, deep_ctx)
@@ -1930,6 +1950,7 @@ impl SqlEditorWidget {
         deep_ctx: &intellisense_context::CursorContext,
         data: &IntellisenseData,
         column_scope: &[String],
+        exclude_current_identifier_chain: bool,
     ) -> ExpressionKeywordContext {
         let tokens = Self::current_query_tokens(deep_ctx);
         let cursor_len = Self::cursor_token_len_in_current_query(deep_ctx);
@@ -1939,7 +1960,14 @@ impl SqlEditorWidget {
             deep_ctx.phase,
             intellisense_context::SqlPhase::OrderByClause
         );
-        let end = Self::expected_suggestion_context_end(tokens, cursor_len, true);
+        // Drop the identifier chain at the cursor only when the user is actually
+        // typing one (a non-empty prefix). With an empty prefix the cursor sits
+        // after a completed token, so excluding it would point `end` at the token
+        // *before* the finished operand and misread a complete operand as an
+        // operand-start — leaking columns/`*` after `c = 'x' `/`SELECT empno `.
+        // Mirrors the flag `collect_expected_keyword_suggestions` already passes.
+        let end =
+            Self::expected_suggestion_context_end(tokens, cursor_len, exclude_current_identifier_chain);
         let follows_operand = Self::cursor_follows_complete_operand(tokens, end);
         let follows_call = matches!(
             Self::meaningful_tokens_before(tokens, end).last(),
@@ -3365,6 +3393,10 @@ impl SqlEditorWidget {
                 deep_ctx,
                 exclude_current_identifier_chain,
             )
+            || Self::cursor_is_at_merge_when_keyword_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
             || Self::cursor_is_at_locking_clause_keyword_slot_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
@@ -4258,6 +4290,54 @@ impl SqlEditorWidget {
         Self::merge_then_action_keywords(tokens, end).is_some()
     }
 
+    /// MERGE merge-action introducer slot right after `WHEN |` (→ `MATCHED` /
+    /// `NOT`) or `WHEN NOT |` (→ `MATCHED`): the only grammatical continuations
+    /// are those keywords — never a column, relation, alias or local symbol. The
+    /// `ON (...)` join condition that precedes the first `WHEN` leaves the cursor
+    /// in `JoinCondition` (a column phase), so without this the bare `WHEN`/`WHEN
+    /// NOT` slot leaked every joined column. Gated to a MERGE whose `WHEN` is not
+    /// a `CASE … WHEN` branch (mirrors `merge_then_action_keywords`), and `WHEN
+    /// NOT` is anchored on the preceding `WHEN` so an `IS NOT`/`AND … NOT` inside
+    /// a match condition is untouched.
+    fn merge_when_action_keywords(
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> Option<&'static [&'static str]> {
+        if !Self::statement_is_merge(tokens) || Self::cursor_is_inside_unclosed_case(tokens, end) {
+            return None;
+        }
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        match toks.last() {
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("WHEN") => {
+                Some(&["MATCHED", "NOT"])
+            }
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("NOT") => {
+                let prev = toks.len().checked_sub(2).and_then(|idx| toks.get(idx));
+                match prev {
+                    Some(SqlToken::Word(prev_word)) if prev_word.eq_ignore_ascii_case("WHEN") => {
+                        Some(&["MATCHED"])
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn cursor_is_at_merge_when_keyword_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::merge_when_action_keywords(tokens, end).is_some()
+    }
+
     /// Row-locking clause keyword slot — `… FOR |` (→ `UPDATE`/`SHARE`) or
     /// `… FOR UPDATE|SHARE |` (→ `OF`/`NOWAIT`/`WAIT`/`SKIP`). Only keywords are
     /// grammatical there, never a column. The caller gates this on a top-level
@@ -4535,6 +4615,9 @@ impl SqlEditorWidget {
         if let Some(candidates) = Self::merge_then_action_keywords(tokens, context_end) {
             return Self::filter_expected_candidates(prefix, candidates);
         }
+        if let Some(candidates) = Self::merge_when_action_keywords(tokens, context_end) {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
         if Self::cursor_is_at_locking_clause_keyword_slot_for_context(deep_ctx, !prefix.is_empty()) {
             if let Some(candidates) =
                 Self::expected_locking_clause_keyword_candidates(tokens, context_end)
@@ -4542,12 +4625,6 @@ impl SqlEditorWidget {
                 return Self::filter_expected_candidates(prefix, candidates);
             }
         }
-
-        // `WHEN [NOT] MATCHED` is a MERGE-only merge-action slot. Restrict it to a
-        // MERGE statement whose `WHEN` is not nested in a `CASE … END`, so a
-        // `CASE WHEN |` / `CASE WHEN NOT |` branch never offers `MATCHED`.
-        let at_merge_when = Self::statement_is_merge(tokens)
-            && !Self::cursor_is_inside_unclosed_case(tokens, context_end);
 
         // A join continuation (`LEFT|RIGHT|FULL|INNER|CROSS|NATURAL JOIN`) is only
         // grammatical in a table position. Gating on the phase keeps a column or
@@ -4561,7 +4638,20 @@ impl SqlEditorWidget {
             Self::trigger_word_is_qualified_member(tokens, context_end);
 
         let candidates: &[&str] = match words.as_slice() {
-            [] => TOP_LEVEL_KEYWORDS,
+            // `previous_meaningful_words_upper` stops at the first non-word token
+            // (a string literal, and any other non-identifier value token), so an
+            // empty `words` is ambiguous: it is a genuine statement start *only*
+            // when nothing at all precedes the cursor. When a value operand sits
+            // immediately before it (`WHERE c = 'x' |`, `IN ('a', |`,
+            // `VALUES (1, |`) the cursor is mid-expression, never a place to begin
+            // a new statement — so the top-level statement keywords would be pure
+            // noise. Gate the statement-start list on there being no preceding
+            // token at all; the operator/clause continuations valid after the
+            // operand still arrive through the expression-keyword allowlist.
+            [] if Self::meaningful_tokens_before(tokens, context_end).is_empty() => {
+                TOP_LEVEL_KEYWORDS
+            }
+            [] => &[],
             _ if Self::is_create_synonym_name_written_context(&words) => &["FOR"],
             [.., last]
                 if !trigger_is_qualified_member
@@ -4730,10 +4820,6 @@ impl SqlEditorWidget {
             }
             [.., last] if *last == "COMMENT" => &["ON"],
             [.., last] if *last == "EXECUTE" => &["IMMEDIATE"],
-            [.., last] if *last == "WHEN" && at_merge_when => &["MATCHED", "NOT"],
-            [.., prev, last] if *prev == "WHEN" && *last == "NOT" && at_merge_when => {
-                &["MATCHED"]
-            }
             [.., prev, last] if *prev == "CREATE" && *last == "OR" => &["REPLACE"],
             _ => {
                 if deep_ctx.cursor_token_len == 0 {
