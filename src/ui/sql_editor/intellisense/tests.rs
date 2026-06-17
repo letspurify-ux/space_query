@@ -562,7 +562,7 @@ fn mysql_context_and_suggestions_for_inline_sql(
     let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
     let mut data = IntellisenseData::new();
     let expr_keyword_ctx =
-        SqlEditorWidget::expression_keyword_context(&deep_ctx, &data, &[], !prefix.is_empty());
+        SqlEditorWidget::expression_keyword_context(&deep_ctx, &data, &[], !prefix.is_empty(), Some(crate::db::DatabaseType::MySQL));
     let suggestions = SqlEditorWidget::base_suggestions_for_context(
         &mut data,
         &prefix,
@@ -21421,7 +21421,7 @@ fn expression_keyword_completion_is_position_aware() {
         data.set_columns_for_table("EMP", emp_columns);
         data.rebuild_indices();
         let expr_keyword_ctx =
-            SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables, !prefix.is_empty());
+            SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables, !prefix.is_empty(), Some(crate::db::DatabaseType::Oracle));
         SqlEditorWidget::base_suggestions_for_context(
             &mut data,
             &prefix,
@@ -21577,7 +21577,7 @@ fn analytic_continuations_offered_only_after_a_closed_call() {
         data.set_columns_for_table("EMP", vec!["ENAME".to_string(), "EMPNO".to_string()]);
         data.rebuild_indices();
         let expr_keyword_ctx =
-            SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables, !prefix.is_empty());
+            SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables, !prefix.is_empty(), Some(crate::db::DatabaseType::Oracle));
         SqlEditorWidget::base_suggestions_for_context(
             &mut data,
             &prefix,
@@ -21603,6 +21603,30 @@ fn analytic_continuations_offered_only_after_a_closed_call() {
         let s = suggestions(sql);
         assert!(!has(&s, kw), "{kw} leaked after a plain operand for `{sql}`: {s:?}");
     }
+
+    // A closing `)` that ends a *grouping/predicate paren* or a *subquery* — not
+    // a function call — is not a call site: the continuations stay suppressed.
+    // (Regression: the previous "last token is `)`" test treated every paren as a
+    // call, leaking `OVER`/`KEEP`/`WITHIN` after `(a + b)`, `(SELECT …)`, etc.)
+    for (sql, kw) in [
+        ("SELECT (empno + 1) ov| FROM emp", "OVER"),
+        ("SELECT (sum(empno)) ov| FROM emp", "OVER"),
+        ("SELECT (SELECT max(empno) FROM emp) ov| FROM emp", "OVER"),
+        ("SELECT (empno) ke| FROM emp", "KEEP"),
+        ("SELECT (empno) wi| FROM emp", "WITHIN"),
+        ("SELECT * FROM emp WHERE EXISTS (SELECT 1 FROM emp) ov|", "OVER"),
+        ("SELECT * FROM emp WHERE empno IN (1, 2) ov|", "OVER"),
+    ] {
+        let s = suggestions(sql);
+        assert!(!has(&s, kw), "{kw} leaked after a non-call `)` for `{sql}`: {s:?}");
+    }
+
+    // A user-defined routine call (a non-keyword identifier before `(`) is still
+    // a call site, so the continuation survives.
+    assert!(
+        has(&suggestions("SELECT my_rank(empno) ov| FROM emp"), "OVER"),
+        "OVER suppressed after a user-defined function call"
+    );
 
     // Immediately after a closed call they are grammatical again.
     for (sql, kw) in [
@@ -21631,7 +21655,7 @@ fn analytic_continuations_offered_only_after_a_closed_call() {
         data.set_columns_for_table("EMP", vec!["ENAME".to_string(), "EMPNO".to_string()]);
         data.rebuild_indices();
         let expr_keyword_ctx =
-            SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables, !prefix.is_empty());
+            SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables, !prefix.is_empty(), Some(crate::db::DatabaseType::MySQL));
         SqlEditorWidget::base_suggestions_for_context(
             &mut data,
             &prefix,
@@ -21674,7 +21698,7 @@ fn escape_offered_only_after_a_like_pattern() {
         data.set_columns_for_table("EMP", vec!["ENAME".to_string(), "EMPNO".to_string()]);
         data.rebuild_indices();
         let expr_keyword_ctx =
-            SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables, !prefix.is_empty());
+            SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables, !prefix.is_empty(), Some(crate::db::DatabaseType::Oracle));
         SqlEditorWidget::base_suggestions_for_context(
             &mut data,
             &prefix,
@@ -21734,7 +21758,7 @@ fn set_quantifiers_offered_only_at_a_list_or_aggregate_anchor() {
         data.set_columns_for_table("EMP", vec!["ENAME".to_string(), "EMPNO".to_string()]);
         data.rebuild_indices();
         let expr_keyword_ctx =
-            SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables, !prefix.is_empty());
+            SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables, !prefix.is_empty(), Some(crate::db::DatabaseType::Oracle));
         SqlEditorWidget::base_suggestions_for_context(
             &mut data, &prefix, None, column_scope.as_deref(),
             matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
@@ -21743,13 +21767,18 @@ fn set_quantifiers_offered_only_at_a_list_or_aggregate_anchor() {
     }
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
 
-    // General operand positions: DISTINCT/UNIQUE are noise.
+    // General operand positions: DISTINCT/UNIQUE are noise. The opening `(`
+    // cases are *grouping/predicate* parens, not aggregate-call parens, so the
+    // quantifier must not be offered just because the previous token is `(`.
     for sql in [
         "SELECT * FROM emp WHERE empno = dis|",
         "SELECT empno + dis| FROM emp",
         "SELECT nvl(empno, dis| FROM emp",
         "SELECT ename, dis| FROM emp",
         "SELECT * FROM emp WHERE empno = uni|",
+        "SELECT (dis| FROM emp",
+        "SELECT (empno + 1) * (dis| FROM emp",
+        "SELECT * FROM emp WHERE (dis|",
     ] {
         let s = suggestions(sql);
         assert!(!has(&s, "DISTINCT"), "DISTINCT leaked into a general operand for `{sql}`: {s:?}");
@@ -21798,7 +21827,7 @@ fn typed_emp_suggestions(sql_with_cursor: &str) -> Vec<String> {
     data.set_column_meta_for_table("EMP", meta);
     data.rebuild_indices();
     let expr_keyword_ctx =
-        SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables, !prefix.is_empty());
+        SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables, !prefix.is_empty(), Some(crate::db::DatabaseType::Oracle));
     SqlEditorWidget::base_suggestions_for_context(
         &mut data, &prefix, None, column_scope.as_deref(),
         matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
@@ -21836,6 +21865,31 @@ fn hierarchical_keywords_offered_only_in_a_connect_by_query() {
     // ROWNUM stays valid without CONNECT BY.
     let s = typed_emp_suggestions("SELECT * FROM emp WHERE rown| = 1");
     assert!(has(&s, "ROWNUM"), "ROWNUM wrongly suppressed: {s:?}");
+
+    // A `CONNECT BY` clause belongs to its own query level: one nested inside a
+    // subquery (`… IN (SELECT … CONNECT BY …)`) must not make the hierarchical
+    // keywords grammatical in the *outer* query, whose select list / predicates
+    // have no `CONNECT BY` of their own.
+    for (sql, kw) in [
+        (
+            "SELECT lev| FROM emp WHERE empno IN (SELECT empno FROM emp CONNECT BY PRIOR empno = empno)",
+            "LEVEL",
+        ),
+        (
+            "SELECT conn| FROM emp WHERE empno IN (SELECT empno FROM emp CONNECT BY PRIOR empno = empno)",
+            "CONNECT_BY_ROOT",
+        ),
+        (
+            "SELECT empno FROM emp WHERE empno IN (SELECT empno FROM emp CONNECT BY PRIOR empno = empno) AND empno = pri|",
+            "PRIOR",
+        ),
+    ] {
+        let s = typed_emp_suggestions(sql);
+        assert!(
+            !has(&s, kw),
+            "{kw} leaked from a nested CONNECT BY subquery into the outer query for `{sql}`: {s:?}"
+        );
+    }
 }
 
 /// The `DEFAULT` value keyword is grammatical only in a DML value position
@@ -21993,7 +22047,7 @@ fn select_wildcard_is_position_aware() {
         let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &ctx);
         let data = IntellisenseData::new();
         let expr_keyword_ctx =
-            SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables, has_prefix);
+            SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables, has_prefix, None);
         let at_keyword_only_slot =
             SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(&ctx, has_prefix);
         if at_keyword_only_slot || expr_keyword_ctx.follows_operand == Some(true) {
@@ -22180,6 +22234,7 @@ fn plsql_value_expression_suppresses_relations() {
             &data,
             &column_tables,
             !prefix.is_empty(),
+            Some(crate::db::DatabaseType::Oracle),
         );
         SqlEditorWidget::base_suggestions_for_context(
             &mut data,
@@ -22327,7 +22382,7 @@ fn bind_variable_name_slot_suppresses_columns() {
         let ct = SqlEditorWidget::resolve_column_tables_for_context(None, &ctx);
         let cs = (!ct.is_empty()).then(|| ct.clone());
         let inc = matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll);
-        let kw = SqlEditorWidget::expression_keyword_context(&ctx, &data, &ct, !prefix.is_empty());
+        let kw = SqlEditorWidget::expression_keyword_context(&ctx, &data, &ct, !prefix.is_empty(), Some(crate::db::DatabaseType::Oracle));
         SqlEditorWidget::base_suggestions_for_context(
             &mut data, &prefix, None, cs.as_deref(), inc, context, false,
             Some(crate::db::DatabaseType::Oracle), kw)
@@ -22342,3 +22397,4 @@ fn bind_variable_name_slot_suppresses_columns() {
     // A normal operand position still completes columns.
     assert!(has(&base("SELECT * FROM emp WHERE empno = |"), "ENAME"));
 }
+

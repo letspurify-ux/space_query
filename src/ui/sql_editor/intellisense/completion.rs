@@ -1175,6 +1175,7 @@ impl SqlEditorWidget {
                 &data,
                 &column_tables,
                 !snapshot.prefix.is_empty(),
+                Some(snapshot.preferred_db_type),
             )
         };
         let include_columns = !has_local_record_member_scope
@@ -2114,6 +2115,7 @@ impl SqlEditorWidget {
         data: &IntellisenseData,
         column_scope: &[String],
         exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
     ) -> ExpressionKeywordContext {
         let tokens = Self::current_query_tokens(deep_ctx);
         let cursor_len = Self::cursor_token_len_in_current_query(deep_ctx);
@@ -2132,20 +2134,40 @@ impl SqlEditorWidget {
         let end =
             Self::expected_suggestion_context_end(tokens, cursor_len, exclude_current_identifier_chain);
         let follows_operand = Self::cursor_follows_complete_operand(tokens, end);
-        let follows_call = matches!(
-            Self::meaningful_tokens_before(tokens, end).last(),
-            Some(SqlToken::Symbol(sym)) if sym == ")"
-        );
+        // The analytic/aggregate continuations (`OVER`/`KEEP`/`WITHIN`/`AGAINST`)
+        // follow the `)` of a *function call*, not a grouping/predicate paren
+        // (`(a + b) `) or a scalar subquery (`(SELECT … ) `). `call_name_before_close`
+        // returns the name introducing the closed paren — present only for a call,
+        // and a real function (`SUM`/`LISTAGG`/…) rather than a clause keyword like
+        // `SELECT` that can also precede a `(`.
+        let follows_call = {
+            let before = Self::meaningful_tokens_before(tokens, end);
+            matches!(before.last(), Some(SqlToken::Symbol(sym)) if sym == ")")
+                && Self::call_name_before_close(&before)
+                    .is_some_and(|name| Self::name_introduces_call(data, &name, db_type))
+        };
         let follows_like_pattern = Self::cursor_follows_like_pattern(tokens, end);
-        let follows_quantifier_anchor =
-            match Self::meaningful_tokens_before(tokens, end).last() {
-                Some(SqlToken::Symbol(sym)) => sym == "(",
+        let follows_quantifier_anchor = {
+            let before = Self::meaningful_tokens_before(tokens, end);
+            match before.last() {
+                // A set-quantifier (`DISTINCT`/`UNIQUE`/`DISTINCTROW`) follows `(`
+                // only when the paren opens an *aggregate function call*
+                // (`COUNT(DISTINCT x)`), never a grouping/predicate paren
+                // (`(a + b)`, `WHERE (x`). The call paren is the one introduced by
+                // a function-name word; a grouping paren is preceded by an
+                // operator/keyword/`(`/`,` (or nothing), so it is not an anchor.
+                Some(SqlToken::Symbol(sym)) if sym == "(" => matches!(
+                    before.len().checked_sub(2).and_then(|i| before.get(i)),
+                    Some(SqlToken::Word(word))
+                        if Self::name_introduces_call(data, &word.to_ascii_uppercase(), db_type)
+                ),
                 Some(SqlToken::Word(word)) => matches!(
                     word.to_ascii_uppercase().as_str(),
                     "SELECT" | "UNION" | "EXCEPT" | "INTERSECT" | "MINUS"
                 ),
                 _ => false,
-            };
+            }
+        };
         let has_connect_by = Self::cursor_query_has_connect_by(tokens);
         let in_dml_value_position = matches!(
             deep_ctx.phase,
@@ -2183,8 +2205,15 @@ impl SqlEditorWidget {
     /// the hierarchical pseudo-columns/operators grammatical. A bare `CONNECT`
     /// word at the top paren level is the defining marker.
     fn cursor_query_has_connect_by(tokens: &[SqlToken]) -> bool {
-        tokens.iter().any(|token| {
+        // `CONNECT BY` is a clause of *this* query level. A `CONNECT` buried in a
+        // nested subquery (`… WHERE x IN (SELECT … CONNECT BY …)`) belongs to that
+        // subquery, not the cursor's query, so it must not make `LEVEL`/`PRIOR`/…
+        // grammatical out here. `tokens` is already the current query body, so the
+        // marker counts only at its top paren depth.
+        let depths = crate::ui::sql_depth::paren_depths(tokens);
+        tokens.iter().enumerate().any(|(idx, token)| {
             matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("CONNECT"))
+                && crate::ui::sql_depth::is_top_level_depth(&depths, idx)
         })
     }
 
@@ -2411,6 +2440,25 @@ impl SqlEditorWidget {
             || crate::sql_text::MYSQL_SQL_KEYWORDS
                 .binary_search(&upper)
                 .is_ok()
+    }
+
+    /// Whether the word `upper` immediately before a `(` introduces a *function
+    /// call*, as opposed to a grouping/predicate paren or a subquery (`SELECT
+    /// (…)`, `IN (…)`, `EXISTS (…)`, `VALUES (…)`). A catalog function
+    /// (`COUNT`/`SUM`/`UPPER`), a user-defined routine (any non-keyword
+    /// identifier), and the full-text operator `MATCH` (a keyword that is not in
+    /// the function catalog) all introduce a call; clause/operator keywords do
+    /// not. Distinguishing the two is what keeps the call-continuation keywords
+    /// (`OVER`/`KEEP`/`WITHIN`/`AGAINST`) and the set-quantifiers
+    /// (`DISTINCT`/`UNIQUE`) off a plain `(a + b)` / `(SELECT …)` paren.
+    fn name_introduces_call(
+        data: &IntellisenseData,
+        upper: &str,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        data.is_language_function(upper, db_type)
+            || !Self::token_is_language_keyword(upper)
+            || upper == "MATCH"
     }
 
     fn qualifier_matches_visible_relation_scope(
