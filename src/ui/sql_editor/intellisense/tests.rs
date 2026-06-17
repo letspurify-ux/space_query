@@ -22760,3 +22760,29 @@ fn statement_start_drops_object_and_function_noise() {
         "a function call leaked into a PL/SQL statement start: {blk:?}"
     );
 }
+
+#[test]
+#[ignore]
+fn zz_probe_gating() {
+    let run = |sql: &str| {
+        let cursor = sql.find('|').unwrap();
+        let s = sql.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql);
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&s, cursor);
+        let hp = !prefix.is_empty();
+        let kw_slot = SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(&ctx, hp);
+        let is_null = SqlEditorWidget::cursor_is_at_is_null_test_keyword_position_for_context(&ctx, hp);
+        let clause_kw = SqlEditorWidget::cursor_is_at_pure_clause_keyword_continuation_for_context(&ctx, hp);
+        eprintln!("kw_slot={} is_null={} clause_kw={}  <= {}", kw_slot, is_null, clause_kw, sql);
+    };
+    for sql in [
+        "SELECT * FROM emp ORDER BY sal ASC N|",
+        "SELECT * FROM emp ORDER BY sal DESC N|",
+        "SELECT * FROM emp ORDER BY sal NULLS F|",
+        "SELECT * FROM emp WHERE ename IS N|",
+        "SELECT * FROM emp WHERE ename IS NOT N|",
+        "SELECT * FROM emp ORDER BY sal A|",
+    ] {
+        run(sql);
+    }
+}
