@@ -68,6 +68,13 @@ struct ExpressionKeywordContext {
     /// slot (`v emp%ROWTYPE`) and embedded SQL clauses, which carry their own
     /// phase; in a column context the base has no relations, so this is a no-op.
     in_plsql_value_expression: bool,
+    /// Whether the cursor names a bind variable — the identifier directly after a
+    /// `:` introducer (`WHERE c = :|`, `:b|`). A bind name is a free/session-bind
+    /// identifier, never a column/relation/`*`/keyword, so the identifier base and
+    /// the wildcard are suppressed there (session bind names still come from the
+    /// local-symbol path). The compound `:=` assignment is a distinct token, so it
+    /// never trips this.
+    at_bind_variable_name: bool,
 }
 
 /// Best-effort type classification of the operand immediately before the cursor,
@@ -102,6 +109,7 @@ impl ExpressionKeywordContext {
             in_dml_value_position: false,
             prev_operand_type: PrecedingOperandType::Unknown,
             in_plsql_value_expression: false,
+            at_bind_variable_name: false,
         }
     }
 }
@@ -1528,10 +1536,13 @@ impl SqlEditorWidget {
         // It is also operand material, so it is dropped right after a complete
         // operand (`SELECT empno |`, `SELECT 'x' |`) where only an operator/
         // comma/`FROM` can follow; the wildcard still appears at an operand-start
-        // (`SELECT |`, `SELECT a, |`) and for a qualified scope (`t.|`).
+        // (`SELECT |`, `SELECT a, |`) and for a qualified scope (`t.|`). A bind
+        // name slot (`= :|`) is likewise not a wildcard position.
         let wildcard_suggestions = if at_keyword_only_identifier_slot
             || at_keyword_only_slot
-            || (qualifier.is_none() && expr_keyword_ctx.follows_operand == Some(true))
+            || (qualifier.is_none()
+                && (expr_keyword_ctx.follows_operand == Some(true)
+                    || expr_keyword_ctx.at_bind_variable_name))
         {
             Vec::new()
         } else {
@@ -1723,6 +1734,14 @@ impl SqlEditorWidget {
     ) -> Vec<String> {
         if qualifier.is_some() {
             return Self::scoped_column_suggestions(data, prefix, column_scope);
+        }
+
+        // A bind-variable name slot (`= :|`, `:b|`) names a free/session-bind
+        // identifier, never a column/relation/keyword. Session bind names are
+        // supplied separately (the local-symbol path), so the identifier base is
+        // empty here.
+        if expr_keyword_ctx.at_bind_variable_name {
+            return Vec::new();
         }
 
         if matches!(context, SqlContext::VariableName | SqlContext::BindValue) {
@@ -2140,6 +2159,10 @@ impl SqlEditorWidget {
             Some(SqlToken::Symbol(sym)) if sym == ":=" || sym == "=>"
         ) || Self::cursor_in_plsql_executable_block(tokens, end)
             || Self::cursor_in_call_argument_list(tokens, end);
+        let at_bind_variable_name = matches!(
+            Self::meaningful_tokens_before(tokens, end).last(),
+            Some(SqlToken::Symbol(sym)) if sym == ":"
+        );
         ExpressionKeywordContext {
             inside_case,
             inside_window_spec,
@@ -2152,6 +2175,7 @@ impl SqlEditorWidget {
             in_dml_value_position,
             prev_operand_type,
             in_plsql_value_expression,
+            at_bind_variable_name,
         }
     }
 

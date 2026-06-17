@@ -22281,3 +22281,38 @@ fn qualified_wildcard_only_for_in_scope_row_source() {
     assert!(wc("SELECT x.| FROM emp e", "x").is_empty());
     assert!(wc("SELECT zzz.| FROM emp", "zzz").is_empty());
 }
+
+/// A bind-variable name slot — the identifier right after a `:` introducer
+/// (`WHERE c = :|`, `:b|`, `SELECT :|`) — names a free/session-bind identifier,
+/// never a column/relation/`*`. The identifier base must be empty there (session
+/// bind names arrive via the local-symbol path).
+#[test]
+fn bind_variable_name_slot_suppresses_columns() {
+    fn base(sql_with_cursor: &str) -> Vec<String> {
+        let cursor = sql_with_cursor.find('|').expect("cursor");
+        let sql = sql_with_cursor.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql_with_cursor);
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+        let context = SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["EMP".into()];
+        data.set_columns_for_table("EMP", vec!["ENAME".into(), "EMPNO".into(), "BONUS".into()]);
+        data.rebuild_indices();
+        let ct = SqlEditorWidget::resolve_column_tables_for_context(None, &ctx);
+        let cs = (!ct.is_empty()).then(|| ct.clone());
+        let inc = matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll);
+        let kw = SqlEditorWidget::expression_keyword_context(&ctx, &data, &ct, !prefix.is_empty());
+        SqlEditorWidget::base_suggestions_for_context(
+            &mut data, &prefix, None, cs.as_deref(), inc, context, false,
+            Some(crate::db::DatabaseType::Oracle), kw)
+    }
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+
+    // Bind name positions: no columns.
+    assert!(base("SELECT * FROM emp WHERE empno = :|").is_empty());
+    assert!(base("SELECT * FROM emp WHERE empno = :b|").is_empty(), "bind prefix must not match column BONUS");
+    assert!(base("SELECT :| FROM emp").is_empty());
+
+    // A normal operand position still completes columns.
+    assert!(has(&base("SELECT * FROM emp WHERE empno = |"), "ENAME"));
+}
