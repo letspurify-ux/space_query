@@ -57,14 +57,16 @@ struct ExpressionKeywordContext {
     /// type-specific postfix operators: `AT` (datetime), `COLLATE` (character),
     /// `MEMBER`/`SUBMULTISET`/`MULTISET` (collection).
     prev_operand_type: PrecedingOperandType,
-    /// Whether the cursor sits in a value expression where a table/view/synonym
-    /// name is never a valid operand — right after the assignment `:=` (`v := |`)
-    /// or named-argument `=>` (`proc(p => |)`), inside an `IF`/`ELSIF`/`WHILE`
-    /// control condition (`IF | THEN`), or inside a routine call's argument list
-    /// (`dbms_output.put_line(|)`). The relation entries the General-context base
-    /// would otherwise dump are dropped as noise (a variable, function, package or
-    /// literal still completes; in a column context the base has no relations, so
-    /// this is a no-op there).
+    /// Whether the cursor sits where a table/view/synonym name is never a valid
+    /// operand: anywhere in a PL/SQL *executable* block body (`RETURN |`,
+    /// `RAISE |`, `IF | THEN`, `v := v + |`, `EXCEPTION WHEN |`, a statement
+    /// start), right after the assignment `:=` / named-argument `=>` (which also
+    /// covers a `DECLARE`-section default), or inside a routine call's argument
+    /// list (`dbms_output.put_line(|)`). The relation entries the General-context
+    /// base would otherwise dump are dropped as noise (a variable, function,
+    /// package or literal still completes). Excludes the PL/SQL declaration type
+    /// slot (`v emp%ROWTYPE`) and embedded SQL clauses, which carry their own
+    /// phase; in a column context the base has no relations, so this is a no-op.
     in_plsql_value_expression: bool,
 }
 
@@ -1982,48 +1984,64 @@ impl SqlEditorWidget {
         )
     }
 
-    /// True when the cursor sits in a PL/SQL control-flow *condition* — the
-    /// boolean header of `IF <cond> THEN`, `ELSIF <cond> THEN`, or `WHILE <cond>
-    /// LOOP`. Such a header is a pure boolean value expression: a variable,
-    /// function, literal or scalar `(SELECT …)` is grammatical, but a bare
-    /// table/view/synonym name never is. This reuses the same PL/SQL control-
-    /// keyword vocabulary the formatter relies on (`sql_text::is_plsql_control_*`)
-    /// so IntelliSense and the formatter classify these constructs identically,
-    /// without paying the cost of running the formatter's output state machine.
+    /// True when the cursor sits inside a PL/SQL *executable* block body — after a
+    /// `BEGIN`, or inside an `IF`/`LOOP`/`CASE` opened within one (including its
+    /// condition header, `EXCEPTION` handlers, and `RETURN`/`RAISE`/assignment
+    /// statements). In an executable body a bare table/view/synonym is never a
+    /// valid operand — code references variables, functions, packages and
+    /// types; the only relations live in *embedded SQL* statements, which carry
+    /// their own `FromClause`/`TableName` phase and are handled elsewhere. The
+    /// *declaration* section is deliberately excluded: a `DECLARE`/`IS` type slot
+    /// (`v emp.empno%TYPE`, `v emp%ROWTYPE`) legitimately names a relation, so the
+    /// frame stack distinguishes it (its top frame is the pending declaration, not
+    /// an executable block).
     ///
-    /// Detection walks back from the cursor at the current paren level: the first
-    /// governing keyword decides it. `IF`/`ELSIF`/`WHILE` mean we are still in the
-    /// header; `THEN`/`LOOP`/a block boundary / a statement head / `;` mean we have
-    /// left it. Balanced sub-groups (a nested `CASE … END`, a `(…)`) are skipped by
-    /// depth so their inner `THEN` cannot end the scan early, while an unclosed
-    /// leading `(` (`IF (a OR |`) keeps the governing `IF` in view.
-    fn cursor_in_plsql_control_condition(tokens: &[SqlToken], end: usize) -> bool {
-        let mut depth = 0i32;
-        for token in Self::meaningful_tokens_before(tokens, end).iter().rev() {
-            match token {
-                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => depth += 1,
-                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => depth -= 1,
-                // A statement terminator at this level ends the search.
-                SqlToken::Symbol(sym) if sym == ";" && depth <= 0 => return false,
-                SqlToken::Word(word) if depth <= 0 => {
-                    let upper = word.to_ascii_uppercase();
-                    match upper.as_str() {
-                        "IF" | "ELSIF" | "WHILE" => return true,
-                        // Header is closed / we are in a body or another construct.
-                        "THEN" | "LOOP" | "ELSE" | "BEGIN" | "DECLARE" | "END" | "CASE"
-                        | "FOR" | "WHEN" => return false,
-                        // A SQL statement head means the cursor is in a SQL clause,
-                        // not a PL/SQL control header.
-                        _ if crate::sql_text::is_statement_head_keyword_upper(&upper) => {
-                            return false
-                        }
-                        _ => {}
+    /// Mirrors the formatter's `WithPlsqlBodyFrame` model — push on
+    /// `BEGIN`/`IF`/`LOOP`/`CASE` (a `DECLARE` opens a *pending* block that
+    /// `BEGIN` promotes), pop on `END` — reusing the shared PL/SQL control-keyword
+    /// vocabulary rather than running the formatter's output state machine. Pushes
+    /// and pops balance 1:1 regardless of `END`/`END IF|LOOP|CASE` qualifiers, so
+    /// the innermost open frame is an exact "executable vs declaring" signal.
+    fn cursor_in_plsql_executable_block(tokens: &[SqlToken], end: usize) -> bool {
+        // Frame kinds are tracked separately because `CASE` is shared between a
+        // SQL `CASE` *expression* and a PL/SQL `CASE` *statement*: a `CASE` that is
+        // not inside a block is just a SQL value expression and must not be read as
+        // PL/SQL code. `IF`/`LOOP` are PL/SQL-only, so they alone mark executable
+        // code; `BEGIN` (a `DECLARE` promoted by its `BEGIN`) is the block marker.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Frame {
+            PendingDeclare,
+            Begin,
+            Control, // IF / LOOP — PL/SQL only
+            Case,    // shared SQL/PL-SQL — not on its own a PL/SQL signal
+        }
+        let mut stack: Vec<Frame> = Vec::new();
+        for token in tokens.get(..end.min(tokens.len())).unwrap_or(tokens) {
+            let SqlToken::Word(word) = token else {
+                continue;
+            };
+            match word.to_ascii_uppercase().as_str() {
+                "DECLARE" => stack.push(Frame::PendingDeclare),
+                "BEGIN" => {
+                    if matches!(stack.last(), Some(Frame::PendingDeclare)) {
+                        *stack.last_mut().unwrap() = Frame::Begin;
+                    } else {
+                        stack.push(Frame::Begin);
                     }
+                }
+                "IF" | "LOOP" => stack.push(Frame::Control),
+                "CASE" => stack.push(Frame::Case),
+                "END" => {
+                    stack.pop();
                 }
                 _ => {}
             }
         }
-        false
+        // Executable when an actual block is open, or the innermost construct is a
+        // PL/SQL-only `IF`/`LOOP` (a bare `CASE` without an enclosing block is a SQL
+        // expression, never PL/SQL code).
+        stack.iter().any(|frame| matches!(frame, Frame::Begin))
+            || matches!(stack.last(), Some(Frame::Control))
     }
 
     /// True when the cursor sits inside a routine *call's* argument list —
@@ -2120,7 +2138,7 @@ impl SqlEditorWidget {
         let in_plsql_value_expression = matches!(
             Self::meaningful_tokens_before(tokens, end).last(),
             Some(SqlToken::Symbol(sym)) if sym == ":=" || sym == "=>"
-        ) || Self::cursor_in_plsql_control_condition(tokens, end)
+        ) || Self::cursor_in_plsql_executable_block(tokens, end)
             || Self::cursor_in_call_argument_list(tokens, end);
         ExpressionKeywordContext {
             inside_case,

@@ -22183,10 +22183,29 @@ fn plsql_value_expression_suppresses_relations() {
         "BEGIN dbms_output.put_line(|); END;",
         "BEGIN dbms_output.put_line('x' || |); END;",
         "BEGIN my_proc(a, |); END;",
+        // Anywhere in an executable block body: RETURN/RAISE, EXCEPTION handler,
+        // a PL/SQL CASE condition, an operator-continued expression, and a bare
+        // statement start are all positions where a relation is never valid.
+        "CREATE FUNCTION f RETURN NUMBER IS BEGIN RETURN |; END;",
+        "DECLARE v NUMBER; BEGIN RETURN |; END;",
+        "DECLARE v NUMBER; BEGIN RAISE |; END;",
+        "BEGIN NULL; EXCEPTION WHEN | THEN NULL; END;",
+        "DECLARE v NUMBER; BEGIN CASE WHEN | THEN NULL; END CASE; END;",
+        "DECLARE v NUMBER; BEGIN v := v + |; END;",
+        "DECLARE v NUMBER; BEGIN v := CASE WHEN x > | THEN 1 END; END;",
+        "DECLARE v NUMBER; BEGIN NULL; | END;",
     ] {
         let s = base_after(sql);
         assert!(!has(&s, "EMP") && !has(&s, "DEPT"), "relations leaked into a PL/SQL value position for `{sql}`: {s:?}");
     }
+
+    // The PL/SQL *declaration* type slot is NOT an executable position: a relation
+    // is valid there for `%TYPE`/`%ROWTYPE`, so it must keep relation completion —
+    // both the top-level DECLARE section and a routine's `IS` declaration section.
+    let s = base_after("DECLARE v | BEGIN NULL; END;");
+    assert!(has(&s, "EMP"), "relation wrongly suppressed in a DECLARE type slot: {s:?}");
+    let s = base_after("CREATE PROCEDURE p IS v | BEGIN NULL; END;");
+    assert!(has(&s, "EMP"), "relation wrongly suppressed in an IS-section type slot: {s:?}");
 
     // A call whose argument is itself a subquery keeps relation completion for
     // that inner query.
@@ -22205,4 +22224,34 @@ fn plsql_value_expression_suppresses_relations() {
     assert!(has(&s, "EMP"), "relation wrongly suppressed in a FROM position: {s:?}");
     let s = base_after("BEGIN IF 1 = 1 THEN SELECT * FROM e| ; END IF; END;");
     assert!(has(&s, "EMP"), "relation wrongly suppressed in an IF body FROM clause: {s:?}");
+}
+
+/// `CASE` is shared between a SQL `CASE` *expression* and a PL/SQL `CASE`
+/// *statement*, so the executable-block detector must not read a bare SQL `CASE`
+/// (no enclosing block) as PL/SQL code. A `CASE` only marks executable code when
+/// a real `BEGIN` block (or a PL/SQL-only `IF`/`LOOP`) encloses it.
+#[test]
+fn plsql_executable_block_detection_excludes_bare_sql_case() {
+    fn exec_block(sql_with_cursor: &str) -> bool {
+        let cursor = sql_with_cursor.find('|').expect("cursor");
+        let sql = sql_with_cursor.replace('|', "");
+        let toks = super::query_text::tokenize_sql_spanned(&sql);
+        let end = toks.partition_point(|s| s.end <= cursor);
+        let tokens: Vec<SqlToken> = toks.into_iter().map(|s| s.token).collect();
+        SqlEditorWidget::cursor_in_plsql_executable_block(&tokens, end)
+    }
+
+    // A bare SQL CASE expression is not PL/SQL executable code.
+    assert!(!exec_block("SELECT CASE WHEN x THEN | END FROM emp"));
+    assert!(!exec_block("SELECT * FROM emp WHERE x = (CASE WHEN a THEN |)"));
+    // Declarations are not executable (relations stay valid for %TYPE/%ROWTYPE).
+    assert!(!exec_block("CREATE PACKAGE p IS v |"));
+    assert!(!exec_block("DECLARE v | BEGIN NULL; END;"));
+
+    // Real PL/SQL executable positions — including a CASE *inside* a block.
+    assert!(exec_block("BEGIN v := |; END;"));
+    assert!(exec_block("BEGIN CASE WHEN | THEN NULL; END CASE; END;"));
+    assert!(exec_block("BEGIN IF a THEN NULL; END IF; v := |; END;"));
+    assert!(exec_block("BEGIN LOOP NULL; END LOOP; v := |; END;"));
+    assert!(exec_block("BEGIN BEGIN v := |; END; END;"));
 }
