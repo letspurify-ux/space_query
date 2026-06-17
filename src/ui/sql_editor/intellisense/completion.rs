@@ -4162,10 +4162,24 @@ impl SqlEditorWidget {
         let words = Self::previous_meaningful_words_upper(tokens, end, 6);
         let trigger_is_qualified_member = Self::trigger_word_is_qualified_member(tokens, end);
         let in_table_context = deep_ctx.phase.is_table_context();
+        let in_order_by =
+            matches!(deep_ctx.phase, intellisense_context::SqlPhase::OrderByClause);
         match words.as_slice() {
             [.., last]
                 if !trigger_is_qualified_member
                     && (*last == "ORDER" || *last == "GROUP" || *last == "CONNECT") =>
+            {
+                true
+            }
+            // `<sort-key> ASC|DESC |` -> only `NULLS` (then FIRST/LAST), or a comma
+            // for the next key. A bare identifier/operand keyword is never valid
+            // after a sort direction, so the ORDER BY column list and the operand-
+            // start keyword dump are both suppressed; the `NULLS` hint is emitted
+            // by the matching arm in `collect_expected_keyword_suggestions`.
+            [.., last]
+                if !trigger_is_qualified_member
+                    && in_order_by
+                    && matches!(last.as_str(), "ASC" | "DESC") =>
             {
                 true
             }
@@ -5513,6 +5527,8 @@ impl SqlEditorWidget {
         // function named `left`/`right`/… (`SELECT left |`, `WHERE right |`) from
         // wrongly offering `JOIN`, while `FROM a LEFT |` stays in `FromClause`.
         let in_table_context = deep_ctx.phase.is_table_context();
+        let in_order_by =
+            matches!(deep_ctx.phase, intellisense_context::SqlPhase::OrderByClause);
         // A dual-use clause keyword (`ORDER`/`GROUP`/`CONNECT`/`START`) used as a
         // qualified member (`t.order `, `t.start `) is a column, so its `BY`/`WITH`
         // continuation must not be offered.
@@ -5559,6 +5575,16 @@ impl SqlEditorWidget {
             // `<sort-key> [ASC|DESC] NULLS |` -> FIRST / LAST (mirrors the
             // matching suppression arm in the continuation predicate).
             [.., last] if !trigger_is_qualified_member && *last == "NULLS" => &["FIRST", "LAST"],
+            // `<sort-key> ASC|DESC |` -> `NULLS` (mirrors the ORDER BY suppression
+            // arm). Scoped to the ORDER BY phase so an index column spec's `ASC`/
+            // `DESC` (`CREATE INDEX ... (col ASC)`) is left alone.
+            [.., last]
+                if !trigger_is_qualified_member
+                    && in_order_by
+                    && matches!(last.as_str(), "ASC" | "DESC") =>
+            {
+                &["NULLS"]
+            }
             // Foreign-key referential actions: `ON DELETE |` / `ON UPDATE |`. The
             // `ON UPDATE` slot additionally admits the MySQL column-default
             // `CURRENT_TIMESTAMP`. Anchored on `ON` so a DML `DELETE`/`UPDATE`

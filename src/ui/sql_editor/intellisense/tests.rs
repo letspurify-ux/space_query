@@ -22762,27 +22762,44 @@ fn statement_start_drops_object_and_function_noise() {
 }
 
 #[test]
-#[ignore]
-fn zz_probe_gating() {
-    let run = |sql: &str| {
-        let cursor = sql.find('|').unwrap();
-        let s = sql.replace('|', "");
+fn order_by_sort_direction_continuation_offers_only_nulls() {
+    // After a sort direction (`<key> ASC|DESC |`) the only grammatical keyword is
+    // `NULLS` (then FIRST/LAST), or a comma for the next key. The operand-start
+    // keyword dump (`NOT`/`NULL`/`NVL`/…) and the column list are both suppressed,
+    // mirroring how `NULLS |` already narrows to FIRST/LAST.
+    let kw = |sql: &str| {
         let ctx = analyze_inline_cursor_sql(sql);
-        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&s, cursor);
-        let hp = !prefix.is_empty();
-        let kw_slot = SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(&ctx, hp);
-        let is_null = SqlEditorWidget::cursor_is_at_is_null_test_keyword_position_for_context(&ctx, hp);
-        let clause_kw = SqlEditorWidget::cursor_is_at_pure_clause_keyword_continuation_for_context(&ctx, hp);
-        eprintln!("kw_slot={} is_null={} clause_kw={}  <= {}", kw_slot, is_null, clause_kw, sql);
+        let cursor = sql.find('|').unwrap();
+        let prefix = crate::ui::intellisense::get_word_at_cursor(&sql.replace('|', ""), cursor).0;
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix, &ctx, Some(crate::db::DatabaseType::Oracle),
+        )
     };
+    let suppressed = |sql: &str| {
+        let ctx = analyze_inline_cursor_sql(sql);
+        let prefix = sql.find('|').map(|c| {
+            crate::ui::intellisense::get_word_at_cursor(&sql.replace('|', ""), c).0
+        }).unwrap_or_default();
+        SqlEditorWidget::cursor_is_at_pure_clause_keyword_continuation_for_context(
+            &ctx, !prefix.is_empty(),
+        )
+    };
+
     for sql in [
+        "SELECT * FROM emp ORDER BY sal ASC |",
+        "SELECT * FROM emp ORDER BY sal DESC |",
         "SELECT * FROM emp ORDER BY sal ASC N|",
-        "SELECT * FROM emp ORDER BY sal DESC N|",
-        "SELECT * FROM emp ORDER BY sal NULLS F|",
-        "SELECT * FROM emp WHERE ename IS N|",
-        "SELECT * FROM emp WHERE ename IS NOT N|",
-        "SELECT * FROM emp ORDER BY sal A|",
+        "SELECT a, b FROM emp ORDER BY a ASC, b DESC |",
     ] {
-        run(sql);
+        assert_eq!(kw(sql), vec!["NULLS".to_string()], "for `{sql}`");
+        assert!(suppressed(sql), "identifier/operand list not suppressed for `{sql}`");
     }
+
+    // An index column spec's `ASC`/`DESC` is not an ORDER BY — leave it alone (no
+    // `NULLS` hint, no suppression of the slot).
+    assert!(kw("CREATE INDEX ix ON emp (empno ASC |").is_empty());
+
+    // The still-typing direction position (`ORDER BY sal A|`) is the sort-key tail,
+    // not the post-direction slot — it still offers ASC/DESC/NULLS, not suppressed.
+    assert!(!suppressed("SELECT * FROM emp ORDER BY sal A|"));
 }
