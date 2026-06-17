@@ -16,6 +16,41 @@ enum SelectListWildcardSlot {
     None,
 }
 
+/// The keyword family that is grammatical where the cursor begins a fresh
+/// statement. A top-level SQL statement starts with a DML/DDL/transaction verb;
+/// a PL/SQL block position admits the procedural statement keywords plus exactly
+/// the construct continuations its enclosing construct allows (resolved by a
+/// PL/SQL position scan into a `PlsqlKeywordPolicy`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatementStartContext {
+    TopLevel,
+    Plsql(PlsqlKeywordPolicy),
+}
+
+/// Which keyword families are grammatical at a PL/SQL statement/continuation
+/// position, resolved from the construct enclosing the cursor and its state.
+/// Every flag defaults off; a position scan turns on exactly what the grammar
+/// admits there, so the flat keyword dump is filtered to that set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+struct PlsqlKeywordPolicy {
+    /// Procedural statement keywords (`IF`/`LOOP`/`RETURN`/…) and bare
+    /// call/assignment targets — a *statement* position (a block body, a loop
+    /// body, or a statement `CASE`/`IF` branch), never an expression `CASE` arm.
+    allow_statements: bool,
+    /// `WHEN` — a `CASE` selector/branch head, or an exception handler.
+    allow_when: bool,
+    /// `ELSIF` — an `IF` body that has not yet reached its `ELSE`.
+    allow_elsif: bool,
+    /// `ELSE` — an `IF`/`CASE` body that has not yet reached its `ELSE`.
+    allow_else: bool,
+    /// `END` — closes the innermost open construct.
+    allow_end: bool,
+    /// `EXCEPTION` — opens a block's handler section (once, before it has one).
+    allow_exception: bool,
+    /// `EXIT`/`CONTINUE` — inside (possibly via a nested construct) a loop.
+    allow_exit_continue: bool,
+}
+
 /// Cursor-position facts that decide which keywords are grammatical at a
 /// value/column expression slot, so the base catalog can be filtered down to an
 /// allowlist of position-valid keywords instead of dumping the whole catalog.
@@ -87,6 +122,12 @@ struct ExpressionKeywordContext {
     /// local-symbol path). The compound `:=` assignment is a distinct token, so it
     /// never trips this.
     at_bind_variable_name: bool,
+    /// When the cursor begins a fresh statement, the boundary kind and (for a
+    /// PL/SQL block) the enclosing-construct facts that gate the statement-keyword
+    /// allowlist. `None` anywhere that is not a statement start, so the flat
+    /// keyword dump is filtered only where a statement verb is the sole valid
+    /// keyword family.
+    statement_start: Option<StatementStartContext>,
 }
 
 /// Best-effort type classification of the operand immediately before the cursor,
@@ -123,6 +164,7 @@ impl ExpressionKeywordContext {
             in_plsql_value_expression: false,
             at_plsql_value_operand: false,
             at_bind_variable_name: false,
+            statement_start: None,
         }
     }
 }
@@ -1837,7 +1879,63 @@ impl SqlEditorWidget {
                 )
             });
         }
+        // At a statement start the only keyword family that is grammatical is the
+        // statement verbs themselves (a top-level `SELECT`/`CREATE`/…, or a PL/SQL
+        // block `IF`/`LOOP`/`RETURN`/… and its construct continuations). The flat
+        // base dump otherwise offers every prefix-matched keyword — clause words,
+        // type names, modifiers, function keywords — none of which can begin a
+        // statement. Drop those, keeping identifiers/objects/functions (a bare
+        // call or assignment target in a PL/SQL block) untouched.
+        if !prefer_columns {
+            if let Some(statement_start) = expr_keyword_ctx.statement_start {
+                suggestions.retain(|suggestion| {
+                    let upper = suggestion.to_ascii_uppercase();
+                    !data.is_language_keyword(&upper, db_type)
+                        || Self::keyword_begins_statement(&upper, statement_start)
+                });
+            }
+        }
         suggestions
+    }
+
+    /// Whether `upper` (a reserved keyword) can stand at the statement-start
+    /// position described by `ctx`. Top-level statements admit the SQL/PLSQL-block
+    /// statement verbs; a PL/SQL block additionally admits the procedural
+    /// statement keywords plus the continuations of the construct enclosing the
+    /// cursor.
+    fn keyword_begins_statement(upper: &str, ctx: StatementStartContext) -> bool {
+        // SQL statement verbs — the keywords that open a top-level statement.
+        const SQL_STATEMENT_KEYWORDS: &[&str] = &[
+            "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "WITH", "CREATE", "ALTER", "DROP",
+            "TRUNCATE", "GRANT", "REVOKE", "COMMENT", "RENAME", "CALL", "EXPLAIN", "ANALYZE",
+            "AUDIT", "NOAUDIT", "LOCK", "SET", "COMMIT", "ROLLBACK", "SAVEPOINT", "BEGIN",
+            "DECLARE", "PURGE", "FLASHBACK", "EXEC", "EXECUTE",
+        ];
+        // Procedural statement keywords that open a PL/SQL block statement.
+        const PLSQL_STATEMENT_KEYWORDS: &[&str] = &[
+            "IF", "CASE", "LOOP", "WHILE", "FOR", "FORALL", "GOTO", "NULL", "RETURN", "RAISE",
+            "BEGIN", "DECLARE", "OPEN", "CLOSE", "FETCH", "EXECUTE", "COMMIT", "ROLLBACK",
+            "SAVEPOINT", "SET", "LOCK", "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "WITH",
+            "PIPE",
+        ];
+
+        match ctx {
+            StatementStartContext::TopLevel => SQL_STATEMENT_KEYWORDS.contains(&upper),
+            StatementStartContext::Plsql(policy) => {
+                if policy.allow_statements && PLSQL_STATEMENT_KEYWORDS.contains(&upper) {
+                    return true;
+                }
+                match upper {
+                    "EXIT" | "CONTINUE" => policy.allow_exit_continue,
+                    "END" => policy.allow_end,
+                    "WHEN" => policy.allow_when,
+                    "ELSIF" => policy.allow_elsif,
+                    "ELSE" => policy.allow_else,
+                    "EXCEPTION" => policy.allow_exception,
+                    _ => false,
+                }
+            }
+        }
     }
 
     /// Decide whether a single base-catalog entry is grammatical at the current
@@ -2233,6 +2331,26 @@ impl SqlEditorWidget {
             Self::meaningful_tokens_before(tokens, end).last(),
             Some(SqlToken::Symbol(sym)) if sym == ":"
         );
+        // A statement start only exists in the neutral General context — the
+        // statement-head position. A clause phase (a select list, a `WHERE`
+        // predicate, a set-operation branch) is never a statement start. Boundary
+        // detection runs on the *full* statement tokens, not the query-scoped
+        // slice: a narrowed set-operation branch begins right after `UNION`, so its
+        // slice would look like a fresh statement (no preceding token) even though
+        // the real previous token (`UNION`) marks a query continuation, not a
+        // statement boundary.
+        let statement_start =
+            if matches!(sql_context_for_phase(deep_ctx.phase), SqlContext::General) {
+                let full_tokens = deep_ctx.statement_tokens.as_ref();
+                let full_end = Self::expected_suggestion_context_end(
+                    full_tokens,
+                    deep_ctx.cursor_token_len,
+                    exclude_current_identifier_chain,
+                );
+                Self::cursor_statement_start_context(full_tokens, full_end)
+            } else {
+                None
+            };
         ExpressionKeywordContext {
             inside_case,
             inside_window_spec,
@@ -2247,6 +2365,266 @@ impl SqlEditorWidget {
             in_plsql_value_expression,
             at_plsql_value_operand,
             at_bind_variable_name,
+            statement_start,
+        }
+    }
+
+    /// Classify whether the cursor begins a fresh statement, and resolve which
+    /// keyword family is grammatical there. A top-level statement start is a
+    /// position after nothing or `;`. Inside a PL/SQL executable block the
+    /// position is resolved by a construct scan (`plsql_keyword_policy`) that
+    /// tracks the enclosing block/`IF`/`CASE`/`LOOP` and its state, so the flat
+    /// keyword dump is filtered to exactly the procedural keywords and the
+    /// construct continuations valid at the cursor.
+    fn cursor_statement_start_context(
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> Option<StatementStartContext> {
+        // A routine-call argument list is a value position, never a statement
+        // start (`proc(|)`), even though its previous token is a `(` separator.
+        if Self::cursor_in_call_argument_list(tokens, end) {
+            return None;
+        }
+
+        if Self::cursor_in_plsql_executable_block(tokens, end) {
+            return Self::plsql_keyword_policy(tokens, end).map(StatementStartContext::Plsql);
+        }
+
+        // Top level: a statement begins only after nothing or a `;` terminator.
+        let prev = Self::meaningful_tokens_before(tokens, end).last().copied();
+        match prev {
+            None => Some(StatementStartContext::TopLevel),
+            Some(SqlToken::Symbol(sym)) if sym == ";" => Some(StatementStartContext::TopLevel),
+            _ => None,
+        }
+    }
+
+    /// Resolve the PL/SQL keyword policy at the cursor by scanning the construct
+    /// stack to it. Returns `None` when the cursor is *not* at a statement or
+    /// construct-continuation position (a condition/selector operand, a value
+    /// expression), where the operand allowlist governs instead. `END <IF|LOOP|
+    /// CASE>` closes one construct and its qualifier keyword is skipped.
+    fn plsql_keyword_policy(tokens: &[SqlToken], end: usize) -> Option<PlsqlKeywordPolicy> {
+        #[derive(Clone, Copy)]
+        enum Frame {
+            PendingDeclare,
+            // A block body; `in_exception` once its `EXCEPTION` handler section
+            // has begun.
+            Block { in_exception: bool },
+            // `awaiting_then` between `IF`/`ELSIF` and `THEN` (the condition);
+            // `in_else` once the `ELSE` arm has begun.
+            If { awaiting_then: bool, in_else: bool },
+            Loop,
+            // A `CASE`: `is_statement` distinguishes a PL/SQL `CASE` statement
+            // (its arms are statements) from a `CASE` value expression (arms are
+            // values). `past_selector` once the first `WHEN` is seen;
+            // `awaiting_then` between a `WHEN` and its `THEN`; `in_else` after the
+            // `ELSE` arm begins.
+            Case {
+                is_statement: bool,
+                past_selector: bool,
+                awaiting_then: bool,
+                in_else: bool,
+            },
+        }
+
+        let toks = tokens.get(..end.min(tokens.len())).unwrap_or(tokens);
+        let mut stack: Vec<Frame> = Vec::new();
+        let mut skip_end_qualifier = false;
+        // Whether the previous significant token closes a statement, so a `CASE`
+        // that follows it opens a statement (not a value expression).
+        let mut prev_is_stmt_boundary = true;
+        let mut last_word_upper: Option<String> = None;
+
+        for token in toks {
+            let upper = match token {
+                SqlToken::Word(word) => word.to_ascii_uppercase(),
+                SqlToken::Comment(_) => continue,
+                SqlToken::Symbol(sym) => {
+                    prev_is_stmt_boundary = sym == ";";
+                    last_word_upper = None;
+                    continue;
+                }
+                // A literal/other token is an operand — it neither opens a
+                // construct nor marks a statement boundary.
+                _ => {
+                    prev_is_stmt_boundary = false;
+                    last_word_upper = None;
+                    continue;
+                }
+            };
+
+            if skip_end_qualifier {
+                skip_end_qualifier = false;
+                if matches!(upper.as_str(), "IF" | "LOOP" | "CASE") {
+                    last_word_upper = Some(upper);
+                    prev_is_stmt_boundary = false;
+                    continue;
+                }
+            }
+
+            match upper.as_str() {
+                "DECLARE" => stack.push(Frame::PendingDeclare),
+                "BEGIN" => {
+                    if matches!(stack.last(), Some(Frame::PendingDeclare)) {
+                        *stack.last_mut().unwrap() = Frame::Block { in_exception: false };
+                    } else {
+                        stack.push(Frame::Block { in_exception: false });
+                    }
+                }
+                "IF" => stack.push(Frame::If {
+                    awaiting_then: true,
+                    in_else: false,
+                }),
+                "ELSIF" => {
+                    if let Some(Frame::If { awaiting_then, .. }) = stack.last_mut() {
+                        *awaiting_then = true;
+                    }
+                }
+                "ELSE" => {
+                    if let Some(Frame::If { in_else, awaiting_then })
+                    | Some(Frame::Case { in_else, awaiting_then, .. }) = stack.last_mut()
+                    {
+                        *in_else = true;
+                        *awaiting_then = false;
+                    }
+                }
+                "THEN" => match stack.last_mut() {
+                    Some(Frame::If { awaiting_then, .. })
+                    | Some(Frame::Case { awaiting_then, .. }) => *awaiting_then = false,
+                    _ => {}
+                },
+                "LOOP" => stack.push(Frame::Loop),
+                "CASE" => stack.push(Frame::Case {
+                    is_statement: prev_is_stmt_boundary,
+                    past_selector: false,
+                    awaiting_then: false,
+                    in_else: false,
+                }),
+                "WHEN" => match stack.last_mut() {
+                    Some(Frame::Case { past_selector, awaiting_then, .. }) => {
+                        *past_selector = true;
+                        *awaiting_then = true;
+                    }
+                    // An exception handler `WHEN` also awaits its `THEN`.
+                    Some(Frame::Block { .. }) => {}
+                    _ => {}
+                },
+                "EXCEPTION" => {
+                    if let Some(Frame::Block { in_exception }) = stack.last_mut() {
+                        *in_exception = true;
+                    }
+                }
+                "END" => {
+                    stack.pop();
+                    skip_end_qualifier = true;
+                }
+                _ => {}
+            }
+
+            prev_is_stmt_boundary =
+                matches!(upper.as_str(), "THEN" | "LOOP" | "ELSE" | "BEGIN" | "EXCEPTION");
+            last_word_upper = Some(upper);
+        }
+
+        let any_loop = stack.iter().any(|frame| matches!(frame, Frame::Loop));
+        let prev_word = last_word_upper.as_deref();
+        // The cursor is at a fresh statement/continuation position when the last
+        // significant token closes a statement (`;`) or opens a body (`THEN`/
+        // `LOOP`/`ELSE`/`BEGIN`/`EXCEPTION`). An operator/operand token (`:=`, `+`,
+        // a finished expression) is not a boundary — that is an operand position
+        // governed by the expression allowlist.
+        let prev_is_boundary = prev_is_stmt_boundary;
+
+        let policy_with = |f: fn(&mut PlsqlKeywordPolicy)| {
+            let mut p = PlsqlKeywordPolicy::default();
+            f(&mut p);
+            p
+        };
+
+        match stack.last().copied() {
+            None => None,
+            Some(Frame::PendingDeclare) => None,
+            Some(Frame::Block { in_exception }) => {
+                // Directly after `EXCEPTION`, only `WHEN` opens the first handler.
+                if prev_word == Some("EXCEPTION") {
+                    return Some(policy_with(|p| p.allow_when = true));
+                }
+                if !prev_is_boundary {
+                    return None;
+                }
+                Some(PlsqlKeywordPolicy {
+                    allow_statements: true,
+                    allow_when: in_exception,
+                    allow_end: true,
+                    allow_exception: !in_exception,
+                    allow_exit_continue: any_loop,
+                    ..Default::default()
+                })
+            }
+            Some(Frame::If { awaiting_then, in_else }) => {
+                if awaiting_then || !prev_is_boundary {
+                    return None;
+                }
+                Some(PlsqlKeywordPolicy {
+                    allow_statements: true,
+                    allow_elsif: !in_else,
+                    allow_else: !in_else,
+                    allow_end: true,
+                    allow_exit_continue: any_loop,
+                    ..Default::default()
+                })
+            }
+            Some(Frame::Loop) => {
+                if !prev_is_boundary {
+                    return None;
+                }
+                Some(PlsqlKeywordPolicy {
+                    allow_statements: true,
+                    allow_end: true,
+                    allow_exit_continue: true,
+                    ..Default::default()
+                })
+            }
+            Some(Frame::Case {
+                is_statement,
+                past_selector,
+                awaiting_then,
+                in_else,
+            }) => {
+                if awaiting_then {
+                    return None;
+                }
+                if !past_selector {
+                    // The selector slot before the first `WHEN`: only `WHEN`.
+                    return Some(policy_with(|p| p.allow_when = true));
+                }
+                // In an arm body. A statement `CASE` admits statements; a value
+                // `CASE` admits only the `WHEN`/`ELSE`/`END` continuations after
+                // its arm value. The continuations need the arm value/statement to
+                // be complete: a statement boundary, or (value `CASE`) a finished
+                // operand.
+                if is_statement {
+                    if !prev_is_boundary {
+                        return None;
+                    }
+                    Some(PlsqlKeywordPolicy {
+                        allow_statements: true,
+                        allow_when: !in_else,
+                        allow_else: !in_else,
+                        allow_end: true,
+                        allow_exit_continue: any_loop,
+                        ..Default::default()
+                    })
+                } else {
+                    Some(PlsqlKeywordPolicy {
+                        allow_when: !in_else,
+                        allow_else: !in_else,
+                        allow_end: true,
+                        ..Default::default()
+                    })
+                }
+            }
         }
     }
 
@@ -6526,22 +6904,59 @@ impl SqlEditorWidget {
             }
         }
         let Some(open_idx) = open_idx else {
-            // No enclosing paren: the statement's own select list.
-            return SelectListWildcardSlot::Full;
+            // No enclosing paren: the statement's own select list. `*`/`t.*` name
+            // a whole-row projection, so they belong only at the start of a fresh
+            // select-list item — never mid-expression (a `CASE` arm, an operator
+            // operand), where they would be ungrammatical noise.
+            return if Self::cursor_at_select_projection_item_start(tokens, end) {
+                SelectListWildcardSlot::Full
+            } else {
+                SelectListWildcardSlot::None
+            };
         };
         if intellisense_context::is_query_expression_start(tokens, open_idx + 1) {
-            // A subquery paren — the cursor is in that subquery's select list.
-            return SelectListWildcardSlot::Full;
+            // A subquery paren — the cursor is in that subquery's select list, so
+            // the same projection-item-start requirement applies.
+            return if Self::cursor_at_select_projection_item_start(tokens, end) {
+                SelectListWildcardSlot::Full
+            } else {
+                SelectListWildcardSlot::None
+            };
         }
-        // A function-call / expression paren: only `COUNT(*)`'s `*` survives, and
-        // only with the cursor sitting immediately after the `(`.
+        // A function-call / expression paren: the only surviving wildcard is the
+        // bare `*` argument of `COUNT(*)` — the one function that admits it — with
+        // the cursor sitting immediately after the `(`. Any other call
+        // (`SUM(|)`, `NVL(|, 0)`, `TRIM(|)`) takes a value expression, never `*`.
         let cursor_right_after_open = Self::meaningful_tokens_before(tokens, end).last().is_some_and(
             |token| matches!(token, SqlToken::Symbol(sym) if sym == "("),
         );
-        if cursor_right_after_open {
+        let enclosing_call_is_count = Self::innermost_open_paren_preceding_word(tokens, end)
+            .is_some_and(|word| word.eq_ignore_ascii_case("COUNT"));
+        if cursor_right_after_open && enclosing_call_is_count {
             SelectListWildcardSlot::CountStarOnly
         } else {
             SelectListWildcardSlot::None
+        }
+    }
+
+    /// True when the cursor sits at the start of a fresh select-list projection
+    /// item — right after `SELECT`, a set-quantifier (`DISTINCT`/`ALL`/`UNIQUE`/
+    /// `DISTINCTROW`), or a list-separating comma. A whole-row wildcard (`*`/
+    /// `t.*`) is itself a projection item, so it is grammatical only here;
+    /// anywhere else inside a select-list expression (a `CASE` arm such as
+    /// `CASE WHEN |`/`THEN |`/`ELSE |`, or an operator operand) it is noise.
+    fn cursor_at_select_projection_item_start(tokens: &[SqlToken], end: usize) -> bool {
+        match Self::meaningful_tokens_before(tokens, end).last() {
+            Some(SqlToken::Word(word)) => matches!(
+                word.to_ascii_uppercase().as_str(),
+                "SELECT" | "DISTINCT" | "ALL" | "UNIQUE" | "DISTINCTROW"
+            ),
+            Some(SqlToken::Symbol(sym)) => sym == ",",
+            Some(_) => false,
+            // Nothing precedes the cursor's word in this query window: the cursor
+            // is at the very start of the (sub)query's select list — a projection
+            // item start.
+            None => true,
         }
     }
 

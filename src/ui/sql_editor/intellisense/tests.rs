@@ -4909,6 +4909,160 @@ fn collect_clause_wildcard_suggestions_outside_select_list_are_empty() {
 }
 
 #[test]
+fn collect_clause_wildcard_suggestions_only_at_projection_item_start() {
+    // `*`/`t.*` name a whole-row projection, so they belong only at the start of
+    // a fresh select-list item: right after `SELECT`, a set-quantifier, or a
+    // list-separating comma — including inside a subquery's select list.
+    let star = |sql: &str| SqlEditorWidget::collect_clause_wildcard_suggestions(
+        "",
+        None,
+        &analyze_inline_cursor_sql(sql),
+    );
+    for sql in [
+        "SELECT | FROM emp",
+        "SELECT a, | FROM emp",
+        "SELECT a, b, |, c FROM emp",
+        "SELECT DISTINCT | FROM emp",
+        "SELECT * FROM t WHERE id IN (SELECT | FROM u)",
+        "SELECT * FROM t WHERE id IN (SELECT a, | FROM u)",
+        "INSERT INTO t SELECT | FROM s",
+    ] {
+        assert!(
+            star(sql).iter().any(|s| s == "*"),
+            "expected `*` projection at item start for: {sql} (got {:?})",
+            star(sql)
+        );
+    }
+
+    // Anywhere else inside a select-list expression `*`/`t.*` is ungrammatical
+    // noise — a `CASE` arm, or an operator operand.
+    for sql in [
+        "SELECT CASE WHEN | THEN 'y' END FROM t",
+        "SELECT CASE a WHEN | THEN 'y' END FROM t",
+        "SELECT CASE WHEN a = 1 THEN | END FROM t",
+        "SELECT CASE WHEN a = 1 THEN 1 ELSE | END FROM t",
+        "SELECT a + | FROM emp",
+    ] {
+        assert!(
+            star(sql).is_empty(),
+            "expected no wildcard mid-expression for: {sql} (got {:?})",
+            star(sql)
+        );
+    }
+}
+
+#[test]
+fn collect_clause_wildcard_suggestions_scope_to_innermost_nested_query() {
+    // A `t.*` wildcard names a row source of the cursor's own query. In a nested
+    // subquery — a scalar subquery in the SELECT list, an IN/EXISTS predicate
+    // subquery, or any deeper nesting — that is the inner query's `FROM`, never
+    // the enclosing query's tables.
+    let star_scopes = |sql: &str| -> Vec<String> {
+        SqlEditorWidget::collect_clause_wildcard_suggestions("", None, &analyze_inline_cursor_sql(sql))
+            .into_iter()
+            .filter(|s| s.ends_with(".*"))
+            .collect()
+    };
+
+    assert_eq!(
+        star_scopes("SELECT (SELECT | FROM b) FROM a"),
+        vec!["b.*".to_string()]
+    );
+    assert_eq!(
+        star_scopes("SELECT * FROM t WHERE id IN (SELECT | FROM u)"),
+        vec!["u.*".to_string()]
+    );
+    assert_eq!(
+        star_scopes("SELECT * FROM t WHERE EXISTS (SELECT | FROM u)"),
+        vec!["u.*".to_string()]
+    );
+    assert_eq!(
+        star_scopes("SELECT * FROM emp e WHERE e.deptno = (SELECT | FROM dept d)"),
+        vec!["d.*".to_string()]
+    );
+    // Nested two levels deep: only the innermost `FROM c` is in projection scope.
+    assert_eq!(
+        star_scopes("SELECT * FROM a WHERE x IN (SELECT y FROM b WHERE z IN (SELECT | FROM c))"),
+        vec!["c.*".to_string()]
+    );
+    // An unclosed (mid-typing) nested subquery scopes to its inner `FROM` too.
+    assert_eq!(
+        star_scopes("SELECT (SELECT | FROM b"),
+        vec!["b.*".to_string()]
+    );
+}
+
+#[test]
+fn collect_clause_wildcard_suggestions_scope_to_cursor_set_operation_branch() {
+    // Each `UNION`/`INTERSECT`/`MINUS`/`EXCEPT` branch is an independent select
+    // list with its own row sources, so a `t.*` wildcard names only the branch
+    // the cursor is in — not the first branch.
+    let star_scopes = |sql: &str| -> Vec<String> {
+        SqlEditorWidget::collect_clause_wildcard_suggestions("", None, &analyze_inline_cursor_sql(sql))
+            .into_iter()
+            .filter(|s| s.ends_with(".*"))
+            .collect()
+    };
+
+    assert_eq!(
+        star_scopes("SELECT | FROM x UNION SELECT b FROM y"),
+        vec!["x.*".to_string()]
+    );
+    assert_eq!(
+        star_scopes("SELECT a FROM x UNION SELECT | FROM y"),
+        vec!["y.*".to_string()]
+    );
+    assert_eq!(
+        star_scopes("SELECT a FROM x UNION ALL SELECT | FROM y"),
+        vec!["y.*".to_string()]
+    );
+    assert_eq!(
+        star_scopes("SELECT a FROM x INTERSECT SELECT | FROM y"),
+        vec!["y.*".to_string()]
+    );
+    // Third branch of a chain.
+    assert_eq!(
+        star_scopes("SELECT a FROM x UNION SELECT b FROM y UNION SELECT | FROM z"),
+        vec!["z.*".to_string()]
+    );
+    // Set operation nested inside a predicate subquery.
+    assert_eq!(
+        star_scopes("SELECT * FROM t WHERE id IN (SELECT a FROM x UNION SELECT | FROM y)"),
+        vec!["y.*".to_string()]
+    );
+}
+
+#[test]
+fn collect_clause_wildcard_suggestions_count_star_only_for_count_call() {
+    // The bare `*` argument is grammatical only in `COUNT(*)` — the one function
+    // that admits it. Every other call argument takes a value expression, so a
+    // `*` there is noise.
+    let star = |sql: &str| SqlEditorWidget::collect_clause_wildcard_suggestions(
+        "",
+        None,
+        &analyze_inline_cursor_sql(sql),
+    );
+
+    assert_eq!(star("SELECT COUNT(|) FROM emp"), vec!["*".to_string()]);
+    assert_eq!(star("SELECT count(|) FROM emp"), vec!["*".to_string()]);
+
+    for sql in [
+        "SELECT NVL(|, 0) FROM emp",
+        "SELECT MAX(|) FROM emp",
+        "SELECT SUM(|) FROM emp",
+        "SELECT TRIM(|) FROM emp",
+        // `COUNT(DISTINCT *)` is invalid — the cursor is no longer right after `(`.
+        "SELECT COUNT(DISTINCT |) FROM emp",
+    ] {
+        assert!(
+            star(sql).is_empty(),
+            "expected no `*` argument for: {sql} (got {:?})",
+            star(sql)
+        );
+    }
+}
+
+#[test]
 fn qualified_condition_comparison_suggestions_cover_supported_predicate_clauses() {
     let cases = [
         (
@@ -22472,3 +22626,85 @@ fn bind_variable_name_slot_suppresses_columns() {
     assert!(has(&base("SELECT * FROM emp WHERE empno = |"), "ENAME"));
 }
 
+/// Helper: pure keyword tokens of the base suggestion list for `sql` (cursor at
+/// `|`), uppercased, for statement-start filtering assertions.
+fn statement_start_base_keywords(sql: &str) -> Vec<String> {
+    let cursor = sql.find('|').expect("cursor marker");
+    let s = sql.replace('|', "");
+    let ctx = analyze_inline_cursor_sql(sql);
+    let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&s, cursor);
+    let context = SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+    let mut data = IntellisenseData::new();
+    let ekc = SqlEditorWidget::expression_keyword_context(
+        &ctx, &data, &[], !prefix.is_empty(), Some(crate::db::DatabaseType::Oracle),
+    );
+    let include_columns = matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll);
+    SqlEditorWidget::base_suggestions_for_context(
+        &mut data, &prefix, None, None, include_columns, context, false,
+        Some(crate::db::DatabaseType::Oracle), ekc,
+    )
+    .into_iter()
+    .filter(|x| !x.ends_with("()") && x.chars().all(|c| c.is_ascii_uppercase() || c == '_'))
+    .collect()
+}
+
+#[test]
+fn statement_start_filters_keyword_dump_to_statement_verbs() {
+    // At a fresh statement head — top level or a PL/SQL block — the flat keyword
+    // dump is restricted to keywords that can actually open a statement; the rest
+    // of the prefix-matched catalog (`SAMPLE`/`SEQUENCE`, `IDENTIFIED`/`INTERSECT`/
+    // `INTO`, `WELLFORMED`/`WHERE`/`WINDOW`) is dropped as noise.
+    let kw = statement_start_base_keywords;
+
+    // Top-level statement start (buffer start, and after a `;` terminator).
+    for sql in ["S|", "SELECT 1 FROM dual; S|"] {
+        let s = kw(sql);
+        assert_eq!(s, vec!["SAVEPOINT", "SELECT", "SET"], "for `{sql}`");
+    }
+
+    // PL/SQL block statement start.
+    assert_eq!(kw("BEGIN I|"), vec!["IF", "INSERT"]);
+    assert_eq!(kw("BEGIN W|"), vec!["WHILE", "WITH"]);
+    assert_eq!(kw("BEGIN NULL; E|"), vec!["END", "EXCEPTION", "EXECUTE"]);
+}
+
+#[test]
+fn statement_start_gates_plsql_construct_continuations() {
+    let kw = statement_start_base_keywords;
+    let has = |sql: &str, k: &str| kw(sql).iter().any(|x| x == k);
+
+    // `CASE` selector slot (statement and value, simple and searched): only
+    // `WHEN` — never the rest of the `W` catalog.
+    assert_eq!(kw("BEGIN CASE W|"), vec!["WHEN"]);
+    assert_eq!(kw("BEGIN CASE x W|"), vec!["WHEN"]);
+    assert_eq!(kw("BEGIN v := CASE x W|"), vec!["WHEN"]);
+
+    // A *value* `CASE` arm offers only the `WHEN`/`ELSE`/`END` continuations —
+    // never the procedural statement keywords valid in a *statement* `CASE`.
+    assert_eq!(kw("BEGIN v := CASE WHEN c THEN r E|"), vec!["ELSE", "END"]);
+    assert!(!has("BEGIN v := CASE WHEN c THEN r E|", "EXECUTE"));
+    // A statement `CASE` arm does admit them.
+    assert!(has("BEGIN CASE x WHEN 1 THEN E|", "EXECUTE"));
+
+    // `IF`: `ELSIF`/`ELSE` only before the `ELSE` arm is taken.
+    assert!(has("BEGIN IF a THEN b; E|", "ELSE"));
+    assert!(has("BEGIN IF a THEN b; E|", "ELSIF"));
+    assert!(!has("BEGIN IF a THEN b; ELSE c; E|", "ELSE"));
+    assert!(!has("BEGIN IF a THEN b; ELSE c; E|", "ELSIF"));
+
+    // `EXIT`/`CONTINUE` reach an enclosing loop, even across a nested `IF`.
+    assert!(has("BEGIN LOOP E|", "EXIT"));
+    assert!(has("BEGIN FOR i IN 1..10 LOOP IF x THEN E|", "EXIT"));
+    assert!(!has("BEGIN E|", "EXIT"));
+
+    // Exception section: directly after `EXCEPTION` only `WHEN`; `EXCEPTION`
+    // itself is offered once (before a block has a handler section), not twice.
+    assert_eq!(kw("BEGIN NULL; EXCEPTION W|"), vec!["WHEN"]);
+    assert!(has("BEGIN NULL; E|", "EXCEPTION"));
+
+    // An operand position inside a block (after `:=`) is not a statement start —
+    // the operand allowlist governs, keeping a value function.
+    assert!(statement_start_base_keywords("BEGIN v := to_ch|")
+        .iter()
+        .all(|k| k != "IF" && k != "INSERT"));
+}

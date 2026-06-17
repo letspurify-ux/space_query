@@ -346,6 +346,7 @@ pub(crate) fn analyze_cursor_context_arc(
     let clamped_cursor_token_len = cursor_token_len.min(statement_tokens.len());
     let parse_result = scan_cursor_context(statement_tokens.as_ref(), clamped_cursor_token_len);
     let active_query_range = find_active_query_range(
+        statement_tokens.as_ref(),
         &parse_result.parsed_ctes,
         &parse_result.parsed_subqueries,
         clamped_cursor_token_len,
@@ -4596,6 +4597,7 @@ fn should_prefer_active_query_range(candidate: TokenRange, existing: TokenRange)
 }
 
 fn find_active_query_range(
+    tokens: &[SqlToken],
     parsed_ctes: &[ParsedCteEntry],
     parsed_subqueries: &[ParsedSubqueryEntry],
     cursor_token_len: usize,
@@ -4620,7 +4622,105 @@ fn find_active_query_range(
         consider(entry.subquery.body_range);
     }
 
+    // A CTE body and a FROM-derived table are not the only nested query scopes:
+    // a scalar subquery in the SELECT list (`SELECT (SELECT | FROM b) FROM a`),
+    // an IN/EXISTS subquery in a predicate (`WHERE x IN (SELECT | FROM b)`), and
+    // any nested combination of these also scope the cursor to their own inner
+    // query. They are neither CTEs nor row sources, so the scope state machine
+    // does not record them as candidate ranges. Scanning the parenthesis
+    // structure directly captures every `(`-introduced query expression
+    // uniformly — closed, or still open while being typed — so the innermost one
+    // containing the cursor wins by the same smallest-range preference.
+    let mut paren_stack: Vec<(usize, bool)> = Vec::new();
+    for (idx, token) in tokens.iter().enumerate() {
+        match token {
+            SqlToken::Symbol(sym) if sym == "(" => {
+                let is_query = is_query_expression_start(tokens, idx + 1);
+                paren_stack.push((idx + 1, is_query));
+            }
+            SqlToken::Symbol(sym) if sym == ")" => {
+                if let Some((inner_start, is_query)) = paren_stack.pop() {
+                    if is_query {
+                        consider(TokenRange {
+                            start: inner_start,
+                            end: idx,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // Parens still open at end-of-input enclose the cursor when a subquery is
+    // mid-typing (`… IN (SELECT | FROM b`); their body runs to the statement end.
+    for (inner_start, is_query) in paren_stack {
+        if is_query {
+            consider(TokenRange {
+                start: inner_start,
+                end: tokens.len(),
+            });
+        }
+    }
+
+    // Within the chosen query scope (or the whole statement, when the cursor is
+    // not nested in a subquery), a set operator (`UNION`/`INTERSECT`/`MINUS`/
+    // `EXCEPT`) splits the scope into independent branches, each with its own
+    // select list and row sources. Narrow to the branch the cursor sits in so
+    // projection-scoped completion (e.g. the `t.*` wildcard, which re-scans this
+    // range for row sources) sees only that branch — matching the per-branch
+    // column scope the state machine already resolves.
+    let base = active_range.unwrap_or(TokenRange {
+        start: 0,
+        end: tokens.len(),
+    });
+    let branch = set_operation_branch_range(tokens, base, cursor_token_len);
+    if branch.start != 0 || branch.end != tokens.len() {
+        active_range = Some(branch);
+    }
+
     active_range
+}
+
+/// Narrow `base` to the set-operation branch (`UNION`/`INTERSECT`/`MINUS`/
+/// `EXCEPT` separated) containing the cursor. Set operators at the scope's own
+/// nesting level (relative paren depth 0) delimit the branches; operators inside
+/// a deeper subquery/parenthesised expression are ignored. Returns `base`
+/// unchanged when the scope has no set operator.
+fn set_operation_branch_range(
+    tokens: &[SqlToken],
+    base: TokenRange,
+    cursor_token_len: usize,
+) -> TokenRange {
+    let start = base.start.min(tokens.len());
+    let end = base.end.min(tokens.len());
+    let mut depth = 0usize;
+    let mut branch_start = start;
+    let mut branch_end = end;
+    for idx in start..end {
+        match &tokens[idx] {
+            SqlToken::Symbol(sym) if sym == "(" => depth += 1,
+            SqlToken::Symbol(sym) if sym == ")" => depth = depth.saturating_sub(1),
+            SqlToken::Word(word)
+                if depth == 0
+                    && matches!(
+                        word.to_ascii_uppercase().as_str(),
+                        "UNION" | "INTERSECT" | "MINUS" | "EXCEPT"
+                    ) =>
+            {
+                if idx < cursor_token_len {
+                    branch_start = idx + 1;
+                } else {
+                    branch_end = idx;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    TokenRange {
+        start: branch_start,
+        end: branch_end,
+    }
 }
 
 pub(crate) fn token_range_slice(tokens: &[SqlToken], range: TokenRange) -> &[SqlToken] {
