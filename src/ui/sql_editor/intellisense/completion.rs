@@ -264,6 +264,40 @@ enum KeepDenseRankSlot {
     AfterRankDirection,
 }
 
+/// Keyword position in an ordered-set aggregate `... WITHIN GROUP (...)` tail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WithinGroupSlot {
+    /// `<ordered-set-call> WITHIN |` - only `GROUP`.
+    AfterWithin,
+    /// `<ordered-set-call> WITHIN GROUP |` - only `(`, so no keyword candidates.
+    AfterGroup,
+}
+
+/// Keyword position in an analytic null-treatment tail:
+/// `FIRST_VALUE(...) IGNORE NULLS OVER (...)`,
+/// `NTH_VALUE(...) FROM LAST RESPECT NULLS OVER (...)`, etc.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnalyticNullTreatmentSlot {
+    /// `<analytic-call> |` - `IGNORE`/`RESPECT`, or `FROM` for `NTH_VALUE`.
+    AfterAnalyticCall,
+    /// `NTH_VALUE(...) |` - may also take `FROM FIRST|LAST`.
+    AfterNthValueCall,
+    /// `NTH_VALUE(...) FROM |` - only `FIRST`/`LAST`.
+    AfterNthValueFrom,
+    /// `NTH_VALUE(...) FROM FIRST|LAST |` - null treatment or `OVER`.
+    AfterNthValueFromDirection,
+    /// `<analytic-tail> IGNORE|RESPECT |` - only `NULLS`.
+    AfterNullTreatment,
+    /// `<analytic-tail> IGNORE|RESPECT NULLS |` - only `OVER`.
+    AfterNulls,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnalyticNullTreatmentCall {
+    General,
+    NthValue,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExpectedObjectSuggestionKind {
     Any,
@@ -473,6 +507,36 @@ fn keep_dense_rank_keywords(slot: KeepDenseRankSlot) -> &'static [&'static str] 
         KeepDenseRankSlot::AfterDenseRank => &["FIRST", "LAST"],
         KeepDenseRankSlot::AfterRankDirection => &["ORDER"],
     }
+}
+
+fn within_group_keywords(slot: WithinGroupSlot) -> &'static [&'static str] {
+    match slot {
+        WithinGroupSlot::AfterWithin => &["GROUP"],
+        WithinGroupSlot::AfterGroup => &[],
+    }
+}
+
+fn analytic_null_treatment_keywords(
+    slot: AnalyticNullTreatmentSlot,
+) -> &'static [&'static str] {
+    match slot {
+        AnalyticNullTreatmentSlot::AfterAnalyticCall => &["IGNORE", "RESPECT", "OVER"],
+        AnalyticNullTreatmentSlot::AfterNthValueCall => &["FROM", "IGNORE", "RESPECT", "OVER"],
+        AnalyticNullTreatmentSlot::AfterNthValueFrom => &["FIRST", "LAST"],
+        AnalyticNullTreatmentSlot::AfterNthValueFromDirection => &["IGNORE", "RESPECT", "OVER"],
+        AnalyticNullTreatmentSlot::AfterNullTreatment => &["NULLS"],
+        AnalyticNullTreatmentSlot::AfterNulls => &["OVER"],
+    }
+}
+
+fn analytic_null_treatment_slot_suppresses_columns(
+    slot: AnalyticNullTreatmentSlot,
+) -> bool {
+    !matches!(
+        slot,
+        AnalyticNullTreatmentSlot::AfterAnalyticCall
+            | AnalyticNullTreatmentSlot::AfterNthValueCall
+    )
 }
 
 /// Data-type keyword set for a dialect and position. MySQL/MariaDB restrict
@@ -1198,6 +1262,9 @@ impl SqlEditorWidget {
                 deep_ctx, has_prefix,
             ) || Self::order_by_sort_modifier_slot_for_context(deep_ctx, has_prefix).is_some()
                 || Self::keep_dense_rank_slot_for_context(deep_ctx, has_prefix).is_some()
+                || Self::within_group_slot_for_context(deep_ctx, has_prefix).is_some()
+                || Self::analytic_null_treatment_slot_for_context(deep_ctx, has_prefix)
+                    .is_some_and(analytic_null_treatment_slot_suppresses_columns)
                 || Self::cursor_is_at_is_null_test_keyword_position_for_context(deep_ctx, has_prefix)
                 || Self::cursor_is_after_complete_dml_target_for_context(deep_ctx, has_prefix)
                 || Self::cursor_is_after_complete_join_target_for_context(deep_ctx, has_prefix)
@@ -2153,7 +2220,7 @@ impl SqlEditorWidget {
         const WINDOW_SPEC_KEYWORDS: &[&str] = &[
             "PARTITION", "BY", "ORDER", "RANGE", "ROWS", "GROUPS", "BETWEEN", "PRECEDING",
             "FOLLOWING", "UNBOUNDED", "CURRENT", "ROW", "TIES", "EXCLUDE", "NO", "OTHERS",
-            "GROUP", "NULLS", "FIRST", "LAST", "RESPECT", "IGNORE",
+            "GROUP", "NULLS", "FIRST", "LAST",
         ];
 
         // CASE body: only inside an unclosed CASE.
@@ -3670,6 +3737,157 @@ impl SqlEditorWidget {
         Self::keep_dense_rank_slot(tokens, end)
     }
 
+    fn function_supports_within_group(name: &str) -> bool {
+        matches!(
+            name,
+            "LISTAGG"
+                | "PERCENTILE_CONT"
+                | "PERCENTILE_DISC"
+                | "RANK"
+                | "DENSE_RANK"
+                | "CUME_DIST"
+                | "PERCENT_RANK"
+        )
+    }
+
+    fn ordered_set_call_before(tokens: &[&SqlToken]) -> bool {
+        matches!(tokens.last(), Some(SqlToken::Symbol(sym)) if sym == ")")
+            && Self::call_name_before_close(tokens)
+                .is_some_and(|name| Self::function_supports_within_group(&name))
+    }
+
+    fn within_group_slot(tokens: &[SqlToken], end: usize) -> Option<WithinGroupSlot> {
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        match toks.as_slice() {
+            [prefix @ .., SqlToken::Word(word)] if word.eq_ignore_ascii_case("WITHIN") => {
+                Self::ordered_set_call_before(prefix).then_some(WithinGroupSlot::AfterWithin)
+            }
+            [prefix @ .., SqlToken::Word(within), SqlToken::Word(group)]
+                if within.eq_ignore_ascii_case("WITHIN") && group.eq_ignore_ascii_case("GROUP") =>
+            {
+                Self::ordered_set_call_before(prefix).then_some(WithinGroupSlot::AfterGroup)
+            }
+            _ => None,
+        }
+    }
+
+    fn within_group_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> Option<WithinGroupSlot> {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::within_group_slot(tokens, end)
+    }
+
+    fn analytic_null_treatment_call_kind(name: &str) -> Option<AnalyticNullTreatmentCall> {
+        match name {
+            "NTH_VALUE" => Some(AnalyticNullTreatmentCall::NthValue),
+            "FIRST_VALUE" | "LAST_VALUE" | "LAG" | "LEAD" => {
+                Some(AnalyticNullTreatmentCall::General)
+            }
+            _ => None,
+        }
+    }
+
+    fn closed_analytic_null_treatment_call(
+        tokens: &[&SqlToken],
+    ) -> Option<AnalyticNullTreatmentCall> {
+        matches!(tokens.last(), Some(SqlToken::Symbol(sym)) if sym == ")")
+            .then(|| Self::call_name_before_close(tokens))
+            .flatten()
+            .and_then(|name| Self::analytic_null_treatment_call_kind(&name))
+    }
+
+    fn nth_value_from_direction_tail(tokens: &[&SqlToken]) -> bool {
+        match tokens {
+            [prefix @ .., SqlToken::Word(from), SqlToken::Word(direction)]
+                if from.eq_ignore_ascii_case("FROM")
+                    && matches!(direction.to_ascii_uppercase().as_str(), "FIRST" | "LAST") =>
+            {
+                Self::closed_analytic_null_treatment_call(prefix)
+                    == Some(AnalyticNullTreatmentCall::NthValue)
+            }
+            _ => false,
+        }
+    }
+
+    fn analytic_null_treatment_can_follow(tokens: &[&SqlToken]) -> bool {
+        Self::closed_analytic_null_treatment_call(tokens).is_some()
+            || Self::nth_value_from_direction_tail(tokens)
+    }
+
+    fn analytic_null_treatment_written(tokens: &[&SqlToken]) -> bool {
+        match tokens {
+            [prefix @ .., SqlToken::Word(treatment)]
+                if matches!(
+                    treatment.to_ascii_uppercase().as_str(),
+                    "IGNORE" | "RESPECT"
+                ) =>
+            {
+                Self::analytic_null_treatment_can_follow(prefix)
+            }
+            _ => false,
+        }
+    }
+
+    fn analytic_null_treatment_slot(
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> Option<AnalyticNullTreatmentSlot> {
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        match toks.as_slice() {
+            [prefix @ .., SqlToken::Word(nulls)] if nulls.eq_ignore_ascii_case("NULLS") => {
+                Self::analytic_null_treatment_written(prefix)
+                    .then_some(AnalyticNullTreatmentSlot::AfterNulls)
+            }
+            [prefix @ .., SqlToken::Word(treatment)]
+                if matches!(
+                    treatment.to_ascii_uppercase().as_str(),
+                    "IGNORE" | "RESPECT"
+                ) =>
+            {
+                Self::analytic_null_treatment_can_follow(prefix)
+                    .then_some(AnalyticNullTreatmentSlot::AfterNullTreatment)
+            }
+            [prefix @ .., SqlToken::Word(from)] if from.eq_ignore_ascii_case("FROM") => {
+                (Self::closed_analytic_null_treatment_call(prefix)
+                    == Some(AnalyticNullTreatmentCall::NthValue))
+                .then_some(AnalyticNullTreatmentSlot::AfterNthValueFrom)
+            }
+            _ if Self::nth_value_from_direction_tail(&toks) => {
+                Some(AnalyticNullTreatmentSlot::AfterNthValueFromDirection)
+            }
+            _ => Self::closed_analytic_null_treatment_call(&toks).map(|call| match call {
+                AnalyticNullTreatmentCall::General => {
+                    AnalyticNullTreatmentSlot::AfterAnalyticCall
+                }
+                AnalyticNullTreatmentCall::NthValue => {
+                    AnalyticNullTreatmentSlot::AfterNthValueCall
+                }
+            }),
+        }
+    }
+
+    fn analytic_null_treatment_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> Option<AnalyticNullTreatmentSlot> {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::analytic_null_treatment_slot(tokens, end)
+    }
+
     /// The word immediately preceding the innermost still-open paren at the
     /// cursor (e.g. `ADD` for `ADD (col |)`), or `None` at top level.
     fn innermost_open_paren_preceding_word(tokens: &[SqlToken], end: usize) -> Option<String> {
@@ -4254,6 +4472,13 @@ impl SqlEditorWidget {
             )
             || Self::keep_dense_rank_slot_for_context(deep_ctx, exclude_current_identifier_chain)
                 .is_some()
+            || Self::within_group_slot_for_context(deep_ctx, exclude_current_identifier_chain)
+                .is_some()
+            || Self::analytic_null_treatment_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
+            .is_some_and(analytic_null_treatment_slot_suppresses_columns)
             || Self::cursor_is_at_type_attribute_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
@@ -5746,6 +5971,17 @@ impl SqlEditorWidget {
 
         if let Some(slot) = Self::keep_dense_rank_slot(tokens, context_end) {
             return Self::filter_expected_candidates(prefix, keep_dense_rank_keywords(slot));
+        }
+
+        if let Some(slot) = Self::within_group_slot(tokens, context_end) {
+            return Self::filter_expected_candidates(prefix, within_group_keywords(slot));
+        }
+
+        if let Some(slot) = Self::analytic_null_treatment_slot(tokens, context_end) {
+            return Self::filter_expected_candidates(
+                prefix,
+                analytic_null_treatment_keywords(slot),
+            );
         }
 
         if let Some(candidates) = Self::type_attribute_candidates(tokens, context_end) {

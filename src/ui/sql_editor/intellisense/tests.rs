@@ -18403,6 +18403,8 @@ fn column_suppressing_keyword_slot_covers_every_family() {
         "SELECT sum(x) OVER (ORDER BY d ROWS CURRENT ROW EXCLUDE NO |) FROM t"
     )); // EXCLUDE tail
     assert!(at("SELECT max(empno) KEEP (DENSE_RANK |) FROM emp")); // KEEP dense-rank slot
+    assert!(at("SELECT listagg(ename) WITHIN | FROM emp")); // WITHIN GROUP slot
+    assert!(at("SELECT last_value(empno) IGNORE | FROM emp")); // analytic null treatment
     assert!(at("SELECT EXTRACT(| FROM hire_date) FROM emp")); // EXTRACT field
     assert!(at("SELECT hire_date - INTERVAL '5' | FROM emp")); // INTERVAL unit
     assert!(at("SELECT * FROM emp ORDER BY id ASC |")); // ORDER BY sort modifier
@@ -20919,6 +20921,8 @@ fn keyword_only_slots_suppress_the_identifier_base() {
         "SELECT SUM(x) OVER (ORDER BY a ROWS UNBOUNDED prec|) FROM t",
         "SELECT x FROM t FETCH FIRST ro| ROWS ONLY",
         "SELECT max(x) KEEP (DENSE_RANK fir|) FROM t",
+        "SELECT listagg(x) WITHIN gr| FROM t",
+        "SELECT last_value(x) IGNORE nu| FROM t",
     ];
     for sql in pure_keyword_slots {
         let ctx = analyze_inline_cursor_sql(sql);
@@ -22029,6 +22033,40 @@ fn analytic_continuations_offered_only_after_a_closed_call() {
     );
 }
 
+#[test]
+fn within_group_keyword_slots_suppress_identifiers_and_offer_fixed_keywords() {
+    let kw = |sql: &str, prefix: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(crate::db::DatabaseType::Oracle),
+        )
+    };
+    let suppresses = |sql: &str| {
+        SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(
+            &analyze_inline_cursor_sql(sql),
+            false,
+        )
+    };
+
+    assert_eq!(
+        kw("SELECT listagg(ename) WITHIN | FROM emp", ""),
+        vec!["GROUP".to_string()]
+    );
+    assert_eq!(
+        kw("SELECT percentile_cont(0.5) WITHIN g| FROM emp", "g"),
+        vec!["GROUP".to_string()]
+    );
+    assert!(kw("SELECT listagg(ename) WITHIN GROUP | FROM emp", "").is_empty());
+    assert!(suppresses("SELECT listagg(ename) WITHIN | FROM emp"));
+    assert!(suppresses("SELECT listagg(ename) WITHIN GROUP | FROM emp"));
+
+    // Lookalikes outside ordered-set aggregate syntax keep normal completion.
+    assert!(kw("SELECT (ename) WITHIN | FROM emp", "").is_empty());
+    assert!(!suppresses("SELECT within | FROM emp"));
+    assert!(!suppresses("SELECT (ename) WITHIN | FROM emp"));
+}
+
 /// `ESCAPE` is grammatical only right after a `LIKE` pattern
 /// (`name LIKE 'a\_%' ESCAPE '\'`), never after a plain operand. It is gated on
 /// the same "continuation that needs a specific preceding operand" principle as
@@ -22338,6 +22376,60 @@ fn first_last_are_not_value_functions() {
         kw.iter().any(|k| k.eq_ignore_ascii_case("FIRST")),
         "NULLS FIRST ordering slot lost FIRST: {kw:?}"
     );
+}
+
+#[test]
+fn analytic_null_treatment_keywords_are_scoped_to_analytic_call_tails() {
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let kw = |sql: &str, prefix: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(crate::db::DatabaseType::Oracle),
+        )
+    };
+    let suppresses = |sql: &str| {
+        let cursor = sql.find('|').expect("cursor marker");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(
+            &analyze_inline_cursor_sql(sql),
+            !prefix.is_empty(),
+        )
+    };
+
+    // `IGNORE`/`RESPECT NULLS` belongs to the analytic function tail before
+    // `OVER`, not inside the `OVER (...)` window specification.
+    let s = typed_emp_suggestions("SELECT sum(empno) OVER (ORDER BY hiredate ign|) FROM emp");
+    assert!(!has(&s, "IGNORE"), "IGNORE leaked inside an OVER window spec: {s:?}");
+    let s = typed_emp_suggestions("SELECT sum(empno) OVER (ORDER BY hiredate res|) FROM emp");
+    assert!(!has(&s, "RESPECT"), "RESPECT leaked inside an OVER window spec: {s:?}");
+
+    assert_eq!(
+        kw("SELECT first_value(empno) ign| FROM emp", "ign"),
+        vec!["IGNORE".to_string()]
+    );
+    assert_eq!(
+        kw("SELECT last_value(empno) RESPECT | FROM emp", ""),
+        vec!["NULLS".to_string()]
+    );
+    assert_eq!(
+        kw("SELECT nth_value(empno, 1) FROM fir| FROM emp", "fir"),
+        vec!["FIRST".to_string()]
+    );
+    assert_eq!(
+        kw("SELECT nth_value(empno, 1) FROM LAST IGNORE | FROM emp", ""),
+        vec!["NULLS".to_string()]
+    );
+    assert_eq!(
+        kw("SELECT nth_value(NVL(empno, 0), 1) FROM FIRST RESPECT NULLS | FROM emp", ""),
+        vec!["OVER".to_string()]
+    );
+
+    assert!(suppresses("SELECT last_value(empno) IGNORE | FROM emp"));
+    assert!(suppresses("SELECT nth_value(empno, 1) FROM fir| FROM emp"));
+    assert!(suppresses("SELECT nth_value(empno, 1) FROM LAST IGNORE NULLS | FROM emp"));
+    assert!(!suppresses("SELECT ignore | FROM emp"));
 }
 
 #[test]
