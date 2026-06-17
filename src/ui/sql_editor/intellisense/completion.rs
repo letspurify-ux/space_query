@@ -1884,18 +1884,45 @@ impl SqlEditorWidget {
         // block `IF`/`LOOP`/`RETURN`/… and its construct continuations). The flat
         // base dump otherwise offers every prefix-matched keyword — clause words,
         // type names, modifiers, function keywords — none of which can begin a
-        // statement. Drop those, keeping identifiers/objects/functions (a bare
-        // call or assignment target in a PL/SQL block) untouched.
+        // statement. Object/identifier material is filtered the same way: a SQL
+        // top-level statement never starts with an identifier or a function call,
+        // and a PL/SQL block statement admits only a bare procedure/package call
+        // (never a function — its result cannot stand as a statement — a sequence,
+        // or a table/view).
         if !prefer_columns {
             if let Some(statement_start) = expr_keyword_ctx.statement_start {
                 suggestions.retain(|suggestion| {
-                    let upper = suggestion.to_ascii_uppercase();
-                    !data.is_language_keyword(&upper, db_type)
-                        || Self::keyword_begins_statement(&upper, statement_start)
+                    Self::suggestion_begins_statement(data, suggestion, statement_start, db_type)
                 });
             }
         }
         suggestions
+    }
+
+    /// Whether a single base-catalog entry can stand where the cursor begins a
+    /// statement. Keyword entries defer to `keyword_begins_statement`; non-keyword
+    /// entries (identifiers, `NAME()` functions) are admitted only as a PL/SQL
+    /// block's bare procedure/package call.
+    fn suggestion_begins_statement(
+        data: &IntellisenseData,
+        suggestion: &str,
+        ctx: StatementStartContext,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        let upper = suggestion.to_ascii_uppercase();
+        if data.is_language_keyword(&upper, db_type) {
+            return Self::keyword_begins_statement(&upper, ctx);
+        }
+        match ctx {
+            StatementStartContext::TopLevel => false,
+            StatementStartContext::Plsql(policy) => {
+                policy.allow_statements
+                    && matches!(
+                        data.suggestion_type_label(suggestion, db_type),
+                        Some("PROCEDURE" | "PACKAGE")
+                    )
+            }
+        }
     }
 
     /// Whether `upper` (a reserved keyword) can stand at the statement-start

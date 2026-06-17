@@ -22708,3 +22708,55 @@ fn statement_start_gates_plsql_construct_continuations() {
         .iter()
         .all(|k| k != "IF" && k != "INSERT"));
 }
+
+#[test]
+fn statement_start_drops_object_and_function_noise() {
+    // A statement head admits no operand material. A SQL top-level statement
+    // never starts with an identifier or a function call; a PL/SQL block
+    // statement admits a bare procedure/package call but never a function (its
+    // result cannot stand as a statement), a sequence, or a table/view.
+    let build = || {
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["STAFF".to_string()];
+        data.procedures = vec!["SYNC_DATA".to_string(), "SEND_MAIL".to_string()];
+        data.functions = vec!["SUMMARIZE".to_string()];
+        data.sequences = vec!["SEQ_ID".to_string()];
+        data.packages = vec!["SCHED_PKG".to_string()];
+        data.rebuild_indices();
+        data
+    };
+    let run = |sql: &str| -> Vec<String> {
+        let cursor = sql.find('|').unwrap();
+        let s = sql.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql);
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&s, cursor);
+        let context = SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+        let mut data = build();
+        let ekc = SqlEditorWidget::expression_keyword_context(
+            &ctx, &data, &[], !prefix.is_empty(), Some(crate::db::DatabaseType::Oracle),
+        );
+        let include_columns = matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll);
+        SqlEditorWidget::base_suggestions_for_context(
+            &mut data, &prefix, None, None, include_columns, context, false,
+            Some(crate::db::DatabaseType::Oracle), ekc,
+        )
+    };
+    let has = |v: &[String], k: &str| v.iter().any(|x| x.eq_ignore_ascii_case(k));
+
+    // Top-level statement start: only statement verbs; no procedure, sequence,
+    // function, or function call.
+    let top = run("SE|");
+    assert!(has(&top, "SELECT") && has(&top, "SET"));
+    for noise in ["SEND_MAIL", "SEQ_ID"] {
+        assert!(!has(&top, noise), "`{noise}` leaked into a top-level statement start: {top:?}");
+    }
+
+    // PL/SQL block statement start: a callable procedure survives; a function
+    // call (built-in `SYS_*()` here) does not.
+    let blk = run("BEGIN SY|");
+    assert!(has(&blk, "SYNC_DATA"), "procedure call dropped from PL/SQL statement start: {blk:?}");
+    assert!(
+        !blk.iter().any(|x| x.ends_with("()")),
+        "a function call leaked into a PL/SQL statement start: {blk:?}"
+    );
+}
