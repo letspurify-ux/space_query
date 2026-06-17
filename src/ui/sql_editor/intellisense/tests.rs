@@ -22255,3 +22255,29 @@ fn plsql_executable_block_detection_excludes_bare_sql_case() {
     assert!(exec_block("BEGIN LOOP NULL; END LOOP; v := |; END;"));
     assert!(exec_block("BEGIN BEGIN v := |; END; END;"));
 }
+
+/// A qualified wildcard `t.*` is grammatical only when `t` names a row source in
+/// scope. An unresolved qualifier (`x.|` where `x` is not a table/alias/CTE/
+/// subquery here) yields no columns, so a lone `*` would be the only — bogus —
+/// suggestion; it must be suppressed. A real alias/table/CTE keeps `t.*`.
+#[test]
+fn qualified_wildcard_only_for_in_scope_row_source() {
+    let wc = |sql_with_cursor: &str, qualifier: &str| {
+        let cursor = sql_with_cursor.find('|').expect("cursor");
+        let sql = sql_with_cursor.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql_with_cursor);
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+        SqlEditorWidget::collect_clause_wildcard_suggestions(&prefix, Some(qualifier), &ctx)
+    };
+    let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
+
+    // In-scope row sources keep `*`.
+    assert!(has(&wc("SELECT e.| FROM emp e", "e"), "*"));
+    assert!(has(&wc("SELECT emp.| FROM emp", "emp"), "*"));
+    assert!(has(&wc("SELECT d.| FROM emp e JOIN dept d ON e.deptno = d.deptno", "d"), "*"));
+    assert!(has(&wc("WITH c AS (SELECT 1 x FROM dual) SELECT c.| FROM c", "c"), "*"));
+
+    // An unresolved qualifier offers no bogus wildcard.
+    assert!(wc("SELECT x.| FROM emp e", "x").is_empty());
+    assert!(wc("SELECT zzz.| FROM emp", "zzz").is_empty());
+}

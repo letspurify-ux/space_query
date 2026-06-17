@@ -6416,7 +6416,18 @@ impl SqlEditorWidget {
         match policy.select_list_wildcard_mode {
             SelectListWildcardMode::None => {}
             SelectListWildcardMode::Qualified => {
-                push_candidate("*".to_string());
+                // `t.*` is grammatical only when `t` actually names a row source in
+                // scope (a table/alias/CTE/subquery in this query). For an
+                // unresolved qualifier (`x.|` where `x` is a typo or not in the
+                // `FROM`) the column completion already yields nothing, so a lone
+                // `*` would be the only — and bogus — suggestion. The scope test is
+                // purely structural (parsed `FROM`/CTE/subquery), so it never hides
+                // `t.*` while the table's columns are still loading.
+                if qualifier
+                    .is_some_and(|q| Self::qualifier_matches_visible_relation_scope(q, deep_ctx))
+                {
+                    push_candidate("*".to_string());
+                }
             }
             SelectListWildcardMode::Unqualified => {
                 let current_query_tokens = Self::current_query_tokens(deep_ctx);
