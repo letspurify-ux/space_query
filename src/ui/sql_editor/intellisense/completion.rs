@@ -68,6 +68,18 @@ struct ExpressionKeywordContext {
     /// slot (`v emp%ROWTYPE`) and embedded SQL clauses, which carry their own
     /// phase; in a column context the base has no relations, so this is a no-op.
     in_plsql_value_expression: bool,
+    /// Whether the cursor is at a PL/SQL *value-operand* position — inside a
+    /// PL/SQL value expression (`in_plsql_value_expression`) *and* directly after
+    /// a token that can only introduce an operand, never begin a statement: the
+    /// assignment `:=` / named-argument `=>`, a binary/comparison/arithmetic
+    /// operator, or a condition/value keyword (`IF`/`ELSIF`/`WHILE`/`RETURN`/
+    /// `RAISE`/`AND`/`OR`/`NOT`/`IN`/`LIKE`/`BETWEEN`). This is what lets the
+    /// expression-keyword allowlist run in General-context PL/SQL code (dropping
+    /// clause/statement keywords like `WHERE`/`WHILE`/`CREATE` that the flat base
+    /// dump would otherwise leak into `v := |`) without touching a *statement
+    /// start* (`BEGIN |`, `; |`, `THEN |`), where those statement keywords are
+    /// the valid completions.
+    at_plsql_value_operand: bool,
     /// Whether the cursor names a bind variable — the identifier directly after a
     /// `:` introducer (`WHERE c = :|`, `:b|`). A bind name is a free/session-bind
     /// identifier, never a column/relation/`*`/keyword, so the identifier base and
@@ -109,6 +121,7 @@ impl ExpressionKeywordContext {
             in_dml_value_position: false,
             prev_operand_type: PrecedingOperandType::Unknown,
             in_plsql_value_expression: false,
+            at_plsql_value_operand: false,
             at_bind_variable_name: false,
         }
     }
@@ -1807,6 +1820,23 @@ impl SqlEditorWidget {
                 !data.is_known_relation(suggestion) || data.is_language_function(&suggestion.to_ascii_uppercase(), db_type)
             });
         }
+        // The same flat-base keyword noise (`WHERE`/`WHILE`/`CREATE`/a stray
+        // `WHEN`/`THEN` after a closed `END CASE`, …) also leaks into a General-
+        // context PL/SQL value expression, which the `prefer_columns` allowlist
+        // above does not cover. Apply it here too, but only at a genuine value-
+        // *operand* position (`v := |`, `IF v > |`, `RETURN |`) — never at a block
+        // statement start, where `IF`/`LOOP`/`RETURN`/… are the valid keywords.
+        if !prefer_columns && expr_keyword_ctx.at_plsql_value_operand {
+            suggestions.retain(|suggestion| {
+                Self::expression_suggestion_is_relevant(
+                    data,
+                    suggestion,
+                    column_scope,
+                    db_type,
+                    expr_keyword_ctx,
+                )
+            });
+        }
         suggestions
     }
 
@@ -2181,6 +2211,24 @@ impl SqlEditorWidget {
             Some(SqlToken::Symbol(sym)) if sym == ":=" || sym == "=>"
         ) || Self::cursor_in_plsql_executable_block(tokens, end)
             || Self::cursor_in_call_argument_list(tokens, end);
+        // A value-operand position is one where the previous token can only
+        // introduce an operand — never begin a statement — so the expression
+        // keyword allowlist is safe to run without hiding the statement keywords
+        // valid at a block statement start (`BEGIN |`, `; |`, `THEN |`).
+        let at_plsql_value_operand = in_plsql_value_expression
+            && match Self::meaningful_tokens_before(tokens, end).last() {
+                Some(SqlToken::Symbol(sym)) => matches!(
+                    sym.as_str(),
+                    ":=" | "=>" | "=" | "<" | ">" | "<=" | ">=" | "<>" | "!=" | "^="
+                        | "+" | "-" | "*" | "/" | "||"
+                ),
+                Some(SqlToken::Word(word)) => matches!(
+                    word.to_ascii_uppercase().as_str(),
+                    "AND" | "OR" | "NOT" | "IN" | "LIKE" | "BETWEEN" | "MOD" | "XOR"
+                        | "DIV" | "RETURN" | "RAISE" | "IF" | "ELSIF" | "WHILE"
+                ),
+                _ => false,
+            };
         let at_bind_variable_name = matches!(
             Self::meaningful_tokens_before(tokens, end).last(),
             Some(SqlToken::Symbol(sym)) if sym == ":"
@@ -2197,6 +2245,7 @@ impl SqlEditorWidget {
             in_dml_value_position,
             prev_operand_type,
             in_plsql_value_expression,
+            at_plsql_value_operand,
             at_bind_variable_name,
         }
     }
@@ -4573,17 +4622,51 @@ impl SqlEditorWidget {
     /// plain `CASE`/`END` balance exact. This keeps `MERGE … SET c = CASE WHEN |`
     /// from being mistaken for a `WHEN MATCHED` merge-action slot.
     fn cursor_is_inside_unclosed_case(tokens: &[SqlToken], end: usize) -> bool {
-        let mut case_depth: usize = 0;
-        for token in tokens.get(..end).unwrap_or(tokens) {
-            if let SqlToken::Word(word) = token {
-                if word.eq_ignore_ascii_case("CASE") {
-                    case_depth += 1;
-                } else if word.eq_ignore_ascii_case("END") {
-                    case_depth = case_depth.saturating_sub(1);
+        // A bare `CASE … END` (SQL expression) and a PL/SQL `CASE … END CASE`
+        // statement both make `WHEN`/`THEN`/`ELSE` grammatical, but `END` is
+        // shared across every block construct: `END IF`/`END LOOP`/`END CASE`
+        // each close a *different* construct, and a bare `END` closes a `BEGIN`
+        // block or a SQL `CASE` expression. Naively counting every `END` as a
+        // `CASE` close (and every `CASE` word as an open) miscounts twice — the
+        // `CASE` in `END CASE` reopens a closed case, and the `END` in `END IF`
+        // closes a still-open enclosing case. Track a block stack instead and
+        // skip a qualified `END`'s keyword so it is read as one close, not a
+        // close plus a new construct. (SqlParserEngine models the same block
+        // structure, but over raw text lines rather than this token slice, so
+        // the token-level stack mirrors its model — as `cursor_in_plsql_
+        // executable_block` already does.)
+        #[derive(PartialEq)]
+        enum Block {
+            Case,
+            Other,
+        }
+        let toks = tokens.get(..end).unwrap_or(tokens);
+        let mut stack: Vec<Block> = Vec::new();
+        let mut idx = 0;
+        while idx < toks.len() {
+            if let SqlToken::Word(word) = &toks[idx] {
+                match word.to_ascii_uppercase().as_str() {
+                    "CASE" => stack.push(Block::Case),
+                    "IF" | "LOOP" | "BEGIN" => stack.push(Block::Other),
+                    "END" => {
+                        stack.pop();
+                        // A qualified `END IF`/`END LOOP`/`END CASE` consumes its
+                        // keyword; skip it so the qualifier is not re-read as the
+                        // start of a fresh construct.
+                        if let Some((next, next_idx)) =
+                            Self::next_word_upper_in_tokens(toks, idx + 1)
+                        {
+                            if matches!(next.as_str(), "IF" | "LOOP" | "CASE") {
+                                idx = next_idx;
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
+            idx += 1;
         }
-        case_depth > 0
+        stack.contains(&Block::Case)
     }
 
     /// MERGE merge-action slot right after `WHEN [NOT] MATCHED [AND <cond>]

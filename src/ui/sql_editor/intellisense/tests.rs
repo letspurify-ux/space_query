@@ -22305,6 +22305,80 @@ fn plsql_value_expression_suppresses_relations() {
     assert!(has(&s, "EMP"), "relation wrongly suppressed in a FROM position: {s:?}");
     let s = base_after("BEGIN IF 1 = 1 THEN SELECT * FROM e| ; END IF; END;");
     assert!(has(&s, "EMP"), "relation wrongly suppressed in an IF body FROM clause: {s:?}");
+
+    // The same flat-base *keyword* noise (clause/statement keywords, and a stray
+    // `WHEN`/`THEN` left over from a closed `END CASE`) must also be dropped at a
+    // PL/SQL value-*operand* position — not just relations.
+    for (sql, kw) in [
+        ("DECLARE v NUMBER; BEGIN v := wh| END;", "WHERE"),
+        ("DECLARE v NUMBER; BEGIN v := wh| END;", "WHILE"),
+        ("DECLARE v NUMBER; BEGIN v := v + cr| END;", "CREATE"),
+        ("DECLARE v NUMBER; BEGIN IF v > wh| THEN NULL; END IF; END;", "WHERE"),
+        // A closed `END CASE`/`END IF` must not leave the CASE body keywords
+        // grammatical at the following operand (the detector miscounted `END`).
+        ("DECLARE v NUMBER; BEGIN CASE WHEN v=1 THEN v:=2; END CASE; v := wh| END;", "WHEN"),
+        ("DECLARE v NUMBER; BEGIN CASE v WHEN 1 THEN v:=2; END CASE; v := th| END;", "THEN"),
+    ] {
+        let s = base_after(sql);
+        assert!(!has(&s, kw), "{kw} leaked into a PL/SQL value-operand position for `{sql}`: {s:?}");
+    }
+
+    // Operand material survives at a value-operand position: a function, an
+    // operand-starting keyword (`CASE`/`CAST`), and — inside a genuinely open
+    // `CASE` — the body keywords remain available.
+    assert!(has(&base_after("DECLARE v NUMBER; BEGIN v := ca| END;"), "CASE"),
+        "CASE starter dropped at a PL/SQL value-operand position");
+    assert!(has(&base_after("DECLARE v NUMBER; BEGIN v := CASE WHEN x > ca| THEN 1 END; END;"), "CAST"),
+        "operand starter dropped inside an open CASE expression");
+
+    // A *statement start* in a block is NOT a value-operand position: the
+    // statement keywords (`IF`/`LOOP`/`RETURN`) stay, never filtered away.
+    assert!(has(&base_after("DECLARE v NUMBER; BEGIN NULL; if| END;"), "IF"),
+        "IF wrongly filtered at a block statement start");
+    assert!(has(&base_after("DECLARE v NUMBER; BEGIN NULL; lo| END;"), "LOOP"),
+        "LOOP wrongly filtered at a block statement start");
+    assert!(has(&base_after("CREATE FUNCTION f RETURN NUMBER IS BEGIN re| END;"), "RETURN"),
+        "RETURN wrongly filtered at a block statement start");
+}
+
+/// `cursor_is_inside_unclosed_case` must read `END` the way PL/SQL does: a bare
+/// `END` closes a SQL `CASE` expression or a `BEGIN` block, while `END IF`/`END
+/// LOOP`/`END CASE` each close their own construct. The naive "every `END`
+/// closes a `CASE`, every `CASE` word opens one" count broke twice — the `CASE`
+/// in `END CASE` reopened a closed case, and the `END` in an inner `END IF`
+/// closed a still-open enclosing case.
+#[test]
+fn cursor_is_inside_unclosed_case_is_plsql_block_aware() {
+    fn inside_case(sql_with_cursor: &str) -> bool {
+        let cursor = sql_with_cursor.find('|').expect("cursor marker");
+        let sql = sql_with_cursor.replace('|', "");
+        let spans = super::query_text::tokenize_sql_spanned(&sql);
+        let end = spans.partition_point(|span| span.end <= cursor);
+        let tokens: Vec<SqlToken> = spans.into_iter().map(|span| span.token).collect();
+        SqlEditorWidget::cursor_is_inside_unclosed_case(&tokens, end)
+    }
+
+    // Inside an unclosed CASE (SQL expression or PL/SQL statement).
+    for sql in [
+        "SELECT CASE WHEN x = 1 th| FROM t",
+        "DECLARE v NUMBER; BEGIN CASE WHEN v = 1 THEN v := 2; el| END;",
+        "SELECT CASE WHEN x = 1 THEN CASE WHEN y = 2 th| END END FROM t",
+        // An inner `END IF` closes only the IF — the enclosing CASE stays open.
+        "DECLARE v NUMBER; BEGIN CASE WHEN v = 1 THEN IF v = 2 THEN v := 3; END IF; el| END;",
+    ] {
+        assert!(inside_case(sql), "cursor should be inside an open CASE for `{sql}`");
+    }
+
+    // Outside any open CASE.
+    for sql in [
+        "SELECT CASE WHEN x = 1 THEN 2 END, c| FROM t",
+        // A closed `END CASE` must not be read as a still-open case.
+        "DECLARE v NUMBER; BEGIN CASE WHEN v = 1 THEN v := 2; END CASE; v := c| END;",
+        // A bare `END IF` (no CASE at all) never opens one.
+        "DECLARE v NUMBER; BEGIN IF x THEN NULL; END IF; v := c| END;",
+    ] {
+        assert!(!inside_case(sql), "cursor should be outside any CASE for `{sql}`");
+    }
 }
 
 /// `CASE` is shared between a SQL `CASE` *expression* and a PL/SQL `CASE`
