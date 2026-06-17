@@ -7870,6 +7870,53 @@ mod dba_feature_tests {
             .unwrap_or_else(|err| panic!("unexpected error: {err}"));
         assert_eq!(target, "STANDBY01");
     }
+
+    /// An auto-terminated SQL*Plus command (`EXEC`/`EXECUTE`, …) is a real
+    /// execution unit, so the statement-bounds walker behind cursor execution must
+    /// produce a span for it. The engine used to finish such a command without
+    /// reporting a boundary, so it yielded a statement string but no span — and
+    /// Ctrl+Enter on an `EXEC` line hit "No SQL at cursor" (or ran an adjacent
+    /// statement). Each line below must resolve to its own bounds from a cursor
+    /// inside it.
+    #[test]
+    fn exec_command_has_statement_bounds_at_cursor() {
+        let db = Some(crate::db::connection::DatabaseType::Oracle);
+        let at = |sql: &str, cursor: usize| {
+            QueryExecutor::statement_at_cursor_for_db_type_with_mysql_delimiter(
+                sql, cursor, db, None,
+            )
+        };
+
+        // A lone EXEC resolves from anywhere on the line.
+        for sql in [
+            "EXEC my_proc",
+            "EXEC my_proc;",
+            "EXECUTE my_proc;",
+            "EXEC my_proc\n",
+        ] {
+            let cursor = sql.trim_end().len();
+            assert!(
+                at(sql, cursor).is_some_and(|s| s.to_ascii_uppercase().starts_with("EXEC")),
+                "EXEC should resolve to its own statement for `{sql:?}`, got {:?}",
+                at(sql, cursor)
+            );
+            assert!(
+                at(sql, 3).is_some(),
+                "cursor mid-EXEC should resolve for `{sql:?}`"
+            );
+        }
+
+        // With a neighbour, the cursor inside the EXEC picks the EXEC, not the
+        // adjacent statement.
+        let sql = "SELECT 1 FROM dual;\nEXEC my_proc";
+        let exec_cursor = sql.find("EXEC").unwrap() + 2;
+        assert_eq!(at(sql, exec_cursor).as_deref(), Some("EXEC my_proc"));
+        let sel_cursor = 3;
+        assert_eq!(at(sql, sel_cursor).as_deref(), Some("SELECT 1 FROM dual"));
+
+        let sql = "EXEC my_proc\nSELECT 1 FROM dual;";
+        assert_eq!(at(sql, 3).as_deref(), Some("EXEC my_proc"));
+    }
 }
 
 pub struct ObjectBrowser;

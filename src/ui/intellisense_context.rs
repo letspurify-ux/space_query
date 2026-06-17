@@ -1640,7 +1640,7 @@ fn sanitize_lock_table_alias(
     }
 }
 
-fn is_query_expression_start(tokens: &[SqlToken], start_idx: usize) -> bool {
+pub(crate) fn is_query_expression_start(tokens: &[SqlToken], start_idx: usize) -> bool {
     let mut idx = skip_comment_tokens(tokens, start_idx);
 
     while matches!(tokens.get(idx), Some(SqlToken::Symbol(sym)) if sym == "(") {

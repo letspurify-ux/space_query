@@ -4,6 +4,18 @@ struct AsyncIntellisenseParseResult {
     routine_cache: RoutineSymbolCacheEntry,
 }
 
+/// Grammatical placement of the unqualified select-list wildcard at the cursor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectListWildcardSlot {
+    /// A query's own select-list level: both `*` and every `t.*` are offered.
+    Full,
+    /// Inside an aggregate's argument right after `(`: only the bare `*`
+    /// (`COUNT(*)`) is offered.
+    CountStarOnly,
+    /// Inside a function/expression sub-paren: no wildcard is grammatical.
+    None,
+}
+
 /// Cursor-position facts that decide which keywords are grammatical at a
 /// value/column expression slot, so the base catalog can be filtered down to an
 /// allowlist of position-valid keywords instead of dumping the whole catalog.
@@ -45,6 +57,15 @@ struct ExpressionKeywordContext {
     /// type-specific postfix operators: `AT` (datetime), `COLLATE` (character),
     /// `MEMBER`/`SUBMULTISET`/`MULTISET` (collection).
     prev_operand_type: PrecedingOperandType,
+    /// Whether the cursor sits in a value expression where a table/view/synonym
+    /// name is never a valid operand — right after the assignment `:=` (`v := |`)
+    /// or named-argument `=>` (`proc(p => |)`), inside an `IF`/`ELSIF`/`WHILE`
+    /// control condition (`IF | THEN`), or inside a routine call's argument list
+    /// (`dbms_output.put_line(|)`). The relation entries the General-context base
+    /// would otherwise dump are dropped as noise (a variable, function, package or
+    /// literal still completes; in a column context the base has no relations, so
+    /// this is a no-op there).
+    in_plsql_value_expression: bool,
 }
 
 /// Best-effort type classification of the operand immediately before the cursor,
@@ -78,6 +99,7 @@ impl ExpressionKeywordContext {
             has_connect_by: false,
             in_dml_value_position: false,
             prev_operand_type: PrecedingOperandType::Unknown,
+            in_plsql_value_expression: false,
         }
     }
 }
@@ -1749,6 +1771,20 @@ impl SqlEditorWidget {
                 )
             });
         }
+        // A value expression (`v := |`, `proc(p => |)`, an `IF`/`WHILE` control
+        // condition, a routine call argument `f(|)`) admits a variable/function/
+        // literal but never a bare table/view/synonym. Only the General context
+        // dumps the whole relation catalog into the base (a column context offers
+        // scoped columns instead — some of which may be named like a table — so
+        // the filter is restricted to `!prefer_columns` to avoid dropping such a
+        // column). The relation names are pure noise here, while a variable,
+        // function, package or literal still completes; a name that is also a
+        // function/package is kept.
+        if !prefer_columns && expr_keyword_ctx.in_plsql_value_expression {
+            suggestions.retain(|suggestion| {
+                !data.is_known_relation(suggestion) || data.is_language_function(&suggestion.to_ascii_uppercase(), db_type)
+            });
+        }
         suggestions
     }
 
@@ -1946,6 +1982,93 @@ impl SqlEditorWidget {
         )
     }
 
+    /// True when the cursor sits in a PL/SQL control-flow *condition* — the
+    /// boolean header of `IF <cond> THEN`, `ELSIF <cond> THEN`, or `WHILE <cond>
+    /// LOOP`. Such a header is a pure boolean value expression: a variable,
+    /// function, literal or scalar `(SELECT …)` is grammatical, but a bare
+    /// table/view/synonym name never is. This reuses the same PL/SQL control-
+    /// keyword vocabulary the formatter relies on (`sql_text::is_plsql_control_*`)
+    /// so IntelliSense and the formatter classify these constructs identically,
+    /// without paying the cost of running the formatter's output state machine.
+    ///
+    /// Detection walks back from the cursor at the current paren level: the first
+    /// governing keyword decides it. `IF`/`ELSIF`/`WHILE` mean we are still in the
+    /// header; `THEN`/`LOOP`/a block boundary / a statement head / `;` mean we have
+    /// left it. Balanced sub-groups (a nested `CASE … END`, a `(…)`) are skipped by
+    /// depth so their inner `THEN` cannot end the scan early, while an unclosed
+    /// leading `(` (`IF (a OR |`) keeps the governing `IF` in view.
+    fn cursor_in_plsql_control_condition(tokens: &[SqlToken], end: usize) -> bool {
+        let mut depth = 0i32;
+        for token in Self::meaningful_tokens_before(tokens, end).iter().rev() {
+            match token {
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => depth += 1,
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => depth -= 1,
+                // A statement terminator at this level ends the search.
+                SqlToken::Symbol(sym) if sym == ";" && depth <= 0 => return false,
+                SqlToken::Word(word) if depth <= 0 => {
+                    let upper = word.to_ascii_uppercase();
+                    match upper.as_str() {
+                        "IF" | "ELSIF" | "WHILE" => return true,
+                        // Header is closed / we are in a body or another construct.
+                        "THEN" | "LOOP" | "ELSE" | "BEGIN" | "DECLARE" | "END" | "CASE"
+                        | "FOR" | "WHEN" => return false,
+                        // A SQL statement head means the cursor is in a SQL clause,
+                        // not a PL/SQL control header.
+                        _ if crate::sql_text::is_statement_head_keyword_upper(&upper) => {
+                            return false
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// True when the cursor sits inside a routine *call's* argument list —
+    /// `proc(|)`, `dbms_output.put_line(|)`, `pkg.fn(a, |)`. An argument is a
+    /// value expression, so a variable/function/literal completes but a bare
+    /// table/view/synonym never does. Detection finds the innermost still-open
+    /// `(`, requires it to be introduced by a routine name (a non-keyword
+    /// identifier immediately before it) and to not open a subquery (`fn(SELECT
+    /// …)` / `CURSOR(SELECT …)` keep relation completion for their inner query —
+    /// the same `is_query_expression_start` test the wildcard nesting uses).
+    fn cursor_in_call_argument_list(tokens: &[SqlToken], end: usize) -> bool {
+        let mut depth = 0i32;
+        let mut open_idx = None;
+        for idx in (0..end.min(tokens.len())).rev() {
+            match &tokens[idx] {
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => depth += 1,
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => {
+                    if depth == 0 {
+                        open_idx = Some(idx);
+                        break;
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+        let Some(open_idx) = open_idx else {
+            return false;
+        };
+        if intellisense_context::is_query_expression_start(tokens, open_idx + 1) {
+            return false;
+        }
+        // The token immediately before `(` must be a routine name: a plain
+        // identifier, not a keyword (which would mark an `IN (…)` / `VALUES (…)` /
+        // expression group rather than a call).
+        matches!(
+            tokens.get(..open_idx)
+                .unwrap_or(tokens)
+                .iter()
+                .rev()
+                .find(|token| !matches!(token, SqlToken::Comment(_))),
+            Some(SqlToken::Word(word)) if !Self::token_is_language_keyword(&word.to_ascii_uppercase())
+        )
+    }
+
     /// Gather the cursor-position facts that drive the expression-keyword
     /// allowlist for the current query. `data`/`column_scope` are consulted to
     /// infer the preceding operand's type for the type-gated postfix operators.
@@ -1994,6 +2117,11 @@ impl SqlEditorWidget {
         );
         let prev_operand_type =
             Self::preceding_operand_type(tokens, end, data, column_scope);
+        let in_plsql_value_expression = matches!(
+            Self::meaningful_tokens_before(tokens, end).last(),
+            Some(SqlToken::Symbol(sym)) if sym == ":=" || sym == "=>"
+        ) || Self::cursor_in_plsql_control_condition(tokens, end)
+            || Self::cursor_in_call_argument_list(tokens, end);
         ExpressionKeywordContext {
             inside_case,
             inside_window_spec,
@@ -2005,6 +2133,7 @@ impl SqlEditorWidget {
             has_connect_by,
             in_dml_value_position,
             prev_operand_type,
+            in_plsql_value_expression,
         }
     }
 
@@ -6196,6 +6325,53 @@ impl SqlEditorWidget {
         suggestions
     }
 
+    /// Where the unqualified select-list wildcards (`*`, `t.*`) are grammatical
+    /// relative to the cursor's paren nesting. They name a whole projection, so
+    /// they belong only at a query's own select-list level — the top level, or the
+    /// select list of a subquery whose `(` directly encloses the cursor — never as
+    /// a value inside a function-call / expression sub-paren (`f(…, |)`, `OVER
+    /// (PARTITION BY |)`), where the only surviving form is the bare `*` of an
+    /// aggregate `COUNT(*)` (cursor right after `(`). Distinguishing a subquery
+    /// paren from a function paren is what keeps `*`/`t.*` flowing into a nested
+    /// `… IN (SELECT | …)` while dropping the `emp.*` noise that leaked into every
+    /// `f(… , |)` argument.
+    fn select_list_wildcard_slot(tokens: &[SqlToken], end: usize) -> SelectListWildcardSlot {
+        // Find the innermost `(` still open at the cursor.
+        let mut depth = 0i32;
+        let mut open_idx = None;
+        for idx in (0..end.min(tokens.len())).rev() {
+            match &tokens[idx] {
+                SqlToken::Symbol(sym) if sym == ")" => depth += 1,
+                SqlToken::Symbol(sym) if sym == "(" => {
+                    if depth == 0 {
+                        open_idx = Some(idx);
+                        break;
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+        let Some(open_idx) = open_idx else {
+            // No enclosing paren: the statement's own select list.
+            return SelectListWildcardSlot::Full;
+        };
+        if intellisense_context::is_query_expression_start(tokens, open_idx + 1) {
+            // A subquery paren — the cursor is in that subquery's select list.
+            return SelectListWildcardSlot::Full;
+        }
+        // A function-call / expression paren: only `COUNT(*)`'s `*` survives, and
+        // only with the cursor sitting immediately after the `(`.
+        let cursor_right_after_open = Self::meaningful_tokens_before(tokens, end).last().is_some_and(
+            |token| matches!(token, SqlToken::Symbol(sym) if sym == "("),
+        );
+        if cursor_right_after_open {
+            SelectListWildcardSlot::CountStarOnly
+        } else {
+            SelectListWildcardSlot::None
+        }
+    }
+
     fn collect_clause_wildcard_suggestions(
         prefix: &str,
         qualifier: Option<&str>,
@@ -6225,18 +6401,33 @@ impl SqlEditorWidget {
                 push_candidate("*".to_string());
             }
             SelectListWildcardMode::Unqualified => {
-                push_candidate("*".to_string());
                 let current_query_tokens = Self::current_query_tokens(deep_ctx);
-                let current_query_tables =
-                    intellisense_context::collect_tables_in_statement(current_query_tokens);
-                for table_ref in current_query_tables {
-                    let scope_name = table_ref
-                        .alias
-                        .as_deref()
-                        .unwrap_or(table_ref.name.as_str());
-                    let rendered_scope = Self::render_select_list_wildcard_scope(scope_name);
-                    if !rendered_scope.is_empty() {
-                        push_candidate(format!("{rendered_scope}.*"));
+                let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+                let end = Self::expected_suggestion_context_end(
+                    current_query_tokens,
+                    cursor_token_len,
+                    !prefix.is_empty(),
+                );
+                match Self::select_list_wildcard_slot(current_query_tokens, end) {
+                    SelectListWildcardSlot::None => {}
+                    SelectListWildcardSlot::CountStarOnly => {
+                        push_candidate("*".to_string());
+                    }
+                    SelectListWildcardSlot::Full => {
+                        push_candidate("*".to_string());
+                        let current_query_tables =
+                            intellisense_context::collect_tables_in_statement(current_query_tokens);
+                        for table_ref in current_query_tables {
+                            let scope_name = table_ref
+                                .alias
+                                .as_deref()
+                                .unwrap_or(table_ref.name.as_str());
+                            let rendered_scope =
+                                Self::render_select_list_wildcard_scope(scope_name);
+                            if !rendered_scope.is_empty() {
+                                push_candidate(format!("{rendered_scope}.*"));
+                            }
+                        }
                     }
                 }
             }

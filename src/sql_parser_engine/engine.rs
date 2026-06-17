@@ -999,6 +999,14 @@ impl SqlParserEngine {
             self.append_current_str(line);
             self.append_current_char('\n');
             self.finish_current_statement();
+            // Report the synthetic end-of-line boundary so span-tracking callers
+            // (the statement-bounds walker behind cursor execution) record this
+            // auto-terminated command just like a normal terminator. Without it an
+            // `EXEC`/`EXECUTE` line produced a statement string but no span, so
+            // Ctrl+Enter on it hit "No SQL at cursor" (or ran an adjacent
+            // statement). The index points at the appended trailing '\n', which
+            // the observer maps to the end of the line.
+            on_statement_boundary(&scratch_chars, scratch_chars.len().saturating_sub(1));
             self.scratch_chars = scratch_chars;
             return;
         }

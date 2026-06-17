@@ -22025,6 +22025,46 @@ fn columns_suppressed_immediately_after_a_complete_operand() {
         "column prefix completion broke");
 }
 
+/// The unqualified select-list wildcard (`*`, `t.*`) belongs at a query's own
+/// select-list level, never inside a function-call / expression sub-paren. The
+/// regression: `SELECT TO_CHAR(x, |)` and `OVER (PARTITION BY |)` leaked `*` and
+/// `emp.*`. The aggregate `COUNT(*)` form (`*` right after `(`) and a nested
+/// subquery's own select list (`… IN (SELECT | …)`) must keep the wildcard.
+#[test]
+fn select_wildcard_respects_paren_nesting() {
+    fn wildcard(sql_with_cursor: &str) -> Vec<String> {
+        let cursor = sql_with_cursor.find('|').expect("cursor marker");
+        let sql = sql_with_cursor.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql_with_cursor);
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+        SqlEditorWidget::collect_clause_wildcard_suggestions(&prefix, None, &ctx)
+    }
+    let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
+
+    // A query's own select-list level keeps the full wildcard set.
+    assert!(has(&wildcard("SELECT | FROM emp"), "*"));
+    assert!(has(&wildcard("SELECT | FROM emp"), "emp.*"));
+    assert!(has(&wildcard("SELECT ename, | FROM emp"), "*"));
+    // A nested subquery's own select list keeps it too (correlation-aware).
+    assert!(has(&wildcard("SELECT * FROM emp WHERE deptno IN (SELECT | FROM dept)"), "*"));
+    assert!(has(&wildcard("SELECT (SELECT | FROM dept) FROM emp"), "*"));
+
+    // A function-call / expression sub-paren admits no projection wildcard.
+    for sql in [
+        "SELECT TO_CHAR(hiredate, |) FROM emp",
+        "SELECT SUBSTR(ename, |) FROM emp",
+        "SELECT COUNT(DISTINCT |) FROM emp",
+        "SELECT SUM(sal) OVER (PARTITION BY |) FROM emp",
+    ] {
+        assert!(wildcard(sql).is_empty(), "wildcard leaked into a sub-paren: {sql}");
+    }
+
+    // The aggregate `COUNT(*)` form survives — bare `*` only, no `t.*`.
+    let count = wildcard("SELECT COUNT(|) FROM emp");
+    assert!(has(&count, "*"), "COUNT(*) lost its star");
+    assert!(!has(&count, "emp.*"), "COUNT( must not offer a qualified wildcard");
+}
+
 /// A MERGE `WHEN |` / `WHEN NOT |` introducer is a keyword-only slot — only
 /// `MATCHED` / `NOT` are grammatical. The `ON (...)` condition before the first
 /// `WHEN` leaves the cursor in a column phase (`JoinCondition`), so without
@@ -22080,87 +22120,89 @@ fn merge_when_introducer_is_a_keyword_only_slot() {
     assert!(!suppresses(case_when), "CASE WHEN must keep its condition columns");
 }
 
-/// The slot after a set operator (`UNION`/`INTERSECT`/`EXCEPT`/`MINUS` and
-/// `UNION ALL`/`UNION DISTINCT`) only begins a new query block, so it offers
-/// `SELECT`/`ALL` — never a relation, column or function. The keyword emission
-/// and the identifier suppression share one helper so they cannot diverge.
+/// A PL/SQL value expression — the assignment `:=`, the named-argument `=>`, and
+/// an `IF`/`ELSIF`/`WHILE` control condition — admits a variable/function/literal
+/// but never a bare table/view/synonym. The General-context base used to dump the
+/// whole relation catalog there (`v := |` / `IF | THEN` → `EMP`, `DEPT`). Reuses
+/// the same PL/SQL control vocabulary the formatter relies on, and runs through
+/// the real `base_suggestions_for_context` apply path. Relations still complete
+/// where they are valid (a `FROM` clause, an embedded SQL statement).
 #[test]
-fn set_operator_slot_offers_only_query_block_keywords() {
-    let kw = |sql: &str, prefix: &str| {
-        let ctx = analyze_inline_cursor_sql(sql);
-        SqlEditorWidget::collect_expected_keyword_suggestions(prefix, &ctx, Some(crate::db::DatabaseType::Oracle))
-    };
-    let suppresses = |sql: &str| {
-        let ctx = analyze_inline_cursor_sql(sql);
-        let has_prefix = sql.find('|').is_some_and(|i| {
-            sql[..i].chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_')
-        });
-        SqlEditorWidget::cursor_is_after_set_operator_for_context(&ctx, has_prefix)
-    };
-
-    assert_eq!(kw("SELECT a FROM t UNION |", ""), vec!["SELECT".to_string(), "ALL".to_string()]);
-    assert_eq!(kw("SELECT a FROM t MINUS |", ""), vec!["SELECT".to_string(), "ALL".to_string()]);
-    assert_eq!(kw("SELECT a FROM t UNION ALL |", ""), vec!["SELECT".to_string()]);
-    // The slot suppresses the relation/identifier base.
-    for sql in ["SELECT a FROM t UNION |", "SELECT a FROM t INTERSECT |", "SELECT a FROM t UNION ALL |"] {
-        assert!(suppresses(sql), "set-operator slot must suppress identifiers: {sql}");
+fn plsql_value_expression_suppresses_relations() {
+    fn base_after(sql_with_cursor: &str) -> Vec<String> {
+        let cursor = sql_with_cursor.find('|').expect("cursor");
+        let sql = sql_with_cursor.replace('|', "");
+        let (routine_cache, expanded) =
+            SqlEditorWidget::build_routine_symbol_cache_bundle_for_test(&sql, cursor);
+        let analysis = SqlEditorWidget::build_intellisense_analysis_from_routine_cache(
+            &routine_cache,
+            expanded.cursor_in_statement,
+        );
+        let deep_ctx = analysis.context.clone();
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+        let context = SqlEditorWidget::classify_intellisense_context(
+            &deep_ctx,
+            deep_ctx.statement_tokens.as_ref(),
+        );
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["EMP".to_string(), "DEPT".to_string()];
+        data.set_columns_for_table("EMP", vec!["ENAME".into(), "EMPNO".into()]);
+        data.rebuild_indices();
+        let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &deep_ctx);
+        let expr_kw = SqlEditorWidget::expression_keyword_context(
+            &deep_ctx,
+            &data,
+            &column_tables,
+            !prefix.is_empty(),
+        );
+        SqlEditorWidget::base_suggestions_for_context(
+            &mut data,
+            &prefix,
+            None,
+            None,
+            false,
+            context,
+            false,
+            Some(crate::db::DatabaseType::Oracle),
+            expr_kw,
+        )
     }
-    // Inside the following SELECT list the slot is gone (a real column context).
-    assert!(!suppresses("SELECT a FROM t UNION SELECT | FROM s"));
-}
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
 
-/// In a `FROM` comma-list, a complete relation reference (the first table, a
-/// comma-separated one, with or without an implicit alias) is followed only by a
-/// further `JOIN`/`,`/clause or an implicit alias — never another bare relation.
-/// The relation list is suppressed there; it stays available where a relation is
-/// genuinely expected (`FROM |`, `FROM a, |`, and while a name is being typed).
-#[test]
-fn from_clause_suppresses_relations_after_a_complete_reference() {
-    let after = |sql: &str| {
-        let ctx = analyze_inline_cursor_sql(sql);
-        let has_prefix = sql.find('|').is_some_and(|i| {
-            sql[..i].chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_')
-        });
-        SqlEditorWidget::cursor_is_after_complete_from_relation_for_context(&ctx, has_prefix)
-    };
-
-    // After a complete reference / implicit alias → suppress.
+    // Assignment RHS, named-argument value, and IF/ELSIF/WHILE conditions: no
+    // relations.
     for sql in [
-        "SELECT * FROM emp |",
-        "SELECT * FROM emp e |",
-        "SELECT * FROM a, b |",
-        "SELECT * FROM scott.emp |",
+        "DECLARE v NUMBER; BEGIN v := |; END;",
+        "BEGIN proc(p => |); END;",
+        "DECLARE v NUMBER; BEGIN IF | THEN NULL; END IF; END;",
+        "DECLARE v NUMBER; BEGIN IF v > | THEN NULL; END IF; END;",
+        "DECLARE v NUMBER; BEGIN IF v = 1 THEN NULL; ELSIF | THEN NULL; END IF; END;",
+        "DECLARE v NUMBER; BEGIN WHILE | LOOP NULL; END LOOP; END;",
+        "DECLARE v NUMBER; BEGIN IF (v OR |) THEN NULL; END IF; END;",
+        // Routine call arguments are value positions too.
+        "BEGIN dbms_output.put_line(|); END;",
+        "BEGIN dbms_output.put_line('x' || |); END;",
+        "BEGIN my_proc(a, |); END;",
     ] {
-        assert!(after(sql), "expected relation suppression after a complete reference: {sql}");
+        let s = base_after(sql);
+        assert!(!has(&s, "EMP") && !has(&s, "DEPT"), "relations leaked into a PL/SQL value position for `{sql}`: {s:?}");
     }
-    // Where a relation is genuinely expected → not suppressed.
-    for sql in [
-        "SELECT * FROM |",
-        "SELECT * FROM emp, |",
-        "SELECT * FROM em|",
-        "SELECT * FROM emp JOIN |",
-    ] {
-        assert!(!after(sql), "relation completion must stay available: {sql}");
-    }
-}
 
-/// `ALTER TABLE <name> |` has its target named already, so an alteration clause
-/// (`ADD`/`MODIFY`/`DROP`/…) follows — never another relation. The name slot
-/// itself (`ALTER TABLE |`) and `DROP TABLE |` still complete relations.
-#[test]
-fn alter_table_target_slot_suppresses_a_second_relation() {
-    let after = |sql: &str| {
-        let ctx = analyze_inline_cursor_sql(sql);
-        let has_prefix = sql.find('|').is_some_and(|i| {
-            sql[..i].chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_')
-        });
-        SqlEditorWidget::cursor_is_after_complete_alter_table_target_for_context(&ctx, has_prefix)
-    };
+    // A call whose argument is itself a subquery keeps relation completion for
+    // that inner query.
+    let s = base_after("BEGIN open_cur(CURSOR(SELECT * FROM e|)); END;");
+    assert!(has(&s, "EMP"), "relation wrongly suppressed inside a call's subquery argument: {s:?}");
 
-    assert!(after("ALTER TABLE emp |"), "ALTER TABLE target slot must suppress relations");
-    assert!(after("ALTER TABLE scott.emp |"), "qualified ALTER TABLE target slot must suppress relations");
-    // The name slot itself and other statements still complete relations.
-    assert!(!after("ALTER TABLE |"), "ALTER TABLE name slot must still complete relations");
-    assert!(!after("DROP TABLE |"));
-    assert!(!after("ALTER TABLE em|"));
+    // A function name in the same slots is still offered (prefix-driven).
+    let s = base_after("DECLARE v NUMBER; BEGIN v := to_ch| ; END;");
+    assert!(has(&s, "TO_CHAR"), "function dropped from a PL/SQL value position: {s:?}");
+    let s = base_after("DECLARE v NUMBER; BEGIN IF to_ch| THEN NULL; END IF; END;");
+    assert!(has(&s, "TO_CHAR"), "function dropped from a PL/SQL condition: {s:?}");
+
+    // Relations still complete where they are valid: a FROM clause, and the IF
+    // *body* (an embedded SQL statement after THEN), not just the header.
+    let s = base_after("BEGIN SELECT * FROM e| ; END;");
+    assert!(has(&s, "EMP"), "relation wrongly suppressed in a FROM position: {s:?}");
+    let s = base_after("BEGIN IF 1 = 1 THEN SELECT * FROM e| ; END IF; END;");
+    assert!(has(&s, "EMP"), "relation wrongly suppressed in an IF body FROM clause: {s:?}");
 }
