@@ -479,31 +479,97 @@ fn referential_action_slot_suppresses_tables_and_offers_action_keywords() {
     ));
 }
 
-/// `<sort-key> [ASC|DESC] NULLS |` accepts only `FIRST`/`LAST`, so the ORDER BY
-/// column list is suppressed and the two ordering keywords are offered instead.
+/// ORDER BY sort modifier tails accept only the next fixed modifier keyword:
+/// `<sort-key> ASC|DESC |` -> `NULLS`,
+/// `<sort-key> [ASC|DESC] NULLS |` -> `FIRST`/`LAST`, and the completed
+/// `NULLS FIRST|LAST |` tail accepts no identifier until a comma starts the next
+/// key. The ORDER BY column list and the flat operand-start keyword dump are
+/// both suppressed there.
 #[test]
-fn order_by_nulls_slot_suppresses_columns_and_offers_first_last() {
+fn order_by_sort_modifier_slots_suppress_columns_and_offer_only_modifier_keywords() {
+    let kw = |sql: &str| {
+        let cursor = sql.find('|').expect("cursor marker");
+        let s = sql.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql);
+        let prefix = crate::ui::intellisense::get_word_at_cursor(&s, cursor).0;
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix,
+            &ctx,
+            Some(crate::db::DatabaseType::Oracle),
+        )
+    };
+
+    for sql in [
+        "SELECT * FROM t ORDER BY id ASC |",
+        "SELECT * FROM t ORDER BY id DESC |",
+        "SELECT * FROM t ORDER BY id ASC N|",
+        "SELECT a, b FROM t ORDER BY a ASC, b DESC |",
+    ] {
+        let cursor = sql.find('|').expect("cursor marker");
+        let s = sql.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql);
+        let has_prefix = !crate::ui::intellisense::get_word_at_cursor(&s, cursor).0.is_empty();
+        assert!(
+            SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(&ctx, has_prefix),
+            "suppression for `{sql}`"
+        );
+        assert_eq!(kw(sql), vec!["NULLS".to_string()], "for `{sql}`");
+    }
+
     for sql in [
         "SELECT * FROM t ORDER BY id NULLS |",
         "SELECT * FROM t ORDER BY id ASC NULLS |",
         "SELECT * FROM t ORDER BY id DESC NULLS |",
     ] {
+        let cursor = sql.find('|').expect("cursor marker");
+        let s = sql.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql);
+        let has_prefix = !crate::ui::intellisense::get_word_at_cursor(&s, cursor).0.is_empty();
+        assert!(
+            SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(&ctx, has_prefix),
+            "suppression for `{sql}`"
+        );
+        let suggestions = kw(sql);
+        assert!(suggestions.iter().any(|k| k == "FIRST"), "FIRST for `{sql}`");
+        assert!(suggestions.iter().any(|k| k == "LAST"), "LAST for `{sql}`");
+    }
+    assert_eq!(
+        kw("SELECT * FROM t ORDER BY id NULLS F|"),
+        vec!["FIRST".to_string()]
+    );
+    assert_eq!(
+        kw("SELECT * FROM t ORDER BY id DESC NULLS L|"),
+        vec!["LAST".to_string()]
+    );
+    for sql in [
+        "SELECT * FROM t ORDER BY id NULLS FIRST |",
+        "SELECT * FROM t ORDER BY id ASC NULLS LAST |",
+    ] {
         let ctx = analyze_inline_cursor_sql(sql);
         assert!(
             SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(&ctx, false),
-            "suppression for `{sql}`"
+            "completed modifier tail should suppress for `{sql}`"
         );
-        let kw = SqlEditorWidget::collect_expected_keyword_suggestions(
-            "",
-            &ctx,
-            Some(crate::db::DatabaseType::Oracle),
-        );
-        assert!(kw.iter().any(|k| k == "FIRST"), "FIRST for `{sql}`");
-        assert!(kw.iter().any(|k| k == "LAST"), "LAST for `{sql}`");
+        assert!(kw(sql).is_empty(), "no keyword should follow `{sql}`");
     }
-    // A qualified member named `nulls` (`t.nulls`) is a column, not the keyword.
+
+    // Lookalikes outside an ORDER BY sort modifier tail are untouched.
     assert!(!SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(
         &analyze_inline_cursor_sql("SELECT t.nulls | FROM t"),
+        false,
+    ));
+    assert!(kw("SELECT nulls | FROM t").is_empty());
+    assert!(kw("CREATE INDEX ix ON t (id ASC |").is_empty());
+    assert!(!SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(
+        &analyze_inline_cursor_sql("CREATE INDEX ix ON t (id ASC |"),
+        false,
+    ));
+    assert!(!SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(
+        &analyze_inline_cursor_sql("SELECT * FROM t ORDER BY id A|"),
+        true,
+    ));
+    assert!(!SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(
+        &analyze_inline_cursor_sql("SELECT * FROM t ORDER BY first |"),
         false,
     ));
 }
@@ -18329,8 +18395,18 @@ fn column_suppressing_keyword_slot_covers_every_family() {
     assert!(at("SELECT CAST(x AS |) FROM t")); // data type
     assert!(at("SELECT * FROM t ORDER BY id FETCH FIRST |")); // row limiting
     assert!(at("SELECT sum(x) OVER (ORDER BY d ROWS BETWEEN UNBOUNDED |) FROM t")); // window frame
+    assert!(at(
+        "SELECT sum(x) OVER (ORDER BY d ROWS BETWEEN UNBOUNDED PRECEDING |) FROM t"
+    )); // completed first frame bound
+    assert!(at("SELECT sum(x) OVER (ORDER BY d ROWS CURRENT ROW |) FROM t")); // completed frame bound
+    assert!(at(
+        "SELECT sum(x) OVER (ORDER BY d ROWS CURRENT ROW EXCLUDE NO |) FROM t"
+    )); // EXCLUDE tail
+    assert!(at("SELECT max(empno) KEEP (DENSE_RANK |) FROM emp")); // KEEP dense-rank slot
     assert!(at("SELECT EXTRACT(| FROM hire_date) FROM emp")); // EXTRACT field
     assert!(at("SELECT hire_date - INTERVAL '5' | FROM emp")); // INTERVAL unit
+    assert!(at("SELECT * FROM emp ORDER BY id ASC |")); // ORDER BY sort modifier
+    assert!(at("SELECT * FROM emp ORDER BY id NULLS FIRST |")); // completed sort modifier
     assert!(at("SELECT * FROM emp ORDER |")); // pure clause-keyword continuation
     assert!(at("SELECT * FROM a LEFT |")); // pure join-type continuation
     assert!(at("SELECT sum(x) OVER (PARTITION |) FROM t")); // window PARTITION BY
@@ -18383,6 +18459,9 @@ fn pure_clause_keyword_continuation_covers_every_family() {
     // clause body, a typed prefix, a qualified member column, a join-type word in
     // an expression, or a completed join target.
     assert!(!at("SELECT * FROM t ORDER BY |"));
+    assert!(!at("SELECT * FROM t ORDER BY id ASC |"));
+    assert!(!at("SELECT * FROM t ORDER BY id NULLS |"));
+    assert!(!at("SELECT * FROM t ORDER BY id NULLS FIRST |"));
     assert!(!at("SELECT | FROM t"));
     assert!(!at("SELECT * FROM t WHERE |"));
     assert!(!at("SELECT * FROM t |"));
@@ -20500,6 +20579,67 @@ fn window_frame_after_and_suggests_second_bound() {
 }
 
 #[test]
+fn window_frame_after_first_bound_suggests_and() {
+    assert_eq!(
+        window_frame_candidates(
+            "SELECT sum(x) OVER (ORDER BY d ROWS BETWEEN UNBOUNDED PRECEDING |) FROM t"
+        ),
+        Some(vec!["AND".into()])
+    );
+    assert_eq!(
+        window_frame_candidates(
+            "SELECT sum(x) OVER (ORDER BY d ROWS BETWEEN 5 PRECEDING |) FROM t"
+        ),
+        Some(vec!["AND".into()])
+    );
+}
+
+#[test]
+fn window_frame_after_complete_bound_suggests_exclude() {
+    assert_eq!(
+        window_frame_candidates("SELECT sum(x) OVER (ORDER BY d ROWS CURRENT ROW |) FROM t"),
+        Some(vec!["EXCLUDE".into()])
+    );
+    assert_eq!(
+        window_frame_candidates(
+            "SELECT sum(x) OVER (ORDER BY d ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW |) FROM t"
+        ),
+        Some(vec!["EXCLUDE".into()])
+    );
+}
+
+#[test]
+fn window_frame_exclude_tail_suggests_only_fixed_keywords() {
+    assert_eq!(
+        window_frame_candidates("SELECT sum(x) OVER (ORDER BY d ROWS CURRENT ROW EXCLUDE |) FROM t"),
+        Some(vec![
+            "CURRENT".into(),
+            "GROUP".into(),
+            "TIES".into(),
+            "NO".into()
+        ])
+    );
+    assert_eq!(
+        window_frame_candidates(
+            "SELECT sum(x) OVER (ORDER BY d ROWS CURRENT ROW EXCLUDE CURRENT |) FROM t"
+        ),
+        Some(vec!["ROW".into()])
+    );
+    assert_eq!(
+        window_frame_candidates(
+            "SELECT sum(x) OVER (ORDER BY d ROWS CURRENT ROW EXCLUDE NO |) FROM t"
+        ),
+        Some(vec!["OTHERS".into()])
+    );
+    assert_eq!(
+        window_frame_candidates(
+            "SELECT sum(x) OVER (ORDER BY d ROWS CURRENT ROW EXCLUDE NO OTHERS |) FROM t"
+        ),
+        Some(Vec::new())
+    );
+}
+
+#[test]
 fn window_frame_groups_unit_is_recognized() {
     assert_eq!(
         window_frame_candidates("SELECT sum(x) OVER (ORDER BY d GROUPS |) FROM t"),
@@ -20515,21 +20655,37 @@ fn window_frame_keyword_only_positions_suppress_columns() {
             false,
         )
     };
-    // `UNBOUNDED |` (-> PRECEDING/FOLLOWING) and `CURRENT |` (-> ROW) only accept
-    // a frame keyword, so columns are suppressed.
+    // Fixed frame keyword tails only accept frame keywords, so columns are
+    // suppressed.
     assert!(at("SELECT sum(x) OVER (ORDER BY d ROWS BETWEEN UNBOUNDED |) FROM t"));
     assert!(at("SELECT sum(x) OVER (ORDER BY d RANGE CURRENT |) FROM t"));
     assert!(at(
         "SELECT sum(x) OVER (ORDER BY d ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED |) FROM t"
+    ));
+    assert!(at(
+        "SELECT sum(x) OVER (ORDER BY d ROWS BETWEEN UNBOUNDED PRECEDING |) FROM t"
+    ));
+    assert!(at("SELECT sum(x) OVER (ORDER BY d ROWS CURRENT ROW |) FROM t"));
+    assert!(at(
+        "SELECT sum(x) OVER (ORDER BY d ROWS CURRENT ROW EXCLUDE |) FROM t"
+    ));
+    assert!(at(
+        "SELECT sum(x) OVER (ORDER BY d ROWS CURRENT ROW EXCLUDE CURRENT |) FROM t"
+    ));
+    assert!(at(
+        "SELECT sum(x) OVER (ORDER BY d ROWS CURRENT ROW EXCLUDE NO OTHERS |) FROM t"
     ));
     // Value-accepting frame slots keep columns visible (a bound may be an
     // expression, e.g. `ROWS 5 PRECEDING` / `RANGE BETWEEN x PRECEDING`).
     assert!(!at("SELECT sum(x) OVER (ORDER BY d ROWS |) FROM t"));
     assert!(!at("SELECT sum(x) OVER (ORDER BY d ROWS BETWEEN |) FROM t"));
     assert!(!at("SELECT sum(x) OVER (ORDER BY d ROWS BETWEEN UNBOUNDED PRECEDING AND |) FROM t"));
-    // A column named `unbounded`/`current` outside any window spec is unaffected.
+    // A column named `unbounded`/`current` outside any window spec, or inside the
+    // window ORDER BY before a frame unit, is unaffected.
     assert!(!at("SELECT unbounded | FROM t"));
     assert!(!at("SELECT current | FROM t"));
+    assert!(!at("SELECT sum(x) OVER (ORDER BY current |) FROM t"));
+    assert!(!at("SELECT sum(x) OVER (ORDER BY unbounded |) FROM t"));
 }
 
 #[test]
@@ -20575,6 +20731,18 @@ fn window_frame_unit_after_closed_over_does_not_trigger() {
 fn window_frame_current_after_closed_over_does_not_trigger() {
     assert_eq!(
         window_frame_candidates("SELECT count(*) OVER (), current | FROM t"),
+        None
+    );
+}
+
+#[test]
+fn window_frame_keywords_require_a_frame_unit() {
+    assert_eq!(
+        window_frame_candidates("SELECT sum(x) OVER (ORDER BY current |) FROM t"),
+        None
+    );
+    assert_eq!(
+        window_frame_candidates("SELECT sum(x) OVER (ORDER BY unbounded |) FROM t"),
         None
     );
 }
@@ -20750,6 +20918,7 @@ fn keyword_only_slots_suppress_the_identifier_base() {
         "SELECT INTERVAL '1' yea| FROM dual",
         "SELECT SUM(x) OVER (ORDER BY a ROWS UNBOUNDED prec|) FROM t",
         "SELECT x FROM t FETCH FIRST ro| ROWS ONLY",
+        "SELECT max(x) KEEP (DENSE_RANK fir|) FROM t",
     ];
     for sql in pure_keyword_slots {
         let ctx = analyze_inline_cursor_sql(sql);
@@ -21497,9 +21666,13 @@ fn row_count_positions_suppress_columns() {
     };
     // Row-count / offset value slots accept only integers/binds.
     assert!(at("SELECT * FROM orders ORDER BY id LIMIT |"));
+    assert!(at("SELECT * FROM orders LIMIT |"));
     assert!(at("SELECT * FROM orders LIMIT 10, |"));
     assert!(at("SELECT * FROM orders LIMIT 10 OFFSET |"));
     assert!(at("SELECT a FROM t OFFSET |"));
+    assert!(at("SELECT * FROM orders LIMIT 10 |"));
+    assert!(at("SELECT * FROM orders LIMIT 10 OFFSET 20 |"));
+    assert!(at("SELECT * FROM orders LIMIT 10, 20 |"));
     // The whole Oracle/ANSI FETCH/OFFSET row-limiting tail is a no-column zone:
     // count slots, unit slots, PERCENT, and the ONLY/WITH/TIES keyword slots all
     // collapse to OrderByClause yet never accept a column.
@@ -21510,13 +21683,37 @@ fn row_count_positions_suppress_columns() {
     assert!(at("SELECT * FROM emp ORDER BY empno FETCH FIRST 5 ROWS |"));
     assert!(at("SELECT * FROM emp ORDER BY empno FETCH FIRST 5 PERCENT |"));
     assert!(at("SELECT * FROM emp ORDER BY empno FETCH FIRST 5 ROWS WITH |"));
+    assert!(at("SELECT * FROM emp ORDER BY empno FETCH FIRST 5 ROWS ONLY |"));
+    assert!(at(
+        "SELECT * FROM emp ORDER BY empno FETCH FIRST 5 ROWS WITH TIES |"
+    ));
+    assert!(at(
+        "SELECT * FROM emp OFFSET 10 ROWS FETCH NEXT 5 ROWS ONLY |"
+    ));
     assert!(at("SELECT * FROM emp OFFSET 10 |"));
     assert!(at("SELECT * FROM emp OFFSET 10 ROWS |"));
+
+    let kw = |sql: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &analyze_inline_cursor_sql(sql),
+            Some(crate::db::DatabaseType::MySQL),
+        )
+    };
+    assert_eq!(
+        kw("SELECT * FROM orders LIMIT 10 |"),
+        vec!["OFFSET".to_string()]
+    );
+    assert!(kw("SELECT * FROM orders LIMIT 10 OFFSET 20 |").is_empty());
+    assert!(kw("SELECT limit 10 | FROM orders").is_empty());
+
     // Ordinary column positions are unaffected, including a `offset_*` column.
     assert!(!at("SELECT | FROM orders"));
     assert!(!at("SELECT a, | FROM orders"));
     assert!(!at("SELECT * FROM orders WHERE | "));
     assert!(!at("SELECT offset_days, | FROM t"));
+    assert!(!at("SELECT limit | FROM orders"));
+    assert!(!at("SELECT offset | FROM orders"));
     assert!(!at("SELECT * FROM orders ORDER BY |"));
 }
 
@@ -22143,6 +22340,47 @@ fn first_last_are_not_value_functions() {
     );
 }
 
+#[test]
+fn keep_dense_rank_keyword_slots_suppress_columns_and_offer_fixed_keywords() {
+    let kw = |sql: &str, prefix: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(crate::db::DatabaseType::Oracle),
+        )
+    };
+    let suppresses = |sql: &str| {
+        SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(
+            &analyze_inline_cursor_sql(sql),
+            false,
+        )
+    };
+
+    assert_eq!(
+        kw("SELECT max(empno) KEEP (DENSE_RANK |) FROM emp", ""),
+        vec!["FIRST".to_string(), "LAST".to_string()]
+    );
+    assert_eq!(
+        kw("SELECT max(empno) KEEP (DENSE_RANK fir|) FROM emp", "fir"),
+        vec!["FIRST".to_string()]
+    );
+    assert_eq!(
+        kw("SELECT max(empno) KEEP (DENSE_RANK FIRST |) FROM emp", ""),
+        vec!["ORDER".to_string()]
+    );
+    assert_eq!(
+        kw("SELECT max(empno) KEEP (DENSE_RANK LAST |) FROM emp", ""),
+        vec!["ORDER".to_string()]
+    );
+    assert!(suppresses("SELECT max(empno) KEEP (DENSE_RANK |) FROM emp"));
+    assert!(suppresses("SELECT max(empno) KEEP (DENSE_RANK FIRST |) FROM emp"));
+
+    // Outside KEEP's dense-rank aggregate syntax these words keep their normal
+    // meaning and do not become keyword-only slots.
+    assert!(!suppresses("SELECT dense_rank | FROM emp"));
+    assert!(kw("SELECT dense_rank | FROM emp", "").is_empty());
+}
+
 /// The top-level statement keywords (`SELECT`, `INSERT`, `CREATE`, `BEGIN`, …)
 /// are grammatical only where a new statement can begin. They must never appear
 /// mid-clause. The regression: `previous_meaningful_words_upper` stops at a
@@ -22759,47 +22997,4 @@ fn statement_start_drops_object_and_function_noise() {
         !blk.iter().any(|x| x.ends_with("()")),
         "a function call leaked into a PL/SQL statement start: {blk:?}"
     );
-}
-
-#[test]
-fn order_by_sort_direction_continuation_offers_only_nulls() {
-    // After a sort direction (`<key> ASC|DESC |`) the only grammatical keyword is
-    // `NULLS` (then FIRST/LAST), or a comma for the next key. The operand-start
-    // keyword dump (`NOT`/`NULL`/`NVL`/…) and the column list are both suppressed,
-    // mirroring how `NULLS |` already narrows to FIRST/LAST.
-    let kw = |sql: &str| {
-        let ctx = analyze_inline_cursor_sql(sql);
-        let cursor = sql.find('|').unwrap();
-        let prefix = crate::ui::intellisense::get_word_at_cursor(&sql.replace('|', ""), cursor).0;
-        SqlEditorWidget::collect_expected_keyword_suggestions(
-            &prefix, &ctx, Some(crate::db::DatabaseType::Oracle),
-        )
-    };
-    let suppressed = |sql: &str| {
-        let ctx = analyze_inline_cursor_sql(sql);
-        let prefix = sql.find('|').map(|c| {
-            crate::ui::intellisense::get_word_at_cursor(&sql.replace('|', ""), c).0
-        }).unwrap_or_default();
-        SqlEditorWidget::cursor_is_at_pure_clause_keyword_continuation_for_context(
-            &ctx, !prefix.is_empty(),
-        )
-    };
-
-    for sql in [
-        "SELECT * FROM emp ORDER BY sal ASC |",
-        "SELECT * FROM emp ORDER BY sal DESC |",
-        "SELECT * FROM emp ORDER BY sal ASC N|",
-        "SELECT a, b FROM emp ORDER BY a ASC, b DESC |",
-    ] {
-        assert_eq!(kw(sql), vec!["NULLS".to_string()], "for `{sql}`");
-        assert!(suppressed(sql), "identifier/operand list not suppressed for `{sql}`");
-    }
-
-    // An index column spec's `ASC`/`DESC` is not an ORDER BY — leave it alone (no
-    // `NULLS` hint, no suppression of the slot).
-    assert!(kw("CREATE INDEX ix ON emp (empno ASC |").is_empty());
-
-    // The still-typing direction position (`ORDER BY sal A|`) is the sort-key tail,
-    // not the post-direction slot — it still offers ASC/DESC/NULLS, not suppressed.
-    assert!(!suppressed("SELECT * FROM emp ORDER BY sal A|"));
 }

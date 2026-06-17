@@ -217,6 +217,53 @@ enum IntervalUnitSlot {
     Trailing,
 }
 
+/// Fixed keyword tail of an `ORDER BY` sort key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OrderBySortModifierSlot {
+    /// `<sort-key> ASC|DESC |` - only `NULLS` can follow before the next key.
+    AfterDirection,
+    /// `<sort-key> [ASC|DESC] NULLS |` - only `FIRST`/`LAST` can follow.
+    AfterNulls,
+    /// `<sort-key> [ASC|DESC] NULLS FIRST|LAST |` - the modifier tail is done.
+    AfterNullOrdering,
+}
+
+/// Keyword position within a window frame clause.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowFrameKeywordSlot {
+    /// `ROWS|RANGE|GROUPS |` - a bound expression may also follow.
+    AfterUnit,
+    /// `... BETWEEN |` - a bound expression may also follow.
+    AfterBetween,
+    /// `... BETWEEN <bound> AND |` - a bound expression may also follow.
+    AfterAnd,
+    /// `UNBOUNDED |` - only `PRECEDING`/`FOLLOWING`.
+    AfterUnbounded,
+    /// `CURRENT |` - only `ROW`.
+    AfterCurrent,
+    /// `... BETWEEN <first-bound> |` - only `AND`.
+    AfterFirstBound,
+    /// `<complete-frame-bound> |` - optionally `EXCLUDE`.
+    AfterFrameEnd,
+    /// `... EXCLUDE |` - only an exclusion kind.
+    AfterExclude,
+    /// `... EXCLUDE CURRENT |` - only `ROW`.
+    AfterExcludeCurrent,
+    /// `... EXCLUDE NO |` - only `OTHERS`.
+    AfterExcludeNo,
+    /// A complete `EXCLUDE ...` tail.
+    AfterExcludeEnd,
+}
+
+/// Keyword position inside Oracle `KEEP (DENSE_RANK FIRST|LAST ORDER BY ...)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeepDenseRankSlot {
+    /// `KEEP (DENSE_RANK |)` - only `FIRST`/`LAST`.
+    AfterDenseRank,
+    /// `KEEP (DENSE_RANK FIRST|LAST |)` - only `ORDER`.
+    AfterRankDirection,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExpectedObjectSuggestionKind {
     Any,
@@ -384,6 +431,47 @@ fn interval_unit_keywords_for(
             Some(DatabaseType::MariaDB) => &[],
         },
         IntervalUnitSlot::Trailing => ORACLE_TRAILING_UNITS,
+    }
+}
+
+fn order_by_sort_modifier_keywords(slot: OrderBySortModifierSlot) -> &'static [&'static str] {
+    match slot {
+        OrderBySortModifierSlot::AfterDirection => &["NULLS"],
+        OrderBySortModifierSlot::AfterNulls => &["FIRST", "LAST"],
+        OrderBySortModifierSlot::AfterNullOrdering => &[],
+    }
+}
+
+fn window_frame_keywords_for(slot: WindowFrameKeywordSlot) -> &'static [&'static str] {
+    match slot {
+        WindowFrameKeywordSlot::AfterUnit => &["BETWEEN", "UNBOUNDED", "CURRENT"],
+        WindowFrameKeywordSlot::AfterBetween | WindowFrameKeywordSlot::AfterAnd => {
+            &["UNBOUNDED", "CURRENT"]
+        }
+        WindowFrameKeywordSlot::AfterUnbounded => &["PRECEDING", "FOLLOWING"],
+        WindowFrameKeywordSlot::AfterCurrent => &["ROW"],
+        WindowFrameKeywordSlot::AfterFirstBound => &["AND"],
+        WindowFrameKeywordSlot::AfterFrameEnd => &["EXCLUDE"],
+        WindowFrameKeywordSlot::AfterExclude => &["CURRENT", "GROUP", "TIES", "NO"],
+        WindowFrameKeywordSlot::AfterExcludeCurrent => &["ROW"],
+        WindowFrameKeywordSlot::AfterExcludeNo => &["OTHERS"],
+        WindowFrameKeywordSlot::AfterExcludeEnd => &[],
+    }
+}
+
+fn window_frame_slot_suppresses_columns(slot: WindowFrameKeywordSlot) -> bool {
+    !matches!(
+        slot,
+        WindowFrameKeywordSlot::AfterUnit
+            | WindowFrameKeywordSlot::AfterBetween
+            | WindowFrameKeywordSlot::AfterAnd
+    )
+}
+
+fn keep_dense_rank_keywords(slot: KeepDenseRankSlot) -> &'static [&'static str] {
+    match slot {
+        KeepDenseRankSlot::AfterDenseRank => &["FIRST", "LAST"],
+        KeepDenseRankSlot::AfterRankDirection => &["ORDER"],
     }
 }
 
@@ -1089,10 +1177,12 @@ impl SqlEditorWidget {
         let restrict_to_relation_columns = completion_policy.restrict_to_relation_columns;
         // A keyword-only position accepts only a fixed keyword (or, for an alias
         // slot, a brand-new name), never an existing identifier — a clause-keyword
-        // continuation (`ORDER |`/`GROUP |`/`<join-type> |` …), the `IS [NOT] |`
-        // null-test operator, the slot right after a complete DML target table
-        // (`UPDATE t |` → `SET`, …), the slot right after a complete JOIN target
-        // table (`… JOIN t |` → `ON`/`USING`), or a table-clause alias-name slot
+        // continuation (`ORDER |`/`GROUP |`/`<join-type> |` …), an ORDER BY sort
+        // modifier tail (`ASC |` → `NULLS`, `NULLS |` → `FIRST`/`LAST`), the
+        // `IS [NOT] |` null-test operator, the slot right after a complete DML
+        // target table (`UPDATE t |` → `SET`, …), the slot right after a complete
+        // JOIN target table (`… JOIN t |` → `ON`/`USING`), or a table-clause
+        // alias-name slot
         // (`FROM t AS |`). The phase machine leaves the cursor in the surrounding
         // table/column phase there, so every identifier source (relations,
         // columns, in-scope aliases/CTEs, local PL/SQL symbols, `*`) must be
@@ -1106,7 +1196,9 @@ impl SqlEditorWidget {
         let at_keyword_only_identifier_slot = qualifier.is_none()
             && (Self::cursor_is_at_pure_clause_keyword_continuation_for_context(
                 deep_ctx, has_prefix,
-            ) || Self::cursor_is_at_is_null_test_keyword_position_for_context(deep_ctx, has_prefix)
+            ) || Self::order_by_sort_modifier_slot_for_context(deep_ctx, has_prefix).is_some()
+                || Self::keep_dense_rank_slot_for_context(deep_ctx, has_prefix).is_some()
+                || Self::cursor_is_at_is_null_test_keyword_position_for_context(deep_ctx, has_prefix)
                 || Self::cursor_is_after_complete_dml_target_for_context(deep_ctx, has_prefix)
                 || Self::cursor_is_after_complete_join_target_for_context(deep_ctx, has_prefix)
                 || Self::cursor_is_at_table_alias_name_slot(deep_ctx, has_prefix)
@@ -1508,13 +1600,13 @@ impl SqlEditorWidget {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             data.get_type_object_suggestions(&snapshot.prefix)
         } else if at_keyword_only_identifier_slot || at_keyword_only_slot {
-            // A pure keyword/value-only slot: a clause-keyword continuation,
-            // `IS [NOT] NULL`, a complete DML/JOIN target tail, a MERGE action,
-            // a `FOR`-locking keyword, an `EXTRACT` field, an `INTERVAL` unit, a
-            // window-frame keyword, or a row-limiting count. Only the slot's
-            // fixed keyword(s) are grammatical — supplied by the keyword merge
-            // below — so the identifier base (every relation, function, column
-            // and unrelated keyword) stays empty.
+            // A pure keyword/value-only slot: a clause-keyword continuation, an
+            // ORDER BY sort modifier tail, `IS [NOT] NULL`, a complete DML/JOIN
+            // target tail, a MERGE action, a `FOR`-locking keyword, an `EXTRACT`
+            // field, an `INTERVAL` unit, a window-frame keyword, or a row-
+            // limiting count. Only the slot's fixed keyword(s) are grammatical;
+            // supplied by the keyword merge below — so the identifier base (every
+            // relation, function, column and unrelated keyword) stays empty.
             Vec::new()
         } else {
             let mut data = intellisense_data
@@ -2199,7 +2291,9 @@ impl SqlEditorWidget {
                 "DECLARE" => stack.push(Frame::PendingDeclare),
                 "BEGIN" => {
                     if matches!(stack.last(), Some(Frame::PendingDeclare)) {
-                        *stack.last_mut().unwrap() = Frame::Begin;
+                        if let Some(last) = stack.last_mut() {
+                            *last = Frame::Begin;
+                        }
                     } else {
                         stack.push(Frame::Begin);
                     }
@@ -2494,7 +2588,11 @@ impl SqlEditorWidget {
                 "DECLARE" => stack.push(Frame::PendingDeclare),
                 "BEGIN" => {
                     if matches!(stack.last(), Some(Frame::PendingDeclare)) {
-                        *stack.last_mut().unwrap() = Frame::Block { in_exception: false };
+                        if let Some(last) = stack.last_mut() {
+                            *last = Frame::Block {
+                                in_exception: false,
+                            };
+                        }
                     } else {
                         stack.push(Frame::Block { in_exception: false });
                     }
@@ -3011,6 +3109,7 @@ impl SqlEditorWidget {
         end: usize,
     ) -> Option<&'static [&'static str]> {
         const FETCH_KEYWORDS: &[&str] = &["FETCH"];
+        const OFFSET_KEYWORDS: &[&str] = &["OFFSET"];
         const ROW_UNIT_KEYWORDS: &[&str] = &["ROW", "ROWS"];
         const ONLY_WITH_KEYWORDS: &[&str] = &["ONLY", "WITH"];
         const TIES_KEYWORDS: &[&str] = &["TIES"];
@@ -3092,8 +3191,16 @@ impl SqlEditorWidget {
             return Some(FETCH_KEYWORDS);
         }
 
-        if len >= 2 && word(2) == Some("OFFSET") && is_count(1) {
+        if len >= 2
+            && word(2) == Some("OFFSET")
+            && is_count(1)
+            && !(len >= 4 && word(4) == Some("LIMIT"))
+        {
             return Some(ROW_UNIT_KEYWORDS);
+        }
+
+        if len >= 2 && word(2) == Some("LIMIT") && is_count(1) {
+            return Some(OFFSET_KEYWORDS);
         }
 
         None
@@ -3106,22 +3213,23 @@ impl SqlEditorWidget {
     /// the statement (which misfires after a closed `OVER ()` on a column named
     /// `rows`/`current`/...). Paren depth is tracked so a `WINDOW` clause inside a
     /// subquery is recognized while a `WITH cte AS (...)` body is not.
-    fn cursor_is_inside_window_spec(tokens: &[SqlToken], end: usize) -> bool {
-        // Stack entry = whether this open paren is a window-specification paren.
-        let mut spec_paren_stack: Vec<bool> = Vec::new();
+    fn window_spec_open_paren_index(tokens: &[SqlToken], end: usize) -> Option<usize> {
+        // Stack entry = whether this open paren is a window-specification paren,
+        // plus the token index of the open paren.
+        let mut spec_paren_stack: Vec<(bool, usize)> = Vec::new();
         let mut last_word_was_over = false;
         let mut last_word_was_as = false;
         // Paren depth at which a `WINDOW` clause is currently open, so only the
         // `name AS (` parens belonging to that clause count as window specs.
         let mut window_clause_depth: Option<usize> = None;
-        for token in tokens.get(..end).unwrap_or(tokens) {
+        for (idx, token) in tokens.get(..end).unwrap_or(tokens).iter().enumerate() {
             let depth = spec_paren_stack.len();
             match token {
                 SqlToken::Comment(_) => {}
                 SqlToken::Symbol(sym) if sym == "(" => {
                     let is_window_spec = last_word_was_over
                         || (last_word_was_as && window_clause_depth == Some(depth));
-                    spec_paren_stack.push(is_window_spec);
+                    spec_paren_stack.push((is_window_spec, idx));
                     last_word_was_over = false;
                     last_word_was_as = false;
                 }
@@ -3151,7 +3259,13 @@ impl SqlEditorWidget {
                 }
             }
         }
-        spec_paren_stack.last().copied().unwrap_or(false)
+        spec_paren_stack
+            .last()
+            .and_then(|(is_window_spec, idx)| is_window_spec.then_some(*idx))
+    }
+
+    fn cursor_is_inside_window_spec(tokens: &[SqlToken], end: usize) -> bool {
+        Self::window_spec_open_paren_index(tokens, end).is_some()
     }
 
     /// True when the cursor sits at the very start of a window specification —
@@ -3377,83 +3491,104 @@ impl SqlEditorWidget {
             .is_some_and(|word| NAME_INTRODUCERS.contains(&word.as_str()))
     }
 
+    fn is_window_frame_unit(word: &str) -> bool {
+        matches!(word, "ROWS" | "RANGE" | "GROUPS")
+    }
+
+    fn window_spec_top_level_parts(tokens: &[SqlToken], end: usize) -> Option<Vec<String>> {
+        let open_idx = Self::window_spec_open_paren_index(tokens, end)?;
+        let depths = crate::ui::sql_depth::paren_depths(tokens);
+        let top_depth = crate::ui::sql_depth::depth_at(&depths, open_idx) + 1;
+        let mut parts = Vec::new();
+        for (idx, token) in tokens.iter().enumerate().take(end).skip(open_idx + 1) {
+            if crate::ui::sql_depth::depth_at(&depths, idx) != top_depth {
+                continue;
+            }
+            match token {
+                SqlToken::Word(word) => parts.push(word.to_ascii_uppercase()),
+                SqlToken::Symbol(sym) => parts.push(sym.clone()),
+                SqlToken::Comment(_) | SqlToken::String(_) => {}
+            }
+        }
+        Some(parts)
+    }
+
+    fn window_frame_tail_has_complete_bound(tail: &[String]) -> bool {
+        match tail {
+            [.., prev, last] if prev == "CURRENT" && last == "ROW" => true,
+            [.., last] if matches!(last.as_str(), "PRECEDING" | "FOLLOWING") => true,
+            _ => false,
+        }
+    }
+
+    fn window_frame_slot_from_tail(tail: &[String]) -> Option<WindowFrameKeywordSlot> {
+        if tail.is_empty() {
+            return Some(WindowFrameKeywordSlot::AfterUnit);
+        }
+        if let Some(exclude_idx) = tail.iter().rposition(|part| part == "EXCLUDE") {
+            return match &tail[exclude_idx + 1..] {
+                [] => Some(WindowFrameKeywordSlot::AfterExclude),
+                [word] if word == "CURRENT" => Some(WindowFrameKeywordSlot::AfterExcludeCurrent),
+                [word] if word == "NO" => Some(WindowFrameKeywordSlot::AfterExcludeNo),
+                [word] if matches!(word.as_str(), "GROUP" | "TIES") => {
+                    Some(WindowFrameKeywordSlot::AfterExcludeEnd)
+                }
+                [first, second] if first == "CURRENT" && second == "ROW" => {
+                    Some(WindowFrameKeywordSlot::AfterExcludeEnd)
+                }
+                [first, second] if first == "NO" && second == "OTHERS" => {
+                    Some(WindowFrameKeywordSlot::AfterExcludeEnd)
+                }
+                _ => None,
+            };
+        }
+        match tail.last().map(String::as_str) {
+            Some("UNBOUNDED") => return Some(WindowFrameKeywordSlot::AfterUnbounded),
+            Some("CURRENT") => return Some(WindowFrameKeywordSlot::AfterCurrent),
+            Some("BETWEEN") => return Some(WindowFrameKeywordSlot::AfterBetween),
+            Some("AND") if tail.first().is_some_and(|part| part == "BETWEEN") => {
+                return Some(WindowFrameKeywordSlot::AfterAnd);
+            }
+            _ => {}
+        }
+        if Self::window_frame_tail_has_complete_bound(tail) {
+            if tail.first().is_some_and(|part| part == "BETWEEN")
+                && !tail.iter().any(|part| part == "AND")
+            {
+                Some(WindowFrameKeywordSlot::AfterFirstBound)
+            } else {
+                Some(WindowFrameKeywordSlot::AfterFrameEnd)
+            }
+        } else {
+            None
+        }
+    }
+
+    fn window_frame_keyword_slot(tokens: &[SqlToken], end: usize) -> Option<WindowFrameKeywordSlot> {
+        let parts = Self::window_spec_top_level_parts(tokens, end)?;
+        let unit_idx = parts
+            .iter()
+            .rposition(|part| Self::is_window_frame_unit(part))?;
+        Self::window_frame_slot_from_tail(&parts[unit_idx + 1..])
+    }
+
     /// Window-frame keyword hints inside an `OVER (... ROWS|RANGE|GROUPS ...)`
-    /// clause. The sibling of `expected_row_limiting_keyword_candidates`: these
-    /// positions expect frame keywords (`BETWEEN`, `UNBOUNDED PRECEDING`,
-    /// `CURRENT ROW`, `PRECEDING`/`FOLLOWING`) rather than columns. Gated on the
-    /// cursor being inside a window specification (`OVER (...)` or `WINDOW name AS
-    /// (...)`) so a column named `rows`/`range`/`current`/`groups` outside a
-    /// window never triggers it.
+    /// clause. The classifier is anchored to the active frame unit inside the
+    /// current window-spec paren, so lookalike sort expressions such as
+    /// `ORDER BY current |` do not receive frame keywords.
     fn expected_window_frame_keyword_candidates(
         tokens: &[SqlToken],
         end: usize,
     ) -> Option<&'static [&'static str]> {
-        const FRAME_START: &[&str] = &["BETWEEN", "UNBOUNDED", "CURRENT"];
-        const FRAME_BOUND: &[&str] = &["UNBOUNDED", "CURRENT"];
-        const DIRECTION: &[&str] = &["PRECEDING", "FOLLOWING"];
-        const CURRENT_TAIL: &[&str] = &["ROW"];
-
-        if !Self::cursor_is_inside_window_spec(tokens, end) {
-            return None;
-        }
-
-        let words = Self::previous_meaningful_words_upper(tokens, end, 4);
-        let len = words.len();
-        let word = |from_end: usize| {
-            len.checked_sub(from_end)
-                .and_then(|idx| words.get(idx))
-                .map(String::as_str)
-        };
-        let is_frame_unit =
-            |w: Option<&str>| matches!(w, Some("ROWS") | Some("RANGE") | Some("GROUPS"));
-
-        // `UNBOUNDED |` -> PRECEDING / FOLLOWING
-        if word(1) == Some("UNBOUNDED") {
-            return Some(DIRECTION);
-        }
-        // `CURRENT |` -> ROW
-        if word(1) == Some("CURRENT") {
-            return Some(CURRENT_TAIL);
-        }
-        // `ROWS|RANGE|GROUPS BETWEEN |` -> first bound
-        if word(1) == Some("BETWEEN") && is_frame_unit(word(2)) {
-            return Some(FRAME_BOUND);
-        }
-        // `... BETWEEN <bound> AND |` -> second bound. Anchored on a frame-only
-        // marker so an ordinary `x BETWEEN a AND |` predicate is left untouched.
-        if word(1) == Some("AND")
-            && words.iter().any(|w| {
-                matches!(w.as_str(), "UNBOUNDED" | "PRECEDING" | "FOLLOWING" | "CURRENT")
-                    || is_frame_unit(Some(w.as_str()))
-            })
-        {
-            return Some(FRAME_BOUND);
-        }
-        // `ROWS|RANGE|GROUPS |` -> BETWEEN or a single bound
-        if is_frame_unit(word(1)) {
-            return Some(FRAME_START);
-        }
-
-        None
+        Self::window_frame_keyword_slot(tokens, end).map(window_frame_keywords_for)
     }
 
-    /// True when the cursor is at a window-frame slot that accepts *only* frame
-    /// keywords — `UNBOUNDED |` (-> PRECEDING/FOLLOWING) or `CURRENT |` (-> ROW).
-    /// A column or value is never valid in either spot in any dialect, so columns
-    /// are suppressed there. The other frame slots (`ROWS|RANGE|GROUPS |`,
-    /// `BETWEEN |`, `... AND |`) also accept a numeric/value bound (e.g. `ROWS 5
-    /// PRECEDING`, `RANGE BETWEEN INTERVAL '1' DAY PRECEDING`), so columns stay
-    /// visible there. Gated through `cursor_is_inside_window_spec` so a column
-    /// named `unbounded`/`current` outside a window never triggers it.
+    /// True when the cursor is at a window-frame slot that accepts only a fixed
+    /// frame keyword, never a column or value. Value-bound slots (`ROWS |`,
+    /// `BETWEEN |`, `... AND |`) keep columns visible; completed frame and
+    /// `EXCLUDE` tails suppress them until a delimiter or fixed keyword is typed.
     fn cursor_is_at_window_frame_keyword_only_position(tokens: &[SqlToken], end: usize) -> bool {
-        if !Self::cursor_is_inside_window_spec(tokens, end) {
-            return false;
-        }
-        let words = Self::previous_meaningful_words_upper(tokens, end, 1);
-        matches!(
-            words.last().map(String::as_str),
-            Some("UNBOUNDED") | Some("CURRENT")
-        )
+        Self::window_frame_keyword_slot(tokens, end).is_some_and(window_frame_slot_suppresses_columns)
     }
 
     fn cursor_is_at_window_frame_keyword_only_position_for_context(
@@ -3468,6 +3603,71 @@ impl SqlEditorWidget {
             exclude_current_identifier_chain,
         );
         Self::cursor_is_at_window_frame_keyword_only_position(tokens, end)
+    }
+
+    fn keep_dense_rank_top_level_words(tokens: &[SqlToken], end: usize) -> Option<Vec<String>> {
+        let mut paren_stack: Vec<(usize, Option<String>)> = Vec::new();
+        let mut last_word: Option<String> = None;
+        for (idx, token) in tokens.get(..end).unwrap_or(tokens).iter().enumerate() {
+            match token {
+                SqlToken::Comment(_) => {}
+                SqlToken::Symbol(sym) if sym == "(" => {
+                    paren_stack.push((idx, last_word.take()));
+                }
+                SqlToken::Symbol(sym) if sym == ")" => {
+                    paren_stack.pop();
+                    last_word = None;
+                }
+                SqlToken::Word(word) => last_word = Some(word.clone()),
+                _ => last_word = None,
+            }
+        }
+        let (open_idx, Some(preceding_word)) = paren_stack.last()? else {
+            return None;
+        };
+        if !preceding_word.eq_ignore_ascii_case("KEEP") {
+            return None;
+        }
+
+        let depths = crate::ui::sql_depth::paren_depths(tokens);
+        let top_depth = crate::ui::sql_depth::depth_at(&depths, *open_idx) + 1;
+        let mut words = Vec::new();
+        for (idx, token) in tokens.iter().enumerate().take(end).skip(open_idx + 1) {
+            if crate::ui::sql_depth::depth_at(&depths, idx) != top_depth {
+                continue;
+            }
+            if let SqlToken::Word(word) = token {
+                words.push(word.to_ascii_uppercase());
+            }
+        }
+        Some(words)
+    }
+
+    fn keep_dense_rank_slot(tokens: &[SqlToken], end: usize) -> Option<KeepDenseRankSlot> {
+        match Self::keep_dense_rank_top_level_words(tokens, end)?.as_slice() {
+            [word] if word == "DENSE_RANK" => Some(KeepDenseRankSlot::AfterDenseRank),
+            [dense_rank, direction]
+                if dense_rank == "DENSE_RANK"
+                    && matches!(direction.as_str(), "FIRST" | "LAST") =>
+            {
+                Some(KeepDenseRankSlot::AfterRankDirection)
+            }
+            _ => None,
+        }
+    }
+
+    fn keep_dense_rank_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> Option<KeepDenseRankSlot> {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::keep_dense_rank_slot(tokens, end)
     }
 
     /// The word immediately preceding the innermost still-open paren at the
@@ -4027,11 +4227,14 @@ impl SqlEditorWidget {
     /// value-only, where a column is never valid and must be suppressed. Every
     /// slot here has a matching keyword hint in `collect_expected_keyword_suggestions`;
     /// keeping the list in one predicate is what prevents column suppression and
-    /// keyword emission from drifting apart as new slots are added. Note window
-    /// frames contribute only their pure-keyword slots (`UNBOUNDED |`/`CURRENT |`):
-    /// the value-bound slots (`ROWS |`, `BETWEEN |`) still accept an expression,
-    /// so they emit keywords without suppressing columns and are intentionally
-    /// absent here.
+    /// keyword emission from drifting apart as new slots are added. ORDER BY sort
+    /// modifier tails (`ASC|DESC |`, `NULLS |`, `NULLS FIRST|LAST |`) are included
+    /// because the next sort key requires a comma; a bare operand is not
+    /// grammatical there. Note window frames contribute only their fixed-keyword
+    /// and completed-tail slots (`UNBOUNDED |`, `CURRENT |`, complete bounds,
+    /// `EXCLUDE |`); value-bound slots (`ROWS |`, `BETWEEN |`, `AND |`) still
+    /// accept an expression, so they emit keywords without suppressing columns
+    /// and are intentionally absent here.
     fn cursor_is_at_column_suppressing_keyword_slot(
         deep_ctx: &intellisense_context::CursorContext,
         exclude_current_identifier_chain: bool,
@@ -4049,6 +4252,8 @@ impl SqlEditorWidget {
                 deep_ctx,
                 exclude_current_identifier_chain,
             )
+            || Self::keep_dense_rank_slot_for_context(deep_ctx, exclude_current_identifier_chain)
+                .is_some()
             || Self::cursor_is_at_type_attribute_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
@@ -4057,6 +4262,11 @@ impl SqlEditorWidget {
                 .is_some()
             || Self::interval_unit_position_for_context(deep_ctx, exclude_current_identifier_chain)
                 .is_some()
+            || Self::order_by_sort_modifier_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
+            .is_some()
             || Self::cursor_is_at_pure_clause_keyword_continuation_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
@@ -4126,6 +4336,51 @@ impl SqlEditorWidget {
         Self::cursor_is_in_table_sample_clause(tokens, end)
     }
 
+    /// The fixed modifier tail after an `ORDER BY` sort key. Once a direction,
+    /// `NULLS`, or `NULLS FIRST|LAST` modifier has been written, another bare
+    /// operand is no longer grammatical until a comma starts the next key; only
+    /// the next modifier keyword, if any, can appear at the cursor. Scoped to
+    /// `OrderByClause` so lookalikes such as `CREATE INDEX ... (col ASC |)` keep
+    /// their own grammar, and qualified members (`t.nulls |`) stay column
+    /// references.
+    fn order_by_sort_modifier_slot(
+        tokens: &[SqlToken],
+        end: usize,
+        phase: intellisense_context::SqlPhase,
+    ) -> Option<OrderBySortModifierSlot> {
+        if !matches!(phase, intellisense_context::SqlPhase::OrderByClause)
+            || Self::trigger_word_is_qualified_member(tokens, end)
+        {
+            return None;
+        }
+        match Self::previous_meaningful_words_upper(tokens, end, 3).as_slice() {
+            [.., last] if matches!(last.as_str(), "ASC" | "DESC") => {
+                Some(OrderBySortModifierSlot::AfterDirection)
+            }
+            [.., last] if *last == "NULLS" => Some(OrderBySortModifierSlot::AfterNulls),
+            [.., prev, last]
+                if *prev == "NULLS" && matches!(last.as_str(), "FIRST" | "LAST") =>
+            {
+                Some(OrderBySortModifierSlot::AfterNullOrdering)
+            }
+            _ => None,
+        }
+    }
+
+    fn order_by_sort_modifier_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> Option<OrderBySortModifierSlot> {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::order_by_sort_modifier_slot(tokens, end, deep_ctx.phase)
+    }
+
     /// True when the cursor sits at a "pure clause-keyword continuation" slot:
     /// immediately after a clause-starter keyword whose only grammatical
     /// continuation is another fixed keyword, never an identifier. These are the
@@ -4162,24 +4417,10 @@ impl SqlEditorWidget {
         let words = Self::previous_meaningful_words_upper(tokens, end, 6);
         let trigger_is_qualified_member = Self::trigger_word_is_qualified_member(tokens, end);
         let in_table_context = deep_ctx.phase.is_table_context();
-        let in_order_by =
-            matches!(deep_ctx.phase, intellisense_context::SqlPhase::OrderByClause);
         match words.as_slice() {
             [.., last]
                 if !trigger_is_qualified_member
                     && (*last == "ORDER" || *last == "GROUP" || *last == "CONNECT") =>
-            {
-                true
-            }
-            // `<sort-key> ASC|DESC |` -> only `NULLS` (then FIRST/LAST), or a comma
-            // for the next key. A bare identifier/operand keyword is never valid
-            // after a sort direction, so the ORDER BY column list and the operand-
-            // start keyword dump are both suppressed; the `NULLS` hint is emitted
-            // by the matching arm in `collect_expected_keyword_suggestions`.
-            [.., last]
-                if !trigger_is_qualified_member
-                    && in_order_by
-                    && matches!(last.as_str(), "ASC" | "DESC") =>
             {
                 true
             }
@@ -4196,10 +4437,6 @@ impl SqlEditorWidget {
             }
             [.., prev, last] if *prev == "ORDER" && *last == "SIBLINGS" => true,
             [.., last] if !trigger_is_qualified_member && *last == "START" => true,
-            // `<sort-key> [ASC|DESC] NULLS |` -> FIRST / LAST. Only those two
-            // keywords are grammatical after NULLS, so the column list that the
-            // surrounding ORDER BY phase would otherwise offer is suppressed.
-            [.., last] if !trigger_is_qualified_member && *last == "NULLS" => true,
             // `... REFERENCES t (...) ON DELETE |` / `ON UPDATE |` -> a fixed
             // referential-action keyword (`CASCADE`, `SET NULL`, …), never a
             // relation. Anchored on the `ON` immediately before so a DML
@@ -4708,6 +4945,44 @@ impl SqlEditorWidget {
             && Self::cursor_word_is_alias_name_after_as(deep_ctx, exclude_current_identifier_chain)
     }
 
+    fn cursor_is_before_current_query_from_clause(tokens: &[SqlToken], end: usize) -> bool {
+        let depths = crate::ui::sql_depth::paren_depths(tokens);
+        let limit = end.min(tokens.len());
+        let is_top_level = |idx| crate::ui::sql_depth::is_top_level_depth(&depths, idx);
+
+        if tokens
+            .iter()
+            .enumerate()
+            .take(limit)
+            .any(|(idx, token)| {
+                is_top_level(idx)
+                    && matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("FROM"))
+            })
+        {
+            return false;
+        }
+
+        for (idx, token) in tokens.iter().enumerate().skip(limit) {
+            if !is_top_level(idx) {
+                continue;
+            }
+            match token {
+                SqlToken::Word(word) if word.eq_ignore_ascii_case("FROM") => return true,
+                SqlToken::Word(word)
+                    if matches!(
+                        word.to_ascii_uppercase().as_str(),
+                        "UNION" | "INTERSECT" | "EXCEPT" | "MINUS"
+                    ) =>
+                {
+                    return false;
+                }
+                SqlToken::Symbol(sym) if sym == ";" => return false,
+                _ => {}
+            }
+        }
+        false
+    }
+
     /// True when the cursor is at a row-count / offset argument — `LIMIT |`,
     /// `LIMIT <offset>, |`, or `OFFSET |`. These accept an integer literal or
     /// bind only, never a column, so column suggestions are suppressed there.
@@ -4743,9 +5018,17 @@ impl SqlEditorWidget {
     /// |`). The phase machine collapses all of these onto `OrderByClause`
     /// (a column context), so without this gate the row-limiting tail would
     /// wrongly offer columns alongside the row-limiting keyword hints.
-    fn cursor_is_in_row_limiting_clause(tokens: &[SqlToken], end: usize) -> bool {
+    fn cursor_is_in_row_limiting_clause(
+        tokens: &[SqlToken],
+        end: usize,
+        phase: intellisense_context::SqlPhase,
+    ) -> bool {
+        if Self::cursor_is_before_current_query_from_clause(tokens, end) {
+            return false;
+        }
         Self::cursor_is_at_row_count_position(tokens, end)
             || Self::expected_row_limiting_keyword_candidates(tokens, end).is_some()
+            || Self::cursor_is_after_complete_row_limiting_tail(tokens, end, phase)
     }
 
     fn cursor_is_in_row_limiting_clause_for_context(
@@ -4759,7 +5042,19 @@ impl SqlEditorWidget {
             cursor_token_len,
             exclude_current_identifier_chain,
         );
-        Self::cursor_is_in_row_limiting_clause(tokens, end)
+        if Self::cursor_is_before_current_query_from_clause(tokens, end) {
+            return false;
+        }
+        if Self::cursor_is_after_complete_row_limiting_tail(tokens, end, deep_ctx.phase) {
+            return true;
+        }
+        if !matches!(
+            deep_ctx.phase,
+            intellisense_context::SqlPhase::OrderByClause
+        ) {
+            return false;
+        }
+        Self::cursor_is_in_row_limiting_clause(tokens, end, deep_ctx.phase)
     }
 
     fn previous_meaningful_words_with_bind_markers_upper(
@@ -5425,9 +5720,16 @@ impl SqlEditorWidget {
         let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
         let context_end =
             Self::expected_suggestion_context_end(tokens, cursor_token_len, !prefix.is_empty());
-        if let Some(candidates) = Self::expected_row_limiting_keyword_candidates(tokens, context_end)
+        if matches!(
+            deep_ctx.phase,
+            intellisense_context::SqlPhase::OrderByClause
+        ) && !Self::cursor_is_before_current_query_from_clause(tokens, context_end)
         {
-            return Self::filter_expected_candidates(prefix, candidates);
+            if let Some(candidates) =
+                Self::expected_row_limiting_keyword_candidates(tokens, context_end)
+            {
+                return Self::filter_expected_candidates(prefix, candidates);
+            }
         }
 
         if let Some(candidates) =
@@ -5440,6 +5742,10 @@ impl SqlEditorWidget {
             Self::expected_window_spec_start_keyword_candidates(tokens, context_end)
         {
             return Self::filter_expected_candidates(prefix, candidates);
+        }
+
+        if let Some(slot) = Self::keep_dense_rank_slot(tokens, context_end) {
+            return Self::filter_expected_candidates(prefix, keep_dense_rank_keywords(slot));
         }
 
         if let Some(candidates) = Self::type_attribute_candidates(tokens, context_end) {
@@ -5480,6 +5786,12 @@ impl SqlEditorWidget {
                 prefix,
                 interval_unit_keywords_for(db_type, slot),
             );
+        }
+
+        if let Some(slot) =
+            Self::order_by_sort_modifier_slot(tokens, context_end, deep_ctx.phase)
+        {
+            return Self::filter_expected_candidates(prefix, order_by_sort_modifier_keywords(slot));
         }
 
         if let Some(candidates) =
@@ -5527,8 +5839,6 @@ impl SqlEditorWidget {
         // function named `left`/`right`/… (`SELECT left |`, `WHERE right |`) from
         // wrongly offering `JOIN`, while `FROM a LEFT |` stays in `FromClause`.
         let in_table_context = deep_ctx.phase.is_table_context();
-        let in_order_by =
-            matches!(deep_ctx.phase, intellisense_context::SqlPhase::OrderByClause);
         // A dual-use clause keyword (`ORDER`/`GROUP`/`CONNECT`/`START`) used as a
         // qualified member (`t.order `, `t.start `) is a column, so its `BY`/`WITH`
         // continuation must not be offered.
@@ -5572,19 +5882,6 @@ impl SqlEditorWidget {
             }
             [.., prev, last] if *prev == "ORDER" && *last == "SIBLINGS" => &["BY"],
             [.., last] if !trigger_is_qualified_member && *last == "START" => &["WITH"],
-            // `<sort-key> [ASC|DESC] NULLS |` -> FIRST / LAST (mirrors the
-            // matching suppression arm in the continuation predicate).
-            [.., last] if !trigger_is_qualified_member && *last == "NULLS" => &["FIRST", "LAST"],
-            // `<sort-key> ASC|DESC |` -> `NULLS` (mirrors the ORDER BY suppression
-            // arm). Scoped to the ORDER BY phase so an index column spec's `ASC`/
-            // `DESC` (`CREATE INDEX ... (col ASC)`) is left alone.
-            [.., last]
-                if !trigger_is_qualified_member
-                    && in_order_by
-                    && matches!(last.as_str(), "ASC" | "DESC") =>
-            {
-                &["NULLS"]
-            }
             // Foreign-key referential actions: `ON DELETE |` / `ON UPDATE |`. The
             // `ON UPDATE` slot additionally admits the MySQL column-default
             // `CURRENT_TIMESTAMP`. Anchored on `ON` so a DML `DELETE`/`UPDATE`
@@ -5755,6 +6052,92 @@ impl SqlEditorWidget {
 
     fn is_row_limit_unit(word: &str) -> bool {
         matches!(word, "ROW" | "ROWS")
+    }
+
+    fn fetch_row_limit_prefix_before_unit(
+        words: &[(String, bool)],
+        unit_from_end: usize,
+    ) -> bool {
+        let len = words.len();
+        let word = |from_end: usize| {
+            len.checked_sub(from_end)
+                .and_then(|idx| words.get(idx))
+                .map(|(value, _)| value.as_str())
+        };
+        let is_count = |from_end: usize| {
+            len.checked_sub(from_end)
+                .and_then(|idx| words.get(idx))
+                .is_some_and(|(value, is_bind)| Self::is_row_count_tail_word(value, *is_bind))
+        };
+
+        (word(unit_from_end + 1).is_some_and(Self::is_fetch_row_limit_direction)
+            && word(unit_from_end + 2) == Some("FETCH"))
+            || (is_count(unit_from_end + 1)
+                && word(unit_from_end + 2).is_some_and(Self::is_fetch_row_limit_direction)
+                && word(unit_from_end + 3) == Some("FETCH"))
+            || (word(unit_from_end + 1) == Some("PERCENT")
+                && is_count(unit_from_end + 2)
+                && word(unit_from_end + 3).is_some_and(Self::is_fetch_row_limit_direction)
+                && word(unit_from_end + 4) == Some("FETCH"))
+    }
+
+    /// True when a row-limiting clause is syntactically complete at the cursor
+    /// and therefore admits no bare identifier unless another clause delimiter is
+    /// written first. This complements `expected_row_limiting_keyword_candidates`,
+    /// which covers the intermediate slots that still have a fixed keyword
+    /// continuation (`ROWS |` -> `ONLY`/`WITH`, `LIMIT n |` -> `OFFSET`).
+    fn cursor_is_after_complete_row_limiting_tail(
+        tokens: &[SqlToken],
+        end: usize,
+        phase: intellisense_context::SqlPhase,
+    ) -> bool {
+        let words = Self::previous_meaningful_words_with_bind_markers_upper(tokens, end, 6);
+        let len = words.len();
+        let word = |from_end: usize| {
+            len.checked_sub(from_end)
+                .and_then(|idx| words.get(idx))
+                .map(|(value, _)| value.as_str())
+        };
+        let is_count = |from_end: usize| {
+            len.checked_sub(from_end)
+                .and_then(|idx| words.get(idx))
+                .is_some_and(|(value, is_bind)| Self::is_row_count_tail_word(value, *is_bind))
+        };
+
+        // ANSI/Oracle: `FETCH FIRST|NEXT [n [PERCENT]] ROWS ONLY`.
+        if word(1) == Some("ONLY")
+            && word(2).is_some_and(Self::is_row_limit_unit)
+            && Self::fetch_row_limit_prefix_before_unit(&words, 2)
+        {
+            return true;
+        }
+        // ANSI/Oracle: `FETCH FIRST|NEXT [n [PERCENT]] ROWS WITH TIES`.
+        if word(1) == Some("TIES")
+            && word(2) == Some("WITH")
+            && word(3).is_some_and(Self::is_row_limit_unit)
+            && Self::fetch_row_limit_prefix_before_unit(&words, 3)
+        {
+            return true;
+        }
+        if !matches!(phase, intellisense_context::SqlPhase::OrderByClause) {
+            return false;
+        }
+        // MySQL/MariaDB: `LIMIT count OFFSET offset`.
+        if len >= 4
+            && word(4) == Some("LIMIT")
+            && is_count(3)
+            && word(2) == Some("OFFSET")
+            && is_count(1)
+        {
+            return true;
+        }
+        // MySQL/MariaDB: `LIMIT offset, count` (commas are skipped by the word
+        // collector, so this deliberately also suppresses the invalid
+        // `LIMIT offset count` lookalike instead of leaking identifiers).
+        if len >= 3 && word(3) == Some("LIMIT") && is_count(2) && is_count(1) {
+            return true;
+        }
+        false
     }
 
     fn expected_object_suggestion_kind(
