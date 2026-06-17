@@ -1326,6 +1326,25 @@ SELECT 2 FROM dual;";
 }
 
 #[test]
+fn test_statement_bounds_at_cursor_keeps_first_exec_without_semicolon() {
+    let sql = "EXEC proc1\nEXEC proc2";
+    // Cursor sits right after the first EXEC line's last token (before the newline).
+    // EXEC is auto-terminated without a ';', so the inter-statement gap is just "\n";
+    // the cursor must still resolve to the first statement, not the second.
+    let cursor = "EXEC proc1".len();
+
+    let bounds = QueryExecutor::statement_bounds_at_cursor(sql, cursor)
+        .expect("expected statement bounds at end of first EXEC line");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert_eq!(
+        statement.trim(),
+        "EXEC proc1",
+        "cursor at end of first EXEC line must resolve to the first statement, got: {statement}"
+    );
+}
+
+#[test]
 fn test_statement_bounds_at_cursor_splits_around_tool_command_line() {
     let sql = "SELECT 1 FROM dual;\nPROMPT section\nSELECT 2 FROM dual;";
     let cursor = sql.rfind("2 FROM dual").unwrap_or(sql.len());

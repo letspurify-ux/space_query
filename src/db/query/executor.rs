@@ -1686,7 +1686,12 @@ impl QueryExecutor {
         cursor_pos: usize,
         next_start: usize,
     ) -> bool {
-        if gap_start >= next_start || cursor_pos < gap_start || cursor_pos >= next_start {
+        // `cursor_pos == gap_start` means the cursor sits exactly at the end of the
+        // previous statement's content, so it belongs to that statement — not the
+        // gap. Without `<=` here an auto-terminated command without a trailing ';'
+        // (e.g. two `EXEC` lines) leaves a whitespace-only gap that the empty-gap
+        // rule below would resolve to the *next* statement.
+        if gap_start >= next_start || cursor_pos <= gap_start || cursor_pos >= next_start {
             return false;
         }
 
