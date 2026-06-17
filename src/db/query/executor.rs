@@ -1586,11 +1586,16 @@ impl QueryExecutor {
         let line = &sql[line_start..line_end];
         let trimmed_line = line.trim();
 
-        if !trimmed_line.is_empty() && Self::parse_tool_command(trimmed_line).is_some() {
+        if !trimmed_line.is_empty()
+            && Self::parse_tool_command(trimmed_line).is_some()
+            && Self::line_starts_in_idle_lex_state(sql, line_start, preferred_db_type)
+        {
             return Some((line_start, line_end));
         }
 
-        let slash_line_start = if trimmed_line == "/" {
+        let slash_line_start = if trimmed_line == "/"
+            && Self::line_starts_in_idle_lex_state(sql, line_start, preferred_db_type)
+        {
             Some(line_start)
         } else {
             None
@@ -1602,6 +1607,37 @@ impl QueryExecutor {
             preferred_db_type,
             initial_mysql_delimiter,
         )
+    }
+
+    /// True when the lexer reaches `line_start` outside any string literal or
+    /// comment. This gates the standalone tool-command short-circuit so a line that
+    /// merely *looks* like a SQL*Plus command (e.g. `SET ECHO ON`) but actually sits
+    /// inside a multi-line string or block comment is not mistaken for one.
+    ///
+    /// Only the lexical mode is checked (not block/paren depth or statement
+    /// termination), because that is the sole question here and it stays correct
+    /// regardless of custom MySQL `DELIMITER`s, which the line-oriented engine does
+    /// not otherwise track.
+    fn line_starts_in_idle_lex_state(
+        sql: &str,
+        line_start: usize,
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
+    ) -> bool {
+        if line_start == 0 {
+            return true;
+        }
+        let Some(prefix) = sql.get(..line_start) else {
+            return true;
+        };
+        let mut engine = SqlParserEngine::new();
+        engine.set_mysql_mode(sql_text::mysql_compatibility_for_sql(
+            sql,
+            preferred_db_type,
+        ));
+        for line in prefix.split_inclusive('\n') {
+            engine.process_line(line.strip_suffix('\n').unwrap_or(line));
+        }
+        engine.is_idle()
     }
 
     #[cfg(test)]
@@ -1687,20 +1723,33 @@ impl QueryExecutor {
         next_start: usize,
     ) -> bool {
         // `cursor_pos == gap_start` means the cursor sits exactly at the end of the
-        // previous statement's content, so it belongs to that statement — not the
-        // gap. Without `<=` here an auto-terminated command without a trailing ';'
-        // (e.g. two `EXEC` lines) leaves a whitespace-only gap that the empty-gap
-        // rule below would resolve to the *next* statement.
+        // previous statement's content, so it belongs to that statement.
         if gap_start >= next_start || cursor_pos <= gap_start || cursor_pos >= next_start {
             return false;
+        }
+
+        // While the cursor is still on the previous statement's last line it belongs
+        // to that statement — whether that's trailing whitespace reached with the End
+        // key on an auto-terminated `EXEC` line without ';', or a trailing same-line
+        // comment. Only once the cursor crosses onto a later line does it become a
+        // candidate for the following statement. A gap with no newline at all sits
+        // entirely on that line, so it always stays with the previous statement.
+        match sql
+            .get(gap_start..next_start)
+            .and_then(|gap| gap.find('\n'))
+            .map(|rel| gap_start + rel)
+        {
+            Some(newline_pos) if cursor_pos <= newline_pos => return false,
+            None => return false,
+            _ => {}
         }
 
         let stripped_gap_start =
             Self::skip_leading_gap_terminator_for_bounds(sql, gap_start, next_start);
         if stripped_gap_start >= next_start {
-            return sql
-                .get(gap_start..next_start)
-                .is_some_and(|gap| gap.trim().is_empty());
+            // Blank line(s) with no comment content: prefer the following statement,
+            // matching the intentional blank-line-prefers-next behavior for routines.
+            return true;
         }
         if cursor_pos < stripped_gap_start {
             return false;

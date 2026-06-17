@@ -1326,30 +1326,112 @@ SELECT 2 FROM dual;";
 }
 
 #[test]
-fn zzz_probe_bounds_scan() {
-    let cases = [
-        ("two exec no semi", "EXEC a\nEXEC b"),
-        ("two exec semi", "EXEC a;\nEXEC b;"),
-        ("exec trailing spaces", "EXEC a   \nEXEC b"),
-        ("exec blank line gap", "EXEC a\n\nEXEC b"),
-        ("select no semi", "SELECT 1 FROM dual\nSELECT 2 FROM dual"),
-        ("select semi", "SELECT 1 FROM dual;\nSELECT 2 FROM dual;"),
-        ("leading comment next", "EXEC a\n-- doc for b\nEXEC b"),
-        ("trailing inline comment", "EXEC a -- note\nEXEC b"),
-    ];
-    for (label, sql) in cases {
-        eprintln!("\n=== {label}: {sql:?} ===");
-        for cursor in 0..=sql.len() {
-            if !sql.is_char_boundary(cursor) {
-                continue;
-            }
-            let stmt = QueryExecutor::statement_bounds_at_cursor(sql, cursor)
-                .map(|(s, e)| sql[s..e].trim().to_string())
-                .unwrap_or_else(|| "<none>".into());
-            let before = &sql[..cursor];
-            eprintln!("  cur={cursor:2} after={before:?} -> {stmt:?}");
-        }
-    }
+fn test_statement_bounds_at_cursor_ignores_tool_command_line_inside_string_literal() {
+    // A line that looks like a SQL*Plus command but sits inside a multi-line string
+    // literal must not be mistaken for a standalone tool command.
+    let sql = "SELECT 'x\nPROMPT hi\ny' FROM dual;\nSELECT 2 FROM dual;";
+    let cursor = sql.find("PROMPT hi").unwrap() + 2;
+
+    let bounds = QueryExecutor::statement_bounds_at_cursor_for_db_type(
+        sql,
+        cursor,
+        Some(crate::db::connection::DatabaseType::Oracle),
+    )
+    .expect("expected statement bounds for cursor inside string literal");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert!(
+        statement.starts_with("SELECT 'x"),
+        "cursor inside a string literal must resolve to the enclosing statement, got: {statement}"
+    );
+}
+
+#[test]
+fn test_statement_bounds_at_cursor_ignores_tool_command_line_inside_block_comment() {
+    // A line that looks like a SQL*Plus command but sits inside a block comment must
+    // not be executed as a tool command.
+    let sql = "/*\nSET ECHO ON\n*/\nSELECT 1 FROM dual;";
+    let cursor = sql.find("SET ECHO ON").unwrap() + 2;
+
+    let bounds = QueryExecutor::statement_bounds_at_cursor_for_db_type(
+        sql,
+        cursor,
+        Some(crate::db::connection::DatabaseType::Oracle),
+    )
+    .expect("expected statement bounds for cursor inside block comment");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert!(
+        !statement.contains("SET ECHO ON") || statement.contains("SELECT 1"),
+        "cursor inside a block comment must not resolve to the commented tool command, got: {statement}"
+    );
+    assert!(
+        statement.trim_start().starts_with("SELECT 1"),
+        "cursor inside a leading block comment should resolve to the following statement, got: {statement}"
+    );
+}
+
+#[test]
+fn test_statement_bounds_at_cursor_keeps_standalone_tool_command_line() {
+    // The standalone tool-command short-circuit must still work for genuine command
+    // lines at a statement boundary (including right after a PL/SQL `/` terminator).
+    let sql = "BEGIN NULL; END;\n/\nPROMPT hi\nSELECT 1 FROM dual;";
+    let cursor = sql.find("PROMPT hi").unwrap() + 2;
+
+    let bounds = QueryExecutor::statement_bounds_at_cursor_for_db_type(
+        sql,
+        cursor,
+        Some(crate::db::connection::DatabaseType::Oracle),
+    )
+    .expect("expected statement bounds for standalone tool command line");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert_eq!(
+        statement.trim(),
+        "PROMPT hi",
+        "cursor on a genuine standalone tool command line must resolve to it, got: {statement}"
+    );
+}
+
+#[test]
+fn test_statement_bounds_at_cursor_ignores_slash_line_inside_string_literal() {
+    // A lone `/` line inside a multi-line string literal is not a SQL*Plus PL/SQL
+    // terminator; the cursor must resolve to the enclosing statement.
+    let sql = "SELECT 'x\n/\ny' FROM dual;\nSELECT 2 FROM dual;";
+    let cursor = sql.find("\n/\n").unwrap() + 1;
+
+    let bounds = QueryExecutor::statement_bounds_at_cursor_for_db_type(
+        sql,
+        cursor,
+        Some(crate::db::connection::DatabaseType::Oracle),
+    )
+    .expect("expected statement bounds for `/` line inside string literal");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert!(
+        statement.starts_with("SELECT 'x"),
+        "`/` inside a string literal must resolve to the enclosing statement, got: {statement}"
+    );
+}
+
+#[test]
+fn test_statement_bounds_at_cursor_ignores_slash_line_inside_block_comment() {
+    // A lone `/` line inside a block comment is not a terminator either.
+    let sql = "/*\n/\n*/\nSELECT 1 FROM dual;";
+    let cursor = sql.find("\n/\n").unwrap() + 1;
+
+    let bounds = QueryExecutor::statement_bounds_at_cursor_for_db_type(
+        sql,
+        cursor,
+        Some(crate::db::connection::DatabaseType::Oracle),
+    )
+    .expect("expected statement bounds for `/` line inside block comment");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert!(
+        statement.trim_start().starts_with("SELECT 1"),
+        "`/` inside a block comment must resolve to the following statement, got: {statement}"
+    );
 }
 
 #[test]
@@ -1368,6 +1450,64 @@ fn test_statement_bounds_at_cursor_keeps_first_exec_without_semicolon() {
         statement.trim(),
         "EXEC proc1",
         "cursor at end of first EXEC line must resolve to the first statement, got: {statement}"
+    );
+}
+
+#[test]
+fn test_statement_bounds_at_cursor_keeps_first_exec_with_trailing_whitespace() {
+    // Trailing spaces on the first EXEC line, reachable with the End key. The
+    // cursor is still on the first statement's line, so it must resolve to the
+    // first statement even though the gap to the next statement is whitespace.
+    let sql = "EXEC proc1   \nEXEC proc2";
+    let cursor = "EXEC proc1   ".len();
+
+    let bounds = QueryExecutor::statement_bounds_at_cursor(sql, cursor)
+        .expect("expected statement bounds in first EXEC line trailing whitespace");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert_eq!(
+        statement.trim(),
+        "EXEC proc1",
+        "cursor in first EXEC line trailing whitespace must resolve to the first statement, got: {statement}"
+    );
+}
+
+#[test]
+fn test_statement_bounds_at_cursor_keeps_first_exec_with_trailing_block_comment() {
+    // A block comment trailing the first EXEC on the same line belongs to that
+    // statement, so a cursor inside it resolves to the first statement — unlike a
+    // leading block comment on its own line, which attaches to the next statement.
+    let sql = "EXEC proc1 /* note */\nEXEC proc2";
+    let cursor = "EXEC proc1 /* no".len();
+
+    let bounds = QueryExecutor::statement_bounds_at_cursor(sql, cursor)
+        .expect("expected statement bounds inside trailing block comment");
+    let statement = &sql[bounds.0..bounds.1];
+
+    // The trailing comment is trimmed from the span, but the cursor must still
+    // resolve to the first statement rather than EXEC proc2.
+    assert_eq!(
+        statement.trim(),
+        "EXEC proc1",
+        "cursor in first EXEC line trailing block comment must resolve to the first statement, got: {statement}"
+    );
+}
+
+#[test]
+fn test_statement_bounds_at_cursor_blank_line_gap_prefers_next_statement() {
+    // A cursor on a genuine blank line *between* two statements keeps preferring
+    // the following statement (intentional, matches the routine-gap behavior).
+    let sql = "EXEC proc1\n\nEXEC proc2";
+    let cursor = "EXEC proc1\n".len();
+
+    let bounds = QueryExecutor::statement_bounds_at_cursor(sql, cursor)
+        .expect("expected statement bounds on blank line gap");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert_eq!(
+        statement.trim(),
+        "EXEC proc2",
+        "cursor on blank line between statements must resolve to the next statement, got: {statement}"
     );
 }
 
