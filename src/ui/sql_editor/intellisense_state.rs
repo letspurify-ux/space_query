@@ -127,6 +127,20 @@ impl IntellisenseRuntimeState {
         self.set_pending_intellisense(None);
     }
 
+    /// Re-point an in-flight async refresh at a new cursor without creating one.
+    /// The fast-path filter advances the caret while a column load is still
+    /// pending; without this the load-completion refresh (which carries the
+    /// late-arriving suggestions) would no longer match the caret and be lost.
+    pub(crate) fn retarget_pending_intellisense(&self, cursor_pos: i32) {
+        let mut guard = self
+            .pending_intellisense
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(pending) = guard.as_mut() {
+            pending.cursor_pos = cursor_pos;
+        }
+    }
+
     pub(crate) fn clear_ui_tracking(&self) {
         self.clear_completion_range();
         self.clear_pending_intellisense();

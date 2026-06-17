@@ -4018,6 +4018,32 @@ fn navigation_shortcut_clears_pending_even_when_popup_not_visible() {
 }
 
 #[test]
+fn retarget_pending_intellisense_moves_caret_in_place() {
+    // The fast-path filter advances the caret while a column load is still in
+    // flight; retargeting keeps the load-completion refresh matching the new
+    // caret so late-arriving comparison suggestions are still applied.
+    let runtime = runtime_state_for_test(Some((4, 8)), Some(PendingIntellisense { cursor_pos: 8 }), 0, 0);
+
+    runtime.retarget_pending_intellisense(9);
+
+    assert_eq!(
+        runtime.pending_intellisense().map(|pending| pending.cursor_pos),
+        Some(9)
+    );
+}
+
+#[test]
+fn retarget_pending_intellisense_is_noop_without_pending_refresh() {
+    // No load is in flight (suggestions were complete): retargeting must not
+    // fabricate a refresh that would needlessly rebuild the popup.
+    let runtime = runtime_state_for_test(Some((4, 8)), None, 0, 0);
+
+    runtime.retarget_pending_intellisense(9);
+
+    assert!(runtime.pending_intellisense().is_none());
+}
+
+#[test]
 fn escape_keydown_consumes_when_popup_is_visible() {
     let runtime = runtime_state_for_test(
         Some((1, 3)),

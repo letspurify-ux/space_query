@@ -917,7 +917,18 @@ impl SqlEditorWidget {
                     };
 
                     if fast_path_applied {
-                        intellisense_runtime_for_handle.clear_pending_intellisense();
+                        // The fast path only filters the open popup; it never
+                        // re-runs analysis. If a column load is still in flight
+                        // (e.g. the other-table columns backing a qualified `=`
+                        // comparison suggestion), keep its pending refresh alive
+                        // and re-point it at the new caret so the load-completion
+                        // refresh still matches. Clearing it here permanently
+                        // dropped those late suggestions until the user deleted
+                        // and retyped.
+                        let (normalized_cursor, _) =
+                            Self::editor_cursor_position(ed, &buffer_for_handle);
+                        intellisense_runtime_for_handle
+                            .retarget_pending_intellisense(normalized_cursor);
                         Self::invalidate_keyup_debounce_with_parse_generation(
                             &intellisense_runtime_for_handle,
                             true,

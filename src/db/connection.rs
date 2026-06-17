@@ -54,6 +54,14 @@ fn ensure_oracle_thin_connect_logger_installed() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
         let _ = tns_thin::set_connect_phase_logger(Box::new(|phase, detail| {
+            // The crate emits a phase event for every TTC round-trip, including
+            // the high-frequency data-plane ones (fetch/execute/commit/...) that
+            // fire on every statement and row batch. Those would flood the log,
+            // so keep only the connect/auth establishment phases this logger
+            // exists to diagnose.
+            if is_oracle_thin_runtime_phase(phase) {
+                return;
+            }
             let message = if detail.is_empty() {
                 phase.to_string()
             } else {
@@ -62,6 +70,18 @@ fn ensure_oracle_thin_connect_logger_installed() {
             logging::log_info("oracle_thin/connect", &message);
         }));
     });
+}
+
+/// True for the per-statement / per-fetch TTC phases that fire on every query,
+/// row batch, commit, rollback, ping or logoff. None of these occur during the
+/// connect/auth handshake, so dropping them keeps connect diagnostics intact.
+fn is_oracle_thin_runtime_phase(phase: &str) -> bool {
+    phase.contains("fetch")
+        || phase.contains("execute")
+        || phase.contains("commit")
+        || phase.contains("rollback")
+        || phase.contains("ping")
+        || phase.contains("logoff")
 }
 
 fn apply_oracle_thin_protocol_env(config: &mut OracleThinConfig) -> Result<(), String> {

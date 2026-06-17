@@ -1326,6 +1326,33 @@ SELECT 2 FROM dual;";
 }
 
 #[test]
+fn zzz_probe_bounds_scan() {
+    let cases = [
+        ("two exec no semi", "EXEC a\nEXEC b"),
+        ("two exec semi", "EXEC a;\nEXEC b;"),
+        ("exec trailing spaces", "EXEC a   \nEXEC b"),
+        ("exec blank line gap", "EXEC a\n\nEXEC b"),
+        ("select no semi", "SELECT 1 FROM dual\nSELECT 2 FROM dual"),
+        ("select semi", "SELECT 1 FROM dual;\nSELECT 2 FROM dual;"),
+        ("leading comment next", "EXEC a\n-- doc for b\nEXEC b"),
+        ("trailing inline comment", "EXEC a -- note\nEXEC b"),
+    ];
+    for (label, sql) in cases {
+        eprintln!("\n=== {label}: {sql:?} ===");
+        for cursor in 0..=sql.len() {
+            if !sql.is_char_boundary(cursor) {
+                continue;
+            }
+            let stmt = QueryExecutor::statement_bounds_at_cursor(sql, cursor)
+                .map(|(s, e)| sql[s..e].trim().to_string())
+                .unwrap_or_else(|| "<none>".into());
+            let before = &sql[..cursor];
+            eprintln!("  cur={cursor:2} after={before:?} -> {stmt:?}");
+        }
+    }
+}
+
+#[test]
 fn test_statement_bounds_at_cursor_keeps_first_exec_without_semicolon() {
     let sql = "EXEC proc1\nEXEC proc2";
     // Cursor sits right after the first EXEC line's last token (before the newline).
