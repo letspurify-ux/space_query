@@ -999,14 +999,25 @@ impl SqlParserEngine {
             self.append_current_str(line);
             self.append_current_char('\n');
             self.finish_current_statement();
-            // Report the synthetic end-of-line boundary so span-tracking callers
-            // (the statement-bounds walker behind cursor execution) record this
-            // auto-terminated command just like a normal terminator. Without it an
-            // `EXEC`/`EXECUTE` line produced a statement string but no span, so
-            // Ctrl+Enter on it hit "No SQL at cursor" (or ran an adjacent
-            // statement). The index points at the appended trailing '\n', which
-            // the observer maps to the end of the line.
-            on_statement_boundary(&scratch_chars, scratch_chars.len().saturating_sub(1));
+            // Report a boundary so span-tracking callers (the statement-bounds
+            // walker behind cursor execution) record this auto-terminated command
+            // just like a normal terminator. Without it an `EXEC`/`EXECUTE` line
+            // produced a statement string but no span, so Ctrl+Enter on it hit
+            // "No SQL at cursor" (or ran an adjacent statement).
+            //
+            // Point the boundary at the trailing ';' terminator when present so
+            // the span excludes it, exactly like a real ';'-terminated statement.
+            // Keeping the ';' inside the span left the inter-statement gap empty
+            // (whitespace only), and the empty-gap rule then resolved a cursor
+            // sitting right after `EXEC foo;` to the *next* statement instead of
+            // this one. Otherwise (no ';', e.g. SET/SPOOL) fall back to the
+            // appended trailing '\n', which the observer maps to end of line.
+            let boundary_idx = scratch_chars
+                .iter()
+                .rposition(|ch| !ch.is_whitespace())
+                .filter(|&idx| scratch_chars[idx] == ';')
+                .unwrap_or_else(|| scratch_chars.len().saturating_sub(1));
+            on_statement_boundary(&scratch_chars, boundary_idx);
             self.scratch_chars = scratch_chars;
             return;
         }

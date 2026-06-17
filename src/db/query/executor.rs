@@ -7917,6 +7917,37 @@ mod dba_feature_tests {
         let sql = "EXEC my_proc\nSELECT 1 FROM dual;";
         assert_eq!(at(sql, 3).as_deref(), Some("EXEC my_proc"));
     }
+
+    /// A cursor sitting right after the `;` of an `EXEC`/`EXECUTE` command must
+    /// resolve to that command, not the following statement. The auto-terminated
+    /// command's span used to include its trailing `;`, leaving the gap to the
+    /// next statement empty, so Ctrl+Enter/F9 ran the *next* `EXEC`. Normal
+    /// `;`-terminated statements never had this problem because their `;` lives
+    /// in the gap; this test pins EXEC to the same behaviour.
+    #[test]
+    fn exec_cursor_after_semicolon_picks_previous_statement() {
+        let db = Some(crate::db::connection::DatabaseType::Oracle);
+        let at = |sql: &str, cursor: usize| {
+            QueryExecutor::statement_at_cursor_for_db_type_with_mysql_delimiter(
+                sql, cursor, db, None,
+            )
+        };
+
+        // Two EXEC statements; cursor right after the first ';'.
+        let sql = "exec proc_a;\nexec proc_b;";
+        let after_first_semi = sql.find(';').unwrap() + 1;
+        assert_eq!(at(sql, after_first_semi).as_deref(), Some("exec proc_a"));
+
+        // EXECUTE spelled out, same expectation.
+        let sql = "EXECUTE proc_a;\nEXECUTE proc_b;";
+        let after_first_semi = sql.find(';').unwrap() + 1;
+        assert_eq!(at(sql, after_first_semi).as_deref(), Some("EXECUTE proc_a"));
+
+        // EXEC followed by a normal query: cursor after EXEC's ';' stays on EXEC.
+        let sql = "exec proc_a;\nselect 1 from dual;";
+        let after_first_semi = sql.find(';').unwrap() + 1;
+        assert_eq!(at(sql, after_first_semi).as_deref(), Some("exec proc_a"));
+    }
 }
 
 pub struct ObjectBrowser;
