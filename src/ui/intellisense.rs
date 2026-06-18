@@ -1368,6 +1368,20 @@ impl IntellisenseData {
         )
     }
 
+    pub fn get_column_owner_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
+        self.ensure_base_indices();
+        Self::suggestions_from_entry_groups(
+            prefix,
+            &[
+                &self.table_entries,
+                &self.view_entries,
+                &self.materialized_view_entries,
+                &self.synonym_entries,
+                &self.public_synonym_entries,
+            ],
+        )
+    }
+
     pub fn get_table_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
         self.ensure_base_indices();
         Self::suggestions_from_entry_groups(prefix, &[&self.table_entries])
@@ -1576,6 +1590,21 @@ impl IntellisenseData {
     pub fn has_members_for_qualifier(&self, qualifier: &str, relation_only: bool) -> bool {
         self.member_entries_for_qualifier(qualifier, relation_only)
             .is_some_and(|entries| !entries.is_empty())
+    }
+
+    pub fn qualifier_relation_member_matches(&self, qualifier: &str, candidate: &str) -> bool {
+        let candidate_upper = NameEntry::lookup_upper(candidate.trim());
+        if candidate_upper.is_empty() {
+            return false;
+        }
+
+        for key in Self::qualifier_lookup_keys(qualifier) {
+            if let Some(entries) = self.relation_member_entries_by_qualifier.get(&key) {
+                return entries.iter().any(|entry| entry.upper == candidate_upper);
+            }
+        }
+
+        false
     }
 
     pub fn get_member_suggestions(

@@ -322,6 +322,25 @@ fn grant_privilege_list_offers_privileges_without_suppressing_roles() {
     }
     // The grantee slot is not a privilege position.
     assert!(!kw("GRANT SELECT ON t TO |").1.iter().any(|p| p == "SELECT"));
+
+    for sql in [
+        "SELECT grant | FROM t",
+        "SELECT * FROM t WHERE revoke |",
+        "CREATE TABLE x AS SELECT grant | FROM t",
+        "SELECT CASE WHEN flag THEN grant | END FROM t",
+        "SELECT CASE WHEN flag THEN 1 ELSE grant | END FROM t",
+        "BEGIN v := CASE WHEN flag THEN grant | END; END;",
+        "SELECT empno FROM emp UNION GRANT |",
+        "SELECT empno FROM emp UNION REVOKE |",
+    ] {
+        let (_, k) = kw(sql);
+        for leaked in ["SELECT", "EXECUTE", "ALL PRIVILEGES"] {
+            assert!(
+                !k.iter().any(|value| value == leaked),
+                "{leaked} privilege keyword leaked outside a GRANT/REVOKE statement for `{sql}`: {k:?}"
+            );
+        }
+    }
 }
 
 /// The brand-new object name of a `CREATE` statement (`CREATE TABLE |`,
@@ -331,33 +350,83 @@ fn grant_privilege_list_offers_privileges_without_suppressing_roles() {
 /// the object-type keyword slots themselves (`CREATE |`, `CREATE MATERIALIZED |`).
 #[test]
 fn create_object_new_name_slot_suppresses_existing_objects() {
-    let is_new_name = |sql: &str| {
+    let is_new_name_with_prefix = |sql: &str| {
         SqlEditorWidget::cursor_is_at_create_object_new_name(
             &analyze_inline_cursor_sql(sql),
             true,
         )
     };
+    let is_new_name_at_empty_slot = |sql: &str| {
+        SqlEditorWidget::cursor_is_at_create_object_new_name(
+            &analyze_inline_cursor_sql(sql),
+            false,
+        )
+    };
+    for sql in ["CREATE TABLE |", "CREATE DATABASE LINK |"] {
+        assert!(is_new_name_at_empty_slot(sql), "new name for `{sql}`");
+    }
     for sql in [
         "CREATE TABLE my|",
+        "CREATE TABLE scott.|",
+        "CREATE PACKAGE p|",
         "CREATE OR REPLACE PACKAGE p|",
+        "CREATE OR REPLACE PACKAGE scott.|",
         "CREATE OR REPLACE PACKAGE BODY p|",
         "CREATE MATERIALIZED VIEW m|",
         "CREATE UNIQUE INDEX i|",
         "CREATE GLOBAL TEMPORARY TABLE t|",
         "CREATE TABLE IF NOT EXISTS t|",
+        "CREATE DATABASE LINK l|",
+        "CREATE SHARED PUBLIC DATABASE LINK l|",
+        "CREATE ROLLBACK SEGMENT r|",
+        "CREATE PUBLIC ROLLBACK SEGMENT r|",
+        "CREATE JAVA SOURCE NAMED j|",
+        "CREATE OR REPLACE JAVA RESOURCE NAMED j|",
     ] {
-        assert!(is_new_name(sql), "new name for `{sql}`");
+        assert!(is_new_name_with_prefix(sql), "new name for `{sql}`");
     }
     for sql in [
         "CREATE |",                 // object-type keyword slot
         "CREATE MATERIALIZED |",    // -> VIEW keyword
+        "CREATE DATABASE |",        // -> LINK keyword
+        "CREATE PUBLIC DATABASE |", // -> LINK keyword
+        "CREATE SHARED DATABASE |", // -> LINK keyword
+        "CREATE ROLLBACK |",        // -> SEGMENT keyword
+        "CREATE PACKAGE |",         // -> BODY keyword or package name
+        "CREATE JAVA SOURCE |",     // -> NAMED keyword
+        "CREATE JAVA CLASS |",      // -> USING keyword
         "CREATE INDEX i ON t|",     // existing table target
         "DROP TABLE t|",            // existing object
         "ALTER TABLE t|",           // existing object
         "SELECT | FROM t",          // unrelated
     ] {
-        assert!(!is_new_name(sql), "must not flag `{sql}`");
+        assert!(
+            !is_new_name_at_empty_slot(sql),
+            "must not flag empty slot `{sql}`"
+        );
+        assert!(
+            !is_new_name_with_prefix(sql),
+            "must not flag typed slot `{sql}`"
+        );
     }
+
+    let qualified_ctx = analyze_inline_cursor_sql("CREATE TABLE scott.|");
+    let qualified_context = SqlEditorWidget::classify_intellisense_context(
+        &qualified_ctx,
+        qualified_ctx.statement_tokens.as_ref(),
+    );
+    let mut data = IntellisenseData::new();
+    data.set_members_for_qualifier_with_kinds(
+        "SCOTT",
+        vec![("EMP".to_string(), Some(QualifiedMemberKind::Table))],
+    );
+    data.set_relation_members_for_qualifier("SCOTT", vec!["EMP".to_string()]);
+    let mode =
+        SqlEditorWidget::resolve_qualified_completion_mode("scott", qualified_context, &qualified_ctx, &data);
+    assert_eq!(
+        mode, None,
+        "qualified CREATE new-name slot must not switch to existing schema members"
+    );
 }
 
 /// The start of a window specification (`OVER (|)` / `WINDOW name AS (|)`)
@@ -636,6 +705,30 @@ fn referential_action_slot_suppresses_tables_and_offers_action_keywords() {
     let on_update = actions("CREATE TABLE c (id NUMBER REFERENCES p (id) ON UPDATE |)");
     assert!(on_update.iter().any(|k| k == "CASCADE"));
     assert!(on_update.iter().any(|k| k == "CURRENT_TIMESTAMP"));
+
+    for sql in [
+        "SELECT * FROM emp e JOIN dept d ON delete |",
+        "SELECT * FROM emp e JOIN dept d ON update |",
+        "SELECT * FROM emp WHERE flag = delete |",
+        "CREATE TABLE x AS SELECT references ON DELETE | FROM emp",
+        "CREATE VIEW v AS SELECT references ON UPDATE | FROM emp",
+        "CREATE TRIGGER trg BEFORE INSERT ON emp BEGIN SELECT references ON DELETE | FROM emp; END;",
+    ] {
+        let suggestions = actions(sql);
+        for keyword in ["CASCADE", "SET NULL", "SET DEFAULT", "NO ACTION", "RESTRICT"] {
+            assert!(
+                !suggestions.iter().any(|k| k == keyword),
+                "{keyword} leaked outside a referential-action slot for `{sql}`: {suggestions:?}"
+            );
+        }
+        assert!(
+            !SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(
+                &analyze_inline_cursor_sql(sql),
+                false,
+            ),
+            "non-FK ON DELETE/UPDATE must not be a keyword-only slot for `{sql}`"
+        );
+    }
 
     // A standalone DML `DELETE`/`UPDATE` (not preceded by `ON`) is untouched.
     assert!(actions("DELETE |").iter().any(|k| k == "FROM"));
@@ -970,10 +1063,45 @@ fn constrained_object_slots_replace_base_catalog() {
         assert_eq!(k, Some(ExpectedObjectSuggestionKind::User), "{sql}");
         assert_eq!(objs, vec!["EMP_USR".to_string()], "{sql}: {objs:?}");
     }
+    for sql in [
+        "GRANT SELECT ON emp_t TO scott, emp|",
+        "REVOKE SELECT ON emp_t FROM scott, emp|",
+    ] {
+        let (k, objs) = analyze(sql);
+        assert_eq!(k, Some(ExpectedObjectSuggestionKind::User), "{sql}");
+        assert_eq!(objs, vec!["EMP_USR".to_string()], "{sql}: {objs:?}");
+    }
 
     // `AUDIT … ON` is an Any slot → kind is Any → base catalog is kept.
     let (k, _) = analyze("AUDIT SELECT ON emp|");
     assert_eq!(k, Some(ExpectedObjectSuggestionKind::Any));
+
+    for sql in [
+        "SELECT call | FROM emp",
+        "SELECT execute | FROM emp",
+        "SELECT describe | FROM emp",
+        "SELECT grant select on | FROM emp",
+        "SELECT revoke select from | FROM emp",
+        "SELECT audit select on | FROM emp",
+        "SELECT noaudit select on | FROM emp",
+        "CREATE TABLE t AS SELECT references | FROM emp",
+        "CREATE TABLE t AS SELECT grant select on | FROM emp",
+        "CREATE VIEW v AS SELECT drop package | FROM emp",
+        "CREATE VIEW v AS SELECT audit select on | FROM emp",
+        "CREATE TRIGGER trg BEFORE INSERT ON emp BEGIN SELECT alter user | FROM emp; END;",
+        "CREATE TRIGGER trg BEFORE INSERT ON emp BEGIN SELECT grant select on | FROM emp; END;",
+        "SELECT empno FROM emp UNION CALL |",
+        "SELECT empno FROM emp UNION DESC |",
+        "SELECT empno FROM emp UNION DROP TABLE |",
+        "SELECT empno FROM emp UNION GRANT SELECT ON |",
+    ] {
+        let (kind, objs) = analyze(sql);
+        assert_eq!(kind, None, "{sql} should not be an object slot");
+        assert!(
+            objs.is_empty(),
+            "{sql} should not pull object suggestions into expression context: {objs:?}"
+        );
+    }
 }
 
 fn assert_has_case_insensitive(values: &[String], expected: &str) {
@@ -17106,6 +17234,18 @@ fn alter_table_add_constraint_column_lists_target_existing_columns() {
     assert_eq!(references.phase, intellisense_context::SqlPhase::DdlColumnList);
     assert_eq!(references.focused_tables, vec!["dept".to_string()]);
 
+    let qualified_references = analyze_inline_cursor_sql(
+        "ALTER TABLE emp ADD FOREIGN KEY (deptno) REFERENCES scott.dept(|)",
+    );
+    assert_eq!(
+        qualified_references.phase,
+        intellisense_context::SqlPhase::DdlColumnList
+    );
+    assert_eq!(
+        qualified_references.focused_tables,
+        vec!["scott.dept".to_string()]
+    );
+
     // A schema-qualified target keeps the qualifier so the right table's
     // columns are loaded.
     let qualified = analyze_inline_cursor_sql("ALTER TABLE scott.emp ADD PRIMARY KEY (|)");
@@ -17170,6 +17310,7 @@ fn alter_table_change_new_name_slot_is_suppressed() {
         "ALTER TABLE emp CHANGE old_col |",
         "ALTER TABLE emp CHANGE COLUMN old_col |",
         "ALTER TABLE emp CHANGE old_col new_col |",
+        "ALTER TABLE emp CHANGE old_col scott.|",
     ] {
         let ctx = analyze_inline_cursor_sql(sql);
         assert!(ctx.ddl_new_name_position, "`{sql}` should suppress");
@@ -17187,6 +17328,200 @@ fn alter_table_change_new_name_slot_is_suppressed() {
         );
         assert_eq!(source.focused_tables, vec!["emp".to_string()], "{sql}");
     }
+}
+
+#[test]
+fn alter_table_qualified_new_name_slots_do_not_use_schema_members() {
+    let mut data = IntellisenseData::new();
+    data.set_members_for_qualifier_with_kinds(
+        "SCOTT",
+        vec![("EMP".to_string(), Some(QualifiedMemberKind::Table))],
+    );
+    data.set_relation_members_for_qualifier("SCOTT", vec!["EMP".to_string()]);
+
+    for sql in [
+        "ALTER TABLE emp ADD CONSTRAINT scott.|",
+        "ALTER TABLE emp RENAME TO scott.|",
+        "ALTER TABLE emp RENAME COLUMN old_col TO scott.|",
+        "ALTER TABLE emp CHANGE old_col scott.|",
+        "ALTER TABLE emp CHANGE COLUMN old_col scott.|",
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        assert!(
+            ctx.ddl_new_name_position,
+            "`{sql}` should be a DDL new-name slot"
+        );
+        let context =
+            SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+        let mode = SqlEditorWidget::resolve_qualified_completion_mode(
+            "scott",
+            context,
+            &ctx,
+            &data,
+        );
+        assert_eq!(
+            mode, None,
+            "qualified DDL new-name slot must not switch to existing schema members for `{sql}`"
+        );
+    }
+}
+
+#[test]
+fn alter_table_index_subcommand_object_slots_filter_to_indexes() {
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["EMP".to_string()];
+    data.indexes = vec!["EMP_PK".to_string()];
+    data.rebuild_indices();
+
+    for sql in [
+        "ALTER TABLE emp DROP INDEX |",
+        "ALTER TABLE emp DROP KEY |",
+        "ALTER TABLE emp RENAME INDEX | TO emp_pk2",
+        "ALTER TABLE emp RENAME KEY | TO emp_pk2",
+    ] {
+        let suggestions =
+            SqlEditorWidget::collect_expected_object_suggestions(&mut data, "", &analyze_inline_cursor_sql(sql));
+        assert_eq!(
+            suggestions,
+            vec!["EMP_PK".to_string()],
+            "`{sql}` should suggest only existing indexes"
+        );
+    }
+
+    let prefixed =
+        analyze_inline_cursor_sql("ALTER TABLE emp DROP INDEX emp|");
+    let prefixed_suggestions =
+        SqlEditorWidget::collect_expected_object_suggestions(&mut data, "emp", &prefixed);
+    assert_eq!(prefixed_suggestions, vec!["EMP_PK".to_string()]);
+
+    data.set_members_for_qualifier_with_kinds(
+        "SCOTT",
+        vec![
+            ("EMP".to_string(), Some(QualifiedMemberKind::Table)),
+            ("EMP_PK".to_string(), Some(QualifiedMemberKind::Index)),
+        ],
+    );
+    let qualified =
+        analyze_inline_cursor_sql("ALTER TABLE emp DROP INDEX scott.|");
+    let qualified_suggestions = SqlEditorWidget::expected_member_suggestions_for_qualifier(
+        &mut data,
+        "scott",
+        "",
+        &qualified,
+    );
+    assert_eq!(
+        qualified_suggestions,
+        vec!["EMP_PK".to_string()],
+        "qualified ALTER TABLE index slot must not leak schema tables"
+    );
+}
+
+#[test]
+fn alter_table_constraint_and_completed_object_slots_suppress_unrelated_identifiers() {
+    let exclude_flag = |sql_with_cursor: &str| {
+        let cursor = sql_with_cursor.find('|').expect("cursor marker");
+        let sql = sql_with_cursor.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+        !prefix.is_empty()
+    };
+
+    for sql in [
+        "ALTER TABLE emp DROP CONSTRAINT |",
+        "ALTER TABLE emp DROP CONSTRAINT fk_emp|",
+        "ALTER TABLE emp DROP FOREIGN KEY |",
+        "ALTER TABLE emp DROP PRIMARY KEY |",
+        "ALTER TABLE emp DROP CHECK |",
+        "ALTER TABLE emp ENABLE CONSTRAINT |",
+        "ALTER TABLE emp ENABLE NOVALIDATE CONSTRAINT |",
+        "ALTER TABLE emp DISABLE CONSTRAINT fk_emp|",
+        "ALTER TABLE emp VALIDATE CONSTRAINT |",
+        "ALTER TABLE emp NOVALIDATE CONSTRAINT |",
+        "ALTER TABLE emp MODIFY CONSTRAINT |",
+        "ALTER TABLE emp ENABLE PRIMARY KEY |",
+        "ALTER TABLE emp DISABLE PRIMARY KEY |",
+        "ALTER TABLE emp DROP PARTITION |",
+        "ALTER TABLE emp DROP SUBPARTITION p1|",
+        "ALTER TABLE emp TRUNCATE PARTITION |",
+        "ALTER TABLE emp MOVE PARTITION p1|",
+        "ALTER TABLE emp EXCHANGE PARTITION p1 |",
+        "ALTER TABLE emp SPLIT PARTITION |",
+        "ALTER TABLE emp MERGE PARTITIONS |",
+        "ALTER TABLE emp COALESCE PARTITION |",
+        "ALTER TABLE emp RENAME PARTITION | TO p2",
+        "ALTER TABLE emp RENAME CONSTRAINT | TO fk_emp2",
+        "ALTER TABLE emp RENAME CONSTRAINT fk_emp |",
+        "ALTER TABLE emp DROP INDEX EMP_PK |",
+        "ALTER TABLE emp RENAME INDEX EMP_PK |",
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        assert!(
+            SqlEditorWidget::cursor_is_at_ddl_identifier_suppression_slot_for_context(
+                &ctx,
+                exclude_flag(sql),
+            ),
+            "`{sql}` should suppress unrelated identifier suggestions"
+        );
+    }
+
+    for sql in [
+        "ALTER TABLE emp DROP INDEX |",
+        "ALTER TABLE emp RENAME INDEX | TO emp_pk2",
+        "ALTER TABLE emp RENAME INDEX EMP_PK TO |",
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        assert!(
+            !SqlEditorWidget::cursor_is_at_ddl_identifier_suppression_slot_for_context(
+                &ctx,
+                exclude_flag(sql),
+            ),
+            "`{sql}` is handled by index object suggestions or new-name suppression"
+        );
+    }
+}
+
+#[test]
+fn rename_statement_target_new_name_slots_are_suppressed() {
+    for sql in ["RENAME emp TO |", "RENAME emp TO new_emp|"] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        assert!(
+            ctx.ddl_new_name_position,
+            "`{sql}` should suppress existing identifiers at the rename target"
+        );
+    }
+
+    let qualified_ctx = analyze_inline_cursor_sql("RENAME emp TO scott.|");
+    assert!(
+        qualified_ctx.ddl_new_name_position,
+        "qualified rename target should still be a new-name slot"
+    );
+    let context = SqlEditorWidget::classify_intellisense_context(
+        &qualified_ctx,
+        qualified_ctx.statement_tokens.as_ref(),
+    );
+    let mut data = IntellisenseData::new();
+    data.set_members_for_qualifier_with_kinds(
+        "SCOTT",
+        vec![("EMP".to_string(), Some(QualifiedMemberKind::Table))],
+    );
+    data.set_relation_members_for_qualifier("SCOTT", vec!["EMP".to_string()]);
+    let mode =
+        SqlEditorWidget::resolve_qualified_completion_mode("scott", context, &qualified_ctx, &data);
+    assert_eq!(
+        mode, None,
+        "qualified rename target must not switch to existing schema members"
+    );
+
+    let source = analyze_inline_cursor_sql("RENAME | TO new_emp");
+    assert!(
+        !source.ddl_new_name_position,
+        "rename source should still reference an existing object"
+    );
+
+    let next_source = analyze_inline_cursor_sql("RENAME TABLE emp TO emp2, |");
+    assert!(
+        !next_source.ddl_new_name_position,
+        "next rename source should still reference an existing object"
+    );
 }
 
 /// `CREATE TABLE … PARTITION BY {RANGE|HASH|LIST|RANGE COLUMNS} (…)` lists the
@@ -18625,6 +18960,32 @@ fn clause_continuation_keyword_is_suppressed_after_qualified_member() {
     assert!(!suggests("SELECT * FROM emp e WHERE e.order |", "BY"));
     assert!(!suggests("SELECT * FROM emp e WHERE e.group |", "BY"));
     assert!(!suggests("SELECT * FROM emp e WHERE e.start |", "WITH"));
+    // Before the query's FROM clause these words are select-list expressions, not
+    // clause openers.
+    for (sql, keyword) in [
+        ("SELECT order | FROM emp", "BY"),
+        ("SELECT group | FROM emp", "BY"),
+        ("SELECT connect | FROM emp", "BY"),
+        ("SELECT start | FROM emp", "WITH"),
+        ("CREATE TABLE x AS SELECT order | FROM emp", "BY"),
+        ("CREATE VIEW v AS SELECT group | FROM emp", "BY"),
+        (
+            "CREATE TRIGGER trg BEFORE INSERT ON emp BEGIN SELECT start | FROM emp; END;",
+            "WITH",
+        ),
+    ] {
+        assert!(
+            !suggests(sql, keyword),
+            "{keyword} leaked into a select-list expression for `{sql}`"
+        );
+        assert!(
+            !SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(
+                &analyze_inline_cursor_sql(sql),
+                false,
+            ),
+            "select-list expression should not be keyword-only for `{sql}`"
+        );
+    }
 }
 
 #[test]
@@ -18691,6 +19052,9 @@ fn column_suppressing_keyword_slot_covers_every_family() {
     assert!(at("SELECT sum(x) OVER (PARTITION |) FROM t")); // window PARTITION BY
     assert!(at("SELECT * FROM emp WHERE a IS |")); // IS null-test operator
     assert!(at("SELECT * FROM emp WHERE a IS NOT |"));
+    assert!(at("CREATE ROLLBACK |")); // statement structural keyword tail
+    assert!(at("CREATE JAVA |")); // statement structural keyword tail
+    assert!(at("CREATE SYNONYM emp_syn |")); // statement structural keyword tail
     // Ordinary column positions remain column positions.
     assert!(!at("SELECT | FROM emp"));
     assert!(!at("SELECT * FROM emp WHERE | "));
@@ -18842,6 +19206,13 @@ fn is_null_test_continuation_offers_keywords_and_suppresses_columns() {
     assert!(!at("SELECT * FROM t WHERE a |"));
     assert!(!at("SELECT * FROM t WHERE a NOT |"));
     assert!(!at("SELECT * FROM t e WHERE e.is |"));
+    assert!(!at("SELECT is | FROM t"));
+    assert!(
+        !kw("SELECT is | FROM t")
+            .iter()
+            .any(|value| value == "NOT" || value == "NULL"),
+        "IS keyword continuation leaked without a left operand"
+    );
     assert!(!at("SELECT * FROM t WHERE a IS NULL AND b |"));
 }
 
@@ -19810,6 +20181,144 @@ fn expected_schema_object_suggestions_fallback_when_member_kinds_are_unknown() {
 }
 
 #[test]
+fn broad_schema_object_fallback_excludes_known_relations() {
+    let call_ctx = analyze_inline_cursor_sql("CALL scott.|");
+    let grant_execute_ctx = analyze_inline_cursor_sql("GRANT EXECUTE ON scott.|");
+    let mut data = IntellisenseData::new();
+    data.set_members_for_qualifier(
+        "SCOTT",
+        vec!["EMP".to_string(), "RUN_JOB".to_string(), "UTIL_PKG".to_string()],
+    );
+    data.set_relation_members_for_qualifier("SCOTT", vec!["EMP".to_string()]);
+
+    let call_suggestions =
+        SqlEditorWidget::expected_member_suggestions_for_qualifier(&mut data, "scott", "", &call_ctx);
+    let grant_execute_suggestions = SqlEditorWidget::expected_member_suggestions_for_qualifier(
+        &mut data,
+        "scott",
+        "",
+        &grant_execute_ctx,
+    );
+
+    assert_eq!(
+        call_suggestions,
+        vec!["RUN_JOB".to_string(), "UTIL_PKG".to_string()]
+    );
+    assert_eq!(
+        grant_execute_suggestions,
+        vec!["RUN_JOB".to_string(), "UTIL_PKG".to_string()]
+    );
+
+    let mut global_relation_data = IntellisenseData::new();
+    global_relation_data.tables = vec!["EMP".to_string()];
+    global_relation_data.rebuild_indices();
+    global_relation_data.set_members_for_qualifier(
+        "SCOTT",
+        vec!["EMP".to_string(), "RUN_JOB".to_string()],
+    );
+    let global_relation_suggestions = SqlEditorWidget::expected_member_suggestions_for_qualifier(
+        &mut global_relation_data,
+        "scott",
+        "",
+        &call_ctx,
+    );
+
+    assert_eq!(global_relation_suggestions, vec!["RUN_JOB".to_string()]);
+}
+
+#[test]
+fn kind_specific_schema_object_slots_do_not_fallback_to_unknown_member_kinds() {
+    let mut data = IntellisenseData::new();
+    data.set_members_for_qualifier(
+        "SCOTT",
+        vec![
+            "EMP".to_string(),
+            "EMP_VIEW".to_string(),
+            "EMP_PK".to_string(),
+            "UTIL_PKG".to_string(),
+            "ADDRESS_T".to_string(),
+        ],
+    );
+
+    for sql in [
+        "SELECT CAST(empno AS scott.|) FROM emp",
+        "DROP TYPE scott.|",
+        "DROP PACKAGE scott.|",
+        "DROP INDEX scott.|",
+        "COMMENT ON TABLE scott.|",
+        "GRANT SELECT ON scott.|",
+    ] {
+        let suggestions =
+            SqlEditorWidget::expected_member_suggestions_for_qualifier(&mut data, "scott", "", &analyze_inline_cursor_sql(sql));
+        assert!(
+            suggestions.is_empty(),
+            "unknown-kind schema object cache leaked into kind-specific slot for `{sql}`: {suggestions:?}"
+        );
+    }
+}
+
+#[test]
+fn unknown_schema_member_kinds_use_global_object_kind_cache_when_available() {
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["EMP".to_string()];
+    data.procedures = vec!["RUN_JOB".to_string()];
+    data.packages = vec!["UTIL_PKG".to_string()];
+    data.indexes = vec!["EMP_PK".to_string()];
+    data.types = vec!["ADDRESS_T".to_string()];
+    data.rebuild_indices();
+    data.set_members_for_qualifier(
+        "SCOTT",
+        vec![
+            "EMP".to_string(),
+            "EMP_PK".to_string(),
+            "RUN_JOB".to_string(),
+            "UTIL_PKG".to_string(),
+            "ADDRESS_T".to_string(),
+        ],
+    );
+
+    let call_suggestions = SqlEditorWidget::expected_member_suggestions_for_qualifier(
+        &mut data,
+        "scott",
+        "",
+        &analyze_inline_cursor_sql("CALL scott.|"),
+    );
+    let execute_suggestions = SqlEditorWidget::expected_member_suggestions_for_qualifier(
+        &mut data,
+        "scott",
+        "",
+        &analyze_inline_cursor_sql("GRANT EXECUTE ON scott.|"),
+    );
+    let type_suggestions = SqlEditorWidget::expected_member_suggestions_for_qualifier(
+        &mut data,
+        "scott",
+        "",
+        &analyze_inline_cursor_sql("DROP TYPE scott.|"),
+    );
+    let index_suggestions = SqlEditorWidget::expected_member_suggestions_for_qualifier(
+        &mut data,
+        "scott",
+        "",
+        &analyze_inline_cursor_sql("DROP INDEX scott.|"),
+    );
+
+    assert_eq!(
+        call_suggestions,
+        vec!["RUN_JOB".to_string(), "UTIL_PKG".to_string()]
+    );
+    assert_eq!(
+        execute_suggestions,
+        vec![
+            "ADDRESS_T".to_string(),
+            "RUN_JOB".to_string(),
+            "UTIL_PKG".to_string()
+        ]
+    );
+    assert_eq!(type_suggestions, vec!["ADDRESS_T".to_string()]);
+    assert_eq!(index_suggestions, vec!["EMP_PK".to_string()]);
+}
+
+#[test]
 fn expected_schema_package_suggestions_do_not_require_top_level_type_lists() {
     let drop_package_ctx = analyze_inline_cursor_sql("DROP PACKAGE scott.|");
     let mut data = IntellisenseData::new();
@@ -19853,6 +20362,169 @@ fn expected_package_member_routine_suggestions_do_not_require_top_level_type_lis
 
     assert!(call_suggestions.iter().any(|value| value == "RUN_JOB"));
     assert!(call_suggestions.iter().any(|value| value == "CALC_BONUS"));
+}
+
+#[test]
+fn qualified_data_type_slots_filter_schema_members_to_types() {
+    let mut data = IntellisenseData::new();
+    data.set_members_for_qualifier_with_kinds(
+        "SCOTT",
+        vec![
+            ("EMP".to_string(), Some(QualifiedMemberKind::Table)),
+            ("RUN_JOB".to_string(), Some(QualifiedMemberKind::Procedure)),
+            ("UTIL_PKG".to_string(), Some(QualifiedMemberKind::Package)),
+            ("ADDRESS_T".to_string(), Some(QualifiedMemberKind::Type)),
+        ],
+    );
+
+    for sql in [
+        "SELECT CAST(empno AS scott.|) FROM emp",
+        "SELECT TREAT(obj_col AS scott.|) FROM emp",
+        "CREATE TABLE customer (addr scott.|)",
+        "ALTER TABLE customer ADD (addr scott.|)",
+        "DECLARE v scott.|; BEGIN NULL; END;",
+        "CREATE FUNCTION f RETURN scott.| IS BEGIN RETURN NULL; END;",
+        "DECLARE TYPE t IS TABLE OF scott.|; BEGIN NULL; END;",
+        "CREATE TYPE t AS TABLE OF scott.|",
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        let context =
+            SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+        let mode =
+            SqlEditorWidget::resolve_qualified_completion_mode("scott", context, &ctx, &data);
+        assert_eq!(mode, Some(QualifiedCompletionMode::ObjectMembers));
+
+        let suggestions =
+            SqlEditorWidget::expected_member_suggestions_for_qualifier(&mut data, "scott", "", &ctx);
+        assert_eq!(suggestions, vec!["ADDRESS_T".to_string()]);
+    }
+}
+
+#[test]
+fn relation_member_cache_does_not_satisfy_non_relation_object_slots() {
+    let mut data = IntellisenseData::new();
+    data.set_relation_members_for_qualifier(
+        "SCOTT",
+        vec!["EMP".to_string(), "EMP_VIEW".to_string()],
+    );
+
+    for sql in [
+        "SELECT CAST(empno AS scott.|) FROM emp",
+        "DROP INDEX scott.|",
+        "DROP PACKAGE scott.|",
+        "GRANT EXECUTE ON scott.|",
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        let context =
+            SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+        let mode =
+            SqlEditorWidget::resolve_qualified_completion_mode("scott", context, &ctx, &data);
+        assert_ne!(
+            mode,
+            Some(QualifiedCompletionMode::RelationMembers),
+            "relation-only schema cache leaked into a non-relation object slot for `{sql}`"
+        );
+
+        let suggestions = SqlEditorWidget::expected_relation_member_suggestions_for_qualifier(
+            &mut data, "scott", "", &ctx,
+        );
+        assert!(
+            suggestions.is_empty(),
+            "relation-only schema cache should not satisfy `{sql}`: {suggestions:?}"
+        );
+    }
+}
+
+#[test]
+fn relation_member_cache_without_kind_metadata_only_satisfies_broad_relation_slots() {
+    let broad_ctx = analyze_inline_cursor_sql("SELECT * FROM scott.|");
+    let mut data = IntellisenseData::new();
+    data.set_relation_members_for_qualifier(
+        "SCOTT",
+        vec![
+            "EMP".to_string(),
+            "EMP_VIEW".to_string(),
+            "EMP_SYN".to_string(),
+        ],
+    );
+
+    let broad_mode = SqlEditorWidget::resolve_qualified_completion_mode(
+        "scott",
+        SqlContext::TableName,
+        &broad_ctx,
+        &data,
+    );
+    assert_eq!(broad_mode, Some(QualifiedCompletionMode::RelationMembers));
+    assert_eq!(
+        SqlEditorWidget::expected_relation_member_suggestions_for_qualifier(
+            &mut data, "scott", "", &broad_ctx,
+        ),
+        vec![
+            "EMP".to_string(),
+            "EMP_SYN".to_string(),
+            "EMP_VIEW".to_string(),
+        ]
+    );
+
+    for sql in [
+        "DROP TABLE scott.|",
+        "DROP VIEW scott.|",
+        "DROP MATERIALIZED VIEW scott.|",
+        "CREATE INDEX idx_emp ON scott.|",
+        "COMMENT ON TABLE scott.|",
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        let context =
+            SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+        let mode =
+            SqlEditorWidget::resolve_qualified_completion_mode("scott", context, &ctx, &data);
+        assert_ne!(
+            mode,
+            Some(QualifiedCompletionMode::RelationMembers),
+            "untyped relation cache leaked into a kind-specific object slot for `{sql}`"
+        );
+        assert!(
+            SqlEditorWidget::expected_relation_member_suggestions_for_qualifier(
+                &mut data, "scott", "", &ctx,
+            )
+            .is_empty(),
+            "untyped relation cache should not satisfy kind-specific slot for `{sql}`"
+        );
+    }
+}
+
+#[test]
+fn comment_on_column_filters_schema_members_to_column_owner_relations() {
+    let ctx = analyze_inline_cursor_sql("COMMENT ON COLUMN scott.|");
+    let mut data = IntellisenseData::new();
+    data.set_members_for_qualifier_with_kinds(
+        "SCOTT",
+        vec![
+            ("EMP".to_string(), Some(QualifiedMemberKind::Table)),
+            ("EMP_VIEW".to_string(), Some(QualifiedMemberKind::View)),
+            (
+                "EMP_MV".to_string(),
+                Some(QualifiedMemberKind::MaterializedView),
+            ),
+            ("EMP_SYN".to_string(), Some(QualifiedMemberKind::Synonym)),
+            ("SEQ_ORDER".to_string(), Some(QualifiedMemberKind::Sequence)),
+            ("UTIL_PKG".to_string(), Some(QualifiedMemberKind::Package)),
+        ],
+    );
+
+    let suggestions = SqlEditorWidget::expected_relation_member_suggestions_for_qualifier(
+        &mut data, "scott", "", &ctx,
+    );
+
+    assert_eq!(
+        suggestions,
+        vec![
+            "EMP".to_string(),
+            "EMP_MV".to_string(),
+            "EMP_SYN".to_string(),
+            "EMP_VIEW".to_string(),
+        ]
+    );
 }
 
 #[test]
@@ -20048,6 +20720,48 @@ fn schema_relation_member_suggestions_filter_by_oracle_object_context() {
     assert_eq!(comment_table_suggestions, vec!["EMP".to_string()]);
     assert_eq!(comment_view_suggestions, vec!["EMP_VIEW".to_string()]);
     assert_eq!(comment_editioning_view_suggestions, vec!["EMP_VIEW".to_string()]);
+
+    for sql in [
+        "CREATE TABLE t AS SELECT references scott.| FROM emp",
+        "CREATE TABLE t AS SELECT grant select on scott.| FROM emp",
+        "CREATE VIEW v AS SELECT drop package scott.| FROM emp",
+        "CREATE VIEW v AS SELECT audit select on scott.| FROM emp",
+        "CREATE TRIGGER trg BEFORE INSERT ON emp BEGIN SELECT alter user scott.| FROM emp; END;",
+        "SELECT empno FROM emp UNION DROP TABLE scott.|",
+        "SELECT empno FROM emp UNION CALL scott.|",
+        "SELECT empno FROM emp UNION GRANT SELECT ON scott.|",
+    ] {
+        let deep_ctx = analyze_inline_cursor_sql(sql);
+        let context = SqlEditorWidget::classify_intellisense_context(
+            &deep_ctx,
+            deep_ctx.statement_tokens.as_ref(),
+        );
+        let mode =
+            SqlEditorWidget::resolve_qualified_completion_mode("scott", context, &deep_ctx, &data);
+
+        if sql.contains(" UNION ") {
+            assert!(
+                SqlEditorWidget::cursor_is_in_invalid_set_operation_branch_for_context(
+                    &deep_ctx, true
+                ),
+                "`{sql}` should be recognized as an invalid query set-operator branch"
+            );
+        } else {
+            assert!(
+                matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
+                "`{sql}` should stay in an expression column context, got {context:?}"
+            );
+        }
+        assert_eq!(
+            SqlEditorWidget::expected_object_suggestion_kind("", Some("scott"), &deep_ctx),
+            None,
+            "`{sql}` should not be treated as a qualified DDL object slot"
+        );
+        assert!(
+            !matches!(mode, Some(QualifiedCompletionMode::RelationMembers)),
+            "`{sql}` should not switch to schema relation members through a DDL object-slot tail: {mode:?}"
+        );
+    }
 }
 
 #[test]
@@ -20340,6 +21054,88 @@ fn collect_expected_keyword_suggestions_complete_rollback_and_java_tails() {
     assert_eq!(create_java_source_suggestions, vec!["NAMED".to_string()]);
     assert_eq!(create_java_resource_suggestions, vec!["NAMED".to_string()]);
     assert_eq!(create_java_class_suggestions, vec!["USING".to_string()]);
+}
+
+#[test]
+fn statement_structural_keywords_are_scoped_to_statement_heads() {
+    let kw = |sql: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &analyze_inline_cursor_sql(sql),
+            Some(crate::db::DatabaseType::Oracle),
+        )
+    };
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+
+    for sql in [
+        "SELECT create | FROM emp",
+        "SELECT drop | FROM emp",
+        "SELECT materialized | FROM emp",
+        "SELECT java | FROM emp",
+        "SELECT execute | FROM emp",
+        "SELECT * FROM emp WHERE status = create |",
+        "SELECT CASE WHEN flag THEN create | END FROM emp",
+        "SELECT CASE WHEN flag THEN 1 ELSE create | END FROM emp",
+        "BEGIN v := CASE WHEN flag THEN create | END; END;",
+        "CREATE TABLE t AS SELECT create | FROM emp",
+        "CREATE VIEW v AS SELECT drop | FROM emp",
+        "CREATE TRIGGER trg BEFORE INSERT ON emp BEGIN SELECT java | FROM emp; END;",
+    ] {
+        let suggestions = kw(sql);
+        for keyword in [
+            "TABLE",
+            "VIEW",
+            "SOURCE",
+            "CLASS",
+            "RESOURCE",
+            "SEGMENT",
+            "IMMEDIATE",
+            "SELECT",
+            "CREATE",
+            "ALTER",
+            "DROP",
+        ] {
+            assert!(
+                !has(&suggestions, keyword),
+                "{keyword} leaked outside a statement-head structural slot for `{sql}`: {suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn dml_statement_head_keywords_are_scoped_to_statement_heads() {
+    let kw = |sql: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &analyze_inline_cursor_sql(sql),
+            Some(crate::db::DatabaseType::Oracle),
+        )
+    };
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+
+    assert_eq!(kw("DELETE |"), vec!["FROM".to_string()]);
+    assert_eq!(kw("INSERT |"), vec!["INTO".to_string()]);
+    assert_eq!(kw("MERGE |"), vec!["INTO".to_string()]);
+
+    for sql in [
+        "SELECT delete | FROM emp",
+        "SELECT insert | FROM emp",
+        "SELECT merge | FROM emp",
+        "SELECT * FROM emp WHERE flag = delete |",
+        "SELECT CASE WHEN flag THEN delete | END FROM emp",
+        "SELECT CASE WHEN flag THEN 1 ELSE delete | END FROM emp",
+        "BEGIN v := CASE WHEN flag THEN delete | END; END;",
+        "CREATE TRIGGER trg BEFORE INSERT |",
+    ] {
+        let suggestions = kw(sql);
+        for keyword in ["FROM", "INTO"] {
+            assert!(
+                !has(&suggestions, keyword),
+                "{keyword} leaked outside a DML statement-head slot for `{sql}`: {suggestions:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -21312,6 +22108,9 @@ fn keyword_only_slots_suppress_the_identifier_base() {
         "SELECT listagg(x) WITHIN gr| FROM t",
         "SELECT last_value(x) IGNORE nu| FROM t",
         "SELECT sum(x) OVER (ORDER BY d NULLS f|) FROM t",
+        "CREATE ROLLBACK seg|",
+        "CREATE JAVA sou|",
+        "CREATE SYNONYM emp_syn fo|",
     ];
     for sql in pure_keyword_slots {
         let ctx = analyze_inline_cursor_sql(sql);
@@ -22763,6 +23562,27 @@ fn sounds_like_operator_is_scoped_to_mysql_character_operands() {
         Some(Oracle),
     ));
 
+    for sql in [
+        "SELECT sounds | FROM emp",
+        "CREATE TABLE x AS SELECT sounds | FROM emp",
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        assert!(
+            !SqlEditorWidget::collect_expected_keyword_suggestions("", &ctx, Some(MySQL))
+                .iter()
+                .any(|value| value == "LIKE"),
+            "LIKE leaked after SOUNDS without a left operand for `{sql}`"
+        );
+        assert!(
+            !SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot_for_db(
+                &ctx,
+                false,
+                Some(MySQL),
+            ),
+            "SOUNDS without a left operand should not be keyword-only for `{sql}`"
+        );
+    }
+
     let s = suggestions("SELECT ename SOUNDS LIKE 'SMTH' es| FROM emp");
     assert!(!has(&s, "ESCAPE"), "ESCAPE leaked after SOUNDS LIKE: {s:?}");
 }
@@ -23085,6 +23905,248 @@ fn set_quantifiers_offered_only_at_a_list_or_aggregate_anchor() {
     assert!(has(&s, "SOME"), "SOME wrongly suppressed in a quantified comparison: {s:?}");
     let s = suggestions("SELECT * FROM emp WHERE empno = al|");
     assert!(has(&s, "ALL"), "ALL wrongly suppressed in a quantified comparison: {s:?}");
+}
+
+#[test]
+fn query_set_operator_slots_use_full_statement_tail() {
+    let kw = |sql: &str, prefix: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(crate::db::DatabaseType::Oracle),
+        )
+    };
+    let suppresses = |sql: &str, exclude_current_identifier_chain: bool| {
+        SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(
+            &analyze_inline_cursor_sql(sql),
+            exclude_current_identifier_chain,
+        )
+    };
+    let base = |sql_with_cursor: &str| {
+        let cursor = sql_with_cursor.find('|').expect("cursor marker");
+        let sql = sql_with_cursor.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql_with_cursor);
+        let context = SqlEditorWidget::classify_intellisense_context(
+            &ctx,
+            ctx.statement_tokens.as_ref(),
+        );
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+        if SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot_for_db(
+            &ctx,
+            !prefix.is_empty(),
+            Some(crate::db::DatabaseType::Oracle),
+        ) {
+            return Vec::new();
+        }
+        let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &ctx);
+        let column_scope = (!column_tables.is_empty()).then(|| column_tables.clone());
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["EMP_T".to_string()];
+        data.procedures = vec!["EMP_PROC".to_string()];
+        data.functions = vec!["EMP_FN".to_string()];
+        data.rebuild_indices();
+        let expr_keyword_ctx = SqlEditorWidget::expression_keyword_context(
+            &ctx,
+            &data,
+            &column_tables,
+            !prefix.is_empty(),
+            Some(crate::db::DatabaseType::Oracle),
+        );
+        SqlEditorWidget::base_suggestions_for_context(
+            &mut data,
+            &prefix,
+            None,
+            column_scope.as_deref(),
+            matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
+            context,
+            false,
+            Some(crate::db::DatabaseType::Oracle),
+            expr_keyword_ctx,
+        )
+    };
+    let has = |suggestions: &[String], value: &str| {
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case(value))
+    };
+
+    assert_eq!(
+        kw("SELECT empno FROM emp UNION |", ""),
+        vec!["SELECT".to_string(), "ALL".to_string()]
+    );
+    assert_eq!(
+        kw("SELECT empno FROM emp UNION ALL |", ""),
+        vec!["SELECT".to_string()]
+    );
+    assert_eq!(
+        kw("SELECT empno FROM emp INTERSECT |", ""),
+        vec!["SELECT".to_string(), "ALL".to_string()]
+    );
+    assert_eq!(
+        kw("SELECT empno FROM emp UNION al|", "al"),
+        vec!["ALL".to_string()]
+    );
+
+    for sql in [
+        "SELECT empno FROM emp UNION |",
+        "SELECT empno FROM emp UNION ALL |",
+        "SELECT empno FROM emp UNION al|",
+    ] {
+        let exclude_current_identifier_chain = sql.contains("al|");
+        assert!(
+            suppresses(sql, exclude_current_identifier_chain),
+            "query set-operator slot should suppress identifier base for `{sql}`"
+        );
+    }
+
+    for sql in [
+        "SELECT empno FROM emp UNION |",
+        "SELECT empno FROM emp UNION ALL |",
+    ] {
+        let suggestions = kw(sql, "");
+        for leaked in ["WITH", "INSERT", "UPDATE", "DELETE", "MERGE", "CREATE", "ALTER", "DROP"]
+        {
+            assert!(
+                !suggestions.iter().any(|value| value == leaked),
+                "{leaked} leaked as a statement-start keyword after a query set operator for `{sql}`: {suggestions:?}"
+            );
+        }
+    }
+
+    for (sql, leaked) in [
+        ("SELECT empno FROM emp UNION DELETE |", "FROM"),
+        ("SELECT empno FROM emp UNION INSERT |", "INTO"),
+        ("SELECT empno FROM emp UNION CREATE |", "TABLE"),
+        ("SELECT empno FROM emp UNION DROP |", "TABLE"),
+    ] {
+        let suggestions = kw(sql, "");
+        assert!(
+            !suggestions.iter().any(|value| value == leaked),
+            "{leaked} leaked from a statement-head lookalike after a query set operator for `{sql}`: {suggestions:?}"
+        );
+        assert!(
+            suppresses(sql, false),
+            "statement-head lookalike after a query set operator should suppress identifier base for `{sql}`"
+        );
+    }
+
+    for sql in [
+        "SELECT empno FROM emp UNION DROP TABLE emp|",
+        "SELECT empno FROM emp UNION CALL emp|",
+        "SELECT empno FROM emp UNION GRANT SELECT ON emp|",
+    ] {
+        let suggestions = base(sql);
+        for leaked in ["EMP_T", "EMP_PROC", "EMP_FN"] {
+            assert!(
+                !has(&suggestions, leaked),
+                "{leaked} leaked from the base catalog after a query set operator for `{sql}`: {suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn multiset_operators_do_not_trigger_query_set_operator_continuations() {
+    let kw = |sql: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &analyze_inline_cursor_sql(sql),
+            Some(crate::db::DatabaseType::Oracle),
+        )
+    };
+    let suppresses_columns = |sql: &str| {
+        SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(
+            &analyze_inline_cursor_sql(sql),
+            false,
+        )
+    };
+    let base = |sql_with_cursor: &str| {
+        let cursor = sql_with_cursor.find('|').expect("cursor marker");
+        let sql = sql_with_cursor.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql_with_cursor);
+        let context =
+            SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+        let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &ctx);
+        let column_scope = (!column_tables.is_empty()).then(|| column_tables.clone());
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["T".to_string()];
+        data.set_columns_for_table(
+            "T",
+            vec!["CHILD_NT".to_string(), "PARENT_NT".to_string()],
+        );
+        data.rebuild_indices();
+        let expr_keyword_ctx = SqlEditorWidget::expression_keyword_context(
+            &ctx,
+            &data,
+            &column_tables,
+            !prefix.is_empty(),
+            Some(crate::db::DatabaseType::Oracle),
+        );
+        SqlEditorWidget::base_suggestions_for_context(
+            &mut data,
+            &prefix,
+            None,
+            column_scope.as_deref(),
+            matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
+            context,
+            false,
+            Some(crate::db::DatabaseType::Oracle),
+            expr_keyword_ctx,
+        )
+    };
+    let has = |suggestions: &[String], keyword: &str| {
+        suggestions
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(keyword))
+    };
+
+    for sql in [
+        "SELECT child_nt MULTISET EXCEPT | parent_nt FROM t",
+        "SELECT child_nt MULTISET UNION | parent_nt FROM t",
+        "SELECT child_nt MULTISET INTERSECT | parent_nt FROM t",
+        "SELECT child_nt MULTISET EXCEPT ALL | parent_nt FROM t",
+        "SELECT child_nt MULTISET UNION DISTINCT | parent_nt FROM t",
+    ] {
+        let suggestions = kw(sql);
+        assert!(
+            !suggestions.iter().any(|value| value == "SELECT"),
+            "query SELECT continuation leaked after a MULTISET operator for `{sql}`: {suggestions:?}"
+        );
+        assert!(
+            !suppresses_columns(sql),
+            "MULTISET operator expression slot should not suppress identifiers for `{sql}`"
+        );
+    }
+
+    for sql in [
+        "SELECT child_nt MULTISET EXCEPT un| parent_nt FROM t",
+        "SELECT child_nt MULTISET UNION un| parent_nt FROM t",
+        "SELECT child_nt MULTISET INTERSECT un| parent_nt FROM t",
+    ] {
+        let suggestions = base(sql);
+        assert!(
+            !has(&suggestions, "UNIQUE"),
+            "select-list UNIQUE leaked after a MULTISET operator for `{sql}`: {suggestions:?}"
+        );
+    }
+
+    for (sql, keyword) in [
+        (
+            "SELECT child_nt MULTISET UNION al| parent_nt FROM t",
+            "ALL",
+        ),
+        (
+            "SELECT child_nt MULTISET UNION dis| parent_nt FROM t",
+            "DISTINCT",
+        ),
+    ] {
+        let suggestions = base(sql);
+        assert!(
+            has(&suggestions, keyword),
+            "{keyword} was suppressed after a MULTISET operator for `{sql}`: {suggestions:?}"
+        );
+    }
 }
 
 /// `EMP` with a typed schema (`ENAME` character, `EMPNO` numeric, `HIREDATE`

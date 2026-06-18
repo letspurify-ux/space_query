@@ -472,6 +472,9 @@ pub(crate) fn analyze_cursor_context_arc(
     } else if ddl_alter_table_introduces_new_name(
         statement_tokens.as_ref(),
         clamped_cursor_token_len,
+    ) || ddl_rename_statement_introduces_new_name(
+        statement_tokens.as_ref(),
+        clamped_cursor_token_len,
     ) {
         // New column/constraint/rename-target name or data-type position: never
         // an existing relation, so suppress identifier suggestions entirely.
@@ -700,6 +703,24 @@ fn ddl_alter_table_introduces_new_name(tokens: &[SqlToken], cursor_token_len: us
         Some("CHANGE") => change_source_seen,
         _ => false,
     }
+}
+
+fn ddl_rename_statement_introduces_new_name(tokens: &[SqlToken], cursor_token_len: usize) -> bool {
+    let sig = significant_statement_tokens_before_cursor(tokens, cursor_token_len);
+    if sig.len() < 3 || !token_is_word(sig[0], "RENAME") {
+        return false;
+    }
+
+    let mut saw_to = false;
+    for token in &sig[1..] {
+        if token_is_symbol(token, ",") {
+            saw_to = false;
+        } else if token_is_word(token, "TO") {
+            saw_to = true;
+        }
+    }
+
+    saw_to
 }
 
 /// The kind of position the cursor occupies inside a parenthesised DDL
@@ -4707,6 +4728,9 @@ fn set_operation_branch_range(
                         "UNION" | "INTERSECT" | "MINUS" | "EXCEPT"
                     ) =>
             {
+                if is_multiset_set_operator(tokens, idx) {
+                    continue;
+                }
                 if idx < cursor_token_len {
                     branch_start = idx + 1;
                 } else {

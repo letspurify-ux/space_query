@@ -94,8 +94,14 @@ struct ExpressionKeywordContext {
     /// Whether the cursor sits at a set-quantifier anchor: right after `SELECT`,
     /// a set operator, or an opening `(`. `DISTINCT`/`UNIQUE`/`DISTINCTROW` are
     /// grammatical only there (`SELECT DISTINCT`, `COUNT(DISTINCT x)`), never as a
-    /// general operand (`x = DISTINCT`, `x + DISTINCT`).
+    /// general operand (`x = DISTINCT`, `x + DISTINCT`). `MULTISET UNION` /
+    /// `EXCEPT` / `INTERSECT` has a separate modifier anchor because it admits
+    /// collection modifiers, not the full select-list synonym family.
     follows_quantifier_anchor: bool,
+    /// Whether the cursor sits after an Oracle collection multiset operator,
+    /// where `ALL`/`DISTINCT` may modify the collection operation but select-list
+    /// aliases such as `UNIQUE` must not leak.
+    follows_multiset_operator_modifier_anchor: bool,
     /// Whether the cursor is immediately after a comparison operator that can
     /// introduce a quantified comparison (`x = ANY (...)`, `x > ALL (...)`).
     follows_quantified_comparison_operator: bool,
@@ -225,6 +231,7 @@ impl ExpressionKeywordContext {
             follows_like_pattern: false,
             inside_group_concat_arguments_before_separator: false,
             follows_quantifier_anchor: false,
+            follows_multiset_operator_modifier_anchor: false,
             follows_quantified_comparison_operator: false,
             has_connect_by: false,
             in_dml_value_position: false,
@@ -383,10 +390,12 @@ enum AnalyticNullTreatmentCall {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExpectedObjectSuggestionKind {
+    NoSuggestions,
     Any,
     Routine,
     Executable,
     RelationOrSequence,
+    ColumnOwner,
     Table,
     View,
     MaterializedView,
@@ -1310,6 +1319,7 @@ impl SqlEditorWidget {
     ) {
         let deep_ctx = analysis.context.as_ref();
         let qualifier = snapshot.qualifier.as_deref();
+        let has_prefix = !snapshot.prefix.is_empty();
         let context =
             Self::classify_intellisense_context(deep_ctx, deep_ctx.statement_tokens.as_ref());
         // An alias declaration (`t AS x` / `t x` / `[x]`) or a DDL new-name /
@@ -1318,18 +1328,28 @@ impl SqlEditorWidget {
         // always irrelevant. Suppress uniformly, regardless of the clause.
         if Self::context_suppresses_completion(context)
             || (qualifier.is_none() && analysis.cursor_in_alias_declaration)
-            || (qualifier.is_none() && deep_ctx.ddl_new_name_position)
+            || deep_ctx.ddl_new_name_position
+            || Self::cursor_is_at_ddl_identifier_suppression_slot_for_context(
+                deep_ctx,
+                has_prefix || qualifier.is_some(),
+            )
             || (qualifier.is_none()
                 && Self::cursor_is_at_select_list_alias_name_slot(
                     deep_ctx,
                     !snapshot.prefix.is_empty(),
                 ))
-            || (qualifier.is_none()
-                && Self::cursor_is_at_create_object_new_name(
-                    deep_ctx,
-                    !snapshot.prefix.is_empty(),
-                ))
+            || Self::cursor_is_at_create_object_new_name(
+                deep_ctx,
+                has_prefix || qualifier.is_some(),
+            )
         {
+            Self::clear_intellisense_ui_state(intellisense_popup, runtime);
+            return;
+        }
+        if Self::cursor_is_in_invalid_set_operation_branch_for_context(
+            deep_ctx,
+            has_prefix || qualifier.is_some(),
+        ) {
             Self::clear_intellisense_ui_state(intellisense_popup, runtime);
             return;
         }
@@ -1353,37 +1373,12 @@ impl SqlEditorWidget {
         // emitting slots are also folded into `at_keyword_only_slot` (via the
         // shared `cursor_is_at_column_suppressing_keyword_slot` chokepoint) so
         // column-gated paths stay consistent.
-        let has_prefix = !snapshot.prefix.is_empty();
         let at_keyword_only_identifier_slot = qualifier.is_none()
-            && (Self::cursor_is_at_pure_clause_keyword_continuation_for_context(
-                deep_ctx, has_prefix,
-            ) || Self::order_by_sort_modifier_slot_for_context(deep_ctx, has_prefix).is_some()
-                || Self::window_order_by_sort_modifier_slot_for_context(deep_ctx, has_prefix)
-                    .is_some()
-                || Self::expected_window_spec_clause_transition_candidates_for_context(
-                    deep_ctx, has_prefix,
-                )
-                .is_some()
-                || Self::keep_dense_rank_slot_for_context(deep_ctx, has_prefix).is_some()
-                || Self::within_group_slot_for_context(deep_ctx, has_prefix).is_some()
-                || Self::analytic_null_treatment_slot_for_context(deep_ctx, has_prefix)
-                    .is_some_and(analytic_null_treatment_slot_suppresses_columns)
-                || Self::cursor_is_at_is_null_test_keyword_position_for_context(deep_ctx, has_prefix)
-                || Self::cursor_is_after_complete_dml_target_for_context(deep_ctx, has_prefix)
-                || Self::cursor_is_after_complete_join_target_for_context(deep_ctx, has_prefix)
-                || Self::cursor_is_at_table_alias_name_slot(deep_ctx, has_prefix)
-                || Self::cursor_is_at_merge_then_action_slot_for_context(deep_ctx, has_prefix)
-                || Self::cursor_is_at_merge_when_keyword_slot_for_context(deep_ctx, has_prefix)
-                || Self::cursor_is_after_set_operator_for_context(deep_ctx, has_prefix)
-                || Self::cursor_is_after_complete_from_relation_for_context(deep_ctx, has_prefix)
-                || Self::cursor_is_after_complete_alter_table_target_for_context(deep_ctx, has_prefix)
-                || Self::cursor_is_at_locking_clause_keyword_slot_for_context(deep_ctx, has_prefix)
-                || Self::expected_sounds_like_keyword_candidates_for_context(
-                    deep_ctx,
-                    has_prefix,
-                    Some(snapshot.preferred_db_type),
-                )
-                .is_some());
+            && Self::cursor_is_at_identifier_suppressing_keyword_slot_for_context(
+                deep_ctx,
+                has_prefix,
+                Some(snapshot.preferred_db_type),
+            );
         let cursor_in_statement = snapshot
             .cursor_pos_usize
             .saturating_sub(analysis.statement_start)
@@ -2307,6 +2302,7 @@ impl SqlEditorWidget {
         // offering them as a general operand without hiding a valid one.
         const SELECT_QUANTIFIER_KEYWORDS: &[&str] =
             &["ALL", "DISTINCT", "UNIQUE", "DISTINCTROW"];
+        const MULTISET_OPERATOR_MODIFIER_KEYWORDS: &[&str] = &["ALL", "DISTINCT"];
         const QUANTIFIED_COMPARISON_KEYWORDS: &[&str] = &["ALL", "ANY", "SOME"];
         // Hierarchical pseudo-columns/operators: grammatical only in a query that
         // has a `CONNECT BY` clause, where an operand is expected.
@@ -2390,6 +2386,14 @@ impl SqlEditorWidget {
             return ctx.follows_operand != Some(true)
                 && ctx.mysql_trigger_allows_old
                 && crate::sql_text::mysql_compatibility_for_sql("", db_type);
+        }
+        // Collection multiset operators accept collection-operation modifiers,
+        // not every select-list quantifier synonym. Keep this separate from the
+        // `SELECT UNIQUE` family so `MULTISET EXCEPT un|` does not offer UNIQUE.
+        if ctx.follows_multiset_operator_modifier_anchor
+            && MULTISET_OPERATOR_MODIFIER_KEYWORDS.contains(&upper)
+        {
+            return true;
         }
         // Set-quantifiers: only at a select-list/aggregate anchor.
         if ctx.follows_quantifier_anchor && SELECT_QUANTIFIER_KEYWORDS.contains(&upper) {
@@ -2630,9 +2634,11 @@ impl SqlEditorWidget {
         let follows_like_pattern = Self::cursor_follows_like_pattern(tokens, end);
         let inside_group_concat_arguments_before_separator =
             Self::cursor_in_group_concat_arguments_before_separator(tokens, end);
+        let before_quantifier_anchor = Self::meaningful_tokens_before(tokens, end);
+        let follows_multiset_operator_modifier_anchor =
+            Self::cursor_follows_multiset_operator_modifier_anchor(&before_quantifier_anchor);
         let follows_quantifier_anchor = {
-            let before = Self::meaningful_tokens_before(tokens, end);
-            match before.last() {
+            match before_quantifier_anchor.last() {
                 // A set-quantifier (`DISTINCT`/`UNIQUE`/`DISTINCTROW`) follows `(`
                 // only when the paren opens an *aggregate function call*
                 // (`COUNT(DISTINCT x)`), never a grouping/predicate paren
@@ -2640,14 +2646,17 @@ impl SqlEditorWidget {
                 // a function-name word; a grouping paren is preceded by an
                 // operator/keyword/`(`/`,` (or nothing), so it is not an anchor.
                 Some(SqlToken::Symbol(sym)) if sym == "(" => matches!(
-                    before.len().checked_sub(2).and_then(|i| before.get(i)),
+                    before_quantifier_anchor
+                        .len()
+                        .checked_sub(2)
+                        .and_then(|i| before_quantifier_anchor.get(i)),
                     Some(SqlToken::Word(word))
                         if Self::name_introduces_call(data, &word.to_ascii_uppercase(), db_type)
                 ),
                 Some(SqlToken::Word(word)) => matches!(
                     word.to_ascii_uppercase().as_str(),
                     "SELECT" | "UNION" | "EXCEPT" | "INTERSECT" | "MINUS"
-                ),
+                ) && !follows_multiset_operator_modifier_anchor,
                 _ => false,
             }
         };
@@ -2720,6 +2729,7 @@ impl SqlEditorWidget {
             follows_like_pattern,
             inside_group_concat_arguments_before_separator,
             follows_quantifier_anchor,
+            follows_multiset_operator_modifier_anchor,
             follows_quantified_comparison_operator,
             has_connect_by,
             in_dml_value_position,
@@ -3180,10 +3190,18 @@ impl SqlEditorWidget {
     }
 
     fn cursor_follows_sounds_operator(tokens: &[SqlToken], end: usize) -> bool {
-        matches!(
-            Self::meaningful_tokens_before(tokens, end).last(),
-            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("SOUNDS")
-        )
+        let meaningful: Vec<(usize, &SqlToken)> = tokens
+            .get(..end)
+            .unwrap_or(tokens)
+            .iter()
+            .enumerate()
+            .filter(|(_, token)| !matches!(token, SqlToken::Comment(_)))
+            .collect();
+        let Some((sounds_idx, SqlToken::Word(word))) = meaningful.last().copied() else {
+            return false;
+        };
+        word.eq_ignore_ascii_case("SOUNDS")
+            && Self::cursor_follows_complete_operand(tokens, sounds_idx) == Some(true)
     }
 
     fn mysql_trigger_pseudo_row_policy(tokens: &[SqlToken], end: usize) -> (bool, bool) {
@@ -3323,6 +3341,27 @@ impl SqlEditorWidget {
         )
     }
 
+    fn cursor_follows_multiset_operator_modifier_anchor(before: &[&SqlToken]) -> bool {
+        let Some(SqlToken::Word(word)) = before.last().copied() else {
+            return false;
+        };
+        if !matches!(
+            word.to_ascii_uppercase().as_str(),
+            "UNION" | "EXCEPT" | "INTERSECT"
+        ) {
+            return false;
+        }
+
+        matches!(
+            before
+                .len()
+                .checked_sub(2)
+                .and_then(|idx| before.get(idx))
+                .copied(),
+            Some(SqlToken::Word(prev_word)) if prev_word.eq_ignore_ascii_case("MULTISET")
+        )
+    }
+
     /// Classify the token immediately before the cursor word: `Some(true)` when it
     /// completes an operand (a value/operator may follow), `Some(false)` when an
     /// operand/expression is expected next, `None` when it cannot be told (so both
@@ -3453,18 +3492,36 @@ impl SqlEditorWidget {
         deep_ctx: &intellisense_context::CursorContext,
         data: &IntellisenseData,
     ) -> Option<QualifiedCompletionMode> {
-        if let Some(kind) = Self::expected_object_suggestion_kind("", Some(qualifier), deep_ctx) {
+        if deep_ctx.ddl_new_name_position
+            || Self::cursor_is_at_create_object_new_name(deep_ctx, true)
+        {
+            return None;
+        }
+        if Self::cursor_is_in_invalid_set_operation_branch_for_context(deep_ctx, true) {
+            return None;
+        }
+
+        let expected_object_kind =
+            Self::expected_object_suggestion_kind("", Some(qualifier), deep_ctx);
+        if matches!(
+            expected_object_kind,
+            Some(ExpectedObjectSuggestionKind::NoSuggestions)
+        ) {
+            return None;
+        }
+        if let Some(kind) = expected_object_kind {
             if data.has_members_for_qualifier(qualifier, false) {
                 return Some(QualifiedCompletionMode::ObjectMembers);
             }
-            if Self::expected_qualifier_member_kinds(kind).is_some()
+            if Self::expected_object_kind_allows_relation_member_cache(kind)
                 && data.has_members_for_qualifier(qualifier, true)
             {
                 return Some(QualifiedCompletionMode::RelationMembers);
             }
         }
 
-        if matches!(context, SqlContext::TableName)
+        if expected_object_kind.is_none()
+            && matches!(context, SqlContext::TableName)
             && data.has_members_for_qualifier(qualifier, true)
         {
             return Some(QualifiedCompletionMode::RelationMembers);
@@ -3876,6 +3933,9 @@ impl SqlEditorWidget {
             "ALL",
             "ALL PRIVILEGES",
         ];
+        if !Self::cursor_has_statement_start_anchor(tokens, end, &["GRANT", "REVOKE"]) {
+            return None;
+        }
         let toks = Self::meaningful_tokens_before(tokens, end);
         // The cursor must sit right after the verb (`GRANT |`) or a privilege-list
         // comma (`GRANT SELECT, |`).
@@ -3938,6 +3998,9 @@ impl SqlEditorWidget {
             "DIMENSION",
             "OPERATOR",
             "LIBRARY",
+            "LINK",
+            "SEGMENT",
+            "NAMED",
             // MySQL/`CREATE … IF NOT EXISTS <name>`.
             "EXISTS",
         ];
@@ -3948,6 +4011,11 @@ impl SqlEditorWidget {
             cursor_token_len,
             exclude_current_identifier_chain,
         );
+        if !exclude_current_identifier_chain
+            && Self::expected_statement_structural_keyword_candidates(tokens, end).is_some()
+        {
+            return false;
+        }
         let words = Self::previous_meaningful_words_upper(tokens, end, 12);
         // Statement must be a CREATE (not DROP/ALTER, whose `<type> <name>` slots
         // reference an existing object), and the cursor must be past the type
@@ -3958,6 +4026,166 @@ impl SqlEditorWidget {
         words
             .last()
             .is_some_and(|word| NAME_INTRODUCERS.contains(&word.as_str()))
+    }
+
+    fn identifier_chain_end(tokens: &[&SqlToken], start: usize) -> Option<usize> {
+        let mut idx = start;
+        let mut expect_word = true;
+        let mut consumed_word = false;
+        while let Some(token) = tokens.get(idx) {
+            match token {
+                SqlToken::Word(_) if expect_word => {
+                    consumed_word = true;
+                    expect_word = false;
+                    idx += 1;
+                }
+                SqlToken::Symbol(sym) if !expect_word && sym == "." => {
+                    expect_word = true;
+                    idx += 1;
+                }
+                _ => break,
+            }
+        }
+        (consumed_word && !expect_word).then_some(idx)
+    }
+
+    fn expected_alter_table_subcommand_object_suggestion_kind(
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> Option<ExpectedObjectSuggestionKind> {
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        if toks.len() < 3
+            || !matches!(toks[0], SqlToken::Word(word) if word.eq_ignore_ascii_case("ALTER"))
+            || !matches!(toks[1], SqlToken::Word(word) if word.eq_ignore_ascii_case("TABLE"))
+        {
+            return None;
+        }
+        let after_table = Self::identifier_chain_end(&toks, 2)?;
+
+        let mut depth = 0i32;
+        let mut action_words = Vec::new();
+        for token in &toks[after_table..] {
+            match token {
+                SqlToken::Symbol(sym) if sym == "(" => depth += 1,
+                SqlToken::Symbol(sym) if sym == ")" => depth = (depth - 1).max(0),
+                SqlToken::Symbol(sym) if depth == 0 && sym == "," => action_words.clear(),
+                SqlToken::Word(word) if depth == 0 => {
+                    let upper = word.to_ascii_uppercase();
+                    if matches!(
+                        upper.as_str(),
+                        "ADD"
+                            | "DROP"
+                            | "MODIFY"
+                            | "RENAME"
+                            | "CHANGE"
+                            | "ALTER"
+                            | "ENABLE"
+                            | "DISABLE"
+                            | "VALIDATE"
+                            | "NOVALIDATE"
+                            | "TRUNCATE"
+                            | "SPLIT"
+                            | "MERGE"
+                            | "EXCHANGE"
+                            | "MOVE"
+                            | "COALESCE"
+                    ) {
+                        action_words.clear();
+                    }
+                    action_words.push(upper);
+                }
+                _ => {}
+            }
+        }
+
+        match action_words.as_slice() {
+            [op, object_type] if op == "DROP" && matches!(object_type.as_str(), "INDEX" | "KEY") => {
+                Some(ExpectedObjectSuggestionKind::Index)
+            }
+            [op, object_type] if op == "RENAME" && matches!(object_type.as_str(), "INDEX" | "KEY") => {
+                Some(ExpectedObjectSuggestionKind::Index)
+            }
+            [op, object_type, ..]
+                if op == "DROP" && matches!(object_type.as_str(), "INDEX" | "KEY") =>
+            {
+                Some(ExpectedObjectSuggestionKind::NoSuggestions)
+            }
+            [op, object_type, rest @ ..]
+                if op == "RENAME" && matches!(object_type.as_str(), "INDEX" | "KEY") =>
+            {
+                if rest.iter().any(|word| word == "TO") {
+                    None
+                } else {
+                    Some(ExpectedObjectSuggestionKind::NoSuggestions)
+                }
+            }
+            [op, object_type, ..]
+                if matches!(
+                    op.as_str(),
+                    "DROP" | "ENABLE" | "DISABLE" | "VALIDATE" | "NOVALIDATE" | "MODIFY"
+                ) && matches!(object_type.as_str(), "CONSTRAINT" | "CHECK") =>
+            {
+                Some(ExpectedObjectSuggestionKind::NoSuggestions)
+            }
+            [op, modifier, object_type, ..]
+                if matches!(op.as_str(), "ENABLE" | "DISABLE")
+                    && matches!(modifier.as_str(), "VALIDATE" | "NOVALIDATE")
+                    && object_type == "CONSTRAINT" =>
+            {
+                Some(ExpectedObjectSuggestionKind::NoSuggestions)
+            }
+            [op, first, second, ..]
+                if matches!(op.as_str(), "DROP" | "ENABLE" | "DISABLE")
+                    && matches!(
+                        (first.as_str(), second.as_str()),
+                        ("FOREIGN", "KEY") | ("PRIMARY", "KEY")
+                    ) =>
+            {
+                Some(ExpectedObjectSuggestionKind::NoSuggestions)
+            }
+            [op, object_type, rest @ ..] if op == "RENAME" && object_type == "CONSTRAINT" => {
+                if rest.iter().any(|word| word == "TO") {
+                    None
+                } else {
+                    Some(ExpectedObjectSuggestionKind::NoSuggestions)
+                }
+            }
+            [op, object_type, ..]
+                if matches!(
+                    op.as_str(),
+                    "DROP"
+                        | "TRUNCATE"
+                        | "SPLIT"
+                        | "MERGE"
+                        | "EXCHANGE"
+                        | "MOVE"
+                        | "COALESCE"
+                        | "RENAME"
+                ) && matches!(
+                    object_type.as_str(),
+                    "PARTITION" | "SUBPARTITION" | "PARTITIONS" | "SUBPARTITIONS"
+                ) =>
+            {
+                Some(ExpectedObjectSuggestionKind::NoSuggestions)
+            }
+            _ => None,
+        }
+    }
+
+    fn cursor_is_at_ddl_identifier_suppression_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> bool {
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let context_end = Self::expected_suggestion_context_end(
+            tokens,
+            deep_ctx.cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        matches!(
+            Self::expected_alter_table_subcommand_object_suggestion_kind(tokens, context_end),
+            Some(ExpectedObjectSuggestionKind::NoSuggestions)
+        )
     }
 
     fn is_window_frame_unit(word: &str) -> bool {
@@ -5313,6 +5541,97 @@ impl SqlEditorWidget {
         Self::table_source_construct_open_paren_position(tokens, end, db_type)
     }
 
+    fn cursor_is_at_identifier_suppressing_keyword_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        Self::cursor_is_at_pure_clause_keyword_continuation_for_context(
+            deep_ctx,
+            exclude_current_identifier_chain,
+        ) || Self::order_by_sort_modifier_slot_for_context(
+            deep_ctx,
+            exclude_current_identifier_chain,
+        )
+        .is_some()
+            || Self::window_order_by_sort_modifier_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
+            .is_some()
+            || Self::expected_window_spec_clause_transition_candidates_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
+            .is_some()
+            || Self::keep_dense_rank_slot_for_context(deep_ctx, exclude_current_identifier_chain)
+                .is_some()
+            || Self::within_group_slot_for_context(deep_ctx, exclude_current_identifier_chain)
+                .is_some()
+            || Self::analytic_null_treatment_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
+            .is_some_and(analytic_null_treatment_slot_suppresses_columns)
+            || Self::cursor_is_at_is_null_test_keyword_position_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
+            || Self::cursor_is_after_complete_dml_target_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
+            || Self::cursor_is_after_complete_join_target_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
+            || Self::cursor_is_at_table_alias_name_slot(deep_ctx, exclude_current_identifier_chain)
+            || Self::cursor_is_at_merge_then_action_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
+            || Self::cursor_is_at_merge_when_keyword_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
+            || Self::cursor_is_after_set_operator_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
+            || Self::cursor_is_after_complete_from_relation_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
+            || Self::cursor_is_after_complete_alter_table_target_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
+            || Self::cursor_is_at_locking_clause_keyword_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
+            || Self::expected_statement_structural_keyword_candidates_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
+            .is_some()
+            || Self::expected_referential_action_keyword_candidates_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
+            .is_some()
+            || Self::expected_sounds_like_keyword_candidates_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+            .is_some()
+            || Self::cursor_is_in_invalid_set_operation_branch_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
+    }
+
     /// The single enumeration of cursor positions whose grammar is keyword- or
     /// value-only, where a column is never valid and must be suppressed. Every
     /// keyword-only slot here has a matching keyword hint in
@@ -5446,6 +5765,16 @@ impl SqlEditorWidget {
                 deep_ctx,
                 exclude_current_identifier_chain,
             )
+            || Self::expected_statement_structural_keyword_candidates_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
+            .is_some()
+            || Self::expected_referential_action_keyword_candidates_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
+            .is_some()
             || Self::cursor_is_in_table_sample_clause_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
@@ -5456,6 +5785,10 @@ impl SqlEditorWidget {
                 db_type,
             )
             .is_some()
+            || Self::cursor_is_in_invalid_set_operation_branch_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
     }
 
     /// True when the cursor is inside an Oracle `TABLESAMPLE`/row-sampling clause
@@ -5553,9 +5886,9 @@ impl SqlEditorWidget {
     /// the same slots, so identifier suppression cannot drift from keyword
     /// emission. The join-type slots are gated on a table context (matching the
     /// emission side) so a column or function named `left`/`right`/… in an
-    /// expression keeps its suggestions; the clause openers are reserved words
-    /// whose bare unqualified use is only a clause start, so they suppress in any
-    /// context (a qualified member like `t.order ` is excluded as a column).
+    /// expression keeps its suggestions; the clause openers are excluded before
+    /// the current query's `FROM` and when written as qualified members, where
+    /// they are expressions rather than clause tails.
     fn cursor_is_at_pure_clause_keyword_continuation_for_context(
         deep_ctx: &intellisense_context::CursorContext,
         exclude_current_identifier_chain: bool,
@@ -5569,10 +5902,12 @@ impl SqlEditorWidget {
         );
         let words = Self::previous_meaningful_words_upper(tokens, end, 6);
         let trigger_is_qualified_member = Self::trigger_word_is_qualified_member(tokens, end);
+        let before_from = Self::cursor_is_before_current_query_from_clause(tokens, end);
         let in_table_context = deep_ctx.phase.is_table_context();
         match words.as_slice() {
             [.., last]
                 if !trigger_is_qualified_member
+                    && !before_from
                     && (*last == "ORDER" || *last == "GROUP" || *last == "CONNECT") =>
             {
                 true
@@ -5588,18 +5923,8 @@ impl SqlEditorWidget {
             {
                 true
             }
-            [.., prev, last] if *prev == "ORDER" && *last == "SIBLINGS" => true,
-            [.., last] if !trigger_is_qualified_member && *last == "START" => true,
-            // `... REFERENCES t (...) ON DELETE |` / `ON UPDATE |` -> a fixed
-            // referential-action keyword (`CASCADE`, `SET NULL`, …), never a
-            // relation. Anchored on the `ON` immediately before so a DML
-            // `DELETE`/`UPDATE` statement keyword (not preceded by `ON`) is left
-            // alone.
-            [.., prev, last]
-                if *prev == "ON" && matches!(last.as_str(), "DELETE" | "UPDATE") =>
-            {
-                true
-            }
+            [.., prev, last] if !before_from && *prev == "ORDER" && *last == "SIBLINGS" => true,
+            [.., last] if !trigger_is_qualified_member && !before_from && *last == "START" => true,
             [.., last]
                 if in_table_context
                     && matches!(
@@ -5620,14 +5945,52 @@ impl SqlEditorWidget {
         }
     }
 
-    /// True when the cursor sits right after the `IS` null-test operator —
-    /// `<expr> IS |` or `<expr> IS NOT |`. Only keywords (`NOT`, `NULL`, …) are
-    /// grammatical there; a bare identifier is never valid in any dialect or
-    /// clause, so this is a pure keyword position regardless of phase. Mirrors the
-    /// hints `collect_expected_keyword_suggestions` emits for the same slots so
-    /// identifier suppression cannot drift from keyword emission. A qualified
-    /// member written `t.is ` is excluded (there `is` is a column, not the
-    /// operator).
+    /// Keyword candidates right after the `IS` null-test operator — `<expr> IS |`
+    /// or `<expr> IS NOT |`. The `IS` token must itself follow a completed
+    /// operand; otherwise a keyword-shaped identifier in a select list (`SELECT
+    /// is | FROM t`) would be mistaken for an operator tail. Mirrors the
+    /// suppression predicate below so keyword emission and identifier suppression
+    /// cannot drift.
+    fn expected_is_null_test_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> Option<&'static [&'static str]> {
+        let meaningful: Vec<(usize, &SqlToken)> = tokens
+            .get(..end)
+            .unwrap_or(tokens)
+            .iter()
+            .enumerate()
+            .filter(|(_, token)| !matches!(token, SqlToken::Comment(_)))
+            .collect();
+        let (last_idx, last_token) = meaningful.last().copied()?;
+
+        let left_operand_before_is = |is_idx: usize| {
+            Self::cursor_follows_complete_operand(tokens, is_idx) == Some(true)
+                && !matches!(
+                    is_idx.checked_sub(1).and_then(|idx| tokens.get(idx)),
+                    Some(SqlToken::Symbol(sym)) if sym == "."
+                )
+        };
+
+        match last_token {
+            SqlToken::Word(word) if word.eq_ignore_ascii_case("IS") => {
+                left_operand_before_is(last_idx).then_some(&["NOT", "NULL"][..])
+            }
+            SqlToken::Word(word) if word.eq_ignore_ascii_case("NOT") => {
+                let (is_idx, is_token) =
+                    meaningful.len().checked_sub(2).and_then(|idx| meaningful.get(idx))?;
+                if matches!(is_token, SqlToken::Word(is_word) if is_word.eq_ignore_ascii_case("IS"))
+                    && left_operand_before_is(*is_idx)
+                {
+                    Some(&["NULL"])
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn cursor_is_at_is_null_test_keyword_position_for_context(
         deep_ctx: &intellisense_context::CursorContext,
         exclude_current_identifier_chain: bool,
@@ -5639,13 +6002,7 @@ impl SqlEditorWidget {
             cursor_token_len,
             exclude_current_identifier_chain,
         );
-        let words = Self::previous_meaningful_words_upper(tokens, end, 6);
-        let trigger_is_qualified_member = Self::trigger_word_is_qualified_member(tokens, end);
-        match words.as_slice() {
-            [.., prev, last] if *prev == "IS" && *last == "NOT" => true,
-            [.., last] if !trigger_is_qualified_member && *last == "IS" => true,
-            _ => false,
-        }
+        Self::expected_is_null_test_keyword_candidates(tokens, end).is_some()
     }
 
     /// Structural keyword hint for the position right after a *complete* DML
@@ -6416,6 +6773,614 @@ impl SqlEditorWidget {
         }
     }
 
+    fn is_statement_structural_anchor_word(word: &str) -> bool {
+        matches!(
+            word,
+            "ALTER"
+                | "ANALYZE"
+                | "CHECK"
+                | "COMMENT"
+                | "CREATE"
+                | "DROP"
+                | "EXECUTE"
+                | "FLASHBACK"
+                | "LOCK"
+                | "OPTIMIZE"
+                | "REPAIR"
+                | "TRUNCATE"
+        )
+    }
+
+    fn meaningful_tokens_with_indices_before(
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> Vec<(usize, &SqlToken)> {
+        tokens
+            .get(..end)
+            .unwrap_or(tokens)
+            .iter()
+            .enumerate()
+            .filter(|(_, token)| !matches!(token, SqlToken::Comment(_)))
+            .collect()
+    }
+
+    fn token_can_begin_statement_at(tokens: &[SqlToken], anchor_idx: usize) -> bool {
+        match Self::cursor_statement_start_context(tokens, anchor_idx) {
+            Some(StatementStartContext::TopLevel) => true,
+            Some(StatementStartContext::Plsql(policy)) => policy.allow_statements,
+            None => false,
+        }
+    }
+
+    fn statement_start_anchor_index(
+        tokens: &[SqlToken],
+        end: usize,
+        anchors: &[&str],
+    ) -> Option<usize> {
+        tokens
+            .get(..end)
+            .unwrap_or(tokens)
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(idx, token)| {
+            let SqlToken::Word(word) = token else {
+                return None;
+            };
+            let upper = word.to_ascii_uppercase();
+            (anchors.contains(&upper.as_str()) && Self::token_can_begin_statement_at(tokens, idx))
+            .then_some(idx)
+        })
+    }
+
+    fn cursor_has_statement_start_anchor(
+        tokens: &[SqlToken],
+        end: usize,
+        anchors: &[&str],
+    ) -> bool {
+        Self::statement_start_anchor_index(tokens, end, anchors).is_some()
+    }
+
+    fn word_is_statement_structural_boundary_after_anchor(word: &str) -> bool {
+        matches!(
+            word,
+            "BEGIN"
+                | "DECLARE"
+                | "DELETE"
+                | "ELSE"
+                | "EXCEPT"
+                | "EXCEPTION"
+                | "FROM"
+                | "FULL"
+                | "GROUP"
+                | "HAVING"
+                | "INNER"
+                | "INSERT"
+                | "INTERSECT"
+                | "JOIN"
+                | "LEFT"
+                | "LOOP"
+                | "MERGE"
+                | "MINUS"
+                | "NATURAL"
+                | "ORDER"
+                | "RIGHT"
+                | "SELECT"
+                | "THEN"
+                | "UNION"
+                | "UPDATE"
+                | "VALUES"
+                | "WHERE"
+                | "WITH"
+        )
+    }
+
+    fn cursor_is_in_statement_structural_head(tokens: &[SqlToken], end: usize) -> bool {
+        let toks = Self::meaningful_tokens_with_indices_before(tokens, end);
+        let Some(anchor_pos) = toks.iter().enumerate().rev().find_map(|(pos, (idx, token))| {
+            let SqlToken::Word(word) = token else {
+                return None;
+            };
+            (Self::is_statement_structural_anchor_word(&word.to_ascii_uppercase())
+                && Self::token_can_begin_statement_at(tokens, *idx))
+            .then_some(pos)
+        }) else {
+            return false;
+        };
+
+        !toks.iter().skip(anchor_pos + 1).any(|(_, token)| match token {
+            SqlToken::Symbol(sym) => sym == ";",
+            SqlToken::Word(word) => Self::word_is_statement_structural_boundary_after_anchor(
+                &word.to_ascii_uppercase(),
+            ),
+            _ => false,
+        })
+    }
+
+    fn cursor_is_in_object_command_head(tokens: &[SqlToken], end: usize) -> bool {
+        let toks = Self::meaningful_tokens_with_indices_before(tokens, end);
+        let Some(anchor_pos) =
+            toks.iter().enumerate().rev().find_map(|(pos, (idx, token))| {
+                let SqlToken::Word(word) = token else {
+                    return None;
+                };
+                let upper = word.to_ascii_uppercase();
+                (matches!(upper.as_str(), "CALL" | "DESC" | "DESCRIBE" | "EXEC" | "EXECUTE")
+                    && Self::token_can_begin_statement_at(tokens, *idx))
+                .then_some(pos)
+            })
+        else {
+            return false;
+        };
+
+        !toks.iter().skip(anchor_pos + 1).any(|(_, token)| match token {
+            SqlToken::Symbol(sym) => sym == ";",
+            SqlToken::Word(word) => Self::word_is_statement_structural_boundary_after_anchor(
+                &word.to_ascii_uppercase(),
+            ),
+            _ => false,
+        })
+    }
+
+    fn cursor_is_at_foreign_key_references_table_slot(tokens: &[SqlToken], end: usize) -> bool {
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        if !matches!(toks.last(), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("REFERENCES"))
+        {
+            return false;
+        }
+        if !Self::cursor_is_in_statement_structural_head(tokens, end) {
+            return false;
+        }
+
+        let first = toks.iter().find_map(|token| match token {
+            SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+            _ => None,
+        });
+        if !matches!(first.as_deref(), Some("ALTER" | "CREATE")) {
+            return false;
+        }
+
+        toks.iter()
+            .any(|token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("TABLE")))
+    }
+
+    fn cursor_is_at_create_on_table_target_slot(tokens: &[SqlToken], end: usize) -> bool {
+        let toks = Self::meaningful_tokens_with_indices_before(tokens, end);
+        let Some(on_idx) = toks.len().checked_sub(1) else {
+            return false;
+        };
+        if !matches!(toks.get(on_idx), Some((_, SqlToken::Word(word))) if word.eq_ignore_ascii_case("ON"))
+        {
+            return false;
+        }
+
+        let Some(object_idx) = toks[..on_idx].iter().enumerate().rev().find_map(|(idx, (_, token))| {
+            let SqlToken::Word(word) = token else {
+                return None;
+            };
+            matches!(word.to_ascii_uppercase().as_str(), "INDEX" | "TRIGGER").then_some(idx)
+        }) else {
+            return false;
+        };
+        let Some(create_idx) = toks[..object_idx].iter().enumerate().rev().find_map(|(idx, (_, token))| {
+            matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("CREATE"))
+                .then_some(idx)
+        }) else {
+            return false;
+        };
+
+        if !Self::token_can_begin_statement_at(tokens, toks[create_idx].0) {
+            return false;
+        }
+
+        if toks[object_idx + 1..on_idx].iter().any(|(_, token)| match token {
+            SqlToken::Symbol(sym) => sym == ";",
+            SqlToken::Word(word) => matches!(
+                word.to_ascii_uppercase().as_str(),
+                "BEGIN"
+                    | "DECLARE"
+                    | "ELSE"
+                    | "EXCEPT"
+                    | "EXCEPTION"
+                    | "FROM"
+                    | "GROUP"
+                    | "HAVING"
+                    | "INTERSECT"
+                    | "JOIN"
+                    | "LOOP"
+                    | "MINUS"
+                    | "ORDER"
+                    | "SELECT"
+                    | "THEN"
+                    | "UNION"
+                    | "VALUES"
+                    | "WHERE"
+                    | "WITH"
+            ),
+            _ => false,
+        }) {
+            return false;
+        }
+
+        !toks[create_idx + 1..object_idx].iter().any(|(_, token)| match token {
+            SqlToken::Symbol(sym) => sym == ";",
+            SqlToken::Word(word) => matches!(
+                word.to_ascii_uppercase().as_str(),
+                "BEGIN"
+                    | "DECLARE"
+                    | "ELSE"
+                    | "EXCEPT"
+                    | "EXCEPTION"
+                    | "FROM"
+                    | "GROUP"
+                    | "HAVING"
+                    | "INTERSECT"
+                    | "JOIN"
+                    | "LOOP"
+                    | "MINUS"
+                    | "ORDER"
+                    | "SELECT"
+                    | "THEN"
+                    | "UNION"
+                    | "VALUES"
+                    | "WHERE"
+                    | "WITH"
+            ),
+            _ => false,
+        })
+    }
+
+    fn expected_statement_structural_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> Option<&'static [&'static str]> {
+        const OBJECT_TYPE_KEYWORDS: &[&str] = &[
+            "TABLE",
+            "VIEW",
+            "MATERIALIZED",
+            "TYPE",
+            "TRIGGER",
+            "INDEX",
+            "PROCEDURE",
+            "FUNCTION",
+            "PACKAGE",
+            "SEQUENCE",
+            "SYNONYM",
+            "DATABASE",
+            "DIRECTORY",
+            "TABLESPACE",
+            "USER",
+            "ROLE",
+            "PROFILE",
+            "ROLLBACK",
+            "JAVA",
+            "LIBRARY",
+            "CLUSTER",
+            "CONTEXT",
+            "DIMENSION",
+            "OPERATOR",
+            "INDEXTYPE",
+            "EDITION",
+            "PUBLIC",
+        ];
+        const ALTER_OBJECT_TYPE_KEYWORDS: &[&str] = &[
+            "TABLE",
+            "VIEW",
+            "MATERIALIZED",
+            "TYPE",
+            "TRIGGER",
+            "INDEX",
+            "PROCEDURE",
+            "FUNCTION",
+            "PACKAGE",
+            "SEQUENCE",
+            "SYNONYM",
+            "DATABASE",
+            "TABLESPACE",
+            "USER",
+            "ROLE",
+            "PROFILE",
+            "PUBLIC",
+            "SHARED",
+            "ROLLBACK",
+            "JAVA",
+            "LIBRARY",
+            "CLUSTER",
+            "DIMENSION",
+            "OPERATOR",
+            "INDEXTYPE",
+            "SYSTEM",
+            "SESSION",
+        ];
+        const CREATE_OBJECT_TYPE_KEYWORDS: &[&str] = &[
+            "TABLE",
+            "VIEW",
+            "MATERIALIZED",
+            "EDITIONING",
+            "TYPE",
+            "TRIGGER",
+            "INDEX",
+            "PROCEDURE",
+            "FUNCTION",
+            "PACKAGE",
+            "SEQUENCE",
+            "SYNONYM",
+            "DATABASE",
+            "DIRECTORY",
+            "TABLESPACE",
+            "SHARED",
+            "USER",
+            "ROLE",
+            "PROFILE",
+            "ROLLBACK",
+            "JAVA",
+            "LIBRARY",
+            "CLUSTER",
+            "CONTEXT",
+            "DIMENSION",
+            "OPERATOR",
+            "INDEXTYPE",
+            "EDITION",
+            "PUBLIC",
+        ];
+        const CREATE_OR_REPLACE_OBJECT_TYPE_KEYWORDS: &[&str] = &[
+            "TABLE",
+            "VIEW",
+            "MATERIALIZED",
+            "EDITIONING",
+            "TYPE",
+            "TRIGGER",
+            "INDEX",
+            "PROCEDURE",
+            "FUNCTION",
+            "PACKAGE",
+            "SEQUENCE",
+            "SYNONYM",
+            "DIRECTORY",
+            "LIBRARY",
+            "USER",
+            "JAVA",
+            "PUBLIC",
+        ];
+        const COMMENT_OBJECT_TYPE_KEYWORDS: &[&str] =
+            &["COLUMN", "TABLE", "VIEW", "MATERIALIZED", "EDITIONING"];
+
+        if !Self::cursor_is_in_statement_structural_head(tokens, end) {
+            return None;
+        }
+
+        let words = Self::previous_meaningful_words_upper(tokens, end, 12);
+        if Self::is_create_synonym_name_written_context(&words) {
+            return Some(&["FOR"]);
+        }
+        if let Some(candidates) = Self::expected_database_link_keyword_candidates(&words) {
+            return Some(candidates);
+        }
+        if let Some(candidates) = Self::expected_java_keyword_candidates(&words) {
+            return Some(candidates);
+        }
+        if let Some(candidates) = Self::expected_rollback_segment_keyword_candidates(&words) {
+            return Some(candidates);
+        }
+
+        match words.as_slice() {
+            [.., last] if *last == "CREATE" => Some(CREATE_OBJECT_TYPE_KEYWORDS),
+            [.., last] if *last == "DROP" => Some(OBJECT_TYPE_KEYWORDS),
+            [.., last] if *last == "ALTER" => Some(ALTER_OBJECT_TYPE_KEYWORDS),
+            [.., prev, last]
+                if *prev == "CREATE" && matches!(last.as_str(), "UNIQUE" | "BITMAP") =>
+            {
+                Some(&["INDEX"])
+            }
+            [.., prev, last] if *prev == "CREATE" && *last == "GLOBAL" => Some(&["TEMPORARY"]),
+            [.., a, b, c] if *a == "CREATE" && *b == "GLOBAL" && *c == "TEMPORARY" => {
+                Some(&["TABLE"])
+            }
+            [.., prev, last]
+                if matches!(prev.as_str(), "CREATE" | "DROP" | "ALTER" | "ON")
+                    && *last == "MATERIALIZED" =>
+            {
+                Some(&["VIEW"])
+            }
+            [.., a, b, c, d]
+                if *a == "CREATE" && *b == "OR" && *c == "REPLACE" && *d == "MATERIALIZED" =>
+            {
+                Some(&["VIEW"])
+            }
+            [.., a, b, c]
+                if matches!(a.as_str(), "ALTER" | "CREATE" | "DROP")
+                    && *b == "MATERIALIZED"
+                    && *c == "VIEW" =>
+            {
+                Some(&["LOG"])
+            }
+            [.., a, b, c, d]
+                if matches!(a.as_str(), "ALTER" | "CREATE" | "DROP")
+                    && *b == "MATERIALIZED"
+                    && *c == "VIEW"
+                    && *d == "LOG" =>
+            {
+                Some(&["ON"])
+            }
+            [.., prev, last]
+                if matches!(prev.as_str(), "CREATE" | "ON") && *last == "EDITIONING" =>
+            {
+                Some(&["VIEW"])
+            }
+            [.., a, b, c, d]
+                if *a == "CREATE" && *b == "OR" && *c == "REPLACE" && *d == "EDITIONING" =>
+            {
+                Some(&["VIEW"])
+            }
+            [.., prev, last]
+                if matches!(prev.as_str(), "CREATE" | "DROP")
+                    && matches!(last.as_str(), "PACKAGE" | "TYPE") =>
+            {
+                Some(&["BODY"])
+            }
+            [.., a, b, c, d]
+                if *a == "CREATE"
+                    && *b == "OR"
+                    && *c == "REPLACE"
+                    && matches!(d.as_str(), "PACKAGE" | "TYPE") =>
+            {
+                Some(&["BODY"])
+            }
+            [.., prev, last] if *prev == "CREATE" && *last == "PUBLIC" => {
+                Some(&["SYNONYM", "DATABASE", "ROLLBACK"])
+            }
+            [.., prev, last]
+                if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "PUBLIC" =>
+            {
+                Some(&["SYNONYM", "DATABASE"])
+            }
+            [.., a, b, c, d]
+                if *a == "CREATE" && *b == "OR" && *c == "REPLACE" && *d == "PUBLIC" =>
+            {
+                Some(&["SYNONYM"])
+            }
+            [.., prev, last] if *prev == "COMMENT" && *last == "ON" => {
+                Some(COMMENT_OBJECT_TYPE_KEYWORDS)
+            }
+            [.., a, b, c] if *a == "CREATE" && *b == "OR" && *c == "REPLACE" => {
+                Some(CREATE_OR_REPLACE_OBJECT_TYPE_KEYWORDS)
+            }
+            [.., last] if *last == "TRUNCATE" || *last == "LOCK" || *last == "FLASHBACK" => {
+                Some(&["TABLE"])
+            }
+            [.., last]
+                if matches!(
+                    last.as_str(),
+                    "ANALYZE" | "OPTIMIZE" | "CHECK" | "REPAIR"
+                ) =>
+            {
+                Some(&["TABLE"])
+            }
+            [.., prev, last] if *prev == "ALTER" && *last == "SESSION" => Some(&["SET"]),
+            [.., a, b, c] if *a == "ALTER" && *b == "SESSION" && *c == "SET" => {
+                Some(&["CURRENT_SCHEMA"])
+            }
+            [.., last] if *last == "COMMENT" => Some(&["ON"]),
+            [.., last] if *last == "EXECUTE" => Some(&["IMMEDIATE"]),
+            [.., prev, last] if *prev == "CREATE" && *last == "OR" => Some(&["REPLACE"]),
+            _ => None,
+        }
+    }
+
+    fn expected_statement_structural_keyword_candidates_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> Option<&'static [&'static str]> {
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let cursor_token_len = deep_ctx.cursor_token_len;
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::expected_statement_structural_keyword_candidates(tokens, end)
+    }
+
+    fn expected_dml_statement_head_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> Option<&'static [&'static str]> {
+        let words = Self::previous_meaningful_words_upper(tokens, end, 2);
+        match words.as_slice() {
+            [last] if *last == "DELETE" => Some(&["FROM"]),
+            [last] if *last == "INSERT" || *last == "MERGE" => Some(&["INTO"]),
+            _ => None,
+        }
+    }
+
+    fn expected_referential_action_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> Option<&'static [&'static str]> {
+        let toks = Self::meaningful_tokens_with_indices_before(tokens, end);
+        let last = toks.len().checked_sub(1)?;
+        let on = last.checked_sub(1)?;
+        if !matches!(toks.get(on), Some((_, SqlToken::Word(word))) if word.eq_ignore_ascii_case("ON")) {
+            return None;
+        }
+        if matches!(
+            on.checked_sub(1).and_then(|index| toks.get(index).map(|(_, token)| *token)),
+            Some(SqlToken::Symbol(sym)) if sym == "."
+        ) {
+            return None;
+        }
+
+        let Some((first_idx, first)) = toks.iter().find_map(|(idx, token)| match token {
+            SqlToken::Word(word) => Some((*idx, word.to_ascii_uppercase())),
+            _ => None,
+        }) else {
+            return None;
+        };
+        if !matches!(first.as_str(), "ALTER" | "CREATE") {
+            return None;
+        }
+        if !Self::token_can_begin_statement_at(tokens, first_idx) {
+            return None;
+        }
+        let Some(references_idx) = toks[..on].iter().enumerate().rev().find_map(|(idx, (_, token))| {
+            matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("REFERENCES"))
+                .then_some(idx)
+        }) else {
+            return None;
+        };
+        let Some(table_idx) = toks[..references_idx]
+            .iter()
+            .enumerate()
+            .find_map(|(idx, (_, token))| {
+                matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("TABLE"))
+                    .then_some(idx)
+            })
+        else {
+            return None;
+        };
+        if toks[table_idx + 1..references_idx]
+            .iter()
+            .any(|(_, token)| match token {
+                SqlToken::Symbol(sym) => sym == ";",
+                SqlToken::Word(word) => Self::word_is_statement_structural_boundary_after_anchor(
+                    &word.to_ascii_uppercase(),
+                ),
+                _ => false,
+            })
+        {
+            return None;
+        }
+
+        match toks.get(last).map(|(_, token)| *token) {
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("DELETE") => {
+                Some(&["CASCADE", "SET NULL", "SET DEFAULT", "NO ACTION", "RESTRICT"])
+            }
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("UPDATE") => Some(&[
+                "CASCADE",
+                "SET NULL",
+                "SET DEFAULT",
+                "NO ACTION",
+                "RESTRICT",
+                "CURRENT_TIMESTAMP",
+            ]),
+            _ => None,
+        }
+    }
+
+    fn expected_referential_action_keyword_candidates_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> Option<&'static [&'static str]> {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::expected_referential_action_keyword_candidates(tokens, end)
+    }
+
     fn is_create_synonym_target_context(words: &[String]) -> bool {
         if words.last().is_none_or(|word| word != "FOR") {
             return false;
@@ -6444,23 +7409,6 @@ impl SqlEditorWidget {
             && words
                 .get(..synonym_idx)
                 .is_some_and(|prefix| prefix.iter().any(|word| word == "CREATE"))
-    }
-
-    fn is_create_on_table_target_context(words: &[String]) -> bool {
-        if words.last().is_none_or(|word| word != "ON") {
-            return false;
-        }
-
-        let Some(create_idx) = words.iter().rposition(|word| word == "CREATE") else {
-            return false;
-        };
-        words
-            .get(create_idx + 1..words.len().saturating_sub(1))
-            .is_some_and(|middle| {
-                middle
-                    .iter()
-                    .any(|word| matches!(word.as_str(), "INDEX" | "TRIGGER"))
-            })
     }
 
     fn completion_suggestion_matches_prefix(suggestion: &str, prefix: &str) -> bool {
@@ -6648,15 +7596,31 @@ impl SqlEditorWidget {
         const SET_OPERATORS: &[&str] = &["UNION", "INTERSECT", "EXCEPT", "MINUS"];
         let is_set_op =
             |word: &str| SET_OPERATORS.iter().any(|op| word.eq_ignore_ascii_case(op));
+        let is_multiset_set_op = |toks: &[&SqlToken], set_op_idx: usize| {
+            matches!(
+                set_op_idx.checked_sub(1).and_then(|idx| toks.get(idx)),
+                Some(SqlToken::Word(prev_word)) if prev_word.eq_ignore_ascii_case("MULTISET")
+            )
+        };
         let toks = Self::meaningful_tokens_before(tokens, end);
         match toks.last() {
-            Some(SqlToken::Word(word)) if is_set_op(word) => Some(&["SELECT", "ALL"]),
+            Some(SqlToken::Word(word)) if is_set_op(word) => {
+                let set_op_idx = toks.len().saturating_sub(1);
+                (!is_multiset_set_op(&toks, set_op_idx)).then_some(&["SELECT", "ALL"][..])
+            }
             Some(SqlToken::Word(word))
                 if word.eq_ignore_ascii_case("ALL") || word.eq_ignore_ascii_case("DISTINCT") =>
             {
                 let prev = toks.len().checked_sub(2).and_then(|idx| toks.get(idx));
                 match prev {
-                    Some(SqlToken::Word(prev_word)) if is_set_op(prev_word) => Some(&["SELECT"]),
+                    Some(SqlToken::Word(prev_word))
+                        if is_set_op(prev_word)
+                            && toks.len()
+                                .checked_sub(2)
+                                .is_some_and(|idx| !is_multiset_set_op(&toks, idx)) =>
+                    {
+                        Some(&["SELECT"])
+                    }
                     _ => None,
                 }
             }
@@ -6668,8 +7632,8 @@ impl SqlEditorWidget {
         deep_ctx: &intellisense_context::CursorContext,
         exclude_current_identifier_chain: bool,
     ) -> bool {
-        let tokens = Self::current_query_tokens(deep_ctx);
-        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let cursor_token_len = deep_ctx.cursor_token_len;
         let end = Self::expected_suggestion_context_end(
             tokens,
             cursor_token_len,
@@ -6758,121 +7722,23 @@ impl SqlEditorWidget {
             "SELECT", "WITH", "INSERT", "UPDATE", "DELETE", "MERGE", "CREATE", "ALTER", "DROP",
             "BEGIN", "DECLARE", "CALL", "VALUES",
         ];
-        const OBJECT_TYPE_KEYWORDS: &[&str] = &[
-            "TABLE",
-            "VIEW",
-            "MATERIALIZED",
-            "TYPE",
-            "TRIGGER",
-            "INDEX",
-            "PROCEDURE",
-            "FUNCTION",
-            "PACKAGE",
-            "SEQUENCE",
-            "SYNONYM",
-            "DATABASE",
-            "DIRECTORY",
-            "TABLESPACE",
-            "USER",
-            "ROLE",
-            "PROFILE",
-            "ROLLBACK",
-            "JAVA",
-            "LIBRARY",
-            "CLUSTER",
-            "CONTEXT",
-            "DIMENSION",
-            "OPERATOR",
-            "INDEXTYPE",
-            "EDITION",
-            "PUBLIC",
-        ];
-        const ALTER_OBJECT_TYPE_KEYWORDS: &[&str] = &[
-            "TABLE",
-            "VIEW",
-            "MATERIALIZED",
-            "TYPE",
-            "TRIGGER",
-            "INDEX",
-            "PROCEDURE",
-            "FUNCTION",
-            "PACKAGE",
-            "SEQUENCE",
-            "SYNONYM",
-            "DATABASE",
-            "TABLESPACE",
-            "USER",
-            "ROLE",
-            "PROFILE",
-            "PUBLIC",
-            "SHARED",
-            "ROLLBACK",
-            "JAVA",
-            "LIBRARY",
-            "CLUSTER",
-            "DIMENSION",
-            "OPERATOR",
-            "INDEXTYPE",
-            "SYSTEM",
-            "SESSION",
-        ];
-        const CREATE_OBJECT_TYPE_KEYWORDS: &[&str] = &[
-            "TABLE",
-            "VIEW",
-            "MATERIALIZED",
-            "EDITIONING",
-            "TYPE",
-            "TRIGGER",
-            "INDEX",
-            "PROCEDURE",
-            "FUNCTION",
-            "PACKAGE",
-            "SEQUENCE",
-            "SYNONYM",
-            "DATABASE",
-            "DIRECTORY",
-            "TABLESPACE",
-            "SHARED",
-            "USER",
-            "ROLE",
-            "PROFILE",
-            "ROLLBACK",
-            "JAVA",
-            "LIBRARY",
-            "CLUSTER",
-            "CONTEXT",
-            "DIMENSION",
-            "OPERATOR",
-            "INDEXTYPE",
-            "EDITION",
-            "PUBLIC",
-        ];
-        const CREATE_OR_REPLACE_OBJECT_TYPE_KEYWORDS: &[&str] = &[
-            "TABLE",
-            "VIEW",
-            "MATERIALIZED",
-            "EDITIONING",
-            "TYPE",
-            "TRIGGER",
-            "INDEX",
-            "PROCEDURE",
-            "FUNCTION",
-            "PACKAGE",
-            "SEQUENCE",
-            "SYNONYM",
-            "DIRECTORY",
-            "LIBRARY",
-            "USER",
-            "JAVA",
-            "PUBLIC",
-        ];
-        const COMMENT_OBJECT_TYPE_KEYWORDS: &[&str] =
-            &["COLUMN", "TABLE", "VIEW", "MATERIALIZED", "EDITIONING"];
 
         let tokens = Self::current_query_tokens(deep_ctx);
         let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
         let context_end =
             Self::expected_suggestion_context_end(tokens, cursor_token_len, !prefix.is_empty());
+        let statement_tokens = deep_ctx.statement_tokens.as_ref();
+        let statement_context_end = Self::expected_suggestion_context_end(
+            statement_tokens,
+            deep_ctx.cursor_token_len,
+            !prefix.is_empty(),
+        );
+        if Self::cursor_is_in_invalid_set_operation_branch_for_context(
+            deep_ctx,
+            !prefix.is_empty(),
+        ) {
+            return Vec::new();
+        }
         if matches!(
             deep_ctx.phase,
             intellisense_context::SqlPhase::OrderByClause
@@ -6996,13 +7862,29 @@ impl SqlEditorWidget {
         }
 
         let words = Self::previous_meaningful_words_upper(tokens, context_end, 6);
-        if let Some(candidates) = Self::expected_database_link_keyword_candidates(&words) {
+        if let Some(candidates) =
+            Self::expected_statement_structural_keyword_candidates(
+                statement_tokens,
+                statement_context_end,
+            )
+        {
             return Self::filter_expected_candidates(prefix, candidates);
         }
-        if let Some(candidates) = Self::expected_java_keyword_candidates(&words) {
+        if let Some(candidates) =
+            Self::expected_dml_statement_head_keyword_candidates(
+                statement_tokens,
+                statement_context_end,
+            )
+        {
             return Self::filter_expected_candidates(prefix, candidates);
         }
-        if let Some(candidates) = Self::expected_rollback_segment_keyword_candidates(&words) {
+        if let Some(candidates) =
+            Self::expected_referential_action_keyword_candidates(tokens, context_end)
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(candidates) = Self::expected_is_null_test_keyword_candidates(tokens, context_end)
+        {
             return Self::filter_expected_candidates(prefix, candidates);
         }
         if let Some(candidates) = Self::merge_then_action_keywords(tokens, context_end) {
@@ -7011,7 +7893,8 @@ impl SqlEditorWidget {
         if let Some(candidates) = Self::merge_when_action_keywords(tokens, context_end) {
             return Self::filter_expected_candidates(prefix, candidates);
         }
-        if let Some(candidates) = Self::expected_set_operator_keyword_candidates(tokens, context_end)
+        if let Some(candidates) =
+            Self::expected_set_operator_keyword_candidates(statement_tokens, statement_context_end)
         {
             return Self::filter_expected_candidates(prefix, candidates);
         }
@@ -7033,6 +7916,7 @@ impl SqlEditorWidget {
         // continuation must not be offered.
         let trigger_is_qualified_member =
             Self::trigger_word_is_qualified_member(tokens, context_end);
+        let before_from = Self::cursor_is_before_current_query_from_clause(tokens, context_end);
 
         let candidates: &[&str] = match words.as_slice() {
             // `previous_meaningful_words_upper` stops at the first non-word token
@@ -7049,9 +7933,9 @@ impl SqlEditorWidget {
                 TOP_LEVEL_KEYWORDS
             }
             [] => &[],
-            _ if Self::is_create_synonym_name_written_context(&words) => &["FOR"],
             [.., last]
                 if !trigger_is_qualified_member
+                    && !before_from
                     && (*last == "ORDER" || *last == "GROUP" || *last == "CONNECT") =>
             {
                 &["BY"]
@@ -7069,31 +7953,12 @@ impl SqlEditorWidget {
             {
                 &["BY"]
             }
-            [.., prev, last] if *prev == "ORDER" && *last == "SIBLINGS" => &["BY"],
-            [.., last] if !trigger_is_qualified_member && *last == "START" => &["WITH"],
-            // Foreign-key referential actions: `ON DELETE |` / `ON UPDATE |`. The
-            // `ON UPDATE` slot additionally admits the MySQL column-default
-            // `CURRENT_TIMESTAMP`. Anchored on `ON` so a DML `DELETE`/`UPDATE`
-            // statement keyword keeps its own continuation below.
-            [.., prev, last] if *prev == "ON" && *last == "DELETE" => {
-                &["CASCADE", "SET NULL", "SET DEFAULT", "NO ACTION", "RESTRICT"]
+            [.., prev, last] if !before_from && *prev == "ORDER" && *last == "SIBLINGS" => {
+                &["BY"]
             }
-            [.., prev, last] if *prev == "ON" && *last == "UPDATE" => &[
-                "CASCADE",
-                "SET NULL",
-                "SET DEFAULT",
-                "NO ACTION",
-                "RESTRICT",
-                "CURRENT_TIMESTAMP",
-            ],
-            // `<expr> IS NOT |` -> NULL; `<expr> IS |` -> NOT / NULL. Only keywords
-            // are grammatical after `IS`, so the matching suppression predicate
-            // (`cursor_is_at_is_null_test_keyword_position_for_context`) clears the
-            // identifier list there.
-            [.., prev, last] if *prev == "IS" && *last == "NOT" => &["NULL"],
-            [.., last] if !trigger_is_qualified_member && *last == "IS" => &["NOT", "NULL"],
-            [.., last] if *last == "DELETE" => &["FROM"],
-            [.., last] if *last == "INSERT" || *last == "MERGE" => &["INTO"],
+            [.., last] if !trigger_is_qualified_member && !before_from && *last == "START" => {
+                &["WITH"]
+            }
             // `LEFT`/`RIGHT`/`FULL` may be followed by the optional `OUTER`
             // before `JOIN`, so both continuations are offered; `INNER`/`CROSS`/
             // `NATURAL` take only `JOIN`.
@@ -7115,110 +7980,7 @@ impl SqlEditorWidget {
             {
                 &["JOIN"]
             }
-            [.., last] if *last == "CREATE" => CREATE_OBJECT_TYPE_KEYWORDS,
-            [.., last] if *last == "DROP" => OBJECT_TYPE_KEYWORDS,
-            [.., last] if *last == "ALTER" => ALTER_OBJECT_TYPE_KEYWORDS,
-            [.., prev, last] if *prev == "CREATE" && matches!(last.as_str(), "UNIQUE" | "BITMAP") => {
-                &["INDEX"]
-            }
-            [.., prev, last] if *prev == "CREATE" && *last == "GLOBAL" => &["TEMPORARY"],
-            [.., a, b, c] if *a == "CREATE" && *b == "GLOBAL" && *c == "TEMPORARY" => {
-                &["TABLE"]
-            }
-            [.., prev, last]
-                if matches!(prev.as_str(), "CREATE" | "DROP" | "ALTER" | "ON")
-                    && *last == "MATERIALIZED" =>
-            {
-                &["VIEW"]
-            }
-            [.., a, b, c, d]
-                if *a == "CREATE" && *b == "OR" && *c == "REPLACE" && *d == "MATERIALIZED" =>
-            {
-                &["VIEW"]
-            }
-            [.., a, b, c]
-                if matches!(a.as_str(), "ALTER" | "CREATE" | "DROP")
-                    && *b == "MATERIALIZED"
-                    && *c == "VIEW" =>
-            {
-                &["LOG"]
-            }
-            [.., a, b, c, d]
-                if matches!(a.as_str(), "ALTER" | "CREATE" | "DROP")
-                    && *b == "MATERIALIZED"
-                    && *c == "VIEW"
-                    && *d == "LOG" =>
-            {
-                &["ON"]
-            }
-            [.., prev, last]
-                if matches!(prev.as_str(), "CREATE" | "ON") && *last == "EDITIONING" =>
-            {
-                &["VIEW"]
-            }
-            [.., a, b, c, d]
-                if *a == "CREATE" && *b == "OR" && *c == "REPLACE" && *d == "EDITIONING" =>
-            {
-                &["VIEW"]
-            }
-            [.., prev, last]
-                if matches!(prev.as_str(), "CREATE" | "DROP")
-                    && matches!(last.as_str(), "PACKAGE" | "TYPE") =>
-            {
-                &["BODY"]
-            }
-            [.., a, b, c, d]
-                if *a == "CREATE"
-                    && *b == "OR"
-                    && *c == "REPLACE"
-                    && matches!(d.as_str(), "PACKAGE" | "TYPE") =>
-            {
-                &["BODY"]
-            }
-            [.., prev, last] if *prev == "CREATE" && *last == "PUBLIC" => {
-                &["SYNONYM", "DATABASE", "ROLLBACK"]
-            }
-            [.., prev, last]
-                if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "PUBLIC" =>
-            {
-                &["SYNONYM", "DATABASE"]
-            }
-            [.., a, b, c, d]
-                if *a == "CREATE" && *b == "OR" && *c == "REPLACE" && *d == "PUBLIC" =>
-            {
-                &["SYNONYM"]
-            }
-            [.., prev, last] if *prev == "COMMENT" && *last == "ON" => {
-                COMMENT_OBJECT_TYPE_KEYWORDS
-            }
-            [.., a, b, c] if *a == "CREATE" && *b == "OR" && *c == "REPLACE" => {
-                CREATE_OR_REPLACE_OBJECT_TYPE_KEYWORDS
-            }
-            [.., last] if *last == "TRUNCATE" || *last == "LOCK" || *last == "FLASHBACK" => {
-                &["TABLE"]
-            }
-            [.., last]
-                if matches!(
-                    last.as_str(),
-                    "ANALYZE" | "OPTIMIZE" | "CHECK" | "REPAIR"
-                ) =>
-            {
-                &["TABLE"]
-            }
-            [.., prev, last] if *prev == "ALTER" && *last == "SESSION" => &["SET"],
-            [.., a, b, c] if *a == "ALTER" && *b == "SESSION" && *c == "SET" => {
-                &["CURRENT_SCHEMA"]
-            }
-            [.., last] if *last == "COMMENT" => &["ON"],
-            [.., last] if *last == "EXECUTE" => &["IMMEDIATE"],
-            [.., prev, last] if *prev == "CREATE" && *last == "OR" => &["REPLACE"],
-            _ => {
-                if deep_ctx.cursor_token_len == 0 {
-                    TOP_LEVEL_KEYWORDS
-                } else {
-                    &[]
-                }
-            }
+            _ => &[],
         };
 
         Self::filter_expected_candidates(prefix, candidates)
@@ -7334,39 +8096,76 @@ impl SqlEditorWidget {
         qualifier: Option<&str>,
         deep_ctx: &intellisense_context::CursorContext,
     ) -> Option<ExpectedObjectSuggestionKind> {
-        let tokens = Self::current_query_tokens(deep_ctx);
-        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
-        let words = Self::previous_meaningful_words_upper(
-            tokens,
-            Self::expected_suggestion_context_end(
-                tokens,
-                cursor_token_len,
-                !prefix.is_empty() || qualifier.is_some(),
-            ),
-            16,
-        );
+        let exclude_current_identifier_chain = !prefix.is_empty() || qualifier.is_some();
+        if Self::cursor_is_in_invalid_set_operation_branch_for_context(
+            deep_ctx,
+            exclude_current_identifier_chain,
+        ) {
+            return None;
+        }
+        if Self::data_type_position_for_context(deep_ctx, exclude_current_identifier_chain)
+            .is_some()
+        {
+            return Some(ExpectedObjectSuggestionKind::Type);
+        }
 
-        if let Some(kind) = Self::expected_grant_revoke_object_suggestion_kind(&words) {
-            return Some(kind);
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let cursor_token_len = deep_ctx.cursor_token_len;
+        let context_end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        let words = Self::previous_meaningful_words_upper(tokens, context_end, 16);
+
+        if Self::cursor_has_statement_start_anchor(
+            tokens,
+            context_end,
+            &["GRANT", "REVOKE", "AUDIT", "NOAUDIT"],
+        ) {
+            if let Some(kind) = Self::expected_grant_revoke_object_suggestion_kind(&words) {
+                return Some(kind);
+            }
         }
-        if let Some(kind) = Self::expected_grant_revoke_grantee_kind(&words) {
-            return Some(kind);
+        if Self::cursor_has_statement_start_anchor(tokens, context_end, &["GRANT", "REVOKE"]) {
+            if let Some(kind) = Self::expected_grant_revoke_grantee_kind(tokens, context_end) {
+                return Some(kind);
+            }
         }
-        if Self::is_create_synonym_target_context(&words) {
+        if Self::cursor_is_in_statement_structural_head(tokens, context_end)
+            && Self::is_create_synonym_target_context(&words)
+        {
             return Some(ExpectedObjectSuggestionKind::Any);
         }
-        if Self::is_create_on_table_target_context(&words) {
+        if Self::cursor_is_at_create_on_table_target_slot(tokens, context_end) {
             return Some(ExpectedObjectSuggestionKind::Table);
+        }
+        if Self::cursor_is_at_foreign_key_references_table_slot(tokens, context_end) {
+            return Some(ExpectedObjectSuggestionKind::Table);
+        }
+        if let Some(kind) =
+            Self::expected_alter_table_subcommand_object_suggestion_kind(tokens, context_end)
+        {
+            return Some(kind);
+        }
+
+        if Self::cursor_is_in_object_command_head(tokens, context_end) {
+            match words.as_slice() {
+            [.., last] if matches!(last.as_str(), "CALL" | "EXEC" | "EXECUTE") => {
+                    return Some(ExpectedObjectSuggestionKind::Routine);
+            }
+            [.., last] if matches!(last.as_str(), "DESC" | "DESCRIBE") => {
+                    return Some(ExpectedObjectSuggestionKind::Any);
+            }
+                _ => {}
+            }
+        }
+
+        if !Self::cursor_is_in_statement_structural_head(tokens, context_end) {
+            return None;
         }
 
         match words.as_slice() {
-            [.., last] if matches!(last.as_str(), "CALL" | "EXEC" | "EXECUTE") => {
-                Some(ExpectedObjectSuggestionKind::Routine)
-            }
-            [.., last] if matches!(last.as_str(), "DESC" | "DESCRIBE") => {
-                Some(ExpectedObjectSuggestionKind::Any)
-            }
-            [.., last] if *last == "REFERENCES" => Some(ExpectedObjectSuggestionKind::Table),
             [.., prev, last]
                 if matches!(
                     prev.as_str(),
@@ -7385,6 +8184,9 @@ impl SqlEditorWidget {
             }
             [.., a, b, c] if *a == "COMMENT" && *b == "ON" && *c == "TABLE" => {
                 Some(ExpectedObjectSuggestionKind::Table)
+            }
+            [.., a, b, c] if *a == "COMMENT" && *b == "ON" && *c == "COLUMN" => {
+                Some(ExpectedObjectSuggestionKind::ColumnOwner)
             }
             [.., prev, last] if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "VIEW" => {
                 Some(ExpectedObjectSuggestionKind::View)
@@ -7556,21 +8358,72 @@ impl SqlEditorWidget {
     /// (including a role grant, `GRANT role TO <grantee>`) names a user or role,
     /// never a schema object. Resolves the slot right after the `TO`/`FROM`
     /// separator to the `User` kind so the whole-catalog dump is suppressed
-    /// there. A multi-grantee continuation after a comma keeps today's behavior
-    /// (the comma is not a meaningful word, so the separator is no longer last).
+    /// there. Multi-grantee continuations after a comma stay in the same grantee
+    /// slot (`GRANT ... TO alice, |`, `REVOKE ... FROM alice, |`).
     fn expected_grant_revoke_grantee_kind(
-        words: &[String],
+        tokens: &[SqlToken],
+        end: usize,
     ) -> Option<ExpectedObjectSuggestionKind> {
-        let separator = words.last()?;
-        if !matches!(separator.as_str(), "TO" | "FROM") {
-            return None;
-        }
-        let verb = words.iter().rev().find_map(|word| match word.as_str() {
-            "GRANT" | "REVOKE" => Some(word.as_str()),
-            _ => None,
-        })?;
+        let (separator_idx, separator) =
+            Self::grant_revoke_grantee_separator_before_cursor(tokens, end)?;
+        let verb = Self::grant_revoke_verb_before_separator(tokens, separator_idx)?;
         let expected_separator = if verb == "GRANT" { "TO" } else { "FROM" };
         (separator == expected_separator).then_some(ExpectedObjectSuggestionKind::User)
+    }
+
+    fn grant_revoke_grantee_separator_before_cursor(
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> Option<(usize, String)> {
+        let last_idx = Self::previous_non_comment_token_index(tokens, end)?;
+        match tokens.get(last_idx)? {
+            SqlToken::Word(word) if matches!(word.to_ascii_uppercase().as_str(), "TO" | "FROM") => {
+                Some((last_idx, word.to_ascii_uppercase()))
+            }
+            SqlToken::Symbol(symbol) if symbol == "," => {
+                let mut scan_end = last_idx;
+                while let Some(idx) = Self::previous_non_comment_token_index(tokens, scan_end) {
+                    if let Some(SqlToken::Word(word)) = tokens.get(idx) {
+                        let upper = word.to_ascii_uppercase();
+                        if matches!(upper.as_str(), "TO" | "FROM") {
+                            return Some((idx, upper));
+                        }
+                        if matches!(upper.as_str(), "GRANT" | "REVOKE") {
+                            return None;
+                        }
+                    }
+                    scan_end = idx;
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn grant_revoke_verb_before_separator(tokens: &[SqlToken], separator_idx: usize) -> Option<&str> {
+        let mut scan_end = separator_idx;
+        while let Some(idx) = Self::previous_non_comment_token_index(tokens, scan_end) {
+            if let Some(SqlToken::Word(word)) = tokens.get(idx) {
+                if word.eq_ignore_ascii_case("GRANT") {
+                    return Some("GRANT");
+                }
+                if word.eq_ignore_ascii_case("REVOKE") {
+                    return Some("REVOKE");
+                }
+            }
+            scan_end = idx;
+        }
+        None
+    }
+
+    fn previous_non_comment_token_index(tokens: &[SqlToken], end: usize) -> Option<usize> {
+        tokens
+            .get(..end.min(tokens.len()))?
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, token)| !matches!(token, SqlToken::Comment(_)))
+            .map(|(idx, _)| idx)
     }
 
     fn expected_grant_revoke_object_suggestion_kind(
@@ -7650,11 +8503,15 @@ impl SqlEditorWidget {
         kind: ExpectedObjectSuggestionKind,
     ) -> Vec<String> {
         let suggestions = match kind {
+            ExpectedObjectSuggestionKind::NoSuggestions => Vec::new(),
             ExpectedObjectSuggestionKind::Any => data.get_object_suggestions(prefix),
             ExpectedObjectSuggestionKind::Routine => data.get_routine_object_suggestions(prefix),
             ExpectedObjectSuggestionKind::Executable => data.get_executable_object_suggestions(prefix),
             ExpectedObjectSuggestionKind::RelationOrSequence => {
                 data.get_relation_or_sequence_object_suggestions(prefix)
+            }
+            ExpectedObjectSuggestionKind::ColumnOwner => {
+                data.get_column_owner_object_suggestions(prefix)
             }
             ExpectedObjectSuggestionKind::Table => data.get_table_object_suggestions(prefix),
             ExpectedObjectSuggestionKind::View => data.get_view_object_suggestions(prefix),
@@ -7719,6 +8576,7 @@ impl SqlEditorWidget {
         kind: ExpectedObjectSuggestionKind,
     ) -> bool {
         match kind {
+            ExpectedObjectSuggestionKind::NoSuggestions => false,
             ExpectedObjectSuggestionKind::Any => true,
             ExpectedObjectSuggestionKind::Routine => {
                 Self::matches_string_list_case_insensitive(&data.procedures, candidate)
@@ -7736,6 +8594,13 @@ impl SqlEditorWidget {
                     || Self::matches_string_list_case_insensitive(&data.views, candidate)
                     || Self::matches_string_list_case_insensitive(&data.materialized_views, candidate)
                     || Self::matches_string_list_case_insensitive(&data.sequences, candidate)
+                    || Self::matches_string_list_case_insensitive(&data.synonyms, candidate)
+                    || Self::matches_string_list_case_insensitive(&data.public_synonyms, candidate)
+            }
+            ExpectedObjectSuggestionKind::ColumnOwner => {
+                Self::matches_string_list_case_insensitive(&data.tables, candidate)
+                    || Self::matches_string_list_case_insensitive(&data.views, candidate)
+                    || Self::matches_string_list_case_insensitive(&data.materialized_views, candidate)
                     || Self::matches_string_list_case_insensitive(&data.synonyms, candidate)
                     || Self::matches_string_list_case_insensitive(&data.public_synonyms, candidate)
             }
@@ -7824,6 +8689,7 @@ impl SqlEditorWidget {
         kind: ExpectedObjectSuggestionKind,
     ) -> Option<&'static [QualifiedMemberKind]> {
         match kind {
+            ExpectedObjectSuggestionKind::NoSuggestions => Some(&[]),
             ExpectedObjectSuggestionKind::Any => None,
             ExpectedObjectSuggestionKind::Routine => Some(&[
                 QualifiedMemberKind::Procedure,
@@ -7841,6 +8707,13 @@ impl SqlEditorWidget {
                 QualifiedMemberKind::View,
                 QualifiedMemberKind::MaterializedView,
                 QualifiedMemberKind::Sequence,
+                QualifiedMemberKind::Synonym,
+                QualifiedMemberKind::PublicSynonym,
+            ]),
+            ExpectedObjectSuggestionKind::ColumnOwner => Some(&[
+                QualifiedMemberKind::Table,
+                QualifiedMemberKind::View,
+                QualifiedMemberKind::MaterializedView,
                 QualifiedMemberKind::Synonym,
                 QualifiedMemberKind::PublicSynonym,
             ]),
@@ -7875,6 +8748,34 @@ impl SqlEditorWidget {
             ExpectedObjectSuggestionKind::JavaResource => Some(&[QualifiedMemberKind::JavaResource]),
             ExpectedObjectSuggestionKind::User => Some(&[QualifiedMemberKind::User]),
         }
+    }
+
+    fn expected_object_kind_allows_relation_member_cache(
+        kind: ExpectedObjectSuggestionKind,
+    ) -> bool {
+        matches!(
+            kind,
+            ExpectedObjectSuggestionKind::RelationOrSequence
+                | ExpectedObjectSuggestionKind::ColumnOwner
+        )
+    }
+
+    fn expected_object_kind_allows_unknown_member_fallback(
+        kind: ExpectedObjectSuggestionKind,
+    ) -> bool {
+        matches!(
+            kind,
+            ExpectedObjectSuggestionKind::Routine | ExpectedObjectSuggestionKind::Executable
+        )
+    }
+
+    fn suggestion_is_known_relation_for_qualifier(
+        data: &IntellisenseData,
+        qualifier: &str,
+        suggestion: &str,
+    ) -> bool {
+        data.qualifier_relation_member_matches(qualifier, suggestion)
+            || data.is_known_relation(suggestion)
     }
 
     fn suggestion_matches_expected_object_kind_for_qualifier(
@@ -7936,8 +8837,18 @@ impl SqlEditorWidget {
                 break;
             }
         }
-        if filtered.is_empty() && !saw_kind_metadata {
+        if filtered.is_empty()
+            && !saw_kind_metadata
+            && Self::expected_object_kind_allows_unknown_member_fallback(kind)
+        {
             suggestions
+                .into_iter()
+                .filter(|suggestion| {
+                    !Self::suggestion_is_known_relation_for_qualifier(data, qualifier, suggestion)
+                })
+                .collect()
+        } else if filtered.is_empty() && !saw_kind_metadata {
+            Vec::new()
         } else {
             filtered
         }
@@ -7986,8 +8897,10 @@ impl SqlEditorWidget {
 
         if saw_kind_metadata {
             filtered
-        } else {
+        } else if Self::expected_object_kind_allows_relation_member_cache(kind) {
             suggestions
+        } else {
+            Vec::new()
         }
     }
 
@@ -9030,6 +9943,79 @@ impl SqlEditorWidget {
                     .min(range.end.saturating_sub(range.start))
             })
             .unwrap_or(deep_ctx.cursor_token_len)
+    }
+
+    fn previous_meaningful_token_before_index(
+        tokens: &[SqlToken],
+        idx: usize,
+    ) -> Option<&SqlToken> {
+        tokens
+            .get(..idx.min(tokens.len()))?
+            .iter()
+            .rev()
+            .find(|token| !matches!(token, SqlToken::Comment(_)))
+    }
+
+    fn active_query_range_starts_after_set_operator(
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> bool {
+        let Some(range) = deep_ctx.active_query_range else {
+            return false;
+        };
+        matches!(
+            Self::previous_meaningful_token_before_index(
+                deep_ctx.statement_tokens.as_ref(),
+                range.start,
+            ),
+            Some(SqlToken::Word(word))
+                if matches!(
+                    word.to_ascii_uppercase().as_str(),
+                    "UNION" | "INTERSECT" | "MINUS" | "EXCEPT"
+                )
+        )
+    }
+
+    fn first_non_comment_index_before(tokens: &[SqlToken], end: usize, start: usize) -> usize {
+        let mut idx = start.min(end).min(tokens.len());
+        let limit = end.min(tokens.len());
+        while idx < limit && matches!(tokens.get(idx), Some(SqlToken::Comment(_))) {
+            idx += 1;
+        }
+        idx
+    }
+
+    fn cursor_is_in_invalid_set_operation_branch_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> bool {
+        if !Self::active_query_range_starts_after_set_operator(deep_ctx) {
+            return false;
+        }
+
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        let mut start = Self::first_non_comment_index_before(tokens, end, 0);
+        if start >= end.min(tokens.len()) {
+            return false;
+        }
+
+        if matches!(
+            tokens.get(start),
+            Some(SqlToken::Word(word))
+                if matches!(word.to_ascii_uppercase().as_str(), "ALL" | "DISTINCT")
+        ) {
+            start = Self::first_non_comment_index_before(tokens, end, start + 1);
+            if start >= end.min(tokens.len()) {
+                return false;
+            }
+        }
+
+        !intellisense_context::is_query_expression_start(tokens, start)
     }
 
     fn next_word_upper_in_tokens(tokens: &[SqlToken], idx: usize) -> Option<(String, usize)> {
