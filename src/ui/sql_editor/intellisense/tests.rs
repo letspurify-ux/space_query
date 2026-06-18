@@ -25455,3 +25455,74 @@ fn plsql_exception_handler_name_slot_offers_predefined_exceptions() {
         );
     }
 }
+
+/// After a complete operand, the open expression construct's mandated keyword(s)
+/// are offered even at an empty prefix (where the flat base catalog emits none):
+/// `AND` to finish a `BETWEEN`, and the `CASE` branch keywords. The innermost
+/// construct wins, and a mid-operand position offers nothing — so no noise.
+#[test]
+fn expression_construct_tail_keywords_are_complete_and_noise_free() {
+    let kw = |sql: &str| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(crate::db::DatabaseType::Oracle),
+        )
+    };
+    let has = |sql: &str, k: &str| kw(sql).iter().any(|x| x == k);
+
+    // BETWEEN → AND, including NOT BETWEEN and a function-call lower bound whose
+    // inner comma must not be mistaken for the BETWEEN separator.
+    for sql in [
+        "SELECT a FROM t WHERE x BETWEEN 1 |",
+        "SELECT a FROM t WHERE x NOT BETWEEN 1 |",
+        "SELECT a FROM t WHERE x BETWEEN greatest(a, b) |",
+    ] {
+        assert_eq!(kw(sql), vec!["AND".to_string()], "AND for `{sql}`");
+    }
+
+    // CASE branch keywords across selector / condition / arm / else, simple and
+    // searched, nested in a SELECT list and through a subquery operand.
+    assert_eq!(kw("SELECT CASE x | END FROM t"), vec!["WHEN".to_string()]);
+    assert_eq!(kw("SELECT CASE x WHEN 1 | END FROM t"), vec!["THEN".to_string()]);
+    assert_eq!(kw("SELECT CASE WHEN c | END FROM t"), vec!["THEN".to_string()]);
+    for sql in [
+        "SELECT CASE x WHEN 1 THEN r | END FROM t",
+        "SELECT CASE WHEN c THEN r | END FROM t",
+        "SELECT c1, CASE WHEN c THEN r | END, c2 FROM t",
+        "SELECT CASE WHEN c THEN (SELECT 1 FROM dual) | END FROM t",
+    ] {
+        assert_eq!(
+            kw(sql),
+            vec!["WHEN".to_string(), "ELSE".to_string(), "END".to_string()],
+            "arm continuations for `{sql}`"
+        );
+    }
+    assert_eq!(kw("SELECT CASE WHEN c THEN r ELSE e | END FROM t"), vec!["END".to_string()]);
+
+    // Innermost construct wins: a BETWEEN inside a WHEN condition takes AND, not
+    // THEN, until it is closed.
+    assert_eq!(kw("SELECT CASE WHEN x BETWEEN a | END FROM t"), vec!["AND".to_string()]);
+    assert_eq!(
+        kw("SELECT CASE WHEN x BETWEEN a AND b | END FROM t"),
+        vec!["THEN".to_string()]
+    );
+
+    // No noise: a closed BETWEEN, a mid-operand, an empty branch/condition, and an
+    // ordinary value position offer none of these.
+    for sql in [
+        "SELECT a FROM t WHERE x BETWEEN 1 AND 2 |",
+        "SELECT a FROM t WHERE x BETWEEN |",
+        "SELECT CASE WHEN c THEN | END FROM t",
+        "SELECT CASE WHEN | END FROM t",
+        "SELECT a FROM t WHERE c = 1 |",
+        "SELECT a, | FROM t",
+    ] {
+        for noise in ["AND", "THEN", "WHEN", "ELSE", "END"] {
+            assert!(!has(sql, noise), "`{noise}` leaked for `{sql}`: {:?}", kw(sql));
+        }
+    }
+}

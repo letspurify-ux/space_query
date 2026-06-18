@@ -3591,6 +3591,129 @@ impl SqlEditorWidget {
         }
     }
 
+    /// After a *complete operand* inside an expression, the keyword(s) the
+    /// innermost open construct grammatically mandates next:
+    ///   * `AND` to finish a `BETWEEN <lo> | …` bound;
+    ///   * a `CASE` construct's branch keywords — `WHEN` after the selector
+    ///     (`CASE x |`) or a finished arm (`… THEN r |`), `THEN` after a branch
+    ///     condition (`WHEN c |`), `ELSE`/`END` to continue/close an arm, `END`
+    ///     to close the `ELSE` arm.
+    ///
+    /// The innermost construct wins — a `BETWEEN` opened inside a `WHEN`
+    /// condition (`CASE WHEN x BETWEEN a |`) must close with `AND` before the
+    /// branch can take `THEN`, so only `AND` is offered there. The operand may
+    /// still be extended (`a.b`, `a + 1`), so these keywords are *merged*
+    /// alongside the ordinary expression completions, never suppressing them.
+    /// Returns `&[]` mid-operand (`BETWEEN |`, `WHEN |`, `a = |`, `THEN |`) or
+    /// when no such construct is open.
+    fn expected_operand_tail_continuation_keywords(
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> &'static [&'static str] {
+        if Self::cursor_follows_complete_operand(tokens, end) != Some(true) {
+            return &[];
+        }
+        let toks = tokens.get(..end.min(tokens.len())).unwrap_or(tokens);
+
+        #[derive(Clone, Copy, PartialEq)]
+        enum CaseState {
+            // After the (optional) selector, before the first `WHEN`.
+            Selector,
+            // Between a branch `WHEN` and its `THEN` (the condition).
+            AwaitingThen,
+            // In an arm body, after `THEN`.
+            InArm,
+            // In the `ELSE` arm body.
+            InElse,
+        }
+        #[derive(Clone, Copy)]
+        enum Frame {
+            // A `BETWEEN` at `depth`, awaiting its `AND`.
+            Between { depth: i32 },
+            // A `CASE … END` expression/statement.
+            Case { state: CaseState },
+            // An `IF`/`LOOP`/`BEGIN` block — tracked only to balance `END`.
+            OtherBlock,
+        }
+
+        let set_innermost_case = |stack: &mut Vec<Frame>, state: CaseState| {
+            if let Some(Frame::Case { state: s }) = stack
+                .iter_mut()
+                .rev()
+                .find(|frame| matches!(frame, Frame::Case { .. }))
+            {
+                *s = state;
+            }
+        };
+
+        let mut depth = 0i32;
+        let mut stack: Vec<Frame> = Vec::new();
+        let mut idx = 0;
+        while idx < toks.len() {
+            match &toks[idx] {
+                SqlToken::Symbol(sym) if sym == "(" => depth += 1,
+                SqlToken::Symbol(sym) if sym == ")" => {
+                    depth = (depth - 1).max(0);
+                    // Abandon any `BETWEEN` left unclosed inside the closed paren.
+                    while matches!(stack.last(), Some(Frame::Between { depth: d }) if *d > depth) {
+                        stack.pop();
+                    }
+                }
+                SqlToken::Word(word) => match word.to_ascii_uppercase().as_str() {
+                    "BETWEEN" => stack.push(Frame::Between { depth }),
+                    "AND" => {
+                        if matches!(stack.last(), Some(Frame::Between { depth: d }) if *d == depth) {
+                            stack.pop();
+                        }
+                    }
+                    "CASE" => stack.push(Frame::Case {
+                        state: CaseState::Selector,
+                    }),
+                    // `WHEN`/`THEN`/`ELSE` drive the innermost `CASE`; a
+                    // `MERGE`/exception `WHEN` has no `Case` frame to update.
+                    "WHEN" => set_innermost_case(&mut stack, CaseState::AwaitingThen),
+                    "THEN" => set_innermost_case(&mut stack, CaseState::InArm),
+                    "ELSE" => set_innermost_case(&mut stack, CaseState::InElse),
+                    "IF" | "LOOP" | "BEGIN" => stack.push(Frame::OtherBlock),
+                    "END" => {
+                        // Drop markers up to and including the innermost block.
+                        while let Some(frame) = stack.pop() {
+                            if matches!(frame, Frame::Case { .. } | Frame::OtherBlock) {
+                                break;
+                            }
+                        }
+                        if let Some((next, next_idx)) =
+                            Self::next_word_upper_in_tokens(toks, idx + 1)
+                        {
+                            if matches!(next.as_str(), "IF" | "LOOP" | "CASE") {
+                                idx = next_idx;
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+            idx += 1;
+        }
+
+        for frame in stack.iter().rev() {
+            match frame {
+                Frame::Between { .. } => return &["AND"],
+                Frame::Case { state } => {
+                    return match state {
+                        CaseState::Selector => &["WHEN"],
+                        CaseState::AwaitingThen => &["THEN"],
+                        CaseState::InArm => &["WHEN", "ELSE", "END"],
+                        CaseState::InElse => &["END"],
+                    }
+                }
+                Frame::OtherBlock => return &[],
+            }
+        }
+        &[]
+    }
+
     /// Dialect-agnostic check used only to tell an identifier from a reserved
     /// word while classifying the previous token. The union of both catalogs is
     /// deliberate: a word that is a keyword in either dialect is treated as a
@@ -8176,7 +8299,22 @@ impl SqlEditorWidget {
             _ => &[],
         };
 
-        Self::filter_expected_candidates(prefix, candidates)
+        let mut result = Self::filter_expected_candidates(prefix, candidates);
+        // Merge the construct-mandated operand-tail keywords (`AND` to close a
+        // `BETWEEN`, and the `CASE` branch keywords `WHEN`/`THEN`/`ELSE`/`END`).
+        // They are additive — the bound/condition/arm operand may still be
+        // extended — so they join the clause continuations above rather than
+        // replacing them, and are the sole source of these keywords at an empty
+        // prefix (the flat base catalog emits no keywords there).
+        let tail = Self::expected_operand_tail_continuation_keywords(tokens, context_end);
+        if !tail.is_empty() {
+            for keyword in Self::filter_expected_candidates(prefix, tail) {
+                if !result.iter().any(|existing| existing.eq_ignore_ascii_case(&keyword)) {
+                    result.push(keyword);
+                }
+            }
+        }
+        result
     }
 
     fn is_row_count_tail_word(word: &str, is_bind: bool) -> bool {
