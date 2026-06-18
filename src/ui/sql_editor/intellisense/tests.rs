@@ -410,6 +410,74 @@ fn window_spec_start_suppresses_columns_and_offers_clause_openers() {
     }
 }
 
+#[test]
+fn window_spec_clause_keywords_are_scoped_to_clause_transitions() {
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let kw = |sql: &str, prefix: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(crate::db::DatabaseType::Oracle),
+        )
+    };
+    let suppresses = |sql: &str| {
+        let cursor = sql.find('|').expect("cursor marker");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(
+            &analyze_inline_cursor_sql(sql),
+            !prefix.is_empty(),
+        )
+    };
+
+    for sql in [
+        "SELECT sum(empno) OVER (PARTITION BY empno |) FROM emp",
+        "SELECT sum(empno) OVER (PARTITION BY empno ord|) FROM emp",
+    ] {
+        let cursor = sql.find('|').expect("cursor marker");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        let suggestions = kw(sql, &prefix);
+        assert!(
+            has(&suggestions, "ORDER BY"),
+            "ORDER BY missing after completed PARTITION BY expression: {suggestions:?}"
+        );
+        assert!(suppresses(sql), "identifier base must be suppressed for `{sql}`");
+    }
+    assert_eq!(
+        kw(
+            "SELECT sum(empno) OVER (PARTITION BY empno ord|) FROM emp",
+            "ord"
+        ),
+        vec!["ORDER BY".to_string()]
+    );
+
+    for (sql, keyword) in [
+        (
+            "SELECT sum(empno) OVER (ORDER BY hiredate par|) FROM emp",
+            "PARTITION",
+        ),
+        (
+            "SELECT sum(empno) OVER (ORDER BY hiredate by|) FROM emp",
+            "BY",
+        ),
+        (
+            "SELECT sum(empno) OVER (PARTITION BY empno, ord|) FROM emp",
+            "ORDER",
+        ),
+        (
+            "SELECT sum(empno) OVER (ORDER BY hiredate ROWS CURRENT ROW ord|) FROM emp",
+            "ORDER",
+        ),
+    ] {
+        let suggestions = typed_emp_suggestions(sql);
+        assert!(
+            !has(&suggestions, keyword),
+            "{keyword} leaked at an invalid window-spec transition: {suggestions:?}"
+        );
+    }
+}
+
 /// An Oracle `TABLESAMPLE` value slot (`FROM t SAMPLE (|)`, `SAMPLE BLOCK (|)`,
 /// `... SEED (|)`) accepts only a numeric sampling percentage / seed, never a
 /// relation, even though the cursor is still in the `FROM` table phase.
@@ -431,6 +499,104 @@ fn table_sample_value_slot_suppresses_relations() {
         &analyze_inline_cursor_sql("SELECT * FROM |"),
         false,
     ));
+}
+
+/// Table-source constructs (`JSON_TABLE(...)`, Oracle `XMLTABLE(...)` and
+/// `TABLE(collection)`) occupy a `FROM` relation position, but immediately after
+/// the construct keyword the only valid token is `(`. The relation catalog must
+/// stay suppressed there; ordinary relation slots and DDL `ALTER TABLE` targets
+/// must remain unaffected.
+#[test]
+fn table_source_construct_open_paren_slots_suppress_relations() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let exclude_flag = |sql_with_cursor: &str| {
+        let cursor = sql_with_cursor.find('|').expect("cursor marker");
+        let sql = sql_with_cursor.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+        !prefix.is_empty()
+    };
+    let suppresses = |sql: &str, db_type| {
+        SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot_for_db(
+            &analyze_inline_cursor_sql(sql),
+            exclude_flag(sql),
+            Some(db_type),
+        )
+    };
+    let apply_table_base = |sql_with_cursor: &str, db_type| {
+        let cursor = sql_with_cursor.find('|').expect("cursor marker");
+        let sql = sql_with_cursor.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql_with_cursor);
+        let context = SqlEditorWidget::classify_intellisense_context(
+            &ctx,
+            ctx.statement_tokens.as_ref(),
+        );
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+        if SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot_for_db(
+            &ctx,
+            !prefix.is_empty(),
+            Some(db_type),
+        ) {
+            return Vec::new();
+        }
+        let mut data = IntellisenseData::new();
+        data.tables = vec![
+            "EMP".to_string(),
+            "JSON_TABLE_STAGE".to_string(),
+            "XMLTABLE_STAGE".to_string(),
+            "TABLE_STAGE".to_string(),
+        ];
+        data.rebuild_indices();
+        SqlEditorWidget::base_suggestions_for_context(
+            &mut data,
+            &prefix,
+            None,
+            None,
+            false,
+            context,
+            false,
+            Some(db_type),
+            ExpressionKeywordContext::ambiguous(),
+        )
+    };
+
+    for sql in [
+        "SELECT * FROM JSON_TABLE jt|",
+        "SELECT * FROM XMLTABLE xt|",
+        "SELECT * FROM TABLE tab|",
+        "SELECT * FROM emp e, TABLE tab|",
+        "SELECT * FROM emp JOIN JSON_TABLE jt|",
+    ] {
+        assert!(suppresses(sql, Oracle), "relation base leaked for `{sql}`");
+        assert!(
+            apply_table_base(sql, Oracle).is_empty(),
+            "relation suggestions survived for `{sql}`"
+        );
+    }
+
+    assert!(
+        suppresses("SELECT * FROM JSON_TABLE jt|", MySQL),
+        "MySQL JSON_TABLE must also suppress relations"
+    );
+    assert!(
+        !suppresses("SELECT * FROM XMLTABLE xt|", MySQL),
+        "MySQL XMLTABLE is not a table-source construct"
+    );
+    assert!(
+        !suppresses("SELECT * FROM TABLE tab|", MySQL),
+        "MySQL TABLE is not an Oracle collection table expression"
+    );
+
+    let ordinary = apply_table_base("SELECT * FROM emp|", Oracle);
+    assert!(
+        has(&ordinary, "EMP"),
+        "ordinary FROM relation completion was suppressed: {ordinary:?}"
+    );
+    assert!(
+        !suppresses("ALTER TABLE emp|", Oracle),
+        "DDL ALTER TABLE target must keep table-object completion"
+    );
 }
 
 /// A foreign-key referential action slot (`... REFERENCES t (...) ON DELETE |`
@@ -572,6 +738,106 @@ fn order_by_sort_modifier_slots_suppress_columns_and_offer_only_modifier_keyword
         &analyze_inline_cursor_sql("SELECT * FROM t ORDER BY first |"),
         false,
     ));
+}
+
+#[test]
+fn window_order_by_sort_modifier_slots_are_scoped_to_sort_tails() {
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let kw = |sql: &str, prefix: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(crate::db::DatabaseType::Oracle),
+        )
+    };
+    let suppresses = |sql: &str| {
+        let cursor = sql.find('|').expect("cursor marker");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(
+            &analyze_inline_cursor_sql(sql),
+            !prefix.is_empty(),
+        )
+    };
+
+    // Window ORDER BY null-ordering keywords are not valid anywhere in the
+    // window specification; they only belong after a sort expression.
+    let partition =
+        typed_emp_suggestions("SELECT sum(empno) OVER (PARTITION BY empno nul|) FROM emp");
+    assert!(
+        !has(&partition, "NULLS"),
+        "NULLS leaked in a PARTITION BY expression: {partition:?}"
+    );
+    let order_expr =
+        typed_emp_suggestions("SELECT sum(empno) OVER (ORDER BY hiredate fir|) FROM emp");
+    assert!(
+        !has(&order_expr, "FIRST"),
+        "FIRST leaked before NULLS in a window ORDER BY: {order_expr:?}"
+    );
+    let last_expr =
+        typed_emp_suggestions("SELECT sum(empno) OVER (ORDER BY hiredate las|) FROM emp");
+    assert!(
+        !has(&last_expr, "LAST"),
+        "LAST leaked before NULLS in a window ORDER BY: {last_expr:?}"
+    );
+    for (sql, keyword) in [
+        (
+            "SELECT sum(empno) OVER (PARTITION BY empno row|) FROM emp",
+            "ROWS",
+        ),
+        (
+            "SELECT sum(empno) OVER (PARTITION BY empno ran|) FROM emp",
+            "RANGE",
+        ),
+        (
+            "SELECT sum(empno) OVER (PARTITION BY empno gro|) FROM emp",
+            "GROUPS",
+        ),
+    ] {
+        let suggestions = typed_emp_suggestions(sql);
+        assert!(
+            !has(&suggestions, keyword),
+            "{keyword} leaked after a window PARTITION BY expression: {suggestions:?}"
+        );
+    }
+
+    assert_eq!(
+        kw("SELECT sum(empno) OVER (ORDER BY hiredate nul|) FROM emp", "nul"),
+        vec!["NULLS".to_string()]
+    );
+    assert_eq!(
+        kw("SELECT sum(empno) OVER (ORDER BY hiredate d|) FROM emp", "d"),
+        vec!["DESC".to_string()]
+    );
+    assert_eq!(
+        kw(
+            "SELECT sum(empno) OVER (ORDER BY hiredate DESC NULLS f|) FROM emp",
+            "f"
+        ),
+        vec!["FIRST".to_string()]
+    );
+    assert_eq!(
+        kw("SELECT sum(empno) OVER (ORDER BY hiredate NULLS |) FROM emp", ""),
+        vec!["FIRST".to_string(), "LAST".to_string()]
+    );
+    assert_eq!(
+        kw(
+            "SELECT sum(empno) OVER (ORDER BY hiredate NULLS FIRST row|) FROM emp",
+            "row"
+        ),
+        vec!["ROWS".to_string()]
+    );
+
+    for sql in [
+        "SELECT sum(empno) OVER (ORDER BY hiredate DESC |) FROM emp",
+        "SELECT sum(empno) OVER (ORDER BY hiredate NULLS |) FROM emp",
+        "SELECT sum(empno) OVER (ORDER BY hiredate NULLS FIRST |) FROM emp",
+    ] {
+        assert!(
+            suppresses(sql),
+            "window sort modifier tail must suppress `{sql}`"
+        );
+    }
 }
 
 /// The definition-list classifier keys off the `TABLE` keyword, so it must not
@@ -18407,8 +18673,17 @@ fn column_suppressing_keyword_slot_covers_every_family() {
     assert!(at("SELECT last_value(empno) IGNORE | FROM emp")); // analytic null treatment
     assert!(at("SELECT EXTRACT(| FROM hire_date) FROM emp")); // EXTRACT field
     assert!(at("SELECT hire_date - INTERVAL '5' | FROM emp")); // INTERVAL unit
+    assert!(at("SELECT CAST | FROM emp")); // expression construct opening paren
+    assert!(at("SELECT * FROM emp WHERE EXISTS |")); // expression construct opening paren
+    assert!(at("SELECT XMLCAST | FROM emp")); // function-like construct opening paren
+    assert!(at("SELECT * FROM emp WHERE JSON_EXISTS |")); // function-like construct opening paren
+    assert!(at("SELECT * FROM JSON_TABLE |")); // table-source construct opening paren
+    assert!(at(
+        "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id NUMBER PATH |))"
+    )); // table-function path literal
     assert!(at("SELECT * FROM emp ORDER BY id ASC |")); // ORDER BY sort modifier
     assert!(at("SELECT * FROM emp ORDER BY id NULLS FIRST |")); // completed sort modifier
+    assert!(at("SELECT sum(x) OVER (ORDER BY d NULLS |) FROM t")); // window sort modifier
     assert!(at("SELECT * FROM emp ORDER |")); // pure clause-keyword continuation
     assert!(at("SELECT * FROM a LEFT |")); // pure join-type continuation
     assert!(at("SELECT sum(x) OVER (PARTITION |) FROM t")); // window PARTITION BY
@@ -18417,6 +18692,8 @@ fn column_suppressing_keyword_slot_covers_every_family() {
     // Ordinary column positions remain column positions.
     assert!(!at("SELECT | FROM emp"));
     assert!(!at("SELECT * FROM emp WHERE | "));
+    assert!(!at("SELECT CASE | FROM emp"));
+    assert!(!at("CREATE TABLE IF NOT EXISTS |"));
     // Value-bound window-frame slots accept an expression, so they are NOT here.
     assert!(!at("SELECT sum(x) OVER (ORDER BY d ROWS BETWEEN | ) FROM t"));
 }
@@ -18716,6 +18993,57 @@ fn interval_unit_slot_suppresses_columns_and_offers_unit_keywords() {
         Some(crate::db::DatabaseType::MySQL),
     );
     assert!(mysql_leading.iter().any(|value| value == "QUARTER"));
+}
+
+#[test]
+fn temporal_literal_body_slots_suppress_columns() {
+    let exclude_flag = |sql_with_cursor: &str| {
+        let cursor = sql_with_cursor.find('|').expect("cursor marker");
+        let sql = sql_with_cursor.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+        !prefix.is_empty()
+    };
+    let at = |sql: &str, db_type| {
+        SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot_for_db(
+            &analyze_inline_cursor_sql(sql),
+            exclude_flag(sql),
+            Some(db_type),
+        )
+    };
+
+    for sql in [
+        "SELECT DATE | FROM dual",
+        "SELECT DATE val| FROM dual",
+        "SELECT TIME | FROM dual",
+        "SELECT TIMESTAMP | FROM dual",
+        "SELECT TIMESTAMP val| FROM dual",
+        "SELECT INTERVAL | FROM dual",
+    ] {
+        assert!(
+            at(sql, crate::db::DatabaseType::Oracle),
+            "temporal literal body slot did not suppress columns for `{sql}`"
+        );
+    }
+
+    assert!(
+        at("SELECT DATE | FROM emp", crate::db::DatabaseType::MySQL),
+        "MySQL DATE literal body slot did not suppress columns"
+    );
+    assert!(
+        !at("SELECT CURRENT_DATE | FROM emp", crate::db::DatabaseType::MySQL),
+        "complete niladic temporal value must not be treated as a literal-body slot"
+    );
+    assert!(
+        !at(
+            "SELECT hiredate - INTERVAL | DAY FROM emp",
+            crate::db::DatabaseType::MySQL
+        ),
+        "MySQL unquoted INTERVAL expression slot must keep column completion"
+    );
+    assert!(
+        !at("SELECT t.DATE | FROM t", crate::db::DatabaseType::Oracle),
+        "qualified column named DATE must not be treated as a literal introducer"
+    );
 }
 
 #[test]
@@ -20560,6 +20888,14 @@ fn window_frame_after_unbounded_suggests_direction() {
         ),
         Some(vec!["PRECEDING".into(), "FOLLOWING".into()])
     );
+    assert_eq!(
+        window_frame_candidates("SELECT sum(x) OVER (ORDER BY d ROWS 5 |) FROM t"),
+        Some(vec!["PRECEDING".into(), "FOLLOWING".into()])
+    );
+    assert_eq!(
+        window_frame_candidates("SELECT sum(x) OVER (ORDER BY d ROWS BETWEEN 5 |) FROM t"),
+        Some(vec!["PRECEDING".into(), "FOLLOWING".into()])
+    );
 }
 
 #[test]
@@ -20750,6 +21086,48 @@ fn window_frame_keywords_require_a_frame_unit() {
 }
 
 #[test]
+fn window_frame_keywords_do_not_leak_through_expression_allowlist() {
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+
+    for (sql, keyword) in [
+        (
+            "SELECT sum(empno) OVER (ORDER BY hiredate unb|) FROM emp",
+            "UNBOUNDED",
+        ),
+        (
+            "SELECT sum(empno) OVER (ORDER BY hiredate cur|) FROM emp",
+            "CURRENT",
+        ),
+        (
+            "SELECT sum(empno) OVER (ORDER BY hiredate pre|) FROM emp",
+            "PRECEDING",
+        ),
+        (
+            "SELECT sum(empno) OVER (ORDER BY hiredate fol|) FROM emp",
+            "FOLLOWING",
+        ),
+        (
+            "SELECT sum(empno) OVER (ORDER BY hiredate exc|) FROM emp",
+            "EXCLUDE",
+        ),
+        (
+            "SELECT sum(empno) OVER (ORDER BY hiredate tie|) FROM emp",
+            "TIES",
+        ),
+        (
+            "SELECT sum(empno) OVER (ORDER BY hiredate oth|) FROM emp",
+            "OTHERS",
+        ),
+    ] {
+        let suggestions = typed_emp_suggestions(sql);
+        assert!(
+            !has(&suggestions, keyword),
+            "{keyword} leaked outside a frame slot for `{sql}`: {suggestions:?}"
+        );
+    }
+}
+
+#[test]
 fn window_frame_numeric_first_bound_then_and_suggests_second_bound() {
     assert_eq!(
         window_frame_candidates(
@@ -20918,11 +21296,18 @@ fn keyword_only_slots_suppress_the_identifier_base() {
     let pure_keyword_slots = [
         "SELECT EXTRACT(yea| FROM d) FROM dual",
         "SELECT INTERVAL '1' yea| FROM dual",
+        "SELECT CAST emp| FROM dual",
+        "SELECT * FROM emp WHERE EXISTS en|",
+        "SELECT XMLCAST emp| FROM dual",
+        "SELECT * FROM emp WHERE JSON_EXISTS en|",
+        "SELECT * FROM JSON_TABLE jt|",
+        "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id NUMBER PATH p|))",
         "SELECT SUM(x) OVER (ORDER BY a ROWS UNBOUNDED prec|) FROM t",
         "SELECT x FROM t FETCH FIRST ro| ROWS ONLY",
         "SELECT max(x) KEEP (DENSE_RANK fir|) FROM t",
         "SELECT listagg(x) WITHIN gr| FROM t",
         "SELECT last_value(x) IGNORE nu| FROM t",
+        "SELECT sum(x) OVER (ORDER BY d NULLS f|) FROM t",
     ];
     for sql in pure_keyword_slots {
         let ctx = analyze_inline_cursor_sql(sql);
@@ -21622,6 +22007,94 @@ fn data_type_json_table_columns_clause_offers_types() {
 }
 
 #[test]
+fn table_function_path_literal_slots_suppress_identifier_base() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let exclude_flag = |sql_with_cursor: &str| {
+        let cursor = sql_with_cursor.find('|').expect("cursor marker");
+        let sql = sql_with_cursor.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+        !prefix.is_empty()
+    };
+    let suppresses = |sql: &str, db_type| {
+        SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot_for_db(
+            &analyze_inline_cursor_sql(sql),
+            exclude_flag(sql),
+            Some(db_type),
+        )
+    };
+    let apply_base = |sql_with_cursor: &str, db_type| {
+        let cursor = sql_with_cursor.find('|').expect("cursor marker");
+        let sql = sql_with_cursor.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql_with_cursor);
+        let context = SqlEditorWidget::classify_intellisense_context(
+            &ctx,
+            ctx.statement_tokens.as_ref(),
+        );
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+        if SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot_for_db(
+            &ctx,
+            !prefix.is_empty(),
+            Some(db_type),
+        ) {
+            return Vec::new();
+        }
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["PATH_STAGE".to_string(), "PAYLOADS".to_string()];
+        data.rebuild_indices();
+        SqlEditorWidget::base_suggestions_for_context(
+            &mut data,
+            &prefix,
+            None,
+            None,
+            false,
+            context,
+            false,
+            Some(db_type),
+            ExpressionKeywordContext::ambiguous(),
+        )
+    };
+
+    for (sql, db_type) in [
+        (
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id NUMBER PATH p|))",
+            Oracle,
+        ),
+        (
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (NESTED PATH p| COLUMNS (id NUMBER PATH '$.id')))",
+            Oracle,
+        ),
+        (
+            "SELECT * FROM XMLTABLE('/r' PASSING x COLUMNS id NUMBER PATH p|)",
+            Oracle,
+        ),
+        (
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id INT PATH p|))",
+            MySQL,
+        ),
+    ] {
+        assert!(
+            suppresses(sql, db_type),
+            "PATH literal slot did not suppress identifiers for `{sql}`"
+        );
+        assert!(
+            apply_base(sql, db_type).is_empty(),
+            "identifier base survived in PATH literal slot for `{sql}`"
+        );
+    }
+
+    assert!(
+        !data_type_suggestions(
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (path |))",
+            "",
+            Oracle
+        )
+        .is_empty(),
+        "column named PATH must remain a type slot"
+    );
+}
+
+#[test]
 fn data_type_table_named_columns_is_not_a_type_position() {
     use crate::db::DatabaseType::{Oracle, MySQL};
     // A table literally named/aliased around "columns" must never offer types.
@@ -21821,10 +22294,9 @@ fn expression_keyword_completion_is_position_aware() {
     assert!(has(&s, "END"), "column named END was hidden: {s:?}");
 
     // The same flat-catalog problem applies to the window-frame boundary
-    // keywords (`PRECEDING`/`FOLLOWING`/`UNBOUNDED`): they are only grammatical
-    // inside a window specification's frame clause, so outside any window spec
-    // they are stripped, but inside an `OVER (...)` / `WINDOW … AS (...)` they
-    // remain available.
+    // keywords (`PRECEDING`/`FOLLOWING`/`UNBOUNDED`): they are stripped from the
+    // base expression catalog and served only by the contextual frame-keyword
+    // merge at actual frame slots.
     for (sql, kw) in [
         ("SELECT pr| FROM emp", "PRECEDING"),
         ("SELECT fo| FROM emp", "FOLLOWING"),
@@ -21834,24 +22306,26 @@ fn expression_keyword_completion_is_position_aware() {
         let s = suggestions(sql, &[]);
         assert!(!has(&s, kw), "{kw} leaked outside window spec for `{sql}`: {s:?}");
     }
-    let s = suggestions(
+    let ctx = analyze_inline_cursor_sql(
         "SELECT SUM(empno) OVER (ORDER BY empno ROWS BETWEEN un| FROM emp",
-        &[],
     );
-    assert!(has(&s, "UNBOUNDED"), "UNBOUNDED suppressed inside window frame: {s:?}");
-    let s = suggestions(
+    let kw = SqlEditorWidget::collect_expected_keyword_suggestions("un", &ctx, Some(Oracle));
+    assert!(has(&kw, "UNBOUNDED"), "UNBOUNDED suppressed inside window frame: {kw:?}");
+    let ctx = analyze_inline_cursor_sql(
         "SELECT SUM(empno) OVER (ORDER BY empno ROWS BETWEEN 1 pr| FROM emp",
-        &[],
     );
-    assert!(has(&s, "PRECEDING"), "PRECEDING suppressed inside window frame: {s:?}");
+    let kw = SqlEditorWidget::collect_expected_keyword_suggestions("pr", &ctx, Some(Oracle));
+    assert!(has(&kw, "PRECEDING"), "PRECEDING suppressed inside window frame: {kw:?}");
     // A column named like a frame keyword is preserved outside a window spec.
     let s = suggestions("SELECT pr| FROM emp", &["PRECEDING"]);
     assert!(has(&s, "PRECEDING"), "column named PRECEDING was hidden: {s:?}");
 
-    // The MERGE action keyword `MATCHED` only follows `WHEN [NOT]`; it must not
-    // leak into a value/column position.
+    // `MATCH` is MySQL full-text syntax and Oracle row-pattern syntax, not a
+    // generic Oracle value expression. The MERGE action keyword `MATCHED` only
+    // follows `WHEN [NOT]`; neither may leak into a value/column position.
     for sql in ["SELECT ma| FROM emp", "SELECT * FROM emp WHERE ma| = 1"] {
         let s = suggestions(sql, &[]);
+        assert!(!has(&s, "MATCH"), "MATCH leaked into value position for `{sql}`: {s:?}");
         assert!(!has(&s, "MATCHED"), "MATCHED leaked into value position for `{sql}`: {s:?}");
     }
     // Its legitimate MERGE slot is still served by the contextual keyword merge.
@@ -21866,6 +22340,8 @@ fn expression_keyword_completion_is_position_aware() {
     // A column named MATCHED is preserved in a value position.
     let s = suggestions("SELECT ma| FROM emp", &["MATCHED"]);
     assert!(has(&s, "MATCHED"), "column named MATCHED was hidden: {s:?}");
+    let s = suggestions("SELECT ma| FROM emp", &["MATCH"]);
+    assert!(has(&s, "MATCH"), "column named MATCH was hidden: {s:?}");
 
     // Clause / statement / DDL keywords never belong in a value expression and
     // are dropped from the base dump (their real slots are served by the
@@ -21994,8 +22470,9 @@ fn analytic_continuations_offered_only_after_a_closed_call() {
         assert!(has(&s, kw), "{kw} suppressed after a closed call for `{sql}`: {s:?}");
     }
 
-    // The MySQL full-text continuation `AGAINST` belongs to the same family:
-    // `MATCH(col) AGAINST ('text')` — a closed call, never a plain operand.
+    // The MySQL full-text continuation `AGAINST` is even narrower:
+    // `MATCH(col) AGAINST ('text')` — a closed MATCH call, never a plain operand
+    // or a different function call.
     let mysql = |sql_with_cursor: &str| -> Vec<String> {
         let cursor = sql_with_cursor.find('|').expect("cursor marker");
         let sql = sql_with_cursor.replace('|', "");
@@ -22028,9 +22505,307 @@ fn analytic_continuations_offered_only_after_a_closed_call() {
         "AGAINST leaked after a plain operand"
     );
     assert!(
-        has(&mysql("SELECT match(ename) ag| FROM emp"), "AGAINST"),
-        "AGAINST suppressed after a closed call"
+        !has(&mysql("SELECT concat(ename) ag| FROM emp"), "AGAINST"),
+        "AGAINST leaked after a non-MATCH function call"
     );
+    assert!(
+        has(&mysql("SELECT ma| FROM emp"), "MATCH"),
+        "MATCH suppressed at a MySQL full-text operand position"
+    );
+    assert!(
+        has(&mysql("SELECT match(ename) ag| FROM emp"), "AGAINST"),
+        "AGAINST suppressed after a closed MATCH call"
+    );
+}
+
+/// MySQL `GROUP_CONCAT` admits the optional `SEPARATOR` clause only inside its
+/// own argument list, after the grouped expression / order expression and before
+/// a separator has already appeared. It must not leak as a generic after-operand
+/// keyword in the select list or predicates.
+#[test]
+fn group_concat_separator_is_scoped_to_group_concat_arguments() {
+    use crate::db::DatabaseType::MySQL;
+
+    fn suggestions(sql_with_cursor: &str) -> Vec<String> {
+        let cursor = sql_with_cursor.find('|').expect("cursor marker");
+        let sql = sql_with_cursor.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql_with_cursor);
+        let context =
+            SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+        let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &ctx);
+        let column_scope = (!column_tables.is_empty()).then(|| column_tables.clone());
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["EMP".to_string()];
+        data.set_columns_for_table("EMP", vec!["ENAME".to_string(), "EMPNO".to_string()]);
+        data.rebuild_indices();
+        let expr_keyword_ctx =
+            SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables, !prefix.is_empty(), Some(MySQL));
+        SqlEditorWidget::base_suggestions_for_context(
+            &mut data,
+            &prefix,
+            None,
+            column_scope.as_deref(),
+            matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
+            context,
+            false,
+            Some(MySQL),
+            expr_keyword_ctx,
+        )
+    }
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+
+    for sql in [
+        "SELECT ename se| FROM emp",
+        "SELECT concat(ename) se| FROM emp",
+        "SELECT * FROM emp WHERE ename se|",
+        "SELECT group_concat(concat(ename, se|)) FROM emp",
+        "SELECT group_concat(ename SEPARATOR ',' se|) FROM emp",
+        "SELECT group_concat(ename SEPARATOR se|) FROM emp",
+    ] {
+        let s = suggestions(sql);
+        assert!(!has(&s, "SEPARATOR"), "SEPARATOR leaked for `{sql}`: {s:?}");
+    }
+
+    for sql in [
+        "SELECT group_concat(ename se|) FROM emp",
+        "SELECT group_concat(DISTINCT ename se|) FROM emp",
+        "SELECT group_concat(ename ORDER BY empno se|) FROM emp",
+    ] {
+        let s = suggestions(sql);
+        assert!(has(&s, "SEPARATOR"), "SEPARATOR suppressed for `{sql}`: {s:?}");
+    }
+}
+
+/// MySQL's phonetic comparison is the compound operator `SOUNDS LIKE`. `SOUNDS`
+/// itself is not a general postfix keyword after every operand, and the `LIKE`
+/// after it is a fixed continuation rather than a normal pattern `LIKE` that can
+/// later take `ESCAPE`.
+#[test]
+fn sounds_like_operator_is_scoped_to_mysql_character_operands() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    fn suggestions(sql_with_cursor: &str) -> Vec<String> {
+        let cursor = sql_with_cursor.find('|').expect("cursor marker");
+        let sql = sql_with_cursor.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql_with_cursor);
+        let context =
+            SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+        let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &ctx);
+        let column_scope = (!column_tables.is_empty()).then(|| column_tables.clone());
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["EMP".to_string()];
+        data.set_columns_for_table("EMP", vec!["ENAME".to_string(), "EMPNO".to_string()]);
+        data.set_column_meta_for_table(
+            "EMP",
+            HashMap::from([
+                (
+                    "ENAME".to_string(),
+                    ColumnMeta {
+                        type_display: "VARCHAR(20)".to_string(),
+                        nullable: true,
+                        is_primary_key: false,
+                    },
+                ),
+                (
+                    "EMPNO".to_string(),
+                    ColumnMeta {
+                        type_display: "INT".to_string(),
+                        nullable: false,
+                        is_primary_key: true,
+                    },
+                ),
+            ]),
+        );
+        data.rebuild_indices();
+        let expr_keyword_ctx =
+            SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables, !prefix.is_empty(), Some(MySQL));
+        SqlEditorWidget::base_suggestions_for_context(
+            &mut data,
+            &prefix,
+            None,
+            column_scope.as_deref(),
+            matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
+            context,
+            false,
+            Some(MySQL),
+            expr_keyword_ctx,
+        )
+    }
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+
+    for sql in ["SELECT empno so| FROM emp", "SELECT 1 so| FROM emp"] {
+        let s = suggestions(sql);
+        assert!(!has(&s, "SOUNDS"), "SOUNDS leaked after a non-character operand for `{sql}`: {s:?}");
+    }
+
+    for sql in ["SELECT ename so| FROM emp", "SELECT upper(ename) so| FROM emp"] {
+        let s = suggestions(sql);
+        assert!(has(&s, "SOUNDS"), "SOUNDS suppressed after a character operand for `{sql}`: {s:?}");
+    }
+
+    let s = suggestions("SELECT ename SOUNDS li| FROM emp");
+    assert!(has(&s, "LIKE"), "LIKE suppressed after SOUNDS: {s:?}");
+
+    let ctx = analyze_inline_cursor_sql("SELECT ename SOUNDS | FROM emp");
+    assert_eq!(
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &ctx, Some(MySQL)),
+        vec!["LIKE".to_string()]
+    );
+    assert!(SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot_for_db(
+        &ctx,
+        false,
+        Some(MySQL),
+    ));
+    assert!(!SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot_for_db(
+        &ctx,
+        false,
+        Some(Oracle),
+    ));
+
+    let s = suggestions("SELECT ename SOUNDS LIKE 'SMTH' es| FROM emp");
+    assert!(!has(&s, "ESCAPE"), "ESCAPE leaked after SOUNDS LIKE: {s:?}");
+}
+
+/// MySQL `NEW`/`OLD` are trigger pseudo rows, not generic expression starters.
+/// They are scoped by trigger event: INSERT exposes `NEW`, DELETE exposes `OLD`,
+/// and UPDATE exposes both.
+#[test]
+fn mysql_trigger_pseudo_rows_are_scoped_to_trigger_events() {
+    use crate::db::DatabaseType::MySQL;
+
+    fn suggestions(sql_with_cursor: &str, extra_emp_columns: &[&str]) -> Vec<String> {
+        let cursor = sql_with_cursor.find('|').expect("cursor marker");
+        let sql = sql_with_cursor.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql_with_cursor);
+        let context =
+            SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+        let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &ctx);
+        let column_scope = (!column_tables.is_empty()).then(|| column_tables.clone());
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["EMP".to_string()];
+        let mut emp_columns = vec!["ENAME".to_string(), "EMPNO".to_string()];
+        emp_columns.extend(extra_emp_columns.iter().map(|c| c.to_string()));
+        data.set_columns_for_table("EMP", emp_columns);
+        data.rebuild_indices();
+        let expr_keyword_ctx =
+            SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables, !prefix.is_empty(), Some(MySQL));
+        SqlEditorWidget::base_suggestions_for_context(
+            &mut data,
+            &prefix,
+            None,
+            column_scope.as_deref(),
+            matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
+            context,
+            false,
+            Some(MySQL),
+            expr_keyword_ctx,
+        )
+    }
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+
+    for (sql, kw) in [
+        ("SELECT ne| FROM emp", "NEW"),
+        ("SELECT ol| FROM emp", "OLD"),
+        ("SELECT * FROM emp WHERE ne| = 1", "NEW"),
+        ("SELECT * FROM emp WHERE ol| = 1", "OLD"),
+    ] {
+        let s = suggestions(sql, &[]);
+        assert!(!has(&s, kw), "{kw} leaked outside a trigger for `{sql}`: {s:?}");
+    }
+
+    let s = suggestions("SELECT ne| FROM emp", &["NEW"]);
+    assert!(has(&s, "NEW"), "column named NEW was hidden: {s:?}");
+    let s = suggestions("SELECT ol| FROM emp", &["OLD"]);
+    assert!(has(&s, "OLD"), "column named OLD was hidden: {s:?}");
+
+    let insert_new = suggestions(
+        "CREATE TRIGGER bi_emp BEFORE INSERT ON emp FOR EACH ROW SET NEW.ename = ne|",
+        &[],
+    );
+    assert!(has(&insert_new, "NEW"), "NEW suppressed in INSERT trigger: {insert_new:?}");
+    let insert_old = suggestions(
+        "CREATE TRIGGER bi_emp BEFORE INSERT ON emp FOR EACH ROW SET NEW.ename = ol|",
+        &[],
+    );
+    assert!(!has(&insert_old, "OLD"), "OLD leaked in INSERT trigger: {insert_old:?}");
+
+    let update_new = suggestions(
+        "CREATE TRIGGER bu_emp BEFORE UPDATE ON emp FOR EACH ROW SET NEW.ename = ne|",
+        &[],
+    );
+    assert!(has(&update_new, "NEW"), "NEW suppressed in UPDATE trigger: {update_new:?}");
+    let update_old = suggestions(
+        "CREATE TRIGGER bu_emp BEFORE UPDATE ON emp FOR EACH ROW SET NEW.ename = ol|",
+        &[],
+    );
+    assert!(has(&update_old, "OLD"), "OLD suppressed in UPDATE trigger: {update_old:?}");
+
+    let delete_new = suggestions(
+        "CREATE TRIGGER bd_emp BEFORE DELETE ON emp FOR EACH ROW SET @v = ne|",
+        &[],
+    );
+    assert!(!has(&delete_new, "NEW"), "NEW leaked in DELETE trigger: {delete_new:?}");
+    let delete_old = suggestions(
+        "CREATE TRIGGER bd_emp BEFORE DELETE ON emp FOR EACH ROW SET @v = ol|",
+        &[],
+    );
+    assert!(has(&delete_old, "OLD"), "OLD suppressed in DELETE trigger: {delete_old:?}");
+}
+
+/// Oracle has a `CURSOR(SELECT ...)` expression; MySQL `CURSOR` is a stored
+/// program declaration keyword and must not appear as a value-expression starter.
+#[test]
+fn cursor_expression_keyword_is_oracle_only() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    fn suggestions(
+        sql_with_cursor: &str,
+        db_type: crate::db::DatabaseType,
+        extra_emp_columns: &[&str],
+    ) -> Vec<String> {
+        let cursor = sql_with_cursor.find('|').expect("cursor marker");
+        let sql = sql_with_cursor.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql_with_cursor);
+        let context =
+            SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+        let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &ctx);
+        let column_scope = (!column_tables.is_empty()).then(|| column_tables.clone());
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["EMP".to_string()];
+        let mut emp_columns = vec!["ENAME".to_string(), "EMPNO".to_string()];
+        emp_columns.extend(extra_emp_columns.iter().map(|c| c.to_string()));
+        data.set_columns_for_table("EMP", emp_columns);
+        data.rebuild_indices();
+        let expr_keyword_ctx =
+            SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables, !prefix.is_empty(), Some(db_type));
+        SqlEditorWidget::base_suggestions_for_context(
+            &mut data,
+            &prefix,
+            None,
+            column_scope.as_deref(),
+            matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
+            context,
+            false,
+            Some(db_type),
+            expr_keyword_ctx,
+        )
+    }
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+
+    let mysql = suggestions("SELECT cu| FROM emp", MySQL, &[]);
+    assert!(!has(&mysql, "CURSOR"), "CURSOR leaked in MySQL value position: {mysql:?}");
+    let mysql = suggestions("SELECT * FROM emp WHERE cu| = 1", MySQL, &[]);
+    assert!(!has(&mysql, "CURSOR"), "CURSOR leaked in MySQL predicate: {mysql:?}");
+
+    let oracle = suggestions("SELECT cu| FROM emp", Oracle, &[]);
+    assert!(has(&oracle, "CURSOR"), "Oracle CURSOR expression was hidden: {oracle:?}");
+
+    let mysql = suggestions("SELECT cu| FROM emp", MySQL, &["CURSOR"]);
+    assert!(has(&mysql, "CURSOR"), "column named CURSOR was hidden: {mysql:?}");
 }
 
 #[test]
@@ -22126,11 +22901,10 @@ fn escape_offered_only_after_a_like_pattern() {
     }
 }
 
-/// The set-quantifiers `DISTINCT`/`UNIQUE`/`DISTINCTROW` are grammatical only at
-/// the start of a select list or an aggregate argument — right after `SELECT`, a
-/// set operator, or an opening `(` — never as a general expression operand. The
-/// quantified-comparison keywords `ALL`/`ANY`/`SOME` are deliberately *not*
-/// gated, since `x = ANY (...)` is valid.
+/// Set-quantifiers are grammatical only at the start of a select list, aggregate
+/// argument, or set-operation branch. Quantified-comparison keywords (`ALL`/
+/// `ANY`/`SOME`) are separate: they follow a comparison operator (`x = ANY
+/// (...)`), never a random operand-start.
 #[test]
 fn set_quantifiers_offered_only_at_a_list_or_aggregate_anchor() {
     fn suggestions(sql_with_cursor: &str) -> Vec<String> {
@@ -22156,15 +22930,19 @@ fn set_quantifiers_offered_only_at_a_list_or_aggregate_anchor() {
     }
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
 
-    // General operand positions: DISTINCT/UNIQUE are noise. The opening `(`
-    // cases are *grouping/predicate* parens, not aggregate-call parens, so the
-    // quantifier must not be offered just because the previous token is `(`.
+    // General operand positions: set/quantified-comparison keywords are noise.
+    // The opening `(` cases are *grouping/predicate* parens, not aggregate-call
+    // parens, so the quantifier must not be offered just because the previous
+    // token is `(`.
     for sql in [
         "SELECT * FROM emp WHERE empno = dis|",
         "SELECT empno + dis| FROM emp",
         "SELECT nvl(empno, dis| FROM emp",
         "SELECT ename, dis| FROM emp",
         "SELECT * FROM emp WHERE empno = uni|",
+        "SELECT an| FROM emp",
+        "SELECT so| FROM emp",
+        "SELECT empno + al| FROM emp",
         "SELECT (dis| FROM emp",
         "SELECT (empno + 1) * (dis| FROM emp",
         "SELECT * FROM emp WHERE (dis|",
@@ -22172,21 +22950,40 @@ fn set_quantifiers_offered_only_at_a_list_or_aggregate_anchor() {
         let s = suggestions(sql);
         assert!(!has(&s, "DISTINCT"), "DISTINCT leaked into a general operand for `{sql}`: {s:?}");
         assert!(!has(&s, "UNIQUE"), "UNIQUE leaked into a general operand for `{sql}`: {s:?}");
+        assert!(!has(&s, "ANY"), "ANY leaked into a general operand for `{sql}`: {s:?}");
+        assert!(!has(&s, "SOME"), "SOME leaked into a general operand for `{sql}`: {s:?}");
+        assert!(!has(&s, "ALL"), "ALL leaked into a general operand for `{sql}`: {s:?}");
     }
 
-    // List / aggregate anchors: DISTINCT is grammatical.
+    // List / aggregate / set-operation anchors: set quantifiers are grammatical.
     for sql in [
         "SELECT dis| FROM emp",
+        "SELECT al| FROM emp",
         "SELECT count(dis| FROM emp",
+        "SELECT count(al| FROM emp",
         "SELECT empno FROM emp UNION dis|",
+        "SELECT empno FROM emp UNION al|",
     ] {
         let s = suggestions(sql);
-        assert!(has(&s, "DISTINCT"), "DISTINCT suppressed at a valid anchor for `{sql}`: {s:?}");
+        if sql.contains("dis|") {
+            assert!(
+                has(&s, "DISTINCT"),
+                "DISTINCT suppressed at a valid anchor for `{sql}`: {s:?}"
+            );
+        } else {
+            assert!(
+                has(&s, "ALL"),
+                "ALL suppressed at a valid anchor for `{sql}`: {s:?}"
+            );
+        }
     }
 
-    // `ANY`/`SOME` remain available as quantified comparisons after `=`.
+    // `ALL`/`ANY`/`SOME` remain available as quantified comparisons after a
+    // comparison operator.
     let s = suggestions("SELECT * FROM emp WHERE empno = an|");
     assert!(has(&s, "ANY"), "ANY wrongly suppressed in a quantified comparison: {s:?}");
+    let s = suggestions("SELECT * FROM emp WHERE empno <> so|");
+    assert!(has(&s, "SOME"), "SOME wrongly suppressed in a quantified comparison: {s:?}");
     let s = suggestions("SELECT * FROM emp WHERE empno = al|");
     assert!(has(&s, "ALL"), "ALL wrongly suppressed in a quantified comparison: {s:?}");
 }
@@ -22194,6 +22991,13 @@ fn set_quantifiers_offered_only_at_a_list_or_aggregate_anchor() {
 /// `EMP` with a typed schema (`ENAME` character, `EMPNO` numeric, `HIREDATE`
 /// datetime) so context-dependent keyword gating can be exercised end to end.
 fn typed_emp_suggestions(sql_with_cursor: &str) -> Vec<String> {
+    typed_emp_suggestions_for_db(sql_with_cursor, crate::db::DatabaseType::Oracle)
+}
+
+fn typed_emp_suggestions_for_db(
+    sql_with_cursor: &str,
+    db_type: crate::db::DatabaseType,
+) -> Vec<String> {
     let cursor = sql_with_cursor.find('|').expect("cursor marker");
     let sql = sql_with_cursor.replace('|', "");
     let ctx = analyze_inline_cursor_sql(sql_with_cursor);
@@ -22216,11 +23020,23 @@ fn typed_emp_suggestions(sql_with_cursor: &str) -> Vec<String> {
     data.set_column_meta_for_table("EMP", meta);
     data.rebuild_indices();
     let expr_keyword_ctx =
-        SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables, !prefix.is_empty(), Some(crate::db::DatabaseType::Oracle));
+        SqlEditorWidget::expression_keyword_context(
+            &ctx,
+            &data,
+            &column_tables,
+            !prefix.is_empty(),
+            Some(db_type),
+        );
     SqlEditorWidget::base_suggestions_for_context(
-        &mut data, &prefix, None, column_scope.as_deref(),
+        &mut data,
+        &prefix,
+        None,
+        column_scope.as_deref(),
         matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
-        context, false, Some(crate::db::DatabaseType::Oracle), expr_keyword_ctx,
+        context,
+        false,
+        Some(db_type),
+        expr_keyword_ctx,
     )
 }
 
@@ -22375,6 +23191,132 @@ fn first_last_are_not_value_functions() {
     assert!(
         kw.iter().any(|k| k.eq_ignore_ascii_case("FIRST")),
         "NULLS FIRST ordering slot lost FIRST: {kw:?}"
+    );
+}
+
+/// MySQL `RLIKE` is an infix regexp operator, not a standalone value-producing
+/// function. It must therefore appear only after a complete operand while still
+/// preserving a real column named `RLIKE` at operand-start positions.
+#[test]
+fn rlike_is_not_a_value_function() {
+    use crate::db::DatabaseType::MySQL;
+
+    fn suggestions(sql_with_cursor: &str, extra_emp_columns: &[&str]) -> Vec<String> {
+        let cursor = sql_with_cursor.find('|').expect("cursor marker");
+        let sql = sql_with_cursor.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql_with_cursor);
+        let context =
+            SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+        let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &ctx);
+        let column_scope = (!column_tables.is_empty()).then(|| column_tables.clone());
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["EMP".to_string()];
+        let mut emp_columns = vec!["ENAME".to_string(), "EMPNO".to_string()];
+        emp_columns.extend(extra_emp_columns.iter().map(|c| c.to_string()));
+        data.set_columns_for_table("EMP", emp_columns);
+        data.rebuild_indices();
+        let expr_keyword_ctx =
+            SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables, !prefix.is_empty(), Some(MySQL));
+        SqlEditorWidget::base_suggestions_for_context(
+            &mut data,
+            &prefix,
+            None,
+            column_scope.as_deref(),
+            matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
+            context,
+            false,
+            Some(MySQL),
+            expr_keyword_ctx,
+        )
+    }
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+
+    for sql in ["SELECT rl| FROM emp", "SELECT * FROM emp WHERE empno = rl|"] {
+        let s = suggestions(sql, &[]);
+        assert!(!has(&s, "RLIKE"), "RLIKE leaked as an operand for `{sql}`: {s:?}");
+    }
+
+    for sql in ["SELECT ename rl| FROM emp", "SELECT * FROM emp WHERE empno rl|"] {
+        let s = suggestions(sql, &[]);
+        assert!(has(&s, "RLIKE"), "RLIKE suppressed as an infix operator for `{sql}`: {s:?}");
+    }
+
+    let s = suggestions("SELECT rl| FROM emp", &["RLIKE"]);
+    assert!(has(&s, "RLIKE"), "column named RLIKE was hidden: {s:?}");
+}
+
+/// MySQL `BINARY` is a prefix operator (`BINARY expr`). Immediately after it the
+/// cursor expects a fresh operand, so postfix operators such as `AND` must not be
+/// offered while column operands still complete.
+#[test]
+fn binary_prefix_operator_expects_an_operand() {
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let mysql = |sql: &str| typed_emp_suggestions_for_db(sql, crate::db::DatabaseType::MySQL);
+
+    let start = mysql("SELECT bi| FROM emp");
+    assert!(has(&start, "BINARY"), "BINARY missing at a MySQL operand start: {start:?}");
+
+    let operand = mysql("SELECT BINARY en| FROM emp");
+    assert!(has(&operand, "ENAME"), "column operand missing after BINARY: {operand:?}");
+
+    let operator = mysql("SELECT BINARY a| FROM emp");
+    assert!(!has(&operator, "AND"), "AND leaked immediately after BINARY: {operator:?}");
+}
+
+/// `CAST`, `EXISTS`, and Oracle `CURSOR` introduce parenthesized constructs.
+/// Immediately after the keyword, neither a column nor a postfix operator is
+/// grammatical; the UI apply path suppresses the identifier base, while the
+/// expression keyword filter also treats the position as operand-starting so
+/// `AND`/`OR` do not leak.
+#[test]
+fn parenthesized_expression_constructs_suppress_identifier_base() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let exclude_flag = |sql_with_cursor: &str| {
+        let cursor = sql_with_cursor.find('|').expect("cursor marker");
+        let sql = sql_with_cursor.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+        !prefix.is_empty()
+    };
+    let suppresses = |sql: &str, db_type| {
+        SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot_for_db(
+            &analyze_inline_cursor_sql(sql),
+            exclude_flag(sql),
+            Some(db_type),
+        )
+    };
+
+    for sql in [
+        "SELECT CAST en| FROM emp",
+        "SELECT * FROM emp WHERE EXISTS en|",
+        "SELECT CURSOR en| FROM emp",
+        "SELECT EXTRACT en| FROM emp",
+        "SELECT JSON_EXISTS en| FROM emp",
+        "SELECT TREAT en| FROM emp",
+        "SELECT XMLCAST en| FROM emp",
+    ] {
+        assert!(suppresses(sql, Oracle), "identifier base leaked for `{sql}`");
+        let suggestions = typed_emp_suggestions_for_db(sql, Oracle);
+        assert!(!has(&suggestions, "AND"), "AND leaked for `{sql}`: {suggestions:?}");
+    }
+
+    assert!(
+        !suppresses("SELECT CURSOR en| FROM emp", MySQL),
+        "MySQL CURSOR is not a value-expression construct"
+    );
+    assert!(
+        !suppresses("CREATE TABLE IF NOT EXISTS emp|", Oracle),
+        "DDL IF NOT EXISTS name slot must keep identifier/object completion"
+    );
+    assert!(
+        !suppresses("SELECT CASE en| FROM emp", Oracle),
+        "CASE can accept a selector expression"
+    );
+    assert!(
+        !suppresses("SELECT BINARY en| FROM emp", MySQL),
+        "BINARY is a prefix operator, not a parenthesized construct"
     );
 }
 
@@ -22571,11 +23513,30 @@ fn columns_suppressed_immediately_after_a_complete_operand() {
         "SELECT * FROM emp ORDER BY ename |",
         "SELECT * FROM emp WHERE ename = 'x' |",
         "SELECT * FROM emp WHERE empno = empno |",
+        "SELECT CURRENT_DATE | FROM emp",
+        "SELECT CURRENT_TIMESTAMP | FROM emp",
+        "SELECT LOCALTIMESTAMP | FROM emp",
+        "SELECT SYSDATE | FROM emp",
+        "SELECT SYSTIMESTAMP | FROM emp",
     ] {
         let s = typed_emp_suggestions(sql);
         assert!(
             !has(&s, "ENAME") && !has(&s, "EMPNO") && !has(&s, "HIREDATE"),
             "operand material leaked after a complete operand for `{sql}`: {s:?}"
+        );
+    }
+
+    for sql in [
+        "SELECT CURRENT_DATE | FROM emp",
+        "SELECT CURRENT_TIME | FROM emp",
+        "SELECT CURRENT_TIMESTAMP | FROM emp",
+        "SELECT LOCALTIME | FROM emp",
+        "SELECT LOCALTIMESTAMP | FROM emp",
+    ] {
+        let s = typed_emp_suggestions_for_db(sql, crate::db::DatabaseType::MySQL);
+        assert!(
+            !has(&s, "ENAME") && !has(&s, "EMPNO") && !has(&s, "HIREDATE"),
+            "operand material leaked after a complete MySQL temporal value for `{sql}`: {s:?}"
         );
     }
 

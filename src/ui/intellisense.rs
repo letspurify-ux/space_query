@@ -450,7 +450,6 @@ pub const MYSQL_FUNCTIONS: &[&str] = &[
     "REPLACE",
     "REVERSE",
     "RIGHT",
-    "RLIKE",
     "ROUND",
     "ROW_COUNT",
     "ROW_NUMBER",
