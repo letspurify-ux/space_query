@@ -201,6 +201,13 @@ const PARENTHESIZED_EXPRESSION_CONSTRUCT_WORDS: &[&str] = &[
 /// otherwise correctly offer relation names.
 const PARENTHESIZED_TABLE_SOURCE_CONSTRUCT_WORDS: &[&str] = &["JSON_TABLE", "TABLE", "XMLTABLE"];
 
+const JSON_ERROR_EMPTY_OPTION_FUNCTION_WORDS: &[&str] =
+    &["JSON_EXISTS", "JSON_QUERY", "JSON_TABLE", "JSON_VALUE"];
+const JSON_ON_NULL_OPTION_FUNCTION_WORDS: &[&str] =
+    &["JSON_ARRAY", "JSON_ARRAYAGG", "JSON_OBJECT", "JSON_OBJECTAGG"];
+const JSON_ERROR_EMPTY_TARGET_WORDS: &[&str] = &["ERROR", "EMPTY"];
+const JSON_NULL_TARGET_WORDS: &[&str] = &["NULL"];
+
 impl ExpressionKeywordContext {
     /// A non-committal context (used where the expression-keyword filter does not
     /// run, e.g. table/qualified slots) that admits both keyword families.
@@ -4517,6 +4524,19 @@ impl SqlEditorWidget {
     /// `COLUMNS` keyword. Shared by the type-slot and string-literal-slot checks
     /// so the table-function subgrammar stays anchored in one place.
     fn cursor_is_inside_table_function_columns_clause(tokens: &[SqlToken], end: usize) -> bool {
+        Self::cursor_is_inside_table_function_columns_clause_matching(tokens, end, |word| {
+            word.eq_ignore_ascii_case("JSON_TABLE") || word.eq_ignore_ascii_case("XMLTABLE")
+        })
+    }
+
+    fn cursor_is_inside_table_function_columns_clause_matching<F>(
+        tokens: &[SqlToken],
+        end: usize,
+        matches_table_function: F,
+    ) -> bool
+    where
+        F: Fn(&str) -> bool,
+    {
         struct Frame {
             follows_table_fn: bool,
             columns_seen: bool,
@@ -4528,8 +4548,7 @@ impl SqlEditorWidget {
                 SqlToken::Comment(_) => {}
                 SqlToken::Symbol(sym) if sym == "(" => {
                     let follows_table_fn = last_word.as_deref().is_some_and(|word| {
-                        word.eq_ignore_ascii_case("JSON_TABLE")
-                            || word.eq_ignore_ascii_case("XMLTABLE")
+                        matches_table_function(word)
                     });
                     stack.push(Frame {
                         follows_table_fn,
@@ -4596,6 +4615,165 @@ impl SqlEditorWidget {
             exclude_current_identifier_chain,
         );
         Self::table_function_path_literal_position(tokens, end)
+    }
+
+    fn json_default_handler_precedes_on(toks: &[&SqlToken], on_index: usize) -> bool {
+        let mut paren_depth = 0usize;
+        for token in toks[..on_index].iter().rev() {
+            match token {
+                SqlToken::Symbol(sym) if sym == ")" => paren_depth += 1,
+                SqlToken::Symbol(sym) if sym == "(" => {
+                    if paren_depth == 0 {
+                        return false;
+                    }
+                    paren_depth -= 1;
+                }
+                SqlToken::Symbol(sym) if sym == "," && paren_depth == 0 => return false,
+                SqlToken::Word(word)
+                    if paren_depth == 0 && word.eq_ignore_ascii_case("DEFAULT") =>
+                {
+                    return true;
+                }
+                SqlToken::Word(word)
+                    if paren_depth == 0
+                        && matches!(
+                            word.to_ascii_uppercase().as_str(),
+                            "COLUMNS"
+                                | "EMPTY"
+                                | "ERROR"
+                                | "FALSE"
+                                | "FORMAT"
+                                | "NULL"
+                                | "ON"
+                                | "PASSING"
+                                | "PATH"
+                                | "RETURNING"
+                                | "TRUE"
+                        ) =>
+                {
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    fn json_query_handler_precedes_on(toks: &[&SqlToken], on_index: usize) -> bool {
+        let Some(prev_index) = on_index.checked_sub(1) else {
+            return false;
+        };
+        let Some(SqlToken::Word(prev)) = toks.get(prev_index) else {
+            return false;
+        };
+        match prev.to_ascii_uppercase().as_str() {
+            "NULL" | "ERROR" | "EMPTY" => true,
+            "ARRAY" | "OBJECT" => matches!(
+                prev_index.checked_sub(1).and_then(|index| toks.get(index)),
+                Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("EMPTY")
+            ),
+            _ => false,
+        }
+    }
+
+    fn json_value_handler_precedes_on(toks: &[&SqlToken], on_index: usize) -> bool {
+        matches!(
+            on_index.checked_sub(1).and_then(|index| toks.get(index)),
+            Some(SqlToken::Word(word))
+                if word.eq_ignore_ascii_case("NULL") || word.eq_ignore_ascii_case("ERROR")
+        ) || Self::json_default_handler_precedes_on(toks, on_index)
+    }
+
+    fn json_exists_handler_precedes_on(toks: &[&SqlToken], on_index: usize) -> bool {
+        matches!(
+            on_index.checked_sub(1).and_then(|index| toks.get(index)),
+            Some(SqlToken::Word(word))
+                if matches!(word.to_ascii_uppercase().as_str(), "ERROR" | "FALSE" | "TRUE")
+        )
+    }
+
+    fn json_table_handler_precedes_on(toks: &[&SqlToken], on_index: usize) -> bool {
+        Self::json_value_handler_precedes_on(toks, on_index)
+            || Self::json_query_handler_precedes_on(toks, on_index)
+            || Self::json_exists_handler_precedes_on(toks, on_index)
+    }
+
+    fn json_on_null_handler_precedes_on(toks: &[&SqlToken], on_index: usize) -> bool {
+        matches!(
+            on_index.checked_sub(1).and_then(|index| toks.get(index)),
+            Some(SqlToken::Word(word))
+                if word.eq_ignore_ascii_case("ABSENT") || word.eq_ignore_ascii_case("NULL")
+        )
+    }
+
+    /// Fixed continuation after the `ON` in SQL/JSON error/empty handlers:
+    /// `NULL ON |`, `DEFAULT expr ON |`, `TRUE ON |`, `EMPTY ARRAY ON |`.
+    /// Also covers JSON generation `ABSENT/NULL ON | -> NULL`. Scoped to JSON
+    /// function/table-function syntax so ordinary `JOIN ... ON |` remains a
+    /// column-expression slot.
+    fn expected_json_on_target_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        let Some(last) = toks.len().checked_sub(1) else {
+            return None;
+        };
+        if !matches!(toks.get(last), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("ON"))
+            || matches!(
+                toks.get(last.checked_sub(1).unwrap_or(last)),
+                Some(SqlToken::Symbol(sym)) if sym == "."
+            )
+        {
+            return None;
+        }
+
+        if Self::cursor_is_inside_table_function_columns_clause_matching(
+            tokens,
+            end,
+            |word| word.eq_ignore_ascii_case("JSON_TABLE"),
+        ) && Self::json_table_handler_precedes_on(&toks, last)
+        {
+            return Some(JSON_ERROR_EMPTY_TARGET_WORDS);
+        }
+
+        let function_word = Self::innermost_open_paren_preceding_word(tokens, end)?;
+        let upper = function_word.to_ascii_uppercase();
+        if JSON_ERROR_EMPTY_OPTION_FUNCTION_WORDS.contains(&upper.as_str()) {
+            let handler_matches = match upper.as_str() {
+                "JSON_EXISTS" => Self::json_exists_handler_precedes_on(&toks, last),
+                "JSON_QUERY" => Self::json_query_handler_precedes_on(&toks, last),
+                "JSON_TABLE" | "JSON_VALUE" => Self::json_table_handler_precedes_on(&toks, last),
+                _ => false,
+            };
+            if handler_matches {
+                return Some(JSON_ERROR_EMPTY_TARGET_WORDS);
+            }
+        }
+
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            && JSON_ON_NULL_OPTION_FUNCTION_WORDS.contains(&upper.as_str())
+            && Self::json_on_null_handler_precedes_on(&toks, last)
+        {
+            return Some(JSON_NULL_TARGET_WORDS);
+        }
+        None
+    }
+
+    fn expected_json_on_target_keyword_candidates_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::expected_json_on_target_keyword_candidates(tokens, end, db_type)
     }
 
     /// True when the cursor is at a PL/SQL type slot: a routine parameter type
@@ -5215,6 +5393,12 @@ impl SqlEditorWidget {
                 deep_ctx,
                 exclude_current_identifier_chain,
             )
+            || Self::expected_json_on_target_keyword_candidates_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+            .is_some()
             || Self::order_by_sort_modifier_slot_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
@@ -6747,6 +6931,12 @@ impl SqlEditorWidget {
 
         if let Some(candidates) =
             Self::expected_sounds_like_keyword_candidates(tokens, context_end, db_type)
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+
+        if let Some(candidates) =
+            Self::expected_json_on_target_keyword_candidates(tokens, context_end, db_type)
         {
             return Self::filter_expected_candidates(prefix, candidates);
         }

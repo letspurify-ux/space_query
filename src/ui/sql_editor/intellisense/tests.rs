@@ -18681,6 +18681,8 @@ fn column_suppressing_keyword_slot_covers_every_family() {
     assert!(at(
         "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id NUMBER PATH |))"
     )); // table-function path literal
+    assert!(at("SELECT JSON_VALUE(doc, '$.a' NULL ON |) FROM t")); // JSON ON target
+    assert!(at("SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON |) FROM t")); // JSON ON NULL target
     assert!(at("SELECT * FROM emp ORDER BY id ASC |")); // ORDER BY sort modifier
     assert!(at("SELECT * FROM emp ORDER BY id NULLS FIRST |")); // completed sort modifier
     assert!(at("SELECT sum(x) OVER (ORDER BY d NULLS |) FROM t")); // window sort modifier
@@ -21302,6 +21304,8 @@ fn keyword_only_slots_suppress_the_identifier_base() {
         "SELECT * FROM emp WHERE JSON_EXISTS en|",
         "SELECT * FROM JSON_TABLE jt|",
         "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id NUMBER PATH p|))",
+        "SELECT JSON_VALUE(doc, '$.a' NULL ON er|) FROM t",
+        "SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON nu|) FROM t",
         "SELECT SUM(x) OVER (ORDER BY a ROWS UNBOUNDED prec|) FROM t",
         "SELECT x FROM t FETCH FIRST ro| ROWS ONLY",
         "SELECT max(x) KEEP (DENSE_RANK fir|) FROM t",
@@ -22091,6 +22095,101 @@ fn table_function_path_literal_slots_suppress_identifier_base() {
         )
         .is_empty(),
         "column named PATH must remain a type slot"
+    );
+}
+
+#[test]
+fn json_on_target_keyword_slots_suppress_identifier_base() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let exclude_flag = |sql_with_cursor: &str| {
+        let cursor = sql_with_cursor.find('|').expect("cursor marker");
+        let sql = sql_with_cursor.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+        !prefix.is_empty()
+    };
+    let suppresses_for = |sql: &str, db_type| {
+        SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot_for_db(
+            &analyze_inline_cursor_sql(sql),
+            exclude_flag(sql),
+            Some(db_type),
+        )
+    };
+    let suppresses = |sql: &str| suppresses_for(sql, Oracle);
+    let keywords_for = |sql_with_cursor: &str, db_type| {
+        let cursor = sql_with_cursor.find('|').expect("cursor marker");
+        let sql = sql_with_cursor.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix,
+            &analyze_inline_cursor_sql(sql_with_cursor),
+            Some(db_type),
+        )
+    };
+    let keywords = |sql_with_cursor: &str| keywords_for(sql_with_cursor, Oracle);
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+
+    for sql in [
+        "SELECT JSON_VALUE(payload, '$.amount' NULL ON |) FROM emp",
+        "SELECT JSON_VALUE(payload, '$.amount' DEFAULT fallback_amt ON |) FROM emp",
+        "SELECT JSON_EXISTS(payload, '$' TRUE ON |) FROM emp",
+        "SELECT JSON_QUERY(payload, '$' EMPTY ARRAY ON |) FROM emp",
+        "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id NUMBER PATH '$.id' NULL ON |))",
+    ] {
+        assert!(suppresses(sql), "JSON ON target slot leaked identifiers for `{sql}`");
+        let kw = keywords(sql);
+        assert!(
+            has(&kw, "ERROR") && has(&kw, "EMPTY"),
+            "JSON ON target keywords missing for `{sql}`: {kw:?}"
+        );
+    }
+
+    for sql in [
+        "SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON |) FROM emp",
+        "SELECT JSON_ARRAY(v NULL ON |) FROM emp",
+    ] {
+        assert!(suppresses(sql), "JSON ON NULL target slot leaked identifiers for `{sql}`");
+        assert_eq!(
+            keywords(sql),
+            vec!["NULL".to_string()],
+            "JSON ON NULL target should only suggest NULL for `{sql}`"
+        );
+    }
+
+    assert_eq!(
+        keywords("SELECT JSON_VALUE(payload, '$.amount' NULL ON er|) FROM emp"),
+        vec!["ERROR".to_string()]
+    );
+    assert_eq!(
+        keywords("SELECT JSON_VALUE(payload, '$.amount' NULL ON em|) FROM emp"),
+        vec!["EMPTY".to_string()]
+    );
+    assert_eq!(
+        keywords("SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON nu|) FROM emp"),
+        vec!["NULL".to_string()]
+    );
+    assert!(
+        keywords("SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON er|) FROM emp").is_empty(),
+        "JSON ON NULL target must not suggest ERROR"
+    );
+    assert!(
+        !suppresses_for("SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON |) FROM emp", MySQL),
+        "Oracle JSON ON NULL target must not suppress identifiers in MySQL mode"
+    );
+    assert!(
+        keywords_for("SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON nu|) FROM emp", MySQL)
+            .is_empty(),
+        "Oracle JSON ON NULL target must not emit keywords in MySQL mode"
+    );
+
+    assert!(
+        !suppresses("SELECT * FROM emp e JOIN dept d ON |"),
+        "ordinary JOIN ON must keep column completion"
+    );
+    let join_columns = typed_emp_suggestions("SELECT * FROM emp e JOIN dept d ON en|");
+    assert!(
+        has(&join_columns, "ENAME"),
+        "ordinary JOIN ON lost column completion: {join_columns:?}"
     );
 }
 
