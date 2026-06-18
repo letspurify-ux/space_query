@@ -1207,6 +1207,16 @@ fn assert_has_case_insensitive(values: &[String], expected: &str) {
     );
 }
 
+fn assert_not_has_case_insensitive(values: &[String], unexpected: &str) {
+    assert!(
+        !values
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(unexpected)),
+        "did not expect `{unexpected}` in values: {:?}",
+        values
+    );
+}
+
 fn virtual_columns_for<'a>(
     columns_by_name: &'a HashMap<String, Vec<String>>,
     relation_name: &str,
@@ -7680,6 +7690,33 @@ END;"#,
 }
 
 #[test]
+fn local_record_member_suggestions_filter_by_expected_operand_type_when_type_known() {
+    let suggestions =
+        SqlEditorWidget::collect_local_record_member_suggestions_with_expected_type_for_test(
+            r#"DECLARE
+    TYPE emp_rec IS RECORD (
+        num_field NUMBER,
+        char_field VARCHAR2(20),
+        date_field DATE,
+        any_field custom_type
+    );
+    v_emp emp_rec;
+BEGIN
+    v_emp.__CODEX_CURSOR__
+END;"#,
+            "v_emp",
+            "",
+            ExpectedOperandTypes::Single(PrecedingOperandType::Numeric),
+        )
+        .expect("record variable should expose fields from its local record type");
+
+    assert_has_case_insensitive(&suggestions, "num_field");
+    assert_has_case_insensitive(&suggestions, "any_field");
+    assert_not_has_case_insensitive(&suggestions, "char_field");
+    assert_not_has_case_insensitive(&suggestions, "date_field");
+}
+
+#[test]
 fn local_record_member_suggestions_include_nested_record_type_fields() {
     let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
         r#"DECLARE
@@ -8540,6 +8577,32 @@ END;"#,
 }
 
 #[test]
+fn local_rowtype_member_suggestions_filter_by_expected_operand_type_when_type_known() {
+    let suggestions =
+        SqlEditorWidget::collect_local_rowtype_member_suggestions_with_expected_type_for_test(
+            r#"DECLARE
+    v_emp scott.emp%ROWTYPE;
+BEGIN
+    v_emp.__CODEX_CURSOR__
+END;"#,
+            "v_emp",
+            "",
+            "SCOTT.EMP",
+            &[
+                ("EMPNO", "NUMBER(4)"),
+                ("ENAME", "VARCHAR2(10)"),
+                ("HIREDATE", "DATE"),
+            ],
+            ExpectedOperandTypes::Single(PrecedingOperandType::Numeric),
+        )
+        .expect("table %ROWTYPE variable should resolve to loaded table columns");
+
+    assert_has_case_insensitive(&suggestions, "EMPNO");
+    assert_not_has_case_insensitive(&suggestions, "ENAME");
+    assert_not_has_case_insensitive(&suggestions, "HIREDATE");
+}
+
+#[test]
 fn local_rowtype_member_suggestions_use_default_qualified_table_columns() {
     let suggestions =
         SqlEditorWidget::collect_local_rowtype_member_suggestions_with_default_for_test(
@@ -8953,6 +9016,392 @@ fn local_symbol_suggestions_merge_session_binds_without_duplicates() {
 
     assert_eq!(v_text_count, 1);
     assert_has_case_insensitive(&suggestions, "V_SESSION");
+}
+
+#[test]
+fn local_symbol_suggestions_filter_by_expected_operand_type_when_type_known() {
+    let sql_with_cursor = r#"DECLARE
+    v_num NUMBER;
+    v_char VARCHAR2(20);
+    v_date DATE;
+    v_any custom_type;
+BEGIN
+    SELECT empno + __CODEX_CURSOR__ FROM emp;
+END;"#;
+    let cursor = sql_with_cursor.find("__CODEX_CURSOR__").expect("cursor");
+    let sql = sql_with_cursor.replacen("__CODEX_CURSOR__", "", 1);
+    let (routine_cache, expanded) =
+        SqlEditorWidget::build_routine_symbol_cache_bundle_for_test(&sql, cursor);
+    let analysis = SqlEditorWidget::build_intellisense_analysis_from_routine_cache(
+        &routine_cache,
+        expanded.cursor_in_statement,
+    );
+    let mut suggestions = SqlEditorWidget::collect_local_symbol_suggestions(
+        "",
+        expanded.cursor_in_statement,
+        &analysis,
+        &[],
+    );
+    let has = |values: &[String], name: &str| values.iter().any(|value| value == name);
+    assert!(
+        has(&suggestions, "v_num")
+            && has(&suggestions, "v_char")
+            && has(&suggestions, "v_date")
+            && has(&suggestions, "v_any"),
+        "test setup did not collect every local symbol before filtering: {suggestions:?}"
+    );
+
+    SqlEditorWidget::filter_local_symbol_suggestions_by_expected_operand_type(
+        &mut suggestions,
+        expanded.cursor_in_statement,
+        &analysis,
+        ExpectedOperandTypes::Single(PrecedingOperandType::Numeric),
+    );
+
+    assert!(
+        has(&suggestions, "v_num"),
+        "numeric local symbol was removed from numeric RHS slot: {suggestions:?}"
+    );
+    assert!(
+        has(&suggestions, "v_any"),
+        "unknown local symbol type should be preserved rather than guessed away: {suggestions:?}"
+    );
+    assert!(
+        !has(&suggestions, "v_char") && !has(&suggestions, "v_date"),
+        "non-numeric typed local symbols leaked into numeric RHS slot: {suggestions:?}"
+    );
+}
+
+#[test]
+fn local_assignment_rhs_suggestions_filter_by_target_type_when_known() {
+    let suggestions_for = |sql_with_cursor: &str| {
+        const CURSOR: &str = "__CODEX_CURSOR__";
+        let cursor = sql_with_cursor.find(CURSOR).expect("cursor");
+        let sql = sql_with_cursor.replacen(CURSOR, "", 1);
+        let (routine_cache, expanded) =
+            SqlEditorWidget::build_routine_symbol_cache_bundle_for_test(&sql, cursor);
+        let analysis = SqlEditorWidget::build_intellisense_analysis_from_routine_cache(
+            &routine_cache,
+            expanded.cursor_in_statement,
+        );
+        let mut suggestions = SqlEditorWidget::collect_local_symbol_suggestions(
+            "",
+            expanded.cursor_in_statement,
+            &analysis,
+            &[],
+        );
+        if let Some(expected_type) = SqlEditorWidget::current_local_assignment_expected_operand_type(
+            analysis.context.statement_tokens.as_ref(),
+            analysis.context.cursor_token_len,
+            expanded.cursor_in_statement,
+            &analysis,
+        ) {
+            SqlEditorWidget::filter_local_symbol_suggestions_by_expected_operand_type(
+                &mut suggestions,
+                expanded.cursor_in_statement,
+                &analysis,
+                expected_type,
+            );
+        }
+        suggestions
+    };
+    let has = |values: &[String], name: &str| values.iter().any(|value| value == name);
+    let assert_only = |sql: &str, expected: &str, unexpected: &[&str]| {
+        let suggestions = suggestions_for(sql);
+        assert!(
+            has(&suggestions, expected),
+            "assignment RHS lost `{expected}` for `{sql}`: {suggestions:?}"
+        );
+        for name in unexpected {
+            assert!(
+                !has(&suggestions, name),
+                "assignment RHS leaked `{name}` for `{sql}`: {suggestions:?}"
+            );
+        }
+        assert!(
+            has(&suggestions, "v_any"),
+            "unknown/custom local types should be preserved for `{sql}`: {suggestions:?}"
+        );
+    };
+
+    let block = |assignment: &str| {
+        format!(
+            r#"DECLARE
+    v_num NUMBER;
+    v_char VARCHAR2(20);
+    v_date DATE;
+    v_any custom_type;
+BEGIN
+    {assignment}
+END;"#
+        )
+    };
+
+    assert_only(
+        &block("v_num := __CODEX_CURSOR__;"),
+        "v_num",
+        &["v_char", "v_date"],
+    );
+    assert_only(
+        &block("v_char := __CODEX_CURSOR__;"),
+        "v_char",
+        &["v_num", "v_date"],
+    );
+    assert_only(
+        &block("v_date := __CODEX_CURSOR__;"),
+        "v_date",
+        &["v_num", "v_char"],
+    );
+
+    let custom_target = suggestions_for(&block("v_any := __CODEX_CURSOR__;"));
+    assert!(
+        has(&custom_target, "v_num")
+            && has(&custom_target, "v_char")
+            && has(&custom_target, "v_date")
+            && has(&custom_target, "v_any"),
+        "custom-typed assignment target must not over-filter RHS symbols: {custom_target:?}"
+    );
+}
+
+#[test]
+fn routine_return_suggestions_filter_by_declared_return_type_when_known() {
+    let suggestions_for = |sql_with_cursor: &str| {
+        const CURSOR: &str = "__CODEX_CURSOR__";
+        let cursor = sql_with_cursor.find(CURSOR).expect("cursor");
+        let sql = sql_with_cursor.replacen(CURSOR, "", 1);
+        let (routine_cache, expanded) =
+            SqlEditorWidget::build_routine_symbol_cache_bundle_for_test(&sql, cursor);
+        let analysis = SqlEditorWidget::build_intellisense_analysis_from_routine_cache(
+            &routine_cache,
+            expanded.cursor_in_statement,
+        );
+        let mut suggestions = SqlEditorWidget::collect_local_symbol_suggestions(
+            "",
+            expanded.cursor_in_statement,
+            &analysis,
+            &[],
+        );
+        if let Some(expected_type) = SqlEditorWidget::current_routine_return_expected_operand_type(
+            analysis.context.statement_tokens.as_ref(),
+            analysis.context.cursor_token_len,
+            expanded.cursor_in_statement,
+            &analysis,
+        ) {
+            SqlEditorWidget::filter_local_symbol_suggestions_by_expected_operand_type(
+                &mut suggestions,
+                expanded.cursor_in_statement,
+                &analysis,
+                expected_type,
+            );
+        }
+        suggestions
+    };
+    let has = |values: &[String], name: &str| values.iter().any(|value| value == name);
+    let assert_only = |sql: &str, expected: &str, unexpected: &[&str]| {
+        let suggestions = suggestions_for(sql);
+        assert!(
+            has(&suggestions, expected),
+            "RETURN expression lost `{expected}` for `{sql}`: {suggestions:?}"
+        );
+        for name in unexpected {
+            assert!(
+                !has(&suggestions, name),
+                "RETURN expression leaked `{name}` for `{sql}`: {suggestions:?}"
+            );
+        }
+        assert!(
+            has(&suggestions, "v_any"),
+            "unknown/custom local types should be preserved for `{sql}`: {suggestions:?}"
+        );
+    };
+
+    let oracle_function = |return_type: &str| {
+        format!(
+            r#"CREATE FUNCTION f RETURN {return_type} IS
+    v_num NUMBER;
+    v_char VARCHAR2(20);
+    v_date DATE;
+    v_any custom_type;
+BEGIN
+    RETURN __CODEX_CURSOR__;
+END;"#
+        )
+    };
+
+    assert_only(
+        &oracle_function("NUMBER"),
+        "v_num",
+        &["v_char", "v_date"],
+    );
+    assert_only(
+        &oracle_function("VARCHAR2"),
+        "v_char",
+        &["v_num", "v_date"],
+    );
+    assert_only(
+        &oracle_function("DATE"),
+        "v_date",
+        &["v_num", "v_char"],
+    );
+
+    let custom_return = suggestions_for(&oracle_function("custom_type"));
+    assert!(
+        has(&custom_return, "v_num")
+            && has(&custom_return, "v_char")
+            && has(&custom_return, "v_date")
+            && has(&custom_return, "v_any"),
+        "custom function return type must not over-filter RETURN symbols: {custom_return:?}"
+    );
+
+    assert_only(
+        r#"CREATE FUNCTION f()
+RETURNS INT
+BEGIN
+    DECLARE v_num INT DEFAULT 0;
+    DECLARE v_char VARCHAR(20) DEFAULT '';
+    DECLARE v_any custom_type;
+    RETURN __CODEX_CURSOR__;
+END;"#,
+        "v_num",
+        &["v_char"],
+    );
+}
+
+#[test]
+fn into_source_slots_filter_columns_to_target_variable_type_when_known() {
+    let suggestions_for = |sql_with_cursor: &str| {
+        let cursor = sql_with_cursor.find('|').expect("cursor");
+        let sql = sql_with_cursor.replace('|', "");
+        let (routine_cache, expanded) =
+            SqlEditorWidget::build_routine_symbol_cache_bundle_for_test(&sql, cursor);
+        let analysis = SqlEditorWidget::build_intellisense_analysis_from_routine_cache(
+            &routine_cache,
+            expanded.cursor_in_statement,
+        );
+        let deep_ctx = analysis.context.as_ref();
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+        let context = SqlEditorWidget::classify_intellisense_context(
+            deep_ctx,
+            deep_ctx.statement_tokens.as_ref(),
+        );
+        let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, deep_ctx);
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["EMP".to_string()];
+        data.set_columns_for_table(
+            "EMP",
+            vec![
+                "ENAME".to_string(),
+                "EMPNO".to_string(),
+                "HIREDATE".to_string(),
+            ],
+        );
+        let meta = HashMap::from([
+            (
+                "ENAME".to_string(),
+                ColumnMeta {
+                    type_display: "VARCHAR2(10)".to_string(),
+                    nullable: true,
+                    is_primary_key: false,
+                },
+            ),
+            (
+                "EMPNO".to_string(),
+                ColumnMeta {
+                    type_display: "NUMBER(4)".to_string(),
+                    nullable: false,
+                    is_primary_key: true,
+                },
+            ),
+            (
+                "HIREDATE".to_string(),
+                ColumnMeta {
+                    type_display: "DATE".to_string(),
+                    nullable: true,
+                    is_primary_key: false,
+                },
+            ),
+        ]);
+        data.set_column_meta_for_table("EMP", meta);
+        data.rebuild_indices();
+        let mut expr_ctx = SqlEditorWidget::expression_keyword_context(
+            deep_ctx,
+            &data,
+            &column_tables,
+            !prefix.is_empty(),
+            Some(crate::db::DatabaseType::Oracle),
+        );
+        expr_ctx.expected_operand_type = expr_ctx.expected_operand_type.or_else(|| {
+            SqlEditorWidget::current_local_into_target_expected_operand_type(
+                deep_ctx.statement_tokens.as_ref(),
+                deep_ctx.cursor_token_len,
+                expanded.cursor_in_statement,
+                &analysis,
+            )
+        });
+        SqlEditorWidget::base_suggestions_for_context(
+            &mut data,
+            &prefix,
+            None,
+            Some(&column_tables),
+            true,
+            context,
+            false,
+            Some(crate::db::DatabaseType::Oracle),
+            expr_ctx,
+        )
+    };
+    let has = |values: &[String], name: &str| values.iter().any(|value| value == name);
+    let assert_only = |sql: &str, expected: &str, unexpected: &[&str]| {
+        let suggestions = suggestions_for(sql);
+        assert!(
+            has(&suggestions, expected),
+            "INTO source slot lost `{expected}` for `{sql}`: {suggestions:?}"
+        );
+        for name in unexpected {
+            assert!(
+                !has(&suggestions, name),
+                "INTO source slot leaked `{name}` for `{sql}`: {suggestions:?}"
+            );
+        }
+    };
+
+    let block = |statement: &str| {
+        format!(
+            r#"DECLARE
+    v_num NUMBER;
+    v_char VARCHAR2(20);
+    v_date DATE;
+BEGIN
+    {statement}
+END;"#
+        )
+    };
+
+    assert_only(
+        &block("SELECT | INTO v_num FROM emp;"),
+        "EMPNO",
+        &["ENAME", "HIREDATE"],
+    );
+    assert_only(
+        &block("SELECT 1, | INTO v_num, v_char FROM emp;"),
+        "ENAME",
+        &["EMPNO", "HIREDATE"],
+    );
+    assert_only(
+        &block("SELECT 1, 'A', | INTO v_num, v_char, v_date FROM emp;"),
+        "HIREDATE",
+        &["ENAME", "EMPNO"],
+    );
+    assert_only(
+        &block("UPDATE emp SET empno = 1 RETURNING | INTO v_num;"),
+        "EMPNO",
+        &["ENAME", "HIREDATE"],
+    );
+    assert_only(
+        &block("UPDATE emp SET empno = 1 RETURNING empno, | INTO v_num, v_date;"),
+        "HIREDATE",
+        &["ENAME", "EMPNO"],
+    );
 }
 
 #[test]
@@ -19129,6 +19578,11 @@ fn column_suppressing_keyword_slot_covers_every_family() {
     assert!(at("SELECT hire_date - INTERVAL '5' | FROM emp")); // INTERVAL unit
     assert!(at("SELECT CAST | FROM emp")); // expression construct opening paren
     assert!(at("SELECT * FROM emp WHERE EXISTS |")); // expression construct opening paren
+    assert!(at("SELECT * FROM emp WHERE empno IN |")); // predicate list opening paren
+    assert!(at("SELECT * FROM emp WHERE empno NOT IN |"));
+    assert!(at("SELECT * FROM emp WHERE empno = ANY |")); // quantified comparison opening paren
+    assert!(at("SELECT * FROM emp WHERE EXISTS (|)")); // subquery-only body
+    assert!(at("SELECT * FROM emp WHERE empno = ANY (|)")); // quantified subquery body
     assert!(at("SELECT XMLCAST | FROM emp")); // function-like construct opening paren
     assert!(at("SELECT * FROM emp WHERE JSON_EXISTS |")); // function-like construct opening paren
     assert!(at("SELECT * FROM JSON_TABLE |")); // table-source construct opening paren
@@ -19143,14 +19597,17 @@ fn column_suppressing_keyword_slot_covers_every_family() {
     assert!(at("SELECT * FROM emp ORDER |")); // pure clause-keyword continuation
     assert!(at("SELECT * FROM a LEFT |")); // pure join-type continuation
     assert!(at("SELECT sum(x) OVER (PARTITION |) FROM t")); // window PARTITION BY
-    assert!(at("SELECT * FROM emp WHERE a IS |")); // IS null-test operator
+    assert!(at("SELECT * FROM emp WHERE a IS |")); // IS predicate operator
     assert!(at("SELECT * FROM emp WHERE a IS NOT |"));
+    assert!(at("SELECT * FROM emp WHERE a IS DISTINCT |"));
+    assert!(at("SELECT * FROM emp WHERE payload IS JSON OBJECT WITH |"));
     assert!(at("CREATE ROLLBACK |")); // statement structural keyword tail
     assert!(at("CREATE JAVA |")); // statement structural keyword tail
     assert!(at("CREATE SYNONYM emp_syn |")); // statement structural keyword tail
     // Ordinary column positions remain column positions.
     assert!(!at("SELECT | FROM emp"));
     assert!(!at("SELECT * FROM emp WHERE | "));
+    assert!(!at("SELECT * FROM emp WHERE empno IN (|)"));
     assert!(!at("SELECT CASE | FROM emp"));
     assert!(!at("CREATE TABLE IF NOT EXISTS |"));
     // Value-bound window-frame slots accept an expression, so they are NOT here.
@@ -19266,36 +19723,128 @@ fn window_partition_continuation_offers_by_and_suppresses_columns() {
 }
 
 #[test]
-fn is_null_test_continuation_offers_keywords_and_suppresses_columns() {
-    let at = |sql: &str| {
-        SqlEditorWidget::cursor_is_at_is_null_test_keyword_position_for_context(
+fn is_predicate_continuations_offer_keywords_and_suppress_columns() {
+    let words = |values: &[&str]| {
+        values
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect::<Vec<_>>()
+    };
+    let prefix_for = |sql_with_cursor: &str| {
+        let cursor = sql_with_cursor.find('|').expect("cursor marker");
+        let sql = sql_with_cursor.replace('|', "");
+        crate::ui::intellisense::get_word_at_cursor(&sql, cursor)
+            .0
+            .to_string()
+    };
+    let at_for = |sql: &str, db_type| {
+        SqlEditorWidget::cursor_is_at_is_predicate_keyword_position_for_context(
             &analyze_inline_cursor_sql(sql),
-            false,
+            !prefix_for(sql).is_empty(),
+            db_type,
         )
     };
-    let kw = |sql: &str| {
+    let kw_for = |sql: &str, db_type| {
         SqlEditorWidget::collect_expected_keyword_suggestions(
-            "",
+            &prefix_for(sql),
             &analyze_inline_cursor_sql(sql),
-            None,
+            db_type,
         )
     };
-    // `IS |` -> NOT / NULL; `IS NOT |` -> NULL. Identifiers are never valid after
-    // `IS`, so the position routes through the column-suppression chokepoint.
+    let at = |sql: &str| at_for(sql, None);
+    let kw = |sql: &str| kw_for(sql, None);
+
+    let is_tail = words(&[
+        "NOT", "NULL", "TRUE", "FALSE", "UNKNOWN", "DISTINCT", "JSON", "OF", "EMPTY", "A",
+        "NAN", "INFINITE",
+    ]);
+    let is_not_tail = words(&[
+        "NULL", "TRUE", "FALSE", "UNKNOWN", "DISTINCT", "JSON", "OF", "EMPTY", "A", "NAN",
+        "INFINITE",
+    ]);
+    let json_tail = words(&[
+        "VALUE", "ARRAY", "OBJECT", "SCALAR", "STRICT", "LAX", "WITH", "WITHOUT",
+    ]);
+
+    // `IS |` / `IS NOT |` open every dialect-valid predicate continuation.
+    // Identifiers are never valid immediately after `IS`, so these positions
+    // route through the column-suppression chokepoint.
     assert!(at("SELECT * FROM t WHERE a IS |"));
-    assert_eq!(kw("SELECT * FROM t WHERE a IS |"), vec!["NOT", "NULL"]);
+    assert_eq!(kw("SELECT * FROM t WHERE a IS |"), is_tail);
+    assert_eq!(kw("SELECT * FROM t WHERE a IS NO|"), words(&["NOT"]));
     assert!(at("SELECT * FROM t WHERE a IS NOT |"));
-    assert_eq!(kw("SELECT * FROM t WHERE a IS NOT |"), vec!["NULL"]);
+    assert_eq!(kw("SELECT * FROM t WHERE a IS NOT |"), is_not_tail);
+
+    // Multi-token predicate tails stay exact at each cursor position.
+    assert_eq!(kw("SELECT * FROM t WHERE a IS DI|"), words(&["DISTINCT"]));
+    assert_eq!(
+        kw("SELECT * FROM t WHERE a IS NOT DI|"),
+        words(&["DISTINCT"])
+    );
+    assert_eq!(kw("SELECT * FROM t WHERE a IS DISTINCT |"), words(&["FROM"]));
+    assert_eq!(
+        kw("SELECT * FROM t WHERE a IS NOT DISTINCT |"),
+        words(&["FROM"])
+    );
+    assert_eq!(kw("SELECT * FROM t WHERE a IS OF |"), words(&["TYPE"]));
+    assert_eq!(kw("SELECT * FROM t WHERE a IS A |"), words(&["SET"]));
+    assert_eq!(kw("SELECT * FROM t WHERE payload IS JSON |"), json_tail);
+    assert_eq!(
+        kw("SELECT * FROM t WHERE payload IS NOT JSON |"),
+        json_tail
+    );
+    assert_eq!(
+        kw("SELECT * FROM t WHERE payload IS JSON OBJECT |"),
+        words(&["STRICT", "LAX", "WITH", "WITHOUT"])
+    );
+    assert_eq!(
+        kw("SELECT * FROM t WHERE payload IS JSON OBJECT STRICT |"),
+        words(&["WITH", "WITHOUT"])
+    );
+    assert_eq!(
+        kw("SELECT * FROM t WHERE payload IS JSON OBJECT WITH |"),
+        words(&["UNIQUE"])
+    );
+    assert_eq!(
+        kw("SELECT * FROM t WHERE payload IS JSON OBJECT WITHOUT UNIQUE |"),
+        words(&["KEYS"])
+    );
+
+    let mysql_tail = words(&["NOT", "NULL", "TRUE", "FALSE", "UNKNOWN"]);
+    assert_eq!(
+        kw_for(
+            "SELECT * FROM t WHERE a IS |",
+            Some(crate::db::DatabaseType::MySQL)
+        ),
+        mysql_tail
+    );
+    assert!(
+        kw_for(
+            "SELECT * FROM t WHERE a IS DI|",
+            Some(crate::db::DatabaseType::MySQL)
+        )
+        .is_empty(),
+        "MySQL-compatible IS predicate must not offer DISTINCT"
+    );
+    assert!(
+        !at_for(
+            "SELECT * FROM t WHERE payload IS JSON |",
+            Some(crate::db::DatabaseType::MySQL)
+        ),
+        "MySQL-compatible IS predicate must not enter Oracle JSON options"
+    );
+
     // Works for any operand and in any clause, including a chained predicate and a
     // boolean expression in the select list.
     assert!(at("SELECT * FROM t WHERE f(x) IS |"));
     assert!(at("SELECT * FROM t WHERE a IS NULL AND b IS |"));
     assert!(at("SELECT a IS | FROM t"));
 
-    // Not the operator: a completed `IS NULL`, an ordinary operand position, the
+    // Not the operator: a completed predicate, an ordinary operand position, the
     // `<col> NOT` predicate tail, a qualified member column named `is`, and the
     // continuation after a finished predicate.
     assert!(!at("SELECT * FROM t WHERE a IS NULL |"));
+    assert!(!at("SELECT * FROM t WHERE payload IS JSON WITH UNIQUE KEYS |"));
     assert!(!at("SELECT * FROM t WHERE a |"));
     assert!(!at("SELECT * FROM t WHERE a NOT |"));
     assert!(!at("SELECT * FROM t e WHERE e.is |"));
@@ -19303,10 +19852,317 @@ fn is_null_test_continuation_offers_keywords_and_suppresses_columns() {
     assert!(
         !kw("SELECT is | FROM t")
             .iter()
-            .any(|value| value == "NOT" || value == "NULL"),
+            .any(|value| ["NOT", "NULL", "DISTINCT", "JSON"].contains(&value.as_str())),
         "IS keyword continuation leaked without a left operand"
     );
     assert!(!at("SELECT * FROM t WHERE a IS NULL AND b |"));
+}
+
+#[test]
+fn is_type_specific_predicate_tails_require_matching_left_operand() {
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let kw = |sql_with_cursor: &str, db_type: crate::db::DatabaseType| -> Vec<String> {
+        let cursor = sql_with_cursor.find('|').expect("cursor marker");
+        let sql = sql_with_cursor.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql_with_cursor);
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+        let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &ctx);
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["T".to_string()];
+        data.set_columns_for_table(
+            "T",
+            vec![
+                "NESTED_COL".to_string(),
+                "FLOAT_COL".to_string(),
+                "NUM_COL".to_string(),
+                "CHAR_COL".to_string(),
+            ],
+        );
+        data.set_column_meta_for_table(
+            "T",
+            HashMap::from([
+                ("NESTED_COL".to_string(), ColumnMeta { type_display: "NESTED TABLE OF NUMBER".to_string(), nullable: true, is_primary_key: false }),
+                ("FLOAT_COL".to_string(), ColumnMeta { type_display: "BINARY_DOUBLE".to_string(), nullable: true, is_primary_key: false }),
+                ("NUM_COL".to_string(), ColumnMeta { type_display: "NUMBER".to_string(), nullable: true, is_primary_key: false }),
+                ("CHAR_COL".to_string(), ColumnMeta { type_display: "VARCHAR2(20)".to_string(), nullable: true, is_primary_key: false }),
+            ]),
+        );
+        data.rebuild_indices();
+        let expr_keyword_ctx = SqlEditorWidget::expression_keyword_context(
+            &ctx,
+            &data,
+            &column_tables,
+            !prefix.is_empty(),
+            Some(db_type),
+        );
+        SqlEditorWidget::collect_expected_keyword_suggestions_with_expression_context(
+            &prefix,
+            &ctx,
+            Some(db_type),
+            Some(expr_keyword_ctx),
+        )
+    };
+    let oracle = |sql: &str| kw(sql, crate::db::DatabaseType::Oracle);
+
+    for sql in [
+        "SELECT * FROM t WHERE num_col IS |",
+        "SELECT * FROM t WHERE char_col IS |",
+        "SELECT * FROM t WHERE num_col IS NOT |",
+        "SELECT * FROM t WHERE char_col IS NOT |",
+    ] {
+        let suggestions = oracle(sql);
+        assert!(
+            !has(&suggestions, "EMPTY") && !has(&suggestions, "A"),
+            "collection-only IS predicate tails leaked for scalar operand `{sql}`: {suggestions:?}"
+        );
+        assert!(
+            !has(&suggestions, "NAN") && !has(&suggestions, "INFINITE"),
+            "floating-only IS predicate tails leaked for scalar operand `{sql}`: {suggestions:?}"
+        );
+        assert!(
+            has(&suggestions, "NULL") && has(&suggestions, "JSON"),
+            "general IS predicate tails were lost for scalar operand `{sql}`: {suggestions:?}"
+        );
+    }
+
+    for sql in [
+        "SELECT * FROM t WHERE float_col IS |",
+        "SELECT * FROM t WHERE float_col IS NOT |",
+    ] {
+        let suggestions = oracle(sql);
+        assert!(
+            has(&suggestions, "NAN") && has(&suggestions, "INFINITE"),
+            "floating IS predicate tails were suppressed for `{sql}`: {suggestions:?}"
+        );
+        assert!(
+            !has(&suggestions, "EMPTY") && !has(&suggestions, "A"),
+            "collection-only tails leaked after floating operand `{sql}`: {suggestions:?}"
+        );
+    }
+
+    for sql in [
+        "SELECT * FROM t WHERE nested_col IS |",
+        "SELECT * FROM t WHERE nested_col IS NOT |",
+    ] {
+        let suggestions = oracle(sql);
+        assert!(
+            has(&suggestions, "EMPTY") && has(&suggestions, "A"),
+            "collection IS predicate tails were suppressed for `{sql}`: {suggestions:?}"
+        );
+    }
+
+    assert_eq!(
+        oracle("SELECT * FROM t WHERE nested_col IS em|"),
+        vec!["EMPTY".to_string()]
+    );
+    assert_eq!(
+        oracle("SELECT * FROM t WHERE nested_col IS a|"),
+        vec!["A".to_string()]
+    );
+    assert_eq!(
+        oracle("SELECT * FROM t WHERE nested_col IS A |"),
+        vec!["SET".to_string()]
+    );
+    assert!(
+        oracle("SELECT * FROM t WHERE num_col IS A |").is_empty(),
+        "SET tail must not appear after scalar IS A"
+    );
+    assert_eq!(
+        oracle("SELECT * FROM t WHERE float_col IS na|"),
+        vec!["NAN".to_string()]
+    );
+    assert_eq!(
+        oracle("SELECT * FROM t WHERE float_col IS inf|"),
+        vec!["INFINITE".to_string()]
+    );
+    assert!(
+        oracle("SELECT * FROM t WHERE num_col IS na|").is_empty(),
+        "NAN must not appear after ordinary NUMBER operands"
+    );
+
+    let mysql = kw(
+        "SELECT * FROM t WHERE nested_col IS |",
+        crate::db::DatabaseType::MySQL,
+    );
+    assert!(
+        !has(&mysql, "EMPTY") && !has(&mysql, "A"),
+        "Oracle collection IS tails leaked in MySQL mode: {mysql:?}"
+    );
+}
+
+#[test]
+fn is_of_type_slots_offer_type_objects_and_suppress_columns() {
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let suggestions_for_db =
+        |sql_with_cursor: &str, db_type: crate::db::DatabaseType| -> Vec<String> {
+        let cursor = sql_with_cursor.find('|').expect("cursor marker");
+        let sql = sql_with_cursor.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql_with_cursor);
+        let context =
+            SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+        let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &ctx);
+        let column_scope = (!column_tables.is_empty()).then(|| column_tables.clone());
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["EMP".to_string()];
+        data.types = vec!["ADDR_TYPE".to_string(), "EMPLOYEE_T".to_string()];
+        data.set_columns_for_table("EMP", vec!["OBJ_COL".to_string(), "EMPNO".to_string()]);
+        data.rebuild_indices();
+        let at_data_type_position = SqlEditorWidget::data_type_position_for_context_for_db(
+            &ctx,
+            !prefix.is_empty(),
+            Some(db_type),
+        )
+        .is_some();
+        let at_keyword_only_slot =
+            SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot_for_db(
+                &ctx,
+                !prefix.is_empty(),
+                Some(db_type),
+            );
+        let expr_keyword_ctx = SqlEditorWidget::expression_keyword_context(
+            &ctx,
+            &data,
+            &column_tables,
+            !prefix.is_empty(),
+            Some(db_type),
+        );
+        let mut values = if at_data_type_position {
+            data.get_type_object_suggestions(&prefix)
+        } else if at_keyword_only_slot {
+            Vec::new()
+        } else {
+            SqlEditorWidget::base_suggestions_for_context(
+                &mut data,
+                &prefix,
+                None,
+                column_scope.as_deref(),
+                matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
+                context,
+                false,
+                Some(db_type),
+                expr_keyword_ctx,
+            )
+        };
+        for keyword in SqlEditorWidget::collect_expected_keyword_suggestions_with_expression_context(
+            &prefix,
+            &ctx,
+            Some(db_type),
+            Some(expr_keyword_ctx),
+        ) {
+            if !values
+                .iter()
+                .any(|value| value.eq_ignore_ascii_case(&keyword))
+            {
+                values.push(keyword);
+            }
+        }
+        values
+    };
+    let suggestions =
+        |sql_with_cursor: &str| suggestions_for_db(sql_with_cursor, crate::db::DatabaseType::Oracle);
+    let suppresses_for_db = |sql: &str, db_type: crate::db::DatabaseType| {
+        let cursor = sql.find('|').expect("cursor marker");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot_for_db(
+            &analyze_inline_cursor_sql(sql),
+            !prefix.is_empty(),
+            Some(db_type),
+        ) || SqlEditorWidget::data_type_position_for_context_for_db(
+            &analyze_inline_cursor_sql(sql),
+            !prefix.is_empty(),
+            Some(db_type),
+        )
+        .is_some()
+    };
+    let suppresses = |sql: &str| suppresses_for_db(sql, crate::db::DatabaseType::Oracle);
+
+    for sql in [
+        "SELECT * FROM emp WHERE obj_col IS OF TYPE |",
+        "SELECT * FROM emp WHERE obj_col IS NOT OF TYPE |",
+    ] {
+        assert!(suppresses(sql), "IS OF TYPE opener leaked columns for `{sql}`");
+        assert!(
+            suggestions(sql).is_empty(),
+            "punctuation-only IS OF TYPE opener should not offer identifiers for `{sql}`"
+        );
+    }
+
+    for sql in [
+        "SELECT * FROM emp WHERE obj_col IS OF TYPE (|)",
+        "SELECT * FROM emp WHERE obj_col IS OF TYPE (ONLY |)",
+        "SELECT * FROM emp WHERE obj_col IS OF TYPE (addr_type, |)",
+        "SELECT * FROM emp WHERE obj_col IS NOT OF TYPE (|)",
+        "SELECT * FROM emp WHERE obj_col IS NOT OF TYPE (ONLY |)",
+        "SELECT * FROM emp WHERE obj_col IS NOT OF TYPE (addr_type, |)",
+    ] {
+        let values = suggestions(sql);
+        assert!(
+            has(&values, "ADDR_TYPE") && has(&values, "EMPLOYEE_T"),
+            "IS OF TYPE list lost type objects for `{sql}`: {values:?}"
+        );
+        assert!(
+            !has(&values, "OBJ_COL") && !has(&values, "EMPNO"),
+            "columns leaked into IS OF TYPE list for `{sql}`: {values:?}"
+        );
+    }
+    assert!(
+        has(&suggestions("SELECT * FROM emp WHERE obj_col IS OF TYPE (|)"), "ONLY"),
+        "IS OF TYPE list should offer ONLY before a type name"
+    );
+    assert_eq!(
+        suggestions("SELECT * FROM emp WHERE obj_col IS OF TYPE (ON|)"),
+        vec!["ONLY".to_string()]
+    );
+    assert_eq!(
+        suggestions("SELECT * FROM emp WHERE obj_col IS NOT OF TYPE (ON|)"),
+        vec!["ONLY".to_string()]
+    );
+    for sql in [
+        "SELECT * FROM emp WHERE obj_col IS OF TYPE (addr|)",
+        "SELECT * FROM emp WHERE obj_col IS OF TYPE (ONLY addr|)",
+        "SELECT * FROM emp WHERE obj_col IS NOT OF TYPE (addr|)",
+        "SELECT * FROM emp WHERE obj_col IS NOT OF TYPE (ONLY addr|)",
+    ] {
+        assert_eq!(
+            suggestions(sql),
+            vec!["ADDR_TYPE".to_string()],
+            "IS OF TYPE type-name prefix should filter to matching TYPE objects for `{sql}`"
+        );
+    }
+    for sql in [
+        "SELECT * FROM emp WHERE obj_col IS OF TYPE (addr_type |)",
+        "SELECT * FROM emp WHERE obj_col IS OF TYPE (ONLY addr_type |)",
+        "SELECT * FROM emp WHERE obj_col IS NOT OF TYPE (addr_type |)",
+        "SELECT * FROM emp WHERE obj_col IS NOT OF TYPE (ONLY addr_type |)",
+    ] {
+        assert!(suppresses(sql), "completed IS OF TYPE name leaked columns for `{sql}`");
+        assert!(
+            suggestions(sql).is_empty(),
+            "completed IS OF TYPE name should not offer identifiers for `{sql}`"
+        );
+    }
+
+    for db_type in [crate::db::DatabaseType::MySQL, crate::db::DatabaseType::MariaDB] {
+        for sql in [
+            "SELECT * FROM emp WHERE obj_col IS OF TYPE |",
+            "SELECT * FROM emp WHERE obj_col IS OF TYPE (|)",
+            "SELECT * FROM emp WHERE obj_col IS OF TYPE (ONLY |)",
+            "SELECT * FROM emp WHERE obj_col IS OF TYPE (addr|)",
+            "SELECT * FROM emp WHERE obj_col IS OF TYPE (ONLY addr|)",
+        ] {
+            let values = suggestions_for_db(sql, db_type);
+            assert!(
+                !has(&values, "ADDR_TYPE") && !has(&values, "EMPLOYEE_T"),
+                "Oracle IS OF TYPE object suggestions leaked for {db_type:?} `{sql}`: {values:?}"
+            );
+        }
+        assert!(
+            !suppresses_for_db("SELECT * FROM emp WHERE obj_col IS OF TYPE |", db_type),
+            "Oracle-only IS OF TYPE opener should not become a {db_type:?} punctuation slot"
+        );
+    }
 }
 
 #[test]
@@ -23302,13 +24158,22 @@ fn expression_keyword_completion_is_position_aware() {
         assert!(!has(&s, kw), "{kw} leaked outside CASE for `{sql}`: {s:?}");
     }
 
-    // Inside an unclosed CASE the body keywords are grammatical again.
+    // Inside an unclosed CASE the body keywords are grammatical only at the
+    // matching CASE state, not merely because some CASE is open.
     let s = suggestions("SELECT CASE WHEN empno = 1 th| FROM emp", &[]);
     assert!(has(&s, "THEN"), "THEN suppressed inside CASE: {s:?}");
     let s = suggestions("SELECT CASE WHEN empno = 1 THEN 2 en| FROM emp", &[]);
     assert!(has(&s, "END"), "END suppressed inside CASE: {s:?}");
     let s = suggestions("SELECT CASE WHEN empno = 1 THEN 2 el| FROM emp", &[]);
     assert!(has(&s, "ELSE"), "ELSE suppressed inside CASE: {s:?}");
+    for (sql, kw) in [
+        ("SELECT CASE WHEN th| THEN 1 END FROM emp", "THEN"),
+        ("SELECT CASE WHEN empno = 1 THEN el| END FROM emp", "ELSE"),
+        ("SELECT CASE WHEN empno = 1 THEN en| END FROM emp", "END"),
+    ] {
+        let s = suggestions(sql, &[]);
+        assert!(!has(&s, kw), "{kw} leaked before the CASE slot was complete for `{sql}`: {s:?}");
+    }
 
     // A column literally named like a CASE keyword is preserved even outside a
     // CASE — the filter never hides a legitimate completion.
@@ -23537,6 +24402,56 @@ fn analytic_continuations_offered_only_after_a_closed_call() {
     assert!(
         has(&mysql("SELECT match(ename) ag| FROM emp"), "AGAINST"),
         "AGAINST suppressed after a closed MATCH call"
+    );
+}
+
+#[test]
+fn mysql_full_text_against_open_paren_slot_suppresses_columns() {
+    let suppresses = |sql: &str, db_type| {
+        SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot_for_db(
+            &analyze_inline_cursor_sql(sql),
+            false,
+            Some(db_type),
+        )
+    };
+
+    assert!(
+        suppresses(
+            "SELECT match(ename) AGAINST | FROM emp",
+            crate::db::DatabaseType::MySQL
+        ),
+        "MATCH ... AGAINST must require an opening paren in MySQL"
+    );
+    assert!(
+        typed_emp_suggestions_for_db(
+            "SELECT match(ename) AGAINST | FROM emp",
+            crate::db::DatabaseType::MySQL
+        )
+        .is_empty(),
+        "identifier material leaked after MATCH ... AGAINST"
+    );
+    assert!(
+        !suppresses(
+            "SELECT match(ename) AGAINST | FROM emp",
+            crate::db::DatabaseType::Oracle
+        ),
+        "Oracle must not treat AGAINST as a MySQL full-text operator"
+    );
+    assert!(
+        !suppresses(
+            "SELECT concat(ename) AGAINST | FROM emp",
+            crate::db::DatabaseType::MySQL
+        ),
+        "only a closed MATCH call may introduce AGAINST"
+    );
+
+    let suggestions = typed_emp_suggestions_for_db(
+        "SELECT match(ename) AGAINST (|) FROM emp",
+        crate::db::DatabaseType::MySQL,
+    );
+    assert!(
+        suggestions.iter().any(|value| value == "ENAME"),
+        "AGAINST argument expression slot should keep columns: {suggestions:?}"
     );
 }
 
@@ -24197,7 +25112,49 @@ fn multiset_operators_do_not_trigger_query_set_operator_continuations() {
         data.tables = vec!["T".to_string()];
         data.set_columns_for_table(
             "T",
-            vec!["CHILD_NT".to_string(), "PARENT_NT".to_string()],
+            vec![
+                "CHILD_NT".to_string(),
+                "PARENT_NT".to_string(),
+                "ELEM".to_string(),
+                "TXT_COL".to_string(),
+            ],
+        );
+        data.set_column_meta_for_table(
+            "T",
+            HashMap::from([
+                (
+                    "CHILD_NT".to_string(),
+                    ColumnMeta {
+                        type_display: "NESTED TABLE OF NUMBER".to_string(),
+                        nullable: true,
+                        is_primary_key: false,
+                    },
+                ),
+                (
+                    "PARENT_NT".to_string(),
+                    ColumnMeta {
+                        type_display: "NESTED TABLE OF NUMBER".to_string(),
+                        nullable: true,
+                        is_primary_key: false,
+                    },
+                ),
+                (
+                    "ELEM".to_string(),
+                    ColumnMeta {
+                        type_display: "NUMBER".to_string(),
+                        nullable: true,
+                        is_primary_key: false,
+                    },
+                ),
+                (
+                    "TXT_COL".to_string(),
+                    ColumnMeta {
+                        type_display: "VARCHAR2(20)".to_string(),
+                        nullable: true,
+                        is_primary_key: false,
+                    },
+                ),
+            ]),
         );
         data.rebuild_indices();
         let expr_keyword_ctx = SqlEditorWidget::expression_keyword_context(
@@ -24271,6 +25228,28 @@ fn multiset_operators_do_not_trigger_query_set_operator_continuations() {
             "{keyword} was suppressed after a MULTISET operator for `{sql}`: {suggestions:?}"
         );
     }
+
+    for sql in [
+        "SELECT child_nt MULTISET EXCEPT | FROM t",
+        "SELECT child_nt MULTISET UNION ALL | FROM t",
+        "SELECT child_nt MULTISET INTERSECT DISTINCT | FROM t",
+    ] {
+        let suggestions = base(sql);
+        assert!(
+            has(&suggestions, "PARENT_NT") && has(&suggestions, "CHILD_NT"),
+            "MULTISET RHS lost collection columns for `{sql}`: {suggestions:?}"
+        );
+        assert!(
+            !has(&suggestions, "ELEM") && !has(&suggestions, "TXT_COL"),
+            "non-collection columns leaked into MULTISET RHS for `{sql}`: {suggestions:?}"
+        );
+    }
+    let prefixed = base("SELECT child_nt MULTISET EXCEPT par| FROM t");
+    assert_eq!(
+        prefixed,
+        vec!["PARENT_NT".to_string()],
+        "MULTISET RHS prefix should keep only matching collection columns"
+    );
 }
 
 /// `EMP` with a typed schema (`ENAME` character, `EMPNO` numeric, `HIREDATE`
@@ -24312,7 +25291,21 @@ fn typed_emp_suggestions_for_db(
             !prefix.is_empty(),
             Some(db_type),
         );
-    SqlEditorWidget::base_suggestions_for_context(
+    let at_keyword_only_slot =
+        SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot_for_db(
+            &ctx,
+            !prefix.is_empty(),
+            Some(db_type),
+        );
+    if at_keyword_only_slot {
+        return Vec::new();
+    }
+    let at_keyword_only_identifier_slot = SqlEditorWidget::cursor_is_at_identifier_suppressing_keyword_slot_for_context(
+        &ctx,
+        !prefix.is_empty(),
+        Some(db_type),
+    );
+    let mut suggestions = SqlEditorWidget::base_suggestions_for_context(
         &mut data,
         &prefix,
         None,
@@ -24322,7 +25315,24 @@ fn typed_emp_suggestions_for_db(
         false,
         Some(db_type),
         expr_keyword_ctx,
-    )
+    );
+    let context_name_suggestions =
+        if matches!(context, SqlContext::VariableName | SqlContext::BindValue)
+            || at_keyword_only_identifier_slot
+            || at_keyword_only_slot
+            || expr_keyword_ctx.expected_operand_type.is_some()
+        {
+            Vec::new()
+        } else {
+            SqlEditorWidget::collect_context_name_suggestions(&prefix, &ctx, context)
+        };
+    suggestions = SqlEditorWidget::maybe_merge_suggestions_with_context_aliases(
+        suggestions,
+        context_name_suggestions,
+        matches!(context, SqlContext::TableName),
+        false,
+    );
+    suggestions
 }
 
 /// Hierarchical pseudo-columns/operators (`LEVEL`, `PRIOR`, `CONNECT_BY_ROOT`,
@@ -24411,6 +25421,26 @@ fn default_value_keyword_offered_only_in_dml_value_positions() {
 #[test]
 fn operand_type_operators_match_the_preceding_operand_type() {
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let kw = |sql: &str| {
+        let cursor = sql.find('|').expect("cursor marker");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(crate::db::DatabaseType::Oracle),
+        )
+    };
+    let suppresses = |sql: &str, db_type| {
+        let cursor = sql.find('|').expect("cursor marker");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot_for_db(
+            &analyze_inline_cursor_sql(sql),
+            !prefix.is_empty(),
+            Some(db_type),
+        )
+    };
 
     // AT after a datetime operand (column, literal, or niladic function).
     for sql in [
@@ -24450,6 +25480,252 @@ fn operand_type_operators_match_the_preceding_operand_type() {
     // But never at an operand-start (these are postfix operators).
     let s = typed_emp_suggestions("SELECT * FROM emp WHERE empno = a|");
     assert!(!has(&s, "AT"), "AT leaked at an operand-start: {s:?}");
+
+    assert_eq!(
+        kw("SELECT * FROM emp WHERE hiredate AT |"),
+        vec!["LOCAL".to_string(), "TIME".to_string()]
+    );
+    assert_eq!(
+        kw("SELECT * FROM emp WHERE hiredate AT ti|"),
+        vec!["TIME".to_string()]
+    );
+    assert_eq!(
+        kw("SELECT * FROM emp WHERE hiredate AT TIME |"),
+        vec!["ZONE".to_string()]
+    );
+    for sql in [
+        "SELECT * FROM emp WHERE hiredate AT |",
+        "SELECT * FROM emp WHERE hiredate AT TIME |",
+    ] {
+        assert!(
+            suppresses(sql, crate::db::DatabaseType::Oracle),
+            "AT TIME ZONE fixed keyword tail leaked columns for `{sql}`"
+        );
+    }
+    assert!(
+        !suppresses(
+            "SELECT * FROM emp WHERE hiredate AT TIME ZONE |",
+            crate::db::DatabaseType::Oracle
+        ),
+        "timezone expression slot after AT TIME ZONE must keep value completion"
+    );
+    let timezone_value = typed_emp_suggestions("SELECT * FROM emp WHERE hiredate AT TIME ZONE |");
+    assert!(
+        has(&timezone_value, "ENAME"),
+        "AT TIME ZONE expression slot lost character columns: {timezone_value:?}"
+    );
+    assert!(
+        !has(&timezone_value, "EMPNO") && !has(&timezone_value, "HIREDATE"),
+        "AT TIME ZONE expression slot leaked non-character columns: {timezone_value:?}"
+    );
+    assert!(
+        !suppresses(
+            "SELECT * FROM emp WHERE hiredate AT |",
+            crate::db::DatabaseType::MySQL
+        ),
+        "Oracle AT TIME ZONE tail must not become a MySQL keyword-only slot"
+    );
+
+    for sql in [
+        "SELECT * FROM emp WHERE ename COLLATE |",
+        "SELECT * FROM emp WHERE ename COLLATE bin|",
+    ] {
+        assert!(
+            suppresses(sql, crate::db::DatabaseType::Oracle),
+            "COLLATE collation-name slot leaked columns for `{sql}`"
+        );
+        assert!(
+            suppresses(sql, crate::db::DatabaseType::MySQL),
+            "MySQL COLLATE collation-name slot leaked columns for `{sql}`"
+        );
+    }
+    assert!(
+        !suppresses("SELECT collate | FROM emp", crate::db::DatabaseType::Oracle),
+        "column or alias named COLLATE must not be mistaken for a collation-name slot"
+    );
+}
+
+#[test]
+fn negated_and_collection_predicate_operators_are_position_aware() {
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+
+    for (sql, keyword) in [
+        ("SELECT * FROM emp WHERE empno NOT in|", "IN"),
+        ("SELECT * FROM emp WHERE ename NOT li|", "LIKE"),
+        ("SELECT * FROM emp WHERE empno NOT bet|", "BETWEEN"),
+        ("SELECT * FROM emp WHERE empno NOT mem|", "MEMBER"),
+        ("SELECT * FROM emp WHERE empno mem|", "MEMBER"),
+    ] {
+        let suggestions = typed_emp_suggestions(sql);
+        assert!(
+            has(&suggestions, keyword),
+            "{keyword} suppressed for `{sql}`: {suggestions:?}"
+        );
+    }
+
+    for (sql, keyword) in [
+        ("SELECT * FROM emp WHERE NOT in|", "IN"),
+        ("SELECT * FROM emp WHERE NOT li|", "LIKE"),
+        ("SELECT * FROM emp WHERE NOT bet|", "BETWEEN"),
+        ("SELECT * FROM emp WHERE NOT mem|", "MEMBER"),
+    ] {
+        let suggestions = typed_emp_suggestions(sql);
+        assert!(
+            !has(&suggestions, keyword),
+            "{keyword} leaked after unary NOT for `{sql}`: {suggestions:?}"
+        );
+    }
+
+    let collection_suggestions = |sql_with_cursor: &str| -> Vec<String> {
+        let cursor = sql_with_cursor.find('|').expect("cursor marker");
+        let sql = sql_with_cursor.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql_with_cursor);
+        let context =
+            SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+        let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &ctx);
+        let column_scope = (!column_tables.is_empty()).then(|| column_tables.clone());
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["T".to_string()];
+        data.set_columns_for_table(
+            "T",
+            vec![
+                "ELEM".to_string(),
+                "CHILD_NT".to_string(),
+                "PARENT_NT".to_string(),
+                "TXT_COL".to_string(),
+            ],
+        );
+        data.set_column_meta_for_table(
+            "T",
+            HashMap::from([
+                (
+                    "ELEM".to_string(),
+                    ColumnMeta {
+                        type_display: "NUMBER".to_string(),
+                        nullable: true,
+                        is_primary_key: false,
+                    },
+                ),
+                (
+                    "CHILD_NT".to_string(),
+                    ColumnMeta {
+                        type_display: "NESTED TABLE OF NUMBER".to_string(),
+                        nullable: true,
+                        is_primary_key: false,
+                    },
+                ),
+                (
+                    "PARENT_NT".to_string(),
+                    ColumnMeta {
+                        type_display: "NESTED TABLE OF NUMBER".to_string(),
+                        nullable: true,
+                        is_primary_key: false,
+                    },
+                ),
+                (
+                    "TXT_COL".to_string(),
+                    ColumnMeta {
+                        type_display: "VARCHAR2(20)".to_string(),
+                        nullable: true,
+                        is_primary_key: false,
+                    },
+                ),
+            ]),
+        );
+        data.rebuild_indices();
+        let at_keyword_only_slot =
+            SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot_for_db(
+                &ctx,
+                !prefix.is_empty(),
+                Some(crate::db::DatabaseType::Oracle),
+            );
+        let expr_keyword_ctx = SqlEditorWidget::expression_keyword_context(
+            &ctx,
+            &data,
+            &column_tables,
+            !prefix.is_empty(),
+            Some(crate::db::DatabaseType::Oracle),
+        );
+        let mut suggestions = if at_keyword_only_slot {
+            Vec::new()
+        } else {
+            SqlEditorWidget::base_suggestions_for_context(
+                &mut data,
+                &prefix,
+                None,
+                column_scope.as_deref(),
+                matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
+                context,
+                false,
+                Some(crate::db::DatabaseType::Oracle),
+                expr_keyword_ctx,
+            )
+        };
+        for keyword in SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix,
+            &ctx,
+            Some(crate::db::DatabaseType::Oracle),
+        ) {
+            if !suggestions
+                .iter()
+                .any(|value| value.eq_ignore_ascii_case(&keyword))
+            {
+                suggestions.push(keyword);
+            }
+        }
+        suggestions
+    };
+
+    for (sql, keyword) in [
+        ("SELECT * FROM t WHERE child_nt sub|", "SUBMULTISET"),
+        ("SELECT * FROM t WHERE child_nt NOT sub|", "SUBMULTISET"),
+        ("SELECT * FROM t WHERE child_nt mul|", "MULTISET"),
+    ] {
+        let suggestions = collection_suggestions(sql);
+        assert!(
+            has(&suggestions, keyword),
+            "{keyword} suppressed after a collection operand for `{sql}`: {suggestions:?}"
+        );
+    }
+    for (sql, keyword) in [
+        ("SELECT * FROM t WHERE elem sub|", "SUBMULTISET"),
+        ("SELECT * FROM t WHERE txt_col mul|", "MULTISET"),
+    ] {
+        let suggestions = collection_suggestions(sql);
+        assert!(
+            !has(&suggestions, keyword),
+            "{keyword} leaked after a non-collection operand for `{sql}`: {suggestions:?}"
+        );
+    }
+
+    for sql in [
+        "SELECT * FROM t WHERE elem MEMBER | parent_nt",
+        "SELECT * FROM t WHERE elem NOT MEMBER | parent_nt",
+        "SELECT * FROM t WHERE child_nt SUBMULTISET | parent_nt",
+        "SELECT * FROM t WHERE child_nt NOT SUBMULTISET | parent_nt",
+    ] {
+        assert_eq!(
+            collection_suggestions(sql),
+            vec!["OF".to_string()],
+            "fixed OF continuation for `{sql}`"
+        );
+    }
+
+    for sql in [
+        "SELECT * FROM t WHERE elem MEMBER OF |",
+        "SELECT * FROM t WHERE child_nt SUBMULTISET OF |",
+    ] {
+        let suggestions = collection_suggestions(sql);
+        assert!(
+            has(&suggestions, "PARENT_NT") && has(&suggestions, "CHILD_NT"),
+            "collection RHS slot lost collection columns for `{sql}`: {suggestions:?}"
+        );
+        assert!(
+            !has(&suggestions, "ELEM") && !has(&suggestions, "TXT_COL"),
+            "non-collection columns leaked into collection RHS slot for `{sql}`: {suggestions:?}"
+        );
+    }
 }
 
 /// `FIRST`/`LAST` are not standalone-callable functions in Oracle — they only
@@ -24803,6 +26079,8 @@ fn columns_suppressed_immediately_after_a_complete_operand() {
         "SELECT LOCALTIMESTAMP | FROM emp",
         "SELECT SYSDATE | FROM emp",
         "SELECT SYSTIMESTAMP | FROM emp",
+        "SELECT CASE WHEN empno = 1 THEN 1 END | FROM emp",
+        "SELECT CASE WHEN empno = 1 THEN CASE WHEN empno = 2 THEN 1 END | END FROM emp",
     ] {
         let s = typed_emp_suggestions(sql);
         assert!(
@@ -24828,11 +26106,915 @@ fn columns_suppressed_immediately_after_a_complete_operand() {
     // At an operand-start the same columns are still offered.
     assert!(has(&typed_emp_suggestions("SELECT | FROM emp"), "ENAME"),
         "columns lost at an operand-start select position");
-    assert!(has(&typed_emp_suggestions("SELECT * FROM emp WHERE empno = | "), "ENAME"),
-        "columns lost after a comparison operator");
+    let comparison_rhs = typed_emp_suggestions("SELECT * FROM emp WHERE empno = | ");
+    assert!(
+        has(&comparison_rhs, "EMPNO"),
+        "matching columns lost after a comparison operator: {comparison_rhs:?}"
+    );
+    assert!(
+        !has(&comparison_rhs, "ENAME") && !has(&comparison_rhs, "HIREDATE"),
+        "non-matching columns leaked after a comparison operator: {comparison_rhs:?}"
+    );
     // And typing a column prefix still completes it.
     assert!(has(&typed_emp_suggestions("SELECT en| FROM emp"), "ENAME"),
         "column prefix completion broke");
+}
+
+/// Predicate operators that require a parenthesized operand (`IN`, quantified
+/// comparison `ANY`/`SOME`/`ALL`) have a punctuation-only slot immediately after
+/// the operator. Once an `IN` list's `(` is present, the list body is a real
+/// operand position again.
+#[test]
+fn predicate_open_paren_slots_suppress_columns_only_before_the_list() {
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    for sql in [
+        "SELECT * FROM emp WHERE empno IN |",
+        "SELECT * FROM emp WHERE empno NOT IN |",
+        "SELECT * FROM emp WHERE empno = ANY |",
+        "SELECT * FROM emp WHERE empno <> SOME |",
+        "SELECT * FROM emp WHERE empno > ALL |",
+    ] {
+        let suggestions = typed_emp_suggestions(sql);
+        assert!(
+            suggestions.is_empty(),
+            "IN-list opener slot should not offer identifier material for `{sql}`: {suggestions:?}"
+        );
+    }
+
+    for sql in [
+        "SELECT * FROM emp WHERE empno IN|",
+        "SELECT * FROM emp WHERE empno NOT IN|",
+        "SELECT * FROM emp WHERE empno = ANY|",
+        "SELECT * FROM emp WHERE empno <> SOME|",
+        "SELECT * FROM emp WHERE empno > ALL|",
+    ] {
+        let suggestions = typed_emp_suggestions(sql);
+        assert!(
+            !has(&suggestions, "ENAME")
+                && !has(&suggestions, "EMPNO")
+                && !has(&suggestions, "HIREDATE"),
+            "columns leaked before an IN-list opener for `{sql}`: {suggestions:?}"
+        );
+    }
+
+    for sql in [
+        "SELECT * FROM emp WHERE empno IN (|)",
+        "SELECT * FROM emp WHERE empno NOT IN (|)",
+        "SELECT * FROM emp WHERE empno IN (1, |)",
+    ] {
+        let suggestions = typed_emp_suggestions(sql);
+        assert!(
+            has(&suggestions, "EMPNO"),
+            "columns were suppressed inside an IN-list operand slot for `{sql}`: {suggestions:?}"
+        );
+        assert!(
+            !has(&suggestions, "ENAME") && !has(&suggestions, "HIREDATE"),
+            "non-matching columns leaked inside an IN-list operand slot for `{sql}`: {suggestions:?}"
+        );
+    }
+
+    assert!(
+        has(
+            &data_type_suggestions(
+                "CREATE FUNCTION f(p IN |) RETURN NUMBER IS BEGIN RETURN 1; END;",
+                "",
+                crate::db::DatabaseType::Oracle,
+            ),
+            "NUMBER"
+        ),
+        "PL/SQL parameter mode `IN |` must remain a type slot"
+    );
+}
+
+#[test]
+fn string_pattern_slots_filter_columns_to_character_operands() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let assert_character_only = |sql: &str, db_type| {
+        let suggestions = typed_emp_suggestions_for_db(sql, db_type);
+        assert!(
+            has(&suggestions, "ENAME"),
+            "character RHS slot lost character columns for `{sql}`: {suggestions:?}"
+        );
+        assert!(
+            !has(&suggestions, "EMPNO") && !has(&suggestions, "HIREDATE"),
+            "non-character columns leaked into character RHS slot for `{sql}`: {suggestions:?}"
+        );
+    };
+
+    for sql in [
+        "SELECT * FROM emp WHERE ename LIKE |",
+        "SELECT * FROM emp WHERE ename NOT LIKE |",
+        "SELECT * FROM emp WHERE ename LIKEC |",
+        "SELECT * FROM emp WHERE ename LIKE 'A%' ESCAPE |",
+        "SELECT * FROM emp WHERE ename LIKE e|",
+    ] {
+        assert_character_only(sql, Oracle);
+    }
+
+    for sql in [
+        "SELECT * FROM emp WHERE ename LIKE |",
+        "SELECT * FROM emp WHERE ename REGEXP |",
+        "SELECT * FROM emp WHERE ename RLIKE |",
+        "SELECT group_concat(ename SEPARATOR |) FROM emp",
+        "SELECT group_concat(ename SEPARATOR e|) FROM emp",
+    ] {
+        assert_character_only(sql, MySQL);
+    }
+}
+
+#[test]
+fn between_bound_slots_filter_columns_to_left_operand_type() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let assert_only = |sql: &str, db_type, expected: &str, unexpected: &[&str]| {
+        let suggestions = typed_emp_suggestions_for_db(sql, db_type);
+        assert!(
+            has(&suggestions, expected),
+            "BETWEEN bound slot lost `{expected}` for `{sql}`: {suggestions:?}"
+        );
+        for name in unexpected {
+            assert!(
+                !has(&suggestions, name),
+                "BETWEEN bound slot leaked `{name}` for `{sql}`: {suggestions:?}"
+            );
+        }
+    };
+
+    for db_type in [Oracle, MySQL] {
+        assert_only(
+            "SELECT * FROM emp WHERE empno BETWEEN |",
+            db_type,
+            "EMPNO",
+            &["ENAME", "HIREDATE"],
+        );
+        assert_only(
+            "SELECT * FROM emp WHERE empno NOT BETWEEN |",
+            db_type,
+            "EMPNO",
+            &["ENAME", "HIREDATE"],
+        );
+        assert_only(
+            "SELECT * FROM emp WHERE empno BETWEEN 1 AND |",
+            db_type,
+            "EMPNO",
+            &["ENAME", "HIREDATE"],
+        );
+        assert_only(
+            "SELECT * FROM emp WHERE hiredate BETWEEN |",
+            db_type,
+            "HIREDATE",
+            &["ENAME", "EMPNO"],
+        );
+        assert_only(
+            "SELECT * FROM emp WHERE ename BETWEEN |",
+            db_type,
+            "ENAME",
+            &["EMPNO", "HIREDATE"],
+        );
+    }
+}
+
+#[test]
+fn comparison_rhs_slots_filter_columns_to_left_operand_type() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let assert_only = |sql: &str, db_type, expected: &str, unexpected: &[&str]| {
+        let suggestions = typed_emp_suggestions_for_db(sql, db_type);
+        assert!(
+            has(&suggestions, expected),
+            "comparison RHS lost `{expected}` for `{sql}`: {suggestions:?}"
+        );
+        for name in unexpected {
+            assert!(
+                !has(&suggestions, name),
+                "comparison RHS leaked `{name}` for `{sql}`: {suggestions:?}"
+            );
+        }
+    };
+
+    for db_type in [Oracle, MySQL] {
+        assert_only(
+            "SELECT * FROM emp WHERE empno = |",
+            db_type,
+            "EMPNO",
+            &["ENAME", "HIREDATE"],
+        );
+        assert_only(
+            "SELECT * FROM emp WHERE empno <> e|",
+            db_type,
+            "EMPNO",
+            &["ENAME", "HIREDATE"],
+        );
+        assert_only(
+            "SELECT * FROM emp WHERE hiredate >= |",
+            db_type,
+            "HIREDATE",
+            &["ENAME", "EMPNO"],
+        );
+        assert_only(
+            "SELECT * FROM emp WHERE ename = |",
+            db_type,
+            "ENAME",
+            &["EMPNO", "HIREDATE"],
+        );
+    }
+
+    for db_type in [Oracle, MySQL] {
+        assert_only(
+            "UPDATE emp SET empno = |",
+            db_type,
+            "EMPNO",
+            &["ENAME", "HIREDATE"],
+        );
+        assert_only(
+            "UPDATE emp e SET e.ename = |",
+            db_type,
+            "ENAME",
+            &["EMPNO", "HIREDATE"],
+        );
+        assert_only(
+            "UPDATE emp SET hiredate = |",
+            db_type,
+            "HIREDATE",
+            &["ENAME", "EMPNO"],
+        );
+    }
+
+    for sql in [
+        "SELECT * FROM emp WHERE empno IS DISTINCT FROM |",
+        "SELECT * FROM emp WHERE empno IS NOT DISTINCT FROM |",
+    ] {
+        assert_only(sql, Oracle, "EMPNO", &["ENAME", "HIREDATE"]);
+    }
+
+    assert_only(
+        "SELECT * FROM emp WHERE empno <=> |",
+        MySQL,
+        "EMPNO",
+        &["ENAME", "HIREDATE"],
+    );
+
+    let unknown_left = typed_emp_suggestions("SELECT * FROM emp WHERE unknown_col = |");
+    assert!(
+        has(&unknown_left, "ENAME") && has(&unknown_left, "EMPNO"),
+        "unknown left operand must not hide otherwise valid RHS columns: {unknown_left:?}"
+    );
+}
+
+#[test]
+fn numeric_operator_rhs_slots_filter_columns_to_numeric_operands() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let assert_numeric_only = |sql: &str, db_type| {
+        let suggestions = typed_emp_suggestions_for_db(sql, db_type);
+        assert!(
+            has(&suggestions, "EMPNO"),
+            "numeric operator RHS lost numeric columns for `{sql}`: {suggestions:?}"
+        );
+        assert!(
+            !has(&suggestions, "ENAME") && !has(&suggestions, "HIREDATE"),
+            "non-numeric columns leaked into numeric operator RHS for `{sql}`: {suggestions:?}"
+        );
+    };
+
+    for db_type in [Oracle, MySQL] {
+        for sql in [
+            "SELECT empno + | FROM emp",
+            "SELECT empno - | FROM emp",
+            "SELECT empno * | FROM emp",
+            "SELECT empno / e| FROM emp",
+        ] {
+            assert_numeric_only(sql, db_type);
+        }
+    }
+
+    for sql in ["SELECT empno MOD | FROM emp", "SELECT empno DIV | FROM emp"] {
+        assert_numeric_only(sql, MySQL);
+    }
+
+    let unknown_left = typed_emp_suggestions("SELECT unknown_col + | FROM emp");
+    assert!(
+        has(&unknown_left, "ENAME") && has(&unknown_left, "EMPNO"),
+        "unknown left operand must not hide otherwise valid arithmetic RHS columns: {unknown_left:?}"
+    );
+}
+
+#[test]
+fn expected_type_slots_suppress_context_names_that_are_not_value_operands() {
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+
+    let arithmetic = typed_emp_suggestions("SELECT e.empno + e| FROM emp e");
+    assert!(
+        has(&arithmetic, "EMPNO"),
+        "numeric RHS lost matching column with alias in scope: {arithmetic:?}"
+    );
+    assert!(
+        !has(&arithmetic, "e"),
+        "row-source alias leaked into numeric RHS operand slot: {arithmetic:?}"
+    );
+
+    let comparison = typed_emp_suggestions("SELECT * FROM emp e WHERE e.empno = e|");
+    assert!(
+        has(&comparison, "EMPNO"),
+        "comparison RHS lost matching column with alias in scope: {comparison:?}"
+    );
+    assert!(
+        !has(&comparison, "e"),
+        "row-source alias leaked into comparison RHS operand slot: {comparison:?}"
+    );
+
+    let pattern = typed_emp_suggestions("SELECT * FROM emp e WHERE e.ename LIKE e|");
+    assert!(
+        has(&pattern, "ENAME"),
+        "character RHS lost matching column with alias in scope: {pattern:?}"
+    );
+    assert!(
+        !has(&pattern, "e"),
+        "row-source alias leaked into character RHS operand slot: {pattern:?}"
+    );
+
+    let select_start = typed_emp_suggestions("SELECT e| FROM emp e");
+    assert!(
+        has(&select_start, "e"),
+        "ordinary select-list operand start should still offer row-source aliases: {select_start:?}"
+    );
+}
+
+#[test]
+fn oracle_datetime_plus_rhs_slots_filter_columns_to_numeric_operands() {
+    use crate::db::DatabaseType::Oracle;
+
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let suggestions = typed_emp_suggestions_for_db("SELECT hiredate + | FROM emp", Oracle);
+    assert!(
+        has(&suggestions, "EMPNO"),
+        "Oracle datetime + RHS lost numeric columns: {suggestions:?}"
+    );
+    assert!(
+        !has(&suggestions, "ENAME") && !has(&suggestions, "HIREDATE"),
+        "Oracle datetime + RHS leaked non-numeric columns: {suggestions:?}"
+    );
+
+    let unknown_left = typed_emp_suggestions_for_db("SELECT unknown_date + | FROM emp", Oracle);
+    assert!(
+        has(&unknown_left, "ENAME") && has(&unknown_left, "EMPNO"),
+        "unknown left operand must not hide otherwise valid datetime arithmetic RHS columns: {unknown_left:?}"
+    );
+}
+
+#[test]
+fn oracle_datetime_minus_rhs_slots_allow_datetime_and_numeric_operands() {
+    use crate::db::DatabaseType::Oracle;
+
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let suggestions = typed_emp_suggestions_for_db("SELECT hiredate - | FROM emp", Oracle);
+    assert!(
+        has(&suggestions, "EMPNO") && has(&suggestions, "HIREDATE"),
+        "Oracle datetime - RHS lost numeric or datetime columns: {suggestions:?}"
+    );
+    assert!(
+        !has(&suggestions, "ENAME"),
+        "Oracle datetime - RHS leaked character columns: {suggestions:?}"
+    );
+
+    let unknown_left = typed_emp_suggestions_for_db("SELECT unknown_date - | FROM emp", Oracle);
+    assert!(
+        has(&unknown_left, "ENAME") && has(&unknown_left, "EMPNO"),
+        "unknown left operand must not hide otherwise valid datetime subtraction RHS columns: {unknown_left:?}"
+    );
+}
+
+#[test]
+fn numeric_function_argument_slots_filter_columns_to_numeric_operands() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let assert_numeric_only = |sql: &str, db_type| {
+        let suggestions = typed_emp_suggestions_for_db(sql, db_type);
+        assert!(
+            has(&suggestions, "EMPNO"),
+            "numeric function argument lost numeric columns for `{sql}`: {suggestions:?}"
+        );
+        assert!(
+            !has(&suggestions, "ENAME") && !has(&suggestions, "HIREDATE"),
+            "numeric function argument leaked non-numeric columns for `{sql}`: {suggestions:?}"
+        );
+    };
+
+    for db_type in [Oracle, MySQL] {
+        for sql in [
+            "SELECT ABS(|) FROM emp",
+            "SELECT POWER(empno, |) FROM emp",
+            "SELECT SUBSTR(ename, |) FROM emp",
+            "SELECT LPAD(ename, |) FROM emp",
+            "SELECT SIN(e|) FROM emp",
+        ] {
+            assert_numeric_only(sql, db_type);
+        }
+    }
+
+    let custom_function = typed_emp_suggestions("SELECT custom_numeric(|) FROM emp");
+    assert!(
+        has(&custom_function, "ENAME") && has(&custom_function, "EMPNO"),
+        "unknown function argument must not hide otherwise valid columns: {custom_function:?}"
+    );
+
+    let qualified_builtin_name = typed_emp_suggestions("SELECT pkg.substr(|) FROM emp");
+    assert!(
+        has(&qualified_builtin_name, "ENAME")
+            && has(&qualified_builtin_name, "EMPNO")
+            && has(&qualified_builtin_name, "HIREDATE"),
+        "qualified routine names must not inherit built-in function argument filters: {qualified_builtin_name:?}"
+    );
+}
+
+#[test]
+fn polymorphic_function_argument_slots_follow_prior_argument_type() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let assert_only = |sql: &str, db_type, expected: &str, unexpected: &[&str]| {
+        let suggestions = typed_emp_suggestions_for_db(sql, db_type);
+        assert!(
+            has(&suggestions, expected),
+            "polymorphic function argument lost `{expected}` for `{sql}`: {suggestions:?}"
+        );
+        for name in unexpected {
+            assert!(
+                !has(&suggestions, name),
+                "polymorphic function argument leaked `{name}` for `{sql}`: {suggestions:?}"
+            );
+        }
+    };
+
+    for db_type in [Oracle, MySQL] {
+        assert_only(
+            "SELECT COALESCE(empno, |) FROM emp",
+            db_type,
+            "EMPNO",
+            &["ENAME", "HIREDATE"],
+        );
+        assert_only(
+            "SELECT GREATEST(hiredate, |) FROM emp",
+            db_type,
+            "HIREDATE",
+            &["ENAME", "EMPNO"],
+        );
+        assert_only(
+            "SELECT LEAST(ename, |) FROM emp",
+            db_type,
+            "ENAME",
+            &["EMPNO", "HIREDATE"],
+        );
+        assert_only(
+            "SELECT NULLIF(ename, |) FROM emp",
+            db_type,
+            "ENAME",
+            &["EMPNO", "HIREDATE"],
+        );
+    }
+
+    assert_only(
+        "SELECT NVL(empno, |) FROM emp",
+        Oracle,
+        "EMPNO",
+        &["ENAME", "HIREDATE"],
+    );
+    assert_only(
+        "SELECT IFNULL(empno, |) FROM emp",
+        MySQL,
+        "EMPNO",
+        &["ENAME", "HIREDATE"],
+    );
+    assert_only(
+        "SELECT NVL2(ename, empno, |) FROM emp",
+        Oracle,
+        "EMPNO",
+        &["ENAME", "HIREDATE"],
+    );
+
+    let unknown_first = typed_emp_suggestions("SELECT COALESCE(unknown_col, |) FROM emp");
+    assert!(
+        has(&unknown_first, "ENAME") && has(&unknown_first, "EMPNO"),
+        "unknown first argument must not hide otherwise valid polymorphic arguments: {unknown_first:?}"
+    );
+}
+
+#[test]
+fn case_result_slots_follow_prior_result_type_when_known() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let assert_only = |sql: &str, db_type, expected: &str, unexpected: &[&str]| {
+        let suggestions = typed_emp_suggestions_for_db(sql, db_type);
+        assert!(
+            has(&suggestions, expected),
+            "CASE result slot lost `{expected}` for `{sql}`: {suggestions:?}"
+        );
+        for name in unexpected {
+            assert!(
+                !has(&suggestions, name),
+                "CASE result slot leaked `{name}` for `{sql}`: {suggestions:?}"
+            );
+        }
+    };
+
+    for db_type in [Oracle, MySQL] {
+        assert_only(
+            "SELECT CASE WHEN empno = 1 THEN empno ELSE | END FROM emp",
+            db_type,
+            "EMPNO",
+            &["ENAME", "HIREDATE"],
+        );
+        assert_only(
+            "SELECT CASE WHEN empno = 1 THEN ename WHEN empno = 2 THEN | END FROM emp",
+            db_type,
+            "ENAME",
+            &["EMPNO", "HIREDATE"],
+        );
+        assert_only(
+            "SELECT CASE ename WHEN 'A' THEN hiredate ELSE | END FROM emp",
+            db_type,
+            "HIREDATE",
+            &["ENAME", "EMPNO"],
+        );
+    }
+
+    let unknown_prior = typed_emp_suggestions("SELECT CASE WHEN empno = 1 THEN NULL ELSE | END FROM emp");
+    assert!(
+        has(&unknown_prior, "ENAME") && has(&unknown_prior, "EMPNO"),
+        "unknown CASE result type must not hide otherwise valid result operands: {unknown_prior:?}"
+    );
+
+    let no_prior = typed_emp_suggestions("SELECT CASE WHEN empno = 1 THEN | END FROM emp");
+    assert!(
+        has(&no_prior, "ENAME") && has(&no_prior, "EMPNO"),
+        "first CASE result arm must not be filtered without a prior result: {no_prior:?}"
+    );
+}
+
+#[test]
+fn character_function_argument_slots_filter_columns_to_character_operands() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let assert_character_only = |sql: &str, db_type| {
+        let suggestions = typed_emp_suggestions_for_db(sql, db_type);
+        assert!(
+            has(&suggestions, "ENAME"),
+            "character function argument lost character columns for `{sql}`: {suggestions:?}"
+        );
+        assert!(
+            !has(&suggestions, "EMPNO") && !has(&suggestions, "HIREDATE"),
+            "character function argument leaked non-character columns for `{sql}`: {suggestions:?}"
+        );
+    };
+
+    for db_type in [Oracle, MySQL] {
+        for sql in [
+            "SELECT UPPER(|) FROM emp",
+            "SELECT REPLACE(ename, |) FROM emp",
+            "SELECT SUBSTR(|, 1) FROM emp",
+            "SELECT LPAD(ename, 5, |) FROM emp",
+            "SELECT INSTR(ename, |) FROM emp",
+        ] {
+            assert_character_only(sql, db_type);
+        }
+    }
+
+    assert_character_only("SELECT TO_DATE(|, 'YYYY-MM-DD') FROM emp", Oracle);
+    assert_character_only("SELECT STR_TO_DATE(|, '%Y-%m-%d') FROM emp", MySQL);
+}
+
+#[test]
+fn datetime_function_argument_slots_filter_columns_to_datetime_operands() {
+    use crate::db::DatabaseType::Oracle;
+
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let assert_datetime_only = |sql: &str| {
+        let suggestions = typed_emp_suggestions_for_db(sql, Oracle);
+        assert!(
+            has(&suggestions, "HIREDATE"),
+            "datetime function argument lost datetime columns for `{sql}`: {suggestions:?}"
+        );
+        assert!(
+            !has(&suggestions, "ENAME") && !has(&suggestions, "EMPNO"),
+            "datetime function argument leaked non-datetime columns for `{sql}`: {suggestions:?}"
+        );
+    };
+    let assert_numeric_only = |sql: &str| {
+        let suggestions = typed_emp_suggestions_for_db(sql, Oracle);
+        assert!(
+            has(&suggestions, "EMPNO"),
+            "datetime function numeric argument lost numeric columns for `{sql}`: {suggestions:?}"
+        );
+        assert!(
+            !has(&suggestions, "ENAME") && !has(&suggestions, "HIREDATE"),
+            "datetime function numeric argument leaked non-numeric columns for `{sql}`: {suggestions:?}"
+        );
+    };
+
+    for sql in [
+        "SELECT ADD_MONTHS(|, 1) FROM emp",
+        "SELECT MONTHS_BETWEEN(hiredate, |) FROM emp",
+        "SELECT LAST_DAY(|) FROM emp",
+        "SELECT NEXT_DAY(|, 'MONDAY') FROM emp",
+    ] {
+        assert_datetime_only(sql);
+    }
+
+    for sql in ["SELECT ADD_MONTHS(hiredate, |) FROM emp"] {
+        assert_numeric_only(sql);
+    }
+}
+
+#[test]
+fn in_list_slots_filter_columns_to_left_operand_type() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let assert_only = |sql: &str, db_type, expected: &str, unexpected: &[&str]| {
+        let suggestions = typed_emp_suggestions_for_db(sql, db_type);
+        assert!(
+            has(&suggestions, expected),
+            "IN-list slot lost `{expected}` for `{sql}`: {suggestions:?}"
+        );
+        for name in unexpected {
+            assert!(
+                !has(&suggestions, name),
+                "IN-list slot leaked `{name}` for `{sql}`: {suggestions:?}"
+            );
+        }
+    };
+
+    for db_type in [Oracle, MySQL] {
+        assert_only(
+            "SELECT * FROM emp WHERE empno IN (|)",
+            db_type,
+            "EMPNO",
+            &["ENAME", "HIREDATE"],
+        );
+        assert_only(
+            "SELECT * FROM emp WHERE empno NOT IN (|)",
+            db_type,
+            "EMPNO",
+            &["ENAME", "HIREDATE"],
+        );
+        assert_only(
+            "SELECT * FROM emp WHERE empno IN (1, |)",
+            db_type,
+            "EMPNO",
+            &["ENAME", "HIREDATE"],
+        );
+        assert_only(
+            "SELECT * FROM emp WHERE hiredate IN (|)",
+            db_type,
+            "HIREDATE",
+            &["ENAME", "EMPNO"],
+        );
+        assert_only(
+            "SELECT * FROM emp WHERE ename IN (|)",
+            db_type,
+            "ENAME",
+            &["EMPNO", "HIREDATE"],
+        );
+    }
+
+    let unknown_left = typed_emp_suggestions("SELECT * FROM emp WHERE unknown_col IN (|)");
+    assert!(
+        has(&unknown_left, "ENAME") && has(&unknown_left, "EMPNO"),
+        "unknown left operand must not hide otherwise valid IN-list columns: {unknown_left:?}"
+    );
+}
+
+#[test]
+fn insert_values_slots_filter_columns_to_target_column_type() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let assert_only = |sql: &str, db_type, expected: &str, unexpected: &[&str]| {
+        let suggestions = typed_emp_suggestions_for_db(sql, db_type);
+        assert!(
+            has(&suggestions, expected),
+            "INSERT VALUES slot lost `{expected}` for `{sql}`: {suggestions:?}"
+        );
+        for name in unexpected {
+            assert!(
+                !has(&suggestions, name),
+                "INSERT VALUES slot leaked `{name}` for `{sql}`: {suggestions:?}"
+            );
+        }
+    };
+
+    for db_type in [Oracle, MySQL] {
+        assert_only(
+            "INSERT INTO emp (empno, ename, hiredate) VALUES (|)",
+            db_type,
+            "EMPNO",
+            &["ENAME", "HIREDATE"],
+        );
+        assert_only(
+            "INSERT INTO emp (empno, ename, hiredate) VALUES (1, |)",
+            db_type,
+            "ENAME",
+            &["EMPNO", "HIREDATE"],
+        );
+        assert_only(
+            "INSERT INTO emp (empno, ename, hiredate) VALUES (1, 'A', |)",
+            db_type,
+            "HIREDATE",
+            &["ENAME", "EMPNO"],
+        );
+        assert_only(
+            "INSERT INTO emp (empno, ename, hiredate) VALUES (1, 'A', SYSDATE), (2, |)",
+            db_type,
+            "ENAME",
+            &["EMPNO", "HIREDATE"],
+        );
+    }
+
+    for db_type in [Oracle, MySQL] {
+        assert_only(
+            "INSERT INTO emp VALUES (|)",
+            db_type,
+            "ENAME",
+            &["EMPNO", "HIREDATE"],
+        );
+        assert_only(
+            "INSERT INTO emp VALUES ('A', |)",
+            db_type,
+            "EMPNO",
+            &["ENAME", "HIREDATE"],
+        );
+        assert_only(
+            "INSERT INTO emp VALUES ('A', 1, |)",
+            db_type,
+            "HIREDATE",
+            &["ENAME", "EMPNO"],
+        );
+        assert_only(
+            "INSERT INTO emp VALUES ('A', 1, SYSDATE), ('B', |)",
+            db_type,
+            "EMPNO",
+            &["ENAME", "HIREDATE"],
+        );
+    }
+
+    let unknown_target = typed_emp_suggestions("INSERT INTO emp VALUES ('A', 1, SYSDATE, |)");
+    assert!(
+        has(&unknown_target, "ENAME") && has(&unknown_target, "EMPNO"),
+        "VALUES slot without a matching target column must not over-filter candidates: {unknown_target:?}"
+    );
+
+    assert_only(
+        "MERGE INTO emp e USING emp s ON (e.empno = s.empno) WHEN NOT MATCHED THEN INSERT (empno, ename, hiredate) VALUES (|)",
+        Oracle,
+        "EMPNO",
+        &["ENAME", "HIREDATE"],
+    );
+    assert_only(
+        "MERGE INTO emp e USING emp s ON (e.empno = s.empno) WHEN NOT MATCHED THEN INSERT (empno, ename, hiredate) VALUES (1, |)",
+        Oracle,
+        "ENAME",
+        &["EMPNO", "HIREDATE"],
+    );
+    assert_only(
+        "MERGE INTO emp e USING emp s ON (e.empno = s.empno) WHEN NOT MATCHED THEN INSERT VALUES (|)",
+        Oracle,
+        "ENAME",
+        &["EMPNO", "HIREDATE"],
+    );
+}
+
+#[test]
+fn insert_select_slots_filter_columns_to_target_column_type() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let assert_only = |sql: &str, db_type, expected: &str, unexpected: &[&str]| {
+        let suggestions = typed_emp_suggestions_for_db(sql, db_type);
+        assert!(
+            has(&suggestions, expected),
+            "INSERT SELECT slot lost `{expected}` for `{sql}`: {suggestions:?}"
+        );
+        for name in unexpected {
+            assert!(
+                !has(&suggestions, name),
+                "INSERT SELECT slot leaked `{name}` for `{sql}`: {suggestions:?}"
+            );
+        }
+    };
+
+    for db_type in [Oracle, MySQL] {
+        assert_only(
+            "INSERT INTO emp (empno, ename, hiredate) SELECT | FROM emp",
+            db_type,
+            "EMPNO",
+            &["ENAME", "HIREDATE"],
+        );
+        assert_only(
+            "INSERT INTO emp (empno, ename, hiredate) SELECT 1, | FROM emp",
+            db_type,
+            "ENAME",
+            &["EMPNO", "HIREDATE"],
+        );
+        assert_only(
+            "INSERT INTO emp (empno, ename, hiredate) SELECT 1, 'A', | FROM emp",
+            db_type,
+            "HIREDATE",
+            &["ENAME", "EMPNO"],
+        );
+        assert_only(
+            "INSERT INTO emp SELECT | FROM emp",
+            db_type,
+            "ENAME",
+            &["EMPNO", "HIREDATE"],
+        );
+        assert_only(
+            "INSERT INTO emp SELECT 'A', | FROM emp",
+            db_type,
+            "EMPNO",
+            &["ENAME", "HIREDATE"],
+        );
+    }
+
+    let nested_select = typed_emp_suggestions(
+        "INSERT INTO emp (empno, ename) SELECT (SELECT | FROM emp) FROM emp",
+    );
+    assert!(
+        has(&nested_select, "ENAME") && has(&nested_select, "EMPNO"),
+        "nested SELECT inside INSERT projection must not inherit outer target type: {nested_select:?}"
+    );
+}
+
+#[test]
+fn subquery_only_open_paren_slots_offer_subquery_keywords_and_suppress_columns() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let prefix_for = |sql_with_cursor: &str| {
+        let cursor = sql_with_cursor.find('|').expect("cursor marker");
+        let sql = sql_with_cursor.replace('|', "");
+        crate::ui::intellisense::get_word_at_cursor(&sql, cursor)
+            .0
+            .to_string()
+    };
+    let suppresses_for = |sql: &str, db_type| {
+        SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot_for_db(
+            &analyze_inline_cursor_sql(sql),
+            !prefix_for(sql).is_empty(),
+            Some(db_type),
+        )
+    };
+    let kw_for = |sql: &str, db_type| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix_for(sql),
+            &analyze_inline_cursor_sql(sql),
+            Some(db_type),
+        )
+    };
+
+    for sql in [
+        "SELECT * FROM emp WHERE EXISTS (|)",
+        "SELECT CURSOR (|) FROM emp",
+        "SELECT * FROM emp WHERE empno = ANY (|)",
+        "SELECT * FROM emp WHERE empno <> SOME (|)",
+        "SELECT * FROM emp WHERE empno > ALL (|)",
+    ] {
+        assert!(suppresses_for(sql, Oracle), "columns leaked for `{sql}`");
+        assert_eq!(
+            kw_for(sql, Oracle),
+            vec!["SELECT".to_string(), "WITH".to_string()],
+            "subquery starter keywords for `{sql}`"
+        );
+        let suggestions = typed_emp_suggestions_for_db(sql, Oracle);
+        assert!(
+            !has(&suggestions, "EMPNO") && !has(&suggestions, "ENAME"),
+            "subquery-only slot offered columns for `{sql}`: {suggestions:?}"
+        );
+    }
+
+    assert_eq!(
+        kw_for("SELECT * FROM emp WHERE EXISTS (sel|)", Oracle),
+        vec!["SELECT".to_string()]
+    );
+    assert!(
+        suppresses_for("SELECT * FROM emp WHERE EXISTS (|)", MySQL),
+        "MySQL EXISTS subquery slot must also suppress columns"
+    );
+    assert!(
+        !suppresses_for("SELECT CURSOR (|) FROM emp", MySQL),
+        "MySQL CURSOR is not an Oracle cursor-expression subquery"
+    );
+    assert!(
+        !suppresses_for("SELECT * FROM emp WHERE empno IN (|)", Oracle),
+        "IN list body can be an expression list, so columns remain valid"
+    );
 }
 
 /// The unqualified select-list wildcard (`*`, `t.*`) belongs at a query's own
@@ -25486,6 +27668,8 @@ fn expression_construct_tail_keywords_are_complete_and_noise_free() {
 
     // CASE branch keywords across selector / condition / arm / else, simple and
     // searched, nested in a SELECT list and through a subquery operand.
+    assert_eq!(kw("SELECT CASE | END FROM t"), vec!["WHEN".to_string()]);
+    assert_eq!(kw("SELECT CASE W| END FROM t"), vec!["WHEN".to_string()]);
     assert_eq!(kw("SELECT CASE x | END FROM t"), vec!["WHEN".to_string()]);
     assert_eq!(kw("SELECT CASE x WHEN 1 | END FROM t"), vec!["THEN".to_string()]);
     assert_eq!(kw("SELECT CASE WHEN c | END FROM t"), vec!["THEN".to_string()]);
@@ -25501,6 +27685,10 @@ fn expression_construct_tail_keywords_are_complete_and_noise_free() {
             "arm continuations for `{sql}`"
         );
     }
+    assert_eq!(
+        kw("SELECT CASE WHEN c THEN CASE WHEN d THEN e END | END FROM t"),
+        vec!["WHEN".to_string(), "ELSE".to_string(), "END".to_string()]
+    );
     assert_eq!(kw("SELECT CASE WHEN c THEN r ELSE e | END FROM t"), vec!["END".to_string()]);
 
     // Innermost construct wins: a BETWEEN inside a WHEN condition takes AND, not

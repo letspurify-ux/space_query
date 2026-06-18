@@ -458,6 +458,7 @@ pub(crate) struct LocalScope {
     end: usize,
     depth: usize,
     kind: LocalScopeKind,
+    return_type_display: Option<String>,
 }
 
 #[derive(Clone)]
@@ -466,6 +467,7 @@ pub(crate) struct LocalSymbolEntry {
     name: String,
     upper: String,
     declared_at: usize,
+    type_display: Option<String>,
     members: Vec<String>,
     member_entries: Vec<LocalMemberEntry>,
     member_source_upper: Option<String>,
@@ -480,6 +482,7 @@ pub(crate) struct LocalSymbolEntry {
 pub(crate) struct LocalMemberEntry {
     name: String,
     upper: String,
+    type_display: Option<String>,
     member_source_upper: Option<String>,
     member_source_uppers: Vec<String>,
     member_source_is_rowtype: bool,

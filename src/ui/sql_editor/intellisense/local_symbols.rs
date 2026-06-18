@@ -42,6 +42,7 @@ struct ParsedRoutineHeader {
     body_keyword_idx: usize,
     decl_start_idx: usize,
     parameters: Vec<ParsedDeclarationSymbol>,
+    return_type_display: Option<String>,
     body_starts_immediately: bool,
 }
 
@@ -62,6 +63,7 @@ struct ParsedForLoopRecord {
 #[derive(Clone)]
 struct ParsedDeclarationSymbol {
     name: String,
+    type_display: Option<String>,
     members: Vec<String>,
     member_entries: Vec<LocalMemberEntry>,
     member_source_upper: Option<String>,
@@ -544,6 +546,312 @@ impl SqlEditorWidget {
         Some(suggestions)
     }
 
+    fn filter_local_symbol_suggestions_by_expected_operand_type(
+        suggestions: &mut Vec<String>,
+        cursor_in_statement: usize,
+        analysis: &IntellisenseAnalysis,
+        expected_type: ExpectedOperandTypes,
+    ) {
+        suggestions.retain(|suggestion| {
+            let Some(symbol) =
+                Self::visible_local_symbol_for_qualifier(suggestion, cursor_in_statement, analysis)
+            else {
+                return true;
+            };
+            let Some(type_display) = symbol.type_display.as_deref() else {
+                return true;
+            };
+
+            Self::operand_type_matches_any_expected(
+                Self::classify_type_display(type_display),
+                expected_type,
+            )
+        });
+    }
+
+    fn current_local_assignment_expected_operand_type(
+        tokens: &[SqlToken],
+        end: usize,
+        cursor_in_statement: usize,
+        analysis: &IntellisenseAnalysis,
+    ) -> Option<ExpectedOperandTypes> {
+        let assign_idx = Self::previous_non_comment_token_index(tokens, end)?;
+        if !matches!(tokens.get(assign_idx), Some(SqlToken::Symbol(sym)) if sym == ":=") {
+            return None;
+        }
+        let target_idx = Self::previous_non_comment_token_index(tokens, assign_idx)?;
+        let Some(SqlToken::Word(target_name)) = tokens.get(target_idx) else {
+            return None;
+        };
+        if matches!(
+            target_idx.checked_sub(1).and_then(|idx| tokens.get(idx)),
+            Some(SqlToken::Symbol(sym)) if sym == "."
+        ) {
+            return None;
+        }
+
+        let symbol =
+            Self::visible_local_symbol_for_qualifier(target_name, cursor_in_statement, analysis)?;
+        let type_display = symbol.type_display.as_deref()?;
+        let operand_type = Self::classify_type_display(type_display);
+        match operand_type {
+            PrecedingOperandType::Datetime
+            | PrecedingOperandType::Character
+            | PrecedingOperandType::Numeric
+            | PrecedingOperandType::FloatingNumeric
+            | PrecedingOperandType::Collection => {
+                Some(ExpectedOperandTypes::Single(operand_type))
+            }
+            PrecedingOperandType::Other | PrecedingOperandType::Unknown => None,
+        }
+    }
+
+    fn current_routine_return_expected_operand_type(
+        tokens: &[SqlToken],
+        end: usize,
+        cursor_in_statement: usize,
+        analysis: &IntellisenseAnalysis,
+    ) -> Option<ExpectedOperandTypes> {
+        let return_idx = Self::previous_non_comment_token_index(tokens, end)?;
+        if !matches!(tokens.get(return_idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("RETURN"))
+        {
+            return None;
+        }
+
+        let scope = analysis
+            .local_scopes
+            .iter()
+            .filter(|scope| {
+                matches!(scope.kind, LocalScopeKind::Routine)
+                    && cursor_in_statement >= scope.start
+                    && cursor_in_statement <= scope.end
+                    && scope.return_type_display.is_some()
+            })
+            .max_by_key(|scope| scope.depth)?;
+        let operand_type = Self::classify_type_display(scope.return_type_display.as_deref()?);
+        match operand_type {
+            PrecedingOperandType::Datetime
+            | PrecedingOperandType::Character
+            | PrecedingOperandType::Numeric
+            | PrecedingOperandType::FloatingNumeric
+            | PrecedingOperandType::Collection => {
+                Some(ExpectedOperandTypes::Single(operand_type))
+            }
+            PrecedingOperandType::Other | PrecedingOperandType::Unknown => None,
+        }
+    }
+
+    fn current_local_into_target_expected_operand_type(
+        tokens: &[SqlToken],
+        end: usize,
+        cursor_in_statement: usize,
+        analysis: &IntellisenseAnalysis,
+    ) -> Option<ExpectedOperandTypes> {
+        let projection_index = Self::current_select_list_anchor_before_cursor(tokens, end)
+            .map(|select_idx| Self::current_select_projection_index(tokens, select_idx, end))
+            .or_else(|| {
+                Self::current_returning_list_anchor_before_cursor(tokens, end)
+                    .map(|returning_idx| {
+                        Self::current_returning_projection_index(tokens, returning_idx, end)
+                    })
+            })?;
+        let into_idx = Self::next_into_keyword_after_cursor(tokens, end)?;
+        let target_name = Self::nth_identifier_after_into(tokens, into_idx, projection_index)?;
+        let symbol =
+            Self::visible_local_symbol_for_qualifier(&target_name, cursor_in_statement, analysis)?;
+        let type_display = symbol.type_display.as_deref()?;
+        let operand_type = Self::classify_type_display(type_display);
+        match operand_type {
+            PrecedingOperandType::Datetime
+            | PrecedingOperandType::Character
+            | PrecedingOperandType::Numeric
+            | PrecedingOperandType::FloatingNumeric
+            | PrecedingOperandType::Collection => {
+                Some(ExpectedOperandTypes::Single(operand_type))
+            }
+            PrecedingOperandType::Other | PrecedingOperandType::Unknown => None,
+        }
+    }
+
+    fn current_returning_list_anchor_before_cursor(tokens: &[SqlToken], end: usize) -> Option<usize> {
+        let mut depth = 0i32;
+        for idx in (0..end.min(tokens.len())).rev() {
+            match &tokens[idx] {
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => depth += 1,
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => {
+                    if depth > 0 {
+                        depth -= 1;
+                    }
+                }
+                SqlToken::Word(word) if depth == 0 => match word.to_ascii_uppercase().as_str() {
+                    "RETURNING" => return Some(idx),
+                    "INTO" | "WHERE" | "GROUP" | "HAVING" | "ORDER" | "VALUES" | "SET"
+                    | "SELECT" => return None,
+                    _ => {}
+                },
+                SqlToken::Symbol(sym) if depth == 0 && sym == ";" => return None,
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn current_returning_projection_index(
+        tokens: &[SqlToken],
+        returning_idx: usize,
+        end: usize,
+    ) -> usize {
+        let mut projection_index = 0usize;
+        let mut depth = 0i32;
+        for token in &tokens[(returning_idx + 1)..end.min(tokens.len())] {
+            match token {
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => depth += 1,
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => {
+                    if depth > 0 {
+                        depth -= 1;
+                    }
+                }
+                SqlToken::Symbol(sym) if depth == 0 && sym == "," => projection_index += 1,
+                _ => {}
+            }
+        }
+        projection_index
+    }
+
+    fn next_into_keyword_after_cursor(tokens: &[SqlToken], start: usize) -> Option<usize> {
+        let mut depth = 0i32;
+        for idx in start.min(tokens.len())..tokens.len() {
+            match &tokens[idx] {
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => depth += 1,
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => {
+                    if depth > 0 {
+                        depth -= 1;
+                    }
+                }
+                SqlToken::Word(word) if depth == 0 && word.eq_ignore_ascii_case("INTO") => {
+                    return Some(idx);
+                }
+                SqlToken::Word(word)
+                    if depth == 0
+                        && matches!(
+                            word.to_ascii_uppercase().as_str(),
+                            "FROM" | "WHERE" | "GROUP" | "HAVING" | "ORDER" | "UNION"
+                                | "INTERSECT" | "EXCEPT" | "MINUS"
+                        ) =>
+                {
+                    return None;
+                }
+                SqlToken::Symbol(sym) if depth == 0 && sym == ";" => return None,
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn nth_identifier_after_into(
+        tokens: &[SqlToken],
+        into_idx: usize,
+        target_index: usize,
+    ) -> Option<String> {
+        let mut index = 0usize;
+        let mut depth = 0i32;
+        let mut current_identifier = None;
+        let mut idx = into_idx + 1;
+        while idx < tokens.len() {
+            match &tokens[idx] {
+                SqlToken::Word(word)
+                    if depth == 0
+                        && index == 0
+                        && current_identifier.is_none()
+                        && word.eq_ignore_ascii_case("BULK") =>
+                {
+                    idx += 1;
+                    if matches!(
+                        tokens.get(idx),
+                        Some(SqlToken::Word(next_word)) if next_word.eq_ignore_ascii_case("COLLECT")
+                    ) {
+                        idx += 1;
+                    }
+                    continue;
+                }
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => depth += 1,
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => {
+                    if depth > 0 {
+                        depth -= 1;
+                    }
+                }
+                SqlToken::Symbol(sym) if depth == 0 && sym == "," => {
+                    if index == target_index {
+                        return current_identifier;
+                    }
+                    index += 1;
+                    current_identifier = None;
+                }
+                SqlToken::Word(word)
+                    if depth == 0
+                        && matches!(
+                            word.to_ascii_uppercase().as_str(),
+                            "FROM" | "WHERE" | "GROUP" | "HAVING" | "ORDER" | "UNION"
+                                | "INTERSECT" | "EXCEPT" | "MINUS"
+                        ) =>
+                {
+                    break;
+                }
+                SqlToken::Word(word) if depth == 0 => {
+                    if matches!(
+                        idx.checked_sub(1).and_then(|prev_idx| tokens.get(prev_idx)),
+                        Some(SqlToken::Symbol(sym)) if sym == "." || sym == ":"
+                    ) {
+                        return None;
+                    }
+                    current_identifier = Some(word.clone());
+                }
+                SqlToken::Symbol(sym) if depth == 0 && sym == ";" => break,
+                _ => {}
+            }
+            idx += 1;
+        }
+
+        (index == target_index).then_some(current_identifier).flatten()
+    }
+
+    fn filter_local_record_member_suggestions_by_expected_operand_type(
+        suggestions: &mut Vec<String>,
+        qualifier: &str,
+        cursor_in_statement: usize,
+        raw_qualifier: Option<&str>,
+        analysis: &IntellisenseAnalysis,
+        expected_type: ExpectedOperandTypes,
+    ) {
+        let Some(scope) = Self::resolve_local_member_scope_for_qualifier(
+            qualifier,
+            cursor_in_statement,
+            raw_qualifier,
+            analysis,
+        ) else {
+            return;
+        };
+
+        suggestions.retain(|suggestion| {
+            let suggestion_upper = Self::local_member_suggestion_lookup_upper(suggestion);
+            let Some(member) = scope
+                .member_entries
+                .iter()
+                .find(|entry| entry.upper == suggestion_upper)
+            else {
+                return true;
+            };
+            let Some(type_display) = member.type_display.as_deref() else {
+                return true;
+            };
+
+            Self::operand_type_matches_any_expected(
+                Self::classify_type_display(type_display),
+                expected_type,
+            )
+        });
+    }
+
     fn local_member_suggestion_lookup_upper(member: &str) -> String {
         let trimmed = member.trim();
         if sql_text::is_quoted_identifier(trimmed) {
@@ -763,7 +1071,7 @@ impl SqlEditorWidget {
         cursor_in_statement: usize,
         analysis: &'a IntellisenseAnalysis,
     ) -> Option<&'a LocalSymbolEntry> {
-        let qualifier_upper = qualifier.to_ascii_uppercase();
+        let qualifier_upper = Self::local_identifier_lookup_upper(qualifier);
         let cursor_in_statement = cursor_in_statement.min(
             analysis
                 .statement_end
@@ -922,6 +1230,7 @@ impl SqlEditorWidget {
                 end: statement_len,
                 depth: 0,
                 kind: LocalScopeKind::Statement,
+                return_type_display: None,
             },
             token_start_idx: 0,
             token_end_idx: token_spans.len(),
@@ -992,6 +1301,7 @@ impl SqlEditorWidget {
                                     end: statement_len,
                                     depth: scope_depth,
                                     kind: LocalScopeKind::Routine,
+                                    return_type_display: parsed.return_type_display.clone(),
                                 },
                                 token_start_idx: idx,
                                 token_end_idx: token_spans.len(),
@@ -1010,6 +1320,7 @@ impl SqlEditorWidget {
                                     scope_id,
                                     parameter.name,
                                     scope_start,
+                                    parameter.type_display,
                                     parameter.members,
                                     parameter.member_entries,
                                     parameter.member_source_upper,
@@ -1039,13 +1350,24 @@ impl SqlEditorWidget {
                                     Self::find_statement_item_end(token_spans, idx, token_spans.len());
                                 let item = &token_spans[idx..item_end];
                                 let declared_at = Self::declaration_item_declared_at(item);
-                                for name in Self::extract_mysql_declaration_symbols_from_item(item) {
-                                    Self::push_local_symbol(
+                                for declaration in
+                                    Self::extract_mysql_declaration_symbols_from_item(item)
+                                {
+                                    Self::push_local_symbol_with_metadata_and_sources(
                                         &mut symbols,
                                         &mut seen_symbol_keys,
                                         scope_id,
-                                        name,
+                                        declaration.name,
                                         declared_at,
+                                        declaration.type_display,
+                                        declaration.members,
+                                        declaration.member_entries,
+                                        declaration.member_source_upper,
+                                        declaration.member_source_uppers,
+                                        declaration.member_source_is_rowtype,
+                                        declaration.member_source_is_collection_like,
+                                        declaration.member_source_allows_visible_members,
+                                        declaration.suggest_name,
                                     );
                                 }
                                 idx = item_end.saturating_sub(1);
@@ -1062,6 +1384,7 @@ impl SqlEditorWidget {
                                     end: statement_len,
                                     depth: scope_depth,
                                     kind: LocalScopeKind::DeclareBlock,
+                                    return_type_display: None,
                                 },
                                 token_start_idx: idx,
                                 token_end_idx: token_spans.len(),
@@ -1099,6 +1422,7 @@ impl SqlEditorWidget {
                                         end: statement_len,
                                         depth: scope_depth,
                                         kind: LocalScopeKind::Loop,
+                                        return_type_display: None,
                                     },
                                     token_start_idx: idx,
                                     token_end_idx: token_spans.len(),
@@ -1115,6 +1439,7 @@ impl SqlEditorWidget {
                                     next_scope_id,
                                     record.name,
                                     token.end,
+                                    None,
                                     record.members,
                                     Vec::new(),
                                     record.member_source_upper,
@@ -1191,6 +1516,7 @@ impl SqlEditorWidget {
                                             end: statement_len,
                                             depth: scope_depth,
                                             kind: LocalScopeKind::Block,
+                                            return_type_display: None,
                                         },
                                         token_start_idx: idx,
                                         token_end_idx: token_spans.len(),
@@ -1403,6 +1729,7 @@ impl SqlEditorWidget {
                     scope_id,
                     declaration.name,
                     declared_at,
+                    declaration.type_display,
                     declaration.members,
                     declaration.member_entries,
                     declaration.member_source_upper,
@@ -1444,6 +1771,7 @@ impl SqlEditorWidget {
                 let member_source_is_rowtype = !member_source_uppers.is_empty();
                 return Some(ParsedDeclarationSymbol {
                     name: cursor_name,
+                    type_display: None,
                     members,
                     member_entries: Vec::new(),
                     member_source_upper,
@@ -1472,10 +1800,12 @@ impl SqlEditorWidget {
 
         let (member_source_upper, member_source_is_rowtype) =
             Self::extract_declaration_member_source(item, first_idx);
+        let type_display = Self::extract_declaration_scalar_type_display(item, first_idx);
         let member_source_uppers =
             Self::rowtype_source_uppers_from_single(&member_source_upper, member_source_is_rowtype);
         Some(ParsedDeclarationSymbol {
             name,
+            type_display,
             members: Vec::new(),
             member_entries: Vec::new(),
             member_source_upper,
@@ -1536,6 +1866,7 @@ impl SqlEditorWidget {
 
         Some(ParsedDeclarationSymbol {
             name,
+            type_display: None,
             members,
             member_entries,
             member_source_upper: None,
@@ -1624,6 +1955,7 @@ impl SqlEditorWidget {
 
         Some(ParsedDeclarationSymbol {
             name,
+            type_display: None,
             members: Vec::new(),
             member_entries: Vec::new(),
             member_source_upper,
@@ -1663,6 +1995,46 @@ impl SqlEditorWidget {
         );
 
         (Some(source_name.to_ascii_uppercase()), is_rowtype)
+    }
+
+    fn extract_declaration_scalar_type_display(
+        item: &[SqlTokenSpan],
+        name_idx: usize,
+    ) -> Option<String> {
+        let mut type_idx = Self::next_meaningful_token_idx(item, name_idx + 1)?;
+        if Self::token_word(&item[type_idx].token)
+            .is_some_and(|word| word.eq_ignore_ascii_case("CONSTANT"))
+        {
+            type_idx = Self::next_meaningful_token_idx(item, type_idx + 1)?;
+        }
+        Self::scalar_type_display_at_idx(item, type_idx)
+    }
+
+    fn extract_parameter_scalar_type_display(
+        item: &[SqlTokenSpan],
+        name_idx: usize,
+    ) -> Option<String> {
+        let mut type_idx = Self::next_meaningful_token_idx(item, name_idx + 1)?;
+        while let Some(word) = Self::token_word(&item[type_idx].token) {
+            if !Self::is_parameter_mode_keyword(word) {
+                break;
+            }
+            type_idx = Self::next_meaningful_token_idx(item, type_idx + 1)?;
+        }
+        Self::scalar_type_display_at_idx(item, type_idx)
+    }
+
+    fn scalar_type_display_at_idx(item: &[SqlTokenSpan], type_idx: usize) -> Option<String> {
+        let type_name = Self::token_word(&item[type_idx].token)?;
+        let type_name = sql_text::strip_identifier_quotes(type_name).to_ascii_uppercase();
+        match Self::classify_type_display(&type_name) {
+            PrecedingOperandType::Datetime
+            | PrecedingOperandType::Character
+            | PrecedingOperandType::Numeric
+            | PrecedingOperandType::FloatingNumeric
+            | PrecedingOperandType::Collection => Some(type_name),
+            PrecedingOperandType::Other | PrecedingOperandType::Unknown => None,
+        }
     }
 
     fn extract_declaration_type_source_name(
@@ -1769,22 +2141,23 @@ impl SqlEditorWidget {
             normalized_name.clone()
         };
 
-        let (member_source_upper, member_source_is_rowtype) =
+        let (type_display, member_source_upper, member_source_is_rowtype) =
             if let Some(type_idx) = Self::next_meaningful_token_idx(item, name_idx + 1)
                 .filter(|idx| *idx < end_idx)
             {
+                let type_display = Self::scalar_type_display_at_idx(item, type_idx);
                 if let Some((source_name, source_end_idx)) =
                     Self::extract_declaration_type_source_name(item, type_idx)
                         .filter(|(_, source_end_idx)| *source_end_idx < end_idx)
                 {
                     let is_rowtype =
                         Self::declaration_type_source_has_percent_kind(item, source_end_idx, "ROWTYPE");
-                    (Some(source_name.to_ascii_uppercase()), is_rowtype)
+                    (type_display, Some(source_name.to_ascii_uppercase()), is_rowtype)
                 } else {
-                    (None, false)
+                    (type_display, None, false)
                 }
             } else {
-                (None, false)
+                (None, None, false)
             };
         let member_source_uppers =
             Self::rowtype_source_uppers_from_single(&member_source_upper, member_source_is_rowtype);
@@ -1792,6 +2165,7 @@ impl SqlEditorWidget {
         Some(LocalMemberEntry {
             upper: normalized_name.to_ascii_uppercase(),
             name,
+            type_display,
             member_source_upper,
             member_source_uppers,
             member_source_is_rowtype,
@@ -1829,7 +2203,9 @@ impl SqlEditorWidget {
         (Vec::new(), Vec::new())
     }
 
-    fn extract_mysql_declaration_symbols_from_item(item: &[SqlTokenSpan]) -> Vec<String> {
+    fn extract_mysql_declaration_symbols_from_item(
+        item: &[SqlTokenSpan],
+    ) -> Vec<ParsedDeclarationSymbol> {
         let Some(first_idx) = item
             .iter()
             .position(|span| !matches!(span.token, SqlToken::Comment(_)))
@@ -1862,6 +2238,7 @@ impl SqlEditorWidget {
         let mut names = Vec::new();
         let mut idx = first_idx.saturating_add(1);
         let mut expecting_name = true;
+        let mut type_display = None;
 
         while idx < item.len() {
             match &item[idx].token {
@@ -1885,8 +2262,9 @@ impl SqlEditorWidget {
                 SqlToken::Word(word) => {
                     let upper = word.to_ascii_uppercase();
                     if upper == "CURSOR" || upper == "CONDITION" {
-                        return names;
+                        break;
                     }
+                    type_display = Self::scalar_type_display_at_idx(item, idx);
                     break;
                 }
                 SqlToken::Symbol(_) => {
@@ -1898,6 +2276,20 @@ impl SqlEditorWidget {
         }
 
         names
+            .into_iter()
+            .map(|name| ParsedDeclarationSymbol {
+                name,
+                type_display: type_display.clone(),
+                members: Vec::new(),
+                member_entries: Vec::new(),
+                member_source_upper: None,
+                member_source_uppers: Vec::new(),
+                member_source_is_rowtype: false,
+                member_source_is_collection_like: false,
+                member_source_allows_visible_members: false,
+                suggest_name: true,
+            })
+            .collect()
     }
 
     fn declaration_item_declared_at(item: &[SqlTokenSpan]) -> usize {
@@ -2483,6 +2875,7 @@ impl SqlEditorWidget {
 
         let mut scan_idx = Self::next_meaningful_token_idx(tokens, name_idx + 1).unwrap_or(tokens.len());
         let mut parameters = Vec::new();
+        let mut return_type_display = None;
         let mut saw_mysql_returns = false;
         if scan_idx < tokens.len() && Self::token_symbol_at(tokens, scan_idx, "(") {
             let (close_idx, parsed_parameters) = Self::extract_parameter_symbols(tokens, scan_idx)?;
@@ -2515,17 +2908,29 @@ impl SqlEditorWidget {
                         body_keyword_idx: scan_idx,
                         decl_start_idx: scan_idx.saturating_add(1),
                         parameters,
+                        return_type_display,
                         body_starts_immediately: false,
                     });
                 }
                 SqlToken::Word(word) if paren_depth == 0 && word.eq_ignore_ascii_case("RETURNS") => {
                     saw_mysql_returns = true;
+                    return_type_display = Self::next_meaningful_token_idx(tokens, scan_idx + 1)
+                        .and_then(|type_idx| Self::scalar_type_display_at_idx(tokens, type_idx));
+                }
+                SqlToken::Word(word)
+                    if paren_depth == 0
+                        && !saw_mysql_returns
+                        && word.eq_ignore_ascii_case("RETURN") =>
+                {
+                    return_type_display = Self::next_meaningful_token_idx(tokens, scan_idx + 1)
+                        .and_then(|type_idx| Self::scalar_type_display_at_idx(tokens, type_idx));
                 }
                 SqlToken::Word(word) if paren_depth == 0 && word.eq_ignore_ascii_case("BEGIN") => {
                     return Some(ParsedRoutineHeader {
                         body_keyword_idx: scan_idx,
                         decl_start_idx: scan_idx,
                         parameters,
+                        return_type_display,
                         body_starts_immediately: true,
                     });
                 }
@@ -2538,6 +2943,7 @@ impl SqlEditorWidget {
                         body_keyword_idx: scan_idx,
                         decl_start_idx: scan_idx,
                         parameters,
+                        return_type_display,
                         body_starts_immediately: true,
                     });
                 }
@@ -2645,11 +3051,13 @@ impl SqlEditorWidget {
                 .and_then(Self::local_identifier_suggestion_from_word)?;
         let (member_source_upper, member_source_is_rowtype) =
             Self::extract_parameter_member_source(item, name_idx);
+        let type_display = Self::extract_parameter_scalar_type_display(item, name_idx);
         let member_source_uppers =
             Self::rowtype_source_uppers_from_single(&member_source_upper, member_source_is_rowtype);
 
         Some(ParsedDeclarationSymbol {
             name,
+            type_display,
             members: Vec::new(),
             member_entries: Vec::new(),
             member_source_upper,
@@ -2827,108 +3235,13 @@ impl SqlEditorWidget {
         }
     }
 
-    fn push_local_symbol(
-        symbols: &mut Vec<LocalSymbolEntry>,
-        seen_symbol_keys: &mut HashSet<(usize, usize, String)>,
-        scope_id: usize,
-        name: String,
-        declared_at: usize,
-    ) {
-        Self::push_local_symbol_with_members(
-            symbols,
-            seen_symbol_keys,
-            scope_id,
-            name,
-            declared_at,
-            Vec::new(),
-        );
-    }
-
-    fn push_local_symbol_with_members(
-        symbols: &mut Vec<LocalSymbolEntry>,
-        seen_symbol_keys: &mut HashSet<(usize, usize, String)>,
-        scope_id: usize,
-        name: String,
-        declared_at: usize,
-        members: Vec<String>,
-    ) {
-        Self::push_local_symbol_with_member_source(
-            symbols,
-            seen_symbol_keys,
-            scope_id,
-            name,
-            declared_at,
-            members,
-            Vec::new(),
-            None,
-        );
-    }
-
-    fn push_local_symbol_with_member_source(
-        symbols: &mut Vec<LocalSymbolEntry>,
-        seen_symbol_keys: &mut HashSet<(usize, usize, String)>,
-        scope_id: usize,
-        name: String,
-        declared_at: usize,
-        members: Vec<String>,
-        member_entries: Vec<LocalMemberEntry>,
-        member_source_upper: Option<String>,
-    ) {
-        Self::push_local_symbol_with_metadata(
-            symbols,
-            seen_symbol_keys,
-            scope_id,
-            name,
-            declared_at,
-            members,
-            member_entries,
-            member_source_upper,
-            false,
-            false,
-            true,
-            true,
-        );
-    }
-
-    fn push_local_symbol_with_metadata(
-        symbols: &mut Vec<LocalSymbolEntry>,
-        seen_symbol_keys: &mut HashSet<(usize, usize, String)>,
-        scope_id: usize,
-        name: String,
-        declared_at: usize,
-        members: Vec<String>,
-        member_entries: Vec<LocalMemberEntry>,
-        member_source_upper: Option<String>,
-        member_source_is_rowtype: bool,
-        member_source_is_collection_like: bool,
-        member_source_allows_visible_members: bool,
-        suggest_name: bool,
-    ) {
-        let member_source_uppers =
-            Self::rowtype_source_uppers_from_single(&member_source_upper, member_source_is_rowtype);
-        Self::push_local_symbol_with_metadata_and_sources(
-            symbols,
-            seen_symbol_keys,
-            scope_id,
-            name,
-            declared_at,
-            members,
-            member_entries,
-            member_source_upper,
-            member_source_uppers,
-            member_source_is_rowtype,
-            member_source_is_collection_like,
-            member_source_allows_visible_members,
-            suggest_name,
-        );
-    }
-
     fn push_local_symbol_with_metadata_and_sources(
         symbols: &mut Vec<LocalSymbolEntry>,
         seen_symbol_keys: &mut HashSet<(usize, usize, String)>,
         scope_id: usize,
         name: String,
         declared_at: usize,
+        type_display: Option<String>,
         members: Vec<String>,
         member_entries: Vec<LocalMemberEntry>,
         member_source_upper: Option<String>,
@@ -2947,6 +3260,7 @@ impl SqlEditorWidget {
             upper,
             name,
             declared_at,
+            type_display,
             members,
             member_entries,
             member_source_upper,
@@ -3144,6 +3458,44 @@ impl SqlEditorWidget {
     }
 
     #[cfg(test)]
+    fn collect_local_record_member_suggestions_with_expected_type_for_test(
+        script_with_cursor: &str,
+        qualifier: &str,
+        prefix: &str,
+        expected_type: ExpectedOperandTypes,
+    ) -> Option<Vec<String>> {
+        const CURSOR_MARKER: &str = "__CODEX_CURSOR__";
+
+        let cursor = script_with_cursor.find(CURSOR_MARKER)?;
+        let sql = script_with_cursor.replacen(CURSOR_MARKER, "", 1);
+        let (routine_cache, expanded) =
+            Self::build_routine_symbol_cache_bundle_for_test(&sql, cursor);
+        let analysis = Self::build_intellisense_analysis_from_routine_cache(
+            &routine_cache,
+            expanded.cursor_in_statement,
+        );
+        let word_start = cursor.saturating_sub(prefix.len());
+        let raw_qualifier = Self::raw_qualifier_before_word_in_text(&sql, word_start);
+        let mut suggestions = Self::collect_local_record_member_suggestions(
+            qualifier,
+            prefix,
+            expanded.cursor_in_statement,
+            raw_qualifier.as_deref(),
+            &analysis,
+        )?;
+
+        Self::filter_local_record_member_suggestions_by_expected_operand_type(
+            &mut suggestions,
+            qualifier,
+            expanded.cursor_in_statement,
+            raw_qualifier.as_deref(),
+            &analysis,
+            expected_type,
+        );
+        Some(suggestions)
+    }
+
+    #[cfg(test)]
     fn collect_local_rowtype_member_suggestions_for_test(
         script_with_cursor: &str,
         qualifier: &str,
@@ -3179,6 +3531,71 @@ impl SqlEditorWidget {
             columns.iter().map(|column| (*column).to_string()).collect(),
         );
         Some(data.get_column_suggestions(prefix, Some(&sources)))
+    }
+
+    #[cfg(test)]
+    fn collect_local_rowtype_member_suggestions_with_expected_type_for_test(
+        script_with_cursor: &str,
+        qualifier: &str,
+        prefix: &str,
+        table_name: &str,
+        columns_with_types: &[(&str, &str)],
+        expected_type: ExpectedOperandTypes,
+    ) -> Option<Vec<String>> {
+        const CURSOR_MARKER: &str = "__CODEX_CURSOR__";
+
+        let cursor = script_with_cursor.find(CURSOR_MARKER)?;
+        let sql = script_with_cursor.replacen(CURSOR_MARKER, "", 1);
+        let (routine_cache, expanded) =
+            Self::build_routine_symbol_cache_bundle_for_test(&sql, cursor);
+        let analysis = Self::build_intellisense_analysis_from_routine_cache(
+            &routine_cache,
+            expanded.cursor_in_statement,
+        );
+        let word_start = cursor.saturating_sub(prefix.len());
+        let raw_qualifier = Self::raw_qualifier_before_word_in_text(&sql, word_start);
+        let sources = Self::local_rowtype_member_sources_for_qualifier(
+            qualifier,
+            expanded.cursor_in_statement,
+            raw_qualifier.as_deref(),
+            &analysis,
+        );
+        if sources.is_empty() {
+            return None;
+        }
+
+        let mut data = IntellisenseData::new();
+        let columns = columns_with_types
+            .iter()
+            .map(|(column, _)| (*column).to_string())
+            .collect();
+        data.set_columns_for_table(table_name, columns);
+        data.set_column_meta_for_table(
+            table_name,
+            columns_with_types
+                .iter()
+                .map(|(column, type_display)| {
+                    (
+                        (*column).to_string(),
+                        crate::ui::intellisense::ColumnMeta {
+                            type_display: (*type_display).to_string(),
+                            nullable: true,
+                            is_primary_key: false,
+                        },
+                    )
+                })
+                .collect(),
+        );
+        let mut suggestions = data.get_column_suggestions(prefix, Some(&sources));
+        suggestions.retain(|suggestion| {
+            Self::column_suggestion_matches_expected_operand_type(
+                &data,
+                suggestion,
+                Some(&sources),
+                expected_type,
+            )
+        });
+        Some(suggestions)
     }
 
     #[cfg(test)]

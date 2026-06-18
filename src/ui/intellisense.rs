@@ -1178,14 +1178,21 @@ impl IntellisenseData {
             return suggestions;
         }
 
-        if Self::push_matching_entries(
-            &self.type_entries,
-            &prefix_upper,
-            prefix,
-            &mut suggestions,
-            &mut seen,
-        ) {
-            return suggestions;
+        // `type_entries` are schema TYPE objects (Oracle object/collection types),
+        // not scalar data-type keywords. MySQL/MariaDB scalar type names come
+        // from the dialect keyword catalog and dedicated data-type slots; a stale
+        // or synthetic Oracle TYPE object must not leak into their general
+        // expression/object catalog.
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            if Self::push_matching_entries(
+                &self.type_entries,
+                &prefix_upper,
+                prefix,
+                &mut suggestions,
+                &mut seen,
+            ) {
+                return suggestions;
+            }
         }
 
         // Schema/DDL-only object kinds that can never appear as a token in a
@@ -6225,6 +6232,40 @@ mod intellisense_tests {
                 general.iter().any(|name| name == expected),
                 "general context should still offer `{expected}`, got {general:?}"
             );
+        }
+    }
+
+    #[test]
+    fn mysql_general_catalog_excludes_oracle_schema_type_objects() {
+        let mut data = IntellisenseData::new();
+        data.types = vec!["ADDR_TYPE".to_string()];
+        data.functions = vec!["ADDR_FUNC".to_string()];
+        data.rebuild_indices();
+
+        let oracle = Some(crate::db::DatabaseType::Oracle);
+        let oracle_general = data.get_suggestions_for_db("ADDR", false, None, false, false, oracle);
+        assert!(
+            oracle_general.iter().any(|name| name == "ADDR_TYPE"),
+            "Oracle general catalog should keep schema TYPE objects: {oracle_general:?}"
+        );
+
+        for db_type in [
+            crate::db::DatabaseType::MySQL,
+            crate::db::DatabaseType::MariaDB,
+        ] {
+            let db = Some(db_type);
+            for (prefer_columns, label) in [(false, "general"), (true, "expression")] {
+                let suggestions =
+                    data.get_suggestions_for_db("ADDR", false, None, false, prefer_columns, db);
+                assert!(
+                    !suggestions.iter().any(|name| name == "ADDR_TYPE"),
+                    "{db_type:?} {label} catalog must not offer Oracle schema TYPE objects: {suggestions:?}"
+                );
+                assert!(
+                    suggestions.iter().any(|name| name == "ADDR_FUNC"),
+                    "{db_type:?} {label} catalog should keep ordinary functions: {suggestions:?}"
+                );
+            }
         }
     }
 
