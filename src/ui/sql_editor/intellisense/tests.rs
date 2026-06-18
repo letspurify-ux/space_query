@@ -9164,6 +9164,124 @@ END;"#
 }
 
 #[test]
+fn declaration_default_suggestions_filter_by_declared_type_when_known() {
+    let suggestions_for = |sql_with_cursor: &str| {
+        const CURSOR: &str = "__CODEX_CURSOR__";
+        let cursor = sql_with_cursor.find(CURSOR).expect("cursor");
+        let sql = sql_with_cursor.replacen(CURSOR, "", 1);
+        let (routine_cache, expanded) =
+            SqlEditorWidget::build_routine_symbol_cache_bundle_for_test(&sql, cursor);
+        let analysis = SqlEditorWidget::build_intellisense_analysis_from_routine_cache(
+            &routine_cache,
+            expanded.cursor_in_statement,
+        );
+        let mut suggestions = SqlEditorWidget::collect_local_symbol_suggestions(
+            "",
+            expanded.cursor_in_statement,
+            &analysis,
+            &[],
+        );
+        if let Some(expected_type) =
+            SqlEditorWidget::current_declaration_default_expected_operand_type(
+                analysis.context.statement_tokens.as_ref(),
+                analysis.context.cursor_token_len,
+            )
+        {
+            SqlEditorWidget::filter_local_symbol_suggestions_by_expected_operand_type(
+                &mut suggestions,
+                expanded.cursor_in_statement,
+                &analysis,
+                expected_type,
+            );
+        }
+        suggestions
+    };
+    let has = |values: &[String], name: &str| values.iter().any(|value| value == name);
+    let assert_only = |sql: &str, expected: &str, unexpected: &[&str]| {
+        let suggestions = suggestions_for(sql);
+        assert!(
+            has(&suggestions, expected),
+            "declaration default lost `{expected}` for `{sql}`: {suggestions:?}"
+        );
+        for name in unexpected {
+            assert!(
+                !has(&suggestions, name),
+                "declaration default leaked `{name}` for `{sql}`: {suggestions:?}"
+            );
+        }
+        assert!(
+            has(&suggestions, "v_any"),
+            "unknown/custom local types should be preserved for `{sql}`: {suggestions:?}"
+        );
+    };
+
+    let oracle_block = |declaration: &str| {
+        format!(
+            r#"DECLARE
+    v_num NUMBER;
+    v_char VARCHAR2(20);
+    v_date DATE;
+    v_any custom_type;
+    {declaration}
+BEGIN
+    NULL;
+END;"#
+        )
+    };
+
+    assert_only(
+        &oracle_block("init_num NUMBER := __CODEX_CURSOR__;"),
+        "v_num",
+        &["v_char", "v_date"],
+    );
+    assert_only(
+        &oracle_block("init_char VARCHAR2(20) DEFAULT __CODEX_CURSOR__;"),
+        "v_char",
+        &["v_num", "v_date"],
+    );
+    assert_only(
+        &oracle_block("init_date DATE := __CODEX_CURSOR__;"),
+        "v_date",
+        &["v_num", "v_char"],
+    );
+
+    let custom_default = suggestions_for(&oracle_block(
+        "init_any custom_type DEFAULT __CODEX_CURSOR__;",
+    ));
+    assert!(
+        has(&custom_default, "v_num")
+            && has(&custom_default, "v_char")
+            && has(&custom_default, "v_date")
+            && has(&custom_default, "v_any"),
+        "custom declaration type must not over-filter initializer symbols: {custom_default:?}"
+    );
+
+    let parameter_default =
+        analyze_inline_cursor_sql("CREATE FUNCTION f(p IN NUMBER := |) RETURN NUMBER IS BEGIN RETURN 1; END;");
+    assert_eq!(
+        SqlEditorWidget::current_declaration_default_expected_operand_type(
+            parameter_default.statement_tokens.as_ref(),
+            parameter_default.cursor_token_len,
+        ),
+        Some(ExpectedOperandTypes::Single(PrecedingOperandType::Numeric))
+    );
+
+    assert_only(
+        r#"CREATE FUNCTION f()
+RETURNS INT
+BEGIN
+    DECLARE v_num INT DEFAULT 0;
+    DECLARE v_char VARCHAR(20) DEFAULT '';
+    DECLARE v_any custom_type;
+    DECLARE init_num INT DEFAULT __CODEX_CURSOR__;
+    RETURN init_num;
+END;"#,
+        "v_num",
+        &["v_char"],
+    );
+}
+
+#[test]
 fn routine_return_suggestions_filter_by_declared_return_type_when_known() {
     let suggestions_for = |sql_with_cursor: &str| {
         const CURSOR: &str = "__CODEX_CURSOR__";
@@ -26225,6 +26343,42 @@ fn string_pattern_slots_filter_columns_to_character_operands() {
 }
 
 #[test]
+fn string_pattern_lhs_slots_filter_columns_to_character_operands() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let assert_character_only = |sql: &str, db_type| {
+        let suggestions = typed_emp_suggestions_for_db(sql, db_type);
+        assert!(
+            has(&suggestions, "ENAME"),
+            "character LHS slot lost character columns for `{sql}`: {suggestions:?}"
+        );
+        assert!(
+            !has(&suggestions, "EMPNO") && !has(&suggestions, "HIREDATE"),
+            "non-character columns leaked into character LHS slot for `{sql}`: {suggestions:?}"
+        );
+    };
+
+    for sql in [
+        "SELECT * FROM emp WHERE | LIKE 'A%'",
+        "SELECT * FROM emp WHERE e| LIKE 'A%'",
+        "SELECT * FROM emp WHERE | NOT LIKE 'A%'",
+        "SELECT * FROM emp WHERE | LIKEC 'A%'",
+    ] {
+        assert_character_only(sql, Oracle);
+        assert_character_only(sql, MySQL);
+    }
+
+    for sql in [
+        "SELECT * FROM emp WHERE | REGEXP '^A'",
+        "SELECT * FROM emp WHERE | RLIKE '^A'",
+        "SELECT * FROM emp WHERE | SOUNDS LIKE 'SMITH'",
+    ] {
+        assert_character_only(sql, MySQL);
+    }
+}
+
+#[test]
 fn between_bound_slots_filter_columns_to_left_operand_type() {
     use crate::db::DatabaseType::{MySQL, Oracle};
 
@@ -26362,6 +26516,132 @@ fn comparison_rhs_slots_filter_columns_to_left_operand_type() {
     assert!(
         has(&unknown_left, "ENAME") && has(&unknown_left, "EMPNO"),
         "unknown left operand must not hide otherwise valid RHS columns: {unknown_left:?}"
+    );
+}
+
+#[test]
+fn comparison_lhs_slots_filter_columns_to_right_operand_type() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let assert_only = |sql: &str, db_type, expected: &str, unexpected: &[&str]| {
+        let suggestions = typed_emp_suggestions_for_db(sql, db_type);
+        assert!(
+            has(&suggestions, expected),
+            "comparison LHS lost `{expected}` for `{sql}`: {suggestions:?}"
+        );
+        for name in unexpected {
+            assert!(
+                !has(&suggestions, name),
+                "comparison LHS leaked `{name}` for `{sql}`: {suggestions:?}"
+            );
+        }
+    };
+
+    for db_type in [Oracle, MySQL] {
+        assert_only(
+            "SELECT * FROM emp WHERE | = empno",
+            db_type,
+            "EMPNO",
+            &["ENAME", "HIREDATE"],
+        );
+        assert_only(
+            "SELECT * FROM emp WHERE e| = empno",
+            db_type,
+            "EMPNO",
+            &["ENAME", "HIREDATE"],
+        );
+        assert_only(
+            "SELECT * FROM emp WHERE | >= hiredate",
+            db_type,
+            "HIREDATE",
+            &["ENAME", "EMPNO"],
+        );
+        assert_only(
+            "SELECT * FROM emp WHERE | <> ename",
+            db_type,
+            "ENAME",
+            &["EMPNO", "HIREDATE"],
+        );
+    }
+
+    for sql in [
+        "SELECT * FROM emp WHERE | IS DISTINCT FROM empno",
+        "SELECT * FROM emp WHERE | IS NOT DISTINCT FROM empno",
+    ] {
+        assert_only(sql, Oracle, "EMPNO", &["ENAME", "HIREDATE"]);
+    }
+
+    assert_only(
+        "SELECT * FROM emp WHERE | <=> empno",
+        MySQL,
+        "EMPNO",
+        &["ENAME", "HIREDATE"],
+    );
+
+    let unknown_right = typed_emp_suggestions("SELECT * FROM emp WHERE | = unknown_col");
+    assert!(
+        has(&unknown_right, "ENAME") && has(&unknown_right, "EMPNO"),
+        "unknown right operand must not hide otherwise valid LHS columns: {unknown_right:?}"
+    );
+}
+
+#[test]
+fn update_set_tuple_rhs_slots_filter_columns_to_target_column_type() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let assert_only = |sql: &str, db_type, expected: &str, unexpected: &[&str]| {
+        let suggestions = typed_emp_suggestions_for_db(sql, db_type);
+        assert!(
+            has(&suggestions, expected),
+            "SET tuple RHS lost `{expected}` for `{sql}`: {suggestions:?}"
+        );
+        for name in unexpected {
+            assert!(
+                !has(&suggestions, name),
+                "SET tuple RHS leaked `{name}` for `{sql}`: {suggestions:?}"
+            );
+        }
+    };
+
+    for db_type in [Oracle, MySQL] {
+        assert_only(
+            "UPDATE emp SET (empno, ename, hiredate) = (|)",
+            db_type,
+            "EMPNO",
+            &["ENAME", "HIREDATE"],
+        );
+        assert_only(
+            "UPDATE emp SET (empno, ename, hiredate) = (1, |)",
+            db_type,
+            "ENAME",
+            &["EMPNO", "HIREDATE"],
+        );
+        assert_only(
+            "UPDATE emp e SET (e.empno, e.ename, e.hiredate) = (1, 'A', |)",
+            db_type,
+            "HIREDATE",
+            &["ENAME", "EMPNO"],
+        );
+        assert_only(
+            "MERGE INTO emp e USING emp s ON (e.empno = s.empno) WHEN MATCHED THEN UPDATE SET (e.empno, e.ename, e.hiredate) = (|)",
+            db_type,
+            "EMPNO",
+            &["ENAME", "HIREDATE"],
+        );
+        assert_only(
+            "MERGE INTO emp e USING emp s ON (e.empno = s.empno) WHEN MATCHED THEN UPDATE SET (e.empno, e.ename, e.hiredate) = (1, |)",
+            db_type,
+            "ENAME",
+            &["EMPNO", "HIREDATE"],
+        );
+    }
+
+    let unknown_target = typed_emp_suggestions("UPDATE emp SET (empno, missing_col) = (1, |)");
+    assert!(
+        has(&unknown_target, "ENAME") && has(&unknown_target, "EMPNO"),
+        "SET tuple RHS with unknown target must not over-filter candidates: {unknown_target:?}"
     );
 }
 
@@ -26534,6 +26814,65 @@ fn numeric_function_argument_slots_filter_columns_to_numeric_operands() {
 }
 
 #[test]
+fn analytic_function_argument_slots_filter_columns_by_argument_role() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let assert_only = |sql: &str, db_type, expected: &str, unexpected: &[&str]| {
+        let suggestions = typed_emp_suggestions_for_db(sql, db_type);
+        assert!(
+            has(&suggestions, expected),
+            "analytic function argument lost `{expected}` for `{sql}`: {suggestions:?}"
+        );
+        for name in unexpected {
+            assert!(
+                !has(&suggestions, name),
+                "analytic function argument leaked `{name}` for `{sql}`: {suggestions:?}"
+            );
+        }
+    };
+
+    for db_type in [Oracle, MySQL] {
+        assert_only(
+            "SELECT LAG(empno, |) OVER (ORDER BY hiredate) FROM emp",
+            db_type,
+            "EMPNO",
+            &["ENAME", "HIREDATE"],
+        );
+        assert_only(
+            "SELECT NTH_VALUE(ename, |) OVER (ORDER BY hiredate) FROM emp",
+            db_type,
+            "EMPNO",
+            &["ENAME", "HIREDATE"],
+        );
+        assert_only(
+            "SELECT LAG(ename, 1, |) OVER (ORDER BY hiredate) FROM emp",
+            db_type,
+            "ENAME",
+            &["EMPNO", "HIREDATE"],
+        );
+        assert_only(
+            "SELECT LEAD(hiredate, 1, |) OVER (ORDER BY hiredate) FROM emp",
+            db_type,
+            "HIREDATE",
+            &["ENAME", "EMPNO"],
+        );
+        assert_only(
+            "SELECT LAG(|, 1, ename) OVER (ORDER BY hiredate) FROM emp",
+            db_type,
+            "ENAME",
+            &["EMPNO", "HIREDATE"],
+        );
+    }
+
+    let no_default = typed_emp_suggestions("SELECT LAG(|, 1) OVER (ORDER BY hiredate) FROM emp");
+    assert!(
+        has(&no_default, "ENAME") && has(&no_default, "EMPNO") && has(&no_default, "HIREDATE"),
+        "LAG first argument must not inherit offset type when no default is present: {no_default:?}"
+    );
+}
+
+#[test]
 fn polymorphic_function_argument_slots_follow_prior_argument_type() {
     use crate::db::DatabaseType::{MySQL, Oracle};
 
@@ -26606,6 +26945,66 @@ fn polymorphic_function_argument_slots_follow_prior_argument_type() {
 }
 
 #[test]
+fn polymorphic_function_first_argument_slots_follow_later_argument_type() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let assert_only = |sql: &str, db_type, expected: &str, unexpected: &[&str]| {
+        let suggestions = typed_emp_suggestions_for_db(sql, db_type);
+        assert!(
+            has(&suggestions, expected),
+            "polymorphic first argument lost `{expected}` for `{sql}`: {suggestions:?}"
+        );
+        for name in unexpected {
+            assert!(
+                !has(&suggestions, name),
+                "polymorphic first argument leaked `{name}` for `{sql}`: {suggestions:?}"
+            );
+        }
+    };
+
+    for db_type in [Oracle, MySQL] {
+        assert_only(
+            "SELECT COALESCE(|, hiredate, empno) FROM emp",
+            db_type,
+            "HIREDATE",
+            &["ENAME", "EMPNO"],
+        );
+        assert_only(
+            "SELECT GREATEST(|, empno, 0) FROM emp",
+            db_type,
+            "EMPNO",
+            &["ENAME", "HIREDATE"],
+        );
+    }
+
+    assert_only(
+        "SELECT NVL(|, empno) FROM emp",
+        Oracle,
+        "EMPNO",
+        &["ENAME", "HIREDATE"],
+    );
+    assert_only(
+        "SELECT IFNULL(|, ename) FROM emp",
+        MySQL,
+        "ENAME",
+        &["EMPNO", "HIREDATE"],
+    );
+
+    let unknown_later = typed_emp_suggestions("SELECT NVL(|, custom_expr) FROM emp");
+    assert!(
+        has(&unknown_later, "ENAME") && has(&unknown_later, "EMPNO"),
+        "unknown later argument must not hide otherwise valid first arguments: {unknown_later:?}"
+    );
+
+    let nested_subquery = typed_emp_suggestions("SELECT NVL(|, (SELECT empno FROM emp)) FROM emp");
+    assert!(
+        has(&nested_subquery, "ENAME") && has(&nested_subquery, "EMPNO"),
+        "subquery later argument must not over-filter first arguments: {nested_subquery:?}"
+    );
+}
+
+#[test]
 fn case_result_slots_follow_prior_result_type_when_known() {
     use crate::db::DatabaseType::{MySQL, Oracle};
 
@@ -26651,10 +27050,35 @@ fn case_result_slots_follow_prior_result_type_when_known() {
         "unknown CASE result type must not hide otherwise valid result operands: {unknown_prior:?}"
     );
 
-    let no_prior = typed_emp_suggestions("SELECT CASE WHEN empno = 1 THEN | END FROM emp");
+    assert_only(
+        "SELECT CASE WHEN empno = 1 THEN | ELSE empno END FROM emp",
+        Oracle,
+        "EMPNO",
+        &["ENAME", "HIREDATE"],
+    );
+    assert_only(
+        "SELECT CASE WHEN empno = 1 THEN | WHEN empno = 2 THEN ename END FROM emp",
+        MySQL,
+        "ENAME",
+        &["EMPNO", "HIREDATE"],
+    );
+    assert_only(
+        "SELECT CASE ename WHEN 'A' THEN | ELSE hiredate END FROM emp",
+        Oracle,
+        "HIREDATE",
+        &["ENAME", "EMPNO"],
+    );
+
+    let no_known_result = typed_emp_suggestions("SELECT CASE WHEN empno = 1 THEN | END FROM emp");
     assert!(
-        has(&no_prior, "ENAME") && has(&no_prior, "EMPNO"),
-        "first CASE result arm must not be filtered without a prior result: {no_prior:?}"
+        has(&no_known_result, "ENAME") && has(&no_known_result, "EMPNO"),
+        "CASE result arm must not be filtered without any known result: {no_known_result:?}"
+    );
+    let nested_subquery_later =
+        typed_emp_suggestions("SELECT CASE WHEN empno = 1 THEN | ELSE (SELECT empno FROM emp) END FROM emp");
+    assert!(
+        has(&nested_subquery_later, "ENAME") && has(&nested_subquery_later, "EMPNO"),
+        "subquery CASE result must not over-filter earlier result operands: {nested_subquery_later:?}"
     );
 }
 
@@ -26682,6 +27106,9 @@ fn character_function_argument_slots_filter_columns_to_character_operands() {
             "SELECT SUBSTR(|, 1) FROM emp",
             "SELECT LPAD(ename, 5, |) FROM emp",
             "SELECT INSTR(ename, |) FROM emp",
+            "SELECT TRIM(|) FROM emp",
+            "SELECT TRIM(LEADING | FROM ename) FROM emp",
+            "SELECT TRIM(LEADING 'x' FROM |) FROM emp",
         ] {
             assert_character_only(sql, db_type);
         }
@@ -26689,6 +27116,35 @@ fn character_function_argument_slots_filter_columns_to_character_operands() {
 
     assert_character_only("SELECT TO_DATE(|, 'YYYY-MM-DD') FROM emp", Oracle);
     assert_character_only("SELECT STR_TO_DATE(|, '%Y-%m-%d') FROM emp", MySQL);
+}
+
+#[test]
+fn extract_source_slots_filter_columns_to_datetime_operands() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let assert_datetime_only = |sql: &str, db_type| {
+        let suggestions = typed_emp_suggestions_for_db(sql, db_type);
+        assert!(
+            has(&suggestions, "HIREDATE"),
+            "EXTRACT source lost datetime columns for `{sql}`: {suggestions:?}"
+        );
+        assert!(
+            !has(&suggestions, "ENAME") && !has(&suggestions, "EMPNO"),
+            "non-datetime columns leaked into EXTRACT source for `{sql}`: {suggestions:?}"
+        );
+    };
+
+    for db_type in [Oracle, MySQL] {
+        assert_datetime_only("SELECT EXTRACT(YEAR FROM |) FROM emp", db_type);
+        assert_datetime_only("SELECT EXTRACT(MONTH FROM h|) FROM emp", db_type);
+    }
+
+    let field_slot = typed_emp_suggestions("SELECT EXTRACT(| FROM hiredate) FROM emp");
+    assert!(
+        !has(&field_slot, "HIREDATE"),
+        "EXTRACT field slot must remain keyword-only, not a datetime source slot: {field_slot:?}"
+    );
 }
 
 #[test]

@@ -606,6 +606,80 @@ impl SqlEditorWidget {
         }
     }
 
+    fn current_declaration_default_expected_operand_type(
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> Option<ExpectedOperandTypes> {
+        let anchor_idx = Self::previous_non_comment_token_index(tokens, end)?;
+        let is_default_anchor = matches!(
+            tokens.get(anchor_idx),
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("DEFAULT")
+        );
+        let is_assignment_anchor =
+            matches!(tokens.get(anchor_idx), Some(SqlToken::Symbol(sym)) if sym == ":=");
+        if !is_default_anchor && !is_assignment_anchor {
+            return None;
+        }
+
+        let start_idx = Self::declaration_default_scan_start(tokens, anchor_idx)?;
+        let token_spans: Vec<SqlTokenSpan> = tokens[start_idx..anchor_idx]
+            .iter()
+            .cloned()
+            .map(|token| SqlTokenSpan {
+                token,
+                start: 0,
+                end: 0,
+            })
+            .collect();
+        for idx in 0..token_spans.len() {
+            if let Some(type_display) = Self::scalar_type_display_at_idx(&token_spans, idx) {
+                let operand_type = Self::classify_type_display(&type_display);
+                return match operand_type {
+                    PrecedingOperandType::Datetime
+                    | PrecedingOperandType::Character
+                    | PrecedingOperandType::Numeric
+                    | PrecedingOperandType::FloatingNumeric
+                    | PrecedingOperandType::Collection => {
+                        Some(ExpectedOperandTypes::Single(operand_type))
+                    }
+                    PrecedingOperandType::Other | PrecedingOperandType::Unknown => None,
+                };
+            }
+        }
+
+        None
+    }
+
+    fn declaration_default_scan_start(tokens: &[SqlToken], anchor_idx: usize) -> Option<usize> {
+        let mut depth = 0i32;
+        for idx in (0..anchor_idx.min(tokens.len())).rev() {
+            match &tokens[idx] {
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => depth += 1,
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => {
+                    if depth == 0 {
+                        return Some(idx.saturating_add(1));
+                    }
+                    depth -= 1;
+                }
+                SqlToken::Symbol(sym) if depth == 0 && (sym == ";" || sym == ",") => {
+                    return Some(idx.saturating_add(1));
+                }
+                SqlToken::Word(word)
+                    if depth == 0
+                        && matches!(
+                            word.to_ascii_uppercase().as_str(),
+                            "DECLARE" | "IS" | "AS" | "BEGIN"
+                        ) =>
+                {
+                    return Some(idx.saturating_add(1));
+                }
+                _ => {}
+            }
+        }
+
+        Some(0)
+    }
+
     fn current_routine_return_expected_operand_type(
         tokens: &[SqlToken],
         end: usize,

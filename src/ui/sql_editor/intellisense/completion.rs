@@ -1602,6 +1602,12 @@ impl SqlEditorWidget {
                 )
             })
             .or_else(|| {
+                Self::current_declaration_default_expected_operand_type(
+                    deep_ctx.statement_tokens.as_ref(),
+                    deep_ctx.cursor_token_len,
+                )
+            })
+            .or_else(|| {
                 Self::current_routine_return_expected_operand_type(
                     deep_ctx.statement_tokens.as_ref(),
                     deep_ctx.cursor_token_len,
@@ -3551,6 +3557,19 @@ impl SqlEditorWidget {
             return Some(ExpectedOperandTypes::Single(PrecedingOperandType::Character));
         }
 
+        if Self::current_pattern_lhs_expected_type(tokens, end, mysql_compatible) {
+            return Some(ExpectedOperandTypes::Single(PrecedingOperandType::Character));
+        }
+        if let Some(expected_type) =
+            Self::current_comparison_lhs_expected_type(tokens, end, data, column_scope)
+        {
+            return Some(ExpectedOperandTypes::Single(expected_type));
+        }
+        if let Some(expected_type) =
+            Self::current_is_distinct_from_lhs_expected_type(tokens, end, data, column_scope)
+        {
+            return Some(ExpectedOperandTypes::Single(expected_type));
+        }
         if let Some(expected_type) =
             Self::current_comparison_rhs_expected_type(tokens, end, data, column_scope)
         {
@@ -3582,6 +3601,9 @@ impl SqlEditorWidget {
         {
             return Some(ExpectedOperandTypes::Single(expected_type));
         }
+        if let Some(expected_type) = Self::current_update_set_tuple_expected_type(tokens, end, data) {
+            return Some(ExpectedOperandTypes::Single(expected_type));
+        }
         if let Some(expected_type) = Self::current_insert_values_expected_type(tokens, end, data) {
             return Some(ExpectedOperandTypes::Single(expected_type));
         }
@@ -3592,6 +3614,9 @@ impl SqlEditorWidget {
             Self::current_function_argument_expected_type(tokens, end, data, column_scope)
         {
             return Some(ExpectedOperandTypes::Single(expected_type));
+        }
+        if Self::cursor_is_at_extract_source_operand(tokens, end) {
+            return Some(ExpectedOperandTypes::Single(PrecedingOperandType::Datetime));
         }
         if let Some(expected_type) =
             Self::current_case_result_expected_type(tokens, end, data, column_scope)
@@ -3664,6 +3689,39 @@ impl SqlEditorWidget {
         })
     }
 
+    fn cursor_is_at_extract_source_operand(tokens: &[SqlToken], end: usize) -> bool {
+        let limit = end.min(tokens.len());
+        let Some(open_idx) = Self::nearest_unclosed_open_paren_before(tokens, limit) else {
+            return false;
+        };
+        let Some(SqlToken::Word(function_name)) =
+            Self::previous_non_comment_token_index(tokens, open_idx).and_then(|idx| tokens.get(idx))
+        else {
+            return false;
+        };
+        if !function_name.eq_ignore_ascii_case("EXTRACT") {
+            return false;
+        }
+
+        let mut nested = 0i32;
+        for token in &tokens[(open_idx + 1)..limit] {
+            match token {
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => nested += 1,
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => {
+                    if nested > 0 {
+                        nested -= 1;
+                    }
+                }
+                SqlToken::Word(word) if nested == 0 && word.eq_ignore_ascii_case("FROM") => {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
+        false
+    }
+
     fn unqualified_function_name_before_open(tokens: &[SqlToken], open_idx: usize) -> Option<String> {
         let name_idx = Self::previous_non_comment_token_index(tokens, open_idx)?;
         let Some(SqlToken::Word(word)) = tokens.get(name_idx) else {
@@ -3716,6 +3774,7 @@ impl SqlEditorWidget {
             "RTRIM",
             "SOUNDEX",
             "TRANSLATE",
+            "TRIM",
             "UPPER",
         ];
         const DATETIME_ARGUMENT_FUNCTIONS: &[&str] = &["LAST_DAY"];
@@ -3775,6 +3834,10 @@ impl SqlEditorWidget {
                 0 | 1 => Some(PrecedingOperandType::Character),
                 _ => None,
             },
+            "LAG" | "LEAD" | "NTH_VALUE" => match argument_index {
+                1 => Some(PrecedingOperandType::Numeric),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -3788,25 +3851,57 @@ impl SqlEditorWidget {
         data: &IntellisenseData,
         column_scope: &[String],
     ) -> Option<PrecedingOperandType> {
-        let reference_argument_index = match name {
+        let prior_reference_argument_index = match name {
             "COALESCE" | "GREATEST" | "LEAST" | "NVL" | "IFNULL" | "NULLIF"
                 if argument_index >= 1 =>
             {
-                0
+                Some(0)
             }
-            "NVL2" if argument_index == 2 => 1,
+            "NVL2" if argument_index == 2 => Some(1),
+            "LAG" | "LEAD" if argument_index == 2 => Some(0),
+            _ => None,
+        };
+        if let Some(prior_reference_argument_index) = prior_reference_argument_index {
+            let (start, end) = Self::top_level_function_argument_bounds_before_cursor(
+                tokens,
+                open_idx,
+                limit,
+                prior_reference_argument_index,
+            )?;
+            return Self::expected_type_from_argument_range(tokens, start, end, data, column_scope);
+        }
+
+        let later_reference_argument_index = match name {
+            "COALESCE" | "GREATEST" | "LEAST" | "NVL" | "IFNULL" | "NULLIF"
+                if argument_index == 0 =>
+            {
+                1
+            }
+            "NVL2" if argument_index == 1 => 2,
+            "LAG" | "LEAD" if argument_index == 0 => 2,
             _ => return None,
         };
-        let (start, end) = Self::top_level_function_argument_bounds_before_cursor(
+        let (start, end) = Self::top_level_function_argument_bounds_after_cursor(
             tokens,
             open_idx,
             limit,
-            reference_argument_index,
+            later_reference_argument_index,
         )?;
-        if Self::argument_range_is_empty(tokens, start, end) {
+        Self::expected_type_from_argument_range(tokens, start, end, data, column_scope)
+    }
+
+    fn expected_type_from_argument_range(
+        tokens: &[SqlToken],
+        start: usize,
+        end: usize,
+        data: &IntellisenseData,
+        column_scope: &[String],
+    ) -> Option<PrecedingOperandType> {
+        if Self::argument_range_is_empty(tokens, start, end)
+            || Self::argument_range_starts_with_query(tokens, start, end)
+        {
             return None;
         }
-
         let reference_type = Self::preceding_operand_type(tokens, end, data, column_scope);
         match reference_type {
             PrecedingOperandType::Datetime
@@ -3849,12 +3944,61 @@ impl SqlEditorWidget {
         (argument_index == target_argument_index).then_some((argument_start, limit.min(tokens.len())))
     }
 
+    fn top_level_function_argument_bounds_after_cursor(
+        tokens: &[SqlToken],
+        open_idx: usize,
+        limit: usize,
+        target_argument_index: usize,
+    ) -> Option<(usize, usize)> {
+        let close_idx =
+            Self::matching_close_paren_index_before(tokens, open_idx, tokens.len()).unwrap_or(tokens.len());
+        if close_idx <= limit {
+            return None;
+        }
+
+        let mut argument_index = 0usize;
+        let mut argument_start = open_idx.saturating_add(1);
+        let mut nested = 0i32;
+        for idx in (open_idx + 1)..close_idx.min(tokens.len()) {
+            match &tokens[idx] {
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => nested += 1,
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => {
+                    if nested > 0 {
+                        nested -= 1;
+                    }
+                }
+                SqlToken::Symbol(sym) if nested == 0 && sym == "," => {
+                    if argument_index == target_argument_index {
+                        return Some((argument_start, idx));
+                    }
+                    argument_index += 1;
+                    argument_start = idx + 1;
+                }
+                _ => {}
+            }
+        }
+
+        (argument_index == target_argument_index).then_some((argument_start, close_idx))
+    }
+
     fn argument_range_is_empty(tokens: &[SqlToken], start: usize, end: usize) -> bool {
         tokens
             .get(start..end.min(tokens.len()))
             .unwrap_or(&[])
             .iter()
             .all(|token| matches!(token, SqlToken::Comment(_)))
+    }
+
+    fn argument_range_starts_with_query(tokens: &[SqlToken], start: usize, end: usize) -> bool {
+        let Some(first_idx) = (start..end.min(tokens.len()))
+            .find(|idx| !matches!(tokens.get(*idx), Some(SqlToken::Comment(_))))
+        else {
+            return false;
+        };
+
+        intellisense_context::is_query_expression_start(tokens, first_idx)
+            || (matches!(tokens.get(first_idx), Some(SqlToken::Symbol(sym)) if sym == "(")
+                && intellisense_context::is_query_expression_start(tokens, first_idx + 1))
     }
 
     fn current_case_result_expected_type(
@@ -3924,6 +4068,71 @@ impl SqlEditorWidget {
                 | PrecedingOperandType::FloatingNumeric
                 | PrecedingOperandType::Collection => return Some(result_type),
                 PrecedingOperandType::Other | PrecedingOperandType::Unknown => {}
+            }
+        }
+
+        let active_result_start = frame.active_result_start?;
+        Self::next_case_result_range_after_cursor(tokens, active_result_start)
+            .and_then(|(start, result_end)| {
+                Self::expected_type_from_argument_range(tokens, start, result_end, data, column_scope)
+            })
+    }
+
+    fn next_case_result_range_after_cursor(
+        tokens: &[SqlToken],
+        active_result_start: usize,
+    ) -> Option<(usize, usize)> {
+        let mut case_depth = 1i32;
+        let mut nested = 0i32;
+        let mut pending_result_start = None;
+        for idx in active_result_start..tokens.len() {
+            match &tokens[idx] {
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => nested += 1,
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => {
+                    if nested > 0 {
+                        nested -= 1;
+                    }
+                }
+                SqlToken::Word(word) if nested == 0 && word.eq_ignore_ascii_case("CASE") => {
+                    case_depth += 1;
+                }
+                SqlToken::Word(word) if nested == 0 && word.eq_ignore_ascii_case("END") => {
+                    if case_depth == 1 {
+                        return pending_result_start.map(|start| (start, idx));
+                    }
+                    case_depth -= 1;
+                }
+                SqlToken::Word(word)
+                    if nested == 0
+                        && case_depth == 1
+                        && word.eq_ignore_ascii_case("THEN") =>
+                {
+                    pending_result_start = Some(idx + 1);
+                }
+                SqlToken::Word(word)
+                    if nested == 0
+                        && case_depth == 1
+                        && word.eq_ignore_ascii_case("ELSE") =>
+                {
+                    if let Some(start) = pending_result_start.take() {
+                        if start >= active_result_start {
+                            return Some((start, idx));
+                        }
+                    }
+                    pending_result_start = Some(idx + 1);
+                }
+                SqlToken::Word(word)
+                    if nested == 0
+                        && case_depth == 1
+                        && word.eq_ignore_ascii_case("WHEN") =>
+                {
+                    if let Some(start) = pending_result_start.take() {
+                        if start >= active_result_start {
+                            return Some((start, idx));
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -4113,6 +4322,111 @@ impl SqlEditorWidget {
             },
             None => None,
         }
+    }
+
+    fn current_update_set_tuple_expected_type(
+        tokens: &[SqlToken],
+        end: usize,
+        data: &IntellisenseData,
+    ) -> Option<PrecedingOperandType> {
+        let limit = end.min(tokens.len());
+        let value_list_open_idx = Self::nearest_unclosed_open_paren_before(tokens, limit)?;
+        let eq_idx = Self::previous_non_comment_token_index(tokens, value_list_open_idx)?;
+        if !matches!(tokens.get(eq_idx), Some(SqlToken::Symbol(sym)) if sym == "=") {
+            return None;
+        }
+        let target_list_close_idx = Self::previous_non_comment_token_index(tokens, eq_idx)?;
+        if !matches!(tokens.get(target_list_close_idx), Some(SqlToken::Symbol(sym)) if sym == ")") {
+            return None;
+        }
+        let target_list_open_idx =
+            Self::matching_open_paren_index_before_close(tokens, target_list_close_idx)?;
+        let set_idx = Self::set_keyword_before_tuple_target(tokens, target_list_open_idx)?;
+        let table_name = Self::update_set_target_table_before_set(tokens, set_idx)?;
+        let argument_index = Self::current_function_argument_index(tokens, value_list_open_idx, limit);
+        let target_column = Self::nth_identifier_in_paren_list(
+            tokens,
+            target_list_open_idx,
+            target_list_close_idx,
+            argument_index,
+        )?;
+
+        match data.get_column_meta(&table_name, &target_column) {
+            Some(meta) => match Self::classify_type_display(&meta.type_display) {
+                PrecedingOperandType::Unknown => None,
+                operand_type => Some(operand_type),
+            },
+            None => None,
+        }
+    }
+
+    fn set_keyword_before_tuple_target(tokens: &[SqlToken], target_open_idx: usize) -> Option<usize> {
+        let mut depth = 0i32;
+        for idx in (0..target_open_idx.min(tokens.len())).rev() {
+            match &tokens[idx] {
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => depth += 1,
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => {
+                    if depth > 0 {
+                        depth -= 1;
+                    }
+                }
+                SqlToken::Word(word) if depth == 0 && word.eq_ignore_ascii_case("SET") => {
+                    return Some(idx);
+                }
+                SqlToken::Word(word)
+                    if depth == 0
+                        && matches!(
+                            word.to_ascii_uppercase().as_str(),
+                            "WHERE" | "RETURNING" | "VALUES" | "SELECT" | "FROM"
+                        ) =>
+                {
+                    return None;
+                }
+                SqlToken::Symbol(sym) if depth == 0 && sym == ";" => return None,
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn update_set_target_table_before_set(tokens: &[SqlToken], set_idx: usize) -> Option<String> {
+        let mut depth = 0i32;
+        for idx in (0..set_idx.min(tokens.len())).rev() {
+            match &tokens[idx] {
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => depth += 1,
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => {
+                    if depth > 0 {
+                        depth -= 1;
+                    }
+                }
+                SqlToken::Word(word) if depth == 0 && word.eq_ignore_ascii_case("UPDATE") => {
+                    let table_start = Self::next_non_comment_token_index(tokens, idx + 1)?;
+                    if matches!(
+                        tokens.get(table_start),
+                        Some(SqlToken::Word(next_word)) if next_word.eq_ignore_ascii_case("SET")
+                    ) {
+                        continue;
+                    }
+                    return Self::relation_name_after_insert_into(tokens, table_start)
+                        .map(|(table_name, _)| table_name);
+                }
+                SqlToken::Word(word) if depth == 0 && word.eq_ignore_ascii_case("MERGE") => {
+                    let into_idx = Self::next_non_comment_token_index(tokens, idx + 1)?;
+                    if !matches!(
+                        tokens.get(into_idx),
+                        Some(SqlToken::Word(into_word)) if into_word.eq_ignore_ascii_case("INTO")
+                    ) {
+                        return None;
+                    }
+                    let table_start = Self::next_non_comment_token_index(tokens, into_idx + 1)?;
+                    return Self::relation_name_after_insert_into(tokens, table_start)
+                        .map(|(table_name, _)| table_name);
+                }
+                SqlToken::Symbol(sym) if depth == 0 && sym == ";" => return None,
+                _ => {}
+            }
+        }
+        None
     }
 
     fn current_select_list_anchor_before_cursor(tokens: &[SqlToken], end: usize) -> Option<usize> {
@@ -4434,6 +4748,29 @@ impl SqlEditorWidget {
         None
     }
 
+    fn matching_open_paren_index_before_close(
+        tokens: &[SqlToken],
+        close_idx: usize,
+    ) -> Option<usize> {
+        if !matches!(tokens.get(close_idx), Some(SqlToken::Symbol(sym)) if sym == ")") {
+            return None;
+        }
+        let mut depth = 0i32;
+        for idx in (0..=close_idx.min(tokens.len().saturating_sub(1))).rev() {
+            match &tokens[idx] {
+                SqlToken::Symbol(sym) if sym == ")" => depth += 1,
+                SqlToken::Symbol(sym) if sym == "(" => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(idx);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
     fn nth_identifier_in_paren_list(
         tokens: &[SqlToken],
         open_idx: usize,
@@ -4497,6 +4834,77 @@ impl SqlEditorWidget {
         }
     }
 
+    fn current_pattern_lhs_expected_type(
+        tokens: &[SqlToken],
+        end: usize,
+        mysql_compatible: bool,
+    ) -> bool {
+        let limit = end.min(tokens.len());
+        if Self::cursor_follows_complete_operand(tokens, limit) == Some(true) {
+            return false;
+        }
+
+        let search_start = Self::lhs_operator_search_start(tokens, limit);
+        let Some(first_idx) = Self::next_non_comment_token_index(tokens, search_start) else {
+            return false;
+        };
+        let Some(SqlToken::Word(first_word)) = tokens.get(first_idx) else {
+            return false;
+        };
+        let first_upper = first_word.to_ascii_uppercase();
+        if matches!(first_upper.as_str(), "LIKE" | "LIKE2" | "LIKE4" | "LIKEC") {
+            return true;
+        }
+        if mysql_compatible && matches!(first_upper.as_str(), "REGEXP" | "RLIKE") {
+            return true;
+        }
+        if mysql_compatible && first_upper == "SOUNDS" {
+            let Some(like_idx) = Self::next_non_comment_token_index(tokens, first_idx + 1) else {
+                return false;
+            };
+            return matches!(
+                tokens.get(like_idx),
+                Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("LIKE")
+            );
+        }
+        if first_upper != "NOT" {
+            return false;
+        }
+
+        let Some(operator_idx) = Self::next_non_comment_token_index(tokens, first_idx + 1) else {
+            return false;
+        };
+        let Some(SqlToken::Word(operator_word)) = tokens.get(operator_idx) else {
+            return false;
+        };
+        let operator_upper = operator_word.to_ascii_uppercase();
+        matches!(operator_upper.as_str(), "LIKE" | "LIKE2" | "LIKE4" | "LIKEC")
+            || (mysql_compatible && matches!(operator_upper.as_str(), "REGEXP" | "RLIKE"))
+    }
+
+    fn current_comparison_lhs_expected_type(
+        tokens: &[SqlToken],
+        end: usize,
+        data: &IntellisenseData,
+        column_scope: &[String],
+    ) -> Option<PrecedingOperandType> {
+        let limit = end.min(tokens.len());
+        if Self::cursor_follows_complete_operand(tokens, limit) == Some(true) {
+            return None;
+        }
+
+        let search_start = Self::lhs_operator_search_start(tokens, limit);
+        let op_idx = Self::next_non_comment_token_index(tokens, search_start)?;
+        let Some(SqlToken::Symbol(sym)) = tokens.get(op_idx) else {
+            return None;
+        };
+        if !Self::is_comparison_operator_symbol(sym.as_str()) {
+            return None;
+        }
+
+        Self::following_operand_type(tokens, op_idx + 1, data, column_scope)
+    }
+
     fn current_is_distinct_from_rhs_expected_type(
         tokens: &[SqlToken],
         end: usize,
@@ -4548,6 +4956,191 @@ impl SqlEditorWidget {
             PrecedingOperandType::Unknown => None,
             operand_type => Some(operand_type),
         }
+    }
+
+    fn current_is_distinct_from_lhs_expected_type(
+        tokens: &[SqlToken],
+        end: usize,
+        data: &IntellisenseData,
+        column_scope: &[String],
+    ) -> Option<PrecedingOperandType> {
+        let limit = end.min(tokens.len());
+        if Self::cursor_follows_complete_operand(tokens, limit) == Some(true) {
+            return None;
+        }
+
+        let search_start = Self::lhs_operator_search_start(tokens, limit);
+        let is_idx = Self::next_non_comment_token_index(tokens, search_start)?;
+        if !matches!(tokens.get(is_idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("IS"))
+        {
+            return None;
+        }
+
+        let first_tail_idx = Self::next_non_comment_token_index(tokens, is_idx + 1)?;
+        let from_idx = match tokens.get(first_tail_idx) {
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("DISTINCT") => {
+                Self::next_non_comment_token_index(tokens, first_tail_idx + 1)?
+            }
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("NOT") => {
+                let distinct_idx = Self::next_non_comment_token_index(tokens, first_tail_idx + 1)?;
+                if !matches!(
+                    tokens.get(distinct_idx),
+                    Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("DISTINCT")
+                ) {
+                    return None;
+                }
+                Self::next_non_comment_token_index(tokens, distinct_idx + 1)?
+            }
+            _ => return None,
+        };
+        if !matches!(tokens.get(from_idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("FROM"))
+        {
+            return None;
+        }
+
+        Self::following_operand_type(tokens, from_idx + 1, data, column_scope)
+    }
+
+    fn lhs_operator_search_start(tokens: &[SqlToken], end: usize) -> usize {
+        let limit = end.min(tokens.len());
+        let Some(first_idx) = Self::next_non_comment_token_index(tokens, limit) else {
+            return limit;
+        };
+        let Some(SqlToken::Word(word)) = tokens.get(first_idx) else {
+            return limit;
+        };
+        if Self::is_lhs_operator_word(word) {
+            return limit;
+        }
+
+        let mut search_start = first_idx + 1;
+        while let Some(dot_idx) = Self::next_non_comment_token_index(tokens, search_start) {
+            if !matches!(tokens.get(dot_idx), Some(SqlToken::Symbol(sym)) if sym == ".") {
+                break;
+            }
+            let Some(next_word_idx) = Self::next_non_comment_token_index(tokens, dot_idx + 1)
+            else {
+                break;
+            };
+            if !matches!(tokens.get(next_word_idx), Some(SqlToken::Word(_))) {
+                break;
+            }
+            search_start = next_word_idx + 1;
+        }
+
+        search_start
+    }
+
+    fn is_lhs_operator_word(word: &str) -> bool {
+        matches!(
+            word.to_ascii_uppercase().as_str(),
+            "LIKE"
+                | "LIKE2"
+                | "LIKE4"
+                | "LIKEC"
+                | "REGEXP"
+                | "RLIKE"
+                | "SOUNDS"
+                | "NOT"
+                | "IS"
+        )
+    }
+
+    fn following_operand_type(
+        tokens: &[SqlToken],
+        start: usize,
+        data: &IntellisenseData,
+        column_scope: &[String],
+    ) -> Option<PrecedingOperandType> {
+        let operand_start = Self::next_non_comment_token_index(tokens, start)?;
+        let operand_end = Self::following_operand_end(tokens, operand_start)?;
+        if Self::argument_range_starts_with_query(tokens, operand_start, operand_end) {
+            return None;
+        }
+
+        match Self::preceding_operand_type(tokens, operand_end, data, column_scope) {
+            PrecedingOperandType::Unknown => None,
+            operand_type => Some(operand_type),
+        }
+    }
+
+    fn following_operand_end(tokens: &[SqlToken], start: usize) -> Option<usize> {
+        let mut depth = 0i32;
+        let mut end = None;
+        for idx in start..tokens.len() {
+            match &tokens[idx] {
+                SqlToken::Comment(_) => {}
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => {
+                    depth += 1;
+                    end = Some(idx + 1);
+                }
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                    end = Some(idx + 1);
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                SqlToken::Symbol(sym)
+                    if depth == 0
+                        && (sym == ","
+                            || sym == ";"
+                            || Self::is_comparison_operator_symbol(sym.as_str())
+                            || matches!(sym.as_str(), "+" | "-" | "*" | "/" | "||")) =>
+                {
+                    if idx == start && matches!(sym.as_str(), "+" | "-") {
+                        end = Some(idx + 1);
+                        continue;
+                    }
+                    break;
+                }
+                SqlToken::Word(word)
+                    if depth == 0 && idx > start && Self::is_operand_tail_boundary_word(word) =>
+                {
+                    break;
+                }
+                _ => end = Some(idx + 1),
+            }
+        }
+
+        end.filter(|operand_end| *operand_end > start)
+    }
+
+    fn is_operand_tail_boundary_word(word: &str) -> bool {
+        matches!(
+            word.to_ascii_uppercase().as_str(),
+            "AND"
+                | "OR"
+                | "WHERE"
+                | "HAVING"
+                | "ON"
+                | "WHEN"
+                | "THEN"
+                | "ELSE"
+                | "SELECT"
+                | "FROM"
+                | "GROUP"
+                | "ORDER"
+                | "BY"
+                | "START"
+                | "CONNECT"
+                | "SET"
+                | "VALUES"
+                | "USING"
+                | "RETURNING"
+                | "BETWEEN"
+                | "LIKE"
+                | "LIKE2"
+                | "LIKE4"
+                | "LIKEC"
+                | "REGEXP"
+                | "RLIKE"
+                | "IS"
+                | "IN"
+        )
     }
 
     fn current_between_bound_expected_type(
