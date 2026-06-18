@@ -472,7 +472,7 @@ pub(crate) fn analyze_cursor_context_arc(
     } else if ddl_alter_table_introduces_new_name(
         statement_tokens.as_ref(),
         clamped_cursor_token_len,
-    ) || ddl_rename_statement_introduces_new_name(
+    ) || ddl_rename_target_introduces_new_name(
         statement_tokens.as_ref(),
         clamped_cursor_token_len,
     ) {
@@ -705,22 +705,51 @@ fn ddl_alter_table_introduces_new_name(tokens: &[SqlToken], cursor_token_len: us
     }
 }
 
-fn ddl_rename_statement_introduces_new_name(tokens: &[SqlToken], cursor_token_len: usize) -> bool {
+/// True when the cursor sits at the *target* of a `RENAME … TO <newname>`
+/// clause — the brand-new name introduced by either a standalone
+/// `RENAME [TABLE] old TO new` statement or any `ALTER <object> … RENAME
+/// [<part>] TO new` statement. This covers `ALTER TABLE … RENAME TO`,
+/// `ALTER TABLE … RENAME COLUMN/CONSTRAINT/PARTITION … TO`, and the sibling
+/// object DDLs that share the same `RENAME … TO` tail (`ALTER INDEX`,
+/// `ALTER TABLESPACE`, `ALTER VIEW`, `ALTER SEQUENCE`, …). The rename target is
+/// never an existing object, so identifier suggestions are suppressed there.
+///
+/// Deliberately conservative:
+///   * only `RENAME`- or `ALTER`-led statements are considered;
+///   * the `TO` is bound to its `RENAME` action — it is reset at a top-level
+///     `,` and ignored inside parentheses (depth > 0) — so an `ALTER … TO`
+///     that is unrelated to a rename, or a `TO` in a parenthesised list, does
+///     not trigger;
+///   * the source/old-name position (`RENAME COLUMN | TO x`, `RENAME | TO x`)
+///     has not yet passed its `TO`, so it stays a real object reference.
+fn ddl_rename_target_introduces_new_name(tokens: &[SqlToken], cursor_token_len: usize) -> bool {
     let sig = significant_statement_tokens_before_cursor(tokens, cursor_token_len);
-    if sig.len() < 3 || !token_is_word(sig[0], "RENAME") {
+    if sig.len() < 3 || !(token_is_word(sig[0], "RENAME") || token_is_word(sig[0], "ALTER")) {
         return false;
     }
 
-    let mut saw_to = false;
-    for token in &sig[1..] {
-        if token_is_symbol(token, ",") {
-            saw_to = false;
-        } else if token_is_word(token, "TO") {
-            saw_to = true;
+    let mut depth = 0i32;
+    let mut in_rename_action = false;
+    let mut saw_rename_to = false;
+    for token in &sig {
+        if token_is_symbol(token, "(") {
+            depth += 1;
+        } else if token_is_symbol(token, ")") {
+            depth = (depth - 1).max(0);
+        } else if depth == 0 {
+            if token_is_symbol(token, ",") {
+                in_rename_action = false;
+                saw_rename_to = false;
+            } else if token_is_word(token, "RENAME") {
+                in_rename_action = true;
+                saw_rename_to = false;
+            } else if in_rename_action && token_is_word(token, "TO") {
+                saw_rename_to = true;
+            }
         }
     }
 
-    saw_to
+    saw_rename_to
 }
 
 /// The kind of position the cursor occupies inside a parenthesised DDL
@@ -971,8 +1000,15 @@ fn ddl_alter_table_column_target(sig: &[&SqlToken]) -> Option<String> {
         // New column name / data type position — never an existing column.
         "ADD" => false,
         "DROP" => prev_is_word("DROP") || prev_is_entry_start,
+        // `MODIFY [COLUMN] col …` (the optional `COLUMN` keyword is MySQL's) and
+        // the Oracle parenthesised `MODIFY (col …, col …)` list both name an
+        // existing column right after the op keyword, the optional `COLUMN`, the
+        // `(`, or a `,`.
         "MODIFY" => {
-            prev_is_word("MODIFY") || token_is_symbol(prev, "(") || token_is_symbol(prev, ",")
+            prev_is_word("MODIFY")
+                || prev_is_word("COLUMN")
+                || token_is_symbol(prev, "(")
+                || token_is_symbol(prev, ",")
         }
         "ALTER" => prev_is_word("ALTER") || prev_is_word("COLUMN"),
         // MySQL `CHANGE [COLUMN] old new TYPE`: only the source name references a

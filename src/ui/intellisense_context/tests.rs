@@ -10294,9 +10294,19 @@ fn ddl_alter_table_drop_paren_list_is_column_context() {
 
 #[test]
 fn ddl_alter_table_modify_column_name_is_column_context() {
-    let ctx = analyze("ALTER TABLE emp MODIFY (|)");
-    assert_eq!(ctx.phase, SqlPhase::DdlColumnList);
-    assert_eq!(ctx.focused_tables, vec!["emp".to_string()]);
+    // Oracle parenthesised form and the MySQL `MODIFY [COLUMN] col` form both
+    // reference an existing column of the altered table. The MySQL `MODIFY
+    // COLUMN |` slot previously fell through to a table reference and offered
+    // relations instead of the table's columns.
+    for sql in [
+        "ALTER TABLE emp MODIFY (|)",
+        "ALTER TABLE emp MODIFY |",
+        "ALTER TABLE emp MODIFY COLUMN |",
+    ] {
+        let ctx = analyze(sql);
+        assert_eq!(ctx.phase, SqlPhase::DdlColumnList, "{sql}");
+        assert_eq!(ctx.focused_tables, vec!["emp".to_string()], "{sql}");
+    }
 }
 
 #[test]
@@ -10393,6 +10403,55 @@ fn ddl_alter_table_rename_target_is_new_name() {
         assert!(
             ctx.ddl_new_name_position,
             "expected new-name suppression for: {sql}"
+        );
+    }
+}
+
+#[test]
+fn ddl_rename_target_is_new_name_for_every_object_and_standalone() {
+    // The `RENAME … TO <newname>` target names a brand-new identifier in every
+    // statement that carries it — the standalone `RENAME [TABLE] old TO new`
+    // (Oracle/MySQL) and any `ALTER <object> … RENAME … TO new` — not just
+    // `ALTER TABLE`. Each of these previously leaked the entire catalog into
+    // the rename target.
+    for sql in [
+        // Standalone rename statements.
+        "RENAME employees TO |",
+        "RENAME employees TO new_n|",
+        "RENAME TABLE employees TO |",
+        // Sibling ALTER object DDLs sharing the `RENAME … TO` tail.
+        "ALTER INDEX emp_idx RENAME TO |",
+        "ALTER INDEX emp_idx RENAME TO new_n|",
+        "ALTER TABLESPACE users RENAME TO |",
+        "ALTER VIEW emp_v RENAME TO |",
+        "ALTER SEQUENCE emp_seq RENAME TO |",
+        "ALTER TRIGGER emp_trg RENAME TO |",
+        "ALTER TABLE emp RENAME CONSTRAINT pk TO |",
+        "ALTER TABLE emp RENAME PARTITION p1 TO |",
+    ] {
+        let ctx = analyze(sql);
+        assert!(
+            ctx.ddl_new_name_position,
+            "expected new-name suppression for rename target: {sql}"
+        );
+    }
+}
+
+#[test]
+fn ddl_rename_source_and_old_name_positions_are_not_new_name() {
+    // Positions *before* the rename `TO` reference the existing object being
+    // renamed, so they must keep their normal suggestions — only the target
+    // (after `TO`) is the brand-new name.
+    for sql in [
+        "RENAME | TO new_n",
+        "RENAME employees |",
+        "ALTER INDEX emp_idx RENAME |",
+        "ALTER TABLE emp RENAME COLUMN | TO new_n",
+    ] {
+        let ctx = analyze(sql);
+        assert!(
+            !ctx.ddl_new_name_position,
+            "rename source/old-name position must not be suppressed: {sql}"
         );
     }
 }

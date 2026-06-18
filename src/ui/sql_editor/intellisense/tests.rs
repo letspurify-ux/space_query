@@ -293,15 +293,24 @@ fn plsql_type_attribute_slot_offers_type_rowtype_and_suppresses_identifiers() {
     assert!(!kw("SELECT a % | FROM t", "", false).0);
 }
 
-/// The `GRANT |` / `REVOKE |` privilege list offers privilege keywords, but
-/// because a role name is also grantable there the slot is *not* suppressed —
-/// privileges merge alongside the identifier base. The grantee slot has none.
+/// The `GRANT |` / `REVOKE |` privilege list offers only the fixed privilege
+/// keywords. Object names (tables, views, sequences, procedures, …) are never
+/// grantable in a privilege list, so the identifier base is suppressed there —
+/// it would otherwise dump the whole catalog as pure noise. The grantee slot is
+/// a separate (user/role) position and offers no privilege keywords.
 #[test]
-fn grant_privilege_list_offers_privileges_without_suppressing_roles() {
+fn grant_privilege_list_offers_only_privilege_keywords_and_suppresses_identifiers() {
     let kw = |sql: &str| {
         let ctx = analyze_inline_cursor_sql(sql);
         (
-            SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(&ctx, false),
+            // The privilege list is an identifier-suppressing slot governed by the
+            // identifier chokepoint; assert that one (a column is also never valid
+            // there, but it is the identifier predicate that gates the catalog).
+            SqlEditorWidget::cursor_is_at_identifier_suppressing_keyword_slot_for_context(
+                &ctx,
+                false,
+                Some(crate::db::DatabaseType::Oracle),
+            ),
             SqlEditorWidget::collect_expected_keyword_suggestions(
                 "",
                 &ctx,
@@ -313,15 +322,29 @@ fn grant_privilege_list_offers_privileges_without_suppressing_roles() {
         "GRANT | ON t TO u",
         "GRANT SELECT, | ON t TO u",
         "REVOKE | ON t FROM u",
+        "REVOKE SELECT, | ON t FROM u",
         "GRANT | TO u",
     ] {
         let (suppress, k) = kw(sql);
-        assert!(!suppress, "must not suppress (roles valid) for `{sql}`");
+        assert!(
+            suppress,
+            "privilege list must suppress the identifier base for `{sql}`"
+        );
         assert!(k.iter().any(|p| p == "SELECT"), "SELECT for `{sql}`");
         assert!(k.iter().any(|p| p == "EXECUTE"), "EXECUTE for `{sql}`");
     }
     // The grantee slot is not a privilege position.
     assert!(!kw("GRANT SELECT ON t TO |").1.iter().any(|p| p == "SELECT"));
+    // The object target after `ON` is a real relation reference, not a privilege
+    // slot — it must stay unsuppressed so existing objects still complete.
+    assert!(
+        !SqlEditorWidget::cursor_is_at_identifier_suppressing_keyword_slot_for_context(
+            &analyze_inline_cursor_sql("GRANT SELECT ON |"),
+            false,
+            Some(crate::db::DatabaseType::Oracle),
+        ),
+        "GRANT … ON <target> must keep relation suggestions"
+    );
 
     for sql in [
         "SELECT grant | FROM t",
@@ -340,6 +363,76 @@ fn grant_privilege_list_offers_privileges_without_suppressing_roles() {
                 "{leaked} privilege keyword leaked outside a GRANT/REVOKE statement for `{sql}`: {k:?}"
             );
         }
+    }
+}
+
+/// Structural guard against keyword/suppression *drift*: when a cursor slot
+/// emits a fixed keyword set through `collect_expected_keyword_suggestions` and
+/// no object/identifier is grammatical there (object kind `None`, not a
+/// data-type slot — which also admits user TYPE objects), the slot MUST be
+/// enrolled in a suppression chokepoint, or the base catalog leaks the whole
+/// schema as noise. This is exactly how `GRANT … |` and `ALTER INDEX … RENAME
+/// TO |` regressed. Each new keyword-only slot has to keep this invariant.
+#[test]
+fn keyword_only_slots_are_enrolled_in_suppression_chokepoint() {
+    let db = Some(crate::db::DatabaseType::Oracle);
+    let suppressed_or_no_keywords = |sql: &str| -> bool {
+        let cursor = sql.find('|').expect("cursor marker");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        let has = !prefix.is_empty();
+        let ctx = analyze_inline_cursor_sql(sql);
+        let kw = SqlEditorWidget::collect_expected_keyword_suggestions(&prefix, &ctx, db);
+        let kind = SqlEditorWidget::expected_object_suggestion_kind(&prefix, None, &ctx);
+        let dtype = SqlEditorWidget::data_type_position_for_context(&ctx, has).is_some();
+        // Brand-new-name DDL slots are suppressed through a different gate
+        // (`ddl_new_name_position`), which is also valid enrollment.
+        let new_name = ctx.ddl_new_name_position
+            || SqlEditorWidget::cursor_is_at_create_object_new_name(&ctx, has);
+        let keyword_only = !kw.is_empty() && kind.is_none() && !dtype;
+        let suppressed = SqlEditorWidget::cursor_is_at_identifier_suppressing_keyword_slot_for_context(&ctx, has, db)
+            || SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot_for_db(&ctx, has, db)
+            || new_name;
+        !keyword_only || suppressed
+    };
+    for sql in [
+        // GRANT/REVOKE privilege list (regression: leaked whole catalog).
+        "GRANT | ON t TO u",
+        "GRANT SELECT, | ON t TO u",
+        "REVOKE | ON t FROM u",
+        "REVOKE SELECT, | ON t FROM u",
+        // Window spec start / %TYPE / JSON ON target.
+        "SELECT sum(x) OVER (|) FROM t",
+        "SELECT sum(x) OVER (PART|) FROM t",
+        "DECLARE v emp%| BEGIN NULL; END;",
+        "DECLARE v emp.sal%| BEGIN NULL; END;",
+        "SELECT json_value(j, '$.a' NULL ON |) FROM t",
+        // DML statement heads.
+        "INSERT INTO emp |",
+        "MERGE INTO emp |",
+        "UPDATE emp |",
+        // Set operator, locking, IS NULL, sort modifiers.
+        "SELECT a FROM t UNION |",
+        "SELECT a FROM t FOR |",
+        "SELECT a FROM t WHERE x IS |",
+        "SELECT a FROM t ORDER BY a ASC |",
+        "SELECT a FROM t ORDER BY a NULLS |",
+        // Join + clause-keyword continuations.
+        "SELECT a FROM t LEFT |",
+        "SELECT a FROM t INNER |",
+        "SELECT a FROM t GROUP |",
+        "SELECT a FROM t ORDER |",
+        "SELECT a FROM t CONNECT BY PRIOR x = y START |",
+        // Complete DML target, MERGE actions.
+        "DELETE FROM emp |",
+        "MERGE INTO t USING s ON (a=b) WHEN |",
+        "MERGE INTO t USING s ON (a=b) WHEN MATCHED THEN |",
+    ] {
+        assert!(
+            suppressed_or_no_keywords(sql),
+            "keyword-only slot leaks the identifier base (not enrolled in a \
+             suppression chokepoint): `{sql}`"
+        );
     }
 }
 
@@ -20072,6 +20165,7 @@ fn table_context_expected_object_suggestions_filter_maintenance_table_targets() 
         "OPTIMIZE TABLE |",
         "CHECK TABLE |",
         "REPAIR TABLE |",
+        "PURGE TABLE |",
         "CREATE TABLE demo (dept_id INT, CONSTRAINT fk_demo FOREIGN KEY (dept_id) REFERENCES |)",
         "ALTER TABLE orders ADD CONSTRAINT fk_orders_customer FOREIGN KEY (customer_id) REFERENCES |",
         "CREATE INDEX idx_emp_dept ON |",
@@ -20094,6 +20188,36 @@ fn table_context_expected_object_suggestions_filter_maintenance_table_targets() 
             "maintenance table target should suggest only tables for `{sql}`"
         );
     }
+}
+
+#[test]
+fn maintenance_object_command_targets_filter_to_their_object_kind() {
+    // `ANALYZE`/`PURGE` over a non-TABLE object must restrict to that object's
+    // kind exactly like `ANALYZE TABLE`/`DROP INDEX` already do — they previously
+    // fell through to `None` and dumped the whole catalog.
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["EMP".to_string()];
+    data.views = vec!["EMP_VIEW".to_string()];
+    data.indexes = vec!["EMP_IDX".to_string()];
+    data.clusters = vec!["EMP_CLU".to_string()];
+    data.procedures = vec!["DO_SYNC".to_string()];
+    data.sequences = vec!["EMP_SEQ".to_string()];
+    data.rebuild_indices();
+
+    let only = |sql: &str, expected: &str| {
+        let ctx = analyze_inline_cursor_sql(sql);
+        let got = SqlEditorWidget::collect_expected_object_suggestions(&mut data.clone(), "", &ctx);
+        assert_eq!(
+            got,
+            vec![expected.to_string()],
+            "`{sql}` must offer only its object kind"
+        );
+    };
+    only("ANALYZE INDEX |", "EMP_IDX");
+    only("PURGE INDEX |", "EMP_IDX");
+    only("PURGE TABLE |", "EMP");
+    only("ANALYZE CLUSTER |", "EMP_CLU");
+    only("TRUNCATE CLUSTER |", "EMP_CLU");
 }
 
 #[test]
@@ -25210,5 +25334,82 @@ fn statement_start_drops_object_and_function_noise() {
     assert!(
         !blk.iter().any(|x| x.ends_with("()")),
         "a function call leaked into a PL/SQL statement start: {blk:?}"
+    );
+}
+
+/// A PL/SQL exception-handler name slot (`EXCEPTION WHEN |`, `WHEN e1 OR |`,
+/// a later `WHEN |`) names an exception: a locally declared one (via local
+/// symbols), a predefined one, or a package-qualified one. The base catalog must
+/// drop every non-package object (procedure, function, sequence, type, …) there
+/// — they previously leaked as pure noise. The detection rides the construct
+/// frame stack, so a `CASE WHEN <cond>` (including one nested inside a handler
+/// body) is never mistaken for an exception name and keeps its columns.
+#[test]
+fn plsql_exception_handler_name_slot_keeps_only_packages_and_spares_case_when() {
+    let db = Some(crate::db::DatabaseType::Oracle);
+    let detect = |sql: &str| {
+        let ctx = analyze_inline_cursor_sql(sql);
+        SqlEditorWidget::cursor_is_at_plsql_exception_name(
+            ctx.statement_tokens.as_ref(),
+            ctx.cursor_token_len,
+        )
+    };
+    let base = |sql: &str| -> Vec<String> {
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["EMP".into()];
+        data.procedures = vec!["DO_SYNC".into()];
+        data.functions = vec!["CALC_TOTAL".into()];
+        data.sequences = vec!["EMP_SEQ".into()];
+        data.packages = vec!["HR_PKG".into()];
+        data.types = vec!["ADDR_TYPE".into()];
+        data.set_columns_for_table("EMP", vec!["EMPNO".into(), "SAL".into()]);
+        data.rebuild_indices();
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        let ctx = analyze_inline_cursor_sql(sql);
+        let context =
+            SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+        let ekc =
+            SqlEditorWidget::expression_keyword_context(&ctx, &data, &[], !prefix.is_empty(), db);
+        let inc = matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll);
+        SqlEditorWidget::base_suggestions_for_context(
+            &mut data, &prefix, None, None, inc, context, false, db, ekc,
+        )
+    };
+
+    // Exception-name slots: detected, and the base keeps only the package.
+    for sql in [
+        "BEGIN NULL; EXCEPTION WHEN | THEN NULL; END;",
+        "BEGIN NULL; EXCEPTION WHEN no_data_found THEN NULL; WHEN | THEN NULL; END;",
+        "DECLARE e EXCEPTION; BEGIN NULL; EXCEPTION WHEN e1 OR | THEN NULL; END;",
+    ] {
+        assert!(detect(sql), "must detect exception name for `{sql}`");
+        let b = base(sql);
+        assert_eq!(b, vec!["HR_PKG".to_string()], "only packages for `{sql}`");
+        for noise in ["DO_SYNC", "CALC_TOTAL", "EMP_SEQ", "ADDR_TYPE", "EMP"] {
+            assert!(!b.iter().any(|s| s == noise), "`{noise}` leaked for `{sql}`");
+        }
+    }
+
+    // A handler *body* (after `THEN`) is an ordinary statement position, not an
+    // exception name — must not be detected.
+    assert!(!detect("BEGIN NULL; EXCEPTION WHEN dup_val_on_index THEN | END;"));
+
+    // `CASE WHEN <cond>` is never an exception name, even nested in a handler
+    // body — its condition keeps full expression completion (columns survive).
+    for sql in [
+        "SELECT CASE WHEN | THEN 1 END FROM emp",
+        "BEGIN v := CASE WHEN | THEN 1 END; END;",
+        "BEGIN CASE x WHEN | THEN NULL; END CASE; END;",
+        "BEGIN NULL; EXCEPTION WHEN e THEN v := CASE WHEN | THEN 1 END; END;",
+    ] {
+        assert!(!detect(sql), "must NOT treat CASE WHEN as exception name: `{sql}`");
+    }
+    assert!(
+        base("SELECT CASE WHEN | THEN 1 END FROM emp")
+            .iter()
+            .any(|s| s == "EMP"),
+        "CASE WHEN condition must keep relation/column completion"
     );
 }

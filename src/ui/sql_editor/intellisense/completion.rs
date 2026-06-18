@@ -153,6 +153,16 @@ struct ExpressionKeywordContext {
     /// keyword dump is filtered only where a statement verb is the sole valid
     /// keyword family.
     statement_start: Option<StatementStartContext>,
+    /// Whether the cursor names an exception in a PL/SQL handler's `WHEN` list
+    /// (`EXCEPTION WHEN |`, `WHEN e1 OR |`), before the handler's `THEN`. Only an
+    /// exception is grammatical there: a locally declared one (supplied via the
+    /// local-symbol path), a predefined one, or a package-qualified one. Of the
+    /// base catalog only a package can begin a qualified exception name
+    /// (`pkg.exc`); every other object (procedure, function, sequence, type,
+    /// trigger, index, relation) is never an exception and is dropped as noise.
+    /// Distinguished from a value `CASE WHEN <cond>` by the construct frame stack,
+    /// so a condition's columns are never suppressed.
+    at_exception_name: bool,
 }
 
 /// Best-effort type classification of the operand immediately before the cursor,
@@ -240,6 +250,7 @@ impl ExpressionKeywordContext {
             at_plsql_value_operand: false,
             at_bind_variable_name: false,
             statement_start: None,
+            at_exception_name: false,
         }
     }
 }
@@ -2112,6 +2123,20 @@ impl SqlEditorWidget {
                 )
             });
         }
+        // An exception-handler name slot (`EXCEPTION WHEN |`, `WHEN e1 OR |`)
+        // names an exception. Locally declared exceptions arrive via the local-
+        // symbol path; of the base catalog only a package can begin a qualified
+        // exception name (`pkg.exc`). Every other object (procedure, function,
+        // sequence, type, trigger, index, relation) and every flat keyword is
+        // never an exception, so keep only packages and drop the rest as noise.
+        if expr_keyword_ctx.at_exception_name {
+            suggestions.retain(|suggestion| {
+                matches!(
+                    data.suggestion_type_label(suggestion, db_type),
+                    Some("PACKAGE")
+                )
+            });
+        }
         // A value expression (`v := |`, `proc(p => |)`, an `IF`/`WHILE` control
         // condition, a routine call argument `f(|)`) admits a variable/function/
         // literal but never a bare table/view/synonym. Only the General context
@@ -2697,6 +2722,7 @@ impl SqlEditorWidget {
             Self::meaningful_tokens_before(tokens, end).last(),
             Some(SqlToken::Symbol(sym)) if sym == ":"
         );
+        let at_exception_name = Self::cursor_is_at_plsql_exception_name(tokens, end);
         // A statement start only exists in the neutral General context — the
         // statement-head position. A clause phase (a select list, a `WHERE`
         // predicate, a set-operation branch) is never a statement start. Boundary
@@ -2738,6 +2764,7 @@ impl SqlEditorWidget {
             at_plsql_value_operand,
             at_bind_variable_name,
             statement_start,
+            at_exception_name,
         }
     }
 
@@ -3002,6 +3029,108 @@ impl SqlEditorWidget {
                 }
             }
         }
+    }
+
+    /// Whether the cursor sits at an exception name in a PL/SQL handler's `WHEN`
+    /// list — `EXCEPTION WHEN |`, `WHEN e1 OR |`, or the `WHEN |` opening a later
+    /// handler — before that handler's `THEN`.
+    ///
+    /// This shares the construct frame-stack of [`plsql_keyword_policy`] so an
+    /// exception-handler `WHEN` (top frame is a `Block` in its `EXCEPTION`
+    /// section) is reliably told apart from a `CASE … WHEN <condition>` (top
+    /// frame is a `Case`); the latter's condition is an ordinary value expression
+    /// whose columns must never be suppressed.
+    fn cursor_is_at_plsql_exception_name(tokens: &[SqlToken], end: usize) -> bool {
+        #[derive(Clone, Copy)]
+        enum Frame {
+            PendingDeclare,
+            // `awaiting_handler` is set between an exception-handler `WHEN` and its
+            // `THEN`, while `in_exception` (the block has reached its handler
+            // section). The cursor is at an exception name exactly when both hold.
+            Block {
+                in_exception: bool,
+                awaiting_handler: bool,
+            },
+            If,
+            Loop,
+            Case,
+        }
+
+        let toks = tokens.get(..end.min(tokens.len())).unwrap_or(tokens);
+        let mut stack: Vec<Frame> = Vec::new();
+        let mut skip_end_qualifier = false;
+
+        for token in toks {
+            let upper = match token {
+                SqlToken::Word(word) => word.to_ascii_uppercase(),
+                SqlToken::Comment(_) => continue,
+                _ => continue,
+            };
+
+            if skip_end_qualifier {
+                skip_end_qualifier = false;
+                if matches!(upper.as_str(), "IF" | "LOOP" | "CASE") {
+                    continue;
+                }
+            }
+
+            match upper.as_str() {
+                "DECLARE" => stack.push(Frame::PendingDeclare),
+                "BEGIN" => {
+                    if matches!(stack.last(), Some(Frame::PendingDeclare)) {
+                        if let Some(last) = stack.last_mut() {
+                            *last = Frame::Block {
+                                in_exception: false,
+                                awaiting_handler: false,
+                            };
+                        }
+                    } else {
+                        stack.push(Frame::Block {
+                            in_exception: false,
+                            awaiting_handler: false,
+                        });
+                    }
+                }
+                "IF" => stack.push(Frame::If),
+                "LOOP" => stack.push(Frame::Loop),
+                "CASE" => stack.push(Frame::Case),
+                "EXCEPTION" => {
+                    if let Some(Frame::Block { in_exception, .. }) = stack.last_mut() {
+                        *in_exception = true;
+                    }
+                }
+                "WHEN" => {
+                    if let Some(Frame::Block {
+                        in_exception: true,
+                        awaiting_handler,
+                    }) = stack.last_mut()
+                    {
+                        *awaiting_handler = true;
+                    }
+                }
+                "THEN" => {
+                    if let Some(Frame::Block {
+                        awaiting_handler, ..
+                    }) = stack.last_mut()
+                    {
+                        *awaiting_handler = false;
+                    }
+                }
+                "END" => {
+                    stack.pop();
+                    skip_end_qualifier = true;
+                }
+                _ => {}
+            }
+        }
+
+        matches!(
+            stack.last(),
+            Some(Frame::Block {
+                in_exception: true,
+                awaiting_handler: true,
+            })
+        )
     }
 
     /// Whether the current query level contains a `CONNECT BY` clause, which makes
@@ -3960,6 +4089,20 @@ impl SqlEditorWidget {
             }
         }
         None
+    }
+
+    fn expected_grant_privilege_keyword_candidates_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> Option<&'static [&'static str]> {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::expected_grant_privilege_keyword_candidates(tokens, end)
     }
 
     /// True when the cursor is at the brand-new object name of a `CREATE`
@@ -5620,6 +5763,11 @@ impl SqlEditorWidget {
                 exclude_current_identifier_chain,
             )
             .is_some()
+            || Self::expected_grant_privilege_keyword_candidates_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
+            .is_some()
             || Self::expected_sounds_like_keyword_candidates_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
@@ -6786,6 +6934,7 @@ impl SqlEditorWidget {
                 | "FLASHBACK"
                 | "LOCK"
                 | "OPTIMIZE"
+                | "PURGE"
                 | "REPAIR"
                 | "TRUNCATE"
         )
@@ -7807,9 +7956,12 @@ impl SqlEditorWidget {
             return Self::filter_expected_candidates(prefix, candidates);
         }
 
-        // GRANT/REVOKE privilege keywords. Emission only — these merge with the
-        // identifier base (a role name is also grantable here), so the privilege
-        // slot is deliberately left out of the suppression chokepoint.
+        // GRANT/REVOKE privilege keywords. Only the fixed privilege words are
+        // grammatical in the privilege list — object names (tables, views,
+        // sequences, procedures, …) are never grantable there, so this slot is
+        // also enrolled in the identifier-suppression chokepoint
+        // (`cursor_is_at_identifier_suppressing_keyword_slot_for_context`) to keep
+        // the base catalog from leaking in.
         if let Some(candidates) =
             Self::expected_grant_privilege_keyword_candidates(tokens, context_end)
         {
@@ -8178,6 +8330,7 @@ impl SqlEditorWidget {
                         | "OPTIMIZE"
                         | "CHECK"
                         | "REPAIR"
+                        | "PURGE"
                 ) && *last == "TABLE" =>
             {
                 Some(ExpectedObjectSuggestionKind::Table)
@@ -8234,7 +8387,10 @@ impl SqlEditorWidget {
             [.., prev, last] if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "EVENT" => {
                 Some(ExpectedObjectSuggestionKind::Event)
             }
-            [.., prev, last] if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "INDEX" => {
+            [.., prev, last]
+                if matches!(prev.as_str(), "ALTER" | "DROP" | "ANALYZE" | "PURGE")
+                    && *last == "INDEX" =>
+            {
                 Some(ExpectedObjectSuggestionKind::Index)
             }
             [.., prev, last]
@@ -8298,7 +8454,8 @@ impl SqlEditorWidget {
                 Some(ExpectedObjectSuggestionKind::Library)
             }
             [.., prev, last]
-                if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "CLUSTER" =>
+                if matches!(prev.as_str(), "ALTER" | "DROP" | "ANALYZE" | "TRUNCATE")
+                    && *last == "CLUSTER" =>
             {
                 Some(ExpectedObjectSuggestionKind::Cluster)
             }
