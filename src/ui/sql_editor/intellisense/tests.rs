@@ -25413,3 +25413,45 @@ fn plsql_exception_handler_name_slot_keeps_only_packages_and_spares_case_when() 
         "CASE WHEN condition must keep relation/column completion"
     );
 }
+
+/// The exception-handler `WHEN` slot also *offers* the Oracle predefined
+/// exceptions (and `OTHERS`) as keywords, prefix-filtered, alongside the user's
+/// declared/package exceptions. A `CASE WHEN` condition and a handler body never
+/// get them, and the Oracle-only construct is gated off for MySQL/MariaDB.
+#[test]
+fn plsql_exception_handler_name_slot_offers_predefined_exceptions() {
+    let kw = |sql: &str, db: crate::db::DatabaseType| {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(db),
+        )
+    };
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
+
+    let empty = kw("BEGIN NULL; EXCEPTION WHEN | THEN NULL; END;", Oracle);
+    for expected in ["OTHERS", "NO_DATA_FOUND", "TOO_MANY_ROWS", "DUP_VAL_ON_INDEX", "VALUE_ERROR"] {
+        assert!(empty.iter().any(|k| k == expected), "{expected} for empty WHEN");
+    }
+    // A continued handler (`WHEN e1 OR |`) is still an exception-name position.
+    assert!(kw("DECLARE e1 EXCEPTION; BEGIN NULL; EXCEPTION WHEN e1 OR | THEN NULL; END;", Oracle)
+        .iter()
+        .any(|k| k == "OTHERS"));
+    // Prefix filters the predefined list.
+    assert_eq!(
+        kw("BEGIN NULL; EXCEPTION WHEN NO_| THEN NULL; END;", Oracle),
+        vec!["NO_DATA_FOUND".to_string(), "NO_DATA_NEEDED".to_string()]
+    );
+    // Not a `CASE WHEN` condition, not a handler body, and Oracle-only.
+    assert!(!kw("SELECT CASE WHEN | THEN 1 END FROM emp", Oracle).iter().any(|k| k == "OTHERS"));
+    assert!(!kw("BEGIN NULL; EXCEPTION WHEN e THEN | END;", Oracle).iter().any(|k| k == "OTHERS"));
+    for db in [MySQL, MariaDB] {
+        assert!(
+            !kw("BEGIN NULL; EXCEPTION WHEN | THEN NULL; END;", db).iter().any(|k| k == "OTHERS"),
+            "predefined Oracle exceptions must not be offered for {db:?}"
+        );
+    }
+}
