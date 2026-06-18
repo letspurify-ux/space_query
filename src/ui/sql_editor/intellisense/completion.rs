@@ -217,6 +217,35 @@ const PARENTHESIZED_EXPRESSION_CONSTRUCT_WORDS: &[&str] = &[
 /// otherwise correctly offer relation names.
 const PARENTHESIZED_TABLE_SOURCE_CONSTRUCT_WORDS: &[&str] = &["JSON_TABLE", "TABLE", "XMLTABLE"];
 
+/// Oracle PL/SQL predefined exceptions (the `STANDARD` package) plus the `OTHERS`
+/// catch-all, offered at an exception-handler `WHEN` slot alongside the user's
+/// own declared exceptions (local symbols) and package-qualified ones (packages).
+const PLSQL_PREDEFINED_EXCEPTIONS: &[&str] = &[
+    "OTHERS",
+    "ACCESS_INTO_NULL",
+    "CASE_NOT_FOUND",
+    "COLLECTION_IS_NULL",
+    "CURSOR_ALREADY_OPEN",
+    "DUP_VAL_ON_INDEX",
+    "INVALID_CURSOR",
+    "INVALID_NUMBER",
+    "LOGIN_DENIED",
+    "NO_DATA_FOUND",
+    "NO_DATA_NEEDED",
+    "NOT_LOGGED_ON",
+    "PROGRAM_ERROR",
+    "ROWTYPE_MISMATCH",
+    "SELF_IS_NULL",
+    "STORAGE_ERROR",
+    "SUBSCRIPT_BEYOND_COUNT",
+    "SUBSCRIPT_OUTSIDE_LIMIT",
+    "SYS_INVALID_ROWID",
+    "TIMEOUT_ON_RESOURCE",
+    "TOO_MANY_ROWS",
+    "VALUE_ERROR",
+    "ZERO_DIVIDE",
+];
+
 const JSON_ERROR_EMPTY_OPTION_FUNCTION_WORDS: &[&str] =
     &["JSON_EXISTS", "JSON_QUERY", "JSON_TABLE", "JSON_VALUE"];
 const JSON_ON_NULL_OPTION_FUNCTION_WORDS: &[&str] =
@@ -7887,6 +7916,18 @@ impl SqlEditorWidget {
             !prefix.is_empty(),
         ) {
             return Vec::new();
+        }
+        // A PL/SQL exception-handler `WHEN` names an exception. Offer the Oracle
+        // predefined exceptions (and `OTHERS`) here; the user's own declared
+        // exceptions and package-qualified ones arrive through the local-symbol
+        // and (package) base paths. MySQL/MariaDB stored programs use a different
+        // `DECLARE … HANDLER` form, so this Oracle-only construct is gated off.
+        if !matches!(
+            db_type,
+            Some(crate::db::DatabaseType::MySQL) | Some(crate::db::DatabaseType::MariaDB)
+        ) && Self::cursor_is_at_plsql_exception_name(tokens, context_end)
+        {
+            return Self::filter_expected_candidates(prefix, PLSQL_PREDEFINED_EXCEPTIONS);
         }
         if matches!(
             deep_ctx.phase,
