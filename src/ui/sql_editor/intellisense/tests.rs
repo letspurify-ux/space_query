@@ -537,6 +537,60 @@ fn keyword_only_slots_are_enrolled_in_suppression_chokepoint() {
     }
 }
 
+#[test]
+fn mysql_keyword_only_slots_are_enrolled_in_suppression_chokepoint() {
+    let db = Some(crate::db::DatabaseType::MySQL);
+    let suppressed_or_no_keywords = |sql: &str| -> bool {
+        let cursor = sql.find('|').expect("cursor marker");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        let has = !prefix.is_empty();
+        let ctx = analyze_inline_cursor_sql(sql);
+        let kw = SqlEditorWidget::collect_expected_keyword_suggestions(&prefix, &ctx, db);
+        let kind =
+            SqlEditorWidget::expected_object_suggestion_kind_for_db(&prefix, None, &ctx, db);
+        let dtype = SqlEditorWidget::data_type_position_for_context_for_db(&ctx, has, db).is_some();
+        let new_name = ctx.ddl_new_name_position
+            || SqlEditorWidget::cursor_is_at_create_object_new_name(&ctx, has);
+        let keyword_only = !kw.is_empty() && kind.is_none() && !dtype;
+        let suppressed = SqlEditorWidget::cursor_is_at_identifier_suppressing_keyword_slot_for_context(&ctx, has, db)
+            || SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot_for_db(&ctx, has, db)
+            || new_name;
+        !keyword_only || suppressed
+    };
+
+    for sql in [
+        "SHOW |",
+        "SHOW CREATE |",
+        "SHOW COLUMNS FROM emp |",
+        "SET |",
+        "SET NAMES utf8mb4 |",
+        "START |",
+        "START TRANSACTION |",
+        "CACHE |",
+        "CACHE INDEX emp |",
+        "LOAD |",
+        "LOAD DATA INFILE data_csv |",
+        "LOCK |",
+        "LOCK TABLES emp |",
+        "RESET |",
+        "RESET REPLICA ALL |",
+        "FLUSH |",
+        "FLUSH TABLES |",
+        "REPAIR TABLE emp |",
+        "CHECK TABLE emp |",
+        "ANALYZE TABLE emp UPDATE HISTOGRAM ON salary |",
+        "GRANT | ON *.* TO u",
+        "REVOKE SELECT, | ON *.* FROM u",
+    ] {
+        assert!(
+            suppressed_or_no_keywords(sql),
+            "MySQL keyword-only slot leaks the identifier base (not enrolled in a \
+             suppression chokepoint): `{sql}`"
+        );
+    }
+}
+
 /// The brand-new object name of a `CREATE` statement (`CREATE TABLE |`,
 /// `CREATE OR REPLACE PACKAGE |`, `CREATE MATERIALIZED VIEW |`, …) never
 /// references an existing object, so the relation/object catalog is suppressed.
@@ -9436,6 +9490,76 @@ fn tool_command_keyword_slots_offer_only_supported_tool_keywords() {
         ),
         "MATCH_RECOGNIZE SHOW must remain SQL, not a SQL*Plus SHOW slot"
     );
+
+    for sql in [
+        "SHOW |",
+        "SHOW COLUMNS FROM |",
+        "SET |",
+        "SET @v = |",
+        "START |",
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        assert!(
+            !SqlEditorWidget::cursor_is_at_tool_no_sql_argument_slot_for_context_for_db(
+                &ctx,
+                false,
+                Some(crate::db::DatabaseType::MySQL),
+            ),
+            "MySQL SQL statement `{sql}` was misclassified as a freeform tool argument"
+        );
+    }
+
+    for sql in ["DELIMITER |", "SOURCE |", "USE |", "SHUTDOWN |"] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        assert!(
+            SqlEditorWidget::cursor_is_at_tool_no_sql_argument_slot_for_context_for_db(
+                &ctx,
+                false,
+                Some(crate::db::DatabaseType::MySQL),
+            ),
+            "MySQL freeform/no-argument command `{sql}` was not suppressed"
+        );
+    }
+
+    for sql in [
+        "SHOW |",
+        "SHOW CREATE |",
+        "SHOW COLUMNS FROM emp |",
+        "SET |",
+        "START |",
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        assert!(
+            SqlEditorWidget::cursor_is_at_identifier_suppressing_keyword_slot_for_context(
+                &ctx,
+                false,
+                Some(crate::db::DatabaseType::MySQL),
+            ),
+            "MySQL keyword-only statement slot `{sql}` did not suppress the base catalog"
+        );
+    }
+
+    let set_value_ctx = analyze_inline_cursor_sql("SET @v = |");
+    assert!(
+        !SqlEditorWidget::cursor_is_at_identifier_suppressing_keyword_slot_for_context(
+            &set_value_ctx,
+            false,
+            Some(crate::db::DatabaseType::MySQL),
+        ),
+        "MySQL SET assignment value must remain an expression slot, not keyword-only"
+    );
+}
+
+#[test]
+fn tool_argument_commands_are_offered_by_a_top_level_statement_inventory() {
+    for command in SqlEditorWidget::TOOL_NO_SQL_ARGUMENT_COMMANDS {
+        let offered_in_oracle = crate::sql_text::statement_head_keywords().contains(command);
+        let offered_in_mysql = crate::sql_text::mysql_statement_head_keywords().contains(command);
+        assert!(
+            offered_in_oracle || offered_in_mysql,
+            "{command} suppresses tool arguments but is not offered as a top-level command in any supported dialect"
+        );
+    }
 }
 
 #[test]
@@ -21658,6 +21782,83 @@ fn mysql_structural_keyword_slots_are_dialect_scoped() {
         ("CREATE DATABASE db COLLATE utf8mb4_bin |", "DEFAULT"),
         ("CREATE DATABASE db ENCRYPTION Y |", "CHARACTER"),
         ("CREATE USER |", "IF"),
+        ("CREATE USER IF |", "NOT"),
+        ("CREATE USER IF NOT |", "EXISTS"),
+        ("CREATE USER alice |", "IDENTIFIED"),
+        ("CREATE USER alice |", "REQUIRE"),
+        ("CREATE USER alice |", "WITH"),
+        ("CREATE USER alice |", "PASSWORD"),
+        ("CREATE USER alice |", "ACCOUNT"),
+        ("CREATE USER alice |", "DEFAULT"),
+        ("CREATE USER alice IDENTIFIED |", "BY"),
+        ("CREATE USER alice IDENTIFIED |", "WITH"),
+        ("CREATE USER alice IDENTIFIED BY |", "RANDOM"),
+        ("CREATE USER alice IDENTIFIED BY RANDOM |", "PASSWORD"),
+        ("CREATE USER alice IDENTIFIED BY RANDOM PASSWORD |", "AND"),
+        ("CREATE USER alice IDENTIFIED BY RANDOM PASSWORD |", "REQUIRE"),
+        (
+            "CREATE USER alice IDENTIFIED WITH mysql_native_password |",
+            "BY",
+        ),
+        (
+            "CREATE USER alice IDENTIFIED WITH mysql_native_password |",
+            "AS",
+        ),
+        (
+            "CREATE USER alice IDENTIFIED WITH mysql_native_password |",
+            "AND",
+        ),
+        (
+            "CREATE USER alice IDENTIFIED WITH mysql_native_password |",
+            "INITIAL",
+        ),
+        (
+            "CREATE USER alice IDENTIFIED WITH mysql_native_password BY |",
+            "RANDOM",
+        ),
+        (
+            "CREATE USER alice IDENTIFIED WITH mysql_native_password BY RANDOM |",
+            "PASSWORD",
+        ),
+        (
+            "CREATE USER alice IDENTIFIED WITH mysql_native_password INITIAL |",
+            "AUTHENTICATION",
+        ),
+        (
+            "CREATE USER alice IDENTIFIED WITH mysql_native_password INITIAL AUTHENTICATION |",
+            "IDENTIFIED",
+        ),
+        (
+            "CREATE USER alice IDENTIFIED WITH mysql_native_password INITIAL AUTHENTICATION IDENTIFIED |",
+            "BY",
+        ),
+        (
+            "CREATE USER alice IDENTIFIED WITH mysql_native_password INITIAL AUTHENTICATION IDENTIFIED BY |",
+            "RANDOM",
+        ),
+        (
+            "CREATE USER alice IDENTIFIED WITH mysql_native_password INITIAL AUTHENTICATION IDENTIFIED BY RANDOM |",
+            "PASSWORD",
+        ),
+        ("CREATE USER alice IDENTIFIED BY 'secret' AND |", "IDENTIFIED"),
+        ("CREATE USER alice REQUIRE |", "SSL"),
+        ("CREATE USER alice REQUIRE |", "CIPHER"),
+        ("CREATE USER alice REQUIRE CIPHER 'cipher' |", "AND"),
+        ("CREATE USER alice WITH |", "MAX_QUERIES_PER_HOUR"),
+        (
+            "CREATE USER alice WITH MAX_QUERIES_PER_HOUR 10 |",
+            "MAX_UPDATES_PER_HOUR",
+        ),
+        ("CREATE USER alice PASSWORD |", "EXPIRE"),
+        ("CREATE USER alice PASSWORD |", "HISTORY"),
+        ("CREATE USER alice PASSWORD |", "REQUIRE"),
+        ("CREATE USER alice PASSWORD EXPIRE |", "INTERVAL"),
+        ("CREATE USER alice PASSWORD EXPIRE INTERVAL 30 |", "DAY"),
+        ("CREATE USER alice PASSWORD REQUIRE |", "CURRENT"),
+        ("CREATE USER alice ACCOUNT |", "LOCK"),
+        ("CREATE USER alice ACCOUNT |", "UNLOCK"),
+        ("CREATE USER alice DEFAULT |", "ROLE"),
+        ("CREATE USER alice DEFAULT ROLE admin |", "REQUIRE"),
         ("CREATE ROLE |", "IF"),
         ("CREATE UNIQUE |", "INDEX"),
         ("CREATE FULLTEXT |", "INDEX"),
@@ -21976,6 +22177,12 @@ fn mysql_structural_keyword_slots_are_dialect_scoped() {
         ("LOCK |", "TABLES"),
         ("UNLOCK |", "INSTANCE"),
         ("CACHE |", "INDEX"),
+        ("CACHE INDEX emp |", "IN"),
+        ("CACHE INDEX emp |", "PARTITION"),
+        ("CACHE INDEX emp |", "INDEX"),
+        ("CACHE INDEX emp |", "KEY"),
+        ("CACHE INDEX emp INDEX ix |", "IN"),
+        ("CACHE INDEX emp, dept |", "IN"),
         ("LOAD |", "DATA"),
         ("LOAD |", "XML"),
         ("LOAD DATA |", "INFILE"),
@@ -21996,9 +22203,14 @@ fn mysql_structural_keyword_slots_are_dialect_scoped() {
         ("LOAD XML CONCURRENT LOCAL |", "INFILE"),
         ("LOAD XML INFILE data_xml |", "INTO"),
         ("LOAD XML INFILE data_xml IGNORE |", "INTO"),
+        ("LOAD INDEX |", "INTO"),
         ("LOAD INDEX INTO |", "CACHE"),
-        ("LOAD INDEX INTO CACHE |", "IGNORE"),
-        ("LOAD INDEX INTO CACHE IGNORE |", "LEAVES"),
+        ("LOAD INDEX INTO CACHE emp |", "IGNORE"),
+        ("LOAD INDEX INTO CACHE emp |", "PARTITION"),
+        ("LOAD INDEX INTO CACHE emp |", "INDEX"),
+        ("LOAD INDEX INTO CACHE emp |", "KEY"),
+        ("LOAD INDEX INTO CACHE emp IGNORE |", "LEAVES"),
+        ("LOAD INDEX INTO CACHE emp, dept |", "IGNORE"),
         ("PURGE |", "BINARY"),
         ("PURGE BINARY |", "LOGS"),
         ("RESET |", "PERSIST"),
@@ -22091,6 +22303,16 @@ fn mysql_structural_keyword_slots_are_dialect_scoped() {
         ("ALTER INSTANCE ENABLE INNODB REDO_LOG |", "ROTATE"),
         ("ALTER INSTANCE RELOAD KEYRING |", "TLS"),
         ("ALTER INSTANCE ROTATE INNODB MASTER KEY |", "RELOAD"),
+        ("CREATE USER IF NOT EXISTS |", "IDENTIFIED"),
+        ("CREATE USER alice@ |", "IDENTIFIED"),
+        ("CREATE USER alice IDENTIFIED WITH |", "BY"),
+        ("CREATE USER alice REQUIRE NONE |", "SSL"),
+        ("CREATE USER alice DEFAULT ROLE |", "REQUIRE"),
+        ("CREATE USER alice COMMENT |", "ACCOUNT"),
+        (
+            "CREATE USER alice IDENTIFIED BY RANDOM PASSWORD |",
+            "REPLACE",
+        ),
         ("ALTER USER IF EXISTS |", "IDENTIFIED"),
         ("ALTER USER alice@ |", "IDENTIFIED"),
         ("ALTER USER alice IDENTIFIED WITH |", "BY"),
@@ -22193,10 +22415,18 @@ fn mysql_prepared_and_explain_keyword_slots_are_dialect_scoped() {
     }
 
     let explain_format = suggestions("EXPLAIN FORMAT |");
-    for expected in ["JSON", "TREE", "TRADITIONAL"] {
+    for expected in ["=", "JSON", "TREE", "TRADITIONAL"] {
         assert!(
             has(&explain_format, expected),
             "{expected} missing for MySQL EXPLAIN FORMAT: {explain_format:?}"
+        );
+    }
+
+    let explain_format_equals = suggestions("EXPLAIN FORMAT = |");
+    for expected in ["JSON", "TREE", "TRADITIONAL"] {
+        assert!(
+            has(&explain_format_equals, expected),
+            "{expected} missing for MySQL EXPLAIN FORMAT =: {explain_format_equals:?}"
         );
     }
 
@@ -22208,12 +22438,47 @@ fn mysql_prepared_and_explain_keyword_slots_are_dialect_scoped() {
         );
     }
 
+    let explain_format_equals_json = suggestions("EXPLAIN FORMAT = JSON |");
+    for expected in ["INTO", "FOR", "SELECT", "UPDATE"] {
+        assert!(
+            has(&explain_format_equals_json, expected),
+            "{expected} missing for MySQL EXPLAIN FORMAT = JSON: {explain_format_equals_json:?}"
+        );
+    }
+
+    for sql in [
+        "EXPLAIN FORMAT JSON INTO @plan |",
+        "EXPLAIN FORMAT = JSON INTO @plan |",
+    ] {
+        let got = suggestions(sql);
+        for expected in ["SELECT", "TABLE", "UPDATE", "DELETE", "INSERT", "REPLACE"] {
+            assert!(
+                has(&got, expected),
+                "{expected} missing after EXPLAIN FORMAT JSON INTO variable for `{sql}`: {got:?}"
+            );
+        }
+    }
+
     let explain_for = suggestions("EXPLAIN FOR |");
     for expected in ["CONNECTION", "DATABASE", "SCHEMA"] {
         assert!(
             has(&explain_for, expected),
             "{expected} missing for MySQL EXPLAIN FOR: {explain_for:?}"
         );
+    }
+
+    for sql in [
+        "EXPLAIN FOR SCHEMA app |",
+        "EXPLAIN FORMAT = JSON FOR DATABASE app |",
+        "EXPLAIN FORMAT = JSON INTO @plan FOR DATABASE app |",
+    ] {
+        let got = suggestions(sql);
+        for expected in ["SELECT", "TABLE", "UPDATE", "DELETE", "INSERT", "REPLACE"] {
+            assert!(
+                has(&got, expected),
+                "{expected} missing after MySQL EXPLAIN schema spec for `{sql}`: {got:?}"
+            );
+        }
     }
 
     let explain_analyze = suggestions("EXPLAIN ANALYZE |");
@@ -22230,7 +22495,8 @@ fn mysql_prepared_and_explain_keyword_slots_are_dialect_scoped() {
         );
     }
 
-    assert_eq!(suggestions("EXPLAIN ANALYZE FORMAT |"), vec!["TREE"]);
+    assert_eq!(suggestions("EXPLAIN ANALYZE FORMAT |"), vec!["=", "TREE"]);
+    assert_eq!(suggestions("EXPLAIN ANALYZE FORMAT = |"), vec!["TREE"]);
 
     let explain_analyze_tree = suggestions("EXPLAIN ANALYZE FORMAT TREE |");
     for expected in ["SELECT", "TABLE", "UPDATE", "DELETE"] {
@@ -22243,6 +22509,28 @@ fn mysql_prepared_and_explain_keyword_slots_are_dialect_scoped() {
         assert!(
             !has(&explain_analyze_tree, unsupported),
             "{unsupported} leaked into MySQL EXPLAIN ANALYZE FORMAT TREE: {explain_analyze_tree:?}"
+        );
+    }
+
+    let explain_analyze_equals_tree = suggestions("EXPLAIN ANALYZE FORMAT = TREE |");
+    for expected in ["SELECT", "TABLE", "UPDATE", "DELETE"] {
+        assert!(
+            has(&explain_analyze_equals_tree, expected),
+            "{expected} missing for MySQL EXPLAIN ANALYZE FORMAT = TREE: {explain_analyze_equals_tree:?}"
+        );
+    }
+
+    let explain_analyze_schema = suggestions("EXPLAIN ANALYZE FORMAT = TREE FOR SCHEMA app |");
+    for expected in ["SELECT", "TABLE", "UPDATE", "DELETE"] {
+        assert!(
+            has(&explain_analyze_schema, expected),
+            "{expected} missing after MySQL EXPLAIN ANALYZE schema spec: {explain_analyze_schema:?}"
+        );
+    }
+    for unsupported in ["INSERT", "REPLACE"] {
+        assert!(
+            !has(&explain_analyze_schema, unsupported),
+            "{unsupported} leaked after MySQL EXPLAIN ANALYZE schema spec: {explain_analyze_schema:?}"
         );
     }
 }
@@ -22303,6 +22591,11 @@ fn mysql_admin_transaction_and_utility_keyword_slots_are_dialect_scoped() {
         ("LOCK TABLES emp |", "AS"),
         ("LOCK TABLES emp AS e |", "READ"),
         ("LOCK TABLES emp READ |", "LOCAL"),
+        ("LOCK TABLES emp READ, dept |", "READ"),
+        ("LOCK TABLES emp READ, dept |", "WRITE"),
+        ("LOCK TABLES emp READ, dept |", "AS"),
+        ("LOCK TABLES emp READ, dept AS d |", "WRITE"),
+        ("LOCK TABLES emp READ, dept READ |", "LOCAL"),
         ("COMMIT |", "WORK"),
         ("COMMIT |", "AND"),
         ("COMMIT AND |", "CHAIN"),
@@ -22391,6 +22684,50 @@ fn mysql_admin_transaction_and_utility_keyword_slots_are_dialect_scoped() {
             "{mysql_only} leaked into Oracle INSTALL slot: {oracle_install:?}"
         );
     }
+
+    for sql in ["LOCK TABLES |", "LOCK TABLES emp READ, |"] {
+        let got = suggestions(sql, MySQL);
+        for invalid in ["AS", "READ", "WRITE", "LOCAL"] {
+            assert!(
+                !has(&got, invalid),
+                "{invalid} leaked into table-name slot for `{sql}`: {got:?}"
+            );
+        }
+    }
+
+    for sql in ["LOCK TABLES emp WRITE |", "LOCK TABLES emp READ LOCAL |"] {
+        let got = suggestions(sql, MySQL);
+        for invalid in ["AS", "READ", "WRITE", "LOCAL"] {
+            assert!(
+                !has(&got, invalid),
+                "{invalid} leaked after complete lock item for `{sql}`: {got:?}"
+            );
+        }
+    }
+
+    for sql in [
+        "CACHE INDEX |",
+        "CACHE INDEX emp, |",
+        "LOAD INDEX INTO CACHE |",
+        "LOAD INDEX INTO CACHE emp, |",
+        "LOAD INDEX INTO CACHE IGNORE |",
+    ] {
+        let got = suggestions(sql, MySQL);
+        for invalid in ["IGNORE", "IN", "INDEX", "KEY", "LEAVES", "PARTITION"] {
+            assert!(
+                !has(&got, invalid),
+                "{invalid} leaked into table-name slot for `{sql}`: {got:?}"
+            );
+        }
+    }
+
+    let cache_index_after_in = suggestions("CACHE INDEX emp IN |", MySQL);
+    for invalid in ["IN", "INDEX", "KEY", "PARTITION"] {
+        assert!(
+            !has(&cache_index_after_in, invalid),
+            "{invalid} leaked after CACHE INDEX key-cache marker: {cache_index_after_in:?}"
+        );
+    }
 }
 
 #[test]
@@ -22446,6 +22783,236 @@ fn collect_expected_object_suggestions_prefer_routines_for_call_context() {
     assert!(call_suggestions.iter().any(|value| value == "UTIL_PKG"));
     assert!(!call_suggestions.iter().any(|value| value == "EMP"));
     assert!(describe_suggestions.iter().any(|value| value == "EMP"));
+}
+
+#[test]
+fn mysql_describe_object_slot_offers_column_owners_only() {
+    use crate::db::DatabaseType::MySQL;
+
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["EMP".to_string()];
+    data.views = vec!["EMP_VIEW".to_string()];
+    data.functions = vec!["CALC_TOTAL".to_string()];
+    data.procedures = vec!["RUN_JOB".to_string()];
+    data.users = vec!["APP_USER".to_string()];
+    data.rebuild_indices();
+
+    for sql in ["DESC |", "DESCRIBE |"] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        let suggestions = SqlEditorWidget::collect_expected_object_suggestions_for_db(
+            &mut data,
+            "",
+            &ctx,
+            Some(MySQL),
+        );
+        assert!(
+            suggestions.iter().any(|value| value == "EMP"),
+            "table missing for `{sql}`: {suggestions:?}"
+        );
+        assert!(
+            suggestions.iter().any(|value| value == "EMP_VIEW"),
+            "view missing for `{sql}`: {suggestions:?}"
+        );
+        for noise in ["CALC_TOTAL", "RUN_JOB", "APP_USER"] {
+            assert!(
+                !suggestions.iter().any(|value| value == noise),
+                "{noise} leaked into MySQL DESCRIBE object slot for `{sql}`: {suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn mysql_explain_head_offers_table_structure_targets_and_statement_heads() {
+    use crate::db::DatabaseType::MySQL;
+
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["EMP".to_string()];
+    data.views = vec!["EMP_VIEW".to_string()];
+    data.functions = vec!["CALC_TOTAL".to_string()];
+    data.procedures = vec!["RUN_JOB".to_string()];
+    data.users = vec!["APP_USER".to_string()];
+    data.rebuild_indices();
+
+    let mut suggestions = |sql: &str| {
+        let ctx = analyze_inline_cursor_sql(sql);
+        let mut object_suggestions = SqlEditorWidget::collect_expected_object_suggestions_for_db(
+            &mut data,
+            "",
+            &ctx,
+            Some(MySQL),
+        );
+        let keyword_suggestions =
+            SqlEditorWidget::collect_expected_keyword_suggestions("", &ctx, Some(MySQL));
+        object_suggestions = SqlEditorWidget::merge_suggestions_with_context_aliases(
+            object_suggestions,
+            keyword_suggestions,
+            true,
+        );
+        object_suggestions
+    };
+    let has = |items: &[String], value: &str| items.iter().any(|item| item == value);
+
+    let explain = suggestions("EXPLAIN |");
+    for expected in ["EMP", "EMP_VIEW", "FORMAT", "FOR", "SELECT", "TABLE", "UPDATE"] {
+        assert!(
+            has(&explain, expected),
+            "{expected} missing from MySQL EXPLAIN head: {explain:?}"
+        );
+    }
+    for noise in ["CALC_TOTAL", "RUN_JOB", "APP_USER"] {
+        assert!(
+            !has(&explain, noise),
+            "{noise} leaked into MySQL EXPLAIN table-structure target slot: {explain:?}"
+        );
+    }
+
+    let explain_format = suggestions("EXPLAIN FORMAT |");
+    for object in ["EMP", "EMP_VIEW"] {
+        assert!(
+            !has(&explain_format, object),
+            "{object} leaked into EXPLAIN FORMAT option slot: {explain_format:?}"
+        );
+    }
+
+    drop(suggestions);
+
+    let variable_slot = {
+        let sql = "EXPLAIN FORMAT = JSON INTO @|";
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql);
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        let context =
+            SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+        let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &ctx);
+        let ekc = SqlEditorWidget::expression_keyword_context(
+            &ctx,
+            &data,
+            &column_tables,
+            !prefix.is_empty(),
+            Some(MySQL),
+        );
+        SqlEditorWidget::base_suggestions_for_context(
+            &mut data,
+            &prefix,
+            None,
+            None,
+            matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
+            context,
+            false,
+            Some(MySQL),
+            ekc,
+        )
+    };
+    assert!(
+        variable_slot.is_empty(),
+        "catalog leaked into EXPLAIN FORMAT JSON INTO user-variable slot: {variable_slot:?}"
+    );
+
+    let mut base_suggestions = |sql: &str| {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql);
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        let context =
+            SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+        let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &ctx);
+        let ekc = SqlEditorWidget::expression_keyword_context(
+            &ctx,
+            &data,
+            &column_tables,
+            !prefix.is_empty(),
+            Some(MySQL),
+        );
+        SqlEditorWidget::base_suggestions_for_context(
+            &mut data,
+            &prefix,
+            None,
+            None,
+            matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
+            context,
+            false,
+            Some(MySQL),
+            ekc,
+        )
+    };
+
+    for sql in [
+        "EXPLAIN FOR SCHEMA |",
+        "EXPLAIN FORMAT = JSON FOR DATABASE |",
+        "EXPLAIN FORMAT = JSON INTO @plan FOR DATABASE |",
+        "EXPLAIN ANALYZE FORMAT = TREE FOR SCHEMA |",
+    ] {
+        let got = base_suggestions(sql);
+        assert!(
+            got.is_empty(),
+            "catalog leaked into MySQL EXPLAIN schema-name slot for `{sql}`: {got:?}"
+        );
+    }
+}
+
+#[test]
+fn mysql_show_object_slots_offer_matching_object_kinds() {
+    use crate::db::DatabaseType::MySQL;
+
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["EMP".to_string()];
+    data.views = vec!["EMP_VIEW".to_string()];
+    data.functions = vec!["CALC_TOTAL".to_string()];
+    data.procedures = vec!["RUN_JOB".to_string()];
+    data.triggers = vec!["BI_EMP".to_string()];
+    data.events = vec!["CLEANUP_EVENT".to_string()];
+    data.users = vec!["APP_USER".to_string()];
+    data.rebuild_indices();
+
+    let mut suggestions = |sql: &str| {
+        let ctx = analyze_inline_cursor_sql(sql);
+        SqlEditorWidget::collect_expected_object_suggestions_for_db(
+            &mut data,
+            "",
+            &ctx,
+            Some(MySQL),
+        )
+    };
+    let has = |items: &[String], value: &str| items.iter().any(|item| item == value);
+
+    for sql in [
+        "SHOW COLUMNS FROM |",
+        "SHOW FULL FIELDS IN |",
+        "SHOW INDEX FROM |",
+        "SHOW KEYS IN |",
+    ] {
+        let got = suggestions(sql);
+        assert!(has(&got, "EMP"), "table missing for `{sql}`: {got:?}");
+        assert!(has(&got, "EMP_VIEW"), "view missing for `{sql}`: {got:?}");
+        for noise in ["CALC_TOTAL", "RUN_JOB", "BI_EMP", "CLEANUP_EVENT", "APP_USER"] {
+            assert!(
+                !has(&got, noise),
+                "{noise} leaked into SHOW table object slot for `{sql}`: {got:?}"
+            );
+        }
+    }
+
+    for (sql, expected, noise) in [
+        ("SHOW CREATE TABLE |", "EMP", &["EMP_VIEW", "CALC_TOTAL", "RUN_JOB"][..]),
+        ("SHOW CREATE VIEW |", "EMP_VIEW", &["EMP", "CALC_TOTAL", "RUN_JOB"]),
+        ("SHOW CREATE FUNCTION |", "CALC_TOTAL", &["EMP", "EMP_VIEW", "RUN_JOB"]),
+        ("SHOW CREATE PROCEDURE |", "RUN_JOB", &["EMP", "EMP_VIEW", "CALC_TOTAL"]),
+        ("SHOW CREATE TRIGGER |", "BI_EMP", &["EMP", "EMP_VIEW", "CALC_TOTAL"]),
+        ("SHOW CREATE EVENT |", "CLEANUP_EVENT", &["EMP", "EMP_VIEW", "CALC_TOTAL"]),
+        ("SHOW CREATE USER |", "APP_USER", &["EMP", "EMP_VIEW", "CALC_TOTAL"]),
+        ("SHOW GRANTS FOR |", "APP_USER", &["EMP", "EMP_VIEW", "CALC_TOTAL"]),
+    ] {
+        let got = suggestions(sql);
+        assert!(has(&got, expected), "{expected} missing for `{sql}`: {got:?}");
+        for item in noise {
+            assert!(
+                !has(&got, item),
+                "{item} leaked into SHOW object slot for `{sql}`: {got:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -30568,6 +31135,204 @@ fn statement_start_drops_object_and_function_noise() {
         !blk.iter().any(|x| x.ends_with("()")),
         "a function call leaked into a PL/SQL statement start: {blk:?}"
     );
+}
+
+#[test]
+fn mysql_do_value_expression_filters_statement_and_relation_noise() {
+    let run = |sql: &str| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql);
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        let context =
+            SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["EMP".to_string()];
+        data.views = vec!["EMP_VIEW".to_string()];
+        data.functions = vec!["CALC_TOTAL".to_string()];
+        data.rebuild_indices();
+        let ekc = SqlEditorWidget::expression_keyword_context(
+            &ctx,
+            &data,
+            &[],
+            !prefix.is_empty(),
+            Some(crate::db::DatabaseType::MySQL),
+        );
+        let include_columns = matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll);
+        SqlEditorWidget::base_suggestions_for_context(
+            &mut data,
+            &prefix,
+            None,
+            None,
+            include_columns,
+            context,
+            false,
+            Some(crate::db::DatabaseType::MySQL),
+            ekc,
+        )
+    };
+    let has = |items: &[String], value: &str| items.iter().any(|item| item == value);
+
+    let start = run("DO |");
+    assert!(
+        has(&start, "CALC_TOTAL"),
+        "DO expression start lost value-producing functions: {start:?}"
+    );
+    for noise in ["SELECT", "CREATE", "DROP", "TABLE", "EMP", "EMP_VIEW"] {
+        assert!(
+            !has(&start, noise),
+            "{noise} leaked into MySQL DO expression start: {start:?}"
+        );
+    }
+
+    let after_operand = run("DO 1 |");
+    for noise in ["NULL", "SELECT", "CREATE", "EMP", "EMP_VIEW", "CALC_TOTAL"] {
+        assert!(
+            !has(&after_operand, noise),
+            "{noise} leaked after complete MySQL DO operand: {after_operand:?}"
+        );
+    }
+
+    let next_item = run("DO 1, |");
+    assert!(
+        has(&next_item, "CALC_TOTAL"),
+        "DO expression-list item start lost value-producing functions: {next_item:?}"
+    );
+    for noise in ["SELECT", "CREATE", "DROP", "EMP", "EMP_VIEW"] {
+        assert!(
+            !has(&next_item, noise),
+            "{noise} leaked into later MySQL DO expression-list item: {next_item:?}"
+        );
+    }
+}
+
+#[test]
+fn mysql_set_assignment_value_expression_filters_statement_and_relation_noise() {
+    let run = |sql: &str| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql);
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        let context =
+            SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["EMP".to_string()];
+        data.views = vec!["EMP_VIEW".to_string()];
+        data.functions = vec!["CALC_TOTAL".to_string()];
+        data.rebuild_indices();
+        let ekc = SqlEditorWidget::expression_keyword_context(
+            &ctx,
+            &data,
+            &[],
+            !prefix.is_empty(),
+            Some(crate::db::DatabaseType::MySQL),
+        );
+        let include_columns = matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll);
+        SqlEditorWidget::base_suggestions_for_context(
+            &mut data,
+            &prefix,
+            None,
+            None,
+            include_columns,
+            context,
+            false,
+            Some(crate::db::DatabaseType::MySQL),
+            ekc,
+        )
+    };
+    let has = |items: &[String], value: &str| items.iter().any(|item| item == value);
+
+    for sql in ["SET @v = |", "SET @v = 1, @w = |"] {
+        let suggestions = run(sql);
+        assert!(
+            has(&suggestions, "CALC_TOTAL"),
+            "SET assignment value lost value-producing functions for `{sql}`: {suggestions:?}"
+        );
+        for noise in ["SELECT", "CREATE", "DROP", "TABLE", "EMP", "EMP_VIEW"] {
+            assert!(
+                !has(&suggestions, noise),
+                "{noise} leaked into MySQL SET assignment value for `{sql}`: {suggestions:?}"
+            );
+        }
+    }
+
+    let after_operand = run("SET @v = 1 |");
+    for noise in ["NULL", "SELECT", "CREATE", "EMP", "EMP_VIEW", "CALC_TOTAL"] {
+        assert!(
+            !has(&after_operand, noise),
+            "{noise} leaked after complete MySQL SET assignment value: {after_operand:?}"
+        );
+    }
+}
+
+#[test]
+fn mysql_help_topic_argument_suppresses_sql_catalog_noise() {
+    let run = |sql: &str| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql);
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        let context =
+            SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["EMP".to_string()];
+        data.views = vec!["EMP_VIEW".to_string()];
+        data.functions = vec!["CALC_TOTAL".to_string()];
+        data.rebuild_indices();
+        let ekc = SqlEditorWidget::expression_keyword_context(
+            &ctx,
+            &data,
+            &[],
+            !prefix.is_empty(),
+            Some(crate::db::DatabaseType::MySQL),
+        );
+        let include_columns = matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll);
+        let mut suggestions = SqlEditorWidget::base_suggestions_for_context(
+            &mut data,
+            &prefix,
+            None,
+            None,
+            include_columns,
+            context,
+            false,
+            Some(crate::db::DatabaseType::MySQL),
+            ekc,
+        );
+        let expected_keywords =
+            SqlEditorWidget::collect_expected_keyword_suggestions_with_expression_context(
+                &prefix,
+                &ctx,
+                Some(crate::db::DatabaseType::MySQL),
+                Some(ekc),
+            );
+        if !expected_keywords.is_empty() {
+            suggestions = SqlEditorWidget::merge_suggestions_with_context_aliases(
+                suggestions,
+                expected_keywords,
+                true,
+            );
+        }
+        suggestions
+    };
+    let has = |items: &[String], value: &str| items.iter().any(|item| item == value);
+
+    for sql in ["HELP |", "HELP SE|", "HELP SELECT |"] {
+        let suggestions = run(sql);
+        for noise in [
+            "SELECT",
+            "CREATE",
+            "DROP",
+            "TABLE",
+            "EMP",
+            "EMP_VIEW",
+            "CALC_TOTAL",
+        ] {
+            assert!(
+                !has(&suggestions, noise),
+                "{noise} leaked into MySQL HELP topic argument for `{sql}`: {suggestions:?}"
+            );
+        }
+    }
 }
 
 /// A PL/SQL exception-handler name slot (`EXCEPTION WHEN |`, `WHEN e1 OR |`,

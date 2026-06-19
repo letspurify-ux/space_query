@@ -1572,6 +1572,8 @@ const STATEMENT_HEAD_KEYWORDS: &[&str] = &[
     "REPFOOTER",
     "PASSWORD",
     "PASSW",
+    "PASSWO",
+    "PASSWOR",
     "AUDIT",
     "NOAUDIT",
     "ASSOCIATE",
@@ -11402,6 +11404,12 @@ mod tests {
         assert!(is_statement_head_keyword("PASSWO"));
         assert!(is_statement_head_keyword("PASSWOR"));
         assert!(is_statement_head_keyword("PASSWORD"));
+        for keyword in ["PASSW", "PASSWO", "PASSWOR", "PASSWORD"] {
+            assert!(
+                statement_head_keywords().contains(&keyword),
+                "{keyword} must be offered at an Oracle top-level statement start"
+            );
+        }
     }
 
     #[test]
