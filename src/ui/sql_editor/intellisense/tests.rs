@@ -9018,6 +9018,293 @@ fn local_symbol_suggestions_merge_session_binds_without_duplicates() {
     assert_has_case_insensitive(&suggestions, "V_SESSION");
 }
 
+fn print_command_bind_suggestions_for_test(
+    script_with_cursor: &str,
+    session_bind_names: &[&str],
+) -> Vec<String> {
+    const CURSOR_MARKER: &str = "__CODEX_CURSOR__";
+
+    let cursor = script_with_cursor.find(CURSOR_MARKER).expect("cursor marker");
+    let sql = script_with_cursor.replacen(CURSOR_MARKER, "", 1);
+    let sql_with_cursor = script_with_cursor.replacen(CURSOR_MARKER, "|", 1);
+    let ctx = analyze_inline_cursor_sql(&sql_with_cursor);
+    let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+    let context =
+        SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+    let (routine_cache, expanded) =
+        SqlEditorWidget::build_routine_symbol_cache_bundle_for_test(&sql, cursor);
+    let analysis = SqlEditorWidget::build_intellisense_analysis_from_routine_cache(
+        &routine_cache,
+        expanded.cursor_in_statement,
+    );
+    let session_bind_names: Vec<String> = session_bind_names
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    let local_suggestions = SqlEditorWidget::collect_local_symbol_suggestions(
+        &prefix,
+        expanded.cursor_in_statement,
+        &analysis,
+        &session_bind_names,
+    );
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["V_TABLE".to_string(), "EMP".to_string()];
+    data.procedures = vec!["V_PROC".to_string()];
+    data.rebuild_indices();
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &ctx);
+    let expr_keyword_ctx = SqlEditorWidget::expression_keyword_context(
+        &ctx,
+        &data,
+        &column_tables,
+        !prefix.is_empty(),
+        Some(crate::db::DatabaseType::Oracle),
+    );
+    let at_tool_bind_name_slot =
+        SqlEditorWidget::cursor_is_at_tool_bind_name_slot_for_context(&ctx, !prefix.is_empty());
+    let at_tool_no_sql_argument_slot =
+        SqlEditorWidget::cursor_is_at_tool_no_sql_argument_slot_for_context(&ctx, !prefix.is_empty());
+    let mut suggestions = if at_tool_bind_name_slot || at_tool_no_sql_argument_slot {
+        Vec::new()
+    } else {
+        SqlEditorWidget::base_suggestions_for_context(
+            &mut data,
+            &prefix,
+            None,
+            None,
+            matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
+            context,
+            false,
+            Some(crate::db::DatabaseType::Oracle),
+            expr_keyword_ctx,
+        )
+    };
+    if !at_tool_bind_name_slot && !matches!(context, SqlContext::VariableName | SqlContext::BindValue)
+    {
+        let expected_keywords =
+            SqlEditorWidget::collect_expected_keyword_suggestions_with_expression_context(
+                &prefix,
+                &ctx,
+                Some(crate::db::DatabaseType::Oracle),
+                Some(expr_keyword_ctx),
+            );
+        if !expected_keywords.is_empty() {
+            suggestions = SqlEditorWidget::merge_suggestions_with_context_aliases(
+                suggestions,
+                expected_keywords,
+                true,
+            );
+        }
+    }
+    if !local_suggestions.is_empty() && !at_tool_no_sql_argument_slot {
+        suggestions =
+            SqlEditorWidget::prepend_local_symbol_suggestions(suggestions, local_suggestions);
+    }
+    if !(matches!(context, SqlContext::VariableName | SqlContext::BindValue)
+        || at_tool_bind_name_slot
+        || at_tool_no_sql_argument_slot
+        || expr_keyword_ctx.at_bind_variable_name
+        || expr_keyword_ctx.expected_operand_type.is_some())
+    {
+        let context_names = SqlEditorWidget::collect_context_name_suggestions(&prefix, &ctx, context);
+        suggestions = SqlEditorWidget::maybe_merge_suggestions_with_context_aliases(
+            suggestions,
+            context_names,
+            matches!(context, SqlContext::TableName),
+            false,
+        );
+    }
+    suggestions
+}
+
+#[test]
+fn freeform_tool_argument_slots_do_not_suggest_sql_catalog() {
+    for sql in [
+        "DEFINE __CODEX_CURSOR__",
+        "DEFINE app_user = __CODEX_CURSOR__",
+        "DEFINE app_user = sc__CODEX_CURSOR__",
+        "DELIMITER __CODEX_CURSOR__",
+        "UNDEFINE __CODEX_CURSOR__",
+        "UNDEFINE app__CODEX_CURSOR__",
+        "ACCEPT __CODEX_CURSOR__",
+        "ACCEPT app_user PROMPT __CODEX_CURSOR__",
+        "PROMPT __CODEX_CURSOR__",
+        "STORE __CODEX_CURSOR__",
+        "GET __CODEX_CURSOR__",
+        "SAVE __CODEX_CURSOR__",
+        "SOURCE __CODEX_CURSOR__",
+        "START __CODEX_CURSOR__",
+        "USE __CODEX_CURSOR__",
+        "CONNECT __CODEX_CURSOR__",
+        "CONN __CODEX_CURSOR__",
+        "PASSWORD __CODEX_CURSOR__",
+        "HOST __CODEX_CURSOR__",
+        "PAUSE __CODEX_CURSOR__",
+        "TTITLE __CODEX_CURSOR__",
+        "BTITLE __CODEX_CURSOR__",
+        "SELECT 1 FROM dual;\nDEFINE app_user = __CODEX_CURSOR__",
+    ] {
+        let suggestions = print_command_bind_suggestions_for_test(sql, &["V_SESSION"]);
+        assert!(
+            suggestions.is_empty(),
+            "SQL catalog or local symbols leaked into tool variable slot for `{sql}`: {suggestions:?}"
+        );
+    }
+
+    let match_recognize_define_ctx = analyze_inline_cursor_sql(
+        "SELECT * FROM ticks MATCH_RECOGNIZE (PATTERN (A) DEFINE A AS |)",
+    );
+    assert!(
+        !SqlEditorWidget::cursor_is_at_tool_no_sql_argument_slot_for_context(
+            &match_recognize_define_ctx,
+            false,
+        ),
+        "MATCH_RECOGNIZE DEFINE clause must remain SQL, not a SQL*Plus DEFINE argument slot"
+    );
+
+    for sql in [
+        "SELECT * FROM emp CONNECT |",
+        "SELECT * FROM emp START |",
+        "SELECT * FROM emp CONNECT BY PRIOR empno = mgr START |",
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        assert!(
+            !SqlEditorWidget::cursor_is_at_tool_no_sql_argument_slot_for_context(&ctx, false),
+            "`{sql}` is a SQL clause, not a SQL*Plus freeform argument slot"
+        );
+    }
+}
+
+#[test]
+fn tool_command_keyword_slots_offer_only_supported_tool_keywords() {
+    let has = |suggestions: &[String], expected: &str| {
+        suggestions
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(expected))
+    };
+    let assert_only = |sql: &str, expected: &[&str]| {
+        let suggestions = print_command_bind_suggestions_for_test(sql, &["V_SESSION"]);
+        for keyword in expected {
+            assert!(
+                has(&suggestions, keyword),
+                "{keyword} was not suggested for `{sql}`: {suggestions:?}"
+            );
+        }
+        for noise in ["V_SESSION", "V_TABLE", "V_PROC", "SELECT", "ALTER", "EMP"] {
+            assert!(
+                !has(&suggestions, noise),
+                "{noise} leaked into tool keyword slot for `{sql}`: {suggestions:?}"
+            );
+        }
+    };
+
+    assert_only("SPOOL __CODEX_CURSOR__", &["OFF", "APPEND"]);
+    assert_only("SPOOL out.log __CODEX_CURSOR__", &["APPEND"]);
+    assert_only("SPOOL a__CODEX_CURSOR__", &["APPEND"]);
+    assert_only("ACCEPT app_user __CODEX_CURSOR__", &["PROMPT"]);
+    assert_only("BREAK __CODEX_CURSOR__", &["ON", "OFF"]);
+    assert_only("CLEAR __CODEX_CURSOR__", &["BREAKS", "COMPUTES"]);
+    assert_only("CLEAR BREAKS __CODEX_CURSOR__", &["CLEAR"]);
+    assert_only("CLEAR BREAKS CLEAR __CODEX_CURSOR__", &["COMPUTES"]);
+    assert_only("COMPUTE __CODEX_CURSOR__", &["SUM", "COUNT", "OFF"]);
+    assert_only("COMPUTE SUM __CODEX_CURSOR__", &["OF"]);
+    assert_only("COMPUTE SUM OF amount __CODEX_CURSOR__", &["ON"]);
+    assert_only("SET __CODEX_CURSOR__", &["AUTOCOMMIT", "DEFINE", "SERVEROUTPUT", "PAGESIZE"]);
+    assert_only("SET SERVEROUTPUT __CODEX_CURSOR__", &["ON", "OFF"]);
+    assert_only("SET SERVEROUTPUT ON __CODEX_CURSOR__", &["SIZE"]);
+    assert_only("SET SERVEROUTPUT ON SIZE __CODEX_CURSOR__", &["UNLIMITED"]);
+    assert_only("SET AUTOCOMMIT __CODEX_CURSOR__", &["ON", "OFF", "TRUE", "FALSE"]);
+    assert_only("SET VERIFY __CODEX_CURSOR__", &["ON", "OFF"]);
+    assert_only("SET PAGESIZE __CODEX_CURSOR__", &[]);
+    assert_only("SHOW __CODEX_CURSOR__", &["USER", "ALL", "ERRORS"]);
+    assert_only("SHOW __CODEX_CURSOR__", &["DATABASES", "TABLES", "COLUMNS", "VARIABLES"]);
+    assert_only("SHOW ERRORS __CODEX_CURSOR__", &["PROCEDURE", "FUNCTION", "PACKAGE", "TYPE"]);
+    assert_only("SHOW ERRORS PACKAGE __CODEX_CURSOR__", &["BODY"]);
+    assert_only("SHOW COLUMNS __CODEX_CURSOR__", &["FROM", "IN"]);
+    assert_only("SHOW COLUMNS FROM emp __CODEX_CURSOR__", &["FROM", "IN"]);
+    assert_only("SHOW CREATE __CODEX_CURSOR__", &["TABLE"]);
+    assert_only("SHOW VARIABLES __CODEX_CURSOR__", &["LIKE"]);
+    assert_only("SHOW STATUS __CODEX_CURSOR__", &["LIKE"]);
+    assert_only("WHENEVER __CODEX_CURSOR__", &["SQLERROR", "OSERROR"]);
+    assert_only("WHENEVER SQLERROR __CODEX_CURSOR__", &["EXIT", "CONTINUE"]);
+    assert_only("WHENEVER OSERROR __CODEX_CURSOR__", &["EXIT", "CONTINUE"]);
+    assert_only("COLUMN ename __CODEX_CURSOR__", &["NEW_VALUE"]);
+    assert_only("COLUMN ename new__CODEX_CURSOR__", &["NEW_VALUE"]);
+
+    let match_recognize_show =
+        analyze_inline_cursor_sql("SELECT * FROM t MATCH_RECOGNIZE (PATTERN (A) SHOW |)");
+    assert!(
+        !SqlEditorWidget::cursor_is_at_tool_no_sql_argument_slot_for_context(
+            &match_recognize_show,
+            false,
+        ),
+        "MATCH_RECOGNIZE SHOW must remain SQL, not a SQL*Plus SHOW slot"
+    );
+}
+
+#[test]
+fn print_command_bind_slot_suggests_only_binds() {
+    let suggestions = print_command_bind_suggestions_for_test(
+        "VAR v_rc REFCURSOR;\nPRINT __CODEX_CURSOR__",
+        &["V_SESSION"],
+    );
+    assert_has_case_insensitive(&suggestions, "v_rc");
+    assert_has_case_insensitive(&suggestions, "V_SESSION");
+    for noise in ["V_TABLE", "V_PROC", "PRINT", "SELECT"] {
+        assert!(
+            !suggestions.iter().any(|value| value.eq_ignore_ascii_case(noise)),
+            "{noise} leaked into PRINT bind slot: {suggestions:?}"
+        );
+    }
+
+    let prefixed = print_command_bind_suggestions_for_test(
+        "VAR v_rc REFCURSOR;\nPRINT v__CODEX_CURSOR__",
+        &["V_SESSION"],
+    );
+    assert_has_case_insensitive(&prefixed, "v_rc");
+    assert_has_case_insensitive(&prefixed, "V_SESSION");
+    assert!(
+        !prefixed.iter().any(|value| value.eq_ignore_ascii_case("V_TABLE")),
+        "base catalog leaked into prefixed PRINT bind slot: {prefixed:?}"
+    );
+
+    let colon_prefixed = print_command_bind_suggestions_for_test(
+        "VAR v_rc REFCURSOR;\nPRINT :v__CODEX_CURSOR__",
+        &["V_SESSION"],
+    );
+    assert_has_case_insensitive(&colon_prefixed, "v_rc");
+    assert_has_case_insensitive(&colon_prefixed, "V_SESSION");
+}
+
+#[test]
+fn colon_bind_name_slot_suggests_only_binds() {
+    for sql in [
+        "VAR v_rc REFCURSOR;\nBEGIN proc(:__CODEX_CURSOR__); END;",
+        "VAR v_rc REFCURSOR;\nEXEC proc(:__CODEX_CURSOR__)",
+        "VAR v_rc REFCURSOR;\nSELECT * FROM emp WHERE empno = :__CODEX_CURSOR__",
+    ] {
+        let suggestions = print_command_bind_suggestions_for_test(sql, &["V_SESSION"]);
+        assert_has_case_insensitive(&suggestions, "v_rc");
+        assert_has_case_insensitive(&suggestions, "V_SESSION");
+        for noise in ["V_TABLE", "V_PROC", "EMP", "SELECT"] {
+            assert!(
+                !suggestions.iter().any(|value| value.eq_ignore_ascii_case(noise)),
+                "{noise} leaked into colon bind slot for `{sql}`: {suggestions:?}"
+            );
+        }
+    }
+
+    let prefixed = print_command_bind_suggestions_for_test(
+        "VAR v_rc REFCURSOR;\nBEGIN proc(:v__CODEX_CURSOR__); END;",
+        &["V_SESSION"],
+    );
+    assert_has_case_insensitive(&prefixed, "v_rc");
+    assert_has_case_insensitive(&prefixed, "V_SESSION");
+    assert!(
+        !prefixed.iter().any(|value| value.eq_ignore_ascii_case("V_TABLE")),
+        "base catalog leaked into prefixed colon bind slot: {prefixed:?}"
+    );
+}
+
 #[test]
 fn local_symbol_suggestions_filter_by_expected_operand_type_when_type_known() {
     let sql_with_cursor = r#"DECLARE
@@ -28748,6 +29035,19 @@ fn statement_start_filters_keyword_dump_to_statement_verbs() {
         }
         for noise in ["SAMPLE", "SEQUENCE"] {
             assert!(!has(&s, noise), "{noise} leaked at `{sql}`: {s:?}");
+        }
+    }
+
+    for sql in ["|", "SELECT 1 FROM dual; |"] {
+        let suggestions = kw(sql);
+        for keyword in [
+            "SELECT", "CREATE", "ALTER", "DROP", "COMMIT", "GRANT", "EXEC", "VARIABLE", "VAR",
+            "PRINT", "DESC",
+        ] {
+            assert!(
+                has(&suggestions, keyword),
+                "{keyword} was suppressed at a blank top-level statement start for `{sql}`: {suggestions:?}"
+            );
         }
     }
 

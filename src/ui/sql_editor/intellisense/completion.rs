@@ -1497,6 +1497,16 @@ impl SqlEditorWidget {
                 !snapshot.prefix.is_empty(),
                 Some(snapshot.preferred_db_type),
             );
+        let at_tool_bind_name_slot = qualifier.is_none()
+            && Self::cursor_is_at_tool_bind_name_slot_for_context(
+                deep_ctx,
+                !snapshot.prefix.is_empty(),
+            );
+        let at_tool_no_sql_argument_slot = qualifier.is_none()
+            && Self::cursor_is_at_tool_no_sql_argument_slot_for_context(
+                deep_ctx,
+                !snapshot.prefix.is_empty(),
+            );
         // A data-type slot is the one keyword-only slot that still admits an
         // identifier — a user-defined TYPE object (`CAST(x AS my_type)`,
         // `col my_type`). It is handled specially below so types survive while
@@ -1717,6 +1727,7 @@ impl SqlEditorWidget {
         };
         let expected_keyword_suggestions = if qualifier.is_none()
             && !restrict_to_relation_columns
+            && !at_tool_bind_name_slot
             && !matches!(context, SqlContext::VariableName | SqlContext::BindValue)
         {
             Self::collect_expected_keyword_suggestions_with_expression_context(
@@ -1730,6 +1741,8 @@ impl SqlEditorWidget {
         };
         let expected_object_suggestions = if qualifier.is_none()
             && !restrict_to_relation_columns
+            && !at_tool_bind_name_slot
+            && !at_tool_no_sql_argument_slot
             && !matches!(
                 context,
                 SqlContext::VariableName
@@ -1949,6 +1962,8 @@ impl SqlEditorWidget {
             local_rowtype_member_suggestions
         } else if !qualified_member_suggestions.is_empty() {
             qualified_member_suggestions
+        } else if at_tool_bind_name_slot || at_tool_no_sql_argument_slot {
+            Vec::new()
         } else if replace_table_context_with_expected_objects {
             expected_object_suggestions.clone()
         } else if at_data_type_position {
@@ -2051,6 +2066,8 @@ impl SqlEditorWidget {
         // name slot (`= :|`) is likewise not a wildcard position.
         let wildcard_suggestions = if at_keyword_only_identifier_slot
             || at_keyword_only_slot
+            || at_tool_bind_name_slot
+            || at_tool_no_sql_argument_slot
             || (qualifier.is_none()
                 && (expr_keyword_ctx.follows_operand == Some(true)
                     || expr_keyword_ctx.at_bind_variable_name))
@@ -2087,6 +2104,9 @@ impl SqlEditorWidget {
                 || restrict_to_relation_columns
                 || at_keyword_only_identifier_slot
                 || at_keyword_only_slot
+                || at_tool_bind_name_slot
+                || at_tool_no_sql_argument_slot
+                || expr_keyword_ctx.at_bind_variable_name
                 || expr_keyword_ctx.expected_operand_type.is_some()
             {
                 Vec::new()
@@ -2099,7 +2119,7 @@ impl SqlEditorWidget {
             matches!(context, SqlContext::TableName),
             qualifier.is_some(),
         );
-        let mut suggestions = if !local_suggestions.is_empty() {
+        let mut suggestions = if !local_suggestions.is_empty() && !at_tool_no_sql_argument_slot {
             Self::prepend_local_symbol_suggestions(suggestions, local_suggestions)
         } else {
             suggestions
@@ -2327,7 +2347,7 @@ impl SqlEditorWidget {
             return Vec::new();
         }
 
-        if matches!(context, SqlContext::TableName) {
+        if matches!(context, SqlContext::TableName) && expr_keyword_ctx.statement_start.is_none() {
             return data.get_relation_suggestions(prefix);
         }
 
@@ -2487,9 +2507,6 @@ impl SqlEditorWidget {
     }
 
     fn append_top_level_statement_head_suggestions(suggestions: &mut Vec<String>, prefix: &str) {
-        if prefix.is_empty() {
-            return;
-        }
         let mut seen: HashSet<String> = suggestions
             .iter()
             .map(|suggestion| suggestion.to_ascii_uppercase())
@@ -3051,18 +3068,21 @@ impl SqlEditorWidget {
         // slice would look like a fresh statement (no preceding token) even though
         // the real previous token (`UNION`) marks a query continuation, not a
         // statement boundary.
-        let statement_start =
-            if matches!(sql_context_for_phase(deep_ctx.phase), SqlContext::General) {
-                let full_tokens = deep_ctx.statement_tokens.as_ref();
-                let full_end = Self::expected_suggestion_context_end(
-                    full_tokens,
-                    deep_ctx.cursor_token_len,
-                    exclude_current_identifier_chain,
-                );
-                Self::cursor_statement_start_context(full_tokens, full_end)
-            } else {
-                None
-            };
+        let full_tokens = deep_ctx.statement_tokens.as_ref();
+        let full_end = Self::expected_suggestion_context_end(
+            full_tokens,
+            deep_ctx.cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        let statement_start = match Self::cursor_statement_start_context(full_tokens, full_end) {
+            Some(StatementStartContext::TopLevel) => Some(StatementStartContext::TopLevel),
+            Some(StatementStartContext::Plsql(policy))
+                if matches!(sql_context_for_phase(deep_ctx.phase), SqlContext::General) =>
+            {
+                Some(StatementStartContext::Plsql(policy))
+            }
+            _ => None,
+        };
         ExpressionKeywordContext {
             construct_continuation_keywords,
             in_order_by,
@@ -8832,6 +8852,112 @@ impl SqlEditorWidget {
             && matches!(toks.get(last), Some(SqlToken::Word(word)) if !Self::token_is_language_keyword(&word.to_ascii_uppercase()))
     }
 
+    fn cursor_is_at_tool_bind_name_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::cursor_is_at_tool_bind_name_slot(tokens, end)
+    }
+
+    fn cursor_is_at_tool_bind_name_slot(tokens: &[SqlToken], end: usize) -> bool {
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        let Some(last) = toks.len().checked_sub(1) else {
+            return false;
+        };
+        let is_print_at_head = |idx: usize| Self::tool_command_word_at_statement_head(&toks, idx, &["PRINT"]);
+
+        is_print_at_head(last)
+            || (matches!(toks.get(last), Some(SqlToken::Symbol(sym)) if sym == ":")
+                && last.checked_sub(1).is_some_and(is_print_at_head))
+    }
+
+    fn cursor_is_at_tool_no_sql_argument_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::cursor_is_at_tool_no_sql_argument_slot(tokens, end)
+    }
+
+    fn cursor_is_at_tool_no_sql_argument_slot(tokens: &[SqlToken], end: usize) -> bool {
+        const FREEFORM_TOOL_ARGUMENT_COMMANDS: &[&str] = &[
+            "DEFINE",
+            "UNDEFINE",
+            "ACCEPT",
+            "BREAK",
+            "CLEAR",
+            "COLUMN",
+            "COMPUTE",
+            "DELIMITER",
+            "PROMPT",
+            "SPOOL",
+            "STORE",
+            "GET",
+            "SAVE",
+            "START",
+            "CONNECT",
+            "CONN",
+            "PASSWORD",
+            "PASSW",
+            "PASSWO",
+            "PASSWOR",
+            "HOST",
+            "PAUSE",
+            "SET",
+            "SHOW",
+            "SOURCE",
+            "WHENEVER",
+            "TTITLE",
+            "BTITLE",
+            "REPHEADER",
+            "REPFOOTER",
+            "USE",
+        ];
+
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        toks.iter().enumerate().rev().any(|(idx, token)| {
+            let SqlToken::Word(word) = token else {
+                return false;
+            };
+            FREEFORM_TOOL_ARGUMENT_COMMANDS
+                .iter()
+                .any(|command| word.eq_ignore_ascii_case(command))
+                && Self::tool_command_word_at_statement_head(
+                    &toks,
+                    idx,
+                    FREEFORM_TOOL_ARGUMENT_COMMANDS,
+                )
+                && !toks.iter().skip(idx + 1).any(|token| {
+                    matches!(token, SqlToken::Symbol(sym) if sym == ";")
+                })
+        })
+    }
+
+    fn tool_command_word_at_statement_head(
+        toks: &[&SqlToken],
+        idx: usize,
+        commands: &[&str],
+    ) -> bool {
+        matches!(
+            toks.get(idx),
+            Some(SqlToken::Word(word))
+                if commands.iter().any(|command| word.eq_ignore_ascii_case(command))
+        ) && (idx == 0 || matches!(toks.get(idx - 1), Some(SqlToken::Symbol(sym)) if sym == ";"))
+    }
+
     /// True when the cursor is at the type slot of a JSON function's `RETURNING`
     /// clause — `JSON_VALUE(col, '$.a' RETURNING |)`, `JSON_QUERY(... RETURNING |)`,
     /// etc. (Oracle and MySQL both accept a data type here, the same grammar as
@@ -12675,6 +12801,225 @@ impl SqlEditorWidget {
         Self::expected_locking_clause_keyword_candidates(tokens, end).is_some()
     }
 
+    fn expected_tool_command_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> Option<&'static [&'static str]> {
+        const NONE: &[&str] = &[];
+        const ACCEPT_AFTER_NAME: &[&str] = &["PROMPT"];
+        const BREAK_HEAD: &[&str] = &["ON", "OFF"];
+        const CLEAR_HEAD: &[&str] = &["BREAKS", "COMPUTES"];
+        const CLEAR_CONNECTOR: &[&str] = &["CLEAR"];
+        const CLEAR_AFTER_CONNECTOR_BREAKS: &[&str] = &["BREAKS"];
+        const CLEAR_AFTER_CONNECTOR_COMPUTES: &[&str] = &["COMPUTES"];
+        const COLUMN_AFTER_NAME: &[&str] = &["NEW_VALUE"];
+        const COMPUTE_HEAD: &[&str] = &["SUM", "COUNT", "OFF"];
+        const COMPUTE_AFTER_AGGREGATE: &[&str] = &["OF"];
+        const COMPUTE_AFTER_OF_COLUMN: &[&str] = &["ON"];
+        const SET_HEAD: &[&str] = &[
+            "AUTOCOMMIT",
+            "COLSEP",
+            "DEFINE",
+            "ECHO",
+            "ERRORCONTINUE",
+            "FEEDBACK",
+            "HEADING",
+            "LINESIZE",
+            "NULL",
+            "PAGESIZE",
+            "SCAN",
+            "SERVEROUTPUT",
+            "SQLBLANKLINES",
+            "TAB",
+            "TIMING",
+            "TRIMOUT",
+            "TRIMSPOOL",
+            "VERIFY",
+        ];
+        const SET_ON_OFF: &[&str] = &["ON", "OFF"];
+        const SET_AUTOCOMMIT_VALUES: &[&str] = &["ON", "OFF", "TRUE", "FALSE"];
+        const SET_SERVEROUTPUT_AFTER_ON: &[&str] = &["SIZE"];
+        const SET_SERVEROUTPUT_AFTER_SIZE: &[&str] = &["UNLIMITED"];
+        const SHOW_HEAD: &[&str] = &[
+            "USER",
+            "ALL",
+            "ERRORS",
+            "DATABASES",
+            "TABLES",
+            "COLUMNS",
+            "CREATE",
+            "PROCESSLIST",
+            "VARIABLES",
+            "STATUS",
+            "WARNINGS",
+        ];
+        const SHOW_ERRORS_TYPES: &[&str] = &[
+            "PROCEDURE",
+            "FUNCTION",
+            "PACKAGE",
+            "TYPE",
+            "TRIGGER",
+            "VIEW",
+        ];
+        const SHOW_ERRORS_BODY: &[&str] = &["BODY"];
+        const SHOW_COLUMNS_AFTER_TOPIC: &[&str] = &["FROM", "IN"];
+        const SHOW_CREATE_AFTER_TOPIC: &[&str] = &["TABLE"];
+        const SHOW_LIKE_AFTER_TOPIC: &[&str] = &["LIKE"];
+        const SPOOL_HEAD: &[&str] = &["OFF", "APPEND"];
+        const SPOOL_AFTER_PATH: &[&str] = &["APPEND"];
+        const WHENEVER_HEAD: &[&str] = &["SQLERROR", "OSERROR"];
+        const WHENEVER_ACTION: &[&str] = &["EXIT", "CONTINUE"];
+
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        let (command_idx, command) = toks.iter().enumerate().rev().find_map(|(idx, token)| {
+            let SqlToken::Word(word) = token else {
+                return None;
+            };
+            let upper = word.to_ascii_uppercase();
+            Self::tool_command_word_at_statement_head(&toks, idx, &[upper.as_str()])
+                .then_some((idx, upper))
+        })?;
+        if toks.iter().skip(command_idx + 1).any(|token| {
+            matches!(token, SqlToken::Symbol(sym) if sym == ";")
+        }) {
+            return None;
+        }
+
+        let tail_tokens = &toks[command_idx + 1..];
+        let tail_words: Vec<String> = tail_tokens
+            .iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                _ => None,
+            })
+            .collect();
+        let tail_has_non_comment = !tail_tokens
+            .iter()
+            .all(|token| matches!(token, SqlToken::Comment(_)));
+
+        match command.as_str() {
+            "ACCEPT" => match tail_words.as_slice() {
+                [] => Some(NONE),
+                [name] if name != "PROMPT" => Some(ACCEPT_AFTER_NAME),
+                [name, last] if name != "PROMPT" && last != "PROMPT" => Some(ACCEPT_AFTER_NAME),
+                _ => Some(NONE),
+            },
+            "BREAK" => match tail_words.as_slice() {
+                [] => Some(BREAK_HEAD),
+                [first] if first == "ON" => Some(NONE),
+                _ => Some(NONE),
+            },
+            "CLEAR" => match tail_words.as_slice() {
+                [] => Some(CLEAR_HEAD),
+                [first] if matches!(first.as_str(), "BREAKS" | "COMPUTES") => Some(CLEAR_CONNECTOR),
+                [first, second]
+                    if second == "CLEAR" && first == "BREAKS" =>
+                {
+                    Some(CLEAR_AFTER_CONNECTOR_COMPUTES)
+                }
+                [first, second]
+                    if second == "CLEAR" && first == "COMPUTES" =>
+                {
+                    Some(CLEAR_AFTER_CONNECTOR_BREAKS)
+                }
+                _ => Some(NONE),
+            },
+            "COLUMN" => match tail_words.as_slice() {
+                [] => Some(NONE),
+                [first] if first != "NEW_VALUE" => Some(COLUMN_AFTER_NAME),
+                _ => Some(NONE),
+            },
+            "COMPUTE" => match tail_words.as_slice() {
+                [] => Some(COMPUTE_HEAD),
+                [first] if matches!(first.as_str(), "SUM" | "COUNT") => Some(COMPUTE_AFTER_AGGREGATE),
+                [first, second, _]
+                    if matches!(first.as_str(), "SUM" | "COUNT") && second == "OF" =>
+                {
+                    Some(COMPUTE_AFTER_OF_COLUMN)
+                }
+                _ => Some(NONE),
+            },
+            "SET" => match tail_words.as_slice() {
+                [] => Some(SET_HEAD),
+                [option]
+                    if matches!(
+                        option.as_str(),
+                        "ECHO"
+                            | "ERRORCONTINUE"
+                            | "FEEDBACK"
+                            | "HEADING"
+                            | "SCAN"
+                            | "SQLBLANKLINES"
+                            | "TAB"
+                            | "TIMING"
+                            | "TRIMOUT"
+                            | "TRIMSPOOL"
+                            | "VERIFY"
+                    ) =>
+                {
+                    Some(SET_ON_OFF)
+                }
+                [option] if option == "AUTOCOMMIT" => Some(SET_AUTOCOMMIT_VALUES),
+                [option] if option == "DEFINE" => Some(SET_ON_OFF),
+                [option] if option == "SERVEROUTPUT" => Some(SET_ON_OFF),
+                [option, value] if option == "SERVEROUTPUT" && value == "ON" => {
+                    Some(SET_SERVEROUTPUT_AFTER_ON)
+                }
+                [option, value, size] if option == "SERVEROUTPUT" && value == "ON" && size == "SIZE" => {
+                    Some(SET_SERVEROUTPUT_AFTER_SIZE)
+                }
+                _ => Some(NONE),
+            },
+            "SHOW" => match tail_words.as_slice() {
+                [] => Some(SHOW_HEAD),
+                [topic] if topic == "ERRORS" => Some(SHOW_ERRORS_TYPES),
+                [topic, object_type]
+                    if topic == "ERRORS" && matches!(object_type.as_str(), "PACKAGE" | "TYPE") =>
+                {
+                    Some(SHOW_ERRORS_BODY)
+                }
+                [topic] if topic == "COLUMNS" => Some(SHOW_COLUMNS_AFTER_TOPIC),
+                [topic, _table] if topic == "COLUMNS" => Some(SHOW_COLUMNS_AFTER_TOPIC),
+                [topic, source_kw, _table]
+                    if topic == "COLUMNS" && matches!(source_kw.as_str(), "FROM" | "IN") =>
+                {
+                    Some(SHOW_COLUMNS_AFTER_TOPIC)
+                }
+                [topic] if topic == "CREATE" => Some(SHOW_CREATE_AFTER_TOPIC),
+                [topic] if matches!(topic.as_str(), "VARIABLES" | "STATUS") => {
+                    Some(SHOW_LIKE_AFTER_TOPIC)
+                }
+                _ => Some(NONE),
+            },
+            "SPOOL" => {
+                if tail_words.is_empty() {
+                    if tail_has_non_comment {
+                        Some(SPOOL_AFTER_PATH)
+                    } else {
+                        Some(SPOOL_HEAD)
+                    }
+                } else if tail_words
+                    .iter()
+                    .any(|word| matches!(word.as_str(), "OFF" | "APPEND"))
+                {
+                    Some(NONE)
+                } else {
+                    Some(SPOOL_AFTER_PATH)
+                }
+            }
+            "WHENEVER" => match tail_words.as_slice() {
+                [] => Some(WHENEVER_HEAD),
+                [first] if matches!(first.as_str(), "SQLERROR" | "OSERROR") => Some(WHENEVER_ACTION),
+                _ => Some(NONE),
+            },
+            "DEFINE" | "UNDEFINE" | "DELIMITER" | "PROMPT" | "STORE" | "GET" | "SAVE"
+            | "START" | "SOURCE" | "USE" | "CONNECT" | "CONN" | "PASSWORD" | "PASSW"
+            | "PASSWO" | "PASSWOR" | "HOST" | "PAUSE" | "TTITLE" | "BTITLE"
+            | "REPHEADER" | "REPFOOTER" => Some(NONE),
+            _ => None,
+        }
+    }
+
     #[cfg(test)]
     fn collect_expected_keyword_suggestions(
         prefix: &str,
@@ -12692,7 +13037,7 @@ impl SqlEditorWidget {
         db_type: Option<crate::db::DatabaseType>,
         expr_keyword_ctx: Option<ExpressionKeywordContext>,
     ) -> Vec<String> {
-        const TOP_LEVEL_KEYWORDS: &[&str] = &[
+        const GENERIC_TOP_LEVEL_KEYWORDS: &[&str] = &[
             "SELECT", "WITH", "INSERT", "UPDATE", "DELETE", "MERGE", "CREATE", "ALTER", "DROP",
             "BEGIN", "DECLARE", "CALL", "VALUES",
         ];
@@ -12712,6 +13057,10 @@ impl SqlEditorWidget {
             !prefix.is_empty(),
         ) {
             return Vec::new();
+        }
+        if let Some(candidates) = Self::expected_tool_command_keyword_candidates(tokens, context_end)
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
         }
         // A PL/SQL exception-handler `WHEN` names an exception. Offer the Oracle
         // predefined exceptions (and `OTHERS`) here; the user's own declared
@@ -12953,7 +13302,11 @@ impl SqlEditorWidget {
             // token at all; the operator/clause continuations valid after the
             // operand still arrive through the expression-keyword allowlist.
             [] if Self::meaningful_tokens_before(tokens, context_end).is_empty() => {
-                TOP_LEVEL_KEYWORDS
+                if Self::top_level_statement_heads_include_sqlplus_commands(db_type) {
+                    crate::sql_text::statement_head_keywords()
+                } else {
+                    GENERIC_TOP_LEVEL_KEYWORDS
+                }
             }
             [] => &[],
             [.., last]
