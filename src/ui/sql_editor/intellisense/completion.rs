@@ -205,6 +205,57 @@ struct ExpressionKeywordContext {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CompletionSourcePolicy {
+    restrict_to_relation_columns: bool,
+    at_keyword_only_identifier_slot: bool,
+    at_keyword_only_slot: bool,
+    at_tool_bind_name_slot: bool,
+    suppress_free_sql_catalog_argument_sources: bool,
+    suppress_expected_keyword_sources: bool,
+}
+
+impl CompletionSourcePolicy {
+    fn new(
+        restrict_to_relation_columns: bool,
+        at_keyword_only_identifier_slot: bool,
+        at_keyword_only_slot: bool,
+        at_tool_bind_name_slot: bool,
+        at_tool_no_sql_argument_slot: bool,
+        expr_keyword_ctx: ExpressionKeywordContext,
+    ) -> Self {
+        let suppress_free_sql_catalog_argument_sources = at_tool_no_sql_argument_slot
+            || expr_keyword_ctx.in_mysql_help_topic_argument
+            || expr_keyword_ctx.at_mysql_explain_schema_name;
+        let suppress_expected_keyword_sources = at_tool_bind_name_slot
+            || expr_keyword_ctx.in_mysql_help_topic_argument
+            || expr_keyword_ctx.at_mysql_explain_schema_name;
+        Self {
+            restrict_to_relation_columns,
+            at_keyword_only_identifier_slot,
+            at_keyword_only_slot,
+            at_tool_bind_name_slot,
+            suppress_free_sql_catalog_argument_sources,
+            suppress_expected_keyword_sources,
+        }
+    }
+
+    fn suppresses_context_names(
+        self,
+        context: SqlContext,
+        expr_keyword_ctx: ExpressionKeywordContext,
+    ) -> bool {
+        matches!(context, SqlContext::VariableName | SqlContext::BindValue)
+            || self.restrict_to_relation_columns
+            || self.at_keyword_only_identifier_slot
+            || self.at_keyword_only_slot
+            || self.at_tool_bind_name_slot
+            || self.suppress_free_sql_catalog_argument_sources
+            || expr_keyword_ctx.at_bind_variable_name
+            || expr_keyword_ctx.expected_operand_type.is_some()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MysqlExplainIntoSlot {
     VariableName,
     AfterVariable,
@@ -1773,6 +1824,14 @@ impl SqlEditorWidget {
             });
         let mut effective_expr_keyword_ctx = expr_keyword_ctx;
         effective_expr_keyword_ctx.expected_operand_type = effective_expected_operand_type;
+        let source_policy = CompletionSourcePolicy::new(
+            restrict_to_relation_columns,
+            at_keyword_only_identifier_slot,
+            at_keyword_only_slot,
+            at_tool_bind_name_slot,
+            at_tool_no_sql_argument_slot,
+            effective_expr_keyword_ctx,
+        );
         if let Some(expected_type) = effective_expected_operand_type {
             Self::filter_local_symbol_suggestions_by_expected_operand_type(
                 &mut local_suggestions,
@@ -1847,9 +1906,7 @@ impl SqlEditorWidget {
         };
         let expected_keyword_suggestions = if qualifier.is_none()
             && !restrict_to_relation_columns
-            && !at_tool_bind_name_slot
-            && !effective_expr_keyword_ctx.in_mysql_help_topic_argument
-            && !effective_expr_keyword_ctx.at_mysql_explain_schema_name
+            && !source_policy.suppress_expected_keyword_sources
             && !matches!(context, SqlContext::VariableName | SqlContext::BindValue)
         {
             Self::collect_expected_keyword_suggestions_with_expression_context(
@@ -1864,9 +1921,7 @@ impl SqlEditorWidget {
         let expected_object_suggestions = if qualifier.is_none()
             && !restrict_to_relation_columns
             && !at_tool_bind_name_slot
-            && !at_tool_no_sql_argument_slot
-            && !effective_expr_keyword_ctx.in_mysql_help_topic_argument
-            && !effective_expr_keyword_ctx.at_mysql_explain_schema_name
+            && !source_policy.suppress_free_sql_catalog_argument_sources
             && !matches!(
                 context,
                 SqlContext::VariableName
@@ -2078,9 +2133,7 @@ impl SqlEditorWidget {
         } else if !qualified_member_suggestions.is_empty() {
             qualified_member_suggestions
         } else if at_tool_bind_name_slot
-            || at_tool_no_sql_argument_slot
-            || effective_expr_keyword_ctx.in_mysql_help_topic_argument
-            || effective_expr_keyword_ctx.at_mysql_explain_schema_name
+            || source_policy.suppress_free_sql_catalog_argument_sources
         {
             Vec::new()
         } else if replace_table_context_with_expected_objects {
@@ -2186,9 +2239,7 @@ impl SqlEditorWidget {
         let wildcard_suggestions = if at_keyword_only_identifier_slot
             || at_keyword_only_slot
             || at_tool_bind_name_slot
-            || at_tool_no_sql_argument_slot
-            || effective_expr_keyword_ctx.in_mysql_help_topic_argument
-            || effective_expr_keyword_ctx.at_mysql_explain_schema_name
+            || source_policy.suppress_free_sql_catalog_argument_sources
             || (qualifier.is_none()
                 && (expr_keyword_ctx.follows_operand == Some(true)
                     || expr_keyword_ctx.at_bind_variable_name))
@@ -2220,22 +2271,13 @@ impl SqlEditorWidget {
                 )
             };
         }
-        let context_name_suggestions =
-            if matches!(context, SqlContext::VariableName | SqlContext::BindValue)
-                || restrict_to_relation_columns
-                || at_keyword_only_identifier_slot
-                || at_keyword_only_slot
-                || at_tool_bind_name_slot
-                || at_tool_no_sql_argument_slot
-                || effective_expr_keyword_ctx.in_mysql_help_topic_argument
-                || effective_expr_keyword_ctx.at_mysql_explain_schema_name
-                || expr_keyword_ctx.at_bind_variable_name
-                || expr_keyword_ctx.expected_operand_type.is_some()
-            {
-                Vec::new()
-            } else {
-                Self::collect_context_name_suggestions(&snapshot.prefix, deep_ctx, context)
-            };
+        let context_name_suggestions = Self::collect_context_name_suggestions_for_completion(
+            &snapshot.prefix,
+            deep_ctx,
+            context,
+            source_policy,
+            effective_expr_keyword_ctx,
+        );
         let suggestions = Self::maybe_merge_suggestions_with_context_aliases(
             suggestions,
             context_name_suggestions,
@@ -2243,9 +2285,7 @@ impl SqlEditorWidget {
             qualifier.is_some(),
         );
         let mut suggestions = if !local_suggestions.is_empty()
-            && !at_tool_no_sql_argument_slot
-            && !effective_expr_keyword_ctx.in_mysql_help_topic_argument
-            && !effective_expr_keyword_ctx.at_mysql_explain_schema_name
+            && !source_policy.suppress_free_sql_catalog_argument_sources
         {
             Self::prepend_local_symbol_suggestions(suggestions, local_suggestions)
         } else {
@@ -21820,6 +21860,20 @@ impl SqlEditorWidget {
                 .get(&key)
                 .is_some_and(|deps| deps.iter().any(|dep| table_is_loading(data, dep)))
         })
+    }
+
+    fn collect_context_name_suggestions_for_completion(
+        prefix: &str,
+        deep_ctx: &intellisense_context::CursorContext,
+        context: SqlContext,
+        source_policy: CompletionSourcePolicy,
+        expr_keyword_ctx: ExpressionKeywordContext,
+    ) -> Vec<String> {
+        if source_policy.suppresses_context_names(context, expr_keyword_ctx) {
+            Vec::new()
+        } else {
+            Self::collect_context_name_suggestions(prefix, deep_ctx, context)
+        }
     }
 
     fn collect_context_name_suggestions(

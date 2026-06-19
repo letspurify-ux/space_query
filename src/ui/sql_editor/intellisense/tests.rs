@@ -9618,7 +9618,17 @@ fn print_command_bind_suggestions_for_test(
         SqlEditorWidget::cursor_is_at_tool_bind_name_slot_for_context(&ctx, !prefix.is_empty());
     let at_tool_no_sql_argument_slot =
         SqlEditorWidget::cursor_is_at_tool_no_sql_argument_slot_for_context(&ctx, !prefix.is_empty());
-    let mut suggestions = if at_tool_bind_name_slot || at_tool_no_sql_argument_slot {
+    let source_policy = CompletionSourcePolicy::new(
+        false,
+        false,
+        false,
+        at_tool_bind_name_slot,
+        at_tool_no_sql_argument_slot,
+        expr_keyword_ctx,
+    );
+    let mut suggestions = if at_tool_bind_name_slot
+        || source_policy.suppress_free_sql_catalog_argument_sources
+    {
         Vec::new()
     } else {
         SqlEditorWidget::base_suggestions_for_context(
@@ -9633,7 +9643,8 @@ fn print_command_bind_suggestions_for_test(
             expr_keyword_ctx,
         )
     };
-    if !at_tool_bind_name_slot && !matches!(context, SqlContext::VariableName | SqlContext::BindValue)
+    if !source_policy.suppress_expected_keyword_sources
+        && !matches!(context, SqlContext::VariableName | SqlContext::BindValue)
     {
         let expected_keywords =
             SqlEditorWidget::collect_expected_keyword_suggestions_with_expression_context(
@@ -9650,24 +9661,23 @@ fn print_command_bind_suggestions_for_test(
             );
         }
     }
-    if !local_suggestions.is_empty() && !at_tool_no_sql_argument_slot {
+    if !local_suggestions.is_empty() && !source_policy.suppress_free_sql_catalog_argument_sources {
         suggestions =
             SqlEditorWidget::prepend_local_symbol_suggestions(suggestions, local_suggestions);
     }
-    if !(matches!(context, SqlContext::VariableName | SqlContext::BindValue)
-        || at_tool_bind_name_slot
-        || at_tool_no_sql_argument_slot
-        || expr_keyword_ctx.at_bind_variable_name
-        || expr_keyword_ctx.expected_operand_type.is_some())
-    {
-        let context_names = SqlEditorWidget::collect_context_name_suggestions(&prefix, &ctx, context);
-        suggestions = SqlEditorWidget::maybe_merge_suggestions_with_context_aliases(
-            suggestions,
-            context_names,
-            matches!(context, SqlContext::TableName),
-            false,
-        );
-    }
+    let context_names = SqlEditorWidget::collect_context_name_suggestions_for_completion(
+        &prefix,
+        &ctx,
+        context,
+        source_policy,
+        expr_keyword_ctx,
+    );
+    suggestions = SqlEditorWidget::maybe_merge_suggestions_with_context_aliases(
+        suggestions,
+        context_names,
+        matches!(context, SqlContext::TableName),
+        false,
+    );
     suggestions
 }
 
@@ -10615,6 +10625,152 @@ END;"#
         &block("UPDATE emp SET empno = 1 RETURNING empno, | INTO v_num, v_date;"),
         "HIREDATE",
         &["ENAME", "EMPNO"],
+    );
+}
+
+#[test]
+fn into_source_slots_suppress_context_names_when_target_type_is_known() {
+    let suggestions_for = |sql_with_cursor: &str| {
+        let cursor = sql_with_cursor.find('|').expect("cursor");
+        let sql = sql_with_cursor.replace('|', "");
+        let (routine_cache, expanded) =
+            SqlEditorWidget::build_routine_symbol_cache_bundle_for_test(&sql, cursor);
+        let analysis = SqlEditorWidget::build_intellisense_analysis_from_routine_cache(
+            &routine_cache,
+            expanded.cursor_in_statement,
+        );
+        let deep_ctx = analysis.context.as_ref();
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+        let context = SqlEditorWidget::classify_intellisense_context(
+            deep_ctx,
+            deep_ctx.statement_tokens.as_ref(),
+        );
+        let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, deep_ctx);
+        let column_scope = (!column_tables.is_empty()).then(|| column_tables.clone());
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["EMP".to_string()];
+        data.set_columns_for_table(
+            "EMP",
+            vec![
+                "ENAME".to_string(),
+                "EMPNO".to_string(),
+                "HIREDATE".to_string(),
+            ],
+        );
+        data.set_column_meta_for_table(
+            "EMP",
+            HashMap::from([
+                (
+                    "ENAME".to_string(),
+                    ColumnMeta {
+                        type_display: "VARCHAR2(10)".to_string(),
+                        nullable: true,
+                        is_primary_key: false,
+                    },
+                ),
+                (
+                    "EMPNO".to_string(),
+                    ColumnMeta {
+                        type_display: "NUMBER(4)".to_string(),
+                        nullable: false,
+                        is_primary_key: true,
+                    },
+                ),
+                (
+                    "HIREDATE".to_string(),
+                    ColumnMeta {
+                        type_display: "DATE".to_string(),
+                        nullable: true,
+                        is_primary_key: false,
+                    },
+                ),
+            ]),
+        );
+        data.rebuild_indices();
+        let mut expr_ctx = SqlEditorWidget::expression_keyword_context(
+            deep_ctx,
+            &data,
+            &column_tables,
+            !prefix.is_empty(),
+            Some(crate::db::DatabaseType::Oracle),
+        );
+        expr_ctx.expected_operand_type = expr_ctx.expected_operand_type.or_else(|| {
+            SqlEditorWidget::current_local_into_target_expected_operand_type(
+                deep_ctx.statement_tokens.as_ref(),
+                deep_ctx.cursor_token_len,
+                expanded.cursor_in_statement,
+                &analysis,
+            )
+        });
+        let at_keyword_only_slot =
+            SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot_for_db(
+                deep_ctx,
+                !prefix.is_empty(),
+                Some(crate::db::DatabaseType::Oracle),
+            );
+        let at_keyword_only_identifier_slot =
+            SqlEditorWidget::cursor_is_at_identifier_suppressing_keyword_slot_for_context(
+                deep_ctx,
+                !prefix.is_empty(),
+                Some(crate::db::DatabaseType::Oracle),
+            );
+        let mut suggestions = if at_keyword_only_slot {
+            Vec::new()
+        } else {
+            SqlEditorWidget::base_suggestions_for_context(
+                &mut data,
+                &prefix,
+                None,
+                column_scope.as_deref(),
+                matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
+                context,
+                false,
+                Some(crate::db::DatabaseType::Oracle),
+                expr_ctx,
+            )
+        };
+        let context_names = SqlEditorWidget::collect_context_name_suggestions_for_completion(
+            &prefix,
+            deep_ctx,
+            context,
+            CompletionSourcePolicy::new(
+                false,
+                at_keyword_only_identifier_slot,
+                at_keyword_only_slot,
+                false,
+                false,
+                expr_ctx,
+            ),
+            expr_ctx,
+        );
+        suggestions = SqlEditorWidget::maybe_merge_suggestions_with_context_aliases(
+            suggestions,
+            context_names,
+            matches!(context, SqlContext::TableName),
+            false,
+        );
+        suggestions
+    };
+    let has = |values: &[String], name: &str| values.iter().any(|value| value.eq_ignore_ascii_case(name));
+
+    let suggestions = suggestions_for(
+        r#"DECLARE
+    v_num NUMBER;
+BEGIN
+    SELECT e| INTO v_num FROM emp e;
+END;"#,
+    );
+    assert!(
+        has(&suggestions, "EMPNO"),
+        "numeric INTO source lost the matching column: {suggestions:?}"
+    );
+    assert!(
+        !has(&suggestions, "ENAME") && !has(&suggestions, "HIREDATE"),
+        "numeric INTO source leaked non-numeric columns: {suggestions:?}"
+    );
+    assert!(
+        !has(&suggestions, "e"),
+        "row-source alias leaked into typed INTO source slot: {suggestions:?}"
     );
 }
 
@@ -28063,16 +28219,20 @@ fn typed_emp_suggestions_for_db(
         Some(db_type),
         expr_keyword_ctx,
     );
-    let context_name_suggestions =
-        if matches!(context, SqlContext::VariableName | SqlContext::BindValue)
-            || at_keyword_only_identifier_slot
-            || at_keyword_only_slot
-            || expr_keyword_ctx.expected_operand_type.is_some()
-        {
-            Vec::new()
-        } else {
-            SqlEditorWidget::collect_context_name_suggestions(&prefix, &ctx, context)
-        };
+    let context_name_suggestions = SqlEditorWidget::collect_context_name_suggestions_for_completion(
+        &prefix,
+        &ctx,
+        context,
+        CompletionSourcePolicy::new(
+            false,
+            at_keyword_only_identifier_slot,
+            at_keyword_only_slot,
+            false,
+            false,
+            expr_keyword_ctx,
+        ),
+        expr_keyword_ctx,
+    );
     suggestions = SqlEditorWidget::maybe_merge_suggestions_with_context_aliases(
         suggestions,
         context_name_suggestions,
