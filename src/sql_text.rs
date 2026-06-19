@@ -1582,9 +1582,80 @@ pub(crate) fn statement_head_keywords() -> &'static [&'static str] {
     STATEMENT_HEAD_KEYWORDS
 }
 
+const MYSQL_STATEMENT_HEAD_KEYWORDS: &[&str] = &[
+    "ALTER",
+    "ANALYZE",
+    "BEGIN",
+    "BINLOG",
+    "CACHE",
+    "CALL",
+    "CHANGE",
+    "CHECK",
+    "CHECKSUM",
+    "CLONE",
+    "COMMIT",
+    "CREATE",
+    "DEALLOCATE",
+    "DELETE",
+    "DELIMITER",
+    "DESC",
+    "DESCRIBE",
+    "DO",
+    "DROP",
+    "EXECUTE",
+    "EXPLAIN",
+    "FLUSH",
+    "GRANT",
+    "HANDLER",
+    "HELP",
+    "IMPORT",
+    "INSERT",
+    "INSTALL",
+    "KILL",
+    "LOAD",
+    "LOCK",
+    "OPTIMIZE",
+    "PREPARE",
+    "PURGE",
+    "RELEASE",
+    "RENAME",
+    "REPAIR",
+    "REPLACE",
+    "RESET",
+    "RESIGNAL",
+    "RESTART",
+    "REVOKE",
+    "ROLLBACK",
+    "SAVEPOINT",
+    "SELECT",
+    "SET",
+    "SHOW",
+    "SHUTDOWN",
+    "SIGNAL",
+    "SOURCE",
+    "START",
+    "STOP",
+    "TABLE",
+    "TRUNCATE",
+    "UNINSTALL",
+    "UNLOCK",
+    "UPDATE",
+    "USE",
+    "VALUES",
+    "WITH",
+    "XA",
+];
+
+pub(crate) fn mysql_statement_head_keywords() -> &'static [&'static str] {
+    MYSQL_STATEMENT_HEAD_KEYWORDS
+}
+
 /// O(1) lookup set for `STATEMENT_HEAD_KEYWORDS` (80+ entries).
 static STATEMENT_HEAD_KEYWORDS_SET: Lazy<HashSet<&'static str>> =
     Lazy::new(|| STATEMENT_HEAD_KEYWORDS.iter().copied().collect());
+
+static MYSQL_STATEMENT_HEAD_KEYWORDS_SET: Lazy<HashSet<&'static str>> =
+    Lazy::new(|| MYSQL_STATEMENT_HEAD_KEYWORDS.iter().copied().collect());
 
 #[inline]
 fn matches_keyword(keyword: &str, candidates: &[&str]) -> bool {
@@ -2936,6 +3007,10 @@ pub(crate) fn is_statement_head_keyword(word: &str) -> bool {
 pub(crate) fn is_statement_head_keyword_upper(word_upper: &str) -> bool {
     STATEMENT_HEAD_KEYWORDS_SET.contains(word_upper)
         || is_password_command_keyword_upper(word_upper)
+}
+
+pub(crate) fn is_mysql_statement_head_keyword_upper(word_upper: &str) -> bool {
+    MYSQL_STATEMENT_HEAD_KEYWORDS_SET.contains(word_upper)
 }
 
 /// Returns true when an (already ASCII-uppercased) keyword can only begin a
@@ -7791,6 +7866,17 @@ mod tests {
     }
 
     #[test]
+    fn mysql_statement_head_keywords_do_not_contain_duplicates() {
+        let mut seen = HashSet::new();
+        for keyword in MYSQL_STATEMENT_HEAD_KEYWORDS {
+            assert!(
+                seen.insert(*keyword),
+                "duplicate MySQL statement head keyword: {keyword}"
+            );
+        }
+    }
+
+    #[test]
     fn formatter_keyword_groups_stay_in_shared_keyword_pool() {
         assert!(FORMAT_CLAUSE_KEYWORDS
             .iter()
@@ -11456,6 +11542,76 @@ mod tests {
             assert!(
                 is_statement_head_keyword(keyword),
                 "missing statement head keyword: {keyword}"
+            );
+        }
+    }
+
+    #[test]
+    fn mysql_statement_head_keywords_include_common_sql_statement_families() {
+        for keyword in [
+            "ALTER",
+            "ANALYZE",
+            "BEGIN",
+            "BINLOG",
+            "CACHE",
+            "CALL",
+            "CHANGE",
+            "CHECK",
+            "CHECKSUM",
+            "CLONE",
+            "COMMIT",
+            "CREATE",
+            "DEALLOCATE",
+            "DELETE",
+            "DESC",
+            "DESCRIBE",
+            "DO",
+            "DROP",
+            "EXECUTE",
+            "EXPLAIN",
+            "FLUSH",
+            "GRANT",
+            "HANDLER",
+            "HELP",
+            "IMPORT",
+            "INSERT",
+            "INSTALL",
+            "KILL",
+            "LOAD",
+            "LOCK",
+            "OPTIMIZE",
+            "PREPARE",
+            "PURGE",
+            "RELEASE",
+            "RENAME",
+            "REPAIR",
+            "REPLACE",
+            "RESET",
+            "RESIGNAL",
+            "RESTART",
+            "REVOKE",
+            "ROLLBACK",
+            "SAVEPOINT",
+            "SELECT",
+            "SET",
+            "SHOW",
+            "SHUTDOWN",
+            "SIGNAL",
+            "START",
+            "STOP",
+            "TABLE",
+            "TRUNCATE",
+            "UNINSTALL",
+            "UNLOCK",
+            "UPDATE",
+            "USE",
+            "VALUES",
+            "WITH",
+            "XA",
+        ] {
+            assert!(
+                is_mysql_statement_head_keyword_upper(keyword),
+                "missing MySQL statement head keyword: {keyword}"
             );
         }
     }

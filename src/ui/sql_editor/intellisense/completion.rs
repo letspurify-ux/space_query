@@ -899,6 +899,51 @@ fn mysql_data_type_keywords(position: DataTypePosition) -> &'static [&'static st
 }
 
 impl SqlEditorWidget {
+    const TOOL_NO_SQL_ARGUMENT_COMMANDS: &'static [&'static str] = &[
+        "DEFINE",
+        "UNDEFINE",
+        "ACCEPT",
+        "ARCHIVE",
+        "BREAK",
+        "CLEAR",
+        "COLUMN",
+        "COMPUTE",
+        "DELIMITER",
+        "DISC",
+        "DISCONNECT",
+        "EXIT",
+        "PROMPT",
+        "SPOOL",
+        "STORE",
+        "GET",
+        "SAVE",
+        "START",
+        "STARTUP",
+        "CONNECT",
+        "CONN",
+        "QUIT",
+        "RECOVER",
+        "RUN",
+        "R",
+        "PASSWORD",
+        "PASSW",
+        "PASSWO",
+        "PASSWOR",
+        "SHUTDOWN",
+        "HOST",
+        "PAUSE",
+        "SET",
+        "SHOW",
+        "SOURCE",
+        "TIMING",
+        "WHENEVER",
+        "TTITLE",
+        "BTITLE",
+        "REPHEADER",
+        "REPFOOTER",
+        "USE",
+    ];
+
     fn context_suppresses_completion(context: SqlContext) -> bool {
         matches!(context, SqlContext::GeneratedName)
     }
@@ -1762,15 +1807,10 @@ impl SqlEditorWidget {
         } else {
             Vec::new()
         };
-        // Replace (not merge) the base catalog with the kind-specific object
-        // list whenever the slot admits only one object family: a table-context
-        // slot, or any *constrained* DDL object slot (`DROP TRIGGER`, `CALL`,
-        // `GRANT … ON`, `GRANT … TO`, `COMMENT ON`, `REFERENCES`, …). Most of
-        // those classify as the neutral General phase, where the base would
-        // otherwise append the whole catalog (every table, trigger, index,
-        // directory, function) after the correct objects — pure noise. An `Any`
-        // slot (`DESC`/`AUDIT`/`CREATE SYNONYM` target) keeps the full catalog
-        // because every object kind is valid there.
+        // Replace (not merge) the base catalog with the object-kind list whenever
+        // the grammar expects a schema object. Even an `Any` slot (`DESC`/`AUDIT`/
+        // `CREATE SYNONYM` target) admits every *object kind*, not arbitrary SQL
+        // keywords or language functions from the flat base catalog.
         let expected_object_kind = if qualifier.is_none() {
             Self::expected_object_suggestion_kind_for_db(
                 &snapshot.prefix,
@@ -1781,11 +1821,7 @@ impl SqlEditorWidget {
         } else {
             None
         };
-        let replace_table_context_with_expected_objects = match expected_object_kind {
-            Some(ExpectedObjectSuggestionKind::Any) => matches!(context, SqlContext::TableName),
-            Some(_) => true,
-            None => false,
-        };
+        let replace_table_context_with_expected_objects = expected_object_kind.is_some();
 
         let allow_empty_prefix = qualifier.is_some()
             || include_columns
@@ -2355,7 +2391,9 @@ impl SqlEditorWidget {
             return Self::scoped_column_suggestions(data, prefix, column_scope);
         }
 
-        let prefer_columns = matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll);
+        let statement_start = expr_keyword_ctx.statement_start;
+        let prefer_columns = statement_start.is_none()
+            && matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll);
         let mut suggestions = data.get_suggestions_for_db(
             prefix,
             include_columns,
@@ -2366,12 +2404,10 @@ impl SqlEditorWidget {
         );
         if !prefer_columns
             && matches!(
-                expr_keyword_ctx.statement_start,
-                Some(StatementStartContext::TopLevel)
+                statement_start, Some(StatementStartContext::TopLevel)
             )
-            && Self::top_level_statement_heads_include_sqlplus_commands(db_type)
         {
-            Self::append_top_level_statement_head_suggestions(&mut suggestions, prefix);
+            Self::append_top_level_statement_head_suggestions(&mut suggestions, prefix, db_type);
         }
         // The base catalog mixes columns, relations, objects and functions (kept
         // as-is) with a *flat, prefix-only* dump of the entire keyword list. That
@@ -2466,7 +2502,7 @@ impl SqlEditorWidget {
         // (never a function — its result cannot stand as a statement — a sequence,
         // or a table/view).
         if !prefer_columns {
-            if let Some(statement_start) = expr_keyword_ctx.statement_start {
+            if let Some(statement_start) = statement_start {
                 suggestions.retain(|suggestion| {
                     Self::suggestion_begins_statement(data, suggestion, statement_start, db_type)
                 });
@@ -2487,12 +2523,12 @@ impl SqlEditorWidget {
     ) -> bool {
         let upper = suggestion.to_ascii_uppercase();
         if matches!(ctx, StatementStartContext::TopLevel)
-            && crate::sql_text::is_statement_head_keyword_upper(&upper)
+            && Self::keyword_begins_top_level_statement_for_db(&upper, db_type)
         {
             return true;
         }
         if data.is_language_keyword(&upper, db_type) {
-            return Self::keyword_begins_statement(&upper, ctx);
+            return Self::keyword_begins_statement(&upper, ctx, db_type);
         }
         match ctx {
             StatementStartContext::TopLevel => false,
@@ -2506,12 +2542,16 @@ impl SqlEditorWidget {
         }
     }
 
-    fn append_top_level_statement_head_suggestions(suggestions: &mut Vec<String>, prefix: &str) {
+    fn append_top_level_statement_head_suggestions(
+        suggestions: &mut Vec<String>,
+        prefix: &str,
+        db_type: Option<crate::db::DatabaseType>,
+    ) {
         let mut seen: HashSet<String> = suggestions
             .iter()
             .map(|suggestion| suggestion.to_ascii_uppercase())
             .collect();
-        for keyword in crate::sql_text::statement_head_keywords() {
+        for keyword in Self::top_level_statement_head_keywords_for_db(db_type) {
             if crate::ui::intellisense::suggestion_matches_completion_prefix(keyword, prefix)
                 && seen.insert((*keyword).to_string())
             {
@@ -2520,12 +2560,26 @@ impl SqlEditorWidget {
         }
     }
 
-    fn top_level_statement_heads_include_sqlplus_commands(
+    fn top_level_statement_head_keywords_for_db(
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> &'static [&'static str] {
+        match db_type.map(crate::db::DatabaseType::sql_dialect) {
+            Some(crate::db::SqlDialect::MySql) => crate::sql_text::mysql_statement_head_keywords(),
+            None | Some(crate::db::SqlDialect::Oracle) => crate::sql_text::statement_head_keywords(),
+        }
+    }
+
+    fn keyword_begins_top_level_statement_for_db(
+        upper: &str,
         db_type: Option<crate::db::DatabaseType>,
     ) -> bool {
         match db_type.map(crate::db::DatabaseType::sql_dialect) {
-            None | Some(crate::db::SqlDialect::Oracle) => true,
-            Some(crate::db::SqlDialect::MySql) => false,
+            Some(crate::db::SqlDialect::MySql) => {
+                crate::sql_text::is_mysql_statement_head_keyword_upper(upper)
+            }
+            None | Some(crate::db::SqlDialect::Oracle) => {
+                crate::sql_text::is_statement_head_keyword_upper(upper)
+            }
         }
     }
 
@@ -2534,7 +2588,11 @@ impl SqlEditorWidget {
     /// statement verbs; a PL/SQL block additionally admits the procedural
     /// statement keywords plus the continuations of the construct enclosing the
     /// cursor.
-    fn keyword_begins_statement(upper: &str, ctx: StatementStartContext) -> bool {
+    fn keyword_begins_statement(
+        upper: &str,
+        ctx: StatementStartContext,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
         // Procedural statement keywords that open a PL/SQL block statement.
         const PLSQL_STATEMENT_KEYWORDS: &[&str] = &[
             "IF", "CASE", "LOOP", "WHILE", "FOR", "FORALL", "GOTO", "NULL", "RETURN", "RAISE",
@@ -2544,7 +2602,7 @@ impl SqlEditorWidget {
         ];
 
         match ctx {
-            StatementStartContext::TopLevel => crate::sql_text::is_statement_head_keyword_upper(upper),
+            StatementStartContext::TopLevel => Self::keyword_begins_top_level_statement_for_db(upper, db_type),
             StatementStartContext::Plsql(policy) => {
                 if policy.allow_statements && PLSQL_STATEMENT_KEYWORDS.contains(&upper) {
                     return true;
@@ -8032,8 +8090,9 @@ impl SqlEditorWidget {
     fn expected_grant_privilege_keyword_candidates(
         tokens: &[SqlToken],
         end: usize,
+        db_type: Option<crate::db::DatabaseType>,
     ) -> Option<&'static [&'static str]> {
-        const PRIVILEGES: &[&str] = &[
+        const ORACLE_PRIVILEGES: &[&str] = &[
             "SELECT",
             "INSERT",
             "UPDATE",
@@ -8046,10 +8105,188 @@ impl SqlEditorWidget {
             "ALL",
             "ALL PRIVILEGES",
         ];
+        const MYSQL_PRIVILEGES: &[&str] = &[
+            "ALL",
+            "ALL PRIVILEGES",
+            "ALTER",
+            "ALTER ROUTINE",
+            "CREATE",
+            "CREATE ROLE",
+            "CREATE ROUTINE",
+            "CREATE TABLESPACE",
+            "CREATE TEMPORARY TABLES",
+            "CREATE USER",
+            "CREATE VIEW",
+            "DELETE",
+            "DROP",
+            "DROP ROLE",
+            "EVENT",
+            "EXECUTE",
+            "FILE",
+            "GRANT OPTION",
+            "INDEX",
+            "INSERT",
+            "LOCK TABLES",
+            "PROCESS",
+            "PROXY",
+            "REFERENCES",
+            "RELOAD",
+            "REPLICATION CLIENT",
+            "REPLICATION SLAVE",
+            "SELECT",
+            "SHOW DATABASES",
+            "SHOW VIEW",
+            "SHUTDOWN",
+            "SUPER",
+            "TRIGGER",
+            "UPDATE",
+            "USAGE",
+            "ALLOW_NONEXISTENT_DEFINER",
+            "APPLICATION_PASSWORD_ADMIN",
+            "AUDIT_ABORT_EXEMPT",
+            "AUDIT_ADMIN",
+            "AUTHENTICATION_POLICY_ADMIN",
+            "BACKUP_ADMIN",
+            "BINLOG_ADMIN",
+            "BINLOG_ENCRYPTION_ADMIN",
+            "CLONE_ADMIN",
+            "CONNECTION_ADMIN",
+            "ENCRYPTION_KEY_ADMIN",
+            "FIREWALL_ADMIN",
+            "FIREWALL_EXEMPT",
+            "FIREWALL_USER",
+            "FLUSH_OPTIMIZER_COSTS",
+            "FLUSH_PRIVILEGES",
+            "FLUSH_STATUS",
+            "FLUSH_TABLES",
+            "FLUSH_USER_RESOURCES",
+            "GROUP_REPLICATION_ADMIN",
+            "GROUP_REPLICATION_STREAM",
+            "INNODB_REDO_LOG_ARCHIVE",
+            "INNODB_REDO_LOG_ENABLE",
+            "MASKING_DICTIONARIES_ADMIN",
+            "NDB_STORED_USER",
+            "OPTIMIZE_LOCAL_TABLE",
+            "PASSWORDLESS_USER_ADMIN",
+            "PERSIST_RO_VARIABLES_ADMIN",
+            "REPLICATION_APPLIER",
+            "REPLICATION_SLAVE_ADMIN",
+            "RESOURCE_GROUP_ADMIN",
+            "RESOURCE_GROUP_USER",
+            "ROLE_ADMIN",
+            "SENSITIVE_VARIABLES_OBSERVER",
+            "SESSION_VARIABLES_ADMIN",
+            "SET_ANY_DEFINER",
+            "SHOW_ROUTINE",
+            "SYSTEM_USER",
+            "SYSTEM_VARIABLES_ADMIN",
+            "TABLE_ENCRYPTION_ADMIN",
+            "TELEMETRY_LOG_ADMIN",
+            "TRANSACTION_GTID_TAG",
+            "XA_RECOVER_ADMIN",
+        ];
+        const MYSQL_REVOKE_PRIVILEGES: &[&str] = &[
+            "IF",
+            "ALL",
+            "ALL PRIVILEGES",
+            "ALTER",
+            "ALTER ROUTINE",
+            "CREATE",
+            "CREATE ROLE",
+            "CREATE ROUTINE",
+            "CREATE TABLESPACE",
+            "CREATE TEMPORARY TABLES",
+            "CREATE USER",
+            "CREATE VIEW",
+            "DELETE",
+            "DROP",
+            "DROP ROLE",
+            "EVENT",
+            "EXECUTE",
+            "FILE",
+            "GRANT OPTION",
+            "INDEX",
+            "INSERT",
+            "LOCK TABLES",
+            "PROCESS",
+            "PROXY",
+            "REFERENCES",
+            "RELOAD",
+            "REPLICATION CLIENT",
+            "REPLICATION SLAVE",
+            "SELECT",
+            "SHOW DATABASES",
+            "SHOW VIEW",
+            "SHUTDOWN",
+            "SUPER",
+            "TRIGGER",
+            "UPDATE",
+            "USAGE",
+            "ALLOW_NONEXISTENT_DEFINER",
+            "APPLICATION_PASSWORD_ADMIN",
+            "AUDIT_ABORT_EXEMPT",
+            "AUDIT_ADMIN",
+            "AUTHENTICATION_POLICY_ADMIN",
+            "BACKUP_ADMIN",
+            "BINLOG_ADMIN",
+            "BINLOG_ENCRYPTION_ADMIN",
+            "CLONE_ADMIN",
+            "CONNECTION_ADMIN",
+            "ENCRYPTION_KEY_ADMIN",
+            "FIREWALL_ADMIN",
+            "FIREWALL_EXEMPT",
+            "FIREWALL_USER",
+            "FLUSH_OPTIMIZER_COSTS",
+            "FLUSH_PRIVILEGES",
+            "FLUSH_STATUS",
+            "FLUSH_TABLES",
+            "FLUSH_USER_RESOURCES",
+            "GROUP_REPLICATION_ADMIN",
+            "GROUP_REPLICATION_STREAM",
+            "INNODB_REDO_LOG_ARCHIVE",
+            "INNODB_REDO_LOG_ENABLE",
+            "MASKING_DICTIONARIES_ADMIN",
+            "NDB_STORED_USER",
+            "OPTIMIZE_LOCAL_TABLE",
+            "PASSWORDLESS_USER_ADMIN",
+            "PERSIST_RO_VARIABLES_ADMIN",
+            "REPLICATION_APPLIER",
+            "REPLICATION_SLAVE_ADMIN",
+            "RESOURCE_GROUP_ADMIN",
+            "RESOURCE_GROUP_USER",
+            "ROLE_ADMIN",
+            "SENSITIVE_VARIABLES_OBSERVER",
+            "SESSION_VARIABLES_ADMIN",
+            "SET_ANY_DEFINER",
+            "SHOW_ROUTINE",
+            "SYSTEM_USER",
+            "SYSTEM_VARIABLES_ADMIN",
+            "TABLE_ENCRYPTION_ADMIN",
+            "TELEMETRY_LOG_ADMIN",
+            "TRANSACTION_GTID_TAG",
+            "XA_RECOVER_ADMIN",
+        ];
         if !Self::cursor_has_statement_start_anchor(tokens, end, &["GRANT", "REVOKE"]) {
             return None;
         }
+        let candidates = if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            MYSQL_PRIVILEGES
+        } else {
+            ORACLE_PRIVILEGES
+        };
         let toks = Self::meaningful_tokens_before(tokens, end);
+        let words = Self::previous_meaningful_words_upper(tokens, end, 3);
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            match words.as_slice() {
+                [.., verb, last] if *verb == "REVOKE" && *last == "IF" => {
+                    return Some(&["EXISTS"]);
+                }
+                [.., last] if *last == "REVOKE" => {
+                    return Some(MYSQL_REVOKE_PRIVILEGES);
+                }
+                _ => {}
+            }
+        }
         // The cursor must sit right after the verb (`GRANT |`) or a privilege-list
         // comma (`GRANT SELECT, |`).
         let after_verb_or_comma = matches!(
@@ -8066,7 +8303,7 @@ impl SqlEditorWidget {
             if let SqlToken::Word(word) = token {
                 let upper = word.to_ascii_uppercase();
                 match upper.as_str() {
-                    "GRANT" | "REVOKE" => return Some(PRIVILEGES),
+                    "GRANT" | "REVOKE" => return Some(candidates),
                     "ON" | "TO" | "FROM" => return None,
                     _ => {}
                 }
@@ -8078,6 +8315,7 @@ impl SqlEditorWidget {
     fn expected_grant_privilege_keyword_candidates_for_context(
         deep_ctx: &intellisense_context::CursorContext,
         exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
     ) -> Option<&'static [&'static str]> {
         let tokens = Self::current_query_tokens(deep_ctx);
         let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
@@ -8086,7 +8324,7 @@ impl SqlEditorWidget {
             cursor_token_len,
             exclude_current_identifier_chain,
         );
-        Self::expected_grant_privilege_keyword_candidates(tokens, end)
+        Self::expected_grant_privilege_keyword_candidates(tokens, end, db_type)
     }
 
     /// True when the cursor is at the brand-new object name of a `CREATE`
@@ -8139,11 +8377,11 @@ impl SqlEditorWidget {
             exclude_current_identifier_chain,
         );
         if !exclude_current_identifier_chain
-            && Self::expected_statement_structural_keyword_candidates(tokens, end).is_some()
+            && Self::expected_statement_structural_keyword_candidates(tokens, end, None).is_some()
         {
             return false;
         }
-        let words = Self::previous_meaningful_words_upper(tokens, end, 12);
+        let words = Self::previous_meaningful_words_upper(tokens, end, 16);
         // Statement must be a CREATE (not DROP/ALTER, whose `<type> <name>` slots
         // reference an existing object), and the cursor must be past the type
         // keyword (`CREATE |` itself still wants an object-type keyword).
@@ -8893,56 +9131,49 @@ impl SqlEditorWidget {
     }
 
     fn cursor_is_at_tool_no_sql_argument_slot(tokens: &[SqlToken], end: usize) -> bool {
-        const FREEFORM_TOOL_ARGUMENT_COMMANDS: &[&str] = &[
-            "DEFINE",
-            "UNDEFINE",
-            "ACCEPT",
-            "BREAK",
-            "CLEAR",
-            "COLUMN",
-            "COMPUTE",
-            "DELIMITER",
-            "PROMPT",
-            "SPOOL",
-            "STORE",
-            "GET",
-            "SAVE",
-            "START",
-            "CONNECT",
-            "CONN",
-            "PASSWORD",
-            "PASSW",
-            "PASSWO",
-            "PASSWOR",
-            "HOST",
-            "PAUSE",
-            "SET",
-            "SHOW",
-            "SOURCE",
-            "WHENEVER",
-            "TTITLE",
-            "BTITLE",
-            "REPHEADER",
-            "REPFOOTER",
-            "USE",
-        ];
-
         let toks = Self::meaningful_tokens_before(tokens, end);
+        if Self::cursor_is_at_symbol_tool_argument_slot(&toks) {
+            return true;
+        }
         toks.iter().enumerate().rev().any(|(idx, token)| {
             let SqlToken::Word(word) = token else {
                 return false;
             };
-            FREEFORM_TOOL_ARGUMENT_COMMANDS
+            Self::TOOL_NO_SQL_ARGUMENT_COMMANDS
                 .iter()
                 .any(|command| word.eq_ignore_ascii_case(command))
                 && Self::tool_command_word_at_statement_head(
                     &toks,
                     idx,
-                    FREEFORM_TOOL_ARGUMENT_COMMANDS,
+                    Self::TOOL_NO_SQL_ARGUMENT_COMMANDS,
                 )
                 && !toks.iter().skip(idx + 1).any(|token| {
                     matches!(token, SqlToken::Symbol(sym) if sym == ";")
                 })
+        })
+    }
+
+    fn cursor_is_at_symbol_tool_argument_slot(toks: &[&SqlToken]) -> bool {
+        let mut command_start: Option<usize> = None;
+        for (idx, token) in toks.iter().enumerate() {
+            if idx > 0 && matches!(token, SqlToken::Symbol(sym) if sym == ";") {
+                command_start = None;
+                continue;
+            }
+            if command_start.is_none()
+                && matches!(
+                    token,
+                    SqlToken::Symbol(sym)
+                        if matches!(sym.as_str(), "@" | "@@" | "!" | "\\" | "\\.")
+                )
+            {
+                command_start = Some(idx);
+            }
+        }
+        command_start.is_some_and(|idx| {
+            !toks.iter().skip(idx + 1).any(|token| {
+                matches!(token, SqlToken::Symbol(sym) if sym == ";")
+            })
         })
     }
 
@@ -10378,6 +10609,7 @@ impl SqlEditorWidget {
             || Self::cursor_is_after_complete_dml_target_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
+                db_type,
             )
             || Self::cursor_is_after_complete_join_target_for_context(
                 deep_ctx,
@@ -10411,6 +10643,7 @@ impl SqlEditorWidget {
             || Self::expected_statement_structural_keyword_candidates_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
+                db_type,
             )
             .is_some()
             || Self::expected_referential_action_keyword_candidates_for_context(
@@ -10421,6 +10654,7 @@ impl SqlEditorWidget {
             || Self::expected_grant_privilege_keyword_candidates_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
+                db_type,
             )
             .is_some()
             || Self::expected_sounds_like_keyword_candidates_for_context(
@@ -10621,6 +10855,7 @@ impl SqlEditorWidget {
             || Self::expected_statement_structural_keyword_candidates_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
+                db_type,
             )
             .is_some()
             || Self::expected_referential_action_keyword_candidates_for_context(
@@ -11076,6 +11311,7 @@ impl SqlEditorWidget {
         tokens: &[SqlToken],
         end: usize,
         phase: intellisense_context::SqlPhase,
+        db_type: Option<crate::db::DatabaseType>,
     ) -> Option<&'static [&'static str]> {
         use intellisense_context::SqlPhase;
 
@@ -11087,7 +11323,21 @@ impl SqlEditorWidget {
         };
         if matches!(
             last.to_ascii_uppercase().as_str(),
-            "UPDATE" | "DELETE" | "INSERT" | "MERGE" | "INTO" | "FROM" | "USING" | "SET" | "VALUES"
+            "UPDATE"
+                | "DELETE"
+                | "INSERT"
+                | "MERGE"
+                | "REPLACE"
+                | "INTO"
+                | "FROM"
+                | "USING"
+                | "SET"
+                | "VALUES"
+                | "LOW_PRIORITY"
+                | "HIGH_PRIORITY"
+                | "DELAYED"
+                | "IGNORE"
+                | "QUICK"
         ) {
             return None;
         }
@@ -11096,6 +11346,8 @@ impl SqlEditorWidget {
             SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
             _ => None,
         })?;
+
+        let mysql_compatible = crate::sql_text::mysql_compatibility_for_sql("", db_type);
 
         match lead.as_str() {
             "UPDATE" if matches!(phase, SqlPhase::UpdateTarget) => Some(&["SET"]),
@@ -11110,7 +11362,15 @@ impl SqlEditorWidget {
                             || matches!(token, SqlToken::Symbol(sym) if sym == ",")
                     }) =>
             {
-                Some(&["WHERE"])
+                if mysql_compatible
+                    && !toks
+                        .iter()
+                        .any(|token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("FROM")))
+                {
+                    Some(&["FROM"])
+                } else {
+                    Some(&["WHERE"])
+                }
             }
             _ => None,
         }
@@ -11123,6 +11383,7 @@ impl SqlEditorWidget {
     fn cursor_is_after_complete_dml_target_for_context(
         deep_ctx: &intellisense_context::CursorContext,
         exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
     ) -> bool {
         let tokens = Self::current_query_tokens(deep_ctx);
         let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
@@ -11131,7 +11392,7 @@ impl SqlEditorWidget {
             cursor_token_len,
             exclude_current_identifier_chain,
         );
-        Self::expected_dml_target_keyword_candidates(tokens, end, deep_ctx.phase).is_some()
+        Self::expected_dml_target_keyword_candidates(tokens, end, deep_ctx.phase, db_type).is_some()
     }
 
     /// Join-condition keyword hint for the position right after a *complete* JOIN
@@ -11865,17 +12126,43 @@ impl SqlEditorWidget {
             word,
             "ALTER"
                 | "ANALYZE"
+                | "CACHE"
+                | "CHANGE"
                 | "CHECK"
+                | "CHECKSUM"
+                | "CLONE"
+                | "COMMIT"
                 | "COMMENT"
                 | "CREATE"
+                | "DEALLOCATE"
                 | "DROP"
                 | "EXECUTE"
+                | "EXPLAIN"
                 | "FLASHBACK"
+                | "FLUSH"
+                | "HANDLER"
+                | "IMPORT"
+                | "INSTALL"
+                | "KILL"
+                | "LOAD"
                 | "LOCK"
                 | "OPTIMIZE"
+                | "PREPARE"
                 | "PURGE"
+                | "RELEASE"
+                | "RENAME"
                 | "REPAIR"
+                | "RESET"
+                | "RESIGNAL"
+                | "ROLLBACK"
+                | "SET"
+                | "SIGNAL"
+                | "START"
+                | "STOP"
                 | "TRUNCATE"
+                | "UNINSTALL"
+                | "UNLOCK"
+                | "XA"
         )
     }
 
@@ -11976,13 +12263,78 @@ impl SqlEditorWidget {
             return false;
         };
 
-        !toks.iter().skip(anchor_pos + 1).any(|(_, token)| match token {
-            SqlToken::Symbol(sym) => sym == ";",
-            SqlToken::Word(word) => Self::word_is_statement_structural_boundary_after_anchor(
-                &word.to_ascii_uppercase(),
-            ),
-            _ => false,
-        })
+        let anchor_upper = match toks.get(anchor_pos).map(|(_, token)| *token) {
+            Some(SqlToken::Word(word)) => word.to_ascii_uppercase(),
+            _ => String::new(),
+        };
+
+        !toks
+            .iter()
+            .enumerate()
+            .skip(anchor_pos + 1)
+            .any(|(pos, (_, token))| match token {
+                SqlToken::Symbol(sym) => sym == ";",
+                SqlToken::Word(word) => {
+                    let upper = word.to_ascii_uppercase();
+                    if upper == "WITH"
+                        && anchor_upper == "START"
+                        && toks[anchor_pos + 1..pos].iter().any(|(_, token)| {
+                            matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("TRANSACTION"))
+                        })
+                    {
+                        return false;
+                    }
+                    if upper == "MERGE"
+                        && matches!(anchor_upper.as_str(), "ALTER" | "CREATE")
+                        && toks[anchor_pos + 1..pos].iter().any(|(_, token)| {
+                            matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("ALGORITHM"))
+                        })
+                    {
+                        return false;
+                    }
+                    if anchor_upper == "ANALYZE"
+                        && matches!(upper.as_str(), "UPDATE" | "WITH")
+                        && toks[anchor_pos + 1..pos].iter().any(|(_, token)| {
+                            matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("TABLE"))
+                        })
+                        && (upper == "UPDATE"
+                            || toks[anchor_pos + 1..pos].iter().any(|(_, token)| {
+                                matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("HISTOGRAM"))
+                            }))
+                    {
+                        return false;
+                    }
+                    if upper == "WITH"
+                        && anchor_upper == "ALTER"
+                        && toks[anchor_pos + 1..pos].iter().any(|(_, token)| {
+                            matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("USER"))
+                        })
+                    {
+                        return false;
+                    }
+                    if upper == "GROUP"
+                        && matches!(anchor_upper.as_str(), "ALTER" | "CREATE" | "DROP" | "SET")
+                        && toks[anchor_pos + 1..pos].iter().any(|(_, token)| {
+                            matches!(token, SqlToken::Word(word) if matches!(word.to_ascii_uppercase().as_str(), "LOGFILE" | "RESOURCE"))
+                        })
+                    {
+                        return false;
+                    }
+                    if matches!(upper.as_str(), "DELETE" | "INSERT" | "UPDATE")
+                        && anchor_upper == "CREATE"
+                        && toks[anchor_pos + 1..pos].iter().any(|(_, token)| {
+                            matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("TRIGGER"))
+                        })
+                        && toks[anchor_pos + 1..pos].iter().any(|(_, token)| {
+                            matches!(token, SqlToken::Word(word) if matches!(word.to_ascii_uppercase().as_str(), "AFTER" | "BEFORE"))
+                        })
+                    {
+                        return false;
+                    }
+                    Self::word_is_statement_structural_boundary_after_anchor(&upper)
+                }
+                _ => false,
+            })
     }
 
     fn cursor_is_in_object_command_head(tokens: &[SqlToken], end: usize) -> bool {
@@ -12121,6 +12473,7 @@ impl SqlEditorWidget {
     fn expected_statement_structural_keyword_candidates(
         tokens: &[SqlToken],
         end: usize,
+        db_type: Option<crate::db::DatabaseType>,
     ) -> Option<&'static [&'static str]> {
         const OBJECT_TYPE_KEYWORDS: &[&str] = &[
             "TABLE",
@@ -12238,6 +12591,13 @@ impl SqlEditorWidget {
         }
 
         let words = Self::previous_meaningful_words_upper(tokens, end, 12);
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return Self::expected_mysql_statement_structural_keyword_candidates(
+                tokens,
+                end,
+                words.as_slice(),
+            );
+        }
         if Self::is_create_synonym_name_written_context(&words) {
             return Some(&["FOR"]);
         }
@@ -12355,9 +12715,2844 @@ impl SqlEditorWidget {
         }
     }
 
+    fn expected_mysql_statement_structural_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        words: &[String],
+    ) -> Option<&'static [&'static str]> {
+        const MYSQL_CREATE_OBJECT_TYPE_KEYWORDS: &[&str] = &[
+            "ALGORITHM",
+            "DATABASE",
+            "DEFINER",
+            "EVENT",
+            "FULLTEXT",
+            "FUNCTION",
+            "INDEX",
+            "LOGFILE",
+            "OR",
+            "PROCEDURE",
+            "RESOURCE",
+            "ROLE",
+            "SCHEMA",
+            "SERVER",
+            "SQL",
+            "SPATIAL",
+            "TABLE",
+            "TABLESPACE",
+            "TEMPORARY",
+            "TRIGGER",
+            "USER",
+            "VIEW",
+        ];
+        const MYSQL_CREATE_OR_REPLACE_OBJECT_TYPE_KEYWORDS: &[&str] = &["VIEW"];
+        const MYSQL_ALTER_OBJECT_TYPE_KEYWORDS: &[&str] = &[
+            "ALGORITHM",
+            "DATABASE",
+            "DEFINER",
+            "EVENT",
+            "FUNCTION",
+            "INSTANCE",
+            "LOGFILE",
+            "PROCEDURE",
+            "RESOURCE",
+            "SCHEMA",
+            "SERVER",
+            "SQL",
+            "TABLE",
+            "TABLESPACE",
+            "USER",
+            "VIEW",
+        ];
+        const MYSQL_ALTER_INSTANCE_ACTION_KEYWORDS: &[&str] =
+            &["DISABLE", "ENABLE", "RELOAD", "ROTATE"];
+        const MYSQL_ALTER_INSTANCE_ROTATE_TARGET_KEYWORDS: &[&str] = &["BINLOG", "INNODB"];
+        const MYSQL_ALTER_INSTANCE_RELOAD_TARGET_KEYWORDS: &[&str] = &["KEYRING", "TLS"];
+        const MYSQL_ALTER_INSTANCE_TLS_TAIL_KEYWORDS: &[&str] = &["FOR", "NO"];
+        const MYSQL_ALTER_INSTANCE_TLS_CHANNEL_VALUES: &[&str] = &["MYSQL_ADMIN", "MYSQL_MAIN"];
+        const MYSQL_ALTER_USER_OPTION_HEAD_KEYWORDS: &[&str] = &[
+            "ACCOUNT",
+            "ADD",
+            "ATTRIBUTE",
+            "COMMENT",
+            "DEFAULT",
+            "DISCARD",
+            "DROP",
+            "FAILED_LOGIN_ATTEMPTS",
+            "IDENTIFIED",
+            "MODIFY",
+            "PASSWORD",
+            "PASSWORD_LOCK_TIME",
+            "REQUIRE",
+            "WITH",
+        ];
+        const MYSQL_ALTER_USER_AFTER_AUTH_KEYWORDS: &[&str] = &[
+            "ACCOUNT",
+            "ATTRIBUTE",
+            "COMMENT",
+            "DEFAULT",
+            "FAILED_LOGIN_ATTEMPTS",
+            "PASSWORD",
+            "PASSWORD_LOCK_TIME",
+            "REQUIRE",
+            "WITH",
+        ];
+        const MYSQL_ALTER_USER_AFTER_PASSWORD_AUTH_KEYWORDS: &[&str] = &[
+            "ACCOUNT",
+            "ATTRIBUTE",
+            "COMMENT",
+            "DEFAULT",
+            "FAILED_LOGIN_ATTEMPTS",
+            "PASSWORD_LOCK_TIME",
+            "REQUIRE",
+            "RETAIN",
+            "WITH",
+        ];
+        const MYSQL_ALTER_USER_AUTH_TAIL_KEYWORDS: &[&str] =
+            &["REPLACE", "RETAIN"];
+        const MYSQL_ALTER_USER_REQUIRE_KEYWORDS: &[&str] =
+            &["CIPHER", "ISSUER", "NONE", "SSL", "SUBJECT", "X509"];
+        const MYSQL_ALTER_USER_REQUIRE_AFTER_TLS_KEYWORDS: &[&str] =
+            &["AND", "CIPHER", "ISSUER", "SSL", "SUBJECT", "X509"];
+        const MYSQL_ALTER_USER_RESOURCE_KEYWORDS: &[&str] = &[
+            "MAX_CONNECTIONS_PER_HOUR",
+            "MAX_QUERIES_PER_HOUR",
+            "MAX_UPDATES_PER_HOUR",
+            "MAX_USER_CONNECTIONS",
+        ];
+        const MYSQL_ALTER_USER_PASSWORD_OPTION_KEYWORDS: &[&str] =
+            &["EXPIRE", "HISTORY", "REQUIRE", "REUSE"];
+        const MYSQL_ALTER_USER_PASSWORD_EXPIRE_KEYWORDS: &[&str] =
+            &["DEFAULT", "INTERVAL", "NEVER"];
+        const MYSQL_ALTER_USER_PASSWORD_REQUIRE_KEYWORDS: &[&str] = &["CURRENT"];
+        const MYSQL_ALTER_USER_PASSWORD_CURRENT_KEYWORDS: &[&str] =
+            &["DEFAULT", "OPTIONAL"];
+        const MYSQL_ALTER_USER_DEFAULT_ROLE_KEYWORDS: &[&str] = &["ALL", "NONE"];
+        const MYSQL_DROP_OBJECT_TYPE_KEYWORDS: &[&str] = &[
+            "DATABASE",
+            "EVENT",
+            "FUNCTION",
+            "INDEX",
+            "LOGFILE",
+            "PREPARE",
+            "PROCEDURE",
+            "RESOURCE",
+            "ROLE",
+            "SCHEMA",
+            "SERVER",
+            "SPATIAL",
+            "TABLE",
+            "TABLESPACE",
+            "TEMPORARY",
+            "TRIGGER",
+            "USER",
+            "VIEW",
+        ];
+        const MYSQL_EXPLAINABLE_STATEMENT_HEAD_KEYWORDS: &[&str] = &[
+            "DELETE", "INSERT", "REPLACE", "SELECT", "TABLE", "UPDATE", "WITH",
+        ];
+        const MYSQL_EXPLAIN_OPTION_OR_STATEMENT_HEAD_KEYWORDS: &[&str] = &[
+            "ANALYZE", "FORMAT", "FOR", "DELETE", "INSERT", "REPLACE", "SELECT", "TABLE",
+            "UPDATE", "WITH",
+        ];
+        const MYSQL_EXPLAIN_ANALYZE_STATEMENT_HEAD_KEYWORDS: &[&str] =
+            &["DELETE", "SELECT", "TABLE", "UPDATE", "WITH"];
+        const MYSQL_EXPLAIN_ANALYZE_OPTION_OR_HEAD_KEYWORDS: &[&str] =
+            &["DELETE", "FORMAT", "SELECT", "TABLE", "UPDATE", "WITH"];
+        const MYSQL_FLUSH_HEAD_KEYWORDS: &[&str] = &[
+            "BINARY",
+            "ENGINE",
+            "ERROR",
+            "GENERAL",
+            "LOCAL",
+            "LOGS",
+            "NO_WRITE_TO_BINLOG",
+            "OPTIMIZER_COSTS",
+            "PRIVILEGES",
+            "RELAY",
+            "SLOW",
+            "STATUS",
+            "TABLE",
+            "TABLES",
+            "USER_RESOURCES",
+        ];
+        const MYSQL_LOGGED_TABLE_MAINTENANCE_HEAD_KEYWORDS: &[&str] =
+            &["LOCAL", "NO_WRITE_TO_BINLOG", "TABLE"];
+        const MYSQL_ANALYZE_HISTOGRAM_HEAD_KEYWORDS: &[&str] = &["DROP", "UPDATE"];
+        const MYSQL_ANALYZE_HISTOGRAM_AFTER_COLUMN_KEYWORDS: &[&str] =
+            &["AUTO", "MANUAL", "USING", "WITH"];
+        const MYSQL_ANALYZE_HISTOGRAM_UPDATE_MODES: &[&str] = &["AUTO", "MANUAL"];
+        const MYSQL_CHECK_TABLE_OPTION_KEYWORDS: &[&str] =
+            &["CHANGED", "EXTENDED", "FAST", "FOR", "MEDIUM", "QUICK"];
+        const MYSQL_CHECKSUM_TABLE_OPTION_KEYWORDS: &[&str] = &["EXTENDED", "QUICK"];
+        const MYSQL_REPAIR_TABLE_OPTION_KEYWORDS: &[&str] =
+            &["EXTENDED", "QUICK", "USE_FRM"];
+        const MYSQL_CHANGE_REPLICATION_FILTER_KEYWORDS: &[&str] = &[
+            "REPLICATE_DO_DB",
+            "REPLICATE_DO_TABLE",
+            "REPLICATE_IGNORE_DB",
+            "REPLICATE_IGNORE_TABLE",
+            "REPLICATE_REWRITE_DB",
+            "REPLICATE_WILD_DO_TABLE",
+            "REPLICATE_WILD_IGNORE_TABLE",
+        ];
+        const MYSQL_CHANGE_REPLICATION_SOURCE_OPTIONS: &[&str] = &[
+            "ASSIGN_GTIDS_TO_ANONYMOUS_TRANSACTIONS",
+            "FOR",
+            "GET_SOURCE_PUBLIC_KEY",
+            "GTID_ONLY",
+            "IGNORE_SERVER_IDS",
+            "NETWORK_NAMESPACE",
+            "PRIVILEGE_CHECKS_USER",
+            "RELAY_LOG_FILE",
+            "RELAY_LOG_POS",
+            "REQUIRE_ROW_FORMAT",
+            "REQUIRE_TABLE_PRIMARY_KEY_CHECK",
+            "SOURCE_AUTO_POSITION",
+            "SOURCE_BIND",
+            "SOURCE_COMPRESSION_ALGORITHMS",
+            "SOURCE_CONNECT_RETRY",
+            "SOURCE_CONNECTION_AUTO_FAILOVER",
+            "SOURCE_DELAY",
+            "SOURCE_HEARTBEAT_PERIOD",
+            "SOURCE_HOST",
+            "SOURCE_LOG_FILE",
+            "SOURCE_LOG_POS",
+            "SOURCE_PASSWORD",
+            "SOURCE_PORT",
+            "SOURCE_PUBLIC_KEY_PATH",
+            "SOURCE_RETRY_COUNT",
+            "SOURCE_SSL",
+            "SOURCE_SSL_CA",
+            "SOURCE_SSL_CAPATH",
+            "SOURCE_SSL_CERT",
+            "SOURCE_SSL_CIPHER",
+            "SOURCE_SSL_CRL",
+            "SOURCE_SSL_CRLPATH",
+            "SOURCE_SSL_KEY",
+            "SOURCE_SSL_VERIFY_SERVER_CERT",
+            "SOURCE_TLS_CIPHERSUITES",
+            "SOURCE_TLS_VERSION",
+            "SOURCE_USER",
+            "SOURCE_ZSTD_COMPRESSION_LEVEL",
+        ];
+        const MYSQL_TRANSACTION_TAIL_KEYWORDS: &[&str] = &["AND", "NO", "RELEASE", "WORK"];
+        const MYSQL_REPLICATION_THREAD_OR_OPTION_KEYWORDS: &[&str] =
+            &["DEFAULT_AUTH", "FOR", "IO_THREAD", "PASSWORD", "PLUGIN_DIR", "SQL_THREAD", "UNTIL", "USER"];
+        const MYSQL_REPLICATION_UNTIL_KEYWORDS: &[&str] = &[
+            "RELAY_LOG_FILE",
+            "SQL_AFTER_GTIDS",
+            "SQL_AFTER_MTS_GAPS",
+            "SQL_BEFORE_GTIDS",
+            "SOURCE_LOG_FILE",
+        ];
+        const MYSQL_RESET_REPLICA_TAIL_KEYWORDS: &[&str] = &["ALL", "FOR"];
+        const MYSQL_START_GROUP_REPLICATION_OPTIONS: &[&str] =
+            &["DEFAULT_AUTH", "PASSWORD", "USER"];
+        const MYSQL_SET_HEAD_KEYWORDS: &[&str] = &[
+            "CHARACTER",
+            "CHARSET",
+            "DEFAULT",
+            "GLOBAL",
+            "NAMES",
+            "PASSWORD",
+            "PERSIST",
+            "PERSIST_ONLY",
+            "RESOURCE",
+            "ROLE",
+            "SESSION",
+            "TRANSACTION",
+        ];
+        const MYSQL_SET_DEFAULT_ROLE_HEAD_KEYWORDS: &[&str] = &["ALL", "NONE"];
+        const MYSQL_SET_ROLE_HEAD_KEYWORDS: &[&str] = &["ALL", "DEFAULT", "NONE"];
+        const MYSQL_SET_PASSWORD_AUTH_KEYWORDS: &[&str] = &["FOR", "TO"];
+        const MYSQL_SET_PASSWORD_TAIL_KEYWORDS: &[&str] = &["REPLACE", "RETAIN"];
+        const MYSQL_LOAD_FILE_OPTIONS: &[&str] =
+            &["CONCURRENT", "INFILE", "LOCAL", "LOW_PRIORITY"];
+        const MYSQL_LOAD_AFTER_PRIORITY: &[&str] = &["INFILE", "LOCAL"];
+        const MYSQL_LOAD_AFTER_INFILE_PATH: &[&str] = &["IGNORE", "INTO", "REPLACE"];
+        const MYSQL_CREATE_INDEX_MODIFIERS: &[&str] = &["FULLTEXT", "SPATIAL", "UNIQUE"];
+        const MYSQL_INDEX_TYPE_KEYWORDS: &[&str] = &["BTREE", "HASH"];
+        const MYSQL_VIEW_PREFIX_AFTER_VERB: &[&str] = &["ALGORITHM", "DEFINER", "SQL", "VIEW"];
+        const MYSQL_VIEW_PREFIX_AFTER_REPLACE: &[&str] =
+            &["ALGORITHM", "DEFINER", "SQL", "VIEW"];
+        const MYSQL_VIEW_PREFIX_AFTER_ALGORITHM: &[&str] =
+            &["DEFINER", "SQL", "VIEW"];
+        const MYSQL_VIEW_ALGORITHM_VALUES: &[&str] =
+            &["MERGE", "TEMPTABLE", "UNDEFINED"];
+        const MYSQL_VIEW_SECURITY_VALUES: &[&str] = &["DEFINER", "INVOKER"];
+        const MYSQL_TRIGGER_TIMING_KEYWORDS: &[&str] = &["AFTER", "BEFORE"];
+        const MYSQL_TRIGGER_EVENT_KEYWORDS: &[&str] = &["DELETE", "INSERT", "UPDATE"];
+        const MYSQL_TRIGGER_ORDER_KEYWORDS: &[&str] = &["FOLLOWS", "PRECEDES"];
+        const MYSQL_SERVER_OPTION_KEYWORDS: &[&str] = &[
+            "DATABASE",
+            "HOST",
+            "OWNER",
+            "PASSWORD",
+            "PORT",
+            "SOCKET",
+            "USER",
+        ];
+        const MYSQL_RESOURCE_GROUP_TYPE_VALUES: &[&str] = &["SYSTEM", "USER"];
+        const MYSQL_RESOURCE_GROUP_CREATE_AFTER_TYPE_KEYWORDS: &[&str] =
+            &["VCPU", "THREAD_PRIORITY", "ENABLE", "DISABLE"];
+        const MYSQL_RESOURCE_GROUP_AFTER_VCPU_KEYWORDS: &[&str] =
+            &["THREAD_PRIORITY", "ENABLE", "DISABLE"];
+        const MYSQL_RESOURCE_GROUP_AFTER_THREAD_PRIORITY_KEYWORDS: &[&str] =
+            &["ENABLE", "DISABLE"];
+        const MYSQL_RESOURCE_GROUP_ATTRIBUTE_HEAD_KEYWORDS: &[&str] =
+            &["VCPU", "THREAD_PRIORITY", "ENABLE", "DISABLE"];
+        const MYSQL_TABLESPACE_CREATE_OPTION_HEAD_KEYWORDS: &[&str] = &[
+            "ADD",
+            "AUTOEXTEND_SIZE",
+            "ENCRYPTION",
+            "ENGINE",
+            "ENGINE_ATTRIBUTE",
+            "FILE_BLOCK_SIZE",
+            "USE",
+        ];
+        const MYSQL_TABLESPACE_ALTER_OPTION_HEAD_KEYWORDS: &[&str] = &[
+            "ADD",
+            "AUTOEXTEND_SIZE",
+            "DROP",
+            "ENCRYPTION",
+            "ENGINE",
+            "ENGINE_ATTRIBUTE",
+            "RENAME",
+            "SET",
+        ];
+        const MYSQL_TABLESPACE_CREATE_AFTER_FILE_KEYWORDS: &[&str] = &[
+            "AUTOEXTEND_SIZE",
+            "COMMENT",
+            "ENCRYPTION",
+            "ENGINE",
+            "ENGINE_ATTRIBUTE",
+            "EXTENT_SIZE",
+            "FILE_BLOCK_SIZE",
+            "INITIAL_SIZE",
+            "MAX_SIZE",
+            "NODEGROUP",
+            "USE",
+            "WAIT",
+        ];
+        const MYSQL_TABLESPACE_ALTER_AFTER_FILE_KEYWORDS: &[&str] =
+            &["ENGINE", "ENGINE_ATTRIBUTE", "INITIAL_SIZE", "WAIT"];
+        const MYSQL_LOGFILE_CREATE_OPTION_HEAD_KEYWORDS: &[&str] = &[
+            "COMMENT",
+            "ENGINE",
+            "INITIAL_SIZE",
+            "NODEGROUP",
+            "REDO_BUFFER_SIZE",
+            "UNDO_BUFFER_SIZE",
+            "WAIT",
+        ];
+        const MYSQL_LOGFILE_ALTER_OPTION_HEAD_KEYWORDS: &[&str] =
+            &["ENGINE", "INITIAL_SIZE", "WAIT"];
+        const MYSQL_CREATE_DATABASE_OPTION_HEAD_KEYWORDS: &[&str] =
+            &["CHARACTER", "COLLATE", "DEFAULT", "ENCRYPTION"];
+        const MYSQL_ALTER_DATABASE_OPTION_HEAD_KEYWORDS: &[&str] =
+            &["CHARACTER", "COLLATE", "DEFAULT", "ENCRYPTION", "READ"];
+        const MYSQL_DATABASE_AFTER_DEFAULT_KEYWORDS: &[&str] =
+            &["CHARACTER", "COLLATE", "ENCRYPTION"];
+        const MYSQL_CREATE_AFTER_DEFINER_KEYWORDS: &[&str] =
+            &["EVENT", "FUNCTION", "PROCEDURE", "SQL", "TRIGGER", "VIEW"];
+        const MYSQL_ALTER_AFTER_DEFINER_KEYWORDS: &[&str] = &["EVENT", "SQL", "VIEW"];
+        const MYSQL_ROUTINE_CHARACTERISTIC_HEAD_KEYWORDS: &[&str] = &[
+            "COMMENT",
+            "CONTAINS",
+            "DETERMINISTIC",
+            "LANGUAGE",
+            "MODIFIES",
+            "NO",
+            "NOT",
+            "READS",
+            "SQL",
+        ];
+        const MYSQL_ROUTINE_SQL_TAIL_KEYWORDS: &[&str] = &["DATA", "SECURITY"];
+        const MYSQL_EVENT_CREATE_TAIL_KEYWORDS: &[&str] =
+            &["COMMENT", "DISABLE", "DO", "ENABLE", "ON"];
+        const MYSQL_EVENT_ALTER_TAIL_KEYWORDS: &[&str] =
+            &["COMMENT", "DISABLE", "DO", "ENABLE", "ON", "RENAME"];
+        const MYSQL_EVENT_SCHEDULE_HEAD_KEYWORDS: &[&str] = &["AT", "EVERY"];
+        const MYSQL_EVENT_INTERVAL_UNIT_KEYWORDS: &[&str] = &[
+            "YEAR",
+            "QUARTER",
+            "MONTH",
+            "DAY",
+            "HOUR",
+            "MINUTE",
+            "WEEK",
+            "SECOND",
+            "YEAR_MONTH",
+            "DAY_HOUR",
+            "DAY_MINUTE",
+            "DAY_SECOND",
+            "HOUR_MINUTE",
+            "HOUR_SECOND",
+            "MINUTE_SECOND",
+        ];
+        const MYSQL_CREATE_EVENT_AFTER_INTERVAL_KEYWORDS: &[&str] =
+            &["COMMENT", "DISABLE", "DO", "ENABLE", "ENDS", "ON", "STARTS"];
+        const MYSQL_ALTER_EVENT_AFTER_INTERVAL_KEYWORDS: &[&str] =
+            &["COMMENT", "DISABLE", "DO", "ENABLE", "ENDS", "ON", "RENAME", "STARTS"];
+        const MYSQL_CREATE_IF_NOT_EXISTS_OBJECT_TYPES: &[&str] =
+            &["DATABASE", "ROLE", "SCHEMA", "TABLE", "USER"];
+        const MYSQL_DROP_IF_EXISTS_OBJECT_TYPES: &[&str] = &[
+            "DATABASE",
+            "EVENT",
+            "FUNCTION",
+            "PROCEDURE",
+            "ROLE",
+            "SCHEMA",
+            "SERVER",
+            "TABLE",
+            "TRIGGER",
+            "USER",
+            "VIEW",
+        ];
+        const MYSQL_XA_HEAD_KEYWORDS: &[&str] = &[
+            "BEGIN", "COMMIT", "END", "PREPARE", "RECOVER", "ROLLBACK", "START",
+        ];
+
+        let expected_view_prefix_candidates =
+            |words: &[String]| -> Option<&'static [&'static str]> {
+                let verb_pos = words
+                    .iter()
+                    .rposition(|word| matches!(word.as_str(), "ALTER" | "CREATE"))?;
+                let verb = words[verb_pos].as_str();
+                let mut idx = verb_pos + 1;
+                if idx >= words.len() {
+                    return None;
+                }
+
+                if verb == "ALTER" && idx == words.len() {
+                    return Some(MYSQL_VIEW_PREFIX_AFTER_VERB);
+                }
+
+                if verb == "CREATE" && words[idx] == "OR" {
+                    if idx + 1 == words.len() {
+                        return Some(&["REPLACE"]);
+                    }
+                    if words.get(idx + 1).map(String::as_str) != Some("REPLACE") {
+                        return None;
+                    }
+                    idx += 2;
+                    if idx == words.len() {
+                        return Some(MYSQL_VIEW_PREFIX_AFTER_REPLACE);
+                    }
+                }
+
+                if words.get(idx).map(String::as_str) == Some("ALGORITHM") {
+                    if idx + 1 == words.len() {
+                        return Some(MYSQL_VIEW_ALGORITHM_VALUES);
+                    }
+                    if !MYSQL_VIEW_ALGORITHM_VALUES.contains(&words[idx + 1].as_str()) {
+                        return None;
+                    }
+                    idx += 2;
+                    if idx == words.len() {
+                        return Some(MYSQL_VIEW_PREFIX_AFTER_ALGORITHM);
+                    }
+                }
+
+                if words.get(idx).map(String::as_str) == Some("DEFINER") {
+                    if idx + 1 >= words.len() {
+                        return None;
+                    }
+                    idx += 2;
+                    if idx == words.len() {
+                        if verb == "CREATE" {
+                            return Some(MYSQL_CREATE_AFTER_DEFINER_KEYWORDS);
+                        }
+                        return Some(MYSQL_ALTER_AFTER_DEFINER_KEYWORDS);
+                    }
+                }
+
+                if words.get(idx).map(String::as_str) == Some("SQL") {
+                    if idx + 1 == words.len() {
+                        return Some(&["SECURITY"]);
+                    }
+                    if words.get(idx + 1).map(String::as_str) != Some("SECURITY") {
+                        return None;
+                    }
+                    if idx + 2 == words.len() {
+                        return Some(MYSQL_VIEW_SECURITY_VALUES);
+                    }
+                    if !MYSQL_VIEW_SECURITY_VALUES.contains(&words[idx + 2].as_str()) {
+                        return None;
+                    }
+                    idx += 3;
+                    if idx == words.len() {
+                        return Some(&["VIEW"]);
+                    }
+                }
+
+                if words.get(idx).map(String::as_str) == Some("VIEW") {
+                    if idx + 2 == words.len() {
+                        return Some(&["AS"]);
+                    }
+                }
+
+                None
+            };
+
+        if let Some(candidates) = expected_view_prefix_candidates(words) {
+            return Some(candidates);
+        }
+
+        let expected_create_trigger_candidates =
+            |words: &[String]| -> Option<&'static [&'static str]> {
+                let create_pos = words.iter().rposition(|word| word == "CREATE")?;
+                let mut idx = create_pos + 1;
+                if idx >= words.len() {
+                    return None;
+                }
+
+                if words.get(idx).map(String::as_str) == Some("DEFINER") {
+                    if idx + 1 >= words.len() {
+                        return None;
+                    }
+                    idx += 2;
+                }
+
+                if words.get(idx).map(String::as_str) != Some("TRIGGER") {
+                    return None;
+                }
+                idx += 1;
+
+                if idx == words.len() {
+                    return Some(&["IF"]);
+                }
+
+                if words.get(idx).map(String::as_str) == Some("IF") {
+                    if idx + 1 == words.len() {
+                        return Some(&["NOT"]);
+                    }
+                    if words.get(idx + 1).map(String::as_str) != Some("NOT") {
+                        return None;
+                    }
+                    if idx + 2 == words.len() {
+                        return Some(&["EXISTS"]);
+                    }
+                    if words.get(idx + 2).map(String::as_str) != Some("EXISTS") {
+                        return None;
+                    }
+                    idx += 3;
+                }
+
+                if idx == words.len() {
+                    return None;
+                }
+
+                idx += 1;
+                if idx == words.len() {
+                    return Some(MYSQL_TRIGGER_TIMING_KEYWORDS);
+                }
+
+                if !MYSQL_TRIGGER_TIMING_KEYWORDS.contains(&words[idx].as_str()) {
+                    return None;
+                }
+                idx += 1;
+                if idx == words.len() {
+                    return Some(MYSQL_TRIGGER_EVENT_KEYWORDS);
+                }
+
+                if !MYSQL_TRIGGER_EVENT_KEYWORDS.contains(&words[idx].as_str()) {
+                    return None;
+                }
+                idx += 1;
+                if idx == words.len() {
+                    return Some(&["ON"]);
+                }
+
+                if words.get(idx).map(String::as_str) != Some("ON") {
+                    return None;
+                }
+                idx += 1;
+                if idx >= words.len() {
+                    return None;
+                }
+
+                idx += 1;
+                if idx == words.len() {
+                    return Some(&["FOR"]);
+                }
+
+                if words.get(idx).map(String::as_str) != Some("FOR") {
+                    return None;
+                }
+                idx += 1;
+                if idx == words.len() {
+                    return Some(&["EACH"]);
+                }
+
+                if words.get(idx).map(String::as_str) != Some("EACH") {
+                    return None;
+                }
+                idx += 1;
+                if idx == words.len() {
+                    return Some(&["ROW"]);
+                }
+
+                if words.get(idx).map(String::as_str) == Some("ROW") {
+                    if idx + 1 == words.len() {
+                        return Some(MYSQL_TRIGGER_ORDER_KEYWORDS);
+                    }
+                }
+
+                None
+            };
+
+        if let Some(candidates) = expected_create_trigger_candidates(words) {
+            return Some(candidates);
+        }
+
+        let event_tail_candidates = |verb: &str| -> &'static [&'static str] {
+            if verb == "ALTER" {
+                MYSQL_EVENT_ALTER_TAIL_KEYWORDS
+            } else {
+                MYSQL_EVENT_CREATE_TAIL_KEYWORDS
+            }
+        };
+
+        let event_after_interval_candidates = |verb: &str| -> &'static [&'static str] {
+            if verb == "ALTER" {
+                MYSQL_ALTER_EVENT_AFTER_INTERVAL_KEYWORDS
+            } else {
+                MYSQL_CREATE_EVENT_AFTER_INTERVAL_KEYWORDS
+            }
+        };
+
+        let expected_event_tail_candidates = |words: &[String],
+                                             idx: usize,
+                                             verb: &str|
+         -> Option<&'static [&'static str]> {
+            if idx >= words.len() {
+                return Some(event_tail_candidates(verb));
+            }
+
+            match words[idx].as_str() {
+                "ON" => match words.get(idx + 1).map(String::as_str) {
+                    None => Some(&["COMPLETION"]),
+                    Some("COMPLETION") => {
+                        if idx + 2 == words.len() {
+                            return Some(&["NOT", "PRESERVE"]);
+                        }
+                        if words.get(idx + 2).map(String::as_str) == Some("NOT") {
+                            if idx + 3 == words.len() {
+                                return Some(&["PRESERVE"]);
+                            }
+                            if words.get(idx + 3).map(String::as_str) == Some("PRESERVE")
+                                && idx + 4 == words.len()
+                            {
+                                return Some(event_tail_candidates(verb));
+                            }
+                            return None;
+                        }
+                        if words.get(idx + 2).map(String::as_str) == Some("PRESERVE")
+                            && idx + 3 == words.len()
+                        {
+                            return Some(event_tail_candidates(verb));
+                        }
+                        None
+                    }
+                    _ => None,
+                },
+                "DISABLE" => {
+                    if idx + 1 == words.len() {
+                        Some(&["ON"])
+                    } else if words.get(idx + 1).map(String::as_str) == Some("ON")
+                        && idx + 2 == words.len()
+                    {
+                        Some(&["REPLICA", "SLAVE"])
+                    } else if idx + 3 == words.len()
+                        && words.get(idx + 1).map(String::as_str) == Some("ON")
+                        && matches!(
+                            words.get(idx + 2).map(String::as_str),
+                            Some("REPLICA" | "SLAVE")
+                        )
+                    {
+                        Some(event_tail_candidates(verb))
+                    } else {
+                        None
+                    }
+                }
+                "ENABLE" => {
+                    if idx + 1 == words.len() {
+                        Some(event_tail_candidates(verb))
+                    } else {
+                        None
+                    }
+                }
+                "RENAME" if verb == "ALTER" => {
+                    if idx + 1 == words.len() {
+                        Some(&["TO"])
+                    } else {
+                        None
+                    }
+                }
+                "COMMENT" | "DO" => None,
+                _ => None,
+            }
+        };
+
+        let expected_event_candidates =
+            |words: &[String]| -> Option<&'static [&'static str]> {
+                let verb_pos = words
+                    .iter()
+                    .rposition(|word| matches!(word.as_str(), "ALTER" | "CREATE"))?;
+                let verb = words[verb_pos].as_str();
+                let mut idx = verb_pos + 1;
+                if idx >= words.len() {
+                    return None;
+                }
+
+                if words.get(idx).map(String::as_str) == Some("DEFINER") {
+                    if idx + 1 >= words.len() {
+                        return None;
+                    }
+                    idx += 2;
+                }
+
+                if words.get(idx).map(String::as_str) != Some("EVENT") {
+                    return None;
+                }
+                idx += 1;
+
+                if verb == "CREATE" {
+                    if idx == words.len() {
+                        return Some(&["IF"]);
+                    }
+                    if words.get(idx).map(String::as_str) == Some("IF") {
+                        if idx + 1 == words.len() {
+                            return Some(&["NOT"]);
+                        }
+                        if words.get(idx + 1).map(String::as_str) != Some("NOT") {
+                            return None;
+                        }
+                        if idx + 2 == words.len() {
+                            return Some(&["EXISTS"]);
+                        }
+                        if words.get(idx + 2).map(String::as_str) != Some("EXISTS") {
+                            return None;
+                        }
+                        idx += 3;
+                    }
+                }
+
+                if idx >= words.len() {
+                    return None;
+                }
+
+                idx += 1;
+                let first_clause_idx = idx;
+                if idx == words.len() {
+                    return if verb == "CREATE" {
+                        Some(&["ON"])
+                    } else {
+                        Some(event_tail_candidates(verb))
+                    };
+                }
+
+                match words[idx].as_str() {
+                    "ON" => {
+                        if idx + 1 == words.len() {
+                            return if verb == "CREATE" && idx == first_clause_idx {
+                                Some(&["SCHEDULE"])
+                            } else if idx == first_clause_idx {
+                                Some(&["COMPLETION", "SCHEDULE"])
+                            } else {
+                                Some(&["COMPLETION"])
+                            };
+                        }
+                        match words.get(idx + 1).map(String::as_str) {
+                            Some("SCHEDULE") => {
+                                if idx + 2 == words.len() {
+                                    return Some(MYSQL_EVENT_SCHEDULE_HEAD_KEYWORDS);
+                                }
+                                match words.get(idx + 2).map(String::as_str) {
+                                    Some("AT") => {
+                                        if idx + 4 == words.len() {
+                                            Some(event_tail_candidates(verb))
+                                        } else if idx + 4 < words.len() {
+                                            expected_event_tail_candidates(words, idx + 4, verb)
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                    Some("EVERY") => {
+                                        if idx + 4 == words.len() {
+                                            return Some(MYSQL_EVENT_INTERVAL_UNIT_KEYWORDS);
+                                        }
+                                        if idx + 5 == words.len()
+                                            && MYSQL_EVENT_INTERVAL_UNIT_KEYWORDS
+                                                .contains(&words[idx + 4].as_str())
+                                        {
+                                            return Some(event_after_interval_candidates(verb));
+                                        }
+                                        if idx + 5 < words.len()
+                                            && MYSQL_EVENT_INTERVAL_UNIT_KEYWORDS
+                                                .contains(&words[idx + 4].as_str())
+                                        {
+                                            return expected_event_tail_candidates(
+                                                words,
+                                                idx + 5,
+                                                verb,
+                                            );
+                                        }
+                                        None
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            Some("COMPLETION") => {
+                                if idx + 2 == words.len() {
+                                    return Some(&["NOT", "PRESERVE"]);
+                                }
+                                if words.get(idx + 2).map(String::as_str) == Some("NOT") {
+                                    if idx + 3 == words.len() {
+                                        return Some(&["PRESERVE"]);
+                                    }
+                                    if words.get(idx + 3).map(String::as_str) == Some("PRESERVE")
+                                        && idx + 4 == words.len()
+                                    {
+                                        return Some(event_tail_candidates(verb));
+                                    }
+                                    return None;
+                                }
+                                if words.get(idx + 2).map(String::as_str) == Some("PRESERVE")
+                                    && idx + 3 == words.len()
+                                {
+                                    return Some(event_tail_candidates(verb));
+                                }
+                                None
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => expected_event_tail_candidates(words, idx, verb),
+                }
+            };
+
+        if let Some(candidates) = expected_event_candidates(words) {
+            return Some(candidates);
+        }
+
+        let expected_routine_characteristic_candidates =
+            |words: &[String], idx: usize| -> Option<&'static [&'static str]> {
+                if idx >= words.len() {
+                    return Some(MYSQL_ROUTINE_CHARACTERISTIC_HEAD_KEYWORDS);
+                }
+
+                match words[idx].as_str() {
+                    "COMMENT" => None,
+                    "LANGUAGE" => {
+                        if idx + 1 == words.len() {
+                            Some(&["SQL"])
+                        } else if words.get(idx + 1).map(String::as_str) == Some("SQL")
+                            && idx + 2 == words.len()
+                        {
+                            Some(MYSQL_ROUTINE_CHARACTERISTIC_HEAD_KEYWORDS)
+                        } else {
+                            None
+                        }
+                    }
+                    "NOT" => {
+                        if idx + 1 == words.len() {
+                            Some(&["DETERMINISTIC"])
+                        } else if words.get(idx + 1).map(String::as_str) == Some("DETERMINISTIC")
+                            && idx + 2 == words.len()
+                        {
+                            Some(MYSQL_ROUTINE_CHARACTERISTIC_HEAD_KEYWORDS)
+                        } else {
+                            None
+                        }
+                    }
+                    "CONTAINS" | "NO" => {
+                        if idx + 1 == words.len() {
+                            Some(&["SQL"])
+                        } else if words.get(idx + 1).map(String::as_str) == Some("SQL")
+                            && idx + 2 == words.len()
+                        {
+                            Some(MYSQL_ROUTINE_CHARACTERISTIC_HEAD_KEYWORDS)
+                        } else {
+                            None
+                        }
+                    }
+                    "READS" | "MODIFIES" => {
+                        if idx + 1 == words.len() {
+                            Some(&["SQL"])
+                        } else if words.get(idx + 1).map(String::as_str) == Some("SQL")
+                            && idx + 2 == words.len()
+                        {
+                            Some(&["DATA"])
+                        } else if words.get(idx + 1).map(String::as_str) == Some("SQL")
+                            && words.get(idx + 2).map(String::as_str) == Some("DATA")
+                            && idx + 3 == words.len()
+                        {
+                            Some(MYSQL_ROUTINE_CHARACTERISTIC_HEAD_KEYWORDS)
+                        } else {
+                            None
+                        }
+                    }
+                    "SQL" => {
+                        if idx + 1 == words.len() {
+                            Some(MYSQL_ROUTINE_SQL_TAIL_KEYWORDS)
+                        } else if words.get(idx + 1).map(String::as_str) == Some("SECURITY")
+                            && idx + 2 == words.len()
+                        {
+                            Some(MYSQL_VIEW_SECURITY_VALUES)
+                        } else if words.get(idx + 1).map(String::as_str) == Some("SECURITY")
+                            && matches!(
+                                words.get(idx + 2).map(String::as_str),
+                                Some("DEFINER" | "INVOKER")
+                            )
+                            && idx + 3 == words.len()
+                        {
+                            Some(MYSQL_ROUTINE_CHARACTERISTIC_HEAD_KEYWORDS)
+                        } else {
+                            None
+                        }
+                    }
+                    "DETERMINISTIC" => {
+                        if idx + 1 == words.len() {
+                            Some(MYSQL_ROUTINE_CHARACTERISTIC_HEAD_KEYWORDS)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            };
+
+        let expected_routine_candidates =
+            |words: &[String]| -> Option<&'static [&'static str]> {
+                let verb_pos = words
+                    .iter()
+                    .rposition(|word| matches!(word.as_str(), "ALTER" | "CREATE"))?;
+                let verb = words[verb_pos].as_str();
+                let mut idx = verb_pos + 1;
+                if idx >= words.len() {
+                    return None;
+                }
+
+                if verb == "CREATE" && words.get(idx).map(String::as_str) == Some("DEFINER") {
+                    if idx + 1 >= words.len() {
+                        return None;
+                    }
+                    idx += 2;
+                }
+
+                let routine_kind = words.get(idx).map(String::as_str)?;
+                if !matches!(routine_kind, "FUNCTION" | "PROCEDURE") {
+                    return None;
+                }
+                idx += 1;
+
+                if verb == "CREATE" {
+                    if idx == words.len() {
+                        return Some(&["IF"]);
+                    }
+                    if words.get(idx).map(String::as_str) == Some("IF") {
+                        if idx + 1 == words.len() {
+                            return Some(&["NOT"]);
+                        }
+                        if words.get(idx + 1).map(String::as_str) != Some("NOT") {
+                            return None;
+                        }
+                        if idx + 2 == words.len() {
+                            return Some(&["EXISTS"]);
+                        }
+                        if words.get(idx + 2).map(String::as_str) != Some("EXISTS") {
+                            return None;
+                        }
+                        idx += 3;
+                    }
+                }
+
+                if idx >= words.len() {
+                    return None;
+                }
+
+                // Routine name. Parameter-list symbols are intentionally ignored by
+                // the word collector, so this covers both `name |` and `name () |`.
+                idx += 1;
+                if idx == words.len() {
+                    return if routine_kind == "FUNCTION" && verb == "CREATE" {
+                        Some(&["RETURNS"])
+                    } else {
+                        Some(MYSQL_ROUTINE_CHARACTERISTIC_HEAD_KEYWORDS)
+                    };
+                }
+
+                if routine_kind == "FUNCTION" && verb == "CREATE" {
+                    if words.get(idx).map(String::as_str) != Some("RETURNS") {
+                        return None;
+                    }
+                    idx += 1;
+                    if idx >= words.len() {
+                        return None;
+                    }
+                    // Return type. Complex types may contain multiple words; use the
+                    // last word as the start of the characteristic tail when present.
+                    idx += 1;
+                    if idx == words.len() {
+                        return Some(MYSQL_ROUTINE_CHARACTERISTIC_HEAD_KEYWORDS);
+                    }
+                }
+
+                expected_routine_characteristic_candidates(words, idx)
+            };
+
+        if let Some(candidates) = expected_routine_candidates(words) {
+            return Some(candidates);
+        }
+
+        let database_option_heads = |verb: &str| -> &'static [&'static str] {
+            if verb == "ALTER" {
+                MYSQL_ALTER_DATABASE_OPTION_HEAD_KEYWORDS
+            } else {
+                MYSQL_CREATE_DATABASE_OPTION_HEAD_KEYWORDS
+            }
+        };
+
+        let expected_database_option_candidates =
+            |words: &[String], idx: usize, verb: &str| -> Option<&'static [&'static str]> {
+                if idx >= words.len() {
+                    return Some(database_option_heads(verb));
+                }
+
+                match words[idx].as_str() {
+                    "DEFAULT" => {
+                        if idx + 1 == words.len() {
+                            Some(MYSQL_DATABASE_AFTER_DEFAULT_KEYWORDS)
+                        } else {
+                            match words.get(idx + 1).map(String::as_str) {
+                                Some("CHARACTER") => {
+                                    if idx + 2 == words.len() {
+                                        Some(&["SET"])
+                                    } else if words.get(idx + 2).map(String::as_str) == Some("SET")
+                                        && idx + 4 == words.len()
+                                    {
+                                        Some(database_option_heads(verb))
+                                    } else {
+                                        None
+                                    }
+                                }
+                                Some("COLLATE" | "ENCRYPTION") => {
+                                    if idx + 3 == words.len() {
+                                        Some(database_option_heads(verb))
+                                    } else {
+                                        None
+                                    }
+                                }
+                                _ => None,
+                            }
+                        }
+                    }
+                    "CHARACTER" => {
+                        if idx + 1 == words.len() {
+                            Some(&["SET"])
+                        } else if words.get(idx + 1).map(String::as_str) == Some("SET")
+                            && idx + 3 == words.len()
+                        {
+                            Some(database_option_heads(verb))
+                        } else {
+                            None
+                        }
+                    }
+                    "COLLATE" | "ENCRYPTION" => {
+                        if idx + 2 == words.len() {
+                            Some(database_option_heads(verb))
+                        } else {
+                            None
+                        }
+                    }
+                    "READ" if verb == "ALTER" => {
+                        if idx + 1 == words.len() {
+                            Some(&["ONLY"])
+                        } else if words.get(idx + 1).map(String::as_str) == Some("ONLY") {
+                            if idx + 2 == words.len() {
+                                Some(&["DEFAULT"])
+                            } else if idx + 3 == words.len()
+                                && words.get(idx + 2).map(String::as_str) == Some("DEFAULT")
+                            {
+                                Some(database_option_heads(verb))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            };
+
+        let expected_database_candidates =
+            |words: &[String]| -> Option<&'static [&'static str]> {
+                let verb_pos = words
+                    .iter()
+                    .rposition(|word| matches!(word.as_str(), "ALTER" | "CREATE"))?;
+                let verb = words[verb_pos].as_str();
+                let mut idx = verb_pos + 1;
+                if !matches!(
+                    words.get(idx).map(String::as_str),
+                    Some("DATABASE" | "SCHEMA")
+                ) {
+                    return None;
+                }
+                idx += 1;
+
+                if verb == "CREATE" {
+                    if idx == words.len() {
+                        return Some(&["IF"]);
+                    }
+                    if words.get(idx).map(String::as_str) == Some("IF") {
+                        if idx + 1 == words.len() {
+                            return Some(&["NOT"]);
+                        }
+                        if words.get(idx + 1).map(String::as_str) != Some("NOT") {
+                            return None;
+                        }
+                        if idx + 2 == words.len() {
+                            return Some(&["EXISTS"]);
+                        }
+                        if words.get(idx + 2).map(String::as_str) != Some("EXISTS") {
+                            return None;
+                        }
+                        idx += 3;
+                    }
+                }
+
+                if idx >= words.len() {
+                    return if verb == "ALTER" {
+                        Some(database_option_heads(verb))
+                    } else {
+                        None
+                    };
+                }
+
+                let current = words[idx].as_str();
+                if database_option_heads(verb).contains(&current) {
+                    return expected_database_option_candidates(words, idx, verb);
+                }
+
+                idx += 1;
+                expected_database_option_candidates(words, idx, verb)
+            };
+
+        if let Some(candidates) = expected_database_candidates(words) {
+            return Some(candidates);
+        }
+
+        let expected_server_candidates =
+            |words: &[String]| -> Option<&'static [&'static str]> {
+                let verb_pos = words
+                    .iter()
+                    .rposition(|word| matches!(word.as_str(), "ALTER" | "CREATE"))?;
+                let verb = words[verb_pos].as_str();
+                let mut idx = verb_pos + 1;
+                if words.get(idx).map(String::as_str) != Some("SERVER") {
+                    return None;
+                }
+                idx += 1;
+
+                if verb == "CREATE" {
+                    if idx >= words.len() {
+                        return None;
+                    }
+                    idx += 1;
+                    if idx == words.len() {
+                        return Some(&["FOREIGN"]);
+                    }
+                    if words.get(idx).map(String::as_str) != Some("FOREIGN") {
+                        return None;
+                    }
+                    idx += 1;
+                    if idx == words.len() {
+                        return Some(&["DATA"]);
+                    }
+                    if words.get(idx).map(String::as_str) != Some("DATA") {
+                        return None;
+                    }
+                    idx += 1;
+                    if idx == words.len() {
+                        return Some(&["WRAPPER"]);
+                    }
+                    if words.get(idx).map(String::as_str) != Some("WRAPPER") {
+                        return None;
+                    }
+                    idx += 1;
+                    if idx >= words.len() {
+                        return None;
+                    }
+                    idx += 1;
+                    if idx == words.len() {
+                        return Some(&["OPTIONS"]);
+                    }
+                } else {
+                    if idx >= words.len() {
+                        return None;
+                    }
+                    idx += 1;
+                    if idx == words.len() {
+                        return Some(&["OPTIONS"]);
+                    }
+                }
+
+                if words.get(idx).map(String::as_str) == Some("OPTIONS") {
+                    if idx + 1 == words.len() {
+                        return Some(MYSQL_SERVER_OPTION_KEYWORDS);
+                    }
+                    if MYSQL_SERVER_OPTION_KEYWORDS.contains(&words[idx + 1].as_str()) {
+                        if idx + 3 == words.len() {
+                            return Some(MYSQL_SERVER_OPTION_KEYWORDS);
+                        }
+                    }
+                }
+
+                None
+            };
+
+        if let Some(candidates) = expected_server_candidates(words) {
+            return Some(candidates);
+        }
+
+        let expected_alter_instance_candidates =
+            |words: &[String]| -> Option<&'static [&'static str]> {
+                let alter_pos = words.iter().rposition(|word| word == "ALTER")?;
+                let mut idx = alter_pos + 1;
+                if words.get(idx).map(String::as_str) != Some("INSTANCE") {
+                    return None;
+                }
+                idx += 1;
+                if idx == words.len() {
+                    return Some(MYSQL_ALTER_INSTANCE_ACTION_KEYWORDS);
+                }
+
+                match words.get(idx).map(String::as_str) {
+                    Some("ENABLE" | "DISABLE") => {
+                        if idx + 1 == words.len() {
+                            return Some(&["INNODB"]);
+                        }
+                        if words.get(idx + 1).map(String::as_str) == Some("INNODB")
+                            && idx + 2 == words.len()
+                        {
+                            return Some(&["REDO_LOG"]);
+                        }
+                        None
+                    }
+                    Some("ROTATE") => {
+                        idx += 1;
+                        if idx == words.len() {
+                            return Some(MYSQL_ALTER_INSTANCE_ROTATE_TARGET_KEYWORDS);
+                        }
+                        if !matches!(
+                            words.get(idx).map(String::as_str),
+                            Some("BINLOG" | "INNODB")
+                        ) {
+                            return None;
+                        }
+                        idx += 1;
+                        if idx == words.len() {
+                            return Some(&["MASTER"]);
+                        }
+                        if words.get(idx).map(String::as_str) == Some("MASTER")
+                            && idx + 1 == words.len()
+                        {
+                            return Some(&["KEY"]);
+                        }
+                        None
+                    }
+                    Some("RELOAD") => {
+                        idx += 1;
+                        if idx == words.len() {
+                            return Some(MYSQL_ALTER_INSTANCE_RELOAD_TARGET_KEYWORDS);
+                        }
+                        match words.get(idx).map(String::as_str) {
+                            Some("KEYRING") => None,
+                            Some("TLS") => {
+                                idx += 1;
+                                if idx == words.len() {
+                                    return Some(MYSQL_ALTER_INSTANCE_TLS_TAIL_KEYWORDS);
+                                }
+                                if words.get(idx).map(String::as_str) == Some("FOR") {
+                                    idx += 1;
+                                    if idx == words.len() {
+                                        return Some(&["CHANNEL"]);
+                                    }
+                                    if words.get(idx).map(String::as_str) != Some("CHANNEL") {
+                                        return None;
+                                    }
+                                    idx += 1;
+                                    if idx == words.len() {
+                                        return Some(MYSQL_ALTER_INSTANCE_TLS_CHANNEL_VALUES);
+                                    }
+                                    if !MYSQL_ALTER_INSTANCE_TLS_CHANNEL_VALUES
+                                        .contains(&words[idx].as_str())
+                                    {
+                                        return None;
+                                    }
+                                    idx += 1;
+                                    if idx == words.len() {
+                                        return Some(&["NO"]);
+                                    }
+                                }
+                                if words.get(idx).map(String::as_str) == Some("NO") {
+                                    idx += 1;
+                                    if idx == words.len() {
+                                        return Some(&["ROLLBACK"]);
+                                    }
+                                    if words.get(idx).map(String::as_str) != Some("ROLLBACK") {
+                                        return None;
+                                    }
+                                    idx += 1;
+                                    if idx == words.len() {
+                                        return Some(&["ON"]);
+                                    }
+                                    if words.get(idx).map(String::as_str) == Some("ON")
+                                        && idx + 1 == words.len()
+                                    {
+                                        return Some(&["ERROR"]);
+                                    }
+                                }
+                                None
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                }
+            };
+
+        if let Some(candidates) = expected_alter_instance_candidates(words) {
+            return Some(candidates);
+        }
+
+        let alter_user_items: Vec<String> = Self::meaningful_tokens_before(tokens, end)
+            .into_iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                SqlToken::String(_) => Some("__VALUE__".to_string()),
+                SqlToken::Symbol(sym) if matches!(sym.as_str(), "@" | "." | ",") => {
+                    Some(sym.clone())
+                }
+                SqlToken::Symbol(_) | SqlToken::Comment(_) => None,
+            })
+            .collect();
+        let account_segment_is_complete = |segment: &[String]| {
+            !segment.is_empty()
+                && !matches!(
+                    segment.last().map(String::as_str),
+                    Some("@" | "." | ",")
+                )
+        };
+        let alter_user_after_auth_candidates = |tail: &[String]| -> &'static [&'static str] {
+            if tail.iter().any(|item| item == "PASSWORD") {
+                MYSQL_ALTER_USER_AFTER_PASSWORD_AUTH_KEYWORDS
+            } else {
+                MYSQL_ALTER_USER_AFTER_AUTH_KEYWORDS
+            }
+        };
+        let expected_alter_user_auth_candidates =
+            |tail: &[String]| -> Option<&'static [&'static str]> {
+                match tail {
+                    [word] if word == "IDENTIFIED" => Some(&["BY", "WITH"]),
+                    [a, b] if a == "IDENTIFIED" && b == "BY" => Some(&["RANDOM"]),
+                    [a, b, c] if a == "IDENTIFIED" && b == "BY" && c == "RANDOM" => {
+                        Some(&["PASSWORD"])
+                    }
+                    [a, b, c]
+                        if a == "IDENTIFIED" && b == "BY" && c == "__VALUE__" =>
+                    {
+                        Some(MYSQL_ALTER_USER_AUTH_TAIL_KEYWORDS)
+                    }
+                    [a, b, c, d]
+                        if a == "IDENTIFIED"
+                            && b == "BY"
+                            && c == "RANDOM"
+                            && d == "PASSWORD" =>
+                    {
+                        Some(MYSQL_ALTER_USER_AUTH_TAIL_KEYWORDS)
+                    }
+                    [a, b] if a == "IDENTIFIED" && b == "WITH" => None,
+                    [a, b, _plugin]
+                        if a == "IDENTIFIED" && b == "WITH" =>
+                    {
+                        Some(&["AS", "BY"])
+                    }
+                    [a, b, _plugin, d]
+                        if a == "IDENTIFIED" && b == "WITH" && d == "BY" =>
+                    {
+                        Some(&["RANDOM"])
+                    }
+                    [a, b, _plugin, d, e]
+                        if a == "IDENTIFIED"
+                            && b == "WITH"
+                            && d == "BY"
+                            && e == "RANDOM" =>
+                    {
+                        Some(&["PASSWORD"])
+                    }
+                    [a, b, _plugin, d, e]
+                        if a == "IDENTIFIED"
+                            && b == "WITH"
+                            && d == "BY"
+                            && e == "__VALUE__" =>
+                    {
+                        Some(MYSQL_ALTER_USER_AUTH_TAIL_KEYWORDS)
+                    }
+                    [a, b, _plugin, d, e, f]
+                        if a == "IDENTIFIED"
+                            && b == "WITH"
+                            && d == "BY"
+                            && e == "RANDOM"
+                            && f == "PASSWORD" =>
+                    {
+                        Some(MYSQL_ALTER_USER_AUTH_TAIL_KEYWORDS)
+                    }
+                    [a, b, _plugin, d]
+                        if a == "IDENTIFIED" && b == "WITH" && d == "AS" =>
+                    {
+                        None
+                    }
+                    [a, b, _plugin, d, e]
+                        if a == "IDENTIFIED"
+                            && b == "WITH"
+                            && d == "AS"
+                            && e == "__VALUE__" =>
+                    {
+                        Some(MYSQL_ALTER_USER_AFTER_AUTH_KEYWORDS)
+                    }
+                    [.., last] if last == "REPLACE" => None,
+                    [.., a, b] if a == "REPLACE" && b == "__VALUE__" => Some(&["RETAIN"]),
+                    [.., last] if last == "RETAIN" => Some(&["CURRENT"]),
+                    [.., a, b] if a == "RETAIN" && b == "CURRENT" => Some(&["PASSWORD"]),
+                    [.., a, b, c] if a == "RETAIN" && b == "CURRENT" && c == "PASSWORD" => {
+                        Some(alter_user_after_auth_candidates(tail))
+                    }
+                    _ => None,
+                }
+            };
+        let expected_alter_user_require_candidates =
+            |tail: &[String]| -> Option<&'static [&'static str]> {
+                match tail {
+                    [word] if word == "REQUIRE" => Some(MYSQL_ALTER_USER_REQUIRE_KEYWORDS),
+                    [a, b] if a == "REQUIRE" && b == "NONE" => {
+                        Some(MYSQL_ALTER_USER_AFTER_AUTH_KEYWORDS)
+                    }
+                    [a, b] if a == "REQUIRE" && matches!(b.as_str(), "SSL" | "X509") => {
+                        Some(MYSQL_ALTER_USER_REQUIRE_AFTER_TLS_KEYWORDS)
+                    }
+                    [a, b] if a == "REQUIRE" && matches!(b.as_str(), "CIPHER" | "ISSUER" | "SUBJECT") => {
+                        None
+                    }
+                    [a, b, c]
+                        if a == "REQUIRE"
+                            && matches!(b.as_str(), "CIPHER" | "ISSUER" | "SUBJECT")
+                            && c == "__VALUE__" =>
+                    {
+                        Some(MYSQL_ALTER_USER_REQUIRE_AFTER_TLS_KEYWORDS)
+                    }
+                    [.., last] if last == "AND" => Some(MYSQL_ALTER_USER_REQUIRE_KEYWORDS),
+                    _ => None,
+                }
+            };
+        let expected_alter_user_password_candidates =
+            |tail: &[String]| -> Option<&'static [&'static str]> {
+                match tail {
+                    [word] if word == "PASSWORD" => Some(MYSQL_ALTER_USER_PASSWORD_OPTION_KEYWORDS),
+                    [a, b] if a == "PASSWORD" && b == "EXPIRE" => {
+                        Some(MYSQL_ALTER_USER_PASSWORD_EXPIRE_KEYWORDS)
+                    }
+                    [a, b, c]
+                        if a == "PASSWORD"
+                            && b == "EXPIRE"
+                            && matches!(c.as_str(), "DEFAULT" | "NEVER") =>
+                    {
+                        Some(MYSQL_ALTER_USER_AFTER_AUTH_KEYWORDS)
+                    }
+                    [a, b, c] if a == "PASSWORD" && b == "EXPIRE" && c == "INTERVAL" => None,
+                    [a, b, c, _n]
+                        if a == "PASSWORD" && b == "EXPIRE" && c == "INTERVAL" =>
+                    {
+                        Some(&["DAY"])
+                    }
+                    [a, b] if a == "PASSWORD" && b == "HISTORY" => Some(&["DEFAULT"]),
+                    [a, b, _value] if a == "PASSWORD" && b == "HISTORY" => {
+                        Some(MYSQL_ALTER_USER_AFTER_AUTH_KEYWORDS)
+                    }
+                    [a, b] if a == "PASSWORD" && b == "REUSE" => Some(&["INTERVAL"]),
+                    [a, b, c] if a == "PASSWORD" && b == "REUSE" && c == "INTERVAL" => {
+                        Some(&["DEFAULT"])
+                    }
+                    [a, b, c, d]
+                        if a == "PASSWORD"
+                            && b == "REUSE"
+                            && c == "INTERVAL"
+                            && d != "DEFAULT" =>
+                    {
+                        Some(&["DAY"])
+                    }
+                    [a, b] if a == "PASSWORD" && b == "REQUIRE" => {
+                        Some(MYSQL_ALTER_USER_PASSWORD_REQUIRE_KEYWORDS)
+                    }
+                    [a, b, c]
+                        if a == "PASSWORD" && b == "REQUIRE" && c == "CURRENT" =>
+                    {
+                        Some(MYSQL_ALTER_USER_PASSWORD_CURRENT_KEYWORDS)
+                    }
+                    [a, b, c, d]
+                        if a == "PASSWORD"
+                            && b == "REQUIRE"
+                            && c == "CURRENT"
+                            && MYSQL_ALTER_USER_PASSWORD_CURRENT_KEYWORDS.contains(&d.as_str()) =>
+                    {
+                        Some(MYSQL_ALTER_USER_AFTER_AUTH_KEYWORDS)
+                    }
+                    _ => None,
+                }
+            };
+        let expected_alter_user_candidates =
+            |items: &[String]| -> Option<&'static [&'static str]> {
+                if !matches!(
+                    items,
+                    [a, b, ..] if a == "ALTER" && b == "USER"
+                ) {
+                    return None;
+                }
+                let mut idx = 2;
+                if idx == items.len() {
+                    return Some(&["IF"]);
+                }
+                if items.get(idx).map(String::as_str) == Some("IF") {
+                    idx += 1;
+                    if idx == items.len() {
+                        return Some(&["EXISTS"]);
+                    }
+                    if items.get(idx).map(String::as_str) != Some("EXISTS") {
+                        return None;
+                    }
+                    idx += 1;
+                }
+                if idx >= items.len() {
+                    return None;
+                }
+
+                let after_user = &items[idx..];
+                let option_start = after_user
+                    .iter()
+                    .position(|item| MYSQL_ALTER_USER_OPTION_HEAD_KEYWORDS.contains(&item.as_str()));
+                let account_segment = &after_user[..option_start.unwrap_or(after_user.len())];
+                if !account_segment_is_complete(account_segment) {
+                    return None;
+                }
+                let Some(option_start) = option_start else {
+                    return Some(MYSQL_ALTER_USER_OPTION_HEAD_KEYWORDS);
+                };
+                let tail = &after_user[option_start..];
+                match tail.first().map(String::as_str) {
+                    Some("IDENTIFIED") => expected_alter_user_auth_candidates(tail),
+                    Some("DISCARD") => match tail {
+                        [word] if word == "DISCARD" => Some(&["OLD"]),
+                        [a, b] if a == "DISCARD" && b == "OLD" => Some(&["PASSWORD"]),
+                        [a, b, c] if a == "DISCARD" && b == "OLD" && c == "PASSWORD" => {
+                            Some(MYSQL_ALTER_USER_AFTER_AUTH_KEYWORDS)
+                        }
+                        _ => None,
+                    },
+                    Some("ADD" | "MODIFY") => match tail {
+                        [.., factor] if matches!(factor.as_str(), "2" | "3") => {
+                            Some(&["FACTOR"])
+                        }
+                        [.., factor, last]
+                            if matches!(factor.as_str(), "2" | "3") && last == "FACTOR" =>
+                        {
+                            Some(&["IDENTIFIED"])
+                        }
+                        _ => None,
+                    },
+                    Some("DROP") => match tail {
+                        [.., factor] if matches!(factor.as_str(), "2" | "3") => {
+                            Some(&["FACTOR"])
+                        }
+                        [.., factor, last]
+                            if matches!(factor.as_str(), "2" | "3") && last == "FACTOR" =>
+                        {
+                            Some(MYSQL_ALTER_USER_AFTER_AUTH_KEYWORDS)
+                        }
+                        _ => None,
+                    },
+                    Some("REQUIRE") => expected_alter_user_require_candidates(tail),
+                    Some("WITH") => match tail {
+                        [word] if word == "WITH" => Some(MYSQL_ALTER_USER_RESOURCE_KEYWORDS),
+                        [.., option, _value]
+                            if MYSQL_ALTER_USER_RESOURCE_KEYWORDS.contains(&option.as_str()) =>
+                        {
+                            Some(MYSQL_ALTER_USER_RESOURCE_KEYWORDS)
+                        }
+                        _ => None,
+                    },
+                    Some("PASSWORD") => expected_alter_user_password_candidates(tail),
+                    Some("FAILED_LOGIN_ATTEMPTS") => {
+                        if tail.len() >= 2 {
+                            Some(MYSQL_ALTER_USER_AFTER_AUTH_KEYWORDS)
+                        } else {
+                            None
+                        }
+                    }
+                    Some("PASSWORD_LOCK_TIME") => {
+                        if tail.len() >= 2 {
+                            Some(MYSQL_ALTER_USER_AFTER_AUTH_KEYWORDS)
+                        } else {
+                            Some(&["UNBOUNDED"])
+                        }
+                    }
+                    Some("ACCOUNT") => match tail {
+                        [word] if word == "ACCOUNT" => Some(&["LOCK", "UNLOCK"]),
+                        [a, b] if a == "ACCOUNT" && matches!(b.as_str(), "LOCK" | "UNLOCK") => {
+                            Some(MYSQL_ALTER_USER_AFTER_AUTH_KEYWORDS)
+                        }
+                        _ => None,
+                    },
+                    Some("DEFAULT") => match tail {
+                        [word] if word == "DEFAULT" => Some(&["ROLE"]),
+                        [a, b] if a == "DEFAULT" && b == "ROLE" => {
+                            Some(MYSQL_ALTER_USER_DEFAULT_ROLE_KEYWORDS)
+                        }
+                        _ => None,
+                    },
+                    Some("COMMENT" | "ATTRIBUTE") => None,
+                    _ => None,
+                }
+            };
+
+        if let Some(candidates) = expected_alter_user_candidates(&alter_user_items) {
+            return Some(candidates);
+        }
+
+        let table_maintenance_items: Vec<String> = Self::meaningful_tokens_before(tokens, end)
+            .into_iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                SqlToken::String(_) => Some("__VALUE__".to_string()),
+                SqlToken::Symbol(sym) if matches!(sym.as_str(), "," | ".") => Some(sym.clone()),
+                SqlToken::Symbol(_) | SqlToken::Comment(_) => None,
+            })
+            .collect();
+        let table_name_segment_is_complete = |segment: &[String]| {
+            !segment.is_empty()
+                && !matches!(segment.last().map(String::as_str), Some("," | "."))
+        };
+        let expected_analyze_table_candidates =
+            |tail: &[String], table_segment: &[String]| -> Option<&'static [&'static str]> {
+                if tail.is_empty() {
+                    if table_name_segment_is_complete(table_segment)
+                        && !table_segment.iter().any(|item| item == ",")
+                    {
+                        return Some(MYSQL_ANALYZE_HISTOGRAM_HEAD_KEYWORDS);
+                    }
+                    return None;
+                }
+
+                match tail {
+                    [word] if word == "UPDATE" => Some(&["HISTOGRAM"]),
+                    [a, b] if a == "UPDATE" && b == "HISTOGRAM" => Some(&["ON"]),
+                    [a, b, c, cols @ ..]
+                        if a == "UPDATE" && b == "HISTOGRAM" && c == "ON" =>
+                    {
+                        if !table_name_segment_is_complete(cols) {
+                            return None;
+                        }
+                        if let Some(pos) = cols.iter().position(|item| item == "WITH") {
+                            let after_with = &cols[pos + 1..];
+                            return match after_with {
+                                [] => None,
+                                [_bucket_count] => Some(&["BUCKETS"]),
+                                [_bucket_count, buckets] if buckets == "BUCKETS" => {
+                                    Some(MYSQL_ANALYZE_HISTOGRAM_UPDATE_MODES)
+                                }
+                                [_bucket_count, buckets, mode]
+                                    if buckets == "BUCKETS"
+                                        && MYSQL_ANALYZE_HISTOGRAM_UPDATE_MODES
+                                            .contains(&mode.as_str()) =>
+                                {
+                                    Some(&["UPDATE"])
+                                }
+                                _ => None,
+                            };
+                        }
+                        if let Some(pos) = cols.iter().position(|item| item == "USING") {
+                            return if pos + 1 == cols.len() {
+                                Some(&["DATA"])
+                            } else {
+                                None
+                            };
+                        }
+                        if let Some(mode) = cols.last() {
+                            if MYSQL_ANALYZE_HISTOGRAM_UPDATE_MODES.contains(&mode.as_str()) {
+                                return Some(&["UPDATE"]);
+                            }
+                        }
+                        Some(MYSQL_ANALYZE_HISTOGRAM_AFTER_COLUMN_KEYWORDS)
+                    }
+                    [word] if word == "DROP" => Some(&["HISTOGRAM"]),
+                    [a, b] if a == "DROP" && b == "HISTOGRAM" => Some(&["ON"]),
+                    _ => None,
+                }
+            };
+        let expected_table_maintenance_candidates =
+            |items: &[String]| -> Option<&'static [&'static str]> {
+                let verb = items.first()?.as_str();
+                if !matches!(verb, "ANALYZE" | "CHECK" | "CHECKSUM" | "OPTIMIZE" | "REPAIR") {
+                    return None;
+                }
+
+                let mut idx = 1;
+                if matches!(verb, "ANALYZE" | "OPTIMIZE" | "REPAIR") {
+                    if idx == items.len() {
+                        return Some(MYSQL_LOGGED_TABLE_MAINTENANCE_HEAD_KEYWORDS);
+                    }
+                    if matches!(
+                        items.get(idx).map(String::as_str),
+                        Some("LOCAL" | "NO_WRITE_TO_BINLOG")
+                    ) {
+                        idx += 1;
+                        if idx == items.len() {
+                            return Some(&["TABLE"]);
+                        }
+                    }
+                } else if idx == items.len() {
+                    return Some(&["TABLE"]);
+                }
+
+                if items.get(idx).map(String::as_str) != Some("TABLE") {
+                    return None;
+                }
+                idx += 1;
+                if idx == items.len() {
+                    return None;
+                }
+
+                let tail_candidates = match verb {
+                    "ANALYZE" => MYSQL_ANALYZE_HISTOGRAM_HEAD_KEYWORDS,
+                    "CHECK" => MYSQL_CHECK_TABLE_OPTION_KEYWORDS,
+                    "CHECKSUM" => MYSQL_CHECKSUM_TABLE_OPTION_KEYWORDS,
+                    "REPAIR" => MYSQL_REPAIR_TABLE_OPTION_KEYWORDS,
+                    "OPTIMIZE" => &[][..],
+                    _ => &[][..],
+                };
+                let after_table = &items[idx..];
+                let tail_start = after_table
+                    .iter()
+                    .position(|item| tail_candidates.contains(&item.as_str()));
+                let table_segment_end = tail_start.unwrap_or(after_table.len());
+                let table_segment = &after_table[..table_segment_end];
+                if !table_name_segment_is_complete(table_segment) {
+                    return None;
+                }
+                let tail = tail_start.map_or(&[][..], |pos| &after_table[pos..]);
+
+                match verb {
+                    "ANALYZE" => expected_analyze_table_candidates(tail, table_segment),
+                    "CHECK" => match tail {
+                        [] => Some(MYSQL_CHECK_TABLE_OPTION_KEYWORDS),
+                        [word] if word == "FOR" => Some(&["UPGRADE"]),
+                        [a, b] if a == "FOR" && b == "UPGRADE" => {
+                            Some(MYSQL_CHECK_TABLE_OPTION_KEYWORDS)
+                        }
+                        [last] if MYSQL_CHECK_TABLE_OPTION_KEYWORDS.contains(&last.as_str()) => {
+                            Some(MYSQL_CHECK_TABLE_OPTION_KEYWORDS)
+                        }
+                        _ => None,
+                    },
+                    "CHECKSUM" => {
+                        if tail.is_empty() {
+                            Some(MYSQL_CHECKSUM_TABLE_OPTION_KEYWORDS)
+                        } else {
+                            None
+                        }
+                    }
+                    "REPAIR" => {
+                        if tail.is_empty()
+                            || tail
+                                .last()
+                                .is_some_and(|last| MYSQL_REPAIR_TABLE_OPTION_KEYWORDS.contains(&last.as_str()))
+                        {
+                            Some(MYSQL_REPAIR_TABLE_OPTION_KEYWORDS)
+                        } else {
+                            None
+                        }
+                    }
+                    "OPTIMIZE" => None,
+                    _ => None,
+                }
+            };
+
+        if let Some(candidates) =
+            expected_table_maintenance_candidates(&table_maintenance_items)
+        {
+            return Some(candidates);
+        }
+
+        let rename_items: Vec<String> = Self::meaningful_tokens_before(tokens, end)
+            .into_iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                SqlToken::String(_) => Some("__VALUE__".to_string()),
+                SqlToken::Symbol(sym) if matches!(sym.as_str(), "," | "." | "@") => {
+                    Some(sym.clone())
+                }
+                SqlToken::Symbol(_) | SqlToken::Comment(_) => None,
+            })
+            .collect();
+        let expected_rename_candidates = |items: &[String]| -> Option<&'static [&'static str]> {
+            if items.first().map(String::as_str) != Some("RENAME") {
+                return None;
+            }
+            let kind_pos = 1;
+            match items.get(kind_pos).map(String::as_str) {
+                None => Some(&["TABLE", "USER"]),
+                Some("TABLE" | "USER") => {
+                    let pair = &items[kind_pos + 1..];
+                    let segment_start = pair
+                        .iter()
+                        .rposition(|item| item == ",")
+                        .map_or(0, |pos| pos + 1);
+                    let segment = &pair[segment_start..];
+                    if segment.is_empty()
+                        || matches!(segment.last().map(String::as_str), Some("." | "@"))
+                    {
+                        return None;
+                    }
+                    if segment.iter().any(|item| item == "TO") {
+                        None
+                    } else {
+                        Some(&["TO"])
+                    }
+                }
+                _ => None,
+            }
+        };
+
+        if let Some(candidates) = expected_rename_candidates(&rename_items) {
+            return Some(candidates);
+        }
+
+        let resource_group_items: Vec<String> = Self::meaningful_tokens_before(tokens, end)
+            .into_iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                SqlToken::String(_) => Some("__VALUE__".to_string()),
+                SqlToken::Symbol(_) | SqlToken::Comment(_) => None,
+            })
+            .collect();
+        let consume_resource_group_value =
+            |items: &[String], mut idx: usize, stop_words: &'static [&'static str]| -> usize {
+                while idx < items.len() && !stop_words.contains(&items[idx].as_str()) {
+                    idx += 1;
+                }
+                idx
+            };
+        let expected_resource_group_attribute_candidates =
+            |items: &[String], mut idx: usize, verb: &str| -> Option<&'static [&'static str]> {
+                if idx == items.len() {
+                    return Some(if verb == "CREATE" {
+                        MYSQL_RESOURCE_GROUP_CREATE_AFTER_TYPE_KEYWORDS
+                    } else {
+                        MYSQL_RESOURCE_GROUP_ATTRIBUTE_HEAD_KEYWORDS
+                    });
+                }
+
+                if items.get(idx).map(String::as_str) == Some("VCPU") {
+                    idx += 1;
+                    if idx == items.len() {
+                        return None;
+                    }
+                    idx = consume_resource_group_value(
+                        items,
+                        idx,
+                        MYSQL_RESOURCE_GROUP_AFTER_VCPU_KEYWORDS,
+                    );
+                    if idx == items.len() {
+                        return Some(MYSQL_RESOURCE_GROUP_AFTER_VCPU_KEYWORDS);
+                    }
+                }
+
+                if items.get(idx).map(String::as_str) == Some("THREAD_PRIORITY") {
+                    idx += 1;
+                    if idx == items.len() {
+                        return None;
+                    }
+                    idx = consume_resource_group_value(
+                        items,
+                        idx,
+                        MYSQL_RESOURCE_GROUP_AFTER_THREAD_PRIORITY_KEYWORDS,
+                    );
+                    if idx == items.len() {
+                        return Some(MYSQL_RESOURCE_GROUP_AFTER_THREAD_PRIORITY_KEYWORDS);
+                    }
+                }
+
+                match items.get(idx).map(String::as_str) {
+                    Some("DISABLE") if verb == "ALTER" => {
+                        if idx + 1 == items.len() {
+                            Some(&["FORCE"])
+                        } else {
+                            None
+                        }
+                    }
+                    Some("ENABLE" | "DISABLE") => None,
+                    _ => None,
+                }
+            };
+        let expected_resource_group_candidates =
+            |items: &[String]| -> Option<&'static [&'static str]> {
+                let verb_pos = items
+                    .iter()
+                    .position(|word| matches!(word.as_str(), "ALTER" | "CREATE" | "DROP" | "SET"))?;
+                let verb = items[verb_pos].as_str();
+                let mut idx = verb_pos + 1;
+
+                if items.get(idx).map(String::as_str) != Some("RESOURCE") {
+                    return None;
+                }
+                idx += 1;
+                if idx == items.len() {
+                    return Some(&["GROUP"]);
+                }
+                if items.get(idx).map(String::as_str) != Some("GROUP") {
+                    return None;
+                }
+                idx += 1;
+                if idx >= items.len() {
+                    return None;
+                }
+
+                idx += 1;
+                match verb {
+                    "CREATE" => {
+                        if idx == items.len() {
+                            return Some(&["TYPE"]);
+                        }
+                        if items.get(idx).map(String::as_str) != Some("TYPE") {
+                            return None;
+                        }
+                        idx += 1;
+                        if idx == items.len() {
+                            return Some(MYSQL_RESOURCE_GROUP_TYPE_VALUES);
+                        }
+                        if !MYSQL_RESOURCE_GROUP_TYPE_VALUES.contains(&items[idx].as_str()) {
+                            return None;
+                        }
+                        idx += 1;
+                        expected_resource_group_attribute_candidates(items, idx, verb)
+                    }
+                    "ALTER" => expected_resource_group_attribute_candidates(items, idx, verb),
+                    "DROP" => {
+                        if idx == items.len() {
+                            Some(&["FORCE"])
+                        } else {
+                            None
+                        }
+                    }
+                    "SET" => {
+                        if idx == items.len() {
+                            Some(&["FOR"])
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            };
+
+        if let Some(candidates) = expected_resource_group_candidates(&resource_group_items) {
+            return Some(candidates);
+        }
+
+        let disk_data_items: Vec<String> = Self::meaningful_tokens_before(tokens, end)
+            .into_iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                SqlToken::String(_) => Some("__VALUE__".to_string()),
+                SqlToken::Symbol(_) | SqlToken::Comment(_) => None,
+            })
+            .collect();
+        let disk_data_option_after_value =
+            |items: &[String], option_heads: &'static [&'static str]| {
+                matches!(
+                    items,
+                    [.., option, _value] if option_heads.contains(&option.as_str())
+                )
+            };
+        let disk_data_option_tail_candidates =
+            |items: &[String],
+             option_start: usize,
+             option_heads: &'static [&'static str]|
+             -> Option<&'static [&'static str]> {
+                if option_start == items.len() {
+                    return Some(option_heads);
+                }
+                let tail = &items[option_start..];
+                match tail {
+                    [last] if *last == "WAIT" => Some(option_heads),
+                    [.., option, _value] if option_heads.contains(&option.as_str()) => {
+                        Some(option_heads)
+                    }
+                    _ => None,
+                }
+            };
+        let expected_disk_data_candidates =
+            |items: &[String]| -> Option<&'static [&'static str]> {
+                let verb_pos = items
+                    .iter()
+                    .position(|word| matches!(word.as_str(), "ALTER" | "CREATE" | "DROP"))?;
+                let verb = items[verb_pos].as_str();
+                let mut idx = verb_pos + 1;
+
+                if matches!(verb, "ALTER" | "CREATE" | "DROP")
+                    && items.get(idx).map(String::as_str) == Some("UNDO")
+                {
+                    if idx + 1 == items.len() {
+                        return Some(&["TABLESPACE"]);
+                    }
+                    idx += 1;
+                }
+
+                if items.get(idx).map(String::as_str) == Some("TABLESPACE") {
+                    idx += 1;
+                    if verb == "DROP" {
+                        return None;
+                    }
+                    if idx >= items.len() {
+                        return None;
+                    }
+                    idx += 1;
+                    if idx == items.len() {
+                        return if verb == "ALTER" {
+                            Some(MYSQL_TABLESPACE_ALTER_OPTION_HEAD_KEYWORDS)
+                        } else {
+                            Some(MYSQL_TABLESPACE_CREATE_OPTION_HEAD_KEYWORDS)
+                        };
+                    }
+
+                    match items.get(idx).map(String::as_str) {
+                        Some("ADD" | "DROP") if verb == "ALTER" => {
+                            if idx + 1 == items.len() {
+                                return Some(&["DATAFILE"]);
+                            }
+                            if items.get(idx + 1).map(String::as_str) == Some("DATAFILE")
+                            {
+                                return disk_data_option_tail_candidates(
+                                    items,
+                                    idx + 3,
+                                    MYSQL_TABLESPACE_ALTER_AFTER_FILE_KEYWORDS,
+                                );
+                            }
+                        }
+                        Some("ADD") if verb == "CREATE" => {
+                            if idx + 1 == items.len() {
+                                return Some(&["DATAFILE"]);
+                            }
+                            if items.get(idx + 1).map(String::as_str) == Some("DATAFILE")
+                            {
+                                return disk_data_option_tail_candidates(
+                                    items,
+                                    idx + 3,
+                                    MYSQL_TABLESPACE_CREATE_AFTER_FILE_KEYWORDS,
+                                );
+                            }
+                        }
+                        Some("USE") if verb == "CREATE" => {
+                            if idx + 1 == items.len() {
+                                return Some(&["LOGFILE"]);
+                            }
+                            if items.get(idx + 1).map(String::as_str) == Some("LOGFILE") {
+                                if idx + 2 == items.len() {
+                                    return Some(&["GROUP"]);
+                                }
+                                if items.get(idx + 2).map(String::as_str) == Some("GROUP")
+                                {
+                                    return disk_data_option_tail_candidates(
+                                        items,
+                                        idx + 4,
+                                        MYSQL_TABLESPACE_CREATE_AFTER_FILE_KEYWORDS,
+                                    );
+                                }
+                            }
+                        }
+                        Some("RENAME") if verb == "ALTER" => {
+                            if idx + 1 == items.len() {
+                                return Some(&["TO"]);
+                            }
+                        }
+                        Some("SET") if verb == "ALTER" => {
+                            if idx + 1 == items.len() {
+                                return Some(&["ACTIVE", "INACTIVE"]);
+                            }
+                        }
+                        Some("WAIT") => {
+                            return if verb == "ALTER" {
+                                Some(MYSQL_TABLESPACE_ALTER_OPTION_HEAD_KEYWORDS)
+                            } else {
+                                Some(MYSQL_TABLESPACE_CREATE_AFTER_FILE_KEYWORDS)
+                            };
+                        }
+                        Some(option)
+                            if verb == "ALTER"
+                                && MYSQL_TABLESPACE_ALTER_OPTION_HEAD_KEYWORDS
+                                    .contains(&option) =>
+                        {
+                            if disk_data_option_after_value(
+                                items,
+                                MYSQL_TABLESPACE_ALTER_OPTION_HEAD_KEYWORDS,
+                            ) {
+                                return Some(MYSQL_TABLESPACE_ALTER_OPTION_HEAD_KEYWORDS);
+                            }
+                        }
+                        Some(option)
+                            if verb == "CREATE"
+                                && MYSQL_TABLESPACE_CREATE_AFTER_FILE_KEYWORDS
+                                    .contains(&option) =>
+                        {
+                            if disk_data_option_after_value(
+                                items,
+                                MYSQL_TABLESPACE_CREATE_AFTER_FILE_KEYWORDS,
+                            ) {
+                                return Some(MYSQL_TABLESPACE_CREATE_AFTER_FILE_KEYWORDS);
+                            }
+                        }
+                        _ => {}
+                    }
+                    return None;
+                }
+
+                if items.get(idx).map(String::as_str) == Some("LOGFILE") {
+                    if idx + 1 == items.len() {
+                        return Some(&["GROUP"]);
+                    }
+                    if items.get(idx + 1).map(String::as_str) != Some("GROUP") {
+                        return None;
+                    }
+                    idx += 2;
+                    if idx >= items.len() {
+                        return None;
+                    }
+                    idx += 1;
+                    if idx == items.len() {
+                        return match verb {
+                            "CREATE" | "ALTER" => Some(&["ADD"]),
+                            "DROP" => Some(&["ENGINE"]),
+                            _ => None,
+                        };
+                    }
+                    match items.get(idx).map(String::as_str) {
+                        Some("ADD") if matches!(verb, "ALTER" | "CREATE") => {
+                            if idx + 1 == items.len() {
+                                return Some(&["UNDOFILE"]);
+                            }
+                            if items.get(idx + 1).map(String::as_str) == Some("UNDOFILE")
+                            {
+                                return if verb == "ALTER" {
+                                    disk_data_option_tail_candidates(
+                                        items,
+                                        idx + 3,
+                                        MYSQL_LOGFILE_ALTER_OPTION_HEAD_KEYWORDS,
+                                    )
+                                } else {
+                                    disk_data_option_tail_candidates(
+                                        items,
+                                        idx + 3,
+                                        MYSQL_LOGFILE_CREATE_OPTION_HEAD_KEYWORDS,
+                                    )
+                                };
+                            }
+                        }
+                        Some("WAIT") if matches!(verb, "ALTER" | "CREATE") => {
+                            return if verb == "ALTER" {
+                                Some(MYSQL_LOGFILE_ALTER_OPTION_HEAD_KEYWORDS)
+                            } else {
+                                Some(MYSQL_LOGFILE_CREATE_OPTION_HEAD_KEYWORDS)
+                            };
+                        }
+                        Some(option)
+                            if verb == "CREATE"
+                                && MYSQL_LOGFILE_CREATE_OPTION_HEAD_KEYWORDS
+                                    .contains(&option) =>
+                        {
+                            if disk_data_option_after_value(
+                                items,
+                                MYSQL_LOGFILE_CREATE_OPTION_HEAD_KEYWORDS,
+                            ) {
+                                return Some(MYSQL_LOGFILE_CREATE_OPTION_HEAD_KEYWORDS);
+                            }
+                        }
+                        Some(option)
+                            if verb == "ALTER"
+                                && MYSQL_LOGFILE_ALTER_OPTION_HEAD_KEYWORDS
+                                    .contains(&option) =>
+                        {
+                            if disk_data_option_after_value(
+                                items,
+                                MYSQL_LOGFILE_ALTER_OPTION_HEAD_KEYWORDS,
+                            ) {
+                                return Some(MYSQL_LOGFILE_ALTER_OPTION_HEAD_KEYWORDS);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                None
+            };
+
+        if let Some(candidates) = expected_disk_data_candidates(&disk_data_items) {
+            return Some(candidates);
+        }
+
+        match words {
+            [.., last] if *last == "CREATE" => Some(MYSQL_CREATE_OBJECT_TYPE_KEYWORDS),
+            [.., last] if *last == "ALTER" => Some(MYSQL_ALTER_OBJECT_TYPE_KEYWORDS),
+            [.., last] if *last == "DROP" => Some(MYSQL_DROP_OBJECT_TYPE_KEYWORDS),
+            [.., a, b]
+                if *a == "CREATE" && MYSQL_CREATE_IF_NOT_EXISTS_OBJECT_TYPES.contains(&b.as_str()) =>
+            {
+                Some(&["IF"])
+            }
+            [.., a, b, c]
+                if *a == "CREATE"
+                    && MYSQL_CREATE_IF_NOT_EXISTS_OBJECT_TYPES.contains(&b.as_str())
+                    && *c == "IF" =>
+            {
+                Some(&["NOT"])
+            }
+            [.., a, b, c, d]
+                if *a == "CREATE"
+                    && MYSQL_CREATE_IF_NOT_EXISTS_OBJECT_TYPES.contains(&b.as_str())
+                    && *c == "IF"
+                    && *d == "NOT" =>
+            {
+                Some(&["EXISTS"])
+            }
+            [.., a, b, c]
+                if *a == "CREATE" && *b == "TEMPORARY" && *c == "TABLE" =>
+            {
+                Some(&["IF"])
+            }
+            [.., a, b, c, d]
+                if *a == "CREATE" && *b == "TEMPORARY" && *c == "TABLE" && *d == "IF" =>
+            {
+                Some(&["NOT"])
+            }
+            [.., a, b, c, d, e]
+                if *a == "CREATE"
+                    && *b == "TEMPORARY"
+                    && *c == "TABLE"
+                    && *d == "IF"
+                    && *e == "NOT" =>
+            {
+                Some(&["EXISTS"])
+            }
+            [.., a, b]
+                if *a == "DROP" && MYSQL_DROP_IF_EXISTS_OBJECT_TYPES.contains(&b.as_str()) =>
+            {
+                Some(&["IF"])
+            }
+            [.., a, b, c]
+                if *a == "DROP"
+                    && MYSQL_DROP_IF_EXISTS_OBJECT_TYPES.contains(&b.as_str())
+                    && *c == "IF" =>
+            {
+                Some(&["EXISTS"])
+            }
+            [.., a, b, c]
+                if *a == "DROP" && *b == "TEMPORARY" && *c == "TABLE" =>
+            {
+                Some(&["IF"])
+            }
+            [.., a, b, c, d]
+                if *a == "DROP" && *b == "TEMPORARY" && *c == "TABLE" && *d == "IF" =>
+            {
+                Some(&["EXISTS"])
+            }
+            [.., a, b]
+                if *a == "CREATE" && MYSQL_CREATE_INDEX_MODIFIERS.contains(&b.as_str()) =>
+            {
+                if *b == "SPATIAL" {
+                    Some(&["INDEX", "REFERENCE"])
+                } else {
+                    Some(&["INDEX"])
+                }
+            }
+            [.., a, b, c]
+                if *a == "CREATE"
+                    && *b == "SPATIAL"
+                    && *c == "REFERENCE" =>
+            {
+                Some(&["SYSTEM"])
+            }
+            [.., a, b, _index_name]
+                if *a == "CREATE" && *b == "INDEX" =>
+            {
+                Some(&["ON", "USING"])
+            }
+            [.., a, b, c, _index_name]
+                if *a == "CREATE"
+                    && MYSQL_CREATE_INDEX_MODIFIERS.contains(&b.as_str())
+                    && *c == "INDEX" =>
+            {
+                Some(&["ON", "USING"])
+            }
+            [.., a, b, _index_name, c]
+                if *a == "CREATE" && *b == "INDEX" && *c == "USING" =>
+            {
+                Some(MYSQL_INDEX_TYPE_KEYWORDS)
+            }
+            [.., a, b, c, _index_name, d]
+                if *a == "CREATE"
+                    && MYSQL_CREATE_INDEX_MODIFIERS.contains(&b.as_str())
+                    && *c == "INDEX"
+                    && *d == "USING" =>
+            {
+                Some(MYSQL_INDEX_TYPE_KEYWORDS)
+            }
+            [.., a, b, _index_name, c, d]
+                if *a == "CREATE"
+                    && *b == "INDEX"
+                    && *c == "USING"
+                    && MYSQL_INDEX_TYPE_KEYWORDS.contains(&d.as_str()) =>
+            {
+                Some(&["ON"])
+            }
+            [.., a, b, c, _index_name, d, e]
+                if *a == "CREATE"
+                    && MYSQL_CREATE_INDEX_MODIFIERS.contains(&b.as_str())
+                    && *c == "INDEX"
+                    && *d == "USING"
+                    && MYSQL_INDEX_TYPE_KEYWORDS.contains(&e.as_str()) =>
+            {
+                Some(&["ON"])
+            }
+            [.., a, b, _index_name]
+                if *a == "DROP" && *b == "INDEX" =>
+            {
+                Some(&["ON"])
+            }
+            [.., a, b, _index_name, c, _table_name]
+                if *a == "DROP" && *b == "INDEX" && *c == "ON" =>
+            {
+                Some(&["ALGORITHM", "LOCK"])
+            }
+            [.., last] if *last == "CHANGE" => Some(&["REPLICATION"]),
+            [.., a, b] if *a == "CHANGE" && *b == "REPLICATION" => {
+                Some(&["FILTER", "SOURCE"])
+            }
+            [.., a, b, c] if *a == "CHANGE" && *b == "REPLICATION" && *c == "SOURCE" => {
+                Some(&["TO"])
+            }
+            [.., a, b, c] if *a == "CHANGE" && *b == "REPLICATION" && *c == "FILTER" => {
+                Some(MYSQL_CHANGE_REPLICATION_FILTER_KEYWORDS)
+            }
+            [.., a, b, c, d]
+                if *a == "CHANGE" && *b == "REPLICATION" && *c == "SOURCE" && *d == "TO" =>
+            {
+                Some(MYSQL_CHANGE_REPLICATION_SOURCE_OPTIONS)
+            }
+            [.., last] if *last == "CLONE" => Some(&["INSTANCE", "LOCAL"]),
+            [.., a, b] if *a == "CLONE" && *b == "LOCAL" => Some(&["DATA"]),
+            [.., a, b, c] if *a == "CLONE" && *b == "LOCAL" && *c == "DATA" => {
+                Some(&["DIRECTORY"])
+            }
+            [.., a, b] if *a == "CLONE" && *b == "INSTANCE" => Some(&["FROM"]),
+            [.., last] if *last == "COMMIT" => Some(MYSQL_TRANSACTION_TAIL_KEYWORDS),
+            [.., last] if *last == "DEALLOCATE" => Some(&["PREPARE"]),
+            [.., last] if *last == "EXPLAIN" => Some(MYSQL_EXPLAIN_OPTION_OR_STATEMENT_HEAD_KEYWORDS),
+            [.., a, b] if *a == "EXPLAIN" && *b == "FORMAT" => {
+                Some(&["JSON", "TREE", "TRADITIONAL"])
+            }
+            [.., a, b, c]
+                if *a == "EXPLAIN"
+                    && *b == "FORMAT"
+                    && matches!(c.as_str(), "JSON" | "TREE" | "TRADITIONAL") =>
+            {
+                if *c == "JSON" {
+                    Some(&[
+                        "INTO", "FOR", "DELETE", "INSERT", "REPLACE", "SELECT", "TABLE",
+                        "UPDATE", "WITH",
+                    ])
+                } else {
+                    Some(MYSQL_EXPLAINABLE_STATEMENT_HEAD_KEYWORDS)
+                }
+            }
+            [.., a, b] if *a == "EXPLAIN" && *b == "FOR" => {
+                Some(&["CONNECTION", "DATABASE", "SCHEMA"])
+            }
+            [.., a, b] if *a == "EXPLAIN" && *b == "ANALYZE" => {
+                Some(MYSQL_EXPLAIN_ANALYZE_OPTION_OR_HEAD_KEYWORDS)
+            }
+            [.., a, b, c] if *a == "EXPLAIN" && *b == "ANALYZE" && *c == "FORMAT" => {
+                Some(&["TREE"])
+            }
+            [.., a, b, c, d]
+                if *a == "EXPLAIN"
+                    && *b == "ANALYZE"
+                    && *c == "FORMAT"
+                    && matches!(d.as_str(), "TREE" | "TRADITIONAL" | "JSON") =>
+            {
+                if *d == "TREE" {
+                    Some(MYSQL_EXPLAIN_ANALYZE_STATEMENT_HEAD_KEYWORDS)
+                } else {
+                    None
+                }
+            }
+            [.., last] if *last == "FLUSH" => Some(MYSQL_FLUSH_HEAD_KEYWORDS),
+            [.., a, b] if *a == "FLUSH" && matches!(b.as_str(), "LOCAL" | "NO_WRITE_TO_BINLOG") => {
+                Some(MYSQL_FLUSH_HEAD_KEYWORDS)
+            }
+            [.., prev, last]
+                if matches!(prev.as_str(), "FLUSH" | "LOCAL" | "NO_WRITE_TO_BINLOG")
+                    && matches!(last.as_str(), "BINARY" | "ENGINE" | "ERROR" | "GENERAL" | "RELAY" | "SLOW") =>
+            {
+                Some(&["LOGS"])
+            }
+            [.., a, b] if *a == "FLUSH" && matches!(b.as_str(), "TABLE" | "TABLES") => {
+                Some(&["FOR", "WITH"])
+            }
+            [.., a, b, c] if *a == "FLUSH" && matches!(b.as_str(), "TABLE" | "TABLES") && *c == "FOR" => {
+                Some(&["EXPORT"])
+            }
+            [.., a, b] if *a == "HANDLER" && !matches!(b.as_str(), "OPEN" | "READ" | "CLOSE") => {
+                Some(&["CLOSE", "OPEN", "READ"])
+            }
+            [.., a, _table, c] if *a == "HANDLER" && *c == "OPEN" => Some(&["AS"]),
+            [.., a, _table, c] if *a == "HANDLER" && *c == "READ" => {
+                Some(&["FIRST", "LAST", "NEXT", "PREV"])
+            }
+            [.., last] if *last == "IMPORT" => Some(&["TABLE"]),
+            [.., a, b] if *a == "IMPORT" && *b == "TABLE" => Some(&["FROM"]),
+            [.., last] if *last == "INSTALL" => Some(&["COMPONENT", "PLUGIN"]),
+            [.., a, b, _plugin] if *a == "INSTALL" && *b == "PLUGIN" => Some(&["SONAME"]),
+            [.., prev, last] if *prev == "CREATE" && *last == "OR" => Some(&["REPLACE"]),
+            [.., a, b, c] if *a == "CREATE" && *b == "OR" && *c == "REPLACE" => {
+                Some(MYSQL_CREATE_OR_REPLACE_OBJECT_TYPE_KEYWORDS)
+            }
+            [.., prev, last] if *prev == "CREATE" && *last == "TEMPORARY" => Some(&["TABLE"]),
+            [.., prev, last] if *prev == "DROP" && *last == "TEMPORARY" => Some(&["TABLE"]),
+            [.., prev, last]
+                if matches!(prev.as_str(), "CREATE" | "ALTER" | "DROP") && *last == "LOGFILE" =>
+            {
+                Some(&["GROUP"])
+            }
+            [.., prev, last]
+                if matches!(prev.as_str(), "CREATE" | "ALTER" | "DROP") && *last == "RESOURCE" =>
+            {
+                Some(&["GROUP"])
+            }
+            [.., prev, last] if *prev == "CREATE" && *last == "SPATIAL" => Some(&["REFERENCE"]),
+            [.., a, b, c] if *a == "CREATE" && *b == "SPATIAL" && *c == "REFERENCE" => {
+                Some(&["SYSTEM"])
+            }
+            [.., last]
+                if matches!(
+                    last.as_str(),
+                    "ANALYZE" | "OPTIMIZE" | "CHECK" | "CHECKSUM" | "REPAIR"
+                ) =>
+            {
+                Some(&["TABLE"])
+            }
+            [.., last] if *last == "TRUNCATE" => Some(&["TABLE"]),
+            [.., last] if *last == "RENAME" => Some(&["TABLE", "USER"]),
+            [.., last] if *last == "LOCK" => Some(&["INSTANCE", "TABLES"]),
+            [.., a, b] if *a == "LOCK" && *b == "INSTANCE" => Some(&["FOR"]),
+            [.., a, b, c] if *a == "LOCK" && *b == "INSTANCE" && *c == "FOR" => {
+                Some(&["BACKUP"])
+            }
+            [.., a, b] if *a == "LOCK" && matches!(b.as_str(), "TABLE" | "TABLES") => {
+                Some(&["AS", "READ", "WRITE"])
+            }
+            [.., a, b, _table]
+                if *a == "LOCK" && matches!(b.as_str(), "TABLE" | "TABLES") =>
+            {
+                Some(&["AS", "READ", "WRITE"])
+            }
+            [.., a, b, c]
+                if *a == "LOCK" && matches!(b.as_str(), "TABLE" | "TABLES") && *c == "AS" =>
+            {
+                Some(&["READ", "WRITE"])
+            }
+            [.., a, b, _table, c, _alias]
+                if *a == "LOCK" && matches!(b.as_str(), "TABLE" | "TABLES") && *c == "AS" =>
+            {
+                Some(&["READ", "WRITE"])
+            }
+            [.., a, b, c]
+                if *a == "LOCK" && matches!(b.as_str(), "TABLE" | "TABLES") && *c == "READ" =>
+            {
+                Some(&["LOCAL"])
+            }
+            [.., a, b, _table, c]
+                if *a == "LOCK" && matches!(b.as_str(), "TABLE" | "TABLES") && *c == "READ" =>
+            {
+                Some(&["LOCAL"])
+            }
+            [.., last] if *last == "UNLOCK" => Some(&["INSTANCE", "TABLES"]),
+            [.., last] if *last == "LOAD" => Some(&["DATA", "INDEX", "XML"]),
+            [.., a, b] if *a == "LOAD" && *b == "INDEX" => Some(&["INTO"]),
+            [.., a, b, c] if *a == "LOAD" && *b == "INDEX" && *c == "INTO" => Some(&["CACHE"]),
+            [.., a, b, c, d]
+                if *a == "LOAD" && *b == "INDEX" && *c == "INTO" && *d == "CACHE" =>
+            {
+                Some(&["IGNORE"])
+            }
+            [.., a, b, c, d, e]
+                if *a == "LOAD"
+                    && *b == "INDEX"
+                    && *c == "INTO"
+                    && *d == "CACHE"
+                    && *e == "IGNORE" =>
+            {
+                Some(&["LEAVES"])
+            }
+            [.., a, b] if *a == "LOAD" && matches!(b.as_str(), "DATA" | "XML") => {
+                Some(MYSQL_LOAD_FILE_OPTIONS)
+            }
+            [.., a, b, c]
+                if *a == "LOAD"
+                    && matches!(b.as_str(), "DATA" | "XML")
+                    && matches!(c.as_str(), "CONCURRENT" | "LOW_PRIORITY") =>
+            {
+                Some(MYSQL_LOAD_AFTER_PRIORITY)
+            }
+            [.., a, b, c]
+                if *a == "LOAD" && matches!(b.as_str(), "DATA" | "XML") && *c == "LOCAL" =>
+            {
+                Some(&["INFILE"])
+            }
+            [.., a, b, c, d]
+                if *a == "LOAD"
+                    && matches!(b.as_str(), "DATA" | "XML")
+                    && matches!(c.as_str(), "CONCURRENT" | "LOW_PRIORITY")
+                    && *d == "LOCAL" =>
+            {
+                Some(&["INFILE"])
+            }
+            [.., a, b, c, _file]
+                if *a == "LOAD" && matches!(b.as_str(), "DATA" | "XML") && *c == "INFILE" =>
+            {
+                Some(MYSQL_LOAD_AFTER_INFILE_PATH)
+            }
+            [.., a, b, c, d, _file]
+                if *a == "LOAD"
+                    && matches!(b.as_str(), "DATA" | "XML")
+                    && matches!(c.as_str(), "CONCURRENT" | "LOCAL" | "LOW_PRIORITY")
+                    && *d == "INFILE" =>
+            {
+                Some(MYSQL_LOAD_AFTER_INFILE_PATH)
+            }
+            [.., a, b, c, d, e, _file]
+                if *a == "LOAD"
+                    && matches!(b.as_str(), "DATA" | "XML")
+                    && matches!(c.as_str(), "CONCURRENT" | "LOW_PRIORITY")
+                    && *d == "LOCAL"
+                    && *e == "INFILE" =>
+            {
+                Some(MYSQL_LOAD_AFTER_INFILE_PATH)
+            }
+            [.., a, b, c, _file, d]
+                if *a == "LOAD"
+                    && matches!(b.as_str(), "DATA" | "XML")
+                    && *c == "INFILE"
+                    && matches!(d.as_str(), "IGNORE" | "REPLACE") =>
+            {
+                Some(&["INTO"])
+            }
+            [.., a, b, c, _file, d]
+                if *a == "LOAD"
+                    && matches!(b.as_str(), "DATA" | "XML")
+                    && *c == "INFILE"
+                    && *d == "INTO" =>
+            {
+                Some(&["TABLE"])
+            }
+            [.., a, b, c, _file, d, e]
+                if *a == "LOAD"
+                    && matches!(b.as_str(), "DATA" | "XML")
+                    && *c == "INFILE"
+                    && matches!(d.as_str(), "IGNORE" | "REPLACE")
+                    && *e == "INTO" =>
+            {
+                Some(&["TABLE"])
+            }
+            [.., last] if *last == "CACHE" => Some(&["INDEX"]),
+            [.., last] if *last == "PURGE" => Some(&["BINARY"]),
+            [.., a, b] if *a == "PURGE" && *b == "BINARY" => Some(&["LOGS"]),
+            [.., a, b, c] if *a == "PURGE" && *b == "BINARY" && *c == "LOGS" => {
+                Some(&["BEFORE", "TO"])
+            }
+            [.., last] if *last == "RESET" => Some(&["BINARY", "MASTER", "PERSIST", "REPLICA", "SLAVE"]),
+            [.., a, b] if *a == "RESET" && *b == "BINARY" => Some(&["LOGS"]),
+            [.., a, b, c] if *a == "RESET" && *b == "BINARY" && *c == "LOGS" => {
+                Some(&["AND"])
+            }
+            [.., a, b, c, d]
+                if *a == "RESET" && *b == "BINARY" && *c == "LOGS" && *d == "AND" =>
+            {
+                Some(&["GTIDS"])
+            }
+            [.., a, b] if *a == "RESET" && matches!(b.as_str(), "REPLICA" | "SLAVE") => {
+                Some(MYSQL_RESET_REPLICA_TAIL_KEYWORDS)
+            }
+            [.., a, b, c]
+                if *a == "RESET" && matches!(b.as_str(), "REPLICA" | "SLAVE") && *c == "ALL" =>
+            {
+                Some(&["FOR"])
+            }
+            [.., a, b, c]
+                if *a == "RESET" && matches!(b.as_str(), "REPLICA" | "SLAVE") && *c == "FOR" =>
+            {
+                Some(&["CHANNEL"])
+            }
+            [.., a, b, c, d]
+                if *a == "RESET"
+                    && matches!(b.as_str(), "REPLICA" | "SLAVE")
+                    && *c == "ALL"
+                    && *d == "FOR" =>
+            {
+                Some(&["CHANNEL"])
+            }
+            [.., a, b] if *a == "RESET" && *b == "PERSIST" => Some(&["IF"]),
+            [.., a, b, c] if *a == "RESET" && *b == "PERSIST" && *c == "IF" => {
+                Some(&["EXISTS"])
+            }
+            [.., last] if *last == "START" => Some(&["GROUP_REPLICATION", "REPLICA", "SLAVE", "TRANSACTION"]),
+            [.., a, b] if *a == "START" && *b == "GROUP_REPLICATION" => {
+                Some(MYSQL_START_GROUP_REPLICATION_OPTIONS)
+            }
+            [.., a, b, option, _value]
+                if *a == "START"
+                    && *b == "GROUP_REPLICATION"
+                    && MYSQL_START_GROUP_REPLICATION_OPTIONS.contains(&option.as_str()) =>
+            {
+                Some(MYSQL_START_GROUP_REPLICATION_OPTIONS)
+            }
+            [.., a, b] if *a == "START" && *b == "TRANSACTION" => {
+                Some(&["READ", "WITH"])
+            }
+            [.., a, b, c] if *a == "START" && *b == "TRANSACTION" && *c == "READ" => {
+                Some(&["ONLY", "WRITE"])
+            }
+            [.., a, b, c] if *a == "START" && *b == "TRANSACTION" && *c == "WITH" => {
+                Some(&["CONSISTENT"])
+            }
+            [.., a, b, c, d]
+                if *a == "START" && *b == "TRANSACTION" && *c == "WITH" && *d == "CONSISTENT" =>
+            {
+                Some(&["SNAPSHOT"])
+            }
+            [.., a, b] if *a == "START" && matches!(b.as_str(), "REPLICA" | "SLAVE") => {
+                Some(MYSQL_REPLICATION_THREAD_OR_OPTION_KEYWORDS)
+            }
+            [.., a, b, c]
+                if *a == "START"
+                    && matches!(b.as_str(), "REPLICA" | "SLAVE")
+                    && matches!(c.as_str(), "IO_THREAD" | "SQL_THREAD") =>
+            {
+                Some(MYSQL_REPLICATION_THREAD_OR_OPTION_KEYWORDS)
+            }
+            [.., a, b, c]
+                if *a == "START" && matches!(b.as_str(), "REPLICA" | "SLAVE") && *c == "UNTIL" =>
+            {
+                Some(MYSQL_REPLICATION_UNTIL_KEYWORDS)
+            }
+            [.., a, b, c]
+                if *a == "START" && matches!(b.as_str(), "REPLICA" | "SLAVE") && *c == "FOR" =>
+            {
+                Some(&["CHANNEL"])
+            }
+            [.., last] if *last == "STOP" => Some(&["GROUP_REPLICATION", "REPLICA", "SLAVE"]),
+            [.., a, b] if *a == "STOP" && matches!(b.as_str(), "REPLICA" | "SLAVE") => {
+                Some(&["FOR", "IO_THREAD", "SQL_THREAD"])
+            }
+            [.., a, b, c]
+                if *a == "STOP"
+                    && matches!(b.as_str(), "REPLICA" | "SLAVE")
+                    && matches!(c.as_str(), "IO_THREAD" | "SQL_THREAD") =>
+            {
+                Some(&["FOR", "IO_THREAD", "SQL_THREAD"])
+            }
+            [.., a, b, c]
+                if *a == "STOP" && matches!(b.as_str(), "REPLICA" | "SLAVE") && *c == "FOR" =>
+            {
+                Some(&["CHANNEL"])
+            }
+            [.., last] if *last == "KILL" => Some(&["CONNECTION", "QUERY"]),
+            [.., last] if *last == "SET" => Some(MYSQL_SET_HEAD_KEYWORDS),
+            [.., a, b] if *a == "SET" && *b == "CHARACTER" => Some(&["SET"]),
+            [.., a, b] if *a == "SET" && matches!(b.as_str(), "CHARSET" | "NAMES") => {
+                Some(&["DEFAULT"])
+            }
+            [.., a, b, c] if *a == "SET" && *b == "CHARACTER" && *c == "SET" => {
+                Some(&["DEFAULT"])
+            }
+            [.., a, b, c] if *a == "SET" && *b == "NAMES" && *c != "DEFAULT" => {
+                Some(&["COLLATE"])
+            }
+            [.., a, b] if *a == "SET" && *b == "DEFAULT" => Some(&["ROLE"]),
+            [.., a, b, c] if *a == "SET" && *b == "DEFAULT" && *c == "ROLE" => {
+                Some(MYSQL_SET_DEFAULT_ROLE_HEAD_KEYWORDS)
+            }
+            [.., a, b, c, _role_specifier]
+                if *a == "SET" && *b == "DEFAULT" && *c == "ROLE" =>
+            {
+                Some(&["TO"])
+            }
+            [.., a, b] if *a == "SET" && *b == "ROLE" => Some(MYSQL_SET_ROLE_HEAD_KEYWORDS),
+            [.., a, b, c] if *a == "SET" && *b == "ROLE" && *c == "ALL" => {
+                Some(&["EXCEPT"])
+            }
+            [.., a, b] if *a == "SET" && *b == "PASSWORD" => {
+                Some(MYSQL_SET_PASSWORD_AUTH_KEYWORDS)
+            }
+            [.., a, b, c, _user] if *a == "SET" && *b == "PASSWORD" && *c == "FOR" => {
+                Some(&["TO"])
+            }
+            [.., a, b, c] if *a == "SET" && *b == "PASSWORD" && *c == "TO" => {
+                Some(&["RANDOM"])
+            }
+            [.., a, b, c, _user, d]
+                if *a == "SET" && *b == "PASSWORD" && *c == "FOR" && *d == "TO" =>
+            {
+                Some(&["RANDOM"])
+            }
+            [.., a, b, c, d]
+                if *a == "SET" && *b == "PASSWORD" && *c == "TO" && *d == "RANDOM" =>
+            {
+                Some(MYSQL_SET_PASSWORD_TAIL_KEYWORDS)
+            }
+            [.., a, b, c, _user, d, e]
+                if *a == "SET"
+                    && *b == "PASSWORD"
+                    && *c == "FOR"
+                    && *d == "TO"
+                    && *e == "RANDOM" =>
+            {
+                Some(MYSQL_SET_PASSWORD_TAIL_KEYWORDS)
+            }
+            [.., a, b, c, d, e]
+                if *a == "SET"
+                    && *b == "PASSWORD"
+                    && *c == "TO"
+                    && *d == "RANDOM"
+                    && *e == "RETAIN" =>
+            {
+                Some(&["CURRENT"])
+            }
+            [.., a, b, c, _user, d, e, f]
+                if *a == "SET"
+                    && *b == "PASSWORD"
+                    && *c == "FOR"
+                    && *d == "TO"
+                    && *e == "RANDOM"
+                    && *f == "RETAIN" =>
+            {
+                Some(&["CURRENT"])
+            }
+            [.., a, b, c, d, e, f]
+                if *a == "SET"
+                    && *b == "PASSWORD"
+                    && *c == "TO"
+                    && *d == "RANDOM"
+                    && *e == "RETAIN"
+                    && *f == "CURRENT" =>
+            {
+                Some(&["PASSWORD"])
+            }
+            [.., a, b, c, _user, d, e, f, g]
+                if *a == "SET"
+                    && *b == "PASSWORD"
+                    && *c == "FOR"
+                    && *d == "TO"
+                    && *e == "RANDOM"
+                    && *f == "RETAIN"
+                    && *g == "CURRENT" =>
+            {
+                Some(&["PASSWORD"])
+            }
+            [.., a, b, c, d, e, _current_password]
+                if *a == "SET"
+                    && *b == "PASSWORD"
+                    && *c == "TO"
+                    && *d == "RANDOM"
+                    && *e == "REPLACE" =>
+            {
+                Some(&["RETAIN"])
+            }
+            [.., a, b, c, _user, d, e, f, _current_password]
+                if *a == "SET"
+                    && *b == "PASSWORD"
+                    && *c == "FOR"
+                    && *d == "TO"
+                    && *e == "RANDOM"
+                    && *f == "REPLACE" =>
+            {
+                Some(&["RETAIN"])
+            }
+            [.., a, b] if *a == "SET" && *b == "RESOURCE" => Some(&["GROUP"]),
+            [.., a, b] if *a == "PREPARE" && *b != "FROM" => Some(&["FROM"]),
+            [.., a, b] if *a == "EXECUTE" && *b != "USING" => Some(&["USING"]),
+            [.., last] if *last == "RELEASE" => Some(&["SAVEPOINT"]),
+            [.., last] if *last == "RESIGNAL" => Some(&["SET", "SQLSTATE"]),
+            [.., last] if *last == "ROLLBACK" => Some(&["AND", "NO", "RELEASE", "TO", "WORK"]),
+            [.., a, b] if matches!(a.as_str(), "COMMIT" | "ROLLBACK") && *b == "WORK" => {
+                Some(MYSQL_TRANSACTION_TAIL_KEYWORDS)
+            }
+            [.., a, b] if matches!(a.as_str(), "COMMIT" | "ROLLBACK") && *b == "AND" => {
+                Some(&["CHAIN", "NO"])
+            }
+            [.., a, b, c]
+                if matches!(a.as_str(), "COMMIT" | "ROLLBACK") && *b == "AND" && *c == "NO" =>
+            {
+                Some(&["CHAIN"])
+            }
+            [.., a, b] if matches!(a.as_str(), "COMMIT" | "ROLLBACK") && *b == "NO" => {
+                Some(&["RELEASE"])
+            }
+            [.., a, b] if *a == "ROLLBACK" && *b == "TO" => Some(&["SAVEPOINT"]),
+            [.., last] if *last == "SIGNAL" => Some(&["SQLSTATE"]),
+            [.., a, b] if matches!(a.as_str(), "SIGNAL" | "RESIGNAL") && *b == "SQLSTATE" => {
+                Some(&["VALUE"])
+            }
+            [.., last] if *last == "UNINSTALL" => Some(&["COMPONENT", "PLUGIN"]),
+            [.., last] if *last == "XA" => Some(MYSQL_XA_HEAD_KEYWORDS),
+            [.., a, b, _xid] if *a == "XA" && matches!(b.as_str(), "BEGIN" | "START") => {
+                Some(&["JOIN", "RESUME"])
+            }
+            [.., a, b, _xid] if *a == "XA" && *b == "END" => Some(&["SUSPEND"]),
+            [.., a, b, _xid, d] if *a == "XA" && *b == "END" && *d == "SUSPEND" => {
+                Some(&["FOR"])
+            }
+            [.., a, b, _xid, d, e]
+                if *a == "XA" && *b == "END" && *d == "SUSPEND" && *e == "FOR" =>
+            {
+                Some(&["MIGRATE"])
+            }
+            [.., a, b, _xid] if *a == "XA" && *b == "COMMIT" => Some(&["ONE"]),
+            [.., a, b, _xid, d] if *a == "XA" && *b == "COMMIT" && *d == "ONE" => {
+                Some(&["PHASE"])
+            }
+            [.., a, b] if *a == "XA" && *b == "RECOVER" => Some(&["CONVERT"]),
+            [.., a, b, c] if *a == "XA" && *b == "RECOVER" && *c == "CONVERT" => {
+                Some(&["XID"])
+            }
+            _ => None,
+        }
+    }
+
     fn expected_statement_structural_keyword_candidates_for_context(
         deep_ctx: &intellisense_context::CursorContext,
         exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
     ) -> Option<&'static [&'static str]> {
         let tokens = deep_ctx.statement_tokens.as_ref();
         let cursor_token_len = deep_ctx.cursor_token_len;
@@ -12366,17 +15561,106 @@ impl SqlEditorWidget {
             cursor_token_len,
             exclude_current_identifier_chain,
         );
-        Self::expected_statement_structural_keyword_candidates(tokens, end)
+        Self::expected_statement_structural_keyword_candidates(tokens, end, db_type)
     }
 
     fn expected_dml_statement_head_keyword_candidates(
         tokens: &[SqlToken],
         end: usize,
+        db_type: Option<crate::db::DatabaseType>,
     ) -> Option<&'static [&'static str]> {
-        let words = Self::previous_meaningful_words_upper(tokens, end, 2);
+        let anchors = if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            &["DELETE", "INSERT", "REPLACE", "UPDATE"][..]
+        } else {
+            &["DELETE", "INSERT", "MERGE"][..]
+        };
+        Self::statement_start_anchor_index(tokens, end, anchors)?;
+
+        let words = Self::previous_meaningful_words_upper(tokens, end, 4);
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return Self::expected_mysql_dml_statement_head_keyword_candidates(&words);
+        }
         match words.as_slice() {
-            [last] if *last == "DELETE" => Some(&["FROM"]),
-            [last] if *last == "INSERT" || *last == "MERGE" => Some(&["INTO"]),
+            [.., last] if *last == "DELETE" => Some(&["FROM"]),
+            [.., last] if *last == "INSERT" || *last == "MERGE" => Some(&["INTO"]),
+            _ => None,
+        }
+    }
+
+    fn expected_mysql_dml_statement_head_keyword_candidates(
+        words: &[String],
+    ) -> Option<&'static [&'static str]> {
+        const MYSQL_DELETE_HEAD: &[&str] = &["FROM", "IGNORE", "LOW_PRIORITY", "QUICK"];
+        const MYSQL_DELETE_AFTER_LOW_PRIORITY: &[&str] = &["FROM", "IGNORE", "QUICK"];
+        const MYSQL_DELETE_AFTER_QUICK: &[&str] = &["FROM", "IGNORE"];
+        const MYSQL_DELETE_AFTER_IGNORE: &[&str] = &["FROM"];
+        const MYSQL_INSERT_HEAD: &[&str] =
+            &["DELAYED", "HIGH_PRIORITY", "IGNORE", "INTO", "LOW_PRIORITY"];
+        const MYSQL_INSERT_AFTER_PRIORITY: &[&str] = &["IGNORE", "INTO"];
+        const MYSQL_INSERT_AFTER_IGNORE: &[&str] = &["INTO"];
+        const MYSQL_REPLACE_HEAD: &[&str] = &["DELAYED", "INTO", "LOW_PRIORITY"];
+        const MYSQL_REPLACE_AFTER_MODIFIER: &[&str] = &["INTO"];
+        const MYSQL_UPDATE_HEAD: &[&str] = &["IGNORE", "LOW_PRIORITY"];
+        const MYSQL_UPDATE_AFTER_LOW_PRIORITY: &[&str] = &["IGNORE"];
+
+        match words {
+            [.., last] if *last == "DELETE" => Some(MYSQL_DELETE_HEAD),
+            [.., verb, last]
+                if *verb == "DELETE" && *last == "LOW_PRIORITY" =>
+            {
+                Some(MYSQL_DELETE_AFTER_LOW_PRIORITY)
+            }
+            [.., verb, last] if *verb == "DELETE" && *last == "QUICK" => {
+                Some(MYSQL_DELETE_AFTER_QUICK)
+            }
+            [.., verb, last] if *verb == "DELETE" && *last == "IGNORE" => {
+                Some(MYSQL_DELETE_AFTER_IGNORE)
+            }
+            [.., verb, a, b]
+                if *verb == "DELETE"
+                    && matches!(a.as_str(), "LOW_PRIORITY" | "QUICK")
+                    && matches!(b.as_str(), "QUICK" | "IGNORE") =>
+            {
+                if *b == "IGNORE" {
+                    Some(MYSQL_DELETE_AFTER_IGNORE)
+                } else {
+                    Some(MYSQL_DELETE_AFTER_QUICK)
+                }
+            }
+            [.., verb, target]
+                if *verb == "DELETE"
+                    && !matches!(
+                        target.as_str(),
+                        "FROM" | "IGNORE" | "LOW_PRIORITY" | "QUICK" | "USING"
+                    ) =>
+            {
+                Some(&["FROM"])
+            }
+            [.., last] if *last == "INSERT" => Some(MYSQL_INSERT_HEAD),
+            [.., verb, last]
+                if *verb == "INSERT"
+                    && matches!(last.as_str(), "DELAYED" | "HIGH_PRIORITY" | "LOW_PRIORITY") =>
+            {
+                Some(MYSQL_INSERT_AFTER_PRIORITY)
+            }
+            [.., verb, last] if *verb == "INSERT" && *last == "IGNORE" => {
+                Some(MYSQL_INSERT_AFTER_IGNORE)
+            }
+            [.., verb, _priority, last]
+                if *verb == "INSERT" && *last == "IGNORE" =>
+            {
+                Some(MYSQL_INSERT_AFTER_IGNORE)
+            }
+            [.., last] if *last == "REPLACE" => Some(MYSQL_REPLACE_HEAD),
+            [.., verb, last]
+                if *verb == "REPLACE" && matches!(last.as_str(), "DELAYED" | "LOW_PRIORITY") =>
+            {
+                Some(MYSQL_REPLACE_AFTER_MODIFIER)
+            }
+            [.., last] if *last == "UPDATE" => Some(MYSQL_UPDATE_HEAD),
+            [.., verb, last] if *verb == "UPDATE" && *last == "LOW_PRIORITY" => {
+                Some(MYSQL_UPDATE_AFTER_LOW_PRIORITY)
+            }
             _ => None,
         }
     }
@@ -12804,6 +16088,7 @@ impl SqlEditorWidget {
     fn expected_tool_command_keyword_candidates(
         tokens: &[SqlToken],
         end: usize,
+        db_type: Option<crate::db::DatabaseType>,
     ) -> Option<&'static [&'static str]> {
         const NONE: &[&str] = &[];
         const ACCEPT_AFTER_NAME: &[&str] = &["PROMPT"];
@@ -12840,19 +16125,96 @@ impl SqlEditorWidget {
         const SET_AUTOCOMMIT_VALUES: &[&str] = &["ON", "OFF", "TRUE", "FALSE"];
         const SET_SERVEROUTPUT_AFTER_ON: &[&str] = &["SIZE"];
         const SET_SERVEROUTPUT_AFTER_SIZE: &[&str] = &["UNLIMITED"];
-        const SHOW_HEAD: &[&str] = &[
+        const ORACLE_SHOW_HEAD: &[&str] = &[
             "USER",
             "ALL",
             "ERRORS",
-            "DATABASES",
-            "TABLES",
+        ];
+        const MYSQL_SHOW_HEAD: &[&str] = &[
+            "BINARY",
+            "BINLOG",
+            "CHARACTER",
+            "CHARSET",
+            "COLLATION",
             "COLUMNS",
+            "COUNT",
             "CREATE",
+            "DATABASES",
+            "ENGINE",
+            "ENGINES",
+            "ERRORS",
+            "EVENTS",
+            "EXTENDED",
+            "FIELDS",
+            "FULL",
+            "FUNCTION",
+            "GLOBAL",
+            "GRANTS",
+            "INDEX",
+            "INDEXES",
+            "KEYS",
+            "OPEN",
+            "PARSE_TREE",
+            "PLUGINS",
+            "PRIVILEGES",
+            "PROCEDURE",
             "PROCESSLIST",
-            "VARIABLES",
+            "PROFILE",
+            "PROFILES",
+            "RELAYLOG",
+            "REPLICA",
+            "REPLICAS",
+            "SESSION",
             "STATUS",
+            "STORAGE",
+            "TABLE",
+            "TABLES",
+            "TRIGGERS",
+            "VARIABLES",
             "WARNINGS",
         ];
+        const MYSQL_SHOW_AFTER_BINARY: &[&str] = &["LOG", "LOGS"];
+        const MYSQL_SHOW_AFTER_BINARY_LOG: &[&str] = &["STATUS"];
+        const MYSQL_SHOW_AFTER_CHARACTER: &[&str] = &["SET"];
+        const MYSQL_SHOW_AFTER_CREATE: &[&str] = &[
+            "DATABASE",
+            "EVENT",
+            "FUNCTION",
+            "PROCEDURE",
+            "TABLE",
+            "TRIGGER",
+            "USER",
+            "VIEW",
+        ];
+        const MYSQL_SHOW_AFTER_ENGINE: &[&str] = &["STATUS", "MUTEX"];
+        const MYSQL_SHOW_AFTER_FULL: &[&str] =
+            &["COLUMNS", "FIELDS", "PROCESSLIST", "TABLES"];
+        const MYSQL_SHOW_AFTER_EXTENDED: &[&str] = &[
+            "COLUMNS",
+            "FIELDS",
+            "FULL",
+            "INDEX",
+            "INDEXES",
+            "KEYS",
+            "TABLES",
+        ];
+        const MYSQL_SHOW_AFTER_EXTENDED_FULL: &[&str] = &["COLUMNS", "FIELDS", "TABLES"];
+        const MYSQL_SHOW_AFTER_GLOBAL_SESSION: &[&str] = &["STATUS", "VARIABLES"];
+        const MYSQL_SHOW_AFTER_ROUTINE_KIND: &[&str] = &["CODE", "STATUS"];
+        const MYSQL_SHOW_AFTER_STORAGE: &[&str] = &["ENGINES"];
+        const MYSQL_SHOW_AFTER_TABLE: &[&str] = &["STATUS"];
+        const MYSQL_SHOW_FROM_TABLE: &[&str] = &["FROM", "IN"];
+        const MYSQL_SHOW_FROM_OR_FILTER: &[&str] = &["FROM", "LIKE", "WHERE"];
+        const MYSQL_SHOW_FROM_IN_OR_FILTER: &[&str] = &["FROM", "IN", "LIKE", "WHERE"];
+        const MYSQL_SHOW_FILTER: &[&str] = &["LIKE", "WHERE"];
+        const MYSQL_SHOW_INDEX_FROM_OR_FILTER: &[&str] = &["FROM", "IN", "WHERE"];
+        const MYSQL_SHOW_LOG_EVENTS_TAIL: &[&str] = &["FROM", "IN", "LIMIT"];
+        const MYSQL_SHOW_LOG_EVENTS_AFTER_IN: &[&str] = &["FROM", "LIMIT"];
+        const MYSQL_SHOW_LIMIT: &[&str] = &["LIMIT"];
+        const MYSQL_SHOW_GRANTS_AFTER_TOPIC: &[&str] = &["FOR"];
+        const MYSQL_SHOW_GRANTS_AFTER_USER: &[&str] = &["USING"];
+        const MYSQL_SHOW_PROFILE_AFTER_TOPIC: &[&str] = &["FOR", "OFFSET", "LIMIT"];
+        const MYSQL_SHOW_COUNT_AFTER_STAR: &[&str] = &["ERRORS", "WARNINGS"];
         const SHOW_ERRORS_TYPES: &[&str] = &[
             "PROCEDURE",
             "FUNCTION",
@@ -12862,9 +16224,6 @@ impl SqlEditorWidget {
             "VIEW",
         ];
         const SHOW_ERRORS_BODY: &[&str] = &["BODY"];
-        const SHOW_COLUMNS_AFTER_TOPIC: &[&str] = &["FROM", "IN"];
-        const SHOW_CREATE_AFTER_TOPIC: &[&str] = &["TABLE"];
-        const SHOW_LIKE_AFTER_TOPIC: &[&str] = &["LIKE"];
         const SPOOL_HEAD: &[&str] = &["OFF", "APPEND"];
         const SPOOL_AFTER_PATH: &[&str] = &["APPEND"];
         const WHENEVER_HEAD: &[&str] = &["SQLERROR", "OSERROR"];
@@ -12876,7 +16235,11 @@ impl SqlEditorWidget {
                 return None;
             };
             let upper = word.to_ascii_uppercase();
-            Self::tool_command_word_at_statement_head(&toks, idx, &[upper.as_str()])
+            Self::tool_command_word_at_statement_head(
+                &toks,
+                idx,
+                Self::TOOL_NO_SQL_ARGUMENT_COMMANDS,
+            )
                 .then_some((idx, upper))
         })?;
         if toks.iter().skip(command_idx + 1).any(|token| {
@@ -12896,6 +16259,212 @@ impl SqlEditorWidget {
         let tail_has_non_comment = !tail_tokens
             .iter()
             .all(|token| matches!(token, SqlToken::Comment(_)));
+        let mysql_compatible = crate::sql_text::mysql_compatibility_for_sql("", db_type);
+        let mysql_show_count_star_tail = || {
+            if tail_tokens.len() != 4 {
+                return false;
+            }
+            matches!(tail_tokens[0], SqlToken::Word(word) if word.eq_ignore_ascii_case("COUNT"))
+                && matches!(tail_tokens[1], SqlToken::Symbol(sym) if sym == "(")
+                && matches!(tail_tokens[2], SqlToken::Symbol(sym) if sym == "*")
+                && matches!(tail_tokens[3], SqlToken::Symbol(sym) if sym == ")")
+        };
+        let mysql_show_column_topic =
+            |word: &str| matches!(word, "COLUMNS" | "FIELDS");
+        let mysql_show_index_topic =
+            |word: &str| matches!(word, "INDEX" | "INDEXES" | "KEYS");
+
+        if mysql_compatible {
+            return match command.as_str() {
+                "DELIMITER" | "SOURCE" | "USE" => Some(NONE),
+                "SHOW" => match tail_words.as_slice() {
+                    _ if mysql_show_count_star_tail() => Some(MYSQL_SHOW_COUNT_AFTER_STAR),
+                    [] => Some(MYSQL_SHOW_HEAD),
+                    [topic] if topic == "BINARY" => Some(MYSQL_SHOW_AFTER_BINARY),
+                    [first, second] if first == "BINARY" && second == "LOG" => {
+                        Some(MYSQL_SHOW_AFTER_BINARY_LOG)
+                    }
+                    [topic] if topic == "BINLOG" => Some(&["EVENTS"]),
+                    [topic] if topic == "CHARACTER" => Some(MYSQL_SHOW_AFTER_CHARACTER),
+                    [topic] if topic == "CREATE" => Some(MYSQL_SHOW_AFTER_CREATE),
+                    [topic] if topic == "ENGINE" => Some(NONE),
+                    [topic, _engine] if topic == "ENGINE" => Some(MYSQL_SHOW_AFTER_ENGINE),
+                    [topic] if topic == "EXTENDED" => Some(MYSQL_SHOW_AFTER_EXTENDED),
+                    [modifier, topic]
+                        if modifier == "EXTENDED" && topic == "FULL" =>
+                    {
+                        Some(MYSQL_SHOW_AFTER_EXTENDED_FULL)
+                    }
+                    [modifier, topic]
+                        if modifier == "EXTENDED" && mysql_show_column_topic(topic) =>
+                    {
+                        Some(MYSQL_SHOW_FROM_TABLE)
+                    }
+                    [modifier, topic]
+                        if modifier == "EXTENDED" && mysql_show_index_topic(topic) =>
+                    {
+                        Some(MYSQL_SHOW_FROM_TABLE)
+                    }
+                    [modifier, topic]
+                        if modifier == "EXTENDED" && topic == "TABLES" =>
+                    {
+                        Some(MYSQL_SHOW_FROM_IN_OR_FILTER)
+                    }
+                    [modifier, topic, source_kw, _table]
+                        if modifier == "EXTENDED"
+                            && mysql_show_column_topic(topic)
+                            && matches!(source_kw.as_str(), "FROM" | "IN") =>
+                    {
+                        Some(MYSQL_SHOW_FROM_IN_OR_FILTER)
+                    }
+                    [modifier, topic, source_kw, _table]
+                        if modifier == "EXTENDED"
+                            && mysql_show_index_topic(topic)
+                            && matches!(source_kw.as_str(), "FROM" | "IN") =>
+                    {
+                        Some(MYSQL_SHOW_INDEX_FROM_OR_FILTER)
+                    }
+                    [modifier, topic, _db]
+                        if modifier == "EXTENDED" && topic == "TABLES" =>
+                    {
+                        Some(MYSQL_SHOW_FILTER)
+                    }
+                    [extended, full, topic]
+                        if extended == "EXTENDED"
+                            && full == "FULL"
+                            && mysql_show_column_topic(topic) =>
+                    {
+                        Some(MYSQL_SHOW_FROM_TABLE)
+                    }
+                    [extended, full, topic]
+                        if extended == "EXTENDED" && full == "FULL" && topic == "TABLES" =>
+                    {
+                        Some(MYSQL_SHOW_FROM_IN_OR_FILTER)
+                    }
+                    [extended, full, topic, source_kw, _table]
+                        if extended == "EXTENDED"
+                            && full == "FULL"
+                            && mysql_show_column_topic(topic)
+                            && matches!(source_kw.as_str(), "FROM" | "IN") =>
+                    {
+                        Some(MYSQL_SHOW_FROM_IN_OR_FILTER)
+                    }
+                    [extended, full, topic, _db]
+                        if extended == "EXTENDED" && full == "FULL" && topic == "TABLES" =>
+                    {
+                        Some(MYSQL_SHOW_FILTER)
+                    }
+                    [topic] if topic == "FULL" => Some(MYSQL_SHOW_AFTER_FULL),
+                    [modifier, topic]
+                        if modifier == "FULL" && mysql_show_column_topic(topic) =>
+                    {
+                        Some(MYSQL_SHOW_FROM_TABLE)
+                    }
+                    [modifier, topic] if modifier == "FULL" && topic == "TABLES" => {
+                        Some(MYSQL_SHOW_FROM_IN_OR_FILTER)
+                    }
+                    [modifier, topic, source_kw, _table]
+                        if modifier == "FULL"
+                            && mysql_show_column_topic(topic)
+                            && matches!(source_kw.as_str(), "FROM" | "IN") =>
+                    {
+                        Some(MYSQL_SHOW_FROM_OR_FILTER)
+                    }
+                    [modifier, topic, _table]
+                        if modifier == "FULL" && topic == "TABLES" =>
+                    {
+                        Some(MYSQL_SHOW_FILTER)
+                    }
+                    [modifier] if matches!(modifier.as_str(), "GLOBAL" | "SESSION") => {
+                        Some(MYSQL_SHOW_AFTER_GLOBAL_SESSION)
+                    }
+                    [modifier, topic]
+                        if matches!(modifier.as_str(), "GLOBAL" | "SESSION")
+                            && matches!(topic.as_str(), "STATUS" | "VARIABLES") =>
+                    {
+                        Some(MYSQL_SHOW_FILTER)
+                    }
+                    [topic] if matches!(topic.as_str(), "FUNCTION" | "PROCEDURE") => {
+                        Some(MYSQL_SHOW_AFTER_ROUTINE_KIND)
+                    }
+                    [topic] if topic == "GRANTS" => Some(MYSQL_SHOW_GRANTS_AFTER_TOPIC),
+                    [topic, for_kw, _user]
+                        if topic == "GRANTS" && for_kw == "FOR" =>
+                    {
+                        Some(MYSQL_SHOW_GRANTS_AFTER_USER)
+                    }
+                    [topic] if mysql_show_index_topic(topic) => Some(MYSQL_SHOW_FROM_TABLE),
+                    [topic, source_kw, _table]
+                        if mysql_show_index_topic(topic)
+                            && matches!(source_kw.as_str(), "FROM" | "IN") =>
+                    {
+                        Some(MYSQL_SHOW_INDEX_FROM_OR_FILTER)
+                    }
+                    [topic] if topic == "OPEN" => Some(&["TABLES"]),
+                    [topic] if topic == "PROFILE" => Some(MYSQL_SHOW_PROFILE_AFTER_TOPIC),
+                    [topic] if topic == "RELAYLOG" => Some(&["EVENTS"]),
+                    [topic, events]
+                        if matches!(topic.as_str(), "BINLOG" | "RELAYLOG") && events == "EVENTS" =>
+                    {
+                        Some(MYSQL_SHOW_LOG_EVENTS_TAIL)
+                    }
+                    [topic, events, in_kw, _log]
+                        if matches!(topic.as_str(), "BINLOG" | "RELAYLOG")
+                            && events == "EVENTS"
+                            && in_kw == "IN" =>
+                    {
+                        Some(MYSQL_SHOW_LOG_EVENTS_AFTER_IN)
+                    }
+                    [topic, events, from_kw, _pos]
+                        if matches!(topic.as_str(), "BINLOG" | "RELAYLOG")
+                            && events == "EVENTS"
+                            && from_kw == "FROM" =>
+                    {
+                        Some(MYSQL_SHOW_LIMIT)
+                    }
+                    [topic] if topic == "REPLICA" => Some(&["STATUS"]),
+                    [topic] if topic == "STORAGE" => Some(MYSQL_SHOW_AFTER_STORAGE),
+                    [topic] if topic == "TABLE" => Some(MYSQL_SHOW_AFTER_TABLE),
+                    [topic] if mysql_show_column_topic(topic) => Some(MYSQL_SHOW_FROM_TABLE),
+                    [topic, _table] if mysql_show_column_topic(topic) => {
+                        Some(MYSQL_SHOW_FROM_IN_OR_FILTER)
+                    }
+                    [topic, source_kw, _table]
+                        if mysql_show_column_topic(topic)
+                            && matches!(source_kw.as_str(), "FROM" | "IN") =>
+                    {
+                        Some(MYSQL_SHOW_FROM_IN_OR_FILTER)
+                    }
+                    [topic]
+                        if matches!(
+                            topic.as_str(),
+                            "CHARSET" | "COLLATION" | "DATABASES" | "EVENTS" | "STATUS"
+                                | "TABLES" | "TRIGGERS" | "VARIABLES"
+                        ) =>
+                    {
+                        if matches!(topic.as_str(), "EVENTS" | "TABLES" | "TRIGGERS") {
+                            Some(MYSQL_SHOW_FROM_IN_OR_FILTER)
+                        } else {
+                            Some(MYSQL_SHOW_FILTER)
+                        }
+                    }
+                    [topic, _db] if matches!(topic.as_str(), "EVENTS" | "TRIGGERS") => {
+                        Some(MYSQL_SHOW_FILTER)
+                    }
+                    [first, second] if first == "TABLE" && second == "STATUS" => {
+                        Some(MYSQL_SHOW_FROM_OR_FILTER)
+                    }
+                    [first, second] if first == "OPEN" && second == "TABLES" => {
+                        Some(MYSQL_SHOW_FROM_OR_FILTER)
+                    }
+                    [topic] if matches!(topic.as_str(), "ERRORS" | "WARNINGS") => {
+                        Some(MYSQL_SHOW_LIMIT)
+                    }
+                    _ => Some(NONE),
+                },
+                _ => None,
+            };
+        }
 
         match command.as_str() {
             "ACCEPT" => match tail_words.as_slice() {
@@ -12971,23 +16540,12 @@ impl SqlEditorWidget {
                 _ => Some(NONE),
             },
             "SHOW" => match tail_words.as_slice() {
-                [] => Some(SHOW_HEAD),
+                [] => Some(ORACLE_SHOW_HEAD),
                 [topic] if topic == "ERRORS" => Some(SHOW_ERRORS_TYPES),
                 [topic, object_type]
                     if topic == "ERRORS" && matches!(object_type.as_str(), "PACKAGE" | "TYPE") =>
                 {
                     Some(SHOW_ERRORS_BODY)
-                }
-                [topic] if topic == "COLUMNS" => Some(SHOW_COLUMNS_AFTER_TOPIC),
-                [topic, _table] if topic == "COLUMNS" => Some(SHOW_COLUMNS_AFTER_TOPIC),
-                [topic, source_kw, _table]
-                    if topic == "COLUMNS" && matches!(source_kw.as_str(), "FROM" | "IN") =>
-                {
-                    Some(SHOW_COLUMNS_AFTER_TOPIC)
-                }
-                [topic] if topic == "CREATE" => Some(SHOW_CREATE_AFTER_TOPIC),
-                [topic] if matches!(topic.as_str(), "VARIABLES" | "STATUS") => {
-                    Some(SHOW_LIKE_AFTER_TOPIC)
                 }
                 _ => Some(NONE),
             },
@@ -13012,10 +16570,7 @@ impl SqlEditorWidget {
                 [first] if matches!(first.as_str(), "SQLERROR" | "OSERROR") => Some(WHENEVER_ACTION),
                 _ => Some(NONE),
             },
-            "DEFINE" | "UNDEFINE" | "DELIMITER" | "PROMPT" | "STORE" | "GET" | "SAVE"
-            | "START" | "SOURCE" | "USE" | "CONNECT" | "CONN" | "PASSWORD" | "PASSW"
-            | "PASSWO" | "PASSWOR" | "HOST" | "PAUSE" | "TTITLE" | "BTITLE"
-            | "REPHEADER" | "REPFOOTER" => Some(NONE),
+            _ if Self::TOOL_NO_SQL_ARGUMENT_COMMANDS.contains(&command.as_str()) => Some(NONE),
             _ => None,
         }
     }
@@ -13037,11 +16592,6 @@ impl SqlEditorWidget {
         db_type: Option<crate::db::DatabaseType>,
         expr_keyword_ctx: Option<ExpressionKeywordContext>,
     ) -> Vec<String> {
-        const GENERIC_TOP_LEVEL_KEYWORDS: &[&str] = &[
-            "SELECT", "WITH", "INSERT", "UPDATE", "DELETE", "MERGE", "CREATE", "ALTER", "DROP",
-            "BEGIN", "DECLARE", "CALL", "VALUES",
-        ];
-
         let tokens = Self::current_query_tokens(deep_ctx);
         let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
         let context_end =
@@ -13058,7 +16608,8 @@ impl SqlEditorWidget {
         ) {
             return Vec::new();
         }
-        if let Some(candidates) = Self::expected_tool_command_keyword_candidates(tokens, context_end)
+        if let Some(candidates) =
+            Self::expected_tool_command_keyword_candidates(tokens, context_end, db_type)
         {
             return Self::filter_expected_candidates(prefix, candidates);
         }
@@ -13177,7 +16728,7 @@ impl SqlEditorWidget {
         // (`cursor_is_at_identifier_suppressing_keyword_slot_for_context`) to keep
         // the base catalog from leaking in.
         if let Some(candidates) =
-            Self::expected_grant_privilege_keyword_candidates(tokens, context_end)
+            Self::expected_grant_privilege_keyword_candidates(tokens, context_end, db_type)
         {
             return Self::filter_expected_candidates(prefix, candidates);
         }
@@ -13216,7 +16767,7 @@ impl SqlEditorWidget {
         }
 
         if let Some(candidates) =
-            Self::expected_dml_target_keyword_candidates(tokens, context_end, deep_ctx.phase)
+            Self::expected_dml_target_keyword_candidates(tokens, context_end, deep_ctx.phase, db_type)
         {
             return Self::filter_expected_candidates(prefix, candidates);
         }
@@ -13232,6 +16783,7 @@ impl SqlEditorWidget {
             Self::expected_statement_structural_keyword_candidates(
                 statement_tokens,
                 statement_context_end,
+                db_type,
             )
         {
             return Self::filter_expected_candidates(prefix, candidates);
@@ -13240,6 +16792,7 @@ impl SqlEditorWidget {
             Self::expected_dml_statement_head_keyword_candidates(
                 statement_tokens,
                 statement_context_end,
+                db_type,
             )
         {
             return Self::filter_expected_candidates(prefix, candidates);
@@ -13302,11 +16855,7 @@ impl SqlEditorWidget {
             // token at all; the operator/clause continuations valid after the
             // operand still arrive through the expression-keyword allowlist.
             [] if Self::meaningful_tokens_before(tokens, context_end).is_empty() => {
-                if Self::top_level_statement_heads_include_sqlplus_commands(db_type) {
-                    crate::sql_text::statement_head_keywords()
-                } else {
-                    GENERIC_TOP_LEVEL_KEYWORDS
-                }
+                Self::top_level_statement_head_keywords_for_db(db_type)
             }
             [] => &[],
             [.., last]

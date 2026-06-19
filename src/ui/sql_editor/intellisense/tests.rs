@@ -366,6 +366,107 @@ fn grant_privilege_list_offers_only_privilege_keywords_and_suppresses_identifier
     }
 }
 
+#[test]
+fn mysql_grant_revoke_privilege_keywords_are_dialect_scoped() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let kw = |sql: &str, db| {
+        let ctx = analyze_inline_cursor_sql(sql);
+        (
+            SqlEditorWidget::cursor_is_at_identifier_suppressing_keyword_slot_for_context(
+                &ctx,
+                false,
+                Some(db),
+            ),
+            SqlEditorWidget::collect_expected_keyword_suggestions("", &ctx, Some(db)),
+        )
+    };
+    let kw_prefixed = |sql: &str, prefix: &str, db| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(db),
+        )
+    };
+    let has = |suggestions: &[String], keyword: &str| {
+        suggestions
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(keyword))
+    };
+
+    let (mysql_grant_suppresses, mysql_grant) = kw("GRANT | ON *.* TO u", MySQL);
+    assert!(
+        mysql_grant_suppresses,
+        "MySQL GRANT privilege list must suppress catalog identifiers"
+    );
+    for expected in [
+        "SELECT",
+        "CREATE USER",
+        "CREATE ROLE",
+        "CREATE TEMPORARY TABLES",
+        "LOCK TABLES",
+        "SHOW DATABASES",
+        "SHOW VIEW",
+        "GRANT OPTION",
+        "PROXY",
+        "USAGE",
+        "BACKUP_ADMIN",
+    ] {
+        assert!(
+            has(&mysql_grant, expected),
+            "{expected} missing for MySQL GRANT privileges: {mysql_grant:?}"
+        );
+    }
+    for oracle_only in ["READ", "ALL PRIVILEGES TO"] {
+        assert!(
+            !has(&mysql_grant, oracle_only),
+            "{oracle_only} leaked into MySQL GRANT privileges: {mysql_grant:?}"
+        );
+    }
+    assert!(
+        !has(&mysql_grant, "IF"),
+        "IF must not be suggested in MySQL GRANT privilege list: {mysql_grant:?}"
+    );
+    assert_eq!(
+        kw_prefixed("GRANT SYSTEM_| ON *.* TO u", "SYSTEM_", MySQL),
+        vec![
+            "SYSTEM_USER".to_string(),
+            "SYSTEM_VARIABLES_ADMIN".to_string()
+        ]
+    );
+    assert_eq!(
+        kw_prefixed("GRANT XA_| ON *.* TO u", "XA_", MySQL),
+        vec!["XA_RECOVER_ADMIN".to_string()]
+    );
+
+    let (_, mysql_revoke) = kw("REVOKE | ON *.* FROM u", MySQL);
+    for expected in ["IF", "SELECT", "BACKUP_ADMIN", "CREATE USER"] {
+        assert!(
+            has(&mysql_revoke, expected),
+            "{expected} missing for MySQL REVOKE privileges: {mysql_revoke:?}"
+        );
+    }
+    assert_eq!(kw("REVOKE IF |", MySQL).1, vec!["EXISTS".to_string()]);
+
+    let (_, mysql_revoke_after_comma) = kw("REVOKE SELECT, | ON *.* FROM u", MySQL);
+    assert!(
+        !has(&mysql_revoke_after_comma, "IF"),
+        "IF must only be suggested immediately after REVOKE: {mysql_revoke_after_comma:?}"
+    );
+    assert!(
+        has(&mysql_revoke_after_comma, "BACKUP_ADMIN"),
+        "dynamic privileges should remain available after a comma: {mysql_revoke_after_comma:?}"
+    );
+
+    let (_, oracle_grant) = kw("GRANT | ON t TO u", Oracle);
+    for mysql_only in ["CREATE USER", "BACKUP_ADMIN", "PROXY", "USAGE", "LOCK TABLES"] {
+        assert!(
+            !has(&oracle_grant, mysql_only),
+            "{mysql_only} leaked into Oracle GRANT privileges: {oracle_grant:?}"
+        );
+    }
+}
+
 /// Structural guard against keyword/suppression *drift*: when a cursor slot
 /// emits a fixed keyword set through `collect_expected_keyword_suggestions` and
 /// no object/identifier is grammatical there (object kind `None`, not a
@@ -1098,11 +1199,10 @@ fn mysql_context_and_suggestions_for_inline_sql(
 
 #[test]
 fn constrained_object_slots_replace_base_catalog() {
-    // A constrained DDL object slot resolves to a single object family (kind is
-    // Some and not `Any`), which makes `trigger_intellisense` replace the base
-    // catalog rather than append it — so `DROP TRIGGER`/`CALL`/`GRANT … ON`/
-    // `GRANT … TO` no longer leak the whole catalog. `Any` slots (`AUDIT`) keep
-    // it because every object kind is valid there.
+    // An object slot resolves to a concrete object family or to `Any` (every
+    // object kind). In both cases `trigger_intellisense` replaces the base catalog
+    // rather than appending it, so schema-object positions never leak SQL keywords
+    // or language functions from the flat base catalog.
     let build = || {
         let mut data = IntellisenseData::new();
         data.tables = vec!["EMP_T".to_string()];
@@ -1127,6 +1227,50 @@ fn constrained_object_slots_replace_base_catalog() {
         let objs = SqlEditorWidget::collect_expected_object_suggestions(&mut data, &prefix, &ctx);
         let kind = SqlEditorWidget::expected_object_suggestion_kind(&prefix, None, &ctx);
         (kind, objs)
+    };
+    let apply_like = |sql: &str| {
+        let cursor = sql.find('|').unwrap();
+        let s = sql.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql);
+        let context = SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&s, cursor);
+        let mut data = build();
+        let expr_keyword_ctx =
+            SqlEditorWidget::expression_keyword_context(&ctx, &data, &[], !prefix.is_empty(), Some(crate::db::DatabaseType::Oracle));
+        let expected_object_kind =
+            SqlEditorWidget::expected_object_suggestion_kind_for_db(&prefix, None, &ctx, Some(crate::db::DatabaseType::Oracle));
+        let expected_object_suggestions =
+            SqlEditorWidget::collect_expected_object_suggestions_for_db(&mut data, &prefix, &ctx, Some(crate::db::DatabaseType::Oracle));
+        let mut suggestions = if expected_object_kind.is_some() {
+            expected_object_suggestions.clone()
+        } else {
+            SqlEditorWidget::base_suggestions_for_context(
+                &mut data,
+                &prefix,
+                None,
+                None,
+                matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
+                context,
+                false,
+                Some(crate::db::DatabaseType::Oracle),
+                expr_keyword_ctx,
+            )
+        };
+        let expected_keywords =
+            SqlEditorWidget::collect_expected_keyword_suggestions_with_expression_context(
+                &prefix,
+                &ctx,
+                Some(crate::db::DatabaseType::Oracle),
+                Some(expr_keyword_ctx),
+            );
+        if !expected_keywords.is_empty() {
+            suggestions = SqlEditorWidget::merge_suggestions_with_context_aliases(
+                suggestions,
+                expected_keywords,
+                true,
+            );
+        }
+        suggestions
     };
 
     // Constrained slots: kind present and not Any, objects limited to the family
@@ -1165,9 +1309,40 @@ fn constrained_object_slots_replace_base_catalog() {
         assert_eq!(objs, vec!["EMP_USR".to_string()], "{sql}: {objs:?}");
     }
 
-    // `AUDIT … ON` is an Any slot → kind is Any → base catalog is kept.
+    // `AUDIT … ON` is an Any slot: all object kinds are relevant, but SQL
+    // keywords and language functions from the flat base catalog are not.
     let (k, _) = analyze("AUDIT SELECT ON emp|");
     assert_eq!(k, Some(ExpectedObjectSuggestionKind::Any));
+
+    for sql in [
+        "DESC |",
+        "DESCRIBE |",
+        "AUDIT SELECT ON |",
+        "CREATE SYNONYM emp_syn FOR |",
+    ] {
+        let suggestions = apply_like(sql);
+        assert!(suggestions.iter().any(|s| s == "EMP_T"), "{sql}: {suggestions:?}");
+        assert!(suggestions.iter().any(|s| s == "EMP_PROC"), "{sql}: {suggestions:?}");
+        for leaked in ["SELECT", "ALTER", "COUNT()"] {
+            assert!(
+                !suggestions.iter().any(|s| s == leaked),
+                "{sql} leaked base `{leaked}` into object slot: {suggestions:?}"
+            );
+        }
+    }
+
+    for sql in ["CALL |", "EXEC |", "EXECUTE |"] {
+        let suggestions = apply_like(sql);
+        assert!(suggestions.iter().any(|s| s == "EMP_PROC"), "{sql}: {suggestions:?}");
+        assert!(suggestions.iter().any(|s| s == "EMP_FN"), "{sql}: {suggestions:?}");
+        assert!(suggestions.iter().any(|s| s == "EMP_PKG"), "{sql}: {suggestions:?}");
+        for leaked in ["EMP_T", "EMP_IDX", "SELECT", "ALTER", "COUNT()"] {
+            assert!(
+                !suggestions.iter().any(|s| s == leaked),
+                "{sql} leaked `{leaked}` into routine slot: {suggestions:?}"
+            );
+        }
+    }
 
     for sql in [
         "SELECT call | FROM emp",
@@ -9119,6 +9294,10 @@ fn print_command_bind_suggestions_for_test(
 #[test]
 fn freeform_tool_argument_slots_do_not_suggest_sql_catalog() {
     for sql in [
+        "@__CODEX_CURSOR__",
+        "@@__CODEX_CURSOR__",
+        "\\. __CODEX_CURSOR__",
+        "! __CODEX_CURSOR__",
         "DEFINE __CODEX_CURSOR__",
         "DEFINE app_user = __CODEX_CURSOR__",
         "DEFINE app_user = sc__CODEX_CURSOR__",
@@ -9127,6 +9306,7 @@ fn freeform_tool_argument_slots_do_not_suggest_sql_catalog() {
         "UNDEFINE app__CODEX_CURSOR__",
         "ACCEPT __CODEX_CURSOR__",
         "ACCEPT app_user PROMPT __CODEX_CURSOR__",
+        "ARCHIVE __CODEX_CURSOR__",
         "PROMPT __CODEX_CURSOR__",
         "STORE __CODEX_CURSOR__",
         "GET __CODEX_CURSOR__",
@@ -9136,12 +9316,24 @@ fn freeform_tool_argument_slots_do_not_suggest_sql_catalog() {
         "USE __CODEX_CURSOR__",
         "CONNECT __CODEX_CURSOR__",
         "CONN __CODEX_CURSOR__",
+        "DISCONNECT __CODEX_CURSOR__",
+        "DISC __CODEX_CURSOR__",
+        "EXIT __CODEX_CURSOR__",
+        "QUIT __CODEX_CURSOR__",
+        "RECOVER __CODEX_CURSOR__",
+        "RUN __CODEX_CURSOR__",
+        "R __CODEX_CURSOR__",
         "PASSWORD __CODEX_CURSOR__",
+        "SHUTDOWN __CODEX_CURSOR__",
+        "STARTUP __CODEX_CURSOR__",
         "HOST __CODEX_CURSOR__",
         "PAUSE __CODEX_CURSOR__",
+        "TIMING __CODEX_CURSOR__",
         "TTITLE __CODEX_CURSOR__",
         "BTITLE __CODEX_CURSOR__",
         "SELECT 1 FROM dual;\nDEFINE app_user = __CODEX_CURSOR__",
+        "SELECT 1 FROM dual;\n@__CODEX_CURSOR__",
+        "SELECT 1 FROM dual;\nEXIT __CODEX_CURSOR__",
     ] {
         let suggestions = print_command_bind_suggestions_for_test(sql, &["V_SESSION"]);
         assert!(
@@ -9216,19 +9408,24 @@ fn tool_command_keyword_slots_offer_only_supported_tool_keywords() {
     assert_only("SET VERIFY __CODEX_CURSOR__", &["ON", "OFF"]);
     assert_only("SET PAGESIZE __CODEX_CURSOR__", &[]);
     assert_only("SHOW __CODEX_CURSOR__", &["USER", "ALL", "ERRORS"]);
-    assert_only("SHOW __CODEX_CURSOR__", &["DATABASES", "TABLES", "COLUMNS", "VARIABLES"]);
     assert_only("SHOW ERRORS __CODEX_CURSOR__", &["PROCEDURE", "FUNCTION", "PACKAGE", "TYPE"]);
     assert_only("SHOW ERRORS PACKAGE __CODEX_CURSOR__", &["BODY"]);
-    assert_only("SHOW COLUMNS __CODEX_CURSOR__", &["FROM", "IN"]);
-    assert_only("SHOW COLUMNS FROM emp __CODEX_CURSOR__", &["FROM", "IN"]);
-    assert_only("SHOW CREATE __CODEX_CURSOR__", &["TABLE"]);
-    assert_only("SHOW VARIABLES __CODEX_CURSOR__", &["LIKE"]);
-    assert_only("SHOW STATUS __CODEX_CURSOR__", &["LIKE"]);
     assert_only("WHENEVER __CODEX_CURSOR__", &["SQLERROR", "OSERROR"]);
     assert_only("WHENEVER SQLERROR __CODEX_CURSOR__", &["EXIT", "CONTINUE"]);
     assert_only("WHENEVER OSERROR __CODEX_CURSOR__", &["EXIT", "CONTINUE"]);
     assert_only("COLUMN ename __CODEX_CURSOR__", &["NEW_VALUE"]);
     assert_only("COLUMN ename new__CODEX_CURSOR__", &["NEW_VALUE"]);
+
+    for command in SqlEditorWidget::TOOL_NO_SQL_ARGUMENT_COMMANDS {
+        let sql = format!("{command} __CODEX_CURSOR__");
+        let suggestions = print_command_bind_suggestions_for_test(&sql, &["V_SESSION"]);
+        for noise in ["V_SESSION", "V_TABLE", "V_PROC", "SELECT", "ALTER", "EMP"] {
+            assert!(
+                !has(&suggestions, noise),
+                "{noise} leaked into tool argument slot for `{sql}`: {suggestions:?}"
+            );
+        }
+    }
 
     let match_recognize_show =
         analyze_inline_cursor_sql("SELECT * FROM t MATCH_RECOGNIZE (PATTERN (A) SHOW |)");
@@ -9239,6 +9436,168 @@ fn tool_command_keyword_slots_offer_only_supported_tool_keywords() {
         ),
         "MATCH_RECOGNIZE SHOW must remain SQL, not a SQL*Plus SHOW slot"
     );
+}
+
+#[test]
+fn tool_command_keyword_slots_are_dialect_scoped() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |suggestions: &[String], expected: &str| {
+        suggestions
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(expected))
+    };
+    let suggestions = |sql: &str, db| {
+        let ctx = analyze_inline_cursor_sql(sql);
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &ctx, Some(db))
+    };
+
+    let oracle_show = suggestions("SHOW |", Oracle);
+    for expected in ["USER", "ALL", "ERRORS"] {
+        assert!(has(&oracle_show, expected), "{expected} missing for Oracle SHOW: {oracle_show:?}");
+    }
+    for noise in ["DATABASES", "TABLES", "COLUMNS", "VARIABLES", "STATUS", "WARNINGS"] {
+        assert!(
+            !has(&oracle_show, noise),
+            "{noise} leaked into Oracle SHOW topics: {oracle_show:?}"
+        );
+    }
+
+    let mysql_show = suggestions("SHOW |", MySQL);
+    for expected in [
+        "BINARY",
+        "BINLOG",
+        "CHARACTER",
+        "CHARSET",
+        "COLLATION",
+        "COLUMNS",
+        "COUNT",
+        "CREATE",
+        "DATABASES",
+        "ENGINE",
+        "ENGINES",
+        "ERRORS",
+        "EVENTS",
+        "EXTENDED",
+        "FIELDS",
+        "FULL",
+        "FUNCTION",
+        "GLOBAL",
+        "GRANTS",
+        "INDEX",
+        "INDEXES",
+        "KEYS",
+        "OPEN",
+        "PARSE_TREE",
+        "PLUGINS",
+        "PRIVILEGES",
+        "PROCEDURE",
+        "PROCESSLIST",
+        "PROFILE",
+        "PROFILES",
+        "RELAYLOG",
+        "REPLICA",
+        "REPLICAS",
+        "SESSION",
+        "STATUS",
+        "STORAGE",
+        "TABLE",
+        "TABLES",
+        "VARIABLES",
+        "WARNINGS",
+    ] {
+        assert!(has(&mysql_show, expected), "{expected} missing for MySQL SHOW: {mysql_show:?}");
+    }
+    for noise in ["USER", "ALL"] {
+        assert!(
+            !has(&mysql_show, noise),
+            "{noise} leaked into MySQL SHOW topics: {mysql_show:?}"
+        );
+    }
+
+    for (sql, expected) in [
+        ("SHOW BINARY |", &["LOG", "LOGS"][..]),
+        ("SHOW BINARY LOG |", &["STATUS"]),
+        ("SHOW BINLOG |", &["EVENTS"]),
+        ("SHOW BINLOG EVENTS |", &["IN", "FROM", "LIMIT"]),
+        ("SHOW CHARACTER |", &["SET"]),
+        ("SHOW CREATE |", &["DATABASE", "EVENT", "FUNCTION", "PROCEDURE", "TABLE", "TRIGGER", "USER", "VIEW"]),
+        ("SHOW ENGINE innodb |", &["STATUS", "MUTEX"]),
+        ("SHOW EXTENDED |", &["COLUMNS", "FIELDS", "FULL", "INDEX", "INDEXES", "KEYS", "TABLES"]),
+        ("SHOW EXTENDED COLUMNS |", &["FROM", "IN"]),
+        ("SHOW EXTENDED FIELDS |", &["FROM", "IN"]),
+        ("SHOW EXTENDED INDEX |", &["FROM", "IN"]),
+        ("SHOW EXTENDED INDEXES |", &["FROM", "IN"]),
+        ("SHOW EXTENDED KEYS |", &["FROM", "IN"]),
+        ("SHOW EXTENDED TABLES |", &["FROM", "IN", "LIKE", "WHERE"]),
+        ("SHOW EXTENDED FULL |", &["COLUMNS", "FIELDS", "TABLES"]),
+        ("SHOW EXTENDED FULL FIELDS |", &["FROM", "IN"]),
+        ("SHOW EXTENDED FULL TABLES |", &["FROM", "IN", "LIKE", "WHERE"]),
+        ("SHOW FULL |", &["COLUMNS", "FIELDS", "PROCESSLIST", "TABLES"]),
+        ("SHOW GLOBAL |", &["STATUS", "VARIABLES"]),
+        ("SHOW SESSION |", &["STATUS", "VARIABLES"]),
+        ("SHOW FUNCTION |", &["CODE", "STATUS"]),
+        ("SHOW PROCEDURE |", &["CODE", "STATUS"]),
+        ("SHOW INDEX |", &["FROM", "IN"]),
+        ("SHOW INDEXES |", &["FROM", "IN"]),
+        ("SHOW KEYS |", &["FROM", "IN"]),
+        ("SHOW INDEX FROM emp |", &["FROM", "IN", "WHERE"]),
+        ("SHOW OPEN |", &["TABLES"]),
+        ("SHOW RELAYLOG |", &["EVENTS"]),
+        ("SHOW RELAYLOG EVENTS |", &["IN", "FROM", "LIMIT"]),
+        ("SHOW REPLICA |", &["STATUS"]),
+        ("SHOW STORAGE |", &["ENGINES"]),
+        ("SHOW TABLE |", &["STATUS"]),
+        ("SHOW COLUMNS |", &["FROM", "IN"]),
+        ("SHOW FIELDS |", &["FROM", "IN"]),
+        ("SHOW COLUMNS FROM emp |", &["FROM", "IN", "LIKE", "WHERE"]),
+        ("SHOW FIELDS FROM emp |", &["FROM", "IN", "LIKE", "WHERE"]),
+        ("SHOW FULL COLUMNS |", &["FROM", "IN"]),
+        ("SHOW FULL FIELDS FROM emp |", &["FROM", "LIKE", "WHERE"]),
+        ("SHOW FULL TABLES |", &["FROM", "IN", "LIKE", "WHERE"]),
+        ("SHOW DATABASES |", &["LIKE", "WHERE"]),
+        ("SHOW EVENTS |", &["FROM", "IN", "LIKE", "WHERE"]),
+        ("SHOW TRIGGERS |", &["FROM", "IN", "LIKE", "WHERE"]),
+        ("SHOW VARIABLES |", &["LIKE", "WHERE"]),
+        ("SHOW GLOBAL STATUS |", &["LIKE", "WHERE"]),
+        ("SHOW TABLE STATUS |", &["FROM", "LIKE", "WHERE"]),
+        ("SHOW OPEN TABLES |", &["FROM", "LIKE", "WHERE"]),
+        ("SHOW ERRORS |", &["LIMIT"]),
+        ("SHOW WARNINGS |", &["LIMIT"]),
+        ("SHOW COUNT(*) |", &["ERRORS", "WARNINGS"]),
+        ("SHOW GRANTS |", &["FOR"]),
+        ("SHOW GRANTS FOR root |", &["USING"]),
+        ("SHOW PROFILE |", &["FOR", "OFFSET", "LIMIT"]),
+    ] {
+        let got = suggestions(sql, MySQL);
+        for expected in expected {
+            assert!(has(&got, expected), "{expected} missing for `{sql}`: {got:?}");
+        }
+    }
+
+    let mysql_show_count = suggestions("SHOW COUNT |", MySQL);
+    for invalid in ["ERRORS", "WARNINGS"] {
+        assert!(
+            !has(&mysql_show_count, invalid),
+            "{invalid} leaked before SHOW COUNT(*) was complete: {mysql_show_count:?}"
+        );
+    }
+
+    let mysql_show_errors = suggestions("SHOW ERRORS |", MySQL);
+    for oracle_only in ["PROCEDURE", "FUNCTION", "PACKAGE", "TYPE", "BODY"] {
+        assert!(
+            !has(&mysql_show_errors, oracle_only),
+            "{oracle_only} leaked after MySQL SHOW ERRORS: {mysql_show_errors:?}"
+        );
+    }
+
+    let mysql_set = suggestions("SET |", MySQL);
+    for oracle_only in ["AUTOCOMMIT", "SERVEROUTPUT", "PAGESIZE", "VERIFY"] {
+        assert!(
+            !has(&mysql_set, oracle_only),
+            "{oracle_only} leaked into MySQL SET slot: {mysql_set:?}"
+        );
+    }
 }
 
 #[test]
@@ -20576,6 +20935,7 @@ fn dml_target_continuation_offers_structural_keyword_and_suppresses_relations() 
         SqlEditorWidget::cursor_is_after_complete_dml_target_for_context(
             &analyze_inline_cursor_sql(sql),
             false,
+            Some(crate::db::DatabaseType::Oracle),
         )
     };
     let kw = |sql: &str| {
@@ -21114,6 +21474,923 @@ fn collect_expected_keyword_suggestions_include_ddl_object_type_tokens() {
     assert_eq!(check_suggestions, vec!["TABLE".to_string()]);
     assert_eq!(repair_suggestions, vec!["TABLE".to_string()]);
     assert_eq!(create_synonym_name_suggestions, vec!["FOR".to_string()]);
+}
+
+#[test]
+fn mysql_structural_keyword_slots_are_dialect_scoped() {
+    use crate::db::DatabaseType::MySQL;
+
+    let suggestions = |sql: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &analyze_inline_cursor_sql(sql),
+            Some(MySQL),
+        )
+    };
+    let has = |suggestions: &[String], keyword: &str| {
+        suggestions
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(keyword))
+    };
+
+    let create = suggestions("CREATE |");
+    for expected in [
+        "ALGORITHM",
+        "DATABASE",
+        "DEFINER",
+        "EVENT",
+        "FULLTEXT",
+        "FUNCTION",
+        "INDEX",
+        "LOGFILE",
+        "OR",
+        "PROCEDURE",
+        "RESOURCE",
+        "ROLE",
+        "SCHEMA",
+        "SERVER",
+        "SQL",
+        "SPATIAL",
+        "TABLE",
+        "TABLESPACE",
+        "TEMPORARY",
+        "TRIGGER",
+        "USER",
+        "VIEW",
+    ] {
+        assert!(
+            has(&create, expected),
+            "{expected} missing for MySQL CREATE: {create:?}"
+        );
+    }
+    for oracle_only in [
+        "PACKAGE",
+        "SYNONYM",
+        "DIRECTORY",
+        "SEQUENCE",
+        "MATERIALIZED",
+        "EDITIONING",
+        "JAVA",
+        "LIBRARY",
+        "PUBLIC",
+        "SHARED",
+    ] {
+        assert!(
+            !has(&create, oracle_only),
+            "{oracle_only} leaked into MySQL CREATE: {create:?}"
+        );
+    }
+
+    for (sql, expected) in [
+        ("CREATE OR |", "REPLACE"),
+        ("CREATE OR REPLACE |", "VIEW"),
+        ("CREATE OR REPLACE |", "ALGORITHM"),
+        ("CREATE OR REPLACE |", "DEFINER"),
+        ("CREATE OR REPLACE |", "SQL"),
+        ("CREATE ALGORITHM |", "MERGE"),
+        ("CREATE ALGORITHM |", "TEMPTABLE"),
+        ("CREATE ALGORITHM |", "UNDEFINED"),
+        ("CREATE ALGORITHM MERGE |", "DEFINER"),
+        ("CREATE ALGORITHM MERGE |", "SQL"),
+        ("CREATE ALGORITHM MERGE |", "VIEW"),
+        ("CREATE OR REPLACE ALGORITHM TEMPTABLE |", "DEFINER"),
+        ("CREATE DEFINER root |", "SQL"),
+        ("CREATE DEFINER root |", "EVENT"),
+        ("CREATE DEFINER root |", "TRIGGER"),
+        ("CREATE DEFINER root |", "VIEW"),
+        ("CREATE SQL |", "SECURITY"),
+        ("CREATE SQL SECURITY |", "DEFINER"),
+        ("CREATE SQL SECURITY |", "INVOKER"),
+        ("CREATE SQL SECURITY INVOKER |", "VIEW"),
+        ("CREATE VIEW v |", "AS"),
+        ("CREATE OR REPLACE SQL SECURITY DEFINER VIEW v |", "AS"),
+        ("CREATE TRIGGER |", "IF"),
+        ("CREATE TRIGGER IF |", "NOT"),
+        ("CREATE TRIGGER IF NOT |", "EXISTS"),
+        ("CREATE TRIGGER trg |", "BEFORE"),
+        ("CREATE TRIGGER trg |", "AFTER"),
+        ("CREATE TRIGGER IF NOT EXISTS trg |", "BEFORE"),
+        ("CREATE TRIGGER trg BEFORE |", "INSERT"),
+        ("CREATE TRIGGER trg BEFORE |", "UPDATE"),
+        ("CREATE TRIGGER trg BEFORE |", "DELETE"),
+        ("CREATE TRIGGER trg BEFORE INSERT |", "ON"),
+        ("CREATE TRIGGER trg BEFORE UPDATE |", "ON"),
+        ("CREATE TRIGGER trg BEFORE DELETE |", "ON"),
+        ("CREATE TRIGGER trg BEFORE INSERT ON emp |", "FOR"),
+        ("CREATE TRIGGER trg BEFORE INSERT ON emp FOR |", "EACH"),
+        ("CREATE TRIGGER trg BEFORE INSERT ON emp FOR EACH |", "ROW"),
+        ("CREATE TRIGGER trg BEFORE INSERT ON emp FOR EACH ROW |", "FOLLOWS"),
+        ("CREATE TRIGGER trg BEFORE INSERT ON emp FOR EACH ROW |", "PRECEDES"),
+        ("CREATE DEFINER root TRIGGER trg AFTER UPDATE |", "ON"),
+        ("CREATE EVENT |", "IF"),
+        ("CREATE EVENT IF |", "NOT"),
+        ("CREATE EVENT IF NOT |", "EXISTS"),
+        ("CREATE EVENT ev |", "ON"),
+        ("CREATE EVENT IF NOT EXISTS ev |", "ON"),
+        ("CREATE DEFINER root EVENT ev |", "ON"),
+        ("CREATE EVENT ev ON |", "SCHEDULE"),
+        ("CREATE EVENT ev ON SCHEDULE |", "AT"),
+        ("CREATE EVENT ev ON SCHEDULE |", "EVERY"),
+        ("CREATE EVENT ev ON SCHEDULE EVERY n |", "DAY"),
+        ("CREATE EVENT ev ON SCHEDULE EVERY n |", "HOUR"),
+        ("CREATE EVENT ev ON SCHEDULE EVERY n DAY |", "STARTS"),
+        ("CREATE EVENT ev ON SCHEDULE EVERY n DAY |", "ENDS"),
+        ("CREATE EVENT ev ON SCHEDULE EVERY n DAY |", "ON"),
+        ("CREATE EVENT ev ON SCHEDULE EVERY n DAY |", "DO"),
+        ("CREATE EVENT ev ON SCHEDULE EVERY n DAY ON |", "COMPLETION"),
+        ("CREATE EVENT ev ON SCHEDULE EVERY n DAY ON COMPLETION |", "NOT"),
+        ("CREATE EVENT ev ON SCHEDULE EVERY n DAY ON COMPLETION |", "PRESERVE"),
+        ("CREATE EVENT ev ON SCHEDULE EVERY n DAY ON COMPLETION NOT |", "PRESERVE"),
+        ("CREATE EVENT ev ON SCHEDULE EVERY n DAY ON COMPLETION NOT PRESERVE |", "DO"),
+        ("CREATE EVENT ev ON SCHEDULE EVERY n DAY DISABLE |", "ON"),
+        ("CREATE EVENT ev ON SCHEDULE EVERY n DAY DISABLE ON |", "REPLICA"),
+        ("CREATE EVENT ev ON SCHEDULE EVERY n DAY DISABLE ON |", "SLAVE"),
+        ("CREATE EVENT ev ON SCHEDULE EVERY n DAY DISABLE ON REPLICA |", "DO"),
+        ("CREATE EVENT ev ON SCHEDULE EVERY n DAY ENABLE |", "DO"),
+        ("CREATE DEFINER root |", "FUNCTION"),
+        ("CREATE DEFINER root |", "PROCEDURE"),
+        ("CREATE PROCEDURE |", "IF"),
+        ("CREATE PROCEDURE IF |", "NOT"),
+        ("CREATE PROCEDURE IF NOT |", "EXISTS"),
+        ("CREATE PROCEDURE p |", "COMMENT"),
+        ("CREATE PROCEDURE p |", "LANGUAGE"),
+        ("CREATE PROCEDURE p |", "NOT"),
+        ("CREATE PROCEDURE p |", "READS"),
+        ("CREATE PROCEDURE p |", "SQL"),
+        ("CREATE FUNCTION |", "IF"),
+        ("CREATE FUNCTION IF NOT |", "EXISTS"),
+        ("CREATE FUNCTION f |", "RETURNS"),
+        ("CREATE FUNCTION f RETURNS INT |", "DETERMINISTIC"),
+        ("CREATE FUNCTION f RETURNS INT LANGUAGE |", "SQL"),
+        ("CREATE FUNCTION f RETURNS INT LANGUAGE SQL |", "COMMENT"),
+        ("CREATE FUNCTION f RETURNS INT NOT |", "DETERMINISTIC"),
+        ("CREATE FUNCTION f RETURNS INT NOT DETERMINISTIC |", "READS"),
+        ("CREATE FUNCTION f RETURNS INT CONTAINS |", "SQL"),
+        ("CREATE FUNCTION f RETURNS INT NO |", "SQL"),
+        ("CREATE FUNCTION f RETURNS INT READS |", "SQL"),
+        ("CREATE FUNCTION f RETURNS INT READS SQL |", "DATA"),
+        ("CREATE FUNCTION f RETURNS INT READS SQL DATA |", "SQL"),
+        ("CREATE FUNCTION f RETURNS INT MODIFIES SQL |", "DATA"),
+        ("CREATE FUNCTION f RETURNS INT SQL |", "SECURITY"),
+        ("CREATE FUNCTION f RETURNS INT SQL SECURITY |", "DEFINER"),
+        ("CREATE FUNCTION f RETURNS INT SQL SECURITY |", "INVOKER"),
+        ("CREATE FUNCTION f RETURNS INT SQL SECURITY DEFINER |", "COMMENT"),
+        ("CREATE TEMPORARY |", "TABLE"),
+        ("CREATE TEMPORARY TABLE |", "IF"),
+        ("CREATE TEMPORARY TABLE IF |", "NOT"),
+        ("CREATE TEMPORARY TABLE IF NOT |", "EXISTS"),
+        ("CREATE TABLE |", "IF"),
+        ("CREATE TABLE IF |", "NOT"),
+        ("CREATE TABLE IF NOT |", "EXISTS"),
+        ("CREATE DATABASE |", "IF"),
+        ("CREATE SCHEMA |", "IF"),
+        ("CREATE DATABASE db |", "DEFAULT"),
+        ("CREATE DATABASE db |", "CHARACTER"),
+        ("CREATE DATABASE db |", "COLLATE"),
+        ("CREATE DATABASE db |", "ENCRYPTION"),
+        ("CREATE SCHEMA db DEFAULT |", "CHARACTER"),
+        ("CREATE SCHEMA db DEFAULT |", "COLLATE"),
+        ("CREATE SCHEMA db DEFAULT |", "ENCRYPTION"),
+        ("CREATE DATABASE db CHARACTER |", "SET"),
+        ("CREATE DATABASE db DEFAULT CHARACTER |", "SET"),
+        ("CREATE DATABASE db CHARACTER SET utf8mb4 |", "COLLATE"),
+        ("CREATE DATABASE db DEFAULT CHARACTER SET utf8mb4 |", "ENCRYPTION"),
+        ("CREATE DATABASE db COLLATE utf8mb4_bin |", "DEFAULT"),
+        ("CREATE DATABASE db ENCRYPTION Y |", "CHARACTER"),
+        ("CREATE USER |", "IF"),
+        ("CREATE ROLE |", "IF"),
+        ("CREATE UNIQUE |", "INDEX"),
+        ("CREATE FULLTEXT |", "INDEX"),
+        ("CREATE SPATIAL |", "INDEX"),
+        ("CREATE SPATIAL |", "REFERENCE"),
+        ("CREATE INDEX ix |", "ON"),
+        ("CREATE INDEX ix |", "USING"),
+        ("CREATE INDEX ix USING |", "BTREE"),
+        ("CREATE INDEX ix USING |", "HASH"),
+        ("CREATE INDEX ix USING BTREE |", "ON"),
+        ("CREATE UNIQUE INDEX ix |", "ON"),
+        ("CREATE UNIQUE INDEX ix USING HASH |", "ON"),
+        ("CREATE FULLTEXT INDEX ix |", "ON"),
+        ("CREATE SPATIAL INDEX ix |", "ON"),
+        ("CREATE LOGFILE |", "GROUP"),
+        ("CREATE LOGFILE GROUP lg |", "ADD"),
+        ("CREATE LOGFILE GROUP lg ADD |", "UNDOFILE"),
+        ("CREATE LOGFILE GROUP lg ADD UNDOFILE 'undo.dat' |", "INITIAL_SIZE"),
+        ("CREATE LOGFILE GROUP lg ADD UNDOFILE 'undo.dat' |", "ENGINE"),
+        ("CREATE LOGFILE GROUP lg ADD UNDOFILE 'undo.dat' WAIT |", "ENGINE"),
+        (
+            "CREATE LOGFILE GROUP lg ADD UNDOFILE 'undo.dat' INITIAL_SIZE 10M |",
+            "UNDO_BUFFER_SIZE",
+        ),
+        ("CREATE UNDO |", "TABLESPACE"),
+        ("CREATE TABLESPACE ts |", "ADD"),
+        ("CREATE TABLESPACE ts |", "ENGINE"),
+        ("CREATE UNDO TABLESPACE ts |", "ADD"),
+        ("CREATE TABLESPACE ts ADD |", "DATAFILE"),
+        ("CREATE TABLESPACE ts ADD DATAFILE 'ts.ibd' |", "AUTOEXTEND_SIZE"),
+        ("CREATE TABLESPACE ts ADD DATAFILE 'ts.ibd' |", "USE"),
+        ("CREATE TABLESPACE ts USE |", "LOGFILE"),
+        ("CREATE TABLESPACE ts USE LOGFILE |", "GROUP"),
+        ("CREATE TABLESPACE ts USE LOGFILE GROUP lg |", "ENGINE"),
+        ("CREATE TABLESPACE ts ADD DATAFILE 'ts.ibd' WAIT |", "ENGINE"),
+        ("CREATE RESOURCE |", "GROUP"),
+        ("CREATE RESOURCE GROUP rg |", "TYPE"),
+        ("CREATE RESOURCE GROUP rg TYPE |", "SYSTEM"),
+        ("CREATE RESOURCE GROUP rg TYPE |", "USER"),
+        ("CREATE RESOURCE GROUP rg TYPE USER |", "VCPU"),
+        ("CREATE RESOURCE GROUP rg TYPE USER |", "THREAD_PRIORITY"),
+        ("CREATE RESOURCE GROUP rg TYPE USER |", "ENABLE"),
+        ("CREATE RESOURCE GROUP rg TYPE USER |", "DISABLE"),
+        ("CREATE RESOURCE GROUP rg TYPE USER VCPU 0 |", "THREAD_PRIORITY"),
+        ("CREATE RESOURCE GROUP rg TYPE USER VCPU 0 |", "ENABLE"),
+        (
+            "CREATE RESOURCE GROUP rg TYPE USER VCPU 0,1,2 |",
+            "THREAD_PRIORITY",
+        ),
+        (
+            "CREATE RESOURCE GROUP rg TYPE SYSTEM THREAD_PRIORITY -20 |",
+            "ENABLE",
+        ),
+        (
+            "CREATE RESOURCE GROUP rg TYPE SYSTEM THREAD_PRIORITY -20 |",
+            "DISABLE",
+        ),
+        ("CREATE SPATIAL REFERENCE |", "SYSTEM"),
+        ("CREATE SERVER s |", "FOREIGN"),
+        ("CREATE SERVER s FOREIGN |", "DATA"),
+        ("CREATE SERVER s FOREIGN DATA |", "WRAPPER"),
+        ("CREATE SERVER s FOREIGN DATA WRAPPER mysql |", "OPTIONS"),
+        (
+            "CREATE SERVER s FOREIGN DATA WRAPPER mysql OPTIONS |",
+            "HOST",
+        ),
+        (
+            "CREATE SERVER s FOREIGN DATA WRAPPER mysql OPTIONS |",
+            "DATABASE",
+        ),
+        (
+            "CREATE SERVER s FOREIGN DATA WRAPPER mysql OPTIONS HOST localhost |",
+            "PORT",
+        ),
+        ("DROP TEMPORARY |", "TABLE"),
+        ("DROP TEMPORARY TABLE |", "IF"),
+        ("DROP TEMPORARY TABLE IF |", "EXISTS"),
+        ("DROP TABLE |", "IF"),
+        ("DROP TABLE IF |", "EXISTS"),
+        ("DROP DATABASE |", "IF"),
+        ("DROP SCHEMA |", "IF"),
+        ("DROP USER |", "IF"),
+        ("DROP ROLE |", "IF"),
+        ("DROP VIEW |", "IF"),
+        ("DROP TRIGGER |", "IF"),
+        ("DROP FUNCTION |", "IF"),
+        ("DROP PROCEDURE |", "IF"),
+        ("DROP EVENT |", "IF"),
+        ("DROP SERVER |", "IF"),
+        ("DROP SERVER IF |", "EXISTS"),
+        ("DROP UNDO |", "TABLESPACE"),
+        ("DROP LOGFILE |", "GROUP"),
+        ("DROP LOGFILE GROUP lg |", "ENGINE"),
+        ("DROP INDEX ix |", "ON"),
+        ("DROP INDEX ix ON emp |", "ALGORITHM"),
+        ("DROP INDEX ix ON emp |", "LOCK"),
+        ("ALTER ALGORITHM |", "MERGE"),
+        ("ALTER ALGORITHM |", "TEMPTABLE"),
+        ("ALTER ALGORITHM |", "UNDEFINED"),
+        ("ALTER ALGORITHM MERGE |", "DEFINER"),
+        ("ALTER ALGORITHM MERGE |", "SQL"),
+        ("ALTER ALGORITHM MERGE |", "VIEW"),
+        ("ALTER DEFINER root |", "SQL"),
+        ("ALTER DEFINER root |", "VIEW"),
+        ("ALTER SQL |", "SECURITY"),
+        ("ALTER SQL SECURITY |", "DEFINER"),
+        ("ALTER SQL SECURITY |", "INVOKER"),
+        ("ALTER SQL SECURITY INVOKER |", "VIEW"),
+        ("ALTER VIEW v |", "AS"),
+        ("ALTER ALGORITHM TEMPTABLE SQL SECURITY DEFINER VIEW v |", "AS"),
+        ("ALTER USER |", "IF"),
+        ("ALTER USER IF |", "EXISTS"),
+        ("ALTER USER alice |", "IDENTIFIED"),
+        ("ALTER USER alice |", "REQUIRE"),
+        ("ALTER USER alice |", "WITH"),
+        ("ALTER USER alice |", "PASSWORD"),
+        ("ALTER USER alice |", "ACCOUNT"),
+        ("ALTER USER alice |", "DEFAULT"),
+        ("ALTER USER alice IDENTIFIED |", "BY"),
+        ("ALTER USER alice IDENTIFIED |", "WITH"),
+        ("ALTER USER alice IDENTIFIED BY |", "RANDOM"),
+        ("ALTER USER alice IDENTIFIED BY RANDOM |", "PASSWORD"),
+        ("ALTER USER alice IDENTIFIED BY RANDOM PASSWORD |", "REPLACE"),
+        ("ALTER USER alice IDENTIFIED BY RANDOM PASSWORD |", "RETAIN"),
+        ("ALTER USER alice IDENTIFIED WITH mysql_native_password |", "BY"),
+        ("ALTER USER alice IDENTIFIED WITH mysql_native_password |", "AS"),
+        (
+            "ALTER USER alice IDENTIFIED WITH mysql_native_password BY |",
+            "RANDOM",
+        ),
+        (
+            "ALTER USER alice IDENTIFIED WITH mysql_native_password BY RANDOM |",
+            "PASSWORD",
+        ),
+        ("ALTER USER alice IDENTIFIED BY 'secret' |", "REPLACE"),
+        ("ALTER USER alice IDENTIFIED BY 'secret' REPLACE 'old' |", "RETAIN"),
+        (
+            "ALTER USER alice IDENTIFIED BY 'secret' RETAIN |",
+            "CURRENT",
+        ),
+        (
+            "ALTER USER alice IDENTIFIED BY 'secret' RETAIN CURRENT |",
+            "PASSWORD",
+        ),
+        ("ALTER USER alice DISCARD |", "OLD"),
+        ("ALTER USER alice DISCARD OLD |", "PASSWORD"),
+        ("ALTER USER alice ADD 2 |", "FACTOR"),
+        ("ALTER USER alice ADD 2 FACTOR |", "IDENTIFIED"),
+        ("ALTER USER alice DROP 2 |", "FACTOR"),
+        ("ALTER USER alice DROP 2 FACTOR |", "PASSWORD"),
+        ("ALTER USER alice REQUIRE |", "SSL"),
+        ("ALTER USER alice REQUIRE |", "CIPHER"),
+        ("ALTER USER alice REQUIRE CIPHER 'cipher' |", "AND"),
+        ("ALTER USER alice REQUIRE SSL |", "AND"),
+        ("ALTER USER alice WITH |", "MAX_QUERIES_PER_HOUR"),
+        (
+            "ALTER USER alice WITH MAX_QUERIES_PER_HOUR 10 |",
+            "MAX_UPDATES_PER_HOUR",
+        ),
+        ("ALTER USER alice PASSWORD |", "EXPIRE"),
+        ("ALTER USER alice PASSWORD |", "HISTORY"),
+        ("ALTER USER alice PASSWORD |", "REQUIRE"),
+        ("ALTER USER alice PASSWORD EXPIRE |", "INTERVAL"),
+        ("ALTER USER alice PASSWORD EXPIRE INTERVAL 30 |", "DAY"),
+        ("ALTER USER alice PASSWORD HISTORY |", "DEFAULT"),
+        ("ALTER USER alice PASSWORD REUSE |", "INTERVAL"),
+        ("ALTER USER alice PASSWORD REUSE INTERVAL 30 |", "DAY"),
+        ("ALTER USER alice PASSWORD REQUIRE |", "CURRENT"),
+        (
+            "ALTER USER alice PASSWORD REQUIRE CURRENT |",
+            "OPTIONAL",
+        ),
+        ("ALTER USER alice ACCOUNT |", "LOCK"),
+        ("ALTER USER alice ACCOUNT |", "UNLOCK"),
+        ("ALTER USER alice DEFAULT |", "ROLE"),
+        ("ALTER USER alice DEFAULT ROLE |", "ALL"),
+        ("ALTER USER alice DEFAULT ROLE |", "NONE"),
+        ("ALTER DEFINER root |", "EVENT"),
+        ("ALTER EVENT ev |", "ON"),
+        ("ALTER EVENT ev |", "RENAME"),
+        ("ALTER EVENT ev |", "DO"),
+        ("ALTER EVENT ev ON |", "SCHEDULE"),
+        ("ALTER EVENT ev ON |", "COMPLETION"),
+        ("ALTER EVENT ev ON SCHEDULE EVERY n |", "DAY"),
+        ("ALTER EVENT ev ON SCHEDULE EVERY n DAY |", "RENAME"),
+        ("ALTER EVENT ev ON SCHEDULE EVERY n DAY RENAME |", "TO"),
+        ("ALTER EVENT ev DISABLE |", "ON"),
+        ("ALTER EVENT ev DISABLE ON |", "REPLICA"),
+        ("ALTER PROCEDURE p |", "COMMENT"),
+        ("ALTER PROCEDURE p LANGUAGE |", "SQL"),
+        ("ALTER FUNCTION f |", "SQL"),
+        ("ALTER FUNCTION f SQL SECURITY |", "INVOKER"),
+        ("ALTER DATABASE |", "DEFAULT"),
+        ("ALTER DATABASE |", "READ"),
+        ("ALTER SCHEMA db |", "CHARACTER"),
+        ("ALTER SCHEMA db |", "READ"),
+        ("ALTER DATABASE db DEFAULT |", "CHARACTER"),
+        ("ALTER DATABASE db CHARACTER |", "SET"),
+        ("ALTER DATABASE db CHARACTER SET utf8mb4 |", "READ"),
+        ("ALTER DATABASE db COLLATE utf8mb4_bin |", "ENCRYPTION"),
+        ("ALTER DATABASE db ENCRYPTION Y |", "READ"),
+        ("ALTER DATABASE db READ |", "ONLY"),
+        ("ALTER DATABASE db READ ONLY |", "DEFAULT"),
+        ("ALTER DATABASE db READ ONLY DEFAULT |", "COLLATE"),
+        ("ALTER INSTANCE |", "ENABLE"),
+        ("ALTER INSTANCE |", "DISABLE"),
+        ("ALTER INSTANCE |", "RELOAD"),
+        ("ALTER INSTANCE |", "ROTATE"),
+        ("ALTER INSTANCE ENABLE |", "INNODB"),
+        ("ALTER INSTANCE ENABLE INNODB |", "REDO_LOG"),
+        ("ALTER INSTANCE DISABLE |", "INNODB"),
+        ("ALTER INSTANCE DISABLE INNODB |", "REDO_LOG"),
+        ("ALTER INSTANCE ROTATE |", "INNODB"),
+        ("ALTER INSTANCE ROTATE |", "BINLOG"),
+        ("ALTER INSTANCE ROTATE INNODB |", "MASTER"),
+        ("ALTER INSTANCE ROTATE BINLOG |", "MASTER"),
+        ("ALTER INSTANCE ROTATE INNODB MASTER |", "KEY"),
+        ("ALTER INSTANCE RELOAD |", "TLS"),
+        ("ALTER INSTANCE RELOAD |", "KEYRING"),
+        ("ALTER INSTANCE RELOAD TLS |", "FOR"),
+        ("ALTER INSTANCE RELOAD TLS |", "NO"),
+        ("ALTER INSTANCE RELOAD TLS FOR |", "CHANNEL"),
+        ("ALTER INSTANCE RELOAD TLS FOR CHANNEL |", "MYSQL_MAIN"),
+        ("ALTER INSTANCE RELOAD TLS FOR CHANNEL |", "MYSQL_ADMIN"),
+        ("ALTER INSTANCE RELOAD TLS FOR CHANNEL MYSQL_MAIN |", "NO"),
+        ("ALTER INSTANCE RELOAD TLS NO |", "ROLLBACK"),
+        ("ALTER INSTANCE RELOAD TLS NO ROLLBACK |", "ON"),
+        ("ALTER INSTANCE RELOAD TLS NO ROLLBACK ON |", "ERROR"),
+        (
+            "ALTER INSTANCE RELOAD TLS FOR CHANNEL MYSQL_ADMIN NO |",
+            "ROLLBACK",
+        ),
+        ("ALTER UNDO |", "TABLESPACE"),
+        ("ALTER TABLESPACE ts |", "ADD"),
+        ("ALTER TABLESPACE ts |", "RENAME"),
+        ("ALTER UNDO TABLESPACE ts |", "SET"),
+        ("ALTER TABLESPACE ts ADD |", "DATAFILE"),
+        ("ALTER TABLESPACE ts DROP |", "DATAFILE"),
+        ("ALTER TABLESPACE ts ADD DATAFILE 'ts2.ibd' |", "INITIAL_SIZE"),
+        ("ALTER TABLESPACE ts ADD DATAFILE 'ts2.ibd' |", "WAIT"),
+        ("ALTER TABLESPACE ts RENAME |", "TO"),
+        ("ALTER UNDO TABLESPACE ts SET |", "ACTIVE"),
+        ("ALTER UNDO TABLESPACE ts SET |", "INACTIVE"),
+        ("ALTER LOGFILE |", "GROUP"),
+        ("ALTER LOGFILE GROUP lg |", "ADD"),
+        ("ALTER LOGFILE GROUP lg ADD |", "UNDOFILE"),
+        ("ALTER LOGFILE GROUP lg ADD UNDOFILE 'undo2.dat' |", "INITIAL_SIZE"),
+        ("ALTER LOGFILE GROUP lg ADD UNDOFILE 'undo2.dat' |", "ENGINE"),
+        ("ALTER SERVER s |", "OPTIONS"),
+        ("ALTER SERVER s OPTIONS |", "USER"),
+        ("ALTER SERVER s OPTIONS USER alice |", "PASSWORD"),
+        ("ALTER RESOURCE |", "GROUP"),
+        ("ALTER RESOURCE GROUP rg |", "VCPU"),
+        ("ALTER RESOURCE GROUP rg |", "THREAD_PRIORITY"),
+        ("ALTER RESOURCE GROUP rg |", "ENABLE"),
+        ("ALTER RESOURCE GROUP rg |", "DISABLE"),
+        ("ALTER RESOURCE GROUP rg VCPU 0-3 |", "THREAD_PRIORITY"),
+        ("ALTER RESOURCE GROUP rg VCPU 0-3 |", "ENABLE"),
+        ("ALTER RESOURCE GROUP rg THREAD_PRIORITY 5 |", "ENABLE"),
+        ("ALTER RESOURCE GROUP rg THREAD_PRIORITY 5 |", "DISABLE"),
+        ("ALTER RESOURCE GROUP rg DISABLE |", "FORCE"),
+        ("DROP RESOURCE |", "GROUP"),
+        ("DROP RESOURCE GROUP rg |", "FORCE"),
+        ("ANALYZE |", "LOCAL"),
+        ("ANALYZE |", "NO_WRITE_TO_BINLOG"),
+        ("ANALYZE LOCAL |", "TABLE"),
+        ("ANALYZE NO_WRITE_TO_BINLOG |", "TABLE"),
+        ("ANALYZE TABLE emp |", "UPDATE"),
+        ("ANALYZE TABLE emp |", "DROP"),
+        ("ANALYZE TABLE emp UPDATE |", "HISTOGRAM"),
+        ("ANALYZE TABLE emp UPDATE HISTOGRAM |", "ON"),
+        ("ANALYZE TABLE emp UPDATE HISTOGRAM ON salary |", "WITH"),
+        ("ANALYZE TABLE emp UPDATE HISTOGRAM ON salary |", "MANUAL"),
+        ("ANALYZE TABLE emp UPDATE HISTOGRAM ON salary |", "AUTO"),
+        ("ANALYZE TABLE emp UPDATE HISTOGRAM ON salary |", "USING"),
+        (
+            "ANALYZE TABLE emp UPDATE HISTOGRAM ON salary WITH 32 |",
+            "BUCKETS",
+        ),
+        (
+            "ANALYZE TABLE emp UPDATE HISTOGRAM ON salary WITH 32 BUCKETS |",
+            "MANUAL",
+        ),
+        (
+            "ANALYZE TABLE emp UPDATE HISTOGRAM ON salary WITH 32 BUCKETS AUTO |",
+            "UPDATE",
+        ),
+        (
+            "ANALYZE TABLE emp UPDATE HISTOGRAM ON salary USING |",
+            "DATA",
+        ),
+        ("ANALYZE TABLE emp DROP |", "HISTOGRAM"),
+        ("ANALYZE TABLE emp DROP HISTOGRAM |", "ON"),
+        ("CHECK TABLE emp |", "FOR"),
+        ("CHECK TABLE emp |", "QUICK"),
+        ("CHECK TABLE emp FOR |", "UPGRADE"),
+        ("CHECK TABLE emp FOR UPGRADE |", "EXTENDED"),
+        ("CHECK TABLE emp QUICK |", "MEDIUM"),
+        ("CHECKSUM TABLE emp |", "QUICK"),
+        ("CHECKSUM TABLE emp |", "EXTENDED"),
+        ("REPAIR |", "LOCAL"),
+        ("REPAIR NO_WRITE_TO_BINLOG |", "TABLE"),
+        ("REPAIR TABLE emp |", "QUICK"),
+        ("REPAIR TABLE emp QUICK |", "EXTENDED"),
+        ("REPAIR TABLE emp QUICK EXTENDED |", "USE_FRM"),
+        ("OPTIMIZE |", "LOCAL"),
+        ("OPTIMIZE NO_WRITE_TO_BINLOG |", "TABLE"),
+        ("RENAME |", "TABLE"),
+        ("RENAME |", "USER"),
+        ("RENAME TABLE emp |", "TO"),
+        ("RENAME TABLE db.emp |", "TO"),
+        ("RENAME TABLE emp TO emp_new, dept |", "TO"),
+        ("RENAME USER alice |", "TO"),
+        ("RENAME USER 'alice'@'localhost' |", "TO"),
+        ("RENAME USER alice TO bob, carol |", "TO"),
+        ("LOCK |", "TABLES"),
+        ("UNLOCK |", "INSTANCE"),
+        ("CACHE |", "INDEX"),
+        ("LOAD |", "DATA"),
+        ("LOAD |", "XML"),
+        ("LOAD DATA |", "INFILE"),
+        ("LOAD DATA |", "LOW_PRIORITY"),
+        ("LOAD DATA |", "CONCURRENT"),
+        ("LOAD DATA |", "LOCAL"),
+        ("LOAD DATA LOW_PRIORITY |", "LOCAL"),
+        ("LOAD DATA LOW_PRIORITY |", "INFILE"),
+        ("LOAD DATA LOCAL |", "INFILE"),
+        ("LOAD DATA LOW_PRIORITY LOCAL |", "INFILE"),
+        ("LOAD DATA INFILE data_csv |", "INTO"),
+        ("LOAD DATA INFILE data_csv |", "REPLACE"),
+        ("LOAD DATA INFILE data_csv |", "IGNORE"),
+        ("LOAD DATA INFILE data_csv REPLACE |", "INTO"),
+        ("LOAD DATA INFILE data_csv INTO |", "TABLE"),
+        ("LOAD DATA INFILE data_csv IGNORE INTO |", "TABLE"),
+        ("LOAD XML |", "INFILE"),
+        ("LOAD XML CONCURRENT LOCAL |", "INFILE"),
+        ("LOAD XML INFILE data_xml |", "INTO"),
+        ("LOAD XML INFILE data_xml IGNORE |", "INTO"),
+        ("LOAD INDEX INTO |", "CACHE"),
+        ("LOAD INDEX INTO CACHE |", "IGNORE"),
+        ("LOAD INDEX INTO CACHE IGNORE |", "LEAVES"),
+        ("PURGE |", "BINARY"),
+        ("PURGE BINARY |", "LOGS"),
+        ("RESET |", "PERSIST"),
+        ("START |", "TRANSACTION"),
+        ("STOP |", "REPLICA"),
+        ("KILL |", "QUERY"),
+        ("SET |", "CHARSET"),
+        ("SET |", "NAMES"),
+        ("SET CHARACTER |", "SET"),
+        ("SET CHARACTER SET |", "DEFAULT"),
+        ("SET CHARSET |", "DEFAULT"),
+        ("SET NAMES |", "DEFAULT"),
+        ("SET NAMES utf8mb4 |", "COLLATE"),
+        ("SET DEFAULT |", "ROLE"),
+        ("SET DEFAULT ROLE |", "ALL"),
+        ("SET DEFAULT ROLE |", "NONE"),
+        ("SET DEFAULT ROLE ALL |", "TO"),
+        ("SET DEFAULT ROLE admin |", "TO"),
+        ("SET ROLE |", "DEFAULT"),
+        ("SET ROLE |", "NONE"),
+        ("SET ROLE |", "ALL"),
+        ("SET ROLE ALL |", "EXCEPT"),
+        ("SET PASSWORD |", "FOR"),
+        ("SET PASSWORD |", "TO"),
+        ("SET PASSWORD FOR root |", "TO"),
+        ("SET PASSWORD TO |", "RANDOM"),
+        ("SET PASSWORD FOR root TO |", "RANDOM"),
+        ("SET PASSWORD TO RANDOM |", "REPLACE"),
+        ("SET PASSWORD TO RANDOM |", "RETAIN"),
+        ("SET PASSWORD FOR root TO RANDOM |", "RETAIN"),
+        ("SET PASSWORD TO RANDOM RETAIN |", "CURRENT"),
+        ("SET PASSWORD TO RANDOM RETAIN CURRENT |", "PASSWORD"),
+        ("SET PASSWORD FOR root TO RANDOM RETAIN |", "CURRENT"),
+        ("SET PASSWORD FOR root TO RANDOM RETAIN CURRENT |", "PASSWORD"),
+        ("SET PASSWORD TO RANDOM REPLACE old |", "RETAIN"),
+        ("SET PASSWORD FOR root TO RANDOM REPLACE old |", "RETAIN"),
+        ("SET RESOURCE |", "GROUP"),
+        ("SET RESOURCE GROUP rg |", "FOR"),
+    ] {
+        let got = suggestions(sql);
+        assert!(has(&got, expected), "{expected} missing for `{sql}`: {got:?}");
+    }
+
+    let set_names_default = suggestions("SET NAMES DEFAULT |");
+    assert!(
+        !has(&set_names_default, "COLLATE"),
+        "COLLATE leaked after SET NAMES DEFAULT: {set_names_default:?}"
+    );
+
+    let set_role_all = suggestions("SET ROLE ALL |");
+    for invalid in ["NAMES", "PASSWORD", "RESOURCE"] {
+        assert!(
+            !has(&set_role_all, invalid),
+            "{invalid} leaked into SET ROLE ALL slot: {set_role_all:?}"
+        );
+    }
+
+    let create_resource_group_disabled = suggestions("CREATE RESOURCE GROUP rg TYPE USER DISABLE |");
+    assert!(
+        !has(&create_resource_group_disabled, "FORCE"),
+        "FORCE leaked into CREATE RESOURCE GROUP DISABLE slot: {create_resource_group_disabled:?}"
+    );
+
+    let alter_resource_group_enabled = suggestions("ALTER RESOURCE GROUP rg ENABLE |");
+    assert!(
+        !has(&alter_resource_group_enabled, "FORCE"),
+        "FORCE leaked into ALTER RESOURCE GROUP ENABLE slot: {alter_resource_group_enabled:?}"
+    );
+
+    for sql in [
+        "RENAME TABLE emp TO |",
+        "RENAME TABLE db. |",
+        "RENAME USER alice TO |",
+        "RENAME USER 'alice'@ |",
+    ] {
+        let got = suggestions(sql);
+        assert!(!has(&got, "TO"), "TO leaked into `{sql}`: {got:?}");
+    }
+
+    for (sql, invalid) in [
+        ("ANALYZE TABLE emp, dept |", "UPDATE"),
+        ("ANALYZE TABLE emp UPDATE HISTOGRAM ON salary WITH |", "BUCKETS"),
+        (
+            "ANALYZE TABLE emp UPDATE HISTOGRAM ON salary USING DATA |",
+            "WITH",
+        ),
+        ("CHECK TABLE emp FOR |", "QUICK"),
+        ("CHECKSUM TABLE emp QUICK |", "EXTENDED"),
+        ("OPTIMIZE TABLE emp |", "QUICK"),
+        ("ALTER INSTANCE ENABLE INNODB REDO_LOG |", "ROTATE"),
+        ("ALTER INSTANCE RELOAD KEYRING |", "TLS"),
+        ("ALTER INSTANCE ROTATE INNODB MASTER KEY |", "RELOAD"),
+        ("ALTER USER IF EXISTS |", "IDENTIFIED"),
+        ("ALTER USER alice@ |", "IDENTIFIED"),
+        ("ALTER USER alice IDENTIFIED WITH |", "BY"),
+        ("ALTER USER alice REQUIRE NONE |", "SSL"),
+        ("ALTER USER alice PASSWORD EXPIRE INTERVAL |", "DAY"),
+        ("ALTER USER alice COMMENT |", "ACCOUNT"),
+    ] {
+        let got = suggestions(sql);
+        assert!(
+            !has(&got, invalid),
+            "{invalid} leaked into `{sql}`: {got:?}"
+        );
+    }
+
+    let create_or_replace = suggestions("CREATE OR REPLACE |");
+    for oracle_only in ["PACKAGE", "TYPE", "TRIGGER", "USER", "SYNONYM"] {
+        assert!(
+            !has(&create_or_replace, oracle_only),
+            "{oracle_only} leaked into MySQL CREATE OR REPLACE: {create_or_replace:?}"
+        );
+    }
+
+    let alter = suggestions("ALTER |");
+    for expected in [
+        "ALGORITHM", "DATABASE", "DEFINER", "EVENT", "FUNCTION", "INSTANCE", "RESOURCE",
+        "SCHEMA", "SQL", "TABLE", "USER", "VIEW",
+    ] {
+        assert!(
+            has(&alter, expected),
+            "{expected} missing for MySQL ALTER: {alter:?}"
+        );
+    }
+    for oracle_only in [
+        "PACKAGE",
+        "SYNONYM",
+        "MATERIALIZED",
+        "SESSION",
+        "PUBLIC",
+        "SHARED",
+    ] {
+        assert!(
+            !has(&alter, oracle_only),
+            "{oracle_only} leaked into MySQL ALTER: {alter:?}"
+        );
+    }
+
+    let drop = suggestions("DROP |");
+    for expected in [
+        "DATABASE", "EVENT", "FUNCTION", "INDEX", "RESOURCE", "ROLE", "TABLE", "TRIGGER",
+        "SCHEMA", "SERVER", "USER", "VIEW", "PREPARE",
+    ] {
+        assert!(
+            has(&drop, expected),
+            "{expected} missing for MySQL DROP: {drop:?}"
+        );
+    }
+    for oracle_only in ["PACKAGE", "SYNONYM", "MATERIALIZED", "JAVA", "PUBLIC"] {
+        assert!(
+            !has(&drop, oracle_only),
+            "{oracle_only} leaked into MySQL DROP: {drop:?}"
+        );
+    }
+}
+
+#[test]
+fn mysql_prepared_and_explain_keyword_slots_are_dialect_scoped() {
+    use crate::db::DatabaseType::MySQL;
+
+    let suggestions = |sql: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &analyze_inline_cursor_sql(sql),
+            Some(MySQL),
+        )
+    };
+    let has = |suggestions: &[String], keyword: &str| {
+        suggestions
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(keyword))
+    };
+
+    for (sql, expected) in [
+        ("DEALLOCATE |", "PREPARE"),
+        ("PREPARE stmt |", "FROM"),
+        ("EXECUTE stmt |", "USING"),
+    ] {
+        let got = suggestions(sql);
+        assert!(has(&got, expected), "{expected} missing for `{sql}`: {got:?}");
+    }
+
+    let explain = suggestions("EXPLAIN |");
+    for expected in [
+        "ANALYZE", "FORMAT", "FOR", "DELETE", "INSERT", "REPLACE", "SELECT", "TABLE",
+        "UPDATE", "WITH",
+    ] {
+        assert!(
+            has(&explain, expected),
+            "{expected} missing for MySQL EXPLAIN: {explain:?}"
+        );
+    }
+
+    let explain_format = suggestions("EXPLAIN FORMAT |");
+    for expected in ["JSON", "TREE", "TRADITIONAL"] {
+        assert!(
+            has(&explain_format, expected),
+            "{expected} missing for MySQL EXPLAIN FORMAT: {explain_format:?}"
+        );
+    }
+
+    let explain_format_json = suggestions("EXPLAIN FORMAT JSON |");
+    for expected in ["INTO", "FOR", "SELECT", "UPDATE"] {
+        assert!(
+            has(&explain_format_json, expected),
+            "{expected} missing for MySQL EXPLAIN FORMAT JSON: {explain_format_json:?}"
+        );
+    }
+
+    let explain_for = suggestions("EXPLAIN FOR |");
+    for expected in ["CONNECTION", "DATABASE", "SCHEMA"] {
+        assert!(
+            has(&explain_for, expected),
+            "{expected} missing for MySQL EXPLAIN FOR: {explain_for:?}"
+        );
+    }
+
+    let explain_analyze = suggestions("EXPLAIN ANALYZE |");
+    for expected in ["FORMAT", "SELECT", "TABLE", "UPDATE", "DELETE"] {
+        assert!(
+            has(&explain_analyze, expected),
+            "{expected} missing for MySQL EXPLAIN ANALYZE: {explain_analyze:?}"
+        );
+    }
+    for unsupported in ["INSERT", "REPLACE"] {
+        assert!(
+            !has(&explain_analyze, unsupported),
+            "{unsupported} leaked into MySQL EXPLAIN ANALYZE: {explain_analyze:?}"
+        );
+    }
+
+    assert_eq!(suggestions("EXPLAIN ANALYZE FORMAT |"), vec!["TREE"]);
+
+    let explain_analyze_tree = suggestions("EXPLAIN ANALYZE FORMAT TREE |");
+    for expected in ["SELECT", "TABLE", "UPDATE", "DELETE"] {
+        assert!(
+            has(&explain_analyze_tree, expected),
+            "{expected} missing for MySQL EXPLAIN ANALYZE FORMAT TREE: {explain_analyze_tree:?}"
+        );
+    }
+    for unsupported in ["INSERT", "REPLACE"] {
+        assert!(
+            !has(&explain_analyze_tree, unsupported),
+            "{unsupported} leaked into MySQL EXPLAIN ANALYZE FORMAT TREE: {explain_analyze_tree:?}"
+        );
+    }
+}
+
+#[test]
+fn mysql_admin_transaction_and_utility_keyword_slots_are_dialect_scoped() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let suggestions = |sql: &str, db| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &analyze_inline_cursor_sql(sql),
+            Some(db),
+        )
+    };
+    let has = |suggestions: &[String], keyword: &str| {
+        suggestions
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(keyword))
+    };
+
+    for (sql, expected) in [
+        ("CHANGE |", "REPLICATION"),
+        ("CHANGE REPLICATION |", "SOURCE"),
+        ("CHANGE REPLICATION |", "FILTER"),
+        ("CHANGE REPLICATION SOURCE |", "TO"),
+        ("CHANGE REPLICATION SOURCE TO |", "SOURCE_HOST"),
+        ("CHANGE REPLICATION SOURCE TO |", "FOR"),
+        ("CHANGE REPLICATION FILTER |", "REPLICATE_DO_DB"),
+        ("CLONE |", "INSTANCE"),
+        ("CLONE |", "LOCAL"),
+        ("CLONE LOCAL |", "DATA"),
+        ("CLONE LOCAL DATA |", "DIRECTORY"),
+        ("CLONE INSTANCE |", "FROM"),
+        ("FLUSH |", "BINARY"),
+        ("FLUSH |", "NO_WRITE_TO_BINLOG"),
+        ("FLUSH LOCAL |", "PRIVILEGES"),
+        ("FLUSH BINARY |", "LOGS"),
+        ("FLUSH TABLES |", "WITH"),
+        ("FLUSH TABLES |", "FOR"),
+        ("FLUSH TABLES FOR |", "EXPORT"),
+        ("IMPORT |", "TABLE"),
+        ("IMPORT TABLE |", "FROM"),
+        ("INSTALL |", "COMPONENT"),
+        ("INSTALL |", "PLUGIN"),
+        ("INSTALL PLUGIN audit_log |", "SONAME"),
+        ("UNINSTALL |", "COMPONENT"),
+        ("UNINSTALL |", "PLUGIN"),
+        ("HANDLER emp |", "OPEN"),
+        ("HANDLER emp |", "READ"),
+        ("HANDLER emp |", "CLOSE"),
+        ("HANDLER emp OPEN |", "AS"),
+        ("HANDLER emp READ |", "FIRST"),
+        ("LOCK INSTANCE |", "FOR"),
+        ("LOCK INSTANCE FOR |", "BACKUP"),
+        ("LOCK TABLES emp |", "READ"),
+        ("LOCK TABLES emp |", "WRITE"),
+        ("LOCK TABLES emp |", "AS"),
+        ("LOCK TABLES emp AS e |", "READ"),
+        ("LOCK TABLES emp READ |", "LOCAL"),
+        ("COMMIT |", "WORK"),
+        ("COMMIT |", "AND"),
+        ("COMMIT AND |", "CHAIN"),
+        ("COMMIT AND NO |", "CHAIN"),
+        ("COMMIT NO |", "RELEASE"),
+        ("ROLLBACK |", "TO"),
+        ("ROLLBACK TO |", "SAVEPOINT"),
+        ("RELEASE |", "SAVEPOINT"),
+        ("RESET BINARY |", "LOGS"),
+        ("RESET BINARY LOGS |", "AND"),
+        ("RESET BINARY LOGS AND |", "GTIDS"),
+        ("RESET REPLICA |", "ALL"),
+        ("RESET REPLICA |", "FOR"),
+        ("RESET REPLICA ALL |", "FOR"),
+        ("RESET REPLICA FOR |", "CHANNEL"),
+        ("RESET REPLICA ALL FOR |", "CHANNEL"),
+        ("RESET PERSIST |", "IF"),
+        ("RESET PERSIST IF |", "EXISTS"),
+        ("PURGE BINARY LOGS |", "BEFORE"),
+        ("PURGE BINARY LOGS |", "TO"),
+        ("SIGNAL |", "SQLSTATE"),
+        ("SIGNAL SQLSTATE |", "VALUE"),
+        ("RESIGNAL |", "SQLSTATE"),
+        ("RESIGNAL |", "SET"),
+        ("RESIGNAL SQLSTATE |", "VALUE"),
+        ("START TRANSACTION |", "WITH"),
+        ("START TRANSACTION |", "READ"),
+        ("START TRANSACTION READ |", "ONLY"),
+        ("START TRANSACTION READ |", "WRITE"),
+        ("START TRANSACTION WITH |", "CONSISTENT"),
+        ("START TRANSACTION WITH CONSISTENT |", "SNAPSHOT"),
+        ("START GROUP_REPLICATION |", "USER"),
+        ("START GROUP_REPLICATION |", "PASSWORD"),
+        ("START GROUP_REPLICATION USER repl |", "DEFAULT_AUTH"),
+        ("START REPLICA |", "IO_THREAD"),
+        ("START REPLICA |", "UNTIL"),
+        ("START REPLICA UNTIL |", "SQL_BEFORE_GTIDS"),
+        ("START REPLICA FOR |", "CHANNEL"),
+        ("STOP REPLICA |", "IO_THREAD"),
+        ("STOP REPLICA |", "FOR"),
+        ("STOP REPLICA FOR |", "CHANNEL"),
+        ("XA |", "START"),
+        ("XA |", "RECOVER"),
+        ("XA START xid |", "JOIN"),
+        ("XA START xid |", "RESUME"),
+        ("XA END xid |", "SUSPEND"),
+        ("XA END xid SUSPEND |", "FOR"),
+        ("XA END xid SUSPEND FOR |", "MIGRATE"),
+        ("XA COMMIT xid |", "ONE"),
+        ("XA COMMIT xid ONE |", "PHASE"),
+        ("XA RECOVER |", "CONVERT"),
+        ("XA RECOVER CONVERT |", "XID"),
+    ] {
+        let got = suggestions(sql, MySQL);
+        assert!(has(&got, expected), "{expected} missing for `{sql}`: {got:?}");
+    }
+
+    let reset_persist_if = suggestions("RESET PERSIST IF |", MySQL);
+    for invalid in ["ALL", "FOR"] {
+        assert!(
+            !has(&reset_persist_if, invalid),
+            "{invalid} leaked into RESET PERSIST IF slot: {reset_persist_if:?}"
+        );
+    }
+
+    let start_group_replication = suggestions("START GROUP_REPLICATION |", MySQL);
+    for invalid in ["IO_THREAD", "UNTIL", "FOR"] {
+        assert!(
+            !has(&start_group_replication, invalid),
+            "{invalid} leaked into START GROUP_REPLICATION options: {start_group_replication:?}"
+        );
+    }
+
+    let mysql_install = suggestions("INSTALL |", MySQL);
+    for oracle_only in ["DIRECTORY", "PACKAGE", "SYNONYM", "TABLE"] {
+        assert!(
+            !has(&mysql_install, oracle_only),
+            "{oracle_only} leaked into MySQL INSTALL slot: {mysql_install:?}"
+        );
+    }
+
+    let oracle_install = suggestions("INSTALL |", Oracle);
+    for mysql_only in ["COMPONENT", "PLUGIN"] {
+        assert!(
+            !has(&oracle_install, mysql_only),
+            "{mysql_only} leaked into Oracle INSTALL slot: {oracle_install:?}"
+        );
+    }
 }
 
 #[test]
@@ -22520,6 +23797,95 @@ fn dml_statement_head_keywords_are_scoped_to_statement_heads() {
                 "{keyword} leaked outside a DML statement-head slot for `{sql}`: {suggestions:?}"
             );
         }
+    }
+}
+
+#[test]
+fn mysql_dml_statement_head_keywords_are_dialect_scoped() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let kw = |sql: &str, db| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &analyze_inline_cursor_sql(sql),
+            Some(db),
+        )
+    };
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+
+    for expected in ["FROM", "LOW_PRIORITY", "QUICK", "IGNORE"] {
+        let suggestions = kw("DELETE |", MySQL);
+        assert!(
+            has(&suggestions, expected),
+            "{expected} missing for MySQL DELETE head: {suggestions:?}"
+        );
+    }
+    for (sql, expected) in [
+        ("DELETE LOW_PRIORITY |", "QUICK"),
+        ("DELETE QUICK |", "IGNORE"),
+        ("DELETE IGNORE |", "FROM"),
+        ("DELETE LOW_PRIORITY QUICK |", "IGNORE"),
+        ("DELETE t1 |", "FROM"),
+    ] {
+        let suggestions = kw(sql, MySQL);
+        assert!(has(&suggestions, expected), "{expected} missing for `{sql}`: {suggestions:?}");
+    }
+
+    for expected in ["DELAYED", "HIGH_PRIORITY", "IGNORE", "INTO", "LOW_PRIORITY"] {
+        let suggestions = kw("INSERT |", MySQL);
+        assert!(
+            has(&suggestions, expected),
+            "{expected} missing for MySQL INSERT head: {suggestions:?}"
+        );
+    }
+    for (sql, expected) in [
+        ("INSERT LOW_PRIORITY |", "IGNORE"),
+        ("INSERT HIGH_PRIORITY |", "INTO"),
+        ("INSERT DELAYED |", "INTO"),
+        ("INSERT IGNORE |", "INTO"),
+        ("INSERT LOW_PRIORITY IGNORE |", "INTO"),
+    ] {
+        let suggestions = kw(sql, MySQL);
+        assert!(has(&suggestions, expected), "{expected} missing for `{sql}`: {suggestions:?}");
+    }
+
+    for expected in ["DELAYED", "INTO", "LOW_PRIORITY"] {
+        let suggestions = kw("REPLACE |", MySQL);
+        assert!(
+            has(&suggestions, expected),
+            "{expected} missing for MySQL REPLACE head: {suggestions:?}"
+        );
+    }
+    for sql in ["REPLACE LOW_PRIORITY |", "REPLACE DELAYED |"] {
+        let suggestions = kw(sql, MySQL);
+        assert!(has(&suggestions, "INTO"), "INTO missing for `{sql}`: {suggestions:?}");
+    }
+
+    let update = kw("UPDATE |", MySQL);
+    for expected in ["LOW_PRIORITY", "IGNORE"] {
+        assert!(has(&update, expected), "{expected} missing for MySQL UPDATE: {update:?}");
+    }
+    let update_low_priority = kw("UPDATE LOW_PRIORITY |", MySQL);
+    assert!(
+        has(&update_low_priority, "IGNORE"),
+        "IGNORE missing for MySQL UPDATE LOW_PRIORITY: {update_low_priority:?}"
+    );
+
+    let mysql_merge = kw("MERGE |", MySQL);
+    assert!(
+        !has(&mysql_merge, "INTO"),
+        "Oracle MERGE INTO leaked into MySQL MERGE head: {mysql_merge:?}"
+    );
+
+    assert_eq!(kw("DELETE |", Oracle), vec!["FROM".to_string()]);
+    assert_eq!(kw("INSERT |", Oracle), vec!["INTO".to_string()]);
+    assert_eq!(kw("MERGE |", Oracle), vec!["INTO".to_string()]);
+    let oracle_replace = kw("REPLACE |", Oracle);
+    for mysql_only in ["DELAYED", "LOW_PRIORITY"] {
+        assert!(
+            !has(&oracle_replace, mysql_only),
+            "{mysql_only} leaked into Oracle REPLACE head: {oracle_replace:?}"
+        );
     }
 }
 
@@ -28987,6 +30353,13 @@ fn bind_variable_name_slot_suppresses_columns() {
 /// Helper: pure keyword tokens of the base suggestion list for `sql` (cursor at
 /// `|`), uppercased, for statement-start filtering assertions.
 fn statement_start_base_keywords(sql: &str) -> Vec<String> {
+    statement_start_base_keywords_for_db(sql, crate::db::DatabaseType::Oracle)
+}
+
+fn statement_start_base_keywords_for_db(
+    sql: &str,
+    db_type: crate::db::DatabaseType,
+) -> Vec<String> {
     let cursor = sql.find('|').expect("cursor marker");
     let s = sql.replace('|', "");
     let ctx = analyze_inline_cursor_sql(sql);
@@ -28994,12 +30367,16 @@ fn statement_start_base_keywords(sql: &str) -> Vec<String> {
     let context = SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
     let mut data = IntellisenseData::new();
     let ekc = SqlEditorWidget::expression_keyword_context(
-        &ctx, &data, &[], !prefix.is_empty(), Some(crate::db::DatabaseType::Oracle),
+        &ctx,
+        &data,
+        &[],
+        !prefix.is_empty(),
+        Some(db_type),
     );
     let include_columns = matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll);
     SqlEditorWidget::base_suggestions_for_context(
         &mut data, &prefix, None, None, include_columns, context, false,
-        Some(crate::db::DatabaseType::Oracle), ekc,
+        Some(db_type), ekc,
     )
     .into_iter()
     .filter(|x| !x.ends_with("()") && x.chars().all(|c| c.is_ascii_uppercase() || c == '_'))
@@ -29038,12 +30415,9 @@ fn statement_start_filters_keyword_dump_to_statement_verbs() {
         }
     }
 
-    for sql in ["|", "SELECT 1 FROM dual; |"] {
+    for sql in ["|", "SELECT 1; |", "SELECT 1 FROM dual; |"] {
         let suggestions = kw(sql);
-        for keyword in [
-            "SELECT", "CREATE", "ALTER", "DROP", "COMMIT", "GRANT", "EXEC", "VARIABLE", "VAR",
-            "PRINT", "DESC",
-        ] {
+        for keyword in crate::sql_text::statement_head_keywords() {
             assert!(
                 has(&suggestions, keyword),
                 "{keyword} was suppressed at a blank top-level statement start for `{sql}`: {suggestions:?}"
@@ -29067,6 +30441,40 @@ fn statement_start_filters_keyword_dump_to_statement_verbs() {
     assert_eq!(kw("BEGIN I|"), vec!["IF", "INSERT"]);
     assert_eq!(kw("BEGIN W|"), vec!["WHILE", "WITH"]);
     assert_eq!(kw("BEGIN NULL; E|"), vec!["END", "EXCEPTION", "EXECUTE"]);
+}
+
+#[test]
+fn mysql_statement_start_offers_mysql_statement_heads() {
+    let kw = |sql: &str| statement_start_base_keywords_for_db(sql, crate::db::DatabaseType::MySQL);
+    let has = |suggestions: &[String], keyword: &str| suggestions.iter().any(|x| x == keyword);
+
+    for sql in ["|", "SELECT 1; |", "SELECT 1 FROM dual; |"] {
+        let suggestions = kw(sql);
+        for keyword in crate::sql_text::mysql_statement_head_keywords() {
+            assert!(
+                has(&suggestions, keyword),
+                "{keyword} was suppressed at a MySQL top-level statement start for `{sql}`: {suggestions:?}"
+            );
+        }
+        for oracle_only in ["SPOOL", "VARIABLE", "VAR", "PRINT", "WHENEVER"] {
+            assert!(
+                !has(&suggestions, oracle_only),
+                "{oracle_only} leaked into MySQL top-level statement start for `{sql}`: {suggestions:?}"
+            );
+        }
+    }
+
+    for keyword in crate::sql_text::mysql_statement_head_keywords() {
+        if keyword.len() == 1 {
+            continue;
+        }
+        let sql = format!("SELECT 1; {}|", &keyword[..keyword.len() - 1]);
+        let suggestions = kw(&sql);
+        assert!(
+            has(&suggestions, keyword),
+            "{keyword} was suppressed for MySQL prefix `{sql}`: {suggestions:?}"
+        );
+    }
 }
 
 #[test]
