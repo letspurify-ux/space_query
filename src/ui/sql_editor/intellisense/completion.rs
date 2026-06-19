@@ -415,6 +415,11 @@ enum IntervalUnitSlot {
 /// Fixed keyword tail of an `ORDER BY` sort key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OrderBySortModifierSlot {
+    /// `<sort-key> |` - a complete sort key with no modifier yet: `ASC`/`DESC`
+    /// (direction) or `NULLS` (null-ordering) can follow before the next key.
+    /// Mirrors the window form's `AfterSortKey`, minus the frame-unit keywords
+    /// (`ROWS`/`RANGE`/`GROUPS`) which are only grammatical inside a window spec.
+    AfterSortKey,
     /// `<sort-key> ASC|DESC |` - only `NULLS` can follow before the next key.
     AfterDirection,
     /// `<sort-key> [ASC|DESC] NULLS |` - only `FIRST`/`LAST` can follow.
@@ -682,6 +687,7 @@ fn interval_unit_keywords_for(
 
 fn order_by_sort_modifier_keywords(slot: OrderBySortModifierSlot) -> &'static [&'static str] {
     match slot {
+        OrderBySortModifierSlot::AfterSortKey => &["ASC", "DESC", "NULLS"],
         OrderBySortModifierSlot::AfterDirection => &["NULLS"],
         OrderBySortModifierSlot::AfterNulls => &["FIRST", "LAST"],
         OrderBySortModifierSlot::AfterNullOrdering => &[],
@@ -7020,6 +7026,51 @@ impl SqlEditorWidget {
         (Self::cursor_follows_complete_operand(tokens, not_idx) == Some(true)).then_some(not_idx)
     }
 
+    /// Keyword candidates right after a *postfix* `NOT` whose left operand is
+    /// complete (`x NOT |`): only the predicate operators that have a negated
+    /// form are grammatical there - never a bare relation/column/value. Mirrors
+    /// the expression-allowlist arm gated on
+    /// `follows_negated_predicate_operator_anchor`, so the empty-prefix popup is
+    /// no longer silent (and, via the suppression chokepoint below, the base
+    /// catalog no longer leaks). A prefix `NOT` (`WHERE NOT |`, `a AND NOT |`)
+    /// has no left operand, so `postfix_not_index_after_left_operand` returns
+    /// `None` and an operand is still expected.
+    fn expected_negated_predicate_operator_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+        left_operand_type: Option<PrecedingOperandType>,
+    ) -> Option<Vec<&'static str>> {
+        Self::postfix_not_index_after_left_operand(tokens, end)?;
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return Some(vec!["IN", "LIKE", "BETWEEN", "REGEXP", "RLIKE"]);
+        }
+        let mut keywords = vec!["IN", "LIKE", "BETWEEN", "MEMBER"];
+        // `x NOT SUBMULTISET OF y` is grammatical only when the left operand is a
+        // collection; gating it keeps the empty-prefix popup from offering it for
+        // a scalar operand. This mirrors the expression-allowlist arm so the
+        // keyword-only slot's emission stays in sync with what is admitted while
+        // typing.
+        if left_operand_type == Some(PrecedingOperandType::Collection) {
+            keywords.push("SUBMULTISET");
+        }
+        Some(keywords)
+    }
+
+    fn cursor_is_at_negated_predicate_operator_anchor_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::postfix_not_index_after_left_operand(tokens, end).is_some()
+    }
+
     fn mysql_trigger_pseudo_row_policy(tokens: &[SqlToken], end: usize) -> (bool, bool) {
         let mut saw_create = false;
         let mut in_trigger_header = false;
@@ -11007,6 +11058,10 @@ impl SqlEditorWidget {
                 deep_ctx,
                 exclude_current_identifier_chain,
             )
+            || Self::cursor_is_at_negated_predicate_operator_anchor_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
     }
 
     /// True when the cursor is inside an Oracle `TABLESAMPLE`/row-sampling clause
@@ -11052,9 +11107,7 @@ impl SqlEditorWidget {
         end: usize,
         phase: intellisense_context::SqlPhase,
     ) -> Option<OrderBySortModifierSlot> {
-        if !matches!(phase, intellisense_context::SqlPhase::OrderByClause)
-            || Self::trigger_word_is_qualified_member(tokens, end)
-        {
+        if !matches!(phase, intellisense_context::SqlPhase::OrderByClause) {
             return None;
         }
         match Self::previous_meaningful_words_upper(tokens, end, 3).as_slice() {
@@ -11067,8 +11120,96 @@ impl SqlEditorWidget {
             {
                 Some(OrderBySortModifierSlot::AfterNullOrdering)
             }
+            // `<sort-key> |` - a complete sort key with no modifier yet. All
+            // three conditions are required:
+            //   * the last meaningful word is *not* a SQL keyword, so it is a
+            //     plain sort-key identifier rather than a clause keyword that can
+            //     legally follow the `ORDER BY` list (`FOR`, `FETCH`, `OFFSET`,
+            //     `UNION`, …) or a window-frame keyword (`ROWS`, `BETWEEN`, …)
+            //     when the cursor sits in an analytic `ORDER BY`. (`BY` and the
+            //     modifier words are keywords too, so they are covered here.)
+            //   * the cursor directly follows a *complete operand* token, which
+            //     excludes a fresh key position (`ORDER BY a, |`), an open operator
+            //     (`ORDER BY a + |`), and a mid member access (`ORDER BY t.|`),
+            //     while still admitting a complete qualified key
+            //     (`ORDER BY t.col |`) or a call (`ORDER BY upper(a) |`).
+            //   * the cursor is still inside the `ORDER BY` item list, not in a
+            //     trailing row-limiting/locking tail that the phase machine also
+            //     reports as `OrderByClause` (`… OFFSET 20 |`, `… LIMIT 10 |`),
+            //     where the number is a clause argument, not a sort key.
+            [.., last]
+                if !crate::sql_text::is_oracle_sql_keyword(last)
+                    && !crate::sql_text::is_mysql_sql_keyword(last)
+                    && Self::cursor_immediately_follows_complete_operand(tokens, end)
+                    && Self::cursor_is_in_order_by_item_list(tokens, end) =>
+            {
+                Some(OrderBySortModifierSlot::AfterSortKey)
+            }
             _ => None,
         }
+    }
+
+    /// True when the cursor sits inside the `ORDER BY` *item* list - walking back
+    /// from `end` reaches the `ORDER BY` head (or an item-separating comma)
+    /// without first crossing a clause keyword that ends the list (`OFFSET`,
+    /// `FETCH`, `LIMIT`, `FOR`, the row-limiting units, a set operator, …).
+    /// Tokens inside parentheses are skipped so a sort key like `upper(a)` or a
+    /// scalar subquery does not trip the keyword check. The sort modifiers
+    /// (`ASC`/`DESC`/`NULLS`/`FIRST`/`LAST`) are part of the item, not boundaries.
+    fn cursor_is_in_order_by_item_list(tokens: &[SqlToken], end: usize) -> bool {
+        let mut paren_depth: i32 = 0;
+        for token in tokens.get(..end).unwrap_or(tokens).iter().rev() {
+            match token {
+                SqlToken::Comment(_) => {}
+                SqlToken::Symbol(sym) if sym == ")" => paren_depth += 1,
+                SqlToken::Symbol(sym) if sym == "(" => {
+                    if paren_depth == 0 {
+                        // An unbalanced open paren means the `ORDER BY` itself is
+                        // nested in an enclosing construct's argument list; the
+                        // head is not reachable at this level.
+                        return false;
+                    }
+                    paren_depth -= 1;
+                }
+                SqlToken::Symbol(sym) if sym == "," && paren_depth == 0 => return true,
+                SqlToken::Word(word) if paren_depth == 0 => {
+                    let upper = word.to_ascii_uppercase();
+                    match upper.as_str() {
+                        "BY" => return true,
+                        "ASC" | "DESC" | "NULLS" | "FIRST" | "LAST" => {}
+                        other
+                            if crate::sql_text::is_oracle_sql_keyword(other)
+                                || crate::sql_text::is_mysql_sql_keyword(other) =>
+                        {
+                            return false
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// True when the last meaningful (non-comment) token before `end` completes
+    /// an operand: an identifier word, a string/quoted literal, or a closing
+    /// `)`. A comma, dot, opening paren, or binary operator leaves the operand
+    /// position open, so those return false. Used by "after a complete operand"
+    /// keyword slots so they do not fire at a fresh list position
+    /// (`ORDER BY a, |`) or mid expression (`ORDER BY a + |`, `ORDER BY t.|`).
+    fn cursor_immediately_follows_complete_operand(tokens: &[SqlToken], end: usize) -> bool {
+        tokens
+            .get(..end)
+            .unwrap_or(tokens)
+            .iter()
+            .rev()
+            .find(|token| !matches!(token, SqlToken::Comment(_)))
+            .is_some_and(|token| match token {
+                SqlToken::Word(_) | SqlToken::String(_) => true,
+                SqlToken::Symbol(sym) => sym == ")",
+                SqlToken::Comment(_) => false,
+            })
     }
 
     fn order_by_sort_modifier_slot_for_context(
@@ -11433,6 +11574,24 @@ impl SqlEditorWidget {
         use intellisense_context::SqlPhase;
 
         let toks = Self::meaningful_tokens_before(tokens, end);
+        // `INSERT/REPLACE INTO t (cols) |`: the cursor sits right after the
+        // column list's closing paren, where only the value source
+        // (`VALUES`/`SELECT`) is grammatical - never another relation. The phase
+        // machine keeps this in the INTO/table phase, so the hint (and the
+        // mirrored identifier suppression) has to be supplied explicitly. The
+        // bare-target case (`INSERT INTO t |`) falls through to the `lead` match
+        // below.
+        if matches!(phase, SqlPhase::IntoClause)
+            && Self::cursor_after_insert_column_list(tokens, end)
+        {
+            let lead = toks.iter().find_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                _ => None,
+            });
+            if matches!(lead.as_deref(), Some("INSERT") | Some("REPLACE")) {
+                return Some(&["VALUES", "SELECT"]);
+            }
+        }
         // The target (or its alias) must be complete: the last token is a plain
         // identifier word, not a leading/connecting keyword and not a separator.
         let SqlToken::Word(last) = toks.last()? else {
@@ -11468,7 +11627,9 @@ impl SqlEditorWidget {
 
         match lead.as_str() {
             "UPDATE" if matches!(phase, SqlPhase::UpdateTarget) => Some(&["SET"]),
-            "INSERT" if matches!(phase, SqlPhase::IntoClause) => Some(&["VALUES", "SELECT"]),
+            "INSERT" | "REPLACE" if matches!(phase, SqlPhase::IntoClause) => {
+                Some(&["VALUES", "SELECT"])
+            }
             "MERGE" if matches!(phase, SqlPhase::IntoClause | SqlPhase::MergeTarget) => {
                 Some(&["USING"])
             }
@@ -11491,6 +11652,32 @@ impl SqlEditorWidget {
             }
             _ => None,
         }
+    }
+
+    /// True when the cursor sits immediately after the closing paren of an
+    /// `INSERT`/`REPLACE` column list (`INSERT INTO t (a, b) |`) and not after
+    /// any later paren group (a `VALUES (…)` row, a subquery): the last
+    /// meaningful token is a `)` whose group is exactly the parsed target's
+    /// column list. Distinguishes the post-column-list value-source slot from
+    /// `INSERT INTO t VALUES (…) |`, where the source is already supplied.
+    fn cursor_after_insert_column_list(tokens: &[SqlToken], end: usize) -> bool {
+        let Some(close_idx) = tokens
+            .get(..end)
+            .unwrap_or(tokens)
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, token)| !matches!(token, SqlToken::Comment(_)))
+            .map(|(idx, _)| idx)
+        else {
+            return false;
+        };
+        if !matches!(tokens.get(close_idx), Some(SqlToken::Symbol(sym)) if sym == ")") {
+            return false;
+        }
+        Self::insert_target_before_source_anchor(tokens, end)
+            .and_then(|target| target.column_list_close_idx)
+            == Some(close_idx)
     }
 
     /// True when the cursor is right after a complete DML target table (see
@@ -11627,6 +11814,223 @@ impl SqlEditorWidget {
     /// predicate keeps emitting its `ON`/`USING` hint. While the relation is still
     /// being typed the caller excludes the cursor word, leaving `FROM`/`,` as the
     /// last token, so relation completion keeps working.
+    /// True when the cursor follows a *complete boolean predicate* in the current
+    /// conjunct - the trailing `AND`/`OR`-separated condition both ends on a
+    /// complete operand and contains a top-level comparison/predicate operator
+    /// (`a = 1 |`, `a IS NOT NULL |`, `a IN (1, 2) |`). A dangling operand
+    /// (`WHERE a |`), an open operator (`WHERE a = |`, `a AND |`), or a bare
+    /// arithmetic expression (`a + 1 |`) is not complete, so the downstream
+    /// clause openers stay hidden until the condition is actually finished. The
+    /// check is intentionally conservative (a parenthesized predicate is treated
+    /// as one operand) so it never *adds* a clause keyword where one is
+    /// ungrammatical.
+    fn cursor_follows_complete_predicate(tokens: &[SqlToken], end: usize) -> bool {
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        // Isolate the current conjunct: walk back at paren depth 0 to the nearest
+        // boundary (the clause keyword, a conjunction, or an enclosing paren).
+        let is_boundary = |word: &str| {
+            matches!(
+                word,
+                "WHERE" | "HAVING" | "ON" | "START" | "CONNECT" | "BY" | "AND" | "OR"
+            )
+        };
+        let mut depth = 0i32;
+        let mut conjunct_start = 0usize;
+        for idx in (0..toks.len()).rev() {
+            match &toks[idx] {
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => depth += 1,
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => {
+                    if depth == 0 {
+                        conjunct_start = idx + 1;
+                        break;
+                    }
+                    depth -= 1;
+                }
+                SqlToken::Word(word) if depth == 0 && is_boundary(&word.to_ascii_uppercase()) => {
+                    conjunct_start = idx + 1;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let conjunct = &toks[conjunct_start..];
+        if conjunct.is_empty() {
+            return false;
+        }
+        // Forward state machine over the conjunct at depth 0: a complete predicate
+        // ends with an operand and has seen a comparison/predicate operator. An
+        // `IS …` predicate is tracked separately (`is_tail`) because its tail
+        // words (`A SET`, `OF TYPE (…)`, `DISTINCT FROM …`) keep the predicate
+        // open even though they are plain words, while `IS NULL`/`IS NAN`/… close
+        // it - so `x IS NULL |` is complete but `x IS A |`/`x IS OF TYPE |` are
+        // not.
+        let mut expecting_operand = true;
+        let mut saw_predicate_operator = false;
+        let mut is_tail = false;
+        let mut depth = 0i32;
+        for token in conjunct {
+            match token {
+                SqlToken::Comment(_) => {}
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => depth += 1,
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => {
+                    depth = (depth - 1).max(0);
+                    expecting_operand = false;
+                    is_tail = false;
+                }
+                _ if depth > 0 => {}
+                SqlToken::Symbol(sym) => {
+                    if matches!(sym.as_str(), "=" | "<" | ">" | "<=" | ">=" | "<>" | "!=" | "^=") {
+                        saw_predicate_operator = true;
+                        expecting_operand = true;
+                        is_tail = false;
+                    } else if matches!(sym.as_str(), "+" | "-" | "*" | "/" | "||") {
+                        expecting_operand = true;
+                        is_tail = false;
+                    } else if sym == "," || sym == ";" {
+                        // A trailing comma/`;` leaves no clean predicate.
+                        expecting_operand = true;
+                        is_tail = false;
+                    }
+                }
+                SqlToken::Word(word) => {
+                    let upper = word.to_ascii_uppercase();
+                    if upper == "IS" {
+                        saw_predicate_operator = true;
+                        expecting_operand = true;
+                        is_tail = true;
+                    } else if is_tail {
+                        // Inside an `IS [NOT] …` tail: only the self-contained
+                        // terminators close the predicate.
+                        match upper.as_str() {
+                            "NULL" | "NAN" | "INFINITE" | "EMPTY" | "JSON" | "PRESENT"
+                            | "ABSENT" | "TRUE" | "FALSE" | "UNKNOWN" | "SET" => {
+                                expecting_operand = false;
+                                is_tail = false;
+                            }
+                            // `NOT`, `A` (awaiting `SET`), `OF`/`TYPE`/`DISTINCT`/
+                            // `FROM` (awaiting their operand) keep the tail open.
+                            _ => expecting_operand = true,
+                        }
+                    } else {
+                        match upper.as_str() {
+                            "IN" | "LIKE" | "BETWEEN" | "MEMBER" | "SUBMULTISET" | "REGEXP"
+                            | "RLIKE" | "EXISTS" => {
+                                saw_predicate_operator = true;
+                                expecting_operand = true;
+                            }
+                            "NOT" | "AND" | "OR" | "ANY" | "ALL" | "ESCAPE" | "OF" => {
+                                expecting_operand = true;
+                            }
+                            _ => expecting_operand = false,
+                        }
+                    }
+                }
+                SqlToken::String(_) => {
+                    expecting_operand = false;
+                    is_tail = false;
+                }
+            }
+        }
+        !expecting_operand && saw_predicate_operator && depth == 0 && !is_tail
+    }
+
+    /// Downstream query-clause opener keywords valid right after the *complete*
+    /// content of the cursor's current clause. The canonical clause order
+    /// (`FROM → WHERE → CONNECT BY/START WITH → GROUP BY → HAVING → ORDER BY →
+    /// row-limiting → locking`) makes the set a function of the phase: only the
+    /// clauses that may follow the current one are offered, so they are never
+    /// out of order. Emitted *additively* (an alias after `FROM t`, the next sort
+    /// key after a comma, etc. may still be typed) and only when the clause is
+    /// actually complete, so the popup gains the missing `ORDER BY`/`GROUP BY`/…
+    /// hints without admitting anything ungrammatical. `ORDER BY` itself is
+    /// excluded here - its sort-modifier/row-limiting tails own that phase.
+    fn expected_query_clause_continuation_keywords(
+        tokens: &[SqlToken],
+        end: usize,
+        phase: intellisense_context::SqlPhase,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> &'static [&'static str] {
+        use intellisense_context::SqlPhase;
+
+        // Clause continuations are statement-level; an open paren means the cursor
+        // is inside a sub-expression/derived table/call, not at the clause tail.
+        if Self::unclosed_paren_count(tokens, end) != 0 {
+            return &[];
+        }
+
+        // The valid downstream clauses depend on the statement kind. `tokens` is
+        // the *current query* (a subquery's own tokens start at its `SELECT`), so
+        // its leading word distinguishes a query (full clause set) from a
+        // `DELETE`/`UPDATE` (which has no `GROUP BY`/`HAVING`/… - only MySQL adds
+        // `ORDER BY`/`LIMIT`). Anything else (MERGE, INSERT, …) gets nothing.
+        let statement_head = tokens.iter().find_map(|token| match token {
+            SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+            _ => None,
+        });
+        let mysql = crate::sql_text::mysql_compatibility_for_sql("", db_type);
+        match statement_head.as_deref() {
+            Some("SELECT") | Some("WITH") => {}
+            Some("DELETE") | Some("UPDATE") => {
+                // Oracle write statements end at `WHERE`; MySQL allows a trailing
+                // `ORDER BY … LIMIT …`.
+                if mysql
+                    && matches!(phase, intellisense_context::SqlPhase::WhereClause)
+                    && Self::cursor_follows_complete_predicate(tokens, end)
+                {
+                    return &["ORDER BY", "LIMIT"];
+                }
+                return &[];
+            }
+            _ => return &[],
+        }
+
+        let complete = match phase {
+            SqlPhase::FromClause => Self::cursor_is_after_complete_from_relation(tokens, end),
+            SqlPhase::GroupByClause => {
+                Self::cursor_immediately_follows_complete_operand(tokens, end)
+                    && Self::cursor_is_in_order_by_item_list(tokens, end)
+            }
+            SqlPhase::WhereClause
+            | SqlPhase::HavingClause
+            | SqlPhase::ConnectByClause
+            | SqlPhase::StartWithClause => Self::cursor_follows_complete_predicate(tokens, end),
+            _ => false,
+        };
+        if !complete {
+            return &[];
+        }
+
+        match (phase, mysql) {
+            (SqlPhase::FromClause, false) => &[
+                "WHERE", "CONNECT BY", "START WITH", "GROUP BY", "HAVING", "ORDER BY", "OFFSET",
+                "FETCH", "FOR UPDATE",
+            ],
+            (SqlPhase::FromClause, true) => {
+                &["WHERE", "GROUP BY", "HAVING", "ORDER BY", "LIMIT", "FOR UPDATE"]
+            }
+            (SqlPhase::WhereClause, false) => &[
+                "CONNECT BY", "START WITH", "GROUP BY", "HAVING", "ORDER BY", "OFFSET", "FETCH",
+                "FOR UPDATE",
+            ],
+            (SqlPhase::WhereClause, true) => {
+                &["GROUP BY", "HAVING", "ORDER BY", "LIMIT", "FOR UPDATE"]
+            }
+            (SqlPhase::StartWithClause, _) => &[
+                "CONNECT BY", "GROUP BY", "HAVING", "ORDER BY", "OFFSET", "FETCH", "FOR UPDATE",
+            ],
+            (SqlPhase::ConnectByClause, _) => &[
+                "START WITH", "GROUP BY", "HAVING", "ORDER BY", "OFFSET", "FETCH", "FOR UPDATE",
+            ],
+            (SqlPhase::GroupByClause, false) => {
+                &["HAVING", "ORDER BY", "OFFSET", "FETCH", "FOR UPDATE"]
+            }
+            (SqlPhase::GroupByClause, true) => &["HAVING", "ORDER BY", "LIMIT", "FOR UPDATE"],
+            (SqlPhase::HavingClause, false) => &["ORDER BY", "OFFSET", "FETCH", "FOR UPDATE"],
+            (SqlPhase::HavingClause, true) => &["ORDER BY", "LIMIT", "FOR UPDATE"],
+            _ => &[],
+        }
+    }
+
     fn cursor_is_after_complete_from_relation(tokens: &[SqlToken], end: usize) -> bool {
         let toks = Self::meaningful_tokens_before(tokens, end);
         // The reference (or its implicit alias) must be complete: the last token
@@ -17583,6 +17987,14 @@ impl SqlEditorWidget {
         {
             return Self::filter_expected_candidates(prefix, candidates);
         }
+        if let Some(candidates) = Self::expected_negated_predicate_operator_keyword_candidates(
+            tokens,
+            context_end,
+            db_type,
+            expr_keyword_ctx.map(|ctx| ctx.negated_predicate_left_operand_type),
+        ) {
+            return Self::filter_expected_candidates(prefix, &candidates);
+        }
         if let Some(candidates) = Self::merge_then_action_keywords(tokens, context_end) {
             return Self::filter_expected_candidates(prefix, candidates);
         }
@@ -17689,6 +18101,31 @@ impl SqlEditorWidget {
         let tail = Self::expected_expression_construct_continuation_keywords(tokens, context_end);
         if !tail.is_empty() {
             for keyword in Self::filter_expected_candidates(prefix, tail) {
+                if !result.iter().any(|existing| existing.eq_ignore_ascii_case(&keyword)) {
+                    result.push(keyword);
+                }
+            }
+        }
+        // Merge the downstream query-clause openers (`… WHERE x = 1 |` → `GROUP
+        // BY`/`ORDER BY`/…). Like the construct tail above they are additive and
+        // the sole source of these multi-word hints at an empty prefix. Gated on
+        // there being no more specific continuation already: a partial clause
+        // opener (`ORDER SIBLINGS |` → `BY`, a join type) leaves `candidates`
+        // non-empty, and a mid-construct operand (`BETWEEN 1 |` → `AND`, a `CASE`
+        // arm) leaves `tail` non-empty - in both the cursor is not yet at a clean
+        // clause boundary, so the openers would be premature.
+        let clause_tail = if candidates.is_empty() && tail.is_empty() {
+            Self::expected_query_clause_continuation_keywords(
+                tokens,
+                context_end,
+                deep_ctx.phase,
+                db_type,
+            )
+        } else {
+            &[]
+        };
+        if !clause_tail.is_empty() {
+            for keyword in Self::filter_expected_candidates(prefix, clause_tail) {
                 if !result.iter().any(|existing| existing.eq_ignore_ascii_case(&keyword)) {
                     result.push(keyword);
                 }

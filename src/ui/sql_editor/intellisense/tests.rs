@@ -510,12 +510,15 @@ fn keyword_only_slots_are_enrolled_in_suppression_chokepoint() {
         "SELECT json_value(j, '$.a' NULL ON |) FROM t",
         // DML statement heads.
         "INSERT INTO emp |",
+        "INSERT INTO emp (a, b) |",
         "MERGE INTO emp |",
         "UPDATE emp |",
-        // Set operator, locking, IS NULL, sort modifiers.
+        // Set operator, locking, IS NULL/NOT, sort modifiers.
         "SELECT a FROM t UNION |",
         "SELECT a FROM t FOR |",
         "SELECT a FROM t WHERE x IS |",
+        "SELECT a FROM t WHERE x NOT |",
+        "SELECT a FROM t ORDER BY a |",
         "SELECT a FROM t ORDER BY a ASC |",
         "SELECT a FROM t ORDER BY a NULLS |",
         // Join + clause-keyword continuations.
@@ -582,6 +585,9 @@ fn mysql_keyword_only_slots_are_enrolled_in_suppression_chokepoint() {
         "ANALYZE TABLE emp UPDATE HISTOGRAM ON salary |",
         "GRANT | ON *.* TO u",
         "REVOKE SELECT, | ON *.* FROM u",
+        "INSERT INTO emp (a, b) |",
+        "REPLACE INTO emp (a) |",
+        "SELECT a FROM t WHERE x NOT |",
     ] {
         assert!(
             suppressed_or_no_keywords(sql),
@@ -1071,14 +1077,184 @@ fn order_by_sort_modifier_slots_suppress_columns_and_offer_only_modifier_keyword
         &analyze_inline_cursor_sql("CREATE INDEX ix ON t (id ASC |"),
         false,
     ));
-    assert!(!SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(
+    // `ORDER BY id A|` is a complete sort key followed by a partial word: only a
+    // sort modifier (`ASC`) is grammatical there — a second key would need a
+    // comma — so columns are suppressed and `ASC` is offered.
+    assert!(SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(
         &analyze_inline_cursor_sql("SELECT * FROM t ORDER BY id A|"),
         true,
     ));
+    assert_eq!(kw("SELECT * FROM t ORDER BY id A|"), vec!["ASC".to_string()]);
+    // `first` is itself a keyword (the `NULLS FIRST` ordering word), so it is not
+    // treated as a bare sort key needing modifiers.
     assert!(!SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(
         &analyze_inline_cursor_sql("SELECT * FROM t ORDER BY first |"),
         false,
     ));
+}
+
+/// A *bare* query-level `ORDER BY` sort key (`ORDER BY a |`, no direction word
+/// yet) offers the direction/null-ordering modifiers and suppresses identifiers,
+/// mirroring the analytic window form. The slot must distinguish the complete
+/// sort key from the many lookalike positions that the phase machine also
+/// reports as `OrderByClause`: a fresh key right after a comma, an open operator,
+/// a mid member access, and the trailing row-limiting/locking tail.
+#[test]
+fn order_by_bare_sort_key_offers_direction_and_null_keywords() {
+    let db = Some(crate::db::DatabaseType::Oracle);
+    let kw = |sql: &str| {
+        let cursor = sql.find('|').expect("cursor marker");
+        let s = sql.replace('|', "");
+        let prefix = crate::ui::intellisense::get_word_at_cursor(&s, cursor).0;
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix,
+            &analyze_inline_cursor_sql(sql),
+            db,
+        )
+    };
+    let suppresses = |sql: &str| {
+        let cursor = sql.find('|').expect("cursor marker");
+        let s = sql.replace('|', "");
+        let has = !crate::ui::intellisense::get_word_at_cursor(&s, cursor).0.is_empty();
+        SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(
+            &analyze_inline_cursor_sql(sql),
+            has,
+        )
+    };
+
+    // A complete sort key with no modifier yet: ASC/DESC/NULLS, columns suppressed.
+    for sql in [
+        "SELECT a FROM t ORDER BY a |",
+        "SELECT a, b FROM t ORDER BY a, b |", // second key in the list
+        "SELECT a FROM t ORDER BY t.col |",   // complete qualified key
+        "SELECT a FROM t ORDER BY upper(a) |", // call result
+        "SELECT a FROM t ORDER BY a + b |",   // complete expression
+    ] {
+        assert_eq!(
+            kw(sql),
+            vec!["ASC".to_string(), "DESC".to_string(), "NULLS".to_string()],
+            "modifier keywords for `{sql}`"
+        );
+        assert!(suppresses(sql), "columns suppressed for `{sql}`");
+    }
+
+    // Typing a modifier filters to it and still suppresses columns.
+    assert_eq!(kw("SELECT a FROM t ORDER BY a D|"), vec!["DESC".to_string()]);
+
+    // Lookalike positions in `OrderByClause` phase that are NOT a complete sort
+    // key: a fresh key after a comma, an open operator, a mid member access, and
+    // the trailing OFFSET/locking tail. None offer the modifiers or suppress.
+    for sql in [
+        "SELECT a FROM t ORDER BY a, |",        // fresh key position
+        "SELECT a FROM t ORDER BY a + |",       // open binary operator
+        "SELECT a FROM t ORDER BY t.|",         // mid member access
+        "SELECT a FROM t ORDER BY |",           // no key yet
+        "SELECT a FROM t ORDER BY a OFFSET 20 |", // row-limiting tail
+    ] {
+        assert!(
+            !kw(sql).iter().any(|k| k == "ASC" || k == "DESC"),
+            "no direction modifier for `{sql}`: {:?}",
+            kw(sql)
+        );
+    }
+
+    // The analytic window form keeps owning its own ORDER BY (direction + frame
+    // units), unaffected by the query-level slot.
+    assert!(kw("SELECT sum(x) OVER (ORDER BY a |) FROM t")
+        .iter()
+        .any(|k| k == "ASC"));
+}
+
+/// After the *complete* content of a query clause, the downstream clause openers
+/// (`GROUP BY`/`ORDER BY`/…) are offered - additively and in canonical order -
+/// so the popup is no longer silent there. The completeness gating must keep them
+/// out of every lookalike: a dangling/incomplete predicate, a mid-construct
+/// operand, a partial clause opener, a non-SELECT statement, and a sub-expression.
+#[test]
+fn query_clause_continuation_offers_downstream_clause_openers() {
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let kw = |sql: &str, db: crate::db::DatabaseType| {
+        let cursor = sql.find('|').expect("cursor marker");
+        let s = sql.replace('|', "");
+        let prefix = crate::ui::intellisense::get_word_at_cursor(&s, cursor).0;
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(db),
+        )
+    };
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    // Complete clauses -> downstream openers (Oracle).
+    assert!(has(&kw("SELECT a FROM t |", Oracle), "ORDER BY"));
+    assert!(has(&kw("SELECT a FROM t alias |", Oracle), "WHERE"));
+    assert!(has(&kw("SELECT a FROM t WHERE a = 1 |", Oracle), "ORDER BY"));
+    assert!(has(&kw("SELECT a FROM t WHERE a = 1 |", Oracle), "GROUP BY"));
+    assert!(has(&kw("SELECT a FROM t GROUP BY a |", Oracle), "HAVING"));
+    assert!(has(&kw("SELECT a, count(*) FROM t GROUP BY a HAVING count(*) > 1 |", Oracle), "ORDER BY"));
+    assert!(has(&kw("SELECT a FROM t WHERE upper(a) = upper(b) |", Oracle), "ORDER BY"));
+    // MySQL uses LIMIT, never CONNECT BY / OFFSET-FETCH.
+    assert!(has(&kw("SELECT a FROM t WHERE a = 1 |", MySQL), "LIMIT"));
+    assert!(!has(&kw("SELECT a FROM t WHERE a = 1 |", MySQL), "CONNECT BY"));
+
+    // Incomplete / lookalike positions -> no openers.
+    for sql in [
+        "SELECT a FROM t WHERE a |",          // dangling operand (no comparison)
+        "SELECT a FROM t WHERE a = |",        // open operator
+        "SELECT a FROM t WHERE a = 1 AND |",  // open conjunction
+        "SELECT a FROM t WHERE a + 1 |",      // arithmetic, no comparison
+        "SELECT a FROM t WHERE x BETWEEN 1 |", // mid-construct (awaits AND)
+        "SELECT a FROM t WHERE obj IS A |",   // mid IS predicate (awaits SET)
+        "SELECT a FROM t WHERE obj IS OF TYPE |",
+        "SELECT a FROM t1, |",                // fresh table position
+        "SELECT a FROM t GROUP BY a, |",      // fresh group item
+        "SELECT a FROM t CONNECT BY PRIOR a = b ORDER SIBLINGS |", // partial opener
+    ] {
+        assert!(
+            !has(&kw(sql, Oracle), "ORDER BY") && !has(&kw(sql, Oracle), "GROUP BY"),
+            "clause opener leaked at incomplete position `{sql}`: {:?}",
+            kw(sql, Oracle)
+        );
+    }
+
+    // `IS NULL` *is* a complete predicate, so openers return there.
+    assert!(has(&kw("SELECT a FROM t WHERE a IS NULL |", Oracle), "ORDER BY"));
+
+    // DELETE/UPDATE are not SELECTs: Oracle offers no query clauses; MySQL allows
+    // only ORDER BY + LIMIT after the WHERE.
+    assert!(kw("DELETE FROM emp WHERE a = 1 |", Oracle).is_empty());
+    assert!(kw("UPDATE emp SET a = 1 WHERE b = 2 |", Oracle).is_empty());
+    assert_eq!(
+        kw("DELETE FROM emp WHERE a = 1 |", MySQL),
+        vec!["ORDER BY".to_string(), "LIMIT".to_string()]
+    );
+    assert!(!has(&kw("UPDATE emp SET a = 1 WHERE b = 2 |", MySQL), "GROUP BY"));
+}
+
+/// `INSERT/REPLACE INTO t (cols) |` offers the value source (`VALUES`/`SELECT`)
+/// and suppresses relations, mirroring the bare-target `INSERT INTO t |` slot.
+/// The hint must not re-appear once the source is supplied (`VALUES (…) |`).
+#[test]
+fn insert_after_column_list_offers_value_source() {
+    let kw = |sql: &str, db: crate::db::DatabaseType| {
+        let cursor = sql.find('|').expect("cursor marker");
+        let s = sql.replace('|', "");
+        let prefix = crate::ui::intellisense::get_word_at_cursor(&s, cursor).0;
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(db),
+        )
+    };
+    use crate::db::DatabaseType::{MySQL, Oracle};
+    let values_select = vec!["VALUES".to_string(), "SELECT".to_string()];
+    assert_eq!(kw("INSERT INTO emp (a, b) |", Oracle), values_select);
+    assert_eq!(kw("INSERT INTO emp |", Oracle), values_select);
+    assert_eq!(kw("INSERT INTO emp (a, b) |", MySQL), values_select);
+    assert_eq!(kw("REPLACE INTO emp (a) |", MySQL), values_select);
+    // Already-supplied source: no re-emission.
+    assert!(kw("INSERT INTO emp VALUES (1, 2) |", Oracle).is_empty());
+    assert!(kw("INSERT INTO emp (a, b) VALUES (1, 2) |", Oracle).is_empty());
 }
 
 #[test]
@@ -1249,6 +1425,129 @@ fn mysql_context_and_suggestions_for_inline_sql(
     );
 
     (context, suggestions)
+}
+
+fn audit_final_suggestions_for(
+    sql: &str,
+    db: crate::db::DatabaseType,
+) -> (Option<ExpectedObjectSuggestionKind>, Vec<String>, Vec<String>) {
+    let cursor = sql.find('|').unwrap();
+    let s = sql.replace('|', "");
+    let ctx = analyze_inline_cursor_sql(sql);
+    let context = SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+    let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&s, cursor);
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["EMP".to_string(), "DEPT".to_string()];
+    data.views = vec!["EMP_V".to_string()];
+    data.rebuild_indices();
+    let has = !prefix.is_empty();
+    let expr_keyword_ctx =
+        SqlEditorWidget::expression_keyword_context(&ctx, &data, &[], has, Some(db));
+    let expected_object_kind =
+        SqlEditorWidget::expected_object_suggestion_kind_for_db(&prefix, None, &ctx, Some(db));
+    let expected_object_suggestions =
+        SqlEditorWidget::collect_expected_object_suggestions_for_db(&mut data, &prefix, &ctx, Some(db));
+    let at_keyword_only = SqlEditorWidget::cursor_is_at_identifier_suppressing_keyword_slot_for_context(&ctx, has, Some(db))
+        || SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot_for_db(&ctx, has, Some(db));
+    let at_data_type = SqlEditorWidget::data_type_position_for_context_for_db(&ctx, has, Some(db)).is_some();
+    let mut suggestions = if expected_object_kind.is_some() {
+        expected_object_suggestions.clone()
+    } else if at_keyword_only && !at_data_type {
+        Vec::new()
+    } else {
+        SqlEditorWidget::base_suggestions_for_context(
+            &mut data,
+            &prefix,
+            None,
+            None,
+            matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
+            context,
+            false,
+            Some(db),
+            expr_keyword_ctx,
+        )
+    };
+    let expected_keywords =
+        SqlEditorWidget::collect_expected_keyword_suggestions_with_expression_context(
+            &prefix, &ctx, Some(db), Some(expr_keyword_ctx),
+        );
+    if !expected_keywords.is_empty() {
+        suggestions = SqlEditorWidget::merge_suggestions_with_context_aliases(
+            suggestions, expected_keywords.clone(), true,
+        );
+    }
+    (expected_object_kind, expected_keywords, suggestions)
+}
+
+#[test]
+#[ignore]
+fn audit_dump_completeness() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+    let oracle = [
+        // documented remaining false-negative gaps
+        "SELECT a FROM t FOR UPDATE OF c |",
+        "CREATE TABLE c (id NUMBER, FOREIGN KEY (id) REFERENCES p (id) ON |)",
+        "INSERT INTO emp (a, b) |",
+        "INSERT INTO emp |",
+        "INSERT INTO emp VALUES (1, 2) |",
+        "INSERT INTO emp (a, b) VALUES (1, 2) |",
+        "INSERT INTO emp (a, b) SELECT x, y FROM s |",
+        "CREATE TABLE t (id NUMBER |)",
+        "CREATE TABLE t (id NUMBER NOT |)",
+        "WITH c AS (SELECT 1 FROM dual) |",
+        "SELECT rank() | FROM t",
+        "BEGIN IF a = 1 | END IF; END;",
+        "BEGIN WHILE a < 1 | LOOP NULL; END LOOP; END;",
+        // more continuation edges
+        "SELECT a FROM t WHERE a = 1 GROUP BY a |",
+        "SELECT a FROM t WHERE a = 1 |",
+        "SELECT a FROM t t1 |",
+        "SELECT a FROM t WHERE a IN |",
+        "SELECT a FROM t WHERE a NOT |",
+        // incomplete positions - must NOT offer clause openers
+        "SELECT a FROM t WHERE a |",
+        "SELECT a FROM t WHERE a = |",
+        "SELECT a FROM t WHERE a = 1 AND |",
+        "SELECT a FROM t WHERE a + 1 |",
+        "SELECT a, |",
+        "SELECT a FROM t1, |",
+        "SELECT a FROM t GROUP BY a, |",
+        "SELECT a FROM t WHERE upper(a) = upper(b) |",
+        "SELECT a FROM (SELECT 1 FROM dual WHERE x = 1 |",
+        "SELECT a FROM t WHERE a = 1 AND b |",
+        "SELECT a FROM t CONNECT BY PRIOR a = b |",
+        "SELECT a FROM t START WITH a = 1 |",
+        "SELECT a FROM t WHERE a = 1 UNION SELECT b FROM s |",
+        "CREATE OR REPLACE |",
+        "ALTER TABLE emp |",
+        "ALTER TABLE emp MODIFY |",
+        "SELECT * FROM t PIVOT (|)",
+        "SELECT a FROM t WHERE a = 1 ORDER |",
+        "SELECT a FROM t WHERE a = 1 FOR |",
+        "DELETE FROM emp WHERE a = 1 |",
+        "UPDATE emp SET a = 1 WHERE b = 2 |",
+        "UPDATE emp SET a = 1 |",
+    ];
+    let mysql = [
+        "DELETE FROM emp WHERE a = 1 |",
+        "UPDATE emp SET a = 1 WHERE b = 2 |",
+        "SELECT a FROM t LIMIT 5 |",
+        "SELECT a FROM t WHERE a = 1 |",
+        "CREATE TABLE c (id INT, FOREIGN KEY (id) REFERENCES p (id) ON |)",
+        "INSERT INTO emp (a, b) |",
+        "SELECT a FROM t GROUP BY a |",
+        "SELECT a FROM t ORDER BY a |",
+        "SELECT a FROM t WHERE a = 1 ON DUPLICATE |",
+        "REPLACE INTO emp (a) |",
+    ];
+    for (db, label, set) in [(Oracle, "Oracle", &oracle[..]), (MySQL, "MySQL", &mysql[..])] {
+        println!("\n===== COMPLETENESS DUMP ({label}) =====");
+        for sql in set {
+            let (kind, kw, final_s) = audit_final_suggestions_for(sql, db);
+            let ctx = analyze_inline_cursor_sql(sql);
+            println!("SQL: {sql}\n  phase={:?} kind={kind:?} kw={kw:?}\n  final={final_s:?}\n", ctx.phase);
+        }
+    }
 }
 
 #[test]
@@ -26346,8 +26645,28 @@ fn json_on_target_keyword_slots_suppress_identifier_base() {
 fn data_type_table_named_columns_is_not_a_type_position() {
     use crate::db::DatabaseType::{Oracle, MySQL};
     // A table literally named/aliased around "columns" must never offer types.
-    assert!(data_type_suggestions("SELECT * FROM all_tab_columns c |", "", Oracle).is_empty());
-    assert!(data_type_suggestions("SELECT * FROM information_schema.columns x |", "", MySQL).is_empty());
+    // (The position *does* legitimately offer query-clause openers - `WHERE`,
+    // `GROUP BY`, `ORDER BY`, … after a complete FROM relation - so assert the
+    // absence of data-type keywords specifically rather than emptiness.)
+    let has_data_type = |v: &[String]| {
+        v.iter().any(|s| {
+            matches!(
+                s.to_ascii_uppercase().as_str(),
+                "NUMBER" | "VARCHAR2" | "VARCHAR" | "CHAR" | "DATE" | "TIMESTAMP" | "INT"
+                    | "INTEGER" | "BLOB" | "CLOB" | "DECIMAL" | "FLOAT"
+            )
+        })
+    };
+    assert!(!has_data_type(&data_type_suggestions(
+        "SELECT * FROM all_tab_columns c |",
+        "",
+        Oracle
+    )));
+    assert!(!has_data_type(&data_type_suggestions(
+        "SELECT * FROM information_schema.columns x |",
+        "",
+        MySQL
+    )));
     // Before the COLUMNS keyword (the JSON expression) is not a type slot either.
     assert!(data_type_suggestions(
         "SELECT * FROM JSON_TABLE(d| , '$' COLUMNS (id NUMBER PATH '$.id'))", "", Oracle).is_empty());
@@ -28196,19 +28515,44 @@ fn operand_type_operators_match_the_preceding_operand_type() {
 fn negated_and_collection_predicate_operators_are_position_aware() {
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
 
+    // After a *postfix* `NOT` (`x NOT |`) only the negated predicate operators
+    // are grammatical: it is a keyword-only slot, so the operator keywords come
+    // from the keyword-emission path while every identifier is suppressed (a
+    // column must not leak alongside, e.g. `empno NOT e|` is not a place for
+    // `ENAME`).
+    let kw = |sql: &str| {
+        let cursor = sql.find('|').expect("cursor marker");
+        let s = sql.replace('|', "");
+        let prefix = crate::ui::intellisense::get_word_at_cursor(&s, cursor).0;
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(crate::db::DatabaseType::Oracle),
+        )
+    };
     for (sql, keyword) in [
         ("SELECT * FROM emp WHERE empno NOT in|", "IN"),
         ("SELECT * FROM emp WHERE ename NOT li|", "LIKE"),
         ("SELECT * FROM emp WHERE empno NOT bet|", "BETWEEN"),
         ("SELECT * FROM emp WHERE empno NOT mem|", "MEMBER"),
-        ("SELECT * FROM emp WHERE empno mem|", "MEMBER"),
     ] {
-        let suggestions = typed_emp_suggestions(sql);
         assert!(
-            has(&suggestions, keyword),
-            "{keyword} suppressed for `{sql}`: {suggestions:?}"
+            has(&kw(sql), keyword),
+            "{keyword} not offered after postfix NOT for `{sql}`: {:?}",
+            kw(sql)
+        );
+        assert!(
+            typed_emp_suggestions(sql).is_empty(),
+            "identifier leaked after postfix NOT for `{sql}`: {:?}",
+            typed_emp_suggestions(sql)
         );
     }
+    // The collection `MEMBER` operator after a bare operand (no `NOT`) is an
+    // allowlist keyword, not a keyword-only slot, so it flows through the base.
+    assert!(
+        has(&typed_emp_suggestions("SELECT * FROM emp WHERE empno mem|"), "MEMBER"),
+        "MEMBER suppressed for bare-operand collection predicate"
+    );
 
     for (sql, keyword) in [
         ("SELECT * FROM emp WHERE NOT in|", "IN"),
@@ -28309,10 +28653,11 @@ fn negated_and_collection_predicate_operators_are_position_aware() {
                 expr_keyword_ctx,
             )
         };
-        for keyword in SqlEditorWidget::collect_expected_keyword_suggestions(
+        for keyword in SqlEditorWidget::collect_expected_keyword_suggestions_with_expression_context(
             &prefix,
             &ctx,
             Some(crate::db::DatabaseType::Oracle),
+            Some(expr_keyword_ctx),
         ) {
             if !suggestions
                 .iter()
