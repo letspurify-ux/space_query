@@ -25574,6 +25574,13 @@ fn operand_type_operators_match_the_preceding_operand_type() {
         "SELECT * FROM emp WHERE empno a|",
         "SELECT ename a| FROM emp",
         "SELECT 'x' a| FROM emp",
+        "SELECT LENGTH(ename) a| FROM emp",
+        "SELECT DATEDIFF(hiredate, hiredate) a| FROM emp",
+        "SELECT ROUND(empno) a| FROM emp",
+        "SELECT TRUNC(empno) a| FROM emp",
+        "SELECT COALESCE(empno, 0) a| FROM emp",
+        "SELECT NVL2(ename, empno, 0) a| FROM emp",
+        "SELECT LAG(empno) a| FROM emp",
     ] {
         let s = typed_emp_suggestions(sql);
         assert!(!has(&s, "AT"), "AT leaked after a non-datetime operand for `{sql}`: {s:?}");
@@ -25584,8 +25591,38 @@ fn operand_type_operators_match_the_preceding_operand_type() {
     assert!(has(&s, "COLLATE"), "COLLATE suppressed after a character operand: {s:?}");
     let s = typed_emp_suggestions("SELECT empno col| FROM emp");
     assert!(!has(&s, "COLLATE"), "COLLATE leaked after a numeric operand: {s:?}");
+    let s = typed_emp_suggestions("SELECT LENGTH(ename) col| FROM emp");
+    assert!(!has(&s, "COLLATE"), "COLLATE leaked after a numeric function: {s:?}");
+    let s = typed_emp_suggestions("SELECT ROUND(empno) col| FROM emp");
+    assert!(!has(&s, "COLLATE"), "COLLATE leaked after a numeric overloaded function: {s:?}");
+    let s = typed_emp_suggestions("SELECT COALESCE(empno, 0) col| FROM emp");
+    assert!(!has(&s, "COLLATE"), "COLLATE leaked after a numeric polymorphic function: {s:?}");
+    let s = typed_emp_suggestions("SELECT NVL2(ename, empno, 0) col| FROM emp");
+    assert!(!has(&s, "COLLATE"), "COLLATE leaked after a numeric polymorphic function: {s:?}");
+    let s = typed_emp_suggestions("SELECT LAG(empno) col| FROM emp");
+    assert!(!has(&s, "COLLATE"), "COLLATE leaked after a numeric analytic function: {s:?}");
     let s = typed_emp_suggestions("SELECT hiredate col| FROM emp");
     assert!(!has(&s, "COLLATE"), "COLLATE leaked after a datetime operand: {s:?}");
+    let s = typed_emp_suggestions("SELECT DATE_ADD(hiredate, INTERVAL 1 DAY) a| FROM emp");
+    assert!(has(&s, "AT"), "AT suppressed after a datetime function: {s:?}");
+    let s = typed_emp_suggestions("SELECT ROUND(hiredate) a| FROM emp");
+    assert!(has(&s, "AT"), "AT suppressed after a datetime overloaded function: {s:?}");
+    let s = typed_emp_suggestions("SELECT TRUNC(hiredate) a| FROM emp");
+    assert!(has(&s, "AT"), "AT suppressed after a datetime overloaded function: {s:?}");
+    let s = typed_emp_suggestions("SELECT COALESCE(hiredate, sysdate) a| FROM emp");
+    assert!(has(&s, "AT"), "AT suppressed after a datetime polymorphic function: {s:?}");
+    let s = typed_emp_suggestions("SELECT NVL2(ename, hiredate, sysdate) a| FROM emp");
+    assert!(has(&s, "AT"), "AT suppressed after a datetime polymorphic function: {s:?}");
+    let s = typed_emp_suggestions("SELECT FIRST_VALUE(hiredate) a| FROM emp");
+    assert!(has(&s, "AT"), "AT suppressed after a datetime analytic function: {s:?}");
+    let s = typed_emp_suggestions("SELECT DATE_FORMAT(hiredate, '%Y') col| FROM emp");
+    assert!(has(&s, "COLLATE"), "COLLATE suppressed after a character function: {s:?}");
+    let s = typed_emp_suggestions("SELECT COALESCE(ename, 'x') col| FROM emp");
+    assert!(has(&s, "COLLATE"), "COLLATE suppressed after a character polymorphic function: {s:?}");
+    let s = typed_emp_suggestions("SELECT NVL2(empno, ename, 'x') col| FROM emp");
+    assert!(has(&s, "COLLATE"), "COLLATE suppressed after a character polymorphic function: {s:?}");
+    let s = typed_emp_suggestions("SELECT LAG(ename) col| FROM emp");
+    assert!(has(&s, "COLLATE"), "COLLATE suppressed after a character analytic function: {s:?}");
 
     // When the operand's type cannot be resolved (an unknown identifier, not an
     // in-scope typed column) the operators are kept — a provable mismatch is
@@ -25594,6 +25631,25 @@ fn operand_type_operators_match_the_preceding_operand_type() {
     assert!(has(&s, "AT"), "AT wrongly suppressed after an unknown operand: {s:?}");
     let s = typed_emp_suggestions("SELECT unknown_col col| FROM emp");
     assert!(has(&s, "COLLATE"), "COLLATE wrongly suppressed after an unknown operand: {s:?}");
+    let s = typed_emp_suggestions("SELECT ROUND(unknown_col) a| FROM emp");
+    assert!(has(&s, "AT"), "AT wrongly suppressed after an unknown overloaded function: {s:?}");
+    let s = typed_emp_suggestions("SELECT ROUND(unknown_col) col| FROM emp");
+    assert!(
+        has(&s, "COLLATE"),
+        "COLLATE wrongly suppressed after an unknown overloaded function: {s:?}"
+    );
+    let s = typed_emp_suggestions("SELECT NVL2(ename, unknown_col, empno) col| FROM emp");
+    assert!(
+        has(&s, "COLLATE"),
+        "COLLATE wrongly suppressed after an unknown polymorphic return: {s:?}"
+    );
+    let s = typed_emp_suggestions("SELECT pkg.to_char() a| FROM emp");
+    assert!(has(&s, "AT"), "AT wrongly suppressed after a qualified call: {s:?}");
+    let s = typed_emp_suggestions("SELECT pkg.to_date() col| FROM emp");
+    assert!(
+        has(&s, "COLLATE"),
+        "COLLATE wrongly suppressed after a qualified call: {s:?}"
+    );
 
     // But never at an operand-start (these are postfix operators).
     let s = typed_emp_suggestions("SELECT * FROM emp WHERE empno = a|");
@@ -26870,6 +26926,11 @@ fn insert_set_rhs_slots_filter_columns_to_target_column_type() {
         "HIREDATE",
         &["ENAME", "EMPNO"],
     );
+    assert_only(
+        "INSERT INTO emp SET empno = TIMESTAMPDIFF(DAY, |, hiredate)",
+        "HIREDATE",
+        &["ENAME", "EMPNO"],
+    );
 
     let unknown_target =
         typed_emp_suggestions_for_db("INSERT INTO emp SET missing_col = (|)", MySQL);
@@ -27213,6 +27274,9 @@ fn numeric_function_argument_slots_filter_columns_to_numeric_operands() {
             "SELECT VARIANCE(|) FROM emp",
             "SELECT NUMTODSINTERVAL(|, 'DAY') FROM emp",
             "SELECT NUMTOYMINTERVAL(|, 'MONTH') FROM emp",
+            "SELECT REGEXP_SUBSTR(ename, 'A', |) FROM emp",
+            "SELECT REGEXP_SUBSTR(ename, 'A', 1, 1, 'i', |) FROM emp",
+            "SELECT REGEXP_INSTR(ename, 'A', |) FROM emp",
         ] {
             assert_numeric_only(sql, db_type);
         }
@@ -27522,10 +27586,15 @@ fn character_function_argument_slots_filter_columns_to_character_operands() {
     for db_type in [Oracle, MySQL] {
         for sql in [
             "SELECT UPPER(|) FROM emp",
+            "SELECT LENGTH(|) FROM emp",
+            "SELECT CHAR_LENGTH(|) FROM emp",
+            "SELECT ASCII(|) FROM emp",
             "SELECT REPLACE(ename, |) FROM emp",
             "SELECT SUBSTR(|, 1) FROM emp",
             "SELECT LPAD(ename, 5, |) FROM emp",
             "SELECT INSTR(ename, |) FROM emp",
+            "SELECT REGEXP_LIKE(ename, |) FROM emp",
+            "SELECT REGEXP_SUBSTR(ename, 'A', 1, 1, |) FROM emp",
             "SELECT TRIM(|) FROM emp",
             "SELECT TRIM(LEADING | FROM ename) FROM emp",
             "SELECT TRIM(LEADING 'x' FROM |) FROM emp",
@@ -27575,11 +27644,11 @@ fn extract_source_slots_filter_columns_to_datetime_operands() {
 
 #[test]
 fn datetime_function_argument_slots_filter_columns_to_datetime_operands() {
-    use crate::db::DatabaseType::Oracle;
+    use crate::db::DatabaseType::{MySQL, Oracle};
 
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
-    let assert_datetime_only = |sql: &str| {
-        let suggestions = typed_emp_suggestions_for_db(sql, Oracle);
+    let assert_datetime_only = |sql: &str, db_type| {
+        let suggestions = typed_emp_suggestions_for_db(sql, db_type);
         assert!(
             has(&suggestions, "HIREDATE"),
             "datetime function argument lost datetime columns for `{sql}`: {suggestions:?}"
@@ -27589,8 +27658,8 @@ fn datetime_function_argument_slots_filter_columns_to_datetime_operands() {
             "datetime function argument leaked non-datetime columns for `{sql}`: {suggestions:?}"
         );
     };
-    let assert_numeric_only = |sql: &str| {
-        let suggestions = typed_emp_suggestions_for_db(sql, Oracle);
+    let assert_numeric_only = |sql: &str, db_type| {
+        let suggestions = typed_emp_suggestions_for_db(sql, db_type);
         assert!(
             has(&suggestions, "EMPNO"),
             "datetime function numeric argument lost numeric columns for `{sql}`: {suggestions:?}"
@@ -27607,12 +27676,77 @@ fn datetime_function_argument_slots_filter_columns_to_datetime_operands() {
         "SELECT LAST_DAY(|) FROM emp",
         "SELECT NEXT_DAY(|, 'MONDAY') FROM emp",
     ] {
-        assert_datetime_only(sql);
+        assert_datetime_only(sql, Oracle);
     }
 
     for sql in ["SELECT ADD_MONTHS(hiredate, |) FROM emp"] {
-        assert_numeric_only(sql);
+        assert_numeric_only(sql, Oracle);
     }
+
+    for sql in [
+        "SELECT DATEDIFF(|, hiredate) FROM emp",
+        "SELECT DATEDIFF(hiredate, |) FROM emp",
+        "SELECT TIMESTAMPDIFF(DAY, |, hiredate) FROM emp",
+        "SELECT TIMESTAMPDIFF(DAY, hiredate, |) FROM emp",
+        "SELECT TIMESTAMPADD(DAY, 1, |) FROM emp",
+        "SELECT DATE_ADD(|, INTERVAL 1 DAY) FROM emp",
+        "SELECT DATE_SUB(|, INTERVAL 1 DAY) FROM emp",
+    ] {
+        assert_datetime_only(sql, MySQL);
+    }
+
+    for sql in ["SELECT TIMESTAMPADD(DAY, |, hiredate) FROM emp"] {
+        assert_numeric_only(sql, MySQL);
+    }
+}
+
+#[test]
+fn overloaded_function_argument_slots_filter_to_supported_type_families() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let assert_has = |sql: &str, db_type, expected: &[&str], unexpected: &[&str]| {
+        let suggestions = typed_emp_suggestions_for_db(sql, db_type);
+        for name in expected {
+            assert!(
+                has(&suggestions, name),
+                "overloaded function argument lost `{name}` for `{sql}`: {suggestions:?}"
+            );
+        }
+        for name in unexpected {
+            assert!(
+                !has(&suggestions, name),
+                "overloaded function argument leaked `{name}` for `{sql}`: {suggestions:?}"
+            );
+        }
+    };
+
+    for sql in ["SELECT ROUND(|) FROM emp", "SELECT TRUNC(|) FROM emp"] {
+        assert_has(sql, Oracle, &["EMPNO", "HIREDATE"], &["ENAME"]);
+    }
+
+    for sql in ["SELECT ROUND(|) FROM emp", "SELECT TRUNCATE(|, 1) FROM emp"] {
+        assert_has(sql, MySQL, &["EMPNO"], &["ENAME", "HIREDATE"]);
+    }
+    assert_has(
+        "SELECT ROUND(hiredate, |) FROM emp",
+        MySQL,
+        &["EMPNO"],
+        &["ENAME", "HIREDATE"],
+    );
+
+    assert_has(
+        "SELECT ROUND(empno, |) FROM emp",
+        Oracle,
+        &["EMPNO"],
+        &["ENAME", "HIREDATE"],
+    );
+    assert_has(
+        "SELECT ROUND(hiredate, |) FROM emp",
+        Oracle,
+        &["ENAME"],
+        &["EMPNO", "HIREDATE"],
+    );
 }
 
 #[test]

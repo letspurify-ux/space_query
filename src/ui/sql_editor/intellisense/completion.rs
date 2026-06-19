@@ -3424,9 +3424,9 @@ impl SqlEditorWidget {
 
     /// Best-effort type of the operand immediately before `end`, used to gate the
     /// operand-type postfix operators. Recognises string/datetime literals,
-    /// datetime niladic functions, the return type of common datetime/character
-    /// built-ins (by the name before a closed call), and the declared type of an
-    /// in-scope column. Everything else is `Unknown`.
+    /// datetime niladic functions, the return type of common built-ins (by the
+    /// name before a closed call, with narrow argument-sensitive cases), and the
+    /// declared type of an in-scope column. Everything else is `Unknown`.
     fn preceding_operand_type(
         tokens: &[SqlToken],
         end: usize,
@@ -3451,10 +3451,7 @@ impl SqlEditorWidget {
                 }
             }
             Some(SqlToken::Symbol(sym)) if sym == ")" => {
-                match Self::call_name_before_close(&before) {
-                    Some(name) => Self::function_return_operand_type(&name),
-                    None => PrecedingOperandType::Unknown,
-                }
+                Self::function_return_operand_type_before_close(&before, data, column_scope)
             }
             Some(SqlToken::Word(word)) => {
                 let upper = word.to_ascii_uppercase();
@@ -3642,9 +3639,15 @@ impl SqlEditorWidget {
             return Some(ExpectedOperandTypes::Single(expected_type));
         }
         if let Some(expected_type) =
-            Self::current_function_argument_expected_type(tokens, end, data, column_scope)
+            Self::current_function_argument_expected_type(
+                tokens,
+                end,
+                data,
+                column_scope,
+                mysql_compatible,
+            )
         {
-            return Some(ExpectedOperandTypes::Single(expected_type));
+            return Some(expected_type);
         }
         if Self::cursor_is_at_extract_source_operand(tokens, end) {
             return Some(ExpectedOperandTypes::Single(PrecedingOperandType::Datetime));
@@ -3696,7 +3699,8 @@ impl SqlEditorWidget {
         end: usize,
         data: &IntellisenseData,
         column_scope: &[String],
-    ) -> Option<PrecedingOperandType> {
+        mysql_compatible: bool,
+    ) -> Option<ExpectedOperandTypes> {
         let limit = end.min(tokens.len());
         let mut depth = 0i32;
         let mut open_idx = None;
@@ -3720,7 +3724,17 @@ impl SqlEditorWidget {
         let function_name = Self::unqualified_function_name_before_open(tokens, open_idx)?;
         let argument_index = Self::current_function_argument_index(tokens, open_idx, limit);
 
-        Self::function_argument_expected_type(&function_name, argument_index).or_else(|| {
+        Self::function_argument_expected_type(
+            &function_name,
+            argument_index,
+            tokens,
+            open_idx,
+            limit,
+            data,
+            column_scope,
+            mysql_compatible,
+        )
+        .or_else(|| {
             Self::polymorphic_function_argument_expected_type(
                 &function_name,
                 argument_index,
@@ -3730,6 +3744,7 @@ impl SqlEditorWidget {
                 data,
                 column_scope,
             )
+            .map(ExpectedOperandTypes::Single)
         })
     }
 
@@ -3802,7 +3817,13 @@ impl SqlEditorWidget {
     fn function_argument_expected_type(
         name: &str,
         argument_index: usize,
-    ) -> Option<PrecedingOperandType> {
+        tokens: &[SqlToken],
+        open_idx: usize,
+        limit: usize,
+        data: &IntellisenseData,
+        column_scope: &[String],
+        mysql_compatible: bool,
+    ) -> Option<ExpectedOperandTypes> {
         const NUMERIC_ARGUMENT_FUNCTIONS: &[&str] = &[
             "ABS", "ACOS", "ASIN", "ATAN", "ATAN2", "CEIL", "CEILING", "COS", "COSH", "EXP",
             "FLOOR", "LN", "LOG", "MOD", "POWER", "POW", "REMAINDER", "SIGN", "SIN", "SINH",
@@ -3810,10 +3831,21 @@ impl SqlEditorWidget {
             "VARIANCE", "VAR_POP", "VAR_SAMP",
         ];
         const CHARACTER_ARGUMENT_FUNCTIONS: &[&str] = &[
+            "ASCII",
+            "BIT_LENGTH",
+            "CHAR_LENGTH",
+            "CHARACTER_LENGTH",
             "CONCAT",
             "INITCAP",
+            "LENGTH",
+            "LENGTH2",
+            "LENGTH4",
+            "LENGTHB",
+            "LENGTHC",
             "LOWER",
             "LTRIM",
+            "OCTET_LENGTH",
+            "REGEXP_LIKE",
             "REPLACE",
             "REVERSE",
             "RTRIM",
@@ -3825,16 +3857,16 @@ impl SqlEditorWidget {
         const DATETIME_ARGUMENT_FUNCTIONS: &[&str] = &["LAST_DAY"];
 
         if NUMERIC_ARGUMENT_FUNCTIONS.contains(&name) {
-            return Some(PrecedingOperandType::Numeric);
+            return Some(ExpectedOperandTypes::Single(PrecedingOperandType::Numeric));
         }
         if CHARACTER_ARGUMENT_FUNCTIONS.contains(&name) {
-            return Some(PrecedingOperandType::Character);
+            return Some(ExpectedOperandTypes::Single(PrecedingOperandType::Character));
         }
         if DATETIME_ARGUMENT_FUNCTIONS.contains(&name) {
-            return Some(PrecedingOperandType::Datetime);
+            return Some(ExpectedOperandTypes::Single(PrecedingOperandType::Datetime));
         }
 
-        match name {
+        let operand_type = match name {
             "SUBSTR" | "SUBSTRB" | "SUBSTRING" => match argument_index {
                 0 => Some(PrecedingOperandType::Character),
                 1 | 2 => Some(PrecedingOperandType::Numeric),
@@ -3855,9 +3887,21 @@ impl SqlEditorWidget {
                 2 => Some(PrecedingOperandType::Numeric),
                 _ => None,
             },
-            "REGEXP_REPLACE" | "REGEXP_SUBSTR" => match argument_index {
+            "REGEXP_REPLACE" => match argument_index {
                 0 | 1 | 2 => Some(PrecedingOperandType::Character),
                 3 | 4 => Some(PrecedingOperandType::Numeric),
+                5 => Some(PrecedingOperandType::Character),
+                _ => None,
+            },
+            "REGEXP_SUBSTR" => match argument_index {
+                0 | 1 => Some(PrecedingOperandType::Character),
+                2 | 3 | 5 => Some(PrecedingOperandType::Numeric),
+                4 => Some(PrecedingOperandType::Character),
+                _ => None,
+            },
+            "REGEXP_INSTR" => match argument_index {
+                0 | 1 => Some(PrecedingOperandType::Character),
+                2 | 3 | 4 | 6 => Some(PrecedingOperandType::Numeric),
                 5 => Some(PrecedingOperandType::Character),
                 _ => None,
             },
@@ -3868,6 +3912,23 @@ impl SqlEditorWidget {
             },
             "MONTHS_BETWEEN" => match argument_index {
                 0 | 1 => Some(PrecedingOperandType::Datetime),
+                _ => None,
+            },
+            "DATEDIFF" => match argument_index {
+                0 | 1 => Some(PrecedingOperandType::Datetime),
+                _ => None,
+            },
+            "TIMESTAMPDIFF" => match argument_index {
+                1 | 2 => Some(PrecedingOperandType::Datetime),
+                _ => None,
+            },
+            "TIMESTAMPADD" => match argument_index {
+                1 => Some(PrecedingOperandType::Numeric),
+                2 => Some(PrecedingOperandType::Datetime),
+                _ => None,
+            },
+            "DATE_ADD" | "DATE_SUB" | "ADDDATE" | "SUBDATE" => match argument_index {
+                0 => Some(PrecedingOperandType::Datetime),
                 _ => None,
             },
             "NEXT_DAY" | "FROM_TZ" => match argument_index {
@@ -3896,6 +3957,63 @@ impl SqlEditorWidget {
                 1 => Some(PrecedingOperandType::Numeric),
                 _ => None,
             },
+            _ => None,
+        };
+        if let Some(operand_type) = operand_type {
+            return Some(ExpectedOperandTypes::Single(operand_type));
+        }
+
+        Self::overloaded_function_argument_expected_type(
+            name,
+            argument_index,
+            tokens,
+            open_idx,
+            limit,
+            data,
+            column_scope,
+            mysql_compatible,
+        )
+    }
+
+    fn overloaded_function_argument_expected_type(
+        name: &str,
+        argument_index: usize,
+        tokens: &[SqlToken],
+        open_idx: usize,
+        limit: usize,
+        data: &IntellisenseData,
+        column_scope: &[String],
+        mysql_compatible: bool,
+    ) -> Option<ExpectedOperandTypes> {
+        match name {
+            "ROUND" if argument_index == 0 && mysql_compatible => {
+                Some(ExpectedOperandTypes::Single(PrecedingOperandType::Numeric))
+            }
+            "ROUND" if argument_index == 1 && mysql_compatible => {
+                Some(ExpectedOperandTypes::Single(PrecedingOperandType::Numeric))
+            }
+            "ROUND" | "TRUNC" if argument_index == 0 => {
+                Some(ExpectedOperandTypes::AnyOf(DATETIME_OR_NUMERIC_OPERAND_TYPES))
+            }
+            "TRUNCATE" if mysql_compatible && argument_index == 0 => {
+                Some(ExpectedOperandTypes::Single(PrecedingOperandType::Numeric))
+            }
+            "ROUND" | "TRUNC" if argument_index == 1 => {
+                let (start, end) =
+                    Self::top_level_function_argument_bounds_before_cursor(tokens, open_idx, limit, 0)?;
+                match Self::expected_type_from_argument_range(tokens, start, end, data, column_scope)? {
+                    PrecedingOperandType::Datetime => {
+                        Some(ExpectedOperandTypes::Single(PrecedingOperandType::Character))
+                    }
+                    PrecedingOperandType::Numeric | PrecedingOperandType::FloatingNumeric => {
+                        Some(ExpectedOperandTypes::Single(PrecedingOperandType::Numeric))
+                    }
+                    _ => None,
+                }
+            }
+            "TRUNCATE" if mysql_compatible && argument_index == 1 => {
+                Some(ExpectedOperandTypes::Single(PrecedingOperandType::Numeric))
+            }
             _ => None,
         }
     }
@@ -5970,10 +6088,7 @@ impl SqlEditorWidget {
         PrecedingOperandType::Other
     }
 
-    /// The function/identifier name immediately before the call whose closing `)`
-    /// is the last token of `before`, or `None` when the `)` closes a plain
-    /// parenthesised group rather than a call.
-    fn call_name_before_close(before: &[&SqlToken]) -> Option<String> {
+    fn call_name_and_open_index_before_close(before: &[&SqlToken]) -> Option<(String, usize)> {
         let mut depth = 0i32;
         let mut open_index = None;
         for (index, token) in before.iter().enumerate().rev() {
@@ -5990,29 +6105,194 @@ impl SqlEditorWidget {
             }
         }
         let open_index = open_index?;
-        match open_index.checked_sub(1).and_then(|i| before.get(i)) {
-            Some(SqlToken::Word(word)) => Some(word.to_ascii_uppercase()),
+        let name_index = open_index.checked_sub(1)?;
+        if matches!(
+            name_index.checked_sub(1).and_then(|i| before.get(i)),
+            Some(SqlToken::Symbol(sym)) if sym == "."
+        ) {
+            return None;
+        }
+        match before.get(name_index) {
+            Some(SqlToken::Word(word)) => Some((word.to_ascii_uppercase(), open_index)),
             _ => None,
         }
     }
 
-    /// Operand type produced by a named built-in. Only the unambiguous
-    /// datetime/character producers are listed; anything else is `Unknown` so the
-    /// type-gated operators stay withheld rather than guessed.
+    /// The function/identifier name immediately before the call whose closing `)`
+    /// is the last token of `before`, or `None` when the `)` closes a plain
+    /// parenthesised group rather than a call.
+    fn call_name_before_close(before: &[&SqlToken]) -> Option<String> {
+        Self::call_name_and_open_index_before_close(before).map(|(name, _)| name)
+    }
+
+    fn function_return_operand_type_before_close(
+        before: &[&SqlToken],
+        data: &IntellisenseData,
+        column_scope: &[String],
+    ) -> PrecedingOperandType {
+        let Some((name, open_idx)) = Self::call_name_and_open_index_before_close(before) else {
+            return PrecedingOperandType::Unknown;
+        };
+        if Self::function_return_depends_on_arguments(&name) {
+            let tokens: Vec<SqlToken> = before.iter().map(|token| (*token).clone()).collect();
+            let close_idx = tokens.len().saturating_sub(1);
+            if let Some(return_type) = Self::argument_sensitive_function_return_operand_type(
+                &name,
+                &tokens,
+                open_idx,
+                close_idx,
+                data,
+                column_scope,
+            ) {
+                return return_type;
+            }
+        }
+        Self::function_return_operand_type(&name)
+    }
+
+    fn function_return_depends_on_arguments(name: &str) -> bool {
+        matches!(
+            name,
+            "ROUND"
+                | "TRUNC"
+                | "COALESCE"
+                | "GREATEST"
+                | "LEAST"
+                | "NVL"
+                | "IFNULL"
+                | "NULLIF"
+                | "NVL2"
+                | "LAG"
+                | "LEAD"
+                | "FIRST_VALUE"
+                | "LAST_VALUE"
+                | "NTH_VALUE"
+        )
+    }
+
+    fn argument_sensitive_function_return_operand_type(
+        name: &str,
+        tokens: &[SqlToken],
+        open_idx: usize,
+        close_idx: usize,
+        data: &IntellisenseData,
+        column_scope: &[String],
+    ) -> Option<PrecedingOperandType> {
+        let return_argument_indexes: &[usize] = match name {
+            "ROUND" | "TRUNC" => &[0],
+            "NVL2" => &[1],
+            "COALESCE" | "GREATEST" | "LEAST" | "NVL" | "IFNULL" | "NULLIF" | "LAG" | "LEAD"
+            | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" => &[0],
+            _ => return None,
+        };
+
+        for argument_index in return_argument_indexes {
+            let Some(argument_type) = Self::closed_call_argument_type(
+                tokens,
+                open_idx,
+                close_idx,
+                *argument_index,
+                data,
+                column_scope,
+            ) else {
+                continue;
+            };
+            return match name {
+                "ROUND" | "TRUNC" => match argument_type {
+                    PrecedingOperandType::Datetime => Some(PrecedingOperandType::Datetime),
+                    PrecedingOperandType::Numeric | PrecedingOperandType::FloatingNumeric => {
+                        Some(PrecedingOperandType::Numeric)
+                    }
+                    _ => None,
+                },
+                _ => Some(argument_type),
+            };
+        }
+        None
+    }
+
+    fn closed_call_argument_type(
+        tokens: &[SqlToken],
+        open_idx: usize,
+        close_idx: usize,
+        argument_index: usize,
+        data: &IntellisenseData,
+        column_scope: &[String],
+    ) -> Option<PrecedingOperandType> {
+        let (start, end) =
+            Self::top_level_function_argument_bounds_before_cursor(tokens, open_idx, close_idx, argument_index)?;
+        Self::expected_type_from_argument_range(tokens, start, end, data, column_scope)
+    }
+
+    /// Operand type produced by a named built-in. Only unambiguous
+    /// datetime/character/numeric producers are listed; anything else is
+    /// `Unknown` so the type-gated operators stay withheld rather than guessed.
     fn function_return_operand_type(name: &str) -> PrecedingOperandType {
         const DATETIME_FUNCTIONS: &[&str] = &[
             "TO_DATE", "TO_TIMESTAMP", "TO_TIMESTAMP_TZ", "FROM_TZ", "ADD_MONTHS", "LAST_DAY",
-            "NEXT_DAY", "NUMTODSINTERVAL", "NUMTOYMINTERVAL",
+            "NEXT_DAY", "DATE_ADD", "DATE_SUB", "ADDDATE", "SUBDATE", "TIMESTAMPADD",
+            "NUMTODSINTERVAL", "NUMTOYMINTERVAL",
         ];
         const CHARACTER_FUNCTIONS: &[&str] = &[
             "TO_CHAR", "TO_NCHAR", "SUBSTR", "SUBSTRB", "UPPER", "LOWER", "INITCAP", "TRIM",
             "LTRIM", "RTRIM", "LPAD", "RPAD", "REPLACE", "CONCAT", "REGEXP_REPLACE",
-            "REGEXP_SUBSTR", "NVL2", "TRANSLATE", "REVERSE", "SOUNDEX",
+            "REGEXP_SUBSTR", "TRANSLATE", "REVERSE", "SOUNDEX", "DATE_FORMAT", "TIME_FORMAT",
+        ];
+        const NUMERIC_FUNCTIONS: &[&str] = &[
+            "ABS",
+            "ACOS",
+            "ASCII",
+            "ASIN",
+            "ATAN",
+            "ATAN2",
+            "AVG",
+            "BIT_LENGTH",
+            "CEIL",
+            "CEILING",
+            "CHAR_LENGTH",
+            "CHARACTER_LENGTH",
+            "COS",
+            "COSH",
+            "DATEDIFF",
+            "EXP",
+            "EXTRACT",
+            "FLOOR",
+            "LENGTH",
+            "LENGTH2",
+            "LENGTH4",
+            "LENGTHB",
+            "LENGTHC",
+            "LN",
+            "LOG",
+            "MOD",
+            "OCTET_LENGTH",
+            "POWER",
+            "POW",
+            "REMAINDER",
+            "SIGN",
+            "SIN",
+            "SINH",
+            "SQRT",
+            "STDDEV",
+            "STDDEV_POP",
+            "STDDEV_SAMP",
+            "SUM",
+            "TAN",
+            "TANH",
+            "TIMESTAMPDIFF",
+            "TO_BINARY_DOUBLE",
+            "TO_BINARY_FLOAT",
+            "TO_NUMBER",
+            "VARIANCE",
+            "VAR_POP",
+            "VAR_SAMP",
         ];
         if DATETIME_FUNCTIONS.contains(&name) {
             PrecedingOperandType::Datetime
         } else if CHARACTER_FUNCTIONS.contains(&name) {
             PrecedingOperandType::Character
+        } else if NUMERIC_FUNCTIONS.contains(&name) {
+            PrecedingOperandType::Numeric
         } else {
             PrecedingOperandType::Unknown
         }
