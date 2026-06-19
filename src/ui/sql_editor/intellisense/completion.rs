@@ -6178,11 +6178,21 @@ impl SqlEditorWidget {
         data: &IntellisenseData,
         column_scope: &[String],
     ) -> Option<PrecedingOperandType> {
+        if matches!(name, "COALESCE" | "NVL" | "IFNULL") {
+            return Self::first_non_null_return_argument_type(
+                tokens,
+                open_idx,
+                close_idx,
+                data,
+                column_scope,
+            );
+        }
+
         let return_argument_indexes: &[usize] = match name {
             "ROUND" | "TRUNC" => &[0],
             "NVL2" => &[1],
-            "COALESCE" | "GREATEST" | "LEAST" | "NVL" | "IFNULL" | "NULLIF" | "LAG" | "LEAD"
-            | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" => &[0],
+            "GREATEST" | "LEAST" | "NULLIF" | "LAG" | "LEAD" | "FIRST_VALUE" | "LAST_VALUE"
+            | "NTH_VALUE" => &[0],
             _ => return None,
         };
 
@@ -6211,6 +6221,26 @@ impl SqlEditorWidget {
         None
     }
 
+    fn first_non_null_return_argument_type(
+        tokens: &[SqlToken],
+        open_idx: usize,
+        close_idx: usize,
+        data: &IntellisenseData,
+        column_scope: &[String],
+    ) -> Option<PrecedingOperandType> {
+        let mut argument_index = 0usize;
+        while let Some((start, end)) =
+            Self::top_level_function_argument_bounds_before_cursor(tokens, open_idx, close_idx, argument_index)
+        {
+            if Self::argument_range_is_null_literal(tokens, start, end) {
+                argument_index += 1;
+                continue;
+            }
+            return Self::expected_type_from_argument_range(tokens, start, end, data, column_scope);
+        }
+        None
+    }
+
     fn closed_call_argument_type(
         tokens: &[SqlToken],
         open_idx: usize,
@@ -6222,6 +6252,16 @@ impl SqlEditorWidget {
         let (start, end) =
             Self::top_level_function_argument_bounds_before_cursor(tokens, open_idx, close_idx, argument_index)?;
         Self::expected_type_from_argument_range(tokens, start, end, data, column_scope)
+    }
+
+    fn argument_range_is_null_literal(tokens: &[SqlToken], start: usize, end: usize) -> bool {
+        let mut meaningful = tokens
+            .get(start..end.min(tokens.len()))
+            .unwrap_or(&[])
+            .iter()
+            .filter(|token| !matches!(token, SqlToken::Comment(_)));
+        matches!(meaningful.next(), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("NULL"))
+            && meaningful.next().is_none()
     }
 
     /// Operand type produced by a named built-in. Only unambiguous

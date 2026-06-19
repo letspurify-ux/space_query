@@ -25579,6 +25579,7 @@ fn operand_type_operators_match_the_preceding_operand_type() {
         "SELECT ROUND(empno) a| FROM emp",
         "SELECT TRUNC(empno) a| FROM emp",
         "SELECT COALESCE(empno, 0) a| FROM emp",
+        "SELECT COALESCE(NULL, empno) a| FROM emp",
         "SELECT NVL2(ename, empno, 0) a| FROM emp",
         "SELECT LAG(empno) a| FROM emp",
     ] {
@@ -25597,6 +25598,11 @@ fn operand_type_operators_match_the_preceding_operand_type() {
     assert!(!has(&s, "COLLATE"), "COLLATE leaked after a numeric overloaded function: {s:?}");
     let s = typed_emp_suggestions("SELECT COALESCE(empno, 0) col| FROM emp");
     assert!(!has(&s, "COLLATE"), "COLLATE leaked after a numeric polymorphic function: {s:?}");
+    let s = typed_emp_suggestions("SELECT NVL(NULL, empno) col| FROM emp");
+    assert!(
+        !has(&s, "COLLATE"),
+        "COLLATE leaked after a NULL-leading numeric polymorphic function: {s:?}"
+    );
     let s = typed_emp_suggestions("SELECT NVL2(ename, empno, 0) col| FROM emp");
     assert!(!has(&s, "COLLATE"), "COLLATE leaked after a numeric polymorphic function: {s:?}");
     let s = typed_emp_suggestions("SELECT LAG(empno) col| FROM emp");
@@ -25611,6 +25617,11 @@ fn operand_type_operators_match_the_preceding_operand_type() {
     assert!(has(&s, "AT"), "AT suppressed after a datetime overloaded function: {s:?}");
     let s = typed_emp_suggestions("SELECT COALESCE(hiredate, sysdate) a| FROM emp");
     assert!(has(&s, "AT"), "AT suppressed after a datetime polymorphic function: {s:?}");
+    let s = typed_emp_suggestions("SELECT COALESCE(NULL, hiredate) a| FROM emp");
+    assert!(
+        has(&s, "AT"),
+        "AT suppressed after a NULL-leading datetime polymorphic function: {s:?}"
+    );
     let s = typed_emp_suggestions("SELECT NVL2(ename, hiredate, sysdate) a| FROM emp");
     assert!(has(&s, "AT"), "AT suppressed after a datetime polymorphic function: {s:?}");
     let s = typed_emp_suggestions("SELECT FIRST_VALUE(hiredate) a| FROM emp");
@@ -25619,6 +25630,11 @@ fn operand_type_operators_match_the_preceding_operand_type() {
     assert!(has(&s, "COLLATE"), "COLLATE suppressed after a character function: {s:?}");
     let s = typed_emp_suggestions("SELECT COALESCE(ename, 'x') col| FROM emp");
     assert!(has(&s, "COLLATE"), "COLLATE suppressed after a character polymorphic function: {s:?}");
+    let s = typed_emp_suggestions("SELECT COALESCE(NULL, ename) col| FROM emp");
+    assert!(
+        has(&s, "COLLATE"),
+        "COLLATE suppressed after a NULL-leading character polymorphic function: {s:?}"
+    );
     let s = typed_emp_suggestions("SELECT NVL2(empno, ename, 'x') col| FROM emp");
     assert!(has(&s, "COLLATE"), "COLLATE suppressed after a character polymorphic function: {s:?}");
     let s = typed_emp_suggestions("SELECT LAG(ename) col| FROM emp");
@@ -25642,6 +25658,11 @@ fn operand_type_operators_match_the_preceding_operand_type() {
     assert!(
         has(&s, "COLLATE"),
         "COLLATE wrongly suppressed after an unknown polymorphic return: {s:?}"
+    );
+    let s = typed_emp_suggestions("SELECT COALESCE(unknown_col, empno) col| FROM emp");
+    assert!(
+        has(&s, "COLLATE"),
+        "COLLATE wrongly suppressed after an unknown-leading polymorphic return: {s:?}"
     );
     let s = typed_emp_suggestions("SELECT pkg.to_char() a| FROM emp");
     assert!(has(&s, "AT"), "AT wrongly suppressed after a qualified call: {s:?}");
