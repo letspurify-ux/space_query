@@ -414,6 +414,7 @@ enum IntervalUnitSlot {
 
 /// Fixed keyword tail of an `ORDER BY` sort key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 enum OrderBySortModifierSlot {
     /// `<sort-key> |` - a complete sort key with no modifier yet: `ASC`/`DESC`
     /// (direction) or `NULLS` (null-ordering) can follow before the next key.
@@ -430,6 +431,7 @@ enum OrderBySortModifierSlot {
 
 /// Fixed keyword tail of an `ORDER BY` item inside a window specification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 enum WindowOrderBySortModifierSlot {
     /// `<sort-key> |` - direction/null-ordering/frame-unit keywords can follow.
     AfterSortKey,
@@ -443,6 +445,7 @@ enum WindowOrderBySortModifierSlot {
 
 /// Keyword position within a window frame clause.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 enum WindowFrameKeywordSlot {
     /// `ROWS|RANGE|GROUPS |` - a bound expression may also follow.
     AfterUnit,
@@ -492,6 +495,7 @@ enum WithinGroupSlot {
 /// `FIRST_VALUE(...) IGNORE NULLS OVER (...)`,
 /// `NTH_VALUE(...) FROM LAST RESPECT NULLS OVER (...)`, etc.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 enum AnalyticNullTreatmentSlot {
     /// `<analytic-call> |` - `IGNORE`/`RESPECT`, or `FROM` for `NTH_VALUE`.
     AfterAnalyticCall,
@@ -726,12 +730,12 @@ fn window_frame_keywords_for(slot: WindowFrameKeywordSlot) -> &'static [&'static
 }
 
 fn window_frame_slot_suppresses_columns(slot: WindowFrameKeywordSlot) -> bool {
-    match slot {
+    !matches!(
+        slot,
         WindowFrameKeywordSlot::AfterUnit
-        | WindowFrameKeywordSlot::AfterBetween
-        | WindowFrameKeywordSlot::AfterAnd => false,
-        _ => true,
-    }
+            | WindowFrameKeywordSlot::AfterBetween
+            | WindowFrameKeywordSlot::AfterAnd
+    )
 }
 
 fn keep_dense_rank_keywords(slot: KeepDenseRankSlot) -> &'static [&'static str] {
@@ -984,6 +988,32 @@ impl SqlEditorWidget {
 
     fn context_suppresses_completion(context: SqlContext) -> bool {
         matches!(context, SqlContext::GeneratedName)
+    }
+
+    fn cursor_alias_declaration_blocks_completion(
+        cursor_in_alias_declaration: bool,
+        qualifier: Option<&str>,
+        prefix: &str,
+        deep_ctx: &intellisense_context::CursorContext,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if qualifier.is_some() || !cursor_in_alias_declaration {
+            return false;
+        }
+
+        let prefix_upper = prefix.to_ascii_uppercase();
+        let prefix_is_keyword = match db_type {
+            Some(db_type) => crate::sql_text::is_sql_keyword_for_db(&prefix_upper, db_type),
+            None => crate::sql_text::is_oracle_sql_keyword(&prefix_upper),
+        };
+        if prefix_is_keyword {
+            return false;
+        }
+
+        Self::collect_expected_keyword_suggestions_with_expression_context(
+            prefix, deep_ctx, db_type, None,
+        )
+        .is_empty()
     }
 
     pub(super) fn trigger_intellisense(
@@ -1516,7 +1546,13 @@ impl SqlEditorWidget {
         // brand-new identifier; offering keywords, columns or relations there is
         // always irrelevant. Suppress uniformly, regardless of the clause.
         if Self::context_suppresses_completion(context)
-            || (qualifier.is_none() && analysis.cursor_in_alias_declaration)
+            || Self::cursor_alias_declaration_blocks_completion(
+                analysis.cursor_in_alias_declaration,
+                qualifier,
+                &snapshot.prefix,
+                deep_ctx,
+                Some(snapshot.preferred_db_type),
+            )
             || deep_ctx.ddl_new_name_position
             || Self::cursor_is_at_ddl_identifier_suppression_slot_for_context(
                 deep_ctx,
@@ -2268,6 +2304,12 @@ impl SqlEditorWidget {
             runtime.clear_pending_intellisense();
         }
 
+        Self::append_exact_catalog_keyword_suggestion(
+            &mut suggestions,
+            &snapshot.prefix,
+            Some(snapshot.preferred_db_type),
+        );
+
         if suggestions.is_empty() {
             intellisense_popup
                 .lock()
@@ -2578,7 +2620,42 @@ impl SqlEditorWidget {
                 });
             }
         }
+        Self::append_exact_catalog_keyword_suggestion(&mut suggestions, prefix, db_type);
+        if prefer_columns {
+            suggestions.retain(|suggestion| {
+                Self::expression_suggestion_is_relevant(
+                    data,
+                    suggestion,
+                    column_scope,
+                    db_type,
+                    expr_keyword_ctx,
+                )
+            });
+        }
         suggestions
+    }
+
+    fn append_exact_catalog_keyword_suggestion(
+        suggestions: &mut Vec<String>,
+        prefix: &str,
+        db_type: Option<crate::db::DatabaseType>,
+    ) {
+        if prefix.is_empty() {
+            return;
+        }
+
+        let upper = prefix.to_ascii_uppercase();
+        let is_keyword = match db_type {
+            Some(db_type) => crate::sql_text::is_sql_keyword_for_db(&upper, db_type),
+            None => crate::sql_text::is_oracle_sql_keyword(&upper),
+        };
+        if is_keyword
+            && !suggestions
+                .iter()
+                .any(|suggestion| suggestion.eq_ignore_ascii_case(&upper))
+        {
+            suggestions.insert(0, upper);
+        }
     }
 
     /// Whether a single base-catalog entry can stand where the cursor begins a
@@ -3077,7 +3154,7 @@ impl SqlEditorWidget {
         // Mirrors the flag `collect_expected_keyword_suggestions` already passes.
         let end =
             Self::expected_suggestion_context_end(tokens, cursor_len, exclude_current_identifier_chain);
-        let follows_operand = Self::cursor_follows_complete_operand(tokens, end);
+        let mut follows_operand = Self::cursor_follows_complete_operand(tokens, end);
         let construct_continuation_keywords =
             Self::expected_expression_construct_continuation_keywords(tokens, end);
         // The analytic/aggregate continuations (`OVER`/`KEEP`/`WITHIN`)
@@ -3105,6 +3182,14 @@ impl SqlEditorWidget {
             Self::postfix_not_index_after_left_operand(tokens, end);
         let follows_negated_predicate_operator_anchor =
             negated_predicate_operator_not_idx.is_some();
+        if negated_predicate_operator_not_idx.is_none()
+            && matches!(
+                Self::meaningful_tokens_before(tokens, end).last(),
+                Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("NOT")
+            )
+        {
+            follows_operand = Some(false);
+        }
         let negated_predicate_left_operand_type = negated_predicate_operator_not_idx
             .map(|not_idx| Self::preceding_operand_type(tokens, not_idx, data, column_scope))
             .unwrap_or(PrecedingOperandType::Unknown);
@@ -4195,7 +4280,7 @@ impl SqlEditorWidget {
                 _ => None,
             },
             "REGEXP_REPLACE" => match argument_index {
-                0 | 1 | 2 => Some(PrecedingOperandType::Character),
+                0..=2 => Some(PrecedingOperandType::Character),
                 3 | 4 => Some(PrecedingOperandType::Numeric),
                 5 => Some(PrecedingOperandType::Character),
                 _ => None,
@@ -4252,7 +4337,7 @@ impl SqlEditorWidget {
                 _ => None,
             },
             "TO_NUMBER" | "TO_BINARY_FLOAT" | "TO_BINARY_DOUBLE" => match argument_index {
-                0 | 1 | 2 => Some(PrecedingOperandType::Character),
+                0..=2 => Some(PrecedingOperandType::Character),
                 _ => None,
             },
             "NUMTODSINTERVAL" | "NUMTOYMINTERVAL" => match argument_index {
@@ -4405,8 +4490,13 @@ impl SqlEditorWidget {
         let mut argument_index = 0usize;
         let mut argument_start = open_idx.saturating_add(1);
         let mut nested = 0i32;
-        for idx in (open_idx + 1)..limit.min(tokens.len()) {
-            match &tokens[idx] {
+        for (idx, token) in tokens
+            .iter()
+            .enumerate()
+            .take(limit.min(tokens.len()))
+            .skip(open_idx + 1)
+        {
+            match token {
                 SqlToken::Symbol(sym) if sym == "(" || sym == "[" => nested += 1,
                 SqlToken::Symbol(sym) if sym == ")" || sym == "]" => {
                     if nested > 0 {
@@ -4442,8 +4532,13 @@ impl SqlEditorWidget {
         let mut argument_index = 0usize;
         let mut argument_start = open_idx.saturating_add(1);
         let mut nested = 0i32;
-        for idx in (open_idx + 1)..close_idx.min(tokens.len()) {
-            match &tokens[idx] {
+        for (idx, token) in tokens
+            .iter()
+            .enumerate()
+            .take(close_idx.min(tokens.len()))
+            .skip(open_idx + 1)
+        {
+            match token {
                 SqlToken::Symbol(sym) if sym == "(" || sym == "[" => nested += 1,
                 SqlToken::Symbol(sym) if sym == ")" || sym == "]" => {
                     if nested > 0 {
@@ -4568,8 +4663,8 @@ impl SqlEditorWidget {
         let mut case_depth = 1i32;
         let mut nested = 0i32;
         let mut pending_result_start = None;
-        for idx in active_result_start..tokens.len() {
-            match &tokens[idx] {
+        for (idx, token) in tokens.iter().enumerate().skip(active_result_start) {
+            match token {
                 SqlToken::Symbol(sym) if sym == "(" || sym == "[" => nested += 1,
                 SqlToken::Symbol(sym) if sym == ")" || sym == "]" => {
                     if nested > 0 {
@@ -4663,8 +4758,13 @@ impl SqlEditorWidget {
         let mut ranges = Vec::new();
         let mut case_depth = 1i32;
         let mut result_start = None;
-        for idx in (open_idx + 1)..close_idx.min(tokens.len()) {
-            match &tokens[idx] {
+        for (idx, token) in tokens
+            .iter()
+            .enumerate()
+            .take(close_idx.min(tokens.len()))
+            .skip(open_idx + 1)
+        {
+            match token {
                 SqlToken::Word(word) if word.eq_ignore_ascii_case("CASE") => case_depth += 1,
                 SqlToken::Word(word) if word.eq_ignore_ascii_case("END") => {
                     if case_depth > 1 {
@@ -5636,8 +5736,13 @@ impl SqlEditorWidget {
             return None;
         }
         let mut depth = 0i32;
-        for idx in open_idx..limit.min(tokens.len()) {
-            match &tokens[idx] {
+        for (idx, token) in tokens
+            .iter()
+            .enumerate()
+            .take(limit.min(tokens.len()))
+            .skip(open_idx)
+        {
+            match token {
                 SqlToken::Symbol(sym) if sym == "(" => depth += 1,
                 SqlToken::Symbol(sym) if sym == ")" => {
                     depth -= 1;
@@ -5683,8 +5788,12 @@ impl SqlEditorWidget {
         let mut index = 0usize;
         let mut depth = 0i32;
         let mut current_identifier: Option<String> = None;
-        for idx in (open_idx + 1)..close_idx.min(tokens.len()) {
-            match &tokens[idx] {
+        for token in tokens
+            .iter()
+            .take(close_idx.min(tokens.len()))
+            .skip(open_idx + 1)
+        {
+            match token {
                 SqlToken::Symbol(sym) if sym == "(" || sym == "[" => depth += 1,
                 SqlToken::Symbol(sym) if sym == ")" || sym == "]" => {
                     if depth > 0 {
@@ -6026,8 +6135,8 @@ impl SqlEditorWidget {
 
     fn top_level_between_and_after(tokens: &[SqlToken], start: usize) -> Option<usize> {
         let mut depth = 0i32;
-        for idx in start.min(tokens.len())..tokens.len() {
-            match &tokens[idx] {
+        for (idx, token) in tokens.iter().enumerate().skip(start.min(tokens.len())) {
+            match token {
                 SqlToken::Comment(_) => {}
                 SqlToken::Symbol(sym) if sym == "(" || sym == "[" => depth += 1,
                 SqlToken::Symbol(sym) if sym == ")" || sym == "]" => {
@@ -6063,10 +6172,16 @@ impl SqlEditorWidget {
         data: &IntellisenseData,
         column_scope: &[String],
     ) -> Option<PrecedingOperandType> {
-        let mut argument_start = start.min(tokens.len());
+        let first_argument_start = start.min(tokens.len());
+        let mut argument_start = first_argument_start;
         let mut nested = 0i32;
-        for idx in argument_start..end.min(tokens.len()) {
-            match &tokens[idx] {
+        for (idx, token) in tokens
+            .iter()
+            .enumerate()
+            .take(end.min(tokens.len()))
+            .skip(first_argument_start)
+        {
+            match token {
                 SqlToken::Symbol(sym) if sym == "(" || sym == "[" => nested += 1,
                 SqlToken::Symbol(sym) if sym == ")" || sym == "]" => {
                     if nested > 0 {
@@ -6320,8 +6435,8 @@ impl SqlEditorWidget {
     fn following_operand_end(tokens: &[SqlToken], start: usize) -> Option<usize> {
         let mut depth = 0i32;
         let mut end = None;
-        for idx in start..tokens.len() {
-            match &tokens[idx] {
+        for (idx, token) in tokens.iter().enumerate().skip(start) {
+            match token {
                 SqlToken::Comment(_) => {}
                 SqlToken::Symbol(sym) if sym == "(" || sym == "[" => {
                     depth += 1;
@@ -6758,7 +6873,7 @@ impl SqlEditorWidget {
     }
 
     fn classifiable_operand_type_display(type_display: &str) -> Option<PrecedingOperandType> {
-        let operand_type = Self::classify_type_display(&type_display);
+        let operand_type = Self::classify_type_display(type_display);
         match operand_type {
             PrecedingOperandType::Datetime
             | PrecedingOperandType::Character
@@ -6784,8 +6899,13 @@ impl SqlEditorWidget {
         target: &str,
     ) -> Option<usize> {
         let mut nested = 0i32;
-        for idx in (open_idx + 1)..close_idx.min(tokens.len()) {
-            match &tokens[idx] {
+        for (idx, token) in tokens
+            .iter()
+            .enumerate()
+            .take(close_idx.min(tokens.len()))
+            .skip(open_idx + 1)
+        {
+            match token {
                 SqlToken::Symbol(sym) if sym == "(" || sym == "[" => nested += 1,
                 SqlToken::Symbol(sym) if sym == ")" || sym == "]" => {
                     if nested > 0 {
@@ -7713,7 +7833,7 @@ impl SqlEditorWidget {
             idx += 1;
         }
 
-        for frame in stack.iter().rev() {
+        if let Some(frame) = stack.iter().next_back() {
             match frame {
                 Frame::Between { .. } => {
                     return if follows_operand == Some(true) {
@@ -7888,6 +8008,7 @@ impl SqlEditorWidget {
         end: usize,
     ) -> Option<&'static [&'static str]> {
         const FETCH_KEYWORDS: &[&str] = &["FETCH"];
+        const FETCH_DIRECTION_KEYWORDS: &[&str] = &["FIRST", "NEXT"];
         const OFFSET_KEYWORDS: &[&str] = &["OFFSET"];
         const ROW_UNIT_KEYWORDS: &[&str] = &["ROW", "ROWS"];
         const ONLY_WITH_KEYWORDS: &[&str] = &["ONLY", "WITH"];
@@ -7903,6 +8024,10 @@ impl SqlEditorWidget {
             tail(from_end)
                 .is_some_and(|(value, is_bind)| Self::is_row_count_tail_word(value, *is_bind))
         };
+
+        if len >= 1 && word(1) == Some("FETCH") {
+            return Some(FETCH_DIRECTION_KEYWORDS);
+        }
 
         if len >= 2
             && word(2).is_some_and(Self::is_row_limit_unit)
@@ -9188,6 +9313,9 @@ impl SqlEditorWidget {
     /// Classify whether the cursor sits where a SQL data type is expected, and in
     /// which kind of position (the keyword set differs for some dialects).
     fn data_type_position(tokens: &[SqlToken], end: usize) -> Option<DataTypePosition> {
+        if Self::cursor_follows_definitely_non_type_keyword(tokens, end) {
+            return None;
+        }
         if Self::cursor_is_after_cast_as(tokens, end) {
             return Some(DataTypePosition::Cast);
         }
@@ -9210,6 +9338,17 @@ impl SqlEditorWidget {
             return Some(DataTypePosition::TypeObject);
         }
         None
+    }
+
+    fn cursor_follows_definitely_non_type_keyword(tokens: &[SqlToken], end: usize) -> bool {
+        matches!(
+            Self::meaningful_tokens_before(tokens, end).last(),
+            Some(SqlToken::Word(word))
+                if matches!(
+                    word.to_ascii_uppercase().as_str(),
+                    "CONSTRAINT" | "DEFAULT" | "NULL" | "NOT" | "PRIMARY" | "FOREIGN" | "UNIQUE" | "CHECK"
+                )
+        )
     }
 
     fn cursor_is_at_tool_variable_type(tokens: &[SqlToken], end: usize) -> bool {
@@ -9592,9 +9731,7 @@ impl SqlEditorWidget {
         db_type: Option<crate::db::DatabaseType>,
     ) -> Option<&'static [&'static str]> {
         let toks = Self::meaningful_tokens_before(tokens, end);
-        let Some(last) = toks.len().checked_sub(1) else {
-            return None;
-        };
+        let last = toks.len().checked_sub(1)?;
         if !matches!(toks.get(last), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("ON"))
             || matches!(
                 toks.get(last.checked_sub(1).unwrap_or(last)),
@@ -10630,9 +10767,7 @@ impl SqlEditorWidget {
             .enumerate()
             .filter(|(_, token)| !matches!(token, SqlToken::Comment(_)))
             .collect();
-        let Some(open_pos) = meaningful.len().checked_sub(1) else {
-            return None;
-        };
+        let open_pos = meaningful.len().checked_sub(1)?;
         let Some((_, SqlToken::Symbol(sym))) = meaningful.get(open_pos).copied() else {
             return None;
         };
@@ -11226,6 +11361,28 @@ impl SqlEditorWidget {
         Self::order_by_sort_modifier_slot(tokens, end, deep_ctx.phase)
     }
 
+    fn cursor_is_inside_within_group_clause(tokens: &[SqlToken], end: usize) -> bool {
+        let mut paren_depth: i32 = 0;
+        for (idx, token) in tokens.iter().take(end.min(tokens.len())).enumerate().rev() {
+            match token {
+                SqlToken::Comment(_) => {}
+                SqlToken::Symbol(sym) if sym == ")" => paren_depth += 1,
+                SqlToken::Symbol(sym) if sym == "(" => {
+                    if paren_depth == 0 {
+                        let before = Self::previous_meaningful_words_upper(tokens, idx, 2);
+                        return matches!(
+                            before.as_slice(),
+                            [within, group] if within == "WITHIN" && group == "GROUP"
+                        );
+                    }
+                    paren_depth -= 1;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
     /// True when the cursor sits at a "pure clause-keyword continuation" slot:
     /// immediately after a clause-starter keyword whose only grammatical
     /// continuation is another fixed keyword, never an identifier. These are the
@@ -11366,7 +11523,7 @@ impl SqlEditorWidget {
 
         let mysql_compatible = crate::sql_text::mysql_compatibility_for_sql("", db_type);
         let allow_collection_predicate_tail =
-            left_operand_type.is_none_or(|ty| ty == PrecedingOperandType::Collection);
+            left_operand_type == Some(PrecedingOperandType::Collection);
         let allow_floating_predicate_tail = left_operand_type.is_none_or(|ty| {
             matches!(
                 ty,
@@ -11944,6 +12101,1306 @@ impl SqlEditorWidget {
     /// actually complete, so the popup gains the missing `ORDER BY`/`GROUP BY`/…
     /// hints without admitting anything ungrammatical. `ORDER BY` itself is
     /// excluded here - its sort-modifier/row-limiting tails own that phase.
+    fn expected_select_list_from_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> Option<&'static [&'static str]> {
+        let mut depth = 0i32;
+        let mut has_top_level_from_before_cursor = false;
+        for token in tokens.iter().take(end.min(tokens.len())) {
+            match token {
+                SqlToken::Symbol(sym) if sym == "(" => depth += 1,
+                SqlToken::Symbol(sym) if sym == ")" => depth = (depth - 1).max(0),
+                SqlToken::Word(word) if depth == 0 && word.eq_ignore_ascii_case("FROM") => {
+                    has_top_level_from_before_cursor = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let mut after_depth = depth;
+        let has_top_level_from_after_cursor = tokens
+            .iter()
+            .skip(end.min(tokens.len()))
+            .any(|token| {
+                match token {
+                    SqlToken::Symbol(sym) if sym == "(" => {
+                        after_depth += 1;
+                        false
+                    }
+                    SqlToken::Symbol(sym) if sym == ")" => {
+                        after_depth = (after_depth - 1).max(0);
+                        false
+                    }
+                    SqlToken::Word(word) if after_depth == 0 && word.eq_ignore_ascii_case("FROM") => {
+                        true
+                    }
+                    _ => false,
+                }
+            });
+
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        let current_projection_is_dml_head_word = matches!(
+            toks.last(),
+            Some(SqlToken::Word(word))
+                if matches!(word.to_ascii_uppercase().as_str(), "DELETE" | "INSERT" | "MERGE")
+        );
+        if Self::unclosed_paren_count(tokens, end) != 0
+            || has_top_level_from_before_cursor
+            || (has_top_level_from_after_cursor && current_projection_is_dml_head_word)
+            || !Self::expected_expression_construct_continuation_keywords(tokens, end).is_empty()
+        {
+            return None;
+        }
+
+        if !toks.iter().any(|token| {
+            matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("SELECT"))
+        }) {
+            return None;
+        }
+
+        let follows_complete_projection = match toks.last() {
+            Some(SqlToken::Word(word)) => !matches!(
+                word.to_ascii_uppercase().as_str(),
+                "SELECT" | "DISTINCT" | "ALL" | "UNIQUE" | "DISTINCTROW" | "AS"
+            ),
+            Some(SqlToken::Symbol(sym)) => sym == "*" || sym == ")",
+            Some(SqlToken::String(_)) => true,
+            Some(SqlToken::Comment(_)) | None => false,
+        };
+
+        follows_complete_projection.then_some(&["FROM"])
+    }
+
+    fn expected_select_modifier_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        if Self::unclosed_paren_count(tokens, end) != 0 {
+            return None;
+        }
+
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        if !matches!(
+            toks.last(),
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("SELECT")
+        ) {
+            return None;
+        }
+
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            Some(&[
+                "ALL",
+                "DISTINCT",
+                "DISTINCTROW",
+                "HIGH_PRIORITY",
+                "STRAIGHT_JOIN",
+                "SQL_BIG_RESULT",
+                "SQL_BUFFER_RESULT",
+                "SQL_CALC_FOUND_ROWS",
+                "SQL_CACHE",
+                "SQL_NO_CACHE",
+                "SQL_SMALL_RESULT",
+            ])
+        } else {
+            Some(&["ALL", "DISTINCT", "UNIQUE"])
+        }
+    }
+
+    fn expected_create_table_column_definition_tail_keywords(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        let visible_end = end.min(tokens.len());
+        let mut depth = 0i32;
+        let mut create_table_def_open = None;
+        for (idx, token) in tokens.iter().take(visible_end).enumerate() {
+            match token {
+                SqlToken::Symbol(sym) if sym == "(" => {
+                    depth += 1;
+                    if depth == 1 {
+                        create_table_def_open = Some(idx);
+                    }
+                }
+                SqlToken::Symbol(sym) if sym == ")" => depth = (depth - 1).max(0),
+                _ => {}
+            }
+        }
+        let def_open = create_table_def_open?;
+        if depth <= 0 {
+            return None;
+        }
+
+        let before_def = Self::meaningful_tokens_before(&tokens[..def_open], def_open);
+        let mut saw_create_table = false;
+        let mut idx = 0;
+        while idx + 1 < before_def.len() {
+            if matches!(
+                (&before_def[idx], &before_def[idx + 1]),
+                (SqlToken::Word(create), SqlToken::Word(table))
+                    if create.eq_ignore_ascii_case("CREATE")
+                        && table.eq_ignore_ascii_case("TABLE")
+            ) {
+                saw_create_table = true;
+                break;
+            }
+            idx += 1;
+        }
+        if !saw_create_table {
+            return None;
+        }
+
+        let after_def_open = Self::meaningful_tokens_before(&tokens[def_open + 1..visible_end], visible_end - def_open - 1);
+        if after_def_open
+            .last()
+            .is_some_and(|token| matches!(token, SqlToken::Symbol(sym) if sym == "," || sym == "("))
+        {
+            return None;
+        }
+        let words_after_open = after_def_open
+            .iter()
+            .filter(|token| matches!(token, SqlToken::Word(_)))
+            .count();
+        if words_after_open < 2 {
+            return None;
+        }
+
+        let words = Self::previous_meaningful_words_upper(tokens, visible_end, 4);
+        match words.as_slice() {
+            [.., last] if last == "PRIMARY" => Some(&["KEY"]),
+            [.., last] if last == "NOT" => Some(&["NULL"]),
+            [.., last] if last == "GENERATED" => Some(&["ALWAYS", "BY"]),
+            [.., prev, last] if prev == "GENERATED" && last == "BY" => Some(&["DEFAULT"]),
+            [.., prev, last] if prev == "BY" && last == "DEFAULT" => Some(&["ON"]),
+            [.., prev, last] if prev == "DEFAULT" && last == "ON" => Some(&["NULL"]),
+            _ if crate::sql_text::mysql_compatibility_for_sql("", db_type) => Some(&[
+                "AUTO_INCREMENT",
+                "CHECK",
+                "COLLATE",
+                "COMMENT",
+                "CONSTRAINT",
+                "DEFAULT",
+                "GENERATED",
+                "INVISIBLE",
+                "NOT NULL",
+                "NULL",
+                "PRIMARY KEY",
+                "REFERENCES",
+                "UNIQUE",
+                "VISIBLE",
+            ]),
+            _ => Some(&[
+                "CHECK",
+                "COLLATE",
+                "CONSTRAINT",
+                "DEFAULT",
+                "GENERATED",
+                "IDENTITY",
+                "INVISIBLE",
+                "NOT NULL",
+                "NULL",
+                "PRIMARY KEY",
+                "REFERENCES",
+                "UNIQUE",
+                "VISIBLE",
+            ]),
+        }
+    }
+
+    fn expected_dml_trailing_clause_keywords(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        if Self::unclosed_paren_count(tokens, end) != 0 {
+            return None;
+        }
+
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        let words = toks
+            .iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let head = words.first()?.as_str();
+        let mysql = crate::sql_text::mysql_compatibility_for_sql("", db_type);
+        let contains = |keyword: &str| words.iter().any(|word| word == keyword);
+        let has_returning = contains("RETURNING");
+        let complete_assignment_or_predicate = Self::cursor_follows_complete_predicate(tokens, end);
+
+        match head {
+            "UPDATE" if contains("SET") && !has_returning && complete_assignment_or_predicate => {
+                if contains("WHERE") {
+                    if mysql {
+                        Some(&["ORDER BY", "LIMIT"])
+                    } else {
+                        Some(&["RETURNING"])
+                    }
+                } else if mysql {
+                    Some(&["WHERE", "ORDER BY", "LIMIT"])
+                } else {
+                    Some(&["WHERE", "RETURNING"])
+                }
+            }
+            "DELETE" if contains("WHERE") && !has_returning && complete_assignment_or_predicate => {
+                if mysql {
+                    Some(&["ORDER BY", "LIMIT"])
+                } else {
+                    Some(&["RETURNING"])
+                }
+            }
+            "INSERT"
+                if contains("VALUES")
+                    && !has_returning
+                    && Self::cursor_immediately_follows_complete_operand(tokens, end) =>
+            {
+                if mysql {
+                    Some(&["ON DUPLICATE KEY UPDATE"])
+                } else {
+                    Some(&["RETURNING"])
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn expected_table_sample_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        phase: intellisense_context::SqlPhase,
+    ) -> Option<&'static [&'static str]> {
+        if !phase.is_table_context() {
+            return None;
+        }
+
+        let words = Self::previous_meaningful_words_upper(tokens, end, 1);
+        matches!(words.last().map(String::as_str), Some("SAMPLE")).then_some(&["BLOCK"])
+    }
+
+    fn expected_flashback_query_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        phase: intellisense_context::SqlPhase,
+    ) -> Option<&'static [&'static str]> {
+        if !phase.is_table_context() {
+            return None;
+        }
+
+        let words = Self::previous_meaningful_words_upper(tokens, end, 6);
+        match words.as_slice() {
+            [.., last] if last == "AS" => Some(&["OF"]),
+            [.., prev, last] if prev == "AS" && last == "OF" => Some(&["SCN", "TIMESTAMP"]),
+            [.., last] if last == "VERSIONS" => Some(&["BETWEEN"]),
+            [.., prev, last] if prev == "VERSIONS" && last == "BETWEEN" => {
+                Some(&["SCN", "TIMESTAMP"])
+            }
+            [.., versions, between, kind, _value]
+                if versions == "VERSIONS"
+                    && between == "BETWEEN"
+                    && matches!(kind.as_str(), "SCN" | "TIMESTAMP")
+                    && Self::cursor_immediately_follows_complete_operand(tokens, end) =>
+            {
+                Some(&["AND"])
+            }
+            _ => None,
+        }
+    }
+
+    fn expected_statement_tail_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return None;
+        }
+
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        let words = toks
+            .iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        let position_after = |keyword: &str| {
+            words
+                .iter()
+                .rposition(|word| word == keyword)
+                .map(|idx| words.len().saturating_sub(idx + 1))
+        };
+
+        match words.as_slice() {
+            [comment, on] if comment == "COMMENT" && on == "ON" => {
+                return Some(&["COLUMN", "TABLE", "VIEW", "MATERIALIZED", "EDITIONING"])
+            }
+            [alter, session] if alter == "ALTER" && session == "SESSION" => return Some(&["SET"]),
+            [truncate] if truncate == "TRUNCATE" => return Some(&["TABLE"]),
+            [.., truncate, table, _name] if truncate == "TRUNCATE" && table == "TABLE" => {
+                return Some(&["DROP STORAGE", "REUSE STORAGE", "CASCADE"])
+            }
+            [.., truncate, table, _name, drop_or_reuse]
+                if truncate == "TRUNCATE"
+                    && table == "TABLE"
+                    && matches!(drop_or_reuse.as_str(), "DROP" | "REUSE") =>
+            {
+                return Some(&["STORAGE"])
+            }
+            [.., drop, table, _name] if drop == "DROP" && table == "TABLE" => {
+                return Some(&["CASCADE", "PURGE"])
+            }
+            [.., drop, table, _name, cascade]
+                if drop == "DROP" && table == "TABLE" && cascade == "CASCADE" =>
+            {
+                return Some(&["CONSTRAINTS"])
+            }
+            _ => {}
+        }
+
+        if words.first().is_some_and(|word| word == "CREATE") {
+            if let Some(1) = position_after("SEQUENCE") {
+                return Some(&[
+                    "START WITH",
+                    "INCREMENT BY",
+                    "MINVALUE",
+                    "MAXVALUE",
+                    "NOMINVALUE",
+                    "NOMAXVALUE",
+                    "CACHE",
+                    "NOCACHE",
+                    "CYCLE",
+                    "NOCYCLE",
+                    "ORDER",
+                    "NOORDER",
+                ]);
+            }
+            match words.as_slice() {
+                [.., sequence, last] if sequence == "SEQUENCE" && last == "START" => {
+                    return Some(&["WITH"])
+                }
+                [.., sequence, last] if sequence == "SEQUENCE" && last == "INCREMENT" => {
+                    return Some(&["BY"])
+                }
+                _ => {}
+            }
+
+            if position_after("INDEX") == Some(1) {
+                return Some(&["ON"]);
+            }
+            if position_after("SYNONYM") == Some(1) {
+                return Some(&["FOR"]);
+            }
+        }
+
+        match words.as_slice() {
+            [alter, table, _name] if alter == "ALTER" && table == "TABLE" => {
+                Some(&["ADD", "DROP", "MODIFY", "RENAME"])
+            }
+            _ => None,
+        }
+    }
+
+    fn expected_transaction_and_dcl_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        if Self::unclosed_paren_count(tokens, end) != 0 {
+            return None;
+        }
+
+        let mysql = crate::sql_text::mysql_compatibility_for_sql("", db_type);
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        let visible_words = toks
+            .iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let full_words = tokens
+            .iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let words = if visible_words.is_empty()
+            || (matches!(visible_words.as_slice(), [set] if set == "SET")
+                && matches!(full_words.as_slice(), [set, transaction, ..] if set == "SET" && transaction == "TRANSACTION"))
+        {
+            full_words
+        } else {
+            visible_words
+        };
+        let current_word = tokens.get(end).and_then(|token| match token {
+            SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+            _ => None,
+        });
+        let contains = |keyword: &str| words.iter().any(|word| word == keyword);
+        let lock_statement = words.first().is_some_and(|word| word == "LOCK");
+
+        if matches!(
+            (words.as_slice(), current_word.as_deref()),
+            ([set], Some("TRANSACTION")) if set == "SET"
+        ) {
+            return Some(&["READ", "ISOLATION", "USE", "NAME"]);
+        }
+
+        if words.first().is_some_and(|word| word == "GRANT")
+            && contains("ON")
+            && !contains("TO")
+            && words.last().is_some_and(|word| word != "ON")
+        {
+            return Some(&["TO"]);
+        }
+        if words.first().is_some_and(|word| word == "GRANT") && contains("TO") {
+            return Some(&["WITH GRANT OPTION"]);
+        }
+        if words.first().is_some_and(|word| word == "REVOKE")
+            && contains("ON")
+            && !contains("FROM")
+            && words.last().is_some_and(|word| word != "ON")
+        {
+            return Some(&["FROM"]);
+        }
+
+        match words.as_slice() {
+            [commit] if commit == "COMMIT" && mysql => {
+                Some(&["WORK", "AND", "CHAIN", "NO", "RELEASE"])
+            }
+            [commit] if commit == "COMMIT" => Some(&["WORK", "COMMENT", "WRITE", "FORCE"]),
+            [.., commit, write] if commit == "COMMIT" && write == "WRITE" => {
+                Some(&["WAIT", "NOWAIT", "IMMEDIATE", "BATCH"])
+            }
+            [rollback] if rollback == "ROLLBACK" && mysql => {
+                Some(&["WORK", "AND", "CHAIN", "NO", "RELEASE", "TO", "TO SAVEPOINT"])
+            }
+            [rollback] if rollback == "ROLLBACK" => Some(&["WORK", "TO SAVEPOINT", "FORCE"]),
+            [rollback, to] if rollback == "ROLLBACK" && to == "TO" => Some(&["SAVEPOINT"]),
+            [set, transaction] if set == "SET" && transaction == "TRANSACTION" => {
+                Some(&["READ", "ISOLATION", "USE", "NAME"])
+            }
+            [set, transaction, read] if set == "SET" && transaction == "TRANSACTION" && read == "READ" => {
+                Some(&["ONLY", "WRITE"])
+            }
+            [set, transaction, isolation]
+                if set == "SET" && transaction == "TRANSACTION" && isolation == "ISOLATION" =>
+            {
+                Some(&["LEVEL"])
+            }
+            [set, transaction, isolation, level]
+                if set == "SET"
+                    && transaction == "TRANSACTION"
+                    && isolation == "ISOLATION"
+                    && level == "LEVEL" =>
+            {
+                Some(&["SERIALIZABLE", "READ COMMITTED"])
+            }
+            [start] if mysql && start == "START" => {
+                Some(&["TRANSACTION", "REPLICA", "SLAVE"])
+            }
+            [start, transaction] if mysql && start == "START" && transaction == "TRANSACTION" => {
+                Some(&["READ", "WITH"])
+            }
+            [lock] if mysql && lock == "LOCK" => Some(&["TABLES", "INSTANCE"]),
+            [lock] if lock == "LOCK" => Some(&["TABLE"]),
+            [lock, table, _name] if !mysql && lock == "LOCK" && table == "TABLE" => Some(&["IN"]),
+            [lock, table, _name, in_word]
+                if !mysql && lock == "LOCK" && table == "TABLE" && in_word == "IN" =>
+            {
+                Some(&["ROW", "SHARE", "EXCLUSIVE"])
+            }
+            [.., in_word, row] if !mysql && lock_statement && in_word == "IN" && row == "ROW" => {
+                Some(&["SHARE", "EXCLUSIVE"])
+            }
+            [.., in_word, share]
+                if !mysql && lock_statement && in_word == "IN" && share == "SHARE" =>
+            {
+                Some(&["UPDATE", "ROW", "MODE"])
+            }
+            [.., last]
+                if !mysql
+                    && lock_statement
+                    && contains("IN")
+                    && matches!(last.as_str(), "EXCLUSIVE" | "UPDATE") =>
+            {
+                Some(&["MODE"])
+            }
+            [.., last] if !mysql && lock_statement && last == "MODE" => Some(&["NOWAIT", "WAIT"]),
+            [lock, tables, _name] if mysql && lock == "LOCK" && tables == "TABLES" => {
+                Some(&["AS", "READ", "WRITE", "LOW_PRIORITY WRITE"])
+            }
+            [unlock] if mysql && unlock == "UNLOCK" => Some(&["INSTANCE", "TABLES"]),
+            _ => None,
+        }
+    }
+
+    fn words_for_keyword_slot(tokens: &[SqlToken], end: usize) -> Vec<String> {
+        let visible_end = end.min(tokens.len());
+        let visible_words = tokens
+            .iter()
+            .take(visible_end)
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if visible_words.is_empty() {
+            tokens
+                .iter()
+                .filter_map(|token| match token {
+                    SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            visible_words
+        }
+    }
+
+    fn expected_plsql_and_routine_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return None;
+        }
+
+        let words = Self::words_for_keyword_slot(tokens, end);
+        let has = |keyword: &str| words.iter().any(|word| word == keyword);
+        let last = words.last().map(String::as_str);
+
+        match words.as_slice() {
+            [.., when, exception] if when == "WHEN" && exception == "OTHERS" => {
+                return Some(&["THEN"])
+            }
+            [.., authid] if authid == "AUTHID" => return Some(&["CURRENT_USER", "DEFINER"]),
+            [.., for_word, each] if for_word == "FOR" && each == "EACH" => {
+                return Some(&["ROW"])
+            }
+            _ => {}
+        }
+
+        if has("BEGIN") {
+            if has("IF") && !has("THEN") {
+                return Some(&["THEN"]);
+            }
+            if has("IF") && has("THEN") && !has("END") {
+                return Some(&["ELSIF", "ELSE", "END IF"]);
+            }
+            if has("WHILE") && !has("LOOP") {
+                return Some(&["LOOP"]);
+            }
+            if has("FOR") && has("IN") && !has("LOOP") {
+                return Some(&["LOOP"]);
+            }
+            if has("CASE") {
+                if has("WHEN") && !has("THEN") {
+                    return Some(&["THEN"]);
+                }
+                if has("THEN") && !has("END") {
+                    return Some(&["WHEN", "ELSE", "END CASE"]);
+                }
+                return Some(&["WHEN", "ELSE", "END CASE"]);
+            }
+        }
+
+        let create_idx = words.iter().position(|word| word == "CREATE")?;
+        let create_tail = &words[create_idx..];
+        let contains = |keyword: &str| create_tail.iter().any(|word| word == keyword);
+
+        if contains("PROCEDURE") {
+            if matches!(create_tail.last().map(String::as_str), Some("PROCEDURE")) {
+                return None;
+            }
+            return Some(&["AUTHID", "IS", "AS"]);
+        }
+        if contains("FUNCTION") && contains("RETURN") {
+            return Some(&[
+                "AUTHID",
+                "DETERMINISTIC",
+                "PARALLEL_ENABLE",
+                "PIPELINED",
+                "RESULT_CACHE",
+                "IS",
+                "AS",
+            ]);
+        }
+        if contains("PACKAGE") && contains("BODY") {
+            if matches!(create_tail.last().map(String::as_str), Some("BODY")) {
+                return None;
+            }
+            return Some(&["IS", "AS"]);
+        }
+        if contains("PACKAGE") {
+            if matches!(create_tail.last().map(String::as_str), Some("PACKAGE")) {
+                return None;
+            }
+            return Some(&["AUTHID", "IS", "AS"]);
+        }
+        if contains("TRIGGER") {
+            if matches!(last, Some("INSERT" | "UPDATE" | "DELETE")) {
+                return Some(&["OR", "ON"]);
+            }
+            if contains("ON") {
+                return Some(&["FOR EACH ROW", "WHEN", "DECLARE", "BEGIN"]);
+            }
+            return Some(&["BEFORE", "AFTER", "INSTEAD OF", "COMPOUND"]);
+        }
+
+        None
+    }
+
+    fn expected_advanced_oracle_query_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return None;
+        }
+
+        let words = Self::words_for_keyword_slot(tokens, end);
+        let has = |keyword: &str| words.iter().any(|word| word == keyword);
+        let last = words.last().map(String::as_str);
+
+        if has("PIVOT") {
+            if has("FOR") {
+                return Some(&["IN"]);
+            }
+            return Some(&["FOR"]);
+        }
+        if has("UNPIVOT") {
+            if matches!(last, Some("INCLUDE" | "EXCLUDE")) {
+                return Some(&["NULLS"]);
+            }
+            return Some(&["INCLUDE", "EXCLUDE"]);
+        }
+        if has("MATCH_RECOGNIZE") {
+            match words.as_slice() {
+                [.., last] if last == "PARTITION" || last == "ORDER" => return Some(&["BY"]),
+                [.., after, match_word] if after == "AFTER" && match_word == "MATCH" => {
+                    return Some(&["SKIP"])
+                }
+                [.., skip] if skip == "SKIP" => {
+                    return Some(&["PAST LAST ROW", "TO NEXT ROW", "TO FIRST", "TO LAST"])
+                }
+                _ => {}
+            }
+            if has("PATTERN") && !has("DEFINE") {
+                return Some(&["DEFINE"]);
+            }
+        }
+        if has("MODEL") {
+            match words.as_slice() {
+                [.., last] if last == "PARTITION" || last == "DIMENSION" => {
+                    return Some(&["BY"])
+                }
+                [.., last] if last == "RULES" => {
+                    return Some(&["UPDATE", "UPSERT", "UPSERT ALL"])
+                }
+                _ => {}
+            }
+            if has("MEASURES") && !has("RULES") {
+                return Some(&["RULES"]);
+            }
+            return Some(&["PARTITION BY", "DIMENSION BY", "MEASURES", "RULES"]);
+        }
+
+        None
+    }
+
+    fn expected_mysql_admin_account_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return None;
+        }
+
+        const MYSQL_CREATE_USER_OPTION_HEAD_KEYWORDS: &[&str] = &[
+            "ACCOUNT",
+            "ATTRIBUTE",
+            "COMMENT",
+            "DEFAULT",
+            "FAILED_LOGIN_ATTEMPTS",
+            "IDENTIFIED",
+            "PASSWORD",
+            "PASSWORD_LOCK_TIME",
+            "REQUIRE",
+            "WITH",
+        ];
+        const MYSQL_CREATE_USER_AFTER_AUTH_KEYWORDS: &[&str] = &[
+            "ACCOUNT",
+            "AND",
+            "ATTRIBUTE",
+            "COMMENT",
+            "DEFAULT",
+            "FAILED_LOGIN_ATTEMPTS",
+            "PASSWORD",
+            "PASSWORD_LOCK_TIME",
+            "RANDOM",
+            "REQUIRE",
+            "WITH",
+        ];
+        const MYSQL_ALTER_USER_OPTION_HEAD_KEYWORDS: &[&str] = &[
+            "ACCOUNT",
+            "ADD",
+            "ATTRIBUTE",
+            "COMMENT",
+            "DEFAULT",
+            "DISCARD",
+            "DROP",
+            "FAILED_LOGIN_ATTEMPTS",
+            "IDENTIFIED",
+            "MODIFY",
+            "PASSWORD",
+            "PASSWORD_LOCK_TIME",
+            "REQUIRE",
+            "WITH",
+        ];
+        const MYSQL_ALTER_USER_AFTER_AUTH_KEYWORDS: &[&str] = &[
+            "ACCOUNT",
+            "ATTRIBUTE",
+            "COMMENT",
+            "DEFAULT",
+            "FAILED_LOGIN_ATTEMPTS",
+            "PASSWORD",
+            "PASSWORD_LOCK_TIME",
+            "RANDOM",
+            "REQUIRE",
+            "WITH",
+        ];
+        const MYSQL_USER_RESOURCE_KEYWORDS: &[&str] = &[
+            "MAX_CONNECTIONS_PER_HOUR",
+            "MAX_QUERIES_PER_HOUR",
+            "MAX_UPDATES_PER_HOUR",
+            "MAX_USER_CONNECTIONS",
+        ];
+        const MYSQL_USER_PASSWORD_OPTION_KEYWORDS: &[&str] =
+            &["EXPIRE", "HISTORY", "REQUIRE", "REUSE"];
+
+        let words = Self::words_for_keyword_slot(tokens, end);
+        let first = words.first().map(String::as_str)?;
+        let last = words.last().map(String::as_str);
+        let has = |keyword: &str| words.iter().any(|word| word == keyword);
+        let is_user_statement = matches!(first, "CREATE" | "ALTER" | "DROP")
+            && words.get(1).map(String::as_str) == Some("USER");
+        let cursor_follows_incomplete_account_symbol = tokens
+            .iter()
+            .take(end)
+            .rev()
+            .find(|token| !matches!(token, SqlToken::Comment(_)))
+            .is_some_and(|token| {
+                matches!(token, SqlToken::Symbol(sym) if matches!(sym.as_str(), "@" | "." | ","))
+            });
+        let user_option_head_keywords = if first == "ALTER" {
+            MYSQL_ALTER_USER_OPTION_HEAD_KEYWORDS
+        } else {
+            MYSQL_CREATE_USER_OPTION_HEAD_KEYWORDS
+        };
+        let user_after_auth_keywords = if first == "ALTER" {
+            MYSQL_ALTER_USER_AFTER_AUTH_KEYWORDS
+        } else {
+            MYSQL_CREATE_USER_AFTER_AUTH_KEYWORDS
+        };
+
+        if first == "CREATE"
+            && is_user_statement
+            && matches!(last, Some("USER" | "IF" | "NOT" | "EXISTS"))
+        {
+            return None;
+        }
+
+        if is_user_statement && cursor_follows_incomplete_account_symbol {
+            return None;
+        }
+
+        if first == "ALTER" && is_user_statement {
+            return None;
+        }
+
+        if first == "DROP" && is_user_statement && matches!(last, Some("IF" | "EXISTS")) {
+            return None;
+        }
+
+        if matches!(first, "CREATE" | "ALTER") && is_user_statement {
+            match last {
+                Some("IDENTIFIED") => return Some(&["BY", "WITH"]),
+                Some("INITIAL") if has("IDENTIFIED") && has("WITH") => {
+                    return Some(&["AUTHENTICATION"]);
+                }
+                Some("AUTHENTICATION") if has("INITIAL") => {
+                    return Some(&["IDENTIFIED"]);
+                }
+                Some("AND") if has("IDENTIFIED") && !has("REQUIRE") => {
+                    return Some(&["IDENTIFIED"]);
+                }
+                Some("REQUIRE") if has("PASSWORD") => {
+                    return Some(&["CURRENT"]);
+                }
+                Some("CURRENT") if has("PASSWORD") && has("REQUIRE") => {
+                    return Some(&["DEFAULT", "OPTIONAL"]);
+                }
+                Some("NONE") if has("REQUIRE") && !has("PASSWORD") => {
+                    return Some(user_after_auth_keywords);
+                }
+                Some("SSL" | "X509" | "CIPHER" | "ISSUER" | "SUBJECT")
+                    if has("REQUIRE") && !has("PASSWORD") =>
+                {
+                    return Some(&["AND", "CIPHER", "ISSUER", "SSL", "SUBJECT", "X509"]);
+                }
+                Some("REQUIRE") => {
+                    return Some(&["NONE", "SSL", "X509", "CIPHER", "ISSUER", "SUBJECT"])
+                }
+                Some("ACCOUNT") => return Some(&["LOCK", "UNLOCK"]),
+                Some("COMMENT" | "ATTRIBUTE") => return None,
+                Some("DEFAULT") if !has("PASSWORD") => {
+                    return Some(&["ROLE"]);
+                }
+                Some("ROLE") if has("DEFAULT") => {
+                    return if first == "ALTER" {
+                        Some(&["ALL", "NONE"])
+                    } else {
+                        None
+                    };
+                }
+                Some("PASSWORD") if has("RANDOM") => {
+                    return Some(user_after_auth_keywords);
+                }
+                Some("PASSWORD") => return Some(MYSQL_USER_PASSWORD_OPTION_KEYWORDS),
+                Some("EXPIRE") if has("PASSWORD") => {
+                    return Some(&["DEFAULT", "NEVER", "INTERVAL"])
+                }
+                Some("HISTORY") if has("PASSWORD") => {
+                    return Some(&["DEFAULT"]);
+                }
+                Some("REUSE") if has("PASSWORD") => {
+                    return Some(&["DEFAULT", "INTERVAL"]);
+                }
+                Some("INTERVAL") if has("PASSWORD") && (has("EXPIRE") || has("REUSE")) => {
+                    return Some(&["DAY"]);
+                }
+                _ if has("PASSWORD")
+                    && has("INTERVAL")
+                    && (has("EXPIRE") || has("REUSE")) =>
+                {
+                    return Some(&["DAY"]);
+                }
+                Some("WITH") if has("IDENTIFIED") => {
+                    return None;
+                }
+                Some("WITH") if !has("IDENTIFIED") => {
+                    return Some(MYSQL_USER_RESOURCE_KEYWORDS);
+                }
+                Some(word) if MYSQL_USER_RESOURCE_KEYWORDS.contains(&word) => {
+                    return Some(MYSQL_USER_RESOURCE_KEYWORDS);
+                }
+                _ if has("WITH")
+                    && MYSQL_USER_RESOURCE_KEYWORDS
+                        .iter()
+                        .any(|keyword| has(keyword)) =>
+                {
+                    return Some(MYSQL_USER_RESOURCE_KEYWORDS);
+                }
+                _ if has("IDENTIFIED") && has("WITH") && !has("BY") => {
+                    return Some(&["AND", "AS", "BY", "INITIAL"]);
+                }
+                _ if has("IDENTIFIED") && has("BY") => {
+                    return Some(user_after_auth_keywords)
+                }
+                _ => {}
+            }
+        }
+
+        match first {
+            "CREATE" if is_user_statement => {
+                if matches!(last, Some("IDENTIFIED")) {
+                    return Some(&["BY", "WITH"]);
+                }
+                Some(user_option_head_keywords)
+            }
+        "DROP" if is_user_statement => Some(&["IF"]),
+            "FLUSH" if words.len() == 1 => Some(&[
+                "BINARY",
+                "ENGINE",
+                "ERROR",
+                "GENERAL",
+                "HOSTS",
+                "LOCAL",
+                "LOGS",
+                "NO_WRITE_TO_BINLOG",
+                "OPTIMIZER_COSTS",
+                "PRIVILEGES",
+                "RELAY",
+                "SLOW",
+                "STATUS",
+                "TABLE",
+                "TABLES",
+                "USER_RESOURCES",
+            ]),
+            "RESET" if words.len() == 1 => Some(&[
+                "BINARY",
+                "MASTER",
+                "PERSIST",
+                "QUERY CACHE",
+                "REPLICA",
+                "SLAVE",
+            ]),
+            "KILL" => Some(&["CONNECTION", "QUERY"]),
+        "PURGE" if words.len() == 1 => Some(&["BINARY", "MASTER"]),
+            _ => None,
+        }
+    }
+
+    fn expected_cte_and_table_expression_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        let words = Self::words_for_keyword_slot(tokens, end);
+        let mysql = crate::sql_text::mysql_compatibility_for_sql("", db_type);
+        let has = |keyword: &str| words.iter().any(|word| word == keyword);
+        let first = words.first().map(String::as_str);
+        let last = words.last().map(String::as_str);
+
+        if first == Some("WITH") {
+            if Self::unclosed_paren_count(tokens, end) != 0 {
+                return None;
+            }
+            let mut depth = 0i32;
+            let mut saw_main_query_select = false;
+            for token in tokens.iter().take(end.min(tokens.len())) {
+                match token {
+                    SqlToken::Symbol(sym) if sym == "(" => depth += 1,
+                    SqlToken::Symbol(sym) if sym == ")" => depth = (depth - 1).max(0),
+                    SqlToken::Word(word)
+                        if depth == 0 && word.eq_ignore_ascii_case("SELECT") =>
+                    {
+                        saw_main_query_select = true;
+                    }
+                    _ => {}
+                }
+            }
+            if saw_main_query_select {
+                return None;
+            }
+            if mysql && words.len() == 1 {
+                return Some(&["RECURSIVE"]);
+            }
+            if mysql && has("RECURSIVE") && !has("AS") {
+                return Some(&["AS"]);
+            }
+            if !mysql {
+                match words.as_slice() {
+                    [.., search] if search == "SEARCH" => return Some(&["DEPTH", "BREADTH"]),
+                    [.., search, depth] if search == "SEARCH" && matches!(depth.as_str(), "DEPTH" | "BREADTH") => {
+                        return Some(&["FIRST"])
+                    }
+                    [.., depth, first_word]
+                        if matches!(depth.as_str(), "DEPTH" | "BREADTH")
+                            && first_word == "FIRST" =>
+                    {
+                        return Some(&["BY"])
+                    }
+                    [.., first_word, by, _col] if first_word == "FIRST" && by == "BY" => {
+                        return Some(&["SET"])
+                    }
+                    [.., cycle, _col] if cycle == "CYCLE" => return Some(&["SET"]),
+                    [.., cycle, _col, set, _mark]
+                        if cycle == "CYCLE" && set == "SET" =>
+                    {
+                        return Some(&["TO"])
+                    }
+                    [.., set, _mark, to, _value] if set == "SET" && to == "TO" => {
+                        return Some(&["DEFAULT"])
+                    }
+                    [.., to]
+                        if to == "TO"
+                            && has("CYCLE")
+                            && has("SET")
+                            && Self::meaningful_tokens_before(tokens, end)
+                                .last()
+                                .is_some_and(|token| matches!(token, SqlToken::String(_))) =>
+                    {
+                        return Some(&["DEFAULT"])
+                    }
+                    _ => {}
+                }
+                if has("AS") && !has("SEARCH") && !has("CYCLE") {
+                    return Some(&["SEARCH", "CYCLE"]);
+                }
+            }
+        }
+
+        match last {
+            Some("CROSS") => return Some(&["JOIN", "APPLY"]),
+            Some("OUTER")
+                if !matches!(
+                    words
+                        .get(words.len().saturating_sub(2))
+                        .map(String::as_str),
+                    Some("LEFT" | "RIGHT" | "FULL")
+                ) =>
+            {
+                return Some(&["APPLY"])
+            }
+            _ => {}
+        }
+
+        if has("XMLTABLE") && !has("COLUMNS") {
+            if has("PASSING") {
+                return Some(&["COLUMNS"]);
+            }
+            return Some(&["PASSING", "COLUMNS"]);
+        }
+        if has("JSON_TABLE") && !has("COLUMNS") {
+            return Some(&["COLUMNS", "ERROR ON ERROR", "NULL ON ERROR"]);
+        }
+
+        None
+    }
+
+    fn expected_mysql_schema_object_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return None;
+        }
+
+        let words = Self::words_for_keyword_slot(tokens, end);
+        let first = words.first().map(String::as_str)?;
+        let last = words.last().map(String::as_str);
+        let has = |keyword: &str| words.iter().any(|word| word == keyword);
+
+        if first == "CREATE" && has("TABLE") {
+            if Self::unclosed_paren_count(tokens, end) != 0 {
+                return None;
+            }
+            if matches!(last, Some("TABLE" | "IF" | "NOT" | "EXISTS")) {
+                return None;
+            }
+            if last == Some("DEFAULT") {
+                return Some(&["CHARACTER SET", "CHARSET", "COLLATE"]);
+            }
+            return Some(&[
+                "ENGINE",
+                "DEFAULT CHARSET",
+                "CHARACTER SET",
+                "COLLATE",
+                "AUTO_INCREMENT",
+                "COMMENT",
+                "ROW_FORMAT",
+            ]);
+        }
+        if first == "CREATE" && has("INDEX") {
+            if last == Some("USING") {
+                return Some(&["BTREE", "HASH"]);
+            }
+            if matches!(last, Some("BTREE" | "HASH")) {
+                return Some(&["ON"]);
+            }
+            return Some(&["ON", "USING"]);
+        }
+        if first == "ALTER" && has("TABLE") {
+            match last {
+                Some("ADD") => {
+                    return Some(&[
+                        "COLUMN",
+                        "INDEX",
+                        "KEY",
+                        "CONSTRAINT",
+                        "PRIMARY KEY",
+                        "UNIQUE",
+                        "FOREIGN KEY",
+                    ])
+                }
+                Some("DROP") => {
+                    return Some(&["COLUMN", "INDEX", "KEY", "PRIMARY KEY", "FOREIGN KEY"])
+                }
+                _ => {}
+            }
+        }
+        if first == "CREATE" && has("FUNCTION") && !has("RETURNS") {
+            if matches!(last, Some("FUNCTION" | "IF" | "NOT" | "EXISTS")) {
+                return None;
+            }
+            return Some(&["RETURNS"]);
+        }
+        if first == "CREATE" && (has("FUNCTION") || has("PROCEDURE")) {
+            if last == Some("NOT") {
+                if words.len() >= 2 && words[words.len() - 2] == "IF" {
+                    return None;
+                }
+                return Some(&["DETERMINISTIC"]);
+            }
+            if matches!(last, Some("LANGUAGE" | "CONTAINS" | "NO" | "READS" | "MODIFIES"))
+            {
+                return Some(&["SQL"]);
+            }
+            if last == Some("SQL") {
+                let previous = words
+                    .len()
+                    .checked_sub(2)
+                    .and_then(|idx| words.get(idx))
+                    .map(String::as_str);
+                if matches!(previous, Some("READS" | "MODIFIES")) {
+                    return Some(&["DATA"]);
+                }
+                if !matches!(previous, Some("LANGUAGE" | "CONTAINS" | "NO")) {
+                    return Some(&["SECURITY"]);
+                }
+            }
+            if last == Some("SECURITY") {
+                return Some(&["DEFINER", "INVOKER"]);
+            }
+            if matches!(last, Some("FUNCTION" | "PROCEDURE" | "IF" | "EXISTS")) {
+                return None;
+            }
+            return Some(&[
+                "LANGUAGE",
+                "DETERMINISTIC",
+                "NOT",
+                "CONTAINS",
+                "NO",
+                "READS",
+                "MODIFIES",
+                "SQL",
+                "COMMENT",
+            ]);
+        }
+        if first == "CREATE" && has("TRIGGER") {
+            if matches!(last, Some("TRIGGER" | "IF" | "NOT")) {
+                return None;
+            }
+            if matches!(last, Some("BEFORE" | "AFTER")) {
+                return Some(&["DELETE", "INSERT", "UPDATE"]);
+            }
+        if matches!(last, Some("INSERT" | "UPDATE" | "DELETE")) {
+            return Some(&["ON"]);
+        }
+        if has("ON") {
+            return None;
+        }
+        return Some(&["BEFORE", "AFTER"]);
+    }
+        if first == "CREATE" && has("EVENT") {
+            if matches!(last, Some("EVENT" | "IF" | "NOT")) {
+                return None;
+            }
+            match words.as_slice() {
+                [.., event, _name] if event == "EVENT" => return Some(&["ON"]),
+                [.., on] if on == "ON" && !has("SCHEDULE") => return Some(&["SCHEDULE"]),
+                [.., on, schedule] if on == "ON" && schedule == "SCHEDULE" => {
+                    return Some(&["AT", "EVERY"])
+                }
+                _ => {}
+            }
+        }
+
+        None
+    }
+
+    fn expected_grouping_returning_and_insert_tail_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        let words = Self::words_for_keyword_slot(tokens, end);
+        let mysql = crate::sql_text::mysql_compatibility_for_sql("", db_type);
+        let has = |keyword: &str| words.iter().any(|word| word == keyword);
+        let last = words.last().map(String::as_str);
+
+        if !mysql && has("GROUP") && has("BY") {
+            if last == Some("GROUPING") {
+                return Some(&["SETS"]);
+            }
+            if last == Some("BY") {
+                return Some(&["ROLLUP", "CUBE", "GROUPING SETS"]);
+            }
+        }
+        if !mysql && has("RETURNING") && !Self::cursor_is_at_json_returning_type(tokens, end) {
+            return Some(&["INTO"]);
+        }
+        if mysql && has("INSERT") && has("DUPLICATE") {
+            if last == Some("DUPLICATE") {
+                return Some(&["KEY UPDATE"]);
+            }
+            if last == Some("KEY") {
+                return Some(&["UPDATE"]);
+            }
+        }
+
+        None
+    }
+
+    fn expected_tool_command_supplement_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return None;
+        }
+
+        let words = Self::words_for_keyword_slot(tokens, end);
+        match words.as_slice() {
+            [set] if set == "SET" => Some(&[
+                "AUTOCOMMIT",
+                "COLSEP",
+                "DEFINE",
+                "ECHO",
+                "ERRORCONTINUE",
+                "FEEDBACK",
+                "HEADING",
+                "LINESIZE",
+                "NULL",
+                "PAGESIZE",
+                "SCAN",
+                "SERVEROUTPUT",
+                "SQLBLANKLINES",
+                "TAB",
+                "TERMOUT",
+                "TIMING",
+                "TRIMOUT",
+                "TRIMSPOOL",
+                "VERIFY",
+            ]),
+            [set, option]
+                if set == "SET" && matches!(option.as_str(), "AUTOCOMMIT" | "SERVEROUTPUT") =>
+            {
+                Some(&["ON", "OFF", "TRUE", "FALSE"])
+            }
+            [show] if show == "SHOW" => Some(&["USER", "ALL", "ERRORS", "PARAMETER", "VERSION"]),
+            [show, errors] if show == "SHOW" && errors == "ERRORS" => {
+                Some(&["PACKAGE", "PROCEDURE", "FUNCTION", "TRIGGER", "TYPE", "VIEW"])
+            }
+            [spool] if spool == "SPOOL" => Some(&["OFF", "OUT", "APPEND"]),
+            [whenever] if whenever == "WHENEVER" => Some(&["SQLERROR", "OSERROR"]),
+            [whenever, error] if whenever == "WHENEVER" && matches!(error.as_str(), "SQLERROR" | "OSERROR") => {
+                Some(&["EXIT", "CONTINUE"])
+            }
+            [whenever, error, exit]
+                if whenever == "WHENEVER"
+                    && matches!(error.as_str(), "SQLERROR" | "OSERROR")
+                    && exit == "EXIT" =>
+            {
+                Some(&["SUCCESS", "FAILURE", "WARNING", "ROLLBACK", "COMMIT"])
+            }
+            _ => None,
+        }
+    }
+
     fn expected_query_clause_continuation_keywords(
         tokens: &[SqlToken],
         end: usize,
@@ -11991,9 +13448,18 @@ impl SqlEditorWidget {
                     && Self::cursor_is_in_order_by_item_list(tokens, end)
             }
             SqlPhase::WhereClause
+            | SqlPhase::JoinCondition
             | SqlPhase::HavingClause
             | SqlPhase::ConnectByClause
             | SqlPhase::StartWithClause => Self::cursor_follows_complete_predicate(tokens, end),
+            SqlPhase::OrderByClause => {
+                let words = Self::previous_meaningful_words_upper(tokens, end, 2);
+                !matches!(
+                    words.last().map(String::as_str),
+                    Some("ORDER" | "BY" | "NULLS")
+                ) && Self::cursor_immediately_follows_complete_operand(tokens, end)
+                    && Self::cursor_is_in_order_by_item_list(tokens, end)
+            }
             _ => false,
         };
         if !complete {
@@ -12002,32 +13468,401 @@ impl SqlEditorWidget {
 
         match (phase, mysql) {
             (SqlPhase::FromClause, false) => &[
-                "WHERE", "CONNECT BY", "START WITH", "GROUP BY", "HAVING", "ORDER BY", "OFFSET",
-                "FETCH", "FOR UPDATE",
+                "JOIN",
+                "WHERE",
+                "LEFT JOIN",
+                "RIGHT JOIN",
+                "FULL JOIN",
+                "INNER JOIN",
+                "CROSS JOIN",
+                "NATURAL JOIN",
+                "LEFT OUTER JOIN",
+                "RIGHT OUTER JOIN",
+                "FULL OUTER JOIN",
+                "CONNECT BY",
+                "START WITH",
+                "GROUP BY",
+                "HAVING",
+                "ORDER BY",
+                "OFFSET",
+                "FETCH",
+                "FOR UPDATE",
+                "UNION",
+                "UNION ALL",
+                "INTERSECT",
+                "MINUS",
+                "EXCEPT",
             ],
-            (SqlPhase::FromClause, true) => {
-                &["WHERE", "GROUP BY", "HAVING", "ORDER BY", "LIMIT", "FOR UPDATE"]
-            }
+            (SqlPhase::FromClause, true) => &[
+                "JOIN",
+                "WHERE",
+                "LEFT JOIN",
+                "RIGHT JOIN",
+                "LEFT OUTER JOIN",
+                "RIGHT OUTER JOIN",
+                "INNER JOIN",
+                "CROSS JOIN",
+                "NATURAL JOIN",
+                "STRAIGHT_JOIN",
+                "GROUP BY",
+                "HAVING",
+                "ORDER BY",
+                "LIMIT",
+                "FOR UPDATE",
+                "UNION",
+                "UNION ALL",
+                "INTERSECT",
+                "EXCEPT",
+            ],
+            (SqlPhase::JoinCondition, false) => &[
+                "JOIN",
+                "WHERE",
+                "LEFT JOIN",
+                "RIGHT JOIN",
+                "FULL JOIN",
+                "INNER JOIN",
+                "CROSS JOIN",
+                "NATURAL JOIN",
+                "LEFT OUTER JOIN",
+                "RIGHT OUTER JOIN",
+                "FULL OUTER JOIN",
+                "CONNECT BY",
+                "START WITH",
+                "GROUP BY",
+                "HAVING",
+                "ORDER BY",
+                "OFFSET",
+                "FETCH",
+                "FOR UPDATE",
+                "UNION",
+                "UNION ALL",
+                "INTERSECT",
+                "MINUS",
+                "EXCEPT",
+            ],
+            (SqlPhase::JoinCondition, true) => &[
+                "JOIN",
+                "WHERE",
+                "LEFT JOIN",
+                "RIGHT JOIN",
+                "LEFT OUTER JOIN",
+                "RIGHT OUTER JOIN",
+                "INNER JOIN",
+                "CROSS JOIN",
+                "NATURAL JOIN",
+                "STRAIGHT_JOIN",
+                "GROUP BY",
+                "HAVING",
+                "ORDER BY",
+                "LIMIT",
+                "FOR UPDATE",
+                "UNION",
+                "UNION ALL",
+                "INTERSECT",
+                "EXCEPT",
+            ],
             (SqlPhase::WhereClause, false) => &[
                 "CONNECT BY", "START WITH", "GROUP BY", "HAVING", "ORDER BY", "OFFSET", "FETCH",
-                "FOR UPDATE",
+                "FOR UPDATE", "UNION", "UNION ALL", "INTERSECT", "MINUS", "EXCEPT",
             ],
             (SqlPhase::WhereClause, true) => {
-                &["GROUP BY", "HAVING", "ORDER BY", "LIMIT", "FOR UPDATE"]
+                &[
+                    "GROUP BY",
+                    "HAVING",
+                    "ORDER BY",
+                    "LIMIT",
+                    "FOR UPDATE",
+                    "UNION",
+                    "UNION ALL",
+                    "INTERSECT",
+                    "EXCEPT",
+                ]
             }
             (SqlPhase::StartWithClause, _) => &[
-                "CONNECT BY", "GROUP BY", "HAVING", "ORDER BY", "OFFSET", "FETCH", "FOR UPDATE",
+                "CONNECT BY",
+                "GROUP BY",
+                "HAVING",
+                "ORDER BY",
+                "OFFSET",
+                "FETCH",
+                "FOR UPDATE",
+                "UNION",
+                "UNION ALL",
+                "INTERSECT",
+                "MINUS",
+                "EXCEPT",
             ],
             (SqlPhase::ConnectByClause, _) => &[
-                "START WITH", "GROUP BY", "HAVING", "ORDER BY", "OFFSET", "FETCH", "FOR UPDATE",
+                "START WITH",
+                "GROUP BY",
+                "HAVING",
+                "ORDER BY",
+                "OFFSET",
+                "FETCH",
+                "FOR UPDATE",
+                "UNION",
+                "UNION ALL",
+                "INTERSECT",
+                "MINUS",
+                "EXCEPT",
             ],
             (SqlPhase::GroupByClause, false) => {
-                &["HAVING", "ORDER BY", "OFFSET", "FETCH", "FOR UPDATE"]
+                &[
+                    "HAVING",
+                    "ORDER BY",
+                    "OFFSET",
+                    "FETCH",
+                    "FOR UPDATE",
+                    "UNION",
+                    "UNION ALL",
+                    "INTERSECT",
+                    "MINUS",
+                    "EXCEPT",
+                ]
             }
-            (SqlPhase::GroupByClause, true) => &["HAVING", "ORDER BY", "LIMIT", "FOR UPDATE"],
-            (SqlPhase::HavingClause, false) => &["ORDER BY", "OFFSET", "FETCH", "FOR UPDATE"],
-            (SqlPhase::HavingClause, true) => &["ORDER BY", "LIMIT", "FOR UPDATE"],
+            (SqlPhase::GroupByClause, true) => &[
+                "HAVING",
+                "ORDER BY",
+                "LIMIT",
+                "FOR UPDATE",
+                "UNION",
+                "UNION ALL",
+                "INTERSECT",
+                "EXCEPT",
+            ],
+            (SqlPhase::HavingClause, false) => &[
+                "ORDER BY",
+                "OFFSET",
+                "FETCH",
+                "FOR UPDATE",
+                "UNION",
+                "UNION ALL",
+                "INTERSECT",
+                "MINUS",
+                "EXCEPT",
+            ],
+            (SqlPhase::HavingClause, true) => &[
+                "ORDER BY",
+                "LIMIT",
+                "FOR UPDATE",
+                "UNION",
+                "UNION ALL",
+                "INTERSECT",
+                "EXCEPT",
+            ],
+            (SqlPhase::OrderByClause, false) => &[
+                "OFFSET",
+                "FETCH",
+                "FOR UPDATE",
+                "UNION",
+                "UNION ALL",
+                "INTERSECT",
+                "MINUS",
+                "EXCEPT",
+            ],
+            (SqlPhase::OrderByClause, true) => &[
+                "LIMIT",
+                "FOR UPDATE",
+                "UNION",
+                "UNION ALL",
+                "INTERSECT",
+                "EXCEPT",
+            ],
             _ => &[],
+        }
+    }
+
+    fn expected_query_clause_continuation_keywords_for_any_complete_phase(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> &'static [&'static str] {
+        use intellisense_context::SqlPhase;
+
+        let visible_end = end.min(tokens.len());
+        let visible_tokens = &tokens[..visible_end];
+        let toks = Self::meaningful_tokens_before(visible_tokens, visible_end);
+        let mut phase = None;
+        let mut idx = 0;
+        while idx < toks.len() {
+            if let SqlToken::Word(word) = &toks[idx] {
+                let upper = word.to_ascii_uppercase();
+                let next_upper = toks.get(idx + 1).and_then(|token| match token {
+                    SqlToken::Word(next) => Some(next.to_ascii_uppercase()),
+                    _ => None,
+                });
+                match upper.as_str() {
+                    "FROM" | "JOIN" | "ON" | "USING" => phase = Some(SqlPhase::FromClause),
+                    "WHERE" => phase = Some(SqlPhase::WhereClause),
+                    "HAVING" => phase = Some(SqlPhase::HavingClause),
+                    "GROUP" if next_upper.as_deref() == Some("BY") => {
+                        phase = Some(SqlPhase::GroupByClause);
+                        idx += 1;
+                    }
+                    "ORDER" if next_upper.as_deref() == Some("BY") => {
+                        phase = Some(SqlPhase::OrderByClause);
+                        idx += 1;
+                    }
+                    "CONNECT" if next_upper.as_deref() == Some("BY") => {
+                        phase = Some(SqlPhase::ConnectByClause);
+                        idx += 1;
+                    }
+                    "START" if next_upper.as_deref() == Some("WITH") => {
+                        phase = Some(SqlPhase::StartWithClause);
+                        idx += 1;
+                    }
+                    _ => {}
+                }
+            }
+            idx += 1;
+        }
+
+        phase
+            .map(|phase| {
+                Self::expected_query_clause_continuation_keywords(
+                    visible_tokens,
+                    visible_end,
+                    phase,
+                    db_type,
+                )
+            })
+            .unwrap_or(&[])
+    }
+
+    fn expected_common_predicate_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        phase: intellisense_context::SqlPhase,
+        expr_keyword_ctx: Option<ExpressionKeywordContext>,
+    ) -> &'static [&'static str] {
+        if !matches!(
+            phase,
+            intellisense_context::SqlPhase::WhereClause
+                | intellisense_context::SqlPhase::JoinCondition
+                | intellisense_context::SqlPhase::HavingClause
+                | intellisense_context::SqlPhase::ConnectByClause
+                | intellisense_context::SqlPhase::StartWithClause
+        ) {
+            return &[];
+        }
+
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        if matches!(toks.last(), Some(SqlToken::Symbol(sym)) if sym == "(") {
+            let prev_word = toks.iter().rev().skip(1).find_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                _ => None,
+            });
+            if matches!(
+                prev_word.as_deref(),
+                Some("IN" | "EXISTS" | "ANY" | "SOME" | "ALL")
+            ) {
+                return &["SELECT", "WITH"];
+            }
+        }
+
+        if expr_keyword_ctx.is_some_and(|ctx| ctx.follows_like_pattern) {
+            return &["ESCAPE", "AND", "OR"];
+        }
+
+        let words = Self::previous_meaningful_words_upper(tokens, end, 3);
+        if matches!(words.as_slice(), [.., order, siblings] if order == "ORDER" && siblings == "SIBLINGS") {
+            return &[];
+        }
+
+        if Self::cursor_follows_complete_predicate(tokens, end) {
+            return &["AND", "OR"];
+        }
+
+        if matches!(
+            words.last().map(String::as_str),
+            Some("MEMBER" | "SUBMULTISET")
+        ) {
+            return &["OF"];
+        }
+
+        let follows_comparison_operator = toks
+            .last()
+            .is_some_and(|token| matches!(token, SqlToken::Symbol(sym) if matches!(sym.as_str(), "=" | ">" | "<" | ">=" | "<=" | "<>" | "!=")));
+
+        match expr_keyword_ctx.and_then(|ctx| ctx.follows_operand) {
+            Some(true) => &[
+                "IS",
+                "IN",
+                "LIKE",
+                "BETWEEN",
+                "NOT",
+                "MEMBER OF",
+                "SUBMULTISET OF",
+            ],
+            Some(false)
+                if phase == intellisense_context::SqlPhase::ConnectByClause
+                    && matches!(words.as_slice(), [.., connect, by] if connect == "CONNECT" && by == "BY") =>
+            {
+                &[
+                    "NOCYCLE",
+                    "PRIOR",
+                    "LEVEL",
+                    "CONNECT_BY_ROOT",
+                    "CONNECT_BY_ISCYCLE",
+                    "CONNECT_BY_ISLEAF",
+                    "CASE",
+                    "CAST",
+                    "EXISTS",
+                    "NOT",
+                    "NULL",
+                    "TRUE",
+                    "FALSE",
+                    "UNKNOWN",
+                    "INTERVAL",
+                    "DATE",
+                    "TIMESTAMP",
+                    "TIME",
+                    "ROWNUM",
+                    "ROWID",
+                ]
+            }
+            Some(false) if phase == intellisense_context::SqlPhase::ConnectByClause => &[
+                "PRIOR",
+                "LEVEL",
+                "CONNECT_BY_ROOT",
+                "CONNECT_BY_ISCYCLE",
+                "CONNECT_BY_ISLEAF",
+                "CASE",
+                "CAST",
+                "EXISTS",
+                "NOT",
+                "NULL",
+                "TRUE",
+                "FALSE",
+                "UNKNOWN",
+                "INTERVAL",
+                "DATE",
+                "TIMESTAMP",
+                "TIME",
+                "ROWNUM",
+                "ROWID",
+            ],
+            Some(false) if follows_comparison_operator => &[
+                "ALL", "ANY", "SOME", "CASE", "CAST", "EXISTS", "NOT", "NULL", "TRUE", "FALSE",
+                "UNKNOWN", "INTERVAL", "DATE", "TIMESTAMP", "TIME", "ROWNUM", "ROWID",
+            ],
+            Some(false) => &[
+                "CASE",
+                "CAST",
+                "EXISTS",
+                "NOT",
+                "NULL",
+                "TRUE",
+                "FALSE",
+                "UNKNOWN",
+                "INTERVAL",
+                "DATE",
+                "TIMESTAMP",
+                "TIME",
+                "ROWNUM",
+                "ROWID",
+            ],
+            None => &[],
         }
     }
 
@@ -12038,7 +13873,7 @@ impl SqlEditorWidget {
         let Some(SqlToken::Word(last)) = toks.last() else {
             return false;
         };
-        if Self::token_is_language_keyword(&last.to_ascii_uppercase()) {
+        if Self::word_breaks_from_relation_tail(last) {
             return false;
         }
         // Walk back over the reference's own words / dotted-name separators to the
@@ -12057,6 +13892,40 @@ impl SqlEditorWidget {
             }
         }
         false
+    }
+
+    fn word_breaks_from_relation_tail(word: &str) -> bool {
+        matches!(
+            word.to_ascii_uppercase().as_str(),
+            "FROM"
+                | "WHERE"
+                | "GROUP"
+                | "HAVING"
+                | "ORDER"
+                | "CONNECT"
+                | "START"
+                | "JOIN"
+                | "INNER"
+                | "LEFT"
+                | "RIGHT"
+                | "FULL"
+                | "CROSS"
+                | "NATURAL"
+                | "OUTER"
+                | "ON"
+                | "USING"
+                | "FOR"
+                | "OFFSET"
+                | "FETCH"
+                | "LIMIT"
+                | "UNION"
+                | "INTERSECT"
+                | "MINUS"
+                | "EXCEPT"
+                | "APPLY"
+                | "LATERAL"
+                | "AS"
+        )
     }
 
     fn cursor_is_after_complete_from_relation_for_context(
@@ -13474,6 +15343,7 @@ impl SqlEditorWidget {
             "FAILED_LOGIN_ATTEMPTS",
             "PASSWORD",
             "PASSWORD_LOCK_TIME",
+            "RANDOM",
             "REQUIRE",
             "WITH",
         ];
@@ -13529,6 +15399,7 @@ impl SqlEditorWidget {
             "FAILED_LOGIN_ATTEMPTS",
             "PASSWORD",
             "PASSWORD_LOCK_TIME",
+            "RANDOM",
             "REQUIRE",
             "WITH",
         ];
@@ -14044,10 +15915,10 @@ impl SqlEditorWidget {
                     }
                 }
 
-                if words.get(idx).map(String::as_str) == Some("VIEW") {
-                    if idx + 2 == words.len() {
-                        return Some(&["AS"]);
-                    }
+                if words.get(idx).map(String::as_str) == Some("VIEW")
+                    && idx + 2 == words.len()
+                {
+                    return Some(&["AS"]);
                 }
 
                 None
@@ -14151,10 +16022,10 @@ impl SqlEditorWidget {
                     return Some(&["ROW"]);
                 }
 
-                if words.get(idx).map(String::as_str) == Some("ROW") {
-                    if idx + 1 == words.len() {
-                        return Some(MYSQL_TRIGGER_ORDER_KEYWORDS);
-                    }
+                if words.get(idx).map(String::as_str) == Some("ROW")
+                    && idx + 1 == words.len()
+                {
+                    return Some(MYSQL_TRIGGER_ORDER_KEYWORDS);
                 }
 
                 None
@@ -14762,10 +16633,10 @@ impl SqlEditorWidget {
                     if idx + 1 == words.len() {
                         return Some(MYSQL_SERVER_OPTION_KEYWORDS);
                     }
-                    if MYSQL_SERVER_OPTION_KEYWORDS.contains(&words[idx + 1].as_str()) {
-                        if idx + 3 == words.len() {
-                            return Some(MYSQL_SERVER_OPTION_KEYWORDS);
-                        }
+                    if MYSQL_SERVER_OPTION_KEYWORDS.contains(&words[idx + 1].as_str())
+                        && idx + 3 == words.len()
+                    {
+                        return Some(MYSQL_SERVER_OPTION_KEYWORDS);
                     }
                 }
 
@@ -16445,9 +18316,13 @@ impl SqlEditorWidget {
                 Some(&["TABLE"])
             }
             [.., last] if *last == "CACHE" => Some(&["INDEX"]),
-            [.., last] if *last == "PURGE" => Some(&["BINARY"]),
-            [.., a, b] if *a == "PURGE" && *b == "BINARY" => Some(&["LOGS"]),
-            [.., a, b, c] if *a == "PURGE" && *b == "BINARY" && *c == "LOGS" => {
+            [.., last] if *last == "PURGE" => Some(&["BINARY", "MASTER"]),
+            [.., a, b] if *a == "PURGE" && matches!(b.as_str(), "BINARY" | "MASTER") => {
+                Some(&["LOGS"])
+            }
+            [.., a, b, c]
+                if *a == "PURGE" && matches!(b.as_str(), "BINARY" | "MASTER") && *c == "LOGS" =>
+            {
                 Some(&["BEFORE", "TO"])
             }
             [.., last] if *last == "RESET" => Some(&["BINARY", "MASTER", "PERSIST", "REPLICA", "SLAVE"]),
@@ -16734,7 +18609,28 @@ impl SqlEditorWidget {
         } else {
             &["DELETE", "INSERT", "MERGE"][..]
         };
-        Self::statement_start_anchor_index(tokens, end, anchors)?;
+        let anchor_idx = Self::statement_start_anchor_index(tokens, end, anchors)?;
+        if tokens
+            .get(..anchor_idx)
+            .unwrap_or(&[])
+            .iter()
+            .filter(|token| !matches!(token, SqlToken::Comment(_)))
+            .any(|token| {
+                !matches!(
+                    token,
+                    SqlToken::Symbol(sym) if sym == ";"
+                ) && !matches!(
+                    token,
+                    SqlToken::Word(word)
+                        if matches!(
+                            word.to_ascii_uppercase().as_str(),
+                            "BEGIN" | "THEN" | "ELSE" | "LOOP"
+                        )
+                )
+            })
+        {
+            return None;
+        }
 
         let words = Self::previous_meaningful_words_upper(tokens, end, 4);
         if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
@@ -16842,34 +18738,27 @@ impl SqlEditorWidget {
             return None;
         }
 
-        let Some((first_idx, first)) = toks.iter().find_map(|(idx, token)| match token {
+        let (first_idx, first) = toks.iter().find_map(|(idx, token)| match token {
             SqlToken::Word(word) => Some((*idx, word.to_ascii_uppercase())),
             _ => None,
-        }) else {
-            return None;
-        };
+        })?;
         if !matches!(first.as_str(), "ALTER" | "CREATE") {
             return None;
         }
         if !Self::token_can_begin_statement_at(tokens, first_idx) {
             return None;
         }
-        let Some(references_idx) = toks[..on].iter().enumerate().rev().find_map(|(idx, (_, token))| {
+        let references_idx = toks[..on].iter().enumerate().rev().find_map(|(idx, (_, token))| {
             matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("REFERENCES"))
                 .then_some(idx)
-        }) else {
-            return None;
-        };
-        let Some(table_idx) = toks[..references_idx]
+        })?;
+        let table_idx = toks[..references_idx]
             .iter()
             .enumerate()
             .find_map(|(idx, (_, token))| {
                 matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("TABLE"))
                     .then_some(idx)
-            })
-        else {
-            return None;
-        };
+            })?;
         if toks[table_idx + 1..references_idx]
             .iter()
             .any(|(_, token)| match token {
@@ -17066,6 +18955,35 @@ impl SqlEditorWidget {
         Self::merge_then_action_keywords(tokens, end).is_some()
     }
 
+    fn merge_action_start_keywords(
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> Option<&'static [&'static str]> {
+        if !Self::statement_is_merge(tokens) || Self::cursor_is_inside_unclosed_case(tokens, end) {
+            return None;
+        }
+
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        if !matches!(toks.last(), Some(SqlToken::Symbol(sym)) if sym == ")") {
+            return None;
+        }
+
+        let mut saw_on = false;
+        for token in &toks {
+            if let SqlToken::Word(word) = token {
+                let upper = word.to_ascii_uppercase();
+                if upper == "WHEN" {
+                    return None;
+                }
+                if upper == "ON" {
+                    saw_on = true;
+                }
+            }
+        }
+
+        saw_on.then_some(&["WHEN"])
+    }
+
     /// MERGE merge-action introducer slot right after `WHEN |` (→ `MATCHED` /
     /// `NOT`) or `WHEN NOT |` (→ `MATCHED`): the only grammatical continuations
     /// are those keywords — never a column, relation, alias or local symbol. The
@@ -17195,6 +19113,9 @@ impl SqlEditorWidget {
             .map(String::as_str);
         if prev == Some("FOR") && matches!(last, Some("UPDATE") | Some("SHARE")) {
             return Some(&["OF", "NOWAIT", "WAIT", "SKIP"]);
+        }
+        if last == Some("SKIP") {
+            return Some(&["LOCKED"]);
         }
         if last == Some("FOR") {
             return Some(&["UPDATE", "SHARE"]);
@@ -17770,18 +19691,146 @@ impl SqlEditorWidget {
         let tokens = Self::current_query_tokens(deep_ctx);
         let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
         let context_end =
-            Self::expected_suggestion_context_end(tokens, cursor_token_len, !prefix.is_empty());
+            Self::expected_keyword_suggestion_context_end(tokens, cursor_token_len, prefix);
         let statement_tokens = deep_ctx.statement_tokens.as_ref();
-        let statement_context_end = Self::expected_suggestion_context_end(
+        let statement_context_end = Self::expected_keyword_suggestion_context_end(
             statement_tokens,
             deep_ctx.cursor_token_len,
-            !prefix.is_empty(),
+            prefix,
         );
         if Self::cursor_is_in_invalid_set_operation_branch_for_context(
             deep_ctx,
             !prefix.is_empty(),
         ) {
             return Vec::new();
+        }
+        if let Some(position) = Self::data_type_position(tokens, context_end) {
+            if position != DataTypePosition::TypeObject {
+                return Self::filter_expected_candidates(
+                    prefix,
+                    data_type_keywords_for(db_type, position),
+                );
+            }
+        }
+        if let Some(candidates) = Self::expected_transaction_and_dcl_keyword_candidates(
+            tokens,
+            context_end,
+            db_type,
+        )
+        .or_else(|| {
+            Self::expected_transaction_and_dcl_keyword_candidates(
+                statement_tokens,
+                statement_context_end,
+                db_type,
+            )
+        })
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(candidates) = Self::expected_plsql_and_routine_keyword_candidates(
+            tokens,
+            context_end,
+            db_type,
+        )
+        .or_else(|| {
+            Self::expected_plsql_and_routine_keyword_candidates(
+                statement_tokens,
+                statement_context_end,
+                db_type,
+            )
+        })
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(candidates) = Self::expected_advanced_oracle_query_keyword_candidates(
+            tokens,
+            context_end,
+            db_type,
+        )
+        .or_else(|| {
+            Self::expected_advanced_oracle_query_keyword_candidates(
+                statement_tokens,
+                statement_context_end,
+                db_type,
+            )
+        })
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(candidates) = Self::expected_cte_and_table_expression_keyword_candidates(
+            tokens,
+            context_end,
+            db_type,
+        )
+        .or_else(|| {
+            Self::expected_cte_and_table_expression_keyword_candidates(
+                statement_tokens,
+                statement_context_end,
+                db_type,
+            )
+        })
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(candidates) = Self::expected_mysql_admin_account_keyword_candidates(
+            tokens,
+            context_end,
+            db_type,
+        )
+        .or_else(|| {
+            Self::expected_mysql_admin_account_keyword_candidates(
+                statement_tokens,
+                statement_context_end,
+                db_type,
+            )
+        })
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(candidates) = Self::expected_mysql_schema_object_keyword_candidates(
+            tokens,
+            context_end,
+            db_type,
+        )
+        .or_else(|| {
+            Self::expected_mysql_schema_object_keyword_candidates(
+                statement_tokens,
+                statement_context_end,
+                db_type,
+            )
+        })
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(candidates) = Self::expected_grouping_returning_and_insert_tail_keyword_candidates(
+            tokens,
+            context_end,
+            db_type,
+        )
+        .or_else(|| {
+            Self::expected_grouping_returning_and_insert_tail_keyword_candidates(
+                statement_tokens,
+                statement_context_end,
+                db_type,
+            )
+        })
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(candidates) = Self::expected_tool_command_supplement_keyword_candidates(
+            tokens,
+            context_end,
+            db_type,
+        )
+        .or_else(|| {
+            Self::expected_tool_command_supplement_keyword_candidates(
+                statement_tokens,
+                statement_context_end,
+                db_type,
+            )
+        })
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
         }
         if let Some(candidates) =
             Self::expected_tool_command_keyword_candidates(tokens, context_end, db_type)
@@ -17938,7 +19987,10 @@ impl SqlEditorWidget {
         if let Some(slot) =
             Self::order_by_sort_modifier_slot(tokens, context_end, deep_ctx.phase)
         {
-            return Self::filter_expected_candidates(prefix, order_by_sort_modifier_keywords(slot));
+            let candidates = order_by_sort_modifier_keywords(slot);
+            if !candidates.is_empty() {
+                return Self::filter_expected_candidates(prefix, candidates);
+            }
         }
 
         if let Some(candidates) =
@@ -17946,14 +19998,81 @@ impl SqlEditorWidget {
         {
             return Self::filter_expected_candidates(prefix, candidates);
         }
-
         if let Some(candidates) =
-            Self::expected_join_target_keyword_candidates(tokens, context_end, deep_ctx.phase)
+            Self::expected_dml_trailing_clause_keywords(tokens, context_end, db_type)
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(candidates) =
+            Self::expected_table_sample_keyword_candidates(tokens, context_end, deep_ctx.phase)
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(candidates) =
+            Self::expected_flashback_query_keyword_candidates(tokens, context_end, deep_ctx.phase)
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(candidates) = Self::expected_transaction_and_dcl_keyword_candidates(
+            tokens,
+            context_end,
+            db_type,
+        )
+        .or_else(|| {
+            Self::expected_transaction_and_dcl_keyword_candidates(
+                statement_tokens,
+                statement_context_end,
+                db_type,
+            )
+        })
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(candidates) =
+            Self::expected_statement_tail_keyword_candidates(tokens, context_end, db_type)
         {
             return Self::filter_expected_candidates(prefix, candidates);
         }
 
+        let join_target_candidates =
+            Self::expected_join_target_keyword_candidates(tokens, context_end, deep_ctx.phase)
+                .or_else(|| {
+                    (!prefix.is_empty()).then(|| {
+                        Self::expected_join_target_keyword_candidates(
+                            tokens,
+                            context_end,
+                            intellisense_context::SqlPhase::FromClause,
+                        )
+                    })?
+                });
+        if let Some(candidates) = join_target_candidates {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+
         let words = Self::previous_meaningful_words_upper(tokens, context_end, 6);
+        if !prefix.is_empty() {
+            let mut filtered = Self::filter_expected_candidates(
+                prefix,
+                Self::expected_query_clause_continuation_keywords_for_any_complete_phase(
+                    tokens,
+                    context_end,
+                    db_type,
+                ),
+            );
+            if filtered.is_empty() {
+                filtered = Self::filter_expected_candidates(
+                    prefix,
+                    Self::expected_query_clause_continuation_keywords_for_any_complete_phase(
+                        statement_tokens,
+                        statement_context_end,
+                        db_type,
+                    ),
+                );
+            }
+            if !filtered.is_empty() {
+                return filtered;
+            }
+        }
         if let Some(candidates) =
             Self::expected_statement_structural_keyword_candidates(
                 statement_tokens,
@@ -17963,17 +20082,41 @@ impl SqlEditorWidget {
         {
             return Self::filter_expected_candidates(prefix, candidates);
         }
+        if matches!(
+            deep_ctx.phase,
+            intellisense_context::SqlPhase::Initial
+                | intellisense_context::SqlPhase::IntoClause
+                | intellisense_context::SqlPhase::UpdateTarget
+                | intellisense_context::SqlPhase::DeleteTarget
+                | intellisense_context::SqlPhase::MergeTarget
+        ) {
+            if let Some(candidates) =
+                Self::expected_dml_statement_head_keyword_candidates(
+                    statement_tokens,
+                    statement_context_end,
+                    db_type,
+                )
+            {
+                return Self::filter_expected_candidates(prefix, candidates);
+            }
+        }
         if let Some(candidates) =
-            Self::expected_dml_statement_head_keyword_candidates(
-                statement_tokens,
-                statement_context_end,
-                db_type,
-            )
+            Self::expected_referential_action_keyword_candidates(tokens, context_end)
         {
             return Self::filter_expected_candidates(prefix, candidates);
         }
         if let Some(candidates) =
-            Self::expected_referential_action_keyword_candidates(tokens, context_end)
+            Self::expected_select_modifier_keyword_candidates(tokens, context_end, db_type)
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(candidates) =
+            Self::expected_create_table_column_definition_tail_keywords(tokens, context_end, db_type)
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(candidates) =
+            Self::expected_select_list_from_keyword_candidates(tokens, context_end)
         {
             return Self::filter_expected_candidates(prefix, candidates);
         }
@@ -17996,6 +20139,9 @@ impl SqlEditorWidget {
             return Self::filter_expected_candidates(prefix, &candidates);
         }
         if let Some(candidates) = Self::merge_then_action_keywords(tokens, context_end) {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(candidates) = Self::merge_action_start_keywords(tokens, context_end) {
             return Self::filter_expected_candidates(prefix, candidates);
         }
         if let Some(candidates) = Self::merge_when_action_keywords(tokens, context_end) {
@@ -18043,7 +20189,13 @@ impl SqlEditorWidget {
             [] => &[],
             [.., last]
                 if !trigger_is_qualified_member
-                    && !before_from
+                    && (!before_from
+                        || (*last == "ORDER"
+                            && (Self::cursor_is_inside_window_spec(tokens, context_end)
+                                || Self::cursor_is_inside_within_group_clause(
+                                    tokens,
+                                    context_end,
+                                ))))
                     && (*last == "ORDER" || *last == "GROUP" || *last == "CONNECT") =>
             {
                 &["BY"]
@@ -18091,7 +20243,6 @@ impl SqlEditorWidget {
             _ => &[],
         };
 
-        let mut result = Self::filter_expected_candidates(prefix, candidates);
         // Merge the construct-mandated operand-tail keywords (`AND` to close a
         // `BETWEEN`, and the `CASE` branch keywords `WHEN`/`THEN`/`ELSE`/`END`).
         // They are additive — the bound/condition/arm operand may still be
@@ -18099,6 +20250,22 @@ impl SqlEditorWidget {
         // replacing them, and are the sole source of these keywords at an empty
         // prefix (the flat base catalog emits no keywords there).
         let tail = Self::expected_expression_construct_continuation_keywords(tokens, context_end);
+        let mut result = Self::filter_expected_candidates(prefix, candidates);
+        if tail.is_empty() {
+            let predicate_tail = Self::expected_common_predicate_keyword_candidates(
+                tokens,
+                context_end,
+                deep_ctx.phase,
+                expr_keyword_ctx,
+            );
+            if !predicate_tail.is_empty() {
+                for keyword in Self::filter_expected_candidates(prefix, predicate_tail) {
+                    if !result.iter().any(|existing| existing.eq_ignore_ascii_case(&keyword)) {
+                        result.push(keyword);
+                    }
+                }
+            }
+        }
         if !tail.is_empty() {
             for keyword in Self::filter_expected_candidates(prefix, tail) {
                 if !result.iter().any(|existing| existing.eq_ignore_ascii_case(&keyword)) {
@@ -18115,12 +20282,24 @@ impl SqlEditorWidget {
         // arm) leaves `tail` non-empty - in both the cursor is not yet at a clean
         // clause boundary, so the openers would be premature.
         let clause_tail = if candidates.is_empty() && tail.is_empty() {
-            Self::expected_query_clause_continuation_keywords(
+            let candidates = Self::expected_query_clause_continuation_keywords(
                 tokens,
                 context_end,
                 deep_ctx.phase,
                 db_type,
-            )
+            );
+            if !prefix.is_empty()
+                && (candidates.is_empty()
+                    || Self::filter_expected_candidates(prefix, candidates).is_empty())
+            {
+                Self::expected_query_clause_continuation_keywords_for_any_complete_phase(
+                    tokens,
+                    context_end,
+                    db_type,
+                )
+            } else {
+                candidates
+            }
         } else {
             &[]
         };
@@ -18739,6 +20918,25 @@ impl SqlEditorWidget {
         Self::current_qualified_identifier_chain_start(tokens, cursor_token_len)
             .unwrap_or(cursor_token_len)
             .min(tokens.len())
+    }
+
+    fn expected_keyword_suggestion_context_end(
+        tokens: &[SqlToken],
+        cursor_token_len: usize,
+        prefix: &str,
+    ) -> usize {
+        let end =
+            Self::expected_suggestion_context_end(tokens, cursor_token_len, !prefix.is_empty());
+        if prefix.is_empty() || end < cursor_token_len || cursor_token_len == 0 {
+            return end;
+        }
+
+        match tokens.get(cursor_token_len.saturating_sub(1)) {
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case(prefix) => {
+                cursor_token_len - 1
+            }
+            _ => end,
+        }
     }
 
     fn collect_expected_object_suggestions_for_kind(

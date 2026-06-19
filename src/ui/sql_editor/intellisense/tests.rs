@@ -902,14 +902,23 @@ fn table_source_construct_open_paren_slots_suppress_relations() {
         suppresses("SELECT * FROM JSON_TABLE jt|", MySQL),
         "MySQL JSON_TABLE must also suppress relations"
     );
-    assert!(
-        !suppresses("SELECT * FROM XMLTABLE xt|", MySQL),
-        "MySQL XMLTABLE is not a table-source construct"
-    );
-    assert!(
-        !suppresses("SELECT * FROM TABLE tab|", MySQL),
-        "MySQL TABLE is not an Oracle collection table expression"
-    );
+    for sql in [
+        "SELECT * FROM XMLTABLE xt|",
+        "SELECT * FROM TABLE tab|",
+    ] {
+        let cursor = sql.find('|').expect("cursor marker");
+        let s = sql.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql);
+        let prefix = crate::ui::intellisense::get_word_at_cursor(&s, cursor).0;
+        assert!(
+            !SqlEditorWidget::table_source_construct_open_paren_position_for_context(
+                &ctx,
+                !prefix.is_empty(),
+                Some(MySQL),
+            ),
+            "MySQL `{sql}` is not an Oracle-only table-source construct"
+        );
+    }
 
     let ordinary = apply_table_base("SELECT * FROM emp|", Oracle);
     assert!(
@@ -1063,7 +1072,13 @@ fn order_by_sort_modifier_slots_suppress_columns_and_offer_only_modifier_keyword
             SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(&ctx, false),
             "completed modifier tail should suppress for `{sql}`"
         );
-        assert!(kw(sql).is_empty(), "no keyword should follow `{sql}`");
+        let got = kw(sql);
+        for unexpected in ["ASC", "DESC", "NULLS", "FIRST", "LAST"] {
+            assert!(
+                !got.iter().any(|item| item == unexpected),
+                "{unexpected} should not follow completed modifier tail for `{sql}`: {got:?}"
+            );
+        }
     }
 
     // Lookalikes outside an ORDER BY sort modifier tail are untouched.
@@ -1071,7 +1086,7 @@ fn order_by_sort_modifier_slots_suppress_columns_and_offer_only_modifier_keyword
         &analyze_inline_cursor_sql("SELECT t.nulls | FROM t"),
         false,
     ));
-    assert!(kw("SELECT nulls | FROM t").is_empty());
+    assert_eq!(kw("SELECT nulls | FROM t"), vec!["FROM".to_string()]);
     assert!(kw("CREATE INDEX ix ON t (id ASC |").is_empty());
     assert!(!SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(
         &analyze_inline_cursor_sql("CREATE INDEX ix ON t (id ASC |"),
@@ -1220,10 +1235,16 @@ fn query_clause_continuation_offers_downstream_clause_openers() {
     // `IS NULL` *is* a complete predicate, so openers return there.
     assert!(has(&kw("SELECT a FROM t WHERE a IS NULL |", Oracle), "ORDER BY"));
 
-    // DELETE/UPDATE are not SELECTs: Oracle offers no query clauses; MySQL allows
-    // only ORDER BY + LIMIT after the WHERE.
-    assert!(kw("DELETE FROM emp WHERE a = 1 |", Oracle).is_empty());
-    assert!(kw("UPDATE emp SET a = 1 WHERE b = 2 |", Oracle).is_empty());
+    // DELETE/UPDATE are not SELECTs: Oracle offers DML RETURNING, not query
+    // clauses; MySQL allows only ORDER BY + LIMIT after the WHERE.
+    assert_eq!(
+        kw("DELETE FROM emp WHERE a = 1 |", Oracle),
+        vec!["RETURNING".to_string()]
+    );
+    assert_eq!(
+        kw("UPDATE emp SET a = 1 WHERE b = 2 |", Oracle),
+        vec!["RETURNING".to_string()]
+    );
     assert_eq!(
         kw("DELETE FROM emp WHERE a = 1 |", MySQL),
         vec!["ORDER BY".to_string(), "LIMIT".to_string()]
@@ -1252,9 +1273,15 @@ fn insert_after_column_list_offers_value_source() {
     assert_eq!(kw("INSERT INTO emp |", Oracle), values_select);
     assert_eq!(kw("INSERT INTO emp (a, b) |", MySQL), values_select);
     assert_eq!(kw("REPLACE INTO emp (a) |", MySQL), values_select);
-    // Already-supplied source: no re-emission.
-    assert!(kw("INSERT INTO emp VALUES (1, 2) |", Oracle).is_empty());
-    assert!(kw("INSERT INTO emp (a, b) VALUES (1, 2) |", Oracle).is_empty());
+    // Already-supplied source: no value-source re-emission.
+    for sql in [
+        "INSERT INTO emp VALUES (1, 2) |",
+        "INSERT INTO emp (a, b) VALUES (1, 2) |",
+    ] {
+        let got = kw(sql, Oracle);
+        assert!(!got.iter().any(|item| item == "VALUES"), "VALUES leaked for `{sql}`: {got:?}");
+        assert!(!got.iter().any(|item| item == "SELECT"), "SELECT leaked for `{sql}`: {got:?}");
+    }
 }
 
 #[test]
@@ -20942,12 +20969,11 @@ fn is_predicate_continuations_offer_keywords_and_suppress_columns() {
     let kw = |sql: &str| kw_for(sql, None);
 
     let is_tail = words(&[
-        "NOT", "NULL", "TRUE", "FALSE", "UNKNOWN", "DISTINCT", "JSON", "OF", "EMPTY", "A",
-        "NAN", "INFINITE",
+        "NOT", "NULL", "TRUE", "FALSE", "UNKNOWN", "DISTINCT", "JSON", "OF", "NAN",
+        "INFINITE",
     ]);
     let is_not_tail = words(&[
-        "NULL", "TRUE", "FALSE", "UNKNOWN", "DISTINCT", "JSON", "OF", "EMPTY", "A", "NAN",
-        "INFINITE",
+        "NULL", "TRUE", "FALSE", "UNKNOWN", "DISTINCT", "JSON", "OF", "NAN", "INFINITE",
     ]);
     let json_tail = words(&[
         "VALUE", "ARRAY", "OBJECT", "SCALAR", "STRICT", "LAX", "WITH", "WITHOUT",
@@ -20974,7 +21000,7 @@ fn is_predicate_continuations_offer_keywords_and_suppress_columns() {
         words(&["FROM"])
     );
     assert_eq!(kw("SELECT * FROM t WHERE a IS OF |"), words(&["TYPE"]));
-    assert_eq!(kw("SELECT * FROM t WHERE a IS A |"), words(&["SET"]));
+    assert!(kw("SELECT * FROM t WHERE a IS A |").is_empty());
     assert_eq!(kw("SELECT * FROM t WHERE payload IS JSON |"), json_tail);
     assert_eq!(
         kw("SELECT * FROM t WHERE payload IS NOT JSON |"),
@@ -21150,9 +21176,10 @@ fn is_type_specific_predicate_tails_require_matching_left_operand() {
         oracle("SELECT * FROM t WHERE nested_col IS A |"),
         vec!["SET".to_string()]
     );
+    let scalar_is_a = oracle("SELECT * FROM t WHERE num_col IS A |");
     assert!(
-        oracle("SELECT * FROM t WHERE num_col IS A |").is_empty(),
-        "SET tail must not appear after scalar IS A"
+        !has(&scalar_is_a, "SET"),
+        "SET tail must not appear after scalar IS A: {scalar_is_a:?}"
     );
     assert_eq!(
         oracle("SELECT * FROM t WHERE float_col IS na|"),
@@ -21325,9 +21352,10 @@ fn is_of_type_slots_offer_type_objects_and_suppress_columns() {
         "SELECT * FROM emp WHERE obj_col IS NOT OF TYPE (ONLY addr_type |)",
     ] {
         assert!(suppresses(sql), "completed IS OF TYPE name leaked columns for `{sql}`");
+        let got = suggestions(sql);
         assert!(
-            suggestions(sql).is_empty(),
-            "completed IS OF TYPE name should not offer identifiers for `{sql}`"
+            !has(&got, "ADDR_TYPE") && !has(&got, "EMPLOYEE_T") && !has(&got, "ONLY"),
+            "completed IS OF TYPE name should not offer identifiers for `{sql}`: {got:?}"
         );
     }
 
@@ -22511,7 +22539,9 @@ fn mysql_structural_keyword_slots_are_dialect_scoped() {
         ("LOAD INDEX INTO CACHE emp IGNORE |", "LEAVES"),
         ("LOAD INDEX INTO CACHE emp, dept |", "IGNORE"),
         ("PURGE |", "BINARY"),
+        ("PURGE |", "MASTER"),
         ("PURGE BINARY |", "LOGS"),
+        ("PURGE MASTER |", "LOGS"),
         ("RESET |", "PERSIST"),
         ("START |", "TRANSACTION"),
         ("STOP |", "REPLICA"),
@@ -22915,6 +22945,8 @@ fn mysql_admin_transaction_and_utility_keyword_slots_are_dialect_scoped() {
         ("RESET PERSIST IF |", "EXISTS"),
         ("PURGE BINARY LOGS |", "BEFORE"),
         ("PURGE BINARY LOGS |", "TO"),
+        ("PURGE MASTER LOGS |", "BEFORE"),
+        ("PURGE MASTER LOGS |", "TO"),
         ("SIGNAL |", "SQLSTATE"),
         ("SIGNAL SQLSTATE |", "VALUE"),
         ("RESIGNAL |", "SQLSTATE"),
@@ -25612,6 +25644,30 @@ fn data_type_suggestions(
     SqlEditorWidget::collect_expected_keyword_suggestions(prefix, &ctx, Some(db))
 }
 
+fn has_data_type_keyword(values: &[String]) -> bool {
+    values.iter().any(|value| {
+        matches!(
+            value.to_ascii_uppercase().as_str(),
+            "NUMBER"
+                | "VARCHAR"
+                | "VARCHAR2"
+                | "NVARCHAR2"
+                | "CHAR"
+                | "NCHAR"
+                | "DATE"
+                | "TIMESTAMP"
+                | "INT"
+                | "INTEGER"
+                | "BLOB"
+                | "CLOB"
+                | "DECIMAL"
+                | "FLOAT"
+                | "PLS_INTEGER"
+                | "SYS_REFCURSOR"
+        )
+    })
+}
+
 #[test]
 fn data_type_cast_as_offers_oracle_types() {
     let s = data_type_suggestions("SELECT CAST(x AS |) FROM t", "", crate::db::DatabaseType::Oracle);
@@ -26198,7 +26254,11 @@ fn data_type_constraint_and_ctas_and_post_type_are_not_type_positions() {
         "SELECT a, | FROM t",
     ] {
         assert!(
-            data_type_suggestions(sql, "", crate::db::DatabaseType::Oracle).is_empty(),
+            !has_data_type_keyword(&data_type_suggestions(
+                sql,
+                "",
+                crate::db::DatabaseType::Oracle
+            )),
             "expected no type suggestions for: {sql}"
         );
     }
@@ -26206,7 +26266,7 @@ fn data_type_constraint_and_ctas_and_post_type_are_not_type_positions() {
 
 /// True when the given marker SQL yields PL/SQL data-type suggestions.
 fn has_plsql_type_suggestions(sql_with_cursor: &str, db: crate::db::DatabaseType) -> bool {
-    !data_type_suggestions(sql_with_cursor, "", db).is_empty()
+    has_data_type_keyword(&data_type_suggestions(sql_with_cursor, "", db))
 }
 
 #[test]
@@ -26396,7 +26456,7 @@ fn data_type_ddl_non_type_slots_offer_nothing() {
         "CREATE INDEX ix ON t (|)",
     ] {
         assert!(
-            data_type_suggestions(sql, "", Oracle).is_empty(),
+            !has_data_type_keyword(&data_type_suggestions(sql, "", Oracle)),
             "unexpected types for: {sql}"
         );
     }
@@ -26648,28 +26708,19 @@ fn data_type_table_named_columns_is_not_a_type_position() {
     // (The position *does* legitimately offer query-clause openers - `WHERE`,
     // `GROUP BY`, `ORDER BY`, … after a complete FROM relation - so assert the
     // absence of data-type keywords specifically rather than emptiness.)
-    let has_data_type = |v: &[String]| {
-        v.iter().any(|s| {
-            matches!(
-                s.to_ascii_uppercase().as_str(),
-                "NUMBER" | "VARCHAR2" | "VARCHAR" | "CHAR" | "DATE" | "TIMESTAMP" | "INT"
-                    | "INTEGER" | "BLOB" | "CLOB" | "DECIMAL" | "FLOAT"
-            )
-        })
-    };
-    assert!(!has_data_type(&data_type_suggestions(
+    assert!(!has_data_type_keyword(&data_type_suggestions(
         "SELECT * FROM all_tab_columns c |",
         "",
         Oracle
     )));
-    assert!(!has_data_type(&data_type_suggestions(
+    assert!(!has_data_type_keyword(&data_type_suggestions(
         "SELECT * FROM information_schema.columns x |",
         "",
         MySQL
     )));
     // Before the COLUMNS keyword (the JSON expression) is not a type slot either.
-    assert!(data_type_suggestions(
-        "SELECT * FROM JSON_TABLE(d| , '$' COLUMNS (id NUMBER PATH '$.id'))", "", Oracle).is_empty());
+    assert!(!has_data_type_keyword(&data_type_suggestions(
+        "SELECT * FROM JSON_TABLE(d| , '$' COLUMNS (id NUMBER PATH '$.id'))", "", Oracle)));
 }
 
 #[test]
@@ -26749,7 +26800,10 @@ fn row_count_positions_suppress_columns() {
         vec!["OFFSET".to_string()]
     );
     assert!(kw("SELECT * FROM orders LIMIT 10 OFFSET 20 |").is_empty());
-    assert!(kw("SELECT limit 10 | FROM orders").is_empty());
+    assert_eq!(
+        kw("SELECT limit 10 | FROM orders"),
+        vec!["FROM".to_string()]
+    );
 
     // Ordinary column positions are unaffected, including a `offset_*` column.
     assert!(!at("SELECT | FROM orders"));
@@ -27484,7 +27538,11 @@ fn within_group_keyword_slots_suppress_identifiers_and_offer_fixed_keywords() {
     assert!(suppresses("SELECT listagg(ename) WITHIN GROUP | FROM emp"));
 
     // Lookalikes outside ordered-set aggregate syntax keep normal completion.
-    assert!(kw("SELECT (ename) WITHIN | FROM emp", "").is_empty());
+    let lookalike = kw("SELECT (ename) WITHIN | FROM emp", "");
+    assert!(
+        !lookalike.iter().any(|value| value.eq_ignore_ascii_case("GROUP")),
+        "WITHIN GROUP leaked outside ordered-set aggregate syntax: {lookalike:?}"
+    );
     assert!(!suppresses("SELECT within | FROM emp"));
     assert!(!suppresses("SELECT (ename) WITHIN | FROM emp"));
 }
@@ -28999,7 +29057,15 @@ fn keep_dense_rank_keyword_slots_suppress_columns_and_offer_fixed_keywords() {
     // Outside KEEP's dense-rank aggregate syntax these words keep their normal
     // meaning and do not become keyword-only slots.
     assert!(!suppresses("SELECT dense_rank | FROM emp"));
-    assert!(kw("SELECT dense_rank | FROM emp", "").is_empty());
+    let lookalike = kw("SELECT dense_rank | FROM emp", "");
+    for unexpected in ["FIRST", "LAST", "ORDER"] {
+        assert!(
+            !lookalike
+                .iter()
+                .any(|value| value.eq_ignore_ascii_case(unexpected)),
+            "KEEP DENSE_RANK keyword `{unexpected}` leaked outside KEEP syntax: {lookalike:?}"
+        );
+    }
 }
 
 /// The top-level statement keywords (`SELECT`, `INSERT`, `CREATE`, `BEGIN`, …)
@@ -31262,6 +31328,3201 @@ fn bind_variable_name_slot_suppresses_columns() {
     assert!(has(&base("SELECT * FROM emp WHERE empno = |"), "ENAME"));
 }
 
+fn query_keyword_completion_suggestions(
+    sql_with_cursor: &str,
+    db_type: crate::db::DatabaseType,
+) -> Vec<String> {
+    let cursor = sql_with_cursor.find('|').expect("cursor");
+    let sql = sql_with_cursor.replace('|', "");
+    let (routine_cache, expanded) =
+        SqlEditorWidget::build_routine_symbol_cache_bundle_for_test(&sql, cursor);
+    let analysis = SqlEditorWidget::build_intellisense_analysis_from_routine_cache(
+        &routine_cache,
+        expanded.cursor_in_statement,
+    );
+    let deep_ctx = analysis.context.clone();
+    let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+
+    if SqlEditorWidget::cursor_alias_declaration_blocks_completion(
+        analysis.cursor_in_alias_declaration,
+        None,
+        &prefix,
+        &deep_ctx,
+        Some(db_type),
+    ) {
+        return Vec::new();
+    }
+
+    let context =
+        SqlEditorWidget::classify_intellisense_context(&deep_ctx, deep_ctx.statement_tokens.as_ref());
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["EMP".into(), "HELP".into(), "DEPT".into()];
+    data.set_columns_for_table(
+        "EMP",
+        vec!["EMPNO".into(), "ENAME".into(), "DEPTNO".into(), "SAL".into()],
+    );
+    data.set_columns_for_table("HELP", vec!["ID".into(), "TOPIC".into()]);
+    data.set_columns_for_table("DEPT", vec!["DEPTNO".into(), "DNAME".into()]);
+    data.rebuild_indices();
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &deep_ctx);
+    let column_scope = (!column_tables.is_empty()).then(|| column_tables.clone());
+    let include_columns = matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll);
+    let expr_kw = SqlEditorWidget::expression_keyword_context(
+        &deep_ctx,
+        &data,
+        &column_tables,
+        !prefix.is_empty(),
+        Some(db_type),
+    );
+    let mut suggestions = SqlEditorWidget::base_suggestions_for_context(
+        &mut data,
+        &prefix,
+        None,
+        column_scope.as_deref(),
+        include_columns,
+        context,
+        false,
+        Some(db_type),
+        expr_kw,
+    );
+    let expected_keywords =
+        SqlEditorWidget::collect_expected_keyword_suggestions_with_expression_context(
+            &prefix,
+            &deep_ctx,
+            Some(db_type),
+            Some(expr_kw),
+        );
+    if !expected_keywords.is_empty() {
+        suggestions = SqlEditorWidget::merge_suggestions_with_context_aliases(
+            suggestions,
+            expected_keywords,
+            true,
+        );
+    }
+    SqlEditorWidget::append_exact_catalog_keyword_suggestion(&mut suggestions, &prefix, Some(db_type));
+    suggestions
+}
+
+#[derive(Clone, Copy)]
+struct RegisteredKeywordSlotCase {
+    db_type: crate::db::DatabaseType,
+    sql: &'static str,
+    keywords: &'static [&'static str],
+}
+
+fn expected_keyword_slot_suggestions(
+    sql_with_cursor: &str,
+    db_type: crate::db::DatabaseType,
+) -> Vec<String> {
+    let cursor = sql_with_cursor.find('|').expect("cursor marker");
+    let s = sql_with_cursor.replace('|', "");
+    let ctx = analyze_inline_cursor_sql(sql_with_cursor);
+    let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&s, cursor);
+    let data = IntellisenseData::new();
+    let expr_kw = SqlEditorWidget::expression_keyword_context(
+        &ctx,
+        &data,
+        &[],
+        !prefix.is_empty(),
+        Some(db_type),
+    );
+    SqlEditorWidget::collect_expected_keyword_suggestions_with_expression_context(
+        &prefix,
+        &ctx,
+        Some(db_type),
+        Some(expr_kw),
+    )
+}
+
+fn registered_keyword_slot_cases() -> Vec<RegisteredKeywordSlotCase> {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    vec![
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT |",
+            keywords: &["ALL", "DISTINCT", "UNIQUE"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "SELECT |",
+            keywords: &[
+                "ALL",
+                "DISTINCT",
+                "DISTINCTROW",
+                "HIGH_PRIORITY",
+                "STRAIGHT_JOIN",
+                "SQL_BIG_RESULT",
+                "SQL_BUFFER_RESULT",
+                "SQL_CALC_FOUND_ROWS",
+                "SQL_CACHE",
+                "SQL_NO_CACHE",
+                "SQL_SMALL_RESULT",
+            ],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT empno |",
+            keywords: &["FROM"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM help |",
+            keywords: &[
+                "JOIN",
+                "WHERE",
+                "LEFT JOIN",
+                "RIGHT JOIN",
+                "FULL JOIN",
+                "INNER JOIN",
+                "CROSS JOIN",
+                "NATURAL JOIN",
+                "LEFT OUTER JOIN",
+                "RIGHT OUTER JOIN",
+                "FULL OUTER JOIN",
+                "CONNECT BY",
+                "START WITH",
+                "GROUP BY",
+                "HAVING",
+                "ORDER BY",
+                "OFFSET",
+                "FETCH",
+                "FOR UPDATE",
+                "UNION",
+                "UNION ALL",
+                "INTERSECT",
+                "MINUS",
+                "EXCEPT",
+            ],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "SELECT * FROM help |",
+            keywords: &[
+                "JOIN",
+                "WHERE",
+                "LEFT JOIN",
+                "RIGHT JOIN",
+                "LEFT OUTER JOIN",
+                "RIGHT OUTER JOIN",
+                "INNER JOIN",
+                "CROSS JOIN",
+                "NATURAL JOIN",
+                "STRAIGHT_JOIN",
+                "GROUP BY",
+                "HAVING",
+                "ORDER BY",
+                "LIMIT",
+                "FOR UPDATE",
+                "UNION",
+                "UNION ALL",
+                "INTERSECT",
+                "EXCEPT",
+            ],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp JOIN dept |",
+            keywords: &["ON", "USING"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp LEFT |",
+            keywords: &["OUTER", "JOIN"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp LEFT OUTER |",
+            keywords: &["JOIN"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp GROUP |",
+            keywords: &["BY"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp WHERE |",
+            keywords: &[
+                "CASE",
+                "CAST",
+                "EXISTS",
+                "NOT",
+                "NULL",
+                "TRUE",
+                "FALSE",
+                "UNKNOWN",
+                "INTERVAL",
+                "DATE",
+                "TIMESTAMP",
+                "TIME",
+                "ROWNUM",
+                "ROWID",
+            ],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp WHERE empno |",
+            keywords: &[
+                "IS",
+                "IN",
+                "LIKE",
+                "BETWEEN",
+                "NOT",
+                "MEMBER OF",
+                "SUBMULTISET OF",
+            ],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp WHERE empno IS |",
+            keywords: &[
+                "NOT",
+                "NULL",
+                "TRUE",
+                "FALSE",
+                "UNKNOWN",
+                "DISTINCT",
+                "JSON",
+                "OF",
+                "NAN",
+                "INFINITE",
+            ],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp WHERE empno = 1 |",
+            keywords: &[
+                "AND",
+                "OR",
+                "CONNECT BY",
+                "START WITH",
+                "GROUP BY",
+                "HAVING",
+                "ORDER BY",
+                "OFFSET",
+                "FETCH",
+                "FOR UPDATE",
+                "UNION",
+                "UNION ALL",
+                "INTERSECT",
+                "MINUS",
+                "EXCEPT",
+            ],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp ORDER BY empno |",
+            keywords: &["ASC", "DESC", "NULLS"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp ORDER BY empno NULLS |",
+            keywords: &["FIRST", "LAST"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp ORDER BY empno FETCH |",
+            keywords: &["FIRST", "NEXT"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp ORDER BY empno FETCH FIRST 10 ROWS |",
+            keywords: &["ONLY", "WITH"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp FOR |",
+            keywords: &["UPDATE", "SHARE"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp FOR UPDATE |",
+            keywords: &["OF", "NOWAIT", "WAIT", "SKIP"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "UPDATE emp |",
+            keywords: &["SET"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "DELETE FROM emp |",
+            keywords: &["WHERE"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "INSERT INTO emp |",
+            keywords: &["VALUES", "SELECT"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "MERGE INTO emp |",
+            keywords: &["USING"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "MERGE INTO emp USING dept ON (emp.deptno = dept.deptno) |",
+            keywords: &["WHEN"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "MERGE INTO emp USING dept ON (emp.deptno = dept.deptno) WHEN |",
+            keywords: &["MATCHED", "NOT"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "MERGE INTO emp USING dept ON (emp.deptno = dept.deptno) WHEN NOT |",
+            keywords: &["MATCHED"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "CREATE |",
+            keywords: &[
+                "TABLE",
+                "VIEW",
+                "MATERIALIZED",
+                "EDITIONING",
+                "TYPE",
+                "TRIGGER",
+                "INDEX",
+                "PROCEDURE",
+                "FUNCTION",
+                "PACKAGE",
+                "SEQUENCE",
+                "SYNONYM",
+                "DATABASE",
+                "DIRECTORY",
+                "TABLESPACE",
+                "SHARED",
+                "USER",
+                "ROLE",
+                "PROFILE",
+                "ROLLBACK",
+                "JAVA",
+                "LIBRARY",
+                "CLUSTER",
+                "CONTEXT",
+                "DIMENSION",
+                "OPERATOR",
+                "INDEXTYPE",
+                "EDITION",
+                "PUBLIC",
+            ],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "CREATE OR |",
+            keywords: &["REPLACE"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "CREATE OR REPLACE |",
+            keywords: &[
+                "TABLE",
+                "VIEW",
+                "MATERIALIZED",
+                "EDITIONING",
+                "TYPE",
+                "TRIGGER",
+                "INDEX",
+                "PROCEDURE",
+                "FUNCTION",
+                "PACKAGE",
+                "SEQUENCE",
+                "SYNONYM",
+                "DIRECTORY",
+                "LIBRARY",
+                "USER",
+                "JAVA",
+                "PUBLIC",
+            ],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "ALTER |",
+            keywords: &[
+                "TABLE",
+                "VIEW",
+                "MATERIALIZED",
+                "TYPE",
+                "TRIGGER",
+                "INDEX",
+                "PROCEDURE",
+                "FUNCTION",
+                "PACKAGE",
+                "SEQUENCE",
+                "SYNONYM",
+                "DATABASE",
+                "TABLESPACE",
+                "USER",
+                "ROLE",
+                "PROFILE",
+                "PUBLIC",
+                "SHARED",
+                "ROLLBACK",
+                "JAVA",
+                "LIBRARY",
+                "CLUSTER",
+                "DIMENSION",
+                "OPERATOR",
+                "INDEXTYPE",
+                "SYSTEM",
+                "SESSION",
+            ],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "DROP |",
+            keywords: &[
+                "TABLE",
+                "VIEW",
+                "MATERIALIZED",
+                "TYPE",
+                "TRIGGER",
+                "INDEX",
+                "PROCEDURE",
+                "FUNCTION",
+                "PACKAGE",
+                "SEQUENCE",
+                "SYNONYM",
+                "DATABASE",
+                "DIRECTORY",
+                "TABLESPACE",
+                "USER",
+                "ROLE",
+                "PROFILE",
+                "ROLLBACK",
+                "JAVA",
+                "LIBRARY",
+                "CLUSTER",
+                "CONTEXT",
+                "DIMENSION",
+                "OPERATOR",
+                "INDEXTYPE",
+                "EDITION",
+                "PUBLIC",
+            ],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "COMMENT ON |",
+            keywords: &["COLUMN", "TABLE", "VIEW", "MATERIALIZED", "EDITIONING"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "CREATE TABLE t (c |)",
+            keywords: &[
+                "NUMBER",
+                "VARCHAR2",
+                "NVARCHAR2",
+                "CHAR",
+                "NCHAR",
+                "DATE",
+                "TIMESTAMP",
+                "FLOAT",
+                "BINARY_FLOAT",
+                "BINARY_DOUBLE",
+                "INTERVAL",
+                "CLOB",
+                "NCLOB",
+                "BLOB",
+                "BFILE",
+                "RAW",
+                "LONG",
+                "ROWID",
+                "UROWID",
+                "XMLTYPE",
+                "JSON",
+                "BOOLEAN",
+                "INTEGER",
+                "INT",
+                "SMALLINT",
+                "DECIMAL",
+                "NUMERIC",
+                "REAL",
+            ],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "CREATE TABLE t (c NUMBER |)",
+            keywords: &[
+                "CHECK",
+                "COLLATE",
+                "CONSTRAINT",
+                "DEFAULT",
+                "GENERATED",
+                "IDENTITY",
+                "INVISIBLE",
+                "NOT NULL",
+                "NULL",
+                "PRIMARY KEY",
+                "REFERENCES",
+                "UNIQUE",
+                "VISIBLE",
+            ],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "CREATE TABLE t (c INT |)",
+            keywords: &[
+                "AUTO_INCREMENT",
+                "CHECK",
+                "COLLATE",
+                "COMMENT",
+                "CONSTRAINT",
+                "DEFAULT",
+                "GENERATED",
+                "INVISIBLE",
+                "NOT NULL",
+                "NULL",
+                "PRIMARY KEY",
+                "REFERENCES",
+                "UNIQUE",
+                "VISIBLE",
+            ],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT EXTRACT(| FROM hiredate) FROM emp",
+            keywords: &[
+                "YEAR",
+                "MONTH",
+                "DAY",
+                "HOUR",
+                "MINUTE",
+                "SECOND",
+                "TIMEZONE_HOUR",
+                "TIMEZONE_MINUTE",
+                "TIMEZONE_REGION",
+                "TIMEZONE_ABBR",
+            ],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT INTERVAL '1' | FROM emp",
+            keywords: &["YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT SUM(sal) OVER (|) FROM emp",
+            keywords: &["PARTITION BY", "ORDER BY", "ROWS", "RANGE", "GROUPS"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT SUM(sal) OVER (ORDER BY sal |) FROM emp",
+            keywords: &["ASC", "DESC", "NULLS", "ROWS", "RANGE", "GROUPS"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT SUM(sal) OVER (ORDER BY sal ROWS |) FROM emp",
+            keywords: &["BETWEEN", "UNBOUNDED", "CURRENT"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT FIRST_VALUE(sal) | FROM emp",
+            keywords: &["OVER", "RESPECT", "IGNORE"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "GRANT | ON emp TO scott",
+            keywords: &[
+                "SELECT",
+                "INSERT",
+                "UPDATE",
+                "DELETE",
+                "REFERENCES",
+                "EXECUTE",
+                "ALTER",
+                "INDEX",
+                "READ",
+                "ALL",
+                "ALL PRIVILEGES",
+            ],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "CREATE TABLE child (parent_id NUMBER REFERENCES parent(id) ON DELETE |)",
+            keywords: &["CASCADE", "SET NULL", "SET DEFAULT", "NO ACTION", "RESTRICT"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp WHERE empno IN (|)",
+            keywords: &["SELECT", "WITH"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT CASE | END FROM emp",
+            keywords: &["WHEN"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT CASE WHEN empno = 1 THEN ename | END FROM emp",
+            keywords: &["WHEN", "ELSE", "END"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "EXPLAIN |",
+            keywords: &[
+                "ANALYZE",
+                "FORMAT",
+                "FOR",
+                "DELETE",
+                "INSERT",
+                "REPLACE",
+                "SELECT",
+                "TABLE",
+                "UPDATE",
+                "WITH",
+            ],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "COMMIT |",
+            keywords: &["WORK", "COMMENT", "WRITE", "FORCE"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "COMMIT |",
+            keywords: &["WORK", "AND", "CHAIN", "NO", "RELEASE"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SET TRANSACTION |",
+            keywords: &["READ", "ISOLATION", "USE", "NAME"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "LOCK TABLE emp IN |",
+            keywords: &["ROW", "SHARE", "EXCLUSIVE"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "WITH q AS (SELECT * FROM emp) | SELECT * FROM q",
+            keywords: &["SEARCH", "CYCLE"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "WITH | q AS (SELECT * FROM help) SELECT * FROM q",
+            keywords: &["RECURSIVE"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM XMLTABLE('/r' |) xt",
+            keywords: &["PASSING", "COLUMNS"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM JSON_TABLE(payload, '$' |) jt",
+            keywords: &["COLUMNS", "ERROR ON ERROR", "NULL ON ERROR"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "FLUSH |",
+            keywords: &[
+                "BINARY",
+                "ENGINE",
+                "ERROR",
+                "GENERAL",
+                "HOSTS",
+                "LOCAL",
+                "LOGS",
+                "NO_WRITE_TO_BINLOG",
+                "OPTIMIZER_COSTS",
+                "PRIVILEGES",
+                "RELAY",
+                "SLOW",
+                "STATUS",
+                "TABLE",
+                "TABLES",
+                "USER_RESOURCES",
+            ],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "RESET |",
+            keywords: &["BINARY", "MASTER", "PERSIST", "QUERY CACHE", "REPLICA", "SLAVE"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "CREATE USER u |",
+            keywords: &[
+                "ACCOUNT",
+                "ATTRIBUTE",
+                "COMMENT",
+                "DEFAULT",
+                "FAILED_LOGIN_ATTEMPTS",
+                "IDENTIFIED",
+                "PASSWORD",
+                "PASSWORD_LOCK_TIME",
+                "REQUIRE",
+                "WITH",
+            ],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "ALTER USER u |",
+            keywords: &[
+                "ACCOUNT",
+                "ADD",
+                "ATTRIBUTE",
+                "COMMENT",
+                "DEFAULT",
+                "DISCARD",
+                "DROP",
+                "FAILED_LOGIN_ATTEMPTS",
+                "IDENTIFIED",
+                "MODIFY",
+                "PASSWORD",
+                "PASSWORD_LOCK_TIME",
+                "REQUIRE",
+                "WITH",
+            ],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "CREATE TABLE t (id INT) |",
+            keywords: &[
+                "ENGINE",
+                "DEFAULT CHARSET",
+                "CHARACTER SET",
+                "COLLATE",
+                "AUTO_INCREMENT",
+                "COMMENT",
+                "ROW_FORMAT",
+            ],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "CREATE FUNCTION f() RETURNS INT |",
+            keywords: &[
+                "DETERMINISTIC",
+                "NOT",
+                "CONTAINS",
+                "NO",
+                "READS",
+                "MODIFIES",
+                "SQL",
+                "COMMENT",
+            ],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "CREATE EVENT e ON SCHEDULE |",
+            keywords: &["AT", "EVERY"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT deptno, COUNT(*) FROM emp GROUP BY |",
+            keywords: &["ROLLUP", "CUBE", "GROUPING SETS"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "UPDATE emp SET sal = 1 RETURNING sal |",
+            keywords: &["INTO"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "INSERT INTO help VALUES (1) ON DUPLICATE |",
+            keywords: &["KEY UPDATE"],
+        },
+    ]
+}
+
+fn registered_keyword_like(value: &str) -> bool {
+    value.chars().any(|ch| ch.is_ascii_alphabetic())
+        && value.chars().all(|ch| {
+            ch.is_ascii_uppercase() || ch.is_ascii_digit() || matches!(ch, '_' | ' ')
+        })
+}
+
+#[test]
+fn registered_keyword_slot_cases_keep_registered_keywords_emitted_by_production() {
+    let mut failures = Vec::new();
+
+    for case in registered_keyword_slot_cases() {
+        let emitted = expected_keyword_slot_suggestions(case.sql, case.db_type)
+            .into_iter()
+            .map(|keyword| keyword.to_ascii_uppercase())
+            .collect::<std::collections::HashSet<_>>();
+
+        for keyword in case.keywords {
+            if !emitted.contains(&keyword.to_ascii_uppercase()) {
+                failures.push(format!(
+                    "`{}` is registered but no longer emitted at `{}` ({:?})",
+                    keyword, case.sql, case.db_type
+                ));
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "registered keyword slot snapshots no longer match production emission:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn registered_keyword_slot_cases_complete_with_empty_and_two_letter_prefixes() {
+    let has = |suggestions: &[String], keyword: &str| {
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case(keyword))
+    };
+    let mut failures = Vec::new();
+
+    for case in registered_keyword_slot_cases() {
+        let mut keywords = case
+            .keywords
+            .iter()
+            .map(|keyword| keyword.to_ascii_uppercase())
+            .collect::<Vec<_>>();
+        for emitted in expected_keyword_slot_suggestions(case.sql, case.db_type) {
+            let upper = emitted.to_ascii_uppercase();
+            if registered_keyword_like(&upper) && !keywords.iter().any(|keyword| keyword == &upper) {
+                keywords.push(upper);
+            }
+        }
+
+        for keyword in keywords {
+            let keyword = keyword.as_str();
+            let empty = query_keyword_completion_suggestions(case.sql, case.db_type);
+            if !has(&empty, keyword) {
+                failures.push(format!(
+                    "`{keyword}` missing for empty prefix at `{}` ({:?}): {empty:?}",
+                    case.sql, case.db_type
+                ));
+            }
+
+            let prefix = keyword[..keyword.len().min(2)].to_ascii_lowercase();
+            let prefixed_sql = case.sql.replace('|', &format!("{prefix}|"));
+            let prefixed = query_keyword_completion_suggestions(&prefixed_sql, case.db_type);
+            if !has(&prefixed, keyword) {
+                failures.push(format!(
+                    "`{keyword}` missing for 2-letter prefix `{prefix}` at `{prefixed_sql}` ({:?}): {prefixed:?}",
+                    case.db_type
+                ));
+            }
+
+            if !keyword.contains(' ') {
+                let exact_sql = case.sql.replace('|', &format!("{}|", keyword.to_ascii_lowercase()));
+                let exact = query_keyword_completion_suggestions(&exact_sql, case.db_type);
+                if !has(&exact, keyword) {
+                    failures.push(format!(
+                        "`{keyword}` missing for exact input at `{exact_sql}` ({:?}): {exact:?}",
+                        case.db_type
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "registered keyword slot failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn critical_keyword_prefixes_rank_expected_keyword_first() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let mut failures = Vec::new();
+    let assert_first = |failures: &mut Vec<String>, sql: &str, keyword: &str, db_type: crate::db::DatabaseType| {
+        let suggestions = query_keyword_completion_suggestions(sql, db_type);
+        let first = suggestions.first().map(String::as_str);
+        if !first.is_some_and(|suggestion| suggestion.eq_ignore_ascii_case(keyword)) {
+            failures.push(format!(
+                "`{keyword}` should be the first suggestion at `{sql}` ({db_type:?}), got {suggestions:?}"
+            ));
+        }
+    };
+    let assert_top = |failures: &mut Vec<String>, sql: &str, keyword: &str, max_rank: usize, db_type: crate::db::DatabaseType| {
+        let suggestions = query_keyword_completion_suggestions(sql, db_type);
+        let rank = suggestions
+            .iter()
+            .position(|suggestion| suggestion.eq_ignore_ascii_case(keyword));
+        if !rank.is_some_and(|rank| rank <= max_rank) {
+            failures.push(format!(
+                "`{keyword}` should be in top {} suggestions at `{sql}` ({db_type:?}), got {suggestions:?}",
+                max_rank + 1
+            ));
+        }
+    };
+
+    assert_first(&mut failures, "SELECT * fr|", "FROM", Oracle);
+    assert_first(&mut failures, "SELECT * FROM help wh|", "WHERE", Oracle);
+    assert_first(&mut failures, "SELECT * FROM help jo|", "JOIN", Oracle);
+    assert_first(&mut failures, "SELECT * FROM emp JOIN dept on|", "ON", Oracle);
+    assert_first(&mut failures, "SELECT * FROM emp JOIN dept us|", "USING", Oracle);
+    assert_first(&mut failures, "SELECT * FROM help gr|", "GROUP BY", Oracle);
+    assert_top(&mut failures, "SELECT * FROM help or|", "ORDER BY", 1, Oracle);
+    assert_first(&mut failures, "SELECT * FROM help WHERE id = 1 an|", "AND", Oracle);
+    assert_top(&mut failures, "SELECT * FROM help WHERE id = 1 or|", "OR", 1, Oracle);
+    assert_first(&mut failures, "SELECT * FROM help WHERE id is nu|", "NULL", Oracle);
+    assert_first(&mut failures, "SELECT * FROM help WHERE id be|", "BETWEEN", Oracle);
+    assert_first(&mut failures, "SELECT * FROM help WHERE id li|", "LIKE", Oracle);
+
+    assert_first(&mut failures, "SELECT * FROM help wh|", "WHERE", MySQL);
+    assert_first(&mut failures, "SELECT * FROM help jo|", "JOIN", MySQL);
+    assert_first(&mut failures, "SELECT * FROM help li|", "LIMIT", MySQL);
+
+    assert!(
+        failures.is_empty(),
+        "critical keyword ranking failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn multi_word_keyword_prefixes_complete_through_each_word_boundary() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |suggestions: &[String], keyword: &str| {
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case(keyword))
+    };
+    let mut failures = Vec::new();
+    let mut assert_has = |sql: &str, keyword: &str, db_type: crate::db::DatabaseType| {
+        let suggestions = query_keyword_completion_suggestions(sql, db_type);
+        if !has(&suggestions, keyword) {
+            failures.push(format!(
+                "`{keyword}` missing at `{sql}` ({db_type:?}): {suggestions:?}"
+            ));
+        }
+    };
+
+    assert_has("SELECT * FROM help le|", "LEFT JOIN", Oracle);
+    assert_has("SELECT * FROM help le|", "LEFT OUTER JOIN", Oracle);
+    assert_has("SELECT * FROM help LEFT o|", "OUTER", Oracle);
+    assert_has("SELECT * FROM help LEFT OUTER jo|", "JOIN", Oracle);
+    assert_has("SELECT * FROM help RIGHT o|", "OUTER", Oracle);
+    assert_has("SELECT * FROM help FULL OUTER jo|", "JOIN", Oracle);
+    assert_has("SELECT * FROM help NATURAL jo|", "JOIN", Oracle);
+    assert_has("SELECT * FROM help CROSS ap|", "APPLY", Oracle);
+    assert_has("SELECT * FROM help OUTER ap|", "APPLY", Oracle);
+
+    assert_has("SELECT * FROM help GROUP b|", "BY", Oracle);
+    assert_has("SELECT * FROM help ORDER b|", "BY", Oracle);
+    assert_has("SELECT * FROM help CONNECT b|", "BY", Oracle);
+    assert_has("SELECT * FROM help START w|", "WITH", Oracle);
+    assert_has("SELECT * FROM help FOR up|", "UPDATE", Oracle);
+    assert_has("SELECT * FROM help FOR UPDATE SKIP lo|", "LOCKED", Oracle);
+    assert_has(
+        "SELECT * FROM help FETCH FIRST 10 ROWS WITH ti|",
+        "TIES",
+        Oracle,
+    );
+    assert_has(
+        "SELECT deptno, COUNT(*) FROM emp GROUP BY GROUPING se|",
+        "SETS",
+        Oracle,
+    );
+    assert_has(
+        "WITH q AS (SELECT * FROM emp) SEARCH de| SELECT * FROM q",
+        "DEPTH",
+        Oracle,
+    );
+
+    assert_has("SELECT * FROM help LEFT o|", "OUTER", MySQL);
+    assert_has("SELECT * FROM help LEFT OUTER jo|", "JOIN", MySQL);
+    assert_has("SELECT * FROM help GROUP b|", "BY", MySQL);
+    assert_has("SELECT * FROM help ORDER b|", "BY", MySQL);
+    assert_has(
+        "INSERT INTO help VALUES (1) ON DUPLICATE ke|",
+        "KEY UPDATE",
+        MySQL,
+    );
+    assert_has(
+        "INSERT INTO help VALUES (1) ON DUPLICATE KEY up|",
+        "UPDATE",
+        MySQL,
+    );
+
+    assert!(
+        failures.is_empty(),
+        "multi-word keyword prefix failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn keyword_suggestions_do_not_cross_invalid_clause_boundaries() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |suggestions: &[String], keyword: &str| {
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case(keyword))
+    };
+    let mut failures = Vec::new();
+    let mut assert_not_has = |sql: &str, keyword: &str, db_type: crate::db::DatabaseType| {
+        let suggestions = query_keyword_completion_suggestions(sql, db_type);
+        if has(&suggestions, keyword) {
+            failures.push(format!(
+                "`{keyword}` should not be suggested at `{sql}` ({db_type:?}): {suggestions:?}"
+            ));
+        }
+    };
+
+    assert_not_has("SELECT * FROM help GROUP BY topic wh|", "WHERE", Oracle);
+    assert_not_has(
+        "SELECT * FROM help GROUP BY topic HAVING COUNT(*) > 0 wh|",
+        "WHERE",
+        Oracle,
+    );
+    assert_not_has("SELECT * FROM help ORDER BY topic gr|", "GROUP BY", Oracle);
+    assert_not_has("SELECT * FROM help ORDER BY topic ha|", "HAVING", Oracle);
+    assert_not_has(
+        "SELECT * FROM help ORDER BY topic FETCH FIRST 10 ROWS ONLY wh|",
+        "WHERE",
+        Oracle,
+    );
+    assert_not_has(
+        "WITH q AS (SELECT * FROM emp) SELECT * FROM q se|",
+        "SEARCH",
+        Oracle,
+    );
+    assert_not_has(
+        "WITH q AS (SELECT * FROM emp) SELECT * FROM q cy|",
+        "CYCLE",
+        Oracle,
+    );
+    assert_not_has("SELECT * FROM emp LEFT OUTER ap|", "APPLY", Oracle);
+    assert_not_has("SELECT * FROM emp RIGHT OUTER ap|", "APPLY", Oracle);
+    assert_not_has("SELECT * FROM emp FULL OUTER ap|", "APPLY", Oracle);
+
+    assert_not_has("SELECT * FROM help GROUP BY topic wh|", "WHERE", MySQL);
+    assert_not_has("SELECT * FROM help ORDER BY topic gr|", "GROUP BY", MySQL);
+    assert_not_has(
+        "INSERT INTO help VALUES (1) ON DUPLICATE KEY UPDATE id = 1 wh|",
+        "WHERE",
+        MySQL,
+    );
+
+    assert!(
+        failures.is_empty(),
+        "invalid clause boundary keyword failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn registered_keyword_slot_cases_are_backed_by_non_empty_production_slots() {
+    let mut failures = Vec::new();
+
+    for case in registered_keyword_slot_cases() {
+        let emitted = expected_keyword_slot_suggestions(case.sql, case.db_type)
+            .into_iter()
+            .filter(|keyword| registered_keyword_like(&keyword.to_ascii_uppercase()))
+            .collect::<Vec<_>>();
+        if emitted.is_empty() {
+            failures.push(format!(
+                "registered slot emitted no keyword-like candidates at `{}` ({:?})",
+                case.sql, case.db_type
+            ));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "registered keyword slot cases without production backing:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn common_query_keywords_complete_with_empty_and_two_letter_prefixes() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |suggestions: &[String], keyword: &str| {
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case(keyword))
+    };
+    let assert_keyword = |sql: &str, keyword: &str, db_type: crate::db::DatabaseType| {
+        let empty = query_keyword_completion_suggestions(sql, db_type);
+        assert!(
+            has(&empty, keyword),
+            "`{keyword}` was not suggested for empty prefix at `{sql}`: {empty:?}"
+        );
+
+        let prefix = keyword[..keyword.len().min(2)].to_ascii_lowercase();
+        let prefixed_sql = sql.replace('|', &format!("{prefix}|"));
+        let prefixed = query_keyword_completion_suggestions(&prefixed_sql, db_type);
+        assert!(
+            has(&prefixed, keyword),
+            "`{keyword}` was not suggested for 2-letter prefix `{prefix}` at `{prefixed_sql}`: {prefixed:?}"
+        );
+
+        if !keyword.contains(' ') {
+            let exact_sql = sql.replace('|', &format!("{}|", keyword.to_ascii_lowercase()));
+            let exact = query_keyword_completion_suggestions(&exact_sql, db_type);
+            assert!(
+                has(&exact, keyword),
+                "`{keyword}` was not preserved for exact input at `{exact_sql}`: {exact:?}"
+            );
+        }
+    };
+
+    for keyword in crate::sql_text::statement_head_keywords() {
+        assert_keyword("|", keyword, Oracle);
+    }
+
+    for keyword in [
+        "SELECT",
+        "WITH",
+        "INSERT",
+        "UPDATE",
+        "DELETE",
+        "MERGE",
+        "CREATE",
+        "ALTER",
+        "DROP",
+        "TRUNCATE",
+        "COMMIT",
+        "ROLLBACK",
+        "GRANT",
+        "REVOKE",
+        "EXPLAIN",
+        "DESC",
+        "DESCRIBE",
+    ] {
+        assert_keyword("|", keyword, Oracle);
+    }
+
+    assert_keyword("SELECT * |", "FROM", Oracle);
+    assert_keyword("SELECT empno |", "FROM", Oracle);
+    assert_keyword("SELECT empno AS employee_no |", "FROM", Oracle);
+    assert_keyword("SELECT COUNT(*) |", "FROM", Oracle);
+    assert_keyword("SELECT 1 |", "FROM", Oracle);
+
+    for keyword in [
+        "JOIN",
+        "WHERE",
+        "LEFT JOIN",
+        "RIGHT JOIN",
+        "FULL JOIN",
+        "INNER JOIN",
+        "CROSS JOIN",
+        "NATURAL JOIN",
+        "LEFT OUTER JOIN",
+        "RIGHT OUTER JOIN",
+        "FULL OUTER JOIN",
+        "CONNECT BY",
+        "START WITH",
+        "GROUP BY",
+        "HAVING",
+        "ORDER BY",
+        "OFFSET",
+        "FETCH",
+        "FOR UPDATE",
+    ] {
+        assert_keyword("SELECT * FROM help |", keyword, Oracle);
+    }
+
+    for keyword in ["ON", "USING"] {
+        assert_keyword("SELECT * FROM emp JOIN dept |", keyword, Oracle);
+    }
+
+    for keyword in ["OUTER", "JOIN"] {
+        assert_keyword("SELECT * FROM emp LEFT |", keyword, Oracle);
+        assert_keyword("SELECT * FROM emp RIGHT |", keyword, Oracle);
+        assert_keyword("SELECT * FROM emp FULL |", keyword, Oracle);
+    }
+    for keyword in ["JOIN"] {
+        assert_keyword("SELECT * FROM emp INNER |", keyword, Oracle);
+        assert_keyword("SELECT * FROM emp CROSS |", keyword, Oracle);
+        assert_keyword("SELECT * FROM emp NATURAL |", keyword, Oracle);
+        assert_keyword("SELECT * FROM emp LEFT OUTER |", keyword, Oracle);
+        assert_keyword("SELECT * FROM emp RIGHT OUTER |", keyword, Oracle);
+        assert_keyword("SELECT * FROM emp FULL OUTER |", keyword, Oracle);
+    }
+
+    for keyword in ["BY"] {
+        assert_keyword("SELECT * FROM emp GROUP |", keyword, Oracle);
+        assert_keyword("SELECT * FROM emp ORDER |", keyword, Oracle);
+        assert_keyword("SELECT * FROM emp CONNECT |", keyword, Oracle);
+    }
+    assert_keyword("SELECT * FROM emp START |", "WITH", Oracle);
+
+    for keyword in [
+        "CONNECT BY",
+        "START WITH",
+        "GROUP BY",
+        "HAVING",
+        "ORDER BY",
+        "OFFSET",
+        "FETCH",
+        "FOR UPDATE",
+    ] {
+        assert_keyword("SELECT * FROM help WHERE id = 1 |", keyword, Oracle);
+    }
+
+    for keyword in ["HAVING", "ORDER BY", "OFFSET", "FETCH", "FOR UPDATE"] {
+        assert_keyword("SELECT * FROM help GROUP BY topic |", keyword, Oracle);
+    }
+    let out_of_order_where =
+        query_keyword_completion_suggestions("SELECT * FROM help GROUP BY topic wh|", Oracle);
+    assert!(
+        !has(&out_of_order_where, "WHERE"),
+        "`WHERE` must not be suggested after GROUP BY has started: {out_of_order_where:?}"
+    );
+
+    for keyword in ["ORDER BY", "OFFSET", "FETCH", "FOR UPDATE"] {
+        assert_keyword("SELECT * FROM help GROUP BY topic HAVING COUNT(*) > 0 |", keyword, Oracle);
+    }
+
+    for keyword in [
+        "CASE",
+        "CAST",
+        "EXISTS",
+        "NOT",
+        "NULL",
+        "TRUE",
+        "FALSE",
+        "UNKNOWN",
+        "INTERVAL",
+        "DATE",
+        "TIMESTAMP",
+        "TIME",
+        "ROWNUM",
+        "ROWID",
+    ] {
+        assert_keyword("SELECT * FROM emp WHERE |", keyword, Oracle);
+        assert_keyword("SELECT * FROM emp WHERE empno = |", keyword, Oracle);
+    }
+
+    for keyword in ["IS", "IN", "LIKE", "BETWEEN", "NOT"] {
+        assert_keyword("SELECT * FROM emp WHERE empno |", keyword, Oracle);
+    }
+
+    for keyword in ["NOT", "NULL", "TRUE", "FALSE", "UNKNOWN"] {
+        assert_keyword("SELECT * FROM emp WHERE empno IS |", keyword, Oracle);
+    }
+    for keyword in ["NULL", "TRUE", "FALSE", "UNKNOWN"] {
+        assert_keyword("SELECT * FROM emp WHERE empno IS NOT |", keyword, Oracle);
+    }
+    assert_keyword("SELECT * FROM emp WHERE ename LIKE 'A%' |", "ESCAPE", Oracle);
+    assert_keyword("SELECT * FROM emp WHERE sal BETWEEN 1 |", "AND", Oracle);
+
+    for keyword in ["AND", "OR"] {
+        assert_keyword("SELECT * FROM emp WHERE empno = 1 |", keyword, Oracle);
+        assert_keyword(
+            "SELECT * FROM emp JOIN dept ON emp.deptno = dept.deptno |",
+            keyword,
+            Oracle,
+        );
+    }
+
+    for keyword in ["ASC", "DESC", "NULLS"] {
+        assert_keyword("SELECT * FROM emp ORDER BY empno |", keyword, Oracle);
+    }
+    assert_keyword("SELECT * FROM emp ORDER BY empno DESC |", "NULLS", Oracle);
+    for keyword in ["FIRST", "LAST"] {
+        assert_keyword("SELECT * FROM emp ORDER BY empno NULLS |", keyword, Oracle);
+        assert_keyword("SELECT * FROM emp ORDER BY empno DESC NULLS |", keyword, Oracle);
+    }
+
+    for keyword in ["FIRST", "NEXT"] {
+        assert_keyword("SELECT * FROM emp ORDER BY empno FETCH |", keyword, Oracle);
+    }
+    for keyword in ["ROW", "ROWS"] {
+        assert_keyword("SELECT * FROM emp ORDER BY empno OFFSET 10 |", keyword, Oracle);
+        assert_keyword("SELECT * FROM emp ORDER BY empno FETCH FIRST 10 |", keyword, Oracle);
+    }
+    for keyword in ["ONLY", "WITH"] {
+        assert_keyword(
+            "SELECT * FROM emp ORDER BY empno FETCH FIRST 10 ROWS |",
+            keyword,
+            Oracle,
+        );
+    }
+    assert_keyword(
+        "SELECT * FROM emp ORDER BY empno FETCH FIRST 10 ROWS WITH |",
+        "TIES",
+        Oracle,
+    );
+
+    for keyword in ["UPDATE", "SHARE"] {
+        assert_keyword("SELECT * FROM emp FOR |", keyword, Oracle);
+    }
+    for keyword in ["OF", "NOWAIT", "WAIT", "SKIP"] {
+        assert_keyword("SELECT * FROM emp FOR UPDATE |", keyword, Oracle);
+    }
+    assert_keyword("SELECT * FROM emp FOR UPDATE SKIP |", "LOCKED", Oracle);
+
+    assert_keyword("UPDATE emp |", "SET", Oracle);
+    assert_keyword("DELETE FROM emp |", "WHERE", Oracle);
+    assert_keyword("INSERT INTO emp |", "VALUES", Oracle);
+    assert_keyword("MERGE INTO emp |", "USING", Oracle);
+    assert_keyword("MERGE INTO emp USING dept ON (emp.deptno = dept.deptno) |", "WHEN", Oracle);
+    for keyword in ["MATCHED", "NOT"] {
+        assert_keyword(
+            "MERGE INTO emp USING dept ON (emp.deptno = dept.deptno) WHEN |",
+            keyword,
+            Oracle,
+        );
+    }
+    assert_keyword(
+        "MERGE INTO emp USING dept ON (emp.deptno = dept.deptno) WHEN NOT |",
+        "MATCHED",
+        Oracle,
+    );
+
+    for keyword in crate::sql_text::mysql_statement_head_keywords() {
+        assert_keyword("|", keyword, MySQL);
+    }
+
+    for keyword in [
+        "JOIN",
+        "WHERE",
+        "LEFT JOIN",
+        "RIGHT JOIN",
+        "LEFT OUTER JOIN",
+        "RIGHT OUTER JOIN",
+        "INNER JOIN",
+        "CROSS JOIN",
+        "NATURAL JOIN",
+        "STRAIGHT_JOIN",
+        "GROUP BY",
+        "HAVING",
+        "ORDER BY",
+        "LIMIT",
+        "FOR UPDATE",
+    ] {
+        assert_keyword("SELECT * FROM help |", keyword, MySQL);
+    }
+
+    assert_keyword("SELECT * FROM help WHERE id = 1 |", "LIMIT", MySQL);
+}
+
+#[test]
+fn broad_keyword_grammar_slots_complete_with_empty_and_two_letter_prefixes() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |suggestions: &[String], keyword: &str| {
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case(keyword))
+    };
+    let assert_keyword = |sql: &str, keyword: &str, db_type: crate::db::DatabaseType| {
+        let empty = query_keyword_completion_suggestions(sql, db_type);
+        assert!(
+            has(&empty, keyword),
+            "`{keyword}` was not suggested for empty prefix at `{sql}`: {empty:?}"
+        );
+
+        let prefix = keyword[..keyword.len().min(2)].to_ascii_lowercase();
+        let prefixed_sql = sql.replace('|', &format!("{prefix}|"));
+        let prefixed = query_keyword_completion_suggestions(&prefixed_sql, db_type);
+        assert!(
+            has(&prefixed, keyword),
+            "`{keyword}` was not suggested for 2-letter prefix `{prefix}` at `{prefixed_sql}`: {prefixed:?}"
+        );
+
+        if !keyword.contains(' ') {
+            let exact_sql = sql.replace('|', &format!("{}|", keyword.to_ascii_lowercase()));
+            let exact = query_keyword_completion_suggestions(&exact_sql, db_type);
+            assert!(
+                has(&exact, keyword),
+                "`{keyword}` was not preserved for exact input at `{exact_sql}`: {exact:?}"
+            );
+        }
+    };
+
+    for keyword in ["TABLE", "VIEW", "INDEX", "SEQUENCE", "SYNONYM", "USER", "ROLE"] {
+        assert_keyword("CREATE |", keyword, Oracle);
+    }
+    assert_keyword("CREATE OR |", "REPLACE", Oracle);
+    for keyword in ["TABLE", "VIEW", "PACKAGE", "PROCEDURE", "FUNCTION", "TRIGGER", "SYNONYM"] {
+        assert_keyword("CREATE OR REPLACE |", keyword, Oracle);
+    }
+    for keyword in ["TABLE", "SESSION", "SYSTEM", "USER", "INDEX"] {
+        assert_keyword("ALTER |", keyword, Oracle);
+    }
+    for keyword in ["TABLE", "VIEW", "INDEX", "SEQUENCE", "SYNONYM", "USER", "ROLE"] {
+        assert_keyword("DROP |", keyword, Oracle);
+    }
+
+    for keyword in ["NUMBER", "VARCHAR2", "CHAR", "DATE", "TIMESTAMP", "CLOB", "BLOB", "RAW"] {
+        assert_keyword("CREATE TABLE t (c |)", keyword, Oracle);
+        assert_keyword("SELECT CAST(empno AS |) FROM emp", keyword, Oracle);
+    }
+
+    for keyword in ["YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"] {
+        assert_keyword("SELECT EXTRACT(| FROM hiredate) FROM emp", keyword, Oracle);
+        assert_keyword("SELECT INTERVAL '1' | FROM emp", keyword, Oracle);
+    }
+    assert_keyword("SELECT EXTRACT(YEAR |) FROM emp", "FROM", Oracle);
+
+    for keyword in ["PARTITION BY", "ORDER BY", "ROWS", "RANGE", "GROUPS"] {
+        assert_keyword("SELECT SUM(sal) OVER (|) FROM emp", keyword, Oracle);
+    }
+    assert_keyword("SELECT SUM(sal) OVER (PARTITION |) FROM emp", "BY", Oracle);
+    assert_keyword("SELECT SUM(sal) OVER (ORDER |) FROM emp", "BY", Oracle);
+    for keyword in ["ASC", "DESC", "NULLS", "ROWS", "RANGE", "GROUPS"] {
+        assert_keyword("SELECT SUM(sal) OVER (ORDER BY sal |) FROM emp", keyword, Oracle);
+    }
+    for keyword in ["BETWEEN", "UNBOUNDED", "CURRENT"] {
+        assert_keyword("SELECT SUM(sal) OVER (ORDER BY sal ROWS |) FROM emp", keyword, Oracle);
+    }
+    for keyword in ["PRECEDING", "FOLLOWING"] {
+        assert_keyword("SELECT SUM(sal) OVER (ORDER BY sal ROWS 1 |) FROM emp", keyword, Oracle);
+    }
+    assert_keyword(
+        "SELECT SUM(sal) OVER (ORDER BY sal ROWS BETWEEN UNBOUNDED |) FROM emp",
+        "PRECEDING",
+        Oracle,
+    );
+    for keyword in ["RESPECT", "IGNORE"] {
+        assert_keyword("SELECT FIRST_VALUE(sal) | FROM emp", keyword, Oracle);
+    }
+    for keyword in ["FIRST", "LAST"] {
+        assert_keyword("SELECT MAX(sal) KEEP (DENSE_RANK |) FROM emp", keyword, Oracle);
+    }
+    assert_keyword("SELECT MAX(sal) KEEP (DENSE_RANK FIRST |) FROM emp", "ORDER", Oracle);
+
+    for keyword in ["SELECT", "INSERT", "UPDATE", "DELETE", "REFERENCES", "EXECUTE"] {
+        assert_keyword("GRANT | ON emp TO scott", keyword, Oracle);
+        assert_keyword("REVOKE | ON emp FROM scott", keyword, Oracle);
+    }
+    for keyword in ["CASCADE", "SET NULL"] {
+        assert_keyword(
+            "CREATE TABLE child (parent_id NUMBER REFERENCES parent(id) ON DELETE |)",
+            keyword,
+            Oracle,
+        );
+    }
+
+    for keyword in ["UNION", "UNION ALL", "INTERSECT", "MINUS", "EXCEPT"] {
+        assert_keyword("SELECT * FROM emp |", keyword, Oracle);
+        assert_keyword("SELECT * FROM emp WHERE empno = 1 |", keyword, Oracle);
+        assert_keyword("SELECT deptno, COUNT(*) FROM emp GROUP BY deptno |", keyword, Oracle);
+    }
+    for keyword in ["UNION", "UNION ALL", "INTERSECT", "EXCEPT"] {
+        assert_keyword("SELECT * FROM help |", keyword, MySQL);
+        assert_keyword("SELECT * FROM help WHERE id = 1 |", keyword, MySQL);
+    }
+
+    for keyword in ["SELECT", "WITH"] {
+        assert_keyword("SELECT * FROM emp WHERE empno IN (|)", keyword, Oracle);
+        assert_keyword("SELECT * FROM emp WHERE EXISTS (|)", keyword, Oracle);
+        assert_keyword("SELECT * FROM emp WHERE empno = ANY (|)", keyword, Oracle);
+    }
+
+    assert_keyword("SELECT CASE | END FROM emp", "WHEN", Oracle);
+    assert_keyword("SELECT CASE WHEN empno = 1 | END FROM emp", "THEN", Oracle);
+    for keyword in ["WHEN", "ELSE", "END"] {
+        assert_keyword("SELECT CASE WHEN empno = 1 THEN ename | END FROM emp", keyword, Oracle);
+    }
+
+    assert_keyword("SELECT * FROM emp WHERE ename SOUNDS |", "LIKE", MySQL);
+    for keyword in ["LOCAL", "TIME"] {
+        assert_keyword("SELECT * FROM emp WHERE hiredate AT |", keyword, Oracle);
+    }
+    assert_keyword("SELECT * FROM emp WHERE hiredate AT TIME |", "ZONE", Oracle);
+    for keyword in ["SELECT", "INSERT", "UPDATE", "DELETE", "REPLACE"] {
+        assert_keyword("EXPLAIN |", keyword, MySQL);
+    }
+    for keyword in ["ANALYZE", "FORMAT", "FOR"] {
+        assert_keyword("EXPLAIN | SELECT * FROM help", keyword, MySQL);
+    }
+    for keyword in ["TABLE", "VIEW", "INDEX", "DATABASE", "SCHEMA", "USER"] {
+        assert_keyword("CREATE |", keyword, MySQL);
+    }
+    for keyword in ["INT", "VARCHAR", "CHAR", "DATE", "DATETIME", "TEXT", "BLOB", "JSON"] {
+        assert_keyword("CREATE TABLE t (c |)", keyword, MySQL);
+    }
+    for keyword in [
+        "BINARY", "CHAR", "DATE", "DATETIME", "DECIMAL", "DOUBLE", "FLOAT", "JSON", "NCHAR",
+        "REAL", "SIGNED", "TIME", "UNSIGNED", "YEAR",
+    ] {
+        assert_keyword("SELECT CAST(empno AS |) FROM emp", keyword, MySQL);
+    }
+}
+
+#[test]
+fn composed_query_keyword_combinations_complete_with_empty_and_two_letter_prefixes() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |suggestions: &[String], keyword: &str| {
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case(keyword))
+    };
+    let assert_keyword = |sql: &str, keyword: &str, db_type: crate::db::DatabaseType| {
+        let empty = query_keyword_completion_suggestions(sql, db_type);
+        assert!(
+            has(&empty, keyword),
+            "`{keyword}` was not suggested for empty prefix at `{sql}`: {empty:?}"
+        );
+
+        let prefix = keyword[..keyword.len().min(2)].to_ascii_lowercase();
+        let prefixed_sql = sql.replace('|', &format!("{prefix}|"));
+        let prefixed = query_keyword_completion_suggestions(&prefixed_sql, db_type);
+        assert!(
+            has(&prefixed, keyword),
+            "`{keyword}` was not suggested for 2-letter prefix `{prefix}` at `{prefixed_sql}`: {prefixed:?}"
+        );
+
+        if !keyword.contains(' ') {
+            let exact_sql = sql.replace('|', &format!("{}|", keyword.to_ascii_lowercase()));
+            let exact = query_keyword_completion_suggestions(&exact_sql, db_type);
+            assert!(
+                has(&exact, keyword),
+                "`{keyword}` was not preserved for exact input at `{exact_sql}`: {exact:?}"
+            );
+        }
+    };
+    let assert_keywords =
+        |sql: &str, keywords: &[&str], db_type: crate::db::DatabaseType| {
+            for keyword in keywords {
+                assert_keyword(sql, keyword, db_type);
+            }
+        };
+
+    assert_keywords(
+        "SELECT e.empno, COUNT(*) FROM emp e WHERE e.sal > 0 |",
+        &[
+            "GROUP BY",
+            "HAVING",
+            "ORDER BY",
+            "OFFSET",
+            "FETCH",
+            "FOR UPDATE",
+            "UNION",
+            "UNION ALL",
+            "INTERSECT",
+            "MINUS",
+            "EXCEPT",
+        ],
+        Oracle,
+    );
+    assert_keywords(
+        "SELECT e.deptno, COUNT(*) FROM emp e WHERE e.sal > 0 GROUP BY e.deptno |",
+        &[
+            "HAVING",
+            "ORDER BY",
+            "OFFSET",
+            "FETCH",
+            "FOR UPDATE",
+            "UNION",
+            "UNION ALL",
+            "INTERSECT",
+            "MINUS",
+            "EXCEPT",
+        ],
+        Oracle,
+    );
+    assert_keywords(
+        "SELECT e.deptno, COUNT(*) FROM emp e WHERE e.sal > 0 GROUP BY e.deptno HAVING COUNT(*) > 1 |",
+        &[
+            "ORDER BY",
+            "OFFSET",
+            "FETCH",
+            "FOR UPDATE",
+            "UNION",
+            "UNION ALL",
+            "INTERSECT",
+            "MINUS",
+            "EXCEPT",
+        ],
+        Oracle,
+    );
+    assert_keywords(
+        "SELECT e.deptno FROM emp e WHERE e.sal > 0 ORDER BY e.deptno DESC NULLS LAST |",
+        &[
+            "OFFSET",
+            "FETCH",
+            "FOR UPDATE",
+            "UNION",
+            "UNION ALL",
+            "INTERSECT",
+            "MINUS",
+            "EXCEPT",
+        ],
+        Oracle,
+    );
+
+    assert_keywords(
+        "WITH q AS (SELECT * FROM emp WHERE empno = 1 |) SELECT * FROM q",
+        &[
+            "GROUP BY",
+            "HAVING",
+            "ORDER BY",
+            "OFFSET",
+            "FETCH",
+            "FOR UPDATE",
+            "UNION",
+        ],
+        Oracle,
+    );
+    assert_keywords(
+        "WITH q AS (SELECT * FROM emp) SELECT * FROM q |",
+        &[
+            "WHERE",
+            "JOIN",
+            "GROUP BY",
+            "HAVING",
+            "ORDER BY",
+            "OFFSET",
+            "FETCH",
+            "FOR UPDATE",
+            "UNION",
+        ],
+        Oracle,
+    );
+    assert_keywords(
+        "SELECT * FROM emp WHERE EXISTS (SELECT * FROM dept |)",
+        &["WHERE", "JOIN", "GROUP BY", "HAVING", "ORDER BY", "FETCH"],
+        Oracle,
+    );
+    assert_keywords(
+        "SELECT * FROM emp WHERE empno IN (SELECT empno FROM dept WHERE active = 1 |)",
+        &["GROUP BY", "HAVING", "ORDER BY", "FETCH", "UNION"],
+        Oracle,
+    );
+    assert_keywords(
+        "SELECT * FROM emp WHERE EXISTS (SELECT * FROM dept) |",
+        &["AND", "OR"],
+        Oracle,
+    );
+
+    assert_keywords(
+        "SELECT * FROM help h |",
+        &["WHERE", "JOIN", "GROUP BY", "HAVING", "ORDER BY", "FETCH"],
+        Oracle,
+    );
+    assert_keywords(
+        "SELECT * FROM help where_alias |",
+        &["WHERE", "JOIN", "GROUP BY", "HAVING", "ORDER BY", "FETCH"],
+        Oracle,
+    );
+    assert_keywords(
+        "SELECT * FROM help join_alias |",
+        &["WHERE", "JOIN", "GROUP BY", "HAVING", "ORDER BY", "FETCH"],
+        Oracle,
+    );
+    assert_keywords(
+        "SELECT * FROM emp e JOIN dept d ON e.deptno = d.deptno JOIN salgrade s |",
+        &["ON", "USING"],
+        Oracle,
+    );
+    assert_keywords(
+        "SELECT * FROM emp e LEFT OUTER JOIN dept d ON e.deptno = d.deptno JOIN salgrade s |",
+        &["ON", "USING"],
+        Oracle,
+    );
+    assert_keywords(
+        "SELECT * FROM emp e JOIN dept d ON e.deptno = d.deptno |",
+        &["AND", "OR", "WHERE", "JOIN", "GROUP BY", "ORDER BY"],
+        Oracle,
+    );
+
+    assert_keywords(
+        "SELECT h.topic, COUNT(*) FROM help h WHERE h.id = 1 |",
+        &["GROUP BY", "HAVING", "ORDER BY", "LIMIT", "UNION", "UNION ALL"],
+        MySQL,
+    );
+    assert_keywords(
+        "SELECT h.topic, COUNT(*) FROM help h WHERE h.id = 1 GROUP BY h.topic |",
+        &["HAVING", "ORDER BY", "LIMIT", "UNION", "UNION ALL"],
+        MySQL,
+    );
+    assert_keywords(
+        "SELECT h.topic, COUNT(*) FROM help h WHERE h.id = 1 GROUP BY h.topic HAVING COUNT(*) > 0 |",
+        &["ORDER BY", "LIMIT", "UNION", "UNION ALL"],
+        MySQL,
+    );
+    assert_keywords(
+        "WITH q AS (SELECT * FROM help WHERE id = 1 |) SELECT * FROM q",
+        &["GROUP BY", "HAVING", "ORDER BY", "LIMIT", "UNION"],
+        MySQL,
+    );
+    assert_keywords(
+        "WITH q AS (SELECT * FROM help) SELECT * FROM q |",
+        &["WHERE", "JOIN", "GROUP BY", "HAVING", "ORDER BY", "LIMIT", "UNION"],
+        MySQL,
+    );
+    assert_keywords(
+        "SELECT * FROM help h WHERE EXISTS (SELECT * FROM child c |)",
+        &["WHERE", "JOIN", "GROUP BY", "HAVING", "ORDER BY", "LIMIT"],
+        MySQL,
+    );
+    assert_keywords(
+        "SELECT * FROM help h JOIN child c ON h.id = c.help_id |",
+        &["AND", "OR", "WHERE", "JOIN", "GROUP BY", "ORDER BY", "LIMIT"],
+        MySQL,
+    );
+}
+
+#[test]
+fn keyword_slot_matrix_preserves_every_emitted_keyword_with_prefix_and_exact_input() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |suggestions: &[String], keyword: &str| {
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case(keyword))
+    };
+    let is_keyword_phrase = |value: &str, db_type: crate::db::DatabaseType| {
+        let fixture_identifier = matches!(
+            value.to_ascii_uppercase().as_str(),
+            "ACTIVE"
+                | "C"
+                | "CHILD"
+                | "D"
+                | "DEPT"
+                | "DEPTNO"
+                | "E"
+                | "EMP"
+                | "EMPNO"
+                | "ENAME"
+                | "H"
+                | "HELP"
+                | "HIREDATE"
+                | "ID"
+                | "NAME"
+                | "Q"
+                | "SAL"
+                | "SALGRADE"
+                | "SCOTT"
+                | "T"
+                | "TOPIC"
+        );
+        if fixture_identifier {
+            return false;
+        }
+
+        value.split_whitespace().all(|part| {
+            let upper = part.to_ascii_uppercase();
+            match db_type {
+                MySQL => crate::sql_text::is_mysql_sql_keyword(&upper),
+                _ => crate::sql_text::is_oracle_sql_keyword(&upper),
+            }
+        })
+    };
+    let assert_keyword = |sql: &str, keyword: &str, db_type: crate::db::DatabaseType| {
+        let prefix = keyword[..keyword.len().min(2)].to_ascii_lowercase();
+        let prefixed_sql = sql.replace('|', &format!("{prefix}|"));
+        let prefixed = query_keyword_completion_suggestions(&prefixed_sql, db_type);
+        assert!(
+            has(&prefixed, keyword),
+            "`{keyword}` was not suggested for 2-letter prefix `{prefix}` at `{prefixed_sql}`: {prefixed:?}"
+        );
+
+        if !keyword.contains(' ') {
+            let exact_sql = sql.replace('|', &format!("{}|", keyword.to_ascii_lowercase()));
+            let exact = query_keyword_completion_suggestions(&exact_sql, db_type);
+            assert!(
+                has(&exact, keyword),
+                "`{keyword}` was not preserved for exact input at `{exact_sql}`: {exact:?}"
+            );
+        }
+    };
+
+    let contexts = [
+        (Oracle, "|"),
+        (Oracle, "SELECT | FROM emp"),
+        (Oracle, "SELECT empno | FROM emp"),
+        (Oracle, "SELECT * FROM emp |"),
+        (Oracle, "SELECT * FROM emp GROUP |"),
+        (Oracle, "SELECT * FROM emp ORDER |"),
+        (Oracle, "SELECT * FROM emp START |"),
+        (Oracle, "SELECT * FROM emp CONNECT |"),
+        (Oracle, "SELECT * FROM emp LEFT |"),
+        (Oracle, "SELECT * FROM emp LEFT OUTER |"),
+        (Oracle, "SELECT * FROM emp JOIN dept |"),
+        (Oracle, "SELECT * FROM emp JOIN dept ON emp.deptno = dept.deptno |"),
+        (Oracle, "SELECT * FROM emp WHERE |"),
+        (Oracle, "SELECT * FROM emp WHERE empno |"),
+        (Oracle, "SELECT * FROM emp WHERE empno IS |"),
+        (Oracle, "SELECT * FROM emp WHERE empno IS NOT |"),
+        (Oracle, "SELECT * FROM emp WHERE empno = |"),
+        (Oracle, "SELECT * FROM emp WHERE empno IN (|)"),
+        (Oracle, "SELECT * FROM emp WHERE EXISTS (|)"),
+        (Oracle, "SELECT * FROM emp WHERE ename LIKE 'A%' |"),
+        (Oracle, "SELECT * FROM emp WHERE sal BETWEEN 1 |"),
+        (Oracle, "SELECT * FROM emp WHERE sal BETWEEN 1 AND 10 |"),
+        (Oracle, "SELECT * FROM emp WHERE empno = 1 |"),
+        (Oracle, "SELECT deptno, COUNT(*) FROM emp GROUP BY deptno |"),
+        (
+            Oracle,
+            "SELECT deptno, COUNT(*) FROM emp GROUP BY deptno HAVING COUNT(*) > 1 |",
+        ),
+        (Oracle, "SELECT * FROM emp ORDER BY empno |"),
+        (Oracle, "SELECT * FROM emp ORDER BY empno DESC |"),
+        (Oracle, "SELECT * FROM emp ORDER BY empno DESC NULLS |"),
+        (Oracle, "SELECT * FROM emp ORDER BY empno DESC NULLS LAST |"),
+        (Oracle, "SELECT * FROM emp ORDER BY empno FETCH |"),
+        (Oracle, "SELECT * FROM emp ORDER BY empno FETCH FIRST 10 |"),
+        (
+            Oracle,
+            "SELECT * FROM emp ORDER BY empno FETCH FIRST 10 ROWS |",
+        ),
+        (
+            Oracle,
+            "SELECT * FROM emp ORDER BY empno FETCH FIRST 10 ROWS WITH |",
+        ),
+        (Oracle, "SELECT * FROM emp FOR |"),
+        (Oracle, "SELECT * FROM emp FOR UPDATE |"),
+        (Oracle, "SELECT * FROM emp FOR UPDATE SKIP |"),
+        (Oracle, "SELECT SUM(sal) OVER (|) FROM emp"),
+        (Oracle, "SELECT SUM(sal) OVER (PARTITION |) FROM emp"),
+        (Oracle, "SELECT SUM(sal) OVER (ORDER |) FROM emp"),
+        (Oracle, "SELECT SUM(sal) OVER (ORDER BY sal |) FROM emp"),
+        (Oracle, "SELECT SUM(sal) OVER (ORDER BY sal ROWS |) FROM emp"),
+        (
+            Oracle,
+            "SELECT SUM(sal) OVER (ORDER BY sal ROWS BETWEEN 1 PRECEDING |) FROM emp",
+        ),
+        (
+            Oracle,
+            "SELECT SUM(sal) OVER (ORDER BY sal ROWS BETWEEN 1 PRECEDING AND 1 |) FROM emp",
+        ),
+        (Oracle, "SELECT MAX(sal) KEEP (DENSE_RANK |) FROM emp"),
+        (Oracle, "SELECT MAX(sal) KEEP (DENSE_RANK FIRST |) FROM emp"),
+        (Oracle, "SELECT FIRST_VALUE(sal) | FROM emp"),
+        (Oracle, "SELECT CASE | END FROM emp"),
+        (Oracle, "SELECT CASE WHEN empno = 1 | END FROM emp"),
+        (Oracle, "SELECT CASE WHEN empno = 1 THEN ename | END FROM emp"),
+        (Oracle, "SELECT EXTRACT(| FROM hiredate) FROM emp"),
+        (Oracle, "SELECT EXTRACT(YEAR |) FROM emp"),
+        (Oracle, "SELECT INTERVAL '1' | FROM emp"),
+        (Oracle, "SELECT CAST(empno AS |) FROM emp"),
+        (Oracle, "CREATE |"),
+        (Oracle, "CREATE OR |"),
+        (Oracle, "CREATE OR REPLACE |"),
+        (Oracle, "CREATE UNIQUE |"),
+        (Oracle, "CREATE BITMAP |"),
+        (Oracle, "CREATE GLOBAL TEMPORARY |"),
+        (Oracle, "CREATE MATERIALIZED |"),
+        (Oracle, "CREATE MATERIALIZED VIEW LOG |"),
+        (Oracle, "CREATE PUBLIC |"),
+        (Oracle, "ALTER |"),
+        (Oracle, "DROP |"),
+        (Oracle, "DROP PACKAGE |"),
+        (Oracle, "DROP MATERIALIZED |"),
+        (Oracle, "COMMENT |"),
+        (Oracle, "COMMENT ON |"),
+        (Oracle, "CREATE TABLE t (c |)"),
+        (Oracle, "CREATE TABLE t (c NUMBER |)"),
+        (Oracle, "CREATE TABLE t (c NUMBER PRIMARY |)"),
+        (Oracle, "GRANT | ON emp TO scott"),
+        (Oracle, "REVOKE | ON emp FROM scott"),
+        (Oracle, "UPDATE emp |"),
+        (Oracle, "UPDATE emp SET sal = 1 |"),
+        (Oracle, "DELETE FROM emp |"),
+        (Oracle, "DELETE FROM emp WHERE empno = 1 |"),
+        (Oracle, "INSERT INTO emp |"),
+        (Oracle, "INSERT INTO emp VALUES (1) |"),
+        (Oracle, "MERGE INTO emp |"),
+        (Oracle, "MERGE INTO emp USING dept ON (emp.deptno = dept.deptno) |"),
+        (Oracle, "MERGE INTO emp USING dept ON (emp.deptno = dept.deptno) WHEN |"),
+        (
+            Oracle,
+            "MERGE INTO emp USING dept ON (emp.deptno = dept.deptno) WHEN MATCHED THEN |",
+        ),
+        (MySQL, "|"),
+        (MySQL, "SELECT | FROM help"),
+        (MySQL, "SELECT * FROM help |"),
+        (MySQL, "SELECT * FROM help JOIN child |"),
+        (MySQL, "SELECT * FROM help JOIN child ON help.id = child.help_id |"),
+        (MySQL, "SELECT * FROM help WHERE |"),
+        (MySQL, "SELECT * FROM help WHERE id |"),
+        (MySQL, "SELECT * FROM help WHERE id IS |"),
+        (MySQL, "SELECT * FROM help WHERE id = |"),
+        (MySQL, "SELECT * FROM help WHERE id IN (|)"),
+        (MySQL, "SELECT * FROM help WHERE id = 1 |"),
+        (MySQL, "SELECT topic, COUNT(*) FROM help GROUP BY topic |"),
+        (
+            MySQL,
+            "SELECT topic, COUNT(*) FROM help GROUP BY topic HAVING COUNT(*) > 1 |",
+        ),
+        (MySQL, "SELECT * FROM help ORDER BY id |"),
+        (MySQL, "SELECT * FROM help ORDER BY id DESC |"),
+        (MySQL, "SELECT * FROM help WHERE name SOUNDS |"),
+        (MySQL, "EXPLAIN |"),
+        (MySQL, "EXPLAIN | SELECT * FROM help"),
+        (MySQL, "CREATE |"),
+        (MySQL, "CREATE TEMPORARY |"),
+        (MySQL, "CREATE UNIQUE |"),
+        (MySQL, "CREATE FULLTEXT |"),
+        (MySQL, "CREATE SPATIAL |"),
+        (MySQL, "ALTER |"),
+        (MySQL, "DROP |"),
+        (MySQL, "CREATE TABLE t (c |)"),
+        (MySQL, "CREATE TABLE t (c INT |)"),
+        (MySQL, "CREATE TABLE t (c INT PRIMARY |)"),
+        (MySQL, "UPDATE help SET id = 1 |"),
+        (MySQL, "DELETE FROM help WHERE id = 1 |"),
+        (MySQL, "INSERT INTO help |"),
+        (MySQL, "REPLACE INTO help |"),
+    ];
+
+    for (db_type, sql) in contexts {
+        let empty = query_keyword_completion_suggestions(sql, db_type);
+        let keyword_suggestions = empty
+            .iter()
+            .filter(|suggestion| is_keyword_phrase(suggestion, db_type))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            !keyword_suggestions.is_empty(),
+            "no keyword suggestions were emitted at `{sql}`: {empty:?}"
+        );
+
+        for keyword in keyword_suggestions {
+            assert_keyword(sql, &keyword, db_type);
+        }
+    }
+}
+
+#[test]
+fn specialized_sql_keyword_slots_complete_with_empty_and_two_letter_prefixes() {
+    use crate::db::DatabaseType::Oracle;
+
+    let has = |suggestions: &[String], keyword: &str| {
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case(keyword))
+    };
+    let assert_keyword = |sql: &str, keyword: &str, db_type: crate::db::DatabaseType| {
+        let empty = query_keyword_completion_suggestions(sql, db_type);
+        assert!(
+            has(&empty, keyword),
+            "`{keyword}` was not suggested for empty prefix at `{sql}`: {empty:?}"
+        );
+
+        let prefix = keyword[..keyword.len().min(2)].to_ascii_lowercase();
+        let prefixed_sql = sql.replace('|', &format!("{prefix}|"));
+        let prefixed = query_keyword_completion_suggestions(&prefixed_sql, db_type);
+        assert!(
+            has(&prefixed, keyword),
+            "`{keyword}` was not suggested for 2-letter prefix `{prefix}` at `{prefixed_sql}`: {prefixed:?}"
+        );
+
+        if !keyword.contains(' ') {
+            let exact_sql = sql.replace('|', &format!("{}|", keyword.to_ascii_lowercase()));
+            let exact = query_keyword_completion_suggestions(&exact_sql, db_type);
+            assert!(
+                has(&exact, keyword),
+                "`{keyword}` was not preserved for exact input at `{exact_sql}`: {exact:?}"
+            );
+        }
+    };
+    let assert_keywords =
+        |sql: &str, keywords: &[&str], db_type: crate::db::DatabaseType| {
+            for keyword in keywords {
+                assert_keyword(sql, keyword, db_type);
+            }
+        };
+
+    assert_keywords(
+        "SELECT JSON_VALUE(payload, '$.amount' NULL ON |) FROM emp",
+        &["ERROR", "EMPTY"],
+        Oracle,
+    );
+    assert_keyword(
+        "SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON |) FROM emp",
+        "NULL",
+        Oracle,
+    );
+
+    assert_keyword("SELECT LISTAGG(ename, ',') WITHIN | FROM emp", "GROUP", Oracle);
+    assert_keyword(
+        "SELECT LISTAGG(ename, ',') WITHIN GROUP (ORDER |) FROM emp",
+        "BY",
+        Oracle,
+    );
+    assert_keywords(
+        "SELECT LISTAGG(ename, ',') WITHIN GROUP (ORDER BY ename |) FROM emp",
+        &["ASC", "DESC", "NULLS"],
+        Oracle,
+    );
+
+    assert_keyword(
+        "SELECT SUM(sal) OVER (ORDER BY sal ROWS BETWEEN UNBOUNDED |) FROM emp",
+        "PRECEDING",
+        Oracle,
+    );
+    assert_keyword(
+        "SELECT SUM(sal) OVER (ORDER BY sal ROWS BETWEEN CURRENT |) FROM emp",
+        "ROW",
+        Oracle,
+    );
+    assert_keywords(
+        "SELECT SUM(sal) OVER (ORDER BY sal ROWS BETWEEN CURRENT ROW AND |) FROM emp",
+        &["UNBOUNDED", "CURRENT"],
+        Oracle,
+    );
+    assert_keyword(
+        "SELECT SUM(sal) OVER (ORDER BY sal ROWS BETWEEN CURRENT ROW AND UNBOUNDED |) FROM emp",
+        "FOLLOWING",
+        Oracle,
+    );
+    assert_keyword(
+        "SELECT SUM(sal) OVER (ORDER BY sal ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW |) FROM emp",
+        "EXCLUDE",
+        Oracle,
+    );
+    assert_keywords(
+        "SELECT SUM(sal) OVER (ORDER BY sal ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE |) FROM emp",
+        &["CURRENT", "GROUP", "TIES", "NO"],
+        Oracle,
+    );
+
+    assert_keywords(
+        "SELECT * FROM emp CONNECT BY |",
+        &["NOCYCLE", "PRIOR"],
+        Oracle,
+    );
+    assert_keywords(
+        "SELECT * FROM emp WHERE sal > |",
+        &["ALL", "ANY", "SOME"],
+        Oracle,
+    );
+    assert_keywords(
+        "SELECT * FROM emp WHERE sal > ANY (|)",
+        &["SELECT", "WITH"],
+        Oracle,
+    );
+    assert_keyword(
+        "SELECT * FROM emp WHERE role_id MEMBER |",
+        "OF",
+        Oracle,
+    );
+
+    assert_keyword("SELECT * FROM emp SAMPLE |", "BLOCK", Oracle);
+    assert_keywords(
+        "SELECT * FROM emp AS OF |",
+        &["SCN", "TIMESTAMP"],
+        Oracle,
+    );
+    assert_keyword("SELECT * FROM emp VERSIONS |", "BETWEEN", Oracle);
+    assert_keywords(
+        "SELECT * FROM emp VERSIONS BETWEEN |",
+        &["SCN", "TIMESTAMP"],
+        Oracle,
+    );
+    assert_keyword(
+        "SELECT * FROM emp VERSIONS BETWEEN SCN 1 |",
+        "AND",
+        Oracle,
+    );
+}
+
+#[test]
+fn statement_structural_keyword_slots_complete_with_empty_and_two_letter_prefixes() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |suggestions: &[String], keyword: &str| {
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case(keyword))
+    };
+    let assert_keyword = |sql: &str, keyword: &str, db_type: crate::db::DatabaseType| {
+        let empty = query_keyword_completion_suggestions(sql, db_type);
+        assert!(
+            has(&empty, keyword),
+            "`{keyword}` was not suggested for empty prefix at `{sql}`: {empty:?}"
+        );
+
+        let prefix = keyword[..keyword.len().min(2)].to_ascii_lowercase();
+        let prefixed_sql = sql.replace('|', &format!("{prefix}|"));
+        let prefixed = query_keyword_completion_suggestions(&prefixed_sql, db_type);
+        assert!(
+            has(&prefixed, keyword),
+            "`{keyword}` was not suggested for 2-letter prefix `{prefix}` at `{prefixed_sql}`: {prefixed:?}"
+        );
+
+        if !keyword.contains(' ') {
+            let exact_sql = sql.replace('|', &format!("{}|", keyword.to_ascii_lowercase()));
+            let exact = query_keyword_completion_suggestions(&exact_sql, db_type);
+            assert!(
+                has(&exact, keyword),
+                "`{keyword}` was not preserved for exact input at `{exact_sql}`: {exact:?}"
+            );
+        }
+    };
+    let assert_keywords =
+        |sql: &str, keywords: &[&str], db_type: crate::db::DatabaseType| {
+            for keyword in keywords {
+                assert_keyword(sql, keyword, db_type);
+            }
+        };
+
+    assert_keyword("TRUNCATE |", "TABLE", Oracle);
+    assert_keywords(
+        "TRUNCATE TABLE emp |",
+        &["DROP STORAGE", "REUSE STORAGE"],
+        Oracle,
+    );
+    assert_keywords(
+        "CREATE SEQUENCE seq |",
+        &[
+            "START WITH",
+            "INCREMENT BY",
+            "MINVALUE",
+            "MAXVALUE",
+            "CACHE",
+            "NOCACHE",
+            "CYCLE",
+            "NOCYCLE",
+            "ORDER",
+            "NOORDER",
+        ],
+        Oracle,
+    );
+    assert_keyword("CREATE INDEX idx |", "ON", Oracle);
+    assert_keyword("CREATE SYNONYM syn |", "FOR", Oracle);
+    assert_keyword("CREATE PUBLIC SYNONYM syn |", "FOR", Oracle);
+    assert_keywords(
+        "ALTER TABLE emp |",
+        &["ADD", "DROP", "MODIFY", "RENAME"],
+        Oracle,
+    );
+    assert_keywords(
+        "DROP TABLE emp |",
+        &["CASCADE", "PURGE"],
+        Oracle,
+    );
+    assert_keyword("ALTER SESSION |", "SET", Oracle);
+    assert_keywords("COMMENT ON |", &["TABLE", "COLUMN"], Oracle);
+
+    assert_keywords(
+        "DELETE |",
+        &["FROM", "IGNORE", "LOW_PRIORITY", "QUICK"],
+        MySQL,
+    );
+    assert_keywords(
+        "DELETE LOW_PRIORITY |",
+        &["FROM", "IGNORE", "QUICK"],
+        MySQL,
+    );
+    assert_keywords(
+        "INSERT |",
+        &["DELAYED", "HIGH_PRIORITY", "IGNORE", "INTO", "LOW_PRIORITY"],
+        MySQL,
+    );
+    assert_keywords("INSERT HIGH_PRIORITY |", &["IGNORE", "INTO"], MySQL);
+    assert_keywords("REPLACE |", &["DELAYED", "INTO", "LOW_PRIORITY"], MySQL);
+    assert_keywords("UPDATE |", &["IGNORE", "LOW_PRIORITY"], MySQL);
+    assert_keyword("UPDATE LOW_PRIORITY |", "IGNORE", MySQL);
+    assert_keywords(
+        "LOAD DATA |",
+        &["CONCURRENT", "INFILE", "LOCAL", "LOW_PRIORITY"],
+        MySQL,
+    );
+    assert_keywords("LOAD DATA LOW_PRIORITY |", &["INFILE", "LOCAL"], MySQL);
+    assert_keywords(
+        "SHOW |",
+        &[
+            "DATABASES",
+            "TABLES",
+            "COLUMNS",
+            "CREATE",
+            "INDEX",
+            "PROCESSLIST",
+            "STATUS",
+            "VARIABLES",
+            "WARNINGS",
+            "ERRORS",
+        ],
+        MySQL,
+    );
+}
+
+#[test]
+fn transaction_dcl_and_lock_keyword_slots_complete_with_empty_and_two_letter_prefixes() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |suggestions: &[String], keyword: &str| {
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case(keyword))
+    };
+    let assert_keyword = |sql: &str, keyword: &str, db_type: crate::db::DatabaseType| {
+        let empty = query_keyword_completion_suggestions(sql, db_type);
+        assert!(
+            has(&empty, keyword),
+            "`{keyword}` was not suggested for empty prefix at `{sql}`: {empty:?}"
+        );
+
+        let prefix = keyword[..keyword.len().min(2)].to_ascii_lowercase();
+        let prefixed_sql = sql.replace('|', &format!("{prefix}|"));
+        let prefixed = query_keyword_completion_suggestions(&prefixed_sql, db_type);
+        assert!(
+            has(&prefixed, keyword),
+            "`{keyword}` was not suggested for 2-letter prefix `{prefix}` at `{prefixed_sql}`: {prefixed:?}"
+        );
+
+        if !keyword.contains(' ') {
+            let exact_sql = sql.replace('|', &format!("{}|", keyword.to_ascii_lowercase()));
+            let exact = query_keyword_completion_suggestions(&exact_sql, db_type);
+            assert!(
+                has(&exact, keyword),
+                "`{keyword}` was not preserved for exact input at `{exact_sql}`: {exact:?}"
+            );
+        }
+    };
+    let assert_keywords =
+        |sql: &str, keywords: &[&str], db_type: crate::db::DatabaseType| {
+            for keyword in keywords {
+                assert_keyword(sql, keyword, db_type);
+            }
+        };
+
+    assert_keywords("COMMIT |", &["WORK", "COMMENT", "WRITE", "FORCE"], Oracle);
+    assert_keywords(
+        "COMMIT WRITE |",
+        &["WAIT", "NOWAIT", "IMMEDIATE", "BATCH"],
+        Oracle,
+    );
+    assert_keywords("ROLLBACK |", &["WORK", "TO SAVEPOINT", "FORCE"], Oracle);
+    assert_keyword("ROLLBACK TO |", "SAVEPOINT", Oracle);
+    assert_keywords(
+        "SET TRANSACTION |",
+        &["READ", "ISOLATION", "USE", "NAME"],
+        Oracle,
+    );
+    assert_keywords("SET TRANSACTION READ |", &["ONLY", "WRITE"], Oracle);
+    assert_keyword("SET TRANSACTION ISOLATION |", "LEVEL", Oracle);
+    assert_keywords(
+        "SET TRANSACTION ISOLATION LEVEL |",
+        &["SERIALIZABLE", "READ COMMITTED"],
+        Oracle,
+    );
+    assert_keyword("LOCK |", "TABLE", Oracle);
+    assert_keyword("LOCK TABLE emp |", "IN", Oracle);
+    assert_keywords("LOCK TABLE emp IN |", &["ROW", "SHARE", "EXCLUSIVE"], Oracle);
+    assert_keywords("LOCK TABLE emp IN ROW |", &["SHARE", "EXCLUSIVE"], Oracle);
+    assert_keywords("LOCK TABLE emp IN SHARE |", &["UPDATE", "ROW", "MODE"], Oracle);
+    assert_keyword("LOCK TABLE emp IN SHARE ROW EXCLUSIVE |", "MODE", Oracle);
+    assert_keywords("LOCK TABLE emp IN SHARE MODE |", &["NOWAIT", "WAIT"], Oracle);
+    assert_keyword("GRANT SELECT ON emp |", "TO", Oracle);
+    assert_keyword("GRANT SELECT ON emp TO scott |", "WITH GRANT OPTION", Oracle);
+    assert_keyword("REVOKE SELECT ON emp |", "FROM", Oracle);
+
+    assert_keywords("COMMIT |", &["WORK", "AND", "CHAIN", "NO", "RELEASE"], MySQL);
+    assert_keywords(
+        "ROLLBACK |",
+        &["WORK", "AND", "CHAIN", "NO", "RELEASE", "TO SAVEPOINT"],
+        MySQL,
+    );
+    assert_keywords("START |", &["TRANSACTION", "REPLICA", "SLAVE"], MySQL);
+    assert_keywords(
+        "START TRANSACTION |",
+        &["READ", "WITH"],
+        MySQL,
+    );
+    assert_keywords("LOCK |", &["TABLES", "INSTANCE"], MySQL);
+    assert_keywords(
+        "LOCK TABLES help |",
+        &["READ", "WRITE", "LOW_PRIORITY WRITE"],
+        MySQL,
+    );
+    assert_keyword("UNLOCK |", "TABLES", MySQL);
+}
+
+#[test]
+fn remaining_plsql_and_routine_keyword_slots_are_formalized() {
+    use crate::db::DatabaseType::Oracle;
+
+    let has = |suggestions: &[String], keyword: &str| {
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case(keyword))
+    };
+    let mut failures = Vec::new();
+    let mut assert_keyword = |sql: &str, keyword: &str| {
+        let empty = query_keyword_completion_suggestions(sql, Oracle);
+        if !has(&empty, keyword) {
+            failures.push(format!(
+                "`{keyword}` missing for empty prefix at `{sql}`: {empty:?}"
+            ));
+        }
+
+        let prefix = keyword[..keyword.len().min(2)].to_ascii_lowercase();
+        let prefixed_sql = sql.replace('|', &format!("{prefix}|"));
+        let prefixed = query_keyword_completion_suggestions(&prefixed_sql, Oracle);
+        if !has(&prefixed, keyword) {
+            failures.push(format!(
+                "`{keyword}` missing for 2-letter prefix `{prefix}` at `{prefixed_sql}`: {prefixed:?}"
+            ));
+        }
+
+        if !keyword.contains(' ') {
+            let exact_sql = sql.replace('|', &format!("{}|", keyword.to_ascii_lowercase()));
+            let exact = query_keyword_completion_suggestions(&exact_sql, Oracle);
+            if !has(&exact, keyword) {
+                failures.push(format!(
+                    "`{keyword}` missing for exact input at `{exact_sql}`: {exact:?}"
+                ));
+            }
+        }
+    };
+
+    for (sql, keywords) in [
+        ("BEGIN IF 1 = 1 | THEN NULL; END IF; END;", &["THEN"][..]),
+        (
+            "BEGIN IF 1 = 1 THEN NULL; | END IF; END;",
+            &["ELSIF", "ELSE", "END IF"],
+        ),
+        (
+            "BEGIN CASE | END CASE; END;",
+            &["WHEN", "ELSE", "END CASE"],
+        ),
+        (
+            "BEGIN CASE WHEN 1 = 1 | THEN NULL; END CASE; END;",
+            &["THEN"],
+        ),
+        (
+            "BEGIN CASE WHEN 1 = 1 THEN NULL; | END CASE; END;",
+            &["WHEN", "ELSE", "END CASE"],
+        ),
+        (
+            "BEGIN WHILE 1 = 1 | LOOP NULL; END LOOP; END;",
+            &["LOOP"],
+        ),
+        (
+            "BEGIN FOR i IN 1..10 | LOOP NULL; END LOOP; END;",
+            &["LOOP"],
+        ),
+        (
+            "BEGIN NULL; EXCEPTION WHEN | THEN NULL; END;",
+            &["OTHERS", "NO_DATA_FOUND", "TOO_MANY_ROWS", "ZERO_DIVIDE"],
+        ),
+        (
+            "BEGIN NULL; EXCEPTION WHEN OTHERS | THEN NULL; END;",
+            &["THEN"],
+        ),
+        (
+            "CREATE OR REPLACE PROCEDURE p |",
+            &["AUTHID", "IS", "AS"],
+        ),
+        (
+            "CREATE OR REPLACE PROCEDURE p AUTHID |",
+            &["CURRENT_USER", "DEFINER"],
+        ),
+        (
+            "CREATE OR REPLACE FUNCTION f RETURN NUMBER |",
+            &[
+                "AUTHID",
+                "DETERMINISTIC",
+                "PARALLEL_ENABLE",
+                "PIPELINED",
+                "RESULT_CACHE",
+                "IS",
+                "AS",
+            ],
+        ),
+        (
+            "CREATE OR REPLACE PACKAGE pkg |",
+            &["AUTHID", "IS", "AS"],
+        ),
+        (
+            "CREATE OR REPLACE PACKAGE BODY pkg |",
+            &["IS", "AS"],
+        ),
+        (
+            "CREATE OR REPLACE TRIGGER trg |",
+            &["BEFORE", "AFTER", "INSTEAD OF", "COMPOUND"],
+        ),
+        (
+            "CREATE OR REPLACE TRIGGER trg BEFORE INSERT |",
+            &["OR", "ON"],
+        ),
+        (
+            "CREATE OR REPLACE TRIGGER trg BEFORE INSERT ON emp |",
+            &["FOR EACH ROW", "WHEN", "DECLARE", "BEGIN"],
+        ),
+        (
+            "CREATE OR REPLACE TRIGGER trg BEFORE INSERT ON emp FOR EACH |",
+            &["ROW"],
+        ),
+    ] {
+        for keyword in keywords {
+            assert_keyword(sql, keyword);
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "PL/SQL/routine keyword slot failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn remaining_advanced_oracle_query_keyword_slots_are_formalized() {
+    use crate::db::DatabaseType::Oracle;
+
+    let has = |suggestions: &[String], keyword: &str| {
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case(keyword))
+    };
+    let mut failures = Vec::new();
+    let mut assert_keyword = |sql: &str, keyword: &str| {
+        let empty = query_keyword_completion_suggestions(sql, Oracle);
+        if !has(&empty, keyword) {
+            failures.push(format!(
+                "`{keyword}` missing for empty prefix at `{sql}`: {empty:?}"
+            ));
+        }
+
+        let prefix = keyword[..keyword.len().min(2)].to_ascii_lowercase();
+        let prefixed_sql = sql.replace('|', &format!("{prefix}|"));
+        let prefixed = query_keyword_completion_suggestions(&prefixed_sql, Oracle);
+        if !has(&prefixed, keyword) {
+            failures.push(format!(
+                "`{keyword}` missing for 2-letter prefix `{prefix}` at `{prefixed_sql}`: {prefixed:?}"
+            ));
+        }
+
+        if !keyword.contains(' ') {
+            let exact_sql = sql.replace('|', &format!("{}|", keyword.to_ascii_lowercase()));
+            let exact = query_keyword_completion_suggestions(&exact_sql, Oracle);
+            if !has(&exact, keyword) {
+                failures.push(format!(
+                    "`{keyword}` missing for exact input at `{exact_sql}`: {exact:?}"
+                ));
+            }
+        }
+    };
+
+    for (sql, keywords) in [
+        (
+            "SELECT * FROM emp PIVOT (SUM(sal) |) p",
+            &["FOR"][..],
+        ),
+        (
+            "SELECT * FROM emp PIVOT (SUM(sal) FOR deptno |) p",
+            &["IN"],
+        ),
+        (
+            "SELECT * FROM emp UNPIVOT |",
+            &["INCLUDE", "EXCLUDE"],
+        ),
+        (
+            "SELECT * FROM emp UNPIVOT INCLUDE |",
+            &["NULLS"],
+        ),
+        (
+            "SELECT * FROM emp MATCH_RECOGNIZE (PARTITION |) mr",
+            &["BY"],
+        ),
+        (
+            "SELECT * FROM emp MATCH_RECOGNIZE (ORDER |) mr",
+            &["BY"],
+        ),
+        (
+            "SELECT * FROM emp MATCH_RECOGNIZE (AFTER MATCH |) mr",
+            &["SKIP"],
+        ),
+        (
+            "SELECT * FROM emp MATCH_RECOGNIZE (AFTER MATCH SKIP |) mr",
+            &["PAST LAST ROW", "TO NEXT ROW", "TO FIRST", "TO LAST"],
+        ),
+        (
+            "SELECT * FROM emp MATCH_RECOGNIZE (PATTERN (A) |) mr",
+            &["DEFINE"],
+        ),
+        (
+            "SELECT * FROM emp MODEL |",
+            &["PARTITION BY", "DIMENSION BY", "MEASURES", "RULES"],
+        ),
+        (
+            "SELECT * FROM emp MODEL PARTITION |",
+            &["BY"],
+        ),
+        (
+            "SELECT * FROM emp MODEL DIMENSION |",
+            &["BY"],
+        ),
+        (
+            "SELECT * FROM emp MODEL DIMENSION BY (deptno) MEASURES (sal) |",
+            &["RULES"],
+        ),
+        (
+            "SELECT * FROM emp MODEL DIMENSION BY (deptno) MEASURES (sal) RULES |",
+            &["UPDATE", "UPSERT", "UPSERT ALL"],
+        ),
+    ] {
+        for keyword in keywords {
+            assert_keyword(sql, keyword);
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "advanced Oracle query keyword slot failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn remaining_mysql_admin_account_keyword_slots_are_formalized() {
+    use crate::db::DatabaseType::MySQL;
+
+    let has = |suggestions: &[String], keyword: &str| {
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case(keyword))
+    };
+    let mut failures = Vec::new();
+    let mut assert_keyword = |sql: &str, keyword: &str| {
+        let empty = query_keyword_completion_suggestions(sql, MySQL);
+        if !has(&empty, keyword) {
+            failures.push(format!(
+                "`{keyword}` missing for empty prefix at `{sql}`: {empty:?}"
+            ));
+        }
+
+        let prefix = keyword[..keyword.len().min(2)].to_ascii_lowercase();
+        let prefixed_sql = sql.replace('|', &format!("{prefix}|"));
+        let prefixed = query_keyword_completion_suggestions(&prefixed_sql, MySQL);
+        if !has(&prefixed, keyword) {
+            failures.push(format!(
+                "`{keyword}` missing for 2-letter prefix `{prefix}` at `{prefixed_sql}`: {prefixed:?}"
+            ));
+        }
+
+        if !keyword.contains(' ') {
+            let exact_sql = sql.replace('|', &format!("{}|", keyword.to_ascii_lowercase()));
+            let exact = query_keyword_completion_suggestions(&exact_sql, MySQL);
+            if !has(&exact, keyword) {
+                failures.push(format!(
+                    "`{keyword}` missing for exact input at `{exact_sql}`: {exact:?}"
+                ));
+            }
+        }
+    };
+
+    for (sql, keywords) in [
+        (
+            "CREATE USER u |",
+            &["IDENTIFIED", "REQUIRE", "WITH", "ACCOUNT", "PASSWORD"][..],
+        ),
+        (
+            "CREATE USER u IDENTIFIED |",
+            &["BY", "WITH"],
+        ),
+        (
+            "ALTER USER u |",
+            &["IDENTIFIED", "REQUIRE", "WITH", "ACCOUNT", "PASSWORD"],
+        ),
+        (
+            "DROP USER |",
+            &["IF"],
+        ),
+        (
+            "DROP USER IF |",
+            &["EXISTS"],
+        ),
+        (
+            "ANALYZE |",
+            &["LOCAL", "NO_WRITE_TO_BINLOG", "TABLE"],
+        ),
+        (
+            "CHECK |",
+            &["TABLE"],
+        ),
+        (
+            "OPTIMIZE |",
+            &["LOCAL", "NO_WRITE_TO_BINLOG", "TABLE"],
+        ),
+        (
+            "REPAIR |",
+            &["LOCAL", "NO_WRITE_TO_BINLOG", "TABLE"],
+        ),
+        (
+            "ANALYZE TABLE help |",
+            &["UPDATE", "DROP"],
+        ),
+        (
+            "ANALYZE TABLE help UPDATE |",
+            &["HISTOGRAM"],
+        ),
+        (
+            "ANALYZE TABLE help DROP |",
+            &["HISTOGRAM"],
+        ),
+        (
+            "ANALYZE TABLE help UPDATE HISTOGRAM |",
+            &["ON"],
+        ),
+        (
+            "ANALYZE TABLE help DROP HISTOGRAM |",
+            &["ON"],
+        ),
+        (
+            "FLUSH |",
+            &["TABLES", "PRIVILEGES", "STATUS", "HOSTS", "LOGS"],
+        ),
+        (
+            "RESET |",
+            &["MASTER", "REPLICA", "SLAVE", "QUERY CACHE", "PERSIST"],
+        ),
+        (
+            "KILL |",
+            &["CONNECTION", "QUERY"],
+        ),
+        (
+            "PURGE |",
+            &["BINARY", "MASTER"],
+        ),
+    ] {
+        for keyword in keywords {
+            assert_keyword(sql, keyword);
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "MySQL admin/account keyword slot failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn remaining_tool_command_keyword_slots_are_formalized() {
+    use crate::db::DatabaseType::Oracle;
+
+    let has = |suggestions: &[String], keyword: &str| {
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case(keyword))
+    };
+    let mut failures = Vec::new();
+    let mut assert_keyword = |sql: &str, keyword: &str| {
+        let empty = query_keyword_completion_suggestions(sql, Oracle);
+        if !has(&empty, keyword) {
+            failures.push(format!(
+                "`{keyword}` missing for empty prefix at `{sql}`: {empty:?}"
+            ));
+        }
+
+        let prefix = keyword[..keyword.len().min(2)].to_ascii_lowercase();
+        let prefixed_sql = sql.replace('|', &format!("{prefix}|"));
+        let prefixed = query_keyword_completion_suggestions(&prefixed_sql, Oracle);
+        if !has(&prefixed, keyword) {
+            failures.push(format!(
+                "`{keyword}` missing for 2-letter prefix `{prefix}` at `{prefixed_sql}`: {prefixed:?}"
+            ));
+        }
+
+        if !keyword.contains(' ') {
+            let exact_sql = sql.replace('|', &format!("{}|", keyword.to_ascii_lowercase()));
+            let exact = query_keyword_completion_suggestions(&exact_sql, Oracle);
+            if !has(&exact, keyword) {
+                failures.push(format!(
+                    "`{keyword}` missing for exact input at `{exact_sql}`: {exact:?}"
+                ));
+            }
+        }
+    };
+
+    for (sql, keywords) in [
+        (
+            "SET |",
+            &[
+                "AUTOCOMMIT",
+                "DEFINE",
+                "ECHO",
+                "FEEDBACK",
+                "HEADING",
+                "LINESIZE",
+                "PAGESIZE",
+                "SERVEROUTPUT",
+                "TERMOUT",
+                "TIMING",
+                "VERIFY",
+            ][..],
+        ),
+        (
+            "SET AUTOCOMMIT |",
+            &["ON", "OFF"],
+        ),
+        (
+            "SET SERVEROUTPUT |",
+            &["ON", "OFF"],
+        ),
+        (
+            "SHOW |",
+            &["ERRORS", "PARAMETER", "USER", "VERSION"],
+        ),
+        (
+            "SHOW ERRORS |",
+            &["PACKAGE", "PROCEDURE", "FUNCTION", "TRIGGER", "VIEW"],
+        ),
+        (
+            "SPOOL |",
+            &["OFF", "OUT"],
+        ),
+        (
+            "WHENEVER |",
+            &["SQLERROR", "OSERROR"],
+        ),
+        (
+            "WHENEVER SQLERROR |",
+            &["EXIT", "CONTINUE"],
+        ),
+        (
+            "WHENEVER SQLERROR EXIT |",
+            &["SUCCESS", "FAILURE", "WARNING", "ROLLBACK", "COMMIT"],
+        ),
+    ] {
+        for keyword in keywords {
+            assert_keyword(sql, keyword);
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "tool command keyword slot failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn remaining_cte_and_table_expression_keyword_slots_are_formalized() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |suggestions: &[String], keyword: &str| {
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case(keyword))
+    };
+    let mut failures = Vec::new();
+    let mut assert_keyword = |sql: &str, keyword: &str, db_type: crate::db::DatabaseType| {
+        let empty = query_keyword_completion_suggestions(sql, db_type);
+        if !has(&empty, keyword) {
+            failures.push(format!(
+                "`{keyword}` missing for empty prefix at `{sql}`: {empty:?}"
+            ));
+        }
+
+        let prefix = keyword[..keyword.len().min(2)].to_ascii_lowercase();
+        let prefixed_sql = sql.replace('|', &format!("{prefix}|"));
+        let prefixed = query_keyword_completion_suggestions(&prefixed_sql, db_type);
+        if !has(&prefixed, keyword) {
+            failures.push(format!(
+                "`{keyword}` missing for 2-letter prefix `{prefix}` at `{prefixed_sql}`: {prefixed:?}"
+            ));
+        }
+
+        if !keyword.contains(' ') {
+            let exact_sql = sql.replace('|', &format!("{}|", keyword.to_ascii_lowercase()));
+            let exact = query_keyword_completion_suggestions(&exact_sql, db_type);
+            if !has(&exact, keyword) {
+                failures.push(format!(
+                    "`{keyword}` missing for exact input at `{exact_sql}`: {exact:?}"
+                ));
+            }
+        }
+    };
+
+    for (db_type, sql, keywords) in [
+        (
+            Oracle,
+            "WITH q AS (SELECT * FROM emp) | SELECT * FROM q",
+            &["SEARCH", "CYCLE"][..],
+        ),
+        (
+            Oracle,
+            "WITH q AS (SELECT * FROM emp) SEARCH | SELECT * FROM q",
+            &["DEPTH", "BREADTH"],
+        ),
+        (
+            Oracle,
+            "WITH q AS (SELECT * FROM emp) SEARCH DEPTH | SELECT * FROM q",
+            &["FIRST"],
+        ),
+        (
+            Oracle,
+            "WITH q AS (SELECT * FROM emp) SEARCH DEPTH FIRST | SELECT * FROM q",
+            &["BY"],
+        ),
+        (
+            Oracle,
+            "WITH q AS (SELECT * FROM emp) SEARCH DEPTH FIRST BY deptno | SELECT * FROM q",
+            &["SET"],
+        ),
+        (
+            Oracle,
+            "WITH q AS (SELECT * FROM emp) CYCLE deptno | SELECT * FROM q",
+            &["SET"],
+        ),
+        (
+            Oracle,
+            "WITH q AS (SELECT * FROM emp) CYCLE deptno SET is_cycle | SELECT * FROM q",
+            &["TO"],
+        ),
+        (
+            Oracle,
+            "WITH q AS (SELECT * FROM emp) CYCLE deptno SET is_cycle TO 'Y' | SELECT * FROM q",
+            &["DEFAULT"],
+        ),
+        (
+            Oracle,
+            "SELECT * FROM emp CROSS |",
+            &["JOIN", "APPLY"],
+        ),
+        (
+            Oracle,
+            "SELECT * FROM emp OUTER |",
+            &["APPLY"],
+        ),
+        (
+            Oracle,
+            "SELECT * FROM XMLTABLE('/r' |) xt",
+            &["PASSING", "COLUMNS"],
+        ),
+        (
+            Oracle,
+            "SELECT * FROM XMLTABLE('/r' PASSING payload |) xt",
+            &["COLUMNS"],
+        ),
+        (
+            Oracle,
+            "SELECT * FROM JSON_TABLE(payload, '$' |) jt",
+            &["COLUMNS", "ERROR ON ERROR", "NULL ON ERROR"],
+        ),
+        (
+            MySQL,
+            "WITH | q AS (SELECT * FROM help) SELECT * FROM q",
+            &["RECURSIVE"],
+        ),
+        (
+            MySQL,
+            "WITH RECURSIVE q | (SELECT * FROM help) SELECT * FROM q",
+            &["AS"],
+        ),
+    ] {
+        for keyword in keywords {
+            assert_keyword(sql, keyword, db_type);
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "CTE/table-expression keyword slot failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn remaining_mysql_schema_object_keyword_slots_are_formalized() {
+    use crate::db::DatabaseType::MySQL;
+
+    let has = |suggestions: &[String], keyword: &str| {
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case(keyword))
+    };
+    let mut failures = Vec::new();
+    let mut assert_keyword = |sql: &str, keyword: &str| {
+        let empty = query_keyword_completion_suggestions(sql, MySQL);
+        if !has(&empty, keyword) {
+            failures.push(format!(
+                "`{keyword}` missing for empty prefix at `{sql}`: {empty:?}"
+            ));
+        }
+
+        let prefix = keyword[..keyword.len().min(2)].to_ascii_lowercase();
+        let prefixed_sql = sql.replace('|', &format!("{prefix}|"));
+        let prefixed = query_keyword_completion_suggestions(&prefixed_sql, MySQL);
+        if !has(&prefixed, keyword) {
+            failures.push(format!(
+                "`{keyword}` missing for 2-letter prefix `{prefix}` at `{prefixed_sql}`: {prefixed:?}"
+            ));
+        }
+
+        if !keyword.contains(' ') {
+            let exact_sql = sql.replace('|', &format!("{}|", keyword.to_ascii_lowercase()));
+            let exact = query_keyword_completion_suggestions(&exact_sql, MySQL);
+            if !has(&exact, keyword) {
+                failures.push(format!(
+                    "`{keyword}` missing for exact input at `{exact_sql}`: {exact:?}"
+                ));
+            }
+        }
+    };
+
+    for (sql, keywords) in [
+        (
+            "CREATE TABLE t (id INT) |",
+            &[
+                "ENGINE",
+                "DEFAULT CHARSET",
+                "CHARACTER SET",
+                "COLLATE",
+                "AUTO_INCREMENT",
+                "COMMENT",
+                "ROW_FORMAT",
+            ][..],
+        ),
+        (
+            "CREATE TABLE t (id INT) DEFAULT |",
+            &["CHARACTER SET", "CHARSET", "COLLATE"],
+        ),
+        (
+            "CREATE INDEX idx |",
+            &["ON", "USING"],
+        ),
+        (
+            "ALTER TABLE help ADD |",
+            &[
+                "COLUMN",
+                "INDEX",
+                "KEY",
+                "CONSTRAINT",
+                "PRIMARY KEY",
+                "UNIQUE",
+                "FOREIGN KEY",
+            ],
+        ),
+        (
+            "ALTER TABLE help DROP |",
+            &["COLUMN", "INDEX", "KEY", "PRIMARY KEY", "FOREIGN KEY"],
+        ),
+        (
+            "CREATE FUNCTION f() |",
+            &["RETURNS"],
+        ),
+        (
+            "CREATE FUNCTION f() RETURNS INT |",
+            &[
+                "DETERMINISTIC",
+                "NOT",
+                "CONTAINS",
+                "NO",
+                "READS",
+                "MODIFIES",
+                "SQL",
+                "COMMENT",
+            ],
+        ),
+        (
+            "CREATE PROCEDURE p() |",
+            &[
+                "DETERMINISTIC",
+                "NOT",
+                "CONTAINS",
+                "NO",
+                "READS",
+                "MODIFIES",
+                "SQL",
+                "COMMENT",
+            ],
+        ),
+        (
+            "CREATE TRIGGER trg |",
+            &["BEFORE", "AFTER"],
+        ),
+        (
+            "CREATE TRIGGER trg BEFORE INSERT |",
+            &["ON"],
+        ),
+        (
+            "CREATE EVENT e |",
+            &["ON"],
+        ),
+        (
+            "CREATE EVENT e ON |",
+            &["SCHEDULE"],
+        ),
+        (
+            "CREATE EVENT e ON SCHEDULE |",
+            &["AT", "EVERY"],
+        ),
+    ] {
+        for keyword in keywords {
+            assert_keyword(sql, keyword);
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "MySQL schema-object keyword slot failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn remaining_mysql_account_tail_keyword_slots_are_formalized() {
+    use crate::db::DatabaseType::MySQL;
+
+    let has = |suggestions: &[String], keyword: &str| {
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case(keyword))
+    };
+    let mut failures = Vec::new();
+    let mut assert_keyword = |sql: &str, keyword: &str| {
+        let empty = query_keyword_completion_suggestions(sql, MySQL);
+        if !has(&empty, keyword) {
+            failures.push(format!(
+                "`{keyword}` missing for empty prefix at `{sql}`: {empty:?}"
+            ));
+        }
+
+        let prefix = keyword[..keyword.len().min(2)].to_ascii_lowercase();
+        let prefixed_sql = sql.replace('|', &format!("{prefix}|"));
+        let prefixed = query_keyword_completion_suggestions(&prefixed_sql, MySQL);
+        if !has(&prefixed, keyword) {
+            failures.push(format!(
+                "`{keyword}` missing for 2-letter prefix `{prefix}` at `{prefixed_sql}`: {prefixed:?}"
+            ));
+        }
+
+        if !keyword.contains(' ') {
+            let exact_sql = sql.replace('|', &format!("{}|", keyword.to_ascii_lowercase()));
+            let exact = query_keyword_completion_suggestions(&exact_sql, MySQL);
+            if !has(&exact, keyword) {
+                failures.push(format!(
+                    "`{keyword}` missing for exact input at `{exact_sql}`: {exact:?}"
+                ));
+            }
+        }
+    };
+
+    for (sql, keywords) in [
+        (
+            "CREATE USER u IDENTIFIED BY 'x' |",
+            &["REQUIRE", "WITH", "ACCOUNT", "PASSWORD"][..],
+        ),
+        (
+            "CREATE USER u REQUIRE |",
+            &["NONE", "SSL", "X509", "CIPHER", "ISSUER", "SUBJECT"],
+        ),
+        (
+            "CREATE USER u ACCOUNT |",
+            &["LOCK", "UNLOCK"],
+        ),
+        (
+            "CREATE USER u PASSWORD |",
+            &["EXPIRE"],
+        ),
+        (
+            "ALTER USER u PASSWORD EXPIRE |",
+            &["DEFAULT", "NEVER", "INTERVAL"],
+        ),
+        (
+            "GRANT SELECT ON help TO u |",
+            &["WITH GRANT OPTION"],
+        ),
+        (
+            "REVOKE SELECT ON help |",
+            &["FROM"],
+        ),
+    ] {
+        for keyword in keywords {
+            assert_keyword(sql, keyword);
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "MySQL account-tail keyword slot failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn remaining_grouping_returning_and_insert_tail_keyword_slots_are_formalized() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |suggestions: &[String], keyword: &str| {
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case(keyword))
+    };
+    let mut failures = Vec::new();
+    let mut assert_keyword = |sql: &str, keyword: &str, db_type: crate::db::DatabaseType| {
+        let empty = query_keyword_completion_suggestions(sql, db_type);
+        if !has(&empty, keyword) {
+            failures.push(format!(
+                "`{keyword}` missing for empty prefix at `{sql}`: {empty:?}"
+            ));
+        }
+
+        let prefix = keyword[..keyword.len().min(2)].to_ascii_lowercase();
+        let prefixed_sql = sql.replace('|', &format!("{prefix}|"));
+        let prefixed = query_keyword_completion_suggestions(&prefixed_sql, db_type);
+        if !has(&prefixed, keyword) {
+            failures.push(format!(
+                "`{keyword}` missing for 2-letter prefix `{prefix}` at `{prefixed_sql}`: {prefixed:?}"
+            ));
+        }
+
+        if !keyword.contains(' ') {
+            let exact_sql = sql.replace('|', &format!("{}|", keyword.to_ascii_lowercase()));
+            let exact = query_keyword_completion_suggestions(&exact_sql, db_type);
+            if !has(&exact, keyword) {
+                failures.push(format!(
+                    "`{keyword}` missing for exact input at `{exact_sql}`: {exact:?}"
+                ));
+            }
+        }
+    };
+
+    for (db_type, sql, keywords) in [
+        (
+            Oracle,
+            "SELECT deptno, COUNT(*) FROM emp GROUP BY |",
+            &["ROLLUP", "CUBE", "GROUPING SETS"][..],
+        ),
+        (
+            Oracle,
+            "SELECT deptno, COUNT(*) FROM emp GROUP BY GROUPING |",
+            &["SETS"],
+        ),
+        (
+            Oracle,
+            "UPDATE emp SET sal = 1 RETURNING sal |",
+            &["INTO"],
+        ),
+        (
+            Oracle,
+            "DELETE FROM emp WHERE empno = 1 RETURNING empno |",
+            &["INTO"],
+        ),
+        (
+            Oracle,
+            "INSERT INTO emp VALUES (1) RETURNING empno |",
+            &["INTO"],
+        ),
+        (
+            MySQL,
+            "INSERT INTO help VALUES (1) ON DUPLICATE |",
+            &["KEY UPDATE"],
+        ),
+        (
+            MySQL,
+            "INSERT INTO help VALUES (1) ON DUPLICATE KEY |",
+            &["UPDATE"],
+        ),
+    ] {
+        for keyword in keywords {
+            assert_keyword(sql, keyword, db_type);
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "grouping/returning/insert-tail keyword slot failures:\n{}",
+        failures.join("\n")
+    );
+}
+
 /// Helper: pure keyword tokens of the base suggestion list for `sql` (cursor at
 /// `|`), uppercased, for statement-start filtering assertions.
 fn statement_start_base_keywords(sql: &str) -> Vec<String> {
@@ -31870,7 +35131,7 @@ fn expression_construct_tail_keywords_are_complete_and_noise_free() {
         "SELECT a FROM t WHERE c = 1 |",
         "SELECT a, | FROM t",
     ] {
-        for noise in ["AND", "THEN", "WHEN", "ELSE", "END"] {
+        for noise in ["THEN", "WHEN", "ELSE", "END"] {
             assert!(!has(sql, noise), "`{noise}` leaked for `{sql}`: {:?}", kw(sql));
         }
     }

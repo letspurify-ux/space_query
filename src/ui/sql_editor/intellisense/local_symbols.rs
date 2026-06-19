@@ -794,8 +794,8 @@ impl SqlEditorWidget {
 
     fn next_into_keyword_after_cursor(tokens: &[SqlToken], start: usize) -> Option<usize> {
         let mut depth = 0i32;
-        for idx in start.min(tokens.len())..tokens.len() {
-            match &tokens[idx] {
+        for (idx, token) in tokens.iter().enumerate().skip(start.min(tokens.len())) {
+            match token {
                 SqlToken::Symbol(sym) if sym == "(" || sym == "[" => depth += 1,
                 SqlToken::Symbol(sym) if sym == ")" || sym == "]" => {
                     if depth > 0 {

@@ -1183,16 +1183,16 @@ impl IntellisenseData {
         // from the dialect keyword catalog and dedicated data-type slots; a stale
         // or synthetic Oracle TYPE object must not leak into their general
         // expression/object catalog.
-        if !crate::sql_text::mysql_compatibility_for_sql("", db_type) {
-            if Self::push_matching_entries(
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            && Self::push_matching_entries(
                 &self.type_entries,
                 &prefix_upper,
                 prefix,
                 &mut suggestions,
                 &mut seen,
-            ) {
-                return suggestions;
-            }
+            )
+        {
+            return suggestions;
         }
 
         // Schema/DDL-only object kinds that can never appear as a token in a
