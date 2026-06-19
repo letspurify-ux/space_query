@@ -3451,7 +3451,11 @@ impl SqlEditorWidget {
                 }
             }
             Some(SqlToken::Symbol(sym)) if sym == ")" => {
-                Self::function_return_operand_type_before_close(&before, data, column_scope)
+                Self::closed_paren_operand_type_before_close(&before, data, column_scope)
+            }
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("END") => {
+                Self::completed_case_return_operand_type(&before, data, column_scope)
+                    .unwrap_or(PrecedingOperandType::Unknown)
             }
             Some(SqlToken::Word(word)) => {
                 let upper = word.to_ascii_uppercase();
@@ -4313,6 +4317,111 @@ impl SqlEditorWidget {
         }
 
         None
+    }
+
+    fn completed_case_return_operand_type(
+        before: &[&SqlToken],
+        data: &IntellisenseData,
+        column_scope: &[String],
+    ) -> Option<PrecedingOperandType> {
+        let close_idx = before.len().checked_sub(1)?;
+        let open_idx = Self::matching_case_index_before_end(before, close_idx)?;
+        let tokens: Vec<SqlToken> = before.iter().map(|token| (*token).clone()).collect();
+        Self::case_result_ranges(&tokens, open_idx, close_idx)
+            .into_iter()
+            .try_fold(None, |known_type, (start, end)| {
+                Self::merge_case_result_type(&tokens, start, end, known_type, data, column_scope)
+            })
+            .flatten()
+    }
+
+    fn matching_case_index_before_end(before: &[&SqlToken], close_idx: usize) -> Option<usize> {
+        let mut depth = 1i32;
+        for idx in (0..close_idx).rev() {
+            match before.get(idx) {
+                Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("END") => depth += 1,
+                Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("CASE") => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(idx);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn case_result_ranges(
+        tokens: &[SqlToken],
+        open_idx: usize,
+        close_idx: usize,
+    ) -> Vec<(usize, usize)> {
+        let mut ranges = Vec::new();
+        let mut case_depth = 1i32;
+        let mut result_start = None;
+        for idx in (open_idx + 1)..close_idx.min(tokens.len()) {
+            match &tokens[idx] {
+                SqlToken::Word(word) if word.eq_ignore_ascii_case("CASE") => case_depth += 1,
+                SqlToken::Word(word) if word.eq_ignore_ascii_case("END") => {
+                    if case_depth > 1 {
+                        case_depth -= 1;
+                    }
+                }
+                SqlToken::Word(word) if case_depth == 1 && word.eq_ignore_ascii_case("THEN") => {
+                    result_start = Some(idx + 1);
+                }
+                SqlToken::Word(word)
+                    if case_depth == 1
+                        && (word.eq_ignore_ascii_case("WHEN")
+                            || word.eq_ignore_ascii_case("ELSE")) =>
+                {
+                    if let Some(start) = result_start.take() {
+                        ranges.push((start, idx));
+                    }
+                    if word.eq_ignore_ascii_case("ELSE") {
+                        result_start = Some(idx + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(start) = result_start {
+            ranges.push((start, close_idx.min(tokens.len())));
+        }
+        ranges
+    }
+
+    fn merge_case_result_type(
+        tokens: &[SqlToken],
+        start: usize,
+        end: usize,
+        known_type: Option<PrecedingOperandType>,
+        data: &IntellisenseData,
+        column_scope: &[String],
+    ) -> Option<Option<PrecedingOperandType>> {
+        if Self::argument_range_is_empty(tokens, start, end)
+            || Self::argument_range_is_null_literal(tokens, start, end)
+        {
+            return Some(known_type);
+        }
+        if Self::argument_range_starts_with_query(tokens, start, end) {
+            return None;
+        }
+        let result_type = Self::preceding_operand_type(tokens, end, data, column_scope);
+        let result_type = match result_type {
+            PrecedingOperandType::FloatingNumeric => PrecedingOperandType::Numeric,
+            PrecedingOperandType::Datetime
+            | PrecedingOperandType::Character
+            | PrecedingOperandType::Numeric
+            | PrecedingOperandType::Collection => result_type,
+            PrecedingOperandType::Other | PrecedingOperandType::Unknown => return None,
+        };
+        match known_type {
+            Some(known) if known != result_type => None,
+            Some(known) => Some(Some(known)),
+            None => Some(Some(result_type)),
+        }
     }
 
     fn current_numeric_operator_rhs(
@@ -6113,9 +6222,38 @@ impl SqlEditorWidget {
             return None;
         }
         match before.get(name_index) {
-            Some(SqlToken::Word(word)) => Some((word.to_ascii_uppercase(), open_index)),
+            Some(SqlToken::Word(word)) if !Self::word_before_open_cannot_introduce_call(word) => {
+                Some((word.to_ascii_uppercase(), open_index))
+            }
             _ => None,
         }
+    }
+
+    fn word_before_open_cannot_introduce_call(word: &str) -> bool {
+        matches!(
+            word.to_ascii_uppercase().as_str(),
+            "SELECT"
+                | "FROM"
+                | "WHERE"
+                | "HAVING"
+                | "ON"
+                | "WHEN"
+                | "THEN"
+                | "ELSE"
+                | "CASE"
+                | "END"
+                | "IN"
+                | "EXISTS"
+                | "IS"
+                | "BETWEEN"
+                | "AND"
+                | "OR"
+                | "NOT"
+                | "VALUES"
+                | "SET"
+                | "USING"
+                | "RETURNING"
+        )
     }
 
     /// The function/identifier name immediately before the call whose closing `)`
@@ -6123,6 +6261,48 @@ impl SqlEditorWidget {
     /// parenthesised group rather than a call.
     fn call_name_before_close(before: &[&SqlToken]) -> Option<String> {
         Self::call_name_and_open_index_before_close(before).map(|(name, _)| name)
+    }
+
+    fn closed_paren_operand_type_before_close(
+        before: &[&SqlToken],
+        data: &IntellisenseData,
+        column_scope: &[String],
+    ) -> PrecedingOperandType {
+        if Self::call_name_and_open_index_before_close(before).is_some() {
+            return Self::function_return_operand_type_before_close(before, data, column_scope);
+        }
+
+        let tokens: Vec<SqlToken> = before.iter().map(|token| (*token).clone()).collect();
+        let close_idx = tokens.len().saturating_sub(1);
+        let Some(open_idx) = Self::matching_open_paren_index_before_close(&tokens, close_idx) else {
+            return PrecedingOperandType::Unknown;
+        };
+        if !Self::open_paren_can_be_grouped_expression(before, open_idx) {
+            return PrecedingOperandType::Unknown;
+        }
+        Self::expected_type_from_argument_range(&tokens, open_idx + 1, close_idx, data, column_scope)
+            .unwrap_or(PrecedingOperandType::Unknown)
+    }
+
+    fn open_paren_can_be_grouped_expression(before: &[&SqlToken], open_idx: usize) -> bool {
+        let Some(prev_idx) = open_idx.checked_sub(1) else {
+            return true;
+        };
+        match before.get(prev_idx) {
+            Some(SqlToken::Symbol(sym)) => matches!(
+                sym.as_str(),
+                "(" | "[" | "," | "=" | "<" | ">" | "+" | "-" | "*" | "/" | "%" | "||"
+            ),
+            Some(SqlToken::Word(word)) => Self::word_before_open_can_start_grouped_expression(word),
+            _ => false,
+        }
+    }
+
+    fn word_before_open_can_start_grouped_expression(word: &str) -> bool {
+        matches!(
+            word.to_ascii_uppercase().as_str(),
+            "SELECT" | "WHERE" | "HAVING" | "ON" | "WHEN" | "THEN" | "ELSE" | "AND" | "OR" | "NOT"
+        )
     }
 
     fn function_return_operand_type_before_close(

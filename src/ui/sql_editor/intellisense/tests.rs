@@ -25576,12 +25576,16 @@ fn operand_type_operators_match_the_preceding_operand_type() {
         "SELECT 'x' a| FROM emp",
         "SELECT LENGTH(ename) a| FROM emp",
         "SELECT DATEDIFF(hiredate, hiredate) a| FROM emp",
+        "SELECT (empno) a| FROM emp",
+        "SELECT ((empno)) a| FROM emp",
         "SELECT ROUND(empno) a| FROM emp",
         "SELECT TRUNC(empno) a| FROM emp",
         "SELECT COALESCE(empno, 0) a| FROM emp",
         "SELECT COALESCE(NULL, empno) a| FROM emp",
         "SELECT NVL2(ename, empno, 0) a| FROM emp",
         "SELECT LAG(empno) a| FROM emp",
+        "SELECT CASE WHEN empno = 1 THEN empno ELSE 0 END a| FROM emp",
+        "SELECT CASE ename WHEN 'A' THEN empno ELSE 0 END a| FROM emp",
     ] {
         let s = typed_emp_suggestions(sql);
         assert!(!has(&s, "AT"), "AT leaked after a non-datetime operand for `{sql}`: {s:?}");
@@ -25592,6 +25596,8 @@ fn operand_type_operators_match_the_preceding_operand_type() {
     assert!(has(&s, "COLLATE"), "COLLATE suppressed after a character operand: {s:?}");
     let s = typed_emp_suggestions("SELECT empno col| FROM emp");
     assert!(!has(&s, "COLLATE"), "COLLATE leaked after a numeric operand: {s:?}");
+    let s = typed_emp_suggestions("SELECT (empno) col| FROM emp");
+    assert!(!has(&s, "COLLATE"), "COLLATE leaked after a parenthesized numeric operand: {s:?}");
     let s = typed_emp_suggestions("SELECT LENGTH(ename) col| FROM emp");
     assert!(!has(&s, "COLLATE"), "COLLATE leaked after a numeric function: {s:?}");
     let s = typed_emp_suggestions("SELECT ROUND(empno) col| FROM emp");
@@ -25603,12 +25609,26 @@ fn operand_type_operators_match_the_preceding_operand_type() {
         !has(&s, "COLLATE"),
         "COLLATE leaked after a NULL-leading numeric polymorphic function: {s:?}"
     );
+    let s = typed_emp_suggestions("SELECT CASE WHEN empno = 1 THEN NULL ELSE empno END col| FROM emp");
+    assert!(
+        !has(&s, "COLLATE"),
+        "COLLATE leaked after a numeric CASE expression: {s:?}"
+    );
+    let s = typed_emp_suggestions(
+        "SELECT CASE WHEN empno = 1 THEN CASE WHEN empno = 2 THEN empno ELSE 0 END ELSE empno END col| FROM emp",
+    );
+    assert!(
+        !has(&s, "COLLATE"),
+        "COLLATE leaked after a nested numeric CASE expression: {s:?}"
+    );
     let s = typed_emp_suggestions("SELECT NVL2(ename, empno, 0) col| FROM emp");
     assert!(!has(&s, "COLLATE"), "COLLATE leaked after a numeric polymorphic function: {s:?}");
     let s = typed_emp_suggestions("SELECT LAG(empno) col| FROM emp");
     assert!(!has(&s, "COLLATE"), "COLLATE leaked after a numeric analytic function: {s:?}");
     let s = typed_emp_suggestions("SELECT hiredate col| FROM emp");
     assert!(!has(&s, "COLLATE"), "COLLATE leaked after a datetime operand: {s:?}");
+    let s = typed_emp_suggestions("SELECT (hiredate) a| FROM emp");
+    assert!(has(&s, "AT"), "AT suppressed after a parenthesized datetime operand: {s:?}");
     let s = typed_emp_suggestions("SELECT DATE_ADD(hiredate, INTERVAL 1 DAY) a| FROM emp");
     assert!(has(&s, "AT"), "AT suppressed after a datetime function: {s:?}");
     let s = typed_emp_suggestions("SELECT ROUND(hiredate) a| FROM emp");
@@ -25622,6 +25642,14 @@ fn operand_type_operators_match_the_preceding_operand_type() {
         has(&s, "AT"),
         "AT suppressed after a NULL-leading datetime polymorphic function: {s:?}"
     );
+    let s = typed_emp_suggestions("SELECT CASE WHEN empno = 1 THEN NULL ELSE hiredate END a| FROM emp");
+    assert!(has(&s, "AT"), "AT suppressed after a datetime CASE expression: {s:?}");
+    let s = typed_emp_suggestions("SELECT CASE ename WHEN 'A' THEN hiredate ELSE sysdate END a| FROM emp");
+    assert!(has(&s, "AT"), "AT suppressed after a simple datetime CASE expression: {s:?}");
+    let s = typed_emp_suggestions(
+        "SELECT CASE WHEN empno = 1 THEN CASE WHEN empno = 2 THEN hiredate ELSE sysdate END ELSE hiredate END a| FROM emp",
+    );
+    assert!(has(&s, "AT"), "AT suppressed after a nested datetime CASE expression: {s:?}");
     let s = typed_emp_suggestions("SELECT NVL2(ename, hiredate, sysdate) a| FROM emp");
     assert!(has(&s, "AT"), "AT suppressed after a datetime polymorphic function: {s:?}");
     let s = typed_emp_suggestions("SELECT FIRST_VALUE(hiredate) a| FROM emp");
@@ -25634,6 +25662,15 @@ fn operand_type_operators_match_the_preceding_operand_type() {
     assert!(
         has(&s, "COLLATE"),
         "COLLATE suppressed after a NULL-leading character polymorphic function: {s:?}"
+    );
+    let s = typed_emp_suggestions("SELECT (ename) col| FROM emp");
+    assert!(has(&s, "COLLATE"), "COLLATE suppressed after a parenthesized character operand: {s:?}");
+    let s = typed_emp_suggestions("SELECT CASE WHEN empno = 1 THEN ename ELSE 'x' END col| FROM emp");
+    assert!(has(&s, "COLLATE"), "COLLATE suppressed after a character CASE expression: {s:?}");
+    let s = typed_emp_suggestions("SELECT CASE ename WHEN 'A' THEN ename ELSE 'x' END col| FROM emp");
+    assert!(
+        has(&s, "COLLATE"),
+        "COLLATE suppressed after a simple character CASE expression: {s:?}"
     );
     let s = typed_emp_suggestions("SELECT NVL2(empno, ename, 'x') col| FROM emp");
     assert!(has(&s, "COLLATE"), "COLLATE suppressed after a character polymorphic function: {s:?}");
@@ -25663,6 +25700,16 @@ fn operand_type_operators_match_the_preceding_operand_type() {
     assert!(
         has(&s, "COLLATE"),
         "COLLATE wrongly suppressed after an unknown-leading polymorphic return: {s:?}"
+    );
+    let s = typed_emp_suggestions("SELECT pkg.to_char(empno) col| FROM emp");
+    assert!(
+        has(&s, "COLLATE"),
+        "COLLATE wrongly suppressed by treating a qualified call as a parenthesized expression: {s:?}"
+    );
+    let s = typed_emp_suggestions("SELECT CASE WHEN empno = 1 THEN unknown_col ELSE empno END col| FROM emp");
+    assert!(
+        has(&s, "COLLATE"),
+        "COLLATE wrongly suppressed after an unknown CASE result: {s:?}"
     );
     let s = typed_emp_suggestions("SELECT pkg.to_char() a| FROM emp");
     assert!(has(&s, "AT"), "AT wrongly suppressed after a qualified call: {s:?}");
