@@ -352,6 +352,8 @@ enum DataTypePosition {
     ColumnDef,
     /// PL/SQL type slot: variable/parameter/return/collection-element type.
     Plsql,
+    /// SQL*Plus-style `VAR name |` bind variable type slot.
+    ToolVariable,
     /// Object type name slot inside Oracle `IS [NOT] OF TYPE (...)`.
     TypeObject,
 }
@@ -812,9 +814,24 @@ fn oracle_data_type_keywords(position: DataTypePosition) -> &'static [&'static s
         "REAL",
         "SYS_REFCURSOR",
     ];
+    const ORACLE_TOOL_VARIABLE_TYPES: &[&str] = &[
+        "REFCURSOR",
+        "SYS_REFCURSOR",
+        "NUMBER",
+        "NUMERIC",
+        "DATE",
+        "TIMESTAMP",
+        "CLOB",
+        "VARCHAR2",
+        "VARCHAR",
+        "NVARCHAR2",
+        "CHAR",
+        "NCHAR",
+    ];
 
     match position {
         DataTypePosition::Plsql => ORACLE_PLSQL_TYPES,
+        DataTypePosition::ToolVariable => ORACLE_TOOL_VARIABLE_TYPES,
         DataTypePosition::TypeObject => &[],
         DataTypePosition::Cast | DataTypePosition::ColumnDef => ORACLE_TYPES,
     }
@@ -876,6 +893,7 @@ fn mysql_data_type_keywords(position: DataTypePosition) -> &'static [&'static st
     match position {
         DataTypePosition::Cast => MYSQL_CAST_TYPES,
         DataTypePosition::TypeObject => &[],
+        DataTypePosition::ToolVariable => &[],
         DataTypePosition::ColumnDef | DataTypePosition::Plsql => MYSQL_COLUMN_TYPES,
     }
 }
@@ -8790,10 +8808,28 @@ impl SqlEditorWidget {
         if Self::cursor_is_at_json_returning_type(tokens, end) {
             return Some(DataTypePosition::Cast);
         }
+        if Self::cursor_is_at_tool_variable_type(tokens, end) {
+            return Some(DataTypePosition::ToolVariable);
+        }
         if Self::is_predicate_of_type_type_object_position(tokens, end) {
             return Some(DataTypePosition::TypeObject);
         }
         None
+    }
+
+    fn cursor_is_at_tool_variable_type(tokens: &[SqlToken], end: usize) -> bool {
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        let Some(last) = toks.len().checked_sub(1) else {
+            return false;
+        };
+        let Some(var_idx) = last.checked_sub(1) else {
+            return false;
+        };
+        let at_statement_head =
+            var_idx == 0 || matches!(toks.get(var_idx - 1), Some(SqlToken::Symbol(sym)) if sym == ";");
+        at_statement_head
+            && matches!(toks.get(var_idx), Some(SqlToken::Word(word)) if matches!(word.to_ascii_uppercase().as_str(), "VAR" | "VARIABLE"))
+            && matches!(toks.get(last), Some(SqlToken::Word(word)) if !Self::token_is_language_keyword(&word.to_ascii_uppercase()))
     }
 
     /// True when the cursor is at the type slot of a JSON function's `RETURNING`
@@ -11308,8 +11344,12 @@ impl SqlEditorWidget {
         position: DataTypePosition,
         db_type: Option<crate::db::DatabaseType>,
     ) -> bool {
-        !matches!(position, DataTypePosition::TypeObject)
-            || !crate::sql_text::mysql_compatibility_for_sql("", db_type)
+        match position {
+            DataTypePosition::TypeObject | DataTypePosition::ToolVariable => {
+                !crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            }
+            DataTypePosition::Cast | DataTypePosition::ColumnDef | DataTypePosition::Plsql => true,
+        }
     }
 
     /// True when the cursor sits right after a standalone `AS` — an alias-name

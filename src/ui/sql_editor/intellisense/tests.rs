@@ -23710,6 +23710,38 @@ fn data_type_plsql_variable_type_list_includes_plsql_only_types() {
 }
 
 #[test]
+fn data_type_tool_variable_command_offers_supported_bind_types() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    for sql in ["VAR v_rc |", "VARIABLE v_text |", "SELECT 1 FROM dual; VAR v_num |"] {
+        let s = data_type_suggestions(sql, "", Oracle);
+        for expected in ["REFCURSOR", "SYS_REFCURSOR", "NUMBER", "VARCHAR2", "TIMESTAMP"] {
+            assert!(
+                s.contains(&expected.to_string()),
+                "{expected} missing for `{sql}`: {s:?}"
+            );
+        }
+        assert!(
+            !s.contains(&"PLS_INTEGER".to_string()),
+            "VAR command should expose bind types, not PL/SQL-only variable types: {s:?}"
+        );
+    }
+
+    assert_eq!(
+        data_type_suggestions("VAR v_rc ref|", "ref", Oracle),
+        vec!["REFCURSOR".to_string()]
+    );
+    assert!(
+        data_type_suggestions("VAR |", "", Oracle).is_empty(),
+        "VAR name slot must not offer data types"
+    );
+    assert!(
+        data_type_suggestions("VAR v_rc |", "", MySQL).is_empty(),
+        "Oracle SQL*Plus VAR type slot must not apply in MySQL mode"
+    );
+}
+
+#[test]
 fn data_type_plsql_routine_parameter_offers_types() {
     use crate::db::DatabaseType::Oracle;
     for sql in [
