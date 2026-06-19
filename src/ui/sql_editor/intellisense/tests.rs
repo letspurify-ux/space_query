@@ -25636,6 +25636,22 @@ fn operand_type_operators_match_the_preceding_operand_type() {
         !has(&timezone_value, "EMPNO") && !has(&timezone_value, "HIREDATE"),
         "AT TIME ZONE expression slot leaked non-character columns: {timezone_value:?}"
     );
+
+    for sql in [
+        "SELECT * FROM emp WHERE | AT TIME ZONE 'UTC'",
+        "SELECT * FROM emp WHERE h| AT TIME ZONE 'UTC'",
+        "SELECT * FROM emp WHERE | AT LOCAL",
+    ] {
+        let suggestions = typed_emp_suggestions(sql);
+        assert!(
+            has(&suggestions, "HIREDATE"),
+            "AT TIME ZONE LHS lost datetime columns for `{sql}`: {suggestions:?}"
+        );
+        assert!(
+            !has(&suggestions, "ENAME") && !has(&suggestions, "EMPNO"),
+            "AT TIME ZONE LHS leaked non-datetime columns for `{sql}`: {suggestions:?}"
+        );
+    }
     assert!(
         !suppresses(
             "SELECT * FROM emp WHERE hiredate AT |",
@@ -25655,6 +25671,34 @@ fn operand_type_operators_match_the_preceding_operand_type() {
         assert!(
             suppresses(sql, crate::db::DatabaseType::MySQL),
             "MySQL COLLATE collation-name slot leaked columns for `{sql}`"
+        );
+    }
+    for (sql, db_type) in [
+        (
+            "SELECT * FROM emp WHERE | COLLATE BINARY_CI",
+            crate::db::DatabaseType::Oracle,
+        ),
+        (
+            "SELECT * FROM emp WHERE e| COLLATE BINARY_CI",
+            crate::db::DatabaseType::Oracle,
+        ),
+        (
+            "SELECT * FROM emp WHERE | COLLATE utf8mb4_bin",
+            crate::db::DatabaseType::MySQL,
+        ),
+        (
+            "SELECT * FROM emp WHERE e| COLLATE utf8mb4_bin",
+            crate::db::DatabaseType::MySQL,
+        ),
+    ] {
+        let suggestions = typed_emp_suggestions_for_db(sql, db_type);
+        assert!(
+            has(&suggestions, "ENAME"),
+            "COLLATE LHS lost character columns for `{sql}`: {suggestions:?}"
+        );
+        assert!(
+            !has(&suggestions, "EMPNO") && !has(&suggestions, "HIREDATE"),
+            "COLLATE LHS leaked non-character columns for `{sql}`: {suggestions:?}"
         );
     }
     assert!(
@@ -25842,6 +25886,40 @@ fn negated_and_collection_predicate_operators_are_position_aware() {
         assert!(
             !has(&suggestions, "ELEM") && !has(&suggestions, "TXT_COL"),
             "non-collection columns leaked into collection RHS slot for `{sql}`: {suggestions:?}"
+        );
+    }
+
+    for sql in [
+        "SELECT * FROM t WHERE | SUBMULTISET OF parent_nt",
+        "SELECT * FROM t WHERE c| SUBMULTISET OF parent_nt",
+        "SELECT * FROM t WHERE | NOT SUBMULTISET OF parent_nt",
+    ] {
+        let suggestions = collection_suggestions(sql);
+        assert!(
+            has(&suggestions, "CHILD_NT") || has(&suggestions, "PARENT_NT"),
+            "SUBMULTISET LHS slot lost collection columns for `{sql}`: {suggestions:?}"
+        );
+        assert!(
+            !has(&suggestions, "ELEM") && !has(&suggestions, "TXT_COL"),
+            "non-collection columns leaked into SUBMULTISET LHS slot for `{sql}`: {suggestions:?}"
+        );
+    }
+
+    for sql in [
+        "SELECT * FROM t WHERE | MEMBER OF parent_nt",
+        "SELECT * FROM t WHERE e| MEMBER OF parent_nt",
+        "SELECT * FROM t WHERE | NOT MEMBER OF parent_nt",
+    ] {
+        let suggestions = collection_suggestions(sql);
+        assert!(
+            has(&suggestions, "ELEM"),
+            "MEMBER OF LHS slot lost element-compatible columns for `{sql}`: {suggestions:?}"
+        );
+        assert!(
+            !has(&suggestions, "CHILD_NT")
+                && !has(&suggestions, "PARENT_NT")
+                && !has(&suggestions, "TXT_COL"),
+            "non-element columns leaked into MEMBER OF LHS slot for `{sql}`: {suggestions:?}"
         );
     }
 }
@@ -26432,6 +26510,60 @@ fn between_bound_slots_filter_columns_to_left_operand_type() {
 }
 
 #[test]
+fn between_lhs_slots_filter_columns_to_bound_operand_type() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let assert_only = |sql: &str, db_type, expected: &str, unexpected: &[&str]| {
+        let suggestions = typed_emp_suggestions_for_db(sql, db_type);
+        assert!(
+            has(&suggestions, expected),
+            "BETWEEN LHS lost `{expected}` for `{sql}`: {suggestions:?}"
+        );
+        for name in unexpected {
+            assert!(
+                !has(&suggestions, name),
+                "BETWEEN LHS leaked `{name}` for `{sql}`: {suggestions:?}"
+            );
+        }
+    };
+
+    for db_type in [Oracle, MySQL] {
+        assert_only(
+            "SELECT * FROM emp WHERE | BETWEEN empno AND 9999",
+            db_type,
+            "EMPNO",
+            &["ENAME", "HIREDATE"],
+        );
+        assert_only(
+            "SELECT * FROM emp WHERE e| BETWEEN empno AND 9999",
+            db_type,
+            "EMPNO",
+            &["ENAME", "HIREDATE"],
+        );
+        assert_only(
+            "SELECT * FROM emp WHERE | NOT BETWEEN hiredate AND CURRENT_DATE",
+            db_type,
+            "HIREDATE",
+            &["ENAME", "EMPNO"],
+        );
+        assert_only(
+            "SELECT * FROM emp WHERE | BETWEEN ename AND 'Z'",
+            db_type,
+            "ENAME",
+            &["EMPNO", "HIREDATE"],
+        );
+    }
+
+    let unknown_bound =
+        typed_emp_suggestions("SELECT * FROM emp WHERE | BETWEEN unknown_col AND other_unknown");
+    assert!(
+        has(&unknown_bound, "ENAME") && has(&unknown_bound, "EMPNO"),
+        "unknown BETWEEN bound must not hide otherwise valid LHS columns: {unknown_bound:?}"
+    );
+}
+
+#[test]
 fn comparison_rhs_slots_filter_columns_to_left_operand_type() {
     use crate::db::DatabaseType::{MySQL, Oracle};
 
@@ -26646,6 +26778,198 @@ fn update_set_tuple_rhs_slots_filter_columns_to_target_column_type() {
 }
 
 #[test]
+fn update_set_scalar_rhs_slots_filter_columns_to_target_column_type() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let assert_only = |sql: &str, db_type, expected: &str, unexpected: &[&str]| {
+        let suggestions = typed_emp_suggestions_for_db(sql, db_type);
+        assert!(
+            has(&suggestions, expected),
+            "SET scalar RHS lost `{expected}` for `{sql}`: {suggestions:?}"
+        );
+        for name in unexpected {
+            assert!(
+                !has(&suggestions, name),
+                "SET scalar RHS leaked `{name}` for `{sql}`: {suggestions:?}"
+            );
+        }
+    };
+
+    for db_type in [Oracle, MySQL] {
+        assert_only(
+            "UPDATE emp SET empno = (|)",
+            db_type,
+            "EMPNO",
+            &["ENAME", "HIREDATE"],
+        );
+        assert_only(
+            "UPDATE emp SET empno = 1, ename = (|)",
+            db_type,
+            "ENAME",
+            &["EMPNO", "HIREDATE"],
+        );
+        assert_only(
+            "UPDATE emp SET ename = CASE WHEN empno = 1 THEN | END",
+            db_type,
+            "ENAME",
+            &["EMPNO", "HIREDATE"],
+        );
+        assert_only(
+            "UPDATE emp e SET e.hiredate = CASE WHEN e.empno = 1 THEN | END",
+            db_type,
+            "HIREDATE",
+            &["ENAME", "EMPNO"],
+        );
+        assert_only(
+            "MERGE INTO emp e USING emp s ON (e.empno = s.empno) WHEN MATCHED THEN UPDATE SET e.ename = CASE WHEN s.empno = 1 THEN | END",
+            db_type,
+            "ENAME",
+            &["EMPNO", "HIREDATE"],
+        );
+    }
+
+    let unknown_target = typed_emp_suggestions("UPDATE emp SET missing_col = (|)");
+    assert!(
+        has(&unknown_target, "ENAME") && has(&unknown_target, "EMPNO"),
+        "SET scalar RHS with unknown target must not over-filter candidates: {unknown_target:?}"
+    );
+}
+
+#[test]
+fn insert_set_rhs_slots_filter_columns_to_target_column_type() {
+    use crate::db::DatabaseType::MySQL;
+
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let assert_only = |sql: &str, expected: &str, unexpected: &[&str]| {
+        let suggestions = typed_emp_suggestions_for_db(sql, MySQL);
+        assert!(
+            has(&suggestions, expected),
+            "INSERT/REPLACE SET RHS lost `{expected}` for `{sql}`: {suggestions:?}"
+        );
+        for name in unexpected {
+            assert!(
+                !has(&suggestions, name),
+                "INSERT/REPLACE SET RHS leaked `{name}` for `{sql}`: {suggestions:?}"
+            );
+        }
+    };
+
+    assert_only(
+        "INSERT INTO emp SET empno = (|)",
+        "EMPNO",
+        &["ENAME", "HIREDATE"],
+    );
+    assert_only(
+        "INSERT INTO emp SET empno = 1, ename = CASE WHEN empno = 1 THEN | END",
+        "ENAME",
+        &["EMPNO", "HIREDATE"],
+    );
+    assert_only(
+        "REPLACE INTO emp SET hiredate = CASE WHEN empno = 1 THEN | END",
+        "HIREDATE",
+        &["ENAME", "EMPNO"],
+    );
+
+    let unknown_target =
+        typed_emp_suggestions_for_db("INSERT INTO emp SET missing_col = (|)", MySQL);
+    assert!(
+        has(&unknown_target, "ENAME") && has(&unknown_target, "EMPNO"),
+        "INSERT SET with unknown target must not over-filter candidates: {unknown_target:?}"
+    );
+}
+
+#[test]
+fn on_duplicate_key_update_rhs_slots_filter_columns_to_target_column_type() {
+    use crate::db::DatabaseType::MySQL;
+
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let assert_only = |sql: &str, expected: &str, unexpected: &[&str]| {
+        let suggestions = typed_emp_suggestions_for_db(sql, MySQL);
+        assert!(
+            has(&suggestions, expected),
+            "ON DUPLICATE KEY UPDATE RHS lost `{expected}` for `{sql}`: {suggestions:?}"
+        );
+        for name in unexpected {
+            assert!(
+                !has(&suggestions, name),
+                "ON DUPLICATE KEY UPDATE RHS leaked `{name}` for `{sql}`: {suggestions:?}"
+            );
+        }
+    };
+
+    assert_only(
+        "INSERT INTO emp (empno, ename, hiredate) VALUES (1, 'A', CURRENT_DATE) ON DUPLICATE KEY UPDATE empno = (|)",
+        "EMPNO",
+        &["ENAME", "HIREDATE"],
+    );
+    assert_only(
+        "INSERT INTO emp (empno, ename, hiredate) VALUES (1, 'A', CURRENT_DATE) ON DUPLICATE KEY UPDATE ename = CASE WHEN empno = 1 THEN | END",
+        "ENAME",
+        &["EMPNO", "HIREDATE"],
+    );
+    assert_only(
+        "INSERT INTO emp (empno, ename, hiredate) VALUES (1, 'A', CURRENT_DATE) ON DUPLICATE KEY UPDATE empno = VALUES(empno), hiredate = CASE WHEN empno = 1 THEN | END",
+        "HIREDATE",
+        &["ENAME", "EMPNO"],
+    );
+
+    let unknown_target = typed_emp_suggestions_for_db(
+        "INSERT INTO emp VALUES ('A', 1, CURRENT_DATE) ON DUPLICATE KEY UPDATE missing_col = (|)",
+        MySQL,
+    );
+    assert!(
+        has(&unknown_target, "ENAME") && has(&unknown_target, "EMPNO"),
+        "ON DUPLICATE KEY UPDATE with unknown target must not over-filter candidates: {unknown_target:?}"
+    );
+}
+
+#[test]
+fn on_conflict_do_update_rhs_slots_filter_columns_to_target_column_type() {
+    use crate::db::DatabaseType::MySQL;
+
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let assert_only = |sql: &str, expected: &str, unexpected: &[&str]| {
+        let suggestions = typed_emp_suggestions_for_db(sql, MySQL);
+        assert!(
+            has(&suggestions, expected),
+            "ON CONFLICT DO UPDATE RHS lost `{expected}` for `{sql}`: {suggestions:?}"
+        );
+        for name in unexpected {
+            assert!(
+                !has(&suggestions, name),
+                "ON CONFLICT DO UPDATE RHS leaked `{name}` for `{sql}`: {suggestions:?}"
+            );
+        }
+    };
+
+    assert_only(
+        "INSERT INTO emp (empno, ename, hiredate) VALUES (1, 'A', CURRENT_DATE) ON CONFLICT (empno) DO UPDATE SET empno = (|)",
+        "EMPNO",
+        &["ENAME", "HIREDATE"],
+    );
+    assert_only(
+        "INSERT INTO emp (empno, ename, hiredate) VALUES (1, 'A', CURRENT_DATE) ON CONFLICT (empno) DO UPDATE SET ename = CASE WHEN empno = 1 THEN | END",
+        "ENAME",
+        &["EMPNO", "HIREDATE"],
+    );
+    assert_only(
+        "INSERT INTO emp (empno, ename, hiredate) VALUES (1, 'A', CURRENT_DATE) ON CONFLICT (empno) DO UPDATE SET empno = EXCLUDED.empno, hiredate = CASE WHEN empno = 1 THEN | END",
+        "HIREDATE",
+        &["ENAME", "EMPNO"],
+    );
+
+    let unknown_target = typed_emp_suggestions_for_db(
+        "INSERT INTO emp VALUES ('A', 1, CURRENT_DATE) ON CONFLICT (empno) DO UPDATE SET missing_col = (|)",
+        MySQL,
+    );
+    assert!(
+        has(&unknown_target, "ENAME") && has(&unknown_target, "EMPNO"),
+        "ON CONFLICT DO UPDATE with unknown target must not over-filter candidates: {unknown_target:?}"
+    );
+}
+
+#[test]
 fn numeric_operator_rhs_slots_filter_columns_to_numeric_operands() {
     use crate::db::DatabaseType::{MySQL, Oracle};
 
@@ -26681,6 +27005,95 @@ fn numeric_operator_rhs_slots_filter_columns_to_numeric_operands() {
     assert!(
         has(&unknown_left, "ENAME") && has(&unknown_left, "EMPNO"),
         "unknown left operand must not hide otherwise valid arithmetic RHS columns: {unknown_left:?}"
+    );
+}
+
+#[test]
+fn numeric_operator_lhs_slots_filter_columns_to_numeric_operands() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let assert_numeric_only = |sql: &str, db_type| {
+        let suggestions = typed_emp_suggestions_for_db(sql, db_type);
+        assert!(
+            has(&suggestions, "EMPNO"),
+            "numeric operator LHS lost numeric columns for `{sql}`: {suggestions:?}"
+        );
+        assert!(
+            !has(&suggestions, "ENAME") && !has(&suggestions, "HIREDATE"),
+            "non-numeric columns leaked into numeric operator LHS for `{sql}`: {suggestions:?}"
+        );
+    };
+
+    for db_type in [Oracle, MySQL] {
+        for sql in [
+            "SELECT | * empno FROM emp",
+            "SELECT e| * empno FROM emp",
+            "SELECT | / empno FROM emp",
+        ] {
+            assert_numeric_only(sql, db_type);
+        }
+    }
+
+    for sql in ["SELECT | MOD empno FROM emp", "SELECT | DIV empno FROM emp"] {
+        assert_numeric_only(sql, MySQL);
+    }
+
+    let unknown_right = typed_emp_suggestions("SELECT | * unknown_col FROM emp");
+    assert!(
+        has(&unknown_right, "ENAME") && has(&unknown_right, "EMPNO"),
+        "unknown right operand must not hide otherwise valid arithmetic LHS columns: {unknown_right:?}"
+    );
+}
+
+#[test]
+fn additive_operator_lhs_slots_follow_right_operand_type() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let assert_has = |sql: &str, db_type, expected: &[&str], unexpected: &[&str]| {
+        let suggestions = typed_emp_suggestions_for_db(sql, db_type);
+        for name in expected {
+            assert!(
+                has(&suggestions, name),
+                "additive operator LHS lost `{name}` for `{sql}`: {suggestions:?}"
+            );
+        }
+        for name in unexpected {
+            assert!(
+                !has(&suggestions, name),
+                "additive operator LHS leaked `{name}` for `{sql}`: {suggestions:?}"
+            );
+        }
+    };
+
+    assert_has(
+        "SELECT | + empno FROM emp",
+        Oracle,
+        &["EMPNO", "HIREDATE"],
+        &["ENAME"],
+    );
+    assert_has(
+        "SELECT | - empno FROM emp",
+        Oracle,
+        &["EMPNO", "HIREDATE"],
+        &["ENAME"],
+    );
+    assert_has(
+        "SELECT | - hiredate FROM emp",
+        Oracle,
+        &["HIREDATE"],
+        &["ENAME", "EMPNO"],
+    );
+
+    for sql in ["SELECT | + empno FROM emp", "SELECT | - empno FROM emp"] {
+        assert_has(sql, MySQL, &["EMPNO"], &["ENAME", "HIREDATE"]);
+    }
+
+    let unknown_right = typed_emp_suggestions("SELECT | + unknown_col FROM emp");
+    assert!(
+        has(&unknown_right, "ENAME") && has(&unknown_right, "EMPNO"),
+        "unknown additive right operand must not hide otherwise valid LHS columns: {unknown_right:?}"
     );
 }
 
@@ -26793,6 +27206,13 @@ fn numeric_function_argument_slots_filter_columns_to_numeric_operands() {
             "SELECT SUBSTR(ename, |) FROM emp",
             "SELECT LPAD(ename, |) FROM emp",
             "SELECT SIN(e|) FROM emp",
+            "SELECT SUM(|) FROM emp",
+            "SELECT SUM(DISTINCT |) FROM emp",
+            "SELECT AVG(|) FROM emp",
+            "SELECT STDDEV(|) FROM emp",
+            "SELECT VARIANCE(|) FROM emp",
+            "SELECT NUMTODSINTERVAL(|, 'DAY') FROM emp",
+            "SELECT NUMTOYMINTERVAL(|, 'MONTH') FROM emp",
         ] {
             assert_numeric_only(sql, db_type);
         }
@@ -27115,7 +27535,13 @@ fn character_function_argument_slots_filter_columns_to_character_operands() {
     }
 
     assert_character_only("SELECT TO_DATE(|, 'YYYY-MM-DD') FROM emp", Oracle);
+    assert_character_only("SELECT TO_CHAR(hiredate, |) FROM emp", Oracle);
+    assert_character_only("SELECT TO_NUMBER(|) FROM emp", Oracle);
+    assert_character_only("SELECT TO_NUMBER(ename, |) FROM emp", Oracle);
+    assert_character_only("SELECT NUMTODSINTERVAL(1, |) FROM emp", Oracle);
+    assert_character_only("SELECT NUMTOYMINTERVAL(1, |) FROM emp", Oracle);
     assert_character_only("SELECT STR_TO_DATE(|, '%Y-%m-%d') FROM emp", MySQL);
+    assert_character_only("SELECT DATE_FORMAT(hiredate, |) FROM emp", MySQL);
 }
 
 #[test]
@@ -27249,6 +27675,64 @@ fn in_list_slots_filter_columns_to_left_operand_type() {
 }
 
 #[test]
+fn in_lhs_slots_filter_columns_to_list_operand_type() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let assert_only = |sql: &str, db_type, expected: &str, unexpected: &[&str]| {
+        let suggestions = typed_emp_suggestions_for_db(sql, db_type);
+        assert!(
+            has(&suggestions, expected),
+            "IN LHS lost `{expected}` for `{sql}`: {suggestions:?}"
+        );
+        for name in unexpected {
+            assert!(
+                !has(&suggestions, name),
+                "IN LHS leaked `{name}` for `{sql}`: {suggestions:?}"
+            );
+        }
+    };
+
+    for db_type in [Oracle, MySQL] {
+        assert_only(
+            "SELECT * FROM emp WHERE | IN (empno, 1)",
+            db_type,
+            "EMPNO",
+            &["ENAME", "HIREDATE"],
+        );
+        assert_only(
+            "SELECT * FROM emp WHERE e| IN (empno, 1)",
+            db_type,
+            "EMPNO",
+            &["ENAME", "HIREDATE"],
+        );
+        assert_only(
+            "SELECT * FROM emp WHERE | NOT IN (hiredate, CURRENT_DATE)",
+            db_type,
+            "HIREDATE",
+            &["ENAME", "EMPNO"],
+        );
+        assert_only(
+            "SELECT * FROM emp WHERE | IN (ename, 'A')",
+            db_type,
+            "ENAME",
+            &["EMPNO", "HIREDATE"],
+        );
+    }
+
+    let empty_list = typed_emp_suggestions("SELECT * FROM emp WHERE | IN ()");
+    assert!(
+        has(&empty_list, "ENAME") && has(&empty_list, "EMPNO"),
+        "empty IN list must not hide otherwise valid LHS columns: {empty_list:?}"
+    );
+    let subquery_list = typed_emp_suggestions("SELECT * FROM emp WHERE | IN (SELECT empno FROM emp)");
+    assert!(
+        has(&subquery_list, "ENAME") && has(&subquery_list, "EMPNO"),
+        "IN subquery must not over-filter LHS columns: {subquery_list:?}"
+    );
+}
+
+#[test]
 fn insert_values_slots_filter_columns_to_target_column_type() {
     use crate::db::DatabaseType::{MySQL, Oracle};
 
@@ -27326,6 +27810,21 @@ fn insert_values_slots_filter_columns_to_target_column_type() {
         has(&unknown_target, "ENAME") && has(&unknown_target, "EMPNO"),
         "VALUES slot without a matching target column must not over-filter candidates: {unknown_target:?}"
     );
+
+    for db_type in [Oracle, MySQL] {
+        assert_only(
+            "INSERT INTO emp (hiredate) VALUES (TO_DATE(|, 'YYYY-MM-DD'))",
+            db_type,
+            "ENAME",
+            &["EMPNO", "HIREDATE"],
+        );
+        assert_only(
+            "INSERT INTO emp (empno) VALUES (EXTRACT(YEAR FROM |))",
+            db_type,
+            "HIREDATE",
+            &["ENAME", "EMPNO"],
+        );
+    }
 
     assert_only(
         "MERGE INTO emp e USING emp s ON (e.empno = s.empno) WHEN NOT MATCHED THEN INSERT (empno, ename, hiredate) VALUES (|)",
@@ -27406,6 +27905,21 @@ fn insert_select_slots_filter_columns_to_target_column_type() {
         has(&nested_select, "ENAME") && has(&nested_select, "EMPNO"),
         "nested SELECT inside INSERT projection must not inherit outer target type: {nested_select:?}"
     );
+
+    for db_type in [Oracle, MySQL] {
+        assert_only(
+            "INSERT INTO emp (hiredate) SELECT TO_DATE(|, 'YYYY-MM-DD') FROM emp",
+            db_type,
+            "ENAME",
+            &["EMPNO", "HIREDATE"],
+        );
+        assert_only(
+            "INSERT INTO emp (empno) SELECT EXTRACT(YEAR FROM |) FROM emp",
+            db_type,
+            "HIREDATE",
+            &["ENAME", "EMPNO"],
+        );
+    }
 }
 
 #[test]
