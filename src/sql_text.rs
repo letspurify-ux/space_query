@@ -1578,6 +1578,10 @@ const STATEMENT_HEAD_KEYWORDS: &[&str] = &[
     "TABLE",
 ];
 
+pub(crate) fn statement_head_keywords() -> &'static [&'static str] {
+    STATEMENT_HEAD_KEYWORDS
+}
+
 /// O(1) lookup set for `STATEMENT_HEAD_KEYWORDS` (80+ entries).
 static STATEMENT_HEAD_KEYWORDS_SET: Lazy<HashSet<&'static str>> =
     Lazy::new(|| STATEMENT_HEAD_KEYWORDS.iter().copied().collect());

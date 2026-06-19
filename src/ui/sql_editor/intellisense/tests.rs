@@ -25565,6 +25565,11 @@ fn operand_type_operators_match_the_preceding_operand_type() {
         "SELECT * FROM emp WHERE hiredate a|",
         "SELECT sysdate a| FROM emp",
         "SELECT DATE '2020-01-01' a| FROM emp",
+        "SELECT TIMESTAMP(6) '2020-01-01 10:00:00' a| FROM emp",
+        "SELECT TIMESTAMP WITH TIME ZONE '2020-01-01 10:00:00 UTC' a| FROM emp",
+        "SELECT TIMESTAMP(6) WITH TIME ZONE '2020-01-01 10:00:00 UTC' a| FROM emp",
+        "SELECT TIMESTAMP WITH LOCAL TIME ZONE '2020-01-01 10:00:00' a| FROM emp",
+        "SELECT TIME(3) WITH TIME ZONE '10:00:00 UTC' a| FROM emp",
     ] {
         let s = typed_emp_suggestions(sql);
         assert!(has(&s, "AT"), "AT suppressed after a datetime operand for `{sql}`: {s:?}");
@@ -25574,10 +25579,21 @@ fn operand_type_operators_match_the_preceding_operand_type() {
         "SELECT * FROM emp WHERE empno a|",
         "SELECT ename a| FROM emp",
         "SELECT 'x' a| FROM emp",
+        "SELECT X'ABCD' a| FROM emp",
+        "SELECT B'1010' a| FROM emp",
         "SELECT LENGTH(ename) a| FROM emp",
         "SELECT DATEDIFF(hiredate, hiredate) a| FROM emp",
         "SELECT (empno) a| FROM emp",
         "SELECT ((empno)) a| FROM emp",
+        "SELECT CAST(ename AS NUMBER) a| FROM emp",
+        "SELECT JSON_VALUE(ename, '$.n' RETURNING NUMBER) a| FROM emp",
+        "SELECT INTERVAL '1' DAY a| FROM emp",
+        "SELECT INTERVAL '1' DAY(2) a| FROM emp",
+        "SELECT INTERVAL '1-2' YEAR TO MONTH a| FROM emp",
+        "SELECT INTERVAL '1 02:03:04.5' DAY(2) TO SECOND(6) a| FROM emp",
+        "SELECT TRUE a| FROM emp",
+        "SELECT FALSE a| FROM emp",
+        "SELECT UNKNOWN a| FROM emp",
         "SELECT ROUND(empno) a| FROM emp",
         "SELECT TRUNC(empno) a| FROM emp",
         "SELECT COALESCE(empno, 0) a| FROM emp",
@@ -25594,12 +25610,32 @@ fn operand_type_operators_match_the_preceding_operand_type() {
     // COLLATE after a character operand only.
     let s = typed_emp_suggestions("SELECT ename col| FROM emp");
     assert!(has(&s, "COLLATE"), "COLLATE suppressed after a character operand: {s:?}");
+    let s = typed_emp_suggestions("SELECT N'abc' col| FROM emp");
+    assert!(has(&s, "COLLATE"), "COLLATE suppressed after a national character literal: {s:?}");
     let s = typed_emp_suggestions("SELECT empno col| FROM emp");
     assert!(!has(&s, "COLLATE"), "COLLATE leaked after a numeric operand: {s:?}");
+    let s = typed_emp_suggestions("SELECT X'ABCD' col| FROM emp");
+    assert!(!has(&s, "COLLATE"), "COLLATE leaked after a hex string literal: {s:?}");
+    let s = typed_emp_suggestions("SELECT B'1010' col| FROM emp");
+    assert!(!has(&s, "COLLATE"), "COLLATE leaked after a bit string literal: {s:?}");
     let s = typed_emp_suggestions("SELECT (empno) col| FROM emp");
     assert!(!has(&s, "COLLATE"), "COLLATE leaked after a parenthesized numeric operand: {s:?}");
     let s = typed_emp_suggestions("SELECT LENGTH(ename) col| FROM emp");
     assert!(!has(&s, "COLLATE"), "COLLATE leaked after a numeric function: {s:?}");
+    let s = typed_emp_suggestions("SELECT CAST(ename AS NUMBER) col| FROM emp");
+    assert!(!has(&s, "COLLATE"), "COLLATE leaked after a numeric CAST: {s:?}");
+    let s = typed_emp_suggestions(
+        "SELECT JSON_VALUE(ename, '$.n' RETURNING NUMBER DEFAULT 0 ON ERROR NULL ON EMPTY) col| FROM emp",
+    );
+    assert!(
+        !has(&s, "COLLATE"),
+        "COLLATE leaked after a numeric JSON RETURNING function: {s:?}"
+    );
+    let s = typed_emp_suggestions_for_db(
+        "SELECT CAST(ename AS SIGNED) col| FROM emp",
+        crate::db::DatabaseType::MySQL,
+    );
+    assert!(!has(&s, "COLLATE"), "COLLATE leaked after a MySQL numeric CAST: {s:?}");
     let s = typed_emp_suggestions("SELECT ROUND(empno) col| FROM emp");
     assert!(!has(&s, "COLLATE"), "COLLATE leaked after a numeric overloaded function: {s:?}");
     let s = typed_emp_suggestions("SELECT COALESCE(empno, 0) col| FROM emp");
@@ -25627,8 +25663,66 @@ fn operand_type_operators_match_the_preceding_operand_type() {
     assert!(!has(&s, "COLLATE"), "COLLATE leaked after a numeric analytic function: {s:?}");
     let s = typed_emp_suggestions("SELECT hiredate col| FROM emp");
     assert!(!has(&s, "COLLATE"), "COLLATE leaked after a datetime operand: {s:?}");
+    let s = typed_emp_suggestions("SELECT TIMESTAMP WITH TIME ZONE '2020-01-01 10:00:00 UTC' col| FROM emp");
+    assert!(
+        !has(&s, "COLLATE"),
+        "COLLATE leaked after a TIMESTAMP WITH TIME ZONE literal: {s:?}"
+    );
+    let s =
+        typed_emp_suggestions("SELECT TIMESTAMP(6) WITH TIME ZONE '2020-01-01 10:00:00 UTC' col| FROM emp");
+    assert!(
+        !has(&s, "COLLATE"),
+        "COLLATE leaked after a TIMESTAMP precision WITH TIME ZONE literal: {s:?}"
+    );
+    let s = typed_emp_suggestions("SELECT TIME WITH TIME ZONE '10:00:00 UTC' col| FROM emp");
+    assert!(
+        !has(&s, "COLLATE"),
+        "COLLATE leaked after a TIME WITH TIME ZONE literal: {s:?}"
+    );
+    let s = typed_emp_suggestions("SELECT TIME(3) WITH TIME ZONE '10:00:00 UTC' col| FROM emp");
+    assert!(
+        !has(&s, "COLLATE"),
+        "COLLATE leaked after a TIME precision WITH TIME ZONE literal: {s:?}"
+    );
+    let s = typed_emp_suggestions("SELECT INTERVAL '1' DAY col| FROM emp");
+    assert!(!has(&s, "COLLATE"), "COLLATE leaked after an interval literal: {s:?}");
+    let s = typed_emp_suggestions("SELECT INTERVAL '1' DAY(2) col| FROM emp");
+    assert!(
+        !has(&s, "COLLATE"),
+        "COLLATE leaked after an interval literal with leading precision: {s:?}"
+    );
+    let s = typed_emp_suggestions("SELECT TRUE col| FROM emp");
+    assert!(!has(&s, "COLLATE"), "COLLATE leaked after TRUE literal: {s:?}");
+    let s = typed_emp_suggestions("SELECT FALSE col| FROM emp");
+    assert!(!has(&s, "COLLATE"), "COLLATE leaked after FALSE literal: {s:?}");
+    let s = typed_emp_suggestions("SELECT UNKNOWN col| FROM emp");
+    assert!(!has(&s, "COLLATE"), "COLLATE leaked after UNKNOWN literal: {s:?}");
+    let s = typed_emp_suggestions("SELECT INTERVAL '1-2' YEAR TO MONTH col| FROM emp");
+    assert!(
+        !has(&s, "COLLATE"),
+        "COLLATE leaked after a compound interval literal: {s:?}"
+    );
+    let s = typed_emp_suggestions("SELECT INTERVAL '1 02:03:04.5' DAY(2) TO SECOND(6) col| FROM emp");
+    assert!(
+        !has(&s, "COLLATE"),
+        "COLLATE leaked after a compound interval literal with precision: {s:?}"
+    );
+    let s = typed_emp_suggestions_for_db(
+        "SELECT INTERVAL 1 DAY col| FROM emp",
+        crate::db::DatabaseType::MySQL,
+    );
+    assert!(
+        !has(&s, "COLLATE"),
+        "COLLATE leaked after a MySQL interval expression: {s:?}"
+    );
     let s = typed_emp_suggestions("SELECT (hiredate) a| FROM emp");
     assert!(has(&s, "AT"), "AT suppressed after a parenthesized datetime operand: {s:?}");
+    let s = typed_emp_suggestions("SELECT CAST(ename AS DATE) a| FROM emp");
+    assert!(has(&s, "AT"), "AT suppressed after a datetime CAST: {s:?}");
+    let s = typed_emp_suggestions("SELECT JSON_VALUE(ename, '$.d' RETURNING DATE) a| FROM emp");
+    assert!(has(&s, "AT"), "AT suppressed after a datetime JSON RETURNING function: {s:?}");
+    let s = typed_emp_suggestions("SELECT XMLCAST(ename AS TIMESTAMP) a| FROM emp");
+    assert!(has(&s, "AT"), "AT suppressed after a datetime XMLCAST: {s:?}");
     let s = typed_emp_suggestions("SELECT DATE_ADD(hiredate, INTERVAL 1 DAY) a| FROM emp");
     assert!(has(&s, "AT"), "AT suppressed after a datetime function: {s:?}");
     let s = typed_emp_suggestions("SELECT ROUND(hiredate) a| FROM emp");
@@ -25665,6 +25759,14 @@ fn operand_type_operators_match_the_preceding_operand_type() {
     );
     let s = typed_emp_suggestions("SELECT (ename) col| FROM emp");
     assert!(has(&s, "COLLATE"), "COLLATE suppressed after a parenthesized character operand: {s:?}");
+    let s = typed_emp_suggestions("SELECT CAST(empno AS VARCHAR2(20)) col| FROM emp");
+    assert!(has(&s, "COLLATE"), "COLLATE suppressed after a character CAST: {s:?}");
+    let s = typed_emp_suggestions("SELECT JSON_QUERY(ename, '$' RETURNING CLOB) col| FROM emp");
+    assert!(has(&s, "COLLATE"), "COLLATE suppressed after a character JSON RETURNING function: {s:?}");
+    let s = typed_emp_suggestions("SELECT JSON_OBJECT(KEY ename VALUE empno RETURNING CLOB) col| FROM emp");
+    assert!(has(&s, "COLLATE"), "COLLATE suppressed after a character JSON object function: {s:?}");
+    let s = typed_emp_suggestions("SELECT XMLSERIALIZE(DOCUMENT ename AS CLOB) col| FROM emp");
+    assert!(has(&s, "COLLATE"), "COLLATE suppressed after a character XMLSERIALIZE: {s:?}");
     let s = typed_emp_suggestions("SELECT CASE WHEN empno = 1 THEN ename ELSE 'x' END col| FROM emp");
     assert!(has(&s, "COLLATE"), "COLLATE suppressed after a character CASE expression: {s:?}");
     let s = typed_emp_suggestions("SELECT CASE ename WHEN 'A' THEN ename ELSE 'x' END col| FROM emp");
@@ -25700,6 +25802,13 @@ fn operand_type_operators_match_the_preceding_operand_type() {
     assert!(
         has(&s, "COLLATE"),
         "COLLATE wrongly suppressed after an unknown-leading polymorphic return: {s:?}"
+    );
+    let s = typed_emp_suggestions("SELECT CAST(empno AS employee_t) col| FROM emp");
+    assert!(has(&s, "COLLATE"), "COLLATE wrongly suppressed after an unknown CAST target: {s:?}");
+    let s = typed_emp_suggestions("SELECT JSON_VALUE(ename, '$.x' RETURNING employee_t) col| FROM emp");
+    assert!(
+        has(&s, "COLLATE"),
+        "COLLATE wrongly suppressed after an unknown JSON RETURNING target: {s:?}"
     );
     let s = typed_emp_suggestions("SELECT pkg.to_char(empno) col| FROM emp");
     assert!(
@@ -28586,10 +28695,40 @@ fn statement_start_filters_keyword_dump_to_statement_verbs() {
     // `INTO`, `WELLFORMED`/`WHERE`/`WINDOW`) is dropped as noise.
     let kw = statement_start_base_keywords;
 
+    let has = |suggestions: &[String], keyword: &str| suggestions.iter().any(|x| x == keyword);
+
     // Top-level statement start (buffer start, and after a `;` terminator).
     for sql in ["S|", "SELECT 1 FROM dual; S|"] {
         let s = kw(sql);
-        assert_eq!(s, vec!["SAVEPOINT", "SELECT", "SET"], "for `{sql}`");
+        for keyword in [
+            "SAVE",
+            "SAVEPOINT",
+            "SELECT",
+            "SET",
+            "SHOW",
+            "SHUTDOWN",
+            "SPOOL",
+            "START",
+            "STARTUP",
+            "STORE",
+        ] {
+            assert!(has(&s, keyword), "{keyword} was suppressed at `{sql}`: {s:?}");
+        }
+        for noise in ["SAMPLE", "SEQUENCE"] {
+            assert!(!has(&s, noise), "{noise} leaked at `{sql}`: {s:?}");
+        }
+    }
+
+    for keyword in crate::sql_text::statement_head_keywords() {
+        if keyword.len() == 1 {
+            continue;
+        }
+        let sql = format!("{}|", &keyword[..keyword.len() - 1]);
+        let suggestions = kw(&sql);
+        assert!(
+            has(&suggestions, keyword),
+            "{keyword} was suppressed at a top-level statement start for `{sql}`: {suggestions:?}"
+        );
     }
 
     // PL/SQL block statement start.

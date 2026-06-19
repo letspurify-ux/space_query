@@ -2326,6 +2326,15 @@ impl SqlEditorWidget {
             prefer_columns,
             db_type,
         );
+        if !prefer_columns
+            && matches!(
+                expr_keyword_ctx.statement_start,
+                Some(StatementStartContext::TopLevel)
+            )
+            && Self::top_level_statement_heads_include_sqlplus_commands(db_type)
+        {
+            Self::append_top_level_statement_head_suggestions(&mut suggestions, prefix);
+        }
         // The base catalog mixes columns, relations, objects and functions (kept
         // as-is) with a *flat, prefix-only* dump of the entire keyword list. That
         // dump is the sole source of keyword noise in a value/column expression —
@@ -2439,6 +2448,11 @@ impl SqlEditorWidget {
         db_type: Option<crate::db::DatabaseType>,
     ) -> bool {
         let upper = suggestion.to_ascii_uppercase();
+        if matches!(ctx, StatementStartContext::TopLevel)
+            && crate::sql_text::is_statement_head_keyword_upper(&upper)
+        {
+            return true;
+        }
         if data.is_language_keyword(&upper, db_type) {
             return Self::keyword_begins_statement(&upper, ctx);
         }
@@ -2454,19 +2468,38 @@ impl SqlEditorWidget {
         }
     }
 
+    fn append_top_level_statement_head_suggestions(suggestions: &mut Vec<String>, prefix: &str) {
+        if prefix.is_empty() {
+            return;
+        }
+        let mut seen: HashSet<String> = suggestions
+            .iter()
+            .map(|suggestion| suggestion.to_ascii_uppercase())
+            .collect();
+        for keyword in crate::sql_text::statement_head_keywords() {
+            if crate::ui::intellisense::suggestion_matches_completion_prefix(keyword, prefix)
+                && seen.insert((*keyword).to_string())
+            {
+                suggestions.push((*keyword).to_string());
+            }
+        }
+    }
+
+    fn top_level_statement_heads_include_sqlplus_commands(
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        match db_type.map(crate::db::DatabaseType::sql_dialect) {
+            None | Some(crate::db::SqlDialect::Oracle) => true,
+            Some(crate::db::SqlDialect::MySql) => false,
+        }
+    }
+
     /// Whether `upper` (a reserved keyword) can stand at the statement-start
     /// position described by `ctx`. Top-level statements admit the SQL/PLSQL-block
     /// statement verbs; a PL/SQL block additionally admits the procedural
     /// statement keywords plus the continuations of the construct enclosing the
     /// cursor.
     fn keyword_begins_statement(upper: &str, ctx: StatementStartContext) -> bool {
-        // SQL statement verbs — the keywords that open a top-level statement.
-        const SQL_STATEMENT_KEYWORDS: &[&str] = &[
-            "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "WITH", "CREATE", "ALTER", "DROP",
-            "TRUNCATE", "GRANT", "REVOKE", "COMMENT", "RENAME", "CALL", "EXPLAIN", "ANALYZE",
-            "AUDIT", "NOAUDIT", "LOCK", "SET", "COMMIT", "ROLLBACK", "SAVEPOINT", "BEGIN",
-            "DECLARE", "PURGE", "FLASHBACK", "EXEC", "EXECUTE",
-        ];
         // Procedural statement keywords that open a PL/SQL block statement.
         const PLSQL_STATEMENT_KEYWORDS: &[&str] = &[
             "IF", "CASE", "LOOP", "WHILE", "FOR", "FORALL", "GOTO", "NULL", "RETURN", "RAISE",
@@ -2476,7 +2509,7 @@ impl SqlEditorWidget {
         ];
 
         match ctx {
-            StatementStartContext::TopLevel => SQL_STATEMENT_KEYWORDS.contains(&upper),
+            StatementStartContext::TopLevel => crate::sql_text::is_statement_head_keyword_upper(upper),
             StatementStartContext::Plsql(policy) => {
                 if policy.allow_statements && PLSQL_STATEMENT_KEYWORDS.contains(&upper) {
                     return true;
@@ -3434,20 +3467,19 @@ impl SqlEditorWidget {
         column_scope: &[String],
     ) -> PrecedingOperandType {
         let before = Self::meaningful_tokens_before(tokens, end);
+        if Self::completed_interval_operand_type(&before).is_some() {
+            return PrecedingOperandType::Other;
+        }
         match before.last() {
             // A string literal is character, unless it is the body of a typed
-            // datetime literal (`DATE '…'` / `TIMESTAMP '…'` / `TIME '…'`).
-            Some(SqlToken::String(_)) => {
-                match before.len().checked_sub(2).and_then(|i| before.get(i)) {
-                    Some(SqlToken::Word(word))
-                        if matches!(
-                            word.to_ascii_uppercase().as_str(),
-                            "DATE" | "TIMESTAMP" | "TIME"
-                        ) =>
-                    {
-                        PrecedingOperandType::Datetime
-                    }
-                    _ => PrecedingOperandType::Character,
+            // datetime literal (`DATE '…'`, `TIMESTAMP WITH TIME ZONE '…'`, etc.).
+            Some(SqlToken::String(value)) => {
+                if Self::is_binary_string_literal(value) {
+                    PrecedingOperandType::Other
+                } else if Self::string_is_typed_temporal_literal(&before) {
+                    PrecedingOperandType::Datetime
+                } else {
+                    PrecedingOperandType::Character
                 }
             }
             Some(SqlToken::Symbol(sym)) if sym == ")" => {
@@ -3459,6 +3491,9 @@ impl SqlEditorWidget {
             }
             Some(SqlToken::Word(word)) => {
                 let upper = word.to_ascii_uppercase();
+                if Self::is_boolean_literal_word(&upper) {
+                    return PrecedingOperandType::Other;
+                }
                 if upper.chars().next().is_some_and(|ch| ch.is_ascii_digit()) {
                     return PrecedingOperandType::Numeric;
                 }
@@ -3475,6 +3510,86 @@ impl SqlEditorWidget {
             }
             _ => PrecedingOperandType::Unknown,
         }
+    }
+
+    fn is_boolean_literal_word(word: &str) -> bool {
+        matches!(word, "TRUE" | "FALSE" | "UNKNOWN")
+    }
+
+    fn is_binary_string_literal(value: &str) -> bool {
+        let mut chars = value.chars();
+        matches!(chars.next(), Some('B' | 'b' | 'X' | 'x')) && matches!(chars.next(), Some('\''))
+    }
+
+    fn string_is_typed_temporal_literal(before: &[&SqlToken]) -> bool {
+        let Some(string_idx) = before.len().checked_sub(1) else {
+            return false;
+        };
+        let word_at = |idx: usize, expected: &str| {
+            matches!(before.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case(expected))
+        };
+        let Some(prev_idx) = string_idx.checked_sub(1) else {
+            return false;
+        };
+        let temporal_base_before = |end_exclusive: usize| -> Option<&str> {
+            let idx = end_exclusive.checked_sub(1)?;
+            if let Some(SqlToken::Word(word)) = before.get(idx) {
+                if matches!(word.to_ascii_uppercase().as_str(), "DATE" | "TIMESTAMP" | "TIME") {
+                    return Some(word.as_str());
+                }
+            }
+            if !matches!(before.get(idx), Some(SqlToken::Symbol(sym)) if sym == ")") {
+                return None;
+            }
+
+            let mut depth = 0i32;
+            for open_idx in (0..idx).rev() {
+                match before.get(open_idx) {
+                    Some(SqlToken::Symbol(sym)) if sym == ")" => depth += 1,
+                    Some(SqlToken::Symbol(sym)) if sym == "(" => {
+                        if depth == 0 {
+                            let type_idx = open_idx.checked_sub(1)?;
+                            return match before.get(type_idx) {
+                                Some(SqlToken::Word(word))
+                                    if matches!(
+                                        word.to_ascii_uppercase().as_str(),
+                                        "TIMESTAMP" | "TIME"
+                                    ) =>
+                                {
+                                    Some(word.as_str())
+                                }
+                                _ => None,
+                            };
+                        }
+                        depth -= 1;
+                    }
+                    _ => {}
+                }
+            }
+            None
+        };
+
+        if temporal_base_before(string_idx).is_some() {
+            return true;
+        }
+
+        if word_at(prev_idx, "ZONE")
+            && prev_idx >= 3
+            && word_at(prev_idx - 1, "TIME")
+            && word_at(prev_idx - 2, "WITH")
+            && temporal_base_before(prev_idx - 2)
+                .is_some_and(|base| base.eq_ignore_ascii_case("TIMESTAMP") || base.eq_ignore_ascii_case("TIME"))
+        {
+            return true;
+        }
+
+        word_at(prev_idx, "ZONE")
+            && prev_idx >= 4
+            && word_at(prev_idx - 1, "TIME")
+            && word_at(prev_idx - 2, "LOCAL")
+            && word_at(prev_idx - 3, "WITH")
+            && temporal_base_before(prev_idx - 3)
+                .is_some_and(|base| base.eq_ignore_ascii_case("TIMESTAMP") || base.eq_ignore_ascii_case("TIME"))
     }
 
     /// Best-effort type of the left operand for the nearest open `IS` predicate
@@ -6176,6 +6291,8 @@ impl SqlEditorWidget {
             || upper.starts_with("NUMERIC")
             || upper.starts_with("DECIMAL")
             || upper.starts_with("DEC")
+            || upper.starts_with("SIGNED")
+            || upper.starts_with("UNSIGNED")
             || upper.starts_with("INT")
             || upper.starts_with("INTEGER")
             || upper.starts_with("SMALLINT")
@@ -6347,6 +6464,16 @@ impl SqlEditorWidget {
                 | "FIRST_VALUE"
                 | "LAST_VALUE"
                 | "NTH_VALUE"
+                | "CAST"
+                | "XMLCAST"
+                | "XMLSERIALIZE"
+                | "JSON_ARRAY"
+                | "JSON_ARRAYAGG"
+                | "JSON_OBJECT"
+                | "JSON_OBJECTAGG"
+                | "JSON_QUERY"
+                | "JSON_TRANSFORM"
+                | "JSON_VALUE"
         )
     }
 
@@ -6358,6 +6485,12 @@ impl SqlEditorWidget {
         data: &IntellisenseData,
         column_scope: &[String],
     ) -> Option<PrecedingOperandType> {
+        if matches!(name, "CAST" | "XMLCAST" | "XMLSERIALIZE") {
+            return Self::cast_like_function_return_operand_type(tokens, open_idx, close_idx);
+        }
+        if Self::function_return_depends_on_returning_type(name) {
+            return Self::returning_type_function_return_operand_type(tokens, open_idx, close_idx);
+        }
         if matches!(name, "COALESCE" | "NVL" | "IFNULL") {
             return Self::first_non_null_return_argument_type(
                 tokens,
@@ -6399,6 +6532,103 @@ impl SqlEditorWidget {
             };
         }
         None
+    }
+
+    fn function_return_depends_on_returning_type(name: &str) -> bool {
+        matches!(
+            name,
+            "JSON_ARRAY"
+                | "JSON_ARRAYAGG"
+                | "JSON_OBJECT"
+                | "JSON_OBJECTAGG"
+                | "JSON_QUERY"
+                | "JSON_TRANSFORM"
+                | "JSON_VALUE"
+        )
+    }
+
+    fn returning_type_function_return_operand_type(
+        tokens: &[SqlToken],
+        open_idx: usize,
+        close_idx: usize,
+    ) -> Option<PrecedingOperandType> {
+        let returning_idx =
+            Self::top_level_word_index_before_close(tokens, open_idx, close_idx, "RETURNING")?;
+        let type_display =
+            Self::type_display_from_token_range(tokens, returning_idx + 1, close_idx)?;
+        Self::classifiable_operand_type_display(&type_display)
+    }
+
+    fn cast_like_function_return_operand_type(
+        tokens: &[SqlToken],
+        open_idx: usize,
+        close_idx: usize,
+    ) -> Option<PrecedingOperandType> {
+        let as_idx = Self::top_level_as_index_before_close(tokens, open_idx, close_idx)?;
+        let type_display = Self::type_display_from_token_range(tokens, as_idx + 1, close_idx)?;
+        Self::classifiable_operand_type_display(&type_display)
+    }
+
+    fn classifiable_operand_type_display(type_display: &str) -> Option<PrecedingOperandType> {
+        let operand_type = Self::classify_type_display(&type_display);
+        match operand_type {
+            PrecedingOperandType::Datetime
+            | PrecedingOperandType::Character
+            | PrecedingOperandType::Numeric
+            | PrecedingOperandType::FloatingNumeric
+            | PrecedingOperandType::Collection => Some(operand_type),
+            PrecedingOperandType::Other | PrecedingOperandType::Unknown => None,
+        }
+    }
+
+    fn top_level_as_index_before_close(
+        tokens: &[SqlToken],
+        open_idx: usize,
+        close_idx: usize,
+    ) -> Option<usize> {
+        Self::top_level_word_index_before_close(tokens, open_idx, close_idx, "AS")
+    }
+
+    fn top_level_word_index_before_close(
+        tokens: &[SqlToken],
+        open_idx: usize,
+        close_idx: usize,
+        target: &str,
+    ) -> Option<usize> {
+        let mut nested = 0i32;
+        for idx in (open_idx + 1)..close_idx.min(tokens.len()) {
+            match &tokens[idx] {
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => nested += 1,
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => {
+                    if nested > 0 {
+                        nested -= 1;
+                    }
+                }
+                SqlToken::Word(word) if nested == 0 && word.eq_ignore_ascii_case(target) => {
+                    return Some(idx);
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn type_display_from_token_range(
+        tokens: &[SqlToken],
+        start: usize,
+        end: usize,
+    ) -> Option<String> {
+        let parts: Vec<&str> = tokens
+            .get(start..end.min(tokens.len()))
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.as_str()),
+                SqlToken::Symbol(sym) => Some(sym.as_str()),
+                SqlToken::String(_) | SqlToken::Comment(_) => None,
+            })
+            .collect();
+        (!parts.is_empty()).then(|| parts.join(" "))
     }
 
     fn first_non_null_return_argument_type(
@@ -9190,6 +9420,99 @@ impl SqlEditorWidget {
             word.to_ascii_uppercase().as_str(),
             "YEAR" | "MONTH" | "DAY" | "HOUR" | "MINUTE" | "SECOND"
         )
+    }
+
+    fn is_completed_interval_unit_word(word: &str) -> bool {
+        matches!(
+            word.to_ascii_uppercase().as_str(),
+            "YEAR"
+                | "MONTH"
+                | "DAY"
+                | "HOUR"
+                | "MINUTE"
+                | "SECOND"
+                | "MICROSECOND"
+                | "WEEK"
+                | "QUARTER"
+                | "SECOND_MICROSECOND"
+                | "MINUTE_MICROSECOND"
+                | "MINUTE_SECOND"
+                | "HOUR_MICROSECOND"
+                | "HOUR_SECOND"
+                | "HOUR_MINUTE"
+                | "DAY_MICROSECOND"
+                | "DAY_SECOND"
+                | "DAY_MINUTE"
+                | "DAY_HOUR"
+                | "YEAR_MONTH"
+        )
+    }
+
+    fn completed_interval_operand_type(before: &[&SqlToken]) -> Option<PrecedingOperandType> {
+        let last = before.len().checked_sub(1)?;
+        let is_interval = |idx: usize| {
+            matches!(before.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("INTERVAL"))
+        };
+        let is_string = |idx: usize| matches!(before.get(idx), Some(SqlToken::String(_)));
+        let is_to = |idx: usize| {
+            matches!(before.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("TO"))
+        };
+        let unit_ending_at = |idx: usize| -> Option<usize> {
+            if matches!(before.get(idx), Some(SqlToken::Word(word)) if Self::is_completed_interval_unit_word(word))
+            {
+                return Some(idx);
+            }
+            if !matches!(before.get(idx), Some(SqlToken::Symbol(sym)) if sym == ")") {
+                return None;
+            }
+
+            let mut depth = 0i32;
+            for open_idx in (0..idx).rev() {
+                match before.get(open_idx) {
+                    Some(SqlToken::Symbol(sym)) if sym == ")" => depth += 1,
+                    Some(SqlToken::Symbol(sym)) if sym == "(" => {
+                        if depth == 0 {
+                            let unit_idx = open_idx.checked_sub(1)?;
+                            return match before.get(unit_idx) {
+                                Some(SqlToken::Word(word))
+                                    if Self::is_completed_interval_unit_word(word) =>
+                                {
+                                    Some(unit_idx)
+                                }
+                                _ => None,
+                            };
+                        }
+                        depth -= 1;
+                    }
+                    _ => {}
+                }
+            }
+            None
+        };
+
+        let last_unit = unit_ending_at(last)?;
+        if last_unit.checked_sub(1).is_some_and(is_string)
+            && last_unit.checked_sub(2).is_some_and(is_interval)
+        {
+            return Some(PrecedingOperandType::Other);
+        }
+        if last_unit.checked_sub(1).is_some_and(is_to) {
+            let first_unit = last_unit.checked_sub(2).and_then(unit_ending_at)?;
+            if first_unit.checked_sub(1).is_some_and(is_string)
+                && first_unit.checked_sub(2).is_some_and(is_interval)
+            {
+                return Some(PrecedingOperandType::Other);
+            }
+        }
+        if last_unit >= 2
+            && before
+                .get(last_unit - 1)
+                .is_some_and(|token| !matches!(token, SqlToken::String(_) | SqlToken::Comment(_)))
+            && is_interval(last_unit - 2)
+        {
+            return Some(PrecedingOperandType::Other);
+        }
+        None
     }
 
     /// The interval-literal qualifier slot at the cursor, if any. An ANSI/Oracle
