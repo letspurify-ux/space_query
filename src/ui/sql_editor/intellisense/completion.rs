@@ -12306,11 +12306,19 @@ impl SqlEditorWidget {
             return None;
         }
 
+        // `FROM` follows only a *complete* select item. The select-list head
+        // keywords (`SELECT`/`DISTINCT`/`AS`/…) never end an item; beyond those, an
+        // expression-internal keyword that expects a fresh operand (`… THEN 2 WHEN
+        // |`, `… ELSE |`) also leaves the item unfinished — `cursor_follows_complete
+        // _operand == Some(false)` marks exactly that, while a keyword-lookalike
+        // *column* (`SELECT nulls |`) reports `None` and still completes the item.
         let follows_complete_projection = match toks.last() {
-            Some(SqlToken::Word(word)) => !matches!(
-                word.to_ascii_uppercase().as_str(),
-                "SELECT" | "DISTINCT" | "ALL" | "UNIQUE" | "DISTINCTROW" | "AS"
-            ),
+            Some(SqlToken::Word(word)) => {
+                !matches!(
+                    word.to_ascii_uppercase().as_str(),
+                    "SELECT" | "DISTINCT" | "ALL" | "UNIQUE" | "DISTINCTROW" | "AS"
+                ) && Self::cursor_follows_complete_operand(tokens, end) != Some(false)
+            }
             Some(SqlToken::Symbol(sym)) => sym == "*" || sym == ")",
             Some(SqlToken::String(_)) => true,
             Some(SqlToken::Comment(_)) | None => false,
@@ -13280,6 +13288,54 @@ impl SqlEditorWidget {
         None
     }
 
+    /// Whether a single-parenthesised-body table-clause construct (`PIVOT (…)`,
+    /// `UNPIVOT [INCLUDE NULLS] (…)`, `MATCH_RECOGNIZE (…)`) is still being typed:
+    /// the cursor is inside its body paren, or the body has not opened yet (so the
+    /// pre-body keyword — `UNPIVOT INCLUDE` — is still grammatical). Once the body
+    /// paren has closed the construct is complete, and its keywords must not be
+    /// re-offered at the surrounding table-clause level (`PIVOT (…) |`).
+    fn table_clause_construct_is_open(tokens: &[SqlToken], end: usize, keyword: &str) -> bool {
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        let Some(kw_pos) = toks.iter().rposition(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case(keyword)),
+        ) else {
+            return false;
+        };
+        let mut depth = 0i32;
+        let mut saw_open = false;
+        for token in &toks[kw_pos + 1..] {
+            match token {
+                SqlToken::Symbol(sym) if sym == "(" => {
+                    depth += 1;
+                    saw_open = true;
+                }
+                SqlToken::Symbol(sym) if sym == ")" => depth = (depth - 1).max(0),
+                _ => {}
+            }
+        }
+        depth > 0 || !saw_open
+    }
+
+    /// Whether the cursor sits inside the body paren of `keyword`'s construct (the
+    /// last occurrence's paren depth is still positive), as opposed to before it.
+    fn cursor_inside_construct_body(tokens: &[SqlToken], end: usize, keyword: &str) -> bool {
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        let Some(kw_pos) = toks.iter().rposition(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case(keyword)),
+        ) else {
+            return false;
+        };
+        let mut depth = 0i32;
+        for token in &toks[kw_pos + 1..] {
+            match token {
+                SqlToken::Symbol(sym) if sym == "(" => depth += 1,
+                SqlToken::Symbol(sym) if sym == ")" => depth = (depth - 1).max(0),
+                _ => {}
+            }
+        }
+        depth > 0
+    }
+
     fn expected_advanced_oracle_query_keyword_candidates(
         tokens: &[SqlToken],
         end: usize,
@@ -13293,19 +13349,27 @@ impl SqlEditorWidget {
         let has = |keyword: &str| words.iter().any(|word| word == keyword);
         let last = words.last().map(String::as_str);
 
-        if has("PIVOT") {
+        if Self::table_clause_construct_is_open(tokens, end, "PIVOT") {
             if has("FOR") {
                 return Some(&["IN"]);
             }
             return Some(&["FOR"]);
         }
-        if has("UNPIVOT") {
+        if Self::table_clause_construct_is_open(tokens, end, "UNPIVOT") {
+            // Inside the body paren the grammar is `col FOR name IN (…)` (like
+            // PIVOT); the `INCLUDE|EXCLUDE NULLS` modifier is only valid before it.
+            if Self::cursor_inside_construct_body(tokens, end, "UNPIVOT") {
+                if has("FOR") {
+                    return Some(&["IN"]);
+                }
+                return Some(&["FOR"]);
+            }
             if matches!(last, Some("INCLUDE" | "EXCLUDE")) {
                 return Some(&["NULLS"]);
             }
             return Some(&["INCLUDE", "EXCLUDE"]);
         }
-        if has("MATCH_RECOGNIZE") {
+        if Self::table_clause_construct_is_open(tokens, end, "MATCH_RECOGNIZE") {
             match words.as_slice() {
                 [.., last] if last == "PARTITION" || last == "ORDER" => return Some(&["BY"]),
                 [.., after, match_word] if after == "AFTER" && match_word == "MATCH" => {
@@ -13320,7 +13384,13 @@ impl SqlEditorWidget {
                 return Some(&["DEFINE"]);
             }
         }
-        if has("MODEL") {
+        // The `MODEL` clause has multiple sub-clauses at depth 0 (so the single-body
+        // open check does not apply), but it is complete once its terminal `RULES
+        // (…)` paren has closed — past that the cursor is back at the query level and
+        // the MODEL keywords must not be re-offered.
+        let model_complete =
+            has("RULES") && !Self::table_clause_construct_is_open(tokens, end, "RULES");
+        if has("MODEL") && !model_complete {
             match words.as_slice() {
                 [.., last] if last == "PARTITION" || last == "DIMENSION" => {
                     return Some(&["BY"])

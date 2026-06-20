@@ -35646,6 +35646,14 @@ fn expression_construct_tail_keywords_are_complete_and_noise_free() {
 
 
 
+
+
+
+
+
+
+
+
 /// A `REFERENCES` clause inside a `CREATE TABLE` definition is parsed precisely:
 /// the referenced-name slot suppresses the constraint catalog entirely, and a
 /// completed reference offers the `ON` referential-action continuation (plus the
@@ -36238,3 +36246,87 @@ fn select_item_closed_call_offers_over_at_empty_prefix() {
 }
 
 
+
+/// `FROM` is offered only after a *complete* select item. An expression-internal
+/// keyword that expects a fresh operand (`SELECT CASE … WHEN |`, `… ELSE |`) or a
+/// trailing operator leaves the item unfinished, so `FROM` must not appear — while
+/// a finished operand, the `*` wildcard, a closed `CASE … END`, and even a
+/// keyword-lookalike column (`SELECT nulls |`) all still complete the item.
+#[test]
+fn select_list_from_is_offered_only_after_a_complete_item() {
+    let kw = |sql: &str| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(crate::db::DatabaseType::Oracle),
+        )
+    };
+    let has_from = |sql: &str| kw(sql).iter().any(|x| x == "FROM");
+
+    for sql in [
+        "SELECT CASE WHEN a = 1 THEN 2 WHEN |",
+        "SELECT CASE WHEN a = 1 THEN 2 ELSE |",
+        "SELECT a + |",
+        "SELECT a AS |",
+        "SELECT DISTINCT |",
+    ] {
+        assert!(!has_from(sql), "FROM offered after an incomplete item `{sql}`: {:?}", kw(sql));
+    }
+    for sql in [
+        "SELECT a |",
+        "SELECT * |",
+        "SELECT t.* |",
+        "SELECT count(*) |",
+        "SELECT 'x' |",
+        "SELECT CASE WHEN a = 1 THEN 2 END |",
+        "SELECT nulls |",  // a column named like the NULLS keyword
+        "SELECT level |",
+    ] {
+        assert!(has_from(sql), "FROM missing after a complete item `{sql}`: {:?}", kw(sql));
+    }
+}
+
+/// A parenthesised-body table-clause construct (`PIVOT`/`UNPIVOT`/`MATCH_RECOGNIZE`)
+/// offers its keywords only while it is open; once its body paren closes the
+/// construct is complete and must not re-offer them at the surrounding table level.
+/// The multi-sub-clause `MODEL` is complete once its terminal `RULES (…)` closes.
+#[test]
+fn table_clause_constructs_stop_offering_keywords_once_closed() {
+    let kw = |sql: &str| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(crate::db::DatabaseType::Oracle),
+        )
+    };
+    let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
+
+    // Closed constructs re-offer nothing of themselves.
+    assert!(!has(&kw("SELECT * FROM t PIVOT (sum(x) FOR y IN (1,2)) |"), "IN"));
+    assert!(!has(&kw("SELECT * FROM t PIVOT (sum(x) FOR y IN (1,2)) |"), "FOR"));
+    for w in ["INCLUDE", "EXCLUDE"] {
+        assert!(!has(&kw("SELECT * FROM t UNPIVOT (x FOR y IN (a, b)) |"), w));
+    }
+    for w in ["PARTITION BY", "DIMENSION BY", "MEASURES", "RULES"] {
+        assert!(
+            !has(&kw("SELECT * FROM t MODEL DIMENSION BY (a) MEASURES (b) RULES (c=1) |"), w),
+            "completed MODEL re-offered `{w}`"
+        );
+    }
+
+    // Open constructs still progress precisely.
+    assert_eq!(kw("SELECT * FROM t PIVOT (sum(x) |"), vec!["FOR".to_string()]);
+    assert_eq!(kw("SELECT * FROM t PIVOT (sum(x) FOR y |"), vec!["IN".to_string()]);
+    // Inside the UNPIVOT body the grammar is `col FOR …`, not the pre-body modifier.
+    assert_eq!(kw("SELECT * FROM t UNPIVOT (x |"), vec!["FOR".to_string()]);
+    assert_eq!(
+        kw("SELECT * FROM t UNPIVOT |"),
+        vec!["INCLUDE".to_string(), "EXCLUDE".to_string()]
+    );
+}
