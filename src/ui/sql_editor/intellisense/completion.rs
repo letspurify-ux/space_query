@@ -441,6 +441,22 @@ enum DataTypePosition {
     TypeObject,
 }
 
+/// Classification of the cursor relative to a `REFERENCES` clause inside the
+/// current `CREATE TABLE` column / constraint definition. Keeps the foreign-key
+/// reference grammar (`REFERENCES t [(cols)] [ON DELETE …] [ON UPDATE …]`) from
+/// either leaking the column-constraint catalog where an object/column name
+/// belongs or hiding the `ON` referential-action continuation.
+enum ReferencesClauseTail {
+    /// No `REFERENCES` governs the cursor; the ordinary column-tail logic applies.
+    NotApplicable,
+    /// A referenced object or column name is expected (`REFERENCES |`,
+    /// `REFERENCES s.|`, `REFERENCES p (col |`); no constraint keyword belongs.
+    ExpectsName,
+    /// The cursor follows a complete `REFERENCES target [(cols)]`; these are the
+    /// grammatical continuation keywords (empty once nothing more may follow).
+    Continue(&'static [&'static str]),
+}
+
 /// Argument slot inside an `EXTRACT(<field> FROM <source>)` call, before the
 /// `FROM`. A datetime field keyword is the only thing valid here, never a column.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -740,10 +756,35 @@ fn interval_unit_keywords_for(
     }
 }
 
-fn order_by_sort_modifier_keywords(slot: OrderBySortModifierSlot) -> &'static [&'static str] {
+fn order_by_sort_modifier_keywords(
+    slot: OrderBySortModifierSlot,
+    db_type: Option<crate::db::DatabaseType>,
+) -> &'static [&'static str] {
+    use crate::db::DatabaseType;
+
+    // MySQL/MariaDB have no `NULLS FIRST/LAST` syntax, so the null-ordering
+    // modifiers are pure noise there. Oracle (and the dialect-agnostic default)
+    // keep them.
+    let supports_nulls_ordering = !matches!(
+        db_type,
+        Some(DatabaseType::MySQL) | Some(DatabaseType::MariaDB)
+    );
+
     match slot {
-        OrderBySortModifierSlot::AfterSortKey => &["ASC", "DESC", "NULLS"],
-        OrderBySortModifierSlot::AfterDirection => &["NULLS"],
+        OrderBySortModifierSlot::AfterSortKey => {
+            if supports_nulls_ordering {
+                &["ASC", "DESC", "NULLS"]
+            } else {
+                &["ASC", "DESC"]
+            }
+        }
+        OrderBySortModifierSlot::AfterDirection => {
+            if supports_nulls_ordering {
+                &["NULLS"]
+            } else {
+                &[]
+            }
+        }
         OrderBySortModifierSlot::AfterNulls => &["FIRST", "LAST"],
         OrderBySortModifierSlot::AfterNullOrdering => &[],
     }
@@ -751,14 +792,40 @@ fn order_by_sort_modifier_keywords(slot: OrderBySortModifierSlot) -> &'static [&
 
 fn window_order_by_sort_modifier_keywords(
     slot: WindowOrderBySortModifierSlot,
+    db_type: Option<crate::db::DatabaseType>,
 ) -> &'static [&'static str] {
+    use crate::db::DatabaseType;
+
+    // MySQL/MariaDB window functions support neither `NULLS FIRST/LAST` ordering
+    // nor the `GROUPS` frame unit (only `ROWS`/`RANGE`), so both are noise there.
+    let mysql = matches!(
+        db_type,
+        Some(DatabaseType::MySQL) | Some(DatabaseType::MariaDB)
+    );
+
     match slot {
         WindowOrderBySortModifierSlot::AfterSortKey => {
-            &["ASC", "DESC", "NULLS", "ROWS", "RANGE", "GROUPS"]
+            if mysql {
+                &["ASC", "DESC", "ROWS", "RANGE"]
+            } else {
+                &["ASC", "DESC", "NULLS", "ROWS", "RANGE", "GROUPS"]
+            }
         }
-        WindowOrderBySortModifierSlot::AfterDirection => &["NULLS", "ROWS", "RANGE", "GROUPS"],
+        WindowOrderBySortModifierSlot::AfterDirection => {
+            if mysql {
+                &["ROWS", "RANGE"]
+            } else {
+                &["NULLS", "ROWS", "RANGE", "GROUPS"]
+            }
+        }
         WindowOrderBySortModifierSlot::AfterNulls => &["FIRST", "LAST"],
-        WindowOrderBySortModifierSlot::AfterNullOrdering => &["ROWS", "RANGE", "GROUPS"],
+        WindowOrderBySortModifierSlot::AfterNullOrdering => {
+            if mysql {
+                &["ROWS", "RANGE"]
+            } else {
+                &["ROWS", "RANGE", "GROUPS"]
+            }
+        }
     }
 }
 
@@ -11025,6 +11092,11 @@ impl SqlEditorWidget {
                 db_type,
             )
             .is_some()
+            || Self::cursor_is_at_alter_table_add_keyword_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
             || Self::cursor_is_in_invalid_set_operation_branch_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
@@ -12021,10 +12093,40 @@ impl SqlEditorWidget {
     /// check is intentionally conservative (a parenthesized predicate is treated
     /// as one operand) so it never *adds* a clause keyword where one is
     /// ungrammatical.
+    /// True when the `AND` at `and_idx` is the separator of a `BETWEEN lo AND hi`
+    /// predicate rather than a boolean conjunction. Scans back at paren depth 0:
+    /// a `BETWEEN` reached before any other conjunction/clause boundary means the
+    /// `AND` belongs to it. Keeps `cursor_follows_complete_predicate` from
+    /// splitting `x BETWEEN 1 AND 2` into a bare `2` conjunct with no operator.
+    fn and_token_belongs_to_between(toks: &[&SqlToken], and_idx: usize) -> bool {
+        let mut depth = 0i32;
+        for idx in (0..and_idx).rev() {
+            match toks[idx] {
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => depth += 1,
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => {
+                    if depth == 0 {
+                        return false;
+                    }
+                    depth -= 1;
+                }
+                SqlToken::Word(word) if depth == 0 => match word.to_ascii_uppercase().as_str() {
+                    "BETWEEN" => return true,
+                    "AND" | "OR" | "WHERE" | "HAVING" | "ON" | "START" | "CONNECT" | "BY" => {
+                        return false
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        false
+    }
+
     fn cursor_follows_complete_predicate(tokens: &[SqlToken], end: usize) -> bool {
         let toks = Self::meaningful_tokens_before(tokens, end);
         // Isolate the current conjunct: walk back at paren depth 0 to the nearest
-        // boundary (the clause keyword, a conjunction, or an enclosing paren).
+        // boundary (the clause keyword, a conjunction, or an enclosing paren). A
+        // `BETWEEN … AND …` separator is not a conjunction boundary.
         let is_boundary = |word: &str| {
             matches!(
                 word,
@@ -12044,6 +12146,11 @@ impl SqlEditorWidget {
                     depth -= 1;
                 }
                 SqlToken::Word(word) if depth == 0 && is_boundary(&word.to_ascii_uppercase()) => {
+                    if word.eq_ignore_ascii_case("AND")
+                        && Self::and_token_belongs_to_between(&toks, idx)
+                    {
+                        continue;
+                    }
                     conjunct_start = idx + 1;
                     break;
                 }
@@ -12307,15 +12414,151 @@ impl SqlEditorWidget {
             return None;
         }
 
-        let words = Self::previous_meaningful_words_upper(tokens, visible_end, 4);
+        let def = Self::current_create_table_definition(&after_def_open);
+        Self::classify_table_element_tail(def, db_type)
+    }
+
+    /// Keyword tail for `ALTER TABLE … ADD <element>` — the column/constraint
+    /// definitions added to an existing table. Shares the classifier with
+    /// `CREATE TABLE` so the constraint/column grammar stays identical. The column
+    /// *type* slots (`ADD col |`, `MODIFY col |`) are intercepted earlier by the
+    /// data-type path, so a non-empty element here is already past its type.
+    fn expected_alter_table_add_tail_keywords(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        if Self::unclosed_paren_count(tokens, end) > 1 {
+            return None;
+        }
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        let mut head = toks.iter().filter_map(|token| match token {
+            SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+            _ => None,
+        });
+        if head.next().as_deref() != Some("ALTER") || head.next().as_deref() != Some("TABLE") {
+            return None;
+        }
+
+        // The governing sub-command is the last top-level action keyword. Only
+        // `ADD` introduces an element *definition* tail; a later MODIFY/CHANGE/
+        // DROP/RENAME/ALTER supersedes it (their tails are type or name slots,
+        // handled elsewhere).
+        let mut depth = 0i32;
+        let mut add_idx = None;
+        for (idx, token) in toks.iter().enumerate() {
+            match token {
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => depth += 1,
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => depth = (depth - 1).max(0),
+                SqlToken::Word(word) if depth == 0 && idx > 1 => {
+                    match word.to_ascii_uppercase().as_str() {
+                        "ADD" => add_idx = Some(idx),
+                        "MODIFY" | "CHANGE" | "DROP" | "RENAME" | "ALTER" => add_idx = None,
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        let add_idx = add_idx?;
+
+        // The element after `ADD`, past a leading `(` (Oracle multi-column add) and
+        // the optional `COLUMN` keyword, isolated to the current comma item.
+        let after_add = toks.get(add_idx + 1..).unwrap_or(&[]);
+        let after_add = match after_add.first() {
+            Some(SqlToken::Symbol(sym)) if *sym == "(" => &after_add[1..],
+            _ => after_add,
+        };
+        let def = Self::current_create_table_definition(after_add);
+        let def = match def.first() {
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("COLUMN") => &def[1..],
+            _ => def,
+        };
+        if def.is_empty() {
+            return None;
+        }
+        // Inside a sub-paren of the element (`FOREIGN KEY (col |`, `CHECK (expr |`,
+        // `NUMBER(precision |`, or a `REFERENCES t (col |` list) a column/expression
+        // is expected, not an element-tail keyword — defer to those paths.
+        let element_depth = def.iter().fold(0i32, |depth, token| match token {
+            SqlToken::Symbol(sym) if sym == "(" || sym == "[" => depth + 1,
+            SqlToken::Symbol(sym) if sym == ")" || sym == "]" => (depth - 1).max(0),
+            _ => depth,
+        });
+        if element_depth > 0 {
+            return None;
+        }
+        Self::classify_table_element_tail(def, db_type)
+    }
+
+    /// Context wrapper enrolling the `ALTER TABLE … ADD` element-tail keyword slots
+    /// in the identifier-suppression chokepoint: these emit a fixed keyword set
+    /// with no grammatical object, so the base catalog must not leak relations.
+    /// Object-bearing positions (the `REFERENCES` target, the FK/PK/CHECK paren
+    /// lists) return `None` from the underlying helper and so are not suppressed.
+    fn cursor_is_at_alter_table_add_keyword_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::expected_alter_table_add_tail_keywords(tokens, end, db_type).is_some()
+    }
+
+    /// Keyword tail for a single table-element definition (a column or a
+    /// constraint), shared by `CREATE TABLE (…)` and `ALTER TABLE … ADD …`. `def`
+    /// is the element's meaningful tokens up to the cursor, paren-balanced at its
+    /// own depth 0. Returns `None` only where a name/object is expected (suppress),
+    /// `Some(&[])` where only punctuation may follow, and the column-property
+    /// catalog for a plain column definition.
+    fn classify_table_element_tail(
+        def: &[&SqlToken],
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        let words = def
+            .iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        // A partial multi-word constraint keyword being typed takes precedence
+        // over the generic tail (and over the `REFERENCES`-aware fallback below).
         match words.as_slice() {
-            [.., last] if last == "PRIMARY" => Some(&["KEY"]),
-            [.., last] if last == "NOT" => Some(&["NULL"]),
-            [.., last] if last == "GENERATED" => Some(&["ALWAYS", "BY"]),
-            [.., prev, last] if prev == "GENERATED" && last == "BY" => Some(&["DEFAULT"]),
-            [.., prev, last] if prev == "BY" && last == "DEFAULT" => Some(&["ON"]),
-            [.., prev, last] if prev == "DEFAULT" && last == "ON" => Some(&["NULL"]),
-            _ if crate::sql_text::mysql_compatibility_for_sql("", db_type) => Some(&[
+            [.., last] if last == "PRIMARY" => return Some(&["KEY"]),
+            [.., last] if last == "FOREIGN" => return Some(&["KEY"]),
+            [.., last] if last == "NOT" => return Some(&["NULL"]),
+            [.., last] if last == "GENERATED" => return Some(&["ALWAYS", "BY"]),
+            [.., prev, last] if prev == "GENERATED" && last == "BY" => return Some(&["DEFAULT"]),
+            [.., prev, last] if prev == "BY" && last == "DEFAULT" => return Some(&["ON"]),
+            [.., prev, last] if prev == "DEFAULT" && last == "ON" => return Some(&["NULL"]),
+            _ => {}
+        }
+        // A `REFERENCES` clause in the current definition overrides the generic
+        // column-constraint tail: a name slot suppresses keywords entirely, and a
+        // complete reference admits only `ON` (+ the remaining inline constraints
+        // for a column-level FK), never a second `REFERENCES`/`DEFAULT`/identity.
+        match Self::references_clause_tail(def, db_type) {
+            ReferencesClauseTail::ExpectsName => return None,
+            ReferencesClauseTail::Continue(keywords) => {
+                return (!keywords.is_empty()).then_some(keywords)
+            }
+            ReferencesClauseTail::NotApplicable => {}
+        }
+        // The `CONSTRAINT name` type slot and a table-level constraint admit a
+        // narrow, structural keyword set — never the inline column-property catalog
+        // (DEFAULT/identity/COLLATE/…), which belongs only to a column definition.
+        if let Some(candidates) = Self::create_table_constraint_tail(def) {
+            return Some(candidates);
+        }
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            Some(&[
                 "AUTO_INCREMENT",
                 "CHECK",
                 "COLLATE",
@@ -12330,8 +12573,9 @@ impl SqlEditorWidget {
                 "REFERENCES",
                 "UNIQUE",
                 "VISIBLE",
-            ]),
-            _ => Some(&[
+            ])
+        } else {
+            Some(&[
                 "CHECK",
                 "COLLATE",
                 "CONSTRAINT",
@@ -12345,8 +12589,204 @@ impl SqlEditorWidget {
                 "REFERENCES",
                 "UNIQUE",
                 "VISIBLE",
-            ]),
+            ])
         }
+    }
+
+    /// Classifies the cursor relative to a `REFERENCES` clause in the current
+    /// `CREATE TABLE` column / constraint definition. `body` is the table
+    /// definition's meaningful tokens up to the cursor (after the opening `(`).
+    ///
+    /// The foreign-key grammar is `REFERENCES t [(cols)] [ON DELETE a] [ON UPDATE
+    /// a]`. Without this the generic column tail would (a) leak the whole
+    /// constraint catalog into the referenced-name slot, (b) never offer the `ON`
+    /// referential-action continuation, and (c) re-offer mutually-exclusive
+    /// openers (`REFERENCES` again, `DEFAULT`, identity) after the FK is set.
+    /// The current column/constraint definition within a `CREATE TABLE` body:
+    /// the meaningful tokens since the last top-level (definition-list) comma.
+    fn current_create_table_definition<'a>(body: &'a [&'a SqlToken]) -> &'a [&'a SqlToken] {
+        let mut depth = 0i32;
+        let mut def_start = 0usize;
+        for (idx, token) in body.iter().enumerate() {
+            match token {
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => depth += 1,
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => depth = (depth - 1).max(0),
+                SqlToken::Symbol(sym) if sym == "," && depth == 0 => def_start = idx + 1,
+                _ => {}
+            }
+        }
+        &body[def_start..]
+    }
+
+    /// Whether the current definition is a *table-level* constraint
+    /// (`[CONSTRAINT name] PRIMARY KEY|UNIQUE|FOREIGN KEY|CHECK …`) rather than a
+    /// column definition. A leading `CONSTRAINT <name>` prefix is skipped; the
+    /// telling token is the first constraint keyword at the definition's depth 0.
+    fn create_table_definition_is_table_level_constraint(def: &[&SqlToken]) -> bool {
+        let head = match def.first() {
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("CONSTRAINT") => {
+                // Skip `CONSTRAINT <name>`.
+                def.get(2)
+            }
+            other => other,
+        };
+        matches!(
+            head,
+            Some(SqlToken::Word(word))
+                if matches!(
+                    word.to_ascii_uppercase().as_str(),
+                    "PRIMARY" | "UNIQUE" | "FOREIGN" | "CHECK"
+                )
+        )
+    }
+
+    /// Keyword tail for the constraint-shaped slots of a `CREATE TABLE`
+    /// definition, returning `None` for a plain column definition (which keeps the
+    /// generic column-property catalog). Handles the `CONSTRAINT <name>` type slot
+    /// and table-level constraints, neither of which admits the inline
+    /// column-property keywords. `REFERENCES`-governed slots are handled earlier by
+    /// [`references_clause_tail`], so a table-level FK here is still awaiting its
+    /// `REFERENCES`.
+    fn create_table_constraint_tail(def: &[&SqlToken]) -> Option<&'static [&'static str]> {
+        // `CONSTRAINT |` — a brand-new constraint name is expected next, not a
+        // keyword. Suppress the column-property catalog (the generic fallback).
+        if matches!(def.last(), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("CONSTRAINT")) {
+            return Some(&[]);
+        }
+        // `CONSTRAINT <name> |` — the constraint *type* slot. Table-level when the
+        // definition itself is the constraint, inline when it names a column
+        // constraint (`col type CONSTRAINT name |`).
+        if let (Some(SqlToken::Word(keyword)), Some(SqlToken::Word(_name))) =
+            (def.len().checked_sub(2).and_then(|i| def.get(i)), def.last())
+        {
+            if keyword.eq_ignore_ascii_case("CONSTRAINT") {
+                let table_level = matches!(
+                    def.first(),
+                    Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("CONSTRAINT")
+                );
+                return Some(if table_level {
+                    &["PRIMARY KEY", "UNIQUE", "FOREIGN KEY", "CHECK"]
+                } else {
+                    &["PRIMARY KEY", "UNIQUE", "CHECK", "REFERENCES", "NOT NULL", "NULL"]
+                });
+            }
+        }
+
+        if !Self::create_table_definition_is_table_level_constraint(def) {
+            return None;
+        }
+        // A table-level FK awaiting its mandatory `REFERENCES` (`FOREIGN KEY (cols)
+        // |`). Every other table-level constraint position (`PRIMARY KEY (cols) |`,
+        // `UNIQUE (cols) |`, `CHECK (expr) |`, or one still awaiting its `(cols)`)
+        // admits no keyword — only the structural `(`/`,`/`)` — so suppress the
+        // column-property catalog that the generic fallback would otherwise leak.
+        let last_is_closed_paren =
+            matches!(def.last(), Some(SqlToken::Symbol(sym)) if *sym == ")");
+        let has_foreign = def
+            .iter()
+            .any(|token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("FOREIGN")));
+        if has_foreign && last_is_closed_paren {
+            Some(&["REFERENCES"])
+        } else {
+            Some(&[])
+        }
+    }
+
+    fn references_clause_tail(
+        body: &[&SqlToken],
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> ReferencesClauseTail {
+        let def = Self::current_create_table_definition(body);
+
+        // Locate `REFERENCES` at the definition's own paren-depth 0, and note a
+        // preceding `FOREIGN` (a table-level FK constraint, not a column FK). A
+        // leading `REFERENCES` is the column-name slot, not a reference clause.
+        let mut depth = 0i32;
+        let mut references_idx = None;
+        let mut saw_foreign = false;
+        for (idx, token) in def.iter().enumerate() {
+            match token {
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => depth += 1,
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => depth = (depth - 1).max(0),
+                SqlToken::Word(word) if depth == 0 => {
+                    let upper = word.to_ascii_uppercase();
+                    if upper == "FOREIGN" && references_idx.is_none() {
+                        saw_foreign = true;
+                    } else if upper == "REFERENCES" && idx > 0 {
+                        references_idx = Some(idx);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(references_idx) = references_idx else {
+            return ReferencesClauseTail::NotApplicable;
+        };
+
+        let after = &def[references_idx + 1..];
+        // `REFERENCES |` / `REFERENCES s.|` — a referenced object name is expected.
+        if after.is_empty()
+            || matches!(after.last(), Some(SqlToken::Symbol(sym)) if *sym == ".")
+            || !matches!(after.first(), Some(SqlToken::Word(_)))
+        {
+            return ReferencesClauseTail::ExpectsName;
+        }
+        // Walk what follows the `REFERENCES`: an unbalanced paren means the cursor
+        // is inside the referenced-column list (a target column is expected);
+        // `ON DELETE`/`ON UPDATE` already present means that action is spent.
+        let mut depth = 0i32;
+        let mut on_delete = false;
+        let mut on_update = false;
+        for (idx, token) in after.iter().enumerate() {
+            match token {
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => depth += 1,
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => depth = (depth - 1).max(0),
+                SqlToken::Word(word) if depth == 0 && word.eq_ignore_ascii_case("ON") => {
+                    match after.get(idx + 1) {
+                        Some(SqlToken::Word(next)) if next.eq_ignore_ascii_case("DELETE") => {
+                            on_delete = true
+                        }
+                        Some(SqlToken::Word(next)) if next.eq_ignore_ascii_case("UPDATE") => {
+                            on_update = true
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        if depth != 0 {
+            return ReferencesClauseTail::ExpectsName;
+        }
+
+        // A complete `REFERENCES target [(cols)]`. `ON` stays available until both
+        // referential actions are spelled out. A table-level FK admits nothing
+        // else; a column-level FK additionally admits the remaining inline
+        // constraints (but never DEFAULT/identity/COLLATE/a second REFERENCES,
+        // which are only grammatical before any inline constraint).
+        let on_available = !(on_delete && on_update);
+        let keywords: &'static [&'static str] = if saw_foreign {
+            if on_available {
+                &["ON"]
+            } else {
+                &[]
+            }
+        } else if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            // MySQL's reference definition is the terminal part of a column
+            // definition, so only the `ON` actions may follow.
+            if on_available {
+                &["ON"]
+            } else {
+                &[]
+            }
+        } else if on_available {
+            &[
+                "ON", "CONSTRAINT", "NOT NULL", "NULL", "PRIMARY KEY", "UNIQUE", "CHECK",
+            ]
+        } else {
+            &["CONSTRAINT", "NOT NULL", "NULL", "PRIMARY KEY", "UNIQUE", "CHECK"]
+        };
+        ReferencesClauseTail::Continue(keywords)
     }
 
     fn expected_dml_trailing_clause_keywords(
@@ -12399,7 +12839,10 @@ impl SqlEditorWidget {
                     && Self::cursor_immediately_follows_complete_operand(tokens, end) =>
             {
                 if mysql {
-                    Some(&["ON DUPLICATE KEY UPDATE"])
+                    // `DUPLICATE` present ⇒ the clause is already open and the
+                    // cursor is in its assignment list (`… UPDATE a = 1 |` → only a
+                    // further `, b = 2`); never re-offer the clause head.
+                    (!contains("DUPLICATE")).then_some(&["ON DUPLICATE KEY UPDATE"])
                 } else {
                     Some(&["RETURNING"])
                 }
@@ -12540,6 +12983,23 @@ impl SqlEditorWidget {
         match words.as_slice() {
             [alter, table, _name] if alter == "ALTER" && table == "TABLE" => {
                 Some(&["ADD", "DROP", "MODIFY", "RENAME"])
+            }
+            // `ALTER TABLE [schema.]t DROP |` is a table sub-operation, not a
+            // `DROP <object>` statement head: offer the droppable table elements.
+            // (Without this the statement-structural fallback would leak the whole
+            // `DROP TABLE/VIEW/PROCEDURE/…` object-type list here.)
+            [alter, table, .., drop]
+                if alter == "ALTER" && table == "TABLE" && drop == "DROP" =>
+            {
+                Some(&["COLUMN", "CONSTRAINT", "PRIMARY KEY", "UNIQUE", "PARTITION"])
+            }
+            // `ALTER TABLE [schema.]t RENAME |` — the renamable table elements
+            // (`RENAME TO`, `RENAME COLUMN/CONSTRAINT/PARTITION`), not the
+            // standalone `RENAME TABLE/USER` statement objects.
+            [alter, table, .., rename]
+                if alter == "ALTER" && table == "TABLE" && rename == "RENAME" =>
+            {
+                Some(&["TO", "COLUMN", "CONSTRAINT", "PARTITION"])
             }
             _ => None,
         }
@@ -12786,12 +13246,34 @@ impl SqlEditorWidget {
             return Some(&["AUTHID", "IS", "AS"]);
         }
         if contains("TRIGGER") {
-            if matches!(last, Some("INSERT" | "UPDATE" | "DELETE")) {
-                return Some(&["OR", "ON"]);
-            }
+            // Past `ON [schema.]table` the timing/event chain is complete; the
+            // trigger body options follow.
             if contains("ON") {
                 return Some(&["FOR EACH ROW", "WHEN", "DECLARE", "BEGIN"]);
             }
+            let prev = words
+                .len()
+                .checked_sub(2)
+                .and_then(|idx| words.get(idx))
+                .map(String::as_str);
+            match last {
+                // A triggering event continues with another event (`OR`) or the
+                // table (`ON`); `UPDATE` additionally admits an `OF <column>` list.
+                Some("INSERT" | "DELETE") => return Some(&["OR", "ON"]),
+                Some("UPDATE") => return Some(&["OF", "OR", "ON"]),
+                // `INSTEAD` → `OF`; the event follows a timing keyword / `OR` /
+                // `INSTEAD OF` (but `UPDATE OF |` names a column, not an event).
+                Some("INSTEAD") => return Some(&["OF"]),
+                Some("OF") if prev == Some("INSTEAD") => {
+                    return Some(&["INSERT", "UPDATE", "DELETE"])
+                }
+                Some("OF") => return None,
+                Some("BEFORE" | "AFTER" | "OR") => {
+                    return Some(&["INSERT", "UPDATE", "DELETE"])
+                }
+                _ => {}
+            }
+            // The trigger timing point (`CREATE TRIGGER trg |`).
             return Some(&["BEFORE", "AFTER", "INSTEAD OF", "COMPOUND"]);
         }
 
@@ -13133,11 +13615,22 @@ impl SqlEditorWidget {
             if saw_main_query_select {
                 return None;
             }
+            // The cursor sits right after a CTE body's closing `)` — the slot where
+            // the main query may begin (`SELECT`) or, on Oracle, the recursive
+            // `SEARCH`/`CYCLE` options. Gating on the `)` keeps these out of the
+            // `WITH c AS |` slot (which still awaits the body's `(`).
+            let after_complete_cte_body = Self::meaningful_tokens_before(tokens, end)
+                .last()
+                .is_some_and(|token| matches!(token, SqlToken::Symbol(sym) if sym == ")"));
             if mysql && words.len() == 1 {
                 return Some(&["RECURSIVE"]);
             }
             if mysql && has("RECURSIVE") && !has("AS") {
                 return Some(&["AS"]);
+            }
+            if mysql && after_complete_cte_body && has("AS") {
+                // MySQL CTEs have no SEARCH/CYCLE; the main query follows.
+                return Some(&["SELECT"]);
             }
             if !mysql {
                 match words.as_slice() {
@@ -13175,8 +13668,9 @@ impl SqlEditorWidget {
                     }
                     _ => {}
                 }
-                if has("AS") && !has("SEARCH") && !has("CYCLE") {
-                    return Some(&["SEARCH", "CYCLE"]);
+                if after_complete_cte_body && has("AS") && !has("SEARCH") && !has("CYCLE") {
+                    // Main query (`SELECT`) or the recursive-CTE options.
+                    return Some(&["SELECT", "SEARCH", "CYCLE"]);
                 }
             }
         }
@@ -13267,6 +13761,11 @@ impl SqlEditorWidget {
                 }
                 Some("DROP") => {
                     return Some(&["COLUMN", "INDEX", "KEY", "PRIMARY KEY", "FOREIGN KEY"])
+                }
+                Some("RENAME") => {
+                    // `ALTER TABLE t RENAME |` — the table itself (`TO`/`AS`) or a
+                    // renamable element, never the standalone `RENAME TABLE/USER`.
+                    return Some(&["TO", "AS", "COLUMN", "INDEX", "KEY"]);
                 }
                 _ => {}
             }
@@ -13370,7 +13869,16 @@ impl SqlEditorWidget {
             }
         }
         if !mysql && has("RETURNING") && !Self::cursor_is_at_json_returning_type(tokens, end) {
-            return Some(&["INTO"]);
+            // Offer `INTO` only while the RETURNING clause still lacks one. A later
+            // `INTO` (after the RETURNING keyword, not the statement-leading
+            // `INSERT INTO`) means the bind list has begun — never re-offer it.
+            let into_already = words
+                .iter()
+                .rposition(|word| word == "RETURNING")
+                .is_some_and(|idx| words[idx + 1..].iter().any(|word| word == "INTO"));
+            if !into_already {
+                return Some(&["INTO"]);
+            }
         }
         if mysql && has("INSERT") && has("DUPLICATE") {
             if last == Some("DUPLICATE") {
@@ -13441,6 +13949,112 @@ impl SqlEditorWidget {
         }
     }
 
+    /// Set-operation keywords that begin a fresh query branch. A single-use clause
+    /// in one branch does not constrain the next, so clause-presence checks are
+    /// scoped to the branch delimited by these.
+    fn is_set_operation_keyword(word: &str) -> bool {
+        matches!(
+            word.to_ascii_uppercase().as_str(),
+            "UNION" | "INTERSECT" | "MINUS" | "EXCEPT"
+        )
+    }
+
+    /// The token range `[start, stop)` of the set-operation branch containing the
+    /// cursor: from just after the last top-level set operator before the cursor
+    /// to the next one at/after it (or the query bounds). Clause-presence is judged
+    /// within this range so a clause in a sibling `UNION` branch is not counted.
+    fn current_set_branch_range(tokens: &[SqlToken], end: usize) -> (usize, usize) {
+        let visible_end = end.min(tokens.len());
+        let mut depth = 0i32;
+        let mut start = 0usize;
+        for (idx, token) in tokens.iter().enumerate() {
+            match token {
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => depth += 1,
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => depth = (depth - 1).max(0),
+                SqlToken::Word(word) if depth == 0 && Self::is_set_operation_keyword(word) => {
+                    if idx < visible_end {
+                        // Skip the operator (and a trailing `ALL`) into the branch.
+                        start = if matches!(tokens.get(idx + 1), Some(SqlToken::Word(w)) if w.eq_ignore_ascii_case("ALL")) {
+                            idx + 2
+                        } else {
+                            idx + 1
+                        };
+                    } else {
+                        return (start, idx);
+                    }
+                }
+                _ => {}
+            }
+        }
+        (start, tokens.len())
+    }
+
+    /// Clause keywords that are grammatically single-use within one query branch,
+    /// so a continuation must not re-offer one already present (`… WHERE x = 1 |
+    /// GROUP BY a` must not re-suggest `GROUP BY`). Repeatable openers (`AND`/`OR`/
+    /// `JOIN`/the set operators) are deliberately excluded.
+    const SINGLE_USE_CLAUSE_KEYWORDS: &'static [&'static str] = &[
+        "WHERE", "GROUP BY", "HAVING", "ORDER BY", "OFFSET", "FETCH", "LIMIT",
+        "FOR UPDATE", "CONNECT BY", "START WITH",
+    ];
+
+    /// Whether `keyword` is a single-use clause already present (as a contiguous
+    /// word sequence at paren depth 0) in the cursor's set-operation branch.
+    fn single_use_clause_present_in_branch(
+        keyword: &str,
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> bool {
+        let upper = keyword.to_ascii_uppercase();
+        if !Self::SINGLE_USE_CLAUSE_KEYWORDS.contains(&upper.as_str()) {
+            return false;
+        }
+        let needle: Vec<&str> = upper.split(' ').collect();
+        let (start, stop) = Self::current_set_branch_range(tokens, end);
+        let mut depth = 0i32;
+        let mut matched = 0usize;
+        for token in tokens.get(start..stop.min(tokens.len())).unwrap_or(&[]) {
+            match token {
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => {
+                    depth += 1;
+                    matched = 0;
+                }
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => {
+                    depth = (depth - 1).max(0);
+                    matched = 0;
+                }
+                SqlToken::Word(word) if depth == 0 => {
+                    if word.eq_ignore_ascii_case(needle[matched]) {
+                        matched += 1;
+                        if matched == needle.len() {
+                            return true;
+                        }
+                    } else {
+                        matched = usize::from(word.eq_ignore_ascii_case(needle[0]));
+                    }
+                }
+                SqlToken::Comment(_) => {}
+                _ => matched = 0,
+            }
+        }
+        false
+    }
+
+    /// Drops every single-use clause keyword already present in the cursor's
+    /// branch from a continuation candidate list — the one chokepoint that keeps
+    /// `GROUP BY`/`ORDER BY`/`FOR UPDATE`/… from being re-offered, replacing the
+    /// per-clause ad-hoc guards.
+    fn drop_present_single_use_clauses(
+        candidates: Vec<String>,
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> Vec<String> {
+        candidates
+            .into_iter()
+            .filter(|keyword| !Self::single_use_clause_present_in_branch(keyword, tokens, end))
+            .collect()
+    }
+
     fn expected_query_clause_continuation_keywords(
         tokens: &[SqlToken],
         end: usize,
@@ -13476,6 +14090,22 @@ impl SqlEditorWidget {
                 {
                     return &["ORDER BY", "LIMIT"];
                 }
+                // After a complete sort item in that MySQL `ORDER BY`, only `LIMIT`
+                // follows (no `FOR UPDATE`/`UNION`/… as in a SELECT). Gate on the
+                // sort item being complete, mirroring the `OrderByClause` arm.
+                if mysql
+                    && matches!(phase, intellisense_context::SqlPhase::OrderByClause)
+                    && !matches!(
+                        Self::previous_meaningful_words_upper(tokens, end, 2)
+                            .last()
+                            .map(String::as_str),
+                        Some("ORDER" | "BY" | "NULLS")
+                    )
+                    && Self::cursor_immediately_follows_complete_operand(tokens, end)
+                    && Self::cursor_is_in_order_by_item_list(tokens, end)
+                {
+                    return &["LIMIT"];
+                }
                 return &[];
             }
             _ => return &[],
@@ -13484,7 +14114,17 @@ impl SqlEditorWidget {
         let complete = match phase {
             SqlPhase::FromClause => Self::cursor_is_after_complete_from_relation(tokens, end),
             SqlPhase::GroupByClause => {
-                Self::cursor_immediately_follows_complete_operand(tokens, end)
+                // `cursor_immediately_follows_complete_operand` treats any bare
+                // word as an operand, so at the empty `GROUP BY |` slot the clause
+                // keyword `BY` would masquerade as a complete grouping item and
+                // leak the downstream openers (`HAVING`/`ORDER BY`/…). Guard the
+                // head words exactly as the `OrderByClause` arm does.
+                !matches!(
+                    Self::previous_meaningful_words_upper(tokens, end, 2)
+                        .last()
+                        .map(String::as_str),
+                    Some("GROUP" | "BY")
+                ) && Self::cursor_immediately_follows_complete_operand(tokens, end)
                     && Self::cursor_is_in_order_by_item_list(tokens, end)
             }
             SqlPhase::WhereClause
@@ -13618,33 +14258,16 @@ impl SqlEditorWidget {
                     "EXCEPT",
                 ]
             }
+            // The hierarchical clauses pair up in either order. Both are emitted
+            // here; the single-use-clause filter on the continuation output drops
+            // whichever partner is already present in the current branch.
             (SqlPhase::StartWithClause, _) => &[
-                "CONNECT BY",
-                "GROUP BY",
-                "HAVING",
-                "ORDER BY",
-                "OFFSET",
-                "FETCH",
-                "FOR UPDATE",
-                "UNION",
-                "UNION ALL",
-                "INTERSECT",
-                "MINUS",
-                "EXCEPT",
+                "CONNECT BY", "GROUP BY", "HAVING", "ORDER BY", "OFFSET", "FETCH",
+                "FOR UPDATE", "UNION", "UNION ALL", "INTERSECT", "MINUS", "EXCEPT",
             ],
             (SqlPhase::ConnectByClause, _) => &[
-                "START WITH",
-                "GROUP BY",
-                "HAVING",
-                "ORDER BY",
-                "OFFSET",
-                "FETCH",
-                "FOR UPDATE",
-                "UNION",
-                "UNION ALL",
-                "INTERSECT",
-                "MINUS",
-                "EXCEPT",
+                "START WITH", "GROUP BY", "HAVING", "ORDER BY", "OFFSET", "FETCH",
+                "FOR UPDATE", "UNION", "UNION ALL", "INTERSECT", "MINUS", "EXCEPT",
             ],
             (SqlPhase::GroupByClause, false) => {
                 &[
@@ -14109,7 +14732,12 @@ impl SqlEditorWidget {
                     .iter()
                     .filter(|token| matches!(token, SqlToken::Symbol(sym) if sym == ")"))
                     .count();
-                return open_parens > close_parens;
+                // A column-name slot lives directly in the table-definition list
+                // (paren depth 1). A deeper position is a nested construct — a
+                // `REFERENCES p (col …)` list, a `CHECK (…)` predicate, or a type's
+                // own precision `NUMBER(…)` — where an identifier is not a new
+                // column awaiting a type, so it is not a data-type slot.
+                return open_parens == close_parens + 1;
             }
         }
 
@@ -15203,7 +15831,9 @@ impl SqlEditorWidget {
 
         match words.as_slice() {
             [.., last] if *last == "CREATE" => Some(CREATE_OBJECT_TYPE_KEYWORDS),
-            [.., last] if *last == "DROP" => Some(OBJECT_TYPE_KEYWORDS),
+            // Statement-initial `DROP |` only — a trailing `DROP` inside another
+            // statement (`ALTER TABLE t DROP`) is a sub-clause, not an object head.
+            [last] if *last == "DROP" => Some(OBJECT_TYPE_KEYWORDS),
             [.., last] if *last == "ALTER" => Some(ALTER_OBJECT_TYPE_KEYWORDS),
             [.., prev, last]
                 if *prev == "CREATE" && matches!(last.as_str(), "UNIQUE" | "BITMAP") =>
@@ -18233,7 +18863,10 @@ impl SqlEditorWidget {
                 Some(&["TABLE"])
             }
             [.., last] if *last == "TRUNCATE" => Some(&["TABLE"]),
-            [.., last] if *last == "RENAME" => Some(&["TABLE", "USER"]),
+            // The statement-initial `RENAME |` → `TABLE`/`USER` is handled by
+            // `expected_rename_candidates` above; a *trailing* `RENAME` here is the
+            // `ALTER TABLE … RENAME` sub-command, not the standalone statement, so
+            // it must not leak the `RENAME TABLE`/`RENAME USER` object list.
             [.., last] if *last == "LOCK" => Some(&["INSTANCE", "TABLES"]),
             [.., a, b] if *a == "LOCK" && *b == "INSTANCE" => Some(&["FOR"]),
             [.., a, b, c] if *a == "LOCK" && *b == "INSTANCE" && *c == "FOR" => {
@@ -18767,10 +19400,25 @@ impl SqlEditorWidget {
     ) -> Option<&'static [&'static str]> {
         let toks = Self::meaningful_tokens_with_indices_before(tokens, end);
         let last = toks.len().checked_sub(1)?;
-        let on = last.checked_sub(1)?;
-        if !matches!(toks.get(on), Some((_, SqlToken::Word(word))) if word.eq_ignore_ascii_case("ON")) {
+        let last_word = match toks.get(last) {
+            Some((_, SqlToken::Word(word))) => word.to_ascii_uppercase(),
+            _ => return None,
+        };
+        // Two slots share the FK `REFERENCES …` gating: the action *keyword*
+        // position (`… ON |` → `DELETE`/`UPDATE`) and the action *value* position
+        // (`… ON DELETE|UPDATE |` → `CASCADE`/`SET NULL`/…). `on` is the index of
+        // the governing `ON`; `action` is the kept action word, if any.
+        let (on, action) = if last_word == "ON" {
+            (last, None)
+        } else if matches!(last_word.as_str(), "DELETE" | "UPDATE") {
+            let on = last.checked_sub(1)?;
+            if !matches!(toks.get(on), Some((_, SqlToken::Word(word))) if word.eq_ignore_ascii_case("ON")) {
+                return None;
+            }
+            (on, Some(last_word.clone()))
+        } else {
             return None;
-        }
+        };
         if matches!(
             on.checked_sub(1).and_then(|index| toks.get(index).map(|(_, token)| *token)),
             Some(SqlToken::Symbol(sym)) if sym == "."
@@ -18812,11 +19460,13 @@ impl SqlEditorWidget {
             return None;
         }
 
-        match toks.get(last).map(|(_, token)| *token) {
-            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("DELETE") => {
+        match action.as_deref() {
+            // `… REFERENCES p (b) ON |` - the referential action verbs.
+            None => Some(&["DELETE", "UPDATE"]),
+            Some("DELETE") => {
                 Some(&["CASCADE", "SET NULL", "SET DEFAULT", "NO ACTION", "RESTRICT"])
             }
-            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("UPDATE") => Some(&[
+            Some("UPDATE") => Some(&[
                 "CASCADE",
                 "SET NULL",
                 "SET DEFAULT",
@@ -19902,7 +20552,7 @@ impl SqlEditorWidget {
         if let Some(slot) = Self::window_order_by_sort_modifier_slot(tokens, context_end) {
             return Self::filter_expected_candidates(
                 prefix,
-                window_order_by_sort_modifier_keywords(slot),
+                window_order_by_sort_modifier_keywords(slot, db_type),
             );
         }
 
@@ -20027,9 +20677,36 @@ impl SqlEditorWidget {
         if let Some(slot) =
             Self::order_by_sort_modifier_slot(tokens, context_end, deep_ctx.phase)
         {
-            let candidates = order_by_sort_modifier_keywords(slot);
-            if !candidates.is_empty() {
-                return Self::filter_expected_candidates(prefix, candidates);
+            // A complete sort item admits the sort modifiers *and* the query's
+            // downstream clauses (`ORDER BY a |` → ASC/DESC/NULLS + OFFSET/FETCH/
+            // FOR UPDATE/UNION/…). The sort-modifier slot used to shadow the clause
+            // tail; merge them so both are offered. The continuation helper applies
+            // its own DELETE/UPDATE gating and complete-item check, returning empty
+            // at an incomplete slot (`ORDER BY a NULLS |`).
+            let mut result = Self::filter_expected_candidates(
+                prefix,
+                order_by_sort_modifier_keywords(slot, db_type),
+            );
+            let continuation = Self::expected_query_clause_continuation_keywords(
+                tokens,
+                context_end,
+                intellisense_context::SqlPhase::OrderByClause,
+                db_type,
+            );
+            for keyword in Self::drop_present_single_use_clauses(
+                Self::filter_expected_candidates(prefix, continuation),
+                tokens,
+                context_end,
+            ) {
+                if !result
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(&keyword))
+                {
+                    result.push(keyword);
+                }
+            }
+            if !result.is_empty() {
+                return result;
             }
         }
 
@@ -20091,22 +20768,30 @@ impl SqlEditorWidget {
 
         let words = Self::previous_meaningful_words_upper(tokens, context_end, 6);
         if !prefix.is_empty() {
-            let mut filtered = Self::filter_expected_candidates(
-                prefix,
-                Self::expected_query_clause_continuation_keywords_for_any_complete_phase(
-                    tokens,
-                    context_end,
-                    db_type,
-                ),
-            );
-            if filtered.is_empty() {
-                filtered = Self::filter_expected_candidates(
+            let mut filtered = Self::drop_present_single_use_clauses(
+                Self::filter_expected_candidates(
                     prefix,
                     Self::expected_query_clause_continuation_keywords_for_any_complete_phase(
-                        statement_tokens,
-                        statement_context_end,
+                        tokens,
+                        context_end,
                         db_type,
                     ),
+                ),
+                tokens,
+                context_end,
+            );
+            if filtered.is_empty() {
+                filtered = Self::drop_present_single_use_clauses(
+                    Self::filter_expected_candidates(
+                        prefix,
+                        Self::expected_query_clause_continuation_keywords_for_any_complete_phase(
+                            statement_tokens,
+                            statement_context_end,
+                            db_type,
+                        ),
+                    ),
+                    statement_tokens,
+                    statement_context_end,
                 );
             }
             if !filtered.is_empty() {
@@ -20156,9 +20841,31 @@ impl SqlEditorWidget {
             return Self::filter_expected_candidates(prefix, candidates);
         }
         if let Some(candidates) =
-            Self::expected_select_list_from_keyword_candidates(tokens, context_end)
+            Self::expected_alter_table_add_tail_keywords(tokens, context_end, db_type)
         {
             return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(candidates) =
+            Self::expected_select_list_from_keyword_candidates(tokens, context_end)
+        {
+            let mut result = Self::filter_expected_candidates(prefix, candidates);
+            // A complete select item that is a closed function call also admits the
+            // analytic continuation `OVER` (`SELECT SUM(x) | FROM …`). The flat
+            // base catalog only supplies it for a non-empty prefix; emitting it
+            // here through the grammar-aware path makes the empty-prefix slot
+            // consistent. `follows_call` already gates this to a real call's `)`
+            // (never a grouping paren or scalar subquery).
+            if expr_keyword_ctx.is_some_and(|ctx| ctx.follows_call) {
+                for keyword in Self::filter_expected_candidates(prefix, &["OVER"]) {
+                    if !result
+                        .iter()
+                        .any(|existing| existing.eq_ignore_ascii_case(&keyword))
+                    {
+                        result.push(keyword);
+                    }
+                }
+            }
+            return result;
         }
         if let Some(candidates) =
             Self::expected_is_predicate_keyword_candidates(
@@ -20344,7 +21051,11 @@ impl SqlEditorWidget {
             &[]
         };
         if !clause_tail.is_empty() {
-            for keyword in Self::filter_expected_candidates(prefix, clause_tail) {
+            for keyword in Self::drop_present_single_use_clauses(
+                Self::filter_expected_candidates(prefix, clause_tail),
+                tokens,
+                context_end,
+            ) {
                 if !result.iter().any(|existing| existing.eq_ignore_ascii_case(&keyword)) {
                     result.push(keyword);
                 }

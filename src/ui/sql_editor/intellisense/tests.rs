@@ -1001,8 +1001,9 @@ fn referential_action_slot_suppresses_tables_and_offers_action_keywords() {
     ));
 }
 
-/// ORDER BY sort modifier tails accept only the next fixed modifier keyword:
-/// `<sort-key> ASC|DESC |` -> `NULLS`,
+/// ORDER BY sort modifier tails offer the next fixed modifier keyword first:
+/// `<sort-key> ASC|DESC |` -> `NULLS` (then the downstream clause openers, since a
+/// directed sort item is a complete clause boundary),
 /// `<sort-key> [ASC|DESC] NULLS |` -> `FIRST`/`LAST`, and the completed
 /// `NULLS FIRST|LAST |` tail accepts no identifier until a comma starts the next
 /// key. The ORDER BY column list and the flat operand-start keyword dump are
@@ -1035,7 +1036,17 @@ fn order_by_sort_modifier_slots_suppress_columns_and_offer_only_modifier_keyword
             SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(&ctx, has_prefix),
             "suppression for `{sql}`"
         );
-        assert_eq!(kw(sql), vec!["NULLS".to_string()], "for `{sql}`");
+        // `NULLS` leads (the only remaining sort modifier), followed by the
+        // downstream clause openers of the now-complete sort item. With a typed
+        // prefix (`ASC N|`) the openers filter out, leaving just `NULLS`.
+        let got = kw(sql);
+        assert_eq!(got.first().map(String::as_str), Some("NULLS"), "for `{sql}`: {got:?}");
+        if !has_prefix {
+            assert!(
+                got.iter().any(|k| k == "FOR UPDATE"),
+                "downstream clause openers for `{sql}`: {got:?}"
+            );
+        }
     }
 
     for sql in [
@@ -1137,7 +1148,10 @@ fn order_by_bare_sort_key_offers_direction_and_null_keywords() {
         )
     };
 
-    // A complete sort key with no modifier yet: ASC/DESC/NULLS, columns suppressed.
+    // A complete sort key with no modifier yet: the sort modifiers come first
+    // (ASC/DESC/NULLS), then the query's downstream clause openers - a complete
+    // sort item is also a clean clause boundary (`ORDER BY a OFFSET …`,
+    // `… FOR UPDATE`, `… UNION …`). Columns stay suppressed.
     for sql in [
         "SELECT a FROM t ORDER BY a |",
         "SELECT a, b FROM t ORDER BY a, b |", // second key in the list
@@ -1145,10 +1159,15 @@ fn order_by_bare_sort_key_offers_direction_and_null_keywords() {
         "SELECT a FROM t ORDER BY upper(a) |", // call result
         "SELECT a FROM t ORDER BY a + b |",   // complete expression
     ] {
+        let got = kw(sql);
         assert_eq!(
-            kw(sql),
-            vec!["ASC".to_string(), "DESC".to_string(), "NULLS".to_string()],
-            "modifier keywords for `{sql}`"
+            got.get(..3),
+            Some(["ASC".to_string(), "DESC".to_string(), "NULLS".to_string()].as_slice()),
+            "modifier keywords lead for `{sql}`: {got:?}"
+        );
+        assert!(
+            got.iter().any(|k| k == "OFFSET") && got.iter().any(|k| k == "FOR UPDATE"),
+            "downstream clause openers for `{sql}`: {got:?}"
         );
         assert!(suppresses(sql), "columns suppressed for `{sql}`");
     }
@@ -1178,6 +1197,288 @@ fn order_by_bare_sort_key_offers_direction_and_null_keywords() {
     assert!(kw("SELECT sum(x) OVER (ORDER BY a |) FROM t")
         .iter()
         .any(|k| k == "ASC"));
+}
+
+/// Dialect-correct sort modifiers and frame units. MySQL/MariaDB have no
+/// `NULLS FIRST/LAST` ordering and no `GROUPS` window frame unit, so those are
+/// suppressed there while Oracle keeps them. Regression guard for the bug where
+/// the modifier slots hard-coded the Oracle set for every dialect, and where the
+/// query-level ORDER BY slot shadowed the downstream clause openers entirely.
+#[test]
+fn order_by_sort_modifiers_are_dialect_aware() {
+    let kw = |sql: &str, db: crate::db::DatabaseType| {
+        let cursor = sql.find('|').expect("cursor marker");
+        let s = sql.replace('|', "");
+        let prefix = crate::ui::intellisense::get_word_at_cursor(&s, cursor).0;
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(db),
+        )
+    };
+    let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
+
+    // Query-level ORDER BY: Oracle offers NULLS, MySQL/MariaDB do not. Both lead
+    // with ASC/DESC and then append their dialect's downstream clause openers.
+    for db in [MySQL, MariaDB] {
+        let got = kw("SELECT a FROM t ORDER BY a |", db);
+        assert_eq!(
+            got.get(..2),
+            Some(["ASC".to_string(), "DESC".to_string()].as_slice()),
+            "{db:?} bare sort key leads with ASC/DESC only: {got:?}"
+        );
+        assert!(!has(&got, "NULLS"), "{db:?} must not offer NULLS: {got:?}");
+        assert!(has(&got, "LIMIT"), "{db:?} appends LIMIT: {got:?}");
+        assert!(!has(&got, "OFFSET"), "{db:?} uses LIMIT not OFFSET: {got:?}");
+    }
+    let oracle = kw("SELECT a FROM t ORDER BY a |", Oracle);
+    assert!(has(&oracle, "NULLS"), "Oracle offers NULLS: {oracle:?}");
+    assert!(has(&oracle, "OFFSET"), "Oracle appends OFFSET: {oracle:?}");
+
+    // `ORDER BY a ASC |`: Oracle still offers NULLS; MySQL goes straight to the
+    // downstream openers (no null-ordering keyword exists there).
+    assert!(has(&kw("SELECT a FROM t ORDER BY a ASC |", Oracle), "NULLS"));
+    assert!(!has(&kw("SELECT a FROM t ORDER BY a ASC |", MySQL), "NULLS"));
+    assert!(has(&kw("SELECT a FROM t ORDER BY a ASC |", MySQL), "LIMIT"));
+
+    // MySQL allows a trailing `ORDER BY … LIMIT` on DELETE/UPDATE: after a
+    // complete sort item the slot offers the direction modifiers plus `LIMIT`
+    // only (no SELECT-only `FOR UPDATE`/`UNION`).
+    for sql in [
+        "DELETE FROM t ORDER BY a |",
+        "UPDATE t SET a = 1 ORDER BY a |",
+    ] {
+        let got = kw(sql, MySQL);
+        assert!(has(&got, "LIMIT"), "MySQL DML ORDER BY offers LIMIT for `{sql}`: {got:?}");
+        assert!(!has(&got, "FOR UPDATE") && !has(&got, "UNION"), "no SELECT tails for `{sql}`: {got:?}");
+    }
+
+    // Analytic window ORDER BY: Oracle offers NULLS + the GROUPS frame unit;
+    // MySQL/MariaDB support neither, only ROWS/RANGE.
+    let win_oracle = kw("SELECT sum(x) OVER (ORDER BY a |) FROM t", Oracle);
+    assert!(has(&win_oracle, "NULLS") && has(&win_oracle, "GROUPS"), "{win_oracle:?}");
+    for db in [MySQL, MariaDB] {
+        let got = kw("SELECT sum(x) OVER (ORDER BY a |) FROM t", db);
+        assert!(has(&got, "ROWS") && has(&got, "RANGE"), "{db:?} frame units: {got:?}");
+        assert!(!has(&got, "NULLS"), "{db:?} window no NULLS: {got:?}");
+        assert!(!has(&got, "GROUPS"), "{db:?} window no GROUPS: {got:?}");
+    }
+}
+
+/// `ALTER TABLE t DROP |` is a table sub-operation, so it offers the droppable
+/// table elements (`COLUMN`/`CONSTRAINT`/`PRIMARY KEY`/…) - NOT the `DROP <object>`
+/// statement object-type list (`TABLE`/`VIEW`/`PROCEDURE`/…). Regression guard for
+/// the Oracle bug where any statement ending in `DROP` leaked the object-type list.
+/// The statement-head `DROP |` must still offer the object types.
+#[test]
+fn alter_table_drop_offers_table_elements_not_object_types() {
+    let kw = |sql: &str, db: crate::db::DatabaseType| {
+        let cursor = sql.find('|').expect("cursor marker");
+        let s = sql.replace('|', "");
+        let prefix = crate::ui::intellisense::get_word_at_cursor(&s, cursor).0;
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(db),
+        )
+    };
+    let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    // Oracle: table elements, never the DROP-statement object types.
+    let oracle = kw("ALTER TABLE t DROP |", Oracle);
+    assert!(has(&oracle, "COLUMN") && has(&oracle, "CONSTRAINT"), "{oracle:?}");
+    for leaked in ["TABLE", "VIEW", "PROCEDURE", "SEQUENCE", "PACKAGE"] {
+        assert!(!has(&oracle, leaked), "`{leaked}` leaked at ALTER TABLE DROP: {oracle:?}");
+    }
+    // Schema-qualified target is handled the same way.
+    let qualified = kw("ALTER TABLE myschema.t DROP |", Oracle);
+    assert!(has(&qualified, "COLUMN") && !has(&qualified, "TABLE"), "{qualified:?}");
+
+    // MySQL keeps its own (correct) table-element set.
+    let mysql = kw("ALTER TABLE t DROP |", MySQL);
+    assert!(has(&mysql, "COLUMN") && has(&mysql, "INDEX"), "{mysql:?}");
+    assert!(!mysql.iter().any(|k| k == "PROCEDURE"), "{mysql:?}");
+
+    // The statement head `DROP |` still offers the object-type list.
+    let drop_head = kw("DROP |", Oracle);
+    assert!(has(&drop_head, "TABLE") && has(&drop_head, "VIEW"), "{drop_head:?}");
+}
+
+/// After a foreign-key `REFERENCES t (cols) ON |`, only the referential action
+/// verbs `DELETE`/`UPDATE` are grammatical - not the inline column-definition
+/// keywords (`CHECK`/`DEFAULT`/…) that the CREATE TABLE tail otherwise leaks
+/// there. The existing `ON DELETE|UPDATE |` action-value slot still resolves to
+/// the action list. Covers both inline (CREATE TABLE) and table-level (ALTER
+/// TABLE ADD CONSTRAINT) foreign keys.
+#[test]
+fn referential_action_on_slot_offers_only_delete_update() {
+    let kw = |sql: &str, db: crate::db::DatabaseType| {
+        let cursor = sql.find('|').expect("cursor marker");
+        let s = sql.replace('|', "");
+        let prefix = crate::ui::intellisense::get_word_at_cursor(&s, cursor).0;
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(db),
+        )
+    };
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    for db in [Oracle, MySQL] {
+        for sql in [
+            "CREATE TABLE t (id NUMBER, CONSTRAINT fk FOREIGN KEY (a) REFERENCES p (b) ON |",
+            "ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (a) REFERENCES p (b) ON |",
+            "CREATE TABLE t (id NUMBER REFERENCES p (b) ON |",
+        ] {
+            assert_eq!(
+                kw(sql, db),
+                vec!["DELETE".to_string(), "UPDATE".to_string()],
+                "ON slot for `{sql}` {db:?}"
+            );
+        }
+        // The action-value slot still resolves to the action list.
+        let del = kw("ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (a) REFERENCES p (b) ON DELETE |", db);
+        assert!(del.iter().any(|k| k == "CASCADE") && del.iter().any(|k| k == "SET NULL"), "{del:?}");
+    }
+
+    // A non-FK `ON` (e.g. a JOIN condition) must not offer the referential verbs.
+    let join = kw("SELECT * FROM a JOIN b ON |", Oracle);
+    assert!(!join.iter().any(|k| k == "DELETE" || k == "UPDATE"), "{join:?}");
+}
+
+/// After a complete CTE body (`WITH c AS (…) |`) the main query may begin: the
+/// slot offers `SELECT` (Oracle additionally the recursive `SEARCH`/`CYCLE`
+/// options). Regression guard for the bug where Oracle offered only SEARCH/CYCLE
+/// (no SELECT) and MySQL leaked a stray `FROM`. The pre-body `WITH c AS |` slot
+/// (still awaiting `(`) must NOT offer these.
+#[test]
+fn with_clause_after_cte_body_offers_main_query_select() {
+    let kw = |sql: &str, db: crate::db::DatabaseType| {
+        let cursor = sql.find('|').expect("cursor marker");
+        let s = sql.replace('|', "");
+        let prefix = crate::ui::intellisense::get_word_at_cursor(&s, cursor).0;
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(db),
+        )
+    };
+    let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
+
+    for sql in [
+        "WITH c AS (SELECT 1 FROM dual) |",
+        "WITH c AS (SELECT 1 FROM dual), d AS (SELECT 2 FROM dual) |",
+    ] {
+        let oracle = kw(sql, Oracle);
+        assert!(has(&oracle, "SELECT"), "Oracle offers SELECT for `{sql}`: {oracle:?}");
+        assert!(has(&oracle, "SEARCH") && has(&oracle, "CYCLE"), "{oracle:?}");
+        for db in [MySQL, MariaDB] {
+            let got = kw(sql, db);
+            assert_eq!(got, vec!["SELECT".to_string()], "{db:?} for `{sql}`: {got:?}");
+        }
+    }
+
+    // The pre-body slot (after `AS`, awaiting `(`) offers neither.
+    for db in [Oracle, MySQL] {
+        let got = kw("WITH c AS |", db);
+        assert!(!has(&got, "SELECT") && !has(&got, "SEARCH"), "pre-body `WITH c AS |` {db:?}: {got:?}");
+    }
+}
+
+/// A completed `BETWEEN lo AND hi` is a complete predicate, so the conjunction
+/// (`AND`/`OR`) and the downstream clause openers must follow it - identical to
+/// any other complete `WHERE`/`HAVING` predicate. Regression guard for the bug
+/// where the predicate-completeness scan mistook the `BETWEEN` separator `AND`
+/// for a boolean conjunction and split off a bare `hi` operand with no operator,
+/// leaving the popup silent. The intermediate `BETWEEN lo |` slot (still awaiting
+/// `AND`) and the open `BETWEEN lo AND |` slot must NOT offer the openers.
+#[test]
+fn completed_between_predicate_offers_conjunction_and_clause_openers() {
+    let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
+    let kw = |sql: &str, db: crate::db::DatabaseType| {
+        let cursor = sql.find('|').expect("cursor marker");
+        let s = sql.replace('|', "");
+        let prefix = crate::ui::intellisense::get_word_at_cursor(&s, cursor).0;
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(db),
+        )
+    };
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    // Completed BETWEEN -> conjunction + downstream openers, both dialects, in
+    // both standalone and second-conjunct positions, and when negated.
+    for sql in [
+        "SELECT a FROM t WHERE x BETWEEN 1 AND 2 |",
+        "SELECT a FROM t WHERE x NOT BETWEEN 1 AND 2 |",
+        "SELECT a FROM t WHERE a = 1 AND x BETWEEN 1 AND 2 |",
+        "SELECT a FROM t HAVING count(*) BETWEEN 1 AND 2 |",
+    ] {
+        for db in [Oracle, MySQL] {
+            let got = kw(sql, db);
+            assert!(has(&got, "AND") && has(&got, "OR"), "conjunction for `{sql}` {db:?}: {got:?}");
+            assert!(has(&got, "ORDER BY"), "openers for `{sql}` {db:?}: {got:?}");
+        }
+    }
+
+    // A *conjunction* after a completed BETWEEN starts a fresh conjunct, which is
+    // incomplete -> no openers (but the column position is live).
+    for sql in [
+        "SELECT a FROM t WHERE x BETWEEN 1 AND 2 AND |", // fresh conjunct
+        "SELECT a FROM t WHERE x BETWEEN 1 AND |",       // awaiting hi operand
+        "SELECT a FROM t WHERE x BETWEEN 1 |",           // awaiting AND (offers AND only)
+    ] {
+        assert!(
+            !has(&kw(sql, Oracle), "ORDER BY") && !has(&kw(sql, Oracle), "GROUP BY"),
+            "opener leaked at incomplete BETWEEN `{sql}`: {:?}",
+            kw(sql, Oracle)
+        );
+    }
+    // Mid-BETWEEN still offers exactly `AND`.
+    assert_eq!(kw("SELECT a FROM t WHERE x BETWEEN 1 |", Oracle), vec!["AND".to_string()]);
+}
+
+/// The empty `GROUP BY |` slot is a column position, not a complete grouping
+/// item: the downstream clause openers (`HAVING`/`ORDER BY`/`LIMIT`/…) must not
+/// leak there. Regression guard for the MySQL path where the clause keyword `BY`
+/// was mistaken for a complete operand. (Oracle intercepts this slot with its
+/// `ROLLUP`/`CUBE`/`GROUPING SETS` openers, which is correct and preserved.)
+#[test]
+fn empty_group_by_slot_does_not_leak_downstream_openers() {
+    let kw = |sql: &str, db: crate::db::DatabaseType| {
+        let cursor = sql.find('|').expect("cursor marker");
+        let s = sql.replace('|', "");
+        let prefix = crate::ui::intellisense::get_word_at_cursor(&s, cursor).0;
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(db),
+        )
+    };
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
+
+    for db in [MySQL, MariaDB] {
+        let got = kw("SELECT a, count(*) FROM t GROUP BY |", db);
+        for leaked in ["HAVING", "ORDER BY", "LIMIT", "UNION", "FOR UPDATE"] {
+            assert!(
+                !got.iter().any(|k| k == leaked),
+                "`{leaked}` leaked at empty GROUP BY for {db:?}: {got:?}"
+            );
+        }
+    }
+
+    // A *complete* grouping item still offers the downstream openers.
+    assert!(kw("SELECT a, count(*) FROM t GROUP BY a |", MySQL)
+        .iter()
+        .any(|k| k == "HAVING"));
+
+    // Oracle keeps its grouping-set openers at the empty slot.
+    let oracle = kw("SELECT a, count(*) FROM t GROUP BY |", Oracle);
+    assert!(oracle.iter().any(|k| k == "ROLLUP"), "{oracle:?}");
 }
 
 /// After the *complete* content of a query clause, the downstream clause openers
@@ -35296,3 +35597,595 @@ fn expression_construct_tail_keywords_are_complete_and_noise_free() {
         }
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/// A `REFERENCES` clause inside a `CREATE TABLE` definition is parsed precisely:
+/// the referenced-name slot suppresses the constraint catalog entirely, and a
+/// completed reference offers the `ON` referential-action continuation (plus the
+/// remaining inline constraints for a column-level FK) — never a second
+/// `REFERENCES`/`DEFAULT`/identity, which are only grammatical before any inline
+/// constraint. The `ON DELETE`/`ON UPDATE` actions drop `ON` once both are spent.
+#[test]
+fn create_table_references_clause_tail_is_precise() {
+    let kw = |sql: &str, db: crate::db::DatabaseType| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(db),
+        )
+    };
+    let oracle = |sql: &str| kw(sql, crate::db::DatabaseType::Oracle);
+    let mysql = |sql: &str| kw(sql, crate::db::DatabaseType::MySQL);
+    let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
+
+    // Column-level FK, complete reference (with and without the referenced-column
+    // list, and through a qualified target): `ON` plus the remaining inline
+    // constraints, never DEFAULT/GENERATED/IDENTITY/COLLATE or a second REFERENCES.
+    for sql in [
+        "CREATE TABLE t (a INT REFERENCES p (b) |)",
+        "CREATE TABLE t (a INT REFERENCES p |)",
+        "CREATE TABLE t (a INT REFERENCES s.p |)",
+        "CREATE TABLE t (a INT NOT NULL, b INT REFERENCES p (c) |)",
+    ] {
+        let s = oracle(sql);
+        assert!(has(&s, "ON"), "ON missing after complete reference `{sql}`: {s:?}");
+        for noise in ["REFERENCES", "DEFAULT", "GENERATED", "IDENTITY", "COLLATE"] {
+            assert!(!has(&s, noise), "`{noise}` leaked after FK reference `{sql}`: {s:?}");
+        }
+        // Other inline constraints remain grammatical on a column FK.
+        assert!(has(&s, "NOT NULL") && has(&s, "CHECK"), "inline constraints dropped `{sql}`: {s:?}");
+    }
+
+    // Table-level FK constraint: only the referential actions follow; no inline
+    // column constraints belong to a table constraint.
+    let s = oracle("CREATE TABLE t (a INT, FOREIGN KEY (a) REFERENCES p (b) |)");
+    assert_eq!(s, vec!["ON".to_string()], "table-level FK tail must be ON only");
+
+    // Referenced-name / referenced-column slots expect an object, not a keyword.
+    for sql in [
+        "CREATE TABLE t (a INT REFERENCES |)",
+        "CREATE TABLE t (a INT REFERENCES s.|)",
+        "CREATE TABLE t (a INT REFERENCES p (|))",
+    ] {
+        assert!(oracle(sql).is_empty(), "constraint keywords leaked at name slot `{sql}`: {:?}", oracle(sql));
+    }
+
+    // `ON` is offered while one action is unspent, then withdrawn once both
+    // referential actions are present.
+    assert!(
+        has(&oracle("CREATE TABLE t (a INT REFERENCES p (b) ON DELETE CASCADE |)"), "ON"),
+        "ON should remain available for the second referential action"
+    );
+    assert!(
+        !has(&oracle("CREATE TABLE t (a INT REFERENCES p (b) ON DELETE CASCADE ON UPDATE CASCADE |)"), "ON"),
+        "ON should be withdrawn once both referential actions are spent"
+    );
+    assert!(
+        oracle("CREATE TABLE t (a INT, FOREIGN KEY (a) REFERENCES p (b) ON DELETE CASCADE ON UPDATE CASCADE |)").is_empty(),
+        "a fully-specified table-level FK admits nothing further"
+    );
+
+    // A partial multi-word constraint keyword still wins over the reference tail.
+    assert_eq!(
+        oracle("CREATE TABLE t (a INT REFERENCES p (b) NOT |)"),
+        vec!["NULL".to_string()],
+        "NOT must complete to NULL, not re-open the reference tail"
+    );
+
+    // MySQL's reference definition is terminal in a column definition, so only the
+    // `ON` actions follow — for both column-level and table-level FKs.
+    for sql in [
+        "CREATE TABLE t (a INT REFERENCES p (b) |)",
+        "CREATE TABLE t (a INT, FOREIGN KEY (a) REFERENCES p (b) |)",
+    ] {
+        assert_eq!(mysql(sql), vec!["ON".to_string()], "MySQL FK tail must be ON only `{sql}`");
+    }
+}
+
+/// The non-FK constraint-shaped slots of a `CREATE TABLE` definition are precise:
+/// a `CONSTRAINT <name>` slot offers the constraint *types* (table- vs column-
+/// level), `FOREIGN`/`FOREIGN KEY (cols)` progress to `KEY`/`REFERENCES`, and a
+/// completed table-level constraint admits no inline column-property keyword.
+#[test]
+fn create_table_constraint_slots_are_precise() {
+    let kw = |sql: &str| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(crate::db::DatabaseType::Oracle),
+        )
+    };
+    let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
+
+    // A completed table-level constraint admits no column-property keyword — only
+    // the structural `,`/`)`. (Previously it leaked DEFAULT/GENERATED/IDENTITY/…)
+    for sql in [
+        "CREATE TABLE t (a INT, PRIMARY KEY (a) |)",
+        "CREATE TABLE t (a INT, UNIQUE (a) |)",
+        "CREATE TABLE t (a INT, CHECK (a > 0) |)",
+        "CREATE TABLE t (a INT, CONSTRAINT c PRIMARY KEY (a) |)",
+    ] {
+        assert!(kw(sql).is_empty(), "table-level constraint leaked column keywords `{sql}`: {:?}", kw(sql));
+    }
+
+    // The `CONSTRAINT <name>` type slot: table-level offers FOREIGN KEY, a column
+    // constraint offers REFERENCES/NOT NULL instead — neither offers DEFAULT/…
+    let table_level = kw("CREATE TABLE t (a INT, CONSTRAINT c |)");
+    assert!(
+        has(&table_level, "PRIMARY KEY") && has(&table_level, "FOREIGN KEY") && has(&table_level, "CHECK"),
+        "table-level CONSTRAINT name slot missing a type: {table_level:?}"
+    );
+    assert!(!has(&table_level, "DEFAULT") && !has(&table_level, "NOT NULL"),
+        "column properties leaked into table-level CONSTRAINT name slot: {table_level:?}");
+    let column_level = kw("CREATE TABLE t (a INT CONSTRAINT c |)");
+    assert!(
+        has(&column_level, "REFERENCES") && has(&column_level, "NOT NULL") && has(&column_level, "PRIMARY KEY"),
+        "column CONSTRAINT name slot missing a type: {column_level:?}"
+    );
+    assert!(!has(&column_level, "FOREIGN KEY") && !has(&column_level, "DEFAULT"),
+        "table-level/property keywords leaked into column CONSTRAINT name slot: {column_level:?}");
+
+    // The `FOREIGN [KEY (cols)]` progression: `KEY`, then the mandatory `REFERENCES`.
+    assert_eq!(kw("CREATE TABLE t (a INT, FOREIGN |)"), vec!["KEY".to_string()]);
+    assert_eq!(kw("CREATE TABLE t (a INT, FOREIGN KEY (a) |)"), vec!["REFERENCES".to_string()]);
+
+    // `CONSTRAINT |` (awaiting the brand-new constraint name) is a name slot — no
+    // keyword belongs, so the column-property catalog is suppressed.
+    assert!(
+        kw("CREATE TABLE t (a INT, CONSTRAINT |)").is_empty(),
+        "constraint-name slot leaked keywords: {:?}",
+        kw("CREATE TABLE t (a INT, CONSTRAINT |)")
+    );
+
+    // A plain column definition still offers the full column-property catalog.
+    let column = kw("CREATE TABLE t (a INT |)");
+    assert!(
+        has(&column, "DEFAULT") && has(&column, "NOT NULL") && has(&column, "PRIMARY KEY"),
+        "column definition tail regressed: {column:?}"
+    );
+}
+
+/// `ALTER TABLE … ADD` reuses the CREATE-TABLE element grammar, so the same
+/// column / constraint tail is offered (constraint types, `FOREIGN`→`KEY`,
+/// `FOREIGN KEY (cols)`→`REFERENCES`, the FK pre-`ON` slot, and the column
+/// property catalog), and those keyword-only tails suppress the object catalog
+/// while the `REFERENCES` target and the FK/PK column lists still expose it.
+#[test]
+fn alter_table_add_element_tail_is_precise_and_suppresses_objects() {
+    let kw = |sql: &str, db: crate::db::DatabaseType| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(db),
+        )
+    };
+    let oracle = |sql: &str| kw(sql, crate::db::DatabaseType::Oracle);
+    let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
+
+    // Constraint-shaped tails, mirroring the CREATE classifier.
+    let types = oracle("ALTER TABLE t ADD CONSTRAINT c |");
+    assert!(
+        has(&types, "PRIMARY KEY") && has(&types, "FOREIGN KEY") && has(&types, "CHECK"),
+        "ADD CONSTRAINT name slot missing a type: {types:?}"
+    );
+    assert_eq!(oracle("ALTER TABLE t ADD PRIMARY |"), vec!["KEY".to_string()]);
+    assert_eq!(oracle("ALTER TABLE t ADD CONSTRAINT c FOREIGN |"), vec!["KEY".to_string()]);
+    assert_eq!(oracle("ALTER TABLE t ADD FOREIGN KEY (a) |"), vec!["REFERENCES".to_string()]);
+    assert_eq!(
+        oracle("ALTER TABLE t ADD CONSTRAINT c FOREIGN KEY (a) REFERENCES p (b) |"),
+        vec!["ON".to_string()],
+        "ALTER FK pre-ON slot must offer ON"
+    );
+    // A completed table-level constraint and the awaiting-name slot offer nothing.
+    assert!(oracle("ALTER TABLE t ADD PRIMARY KEY (a) |").is_empty());
+    assert!(oracle("ALTER TABLE t ADD CONSTRAINT |").is_empty());
+
+    // Column adds get the full property catalog (bare, parenthesised multi-add,
+    // and the optional COLUMN keyword); the type slot stays out of it.
+    for sql in [
+        "ALTER TABLE t ADD col INT |",
+        "ALTER TABLE t ADD COLUMN col INT |",
+        "ALTER TABLE t ADD (c1 INT, c2 INT |)",
+    ] {
+        let props = oracle(sql);
+        assert!(
+            has(&props, "DEFAULT") && has(&props, "NOT NULL"),
+            "ADD column property tail missing `{sql}`: {props:?}"
+        );
+    }
+    assert_eq!(oracle("ALTER TABLE t ADD col INT NOT |"), vec!["NULL".to_string()]);
+
+    // The object catalog is suppressed at the keyword-only element tails, but kept
+    // at the object/column positions (REFERENCES target, FK/PK column lists).
+    let suppressed = |sql: &str| {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::cursor_is_at_identifier_suppressing_keyword_slot_for_context(
+            &analyze_inline_cursor_sql(sql),
+            !prefix.is_empty(),
+            Some(crate::db::DatabaseType::Oracle),
+        )
+    };
+    for sql in [
+        "ALTER TABLE t ADD CONSTRAINT c |",
+        "ALTER TABLE t ADD col INT |",
+        "ALTER TABLE t ADD FOREIGN KEY (a) |",
+        "ALTER TABLE t ADD PRIMARY KEY (a) |",
+    ] {
+        assert!(suppressed(sql), "object catalog not suppressed at keyword tail `{sql}`");
+    }
+    for sql in [
+        "ALTER TABLE t ADD FOREIGN KEY (a) REFERENCES |",
+        "ALTER TABLE t ADD FOREIGN KEY (|)",
+        "ALTER TABLE t ADD CONSTRAINT c FOREIGN KEY (a) REFERENCES p (|))",
+    ] {
+        assert!(!suppressed(sql), "object/column wrongly suppressed at `{sql}`");
+    }
+}
+
+/// A DML trailing clause whose grammar is single-use is offered only while it is
+/// absent, never re-offered once present: the Oracle `RETURNING … INTO <binds>`
+/// and the MySQL `INSERT … ON DUPLICATE KEY UPDATE <assignments>`. The position
+/// check distinguishes the statement-leading `INSERT INTO` from the RETURNING
+/// `INTO`, so the latter is still offered when only the former is present.
+#[test]
+fn single_use_dml_trailing_clauses_are_not_re_offered() {
+    let kw = |sql: &str, db: crate::db::DatabaseType| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(db),
+        )
+    };
+    let oracle = |sql: &str| kw(sql, crate::db::DatabaseType::Oracle);
+    let mysql = |sql: &str| kw(sql, crate::db::DatabaseType::MySQL);
+    let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
+
+    // `RETURNING … INTO` — offered before INTO (including past the statement's own
+    // `INSERT INTO`), withdrawn once the bind list is open.
+    assert!(has(&oracle("UPDATE t SET a=1 RETURNING a |"), "INTO"));
+    assert!(has(&oracle("UPDATE t SET a=1 RETURNING a, b |"), "INTO"));
+    assert!(has(&oracle("INSERT INTO t (a) VALUES (1) RETURNING a |"), "INTO"));
+    assert!(has(&oracle("DELETE FROM t WHERE x=1 RETURNING a |"), "INTO"));
+    for sql in [
+        "UPDATE t SET a=1 RETURNING a INTO :b |",
+        "INSERT INTO t (a) VALUES (1) RETURNING a INTO :b |",
+        "UPDATE t SET a=1 RETURNING a INTO |",
+    ] {
+        assert!(!has(&oracle(sql), "INTO"), "RETURNING INTO re-offered for `{sql}`: {:?}", oracle(sql));
+    }
+
+    // `ON DUPLICATE KEY UPDATE` — offered until present (incl. while typing `ON`),
+    // never re-offered once the assignment list has begun.
+    assert!(has(&mysql("INSERT INTO t (a) VALUES (1) |"), "ON DUPLICATE KEY UPDATE"));
+    assert!(has(&mysql("INSERT INTO t (a) VALUES (1) ON |"), "ON DUPLICATE KEY UPDATE"));
+    for sql in [
+        "INSERT INTO t (a) VALUES (1) ON DUPLICATE KEY UPDATE a = 1 |",
+        "INSERT INTO t (a) VALUES (1) ON DUPLICATE KEY UPDATE a = 1, b = 2 |",
+    ] {
+        assert!(
+            !has(&mysql(sql), "ON DUPLICATE KEY UPDATE"),
+            "ON DUPLICATE KEY UPDATE re-offered for `{sql}`: {:?}",
+            mysql(sql)
+        );
+    }
+}
+
+/// The Oracle `CREATE TRIGGER` timing → event → table chain is modelled as a
+/// progression, not a fixed list: the timing point (`BEFORE`/`AFTER`/`INSTEAD
+/// OF`) is offered once, then the triggering events (`INSERT`/`UPDATE`/`DELETE`),
+/// then `OR`/`ON` — never re-offering the timing keywords after a timing word.
+#[test]
+fn oracle_create_trigger_timing_event_chain_does_not_re_offer_timing() {
+    let kw = |sql: &str| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(crate::db::DatabaseType::Oracle),
+        )
+    };
+
+    // The initial timing point.
+    assert_eq!(
+        kw("CREATE OR REPLACE TRIGGER trg |"),
+        vec!["BEFORE".to_string(), "AFTER".to_string(), "INSTEAD OF".to_string(), "COMPOUND".to_string()]
+    );
+    // After a timing keyword: the events, never the timing list again.
+    for sql in [
+        "CREATE OR REPLACE TRIGGER trg BEFORE |",
+        "CREATE OR REPLACE TRIGGER trg AFTER |",
+        "CREATE OR REPLACE TRIGGER trg INSTEAD OF |",
+        "CREATE OR REPLACE TRIGGER trg BEFORE INSERT OR |",
+    ] {
+        assert_eq!(
+            kw(sql),
+            vec!["INSERT".to_string(), "UPDATE".to_string(), "DELETE".to_string()],
+            "trigger event slot wrong for `{sql}`"
+        );
+    }
+    assert_eq!(kw("CREATE OR REPLACE TRIGGER trg INSTEAD |"), vec!["OF".to_string()]);
+    assert_eq!(kw("CREATE OR REPLACE TRIGGER trg BEFORE INSERT |"), vec!["OR".to_string(), "ON".to_string()]);
+    // `UPDATE` admits an `OF <column>` list; the column slot itself stays empty.
+    assert_eq!(
+        kw("CREATE OR REPLACE TRIGGER trg BEFORE UPDATE |"),
+        vec!["OF".to_string(), "OR".to_string(), "ON".to_string()]
+    );
+    assert!(kw("CREATE OR REPLACE TRIGGER trg BEFORE UPDATE OF |").is_empty());
+    // Past `ON table`, the body options.
+    assert_eq!(
+        kw("CREATE OR REPLACE TRIGGER trg BEFORE INSERT ON t |"),
+        vec!["FOR EACH ROW".to_string(), "WHEN".to_string(), "DECLARE".to_string(), "BEGIN".to_string()]
+    );
+}
+
+/// `ALTER TABLE … RENAME |` is a table sub-operation (rename the table or one of
+/// its elements), not the standalone `RENAME TABLE/USER` statement, so it must not
+/// leak that statement's object list. The standalone `RENAME |` is unaffected.
+#[test]
+fn alter_table_rename_offers_table_elements_not_statement_objects() {
+    let kw = |sql: &str, db: crate::db::DatabaseType| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(db),
+        )
+    };
+    let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
+
+    for db in [crate::db::DatabaseType::Oracle, crate::db::DatabaseType::MySQL] {
+        for sql in ["ALTER TABLE t RENAME |", "ALTER TABLE s.t RENAME |"] {
+            let s = kw(sql, db);
+            assert!(has(&s, "TO"), "ALTER TABLE RENAME missing TO for `{sql}` ({db:?}): {s:?}");
+            assert!(
+                !has(&s, "USER") && !has(&s, "TABLE"),
+                "standalone RENAME objects leaked into ALTER TABLE RENAME `{sql}` ({db:?}): {s:?}"
+            );
+        }
+    }
+    // Oracle renames table elements; MySQL renames the table or an index/column.
+    assert!(has(&kw("ALTER TABLE t RENAME |", crate::db::DatabaseType::Oracle), "CONSTRAINT"));
+    assert!(has(&kw("ALTER TABLE t RENAME |", crate::db::DatabaseType::MySQL), "INDEX"));
+    // The standalone statement still offers its objects.
+    assert!(has(&kw("RENAME |", crate::db::DatabaseType::MySQL), "TABLE"));
+}
+
+/// The hierarchical-query clauses pair in either order (`START WITH` ⇄ `CONNECT
+/// BY`); once one is present its continuation must not re-offer the other one it
+/// already has, but a query with only one still offers the missing partner.
+#[test]
+fn hierarchical_clause_continuation_does_not_re_offer_present_clause() {
+    let kw = |sql: &str| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(crate::db::DatabaseType::Oracle),
+        )
+    };
+    let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
+
+    // Only one present → the partner is still offered.
+    assert!(has(&kw("SELECT a FROM t CONNECT BY PRIOR a = b |"), "START WITH"));
+    assert!(has(&kw("SELECT a FROM t START WITH a = 1 |"), "CONNECT BY"));
+    // Both present (either order) → neither hierarchical opener is re-offered.
+    for sql in [
+        "SELECT a FROM t START WITH a = 1 CONNECT BY PRIOR a = b |",
+        "SELECT a FROM t CONNECT BY PRIOR a = b START WITH c = 1 |",
+    ] {
+        let s = kw(sql);
+        assert!(
+            !has(&s, "START WITH") && !has(&s, "CONNECT BY"),
+            "hierarchical clause re-offered when already present `{sql}`: {s:?}"
+        );
+        // The downstream clauses are still offered.
+        assert!(has(&s, "GROUP BY") && has(&s, "ORDER BY"), "downstream clauses dropped `{sql}`: {s:?}");
+    }
+}
+
+/// The generalised single-use-clause filter: a query clause that already exists
+/// in the cursor's set-operation branch is never re-offered as a continuation —
+/// regardless of which side of the cursor it sits — while repeatable openers
+/// (`AND`/`OR`/`JOIN`/set operators) and a sibling `UNION` branch's clauses are
+/// untouched. This one chokepoint replaces the per-clause ad-hoc guards.
+#[test]
+fn single_use_clauses_present_in_branch_are_not_re_offered() {
+    let kw = |sql: &str, db: crate::db::DatabaseType| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(db),
+        )
+    };
+    let oracle = |sql: &str| kw(sql, crate::db::DatabaseType::Oracle);
+    let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
+
+    // A clause present anywhere in the branch (before OR after the cursor) is
+    // dropped from the continuation; one not present is still offered.
+    let cases: &[(&str, &str)] = &[
+        ("SELECT a FROM t WHERE x = 1 | GROUP BY a", "GROUP BY"),
+        ("SELECT a FROM t WHERE x = 1 | ORDER BY a", "ORDER BY"),
+        ("SELECT a FROM t WHERE x = 1 | FETCH FIRST 5 ROWS ONLY", "FETCH"),
+        ("SELECT a FROM t WHERE x = 1 | FOR UPDATE", "FOR UPDATE"),
+        ("SELECT a FROM t GROUP BY a | HAVING count(*) > 1", "HAVING"),
+        ("SELECT a FROM t JOIN u ON a = b | WHERE x = 1", "WHERE"),
+    ];
+    for (sql, dropped) in cases {
+        let s = oracle(sql);
+        assert!(!has(&s, dropped), "`{dropped}` re-offered though present `{sql}`: {s:?}");
+        // A clause that is NOT present is still offered (no over-suppression).
+        assert!(has(&s, "UNION"), "repeatable opener wrongly dropped `{sql}`: {s:?}");
+    }
+    // MySQL `LIMIT` is single-use too.
+    assert!(!has(&kw("SELECT a FROM t WHERE x = 1 | LIMIT 5", crate::db::DatabaseType::MySQL), "LIMIT"));
+
+    // Set-operation branch scoping: a clause in a sibling branch does NOT suppress
+    // it in the current one.
+    let s = oracle("SELECT a FROM t GROUP BY a UNION SELECT b FROM u WHERE x = 1 |");
+    assert!(has(&s, "GROUP BY"), "fresh UNION branch wrongly suppressed GROUP BY: {s:?}");
+
+    // No clause present → the full opener set is offered (nothing over-dropped).
+    let s = oracle("SELECT a FROM t WHERE x = 1 |");
+    assert!(
+        has(&s, "GROUP BY") && has(&s, "ORDER BY") && has(&s, "FOR UPDATE") && has(&s, "FETCH"),
+        "clauses dropped where none present: {s:?}"
+    );
+}
+
+/// The `CREATE TABLE` column-name → data-type slot is confined to the table
+/// definition's own paren depth. An identifier nested one level deeper is part of
+/// a `REFERENCES p (col …)` list, a `CHECK (…)` predicate, or a type's precision
+/// `NUMBER(…)` — none of which is a new column awaiting a type, so no data-type
+/// keywords leak there.
+#[test]
+fn create_table_data_type_slot_is_confined_to_definition_depth() {
+    let is_type_slot = |sql: &str| -> bool {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::data_type_position_for_context(
+            &analyze_inline_cursor_sql(sql),
+            !prefix.is_empty(),
+        )
+        .is_some()
+    };
+
+    // Real column-name → type slots, at the definition's own depth.
+    for sql in [
+        "CREATE TABLE t (a |)",
+        "CREATE TABLE t (a INT, b |)",
+        "CREATE TABLE t (a NUMBER(10), b |)",
+    ] {
+        assert!(is_type_slot(sql), "real data-type slot not recognized `{sql}`");
+    }
+
+    // Nested positions that merely look like a column name: not type slots.
+    for sql in [
+        "CREATE TABLE t (a INT REFERENCES p (b |))",
+        "CREATE TABLE t (a INT, FOREIGN KEY (a) REFERENCES p (b |))",
+        "CREATE TABLE t (a INT CHECK (x |))",
+        "CREATE TABLE t (a NUMBER(|))",
+    ] {
+        assert!(!is_type_slot(sql), "data types leaked into a nested construct `{sql}`");
+    }
+}
+
+/// A complete select item that is a closed function call admits the analytic
+/// continuation `OVER`, even at an empty prefix (where the flat base catalog
+/// supplies it only for a typed prefix). The `FROM` clause opener is still
+/// offered alongside it. A grouping paren, a scalar subquery, and a plain column
+/// are not calls, so `OVER` stays out.
+#[test]
+fn select_item_closed_call_offers_over_at_empty_prefix() {
+    let kw = |sql: &str| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        let ctx = analyze_inline_cursor_sql(sql);
+        let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &ctx);
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["T".to_string()];
+        data.set_columns_for_table("T", vec!["X".to_string(), "A".to_string(), "B".to_string()]);
+        data.rebuild_indices();
+        let ekc = SqlEditorWidget::expression_keyword_context(
+            &ctx,
+            &data,
+            &column_tables,
+            !prefix.is_empty(),
+            Some(crate::db::DatabaseType::Oracle),
+        );
+        SqlEditorWidget::collect_expected_keyword_suggestions_with_expression_context(
+            &prefix,
+            &ctx,
+            Some(crate::db::DatabaseType::Oracle),
+            Some(ekc),
+        )
+    };
+    let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
+
+    // After a closed call: both FROM and OVER, regardless of nesting in the list.
+    for sql in [
+        "SELECT sum(x) | FROM t",
+        "SELECT count(*) | FROM t",
+        "SELECT a, sum(x) | FROM t",
+    ] {
+        let s = kw(sql);
+        assert!(has(&s, "FROM") && has(&s, "OVER"), "FROM+OVER expected `{sql}`: {s:?}");
+    }
+
+    // Not a call: a grouping paren, a scalar subquery, and a plain column offer
+    // FROM but never OVER.
+    for sql in [
+        "SELECT (a + b) | FROM t",
+        "SELECT (SELECT 1 FROM dual) | FROM t",
+        "SELECT x | FROM t",
+    ] {
+        let s = kw(sql);
+        assert!(has(&s, "FROM"), "FROM missing `{sql}`: {s:?}");
+        assert!(!has(&s, "OVER"), "OVER leaked at a non-call position `{sql}`: {s:?}");
+    }
+}
+
+
