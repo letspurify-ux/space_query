@@ -35638,6 +35638,14 @@ fn expression_construct_tail_keywords_are_complete_and_noise_free() {
 
 
 
+
+
+
+
+
+
+
+
 /// A `REFERENCES` clause inside a `CREATE TABLE` definition is parsed precisely:
 /// the referenced-name slot suppresses the constraint catalog entirely, and a
 /// completed reference offers the `ON` referential-action continuation (plus the
@@ -36092,6 +36100,47 @@ fn single_use_clauses_present_in_branch_are_not_re_offered() {
         has(&s, "GROUP BY") && has(&s, "ORDER BY") && has(&s, "FOR UPDATE") && has(&s, "FETCH"),
         "clauses dropped where none present: {s:?}"
     );
+}
+
+/// The generalised statement-head-verb guard: a bare `CREATE`/`DROP`/`ALTER`
+/// opens its object-type list only when it heads the current statement (start, or
+/// after a `;`) — never as a trailing sub-clause of an enclosing statement
+/// (`ALTER TABLE t DROP |`), which the bare `[last]`/`[.., last]` slice patterns
+/// got wrong in opposite directions.
+#[test]
+fn statement_head_verb_opens_object_list_only_at_statement_head() {
+    let kw = |sql: &str, db: crate::db::DatabaseType| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(db),
+        )
+    };
+    let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
+
+    for db in [crate::db::DatabaseType::Oracle, crate::db::DatabaseType::MySQL] {
+        // Statement head — at the start AND after a `;` (multi-statement) — opens
+        // the object-type catalog.
+        for sql in ["DROP |", "CREATE |", "ALTER |", "SELECT 1 FROM dual; DROP |"] {
+            assert!(
+                has(&kw(sql, db), "TABLE"),
+                "statement-head verb did not open the object list `{sql}` ({db:?}): {:?}",
+                kw(sql, db)
+            );
+        }
+        // A trailing sub-clause verb does NOT leak the object catalog (the table's
+        // droppable elements come instead).
+        for sql in ["ALTER TABLE t DROP |", "ALTER TABLE t ADD c INT, DROP |"] {
+            let s = kw(sql, db);
+            assert!(
+                has(&s, "COLUMN") && !has(&s, "VIEW") && !has(&s, "PROCEDURE"),
+                "trailing DROP leaked the DROP-object catalog `{sql}` ({db:?}): {s:?}"
+            );
+        }
+    }
 }
 
 /// The `CREATE TABLE` column-name → data-type slot is confined to the table

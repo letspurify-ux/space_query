@@ -15688,6 +15688,34 @@ impl SqlEditorWidget {
         })
     }
 
+    /// True when the cursor sits immediately after `verb` and `verb` heads the
+    /// current statement — the object-type slot of a fresh `verb <object>`
+    /// statement, not a trailing `verb` sub-clause of an enclosing statement
+    /// (`ALTER TABLE t DROP |`). The current statement starts after the last
+    /// top-level `;`, so this matches both `DROP |` and `…; DROP |` while rejecting
+    /// the buried sub-clause — which neither the over-strict `[last]` nor the
+    /// over-greedy `[.., last]` slice pattern can do (the word list drops the `;`).
+    fn cursor_at_statement_head_verb(tokens: &[SqlToken], end: usize, verb: &str) -> bool {
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        let Some(SqlToken::Word(last)) = toks.last() else {
+            return false;
+        };
+        if !last.eq_ignore_ascii_case(verb) {
+            return false;
+        }
+        // Walking back from the verb to the statement boundary, no other word may
+        // intervene; a `;` (or the start of input) means the verb is the head.
+        toks[..toks.len() - 1]
+            .iter()
+            .rev()
+            .find_map(|token| match token {
+                SqlToken::Symbol(sym) if sym == ";" => Some(true),
+                SqlToken::Word(_) => Some(false),
+                _ => None,
+            })
+            .unwrap_or(true)
+    }
+
     fn expected_statement_structural_keyword_candidates(
         tokens: &[SqlToken],
         end: usize,
@@ -15829,12 +15857,21 @@ impl SqlEditorWidget {
             return Some(candidates);
         }
 
+        // A bare statement-head verb (`CREATE`/`DROP`/`ALTER |`, also after a `;`)
+        // opens the object-type list. Gated on the verb actually heading the
+        // current statement so a trailing sub-clause verb (`ALTER TABLE t DROP |`)
+        // does not leak the `DROP <object>` catalog.
+        if Self::cursor_at_statement_head_verb(tokens, end, "CREATE") {
+            return Some(CREATE_OBJECT_TYPE_KEYWORDS);
+        }
+        if Self::cursor_at_statement_head_verb(tokens, end, "DROP") {
+            return Some(OBJECT_TYPE_KEYWORDS);
+        }
+        if Self::cursor_at_statement_head_verb(tokens, end, "ALTER") {
+            return Some(ALTER_OBJECT_TYPE_KEYWORDS);
+        }
+
         match words.as_slice() {
-            [.., last] if *last == "CREATE" => Some(CREATE_OBJECT_TYPE_KEYWORDS),
-            // Statement-initial `DROP |` only — a trailing `DROP` inside another
-            // statement (`ALTER TABLE t DROP`) is a sub-clause, not an object head.
-            [last] if *last == "DROP" => Some(OBJECT_TYPE_KEYWORDS),
-            [.., last] if *last == "ALTER" => Some(ALTER_OBJECT_TYPE_KEYWORDS),
             [.., prev, last]
                 if *prev == "CREATE" && matches!(last.as_str(), "UNIQUE" | "BITMAP") =>
             {
@@ -18576,10 +18613,20 @@ impl SqlEditorWidget {
             };
         }
 
+        // Bare statement-head verbs open the object-type list only when the verb
+        // heads the current statement (`CREATE/ALTER/DROP |`, also after a `;`),
+        // never as a trailing sub-clause (`ALTER TABLE t DROP |`).
+        if Self::cursor_at_statement_head_verb(tokens, end, "CREATE") {
+            return Some(MYSQL_CREATE_OBJECT_TYPE_KEYWORDS);
+        }
+        if Self::cursor_at_statement_head_verb(tokens, end, "ALTER") {
+            return Some(MYSQL_ALTER_OBJECT_TYPE_KEYWORDS);
+        }
+        if Self::cursor_at_statement_head_verb(tokens, end, "DROP") {
+            return Some(MYSQL_DROP_OBJECT_TYPE_KEYWORDS);
+        }
+
         match words {
-            [.., last] if *last == "CREATE" => Some(MYSQL_CREATE_OBJECT_TYPE_KEYWORDS),
-            [.., last] if *last == "ALTER" => Some(MYSQL_ALTER_OBJECT_TYPE_KEYWORDS),
-            [.., last] if *last == "DROP" => Some(MYSQL_DROP_OBJECT_TYPE_KEYWORDS),
             [.., a, b]
                 if *a == "CREATE" && MYSQL_CREATE_IF_NOT_EXISTS_OBJECT_TYPES.contains(&b.as_str()) =>
             {
