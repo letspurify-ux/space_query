@@ -13938,7 +13938,15 @@ impl SqlEditorWidget {
                 return Some(&["ROLLUP", "CUBE", "GROUPING SETS"]);
             }
         }
-        if !mysql && has("RETURNING") && !Self::cursor_is_at_json_returning_type(tokens, end) {
+        if !mysql
+            && has("RETURNING")
+            && Self::unclosed_paren_count(tokens, end) == 0
+            && !Self::cursor_is_at_json_returning_type(tokens, end)
+        {
+            // The DML `RETURNING … INTO` clause lives at the statement top level; a
+            // `RETURNING <type>` inside an open function-call paren (`JSON_VALUE(…
+            // RETURNING NUMBER |)`) is a different grammar, so the `unclosed paren`
+            // guard keeps `INTO` from leaking into it.
             // Offer `INTO` only while the RETURNING clause still lacks one. A later
             // `INTO` (after the RETURNING keyword, not the statement-leading
             // `INSERT INTO`) means the bind list has begun — never re-offer it.
@@ -14138,6 +14146,16 @@ impl SqlEditorWidget {
         if Self::unclosed_paren_count(tokens, end) != 0 {
             return &[];
         }
+
+        // A completed table-clause construct whose result is the table source
+        // (`… PIVOT (…) |`, `… MATCH_RECOGNIZE (…) |`) sits where a FROM relation
+        // would: the same downstream clauses follow. The open form is already
+        // excluded by the unclosed-paren guard above, and the `FromClause`
+        // completeness check below confirms the construct's `)` closed it.
+        let phase = match phase {
+            SqlPhase::PivotClause | SqlPhase::MatchRecognizeClause => SqlPhase::FromClause,
+            other => other,
+        };
 
         // The valid downstream clauses depend on the statement kind. `tokens` is
         // the *current query* (a subquery's own tokens start at its `SELECT`), so
@@ -14599,8 +14617,50 @@ impl SqlEditorWidget {
         }
     }
 
+    /// A table-clause construct whose *result is the table source* — `… PIVOT
+    /// (…)`, `… UNPIVOT (…)`, `… MATCH_RECOGNIZE (…)` — is a complete FROM relation
+    /// once its body paren closes (the relation no longer ends in an identifier).
+    /// Detected by matching the trailing `)` to its `(` and checking the
+    /// introducing keyword, so an `ON (…)`/`IN (…)`/grouping paren is not mistaken.
+    fn cursor_follows_complete_table_clause_construct(toks: &[&SqlToken]) -> bool {
+        if !matches!(toks.last(), Some(SqlToken::Symbol(sym)) if *sym == ")") {
+            return false;
+        }
+        let mut depth = 0i32;
+        let mut open_idx = None;
+        for (idx, token) in toks.iter().enumerate().rev() {
+            match token {
+                SqlToken::Symbol(sym) if sym == ")" => depth += 1,
+                SqlToken::Symbol(sym) if sym == "(" => {
+                    depth -= 1;
+                    if depth == 0 {
+                        open_idx = Some(idx);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        matches!(
+            open_idx
+                .and_then(|idx| idx.checked_sub(1))
+                .and_then(|idx| toks.get(idx)),
+            Some(SqlToken::Word(word))
+                if matches!(
+                    word.to_ascii_uppercase().as_str(),
+                    "PIVOT" | "UNPIVOT" | "MATCH_RECOGNIZE"
+                )
+        )
+    }
+
     fn cursor_is_after_complete_from_relation(tokens: &[SqlToken], end: usize) -> bool {
         let toks = Self::meaningful_tokens_before(tokens, end);
+        // A closed table-clause construct (`… PIVOT (…) |`, `… MATCH_RECOGNIZE
+        // (…) |`) completes the relation even though it ends in `)` rather than an
+        // identifier — so the query continuation (`WHERE`/`JOIN`/…) follows it.
+        if Self::cursor_follows_complete_table_clause_construct(&toks) {
+            return true;
+        }
         // The reference (or its implicit alias) must be complete: the last token
         // is a plain identifier word, never a separator or a clause keyword.
         let Some(SqlToken::Word(last)) = toks.last() else {

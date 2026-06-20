@@ -36247,6 +36247,8 @@ fn select_item_closed_call_offers_over_at_empty_prefix() {
 
 
 
+
+
 /// `FROM` is offered only after a *complete* select item. An expression-internal
 /// keyword that expects a fresh operand (`SELECT CASE … WHEN |`, `… ELSE |`) or a
 /// trailing operator leaves the item unfinished, so `FROM` must not appear — while
@@ -36329,4 +36331,142 @@ fn table_clause_constructs_stop_offering_keywords_once_closed() {
         kw("SELECT * FROM t UNPIVOT |"),
         vec!["INCLUDE".to_string(), "EXCLUDE".to_string()]
     );
+}
+
+/// Structural invariant for the construct-completeness class: a parenthesised
+/// table-clause construct, once its body has closed, must NOT re-offer any of its
+/// own keywords at the surrounding level — and while open it must still offer
+/// them. This locks the whole class (the `table_clause_construct_is_open` gate),
+/// so any future construct that forgets the closed-check fails here rather than
+/// shipping the `PIVOT (…) | → IN` style noise.
+#[test]
+fn parenthesised_table_clause_constructs_do_not_re_offer_keywords_once_closed() {
+    let kw = |sql: &str| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(crate::db::DatabaseType::Oracle),
+        )
+    };
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+
+    // (closed-form SQL, the construct's own keywords, an open-form SQL, the keyword
+    // that open form must still offer).
+    let cases: &[(&str, &[&str], &str, &str)] = &[
+        (
+            "SELECT * FROM t PIVOT (sum(x) FOR y IN (1,2)) |",
+            &["FOR", "IN"],
+            "SELECT * FROM t PIVOT (sum(x) |",
+            "FOR",
+        ),
+        (
+            "SELECT * FROM t UNPIVOT (x FOR y IN (a,b)) |",
+            &["INCLUDE", "EXCLUDE", "NULLS", "FOR", "IN"],
+            "SELECT * FROM t UNPIVOT |",
+            "INCLUDE",
+        ),
+        (
+            "SELECT * FROM t MATCH_RECOGNIZE (PARTITION BY a ORDER BY b \
+             PATTERN (x) DEFINE x AS y) |",
+            &["PATTERN", "DEFINE", "MEASURES", "PARTITION BY"],
+            "SELECT * FROM t MATCH_RECOGNIZE (PATTERN (x) |",
+            "DEFINE",
+        ),
+        (
+            "SELECT * FROM t MODEL DIMENSION BY (a) MEASURES (b) RULES (c=1) |",
+            &["PARTITION BY", "DIMENSION BY", "MEASURES", "RULES"],
+            "SELECT * FROM t MODEL DIMENSION BY (a) |",
+            "MEASURES",
+        ),
+    ];
+
+    for (closed, own_keywords, open, must_offer) in cases {
+        let closed_out = kw(closed);
+        for keyword in *own_keywords {
+            assert!(
+                !has(&closed_out, keyword),
+                "closed construct re-offered `{keyword}` for `{closed}`: {closed_out:?}"
+            );
+        }
+        assert!(
+            has(&kw(open), must_offer),
+            "open construct dropped `{must_offer}` for `{open}`: {:?}",
+            kw(open)
+        );
+    }
+}
+
+/// A completed table-clause construct whose result is the table source (`… PIVOT
+/// (…)`, `… UNPIVOT (…)`, `… MATCH_RECOGNIZE (…)`) sits where a FROM relation
+/// would, so the downstream query clauses (`WHERE`/`JOIN`/`GROUP BY`/…) follow it —
+/// while the open form still only offers the construct's own keywords, and an
+/// already-present clause is not re-offered (the single-use filter composes here).
+#[test]
+fn completed_table_clause_construct_offers_query_continuation() {
+    let kw = |sql: &str| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(crate::db::DatabaseType::Oracle),
+        )
+    };
+    let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
+
+    for sql in [
+        "SELECT * FROM t PIVOT (sum(x) FOR y IN (1,2)) |",
+        "SELECT * FROM t UNPIVOT (x FOR y IN (a,b)) |",
+        "SELECT * FROM t MATCH_RECOGNIZE (PATTERN (x) DEFINE x AS y) |",
+    ] {
+        let s = kw(sql);
+        assert!(
+            has(&s, "WHERE") && has(&s, "GROUP BY") && has(&s, "ORDER BY") && has(&s, "JOIN"),
+            "completed construct did not offer the query continuation `{sql}`: {s:?}"
+        );
+        // Still no re-offer of the construct's own keywords.
+        assert!(!has(&s, "FOR") && !has(&s, "IN"), "construct keyword re-offered `{sql}`: {s:?}");
+    }
+
+    // The open form is unaffected: only the construct's own keywords, no WHERE.
+    let open = kw("SELECT * FROM t PIVOT (sum(x) |");
+    assert!(has(&open, "FOR") && !has(&open, "WHERE"), "open construct leaked continuation: {open:?}");
+
+    // The single-use filter still applies after the construct: a present clause is
+    // not re-offered, but the others are.
+    let s = kw("SELECT * FROM t PIVOT (p FOR y IN (1,2)) pv WHERE x = 1 |");
+    assert!(!has(&s, "WHERE") && has(&s, "GROUP BY"), "single-use filter not composed after construct: {s:?}");
+}
+
+/// The DML `RETURNING … INTO` clause is statement-level; a `RETURNING <type>`
+/// inside an open function-call paren (`JSON_VALUE(… RETURNING NUMBER |)`) is a
+/// different grammar and must not have `INTO` leaked into it, while a real DML
+/// RETURNING at the top level still offers it.
+#[test]
+fn returning_into_does_not_leak_into_a_function_call_returning() {
+    let kw = |sql: &str| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix, &analyze_inline_cursor_sql(sql), Some(crate::db::DatabaseType::Oracle))
+    };
+    let has_into = |sql: &str| kw(sql).iter().any(|x| x == "INTO");
+    for sql in [
+        "SELECT JSON_VALUE(j, '$.a' RETURNING NUMBER |) FROM t",
+        "SELECT JSON_QUERY(j, '$.a' RETURNING VARCHAR2(100) |) FROM t",
+    ] {
+        assert!(!has_into(sql), "INTO leaked into a function RETURNING `{sql}`: {:?}", kw(sql));
+    }
+    for sql in [
+        "UPDATE t SET a=1 RETURNING a |",
+        "INSERT INTO t (a) VALUES (1) RETURNING a |",
+        "DELETE FROM t WHERE x=1 RETURNING a |",
+    ] {
+        assert!(has_into(sql), "DML RETURNING INTO dropped `{sql}`: {:?}", kw(sql));
+    }
 }
