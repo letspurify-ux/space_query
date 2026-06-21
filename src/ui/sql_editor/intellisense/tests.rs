@@ -36498,6 +36498,19 @@ fn query_level_continuations_do_not_leak_into_non_query_parens() {
         ("INTO", "SELECT json_query(j, '$.a' RETURNING VARCHAR2(10) |) FROM t"),
         // a grouping paren is not a query block either
         ("SELECT", "SELECT (a + b UNION |) FROM t"),
+        // every other query/statement-level clause opener is likewise scoped out of
+        // a function-call argument list (these are already guarded by the
+        // continuation/handler paren checks; the matrix locks them against drift).
+        ("UPDATE", "SELECT f(x FOR |) FROM t"),
+        ("SHARE", "SELECT f(x FOR |) FROM t"),
+        ("BY", "SELECT f(a GROUP |) FROM t"),
+        ("BY", "SELECT f(a ORDER |) FROM t"),
+        ("FIRST", "SELECT f(a FETCH |) FROM t"),
+        ("NEXT", "SELECT f(a FETCH |) FROM t"),
+        ("DELETE", "SELECT f(a ON |) FROM t"),
+        ("UPDATE", "SELECT f(a ON |) FROM t"),
+        ("WHERE", "SELECT f(a GROUP BY b |) FROM t"),
+        ("ORDER BY", "SELECT f(a GROUP BY b |) FROM t"),
     ];
     for (keyword, sql) in leak_cases {
         assert!(
@@ -36516,4 +36529,51 @@ fn query_level_continuations_do_not_leak_into_non_query_parens() {
     // And the top-level forms are unaffected.
     assert!(has(&kw("SELECT a FROM t UNION |"), "SELECT"));
     assert!(has(&kw("UPDATE t SET a = 1 RETURNING a |"), "INTO"));
+}
+
+#[test]
+fn zzz_probe_gaps() {
+    let kw = |sql: &str, db: crate::db::DatabaseType| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix, &analyze_inline_cursor_sql(sql), Some(db))
+    };
+    use crate::db::DatabaseType::{Oracle, MySQL};
+    for sql in [
+        // type-gated IS predicates
+        "SELECT a FROM t WHERE x IS NOT |",
+        "SELECT a FROM t WHERE coll IS |",
+        // MEMBER / collection predicates
+        "SELECT a FROM t WHERE x MEMBER |",
+        "SELECT a FROM t WHERE x NOT MEMBER |",
+        "SELECT a FROM t WHERE x IS A |",
+        // %TYPE %ROWTYPE
+        "DECLARE v emp.sal%| BEGIN NULL; END;",
+        "DECLARE v emp%| BEGIN NULL; END;",
+        // sequence pseudo-columns
+        "SELECT seq.| FROM dual",
+        "INSERT INTO t VALUES (seq.|)",
+        // named args
+        "BEGIN proc(p => |); END;",
+        // LIKE ESCAPE
+        "SELECT a FROM t WHERE x LIKE '%a%' |",
+        // BETWEEN SYMMETRIC etc
+        "SELECT a FROM t WHERE x NOT BETWEEN 1 |",
+        // IS JSON options
+        "SELECT a FROM t WHERE x IS JSON |",
+        // interval
+        "SELECT a FROM t WHERE x IS JSON (|)",
+        // datetime AT
+        "SELECT a FROM t WHERE x AT |",
+    ] {
+        eprintln!("O {:?} => {:?}", sql, kw(sql, Oracle));
+    }
+    for sql in [
+        "SELECT a FROM t WHERE x SOUNDS |",
+        "SELECT a FROM t WHERE MATCH(a) AGAINST ('x' |)",
+    ] {
+        eprintln!("M {:?} => {:?}", sql, kw(sql, MySQL));
+    }
 }
