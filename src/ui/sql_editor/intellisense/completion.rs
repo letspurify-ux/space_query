@@ -19906,11 +19906,51 @@ impl SqlEditorWidget {
     /// so the slot suppresses the identifier base while these keyword hints come
     /// from the same helper — the keyword emission and column suppression cannot
     /// drift apart.
+    /// Whether the cursor's innermost still-open paren is a *query block* — it
+    /// either does not exist (the cursor is in the main query) or its first
+    /// meaningful token is `SELECT`/`WITH` (a subquery), as opposed to a
+    /// function-call argument list or a grouping/`IN`-list paren. Used to keep
+    /// query-level continuations (set operators) from leaking into expression
+    /// parens, while still firing inside a genuine subquery.
+    fn cursor_enclosing_paren_is_query_block(tokens: &[SqlToken], end: usize) -> bool {
+        let visible = tokens.get(..end).unwrap_or(tokens);
+        let mut open_stack: Vec<usize> = Vec::new();
+        for (idx, token) in visible.iter().enumerate() {
+            match token {
+                SqlToken::Symbol(sym) if sym == "(" => open_stack.push(idx),
+                SqlToken::Symbol(sym) if sym == ")" => {
+                    open_stack.pop();
+                }
+                _ => {}
+            }
+        }
+        let Some(open_idx) = open_stack.last().copied() else {
+            return true; // main query level
+        };
+        matches!(
+            visible
+                .get(open_idx + 1..)
+                .unwrap_or(&[])
+                .iter()
+                .find(|token| !matches!(token, SqlToken::Comment(_))),
+            Some(SqlToken::Word(word))
+                if word.eq_ignore_ascii_case("SELECT") || word.eq_ignore_ascii_case("WITH")
+        )
+    }
+
     fn expected_set_operator_keyword_candidates(
         tokens: &[SqlToken],
         end: usize,
     ) -> Option<&'static [&'static str]> {
         const SET_OPERATORS: &[&str] = &["UNION", "INTERSECT", "EXCEPT", "MINUS"];
+        // A set operator joins query blocks, so it is grammatical only at a query's
+        // own top level — the main statement or a subquery — never inside a
+        // function-call argument list or a grouping paren (`decode(… UNION |)`,
+        // `(a + b UNION |)`). The cursor's innermost enclosing paren must therefore
+        // either not exist (main query) or directly contain a query.
+        if !Self::cursor_enclosing_paren_is_query_block(tokens, end) {
+            return None;
+        }
         let is_set_op =
             |word: &str| SET_OPERATORS.iter().any(|op| word.eq_ignore_ascii_case(op));
         let is_multiset_set_op = |toks: &[&SqlToken], set_op_idx: usize| {

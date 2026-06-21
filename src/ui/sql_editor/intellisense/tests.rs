@@ -36470,3 +36470,50 @@ fn returning_into_does_not_leak_into_a_function_call_returning() {
         assert!(has_into(sql), "DML RETURNING INTO dropped `{sql}`: {:?}", kw(sql));
     }
 }
+
+/// Root-cause invariant for the "scope-unaware handler" bug class: a query-level
+/// clause continuation must NOT leak into a function-call / grouping paren (where
+/// the keyword is not at any query's top level), yet must still fire inside a
+/// genuine subquery paren. Locks the whole class — any handler that gates on a
+/// flat `has(KEYWORD)` without scoping fails here rather than shipping the
+/// `decode(… UNION |) → SELECT` / `JSON_VALUE(… RETURNING NUMBER |) → INTO` noise.
+#[test]
+fn query_level_continuations_do_not_leak_into_non_query_parens() {
+    let kw = |sql: &str| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix, &analyze_inline_cursor_sql(sql), Some(crate::db::DatabaseType::Oracle))
+    };
+    let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
+
+    // (keyword that must NOT leak, a function-call/grouping-paren SQL that buries
+    // the trigger keyword).
+    let leak_cases: &[(&str, &str)] = &[
+        ("SELECT", "SELECT decode(x, 1, 2 UNION |) FROM t"),
+        ("SELECT", "SELECT decode(x, 1, 2 MINUS |) FROM t"),
+        ("SELECT", "SELECT greatest(a, b INTERSECT |) FROM t"),
+        ("INTO", "SELECT json_value(j, '$.a' RETURNING NUMBER |) FROM t"),
+        ("INTO", "SELECT json_query(j, '$.a' RETURNING VARCHAR2(10) |) FROM t"),
+        // a grouping paren is not a query block either
+        ("SELECT", "SELECT (a + b UNION |) FROM t"),
+    ];
+    for (keyword, sql) in leak_cases {
+        assert!(
+            !has(&kw(sql), keyword),
+            "query-level `{keyword}` leaked into a non-query paren `{sql}`: {:?}",
+            kw(sql)
+        );
+    }
+
+    // The same keywords inside a real subquery paren still drive the continuation.
+    assert!(has(&kw("SELECT * FROM (SELECT a FROM u UNION |) v"), "SELECT"));
+    assert!(has(&kw("SELECT * FROM t WHERE x IN (SELECT a FROM u UNION |)"), "SELECT"));
+    assert!(has(&kw("SELECT f((SELECT a FROM t UNION |)) FROM dual"), "SELECT"));
+    assert!(has(&kw("SELECT * FROM (SELECT a FROM u GROUP BY a |) v"), "HAVING"));
+    assert!(has(&kw("SELECT * FROM t WHERE x IN (SELECT a FROM u WHERE y = 1 |)"), "GROUP BY"));
+    // And the top-level forms are unaffected.
+    assert!(has(&kw("SELECT a FROM t UNION |"), "SELECT"));
+    assert!(has(&kw("UPDATE t SET a = 1 RETURNING a |"), "INTO"));
+}
