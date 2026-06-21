@@ -36733,3 +36733,143 @@ fn identity_chain_and_dml_error_logging_offer_the_right_tail() {
     assert!(has(&kw("INSERT INTO t VALUES (1) |"), "RETURNING"));
     assert!(has(&kw("DELETE FROM t WHERE x = 1 |"), "RETURNING"));
 }
+
+/// `SET TRANSACTION` is dialect-scoped: MySQL offers only `ISOLATION`/`READ` (the
+/// Oracle `USE ROLLBACK SEGMENT` / `NAME` are not valid there) and its full set of
+/// four isolation levels, while Oracle keeps `USE`/`NAME` and its two levels.
+#[test]
+fn set_transaction_options_are_dialect_scoped() {
+    let kw = |sql: &str, db: crate::db::DatabaseType| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix, &analyze_inline_cursor_sql(sql), Some(db))
+    };
+    let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
+    use crate::db::DatabaseType::{Oracle, MySQL};
+
+    // MySQL: no Oracle-only USE/NAME; all four isolation levels.
+    let m = kw("SET TRANSACTION |", MySQL);
+    assert!(has(&m, "ISOLATION") && has(&m, "READ"), "MySQL SET TRANSACTION missing option: {m:?}");
+    assert!(!has(&m, "USE") && !has(&m, "NAME"), "Oracle-only SET TRANSACTION option leaked into MySQL: {m:?}");
+    let ml = kw("SET TRANSACTION ISOLATION LEVEL |", MySQL);
+    for level in ["SERIALIZABLE", "READ COMMITTED", "REPEATABLE READ", "READ UNCOMMITTED"] {
+        assert!(has(&ml, level), "MySQL isolation level `{level}` missing: {ml:?}");
+    }
+
+    // Oracle: keeps USE/NAME and its two levels (no REPEATABLE READ).
+    let o = kw("SET TRANSACTION |", Oracle);
+    assert!(has(&o, "USE") && has(&o, "NAME"));
+    let ol = kw("SET TRANSACTION ISOLATION LEVEL |", Oracle);
+    assert!(has(&ol, "SERIALIZABLE") && has(&ol, "READ COMMITTED") && !has(&ol, "REPEATABLE READ"));
+}
+
+/// The row-locking `FOR UPDATE`/`FOR SHARE` tail is dialect-scoped: Oracle's
+/// `WAIT <n>` wait-mode is not valid in MySQL (which has only `NOWAIT`/`SKIP
+/// LOCKED`), so it must not leak there. The shared `OF`/`NOWAIT`/`SKIP` stay.
+#[test]
+fn for_update_wait_mode_is_oracle_only() {
+    let kw = |sql: &str, db: crate::db::DatabaseType| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix, &analyze_inline_cursor_sql(sql), Some(db))
+    };
+    let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
+    use crate::db::DatabaseType::{Oracle, MySQL};
+
+    for sql in ["SELECT a FROM t FOR UPDATE |", "SELECT a FROM t FOR SHARE |"] {
+        let m = kw(sql, MySQL);
+        assert!(has(&m, "NOWAIT") && has(&m, "SKIP") && has(&m, "OF"), "MySQL lock option missing `{sql}`: {m:?}");
+        assert!(!has(&m, "WAIT"), "Oracle-only WAIT leaked into MySQL `{sql}`: {m:?}");
+
+        let o = kw(sql, Oracle);
+        assert!(has(&o, "WAIT") && has(&o, "NOWAIT") && has(&o, "SKIP"), "Oracle lock option missing `{sql}`: {o:?}");
+    }
+}
+
+/// MySQL `CREATE INDEX` offers `ON <table>` and `USING <type>` each at most once —
+/// neither is re-offered after it is present (`CREATE INDEX i ON t (a) |` → `USING`
+/// only, not `ON` again), and a fully-specified index offers nothing more.
+#[test]
+fn mysql_create_index_on_and_using_are_single_use() {
+    let kw = |sql: &str| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix, &analyze_inline_cursor_sql(sql), Some(crate::db::DatabaseType::MySQL))
+    };
+    assert_eq!(kw("CREATE INDEX i |"), vec!["ON".to_string(), "USING".to_string()]);
+    assert_eq!(kw("CREATE INDEX i ON t (a) |"), vec!["USING".to_string()]);
+    assert_eq!(kw("CREATE INDEX i USING BTREE |"), vec!["ON".to_string()]);
+    assert_eq!(kw("CREATE INDEX i USING |"), vec!["BTREE".to_string(), "HASH".to_string()]);
+    assert!(kw("CREATE INDEX i ON t (a) USING BTREE |").is_empty());
+    assert!(kw("CREATE INDEX i USING BTREE ON t (a) |").is_empty());
+}
+
+/// The `GRANT … WITH {GRANT|ADMIN} OPTION` clause is single-use and progresses
+/// `WITH`→`GRANT OPTION`→(typed `WITH GRANT`)→`OPTION`→complete. Once complete it
+/// offers nothing — and must not let the privilege `SELECT` in `GRANT SELECT …`
+/// fall through to leak the select-list `FROM`.
+#[test]
+fn grant_with_option_clause_is_single_use_and_does_not_leak_from() {
+    let kw = |sql: &str, db: crate::db::DatabaseType| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix, &analyze_inline_cursor_sql(sql), Some(db))
+    };
+    use crate::db::DatabaseType::{Oracle, MySQL};
+
+    assert_eq!(kw("GRANT SELECT ON t TO u WITH GRANT |", Oracle), vec!["OPTION".to_string()]);
+    for sql in [
+        "GRANT SELECT ON t TO u WITH GRANT OPTION |",
+        "GRANT CREATE SESSION TO u WITH ADMIN OPTION |",
+    ] {
+        assert!(kw(sql, Oracle).is_empty(), "completed GRANT re-offered `{sql}`: {:?}", kw(sql, Oracle));
+    }
+    assert!(kw("GRANT SELECT ON t.* TO u WITH GRANT OPTION |", MySQL).is_empty());
+    // The earlier-stage outputs are unchanged.
+    assert_eq!(kw("GRANT SELECT ON t TO u |", Oracle), vec!["WITH GRANT OPTION".to_string()]);
+    assert_eq!(kw("GRANT SELECT ON t TO u WITH |", Oracle), vec!["GRANT OPTION".to_string()]);
+}
+
+#[test]
+fn zzz_probe_gaps() {
+    let kw = |sql: &str, db: crate::db::DatabaseType| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix, &analyze_inline_cursor_sql(sql), Some(db))
+    };
+    use crate::db::DatabaseType::{Oracle, MySQL};
+    let has = |v: &Vec<String>, s: &str| v.iter().any(|x| x == s);
+    for sql in [
+        "REVOKE SELECT ON t FROM u |",
+        "REVOKE SELECT, UPDATE ON t FROM u |",
+        "AUDIT SELECT ON t |",
+        "AUDIT SELECT, UPDATE |",
+        "GRANT SELECT, INSERT ON t TO u |",
+        "GRANT SELECT ON t TO u |",
+        "REVOKE SELECT ON t FROM u |",
+        "NOAUDIT SELECT |",
+        "GRANT SELECT ON t TO role1 |",
+        "COMMENT ON TABLE t IS 'select stuff' |",
+        "CREATE USER u DEFAULT TABLESPACE ts |",
+    ] {
+        let s = kw(sql, Oracle);
+        eprintln!("O {:?} FROM={} sample={:?}", sql, has(&s,"FROM"), s.iter().take(4).collect::<Vec<_>>());
+    }
+    for sql in [
+        "REVOKE SELECT ON t.* FROM u |",
+        "GRANT SELECT, INSERT ON t.* TO u |",
+    ] {
+        let s = kw(sql, MySQL);
+        eprintln!("M {:?} FROM={} sample={:?}", sql, has(&s,"FROM"), s.iter().take(4).collect::<Vec<_>>());
+    }
+}

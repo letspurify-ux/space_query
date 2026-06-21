@@ -13176,6 +13176,21 @@ impl SqlEditorWidget {
             return Some(&["TO"]);
         }
         if words.first().is_some_and(|word| word == "GRANT") && contains("TO") {
+            // The `WITH {GRANT|ADMIN|HIERARCHY} OPTION` clause is single-use: once
+            // its terminal `OPTION` is present the grant is complete. Return an empty
+            // (handled) set rather than `None` so the privilege `SELECT` in `GRANT
+            // SELECT …` cannot fall through and leak the select-list `FROM`.
+            if contains("OPTION") {
+                return Some(&[]);
+            }
+            // `WITH <kind> |` → the trailing `OPTION` keyword.
+            if matches!(
+                words.last().map(String::as_str),
+                Some("GRANT") | Some("ADMIN") | Some("HIERARCHY")
+            ) && words.iter().rev().nth(1).map(String::as_str) == Some("WITH")
+            {
+                return Some(&["OPTION"]);
+            }
             // Object privileges (`… ON obj …`) end with `WITH GRANT OPTION`; system
             // privileges and roles with `WITH ADMIN OPTION`. Once `WITH` is typed,
             // only the option phrase remains (never the whole `WITH … OPTION`).
@@ -13208,7 +13223,12 @@ impl SqlEditorWidget {
             [rollback] if rollback == "ROLLBACK" => Some(&["WORK", "TO SAVEPOINT", "FORCE"]),
             [rollback, to] if rollback == "ROLLBACK" && to == "TO" => Some(&["SAVEPOINT"]),
             [set, transaction] if set == "SET" && transaction == "TRANSACTION" => {
-                Some(&["READ", "ISOLATION", "USE", "NAME"])
+                // `USE ROLLBACK SEGMENT` / `NAME` are Oracle-only.
+                if mysql {
+                    Some(&["ISOLATION", "READ"])
+                } else {
+                    Some(&["READ", "ISOLATION", "USE", "NAME"])
+                }
             }
             [set, transaction, read] if set == "SET" && transaction == "TRANSACTION" && read == "READ" => {
                 Some(&["ONLY", "WRITE"])
@@ -13224,7 +13244,18 @@ impl SqlEditorWidget {
                     && isolation == "ISOLATION"
                     && level == "LEVEL" =>
             {
-                Some(&["SERIALIZABLE", "READ COMMITTED"])
+                // Oracle supports only SERIALIZABLE / READ COMMITTED; MySQL adds
+                // REPEATABLE READ and READ UNCOMMITTED.
+                if mysql {
+                    Some(&[
+                        "SERIALIZABLE",
+                        "READ COMMITTED",
+                        "REPEATABLE READ",
+                        "READ UNCOMMITTED",
+                    ])
+                } else {
+                    Some(&["SERIALIZABLE", "READ COMMITTED"])
+                }
             }
             [start] if mysql && start == "START" => {
                 Some(&["TRANSACTION", "REPLICA", "SLAVE"])
@@ -13942,10 +13973,17 @@ impl SqlEditorWidget {
             if last == Some("USING") {
                 return Some(&["BTREE", "HASH"]);
             }
+            // `ON <table>` and `USING <type>` are each single-use, so do not
+            // re-offer one already present (`CREATE INDEX i ON t (a) |` → `USING`).
             if matches!(last, Some("BTREE" | "HASH")) {
-                return Some(&["ON"]);
+                return Some(if has("ON") { &[] } else { &["ON"] });
             }
-            return Some(&["ON", "USING"]);
+            return Some(match (has("ON"), has("USING")) {
+                (false, false) => &["ON", "USING"],
+                (true, false) => &["USING"],
+                (false, true) => &["ON"],
+                (true, true) => &[],
+            });
         }
         if first == "ALTER" && has("TABLE") {
             match last {
@@ -20141,7 +20179,9 @@ impl SqlEditorWidget {
     fn expected_locking_clause_keyword_candidates(
         tokens: &[SqlToken],
         end: usize,
+        db_type: Option<crate::db::DatabaseType>,
     ) -> Option<&'static [&'static str]> {
+        let mysql = crate::sql_text::mysql_compatibility_for_sql("", db_type);
         let words = Self::previous_meaningful_words_upper(tokens, end, 2);
         let last = words.last().map(String::as_str);
         let prev = words
@@ -20150,7 +20190,12 @@ impl SqlEditorWidget {
             .and_then(|idx| words.get(idx))
             .map(String::as_str);
         if prev == Some("FOR") && matches!(last, Some("UPDATE") | Some("SHARE")) {
-            return Some(&["OF", "NOWAIT", "WAIT", "SKIP"]);
+            // MySQL has `[NOWAIT | SKIP LOCKED]` but no Oracle `WAIT <n>`.
+            return Some(if mysql {
+                &["OF", "NOWAIT", "SKIP"]
+            } else {
+                &["OF", "NOWAIT", "WAIT", "SKIP"]
+            });
         }
         if last == Some("SKIP") {
             return Some(&["LOCKED"]);
@@ -20201,7 +20246,7 @@ impl SqlEditorWidget {
         if Self::unclosed_paren_count(tokens, end) != 0 {
             return false;
         }
-        Self::expected_locking_clause_keyword_candidates(tokens, end).is_some()
+        Self::expected_locking_clause_keyword_candidates(tokens, end, None).is_some()
     }
 
     fn expected_tool_command_keyword_candidates(
@@ -21254,7 +21299,7 @@ impl SqlEditorWidget {
         }
         if Self::cursor_is_at_locking_clause_keyword_slot_for_context(deep_ctx, !prefix.is_empty()) {
             if let Some(candidates) =
-                Self::expected_locking_clause_keyword_candidates(tokens, context_end)
+                Self::expected_locking_clause_keyword_candidates(tokens, context_end, db_type)
             {
                 return Self::filter_expected_candidates(prefix, candidates);
             }

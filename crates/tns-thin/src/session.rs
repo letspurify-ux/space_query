@@ -17,7 +17,7 @@ use std::net::{Shutdown, TcpStream};
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU8, Ordering},
     Arc, Mutex,
 };
 use std::time::Duration;
@@ -51,6 +51,7 @@ use crate::{log_connect_phase, OracleThinError};
 const TNS_PACKET_TYPE_DATA: u8 = 6;
 const TNS_PACKET_TYPE_MARKER: u8 = 12;
 const TNS_PACKET_TYPE_CONTROL: u8 = 14;
+#[cfg(test)]
 const TNS_MARKER_TYPE_BREAK: u8 = 1;
 const TNS_MARKER_TYPE_RESET: u8 = 2;
 const TNS_MARKER_TYPE_INTERRUPT: u8 = 3;
@@ -67,6 +68,9 @@ const TNS_DATA_FLAGS_END_OF_RESPONSE: u16 = 0x2000;
 const CANCEL_RESET_DRAIN_TIMEOUT: Duration = Duration::from_millis(750);
 /// Safety bound on packets drained during a cancel reset handshake.
 const CANCEL_RESET_MAX_PACKETS: usize = 64;
+const BREAK_SIGNAL_NONE: u8 = 0;
+const BREAK_SIGNAL_OOB: u8 = 1;
+const BREAK_SIGNAL_INBAND: u8 = 2;
 const TNS_MSG_TYPE_PROTOCOL: u8 = 1;
 const TNS_MSG_TYPE_DATA_TYPES: u8 = 2;
 const TNS_MSG_TYPE_FUNCTION: u8 = 3;
@@ -610,6 +614,7 @@ impl OracleThinCapabilities {
 #[derive(Debug, Clone)]
 pub struct OracleThinCancelHandle {
     cancelled: Arc<AtomicBool>,
+    break_signal: Arc<AtomicU8>,
     break_stream: Option<Arc<Mutex<TcpStream>>>,
     protocol_version: u16,
     supports_oob: bool,
@@ -621,12 +626,29 @@ impl OracleThinCancelHandle {
     /// connection stays reusable. Mirrors python-oracledb `_break_external` and
     /// go-ora `BreakConnection`, neither of which closes the socket here.
     pub fn break_execution(&self) -> Result<(), OracleThinError> {
-        self.cancelled.store(true, Ordering::SeqCst);
+        if self
+            .cancelled
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Ok(());
+        }
+        self.break_signal.store(
+            planned_break_signal(self.protocol_version, self.supports_oob).as_u8(),
+            Ordering::SeqCst,
+        );
         if let Some(stream) = &self.break_stream {
             let mut stream = stream
                 .lock()
                 .map_err(|_| OracleThinError::new("Oracle thin cancel stream lock poisoned"))?;
-            send_break_signal(&mut stream, self.protocol_version, self.supports_oob)?;
+            match send_break_signal(&mut stream, self.protocol_version, self.supports_oob) {
+                Ok(signal) => self.break_signal.store(signal.as_u8(), Ordering::SeqCst),
+                Err(err) => {
+                    self.break_signal.store(BREAK_SIGNAL_NONE, Ordering::SeqCst);
+                    self.cancelled.store(false, Ordering::SeqCst);
+                    return Err(err);
+                }
+            }
         }
         Ok(())
     }
@@ -669,6 +691,7 @@ pub struct OracleThinSession {
     server_state: ServerSidePiggybackState,
     in_request: bool,
     cancel_flag: Arc<AtomicBool>,
+    cancel_signal: Arc<AtomicU8>,
     ttc_sequence: u8,
     pool_managed: bool,
     drcp_establish_session: bool,
@@ -733,6 +756,7 @@ impl OracleThinSession {
             server_state: auth.server_state,
             in_request: false,
             cancel_flag: Arc::new(AtomicBool::new(false)),
+            cancel_signal: Arc::new(AtomicU8::new(BREAK_SIGNAL_NONE)),
             ttc_sequence: 3,
             pool_managed: false,
             drcp_establish_session: false,
@@ -829,6 +853,7 @@ impl OracleThinSession {
     pub fn cancel_handle(&self) -> OracleThinCancelHandle {
         OracleThinCancelHandle {
             cancelled: Arc::clone(&self.cancel_flag),
+            break_signal: Arc::clone(&self.cancel_signal),
             break_stream: self
                 .stream
                 .try_clone()
@@ -841,18 +866,50 @@ impl OracleThinSession {
 
     pub fn reset_pending_cancel(&self) {
         self.cancel_flag.store(false, Ordering::SeqCst);
+        self.cancel_signal
+            .store(BREAK_SIGNAL_NONE, Ordering::SeqCst);
     }
 
     /// Tier 1 (graceful) break. See [`OracleThinCancelHandle::break_execution`];
     /// the socket is left open so the reader can run the break/reset handshake.
     pub fn break_execution(&self) -> Result<(), OracleThinError> {
-        self.cancel_flag.store(true, Ordering::SeqCst);
-        let mut stream = self.stream.try_clone()?;
-        send_break_signal(
+        if self
+            .cancel_flag
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Ok(());
+        }
+        self.cancel_signal.store(
+            planned_break_signal(
+                self.capabilities.protocol_version.unwrap_or(319),
+                self.capabilities.supports_oob,
+            )
+            .as_u8(),
+            Ordering::SeqCst,
+        );
+        let mut stream = match self.stream.try_clone() {
+            Ok(stream) => stream,
+            Err(err) => {
+                self.cancel_signal
+                    .store(BREAK_SIGNAL_NONE, Ordering::SeqCst);
+                self.cancel_flag.store(false, Ordering::SeqCst);
+                return Err(err.into());
+            }
+        };
+        match send_break_signal(
             &mut stream,
             self.capabilities.protocol_version.unwrap_or(319),
             self.capabilities.supports_oob,
-        )?;
+        ) {
+            Ok(signal) => self.cancel_signal.store(signal.as_u8(), Ordering::SeqCst),
+            Err(err) => {
+                self.cancel_signal
+                    .store(BREAK_SIGNAL_NONE, Ordering::SeqCst);
+                self.cancel_flag.store(false, Ordering::SeqCst);
+                return Err(err);
+            }
+        }
         Ok(())
     }
 
@@ -863,8 +920,38 @@ impl OracleThinSession {
     /// cleanly — e.g. a tier-2 `force_close` already shut the socket down — the
     /// session is marked broken so the pool discards it. Always reports
     /// ORA-01013 to the caller.
-    fn finish_cancelled_read(&mut self) -> OracleThinError {
-        if self.drain_cancel_response().is_err() {
+    fn current_cancel_signal(&self) -> Option<BreakSignal> {
+        if self.cancel_flag.load(Ordering::SeqCst) {
+            Some(BreakSignal::from_u8(
+                self.cancel_signal.load(Ordering::SeqCst),
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn clear_go_ora_cancel_if_response_completed<T>(&self, response: &Result<T, OracleThinError>) {
+        if !protocol_uses_go_ora_legacy_mappings(self.capabilities.protocol_version)
+            || !self.cancel_flag.load(Ordering::SeqCst)
+        {
+            return;
+        }
+        if response.is_ok()
+            || response
+                .as_ref()
+                .err()
+                .is_some_and(error_looks_like_oracle_response)
+        {
+            self.reset_pending_cancel();
+        }
+    }
+
+    fn finish_cancelled_read(&mut self, signal: BreakSignal) -> OracleThinError {
+        let outcome = self.drain_cancel_response(signal);
+        self.cancel_signal
+            .store(BREAK_SIGNAL_NONE, Ordering::SeqCst);
+        self.cancel_flag.store(false, Ordering::SeqCst);
+        if outcome.is_err() {
             self.broken = true;
         }
         OracleThinError::new("ORA-01013: user requested cancel of current operation")
@@ -873,17 +960,91 @@ impl OracleThinSession {
     /// Completes the break/reset handshake after a graceful cancel so the
     /// connection is left at a clean request boundary and stays reusable.
     ///
-    /// The server answers a break by sending a RESET marker and then **waits for
-    /// the client's RESET** before emitting the trailing ORA-01013 error data
-    /// packet. The in-band reader ([`read_data_packet_with_flags_and_control`])
-    /// returns on that server RESET marker without acknowledging it, so we must
-    /// send the client RESET here, then drain up to the trailing data packet.
-    /// Mirrors go-ora `processMarker` (send RESET after the marker, then read
-    /// the data packet) and python-oracledb `_reset` (send RESET, read until the
-    /// server reset, then the data packet).
-    fn drain_cancel_response(&mut self) -> Result<(), OracleThinError> {
+    /// Protocol 314 follows go-ora `read`: read the next packet first, call
+    /// `processMarker` only when it is a marker, and then continue to the trailing
+    /// ORA-01013 data packet. Modern protocols follow python-oracledb's break
+    /// path: after an OOB break, send the in-band INTERRUPT marker, read the
+    /// server marker, send RESET, then skip server markers up to the trailing
+    /// ORA-01013 data packet.
+    fn drain_cancel_response(&mut self, signal: BreakSignal) -> Result<(), OracleThinError> {
         let protocol_version = self.capabilities.protocol_version.unwrap_or(319);
+        if protocol_version >= TNS_VERSION_MIN_ACCEPTED {
+            return self.drain_python_cancel_response(protocol_version, signal);
+        }
+        self.drain_go_ora_cancel_response(protocol_version)
+    }
+
+    fn drain_go_ora_cancel_response(
+        &mut self,
+        protocol_version: u16,
+    ) -> Result<(), OracleThinError> {
+        let prior_timeout = self.stream.read_timeout().ok().flatten();
+        self.stream
+            .set_read_timeout(Some(CANCEL_RESET_DRAIN_TIMEOUT))
+            .map_err(|err| {
+                OracleThinError::new(format!("failed to set Oracle cancel reset timeout: {err}"))
+            })?;
+        let outcome = self.drain_go_ora_cancel_read(protocol_version);
+        let _ = self.stream.set_read_timeout(prior_timeout);
+        outcome
+    }
+
+    fn drain_go_ora_cancel_read(&mut self, protocol_version: u16) -> Result<(), OracleThinError> {
+        for _ in 0..CANCEL_RESET_MAX_PACKETS {
+            match read_cancel_reset_packet(&mut self.stream, protocol_version)? {
+                CancelResetPacket::Quiet => {
+                    return Err(OracleThinError::new("Oracle cancel response timed out"));
+                }
+                CancelResetPacket::Packet(TNS_PACKET_TYPE_MARKER, _) => {
+                    if self.read_go_ora_after_marker_reset(protocol_version)? {
+                        return Ok(());
+                    }
+                }
+                CancelResetPacket::Packet(TNS_PACKET_TYPE_CONTROL, _) => {}
+                CancelResetPacket::Packet(TNS_PACKET_TYPE_DATA, _) => return Ok(()),
+                CancelResetPacket::Packet(other, _) => {
+                    return Err(OracleThinError::new(format!(
+                        "unexpected TNS packet type {other} during cancel response"
+                    )));
+                }
+            }
+        }
+        Err(OracleThinError::new(
+            "Oracle cancel response drain exceeded packet limit",
+        ))
+    }
+
+    fn read_go_ora_after_marker_reset(
+        &mut self,
+        protocol_version: u16,
+    ) -> Result<bool, OracleThinError> {
         write_marker_packet(&mut self.stream, protocol_version, TNS_MARKER_TYPE_RESET)?;
+        match read_cancel_reset_packet(&mut self.stream, protocol_version)? {
+            CancelResetPacket::Quiet => Err(OracleThinError::new("Oracle cancel reset timed out")),
+            CancelResetPacket::Packet(TNS_PACKET_TYPE_MARKER, _) => Ok(false),
+            CancelResetPacket::Packet(TNS_PACKET_TYPE_CONTROL, _) => Ok(false),
+            CancelResetPacket::Packet(TNS_PACKET_TYPE_DATA, _) => Ok(true),
+            CancelResetPacket::Packet(other, _) => Err(OracleThinError::new(format!(
+                "unexpected TNS packet type {other} after cancel reset"
+            ))),
+        }
+    }
+
+    fn drain_python_cancel_response(
+        &mut self,
+        protocol_version: u16,
+        signal: BreakSignal,
+    ) -> Result<(), OracleThinError> {
+        if protocol_version >= TNS_VERSION_MIN_ACCEPTED
+            && self.capabilities.supports_oob
+            && signal == BreakSignal::Oob
+        {
+            write_marker_packet(
+                &mut self.stream,
+                protocol_version,
+                TNS_MARKER_TYPE_INTERRUPT,
+            )?;
+        }
 
         let prior_timeout = self.stream.read_timeout().ok().flatten();
         self.stream
@@ -891,35 +1052,61 @@ impl OracleThinSession {
             .map_err(|err| {
                 OracleThinError::new(format!("failed to set Oracle cancel reset timeout: {err}"))
             })?;
-        let outcome = self.drain_cancel_reset(protocol_version);
+        let outcome = self.drain_python_break_response(protocol_version);
         let _ = self.stream.set_read_timeout(prior_timeout);
         outcome
     }
 
-    fn drain_cancel_reset(&mut self, protocol_version: u16) -> Result<(), OracleThinError> {
-        // After our client RESET the server emits the trailing ORA-01013 error
-        // data packet, possibly preceded by its own RESET marker (python-oracledb
-        // protocols 315/318/319) or none (go-ora protocol 314, which reads
-        // exactly one data packet after the reset). We skip any markers — also
-        // answering a residual BREAK with a RESET — and stop at the first data
-        // packet, which marks the clean request boundary. A quiet socket (read
-        // timeout at a boundary) is the fallback terminator.
+    fn drain_python_break_response(
+        &mut self,
+        protocol_version: u16,
+    ) -> Result<(), OracleThinError> {
         for _ in 0..CANCEL_RESET_MAX_PACKETS {
             match read_cancel_reset_packet(&mut self.stream, protocol_version)? {
-                CancelResetPacket::Quiet => return Ok(()),
+                CancelResetPacket::Quiet => {
+                    return Err(OracleThinError::new(
+                        "Oracle cancel break response timed out",
+                    ));
+                }
                 CancelResetPacket::Packet(TNS_PACKET_TYPE_MARKER, data) => {
-                    // Server still breaking: acknowledge with a reset marker.
-                    if data.last().copied() == Some(TNS_MARKER_TYPE_BREAK) {
-                        write_marker_packet(
-                            &mut self.stream,
-                            protocol_version,
-                            TNS_MARKER_TYPE_RESET,
-                        )?;
+                    return self.drain_python_reset_from_marker(protocol_version, data);
+                }
+                CancelResetPacket::Packet(TNS_PACKET_TYPE_CONTROL, _) => {}
+                CancelResetPacket::Packet(TNS_PACKET_TYPE_DATA, _) => return Ok(()),
+                CancelResetPacket::Packet(other, _) => {
+                    return Err(OracleThinError::new(format!(
+                        "unexpected TNS packet type {other} during cancel break"
+                    )));
+                }
+            }
+        }
+        Err(OracleThinError::new(
+            "Oracle cancel break drain exceeded packet limit",
+        ))
+    }
+
+    fn drain_python_reset_from_marker(
+        &mut self,
+        protocol_version: u16,
+        first_marker: Vec<u8>,
+    ) -> Result<(), OracleThinError> {
+        write_marker_packet(&mut self.stream, protocol_version, TNS_MARKER_TYPE_RESET)?;
+        if first_marker.last().copied() == Some(TNS_MARKER_TYPE_RESET) {
+            return self.drain_python_after_reset_marker(protocol_version);
+        }
+
+        for _ in 0..CANCEL_RESET_MAX_PACKETS {
+            match read_cancel_reset_packet(&mut self.stream, protocol_version)? {
+                CancelResetPacket::Quiet => {
+                    return Err(OracleThinError::new("Oracle cancel reset marker timed out"));
+                }
+                CancelResetPacket::Packet(TNS_PACKET_TYPE_MARKER, data) => {
+                    if data.last().copied() == Some(TNS_MARKER_TYPE_RESET) {
+                        return self.drain_python_after_reset_marker(protocol_version);
                     }
                 }
                 CancelResetPacket::Packet(TNS_PACKET_TYPE_CONTROL, _) => {}
-                // Trailing error/end-of-response packet: clean request boundary.
-                CancelResetPacket::Packet(TNS_PACKET_TYPE_DATA, _) => return Ok(()),
+                CancelResetPacket::Packet(TNS_PACKET_TYPE_DATA, _) => {}
                 CancelResetPacket::Packet(other, _) => {
                     return Err(OracleThinError::new(format!(
                         "unexpected TNS packet type {other} during cancel reset"
@@ -928,7 +1115,33 @@ impl OracleThinSession {
             }
         }
         Err(OracleThinError::new(
-            "Oracle thin cancel reset did not reach a clean boundary",
+            "Oracle cancel reset drain exceeded packet limit",
+        ))
+    }
+
+    fn drain_python_after_reset_marker(
+        &mut self,
+        protocol_version: u16,
+    ) -> Result<(), OracleThinError> {
+        for _ in 0..CANCEL_RESET_MAX_PACKETS {
+            match read_cancel_reset_packet(&mut self.stream, protocol_version)? {
+                CancelResetPacket::Quiet => {
+                    return Err(OracleThinError::new(
+                        "Oracle cancel reset trailing data timed out",
+                    ));
+                }
+                CancelResetPacket::Packet(TNS_PACKET_TYPE_MARKER, _) => {}
+                CancelResetPacket::Packet(TNS_PACKET_TYPE_CONTROL, _) => {}
+                CancelResetPacket::Packet(TNS_PACKET_TYPE_DATA, _) => return Ok(()),
+                CancelResetPacket::Packet(other, _) => {
+                    return Err(OracleThinError::new(format!(
+                        "unexpected TNS packet type {other} after cancel reset"
+                    )));
+                }
+            }
+        }
+        Err(OracleThinError::new(
+            "Oracle cancel reset marker skip exceeded packet limit",
         ))
     }
 
@@ -1605,6 +1818,10 @@ impl OracleThinSession {
             ..ExecuteReadState::default()
         };
         let request = StatementRequest::query("", row_count);
+        let cancel_state = CancelReadState {
+            flag: &self.cancel_flag,
+            signal: &self.cancel_signal,
+        };
         let response = read_execute_response_with_state(
             &mut self.stream,
             &self.capabilities,
@@ -1612,9 +1829,11 @@ impl OracleThinSession {
             &mut self.server_state,
             state,
             close_sequence.is_some(),
+            Some(cancel_state),
         );
-        if self.cancel_flag.swap(false, Ordering::SeqCst) {
-            return Err(self.finish_cancelled_read());
+        self.clear_go_ora_cancel_if_response_completed(&response);
+        if let Some(signal) = self.current_cancel_signal() {
+            return Err(self.finish_cancelled_read(signal));
         }
         let result = match response {
             Ok(mut response) => {
@@ -1819,6 +2038,7 @@ impl OracleThinSession {
             &self.capabilities,
             &mut self.server_state,
             true,
+            None,
         )
     }
 
@@ -2557,15 +2777,21 @@ impl OracleThinSession {
             || (request.is_query
                 && request.prefetch_rows == 0
                 && request.sql.contains("SQ_INTERNAL_ROWID"));
+        let cancel_state = CancelReadState {
+            flag: &self.cancel_flag,
+            signal: &self.cancel_signal,
+        };
         let response = read_execute_response(
             &mut self.stream,
             &self.capabilities,
             request,
             &mut self.server_state,
             skip_empty_end_of_response,
+            Some(cancel_state),
         );
-        if self.cancel_flag.swap(false, Ordering::SeqCst) {
-            let error = self.finish_cancelled_read();
+        self.clear_go_ora_cancel_if_response_completed(&response);
+        if let Some(signal) = self.current_cancel_signal() {
+            let error = self.finish_cancelled_read(signal);
             let _ = self.free_temp_lobs_and_fetched(&temp_lob_locators);
             return Err(error);
         }
@@ -2772,14 +2998,20 @@ impl OracleThinSession {
         self.clear_pending_current_schema_if_written(current_schema.as_deref());
         self.clear_pending_end_to_end_if_written(end_to_end.as_ref());
         log_connect_phase(&format!("ttc-{operation}-read"), "");
+        let cancel_state = CancelReadState {
+            flag: &self.cancel_flag,
+            signal: &self.cancel_signal,
+        };
         let response = read_simple_response(
             &mut self.stream,
             &self.capabilities,
             &mut self.server_state,
             !pending_cursor_closes.is_empty(),
+            Some(cancel_state),
         );
-        if self.cancel_flag.swap(false, Ordering::SeqCst) {
-            return Err(self.finish_cancelled_read());
+        self.clear_go_ora_cancel_if_response_completed(&response);
+        if let Some(signal) = self.current_cancel_signal() {
+            return Err(self.finish_cancelled_read(signal));
         }
         response
     }
@@ -2811,6 +3043,7 @@ impl OracleThinSession {
             &self.capabilities,
             &mut self.server_state,
             false,
+            None,
         )
     }
 
@@ -3006,6 +3239,7 @@ impl OracleThinSession {
             &self.capabilities,
             &mut self.server_state,
             !pending_cursor_closes.is_empty(),
+            None,
         )
     }
 }
@@ -3093,18 +3327,58 @@ fn send_oob_break(_stream: &TcpStream) -> Result<bool, OracleThinError> {
     Ok(false)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BreakSignal {
+    None,
+    Oob,
+    InBand,
+}
+
+#[derive(Clone, Copy)]
+struct CancelReadState<'a> {
+    flag: &'a AtomicBool,
+    signal: &'a AtomicU8,
+}
+
+impl BreakSignal {
+    fn as_u8(self) -> u8 {
+        match self {
+            BreakSignal::None => BREAK_SIGNAL_NONE,
+            BreakSignal::Oob => BREAK_SIGNAL_OOB,
+            BreakSignal::InBand => BREAK_SIGNAL_INBAND,
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            BREAK_SIGNAL_OOB => BreakSignal::Oob,
+            BREAK_SIGNAL_INBAND => BreakSignal::InBand,
+            _ => BreakSignal::None,
+        }
+    }
+}
+
+fn planned_break_signal(_protocol_version: u16, supports_oob: bool) -> BreakSignal {
+    if supports_oob {
+        BreakSignal::Oob
+    } else {
+        BreakSignal::InBand
+    }
+}
+
 fn send_break_signal(
     stream: &mut TcpStream,
     protocol_version: u16,
     supports_oob: bool,
-) -> Result<(), OracleThinError> {
+) -> Result<BreakSignal, OracleThinError> {
     if supports_oob {
         if send_oob_break(stream)? {
-            return Ok(());
+            return Ok(BreakSignal::Oob);
         }
     }
 
-    write_marker_packet(stream, protocol_version, TNS_MARKER_TYPE_INTERRUPT)
+    write_marker_packet(stream, protocol_version, TNS_MARKER_TYPE_INTERRUPT)?;
+    Ok(BreakSignal::InBand)
 }
 
 fn capabilities_from_accept(
@@ -3293,6 +3567,10 @@ fn protocol_uses_go_ora_legacy_mappings(protocol_version: Option<u16>) -> bool {
 
 fn protocol_uses_python_oracledb_modern_mappings(protocol_version: Option<u16>) -> bool {
     !protocol_uses_go_ora_legacy_mappings(protocol_version)
+}
+
+fn error_looks_like_oracle_response(error: &OracleThinError) -> bool {
+    error.to_string().contains("ORA-")
 }
 
 #[derive(Debug, Clone)]
@@ -5879,6 +6157,7 @@ fn read_execute_response(
     request: &StatementRequest,
     server_state: &mut ServerSidePiggybackState,
     skip_empty_end_of_response: bool,
+    cancel_state: Option<CancelReadState<'_>>,
 ) -> Result<ExecuteResponse, OracleThinError> {
     read_execute_response_with_state(
         stream,
@@ -5887,6 +6166,7 @@ fn read_execute_response(
         server_state,
         ExecuteReadState::default(),
         skip_empty_end_of_response,
+        cancel_state,
     )
 }
 
@@ -5897,6 +6177,7 @@ fn read_execute_response_with_state(
     server_state: &mut ServerSidePiggybackState,
     mut state: ExecuteReadState,
     mut skip_empty_end_of_response: bool,
+    cancel_state: Option<CancelReadState<'_>>,
 ) -> Result<ExecuteResponse, OracleThinError> {
     server_state.last_warning = None;
     if request_is_dml_returning(request) && state.out_bind_columns.is_empty() {
@@ -5913,8 +6194,11 @@ fn read_execute_response_with_state(
     let mut response_had_content = false;
     let trace = std::env::var_os("ORACLE_THIN_TRACE_EXEC").is_some();
     while !state.done {
-        let (data_flags, packet) =
-            read_data_packet_with_flags(stream, capabilities.protocol_version.unwrap_or(319))?;
+        let (data_flags, packet) = read_data_packet_with_flags_for_cancel(
+            stream,
+            capabilities.protocol_version.unwrap_or(319),
+            cancel_state,
+        )?;
         if trace {
             eprintln!(
                 "thin exec response data_flags=0x{data_flags:04x} packet={}",
@@ -6096,13 +6380,17 @@ fn read_simple_response(
     capabilities: &OracleThinCapabilities,
     server_state: &mut ServerSidePiggybackState,
     mut skip_empty_end_of_response: bool,
+    cancel_state: Option<CancelReadState<'_>>,
 ) -> Result<(), OracleThinError> {
     server_state.last_warning = None;
     let mut done = false;
     let mut response_had_content = false;
     while !done {
-        let (data_flags, packet) =
-            read_data_packet_with_flags(stream, capabilities.protocol_version.unwrap_or(319))?;
+        let (data_flags, packet) = read_data_packet_with_flags_for_cancel(
+            stream,
+            capabilities.protocol_version.unwrap_or(319),
+            cancel_state,
+        )?;
         let mut cursor = PacketCursor::streaming(packet, data_flags, &mut *stream, capabilities);
         let mut skipped_empty_end_of_response = false;
         while cursor.remaining() > 0 && !done {
@@ -11810,7 +12098,15 @@ fn read_data_packet_with_flags(
     stream: &mut TcpStream,
     protocol_version: u16,
 ) -> Result<(u16, Vec<u8>), OracleThinError> {
-    read_data_packet_with_flags_and_control(stream, protocol_version)
+    read_data_packet_with_flags_for_cancel(stream, protocol_version, None)
+}
+
+fn read_data_packet_with_flags_for_cancel(
+    stream: &mut TcpStream,
+    protocol_version: u16,
+    cancel_state: Option<CancelReadState<'_>>,
+) -> Result<(u16, Vec<u8>), OracleThinError> {
+    read_data_packet_with_flags_and_control_for_cancel(stream, protocol_version, cancel_state)
         .map(|(_, data_flags, payload)| (data_flags, payload))
 }
 
@@ -11818,53 +12114,32 @@ fn read_data_packet_with_flags_and_control(
     stream: &mut TcpStream,
     protocol_version: u16,
 ) -> Result<(bool, u16, Vec<u8>), OracleThinError> {
+    read_data_packet_with_flags_and_control_for_cancel(stream, protocol_version, None)
+}
+
+fn read_data_packet_with_flags_and_control_for_cancel(
+    stream: &mut TcpStream,
+    protocol_version: u16,
+    cancel_state: Option<CancelReadState<'_>>,
+) -> Result<(bool, u16, Vec<u8>), OracleThinError> {
     let mut oob_reset_received = false;
     loop {
-        let mut header = [0u8; 8];
-        stream
-            .read_exact(&mut header)
-            .map_err(|err| read_packet_error("TNS data header", err))?;
-        let size = if protocol_version >= 315 {
-            u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize
-        } else {
-            u16::from_be_bytes([header[0], header[1]]) as usize
-        };
-        if size < 8 {
-            return Err(OracleThinError::new(format!(
-                "invalid TNS packet length {size}"
-            )));
-        }
-        let mut data = vec![0u8; size - 8];
-        stream
-            .read_exact(&mut data)
-            .map_err(|err| read_packet_body_error(err, header[4], size, &header))?;
-        match header[4] {
+        let (packet_type, data) = read_tns_packet(stream, protocol_version, "TNS data")?;
+        match packet_type {
             TNS_PACKET_TYPE_DATA => {
                 if data.len() < 2 {
                     return Err(OracleThinError::new(format!(
-                        "invalid TNS data packet length {size}"
+                        "invalid TNS data packet length {}",
+                        data.len() + 8
                     )));
                 }
                 let data_flags = u16::from_be_bytes([data[0], data[1]]);
                 return Ok((oob_reset_received, data_flags, data[2..].to_vec()));
             }
             TNS_PACKET_TYPE_MARKER => {
-                if data.last() == Some(&TNS_MARKER_TYPE_BREAK) {
-                    write_marker_packet(stream, protocol_version, TNS_MARKER_TYPE_RESET)?;
-                    continue;
-                }
-                if data.last() == Some(&TNS_MARKER_TYPE_RESET) {
-                    return Ok((
-                        oob_reset_received,
-                        TNS_DATA_FLAGS_END_OF_RESPONSE,
-                        vec![TNS_MSG_TYPE_END_OF_RESPONSE],
-                    ));
-                }
-                return Err(OracleThinError::new(format!(
-                    "received unsupported TNS packet type {} while waiting for data: {}",
-                    header[4],
-                    hex_encode_upper(&data)
-                )));
+                let (marker_oob_reset, data_flags, payload) =
+                    read_data_after_marker_reset(stream, protocol_version, data, cancel_state)?;
+                return Ok((oob_reset_received | marker_oob_reset, data_flags, payload));
             }
             TNS_PACKET_TYPE_CONTROL => {
                 oob_reset_received |= process_control_packet(&data)?.oob_reset_received;
@@ -11877,6 +12152,163 @@ fn read_data_packet_with_flags_and_control(
             }
         }
     }
+}
+
+fn read_tns_packet(
+    stream: &mut TcpStream,
+    protocol_version: u16,
+    context: &str,
+) -> Result<(u8, Vec<u8>), OracleThinError> {
+    let mut header = [0u8; 8];
+    stream
+        .read_exact(&mut header)
+        .map_err(|err| read_packet_error(&format!("{context} header"), err))?;
+    let size = if protocol_version >= 315 {
+        u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize
+    } else {
+        u16::from_be_bytes([header[0], header[1]]) as usize
+    };
+    if size < 8 {
+        return Err(OracleThinError::new(format!(
+            "invalid TNS packet length {size} while reading {context}"
+        )));
+    }
+    let mut data = vec![0u8; size - 8];
+    stream
+        .read_exact(&mut data)
+        .map_err(|err| read_packet_body_error(err, header[4], size, &header))?;
+    Ok((header[4], data))
+}
+
+fn read_data_after_marker_reset(
+    stream: &mut TcpStream,
+    protocol_version: u16,
+    first_marker: Vec<u8>,
+    cancel_state: Option<CancelReadState<'_>>,
+) -> Result<(bool, u16, Vec<u8>), OracleThinError> {
+    write_marker_packet(stream, protocol_version, TNS_MARKER_TYPE_RESET)?;
+
+    let mut oob_reset_received = false;
+    if protocol_version < TNS_VERSION_MIN_ACCEPTED {
+        if let Some((data_flags, payload)) = read_go_ora_packet_after_marker_reset(
+            stream,
+            protocol_version,
+            cancel_state,
+            &mut oob_reset_received,
+        )? {
+            return Ok((oob_reset_received, data_flags, payload));
+        }
+        loop {
+            let (packet_type, data) =
+                read_tns_packet(stream, protocol_version, "TNS post-marker data")?;
+            match packet_type {
+                TNS_PACKET_TYPE_CONTROL => {
+                    oob_reset_received |= process_control_packet(&data)?.oob_reset_received;
+                }
+                TNS_PACKET_TYPE_MARKER => {
+                    write_marker_packet(stream, protocol_version, TNS_MARKER_TYPE_RESET)?;
+                    if let Some((data_flags, payload)) = read_go_ora_packet_after_marker_reset(
+                        stream,
+                        protocol_version,
+                        cancel_state,
+                        &mut oob_reset_received,
+                    )? {
+                        return Ok((oob_reset_received, data_flags, payload));
+                    }
+                }
+                TNS_PACKET_TYPE_DATA => {
+                    let (data_flags, payload) =
+                        finish_marker_reset_data_packet(data, cancel_state)?;
+                    return Ok((oob_reset_received, data_flags, payload));
+                }
+                other => {
+                    return Err(OracleThinError::new(format!(
+                        "unexpected TNS packet type {other} after marker reset"
+                    )));
+                }
+            }
+        }
+    }
+
+    let mut saw_reset_marker = first_marker.last().copied() == Some(TNS_MARKER_TYPE_RESET);
+    while !saw_reset_marker {
+        let (packet_type, data) = read_tns_packet(stream, protocol_version, "TNS reset marker")?;
+        match packet_type {
+            TNS_PACKET_TYPE_MARKER => {
+                saw_reset_marker = data.last().copied() == Some(TNS_MARKER_TYPE_RESET);
+            }
+            TNS_PACKET_TYPE_CONTROL => {
+                oob_reset_received |= process_control_packet(&data)?.oob_reset_received;
+            }
+            TNS_PACKET_TYPE_DATA => {}
+            other => {
+                return Err(OracleThinError::new(format!(
+                    "unexpected TNS packet type {other} during marker reset"
+                )));
+            }
+        }
+    }
+
+    loop {
+        let (packet_type, data) = read_tns_packet(stream, protocol_version, "TNS post-reset data")?;
+        match packet_type {
+            TNS_PACKET_TYPE_MARKER => {}
+            TNS_PACKET_TYPE_CONTROL => {
+                oob_reset_received |= process_control_packet(&data)?.oob_reset_received;
+            }
+            TNS_PACKET_TYPE_DATA => {
+                let (data_flags, payload) = finish_marker_reset_data_packet(data, cancel_state)?;
+                return Ok((oob_reset_received, data_flags, payload));
+            }
+            other => {
+                return Err(OracleThinError::new(format!(
+                    "unexpected TNS packet type {other} after marker reset"
+                )));
+            }
+        }
+    }
+}
+
+fn read_go_ora_packet_after_marker_reset(
+    stream: &mut TcpStream,
+    protocol_version: u16,
+    cancel_state: Option<CancelReadState<'_>>,
+    oob_reset_received: &mut bool,
+) -> Result<Option<(u16, Vec<u8>)>, OracleThinError> {
+    let (packet_type, data) = read_tns_packet(stream, protocol_version, "TNS post-marker data")?;
+    match packet_type {
+        TNS_PACKET_TYPE_CONTROL => {
+            *oob_reset_received |= process_control_packet(&data)?.oob_reset_received;
+            Ok(None)
+        }
+        TNS_PACKET_TYPE_MARKER => Ok(None),
+        TNS_PACKET_TYPE_DATA => finish_marker_reset_data_packet(data, cancel_state).map(Some),
+        other => Err(OracleThinError::new(format!(
+            "unexpected TNS packet type {other} after marker reset"
+        ))),
+    }
+}
+
+fn finish_marker_reset_data_packet(
+    data: Vec<u8>,
+    cancel_state: Option<CancelReadState<'_>>,
+) -> Result<(u16, Vec<u8>), OracleThinError> {
+    if data.len() < 2 {
+        return Err(OracleThinError::new(format!(
+            "invalid TNS data packet length {}",
+            data.len() + 8
+        )));
+    }
+    if let Some(cancel_state) = cancel_state {
+        if cancel_state.flag.load(Ordering::SeqCst) {
+            cancel_state
+                .signal
+                .store(BREAK_SIGNAL_NONE, Ordering::SeqCst);
+            cancel_state.flag.store(false, Ordering::SeqCst);
+        }
+    }
+    let data_flags = u16::from_be_bytes([data[0], data[1]]);
+    Ok((data_flags, data[2..].to_vec()))
 }
 
 #[derive(Debug, Default)]
@@ -11955,8 +12387,8 @@ enum CancelResetPacket {
 }
 
 /// Reads a single whole TNS packet during a cancel reset drain. A read timeout
-/// on the packet header means the socket is quiet at a request boundary, which
-/// is the normal way the drain terminates.
+/// on the packet header is surfaced as `Quiet`; callers decide whether that
+/// timeout is recoverable for their protocol phase.
 fn read_cancel_reset_packet(
     stream: &mut TcpStream,
     protocol_version: u16,
@@ -13165,7 +13597,10 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::sync::{atomic::AtomicBool, Arc};
+    use std::sync::{
+        atomic::{AtomicBool, AtomicU8},
+        Arc,
+    };
     use std::time::{Duration, Instant};
 
     use super::CANCEL_RESET_DRAIN_TIMEOUT;
@@ -13174,42 +13609,43 @@ mod tests {
         column_types_may_contain_ref_cursors, column_types_require_define_fetch_for_values,
         columns_may_contain_ref_cursors, columns_require_define_fetch_for_values,
         oracle_thin_driver_name, put_u16_be_vec, write_auth_header,
-        write_close_temp_lobs_piggyback, write_lob_operation_request, AuthSessionKeyParts,
-        ExecuteReadState, WriteLobOperationArgs, DATA_TYPE_REPRESENTATIONS, ORA_TYPE_NUM_BFILE,
-        ORA_TYPE_NUM_BINARY_DOUBLE, ORA_TYPE_NUM_BINARY_FLOAT, ORA_TYPE_NUM_BLOB,
-        ORA_TYPE_NUM_BOOLEAN, ORA_TYPE_NUM_CHAR, ORA_TYPE_NUM_CLOB, ORA_TYPE_NUM_CURSOR,
-        ORA_TYPE_NUM_DATE, ORA_TYPE_NUM_DBFILE, ORA_TYPE_NUM_DJSON, ORA_TYPE_NUM_INTERVAL_DS,
-        ORA_TYPE_NUM_INTERVAL_YM, ORA_TYPE_NUM_JSON, ORA_TYPE_NUM_LONG, ORA_TYPE_NUM_LONG_RAW,
-        ORA_TYPE_NUM_NUMBER, ORA_TYPE_NUM_OBJECT, ORA_TYPE_NUM_RAW, ORA_TYPE_NUM_ROWID,
-        ORA_TYPE_NUM_TIMESTAMP_LTZ, ORA_TYPE_NUM_TIMESTAMP_TZ, ORA_TYPE_NUM_TIMESTAMP_TZ_EXT,
-        ORA_TYPE_NUM_UROWID, ORA_TYPE_NUM_VARCHAR, ORA_TYPE_NUM_VECTOR,
-        PYTHON_ORACLEDB_MODERN_DATA_TYPE_REPRESENTATIONS, TNS_AUTH_MODE_CHANGE_PASSWORD,
-        TNS_AUTH_MODE_LOGON, TNS_AUTH_MODE_SYSASM, TNS_AUTH_MODE_SYSBKP, TNS_AUTH_MODE_SYSDBA,
-        TNS_AUTH_MODE_SYSDGD, TNS_AUTH_MODE_SYSKMT, TNS_AUTH_MODE_SYSOPER, TNS_AUTH_MODE_SYSRAC,
-        TNS_AUTH_MODE_WITH_PASSWORD, TNS_BIND_USE_INDICATORS, TNS_CHARSET_UTF8,
-        TNS_CONTROL_TYPE_INBAND_NOTIFICATION, TNS_CONTROL_TYPE_RESET_OOB,
-        TNS_DATA_FLAGS_END_OF_RESPONSE, TNS_DATA_FLAGS_EOF, TNS_DATA_TYPE_BDOUBLE,
-        TNS_DATA_TYPE_BFLOAT, TNS_DATA_TYPE_BINARY_INTEGER, TNS_DATA_TYPE_CFILE, TNS_DATA_TYPE_CLV,
-        TNS_DATA_TYPE_DBLOB, TNS_DATA_TYPE_DCLOB, TNS_DATA_TYPE_DOL, TNS_DATA_TYPE_DOP,
-        TNS_DATA_TYPE_DTR, TNS_DATA_TYPE_DUN, TNS_DATA_TYPE_EDATE, TNS_DATA_TYPE_ESITZ,
-        TNS_DATA_TYPE_EXT_NAMED, TNS_DATA_TYPE_EXT_REF, TNS_DATA_TYPE_FLOAT, TNS_DATA_TYPE_INT_REF,
-        TNS_DATA_TYPE_LVB, TNS_DATA_TYPE_LVC, TNS_DATA_TYPE_OAC, TNS_DATA_TYPE_OAC9,
-        TNS_DATA_TYPE_ODT, TNS_DATA_TYPE_PDN, TNS_DATA_TYPE_PNTY, TNS_DATA_TYPE_RDD,
-        TNS_DATA_TYPE_RSET, TNS_DATA_TYPE_SLS, TNS_DATA_TYPE_STR, TNS_DATA_TYPE_TIME,
-        TNS_DATA_TYPE_TIME_TZ, TNS_DATA_TYPE_UB8, TNS_DATA_TYPE_UIN, TNS_DATA_TYPE_VBI,
-        TNS_DATA_TYPE_VCS, TNS_DATA_TYPE_VNU, TNS_DATA_TYPE_VST, TNS_DEFAULT_SDU,
-        TNS_DURATION_SESSION, TNS_END_TO_END_ACTION, TNS_END_TO_END_CLIENT_IDENTIFIER,
-        TNS_END_TO_END_CLIENT_INFO, TNS_END_TO_END_DBOP, TNS_END_TO_END_MODULE,
-        TNS_EOCS_FLAGS_TXN_IN_PROGRESS, TNS_ERR_INBAND_MESSAGE, TNS_EXEC_FLAGS_IMPLICIT_RESULTSET,
-        TNS_FUNC_AUTH_PHASE_ONE, TNS_FUNC_AUTH_PHASE_TWO, TNS_FUNC_LOB_OP, TNS_FUNC_PING,
-        TNS_FUNC_SESSION_STATE, TNS_FUNC_SET_END_TO_END_ATTR, TNS_FUNC_SET_SCHEMA,
-        TNS_JSON_TYPE_ID, TNS_LOB_LOC_FLAGS_ABSTRACT, TNS_LOB_LOC_FLAGS_LITTLE_ENDIAN,
-        TNS_LOB_LOC_FLAGS_TEMP, TNS_LOB_LOC_FLAGS_VAR_LENGTH_CHARSET, TNS_LOB_LOC_OFFSET_FLAG_1,
-        TNS_LOB_LOC_OFFSET_FLAG_3, TNS_LOB_LOC_OFFSET_FLAG_4, TNS_LOB_OP_ARRAY,
-        TNS_LOB_OP_CREATE_TEMP, TNS_LOB_OP_FREE_TEMP, TNS_LOB_PREFETCH_FLAG, TNS_MARKER_TYPE_BREAK,
-        TNS_MARKER_TYPE_INTERRUPT, TNS_MARKER_TYPE_RESET, TNS_MAX_LONG_LENGTH,
-        TNS_MSG_TYPE_END_OF_RESPONSE, TNS_MSG_TYPE_FUNCTION, TNS_MSG_TYPE_PIGGYBACK,
-        TNS_MSG_TYPE_STATUS, TNS_PACKET_TYPE_CONTROL, TNS_PACKET_TYPE_DATA, TNS_PACKET_TYPE_MARKER,
+        write_close_temp_lobs_piggyback, write_lob_operation_request, write_marker_packet,
+        AuthSessionKeyParts, ExecuteReadState, WriteLobOperationArgs, DATA_TYPE_REPRESENTATIONS,
+        ORA_TYPE_NUM_BFILE, ORA_TYPE_NUM_BINARY_DOUBLE, ORA_TYPE_NUM_BINARY_FLOAT,
+        ORA_TYPE_NUM_BLOB, ORA_TYPE_NUM_BOOLEAN, ORA_TYPE_NUM_CHAR, ORA_TYPE_NUM_CLOB,
+        ORA_TYPE_NUM_CURSOR, ORA_TYPE_NUM_DATE, ORA_TYPE_NUM_DBFILE, ORA_TYPE_NUM_DJSON,
+        ORA_TYPE_NUM_INTERVAL_DS, ORA_TYPE_NUM_INTERVAL_YM, ORA_TYPE_NUM_JSON, ORA_TYPE_NUM_LONG,
+        ORA_TYPE_NUM_LONG_RAW, ORA_TYPE_NUM_NUMBER, ORA_TYPE_NUM_OBJECT, ORA_TYPE_NUM_RAW,
+        ORA_TYPE_NUM_ROWID, ORA_TYPE_NUM_TIMESTAMP_LTZ, ORA_TYPE_NUM_TIMESTAMP_TZ,
+        ORA_TYPE_NUM_TIMESTAMP_TZ_EXT, ORA_TYPE_NUM_UROWID, ORA_TYPE_NUM_VARCHAR,
+        ORA_TYPE_NUM_VECTOR, PYTHON_ORACLEDB_MODERN_DATA_TYPE_REPRESENTATIONS,
+        TNS_AUTH_MODE_CHANGE_PASSWORD, TNS_AUTH_MODE_LOGON, TNS_AUTH_MODE_SYSASM,
+        TNS_AUTH_MODE_SYSBKP, TNS_AUTH_MODE_SYSDBA, TNS_AUTH_MODE_SYSDGD, TNS_AUTH_MODE_SYSKMT,
+        TNS_AUTH_MODE_SYSOPER, TNS_AUTH_MODE_SYSRAC, TNS_AUTH_MODE_WITH_PASSWORD,
+        TNS_BIND_USE_INDICATORS, TNS_CHARSET_UTF8, TNS_CONTROL_TYPE_INBAND_NOTIFICATION,
+        TNS_CONTROL_TYPE_RESET_OOB, TNS_DATA_FLAGS_END_OF_RESPONSE, TNS_DATA_FLAGS_EOF,
+        TNS_DATA_TYPE_BDOUBLE, TNS_DATA_TYPE_BFLOAT, TNS_DATA_TYPE_BINARY_INTEGER,
+        TNS_DATA_TYPE_CFILE, TNS_DATA_TYPE_CLV, TNS_DATA_TYPE_DBLOB, TNS_DATA_TYPE_DCLOB,
+        TNS_DATA_TYPE_DOL, TNS_DATA_TYPE_DOP, TNS_DATA_TYPE_DTR, TNS_DATA_TYPE_DUN,
+        TNS_DATA_TYPE_EDATE, TNS_DATA_TYPE_ESITZ, TNS_DATA_TYPE_EXT_NAMED, TNS_DATA_TYPE_EXT_REF,
+        TNS_DATA_TYPE_FLOAT, TNS_DATA_TYPE_INT_REF, TNS_DATA_TYPE_LVB, TNS_DATA_TYPE_LVC,
+        TNS_DATA_TYPE_OAC, TNS_DATA_TYPE_OAC9, TNS_DATA_TYPE_ODT, TNS_DATA_TYPE_PDN,
+        TNS_DATA_TYPE_PNTY, TNS_DATA_TYPE_RDD, TNS_DATA_TYPE_RSET, TNS_DATA_TYPE_SLS,
+        TNS_DATA_TYPE_STR, TNS_DATA_TYPE_TIME, TNS_DATA_TYPE_TIME_TZ, TNS_DATA_TYPE_UB8,
+        TNS_DATA_TYPE_UIN, TNS_DATA_TYPE_VBI, TNS_DATA_TYPE_VCS, TNS_DATA_TYPE_VNU,
+        TNS_DATA_TYPE_VST, TNS_DEFAULT_SDU, TNS_DURATION_SESSION, TNS_END_TO_END_ACTION,
+        TNS_END_TO_END_CLIENT_IDENTIFIER, TNS_END_TO_END_CLIENT_INFO, TNS_END_TO_END_DBOP,
+        TNS_END_TO_END_MODULE, TNS_EOCS_FLAGS_TXN_IN_PROGRESS, TNS_ERR_INBAND_MESSAGE,
+        TNS_EXEC_FLAGS_IMPLICIT_RESULTSET, TNS_FUNC_AUTH_PHASE_ONE, TNS_FUNC_AUTH_PHASE_TWO,
+        TNS_FUNC_LOB_OP, TNS_FUNC_PING, TNS_FUNC_SESSION_STATE, TNS_FUNC_SET_END_TO_END_ATTR,
+        TNS_FUNC_SET_SCHEMA, TNS_JSON_TYPE_ID, TNS_LOB_LOC_FLAGS_ABSTRACT,
+        TNS_LOB_LOC_FLAGS_LITTLE_ENDIAN, TNS_LOB_LOC_FLAGS_TEMP,
+        TNS_LOB_LOC_FLAGS_VAR_LENGTH_CHARSET, TNS_LOB_LOC_OFFSET_FLAG_1, TNS_LOB_LOC_OFFSET_FLAG_3,
+        TNS_LOB_LOC_OFFSET_FLAG_4, TNS_LOB_OP_ARRAY, TNS_LOB_OP_CREATE_TEMP, TNS_LOB_OP_FREE_TEMP,
+        TNS_LOB_PREFETCH_FLAG, TNS_MARKER_TYPE_BREAK, TNS_MARKER_TYPE_INTERRUPT,
+        TNS_MARKER_TYPE_RESET, TNS_MAX_LONG_LENGTH, TNS_MSG_TYPE_END_OF_RESPONSE,
+        TNS_MSG_TYPE_FUNCTION, TNS_MSG_TYPE_PIGGYBACK, TNS_MSG_TYPE_STATUS,
+        TNS_PACKET_TYPE_CONTROL, TNS_PACKET_TYPE_DATA, TNS_PACKET_TYPE_MARKER,
         TNS_SESSION_STATE_EXPLICIT_BOUNDARY, TNS_SESSION_STATE_REQUEST_BEGIN,
         TNS_SESSION_STATE_REQUEST_END, TNS_VECTOR_FLAG_NORM, TNS_VECTOR_FLAG_NORM_RESERVED,
         TNS_VECTOR_FLAG_SPARSE, TNS_VECTOR_FORMAT_BINARY, TNS_VECTOR_FORMAT_FLOAT32,
@@ -13248,25 +13684,26 @@ mod tests {
         write_current_schema_piggyback, write_data_packet, write_data_type_representations,
         write_end_to_end_piggyback, write_eof_data_packet, write_function_code,
         write_session_state_piggyback, write_ub2, write_ub4, write_ub8, AuthCredentials, AuthState,
-        EndToEndAttributes, OracleThinAppContext, OracleThinAuthMode, OracleThinCapabilities,
-        OracleThinConfig, OracleThinPurity, OracleThinSession, OracleValue, PacketCursor,
-        ServerSidePiggybackState, ThinColumn, CS_FORM_IMPLICIT, CS_FORM_NCHAR,
-        ORACLE_CHARSET_AL32UTF8, ORACLE_CHARSET_UTF8, TNS_CCAP_END_OF_CALL_STATUS,
-        TNS_CCAP_END_OF_RESPONSE, TNS_CCAP_EXPLICIT_BOUNDARY, TNS_CCAP_FIELD_VERSION,
-        TNS_CCAP_FIELD_VERSION_20_1, TNS_CCAP_FIELD_VERSION_23_1,
-        TNS_CCAP_FIELD_VERSION_23_1_EXT_1, TNS_CCAP_LEGACY_FAST_SESSION_ATTRIBUTES, TNS_CCAP_OCI1,
-        TNS_CCAP_TTC1, TNS_CCAP_TTC4, TNS_DRCP_DEAUTHENTICATE, TNS_ERR_NO_DATA_FOUND,
-        TNS_ESCAPE_CHAR, TNS_FUNC_COMMIT, TNS_FUNC_LOGOFF, TNS_FUNC_ROLLBACK,
-        TNS_FUNC_SESSION_RELEASE, TNS_JSON_MAX_LENGTH, TNS_KEYWORD_NUM_CURRENT_SCHEMA,
-        TNS_KEYWORD_NUM_EDITION, TNS_KEYWORD_NUM_TRANSACTION_ID, TNS_LEGACY_CLR_CHUNK_SIZE,
-        TNS_MAX_ROWID_LENGTH, TNS_MAX_UROWID_LENGTH, TNS_MSG_TYPE_ERROR, TNS_MSG_TYPE_ONEWAY_FN,
-        TNS_MSG_TYPE_PARAMETER, TNS_MSG_TYPE_PROTOCOL, TNS_MSG_TYPE_ROW_DATA,
-        TNS_MSG_TYPE_SERVER_SIDE_PIGGYBACK, TNS_OBJ_HAS_INDEXES, TNS_OBJ_IS_DEGENERATE,
-        TNS_OBJ_NO_PREFIX_SEG, TNS_RCAP_TTC, TNS_RCAP_TTC_32K, TNS_RCAP_TTC_SESSION_STATE_OPS,
-        TNS_RCAP_TTC_ZERO_COPY, TNS_SERVER_PIGGYBACK_LTXID, TNS_SERVER_PIGGYBACK_SESS_RET,
-        TNS_SERVER_PIGGYBACK_TRACE_EVENT, TNS_TPC_TXNID_SYNC_SERVER, TNS_TPC_TXNID_SYNC_SET,
-        TNS_TPC_TXNID_SYNC_UNSET, TNS_VERIFIER_TYPE_10G, TNS_VERIFIER_TYPE_11G_1,
-        TNS_VERIFIER_TYPE_11G_2, TNS_VERIFIER_TYPE_12C, TNS_XML_TYPE_LOB, TNS_XML_TYPE_STRING,
+        BreakSignal, CancelReadState, EndToEndAttributes, OracleThinAppContext, OracleThinAuthMode,
+        OracleThinCapabilities, OracleThinConfig, OracleThinPurity, OracleThinSession, OracleValue,
+        PacketCursor, ServerSidePiggybackState, ThinColumn, BREAK_SIGNAL_INBAND, BREAK_SIGNAL_NONE,
+        BREAK_SIGNAL_OOB, CS_FORM_IMPLICIT, CS_FORM_NCHAR, ORACLE_CHARSET_AL32UTF8,
+        ORACLE_CHARSET_UTF8, TNS_CCAP_END_OF_CALL_STATUS, TNS_CCAP_END_OF_RESPONSE,
+        TNS_CCAP_EXPLICIT_BOUNDARY, TNS_CCAP_FIELD_VERSION, TNS_CCAP_FIELD_VERSION_20_1,
+        TNS_CCAP_FIELD_VERSION_23_1, TNS_CCAP_FIELD_VERSION_23_1_EXT_1,
+        TNS_CCAP_LEGACY_FAST_SESSION_ATTRIBUTES, TNS_CCAP_OCI1, TNS_CCAP_TTC1, TNS_CCAP_TTC4,
+        TNS_DRCP_DEAUTHENTICATE, TNS_ERR_NO_DATA_FOUND, TNS_ESCAPE_CHAR, TNS_FUNC_COMMIT,
+        TNS_FUNC_LOGOFF, TNS_FUNC_ROLLBACK, TNS_FUNC_SESSION_RELEASE, TNS_JSON_MAX_LENGTH,
+        TNS_KEYWORD_NUM_CURRENT_SCHEMA, TNS_KEYWORD_NUM_EDITION, TNS_KEYWORD_NUM_TRANSACTION_ID,
+        TNS_LEGACY_CLR_CHUNK_SIZE, TNS_MAX_ROWID_LENGTH, TNS_MAX_UROWID_LENGTH, TNS_MSG_TYPE_ERROR,
+        TNS_MSG_TYPE_ONEWAY_FN, TNS_MSG_TYPE_PARAMETER, TNS_MSG_TYPE_PROTOCOL,
+        TNS_MSG_TYPE_ROW_DATA, TNS_MSG_TYPE_SERVER_SIDE_PIGGYBACK, TNS_OBJ_HAS_INDEXES,
+        TNS_OBJ_IS_DEGENERATE, TNS_OBJ_NO_PREFIX_SEG, TNS_RCAP_TTC, TNS_RCAP_TTC_32K,
+        TNS_RCAP_TTC_SESSION_STATE_OPS, TNS_RCAP_TTC_ZERO_COPY, TNS_SERVER_PIGGYBACK_LTXID,
+        TNS_SERVER_PIGGYBACK_SESS_RET, TNS_SERVER_PIGGYBACK_TRACE_EVENT, TNS_TPC_TXNID_SYNC_SERVER,
+        TNS_TPC_TXNID_SYNC_SET, TNS_TPC_TXNID_SYNC_UNSET, TNS_VERIFIER_TYPE_10G,
+        TNS_VERIFIER_TYPE_11G_1, TNS_VERIFIER_TYPE_11G_2, TNS_VERIFIER_TYPE_12C, TNS_XML_TYPE_LOB,
+        TNS_XML_TYPE_STRING,
     };
     #[cfg(unix)]
     use super::{
@@ -13306,6 +13743,7 @@ mod tests {
             server_state: ServerSidePiggybackState::default(),
             in_request: false,
             cancel_flag: Arc::new(AtomicBool::new(false)),
+            cancel_signal: Arc::new(AtomicU8::new(BREAK_SIGNAL_NONE)),
             ttc_sequence: 3,
             pool_managed: false,
             drcp_establish_session: false,
@@ -13334,6 +13772,20 @@ mod tests {
         let mut header = [0u8; 8];
         stream.read_exact(&mut header).unwrap();
         read_tns_test_packet_body_after_header(stream, protocol_version, header)
+    }
+
+    fn read_raw_tns_test_packet(stream: &mut TcpStream, protocol_version: u16) -> Vec<u8> {
+        let mut header = [0u8; 8];
+        stream.read_exact(&mut header).unwrap();
+        let size = if protocol_version >= 315 {
+            u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize
+        } else {
+            u16::from_be_bytes([header[0], header[1]]) as usize
+        };
+        let mut packet = header.to_vec();
+        packet.resize(size, 0);
+        stream.read_exact(&mut packet[8..]).unwrap();
+        packet
     }
 
     fn read_tns_test_packet_body_after_header(
@@ -13369,7 +13821,7 @@ mod tests {
 
     #[test]
     fn write_data_packet_uses_protocol_specific_length_and_data_flags_for_chunks() {
-        for protocol_version in [314, 315, 318, 319] {
+        for protocol_version in [314] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
             let server = std::thread::spawn(move || {
@@ -13430,7 +13882,7 @@ mod tests {
 
     #[test]
     fn write_eof_data_packet_matches_python_oracledb_logoff_close_packet() {
-        for protocol_version in [314, 315, 318, 319] {
+        for protocol_version in [314] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
             let server = std::thread::spawn(move || {
@@ -13891,8 +14343,8 @@ mod tests {
     }
 
     #[test]
-    fn read_data_packet_converts_reset_marker_to_end_of_response_for_all_protocols() {
-        for protocol_version in [314, 315, 318, 319] {
+    fn read_data_packet_resets_marker_and_reads_trailing_data_for_all_protocols() {
+        for protocol_version in [314, 315, 317, 318, 319] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
             let server = std::thread::spawn(move || {
@@ -13902,6 +14354,22 @@ mod tests {
                         protocol_version,
                         TNS_PACKET_TYPE_MARKER,
                         &[1, 0, TNS_MARKER_TYPE_RESET],
+                    ))
+                    .unwrap();
+                let reset = read_tns_test_packet(&mut stream, protocol_version);
+                assert_eq!(
+                    reset.last().copied(),
+                    Some(TNS_MARKER_TYPE_RESET),
+                    "{protocol_version}"
+                );
+                let mut data_body = Vec::new();
+                data_body.extend_from_slice(&TNS_DATA_FLAGS_END_OF_RESPONSE.to_be_bytes());
+                data_body.extend_from_slice(&[TNS_MSG_TYPE_END_OF_RESPONSE]);
+                stream
+                    .write_all(&tns_test_packet(
+                        protocol_version,
+                        TNS_PACKET_TYPE_DATA,
+                        &data_body,
                     ))
                     .unwrap();
             });
@@ -13923,7 +14391,7 @@ mod tests {
 
     #[test]
     fn read_data_packet_replies_to_break_marker_and_continues_for_all_protocols() {
-        for protocol_version in [314, 315, 318, 319] {
+        for protocol_version in [314, 315, 317, 318, 319] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
             let server = std::thread::spawn(move || {
@@ -13952,6 +14420,15 @@ mod tests {
                     "{protocol_version}"
                 );
 
+                if protocol_version >= 315 {
+                    stream
+                        .write_all(&tns_test_packet(
+                            protocol_version,
+                            TNS_PACKET_TYPE_MARKER,
+                            &[1, 0, TNS_MARKER_TYPE_RESET],
+                        ))
+                        .unwrap();
+                }
                 let mut data_body = Vec::new();
                 data_body.extend_from_slice(&TNS_DATA_FLAGS_EOF.to_be_bytes());
                 data_body.extend_from_slice(&[0xaa, 0xbb]);
@@ -13973,6 +14450,134 @@ mod tests {
             assert_eq!(payload, vec![0xaa, 0xbb], "{protocol_version}");
             server.join().unwrap();
         }
+    }
+
+    #[test]
+    fn marker_packet_bytes_match_go_ora_and_python_oracledb() {
+        let fixtures = [
+            (
+                314,
+                vec![0, 0x0b, 0, 0, TNS_PACKET_TYPE_MARKER, 0, 0, 0, 1, 0],
+            ),
+            (
+                315,
+                vec![0, 0, 0, 0x0b, TNS_PACKET_TYPE_MARKER, 0, 0, 0, 1, 0],
+            ),
+            (
+                317,
+                vec![0, 0, 0, 0x0b, TNS_PACKET_TYPE_MARKER, 0, 0, 0, 1, 0],
+            ),
+            (
+                318,
+                vec![0, 0, 0, 0x0b, TNS_PACKET_TYPE_MARKER, 0, 0, 0, 1, 0],
+            ),
+        ];
+        for (protocol_version, mut expected_prefix) in fixtures {
+            for marker_type in [TNS_MARKER_TYPE_INTERRUPT, TNS_MARKER_TYPE_RESET] {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let addr = listener.local_addr().unwrap();
+                let server = std::thread::spawn(move || {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    read_raw_tns_test_packet(&mut stream, protocol_version)
+                });
+                let mut stream = TcpStream::connect(addr).unwrap();
+
+                write_marker_packet(&mut stream, protocol_version, marker_type).unwrap();
+                let packet = server.join().unwrap();
+
+                expected_prefix.push(marker_type);
+                assert_eq!(packet, expected_prefix, "{protocol_version}/{marker_type}");
+                expected_prefix.pop();
+            }
+        }
+    }
+
+    #[test]
+    fn protocol_314_marker_reset_consumes_one_packet_like_go_ora() {
+        let protocol_version = 314;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .write_all(&tns_test_packet(
+                    protocol_version,
+                    TNS_PACKET_TYPE_MARKER,
+                    &[1, 0, TNS_MARKER_TYPE_BREAK],
+                ))
+                .unwrap();
+
+            let first_reset = read_raw_tns_test_packet(&mut stream, protocol_version);
+            assert_eq!(
+                first_reset,
+                vec![
+                    0,
+                    0x0b,
+                    0,
+                    0,
+                    TNS_PACKET_TYPE_MARKER,
+                    0,
+                    0,
+                    0,
+                    1,
+                    0,
+                    TNS_MARKER_TYPE_RESET
+                ]
+            );
+
+            stream
+                .write_all(&tns_test_packet(
+                    protocol_version,
+                    TNS_PACKET_TYPE_MARKER,
+                    &[1, 0, TNS_MARKER_TYPE_BREAK],
+                ))
+                .unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            let mut header = [0u8; 8];
+            let err = stream.read_exact(&mut header).unwrap_err();
+            assert!(
+                matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::UnexpectedEof
+                ),
+                "protocol {protocol_version}: marker consumed by go-ora processMarker should not receive immediate RESET: {err}"
+            );
+            stream.set_read_timeout(None).unwrap();
+
+            stream
+                .write_all(&tns_test_packet(
+                    protocol_version,
+                    TNS_PACKET_TYPE_MARKER,
+                    &[1, 0, TNS_MARKER_TYPE_BREAK],
+                ))
+                .unwrap();
+            let second_reset = read_raw_tns_test_packet(&mut stream, protocol_version);
+            assert_eq!(second_reset, first_reset);
+
+            let mut data_body = Vec::new();
+            data_body.extend_from_slice(&TNS_DATA_FLAGS_EOF.to_be_bytes());
+            data_body.extend_from_slice(&[0xaa, 0xbb]);
+            stream
+                .write_all(&tns_test_packet(
+                    protocol_version,
+                    TNS_PACKET_TYPE_DATA,
+                    &data_body,
+                ))
+                .unwrap();
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut session = test_session_with_stream(stream);
+
+        let (flags, payload) =
+            read_data_packet_with_flags(&mut session.stream, protocol_version).unwrap();
+
+        assert_eq!(flags, TNS_DATA_FLAGS_EOF);
+        assert_eq!(payload, vec![0xaa, 0xbb]);
+        server.join().unwrap();
     }
 
     #[test]
@@ -14060,17 +14665,241 @@ mod tests {
     }
 
     #[test]
+    fn protocol_314_cancel_direct_error_data_does_not_send_extra_reset() {
+        let protocol_version = 314;
+        let caps = OracleThinCapabilities {
+            protocol_version: Some(protocol_version),
+            ttc_field_version: 6,
+            supports_end_of_call_status: false,
+            supports_fast_session_attributes: false,
+            supports_big_clr_chunks: false,
+            ..OracleThinCapabilities::default()
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_caps = caps.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_one_tns_test_packet(&mut stream, protocol_version);
+
+            let mut payload = vec![TNS_MSG_TYPE_ERROR];
+            push_legacy_summary_prefix(&mut payload, 0, 1013, 0, 0);
+            for _ in 0..4 {
+                write_ub4(&mut payload, 0);
+            }
+            write_bytes_with_length_for_capabilities(
+                &mut payload,
+                b"ORA-01013: user requested cancel of current operation\n",
+                &server_caps,
+            )
+            .unwrap();
+            write_data_packet(&mut stream, protocol_version, TNS_DEFAULT_SDU, &payload).unwrap();
+
+            stream
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            let mut header = [0u8; 8];
+            let err = stream.read_exact(&mut header).unwrap_err();
+            assert!(
+                matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::UnexpectedEof
+                ),
+                "protocol 314 direct cancel data should not be followed by RESET: {err}"
+            );
+        });
+
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut session = test_session_with_stream(stream);
+        session.capabilities = caps;
+        session
+            .cancel_signal
+            .store(BREAK_SIGNAL_INBAND, std::sync::atomic::Ordering::SeqCst);
+        session
+            .cancel_flag
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let err = session
+            .execute_request(&StatementRequest::query(
+                "select count(*) from all_objects",
+                1,
+            ))
+            .expect_err("direct ORA-01013 data should be returned");
+        assert!(
+            err.to_string().contains("ORA-01013"),
+            "unexpected cancel error: {err}"
+        );
+        assert!(!session
+            .cancel_flag
+            .load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!session.is_broken());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn cancel_state_stays_in_progress_until_break_drain_finishes() {
+        let protocol_version = 315;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let interrupt = read_tns_test_packet(&mut stream, protocol_version);
+            assert_eq!(interrupt.last().copied(), Some(TNS_MARKER_TYPE_INTERRUPT));
+            stream
+                .write_all(&tns_test_packet(
+                    protocol_version,
+                    TNS_PACKET_TYPE_MARKER,
+                    &[1, 0, TNS_MARKER_TYPE_RESET],
+                ))
+                .unwrap();
+            let reset = read_tns_test_packet(&mut stream, protocol_version);
+            assert_eq!(reset.last().copied(), Some(TNS_MARKER_TYPE_RESET));
+            let mut data_body = Vec::new();
+            data_body.extend_from_slice(&TNS_DATA_FLAGS_END_OF_RESPONSE.to_be_bytes());
+            data_body.extend_from_slice(&[TNS_MSG_TYPE_ERROR]);
+            stream
+                .write_all(&tns_test_packet(
+                    protocol_version,
+                    TNS_PACKET_TYPE_DATA,
+                    &data_body,
+                ))
+                .unwrap();
+        });
+
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut session = test_session_with_stream(stream);
+        session.capabilities.protocol_version = Some(protocol_version);
+        session.capabilities.supports_oob = true;
+        session
+            .cancel_signal
+            .store(BREAK_SIGNAL_OOB, std::sync::atomic::Ordering::SeqCst);
+        session
+            .cancel_flag
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let signal = session
+            .current_cancel_signal()
+            .expect("cancel should be pending");
+        assert_eq!(signal, BreakSignal::Oob);
+        assert!(session
+            .cancel_flag
+            .load(std::sync::atomic::Ordering::SeqCst));
+
+        let err = session.finish_cancelled_read(signal);
+        assert!(
+            err.to_string().contains("ORA-01013"),
+            "unexpected cancel error: {err}"
+        );
+        assert!(!session
+            .cancel_flag
+            .load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            session
+                .cancel_signal
+                .load(std::sync::atomic::Ordering::SeqCst),
+            BREAK_SIGNAL_NONE
+        );
+        assert!(!session.is_broken());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn oob_cancel_marker_reset_is_handled_in_read_path_without_extra_interrupt() {
+        let protocol_version = 315;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .write_all(&tns_test_packet(
+                    protocol_version,
+                    TNS_PACKET_TYPE_MARKER,
+                    &[1, 0, TNS_MARKER_TYPE_RESET],
+                ))
+                .unwrap();
+            let reset = read_tns_test_packet(&mut stream, protocol_version);
+            assert_eq!(reset.last().copied(), Some(TNS_MARKER_TYPE_RESET));
+
+            let mut data_body = Vec::new();
+            data_body.extend_from_slice(&TNS_DATA_FLAGS_END_OF_RESPONSE.to_be_bytes());
+            data_body.push(TNS_MSG_TYPE_STATUS);
+            write_ub4(&mut data_body, 0);
+            write_ub2(&mut data_body, 0);
+            data_body.push(TNS_MSG_TYPE_END_OF_RESPONSE);
+            stream
+                .write_all(&tns_test_packet(
+                    protocol_version,
+                    TNS_PACKET_TYPE_DATA,
+                    &data_body,
+                ))
+                .unwrap();
+
+            stream
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            let mut header = [0u8; 8];
+            let err = stream.read_exact(&mut header).unwrap_err();
+            assert!(
+                matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::UnexpectedEof
+                ),
+                "unexpected extra packet after marker reset: {err}"
+            );
+        });
+
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut session = test_session_with_stream(stream);
+        session.capabilities.protocol_version = Some(protocol_version);
+        session.capabilities.supports_oob = true;
+        session
+            .cancel_signal
+            .store(BREAK_SIGNAL_OOB, std::sync::atomic::Ordering::SeqCst);
+        session
+            .cancel_flag
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let cancel_state = CancelReadState {
+            flag: &session.cancel_flag,
+            signal: &session.cancel_signal,
+        };
+
+        let mut server_state = ServerSidePiggybackState::default();
+        super::read_execute_response_with_state(
+            &mut session.stream,
+            &session.capabilities,
+            &StatementRequest::query("select count(*) from all_objects", 1),
+            &mut server_state,
+            ExecuteReadState::default(),
+            false,
+            Some(cancel_state),
+        )
+        .expect("marker reset should drain without an extra break packet");
+        assert!(!session
+            .cancel_flag
+            .load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            session
+                .cancel_signal
+                .load(std::sync::atomic::Ordering::SeqCst),
+            BREAK_SIGNAL_NONE
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
     fn cancel_reset_drains_break_response_and_keeps_connection_reusable() {
-        for protocol_version in [314, 315, 318, 319] {
+        for protocol_version in [314, 315, 317, 318, 319] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
             let server = std::thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
-                // python-oracledb (315/318/319) style: the drain opens with the
-                // client RESET (we read it back), then the server answers with
-                // its own RESET marker followed by the trailing ORA-01013
-                // error/end-of-response data packet that closes the boundary.
-                read_one_tns_test_packet(&mut stream, protocol_version);
+                // python-oracledb (315/317/318/319) style: the reader receives a
+                // server marker, then answers it with a client RESET before
+                // consuming the trailing ORA-01013 error/end-of-response data.
                 stream
                     .write_all(&tns_test_packet(
                         protocol_version,
@@ -14078,6 +14907,7 @@ mod tests {
                         &[1, 0, TNS_MARKER_TYPE_RESET],
                     ))
                     .unwrap();
+                read_one_tns_test_packet(&mut stream, protocol_version);
                 let mut data_body = Vec::new();
                 data_body.extend_from_slice(&TNS_DATA_FLAGS_END_OF_RESPONSE.to_be_bytes());
                 data_body.extend_from_slice(&[TNS_MSG_TYPE_ERROR]);
@@ -14096,7 +14926,7 @@ mod tests {
             session.capabilities.protocol_version = Some(protocol_version);
 
             session
-                .drain_cancel_response()
+                .drain_cancel_response(BreakSignal::InBand)
                 .unwrap_or_else(|err| panic!("protocol {protocol_version} drain failed: {err}"));
             assert!(
                 !session.is_broken(),
@@ -14110,7 +14940,7 @@ mod tests {
     fn break_execution_without_oob_sends_single_interrupt_marker() {
         // Mirrors python-oracledb `_break_external`: with OOB unavailable the
         // graceful break is signalled by exactly one in-band INTERRUPT marker.
-        for protocol_version in [314, 315, 318, 319] {
+        for protocol_version in [314, 315, 317, 318, 319] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
             let server = std::thread::spawn(move || {
@@ -14190,17 +15020,31 @@ mod tests {
     }
 
     #[test]
-    fn cancel_reset_terminates_on_trailing_data_without_server_reset() {
-        // go-ora (protocol 314) style: after the client RESET the server sends
-        // exactly one data packet (no server RESET marker). The drain must stop
-        // on that data packet rather than waiting for the quiet timeout.
-        for protocol_version in [314, 315, 318, 319] {
+    fn modern_oob_cancel_drain_sends_interrupt_then_resets_server_marker() {
+        for protocol_version in [315, 317, 318, 319] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
             let server = std::thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
-                // client RESET that opens the handshake
-                read_one_tns_test_packet(&mut stream, protocol_version);
+                let interrupt = read_tns_test_packet(&mut stream, protocol_version);
+                assert_eq!(
+                    interrupt.last().copied(),
+                    Some(TNS_MARKER_TYPE_INTERRUPT),
+                    "{protocol_version}: expected python-oracledb OOB follow-up INTERRUPT"
+                );
+                stream
+                    .write_all(&tns_test_packet(
+                        protocol_version,
+                        TNS_PACKET_TYPE_MARKER,
+                        &[1, 0, TNS_MARKER_TYPE_RESET],
+                    ))
+                    .unwrap();
+                let reset = read_tns_test_packet(&mut stream, protocol_version);
+                assert_eq!(
+                    reset.last().copied(),
+                    Some(TNS_MARKER_TYPE_RESET),
+                    "{protocol_version}: expected client RESET after server marker"
+                );
                 let mut data_body = Vec::new();
                 data_body.extend_from_slice(&TNS_DATA_FLAGS_END_OF_RESPONSE.to_be_bytes());
                 data_body.extend_from_slice(&[TNS_MSG_TYPE_ERROR]);
@@ -14211,6 +15055,112 @@ mod tests {
                         &data_body,
                     ))
                     .unwrap();
+            });
+            let stream = TcpStream::connect(addr).unwrap();
+            let mut session = test_session_with_stream(stream);
+            session.capabilities.protocol_version = Some(protocol_version);
+            session.capabilities.supports_oob = true;
+
+            session
+                .drain_cancel_response(BreakSignal::Oob)
+                .unwrap_or_else(|err| panic!("protocol {protocol_version} drain failed: {err}"));
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn modern_cancel_reset_discards_packets_until_reset_marker() {
+        for protocol_version in [315, 317, 318, 319] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let interrupt = read_tns_test_packet(&mut stream, protocol_version);
+                assert_eq!(interrupt.last().copied(), Some(TNS_MARKER_TYPE_INTERRUPT));
+                stream
+                    .write_all(&tns_test_packet(
+                        protocol_version,
+                        TNS_PACKET_TYPE_MARKER,
+                        &[1, 0, TNS_MARKER_TYPE_BREAK],
+                    ))
+                    .unwrap();
+                let reset = read_tns_test_packet(&mut stream, protocol_version);
+                assert_eq!(reset.last().copied(), Some(TNS_MARKER_TYPE_RESET));
+
+                let mut discarded = Vec::new();
+                discarded.extend_from_slice(&TNS_DATA_FLAGS_END_OF_RESPONSE.to_be_bytes());
+                discarded.push(TNS_MSG_TYPE_END_OF_RESPONSE);
+                stream
+                    .write_all(&tns_test_packet(
+                        protocol_version,
+                        TNS_PACKET_TYPE_DATA,
+                        &discarded,
+                    ))
+                    .unwrap();
+                stream
+                    .write_all(&tns_test_packet(
+                        protocol_version,
+                        TNS_PACKET_TYPE_MARKER,
+                        &[1, 0, TNS_MARKER_TYPE_RESET],
+                    ))
+                    .unwrap();
+                let mut trailing = Vec::new();
+                trailing.extend_from_slice(&TNS_DATA_FLAGS_END_OF_RESPONSE.to_be_bytes());
+                trailing.push(TNS_MSG_TYPE_ERROR);
+                stream
+                    .write_all(&tns_test_packet(
+                        protocol_version,
+                        TNS_PACKET_TYPE_DATA,
+                        &trailing,
+                    ))
+                    .unwrap();
+            });
+            let stream = TcpStream::connect(addr).unwrap();
+            let mut session = test_session_with_stream(stream);
+            session.capabilities.protocol_version = Some(protocol_version);
+            session.capabilities.supports_oob = true;
+
+            session
+                .drain_cancel_response(BreakSignal::Oob)
+                .unwrap_or_else(|err| panic!("protocol {protocol_version} drain failed: {err}"));
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn protocol_314_cancel_drain_reads_direct_data_without_initial_reset() {
+        // go-ora (protocol 314) style: after BreakConnection the read path reads
+        // first. If the server already sends data, the client does not send an
+        // eager RESET marker.
+        for protocol_version in [314] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut data_body = Vec::new();
+                data_body.extend_from_slice(&TNS_DATA_FLAGS_END_OF_RESPONSE.to_be_bytes());
+                data_body.extend_from_slice(&[TNS_MSG_TYPE_ERROR]);
+                stream
+                    .write_all(&tns_test_packet(
+                        protocol_version,
+                        TNS_PACKET_TYPE_DATA,
+                        &data_body,
+                    ))
+                    .unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(100)))
+                    .unwrap();
+                let mut header = [0u8; 8];
+                let err = stream.read_exact(&mut header).unwrap_err();
+                assert!(
+                    matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::UnexpectedEof
+                    ),
+                    "protocol {protocol_version}: direct data drain should not send RESET: {err}"
+                );
                 std::thread::sleep(Duration::from_millis(200));
             });
             let stream = TcpStream::connect(addr).unwrap();
@@ -14219,7 +15169,7 @@ mod tests {
 
             let started = std::time::Instant::now();
             session
-                .drain_cancel_response()
+                .drain_cancel_response(BreakSignal::InBand)
                 .unwrap_or_else(|err| panic!("protocol {protocol_version} drain failed: {err}"));
             assert!(
                 started.elapsed() < CANCEL_RESET_DRAIN_TIMEOUT,
@@ -14231,6 +15181,93 @@ mod tests {
             );
             server.join().unwrap();
         }
+    }
+
+    #[test]
+    fn protocol_314_cancel_drain_marker_reset_consumes_one_packet_like_go_ora() {
+        let protocol_version = 314;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .write_all(&tns_test_packet(
+                    protocol_version,
+                    TNS_PACKET_TYPE_MARKER,
+                    &[1, 0, TNS_MARKER_TYPE_BREAK],
+                ))
+                .unwrap();
+
+            let first_reset = read_raw_tns_test_packet(&mut stream, protocol_version);
+            assert_eq!(
+                first_reset,
+                vec![
+                    0,
+                    0x0b,
+                    0,
+                    0,
+                    TNS_PACKET_TYPE_MARKER,
+                    0,
+                    0,
+                    0,
+                    1,
+                    0,
+                    TNS_MARKER_TYPE_RESET
+                ]
+            );
+
+            stream
+                .write_all(&tns_test_packet(
+                    protocol_version,
+                    TNS_PACKET_TYPE_MARKER,
+                    &[1, 0, TNS_MARKER_TYPE_BREAK],
+                ))
+                .unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            let mut header = [0u8; 8];
+            let err = stream.read_exact(&mut header).unwrap_err();
+            assert!(
+                matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::UnexpectedEof
+                ),
+                "protocol {protocol_version}: marker consumed by go-ora processMarker should not receive immediate RESET: {err}"
+            );
+            stream.set_read_timeout(None).unwrap();
+
+            stream
+                .write_all(&tns_test_packet(
+                    protocol_version,
+                    TNS_PACKET_TYPE_MARKER,
+                    &[1, 0, TNS_MARKER_TYPE_BREAK],
+                ))
+                .unwrap();
+            let second_reset = read_raw_tns_test_packet(&mut stream, protocol_version);
+            assert_eq!(second_reset, first_reset);
+
+            let mut data_body = Vec::new();
+            data_body.extend_from_slice(&TNS_DATA_FLAGS_END_OF_RESPONSE.to_be_bytes());
+            data_body.extend_from_slice(&[TNS_MSG_TYPE_ERROR]);
+            stream
+                .write_all(&tns_test_packet(
+                    protocol_version,
+                    TNS_PACKET_TYPE_DATA,
+                    &data_body,
+                ))
+                .unwrap();
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut session = test_session_with_stream(stream);
+        session.capabilities.protocol_version = Some(protocol_version);
+
+        session
+            .drain_cancel_response(BreakSignal::InBand)
+            .unwrap_or_else(|err| panic!("protocol {protocol_version} drain failed: {err}"));
+        server.join().unwrap();
     }
 
     #[test]
@@ -14632,7 +15669,7 @@ mod tests {
 
     #[test]
     fn fetch_read_error_queues_active_cursor_close_for_all_protocols() {
-        for protocol_version in [314, 315, 318, 319] {
+        for protocol_version in [314, 315, 317, 318, 319] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
             let server = std::thread::spawn(move || {
@@ -14717,6 +15754,7 @@ mod tests {
         for (protocol_version, control_type) in [
             (314, TNS_CONTROL_TYPE_RESET_OOB),
             (315, TNS_CONTROL_TYPE_INBAND_NOTIFICATION),
+            (317, TNS_CONTROL_TYPE_INBAND_NOTIFICATION),
             (318, TNS_CONTROL_TYPE_RESET_OOB),
             (319, TNS_CONTROL_TYPE_INBAND_NOTIFICATION),
         ] {
@@ -19956,6 +20994,7 @@ mod tests {
             &mut server_state,
             ExecuteReadState::default(),
             false,
+            None,
         )
         .unwrap();
 
