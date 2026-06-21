@@ -143,7 +143,7 @@ impl Default for ConnectOptions {
             desired_protocol_version: 319,
             minimum_protocol_version: TNS_MIN_SUPPORTED_PROTOCOL,
             desired_ttc_field_version: None,
-            disable_oob_probe: true,
+            disable_oob_probe: false,
             tcp_connect_timeout: TNS_DEFAULT_TCP_CONNECT_TIMEOUT,
             retry_count: 0,
             retry_delay: Duration::from_secs(1),

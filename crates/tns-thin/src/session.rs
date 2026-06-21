@@ -626,19 +626,7 @@ impl OracleThinCancelHandle {
             let mut stream = stream
                 .lock()
                 .map_err(|_| OracleThinError::new("Oracle thin cancel stream lock poisoned"))?;
-            // Mirror python-oracledb `_break_external`: out-of-band urgent data
-            // and the in-band INTERRUPT marker are mutually exclusive. When OOB
-            // is available the server is notified via the urgent byte alone;
-            // otherwise an in-band marker is the only signal it will see.
-            if self.supports_oob {
-                let _ = send_oob_break(&stream);
-            } else {
-                write_marker_packet(
-                    &mut stream,
-                    self.protocol_version,
-                    TNS_MARKER_TYPE_INTERRUPT,
-                )?;
-            }
+            send_break_signal(&mut stream, self.protocol_version, self.supports_oob)?;
         }
         Ok(())
     }
@@ -859,19 +847,12 @@ impl OracleThinSession {
     /// the socket is left open so the reader can run the break/reset handshake.
     pub fn break_execution(&self) -> Result<(), OracleThinError> {
         self.cancel_flag.store(true, Ordering::SeqCst);
-        // Mirror python-oracledb `_break_external`: OOB urgent data and the
-        // in-band INTERRUPT marker are mutually exclusive (see
-        // [`OracleThinCancelHandle::break_execution`]).
-        if self.capabilities.supports_oob {
-            let _ = send_oob_break(&self.stream);
-        } else {
-            let mut stream = self.stream.try_clone()?;
-            write_marker_packet(
-                &mut stream,
-                self.capabilities.protocol_version.unwrap_or(319),
-                TNS_MARKER_TYPE_INTERRUPT,
-            )?;
-        }
+        let mut stream = self.stream.try_clone()?;
+        send_break_signal(
+            &mut stream,
+            self.capabilities.protocol_version.unwrap_or(319),
+            self.capabilities.supports_oob,
+        )?;
         Ok(())
     }
 
@@ -3090,7 +3071,7 @@ fn normalize_cursor_ids(mut cursor_ids: Vec<u32>) -> Vec<u32> {
 }
 
 #[cfg(unix)]
-fn send_oob_break(stream: &TcpStream) -> Result<(), OracleThinError> {
+fn send_oob_break(stream: &TcpStream) -> Result<bool, OracleThinError> {
     let value = b"!";
     let written = unsafe {
         libc::send(
@@ -3101,17 +3082,29 @@ fn send_oob_break(stream: &TcpStream) -> Result<(), OracleThinError> {
         )
     };
     if written == value.len() as isize {
-        Ok(())
+        Ok(true)
     } else {
         Err(OracleThinError::from(std::io::Error::last_os_error()))
     }
 }
 
 #[cfg(not(unix))]
-fn send_oob_break(_stream: &TcpStream) -> Result<(), OracleThinError> {
-    Err(OracleThinError::new(
-        "Oracle thin out-of-band break is not supported on this platform",
-    ))
+fn send_oob_break(_stream: &TcpStream) -> Result<bool, OracleThinError> {
+    Ok(false)
+}
+
+fn send_break_signal(
+    stream: &mut TcpStream,
+    protocol_version: u16,
+    supports_oob: bool,
+) -> Result<(), OracleThinError> {
+    if supports_oob {
+        if send_oob_break(stream)? {
+            return Ok(());
+        }
+    }
+
+    write_marker_packet(stream, protocol_version, TNS_MARKER_TYPE_INTERRUPT)
 }
 
 fn capabilities_from_accept(
@@ -3160,7 +3153,9 @@ fn probe_oob_reset_if_supported(
     {
         return Ok(());
     }
-    send_oob_break(stream)?;
+    if !send_oob_break(stream)? {
+        return Ok(());
+    }
     write_marker_packet(
         stream,
         capabilities.protocol_version.unwrap_or(319),
@@ -14159,6 +14154,37 @@ mod tests {
             assert_eq!(
                 trailing, 0,
                 "protocol {protocol_version}: only the marker should be sent"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn break_execution_with_oob_sends_no_external_marker_when_oob_succeeds() {
+        for protocol_version in [315, 317, 318, 319] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(100)))
+                    .unwrap();
+                let mut header = [0u8; 8];
+                stream.read(&mut header).unwrap_or(0)
+            });
+            let stream = TcpStream::connect(addr).unwrap();
+            let mut session = test_session_with_stream(stream);
+            session.capabilities.protocol_version = Some(protocol_version);
+            session.capabilities.supports_oob = true;
+
+            session
+                .break_execution()
+                .unwrap_or_else(|err| panic!("protocol {protocol_version} break failed: {err}"));
+
+            let normal_bytes = server.join().unwrap();
+            assert_eq!(
+                normal_bytes, 0,
+                "protocol {protocol_version}: OOB external break must not also write an in-band marker"
             );
         }
     }

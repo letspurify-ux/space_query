@@ -93,6 +93,7 @@ const MAX_WORD_UNDO_HISTORY: usize = 500;
 const MAX_WORD_UNDO_HISTORY_BYTES: usize = 64 * 1024 * 1024;
 const EDITOR_TOP_PADDING: i32 = 4;
 const ALERT_RETRY_INTERVAL_SECONDS: f64 = 0.25;
+const ORACLE_THIN_LAZY_FETCH_DB_CANCEL_FORCE_TIMEOUT: Duration = Duration::from_millis(1_200);
 
 type ObjectContextCallback = Arc<Mutex<Option<Box<dyn FnMut(String, IntellisenseData) -> bool>>>>;
 
@@ -2937,12 +2938,37 @@ impl SqlEditorWidget {
     }
 
     fn start_lazy_fetch_cancel_watchdog(&self, session_id: u64) {
+        let timeout = Self::lazy_fetch_cancel_watchdog_timeout_for(
+            &self.active_lazy_fetch,
+            session_id,
+            self.cancel_timeout(),
+        );
         Self::start_lazy_fetch_cancel_watchdog_with(
             self.active_lazy_fetch.clone(),
             self.progress_sender.clone(),
             session_id,
-            self.cancel_timeout(),
+            timeout,
         );
+    }
+
+    fn lazy_fetch_cancel_watchdog_timeout_for(
+        active_lazy_fetch: &Arc<Mutex<Option<LazyFetchHandle>>>,
+        session_id: u64,
+        configured_timeout: Duration,
+    ) -> Duration {
+        let db_cancel_requested = active_lazy_fetch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|handle| {
+                handle.session_id == session_id
+                    && handle.db_cancel_requested.load(Ordering::Relaxed)
+            });
+        if db_cancel_requested {
+            configured_timeout.min(ORACLE_THIN_LAZY_FETCH_DB_CANCEL_FORCE_TIMEOUT)
+        } else {
+            configured_timeout
+        }
     }
 
     fn start_lazy_fetch_cancel_watchdog_with(

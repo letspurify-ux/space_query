@@ -23907,6 +23907,59 @@ mod query_execution_cleanup_tests {
     }
 
     #[test]
+    fn lazy_fetch_db_cancel_uses_short_force_watchdog_timeout() {
+        let (sender, _receiver) = mpsc::channel();
+        let db_cancel_requested = Arc::new(AtomicBool::new(true));
+        let active = Arc::new(Mutex::new(Some(LazyFetchHandle {
+            index: 3,
+            session_id: 42,
+            operation_id: 42,
+            connection_generation: 7,
+            sender,
+            cancel_handle: None,
+            cancel_requested: Arc::new(AtomicBool::new(true)),
+            retain_session_on_cancel: Arc::new(AtomicBool::new(true)),
+            db_cancel_requested: db_cancel_requested.clone(),
+            fetch_in_progress: Arc::new(AtomicBool::new(true)),
+        })));
+
+        assert_eq!(
+            SqlEditorWidget::lazy_fetch_cancel_watchdog_timeout_for(
+                &active,
+                42,
+                Duration::from_secs(60),
+            ),
+            Duration::from_millis(1_200)
+        );
+        assert_eq!(
+            SqlEditorWidget::lazy_fetch_cancel_watchdog_timeout_for(
+                &active,
+                42,
+                Duration::from_millis(500),
+            ),
+            Duration::from_millis(500)
+        );
+
+        db_cancel_requested.store(false, Ordering::Relaxed);
+        assert_eq!(
+            SqlEditorWidget::lazy_fetch_cancel_watchdog_timeout_for(
+                &active,
+                42,
+                Duration::from_secs(60),
+            ),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            SqlEditorWidget::lazy_fetch_cancel_watchdog_timeout_for(
+                &active,
+                99,
+                Duration::from_secs(60),
+            ),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
     fn repeated_lazy_cancel_keeps_handle_canceling_until_worker_closes() {
         let (sender, receiver) = mpsc::channel();
         let active = Arc::new(Mutex::new(Some(LazyFetchHandle {
@@ -30522,7 +30575,7 @@ mod mysql_transaction_feedback_tests {
         if let Some(version) = oracle_thin_ttc_field_version_env("ORACLE_THIN_TTC_FIELD_VERSION") {
             config.connect_options.desired_ttc_field_version = Some(version);
         }
-        config.connect_options.disable_oob_probe = true;
+        config.connect_options.disable_oob_probe = false;
         config
     }
 
@@ -31124,6 +31177,17 @@ mod mysql_transaction_feedback_tests {
                             Some(session_id),
                             true,
                         ));
+                        let timeout = SqlEditorWidget::lazy_fetch_cancel_watchdog_timeout_for(
+                            &active_lazy_fetch,
+                            session_id,
+                            Duration::from_secs(60),
+                        );
+                        SqlEditorWidget::start_lazy_fetch_cancel_watchdog_with(
+                            active_lazy_fetch.clone(),
+                            sender.clone(),
+                            session_id,
+                            timeout,
+                        );
                         cancel_sent = true;
                     }
                 }
@@ -32544,7 +32608,9 @@ mod mysql_transaction_feedback_tests {
     #[ignore = "requires local Oracle listener"]
     fn oracle_thin_lazy_fetch_cancel_during_fetch_all_closes_without_cleanup_error() {
         let sql = "select a.object_id from all_objects a, all_objects b, all_objects c";
+        let started = Instant::now();
         let progress = oracle_thin_lazy_fetch_cancel_during_fetch_all_progress(sql, 1);
+        let elapsed = started.elapsed();
         let failures = oracle_thin_progress_failures(&progress);
         let close_events = progress
             .iter()
@@ -32562,6 +32628,11 @@ mod mysql_transaction_feedback_tests {
             })
             .collect::<Vec<_>>();
 
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "Oracle Thin lazy cancel should close promptly; elapsed={elapsed:?} events={}",
+            progress.len()
+        );
         assert!(
             failures.is_empty(),
             "Oracle Thin lazy cancel failures: {failures:?}"
@@ -32608,8 +32679,10 @@ mod mysql_transaction_feedback_tests {
         assert_oracle_thin_protocol_318_fv12_no_eor(&caps_conn);
 
         let sql = "select a.object_id from all_objects a, all_objects b, all_objects c";
+        let started = Instant::now();
         let progress =
             oracle_thin_lazy_fetch_cancel_during_fetch_all_progress_with_config(config, sql, 1);
+        let elapsed = started.elapsed();
         let failures = oracle_thin_progress_failures(&progress);
         let close_events = progress
             .iter()
@@ -32627,6 +32700,11 @@ mod mysql_transaction_feedback_tests {
             })
             .collect::<Vec<_>>();
 
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "318/FV12 lazy cancel should close promptly; elapsed={elapsed:?} events={}",
+            progress.len()
+        );
         assert!(
             failures.is_empty(),
             "Oracle Thin 318/FV12 lazy cancel failures: {failures:?}"
