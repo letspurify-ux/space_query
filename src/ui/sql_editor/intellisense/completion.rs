@@ -12314,9 +12314,24 @@ impl SqlEditorWidget {
             return None;
         }
 
-        if !toks.iter().any(|token| {
-            matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("SELECT"))
-        }) {
+        // The governing `SELECT` must be at the query's own top level. A `SELECT`
+        // buried in a sub-paren (a CTE body, a scalar subquery) does not put the
+        // cursor in a select list — `WITH c AS (SELECT …) … CYCLE |` is in the WITH
+        // clause, not a projection, so `FROM` must not be offered there.
+        let mut select_depth = 0i32;
+        let has_top_level_select = toks.iter().any(|token| match token {
+            SqlToken::Symbol(sym) if sym == "(" || sym == "[" => {
+                select_depth += 1;
+                false
+            }
+            SqlToken::Symbol(sym) if sym == ")" || sym == "]" => {
+                select_depth = (select_depth - 1).max(0);
+                false
+            }
+            SqlToken::Word(word) => select_depth == 0 && word.eq_ignore_ascii_case("SELECT"),
+            _ => false,
+        });
+        if !has_top_level_select {
             return None;
         }
 
@@ -12328,9 +12343,23 @@ impl SqlEditorWidget {
         // *column* (`SELECT nulls |`) reports `None` and still completes the item.
         let follows_complete_projection = match toks.last() {
             Some(SqlToken::Word(word)) => {
+                // The select-list heads (`SELECT`/`DISTINCT`/`AS`/…) never end an
+                // item; nor does a binary set / collection operator
+                // (`a UNION |`, `a MULTISET UNION |`) — its right operand is still
+                // pending, so `FROM` is premature there too.
                 !matches!(
                     word.to_ascii_uppercase().as_str(),
-                    "SELECT" | "DISTINCT" | "ALL" | "UNIQUE" | "DISTINCTROW" | "AS"
+                    "SELECT"
+                        | "DISTINCT"
+                        | "ALL"
+                        | "UNIQUE"
+                        | "DISTINCTROW"
+                        | "AS"
+                        | "UNION"
+                        | "INTERSECT"
+                        | "EXCEPT"
+                        | "MINUS"
+                        | "MULTISET"
                 ) && Self::cursor_follows_complete_operand(tokens, end) != Some(false)
             }
             Some(SqlToken::Symbol(sym)) => sym == "*" || sym == ")",
@@ -12888,6 +12917,47 @@ impl SqlEditorWidget {
 
         let words = Self::previous_meaningful_words_upper(tokens, end, 1);
         matches!(words.last().map(String::as_str), Some("SAMPLE")).then_some(&["BLOCK"])
+    }
+
+    /// MySQL index-hint keywords after a table reference (`FROM t USE |` →
+    /// `INDEX`/`KEY`, `… USE INDEX |` → `FOR`). Without this the trailing
+    /// `USE`/`IGNORE`/`FORCE` is mistaken for a table alias and the query-clause
+    /// continuation leaks. Gated so a statement-initial `USE db` and DML modifiers
+    /// (`DELETE IGNORE`) are untouched. (`… INDEX FOR |` → `JOIN`/… is shadowed by
+    /// the `FOR UPDATE` locking handler — a deferred niche-completeness gap.)
+    fn expected_mysql_index_hint_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        phase: intellisense_context::SqlPhase,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        // Index hints live in a query's table clause; gating on the table context
+        // keeps the same keywords in DDL (`CREATE TABLESPACE … USE LOGFILE`) clear.
+        if !phase.is_table_context()
+            || !crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            || Self::unclosed_paren_count(tokens, end) != 0
+        {
+            return None;
+        }
+        let words = Self::previous_meaningful_words_upper(tokens, end, 4);
+        let last = words.last().map(String::as_str)?;
+        let prev = words
+            .len()
+            .checked_sub(2)
+            .and_then(|idx| words.get(idx))
+            .map(String::as_str);
+        match last {
+            // `FROM t USE|IGNORE|FORCE |` — the hint introducer must directly follow
+            // a table reference (a plain identifier), so it is not a statement head
+            // (`USE db`) nor a DML modifier (`DELETE IGNORE`, `INSERT IGNORE`).
+            "USE" | "IGNORE" | "FORCE"
+                if prev.is_some_and(|word| !Self::token_is_language_keyword(word)) =>
+            {
+                Some(&["INDEX", "KEY"])
+            }
+            "INDEX" | "KEY" if matches!(prev, Some("USE" | "IGNORE" | "FORCE")) => Some(&["FOR"]),
+            _ => None,
+        }
     }
 
     fn expected_flashback_query_keyword_candidates(
@@ -20985,6 +21055,11 @@ impl SqlEditorWidget {
         }
         if let Some(candidates) =
             Self::expected_flashback_query_keyword_candidates(tokens, context_end, deep_ctx.phase)
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(candidates) =
+            Self::expected_mysql_index_hint_keyword_candidates(tokens, context_end, deep_ctx.phase, db_type)
         {
             return Self::filter_expected_candidates(prefix, candidates);
         }

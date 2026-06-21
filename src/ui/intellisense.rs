@@ -4154,6 +4154,16 @@ pub(crate) fn sql_context_for_phase(
 pub struct SignaturePopup {
     frame: Option<Frame>,
     visible: bool,
+    last_render: Option<SignaturePopupRenderState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SignaturePopupRenderState {
+    display: String,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
 }
 
 impl SignaturePopup {
@@ -4171,6 +4181,7 @@ impl SignaturePopup {
         Self {
             frame: None,
             visible: false,
+            last_render: None,
         }
     }
 
@@ -4265,12 +4276,29 @@ impl SignaturePopup {
         let width = (text_w + 20).clamp(120, 1100);
         let height = Self::height();
         let (x, y) = Self::overlay_position(editor, anchor_pos, width, height);
+        let render_state = SignaturePopupRenderState {
+            display,
+            x,
+            y,
+            width,
+            height,
+        };
+
+        if self.is_visible()
+            && self
+                .last_render
+                .as_ref()
+                .is_some_and(|last_render| last_render == &render_state)
+        {
+            return;
+        }
 
         let Some(frame) = self.ensure_frame(editor) else {
             self.visible = false;
+            self.last_render = None;
             return;
         };
-        frame.set_label(&display);
+        frame.set_label(&render_state.display);
         frame.set_size(width, height);
         frame.set_pos(x, y);
         frame.show();
@@ -4279,10 +4307,12 @@ impl SignaturePopup {
             win.redraw();
         }
         self.visible = true;
+        self.last_render = Some(render_state);
     }
 
     pub fn hide(&mut self) {
         self.visible = false;
+        self.last_render = None;
         if let Some(frame) = self.frame.as_mut() {
             if frame.was_deleted() {
                 return;

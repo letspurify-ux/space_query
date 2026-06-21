@@ -36611,3 +36611,90 @@ fn grant_option_and_insert_all_do_not_offer_wrong_tail() {
         assert!(!has(&kw(sql), "RETURNING"), "RETURNING leaked into multi-table INSERT `{sql}`: {:?}", kw(sql));
     }
 }
+
+/// A binary set / collection operator in the select list (`a UNION |`, `a MULTISET
+/// UNION |`) leaves its right operand pending, so `FROM` is premature — the query
+/// set operators are also handled by the set-op continuation (which offers
+/// `SELECT`), but the collection (`MULTISET …`) operators must not leak `FROM`.
+/// Ordinary complete items still offer it.
+#[test]
+fn from_is_not_offered_after_a_set_or_collection_operator() {
+    let kw = |sql: &str| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix, &analyze_inline_cursor_sql(sql), Some(crate::db::DatabaseType::Oracle))
+    };
+    let has_from = |sql: &str| kw(sql).iter().any(|x| x == "FROM");
+
+    for sql in [
+        "SELECT a UNION |",
+        "SELECT a INTERSECT |",
+        "SELECT a MINUS |",
+        "SELECT a MULTISET UNION |",
+        "SELECT a MULTISET INTERSECT |",
+        "SELECT a MULTISET EXCEPT |",
+        "SELECT a MULTISET |",
+    ] {
+        assert!(!has_from(sql), "FROM offered after a set/collection operator `{sql}`: {:?}", kw(sql));
+    }
+    // Ordinary complete items still offer FROM.
+    assert!(has_from("SELECT a |"));
+    assert!(has_from("SELECT a, b |"));
+}
+
+/// A MySQL index hint after a table reference (`FROM t USE |`) offers `INDEX`/`KEY`
+/// instead of leaking the query-clause continuation (the trailing `USE`/`IGNORE`/
+/// `FORCE` was previously mistaken for a table alias). It stays scoped: a
+/// statement-initial `USE db`, a DML modifier (`DELETE IGNORE`), and the same
+/// keyword in DDL (`CREATE TABLESPACE … USE LOGFILE`) are untouched.
+#[test]
+fn mysql_index_hint_after_table_offers_index_not_clause_continuation() {
+    let kw = |sql: &str| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix, &analyze_inline_cursor_sql(sql), Some(crate::db::DatabaseType::MySQL))
+    };
+    let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
+
+    for sql in ["SELECT a FROM t USE |", "SELECT a FROM t IGNORE |", "SELECT a FROM t alias FORCE |"] {
+        let s = kw(sql);
+        assert!(has(&s, "INDEX") && has(&s, "KEY"), "index hint missing INDEX/KEY `{sql}`: {s:?}");
+        assert!(!has(&s, "WHERE") && !has(&s, "JOIN"), "clause continuation leaked at hint `{sql}`: {s:?}");
+    }
+    assert_eq!(kw("SELECT a FROM t USE INDEX |"), vec!["FOR".to_string()]);
+
+    // Not an index hint: keep the existing meaning.
+    assert!(has(&kw("DELETE IGNORE |"), "FROM"));          // DML modifier
+    assert!(has(&kw("CREATE TABLESPACE ts USE |"), "LOGFILE")); // DDL
+    assert!(!has(&kw("SELECT a FROM t |"), "INDEX"));      // ordinary table → continuation
+}
+
+/// `FROM` in the select list is gated on a *top-level* `SELECT`: a `SELECT` buried
+/// in a sub-paren (a CTE body, a scalar subquery) does not put the cursor in a
+/// projection, so `WITH c AS (SELECT …) … |` (in the WITH clause) must not offer
+/// `FROM`, while the main query and a real (current-query-scoped) subquery select
+/// list still do.
+#[test]
+fn select_list_from_requires_a_top_level_select() {
+    let kw = |sql: &str| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix, &analyze_inline_cursor_sql(sql), Some(crate::db::DatabaseType::Oracle))
+    };
+    let has_from = |sql: &str| kw(sql).iter().any(|x| x == "FROM");
+
+    // WITH-clause positions (only the CTE body has a SELECT, at depth > 0).
+    assert!(!has_from("WITH c (a) AS (SELECT 1 FROM dual) |"));
+    assert!(!has_from("WITH c (a) AS (SELECT 1 FROM dual) SEARCH DEPTH FIRST BY a SET sq CYCLE |"));
+    // Real select lists (top-level SELECT, or a current-query-scoped subquery).
+    assert!(has_from("WITH c AS (SELECT 1 FROM dual) SELECT a |"));
+    assert!(has_from("SELECT a |"));
+    assert!(has_from("SELECT * FROM (SELECT a |) x"));
+    assert!(has_from("SELECT (SELECT a |) FROM dual"));
+}
