@@ -7082,6 +7082,66 @@ impl SqlEditorWidget {
         None
     }
 
+    /// Whether `target` appears as a word at the statement's top paren level
+    /// (depth 0) in `tokens[..end]`. Distinguishes a statement-level clause keyword
+    /// from the same word nested inside a function-call / sub-expression paren —
+    /// including a *closed* one, which `unclosed_paren_count` (open parens only) and
+    /// a flat `words_for_keyword_slot` scan both miss (`JSON_VALUE(j RETURNING
+    /// NUMBER) |` must not be read as a DML `RETURNING`).
+    fn top_level_word_present_before(tokens: &[SqlToken], end: usize, target: &str) -> bool {
+        let mut depth = 0i32;
+        for token in tokens.get(..end.min(tokens.len())).unwrap_or(tokens) {
+            match token {
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => depth += 1,
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => depth = (depth - 1).max(0),
+                SqlToken::Word(word) if depth == 0 && word.eq_ignore_ascii_case(target) => {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Whether `first` immediately followed by `second` occurs as a contiguous word
+    /// pair at the statement's top paren level (depth 0) in `tokens[..end]`. Used to
+    /// detect a multi-word clause head (`LOG ERRORS`) without mistaking a function
+    /// *named* like the first word for it — a call's name sits at depth 0 but is
+    /// immediately followed by `(`, not the second keyword (`LOG(10, x)` ≠ the DML
+    /// error-logging clause).
+    fn top_level_word_pair_present_before(
+        tokens: &[SqlToken],
+        end: usize,
+        first: &str,
+        second: &str,
+    ) -> bool {
+        let mut depth = 0i32;
+        let mut prev_was_first = false;
+        for token in tokens.get(..end.min(tokens.len())).unwrap_or(tokens) {
+            match token {
+                SqlToken::Comment(_) => continue,
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => {
+                    depth += 1;
+                    prev_was_first = false;
+                }
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => {
+                    depth = (depth - 1).max(0);
+                    prev_was_first = false;
+                }
+                SqlToken::Symbol(_) => prev_was_first = false,
+                SqlToken::Word(word) if depth == 0 => {
+                    if prev_was_first && word.eq_ignore_ascii_case(second) {
+                        return true;
+                    }
+                    prev_was_first = word.eq_ignore_ascii_case(first);
+                }
+                SqlToken::Word(_) => prev_was_first = false,
+                SqlToken::String(_) => prev_was_first = false,
+            }
+        }
+        false
+    }
+
     fn type_display_from_token_range(
         tokens: &[SqlToken],
         start: usize,
@@ -9303,6 +9363,38 @@ impl SqlEditorWidget {
         Self::within_group_slot(tokens, end)
     }
 
+    /// `<closed call> KEEP |` / `<closed call> OVER |` — an analytic continuation
+    /// that still awaits its parenthesised argument: `KEEP (DENSE_RANK FIRST|LAST
+    /// ORDER BY …)` or, for `OVER`, an inline `(window-spec)` / a named window.
+    /// Until that argument begins, only `(` (or, after `OVER`, a window name) is
+    /// grammatical, so identifiers, operators and the select-list `FROM` are all
+    /// premature here. Gated on the keyword closing a *call* `)` so `KEEP`/`OVER`
+    /// written as a column alias after a grouping paren (`(a+b) keep`) is unaffected.
+    /// `WITHIN` has its own `within_group_slot`; once the argument's `(` is open,
+    /// `keep_dense_rank_slot` / the window-spec handlers take over inside it.
+    fn cursor_at_analytic_continuation_awaiting_argument(tokens: &[SqlToken], end: usize) -> bool {
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        let [prefix @ .., SqlToken::Word(word)] = toks.as_slice() else {
+            return false;
+        };
+        matches!(word.to_ascii_uppercase().as_str(), "KEEP" | "OVER")
+            && Self::call_name_before_close(prefix).is_some()
+    }
+
+    fn cursor_at_analytic_continuation_awaiting_argument_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::cursor_at_analytic_continuation_awaiting_argument(tokens, end)
+    }
+
     fn analytic_null_treatment_call_kind(name: &str) -> Option<AnalyticNullTreatmentCall> {
         match name {
             "NTH_VALUE" => Some(AnalyticNullTreatmentCall::NthValue),
@@ -11054,6 +11146,10 @@ impl SqlEditorWidget {
                 .is_some()
             || Self::within_group_slot_for_context(deep_ctx, exclude_current_identifier_chain)
                 .is_some()
+            || Self::cursor_at_analytic_continuation_awaiting_argument_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
             || Self::analytic_null_treatment_slot_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
@@ -11230,6 +11326,10 @@ impl SqlEditorWidget {
                 .is_some()
             || Self::within_group_slot_for_context(deep_ctx, exclude_current_identifier_chain)
                 .is_some()
+            || Self::cursor_at_analytic_continuation_awaiting_argument_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
             || Self::analytic_null_treatment_slot_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
@@ -12095,28 +12195,59 @@ impl SqlEditorWidget {
 
         let toks = Self::meaningful_tokens_before(tokens, end);
         // The join target (or its alias) must be complete: the last token is a
-        // plain identifier word, not a join keyword and not a separator.
-        let SqlToken::Word(last) = toks.last()? else {
-            return None;
-        };
-        if is_join_keyword(last) {
-            return None;
+        // plain identifier word or the closing `)` of a parenthesised source — not a
+        // join keyword (still typing the type) and not a bare separator.
+        match toks.last()? {
+            SqlToken::Word(word) if is_join_keyword(word) => return None,
+            SqlToken::Word(_) => {}
+            SqlToken::Symbol(sym) if sym == ")" => {}
+            _ => return None,
         }
 
         // Walk back to the governing `JOIN`; between it and the cursor only the
-        // target name (`schema.table`) and an optional alias word may appear.
+        // target reference (a `schema.table` name or a parenthesised source —
+        // derived table / `TABLE(...)`) and an optional alias word may appear.
         let mut idx = toks.len() - 1;
         let join_idx = loop {
+            match &toks[idx] {
+                SqlToken::Word(word) if word.eq_ignore_ascii_case("JOIN") => break idx,
+                // An `ON`/`USING` between the cursor and the `JOIN` means a join
+                // condition is already complete (`JOIN t ON (a=b) |`), so this is the
+                // post-condition position, not a bare-target slot.
+                SqlToken::Word(word)
+                    if matches!(word.to_ascii_uppercase().as_str(), "ON" | "USING") =>
+                {
+                    return None;
+                }
+                SqlToken::Word(_) => {} // part of the table name or its alias
+                SqlToken::Symbol(sym) if sym == "." => {} // dotted name separator
+                SqlToken::Symbol(sym) if sym == ")" => {
+                    // Skip the whole parenthesised source back to its matching `(`;
+                    // what introduces it (`JOIN`) is resolved on the next iteration.
+                    let mut depth = 1i32;
+                    loop {
+                        if idx == 0 {
+                            return None;
+                        }
+                        idx -= 1;
+                        match &toks[idx] {
+                            SqlToken::Symbol(sym) if sym == ")" => depth += 1,
+                            SqlToken::Symbol(sym) if sym == "(" => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => return None, // comma / operator: not a simple target
+            }
             if idx == 0 {
                 return None;
             }
             idx -= 1;
-            match &toks[idx] {
-                SqlToken::Word(word) if word.eq_ignore_ascii_case("JOIN") => break idx,
-                SqlToken::Word(_) => {} // part of the table name or its alias
-                SqlToken::Symbol(sym) if sym == "." => {} // dotted name separator
-                _ => return None, // comma / paren / operator: not a simple target
-            }
         };
 
         // `CROSS JOIN` / `NATURAL JOIN` take no join condition.
@@ -12435,6 +12566,9 @@ impl SqlEditorWidget {
                         | "MINUS"
                         | "MULTISET"
                 ) && Self::cursor_follows_complete_operand(tokens, end) != Some(false)
+                    // An analytic continuation (`agg KEEP |` / `… OVER |`) still
+                    // awaits its parenthesised argument, so the item is unfinished.
+                    && !Self::cursor_at_analytic_continuation_awaiting_argument(tokens, end)
             }
             Some(SqlToken::Symbol(sym)) => sym == "*" || sym == ")",
             Some(SqlToken::String(_)) => true,
@@ -12703,6 +12837,8 @@ impl SqlEditorWidget {
             return Some(candidates);
         }
         if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            // MySQL's column-property ordering is loose (`NOT NULL DEFAULT v
+            // AUTO_INCREMENT …`), so the full catalog stays valid after a constraint.
             Some(&[
                 "AUTO_INCREMENT",
                 "CHECK",
@@ -12718,6 +12854,20 @@ impl SqlEditorWidget {
                 "REFERENCES",
                 "UNIQUE",
                 "VISIBLE",
+            ])
+        } else if Self::column_definition_has_inline_constraint(&words) {
+            // Oracle puts the column properties (`DEFAULT`/identity/`COLLATE`/
+            // visibility) *before* the inline constraints; once a constraint has been
+            // written only further constraints may follow, so the pre-constraint
+            // properties are dropped (they are no longer grammatical here).
+            Some(&[
+                "CONSTRAINT",
+                "NOT NULL",
+                "NULL",
+                "PRIMARY KEY",
+                "UNIQUE",
+                "CHECK",
+                "REFERENCES",
             ])
         } else {
             Some(&[
@@ -12736,6 +12886,22 @@ impl SqlEditorWidget {
                 "VISIBLE",
             ])
         }
+    }
+
+    /// Whether an Oracle column definition has already written an inline constraint
+    /// (a `CONSTRAINT` clause, `NOT NULL`, `PRIMARY KEY`, `UNIQUE`, `CHECK`, or
+    /// `REFERENCES`). `words` are the definition's words; the first (the column name)
+    /// is skipped so a column *named* like a keyword is not mistaken for one, and the
+    /// data-type words never collide with these markers. Partial constraints (`NOT`,
+    /// `PRIMARY`, `FOREIGN`) are resolved by earlier arms, so any marker seen here is
+    /// a complete constraint.
+    fn column_definition_has_inline_constraint(words: &[String]) -> bool {
+        words.iter().skip(1).any(|word| {
+            matches!(
+                word.as_str(),
+                "CONSTRAINT" | "NOT" | "PRIMARY" | "UNIQUE" | "CHECK" | "REFERENCES"
+            )
+        })
     }
 
     /// Classifies the cursor relative to a `REFERENCES` clause in the current
@@ -12954,7 +13120,15 @@ impl SqlEditorWidget {
         let head = words.first()?.as_str();
         let mysql = crate::sql_text::mysql_compatibility_for_sql("", db_type);
         let contains = |keyword: &str| words.iter().any(|word| word == keyword);
-        let has_returning = contains("RETURNING");
+        // `RETURNING` and `LOG` must be counted only at the statement top level —
+        // both also occur *inside* a closed function call (`f(x RETURNING y)`, the
+        // math function `LOG(10, x)`), where a flat `contains` would wrongly mark the
+        // DML RETURNING / error-logging clause as present and withdraw the whole tail.
+        let has_returning = Self::top_level_word_present_before(tokens, end, "RETURNING");
+        // The error-logging clause is `LOG ERRORS …`; match the pair so the math
+        // function `LOG(10, x)` (a top-level name followed by `(`) is not mistaken
+        // for it.
+        let has_log = Self::top_level_word_pair_present_before(tokens, end, "LOG", "ERRORS");
         let complete_assignment_or_predicate = Self::cursor_follows_complete_predicate(tokens, end);
 
         // Oracle DML error-logging clause `LOG ERRORS [INTO tbl] [REJECT LIMIT
@@ -12964,15 +13138,15 @@ impl SqlEditorWidget {
         if !mysql && is_dml {
             match words.last().map(String::as_str) {
                 Some("LOG") => return Some(&["ERRORS"]),
-                Some("ERRORS") if contains("LOG") => return Some(&["INTO", "REJECT LIMIT"]),
-                Some("REJECT") if contains("LOG") => return Some(&["LIMIT"]),
-                Some("LIMIT") if contains("LOG") && contains("REJECT") => {
+                Some("ERRORS") if has_log => return Some(&["INTO", "REJECT LIMIT"]),
+                Some("REJECT") if has_log => return Some(&["LIMIT"]),
+                Some("LIMIT") if has_log && contains("REJECT") => {
                     return Some(&["UNLIMITED"])
                 }
                 _ => {}
             }
         }
-        let returning_done = has_returning || (is_dml && contains("LOG"));
+        let returning_done = has_returning || (is_dml && has_log);
 
         match head {
             "UPDATE" if contains("SET") && !returning_done && complete_assignment_or_predicate => {
@@ -13744,6 +13918,40 @@ impl SqlEditorWidget {
         let words = Self::words_for_keyword_slot(tokens, end);
         let is_keyword =
             |word: &str| crate::sql_text::is_sql_keyword_for_db(word, crate::db::DatabaseType::Oracle);
+
+        // `FORALL <idx> IN <bounds> [SAVE EXCEPTIONS] |` is followed by exactly one
+        // bound DML statement. After the bound (a complete operand) the DML verbs are
+        // offered — plus `SAVE EXCEPTIONS`, until it is present; once a DML verb has
+        // begun, nothing is re-offered.
+        if let Some(forall_idx) = words.iter().position(|word| word == "FORALL") {
+            let after = &words[forall_idx..];
+            let has_in = after.iter().any(|word| word == "IN");
+            let has_dml = after.iter().any(|word| {
+                matches!(word.as_str(), "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "EXECUTE")
+            });
+            if has_in && !has_dml {
+                if words.last().map(String::as_str) == Some("EXCEPTIONS") {
+                    return Some(&["INSERT", "UPDATE", "DELETE", "MERGE", "EXECUTE IMMEDIATE"]);
+                }
+                // The bound is complete only past its operand — not at the bound
+                // keywords themselves (`IN |`, `INDICES |`, `INDICES OF |`).
+                if !matches!(
+                    words.last().map(String::as_str),
+                    Some("IN" | "OF" | "INDICES" | "VALUES")
+                ) && Self::cursor_immediately_follows_complete_operand(tokens, end)
+                {
+                    return Some(&[
+                        "INSERT",
+                        "UPDATE",
+                        "DELETE",
+                        "MERGE",
+                        "EXECUTE IMMEDIATE",
+                        "SAVE EXCEPTIONS",
+                    ]);
+                }
+            }
+        }
+
         match words.as_slice() {
             // `OPEN <cur> FOR |` — a query expression follows.
             [.., open, name, for_word]
@@ -14434,6 +14642,10 @@ impl SqlEditorWidget {
             if Self::unclosed_paren_count(tokens, end) != 0 {
                 return None;
             }
+            // `ON |` introduces the indexed *table* — a relation, not a keyword.
+            if last == Some("ON") {
+                return None;
+            }
             if last == Some("USING") {
                 return Some(&["BTREE", "HASH"]);
             }
@@ -14570,7 +14782,13 @@ impl SqlEditorWidget {
         let has = |keyword: &str| words.iter().any(|word| word == keyword);
         let last = words.last().map(String::as_str);
 
-        if !mysql && has("GROUP") && has("BY") {
+        // The extended `GROUP BY` grammar (`ROLLUP`/`CUBE`/`GROUPING SETS`) lives at
+        // the query's top level. Gating on `unclosed_paren_count == 0` keeps it from
+        // firing inside a paren whose `GROUP`/`BY` belong to a different construct —
+        // e.g. `LISTAGG(x) WITHIN GROUP (ORDER BY |` (the `GROUP` is `WITHIN GROUP`'s,
+        // the `BY` is the inner `ORDER BY`'s). A real subquery `GROUP BY` is at depth
+        // 0 within its own current-query token scope, so it is unaffected.
+        if !mysql && has("GROUP") && has("BY") && Self::unclosed_paren_count(tokens, end) == 0 {
             if last == Some("GROUPING") {
                 return Some(&["SETS"]);
             }
@@ -14579,7 +14797,7 @@ impl SqlEditorWidget {
             }
         }
         if !mysql
-            && has("RETURNING")
+            && Self::top_level_word_present_before(tokens, end, "RETURNING")
             && Self::unclosed_paren_count(tokens, end) == 0
             && !Self::cursor_is_at_json_returning_type(tokens, end)
         {
@@ -15326,12 +15544,61 @@ impl SqlEditorWidget {
         )
     }
 
+    /// Whether the `)` at `close_idx` in `toks` closes a parenthesised table source
+    /// at a FROM-list position — a derived table `(SELECT …)`, a `TABLE(coll)`
+    /// collection source, a parenthesised join, or a parenthesised table reference.
+    /// Identified by the matching `(`'s introducer being a FROM-list slot (`FROM` /
+    /// `,` / a JOIN keyword / `APPLY` / `LATERAL` / `TABLE` / a nested `(`), which —
+    /// since the caller is already in the FROM-clause phase — is what distinguishes
+    /// it from a predicate / function-call / grouping paren.
+    fn paren_closes_from_list_table_source(toks: &[&SqlToken], close_idx: usize) -> bool {
+        if !matches!(toks.get(close_idx), Some(SqlToken::Symbol(sym)) if *sym == ")") {
+            return false;
+        }
+        let mut depth = 0i32;
+        let mut open_idx = None;
+        for idx in (0..=close_idx).rev() {
+            match toks[idx] {
+                SqlToken::Symbol(sym) if sym == ")" => depth += 1,
+                SqlToken::Symbol(sym) if sym == "(" => {
+                    depth -= 1;
+                    if depth == 0 {
+                        open_idx = Some(idx);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(open_idx) = open_idx else {
+            return false;
+        };
+        match open_idx.checked_sub(1).and_then(|idx| toks.get(idx)) {
+            // A leading parenthesised source (`(SELECT …) |` as the whole FROM list)
+            // or one nested in another `(`/after a `,`.
+            None => true,
+            Some(SqlToken::Symbol(sym)) => matches!(sym.as_str(), "(" | ","),
+            Some(SqlToken::Word(word)) => matches!(
+                word.to_ascii_uppercase().as_str(),
+                "FROM" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "CROSS"
+                    | "NATURAL" | "OUTER" | "APPLY" | "LATERAL" | "TABLE" | "STRAIGHT_JOIN"
+            ),
+            _ => false,
+        }
+    }
+
     fn cursor_is_after_complete_from_relation(tokens: &[SqlToken], end: usize) -> bool {
         let toks = Self::meaningful_tokens_before(tokens, end);
         // A closed table-clause construct (`… PIVOT (…) |`, `… MATCH_RECOGNIZE
         // (…) |`) completes the relation even though it ends in `)` rather than an
         // identifier — so the query continuation (`WHERE`/`JOIN`/…) follows it.
         if Self::cursor_follows_complete_table_clause_construct(&toks) {
+            return true;
+        }
+        // A parenthesised table source with no trailing alias (`FROM (SELECT …) |`,
+        // `FROM TABLE(coll) |`) ends in `)` — it is just as complete as a named
+        // relation, so the same continuation follows.
+        if Self::paren_closes_from_list_table_source(&toks, toks.len().wrapping_sub(1)) {
             return true;
         }
         // The reference (or its implicit alias) must be complete: the last token
@@ -15344,7 +15611,8 @@ impl SqlEditorWidget {
         }
         // Walk back over the reference's own words / dotted-name separators to the
         // structural token that introduces the list slot: `FROM` or a `,` means a
-        // complete comma-list reference; anything else (a `JOIN`/join-type word, a
+        // complete comma-list reference; a `)` means an aliased parenthesised source
+        // (`FROM (SELECT …) v |`, `FROM (SELECT …) AS v |`); anything else (a
         // `(`, an operator) belongs to another slot and is left untouched.
         let mut idx = toks.len() - 1;
         while idx > 0 {
@@ -15352,6 +15620,9 @@ impl SqlEditorWidget {
             match &toks[idx] {
                 SqlToken::Word(word) if word.eq_ignore_ascii_case("FROM") => return true,
                 SqlToken::Symbol(sym) if sym == "," => return true,
+                SqlToken::Symbol(sym) if sym == ")" => {
+                    return Self::paren_closes_from_list_table_source(&toks, idx)
+                }
                 SqlToken::Word(_) => {} // part of the table name or its implicit alias
                 SqlToken::Symbol(sym) if sym == "." => {} // dotted-name separator
                 _ => return false,
@@ -20680,6 +20951,35 @@ impl SqlEditorWidget {
     /// `FOR` clauses — and PL/SQL `FOR` loops / `OPEN … FOR` (a neutral phase)
     /// keep their normal completion. `FOR UPDATE OF |` is a column list, so it
     /// returns `None` and is unaffected.
+    /// Within a top-level `FOR { UPDATE | SHARE } OF <col>[, <col>]… `, whether the
+    /// cursor follows a *complete* column — so the lock-wait options (and a further
+    /// `, col`) may follow — rather than sitting at a fresh-column slot (`OF |`,
+    /// `…, |`). Returns false when no such `OF` precedes the cursor or a lock-wait
+    /// option (`NOWAIT`/`WAIT`/`SKIP LOCKED`) has already been written.
+    fn for_update_of_column_list_is_complete(tokens: &[SqlToken], end: usize) -> bool {
+        let words = Self::words_for_keyword_slot(tokens, end);
+        let Some(for_idx) = words.iter().rposition(|word| word == "FOR") else {
+            return false;
+        };
+        if !matches!(words.get(for_idx + 1).map(String::as_str), Some("UPDATE" | "SHARE")) {
+            return false;
+        }
+        if words.get(for_idx + 2).map(String::as_str) != Some("OF") {
+            return false;
+        }
+        let tail = &words[for_idx + 3..];
+        if tail.is_empty()
+            || tail
+                .iter()
+                .any(|word| matches!(word.as_str(), "NOWAIT" | "WAIT" | "SKIP" | "LOCKED"))
+        {
+            return false;
+        }
+        // Not at a fresh-column slot: the last token is a complete column operand,
+        // not the bare `OF` keyword or a trailing comma.
+        Self::cursor_immediately_follows_complete_operand(tokens, end)
+    }
+
     fn expected_locking_clause_keyword_candidates(
         tokens: &[SqlToken],
         end: usize,
@@ -20699,6 +20999,17 @@ impl SqlEditorWidget {
                 &["OF", "NOWAIT", "SKIP"]
             } else {
                 &["OF", "NOWAIT", "WAIT", "SKIP"]
+            });
+        }
+        // `FOR UPDATE|SHARE OF <col>[, <col>]… |` — once a column has been written
+        // the lock-wait options follow (a further `, col` is also valid, but only
+        // after a comma, so no column is offered at this post-list slot). The bare
+        // `OF |` / `…, |` column slots are handled below by returning `None`.
+        if Self::for_update_of_column_list_is_complete(tokens, end) {
+            return Some(if mysql {
+                &["NOWAIT", "SKIP"]
+            } else {
+                &["NOWAIT", "WAIT", "SKIP"]
             });
         }
         if last == Some("SKIP") {

@@ -1813,7 +1813,6 @@ fn audit_dump_completeness() {
     use crate::db::DatabaseType::{MySQL, Oracle};
     let oracle = [
         // documented remaining false-negative gaps
-        "SELECT a FROM t FOR UPDATE OF c |",
         "CREATE TABLE c (id NUMBER, FOREIGN KEY (id) REFERENCES p (id) ON |)",
         "INSERT INTO emp (a, b) |",
         "INSERT INTO emp |",
@@ -28010,6 +28009,51 @@ fn within_group_keyword_slots_suppress_identifiers_and_offer_fixed_keywords() {
     assert!(!suppresses("SELECT (ename) WITHIN | FROM emp"));
 }
 
+/// `<closed call> KEEP |` / `… OVER |` is an analytic continuation that still
+/// awaits its parenthesised argument (`KEEP (DENSE_RANK …)`, `OVER (…)`/a window
+/// name). Until the argument begins it is not a complete select item, so the
+/// select-list `FROM` and all identifiers are suppressed — the same "continuation
+/// needs a specific preceding operand" principle as `WITHIN GROUP`. The gating is
+/// call-aware: `KEEP`/`OVER` written as a column alias (after a plain column or a
+/// grouping paren, not a call) keeps normal completion, and the *completed*
+/// continuation (`KEEP (…) |`, `OVER (…) |`) offers `FROM` again.
+#[test]
+fn analytic_continuation_awaiting_argument_suppresses_query_continuation() {
+    let kw = |sql: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "", &analyze_inline_cursor_sql(sql), Some(crate::db::DatabaseType::Oracle))
+    };
+    let suppresses = |sql: &str| {
+        SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(
+            &analyze_inline_cursor_sql(sql), false)
+            || SqlEditorWidget::cursor_is_at_identifier_suppressing_keyword_slot_for_context(
+                &analyze_inline_cursor_sql(sql), false, Some(crate::db::DatabaseType::Oracle))
+    };
+    let has = |v: &Vec<String>, s: &str| v.iter().any(|x| x == s);
+
+    // Pending argument: no `FROM`, identifiers suppressed.
+    for sql in [
+        "SELECT MAX(empno) KEEP | FROM emp",
+        "SELECT MAX(empno) OVER | FROM emp",
+    ] {
+        assert!(!has(&kw(sql), "FROM"), "FROM leaked before analytic argument at `{sql}`: {:?}", kw(sql));
+        assert!(suppresses(sql), "identifiers not suppressed before analytic argument at `{sql}`");
+    }
+    // Completed continuation: `FROM` returns, nothing suppressed.
+    for sql in [
+        "SELECT MAX(empno) KEEP (DENSE_RANK FIRST ORDER BY empno) | FROM emp",
+        "SELECT MAX(empno) OVER (PARTITION BY empno) | FROM emp",
+    ] {
+        assert!(has(&kw(sql), "FROM"), "FROM missing after complete analytic at `{sql}`: {:?}", kw(sql));
+        assert!(!suppresses(sql), "identifiers wrongly suppressed after complete analytic at `{sql}`");
+    }
+    // Alias lookalikes (not after a call) keep normal completion.
+    assert!(has(&kw("SELECT empno keep | FROM emp"), "FROM"),
+        "alias `keep` lost FROM: {:?}", kw("SELECT empno keep | FROM emp"));
+    assert!(!suppresses("SELECT empno keep | FROM emp"));
+    assert!(!suppresses("SELECT (empno) keep | FROM emp"));
+}
+
 /// `ESCAPE` is grammatical only right after a `LIKE` pattern
 /// (`name LIKE 'a\_%' ESCAPE '\'`), never after a plain operand. It is gated on
 /// the same "continuation that needs a specific preceding operand" principle as
@@ -34097,6 +34141,50 @@ fn transaction_dcl_and_lock_keyword_slots_complete_with_empty_and_two_letter_pre
     assert_keyword("UNLOCK |", "TABLES", MySQL);
 }
 
+/// The row-locking clause `FOR { UPDATE | SHARE } [OF col[, col]…] [NOWAIT | WAIT
+/// n | SKIP LOCKED]` is a small state machine. After the `OF` column list is
+/// complete the lock-wait options follow; the bare `OF |` / `…, |` slots stay
+/// column positions, and once a wait option is written the clause is complete.
+#[test]
+fn for_update_of_column_list_offers_lock_wait_options() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+    let kw = |sql: &str, db: crate::db::DatabaseType| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "", &analyze_inline_cursor_sql(sql), Some(db))
+    };
+    let has = |v: &Vec<String>, s: &str| v.iter().any(|x| x == s);
+
+    // After a complete column the lock-wait options follow (Oracle has `WAIT n`).
+    for sql in ["SELECT a FROM t FOR UPDATE OF c |", "SELECT a FROM t FOR UPDATE OF a, b |"] {
+        let s = kw(sql, Oracle);
+        for opt in ["NOWAIT", "WAIT", "SKIP"] {
+            assert!(has(&s, opt), "`{opt}` missing after FOR UPDATE OF list at `{sql}`: {s:?}");
+        }
+        assert!(!has(&s, "OF"), "`OF` re-offered after column list at `{sql}`: {s:?}");
+    }
+    // MySQL has `[NOWAIT | SKIP LOCKED]` but no `WAIT n`.
+    let m = kw("SELECT a FROM t FOR UPDATE OF c |", MySQL);
+    assert!(has(&m, "NOWAIT") && has(&m, "SKIP") && !has(&m, "WAIT"), "MySQL OF tail: {m:?}");
+
+    // The fresh-column slots (`OF |`, `…, |`) are column positions, not keyword slots.
+    assert!(kw("SELECT a FROM t FOR UPDATE OF |", Oracle).is_empty());
+    assert!(kw("SELECT a FROM t FOR UPDATE OF c, |", Oracle).is_empty());
+    // Once a wait option is written the clause is complete — nothing re-offered.
+    for sql in [
+        "SELECT a FROM t FOR UPDATE OF c NOWAIT |",
+        "SELECT a FROM t FOR UPDATE OF c WAIT 5 |",
+        "SELECT a FROM t FOR UPDATE OF c SKIP LOCKED |",
+    ] {
+        assert!(kw(sql, Oracle).is_empty(), "completed locking clause re-offered at `{sql}`: {:?}", kw(sql, Oracle));
+    }
+    // The earlier states are unchanged: `FOR |` and `FOR UPDATE |`.
+    assert_eq!(kw("SELECT a FROM t FOR |", Oracle), vec!["UPDATE".to_string(), "SHARE".to_string()]);
+    let bare = kw("SELECT a FROM t FOR UPDATE |", Oracle);
+    for opt in ["OF", "NOWAIT", "WAIT", "SKIP"] {
+        assert!(has(&bare, opt), "`{opt}` missing at bare FOR UPDATE: {bare:?}");
+    }
+}
+
 #[test]
 fn remaining_plsql_and_routine_keyword_slots_are_formalized() {
     use crate::db::DatabaseType::Oracle;
@@ -35959,6 +36047,74 @@ fn create_table_constraint_slots_are_precise() {
     );
 }
 
+/// Oracle column properties (`DEFAULT`/identity/`COLLATE`/visibility) precede the
+/// inline constraints, so once a constraint has been written only further
+/// constraints follow — the pre-constraint properties are dropped. MySQL's looser
+/// ordering keeps them. (CREATE and ALTER … ADD share the classifier.)
+#[test]
+fn oracle_inline_column_properties_drop_after_a_constraint() {
+    let kw = |sql: &str, db: crate::db::DatabaseType| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix, &analyze_inline_cursor_sql(sql), Some(db))
+    };
+    use crate::db::DatabaseType::{Oracle, MySQL};
+    let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
+    let dropped = ["DEFAULT", "GENERATED", "IDENTITY", "COLLATE", "INVISIBLE", "VISIBLE"];
+
+    // Oracle: after an inline constraint the property keywords are gone; only the
+    // constraint continuations remain.
+    for sql in [
+        "CREATE TABLE t (a INT NOT NULL |)",
+        "CREATE TABLE t (a INT PRIMARY KEY |)",
+        "CREATE TABLE t (a INT CONSTRAINT c CHECK (a > 0) |)",
+        "ALTER TABLE t ADD c INT NOT NULL |",
+    ] {
+        let s = kw(sql, Oracle);
+        for d in dropped {
+            assert!(!has(&s, d), "`{d}` leaked after a constraint at `{sql}`: {s:?}");
+        }
+        assert!(has(&s, "CONSTRAINT") && has(&s, "CHECK") && has(&s, "PRIMARY KEY"),
+            "constraint continuations missing at `{sql}`: {s:?}");
+    }
+    // Before any constraint the full property catalog is still offered.
+    assert!(has(&kw("CREATE TABLE t (a INT |)", Oracle), "DEFAULT"));
+    assert!(has(&kw("CREATE TABLE t (a INT DEFAULT 5 |)", Oracle), "NOT NULL"));
+    // MySQL keeps the looser ordering (`NOT NULL DEFAULT v`).
+    assert!(has(&kw("CREATE TABLE t (a INT NOT NULL |)", MySQL), "DEFAULT"));
+}
+
+/// `FORALL <idx> IN <bounds> [SAVE EXCEPTIONS] |` is followed by exactly one bound
+/// DML statement, so the DML verbs (plus `SAVE EXCEPTIONS`, until present) are
+/// offered after the bound — and not before it, nor once a verb has begun.
+#[test]
+fn forall_offers_the_bound_dml_statement() {
+    let kw = |sql: &str| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix, &analyze_inline_cursor_sql(sql), Some(crate::db::DatabaseType::Oracle))
+    };
+    let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
+
+    let after_bound = kw("BEGIN FORALL i IN 1..10 | END;");
+    assert!(has(&after_bound, "INSERT") && has(&after_bound, "UPDATE")
+        && has(&after_bound, "SAVE EXCEPTIONS"), "FORALL bound tail: {after_bound:?}");
+    // `INDICES OF` / `VALUES OF` bound forms too.
+    assert!(has(&kw("BEGIN FORALL i IN INDICES OF coll | END;"), "DELETE"));
+    // After SAVE EXCEPTIONS the clause is single-use (not re-offered).
+    let after_save = kw("BEGIN FORALL i IN 1..10 SAVE EXCEPTIONS | END;");
+    assert!(has(&after_save, "INSERT") && !has(&after_save, "SAVE EXCEPTIONS"),
+        "SAVE EXCEPTIONS re-offered: {after_save:?}");
+    // Before the bound is complete, no DML verbs.
+    assert!(!has(&kw("BEGIN FORALL i IN | END;"), "INSERT"));
+    // Once a verb has begun, nothing is re-offered.
+    assert!(!has(&kw("BEGIN FORALL i IN 1..10 INSERT INTO t | END;"), "UPDATE"));
+}
+
 /// `ALTER TABLE … ADD` reuses the CREATE-TABLE element grammar, so the same
 /// column / constraint tail is offered (constraint types, `FOREIGN`→`KEY`,
 /// `FOREIGN KEY (cols)`→`REFERENCES`, the FK pre-`ON` slot, and the column
@@ -37322,4 +37478,91 @@ fn zzz_probe_gaps() {
         let s = kw(sql, MySQL);
         eprintln!("M {:?} FROM={} sample={:?}", sql, has(&s,"FROM"), s.iter().take(4).collect::<Vec<_>>());
     }
+}
+
+/// A clause keyword that *also* occurs inside a function call — `GROUP`/`BY` in
+/// `WITHIN GROUP (ORDER BY …)`, a function `RETURNING` (`JSON_VALUE(j RETURNING
+/// NUMBER)`), the math function `LOG(…)` — must not be mistaken for the
+/// statement-level clause (`GROUP BY ROLLUP/CUBE`, the DML `RETURNING … INTO`, the
+/// `LOG ERRORS` clause). A flat `contains()` is depth-blind; the detectors are
+/// scoped to the statement's top paren level. The genuine top-level clauses, and
+/// the same clause inside a *real* subquery (its own token scope), still work.
+#[test]
+fn clause_keywords_inside_function_calls_do_not_leak_to_statement_level() {
+    let kw = |sql: &str, db: crate::db::DatabaseType| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "", &analyze_inline_cursor_sql(sql), Some(db))
+    };
+    use crate::db::DatabaseType::Oracle;
+    let has = |v: &Vec<String>, s: &str| v.iter().any(|x| x == s);
+
+    // GROUP BY's ROLLUP/CUBE/GROUPING SETS must not leak into a WITHIN GROUP ORDER BY.
+    assert!(kw("SELECT listagg(x,',') WITHIN GROUP (ORDER BY |", Oracle).is_empty(),
+        "GROUP BY extras leaked into WITHIN GROUP ORDER BY");
+    // …but a real (sub)query GROUP BY still offers them.
+    assert!(has(&kw("SELECT count(*) FROM t GROUP BY |", Oracle), "ROLLUP"));
+    assert!(has(&kw("SELECT a FROM t WHERE x IN (SELECT b FROM s GROUP BY |", Oracle), "CUBE"));
+
+    // A function `RETURNING` must not make the select item offer the DML `INTO`.
+    assert!(!has(&kw("SELECT json_value(j, '$.a' RETURNING NUMBER) |", Oracle), "INTO"));
+    assert!(has(&kw("SELECT json_value(j, '$.a' RETURNING NUMBER) |", Oracle), "FROM"));
+    // …but a top-level DML RETURNING still offers INTO.
+    assert!(has(&kw("UPDATE t SET a=1 RETURNING a |", Oracle), "INTO"));
+
+    // A function-internal RETURNING / the math function LOG must not withdraw the
+    // UPDATE SET tail (WHERE/RETURNING).
+    for sql in [
+        "UPDATE t SET a = f(x RETURNING y) |",
+        "UPDATE t SET a = log(10, x) |",
+    ] {
+        let s = kw(sql, Oracle);
+        assert!(has(&s, "WHERE") && has(&s, "RETURNING"),
+            "UPDATE SET tail withdrawn by function-internal keyword at `{sql}`: {s:?}");
+    }
+    // …but the genuine `LOG ERRORS` clause is still recognised and spends RETURNING.
+    assert!(has(&kw("INSERT INTO t VALUES (1) LOG |", Oracle), "ERRORS"));
+    assert!(has(&kw("INSERT INTO t VALUES (1) LOG ERRORS |", Oracle), "INTO"));
+}
+
+/// A parenthesised FROM-list table source — a derived table `(SELECT …)` (with or
+/// without an alias), a comma/JOIN-introduced one, or `TABLE(coll)` — completes the
+/// relation just like a named table, so the same query continuation follows. As a
+/// JOIN target it offers `ON`/`USING` (unless `CROSS`/`NATURAL`), exactly like a
+/// plain table.
+#[test]
+fn derived_table_and_parenthesised_source_offer_query_continuation() {
+    let kw = |sql: &str, db: crate::db::DatabaseType| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "", &analyze_inline_cursor_sql(sql), Some(db))
+    };
+    use crate::db::DatabaseType::{Oracle, MySQL};
+    let has = |v: &Vec<String>, s: &str| v.iter().any(|x| x == s);
+    let offers_continuation = |v: &Vec<String>| has(v, "WHERE") && has(v, "GROUP BY") && has(v, "JOIN");
+
+    // Derived table, with/without alias; comma list; collection source — all offer
+    // the same continuation as a plain table (`FROM t |`).
+    for sql in [
+        "SELECT a FROM (SELECT b FROM s) |",
+        "SELECT a FROM (SELECT b FROM s) v |",
+        "SELECT a FROM t, (SELECT b FROM s) v |",
+        "SELECT a FROM TABLE(f(1)) |",
+    ] {
+        assert!(offers_continuation(&kw(sql, Oracle)),
+            "derived/parenthesised source missing continuation at `{sql}`: {:?}", kw(sql, Oracle));
+    }
+    assert!(offers_continuation(&kw("SELECT a FROM (SELECT b FROM s) AS v |", MySQL)));
+
+    // As a JOIN target it offers ON/USING (like a plain table), with or without alias.
+    for sql in [
+        "SELECT a FROM t1 JOIN (SELECT b FROM s) |",
+        "SELECT a FROM t1 JOIN (SELECT b FROM s) v |",
+    ] {
+        let s = kw(sql, Oracle);
+        assert!(has(&s, "ON") && has(&s, "USING") && !has(&s, "WHERE"),
+            "derived JOIN target should offer ON/USING at `{sql}`: {s:?}");
+    }
+    // CROSS JOIN takes no condition, so the continuation follows instead.
+    assert!(offers_continuation(&kw("SELECT a FROM t1 CROSS JOIN (SELECT b FROM s) |", Oracle)));
+    // The cursor inside the derived table is still its own column context (no leak).
+    assert!(!offers_continuation(&kw("SELECT a FROM (SELECT b FROM s WHERE |", Oracle)));
 }
