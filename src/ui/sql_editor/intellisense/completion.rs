@@ -45,6 +45,11 @@ struct PlsqlKeywordPolicy {
     allow_else: bool,
     /// `END` — closes the innermost open construct.
     allow_end: bool,
+    /// The precise `END` form for the innermost open construct (`END IF`/
+    /// `END LOOP`/`END CASE`, or a bare `END` for a block). `None` when `allow_end`
+    /// is off. Lets the block-statement keyword source offer the exact closer
+    /// instead of a bare `END`.
+    end_keyword: Option<&'static str>,
     /// `EXCEPTION` — opens a block's handler section (once, before it has one).
     allow_exception: bool,
     /// `EXIT`/`CONTINUE` — inside (possibly via a nested construct) a loop.
@@ -364,6 +369,46 @@ const PLSQL_PREDEFINED_EXCEPTIONS: &[&str] = &[
     "VALUE_ERROR",
     "ZERO_DIVIDE",
 ];
+
+/// Procedural statement keywords that can open a PL/SQL block statement. Shared
+/// by the base-catalog statement-start filter (`keyword_begins_statement`) and
+/// the grammar-aware block-statement keyword source
+/// (`expected_plsql_block_statement_keyword_candidates`) so both agree on what a
+/// statement position admits.
+const PLSQL_STATEMENT_KEYWORDS: &[&str] = &[
+    "IF", "CASE", "LOOP", "WHILE", "FOR", "FORALL", "GOTO", "NULL", "RETURN", "RAISE", "BEGIN",
+    "DECLARE", "OPEN", "CLOSE", "FETCH", "EXECUTE", "COMMIT", "ROLLBACK", "SAVEPOINT", "SET",
+    "LOCK", "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "WITH", "PIPE",
+];
+
+/// Maps a recognised `CREATE SEQUENCE` option word to its `&'static str` form so
+/// the option-list classifier can record it without allocating. Bare and
+/// value-bearing options both pass through; an unrecognised word never reaches
+/// here (the classifier matches the exact set first).
+fn option_canonical(word: &str) -> &'static str {
+    match word {
+        "START WITH" => "START WITH",
+        "INCREMENT BY" => "INCREMENT BY",
+        "MINVALUE" => "MINVALUE",
+        "MAXVALUE" => "MAXVALUE",
+        "NOMINVALUE" => "NOMINVALUE",
+        "NOMAXVALUE" => "NOMAXVALUE",
+        "CACHE" => "CACHE",
+        "NOCACHE" => "NOCACHE",
+        "CYCLE" => "CYCLE",
+        "NOCYCLE" => "NOCYCLE",
+        "ORDER" => "ORDER",
+        "NOORDER" => "NOORDER",
+        other => debug_assert_unreachable_option(other),
+    }
+}
+
+/// Unreachable arm for [`option_canonical`]: in debug builds it panics to surface a
+/// classifier/keyword mismatch; in release it falls back to an empty marker.
+fn debug_assert_unreachable_option(word: &str) -> &'static str {
+    debug_assert!(false, "unmapped CREATE SEQUENCE option word: {word}");
+    ""
+}
 
 const JSON_ERROR_EMPTY_OPTION_FUNCTION_WORDS: &[&str] =
     &["JSON_EXISTS", "JSON_QUERY", "JSON_TABLE", "JSON_VALUE"];
@@ -2847,14 +2892,6 @@ impl SqlEditorWidget {
         ctx: StatementStartContext,
         db_type: Option<crate::db::DatabaseType>,
     ) -> bool {
-        // Procedural statement keywords that open a PL/SQL block statement.
-        const PLSQL_STATEMENT_KEYWORDS: &[&str] = &[
-            "IF", "CASE", "LOOP", "WHILE", "FOR", "FORALL", "GOTO", "NULL", "RETURN", "RAISE",
-            "BEGIN", "DECLARE", "OPEN", "CLOSE", "FETCH", "EXECUTE", "COMMIT", "ROLLBACK",
-            "SAVEPOINT", "SET", "LOCK", "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "WITH",
-            "PIPE",
-        ];
-
         match ctx {
             StatementStartContext::TopLevel => Self::keyword_begins_top_level_statement_for_db(upper, db_type),
             StatementStartContext::Plsql(policy) => {
@@ -3646,6 +3683,7 @@ impl SqlEditorWidget {
                     allow_statements: true,
                     allow_when: in_exception,
                     allow_end: true,
+                    end_keyword: Some("END"),
                     allow_exception: !in_exception,
                     allow_exit_continue: any_loop,
                     ..Default::default()
@@ -3660,6 +3698,7 @@ impl SqlEditorWidget {
                     allow_elsif: !in_else,
                     allow_else: !in_else,
                     allow_end: true,
+                    end_keyword: Some("END IF"),
                     allow_exit_continue: any_loop,
                     ..Default::default()
                 })
@@ -3671,6 +3710,7 @@ impl SqlEditorWidget {
                 Some(PlsqlKeywordPolicy {
                     allow_statements: true,
                     allow_end: true,
+                    end_keyword: Some("END LOOP"),
                     allow_exit_continue: true,
                     ..Default::default()
                 })
@@ -3702,6 +3742,7 @@ impl SqlEditorWidget {
                         allow_when: !in_else,
                         allow_else: !in_else,
                         allow_end: true,
+                        end_keyword: Some("END CASE"),
                         allow_exit_continue: any_loop,
                         ..Default::default()
                     })
@@ -3710,6 +3751,7 @@ impl SqlEditorWidget {
                         allow_when: !in_else,
                         allow_else: !in_else,
                         allow_end: true,
+                        end_keyword: Some("END CASE"),
                         ..Default::default()
                     })
                 }
@@ -3727,6 +3769,18 @@ impl SqlEditorWidget {
     /// frame is a `Case`); the latter's condition is an ordinary value expression
     /// whose columns must never be suppressed.
     fn cursor_is_at_plsql_exception_name(tokens: &[SqlToken], end: usize) -> bool {
+        // `RAISE <exception>` names an exception just like a handler `WHEN`; the
+        // word right before the cursor being `RAISE` (inside an executable block, so
+        // it is the statement, not a column) marks the slot. `RAISE;` (bare re-raise)
+        // is also valid, so this is additive — the predefined/declared exception
+        // names are offered without forcing one.
+        if matches!(
+            Self::meaningful_tokens_before(tokens, end).last(),
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("RAISE")
+        ) && Self::cursor_in_plsql_executable_block(tokens, end)
+        {
+            return true;
+        }
         #[derive(Clone, Copy)]
         enum Frame {
             PendingDeclare,
@@ -11097,6 +11151,26 @@ impl SqlEditorWidget {
                 exclude_current_identifier_chain,
                 db_type,
             )
+            || Self::cursor_is_at_create_sequence_option_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+            || Self::cursor_is_at_statement_tail_keyword_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+            || Self::cursor_is_at_mysql_alter_table_element_keyword_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+            || Self::cursor_is_at_transaction_or_lock_keyword_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
             || Self::cursor_is_in_invalid_set_operation_branch_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
@@ -12469,11 +12543,15 @@ impl SqlEditorWidget {
         Self::classify_table_element_tail(def, db_type)
     }
 
-    /// Keyword tail for `ALTER TABLE … ADD <element>` — the column/constraint
-    /// definitions added to an existing table. Shares the classifier with
-    /// `CREATE TABLE` so the constraint/column grammar stays identical. The column
-    /// *type* slots (`ADD col |`, `MODIFY col |`) are intercepted earlier by the
-    /// data-type path, so a non-empty element here is already past its type.
+    /// Keyword tail for `ALTER TABLE … {ADD|MODIFY} <element>` — the column/
+    /// constraint definitions added to, or the column redefinitions applied on, an
+    /// existing table. Shares the classifier with `CREATE TABLE` so the constraint/
+    /// column grammar stays identical. The column *type* slots (`ADD col |`,
+    /// `MODIFY col |`) are intercepted earlier by the data-type path, so a non-empty
+    /// element here is already past its type. At an empty element, `ADD |` offers
+    /// the element-start keywords (a fresh column name is the user's, the keywords
+    /// are the constraint introducers) while `MODIFY |` defers (an existing column
+    /// name is expected — the column path serves it).
     fn expected_alter_table_add_tail_keywords(
         tokens: &[SqlToken],
         end: usize,
@@ -12491,30 +12569,32 @@ impl SqlEditorWidget {
             return None;
         }
 
-        // The governing sub-command is the last top-level action keyword. Only
-        // `ADD` introduces an element *definition* tail; a later MODIFY/CHANGE/
-        // DROP/RENAME/ALTER supersedes it (their tails are type or name slots,
-        // handled elsewhere).
+        // The governing sub-command is the last top-level action keyword. `ADD`
+        // introduces an element *definition* tail; `MODIFY` a column *redefinition*
+        // tail (same column/constraint grammar past the type). A later CHANGE/DROP/
+        // RENAME/ALTER supersedes them (their tails are different slots, handled
+        // elsewhere).
         let mut depth = 0i32;
-        let mut add_idx = None;
+        let mut governing: Option<(usize, bool)> = None; // (index, is_modify)
         for (idx, token) in toks.iter().enumerate() {
             match token {
                 SqlToken::Symbol(sym) if sym == "(" || sym == "[" => depth += 1,
                 SqlToken::Symbol(sym) if sym == ")" || sym == "]" => depth = (depth - 1).max(0),
                 SqlToken::Word(word) if depth == 0 && idx > 1 => {
                     match word.to_ascii_uppercase().as_str() {
-                        "ADD" => add_idx = Some(idx),
-                        "MODIFY" | "CHANGE" | "DROP" | "RENAME" | "ALTER" => add_idx = None,
+                        "ADD" => governing = Some((idx, false)),
+                        "MODIFY" => governing = Some((idx, true)),
+                        "CHANGE" | "DROP" | "RENAME" | "ALTER" => governing = None,
                         _ => {}
                     }
                 }
                 _ => {}
             }
         }
-        let add_idx = add_idx?;
+        let (add_idx, is_modify) = governing?;
 
-        // The element after `ADD`, past a leading `(` (Oracle multi-column add) and
-        // the optional `COLUMN` keyword, isolated to the current comma item.
+        // The element after the sub-command, past a leading `(` (Oracle multi-column
+        // form) and the optional `COLUMN` keyword, isolated to the current comma item.
         let after_add = toks.get(add_idx + 1..).unwrap_or(&[]);
         let after_add = match after_add.first() {
             Some(SqlToken::Symbol(sym)) if *sym == "(" => &after_add[1..],
@@ -12526,7 +12606,18 @@ impl SqlEditorWidget {
             _ => def,
         };
         if def.is_empty() {
-            return None;
+            // `MODIFY |` names an existing column — defer to the column path.
+            if is_modify {
+                return None;
+            }
+            // `ADD |` begins a fresh element: a new column (the name is the user's,
+            // suppressed via the chokepoint enrolment) or a constraint introducer.
+            // Oracle's element-start keywords; MySQL's richer `ADD` element-start
+            // (INDEX/KEY/FULLTEXT/…) is served by its own schema-object handler.
+            if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+                return None;
+            }
+            return Some(&["CONSTRAINT", "PRIMARY KEY", "UNIQUE", "FOREIGN KEY", "CHECK"]);
         }
         // Inside a sub-paren of the element (`FOREIGN KEY (col |`, `CHECK (expr |`,
         // `NUMBER(precision |`, or a `REFERENCES t (col |` list) a column/expression
@@ -12922,6 +13013,43 @@ impl SqlEditorWidget {
                     Some(&["RETURNING"])
                 }
             }
+            // The matched `UPDATE SET <assignments>` of a MERGE. After a complete
+            // assignment the clause continues with a row filter (`WHERE`), the
+            // matched-`DELETE` sub-clause (`DELETE WHERE`), or the next merge action
+            // (`WHEN [NOT] MATCHED`). Anchor on the last *top-level* action keyword
+            // being `SET` (a `WHERE`/`DELETE` already opened, or a subquery's nested
+            // `WHERE` in an assignment value, must not fire this).
+            "MERGE" if complete_assignment_or_predicate => {
+                let mut depth = 0i32;
+                let mut last_anchor: Option<&str> = None;
+                let mut has_update = false;
+                for token in &toks {
+                    match token {
+                        SqlToken::Symbol(sym) if sym == "(" || sym == "[" => depth += 1,
+                        SqlToken::Symbol(sym) if sym == ")" || sym == "]" => {
+                            depth = (depth - 1).max(0)
+                        }
+                        SqlToken::Word(word) if depth == 0 => {
+                            match word.to_ascii_uppercase().as_str() {
+                                "UPDATE" => {
+                                    has_update = true;
+                                    last_anchor = Some("UPDATE");
+                                }
+                                "SET" => last_anchor = Some("SET"),
+                                "WHERE" => last_anchor = Some("WHERE"),
+                                "DELETE" => last_anchor = Some("DELETE"),
+                                "INSERT" => last_anchor = Some("INSERT"),
+                                "VALUES" => last_anchor = Some("VALUES"),
+                                "WHEN" => last_anchor = Some("WHEN"),
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                (has_update && last_anchor == Some("SET"))
+                    .then_some(&["WHERE", "DELETE WHERE", "WHEN"])
+            }
             _ => None,
         }
     }
@@ -13009,6 +13137,220 @@ impl SqlEditorWidget {
         }
     }
 
+    /// Keyword slots of an Oracle `CREATE SEQUENCE [schema.]name <option>*` option
+    /// list. Each option is single-use (and several form mutually-exclusive pairs,
+    /// e.g. `CACHE`/`NOCACHE`), so at an option boundary the remaining (not-yet-used)
+    /// options are offered and never re-offered. Returns:
+    /// - `Some(remaining)` at an option boundary (`SEQUENCE s |`, `… START WITH 1 |`,
+    ///   `… CACHE 20 |`, `… NOCYCLE |`) — the options still available;
+    /// - `Some(&[])` at a value slot (`… START WITH |`, `… CACHE |`, `… MINVALUE |`)
+    ///   where a number is expected — no keyword, but the slot is still a sequence
+    ///   slot so the base catalog stays suppressed (the enrolment below);
+    /// - `None` when the cursor is not on a sequence option (a partial sub-keyword
+    ///   `… START |`→`WITH` / `… INCREMENT |`→`BY` is left to the tail handler, and
+    ///   the unnamed `CREATE SEQUENCE |` is the name slot).
+    fn expected_create_sequence_option_keywords(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<Vec<&'static str>> {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return None;
+        }
+        if Self::unclosed_paren_count(tokens, end) != 0 {
+            return None;
+        }
+        let words = Self::words_for_keyword_slot(tokens, end);
+        if words.first().map(String::as_str) != Some("CREATE") {
+            return None;
+        }
+        let seq_pos = words.iter().position(|word| word == "SEQUENCE")?;
+        // Only `OR REPLACE` may sit between `CREATE` and `SEQUENCE` — a different
+        // object (`CREATE TABLE … SEQUENCE …` as a column name) must not match.
+        if words[1..seq_pos]
+            .iter()
+            .any(|word| !matches!(word.as_str(), "OR" | "REPLACE"))
+        {
+            return None;
+        }
+        // The option list begins after the sequence name (one word past `SEQUENCE`).
+        // No name yet (`CREATE SEQUENCE |`) → the name slot, not ours.
+        let opts = words.get(seq_pos + 2..)?;
+
+        let mut present: Vec<&'static str> = Vec::new();
+        let mut i = 0;
+        while i < opts.len() {
+            match opts[i].as_str() {
+                "START" => match opts.get(i + 1).map(String::as_str) {
+                    None => return Some(vec!["WITH"]), // `START |` → sub-keyword `WITH`
+                    Some("WITH") => {
+                        if i + 2 >= opts.len() {
+                            return Some(Vec::new()); // value slot
+                        }
+                        present.push("START WITH");
+                        i += 3;
+                    }
+                    _ => return None,
+                },
+                "INCREMENT" => match opts.get(i + 1).map(String::as_str) {
+                    None => return Some(vec!["BY"]), // `INCREMENT |` → sub-keyword `BY`
+                    Some("BY") => {
+                        if i + 2 >= opts.len() {
+                            return Some(Vec::new());
+                        }
+                        present.push("INCREMENT BY");
+                        i += 3;
+                    }
+                    _ => return None,
+                },
+                option @ ("MINVALUE" | "MAXVALUE" | "CACHE") => {
+                    if i + 1 >= opts.len() {
+                        return Some(Vec::new()); // value slot
+                    }
+                    present.push(option_canonical(option));
+                    i += 2;
+                }
+                option @ ("NOMINVALUE" | "NOMAXVALUE" | "NOCACHE" | "CYCLE" | "NOCYCLE"
+                | "ORDER" | "NOORDER") => {
+                    present.push(option_canonical(option));
+                    i += 1;
+                }
+                // A stray token (an unexpected value, an unknown word) — not a clean
+                // option boundary; leave it to the other handlers.
+                _ => return None,
+            }
+        }
+
+        let has = |option: &str| present.iter().any(|seen| *seen == option);
+        let mut remaining: Vec<&'static str> = Vec::new();
+        if !has("START WITH") {
+            remaining.push("START WITH");
+        }
+        if !has("INCREMENT BY") {
+            remaining.push("INCREMENT BY");
+        }
+        if !has("MINVALUE") && !has("NOMINVALUE") {
+            remaining.push("MINVALUE");
+            remaining.push("NOMINVALUE");
+        }
+        if !has("MAXVALUE") && !has("NOMAXVALUE") {
+            remaining.push("MAXVALUE");
+            remaining.push("NOMAXVALUE");
+        }
+        if !has("CACHE") && !has("NOCACHE") {
+            remaining.push("CACHE");
+            remaining.push("NOCACHE");
+        }
+        if !has("CYCLE") && !has("NOCYCLE") {
+            remaining.push("CYCLE");
+            remaining.push("NOCYCLE");
+        }
+        if !has("ORDER") && !has("NOORDER") {
+            remaining.push("ORDER");
+            remaining.push("NOORDER");
+        }
+        Some(remaining)
+    }
+
+    /// Context wrapper enrolling the `CREATE SEQUENCE` option/value slots in the
+    /// identifier-suppression chokepoint, so the base relation catalog never leaks
+    /// where only sequence options (or a numeric value) belong.
+    fn cursor_is_at_create_sequence_option_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::expected_create_sequence_option_keywords(tokens, end, db_type).is_some()
+    }
+
+    /// Context wrapper enrolling the MySQL `ALTER TABLE … {ADD|DROP|RENAME} |`
+    /// element-start keyword slots in the identifier-suppression chokepoint. These
+    /// begin a fresh element (a new column name is the user's, the keywords are the
+    /// element/constraint introducers), so a bare relation is never grammatical and
+    /// the base catalog must be suppressed. Scoped narrowly to the element-start
+    /// last token because other arms of the MySQL schema-object handler (notably
+    /// `CREATE INDEX i ON |`) sit at an object position where a relation is valid.
+    fn cursor_is_at_mysql_alter_table_element_keyword_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return false;
+        }
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        let words = Self::words_for_keyword_slot(tokens, end);
+        words.first().map(String::as_str) == Some("ALTER")
+            && words.iter().any(|word| word == "TABLE")
+            && matches!(
+                words.last().map(String::as_str),
+                Some("ADD" | "DROP" | "RENAME")
+            )
+    }
+
+    /// Context wrapper enrolling the transaction-control and `LOCK TABLE` keyword
+    /// slots (`LOCK TABLE t IN |`→ROW/SHARE/…, `COMMIT |`, `ROLLBACK |`,
+    /// `SET TRANSACTION …`) in the identifier-suppression chokepoint. `GRANT`/
+    /// `REVOKE` are excluded because their grantee/object positions name an
+    /// identifier (a user/role/object) the base catalog must still supply; every
+    /// other arm of the underlying handler is a fixed-keyword slot, and the object/
+    /// savepoint-name positions (`LOCK TABLE |`, `ROLLBACK TO SAVEPOINT |`) return
+    /// `None` and stay available.
+    fn cursor_is_at_transaction_or_lock_keyword_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        let words = Self::words_for_keyword_slot(tokens, end);
+        if matches!(words.first().map(String::as_str), Some("GRANT" | "REVOKE")) {
+            return false;
+        }
+        Self::expected_transaction_and_dcl_keyword_candidates(tokens, end, db_type).is_some()
+    }
+
+    /// Context wrapper enrolling the post-object statement-tail keyword slots
+    /// (`DROP TABLE t |`→CASCADE/PURGE, `TRUNCATE TABLE t |`, `COMMENT ON |`,
+    /// `ALTER TABLE t |`→ADD/DROP/…, `CREATE INDEX i |`→ON, …) in the
+    /// identifier-suppression chokepoint. Every arm of the underlying handler sits
+    /// *past* a complete object where a bare relation is no longer grammatical, so
+    /// the base catalog must be suppressed; the object-name/target positions (a
+    /// `CREATE INDEX i ON |` table, a `CREATE SYNONYM s FOR |` target) return `None`
+    /// there and stay available.
+    fn cursor_is_at_statement_tail_keyword_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::expected_statement_tail_keyword_candidates(tokens, end, db_type).is_some()
+    }
+
     fn expected_statement_tail_keyword_candidates(
         tokens: &[SqlToken],
         end: usize,
@@ -13038,6 +13380,26 @@ impl SqlEditorWidget {
             [comment, on] if comment == "COMMENT" && on == "ON" => {
                 return Some(&["COLUMN", "TABLE", "VIEW", "MATERIALIZED", "EDITIONING"])
             }
+            // `COMMENT ON <object-type> <name> |` → `IS` (the comment text). While the
+            // object *kind*/name is still being chosen the name follows (a relation/
+            // column — keep it available, `None`); past the name `IS` introduces the
+            // literal, and once `IS` is present nothing more is offered here.
+            [comment, on, rest @ ..]
+                if comment == "COMMENT" && on == "ON" && !rest.is_empty() =>
+            {
+                if rest.iter().any(|word| word == "IS") {
+                    return None;
+                }
+                match rest.last().map(String::as_str) {
+                    Some("MATERIALIZED") => return Some(&["VIEW"]),
+                    Some(
+                        "TABLE" | "COLUMN" | "VIEW" | "EDITIONING" | "OPERATOR" | "INDEXTYPE"
+                        | "MINING" | "MODEL",
+                    ) => return None,
+                    Some(_) => return Some(&["IS"]),
+                    None => {}
+                }
+            }
             [alter, session] if alter == "ALTER" && session == "SESSION" => return Some(&["SET"]),
             [truncate] if truncate == "TRUNCATE" => return Some(&["TABLE"]),
             [.., truncate, table, _name] if truncate == "TRUNCATE" && table == "TABLE" => {
@@ -13062,34 +13424,20 @@ impl SqlEditorWidget {
         }
 
         if words.first().is_some_and(|word| word == "CREATE") {
-            if let Some(1) = position_after("SEQUENCE") {
-                return Some(&[
-                    "START WITH",
-                    "INCREMENT BY",
-                    "MINVALUE",
-                    "MAXVALUE",
-                    "NOMINVALUE",
-                    "NOMAXVALUE",
-                    "CACHE",
-                    "NOCACHE",
-                    "CYCLE",
-                    "NOCYCLE",
-                    "ORDER",
-                    "NOORDER",
-                ]);
-            }
-            match words.as_slice() {
-                [.., sequence, last] if sequence == "SEQUENCE" && last == "START" => {
-                    return Some(&["WITH"])
-                }
-                [.., sequence, last] if sequence == "SEQUENCE" && last == "INCREMENT" => {
-                    return Some(&["BY"])
-                }
-                _ => {}
-            }
-
+            // Every `CREATE SEQUENCE …` option position (the option-list start, the
+            // boundaries, the partial sub-keyword steps and the value slots) is
+            // handled by `expected_create_sequence_option_keywords`, which runs
+            // earlier in the chain and prunes already-present single-use options.
             if position_after("INDEX") == Some(1) {
                 return Some(&["ON"]);
+            }
+            // `CREATE [OR REPLACE] [FORCE] VIEW v |` → `AS` (the defining query). A
+            // materialized view has its own option grammar (BUILD/REFRESH/…), so it
+            // is excluded here.
+            if !words.iter().any(|word| word == "MATERIALIZED")
+                && position_after("VIEW") == Some(1)
+            {
+                return Some(&["AS"]);
             }
             if position_after("SYNONYM") == Some(1) {
                 return Some(&["FOR"]);
@@ -13316,6 +13664,117 @@ impl SqlEditorWidget {
                 .collect()
         } else {
             visible_words
+        }
+    }
+
+    /// Keywords grammatical at a PL/SQL block *statement-start* position — a block
+    /// body, a loop body, or an `IF`/statement-`CASE`/exception-handler branch body
+    /// (`BEGIN |`, `; |`, `THEN |`, `ELSE |`, `LOOP |`). The position and the
+    /// admissible continuations are resolved by the shared construct scan
+    /// (`cursor_statement_start_context` → `PlsqlKeywordPolicy`), so this offers
+    /// exactly the procedural statement verbs plus the enclosing construct's
+    /// continuations (`ELSIF`/`ELSE`/`EXIT`/`CONTINUE`/`WHEN`/`EXCEPTION`/the
+    /// precise `END …`). Non-statement positions — a condition/selector/value
+    /// operand, or a value-expression `CASE` arm — yield `None` (the policy's
+    /// `allow_statements` is off there), leaving the expression allowlist and the
+    /// header/partial-construct source (`expected_plsql_and_routine_keyword_candidates`)
+    /// to govern. Oracle-only; MySQL/MariaDB stored programs use a different grammar.
+    fn expected_plsql_block_statement_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<Vec<&'static str>> {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return None;
+        }
+        let StatementStartContext::Plsql(policy) =
+            Self::cursor_statement_start_context(tokens, end)?
+        else {
+            return None;
+        };
+        // Only a genuine statement-start position offers the statement verbs. The
+        // selector/condition/handler-name and value-`CASE` arm slots (where
+        // `allow_statements` is off) are governed by the expression allowlist and
+        // the partial-construct source (`expected_plsql_and_routine_keyword_candidates`,
+        // e.g. a `CASE` selector head → `WHEN`/`ELSE`/`END CASE`), so they fall
+        // through untouched.
+        if !policy.allow_statements {
+            return None;
+        }
+        let mut candidates: Vec<&'static str> = PLSQL_STATEMENT_KEYWORDS.to_vec();
+        if policy.allow_exit_continue {
+            candidates.push("EXIT");
+            candidates.push("CONTINUE");
+        }
+        if policy.allow_elsif {
+            candidates.push("ELSIF");
+        }
+        if policy.allow_else {
+            candidates.push("ELSE");
+        }
+        if policy.allow_when {
+            candidates.push("WHEN");
+        }
+        if policy.allow_exception {
+            candidates.push("EXCEPTION");
+        }
+        if let Some(end_keyword) = policy.end_keyword.filter(|_| policy.allow_end) {
+            candidates.push(end_keyword);
+        }
+        Some(candidates)
+    }
+
+    /// Keyword tails of the PL/SQL cursor statements `OPEN <cur> FOR <query>` and
+    /// `FETCH <cur> [BULK COLLECT] INTO <targets>`. Gated to an executable block so
+    /// the cursor `FETCH <name>` is told apart from the SQL row-limiting
+    /// `FETCH {FIRST|NEXT} …` (whose name token is a keyword, also excluded). After
+    /// `… FOR` a query begins, so `SELECT`/`WITH` are offered; `FETCH <cur> |` opens
+    /// the destination with `INTO` or `BULK COLLECT`. Oracle-only.
+    fn expected_plsql_cursor_statement_keywords(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return None;
+        }
+        if !Self::cursor_in_plsql_executable_block(tokens, end) {
+            return None;
+        }
+        let words = Self::words_for_keyword_slot(tokens, end);
+        let is_keyword =
+            |word: &str| crate::sql_text::is_sql_keyword_for_db(word, crate::db::DatabaseType::Oracle);
+        match words.as_slice() {
+            // `OPEN <cur> FOR |` — a query expression follows.
+            [.., open, name, for_word]
+                if open == "OPEN" && for_word == "FOR" && !is_keyword(name) =>
+            {
+                Some(&["SELECT", "WITH"])
+            }
+            // `FETCH <cur> BULK COLLECT |` → `INTO`.
+            [.., fetch, name, bulk, collect]
+                if fetch == "FETCH"
+                    && bulk == "BULK"
+                    && collect == "COLLECT"
+                    && !is_keyword(name) =>
+            {
+                Some(&["INTO"])
+            }
+            // `FETCH <cur> BULK |` → `COLLECT`.
+            [.., fetch, name, bulk]
+                if fetch == "FETCH" && bulk == "BULK" && !is_keyword(name) =>
+            {
+                Some(&["COLLECT"])
+            }
+            // `FETCH <cur> |` — the destination opener.
+            [.., fetch, name] if fetch == "FETCH" && !is_keyword(name) => {
+                Some(&["INTO", "BULK COLLECT"])
+            }
+            // `EXIT |` / `CONTINUE |` — the optional `WHEN <condition>` guard (a bare
+            // `EXIT;` or `EXIT <label>;` is also valid, so this is additive, not a
+            // required slot).
+            [.., last] if matches!(last.as_str(), "EXIT" | "CONTINUE") => Some(&["WHEN"]),
+            _ => None,
         }
     }
 
@@ -13970,6 +14429,11 @@ impl SqlEditorWidget {
             ]);
         }
         if first == "CREATE" && has("INDEX") {
+            // Inside the indexed-column list (`ON t (a |`) the cursor names a column,
+            // not an index option — leave it to the column path.
+            if Self::unclosed_paren_count(tokens, end) != 0 {
+                return None;
+            }
             if last == Some("USING") {
                 return Some(&["BTREE", "HASH"]);
             }
@@ -13978,9 +14442,16 @@ impl SqlEditorWidget {
             if matches!(last, Some("BTREE" | "HASH")) {
                 return Some(if has("ON") { &[] } else { &["ON"] });
             }
+            // `USING` follows the *column list*, not the bare table — so it is only
+            // grammatical once the `(…)` has closed (`ON t (a) |`). At `ON t |` the
+            // column list is still expected: offer nothing (the `(` is punctuation).
+            let has_column_list = Self::meaningful_tokens_before(tokens, end)
+                .iter()
+                .any(|token| matches!(token, SqlToken::Symbol(sym) if sym == ")"));
             return Some(match (has("ON"), has("USING")) {
                 (false, false) => &["ON", "USING"],
-                (true, false) => &["USING"],
+                (true, false) if has_column_list => &["USING"],
+                (true, false) => &[],
                 (false, true) => &["ON"],
                 (true, true) => &[],
             });
@@ -14302,6 +14773,28 @@ impl SqlEditorWidget {
             .collect()
     }
 
+    /// The head keyword of the first *top-level* (depth-0) query in `tokens` —
+    /// `SELECT` or `WITH`. Used to see through a query-defining DDL/DML wrapper
+    /// (`CREATE VIEW … AS SELECT …`, `CREATE TABLE … AS SELECT …`, `INSERT …
+    /// SELECT …`) to the embedded query whose clauses the cursor is editing. A
+    /// nested subquery's `SELECT` sits at depth > 0 and is skipped.
+    fn first_top_level_query_head(tokens: &[SqlToken], end: usize) -> Option<&'static str> {
+        let mut depth = 0i32;
+        for token in tokens.get(..end.min(tokens.len())).unwrap_or(tokens) {
+            match token {
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => depth += 1,
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => depth = (depth - 1).max(0),
+                SqlToken::Word(word) if depth == 0 => match word.to_ascii_uppercase().as_str() {
+                    "SELECT" => return Some("SELECT"),
+                    "WITH" => return Some("WITH"),
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        None
+    }
+
     fn expected_query_clause_continuation_keywords(
         tokens: &[SqlToken],
         end: usize,
@@ -14335,6 +14828,17 @@ impl SqlEditorWidget {
             SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
             _ => None,
         });
+        // A query-defining DDL/DML wrapper (`CREATE VIEW … AS SELECT`, CTAS,
+        // `INSERT … SELECT`) precedes the embedded query whose clauses the cursor is
+        // in; resolve the head to that query's `SELECT`/`WITH` so its continuation
+        // set applies. Without this the wrapper word shadows it and the cursor gets
+        // nothing after a complete `FROM`/`WHERE`/… inside the defining query.
+        let statement_head = match statement_head.as_deref() {
+            Some("CREATE" | "INSERT" | "REPLACE") => {
+                Self::first_top_level_query_head(tokens, end).map(str::to_string)
+            }
+            _ => statement_head,
+        };
         let mysql = crate::sql_text::mysql_compatibility_for_sql("", db_type);
         match statement_head.as_deref() {
             Some("SELECT") | Some("WITH") => {}
@@ -20795,6 +21299,21 @@ impl SqlEditorWidget {
                 );
             }
         }
+        if let Some(candidates) = Self::expected_create_sequence_option_keywords(
+            tokens,
+            context_end,
+            db_type,
+        )
+        .or_else(|| {
+            Self::expected_create_sequence_option_keywords(
+                statement_tokens,
+                statement_context_end,
+                db_type,
+            )
+        })
+        {
+            return Self::filter_expected_candidates(prefix, &candidates);
+        }
         if let Some(candidates) = Self::expected_transaction_and_dcl_keyword_candidates(
             tokens,
             context_end,
@@ -20802,6 +21321,36 @@ impl SqlEditorWidget {
         )
         .or_else(|| {
             Self::expected_transaction_and_dcl_keyword_candidates(
+                statement_tokens,
+                statement_context_end,
+                db_type,
+            )
+        })
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(candidates) = Self::expected_plsql_block_statement_keyword_candidates(
+            tokens,
+            context_end,
+            db_type,
+        )
+        .or_else(|| {
+            Self::expected_plsql_block_statement_keyword_candidates(
+                statement_tokens,
+                statement_context_end,
+                db_type,
+            )
+        })
+        {
+            return Self::filter_expected_candidates(prefix, &candidates);
+        }
+        if let Some(candidates) = Self::expected_plsql_cursor_statement_keywords(
+            tokens,
+            context_end,
+            db_type,
+        )
+        .or_else(|| {
+            Self::expected_plsql_cursor_statement_keywords(
                 statement_tokens,
                 statement_context_end,
                 db_type,

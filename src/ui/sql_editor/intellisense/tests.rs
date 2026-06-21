@@ -34226,6 +34226,153 @@ fn remaining_plsql_and_routine_keyword_slots_are_formalized() {
     );
 }
 
+/// A PL/SQL block *statement-start* position (a block body, a loop body, an
+/// `IF`/statement-`CASE`/exception-handler branch body) offers the procedural
+/// statement verbs plus exactly the enclosing construct's continuations
+/// (`ELSIF`/`ELSE`/`EXIT`/`CONTINUE`/`EXCEPTION`/the precise `END …`). The same
+/// scan governs every member of the family — `BEGIN |`, `; |`, `THEN |`,
+/// `ELSE |`, `LOOP |`, a nested block — driven by `PlsqlKeywordPolicy`, so the
+/// list is complete and never leaks keywords valid only at another position.
+#[test]
+fn plsql_block_statement_starts_offer_procedural_verbs_and_construct_continuations() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |suggestions: &[String], keyword: &str| {
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case(keyword))
+    };
+    let mut failures = Vec::new();
+
+    // (sql, keywords that MUST be offered, keywords that must NOT be offered)
+    let cases: &[(&str, &[&str], &[&str])] = &[
+        // Block body — verbs, the handler opener and a bare `END`. The selector
+        // word `THEN`/`ELSIF` (no enclosing IF/CASE) must not appear.
+        (
+            "BEGIN | END;",
+            &["IF", "LOOP", "FOR", "WHILE", "NULL", "RETURN", "RAISE", "OPEN", "EXCEPTION", "END"],
+            &["THEN", "ELSIF", "ELSE", "EXIT", "CONTINUE", "END IF", "WHEN"],
+        ),
+        // After a statement terminator — same block-body family.
+        (
+            "BEGIN NULL; | END;",
+            &["IF", "LOOP", "NULL", "EXCEPTION", "END"],
+            &["THEN", "ELSE", "EXIT", "END LOOP"],
+        ),
+        (
+            "DECLARE v NUMBER; BEGIN | END;",
+            &["IF", "SELECT", "NULL", "END"],
+            &["THEN", "ELSIF"],
+        ),
+        // IF body after THEN — verbs plus the IF continuations and `END IF`.
+        (
+            "BEGIN IF a = 1 THEN | END IF; END;",
+            &["IF", "NULL", "RETURN", "ELSIF", "ELSE", "END IF"],
+            &["THEN", "WHEN", "END", "END LOOP", "EXIT"],
+        ),
+        // ELSE arm — no further ELSIF/ELSE, still verbs and `END IF`.
+        (
+            "BEGIN IF a = 1 THEN NULL; ELSE | END IF; END;",
+            &["IF", "NULL", "END IF"],
+            &["ELSIF", "ELSE", "THEN"],
+        ),
+        // Loop body — verbs plus `EXIT`/`CONTINUE` and `END LOOP`.
+        (
+            "BEGIN LOOP | END LOOP; END;",
+            &["IF", "NULL", "EXIT", "CONTINUE", "END LOOP"],
+            &["THEN", "ELSIF", "END IF", "EXCEPTION", "WHEN"],
+        ),
+        // Statement-CASE arm body — verbs plus `WHEN`/`ELSE`/`END CASE`.
+        (
+            "BEGIN CASE WHEN a = 1 THEN | END CASE; END;",
+            &["IF", "NULL", "WHEN", "ELSE", "END CASE"],
+            &["THEN", "ELSIF", "END IF", "END LOOP"],
+        ),
+        // Nested loop inside an IF — loop continuations win; `EXIT` is valid
+        // because a loop encloses the cursor.
+        (
+            "BEGIN IF a THEN LOOP | END LOOP; END IF; END;",
+            &["IF", "NULL", "EXIT", "CONTINUE", "END LOOP"],
+            &["END IF", "ELSIF", "WHEN"],
+        ),
+        // Block body after a closed nested construct — back to the block family.
+        (
+            "BEGIN IF a THEN NULL; END IF; | END;",
+            &["IF", "NULL", "EXCEPTION", "END"],
+            &["END IF", "ELSIF", "EXIT", "THEN"],
+        ),
+        // Exception-handler body after THEN — verbs, the next-handler `WHEN`, `END`.
+        (
+            "BEGIN NULL; EXCEPTION WHEN NO_DATA_FOUND THEN | END;",
+            &["IF", "NULL", "RAISE", "WHEN", "END"],
+            &["EXCEPTION", "ELSIF", "ELSE", "THEN", "END IF"],
+        ),
+    ];
+
+    for (sql, must_offer, must_not_offer) in cases {
+        let suggestions = query_keyword_completion_suggestions(sql, Oracle);
+        for keyword in *must_offer {
+            if !has(&suggestions, keyword) {
+                failures.push(format!("`{keyword}` missing at `{sql}`: {suggestions:?}"));
+            }
+        }
+        for keyword in *must_not_offer {
+            if has(&suggestions, keyword) {
+                failures.push(format!("`{keyword}` leaked at `{sql}`: {suggestions:?}"));
+            }
+        }
+    }
+
+    // A condition/selector operand or a value-`CASE` arm is NOT a statement start:
+    // the statement verbs must never leak there.
+    for sql in [
+        "BEGIN IF a = 1 | END IF; END;",            // awaiting THEN
+        "BEGIN WHILE x < 1 | END;",                  // awaiting LOOP
+        "BEGIN v := CASE WHEN a THEN 1 | END; END;", // value-CASE arm value
+        "SELECT CASE WHEN a THEN 1 | FROM t",        // SQL CASE outside any block
+    ] {
+        let suggestions = query_keyword_completion_suggestions(sql, Oracle);
+        // Unambiguous statement-body verbs — these are never the awaited construct
+        // keyword (`THEN`/`LOOP`) nor a value-expression operand, so any appearance
+        // here is a leak.
+        for verb in ["IF", "RETURN", "RAISE", "FETCH", "OPEN"] {
+            if has(&suggestions, verb) {
+                failures.push(format!(
+                    "statement verb `{verb}` leaked at non-statement-start `{sql}`: {suggestions:?}"
+                ));
+            }
+        }
+    }
+
+    // Prefix filtering still narrows the family (production path, two-letter
+    // prefix) and the precise multi-word `END …` form survives.
+    let loop_body = query_keyword_completion_suggestions("BEGIN LOOP ex| END LOOP; END;", Oracle);
+    if !has(&loop_body, "EXIT") {
+        failures.push(format!("prefix `ex` dropped `EXIT`: {loop_body:?}"));
+    }
+    let end_if = query_keyword_completion_suggestions("BEGIN IF a THEN NULL; en| END IF; END;", Oracle);
+    if !has(&end_if, "END IF") {
+        failures.push(format!("prefix `en` dropped `END IF`: {end_if:?}"));
+    }
+
+    // The source is Oracle-only: a MySQL/MariaDB stored-program block must not be
+    // fed the Oracle PL/SQL statement verbs by this path.
+    let mysql_block = query_keyword_completion_suggestions("BEGIN | END", MySQL);
+    for verb in ["FORALL", "RAISE", "EXIT"] {
+        if has(&mysql_block, verb) {
+            failures.push(format!(
+                "Oracle PL/SQL verb `{verb}` leaked into MySQL block: {mysql_block:?}"
+            ));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "PL/SQL block statement-start failures:\n{}",
+        failures.join("\n")
+    );
+}
+
 #[test]
 fn remaining_advanced_oracle_query_keyword_slots_are_formalized() {
     use crate::db::DatabaseType::Oracle;
@@ -35894,6 +36041,314 @@ fn alter_table_add_element_tail_is_precise_and_suppresses_objects() {
     }
 }
 
+/// `ALTER TABLE … MODIFY <col> <type> |` reaches the same column-property tail as
+/// `ADD`, and `ALTER TABLE … ADD |` (a fresh element) offers the constraint
+/// introducers — both with the base relation catalog suppressed. `MODIFY |` (an
+/// existing-column name slot) is left to the column path.
+#[test]
+fn alter_table_modify_and_add_head_offer_element_keywords_without_object_leak() {
+    let kw = |sql: &str, db: crate::db::DatabaseType| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix, &analyze_inline_cursor_sql(sql), Some(db))
+    };
+    let suppressed = |sql: &str, db: crate::db::DatabaseType| {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::cursor_is_at_identifier_suppressing_keyword_slot_for_context(
+            &analyze_inline_cursor_sql(sql), !prefix.is_empty(), Some(db))
+    };
+    use crate::db::DatabaseType::{Oracle, MySQL};
+    let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
+
+    // MODIFY post-type → property catalog (bare and parenthesised), both dialects.
+    for (sql, db) in [
+        ("ALTER TABLE t MODIFY a NUMBER |", Oracle),
+        ("ALTER TABLE t MODIFY (a NUMBER |)", Oracle),
+        ("ALTER TABLE t MODIFY a INT |", MySQL),
+    ] {
+        let props = kw(sql, db);
+        assert!(has(&props, "DEFAULT") && has(&props, "NOT NULL"),
+            "MODIFY property tail missing `{sql}`: {props:?}");
+        assert!(suppressed(sql, db), "object catalog not suppressed at `{sql}`");
+    }
+    assert_eq!(kw("ALTER TABLE t MODIFY a NUMBER NOT |", Oracle), vec!["NULL".to_string()]);
+
+    // ADD head (fresh element) → constraint introducers, base catalog suppressed.
+    let add_head = kw("ALTER TABLE t ADD |", Oracle);
+    assert!(has(&add_head, "CONSTRAINT") && has(&add_head, "PRIMARY KEY")
+        && has(&add_head, "FOREIGN KEY") && has(&add_head, "CHECK"),
+        "ADD head missing constraint introducers: {add_head:?}");
+    assert!(suppressed("ALTER TABLE t ADD |", Oracle));
+    // A second element after a comma is likewise an element start.
+    assert!(has(&kw("ALTER TABLE t ADD c1 NUMBER, |", Oracle), "CONSTRAINT"));
+
+    // `MODIFY |` (existing-column name slot) is deferred — not a keyword-only slot.
+    assert!(kw("ALTER TABLE t MODIFY |", Oracle).is_empty());
+}
+
+/// The Oracle `CREATE SEQUENCE [schema.]name <option>*` option list: at any option
+/// boundary the *remaining* options are offered, an already-used single-use option
+/// (and the partner of a used mutually-exclusive pair) is never re-offered, the
+/// numeric value slots suppress the base catalog, and the partial sub-keyword steps
+/// still resolve.
+#[test]
+fn create_sequence_option_list_offers_only_remaining_options() {
+    let kw = |sql: &str| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix, &analyze_inline_cursor_sql(sql), Some(crate::db::DatabaseType::Oracle))
+    };
+    let suppressed = |sql: &str| {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::cursor_is_at_identifier_suppressing_keyword_slot_for_context(
+            &analyze_inline_cursor_sql(sql), !prefix.is_empty(), Some(crate::db::DatabaseType::Oracle))
+    };
+    let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
+
+    // The option-list start offers every option.
+    let start = kw("CREATE SEQUENCE seq |");
+    assert!(has(&start, "START WITH") && has(&start, "INCREMENT BY") && has(&start, "CACHE")
+        && has(&start, "CYCLE") && has(&start, "ORDER"), "start option list incomplete: {start:?}");
+
+    // After a complete value-bearing option, the used one is gone; the rest remain.
+    let after_start = kw("CREATE SEQUENCE seq START WITH 1 |");
+    assert!(!has(&after_start, "START WITH"), "re-offered used START WITH: {after_start:?}");
+    assert!(has(&after_start, "INCREMENT BY") && has(&after_start, "CACHE"),
+        "remaining options missing after START WITH: {after_start:?}");
+
+    // Mutual exclusion: using CACHE withdraws both CACHE and NOCACHE.
+    let after_cache = kw("CREATE SEQUENCE seq CACHE 20 |");
+    assert!(!has(&after_cache, "CACHE") && !has(&after_cache, "NOCACHE"),
+        "CACHE/NOCACHE re-offered after CACHE 20: {after_cache:?}");
+    assert!(has(&after_cache, "CYCLE"));
+
+    // A bare option (NOCACHE) is also single-use and a boundary.
+    assert!(!has(&kw("CREATE SEQUENCE seq NOCACHE |"), "CACHE"));
+    assert!(!has(&kw("CREATE SEQUENCE seq NOCACHE |"), "NOCACHE"));
+
+    // No predicate-operator or table-catalog noise at the boundaries (the regression).
+    for sql in ["CREATE SEQUENCE seq START WITH 1 |", "CREATE SEQUENCE seq INCREMENT BY 1 |",
+                "CREATE SEQUENCE seq CACHE 20 |"] {
+        let s = kw(sql);
+        assert!(!has(&s, "IS") && !has(&s, "BETWEEN"), "predicate operator leaked at `{sql}`: {s:?}");
+        assert!(suppressed(sql), "base catalog not suppressed at `{sql}`");
+    }
+
+    // Partial sub-keyword steps still resolve; the value slots suppress + offer none.
+    assert_eq!(kw("CREATE SEQUENCE seq START |"), vec!["WITH".to_string()]);
+    assert_eq!(kw("CREATE SEQUENCE seq INCREMENT |"), vec!["BY".to_string()]);
+    assert!(kw("CREATE SEQUENCE seq START WITH |").is_empty());
+    assert!(suppressed("CREATE SEQUENCE seq START WITH |"));
+
+    // A `SEQUENCE` word inside a CREATE TABLE column is not a CREATE SEQUENCE.
+    assert!(!has(&kw("CREATE TABLE foo (x SEQUENCE |)"), "INCREMENT BY"));
+}
+
+/// PL/SQL cursor statements: `OPEN <cur> FOR |` opens a query (`SELECT`/`WITH`),
+/// and `FETCH <cur> |` opens the destination (`INTO` / `BULK COLLECT`). Gated to an
+/// executable block so the SQL row-limiting `FETCH FIRST …` is never mistaken for a
+/// cursor fetch.
+#[test]
+fn plsql_open_for_and_fetch_offer_cursor_statement_keywords() {
+    let kw = |sql: &str, db: crate::db::DatabaseType| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix, &analyze_inline_cursor_sql(sql), Some(db))
+    };
+    use crate::db::DatabaseType::{Oracle, MySQL};
+    let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
+
+    let open = kw("BEGIN OPEN c FOR | END;", Oracle);
+    assert!(has(&open, "SELECT") && has(&open, "WITH"), "OPEN .. FOR slot: {open:?}");
+
+    let fetch = kw("BEGIN FETCH c | END;", Oracle);
+    assert!(has(&fetch, "INTO") && has(&fetch, "BULK COLLECT"), "FETCH slot: {fetch:?}");
+    assert_eq!(kw("BEGIN FETCH c BULK | END;", Oracle), vec!["COLLECT".to_string()]);
+    assert_eq!(kw("BEGIN FETCH c BULK COLLECT | END;", Oracle), vec!["INTO".to_string()]);
+
+    // The SQL row-limiting `FETCH FIRST`/`NEXT` (a keyword name) is not a cursor
+    // fetch — `INTO`/`BULK COLLECT` must not be offered there.
+    let row_limit = kw("BEGIN SELECT a FROM t ORDER BY a OFFSET 1 ROWS FETCH | END;", Oracle);
+    assert!(!has(&row_limit, "BULK COLLECT"), "row-limiting FETCH got cursor keywords: {row_limit:?}");
+    // Outside a block the cursor-fetch source is inert.
+    assert!(!has(&kw("FETCH c |", Oracle), "BULK COLLECT"));
+    // MySQL stored programs use a different cursor grammar — Oracle-only source off.
+    assert!(kw("BEGIN OPEN c FOR | END", MySQL).is_empty());
+}
+
+/// The matched `UPDATE SET <assignments>` clause of a MERGE continues, after a
+/// complete assignment, with `WHERE` / `DELETE WHERE` / the next `WHEN`. It is
+/// offered only at that boundary — not mid-assignment, and not re-offered once a
+/// `WHERE`/`DELETE` sub-clause has opened. A plain `UPDATE` is unaffected.
+#[test]
+fn merge_matched_update_set_tail_offers_filter_delete_and_next_when() {
+    let kw = |sql: &str| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix, &analyze_inline_cursor_sql(sql), Some(crate::db::DatabaseType::Oracle))
+    };
+    let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
+    let base = "MERGE INTO t USING s ON (t.id = s.id) WHEN MATCHED THEN UPDATE SET ";
+
+    // After a complete assignment (single and multi).
+    for tail in ["a = b |", "a = b, c = d |"] {
+        let s = kw(&format!("{base}{tail}"));
+        assert!(has(&s, "WHERE") && has(&s, "DELETE WHERE") && has(&s, "WHEN"),
+            "merge update set boundary `{tail}`: {s:?}");
+    }
+    // Mid-assignment must not offer the tail.
+    for tail in ["a = |", "a = b, |", "a = b, c = |"] {
+        let s = kw(&format!("{base}{tail}"));
+        assert!(!has(&s, "WHERE") && !has(&s, "DELETE WHERE"),
+            "merge tail leaked mid-assignment `{tail}`: {s:?}");
+    }
+    // Once WHERE has opened it is not re-offered (the predicate continues instead).
+    let after_where = kw(&format!("{base}a = b WHERE c = 1 |"));
+    assert!(!has(&after_where, "WHERE"), "WHERE re-offered: {after_where:?}");
+    // A subquery's nested WHERE in the assignment value does not block the boundary.
+    let subquery_value = kw(&format!("{base}a = (SELECT x FROM y WHERE z = 1) |"));
+    assert!(has(&subquery_value, "WHERE") && has(&subquery_value, "WHEN"),
+        "subquery value blocked the tail: {subquery_value:?}");
+    // A plain UPDATE keeps its own tail (WHERE/RETURNING), no DELETE WHERE.
+    let plain = kw("UPDATE t SET a = b |");
+    assert!(has(&plain, "WHERE") && !has(&plain, "DELETE WHERE"), "plain update tail: {plain:?}");
+}
+
+/// Post-object statement-tail positions where a bare relation is no longer
+/// grammatical must suppress the base catalog (the inverse-drift class). Enrolling
+/// `expected_statement_tail_keyword_candidates` in the chokepoint covers them at
+/// once, and the COMMENT/VIEW additions ride along. The object-name/target slots
+/// (`CREATE INDEX i ON |`, `COMMENT ON TABLE |`) stay open.
+#[test]
+fn statement_tail_keyword_slots_suppress_relations_and_offer_tail_keywords() {
+    use crate::db::DatabaseType::{Oracle, MySQL};
+    let kw = |sql: &str, db: crate::db::DatabaseType| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix, &analyze_inline_cursor_sql(sql), Some(db))
+    };
+    let suppressed = |sql: &str, db: crate::db::DatabaseType| {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::cursor_is_at_identifier_suppressing_keyword_slot_for_context(
+            &analyze_inline_cursor_sql(sql), !prefix.is_empty(), Some(db))
+    };
+    let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
+
+    // Suppressed post-object tails (and their tail keyword).
+    for (sql, must) in [
+        ("DROP TABLE t |", "CASCADE"),
+        ("TRUNCATE TABLE t |", "DROP STORAGE"),
+        ("COMMENT ON TABLE t |", "IS"),
+        ("COMMENT ON COLUMN t.c |", "IS"),
+        ("CREATE VIEW v |", "AS"),
+        ("CREATE INDEX i |", "ON"),
+    ] {
+        assert!(has(&kw(sql, Oracle), must), "tail keyword `{must}` missing at `{sql}`: {:?}", kw(sql, Oracle));
+        assert!(suppressed(sql, Oracle), "relations not suppressed at `{sql}`");
+    }
+    // `IS` is not offered before the object name, nor after it is already present.
+    assert!(!has(&kw("COMMENT ON TABLE |", Oracle), "IS"));
+    assert!(!suppressed("COMMENT ON TABLE |", Oracle)); // name slot — relation valid
+    assert!(kw("COMMENT ON TABLE t IS 'x' |", Oracle).is_empty());
+    // A materialized view is not given the plain-view `AS` tail here.
+    assert!(!has(&kw("CREATE MATERIALIZED VIEW mv |", Oracle), "AS"));
+    // The `CREATE INDEX i ON |` table target stays available (not suppressed).
+    assert!(!suppressed("CREATE INDEX i ON |", Oracle));
+
+    // MySQL `ALTER TABLE t {ADD|DROP|RENAME} |` element starts suppress relations.
+    for sql in ["ALTER TABLE t ADD |", "ALTER TABLE t DROP |", "ALTER TABLE t RENAME |"] {
+        assert!(suppressed(sql, MySQL), "MySQL element start not suppressed at `{sql}`");
+    }
+}
+
+/// PL/SQL `EXIT |` / `CONTINUE |` offer the optional `WHEN <condition>` guard, and
+/// a query-defining wrapper (`CREATE VIEW … AS SELECT`, CTAS, `INSERT … SELECT`)
+/// resolves its embedded query so the SELECT clause continuations apply after a
+/// complete `FROM`/`WHERE` inside it.
+#[test]
+fn loop_exit_guard_and_wrapped_query_continuations_are_offered() {
+    let kw = |sql: &str| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix, &analyze_inline_cursor_sql(sql), Some(crate::db::DatabaseType::Oracle))
+    };
+    let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
+
+    assert_eq!(kw("BEGIN LOOP EXIT | END LOOP; END;"), vec!["WHEN".to_string()]);
+    assert_eq!(kw("BEGIN LOOP CONTINUE | END LOOP; END;"), vec!["WHEN".to_string()]);
+
+    // The defining query of a view / CTAS / INSERT … SELECT offers the SELECT
+    // clause continuations after a complete FROM (previously empty).
+    for sql in [
+        "CREATE VIEW v AS SELECT a FROM t |",
+        "CREATE TABLE x AS SELECT a FROM t |",
+        "INSERT INTO x SELECT a FROM t |",
+    ] {
+        let s = kw(sql);
+        assert!(has(&s, "WHERE") && has(&s, "GROUP BY"),
+            "wrapped query continuation missing at `{sql}`: {s:?}");
+    }
+    // A non-query CREATE/INSERT is unaffected (no continuation leaks).
+    assert!(kw("INSERT INTO t (a) VALUES (1) |").iter().all(|k| k != "GROUP BY"));
+}
+
+/// `LOCK TABLE t IN |` (and the other transaction-control keyword slots) offer
+/// their fixed keywords with the base relation catalog suppressed, while the
+/// table-name slot (`LOCK TABLE |`) and `GRANT`/`REVOKE` identifier positions stay
+/// open. PL/SQL `RAISE |` offers the predefined exception names (the slot is
+/// additive — a bare `RAISE;` is still valid).
+#[test]
+fn lock_keyword_slots_suppress_relations_and_raise_offers_exceptions() {
+    use crate::db::DatabaseType::Oracle;
+    let kw = |sql: &str| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix, &analyze_inline_cursor_sql(sql), Some(Oracle))
+    };
+    let suppressed = |sql: &str| {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::cursor_is_at_identifier_suppressing_keyword_slot_for_context(
+            &analyze_inline_cursor_sql(sql), !prefix.is_empty(), Some(Oracle))
+    };
+    let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
+
+    // `LOCK TABLE t IN |` → modes, relations suppressed; the `IN <mode>` chain too.
+    assert!(has(&kw("LOCK TABLE t IN |"), "SHARE"));
+    assert!(suppressed("LOCK TABLE t IN |"));
+    assert!(suppressed("LOCK TABLE t |")); // → IN
+    // The table-name slot stays open (relation is valid there).
+    assert!(!suppressed("LOCK TABLE |"));
+    // GRANT/REVOKE keep their identifier positions (grantee/object) available.
+    assert!(!suppressed("GRANT SELECT ON t TO |"));
+
+    // PL/SQL `RAISE |` → predefined exceptions (additive; columns/relations dropped).
+    let raise = kw("BEGIN RAISE | END;");
+    assert!(has(&raise, "NO_DATA_FOUND") && has(&raise, "OTHERS"),
+        "RAISE did not offer exceptions: {raise:?}");
+}
+
 /// A DML trailing clause whose grammar is single-use is offered only while it is
 /// absent, never re-offered once present: the Oracle `RETURNING … INTO <binds>`
 /// and the MySQL `INSERT … ON DUPLICATE KEY UPDATE <assignments>`. The position
@@ -36803,6 +37258,9 @@ fn mysql_create_index_on_and_using_are_single_use() {
             &prefix, &analyze_inline_cursor_sql(sql), Some(crate::db::DatabaseType::MySQL))
     };
     assert_eq!(kw("CREATE INDEX i |"), vec!["ON".to_string(), "USING".to_string()]);
+    // `USING` follows the indexed-column list, not the bare table — so `ON t |`
+    // (before the `(…)`) must not offer it, while `ON t (a) |` does.
+    assert!(kw("CREATE INDEX i ON t |").is_empty());
     assert_eq!(kw("CREATE INDEX i ON t (a) |"), vec!["USING".to_string()]);
     assert_eq!(kw("CREATE INDEX i USING BTREE |"), vec!["ON".to_string()]);
     assert_eq!(kw("CREATE INDEX i USING |"), vec!["BTREE".to_string(), "HASH".to_string()]);
@@ -36851,16 +37309,8 @@ fn zzz_probe_gaps() {
     let has = |v: &Vec<String>, s: &str| v.iter().any(|x| x == s);
     for sql in [
         "REVOKE SELECT ON t FROM u |",
-        "REVOKE SELECT, UPDATE ON t FROM u |",
-        "AUDIT SELECT ON t |",
-        "AUDIT SELECT, UPDATE |",
         "GRANT SELECT, INSERT ON t TO u |",
-        "GRANT SELECT ON t TO u |",
-        "REVOKE SELECT ON t FROM u |",
-        "NOAUDIT SELECT |",
-        "GRANT SELECT ON t TO role1 |",
         "COMMENT ON TABLE t IS 'select stuff' |",
-        "CREATE USER u DEFAULT TABLESPACE ts |",
     ] {
         let s = kw(sql, Oracle);
         eprintln!("O {:?} FROM={} sample={:?}", sql, has(&s,"FROM"), s.iter().take(4).collect::<Vec<_>>());
