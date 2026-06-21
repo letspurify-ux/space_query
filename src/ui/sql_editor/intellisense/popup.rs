@@ -188,6 +188,24 @@ impl SignatureBackend for MysqlSignatureBackend {
     }
 }
 
+struct SignaturePopupTransitionGuard {
+    runtime: Arc<IntellisenseRuntimeState>,
+}
+
+impl SignaturePopupTransitionGuard {
+    fn new(runtime: Arc<IntellisenseRuntimeState>) -> Self {
+        runtime.set_signature_popup_transition_state(IntellisensePopupTransitionState::Showing);
+        Self { runtime }
+    }
+}
+
+impl Drop for SignaturePopupTransitionGuard {
+    fn drop(&mut self) {
+        self.runtime
+            .set_signature_popup_transition_state(IntellisensePopupTransitionState::Idle);
+    }
+}
+
 impl SqlEditorWidget {
     /// Lookup key for a routine call: `QUALIFIER.NAME` uppercased.
     fn signature_key(call: &crate::ui::intellisense::EnclosingCall) -> String {
@@ -207,31 +225,71 @@ impl SqlEditorWidget {
         Some(Self::build_signature_label(name, &args))
     }
 
-    /// Screen position for the signature popup: just above the line containing
-    /// the call's opening parenthesis.
-    fn signature_popup_position(editor: &TextEditor, anchor_pos: i32) -> (i32, i32) {
-        let (cursor_x, cursor_y) = editor.position_to_xy(anchor_pos);
-        let (win_x, win_y) = editor
-            .window()
-            .map(|win| (win.x_root(), win.y_root()))
-            .unwrap_or((0, 0));
-        let x = win_x + cursor_x;
-        let y = (win_y + cursor_y - SignaturePopup::height() - 2).max(win_y);
-        (x, y)
-    }
-
     pub(crate) fn signature_popup_is_visible(&self) -> bool {
-        self.signature_popup
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_visible()
+        if matches!(
+            self.intellisense_runtime.signature_popup_transition_state(),
+            IntellisensePopupTransitionState::Showing
+        ) {
+            return true;
+        }
+        match self.signature_popup.try_lock() {
+            Ok(popup) => popup.is_visible(),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().is_visible(),
+            Err(std::sync::TryLockError::WouldBlock) => false,
+        }
     }
 
     fn hide_signature_popup(&self) {
+        if !Self::can_try_hide_signature_popup(
+            self.intellisense_runtime.signature_popup_transition_state(),
+        ) {
+            return;
+        }
+        if Self::try_hide_signature_popup_now(&self.signature_popup) {
+            return;
+        }
+        Self::schedule_deferred_signature_popup_hide(
+            self.signature_popup.clone(),
+            SIGNATURE_POPUP_DEFERRED_HIDE_RETRIES,
+        );
+    }
+
+    fn can_try_hide_signature_popup(state: IntellisensePopupTransitionState) -> bool {
+        matches!(state, IntellisensePopupTransitionState::Idle)
+    }
+
+    fn try_hide_signature_popup_now(signature_popup: &Arc<Mutex<SignaturePopup>>) -> bool {
+        match signature_popup.try_lock() {
+            Ok(mut popup) => popup.hide(),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                poisoned.into_inner().hide();
+            }
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+        }
+        true
+    }
+
+    fn schedule_deferred_signature_popup_hide(
+        signature_popup: Arc<Mutex<SignaturePopup>>,
+        remaining_retries: u8,
+    ) {
+        app::add_timeout3(0.0, move |_| {
+            if Self::try_hide_signature_popup_now(&signature_popup) || remaining_retries == 0 {
+                return;
+            }
+            Self::schedule_deferred_signature_popup_hide(
+                signature_popup.clone(),
+                remaining_retries - 1,
+            );
+        });
+    }
+
+    fn show_signature_popup(&self, label: &SignatureLabel, active_arg: usize, anchor_pos: i32) {
+        let _transition = SignaturePopupTransitionGuard::new(self.intellisense_runtime.clone());
         self.signature_popup
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .hide();
+            .show(&self.editor, label, active_arg, anchor_pos);
     }
 
     /// Recompute the routine call enclosing the cursor and show, hide, or fetch
@@ -302,11 +360,7 @@ impl SqlEditorWidget {
 
         match action {
             Action::Show(label, active_arg) => {
-                let (x, y) = Self::signature_popup_position(&self.editor, call.open_paren as i32);
-                self.signature_popup
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .show(&label, active_arg, x, y);
+                self.show_signature_popup(&label, active_arg, call.open_paren as i32);
             }
             Action::Hide => self.hide_signature_popup(),
             Action::Fetch => {

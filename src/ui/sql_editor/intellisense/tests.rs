@@ -5399,6 +5399,12 @@ fn nonblocking_popup_hide_waits_until_show_transition_finishes() {
     assert!(!SqlEditorWidget::can_try_hide_intellisense_popup(
         IntellisensePopupTransitionState::Showing
     ));
+    assert!(SqlEditorWidget::can_try_hide_signature_popup(
+        IntellisensePopupTransitionState::Idle
+    ));
+    assert!(!SqlEditorWidget::can_try_hide_signature_popup(
+        IntellisensePopupTransitionState::Showing
+    ));
 }
 
 #[test]

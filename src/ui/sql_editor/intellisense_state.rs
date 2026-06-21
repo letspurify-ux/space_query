@@ -65,6 +65,7 @@ pub(crate) struct IntellisenseRuntimeState {
     parse_generation: Arc<AtomicU64>,
     buffer_revision: Arc<AtomicU64>,
     popup_show_in_progress: Arc<AtomicU8>,
+    signature_popup_show_in_progress: Arc<AtomicU8>,
     keyup_debounce_generation: Arc<Mutex<u64>>,
     keyup_debounce_handle: Arc<Mutex<Option<app::TimeoutHandle>>>,
     cached_db_type: Arc<AtomicU8>,
@@ -80,6 +81,9 @@ impl IntellisenseRuntimeState {
             parse_generation: Arc::new(AtomicU64::new(0)),
             buffer_revision: Arc::new(AtomicU64::new(0)),
             popup_show_in_progress: Arc::new(AtomicU8::new(
+                IntellisensePopupTransitionState::Idle as u8,
+            )),
+            signature_popup_show_in_progress: Arc::new(AtomicU8::new(
                 IntellisensePopupTransitionState::Idle as u8,
             )),
             keyup_debounce_generation: Arc::new(Mutex::new(0_u64)),
@@ -238,6 +242,17 @@ impl IntellisenseRuntimeState {
 
     pub(crate) fn set_popup_transition_state(&self, state: IntellisensePopupTransitionState) {
         store_popup_transition_state(&self.popup_show_in_progress, state);
+    }
+
+    pub(crate) fn signature_popup_transition_state(&self) -> IntellisensePopupTransitionState {
+        load_popup_transition_state(&self.signature_popup_show_in_progress)
+    }
+
+    pub(crate) fn set_signature_popup_transition_state(
+        &self,
+        state: IntellisensePopupTransitionState,
+    ) {
+        store_popup_transition_state(&self.signature_popup_show_in_progress, state);
     }
 
     pub(crate) fn take_keyup_timeout_handle(&self) -> Option<app::TimeoutHandle> {

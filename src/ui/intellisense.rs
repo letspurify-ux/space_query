@@ -1,6 +1,6 @@
 use crate::sql_text;
 use crate::ui::theme;
-use fltk::{browser::HoldBrowser, frame::Frame, prelude::*, window::Window};
+use fltk::{browser::HoldBrowser, frame::Frame, prelude::*, text::TextEditor, window::Window};
 use std::any::Any;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -4148,12 +4148,11 @@ pub(crate) fn sql_context_for_phase(
     }
 }
 
-/// Borderless popup showing the signature of the routine call enclosing the
-/// cursor, with the active argument bracketed. Separate window from the
-/// completion popup so both can be visible at once.
+/// In-window overlay showing the signature of the routine call enclosing the
+/// cursor, with the active argument bracketed. Keeping this inside the editor's
+/// parent window preserves editor focus while the hint is visible.
 pub struct SignaturePopup {
-    window: Window,
-    frame: Frame,
+    frame: Option<Frame>,
     visible: bool,
 }
 
@@ -4169,51 +4168,48 @@ impl SignaturePopup {
     }
 
     pub fn new() -> Self {
-        let current_group = fltk::group::Group::try_current();
-        fltk::group::Group::set_current(None::<&fltk::group::Group>);
-
-        let height = Self::height();
-        let mut window = Window::default().with_size(200, height);
-        window.set_border(false);
-        window.set_color(theme::panel_raised());
-        window.make_modal(false);
-        window.set_override();
-
-        let mut frame = Frame::default().with_size(200, height).with_pos(0, 0);
-        frame.set_label_color(theme::text_primary());
-        frame.set_label_size(Self::font_size());
-        frame.set_align(fltk::enums::Align::Left | fltk::enums::Align::Inside);
-
-        window.end();
-        if let Some(ref group) = current_group {
-            fltk::group::Group::set_current(Some(group));
-        }
-        window.hide();
-
         Self {
-            window,
-            frame,
+            frame: None,
             visible: false,
         }
     }
 
     fn is_deleted(&self) -> bool {
-        self.window.was_deleted() || self.frame.was_deleted()
+        self.frame.as_ref().is_some_and(|frame| frame.was_deleted())
     }
 
-    /// Render `label` with the argument at `active_arg` bracketed, sizing and
-    /// positioning the popup at `(x, y)`.
-    pub fn show(&mut self, label: &SignatureLabel, active_arg: usize, x: i32, y: i32) {
+    fn ensure_frame(&mut self, editor: &TextEditor) -> Option<&mut Frame> {
         if self.is_deleted() {
+            self.frame = None;
             self.visible = false;
-            return;
         }
-        if label.text.is_empty() {
-            self.hide();
-            return;
+        if self.frame.is_none() {
+            let parent = editor.window()?;
+            let current_group = fltk::group::Group::try_current();
+            parent.begin();
+            let mut frame = Frame::default()
+                .with_size(200, Self::height())
+                .with_pos(0, 0);
+            frame.set_frame(fltk::enums::FrameType::FlatBox);
+            frame.set_color(theme::panel_raised());
+            frame.set_label_color(theme::text_primary());
+            frame.set_label_size(Self::font_size());
+            frame.set_align(fltk::enums::Align::Left | fltk::enums::Align::Inside);
+            frame.clear_visible_focus();
+            frame.hide();
+            parent.end();
+            if let Some(ref group) = current_group {
+                fltk::group::Group::set_current(Some(group));
+            } else {
+                fltk::group::Group::set_current(None::<&fltk::group::Group>);
+            }
+            self.frame = Some(frame);
         }
+        self.frame.as_mut()
+    }
 
-        let display = match label.arg_spans.get(active_arg) {
+    fn display_text(label: &SignatureLabel, active_arg: usize) -> String {
+        match label.arg_spans.get(active_arg) {
             Some(&(start, end)) if start <= label.text.len() && end <= label.text.len() => {
                 format!(
                     "{}[ {} ]{}",
@@ -4223,46 +4219,92 @@ impl SignaturePopup {
                 )
             }
             _ => label.text.clone(),
-        };
+        }
+    }
 
+    /// Position inside the editor's parent window. Mirrors the completion
+    /// popup's cursor-position and window-bound clamping, but deliberately keeps
+    /// coordinates local because the signature hint is an in-window overlay.
+    fn overlay_position(
+        editor: &TextEditor,
+        anchor_pos: i32,
+        width: i32,
+        height: i32,
+    ) -> (i32, i32) {
+        let (cursor_x, cursor_y) = editor.position_to_xy(anchor_pos);
+        let mut popup_x = cursor_x;
+        let mut popup_y = cursor_y - height - 2;
+
+        if let Some(win) = editor.window() {
+            let max_x = (win.w() - width).max(0);
+            let max_y = (win.h() - height).max(0);
+            popup_x = popup_x.clamp(0, max_x);
+            popup_y = popup_y.clamp(0, max_y);
+        }
+
+        (popup_x, popup_y)
+    }
+
+    /// Render `label` with the argument at `active_arg` bracketed, sizing and
+    /// positioning the overlay above the call's opening parenthesis.
+    pub fn show(
+        &mut self,
+        editor: &TextEditor,
+        label: &SignatureLabel,
+        active_arg: usize,
+        anchor_pos: i32,
+    ) {
+        if label.text.is_empty() {
+            self.hide();
+            return;
+        }
+
+        let display = Self::display_text(label, active_arg);
         fltk::draw::set_font(fltk::enums::Font::Helvetica, Self::font_size());
         let (text_w, _) = fltk::draw::measure(&display, false);
         let width = (text_w + 20).clamp(120, 1100);
         let height = Self::height();
-        self.frame.set_label(&display);
-        self.frame.set_size(width, height);
-        self.window.set_size(width, height);
-        self.window.set_pos(x, y);
-        if !self.window.shown() {
-            self.window.show();
-        } else {
-            self.window.redraw();
+        let (x, y) = Self::overlay_position(editor, anchor_pos, width, height);
+
+        let Some(frame) = self.ensure_frame(editor) else {
+            self.visible = false;
+            return;
+        };
+        frame.set_label(&display);
+        frame.set_size(width, height);
+        frame.set_pos(x, y);
+        frame.show();
+        frame.redraw();
+        if let Some(mut win) = editor.window() {
+            win.redraw();
         }
         self.visible = true;
     }
 
     pub fn hide(&mut self) {
-        if self.is_deleted() {
-            self.visible = false;
-            return;
-        }
-        self.window.hide();
-        self.window.resize(0, 0, 0, 0);
         self.visible = false;
+        if let Some(frame) = self.frame.as_mut() {
+            if frame.was_deleted() {
+                return;
+            }
+            frame.hide();
+            frame.redraw();
+            if let Some(mut win) = frame.window() {
+                win.redraw();
+            }
+        }
     }
 
     pub fn is_visible(&self) -> bool {
-        !self.is_deleted() && self.visible
+        self.visible && !self.is_deleted()
     }
 
     pub fn delete_for_close(&mut self) {
-        if self.is_deleted() {
-            self.visible = false;
-            return;
-        }
         self.hide();
-        if !self.window.was_deleted() {
-            Window::delete(self.window.clone());
+        if let Some(frame) = self.frame.take() {
+            if !frame.was_deleted() {
+                Frame::delete(frame);
+            }
         }
     }
 }
