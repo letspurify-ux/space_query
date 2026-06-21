@@ -11626,6 +11626,20 @@ impl SqlEditorWidget {
         let (_, last_token) = meaningful.last().copied()?;
 
         let left_operand_before_is = |is_idx: usize| {
+            // A declaration / definition `<keyword> <name> IS …` (CURSOR / TYPE /
+            // SUBTYPE / PROCEDURE / FUNCTION / PACKAGE / [TYPE|PACKAGE] BODY) opens a
+            // query, type, or routine body — its `IS` is structural, never an `x IS
+            // NULL` boolean predicate tail.
+            if matches!(
+                is_idx.checked_sub(2).and_then(|idx| tokens.get(idx)),
+                Some(SqlToken::Word(word))
+                    if matches!(
+                        word.to_ascii_uppercase().as_str(),
+                        "CURSOR" | "TYPE" | "SUBTYPE" | "PROCEDURE" | "FUNCTION" | "PACKAGE" | "BODY"
+                    )
+            ) {
+                return false;
+            }
             Self::cursor_follows_complete_operand(tokens, is_idx) == Some(true)
                 && !matches!(
                     is_idx.checked_sub(1).and_then(|idx| tokens.get(idx)),
@@ -13224,13 +13238,22 @@ impl SqlEditorWidget {
         let create_tail = &words[create_idx..];
         let contains = |keyword: &str| create_tail.iter().any(|word| word == keyword);
 
+        // `IS`/`AS` is the routine header's terminal keyword: once present, the
+        // body follows and the header options must not be re-offered.
+        let header_body_keyword_present = contains("IS") || contains("AS");
         if contains("PROCEDURE") {
             if matches!(create_tail.last().map(String::as_str), Some("PROCEDURE")) {
+                return None;
+            }
+            if header_body_keyword_present {
                 return None;
             }
             return Some(&["AUTHID", "IS", "AS"]);
         }
         if contains("FUNCTION") && contains("RETURN") {
+            if header_body_keyword_present {
+                return None;
+            }
             return Some(&[
                 "AUTHID",
                 "DETERMINISTIC",
@@ -13245,10 +13268,16 @@ impl SqlEditorWidget {
             if matches!(create_tail.last().map(String::as_str), Some("BODY")) {
                 return None;
             }
+            if header_body_keyword_present {
+                return None;
+            }
             return Some(&["IS", "AS"]);
         }
         if contains("PACKAGE") {
             if matches!(create_tail.last().map(String::as_str), Some("PACKAGE")) {
+                return None;
+            }
+            if header_body_keyword_present {
                 return None;
             }
             return Some(&["AUTHID", "IS", "AS"]);

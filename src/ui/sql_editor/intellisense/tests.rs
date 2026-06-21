@@ -36530,3 +36530,45 @@ fn query_level_continuations_do_not_leak_into_non_query_parens() {
     assert!(has(&kw("SELECT a FROM t UNION |"), "SELECT"));
     assert!(has(&kw("UPDATE t SET a = 1 RETURNING a |"), "INTO"));
 }
+
+/// A structural `IS` that opens a declaration / routine body (`CURSOR c IS …`,
+/// `TYPE t IS …`, `CREATE PROCEDURE p IS …`, `CREATE PACKAGE pkg IS …`) is not the
+/// boolean `x IS NULL` predicate, so its tails (`NULL`/`JSON`/`NAN`/…) must not
+/// leak; a real predicate `IS` still offers them. Separately, a routine header
+/// stops offering its options (`AUTHID`/`IS`/`AS`/…) once the body keyword appears.
+#[test]
+fn structural_is_and_routine_header_do_not_leak_predicate_or_header_keywords() {
+    let kw = |sql: &str| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix, &analyze_inline_cursor_sql(sql), Some(crate::db::DatabaseType::Oracle))
+    };
+    let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
+
+    // Structural `IS` — no boolean-predicate tails, no header re-offer.
+    for sql in [
+        "DECLARE CURSOR c IS |",
+        "DECLARE TYPE t IS |",
+        "DECLARE SUBTYPE s IS |",
+        "CREATE PROCEDURE p AS |",
+        "CREATE OR REPLACE PROCEDURE p IS |",
+        "CREATE FUNCTION f RETURN NUMBER IS |",
+        "CREATE PACKAGE pkg IS |",
+        "CREATE PACKAGE BODY pkg IS |",
+    ] {
+        let s = kw(sql);
+        for noise in ["NULL", "JSON", "NAN", "AUTHID", "IS", "AS"] {
+            assert!(!has(&s, noise), "`{noise}` leaked at a structural IS/body `{sql}`: {s:?}");
+        }
+    }
+
+    // A real predicate `IS` still offers its tails.
+    assert!(has(&kw("SELECT a FROM t WHERE x IS |"), "NULL"));
+    assert!(has(&kw("SELECT a FROM t WHERE x IS NOT |"), "JSON"));
+
+    // The routine header before the body keyword still offers its options.
+    assert!(has(&kw("CREATE PROCEDURE p |"), "AS"));
+    assert!(has(&kw("CREATE FUNCTION f (p IN NUMBER) RETURN NUMBER |"), "DETERMINISTIC"));
+}
