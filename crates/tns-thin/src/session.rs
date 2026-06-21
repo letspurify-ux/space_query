@@ -14464,11 +14464,11 @@ mod tests {
                 vec![0, 0, 0, 0x0b, TNS_PACKET_TYPE_MARKER, 0, 0, 0, 1, 0],
             ),
             (
-                317,
+                318,
                 vec![0, 0, 0, 0x0b, TNS_PACKET_TYPE_MARKER, 0, 0, 0, 1, 0],
             ),
             (
-                318,
+                319,
                 vec![0, 0, 0, 0x0b, TNS_PACKET_TYPE_MARKER, 0, 0, 0, 1, 0],
             ),
         ];
@@ -14892,12 +14892,12 @@ mod tests {
 
     #[test]
     fn cancel_reset_drains_break_response_and_keeps_connection_reusable() {
-        for protocol_version in [314, 315, 317, 318, 319] {
+        for protocol_version in [314, 315, 318, 319] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
             let server = std::thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
-                // python-oracledb (315/317/318/319) style: the reader receives a
+                // python-oracledb (315/318/319) style: the reader receives a
                 // server marker, then answers it with a client RESET before
                 // consuming the trailing ORA-01013 error/end-of-response data.
                 stream
@@ -14940,7 +14940,7 @@ mod tests {
     fn break_execution_without_oob_sends_single_interrupt_marker() {
         // Mirrors python-oracledb `_break_external`: with OOB unavailable the
         // graceful break is signalled by exactly one in-band INTERRUPT marker.
-        for protocol_version in [314, 315, 317, 318, 319] {
+        for protocol_version in [314, 315, 318, 319] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
             let server = std::thread::spawn(move || {
@@ -14991,7 +14991,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn break_execution_with_oob_sends_no_external_marker_when_oob_succeeds() {
-        for protocol_version in [315, 317, 318, 319] {
+        for protocol_version in [315, 318, 319] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
             let server = std::thread::spawn(move || {
@@ -15021,7 +15021,7 @@ mod tests {
 
     #[test]
     fn modern_oob_cancel_drain_sends_interrupt_then_resets_server_marker() {
-        for protocol_version in [315, 317, 318, 319] {
+        for protocol_version in [315, 318, 319] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
             let server = std::thread::spawn(move || {
@@ -15070,7 +15070,7 @@ mod tests {
 
     #[test]
     fn modern_cancel_reset_discards_packets_until_reset_marker() {
-        for protocol_version in [315, 317, 318, 319] {
+        for protocol_version in [315, 318, 319] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
             let server = std::thread::spawn(move || {
