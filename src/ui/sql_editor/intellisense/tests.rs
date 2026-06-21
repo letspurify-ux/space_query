@@ -36572,3 +36572,36 @@ fn structural_is_and_routine_header_do_not_leak_predicate_or_header_keywords() {
     assert!(has(&kw("CREATE PROCEDURE p |"), "AS"));
     assert!(has(&kw("CREATE FUNCTION f (p IN NUMBER) RETURN NUMBER |"), "DETERMINISTIC"));
 }
+
+/// `GRANT … TO grantee` ends with the option phrase appropriate to the privilege
+/// kind — `WITH GRANT OPTION` for object privileges (`… ON obj …`), `WITH ADMIN
+/// OPTION` for system privileges / roles — and once `WITH` is typed only the bare
+/// option remains (never the whole `WITH … OPTION` again). Multi-table `INSERT
+/// ALL`/`FIRST` has no `RETURNING`, and its `WHEN` branch expects a predicate.
+#[test]
+fn grant_option_and_insert_all_do_not_offer_wrong_tail() {
+    let kw = |sql: &str| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix, &analyze_inline_cursor_sql(sql), Some(crate::db::DatabaseType::Oracle))
+    };
+
+    assert_eq!(kw("GRANT SELECT ON t TO u |"), vec!["WITH GRANT OPTION".to_string()]);
+    assert_eq!(kw("GRANT SELECT ON t TO u WITH |"), vec!["GRANT OPTION".to_string()]);
+    assert_eq!(kw("GRANT CREATE SESSION TO u |"), vec!["WITH ADMIN OPTION".to_string()]);
+    assert_eq!(kw("GRANT CREATE SESSION TO u WITH |"), vec!["ADMIN OPTION".to_string()]);
+
+    let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
+    // Single-table INSERT keeps RETURNING; multi-table conditional/unconditional
+    // INSERT ALL/FIRST never offers it.
+    assert!(has(&kw("INSERT INTO t VALUES (1) |"), "RETURNING"));
+    for sql in [
+        "INSERT ALL INTO t1 VALUES (1) WHEN |",
+        "INSERT ALL INTO t1 VALUES (1) INTO t2 VALUES (2) |",
+        "INSERT FIRST WHEN x > 1 THEN INTO t1 VALUES (1) |",
+    ] {
+        assert!(!has(&kw(sql), "RETURNING"), "RETURNING leaked into multi-table INSERT `{sql}`: {:?}", kw(sql));
+    }
+}

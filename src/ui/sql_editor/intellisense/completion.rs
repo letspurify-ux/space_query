@@ -12858,6 +12858,10 @@ impl SqlEditorWidget {
             "INSERT"
                 if contains("VALUES")
                     && !has_returning
+                    // A multi-table `INSERT ALL`/`INSERT FIRST` has no `RETURNING`,
+                    // and its `WHEN <cond>` branches expect a predicate, not a tail
+                    // clause — exclude it so neither leaks there.
+                    && !matches!(words.get(1).map(String::as_str), Some("ALL") | Some("FIRST"))
                     && Self::cursor_immediately_follows_complete_operand(tokens, end) =>
             {
                 if mysql {
@@ -13082,7 +13086,15 @@ impl SqlEditorWidget {
             return Some(&["TO"]);
         }
         if words.first().is_some_and(|word| word == "GRANT") && contains("TO") {
-            return Some(&["WITH GRANT OPTION"]);
+            // Object privileges (`… ON obj …`) end with `WITH GRANT OPTION`; system
+            // privileges and roles with `WITH ADMIN OPTION`. Once `WITH` is typed,
+            // only the option phrase remains (never the whole `WITH … OPTION`).
+            return Some(match (contains("ON"), contains("WITH")) {
+                (true, false) => &["WITH GRANT OPTION"],
+                (true, true) => &["GRANT OPTION"],
+                (false, false) => &["WITH ADMIN OPTION"],
+                (false, true) => &["ADMIN OPTION"],
+            });
         }
         if words.first().is_some_and(|word| word == "REVOKE")
             && contains("ON")
