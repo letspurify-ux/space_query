@@ -3131,6 +3131,13 @@ impl DatabaseConnection {
             info.password.clone(),
         );
         config.program = "space-query-thin".to_string();
+        // Skip the connect-time out-of-band probe on the interactive connect
+        // path. Some Oracle 318+ listeners advertise OOB (supports_oob_check)
+        // but then stall the protocol handshake when the urgent-data probe is
+        // sent, hanging login at `ttc-protocol-read`. Without the probe, query
+        // cancel falls back to the in-band interrupt marker (the two-tier
+        // model still works). Matches the diagnostic/debug connect paths.
+        config.connect_options.disable_oob_probe = true;
         apply_oracle_thin_protocol_env(&mut config)?;
         apply_oracle_thin_debug_protocol(&mut config, info.debug_oracle_thin_protocol_version)?;
         Ok(config)
