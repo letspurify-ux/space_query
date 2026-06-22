@@ -3464,7 +3464,7 @@ fn negotiate_protocol(
 
     log_connect_phase("ttc-protocol-read", "");
     let (oob_reset_received, packet) =
-        read_data_packet_with_control(stream, capabilities.protocol_version.unwrap_or(319))?;
+        read_connect_data_packet(stream, capabilities.protocol_version.unwrap_or(319))?;
     if oob_reset_received {
         capabilities.supports_oob = false;
     }
@@ -3506,7 +3506,8 @@ fn negotiate_data_types(
     )?;
 
     log_connect_phase("ttc-data-types-read", "");
-    let packet = read_data_packet(stream, capabilities.protocol_version.unwrap_or(319))?;
+    let (_oob_reset_received, packet) =
+        read_connect_data_packet(stream, capabilities.protocol_version.unwrap_or(319))?;
     let mut cursor = PacketCursor::with_capabilities(&packet, capabilities);
     let message_type = cursor.read_u8()?;
     if message_type != TNS_MSG_TYPE_DATA_TYPES {
@@ -12086,6 +12087,50 @@ fn read_data_packet(
     read_data_packet_with_flags(stream, protocol_version).map(|(_, payload)| payload)
 }
 
+/// Reads the next TTC response during the connection handshake, transparently
+/// discarding any control or marker packets the server sends in reply to the
+/// out-of-band probe before delivering the real protocol response.
+///
+/// This mirrors python-oracledb, which consumes the OOB reset acknowledgement
+/// (a `RESET_OOB` control packet and/or an echoed `RESET` marker) and then
+/// processes the protocol response. Unlike the runtime cancel drain
+/// ([`read_data_after_marker_reset`]), it never echoes an extra reset marker
+/// and never blocks waiting for a break/reset handshake to complete, so an OOB
+/// probe acknowledgement at protocol 318+ cannot stall login.
+fn read_connect_data_packet(
+    stream: &mut TcpStream,
+    protocol_version: u16,
+) -> Result<(bool, Vec<u8>), OracleThinError> {
+    let mut oob_reset_received = false;
+    loop {
+        let (packet_type, data) = read_tns_packet(stream, protocol_version, "TNS connect data")?;
+        match packet_type {
+            TNS_PACKET_TYPE_DATA => {
+                if data.len() < 2 {
+                    return Err(OracleThinError::new(format!(
+                        "invalid TNS data packet length {}",
+                        data.len() + 8
+                    )));
+                }
+                return Ok((oob_reset_received, data[2..].to_vec()));
+            }
+            TNS_PACKET_TYPE_CONTROL => {
+                oob_reset_received |= process_control_packet(&data)?.oob_reset_received;
+            }
+            TNS_PACKET_TYPE_MARKER => {
+                // OOB probe acknowledgement: consume the echoed marker and keep
+                // reading for the real protocol response without replying.
+            }
+            other => {
+                return Err(OracleThinError::new(format!(
+                    "expected TNS data packet during connect, got packet type {other}"
+                )));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 fn read_data_packet_with_control(
     stream: &mut TcpStream,
     protocol_version: u16,
@@ -12110,6 +12155,7 @@ fn read_data_packet_with_flags_for_cancel(
         .map(|(_, data_flags, payload)| (data_flags, payload))
 }
 
+#[cfg(test)]
 fn read_data_packet_with_flags_and_control(
     stream: &mut TcpStream,
     protocol_version: u16,
@@ -13675,18 +13721,19 @@ mod tests {
         oracle_column_type_from_ora_type_for_protocol, process_auth_payload, process_describe_body,
         process_legacy_execute_error, process_protocol_message, process_return_parameters,
         process_row_data, process_server_side_piggyback, process_token, process_warning,
-        read_boolean_value, read_data_packet_with_control, read_data_packet_with_flags,
-        read_rowid_value, read_urowid_value, request_is_dml_returning, request_with_out_bind_types,
-        thin_column_from_column_metadata, thin_column_from_object_attr,
-        validate_supported_protocol, verify_server_response, windows_code_pages_for_encoding,
-        write_bind_rows_for_request, write_bind_value, write_bytes_with_length_for_capabilities,
-        write_bytes_with_two_lengths, write_close_cursors_piggyback, write_column_metadata,
-        write_current_schema_piggyback, write_data_packet, write_data_type_representations,
-        write_end_to_end_piggyback, write_eof_data_packet, write_function_code,
-        write_session_state_piggyback, write_ub2, write_ub4, write_ub8, AuthCredentials, AuthState,
-        BreakSignal, CancelReadState, EndToEndAttributes, OracleThinAppContext, OracleThinAuthMode,
-        OracleThinCapabilities, OracleThinConfig, OracleThinPurity, OracleThinSession, OracleValue,
-        PacketCursor, ServerSidePiggybackState, ThinColumn, BREAK_SIGNAL_INBAND, BREAK_SIGNAL_NONE,
+        read_boolean_value, read_connect_data_packet, read_data_packet_with_control,
+        read_data_packet_with_flags, read_rowid_value, read_urowid_value, request_is_dml_returning,
+        request_with_out_bind_types, thin_column_from_column_metadata,
+        thin_column_from_object_attr, validate_supported_protocol, verify_server_response,
+        windows_code_pages_for_encoding, write_bind_rows_for_request, write_bind_value,
+        write_bytes_with_length_for_capabilities, write_bytes_with_two_lengths,
+        write_close_cursors_piggyback, write_column_metadata, write_current_schema_piggyback,
+        write_data_packet, write_data_type_representations, write_end_to_end_piggyback,
+        write_eof_data_packet, write_function_code, write_session_state_piggyback, write_ub2,
+        write_ub4, write_ub8, AuthCredentials, AuthState, BreakSignal, CancelReadState,
+        EndToEndAttributes, OracleThinAppContext, OracleThinAuthMode, OracleThinCapabilities,
+        OracleThinConfig, OracleThinPurity, OracleThinSession, OracleValue, PacketCursor,
+        ServerSidePiggybackState, ThinColumn, BREAK_SIGNAL_INBAND, BREAK_SIGNAL_NONE,
         BREAK_SIGNAL_OOB, CS_FORM_IMPLICIT, CS_FORM_NCHAR, ORACLE_CHARSET_AL32UTF8,
         ORACLE_CHARSET_UTF8, TNS_CCAP_END_OF_CALL_STATUS, TNS_CCAP_END_OF_RESPONSE,
         TNS_CCAP_EXPLICIT_BOUNDARY, TNS_CCAP_FIELD_VERSION, TNS_CCAP_FIELD_VERSION_20_1,
@@ -14931,6 +14978,71 @@ mod tests {
             assert!(
                 !session.is_broken(),
                 "protocol {protocol_version}: connection should remain reusable"
+            );
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn connect_read_consumes_oob_probe_ack_before_protocol_response() {
+        // Mirrors python-oracledb: at protocol 318+ the server answers the OOB
+        // probe with a RESET_OOB control packet and/or an echoed RESET marker
+        // before the real protocol response. The connect read must discard the
+        // acknowledgement and deliver the protocol payload instead of stalling
+        // in the runtime break/reset drain (which blocks awaiting a handshake
+        // that never completes during login).
+        for protocol_version in [318, 319] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                // OOB reset acknowledgement: RESET_OOB control (control type 9)
+                // signalling the urgent break was not honoured end-to-end,
+                // followed by an echoed RESET marker.
+                stream
+                    .write_all(&tns_test_packet(
+                        protocol_version,
+                        TNS_PACKET_TYPE_CONTROL,
+                        &[0, 9],
+                    ))
+                    .unwrap();
+                stream
+                    .write_all(&tns_test_packet(
+                        protocol_version,
+                        TNS_PACKET_TYPE_MARKER,
+                        &[1, 0, TNS_MARKER_TYPE_RESET],
+                    ))
+                    .unwrap();
+                // The actual protocol response follows the acknowledgement.
+                let mut data_body = Vec::new();
+                data_body.extend_from_slice(&0u16.to_be_bytes());
+                data_body.push(TNS_MSG_TYPE_PROTOCOL);
+                stream
+                    .write_all(&tns_test_packet(
+                        protocol_version,
+                        TNS_PACKET_TYPE_DATA,
+                        &data_body,
+                    ))
+                    .unwrap();
+                std::thread::sleep(Duration::from_millis(50));
+            });
+            let mut stream = TcpStream::connect(addr).unwrap();
+            // Fail fast (rather than hang the suite) if the read regresses.
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let (oob_reset_received, payload) =
+                read_connect_data_packet(&mut stream, protocol_version).unwrap_or_else(|err| {
+                    panic!("protocol {protocol_version} connect read failed: {err}")
+                });
+            assert!(
+                oob_reset_received,
+                "protocol {protocol_version}: RESET_OOB control must disable OOB"
+            );
+            assert_eq!(
+                payload,
+                vec![TNS_MSG_TYPE_PROTOCOL],
+                "protocol {protocol_version}: connect read must return the protocol response"
             );
             server.join().unwrap();
         }
