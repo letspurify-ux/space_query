@@ -730,6 +730,17 @@ impl OracleThinSession {
         let (mut stream, accept) = connector.connect_tcp(&config.target)?;
         validate_supported_protocol(&accept)?;
         let mut capabilities = capabilities_from_accept(&config.connect_options, &accept);
+        log_connect_phase(
+            "tns-accept-capabilities",
+            &format!(
+                "protocol={} supports_oob={} supports_oob_check={} fast_auth={} end_of_response={}",
+                capabilities.protocol_version.unwrap_or(0),
+                capabilities.supports_oob,
+                capabilities.supports_oob_check,
+                capabilities.supports_fast_auth,
+                capabilities.supports_end_of_response,
+            ),
+        );
         probe_oob_reset_if_supported(&mut stream, &config.connect_options, &capabilities)?;
         negotiate_protocol(&mut stream, &mut capabilities)?;
         negotiate_data_types(&mut stream, &capabilities)?;
@@ -3425,8 +3436,18 @@ fn probe_oob_reset_if_supported(
 ) -> Result<(), OracleThinError> {
     if options.disable_oob_probe || !(capabilities.supports_oob && capabilities.supports_oob_check)
     {
+        log_connect_phase(
+            "oob-probe-skip",
+            &format!(
+                "disable_oob_probe={} supports_oob={} supports_oob_check={}",
+                options.disable_oob_probe,
+                capabilities.supports_oob,
+                capabilities.supports_oob_check
+            ),
+        );
         return Ok(());
     }
+    log_connect_phase("oob-probe-send", "out-of-band break + reset marker");
     if !send_oob_break(stream)? {
         return Ok(());
     }
