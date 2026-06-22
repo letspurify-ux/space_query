@@ -11597,7 +11597,12 @@ impl SqlEditorWidget {
                     let upper = word.to_ascii_uppercase();
                     match upper.as_str() {
                         "BY" => return true,
-                        "ASC" | "DESC" | "NULLS" | "FIRST" | "LAST" => {}
+                        // ORDER BY sort modifiers and the GROUP BY extended-grouping
+                        // keywords are *part of* an item, not a trailing clause, so
+                        // they must not end the walk-back to the `BY` head
+                        // (`GROUP BY ROLLUP(a) |` is still inside the grouping list).
+                        "ASC" | "DESC" | "NULLS" | "FIRST" | "LAST" | "ROLLUP" | "CUBE"
+                        | "GROUPING" | "SETS" => {}
                         other
                             if crate::sql_text::is_oracle_sql_keyword(other)
                                 || crate::sql_text::is_mysql_sql_keyword(other) =>
@@ -12343,6 +12348,47 @@ impl SqlEditorWidget {
 
     fn cursor_follows_complete_predicate(tokens: &[SqlToken], end: usize) -> bool {
         let toks = Self::meaningful_tokens_before(tokens, end);
+        Self::token_slice_forms_complete_predicate(&toks)
+    }
+
+    /// True when the cursor immediately follows a complete `USING (col, …)` join
+    /// condition — the last meaningful token is the `)` closing the column list
+    /// whose matching `(` is introduced by `USING`. Like a finished `ON` predicate
+    /// this completes the join, so the query continuation (`WHERE`/`JOIN`/…)
+    /// follows. The column list is not a boolean predicate, so this is kept
+    /// separate from [`Self::cursor_follows_complete_predicate`].
+    fn cursor_follows_complete_using_clause(tokens: &[SqlToken], end: usize) -> bool {
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        if !matches!(toks.last(), Some(SqlToken::Symbol(sym)) if *sym == ")") {
+            return false;
+        }
+        // Find the `(` matching the trailing `)`.
+        let mut depth = 0i32;
+        let mut open = None;
+        for idx in (0..toks.len()).rev() {
+            match toks[idx] {
+                SqlToken::Symbol(sym) if sym == ")" => depth += 1,
+                SqlToken::Symbol(sym) if sym == "(" => {
+                    depth -= 1;
+                    if depth == 0 {
+                        open = Some(idx);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        matches!(
+            open.and_then(|idx| idx.checked_sub(1)).and_then(|idx| toks.get(idx)),
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("USING")
+        )
+    }
+
+    /// Core of [`Self::cursor_follows_complete_predicate`], operating on an already
+    /// collected token slice so it can recurse into a grouping paren's contents (a
+    /// fully parenthesised boolean group `(a = b)` is a complete predicate operand,
+    /// not just an opaque value).
+    fn token_slice_forms_complete_predicate(toks: &[&SqlToken]) -> bool {
         // Isolate the current conjunct: walk back at paren depth 0 to the nearest
         // boundary (the clause keyword, a conjunction, or an enclosing paren). A
         // `BETWEEN … AND …` separator is not a conjunction boundary.
@@ -12366,7 +12412,7 @@ impl SqlEditorWidget {
                 }
                 SqlToken::Word(word) if depth == 0 && is_boundary(&word.to_ascii_uppercase()) => {
                     if word.eq_ignore_ascii_case("AND")
-                        && Self::and_token_belongs_to_between(&toks, idx)
+                        && Self::and_token_belongs_to_between(toks, idx)
                     {
                         continue;
                     }
@@ -12390,17 +12436,44 @@ impl SqlEditorWidget {
         let mut expecting_operand = true;
         let mut saw_predicate_operator = false;
         let mut is_tail = false;
-        let mut depth = 0i32;
-        for token in conjunct {
-            match token {
+        let mut idx = 0usize;
+        while idx < conjunct.len() {
+            match conjunct[idx] {
                 SqlToken::Comment(_) => {}
-                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => depth += 1,
+                // A bracketed group is consumed as one unit. If it *starts an
+                // operand* it is a grouping/boolean paren (not a function-call
+                // argument list, which follows a value) — so a fully parenthesised
+                // complete predicate `(a = b)` is itself a boolean operand. A group
+                // that follows a value is a call/subscript and never a predicate.
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => {
+                    let mut group_depth = 1i32;
+                    let mut close = idx + 1;
+                    while close < conjunct.len() && group_depth > 0 {
+                        match conjunct[close] {
+                            SqlToken::Symbol(s) if s == "(" || s == "[" => group_depth += 1,
+                            SqlToken::Symbol(s) if s == ")" || s == "]" => group_depth -= 1,
+                            _ => {}
+                        }
+                        close += 1;
+                    }
+                    if group_depth != 0 {
+                        // Unbalanced open — malformed, never a complete predicate.
+                        return false;
+                    }
+                    if expecting_operand
+                        && Self::token_slice_forms_complete_predicate(&conjunct[idx + 1..close - 1])
+                    {
+                        saw_predicate_operator = true;
+                    }
+                    expecting_operand = false;
+                    is_tail = false;
+                    idx = close;
+                    continue;
+                }
                 SqlToken::Symbol(sym) if sym == ")" || sym == "]" => {
-                    depth = (depth - 1).max(0);
                     expecting_operand = false;
                     is_tail = false;
                 }
-                _ if depth > 0 => {}
                 SqlToken::Symbol(sym) => {
                     if matches!(sym.as_str(), "=" | "<" | ">" | "<=" | ">=" | "<>" | "!=" | "^=") {
                         saw_predicate_operator = true;
@@ -12453,8 +12526,9 @@ impl SqlEditorWidget {
                     is_tail = false;
                 }
             }
+            idx += 1;
         }
-        !expecting_operand && saw_predicate_operator && depth == 0 && !is_tail
+        !expecting_operand && saw_predicate_operator && !is_tail
     }
 
     /// Downstream query-clause opener keywords valid right after the *complete*
@@ -13147,10 +13221,14 @@ impl SqlEditorWidget {
             }
         }
         let returning_done = has_returning || (is_dml && has_log);
+        // The statement's own `WHERE` must be counted at the top level — a `WHERE`
+        // inside a subquery in a SET value / predicate (`SET a = (SELECT … WHERE …)`)
+        // is not the UPDATE/DELETE's `WHERE` and must not suppress offering it.
+        let has_where = Self::top_level_word_present_before(tokens, end, "WHERE");
 
         match head {
             "UPDATE" if contains("SET") && !returning_done && complete_assignment_or_predicate => {
-                if contains("WHERE") {
+                if has_where {
                     if mysql {
                         Some(&["ORDER BY", "LIMIT"])
                     } else {
@@ -13162,7 +13240,7 @@ impl SqlEditorWidget {
                     Some(&["WHERE", "RETURNING"])
                 }
             }
-            "DELETE" if contains("WHERE") && !returning_done && complete_assignment_or_predicate => {
+            "DELETE" if has_where && !returning_done && complete_assignment_or_predicate => {
                 if mysql {
                     Some(&["ORDER BY", "LIMIT"])
                 } else {
@@ -13615,6 +13693,16 @@ impl SqlEditorWidget {
             }
             if position_after("SYNONYM") == Some(1) {
                 return Some(&["FOR"]);
+            }
+            // `CREATE [OR REPLACE] TYPE ty AS |` → the type-spec kind. The downstream
+            // grammars already complete from there (`AS TABLE OF |`→types, `AS OBJECT
+            // (attrs)`/`AS VARRAY(n) OF |`→types). A TYPE *body* (`TYPE BODY ty AS |`)
+            // is the method-implementation grammar, so it is excluded.
+            if words.iter().any(|word| word == "TYPE")
+                && !words.iter().any(|word| word == "BODY")
+                && (position_after("AS") == Some(0) || position_after("IS") == Some(0))
+            {
+                return Some(&["OBJECT", "TABLE OF", "VARRAY"]);
             }
         }
 
@@ -14589,13 +14677,27 @@ impl SqlEditorWidget {
             _ => {}
         }
 
-        if has("XMLTABLE") && !has("COLUMNS") {
+        // The `XMLTABLE`/`JSON_TABLE` subgrammar (`PASSING`/`COLUMNS`/…) is only
+        // grammatical *inside* the open call paren — once it closes, a depth-blind
+        // `has("XMLTABLE")` would leak `COLUMNS` into the surrounding query
+        // (`FROM xmltable(… PASSING c) v |`). Gate on the innermost open paren being
+        // that call's argument list.
+        let enclosing_call = Self::innermost_open_paren_preceding_word(tokens, end);
+        if enclosing_call
+            .as_deref()
+            .is_some_and(|word| word.eq_ignore_ascii_case("XMLTABLE"))
+            && !has("COLUMNS")
+        {
             if has("PASSING") {
                 return Some(&["COLUMNS"]);
             }
             return Some(&["PASSING", "COLUMNS"]);
         }
-        if has("JSON_TABLE") && !has("COLUMNS") {
+        if enclosing_call
+            .as_deref()
+            .is_some_and(|word| word.eq_ignore_ascii_case("JSON_TABLE"))
+            && !has("COLUMNS")
+        {
             return Some(&["COLUMNS", "ERROR ON ERROR", "NULL ON ERROR"]);
         }
 
@@ -15106,8 +15208,15 @@ impl SqlEditorWidget {
                 ) && Self::cursor_immediately_follows_complete_operand(tokens, end)
                     && Self::cursor_is_in_order_by_item_list(tokens, end)
             }
+            // A join is finished either by a complete `ON` predicate or by a
+            // complete `USING (col, …)` column list — both let the query
+            // continuation follow. (`USING (…)` is a column list, not a predicate,
+            // so it deliberately does not pick up the `AND`/`OR` conjunction tail.)
+            SqlPhase::JoinCondition => {
+                Self::cursor_follows_complete_predicate(tokens, end)
+                    || Self::cursor_follows_complete_using_clause(tokens, end)
+            }
             SqlPhase::WhereClause
-            | SqlPhase::JoinCondition
             | SqlPhase::HavingClause
             | SqlPhase::ConnectByClause
             | SqlPhase::StartWithClause => Self::cursor_follows_complete_predicate(tokens, end),
@@ -15544,13 +15653,33 @@ impl SqlEditorWidget {
         )
     }
 
+    /// Whether the token at `idx` (or the boundary `None`) is a FROM-list slot
+    /// introducer — the position where a fresh table source begins: the `FROM`
+    /// keyword, a `,`, a JOIN keyword, `APPLY`/`LATERAL`, the start of input, or an
+    /// enclosing `(`.
+    fn token_introduces_from_list_source(toks: &[&SqlToken], idx: Option<usize>) -> bool {
+        match idx.and_then(|i| toks.get(i)) {
+            None => true,
+            Some(SqlToken::Symbol(sym)) => matches!(sym.as_str(), "(" | ","),
+            Some(SqlToken::Word(word)) => matches!(
+                word.to_ascii_uppercase().as_str(),
+                "FROM" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "CROSS"
+                    | "NATURAL" | "OUTER" | "APPLY" | "LATERAL" | "STRAIGHT_JOIN"
+            ),
+            _ => false,
+        }
+    }
+
     /// Whether the `)` at `close_idx` in `toks` closes a parenthesised table source
-    /// at a FROM-list position — a derived table `(SELECT …)`, a `TABLE(coll)`
-    /// collection source, a parenthesised join, or a parenthesised table reference.
-    /// Identified by the matching `(`'s introducer being a FROM-list slot (`FROM` /
-    /// `,` / a JOIN keyword / `APPLY` / `LATERAL` / `TABLE` / a nested `(`), which —
-    /// since the caller is already in the FROM-clause phase — is what distinguishes
-    /// it from a predicate / function-call / grouping paren.
+    /// at a FROM-list position — a derived table `(SELECT …)`, a parenthesised
+    /// join / table reference, or a table function (`TABLE(coll)`, `XMLTABLE(…)`,
+    /// `JSON_TABLE(…)`, a pipelined UDF `pkg.f(x)`). Identified by the matching `(`
+    /// sitting directly at a FROM-list slot (derived/parenthesised source) or being
+    /// the argument list of a (possibly dotted) function name that itself sits at a
+    /// FROM-list slot. Since the caller is already in the FROM-clause phase, this is
+    /// what distinguishes such a source from a post-table modifier (`t SAMPLE(n)`,
+    /// `t PARTITION(p)` — the name follows the *table*, not a FROM-list slot) or a
+    /// predicate / grouping paren.
     fn paren_closes_from_list_table_source(toks: &[&SqlToken], close_idx: usize) -> bool {
         if !matches!(toks.get(close_idx), Some(SqlToken::Symbol(sym)) if *sym == ")") {
             return false;
@@ -15573,17 +15702,34 @@ impl SqlEditorWidget {
         let Some(open_idx) = open_idx else {
             return false;
         };
-        match open_idx.checked_sub(1).and_then(|idx| toks.get(idx)) {
-            // A leading parenthesised source (`(SELECT …) |` as the whole FROM list)
-            // or one nested in another `(`/after a `,`.
-            None => true,
-            Some(SqlToken::Symbol(sym)) => matches!(sym.as_str(), "(" | ","),
-            Some(SqlToken::Word(word)) => matches!(
-                word.to_ascii_uppercase().as_str(),
-                "FROM" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "CROSS"
-                    | "NATURAL" | "OUTER" | "APPLY" | "LATERAL" | "TABLE" | "STRAIGHT_JOIN"
-            ),
-            _ => false,
+        let before = open_idx.checked_sub(1);
+        // Derived table / parenthesised source: the `(` is directly at a FROM-list slot.
+        if Self::token_introduces_from_list_source(toks, before) {
+            return true;
+        }
+        // Table function: the `(` is the argument list of a (possibly dotted) name
+        // whose head sits at a FROM-list slot. Walk back over `name (. name)*`.
+        let mut idx = match before {
+            Some(idx) if matches!(toks.get(idx), Some(SqlToken::Word(_))) => idx,
+            _ => return false,
+        };
+        loop {
+            match idx.checked_sub(1).and_then(|i| toks.get(i)) {
+                Some(SqlToken::Symbol(sym)) if sym == "." => {
+                    // Skip the dot and its qualifier word, then continue.
+                    let Some(q) = idx.checked_sub(2) else {
+                        return false;
+                    };
+                    if !matches!(toks.get(q), Some(SqlToken::Word(_))) {
+                        return false;
+                    }
+                    idx = q;
+                }
+                other => {
+                    let _ = other;
+                    return Self::token_introduces_from_list_source(toks, idx.checked_sub(1));
+                }
+            }
         }
     }
 

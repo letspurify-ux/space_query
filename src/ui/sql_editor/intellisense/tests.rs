@@ -37452,6 +37452,29 @@ fn grant_with_option_clause_is_single_use_and_does_not_leak_from() {
     assert_eq!(kw("GRANT SELECT ON t TO u WITH |", Oracle), vec!["GRANT OPTION".to_string()]);
 }
 
+/// `CREATE [OR REPLACE] TYPE ty AS|IS |` offers the type-spec kind (`OBJECT`,
+/// `TABLE OF`, `VARRAY`) — the entry into an otherwise-complete grammar (`TABLE OF`
+/// → types already works). A TYPE *body* (`CREATE TYPE BODY ty AS |`, the method
+/// implementations) and an unrelated `AS` (a column alias) must not get it.
+#[test]
+fn create_type_spec_offers_object_table_varray() {
+    let kw = |sql: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "", &analyze_inline_cursor_sql(sql), Some(crate::db::DatabaseType::Oracle))
+    };
+    let has = |v: &Vec<String>, s: &str| v.iter().any(|x| x == s);
+    let is_kind = |v: &Vec<String>| has(v, "OBJECT") && has(v, "TABLE OF") && has(v, "VARRAY");
+
+    assert!(is_kind(&kw("CREATE TYPE ty AS |")));
+    assert!(is_kind(&kw("CREATE OR REPLACE TYPE ty AS |")));
+    assert!(is_kind(&kw("CREATE TYPE ty IS |")));
+    // Type body and unrelated `AS` must not get the kind keywords.
+    assert!(!has(&kw("CREATE TYPE BODY ty AS |"), "OBJECT"));
+    assert!(!has(&kw("SELECT a FROM t WHERE x AS |"), "OBJECT"));
+    // Downstream is unchanged: `TABLE OF` still leads to the type catalog.
+    assert!(has(&kw("CREATE TYPE ty AS TABLE OF |"), "NUMBER"));
+}
+
 #[test]
 fn zzz_probe_gaps() {
     let kw = |sql: &str, db: crate::db::DatabaseType| -> Vec<String> {
@@ -37522,6 +37545,48 @@ fn clause_keywords_inside_function_calls_do_not_leak_to_statement_level() {
     // …but the genuine `LOG ERRORS` clause is still recognised and spends RETURNING.
     assert!(has(&kw("INSERT INTO t VALUES (1) LOG |", Oracle), "ERRORS"));
     assert!(has(&kw("INSERT INTO t VALUES (1) LOG ERRORS |", Oracle), "INTO"));
+
+    // A `WHERE` inside a subquery in a SET value is not the UPDATE's own `WHERE`, so
+    // the statement-level `WHERE` must still be offered.
+    let s = kw("UPDATE t SET a = (SELECT x FROM s WHERE y=1) |", Oracle);
+    assert!(has(&s, "WHERE") && has(&s, "RETURNING"),
+        "outer WHERE dropped by a subquery WHERE in SET value: {s:?}");
+    // …and once the statement's own top-level WHERE exists it is not re-offered.
+    assert!(!has(&kw("UPDATE t SET a = (SELECT x FROM s WHERE y=1) WHERE z=2 |", Oracle), "WHERE"));
+}
+
+/// After a *complete* GROUP BY grouping element the clause continues
+/// (`HAVING`/`ORDER BY`/…) — including the extended-grouping forms `ROLLUP(…)`,
+/// `CUBE(…)`, `GROUPING SETS(…)`, whose keywords are part of the item (so the
+/// walk-back to the `BY` head must not treat them as a trailing-clause boundary).
+/// The empty slot and a fresh post-comma item still suppress the continuation, and
+/// ORDER BY is unaffected.
+#[test]
+fn group_by_extended_grouping_elements_offer_clause_continuation() {
+    let kw = |sql: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "", &analyze_inline_cursor_sql(sql), Some(crate::db::DatabaseType::Oracle))
+    };
+    let has = |v: &Vec<String>, s: &str| v.iter().any(|x| x == s);
+
+    for sql in [
+        "SELECT a FROM t GROUP BY a |",
+        "SELECT a FROM t GROUP BY ROLLUP(a) |",
+        "SELECT a FROM t GROUP BY CUBE(a, b) |",
+        "SELECT a FROM t GROUP BY GROUPING SETS ((a), (b)) |",
+        "SELECT a FROM t GROUP BY a, ROLLUP(b) |",
+    ] {
+        let s = kw(sql);
+        assert!(has(&s, "HAVING") && has(&s, "ORDER BY"),
+            "GROUP BY element missing continuation at `{sql}`: {s:?}");
+    }
+    // The empty slot offers the grouping-type keywords, not the continuation;
+    // a fresh post-comma item offers nothing; ORDER BY tails are unchanged.
+    assert!(has(&kw("SELECT a FROM t GROUP BY |"), "ROLLUP")
+        && !has(&kw("SELECT a FROM t GROUP BY |"), "HAVING"));
+    assert!(!has(&kw("SELECT a FROM t GROUP BY ROLLUP(a), |"), "HAVING"));
+    assert!(has(&kw("SELECT a FROM t ORDER BY a |"), "ASC")
+        && has(&kw("SELECT a FROM t ORDER BY a |"), "OFFSET"));
 }
 
 /// A parenthesised FROM-list table source — a derived table `(SELECT …)` (with or
@@ -37565,4 +37630,136 @@ fn derived_table_and_parenthesised_source_offer_query_continuation() {
     assert!(offers_continuation(&kw("SELECT a FROM t1 CROSS JOIN (SELECT b FROM s) |", Oracle)));
     // The cursor inside the derived table is still its own column context (no leak).
     assert!(!offers_continuation(&kw("SELECT a FROM (SELECT b FROM s WHERE |", Oracle)));
+
+    // Table functions are FROM sources too: TABLE/XMLTABLE/JSON_TABLE and a
+    // (possibly dotted) pipelined UDF. After the call the continuation follows; as a
+    // JOIN target it offers ON/USING. A post-table modifier (`t SAMPLE(n)`) is NOT a
+    // FROM-list source (its name follows the table, not a FROM slot) and stays out.
+    for sql in [
+        "SELECT * FROM my_func(x) |",
+        "SELECT * FROM pkg.my_func(x) |",
+        "SELECT * FROM XMLTABLE('/a' PASSING c COLUMNS d NUMBER PATH '/b') |",
+        "SELECT * FROM t, JSON_TABLE(j, '$' COLUMNS (c NUMBER PATH '$.x')) |",
+    ] {
+        assert!(offers_continuation(&kw(sql, Oracle)),
+            "table function source missing continuation at `{sql}`: {:?}", kw(sql, Oracle));
+    }
+    assert!(has(&kw("SELECT * FROM t1 JOIN my_func(x) |", Oracle), "ON"));
+    // A post-table modifier is not a parenthesised FROM source.
+    assert!(!offers_continuation(&kw("SELECT * FROM t SAMPLE (10) |", Oracle)));
+}
+
+/// The `XMLTABLE`/`JSON_TABLE` subgrammar (`PASSING`/`COLUMNS`/error clauses) is
+/// only grammatical *inside* the still-open call paren. A depth-blind `has()` used
+/// to leak `COLUMNS` into the surrounding query once the call closed
+/// (`FROM xmltable(… PASSING c) v |` as a JOIN target offered `COLUMNS` instead of
+/// `ON`/`USING`). Gated on the innermost open paren being that call's argument list.
+#[test]
+fn xmltable_subgrammar_is_confined_to_the_open_call() {
+    let kw = |sql: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "", &analyze_inline_cursor_sql(sql), Some(crate::db::DatabaseType::Oracle))
+    };
+    let has = |v: &Vec<String>, s: &str| v.iter().any(|x| x == s);
+
+    // Inside the open call the subgrammar is still offered.
+    assert!(has(&kw("SELECT * FROM XMLTABLE('/a' |"), "PASSING"));
+    assert!(has(&kw("SELECT * FROM XMLTABLE('/a' PASSING x |"), "COLUMNS"));
+    assert!(has(&kw("SELECT * FROM JSON_TABLE(j, '$' |"), "COLUMNS"));
+    // Once the call closes, `COLUMNS`/`PASSING` must not leak out.
+    for sql in [
+        "SELECT * FROM XMLTABLE('/a' PASSING c) |",
+        "SELECT * FROM t1 JOIN XMLTABLE('/a' PASSING c) v |",
+        "SELECT * FROM JSON_TABLE(j, '$' COLUMNS (c NUMBER PATH '$.x')) v |",
+    ] {
+        let s = kw(sql);
+        assert!(!has(&s, "COLUMNS") && !has(&s, "PASSING"),
+            "XMLTABLE subgrammar leaked past the closed call at `{sql}`: {s:?}");
+    }
+}
+
+/// A *fully parenthesised* boolean group `(a = b)` is itself a complete predicate
+/// operand — `WHERE (a = b) |` / `JOIN … ON (a = b) |` must offer the same
+/// continuation as the unparenthesised form, at any nesting depth. The completeness
+/// check therefore recurses into a *grouping* paren (one that starts an operand);
+/// it must NOT recurse into a function-call argument list (a paren following a
+/// value), so `WHERE f(a = b) |` stays an opaque value and is not "complete". A
+/// bare parenthesised value (`(a)`, `(a + 1)`, a scalar subquery, a row
+/// constructor `(a, b)`) is likewise not a predicate.
+#[test]
+fn parenthesised_predicate_completes_like_the_unparenthesised_form() {
+    let kw = |sql: &str, db: crate::db::DatabaseType| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "", &analyze_inline_cursor_sql(sql), Some(db))
+    };
+    use crate::db::DatabaseType::Oracle;
+    let has = |v: &Vec<String>, s: &str| v.iter().any(|x| x == s);
+    let offers_continuation = |v: &Vec<String>| has(v, "GROUP BY") && has(v, "ORDER BY");
+
+    // Parenthesised predicates complete just like the bare form — WHERE, HAVING,
+    // and a join `ON`, including nested grouping and a leading subquery operand.
+    for sql in [
+        "SELECT a FROM t WHERE (a = b) |",
+        "SELECT a FROM t WHERE (a = b AND c = d) |",
+        "SELECT a FROM t WHERE ((a = b)) |",
+        "SELECT a FROM t WHERE (a = b) AND (c = d) |",
+        "SELECT a FROM t WHERE (SELECT c FROM s) > 5 |",
+        "SELECT a FROM t WHERE x IN (SELECT id FROM s) |",
+        "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM s) |",
+    ] {
+        assert!(offers_continuation(&kw(sql, Oracle)),
+            "parenthesised predicate missing continuation at `{sql}`: {:?}", kw(sql, Oracle));
+    }
+    // A join `ON (cond)` finishes the join exactly like `ON cond`.
+    for sql in [
+        "SELECT a FROM t1 JOIN t2 ON (a = b) |",
+        "SELECT a FROM t1 JOIN t2 ON (a = b AND c = d) |",
+    ] {
+        let s = kw(sql, Oracle);
+        assert!(has(&s, "JOIN") && has(&s, "WHERE"),
+            "parenthesised join condition missing continuation at `{sql}`: {s:?}");
+    }
+
+    // Things that look parenthesised but are NOT a complete predicate stay incomplete.
+    for sql in [
+        "SELECT a FROM t WHERE (a) |",            // bare parenthesised column
+        "SELECT a FROM t WHERE (a + 1) |",        // parenthesised arithmetic
+        "SELECT a FROM t WHERE (a, b) |",         // row constructor
+        "SELECT a FROM t WHERE (SELECT c FROM s) |", // scalar subquery alone
+        "SELECT a FROM t WHERE f(a = b) |",       // function-call argument list, NOT a grouping paren
+    ] {
+        assert!(!offers_continuation(&kw(sql, Oracle)),
+            "non-predicate parenthesised value wrongly completed at `{sql}`: {:?}", kw(sql, Oracle));
+    }
+}
+
+/// A `USING (col, …)` column list finishes a join just like a complete `ON`
+/// predicate, so the query continuation (`WHERE`/`JOIN`/…) follows it. Because the
+/// list is not a boolean predicate it must NOT pick up the `AND`/`OR` conjunction
+/// tail that an `ON` predicate offers; and while the cursor is still inside the
+/// column list nothing query-level is offered.
+#[test]
+fn using_join_column_list_completes_the_join() {
+    let kw = |sql: &str, db: crate::db::DatabaseType| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "", &analyze_inline_cursor_sql(sql), Some(db))
+    };
+    use crate::db::DatabaseType::{Oracle, MySQL};
+    let has = |v: &Vec<String>, s: &str| v.iter().any(|x| x == s);
+
+    for sql in [
+        "SELECT a FROM t1 JOIN t2 USING (a) |",
+        "SELECT a FROM t1 JOIN t2 USING (a, b) |",
+    ] {
+        let s = kw(sql, Oracle);
+        assert!(has(&s, "JOIN") && has(&s, "WHERE") && has(&s, "GROUP BY"),
+            "USING clause missing join continuation at `{sql}`: {s:?}");
+        assert!(!has(&s, "AND") && !has(&s, "OR"),
+            "USING column list wrongly offered the predicate conjunction tail at `{sql}`: {s:?}");
+    }
+    assert!(has(&kw("SELECT a FROM t1 JOIN t2 USING (a) |", MySQL), "WHERE"));
+    // Inside the still-open column list, no query-level continuation.
+    let s = kw("SELECT a FROM t1 JOIN t2 USING (a, |", Oracle);
+    assert!(!has(&s, "WHERE") && !has(&s, "JOIN"),
+        "query continuation leaked into the open USING column list: {s:?}");
 }
