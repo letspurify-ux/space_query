@@ -12361,6 +12361,16 @@ impl SqlEditorWidget {
         let mut idx = toks.len() - 1;
         let join_idx = loop {
             match &toks[idx] {
+                // A MySQL index hint's `FOR JOIN` purpose (`USE INDEX FOR JOIN (i)`)
+                // is not a join clause — its `(i)` index list was just skipped, so the
+                // `JOIN` reached here introduces no target.
+                SqlToken::Word(word)
+                    if word.eq_ignore_ascii_case("JOIN")
+                        && idx > 0
+                        && matches!(&toks[idx - 1], SqlToken::Word(w) if w.eq_ignore_ascii_case("FOR")) =>
+                {
+                    return None;
+                }
                 SqlToken::Word(word) if word.eq_ignore_ascii_case("JOIN") => break idx,
                 // An `ON`/`USING` between the cursor and the `JOIN` means a join
                 // condition is already complete (`JOIN t ON (a=b) |`), so this is the
@@ -13107,6 +13117,42 @@ impl SqlEditorWidget {
                     return false;
                 }
                 true
+            })
+            .collect()
+    }
+
+    /// MySQL *table* options after `CREATE TABLE (…) |` are each single-use, so an
+    /// option already specified (`… ENGINE = InnoDB |`) must drop out of the
+    /// continuation while the others stay valid. The character-set slot has two
+    /// spellings (`DEFAULT CHARSET` / `CHARACTER SET`) that share one occurrence.
+    /// Only the option region — from the cursor back to the column list's closing
+    /// `)` — is inspected; option *values* (`= InnoDB`, `= utf8mb4`) are bare words
+    /// that never collide with the option keywords, so a flat back-scan suffices.
+    /// A no-op for any candidate list that carries none of these keywords (the
+    /// other MySQL schema-object slots: ALTER/INDEX/TRIGGER/…).
+    fn drop_present_single_use_table_options(
+        candidates: Vec<String>,
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> Vec<String> {
+        let mut present: Vec<String> = Vec::new();
+        for token in Self::meaningful_tokens_before(tokens, end).iter().rev() {
+            match token {
+                SqlToken::Symbol(sym) if sym == ")" => break, // column list close
+                SqlToken::Word(word) => present.push(word.to_ascii_uppercase()),
+                _ => {}
+            }
+        }
+        let has = |kw: &str| present.iter().any(|word| word == kw);
+        let charset_present = has("CHARSET") || has("CHARACTER");
+        candidates
+            .into_iter()
+            .filter(|candidate| match candidate.to_ascii_uppercase().as_str() {
+                "ENGINE" | "AUTO_INCREMENT" | "COMMENT" | "ROW_FORMAT" | "COLLATE" => {
+                    !has(&candidate.to_ascii_uppercase())
+                }
+                "DEFAULT CHARSET" | "CHARACTER SET" => !charset_present,
+                _ => true,
             })
             .collect()
     }
@@ -15464,21 +15510,33 @@ impl SqlEditorWidget {
             return false;
         }
         let needle: Vec<&str> = upper.split(' ').collect();
+        // `ORDER BY` / `GROUP BY` also appear as a MySQL index-hint *purpose*
+        // (`USE INDEX FOR ORDER BY (i)`), where the keyword is led by `FOR` and is
+        // not the statement clause. No statement clause is spelled `FOR ORDER BY` /
+        // `FOR GROUP BY`, so such an occurrence is unambiguously the hint purpose.
+        let purpose_clause = matches!(upper.as_str(), "ORDER BY" | "GROUP BY");
         let (start, stop) = Self::current_set_branch_range(tokens, end);
         let mut depth = 0i32;
         let mut matched = 0usize;
+        let mut prev_for = false;
         for token in tokens.get(start..stop.min(tokens.len())).unwrap_or(&[]) {
             match token {
                 SqlToken::Symbol(sym) if sym == "(" || sym == "[" => {
                     depth += 1;
                     matched = 0;
+                    prev_for = false;
                 }
                 SqlToken::Symbol(sym) if sym == ")" || sym == "]" => {
                     depth = (depth - 1).max(0);
                     matched = 0;
+                    prev_for = false;
                 }
                 SqlToken::Word(word) if depth == 0 => {
-                    if word.eq_ignore_ascii_case(needle[matched]) {
+                    if purpose_clause && prev_for && word.eq_ignore_ascii_case(needle[0]) {
+                        // The index-hint purpose `FOR ORDER BY` / `FOR GROUP BY` — not
+                        // the statement clause; do not count it as present.
+                        matched = 0;
+                    } else if word.eq_ignore_ascii_case(needle[matched]) {
                         matched += 1;
                         if matched == needle.len() {
                             return true;
@@ -15486,9 +15544,13 @@ impl SqlEditorWidget {
                     } else {
                         matched = usize::from(word.eq_ignore_ascii_case(needle[0]));
                     }
+                    prev_for = word.eq_ignore_ascii_case("FOR");
                 }
                 SqlToken::Comment(_) => {}
-                _ => matched = 0,
+                _ => {
+                    matched = 0;
+                    prev_for = false;
+                }
             }
         }
         false
@@ -16181,38 +16243,16 @@ impl SqlEditorWidget {
         let Some(open_idx) = open_idx else {
             return false;
         };
-        let word_at = |i: usize| match toks.get(i) {
-            Some(SqlToken::Word(w)) => Some(w.to_ascii_uppercase()),
-            _ => None,
-        };
-        let is_lead = |w: &str| matches!(w, "PARTITION" | "SUBPARTITION" | "SAMPLE" | "TABLESAMPLE");
-        // Walk back from the word before `(` to the modifier's lead keyword, allowing
-        // one method/`FOR` filler (`SAMPLE BLOCK (…)`, `TABLESAMPLE BERNOULLI (…)`,
-        // `PARTITION FOR (…)`).
-        let mut cur = match open_idx.checked_sub(1) {
-            Some(i) => i,
-            None => return false,
-        };
-        let Some(w) = word_at(cur) else {
+        // Identify the modifier's lead keyword (the first token of the construct that
+        // owns this paren). `None` means the paren is not a post-table modifier.
+        let Some(lead_idx) = Self::post_table_modifier_lead(toks, open_idx) else {
             return false;
         };
-        if !is_lead(&w) {
-            if !matches!(w.as_str(), "FOR" | "BLOCK" | "BERNOULLI" | "SYSTEM") {
-                return false;
-            }
-            let Some(prev) = cur.checked_sub(1) else {
-                return false;
-            };
-            if !word_at(prev).is_some_and(|pw| is_lead(&pw)) {
-                return false;
-            }
-            cur = prev;
-        }
         // The modifier must attach to a table reference: the preceding token is an
         // identifier word (the table name / its dotted tail) or another stacked
         // post-table modifier — not a FROM-list introducer (which would make the
         // paren a table-function argument list, e.g. `FROM sample(10)`).
-        let Some(name_idx) = cur.checked_sub(1) else {
+        let Some(name_idx) = lead_idx.checked_sub(1) else {
             return false;
         };
         match toks.get(name_idx) {
@@ -16222,6 +16262,62 @@ impl SqlEditorWidget {
             }
             _ => false,
         }
+    }
+
+    /// Given the index of a post-table modifier's opening `(`, return the index of
+    /// the construct's lead keyword (so the caller can verify it attaches to a table
+    /// reference), or `None` if the paren is not a recognised post-table modifier.
+    /// Covers the Oracle/ANSI sampling & partition modifiers (`PARTITION (…)`,
+    /// `SAMPLE [BLOCK] (…)`, `TABLESAMPLE BERNOULLI (…)`, `PARTITION FOR (…)`) and
+    /// the MySQL index hint (`{USE|IGNORE|FORCE} {INDEX|KEY} [FOR {JOIN | ORDER BY |
+    /// GROUP BY}] (index_list)`) — its closing `)` likewise leaves the relation
+    /// complete, so the query continuation follows.
+    fn post_table_modifier_lead(toks: &[&SqlToken], open_idx: usize) -> Option<usize> {
+        let word_at = |i: usize| match toks.get(i) {
+            Some(SqlToken::Word(w)) => Some(w.to_ascii_uppercase()),
+            _ => None,
+        };
+        let cur = open_idx.checked_sub(1)?;
+        let w = word_at(cur)?;
+        let is_lead = |w: &str| matches!(w, "PARTITION" | "SUBPARTITION" | "SAMPLE" | "TABLESAMPLE");
+        // Oracle/ANSI modifier: the lead keyword directly, or one method/`FOR` filler
+        // (`SAMPLE BLOCK (…)`, `TABLESAMPLE BERNOULLI (…)`, `PARTITION FOR (…)`).
+        if is_lead(&w) {
+            return Some(cur);
+        }
+        if matches!(w.as_str(), "FOR" | "BLOCK" | "BERNOULLI" | "SYSTEM") {
+            if let Some(prev) = cur.checked_sub(1) {
+                if word_at(prev).is_some_and(|pw| is_lead(&pw)) {
+                    return Some(prev);
+                }
+            }
+        }
+        // MySQL index hint: walk back from the word before `(` over an optional `FOR
+        // {JOIN | ORDER BY | GROUP BY}` purpose, then the mandatory `INDEX`/`KEY`, to
+        // the `USE`/`IGNORE`/`FORCE` lead.
+        let nb = |d: usize| open_idx.checked_sub(d).and_then(word_at);
+        let is_hint_lead = |w: &Option<String>| matches!(w.as_deref(), Some("USE" | "IGNORE" | "FORCE"));
+        let is_index = |w: &Option<String>| matches!(w.as_deref(), Some("INDEX" | "KEY"));
+        let (w1, w2, w3, w4, w5) = (nb(1), nb(2), nb(3), nb(4), nb(5));
+        if is_index(&w1) && is_hint_lead(&w2) {
+            return open_idx.checked_sub(2); // `{USE|…} {INDEX|KEY} (`
+        }
+        if w1.as_deref() == Some("JOIN")
+            && w2.as_deref() == Some("FOR")
+            && is_index(&w3)
+            && is_hint_lead(&w4)
+        {
+            return open_idx.checked_sub(4); // `… INDEX FOR JOIN (`
+        }
+        if w1.as_deref() == Some("BY")
+            && matches!(w2.as_deref(), Some("ORDER" | "GROUP"))
+            && w3.as_deref() == Some("FOR")
+            && is_index(&w4)
+            && is_hint_lead(&w5)
+        {
+            return open_idx.checked_sub(5); // `… INDEX FOR ORDER|GROUP BY (`
+        }
+        None
     }
 
     fn cursor_is_after_complete_from_relation(tokens: &[SqlToken], end: usize) -> bool {
@@ -22379,20 +22475,25 @@ impl SqlEditorWidget {
         {
             return Self::filter_expected_candidates(prefix, candidates);
         }
-        if let Some(candidates) = Self::expected_mysql_schema_object_keyword_candidates(
-            tokens,
-            context_end,
-            db_type,
-        )
-        .or_else(|| {
-            Self::expected_mysql_schema_object_keyword_candidates(
-                statement_tokens,
-                statement_context_end,
-                db_type,
-            )
-        })
+        if let Some((candidates, src_tokens, src_end)) =
+            Self::expected_mysql_schema_object_keyword_candidates(tokens, context_end, db_type)
+                .map(|candidates| (candidates, tokens, context_end))
+                .or_else(|| {
+                    Self::expected_mysql_schema_object_keyword_candidates(
+                        statement_tokens,
+                        statement_context_end,
+                        db_type,
+                    )
+                    .map(|candidates| (candidates, statement_tokens, statement_context_end))
+                })
         {
-            return Self::filter_expected_candidates(prefix, candidates);
+            // Table options are each single-use — drop any already specified
+            // (`CREATE TABLE (…) ENGINE = InnoDB |` must not re-offer `ENGINE`).
+            return Self::drop_present_single_use_table_options(
+                Self::filter_expected_candidates(prefix, candidates),
+                src_tokens,
+                src_end,
+            );
         }
         if let Some(candidates) = Self::expected_grouping_returning_and_insert_tail_keyword_candidates(
             tokens,

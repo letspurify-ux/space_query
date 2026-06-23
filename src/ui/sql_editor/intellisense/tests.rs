@@ -37819,32 +37819,78 @@ fn create_type_spec_offers_object_table_varray() {
     assert!(has(&kw("CREATE TYPE ty AS TABLE OF |"), "NUMBER"));
 }
 
+/// MySQL table options after `CREATE TABLE (…) |` are each single-use, so an
+/// option already specified must drop out of the continuation while the others
+/// stay valid. Mirrors the column-property and clause single-use guards.
 #[test]
-fn zzz_probe_gaps() {
-    let kw = |sql: &str, db: crate::db::DatabaseType| -> Vec<String> {
-        let cursor = sql.find('|').expect("cursor");
-        let plain = sql.replace('|', "");
-        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+fn mysql_create_table_options_are_single_use() {
+    let kw = |sql: &str| {
         SqlEditorWidget::collect_expected_keyword_suggestions(
-            &prefix, &analyze_inline_cursor_sql(sql), Some(db))
+            "", &analyze_inline_cursor_sql(sql), Some(crate::db::DatabaseType::MySQL))
     };
-    use crate::db::DatabaseType::{Oracle, MySQL};
     let has = |v: &Vec<String>, s: &str| v.iter().any(|x| x == s);
-    for sql in [
-        "REVOKE SELECT ON t FROM u |",
-        "GRANT SELECT, INSERT ON t TO u |",
-        "COMMENT ON TABLE t IS 'select stuff' |",
-    ] {
-        let s = kw(sql, Oracle);
-        eprintln!("O {:?} FROM={} sample={:?}", sql, has(&s,"FROM"), s.iter().take(4).collect::<Vec<_>>());
+
+    // Fresh option slot: the whole catalog.
+    let all = kw("CREATE TABLE t (a INT) |");
+    for opt in ["ENGINE", "DEFAULT CHARSET", "COLLATE", "AUTO_INCREMENT", "COMMENT", "ROW_FORMAT"] {
+        assert!(has(&all, opt), "fresh option slot missing `{opt}`: {all:?}");
     }
+    // A specified option is not re-offered; the others remain.
+    let after_engine = kw("CREATE TABLE t (a INT) ENGINE = InnoDB |");
+    assert!(!has(&after_engine, "ENGINE"), "ENGINE re-offered: {after_engine:?}");
+    assert!(has(&after_engine, "AUTO_INCREMENT") && has(&after_engine, "COMMENT"));
+    // The character-set slot is shared between its two spellings.
+    let after_charset = kw("CREATE TABLE t (a INT) DEFAULT CHARSET = utf8mb4 |");
+    assert!(!has(&after_charset, "DEFAULT CHARSET") && !has(&after_charset, "CHARACTER SET"),
+        "charset re-offered: {after_charset:?}");
+    assert!(has(&after_charset, "ENGINE"));
+    let after_char_set = kw("CREATE TABLE t (a INT) CHARACTER SET utf8 |");
+    assert!(!has(&after_char_set, "DEFAULT CHARSET") && !has(&after_char_set, "CHARACTER SET"));
+    // Several stacked options each drop out individually.
+    let stacked = kw("CREATE TABLE t (a INT) ENGINE = InnoDB AUTO_INCREMENT = 5 |");
+    assert!(!has(&stacked, "ENGINE") && !has(&stacked, "AUTO_INCREMENT"));
+    assert!(has(&stacked, "COMMENT") && has(&stacked, "ROW_FORMAT"));
+}
+
+/// A MySQL index hint (`{USE|IGNORE|FORCE} {INDEX|KEY} [FOR {JOIN|ORDER BY|GROUP
+/// BY}] (list)`) closes the table reference just like a plain table, so the query
+/// continuation follows it. Its `FOR JOIN` purpose is not a join clause (no
+/// spurious `ON`/`USING`), and its `FOR ORDER BY`/`FOR GROUP BY` purpose is not the
+/// statement clause (it does not spend the `ORDER BY`/`GROUP BY` continuation).
+#[test]
+fn mysql_index_hint_completes_the_table_reference() {
+    let kw = |sql: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "", &analyze_inline_cursor_sql(sql), Some(crate::db::DatabaseType::MySQL))
+    };
+    let has = |v: &Vec<String>, s: &str| v.iter().any(|x| x == s);
+
+    // The completed hint admits the same continuation as a bare table.
     for sql in [
-        "REVOKE SELECT ON t.* FROM u |",
-        "GRANT SELECT, INSERT ON t.* TO u |",
+        "SELECT * FROM t USE INDEX (i) |",
+        "SELECT * FROM t FORCE KEY (i) |",
+        "SELECT * FROM t USE INDEX FOR JOIN (i) |",
+        "SELECT * FROM t USE INDEX FOR ORDER BY (i) |",
+        "SELECT * FROM t USE INDEX FOR GROUP BY (i) |",
+        "SELECT * FROM t IGNORE KEY (i) USE INDEX (j) |",
     ] {
-        let s = kw(sql, MySQL);
-        eprintln!("M {:?} FROM={} sample={:?}", sql, has(&s,"FROM"), s.iter().take(4).collect::<Vec<_>>());
+        let s = kw(sql);
+        assert!(has(&s, "WHERE") && has(&s, "JOIN") && has(&s, "ORDER BY") && has(&s, "GROUP BY"),
+            "index-hint continuation incomplete at `{sql}`: {s:?}");
+        // `FOR JOIN` is an index-hint purpose, never a real join target.
+        assert!(!has(&s, "ON") && !has(&s, "USING"),
+            "index hint mistaken for a join target at `{sql}`: {s:?}");
     }
+    // Mid-hint slots are unaffected (the hint sub-grammar still drives them).
+    assert_eq!(kw("SELECT * FROM t USE |"), vec!["INDEX".to_string(), "KEY".to_string()]);
+    assert_eq!(kw("SELECT * FROM t USE INDEX |"), vec!["FOR".to_string()]);
+    // A real `ORDER BY`/`GROUP BY` after the hint is still single-use.
+    assert!(!has(&kw("SELECT * FROM t USE INDEX (i) ORDER BY a |"), "ORDER BY"));
+    // A genuine JOIN target carrying an index hint still needs its join condition:
+    // the hint tokens are walked over and the real `JOIN` is found.
+    let join_hint = kw("SELECT * FROM a JOIN b USE INDEX (i) |");
+    assert!(has(&join_hint, "ON") && has(&join_hint, "USING"),
+        "join target with index hint lost ON/USING: {join_hint:?}");
 }
 
 /// A clause keyword that *also* occurs inside a function call — `GROUP`/`BY` in
