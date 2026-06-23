@@ -11247,6 +11247,11 @@ impl SqlEditorWidget {
                 exclude_current_identifier_chain,
                 db_type,
             )
+            || Self::cursor_is_at_create_table_element_keyword_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
             || Self::cursor_is_at_create_sequence_option_slot_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
@@ -11257,7 +11262,7 @@ impl SqlEditorWidget {
                 exclude_current_identifier_chain,
                 db_type,
             )
-            || Self::cursor_is_at_mysql_alter_table_element_keyword_slot_for_context(
+            || Self::cursor_is_at_mysql_schema_object_keyword_slot_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
                 db_type,
@@ -11529,6 +11534,22 @@ impl SqlEditorWidget {
         phase: intellisense_context::SqlPhase,
     ) -> Option<OrderBySortModifierSlot> {
         if !matches!(phase, intellisense_context::SqlPhase::OrderByClause) {
+            return None;
+        }
+        // A fresh sort key begins after the item-separating comma (`ORDER BY a DESC,
+        // |`): the previous item's `ASC`/`DESC`/`NULLS` modifier is out of scope. The
+        // word-only history below skips the comma, so it would otherwise see that
+        // modifier through it; reject the position when the cursor immediately
+        // follows a comma (a fresh key takes its own operand, not a modifier).
+        if matches!(
+            tokens
+                .get(..end)
+                .unwrap_or(tokens)
+                .iter()
+                .rev()
+                .find(|token| !matches!(token, SqlToken::Comment(_))),
+            Some(SqlToken::Symbol(sym)) if sym == ","
+        ) {
             return None;
         }
         match Self::previous_meaningful_words_upper(tokens, end, 3).as_slice() {
@@ -12733,21 +12754,32 @@ impl SqlEditorWidget {
         }
 
         let after_def_open = Self::meaningful_tokens_before(&tokens[def_open + 1..visible_end], visible_end - def_open - 1);
-        if after_def_open
-            .last()
-            .is_some_and(|token| matches!(token, SqlToken::Symbol(sym) if sym == "," || sym == "("))
-        {
-            return None;
-        }
-        let words_after_open = after_def_open
-            .iter()
-            .filter(|token| matches!(token, SqlToken::Word(_)))
-            .count();
-        if words_after_open < 2 {
-            return None;
-        }
-
         let def = Self::current_create_table_definition(&after_def_open);
+        // Element start — the first item (`CREATE TABLE t (|`) or a fresh post-comma
+        // item (`… (a NUMBER, |`): a new column (the name is the user's, suppressed
+        // via the chokepoint enrolment) or a table-level constraint introducer.
+        // Mirrors `ALTER TABLE … ADD |` (the shared element grammar). MySQL's richer
+        // element-start (INDEX/KEY/FULLTEXT/…) is left to its schema-object handler.
+        if def.is_empty() {
+            if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+                return None;
+            }
+            return Some(&["CONSTRAINT", "PRIMARY KEY", "UNIQUE", "FOREIGN KEY", "CHECK"]);
+        }
+        // Inside a sub-paren of the element (`CHECK (expr |`, `NUMBER(precision |`, a
+        // `REFERENCES t (col |` list) a column/expression is expected, not an
+        // element-tail keyword — defer to those paths. (Mirrors the ALTER handler.)
+        let element_depth = def.iter().fold(0i32, |depth, token| match token {
+            SqlToken::Symbol(sym) if sym == "(" || sym == "[" => depth + 1,
+            SqlToken::Symbol(sym) if sym == ")" || sym == "]" => (depth - 1).max(0),
+            _ => depth,
+        });
+        if element_depth > 0 {
+            return None;
+        }
+        // The classifier resolves the rest: a bare column name awaiting its type
+        // (`… (a |`) → `None` (data-type path), a partial constraint (`PRIMARY |`
+        // → `KEY`), and the column-property / constraint tails.
         Self::classify_table_element_tail(def, db_type)
     }
 
@@ -12861,6 +12893,28 @@ impl SqlEditorWidget {
         Self::expected_alter_table_add_tail_keywords(tokens, end, db_type).is_some()
     }
 
+    /// Context wrapper enrolling the `CREATE TABLE (…)` element-tail keyword slots in
+    /// the identifier-suppression chokepoint — the mirror of the `ALTER TABLE … ADD`
+    /// enrolment, sharing the same classifier. Every `Some(...)` arm is keyword-only
+    /// (the element-start constraint introducers, the column-property tail); the
+    /// name/object positions (a fresh column name, the `REFERENCES` target, the
+    /// FK/PK/CHECK paren lists, a bare `name |` awaiting its type) return `None` and
+    /// stay available so existing objects/types still complete.
+    fn cursor_is_at_create_table_element_keyword_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::expected_create_table_column_definition_tail_keywords(tokens, end, db_type).is_some()
+    }
+
     /// Keyword tail for a single table-element definition (a column or a
     /// constraint), shared by `CREATE TABLE (…)` and `ALTER TABLE … ADD …`. `def`
     /// is the element's meaningful tokens up to the cursor, paren-balanced at its
@@ -12909,6 +12963,28 @@ impl SqlEditorWidget {
         // (DEFAULT/identity/COLLATE/…), which belongs only to a column definition.
         if let Some(candidates) = Self::create_table_constraint_tail(def) {
             return Some(candidates);
+        }
+        // A column property that takes an argument expects that argument next, not
+        // another property: `DEFAULT <expr>`, `COLLATE <name>`, MySQL `COMMENT
+        // <string>`, and the `GENERATED … AS` identity/virtual form. The actual last
+        // token is checked (not the word-only `words`) because a value like `DEFAULT
+        // 5` ends in a non-word, so `DEFAULT |` and `DEFAULT 5 |` look identical to a
+        // word-only scan. `GENERATED BY DEFAULT |` is resolved by the `words` arms
+        // above, so a `DEFAULT` reaching here is the property.
+        if let Some(SqlToken::Word(last)) = def.last() {
+            match last.to_ascii_uppercase().as_str() {
+                "DEFAULT" | "COLLATE" | "COMMENT" => return None,
+                "AS" if words.iter().any(|w| w == "GENERATED") => return Some(&["IDENTITY"]),
+                _ => {}
+            }
+        }
+        // A bare column name with no data type yet (`… (a INT, b |`) is not at a
+        // property tail — the data type is expected next, served by the data-type
+        // path. The partial-constraint and constraint arms above already produced the
+        // 1-word `Some` cases (`PRIMARY |`→KEY, `CONSTRAINT |`→name), so a single word
+        // reaching here is a plain name; defer (and do not suppress the type slot).
+        if words.len() < 2 {
+            return None;
         }
         if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
             // MySQL's column-property ordering is loose (`NOT NULL DEFAULT v
@@ -13174,6 +13250,123 @@ impl SqlEditorWidget {
         ReferencesClauseTail::Continue(keywords)
     }
 
+    /// Oracle multi-table `INSERT { ALL | FIRST }` sub-grammar continuation. The
+    /// statement is a sequence of `[WHEN cond THEN] insert_into_clause [values_clause]`
+    /// targets (optionally an `ELSE` branch) terminated by the source `subquery`, so
+    /// the keywords offered depend on the trailing structure rather than on a single
+    /// anchor:
+    ///   `INSERT ALL |`                      → INTO / WHEN   (`FIRST` → WHEN only)
+    ///   `… WHEN <cond> |`                   → THEN
+    ///   `… THEN |` / `… ELSE |`             → INTO
+    ///   after a complete target (`… VALUES (…) |`) → the source `SELECT`, another
+    ///     `INTO`, and — while conditional and no `ELSE` has opened yet — `WHEN`/`ELSE`.
+    /// Single-table `INSERT INTO` (word after `INSERT` is not `ALL`/`FIRST`) and the
+    /// cursor inside any open paren are left to the other handlers.
+    fn expected_multi_table_insert_keywords(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return None;
+        }
+        if Self::unclosed_paren_count(tokens, end) != 0 {
+            return None;
+        }
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        let word_upper = |t: &&SqlToken| match t {
+            SqlToken::Word(w) => Some(w.to_ascii_uppercase()),
+            _ => None,
+        };
+        if toks.first().and_then(word_upper).as_deref() != Some("INSERT") {
+            return None;
+        }
+        let is_first = match toks.get(1).and_then(word_upper).as_deref() {
+            Some("ALL") => false,
+            Some("FIRST") => true,
+            _ => return None,
+        };
+
+        // Scan the depth-0 structure for the flags / last keyword that select the state.
+        let mut depth = 0i32;
+        let mut has_when = false;
+        let mut has_else = false;
+        let mut last_when_open = false; // a `WHEN` whose `THEN` has not yet appeared
+        for token in &toks {
+            match token {
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => depth += 1,
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => depth = (depth - 1).max(0),
+                SqlToken::Word(word) if depth == 0 => {
+                    match word.to_ascii_uppercase().as_str() {
+                        "WHEN" => {
+                            has_when = true;
+                            last_when_open = true;
+                        }
+                        "THEN" => last_when_open = false,
+                        "ELSE" => has_else = true,
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let last = toks.last();
+        let last_word = last.and_then(word_upper);
+        // `INSERT ALL |` / `INSERT FIRST |` — the very start of the body.
+        if toks.len() == 2 {
+            return Some(if is_first { &["WHEN"] } else { &["INTO", "WHEN"] });
+        }
+        // `… THEN |` / `… ELSE |` — a fresh target begins with `INTO`.
+        if matches!(last_word.as_deref(), Some("THEN") | Some("ELSE")) {
+            return Some(&["INTO"]);
+        }
+        // `… WHEN <cond> |` — the condition is complete, so `THEN` follows. (An
+        // incomplete condition is left to the expression handler.)
+        if last_when_open {
+            return Self::cursor_follows_complete_predicate(tokens, end).then_some(&["THEN"]);
+        }
+        // After a complete target — `… VALUES (…) |` — the next target, the source
+        // subquery, and (while conditional and before any `ELSE`) the next branch.
+        let closes_values = matches!(last, Some(SqlToken::Symbol(sym)) if *sym == ")")
+            && Self::paren_open_keyword_is(&toks, toks.len() - 1, "VALUES");
+        if closes_values {
+            return Some(match (has_when, has_else) {
+                (true, false) => &["INTO", "WHEN", "ELSE", "SELECT"],
+                (true, true) => &["INTO", "SELECT"],
+                (false, _) => &["INTO", "SELECT"],
+            });
+        }
+        None
+    }
+
+    /// Whether the `)` at `close_idx` in `toks` matches a `(` whose immediately
+    /// preceding word equals `keyword` (case-insensitive) — e.g. the `(` of a
+    /// `VALUES (…)` list.
+    fn paren_open_keyword_is(toks: &[&SqlToken], close_idx: usize, keyword: &str) -> bool {
+        let mut depth = 0i32;
+        let mut open_idx = None;
+        for idx in (0..=close_idx).rev() {
+            match toks[idx] {
+                SqlToken::Symbol(sym) if sym == ")" => depth += 1,
+                SqlToken::Symbol(sym) if sym == "(" => {
+                    depth -= 1;
+                    if depth == 0 {
+                        open_idx = Some(idx);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        matches!(
+            open_idx
+                .and_then(|idx| idx.checked_sub(1))
+                .and_then(|idx| toks.get(idx)),
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case(keyword)
+        )
+    }
+
     fn expected_dml_trailing_clause_keywords(
         tokens: &[SqlToken],
         end: usize,
@@ -13265,16 +13458,31 @@ impl SqlEditorWidget {
                     Some(&["RETURNING"])
                 }
             }
+            // The not-matched `INSERT [(cols)] VALUES (…)` of a MERGE takes an
+            // optional row filter `WHERE`. The clause ends at the `VALUES (…)` close,
+            // so when the cursor follows it (no `WHERE` opened yet — a present `WHERE`
+            // would sit after the `)`), offer the filter. (`complete_assignment_or_
+            // predicate` does not cover a bare closing `)`, so this is its own arm.)
+            "MERGE"
+                if matches!(toks.last(), Some(SqlToken::Symbol(sym)) if *sym == ")")
+                    && Self::paren_open_keyword_is(&toks, toks.len() - 1, "VALUES") =>
+            {
+                Some(&["WHERE"])
+            }
             // The matched `UPDATE SET <assignments>` of a MERGE. After a complete
             // assignment the clause continues with a row filter (`WHERE`), the
             // matched-`DELETE` sub-clause (`DELETE WHERE`), or the next merge action
-            // (`WHEN [NOT] MATCHED`). Anchor on the last *top-level* action keyword
-            // being `SET` (a `WHERE`/`DELETE` already opened, or a subquery's nested
-            // `WHERE` in an assignment value, must not fire this).
+            // (`WHEN [NOT] MATCHED`). A completed `WHERE`/`DELETE WHERE` predicate is
+            // still a boundary: it withdraws only the part it consumed (a present
+            // `WHERE` is not re-offered; once `DELETE` opened, `DELETE WHERE` is not),
+            // and the remaining continuation still follows. Anchored on the last
+            // *top-level* action keyword so a subquery's nested `WHERE` in an
+            // assignment value does not fire this.
             "MERGE" if complete_assignment_or_predicate => {
                 let mut depth = 0i32;
                 let mut last_anchor: Option<&str> = None;
                 let mut has_update = false;
+                let mut has_delete = false;
                 for token in &toks {
                     match token {
                         SqlToken::Symbol(sym) if sym == "(" || sym == "[" => depth += 1,
@@ -13289,7 +13497,10 @@ impl SqlEditorWidget {
                                 }
                                 "SET" => last_anchor = Some("SET"),
                                 "WHERE" => last_anchor = Some("WHERE"),
-                                "DELETE" => last_anchor = Some("DELETE"),
+                                "DELETE" => {
+                                    has_delete = true;
+                                    last_anchor = Some("DELETE");
+                                }
                                 "INSERT" => last_anchor = Some("INSERT"),
                                 "VALUES" => last_anchor = Some("VALUES"),
                                 "WHEN" => last_anchor = Some("WHEN"),
@@ -13299,8 +13510,19 @@ impl SqlEditorWidget {
                         _ => {}
                     }
                 }
-                (has_update && last_anchor == Some("SET"))
-                    .then_some(&["WHERE", "DELETE WHERE", "WHEN"])
+                match (has_update, last_anchor) {
+                    // Assignment list just completed — full continuation.
+                    (true, Some("SET")) => Some(&["WHERE", "DELETE WHERE", "WHEN"]),
+                    // A completed `WHERE` predicate continues (the conjunction tail
+                    // `AND`/`OR` extends it) and is itself a boundary: the update's
+                    // filter offers the `DELETE WHERE` sub-clause + next `WHEN`; once
+                    // `DELETE` has opened it is the delete's filter, so only the next
+                    // `WHEN` remains. (This handler returns first in the chain, so the
+                    // predicate's own `AND`/`OR` must be carried here.)
+                    (true, Some("WHERE")) if has_delete => Some(&["AND", "OR", "WHEN"]),
+                    (true, Some("WHERE")) => Some(&["AND", "OR", "DELETE WHERE", "WHEN"]),
+                    _ => None,
+                }
             }
             _ => None,
         }
@@ -13522,14 +13744,18 @@ impl SqlEditorWidget {
         Self::expected_create_sequence_option_keywords(tokens, end, db_type).is_some()
     }
 
-    /// Context wrapper enrolling the MySQL `ALTER TABLE … {ADD|DROP|RENAME} |`
-    /// element-start keyword slots in the identifier-suppression chokepoint. These
-    /// begin a fresh element (a new column name is the user's, the keywords are the
-    /// element/constraint introducers), so a bare relation is never grammatical and
-    /// the base catalog must be suppressed. Scoped narrowly to the element-start
-    /// last token because other arms of the MySQL schema-object handler (notably
-    /// `CREATE INDEX i ON |`) sit at an object position where a relation is valid.
-    fn cursor_is_at_mysql_alter_table_element_keyword_slot_for_context(
+    /// Context wrapper enrolling the MySQL schema-object DDL keyword slots
+    /// (`expected_mysql_schema_object_keyword_candidates`) in the
+    /// identifier-suppression chokepoint. Every arm of that handler that returns
+    /// `Some(...)` sits at a keyword-only continuation — past a complete object,
+    /// where a bare relation/column is no longer grammatical (`CREATE INDEX i ON t
+    /// (a) |`→USING, `CREATE INDEX i USING BTREE ON t (a) |`→nothing, `CREATE TABLE
+    /// t (…) |`→ENGINE/…, `ALTER TABLE t ADD |`→COLUMN/…, `CREATE TRIGGER … BEFORE
+    /// |`→event, `CREATE EVENT … ON |`→SCHEDULE). The genuine object positions
+    /// (`CREATE INDEX i ON |` table, `CREATE TRIGGER … ON |` table, the object-name
+    /// slots) return `None` there and stay available, so suppressing on
+    /// `is_some()` keeps the catalog exactly where an identifier is valid.
+    fn cursor_is_at_mysql_schema_object_keyword_slot_for_context(
         deep_ctx: &intellisense_context::CursorContext,
         exclude_current_identifier_chain: bool,
         db_type: Option<crate::db::DatabaseType>,
@@ -13544,13 +13770,7 @@ impl SqlEditorWidget {
             cursor_token_len,
             exclude_current_identifier_chain,
         );
-        let words = Self::words_for_keyword_slot(tokens, end);
-        words.first().map(String::as_str) == Some("ALTER")
-            && words.iter().any(|word| word == "TABLE")
-            && matches!(
-                words.last().map(String::as_str),
-                Some("ADD" | "DROP" | "RENAME")
-            )
+        Self::expected_mysql_schema_object_keyword_candidates(tokens, end, db_type).is_some()
     }
 
     /// Context wrapper enrolling the transaction-control and `LOCK TABLE` keyword
@@ -15733,6 +15953,81 @@ impl SqlEditorWidget {
         }
     }
 
+    /// Whether the `)` at `close_idx` closes a *post-table modifier* — Oracle's
+    /// partition-extension (`PARTITION (…)`, `SUBPARTITION (…)`, optionally `… FOR
+    /// (…)`) or row-sampling (`SAMPLE [BLOCK] (…)`, `TABLESAMPLE [method] (…)`)
+    /// clause. Such a clause attaches to a table reference *without* introducing a
+    /// new FROM-list source, so the relation is just as complete as the bare `FROM t
+    /// |` — the same continuation follows. Identified by the modifier keyword that
+    /// introduces the paren being preceded by a table reference (an identifier word,
+    /// or another stacked modifier). A table-function call (`FROM sample(10)`) has a
+    /// FROM-list introducer there instead of a name, so it is not mistaken for one.
+    fn paren_closes_post_table_modifier(toks: &[&SqlToken], close_idx: usize) -> bool {
+        if !matches!(toks.get(close_idx), Some(SqlToken::Symbol(sym)) if *sym == ")") {
+            return false;
+        }
+        // Match the trailing `)` to its `(`.
+        let mut depth = 0i32;
+        let mut open_idx = None;
+        for idx in (0..=close_idx).rev() {
+            match toks[idx] {
+                SqlToken::Symbol(sym) if sym == ")" => depth += 1,
+                SqlToken::Symbol(sym) if sym == "(" => {
+                    depth -= 1;
+                    if depth == 0 {
+                        open_idx = Some(idx);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(open_idx) = open_idx else {
+            return false;
+        };
+        let word_at = |i: usize| match toks.get(i) {
+            Some(SqlToken::Word(w)) => Some(w.to_ascii_uppercase()),
+            _ => None,
+        };
+        let is_lead = |w: &str| matches!(w, "PARTITION" | "SUBPARTITION" | "SAMPLE" | "TABLESAMPLE");
+        // Walk back from the word before `(` to the modifier's lead keyword, allowing
+        // one method/`FOR` filler (`SAMPLE BLOCK (…)`, `TABLESAMPLE BERNOULLI (…)`,
+        // `PARTITION FOR (…)`).
+        let mut cur = match open_idx.checked_sub(1) {
+            Some(i) => i,
+            None => return false,
+        };
+        let Some(w) = word_at(cur) else {
+            return false;
+        };
+        if !is_lead(&w) {
+            if !matches!(w.as_str(), "FOR" | "BLOCK" | "BERNOULLI" | "SYSTEM") {
+                return false;
+            }
+            let Some(prev) = cur.checked_sub(1) else {
+                return false;
+            };
+            if !word_at(prev).is_some_and(|pw| is_lead(&pw)) {
+                return false;
+            }
+            cur = prev;
+        }
+        // The modifier must attach to a table reference: the preceding token is an
+        // identifier word (the table name / its dotted tail) or another stacked
+        // post-table modifier — not a FROM-list introducer (which would make the
+        // paren a table-function argument list, e.g. `FROM sample(10)`).
+        let Some(name_idx) = cur.checked_sub(1) else {
+            return false;
+        };
+        match toks.get(name_idx) {
+            Some(SqlToken::Word(w)) => !Self::word_breaks_from_relation_tail(&w.to_ascii_uppercase()),
+            Some(SqlToken::Symbol(sym)) if sym == ")" => {
+                Self::paren_closes_post_table_modifier(toks, name_idx)
+            }
+            _ => false,
+        }
+    }
+
     fn cursor_is_after_complete_from_relation(tokens: &[SqlToken], end: usize) -> bool {
         let toks = Self::meaningful_tokens_before(tokens, end);
         // A closed table-clause construct (`… PIVOT (…) |`, `… MATCH_RECOGNIZE
@@ -15745,6 +16040,11 @@ impl SqlEditorWidget {
         // `FROM TABLE(coll) |`) ends in `)` — it is just as complete as a named
         // relation, so the same continuation follows.
         if Self::paren_closes_from_list_table_source(&toks, toks.len().wrapping_sub(1)) {
+            return true;
+        }
+        // A post-table modifier (`FROM t PARTITION (p) |`, `FROM t SAMPLE (10) |`)
+        // also ends in `)` but leaves the relation complete — same continuation.
+        if Self::paren_closes_post_table_modifier(&toks, toks.len().wrapping_sub(1)) {
             return true;
         }
         // The reference (or its implicit alias) must be complete: the last token
@@ -15768,6 +16068,7 @@ impl SqlEditorWidget {
                 SqlToken::Symbol(sym) if sym == "," => return true,
                 SqlToken::Symbol(sym) if sym == ")" => {
                     return Self::paren_closes_from_list_table_source(&toks, idx)
+                        || Self::paren_closes_post_table_modifier(&toks, idx)
                 }
                 SqlToken::Word(_) => {} // part of the table name or its implicit alias
                 SqlToken::Symbol(sym) if sym == "." => {} // dotted-name separator
@@ -17170,14 +17471,20 @@ impl SqlEditorWidget {
             [.., a, b, c] if *a == "CREATE" && *b == "OR" && *c == "REPLACE" => {
                 Some(CREATE_OR_REPLACE_OBJECT_TYPE_KEYWORDS)
             }
-            [.., last] if *last == "TRUNCATE" || *last == "LOCK" || *last == "FLASHBACK" => {
+            [.., last]
+                if (*last == "TRUNCATE" || *last == "LOCK" || *last == "FLASHBACK")
+                    && Self::cursor_at_statement_head_verb(tokens, end, last) =>
+            {
                 Some(&["TABLE"])
             }
+            // MySQL maintenance statements (`ANALYZE`/`OPTIMIZE`/`CHECK`/`REPAIR
+            // TABLE`). The verb must be the statement head — otherwise the constraint
+            // `CHECK (…)` inside a `CREATE TABLE`/`ALTER TABLE … ADD` (whose last
+            // *word* is `CHECK`, the `(` being a symbol the word-only match skips)
+            // would falsely offer `TABLE` inside the check-expression paren.
             [.., last]
-                if matches!(
-                    last.as_str(),
-                    "ANALYZE" | "OPTIMIZE" | "CHECK" | "REPAIR"
-                ) =>
+                if matches!(last.as_str(), "ANALYZE" | "OPTIMIZE" | "CHECK" | "REPAIR")
+                    && Self::cursor_at_statement_head_verb(tokens, end, last) =>
             {
                 Some(&["TABLE"])
             }
@@ -22111,6 +22418,11 @@ impl SqlEditorWidget {
 
         if let Some(candidates) =
             Self::expected_dml_target_keyword_candidates(tokens, context_end, deep_ctx.phase, db_type)
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(candidates) =
+            Self::expected_multi_table_insert_keywords(tokens, context_end, db_type)
         {
             return Self::filter_expected_candidates(prefix, candidates);
         }

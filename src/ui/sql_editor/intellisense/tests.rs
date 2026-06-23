@@ -1176,21 +1176,29 @@ fn order_by_bare_sort_key_offers_direction_and_null_keywords() {
     assert_eq!(kw("SELECT a FROM t ORDER BY a D|"), vec!["DESC".to_string()]);
 
     // Lookalike positions in `OrderByClause` phase that are NOT a complete sort
-    // key: a fresh key after a comma, an open operator, a mid member access, and
-    // the trailing OFFSET/locking tail. None offer the modifiers or suppress.
+    // key: a fresh key after a comma — including one that follows a *previous
+    // item's* modifier (`a DESC, |`, `a NULLS FIRST, |`), where the word-only
+    // history would otherwise see the modifier through the comma — an open
+    // operator, a mid member access, and the trailing OFFSET/locking tail. None
+    // offer any sort modifier (ASC/DESC/NULLS) at the fresh key.
     for sql in [
-        "SELECT a FROM t ORDER BY a, |",        // fresh key position
-        "SELECT a FROM t ORDER BY a + |",       // open binary operator
-        "SELECT a FROM t ORDER BY t.|",         // mid member access
-        "SELECT a FROM t ORDER BY |",           // no key yet
+        "SELECT a FROM t ORDER BY a, |",          // fresh key position
+        "SELECT a FROM t ORDER BY a DESC, |",     // fresh key after a direction modifier
+        "SELECT a FROM t ORDER BY a NULLS FIRST, |", // fresh key after a null-ordering modifier
+        "SELECT a FROM t ORDER BY a + |",         // open binary operator
+        "SELECT a FROM t ORDER BY t.|",           // mid member access
+        "SELECT a FROM t ORDER BY |",             // no key yet
         "SELECT a FROM t ORDER BY a OFFSET 20 |", // row-limiting tail
     ] {
         assert!(
-            !kw(sql).iter().any(|k| k == "ASC" || k == "DESC"),
-            "no direction modifier for `{sql}`: {:?}",
+            !kw(sql).iter().any(|k| k == "ASC" || k == "DESC" || k == "NULLS"),
+            "no sort modifier at non-sort-key position `{sql}`: {:?}",
             kw(sql)
         );
     }
+    // A modifier IS offered again on a genuine *new* key after the comma.
+    assert_eq!(kw("SELECT a FROM t ORDER BY a DESC, b |").get(..3),
+        Some(["ASC".to_string(), "DESC".to_string(), "NULLS".to_string()].as_slice()));
 
     // The analytic window form keeps owning its own ORDER BY (direction + frame
     // units), unaffected by the query-level slot.
@@ -22387,6 +22395,24 @@ fn collect_expected_keyword_suggestions_include_ddl_object_type_tokens() {
     assert_eq!(check_suggestions, vec!["TABLE".to_string()]);
     assert_eq!(repair_suggestions, vec!["TABLE".to_string()]);
     assert_eq!(create_synonym_name_suggestions, vec!["FOR".to_string()]);
+
+    // The maintenance verbs (`ANALYZE`/`OPTIMIZE`/`CHECK`/`REPAIR`/`TRUNCATE`/`LOCK`/
+    // `FLASHBACK` `TABLE`) are statement heads — they must NOT fire when the same word
+    // appears mid-statement. The constraint `CHECK (` inside a `CREATE TABLE` /
+    // `ALTER TABLE … ADD` (whose last *word* is `CHECK`, the `(` being a symbol the
+    // word-only match skips) must not offer the maintenance `TABLE` in the
+    // check-expression paren.
+    for sql in [
+        "CREATE TABLE t (a NUMBER, CHECK (|",
+        "CREATE TABLE t (a NUMBER, CONSTRAINT c CHECK (|",
+        "ALTER TABLE t ADD CHECK (|",
+        "ALTER TABLE t ADD CONSTRAINT c CHECK (|",
+    ] {
+        let s = SqlEditorWidget::collect_expected_keyword_suggestions(
+            "", &analyze_inline_cursor_sql(sql), None);
+        assert!(!s.iter().any(|k| k == "TABLE"),
+            "constraint CHECK( falsely offered the maintenance TABLE at `{sql}`: {s:?}");
+    }
 }
 
 #[test]
@@ -36045,6 +36071,50 @@ fn create_table_constraint_slots_are_precise() {
         has(&column, "DEFAULT") && has(&column, "NOT NULL") && has(&column, "PRIMARY KEY"),
         "column definition tail regressed: {column:?}"
     );
+
+    // Element start — the first item and every fresh post-comma item — begins a new
+    // column (the name is the user's) or a table-level constraint, so it offers the
+    // constraint introducers (mirroring `ALTER TABLE … ADD |`) and suppresses the
+    // existing-object catalog (a brand-new column name has nothing to complete). A
+    // bare name awaiting its type defers to the data-type path (no introducers).
+    let suppressed = |sql: &str| {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::cursor_is_at_identifier_suppressing_keyword_slot_for_context(
+            &analyze_inline_cursor_sql(sql), !prefix.is_empty(),
+            Some(crate::db::DatabaseType::Oracle))
+    };
+    let introducers = ["CONSTRAINT", "PRIMARY KEY", "UNIQUE", "FOREIGN KEY", "CHECK"];
+    for sql in [
+        "CREATE TABLE t (|",
+        "CREATE TABLE t (a NUMBER, |",
+        "CREATE TABLE t (a NUMBER NOT NULL, |",
+        "CREATE TABLE t (PRIMARY KEY (a), |",
+    ] {
+        let s = kw(sql);
+        for k in introducers {
+            assert!(has(&s, k), "element start missing `{k}` at `{sql}`: {s:?}");
+        }
+        assert!(suppressed(sql), "element start did not suppress the catalog at `{sql}`");
+    }
+    // A partial table-level constraint keyword still continues (`PRIMARY |` → `KEY`),
+    // exactly like ALTER … ADD.
+    assert_eq!(kw("CREATE TABLE t (a NUMBER, PRIMARY |"), vec!["KEY".to_string()]);
+    // A bare column name awaiting its type is NOT an element-start keyword slot — the
+    // data-type path serves it and the type position is not suppressed.
+    assert!(!has(&kw("CREATE TABLE t (a NUMBER, b |"), "CONSTRAINT"));
+    assert!(!suppressed("CREATE TABLE t (a NUMBER, b |"));
+    // MySQL element start is left to its own schema-object handler (no Oracle set).
+    let mysql_start = {
+        let sql = "CREATE TABLE t (a INT, |";
+        let cursor = sql.find('|').unwrap();
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix, &analyze_inline_cursor_sql(sql), Some(crate::db::DatabaseType::MySQL))
+    };
+    assert!(!mysql_start.iter().any(|k| k == "FOREIGN KEY"));
 }
 
 /// Oracle column properties (`DEFAULT`/identity/`COLLATE`/visibility) precede the
@@ -36084,6 +36154,48 @@ fn oracle_inline_column_properties_drop_after_a_constraint() {
     assert!(has(&kw("CREATE TABLE t (a INT DEFAULT 5 |)", Oracle), "NOT NULL"));
     // MySQL keeps the looser ordering (`NOT NULL DEFAULT v`).
     assert!(has(&kw("CREATE TABLE t (a INT NOT NULL |)", MySQL), "DEFAULT"));
+}
+
+/// A column property that takes an argument expects that argument next, not another
+/// property — `DEFAULT <expr>`, `COLLATE <name>`, MySQL `COMMENT <string>`, and the
+/// `GENERATED … AS` form. The property catalog must not leak into the argument slot
+/// (the word-only history can't tell `DEFAULT |` from `DEFAULT 5 |`, since a numeric
+/// value is not a word — so the actual last token is checked). After a *complete*
+/// argument the property tail resumes. CREATE and ALTER … ADD share the classifier.
+#[test]
+fn column_property_argument_slots_do_not_leak_the_property_catalog() {
+    let kw = |sql: &str, db: crate::db::DatabaseType| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix, &analyze_inline_cursor_sql(sql), Some(db))
+    };
+    use crate::db::DatabaseType::{Oracle, MySQL};
+    let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
+
+    // The argument slot offers no property keyword (a value/name/string follows).
+    for (sql, db) in [
+        ("CREATE TABLE t (a NUMBER DEFAULT |", Oracle),
+        ("CREATE TABLE t (a NUMBER COLLATE |", Oracle),
+        ("ALTER TABLE t ADD a NUMBER DEFAULT |", Oracle),
+        ("CREATE TABLE t (a INT DEFAULT |", MySQL),
+        ("CREATE TABLE t (a INT COMMENT |", MySQL),
+        ("CREATE TABLE t (a INT DEFAULT 5 COMMENT |", MySQL),
+    ] {
+        let s = kw(sql, db);
+        for leaked in ["DEFAULT", "COLLATE", "CONSTRAINT", "CHECK", "NOT NULL", "COMMENT"] {
+            assert!(!has(&s, leaked), "property catalog leaked into the argument slot `{sql}`: {s:?}");
+        }
+    }
+    // `GENERATED … AS |` offers the identity form (the user opens `(` for a virtual col).
+    assert_eq!(kw("CREATE TABLE t (a NUMBER GENERATED ALWAYS AS |", Oracle), vec!["IDENTITY".to_string()]);
+    // After a complete argument the property tail resumes.
+    assert!(has(&kw("CREATE TABLE t (a NUMBER DEFAULT 5 |", Oracle), "NOT NULL"));
+    assert!(has(&kw("CREATE TABLE t (a VARCHAR2(10) COLLATE BINARY_CI |", Oracle), "NOT NULL"));
+    // `GENERATED BY DEFAULT |` is the identity grammar, not the property — unaffected.
+    assert!(has(&kw("CREATE TABLE t (a NUMBER GENERATED BY DEFAULT |", Oracle), "ON")
+        || has(&kw("CREATE TABLE t (a NUMBER GENERATED BY DEFAULT |", Oracle), "AS"));
 }
 
 /// `FORALL <idx> IN <bounds> [SAVE EXCEPTIONS] |` is followed by exactly one bound
@@ -36370,9 +36482,24 @@ fn merge_matched_update_set_tail_offers_filter_delete_and_next_when() {
         assert!(!has(&s, "WHERE") && !has(&s, "DELETE WHERE"),
             "merge tail leaked mid-assignment `{tail}`: {s:?}");
     }
-    // Once WHERE has opened it is not re-offered (the predicate continues instead).
+    // A completed `WHERE` predicate is itself a boundary: `WHERE` is not re-offered,
+    // but the predicate continues (`AND`/`OR`) and the remaining sub-clauses follow
+    // (`DELETE WHERE` + next `WHEN`).
     let after_where = kw(&format!("{base}a = b WHERE c = 1 |"));
     assert!(!has(&after_where, "WHERE"), "WHERE re-offered: {after_where:?}");
+    assert!(has(&after_where, "AND") && has(&after_where, "OR")
+        && has(&after_where, "DELETE WHERE") && has(&after_where, "WHEN"),
+        "merge update WHERE tail incomplete: {after_where:?}");
+    // After the matched `DELETE WHERE` predicate only the next `WHEN` remains —
+    // `DELETE WHERE` is not re-offered, the predicate still continues.
+    let after_delete = kw(&format!("{base}a = b DELETE WHERE d = 1 |"));
+    assert!(has(&after_delete, "WHEN") && has(&after_delete, "AND")
+        && !has(&after_delete, "DELETE WHERE"),
+        "merge delete WHERE tail wrong: {after_delete:?}");
+    // The update's `WHERE` followed by the delete's `WHERE` still resolves to the
+    // next `WHEN` only (both filters spent).
+    let both = kw(&format!("{base}a = b WHERE c = 1 DELETE WHERE d = 1 |"));
+    assert!(has(&both, "WHEN") && !has(&both, "DELETE WHERE"), "merge both-where tail: {both:?}");
     // A subquery's nested WHERE in the assignment value does not block the boundary.
     let subquery_value = kw(&format!("{base}a = (SELECT x FROM y WHERE z = 1) |"));
     assert!(has(&subquery_value, "WHERE") && has(&subquery_value, "WHEN"),
@@ -36380,6 +36507,124 @@ fn merge_matched_update_set_tail_offers_filter_delete_and_next_when() {
     // A plain UPDATE keeps its own tail (WHERE/RETURNING), no DELETE WHERE.
     let plain = kw("UPDATE t SET a = b |");
     assert!(has(&plain, "WHERE") && !has(&plain, "DELETE WHERE"), "plain update tail: {plain:?}");
+
+    // The not-matched `INSERT … VALUES (…)` clause takes an optional `WHERE` filter,
+    // offered once the `VALUES (…)` list closes — present whether or not a matched
+    // clause precedes it, and not re-offered once the `WHERE` has opened.
+    let nm = "MERGE INTO t USING s ON (t.id = s.id) WHEN NOT MATCHED THEN INSERT (a) VALUES (1)";
+    assert_eq!(kw(&format!("{nm} |")), vec!["WHERE".to_string()]);
+    assert_eq!(
+        kw("MERGE INTO t USING s ON (t.id = s.id) WHEN MATCHED THEN UPDATE SET a = 1 \
+            WHEN NOT MATCHED THEN INSERT (a) VALUES (1) |"),
+        vec!["WHERE".to_string()]);
+    // Once the WHERE has opened the predicate continues (AND/OR), WHERE not re-offered.
+    let nm_where = kw(&format!("{nm} WHERE x = 1 |"));
+    assert!(!has(&nm_where, "WHERE") && has(&nm_where, "AND"), "nm insert WHERE tail: {nm_where:?}");
+    // The cursor inside the still-open VALUES list is an expression, not the filter.
+    assert!(!has(&kw(&format!("{nm_open} |", nm_open = "MERGE INTO t USING s ON (t.id = s.id) WHEN NOT MATCHED THEN INSERT (a) VALUES (")), "WHERE"));
+    // A single-table INSERT … VALUES is unaffected (no merge WHERE filter).
+    assert!(!has(&kw("INSERT INTO t VALUES (1) |"), "WHERE"));
+}
+
+/// Oracle multi-table `INSERT { ALL | FIRST }` progresses through its own
+/// sub-grammar: the body start offers `INTO`/`WHEN` (`FIRST` is conditional-only,
+/// so `WHEN` only); a complete `WHEN` condition offers `THEN`; `THEN`/`ELSE` open a
+/// fresh `INTO` target; and after a complete target (`… VALUES (…)`) the source
+/// `SELECT`, another `INTO`, and — while conditional and before any `ELSE` — the
+/// next `WHEN`/`ELSE` follow. Single-table `INSERT INTO` and the cursor inside an
+/// open paren are unaffected.
+#[test]
+fn multi_table_insert_subgrammar_continuation() {
+    let kw = |sql: &str, db: crate::db::DatabaseType| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix, &analyze_inline_cursor_sql(sql), Some(db))
+    };
+    use crate::db::DatabaseType::{Oracle, MySQL};
+    let eq = |v: Vec<String>, exp: &[&str]| {
+        let got: Vec<&str> = v.iter().map(String::as_str).collect();
+        assert_eq!(got, exp, "multi-table insert state mismatch");
+    };
+
+    // Body start: unconditional `ALL` admits a target or a condition; `FIRST` is
+    // conditional-only.
+    eq(kw("INSERT ALL |", Oracle), &["INTO", "WHEN"]);
+    eq(kw("INSERT FIRST |", Oracle), &["WHEN"]);
+    // Conditional progression: condition → THEN → target.
+    eq(kw("INSERT ALL WHEN x > 1 |", Oracle), &["THEN"]);
+    eq(kw("INSERT ALL WHEN x > 1 THEN |", Oracle), &["INTO"]);
+    // After a complete target — unconditional vs. conditional vs. post-ELSE.
+    eq(kw("INSERT ALL INTO t VALUES (1) |", Oracle), &["INTO", "SELECT"]);
+    eq(kw("INSERT ALL INTO t (a) VALUES (1) INTO u VALUES (2) |", Oracle), &["INTO", "SELECT"]);
+    eq(kw("INSERT ALL WHEN x > 1 THEN INTO t VALUES (1) |", Oracle),
+        &["INTO", "WHEN", "ELSE", "SELECT"]);
+    eq(kw("INSERT FIRST WHEN x > 1 THEN INTO t VALUES (1) |", Oracle),
+        &["INTO", "WHEN", "ELSE", "SELECT"]);
+    eq(kw("INSERT ALL WHEN x > 1 THEN INTO t VALUES (1) ELSE |", Oracle), &["INTO"]);
+    // Once `ELSE` has opened, no further `WHEN`/`ELSE` — only more targets / the source.
+    eq(kw("INSERT ALL WHEN x > 1 THEN INTO t VALUES (1) ELSE INTO u VALUES (2) |", Oracle),
+        &["INTO", "SELECT"]);
+
+    // An incomplete `WHEN` condition and the cursor inside the open `VALUES` paren
+    // are left to the expression handler (no sub-grammar keyword leaks).
+    let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
+    assert!(!has(&kw("INSERT ALL WHEN x > |", Oracle), "THEN"));
+    assert!(!has(&kw("INSERT ALL INTO t VALUES (|", Oracle), "INTO"));
+    // Single-table INSERT is unaffected (Oracle RETURNING, MySQL upsert).
+    assert!(has(&kw("INSERT INTO t VALUES (1) |", Oracle), "RETURNING"));
+    assert!(has(&kw("INSERT INTO t VALUES (1) |", MySQL), "ON DUPLICATE KEY UPDATE"));
+}
+
+/// Every MySQL schema-object DDL keyword slot that returns a keyword-only
+/// continuation (`expected_mysql_schema_object_keyword_candidates`) is enrolled in
+/// the identifier-suppression chokepoint, so the base relation catalog never leaks
+/// where only a fixed keyword (or nothing) is grammatical — `CREATE INDEX i ON t
+/// (a) |`, `CREATE INDEX i USING BTREE ON t (a) |`, `CREATE TABLE t (…) |`, the
+/// `ALTER TABLE … {ADD|DROP|RENAME} |` element starts, and the `CREATE
+/// TRIGGER`/`CREATE EVENT` keyword tails. The genuine object positions (`CREATE
+/// INDEX i ON |`, `CREATE TRIGGER … ON |`) stay unsuppressed so relations complete.
+#[test]
+fn mysql_schema_object_keyword_slots_suppress_the_relation_catalog() {
+    use crate::db::DatabaseType::MySQL;
+    let suppressed = |sql: &str, excl: bool| {
+        let ctx = analyze_inline_cursor_sql(sql);
+        SqlEditorWidget::cursor_is_at_identifier_suppressing_keyword_slot_for_context(
+            &ctx, excl, Some(MySQL))
+    };
+    let kw = |sql: &str| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix, &analyze_inline_cursor_sql(sql), Some(MySQL))
+    };
+    let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
+
+    // Keyword-only continuations suppress the catalog (and still emit their keyword).
+    for sql in [
+        "CREATE INDEX i ON t (a) |",
+        "CREATE INDEX i USING BTREE ON t (a) |",
+        "CREATE TABLE t (a INT) |",
+        "ALTER TABLE t ADD |",
+        "ALTER TABLE t DROP |",
+        "ALTER TABLE t RENAME |",
+        "CREATE TRIGGER g BEFORE |",
+        "CREATE EVENT e ON SCHEDULE |",
+    ] {
+        assert!(suppressed(sql, false), "catalog leaked at keyword-only slot `{sql}`");
+    }
+    // The keyword is still offered alongside the suppression, including mid-typed.
+    assert!(has(&kw("CREATE INDEX i ON t (a) |"), "USING"));
+    assert!(suppressed("CREATE INDEX i ON t (a) US|", true));
+
+    // The genuine object positions stay unsuppressed — a relation is valid there.
+    for sql in ["CREATE INDEX i ON |", "CREATE TRIGGER g BEFORE INSERT ON |"] {
+        assert!(!suppressed(sql, false), "object position wrongly suppressed `{sql}`");
+    }
+    // Inside the still-open indexed-column list a column is named, not suppressed.
+    assert!(!suppressed("CREATE INDEX i ON t (|", false));
 }
 
 /// Post-object statement-tail positions where a bare relation is no longer
@@ -37633,8 +37878,7 @@ fn derived_table_and_parenthesised_source_offer_query_continuation() {
 
     // Table functions are FROM sources too: TABLE/XMLTABLE/JSON_TABLE and a
     // (possibly dotted) pipelined UDF. After the call the continuation follows; as a
-    // JOIN target it offers ON/USING. A post-table modifier (`t SAMPLE(n)`) is NOT a
-    // FROM-list source (its name follows the table, not a FROM slot) and stays out.
+    // JOIN target it offers ON/USING.
     for sql in [
         "SELECT * FROM my_func(x) |",
         "SELECT * FROM pkg.my_func(x) |",
@@ -37645,8 +37889,55 @@ fn derived_table_and_parenthesised_source_offer_query_continuation() {
             "table function source missing continuation at `{sql}`: {:?}", kw(sql, Oracle));
     }
     assert!(has(&kw("SELECT * FROM t1 JOIN my_func(x) |", Oracle), "ON"));
-    // A post-table modifier is not a parenthesised FROM source.
-    assert!(!offers_continuation(&kw("SELECT * FROM t SAMPLE (10) |", Oracle)));
+}
+
+/// A post-table modifier — Oracle's partition-extension (`PARTITION (…)`,
+/// `SUBPARTITION (…)`, `… FOR (…)`) or row-sampling (`SAMPLE [BLOCK] (…)`,
+/// `TABLESAMPLE [method] (…)`) clause — attaches to a table reference without
+/// changing its completeness: the relation is just as finished as the bare
+/// `FROM t |`, so the same query continuation follows (and as a JOIN target it
+/// offers `ON`/`USING`). It is NOT a new FROM-list source, so a table-function
+/// call whose name merely *looks* like a modifier (`FROM sample(10)`) is still
+/// treated as a source, and the cursor inside the still-open modifier paren gets
+/// no query continuation.
+#[test]
+fn post_table_modifier_completes_the_relation() {
+    let kw = |sql: &str, db: crate::db::DatabaseType| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "", &analyze_inline_cursor_sql(sql), Some(db))
+    };
+    use crate::db::DatabaseType::Oracle;
+    let has = |v: &Vec<String>, s: &str| v.iter().any(|x| x == s);
+    let offers_continuation = |v: &Vec<String>| has(v, "WHERE") && has(v, "GROUP BY") && has(v, "JOIN");
+
+    // Every modifier form — alone or stacked, with or without a trailing alias —
+    // leaves a complete relation that offers the query continuation.
+    for sql in [
+        "SELECT * FROM t SAMPLE (10) |",
+        "SELECT * FROM t SAMPLE BLOCK (10) |",
+        "SELECT * FROM t TABLESAMPLE BERNOULLI (10) |",
+        "SELECT * FROM t PARTITION (p1) |",
+        "SELECT * FROM t SUBPARTITION (s1) |",
+        "SELECT * FROM t PARTITION FOR (1) |",
+        "SELECT * FROM t PARTITION (p1) x |",     // trailing alias
+        "SELECT * FROM s.t PARTITION (p1) |",      // dotted table name
+        "SELECT * FROM t PARTITION (p1) SAMPLE (10) |", // stacked modifiers
+    ] {
+        assert!(offers_continuation(&kw(sql, Oracle)),
+            "post-table modifier missing continuation at `{sql}`: {:?}", kw(sql, Oracle));
+    }
+    // As a JOIN target the modified relation still expects the join condition.
+    let s = kw("SELECT * FROM t1 JOIN t2 PARTITION (p1) |", Oracle);
+    assert!(has(&s, "ON") && has(&s, "USING") && !has(&s, "WHERE"),
+        "modified JOIN target should offer ON/USING: {s:?}");
+
+    // A table-function call whose name resembles a modifier keyword is still a
+    // FROM-list source, not a modifier — the continuation still follows, proving it
+    // was classified as a source (the discriminator is the missing table name).
+    assert!(offers_continuation(&kw("SELECT * FROM sample (10) |", Oracle)));
+    // Inside the still-open modifier paren there is no query continuation.
+    assert!(!offers_continuation(&kw("SELECT * FROM t PARTITION (|", Oracle)));
+    assert!(!offers_continuation(&kw("SELECT * FROM t SAMPLE (|", Oracle)));
 }
 
 /// The `XMLTABLE`/`JSON_TABLE` subgrammar (`PASSING`/`COLUMNS`/error clauses) is
