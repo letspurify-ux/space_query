@@ -207,6 +207,10 @@ struct ExpressionKeywordContext {
     /// Distinguished from a value `CASE WHEN <cond>` by the construct frame stack,
     /// so a condition's columns are never suppressed.
     at_exception_name: bool,
+    /// Single-use postfix operators already applied to the current operand chain
+    /// (`COLLATE`, `AT [TIME ZONE|LOCAL]`, `SOUNDS LIKE`). Each is grammatical at
+    /// most once per operand, so a present one must not be re-offered.
+    applied_postfix_operators: AppliedPostfixOperators,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -293,6 +297,44 @@ enum PrecedingOperandType {
 enum ExpectedOperandTypes {
     Single(PrecedingOperandType),
     AnyOf(&'static [PrecedingOperandType]),
+}
+
+/// Keywords that bound the current comparison/operand expression: a postfix
+/// operator (`LIKE`, `COLLATE`, `AT`, `SOUNDS`) sitting before one of these
+/// belongs to a *different* operand, so a back-scan for "is this operator already
+/// applied to the current operand" must stop here.
+const OPERAND_SEGMENT_BOUNDARY_KEYWORDS: &[&str] = &[
+    "AND", "OR", "WHERE", "HAVING", "ON", "WHEN", "THEN", "ELSE", "SELECT", "FROM",
+    "GROUP", "ORDER", "BY", "START", "CONNECT", "SET", "VALUES", "USING", "RETURNING",
+    "CASE", "INTO", "BETWEEN",
+];
+
+/// Single-use postfix operators already present in the cursor's current operand
+/// chain. Each is grammatical at most once per operand, so once applied it must
+/// not be re-offered (`x COLLATE c |`, `ts AT TIME ZONE z |`, `a SOUNDS LIKE p |`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+struct AppliedPostfixOperators {
+    collate: bool,
+    at_clause: bool,
+    sounds: bool,
+    member: bool,
+}
+
+/// Where the cursor sits relative to the `LIKE` that owns the current comparison
+/// expression. Distinguishes a pattern whose optional `ESCAPE` clause is still
+/// available from one that has already spent it, so the single-use keyword is not
+/// re-offered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LikePatternPosition {
+    /// Cursor follows a `LIKE` pattern with no `ESCAPE` clause yet — the `ESCAPE`
+    /// keyword is grammatical here.
+    PatternTail,
+    /// Cursor follows a `LIKE` pattern that already carries an `ESCAPE` clause
+    /// (the keyword alone, awaiting its char, or complete) — `ESCAPE` is
+    /// single-use, so it must not be offered again.
+    EscapeConsumed,
+    /// No `LIKE` owns this position.
+    None,
 }
 
 struct InsertValuesTarget {
@@ -452,6 +494,7 @@ impl ExpressionKeywordContext {
             at_bind_variable_name: false,
             statement_start: None,
             at_exception_name: false,
+            applied_postfix_operators: AppliedPostfixOperators::default(),
         }
     }
 }
@@ -3047,6 +3090,7 @@ impl SqlEditorWidget {
         }
         if upper == "SOUNDS" {
             return ctx.follows_operand == Some(true)
+                && !ctx.applied_postfix_operators.sounds
                 && matches!(
                     ctx.prev_operand_type,
                     PrecedingOperandType::Character | PrecedingOperandType::Unknown
@@ -3125,6 +3169,7 @@ impl SqlEditorWidget {
         // operand whose type we could not resolve is never hidden.
         if upper == "AT" {
             return ctx.follows_operand == Some(true)
+                && !ctx.applied_postfix_operators.at_clause
                 && matches!(
                     ctx.prev_operand_type,
                     PrecedingOperandType::Datetime | PrecedingOperandType::Unknown
@@ -3132,6 +3177,7 @@ impl SqlEditorWidget {
         }
         if upper == "COLLATE" {
             return ctx.follows_operand == Some(true)
+                && !ctx.applied_postfix_operators.collate
                 && matches!(
                     ctx.prev_operand_type,
                     PrecedingOperandType::Character | PrecedingOperandType::Unknown
@@ -3146,6 +3192,7 @@ impl SqlEditorWidget {
         // the operand-start list below.)
         if upper == "MEMBER" {
             return ctx.follows_operand == Some(true)
+                && !ctx.applied_postfix_operators.member
                 && !crate::sql_text::mysql_compatibility_for_sql("", db_type);
         }
         if upper == "SUBMULTISET" {
@@ -3346,7 +3393,15 @@ impl SqlEditorWidget {
             );
             Self::mysql_trigger_pseudo_row_policy(full_tokens, full_end)
         };
-        let follows_like_pattern = Self::cursor_follows_like_pattern(tokens, end);
+        // Only offer the `ESCAPE` keyword when the owning `LIKE` has not already
+        // spent its single-use escape clause (`… LIKE 'a%' ESCAPE '\' |` must not
+        // re-offer it). The escape-char operand position is typed separately via
+        // `cursor_follows_like_pattern`, which stays true across the whole clause.
+        let follows_like_pattern = matches!(
+            Self::like_pattern_position(tokens, end),
+            LikePatternPosition::PatternTail
+        );
+        let applied_postfix_operators = Self::cursor_applied_postfix_operators(tokens, end);
         let inside_group_concat_arguments_before_separator =
             Self::cursor_in_group_concat_arguments_before_separator(tokens, end);
         let before_quantifier_anchor = Self::meaningful_tokens_before(tokens, end);
@@ -3488,6 +3543,7 @@ impl SqlEditorWidget {
             at_bind_variable_name,
             statement_start,
             at_exception_name,
+            applied_postfix_operators,
         }
     }
 
@@ -7286,26 +7342,86 @@ impl SqlEditorWidget {
     /// deeper paren level are skipped so a `LIKE` buried in a sub-expression
     /// (`f(a LIKE b) |`) never counts.
     fn cursor_follows_like_pattern(tokens: &[SqlToken], end: usize) -> bool {
-        // Keywords that bound the current comparison expression: a `LIKE` before
-        // one of these belongs to a different predicate, so `ESCAPE` is not valid.
-        const SEGMENT_BOUNDARY: &[&str] = &[
-            "AND", "OR", "WHERE", "HAVING", "ON", "WHEN", "THEN", "ELSE", "SELECT", "FROM",
-            "GROUP", "ORDER", "BY", "START", "CONNECT", "SET", "VALUES", "USING", "RETURNING",
-            "CASE", "INTO", "BETWEEN",
-        ];
+        !matches!(
+            Self::like_pattern_position(tokens, end),
+            LikePatternPosition::None
+        )
+    }
+
+    /// Which single-use postfix operators are already applied to the cursor's
+    /// current operand chain. Scan back at paren depth 0 over the operand chain;
+    /// stop at the first operand boundary — any operator/comparison/comma symbol
+    /// (a qualified-name `.` is part of the operand, not a boundary) or a clause/
+    /// boolean keyword — so an operator bound to an *earlier* operand does not
+    /// count. A keyword reached before a boundary is an applied postfix operator.
+    fn cursor_applied_postfix_operators(tokens: &[SqlToken], end: usize) -> AppliedPostfixOperators {
         let before = Self::meaningful_tokens_before(tokens, end);
         let mut depth = 0i32;
+        let mut applied = AppliedPostfixOperators::default();
+        // `MEMBER` is a plausible column name, so it counts as the (single-use)
+        // `MEMBER OF` operator only when its mandatory `OF` follows it in the chain
+        // (seen earlier in this backward scan) — a bare `member` operand still gets
+        // the operator offered.
+        let mut saw_of = false;
+        for token in before.iter().rev() {
+            match token {
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => depth += 1,
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => {
+                    if depth == 0 {
+                        return applied;
+                    }
+                    depth -= 1;
+                }
+                _ if depth > 0 => {}
+                // `.` chains a qualified name (`t.col`); every other symbol
+                // (operator, comma, `=`, `||`, …) ends the current operand chain.
+                SqlToken::Symbol(sym) if sym == "." => {}
+                SqlToken::Symbol(_) => return applied,
+                SqlToken::Word(word) => {
+                    match word.to_ascii_uppercase().as_str() {
+                        "COLLATE" => applied.collate = true,
+                        "AT" => applied.at_clause = true,
+                        "SOUNDS" => applied.sounds = true,
+                        "OF" => saw_of = true,
+                        "MEMBER" if saw_of => applied.member = true,
+                        other if OPERAND_SEGMENT_BOUNDARY_KEYWORDS.contains(&other) => {
+                            return applied;
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        applied
+    }
+
+    /// Classify the cursor relative to the `LIKE` that owns the current
+    /// comparison expression. Scan back at paren depth 0: a `LIKE`-family keyword
+    /// found before any segment boundary (a boolean connector, clause keyword or
+    /// comma) means we are in/after a `LIKE` pattern; a boundary found first means
+    /// we are not. Tokens nested inside a deeper paren level are skipped so a
+    /// `LIKE` buried in a sub-expression (`f(a LIKE b) |`) never counts. An
+    /// `ESCAPE` keyword passed on the way to the `LIKE` means the (single-use)
+    /// escape clause is already present — the keyword must not be re-offered, but
+    /// the position is still owned by the `LIKE` (so the escape-char operand is
+    /// still typed correctly).
+    fn like_pattern_position(tokens: &[SqlToken], end: usize) -> LikePatternPosition {
+        const SEGMENT_BOUNDARY: &[&str] = OPERAND_SEGMENT_BOUNDARY_KEYWORDS;
+        let before = Self::meaningful_tokens_before(tokens, end);
+        let mut depth = 0i32;
+        let mut escape_seen = false;
         for (idx, token) in before.iter().enumerate().rev() {
             match token {
                 SqlToken::Symbol(sym) if sym == ")" || sym == "]" => depth += 1,
                 SqlToken::Symbol(sym) if sym == "(" || sym == "[" => {
                     if depth == 0 {
-                        return false;
+                        return LikePatternPosition::None;
                     }
                     depth -= 1;
                 }
                 _ if depth > 0 => {}
-                SqlToken::Symbol(sym) if sym == "," => return false,
+                SqlToken::Symbol(sym) if sym == "," => return LikePatternPosition::None,
                 SqlToken::Word(word) => {
                     let upper = word.to_ascii_uppercase();
                     if matches!(upper.as_str(), "LIKE" | "LIKE2" | "LIKE4" | "LIKEC") {
@@ -7317,18 +7433,27 @@ impl SqlEditorWidget {
                                 Some(SqlToken::Word(prev)) if prev.eq_ignore_ascii_case("SOUNDS")
                             )
                         {
-                            return false;
+                            return LikePatternPosition::None;
                         }
-                        return true;
+                        return if escape_seen {
+                            LikePatternPosition::EscapeConsumed
+                        } else {
+                            LikePatternPosition::PatternTail
+                        };
+                    }
+                    if upper == "ESCAPE" {
+                        // An `ESCAPE` clause already attached to the owning `LIKE`.
+                        escape_seen = true;
+                        continue;
                     }
                     if SEGMENT_BOUNDARY.contains(&upper.as_str()) {
-                        return false;
+                        return LikePatternPosition::None;
                     }
                 }
                 _ => {}
             }
         }
-        false
+        LikePatternPosition::None
     }
 
     fn cursor_follows_sounds_operator(tokens: &[SqlToken], end: usize) -> bool {

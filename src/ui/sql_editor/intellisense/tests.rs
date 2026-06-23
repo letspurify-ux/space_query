@@ -28137,6 +28137,78 @@ fn escape_offered_only_after_a_like_pattern() {
         let s = suggestions(sql);
         assert!(has(&s, "ESCAPE"), "ESCAPE suppressed after a LIKE pattern for `{sql}`: {s:?}");
     }
+
+    // `ESCAPE` is single-use: once the owning LIKE already carries an escape
+    // clause (the keyword awaiting its char, or complete) it must not be
+    // re-offered. The next legal continuation is the predicate/clause tail, not
+    // another ESCAPE.
+    for sql in [
+        "SELECT * FROM emp WHERE ename LIKE 'a%' ESCAPE '\\' es| ",
+        "SELECT * FROM emp WHERE ename NOT LIKE 'a%' ESCAPE '\\' es| ",
+        "SELECT * FROM emp WHERE empno = 1 AND ename LIKE 'a%' ESCAPE '\\' es| ",
+        // Cursor right after the ESCAPE keyword expects the escape *char*, not the
+        // keyword again.
+        "SELECT * FROM emp WHERE ename LIKE 'a%' ESCAPE es| ",
+    ] {
+        let s = suggestions(sql);
+        assert!(!has(&s, "ESCAPE"), "single-use ESCAPE re-offered for `{sql}`: {s:?}");
+    }
+}
+
+/// The single-use postfix operators `COLLATE` (character), `AT [TIME ZONE|LOCAL]`
+/// (datetime) and MySQL `SOUNDS LIKE` are grammatical at most once per operand
+/// chain. Each must be offered on a fresh operand but never re-offered once
+/// already applied — the same single-use principle as `ESCAPE` after a `LIKE`
+/// pattern, here at the operand-operator level. An operator bound to an *earlier*
+/// operand (before a comparison/arithmetic boundary) must not suppress it on a new
+/// operand.
+#[test]
+fn single_use_postfix_operators_are_not_re_offered() {
+    fn suggestions(sql_with_cursor: &str, db: crate::db::DatabaseType) -> Vec<String> {
+        let cursor = sql_with_cursor.find('|').expect("cursor marker");
+        let sql = sql_with_cursor.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql_with_cursor);
+        let context =
+            SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+        let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &ctx);
+        let column_scope = (!column_tables.is_empty()).then(|| column_tables.clone());
+        let mut data = IntellisenseData::new();
+        let expr_keyword_ctx = SqlEditorWidget::expression_keyword_context(
+            &ctx, &data, &column_tables, !prefix.is_empty(), Some(db));
+        SqlEditorWidget::base_suggestions_for_context(
+            &mut data, &prefix, None, column_scope.as_deref(),
+            matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
+            context, false, Some(db), expr_keyword_ctx)
+    }
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    use crate::db::DatabaseType::{Oracle, MySQL};
+
+    // First-offer on a fresh operand of the matching type: still offered.
+    assert!(has(&suggestions("SELECT * FROM t WHERE 'lit' c| ", Oracle), "COLLATE"));
+    assert!(has(&suggestions("SELECT * FROM t WHERE a s| ", MySQL), "SOUNDS"));
+    assert!(has(&suggestions("SELECT * FROM t WHERE ts a| ", Oracle), "AT"));
+
+    assert!(has(&suggestions("SELECT * FROM t WHERE x m| ", Oracle), "MEMBER"));
+
+    // Re-offer once already applied to the operand chain: suppressed.
+    for (sql, db, kw) in [
+        ("SELECT * FROM t WHERE 'lit' COLLATE my_coll c| ", Oracle, "COLLATE"),
+        ("SELECT * FROM t WHERE a SOUNDS LIKE 'b' s| ", MySQL, "SOUNDS"),
+        ("SELECT * FROM t WHERE ts AT TIME ZONE tz a| ", Oracle, "AT"),
+        ("SELECT * FROM t WHERE ts AT LOCAL a| ", Oracle, "AT"),
+        ("SELECT * FROM t WHERE x MEMBER OF coll m| ", Oracle, "MEMBER"),
+    ] {
+        let s = suggestions(sql, db);
+        assert!(!has(&s, kw), "single-use {kw} re-offered for `{sql}`: {s:?}");
+    }
+
+    // An operator on an *earlier* operand (before a `=` boundary) does not
+    // suppress it on the fresh right-hand operand.
+    assert!(
+        has(&suggestions("SELECT * FROM t WHERE 'x' COLLATE c1 = 'y' c| ", Oracle), "COLLATE"),
+        "COLLATE wrongly suppressed on a fresh operand by an earlier operand's COLLATE"
+    );
 }
 
 /// Set-quantifiers are grammatical only at the start of a select list, aggregate
