@@ -26694,6 +26694,71 @@ fn merge_when_then_action_slot_offers_action_keywords_not_columns() {
     assert!(SqlEditorWidget::collect_expected_keyword_suggestions("", &case_ctx, None).is_empty());
 }
 
+/// The MERGE match-condition region (`WHEN [NOT] MATCHED [AND <cond>] |`, before
+/// `THEN`) is owned by a dedicated handler: right after `MATCHED` the only
+/// grammatical continuations are `THEN` (proceed) or `AND` (open the optional
+/// condition), and after a complete `AND <predicate>` the condition extends
+/// (`AND`/`OR`) or closes with `THEN`. Guards against the generic
+/// predicate-conjunction handler, which wrongly offered a bare `OR` right after
+/// `MATCHED` and never offered the mandatory `THEN`.
+#[test]
+fn merge_match_condition_offers_then_and_not_bare_or() {
+    use crate::db::DatabaseType::Oracle;
+    let kw = |sql: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &analyze_inline_cursor_sql(sql),
+            Some(Oracle),
+        )
+    };
+    // Right after `MATCHED`/`NOT MATCHED`: `THEN` or `AND` — never a bare `OR`.
+    for sql in [
+        "MERGE INTO t USING s ON (t.id=s.id) WHEN MATCHED |",
+        "MERGE INTO t USING s ON (t.id=s.id) WHEN NOT MATCHED |",
+    ] {
+        assert_eq!(kw(sql), vec!["THEN".to_string(), "AND".to_string()], "`{sql}`");
+    }
+    // After a complete match condition: extend (`AND`/`OR`) or close (`THEN`).
+    for sql in [
+        "MERGE INTO t USING s ON (t.id=s.id) WHEN MATCHED AND t.x=1 |",
+        "MERGE INTO t USING s ON (t.id=s.id) WHEN NOT MATCHED AND s.x=1 |",
+    ] {
+        assert_eq!(
+            kw(sql),
+            vec!["AND".to_string(), "OR".to_string(), "THEN".to_string()],
+            "`{sql}`"
+        );
+    }
+    // An open condition (`… AND |`) is an expression slot — no merge keywords —
+    // and the action tail past `THEN` is unaffected.
+    assert!(kw("MERGE INTO t USING s ON (t.id=s.id) WHEN MATCHED AND |").is_empty());
+    assert_eq!(
+        kw("MERGE INTO t USING s ON (t.id=s.id) WHEN MATCHED THEN UPDATE SET a=1 |"),
+        vec!["WHERE".to_string(), "DELETE WHERE".to_string(), "WHEN".to_string()]
+    );
+
+    // The keyword-only sub-slots (bare `MATCHED`, complete condition) suppress the
+    // joined columns the `ON (...)` `JoinCondition` phase would otherwise leak; an
+    // open condition (`… AND |`) keeps them, since the predicate needs an operand.
+    let col_suppressed = |sql: &str| {
+        SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(
+            &analyze_inline_cursor_sql(sql),
+            false,
+        )
+    };
+    for sql in [
+        "MERGE INTO t USING s ON (t.id=s.id) WHEN MATCHED |",
+        "MERGE INTO t USING s ON (t.id=s.id) WHEN NOT MATCHED |",
+        "MERGE INTO t USING s ON (t.id=s.id) WHEN MATCHED AND t.x=1 |",
+    ] {
+        assert!(col_suppressed(sql), "columns must be suppressed: `{sql}`");
+    }
+    assert!(
+        !col_suppressed("MERGE INTO t USING s ON (t.id=s.id) WHEN MATCHED AND |"),
+        "the open match condition must keep its column operand"
+    );
+}
+
 /// The row-locking clause `… FOR |` (→ `UPDATE`/`SHARE`) and `… FOR UPDATE |`
 /// (→ `OF`/`NOWAIT`/…) are keyword-only slots — a column is never valid. The
 /// trailing-clause phase used to leave them in a column context. They are gated
@@ -31748,10 +31813,16 @@ fn merge_when_introducer_is_a_keyword_only_slot() {
         vec!["MATCHED".to_string()]
     );
 
-    // `WHEN MATCHED |` still admits a column expression (`AND <cond>` / `THEN`),
-    // so it is NOT a column-suppressing slot.
+    // `WHEN MATCHED |` (bare, before any condition) admits only `THEN` or the
+    // optional `AND` — a column is not grammatical until `AND` opens a condition —
+    // so it is a keyword-only slot and the joined columns are suppressed. The
+    // column operand returns once `AND` is typed (covered in
+    // `merge_match_condition_offers_then_and_not_bare_or`).
     let when_matched = format!("{ON} WHEN MATCHED |");
-    assert!(!suppresses(&when_matched), "WHEN MATCHED must keep its AND-condition columns");
+    assert_eq!(kw(&when_matched), vec!["THEN".to_string(), "AND".to_string()]);
+    assert!(suppresses(&when_matched), "bare WHEN MATCHED admits only THEN/AND, not columns");
+    let when_matched_cond = format!("{ON} WHEN MATCHED AND |");
+    assert!(!suppresses(&when_matched_cond), "an open AND condition must keep its columns");
 
     // A `CASE WHEN |` value expression is not a MERGE action slot.
     let case_when = "SELECT CASE WHEN | END FROM emp";
@@ -36932,9 +37003,15 @@ fn lock_keyword_slots_suppress_relations_and_raise_offers_exceptions() {
     assert!(!suppressed("GRANT SELECT ON t TO |"));
 
     // PL/SQL `RAISE |` → predefined exceptions (additive; columns/relations dropped).
+    // `OTHERS` is a handler-only catch-all and cannot be raised, so it is excluded
+    // here — but it must still be offered at an exception-handler `WHEN`.
     let raise = kw("BEGIN RAISE | END;");
-    assert!(has(&raise, "NO_DATA_FOUND") && has(&raise, "OTHERS"),
-        "RAISE did not offer exceptions: {raise:?}");
+    assert!(has(&raise, "NO_DATA_FOUND"), "RAISE did not offer exceptions: {raise:?}");
+    assert!(!has(&raise, "OTHERS"), "RAISE must not offer the non-raisable OTHERS: {raise:?}");
+    assert!(
+        has(&kw("BEGIN NULL; EXCEPTION WHEN | THEN NULL; END;"), "OTHERS"),
+        "the handler WHEN slot must still offer OTHERS"
+    );
 }
 
 /// A DML trailing clause whose grammar is single-use is offered only while it is
@@ -38293,4 +38370,3 @@ fn using_join_column_list_completes_the_join() {
     assert!(!has(&s, "WHERE") && !has(&s, "JOIN"),
         "query continuation leaked into the open USING column list: {s:?}");
 }
-

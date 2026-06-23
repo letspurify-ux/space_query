@@ -3824,17 +3824,21 @@ impl SqlEditorWidget {
     /// section) is reliably told apart from a `CASE … WHEN <condition>` (top
     /// frame is a `Case`); the latter's condition is an ordinary value expression
     /// whose columns must never be suppressed.
-    fn cursor_is_at_plsql_exception_name(tokens: &[SqlToken], end: usize) -> bool {
-        // `RAISE <exception>` names an exception just like a handler `WHEN`; the
-        // word right before the cursor being `RAISE` (inside an executable block, so
-        // it is the statement, not a column) marks the slot. `RAISE;` (bare re-raise)
-        // is also valid, so this is additive — the predefined/declared exception
-        // names are offered without forcing one.
-        if matches!(
+    /// `RAISE <exception>` names an exception just like a handler `WHEN`; the word
+    /// right before the cursor being `RAISE` (inside an executable block, so it is
+    /// the statement, not a column) marks the slot. `RAISE;` (bare re-raise) is
+    /// also valid, so the names are offered additively without forcing one. Unlike
+    /// a handler `WHEN`, a `RAISE` can name only a *raisable* exception — `OTHERS`
+    /// is a handler-only catch-all and is not raisable, so the caller drops it.
+    fn cursor_is_at_raise_exception_name(tokens: &[SqlToken], end: usize) -> bool {
+        matches!(
             Self::meaningful_tokens_before(tokens, end).last(),
             Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("RAISE")
         ) && Self::cursor_in_plsql_executable_block(tokens, end)
-        {
+    }
+
+    fn cursor_is_at_plsql_exception_name(tokens: &[SqlToken], end: usize) -> bool {
+        if Self::cursor_is_at_raise_exception_name(tokens, end) {
             return true;
         }
         #[derive(Clone, Copy)]
@@ -11329,6 +11333,10 @@ impl SqlEditorWidget {
                 deep_ctx,
                 exclude_current_identifier_chain,
             )
+            || Self::cursor_is_at_merge_match_condition_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
             || Self::cursor_is_after_set_operator_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
@@ -11578,6 +11586,10 @@ impl SqlEditorWidget {
                 exclude_current_identifier_chain,
             )
             || Self::cursor_is_at_merge_when_keyword_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
+            || Self::cursor_is_at_merge_match_condition_slot_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
             )
@@ -21550,6 +21562,79 @@ impl SqlEditorWidget {
         Self::merge_then_action_keywords(tokens, end).is_some()
     }
 
+    /// Whether the cursor is at the MERGE match-condition keyword slot — right
+    /// after `WHEN [NOT] MATCHED` (only `THEN`/`AND` valid) or after a complete
+    /// `AND <predicate>` (only `AND`/`OR`/`THEN` valid). Both are keyword-only:
+    /// the `ON (...)` join condition leaves the cursor in `JoinCondition` (a
+    /// column phase), so without enrolling this slot the joined columns leaked
+    /// where no column is grammatical. An *incomplete* condition (`… AND |`)
+    /// returns `None` from the underlying handler and stays a column position.
+    fn cursor_is_at_merge_match_condition_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::merge_match_condition_keywords(tokens, end).is_some()
+    }
+
+    /// MERGE match-condition region: the slot after `WHEN [NOT] MATCHED` and
+    /// before its `THEN`. The optional `AND <condition>` lives here, so right
+    /// after `MATCHED` (no condition started) the grammatical continuations are
+    /// `THEN` (proceed straight to the action) or `AND` (open the match
+    /// condition); after a complete `AND <predicate>` the condition extends
+    /// (`AND`/`OR`) or closes with `THEN`. A bare `OR` right after `MATCHED` is
+    /// *not* grammatical — and the generic predicate-conjunction handler would
+    /// both offer it and never offer the mandatory `THEN` — so this owns the
+    /// region. Gated to a MERGE whose `WHEN` is not a `CASE … WHEN` branch and
+    /// anchored on the nearest preceding `WHEN`, so an `AND … MATCHED`-style
+    /// column or an unrelated `MATCHED` identifier is untouched.
+    fn merge_match_condition_keywords(
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> Option<&'static [&'static str]> {
+        if !Self::statement_is_merge(tokens) || Self::cursor_is_inside_unclosed_case(tokens, end) {
+            return None;
+        }
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        let words: Vec<String> = toks
+            .iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                _ => None,
+            })
+            .collect();
+        let when_idx = words.iter().rposition(|word| word == "WHEN")?;
+        let matched_idx = match words.get(when_idx + 1).map(String::as_str) {
+            Some("MATCHED") => when_idx + 1,
+            Some("NOT") if words.get(when_idx + 2).map(String::as_str) == Some("MATCHED") => {
+                when_idx + 2
+            }
+            _ => return None,
+        };
+        // Past a `THEN` the cursor is in the action body, not the condition.
+        if words[matched_idx + 1..].iter().any(|word| word == "THEN") {
+            return None;
+        }
+        // Right after `MATCHED` (no condition yet): close with `THEN` or open the
+        // optional `AND` condition.
+        if matches!(toks.last(), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("MATCHED")) {
+            return Some(&["THEN", "AND"]);
+        }
+        // After `MATCHED AND <predicate>`: extend or close the condition once the
+        // predicate is complete (an incomplete one is the expression handler's
+        // column/operator slot).
+        if Self::cursor_follows_complete_predicate(tokens, end) {
+            return Some(&["AND", "OR", "THEN"]);
+        }
+        None
+    }
+
     fn merge_action_start_keywords(
         tokens: &[SqlToken],
         end: usize,
@@ -22577,7 +22662,13 @@ impl SqlEditorWidget {
         if !crate::sql_text::mysql_compatibility_for_sql("", db_type)
             && Self::cursor_is_at_plsql_exception_name(tokens, context_end)
         {
-            return Self::filter_expected_candidates(prefix, PLSQL_PREDEFINED_EXCEPTIONS);
+            let candidates = Self::filter_expected_candidates(prefix, PLSQL_PREDEFINED_EXCEPTIONS);
+            // `OTHERS` is a handler-only catch-all; it cannot be raised, so drop it
+            // at a `RAISE` slot (it stays for an exception-handler `WHEN`).
+            if Self::cursor_is_at_raise_exception_name(tokens, context_end) {
+                return candidates.into_iter().filter(|c| c != "OTHERS").collect();
+            }
+            return candidates;
         }
         if matches!(
             deep_ctx.phase,
@@ -22944,6 +23035,9 @@ impl SqlEditorWidget {
             expr_keyword_ctx.map(|ctx| ctx.negated_predicate_left_operand_type),
         ) {
             return Self::filter_expected_candidates(prefix, &candidates);
+        }
+        if let Some(candidates) = Self::merge_match_condition_keywords(tokens, context_end) {
+            return Self::filter_expected_candidates(prefix, candidates);
         }
         if let Some(candidates) = Self::merge_then_action_keywords(tokens, context_end) {
             return Self::filter_expected_candidates(prefix, candidates);
