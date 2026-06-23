@@ -3310,6 +3310,22 @@ impl MainWindow {
         }
     }
 
+    /// Appends `default_ext` (without a dot) to a save target whose typed name
+    /// lacks an extension, mirroring the extension of the selected file-type
+    /// filter. When the "All Files" filter is selected (`all_files_index`) the
+    /// name is returned untouched.
+    fn apply_default_extension(
+        path: PathBuf,
+        default_ext: &str,
+        filter_value: i32,
+        all_files_index: Option<i32>,
+    ) -> PathBuf {
+        if Some(filter_value) == all_files_index || path.extension().is_some() {
+            return path;
+        }
+        path.with_extension(default_ext)
+    }
+
     fn export_current_results_to_csv(
         state: &Arc<Mutex<AppState>>,
         file_sender: &std::sync::mpsc::Sender<FileActionResult>,
@@ -3321,6 +3337,10 @@ impl MainWindow {
         if filename.as_os_str().is_empty() {
             return;
         }
+        // The native chooser auto-appends an "All Files" entry after our single
+        // "CSV Files" filter, so it sits at index 1 (skip); index 0 → force .csv.
+        let filename =
+            Self::apply_default_extension(filename, "csv", dialog.filter_value(), Some(1));
 
         let sender = file_sender.clone();
         let deferred_sender = sender.clone();
@@ -3802,13 +3822,21 @@ impl MainWindow {
         let should_record_recent = force_save_as || current_file.is_none();
         let target_path = if force_save_as { None } else { current_file }.or_else(|| {
             let mut dialog = FileDialog::new(FileDialogType::BrowseSaveFile);
-            dialog.set_filter("SQL Files\t*.sql\nAll Files\t*.*");
+            // The native chooser auto-appends an "All Files" entry, so listing
+            // it here would show it twice. It lands right after our filters, at
+            // index 1 (0 = "SQL Files", 1 = auto "All Files" → skip).
+            dialog.set_filter("SQL Files\t*.sql");
             dialog.show();
             let filename = dialog.filename();
             if filename.as_os_str().is_empty() {
                 None
             } else {
-                Some(filename)
+                Some(Self::apply_default_extension(
+                    filename,
+                    "sql",
+                    dialog.filter_value(),
+                    Some(1),
+                ))
             }
         });
 
@@ -7287,7 +7315,9 @@ impl MainWindow {
             }
             "File/Open SQL File" => {
                 let mut dialog = FileDialog::new(FileDialogType::BrowseFile);
-                dialog.set_filter("SQL Files\t*.sql\nAll Files\t*.*");
+                // The native macOS open panel auto-appends an "All Files" entry,
+                // so listing it here would show it twice.
+                dialog.set_filter("SQL Files\t*.sql");
                 dialog.show();
                 let filename = dialog.filename();
                 MainWindow::open_sql_file_path(state, file_sender, filename);
