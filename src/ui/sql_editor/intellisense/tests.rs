@@ -295,6 +295,56 @@ fn plsql_type_attribute_slot_offers_type_rowtype_and_suppresses_identifiers() {
 
 /// The `GRANT |` / `REVOKE |` privilege list offers only the fixed privilege
 /// keywords. Object names (tables, views, sequences, procedures, …) are never
+/// After a complete privilege list (`GRANT SELECT, INSERT |`) the only
+/// grammatical continuation is the object clause `ON`. Without an explicit
+/// privilege-list-tail arm the statement falls through to the query-continuation
+/// fallback, which misreads the leading `SELECT` privilege as a select list and
+/// leaks its `FROM` — pure noise. A MySQL `REVOKE` may also revoke globally
+/// (no `ON`), so it additionally admits `FROM`; an open column list defers to the
+/// catalog. The privilege-name slots (`GRANT |` / `GRANT SELECT, |`) keep
+/// offering privileges as before.
+#[test]
+fn grant_privilege_list_tail_offers_object_clause_not_select_from() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+    let kw = |sql: &str, db| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &analyze_inline_cursor_sql(sql),
+            Some(db),
+        )
+    };
+    // After a privilege (or a closed column list) `ON` is the continuation, and
+    // the misparsed select-list `FROM` must never appear.
+    for sql in [
+        "GRANT SELECT |",
+        "GRANT SELECT, INSERT |",
+        "GRANT UPDATE (c) |",
+        "GRANT ALL PRIVILEGES |",
+    ] {
+        let k = kw(sql, Oracle);
+        assert_eq!(k, vec!["ON".to_string()], "`{sql}`");
+    }
+    assert_eq!(kw("GRANT SELECT, INSERT |", MySQL), vec!["ON".to_string()]);
+    assert_eq!(kw("GRANT CREATE |", MySQL), vec!["ON".to_string()]);
+    // Oracle `REVOKE` object privileges always carry `ON`; a MySQL `REVOKE` may
+    // strip globally, so it admits a direct `FROM` too.
+    assert_eq!(kw("REVOKE SELECT, INSERT |", Oracle), vec!["ON".to_string()]);
+    assert_eq!(
+        kw("REVOKE SELECT, INSERT |", MySQL),
+        vec!["ON".to_string(), "FROM".to_string()]
+    );
+    // The privilege-name slots still offer privileges, and an open column list
+    // defers (the comma there separates columns, not privileges).
+    assert!(kw("GRANT |", Oracle).iter().any(|p| p == "SELECT"));
+    assert!(kw("GRANT SELECT, |", Oracle).iter().any(|p| p == "INSERT"));
+    assert!(
+        !kw("GRANT UPDATE (c, |", Oracle)
+            .iter()
+            .any(|p| p == "SELECT"),
+        "privilege keywords must not leak into an open GRANT column list"
+    );
+}
+
 /// grantable in a privilege list, so the identifier base is suppressed there —
 /// it would otherwise dump the whole catalog as pure noise. The grantee slot is
 /// a separate (user/role) position and offers no privilege keywords.
@@ -26971,6 +27021,50 @@ fn data_type_value_positions_after_complete_type_are_not_type_slots() {
     }
 }
 
+/// The Oracle trigger body options follow `ON [schema.]table` in grammatical
+/// order — `[FOR EACH ROW] [WHEN (cond)] {DECLARE|BEGIN|…}` — and each is
+/// single-use: once `FOR EACH ROW` is present it must not be re-offered, and once
+/// the `WHEN` condition is present neither it nor `FOR EACH ROW` reappears. Guards
+/// against the spent-clause re-offer that dumped `FOR EACH ROW` back into the
+/// suggestion list after it was already typed.
+#[test]
+fn oracle_trigger_body_options_are_single_use_and_ordered() {
+    use crate::db::DatabaseType::Oracle;
+    let kw = |sql: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &analyze_inline_cursor_sql(sql),
+            Some(Oracle),
+        )
+    };
+    assert_eq!(
+        kw("CREATE TRIGGER trg BEFORE INSERT ON t |"),
+        vec![
+            "FOR EACH ROW".to_string(),
+            "WHEN".to_string(),
+            "DECLARE".to_string(),
+            "BEGIN".to_string(),
+        ]
+    );
+    // `FOR EACH ROW` present → not re-offered; `WHEN`/body still available.
+    assert_eq!(
+        kw("CREATE TRIGGER trg AFTER UPDATE OF c ON t FOR EACH ROW |"),
+        vec!["WHEN".to_string(), "DECLARE".to_string(), "BEGIN".to_string()]
+    );
+    assert_eq!(
+        kw("CREATE TRIGGER trg INSTEAD OF INSERT ON v FOR EACH ROW |"),
+        vec!["WHEN".to_string(), "DECLARE".to_string(), "BEGIN".to_string()]
+    );
+    // `WHEN` condition present → only the body block remains (no `FOR EACH ROW`,
+    // no second `WHEN`), whether or not `FOR EACH ROW` preceded it.
+    for sql in [
+        "CREATE TRIGGER trg BEFORE INSERT ON t FOR EACH ROW WHEN (n.id>0) |",
+        "CREATE TRIGGER trg BEFORE INSERT ON t WHEN (n.id>0) |",
+    ] {
+        assert_eq!(kw(sql), vec!["DECLARE".to_string(), "BEGIN".to_string()], "`{sql}`");
+    }
+}
+
 #[test]
 fn data_type_trigger_declaration_offers_types_but_body_does_not() {
     use crate::db::DatabaseType::Oracle;
@@ -38199,3 +38293,4 @@ fn using_join_column_list_completes_the_join() {
     assert!(!has(&s, "WHERE") && !has(&s, "JOIN"),
         "query continuation leaked into the open USING column list: {s:?}");
 }
+

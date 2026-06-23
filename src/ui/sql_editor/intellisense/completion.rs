@@ -8895,29 +8895,55 @@ impl SqlEditorWidget {
                 _ => {}
             }
         }
-        // The cursor must sit right after the verb (`GRANT |`) or a privilege-list
-        // comma (`GRANT SELECT, |`).
+        // Locate the cursor within the privilege list: scan back to the
+        // controlling verb. If a clause separator (`ON`/`TO`/`FROM`) is reached
+        // first, the cursor has moved past the privilege list and a later handler
+        // owns the slot.
+        let mut verb = None;
+        for token in toks.iter().rev() {
+            if let SqlToken::Word(word) = token {
+                let upper = word.to_ascii_uppercase();
+                match upper.as_str() {
+                    "GRANT" | "REVOKE" => {
+                        verb = Some(upper);
+                        break;
+                    }
+                    "ON" | "TO" | "FROM" => break,
+                    _ => {}
+                }
+            }
+        }
+        let Some(verb) = verb else {
+            return None;
+        };
+        // Inside an open privilege column list (`GRANT UPDATE (c, |`) the comma is
+        // a column separator, not a privilege separator: the slot names a column
+        // of the (not-yet-known) object, so defer to the catalog rather than
+        // offering privilege keywords.
+        if Self::unclosed_paren_count(tokens, end) != 0 {
+            return None;
+        }
+        // Right after the verb (`GRANT |`) or a privilege-list comma
+        // (`GRANT SELECT, |`) the privilege names themselves are grammatical.
         let after_verb_or_comma = matches!(
             toks.last(),
             Some(SqlToken::Word(word))
                 if word.eq_ignore_ascii_case("GRANT") || word.eq_ignore_ascii_case("REVOKE")
         ) || matches!(toks.last(), Some(SqlToken::Symbol(sym)) if sym == ",");
-        if !after_verb_or_comma {
-            return None;
+        if after_verb_or_comma {
+            return Some(candidates);
         }
-        // Scan back to the controlling verb; bail if a clause separator already
-        // moved the cursor past the privilege list.
-        for token in toks.iter().rev() {
-            if let SqlToken::Word(word) = token {
-                let upper = word.to_ascii_uppercase();
-                match upper.as_str() {
-                    "GRANT" | "REVOKE" => return Some(candidates),
-                    "ON" | "TO" | "FROM" => return None,
-                    _ => {}
-                }
-            }
+        // After a complete privilege (`GRANT SELECT, INSERT |`) or its closed
+        // column list (`GRANT UPDATE (c) |`) the only grammatical continuation is
+        // the object clause `ON` — a MySQL `REVOKE` may also revoke globally
+        // (`REVOKE ALL PRIVILEGES, GRANT OPTION FROM u`), so it admits `FROM` too.
+        // Returning a handled set short-circuits the query-continuation fallback
+        // that would otherwise misread the leading `SELECT` privilege as a select
+        // list and leak its `FROM`.
+        if verb == "REVOKE" && crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return Some(&["ON", "FROM"]);
         }
-        None
+        Some(&["ON"])
     }
 
     fn expected_grant_privilege_keyword_candidates_for_context(
@@ -14634,9 +14660,22 @@ impl SqlEditorWidget {
         }
         if contains("TRIGGER") {
             // Past `ON [schema.]table` the timing/event chain is complete; the
-            // trigger body options follow.
+            // trigger body options follow in their grammatical order —
+            // `[FOR EACH ROW] [WHEN (cond)] {DECLARE|BEGIN|…}` — and each option is
+            // single-use: once `FOR EACH ROW` is present it is not re-offered, and
+            // once the `WHEN` condition is present neither it nor the earlier
+            // `FOR EACH ROW` is offered again. (`EACH` appears only in `FOR EACH
+            // ROW` within a trigger, so it is a reliable presence marker.)
             if contains("ON") {
-                return Some(&["FOR EACH ROW", "WHEN", "DECLARE", "BEGIN"]);
+                let has_for_each = contains("EACH");
+                let has_when = contains("WHEN");
+                return Some(if has_when {
+                    &["DECLARE", "BEGIN"]
+                } else if has_for_each {
+                    &["WHEN", "DECLARE", "BEGIN"]
+                } else {
+                    &["FOR EACH ROW", "WHEN", "DECLARE", "BEGIN"]
+                });
             }
             let prev = words
                 .len()
