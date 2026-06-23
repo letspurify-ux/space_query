@@ -12665,7 +12665,26 @@ impl SqlEditorWidget {
                     // awaits its parenthesised argument, so the item is unfinished.
                     && !Self::cursor_at_analytic_continuation_awaiting_argument(tokens, end)
             }
-            Some(SqlToken::Symbol(sym)) => sym == "*" || sym == ")",
+            Some(SqlToken::Symbol(sym)) if sym == ")" => true,
+            Some(SqlToken::Symbol(sym)) if sym == "*" => {
+                // A trailing `*` completes the projection only as the wildcard
+                // (`SELECT * |`, `SELECT t.* |`, `SELECT a, * |`) — never as the
+                // multiplication operator (`SELECT a * |`, whose right operand is
+                // still pending). It is the wildcard iff the token before it does not
+                // complete an operand: a list/qualifier separator (`,`/`(`/`.`) or a
+                // select-list head keyword precedes the wildcard, while an identifier/
+                // literal/`)` precedes a multiplication.
+                match toks.get(toks.len().wrapping_sub(2)) {
+                    Some(SqlToken::Symbol(prev)) => matches!(prev.as_str(), "," | "(" | "."),
+                    Some(SqlToken::Word(prev)) => matches!(
+                        prev.to_ascii_uppercase().as_str(),
+                        "SELECT" | "UNION" | "INTERSECT" | "EXCEPT" | "MINUS" | "ALL"
+                            | "DISTINCT" | "DISTINCTROW"
+                    ),
+                    _ => false,
+                }
+            }
+            Some(SqlToken::Symbol(_)) => false,
             Some(SqlToken::String(_)) => true,
             Some(SqlToken::Comment(_)) | None => false,
         };
@@ -12913,6 +12932,58 @@ impl SqlEditorWidget {
             exclude_current_identifier_chain,
         );
         Self::expected_create_table_column_definition_tail_keywords(tokens, end, db_type).is_some()
+    }
+
+    /// Drops single-use column properties that are already present in the current
+    /// element from a column-property candidate list — `DEFAULT`/`COLLATE`/`COMMENT`/
+    /// `AUTO_INCREMENT`/`IDENTITY` may each appear at most once, and `INVISIBLE`/
+    /// `VISIBLE` are mutually exclusive — so `… DEFAULT 5 |` no longer re-offers
+    /// `DEFAULT`. Only the current element's own (depth-0) words are inspected:
+    /// scanning back stops at the element-separating `,` or the enclosing list `(`,
+    /// and tokens inside a sub-paren (`DEFAULT (expr)`, `CHECK (…)`, a type
+    /// precision) are skipped, so a keyword *used as an expression operand* is not
+    /// mistaken for the property.
+    fn drop_present_single_use_column_properties(
+        candidates: Vec<String>,
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> Vec<String> {
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        let mut present: Vec<String> = Vec::new();
+        let mut depth = 0i32;
+        for token in toks.iter().rev() {
+            match token {
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => depth += 1,
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => {
+                    if depth == 0 {
+                        break; // reached the element's own list `(`
+                    }
+                    depth -= 1;
+                }
+                SqlToken::Symbol(sym) if sym == "," && depth == 0 => break, // element start
+                SqlToken::Word(word) if depth == 0 => present.push(word.to_ascii_uppercase()),
+                _ => {}
+            }
+        }
+        let has = |kw: &str| present.iter().any(|word| word == kw);
+        const SINGLE_USE: &[&str] =
+            &["DEFAULT", "COLLATE", "COMMENT", "AUTO_INCREMENT", "IDENTITY"];
+        candidates
+            .into_iter()
+            .filter(|candidate| {
+                let upper = candidate.to_ascii_uppercase();
+                if SINGLE_USE.contains(&upper.as_str()) && has(&upper) {
+                    return false;
+                }
+                // `INVISIBLE` and `VISIBLE` are a single mutually-exclusive slot.
+                if matches!(upper.as_str(), "INVISIBLE" | "VISIBLE")
+                    && (has("INVISIBLE") || has("VISIBLE"))
+                {
+                    return false;
+                }
+                true
+            })
+            .collect()
     }
 
     /// Keyword tail for a single table-element definition (a column or a
@@ -22554,12 +22625,20 @@ impl SqlEditorWidget {
         if let Some(candidates) =
             Self::expected_create_table_column_definition_tail_keywords(tokens, context_end, db_type)
         {
-            return Self::filter_expected_candidates(prefix, candidates);
+            return Self::drop_present_single_use_column_properties(
+                Self::filter_expected_candidates(prefix, candidates),
+                tokens,
+                context_end,
+            );
         }
         if let Some(candidates) =
             Self::expected_alter_table_add_tail_keywords(tokens, context_end, db_type)
         {
-            return Self::filter_expected_candidates(prefix, candidates);
+            return Self::drop_present_single_use_column_properties(
+                Self::filter_expected_candidates(prefix, candidates),
+                tokens,
+                context_end,
+            );
         }
         if let Some(candidates) =
             Self::expected_select_list_from_keyword_candidates(tokens, context_end)
