@@ -132,6 +132,13 @@ pub struct ScopedTableRef {
     pub is_cte: bool,
 }
 
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(crate) struct TableRefDeclaredAtCursor {
+    pub table: ScopedTableRef,
+    pub token_start: usize,
+}
+
 /// CTE definition parsed from WITH clause.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -184,12 +191,21 @@ pub struct CursorContext {
     pub cursor_token_len: usize,
     /// Innermost query body containing the cursor when inside a CTE/subquery.
     pub(crate) active_query_range: Option<TokenRange>,
+    /// Whether `active_query_range` is narrowed by set-operation branch split
+    /// (`UNION`/`INTERSECT`/`MINUS`/`EXCEPT`) that should isolate symbol
+    /// visibility per branch.
+    pub(crate) in_set_operation_query_branch: bool,
     /// Current SQL phase at cursor position
     pub phase: SqlPhase,
     /// Current parenthesis nesting depth (0 = top level)
     pub depth: usize,
     /// All tables visible at cursor position (current scope + parent scopes + CTEs)
     pub tables_in_scope: Vec<ScopedTableRef>,
+    /// All tables whose declarations are visible at cursor scope and declared
+    /// before the cursor position.
+    pub tables_in_scope_before_cursor: Vec<ScopedTableRef>,
+    /// Same as `tables_in_scope_before_cursor`, but with declaration position.
+    pub(crate) tables_in_scope_before_cursor_with_pos: Vec<TableRefDeclaredAtCursor>,
     /// CTEs defined in WITH clause
     pub ctes: Vec<CteDefinition>,
     /// Subquery aliases with their body tokens for column inference
@@ -345,7 +361,7 @@ pub(crate) fn analyze_cursor_context_arc(
 ) -> CursorContext {
     let clamped_cursor_token_len = cursor_token_len.min(statement_tokens.len());
     let parse_result = scan_cursor_context(statement_tokens.as_ref(), clamped_cursor_token_len);
-    let active_query_range = find_active_query_range(
+    let (active_query_range, in_set_operation_query_branch) = find_active_query_range(
         statement_tokens.as_ref(),
         &parse_result.parsed_ctes,
         &parse_result.parsed_subqueries,
@@ -367,6 +383,17 @@ pub(crate) fn analyze_cursor_context_arc(
         &parse_result.parsed_subqueries,
         &parse_result.visible_scope_chain,
     );
+    let mut tables_in_scope_before_cursor = filter_visible_scope_entries_declared_before_cursor(
+        &parse_result.parsed_tables,
+        &parse_result.visible_scope_chain,
+        clamped_cursor_token_len,
+    );
+    let mut tables_in_scope_before_cursor_with_pos =
+        filter_visible_scope_entries_declared_before_cursor_with_pos(
+            &parse_result.parsed_tables,
+            &parse_result.visible_scope_chain,
+            clamped_cursor_token_len,
+        );
     let ctes = filter_visible_ctes(
         &visible_cte_entries,
         &parse_result.visible_cte_scope_chain,
@@ -374,65 +401,25 @@ pub(crate) fn analyze_cursor_context_arc(
     );
 
     let mut tables_in_scope = table_analysis.tables;
-    for cte in &ctes {
-        // A CTE already merged in by an earlier iteration (same name, redefined
-        // at a different scope depth) is updated in place to the applicable depth.
-        if let Some(existing_idx) = tables_in_scope
-            .iter()
-            .position(|t| t.is_cte && t.name.eq_ignore_ascii_case(&cte.name))
-        {
-            if tables_in_scope[existing_idx].depth <= cte.depth {
-                tables_in_scope[existing_idx] = ScopedTableRef {
-                    name: cte.name.clone(),
-                    alias: None,
-                    depth: cte.depth,
-                    is_cte: true,
-                };
-            }
-            continue;
-        }
-        // The FROM/JOIN scope collector records every relation reference as a
-        // physical table (`is_cte = false`); it does not cross-check the WITH
-        // list. So a reference to this CTE is already present, mis-flagged. Flag
-        // those references as CTEs in place — preserving their alias and depth —
-        // instead of appending a duplicate bare scope entry. Multiple references
-        // (e.g. `FROM c c1, c c2`) are all corrected.
-        let mut flagged_reference = false;
-        for table_ref in tables_in_scope.iter_mut() {
-            if !table_ref.is_cte && table_ref.name.eq_ignore_ascii_case(&cte.name) {
-                table_ref.is_cte = true;
-                flagged_reference = true;
-            }
-        }
-        if flagged_reference {
-            continue;
-        }
-        // The CTE is in scope but not referenced in this query's FROM; expose it
-        // as a referable relation under its bare name.
-        tables_in_scope.push(ScopedTableRef {
-            name: cte.name.clone(),
-            alias: None,
-            depth: cte.depth,
-            is_cte: true,
-        });
-    }
-    if let Some(excluded_target_table) = parse_result.excluded_target_table.as_ref() {
-        let already = tables_in_scope.iter().any(|table| {
-            table.name.eq_ignore_ascii_case(excluded_target_table)
-                && table
-                    .alias
-                    .as_deref()
-                    .is_some_and(|alias| alias.eq_ignore_ascii_case("EXCLUDED"))
-        });
-        if !already {
-            tables_in_scope.push(ScopedTableRef {
-                name: excluded_target_table.clone(),
-                alias: Some("EXCLUDED".to_string()),
-                depth: parse_result.depth,
-                is_cte: false,
-            });
-        }
-    }
+    apply_cte_and_excluded_target_tables(
+        &mut tables_in_scope,
+        &ctes,
+        parse_result.depth,
+        parse_result.excluded_target_table.as_deref(),
+    );
+    apply_cte_and_excluded_target_tables(
+        &mut tables_in_scope_before_cursor,
+        &ctes,
+        parse_result.depth,
+        parse_result.excluded_target_table.as_deref(),
+    );
+    apply_cte_and_excluded_target_tables_with_pos(
+        &mut tables_in_scope_before_cursor_with_pos,
+        &ctes,
+        parse_result.depth,
+        parse_result.excluded_target_table.as_deref(),
+        clamped_cursor_token_len,
+    );
 
     let mut phase = parse_result.phase;
     let mut focused_tables = parse_result.focused_tables;
@@ -485,9 +472,12 @@ pub(crate) fn analyze_cursor_context_arc(
         statement_tokens,
         cursor_token_len: clamped_cursor_token_len,
         active_query_range,
+        in_set_operation_query_branch,
         phase,
         depth: parse_result.depth,
         tables_in_scope,
+        tables_in_scope_before_cursor,
+        tables_in_scope_before_cursor_with_pos,
         ctes,
         subqueries: table_analysis.subqueries,
         focused_tables,
@@ -4594,6 +4584,158 @@ fn filter_scope_entries(
     TableAnalysis { tables, subqueries }
 }
 
+fn apply_cte_and_excluded_target_tables(
+    tables_in_scope: &mut Vec<ScopedTableRef>,
+    ctes: &[CteDefinition],
+    depth: usize,
+    excluded_target_table: Option<&str>,
+) {
+    for cte in ctes {
+        // A CTE already merged in by an earlier iteration (same name, redefined
+        // at a different scope depth) is updated in place to the applicable depth.
+        if let Some(existing_idx) = tables_in_scope
+            .iter()
+            .position(|t| t.is_cte && t.name.eq_ignore_ascii_case(&cte.name))
+        {
+            if tables_in_scope[existing_idx].depth <= cte.depth {
+                tables_in_scope[existing_idx] = ScopedTableRef {
+                    name: cte.name.clone(),
+                    alias: None,
+                    depth: cte.depth,
+                    is_cte: true,
+                };
+            }
+            continue;
+        }
+
+        // The FROM/JOIN scope collector records every relation reference as a
+        // physical table (`is_cte = false`); it does not cross-check the WITH
+        // list. So a reference to this CTE is already present, mis-flagged. Flag
+        // those references as CTEs in place — preserving their alias and depth —
+        // instead of appending a duplicate bare scope entry. Multiple references
+        // (e.g. `FROM c c1, c c2`) are all corrected.
+        let mut flagged_reference = false;
+        for table_ref in tables_in_scope.iter_mut() {
+            if !table_ref.is_cte && table_ref.name.eq_ignore_ascii_case(&cte.name) {
+                table_ref.is_cte = true;
+                flagged_reference = true;
+            }
+        }
+        if flagged_reference {
+            continue;
+        }
+
+        // The CTE is in scope but not referenced in this query's FROM; expose it
+        // as a referable relation under its bare name.
+        tables_in_scope.push(ScopedTableRef {
+            name: cte.name.clone(),
+            alias: None,
+            depth: cte.depth,
+            is_cte: true,
+        });
+    }
+
+    if let Some(excluded_target_table) = excluded_target_table {
+        let already = tables_in_scope.iter().any(|table| {
+            table.name.eq_ignore_ascii_case(excluded_target_table)
+                && table
+                    .alias
+                    .as_deref()
+                    .is_some_and(|alias| alias.eq_ignore_ascii_case("EXCLUDED"))
+        });
+        if !already {
+            tables_in_scope.push(ScopedTableRef {
+                name: excluded_target_table.to_string(),
+                alias: Some("EXCLUDED".to_string()),
+                depth,
+                is_cte: false,
+            });
+        }
+    }
+}
+
+fn apply_cte_and_excluded_target_tables_with_pos(
+    tables_in_scope: &mut Vec<TableRefDeclaredAtCursor>,
+    ctes: &[CteDefinition],
+    depth: usize,
+    excluded_target_table: Option<&str>,
+    cursor_token_len: usize,
+) {
+    for cte in ctes {
+        // A CTE already merged in by an earlier iteration (same name, redefined
+        // at a different scope depth) is updated in place to the applicable
+        // depth.
+        if let Some(existing_idx) = tables_in_scope
+            .iter()
+            .position(|t| t.table.is_cte && t.table.name.eq_ignore_ascii_case(&cte.name))
+        {
+            if tables_in_scope[existing_idx].table.depth <= cte.depth {
+                let existing_pos = tables_in_scope[existing_idx].token_start;
+                tables_in_scope[existing_idx] = TableRefDeclaredAtCursor {
+                    table: ScopedTableRef {
+                        name: cte.name.clone(),
+                        alias: None,
+                        depth: cte.depth,
+                        is_cte: true,
+                    },
+                    token_start: existing_pos,
+                };
+            }
+            continue;
+        }
+
+        // The FROM/JOIN scope collector records every relation reference as a
+        // physical table (`is_cte = false`); it does not cross-check the WITH
+        // list. So a reference to this CTE is already present, mis-flagged. Flag
+        // those references as CTEs in place — preserving their alias and depth —
+        // instead of appending a duplicate bare scope entry.
+        let mut flagged_reference = false;
+        for table_ref in tables_in_scope.iter_mut() {
+            if !table_ref.table.is_cte && table_ref.table.name.eq_ignore_ascii_case(&cte.name) {
+                table_ref.table.is_cte = true;
+                flagged_reference = true;
+            }
+        }
+        if flagged_reference {
+            continue;
+        }
+
+        // The CTE is in scope but not referenced in this query's FROM; expose
+        // it as a referable relation under its bare name.
+        tables_in_scope.push(TableRefDeclaredAtCursor {
+            table: ScopedTableRef {
+                name: cte.name.clone(),
+                alias: None,
+                depth: cte.depth,
+                is_cte: true,
+            },
+            token_start: cursor_token_len,
+        });
+    }
+
+    if let Some(excluded_target_table) = excluded_target_table {
+        let already = tables_in_scope.iter().any(|table| {
+            table.table.name.eq_ignore_ascii_case(excluded_target_table)
+                && table
+                    .table
+                    .alias
+                    .as_deref()
+                    .is_some_and(|alias| alias.eq_ignore_ascii_case("EXCLUDED"))
+        });
+        if !already {
+            tables_in_scope.push(TableRefDeclaredAtCursor {
+                table: ScopedTableRef {
+                    name: excluded_target_table.to_string(),
+                    alias: Some("EXCLUDED".to_string()),
+                    depth,
+                    is_cte: false,
+                },
+                token_start: cursor_token_len,
+            });
+        }
+    }
+}
+
 fn is_cursor_inside_cte_body(entry: &ParsedCteEntry, cursor_token_len: usize) -> bool {
     cursor_token_len >= entry.cte.body_range.start && cursor_token_len < entry.cte.body_range.end
 }
@@ -4658,8 +4800,9 @@ fn find_active_query_range(
     parsed_ctes: &[ParsedCteEntry],
     parsed_subqueries: &[ParsedSubqueryEntry],
     cursor_token_len: usize,
-) -> Option<TokenRange> {
+) -> (Option<TokenRange>, bool) {
     let mut active_range = None;
+    let mut in_set_operation_query_branch = false;
 
     let mut consider = |range: TokenRange| {
         if !token_range_contains_cursor(range, cursor_token_len) {
@@ -4731,11 +4874,12 @@ fn find_active_query_range(
         end: tokens.len(),
     });
     let branch = set_operation_branch_range(tokens, base, cursor_token_len);
-    if branch.start != 0 || branch.end != tokens.len() {
+    if branch != base {
         active_range = Some(branch);
+        in_set_operation_query_branch = true;
     }
 
-    active_range
+    (active_range, in_set_operation_query_branch)
 }
 
 /// Narrow `base` to the set-operation branch (`UNION`/`INTERSECT`/`MINUS`/
@@ -6322,19 +6466,62 @@ pub(crate) fn collect_tables_in_statement(tokens: &[SqlToken]) -> Vec<ScopedTabl
     collect_tables_deep(tokens, &[0], tokens.len()).tables
 }
 
-/// Collect tables whose declaration appears strictly before `cursor_token_len`.
-/// Used by JOIN-ON comparison suggestions so a not-yet-declared later JOIN target
-/// (e.g. `c` in `JOIN tb2 b ON a.| JOIN tb3 c ON ...`) is excluded.
+/// Collect tables from the scanned statement that are declared before
+/// `cursor_token_len`.
+///
+/// This is used for JOIN-ON comparison suggestions so a not-yet-declared later
+/// JOIN target (for example, `c` in
+/// `JOIN tb2 b ON a.| JOIN tb3 c ON ...`) is excluded from the suggestion set.
 pub(crate) fn collect_tables_in_statement_declared_before_cursor(
     tokens: &[SqlToken],
     cursor_token_len: usize,
 ) -> Vec<ScopedTableRef> {
     let scan_result = scan_cursor_context(tokens, cursor_token_len);
-    scan_result
-        .parsed_tables
-        .into_iter()
+    filter_scope_entries_declared_before_cursor(&scan_result.parsed_tables, cursor_token_len)
+}
+
+fn filter_scope_entries_declared_before_cursor(
+    parsed_tables: &[ParsedTableEntry],
+    cursor_token_len: usize,
+) -> Vec<ScopedTableRef> {
+    parsed_tables
+        .iter()
         .filter(|entry| entry.token_start < cursor_token_len)
-        .map(|entry| entry.table)
+        .map(|entry| entry.table.clone())
+        .collect()
+}
+
+fn filter_visible_scope_entries_declared_before_cursor(
+    parsed_tables: &[ParsedTableEntry],
+    visible_scope_chain: &[usize],
+    cursor_token_len: usize,
+) -> Vec<ScopedTableRef> {
+    filter_visible_scope_entries_declared_before_cursor_with_pos(
+        parsed_tables,
+        visible_scope_chain,
+        cursor_token_len,
+    )
+    .into_iter()
+    .map(|entry| entry.table)
+    .collect()
+}
+
+fn filter_visible_scope_entries_declared_before_cursor_with_pos(
+    parsed_tables: &[ParsedTableEntry],
+    visible_scope_chain: &[usize],
+    cursor_token_len: usize,
+) -> Vec<TableRefDeclaredAtCursor> {
+    let visible_scope_ids: HashSet<usize> = visible_scope_chain.iter().copied().collect();
+
+    parsed_tables
+        .iter()
+        .filter(|entry| {
+            visible_scope_ids.contains(&entry.scope_id) && entry.token_start < cursor_token_len
+        })
+        .map(|entry| TableRefDeclaredAtCursor {
+            table: entry.table.clone(),
+            token_start: entry.token_start,
+        })
         .collect()
 }
 

@@ -747,6 +747,10 @@ impl DatabaseType {
         self == expected
     }
 
+    pub(crate) fn is_mysql_or_mariadb(self) -> bool {
+        self == Self::MySQL || self == Self::MariaDB
+    }
+
     pub fn from_cache_key(raw: u8) -> Self {
         Self::supported()
             .iter()

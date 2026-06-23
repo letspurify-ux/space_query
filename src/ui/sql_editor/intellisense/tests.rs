@@ -7046,6 +7046,538 @@ fn qualified_condition_comparison_suggestions_skip_tables_declared_after_cursor_
 }
 
 #[test]
+fn auto_join_condition_is_scoped_to_declared_join_side_only() {
+    use crate::ui::intellisense::ForeignKeyMeta;
+    use crate::ui::intellisense_context::ScopedTableRef;
+
+    let deep_ctx = analyze_inline_cursor_sql(
+        "SELECT * FROM dept d JOIN emp e ON d.| JOIN bonus b ON b.empno = e.empno",
+    );
+
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["DEPT".to_string(), "EMP".to_string(), "BONUS".to_string()];
+    data.rebuild_indices();
+    data.set_foreign_keys_for_table(
+        "EMP",
+        vec![ForeignKeyMeta {
+            columns: vec!["DEPTNO".to_string()],
+            ref_table: "DEPT".to_string(),
+            ref_columns: vec!["DEPTNO".to_string()],
+        }],
+    );
+    data.set_foreign_keys_for_table(
+        "BONUS",
+        vec![ForeignKeyMeta {
+            columns: vec!["EMPNO".to_string()],
+            ref_table: "EMP".to_string(),
+            ref_columns: vec!["EMPNO".to_string()],
+        }],
+    );
+
+    let all_scope_tables: Vec<&ScopedTableRef> = deep_ctx
+        .tables_in_scope
+        .iter()
+        .filter(|table| !table.is_cte)
+        .collect();
+    let all_scope_condition = {
+        if let [lefts @ .., right] = all_scope_tables.as_slice() {
+            SqlEditorWidget::build_auto_join_condition(&data, right, lefts)
+        } else {
+            None
+        }
+    };
+
+    let scoped_tables = SqlEditorWidget::auto_join_condition_tables_for_context(&deep_ctx);
+    let scoped_refs: Vec<&ScopedTableRef> = scoped_tables.iter().collect();
+    let scoped_condition = {
+        if let [lefts @ .., right] = scoped_refs.as_slice() {
+            SqlEditorWidget::build_auto_join_condition(&data, right, lefts)
+        } else {
+            None
+        }
+    };
+
+    assert_eq!(
+        all_scope_condition.as_deref(),
+        Some("b.EMPNO = e.EMPNO"),
+        "legacy all-scope path leaks the trailing join table",
+    );
+    assert_eq!(
+        scoped_condition.as_deref(),
+        Some("e.DEPTNO = d.DEPTNO"),
+        "auto join condition should use only already-declared join peers",
+    );
+}
+
+#[test]
+fn auto_join_condition_ignores_tables_from_unrelated_cte_body() {
+    let deep_ctx = analyze_inline_cursor_sql(
+        "WITH cte AS (SELECT * FROM secret_tbl s) SELECT * FROM main_tbl m JOIN other_tbl o ON m.|",
+    );
+
+    let mut data = IntellisenseData::new();
+    data.tables = vec![
+        "MAIN_TBL".to_string(),
+        "OTHER_TBL".to_string(),
+        "SECRET_TBL".to_string(),
+    ];
+    data.rebuild_indices();
+    data.set_foreign_keys_for_table(
+        "OTHER_TBL",
+        vec![crate::ui::intellisense::ForeignKeyMeta {
+            columns: vec!["ID".to_string()],
+            ref_table: "MAIN_TBL".to_string(),
+            ref_columns: vec!["ID".to_string()],
+        }],
+    );
+    data.set_columns_for_table("MAIN_TBL", vec!["ID".to_string()]);
+    data.set_columns_for_table("OTHER_TBL", vec!["ID".to_string()]);
+    data.set_columns_for_table("SECRET_TBL", vec!["ID".to_string()]);
+
+    let comparison_suggestions = SqlEditorWidget::collect_qualified_condition_comparison_suggestions(
+        &data,
+        "",
+        "m",
+        &deep_ctx,
+    );
+    assert!(
+        comparison_suggestions.iter().any(|s| s.eq_ignore_ascii_case("m.id = o.id")),
+        "ON-completion must still use join peers, got: {comparison_suggestions:?}",
+    );
+    assert!(
+        !comparison_suggestions
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case("m.id = s.id") || s.eq_ignore_ascii_case("m.id = secret_tbl.id")),
+        "tables declared only inside a CTE body must not be used in JOIN condition suggestions: {comparison_suggestions:?}",
+    );
+
+    let scoped_tables = SqlEditorWidget::auto_join_condition_tables_for_context(&deep_ctx);
+    let scoped_names: Vec<String> = scoped_tables
+        .iter()
+        .map(|table| table.name.to_ascii_uppercase())
+        .collect();
+    assert!(
+        scoped_names.iter().any(|name| name == "MAIN_TBL"),
+        "expected join-eligible left side main table, got {scoped_names:?}"
+    );
+    assert!(
+        scoped_names.iter().any(|name| name == "OTHER_TBL"),
+        "expected join-eligible right side join table, got {scoped_names:?}"
+    );
+    assert!(
+        !scoped_names.iter().any(|name| name == "SECRET_TBL"),
+        "CTE-body table should not participate in JOIN-ON condition scope: {scoped_names:?}"
+    );
+}
+
+#[test]
+fn auto_join_condition_ignores_later_set_operator_tables_in_first_branch() {
+    use crate::ui::intellisense::ForeignKeyMeta;
+    use crate::ui::intellisense_context::ScopedTableRef;
+
+    let deep_ctx = analyze_inline_cursor_sql(
+        "SELECT * FROM dept d JOIN emp e ON d.id = e.id WHERE d.| \
+         UNION ALL SELECT bonus b JOIN payroll p ON p.id = b.emp_id",
+    );
+
+    let mut data = IntellisenseData::new();
+    data.tables = vec![
+        "DEPT".to_string(),
+        "EMP".to_string(),
+        "BONUS".to_string(),
+        "PAYROLL".to_string(),
+    ];
+    data.rebuild_indices();
+    data.set_foreign_keys_for_table(
+        "EMP",
+        vec![ForeignKeyMeta {
+            columns: vec!["DEPTNO".to_string()],
+            ref_table: "DEPT".to_string(),
+            ref_columns: vec!["DEPTNO".to_string()],
+        }],
+    );
+
+    let scoped_tables = SqlEditorWidget::auto_join_condition_tables_for_context(&deep_ctx);
+    let scoped_refs: Vec<&ScopedTableRef> = scoped_tables.iter().collect();
+    let scoped_condition = {
+        if let [lefts @ .., right] = scoped_refs.as_slice() {
+            SqlEditorWidget::build_auto_join_condition(&data, right, lefts)
+        } else {
+            None
+        }
+    };
+
+    assert_eq!(
+        scoped_condition.as_deref(),
+        Some("e.DEPTNO = d.DEPTNO"),
+        "first-branch JOIN ON should not include later UNION tables in auto-join: {:?}",
+        scoped_condition,
+    );
+}
+
+#[test]
+fn qualified_condition_comparison_suggestions_skip_set_operator_branch_tables() {
+    let deep_ctx = analyze_inline_cursor_sql(
+        "SELECT * FROM main_tbl m \
+         UNION \
+         SELECT a.id FROM aux_tbl a JOIN ref_tbl r ON a.id = r.id WHERE a.|",
+    );
+
+    let mut data = IntellisenseData::new();
+    data.tables = vec![
+        "MAIN_TBL".to_string(),
+        "AUX_TBL".to_string(),
+        "REF_TBL".to_string(),
+    ];
+    data.rebuild_indices();
+    data.set_columns_for_table("MAIN_TBL", vec!["ID".to_string()]);
+    data.set_columns_for_table("AUX_TBL", vec!["ID".to_string()]);
+    data.set_columns_for_table("REF_TBL", vec!["ID".to_string()]);
+
+    let comparison_suggestions = SqlEditorWidget::collect_qualified_condition_comparison_suggestions(
+        &data,
+        "",
+        "a",
+        &deep_ctx,
+    );
+
+    assert!(
+        comparison_suggestions.iter().any(|s| s.eq_ignore_ascii_case("a.id = r.id")),
+        "current-branch join peer should be suggested, got: {comparison_suggestions:?}",
+    );
+    assert!(
+        !comparison_suggestions
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case("a.id = m.id")),
+        "tables from earlier UNION branch should not be offered: {comparison_suggestions:?}",
+    );
+
+    let lookup_tables = SqlEditorWidget::comparison_lookup_tables_for_context(Some("a"), &deep_ctx);
+    assert!(
+        lookup_tables.iter().any(|t| t.eq_ignore_ascii_case("AUX_TBL")),
+        "lookup tables should include current branch left table: {lookup_tables:?}"
+    );
+    assert!(
+        lookup_tables.iter().any(|t| t.eq_ignore_ascii_case("REF_TBL")),
+        "lookup tables should include current branch right table: {lookup_tables:?}"
+    );
+    assert!(
+        !lookup_tables
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case("MAIN_TBL")),
+        "earlier UNION branch table must not be a lookup table: {lookup_tables:?}"
+    );
+}
+
+#[test]
+fn qualified_condition_comparison_suggestions_skip_set_operator_branch_tables_in_first_operand() {
+    let deep_ctx = analyze_inline_cursor_sql(
+        "SELECT m.id FROM main_tbl m JOIN aux_tbl a ON m.id = a.id WHERE m.| \
+         UNION ALL SELECT b.id FROM branch_tbl b JOIN ref_tbl r ON b.id = r.id",
+    );
+
+    let mut data = IntellisenseData::new();
+    data.tables = vec![
+        "MAIN_TBL".to_string(),
+        "AUX_TBL".to_string(),
+        "BRANCH_TBL".to_string(),
+        "REF_TBL".to_string(),
+    ];
+    data.rebuild_indices();
+    data.set_columns_for_table("MAIN_TBL", vec!["ID".to_string()]);
+    data.set_columns_for_table("AUX_TBL", vec!["ID".to_string()]);
+    data.set_columns_for_table("BRANCH_TBL", vec!["ID".to_string()]);
+    data.set_columns_for_table("REF_TBL", vec!["ID".to_string()]);
+
+    let comparison_suggestions = SqlEditorWidget::collect_qualified_condition_comparison_suggestions(
+        &data,
+        "",
+        "m",
+        &deep_ctx,
+    );
+
+    assert!(
+        comparison_suggestions.iter().any(|s| s.eq_ignore_ascii_case("m.id = a.id")),
+        "first-operand UNION branch JOIN peer should be suggested, got: {comparison_suggestions:?}",
+    );
+    assert!(
+        !comparison_suggestions
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case("m.id = b.id") || s.eq_ignore_ascii_case("m.id = r.id")),
+        "later UNION branch tables must not be offered: {comparison_suggestions:?}",
+    );
+
+    let lookup_tables = SqlEditorWidget::comparison_lookup_tables_for_context(Some("m"), &deep_ctx);
+    assert!(
+        lookup_tables.iter().any(|t| t.eq_ignore_ascii_case("MAIN_TBL")),
+        "lookup tables should include current-operand left table: {lookup_tables:?}"
+    );
+    assert!(
+        lookup_tables.iter().any(|t| t.eq_ignore_ascii_case("AUX_TBL")),
+        "lookup tables should include current-operand join table: {lookup_tables:?}"
+    );
+    assert!(
+        !lookup_tables
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case("BRANCH_TBL")),
+        "later UNION branch table must not be a lookup table: {lookup_tables:?}"
+    );
+}
+
+#[test]
+fn qualified_condition_comparison_suggestions_skip_set_operator_all_branch_tables() {
+    let deep_ctx = analyze_inline_cursor_sql(
+        "SELECT * FROM main_tbl m \
+         UNION ALL \
+         SELECT a.id FROM aux_tbl a JOIN ref_tbl r ON a.id = r.id WHERE a.|",
+    );
+
+    let mut data = IntellisenseData::new();
+    data.tables = vec![
+        "MAIN_TBL".to_string(),
+        "AUX_TBL".to_string(),
+        "REF_TBL".to_string(),
+    ];
+    data.rebuild_indices();
+    data.set_columns_for_table("MAIN_TBL", vec!["ID".to_string()]);
+    data.set_columns_for_table("AUX_TBL", vec!["ID".to_string()]);
+    data.set_columns_for_table("REF_TBL", vec!["ID".to_string()]);
+
+    let comparison_suggestions = SqlEditorWidget::collect_qualified_condition_comparison_suggestions(
+        &data,
+        "",
+        "a",
+        &deep_ctx,
+    );
+
+    assert!(
+        comparison_suggestions.iter().any(|s| s.eq_ignore_ascii_case("a.id = r.id")),
+        "current-branch join peer should be suggested, got: {comparison_suggestions:?}",
+    );
+    assert!(
+        !comparison_suggestions
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case("a.id = m.id")),
+        "tables from earlier UNION ALL branch should not be offered: {comparison_suggestions:?}",
+    );
+
+    let lookup_tables = SqlEditorWidget::comparison_lookup_tables_for_context(Some("a"), &deep_ctx);
+    assert!(
+        lookup_tables.iter().any(|t| t.eq_ignore_ascii_case("AUX_TBL")),
+        "lookup tables should include current branch left table: {lookup_tables:?}"
+    );
+    assert!(
+        lookup_tables.iter().any(|t| t.eq_ignore_ascii_case("REF_TBL")),
+        "lookup tables should include current branch right table: {lookup_tables:?}"
+    );
+    assert!(
+        !lookup_tables
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case("MAIN_TBL")),
+        "earlier UNION ALL branch table must not be a lookup table: {lookup_tables:?}"
+    );
+}
+
+#[test]
+fn qualified_condition_comparison_suggestions_keep_outer_scope_table_in_set_operation_subquery_branch() {
+    let deep_ctx = analyze_inline_cursor_sql(
+        "SELECT o.id FROM outer_tbl o \
+         WHERE o.id IN (SELECT a.id FROM aux_tbl a \
+         UNION ALL SELECT b.id FROM branch_tbl b WHERE b.id = o.|)",
+    );
+
+    let mut data = IntellisenseData::new();
+    data.tables = vec![
+        "OUTER_TBL".to_string(),
+        "AUX_TBL".to_string(),
+        "BRANCH_TBL".to_string(),
+    ];
+    data.rebuild_indices();
+    data.set_columns_for_table("OUTER_TBL", vec!["ID".to_string()]);
+    data.set_columns_for_table("AUX_TBL", vec!["ID".to_string()]);
+    data.set_columns_for_table("BRANCH_TBL", vec!["ID".to_string()]);
+
+    let comparison_suggestions = SqlEditorWidget::collect_qualified_condition_comparison_suggestions(
+        &data,
+        "",
+        "b",
+        &deep_ctx,
+    );
+
+    assert!(
+        comparison_suggestions.iter().any(|s| s.eq_ignore_ascii_case("b.id = o.id")),
+        "outer-scope table should be used for comparison, got: {comparison_suggestions:?}",
+    );
+    assert!(
+        !comparison_suggestions
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case("b.id = a.id")),
+        "sibling UNION branch table should not be offered: {comparison_suggestions:?}",
+    );
+
+    let lookup_tables = SqlEditorWidget::comparison_lookup_tables_for_context(Some("b"), &deep_ctx);
+    assert!(
+        lookup_tables.iter().any(|t| t.eq_ignore_ascii_case("BRANCH_TBL")),
+        "lookup tables should include current branch table: {lookup_tables:?}"
+    );
+    assert!(
+        lookup_tables.iter().any(|t| t.eq_ignore_ascii_case("OUTER_TBL")),
+        "lookup tables should include outer scope table: {lookup_tables:?}"
+    );
+    assert!(
+        !lookup_tables
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case("AUX_TBL")),
+        "earlier UNION branch table should not be in lookup tables: {lookup_tables:?}"
+    );
+}
+
+#[test]
+fn qualified_condition_comparison_suggestions_skip_nested_set_operator_outer_branch_tables() {
+    let deep_ctx = analyze_inline_cursor_sql(
+        "SELECT * FROM main_tbl m \
+         UNION \
+         SELECT * FROM (SELECT a.id FROM aux_tbl a JOIN ref_tbl r ON a.id = r.id WHERE a.|) q",
+    );
+
+    let mut data = IntellisenseData::new();
+    data.tables = vec![
+        "MAIN_TBL".to_string(),
+        "AUX_TBL".to_string(),
+        "REF_TBL".to_string(),
+    ];
+    data.rebuild_indices();
+    data.set_columns_for_table("MAIN_TBL", vec!["ID".to_string()]);
+    data.set_columns_for_table("AUX_TBL", vec!["ID".to_string()]);
+    data.set_columns_for_table("REF_TBL", vec!["ID".to_string()]);
+
+    let comparison_suggestions = SqlEditorWidget::collect_qualified_condition_comparison_suggestions(
+        &data,
+        "",
+        "a",
+        &deep_ctx,
+    );
+
+    assert!(
+        comparison_suggestions.iter().any(|s| s.eq_ignore_ascii_case("a.id = r.id")),
+        "nested-branch join peer should be suggested, got: {comparison_suggestions:?}",
+    );
+    assert!(
+        !comparison_suggestions
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case("a.id = m.id")),
+        "outer UNION branch table should not be offered in nested subquery context: {comparison_suggestions:?}",
+    );
+
+    let lookup_tables = SqlEditorWidget::comparison_lookup_tables_for_context(Some("a"), &deep_ctx);
+    assert!(
+        lookup_tables.iter().any(|t| t.eq_ignore_ascii_case("AUX_TBL")),
+        "lookup tables should include nested-query left table: {lookup_tables:?}"
+    );
+    assert!(
+        lookup_tables.iter().any(|t| t.eq_ignore_ascii_case("REF_TBL")),
+        "lookup tables should include nested-query right table: {lookup_tables:?}"
+    );
+    assert!(
+        !lookup_tables
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case("MAIN_TBL")),
+        "outer UNION branch table must not be a lookup table in nested context: {lookup_tables:?}"
+    );
+}
+
+#[test]
+fn qualified_condition_comparison_suggestions_skip_unrelated_cte_body_tables() {
+    let deep_ctx = analyze_inline_cursor_sql(
+        "WITH cte AS (SELECT * FROM secret_tbl s) \
+         SELECT * FROM main_tbl m JOIN aux_tbl a ON m.id = a.id WHERE m.|",
+    );
+
+    let mut data = IntellisenseData::new();
+    data.tables = vec![
+        "MAIN_TBL".to_string(),
+        "AUX_TBL".to_string(),
+        "SECRET_TBL".to_string(),
+    ];
+    data.rebuild_indices();
+    data.set_columns_for_table("MAIN_TBL", vec!["ID".to_string()]);
+    data.set_columns_for_table("AUX_TBL", vec!["ID".to_string()]);
+    data.set_columns_for_table("SECRET_TBL", vec!["ID".to_string()]);
+
+    let comparison_suggestions = SqlEditorWidget::collect_qualified_condition_comparison_suggestions(
+        &data,
+        "",
+        "m",
+        &deep_ctx,
+    );
+    assert!(
+        comparison_suggestions.iter().any(|s| s.eq_ignore_ascii_case("m.id = a.id")),
+        "WHERE-clause suggestion should still use join peers, got: {comparison_suggestions:?}",
+    );
+    assert!(
+        !comparison_suggestions
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case("m.id = s.id") || s.eq_ignore_ascii_case("m.id = secret_tbl.id")),
+        "CTE-body tables must not be proposed in non-JOIN conditions: {comparison_suggestions:?}",
+    );
+
+    let lookup_tables = SqlEditorWidget::comparison_lookup_tables_for_context(Some("m"), &deep_ctx);
+    assert!(
+        lookup_tables.iter().any(|t| t.eq_ignore_ascii_case("MAIN_TBL")),
+        "lookup tables should include left side table, got {lookup_tables:?}"
+    );
+    assert!(
+        lookup_tables.iter().any(|t| t.eq_ignore_ascii_case("AUX_TBL")),
+        "lookup tables should include peer table, got {lookup_tables:?}"
+    );
+    assert!(
+        !lookup_tables
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case("SECRET_TBL")),
+        "CTE-body table should not be in lookup tables: {lookup_tables:?}"
+    );
+}
+
+#[test]
+fn auto_join_condition_stays_cursor_scoped_inside_nested_query() {
+    use crate::ui::intellisense::ForeignKeyMeta;
+    use crate::ui::intellisense_context::ScopedTableRef;
+
+    let deep_ctx = analyze_inline_cursor_sql(
+        "SELECT * FROM (SELECT * FROM dept d JOIN emp e ON d.| JOIN bonus b ON b.empno = e.empno) x",
+    );
+
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["DEPT".to_string(), "EMP".to_string(), "BONUS".to_string()];
+    data.rebuild_indices();
+    data.set_foreign_keys_for_table(
+        "EMP",
+        vec![ForeignKeyMeta {
+            columns: vec!["DEPTNO".to_string()],
+            ref_table: "DEPT".to_string(),
+            ref_columns: vec!["DEPTNO".to_string()],
+        }],
+    );
+
+    let scoped_tables = SqlEditorWidget::auto_join_condition_tables_for_context(&deep_ctx);
+    let scoped_refs: Vec<&ScopedTableRef> = scoped_tables.iter().collect();
+    let scoped_condition = {
+        if let [lefts @ .., right] = scoped_refs.as_slice() {
+            SqlEditorWidget::build_auto_join_condition(&data, right, lefts)
+        } else {
+            None
+        }
+    };
+
+    assert_eq!(
+        scoped_condition.as_deref(),
+        Some("e.DEPTNO = d.DEPTNO"),
+        "nested-query JOIN ON should respect cursor-aware joined peers: {:?}",
+        scoped_condition,
+    );
+}
+
+#[test]
 fn qualified_condition_comparison_suggestions_skip_later_join_inside_derived_subquery() {
     let deep_ctx = analyze_inline_cursor_sql(
         "SELECT * FROM (SELECT * FROM tb1 a JOIN tb2 b ON a.| JOIN tb3 c ON 1=1) x",

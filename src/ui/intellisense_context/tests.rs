@@ -34,6 +34,13 @@ fn table_names(ctx: &CursorContext) -> Vec<String> {
         .collect()
 }
 
+fn table_names_before_cursor(ctx: &CursorContext) -> Vec<String> {
+    ctx.tables_in_scope_before_cursor
+        .iter()
+        .map(|t| t.name.to_uppercase())
+        .collect()
+}
+
 fn cte_names(ctx: &CursorContext) -> Vec<String> {
     ctx.ctes.iter().map(|c| c.name.to_uppercase()).collect()
 }
@@ -149,6 +156,29 @@ fn phase_join_on_clause() {
     let ctx = analyze("SELECT a FROM t1 JOIN t2 ON |");
     assert_eq!(ctx.phase, SqlPhase::JoinCondition);
     assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn tables_in_scope_before_cursor_excludes_tables_declared_after_cursor_in_join_chain() {
+    let ctx = analyze("SELECT * FROM a_tbl a JOIN b_tbl b ON a.id = | JOIN c_tbl c ON c.id = a.id");
+
+    let names = table_names_before_cursor(&ctx);
+    assert!(names.iter().any(|name| name == "A_TBL"));
+    assert!(names.iter().any(|name| name == "B_TBL"));
+    assert!(!names.iter().any(|name| name == "C_TBL"));
+    assert_eq!(names.len(), 2);
+}
+
+#[test]
+fn tables_in_scope_before_cursor_skips_nonvisible_scope_tables() {
+    let ctx = analyze(
+        "SELECT * FROM (SELECT * FROM hidden h_tbl) subq JOIN outer_tbl o_tbl ON o_tbl.id = |",
+    );
+
+    let names = table_names_before_cursor(&ctx);
+    assert!(names.iter().any(|name| name == "SUBQ"));
+    assert!(names.iter().any(|name| name == "OUTER_TBL"));
+    assert!(!names.iter().any(|name| name == "HIDDEN"));
 }
 
 #[test]
@@ -2916,6 +2946,92 @@ fn union_resets_phase_for_second_select() {
     let ctx = analyze("SELECT a FROM t1 UNION ALL SELECT | FROM t2");
     assert_eq!(ctx.phase, SqlPhase::SelectList);
     assert_eq!(ctx.depth, 0);
+}
+
+#[test]
+fn set_operation_query_sets_branch_context_flag() {
+    let first_ctx = analyze("SELECT | FROM t1 UNION ALL SELECT a FROM t2");
+    let second_ctx = analyze("SELECT a FROM t1 UNION ALL SELECT | FROM t2");
+
+    assert!(first_ctx.in_set_operation_query_branch);
+    assert!(second_ctx.in_set_operation_query_branch);
+}
+
+#[test]
+fn tables_in_scope_before_cursor_in_set_operator_branch_excludes_other_branch() {
+    let ctx =
+        analyze("SELECT main.id FROM main_tbl m UNION ALL SELECT aux.id FROM aux_tbl a WHERE a.|");
+
+    let names = table_names_before_cursor(&ctx);
+
+    assert!(
+        names.iter().any(|name| name == "AUX_TBL"),
+        "current set-operator branch tables should remain in scope: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|name| name == "MAIN_TBL"),
+        "left branch table must not leak into right-branch cursor scope: {names:?}"
+    );
+}
+
+#[test]
+fn tables_in_scope_before_cursor_in_set_operator_first_branch_excludes_later_branch() {
+    let ctx = analyze(
+        "SELECT main.id FROM main_tbl m JOIN aux_tbl a ON main.id = a.id WHERE m.| UNION ALL \
+         SELECT aux2.id FROM aux_tbl_2 a2",
+    );
+
+    let names = table_names_before_cursor(&ctx);
+
+    assert!(
+        names.iter().any(|name| name == "MAIN_TBL"),
+        "current first-branch table must be present: {names:?}"
+    );
+    assert!(
+        names.iter().any(|name| name == "AUX_TBL"),
+        "current first-branch table should stay in scope: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|name| name == "AUX_TBL_2"),
+        "later UNION branch table must not leak into first-branch cursor scope: {names:?}"
+    );
+}
+
+#[test]
+fn tables_in_scope_before_cursor_in_nested_set_operator_keeps_outer_scope() {
+    let ctx = analyze(
+        "SELECT o.id FROM outer_tbl o WHERE o.id IN (SELECT a.id FROM aux_tbl a \
+         UNION ALL SELECT b.id FROM branch_tbl b WHERE b.|)",
+    );
+
+    let names = table_names_before_cursor(&ctx);
+
+    assert!(
+        names.iter().any(|name| name == "BRANCH_TBL"),
+        "nested set-operator branch table should remain in scope: {names:?}"
+    );
+    assert!(
+        names.iter().any(|name| name == "OUTER_TBL"),
+        "outer query scope should be preserved inside nested set-operator branch: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|name| name == "AUX_TBL"),
+        "outer sibling set-operator branch table should be excluded: {names:?}"
+    );
+}
+
+#[test]
+fn set_operation_query_flag_remains_false_in_nested_non_set_context() {
+    let outer_ctx = analyze("SELECT * FROM (SELECT c FROM child) q WHERE c IN (SELECT | FROM t2)");
+
+    assert!(!outer_ctx.in_set_operation_query_branch);
+}
+
+#[test]
+fn non_set_query_does_not_set_branch_context_flag() {
+    let ctx = analyze("SELECT a FROM t1 WHERE a = |");
+
+    assert!(!ctx.in_set_operation_query_branch);
 }
 
 #[test]

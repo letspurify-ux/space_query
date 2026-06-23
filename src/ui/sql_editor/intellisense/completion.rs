@@ -801,11 +801,14 @@ fn extract_field_keywords_for(
         "YEAR_MONTH",
     ];
 
+    let db_type = match db_type {
+        Some(db_type) => db_type,
+        None => DatabaseType::Oracle,
+    };
     match db_type {
-        None => ORACLE_FIELDS,
-        Some(DatabaseType::Oracle) => ORACLE_FIELDS,
-        Some(DatabaseType::MySQL) => MYSQL_FIELDS,
-        Some(DatabaseType::MariaDB) => MYSQL_FIELDS,
+        DatabaseType::Oracle => ORACLE_FIELDS,
+        DatabaseType::MySQL => MYSQL_FIELDS,
+        DatabaseType::MariaDB => MYSQL_FIELDS,
     }
 }
 
@@ -823,22 +826,25 @@ fn interval_unit_keywords_for(
     const ORACLE_TRAILING_UNITS: &[&str] = &["MONTH", "HOUR", "MINUTE", "SECOND"];
     const TO_KEYWORD: &[&str] = &["TO"];
 
+    let db_type = match db_type {
+        Some(db_type) => db_type,
+        None => DatabaseType::Oracle,
+    };
+
     match slot {
         IntervalUnitSlot::Leading => match db_type {
-            None => ORACLE_LEADING_UNITS,
-            Some(DatabaseType::Oracle) => ORACLE_LEADING_UNITS,
+            DatabaseType::Oracle => ORACLE_LEADING_UNITS,
             // MySQL's quoted interval reuses the same datetime unit names as
             // EXTRACT (including compound units like `DAY_HOUR`).
-            Some(DatabaseType::MySQL) => extract_field_keywords_for(db_type),
-            Some(DatabaseType::MariaDB) => extract_field_keywords_for(db_type),
+            DatabaseType::MySQL => extract_field_keywords_for(Some(db_type)),
+            DatabaseType::MariaDB => extract_field_keywords_for(Some(db_type)),
         },
         IntervalUnitSlot::AwaitingTo => match db_type {
-            None => TO_KEYWORD,
-            Some(DatabaseType::Oracle) => TO_KEYWORD,
+            DatabaseType::Oracle => TO_KEYWORD,
             // No `TO` qualifier in a MySQL interval — suppress columns but offer
             // nothing rather than a wrong keyword.
-            Some(DatabaseType::MySQL) => &[],
-            Some(DatabaseType::MariaDB) => &[],
+            DatabaseType::MySQL => &[],
+            DatabaseType::MariaDB => &[],
         },
         IntervalUnitSlot::Trailing => ORACLE_TRAILING_UNITS,
     }
@@ -848,15 +854,11 @@ fn order_by_sort_modifier_keywords(
     slot: OrderBySortModifierSlot,
     db_type: Option<crate::db::DatabaseType>,
 ) -> &'static [&'static str] {
-    use crate::db::DatabaseType;
-
     // MySQL/MariaDB have no `NULLS FIRST/LAST` syntax, so the null-ordering
     // modifiers are pure noise there. Oracle (and the dialect-agnostic default)
     // keep them.
-    let supports_nulls_ordering = !matches!(
-        db_type,
-        Some(DatabaseType::MySQL) | Some(DatabaseType::MariaDB)
-    );
+    let supports_nulls_ordering =
+        !db_type.is_some_and(DatabaseType::is_mysql_or_mariadb);
 
     match slot {
         OrderBySortModifierSlot::AfterSortKey => {
@@ -882,14 +884,9 @@ fn window_order_by_sort_modifier_keywords(
     slot: WindowOrderBySortModifierSlot,
     db_type: Option<crate::db::DatabaseType>,
 ) -> &'static [&'static str] {
-    use crate::db::DatabaseType;
-
     // MySQL/MariaDB window functions support neither `NULLS FIRST/LAST` ordering
     // nor the `GROUPS` frame unit (only `ROWS`/`RANGE`), so both are noise there.
-    let mysql = matches!(
-        db_type,
-        Some(DatabaseType::MySQL) | Some(DatabaseType::MariaDB)
-    );
+    let mysql = db_type.is_some_and(DatabaseType::is_mysql_or_mariadb);
 
     match slot {
         WindowOrderBySortModifierSlot::AfterSortKey => {
@@ -2452,12 +2449,10 @@ impl SqlEditorWidget {
         if qualifier.is_none()
             && matches!(deep_ctx.phase, intellisense_context::SqlPhase::JoinCondition)
         {
-            let real_tables: Vec<&intellisense_context::ScopedTableRef> = deep_ctx
-                .tables_in_scope
-                .iter()
-                .filter(|table| !table.is_cte)
-                .collect();
-            if let [lefts @ .., right] = real_tables.as_slice() {
+            let real_tables = Self::auto_join_condition_tables_for_context(deep_ctx);
+            let real_table_refs: Vec<&intellisense_context::ScopedTableRef> =
+                real_tables.iter().collect();
+            if let [lefts @ .., right] = real_table_refs.as_slice() {
                 if !lefts.is_empty() {
                     // Foreign keys are loaded lazily (only here, when a JOIN is
                     // actually being written) to keep ordinary column
@@ -8248,7 +8243,10 @@ impl SqlEditorWidget {
         qualifier: &str,
         deep_ctx: &intellisense_context::CursorContext,
     ) -> bool {
-        deep_ctx.tables_in_scope.iter().any(|table_ref| {
+        deep_ctx
+            .tables_in_scope
+            .iter()
+            .any(|table_ref| {
             Self::completion_identifiers_match(&table_ref.name, qualifier)
                 || table_ref
                     .alias
@@ -8917,9 +8915,7 @@ impl SqlEditorWidget {
                 }
             }
         }
-        let Some(verb) = verb else {
-            return None;
-        };
+        let verb = verb?;
         // Inside an open privilege column list (`GRANT UPDATE (c, |`) the comma is
         // a column separator, not a privilege separator: the slot names a column
         // of the (not-yet-known) object, so defer to the catalog rather than
@@ -13975,7 +13971,8 @@ impl SqlEditorWidget {
             }
         }
 
-        let has = |option: &str| present.iter().any(|seen| *seen == option);
+        let present: std::collections::HashSet<&str> = present.iter().copied().collect();
+        let has = |option: &str| present.contains(option);
         let mut remaining: Vec<&'static str> = Vec::new();
         if !has("START WITH") {
             remaining.push("START WITH");
@@ -24549,47 +24546,56 @@ impl SqlEditorWidget {
             .join(" AND ")
     }
 
-    /// Build an FK-based join condition (e.g. `e.DEPTNO = d.DEPTNO`) between the
-    /// most-recently joined table (`right`) and an earlier table in scope, when
-    /// a foreign key relates them in either direction. Returns the condition
-    /// expression without the `ON` keyword. Prefers the nearest preceding table.
+    /// Build an FK-based join condition (e.g. `e.DEPTNO = d.DEPTNO`) between
+    /// the nearest right-hand table candidate and an earlier table in scope,
+    /// when a foreign key relates them in either direction. Returns the condition
+    /// expression without the `ON` keyword. Prefers the nearest feasible pair.
     fn build_auto_join_condition(
         data: &IntellisenseData,
         right: &intellisense_context::ScopedTableRef,
         lefts: &[&intellisense_context::ScopedTableRef],
     ) -> Option<String> {
-        let right_q = Self::auto_join_qualifier(right);
-        for left in lefts.iter().rev() {
-            let left_q = Self::auto_join_qualifier(left);
+        if lefts.is_empty() {
+            return None;
+        }
 
-            if let Some(fks) = data.get_foreign_keys(&right.name) {
-                for fk in fks {
-                    if Self::auto_join_tables_match(&fk.ref_table, &left.name)
-                        && !fk.columns.is_empty()
-                        && fk.columns.len() == fk.ref_columns.len()
-                    {
-                        return Some(Self::format_auto_join_pairs(
-                            &right_q,
-                            &fk.columns,
-                            &left_q,
-                            &fk.ref_columns,
-                        ));
+        let all_tables = lefts.iter().copied().chain(std::iter::once(right)).collect::<Vec<_>>();
+        for right_index in (1..all_tables.len()).rev() {
+            let right = all_tables[right_index];
+            let right_q = Self::auto_join_qualifier(right);
+
+            for left in all_tables[..right_index].iter().rev() {
+                let left_q = Self::auto_join_qualifier(left);
+
+                if let Some(fks) = data.get_foreign_keys(&right.name) {
+                    for fk in fks {
+                        if Self::auto_join_tables_match(&fk.ref_table, &left.name)
+                            && !fk.columns.is_empty()
+                            && fk.columns.len() == fk.ref_columns.len()
+                        {
+                            return Some(Self::format_auto_join_pairs(
+                                &right_q,
+                                &fk.columns,
+                                &left_q,
+                                &fk.ref_columns,
+                            ));
+                        }
                     }
                 }
-            }
 
-            if let Some(fks) = data.get_foreign_keys(&left.name) {
-                for fk in fks {
-                    if Self::auto_join_tables_match(&fk.ref_table, &right.name)
-                        && !fk.columns.is_empty()
-                        && fk.columns.len() == fk.ref_columns.len()
-                    {
-                        return Some(Self::format_auto_join_pairs(
-                            &left_q,
-                            &fk.columns,
-                            &right_q,
-                            &fk.ref_columns,
-                        ));
+                if let Some(fks) = data.get_foreign_keys(&left.name) {
+                    for fk in fks {
+                        if Self::auto_join_tables_match(&fk.ref_table, &right.name)
+                            && !fk.columns.is_empty()
+                            && fk.columns.len() == fk.ref_columns.len()
+                        {
+                            return Some(Self::format_auto_join_pairs(
+                                &left_q,
+                                &fk.columns,
+                                &right_q,
+                                &fk.ref_columns,
+                            ));
+                        }
                     }
                 }
             }
@@ -25316,29 +25322,51 @@ impl SqlEditorWidget {
             .unwrap_or(deep_ctx.cursor_token_len)
     }
 
-    fn previous_meaningful_token_before_index(
-        tokens: &[SqlToken],
-        idx: usize,
-    ) -> Option<&SqlToken> {
-        tokens
-            .get(..idx.min(tokens.len()))?
-            .iter()
-            .rev()
-            .find(|token| !matches!(token, SqlToken::Comment(_)))
+    fn previous_meaningful_token_index_before(tokens: &[SqlToken], idx: usize) -> Option<usize> {
+        let mut i = idx.min(tokens.len());
+        while i > 0 {
+            i -= 1;
+            if !matches!(tokens.get(i), Some(SqlToken::Comment(_))) {
+                return Some(i);
+            }
+        }
+        None
     }
 
     fn active_query_range_starts_after_set_operator(
         deep_ctx: &intellisense_context::CursorContext,
     ) -> bool {
+        if !deep_ctx.in_set_operation_query_branch {
+            return false;
+        }
+
         let Some(range) = deep_ctx.active_query_range else {
             return false;
         };
+        let Some(mut token_idx) = Self::previous_meaningful_token_index_before(
+            deep_ctx.statement_tokens.as_ref(),
+            range.start,
+        ) else {
+            return false;
+        };
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let Some(mut token) = tokens.get(token_idx) else {
+            return false;
+        };
+
+        if let SqlToken::Word(word) = &token {
+            if matches!(word.to_ascii_uppercase().as_str(), "ALL" | "DISTINCT") {
+            token_idx = Self::previous_meaningful_token_index_before(tokens, token_idx).unwrap_or(0);
+            let Some(previous_token) = tokens.get(token_idx) else {
+                return false;
+            };
+            token = previous_token;
+        }
+        }
+
         matches!(
-            Self::previous_meaningful_token_before_index(
-                deep_ctx.statement_tokens.as_ref(),
-                range.start,
-            ),
-            Some(SqlToken::Word(word))
+            token,
+            SqlToken::Word(word)
                 if matches!(
                     word.to_ascii_uppercase().as_str(),
                     "UNION" | "INTERSECT" | "MINUS" | "EXCEPT"
@@ -25719,7 +25747,9 @@ impl SqlEditorWidget {
             .iter()
             .any(|var| var.eq_ignore_ascii_case(qualifier))
         {
-            return intellisense_context::resolve_all_scope_tables(&deep_ctx.tables_in_scope);
+            return intellisense_context::resolve_all_scope_tables(
+                &deep_ctx.tables_in_scope,
+            );
         }
 
         let mut resolved = resolved;
@@ -25786,10 +25816,16 @@ impl SqlEditorWidget {
             return false;
         };
 
-        matches!(
-            Self::previous_non_comment_token(tokens, chain_start),
-            Some(SqlToken::Symbol(symbol)) if symbol == "="
-        )
+        let cursor_after_identifier_fragment = cursor_token_len
+            .checked_sub(1)
+            .and_then(|idx| tokens.get(idx))
+            .is_some_and(|token| matches!(token, SqlToken::Word(_) | SqlToken::String(_)));
+
+        let previous = Self::previous_non_comment_token(tokens, chain_start);
+        if !cursor_after_identifier_fragment {
+            return false;
+        }
+        matches!(previous, Some(SqlToken::Symbol(symbol)) if symbol == "=")
     }
 
     fn supports_qualified_condition_comparison_suggestions(
@@ -25809,29 +25845,79 @@ impl SqlEditorWidget {
     fn current_query_tables_for_condition_completion(
         deep_ctx: &intellisense_context::CursorContext,
     ) -> Vec<intellisense_context::ScopedTableRef> {
-        let current_query_tokens = Self::current_query_tokens(deep_ctx);
-        let current_query_tables = if matches!(
-            deep_ctx.phase,
-            intellisense_context::SqlPhase::JoinCondition
-        ) {
-            intellisense_context::collect_tables_in_statement_declared_before_cursor(
-                current_query_tokens,
-                Self::cursor_token_len_in_current_query(deep_ctx),
-            )
-        } else {
-            intellisense_context::collect_tables_in_statement(current_query_tokens)
-        };
-        if current_query_tables.is_empty() {
-            deep_ctx.tables_in_scope.clone()
-        } else {
-            current_query_tables
+        let include_outer_scope_tables =
+            |tables: &mut Vec<intellisense_context::ScopedTableRef>| {
+                let current_depth = deep_ctx.depth;
+                if current_depth == 0 {
+                    return;
+                }
+
+                for entry in &deep_ctx.tables_in_scope_before_cursor_with_pos {
+                    if entry.table.depth >= current_depth {
+                        continue;
+                    }
+
+                    let exists = tables.iter().any(|existing| {
+                        existing.depth == entry.table.depth
+                            && existing.name.eq_ignore_ascii_case(&entry.table.name)
+                            && match (&existing.alias, &entry.table.alias) {
+                                (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+                                (None, None) => true,
+                                _ => false,
+                            }
+                    });
+                    if !exists {
+                        tables.push(entry.table.clone());
+                    }
+                }
+            };
+
+        if deep_ctx.in_set_operation_query_branch {
+            let current_query_tokens = Self::current_query_tokens(deep_ctx);
+            let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+            let mut current_query_tables =
+                intellisense_context::collect_tables_in_statement_declared_before_cursor(
+                    current_query_tokens,
+                    cursor_token_len,
+                );
+            include_outer_scope_tables(&mut current_query_tables);
+            return current_query_tables;
         }
+
+        let current_query_tables = deep_ctx
+            .tables_in_scope_before_cursor_with_pos
+            .iter()
+            .map(|entry| entry.table.clone())
+            .collect::<Vec<_>>();
+        if !current_query_tables.is_empty() {
+            return current_query_tables;
+        }
+
+        let current_query_tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let current_query_tables = intellisense_context::collect_tables_in_statement_declared_before_cursor(
+            current_query_tokens,
+            cursor_token_len,
+        );
+        if current_query_tables.is_empty() {
+            return deep_ctx.tables_in_scope_before_cursor.clone();
+        }
+
+        if deep_ctx.tables_in_scope_before_cursor.is_empty() {
+            return current_query_tables;
+        }
+
+        deep_ctx.tables_in_scope_before_cursor.clone()
     }
 
     fn comparison_scope_tables_for_context(
         deep_ctx: &intellisense_context::CursorContext,
     ) -> Vec<intellisense_context::ScopedTableRef> {
         let mut tables = Self::current_query_tables_for_condition_completion(deep_ctx);
+
+        if deep_ctx.in_set_operation_query_branch {
+            return tables;
+        }
 
         // In JOIN ON we deliberately exclude later-declared tables (see
         // `current_query_tables_for_condition_completion`). Skip the outer-scope
@@ -25865,6 +25951,15 @@ impl SqlEditorWidget {
         }
 
         tables
+    }
+
+    fn auto_join_condition_tables_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> Vec<intellisense_context::ScopedTableRef> {
+        Self::comparison_scope_tables_for_context(deep_ctx)
+            .into_iter()
+            .filter(|table| !table.is_cte)
+            .collect()
     }
 
     fn comparison_lookup_tables_for_context(
