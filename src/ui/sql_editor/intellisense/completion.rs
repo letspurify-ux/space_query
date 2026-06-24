@@ -1832,6 +1832,19 @@ impl SqlEditorWidget {
         let has_prefix = !snapshot.prefix.is_empty();
         let context =
             Self::classify_intellisense_context(deep_ctx, deep_ctx.statement_tokens.as_ref());
+        let at_data_type_position = qualifier.is_none()
+            && Self::data_type_position_for_context_for_db(
+                deep_ctx,
+                has_prefix,
+                Some(snapshot.preferred_db_type),
+            )
+            .is_some();
+        let ddl_new_name_allows_keyword_suggestions = qualifier.is_none()
+            && Self::cursor_is_at_ddl_new_name_keyword_suggestion_slot(
+                deep_ctx,
+                has_prefix,
+                Some(snapshot.preferred_db_type),
+            );
         // An alias declaration (`t AS x` / `t x` / `[x]`) or a DDL new-name /
         // data-type slot (`ALTER TABLE t ADD col …`, `RENAME … TO new`) names a
         // brand-new identifier; offering keywords, columns or relations there is
@@ -1844,7 +1857,9 @@ impl SqlEditorWidget {
                 deep_ctx,
                 Some(snapshot.preferred_db_type),
             )
-            || deep_ctx.ddl_new_name_position
+            || (deep_ctx.ddl_new_name_position
+                && !at_data_type_position
+                && !ddl_new_name_allows_keyword_suggestions)
             || Self::cursor_is_at_rename_target_new_name_slot_for_context(
                 deep_ctx,
                 has_prefix || qualifier.is_some(),
@@ -1926,13 +1941,6 @@ impl SqlEditorWidget {
         // identifier — a user-defined TYPE object (`CAST(x AS my_type)`,
         // `col my_type`). It is handled specially below so types survive while
         // every other identifier source is still suppressed.
-        let at_data_type_position = qualifier.is_none()
-            && Self::data_type_position_for_context_for_db(
-                deep_ctx,
-                !snapshot.prefix.is_empty(),
-                Some(snapshot.preferred_db_type),
-            )
-            .is_some();
         let cursor_in_statement = snapshot
             .cursor_pos_usize
             .saturating_sub(analysis.statement_start)
@@ -9908,6 +9916,28 @@ impl SqlEditorWidget {
         )
     }
 
+    fn cursor_is_at_ddl_new_name_keyword_suggestion_slot(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let context_end = Self::expected_suggestion_context_end(
+            tokens,
+            deep_ctx.cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::expected_alter_table_add_tail_keywords(tokens, context_end, db_type)
+            .or_else(|| {
+                Self::expected_create_table_column_definition_tail_keywords(
+                    tokens,
+                    context_end,
+                    db_type,
+                )
+            })
+            .is_some_and(|keywords| !keywords.is_empty())
+    }
+
     fn is_window_frame_unit(word: &str) -> bool {
         matches!(word, "ROWS" | "RANGE" | "GROUPS")
     }
@@ -14038,13 +14068,12 @@ impl SqlEditorWidget {
             _ => after_add,
         };
         let def = Self::current_create_table_definition(after_add);
-        let def = match def.first() {
-            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("COLUMN") => &def[1..],
-            _ => def,
-        };
+        let had_column_keyword =
+            matches!(def.first(), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("COLUMN"));
+        let def = if had_column_keyword { &def[1..] } else { def };
         if def.is_empty() {
             // `MODIFY |` names an existing column — defer to the column path.
-            if is_modify {
+            if is_modify || had_column_keyword {
                 return None;
             }
             // `ADD |` begins a fresh element: a new column (the name is the user's,

@@ -1838,7 +1838,8 @@ fn audit_final_suggestions_for(
     let s = sql.replace('|', "");
     let ctx = analyze_inline_cursor_sql(sql);
     let context = SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
-    let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&s, cursor);
+    let (prefix, word_start, _) = crate::ui::intellisense::get_word_at_cursor(&s, cursor);
+    let has_qualifier = word_start > 0 && s[..word_start].trim_end().ends_with('.');
     let mut data = IntellisenseData::new();
     data.tables = vec![
         "EMP".to_string(),
@@ -1909,13 +1910,39 @@ fn audit_final_suggestions_for(
     data.set_column_meta_for_table("P", HashMap::from([("ID".to_string(), meta("NUMBER"))]));
     data.rebuild_indices();
     let has = !prefix.is_empty();
+    let trigger_has_identifier = has || has_qualifier;
     let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &ctx);
     let column_scope = (!column_tables.is_empty()).then(|| column_tables.clone());
     let expr_keyword_ctx =
         SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables, has, Some(db));
-    if ctx.ddl_new_name_position
-        || SqlEditorWidget::cursor_is_at_create_object_new_name(&ctx, has)
-        || SqlEditorWidget::cursor_is_at_rename_target_new_name_slot_for_context(&ctx, has)
+    let at_data_type_for_suppressed_name =
+        SqlEditorWidget::data_type_position_for_context_for_db(&ctx, has, Some(db)).is_some()
+            || SqlEditorWidget::data_type_position_for_context_for_db(&ctx, true, Some(db))
+                .is_some();
+    let ddl_new_name_allows_keyword_suggestions =
+        !has_qualifier
+            && SqlEditorWidget::cursor_is_at_ddl_new_name_keyword_suggestion_slot(
+                &ctx,
+                has,
+                Some(db),
+            );
+    if SqlEditorWidget::context_suppresses_completion(context)
+        || (ctx.ddl_new_name_position
+            && !at_data_type_for_suppressed_name
+            && !ddl_new_name_allows_keyword_suggestions)
+        || SqlEditorWidget::cursor_is_at_create_object_new_name(&ctx, trigger_has_identifier)
+        || SqlEditorWidget::cursor_is_at_rename_target_new_name_slot_for_context(
+            &ctx,
+            trigger_has_identifier,
+        )
+        || SqlEditorWidget::cursor_is_at_ddl_identifier_suppression_slot_for_context(
+            &ctx,
+            trigger_has_identifier,
+        )
+        || SqlEditorWidget::cursor_is_in_invalid_set_operation_branch_for_context(
+            &ctx,
+            trigger_has_identifier,
+        )
     {
         return (None, Vec::new(), Vec::new());
     }
@@ -40938,6 +40965,167 @@ fn prefixed_data_type_slots_do_not_offer_catalog() {
                 "{leaked} leaked into prefixed data-type slot at `{sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
             );
         }
+    }
+}
+
+#[test]
+fn alter_table_add_final_suggestions_separate_names_types_and_constraint_keywords() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+    let assert_no_catalog = |sql: &str, db, suggestions: &[String]| {
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "APP_USER",
+            "SCOTT",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "EMPNO",
+            "ENAME",
+            "DEPTNO",
+            "DNAME",
+        ] {
+            assert!(
+                !contains(suggestions, leaked),
+                "{leaked} leaked into ALTER TABLE ADD slot at `{sql}` for {db:?}: {suggestions:?}"
+            );
+        }
+    };
+
+    for (db, sql, expected) in [
+        (Oracle, "ALTER TABLE t ADD col |", "NUMBER"),
+        (Oracle, "ALTER TABLE t ADD COLUMN col |", "NUMBER"),
+        (Oracle, "ALTER TABLE t ADD (c1 NUMBER, c2 |)", "NUMBER"),
+        (Oracle, "ALTER TABLE t MODIFY col |", "NUMBER"),
+        (Oracle, "ALTER TABLE t MODIFY (col |)", "NUMBER"),
+        (MySQL, "ALTER TABLE t ADD col |", "INT"),
+        (MySQL, "ALTER TABLE t ADD COLUMN col |", "INT"),
+        (MySQL, "ALTER TABLE t MODIFY col |", "INT"),
+        (MySQL, "ALTER TABLE t CHANGE old_col new_col |", "INT"),
+        (MySQL, "ALTER TABLE t CHANGE old_col new_col D|", "DATE"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert!(
+            contains(&final_suggestions, expected),
+            "{expected} missing from ALTER TABLE data-type slot at `{sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert_no_catalog(sql, db, &final_suggestions);
+    }
+
+    for (sql, expected) in [
+        ("ALTER TABLE t ADD |", "CONSTRAINT"),
+        ("ALTER TABLE t ADD CONSTRAINT c |", "PRIMARY KEY"),
+        ("ALTER TABLE t ADD CONSTRAINT c F|", "FOREIGN KEY"),
+        ("ALTER TABLE t ADD CONSTRAINT c FOREIGN |", "KEY"),
+        ("ALTER TABLE t ADD PRIMARY |", "KEY"),
+        ("ALTER TABLE t ADD FOREIGN KEY (a) |", "REFERENCES"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert!(
+            contains(&final_suggestions, expected),
+            "{expected} missing from ALTER TABLE constraint keyword slot at `{sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert_no_catalog(sql, Oracle, &final_suggestions);
+    }
+
+    for (db, sql) in [
+        (Oracle, "ALTER TABLE t ADD COLUMN |"),
+        (Oracle, "ALTER TABLE t ADD CONSTRAINT |"),
+        (Oracle, "ALTER TABLE t ADD CONSTRAINT scott.|"),
+        (MySQL, "ALTER TABLE t ADD |"),
+        (MySQL, "ALTER TABLE t ADD COLUMN |"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert_eq!(
+            kind, None,
+            "new-name slot should not resolve object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            final_suggestions.is_empty(),
+            "new-name slot should stay empty at `{sql}` for {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+        );
+    }
+}
+
+#[test]
+fn create_table_final_suggestions_separate_names_types_and_constraint_keywords() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+    let assert_no_catalog = |sql: &str, db, suggestions: &[String]| {
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "APP_USER",
+            "SCOTT",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "EMPNO",
+            "ENAME",
+            "DEPTNO",
+            "DNAME",
+        ] {
+            assert!(
+                !contains(suggestions, leaked),
+                "{leaked} leaked into CREATE TABLE element slot at `{sql}` for {db:?}: {suggestions:?}"
+            );
+        }
+    };
+
+    for (sql, expected) in [
+        ("CREATE TABLE t (|", "CONSTRAINT"),
+        ("CREATE TABLE t (a NUMBER, |", "CONSTRAINT"),
+        ("CREATE TABLE t (a NUMBER NOT NULL, |", "CONSTRAINT"),
+        ("CREATE TABLE t (PRIMARY KEY (a), |", "CONSTRAINT"),
+        ("CREATE TABLE t (a NUMBER, PRIMARY |", "KEY"),
+        ("CREATE TABLE t (a INT, CONSTRAINT c |", "PRIMARY KEY"),
+        ("CREATE TABLE t (a INT, CONSTRAINT c F|", "FOREIGN KEY"),
+        ("CREATE TABLE t (a INT, FOREIGN |", "KEY"),
+        ("CREATE TABLE t (a INT, FOREIGN KEY (a) |", "REFERENCES"),
+        ("CREATE TABLE t (a INT |", "DEFAULT"),
+        ("CREATE TABLE t (a INT CONSTRAINT c |", "NOT NULL"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert!(
+            contains(&final_suggestions, expected),
+            "{expected} missing from CREATE TABLE element slot at `{sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert_no_catalog(sql, Oracle, &final_suggestions);
+    }
+
+    for (db, sql, expected) in [
+        (Oracle, "CREATE TABLE t (a |", "NUMBER"),
+        (Oracle, "CREATE TABLE t (a NUMBER, b |", "NUMBER"),
+        (MySQL, "CREATE TABLE t (a |", "INT"),
+        (MySQL, "CREATE TABLE t (a INT, b |", "INT"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert!(
+            contains(&final_suggestions, expected),
+            "{expected} missing from CREATE TABLE data-type slot at `{sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert_no_catalog(sql, db, &final_suggestions);
+    }
+
+    for (db, sql) in [
+        (Oracle, "CREATE TABLE t (CONSTRAINT |"),
+        (Oracle, "CREATE TABLE t (a INT, CONSTRAINT |"),
+        (Oracle, "CREATE TABLE t (scott.|"),
+        (MySQL, "CREATE TABLE t (|"),
+        (MySQL, "CREATE TABLE t (scott.|"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert_eq!(
+            kind, None,
+            "new-name slot should not resolve object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            final_suggestions.is_empty(),
+            "new-name slot should stay empty at `{sql}` for {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+        );
     }
 }
 

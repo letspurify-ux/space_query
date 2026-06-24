@@ -692,10 +692,15 @@ fn ddl_alter_table_introduces_new_name(tokens: &[SqlToken], cursor_token_len: us
         return false;
     }
 
+    let action_ends_with_dot = sig.last().is_some_and(|token| token_is_symbol(token, "."));
+
     match op {
         // After ADD every top-level name is a new column/constraint name or a
         // data type — except the `REFERENCES <table>` target.
-        Some("ADD") => !saw_references && ddl_alter_table_add_action_is_new_name(&action_words),
+        Some("ADD") => {
+            !saw_references
+                && ddl_alter_table_add_action_is_new_name(&action_words, action_ends_with_dot)
+        }
         // `RENAME [COLUMN x] TO <newname>` introduces a new name after `TO`.
         Some("RENAME") => saw_to,
         // `CHANGE [COLUMN] old new …`: once the source column is named, the rest
@@ -705,10 +710,16 @@ fn ddl_alter_table_introduces_new_name(tokens: &[SqlToken], cursor_token_len: us
     }
 }
 
-fn ddl_alter_table_add_action_is_new_name(action_words: &[String]) -> bool {
+fn ddl_alter_table_add_action_is_new_name(
+    action_words: &[String],
+    action_ends_with_dot: bool,
+) -> bool {
     match action_words {
         [] => true,
         [word] if word == "CONSTRAINT" => true,
+        [first, _] if first == "CONSTRAINT" && action_ends_with_dot => true,
+        [first, _] if first == "CONSTRAINT" => false,
+        [first, _, ..] if first == "CONSTRAINT" => false,
         [word] if word.len() >= 2 && ddl_alter_table_add_structural_keyword_starts_with(word) => {
             false
         }
@@ -721,7 +732,6 @@ fn ddl_alter_table_add_action_is_new_name(action_words: &[String]) -> bool {
             false
         }
         [_] => true,
-        [first, ..] if first == "CONSTRAINT" => true,
         _ => false,
     }
 }
@@ -959,8 +969,10 @@ fn ddl_definition_list_target(
             // column/constraint name; a later position is a data-type slot the
             // caller resolves on its own.
             let prev = sig.last()?;
-            (token_is_symbol(prev, "(") || token_is_symbol(prev, ","))
-                .then_some(DdlDefinitionTarget::NewName)
+            (token_is_symbol(prev, "(")
+                || token_is_symbol(prev, ",")
+                || ddl_definition_list_entry_starts_with_dangling_qualified_name(&sig))
+            .then_some(DdlDefinitionTarget::NewName)
         }
         Some(Frame::OwnColumns) => {
             // `ALTER TABLE t ADD … KEY (col)` references `t`'s existing catalog
@@ -988,6 +1000,39 @@ fn ddl_definition_list_target(
                 .then_some(DdlDefinitionTarget::NewName)
         }
         None => None,
+    }
+}
+
+fn ddl_definition_list_entry_starts_with_dangling_qualified_name(sig: &[&SqlToken]) -> bool {
+    if !sig.last().is_some_and(|token| token_is_symbol(token, ".")) {
+        return false;
+    }
+
+    let mut entry: Vec<&SqlToken> = Vec::new();
+    let mut depth = 0i32;
+    for token in sig.iter().rev() {
+        if token_is_symbol(token, ")") {
+            depth += 1;
+        } else if token_is_symbol(token, "(") {
+            if depth == 0 {
+                break;
+            }
+            depth -= 1;
+        } else if depth == 0 && token_is_symbol(token, ",") {
+            break;
+        }
+        entry.push(*token);
+    }
+    entry.reverse();
+
+    match entry.as_slice() {
+        [SqlToken::Word(_), SqlToken::Symbol(dot)] if dot == "." => true,
+        [SqlToken::Word(keyword), SqlToken::Word(_), SqlToken::Symbol(dot)]
+            if keyword.eq_ignore_ascii_case("CONSTRAINT") && dot == "." =>
+        {
+            true
+        }
+        _ => false,
     }
 }
 

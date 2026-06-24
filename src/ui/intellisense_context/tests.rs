@@ -10516,11 +10516,28 @@ fn ddl_alter_table_type_prefix_positions_are_not_new_name() {
         "ALTER TABLE emp ADD COLUMN salary D|",
         "ALTER TABLE emp ADD salary INT |",
         "ALTER TABLE emp CHANGE old_name new_name D|",
+        "CREATE TABLE emp (salary scott.|",
     ] {
         let ctx = analyze(sql);
         assert!(
             !ctx.ddl_new_name_position,
             "type position must not be treated as a new name: {sql}"
+        );
+    }
+}
+
+#[test]
+fn ddl_create_table_qualified_entry_start_is_new_name() {
+    for sql in [
+        "CREATE TABLE emp (scott.|",
+        "CREATE TABLE emp (id NUMBER, scott.|",
+        "CREATE TABLE emp (CONSTRAINT scott.|",
+        "CREATE TABLE emp (id NUMBER, CONSTRAINT scott.|",
+    ] {
+        let ctx = analyze(sql);
+        assert!(
+            ctx.ddl_new_name_position,
+            "qualified definition-list entry start must suppress catalog: {sql}"
         );
     }
 }
