@@ -1915,6 +1915,7 @@ fn audit_final_suggestions_for(
         SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables, has, Some(db));
     if ctx.ddl_new_name_position
         || SqlEditorWidget::cursor_is_at_create_object_new_name(&ctx, has)
+        || SqlEditorWidget::cursor_is_at_rename_target_new_name_slot_for_context(&ctx, has)
     {
         return (None, Vec::new(), Vec::new());
     }
@@ -20528,6 +20529,13 @@ fn alter_table_constraint_and_completed_object_slots_suppress_unrelated_identifi
 
 #[test]
 fn rename_statement_target_new_name_slots_are_suppressed() {
+    let exclude_flag = |sql_with_cursor: &str| {
+        sql_with_cursor
+            .strip_suffix('|')
+            .and_then(|sql| sql.chars().last())
+            .is_some_and(|ch| ch.is_alphanumeric() || ch == '_' || ch == '.')
+    };
+
     for sql in [
         "RENAME emp TO |",
         "RENAME emp TO new_emp|",
@@ -20586,6 +20594,22 @@ fn rename_statement_target_new_name_slots_are_suppressed() {
         !next_source.ddl_new_name_position,
         "next rename source should still reference an existing object"
     );
+
+    for sql in [
+        "RENAME TABLE emp TO emp2, dept TO |",
+        "RENAME TABLE emp TO emp2, dept TO new_dept|",
+        "RENAME USER alice TO bob, carol TO |",
+        "RENAME USER alice TO bob, carol TO dave|",
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        assert!(
+            SqlEditorWidget::cursor_is_at_rename_target_new_name_slot_for_context(
+                &ctx,
+                exclude_flag(sql),
+            ),
+            "`{sql}` should suppress existing identifiers at a later rename target"
+        );
+    }
 }
 
 /// `CREATE TABLE … PARTITION BY {RANGE|HASH|LIST|RANGE COLUMNS} (…)` lists the
@@ -26104,6 +26128,158 @@ fn schema_object_member_suggestions_cover_oracle_ddl_object_types() {
             "SALES_MV".to_string(),
             "SEQ_ORDER".to_string()
         ]
+    );
+}
+
+#[test]
+fn prefixed_schema_object_member_slots_stay_within_expected_kind() {
+    let mut data = IntellisenseData::new();
+    data.set_members_for_qualifier_with_kinds(
+        "SCOTT",
+        vec![
+            ("EMP".to_string(), Some(QualifiedMemberKind::Table)),
+            ("EMP_VIEW".to_string(), Some(QualifiedMemberKind::View)),
+            (
+                "EMP_MV".to_string(),
+                Some(QualifiedMemberKind::MaterializedView),
+            ),
+            ("EMP_SEQ".to_string(), Some(QualifiedMemberKind::Sequence)),
+            ("EMP_SYN".to_string(), Some(QualifiedMemberKind::Synonym)),
+            ("EMP_PROC".to_string(), Some(QualifiedMemberKind::Procedure)),
+            ("EMP_FUNC".to_string(), Some(QualifiedMemberKind::Function)),
+            ("EMP_PKG".to_string(), Some(QualifiedMemberKind::Package)),
+            ("EMP_TYPE".to_string(), Some(QualifiedMemberKind::Type)),
+            ("EMP_TRG".to_string(), Some(QualifiedMemberKind::Trigger)),
+            ("EMP_IDX".to_string(), Some(QualifiedMemberKind::Index)),
+        ],
+    );
+    data.set_relation_members_for_qualifier(
+        "SCOTT",
+        vec![
+            "EMP".to_string(),
+            "EMP_VIEW".to_string(),
+            "EMP_MV".to_string(),
+            "EMP_SEQ".to_string(),
+            "EMP_SYN".to_string(),
+        ],
+    );
+
+    let relation_cases: &[(&str, &[&str])] = &[
+        ("DROP TABLE scott.emp|", &["EMP"]),
+        ("DROP VIEW scott.emp|", &["EMP_VIEW"]),
+        ("DROP MATERIALIZED VIEW scott.emp|", &["EMP_MV"]),
+        ("COMMENT ON COLUMN scott.emp|", &["EMP", "EMP_MV", "EMP_SYN", "EMP_VIEW"]),
+        (
+            "GRANT SELECT ON scott.emp|",
+            &["EMP", "EMP_MV", "EMP_SEQ", "EMP_SYN", "EMP_VIEW"],
+        ),
+    ];
+    for (sql, expected) in relation_cases {
+        let suggestions = SqlEditorWidget::expected_relation_member_suggestions_for_qualifier(
+            &mut data,
+            "scott",
+            "emp",
+            &analyze_inline_cursor_sql(sql),
+        );
+        let expected: Vec<String> = expected.iter().map(|value| (*value).to_string()).collect();
+        assert_eq!(
+            suggestions, expected,
+            "prefixed schema relation slot leaked the wrong object kind for `{sql}`"
+        );
+    }
+
+    let object_cases: &[(&str, &[&str])] = &[
+        ("DROP INDEX scott.emp|", &["EMP_IDX"]),
+        ("ALTER TRIGGER scott.emp|", &["EMP_TRG"]),
+        ("DROP PACKAGE scott.emp|", &["EMP_PKG"]),
+        ("DROP TYPE scott.emp|", &["EMP_TYPE"]),
+        (
+            "GRANT EXECUTE ON scott.emp|",
+            &["EMP_FUNC", "EMP_PKG", "EMP_PROC", "EMP_TYPE"],
+        ),
+    ];
+    for (sql, expected) in object_cases {
+        let suggestions = SqlEditorWidget::expected_member_suggestions_for_qualifier(
+            &mut data,
+            "scott",
+            "emp",
+            &analyze_inline_cursor_sql(sql),
+        );
+        let expected: Vec<String> = expected.iter().map(|value| (*value).to_string()).collect();
+        assert_eq!(
+            suggestions, expected,
+            "prefixed schema object slot leaked the wrong object kind for `{sql}`"
+        );
+    }
+}
+
+#[test]
+fn table_context_schema_member_cache_filters_to_relations_without_relation_cache() {
+    let mut data = IntellisenseData::new();
+    data.set_members_for_qualifier_with_kinds(
+        "SCOTT",
+        vec![
+            ("EMP".to_string(), Some(QualifiedMemberKind::Table)),
+            ("EMP_VIEW".to_string(), Some(QualifiedMemberKind::View)),
+            (
+                "EMP_MV".to_string(),
+                Some(QualifiedMemberKind::MaterializedView),
+            ),
+            ("EMP_SEQ".to_string(), Some(QualifiedMemberKind::Sequence)),
+            ("EMP_SYN".to_string(), Some(QualifiedMemberKind::Synonym)),
+            ("EMP_PROC".to_string(), Some(QualifiedMemberKind::Procedure)),
+            ("EMP_PKG".to_string(), Some(QualifiedMemberKind::Package)),
+            ("EMP_TYPE".to_string(), Some(QualifiedMemberKind::Type)),
+        ],
+    );
+
+    let ctx = analyze_inline_cursor_sql("SELECT * FROM scott.emp|");
+    let context = SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+    assert_eq!(context, SqlContext::TableName);
+    assert_eq!(
+        SqlEditorWidget::resolve_qualified_completion_mode("scott", context, &ctx, &data),
+        Some(QualifiedCompletionMode::RelationMembers)
+    );
+
+    let suggestions = SqlEditorWidget::expected_relation_member_suggestions_for_qualifier(
+        &mut data, "scott", "emp", &ctx,
+    );
+    assert_eq!(
+        suggestions,
+        vec![
+            "EMP".to_string(),
+            "EMP_MV".to_string(),
+            "EMP_SEQ".to_string(),
+            "EMP_SYN".to_string(),
+            "EMP_VIEW".to_string(),
+        ],
+        "table-name schema member completion must not leak routines or types"
+    );
+}
+
+#[test]
+fn table_context_unknown_schema_member_fallback_keeps_known_relations_only() {
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["EMP".to_string()];
+    data.rebuild_indices();
+    data.set_members_for_qualifier(
+        "SCOTT",
+        vec![
+            "EMP".to_string(),
+            "EMP_PROC".to_string(),
+            "EMP_PKG".to_string(),
+        ],
+    );
+
+    let ctx = analyze_inline_cursor_sql("SELECT * FROM scott.emp|");
+    let suggestions = SqlEditorWidget::expected_relation_member_suggestions_for_qualifier(
+        &mut data, "scott", "emp", &ctx,
+    );
+
+    assert_eq!(
+        suggestions,
+        vec!["EMP".to_string()],
+        "unknown schema member fallback must not dump non-relations into table-name completion"
     );
 }
 
@@ -41058,6 +41234,185 @@ fn oracle_prefixed_object_slots_keep_schema_name_suggestions() {
 }
 
 #[test]
+fn prefixed_object_slots_do_not_merge_statement_keywords() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for (db, sql) in [
+        (Oracle, "DROP TABLE s|"),
+        (Oracle, "COMMENT ON TABLE s|"),
+        (Oracle, "GRANT SELECT ON s| TO scott"),
+        (Oracle, "CREATE INDEX ix ON s|"),
+        (Oracle, "CREATE TABLE child (parent_id NUMBER REFERENCES s|)"),
+        (MySQL, "DROP TABLE s|"),
+        (MySQL, "SHOW CREATE TABLE s|"),
+        (MySQL, "SHOW COLUMNS FROM s|"),
+        (MySQL, "GRANT SELECT ON s| TO scott"),
+        (MySQL, "CREATE INDEX ix ON s|"),
+        (MySQL, "CREATE TABLE child (parent_id INT REFERENCES s|)"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert!(
+            kind.is_some(),
+            "prefixed object slot lost expected object kind at `{sql}`; keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "SELECT",
+            "SESSION",
+            "SCHEMA",
+            "SET",
+            "SHOW",
+            "START",
+            "SAVEPOINT",
+            "WHERE",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into prefixed object slot at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn prefixed_object_slots_stay_within_expected_object_family() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for (db, sql, expected, leaked) in [
+        (
+            Oracle,
+            "DROP TABLE d|",
+            "DEPT",
+            &["EMP_V", "RUN_JOB", "CALC_TOTAL", "APP_USER", "SCOTT"][..],
+        ),
+        (
+            Oracle,
+            "CREATE INDEX ix ON d|",
+            "DEPT",
+            &["EMP_V", "RUN_JOB", "CALC_TOTAL", "APP_USER", "SCOTT"],
+        ),
+        (
+            Oracle,
+            "COMMENT ON VIEW emp|",
+            "EMP_V",
+            &["EMP", "DEPT", "RUN_JOB", "APP_USER", "SCOTT"],
+        ),
+        (
+            Oracle,
+            "GRANT EXECUTE ON run| TO scott",
+            "RUN_JOB",
+            &["EMP", "DEPT", "EMP_V", "APP_USER", "SCOTT"],
+        ),
+        (
+            Oracle,
+            "ALTER SESSION SET CURRENT_SCHEMA = app|",
+            "APP_USER",
+            &["EMP", "DEPT", "EMP_V", "RUN_JOB", "CALC_TOTAL"],
+        ),
+        (
+            MySQL,
+            "DROP TABLE d|",
+            "DEPT",
+            &["EMP_V", "RUN_JOB", "CALC_TOTAL", "APP_USER", "SCOTT"],
+        ),
+        (
+            MySQL,
+            "SHOW CREATE VIEW emp|",
+            "EMP_V",
+            &["EMP", "DEPT", "RUN_JOB", "APP_USER", "SCOTT"],
+        ),
+        (
+            MySQL,
+            "SHOW CREATE FUNCTION calc|",
+            "CALC_TOTAL",
+            &["EMP", "DEPT", "EMP_V", "RUN_JOB", "APP_USER", "SCOTT"],
+        ),
+        (
+            MySQL,
+            "SHOW CREATE PROCEDURE run|",
+            "RUN_JOB",
+            &["EMP", "DEPT", "EMP_V", "CALC_TOTAL", "APP_USER", "SCOTT"],
+        ),
+        (
+            MySQL,
+            "SHOW GRANTS FOR app|",
+            "APP_USER",
+            &["EMP", "DEPT", "EMP_V", "RUN_JOB", "CALC_TOTAL"],
+        ),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert!(
+            kind.is_some(),
+            "prefixed object slot lost expected object kind at `{sql}`; keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            contains(&final_suggestions, expected),
+            "{expected} missing from prefixed object slot at `{sql}`: {final_suggestions:?}"
+        );
+        for item in leaked {
+            assert!(
+                !contains(&final_suggestions, item),
+                "{item} leaked into prefixed object slot at `{sql}`: {final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn prefixed_new_name_slots_do_not_offer_catalog_or_keywords() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for (db, sql) in [
+        (Oracle, "CREATE TABLE app|"),
+        (Oracle, "CREATE OR REPLACE PACKAGE app|"),
+        (Oracle, "CREATE MATERIALIZED VIEW app|"),
+        (Oracle, "ALTER TABLE emp RENAME TO app|"),
+        (MySQL, "CREATE TABLE app|"),
+        (MySQL, "CREATE TABLE IF NOT EXISTS app|"),
+        (MySQL, "CREATE USER app|"),
+        (MySQL, "CREATE USER alice, app|"),
+        (MySQL, "CREATE USER alice IDENTIFIED BY 'secret', app|"),
+        (MySQL, "CREATE ROLE app|"),
+        (MySQL, "CREATE ROLE report_reader, app|"),
+        (MySQL, "RENAME TABLE emp TO app|"),
+        (MySQL, "RENAME TABLE emp TO emp2, dept TO app|"),
+        (MySQL, "RENAME USER alice TO app|"),
+        (MySQL, "RENAME USER alice TO bob, scott TO app|"),
+        (MySQL, "ALTER EVENT ev RENAME TO app|"),
+        (MySQL, "ALTER TABLESPACE ts RENAME TO app|"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert_eq!(
+            kind, None,
+            "new-name slot should not resolve to an existing object kind at `{sql}`; keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "APP_USER",
+            "SCOTT",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "SELECT",
+            "SET",
+            "SHOW",
+            "WHERE",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into prefixed new-name slot at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn mysql_option_value_slots_do_not_offer_object_catalog_in_final_suggestions() {
     use crate::db::DatabaseType::MySQL;
 
@@ -41142,6 +41497,81 @@ fn mysql_option_value_slots_do_not_offer_object_catalog_in_final_suggestions() {
             assert!(
                 !contains(&final_suggestions, leaked),
                 "{leaked} leaked into MySQL option value slot at `{sql}`: {final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn mysql_prefixed_option_value_slots_do_not_offer_catalog_or_keywords() {
+    use crate::db::DatabaseType::MySQL;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for sql in [
+        "CREATE USER alice IDENTIFIED BY app|",
+        "CREATE USER alice IDENTIFIED WITH auth_plugin BY app|",
+        "CREATE USER alice REQUIRE CIPHER app|",
+        "CREATE USER alice REQUIRE CIPHER 'cipher' AND ISSUER app|",
+        "CREATE USER alice COMMENT app|",
+        "CREATE USER alice ATTRIBUTE app|",
+        "CREATE USER alice FAILED_LOGIN_ATTEMPTS d|",
+        "CREATE USER alice PASSWORD_LOCK_TIME d|",
+        "CREATE USER alice WITH MAX_QUERIES_PER_HOUR d|",
+        "ALTER USER alice PASSWORD EXPIRE INTERVAL d|",
+        "ALTER USER alice PASSWORD REUSE INTERVAL d|",
+        "ALTER USER alice WITH MAX_CONNECTIONS_PER_HOUR d|",
+        "CREATE DATABASE db CHARACTER SET s|",
+        "CREATE DATABASE db COLLATE s|",
+        "CREATE DATABASE db ENCRYPTION s|",
+        "CREATE RESOURCE GROUP rg TYPE s|",
+        "CREATE RESOURCE GROUP rg TYPE USER VCPU d|",
+        "CREATE RESOURCE GROUP rg TYPE USER THREAD_PRIORITY d|",
+        "CREATE SERVER srv FOREIGN DATA WRAPPER mysql OPTIONS HOST app|",
+        "CREATE SERVER srv FOREIGN DATA WRAPPER mysql OPTIONS DATABASE app|",
+        "CREATE SERVER srv FOREIGN DATA WRAPPER mysql OPTIONS USER app|",
+        "ALTER SERVER srv OPTIONS OWNER app|",
+        "ALTER SERVER srv OPTIONS SOCKET app|",
+        "START GROUP_REPLICATION USER app|",
+        "START GROUP_REPLICATION DEFAULT_AUTH app|",
+        "START GROUP_REPLICATION PASSWORD app|",
+        "CHANGE REPLICATION SOURCE TO SOURCE_HOST app|",
+        "CHANGE REPLICATION SOURCE TO SOURCE_USER app|",
+        "CHANGE REPLICATION SOURCE TO SOURCE_PASSWORD app|",
+        "CHANGE REPLICATION SOURCE TO SOURCE_PORT d|",
+        "CREATE FUNCTION f RETURNS INT COMMENT app|",
+        "ALTER FUNCTION f COMMENT app|",
+        "CREATE PROCEDURE p COMMENT app|",
+        "ALTER PROCEDURE p COMMENT app|",
+        "CREATE EVENT ev ON SCHEDULE EVERY n DAY COMMENT app|",
+        "ALTER EVENT ev COMMENT app|",
+        "ALTER EVENT ev RENAME TO app|",
+        "CREATE LOGFILE GROUP lg ADD UNDOFILE app|",
+        "CREATE LOGFILE GROUP lg ADD UNDOFILE 'undo.dat' INITIAL_SIZE d|",
+        "CREATE TABLESPACE ts ADD DATAFILE app|",
+        "CREATE TABLESPACE ts ADD DATAFILE 'ts.ibd' INITIAL_SIZE d|",
+        "ALTER TABLESPACE ts ADD DATAFILE app|",
+        "ALTER TABLESPACE ts RENAME TO app|",
+        "ALTER LOGFILE GROUP lg ADD UNDOFILE app|",
+    ] {
+        let (_kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, MySQL);
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "APP_USER",
+            "SCOTT",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "SELECT",
+            "SET",
+            "SHOW",
+            "START",
+            "WHERE",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into prefixed MySQL option value slot at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
             );
         }
     }
@@ -41351,4 +41781,126 @@ fn qualified_alias_column_slot_yields_relation_columns() {
             );
         }
     }
+}
+
+#[test]
+fn schema_qualified_column_slot_yields_only_relation_columns() {
+    for (sql, qualifier) in [
+        ("SELECT scott.emp.e| FROM scott.emp", "scott.emp"),
+        ("SELECT * FROM scott.emp WHERE scott.emp.e| = 1", "scott.emp"),
+        ("COMMENT ON COLUMN scott.emp.e|", "scott.emp"),
+    ] {
+        let cursor = sql.find('|').expect("cursor marker should exist");
+        let source = sql.replace('|', "");
+        let (prefix, start, _) = crate::ui::intellisense::get_word_at_cursor(&source, cursor);
+        let parsed_qualifier = SqlEditorWidget::qualifier_before_word_in_text(&source, start);
+        assert_eq!(
+            parsed_qualifier.as_deref(),
+            Some(qualifier),
+            "qualified column parser should keep the full qualifier chain for `{sql}`"
+        );
+
+        let ctx = analyze_inline_cursor_sql(sql);
+        let context =
+            SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["EMP".to_string()];
+        data.views = vec!["EMP_VIEW".to_string()];
+        data.procedures = vec!["EMP_PROC".to_string()];
+        data.users = vec!["SCOTT".to_string()];
+        data.rebuild_indices();
+        data.set_columns_for_table(
+            "EMP",
+            vec![
+                "EMPNO".to_string(),
+                "ENAME".to_string(),
+                "SAL".to_string(),
+            ],
+        );
+        data.set_columns_for_table("DEPT", vec!["DNAME".to_string()]);
+        data.set_members_for_qualifier_with_kinds(
+            "SCOTT",
+            vec![
+                ("EMP".to_string(), Some(QualifiedMemberKind::Table)),
+                ("EMP_VIEW".to_string(), Some(QualifiedMemberKind::View)),
+                ("EMP_PROC".to_string(), Some(QualifiedMemberKind::Procedure)),
+            ],
+        );
+
+        let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some(qualifier), &ctx);
+        assert_eq!(
+            column_tables,
+            vec![qualifier.to_string()],
+            "`{sql}` should scope columns to the fully-qualified relation key"
+        );
+        let suggestions = SqlEditorWidget::base_suggestions_for_context(
+            &mut data,
+            &prefix,
+            Some(qualifier),
+            Some(&column_tables),
+            true,
+            context,
+            false,
+            Some(crate::db::DatabaseType::Oracle),
+            super::ExpressionKeywordContext::ambiguous(),
+        );
+
+        assert_eq!(
+            suggestions,
+            vec!["EMPNO".to_string(), "ENAME".to_string()],
+            "`{sql}` should suggest only matching columns from the qualified relation"
+        );
+    }
+}
+
+#[test]
+fn comment_on_column_qualified_owner_prefers_columns_over_schema_object_members() {
+    let ctx = analyze_inline_cursor_sql("COMMENT ON COLUMN scott.emp.e|");
+    let mut data = IntellisenseData::new();
+    data.set_columns_for_table(
+        "SCOTT.EMP",
+        vec![
+            "EMPNO".to_string(),
+            "ENAME".to_string(),
+            "SAL".to_string(),
+        ],
+    );
+    data.set_members_for_qualifier_with_kinds(
+        "SCOTT.EMP",
+        vec![
+            ("EXEC_JOB".to_string(), Some(QualifiedMemberKind::Procedure)),
+            ("EXPORT_PKG".to_string(), Some(QualifiedMemberKind::Package)),
+        ],
+    );
+
+    assert_eq!(
+        SqlEditorWidget::resolve_qualified_completion_mode(
+            "scott.emp",
+            SqlContext::TableName,
+            &ctx,
+            &data,
+        ),
+        Some(QualifiedCompletionMode::RelationColumns),
+        "COMMENT ON COLUMN owner completion must not switch to object members"
+    );
+
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("scott.emp"), &ctx);
+    let suggestions = SqlEditorWidget::base_suggestions_for_context(
+        &mut data,
+        "e",
+        Some("scott.emp"),
+        Some(&column_tables),
+        true,
+        SqlContext::TableName,
+        false,
+        Some(crate::db::DatabaseType::Oracle),
+        super::ExpressionKeywordContext::ambiguous(),
+    );
+
+    assert_eq!(
+        suggestions,
+        vec!["EMPNO".to_string(), "ENAME".to_string()],
+        "COMMENT ON COLUMN should offer relation columns, not package/procedure members"
+    );
 }

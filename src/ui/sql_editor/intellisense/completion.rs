@@ -1845,6 +1845,10 @@ impl SqlEditorWidget {
                 Some(snapshot.preferred_db_type),
             )
             || deep_ctx.ddl_new_name_position
+            || Self::cursor_is_at_rename_target_new_name_slot_for_context(
+                deep_ctx,
+                has_prefix || qualifier.is_some(),
+            )
             || Self::cursor_is_at_ddl_identifier_suppression_slot_for_context(
                 deep_ctx,
                 has_prefix || qualifier.is_some(),
@@ -8885,6 +8889,7 @@ impl SqlEditorWidget {
     ) -> Option<QualifiedCompletionMode> {
         if deep_ctx.ddl_new_name_position
             || Self::cursor_is_at_create_object_new_name(deep_ctx, true)
+            || Self::cursor_is_at_rename_target_new_name_slot_for_context(deep_ctx, true)
         {
             return None;
         }
@@ -8901,6 +8906,13 @@ impl SqlEditorWidget {
             return None;
         }
         if let Some(kind) = expected_object_kind {
+            if matches!(kind, ExpectedObjectSuggestionKind::ColumnOwner)
+                && Self::qualified_column_owner_resolves_to_relation_columns(
+                    qualifier, deep_ctx, data,
+                )
+            {
+                return Some(QualifiedCompletionMode::RelationColumns);
+            }
             if data.has_members_for_qualifier(qualifier, false) {
                 return Some(QualifiedCompletionMode::ObjectMembers);
             }
@@ -8937,6 +8949,33 @@ impl SqlEditorWidget {
         }
 
         None
+    }
+
+    fn qualified_column_owner_resolves_to_relation_columns(
+        qualifier: &str,
+        deep_ctx: &intellisense_context::CursorContext,
+        data: &IntellisenseData,
+    ) -> bool {
+        if Self::qualifier_matches_visible_relation_scope(qualifier, deep_ctx)
+            || data.is_known_relation(qualifier)
+        {
+            return true;
+        }
+
+        let has_unquoted_dot = Self::has_unquoted_dot(qualifier);
+        if !has_unquoted_dot && data.has_members_for_qualifier(qualifier, false) {
+            return false;
+        }
+
+        let resolved_tables = Self::resolve_column_tables_for_context(Some(qualifier), deep_ctx);
+        if resolved_tables.iter().any(|table| {
+            data.is_known_relation(table) || !data.get_columns_for_table(table).is_empty()
+        }) {
+            return true;
+        }
+
+        Self::resolve_table_column_load_key(data, qualifier).is_some()
+            || !data.get_columns_for_table(qualifier).is_empty()
     }
 
     fn previous_meaningful_words_upper(
@@ -9640,6 +9679,47 @@ impl SqlEditorWidget {
         words
             .last()
             .is_some_and(|word| NAME_INTRODUCERS.contains(&word.as_str()))
+    }
+
+    fn cursor_is_at_rename_target_new_name_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> bool {
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            deep_ctx.cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        if !matches!(
+            toks.first(),
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("RENAME")
+        ) {
+            return false;
+        }
+
+        let segment_start = toks
+            .iter()
+            .rposition(|token| matches!(token, SqlToken::Symbol(sym) if sym == ","))
+            .map_or(0, |idx| idx + 1);
+        let mut segment = toks[segment_start..]
+            .iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                SqlToken::String(_) => Some("__VALUE__".to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        if segment.first().map(String::as_str) == Some("RENAME") {
+            segment.remove(0);
+            if matches!(segment.first().map(String::as_str), Some("TABLE" | "USER")) {
+                segment.remove(0);
+            }
+        }
+
+        segment.iter().position(|word| word == "TO").is_some_and(|idx| idx > 0)
     }
 
     fn identifier_chain_end(tokens: &[&SqlToken], start: usize) -> Option<usize> {
@@ -28192,10 +28272,14 @@ impl SqlEditorWidget {
         deep_ctx: &intellisense_context::CursorContext,
     ) -> Vec<String> {
         let suggestions = data.get_member_suggestions(qualifier, prefix, true);
-        let Some(kind) = Self::expected_object_suggestion_kind(prefix, Some(qualifier), deep_ctx)
-        else {
-            return suggestions;
-        };
+        let kind = Self::expected_object_suggestion_kind(prefix, Some(qualifier), deep_ctx)
+            .or_else(|| {
+                let context =
+                    Self::classify_intellisense_context(deep_ctx, deep_ctx.statement_tokens.as_ref());
+                matches!(context, SqlContext::TableName)
+                    .then_some(ExpectedObjectSuggestionKind::RelationOrSequence)
+            });
+        let Some(kind) = kind else { return suggestions };
         if matches!(kind, ExpectedObjectSuggestionKind::Any) {
             let all_suggestions = data.get_member_suggestions(qualifier, prefix, false);
             return if all_suggestions.is_empty() {
@@ -28230,6 +28314,11 @@ impl SqlEditorWidget {
             filtered
         } else if Self::expected_object_kind_allows_relation_member_cache(kind) {
             suggestions
+                .into_iter()
+                .filter(|suggestion| {
+                    Self::suggestion_is_known_relation_for_qualifier(data, qualifier, suggestion)
+                })
+                .collect()
         } else {
             Vec::new()
         }
