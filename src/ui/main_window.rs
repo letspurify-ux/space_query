@@ -986,6 +986,7 @@ pub struct AppState {
     query_timeout_input: IntInput,
     pub result_tabs: ResultTabsWidget,
     result_toolbar: Flex,
+    result_one_tab_per_query_check: CheckButton,
     result_edit_check: CheckButton,
     result_insert_btn: Button,
     result_delete_btn: Button,
@@ -1588,6 +1589,28 @@ impl AppState {
         for tab_id in finished_contexts {
             self.finish_progress_context(tab_id);
         }
+    }
+
+    fn clear_result_grids_for_new_query_batch(&mut self) -> Vec<u64> {
+        let had_tabs = self.result_tabs.tab_count() > 0;
+        let mut lazy_fetch_sessions = Vec::new();
+        for session_id in self.result_tabs.lazy_fetch_sessions() {
+            Self::push_unique_session_id(&mut lazy_fetch_sessions, session_id);
+        }
+        for context in self.progress_contexts.values() {
+            for session_id in context.lazy_fetch_sessions.keys().copied() {
+                Self::push_unique_session_id(&mut lazy_fetch_sessions, session_id);
+            }
+        }
+        self.result_tabs.clear_grids();
+        self.mark_lazy_fetch_result_tabs_closed(lazy_fetch_sessions.clone());
+        self.mark_all_result_tabs_closed_for_clear();
+        self.result_tab_offset = self.result_tabs.tab_count();
+        if had_tabs {
+            malloc_trim_process();
+        }
+        self.refresh_result_edit_controls();
+        lazy_fetch_sessions
     }
 
     fn push_unique_session_id(session_ids: &mut Vec<u64>, session_id: u64) {
@@ -4419,9 +4442,17 @@ impl MainWindow {
         let spacer = Frame::default();
         result_toolbar.resizable(&spacer);
 
+        let mut one_tab_per_query_check = CheckButton::default()
+            .with_size(BUTTON_WIDTH_LARGE + 45, BUTTON_HEIGHT)
+            .with_label(" One tab per query");
+        one_tab_per_query_check.set_tooltip(
+            "Unchecked: clear existing result tabs before each execution. Checked: append result tabs.",
+        );
+        result_toolbar.fixed(&one_tab_per_query_check, BUTTON_WIDTH_LARGE + 45);
+
         let mut edit_mode_check = CheckButton::default()
             .with_size(BUTTON_WIDTH_SMALL, BUTTON_HEIGHT)
-            .with_label("Edit");
+            .with_label(" Edit");
         edit_mode_check.set_tooltip("Enable staged edit mode for the current result tab");
         edit_mode_check.hide();
         result_toolbar.fixed(&edit_mode_check, 0);
@@ -4678,6 +4709,7 @@ impl MainWindow {
             query_timeout_input: timeout_input.clone(),
             result_tabs: result_tabs.clone(),
             result_toolbar: result_toolbar.clone(),
+            result_one_tab_per_query_check: one_tab_per_query_check.clone(),
             result_edit_check: edit_mode_check.clone(),
             result_insert_btn: edit_insert_btn.clone(),
             result_delete_btn: edit_delete_btn.clone(),
@@ -6171,6 +6203,14 @@ impl MainWindow {
                     ) {
                         return;
                     }
+                    let one_tab_per_query = s.result_one_tab_per_query_check.value();
+                    let lazy_fetch_sessions = if !one_tab_per_query
+                        && s.result_grid_execution_target.is_none()
+                    {
+                        s.clear_result_grids_for_new_query_batch()
+                    } else {
+                        Vec::new()
+                    };
                     let tab_count = s.result_tabs.tab_count();
                     let mut context = QueryProgressContext::new(
                         resolve_result_tab_offset(tab_count, s.result_grid_execution_target),
@@ -6183,6 +6223,14 @@ impl MainWindow {
                     }
                     s.progress_contexts.insert(tab_id, context);
                     s.sync_transaction_mode_controls();
+                    drop(s);
+                    for session_id in lazy_fetch_sessions {
+                        AppState::request_lazy_fetch_on_editors(
+                            &state_for_progress,
+                            session_id,
+                            crate::ui::sql_editor::LazyFetchRequest::CancelAndDiscard,
+                        );
+                    }
                 }
                 QueryProgress::StatementStart { index } => {
                     let has_live_connection = s.has_live_connection;
@@ -6196,17 +6244,20 @@ impl MainWindow {
                     ) {
                         return;
                     }
+                    let tab_count = s.result_tabs.tab_count();
+                    let mut result_tabs = s.result_tabs.clone();
                     let query_canceling_pending = s.pending_query_canceling_tabs.contains(&tab_id);
-                    let status = {
+                    let (tab_index, status) = {
                         let Some(context) = s.progress_contexts.get_mut(&tab_id) else {
                             return;
                         };
                         context.fetch_row_counts.remove(&index);
                         context.active_statement_index = Some(index);
+                        let tab_index = context.ensure_result_tab_index(index, tab_count);
                         let status =
                             statement_start_status(&context.state_label, query_canceling_pending);
                         context.state_label = status.label().to_string();
-                        status
+                        (tab_index, status)
                     };
                     if status == ResultTabStatus::Canceling {
                         if s.should_show_progress_status_for_tab(tab_id) {
@@ -6223,6 +6274,13 @@ impl MainWindow {
                         }
                     }
                     s.refresh_result_edit_controls();
+                    drop(s);
+                    result_tabs.start_statement(tab_index, &format!("Result {}", tab_index + 1));
+                    if status == ResultTabStatus::Canceling {
+                        result_tabs.mark_statement_canceling(tab_index);
+                    }
+                    app::redraw();
+                    app::flush();
                 }
                 QueryProgress::SelectStart {
                     index,
