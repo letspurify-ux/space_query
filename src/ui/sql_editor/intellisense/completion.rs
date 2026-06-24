@@ -2655,6 +2655,20 @@ impl SqlEditorWidget {
         }
     }
 
+    fn suggestion_is_scoped_column(
+        data: &mut IntellisenseData,
+        suggestion: &str,
+        column_scope: Option<&[String]>,
+    ) -> bool {
+        column_scope.is_some_and(|scope| {
+            !scope.is_empty()
+                && data
+                    .get_column_suggestions(suggestion, Some(scope))
+                    .iter()
+                    .any(|column| column.eq_ignore_ascii_case(suggestion))
+        })
+    }
+
     fn column_suggestion_matches_expected_operand_type(
         data: &IntellisenseData,
         suggestion: &str,
@@ -3213,6 +3227,12 @@ impl SqlEditorWidget {
         let upper = suggestion.to_ascii_uppercase();
         if !data.is_language_keyword(&upper, db_type) {
             // Column / relation / object identifier: operand material only.
+            if data.is_known_relation(suggestion)
+                && !data.is_language_function(&upper, db_type)
+                && !Self::suggestion_is_scoped_column(data, suggestion, column_scope)
+            {
+                return false;
+            }
             return !after_operand;
         }
         if Self::keyword_is_grammatical_in_expression(&upper, expr_keyword_ctx, db_type) {
@@ -15677,6 +15697,32 @@ impl SqlEditorWidget {
         depth > 0
     }
 
+    fn construct_body_has_top_level_item_before_cursor(
+        tokens: &[SqlToken],
+        end: usize,
+        keyword: &str,
+    ) -> bool {
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        let Some(kw_pos) = toks.iter().rposition(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case(keyword)),
+        ) else {
+            return false;
+        };
+        let mut depth = 0i32;
+        let mut saw_top_level_item = false;
+        for token in &toks[kw_pos + 1..] {
+            match token {
+                SqlToken::Symbol(sym) if sym == "(" => depth += 1,
+                SqlToken::Symbol(sym) if sym == ")" => depth = (depth - 1).max(0),
+                SqlToken::Comment(_) => {}
+                _ if depth == 1 => saw_top_level_item = true,
+                _ => {}
+            }
+        }
+
+        depth == 1 && saw_top_level_item
+    }
+
     fn expected_advanced_oracle_query_keyword_candidates(
         tokens: &[SqlToken],
         end: usize,
@@ -15691,6 +15737,9 @@ impl SqlEditorWidget {
         let last = words.last().map(String::as_str);
 
         if Self::table_clause_construct_is_open(tokens, end, "PIVOT") {
+            if !Self::construct_body_has_top_level_item_before_cursor(tokens, end, "PIVOT") {
+                return None;
+            }
             if has("FOR") {
                 return Some(&["IN"]);
             }
@@ -15700,6 +15749,10 @@ impl SqlEditorWidget {
             // Inside the body paren the grammar is `col FOR name IN (…)` (like
             // PIVOT); the `INCLUDE|EXCLUDE NULLS` modifier is only valid before it.
             if Self::cursor_inside_construct_body(tokens, end, "UNPIVOT") {
+                if !Self::construct_body_has_top_level_item_before_cursor(tokens, end, "UNPIVOT")
+                {
+                    return None;
+                }
                 if has("FOR") {
                     return Some(&["IN"]);
                 }
@@ -23500,6 +23553,12 @@ impl SqlEditorWidget {
                     data_type_keywords_for(db_type, position),
                 );
             }
+        }
+        if Self::phase_allows_expression_construct_open_paren(deep_ctx.phase)
+            && (Self::predicate_open_paren_position(tokens, context_end)
+                || Self::predicate_open_paren_position(statement_tokens, statement_context_end))
+        {
+            return Vec::new();
         }
         if let Some(candidates) = Self::expected_create_sequence_option_keywords(
             tokens,

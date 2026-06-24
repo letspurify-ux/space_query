@@ -1839,10 +1839,17 @@ fn audit_final_suggestions_for(
     let mut data = IntellisenseData::new();
     data.tables = vec!["EMP".to_string(), "DEPT".to_string()];
     data.views = vec!["EMP_V".to_string()];
+    data.set_columns_for_table(
+        "EMP",
+        vec!["EMPNO".to_string(), "ENAME".to_string(), "SAL".to_string()],
+    );
+    data.set_columns_for_table("DEPT", vec!["DEPTNO".to_string(), "DNAME".to_string()]);
     data.rebuild_indices();
     let has = !prefix.is_empty();
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &ctx);
+    let column_scope = (!column_tables.is_empty()).then(|| column_tables.clone());
     let expr_keyword_ctx =
-        SqlEditorWidget::expression_keyword_context(&ctx, &data, &[], has, Some(db));
+        SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables, has, Some(db));
     let expected_object_kind =
         SqlEditorWidget::expected_object_suggestion_kind_for_db(&prefix, None, &ctx, Some(db));
     let expected_object_suggestions =
@@ -1859,10 +1866,10 @@ fn audit_final_suggestions_for(
             &mut data,
             &prefix,
             None,
-            None,
+            column_scope.as_deref(),
             matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
             context,
-            false,
+            ClauseCompletionPolicy::for_phase(ctx.phase, true).restrict_to_relation_columns,
             Some(db),
             expr_keyword_ctx,
         )
@@ -20562,6 +20569,7 @@ fn ddl_definition_list_detector_leaves_other_alter_operations_intact() {
     for (sql, expected) in [
         ("ALTER TABLE emp MODIFY (|)", intellisense_context::SqlPhase::DdlColumnList),
         ("ALTER TABLE emp MODIFY |", intellisense_context::SqlPhase::DdlColumnList),
+        ("ALTER TABLE emp DROP COLUMN |", intellisense_context::SqlPhase::DdlColumnList),
         ("ALTER TABLE emp RENAME COLUMN | TO x", intellisense_context::SqlPhase::DdlColumnList),
     ] {
         let ctx = analyze_inline_cursor_sql(sql);
@@ -20574,6 +20582,71 @@ fn ddl_definition_list_detector_leaves_other_alter_operations_intact() {
     let ctas = analyze_inline_cursor_sql("CREATE TABLE t AS SELECT | FROM emp");
     assert_eq!(ctas.phase, intellisense_context::SqlPhase::SelectList);
     assert!(!ctas.ddl_new_name_position);
+}
+
+#[test]
+fn alter_table_existing_column_operations_suggest_target_columns() {
+    let suggestions_for = |sql: &str| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        let ctx = analyze_inline_cursor_sql(sql);
+        let context = SqlEditorWidget::classify_intellisense_context(
+            &ctx,
+            ctx.statement_tokens.as_ref(),
+        );
+        assert_eq!(context, SqlContext::ColumnName, "{sql}");
+
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["EMP".to_string(), "DEPT".to_string()];
+        data.set_columns_for_table(
+            "EMP",
+            vec!["EMPNO".to_string(), "ENAME".to_string(), "SAL".to_string()],
+        );
+        data.set_columns_for_table("DEPT", vec!["DEPTNO".to_string(), "DNAME".to_string()]);
+        data.rebuild_indices();
+
+        let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &ctx);
+        assert_eq!(column_tables, vec!["emp".to_string()], "{sql}");
+        let column_scope = (!column_tables.is_empty()).then(|| column_tables.clone());
+        let expr_keyword_ctx = SqlEditorWidget::expression_keyword_context(
+            &ctx,
+            &data,
+            &column_tables,
+            !prefix.is_empty(),
+            Some(crate::db::DatabaseType::Oracle),
+        );
+
+        SqlEditorWidget::base_suggestions_for_context(
+            &mut data,
+            &prefix,
+            None,
+            column_scope.as_deref(),
+            matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
+            context,
+            ClauseCompletionPolicy::for_phase(ctx.phase, true).restrict_to_relation_columns,
+            Some(crate::db::DatabaseType::Oracle),
+            expr_keyword_ctx,
+        )
+    };
+
+    for sql in [
+        "ALTER TABLE emp MODIFY |",
+        "ALTER TABLE emp MODIFY (|)",
+        "ALTER TABLE emp DROP COLUMN |",
+        "ALTER TABLE emp RENAME COLUMN | TO new_name",
+    ] {
+        let suggestions = suggestions_for(sql);
+        assert!(
+            suggestions.iter().any(|value| value == "ENAME")
+                && suggestions.iter().any(|value| value == "EMPNO"),
+            "`{sql}` should suggest EMP columns: {suggestions:?}"
+        );
+        assert!(
+            !suggestions.iter().any(|value| value == "DNAME" || value == "DEPT"),
+            "`{sql}` leaked unrelated relation data: {suggestions:?}"
+        );
+    }
 }
 
 #[test]
@@ -28342,6 +28415,72 @@ fn expression_keyword_completion_is_position_aware() {
     assert!(has(&s, "ENAME"), "column dropped at operand-start: {s:?}");
 }
 
+#[test]
+fn sql_value_expression_suppresses_relation_names() {
+    use crate::db::DatabaseType::Oracle;
+
+    fn suggestions(sql_with_cursor: &str, emp_columns: &[&str]) -> Vec<String> {
+        let cursor = sql_with_cursor.find('|').expect("cursor marker");
+        let sql = sql_with_cursor.replace('|', "");
+        let ctx = analyze_inline_cursor_sql(sql_with_cursor);
+        let context =
+            SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+        let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &ctx);
+        let column_scope = (!column_tables.is_empty()).then(|| column_tables.clone());
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["EMP".to_string(), "DEPT".to_string()];
+        data.views = vec!["EMP_V".to_string()];
+        data.set_columns_for_table(
+            "EMP",
+            emp_columns.iter().map(|column| (*column).to_string()).collect(),
+        );
+        data.rebuild_indices();
+        let expr_keyword_ctx =
+            SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables, !prefix.is_empty(), Some(Oracle));
+        SqlEditorWidget::base_suggestions_for_context(
+            &mut data,
+            &prefix,
+            None,
+            column_scope.as_deref(),
+            matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
+            context,
+            false,
+            Some(Oracle),
+            expr_keyword_ctx,
+        )
+    }
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+
+    for sql in [
+        "SELECT a, |",
+        "SELECT empno FROM emp GROUP BY empno, |",
+        "SELECT * FROM emp WHERE empno = |",
+        "SELECT * FROM emp WHERE empno = 1 AND |",
+    ] {
+        let s = suggestions(sql, &["ENAME", "EMPNO"]);
+        assert!(
+            !has(&s, "EMP") && !has(&s, "DEPT") && !has(&s, "EMP_V"),
+            "relation names leaked into SQL value/column expression for `{sql}`: {s:?}"
+        );
+    }
+
+    let rhs = suggestions("SELECT * FROM emp WHERE empno = |", &["ENAME", "EMPNO"]);
+    assert!(has(&rhs, "ENAME"), "scoped column was wrongly suppressed: {rhs:?}");
+
+    let column_named_like_table = suggestions("SELECT emp| FROM emp", &["EMP", "EMPNO"]);
+    assert!(
+        has(&column_named_like_table, "EMP"),
+        "real scoped column named like a table must be preserved: {column_named_like_table:?}"
+    );
+
+    let relation_slot = suggestions("SELECT * FROM |", &["ENAME", "EMPNO"]);
+    assert!(
+        has(&relation_slot, "EMP") && has(&relation_slot, "DEPT"),
+        "relation names must remain available in FROM slots: {relation_slot:?}"
+    );
+}
+
 /// The analytic/aggregate continuations `OVER`, `KEEP` and `WITHIN` (GROUP) are
 /// only grammatical immediately after a closed call — `SUM(x) OVER (…)`,
 /// `MAX(x) KEEP (DENSE_RANK …)`, `LISTAGG(…) WITHIN GROUP (…)`. After any other
@@ -30668,6 +30807,13 @@ fn columns_suppressed_immediately_after_a_complete_operand() {
 #[test]
 fn predicate_open_paren_slots_suppress_columns_only_before_the_list() {
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+    let keywords = |sql: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &analyze_inline_cursor_sql(sql),
+            Some(crate::db::DatabaseType::Oracle),
+        )
+    };
     for sql in [
         "SELECT * FROM emp WHERE empno IN |",
         "SELECT * FROM emp WHERE empno NOT IN |",
@@ -30679,6 +30825,11 @@ fn predicate_open_paren_slots_suppress_columns_only_before_the_list() {
         assert!(
             suggestions.is_empty(),
             "IN-list opener slot should not offer identifier material for `{sql}`: {suggestions:?}"
+        );
+        assert!(
+            keywords(sql).is_empty(),
+            "IN-list opener slot should not offer expression keywords for `{sql}`: {:?}",
+            keywords(sql)
         );
     }
 
@@ -36731,11 +36882,26 @@ fn plsql_exception_handler_name_slot_keeps_only_packages_and_spares_case_when() 
         let ctx = analyze_inline_cursor_sql(sql);
         let context =
             SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
-        let ekc =
-            SqlEditorWidget::expression_keyword_context(&ctx, &data, &[], !prefix.is_empty(), db);
+        let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &ctx);
+        let column_scope = (!column_tables.is_empty()).then(|| column_tables.clone());
+        let ekc = SqlEditorWidget::expression_keyword_context(
+            &ctx,
+            &data,
+            &column_tables,
+            !prefix.is_empty(),
+            db,
+        );
         let inc = matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll);
         SqlEditorWidget::base_suggestions_for_context(
-            &mut data, &prefix, None, None, inc, context, false, db, ekc,
+            &mut data,
+            &prefix,
+            None,
+            column_scope.as_deref(),
+            inc,
+            context,
+            false,
+            db,
+            ekc,
         )
     };
 
@@ -36786,8 +36952,8 @@ fn plsql_exception_handler_name_slot_keeps_only_packages_and_spares_case_when() 
     assert!(
         base("SELECT CASE WHEN | THEN 1 END FROM emp")
             .iter()
-            .any(|s| s == "EMP"),
-        "CASE WHEN condition must keep relation/column completion"
+            .any(|s| s == "EMPNO"),
+        "CASE WHEN condition must keep column completion"
     );
 }
 
@@ -38263,9 +38429,12 @@ fn table_clause_constructs_stop_offering_keywords_once_closed() {
     }
 
     // Open constructs still progress precisely.
+    assert!(!has(&kw("SELECT * FROM t PIVOT (|"), "FOR"));
+    assert!(!has(&kw("SELECT * FROM t PIVOT (sum(|"), "FOR"));
     assert_eq!(kw("SELECT * FROM t PIVOT (sum(x) |"), vec!["FOR".to_string()]);
     assert_eq!(kw("SELECT * FROM t PIVOT (sum(x) FOR y |"), vec!["IN".to_string()]);
     // Inside the UNPIVOT body the grammar is `col FOR …`, not the pre-body modifier.
+    assert!(!has(&kw("SELECT * FROM t UNPIVOT (|"), "FOR"));
     assert_eq!(kw("SELECT * FROM t UNPIVOT (x |"), vec!["FOR".to_string()]);
     assert_eq!(
         kw("SELECT * FROM t UNPIVOT |"),
