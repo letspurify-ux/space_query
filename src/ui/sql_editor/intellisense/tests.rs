@@ -1839,7 +1839,8 @@ fn audit_final_suggestions_for(
     let ctx = analyze_inline_cursor_sql(sql);
     let context = SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
     let (prefix, word_start, _) = crate::ui::intellisense::get_word_at_cursor(&s, cursor);
-    let has_qualifier = word_start > 0 && s[..word_start].trim_end().ends_with('.');
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&s, word_start);
+    let has_qualifier = qualifier.is_some();
     let mut data = IntellisenseData::new();
     data.tables = vec![
         "EMP".to_string(),
@@ -1855,6 +1856,36 @@ fn audit_final_suggestions_for(
     data.functions = vec!["CALC_TOTAL".to_string()];
     data.triggers = vec!["BI_EMP".to_string()];
     data.events = vec!["CLEANUP_EVENT".to_string()];
+    data.set_members_for_qualifier_with_kinds(
+        "APP",
+        vec![
+            ("EMP".to_string(), Some(QualifiedMemberKind::Table)),
+            ("EMP_VIEW".to_string(), Some(QualifiedMemberKind::View)),
+            ("EMP_FUNC".to_string(), Some(QualifiedMemberKind::Function)),
+            ("EMP_PROC".to_string(), Some(QualifiedMemberKind::Procedure)),
+            ("EMP_TRG".to_string(), Some(QualifiedMemberKind::Trigger)),
+            ("EMP_EVENT".to_string(), Some(QualifiedMemberKind::Event)),
+            ("EMP_USER".to_string(), Some(QualifiedMemberKind::User)),
+        ],
+    );
+    data.set_relation_members_for_qualifier(
+        "APP",
+        vec!["EMP".to_string(), "EMP_VIEW".to_string()],
+    );
+    data.set_members_for_qualifier_with_kinds(
+        "SCOTT",
+        vec![
+            ("EMP".to_string(), Some(QualifiedMemberKind::Table)),
+            ("EMP_V".to_string(), Some(QualifiedMemberKind::View)),
+            ("RUN_JOB".to_string(), Some(QualifiedMemberKind::Procedure)),
+            ("CALC_TOTAL".to_string(), Some(QualifiedMemberKind::Function)),
+            ("ADDRESS_T".to_string(), Some(QualifiedMemberKind::Type)),
+        ],
+    );
+    data.set_relation_members_for_qualifier(
+        "SCOTT",
+        vec!["EMP".to_string(), "EMP_V".to_string()],
+    );
     data.set_columns_for_table(
         "EMP",
         vec!["EMPNO".to_string(), "ENAME".to_string(), "SAL".to_string()],
@@ -1911,7 +1942,24 @@ fn audit_final_suggestions_for(
     data.rebuild_indices();
     let has = !prefix.is_empty();
     let trigger_has_identifier = has || has_qualifier;
-    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &ctx);
+    let qualified_completion_mode = qualifier.as_deref().and_then(|qualifier| {
+        SqlEditorWidget::resolve_qualified_completion_mode_for_db(
+            qualifier,
+            context,
+            &ctx,
+            &data,
+            Some(db),
+        )
+    });
+    let qualified_mode_uses_members = matches!(
+        qualified_completion_mode,
+        Some(QualifiedCompletionMode::RelationMembers | QualifiedCompletionMode::ObjectMembers)
+    );
+    let column_tables = if qualified_mode_uses_members {
+        Vec::new()
+    } else {
+        SqlEditorWidget::resolve_column_tables_for_context(qualifier.as_deref(), &ctx)
+    };
     let column_scope = (!column_tables.is_empty()).then(|| column_tables.clone());
     let expr_keyword_ctx =
         SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables, has, Some(db));
@@ -1939,6 +1987,11 @@ fn audit_final_suggestions_for(
             &ctx,
             trigger_has_identifier,
         )
+        || (has_qualifier
+            && SqlEditorWidget::cursor_is_at_qualified_identifier_suppression_slot_for_context(
+                &ctx,
+                Some(db),
+            ))
         || SqlEditorWidget::cursor_is_in_invalid_set_operation_branch_for_context(
             &ctx,
             trigger_has_identifier,
@@ -1946,18 +1999,39 @@ fn audit_final_suggestions_for(
     {
         return (None, Vec::new(), Vec::new());
     }
-    let expected_object_kind =
-        SqlEditorWidget::expected_object_suggestion_kind_for_db(&prefix, None, &ctx, Some(db));
-    let expected_object_suggestions =
-        SqlEditorWidget::collect_expected_object_suggestions_for_db(&mut data, &prefix, &ctx, Some(db));
-    let at_keyword_only = SqlEditorWidget::cursor_is_at_identifier_suppressing_keyword_slot_for_context(&ctx, has, Some(db))
-        || SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot_for_db(&ctx, has, Some(db));
+    let expected_object_kind = SqlEditorWidget::expected_object_suggestion_kind_for_db(
+        &prefix,
+        qualifier.as_deref(),
+        &ctx,
+        Some(db),
+    );
+    let expected_object_suggestions = if qualifier.is_none() {
+        SqlEditorWidget::collect_expected_object_suggestions_for_db(
+            &mut data,
+            &prefix,
+            &ctx,
+            Some(db),
+        )
+    } else {
+        Vec::new()
+    };
+    let at_keyword_only = qualifier.is_none()
+        && (SqlEditorWidget::cursor_is_at_identifier_suppressing_keyword_slot_for_context(
+            &ctx,
+            has,
+            Some(db),
+        ) || SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot_for_db(
+            &ctx,
+            has,
+            Some(db),
+        ));
     let at_data_type =
-        SqlEditorWidget::data_type_position_for_context_for_db(&ctx, has, Some(db)).is_some()
+        qualifier.is_none()
+            && (SqlEditorWidget::data_type_position_for_context_for_db(&ctx, has, Some(db)).is_some()
             || SqlEditorWidget::data_type_position_for_context_for_db(&ctx, true, Some(db))
-                .is_some();
+                .is_some());
     let restrict_to_relation_columns =
-        ClauseCompletionPolicy::for_phase(ctx.phase, true).restrict_to_relation_columns;
+        ClauseCompletionPolicy::for_phase(ctx.phase, qualifier.is_some()).restrict_to_relation_columns;
     let source_allowance =
         CompletionSourcePolicy::new(
             restrict_to_relation_columns && !at_data_type,
@@ -1967,10 +2041,35 @@ fn audit_final_suggestions_for(
             false,
             expr_keyword_ctx,
         )
-            .allowance(context, None, expr_keyword_ctx);
-    let mut suggestions = if at_data_type {
+            .allowance(context, qualifier.as_deref(), expr_keyword_ctx);
+    let qualified_member_suggestions = match (qualifier.as_deref(), qualified_completion_mode) {
+        (Some(qualifier), Some(QualifiedCompletionMode::RelationMembers)) => {
+            SqlEditorWidget::expected_relation_member_suggestions_for_qualifier_for_db(
+                &mut data,
+                qualifier,
+                &prefix,
+                &ctx,
+                Some(db),
+            )
+        }
+        (Some(qualifier), Some(QualifiedCompletionMode::ObjectMembers)) => {
+            SqlEditorWidget::expected_member_suggestions_for_qualifier_for_db(
+                &mut data,
+                qualifier,
+                &prefix,
+                &ctx,
+                Some(db),
+            )
+        }
+        _ => Vec::new(),
+    };
+    let replace_table_context_with_expected_objects =
+        qualifier.is_none() && expected_object_kind.is_some();
+    let mut suggestions = if !qualified_member_suggestions.is_empty() {
+        qualified_member_suggestions
+    } else if at_data_type {
         data.get_type_object_suggestions(&prefix)
-    } else if expected_object_kind.is_some() {
+    } else if replace_table_context_with_expected_objects {
         expected_object_suggestions.clone()
     } else if at_keyword_only && !at_data_type {
         Vec::new()
@@ -1980,7 +2079,7 @@ fn audit_final_suggestions_for(
         SqlEditorWidget::base_suggestions_for_context(
             &mut data,
             &prefix,
-            None,
+            qualifier.as_deref(),
             column_scope.as_deref(),
             matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
             context,
@@ -21915,6 +22014,100 @@ fn resolve_qualified_completion_mode_uses_schema_members_for_oracle_object_ddl_c
 }
 
 #[test]
+fn qualified_value_and_keyword_only_slots_do_not_use_schema_members() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let mut data = IntellisenseData::new();
+    data.set_members_for_qualifier_with_kinds(
+        "SCOTT",
+        vec![
+            ("EMP".to_string(), Some(QualifiedMemberKind::Table)),
+            ("RUN_JOB".to_string(), Some(QualifiedMemberKind::Procedure)),
+            ("ADDRESS_T".to_string(), Some(QualifiedMemberKind::Type)),
+        ],
+    );
+    data.set_relation_members_for_qualifier("SCOTT", vec!["EMP".to_string()]);
+
+    for (db, sql) in [
+        (Oracle, "COMMENT ON TABLE emp IS scott.|"),
+        (Oracle, "COMMENT ON COLUMN emp.sal IS scott.|"),
+        (Oracle, "CREATE SEQUENCE s START WITH scott.|"),
+        (Oracle, "CREATE TABLE t (a NUMBER) TABLESPACE scott.|"),
+        (Oracle, "DROP TABLE emp PURGE scott.|"),
+        (Oracle, "LOCK TABLE emp IN SHARE scott.|"),
+        (Oracle, "SELECT * FROM emp e ORDER e.|"),
+        (Oracle, "SELECT * FROM emp e GROUP e.|"),
+        (Oracle, "SELECT * FROM emp e ORDER BY empno ASC e.|"),
+        (Oracle, "SELECT * FROM emp e JOIN dept d e.|"),
+        (Oracle, "SELECT empno FROM emp UNION e.|"),
+        (Oracle, "UPDATE emp e.|"),
+        (Oracle, "DELETE FROM emp e.|"),
+        (Oracle, "ALTER TABLE emp e.|"),
+        (Oracle, "GRANT SELECT ON emp TO scott e.|"),
+        (Oracle, "REVOKE SELECT ON emp FROM scott e.|"),
+        (MySQL, "CREATE DATABASE db CHARACTER SET scott.|"),
+        (MySQL, "CREATE USER alice IDENTIFIED BY scott.|"),
+        (MySQL, "CREATE TABLESPACE ts ADD DATAFILE scott.|"),
+        (MySQL, "ALTER TABLESPACE ts ADD DATAFILE scott.|"),
+        (MySQL, "SET NAMES utf8mb4 COLLATE scott.|"),
+        (MySQL, "CREATE INDEX ix ON emp (empno) e.|"),
+        (MySQL, "ALTER TABLE emp ADD COLUMN id INT e.|"),
+        (MySQL, "CREATE TRIGGER trg BEFORE e.|"),
+        (MySQL, "SELECT * FROM emp e ORDER e.|"),
+        (MySQL, "SELECT * FROM emp e GROUP e.|"),
+        (Oracle, "SELECT * FROM emp e WHERE empno IS e.|"),
+        (Oracle, "SELECT * FROM emp e FETCH FIRST 1 ROWS ONLY e.|"),
+        (MySQL, "SELECT * FROM emp e WHERE ename COLLATE e.|"),
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        let context =
+            SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+        assert!(
+            SqlEditorWidget::cursor_is_at_qualified_identifier_suppression_slot_for_context(
+                &ctx,
+                Some(db),
+            ),
+            "`{sql}` should be a qualified value/keyword-only suppression slot"
+        );
+        assert_eq!(
+            SqlEditorWidget::resolve_qualified_completion_mode_for_db(
+                "scott",
+                context,
+                &ctx,
+                &data,
+                Some(db),
+            ),
+            None,
+            "qualified value/keyword-only slot must not switch to schema members for `{sql}`"
+        );
+        assert!(
+            audit_final_suggestions_for(sql, db).2.is_empty(),
+            "qualified value/keyword-only slot leaked final suggestions for `{sql}`"
+        );
+    }
+
+    for (db, sql) in [
+        (Oracle, "DROP TABLE scott.|"),
+        (Oracle, "GRANT SELECT ON scott.|"),
+        (Oracle, "SELECT CAST(empno AS scott.|) FROM emp"),
+        (Oracle, "SELECT e.| FROM emp e"),
+        (Oracle, "SELECT * FROM emp e WHERE e.|"),
+        (MySQL, "DROP TABLE scott.|"),
+        (MySQL, "SHOW CREATE TABLE scott.|"),
+        (MySQL, "SELECT e.| FROM emp e"),
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        assert!(
+            !SqlEditorWidget::cursor_is_at_qualified_identifier_suppression_slot_for_context(
+                &ctx,
+                Some(db),
+            ),
+            "`{sql}` is a real qualified identifier slot and must stay open"
+        );
+    }
+}
+
+#[test]
 fn schema_object_context_prefers_all_members_when_relation_cache_also_exists() {
     let grant_execute_ctx = analyze_inline_cursor_sql("GRANT EXECUTE ON scott.|");
     let grant_select_ctx = analyze_inline_cursor_sql("GRANT SELECT ON scott.|");
@@ -26248,6 +26441,155 @@ fn prefixed_schema_object_member_slots_stay_within_expected_kind() {
         assert_eq!(
             suggestions, expected,
             "prefixed schema object slot leaked the wrong object kind for `{sql}`"
+        );
+    }
+}
+
+#[test]
+fn oracle_qualified_schema_member_final_suggestions_stay_within_expected_kind() {
+    use crate::db::DatabaseType::Oracle;
+
+    for (sql, expected) in [
+        ("DROP TABLE scott.e|", vec!["EMP"]),
+        ("DROP VIEW scott.e|", vec!["EMP_V"]),
+        ("GRANT SELECT ON scott.e|", vec!["EMP", "EMP_V"]),
+        ("GRANT EXECUTE ON scott.r|", vec!["RUN_JOB"]),
+        ("CALL scott.c|", vec!["CALC_TOTAL"]),
+        ("SELECT CAST(empno AS scott.a|) FROM emp", vec!["ADDRESS_T"]),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        let expected: Vec<String> = expected.into_iter().map(str::to_string).collect();
+        assert!(
+            kind.is_some(),
+            "qualified Oracle object slot lost expected kind for `{sql}`"
+        );
+        assert!(
+            keywords.is_empty(),
+            "qualified Oracle object slot should not merge keywords for `{sql}`: {keywords:?}"
+        );
+        assert_eq!(
+            final_suggestions, expected,
+            "qualified Oracle final suggestions leaked the wrong schema members for `{sql}`"
+        );
+    }
+}
+
+#[test]
+fn mysql_qualified_schema_member_slots_use_mysql_object_kinds() {
+    use crate::db::DatabaseType::MySQL;
+
+    let mut data = IntellisenseData::new();
+    data.set_members_for_qualifier_with_kinds(
+        "APP",
+        vec![
+            ("EMP".to_string(), Some(QualifiedMemberKind::Table)),
+            ("EMP_VIEW".to_string(), Some(QualifiedMemberKind::View)),
+            ("EMP_FUNC".to_string(), Some(QualifiedMemberKind::Function)),
+            ("EMP_PROC".to_string(), Some(QualifiedMemberKind::Procedure)),
+            ("EMP_TRG".to_string(), Some(QualifiedMemberKind::Trigger)),
+            ("EMP_EVENT".to_string(), Some(QualifiedMemberKind::Event)),
+            ("EMP_USER".to_string(), Some(QualifiedMemberKind::User)),
+        ],
+    );
+    data.set_relation_members_for_qualifier(
+        "APP",
+        vec!["EMP".to_string(), "EMP_VIEW".to_string()],
+    );
+
+    for (sql, expected) in [
+        ("SHOW CREATE FUNCTION app.emp|", vec!["EMP_FUNC"]),
+        ("SHOW CREATE PROCEDURE app.emp|", vec!["EMP_PROC"]),
+        ("SHOW CREATE TRIGGER app.emp|", vec!["EMP_TRG"]),
+        ("SHOW CREATE EVENT app.emp|", vec!["EMP_EVENT"]),
+        ("SHOW CREATE USER app.emp|", vec!["EMP_USER"]),
+        ("SHOW GRANTS FOR app.emp|", vec!["EMP_USER"]),
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        let context =
+            SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+        assert_eq!(
+            SqlEditorWidget::resolve_qualified_completion_mode_for_db(
+                "app",
+                context,
+                &ctx,
+                &data,
+                Some(MySQL),
+            ),
+            Some(QualifiedCompletionMode::ObjectMembers),
+            "`{sql}` should use schema object-member completion"
+        );
+
+        let suggestions = SqlEditorWidget::expected_member_suggestions_for_qualifier_for_db(
+            &mut data,
+            "app",
+            "emp",
+            &ctx,
+            Some(MySQL),
+        );
+        let expected: Vec<String> = expected.into_iter().map(str::to_string).collect();
+        assert_eq!(
+            suggestions, expected,
+            "MySQL qualified object slot leaked the wrong schema members for `{sql}`"
+        );
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, MySQL);
+        assert!(
+            keywords.is_empty(),
+            "qualified MySQL object slot should not merge keywords for `{sql}`: {keywords:?}"
+        );
+        assert!(
+            kind.is_some(),
+            "qualified MySQL object slot lost expected kind for `{sql}`"
+        );
+        assert_eq!(
+            final_suggestions, expected,
+            "qualified final suggestions leaked the wrong schema members for `{sql}`"
+        );
+    }
+
+    for (sql, expected) in [
+        ("SHOW CREATE TABLE app.emp|", vec!["EMP"]),
+        ("SHOW CREATE VIEW app.emp|", vec!["EMP_VIEW"]),
+        ("SHOW COLUMNS FROM app.emp|", vec!["EMP", "EMP_VIEW"]),
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        let context =
+            SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+        assert_eq!(
+            SqlEditorWidget::resolve_qualified_completion_mode_for_db(
+                "app",
+                context,
+                &ctx,
+                &data,
+                Some(MySQL),
+            ),
+            Some(QualifiedCompletionMode::ObjectMembers),
+            "`{sql}` should use schema object-member completion with relation-kind filtering"
+        );
+
+        let suggestions = SqlEditorWidget::expected_member_suggestions_for_qualifier_for_db(
+            &mut data,
+            "app",
+            "emp",
+            &ctx,
+            Some(MySQL),
+        );
+        let expected: Vec<String> = expected.into_iter().map(str::to_string).collect();
+        assert_eq!(
+            suggestions, expected,
+            "MySQL qualified relation slot leaked the wrong schema members for `{sql}`"
+        );
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, MySQL);
+        assert!(
+            keywords.is_empty(),
+            "qualified MySQL relation slot should not merge keywords for `{sql}`: {keywords:?}"
+        );
+        assert!(
+            kind.is_some(),
+            "qualified MySQL relation slot lost expected kind for `{sql}`"
+        );
+        assert_eq!(
+            final_suggestions, expected,
+            "qualified final suggestions leaked the wrong schema members for `{sql}`"
         );
     }
 }

@@ -1868,6 +1868,11 @@ impl SqlEditorWidget {
                 deep_ctx,
                 has_prefix || qualifier.is_some(),
             )
+            || (qualifier.is_some()
+                && Self::cursor_is_at_qualified_identifier_suppression_slot_for_context(
+                    deep_ctx,
+                    Some(snapshot.preferred_db_type),
+                ))
             || (qualifier.is_none()
                 && Self::cursor_is_at_select_list_alias_name_slot(
                     deep_ctx,
@@ -1993,7 +1998,13 @@ impl SqlEditorWidget {
                 let data = intellisense_data
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                Self::resolve_qualified_completion_mode(qualifier, context, deep_ctx, &data)
+                Self::resolve_qualified_completion_mode_for_db(
+                    qualifier,
+                    context,
+                    deep_ctx,
+                    &data,
+                    Some(snapshot.preferred_db_type),
+                )
             })
         };
         let qualified_mode_uses_members = matches!(
@@ -2131,22 +2142,24 @@ impl SqlEditorWidget {
                 let mut data = intellisense_data
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                Self::expected_relation_member_suggestions_for_qualifier(
+                Self::expected_relation_member_suggestions_for_qualifier_for_db(
                     &mut data,
                     qualifier,
                     &snapshot.prefix,
                     deep_ctx,
+                    Some(snapshot.preferred_db_type),
                 )
             }
             (Some(qualifier), Some(QualifiedCompletionMode::ObjectMembers)) => {
                 let mut data = intellisense_data
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                Self::expected_member_suggestions_for_qualifier(
+                Self::expected_member_suggestions_for_qualifier_for_db(
                     &mut data,
                     qualifier,
                     &snapshot.prefix,
                     deep_ctx,
+                    Some(snapshot.preferred_db_type),
                 )
             }
             _ => Vec::new(),
@@ -8921,9 +8934,22 @@ impl SqlEditorWidget {
         deep_ctx: &intellisense_context::CursorContext,
         data: &IntellisenseData,
     ) -> Option<QualifiedCompletionMode> {
+        Self::resolve_qualified_completion_mode_for_db(qualifier, context, deep_ctx, data, None)
+    }
+
+    fn resolve_qualified_completion_mode_for_db(
+        qualifier: &str,
+        context: SqlContext,
+        deep_ctx: &intellisense_context::CursorContext,
+        data: &IntellisenseData,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<QualifiedCompletionMode> {
         if deep_ctx.ddl_new_name_position
             || Self::cursor_is_at_create_object_new_name(deep_ctx, true)
             || Self::cursor_is_at_rename_target_new_name_slot_for_context(deep_ctx, true)
+            || Self::cursor_is_at_qualified_identifier_suppression_slot_for_context(
+                deep_ctx, db_type,
+            )
         {
             return None;
         }
@@ -8932,7 +8958,7 @@ impl SqlEditorWidget {
         }
 
         let expected_object_kind =
-            Self::expected_object_suggestion_kind("", Some(qualifier), deep_ctx);
+            Self::expected_object_suggestion_kind_for_db("", Some(qualifier), deep_ctx, db_type);
         if matches!(
             expected_object_kind,
             Some(ExpectedObjectSuggestionKind::NoSuggestions)
@@ -8983,6 +9009,25 @@ impl SqlEditorWidget {
         }
 
         None
+    }
+
+    fn cursor_is_at_qualified_identifier_suppression_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if Self::expected_object_suggestion_kind_for_db("", Some(""), deep_ctx, db_type)
+            .is_some_and(|kind| !matches!(kind, ExpectedObjectSuggestionKind::NoSuggestions))
+        {
+            return false;
+        }
+        let at_data_type_position =
+            Self::data_type_position_for_context_for_db(deep_ctx, true, db_type).is_some();
+        !at_data_type_position
+            && (Self::cursor_is_at_identifier_suppressing_keyword_slot_for_context(
+                deep_ctx, true, db_type,
+            ) || Self::cursor_is_at_column_suppressing_keyword_slot_for_db(
+                deep_ctx, true, db_type,
+            ))
     }
 
     fn qualified_column_owner_resolves_to_relation_columns(
@@ -28386,8 +28431,21 @@ impl SqlEditorWidget {
         prefix: &str,
         deep_ctx: &intellisense_context::CursorContext,
     ) -> Vec<String> {
+        Self::expected_member_suggestions_for_qualifier_for_db(
+            data, qualifier, prefix, deep_ctx, None,
+        )
+    }
+
+    fn expected_member_suggestions_for_qualifier_for_db(
+        data: &mut IntellisenseData,
+        qualifier: &str,
+        prefix: &str,
+        deep_ctx: &intellisense_context::CursorContext,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Vec<String> {
         let suggestions = data.get_member_suggestions(qualifier, prefix, false);
-        let Some(kind) = Self::expected_object_suggestion_kind(prefix, Some(qualifier), deep_ctx)
+        let Some(kind) =
+            Self::expected_object_suggestion_kind_for_db(prefix, Some(qualifier), deep_ctx, db_type)
         else {
             return suggestions;
         };
@@ -28445,8 +28503,20 @@ impl SqlEditorWidget {
         prefix: &str,
         deep_ctx: &intellisense_context::CursorContext,
     ) -> Vec<String> {
+        Self::expected_relation_member_suggestions_for_qualifier_for_db(
+            data, qualifier, prefix, deep_ctx, None,
+        )
+    }
+
+    fn expected_relation_member_suggestions_for_qualifier_for_db(
+        data: &mut IntellisenseData,
+        qualifier: &str,
+        prefix: &str,
+        deep_ctx: &intellisense_context::CursorContext,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Vec<String> {
         let suggestions = data.get_member_suggestions(qualifier, prefix, true);
-        let kind = Self::expected_object_suggestion_kind(prefix, Some(qualifier), deep_ctx)
+        let kind = Self::expected_object_suggestion_kind_for_db(prefix, Some(qualifier), deep_ctx, db_type)
             .or_else(|| {
                 let context =
                     Self::classify_intellisense_context(deep_ctx, deep_ctx.statement_tokens.as_ref());
