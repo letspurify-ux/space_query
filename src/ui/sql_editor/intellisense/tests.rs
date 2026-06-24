@@ -1925,12 +1925,15 @@ fn audit_final_suggestions_for(
         SqlEditorWidget::collect_expected_object_suggestions_for_db(&mut data, &prefix, &ctx, Some(db));
     let at_keyword_only = SqlEditorWidget::cursor_is_at_identifier_suppressing_keyword_slot_for_context(&ctx, has, Some(db))
         || SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot_for_db(&ctx, has, Some(db));
-    let at_data_type = SqlEditorWidget::data_type_position_for_context_for_db(&ctx, has, Some(db)).is_some();
+    let at_data_type =
+        SqlEditorWidget::data_type_position_for_context_for_db(&ctx, has, Some(db)).is_some()
+            || SqlEditorWidget::data_type_position_for_context_for_db(&ctx, true, Some(db))
+                .is_some();
     let restrict_to_relation_columns =
         ClauseCompletionPolicy::for_phase(ctx.phase, true).restrict_to_relation_columns;
     let source_allowance =
         CompletionSourcePolicy::new(
-            restrict_to_relation_columns,
+            restrict_to_relation_columns && !at_data_type,
             at_keyword_only,
             at_keyword_only,
             false,
@@ -1938,7 +1941,9 @@ fn audit_final_suggestions_for(
             expr_keyword_ctx,
         )
             .allowance(context, None, expr_keyword_ctx);
-    let mut suggestions = if expected_object_kind.is_some() {
+    let mut suggestions = if at_data_type {
+        data.get_type_object_suggestions(&prefix)
+    } else if expected_object_kind.is_some() {
         expected_object_suggestions.clone()
     } else if at_keyword_only && !at_data_type {
         Vec::new()
@@ -1964,7 +1969,7 @@ fn audit_final_suggestions_for(
             Some(db),
         );
     let expected_keywords =
-        if source_allowance.expected_keyword_suggestions || allow_dml_returning_into_keyword {
+        if source_allowance.expected_keyword_suggestions || allow_dml_returning_into_keyword || at_data_type {
         SqlEditorWidget::collect_expected_keyword_suggestions_with_expression_context(
             &prefix, &ctx, Some(db), Some(expr_keyword_ctx),
         )
@@ -40742,6 +40747,195 @@ fn prefixed_join_and_set_operator_slots_do_not_offer_object_catalog() {
             assert!(
                 !contains(&final_suggestions, leaked),
                 "{leaked} leaked into join target relation slot at `{sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn prefixed_expression_keyword_slots_do_not_offer_catalog() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for (db, sql, expected_keyword) in [
+        (Oracle, "SELECT empno FROM emp WHERE empno BETWEEN 1 A|", "AND"),
+        (Oracle, "SELECT empno FROM emp WHERE empno IS N|", "NULL"),
+        (Oracle, "SELECT empno FROM emp WHERE empno IS NOT N|", "NULL"),
+        (Oracle, "SELECT empno FROM emp ORDER BY empno D|", "DESC"),
+        (Oracle, "SELECT empno FROM emp ORDER BY empno N|", "NULLS"),
+        (Oracle, "SELECT empno FROM emp ORDER BY empno DESC N|", "NULLS"),
+        (Oracle, "SELECT empno FROM emp ORDER BY empno NULLS F|", "FIRST"),
+        (
+            Oracle,
+            "SELECT SUM(sal) OVER (ORDER BY sal R|) FROM emp",
+            "ROWS",
+        ),
+        (
+            Oracle,
+            "SELECT SUM(sal) OVER (ORDER BY sal ROWS BETWEEN UNBOUNDED P|) FROM emp",
+            "PRECEDING",
+        ),
+        (
+            Oracle,
+            "SELECT SUM(sal) OVER (ORDER BY sal ROWS BETWEEN CURRENT ROW AND CURRENT R|) FROM emp",
+            "ROW",
+        ),
+        (
+            Oracle,
+            "SELECT SUM(sal) OVER (ORDER BY sal ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE N|) FROM emp",
+            "NO",
+        ),
+        (
+            Oracle,
+            "SELECT empno FROM emp ORDER BY empno FETCH FIRST 10 ROWS W|",
+            "WITH",
+        ),
+        (Oracle, "SELECT empno FROM emp WHERE hiredate AT L|", "LOCAL"),
+        (MySQL, "SELECT empno FROM emp ORDER BY empno D|", "DESC"),
+        (
+            MySQL,
+            "SELECT SUM(sal) OVER (ORDER BY sal R|) FROM emp",
+            "ROWS",
+        ),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert!(
+            contains(&final_suggestions, expected_keyword),
+            "{expected_keyword} missing from prefixed expression keyword slot at `{sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "APP_USER",
+            "SCOTT",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "EMPNO",
+            "ENAME",
+            "DEPTNO",
+            "DNAME",
+            "P",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into prefixed expression keyword slot at `{sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+
+    for (db, sql, expected_column) in [
+        (
+            Oracle,
+            "SELECT empno FROM emp WHERE empno BETWEEN e| AND 10",
+            "EMPNO",
+        ),
+        (
+            Oracle,
+            "SELECT empno FROM emp WHERE empno BETWEEN 1 AND e|",
+            "EMPNO",
+        ),
+        (
+            Oracle,
+            "SELECT SUM(sal) OVER (ORDER BY sal ROWS BETWEEN e| AND CURRENT ROW) FROM emp",
+            "EMPNO",
+        ),
+        (
+            Oracle,
+            "SELECT SUM(sal) OVER (ORDER BY sal ROWS BETWEEN CURRENT ROW AND e|) FROM emp",
+            "EMPNO",
+        ),
+        (
+            MySQL,
+            "SELECT empno FROM emp WHERE empno BETWEEN e| AND 10",
+            "EMPNO",
+        ),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert!(
+            contains(&final_suggestions, expected_column),
+            "value slot lost `{expected_column}` at `{sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in ["AND", "ROWS", "RANGE", "PRECEDING", "FOLLOWING", "CURRENT"] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into value slot at `{sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn prefixed_data_type_slots_do_not_offer_catalog() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for (db, sql, expected_keyword) in [
+        (Oracle, "CREATE TABLE t (c D|)", Some("DATE")),
+        (Oracle, "CREATE TABLE t (c C|)", Some("CHAR")),
+        (Oracle, "ALTER TABLE emp ADD (c D|)", Some("DATE")),
+        (Oracle, "ALTER TABLE emp MODIFY (ename C|)", Some("CHAR")),
+        (Oracle, "SELECT CAST(empno AS C|) FROM emp", Some("CHAR")),
+        (Oracle, "SELECT XMLCAST(ename AS C|) FROM emp", Some("CHAR")),
+        (
+            Oracle,
+            "SELECT VALIDATE_CONVERSION(ename AS D|) FROM emp",
+            Some("DATE"),
+        ),
+        (
+            Oracle,
+            "SELECT JSON_VALUE(ename, '$.x' RETURNING C|) FROM emp",
+            Some("CHAR"),
+        ),
+        (Oracle, "DECLARE v C| BEGIN NULL; END;", Some("CHAR")),
+        (
+            Oracle,
+            "CREATE FUNCTION f(p D|) RETURN NUMBER IS BEGIN RETURN 1; END;",
+            Some("DATE"),
+        ),
+        (
+            Oracle,
+            "CREATE FUNCTION f RETURN D| IS BEGIN RETURN SYSDATE; END;",
+            Some("DATE"),
+        ),
+        (Oracle, "CREATE TYPE ty AS TABLE OF C|", Some("CHAR")),
+        (Oracle, "VAR v C|", Some("CHAR")),
+        (Oracle, "CREATE TABLE t (c E|)", None),
+        (MySQL, "CREATE TABLE t (c D|)", Some("DATE")),
+        (MySQL, "CREATE TABLE t (c VAR|)", Some("VARCHAR")),
+        (MySQL, "ALTER TABLE emp ADD c D|", Some("DATE")),
+        (MySQL, "ALTER TABLE emp MODIFY ename VAR|", Some("VARCHAR")),
+        (MySQL, "SELECT CAST(empno AS D|) FROM emp", Some("DATE")),
+        (MySQL, "CREATE PROCEDURE pr(p D|) BEGIN END", Some("DATE")),
+        (MySQL, "CREATE TABLE t (c E|)", None),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        if let Some(expected_keyword) = expected_keyword {
+            assert!(
+                contains(&final_suggestions, expected_keyword),
+                "{expected_keyword} missing from prefixed data-type slot at `{sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "APP_USER",
+            "SCOTT",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "BI_EMP",
+            "CLEANUP_EVENT",
+            "EMPNO",
+            "ENAME",
+            "DEPTNO",
+            "DNAME",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into prefixed data-type slot at `{sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
             );
         }
     }

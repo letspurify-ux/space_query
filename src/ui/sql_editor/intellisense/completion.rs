@@ -2044,7 +2044,7 @@ impl SqlEditorWidget {
         let mut effective_expr_keyword_ctx = expr_keyword_ctx;
         effective_expr_keyword_ctx.expected_operand_type = effective_expected_operand_type;
         let source_policy = CompletionSourcePolicy::new(
-            restrict_to_relation_columns,
+            restrict_to_relation_columns && !at_data_type_position,
             at_keyword_only_identifier_slot,
             at_keyword_only_slot,
             at_tool_bind_name_slot,
@@ -2151,6 +2151,7 @@ impl SqlEditorWidget {
             );
         let expected_keyword_suggestions = if source_allowance.expected_keyword_suggestions
             || allow_dml_returning_into_keyword
+            || at_data_type_position
         {
             Self::collect_expected_keyword_suggestions_with_expression_context(
                 &snapshot.prefix,
@@ -2367,8 +2368,6 @@ impl SqlEditorWidget {
             qualified_member_suggestions
         } else if !source_allowance.base_catalog_suggestions {
             Vec::new()
-        } else if replace_table_context_with_expected_objects {
-            expected_object_suggestions.clone()
         } else if at_data_type_position {
             // A data-type slot (`CAST(x AS |)`, a column/PL-SQL type) admits
             // only type names: the dialect type keywords come from the expected-
@@ -2379,6 +2378,8 @@ impl SqlEditorWidget {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             data.get_type_object_suggestions(&snapshot.prefix)
+        } else if replace_table_context_with_expected_objects {
+            expected_object_suggestions.clone()
         } else if at_keyword_only_identifier_slot || at_keyword_only_slot {
             // A pure keyword/value-only slot: a clause-keyword continuation, an
             // ORDER BY sort modifier tail, an `IS` predicate tail, an `IN` list
@@ -20284,7 +20285,16 @@ impl SqlEditorWidget {
             cursor_token_len,
             exclude_current_identifier_chain,
         );
-        let position = Self::data_type_position(tokens, end);
+        let position = Self::data_type_position(tokens, end).or_else(|| {
+            exclude_current_identifier_chain
+                .then(|| {
+                    Self::data_type_position(
+                        tokens,
+                        Self::context_end_before_current_word(tokens, cursor_token_len)?,
+                    )
+                })
+                .flatten()
+        });
         if let Some(position) = position {
             return Self::data_type_position_allowed_for_db(position, db_type).then_some(position);
         }
@@ -20294,14 +20304,37 @@ impl SqlEditorWidget {
             deep_ctx.cursor_token_len,
             exclude_current_identifier_chain,
         );
-        match Self::data_type_position(statement_tokens, statement_end) {
-            Some(DataTypePosition::TypeObject)
-                if Self::data_type_position_allowed_for_db(DataTypePosition::TypeObject, db_type) =>
-            {
-                Some(DataTypePosition::TypeObject)
-            }
-            _ => None,
+        let statement_position =
+            Self::data_type_position(statement_tokens, statement_end).or_else(|| {
+                exclude_current_identifier_chain
+                    .then(|| {
+                        Self::data_type_position(
+                            statement_tokens,
+                            Self::context_end_before_current_word(
+                                statement_tokens,
+                                deep_ctx.cursor_token_len,
+                            )?,
+                        )
+                    })
+                    .flatten()
+            });
+        if let Some(position) = statement_position {
+            return Self::data_type_position_allowed_for_db(position, db_type).then_some(position);
         }
+        None
+    }
+
+    fn context_end_before_current_word(
+        tokens: &[SqlToken],
+        cursor_token_len: usize,
+    ) -> Option<usize> {
+        let end = cursor_token_len.min(tokens.len());
+        end.checked_sub(1).filter(|idx| {
+            matches!(
+                tokens.get(*idx),
+                Some(SqlToken::Word(_) | SqlToken::String(_))
+            )
+        })
     }
 
     fn data_type_position_allowed_for_db(
@@ -25513,6 +25546,9 @@ impl SqlEditorWidget {
         if !Self::cursor_enclosing_paren_is_query_block(tokens, end) {
             return None;
         }
+        if Self::cursor_is_in_mysql_set_role_except_syntax(tokens, end) {
+            return None;
+        }
         let is_set_op =
             |word: &str| SET_OPERATORS.iter().any(|op| word.eq_ignore_ascii_case(op));
         let is_multiset_set_op = |toks: &[&SqlToken], set_op_idx: usize| {
@@ -26228,7 +26264,16 @@ impl SqlEditorWidget {
         ) {
             return Vec::new();
         }
-        if let Some(position) = Self::data_type_position(tokens, context_end) {
+        if let Some(candidates) =
+            Self::expected_set_operator_keyword_candidates(statement_tokens, statement_context_end)
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(position) = Self::data_type_position_for_context_for_db(
+            deep_ctx,
+            !prefix.is_empty(),
+            db_type,
+        ) {
             if position != DataTypePosition::TypeObject {
                 return Self::filter_expected_candidates(
                     prefix,
@@ -26574,7 +26619,11 @@ impl SqlEditorWidget {
             return Self::filter_expected_candidates(prefix, candidates);
         }
 
-        if let Some(position) = Self::data_type_position(tokens, context_end) {
+        if let Some(position) = Self::data_type_position_for_context_for_db(
+            deep_ctx,
+            !prefix.is_empty(),
+            db_type,
+        ) {
             return Self::filter_expected_candidates(
                 prefix,
                 data_type_keywords_for(db_type, position),
@@ -26925,11 +26974,6 @@ impl SqlEditorWidget {
             return Self::filter_expected_candidates(prefix, candidates);
         }
         if let Some(candidates) = Self::merge_when_action_keywords(tokens, context_end) {
-            return Self::filter_expected_candidates(prefix, candidates);
-        }
-        if let Some(candidates) =
-            Self::expected_set_operator_keyword_candidates(statement_tokens, statement_context_end)
-        {
             return Self::filter_expected_candidates(prefix, candidates);
         }
         if Self::cursor_is_at_locking_clause_keyword_slot_for_context(deep_ctx, !prefix.is_empty()) {

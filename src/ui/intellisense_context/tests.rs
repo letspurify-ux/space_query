@@ -10510,6 +10510,22 @@ fn ddl_alter_table_add_positions_are_new_name() {
 }
 
 #[test]
+fn ddl_alter_table_type_prefix_positions_are_not_new_name() {
+    for sql in [
+        "ALTER TABLE emp ADD salary D|",
+        "ALTER TABLE emp ADD COLUMN salary D|",
+        "ALTER TABLE emp ADD salary INT |",
+        "ALTER TABLE emp CHANGE old_name new_name D|",
+    ] {
+        let ctx = analyze(sql);
+        assert!(
+            !ctx.ddl_new_name_position,
+            "type position must not be treated as a new name: {sql}"
+        );
+    }
+}
+
+#[test]
 fn ddl_alter_table_rename_target_is_new_name() {
     for sql in [
         "ALTER TABLE emp RENAME TO |",

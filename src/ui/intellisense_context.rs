@@ -633,6 +633,7 @@ fn ddl_alter_table_introduces_new_name(tokens: &[SqlToken], cursor_token_len: us
     // name has been passed, after which the cursor is at the new-name/data-type
     // position rather than the (existing) source column.
     let mut change_source_seen = false;
+    let mut action_words: Vec<String> = Vec::new();
     for token in &sig[after_table..] {
         if token_is_symbol(token, "(") {
             depth += 1;
@@ -649,6 +650,7 @@ fn ddl_alter_table_introduces_new_name(tokens: &[SqlToken], cursor_token_len: us
             saw_references = false;
             saw_to = false;
             change_source_seen = false;
+            action_words.clear();
             continue;
         }
         if let SqlToken::Word(word) = token {
@@ -663,12 +665,20 @@ fn ddl_alter_table_introduces_new_name(tokens: &[SqlToken], cursor_token_len: us
                     saw_references = false;
                     saw_to = false;
                     change_source_seen = false;
+                    action_words.clear();
                 }
-                "REFERENCES" => saw_references = true,
-                "TO" => saw_to = true,
+                "REFERENCES" => {
+                    saw_references = true;
+                    action_words.push("REFERENCES".to_string());
+                }
+                "TO" => {
+                    saw_to = true;
+                    action_words.push("TO".to_string());
+                }
                 // The optional `COLUMN` keyword precedes the source name.
                 "COLUMN" => {}
                 _ => {
+                    action_words.push(word.to_ascii_uppercase());
                     if op == Some("CHANGE") {
                         change_source_seen = true;
                     }
@@ -685,14 +695,50 @@ fn ddl_alter_table_introduces_new_name(tokens: &[SqlToken], cursor_token_len: us
     match op {
         // After ADD every top-level name is a new column/constraint name or a
         // data type — except the `REFERENCES <table>` target.
-        Some("ADD") => !saw_references,
+        Some("ADD") => !saw_references && ddl_alter_table_add_action_is_new_name(&action_words),
         // `RENAME [COLUMN x] TO <newname>` introduces a new name after `TO`.
         Some("RENAME") => saw_to,
         // `CHANGE [COLUMN] old new …`: once the source column is named, the rest
         // of the clause is the new name and its data type.
-        Some("CHANGE") => change_source_seen,
+        Some("CHANGE") => change_source_seen && action_words.len() <= 2,
         _ => false,
     }
+}
+
+fn ddl_alter_table_add_action_is_new_name(action_words: &[String]) -> bool {
+    match action_words {
+        [] => true,
+        [word] if word == "CONSTRAINT" => true,
+        [word] if word.len() >= 2 && ddl_alter_table_add_structural_keyword_starts_with(word) => {
+            false
+        }
+        [word]
+            if matches!(
+                word.as_str(),
+                "PRIMARY" | "FOREIGN" | "UNIQUE" | "CHECK" | "KEY" | "INDEX"
+            ) =>
+        {
+            false
+        }
+        [_] => true,
+        [first, ..] if first == "CONSTRAINT" => true,
+        _ => false,
+    }
+}
+
+fn ddl_alter_table_add_structural_keyword_starts_with(prefix: &str) -> bool {
+    [
+        "COLUMN",
+        "CONSTRAINT",
+        "PRIMARY",
+        "UNIQUE",
+        "FOREIGN",
+        "KEY",
+        "INDEX",
+        "CHECK",
+    ]
+    .iter()
+    .any(|keyword| keyword.starts_with(prefix))
 }
 
 /// True when the cursor sits at the *target* of a `RENAME … TO <newname>`
