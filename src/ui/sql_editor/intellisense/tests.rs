@@ -41007,6 +41007,57 @@ fn ddl_object_target_slots_are_precise_in_final_suggestions() {
 }
 
 #[test]
+fn mysql_prefixed_non_user_object_slots_do_not_merge_user_schemas() {
+    use crate::db::DatabaseType::MySQL;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for sql in [
+        "DROP TABLE app|",
+        "DROP VIEW app|",
+        "SHOW CREATE TABLE app|",
+        "SHOW CREATE VIEW app|",
+        "SHOW COLUMNS FROM app|",
+        "GRANT SELECT ON app| TO scott",
+        "CREATE INDEX ix ON app|",
+        "CREATE TRIGGER trg BEFORE INSERT ON app|",
+        "CREATE TABLE child (parent_id INT REFERENCES app|)",
+        "COMMENT ON TABLE app|",
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, MySQL);
+        assert!(
+            kind.is_some(),
+            "prefixed MySQL object slot lost expected object kind at `{sql}`; keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in ["APP_USER", "SCOTT"] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked as a schema/user into prefixed non-user object slot at `{sql}`: {final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn oracle_prefixed_object_slots_keep_schema_name_suggestions() {
+    use crate::db::DatabaseType::Oracle;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for sql in ["DROP TABLE app|", "COMMENT ON TABLE app|", "GRANT SELECT ON app| TO scott"] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert!(
+            kind.is_some(),
+            "prefixed Oracle object slot lost expected object kind at `{sql}`; keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            contains(&final_suggestions, "APP_USER"),
+            "Oracle object slot should keep schema/user prefix suggestion at `{sql}`: {final_suggestions:?}"
+        );
+    }
+}
+
+#[test]
 fn mysql_option_value_slots_do_not_offer_object_catalog_in_final_suggestions() {
     use crate::db::DatabaseType::MySQL;
 

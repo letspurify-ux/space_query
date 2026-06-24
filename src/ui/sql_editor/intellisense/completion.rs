@@ -27821,6 +27821,15 @@ impl SqlEditorWidget {
         prefix: &str,
         kind: ExpectedObjectSuggestionKind,
     ) -> Vec<String> {
+        Self::collect_expected_object_suggestions_for_kind_for_db(data, prefix, kind, None)
+    }
+
+    fn collect_expected_object_suggestions_for_kind_for_db(
+        data: &mut IntellisenseData,
+        prefix: &str,
+        kind: ExpectedObjectSuggestionKind,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Vec<String> {
         let suggestions = match kind {
             ExpectedObjectSuggestionKind::NoSuggestions => Vec::new(),
             ExpectedObjectSuggestionKind::Any => data.get_object_suggestions(prefix),
@@ -27872,7 +27881,10 @@ impl SqlEditorWidget {
             ExpectedObjectSuggestionKind::User => data.get_user_suggestions(prefix),
         };
 
-        if prefix.is_empty() || matches!(kind, ExpectedObjectSuggestionKind::User) {
+        if prefix.is_empty()
+            || matches!(kind, ExpectedObjectSuggestionKind::User)
+            || crate::sql_text::mysql_compatibility_for_sql("", db_type)
+        {
             return suggestions;
         }
 
@@ -28239,7 +28251,9 @@ impl SqlEditorWidget {
         db_type: Option<crate::db::DatabaseType>,
     ) -> Vec<String> {
         match Self::expected_object_suggestion_kind_for_db(prefix, None, deep_ctx, db_type) {
-            Some(kind) => Self::collect_expected_object_suggestions_for_kind(data, prefix, kind),
+            Some(kind) => {
+                Self::collect_expected_object_suggestions_for_kind_for_db(data, prefix, kind, db_type)
+            }
             None => Vec::new(),
         }
     }
