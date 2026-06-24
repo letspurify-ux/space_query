@@ -11884,6 +11884,12 @@ impl SqlEditorWidget {
                 db_type,
             )
             .is_some()
+            || Self::expected_cte_and_table_expression_keyword_candidates_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+            .is_some()
             || Self::cursor_is_at_alter_table_add_keyword_slot_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
@@ -22180,6 +22186,21 @@ impl SqlEditorWidget {
             exclude_current_identifier_chain,
         );
         Self::expected_statement_structural_keyword_candidates(tokens, end, db_type)
+    }
+
+    fn expected_cte_and_table_expression_keyword_candidates_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let cursor_token_len = deep_ctx.cursor_token_len;
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::expected_cte_and_table_expression_keyword_candidates(tokens, end, db_type)
     }
 
     fn expected_dml_statement_head_keyword_candidates(

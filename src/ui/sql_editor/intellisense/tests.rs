@@ -1433,9 +1433,23 @@ fn with_clause_after_cte_body_offers_main_query_select() {
         let oracle = kw(sql, Oracle);
         assert!(has(&oracle, "SELECT"), "Oracle offers SELECT for `{sql}`: {oracle:?}");
         assert!(has(&oracle, "SEARCH") && has(&oracle, "CYCLE"), "{oracle:?}");
+        let final_oracle = query_keyword_completion_suggestions(sql, Oracle);
+        for noise in ["EMP", "HELP", "DEPT"] {
+            assert!(
+                !has(&final_oracle, noise),
+                "{noise} leaked into completed CTE-body keyword slot for `{sql}`: {final_oracle:?}"
+            );
+        }
         for db in [MySQL, MariaDB] {
             let got = kw(sql, db);
             assert_eq!(got, vec!["SELECT".to_string()], "{db:?} for `{sql}`: {got:?}");
+            let final_suggestions = query_keyword_completion_suggestions(sql, db);
+            for noise in ["EMP", "HELP", "DEPT"] {
+                assert!(
+                    !has(&final_suggestions, noise),
+                    "{noise} leaked into completed CTE-body keyword slot for `{sql}` ({db:?}): {final_suggestions:?}"
+                );
+            }
         }
     }
 
