@@ -270,17 +270,21 @@ impl CompletionSourcePolicy {
     ) -> CompletionSourceAllowance {
         let qualifier_is_none = qualifier.is_none();
         let is_table_name_context = matches!(context, SqlContext::TableName);
+        let after_complete_operand =
+            !is_table_name_context && expr_keyword_ctx.follows_operand == Some(true);
 
         CompletionSourceAllowance {
             session_bind_names: qualifier_is_none
                 && !self.at_keyword_only_identifier_slot
                 && !self.at_keyword_only_slot
                 && !is_table_name_context
+                && !after_complete_operand
                 && !self.restrict_to_relation_columns,
             local_suggestions: qualifier_is_none
                 && !self.at_keyword_only_identifier_slot
                 && !self.at_keyword_only_slot
                 && !is_table_name_context
+                && !after_complete_operand
                 && !self.restrict_to_relation_columns,
             expected_keyword_suggestions: qualifier_is_none
                 && !self.restrict_to_relation_columns
@@ -297,7 +301,8 @@ impl CompletionSourcePolicy {
                         | SqlContext::ColumnName
                         | SqlContext::ColumnOrAll
                 ),
-            prepend_local_symbol_suggestions: !self.suppress_free_sql_catalog_argument_sources,
+            prepend_local_symbol_suggestions: !self.suppress_free_sql_catalog_argument_sources
+                && !after_complete_operand,
             // The base-catalog branch is the fall-through that produces columns
             // (including the qualified `t.|` column list, which `qualifier.is_some()`
             // routes through `base_suggestions_for_context`), relations, objects and
@@ -323,6 +328,7 @@ impl CompletionSourcePolicy {
                 && !self.suppress_free_sql_catalog_argument_sources,
             derived_column_suggestions: qualifier_is_none
                 && !self.restrict_to_relation_columns
+                && !self.at_keyword_only_identifier_slot
                 && !self.at_keyword_only_slot,
             context_name_suggestions: !self.suppresses_context_names(context, expr_keyword_ctx),
         }
@@ -341,6 +347,8 @@ impl CompletionSourcePolicy {
             || self.suppress_free_sql_catalog_argument_sources
             || expr_keyword_ctx.at_bind_variable_name
             || expr_keyword_ctx.expected_operand_type.is_some()
+            || (!matches!(context, SqlContext::TableName)
+                && expr_keyword_ctx.follows_operand == Some(true))
     }
 }
 

@@ -6303,6 +6303,69 @@ fn collect_context_name_suggestions_in_table_context_keep_only_ctes() {
 }
 
 #[test]
+fn context_name_suggestions_are_suppressed_after_complete_operand() {
+    let sql = "WITH recent_emp AS (SELECT empno FROM emp) \
+               SELECT * FROM emp e WHERE empno e|";
+    let cursor = sql.find('|').expect("cursor marker");
+    let plain = sql.replace('|', "");
+    let deep_ctx = analyze_inline_cursor_sql(sql);
+    let context =
+        SqlEditorWidget::classify_intellisense_context(&deep_ctx, deep_ctx.statement_tokens.as_ref());
+    let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+    let data = IntellisenseData::new();
+    let expr_keyword_ctx =
+        SqlEditorWidget::expression_keyword_context(&deep_ctx, &data, &[], !prefix.is_empty(), Some(crate::db::DatabaseType::Oracle));
+
+    assert_eq!(
+        expr_keyword_ctx.follows_operand,
+        Some(true),
+        "test must exercise a post-operand expression slot"
+    );
+    let policy = CompletionSourcePolicy::new(false, false, false, false, false, expr_keyword_ctx);
+    assert!(
+        policy.suppresses_context_names(context, expr_keyword_ctx),
+        "aliases/CTEs are identifier operands and must not be merged after a complete operand"
+    );
+}
+
+#[test]
+fn local_identifier_sources_are_suppressed_after_complete_operand() {
+    let mut expr_keyword_ctx = ExpressionKeywordContext::ambiguous();
+    let operand_start = CompletionSourcePolicy::new(
+        false,
+        false,
+        false,
+        false,
+        false,
+        expr_keyword_ctx,
+    )
+    .allowance(SqlContext::ColumnName, None, expr_keyword_ctx);
+    assert!(
+        operand_start.session_bind_names
+            && operand_start.local_suggestions
+            && operand_start.prepend_local_symbol_suggestions,
+        "local/session identifiers should stay available at an operand start"
+    );
+
+    expr_keyword_ctx.follows_operand = Some(true);
+    let after_operand = CompletionSourcePolicy::new(
+        false,
+        false,
+        false,
+        false,
+        false,
+        expr_keyword_ctx,
+    )
+    .allowance(SqlContext::ColumnName, None, expr_keyword_ctx);
+    assert!(
+        !after_operand.session_bind_names
+            && !after_operand.local_suggestions
+            && !after_operand.prepend_local_symbol_suggestions,
+        "local/session identifiers are operand material and must not be merged after a complete operand"
+    );
+}
+
+#[test]
 fn collect_clause_wildcard_suggestions_for_select_list_include_star_and_scoped_rowsources() {
     let deep_ctx = analyze_inline_cursor_sql(
         "WITH recent_emp AS (SELECT empno FROM emp) \
@@ -18627,6 +18690,79 @@ fn collect_derived_columns_for_analytic_order_by_excludes_select_aliases() {
             .any(|c| c.eq_ignore_ascii_case("running_sal")),
         "analytic ORDER BY must not suggest sibling analytic aliases: {:?}",
         derived
+    );
+}
+
+#[test]
+fn order_by_keyword_only_tails_do_not_merge_derived_columns() {
+    let sql = "SELECT empno AS alias_empno FROM emp ORDER BY empno DESC |";
+    let deep_ctx = analyze_inline_cursor_sql(sql);
+    let context =
+        SqlEditorWidget::classify_intellisense_context(&deep_ctx, deep_ctx.statement_tokens.as_ref());
+    let expr_keyword_ctx = ExpressionKeywordContext::ambiguous();
+    let at_keyword_only_identifier_slot =
+        SqlEditorWidget::cursor_is_at_identifier_suppressing_keyword_slot_for_context(
+            &deep_ctx,
+            false,
+            Some(crate::db::DatabaseType::Oracle),
+        );
+    let at_keyword_only_slot =
+        SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot(&deep_ctx, false);
+    assert!(
+        at_keyword_only_identifier_slot,
+        "ORDER BY modifier tail must suppress identifier sources"
+    );
+
+    let allowance = CompletionSourcePolicy::new(
+        false,
+        at_keyword_only_identifier_slot,
+        at_keyword_only_slot,
+        false,
+        false,
+        expr_keyword_ctx,
+    )
+    .allowance(context, None, expr_keyword_ctx);
+    assert!(
+        !allowance.derived_column_suggestions,
+        "derived aliases must not be merged at a keyword-only ORDER BY tail"
+    );
+    let identifier_only_allowance = CompletionSourcePolicy::new(
+        false,
+        true,
+        false,
+        false,
+        false,
+        expr_keyword_ctx,
+    )
+    .allowance(SqlContext::ColumnName, None, expr_keyword_ctx);
+    assert!(
+        !identifier_only_allowance.derived_column_suggestions,
+        "derived aliases are identifier suggestions and must obey identifier-only suppression"
+    );
+
+    let mut suggestions = SqlEditorWidget::collect_expected_keyword_suggestions(
+        "",
+        &deep_ctx,
+        Some(crate::db::DatabaseType::Oracle),
+    );
+    if allowance.derived_column_suggestions {
+        suggestions = SqlEditorWidget::merge_suggestions_with_derived_columns(
+            suggestions,
+            "",
+            SqlEditorWidget::collect_derived_columns_for_context(&deep_ctx),
+        );
+    }
+    assert!(
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case("NULLS")),
+        "keyword tail should still offer NULLS: {suggestions:?}"
+    );
+    assert!(
+        !suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case("alias_empno")),
+        "derived alias leaked into keyword-only ORDER BY tail: {suggestions:?}"
     );
 }
 
