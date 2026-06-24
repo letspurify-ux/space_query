@@ -223,6 +223,20 @@ struct CompletionSourcePolicy {
     suppress_expected_keyword_sources: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CompletionSourceAllowance {
+    session_bind_names: bool,
+    local_suggestions: bool,
+    expected_keyword_suggestions: bool,
+    expected_object_suggestions: bool,
+    prepend_local_symbol_suggestions: bool,
+    base_catalog_suggestions: bool,
+    wildcard_suggestions: bool,
+    comparison_suggestions: bool,
+    derived_column_suggestions: bool,
+    context_name_suggestions: bool,
+}
+
 impl CompletionSourcePolicy {
     fn new(
         restrict_to_relation_columns: bool,
@@ -245,6 +259,72 @@ impl CompletionSourcePolicy {
             at_tool_bind_name_slot,
             suppress_free_sql_catalog_argument_sources,
             suppress_expected_keyword_sources,
+        }
+    }
+
+    fn allowance(
+        self,
+        context: SqlContext,
+        qualifier: Option<&str>,
+        expr_keyword_ctx: ExpressionKeywordContext,
+    ) -> CompletionSourceAllowance {
+        let qualifier_is_none = qualifier.is_none();
+        let is_table_name_context = matches!(context, SqlContext::TableName);
+
+        CompletionSourceAllowance {
+            session_bind_names: qualifier_is_none
+                && !self.at_keyword_only_identifier_slot
+                && !self.at_keyword_only_slot
+                && !is_table_name_context
+                && !self.restrict_to_relation_columns,
+            local_suggestions: qualifier_is_none
+                && !self.at_keyword_only_identifier_slot
+                && !self.at_keyword_only_slot
+                && !is_table_name_context
+                && !self.restrict_to_relation_columns,
+            expected_keyword_suggestions: qualifier_is_none
+                && !self.restrict_to_relation_columns
+                && !self.suppress_expected_keyword_sources
+                && !matches!(context, SqlContext::VariableName | SqlContext::BindValue),
+            expected_object_suggestions: qualifier_is_none
+                && !self.restrict_to_relation_columns
+                && !self.at_tool_bind_name_slot
+                && !self.suppress_free_sql_catalog_argument_sources
+                && !matches!(
+                    context,
+                    SqlContext::VariableName
+                        | SqlContext::BindValue
+                        | SqlContext::ColumnName
+                        | SqlContext::ColumnOrAll
+                ),
+            prepend_local_symbol_suggestions: !self.suppress_free_sql_catalog_argument_sources,
+            // The base-catalog branch is the fall-through that produces columns
+            // (including the qualified `t.|` column list, which `qualifier.is_some()`
+            // routes through `base_suggestions_for_context`), relations, objects and
+            // functions. It is suppressed only at the two argument-name slots that
+            // name a free identifier; the qualifier and keyword-only cases are
+            // handled by the dedicated branches that follow this one, so they must
+            // NOT gate this flag (gating on `qualifier.is_none()` here drops the
+            // qualified column list entirely).
+            base_catalog_suggestions: !self.at_tool_bind_name_slot
+                && !self.suppress_free_sql_catalog_argument_sources,
+            wildcard_suggestions: qualifier_is_none
+                && !self.at_keyword_only_identifier_slot
+                && !self.at_keyword_only_slot
+                && !self.at_tool_bind_name_slot
+                && !self.suppress_free_sql_catalog_argument_sources
+                && !(
+                    expr_keyword_ctx.follows_operand == Some(true)
+                        || expr_keyword_ctx.at_bind_variable_name
+                ),
+            comparison_suggestions: qualifier.is_some()
+                && !self.at_keyword_only_identifier_slot
+                && !self.at_keyword_only_slot
+                && !self.suppress_free_sql_catalog_argument_sources,
+            derived_column_suggestions: qualifier_is_none
+                && !self.restrict_to_relation_columns
+                && !self.at_keyword_only_slot,
+            context_name_suggestions: !self.suppresses_context_names(context, expr_keyword_ctx),
         }
     }
 
@@ -1849,31 +1929,6 @@ impl SqlEditorWidget {
                     .statement_end
                     .saturating_sub(analysis.statement_start),
             );
-        let session_bind_names = if qualifier.is_none()
-            && !at_keyword_only_identifier_slot
-            && !at_keyword_only_slot
-            && !matches!(context, SqlContext::TableName)
-            && !restrict_to_relation_columns
-        {
-            Self::session_bind_names(connection)
-        } else {
-            Vec::new()
-        };
-        let mut local_suggestions = if qualifier.is_none()
-            && !at_keyword_only_identifier_slot
-            && !at_keyword_only_slot
-            && !matches!(context, SqlContext::TableName)
-            && !restrict_to_relation_columns
-        {
-            Self::collect_local_symbol_suggestions(
-                &snapshot.prefix,
-                cursor_in_statement,
-                analysis,
-                &session_bind_names,
-            )
-        } else {
-            Vec::new()
-        };
         let local_record_member_suggestions = qualifier
             .and_then(|qualifier| {
                 Self::collect_local_record_member_suggestions(
@@ -1984,6 +2039,26 @@ impl SqlEditorWidget {
             at_tool_no_sql_argument_slot,
             effective_expr_keyword_ctx,
         );
+        let source_allowance = source_policy.allowance(
+            context,
+            qualifier,
+            effective_expr_keyword_ctx,
+        );
+        let session_bind_names = if source_allowance.session_bind_names {
+            Self::session_bind_names(connection)
+        } else {
+            Vec::new()
+        };
+        let mut local_suggestions = if source_allowance.local_suggestions {
+            Self::collect_local_symbol_suggestions(
+                &snapshot.prefix,
+                cursor_in_statement,
+                analysis,
+                &session_bind_names,
+            )
+        } else {
+            Vec::new()
+        };
         if let Some(expected_type) = effective_expected_operand_type {
             Self::filter_local_symbol_suggestions_by_expected_operand_type(
                 &mut local_suggestions,
@@ -2056,10 +2131,7 @@ impl SqlEditorWidget {
             }
             _ => Vec::new(),
         };
-        let expected_keyword_suggestions = if qualifier.is_none()
-            && !restrict_to_relation_columns
-            && !source_policy.suppress_expected_keyword_sources
-            && !matches!(context, SqlContext::VariableName | SqlContext::BindValue)
+        let expected_keyword_suggestions = if source_allowance.expected_keyword_suggestions
         {
             Self::collect_expected_keyword_suggestions_with_expression_context(
                 &snapshot.prefix,
@@ -2070,17 +2142,7 @@ impl SqlEditorWidget {
         } else {
             Vec::new()
         };
-        let expected_object_suggestions = if qualifier.is_none()
-            && !restrict_to_relation_columns
-            && !at_tool_bind_name_slot
-            && !source_policy.suppress_free_sql_catalog_argument_sources
-            && !matches!(
-                context,
-                SqlContext::VariableName
-                    | SqlContext::BindValue
-                    | SqlContext::ColumnName
-                    | SqlContext::ColumnOrAll
-            ) {
+        let expected_object_suggestions = if source_allowance.expected_object_suggestions {
             let mut data = intellisense_data
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2284,9 +2346,7 @@ impl SqlEditorWidget {
             local_rowtype_member_suggestions
         } else if !qualified_member_suggestions.is_empty() {
             qualified_member_suggestions
-        } else if at_tool_bind_name_slot
-            || source_policy.suppress_free_sql_catalog_argument_sources
-        {
+        } else if !source_allowance.base_catalog_suggestions {
             Vec::new()
         } else if replace_table_context_with_expected_objects {
             expected_object_suggestions.clone()
@@ -2354,7 +2414,7 @@ impl SqlEditorWidget {
                 true,
             );
         }
-        let comparison_suggestions = {
+        let comparison_suggestions = if source_allowance.comparison_suggestions {
             let data = intellisense_data
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2368,6 +2428,8 @@ impl SqlEditorWidget {
                     )
                 })
                 .unwrap_or_default()
+        } else {
+            Vec::new()
         };
         if !comparison_suggestions.is_empty() {
             suggestions = Self::merge_qualified_condition_comparison_suggestions(
@@ -2388,14 +2450,7 @@ impl SqlEditorWidget {
         // comma/`FROM` can follow; the wildcard still appears at an operand-start
         // (`SELECT |`, `SELECT a, |`) and for a qualified scope (`t.|`). A bind
         // name slot (`= :|`) is likewise not a wildcard position.
-        let wildcard_suggestions = if at_keyword_only_identifier_slot
-            || at_keyword_only_slot
-            || at_tool_bind_name_slot
-            || source_policy.suppress_free_sql_catalog_argument_sources
-            || (qualifier.is_none()
-                && (expr_keyword_ctx.follows_operand == Some(true)
-                    || expr_keyword_ctx.at_bind_variable_name))
-        {
+        let wildcard_suggestions = if !source_allowance.wildcard_suggestions {
             Vec::new()
         } else {
             Self::collect_clause_wildcard_suggestions(&snapshot.prefix, qualifier, deep_ctx)
@@ -2407,7 +2462,7 @@ impl SqlEditorWidget {
                 true,
             );
         }
-        if include_columns && qualifier.is_none() && !restrict_to_relation_columns {
+        if source_allowance.derived_column_suggestions {
             let derived_columns = Self::collect_derived_columns_for_context(deep_ctx);
             suggestions = if Self::cursor_is_in_query_level_order_by(deep_ctx) {
                 Self::merge_suggestions_with_prioritized_derived_columns(
@@ -2423,13 +2478,11 @@ impl SqlEditorWidget {
                 )
             };
         }
-        let context_name_suggestions = Self::collect_context_name_suggestions_for_completion(
-            &snapshot.prefix,
-            deep_ctx,
-            context,
-            source_policy,
-            effective_expr_keyword_ctx,
-        );
+        let context_name_suggestions = if source_allowance.context_name_suggestions {
+            Self::collect_context_name_suggestions(&snapshot.prefix, deep_ctx, context)
+        } else {
+            Vec::new()
+        };
         let suggestions = Self::maybe_merge_suggestions_with_context_aliases(
             suggestions,
             context_name_suggestions,
@@ -2437,7 +2490,7 @@ impl SqlEditorWidget {
             qualifier.is_some(),
         );
         let mut suggestions = if !local_suggestions.is_empty()
-            && !source_policy.suppress_free_sql_catalog_argument_sources
+            && source_allowance.prepend_local_symbol_suggestions
         {
             Self::prepend_local_symbol_suggestions(suggestions, local_suggestions)
         } else {
@@ -10497,6 +10550,143 @@ impl SqlEditorWidget {
         }
     }
 
+    /// Keyword slot inside a SQL-standard `TRIM`/`SUBSTRING`/`POSITION` call, at a
+    /// position *after a complete operand* where the only grammatical continuation
+    /// is the function's separator keyword — never another column:
+    /// - `POSITION(<substr> |` → `IN`
+    /// - `TRIM([{LEADING|TRAILING|BOTH}] [removal] |` → `FROM`
+    /// - `SUBSTRING(<str> |` → `FROM` (the standard form; the comma form
+    ///   `SUBSTRING(str, pos, len)` takes no keyword, so a seen comma suppresses it)
+    /// - `SUBSTRING(<str> FROM <pos> |` → `FOR`
+    ///
+    /// Tracked with a per-call frame stack so an operand of a *nested* call does not
+    /// confuse the outer one, and only the innermost frame's function counts. The
+    /// `SUBSTR` (comma-only) spelling is intentionally excluded.
+    fn standard_function_keyword_slot(
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> Option<&'static [&'static str]> {
+        struct Frame {
+            func: Option<&'static str>,
+            seen_from: bool,
+            seen_for: bool,
+            seen_in: bool,
+            seen_comma: bool,
+        }
+        let mut stack: Vec<Frame> = Vec::new();
+        let mut last_word: Option<String> = None;
+        // Whether the most recent meaningful token completed an operand (a value
+        // word/string or a closed `)`), so the cursor sits just past it.
+        let mut last_ended_operand = false;
+        for token in tokens.get(..end).unwrap_or(tokens) {
+            match token {
+                SqlToken::Comment(_) => {}
+                SqlToken::Symbol(sym) if sym == "(" => {
+                    let func = last_word.as_deref().map(str::to_ascii_uppercase).and_then(
+                        |word| match word.as_str() {
+                            "TRIM" => Some("TRIM"),
+                            "SUBSTRING" => Some("SUBSTRING"),
+                            "POSITION" => Some("POSITION"),
+                            _ => None,
+                        },
+                    );
+                    stack.push(Frame {
+                        func,
+                        seen_from: false,
+                        seen_for: false,
+                        seen_in: false,
+                        seen_comma: false,
+                    });
+                    last_word = None;
+                    last_ended_operand = false;
+                }
+                SqlToken::Symbol(sym) if sym == ")" => {
+                    stack.pop();
+                    last_word = None;
+                    last_ended_operand = true;
+                }
+                SqlToken::Symbol(sym) if sym == "," => {
+                    if let Some(frame) = stack.last_mut() {
+                        frame.seen_comma = true;
+                    }
+                    last_word = None;
+                    last_ended_operand = false;
+                }
+                SqlToken::Symbol(_) => {
+                    // An operator (`||`, `+`, …) leaves the operand incomplete.
+                    last_word = None;
+                    last_ended_operand = false;
+                }
+                SqlToken::Word(word) => {
+                    let upper = word.to_ascii_uppercase();
+                    match upper.as_str() {
+                        "FROM" => {
+                            if let Some(frame) = stack.last_mut() {
+                                frame.seen_from = true;
+                            }
+                            last_word = None;
+                            last_ended_operand = false;
+                        }
+                        "FOR" => {
+                            if let Some(frame) = stack.last_mut() {
+                                frame.seen_for = true;
+                            }
+                            last_word = None;
+                            last_ended_operand = false;
+                        }
+                        "IN" => {
+                            if let Some(frame) = stack.last_mut() {
+                                frame.seen_in = true;
+                            }
+                            last_word = None;
+                            last_ended_operand = false;
+                        }
+                        "LEADING" | "TRAILING" | "BOTH" => {
+                            // A trim-spec qualifier, not an operand.
+                            last_word = None;
+                            last_ended_operand = false;
+                        }
+                        _ => {
+                            last_word = Some(word.clone());
+                            last_ended_operand = true;
+                        }
+                    }
+                }
+                SqlToken::String(_) => {
+                    last_word = None;
+                    last_ended_operand = true;
+                }
+            }
+        }
+        if !last_ended_operand {
+            return None;
+        }
+        let frame = stack.last()?;
+        match frame.func? {
+            "POSITION" if !frame.seen_in => Some(&["IN"]),
+            "TRIM" if !frame.seen_from => Some(&["FROM"]),
+            "SUBSTRING" if frame.seen_from && !frame.seen_for && !frame.seen_comma => {
+                Some(&["FOR"])
+            }
+            "SUBSTRING" if !frame.seen_from && !frame.seen_comma => Some(&["FROM"]),
+            _ => None,
+        }
+    }
+
+    fn standard_function_keyword_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> Option<&'static [&'static str]> {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::standard_function_keyword_slot(tokens, end)
+    }
+
     fn extract_field_position_for_context(
         deep_ctx: &intellisense_context::CursorContext,
         exclude_current_identifier_chain: bool,
@@ -11270,6 +11460,120 @@ impl SqlEditorWidget {
         Self::table_source_construct_open_paren_position(tokens, end, db_type)
     }
 
+    /// MySQL object types that accept `DROP <obj> [IF EXISTS] <name>`.
+    fn is_mysql_droppable_object_type(word: &str) -> bool {
+        matches!(
+            word,
+            "DATABASE"
+                | "EVENT"
+                | "FUNCTION"
+                | "PROCEDURE"
+                | "ROLE"
+                | "SCHEMA"
+                | "SERVER"
+                | "TABLE"
+                | "TRIGGER"
+                | "USER"
+                | "VIEW"
+        )
+    }
+
+    /// `DROP [TEMPORARY] <object> |` — the object-name slot, where the structural
+    /// candidates offer the optional `IF [EXISTS]` prefix but an existing object
+    /// name is equally grammatical. Unlike a `CREATE <object> |` slot (a brand-new
+    /// name), the catalog must stay available here, so this slot is excluded from
+    /// the structural-keyword suppression. Only the bare name slot qualifies; past
+    /// the name the DDL-tail handler suppresses, and `DROP <obj> IF EXISTS |` keeps
+    /// the catalog on its own.
+    fn cursor_is_at_mysql_drop_object_name_slot(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return false;
+        }
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            deep_ctx.cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        let words = Self::words_for_keyword_slot(tokens, end);
+        words.first().map(String::as_str) == Some("DROP")
+            && words
+                .last()
+                .is_some_and(|word| Self::is_mysql_droppable_object_type(word))
+    }
+
+    /// `LOCK TABLES <tbl> …` / `FLUSH [LOCAL] TABLES <tbl> …` table-list slots,
+    /// where a relation is named: right after the `TABLE(S)` keyword, after a comma
+    /// (the next locked/flushed table) or after a schema dot. The structural
+    /// candidates claim these slots (with an empty or `FOR`/`WITH` keyword set) to
+    /// block keyword noise, but the table catalog must still be offered — unlike
+    /// the alias (`… AS |`) or lock-type (`… emp |`→READ/WRITE) slots, which name no
+    /// relation and stay suppressed.
+    fn cursor_is_at_mysql_lock_or_flush_tables_relation_slot(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return false;
+        }
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            deep_ctx.cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        let words = Self::words_for_keyword_slot(tokens, end);
+        let is_lock_or_flush_tables = match words.first().map(String::as_str) {
+            Some("LOCK") => words.get(1).map(String::as_str) == Some("TABLES"),
+            Some("FLUSH") => words.iter().any(|word| word == "TABLE" || word == "TABLES"),
+            _ => false,
+        };
+        if !is_lock_or_flush_tables {
+            return false;
+        }
+        let last_token_is = |symbol: &str| {
+            matches!(
+                Self::meaningful_tokens_before(tokens, end).last(),
+                Some(SqlToken::Symbol(sym)) if sym == symbol
+            )
+        };
+        matches!(words.last().map(String::as_str), Some("TABLE" | "TABLES"))
+            || last_token_is(",")
+            || last_token_is(".")
+    }
+
+    /// Whether the statement-structural keyword slot suppresses the identifier
+    /// catalog. It does for every fixed-keyword statement head/tail except the
+    /// MySQL `DROP <object> |` name slot and the `LOCK`/`FLUSH TABLES` table-list
+    /// slots, where an existing relation name belongs alongside the keywords.
+    fn statement_structural_slot_suppresses_identifiers(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        Self::expected_statement_structural_keyword_candidates_for_context(
+            deep_ctx,
+            exclude_current_identifier_chain,
+            db_type,
+        )
+        .is_some()
+            && !Self::cursor_is_at_mysql_drop_object_name_slot(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+            && !Self::cursor_is_at_mysql_lock_or_flush_tables_relation_slot(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+    }
+
     fn cursor_is_at_identifier_suppressing_keyword_slot_for_context(
         deep_ctx: &intellisense_context::CursorContext,
         exclude_current_identifier_chain: bool,
@@ -11349,12 +11653,11 @@ impl SqlEditorWidget {
                 deep_ctx,
                 exclude_current_identifier_chain,
             )
-            || Self::expected_statement_structural_keyword_candidates_for_context(
+            || Self::statement_structural_slot_suppresses_identifiers(
                 deep_ctx,
                 exclude_current_identifier_chain,
                 db_type,
             )
-            .is_some()
             || Self::expected_tool_command_keyword_candidates_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
@@ -11501,6 +11804,11 @@ impl SqlEditorWidget {
             )
             || Self::extract_field_position_for_context(deep_ctx, exclude_current_identifier_chain)
                 .is_some()
+            || Self::standard_function_keyword_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
+            .is_some()
             || Self::interval_unit_position_for_context(deep_ctx, exclude_current_identifier_chain)
                 .is_some()
             || Self::temporal_literal_body_position_for_context(
@@ -11605,12 +11913,11 @@ impl SqlEditorWidget {
                 deep_ctx,
                 exclude_current_identifier_chain,
             )
-            || Self::expected_statement_structural_keyword_candidates_for_context(
+            || Self::statement_structural_slot_suppresses_identifiers(
                 deep_ctx,
                 exclude_current_identifier_chain,
                 db_type,
             )
-            .is_some()
             || Self::expected_referential_action_keyword_candidates_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
@@ -13862,8 +14169,13 @@ impl SqlEditorWidget {
         tokens: &[SqlToken],
         end: usize,
         phase: intellisense_context::SqlPhase,
+        db_type: Option<crate::db::DatabaseType>,
     ) -> Option<&'static [&'static str]> {
-        if !phase.is_table_context() {
+        // Flashback (`AS OF`, `VERSIONS BETWEEN`) is Oracle-only. In MySQL a table's
+        // `AS` introduces an alias (a new name), so `OF` must not be offered there.
+        if !phase.is_table_context()
+            || crate::sql_text::mysql_compatibility_for_sql("", db_type)
+        {
             return None;
         }
 
@@ -14052,12 +14364,13 @@ impl SqlEditorWidget {
 
     /// Context wrapper enrolling the transaction-control and `LOCK TABLE` keyword
     /// slots (`LOCK TABLE t IN |`→ROW/SHARE/…, `COMMIT |`, `ROLLBACK |`,
-    /// `SET TRANSACTION …`) in the identifier-suppression chokepoint. `GRANT`/
-    /// `REVOKE` are excluded because their grantee/object positions name an
-    /// identifier (a user/role/object) the base catalog must still supply; every
-    /// other arm of the underlying handler is a fixed-keyword slot, and the object/
-    /// savepoint-name positions (`LOCK TABLE |`, `ROLLBACK TO SAVEPOINT |`) return
-    /// `None` and stay available.
+    /// `SET TRANSACTION …`) in the identifier-suppression chokepoint. For `GRANT`/
+    /// `REVOKE` only the identifier slots keep the base catalog — the object slot
+    /// (`… ON |`), the grantee slot (`… TO |`/`… FROM |`) and their comma-separated
+    /// list continuations; past a written object/grantee the tail is keyword-only
+    /// (`TO`, `WITH GRANT OPTION`, …) and is suppressed. The object/savepoint-name
+    /// positions (`LOCK TABLE |`, `ROLLBACK TO SAVEPOINT |`) return `None` and stay
+    /// available.
     fn cursor_is_at_transaction_or_lock_keyword_slot_for_context(
         deep_ctx: &intellisense_context::CursorContext,
         exclude_current_identifier_chain: bool,
@@ -14072,7 +14385,25 @@ impl SqlEditorWidget {
         );
         let words = Self::words_for_keyword_slot(tokens, end);
         if matches!(words.first().map(String::as_str), Some("GRANT" | "REVOKE")) {
-            return false;
+            // Keep the base catalog only at the identifier slots: the object slot
+            // (`… ON |`), the grantee slot (`… TO |`/`… FROM |`), and each list
+            // continuation after a comma. Past a written object/grantee only the
+            // keyword continuations remain (`TO`, `WITH GRANT OPTION`, …), so the
+            // catalog is suppressed there via the fall-through.
+            let last_is_comma = matches!(
+                Self::meaningful_tokens_before(tokens, end).last(),
+                Some(SqlToken::Symbol(sym)) if sym == ","
+            );
+            if last_is_comma
+                || matches!(words.last().map(String::as_str), Some("ON" | "TO" | "FROM"))
+            {
+                return false;
+            }
+            // Keyword-only tail (the privilege list and everything past a written
+            // object/grantee): no relation is grammatical, so suppress. `REVOKE`
+            // completes without a trailing keyword, so this cannot defer to the
+            // DCL candidates (which return `None` there).
+            return true;
         }
         Self::expected_transaction_and_dcl_keyword_candidates(tokens, end, db_type).is_some()
     }
@@ -14098,6 +14429,362 @@ impl SqlEditorWidget {
             exclude_current_identifier_chain,
         );
         Self::expected_statement_tail_keyword_candidates(tokens, end, db_type).is_some()
+    }
+
+    /// Words that may sit between a `CREATE`/`DROP`/`ALTER` head verb and the
+    /// object-type keyword without being the type (`CREATE OR REPLACE`, `CREATE
+    /// GLOBAL TEMPORARY`, `CREATE UNIQUE INDEX`, `DROP PUBLIC SYNONYM`, …).
+    fn is_ddl_object_type_modifier(word: &str) -> bool {
+        matches!(
+            word,
+            "OR" | "REPLACE"
+                | "GLOBAL"
+                | "TEMPORARY"
+                | "PRIVATE"
+                | "UNIQUE"
+                | "BITMAP"
+                | "MULTIVALUE"
+                | "PUBLIC"
+                | "SHARED"
+                | "BIGFILE"
+                | "SMALLFILE"
+                | "UNDO"
+                | "FORCE"
+                | "NO"
+                | "NONEDITIONABLE"
+                | "EDITIONABLE"
+        )
+    }
+
+    /// The canonical object type a single-object `CREATE`/`DROP` operates on,
+    /// found as the first object-type keyword after the head verb and its leading
+    /// modifiers, paired with the number of words that follow the type phrase. The
+    /// trailing count separates the bare object-name slot (`0`, the name is not
+    /// yet written) from the option region (`>= 1`, the name and beyond). Picking
+    /// the *leading* type means a later option keyword (the `TABLESPACE` of
+    /// `CREATE TABLE … TABLESPACE`) is never mistaken for the object type.
+    /// Multi-word types collapse to a single canonical token.
+    fn leading_ddl_object_type(words: &[String]) -> Option<(&'static str, usize)> {
+        const TYPES: &[&str] = &[
+            "TABLE",
+            "VIEW",
+            "INDEX",
+            "SEQUENCE",
+            "SYNONYM",
+            "PROCEDURE",
+            "FUNCTION",
+            "PACKAGE",
+            "TYPE",
+            "TRIGGER",
+            "USER",
+            "ROLE",
+            "TABLESPACE",
+            "PROFILE",
+            "DIRECTORY",
+            "CLUSTER",
+            "DATABASE",
+            "SCHEMA",
+            "EVENT",
+            "SERVER",
+            "CONTEXT",
+            "DIMENSION",
+            "LIBRARY",
+            "MATERIALIZED",
+        ];
+        let mut idx = 1; // skip the head verb
+        while words.get(idx).is_some_and(|word| Self::is_ddl_object_type_modifier(word)) {
+            idx += 1;
+        }
+        let ty = TYPES
+            .iter()
+            .copied()
+            .find(|ty| words.get(idx).map(String::as_str) == Some(*ty))?;
+        let next_is = |word: &str| words.get(idx + 1).map(String::as_str) == Some(word);
+        // A `MATERIALIZED VIEW LOG` is a distinct object with its own `ON <table>`
+        // grammar (handled by the statement-structural candidates), so it is not a
+        // completed materialized view here.
+        if ty == "MATERIALIZED"
+            && next_is("VIEW")
+            && words.get(idx + 2).map(String::as_str) == Some("LOG")
+        {
+            return None;
+        }
+        let (canonical, phrase_end) = match ty {
+            "MATERIALIZED" if next_is("VIEW") => ("MATERIALIZED VIEW", idx + 2),
+            "PACKAGE" if next_is("BODY") => ("PACKAGE BODY", idx + 2),
+            "TYPE" if next_is("BODY") => ("TYPE BODY", idx + 2),
+            "DATABASE" if next_is("LINK") => ("DATABASE LINK", idx + 2),
+            other => (other, idx + 1),
+        };
+        Some((canonical, words.len().saturating_sub(phrase_end)))
+    }
+
+    /// Whether a balanced parenthesised group has already been opened and closed
+    /// at the top level before `end` (e.g. the column-definition list of a
+    /// `CREATE TABLE`/`CREATE INDEX` has been completed).
+    fn has_closed_top_level_paren(tokens: &[SqlToken], end: usize) -> bool {
+        let mut depth: i32 = 0;
+        for token in tokens.get(..end).unwrap_or(tokens) {
+            if let SqlToken::Symbol(sym) = token {
+                if sym == "(" {
+                    depth += 1;
+                } else if sym == ")" {
+                    depth -= 1;
+                    if depth <= 0 {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// `DROP <object> <name> [options] |` — past the written object name a bare
+    /// relation is no longer grammatical, so every recognised single-object drop
+    /// returns a handled set (the object-specific options where unambiguous, an
+    /// empty set otherwise) to suppress the catalog. `DROP TABLE …` physical
+    /// options (CASCADE/PURGE) are produced by the caller's dedicated arms; the
+    /// object-name slot itself (no name yet) returns `None` so objects stay
+    /// available.
+    fn expected_drop_object_tail_keywords(words: &[String]) -> Option<&'static [&'static str]> {
+        if words.first().map(String::as_str) != Some("DROP") {
+            return None;
+        }
+        let (ty, words_after_type) = Self::leading_ddl_object_type(words)?;
+        if words_after_type == 0 {
+            return None;
+        }
+        let has = |keyword: &str| words.iter().any(|word| word == keyword);
+        Some(match ty {
+            // `DROP TABLE [schema.]t [CASCADE [CONSTRAINTS]] [PURGE]`. Detected by
+            // keyword presence (not position) so a schema-qualified name does not
+            // shift the match, and the options are single-use.
+            "TABLE" if has("PURGE") || has("CONSTRAINTS") => &[],
+            "TABLE" if has("CASCADE") => &["CONSTRAINTS"],
+            "TABLE" => &["CASCADE", "PURGE"],
+            "USER" => &["CASCADE"],
+            "TYPE" => &["FORCE", "VALIDATE"],
+            "TABLESPACE" => &["INCLUDING CONTENTS", "CASCADE CONSTRAINTS"],
+            "MATERIALIZED VIEW" => &["PRESERVE TABLE"],
+            _ => &[],
+        })
+    }
+
+    /// `CREATE <object> <name> … |` past the object name. The closed-definition
+    /// tail of a `TABLE`/`INDEX` (column list balanced) offers the physical/storage
+    /// options at the boundary and suppresses the catalog deeper in the region; a
+    /// `VIEW` awaits its `AS`; the named-object option grammars we do not fully
+    /// model (`USER`/`ROLE`/`TABLESPACE`/`PROFILE`/`DIRECTORY`) offer their first
+    /// keyword and otherwise suppress. A `SELECT` marks a CTAS defining query whose
+    /// column/relation slots belong to the query grammar, so it is excluded.
+    fn expected_create_object_tail_keywords(
+        words: &[String],
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> Option<&'static [&'static str]> {
+        if words.first().map(String::as_str) != Some("CREATE") {
+            return None;
+        }
+        if Self::unclosed_paren_count(tokens, end) != 0 {
+            return None; // inside the definition list: the column-def grammar runs
+        }
+        let (ty, words_after_type) = Self::leading_ddl_object_type(words)?;
+        if words_after_type == 0 {
+            return None; // object-name slot
+        }
+        if words.iter().any(|word| word == "SELECT") {
+            return None; // CTAS defining query
+        }
+        let has_as = words.iter().any(|word| word == "AS");
+        let closed_paren = Self::has_closed_top_level_paren(tokens, end);
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        let last_is_close_paren =
+            matches!(toks.last(), Some(SqlToken::Symbol(sym)) if sym == ")");
+
+        match ty {
+            "TABLE" if !has_as => Some(if last_is_close_paren {
+                &[
+                    "TABLESPACE", "PCTFREE", "STORAGE", "LOGGING", "NOLOGGING", "COMPRESS",
+                    "NOCOMPRESS", "CACHE", "NOCACHE", "PARALLEL", "NOPARALLEL", "ORGANIZATION",
+                    "PARTITION BY", "ENABLE", "DISABLE",
+                ]
+            } else if closed_paren {
+                &[] // deeper in the physical-attributes region
+            } else {
+                &["AS", "OF"] // pre-definition slot (`CREATE TABLE t |`)
+            }),
+            "INDEX" if words.iter().any(|word| word == "ON") => {
+                if last_is_close_paren {
+                    Some(&[
+                        "TABLESPACE", "PCTFREE", "STORAGE", "LOGGING", "NOLOGGING", "COMPRESS",
+                        "NOCOMPRESS", "PARALLEL", "NOPARALLEL", "ONLINE", "REVERSE", "LOCAL",
+                        "GLOBAL",
+                    ])
+                } else if closed_paren {
+                    Some(&[])
+                } else {
+                    None // `CREATE INDEX i ON t |` still names columns/`(`
+                }
+            }
+            "VIEW" => (!has_as).then_some(&["AS"][..]),
+            "MATERIALIZED VIEW" => (!has_as).then_some(&[][..]),
+            // `CREATE SYNONYM s |` → `FOR` (the statement-structural candidates);
+            // once `FOR <target>` is written the synonym is complete. The target
+            // slot itself (`… FOR |`) keeps the catalog available.
+            "SYNONYM" => (words.iter().any(|word| word == "FOR")
+                && words.last().map(String::as_str) != Some("FOR"))
+            .then_some(&[][..]),
+            "USER" if words_after_type == 1 => Some(&["IDENTIFIED"]),
+            "ROLE" if words_after_type == 1 => Some(&["IDENTIFIED", "NOT"]),
+            "TABLESPACE" if words_after_type == 1 => Some(&["DATAFILE"]),
+            "PROFILE" if words_after_type == 1 => Some(&["LIMIT"]),
+            "DIRECTORY" if words_after_type == 1 => Some(&["AS"]),
+            "USER" | "ROLE" | "TABLESPACE" | "PROFILE" | "DIRECTORY" | "CLUSTER" => Some(&[]),
+            _ => None,
+        }
+    }
+
+    /// `ALTER <object> <name> … |` past the object name. `ALTER TABLE` keeps its
+    /// dedicated `ADD/DROP/MODIFY/RENAME` arm (excluded here); the other alterable
+    /// objects offer their primary action keywords at the immediate post-name slot
+    /// and otherwise suppress the catalog (a bare relation is never grammatical in
+    /// an `ALTER` body). The object-name slot itself returns `None` so the catalog
+    /// stays available there.
+    fn expected_alter_object_tail_keywords(words: &[String]) -> Option<&'static [&'static str]> {
+        if words.first().map(String::as_str) != Some("ALTER") {
+            return None;
+        }
+        let (ty, words_after_type) = Self::leading_ddl_object_type(words)?;
+        if words_after_type == 0 {
+            return None;
+        }
+        match ty {
+            "TABLE" => None, // dedicated ADD/DROP/MODIFY/RENAME arm
+            "INDEX" if words_after_type == 1 => Some(&[
+                "REBUILD", "RENAME", "COALESCE", "MODIFY", "MONITORING", "NOMONITORING",
+                "UNUSABLE", "ENABLE", "DISABLE", "PARAMETERS",
+            ]),
+            "SEQUENCE" if words_after_type == 1 => Some(&[
+                "INCREMENT BY", "MINVALUE", "NOMINVALUE", "MAXVALUE", "NOMAXVALUE", "CACHE",
+                "NOCACHE", "CYCLE", "NOCYCLE", "ORDER", "NOORDER",
+            ]),
+            "USER" if words_after_type == 1 => Some(&[
+                "IDENTIFIED", "DEFAULT", "TEMPORARY", "QUOTA", "PROFILE", "PASSWORD", "ACCOUNT",
+                "GRANT", "REVOKE",
+            ]),
+            "VIEW" if words_after_type == 1 => {
+                Some(&["COMPILE", "READ", "ENABLE", "DISABLE", "MODIFY", "ADD"])
+            }
+            "MATERIALIZED VIEW" if words_after_type == 1 => {
+                Some(&["COMPILE", "REFRESH", "REBUILD", "ENABLE", "DISABLE", "MODIFY"])
+            }
+            "PROCEDURE" | "FUNCTION" | "PACKAGE" | "PACKAGE BODY" | "TRIGGER" | "TYPE"
+            | "TYPE BODY"
+                if words_after_type == 1 =>
+            {
+                Some(&["COMPILE", "ENABLE", "DISABLE"])
+            }
+            // Deeper option regions and the remaining alterable objects: suppress
+            // the catalog without guessing the (large) option grammar.
+            "INDEX" | "SEQUENCE" | "USER" | "VIEW" | "MATERIALIZED VIEW" | "PROCEDURE"
+            | "FUNCTION" | "PACKAGE" | "PACKAGE BODY" | "TRIGGER" | "TYPE" | "TYPE BODY"
+            | "TABLESPACE" | "PROFILE" | "ROLE" | "CLUSTER" => Some(&[]),
+            _ => None,
+        }
+    }
+
+    /// Oracle non-query admin/utility statements (`ANALYZE`, `AUDIT`/`NOAUDIT`,
+    /// `FLASHBACK`, `PURGE`, `CALL`). Once the object name is written a bare
+    /// relation is no longer grammatical, so these suppress the catalog (offering
+    /// the real continuation keywords where unambiguous). The object/identifier
+    /// slots (`ANALYZE TABLE |`, `AUDIT … ON |`, `CALL |`/inside its argument list)
+    /// return `None` and keep the catalog available.
+    fn expected_oracle_admin_statement_tail_keywords(
+        words: &[String],
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> Option<&'static [&'static str]> {
+        let first = words.first().map(String::as_str)?;
+        let last = words.last().map(String::as_str);
+        let has = |keyword: &str| words.iter().any(|word| word == keyword);
+        match first {
+            // `ANALYZE {TABLE|INDEX|CLUSTER} <name> |` → the analysis operations.
+            "ANALYZE" if has("TABLE") || has("INDEX") || has("CLUSTER") => {
+                if matches!(last, Some("TABLE" | "INDEX" | "CLUSTER")) {
+                    return None; // object-name slot
+                }
+                if has("STATISTICS") || has("STRUCTURE") || has("ROWS") {
+                    return Some(&[]); // operation chosen / complete
+                }
+                Some(&[
+                    "COMPUTE STATISTICS",
+                    "ESTIMATE STATISTICS",
+                    "VALIDATE STRUCTURE",
+                    "DELETE STATISTICS",
+                    "LIST CHAINED ROWS",
+                ])
+            }
+            // `AUDIT <privileges> [ON <obj>] [BY <user>] [WHENEVER …]`. The `ON`/`BY`
+            // identifier slots keep the catalog; everywhere else only the clause
+            // keywords are grammatical (never the select-list `FROM`).
+            "AUDIT" | "NOAUDIT" => match last {
+                Some("ON") | Some("BY") => None,
+                Some("WHENEVER") => Some(&["SUCCESSFUL", "NOT"]),
+                Some("NOT") if has("WHENEVER") => Some(&["SUCCESSFUL"]),
+                _ => Some(match (has("ON"), has("BY"), has("WHENEVER")) {
+                    (false, false, false) => &["ON", "BY", "WHENEVER"],
+                    (true, false, false) => &["BY", "WHENEVER"],
+                    (_, true, false) => &["WHENEVER"],
+                    _ => &[],
+                }),
+            },
+            // `FLASHBACK {TABLE|DATABASE} … |` — the relation and `TO` slots keep the
+            // catalog; past them the statement is option-only, so suppress.
+            "FLASHBACK" => {
+                if matches!(last, Some("FLASHBACK" | "TABLE" | "DATABASE" | "TO")) {
+                    return None;
+                }
+                Some(&[])
+            }
+            // `PURGE {TABLE|INDEX} <name>` / `PURGE RECYCLEBIN` — complete once the
+            // object name is written.
+            "PURGE" => {
+                if matches!(last, Some("PURGE" | "TABLE" | "INDEX")) {
+                    return None; // object-name slot
+                }
+                Some(&[])
+            }
+            // `CALL proc[(args)] [INTO :host] |` — a complete call; the procedure
+            // name slot and the argument list keep the catalog available.
+            "CALL" => {
+                if words.len() <= 1 || Self::unclosed_paren_count(tokens, end) != 0 {
+                    return None;
+                }
+                Some(&[])
+            }
+            // `ASSOCIATE STATISTICS WITH <objects> |` → `USING`; `DISASSOCIATE
+            // STATISTICS FROM <objects> |` → complete. The object-kind keyword and
+            // the comma-separated object list keep the catalog available.
+            "ASSOCIATE" | "DISASSOCIATE" if has("STATISTICS") => {
+                let last_is_comma = matches!(
+                    Self::meaningful_tokens_before(tokens, end).last(),
+                    Some(SqlToken::Symbol(sym)) if sym == ","
+                );
+                if last_is_comma
+                    || matches!(
+                        last,
+                        Some(
+                            "WITH" | "FROM" | "COLUMNS" | "FUNCTIONS" | "PACKAGES" | "TYPES"
+                                | "INDEXES" | "INDEXTYPES"
+                        )
+                    )
+                {
+                    return None;
+                }
+                Some(if first == "ASSOCIATE" { &["USING"] } else { &[] })
+            }
+            _ => None,
+        }
     }
 
     fn expected_statement_tail_keyword_candidates(
@@ -14137,7 +14824,9 @@ impl SqlEditorWidget {
                 if comment == "COMMENT" && on == "ON" && !rest.is_empty() =>
             {
                 if rest.iter().any(|word| word == "IS") {
-                    return None;
+                    // The comment text is a string literal — never a relation — so
+                    // suppress the catalog rather than leaving the slot open.
+                    return Some(&[]);
                 }
                 match rest.last().map(String::as_str) {
                     Some("MATERIALIZED") => return Some(&["VIEW"]),
@@ -14201,6 +14890,41 @@ impl SqlEditorWidget {
             {
                 return Some(&["OBJECT", "TABLE OF", "VARRAY"]);
             }
+        }
+
+        // Past the object name of a single-object `DROP`/`CREATE`, a bare relation
+        // is no longer grammatical. These helpers identify the *leading* object
+        // type (so a later option keyword like the `TABLESPACE` of `CREATE TABLE …
+        // TABLESPACE` is never mistaken for the type) and return a handled set —
+        // the real option keywords where the grammar is unambiguous, otherwise an
+        // empty set — so the catalog is suppressed at the tail. The object-name
+        // slot itself (`DROP VIEW |`) and the defining-query/relation slots
+        // (`CREATE SYNONYM s FOR |`, `… AS SELECT … FROM |`) return `None` and keep
+        // the catalog available.
+        if let Some(candidates) = Self::expected_drop_object_tail_keywords(&words) {
+            return Some(candidates);
+        }
+        if let Some(candidates) =
+            Self::expected_create_object_tail_keywords(&words, tokens, end)
+        {
+            return Some(candidates);
+        }
+        if let Some(candidates) = Self::expected_alter_object_tail_keywords(&words) {
+            return Some(candidates);
+        }
+        if let Some(candidates) =
+            Self::expected_oracle_admin_statement_tail_keywords(&words, tokens, end)
+        {
+            return Some(candidates);
+        }
+        // Option keywords that take a name from a catalog we do not model (a
+        // tablespace) are followed by an identifier slot, never a relation; in a
+        // `CREATE`/`ALTER` statement suppress the catalog there.
+        if matches!(words.first().map(String::as_str), Some("CREATE" | "ALTER"))
+            && Self::unclosed_paren_count(tokens, end) == 0
+            && words.last().map(String::as_str) == Some("TABLESPACE")
+        {
+            return Some(&[]);
         }
 
         match words.as_slice() {
@@ -15047,7 +15771,9 @@ impl SqlEditorWidget {
                 }
                 Some(user_option_head_keywords)
             }
-        "DROP" if is_user_statement => Some(&["IF"]),
+            // `DROP USER [IF EXISTS] user` — `IF` is grammatical only before the
+            // user name (right after `USER`); past the name nothing more is offered.
+            "DROP" if is_user_statement => (last == Some("USER")).then_some(&["IF"][..]),
             "FLUSH" if words.len() == 1 => Some(&[
                 "BINARY",
                 "ENGINE",
@@ -15379,6 +16105,92 @@ impl SqlEditorWidget {
                 }
                 _ => {}
             }
+        }
+
+        let last_token_is_comma = matches!(
+            Self::meaningful_tokens_before(tokens, end).last(),
+            Some(SqlToken::Symbol(sym)) if sym == ","
+        );
+
+        // `DROP <object> <name> |` — once the name is written a bare relation is no
+        // longer grammatical. The object-name slot (the structural candidates offer
+        // `IF EXISTS` there), the comma-separated list continuation (`DROP TABLE a,
+        // |`), and the `DROP INDEX … ON |` table slot keep the catalog available.
+        if first == "DROP" && !has("INDEX") && !last_token_is_comma {
+            if let Some((_, words_after_type)) = Self::leading_ddl_object_type(&words) {
+                if words_after_type >= 1 && !matches!(last, Some("IF" | "EXISTS")) {
+                    return Some(&[]);
+                }
+            }
+        }
+
+        // `CREATE [OR REPLACE] VIEW v [ (cols) ] |` → `AS` (the defining query). The
+        // open column-alias list and the view-name slot keep the catalog available.
+        if first == "CREATE" && has("VIEW") && !has("AS") {
+            if Self::unclosed_paren_count(tokens, end) != 0 {
+                return None;
+            }
+            if matches!(last, Some("VIEW" | "IF" | "NOT" | "EXISTS")) {
+                return None;
+            }
+            return Some(&["AS"]);
+        }
+
+        // `TRUNCATE [TABLE] t |` — complete. `TRUNCATE |`→`TABLE` and the table slot
+        // (`TRUNCATE TABLE |`) keep the catalog available.
+        if first == "TRUNCATE" {
+            if matches!(last, Some("TRUNCATE" | "TABLE")) {
+                return None;
+            }
+            return Some(&[]);
+        }
+
+        // `RENAME TABLE old TO new [, old TO new]` — within each pair `TO` follows
+        // the old name (offered by the structural candidates) and the new name
+        // completes the pair. Suppress only past the new name; the relation slots
+        // (`RENAME TABLE |`, `… TO |`) and the comma list continuation keep the
+        // catalog, and the post-old-name slot defers so `TO` is still offered.
+        if first == "RENAME" && !last_token_is_comma {
+            if matches!(last, Some("RENAME" | "TABLE" | "TO")) {
+                return None;
+            }
+            let current_pair_has_to = Self::meaningful_tokens_before(tokens, end)
+                .iter()
+                .rev()
+                .take_while(|token| !matches!(token, SqlToken::Symbol(sym) if sym == ","))
+                .any(|token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("TO")));
+            return current_pair_has_to.then_some(&[][..]);
+        }
+
+        // `OPTIMIZE TABLE t [, t2] |` — complete; the table slot and the comma list
+        // continuation keep the catalog. (`ANALYZE`/`CHECK TABLE` are handled by
+        // their own maintenance grammars.)
+        if first == "OPTIMIZE" && has("TABLE") && !last_token_is_comma {
+            if last == Some("TABLE") {
+                return None;
+            }
+            return Some(&[]);
+        }
+
+        // `FLUSH <option>` — a terminal flush option completes the statement, so a
+        // relation is no longer grammatical. `TABLES`/`TABLE` take a relation list
+        // (keep the catalog) and `LOCAL`/`NO_WRITE_TO_BINLOG` are prefixes whose
+        // option list the structural candidates supply.
+        if first == "FLUSH"
+            && matches!(
+                last,
+                Some(
+                    "PRIVILEGES" | "STATUS" | "HOSTS" | "LOGS" | "USER_RESOURCES"
+                        | "OPTIMIZER_COSTS"
+                )
+            )
+        {
+            return Some(&[]);
+        }
+        // `CALL proc[(args)] |` — a complete call names no relation past its
+        // argument list.
+        if first == "CALL" && words.len() > 1 && Self::unclosed_paren_count(tokens, end) == 0 {
+            return Some(&[]);
         }
 
         None
@@ -22271,7 +23083,15 @@ impl SqlEditorWidget {
                     [topic] if topic == "STORAGE" => Some(MYSQL_SHOW_AFTER_STORAGE),
                     [topic] if topic == "TABLE" => Some(MYSQL_SHOW_AFTER_TABLE),
                     [topic] if mysql_show_column_topic(topic) => Some(MYSQL_SHOW_FROM_TABLE),
-                    [topic, _table] if mysql_show_column_topic(topic) => {
+                    // `SHOW COLUMNS <tbl> |` (table named directly) → the post-table
+                    // filters. A bare `FROM`/`IN` here is the source keyword, not the
+                    // table name (`SHOW COLUMNS FROM |` still awaits the table), so it
+                    // must not match — the table catalog is offered via the object
+                    // kind instead.
+                    [topic, table]
+                        if mysql_show_column_topic(topic)
+                            && !matches!(table.as_str(), "FROM" | "IN") =>
+                    {
                         Some(MYSQL_SHOW_FROM_IN_OR_FILTER)
                     }
                     [topic, source_kw, _table]
@@ -22797,6 +23617,10 @@ impl SqlEditorWidget {
             None => {}
         }
 
+        if let Some(candidates) = Self::standard_function_keyword_slot(tokens, context_end) {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+
         if let Some(slot) = Self::interval_unit_position(tokens, context_end) {
             return Self::filter_expected_candidates(
                 prefix,
@@ -22861,7 +23685,12 @@ impl SqlEditorWidget {
             return Self::filter_expected_candidates(prefix, candidates);
         }
         if let Some(candidates) =
-            Self::expected_flashback_query_keyword_candidates(tokens, context_end, deep_ctx.phase)
+            Self::expected_flashback_query_keyword_candidates(
+                tokens,
+                context_end,
+                deep_ctx.phase,
+                db_type,
+            )
         {
             return Self::filter_expected_candidates(prefix, candidates);
         }
@@ -23434,6 +24263,17 @@ impl SqlEditorWidget {
                         | "REPAIR"
                         | "PURGE"
                 ) && *last == "TABLE" =>
+            {
+                Some(ExpectedObjectSuggestionKind::Table)
+            }
+            // MySQL `LOCK TABLES |` / `FLUSH [LOCAL] TABLES |` name a relation list;
+            // the structural candidates supply the surrounding keywords (`READ`/
+            // `WRITE`, `FOR`/`WITH`), but the table catalog belongs here too.
+            [first, .., last]
+                if matches!(
+                    (first.as_str(), last.as_str()),
+                    ("LOCK", "TABLES") | ("FLUSH", "TABLES") | ("FLUSH", "TABLE")
+                ) =>
             {
                 Some(ExpectedObjectSuggestionKind::Table)
             }
@@ -24731,20 +25571,6 @@ impl SqlEditorWidget {
                 .get(&key)
                 .is_some_and(|deps| deps.iter().any(|dep| table_is_loading(data, dep)))
         })
-    }
-
-    fn collect_context_name_suggestions_for_completion(
-        prefix: &str,
-        deep_ctx: &intellisense_context::CursorContext,
-        context: SqlContext,
-        source_policy: CompletionSourcePolicy,
-        expr_keyword_ctx: ExpressionKeywordContext,
-    ) -> Vec<String> {
-        if source_policy.suppresses_context_names(context, expr_keyword_ctx) {
-            Vec::new()
-        } else {
-            Self::collect_context_name_suggestions(prefix, deep_ctx, context)
-        }
     }
 
     fn collect_context_name_suggestions(

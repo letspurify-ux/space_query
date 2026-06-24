@@ -10561,13 +10561,11 @@ fn print_command_bind_suggestions_for_test(
         suggestions =
             SqlEditorWidget::prepend_local_symbol_suggestions(suggestions, local_suggestions);
     }
-    let context_names = SqlEditorWidget::collect_context_name_suggestions_for_completion(
-        &prefix,
-        &ctx,
-        context,
-        source_policy,
-        expr_keyword_ctx,
-    );
+    let context_names = if source_policy.suppresses_context_names(context, expr_keyword_ctx) {
+        Vec::new()
+    } else {
+        SqlEditorWidget::collect_context_name_suggestions(&prefix, &ctx, context)
+    };
     suggestions = SqlEditorWidget::maybe_merge_suggestions_with_context_aliases(
         suggestions,
         context_names,
@@ -11625,20 +11623,19 @@ fn into_source_slots_suppress_context_names_when_target_type_is_known() {
                 expr_ctx,
             )
         };
-        let context_names = SqlEditorWidget::collect_context_name_suggestions_for_completion(
-            &prefix,
-            deep_ctx,
-            context,
-            CompletionSourcePolicy::new(
-                false,
-                at_keyword_only_identifier_slot,
-                at_keyword_only_slot,
-                false,
-                false,
-                expr_ctx,
-            ),
+        let context_name_policy = CompletionSourcePolicy::new(
+            false,
+            at_keyword_only_identifier_slot,
+            at_keyword_only_slot,
+            false,
+            false,
             expr_ctx,
         );
+        let context_names = if context_name_policy.suppresses_context_names(context, expr_ctx) {
+            Vec::new()
+        } else {
+            SqlEditorWidget::collect_context_name_suggestions(&prefix, deep_ctx, context)
+        };
         suggestions = SqlEditorWidget::maybe_merge_suggestions_with_context_aliases(
             suggestions,
             context_names,
@@ -29359,20 +29356,22 @@ fn typed_emp_suggestions_for_db(
         Some(db_type),
         expr_keyword_ctx,
     );
-    let context_name_suggestions = SqlEditorWidget::collect_context_name_suggestions_for_completion(
-        &prefix,
-        &ctx,
-        context,
-        CompletionSourcePolicy::new(
-            false,
-            at_keyword_only_identifier_slot,
-            at_keyword_only_slot,
-            false,
-            false,
-            expr_keyword_ctx,
-        ),
+    let context_name_policy = CompletionSourcePolicy::new(
+        false,
+        at_keyword_only_identifier_slot,
+        at_keyword_only_slot,
+        false,
+        false,
         expr_keyword_ctx,
     );
+    let context_name_suggestions = if context_name_policy.suppresses_context_names(
+        context,
+        expr_keyword_ctx,
+    ) {
+        Vec::new()
+    } else {
+        SqlEditorWidget::collect_context_name_suggestions(&prefix, &ctx, context)
+    };
     suggestions = SqlEditorWidget::maybe_merge_suggestions_with_context_aliases(
         suggestions,
         context_name_suggestions,
@@ -38901,4 +38900,533 @@ fn using_join_column_list_completes_the_join() {
     let s = kw("SELECT a FROM t1 JOIN t2 USING (a, |", Oracle);
     assert!(!has(&s, "WHERE") && !has(&s, "JOIN"),
         "query continuation leaked into the open USING column list: {s:?}");
+}
+
+
+/// After a `CREATE TABLE`/`CREATE INDEX` whose mandatory definition list is
+/// closed, a bare relation is no longer grammatical — only the physical/storage
+/// option keywords are. Guards against the relation-catalog leak at the Oracle
+/// post-definition tail (MySQL already had its table-option grammar) while
+/// keeping the leak suppressed and offering the correct continuations. A CTAS
+/// (`… AS SELECT …`, including a subquery inside it) stays a query position and
+/// must NOT be treated as an option tail, and an open definition list is still a
+/// column-definition position.
+#[test]
+fn create_table_and_index_definition_tail_offers_options_and_suppresses_relations() {
+    use crate::db::DatabaseType::{Oracle, MySQL};
+    let kw = |sql: &str, db: crate::db::DatabaseType| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "", &analyze_inline_cursor_sql(sql), Some(db))
+    };
+    let idsupp = |sql: &str, db: crate::db::DatabaseType| {
+        SqlEditorWidget::cursor_is_at_identifier_suppressing_keyword_slot_for_context(
+            &analyze_inline_cursor_sql(sql), false, Some(db))
+    };
+    let has = |v: &Vec<String>, s: &str| v.iter().any(|x| x == s);
+
+    // Oracle CREATE TABLE tail: relation suppressed, table options offered.
+    for sql in [
+        "CREATE TABLE t (a NUMBER) |",
+        "CREATE TABLE t (a NUMBER, b NUMBER) |",
+        "CREATE TABLE t (a NUMBER PRIMARY KEY) |",
+        "CREATE TABLE t (a NUMBER, CONSTRAINT ck CHECK (a > 0)) |",
+        "CREATE GLOBAL TEMPORARY TABLE t (a NUMBER) |",
+    ] {
+        assert!(idsupp(sql, Oracle), "relation must be suppressed at `{sql}`");
+        let s = kw(sql, Oracle);
+        assert!(has(&s, "TABLESPACE") && has(&s, "STORAGE") && has(&s, "PARTITION BY"),
+            "table options missing at `{sql}`: {s:?}");
+    }
+
+    // Oracle CREATE INDEX tail: relation suppressed, index options offered.
+    for sql in [
+        "CREATE INDEX i ON t (a) |",
+        "CREATE UNIQUE INDEX i ON t (a, b) |",
+        "CREATE INDEX i ON t (UPPER(a)) |",
+    ] {
+        assert!(idsupp(sql, Oracle), "relation must be suppressed at `{sql}`");
+        let s = kw(sql, Oracle);
+        assert!(has(&s, "TABLESPACE") && has(&s, "ONLINE") && has(&s, "LOCAL"),
+            "index options missing at `{sql}`: {s:?}");
+        // Index tail is not a table tail.
+        assert!(!has(&s, "ORGANIZATION"), "table-only option leaked into index tail at `{sql}`: {s:?}");
+    }
+
+    // CTAS stays a query position: the option tail must not fire (the column
+    // slot belongs to the SELECT), even when a subquery closes a paren.
+    for sql in [
+        "CREATE TABLE t (a NUMBER) AS SELECT |",
+        "CREATE TABLE t (a, b) AS SELECT * FROM (SELECT 1 FROM dual) |",
+    ] {
+        let s = kw(sql, Oracle);
+        assert!(!has(&s, "TABLESPACE") && !has(&s, "PARTITION BY"),
+            "option tail leaked into CTAS query position at `{sql}`: {s:?}");
+    }
+
+    // Inside an open definition list it is still a column-definition position,
+    // never the option tail.
+    let open = kw("CREATE TABLE t (a |", Oracle);
+    assert!(!open.iter().any(|x| x == "TABLESPACE"),
+        "option tail leaked into open column-definition list: {open:?}");
+
+    // MySQL keeps its own table-option grammar (not the Oracle physical-attrs).
+    let my = kw("CREATE TABLE t (a INT) |", MySQL);
+    assert!(my.iter().any(|x| x == "ENGINE"), "MySQL table options missing: {my:?}");
+    assert!(!my.iter().any(|x| x == "ORGANIZATION"),
+        "Oracle-only option leaked into MySQL tail: {my:?}");
+}
+
+
+/// Past the object name of a single-object `DROP`/`CREATE`/`ALTER` a bare
+/// relation is no longer grammatical, so the completed/option-region tail
+/// suppresses the catalog (and offers the real option keywords where the grammar
+/// is unambiguous). The object-name slot itself and the defining-query/relation
+/// slots (`CREATE INDEX i ON |`, `CREATE SYNONYM s FOR |`, `… AS SELECT … FROM |`,
+/// the `GRANT … ON|TO` identifier slots) keep the catalog available. Guards
+/// against the broad relation-catalog leak at DDL statement tails, including
+/// schema-qualified names and multi-word object types.
+#[test]
+fn ddl_statement_tails_suppress_relations_and_offer_object_options() {
+    use crate::db::DatabaseType::Oracle;
+    let idsupp = |sql: &str| {
+        let excl = sql
+            .strip_suffix('|')
+            .and_then(|s| s.chars().last())
+            .is_some_and(|c| c.is_alphanumeric());
+        SqlEditorWidget::cursor_is_at_identifier_suppressing_keyword_slot_for_context(
+            &analyze_inline_cursor_sql(sql),
+            excl,
+            Some(Oracle),
+        )
+    };
+    let kw = |sql: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &analyze_inline_cursor_sql(sql),
+            Some(Oracle),
+        )
+    };
+    let has = |v: &Vec<String>, s: &str| v.iter().any(|x| x == s);
+
+    // DROP single-object tails: catalog suppressed; options where unambiguous.
+    for sql in [
+        "DROP VIEW v |",
+        "DROP INDEX i |",
+        "DROP SEQUENCE s |",
+        "DROP SYNONYM s |",
+        "DROP PROCEDURE p |",
+        "DROP USER u |",
+        "DROP TYPE t |",
+        "DROP TABLESPACE ts |",
+        "DROP MATERIALIZED VIEW mv |",
+        "DROP PACKAGE BODY pb |",
+        "DROP TABLE s.t |",                 // schema-qualified
+        "DROP TABLE t PURGE |",             // trailing option
+        "DROP TABLE t CASCADE CONSTRAINTS |",
+    ] {
+        assert!(idsupp(sql), "relation must be suppressed at `{sql}`");
+    }
+    assert_eq!(kw("DROP USER u |"), vec!["CASCADE".to_string()]);
+    assert_eq!(kw("DROP TYPE t |"), vec!["FORCE".to_string(), "VALIDATE".to_string()]);
+    assert_eq!(kw("DROP TABLE s.t |"), vec!["CASCADE".to_string(), "PURGE".to_string()]);
+    assert_eq!(kw("DROP TABLE t CASCADE |"), vec!["CONSTRAINTS".to_string()]);
+
+    // DROP object-name slot keeps objects available (no name written yet).
+    assert!(!idsupp("DROP VIEW |"), "object-name slot must keep the catalog");
+    assert!(!idsupp("DROP TABLE |"));
+
+    // CREATE non-relational object tails: suppressed, first keyword offered.
+    assert!(idsupp("CREATE USER u |") && has(&kw("CREATE USER u |"), "IDENTIFIED"));
+    assert!(idsupp("CREATE ROLE r |") && has(&kw("CREATE ROLE r |"), "IDENTIFIED"));
+    assert!(idsupp("CREATE TABLESPACE ts |") && has(&kw("CREATE TABLESPACE ts |"), "DATAFILE"));
+    assert!(idsupp("CREATE PROFILE p |") && has(&kw("CREATE PROFILE p |"), "LIMIT"));
+    assert!(idsupp("CREATE DIRECTORY d |") && has(&kw("CREATE DIRECTORY d |"), "AS"));
+    assert!(idsupp("CREATE VIEW v (a, b) |") && has(&kw("CREATE VIEW v (a, b) |"), "AS"));
+    // Deeper into the option region the catalog stays suppressed (no re-offer).
+    assert!(idsupp("CREATE USER u IDENTIFIED BY p |"));
+    assert!(idsupp("CREATE TABLE t (a NUMBER) TABLESPACE |"));        // tablespace-name slot
+    assert!(idsupp("CREATE TABLE t (a NUMBER) TABLESPACE users LOGGING |"));
+
+    // CREATE SYNONYM: target slot keeps the catalog, completed target suppresses.
+    assert!(!idsupp("CREATE SYNONYM s FOR |"), "synonym target slot keeps catalog");
+    assert!(idsupp("CREATE SYNONYM s FOR x.y |"));
+
+    // ALTER object tails: suppressed with primary actions; ALTER TABLE keeps its
+    // dedicated arm; the object-name slot keeps the catalog.
+    assert!(idsupp("ALTER INDEX i |") && has(&kw("ALTER INDEX i |"), "REBUILD"));
+    assert!(idsupp("ALTER SEQUENCE s |") && has(&kw("ALTER SEQUENCE s |"), "INCREMENT BY"));
+    assert!(idsupp("ALTER USER u |") && has(&kw("ALTER USER u |"), "IDENTIFIED"));
+    assert!(idsupp("ALTER PROCEDURE p |") && has(&kw("ALTER PROCEDURE p |"), "COMPILE"));
+    let alter_table = kw("ALTER TABLE t |");
+    assert!(has(&alter_table, "ADD") && has(&alter_table, "MODIFY"), "{alter_table:?}");
+    assert!(!idsupp("ALTER TABLE |"), "ALTER TABLE name slot must keep the catalog");
+
+    // GRANT/REVOKE: identifier slots keep the catalog, keyword tails suppress.
+    assert!(!idsupp("GRANT SELECT ON |"), "object slot keeps catalog");
+    assert!(!idsupp("GRANT SELECT ON emp TO |"), "grantee slot keeps catalog");
+    assert!(!idsupp("GRANT SELECT ON emp TO scott, |"), "grantee list keeps catalog");
+    assert!(!idsupp("REVOKE SELECT ON emp FROM |"));
+    assert!(idsupp("GRANT SELECT ON emp TO scott |")
+        && has(&kw("GRANT SELECT ON emp TO scott |"), "WITH GRANT OPTION"));
+    assert!(idsupp("REVOKE SELECT ON emp FROM scott |"));
+
+    // A `MATERIALIZED VIEW LOG` is a distinct object, not a completed MV.
+    assert!(has(&kw("CREATE MATERIALIZED VIEW LOG |"), "ON"),
+        "MV LOG must still offer ON, not be treated as a completed view");
+}
+
+
+/// MySQL DDL statement tails suppress the relation catalog past the object name,
+/// the same leak class as the Oracle dialect. The object-name slots, the
+/// comma-separated list continuations (`DROP TABLE a, |`, multi-pair `RENAME`),
+/// and the relation slots (`DROP INDEX … ON |`, `TRUNCATE TABLE |`, `RENAME
+/// TABLE … TO |`) keep the catalog available. Guards against the broad MySQL
+/// DDL-tail leak and the stray `IF` re-offer past a written `DROP USER` name.
+#[test]
+fn mysql_ddl_statement_tails_suppress_relations() {
+    use crate::db::DatabaseType::MySQL;
+    let idsupp = |sql: &str| {
+        let excl = sql
+            .strip_suffix('|')
+            .and_then(|s| s.chars().last())
+            .is_some_and(|c| c.is_alphanumeric());
+        SqlEditorWidget::cursor_is_at_identifier_suppressing_keyword_slot_for_context(
+            &analyze_inline_cursor_sql(sql),
+            excl,
+            Some(MySQL),
+        )
+    };
+    let kw = |sql: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &analyze_inline_cursor_sql(sql),
+            Some(MySQL),
+        )
+    };
+    let has = |v: &Vec<String>, s: &str| v.iter().any(|x| x == s);
+
+    // DROP single-object tails: catalog suppressed past the name (incl.
+    // schema-qualified) with no stray keywords.
+    for sql in [
+        "DROP TABLE t |",
+        "DROP TABLE s.t |",
+        "DROP VIEW v |",
+        "DROP DATABASE d |",
+        "DROP SCHEMA s |",
+        "DROP PROCEDURE p |",
+        "DROP FUNCTION f |",
+        "DROP TRIGGER tg |",
+        "DROP EVENT e |",
+        "DROP SERVER srv |",
+        "DROP USER u |",
+    ] {
+        assert!(idsupp(sql), "relation must be suppressed at `{sql}`");
+        assert!(kw(sql).is_empty(), "no keyword tail expected at `{sql}`: {:?}", kw(sql));
+    }
+
+    // The `IF [EXISTS]` flow is grammatical only before the name.
+    assert!(has(&kw("DROP USER |"), "IF"));
+    assert!(has(&kw("DROP USER IF |"), "EXISTS"));
+    assert!(kw("DROP USER IF EXISTS |").is_empty());
+
+    // Relation / list-continuation slots keep the catalog. (The bare object-name
+    // slot `DROP TABLE |` offers `IF [EXISTS]` and is a separate pre-existing
+    // suppression, not part of this leak class.)
+    assert!(!idsupp("DROP TABLE a, |"), "drop list continuation keeps catalog");
+    assert!(!idsupp("DROP INDEX i ON |"), "DROP INDEX table slot keeps catalog");
+
+    // CREATE VIEW with a column-alias list still awaits `AS`.
+    assert!(idsupp("CREATE VIEW v (a, b) |") && has(&kw("CREATE VIEW v (a, b) |"), "AS"));
+
+    // TRUNCATE: `TRUNCATE |`→TABLE, the table slot keeps the catalog, the tail
+    // suppresses.
+    assert!(has(&kw("TRUNCATE |"), "TABLE"));
+    assert!(!idsupp("TRUNCATE TABLE |"), "truncate table slot keeps catalog");
+    assert!(idsupp("TRUNCATE TABLE t |"));
+
+    // RENAME pairs: `TO` after the old name, suppress past the new name, keep the
+    // catalog at each relation slot and list continuation.
+    assert!(!idsupp("RENAME TABLE |"));
+    assert!(idsupp("RENAME TABLE emp |") && has(&kw("RENAME TABLE emp |"), "TO"));
+    assert!(!idsupp("RENAME TABLE emp TO |"));
+    assert!(idsupp("RENAME TABLE emp TO x |"));
+    assert!(!idsupp("RENAME TABLE emp TO x, |"));
+    assert!(has(&kw("RENAME TABLE emp TO x, dept |"), "TO"));
+    assert!(idsupp("RENAME TABLE emp TO x, dept TO y |"));
+
+    // Pre-existing MySQL grammars unaffected.
+    assert!(has(&kw("CREATE TABLE t (a INT) |"), "ENGINE"));
+    assert!(has(&kw("CREATE USER u |"), "IDENTIFIED"));
+}
+
+/// Non-query admin/utility statement tails suppress the relation catalog past the
+/// object name (and never leak the select-list `FROM` into `AUDIT`), while the
+/// object/identifier slots keep the catalog available. Also locks the MySQL
+/// `DROP <object> |` name slot offering the table catalog alongside `IF EXISTS`
+/// (an existing object is named there, unlike a `CREATE` slot).
+#[test]
+fn admin_statement_tails_suppress_relations_without_select_noise() {
+    use crate::db::DatabaseType::{Oracle, MySQL};
+    let idsupp = |sql: &str, db: crate::db::DatabaseType| {
+        let excl = sql
+            .strip_suffix('|')
+            .and_then(|s| s.chars().last())
+            .is_some_and(|c| c.is_alphanumeric());
+        SqlEditorWidget::cursor_is_at_identifier_suppressing_keyword_slot_for_context(
+            &analyze_inline_cursor_sql(sql),
+            excl,
+            Some(db),
+        )
+    };
+    let kw = |sql: &str, db: crate::db::DatabaseType| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &analyze_inline_cursor_sql(sql),
+            Some(db),
+        )
+    };
+    let has = |v: &Vec<String>, s: &str| v.iter().any(|x| x == s);
+
+    // Oracle admin tails: suppressed, with the real continuation keywords.
+    assert!(idsupp("COMMENT ON COLUMN emp.sal IS 'x' |", Oracle));
+    assert!(idsupp("ANALYZE TABLE emp |", Oracle)
+        && has(&kw("ANALYZE TABLE emp |", Oracle), "COMPUTE STATISTICS"));
+    assert!(idsupp("ANALYZE TABLE emp COMPUTE STATISTICS |", Oracle));
+    assert!(idsupp("FLASHBACK TABLE emp TO BEFORE DROP |", Oracle));
+    assert!(idsupp("PURGE TABLE emp |", Oracle));
+    assert!(idsupp("CALL my_proc(1) |", Oracle));
+    assert!(idsupp("ASSOCIATE STATISTICS WITH COLUMNS emp.sal |", Oracle)
+        && has(&kw("ASSOCIATE STATISTICS WITH COLUMNS emp.sal |", Oracle), "USING"));
+
+    // `AUDIT` is not a query: it offers its clause keywords, never `FROM`.
+    let audit = kw("AUDIT SELECT ON emp |", Oracle);
+    assert!(idsupp("AUDIT SELECT ON emp |", Oracle));
+    assert!(has(&audit, "BY") && has(&audit, "WHENEVER"), "{audit:?}");
+    assert!(!has(&audit, "FROM"), "select-list FROM leaked into AUDIT: {audit:?}");
+
+    // Admin object/argument slots keep the catalog.
+    assert!(!idsupp("ANALYZE TABLE |", Oracle), "analyze table slot keeps catalog");
+    assert!(!idsupp("CALL |", Oracle), "call proc-name slot keeps catalog");
+    assert!(!idsupp("AUDIT SELECT ON |", Oracle), "audit object slot keeps catalog");
+
+    // MySQL admin tails.
+    assert!(idsupp("FLUSH PRIVILEGES |", MySQL));
+    assert!(has(&kw("FLUSH LOCAL |", MySQL), "PRIVILEGES"), "FLUSH option list lost");
+    assert!(idsupp("OPTIMIZE TABLE emp |", MySQL));
+    assert!(!idsupp("OPTIMIZE TABLE |", MySQL), "optimize table slot keeps catalog");
+    assert!(idsupp("CALL my_proc(1) |", MySQL));
+
+    // MySQL `DROP <object> |` name slot offers the catalog alongside `IF`.
+    assert!(!idsupp("DROP TABLE |", MySQL), "drop-table name slot keeps catalog");
+    assert!(!idsupp("DROP VIEW |", MySQL));
+    assert!(!idsupp("DROP TEMPORARY TABLE |", MySQL));
+    assert!(has(&kw("DROP TABLE |", MySQL), "IF"), "IF EXISTS still offered");
+    // Past the name it suppresses again.
+    assert!(idsupp("DROP TABLE t |", MySQL));
+}
+
+/// Relation-naming slots that also carry nearby keywords must still offer the
+/// table catalog (not be over-suppressed): the MySQL `LOCK TABLES`/`FLUSH TABLES`
+/// table-list slots and the `SHOW COLUMNS FROM` table slot. The keyword/alias/
+/// lock-type slots in the same statements stay suppressed, and the post-table
+/// filters appear only once the table is named.
+#[test]
+fn mysql_relation_naming_admin_slots_offer_the_catalog() {
+    use crate::db::DatabaseType::MySQL;
+    let supp = |sql: &str| {
+        let excl = sql
+            .strip_suffix('|')
+            .and_then(|s| s.chars().last())
+            .is_some_and(|c| c.is_alphanumeric());
+        SqlEditorWidget::cursor_is_at_identifier_suppressing_keyword_slot_for_context(
+            &analyze_inline_cursor_sql(sql),
+            excl,
+            Some(MySQL),
+        )
+    };
+    let kind = |sql: &str| {
+        SqlEditorWidget::expected_object_suggestion_kind_for_db(
+            "",
+            None,
+            &analyze_inline_cursor_sql(sql),
+            Some(MySQL),
+        )
+    };
+    let kw = |sql: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &analyze_inline_cursor_sql(sql),
+            Some(MySQL),
+        )
+    };
+    let has = |v: &Vec<String>, s: &str| v.iter().any(|x| x == s);
+    use ExpectedObjectSuggestionKind as K;
+
+    // LOCK/FLUSH TABLES table-list slots: catalog offered (not suppressed).
+    for sql in [
+        "LOCK TABLES |",
+        "LOCK TABLES emp READ, |",
+        "FLUSH TABLES |",
+        "FLUSH LOCAL TABLES |",
+    ] {
+        assert!(!supp(sql), "relation-naming slot must offer the catalog at `{sql}`");
+    }
+    assert_eq!(kind("LOCK TABLES |"), Some(K::Table));
+    assert_eq!(kind("FLUSH TABLES |"), Some(K::Table));
+    // `FLUSH TABLES |` still offers its own keywords alongside the catalog.
+    assert!(has(&kw("FLUSH TABLES |"), "FOR") && has(&kw("FLUSH TABLES |"), "WITH"));
+
+    // The alias / lock-type / post-table slots in the same statements stay
+    // suppressed (no relation grammatical there).
+    assert!(supp("LOCK TABLES emp |")); // lock-type slot → AS/READ/WRITE
+    assert!(has(&kw("LOCK TABLES emp |"), "READ"));
+    assert!(supp("LOCK TABLES emp AS |")); // alias = a new name
+
+    // `SHOW COLUMNS FROM |` offers the table via the object kind and no longer
+    // leaks the post-table filter keywords prematurely.
+    assert_eq!(kind("SHOW COLUMNS FROM |"), Some(K::ColumnOwner));
+    assert!(kw("SHOW COLUMNS FROM |").is_empty(),
+        "premature filter keywords at the SHOW COLUMNS table slot: {:?}",
+        kw("SHOW COLUMNS FROM |"));
+    // After the table is named the filters appear.
+    let after = kw("SHOW COLUMNS FROM emp |");
+    assert!(has(&after, "LIKE") && has(&after, "WHERE"), "{after:?}");
+}
+
+/// Oracle's flashback `AS OF` / `VERSIONS BETWEEN` is dialect-specific: after a
+/// table's `AS`, Oracle may continue with `OF` (a flashback query) — but in MySQL
+/// `AS` only introduces a table/lock alias (a new name), so `OF` must not be
+/// offered there. Guards against the flashback keywords leaking into MySQL.
+#[test]
+fn flashback_as_of_is_oracle_only() {
+    use crate::db::DatabaseType::{Oracle, MySQL};
+    let kw = |sql: &str, db: crate::db::DatabaseType| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "", &analyze_inline_cursor_sql(sql), Some(db))
+    };
+    let has = |v: &Vec<String>, s: &str| v.iter().any(|x| x == s);
+
+    // Oracle: `FROM emp AS |` continues a flashback query with `OF`.
+    assert!(has(&kw("SELECT * FROM emp AS |", Oracle), "OF"));
+    assert!(has(&kw("SELECT * FROM emp AS OF |", Oracle), "SCN"));
+    assert!(has(&kw("SELECT * FROM emp VERSIONS |", Oracle), "BETWEEN"));
+
+    // MySQL: `AS` is an alias — no flashback `OF`.
+    assert!(!has(&kw("SELECT * FROM emp AS |", MySQL), "OF"),
+        "flashback OF leaked into a MySQL table alias");
+    assert!(!has(&kw("LOCK TABLES emp AS |", MySQL), "OF"),
+        "flashback OF leaked into a MySQL LOCK TABLES alias");
+}
+
+/// SQL-standard `TRIM`/`SUBSTRING`/`POSITION` calls have an internal keyword
+/// grammar: after a complete operand the only continuation is the function's
+/// separator keyword (never another column), so columns are suppressed and the
+/// keyword is offered. The first-argument value slots still take a column, the
+/// comma form of `SUBSTRING` takes no keyword, and `SUBSTR` (comma-only) and
+/// unrelated functions are unaffected.
+#[test]
+fn standard_function_internal_keyword_grammar_is_offered() {
+    use crate::db::DatabaseType::{Oracle, MySQL};
+    let kw = |sql: &str, db: crate::db::DatabaseType| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "", &analyze_inline_cursor_sql(sql), Some(db))
+    };
+    let supp = |sql: &str, db: crate::db::DatabaseType| {
+        SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot_for_db(
+            &analyze_inline_cursor_sql(sql), false, Some(db))
+    };
+    let eq = |sql: &str, db: crate::db::DatabaseType, want: &[&str]| {
+        assert_eq!(kw(sql, db), want.iter().map(|s| s.to_string()).collect::<Vec<_>>(), "{sql}");
+        assert!(supp(sql, db), "columns must be suppressed at `{sql}`");
+    };
+
+    // After-operand keyword slots (columns suppressed, separator keyword offered).
+    eq("SELECT POSITION('a' |", Oracle, &["IN"]);
+    eq("SELECT POSITION(col |", Oracle, &["IN"]);
+    eq("SELECT TRIM(name |", Oracle, &["FROM"]);
+    eq("SELECT TRIM(LEADING 'x' |", Oracle, &["FROM"]);
+    eq("SELECT SUBSTRING(name |", MySQL, &["FROM"]);
+    eq("SELECT SUBSTRING(name FROM 1 |", MySQL, &["FOR"]);
+    // Nested complete operand resolves to the outer call's keyword.
+    eq("SELECT POSITION(INSTR(a, b) |", Oracle, &["IN"]);
+
+    // Not keyword slots: the str operand (inside/after the separator), the comma
+    // form, `SUBSTR`, the first-arg value slot, and unrelated calls.
+    let none = |sql: &str, db: crate::db::DatabaseType| {
+        assert!(kw(sql, db).is_empty(), "unexpected keyword at `{sql}`: {:?}", kw(sql, db));
+        assert!(!supp(sql, db), "columns must NOT be suppressed at `{sql}`");
+    };
+    none("SELECT POSITION('a' IN name |", Oracle);   // inside the search string
+    none("SELECT TRIM(BOTH ' ' FROM name |", Oracle);
+    none("SELECT SUBSTRING(name, 1 |", MySQL);        // comma form
+    none("SELECT SUBSTR(name |", Oracle);             // comma-only spelling
+    none("SELECT UPPER(name |", Oracle);              // unrelated function
+}
+
+/// Regression: a qualified column slot (`t.|` / alias `a.|`) must keep the
+/// base-catalog fall-through enabled so the qualified column list is produced.
+/// A refactor once gated `base_catalog_suggestions` on `qualifier.is_none()`,
+/// which silently dropped every `<alias>.` column completion. This locks the
+/// allowance contract (the qualifier/keyword-only cases are routed by later
+/// dedicated branches, not by this flag) and verifies the columns actually
+/// surface through the production `base_suggestions_for_context` path.
+#[test]
+fn qualified_alias_column_slot_yields_relation_columns() {
+    for sql in [
+        "select * from help a where a.|",
+        "select a.| from help a",
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["help".to_string()];
+        data.rebuild_indices();
+        data.set_columns_for_table(
+            "help",
+            vec!["id".to_string(), "topic".to_string(), "text".to_string()],
+        );
+
+        // The qualifier resolves to its relation and the mode is RelationColumns.
+        assert_eq!(
+            SqlEditorWidget::resolve_qualified_completion_mode(
+                "a",
+                SqlContext::ColumnName,
+                &ctx,
+                &data,
+            ),
+            Some(super::QualifiedCompletionMode::RelationColumns),
+            "mode for `{sql}`"
+        );
+
+        // The allowance must NOT suppress the base catalog merely because a
+        // qualifier is present — that branch carries the qualified column list.
+        let expr_keyword_ctx = super::ExpressionKeywordContext::ambiguous();
+        let policy =
+            CompletionSourcePolicy::new(false, false, false, false, false, expr_keyword_ctx);
+        let allowance = policy.allowance(SqlContext::ColumnName, Some("a"), expr_keyword_ctx);
+        assert!(
+            allowance.base_catalog_suggestions,
+            "base catalog must stay enabled at a qualified slot for `{sql}`"
+        );
+
+        // End-to-end: the production column path yields the relation's columns.
+        let column_tables = SqlEditorWidget::resolve_column_tables_for_context(Some("a"), &ctx);
+        let cols = SqlEditorWidget::base_suggestions_for_context(
+            &mut data,
+            "",
+            Some("a"),
+            Some(&column_tables),
+            true,
+            SqlContext::ColumnName,
+            false,
+            Some(crate::db::DatabaseType::Oracle),
+            expr_keyword_ctx,
+        );
+        for expected in ["id", "topic", "text"] {
+            assert!(
+                cols.iter().any(|c| c.eq_ignore_ascii_case(expected)),
+                "`{sql}` should suggest column `{expected}`, got {cols:?}"
+            );
+        }
+    }
 }
