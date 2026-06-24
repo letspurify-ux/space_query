@@ -308,15 +308,15 @@ impl CompletionSourcePolicy {
             // qualified column list entirely).
             base_catalog_suggestions: !self.at_tool_bind_name_slot
                 && !self.suppress_free_sql_catalog_argument_sources,
-            wildcard_suggestions: qualifier_is_none
-                && !self.at_keyword_only_identifier_slot
-                && !self.at_keyword_only_slot
-                && !self.at_tool_bind_name_slot
-                && !self.suppress_free_sql_catalog_argument_sources
-                && !(
-                    expr_keyword_ctx.follows_operand == Some(true)
-                        || expr_keyword_ctx.at_bind_variable_name
-                ),
+            wildcard_suggestions: !(
+                !qualifier_is_none
+                    || self.at_keyword_only_identifier_slot
+                    || self.at_keyword_only_slot
+                    || self.at_tool_bind_name_slot
+                    || self.suppress_free_sql_catalog_argument_sources
+                    || expr_keyword_ctx.follows_operand == Some(true)
+                    || expr_keyword_ctx.at_bind_variable_name
+            ),
             comparison_suggestions: qualifier.is_some()
                 && !self.at_keyword_only_identifier_slot
                 && !self.at_keyword_only_slot

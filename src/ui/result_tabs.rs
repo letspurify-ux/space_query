@@ -326,6 +326,21 @@ impl ResultTabsWidget {
         }
     }
 
+    fn layout_active_tab_child(tabs: &mut Tabs) {
+        let (x, y, w, h) = Self::content_bounds(tabs);
+        if let Some(widget) = tabs.value() {
+            if let Some(mut group) = widget.as_group() {
+                group.resize(x, y, w, h);
+                tabs.set_label_size((constants::TAB_HEADER_HEIGHT - 8).max(8));
+                tabs.redraw();
+                return;
+            }
+        }
+        Self::layout_children(tabs);
+        tabs.set_label_size((constants::TAB_HEADER_HEIGHT - 8).max(8));
+        tabs.redraw();
+    }
+
     fn inner_tabs_bounds(x: i32, y: i32, w: i32, h: i32) -> (i32, i32, i32, i32) {
         let gap = if h > 1 {
             Self::INNER_TAB_TOP_GAP.min(h - 1)
@@ -343,6 +358,16 @@ impl ResultTabsWidget {
             Self::inner_tabs_bounds(section.x(), section.y(), section.w(), section.h());
         tabs.resize(x, y, w, h);
         Self::layout_children(tabs);
+    }
+
+    fn layout_active_inner_tabs(section: &Group, tabs: &mut Tabs) {
+        if section.was_deleted() || tabs.was_deleted() {
+            return;
+        }
+        let (x, y, w, h) =
+            Self::inner_tabs_bounds(section.x(), section.y(), section.w(), section.h());
+        tabs.resize(x, y, w, h);
+        Self::layout_active_tab_child(tabs);
     }
 
     fn layout_text_pane_in_tabs(tabs: &Tabs, pane: &mut TextPane) {
@@ -836,6 +861,7 @@ impl ResultTabsWidget {
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = index;
                 Self::fire_on_change_with(&on_change_for_cb);
             }
+            Self::layout_active_tab_child(t);
         });
 
         let on_change_for_top_cb = on_change_callback.clone();
@@ -943,7 +969,7 @@ impl ResultTabsWidget {
 
         let mut data_tabs_for_resize = data_tabs.clone();
         data_tabs.resize_callback(move |t, _, _, _, _| {
-            Self::layout_children(t);
+            Self::layout_active_tab_child(t);
         });
         let script_output_for_resize = script_output.clone();
         let script_errors_for_resize = script_errors.clone();
@@ -971,7 +997,10 @@ impl ResultTabsWidget {
         let explain_plan_for_resize = explain_plan.clone();
         tabs.resize_callback(move |t, _, _, _, _| {
             Self::layout_children(t);
-            Self::layout_inner_tabs(&sections_for_resize.data_grid, &mut data_tabs_for_resize);
+            Self::layout_active_inner_tabs(
+                &sections_for_resize.data_grid,
+                &mut data_tabs_for_resize,
+            );
             Self::layout_inner_tabs(
                 &sections_for_resize.script_output,
                 &mut script_tabs_for_resize,
