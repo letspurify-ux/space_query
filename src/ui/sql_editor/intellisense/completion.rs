@@ -2547,11 +2547,28 @@ impl SqlEditorWidget {
             runtime.clear_pending_intellisense();
         }
 
-        Self::append_exact_catalog_keyword_suggestion(
-            &mut suggestions,
-            &snapshot.prefix,
-            Some(snapshot.preferred_db_type),
-        );
+        if Self::should_append_exact_catalog_keyword_after_context_filters(
+            context,
+            qualifier,
+            source_allowance,
+            effective_expr_keyword_ctx,
+            at_data_type_position,
+            at_tool_no_sql_argument_slot,
+            replace_table_context_with_expected_objects,
+            Self::cursor_prefix_starts_relation_name_slot(deep_ctx),
+            Self::exact_keyword_expected_before_current_identifier(
+                &snapshot.prefix,
+                deep_ctx,
+                Some(snapshot.preferred_db_type),
+                effective_expr_keyword_ctx,
+            ),
+        ) {
+            Self::append_exact_catalog_keyword_suggestion(
+                &mut suggestions,
+                &snapshot.prefix,
+                Some(snapshot.preferred_db_type),
+            );
+        }
 
         if suggestions.is_empty() {
             intellisense_popup
@@ -2752,6 +2769,9 @@ impl SqlEditorWidget {
         );
         let in_mysql_top_level_value_expression = expr_keyword_ctx.in_mysql_do_value_expression
             || expr_keyword_ctx.in_mysql_set_assignment_value_expression;
+        let in_plsql_value_expression =
+            !crate::sql_text::mysql_compatibility_for_sql("", db_type)
+                && expr_keyword_ctx.in_plsql_value_expression;
         if !prefer_columns
             && matches!(
                 statement_start, Some(StatementStartContext::TopLevel)
@@ -2820,7 +2840,7 @@ impl SqlEditorWidget {
         // function, package or literal still completes; a name that is also a
         // function/package is kept.
         if in_mysql_top_level_value_expression
-            || (!prefer_columns && expr_keyword_ctx.in_plsql_value_expression)
+            || (!prefer_columns && in_plsql_value_expression)
         {
             suggestions.retain(|suggestion| {
                 !data.is_known_relation(suggestion) || data.is_language_function(&suggestion.to_ascii_uppercase(), db_type)
@@ -2832,10 +2852,10 @@ impl SqlEditorWidget {
         // above does not cover. Apply it here too, but only at a genuine value-
         // *operand* position (`v := |`, `IF v > |`, `RETURN |`) — never at a block
         // statement start, where `IF`/`LOOP`/`RETURN`/… are the valid keywords.
-        if !prefer_columns
-            && (expr_keyword_ctx.at_plsql_value_operand
-                || in_mysql_top_level_value_expression)
-        {
+        let filter_value_expression_exact_keywords = !prefer_columns
+            && (in_mysql_top_level_value_expression
+                || (in_plsql_value_expression && statement_start.is_none()));
+        if filter_value_expression_exact_keywords {
             suggestions.retain(|suggestion| {
                 Self::expression_suggestion_is_relevant(
                     data,
@@ -2863,8 +2883,19 @@ impl SqlEditorWidget {
                 });
             }
         }
-        Self::append_exact_catalog_keyword_suggestion(&mut suggestions, prefix, db_type);
-        if prefer_columns {
+        if Self::should_append_exact_catalog_keyword_in_base_context(
+            data,
+            prefix,
+            column_scope,
+            db_type,
+            prefer_columns,
+            statement_start,
+            filter_value_expression_exact_keywords,
+            expr_keyword_ctx,
+        ) {
+            Self::append_exact_catalog_keyword_suggestion(&mut suggestions, prefix, db_type);
+        }
+        if prefer_columns || filter_value_expression_exact_keywords {
             suggestions.retain(|suggestion| {
                 Self::expression_suggestion_is_relevant(
                     data,
@@ -2878,13 +2909,12 @@ impl SqlEditorWidget {
         suggestions
     }
 
-    fn append_exact_catalog_keyword_suggestion(
-        suggestions: &mut Vec<String>,
+    fn exact_catalog_keyword_for_prefix(
         prefix: &str,
         db_type: Option<crate::db::DatabaseType>,
-    ) {
+    ) -> Option<String> {
         if prefix.is_empty() {
-            return;
+            return None;
         }
 
         let upper = prefix.to_ascii_uppercase();
@@ -2892,13 +2922,159 @@ impl SqlEditorWidget {
             Some(db_type) => crate::sql_text::is_sql_keyword_for_db(&upper, db_type),
             None => crate::sql_text::is_oracle_sql_keyword(&upper),
         };
-        if is_keyword
-            && !suggestions
-                .iter()
-                .any(|suggestion| suggestion.eq_ignore_ascii_case(&upper))
+        is_keyword.then_some(upper)
+    }
+
+    fn should_append_exact_catalog_keyword_in_base_context(
+        data: &mut IntellisenseData,
+        prefix: &str,
+        column_scope: Option<&[String]>,
+        db_type: Option<crate::db::DatabaseType>,
+        prefer_columns: bool,
+        statement_start: Option<StatementStartContext>,
+        filter_value_expression_exact_keywords: bool,
+        expr_keyword_ctx: ExpressionKeywordContext,
+    ) -> bool {
+        let Some(keyword) = Self::exact_catalog_keyword_for_prefix(prefix, db_type) else {
+            return false;
+        };
+
+        if !prefer_columns
+            && statement_start.is_some_and(|statement_start| {
+                !Self::suggestion_begins_statement(data, &keyword, statement_start, db_type)
+            })
+        {
+            return false;
+        }
+
+        if prefer_columns || filter_value_expression_exact_keywords {
+            return Self::expression_suggestion_is_relevant(
+                data,
+                &keyword,
+                column_scope,
+                db_type,
+                expr_keyword_ctx,
+            );
+        }
+
+        true
+    }
+
+    fn append_exact_catalog_keyword_suggestion(
+        suggestions: &mut Vec<String>,
+        prefix: &str,
+        db_type: Option<crate::db::DatabaseType>,
+    ) {
+        let Some(upper) = Self::exact_catalog_keyword_for_prefix(prefix, db_type) else {
+            return;
+        };
+        if !suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case(&upper))
         {
             suggestions.insert(0, upper);
         }
+    }
+
+    fn should_append_exact_catalog_keyword_after_context_filters(
+        context: SqlContext,
+        qualifier: Option<&str>,
+        source_allowance: CompletionSourceAllowance,
+        expr_keyword_ctx: ExpressionKeywordContext,
+        at_data_type_position: bool,
+        at_tool_no_sql_argument_slot: bool,
+        replace_table_context_with_expected_objects: bool,
+        current_prefix_starts_relation_name_slot: bool,
+        exact_keyword_expected_before_current_identifier: bool,
+    ) -> bool {
+        source_allowance.expected_keyword_suggestions
+            && qualifier.is_none()
+            && !matches!(context, SqlContext::VariableName | SqlContext::BindValue)
+            && !expr_keyword_ctx.at_bind_variable_name
+            && !expr_keyword_ctx.in_mysql_help_topic_argument
+            && !expr_keyword_ctx.at_mysql_explain_schema_name
+            && !at_data_type_position
+            && !at_tool_no_sql_argument_slot
+            && !replace_table_context_with_expected_objects
+            && !current_prefix_starts_relation_name_slot
+            && exact_keyword_expected_before_current_identifier
+    }
+
+    fn exact_keyword_expected_before_current_identifier(
+        prefix: &str,
+        deep_ctx: &intellisense_context::CursorContext,
+        db_type: Option<crate::db::DatabaseType>,
+        expr_keyword_ctx: ExpressionKeywordContext,
+    ) -> bool {
+        if prefix.is_empty() {
+            return false;
+        }
+        let upper = prefix.to_ascii_uppercase();
+        let is_keyword = match db_type {
+            Some(db_type) => crate::sql_text::is_sql_keyword_for_db(&upper, db_type),
+            None => crate::sql_text::is_oracle_sql_keyword(&upper),
+        };
+        if !is_keyword {
+            return false;
+        }
+
+        if let Some(position) = Self::extract_field_position_for_context(deep_ctx, true) {
+            let candidates = match position {
+                ExtractArgPosition::Field => extract_field_keywords_for(db_type),
+                ExtractArgPosition::AwaitingFrom => &["FROM"],
+            };
+            return Self::filter_expected_candidates(prefix, candidates)
+                .iter()
+                .any(|suggestion| suggestion.eq_ignore_ascii_case(&upper));
+        }
+
+        let statement_tokens = deep_ctx.statement_tokens.clone();
+        let split_idx = Self::expected_keyword_suggestion_context_end(
+            statement_tokens.as_ref(),
+            deep_ctx.cursor_token_len,
+            prefix,
+        );
+        if split_idx >= deep_ctx.cursor_token_len {
+            return false;
+        }
+
+        let truncated_tokens: Arc<[SqlToken]> = statement_tokens
+            .get(..split_idx)
+            .unwrap_or(&[])
+            .to_vec()
+            .into();
+        let before_ctx =
+            intellisense_context::analyze_cursor_context_arc(truncated_tokens, split_idx);
+        Self::collect_expected_keyword_suggestions_with_expression_context(
+            "",
+            &before_ctx,
+            db_type,
+            Some(expr_keyword_ctx),
+        )
+        .iter()
+        .any(|suggestion| suggestion.eq_ignore_ascii_case(&upper))
+    }
+
+    fn cursor_prefix_starts_relation_name_slot(
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> bool {
+        let relation_anchor = |tokens: &[SqlToken], cursor_token_len: usize| {
+            let end = Self::expected_suggestion_context_end(tokens, cursor_token_len, true);
+            let words = Self::previous_meaningful_words_upper(tokens, end, 3);
+            match words.last().map(String::as_str) {
+                Some("FROM" | "JOIN" | "INTO" | "TABLE" | "TABLES") => true,
+                Some("UPDATE") => !matches!(
+                    words.get(words.len().saturating_sub(2)).map(String::as_str),
+                    Some("FOR")
+                ),
+                _ => false,
+            }
+        };
+
+        relation_anchor(
+            Self::current_query_tokens(deep_ctx),
+            Self::cursor_token_len_in_current_query(deep_ctx),
+        ) || relation_anchor(deep_ctx.statement_tokens.as_ref(), deep_ctx.cursor_token_len)
     }
 
     /// Whether a single base-catalog entry can stand where the cursor begins a
@@ -23604,7 +23780,9 @@ impl SqlEditorWidget {
             );
         }
 
-        match Self::extract_field_position(tokens, context_end) {
+        match Self::extract_field_position(tokens, context_end)
+            .or_else(|| Self::extract_field_position(statement_tokens, statement_context_end))
+        {
             Some(ExtractArgPosition::Field) => {
                 return Self::filter_expected_candidates(
                     prefix,

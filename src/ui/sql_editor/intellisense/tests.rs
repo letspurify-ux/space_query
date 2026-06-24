@@ -32474,6 +32474,10 @@ fn plsql_value_expression_suppresses_relations() {
         ("DECLARE v NUMBER; BEGIN v := wh| END;", "WHERE"),
         ("DECLARE v NUMBER; BEGIN v := wh| END;", "WHILE"),
         ("DECLARE v NUMBER; BEGIN v := v + cr| END;", "CREATE"),
+        ("DECLARE v NUMBER; BEGIN v := SELECT| END;", "SELECT"),
+        ("DECLARE v NUMBER; BEGIN v := CREATE| END;", "CREATE"),
+        ("DECLARE v NUMBER; BEGIN v := v SELECT| END;", "SELECT"),
+        ("DECLARE v NUMBER; BEGIN IF v SELECT| THEN NULL; END IF; END;", "SELECT"),
         ("DECLARE v NUMBER; BEGIN IF v > wh| THEN NULL; END IF; END;", "WHERE"),
         // A closed `END CASE`/`END IF` must not leave the CASE body keywords
         // grammatical at the following operand (the detector miscounted `END`).
@@ -32489,8 +32493,12 @@ fn plsql_value_expression_suppresses_relations() {
     // `CASE` — the body keywords remain available.
     assert!(has(&base_after("DECLARE v NUMBER; BEGIN v := ca| END;"), "CASE"),
         "CASE starter dropped at a PL/SQL value-operand position");
+    assert!(has(&base_after("DECLARE v NUMBER; BEGIN v := CASE| END;"), "CASE"),
+        "exact CASE starter dropped at a PL/SQL value-operand position");
     assert!(has(&base_after("DECLARE v NUMBER; BEGIN v := CASE WHEN x > ca| THEN 1 END; END;"), "CAST"),
         "operand starter dropped inside an open CASE expression");
+    assert!(has(&base_after("DECLARE v NUMBER; BEGIN v := v AND| END;"), "AND"),
+        "exact AND operator dropped after a PL/SQL value operand");
 
     // A *statement start* in a block is NOT a value-operand position: the
     // statement keywords (`IF`/`LOOP`/`RETURN`) stay, never filtered away.
@@ -32680,17 +32688,49 @@ fn query_keyword_completion_suggestions(
         !prefix.is_empty(),
         Some(db_type),
     );
-    let mut suggestions = SqlEditorWidget::base_suggestions_for_context(
-        &mut data,
-        &prefix,
-        None,
-        column_scope.as_deref(),
-        include_columns,
-        context,
-        false,
+    let exclude_current_identifier_chain = !prefix.is_empty();
+    let at_keyword_only_identifier_slot =
+        SqlEditorWidget::cursor_is_at_identifier_suppressing_keyword_slot_for_context(
+            &deep_ctx,
+            exclude_current_identifier_chain,
+            Some(db_type),
+        );
+    let at_keyword_only_slot = SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot_for_db(
+        &deep_ctx,
+        exclude_current_identifier_chain,
         Some(db_type),
-        expr_kw,
     );
+    let at_data_type_position = SqlEditorWidget::data_type_position_for_context_for_db(
+        &deep_ctx,
+        exclude_current_identifier_chain,
+        Some(db_type),
+    )
+    .is_some();
+    let source_allowance =
+        CompletionSourcePolicy::new(
+            false,
+            at_keyword_only_identifier_slot,
+            at_keyword_only_slot,
+            false,
+            false,
+            expr_kw,
+        )
+            .allowance(context, None, expr_kw);
+    let mut suggestions = if at_keyword_only_identifier_slot || at_keyword_only_slot {
+        Vec::new()
+    } else {
+        SqlEditorWidget::base_suggestions_for_context(
+            &mut data,
+            &prefix,
+            None,
+            column_scope.as_deref(),
+            include_columns,
+            context,
+            false,
+            Some(db_type),
+            expr_kw,
+        )
+    };
     let expected_keywords =
         SqlEditorWidget::collect_expected_keyword_suggestions_with_expression_context(
             &prefix,
@@ -32705,8 +32745,50 @@ fn query_keyword_completion_suggestions(
             true,
         );
     }
-    SqlEditorWidget::append_exact_catalog_keyword_suggestion(&mut suggestions, &prefix, Some(db_type));
+    if SqlEditorWidget::should_append_exact_catalog_keyword_after_context_filters(
+        context,
+        None,
+        source_allowance,
+        expr_kw,
+        at_data_type_position,
+        false,
+        false,
+        SqlEditorWidget::cursor_prefix_starts_relation_name_slot(&deep_ctx),
+        SqlEditorWidget::exact_keyword_expected_before_current_identifier(
+            &prefix,
+            &deep_ctx,
+            Some(db_type),
+            expr_kw,
+        ),
+    ) {
+        SqlEditorWidget::append_exact_catalog_keyword_suggestion(
+            &mut suggestions,
+            &prefix,
+            Some(db_type),
+        );
+    }
     suggestions
+}
+
+#[test]
+fn exact_catalog_keyword_is_not_reintroduced_after_context_filters() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    for (sql, db_type) in [
+        ("SELECT * FROM emp WHERE empno = :SELECT|", Oracle),
+        ("SELECT * FROM SELECT|", Oracle),
+        ("SELECT EXTRACT(SELECT| FROM hiredate) FROM emp", Oracle),
+        ("SELECT CAST(empno AS SELECT|) FROM emp", Oracle),
+        ("EXPLAIN FOR SCHEMA SELECT|", MySQL),
+    ] {
+        let suggestions = query_keyword_completion_suggestions(sql, db_type);
+        assert!(
+            !suggestions
+                .iter()
+                .any(|suggestion| suggestion.eq_ignore_ascii_case("SELECT")),
+            "exact catalog keyword leaked at `{sql}`: {suggestions:?}"
+        );
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -36083,6 +36165,15 @@ fn statement_start_filters_keyword_dump_to_statement_verbs() {
             assert!(!has(&s, noise), "{noise} leaked at `{sql}`: {s:?}");
         }
     }
+    for sql in ["WHERE|", "GROUP|", "SELECT 1 FROM dual; WHERE|"] {
+        let s = kw(sql);
+        for noise in ["WHERE", "GROUP"] {
+            assert!(
+                !has(&s, noise),
+                "{noise} exact keyword leaked at statement start `{sql}`: {s:?}"
+            );
+        }
+    }
 
     for sql in ["|", "SELECT 1; |", "SELECT 1 FROM dual; |"] {
         let suggestions = kw(sql);
@@ -36306,6 +36397,16 @@ fn mysql_do_value_expression_filters_statement_and_relation_noise() {
             "{noise} leaked into later MySQL DO expression-list item: {next_item:?}"
         );
     }
+
+    for sql in ["DO SELECT|", "DO CREATE|", "DO 1, SELECT|", "DO 1 SELECT|"] {
+        let exact_keyword = run(sql);
+        for noise in ["SELECT", "CREATE"] {
+            assert!(
+                !has(&exact_keyword, noise),
+                "{noise} exact keyword leaked into MySQL DO expression `{sql}`: {exact_keyword:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -36364,6 +36465,16 @@ fn mysql_set_assignment_value_expression_filters_statement_and_relation_noise() 
             !has(&after_operand, noise),
             "{noise} leaked after complete MySQL SET assignment value: {after_operand:?}"
         );
+    }
+
+    for sql in ["SET @v = SELECT|", "SET @v = 1, @w = CREATE|", "SET @v = 1 SELECT|"] {
+        let exact_keyword = run(sql);
+        for noise in ["SELECT", "CREATE"] {
+            assert!(
+                !has(&exact_keyword, noise),
+                "{noise} exact keyword leaked into MySQL SET assignment value `{sql}`: {exact_keyword:?}"
+            );
+        }
     }
 }
 
@@ -36491,6 +36602,22 @@ fn plsql_exception_handler_name_slot_keeps_only_packages_and_spares_case_when() 
             assert!(!b.iter().any(|s| s == noise), "`{noise}` leaked for `{sql}`");
         }
     }
+    for sql in [
+        "BEGIN NULL; EXCEPTION WHEN SELECT| THEN NULL; END;",
+        "DECLARE e EXCEPTION; BEGIN NULL; EXCEPTION WHEN e1 OR SELECT| THEN NULL; END;",
+    ] {
+        assert!(detect(sql), "must detect exception name for `{sql}`");
+        let b = base(sql);
+        assert!(
+            !b.iter().any(|s| s.eq_ignore_ascii_case("SELECT")),
+            "exact SQL keyword leaked into exception-name slot for `{sql}`: {b:?}"
+        );
+    }
+    let raise = base("BEGIN RAISE SELECT|; END;");
+    assert!(
+        !raise.iter().any(|s| s.eq_ignore_ascii_case("SELECT")),
+        "exact SQL keyword leaked into RAISE exception-name slot: {raise:?}"
+    );
 
     // A handler *body* (after `THEN`) is an ordinary statement position, not an
     // exception name — must not be detected.
