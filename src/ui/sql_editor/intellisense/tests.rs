@@ -981,17 +981,17 @@ fn table_source_construct_open_paren_slots_suppress_relations() {
     );
 }
 
-/// A foreign-key referential action slot (`... REFERENCES t (...) ON DELETE |`
-/// / `ON UPDATE |`) accepts only a fixed action keyword, never a relation. The
-/// `DELETE`/`UPDATE` keyword there must not be mistaken for a DML statement (it
-/// previously fell through to the `DeleteTarget`/`UpdateTarget` table phase and
-/// offered the entire table catalog).
+/// A foreign-key referential action slot (`... REFERENCES t (...) ON DELETE |`,
+/// plus MySQL's `ON UPDATE |`) accepts only fixed action keywords, never a
+/// relation. The `DELETE`/`UPDATE` keyword there must not be mistaken for a DML
+/// statement (it previously fell through to the `DeleteTarget`/`UpdateTarget`
+/// table phase and offered the entire table catalog).
 #[test]
 fn referential_action_slot_suppresses_tables_and_offers_action_keywords() {
     for sql in [
         "CREATE TABLE c (id NUMBER REFERENCES p (id) ON DELETE |)",
-        "CREATE TABLE c (id NUMBER REFERENCES p (id) ON UPDATE |)",
         "ALTER TABLE c ADD CONSTRAINT fk FOREIGN KEY (pid) REFERENCES p (id) ON DELETE |",
+        "CREATE TABLE c (id INT REFERENCES p (id) ON UPDATE |)",
     ] {
         let ctx = analyze_inline_cursor_sql(sql);
         // Not a table-target phase any more.
@@ -1010,14 +1010,26 @@ fn referential_action_slot_suppresses_tables_and_offers_action_keywords() {
             Some(crate::db::DatabaseType::Oracle),
         )
     };
+    let mysql_actions = |sql: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &analyze_inline_cursor_sql(sql),
+            Some(crate::db::DatabaseType::MySQL),
+        )
+    };
     let on_delete = actions("CREATE TABLE c (id NUMBER REFERENCES p (id) ON DELETE |)");
     assert!(on_delete.iter().any(|k| k == "CASCADE"));
     assert!(on_delete.iter().any(|k| k == "SET NULL"));
+    assert!(!on_delete.iter().any(|k| k == "SET DEFAULT"));
     // The action slot does not leak the standalone-`DELETE` continuation `FROM`.
     assert!(!on_delete.iter().any(|k| k == "FROM"));
-    let on_update = actions("CREATE TABLE c (id NUMBER REFERENCES p (id) ON UPDATE |)");
+    let invalid_oracle_update =
+        actions("CREATE TABLE c (id NUMBER REFERENCES p (id) ON UPDATE |)");
+    assert!(invalid_oracle_update.is_empty(), "{invalid_oracle_update:?}");
+    let on_update = mysql_actions("CREATE TABLE c (id INT REFERENCES p (id) ON UPDATE |)");
     assert!(on_update.iter().any(|k| k == "CASCADE"));
-    assert!(on_update.iter().any(|k| k == "CURRENT_TIMESTAMP"));
+    assert!(on_update.iter().any(|k| k == "RESTRICT"));
+    assert!(!on_update.iter().any(|k| k == "CURRENT_TIMESTAMP"));
 
     for sql in [
         "SELECT * FROM emp e JOIN dept d ON delete |",
@@ -1364,8 +1376,8 @@ fn alter_table_drop_offers_table_elements_not_object_types() {
     assert!(has(&drop_head, "TABLE") && has(&drop_head, "VIEW"), "{drop_head:?}");
 }
 
-/// After a foreign-key `REFERENCES t (cols) ON |`, only the referential action
-/// verbs `DELETE`/`UPDATE` are grammatical - not the inline column-definition
+/// After a foreign-key `REFERENCES t (cols) ON |`, only dialect-valid referential
+/// action verbs are grammatical - not the inline column-definition
 /// keywords (`CHECK`/`DEFAULT`/…) that the CREATE TABLE tail otherwise leaks
 /// there. The existing `ON DELETE|UPDATE |` action-value slot still resolves to
 /// the action list. Covers both inline (CREATE TABLE) and table-level (ALTER
@@ -1384,17 +1396,27 @@ fn referential_action_on_slot_offers_only_delete_update() {
     };
     use crate::db::DatabaseType::{MySQL, Oracle};
 
+    for sql in [
+        "CREATE TABLE t (id NUMBER, CONSTRAINT fk FOREIGN KEY (a) REFERENCES p (b) ON |",
+        "ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (a) REFERENCES p (b) ON |",
+        "CREATE TABLE t (id NUMBER REFERENCES p (b) ON |",
+    ] {
+        assert_eq!(kw(sql, Oracle), vec!["DELETE".to_string()], "Oracle ON slot for `{sql}`");
+        assert_eq!(
+            kw(sql, MySQL),
+            vec!["DELETE".to_string(), "UPDATE".to_string()],
+            "MySQL ON slot for `{sql}`"
+        );
+    }
     for db in [Oracle, MySQL] {
         for sql in [
             "CREATE TABLE t (id NUMBER, CONSTRAINT fk FOREIGN KEY (a) REFERENCES p (b) ON |",
             "ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (a) REFERENCES p (b) ON |",
             "CREATE TABLE t (id NUMBER REFERENCES p (b) ON |",
         ] {
-            assert_eq!(
-                kw(sql, db),
-                vec!["DELETE".to_string(), "UPDATE".to_string()],
-                "ON slot for `{sql}` {db:?}"
-            );
+            for leaked in ["CHECK", "DEFAULT", "REFERENCES", "CURRENT_TIMESTAMP"] {
+                assert!(!kw(sql, db).iter().any(|k| k == leaked), "{leaked} leaked for `{sql}` {db:?}");
+            }
         }
         // The action-value slot still resolves to the action list.
         let del = kw("ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (a) REFERENCES p (b) ON DELETE |", db);
@@ -2107,6 +2129,82 @@ fn audit_final_suggestions_for(
             suggestions, expected_keywords.clone(), true,
         );
     }
+    let comparison_suggestions = if source_allowance.comparison_suggestions {
+        qualifier
+            .as_deref()
+            .map(|qualifier| {
+                SqlEditorWidget::collect_qualified_condition_comparison_suggestions(
+                    &data, &prefix, qualifier, &ctx,
+                )
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if !comparison_suggestions.is_empty() {
+        suggestions = SqlEditorWidget::merge_qualified_condition_comparison_suggestions(
+            suggestions,
+            comparison_suggestions,
+            ctx.phase,
+        );
+    }
+    let wildcard_suggestions = if source_allowance.wildcard_suggestions {
+        SqlEditorWidget::collect_clause_wildcard_suggestions(&prefix, qualifier.as_deref(), &ctx)
+    } else {
+        Vec::new()
+    };
+    if !wildcard_suggestions.is_empty() {
+        suggestions = SqlEditorWidget::merge_suggestions_with_context_aliases(
+            suggestions,
+            wildcard_suggestions,
+            true,
+        );
+    }
+    if source_allowance.derived_column_suggestions {
+        let derived_columns = SqlEditorWidget::collect_derived_columns_for_context(&ctx);
+        suggestions = if SqlEditorWidget::cursor_is_in_query_level_order_by(&ctx) {
+            SqlEditorWidget::merge_suggestions_with_prioritized_derived_columns(
+                suggestions,
+                &prefix,
+                derived_columns,
+            )
+        } else {
+            SqlEditorWidget::merge_suggestions_with_derived_columns(
+                suggestions,
+                &prefix,
+                derived_columns,
+            )
+        };
+    }
+    let context_name_suggestions = if source_allowance.context_name_suggestions {
+        SqlEditorWidget::collect_context_name_suggestions(&prefix, &ctx, context)
+    } else {
+        Vec::new()
+    };
+    suggestions = SqlEditorWidget::maybe_merge_suggestions_with_context_aliases(
+        suggestions,
+        context_name_suggestions,
+        matches!(context, SqlContext::TableName),
+        qualifier.is_some(),
+    );
+    if SqlEditorWidget::should_append_exact_catalog_keyword_after_context_filters(
+        context,
+        qualifier.as_deref(),
+        source_allowance,
+        expr_keyword_ctx,
+        at_data_type,
+        false,
+        replace_table_context_with_expected_objects,
+        SqlEditorWidget::cursor_prefix_starts_relation_name_slot(&ctx),
+        SqlEditorWidget::exact_keyword_expected_before_current_identifier(
+            &prefix,
+            &ctx,
+            Some(db),
+            expr_keyword_ctx,
+        ),
+    ) {
+        SqlEditorWidget::append_exact_catalog_keyword_suggestion(&mut suggestions, &prefix, Some(db));
+    }
     (expected_object_kind, expected_keywords, suggestions)
 }
 
@@ -2177,6 +2275,225 @@ fn audit_dump_completeness() {
             let ctx = analyze_inline_cursor_sql(sql);
             println!("SQL: {sql}\n  phase={:?} kind={kind:?} kw={kw:?}\n  final={final_s:?}\n", ctx.phase);
         }
+    }
+}
+
+#[test]
+fn audit_final_suggestions_include_runtime_merge_sources() {
+    use crate::db::DatabaseType::Oracle;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    let (_kind, _keywords, select_start) = audit_final_suggestions_for("SELECT | FROM emp e", Oracle);
+    assert!(
+        contains(&select_start, "*"),
+        "final audit should include the select-list wildcard at projection start: {select_start:?}"
+    );
+    assert!(
+        contains(&select_start, "emp.*") || contains(&select_start, "e.*"),
+        "final audit should include scoped wildcard suggestions at projection start: {select_start:?}"
+    );
+
+    let (_kind, _keywords, after_operand) =
+        audit_final_suggestions_for("SELECT ename | FROM emp e", Oracle);
+    assert!(
+        !contains(&after_operand, "*") && !contains(&after_operand, "e.*"),
+        "final audit should suppress wildcard suggestions after a complete operand: {after_operand:?}"
+    );
+
+    let (_kind, _keywords, order_by_alias) =
+        audit_final_suggestions_for("SELECT empno AS employee_no FROM emp ORDER BY employee|", Oracle);
+    assert!(
+        contains(&order_by_alias, "employee_no"),
+        "final audit should include derived select-list aliases in ORDER BY: {order_by_alias:?}"
+    );
+
+    let (_kind, _keywords, cte_context_name) = audit_final_suggestions_for(
+        "WITH recent AS (SELECT empno FROM emp) SELECT rec| FROM recent r",
+        Oracle,
+    );
+    assert!(
+        contains(&cte_context_name, "recent"),
+        "final audit should include context-name suggestions for visible CTEs: {cte_context_name:?}"
+    );
+
+    let (_kind, _keywords, join_comparison) =
+        audit_final_suggestions_for("SELECT * FROM t JOIN s ON t.|", Oracle);
+    assert!(
+        contains(&join_comparison, "t.B = s.B") && contains(&join_comparison, "t.X = s.X"),
+        "final audit should include qualified comparison suggestions in JOIN conditions: {join_comparison:?}"
+    );
+}
+
+#[test]
+fn oracle_pivot_aggregate_function_slots_do_not_offer_columns() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+    let assert_no_source_columns = |sql: &str, values: &[String]| {
+        for leaked in ["A", "B", "X", "T", "S"] {
+            assert!(
+                !contains(values, leaked),
+                "{leaked} leaked into Oracle PIVOT aggregate-function slot at `{sql}`: {values:?}"
+            );
+        }
+    };
+
+    for sql in ["SELECT * FROM t PIVOT (|)", "SELECT * FROM t PIVOT (SUM(x), |)"] {
+        let (kind, keywords, suggestions) = audit_final_suggestions_for(sql, Oracle);
+        for expected in ["SUM()", "COUNT()", "AVG()", "MAX()", "MIN()"] {
+            assert!(
+                contains(&suggestions, expected),
+                "Oracle PIVOT aggregate-function slot lost {expected} at `{sql}`: kind={kind:?} keywords={keywords:?} final={suggestions:?}"
+            );
+        }
+        assert_no_source_columns(sql, &suggestions);
+    }
+
+    let (kind, keywords, prefixed) =
+        audit_final_suggestions_for("SELECT * FROM t PIVOT (S|)", Oracle);
+    assert!(
+        contains(&prefixed, "SUM()") && contains(&prefixed, "STDDEV()"),
+        "Oracle PIVOT aggregate-function prefix slot lost function suggestions: kind={kind:?} keywords={keywords:?} final={prefixed:?}"
+    );
+    assert_no_source_columns("SELECT * FROM t PIVOT (S|)", &prefixed);
+
+    let (kind, keywords, argument_columns) =
+        audit_final_suggestions_for("SELECT * FROM t PIVOT (SUM(|)", Oracle);
+    assert!(
+        contains(&argument_columns, "A") && contains(&argument_columns, "B"),
+        "Oracle PIVOT aggregate argument should still offer source columns: kind={kind:?} keywords={keywords:?} final={argument_columns:?}"
+    );
+    assert!(
+        !contains(&argument_columns, "SUM()"),
+        "Oracle PIVOT aggregate argument incorrectly offered aggregate-function names: {argument_columns:?}"
+    );
+
+    let (kind, keywords, for_column) =
+        audit_final_suggestions_for("SELECT * FROM t PIVOT (SUM(x) FOR |)", Oracle);
+    assert!(
+        contains(&for_column, "A") && contains(&for_column, "B"),
+        "Oracle PIVOT FOR expression should still offer source columns: kind={kind:?} keywords={keywords:?} final={for_column:?}"
+    );
+    assert!(
+        !contains(&for_column, "SUM()"),
+        "Oracle PIVOT FOR expression incorrectly offered aggregate-function names: {for_column:?}"
+    );
+
+    let (_kind, _keywords, after_aggregate) =
+        audit_final_suggestions_for("SELECT * FROM t PIVOT (SUM(x) |)", Oracle);
+    assert_eq!(after_aggregate, vec!["FOR".to_string()]);
+
+    let (_kind, _keywords, mysql_pivot) =
+        audit_final_suggestions_for("SELECT * FROM t PIVOT (|)", MySQL);
+    assert!(
+        !contains(&mysql_pivot, "SUM()") && !contains(&mysql_pivot, "COUNT()"),
+        "MySQL should not use Oracle PIVOT aggregate-function candidates: {mysql_pivot:?}"
+    );
+}
+
+#[test]
+fn table_clause_construct_keywords_do_not_hijack_expression_calls() {
+    use crate::db::DatabaseType::Oracle;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    let real_pivot = analyze_inline_cursor_sql("SELECT * FROM t PIVOT (|)");
+    assert_eq!(
+        real_pivot.phase,
+        intellisense_context::SqlPhase::PivotClause
+    );
+    let real_model = analyze_inline_cursor_sql("SELECT * FROM t MODEL |");
+    assert_eq!(
+        real_model.phase,
+        intellisense_context::SqlPhase::ModelClause
+    );
+
+    for sql in [
+        "SELECT pivot(|) FROM t",
+        "SELECT some_func(pivot(|)) FROM t",
+        "SELECT match_recognize(|) FROM t",
+        "SELECT model(|) FROM t",
+        "SELECT * FROM t WHERE model(|)",
+        "SELECT * FROM t WHERE a = model(|)",
+        "SELECT values(|) FROM t",
+        "SELECT some_func(values(|)) FROM t",
+        "SELECT * FROM t WHERE values(|)",
+        "SELECT * FROM t WHERE a = values(|)",
+        "SELECT merge(|) FROM t",
+        "SELECT * FROM t WHERE merge(|)",
+        "SELECT * FROM t WHERE a = merge(|)",
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        assert_ne!(
+            ctx.phase,
+            intellisense_context::SqlPhase::PivotClause,
+            "expression call was misclassified as a table PIVOT clause at `{sql}`"
+        );
+        assert_ne!(
+            ctx.phase,
+            intellisense_context::SqlPhase::MatchRecognizeClause,
+            "expression call was misclassified as MATCH_RECOGNIZE at `{sql}`"
+        );
+        assert_ne!(
+            ctx.phase,
+            intellisense_context::SqlPhase::ModelClause,
+            "expression call was misclassified as MODEL at `{sql}`"
+        );
+        assert_ne!(
+            ctx.phase,
+            intellisense_context::SqlPhase::ValuesClause,
+            "expression call was misclassified as an INSERT VALUES clause at `{sql}`"
+        );
+        assert_ne!(
+            ctx.phase,
+            intellisense_context::SqlPhase::MergeTarget,
+            "expression call was misclassified as a MERGE statement target at `{sql}`"
+        );
+
+        let (kind, keywords, suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert!(
+            contains(&suggestions, "A") && contains(&suggestions, "B"),
+            "expression-call argument should keep source columns at `{sql}`: kind={kind:?} keywords={keywords:?} final={suggestions:?}"
+        );
+        for leaked in [
+            "SUM()",
+            "COUNT()",
+            "DEFINE",
+            "PATTERN",
+            "PARTITION BY",
+            "DIMENSION BY",
+            "MEASURES",
+            "RULES",
+        ] {
+            assert!(
+                !contains(&suggestions, leaked),
+                "{leaked} leaked from table-clause grammar into expression call at `{sql}`: kind={kind:?} keywords={keywords:?} final={suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn pure_clause_keyword_continuations_do_not_merge_predicate_tails() {
+    use crate::db::DatabaseType::Oracle;
+
+    for (sql, expected) in [
+        ("SELECT a FROM t WHERE a = 1 ORDER |", vec!["BY"]),
+        ("SELECT a FROM t WHERE a = 1 GROUP |", vec!["BY"]),
+        ("SELECT a FROM t WHERE a = 1 CONNECT |", vec!["BY"]),
+        ("SELECT a FROM t WHERE a = 1 START |", vec!["WITH"]),
+        ("SELECT a FROM t ORDER SIBLINGS |", vec!["BY"]),
+    ] {
+        let (kind, keywords, suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert_eq!(
+            suggestions,
+            expected
+                .into_iter()
+                .map(|item| item.to_string())
+                .collect::<Vec<_>>(),
+            "pure clause continuation leaked extra predicate tails at `{sql}`: kind={kind:?} keywords={keywords:?}"
+        );
     }
 }
 
@@ -20840,6 +21157,13 @@ fn ddl_definition_list_detector_leaves_other_alter_operations_intact() {
         assert_eq!(ctx.phase, expected, "phase for `{sql}`");
         assert!(!ctx.ddl_new_name_position, "{sql}");
         assert_eq!(ctx.focused_tables, vec!["emp".to_string()], "{sql}");
+        assert!(
+            ctx.tables_in_scope
+                .iter()
+                .all(|table| table.alias.as_deref() != Some("MODIFY")),
+            "`MODIFY` must not be parsed as a table alias for `{sql}`: {:?}",
+            ctx.tables_in_scope
+        );
     }
 
     // CTAS body is an ordinary SELECT list, untouched by the detector.
@@ -20911,6 +21235,18 @@ fn alter_table_existing_column_operations_suggest_target_columns() {
             "`{sql}` leaked unrelated relation data: {suggestions:?}"
         );
     }
+
+    let (_kind, keywords, final_suggestions) =
+        audit_final_suggestions_for("ALTER TABLE emp MODIFY |", crate::db::DatabaseType::Oracle);
+    assert!(
+        final_suggestions.iter().any(|value| value == "ENAME")
+            && final_suggestions.iter().any(|value| value == "EMPNO"),
+        "final suggestions lost EMP columns at ALTER MODIFY column slot: keywords={keywords:?} final={final_suggestions:?}"
+    );
+    assert!(
+        !final_suggestions.iter().any(|value| value == "MODIFY"),
+        "`MODIFY` leaked as a final column suggestion: keywords={keywords:?} final={final_suggestions:?}"
+    );
 }
 
 #[test]
@@ -34540,7 +34876,7 @@ fn registered_keyword_slot_cases() -> Vec<RegisteredKeywordSlotCase> {
         RegisteredKeywordSlotCase {
             db_type: Oracle,
             sql: "CREATE TABLE child (parent_id NUMBER REFERENCES parent(id) ON DELETE |)",
-            keywords: &["CASCADE", "SET NULL", "SET DEFAULT", "NO ACTION", "RESTRICT"],
+            keywords: &["CASCADE", "SET NULL"],
         },
         RegisteredKeywordSlotCase {
             db_type: Oracle,
@@ -38220,7 +38556,8 @@ fn expression_construct_tail_keywords_are_complete_and_noise_free() {
 /// completed reference offers the `ON` referential-action continuation (plus the
 /// remaining inline constraints for a column-level FK) — never a second
 /// `REFERENCES`/`DEFAULT`/identity, which are only grammatical before any inline
-/// constraint. The `ON DELETE`/`ON UPDATE` actions drop `ON` once both are spent.
+/// constraint. Oracle spends `ON` after `ON DELETE`; MySQL spends it once both
+/// `ON DELETE` and `ON UPDATE` are present.
 #[test]
 fn create_table_references_clause_tail_is_precise() {
     let kw = |sql: &str, db: crate::db::DatabaseType| -> Vec<String> {
@@ -38269,18 +38606,24 @@ fn create_table_references_clause_tail_is_precise() {
         assert!(oracle(sql).is_empty(), "constraint keywords leaked at name slot `{sql}`: {:?}", oracle(sql));
     }
 
-    // `ON` is offered while one action is unspent, then withdrawn once both
-    // referential actions are present.
+    // Oracle has only ON DELETE, so the referential-action introducer is spent
+    // once that action appears.
     assert!(
-        has(&oracle("CREATE TABLE t (a INT REFERENCES p (b) ON DELETE CASCADE |)"), "ON"),
-        "ON should remain available for the second referential action"
+        !has(&oracle("CREATE TABLE t (a INT REFERENCES p (b) ON DELETE CASCADE |)"), "ON"),
+        "Oracle ON should be withdrawn once ON DELETE is present"
+    );
+
+    // MySQL still allows the second referential action until both are present.
+    assert!(
+        has(&mysql("CREATE TABLE t (a INT REFERENCES p (b) ON DELETE CASCADE |)"), "ON"),
+        "MySQL ON should remain available for the second referential action"
     );
     assert!(
-        !has(&oracle("CREATE TABLE t (a INT REFERENCES p (b) ON DELETE CASCADE ON UPDATE CASCADE |)"), "ON"),
+        !has(&mysql("CREATE TABLE t (a INT REFERENCES p (b) ON DELETE CASCADE ON UPDATE CASCADE |)"), "ON"),
         "ON should be withdrawn once both referential actions are spent"
     );
     assert!(
-        oracle("CREATE TABLE t (a INT, FOREIGN KEY (a) REFERENCES p (b) ON DELETE CASCADE ON UPDATE CASCADE |)").is_empty(),
+        mysql("CREATE TABLE t (a INT, FOREIGN KEY (a) REFERENCES p (b) ON DELETE CASCADE ON UPDATE CASCADE |)").is_empty(),
         "a fully-specified table-level FK admits nothing further"
     );
 
@@ -40972,6 +41315,101 @@ fn prefixed_dml_tail_keyword_slots_do_not_offer_object_catalog() {
 }
 
 #[test]
+fn unprefixed_dml_and_fk_keyword_slots_do_not_offer_object_catalog() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+    let assert_no_catalog_noise =
+        |sql: &str, db: crate::db::DatabaseType, suggestions: &[String]| {
+            for leaked in [
+                "EMP",
+                "DEPT",
+                "EMP_V",
+                "APP_USER",
+                "SCOTT",
+                "RUN_JOB",
+                "CALC_TOTAL",
+                "EMPNO",
+                "ENAME",
+                "DEPTNO",
+                "DNAME",
+            ] {
+                assert!(
+                    !contains(suggestions, leaked),
+                    "{leaked} leaked into keyword-only slot at `{sql}` {db:?}: {suggestions:?}"
+                );
+            }
+        };
+
+    let keyword_only_cases: &[(crate::db::DatabaseType, &str, &[&str])] = &[
+        (Oracle, "INSERT INTO emp |", &["VALUES", "SELECT"][..]),
+        (Oracle, "INSERT INTO emp (a, b) |", &["VALUES", "SELECT"]),
+        (MySQL, "INSERT INTO emp (a, b) |", &["VALUES", "SELECT"]),
+        (MySQL, "REPLACE INTO emp (a) |", &["VALUES", "SELECT"]),
+        (Oracle, "INSERT INTO emp VALUES (1, 2) |", &["RETURNING"]),
+        (
+            Oracle,
+            "INSERT INTO emp (a, b) VALUES (1, 2) |",
+            &["RETURNING"],
+        ),
+        (Oracle, "DELETE FROM emp WHERE a = 1 |", &["RETURNING"]),
+        (
+            Oracle,
+            "UPDATE emp SET a = 1 WHERE b = 2 |",
+            &["RETURNING"],
+        ),
+        (Oracle, "UPDATE emp SET a = 1 |", &["WHERE", "RETURNING"]),
+        (MySQL, "DELETE FROM emp WHERE a = 1 |", &["ORDER BY", "LIMIT"]),
+        (
+            MySQL,
+            "UPDATE emp SET a = 1 WHERE b = 2 |",
+            &["ORDER BY", "LIMIT"],
+        ),
+        (MySQL, "SELECT a FROM t LIMIT 5 |", &["OFFSET"]),
+        (
+            Oracle,
+            "CREATE TABLE c (id NUMBER, FOREIGN KEY (id) REFERENCES p (id) ON |)",
+            &["DELETE"],
+        ),
+        (
+            MySQL,
+            "CREATE TABLE c (id INT, FOREIGN KEY (id) REFERENCES p (id) ON |)",
+            &["DELETE", "UPDATE"],
+        ),
+    ];
+    for &(db, sql, expected) in keyword_only_cases {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert_eq!(
+            final_suggestions,
+            expected.iter().map(|item| item.to_string()).collect::<Vec<_>>(),
+            "unexpected final suggestions at `{sql}` {db:?}: kind={kind:?} keywords={keywords:?}"
+        );
+        assert_no_catalog_noise(sql, db, &final_suggestions);
+    }
+
+    let (kind, keywords, invalid_mysql_upsert) =
+        audit_final_suggestions_for("SELECT a FROM t WHERE a = 1 ON DUPLICATE |", MySQL);
+    assert!(
+        invalid_mysql_upsert.is_empty(),
+        "invalid SELECT-level ON DUPLICATE should not offer MySQL upsert keywords: kind={kind:?} keywords={keywords:?} final={invalid_mysql_upsert:?}"
+    );
+
+    let (kind, keywords, insert_select_tail) =
+        audit_final_suggestions_for("INSERT INTO emp (a, b) SELECT x, y FROM s |", Oracle);
+    assert!(
+        contains(&insert_select_tail, "JOIN")
+            && contains(&insert_select_tail, "WHERE")
+            && contains(&insert_select_tail, "ORDER BY"),
+        "INSERT ... SELECT tail lost query continuations: kind={kind:?} keywords={keywords:?} final={insert_select_tail:?}"
+    );
+    assert_no_catalog_noise(
+        "INSERT INTO emp (a, b) SELECT x, y FROM s |",
+        Oracle,
+        &insert_select_tail,
+    );
+}
+
+#[test]
 fn prefixed_query_clause_tail_slots_do_not_offer_object_catalog() {
     use crate::db::DatabaseType::{MySQL, Oracle};
 
@@ -41039,8 +41477,13 @@ fn prefixed_query_clause_tail_slots_do_not_offer_object_catalog() {
         "SELECT empno FROM emp HAVING count(*) > e|",
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        let contains_ci = |needle: &str| {
+            final_suggestions
+                .iter()
+                .any(|value| value.eq_ignore_ascii_case(needle))
+        };
         assert!(
-            contains(&final_suggestions, "ENAME") && contains(&final_suggestions, "EMPNO"),
+            contains_ci("ENAME") && contains_ci("EMPNO"),
             "expression slot lost columns at `{sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
         );
         for leaked in ["WHERE", "GROUP BY", "HAVING", "ORDER BY", "FETCH", "OFFSET"] {

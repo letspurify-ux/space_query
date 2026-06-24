@@ -619,9 +619,9 @@ enum DataTypePosition {
 
 /// Classification of the cursor relative to a `REFERENCES` clause inside the
 /// current `CREATE TABLE` column / constraint definition. Keeps the foreign-key
-/// reference grammar (`REFERENCES t [(cols)] [ON DELETE …] [ON UPDATE …]`) from
-/// either leaking the column-constraint catalog where an object/column name
-/// belongs or hiding the `ON` referential-action continuation.
+/// reference grammar (`REFERENCES t [(cols)] [ON DELETE …]`, plus MySQL's
+/// `[ON UPDATE …]`) from either leaking the column-constraint catalog where an
+/// object/column name belongs or hiding the `ON` referential-action continuation.
 enum ReferencesClauseTail {
     /// No `REFERENCES` governs the cursor; the ordinary column-tail logic applies.
     NotApplicable,
@@ -1232,6 +1232,41 @@ fn mysql_data_type_keywords(position: DataTypePosition) -> &'static [&'static st
 }
 
 impl SqlEditorWidget {
+    const ORACLE_PIVOT_AGGREGATE_FUNCTIONS: &'static [&'static str] = &[
+        "ANY_VALUE()",
+        "APPROX_COUNT_DISTINCT()",
+        "APPROX_PERCENTILE()",
+        "AVG()",
+        "COLLECT()",
+        "CORR()",
+        "COUNT()",
+        "COVAR_POP()",
+        "COVAR_SAMP()",
+        "JSON_ARRAYAGG()",
+        "JSON_OBJECTAGG()",
+        "LISTAGG()",
+        "MAX()",
+        "MEDIAN()",
+        "MIN()",
+        "REGR_AVGX()",
+        "REGR_AVGY()",
+        "REGR_COUNT()",
+        "REGR_INTERCEPT()",
+        "REGR_R2()",
+        "REGR_SLOPE()",
+        "REGR_SXX()",
+        "REGR_SXY()",
+        "REGR_SYY()",
+        "STDDEV()",
+        "STDDEV_POP()",
+        "STDDEV_SAMP()",
+        "SUM()",
+        "VARIANCE()",
+        "VAR_POP()",
+        "VAR_SAMP()",
+        "XMLAGG()",
+    ];
+
     const TOOL_NO_SQL_ARGUMENT_COMMANDS: &'static [&'static str] = &[
         "DEFINE",
         "UNDEFINE",
@@ -12415,6 +12450,13 @@ impl SqlEditorWidget {
             || Self::expected_referential_action_keyword_candidates_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
+                db_type,
+            )
+            .is_some()
+            || Self::expected_oracle_pivot_aggregate_function_candidates_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
             )
             .is_some()
             || Self::expected_grant_privilege_keyword_candidates_for_context(
@@ -12695,6 +12737,13 @@ impl SqlEditorWidget {
             || Self::expected_referential_action_keyword_candidates_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
+                db_type,
+            )
+            .is_some()
+            || Self::expected_oracle_pivot_aggregate_function_candidates_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
             )
             .is_some()
             || Self::cursor_is_in_table_sample_clause_for_context(
@@ -15277,8 +15326,9 @@ impl SqlEditorWidget {
     /// `CREATE TABLE` column / constraint definition. `body` is the table
     /// definition's meaningful tokens up to the cursor (after the opening `(`).
     ///
-    /// The foreign-key grammar is `REFERENCES t [(cols)] [ON DELETE a] [ON UPDATE
-    /// a]`. Without this the generic column tail would (a) leak the whole
+    /// The foreign-key grammar is `REFERENCES t [(cols)] [ON DELETE a]`, with an
+    /// additional `[ON UPDATE a]` action in MySQL. Without this the generic column
+    /// tail would (a) leak the whole
     /// constraint catalog into the referenced-name slot, (b) never offer the `ON`
     /// referential-action continuation, and (c) re-offer mutually-exclusive
     /// openers (`REFERENCES` again, `DEFAULT`, identity) after the FK is set.
@@ -15439,19 +15489,26 @@ impl SqlEditorWidget {
             return ReferencesClauseTail::ExpectsName;
         }
 
-        // A complete `REFERENCES target [(cols)]`. `ON` stays available until both
-        // referential actions are spelled out. A table-level FK admits nothing
-        // else; a column-level FK additionally admits the remaining inline
-        // constraints (but never DEFAULT/identity/COLLATE/a second REFERENCES,
-        // which are only grammatical before any inline constraint).
-        let on_available = !(on_delete && on_update);
+        // A complete `REFERENCES target [(cols)]`. MySQL can spell both
+        // referential actions (`ON DELETE` and `ON UPDATE`); Oracle has only the
+        // delete action, so `ON` is spent as soon as either action is present. A
+        // table-level FK admits nothing else; a column-level FK additionally admits
+        // the remaining inline constraints (but never DEFAULT/identity/COLLATE/a
+        // second REFERENCES, which are only grammatical before any inline
+        // constraint).
+        let mysql = crate::sql_text::mysql_compatibility_for_sql("", db_type);
+        let on_available = if mysql {
+            !(on_delete && on_update)
+        } else {
+            !(on_delete || on_update)
+        };
         let keywords: &'static [&'static str] = if saw_foreign {
             if on_available {
                 &["ON"]
             } else {
                 &[]
             }
-        } else if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+        } else if mysql {
             // MySQL's reference definition is the terminal part of a column
             // definition, so only the `ON` actions may follow.
             if on_available {
@@ -17681,6 +17738,92 @@ impl SqlEditorWidget {
         depth > 0 || !saw_open
     }
 
+    fn table_clause_construct_has_table_source_anchor(
+        tokens: &[SqlToken],
+        end: usize,
+        keyword: &str,
+    ) -> bool {
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        let Some(kw_pos) = toks.iter().rposition(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case(keyword)),
+        ) else {
+            return false;
+        };
+
+        let Some(prev) = toks.get(..kw_pos).and_then(|before| {
+            before
+                .iter()
+                .rev()
+                .find(|token| !matches!(token, SqlToken::Comment(_)))
+        }) else {
+            return false;
+        };
+        match prev {
+            SqlToken::Word(word) => {
+                let upper = word.to_ascii_uppercase();
+                if matches!(
+                    upper.as_str(),
+                    "SELECT"
+                        | "WHERE"
+                        | "HAVING"
+                        | "ON"
+                        | "BY"
+                        | "ORDER"
+                        | "GROUP"
+                        | "CONNECT"
+                        | "START"
+                        | "AND"
+                        | "OR"
+                        | "NOT"
+                        | "IN"
+                        | "LIKE"
+                        | "BETWEEN"
+                ) {
+                    return false;
+                }
+            }
+            SqlToken::Symbol(sym) if sym == ")" => {}
+            _ => return false,
+        }
+
+        let mut depth = 0i32;
+        for token in toks.iter().take(kw_pos).rev() {
+            match token {
+                SqlToken::Comment(_) => {}
+                SqlToken::Symbol(sym) if sym == ")" => depth += 1,
+                SqlToken::Symbol(sym) if sym == "(" => depth = (depth - 1).max(0),
+                SqlToken::Word(word) if depth == 0 => {
+                    let upper = word.to_ascii_uppercase();
+                    if matches!(
+                        upper.as_str(),
+                        "FROM" | "JOIN" | "APPLY" | "TABLE" | "ONLY" | "PARTITION"
+                    ) {
+                        return true;
+                    }
+                    if matches!(
+                        upper.as_str(),
+                        "SELECT"
+                            | "WHERE"
+                            | "GROUP"
+                            | "HAVING"
+                            | "ORDER"
+                            | "CONNECT"
+                            | "START"
+                            | "UNION"
+                            | "INTERSECT"
+                            | "MINUS"
+                            | "EXCEPT"
+                    ) {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        false
+    }
+
     /// Whether the cursor sits inside the body paren of `keyword`'s construct (the
     /// last occurrence's paren depth is still positive), as opposed to before it.
     fn cursor_inside_construct_body(tokens: &[SqlToken], end: usize, keyword: &str) -> bool {
@@ -17753,6 +17896,81 @@ impl SqlEditorWidget {
             }
         }
         false
+    }
+
+    fn expected_oracle_pivot_aggregate_function_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return None;
+        }
+        if !Self::table_clause_construct_has_table_source_anchor(tokens, end, "PIVOT") {
+            return None;
+        }
+
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        let kw_pos = toks.iter().rposition(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("PIVOT")),
+        )?;
+        let mut depth = 0i32;
+        let mut saw_body_open = false;
+        let mut saw_for = false;
+        let mut current_top_level_item_has_token = false;
+
+        for token in &toks[kw_pos + 1..] {
+            match token {
+                SqlToken::Symbol(sym) if sym == "(" => {
+                    depth += 1;
+                    saw_body_open = true;
+                    if depth > 1 {
+                        current_top_level_item_has_token = true;
+                    }
+                }
+                SqlToken::Symbol(sym) if sym == ")" => {
+                    if depth > 1 {
+                        current_top_level_item_has_token = true;
+                    }
+                    depth = (depth - 1).max(0);
+                }
+                SqlToken::Symbol(sym) if sym == "," && depth == 1 => {
+                    current_top_level_item_has_token = false;
+                }
+                SqlToken::Word(word) if depth == 1 && word.eq_ignore_ascii_case("FOR") => {
+                    saw_for = true;
+                    current_top_level_item_has_token = true;
+                }
+                SqlToken::Comment(_) => {}
+                _ if depth == 1 => {
+                    current_top_level_item_has_token = true;
+                }
+                _ => {}
+            }
+        }
+
+        (saw_body_open && depth == 1 && !saw_for && !current_top_level_item_has_token)
+            .then_some(Self::ORACLE_PIVOT_AGGREGATE_FUNCTIONS)
+    }
+
+    fn expected_oracle_pivot_aggregate_function_candidates_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        if !matches!(deep_ctx.phase, intellisense_context::SqlPhase::PivotClause)
+            && !deep_ctx.phase.is_table_context()
+        {
+            return None;
+        }
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::expected_oracle_pivot_aggregate_function_candidates(tokens, end, db_type)
     }
 
     fn construct_body_top_level_words_before_cursor(
@@ -17879,6 +18097,7 @@ impl SqlEditorWidget {
         tokens: &[SqlToken],
         end: usize,
         db_type: Option<crate::db::DatabaseType>,
+        phase: intellisense_context::SqlPhase,
     ) -> Option<&'static [&'static str]> {
         if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
             return None;
@@ -17888,7 +18107,16 @@ impl SqlEditorWidget {
         let has = |keyword: &str| words.iter().any(|word| word == keyword);
         let last = words.last().map(String::as_str);
 
-        if Self::table_clause_construct_is_open(tokens, end, "PIVOT") {
+        if (matches!(phase, intellisense_context::SqlPhase::PivotClause)
+            || phase.is_table_context())
+            && Self::table_clause_construct_is_open(tokens, end, "PIVOT")
+            && Self::table_clause_construct_has_table_source_anchor(tokens, end, "PIVOT")
+        {
+            if let Some(candidates) =
+                Self::expected_oracle_pivot_aggregate_function_candidates(tokens, end, db_type)
+            {
+                return Some(candidates);
+            }
             if !Self::construct_body_has_top_level_item_before_cursor(tokens, end, "PIVOT") {
                 return None;
             }
@@ -17897,7 +18125,11 @@ impl SqlEditorWidget {
             }
             return Some(&["FOR"]);
         }
-        if Self::table_clause_construct_is_open(tokens, end, "UNPIVOT") {
+        if (matches!(phase, intellisense_context::SqlPhase::PivotClause)
+            || phase.is_table_context())
+            && Self::table_clause_construct_is_open(tokens, end, "UNPIVOT")
+            && Self::table_clause_construct_has_table_source_anchor(tokens, end, "UNPIVOT")
+        {
             // Inside the body paren the grammar is `col FOR name IN (…)` (like
             // PIVOT); the `INCLUDE|EXCLUDE NULLS` modifier is only valid before it.
             if Self::cursor_inside_construct_body(tokens, end, "UNPIVOT") {
@@ -17917,7 +18149,17 @@ impl SqlEditorWidget {
             }
             return Some(&["INCLUDE", "EXCLUDE"]);
         }
-        if Self::table_clause_construct_is_open(tokens, end, "MATCH_RECOGNIZE") {
+        if (matches!(
+            phase,
+            intellisense_context::SqlPhase::MatchRecognizeClause
+        ) || phase.is_table_context())
+            && Self::table_clause_construct_is_open(tokens, end, "MATCH_RECOGNIZE")
+            && Self::table_clause_construct_has_table_source_anchor(
+                tokens,
+                end,
+                "MATCH_RECOGNIZE",
+            )
+        {
             let match_recognize_body_words =
                 Self::construct_body_top_level_words_before_cursor(tokens, end, "MATCH_RECOGNIZE");
             match match_recognize_body_words.as_slice() {
@@ -17957,7 +18199,10 @@ impl SqlEditorWidget {
         let model_complete = Self::construct_top_level_parenthesized_clause_is_complete(
             tokens, end, "MODEL", "RULES",
         );
-        if has("MODEL") && !model_complete {
+        if matches!(phase, intellisense_context::SqlPhase::ModelClause)
+            && has("MODEL")
+            && !model_complete
+        {
             match words.as_slice() {
                 _ if matches!(
                     model_last_top_level_word.as_deref(),
@@ -25170,6 +25415,7 @@ impl SqlEditorWidget {
     fn expected_referential_action_keyword_candidates(
         tokens: &[SqlToken],
         end: usize,
+        db_type: Option<crate::db::DatabaseType>,
     ) -> Option<&'static [&'static str]> {
         let toks = Self::meaningful_tokens_with_indices_before(tokens, end);
         let last = toks.len().checked_sub(1)?;
@@ -25233,20 +25479,21 @@ impl SqlEditorWidget {
             return None;
         }
 
+        let mysql = crate::sql_text::mysql_compatibility_for_sql("", db_type);
         match action.as_deref() {
-            // `… REFERENCES p (b) ON |` - the referential action verbs.
-            None => Some(&["DELETE", "UPDATE"]),
-            Some("DELETE") => {
+            // `… REFERENCES p (b) ON |` - the referential action verbs. Oracle
+            // foreign keys support only `ON DELETE`; MySQL also supports
+            // `ON UPDATE`.
+            None if mysql => Some(&["DELETE", "UPDATE"]),
+            None => Some(&["DELETE"]),
+            Some("DELETE") if mysql => {
                 Some(&["CASCADE", "SET NULL", "SET DEFAULT", "NO ACTION", "RESTRICT"])
             }
-            Some("UPDATE") => Some(&[
-                "CASCADE",
-                "SET NULL",
-                "SET DEFAULT",
-                "NO ACTION",
-                "RESTRICT",
-                "CURRENT_TIMESTAMP",
-            ]),
+            Some("DELETE") => Some(&["CASCADE", "SET NULL"]),
+            Some("UPDATE") if mysql => {
+                Some(&["CASCADE", "SET NULL", "SET DEFAULT", "NO ACTION", "RESTRICT"])
+            }
+            Some("UPDATE") => Some(&[]),
             _ => None,
         }
     }
@@ -25254,6 +25501,7 @@ impl SqlEditorWidget {
     fn expected_referential_action_keyword_candidates_for_context(
         deep_ctx: &intellisense_context::CursorContext,
         exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
     ) -> Option<&'static [&'static str]> {
         let tokens = Self::current_query_tokens(deep_ctx);
         let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
@@ -25262,7 +25510,7 @@ impl SqlEditorWidget {
             cursor_token_len,
             exclude_current_identifier_chain,
         );
-        Self::expected_referential_action_keyword_candidates(tokens, end)
+        Self::expected_referential_action_keyword_candidates(tokens, end, db_type)
     }
 
     fn is_create_synonym_target_context(words: &[String]) -> bool {
@@ -26440,12 +26688,14 @@ impl SqlEditorWidget {
             tokens,
             context_end,
             db_type,
+            deep_ctx.phase,
         )
         .or_else(|| {
             Self::expected_advanced_oracle_query_keyword_candidates(
                 statement_tokens,
                 statement_context_end,
                 db_type,
+                deep_ctx.phase,
             )
         })
         {
@@ -26971,7 +27221,7 @@ impl SqlEditorWidget {
             }
         }
         if let Some(candidates) =
-            Self::expected_referential_action_keyword_candidates(tokens, context_end)
+            Self::expected_referential_action_keyword_candidates(tokens, context_end, db_type)
         {
             return Self::filter_expected_candidates(prefix, candidates);
         }
@@ -27149,7 +27399,7 @@ impl SqlEditorWidget {
         // prefix (the flat base catalog emits no keywords there).
         let tail = Self::expected_expression_construct_continuation_keywords(tokens, context_end);
         let mut result = Self::filter_expected_candidates(prefix, candidates);
-        if tail.is_empty() {
+        if candidates.is_empty() && tail.is_empty() {
             let predicate_tail = Self::expected_common_predicate_keyword_candidates(
                 tokens,
                 context_end,

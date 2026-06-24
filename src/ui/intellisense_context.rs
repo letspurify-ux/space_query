@@ -4250,10 +4250,16 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         depth_frames[depth].returning_clause_active = false;
                         depth_frames[depth].locking_clause_active = false;
                         depth_frames[depth].postgres_conflict_update_active = false;
-                        depth_frames[depth].phase = SqlPhase::MergeTarget;
-                        depth_frames[depth].statement_kind = StatementKind::Merge;
-                        depth_frames[depth].current_target_table = None;
-                        mark_query_scope(depth, &mut depth_frames, &mut query_depth);
+                        let is_expression_context = current_phase.is_column_context()
+                            || matches!(current_phase, SqlPhase::ValuesClause);
+                        if is_expression_context {
+                            relation_state.clear();
+                        } else {
+                            depth_frames[depth].phase = SqlPhase::MergeTarget;
+                            depth_frames[depth].statement_kind = StatementKind::Merge;
+                            depth_frames[depth].current_target_table = None;
+                            mark_query_scope(depth, &mut depth_frames, &mut query_depth);
+                        }
                         relation_state.clear();
                     }
                     "RENAME" => {
@@ -4302,21 +4308,26 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     "VALUES" => {
                         // In MySQL ON DUPLICATE KEY UPDATE, VALUES(col) is a function
                         // reference to the attempted-insert value, NOT the INSERT VALUES clause.
-                        // Skip the phase change when we're inside a DML SET expression.
+                        // It can also appear as an expression function/identifier in
+                        // SELECT/WHERE positions. Only treat it as the DML VALUES
+                        // source when an INSERT-like statement has already captured
+                        // its target.
                         let in_set_expr = depth_frames.get(depth).is_some_and(|frame| {
                             frame.dml_set_active && matches!(frame.phase, SqlPhase::SetClause)
                         });
-                        if !in_set_expr {
+                        if !in_set_expr
+                            && values_clause_can_start(tokens, idx, &depth_frames[depth])
+                        {
                             depth_frames[depth].phase = SqlPhase::ValuesClause;
                             mark_query_scope(depth, &mut depth_frames, &mut query_depth);
                         }
                         relation_state.clear();
                     }
-                    "MATCH_RECOGNIZE" => {
+                    "MATCH_RECOGNIZE" if depth_frames[depth].phase.is_table_context() => {
                         depth_frames[depth].phase = SqlPhase::MatchRecognizeClause;
                         relation_state.clear();
                     }
-                    "MATCH" => {
+                    "MATCH" if depth_frames[depth].phase.is_table_context() => {
                         if let Some((next_keyword, next_idx)) = next_word_upper(tokens, idx + 1) {
                             if next_keyword == "RECOGNIZE" {
                                 depth_frames[depth].phase = SqlPhase::MatchRecognizeClause;
@@ -4325,11 +4336,11 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             }
                         }
                     }
-                    "PIVOT" | "UNPIVOT" => {
+                    "PIVOT" | "UNPIVOT" if depth_frames[depth].phase.is_table_context() => {
                         depth_frames[depth].phase = SqlPhase::PivotClause;
                         relation_state.clear();
                     }
-                    "MODEL" => {
+                    "MODEL" if model_clause_can_start(tokens, idx, depth_frames[depth].phase) => {
                         depth_frames[depth].phase = SqlPhase::ModelClause;
                         relation_state.clear();
                     }
@@ -4427,12 +4438,30 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 });
                                 let relation_arg_tokens = relation_body_range
                                     .map(|range| token_range_slice(tokens, range));
+                                let allow_relation_alias =
+                                    matches!(
+                                        current_phase,
+                                        SqlPhase::FromClause
+                                            | SqlPhase::UpdateTarget
+                                            | SqlPhase::DeleteTarget
+                                            | SqlPhase::MergeTarget
+                                    ) || (matches!(current_phase, SqlPhase::IntoClause)
+                                        && matches!(
+                                            current_statement_kind,
+                                            StatementKind::Insert
+                                                | StatementKind::Merge
+                                                | StatementKind::Lock
+                                        ));
                                 let (
                                     direct_alias,
                                     direct_after_alias,
                                     direct_explicit_columns,
                                     direct_explicit_column_range,
-                                ) = parse_alias_deep_with_columns(tokens, relation_arg_end);
+                                ) = if allow_relation_alias {
+                                    parse_alias_deep_with_columns(tokens, relation_arg_end)
+                                } else {
+                                    (None, relation_arg_end, Vec::new(), None)
+                                };
                                 let (direct_alias, direct_after_alias) = sanitize_lock_table_alias(
                                     tokens,
                                     relation_arg_end,
@@ -6412,6 +6441,129 @@ fn skip_model_clause(tokens: &[SqlToken], start: usize) -> usize {
     }
 
     idx
+}
+
+fn model_clause_can_start(tokens: &[SqlToken], idx: usize, phase: SqlPhase) -> bool {
+    if !matches!(
+        phase,
+        SqlPhase::FromClause
+            | SqlPhase::WhereClause
+            | SqlPhase::GroupByClause
+            | SqlPhase::HavingClause
+            | SqlPhase::ConnectByClause
+            | SqlPhase::StartWithClause
+    ) {
+        return false;
+    }
+
+    let next_idx = skip_comment_tokens(tokens, idx.saturating_add(1));
+    if matches!(tokens.get(next_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
+        return false;
+    }
+
+    let Some(prev) = tokens.get(..idx).and_then(|before| {
+        before
+            .iter()
+            .rev()
+            .find(|token| !matches!(token, SqlToken::Comment(_)))
+    }) else {
+        return false;
+    };
+
+    match prev {
+        SqlToken::Word(word) => !matches!(
+            word.to_ascii_uppercase().as_str(),
+            "SELECT"
+                | "FROM"
+                | "JOIN"
+                | "WHERE"
+                | "GROUP"
+                | "ORDER"
+                | "HAVING"
+                | "CONNECT"
+                | "START"
+                | "BY"
+                | "ON"
+                | "AND"
+                | "OR"
+                | "NOT"
+                | "IN"
+                | "LIKE"
+                | "BETWEEN"
+                | "IS"
+                | "AS"
+                | "MODEL"
+                | "PARTITION"
+                | "DIMENSION"
+                | "MEASURES"
+                | "RULES"
+        ),
+        SqlToken::String(_) => true,
+        SqlToken::Symbol(sym) => sym == ")",
+        SqlToken::Comment(_) => false,
+    }
+}
+
+fn values_clause_can_start(tokens: &[SqlToken], idx: usize, frame: &ParserDepthFrame) -> bool {
+    let insert_source_can_start = matches!(frame.statement_kind, StatementKind::Insert)
+        && frame.current_target_table.is_some()
+        && matches!(
+            frame.phase,
+            SqlPhase::IntoClause
+                | SqlPhase::InsertColumnList
+                | SqlPhase::MergeInsertColumnList
+                | SqlPhase::SetClause
+        );
+    if insert_source_can_start {
+        return true;
+    }
+
+    if frame.allows_leading_query_expression && matches!(frame.phase, SqlPhase::Initial) {
+        return true;
+    }
+
+    matches!(frame.statement_kind, StatementKind::Merge)
+        && matches!(
+            frame.phase,
+            SqlPhase::SetClause | SqlPhase::MergeInsertColumnList
+        )
+        && values_follows_merge_insert_action(tokens, idx)
+}
+
+fn values_follows_merge_insert_action(tokens: &[SqlToken], idx: usize) -> bool {
+    match prev_non_comment_token(tokens, idx) {
+        Some((SqlToken::Word(word), _)) => word.eq_ignore_ascii_case("INSERT"),
+        Some((SqlToken::Symbol(sym), close_idx)) if sym == ")" => {
+            matching_open_paren_before_close(tokens, close_idx)
+                .and_then(|open_idx| prev_word_upper(tokens, open_idx))
+                .is_some_and(|(word, _)| word == "INSERT")
+        }
+        _ => false,
+    }
+}
+
+fn matching_open_paren_before_close(tokens: &[SqlToken], close_idx: usize) -> Option<usize> {
+    if !matches!(tokens.get(close_idx), Some(SqlToken::Symbol(sym)) if sym == ")") {
+        return None;
+    }
+
+    let mut depth = 1usize;
+    let mut idx = close_idx;
+    while idx > 0 {
+        idx -= 1;
+        match tokens.get(idx) {
+            Some(SqlToken::Symbol(sym)) if sym == ")" => depth = depth.saturating_add(1),
+            Some(SqlToken::Symbol(sym)) if sym == "(" => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 /// Parse an alias after a subquery closing ')' and capture any trailing derived
