@@ -2143,7 +2143,14 @@ impl SqlEditorWidget {
             }
             _ => Vec::new(),
         };
+        let allow_dml_returning_into_keyword =
+            Self::cursor_is_at_dml_returning_into_keyword_slot_for_context(
+                &snapshot.prefix,
+                deep_ctx,
+                Some(snapshot.preferred_db_type),
+            );
         let expected_keyword_suggestions = if source_allowance.expected_keyword_suggestions
+            || allow_dml_returning_into_keyword
         {
             Self::collect_expected_keyword_suggestions_with_expression_context(
                 &snapshot.prefix,
@@ -5688,6 +5695,24 @@ impl SqlEditorWidget {
                 [on, duplicate, key]
                     if on == "ON" && duplicate == "DUPLICATE" && key == "KEY"
             )
+            || Self::cursor_is_at_mysql_on_duplicate_after_on_tail(tokens, end, db_type)
+    }
+
+    fn cursor_is_at_mysql_on_duplicate_after_on_tail(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            || !Self::top_level_values_clause_present_before(tokens, end)
+        {
+            return false;
+        }
+        let words = Self::words_for_keyword_slot(tokens, end);
+        matches!(
+            (words.first().map(String::as_str), words.last().map(String::as_str)),
+            (Some("INSERT"), Some("ON"))
+        ) && !Self::top_level_word_pair_present_before(tokens, end, "ON", "DUPLICATE")
     }
 
     fn cursor_is_at_mysql_on_duplicate_keyword_tail_for_context(
@@ -16971,6 +16996,9 @@ impl SqlEditorWidget {
         {
             return Some(candidates);
         }
+        if let Some(candidates) = Self::expected_alter_table_tail_keywords(&words) {
+            return Some(candidates);
+        }
         // Option keywords that take a name from a catalog we do not model (a
         // tablespace) are followed by an identifier slot, never a relation; in a
         // `CREATE`/`ALTER` statement suppress the catalog there.
@@ -16981,26 +17009,29 @@ impl SqlEditorWidget {
             return Some(&[]);
         }
 
-        match words.as_slice() {
-            [alter, table, _name] if alter == "ALTER" && table == "TABLE" => {
+        None
+    }
+
+    fn expected_alter_table_tail_keywords(words: &[String]) -> Option<&'static [&'static str]> {
+        if !matches!(
+            words,
+            [alter, table, ..] if alter == "ALTER" && table == "TABLE"
+        ) {
+            return None;
+        }
+        let tail = words.get(2..)?;
+        if tail.is_empty() {
+            return None;
+        }
+
+        match tail.last().map(String::as_str) {
+            Some("DROP") => Some(&["COLUMN", "CONSTRAINT", "PRIMARY KEY", "UNIQUE", "PARTITION"]),
+            Some("RENAME") => Some(&["TO", "COLUMN", "CONSTRAINT", "PARTITION"]),
+            _ if !tail
+                .iter()
+                .any(|word| matches!(word.as_str(), "ADD" | "DROP" | "MODIFY" | "RENAME")) =>
+            {
                 Some(&["ADD", "DROP", "MODIFY", "RENAME"])
-            }
-            // `ALTER TABLE [schema.]t DROP |` is a table sub-operation, not a
-            // `DROP <object>` statement head: offer the droppable table elements.
-            // (Without this the statement-structural fallback would leak the whole
-            // `DROP TABLE/VIEW/PROCEDURE/…` object-type list here.)
-            [alter, table, .., drop]
-                if alter == "ALTER" && table == "TABLE" && drop == "DROP" =>
-            {
-                Some(&["COLUMN", "CONSTRAINT", "PRIMARY KEY", "UNIQUE", "PARTITION"])
-            }
-            // `ALTER TABLE [schema.]t RENAME |` — the renamable table elements
-            // (`RENAME TO`, `RENAME COLUMN/CONSTRAINT/PARTITION`), not the
-            // standalone `RENAME TABLE/USER` statement objects.
-            [alter, table, .., rename]
-                if alter == "ALTER" && table == "TABLE" && rename == "RENAME" =>
-            {
-                Some(&["TO", "COLUMN", "CONSTRAINT", "PARTITION"])
             }
             _ => None,
         }
@@ -18800,25 +18831,10 @@ impl SqlEditorWidget {
                 return Some(&["ROLLUP", "CUBE", "GROUPING SETS"]);
             }
         }
-        if !mysql
-            && Self::top_level_dml_clause_word_present_before(tokens, end, "RETURNING")
-            && Self::unclosed_paren_count(tokens, end) == 0
-            && !Self::cursor_is_at_json_returning_type(tokens, end)
+        if let Some(candidates) =
+            Self::expected_dml_returning_into_keyword_candidates(tokens, end, db_type)
         {
-            // The DML `RETURNING … INTO` clause lives at the statement top level; a
-            // `RETURNING <type>` inside an open function-call paren (`JSON_VALUE(…
-            // RETURNING NUMBER |)`) is a different grammar, so the `unclosed paren`
-            // guard keeps `INTO` from leaking into it.
-            // Offer `INTO` only while the RETURNING clause still lacks one. A later
-            // `INTO` (after the RETURNING keyword, not the statement-leading
-            // `INSERT INTO`) means the bind list has begun — never re-offer it.
-            let into_already = words
-                .iter()
-                .rposition(|word| word == "RETURNING")
-                .is_some_and(|idx| words[idx + 1..].iter().any(|word| word == "INTO"));
-            if !into_already {
-                return Some(&["INTO"]);
-            }
+            return Some(candidates);
         }
         if mysql
             && matches!(words.first().map(String::as_str), Some("INSERT"))
@@ -18833,6 +18849,75 @@ impl SqlEditorWidget {
         }
 
         None
+    }
+
+    fn expected_mysql_on_duplicate_after_on_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        Self::cursor_is_at_mysql_on_duplicate_after_on_tail(tokens, end, db_type)
+            .then_some(&["DUPLICATE KEY UPDATE"][..])
+    }
+
+    fn expected_dml_returning_into_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            || !Self::top_level_dml_clause_word_present_before(tokens, end, "RETURNING")
+            || Self::unclosed_paren_count(tokens, end) != 0
+            || Self::cursor_is_at_json_returning_type(tokens, end)
+            || !Self::cursor_immediately_follows_complete_operand(tokens, end)
+        {
+            return None;
+        }
+
+        // The DML `RETURNING … INTO` clause lives at the statement top level; a
+        // `RETURNING <type>` inside an open function-call paren (`JSON_VALUE(…
+        // RETURNING NUMBER |)`) is a different grammar, so the guards above keep
+        // `INTO` from leaking into it. Offer `INTO` only while the RETURNING clause
+        // still lacks one. A later `INTO` (after the RETURNING keyword, not the
+        // statement-leading `INSERT INTO`) means the bind list has begun.
+        let words = Self::words_for_keyword_slot(tokens, end);
+        if words.last().is_some_and(|word| word == "RETURNING") {
+            return None;
+        }
+        let into_already = words
+            .iter()
+            .rposition(|word| word == "RETURNING")
+            .is_some_and(|idx| words[idx + 1..].iter().any(|word| word == "INTO"));
+        (!into_already).then_some(&["INTO"][..])
+    }
+
+    fn cursor_is_at_dml_returning_into_keyword_slot_for_context(
+        prefix: &str,
+        deep_ctx: &intellisense_context::CursorContext,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let context_end =
+            Self::expected_keyword_suggestion_context_end(tokens, cursor_token_len, prefix);
+        if Self::expected_dml_returning_into_keyword_candidates(tokens, context_end, db_type)
+            .is_some()
+        {
+            return true;
+        }
+
+        let statement_tokens = deep_ctx.statement_tokens.as_ref();
+        let statement_context_end = Self::expected_keyword_suggestion_context_end(
+            statement_tokens,
+            deep_ctx.cursor_token_len,
+            prefix,
+        );
+        Self::expected_dml_returning_into_keyword_candidates(
+            statement_tokens,
+            statement_context_end,
+            db_type,
+        )
+        .is_some()
     }
 
     fn expected_tool_command_supplement_keyword_candidates(
@@ -26310,6 +26395,24 @@ impl SqlEditorWidget {
                 filtered, src_tokens, src_end, db_type,
             );
         }
+        if !prefix.is_empty() {
+            if let Some(candidates) =
+                Self::expected_mysql_on_duplicate_after_on_keyword_candidates(
+                    tokens,
+                    context_end,
+                    db_type,
+                )
+                .or_else(|| {
+                    Self::expected_mysql_on_duplicate_after_on_keyword_candidates(
+                        statement_tokens,
+                        statement_context_end,
+                        db_type,
+                    )
+                })
+            {
+                return Self::filter_expected_candidates(prefix, candidates);
+            }
+        }
         if let Some(candidates) = Self::expected_grouping_returning_and_insert_tail_keyword_candidates(
             tokens,
             context_end,
@@ -27772,9 +27875,8 @@ impl SqlEditorWidget {
     }
 
     fn grant_revoke_verb_before_separator(tokens: &[SqlToken], separator_idx: usize) -> Option<&str> {
-        let mut scan_end = separator_idx;
-        while let Some(idx) = Self::previous_non_comment_token_index(tokens, scan_end) {
-            if let Some(SqlToken::Word(word)) = tokens.get(idx) {
+        for token in tokens.get(..separator_idx.min(tokens.len()))? {
+            if let SqlToken::Word(word) = token {
                 if word.eq_ignore_ascii_case("GRANT") {
                     return Some("GRANT");
                 }
@@ -27782,7 +27884,6 @@ impl SqlEditorWidget {
                     return Some("REVOKE");
                 }
             }
-            scan_end = idx;
         }
         None
     }

@@ -1957,7 +1957,14 @@ fn audit_final_suggestions_for(
             expr_keyword_ctx,
         )
     };
-    let expected_keywords = if source_allowance.expected_keyword_suggestions {
+    let allow_dml_returning_into_keyword =
+        SqlEditorWidget::cursor_is_at_dml_returning_into_keyword_slot_for_context(
+            &prefix,
+            &ctx,
+            Some(db),
+        );
+    let expected_keywords =
+        if source_allowance.expected_keyword_suggestions || allow_dml_returning_into_keyword {
         SqlEditorWidget::collect_expected_keyword_suggestions_with_expression_context(
             &prefix, &ctx, Some(db), Some(expr_keyword_ctx),
         )
@@ -40388,6 +40395,358 @@ fn ddl_statement_tails_suppress_relations_and_offer_object_options() {
         "MV LOG must still offer ON, not be treated as a completed view");
 }
 
+#[test]
+fn prefixed_statement_tail_keyword_slots_do_not_offer_object_catalog() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for (db, sql, expected_keyword) in [
+        (Oracle, "DROP TABLE emp CAS|", "CASCADE"),
+        (Oracle, "DROP TABLE scott.emp CAS|", "CASCADE"),
+        (Oracle, "DROP TABLE emp PUR|", "PURGE"),
+        (Oracle, "DROP TABLE scott.emp PUR|", "PURGE"),
+        (Oracle, "DROP TABLE emp CASCADE CON|", "CONSTRAINTS"),
+        (Oracle, "DROP TABLE scott.emp CASCADE CON|", "CONSTRAINTS"),
+        (Oracle, "COMMENT ON TABLE emp I|", "IS"),
+        (Oracle, "COMMENT ON TABLE scott.emp I|", "IS"),
+        (Oracle, "COMMENT ON COLUMN emp.sal I|", "IS"),
+        (Oracle, "COMMENT ON COLUMN scott.emp.sal I|", "IS"),
+        (Oracle, "CREATE VIEW emp_v A|", "AS"),
+        (Oracle, "CREATE VIEW scott.emp_v A|", "AS"),
+        (Oracle, "CREATE INDEX emp_idx O|", "ON"),
+        (Oracle, "ALTER TABLE emp R|", "RENAME"),
+        (Oracle, "ALTER TABLE scott.emp R|", "RENAME"),
+        (Oracle, "GRANT SELECT ON emp TO scott W|", "WITH GRANT OPTION"),
+        (Oracle, "GRANT SELECT ON scott.emp TO app_user W|", "WITH GRANT OPTION"),
+        (MySQL, "CREATE VIEW emp_v A|", "AS"),
+        (MySQL, "CREATE TABLE t (a INT) ENG|", "ENGINE"),
+        (MySQL, "CREATE INDEX emp_idx ON emp (empno) US|", "USING"),
+        (MySQL, "RENAME TABLE emp T|", "TO"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert!(
+            contains(&final_suggestions, expected_keyword),
+            "{expected_keyword} missing from tail slot at `{sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "APP_USER",
+            "SCOTT",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "BI_EMP",
+            "CLEANUP_EVENT",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into prefixed tail keyword slot at `{sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn prefixed_dml_column_slots_stay_on_target_relation_columns() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for sql in [
+        "INSERT INTO emp (e|)",
+        "INSERT INTO emp (empno, e|)",
+        "UPDATE emp SET e|",
+        "UPDATE emp SET sal = 1, e|",
+        "MERGE INTO emp e USING dept d ON (e.empno = d.deptno) WHEN NOT MATCHED THEN INSERT (e|) VALUES (d.deptno)",
+        "UPDATE emp SET sal = sal + 1 RETURNING e|",
+        "UPDATE emp SET sal = sal + 1 RETURNING sal, e|",
+        "DELETE FROM emp WHERE empno = 1 RETURNING e|",
+        "INSERT INTO emp (empno) VALUES (1) RETURNING e|",
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert_eq!(
+            kind, None,
+            "DML column slot should use relation-column completion at `{sql}`; keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            contains(&final_suggestions, "ENAME") && contains(&final_suggestions, "EMPNO"),
+            "DML column slot lost EMP columns at `{sql}`: {final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "APP_USER",
+            "SCOTT",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "DEPTNO",
+            "DNAME",
+            "SELECT",
+            "WHERE",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into DML column slot at `{sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+
+    for (db, sql) in [
+        (MySQL, "INSERT INTO emp (e|)"),
+        (MySQL, "INSERT INTO emp (empno, e|)"),
+        (MySQL, "INSERT INTO emp SET e|"),
+        (MySQL, "INSERT INTO emp SET sal = 1, e|"),
+        (MySQL, "UPDATE emp SET e|"),
+        (MySQL, "UPDATE emp SET sal = 1, e|"),
+        (Oracle, "UPDATE emp e SET e.e|"),
+        (Oracle, "UPDATE emp e SET sal = 1 RETURNING e.e|"),
+        (Oracle, "DELETE FROM emp e WHERE empno = 1 RETURNING e.e|"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert_eq!(
+            kind, None,
+            "qualified/MySQL DML column slot should use relation-column completion at `{sql}`; keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            contains(&final_suggestions, "ENAME") && contains(&final_suggestions, "EMPNO"),
+            "qualified/MySQL DML column slot lost EMP columns at `{sql}`: {final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "APP_USER",
+            "SCOTT",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "DEPTNO",
+            "DNAME",
+            "SELECT",
+            "WHERE",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into qualified/MySQL DML column slot at `{sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn prefixed_dml_tail_keyword_slots_do_not_offer_object_catalog() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for (db, sql, expected_keyword) in [
+        (Oracle, "UPDATE emp SET sal = 1 W|", "WHERE"),
+        (Oracle, "UPDATE emp SET sal = 1 R|", "RETURNING"),
+        (Oracle, "UPDATE emp SET sal = 1 WHERE empno = 1 R|", "RETURNING"),
+        (Oracle, "DELETE FROM emp W|", "WHERE"),
+        (Oracle, "DELETE FROM emp WHERE empno = 1 R|", "RETURNING"),
+        (Oracle, "INSERT INTO emp VALUES (1) R|", "RETURNING"),
+        (Oracle, "INSERT INTO emp (empno) VALUES (1) RETURNING empno I|", "INTO"),
+        (MySQL, "UPDATE emp SET sal = 1 W|", "WHERE"),
+        (MySQL, "DELETE FROM emp W|", "WHERE"),
+        (MySQL, "INSERT INTO emp VALUES (1) ON D|", "DUPLICATE KEY UPDATE"),
+        (MySQL, "INSERT INTO emp VALUES (1) ON DUPLICATE K|", "KEY UPDATE"),
+        (MySQL, "INSERT INTO emp VALUES (1) ON DUPLICATE KEY U|", "UPDATE"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert!(
+            contains(&final_suggestions, expected_keyword),
+            "{expected_keyword} missing from DML tail slot at `{sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "APP_USER",
+            "SCOTT",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "EMPNO",
+            "ENAME",
+            "DEPTNO",
+            "DNAME",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into DML tail keyword slot at `{sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+
+    for sql in [
+        "UPDATE emp SET sal = 1 RETURNING |",
+        "DELETE FROM emp WHERE empno = 1 RETURNING |",
+        "INSERT INTO emp (empno) VALUES (1) RETURNING |",
+    ] {
+        let (_kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert!(
+            contains(&final_suggestions, "EMPNO") && contains(&final_suggestions, "ENAME"),
+            "empty RETURNING column slot should keep target columns at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            !contains(&final_suggestions, "INTO"),
+            "INTO must not appear before a RETURNING expression at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+    }
+}
+
+#[test]
+fn prefixed_query_clause_tail_slots_do_not_offer_object_catalog() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for (db, sql, expected_keyword) in [
+        (Oracle, "SELECT empno FROM emp W|", "WHERE"),
+        (Oracle, "SELECT empno FROM emp G|", "GROUP BY"),
+        (Oracle, "SELECT empno FROM emp O|", "ORDER BY"),
+        (Oracle, "SELECT empno FROM emp WHERE empno = 1 G|", "GROUP BY"),
+        (Oracle, "SELECT empno FROM emp WHERE empno = 1 O|", "ORDER BY"),
+        (
+            Oracle,
+            "SELECT deptno, count(*) FROM emp GROUP BY deptno H|",
+            "HAVING",
+        ),
+        (
+            Oracle,
+            "SELECT deptno, count(*) FROM emp GROUP BY deptno O|",
+            "ORDER BY",
+        ),
+        (
+            Oracle,
+            "SELECT deptno, count(*) FROM emp GROUP BY deptno HAVING count(*) > 1 O|",
+            "ORDER BY",
+        ),
+        (Oracle, "SELECT empno FROM emp ORDER BY empno F|", "FETCH"),
+        (Oracle, "SELECT empno FROM emp ORDER BY empno O|", "OFFSET"),
+        (Oracle, "SELECT empno FROM emp ORDER BY empno FOR U|", "UPDATE"),
+        (MySQL, "SELECT empno FROM emp W|", "WHERE"),
+        (MySQL, "SELECT empno FROM emp G|", "GROUP BY"),
+        (MySQL, "SELECT empno FROM emp O|", "ORDER BY"),
+        (MySQL, "SELECT empno FROM emp WHERE empno = 1 L|", "LIMIT"),
+        (MySQL, "SELECT empno FROM emp ORDER BY empno L|", "LIMIT"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert!(
+            contains(&final_suggestions, expected_keyword),
+            "{expected_keyword} missing from prefixed query tail slot at `{sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "APP_USER",
+            "SCOTT",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "EMPNO",
+            "ENAME",
+            "DEPTNO",
+            "DNAME",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into prefixed query tail slot at `{sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+
+    for sql in [
+        "SELECT empno FROM emp WHERE e|",
+        "SELECT empno FROM emp GROUP BY e|",
+        "SELECT empno FROM emp ORDER BY e|",
+        "SELECT empno FROM emp HAVING count(*) > e|",
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert!(
+            contains(&final_suggestions, "ENAME") && contains(&final_suggestions, "EMPNO"),
+            "expression slot lost columns at `{sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in ["WHERE", "GROUP BY", "HAVING", "ORDER BY", "FETCH", "OFFSET"] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into expression slot at `{sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn prefixed_join_and_set_operator_slots_do_not_offer_object_catalog() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for (db, sql, expected_keyword) in [
+        (Oracle, "SELECT * FROM emp J|", "JOIN"),
+        (Oracle, "SELECT * FROM emp LEFT J|", "JOIN"),
+        (Oracle, "SELECT * FROM emp LEFT OUTER J|", "JOIN"),
+        (Oracle, "SELECT * FROM emp JOIN dept O|", "ON"),
+        (Oracle, "SELECT * FROM emp JOIN dept U|", "USING"),
+        (Oracle, "SELECT * FROM emp JOIN dept ON emp.deptno = dept.deptno W|", "WHERE"),
+        (Oracle, "SELECT empno FROM emp UNION A|", "ALL"),
+        (Oracle, "SELECT empno FROM emp UNION ALL S|", "SELECT"),
+        (Oracle, "SELECT empno FROM emp INTERSECT S|", "SELECT"),
+        (Oracle, "SELECT empno FROM emp MINUS S|", "SELECT"),
+        (MySQL, "SELECT * FROM emp J|", "JOIN"),
+        (MySQL, "SELECT * FROM emp LEFT J|", "JOIN"),
+        (MySQL, "SELECT * FROM emp JOIN dept O|", "ON"),
+        (MySQL, "SELECT empno FROM emp UNION A|", "ALL"),
+        (MySQL, "SELECT empno FROM emp UNION ALL S|", "SELECT"),
+        (MySQL, "SELECT empno FROM emp EXCEPT S|", "SELECT"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert!(
+            contains(&final_suggestions, expected_keyword),
+            "{expected_keyword} missing from prefixed join/set slot at `{sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "APP_USER",
+            "SCOTT",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "EMPNO",
+            "ENAME",
+            "DEPTNO",
+            "DNAME",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into prefixed join/set slot at `{sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+
+    for (db, sql) in [
+        (Oracle, "SELECT * FROM emp JOIN |"),
+        (Oracle, "SELECT * FROM emp LEFT JOIN |"),
+        (MySQL, "SELECT * FROM emp JOIN |"),
+        (MySQL, "SELECT * FROM emp LEFT JOIN |"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert!(
+            contains(&final_suggestions, "EMP") && contains(&final_suggestions, "DEPT"),
+            "join target slot should keep relation catalog at `{sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in ["ON", "USING", "WHERE", "GROUP BY", "ORDER BY", "EMPNO", "ENAME"] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into join target relation slot at `{sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
 
 /// MySQL DDL statement tails suppress the relation catalog past the object name,
 /// the same leak class as the Oracle dialect. The object-name slots, the
@@ -40947,6 +41306,95 @@ fn grant_revoke_slots_are_precise_in_final_suggestions() {
                 "{leaked} leaked into DCL grantee slot at `{sql}`: {final_suggestions:?}"
             );
         }
+    }
+}
+
+#[test]
+fn prefixed_grant_revoke_grantee_and_tail_slots_are_precise() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for (db, sql, expected_user) in [
+        (Oracle, "GRANT SELECT ON emp TO app|", "APP_USER"),
+        (Oracle, "GRANT SELECT ON emp TO scott, app|", "APP_USER"),
+        (Oracle, "REVOKE SELECT ON emp FROM app|", "APP_USER"),
+        (Oracle, "REVOKE SELECT ON emp FROM scott, app|", "APP_USER"),
+        (Oracle, "GRANT CREATE SESSION TO app|", "APP_USER"),
+        (Oracle, "GRANT app_role TO app|", "APP_USER"),
+        (MySQL, "GRANT SELECT ON emp TO app|", "APP_USER"),
+        (MySQL, "REVOKE SELECT ON emp FROM app|", "APP_USER"),
+        (MySQL, "REVOKE ALL PRIVILEGES, GRANT OPTION FROM app|", "APP_USER"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert_eq!(
+            kind,
+            Some(ExpectedObjectSuggestionKind::User),
+            "DCL prefixed grantee slot should resolve to users at `{sql}`; keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            contains(&final_suggestions, expected_user),
+            "{expected_user} missing from prefixed DCL grantee slot at `{sql}`: {final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "SELECT",
+            "INSERT",
+            "UPDATE",
+            "WHERE",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into prefixed DCL grantee slot at `{sql}`: {final_suggestions:?}"
+            );
+        }
+    }
+
+    for (db, sql, expected_keyword) in [
+        (Oracle, "GRANT SELECT ON emp TO app_user W|", "WITH GRANT OPTION"),
+        (Oracle, "GRANT SELECT ON emp TO app_user WITH G|", "GRANT OPTION"),
+        (Oracle, "GRANT SELECT ON emp TO app_user WITH GRANT O|", "OPTION"),
+        (Oracle, "GRANT CREATE SESSION TO app_user W|", "WITH ADMIN OPTION"),
+        (Oracle, "GRANT CREATE SESSION TO app_user WITH A|", "ADMIN OPTION"),
+        (Oracle, "GRANT app_role TO app_user W|", "WITH ADMIN OPTION"),
+        (MySQL, "GRANT SELECT ON emp TO app_user W|", "WITH GRANT OPTION"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert!(
+            contains(&final_suggestions, expected_keyword),
+            "{expected_keyword} missing from prefixed DCL tail slot at `{sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "APP_USER",
+            "SCOTT",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "SELECT",
+            "WHERE",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into prefixed DCL tail slot at `{sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+
+    for (db, sql) in [
+        (Oracle, "REVOKE SELECT ON emp FROM app_user F|"),
+        (MySQL, "REVOKE SELECT ON emp FROM app_user F|"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert!(
+            final_suggestions.is_empty(),
+            "completed REVOKE tail should not offer catalog or stale separator at `{sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+        );
     }
 }
 
