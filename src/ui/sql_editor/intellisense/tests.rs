@@ -41306,6 +41306,101 @@ fn derived_table_and_parenthesised_source_offer_query_continuation() {
     assert!(has(&kw("SELECT * FROM t1 JOIN my_func(x) |", Oracle), "ON"));
 }
 
+#[test]
+fn derived_table_and_table_function_tail_slots_do_not_offer_catalog() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+    let assert_no_catalog_noise =
+        |sql: &str, db: crate::db::DatabaseType, final_suggestions: &[String]| {
+            for leaked in [
+                "EMP",
+                "DEPT",
+                "EMP_V",
+                "APP_USER",
+                "SCOTT",
+                "RUN_JOB",
+                "CALC_TOTAL",
+                "EMPNO",
+                "ENAME",
+                "DEPTNO",
+                "DNAME",
+                "MY_FUNC",
+            ] {
+                assert!(
+                    !contains(final_suggestions, leaked),
+                    "{leaked} leaked into derived/table-function tail at `{sql}` {db:?}: {final_suggestions:?}"
+                );
+            }
+        };
+
+    for (db, sql, expected_keywords) in [
+        (
+            Oracle,
+            "SELECT a FROM (SELECT b FROM s) |",
+            &["JOIN", "WHERE", "GROUP BY", "ORDER BY"][..],
+        ),
+        (
+            Oracle,
+            "SELECT a FROM (SELECT b FROM s) v |",
+            &["JOIN", "WHERE", "GROUP BY", "ORDER BY"],
+        ),
+        (
+            Oracle,
+            "SELECT a FROM t, (SELECT b FROM s) v |",
+            &["JOIN", "WHERE", "GROUP BY", "ORDER BY"],
+        ),
+        (
+            MySQL,
+            "SELECT a FROM (SELECT b FROM s) AS v |",
+            &["JOIN", "WHERE", "GROUP BY", "ORDER BY"],
+        ),
+        (
+            Oracle,
+            "SELECT a FROM t1 JOIN (SELECT b FROM s) |",
+            &["ON", "USING"],
+        ),
+        (
+            Oracle,
+            "SELECT a FROM t1 JOIN (SELECT b FROM s) v |",
+            &["ON", "USING"],
+        ),
+        (
+            Oracle,
+            "SELECT a FROM t1 CROSS JOIN (SELECT b FROM s) |",
+            &["JOIN", "WHERE", "GROUP BY", "ORDER BY"],
+        ),
+        (
+            Oracle,
+            "SELECT * FROM TABLE(f(1)) |",
+            &["JOIN", "WHERE", "GROUP BY", "ORDER BY"],
+        ),
+        (
+            Oracle,
+            "SELECT * FROM XMLTABLE('/a' COLUMNS d NUMBER PATH '/b') |",
+            &["JOIN", "WHERE", "GROUP BY", "ORDER BY"],
+        ),
+        (
+            Oracle,
+            "SELECT * FROM t1 JOIN my_func(x) |",
+            &["ON", "USING"],
+        ),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert_eq!(
+            kind, None,
+            "derived/table-function tail should not resolve an object kind at `{sql}`; keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for expected in expected_keywords {
+            assert!(
+                contains(&final_suggestions, expected),
+                "{expected} missing from derived/table-function tail at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+        assert_no_catalog_noise(sql, db, &final_suggestions);
+    }
+}
+
 /// A post-table modifier — Oracle's partition-extension (`PARTITION (…)`,
 /// `SUBPARTITION (…)`, `… FOR (…)`) or row-sampling (`SAMPLE [BLOCK] (…)`,
 /// `TABLESAMPLE [method] (…)`) clause — attaches to a table reference without
@@ -41355,6 +41450,74 @@ fn post_table_modifier_completes_the_relation() {
     assert!(!offers_continuation(&kw("SELECT * FROM t SAMPLE (|", Oracle)));
 }
 
+#[test]
+fn post_table_modifier_tail_slots_do_not_offer_catalog() {
+    use crate::db::DatabaseType::Oracle;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+    let assert_no_catalog_noise = |sql: &str, final_suggestions: &[String]| {
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "APP_USER",
+            "SCOTT",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "EMPNO",
+            "ENAME",
+            "DEPTNO",
+            "DNAME",
+        ] {
+            assert!(
+                !contains(final_suggestions, leaked),
+                "{leaked} leaked into post-table modifier tail at `{sql}`: {final_suggestions:?}"
+            );
+        }
+    };
+
+    for (sql, expected_keywords) in [
+        (
+            "SELECT * FROM t SAMPLE (10) |",
+            &["JOIN", "WHERE", "GROUP BY", "ORDER BY"][..],
+        ),
+        (
+            "SELECT * FROM t SAMPLE BLOCK (10) |",
+            &["JOIN", "WHERE", "GROUP BY", "ORDER BY"],
+        ),
+        (
+            "SELECT * FROM t PARTITION (p1) |",
+            &["JOIN", "WHERE", "GROUP BY", "ORDER BY"],
+        ),
+        (
+            "SELECT * FROM t PARTITION (p1) x |",
+            &["JOIN", "WHERE", "GROUP BY", "ORDER BY"],
+        ),
+        (
+            "SELECT * FROM t PARTITION (p1) SAMPLE (10) |",
+            &["JOIN", "WHERE", "GROUP BY", "ORDER BY"],
+        ),
+        ("SELECT * FROM t1 JOIN t2 PARTITION (p1) |", &["ON", "USING"]),
+        (
+            "SELECT * FROM t1 JOIN t2 SAMPLE BLOCK (5) |",
+            &["ON", "USING"],
+        ),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert_eq!(
+            kind, None,
+            "post-table modifier tail should not resolve an object kind at `{sql}`; keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for expected in expected_keywords {
+            assert!(
+                contains(&final_suggestions, expected),
+                "{expected} missing from post-table modifier tail at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+        assert_no_catalog_noise(sql, &final_suggestions);
+    }
+}
+
 /// The `XMLTABLE`/`JSON_TABLE` subgrammar (`PASSING`/`COLUMNS`/error clauses) is
 /// only grammatical *inside* the still-open call paren. A depth-blind `has()` used
 /// to leak `COLUMNS` into the surrounding query once the call closed
@@ -41381,6 +41544,67 @@ fn xmltable_subgrammar_is_confined_to_the_open_call() {
         let s = kw(sql);
         assert!(!has(&s, "COLUMNS") && !has(&s, "PASSING"),
             "XMLTABLE subgrammar leaked past the closed call at `{sql}`: {s:?}");
+    }
+}
+
+#[test]
+fn closed_xmltable_and_json_table_tail_slots_do_not_offer_catalog() {
+    use crate::db::DatabaseType::Oracle;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+    let assert_no_catalog_noise = |sql: &str, final_suggestions: &[String]| {
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "APP_USER",
+            "SCOTT",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "EMPNO",
+            "ENAME",
+            "DEPTNO",
+            "DNAME",
+            "COLUMNS",
+            "PASSING",
+        ] {
+            assert!(
+                !contains(final_suggestions, leaked),
+                "{leaked} leaked after closed XMLTABLE/JSON_TABLE at `{sql}`: {final_suggestions:?}"
+            );
+        }
+    };
+
+    for (sql, expected_keywords) in [
+        (
+            "SELECT * FROM XMLTABLE('/a' PASSING c) |",
+            &["JOIN", "WHERE", "GROUP BY", "ORDER BY"][..],
+        ),
+        (
+            "SELECT * FROM XMLTABLE('/a' PASSING c) v |",
+            &["JOIN", "WHERE", "GROUP BY", "ORDER BY"],
+        ),
+        (
+            "SELECT * FROM t1 JOIN XMLTABLE('/a' PASSING c) v |",
+            &["ON", "USING"],
+        ),
+        (
+            "SELECT * FROM JSON_TABLE(j, '$' COLUMNS (c NUMBER PATH '$.x')) v |",
+            &["JOIN", "WHERE", "GROUP BY", "ORDER BY"],
+        ),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert_eq!(
+            kind, None,
+            "closed XMLTABLE/JSON_TABLE tail should not resolve an object kind at `{sql}`; keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for expected in expected_keywords {
+            assert!(
+                contains(&final_suggestions, expected),
+                "{expected} missing after closed XMLTABLE/JSON_TABLE at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+        assert_no_catalog_noise(sql, &final_suggestions);
     }
 }
 
@@ -41436,6 +41660,70 @@ fn parenthesised_predicate_completes_like_the_unparenthesised_form() {
     ] {
         assert!(!offers_continuation(&kw(sql, Oracle)),
             "non-predicate parenthesised value wrongly completed at `{sql}`: {:?}", kw(sql, Oracle));
+    }
+}
+
+#[test]
+fn parenthesised_predicate_tail_slots_do_not_offer_catalog() {
+    use crate::db::DatabaseType::Oracle;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+    let assert_no_catalog_noise = |sql: &str, final_suggestions: &[String]| {
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "APP_USER",
+            "SCOTT",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "EMPNO",
+            "ENAME",
+            "DEPTNO",
+            "DNAME",
+        ] {
+            assert!(
+                !contains(final_suggestions, leaked),
+                "{leaked} leaked into parenthesised predicate tail at `{sql}`: {final_suggestions:?}"
+            );
+        }
+    };
+
+    for sql in [
+        "SELECT a FROM t WHERE (a = b) |",
+        "SELECT a FROM t WHERE (a = b AND c = d) |",
+        "SELECT a FROM t WHERE ((a = b)) |",
+        "SELECT a FROM t WHERE (a = b) AND (c = d) |",
+        "SELECT a FROM t WHERE (SELECT c FROM s) > 5 |",
+        "SELECT a FROM t WHERE x IN (SELECT id FROM s) |",
+        "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM s) |",
+        "SELECT a FROM t1 JOIN t2 ON (a = b) |",
+        "SELECT a FROM t1 JOIN t2 ON (a = b AND c = d) |",
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert!(
+            contains(&final_suggestions, "GROUP BY")
+                || contains(&final_suggestions, "WHERE")
+                || contains(&final_suggestions, "JOIN"),
+            "parenthesised predicate tail lost query continuation at `{sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert_no_catalog_noise(sql, &final_suggestions);
+    }
+
+    for sql in [
+        "SELECT a FROM t WHERE (a) |",
+        "SELECT a FROM t WHERE (a + 1) |",
+        "SELECT a FROM t WHERE (a, b) |",
+        "SELECT a FROM t WHERE (SELECT c FROM s) |",
+        "SELECT a FROM t WHERE f(a = b) |",
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        for leaked in ["GROUP BY", "HAVING", "ORDER BY", "OFFSET", "FETCH", "FOR UPDATE"] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked after incomplete parenthesised value at `{sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
     }
 }
 
