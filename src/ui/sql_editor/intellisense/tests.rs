@@ -2423,6 +2423,102 @@ fn table_clause_construct_keywords_do_not_hijack_expression_calls() {
         "SELECT merge(|) FROM t",
         "SELECT * FROM t WHERE merge(|)",
         "SELECT * FROM t WHERE a = merge(|)",
+        "SELECT insert(|) FROM t",
+        "SELECT update(|) FROM t",
+        "SELECT delete(|) FROM t",
+        "SELECT replace(|) FROM t",
+        "SELECT call(|) FROM t",
+        "SELECT open(|) FROM t",
+        "SELECT lock(|) FROM t",
+        "SELECT rename(|) FROM t",
+        "SELECT join(|) FROM t",
+        "SELECT apply(|) FROM t",
+        "SELECT into(|) FROM t",
+        "SELECT using(|) FROM t",
+        "SELECT from(|) FROM t",
+        "SELECT where(|) FROM t",
+        "SELECT having(|) FROM t",
+        "SELECT order(|) FROM t",
+        "SELECT group(|) FROM t",
+        "SELECT connect(|) FROM t",
+        "SELECT start(|) FROM t",
+        "SELECT for(|) FROM t",
+        "SELECT a + from(|) FROM t",
+        "SELECT a * from(|) FROM t",
+        "SELECT CASE WHEN a = 1 THEN from(|) ELSE b END FROM t",
+        "SELECT * FROM t WHERE a = from(|)",
+        "SELECT * FROM t WHERE a + from(|) > 1",
+        "SELECT * FROM t WHERE a = 1 AND from(|)",
+        "SELECT * FROM t GROUP BY from(|)",
+        "SELECT * FROM t HAVING from(|) > 0",
+        "SELECT * FROM t ORDER BY from(|)",
+        "SELECT a + into(|) FROM t",
+        "SELECT CASE WHEN a = 1 THEN into(|) ELSE b END FROM t",
+        "SELECT * FROM t WHERE a = into(|)",
+        "SELECT * FROM t WHERE a = 1 AND into(|)",
+        "SELECT * FROM t GROUP BY into(|)",
+        "SELECT * FROM t HAVING into(|) > 0",
+        "SELECT * FROM t ORDER BY into(|)",
+        "SELECT a + using(|) FROM t",
+        "SELECT * FROM t WHERE a = using(|)",
+        "SELECT * FROM t WHERE a = 1 AND using(|)",
+        "SELECT * FROM t GROUP BY using(|)",
+        "SELECT * FROM t HAVING using(|) > 0",
+        "SELECT * FROM t ORDER BY using(|)",
+        "SELECT a + returning(|) FROM t",
+        "SELECT * FROM t WHERE a = returning(|)",
+        "SELECT * FROM t WHERE a = 1 AND returning(|)",
+        "SELECT * FROM t GROUP BY returning(|)",
+        "SELECT * FROM t HAVING returning(|) > 0",
+        "SELECT * FROM t ORDER BY returning(|)",
+        "SELECT a + set(|) FROM t",
+        "SELECT * FROM t WHERE a = set(|)",
+        "SELECT * FROM t WHERE a = 1 AND set(|)",
+        "SELECT * FROM t GROUP BY set(|)",
+        "SELECT * FROM t HAVING set(|) > 0",
+        "SELECT * FROM t ORDER BY set(|)",
+        "SELECT a + update(|) FROM t",
+        "SELECT * FROM t WHERE a = update(|)",
+        "SELECT * FROM t WHERE a = 1 AND update(|)",
+        "SELECT * FROM t GROUP BY update(|)",
+        "SELECT * FROM t HAVING update(|) > 0",
+        "SELECT * FROM t ORDER BY update(|)",
+        "SELECT a + delete(|) FROM t",
+        "SELECT * FROM t WHERE a = delete(|)",
+        "SELECT * FROM t WHERE a = 1 AND delete(|)",
+        "SELECT * FROM t GROUP BY delete(|)",
+        "SELECT * FROM t HAVING delete(|) > 0",
+        "SELECT * FROM t ORDER BY delete(|)",
+        "SELECT a + merge(|) FROM t",
+        "SELECT * FROM t GROUP BY merge(|)",
+        "SELECT * FROM t HAVING merge(|) > 0",
+        "SELECT * FROM t ORDER BY merge(|)",
+        "SELECT a + rename(|) FROM t",
+        "SELECT * FROM t WHERE a = rename(|)",
+        "SELECT * FROM t WHERE a = 1 AND rename(|)",
+        "SELECT * FROM t GROUP BY rename(|)",
+        "SELECT * FROM t HAVING rename(|) > 0",
+        "SELECT * FROM t ORDER BY rename(|)",
+        "SELECT a + join(|) FROM t",
+        "SELECT * FROM t WHERE a = join(|)",
+        "SELECT * FROM t WHERE a = 1 AND join(|)",
+        "SELECT * FROM t GROUP BY join(|)",
+        "SELECT * FROM t HAVING join(|) > 0",
+        "SELECT * FROM t ORDER BY join(|)",
+        "SELECT a + apply(|) FROM t",
+        "SELECT * FROM t WHERE a = apply(|)",
+        "SELECT * FROM t WHERE a = 1 AND apply(|)",
+        "SELECT * FROM t GROUP BY apply(|)",
+        "SELECT * FROM t HAVING apply(|) > 0",
+        "SELECT * FROM t ORDER BY apply(|)",
+        "SELECT a + values(|) FROM t",
+        "SELECT * FROM t GROUP BY values(|)",
+        "SELECT * FROM t HAVING values(|) > 0",
+        "SELECT * FROM t ORDER BY values(|)",
+        "SELECT a + model(|) FROM t",
+        "SELECT * FROM t GROUP BY model(|)",
+        "SELECT * FROM t HAVING model(|) > 0",
+        "SELECT * FROM t ORDER BY model(|)",
     ] {
         let ctx = analyze_inline_cursor_sql(sql);
         assert_ne!(
@@ -2450,12 +2546,19 @@ fn table_clause_construct_keywords_do_not_hijack_expression_calls() {
             intellisense_context::SqlPhase::MergeTarget,
             "expression call was misclassified as a MERGE statement target at `{sql}`"
         );
+        assert_ne!(
+            ctx.phase,
+            intellisense_context::SqlPhase::SelectIntoTarget,
+            "expression call was misclassified as a SELECT INTO target at `{sql}`"
+        );
 
         let (kind, keywords, suggestions) = audit_final_suggestions_for(sql, Oracle);
-        assert!(
-            contains(&suggestions, "A") && contains(&suggestions, "B"),
-            "expression-call argument should keep source columns at `{sql}`: kind={kind:?} keywords={keywords:?} final={suggestions:?}"
-        );
+        if !sql.contains("replace(") {
+            assert!(
+                contains(&suggestions, "A") && contains(&suggestions, "B"),
+                "expression-call argument should keep source columns at `{sql}`: kind={kind:?} keywords={keywords:?} final={suggestions:?}"
+            );
+        }
         for leaked in [
             "SUM()",
             "COUNT()",
@@ -2469,6 +2572,115 @@ fn table_clause_construct_keywords_do_not_hijack_expression_calls() {
             assert!(
                 !contains(&suggestions, leaked),
                 "{leaked} leaked from table-clause grammar into expression call at `{sql}`: kind={kind:?} keywords={keywords:?} final={suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn clause_keyword_expression_calls_preserve_enclosing_select_list_phase() {
+    for sql in [
+        "SELECT where(|) FROM t",
+        "SELECT group(|) FROM t",
+        "SELECT having(|) FROM t",
+        "SELECT order(|) FROM t",
+        "SELECT connect(|) FROM t",
+        "SELECT start(|) FROM t",
+        "SELECT qualify(|) FROM t",
+        "SELECT limit(|) FROM t",
+        "SELECT offset(|) FROM t",
+        "SELECT fetch(|) FROM t",
+        "SELECT window(|) FROM t",
+        "SELECT union(|) FROM t",
+        "SELECT intersect(|) FROM t",
+        "SELECT minus(|) FROM t",
+        "SELECT except(|) FROM t",
+        "SELECT a + where(|) FROM t",
+        "SELECT a * group(|) FROM t",
+        "SELECT CASE WHEN a = 1 THEN order(|) ELSE b END FROM t",
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        assert_eq!(
+            ctx.phase,
+            intellisense_context::SqlPhase::SelectList,
+            "clause keyword used as an expression call must preserve select-list phase at `{sql}`"
+        );
+        let (_kind, _keywords, suggestions) =
+            audit_final_suggestions_for(sql, crate::db::DatabaseType::Oracle);
+        if !sql.contains("union(")
+            && !sql.contains("intersect(")
+            && !sql.contains("minus(")
+            && !sql.contains("except(")
+        {
+            assert!(
+                suggestions.iter().any(|item| item == "A")
+                    && suggestions.iter().any(|item| item == "B"),
+                "clause keyword expression call should keep source columns at `{sql}`: {suggestions:?}"
+            );
+        }
+        for leaked in ["DEPT", "EMP", "EMP_V", "RUN_JOB", "SELECT", "WHERE", "ORDER BY"] {
+            assert!(
+                !suggestions.iter().any(|item| item == leaked),
+                "{leaked} leaked into clause keyword expression call at `{sql}`: {suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn dml_expression_calls_do_not_reenter_structural_keyword_phases() {
+    use crate::db::DatabaseType::Oracle;
+    use intellisense_context::SqlPhase;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for (sql, expected_phase) in [
+        ("UPDATE emp SET a = set(|)", SqlPhase::SetClause),
+        ("UPDATE emp SET a = into(|)", SqlPhase::SetClause),
+        ("UPDATE emp SET a = using(|)", SqlPhase::SetClause),
+        ("UPDATE emp SET a = values(|)", SqlPhase::SetClause),
+        ("UPDATE emp SET a = returning(|)", SqlPhase::SetClause),
+        ("UPDATE emp SET a = 1 RETURNING into(|)", SqlPhase::DmlReturningList),
+        ("UPDATE emp SET a = 1 WHERE b = returning(|)", SqlPhase::WhereClause),
+        ("DELETE FROM emp WHERE a = using(|)", SqlPhase::WhereClause),
+        ("DELETE FROM emp WHERE a = into(|)", SqlPhase::WhereClause),
+        ("DELETE FROM emp WHERE a = returning(|)", SqlPhase::WhereClause),
+        (
+            "MERGE INTO emp e USING dept d ON (e.empno = using(|))",
+            SqlPhase::JoinCondition,
+        ),
+        (
+            "MERGE INTO emp e USING dept d ON (e.empno = into(|))",
+            SqlPhase::JoinCondition,
+        ),
+        (
+            "INSERT INTO emp (a) VALUES (returning(|))",
+            SqlPhase::ValuesClause,
+        ),
+        ("INSERT INTO emp (a) VALUES (into(|))", SqlPhase::ValuesClause),
+        ("INSERT INTO emp (a) VALUES (using(|))", SqlPhase::ValuesClause),
+        (
+            "UPDATE emp SET a = 1 RETURNING returning(|)",
+            SqlPhase::DmlReturningList,
+        ),
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        assert_eq!(
+            ctx.phase, expected_phase,
+            "DML expression call should not be reclassified as structural keyword phase at `{sql}`"
+        );
+
+        let (kind, keywords, suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert!(
+            contains(&suggestions, "EMPNO")
+                && contains(&suggestions, "ENAME")
+                && contains(&suggestions, "SAL"),
+            "DML expression call should keep target/source columns at `{sql}`: kind={kind:?} keywords={keywords:?} final={suggestions:?}"
+        );
+        for leaked in ["DEPT", "EMP", "EMP_V", "RUN_JOB", "VALUES", "WHERE"] {
+            assert!(
+                !contains(&suggestions, leaked),
+                "{leaked} leaked into DML expression call at `{sql}`: kind={kind:?} keywords={keywords:?} final={suggestions:?}"
             );
         }
     }

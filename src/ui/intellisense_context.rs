@@ -1462,6 +1462,7 @@ fn is_statement_keyword_suppressed_in_expression_phase(phase: SqlPhase) -> bool 
             | SqlPhase::StartWithClause
             | SqlPhase::MatchRecognizeClause
             | SqlPhase::ValuesClause
+            | SqlPhase::DmlReturningList
             | SqlPhase::PivotClause
             | SqlPhase::ModelClause
             | SqlPhase::SetClause
@@ -2394,6 +2395,12 @@ fn phase_on_open_paren(
     if matches!(current_phase, SqlPhase::JoinCondition)
         && previous_word_chain_matches(tokens, open_paren_idx, &["USING"])
     {
+        if prev_non_comment_token(tokens, open_paren_idx).is_some_and(|(token, idx)| {
+            matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("USING"))
+                && is_keyword_function_call_start(tokens, idx)
+        }) {
+            return None;
+        }
         return Some(SqlPhase::JoinUsingColumnList);
     }
 
@@ -2627,6 +2634,18 @@ fn transition_on_into_keyword(
     current_statement_kind: StatementKind,
     in_returning_clause: bool,
 ) -> Option<(SqlPhase, Expectation)> {
+    let next_is_call_open = matches!(
+        tokens.get(skip_comment_tokens(tokens, idx.saturating_add(1))),
+        Some(SqlToken::Symbol(sym)) if sym == "("
+    );
+    if next_is_call_open
+        && is_keyword_function_call_start(tokens, idx)
+        && is_statement_keyword_suppressed_in_expression_phase(current_phase)
+        && !is_multi_table_insert_into_target_context(tokens, idx, current_statement_kind)
+    {
+        return None;
+    }
+
     let is_log_errors_target = matches!(
         current_statement_kind,
         StatementKind::Insert
@@ -2673,18 +2692,39 @@ fn transition_on_into_keyword(
         return Some((SqlPhase::IntoClause, Expectation::Table));
     }
 
-    if matches!(current_phase, SqlPhase::SelectList) {
+    if matches!(current_phase, SqlPhase::SelectList) && !next_is_call_open {
         return Some((SqlPhase::SelectIntoTarget, Expectation::Variable));
     }
 
     None
 }
 
+fn is_multi_table_insert_into_target_context(
+    tokens: &[SqlToken],
+    into_idx: usize,
+    statement_kind: StatementKind,
+) -> bool {
+    matches!(statement_kind, StatementKind::Insert)
+        && prev_word_upper(tokens, into_idx)
+            .is_some_and(|(prev, _)| matches!(prev.as_str(), "ALL" | "FIRST" | "THEN" | "ELSE"))
+}
+
 fn transition_on_using_keyword(
+    tokens: &[SqlToken],
+    idx: usize,
     current_phase: SqlPhase,
     current_statement_kind: StatementKind,
     open_cursor_active: bool,
 ) -> Option<(SqlPhase, Expectation)> {
+    if matches!(
+        tokens.get(skip_comment_tokens(tokens, idx.saturating_add(1))),
+        Some(SqlToken::Symbol(sym)) if sym == "("
+    ) && is_keyword_function_call_start(tokens, idx)
+        && is_statement_keyword_suppressed_in_expression_phase(current_phase)
+    {
+        return None;
+    }
+
     if matches!(current_statement_kind, StatementKind::ExecuteImmediate) {
         return Some((SqlPhase::UsingBindList, Expectation::BindValue));
     }
@@ -3641,6 +3681,10 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         relation_state.clear();
                     }
                     "FROM" => {
+                        let next_is_call_open = matches!(
+                            tokens.get(skip_comment_tokens(tokens, idx.saturating_add(1))),
+                            Some(SqlToken::Symbol(sym)) if sym == "("
+                        );
                         let from_belongs_to_distinct_predicate =
                             is_distinct_from_operator(tokens, idx)
                                 && current_phase.is_column_context();
@@ -3656,6 +3700,15 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             if let Some(frame) = depth_frames.get_mut(depth) {
                                 frame.function_from_state.consume();
                             }
+                        } else if next_is_call_open
+                            && keyword_call_should_preserve_expression_phase(
+                                tokens,
+                                idx,
+                                cursor_token_len,
+                                current_phase,
+                            )
+                        {
+                            relation_state.clear();
                         } else if from_belongs_to_distinct_predicate {
                             relation_state.clear();
                         } else {
@@ -3741,6 +3794,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             .map(|frame| frame.open_cursor_active)
                             .unwrap_or(false);
                         if let Some((phase, expectation)) = transition_on_using_keyword(
+                            tokens,
+                            idx,
                             current_phase,
                             current_statement_kind,
                             open_cursor_active,
@@ -3840,15 +3895,31 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         }
                     }
                     "JOIN" | "APPLY" => {
-                        if upper == "APPLY" {
-                            relation_modifier_state.mark_lateral_like();
+                        if keyword_call_should_preserve_expression_phase(
+                            tokens,
+                            idx,
+                            cursor_token_len,
+                            current_phase,
+                        ) {
+                            relation_state.clear();
+                        } else {
+                            if upper == "APPLY" {
+                                relation_modifier_state.mark_lateral_like();
+                            }
+                            depth_frames[depth].phase = SqlPhase::FromClause;
+                            depth_frames[depth].join_using_tables.clear();
+                            relation_state.expect_table();
                         }
-                        depth_frames[depth].phase = SqlPhase::FromClause;
-                        depth_frames[depth].join_using_tables.clear();
-                        relation_state.expect_table();
                     }
                     "STRAIGHT_JOIN" => {
-                        if matches!(current_phase, SqlPhase::FromClause) {
+                        if keyword_call_should_preserve_expression_phase(
+                            tokens,
+                            idx,
+                            cursor_token_len,
+                            current_phase,
+                        ) {
+                            relation_state.clear();
+                        } else if matches!(current_phase, SqlPhase::FromClause) {
                             depth_frames[depth].phase = SqlPhase::FromClause;
                             depth_frames[depth].join_using_tables.clear();
                             relation_state.expect_table();
@@ -3866,11 +3937,24 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         }
                     }
                     "WHERE" => {
-                        depth_frames[depth].phase = SqlPhase::WhereClause;
+                        if !keyword_call_should_preserve_expression_phase(
+                            tokens,
+                            idx,
+                            cursor_token_len,
+                            current_phase,
+                        ) {
+                            depth_frames[depth].phase = SqlPhase::WhereClause;
+                        }
                         relation_state.clear();
                     }
                     "GROUP" => {
-                        if !is_within_group_keyword(tokens, idx) {
+                        if !keyword_call_should_preserve_expression_phase(
+                            tokens,
+                            idx,
+                            cursor_token_len,
+                            current_phase,
+                        ) && !is_within_group_keyword(tokens, idx)
+                        {
                             if let Some((next_keyword, next_idx)) = next_word_upper(tokens, idx + 1)
                             {
                                 if next_keyword == "BY" {
@@ -3882,13 +3966,29 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         relation_state.clear();
                     }
                     "HAVING" => {
-                        depth_frames[depth].phase = SqlPhase::HavingClause;
+                        if !keyword_call_should_preserve_expression_phase(
+                            tokens,
+                            idx,
+                            cursor_token_len,
+                            current_phase,
+                        ) {
+                            depth_frames[depth].phase = SqlPhase::HavingClause;
+                        }
                         relation_state.clear();
                     }
                     "ORDER" => {
-                        if let Some(by_idx) = find_order_by_keyword(tokens, idx + 1) {
-                            depth_frames[depth].phase = SqlPhase::OrderByClause;
-                            idx = by_idx; // skip BY (and any interleaved comments)
+                        let preserve_expression_phase =
+                            keyword_call_should_preserve_expression_phase(
+                                tokens,
+                                idx,
+                                cursor_token_len,
+                                current_phase,
+                            );
+                        if !preserve_expression_phase {
+                            if let Some(by_idx) = find_order_by_keyword(tokens, idx + 1) {
+                                depth_frames[depth].phase = SqlPhase::OrderByClause;
+                                idx = by_idx; // skip BY (and any interleaved comments)
+                            }
                         }
                         relation_state.clear();
                     }
@@ -3897,7 +3997,14 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             .get(depth)
                             .map(|frame| frame.statement_kind)
                             .unwrap_or(StatementKind::Unknown);
-                        if matches!(current_statement_kind, StatementKind::OpenCursor) {
+                        if keyword_call_should_preserve_expression_phase(
+                            tokens,
+                            idx,
+                            cursor_token_len,
+                            current_phase,
+                        ) {
+                            relation_state.clear();
+                        } else if matches!(current_statement_kind, StatementKind::OpenCursor) {
                             depth_frames[depth].open_cursor_active = true;
                         } else if is_locking_for_clause(tokens, idx + 1) {
                             depth_frames[depth].locking_clause_active = true;
@@ -3969,22 +4076,50 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     }
                     "WINDOW" => {
                         // Treat SQL-standard WINDOW clause expressions as column context.
-                        depth_frames[depth].phase = SqlPhase::OrderByClause;
+                        if !keyword_call_should_preserve_expression_phase(
+                            tokens,
+                            idx,
+                            cursor_token_len,
+                            current_phase,
+                        ) {
+                            depth_frames[depth].phase = SqlPhase::OrderByClause;
+                        }
                         relation_state.clear();
                     }
                     "QUALIFY" => {
                         // QUALIFY filters rows using analytic expressions, similar to WHERE.
-                        depth_frames[depth].phase = SqlPhase::WhereClause;
+                        if !keyword_call_should_preserve_expression_phase(
+                            tokens,
+                            idx,
+                            cursor_token_len,
+                            current_phase,
+                        ) {
+                            depth_frames[depth].phase = SqlPhase::WhereClause;
+                        }
                         relation_state.clear();
                     }
                     "LIMIT" | "OFFSET" => {
                         // Pagination clauses are post-FROM boundaries; they must not keep
                         // relation-target parsing active even when ORDER BY is omitted.
-                        depth_frames[depth].phase = SqlPhase::OrderByClause;
+                        if !keyword_call_should_preserve_expression_phase(
+                            tokens,
+                            idx,
+                            cursor_token_len,
+                            current_phase,
+                        ) {
+                            depth_frames[depth].phase = SqlPhase::OrderByClause;
+                        }
                         relation_state.clear();
                     }
                     "FETCH" => {
-                        if let Some((phase, statement_kind, expectation)) =
+                        if keyword_call_should_preserve_expression_phase(
+                            tokens,
+                            idx,
+                            cursor_token_len,
+                            current_phase,
+                        ) {
+                            relation_state.clear();
+                        } else if let Some((phase, statement_kind, expectation)) =
                             transition_on_fetch_keyword(tokens, idx, current_phase)
                         {
                             depth_frames[depth].phase = phase;
@@ -4020,12 +4155,21 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         let merge_update_set_introducer =
                             matches!(current_statement_kind, StatementKind::Merge)
                                 && matches!(last_word.as_deref(), Some("UPDATE"));
-                        let keep_expression_phase_for_set =
-                            is_statement_keyword_suppressed_in_expression_phase(current_phase)
-                                && !postgres_conflict_update_active
-                                && !matches!(current_statement_kind, StatementKind::Update)
-                                && !merge_update_set_introducer;
-                        if hierarchical_clause_active {
+                        let preserve_expression_phase =
+                            keyword_call_should_preserve_expression_phase(
+                                tokens,
+                                idx,
+                                cursor_token_len,
+                                current_phase,
+                            );
+                        let keep_expression_phase_for_set = (preserve_expression_phase
+                            || is_statement_keyword_suppressed_in_expression_phase(current_phase))
+                            && !postgres_conflict_update_active
+                            && !matches!(current_statement_kind, StatementKind::Update)
+                            && !merge_update_set_introducer;
+                        if preserve_expression_phase {
+                            relation_state.clear();
+                        } else if hierarchical_clause_active {
                             // Oracle hierarchical query SEARCH/CYCLE clauses use
                             // `... SET <ordering_or_cycle_col>` where SET introduces
                             // a generated output column name rather than a column
@@ -4108,7 +4252,14 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 | StatementKind::Merge
                         );
 
-                        if is_dml_returning_context {
+                        if keyword_call_should_preserve_expression_phase(
+                            tokens,
+                            idx,
+                            cursor_token_len,
+                            current_phase,
+                        ) {
+                            relation_state.clear();
+                        } else if is_dml_returning_context {
                             // DML RETURNING lists target columns/expressions.
                             depth_frames[depth].phase = SqlPhase::DmlReturningList;
                             depth_frames[depth].returning_clause_active = true;
@@ -4288,19 +4439,39 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         relation_state.clear();
                     }
                     "CONNECT" => {
-                        if let Some((next_keyword, next_idx)) = next_word_upper(tokens, idx + 1) {
-                            if next_keyword == "BY" {
-                                depth_frames[depth].phase = SqlPhase::ConnectByClause;
-                                idx = next_idx;
+                        let preserve_expression_phase =
+                            keyword_call_should_preserve_expression_phase(
+                                tokens,
+                                idx,
+                                cursor_token_len,
+                                current_phase,
+                            );
+                        if !preserve_expression_phase {
+                            if let Some((next_keyword, next_idx)) = next_word_upper(tokens, idx + 1)
+                            {
+                                if next_keyword == "BY" {
+                                    depth_frames[depth].phase = SqlPhase::ConnectByClause;
+                                    idx = next_idx;
+                                }
                             }
                         }
                         relation_state.clear();
                     }
                     "START" => {
-                        if let Some((next_keyword, next_idx)) = next_word_upper(tokens, idx + 1) {
-                            if next_keyword == "WITH" {
-                                depth_frames[depth].phase = SqlPhase::StartWithClause;
-                                idx = next_idx;
+                        let preserve_expression_phase =
+                            keyword_call_should_preserve_expression_phase(
+                                tokens,
+                                idx,
+                                cursor_token_len,
+                                current_phase,
+                            );
+                        if !preserve_expression_phase {
+                            if let Some((next_keyword, next_idx)) = next_word_upper(tokens, idx + 1)
+                            {
+                                if next_keyword == "WITH" {
+                                    depth_frames[depth].phase = SqlPhase::StartWithClause;
+                                    idx = next_idx;
+                                }
                             }
                         }
                         relation_state.clear();
@@ -4345,7 +4516,13 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         relation_state.clear();
                     }
                     "UNION" | "INTERSECT" | "EXCEPT" | "MINUS" => {
-                        if is_multiset_set_operator(tokens, idx) {
+                        if keyword_call_should_preserve_expression_phase(
+                            tokens,
+                            idx,
+                            cursor_token_len,
+                            current_phase,
+                        ) || is_multiset_set_operator(tokens, idx)
+                        {
                             relation_state.clear();
                         } else {
                             depth_frames[depth].phase = SqlPhase::Initial;
@@ -6501,6 +6678,66 @@ fn model_clause_can_start(tokens: &[SqlToken], idx: usize, phase: SqlPhase) -> b
         SqlToken::String(_) => true,
         SqlToken::Symbol(sym) => sym == ")",
         SqlToken::Comment(_) => false,
+    }
+}
+
+fn is_keyword_function_call_start(tokens: &[SqlToken], idx: usize) -> bool {
+    match prev_non_comment_token(tokens, idx) {
+        Some((SqlToken::Word(word), _)) => matches!(
+            word.to_ascii_uppercase().as_str(),
+            "SELECT"
+                | "DISTINCT"
+                | "ALL"
+                | "AS"
+                | "THEN"
+                | "ELSE"
+                | "WHEN"
+                | "AND"
+                | "OR"
+                | "NOT"
+                | "ON"
+                | "WHERE"
+                | "BY"
+                | "HAVING"
+                | "RETURNING"
+                | "VALUES"
+                | "SET"
+        ),
+        Some((SqlToken::Symbol(sym), prev_idx)) => match sym.as_str() {
+            "*" => !is_projection_wildcard_star(tokens, prev_idx),
+            "," | "(" | "[" | "=" | "+" | "-" | "/" | "%" | "||" | "<" | ">" | "<=" | ">="
+            | "<>" | "!=" => true,
+            _ => false,
+        },
+        None => true,
+        _ => false,
+    }
+}
+
+fn keyword_call_should_preserve_expression_phase(
+    tokens: &[SqlToken],
+    idx: usize,
+    cursor_token_len: usize,
+    phase: SqlPhase,
+) -> bool {
+    idx < cursor_token_len
+        && matches!(
+            tokens.get(skip_comment_tokens(tokens, idx.saturating_add(1))),
+            Some(SqlToken::Symbol(sym)) if sym == "("
+        )
+        && is_keyword_function_call_start(tokens, idx)
+        && is_statement_keyword_suppressed_in_expression_phase(phase)
+}
+
+fn is_projection_wildcard_star(tokens: &[SqlToken], star_idx: usize) -> bool {
+    match prev_non_comment_token(tokens, star_idx) {
+        Some((SqlToken::Word(word), _)) => matches!(
+            word.to_ascii_uppercase().as_str(),
+            "SELECT" | "DISTINCT" | "ALL"
+        ),
+        Some((SqlToken::Symbol(sym), _)) => matches!(sym.as_str(), "," | "."),
+        None => true,
+        _ => false,
     }
 }
 
