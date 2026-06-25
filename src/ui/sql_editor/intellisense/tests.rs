@@ -207,7 +207,11 @@ fn join_clause_completion_is_scoped_to_joined_tables() {
     ] {
         let ctx = analyze_inline_cursor_sql(sql);
         assert!(
-            SqlEditorWidget::cursor_is_after_complete_join_target_for_context(&ctx, false),
+            SqlEditorWidget::cursor_is_after_complete_join_target_for_context_for_db(
+                &ctx,
+                false,
+                Some(crate::db::DatabaseType::Oracle),
+            ),
             "complete target for `{sql}`"
         );
         let kw = SqlEditorWidget::collect_expected_keyword_suggestions(
@@ -23844,6 +23848,31 @@ fn outer_join_continuation_offers_join_keyword() {
     assert!(!candidates("SELECT * FROM a INNER |")
         .iter()
         .any(|v| v == "OUTER"));
+
+    let mysql_candidates = |sql: &str| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &analyze_inline_cursor_sql(sql),
+            Some(crate::db::DatabaseType::MySQL),
+        )
+    };
+    for (sql, leaked) in [
+        ("SELECT * FROM a FULL |", "OUTER"),
+        ("SELECT * FROM a FULL |", "JOIN"),
+        ("SELECT * FROM a FULL OUTER |", "JOIN"),
+    ] {
+        let got = mysql_candidates(sql);
+        assert!(
+            !got.iter().any(|value| value == leaked),
+            "{leaked} leaked from unsupported MySQL FULL join continuation at `{sql}`: {got:?}"
+        );
+    }
+    assert!(mysql_candidates("SELECT * FROM a LEFT |")
+        .iter()
+        .any(|v| v == "OUTER"));
+    assert!(mysql_candidates("SELECT * FROM a RIGHT OUTER |")
+        .iter()
+        .any(|v| v == "JOIN"));
 }
 
 #[test]
@@ -24379,9 +24408,10 @@ fn dml_target_continuation_offers_structural_keyword_and_suppresses_relations() 
 #[test]
 fn join_target_continuation_offers_on_using_and_suppresses_relations() {
     let det = |sql: &str| {
-        SqlEditorWidget::cursor_is_after_complete_join_target_for_context(
+        SqlEditorWidget::cursor_is_after_complete_join_target_for_context_for_db(
             &analyze_inline_cursor_sql(sql),
             false,
+            Some(crate::db::DatabaseType::Oracle),
         )
     };
     let kw = |sql: &str| {
@@ -24420,6 +24450,42 @@ fn join_target_continuation_offers_on_using_and_suppresses_relations() {
     assert!(!det("SELECT * FROM a, b |"));
     // A bare join-type word routes through the join-continuation family instead.
     assert!(!det("SELECT * FROM a LEFT |"));
+
+    let kw_for = |sql: &str, db: crate::db::DatabaseType| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &analyze_inline_cursor_sql(sql),
+            Some(db),
+        )
+    };
+    let has = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+    let mysql_straight = kw_for(
+        "SELECT * FROM a STRAIGHT_JOIN b |",
+        crate::db::DatabaseType::MySQL,
+    );
+    assert!(
+        has(&mysql_straight, "ON") && has(&mysql_straight, "USING"),
+        "MySQL STRAIGHT_JOIN target should offer ON/USING: {mysql_straight:?}"
+    );
+    for (db, sql) in [
+        (
+            crate::db::DatabaseType::Oracle,
+            "SELECT * FROM a STRAIGHT_JOIN b |",
+        ),
+        (crate::db::DatabaseType::MySQL, "SELECT * FROM a FULL JOIN b |"),
+        (
+            crate::db::DatabaseType::MySQL,
+            "SELECT * FROM a FULL OUTER JOIN b |",
+        ),
+    ] {
+        let got = kw_for(sql, db);
+        for leaked in ["ON", "USING"] {
+            assert!(
+                !has(&got, leaked),
+                "{leaked} leaked into unsupported join target at `{sql}` {db:?}: {got:?}"
+            );
+        }
+    }
 }
 
 #[test]

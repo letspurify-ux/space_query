@@ -14343,9 +14343,10 @@ impl SqlEditorWidget {
                 exclude_current_identifier_chain,
                 db_type,
             )
-            || Self::cursor_is_after_complete_join_target_for_context(
+            || Self::cursor_is_after_complete_join_target_for_context_for_db(
                 deep_ctx,
                 exclude_current_identifier_chain,
+                db_type,
             )
             || Self::cursor_is_at_table_alias_name_slot(deep_ctx, exclude_current_identifier_chain)
             || Self::cursor_is_at_merge_then_action_slot_for_context(
@@ -15564,12 +15565,14 @@ impl SqlEditorWidget {
         tokens: &[SqlToken],
         end: usize,
         phase: intellisense_context::SqlPhase,
+        db_type: Option<crate::db::DatabaseType>,
     ) -> Option<&'static [&'static str]> {
         use intellisense_context::SqlPhase;
 
         if !matches!(phase, SqlPhase::FromClause) {
             return None;
         }
+        let mysql = crate::sql_text::mysql_compatibility_for_sql("", db_type);
         let is_join_keyword = |word: &str| {
             matches!(
                 word.to_ascii_uppercase().as_str(),
@@ -15583,7 +15586,7 @@ impl SqlEditorWidget {
                     | "FULL"
                     | "CROSS"
                     | "NATURAL"
-            )
+            ) || (mysql && word.eq_ignore_ascii_case("STRAIGHT_JOIN"))
         };
 
         let toks = Self::meaningful_tokens_before(tokens, end);
@@ -15613,7 +15616,12 @@ impl SqlEditorWidget {
                 {
                     return None;
                 }
-                SqlToken::Word(word) if word.eq_ignore_ascii_case("JOIN") => break idx,
+                SqlToken::Word(word)
+                    if word.eq_ignore_ascii_case("JOIN")
+                        || (mysql && word.eq_ignore_ascii_case("STRAIGHT_JOIN")) =>
+                {
+                    break idx
+                }
                 // An `ON`/`USING` between the cursor and the `JOIN` means a join
                 // condition is already complete (`JOIN t ON (a=b) |`), so this is the
                 // post-condition position, not a bare-target slot.
@@ -15662,7 +15670,12 @@ impl SqlEditorWidget {
                     if matches!(
                         word.to_ascii_uppercase().as_str(),
                         "LEFT" | "RIGHT" | "FULL" | "INNER" | "OUTER"
-                    ) => {}
+                    ) =>
+                {
+                    if mysql && word.eq_ignore_ascii_case("FULL") {
+                        return None;
+                    }
+                }
                 SqlToken::Word(word)
                     if matches!(word.to_ascii_uppercase().as_str(), "CROSS" | "NATURAL") =>
                 {
@@ -15679,9 +15692,10 @@ impl SqlEditorWidget {
     /// [`Self::expected_join_target_keyword_candidates`]). The position expects a
     /// join condition keyword, never another relation, so the identifier list is
     /// suppressed there.
-    fn cursor_is_after_complete_join_target_for_context(
+    fn cursor_is_after_complete_join_target_for_context_for_db(
         deep_ctx: &intellisense_context::CursorContext,
         exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
     ) -> bool {
         let tokens = Self::current_query_tokens(deep_ctx);
         let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
@@ -15690,7 +15704,8 @@ impl SqlEditorWidget {
             cursor_token_len,
             exclude_current_identifier_chain,
         );
-        Self::expected_join_target_keyword_candidates(tokens, end, deep_ctx.phase).is_some()
+        Self::expected_join_target_keyword_candidates(tokens, end, deep_ctx.phase, db_type)
+            .is_some()
     }
 
     /// True when the cursor sits right after a *complete* relation reference in a
@@ -32803,13 +32818,19 @@ impl SqlEditorWidget {
         }
 
         let join_target_candidates =
-            Self::expected_join_target_keyword_candidates(tokens, context_end, deep_ctx.phase)
+            Self::expected_join_target_keyword_candidates(
+                tokens,
+                context_end,
+                deep_ctx.phase,
+                db_type,
+            )
                 .or_else(|| {
                     (!prefix.is_empty()).then(|| {
                         Self::expected_join_target_keyword_candidates(
                             tokens,
                             context_end,
                             intellisense_context::SqlPhase::FromClause,
+                            db_type,
                         )
                     })?
                 });
@@ -33104,9 +33125,11 @@ impl SqlEditorWidget {
             }
             // `LEFT`/`RIGHT`/`FULL` may be followed by the optional `OUTER`
             // before `JOIN`, so both continuations are offered; `INNER`/`CROSS`/
-            // `NATURAL` take only `JOIN`.
+            // `NATURAL` take only `JOIN`. MySQL/MariaDB have no FULL join form.
             [.., last]
-                if in_table_context && matches!(last.as_str(), "LEFT" | "RIGHT" | "FULL") =>
+                if in_table_context
+                    && matches!(last.as_str(), "LEFT" | "RIGHT")
+                        || (in_table_context && !mysql && *last == "FULL") =>
             {
                 &["OUTER", "JOIN"]
             }
@@ -33119,7 +33142,8 @@ impl SqlEditorWidget {
             [.., prev, last]
                 if in_table_context
                     && *last == "OUTER"
-                    && matches!(prev.as_str(), "LEFT" | "RIGHT" | "FULL") =>
+                    && (matches!(prev.as_str(), "LEFT" | "RIGHT")
+                        || (!mysql && *prev == "FULL")) =>
             {
                 &["JOIN"]
             }
