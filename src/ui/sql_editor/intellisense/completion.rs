@@ -1953,6 +1953,8 @@ impl SqlEditorWidget {
                 has_prefix,
                 Some(snapshot.preferred_db_type),
             );
+        let at_table_alias_name_slot = qualifier.is_none()
+            && Self::cursor_is_at_table_alias_name_slot(deep_ctx, has_prefix);
         // The cursor may sit in a slot whose grammar is keyword/value-only — a
         // data type, a row-limiting argument, a pure window-frame keyword, an
         // EXTRACT field, an INTERVAL unit, or a punctuation-only operator opener
@@ -2205,7 +2207,7 @@ impl SqlEditorWidget {
                 deep_ctx,
                 Some(snapshot.preferred_db_type),
             );
-        let expected_keyword_suggestions = if source_allowance.expected_keyword_suggestions
+        let mut expected_keyword_suggestions = if source_allowance.expected_keyword_suggestions
             || allow_dml_returning_into_keyword
             || at_data_type_position
         {
@@ -2218,6 +2220,9 @@ impl SqlEditorWidget {
         } else {
             Vec::new()
         };
+        if at_table_alias_name_slot {
+            expected_keyword_suggestions.retain(|keyword| keyword.eq_ignore_ascii_case("OF"));
+        }
         let expected_object_suggestions = if source_allowance.expected_object_suggestions {
             let mut data = intellisense_data
                 .lock()
@@ -15894,8 +15899,16 @@ impl SqlEditorWidget {
 
         let words = Self::previous_meaningful_words_upper(tokens, end, 6);
         match words.as_slice() {
-            [.., last] if last == "AS" => Some(&["OF"]),
-            [.., prev, last] if prev == "AS" && last == "OF" => Some(&["SCN", "TIMESTAMP"]),
+            [.., last] if last == "AS" && Self::flashback_as_of_anchor_is_relation(tokens, end) => {
+                Some(&["OF"])
+            }
+            [.., prev, last]
+                if prev == "AS"
+                    && last == "OF"
+                    && Self::flashback_as_of_anchor_is_relation(tokens, end) =>
+            {
+                Some(&["SCN", "TIMESTAMP"])
+            }
             [.., last] if last == "VERSIONS" => Some(&["BETWEEN"]),
             [.., prev, last] if prev == "VERSIONS" && last == "BETWEEN" => {
                 Some(&["SCN", "TIMESTAMP"])
@@ -15910,6 +15923,37 @@ impl SqlEditorWidget {
             }
             _ => None,
         }
+    }
+
+    fn flashback_as_of_anchor_is_relation(tokens: &[SqlToken], end: usize) -> bool {
+        let Some((last_idx, SqlToken::Word(last))) =
+            Self::previous_non_comment_token_index(tokens, end)
+                .and_then(|idx| tokens.get(idx).map(|token| (idx, token)))
+        else {
+            return false;
+        };
+
+        let as_idx = if last.eq_ignore_ascii_case("AS") {
+            last_idx
+        } else if last.eq_ignore_ascii_case("OF") {
+            let Some((as_idx, SqlToken::Word(as_word))) =
+                Self::previous_non_comment_token_index(tokens, last_idx)
+                    .and_then(|idx| tokens.get(idx).map(|token| (idx, token)))
+            else {
+                return false;
+            };
+            if !as_word.eq_ignore_ascii_case("AS") {
+                return false;
+            }
+            as_idx
+        } else {
+            return false;
+        };
+
+        matches!(
+            Self::previous_non_comment_token_index(tokens, as_idx).and_then(|idx| tokens.get(idx)),
+            Some(SqlToken::Word(_))
+        )
     }
 
     /// Keyword slots of an Oracle `CREATE SEQUENCE [schema.]name <option>*` option

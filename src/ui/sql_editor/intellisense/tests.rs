@@ -2014,6 +2014,7 @@ fn audit_final_suggestions_for(
                 &ctx,
                 Some(db),
             ))
+        || (!has_qualifier && SqlEditorWidget::cursor_is_at_select_list_alias_name_slot(&ctx, has))
         || SqlEditorWidget::cursor_is_in_invalid_set_operation_branch_for_context(
             &ctx,
             trigger_has_identifier,
@@ -2047,6 +2048,8 @@ fn audit_final_suggestions_for(
             has,
             Some(db),
         ));
+    let at_table_alias_name_slot =
+        qualifier.is_none() && SqlEditorWidget::cursor_is_at_table_alias_name_slot(&ctx, has);
     let at_data_type =
         qualifier.is_none()
             && (SqlEditorWidget::data_type_position_for_context_for_db(&ctx, has, Some(db)).is_some()
@@ -2116,7 +2119,7 @@ fn audit_final_suggestions_for(
             &ctx,
             Some(db),
         );
-    let expected_keywords =
+    let mut expected_keywords =
         if source_allowance.expected_keyword_suggestions || allow_dml_returning_into_keyword || at_data_type {
         SqlEditorWidget::collect_expected_keyword_suggestions_with_expression_context(
             &prefix, &ctx, Some(db), Some(expr_keyword_ctx),
@@ -2124,6 +2127,9 @@ fn audit_final_suggestions_for(
     } else {
         Vec::new()
     };
+    if at_table_alias_name_slot {
+        expected_keywords.retain(|keyword| keyword.eq_ignore_ascii_case("OF"));
+    }
     if !expected_keywords.is_empty() {
         suggestions = SqlEditorWidget::merge_suggestions_with_context_aliases(
             suggestions, expected_keywords.clone(), true,
@@ -27550,6 +27556,137 @@ fn dml_statement_head_keywords_are_scoped_to_statement_heads() {
 }
 
 #[test]
+fn bare_statement_keyword_identifiers_do_not_offer_statement_tails() {
+    use crate::db::DatabaseType::Oracle;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "SELECT insert | FROM emp",
+            &[
+                "INTO",
+                "SET",
+                "TABLE",
+                "VIEW",
+                "MATERIALIZED",
+                "SESSION",
+                "SYSTEM",
+                "IMMEDIATE",
+                "INDEX",
+                "PROCEDURE",
+                "FUNCTION",
+                "PACKAGE",
+            ],
+        ),
+        ("SELECT update | FROM emp", &["INTO", "SET", "TABLE", "VIEW", "IMMEDIATE"]),
+        ("SELECT delete | FROM emp", &["INTO", "TABLE", "VIEW", "IMMEDIATE"]),
+        ("SELECT merge | FROM emp", &["INTO", "SET", "TABLE", "VIEW", "IMMEDIATE"]),
+        ("SELECT replace | FROM emp", &["INTO", "SET", "TABLE", "VIEW", "IMMEDIATE"]),
+        ("SELECT execute | FROM emp", &["IMMEDIATE", "INTO", "TABLE", "VIEW"]),
+        ("SELECT create | FROM emp", &["TABLE", "VIEW", "MATERIALIZED", "INDEX"]),
+        ("SELECT alter | FROM emp", &["TABLE", "SESSION", "SYSTEM", "INDEX"]),
+        ("SELECT drop | FROM emp", &["TABLE", "VIEW", "INDEX", "PACKAGE"]),
+        (
+            "SELECT * FROM emp WHERE flag = insert |",
+            &["INTO", "FROM", "SET", "TABLE", "VIEW", "IMMEDIATE"],
+        ),
+        (
+            "SELECT * FROM emp WHERE flag = update |",
+            &["INTO", "FROM", "SET", "TABLE", "VIEW", "IMMEDIATE"],
+        ),
+        (
+            "SELECT * FROM emp WHERE flag = delete |",
+            &["INTO", "FROM", "TABLE", "VIEW", "IMMEDIATE"],
+        ),
+        (
+            "SELECT * FROM emp WHERE flag = merge |",
+            &["INTO", "FROM", "SET", "TABLE", "VIEW", "IMMEDIATE"],
+        ),
+        (
+            "SELECT * FROM emp WHERE flag = replace |",
+            &["INTO", "FROM", "SET", "TABLE", "VIEW", "IMMEDIATE"],
+        ),
+        (
+            "SELECT * FROM emp WHERE flag = execute |",
+            &["IMMEDIATE", "INTO", "FROM", "TABLE", "VIEW"],
+        ),
+        (
+            "SELECT * FROM emp WHERE flag = create |",
+            &["FROM", "TABLE", "VIEW", "MATERIALIZED", "INDEX"],
+        ),
+        (
+            "SELECT * FROM emp WHERE flag = alter |",
+            &["FROM", "TABLE", "SESSION", "SYSTEM", "INDEX"],
+        ),
+        (
+            "SELECT * FROM emp WHERE flag = drop |",
+            &["FROM", "TABLE", "VIEW", "INDEX", "PACKAGE"],
+        ),
+    ];
+
+    for (sql, leaked_keywords) in cases {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        for leaked in *leaked_keywords {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked after a bare statement-keyword identifier at `{sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn mysql_bare_statement_keyword_identifiers_do_not_offer_statement_tails() {
+    use crate::db::DatabaseType::MySQL;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for (sql, leaked_keywords) in [
+        (
+            "SELECT insert | FROM emp",
+            vec!["INTO", "LOW_PRIORITY", "HIGH_PRIORITY", "IGNORE", "SET"],
+        ),
+        (
+            "SELECT replace | FROM emp",
+            vec!["INTO", "LOW_PRIORITY", "DELAYED", "SET"],
+        ),
+        (
+            "SELECT update | FROM emp",
+            vec!["LOW_PRIORITY", "IGNORE", "SET"],
+        ),
+        (
+            "SELECT delete | FROM emp",
+            vec!["LOW_PRIORITY", "QUICK", "IGNORE"],
+        ),
+        (
+            "SELECT * FROM emp WHERE flag = insert |",
+            vec!["INTO", "LOW_PRIORITY", "HIGH_PRIORITY", "IGNORE", "SET", "FROM"],
+        ),
+        (
+            "SELECT * FROM emp WHERE flag = replace |",
+            vec!["INTO", "LOW_PRIORITY", "DELAYED", "SET", "FROM"],
+        ),
+        (
+            "SELECT * FROM emp WHERE flag = update |",
+            vec!["LOW_PRIORITY", "IGNORE", "SET", "FROM"],
+        ),
+        (
+            "SELECT * FROM emp WHERE flag = delete |",
+            vec!["LOW_PRIORITY", "QUICK", "IGNORE", "FROM"],
+        ),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, MySQL);
+        for leaked in leaked_keywords {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked after a bare MySQL statement-keyword identifier at `{sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn mysql_dml_statement_head_keywords_are_dialect_scoped() {
     use crate::db::DatabaseType::{MySQL, Oracle};
 
@@ -28964,6 +29101,83 @@ fn table_alias_slot_after_as_suppresses_identifier_base() {
             !SqlEditorWidget::cursor_is_at_table_alias_name_slot(&ctx, has_prefix(sql)),
             "must not be a table-alias slot: {sql}"
         );
+    }
+}
+
+#[test]
+fn alias_name_slots_do_not_offer_catalog_or_expression_noise() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+    let assert_no_identifier_noise =
+        |sql: &str, db: crate::db::DatabaseType, final_suggestions: &[String]| {
+            for leaked in [
+                "EMP",
+                "DEPT",
+                "EMP_V",
+                "APP_USER",
+                "SCOTT",
+                "RUN_JOB",
+                "CALC_TOTAL",
+                "EMPNO",
+                "ENAME",
+                "SAL",
+                "*",
+                "SELECT",
+                "WHERE",
+            ] {
+                assert!(
+                    !contains(final_suggestions, leaked),
+                    "{leaked} leaked into alias-name slot at `{sql}` {db:?}: {final_suggestions:?}"
+                );
+            }
+        };
+
+    for (db, sql) in [
+        (Oracle, "SELECT col AS | FROM t"),
+        (Oracle, "SELECT col AS my| FROM t"),
+        (Oracle, "SELECT a, b AS | FROM t"),
+        (MySQL, "SELECT col AS | FROM t"),
+        (MySQL, "SELECT col AS my| FROM t"),
+        (MySQL, "SELECT a, b AS | FROM t"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert_eq!(
+            kind, None,
+            "select-list alias slot should not resolve an object kind at `{sql}`; keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            final_suggestions.is_empty(),
+            "select-list alias slot should not offer completions at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+        );
+    }
+
+    for (db, sql, allowed_keywords) in [
+        (Oracle, "SELECT * FROM emp AS |", &["OF"][..]),
+        (Oracle, "SELECT * FROM emp e JOIN dept AS |", &["OF"][..]),
+        (Oracle, "SELECT * FROM (SELECT 1 FROM dual) AS |", &[][..]),
+        (Oracle, "UPDATE emp AS |", &[][..]),
+        (Oracle, "DELETE FROM emp AS |", &[][..]),
+        (Oracle, "MERGE INTO emp AS |", &[][..]),
+        (MySQL, "SELECT * FROM emp AS |", &[][..]),
+        (MySQL, "SELECT * FROM emp e JOIN dept AS |", &[][..]),
+        (MySQL, "UPDATE emp AS |", &[][..]),
+        (MySQL, "DELETE FROM emp AS |", &[][..]),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert_eq!(
+            kind, None,
+            "table alias slot should not resolve an object kind at `{sql}`; keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert_no_identifier_noise(sql, db, &final_suggestions);
+        for suggestion in &final_suggestions {
+            assert!(
+                allowed_keywords
+                    .iter()
+                    .any(|allowed| suggestion.eq_ignore_ascii_case(allowed)),
+                "unexpected non-alias keyword `{suggestion}` at table alias slot `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
     }
 }
 
