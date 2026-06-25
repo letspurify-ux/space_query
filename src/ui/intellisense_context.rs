@@ -1469,6 +1469,10 @@ fn is_statement_keyword_suppressed_in_expression_phase(phase: SqlPhase) -> bool 
     )
 }
 
+fn statement_keyword_can_be_expression_token(phase: SqlPhase) -> bool {
+    phase.is_column_context() || matches!(phase, SqlPhase::ValuesClause)
+}
+
 fn find_order_by_keyword(tokens: &[SqlToken], start_idx: usize) -> Option<usize> {
     let (next_keyword, next_idx) = next_word_upper(tokens, start_idx)?;
     if next_keyword == "BY" {
@@ -2652,7 +2656,7 @@ fn transition_on_fetch_keyword(
         ));
     }
 
-    if current_phase.is_column_context() || matches!(current_phase, SqlPhase::ValuesClause) {
+    if statement_keyword_can_be_expression_token(current_phase) {
         return None;
     }
 
@@ -2784,7 +2788,7 @@ fn should_start_execute_immediate(
     idx: usize,
     current_phase: SqlPhase,
 ) -> bool {
-    if current_phase.is_column_context() || matches!(current_phase, SqlPhase::ValuesClause) {
+    if statement_keyword_can_be_expression_token(current_phase) {
         return false;
     }
 
@@ -3505,8 +3509,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             .get(depth)
                             .map(|frame| frame.statement_kind)
                             .unwrap_or(StatementKind::Unknown);
-                        let is_expression_context = current_phase.is_column_context()
-                            || matches!(current_phase, SqlPhase::ValuesClause);
+                        let is_expression_context =
+                            statement_keyword_can_be_expression_token(current_phase);
                         let is_merge_action_keyword = is_merge_action_context(
                             current_statement_kind,
                             current_phase,
@@ -3532,8 +3536,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         depth_frames[depth].returning_clause_active = false;
                         depth_frames[depth].current_target_table = None;
                         depth_frames[depth].postgres_conflict_update_active = false;
-                        let is_expression_context = current_phase.is_column_context()
-                            || matches!(current_phase, SqlPhase::ValuesClause);
+                        let is_expression_context =
+                            statement_keyword_can_be_expression_token(current_phase);
                         // `CREATE OR REPLACE VIEW/PROCEDURE/FUNCTION/TRIGGER ...` uses
                         // REPLACE as a DDL modifier, not as a DML statement.
                         let is_create_or_replace = matches!(last_word.as_deref(), Some("OR"));
@@ -3565,8 +3569,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         }
                         if !is_post_query_lock_modifier {
                             depth_frames[depth].locking_clause_active = false;
-                            let is_expression_context = current_phase.is_column_context()
-                                || matches!(current_phase, SqlPhase::ValuesClause);
+                            let is_expression_context =
+                                statement_keyword_can_be_expression_token(current_phase);
                             if is_expression_context {
                                 // Inside expressions, LOCK can be a valid identifier/token.
                                 relation_state.clear();
@@ -3580,8 +3584,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     }
                     "OPEN" => {
                         depth_frames[depth].postgres_conflict_update_active = false;
-                        let is_expression_context = current_phase.is_column_context()
-                            || matches!(current_phase, SqlPhase::ValuesClause);
+                        let is_expression_context =
+                            statement_keyword_can_be_expression_token(current_phase);
                         if is_expression_context {
                             relation_state.clear();
                         } else {
@@ -3673,8 +3677,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         relation_state.clear();
                     }
                     "CALL" => {
-                        let is_expression_context = current_phase.is_column_context()
-                            || matches!(current_phase, SqlPhase::ValuesClause);
+                        let is_expression_context =
+                            statement_keyword_can_be_expression_token(current_phase);
                         if is_expression_context {
                             relation_state.clear();
                         } else {
@@ -4312,8 +4316,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                     last_word.as_deref(),
                                     Some("IN") | Some("ROW") | Some("SHARE")
                                 );
-                        let is_expression_context = current_phase.is_column_context()
-                            || matches!(current_phase, SqlPhase::ValuesClause);
+                        let is_expression_context =
+                            statement_keyword_can_be_expression_token(current_phase);
                         let is_merge_action_keyword = is_merge_action_context(
                             current_statement_kind,
                             current_phase,
@@ -4392,8 +4396,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             .get(depth)
                             .map(|frame| frame.statement_kind)
                             .unwrap_or(StatementKind::Unknown);
-                        let is_expression_context = current_phase.is_column_context()
-                            || matches!(current_phase, SqlPhase::ValuesClause);
+                        let is_expression_context =
+                            statement_keyword_can_be_expression_token(current_phase);
                         let is_merge_action_keyword = is_merge_action_context(
                             current_statement_kind,
                             current_phase,
@@ -4433,8 +4437,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         depth_frames[depth].returning_clause_active = false;
                         depth_frames[depth].locking_clause_active = false;
                         depth_frames[depth].postgres_conflict_update_active = false;
-                        let is_expression_context = current_phase.is_column_context()
-                            || matches!(current_phase, SqlPhase::ValuesClause);
+                        let is_expression_context =
+                            statement_keyword_can_be_expression_token(current_phase);
                         if is_expression_context {
                             relation_state.clear();
                         } else {
@@ -4447,8 +4451,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     }
                     "RENAME" => {
                         depth_frames[depth].postgres_conflict_update_active = false;
-                        let is_expression_context = current_phase.is_column_context()
-                            || matches!(current_phase, SqlPhase::ValuesClause);
+                        let is_expression_context =
+                            statement_keyword_can_be_expression_token(current_phase);
                         if is_expression_context {
                             relation_state.clear();
                         } else {
@@ -4581,12 +4585,16 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             );
                         }
                     }
-                    kw if is_table_stop_keyword(kw) && relation_state.is_expect_table() => {
+                    kw if is_table_stop_keyword(kw)
+                        && relation_state.is_expect_table()
+                        && !table_source_construct_keyword_can_be_relation_name(kw) =>
+                    {
                         relation_state.clear();
                     }
                     _ => {
                         if relation_state.is_expect_table() {
-                            if let Some((table_name, next_idx)) = parse_table_name_deep(tokens, idx)
+                            if let Some((table_name, next_idx)) =
+                                parse_expected_table_name_deep(tokens, idx)
                             {
                                 let current_statement_kind = depth_frames
                                     .get(depth)
@@ -5620,6 +5628,27 @@ fn previous_word_chain_matches(tokens: &[SqlToken], before_idx: usize, chain: &[
 
 fn is_mysql_on_duplicate_key_update(tokens: &[SqlToken], update_idx: usize) -> bool {
     previous_word_chain_matches(tokens, update_idx, &["KEY", "DUPLICATE", "ON"])
+        && !on_duplicate_key_looks_like_expression_call(tokens, update_idx)
+}
+
+fn on_duplicate_key_looks_like_expression_call(tokens: &[SqlToken], update_idx: usize) -> bool {
+    let Some((key_word, key_idx)) = prev_word_upper(tokens, update_idx) else {
+        return false;
+    };
+    if key_word != "KEY" {
+        return false;
+    }
+    let Some((duplicate_word, duplicate_idx)) = prev_word_upper(tokens, key_idx) else {
+        return false;
+    };
+    if duplicate_word != "DUPLICATE" {
+        return false;
+    }
+    let Some((on_word, on_idx)) = prev_word_upper(tokens, duplicate_idx) else {
+        return false;
+    };
+
+    on_word == "ON" && is_keyword_function_call_start(tokens, on_idx)
 }
 
 fn is_postgres_on_conflict_do_update(tokens: &[SqlToken], update_idx: usize) -> bool {
@@ -5757,6 +5786,18 @@ fn normalize_table_name_part(value: &str) -> String {
 
 /// Parse a table name at the given position (handling schema.table format).
 fn parse_table_name_deep(tokens: &[SqlToken], start: usize) -> Option<(String, usize)> {
+    parse_table_name_deep_with_options(tokens, start, false)
+}
+
+fn parse_expected_table_name_deep(tokens: &[SqlToken], start: usize) -> Option<(String, usize)> {
+    parse_table_name_deep_with_options(tokens, start, true)
+}
+
+fn parse_table_name_deep_with_options(
+    tokens: &[SqlToken],
+    start: usize,
+    allow_table_source_construct_keyword_name: bool,
+) -> Option<(String, usize)> {
     match tokens.get(start) {
         Some(SqlToken::Symbol(sym)) if sym == "(" => None,
         Some(SqlToken::Word(word)) => {
@@ -5768,7 +5809,12 @@ fn parse_table_name_deep(tokens: &[SqlToken], start: usize) -> Option<(String, u
             let is_quoted = is_quoted_identifier(word);
             let upper = word.to_ascii_uppercase();
             // Skip if this is a keyword rather than a table name
-            if !is_quoted && (is_join_keyword(&upper) || is_table_stop_keyword(&upper)) {
+            if !is_quoted
+                && (is_join_keyword(&upper)
+                    || (is_table_stop_keyword(&upper)
+                        && !(allow_table_source_construct_keyword_name
+                            && table_source_construct_keyword_can_be_relation_name(&upper))))
+            {
                 return None;
             }
             if !is_identifier_word_token(word) {
@@ -5822,6 +5868,13 @@ fn parse_table_name_deep(tokens: &[SqlToken], start: usize) -> Option<(String, u
         }
         _ => None,
     }
+}
+
+fn table_source_construct_keyword_can_be_relation_name(word: &str) -> bool {
+    matches!(
+        word,
+        "PIVOT" | "UNPIVOT" | "MODEL" | "MATCH_RECOGNIZE" | "MATCH"
+    )
 }
 
 fn parse_relation_wrapper_table_name(

@@ -17778,6 +17778,11 @@ impl SqlEditorWidget {
                         | "IN"
                         | "LIKE"
                         | "BETWEEN"
+                        | "FROM"
+                        | "JOIN"
+                        | "APPLY"
+                        | "LATERAL"
+                        | "STRAIGHT_JOIN"
                 ) {
                     return false;
                 }

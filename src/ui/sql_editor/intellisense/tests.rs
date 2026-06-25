@@ -2415,6 +2415,11 @@ fn table_clause_construct_keywords_do_not_hijack_expression_calls() {
         "SELECT * FROM match_recognize(|)",
         "SELECT * FROM match recognize(|)",
         "SELECT * FROM model(|)",
+        "SELECT * FROM t JOIN pivot(|)",
+        "SELECT * FROM t JOIN unpivot(|)",
+        "SELECT * FROM t JOIN match_recognize(|)",
+        "SELECT * FROM t CROSS APPLY pivot(|)",
+        "SELECT * FROM t STRAIGHT_JOIN pivot(|)",
     ] {
         let ctx = analyze_inline_cursor_sql(sql);
         assert_ne!(
@@ -2449,6 +2454,25 @@ fn table_clause_construct_keywords_do_not_hijack_expression_calls() {
                 "{leaked} leaked from table-clause grammar into table-source identifier/function position at `{sql}`: kind={kind:?} keywords={keywords:?} final={suggestions:?}"
             );
         }
+    }
+
+    for (sql, qualifier, expected_table) in [
+        ("SELECT * FROM pivot p WHERE p.|", "p", "pivot"),
+        ("SELECT * FROM unpivot u WHERE u.|", "u", "unpivot"),
+        ("SELECT * FROM match m WHERE m.|", "m", "match"),
+        ("SELECT * FROM match_recognize mr WHERE mr.|", "mr", "match_recognize"),
+        ("SELECT * FROM model m WHERE m.|", "m", "model"),
+        ("SELECT * FROM t JOIN pivot p ON p.|", "p", "pivot"),
+        ("SELECT * FROM t JOIN unpivot u ON u.|", "u", "unpivot"),
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        let column_tables =
+            SqlEditorWidget::resolve_column_tables_for_context(Some(qualifier), &ctx);
+        assert_eq!(
+            column_tables,
+            vec![expected_table.to_string()],
+            "table-source keyword identifier should be collected as a relation at `{sql}`"
+        );
     }
 
     for sql in [
@@ -2682,6 +2706,12 @@ fn dml_expression_calls_do_not_reenter_structural_keyword_phases() {
         ("UPDATE emp SET a = using(|)", SqlPhase::SetClause),
         ("UPDATE emp SET a = values(|)", SqlPhase::SetClause),
         ("UPDATE emp SET a = returning(|)", SqlPhase::SetClause),
+        ("UPDATE emp SET a = insert(|)", SqlPhase::SetClause),
+        ("UPDATE emp SET a = replace(|)", SqlPhase::SetClause),
+        ("UPDATE emp SET a = update(|)", SqlPhase::SetClause),
+        ("UPDATE emp SET a = delete(|)", SqlPhase::SetClause),
+        ("UPDATE emp SET a = merge(|)", SqlPhase::SetClause),
+        ("UPDATE emp SET a = rename(|)", SqlPhase::SetClause),
         ("UPDATE emp SET a = 1 RETURNING into(|)", SqlPhase::DmlReturningList),
         ("UPDATE emp SET a = 1 WHERE b = returning(|)", SqlPhase::WhereClause),
         ("DELETE FROM emp WHERE a = using(|)", SqlPhase::WhereClause),
@@ -2718,6 +2748,18 @@ fn dml_expression_calls_do_not_reenter_structural_keyword_phases() {
             SqlPhase::WhereClause,
         ),
         (
+            "INSERT INTO emp (a) VALUES (on duplicate key update(|))",
+            SqlPhase::ValuesClause,
+        ),
+        (
+            "INSERT INTO emp (a) SELECT on duplicate key update(|) FROM s",
+            SqlPhase::SelectList,
+        ),
+        (
+            "INSERT INTO emp (a) SELECT x FROM s WHERE on duplicate key update(|)",
+            SqlPhase::WhereClause,
+        ),
+        (
             "UPDATE emp SET a = 1 RETURNING returning(|)",
             SqlPhase::DmlReturningList,
         ),
@@ -2729,12 +2771,19 @@ fn dml_expression_calls_do_not_reenter_structural_keyword_phases() {
         );
 
         let (kind, keywords, suggestions) = audit_final_suggestions_for(sql, Oracle);
-        assert!(
-            contains(&suggestions, "EMPNO")
-                && contains(&suggestions, "ENAME")
-                && contains(&suggestions, "SAL"),
-            "DML expression call should keep target/source columns at `{sql}`: kind={kind:?} keywords={keywords:?} final={suggestions:?}"
-        );
+        if sql.contains("replace(") {
+            assert!(
+                contains(&suggestions, "ENAME"),
+                "typed DML expression call should keep matching target/source columns at `{sql}`: kind={kind:?} keywords={keywords:?} final={suggestions:?}"
+            );
+        } else {
+            assert!(
+                contains(&suggestions, "EMPNO")
+                    && contains(&suggestions, "ENAME")
+                    && contains(&suggestions, "SAL"),
+                "DML expression call should keep target/source columns at `{sql}`: kind={kind:?} keywords={keywords:?} final={suggestions:?}"
+            );
+        }
         for leaked in ["DEPT", "EMP", "EMP_V", "RUN_JOB", "VALUES", "WHERE"] {
             assert!(
                 !contains(&suggestions, leaked),
