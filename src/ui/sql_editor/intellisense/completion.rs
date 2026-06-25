@@ -1867,13 +1867,19 @@ impl SqlEditorWidget {
         let has_prefix = !snapshot.prefix.is_empty();
         let context =
             Self::classify_intellisense_context(deep_ctx, deep_ctx.statement_tokens.as_ref());
-        let at_data_type_position = qualifier.is_none()
-            && Self::data_type_position_for_context_for_db(
+        let data_type_position = qualifier.is_none().then(|| {
+            Self::data_type_position_for_context_for_db(
                 deep_ctx,
                 has_prefix,
                 Some(snapshot.preferred_db_type),
             )
-            .is_some();
+        }).flatten();
+        let at_data_type_position = data_type_position.is_some()
+            && !Self::cursor_is_at_create_table_element_keyword_slot_for_context(
+                deep_ctx,
+                has_prefix,
+                Some(snapshot.preferred_db_type),
+            );
         let ddl_new_name_allows_keyword_suggestions = qualifier.is_none()
             && Self::cursor_is_at_ddl_new_name_keyword_suggestion_slot(
                 deep_ctx,
@@ -2446,13 +2452,24 @@ impl SqlEditorWidget {
         } else if at_data_type_position {
             // A data-type slot (`CAST(x AS |)`, a column/PL-SQL type) admits
             // only type names: the dialect type keywords come from the expected-
-            // keyword merge below, and user-defined TYPE objects from here.
-            // Relations, functions, columns and unrelated keywords are all
-            // irrelevant, so the rest of the catalog stays suppressed.
-            let mut data = intellisense_data
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            data.get_type_object_suggestions(&snapshot.prefix)
+            // keyword merge below. User-defined TYPE objects are valid only for
+            // Oracle-style type positions, never MySQL/MariaDB type keywords or
+            // SQL*Plus bind variable type slots. Relations, functions, columns and
+            // unrelated keywords are all irrelevant, so the rest of the catalog
+            // stays suppressed.
+            if data_type_position.is_some_and(|position| {
+                Self::data_type_position_allows_user_type_objects(
+                    position,
+                    Some(snapshot.preferred_db_type),
+                )
+            }) {
+                let mut data = intellisense_data
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                data.get_type_object_suggestions(&snapshot.prefix)
+            } else {
+                Vec::new()
+            }
         } else if replace_table_context_with_expected_objects {
             expected_object_suggestions.clone()
         } else if at_keyword_only_identifier_slot || at_keyword_only_slot {
@@ -9087,6 +9104,11 @@ impl SqlEditorWidget {
         if Self::cursor_is_in_invalid_set_operation_branch_for_context(deep_ctx, true) {
             return None;
         }
+        if Self::data_type_position_for_context_for_db(deep_ctx, true, db_type)
+            .is_some_and(|position| !Self::data_type_position_allows_user_type_objects(position, db_type))
+        {
+            return None;
+        }
 
         let expected_object_kind =
             Self::expected_object_suggestion_kind_for_db("", Some(qualifier), deep_ctx, db_type);
@@ -9151,14 +9173,16 @@ impl SqlEditorWidget {
         {
             return false;
         }
-        let at_data_type_position =
-            Self::data_type_position_for_context_for_db(deep_ctx, true, db_type).is_some();
-        !at_data_type_position
-            && (Self::cursor_is_at_identifier_suppressing_keyword_slot_for_context(
+        if let Some(position) = Self::data_type_position_for_context_for_db(deep_ctx, true, db_type)
+        {
+            return !Self::data_type_position_allows_user_type_objects(position, db_type);
+        }
+
+        Self::cursor_is_at_identifier_suppressing_keyword_slot_for_context(
                 deep_ctx, true, db_type,
             ) || Self::cursor_is_at_column_suppressing_keyword_slot_for_db(
                 deep_ctx, true, db_type,
-            ))
+            )
     }
 
     fn qualified_column_owner_resolves_to_relation_columns(
@@ -12446,6 +12470,136 @@ impl SqlEditorWidget {
         )
     }
 
+    /// MySQL component/plugin commands take external component URNs, plugin
+    /// identifiers, or SONAME string values; `HANDLER ... OPEN AS` takes a
+    /// handler alias. None of those are schema objects, so the flat catalog must
+    /// stay out even when the structural keyword source has no keyword to emit.
+    fn cursor_is_at_mysql_component_plugin_or_handler_value_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return false;
+        }
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            deep_ctx.cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        let words = Self::words_for_keyword_slot(tokens, end);
+        match words.as_slice() {
+            [install, component, ..] if install == "INSTALL" && component == "COMPONENT" => true,
+            [install, plugin, ..] if install == "INSTALL" && plugin == "PLUGIN" => true,
+            [uninstall, component, ..]
+                if uninstall == "UNINSTALL" && component == "COMPONENT" =>
+            {
+                true
+            }
+            [uninstall, plugin, ..] if uninstall == "UNINSTALL" && plugin == "PLUGIN" => true,
+            [handler, ..]
+                if handler == "HANDLER"
+                    && words
+                        .windows(2)
+                        .any(|window| matches!(window, [open, as_kw] if open == "OPEN" && as_kw == "AS")) =>
+            {
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Statement-level MySQL commands such as `KILL`, `SIGNAL`, `SET PASSWORD`,
+    /// role/charset `SET` forms, replication channel clauses, `IMPORT TABLE FROM`,
+    /// and `XA` take process ids, SQLSTATE values, account/role/charset names,
+    /// channel names, file paths, or transaction ids. Those values are not schema
+    /// objects, so the schema catalog must not be mixed into their slots.
+    fn cursor_is_at_mysql_statement_value_non_catalog_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return false;
+        }
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            deep_ctx.cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        let words = Self::meaningful_tokens_before(tokens, end)
+            .into_iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                SqlToken::String(_) => Some("__VALUE__".to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let Some(first) = words.first().map(String::as_str) else {
+            return false;
+        };
+
+        if matches!(first, "KILL" | "SIGNAL" | "RESIGNAL" | "XA") {
+            return true;
+        }
+        if matches!(words.as_slice(), [import, table, from, ..] if import == "IMPORT" && table == "TABLE" && from == "FROM")
+        {
+            return true;
+        }
+        if matches!(words.as_slice(), [reset, persist, ..] if reset == "RESET" && persist == "PERSIST")
+        {
+            return true;
+        }
+        if first == "SET" {
+            match words.as_slice() {
+                [set, password, to, random, replace, ..]
+                    if set == "SET"
+                        && password == "PASSWORD"
+                        && to == "TO"
+                        && random == "RANDOM"
+                        && replace == "REPLACE" =>
+                {
+                    return true;
+                }
+                [set, password, for_kw, _account, to, random, replace, ..]
+                    if set == "SET"
+                        && password == "PASSWORD"
+                        && for_kw == "FOR"
+                        && to == "TO"
+                        && random == "RANDOM"
+                        && replace == "REPLACE" =>
+                {
+                    return true;
+                }
+                [set, names, .., collate]
+                    if set == "SET" && names == "NAMES" && collate == "COLLATE" =>
+                {
+                    return true;
+                }
+                [set, resource, group, _name, for_kw, ..]
+                    if set == "SET"
+                        && resource == "RESOURCE"
+                        && group == "GROUP"
+                        && for_kw == "FOR" =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        if matches!(first, "START" | "STOP" | "RESET" | "CHANGE")
+            && words
+                .windows(2)
+                .any(|window| matches!(window, [for_kw, channel] if for_kw == "FOR" && channel == "CHANNEL"))
+        {
+            return true;
+        }
+
+        false
+    }
+
     /// Whether the statement-structural keyword slot suppresses the identifier
     /// catalog. It does for every fixed-keyword statement head/tail except the
     /// MySQL `DROP <object> |` name slot and the `LOCK`/`FLUSH TABLES` table-list
@@ -12553,6 +12707,11 @@ impl SqlEditorWidget {
                 deep_ctx,
                 exclude_current_identifier_chain,
             )
+            || Self::cursor_is_at_create_table_element_keyword_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
             || Self::cursor_is_at_locking_clause_keyword_slot_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
@@ -12569,6 +12728,21 @@ impl SqlEditorWidget {
                 db_type,
             )
             || Self::cursor_is_at_mysql_prepared_statement_non_catalog_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+            || Self::cursor_is_at_mysql_component_plugin_or_handler_value_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+            || Self::cursor_is_at_mysql_statement_value_non_catalog_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+            || Self::cursor_is_at_transaction_or_lock_value_non_catalog_slot_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
                 db_type,
@@ -15963,32 +16137,52 @@ impl SqlEditorWidget {
     }
 
     /// MySQL index-hint keywords after a table reference (`FROM t USE |` →
-    /// `INDEX`/`KEY`, `… USE INDEX |` → `FOR`). Without this the trailing
-    /// `USE`/`IGNORE`/`FORCE` is mistaken for a table alias and the query-clause
-    /// continuation leaks. Gated so a statement-initial `USE db` and DML modifiers
-    /// (`DELETE IGNORE`) are untouched. (`… INDEX FOR |` → `JOIN`/… is shadowed by
-    /// the `FOR UPDATE` locking handler — a deferred niche-completeness gap.)
+    /// `INDEX`/`KEY`, `… USE INDEX |` → `FOR`, `… USE INDEX FOR |` → `JOIN`/
+    /// `ORDER BY`/`GROUP BY`). Without this the trailing `USE`/`IGNORE`/`FORCE` is
+    /// mistaken for a table alias and the query-clause continuation leaks. Gated so
+    /// a statement-initial `USE db` and DML modifiers (`DELETE IGNORE`) are
+    /// untouched.
     fn expected_mysql_index_hint_keyword_candidates(
         tokens: &[SqlToken],
         end: usize,
         phase: intellisense_context::SqlPhase,
         db_type: Option<crate::db::DatabaseType>,
     ) -> Option<&'static [&'static str]> {
-        // Index hints live in a query's table clause; gating on the table context
-        // keeps the same keywords in DDL (`CREATE TABLESPACE … USE LOGFILE`) clear.
-        if !phase.is_table_context()
-            || !crate::sql_text::mysql_compatibility_for_sql("", db_type)
-            || Self::unclosed_paren_count(tokens, end) != 0
-        {
-            return None;
-        }
-        let words = Self::previous_meaningful_words_upper(tokens, end, 4);
+        let words = Self::previous_meaningful_words_upper(tokens, end, 5);
         let last = words.last().map(String::as_str)?;
         let prev = words
             .len()
             .checked_sub(2)
             .and_then(|idx| words.get(idx))
             .map(String::as_str);
+        let prev2 = words
+            .len()
+            .checked_sub(3)
+            .and_then(|idx| words.get(idx))
+            .map(String::as_str);
+        let prev3 = words
+            .len()
+            .checked_sub(4)
+            .and_then(|idx| words.get(idx))
+            .map(String::as_str);
+        let in_index_hint_for_tail = matches!(last, "FOR")
+            && matches!(prev, Some("INDEX" | "KEY"))
+            && matches!(prev2, Some("USE" | "IGNORE" | "FORCE"));
+        let in_index_hint_purpose_tail = matches!(last, "ORDER" | "GROUP")
+            && matches!(prev, Some("FOR"))
+            && matches!(prev2, Some("INDEX" | "KEY"))
+            && matches!(prev3, Some("USE" | "IGNORE" | "FORCE"));
+
+        // Index hints live in a query's table clause; gating on the table context
+        // keeps the same keywords in DDL (`CREATE TABLESPACE … USE LOGFILE`) clear.
+        // Once `FOR` has been read the generic phase classifier can see a locking
+        // clause, so allow only the fully shaped index-hint tail through.
+        if (!phase.is_table_context() && !in_index_hint_for_tail && !in_index_hint_purpose_tail)
+            || !crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            || Self::unclosed_paren_count(tokens, end) != 0
+        {
+            return None;
+        }
         match last {
             // `FROM t USE|IGNORE|FORCE |` — the hint introducer must directly follow
             // a table reference (a plain identifier), so it is not a statement head
@@ -15999,6 +16193,8 @@ impl SqlEditorWidget {
                 Some(&["INDEX", "KEY"])
             }
             "INDEX" | "KEY" if matches!(prev, Some("USE" | "IGNORE" | "FORCE")) => Some(&["FOR"]),
+            "FOR" if in_index_hint_for_tail => Some(&["JOIN", "ORDER BY", "GROUP BY"]),
+            "ORDER" | "GROUP" if in_index_hint_purpose_tail => Some(&["BY"]),
             _ => None,
         }
     }
@@ -16245,9 +16441,9 @@ impl SqlEditorWidget {
     /// `REVOKE` only the identifier slots keep the base catalog — the object slot
     /// (`… ON |`), the grantee slot (`… TO |`/`… FROM |`) and their comma-separated
     /// list continuations; past a written object/grantee the tail is keyword-only
-    /// (`TO`, `WITH GRANT OPTION`, …) and is suppressed. The object/savepoint-name
-    /// positions (`LOCK TABLE |`, `ROLLBACK TO SAVEPOINT |`) return `None` and stay
-    /// available.
+    /// (`TO`, `WITH GRANT OPTION`, …) and is suppressed. Object positions such as
+    /// `LOCK TABLE |` return `None` and stay available; savepoint/name/value slots
+    /// are handled by the value-specific predicate below.
     fn cursor_is_at_transaction_or_lock_keyword_slot_for_context(
         deep_ctx: &intellisense_context::CursorContext,
         exclude_current_identifier_chain: bool,
@@ -16283,6 +16479,79 @@ impl SqlEditorWidget {
             return true;
         }
         Self::expected_transaction_and_dcl_keyword_candidates(tokens, end, db_type).is_some()
+    }
+
+    /// Transaction/lock statements also contain identifier-looking value slots
+    /// that are not schema-object names: savepoint names, transaction names,
+    /// commit comments/transaction ids, Oracle lock wait seconds, and MySQL
+    /// `LOCK TABLES ... AS <alias>`. The keyword candidate helper deliberately
+    /// returns `None` there, so suppress the object catalog with a value-specific
+    /// check instead.
+    fn cursor_is_at_transaction_or_lock_value_non_catalog_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        let words = Self::words_for_keyword_slot(tokens, end);
+        let mysql = crate::sql_text::mysql_compatibility_for_sql("", db_type);
+        let first = words.first().map(String::as_str);
+        let last = words.last().map(String::as_str);
+        let has = |keyword: &str| words.iter().any(|word| word == keyword);
+        let has_alias_after_as = || {
+            words
+                .iter()
+                .rposition(|word| word == "AS")
+                .is_some_and(|idx| idx + 1 < words.len())
+        };
+
+        match first {
+            Some("SAVEPOINT") => return true,
+            Some("ROLLBACK") if matches!(words.as_slice(), [rollback, to, savepoint, ..] if rollback == "ROLLBACK" && to == "TO" && savepoint == "SAVEPOINT") => {
+                return true;
+            }
+            Some("RELEASE")
+                if mysql
+                    && matches!(words.as_slice(), [release, savepoint, ..] if release == "RELEASE" && savepoint == "SAVEPOINT") =>
+            {
+                return true;
+            }
+            Some("COMMIT") if !mysql && (has("COMMENT") || has("FORCE")) => return true,
+            Some("ROLLBACK") if !mysql && has("FORCE") => return true,
+            Some("SET") if !mysql && matches!(last, Some("NAME" | "SEGMENT")) => return true,
+            Some("SET")
+                if !mysql
+                    && (has("NAME")
+                        || matches!(
+                            words.as_slice(),
+                            [set, transaction, use_word, rollback, segment, ..]
+                                if set == "SET"
+                                    && transaction == "TRANSACTION"
+                                    && use_word == "USE"
+                                    && rollback == "ROLLBACK"
+                                    && segment == "SEGMENT"
+                        )) =>
+            {
+                return true;
+            }
+            Some("LOCK") if !mysql && has("WAIT") => return true,
+            Some("LOCK")
+                if mysql
+                    && matches!(words.as_slice(), [lock, tables, ..] if lock == "LOCK" && tables == "TABLES")
+                    && (matches!(last, Some("AS")) || has_alias_after_as()) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+
+        false
     }
 
     /// Completed MySQL admin/utility tails may have no further keyword to emit, but
@@ -20914,6 +21183,15 @@ impl SqlEditorWidget {
             DataTypePosition::Cast | DataTypePosition::ColumnDef | DataTypePosition::Plsql => true,
         }
     }
+
+    fn data_type_position_allows_user_type_objects(
+        position: DataTypePosition,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        !crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            && !matches!(position, DataTypePosition::ToolVariable)
+    }
+
 
     /// True when the cursor sits right after a standalone `AS` — an alias-name
     /// slot that introduces a brand-new identifier (`expr AS |`, `relation
@@ -26215,6 +26493,12 @@ impl SqlEditorWidget {
         db_type: Option<crate::db::DatabaseType>,
     ) -> Option<&'static [&'static str]> {
         let mysql = crate::sql_text::mysql_compatibility_for_sql("", db_type);
+        if Self::words_for_keyword_slot(tokens, end)
+            .first()
+            .is_some_and(|word| word == "SET")
+        {
+            return None;
+        }
         let words = Self::previous_meaningful_words_upper(tokens, end, 2);
         let last = words.last().map(String::as_str);
         let prev = words
@@ -27855,12 +28139,19 @@ impl SqlEditorWidget {
         ) {
             return None;
         }
+        if Self::cursor_is_at_create_table_element_keyword_slot_for_context(
+            deep_ctx,
+            exclude_current_identifier_chain,
+            db_type,
+        ) {
+            return None;
+        }
         if Self::data_type_position_for_context_for_db(
             deep_ctx,
             exclude_current_identifier_chain,
             db_type,
         )
-        .is_some()
+        .is_some_and(|position| Self::data_type_position_allows_user_type_objects(position, db_type))
         {
             return Some(ExpectedObjectSuggestionKind::Type);
         }
@@ -27895,6 +28186,11 @@ impl SqlEditorWidget {
             }
             if let Some(kind) =
                 Self::expected_mysql_role_account_object_suggestion_kind(tokens, context_end)
+            {
+                return Some(kind);
+            }
+            if let Some(kind) =
+                Self::expected_mysql_set_password_account_object_suggestion_kind(tokens, context_end)
             {
                 return Some(kind);
             }
@@ -28426,6 +28722,28 @@ impl SqlEditorWidget {
             _ => false,
         };
         role_or_account_slot.then_some(ExpectedObjectSuggestionKind::User)
+    }
+
+    fn expected_mysql_set_password_account_object_suggestion_kind(
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> Option<ExpectedObjectSuggestionKind> {
+        let items = Self::meaningful_tokens_before(tokens, end)
+            .into_iter()
+            .filter_map(Self::mysql_user_account_slot_item)
+            .collect::<Vec<_>>();
+        let account_slot = match items.as_slice() {
+            [set, password, for_kw] if set == "SET" && password == "PASSWORD" && for_kw == "FOR" => {
+                true
+            }
+            [set, password, for_kw, .., at]
+                if set == "SET" && password == "PASSWORD" && for_kw == "FOR" && at == "@" =>
+            {
+                true
+            }
+            _ => false,
+        };
+        account_slot.then_some(ExpectedObjectSuggestionKind::User)
     }
 
     fn expected_mysql_index_cache_object_suggestion_kind(
