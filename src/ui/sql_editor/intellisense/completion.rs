@@ -2207,8 +2207,22 @@ impl SqlEditorWidget {
                 deep_ctx,
                 Some(snapshot.preferred_db_type),
             );
+        let allow_locking_clause_keyword = qualifier.is_none()
+            && Self::cursor_is_at_locking_clause_keyword_slot_for_context(
+                deep_ctx,
+                !snapshot.prefix.is_empty(),
+            );
+        let allow_dml_error_logging_keyword = qualifier.is_none()
+            && Self::expected_dml_error_logging_keyword_candidates_for_context(
+                deep_ctx,
+                !snapshot.prefix.is_empty(),
+                Some(snapshot.preferred_db_type),
+            )
+            .is_some();
         let mut expected_keyword_suggestions = if source_allowance.expected_keyword_suggestions
             || allow_dml_returning_into_keyword
+            || allow_locking_clause_keyword
+            || allow_dml_error_logging_keyword
             || at_data_type_position
         {
             Self::collect_expected_keyword_suggestions_with_expression_context(
@@ -7903,6 +7917,83 @@ impl SqlEditorWidget {
         Self::cursor_immediately_follows_complete_operand(tokens, end)
     }
 
+    fn expected_dml_error_logging_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            || Self::unclosed_paren_count(tokens, end) != 0
+        {
+            return None;
+        }
+
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        let words = toks
+            .iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let head = words.first()?.as_str();
+        if !matches!(head, "INSERT" | "UPDATE" | "DELETE" | "MERGE") {
+            return None;
+        }
+
+        let has_log = Self::top_level_word_pair_present_before(tokens, end, "LOG", "ERRORS");
+        match words.last().map(String::as_str) {
+            Some("LOG") if Self::cursor_is_at_dml_error_logging_log_tail(tokens, end, head) => {
+                Some(&["ERRORS"])
+            }
+            Some("ERRORS") if has_log => Some(&["INTO", "REJECT LIMIT"]),
+            _ if has_log && Self::cursor_follows_error_logging_table_name(tokens, end) => {
+                Some(&["REJECT LIMIT"])
+            }
+            Some("REJECT")
+                if has_log && Self::cursor_is_at_error_logging_reject_tail(tokens, end) =>
+            {
+                Some(&["LIMIT"])
+            }
+            Some("LIMIT")
+                if has_log
+                    && Self::top_level_error_logging_reject_limit_present_before(tokens, end) =>
+            {
+                Some(&["UNLIMITED"])
+            }
+            _ => None,
+        }
+    }
+
+    fn expected_dml_error_logging_keyword_candidates_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let context_end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::expected_dml_error_logging_keyword_candidates(tokens, context_end, db_type).or_else(
+            || {
+                let statement_tokens = deep_ctx.statement_tokens.as_ref();
+                let statement_context_end = Self::expected_suggestion_context_end(
+                    statement_tokens,
+                    deep_ctx.cursor_token_len,
+                    exclude_current_identifier_chain,
+                );
+                Self::expected_dml_error_logging_keyword_candidates(
+                    statement_tokens,
+                    statement_context_end,
+                    db_type,
+                )
+            },
+        )
+    }
+
     fn type_display_from_token_range(
         tokens: &[SqlToken],
         start: usize,
@@ -12330,6 +12421,31 @@ impl SqlEditorWidget {
             || last_token_is(".")
     }
 
+    /// MySQL prepared-statement commands name client-side statement handles and
+    /// user-variable/string expressions, not schema objects. Keep the base catalog
+    /// out of those slots while the structural keyword handler still supplies the
+    /// fixed connectors (`FROM`, `PREPARE`, `USING`) where appropriate.
+    fn cursor_is_at_mysql_prepared_statement_non_catalog_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return false;
+        }
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            deep_ctx.cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        let words = Self::words_for_keyword_slot(tokens, end);
+        matches!(
+            words.first().map(String::as_str),
+            Some("PREPARE" | "DEALLOCATE" | "EXEC" | "EXECUTE")
+        )
+    }
+
     /// Whether the statement-structural keyword slot suppresses the identifier
     /// catalog. It does for every fixed-keyword statement head/tail except the
     /// MySQL `DROP <object> |` name slot and the `LOCK`/`FLUSH TABLES` table-list
@@ -12420,6 +12536,11 @@ impl SqlEditorWidget {
                 deep_ctx,
                 exclude_current_identifier_chain,
             )
+            || Self::cursor_is_at_plsql_keyword_only_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
             || Self::cursor_is_after_set_operator_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
@@ -12436,7 +12557,18 @@ impl SqlEditorWidget {
                 deep_ctx,
                 exclude_current_identifier_chain,
             )
+            || Self::expected_dml_error_logging_keyword_candidates_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+            .is_some()
             || Self::cursor_is_at_mysql_on_duplicate_keyword_tail_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+            || Self::cursor_is_at_mysql_prepared_statement_non_catalog_slot_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
                 db_type,
@@ -12729,6 +12861,12 @@ impl SqlEditorWidget {
                 deep_ctx,
                 exclude_current_identifier_chain,
             )
+            || Self::expected_dml_error_logging_keyword_candidates_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+            .is_some()
             || Self::cursor_is_at_mysql_on_duplicate_keyword_tail_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
@@ -15684,28 +15822,10 @@ impl SqlEditorWidget {
         // {n | UNLIMITED}]`. It follows the optional RETURNING, so once `LOG`
         // appears RETURNING is no longer offerable (handled via `returning_done`).
         let is_dml = matches!(head, "INSERT" | "UPDATE" | "DELETE" | "MERGE");
-        if !mysql && is_dml {
-            match words.last().map(String::as_str) {
-                Some("LOG")
-                    if Self::cursor_is_at_dml_error_logging_log_tail(tokens, end, head) =>
-                {
-                    return Some(&["ERRORS"])
-                }
-                Some("ERRORS") if has_log => return Some(&["INTO", "REJECT LIMIT"]),
-                _ if has_log && Self::cursor_follows_error_logging_table_name(tokens, end) => {
-                    return Some(&["REJECT LIMIT"])
-                }
-                Some("REJECT") if has_log && Self::cursor_is_at_error_logging_reject_tail(tokens, end) => {
-                    return Some(&["LIMIT"])
-                }
-                Some("LIMIT")
-                    if has_log
-                        && Self::top_level_error_logging_reject_limit_present_before(tokens, end) =>
-                {
-                    return Some(&["UNLIMITED"])
-                }
-                _ => {}
-            }
+        if let Some(candidates) = Self::expected_dml_error_logging_keyword_candidates(
+            tokens, end, db_type,
+        ) {
+            return Some(candidates);
         }
         let returning_done = has_returning || (is_dml && has_log);
         // The statement's own `WHERE` must be counted at the top level — a `WHERE`
@@ -17460,15 +17580,23 @@ impl SqlEditorWidget {
         else {
             return None;
         };
-        // Only a genuine statement-start position offers the statement verbs. The
-        // selector/condition/handler-name and value-`CASE` arm slots (where
-        // `allow_statements` is off) are governed by the expression allowlist and
-        // the partial-construct source (`expected_plsql_and_routine_keyword_candidates`,
-        // e.g. a `CASE` selector head → `WHEN`/`ELSE`/`END CASE`), so they fall
-        // through untouched.
+        // Only genuine statement-start positions offer statement verbs. Most
+        // construct-only tails (`CASE |`, `CASE ... THEN ... |`) are handled by
+        // `expected_plsql_and_routine_keyword_candidates`, which carries richer
+        // alternatives such as `ELSE`/`END CASE`; keep this source to statement
+        // starts plus the exception-section opener.
         if !policy.allow_statements {
-            return None;
+            let prev_word = Self::meaningful_tokens_before(tokens, end)
+                .last()
+                .and_then(|token| match token {
+                    SqlToken::Word(word) => Some(word.as_str()),
+                    _ => None,
+                });
+            return (policy.allow_when
+                && prev_word.is_some_and(|word| word.eq_ignore_ascii_case("EXCEPTION")))
+            .then_some(vec!["WHEN"]);
         }
+
         let mut candidates: Vec<&'static str> = PLSQL_STATEMENT_KEYWORDS.to_vec();
         if policy.allow_exit_continue {
             candidates.push("EXIT");
@@ -17489,7 +17617,7 @@ impl SqlEditorWidget {
         if let Some(end_keyword) = policy.end_keyword.filter(|_| policy.allow_end) {
             candidates.push(end_keyword);
         }
-        Some(candidates)
+        (!candidates.is_empty()).then_some(candidates)
     }
 
     /// Keyword tails of the PL/SQL cursor statements `OPEN <cur> FOR <query>` and
@@ -17580,6 +17708,78 @@ impl SqlEditorWidget {
             [.., last] if matches!(last.as_str(), "EXIT" | "CONTINUE") => Some(&["WHEN"]),
             _ => None,
         }
+    }
+
+    fn expected_plsql_end_qualifier_keywords(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return None;
+        }
+        let end_idx = Self::previous_non_comment_token_index(tokens, end)?;
+        if !Self::cursor_in_plsql_executable_block(tokens, end_idx) {
+            return None;
+        }
+        if !matches!(tokens.get(end_idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("END"))
+        {
+            return None;
+        }
+
+        let policy = Self::plsql_keyword_policy(tokens, end_idx)?;
+        match policy.end_keyword {
+            Some("END IF") => Some(&["IF"]),
+            Some("END LOOP") => Some(&["LOOP"]),
+            Some("END CASE") => Some(&["CASE"]),
+            _ => None,
+        }
+    }
+
+    fn cursor_is_at_plsql_keyword_only_slot(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return false;
+        }
+        if Self::expected_plsql_cursor_statement_keywords(tokens, end, db_type).is_some()
+            || Self::expected_plsql_end_qualifier_keywords(tokens, end, db_type).is_some()
+            || Self::expected_plsql_and_routine_keyword_candidates(tokens, end, db_type).is_some()
+            || Self::cursor_is_at_plsql_exception_name(tokens, end)
+        {
+            return true;
+        }
+        matches!(
+            Self::cursor_statement_start_context(tokens, end),
+            Some(StatementStartContext::Plsql(policy))
+                if !policy.allow_statements
+                    && (policy.allow_when
+                        || policy.allow_elsif
+                        || policy.allow_else
+                        || policy.allow_end
+                        || policy.allow_exception
+                        || policy.allow_exit_continue)
+        )
+    }
+
+    fn cursor_is_at_plsql_keyword_only_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let context_end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        if Self::cursor_is_at_plsql_keyword_only_slot(tokens, context_end, db_type) {
+            return true;
+        }
+        false
     }
 
     fn expected_plsql_and_routine_keyword_candidates(
@@ -21114,6 +21314,7 @@ impl SqlEditorWidget {
                 | "CREATE"
                 | "DEALLOCATE"
                 | "DROP"
+                | "EXEC"
                 | "EXECUTE"
                 | "EXPLAIN"
                 | "FLASHBACK"
@@ -25259,8 +25460,13 @@ impl SqlEditorWidget {
                 Some(&["RETAIN"])
             }
             [.., a, b] if *a == "SET" && *b == "RESOURCE" => Some(&["GROUP"]),
+            [.., last] if *last == "PREPARE" => Some(&[]),
             [.., a, b] if *a == "PREPARE" && *b != "FROM" => Some(&["FROM"]),
+            [.., a, _stmt, b] if *a == "PREPARE" && *b == "FROM" => Some(&[]),
+            [.., a, b] if *a == "DEALLOCATE" && *b == "PREPARE" => Some(&[]),
+            [.., last] if matches!(last.as_str(), "EXEC" | "EXECUTE") => Some(&[]),
             [.., a, b] if *a == "EXECUTE" && *b != "USING" => Some(&["USING"]),
+            [.., a, _stmt, b] if *a == "EXECUTE" && *b == "USING" => Some(&[]),
             [.., last] if *last == "RELEASE" => Some(&["SAVEPOINT"]),
             [.., last] if *last == "RESIGNAL" => Some(&["SET", "SQLSTATE"]),
             [.., last] if *last == "ROLLBACK" => Some(&["AND", "NO", "RELEASE", "TO", "WORK"]),
@@ -26718,6 +26924,17 @@ impl SqlEditorWidget {
         {
             return Self::filter_expected_candidates(prefix, candidates);
         }
+        if let Some(candidates) =
+            Self::expected_plsql_end_qualifier_keywords(tokens, context_end, db_type).or_else(|| {
+                Self::expected_plsql_end_qualifier_keywords(
+                    statement_tokens,
+                    statement_context_end,
+                    db_type,
+                )
+            })
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
         if let Some(candidates) = Self::expected_plsql_and_routine_keyword_candidates(
             tokens,
             context_end,
@@ -27727,7 +27944,11 @@ impl SqlEditorWidget {
 
         if Self::cursor_is_in_object_command_head(tokens, context_end) {
             match words.as_slice() {
-                [.., last] if matches!(last.as_str(), "CALL" | "EXEC" | "EXECUTE") => {
+                [.., last]
+                    if *last == "CALL"
+                        || (!crate::sql_text::mysql_compatibility_for_sql("", db_type)
+                            && matches!(last.as_str(), "EXEC" | "EXECUTE")) =>
+                {
                     return Some(ExpectedObjectSuggestionKind::Routine);
                 }
                 [.., last]
@@ -28428,6 +28649,31 @@ impl SqlEditorWidget {
         kind: ExpectedObjectSuggestionKind,
         db_type: Option<crate::db::DatabaseType>,
     ) -> Vec<String> {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            match kind {
+                ExpectedObjectSuggestionKind::Routine => {
+                    return data.get_procedure_object_suggestions(prefix);
+                }
+                ExpectedObjectSuggestionKind::Executable => {
+                    return Self::merge_suggestions_with_context_aliases(
+                        data.get_procedure_object_suggestions(prefix),
+                        data.get_function_object_suggestions(prefix),
+                        false,
+                    );
+                }
+                ExpectedObjectSuggestionKind::RelationOrSequence
+                | ExpectedObjectSuggestionKind::ColumnOwner => {
+                    let suggestions = data.get_table_object_suggestions(prefix);
+                    return Self::merge_suggestions_with_context_aliases(
+                        suggestions,
+                        data.get_view_object_suggestions(prefix),
+                        false,
+                    );
+                }
+                _ => {}
+            }
+        }
+
         let suggestions = match kind {
             ExpectedObjectSuggestionKind::NoSuggestions => Vec::new(),
             ExpectedObjectSuggestionKind::Any => data.get_object_suggestions(prefix),
@@ -28499,11 +28745,38 @@ impl SqlEditorWidget {
             .any(|value| value.eq_ignore_ascii_case(candidate))
     }
 
-    fn suggestion_matches_expected_object_kind(
+    fn suggestion_matches_expected_object_kind_for_db(
         data: &IntellisenseData,
         candidate: &str,
         kind: ExpectedObjectSuggestionKind,
+        db_type: Option<crate::db::DatabaseType>,
     ) -> bool {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            match kind {
+                ExpectedObjectSuggestionKind::Routine => {
+                    return Self::matches_string_list_case_insensitive(
+                        &data.procedures,
+                        candidate,
+                    );
+                }
+                ExpectedObjectSuggestionKind::Executable => {
+                    return Self::matches_string_list_case_insensitive(
+                        &data.procedures,
+                        candidate,
+                    ) || Self::matches_string_list_case_insensitive(
+                        &data.functions,
+                        candidate,
+                    );
+                }
+                ExpectedObjectSuggestionKind::RelationOrSequence
+                | ExpectedObjectSuggestionKind::ColumnOwner => {
+                    return Self::matches_string_list_case_insensitive(&data.tables, candidate)
+                        || Self::matches_string_list_case_insensitive(&data.views, candidate);
+                }
+                _ => {}
+            }
+        }
+
         match kind {
             ExpectedObjectSuggestionKind::NoSuggestions => false,
             ExpectedObjectSuggestionKind::Any => true,
@@ -28679,6 +28952,28 @@ impl SqlEditorWidget {
         }
     }
 
+    fn expected_qualifier_member_kinds_for_db(
+        kind: ExpectedObjectSuggestionKind,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [QualifiedMemberKind]> {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return match kind {
+                ExpectedObjectSuggestionKind::Routine => Some(&[QualifiedMemberKind::Procedure]),
+                ExpectedObjectSuggestionKind::Executable => Some(&[
+                    QualifiedMemberKind::Procedure,
+                    QualifiedMemberKind::Function,
+                ]),
+                ExpectedObjectSuggestionKind::RelationOrSequence
+                | ExpectedObjectSuggestionKind::ColumnOwner => {
+                    Some(&[QualifiedMemberKind::Table, QualifiedMemberKind::View])
+                }
+                _ => Self::expected_qualifier_member_kinds(kind),
+            };
+        }
+
+        Self::expected_qualifier_member_kinds(kind)
+    }
+
     fn expected_object_kind_allows_relation_member_cache(
         kind: ExpectedObjectSuggestionKind,
     ) -> bool {
@@ -28707,13 +29002,77 @@ impl SqlEditorWidget {
             || data.is_known_relation(suggestion)
     }
 
+    fn suggestion_is_mysql_incompatible_relation_family(
+        data: &IntellisenseData,
+        candidate: &str,
+    ) -> bool {
+        !Self::matches_string_list_case_insensitive(&data.tables, candidate)
+            && !Self::matches_string_list_case_insensitive(&data.views, candidate)
+            && (Self::matches_string_list_case_insensitive(&data.materialized_views, candidate)
+                || Self::matches_string_list_case_insensitive(&data.sequences, candidate)
+                || Self::matches_string_list_case_insensitive(&data.synonyms, candidate)
+                || Self::matches_string_list_case_insensitive(&data.public_synonyms, candidate))
+    }
+
+    fn suggestion_is_mysql_incompatible_executable_family(
+        data: &IntellisenseData,
+        candidate: &str,
+        allow_functions: bool,
+    ) -> bool {
+        !Self::matches_string_list_case_insensitive(&data.procedures, candidate)
+            && !(allow_functions
+                && Self::matches_string_list_case_insensitive(&data.functions, candidate))
+            && (data.is_known_relation(candidate)
+                || Self::matches_string_list_case_insensitive(&data.functions, candidate)
+                || Self::matches_string_list_case_insensitive(&data.packages, candidate)
+                || Self::matches_string_list_case_insensitive(&data.types, candidate)
+                || Self::matches_string_list_case_insensitive(&data.users, candidate)
+                || Self::matches_string_list_case_insensitive(&data.triggers, candidate)
+                || Self::matches_string_list_case_insensitive(&data.events, candidate)
+                || Self::matches_string_list_case_insensitive(&data.indexes, candidate)
+                || Self::matches_string_list_case_insensitive(&data.database_links, candidate)
+                || Self::matches_string_list_case_insensitive(&data.directories, candidate)
+                || Self::matches_string_list_case_insensitive(&data.libraries, candidate)
+                || Self::matches_string_list_case_insensitive(&data.clusters, candidate)
+                || Self::matches_string_list_case_insensitive(&data.contexts, candidate)
+                || Self::matches_string_list_case_insensitive(&data.dimensions, candidate)
+                || Self::matches_string_list_case_insensitive(&data.operators, candidate)
+                || Self::matches_string_list_case_insensitive(&data.indextypes, candidate)
+                || Self::matches_string_list_case_insensitive(&data.editions, candidate)
+                || Self::matches_string_list_case_insensitive(&data.java_sources, candidate)
+                || Self::matches_string_list_case_insensitive(&data.java_classes, candidate)
+                || Self::matches_string_list_case_insensitive(&data.java_resources, candidate))
+    }
+
+    fn suggestion_is_known_relation_for_qualifier_for_db(
+        data: &IntellisenseData,
+        qualifier: &str,
+        suggestion: &str,
+        kind: ExpectedObjectSuggestionKind,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            && matches!(
+                kind,
+                ExpectedObjectSuggestionKind::RelationOrSequence
+                    | ExpectedObjectSuggestionKind::ColumnOwner
+            )
+            && Self::suggestion_is_mysql_incompatible_relation_family(data, suggestion)
+        {
+            return false;
+        }
+
+        Self::suggestion_is_known_relation_for_qualifier(data, qualifier, suggestion)
+    }
+
     fn suggestion_matches_expected_object_kind_for_qualifier(
         data: &IntellisenseData,
         qualifier: &str,
         candidate: &str,
         kind: ExpectedObjectSuggestionKind,
+        db_type: Option<crate::db::DatabaseType>,
     ) -> bool {
-        if let Some(expected_kinds) = Self::expected_qualifier_member_kinds(kind) {
+        if let Some(expected_kinds) = Self::expected_qualifier_member_kinds_for_db(kind, db_type) {
             if let Some(matches) =
                 data.qualifier_member_matches_kinds(qualifier, candidate, expected_kinds)
             {
@@ -28721,7 +29080,18 @@ impl SqlEditorWidget {
             }
         }
 
-        Self::suggestion_matches_expected_object_kind(data, candidate, kind)
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            && matches!(
+                kind,
+                ExpectedObjectSuggestionKind::RelationOrSequence
+                    | ExpectedObjectSuggestionKind::ColumnOwner
+            )
+            && data.qualifier_relation_member_matches(qualifier, candidate)
+        {
+            return !Self::suggestion_is_mysql_incompatible_relation_family(data, candidate);
+        }
+
+        Self::suggestion_matches_expected_object_kind_for_db(data, candidate, kind, db_type)
     }
 
     fn expected_member_suggestions_for_qualifier(
@@ -28756,7 +29126,9 @@ impl SqlEditorWidget {
         let mut saw_kind_metadata = false;
         let mut seen = HashSet::new();
         for suggestion in &suggestions {
-            if let Some(expected_kinds) = Self::expected_qualifier_member_kinds(kind) {
+            if let Some(expected_kinds) =
+                Self::expected_qualifier_member_kinds_for_db(kind, db_type)
+            {
                 if data
                     .qualifier_member_matches_kinds(qualifier, suggestion, expected_kinds)
                     .is_some()
@@ -28769,6 +29141,7 @@ impl SqlEditorWidget {
                 qualifier,
                 suggestion,
                 kind,
+                db_type,
             ) {
                 continue;
             }
@@ -28786,6 +29159,20 @@ impl SqlEditorWidget {
             suggestions
                 .into_iter()
                 .filter(|suggestion| {
+                    if crate::sql_text::mysql_compatibility_for_sql("", db_type)
+                        && matches!(
+                            kind,
+                            ExpectedObjectSuggestionKind::Routine
+                                | ExpectedObjectSuggestionKind::Executable
+                        )
+                        && Self::suggestion_is_mysql_incompatible_executable_family(
+                            data,
+                            suggestion,
+                            matches!(kind, ExpectedObjectSuggestionKind::Executable),
+                        )
+                    {
+                        return false;
+                    }
                     !Self::suggestion_is_known_relation_for_qualifier(data, qualifier, suggestion)
                 })
                 .collect()
@@ -28831,7 +29218,7 @@ impl SqlEditorWidget {
                 all_suggestions
             };
         }
-        let Some(expected_kinds) = Self::expected_qualifier_member_kinds(kind) else {
+        let Some(expected_kinds) = Self::expected_qualifier_member_kinds_for_db(kind, db_type) else {
             return suggestions;
         };
 
@@ -28859,7 +29246,9 @@ impl SqlEditorWidget {
             suggestions
                 .into_iter()
                 .filter(|suggestion| {
-                    Self::suggestion_is_known_relation_for_qualifier(data, qualifier, suggestion)
+                    Self::suggestion_is_known_relation_for_qualifier_for_db(
+                        data, qualifier, suggestion, kind, db_type,
+                    )
                 })
                 .collect()
         } else {
