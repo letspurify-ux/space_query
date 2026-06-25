@@ -46,6 +46,9 @@ use crate::utils::{malloc_trim_process, AppConfig, QueryHistory};
 
 type MutexFlag = Arc<Mutex<Option<u64>>>;
 
+const RESULT_ONE_TAB_PER_QUERY_LABEL: &str = " One tab per query";
+const RESULT_CHECKBOX_GROUP_GAP: i32 = TOOLBAR_SPACING;
+
 static NEXT_MUTEX_FLAG_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 fn next_mutex_flag_token() -> u64 {
@@ -987,6 +990,7 @@ pub struct AppState {
     pub result_tabs: ResultTabsWidget,
     result_toolbar: Flex,
     result_one_tab_per_query_check: CheckButton,
+    result_one_tab_edit_gap: Frame,
     result_edit_check: CheckButton,
     result_insert_btn: Button,
     result_delete_btn: Button,
@@ -1040,6 +1044,19 @@ fn set_result_action_button_visibility(toolbar: &mut Flex, button: &mut Button, 
         }
         toolbar.fixed(button, 0);
     }
+}
+
+fn result_toolbar_checkbox_width(check: &CheckButton, min_width: i32) -> i32 {
+    let (label_w, _) = check.measure_label();
+    result_toolbar_checkbox_width_for_label(label_w, min_width)
+}
+
+fn result_toolbar_checkbox_width_for_label(label_w: i32, min_width: i32) -> i32 {
+    const CHECK_INDICATOR_AND_PADDING: i32 = 34;
+    label_w
+        .max(0)
+        .saturating_add(CHECK_INDICATOR_AND_PADDING)
+        .max(min_width)
 }
 
 fn transaction_isolation_choice_labels(
@@ -2336,7 +2353,14 @@ impl AppState {
         let show_edit_check = can_edit;
         if show_edit_check {
             self.result_toolbar
-                .fixed(&self.result_edit_check, BUTTON_WIDTH_SMALL);
+                .fixed(&self.result_one_tab_edit_gap, RESULT_CHECKBOX_GROUP_GAP);
+            if !self.result_one_tab_edit_gap.visible() {
+                self.result_one_tab_edit_gap.show();
+            }
+            self.result_toolbar.fixed(
+                &self.result_edit_check,
+                result_toolbar_checkbox_width(&self.result_edit_check, BUTTON_WIDTH_SMALL),
+            );
             if !self.result_edit_check.visible() {
                 self.result_edit_check.show();
             }
@@ -2350,6 +2374,10 @@ impl AppState {
             if self.result_edit_check.visible() {
                 self.result_edit_check.hide();
             }
+            if self.result_one_tab_edit_gap.visible() {
+                self.result_one_tab_edit_gap.hide();
+            }
+            self.result_toolbar.fixed(&self.result_one_tab_edit_gap, 0);
             self.result_toolbar.fixed(&self.result_edit_check, 0);
         }
         let desired_checked = edit_active && can_edit;
@@ -4444,11 +4472,18 @@ impl MainWindow {
 
         let mut one_tab_per_query_check = CheckButton::default()
             .with_size(BUTTON_WIDTH_LARGE + 45, BUTTON_HEIGHT)
-            .with_label(" One tab per query");
+            .with_label(RESULT_ONE_TAB_PER_QUERY_LABEL);
         one_tab_per_query_check.set_tooltip(
             "Unchecked: clear existing result tabs before each execution. Checked: append result tabs.",
         );
-        result_toolbar.fixed(&one_tab_per_query_check, BUTTON_WIDTH_LARGE + 45);
+        result_toolbar.fixed(
+            &one_tab_per_query_check,
+            result_toolbar_checkbox_width(&one_tab_per_query_check, BUTTON_WIDTH_LARGE + 45),
+        );
+
+        let mut one_tab_edit_gap = Frame::default();
+        one_tab_edit_gap.hide();
+        result_toolbar.fixed(&one_tab_edit_gap, 0);
 
         let mut edit_mode_check = CheckButton::default()
             .with_size(BUTTON_WIDTH_SMALL, BUTTON_HEIGHT)
@@ -4710,6 +4745,7 @@ impl MainWindow {
             result_tabs: result_tabs.clone(),
             result_toolbar: result_toolbar.clone(),
             result_one_tab_per_query_check: one_tab_per_query_check.clone(),
+            result_one_tab_edit_gap: one_tab_edit_gap.clone(),
             result_edit_check: edit_mode_check.clone(),
             result_insert_btn: edit_insert_btn.clone(),
             result_delete_btn: edit_delete_btn.clone(),
@@ -5354,6 +5390,21 @@ impl MainWindow {
                 apply_widget_font_recursive(&mut child, font, ui_size);
             }
         }
+
+        state.result_toolbar.fixed(
+            &state.result_one_tab_per_query_check,
+            result_toolbar_checkbox_width(
+                &state.result_one_tab_per_query_check,
+                BUTTON_WIDTH_LARGE + 45,
+            ),
+        );
+        if state.result_edit_check.visible() {
+            state.result_toolbar.fixed(
+                &state.result_edit_check,
+                result_toolbar_checkbox_width(&state.result_edit_check, BUTTON_WIDTH_SMALL),
+            );
+        }
+        state.result_toolbar.layout();
     }
 
     fn clamp_query_split_with(
@@ -9309,6 +9360,17 @@ mod tests {
         let normalized = MainWindow::normalize_line_endings_for_editor(text);
 
         assert_eq!(normalized, "select 1;\nselect 2;\nselect 3;");
+    }
+
+    #[test]
+    fn result_toolbar_checkbox_width_tracks_measured_label_width() {
+        let base_width = BUTTON_WIDTH_LARGE + 45;
+
+        assert_eq!(
+            result_toolbar_checkbox_width_for_label(1, base_width),
+            base_width
+        );
+        assert!(result_toolbar_checkbox_width_for_label(base_width, base_width) > base_width);
     }
 
     #[test]

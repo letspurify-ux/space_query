@@ -3743,9 +3743,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 cursor_token_len,
                                 current_phase,
                             )
+                            || from_belongs_to_distinct_predicate
                         {
-                            relation_state.clear();
-                        } else if from_belongs_to_distinct_predicate {
                             relation_state.clear();
                         } else {
                             depth_frames[depth].phase = SqlPhase::FromClause;

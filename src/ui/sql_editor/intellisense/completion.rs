@@ -7728,9 +7728,8 @@ impl SqlEditorWidget {
                     let upper = word.to_ascii_uppercase();
                     if prev_top_word.as_deref() == Some("GROUP") && upper == "BY" {
                         clause = QueryClause::GroupBy;
-                    } else if prev_top_word.as_deref() == Some("ORDER") && upper == "BY" {
-                        clause = QueryClause::Other;
-                    } else if matches!(
+                    } else if (prev_top_word.as_deref() == Some("ORDER") && upper == "BY")
+                        || matches!(
                         upper.as_str(),
                         "WHERE"
                             | "HAVING"
@@ -9059,6 +9058,7 @@ impl SqlEditorWidget {
                 .any(|subq| Self::completion_identifiers_match(&subq.alias, qualifier))
     }
 
+    #[cfg(test)]
     fn resolve_qualified_completion_mode(
         qualifier: &str,
         context: SqlContext,
@@ -15315,10 +15315,10 @@ impl SqlEditorWidget {
                 .filter(|candidate| {
                     let upper = candidate.to_ascii_uppercase();
                     !upper.starts_with("REPLICATE_")
-                        || !tail
+                        || tail
                             .iter()
                             .position(|word| word == &upper)
-                            .is_some_and(|idx| tail.get(idx + 1).is_some())
+                            .is_none_or(|idx| tail.get(idx + 1).is_none())
                 })
                 .collect();
         }
@@ -18925,9 +18925,7 @@ impl SqlEditorWidget {
             if matches!(last, Some("TABLE" | "IF" | "NOT" | "EXISTS")) {
                 return None;
             }
-            let Some(table_tail) = Self::create_table_tail_tokens_after_name(tokens, end) else {
-                return None;
-            };
+            let table_tail = Self::create_table_tail_tokens_after_name(tokens, end)?;
             let table_tail_words = table_tail
                 .iter()
                 .filter_map(|token| match token {
@@ -20603,10 +20601,10 @@ impl SqlEditorWidget {
         Some(words)
     }
 
-    fn create_index_tail_tokens_after_name<'a>(
-        tokens: &'a [SqlToken],
+    fn create_index_tail_tokens_after_name(
+        tokens: &[SqlToken],
         end: usize,
-    ) -> Option<Vec<&'a SqlToken>> {
+    ) -> Option<Vec<&SqlToken>> {
         let toks = Self::meaningful_tokens_before(tokens, end);
         if !matches!(toks.first(), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("CREATE"))
         {
@@ -20681,10 +20679,10 @@ impl SqlEditorWidget {
         saw_word && !expect_word
     }
 
-    fn create_table_tail_tokens_after_name<'a>(
-        tokens: &'a [SqlToken],
+    fn create_table_tail_tokens_after_name(
+        tokens: &[SqlToken],
         end: usize,
-    ) -> Option<Vec<&'a SqlToken>> {
+    ) -> Option<Vec<&SqlToken>> {
         let toks = Self::meaningful_tokens_before(tokens, end);
         if !matches!(toks.first(), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("CREATE"))
         {
@@ -29019,8 +29017,8 @@ impl SqlEditorWidget {
         candidate: &str,
         allow_functions: bool,
     ) -> bool {
-        !Self::matches_string_list_case_insensitive(&data.procedures, candidate)
-            && !(allow_functions
+        !(Self::matches_string_list_case_insensitive(&data.procedures, candidate)
+            || allow_functions
                 && Self::matches_string_list_case_insensitive(&data.functions, candidate))
             && (data.is_known_relation(candidate)
                 || Self::matches_string_list_case_insensitive(&data.functions, candidate)
@@ -29094,6 +29092,7 @@ impl SqlEditorWidget {
         Self::suggestion_matches_expected_object_kind_for_db(data, candidate, kind, db_type)
     }
 
+    #[cfg(test)]
     fn expected_member_suggestions_for_qualifier(
         data: &mut IntellisenseData,
         qualifier: &str,
@@ -29183,6 +29182,7 @@ impl SqlEditorWidget {
         }
     }
 
+    #[cfg(test)]
     fn expected_relation_member_suggestions_for_qualifier(
         data: &mut IntellisenseData,
         qualifier: &str,
