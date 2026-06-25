@@ -685,6 +685,37 @@ pub enum QualifiedMemberKind {
 }
 
 impl QualifiedMemberKind {
+    pub fn type_label(self) -> &'static str {
+        match self {
+            Self::Table => "TABLE",
+            Self::View => "VIEW",
+            Self::MaterializedView => "MVIEW",
+            Self::Type => "TYPE",
+            Self::Trigger => "TRIGGER",
+            Self::Event => "EVENT",
+            Self::Index => "INDEX",
+            Self::Procedure => "PROCEDURE",
+            Self::Function => "FUNCTION",
+            Self::Package => "PACKAGE",
+            Self::Sequence => "SEQUENCE",
+            Self::Synonym => "SYNONYM",
+            Self::PublicSynonym => "PUBLIC SYNONYM",
+            Self::DatabaseLink => "DATABASE LINK",
+            Self::Directory => "DIRECTORY",
+            Self::Library => "LIBRARY",
+            Self::Cluster => "CLUSTER",
+            Self::Context => "CONTEXT",
+            Self::Dimension => "DIMENSION",
+            Self::Operator => "OPERATOR",
+            Self::Indextype => "INDEXTYPE",
+            Self::Edition => "EDITION",
+            Self::JavaSource => "JAVA SOURCE",
+            Self::JavaClass => "JAVA CLASS",
+            Self::JavaResource => "JAVA RESOURCE",
+            Self::User => "USER",
+        }
+    }
+
     pub fn from_object_type_name(object_type: &str) -> Option<Self> {
         match object_type.trim().to_ascii_uppercase().as_str() {
             "TABLE" | "BASE TABLE" => Some(Self::Table),
@@ -1701,6 +1732,59 @@ impl IntellisenseData {
         None
     }
 
+    pub fn qualifier_member_type_label(
+        &self,
+        qualifier: &str,
+        candidate: &str,
+    ) -> Option<&'static str> {
+        const LABEL_PRIORITY: &[QualifiedMemberKind] = &[
+            QualifiedMemberKind::Table,
+            QualifiedMemberKind::View,
+            QualifiedMemberKind::MaterializedView,
+            QualifiedMemberKind::Type,
+            QualifiedMemberKind::Trigger,
+            QualifiedMemberKind::Event,
+            QualifiedMemberKind::Index,
+            QualifiedMemberKind::Procedure,
+            QualifiedMemberKind::Function,
+            QualifiedMemberKind::Package,
+            QualifiedMemberKind::Sequence,
+            QualifiedMemberKind::PublicSynonym,
+            QualifiedMemberKind::Synonym,
+            QualifiedMemberKind::DatabaseLink,
+            QualifiedMemberKind::Directory,
+            QualifiedMemberKind::Library,
+            QualifiedMemberKind::Cluster,
+            QualifiedMemberKind::Context,
+            QualifiedMemberKind::Dimension,
+            QualifiedMemberKind::Operator,
+            QualifiedMemberKind::Indextype,
+            QualifiedMemberKind::Edition,
+            QualifiedMemberKind::JavaSource,
+            QualifiedMemberKind::JavaClass,
+            QualifiedMemberKind::JavaResource,
+            QualifiedMemberKind::User,
+        ];
+
+        let candidate_upper = NameEntry::lookup_upper(candidate.trim());
+        if candidate_upper.is_empty() {
+            return None;
+        }
+
+        for key in Self::qualifier_lookup_keys(qualifier) {
+            let Some(member_kinds) = self.member_kinds_by_qualifier.get(&key) else {
+                continue;
+            };
+            let kinds = member_kinds.get(&candidate_upper)?;
+            return LABEL_PRIORITY
+                .iter()
+                .find(|kind| kinds.contains(kind))
+                .map(|kind| kind.type_label());
+        }
+
+        None
+    }
+
     pub fn set_default_qualifier(&mut self, qualifier: Option<String>) {
         let original = qualifier
             .as_deref()
@@ -2316,7 +2400,9 @@ impl IntellisenseData {
             "VIEW"
         } else if has(&self.materialized_view_entries) {
             "MVIEW"
-        } else if has(&self.synonym_entries) || has(&self.public_synonym_entries) {
+        } else if has(&self.public_synonym_entries) {
+            "PUBLIC SYNONYM"
+        } else if has(&self.synonym_entries) {
             "SYNONYM"
         } else if has(&self.procedure_entries) {
             "PROCEDURE"
@@ -2334,6 +2420,30 @@ impl IntellisenseData {
             "EVENT"
         } else if has(&self.index_entries) {
             "INDEX"
+        } else if has(&self.database_link_entries) {
+            "DATABASE LINK"
+        } else if has(&self.directory_entries) {
+            "DIRECTORY"
+        } else if has(&self.library_entries) {
+            "LIBRARY"
+        } else if has(&self.cluster_entries) {
+            "CLUSTER"
+        } else if has(&self.context_entries) {
+            "CONTEXT"
+        } else if has(&self.dimension_entries) {
+            "DIMENSION"
+        } else if has(&self.operator_entries) {
+            "OPERATOR"
+        } else if has(&self.indextype_entries) {
+            "INDEXTYPE"
+        } else if has(&self.edition_entries) {
+            "EDITION"
+        } else if has(&self.java_source_entries) {
+            "JAVA SOURCE"
+        } else if has(&self.java_class_entries) {
+            "JAVA CLASS"
+        } else if has(&self.java_resource_entries) {
+            "JAVA RESOURCE"
         } else if has(&self.user_entries) {
             "USER"
         } else if self.is_catalog_keyword(upper.as_str(), db_type) {
@@ -4407,16 +4517,67 @@ mod intellisense_tests {
         let mut data = IntellisenseData::new();
         data.tables = vec!["EMP".to_string()];
         data.views = vec!["EMP_VIEW".to_string()];
+        data.materialized_views = vec!["MVIEW_SALES".to_string()];
+        data.synonyms = vec!["EMP_SYN".to_string()];
+        data.public_synonyms = vec!["PUBLIC_EMP".to_string()];
         data.procedures = vec!["DO_WORK".to_string()];
+        data.packages = vec!["HR_PKG".to_string()];
+        data.functions = vec!["CALC_TOTAL".to_string()];
+        data.sequences = vec!["EMP_SEQ".to_string()];
+        data.types = vec!["ADDRESS_T".to_string()];
+        data.triggers = vec!["BI_EMP".to_string()];
+        data.events = vec!["CLEANUP_EVENT".to_string()];
+        data.indexes = vec!["IDX_EMP_NAME".to_string()];
+        data.database_links = vec!["APP_LINK".to_string()];
+        data.directories = vec!["DATA_PUMP_DIR".to_string()];
+        data.libraries = vec!["APP_LIB".to_string()];
+        data.clusters = vec!["EMP_CLUSTER".to_string()];
+        data.contexts = vec!["APP_CTX".to_string()];
+        data.dimensions = vec!["SALES_DIM".to_string()];
+        data.operators = vec!["TEXT_OP".to_string()];
+        data.indextypes = vec!["TEXT_ITYPE".to_string()];
+        data.editions = vec!["ORA_EDITION".to_string()];
+        data.java_sources = vec!["Welcome".to_string()];
+        data.java_classes = vec!["WelcomeClass".to_string()];
+        data.java_resources = vec!["WelcomeRes".to_string()];
+        data.users = vec!["APP_USER".to_string()];
         data.rebuild_indices();
 
         let oracle = Some(crate::db::DatabaseType::Oracle);
-        assert_eq!(data.suggestion_type_label("EMP", oracle), Some("TABLE"));
-        assert_eq!(data.suggestion_type_label("emp_view", oracle), Some("VIEW"));
-        assert_eq!(
-            data.suggestion_type_label("DO_WORK", oracle),
-            Some("PROCEDURE")
-        );
+        for (name, label) in [
+            ("EMP", "TABLE"),
+            ("emp_view", "VIEW"),
+            ("MVIEW_SALES", "MVIEW"),
+            ("EMP_SYN", "SYNONYM"),
+            ("PUBLIC_EMP", "PUBLIC SYNONYM"),
+            ("DO_WORK", "PROCEDURE"),
+            ("HR_PKG", "PACKAGE"),
+            ("CALC_TOTAL", "FUNCTION"),
+            ("EMP_SEQ", "SEQUENCE"),
+            ("ADDRESS_T", "TYPE"),
+            ("BI_EMP", "TRIGGER"),
+            ("CLEANUP_EVENT", "EVENT"),
+            ("IDX_EMP_NAME", "INDEX"),
+            ("APP_LINK", "DATABASE LINK"),
+            ("DATA_PUMP_DIR", "DIRECTORY"),
+            ("APP_LIB", "LIBRARY"),
+            ("EMP_CLUSTER", "CLUSTER"),
+            ("APP_CTX", "CONTEXT"),
+            ("SALES_DIM", "DIMENSION"),
+            ("TEXT_OP", "OPERATOR"),
+            ("TEXT_ITYPE", "INDEXTYPE"),
+            ("ORA_EDITION", "EDITION"),
+            ("Welcome", "JAVA SOURCE"),
+            ("WelcomeClass", "JAVA CLASS"),
+            ("WelcomeRes", "JAVA RESOURCE"),
+            ("APP_USER", "USER"),
+        ] {
+            assert_eq!(
+                data.suggestion_type_label(name, oracle),
+                Some(label),
+                "{name} should be labelled {label}"
+            );
+        }
         // Static catalog keyword and a built-in function rendered with "()".
         assert_eq!(
             data.suggestion_type_label("SELECT", oracle),
@@ -6826,8 +6987,57 @@ mod intellisense_tests {
             vec![
                 ("EMP".to_string(), Some(QualifiedMemberKind::Table)),
                 ("EMP_VIEW".to_string(), Some(QualifiedMemberKind::View)),
+                (
+                    "EMP_MV".to_string(),
+                    Some(QualifiedMemberKind::MaterializedView),
+                ),
+                ("EMP_TYPE".to_string(), Some(QualifiedMemberKind::Type)),
+                ("EMP_TRG".to_string(), Some(QualifiedMemberKind::Trigger)),
+                ("EMP_EVENT".to_string(), Some(QualifiedMemberKind::Event)),
+                ("EMP_IDX".to_string(), Some(QualifiedMemberKind::Index)),
+                ("EMP_PROC".to_string(), Some(QualifiedMemberKind::Procedure)),
+                ("EMP_FUNC".to_string(), Some(QualifiedMemberKind::Function)),
                 ("EMP_SEQ".to_string(), Some(QualifiedMemberKind::Sequence)),
                 ("EMP_PKG".to_string(), Some(QualifiedMemberKind::Package)),
+                ("EMP_SYN".to_string(), Some(QualifiedMemberKind::Synonym)),
+                (
+                    "EMP_LINK".to_string(),
+                    Some(QualifiedMemberKind::DatabaseLink),
+                ),
+                ("EMP_DIR".to_string(), Some(QualifiedMemberKind::Directory)),
+                ("EMP_LIB".to_string(), Some(QualifiedMemberKind::Library)),
+                (
+                    "EMP_CLUSTER".to_string(),
+                    Some(QualifiedMemberKind::Cluster),
+                ),
+                ("EMP_CTX".to_string(), Some(QualifiedMemberKind::Context)),
+                ("EMP_DIM".to_string(), Some(QualifiedMemberKind::Dimension)),
+                ("EMP_OP".to_string(), Some(QualifiedMemberKind::Operator)),
+                (
+                    "EMP_ITYPE".to_string(),
+                    Some(QualifiedMemberKind::Indextype),
+                ),
+                (
+                    "EMP_EDITION".to_string(),
+                    Some(QualifiedMemberKind::Edition),
+                ),
+                (
+                    "EMP_JAVA_SRC".to_string(),
+                    Some(QualifiedMemberKind::JavaSource),
+                ),
+                (
+                    "EMP_JAVA_CLASS".to_string(),
+                    Some(QualifiedMemberKind::JavaClass),
+                ),
+                (
+                    "EMP_JAVA_RES".to_string(),
+                    Some(QualifiedMemberKind::JavaResource),
+                ),
+                (
+                    "EMP_PUB_SYN".to_string(),
+                    Some(QualifiedMemberKind::PublicSynonym),
+                ),
+                ("EMP_USER".to_string(), Some(QualifiedMemberKind::User)),
             ],
         );
         data.set_members_for_qualifier_with_kinds(
@@ -6843,11 +7053,37 @@ mod intellisense_tests {
         assert_eq!(data.default_qualifier(), Some("SCOTT"));
         assert_eq!(data.tables, vec!["EMP".to_string()]);
         assert_eq!(data.views, vec!["EMP_VIEW".to_string()]);
+        assert_eq!(data.materialized_views, vec!["EMP_MV".to_string()]);
+        assert_eq!(data.types, vec!["EMP_TYPE".to_string()]);
+        assert_eq!(data.triggers, vec!["EMP_TRG".to_string()]);
+        assert_eq!(data.events, vec!["EMP_EVENT".to_string()]);
+        assert_eq!(data.indexes, vec!["EMP_IDX".to_string()]);
+        assert_eq!(data.procedures, vec!["EMP_PROC".to_string()]);
+        assert_eq!(data.functions, vec!["EMP_FUNC".to_string()]);
         assert_eq!(data.sequences, vec!["EMP_SEQ".to_string()]);
         assert_eq!(data.packages, vec!["EMP_PKG".to_string()]);
+        assert_eq!(data.synonyms, vec!["EMP_SYN".to_string()]);
+        assert_eq!(data.database_links, vec!["EMP_LINK".to_string()]);
+        assert_eq!(data.directories, vec!["EMP_DIR".to_string()]);
+        assert_eq!(data.libraries, vec!["EMP_LIB".to_string()]);
+        assert_eq!(data.clusters, vec!["EMP_CLUSTER".to_string()]);
+        assert_eq!(data.contexts, vec!["EMP_CTX".to_string()]);
+        assert_eq!(data.dimensions, vec!["EMP_DIM".to_string()]);
+        assert_eq!(data.operators, vec!["EMP_OP".to_string()]);
+        assert_eq!(data.indextypes, vec!["EMP_ITYPE".to_string()]);
+        assert_eq!(data.editions, vec!["EMP_EDITION".to_string()]);
+        assert_eq!(data.java_sources, vec!["EMP_JAVA_SRC".to_string()]);
+        assert_eq!(data.java_classes, vec!["EMP_JAVA_CLASS".to_string()]);
+        assert_eq!(data.java_resources, vec!["EMP_JAVA_RES".to_string()]);
+        assert!(data.public_synonyms.is_empty());
+        assert!(data.users.is_empty());
         assert_eq!(
             data.get_table_object_suggestions("E"),
             vec!["EMP".to_string()]
+        );
+        assert_eq!(
+            data.suggestion_type_label("EMP_LINK", Some(crate::db::DatabaseType::Oracle)),
+            Some("DATABASE LINK")
         );
     }
 
