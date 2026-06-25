@@ -2407,6 +2407,11 @@ fn phase_on_open_paren(
     if matches!(statement_kind, StatementKind::Insert)
         && previous_word_chain_matches(tokens, open_paren_idx, &["CONFLICT", "ON"])
     {
+        if on_conflict_looks_like_expression_call(tokens, open_paren_idx, current_phase)
+            || paren_depth_before_token(tokens, open_paren_idx) > 0
+        {
+            return None;
+        }
         return Some(SqlPhase::ConflictTargetList);
     }
 
@@ -2437,6 +2442,33 @@ fn phase_on_open_paren(
     }
 
     None
+}
+
+fn on_conflict_looks_like_expression_call(
+    tokens: &[SqlToken],
+    open_paren_idx: usize,
+    current_phase: SqlPhase,
+) -> bool {
+    prev_word_upper(tokens, open_paren_idx).is_some_and(|(word, conflict_idx)| {
+        word == "CONFLICT"
+            && prev_word_upper(tokens, conflict_idx).is_some_and(|(prev_word, on_idx)| {
+                prev_word == "ON"
+                    && is_keyword_function_call_start(tokens, on_idx)
+                    && is_statement_keyword_suppressed_in_expression_phase(current_phase)
+            })
+    })
+}
+
+fn paren_depth_before_token(tokens: &[SqlToken], end_idx: usize) -> usize {
+    let mut depth = 0usize;
+    for token in tokens.iter().take(end_idx) {
+        match token {
+            SqlToken::Symbol(sym) if sym == "(" => depth = depth.saturating_add(1),
+            SqlToken::Symbol(sym) if sym == ")" => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    depth
 }
 
 fn alias_column_list_source_before_open_paren(
@@ -4494,11 +4526,17 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         }
                         relation_state.clear();
                     }
-                    "MATCH_RECOGNIZE" if depth_frames[depth].phase.is_table_context() => {
+                    "MATCH_RECOGNIZE"
+                        if depth_frames[depth].phase.is_table_context()
+                            && !relation_state.is_expect_table() =>
+                    {
                         depth_frames[depth].phase = SqlPhase::MatchRecognizeClause;
                         relation_state.clear();
                     }
-                    "MATCH" if depth_frames[depth].phase.is_table_context() => {
+                    "MATCH"
+                        if depth_frames[depth].phase.is_table_context()
+                            && !relation_state.is_expect_table() =>
+                    {
                         if let Some((next_keyword, next_idx)) = next_word_upper(tokens, idx + 1) {
                             if next_keyword == "RECOGNIZE" {
                                 depth_frames[depth].phase = SqlPhase::MatchRecognizeClause;
@@ -4507,11 +4545,17 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             }
                         }
                     }
-                    "PIVOT" | "UNPIVOT" if depth_frames[depth].phase.is_table_context() => {
+                    "PIVOT" | "UNPIVOT"
+                        if depth_frames[depth].phase.is_table_context()
+                            && !relation_state.is_expect_table() =>
+                    {
                         depth_frames[depth].phase = SqlPhase::PivotClause;
                         relation_state.clear();
                     }
-                    "MODEL" if model_clause_can_start(tokens, idx, depth_frames[depth].phase) => {
+                    "MODEL"
+                        if !relation_state.is_expect_table()
+                            && model_clause_can_start(tokens, idx, depth_frames[depth].phase) =>
+                    {
                         depth_frames[depth].phase = SqlPhase::ModelClause;
                         relation_state.clear();
                     }

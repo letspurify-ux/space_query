@@ -2410,6 +2410,48 @@ fn table_clause_construct_keywords_do_not_hijack_expression_calls() {
     );
 
     for sql in [
+        "SELECT * FROM pivot(|)",
+        "SELECT * FROM unpivot(|)",
+        "SELECT * FROM match_recognize(|)",
+        "SELECT * FROM match recognize(|)",
+        "SELECT * FROM model(|)",
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        assert_ne!(
+            ctx.phase,
+            intellisense_context::SqlPhase::PivotClause,
+            "table-source identifier/function position was misclassified as PIVOT at `{sql}`"
+        );
+        assert_ne!(
+            ctx.phase,
+            intellisense_context::SqlPhase::MatchRecognizeClause,
+            "table-source identifier/function position was misclassified as MATCH_RECOGNIZE at `{sql}`"
+        );
+        assert_ne!(
+            ctx.phase,
+            intellisense_context::SqlPhase::ModelClause,
+            "table-source identifier/function position was misclassified as MODEL at `{sql}`"
+        );
+
+        let (kind, keywords, suggestions) = audit_final_suggestions_for(sql, Oracle);
+        for leaked in [
+            "SUM()",
+            "COUNT()",
+            "DEFINE",
+            "PATTERN",
+            "PARTITION BY",
+            "DIMENSION BY",
+            "MEASURES",
+            "RULES",
+        ] {
+            assert!(
+                !contains(&suggestions, leaked),
+                "{leaked} leaked from table-clause grammar into table-source identifier/function position at `{sql}`: kind={kind:?} keywords={keywords:?} final={suggestions:?}"
+            );
+        }
+    }
+
+    for sql in [
         "SELECT pivot(|) FROM t",
         "SELECT some_func(pivot(|)) FROM t",
         "SELECT match_recognize(|) FROM t",
@@ -2659,6 +2701,22 @@ fn dml_expression_calls_do_not_reenter_structural_keyword_phases() {
         ),
         ("INSERT INTO emp (a) VALUES (into(|))", SqlPhase::ValuesClause),
         ("INSERT INTO emp (a) VALUES (using(|))", SqlPhase::ValuesClause),
+        (
+            "INSERT INTO emp (a) VALUES (on conflict(|))",
+            SqlPhase::ValuesClause,
+        ),
+        (
+            "INSERT INTO emp (a) SELECT on conflict(|) FROM s",
+            SqlPhase::SelectList,
+        ),
+        (
+            "INSERT INTO emp (a) SELECT x, on conflict(|) FROM s",
+            SqlPhase::SelectList,
+        ),
+        (
+            "INSERT INTO emp (a) SELECT x FROM s WHERE on conflict(|)",
+            SqlPhase::WhereClause,
+        ),
         (
             "UPDATE emp SET a = 1 RETURNING returning(|)",
             SqlPhase::DmlReturningList,
