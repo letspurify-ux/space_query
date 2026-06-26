@@ -6261,7 +6261,7 @@ impl MainWindow {
                 }
                 QueryProgress::StatementStart {
                     index,
-                    create_result_tab,
+                    result_tab_policy,
                 } => {
                     let has_live_connection = s.has_live_connection;
                     let has_running_queries = s.sql_editor.is_query_running()
@@ -6282,6 +6282,7 @@ impl MainWindow {
                         };
                         context.fetch_row_counts.remove(&index);
                         context.mark_statement_running(index);
+                        let create_result_tab = result_tab_policy.creates_result_tab();
                         let result_tab_id = create_result_tab.then(|| {
                             context.ensure_result_tab_id(index, || result_tabs.reserve_result_tab_id())
                         });
@@ -6944,7 +6945,6 @@ impl MainWindow {
                     let remove_empty_success_grid = result_status == ResultTabStatus::Done
                         && result_tab_id.is_some()
                         && !should_display_data_grid
-                        && !result.is_select
                         && grid_execution_target.is_none()
                         && !has_fetched_rows;
                     let mut removed_last_result_tab = false;

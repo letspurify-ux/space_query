@@ -988,6 +988,15 @@ impl StatementSessionEffects {
         self.transaction.requires_decision_after_success
     }
 
+    pub(crate) fn requires_transaction_decision_after_interrupt(self, auto_commit: bool) -> bool {
+        !auto_commit
+            && (self.transaction.may_leave_uncommitted_work
+                || self.transaction.opens_or_preserves_state
+                || self.transaction.requires_decision_after_success
+                || self.state_hint.requires_retention_when_autocommit_off
+                || self.state_hint.requires_transaction_decision_after_success)
+    }
+
     fn acquires_table_lock(self) -> bool {
         matches!(self.table_lock, StatementTableLockEffect::Acquires)
     }
@@ -1533,10 +1542,6 @@ impl MySqlBatchSessionEffects {
         self.may_have_uncommitted_work
     }
 
-    pub(crate) fn transaction_state_cleared(&self) -> bool {
-        self.transaction_state_cleared
-    }
-
     pub(crate) fn may_hold_table_lock(&self) -> bool {
         self.table_lock_delta.may_hold() || self.flush_table_lock_delta.may_hold()
     }
@@ -1689,8 +1694,8 @@ impl MySqlBatchSessionEffects {
     pub(crate) fn retained_state_after_interrupted_batch(
         &self,
         prior_state: RetainedSessionState,
-        script_mode: bool,
-        auto_commit: bool,
+        _script_mode: bool,
+        _auto_commit: bool,
     ) -> Option<RetainedSessionState> {
         let prior_transaction_state = self.prior_transaction_state_after_batch(prior_state);
         let prior_may_have_uncommitted_work =
@@ -1703,8 +1708,7 @@ impl MySqlBatchSessionEffects {
                     .transaction_state()
                     .requires_transaction_decision())
             || self.may_have_uncommitted_work_after_batch(prior_state)
-            || (self.saw_uncertain_named_lock_release() && prior_may_have_uncommitted_work)
-            || (script_mode && !auto_commit && !self.transaction_state_cleared());
+            || (self.saw_uncertain_named_lock_release() && prior_may_have_uncommitted_work);
         let transaction_state =
             if prior_transaction_state == TransactionSessionState::InvalidSession {
                 TransactionSessionState::InvalidSession
@@ -4432,6 +4436,30 @@ mod tests {
         };
 
         assert!(!statement_cancel_can_reuse_session(hint));
+    }
+
+    #[test]
+    fn oracle_interrupt_decision_covers_transaction_preserving_statements() {
+        let post_processor = statement_session_post_processor_for(DatabaseType::Oracle);
+        let plain_select = post_processor.effects_for_sql("SELECT 1 FROM dual");
+        assert!(!plain_select.requires_transaction_decision_after_interrupt(false));
+
+        for sql in [
+            "SET TRANSACTION READ ONLY",
+            "LOCK TABLE t IN EXCLUSIVE MODE",
+            "SAVEPOINT sp1",
+            "ROLLBACK TO SAVEPOINT sp1",
+        ] {
+            let effects = post_processor.effects_for_sql(sql);
+            assert!(
+                effects.requires_transaction_decision_after_interrupt(false),
+                "{sql}"
+            );
+            assert!(
+                !effects.requires_transaction_decision_after_interrupt(true),
+                "{sql}"
+            );
+        }
     }
 
     #[test]
@@ -9168,18 +9196,12 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_mysql_autocommit_off_script_requires_decision() {
+    fn interrupted_mysql_clean_autocommit_off_script_does_not_require_decision() {
         let batch_effects = MySqlBatchSessionEffects::default();
 
-        let retained = batch_effects
+        assert!(batch_effects
             .retained_state_after_interrupted_batch(RetainedSessionState::default(), true, false)
-            .expect("autocommit-off script interrupt must require a decision");
-
-        assert_eq!(
-            retained.transaction_state(),
-            TransactionSessionState::DecisionRequired
-        );
-        assert!(retained.requires_transaction_decision());
+            .is_none());
     }
 
     #[test]

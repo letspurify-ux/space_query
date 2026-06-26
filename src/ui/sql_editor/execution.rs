@@ -530,11 +530,11 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
                         let _ = sender.send(QueryProgress::BatchStart {
                             activity: db_activity.to_string(),
                         });
-                        let _ = sender.send(QueryProgress::StatementStart {
+                        SqlEditorWidget::emit_statement_start(
+                            &sender,
                             index,
-                            create_result_tab: true,
-                        });
-                        app::awake();
+                            ResultTabPolicy::Create,
+                        );
                         let (heading_enabled, feedback_enabled) =
                             SqlEditorWidget::current_output_settings(&session);
                         let (colsep, null_text, _trimspool_enabled) =
@@ -1219,6 +1219,20 @@ impl QueryExecutionCleanupGuard {
         }
     }
 
+    fn protect_oracle_statement_on_cancel(
+        &mut self,
+        auto_commit: bool,
+        statement_effects: crate::db::StatementSessionEffects,
+    ) {
+        if statement_effects.requires_transaction_decision_after_interrupt(auto_commit)
+            || (auto_commit
+                && (statement_effects.may_leave_uncommitted_work()
+                    || statement_effects.requires_transaction_decision_after_success()))
+        {
+            self.protect_oracle_dirty_statement_on_cancel(auto_commit);
+        }
+    }
+
     fn protect_oracle_script_session_after_interrupt(&mut self, auto_commit: bool) {
         if auto_commit {
             self.invalidate_oracle_pooled_session();
@@ -1227,20 +1241,19 @@ impl QueryExecutionCleanupGuard {
         }
     }
 
-    fn protect_oracle_select_session_after_interrupt(
+    fn protect_oracle_statement_after_interrupt(
         &mut self,
-        script_mode: bool,
         auto_commit: bool,
         statement_effects: crate::db::StatementSessionEffects,
     ) {
-        if statement_effects.may_leave_uncommitted_work()
-            || statement_effects.opens_or_preserves_transaction_state()
-            || statement_effects.requires_transaction_decision_after_success()
-            || script_mode
-        {
+        self.require_oracle_pooled_session_health_check();
+        if statement_effects.requires_transaction_decision_after_interrupt(auto_commit) {
             self.protect_oracle_script_session_after_interrupt(auto_commit);
-        } else {
-            self.require_oracle_pooled_session_health_check();
+        } else if auto_commit
+            && (statement_effects.may_leave_uncommitted_work()
+                || statement_effects.requires_transaction_decision_after_success())
+        {
+            self.invalidate_oracle_pooled_session();
         }
     }
 
@@ -6976,11 +6989,11 @@ impl SqlEditorWidget {
                                             message,
                                         );
                                     let index = result_index;
-                                    let _ = sender.send(QueryProgress::StatementStart {
+                                    SqlEditorWidget::emit_statement_start(
+                                        sender,
                                         index,
-                                        create_result_tab: true,
-                                    });
-                                    app::awake();
+                                        ResultTabPolicy::Create,
+                                    );
                                     let mut result = QueryResult::new_error(&sql_text, &message);
                                     result.is_select = true;
                                     if !result.message.trim().is_empty() {
@@ -7009,11 +7022,11 @@ impl SqlEditorWidget {
                                 }
                                 let session_id = next_lazy_fetch_session_id
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                let _ = sender.send(QueryProgress::StatementStart {
-                                    index: result_index,
-                                    create_result_tab: true,
-                                });
-                                app::awake();
+                                SqlEditorWidget::emit_statement_start(
+                                    sender,
+                                    result_index,
+                                    ResultTabPolicy::Create,
+                                );
                                 SqlEditorWidget::start_mysql_lazy_select(
                                     connection_generation,
                                     pool_context_epoch,
@@ -7065,11 +7078,11 @@ impl SqlEditorWidget {
                                     }
                                 } else {
                                     let index = result_index;
-                                    let _ = sender.send(QueryProgress::StatementStart {
+                                    SqlEditorWidget::emit_statement_start(
+                                        sender,
                                         index,
-                                        create_result_tab: true,
-                                    });
-                                    app::awake();
+                                        ResultTabPolicy::Create,
+                                    );
                                     let mut result = QueryResult::new_error(&sql_text, &message);
                                     result.is_select = true;
                                     if !result.message.trim().is_empty() {
@@ -7106,11 +7119,11 @@ impl SqlEditorWidget {
                     }
                     let mut result_statement_start_emitted = false;
                     if !script_mode && displayable_result_statement {
-                        let _ = sender.send(QueryProgress::StatementStart {
-                            index: result_index,
-                            create_result_tab: true,
-                        });
-                        app::awake();
+                        SqlEditorWidget::emit_statement_start(
+                            sender,
+                            result_index,
+                            ResultTabPolicy::Create,
+                        );
                         result_statement_start_emitted = true;
                     }
                     match execute_mysql_sql(sql_text.as_str(), auto_commit, &mysql_batch_effects) {
@@ -7815,12 +7828,6 @@ impl SqlEditorWidget {
                     );
                     cleanup.track_oracle_pooled_session_scope_connection(shared_connection.clone());
                 }
-                if script_mode && auto_commit {
-                    cleanup.invalidate_oracle_pooled_session_on_cancel();
-                } else if script_mode {
-                    cleanup.require_oracle_pooled_session_transaction_decision_on_cancel();
-                }
-
                 let explicit_transaction_first_statement =
                     SqlEditorWidget::requires_transaction_first_statement(&items);
                 let transaction_mode = if explicit_transaction_first_statement {
@@ -9950,8 +9957,8 @@ impl SqlEditorWidget {
                                     SqlEditorWidget::emit_statement_start_once(
                                         &sender,
                                         index,
-                                        false,
-&mut statement_start_emitted,
+                                        ResultTabPolicy::Defer,
+                                        &mut statement_start_emitted,
                                     );
                                 }
                                 let mut timed_out = false;
@@ -9997,8 +10004,8 @@ impl SqlEditorWidget {
                                     SqlEditorWidget::emit_statement_start_once(
                                         &sender,
                                         index,
-                                        false,
-&mut statement_start_emitted,
+                                        ResultTabPolicy::Defer,
+                                        &mut statement_start_emitted,
                                     );
                                     if !result.message.trim().is_empty() {
                                         SqlEditorWidget::append_spool_output(
@@ -10036,8 +10043,8 @@ impl SqlEditorWidget {
                                     SqlEditorWidget::emit_statement_start_once(
                                         &sender,
                                         index,
-                                        false,
-&mut statement_start_emitted,
+                                        ResultTabPolicy::Defer,
+                                        &mut statement_start_emitted,
                                     );
                                 }
                                 let mut timed_out = false;
@@ -10083,8 +10090,8 @@ impl SqlEditorWidget {
                                     SqlEditorWidget::emit_statement_start_once(
                                         &sender,
                                         index,
-                                        false,
-&mut statement_start_emitted,
+                                        ResultTabPolicy::Defer,
+                                        &mut statement_start_emitted,
                                     );
                                     if !result.message.trim().is_empty() {
                                         SqlEditorWidget::append_spool_output(
@@ -10243,7 +10250,10 @@ impl SqlEditorWidget {
                                     }
                                 };
 
-                                cleanup.protect_oracle_dirty_statement_on_cancel(auto_commit);
+                                cleanup.protect_oracle_statement_on_cancel(
+                                    auto_commit,
+                                    statement_effects,
+                                );
                                 SqlEditorWidget::apply_oracle_db_statement_effects(
                                     &mut cleanup,
                                     statement_effects,
@@ -10255,8 +10265,8 @@ impl SqlEditorWidget {
                                     SqlEditorWidget::emit_statement_start_once(
                                         &sender,
                                         index,
-                                        false,
-&mut statement_start_emitted,
+                                        ResultTabPolicy::Defer,
+                                        &mut statement_start_emitted,
                                     );
                                 }
                                 let statement_start = Instant::now();
@@ -10274,17 +10284,16 @@ impl SqlEditorWidget {
                                         if load_mutex_bool(&cancel_flag) {
                                             timed_out = false;
                                         }
-                                        cleanup.note_oracle_statement_error(&err, auto_commit);
-                                        if !auto_commit
-                                            && (cancelled || timed_out)
-                                            && !SqlEditorWidget::oracle_error_message_has_connection_error(
+                                        let has_connection_error =
+                                            SqlEditorWidget::oracle_error_message_has_connection_error(
                                                 &err.to_string(),
-                                            )
-                                        {
-                                            cleanup
-                                                .require_oracle_pooled_session_health_check();
-                                            cleanup
-                                                .require_oracle_pooled_session_transaction_decision();
+                                            );
+                                        cleanup.note_oracle_statement_error(&err, auto_commit);
+                                        if (cancelled || timed_out) && !has_connection_error {
+                                            cleanup.protect_oracle_statement_after_interrupt(
+                                                auto_commit,
+                                                statement_effects,
+                                            );
                                         } else {
                                             SqlEditorWidget::invalidate_oracle_pooled_session_after_error(
                                                 &mut cleanup,
@@ -10312,8 +10321,8 @@ impl SqlEditorWidget {
                                             SqlEditorWidget::emit_statement_start_once(
                                                 &sender,
                                                 index,
-                                                false,
-&mut statement_start_emitted,
+                                                ResultTabPolicy::Defer,
+                                                &mut statement_start_emitted,
                                             );
                                             SqlEditorWidget::append_spool_output(
                                                 &session,
@@ -10467,8 +10476,8 @@ impl SqlEditorWidget {
                                                 SqlEditorWidget::emit_statement_start_once(
                                                     &sender,
                                                     index,
-                                                    false,
-&mut statement_start_emitted,
+                                                    ResultTabPolicy::Defer,
+                                                    &mut statement_start_emitted,
                                                 );
                                                 SqlEditorWidget::append_spool_output(
                                                     &session,
@@ -10545,8 +10554,8 @@ impl SqlEditorWidget {
                                             SqlEditorWidget::emit_statement_start_once(
                                                 &sender,
                                                 index,
-                                                false,
-&mut statement_start_emitted,
+                                                ResultTabPolicy::Defer,
+                                                &mut statement_start_emitted,
                                             );
                                             SqlEditorWidget::append_spool_output(
                                                 &session,
@@ -10607,8 +10616,8 @@ impl SqlEditorWidget {
                                     SqlEditorWidget::emit_statement_start_once(
                                         &sender,
                                         index,
-                                        false,
-&mut statement_start_emitted,
+                                        ResultTabPolicy::Defer,
+                                        &mut statement_start_emitted,
                                     );
                                     if !result.message.trim().is_empty() {
                                         SqlEditorWidget::append_spool_output(
@@ -10631,14 +10640,14 @@ impl SqlEditorWidget {
                                         break;
                                     }
                                     let index = result_index;
-                                    let _ = sender.send(QueryProgress::StatementStart { index, create_result_tab: true });
-                                    app::awake();
 
                                     let mut buffered_rows: Vec<Vec<String>> = Vec::new();
                                     let mut cursor_rows: Vec<Vec<String>> = Vec::new();
                                     let mut last_flush = Instant::now();
                                     let mut has_flushed_rows = false;
                                     let mut cursor_timed_out = false;
+                                    let cursor_has_columns = std::cell::Cell::new(false);
+                                    let cursor_statement_started = std::cell::Cell::new(false);
                                     let (heading_enabled, feedback_enabled) =
                                         SqlEditorWidget::current_output_settings(&session);
                                     let (colsep, null_text, _trimspool_enabled) =
@@ -10653,6 +10662,17 @@ impl SqlEditorWidget {
                                                 .iter()
                                                 .map(|col| col.name.clone())
                                                 .collect::<Vec<String>>();
+                                            if names.is_empty() {
+                                                return;
+                                            }
+                                            if !cursor_statement_started.replace(true) {
+                                                SqlEditorWidget::emit_statement_start(
+                                                    &sender,
+                                                    index,
+                                                    ResultTabPolicy::Create,
+                                                );
+                                            }
+                                            cursor_has_columns.set(true);
                                             let display_columns =
                                                 SqlEditorWidget::apply_heading_setting(
                                                     names,
@@ -10676,6 +10696,9 @@ impl SqlEditorWidget {
                                                 return false;
                                             }
                                             cursor_rows.push(row.clone());
+                                            if !cursor_has_columns.get() {
+                                                return true;
+                                            }
                                             let mut display_row = row;
                                             SqlEditorWidget::apply_null_text_to_row(
                                                 &mut display_row,
@@ -10834,13 +10857,13 @@ impl SqlEditorWidget {
                                         break;
                                     }
                                     let index = result_index;
-                                    let _ = sender.send(QueryProgress::StatementStart { index, create_result_tab: true });
-                                    app::awake();
 
                                     let mut buffered_rows: Vec<Vec<String>> = Vec::new();
                                     let mut last_flush = Instant::now();
                                     let mut has_flushed_rows = false;
                                     let mut cursor_timed_out = false;
+                                    let cursor_has_columns = std::cell::Cell::new(false);
+                                    let cursor_statement_started = std::cell::Cell::new(false);
                                     let (heading_enabled, feedback_enabled) =
                                         SqlEditorWidget::current_output_settings(&session);
                                     let (colsep, null_text, _trimspool_enabled) =
@@ -10855,6 +10878,17 @@ impl SqlEditorWidget {
                                                 .iter()
                                                 .map(|col| col.name.clone())
                                                 .collect::<Vec<String>>();
+                                            if names.is_empty() {
+                                                return;
+                                            }
+                                            if !cursor_statement_started.replace(true) {
+                                                SqlEditorWidget::emit_statement_start(
+                                                    &sender,
+                                                    index,
+                                                    ResultTabPolicy::Create,
+                                                );
+                                            }
+                                            cursor_has_columns.set(true);
                                             let display_columns =
                                                 SqlEditorWidget::apply_heading_setting(
                                                     names,
@@ -10876,6 +10910,9 @@ impl SqlEditorWidget {
                                         &mut |row| {
                                             if load_mutex_bool(&cancel_flag) {
                                                 return false;
+                                            }
+                                            if !cursor_has_columns.get() {
+                                                return true;
                                             }
                                             let mut display_row = row;
                                             SqlEditorWidget::apply_null_text_to_row(
@@ -11081,8 +11118,11 @@ impl SqlEditorWidget {
                                 };
 
                                 let index = result_index;
-                                let _ = sender.send(QueryProgress::StatementStart { index, create_result_tab: true });
-                                app::awake();
+                                SqlEditorWidget::emit_statement_start(
+                                    &sender,
+                                    index,
+                                    ResultTabPolicy::Create,
+                                );
 
                                 let (heading_enabled, feedback_enabled) =
                                     SqlEditorWidget::current_output_settings(&session);
@@ -11388,11 +11428,7 @@ impl SqlEditorWidget {
                                                     false, true, true, false,
                                                 );
                                                 cleanup
-                                                    .protect_oracle_select_session_after_interrupt(
-                                                        script_mode,
-                                                        auto_commit,
-                                                        statement_effects,
-                                                    );
+                                                    .protect_oracle_statement_after_interrupt(auto_commit, statement_effects);
                                             } else if was_cancelled {
                                                 query_result.message =
                                                     SqlEditorWidget::cancel_message();
@@ -11402,11 +11438,7 @@ impl SqlEditorWidget {
                                                     true, false, false, false,
                                                 );
                                                 cleanup
-                                                    .protect_oracle_select_session_after_interrupt(
-                                                        script_mode,
-                                                        auto_commit,
-                                                        statement_effects,
-                                                    );
+                                                    .protect_oracle_statement_after_interrupt(auto_commit, statement_effects);
                                             }
                                             if !feedback_enabled {
                                                 query_result.message.clear();
@@ -11430,11 +11462,7 @@ impl SqlEditorWidget {
                                             statement_interrupted = timed_out || cancelled;
                                             if statement_interrupted {
                                                 cleanup
-                                                    .protect_oracle_select_session_after_interrupt(
-                                                        script_mode,
-                                                        auto_commit,
-                                                        statement_effects,
-                                                    );
+                                                    .protect_oracle_statement_after_interrupt(auto_commit, statement_effects);
                                             }
                                             SqlEditorWidget::invalidate_oracle_pooled_session_after_select_error(
                                                 &mut cleanup,
@@ -11634,15 +11662,18 @@ impl SqlEditorWidget {
                                     }
                                 };
 
-                                cleanup.protect_oracle_dirty_statement_on_cancel(auto_commit);
+                                cleanup.protect_oracle_statement_on_cancel(
+                                    auto_commit,
+                                    statement_effects,
+                                );
                                 let index = result_index;
                                 let mut statement_start_emitted = false;
                                 if !script_mode {
                                     SqlEditorWidget::emit_statement_start_once(
                                         &sender,
                                         index,
-                                        false,
-&mut statement_start_emitted,
+                                        ResultTabPolicy::Defer,
+                                        &mut statement_start_emitted,
                                     );
                                 }
                                 let statement_start = Instant::now();
@@ -11671,14 +11702,11 @@ impl SqlEditorWidget {
                                                 statement_effects,
                                             );
                                         }
-                                        if !auto_commit
-                                            && (cancelled || timed_out)
-                                            && !has_connection_error
-                                        {
-                                            cleanup
-                                                .require_oracle_pooled_session_health_check();
-                                            cleanup
-                                                .require_oracle_pooled_session_transaction_decision();
+                                        if (cancelled || timed_out) && !has_connection_error {
+                                            cleanup.protect_oracle_statement_after_interrupt(
+                                                auto_commit,
+                                                statement_effects,
+                                            );
                                         } else {
                                             SqlEditorWidget::invalidate_oracle_pooled_session_after_error(
                                                 &mut cleanup,
@@ -11704,11 +11732,11 @@ impl SqlEditorWidget {
                                             );
                                         } else {
                                             SqlEditorWidget::emit_statement_start_once(
-                                                &sender,
-                                                index,
-                                                false,
-&mut statement_start_emitted,
-                                            );
+                                        &sender,
+                                        index,
+                                        ResultTabPolicy::Defer,
+                                        &mut statement_start_emitted,
+                                    );
                                             let result =
                                                 QueryResult::new_error(&sql_text, &message);
                                             let _ = sender.send(QueryProgress::StatementFinished {
@@ -11980,8 +12008,8 @@ impl SqlEditorWidget {
                                     SqlEditorWidget::emit_statement_start_once(
                                         &sender,
                                         index,
-                                        false,
-&mut statement_start_emitted,
+                                        ResultTabPolicy::Defer,
+                                        &mut statement_start_emitted,
                                     );
                                     if !result.message.trim().is_empty() {
                                         SqlEditorWidget::append_spool_output(
@@ -12127,11 +12155,7 @@ impl SqlEditorWidget {
             return false;
         }
 
-        let _ = sender.send(QueryProgress::StatementStart {
-            index,
-            create_result_tab: false,
-        });
-        app::awake();
+        Self::emit_statement_start(sender, index, ResultTabPolicy::Defer);
         if !message.trim().is_empty() {
             SqlEditorWidget::append_spool_output(session, std::slice::from_ref(&message));
         }
@@ -12147,20 +12171,28 @@ impl SqlEditorWidget {
         true
     }
 
+    fn emit_statement_start(
+        sender: &mpsc::Sender<QueryProgress>,
+        index: usize,
+        result_tab_policy: ResultTabPolicy,
+    ) {
+        let _ = sender.send(QueryProgress::StatementStart {
+            index,
+            result_tab_policy,
+        });
+        app::awake();
+    }
+
     fn emit_statement_start_once(
         sender: &mpsc::Sender<QueryProgress>,
         index: usize,
-        create_result_tab: bool,
+        result_tab_policy: ResultTabPolicy,
         emitted: &mut bool,
     ) {
         if *emitted {
             return;
         }
-        let _ = sender.send(QueryProgress::StatementStart {
-            index,
-            create_result_tab,
-        });
-        app::awake();
+        Self::emit_statement_start(sender, index, result_tab_policy);
         *emitted = true;
     }
 
@@ -12962,11 +12994,18 @@ impl SqlEditorWidget {
         let display_columns =
             Self::apply_heading_setting(raw_column_names.clone(), heading_enabled);
 
-        let _ = sender.send(QueryProgress::StatementStart {
-            index,
-            create_result_tab: true,
-        });
-        app::awake();
+        if raw_column_names.is_empty() {
+            Self::oracle_thin_close_ref_cursor(conn, initial_cursor_id, active_cursor_id);
+            return Ok(OracleThinCursorStreamOutcome {
+                cursor_result: CursorResult {
+                    columns: raw_column_names,
+                    rows: Vec::new(),
+                },
+                was_cancelled: false,
+            });
+        }
+
+        Self::emit_statement_start(sender, index, ResultTabPolicy::Create);
 
         if Self::execute_oracle_thin_cancel_requested(cancel_flag) {
             Self::oracle_thin_close_ref_cursor(conn, initial_cursor_id, active_cursor_id);
@@ -13850,11 +13889,26 @@ impl SqlEditorWidget {
         columns: Vec<String>,
         rows: Vec<Vec<String>>,
     ) {
+        Self::emit_oracle_thin_select_result_with_start_option(
+            sender, session, conn_name, index, sql, columns, rows, true,
+        );
+    }
+
+    fn emit_oracle_thin_select_result_with_start_option(
+        sender: &mpsc::Sender<QueryProgress>,
+        session: &Arc<Mutex<SessionState>>,
+        conn_name: &str,
+        index: usize,
+        sql: &str,
+        columns: Vec<String>,
+        rows: Vec<Vec<String>>,
+        emit_statement_start: bool,
+    ) {
         let feedback_enabled = match session.lock() {
             Ok(guard) => guard.feedback_enabled,
             Err(poisoned) => poisoned.into_inner().feedback_enabled,
         };
-        Self::emit_select_result(
+        Self::emit_select_result_with_start_option(
             sender,
             session,
             conn_name,
@@ -13864,6 +13918,7 @@ impl SqlEditorWidget {
             rows,
             true,
             feedback_enabled,
+            emit_statement_start,
         );
     }
 
@@ -13940,6 +13995,8 @@ impl SqlEditorWidget {
         let mut had_error = false;
         let mut timed_out = false;
         let mut transaction_mode_applied = false;
+        let mut batch_may_report_transaction_work =
+            prior_retained_state.may_have_uncommitted_work();
         let working_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let mut frames = vec![ScriptExecutionFrame {
             items,
@@ -14719,6 +14776,10 @@ impl SqlEditorWidget {
                     let execution_sql = exec_call.unwrap_or_else(|| sql_to_execute.clone());
                     let head = Self::oracle_thin_statement_head(&execution_sql);
                     let statement_effects = post_processor.effects_for_sql(&execution_sql);
+                    batch_may_report_transaction_work |= statement_effects
+                        .may_leave_uncommitted_work()
+                        || statement_effects.opens_or_preserves_transaction_state()
+                        || statement_effects.requires_transaction_decision_after_success();
                     if head.starts_with("set serveroutput") {
                         let mut statement_error = None::<String>;
                         let mut confirmation = String::new();
@@ -14812,10 +14873,15 @@ impl SqlEditorWidget {
                                 }
                                 break;
                             } else {
+                                let tx_effects = post_processor.effects_for_sql(&tx_sql);
+                                batch_may_report_transaction_work |= tx_effects
+                                    .may_leave_uncommitted_work()
+                                    || tx_effects.opens_or_preserves_transaction_state()
+                                    || tx_effects.requires_transaction_decision_after_success();
                                 retained_state =
                                     Self::oracle_retained_state_after_statement_effects(
                                         retained_state,
-                                        post_processor.effects_for_sql(&tx_sql),
+                                        tx_effects,
                                         false,
                                         false,
                                         false,
@@ -14851,6 +14917,7 @@ impl SqlEditorWidget {
                             Err(err) => statement_error = Some(err),
                         }
                     } else if Self::oracle_thin_is_query(&execution_sql) {
+                        Self::emit_statement_start(sender, result_index, ResultTabPolicy::Create);
                         match Self::oracle_thin_select_cells_with_binds_and_cancel(
                             conn,
                             &execution_sql,
@@ -14895,7 +14962,7 @@ impl SqlEditorWidget {
                                         &columns,
                                         rows.last().map(Vec::as_slice),
                                     );
-                                    Self::emit_oracle_thin_select_result(
+                                    Self::emit_oracle_thin_select_result_with_start_option(
                                         sender,
                                         session,
                                         conn_name,
@@ -14903,6 +14970,7 @@ impl SqlEditorWidget {
                                         &display_sql,
                                         columns,
                                         rows,
+                                        false,
                                     );
                                     result_index += 1;
                                 }
@@ -15248,10 +15316,9 @@ impl SqlEditorWidget {
                             auto_commit,
                             true,
                             false,
-                            !auto_commit
-                                && (load_mutex_bool(cancel_flag) || statement_timed_out)
-                                && (statement_effects.may_leave_uncommitted_work()
-                                    || statement_effects.opens_or_preserves_transaction_state()),
+                            (load_mutex_bool(cancel_flag) || statement_timed_out)
+                                && statement_effects
+                                    .requires_transaction_decision_after_interrupt(auto_commit),
                         );
                         Self::emit_non_select_result(
                             sender,
@@ -15313,17 +15380,15 @@ impl SqlEditorWidget {
         let retained_state = if invalid_session {
             RetainedSessionState::from_transaction_state(TransactionSessionState::InvalidSession)
         } else {
-            let live_state =
-                if crate::db::DatabaseConnection::oracle_thin_session_may_have_uncommitted_work(
+            let live_state = if batch_may_report_transaction_work
+                && crate::db::DatabaseConnection::oracle_thin_session_may_have_uncommitted_work(
                     conn,
                     "oracle thin batch",
                 ) {
-                    RetainedSessionState::from_transaction_state(
-                        TransactionSessionState::MaybeDirty,
-                    )
-                } else {
-                    RetainedSessionState::default()
-                };
+                RetainedSessionState::from_transaction_state(TransactionSessionState::MaybeDirty)
+            } else {
+                RetainedSessionState::default()
+            };
             retained_state.conservative_merge(live_state)
         };
         OracleThinBatchOutcome {
@@ -16078,33 +16143,29 @@ impl SqlEditorWidget {
         feedback_enabled: bool,
         emit_statement_start: bool,
     ) {
-        if emit_statement_start {
-            let _ = sender.send(QueryProgress::StatementStart {
-                index,
-                create_result_tab: true,
-            });
-            app::awake();
+        let has_display_columns = !column_names.is_empty();
+        if emit_statement_start && has_display_columns {
+            Self::emit_statement_start(sender, index, ResultTabPolicy::Create);
         }
         let (colsep, null_text, _trimspool_enabled) =
             SqlEditorWidget::current_text_output_settings(session);
-        let _ = sender.send(QueryProgress::SelectStart {
-            index,
-            columns: column_names.clone(),
-            null_text: null_text.clone(),
-        });
-        app::awake();
-        if !column_names.is_empty() {
+        if has_display_columns {
+            let _ = sender.send(QueryProgress::SelectStart {
+                index,
+                columns: column_names.clone(),
+                null_text: null_text.clone(),
+            });
+            app::awake();
             SqlEditorWidget::append_spool_output(session, &[column_names.join(&colsep)]);
         }
 
-        let mut row_count = 0usize;
+        let row_count = if has_display_columns { rows.len() } else { 0 };
         let mut buffered_display_rows: Vec<Vec<String>> = Vec::new();
         let mut buffered_raw_rows: Vec<Vec<String>> = Vec::new();
         let mut last_flush = Instant::now();
         let mut has_flushed_rows = false;
-        if !rows.is_empty() {
+        if has_display_columns && !rows.is_empty() {
             for row in rows {
-                row_count += 1;
                 buffered_display_rows.push(SqlEditorWidget::display_row_values(&row, &null_text));
                 buffered_raw_rows.push(row);
                 if SqlEditorWidget::should_flush_progress_rows(
@@ -20514,6 +20575,54 @@ mod query_execution_cleanup_tests {
         );
     }
 
+    #[test]
+    fn empty_column_select_result_does_not_emit_grid_start_events() {
+        let (sender, receiver) = mpsc::channel();
+        let session = Arc::new(Mutex::new(SessionState::default()));
+
+        SqlEditorWidget::emit_select_result_with_start_option(
+            &sender,
+            &session,
+            "TEST_CONN",
+            0,
+            "EMPTY CURSOR",
+            Vec::new(),
+            vec![vec!["ignored".to_string()]],
+            true,
+            true,
+            true,
+        );
+        drop(sender);
+
+        let events: Vec<_> = receiver.try_iter().collect();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, QueryProgress::StatementStart { .. })),
+            "unexpected StatementStart event"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, QueryProgress::SelectStart { .. })),
+            "unexpected SelectStart event"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, QueryProgress::Rows { .. })),
+            "unexpected Rows event"
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [QueryProgress::StatementFinished { result, .. }]
+                if result.success
+                    && result.is_select
+                    && result.columns.is_empty()
+                    && result.row_count == 0
+        ));
+    }
+
     fn new_test_cleanup_guard_with_owner(
         sender: mpsc::Sender<QueryProgress>,
         current_query_connection: Arc<Mutex<Option<Arc<Connection>>>>,
@@ -20925,6 +21034,9 @@ mod query_execution_cleanup_tests {
 
     #[test]
     fn oracle_successful_statement_clears_late_cancel_protection() {
+        let statement_effects =
+            crate::db::statement_session_post_processor_for(crate::db::DatabaseType::Oracle)
+                .effects_for_sql("INSERT INTO t VALUES (1)");
         for auto_commit in [true, false] {
             let (sender, _receiver) = mpsc::channel();
             let mut cleanup = new_test_cleanup_guard(
@@ -20934,7 +21046,7 @@ mod query_execution_cleanup_tests {
                 Arc::new(Mutex::new(true)),
                 Arc::new(Mutex::new(true)),
             );
-            cleanup.protect_oracle_dirty_statement_on_cancel(auto_commit);
+            cleanup.protect_oracle_statement_on_cancel(auto_commit, statement_effects);
 
             assert_eq!(
                 cleanup.oracle_pooled_session_invalidated_on_cancel,
@@ -22197,7 +22309,7 @@ mod query_execution_cleanup_tests {
     }
 
     #[test]
-    fn oracle_script_select_interrupt_policy_replaces_or_requires_decision() {
+    fn oracle_plain_select_interrupt_policy_requires_only_health_check() {
         let select_effects =
             crate::db::statement_session_post_processor_for(crate::db::DatabaseType::Oracle)
                 .effects_for_sql("SELECT 1 FROM dual");
@@ -22209,9 +22321,10 @@ mod query_execution_cleanup_tests {
             Arc::new(Mutex::new(false)),
             Arc::new(Mutex::new(true)),
         );
-        cleanup.protect_oracle_select_session_after_interrupt(true, true, select_effects);
-        assert!(cleanup.oracle_pooled_session_invalidated);
+        cleanup.protect_oracle_statement_after_interrupt(true, select_effects);
+        assert!(!cleanup.oracle_pooled_session_invalidated);
         assert!(!cleanup.oracle_pooled_session_transaction_decision_required);
+        assert!(cleanup.oracle_pooled_session_requires_health_check);
 
         let (sender, _receiver) = mpsc::channel();
         let mut cleanup = new_test_cleanup_guard(
@@ -22221,20 +22334,9 @@ mod query_execution_cleanup_tests {
             Arc::new(Mutex::new(false)),
             Arc::new(Mutex::new(true)),
         );
-        cleanup.protect_oracle_select_session_after_interrupt(true, false, select_effects);
+        cleanup.protect_oracle_statement_after_interrupt(false, select_effects);
         assert!(!cleanup.oracle_pooled_session_invalidated);
-        assert!(cleanup.oracle_pooled_session_transaction_decision_required);
-
-        let (sender, _receiver) = mpsc::channel();
-        let mut cleanup = new_test_cleanup_guard(
-            sender,
-            Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(false)),
-            Arc::new(Mutex::new(true)),
-        );
-        cleanup.protect_oracle_select_session_after_interrupt(false, false, select_effects);
-        assert!(!cleanup.oracle_pooled_session_invalidated);
+        assert!(!cleanup.oracle_pooled_session_transaction_decision_required);
         assert!(cleanup.oracle_pooled_session_requires_health_check);
     }
 
@@ -22252,7 +22354,7 @@ mod query_execution_cleanup_tests {
             Arc::new(Mutex::new(false)),
             Arc::new(Mutex::new(true)),
         );
-        cleanup.protect_oracle_select_session_after_interrupt(false, true, effects);
+        cleanup.protect_oracle_statement_after_interrupt(true, effects);
         assert!(cleanup.oracle_pooled_session_invalidated);
         assert!(!cleanup.oracle_pooled_session_transaction_decision_required);
 
@@ -22264,7 +22366,7 @@ mod query_execution_cleanup_tests {
             Arc::new(Mutex::new(false)),
             Arc::new(Mutex::new(true)),
         );
-        cleanup.protect_oracle_select_session_after_interrupt(false, false, effects);
+        cleanup.protect_oracle_statement_after_interrupt(false, effects);
         assert!(!cleanup.oracle_pooled_session_invalidated);
         assert!(cleanup.oracle_pooled_session_transaction_decision_required);
     }
@@ -25456,12 +25558,10 @@ mod query_execution_cleanup_tests {
     }
 
     #[test]
-    fn mysql_cancelled_script_with_autocommit_off_requires_transaction_decision() {
-        let retained = crate::db::MySqlBatchSessionEffects::default()
+    fn mysql_cancelled_clean_script_with_autocommit_off_does_not_request_transaction_decision() {
+        assert!(crate::db::MySqlBatchSessionEffects::default()
             .retained_state_after_interrupted_batch(RetainedSessionState::default(), true, false)
-            .expect("autocommit-off interrupted script must retain a decision state");
-
-        assert!(retained.requires_transaction_decision());
+            .is_none());
     }
 
     #[test]
@@ -25667,7 +25767,7 @@ mod query_execution_cleanup_tests {
     }
 
     #[test]
-    fn mysql_script_cancel_between_read_only_autocommit_off_statements_requires_decision() {
+    fn mysql_script_cancel_between_read_only_autocommit_off_statements_discards_without_decision() {
         let frames = vec![ScriptExecutionFrame {
             items: vec![
                 ScriptItem::Statement("SELECT 1".to_string()),
@@ -25689,10 +25789,19 @@ mod query_execution_cleanup_tests {
                 true
             )
         );
-        let retained = batch_effects
+        assert!(batch_effects
             .retained_state_after_interrupted_batch(RetainedSessionState::default(), true, false)
-            .expect("interrupted autocommit-off script must retain a decision state");
-        assert!(retained.requires_transaction_decision());
+            .is_none());
+        let decision = batch_effects.decision_after_interrupted_batch(
+            RetainedSessionState::default(),
+            true,
+            false,
+        );
+        assert_eq!(
+            decision.outcome,
+            crate::db::RetainedSessionOutcome::DiscardPhysical
+        );
+        assert!(!decision.requires_session_info_sync);
     }
 
     #[test]
@@ -27970,9 +28079,9 @@ mod mysql_batch_execution_regression_tests {
                 QueryProgress::BatchStart { .. } => "BatchStart".to_string(),
                 QueryProgress::StatementStart {
                     index,
-                    create_result_tab,
+                    result_tab_policy,
                 } => {
-                    format!("StatementStart({index}, create_result_tab={create_result_tab})")
+                    format!("StatementStart({index}, result_tab_policy={result_tab_policy:?})")
                 }
                 QueryProgress::SelectStart { index, columns, .. } => {
                     format!("SelectStart({index}, cols={})", columns.len())

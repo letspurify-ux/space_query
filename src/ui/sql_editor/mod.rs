@@ -258,7 +258,7 @@ pub enum QueryProgress {
     },
     StatementStart {
         index: usize,
-        create_result_tab: bool,
+        result_tab_policy: ResultTabPolicy,
     },
     SelectStart {
         index: usize,
@@ -351,6 +351,18 @@ pub enum QueryProgress {
     ExecutionFinished(crate::db::session_policy::ExecutionFinishedEvent),
     BatchFinished,
     MetadataRefreshNeeded,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResultTabPolicy {
+    Create,
+    Defer,
+}
+
+impl ResultTabPolicy {
+    pub fn creates_result_tab(self) -> bool {
+        matches!(self, Self::Create)
+    }
 }
 
 impl QueryProgress {
