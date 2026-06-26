@@ -685,6 +685,7 @@ struct QueryProgressContext {
     started_at: Instant,
     activity_label: String,
     active_statement_index: Option<usize>,
+    running_statement_index: Option<usize>,
     state_label: String,
     auto_selected_result_tab: bool,
 }
@@ -783,9 +784,26 @@ impl QueryProgressContext {
             started_at: now,
             activity_label,
             active_statement_index: None,
+            running_statement_index: None,
             state_label: ResultTabStatus::Running.label().to_string(),
             auto_selected_result_tab: false,
         }
+    }
+
+    fn mark_statement_running(&mut self, statement_index: usize) {
+        self.active_statement_index = Some(statement_index);
+        self.running_statement_index = Some(statement_index);
+    }
+
+    fn mark_statement_finished(&mut self, statement_index: usize) {
+        if self.running_statement_index == Some(statement_index) {
+            self.running_statement_index = None;
+        }
+        self.active_statement_index = Some(statement_index);
+    }
+
+    fn canceling_statement_index(&self) -> Option<usize> {
+        self.running_statement_index
     }
 
     fn mark_statement_closed(&mut self, statement_index: usize) {
@@ -797,6 +815,9 @@ impl QueryProgressContext {
         }
         if self.active_statement_index == Some(statement_index) {
             self.active_statement_index = None;
+        }
+        if self.running_statement_index == Some(statement_index) {
+            self.running_statement_index = None;
         }
         self.state_label = ResultTabStatus::Cancelled.label().to_string();
     }
@@ -810,6 +831,9 @@ impl QueryProgressContext {
         statement_indices.extend(self.fetch_row_counts.keys().copied());
         statement_indices.extend(self.result_tab_ids.keys().copied());
         if let Some(index) = self.active_statement_index {
+            statement_indices.push(index);
+        }
+        if let Some(index) = self.running_statement_index {
             statement_indices.push(index);
         }
         statement_indices.sort_unstable();
@@ -1639,7 +1663,7 @@ impl AppState {
             return false;
         };
         context.state_label = ResultTabStatus::Canceling.label().to_string();
-        let Some(statement_index) = context.active_statement_index else {
+        let Some(statement_index) = context.canceling_statement_index() else {
             return false;
         };
         let Some(tab_id) = context.result_tab_id_for_statement(statement_index) else {
@@ -6235,7 +6259,10 @@ impl MainWindow {
                         );
                     }
                 }
-                QueryProgress::StatementStart { index } => {
+                QueryProgress::StatementStart {
+                    index,
+                    create_result_tab,
+                } => {
                     let has_live_connection = s.has_live_connection;
                     let has_running_queries = s.sql_editor.is_query_running()
                         || s.editor_tabs
@@ -6254,10 +6281,16 @@ impl MainWindow {
                             return;
                         };
                         context.fetch_row_counts.remove(&index);
-                        context.active_statement_index = Some(index);
-                        let result_tab_id =
-                            context.ensure_result_tab_id(index, || result_tabs.reserve_result_tab_id());
-                        let select_tab = context.claim_result_tab_auto_select();
+                        context.mark_statement_running(index);
+                        let result_tab_id = create_result_tab.then(|| {
+                            context.ensure_result_tab_id(index, || result_tabs.reserve_result_tab_id())
+                        });
+                        let select_tab = if create_result_tab {
+                            let _ = context.claim_result_tab_auto_select();
+                            true
+                        } else {
+                            false
+                        };
                         let status =
                             statement_start_status(&context.state_label, query_canceling_pending);
                         context.state_label = status.label().to_string();
@@ -6279,9 +6312,11 @@ impl MainWindow {
                     }
                     s.refresh_result_edit_controls();
                     drop(s);
-                    result_tabs.ensure_statement_tab_by_id(result_tab_id, "Result", select_tab);
-                    if status == ResultTabStatus::Canceling {
-                        result_tabs.mark_statement_canceling_by_id(result_tab_id);
+                    if let Some(result_tab_id) = result_tab_id {
+                        result_tabs.ensure_statement_tab_by_id(result_tab_id, "Result", select_tab);
+                        if status == ResultTabStatus::Canceling {
+                            result_tabs.mark_statement_canceling_by_id(result_tab_id);
+                        }
                     }
                     app::redraw();
                     app::flush();
@@ -6906,15 +6941,25 @@ impl MainWindow {
                     let remove_empty_error_grid = result_status == ResultTabStatus::Error
                         && result_tab_id.is_some()
                         && !has_fetched_rows;
+                    let remove_empty_success_grid = result_status == ResultTabStatus::Done
+                        && result_tab_id.is_some()
+                        && !should_display_data_grid
+                        && !result.is_select
+                        && grid_execution_target.is_none()
+                        && !has_fetched_rows;
+                    let mut removed_last_result_tab = false;
                     if let Some(context) = s.progress_contexts.get_mut(&tab_id) {
                         context.fetch_row_counts.remove(&index);
                         context.mark_lazy_fetch_active_for_statement(index);
-                        context.active_statement_index = Some(index);
+                        context.mark_statement_finished(index);
                         context.state_label = result_status.label().to_string();
-                        if remove_empty_error_grid {
+                        if remove_empty_error_grid || remove_empty_success_grid {
                             context.result_tab_ids.remove(&index);
+                            removed_last_result_tab = context.result_tab_ids.is_empty();
                         }
                     }
+                    let should_select_info_pane = should_select_info_pane
+                        || (remove_empty_success_grid && removed_last_result_tab);
                     if s.should_show_progress_status_for_tab(tab_id) {
                         s.set_status_message(result_status.status_bar_message());
                     }
@@ -6929,7 +6974,7 @@ impl MainWindow {
                     s.refresh_result_edit_controls();
                     drop(s);
 
-                    if remove_empty_error_grid {
+                    if remove_empty_error_grid || remove_empty_success_grid {
                         if let Some(result_tab_id) = result_tab_id {
                             let _ = result_tabs.close_tab_by_id_and_take_lazy_fetch(result_tab_id);
                         }
@@ -10325,13 +10370,32 @@ mod tests {
         context.fetch_row_counts.insert(2, 100);
         context.lazy_fetch_sessions.insert(44, 2);
         context.active_statement_index = Some(2);
+        context.running_statement_index = Some(2);
 
         context.mark_statement_closed(2);
 
         assert!(context.closed_statement_indices.contains(&2));
         assert!(!context.fetch_row_counts.contains_key(&2));
         assert_eq!(context.active_statement_index, None);
+        assert_eq!(context.canceling_statement_index(), None);
         assert_eq!(context.lazy_fetch_sessions.get(&44), Some(&2));
+    }
+
+    #[test]
+    fn progress_context_canceling_statement_tracks_running_statement_not_active_result() {
+        let mut context = QueryProgressContext::new(None, "Executing".to_string(), None);
+
+        context.mark_statement_running(0);
+        context.mark_statement_finished(0);
+        context.active_statement_index = Some(0);
+        context.mark_statement_running(1);
+
+        assert_eq!(context.active_statement_index, Some(1));
+        context.active_statement_index = Some(0);
+        assert_eq!(context.canceling_statement_index(), Some(1));
+
+        context.mark_statement_finished(1);
+        assert_eq!(context.canceling_statement_index(), None);
     }
 
     #[test]

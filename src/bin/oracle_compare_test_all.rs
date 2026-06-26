@@ -130,7 +130,7 @@ fn trace_progress_event(mode: OracleDriverMode, event: &QueryProgress) {
         QueryProgress::BatchStart { activity } => {
             eprintln!("[{}] batch start: {activity}", mode.label());
         }
-        QueryProgress::StatementStart { index } => {
+        QueryProgress::StatementStart { index, .. } => {
             eprintln!("[{}] statement start #{index}", mode.label());
         }
         QueryProgress::SelectStart { index, columns, .. } => {

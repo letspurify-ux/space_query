@@ -530,7 +530,10 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
                         let _ = sender.send(QueryProgress::BatchStart {
                             activity: db_activity.to_string(),
                         });
-                        let _ = sender.send(QueryProgress::StatementStart { index });
+                        let _ = sender.send(QueryProgress::StatementStart {
+                            index,
+                            create_result_tab: true,
+                        });
                         app::awake();
                         let (heading_enabled, feedback_enabled) =
                             SqlEditorWidget::current_output_settings(&session);
@@ -6922,8 +6925,12 @@ impl SqlEditorWidget {
                         SqlEditorWidget::mysql_statement_session_effects_for_sql_for_db_type(
                             db_type, &sql_text,
                         );
+                    let displayable_result_statement =
+                        crate::db::query::mysql_executor::MysqlExecutor::is_displayable_select_statement_for_db_type(
+                            db_type, &sql_text,
+                        );
                     if lazy_fetch_single_statement
-                        && crate::db::query::mysql_executor::MysqlExecutor::is_displayable_select_statement_for_db_type(db_type, &sql_text)
+                        && displayable_result_statement
                         && SqlEditorWidget::mysql_select_can_use_lazy_fetch(statement_effects)
                     {
                         match Self::acquire_mysql_pooled_session(
@@ -6969,7 +6976,10 @@ impl SqlEditorWidget {
                                             message,
                                         );
                                     let index = result_index;
-                                    let _ = sender.send(QueryProgress::StatementStart { index });
+                                    let _ = sender.send(QueryProgress::StatementStart {
+                                        index,
+                                        create_result_tab: true,
+                                    });
                                     app::awake();
                                     let mut result = QueryResult::new_error(&sql_text, &message);
                                     result.is_select = true;
@@ -7001,6 +7011,7 @@ impl SqlEditorWidget {
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 let _ = sender.send(QueryProgress::StatementStart {
                                     index: result_index,
+                                    create_result_tab: true,
                                 });
                                 app::awake();
                                 SqlEditorWidget::start_mysql_lazy_select(
@@ -7054,7 +7065,10 @@ impl SqlEditorWidget {
                                     }
                                 } else {
                                     let index = result_index;
-                                    let _ = sender.send(QueryProgress::StatementStart { index });
+                                    let _ = sender.send(QueryProgress::StatementStart {
+                                        index,
+                                        create_result_tab: true,
+                                    });
                                     app::awake();
                                     let mut result = QueryResult::new_error(&sql_text, &message);
                                     result.is_select = true;
@@ -7089,6 +7103,15 @@ impl SqlEditorWidget {
                                 continue;
                             }
                         }
+                    }
+                    let mut result_statement_start_emitted = false;
+                    if !script_mode && displayable_result_statement {
+                        let _ = sender.send(QueryProgress::StatementStart {
+                            index: result_index,
+                            create_result_tab: true,
+                        });
+                        app::awake();
+                        result_statement_start_emitted = true;
                     }
                     match execute_mysql_sql(sql_text.as_str(), auto_commit, &mysql_batch_effects) {
                         Ok(success) => {
@@ -7170,7 +7193,7 @@ impl SqlEditorWidget {
                                         raw_column_names.clone(),
                                         heading_enabled,
                                     );
-                                    SqlEditorWidget::emit_select_result(
+                                    SqlEditorWidget::emit_select_result_with_start_option(
                                         sender,
                                         session,
                                         &conn_name,
@@ -7180,6 +7203,7 @@ impl SqlEditorWidget {
                                         result.rows.clone(),
                                         result.success,
                                         feedback_enabled,
+                                        !result_statement_start_emitted,
                                     );
                                     SqlEditorWidget::apply_column_new_value_from_row(
                                         session,
@@ -9920,6 +9944,16 @@ impl SqlEditorWidget {
                             }
 
                             if QueryExecutor::is_plain_commit(&sql_text) {
+                                let index = result_index;
+                                let mut statement_start_emitted = false;
+                                if !script_mode {
+                                    SqlEditorWidget::emit_statement_start_once(
+                                        &sender,
+                                        index,
+                                        false,
+&mut statement_start_emitted,
+                                    );
+                                }
                                 let mut timed_out = false;
                                 let statement_start = Instant::now();
                                 let mut result = match conn.commit() {
@@ -9960,9 +9994,12 @@ impl SqlEditorWidget {
                                         timed_out,
                                     );
                                 } else {
-                                    let index = result_index;
-                                    let _ = sender.send(QueryProgress::StatementStart { index });
-                                    app::awake();
+                                    SqlEditorWidget::emit_statement_start_once(
+                                        &sender,
+                                        index,
+                                        false,
+&mut statement_start_emitted,
+                                    );
                                     if !result.message.trim().is_empty() {
                                         SqlEditorWidget::append_spool_output(
                                             &session,
@@ -9993,6 +10030,16 @@ impl SqlEditorWidget {
                             }
 
                             if QueryExecutor::is_plain_rollback(&sql_text) {
+                                let index = result_index;
+                                let mut statement_start_emitted = false;
+                                if !script_mode {
+                                    SqlEditorWidget::emit_statement_start_once(
+                                        &sender,
+                                        index,
+                                        false,
+&mut statement_start_emitted,
+                                    );
+                                }
                                 let mut timed_out = false;
                                 let statement_start = Instant::now();
                                 let mut result = match conn.rollback() {
@@ -10033,9 +10080,12 @@ impl SqlEditorWidget {
                                         timed_out,
                                     );
                                 } else {
-                                    let index = result_index;
-                                    let _ = sender.send(QueryProgress::StatementStart { index });
-                                    app::awake();
+                                    SqlEditorWidget::emit_statement_start_once(
+                                        &sender,
+                                        index,
+                                        false,
+&mut statement_start_emitted,
+                                    );
                                     if !result.message.trim().is_empty() {
                                         SqlEditorWidget::append_spool_output(
                                             &session,
@@ -10199,6 +10249,16 @@ impl SqlEditorWidget {
                                     statement_effects,
                                 );
 
+                                let index = result_index;
+                                let mut statement_start_emitted = false;
+                                if !script_mode {
+                                    SqlEditorWidget::emit_statement_start_once(
+                                        &sender,
+                                        index,
+                                        false,
+&mut statement_start_emitted,
+                                    );
+                                }
                                 let statement_start = Instant::now();
                                 let mut timed_out = false;
                                 let stmt = match QueryExecutor::execute_with_binds(
@@ -10249,10 +10309,12 @@ impl SqlEditorWidget {
                                                 timed_out,
                                             );
                                         } else {
-                                            let index = result_index;
-                                            let _ = sender
-                                                .send(QueryProgress::StatementStart { index });
-                                            app::awake();
+                                            SqlEditorWidget::emit_statement_start_once(
+                                                &sender,
+                                                index,
+                                                false,
+&mut statement_start_emitted,
+                                            );
                                             SqlEditorWidget::append_spool_output(
                                                 &session,
                                                 std::slice::from_ref(&message),
@@ -10402,10 +10464,12 @@ impl SqlEditorWidget {
                                                     timed_out,
                                                 );
                                             } else {
-                                                let index = result_index;
-                                                let _ = sender
-                                                    .send(QueryProgress::StatementStart { index });
-                                                app::awake();
+                                                SqlEditorWidget::emit_statement_start_once(
+                                                    &sender,
+                                                    index,
+                                                    false,
+&mut statement_start_emitted,
+                                                );
                                                 SqlEditorWidget::append_spool_output(
                                                     &session,
                                                     std::slice::from_ref(&message),
@@ -10478,10 +10542,12 @@ impl SqlEditorWidget {
                                                 timed_out,
                                             );
                                         } else {
-                                            let index = result_index;
-                                            let _ = sender
-                                                .send(QueryProgress::StatementStart { index });
-                                            app::awake();
+                                            SqlEditorWidget::emit_statement_start_once(
+                                                &sender,
+                                                index,
+                                                false,
+&mut statement_start_emitted,
+                                            );
                                             SqlEditorWidget::append_spool_output(
                                                 &session,
                                                 std::slice::from_ref(&message),
@@ -10538,9 +10604,12 @@ impl SqlEditorWidget {
                                         timed_out,
                                     );
                                 } else {
-                                    let index = result_index;
-                                    let _ = sender.send(QueryProgress::StatementStart { index });
-                                    app::awake();
+                                    SqlEditorWidget::emit_statement_start_once(
+                                        &sender,
+                                        index,
+                                        false,
+&mut statement_start_emitted,
+                                    );
                                     if !result.message.trim().is_empty() {
                                         SqlEditorWidget::append_spool_output(
                                             &session,
@@ -10562,7 +10631,7 @@ impl SqlEditorWidget {
                                         break;
                                     }
                                     let index = result_index;
-                                    let _ = sender.send(QueryProgress::StatementStart { index });
+                                    let _ = sender.send(QueryProgress::StatementStart { index, create_result_tab: true });
                                     app::awake();
 
                                     let mut buffered_rows: Vec<Vec<String>> = Vec::new();
@@ -10765,7 +10834,7 @@ impl SqlEditorWidget {
                                         break;
                                     }
                                     let index = result_index;
-                                    let _ = sender.send(QueryProgress::StatementStart { index });
+                                    let _ = sender.send(QueryProgress::StatementStart { index, create_result_tab: true });
                                     app::awake();
 
                                     let mut buffered_rows: Vec<Vec<String>> = Vec::new();
@@ -11012,7 +11081,7 @@ impl SqlEditorWidget {
                                 };
 
                                 let index = result_index;
-                                let _ = sender.send(QueryProgress::StatementStart { index });
+                                let _ = sender.send(QueryProgress::StatementStart { index, create_result_tab: true });
                                 app::awake();
 
                                 let (heading_enabled, feedback_enabled) =
@@ -11566,6 +11635,16 @@ impl SqlEditorWidget {
                                 };
 
                                 cleanup.protect_oracle_dirty_statement_on_cancel(auto_commit);
+                                let index = result_index;
+                                let mut statement_start_emitted = false;
+                                if !script_mode {
+                                    SqlEditorWidget::emit_statement_start_once(
+                                        &sender,
+                                        index,
+                                        false,
+&mut statement_start_emitted,
+                                    );
+                                }
                                 let statement_start = Instant::now();
                                 let mut timed_out = false;
                                 let stmt = match QueryExecutor::execute_with_binds(
@@ -11624,10 +11703,12 @@ impl SqlEditorWidget {
                                                 timed_out,
                                             );
                                         } else {
-                                            let index = result_index;
-                                            let _ = sender
-                                                .send(QueryProgress::StatementStart { index });
-                                            app::awake();
+                                            SqlEditorWidget::emit_statement_start_once(
+                                                &sender,
+                                                index,
+                                                false,
+&mut statement_start_emitted,
+                                            );
                                             let result =
                                                 QueryResult::new_error(&sql_text, &message);
                                             let _ = sender.send(QueryProgress::StatementFinished {
@@ -11896,9 +11977,12 @@ impl SqlEditorWidget {
                                         timed_out,
                                     );
                                 } else {
-                                    let index = result_index;
-                                    let _ = sender.send(QueryProgress::StatementStart { index });
-                                    app::awake();
+                                    SqlEditorWidget::emit_statement_start_once(
+                                        &sender,
+                                        index,
+                                        false,
+&mut statement_start_emitted,
+                                    );
                                     if !result.message.trim().is_empty() {
                                         SqlEditorWidget::append_spool_output(
                                             &session,
@@ -12043,7 +12127,10 @@ impl SqlEditorWidget {
             return false;
         }
 
-        let _ = sender.send(QueryProgress::StatementStart { index });
+        let _ = sender.send(QueryProgress::StatementStart {
+            index,
+            create_result_tab: false,
+        });
         app::awake();
         if !message.trim().is_empty() {
             SqlEditorWidget::append_spool_output(session, std::slice::from_ref(&message));
@@ -12058,6 +12145,23 @@ impl SqlEditorWidget {
         });
         app::awake();
         true
+    }
+
+    fn emit_statement_start_once(
+        sender: &mpsc::Sender<QueryProgress>,
+        index: usize,
+        create_result_tab: bool,
+        emitted: &mut bool,
+    ) {
+        if *emitted {
+            return;
+        }
+        let _ = sender.send(QueryProgress::StatementStart {
+            index,
+            create_result_tab,
+        });
+        app::awake();
+        *emitted = true;
     }
 
     fn emit_script_result(
@@ -12858,7 +12962,10 @@ impl SqlEditorWidget {
         let display_columns =
             Self::apply_heading_setting(raw_column_names.clone(), heading_enabled);
 
-        let _ = sender.send(QueryProgress::StatementStart { index });
+        let _ = sender.send(QueryProgress::StatementStart {
+            index,
+            create_result_tab: true,
+        });
         app::awake();
 
         if Self::execute_oracle_thin_cancel_requested(cancel_flag) {
@@ -15945,8 +16052,39 @@ impl SqlEditorWidget {
         success: bool,
         feedback_enabled: bool,
     ) {
-        let _ = sender.send(QueryProgress::StatementStart { index });
-        app::awake();
+        Self::emit_select_result_with_start_option(
+            sender,
+            session,
+            conn_name,
+            index,
+            sql,
+            column_names,
+            rows,
+            success,
+            feedback_enabled,
+            true,
+        );
+    }
+
+    pub(super) fn emit_select_result_with_start_option(
+        sender: &mpsc::Sender<QueryProgress>,
+        session: &Arc<Mutex<SessionState>>,
+        conn_name: &str,
+        index: usize,
+        sql: &str,
+        column_names: Vec<String>,
+        rows: Vec<Vec<String>>,
+        success: bool,
+        feedback_enabled: bool,
+        emit_statement_start: bool,
+    ) {
+        if emit_statement_start {
+            let _ = sender.send(QueryProgress::StatementStart {
+                index,
+                create_result_tab: true,
+            });
+            app::awake();
+        }
         let (colsep, null_text, _trimspool_enabled) =
             SqlEditorWidget::current_text_output_settings(session);
         let _ = sender.send(QueryProgress::SelectStart {
@@ -27830,8 +27968,11 @@ mod mysql_batch_execution_regression_tests {
                     format!("OperationAbandoned({})", token.operation_id)
                 }
                 QueryProgress::BatchStart { .. } => "BatchStart".to_string(),
-                QueryProgress::StatementStart { index } => {
-                    format!("StatementStart({index})")
+                QueryProgress::StatementStart {
+                    index,
+                    create_result_tab,
+                } => {
+                    format!("StatementStart({index}, create_result_tab={create_result_tab})")
                 }
                 QueryProgress::SelectStart { index, columns, .. } => {
                     format!("SelectStart({index}, cols={})", columns.len())
@@ -33283,7 +33424,7 @@ mod mysql_transaction_feedback_tests {
             };
             let started_pos = progress
                 .iter()
-                .position(|event| matches!(event, QueryProgress::StatementStart { index: row_index } if *row_index == index))
+                .position(|event| matches!(event, QueryProgress::StatementStart { index: row_index, .. } if *row_index == index))
                 .unwrap_or_else(|| panic!("{label} should start a result statement"));
             let select_pos = progress
                 .iter()

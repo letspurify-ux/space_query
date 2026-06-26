@@ -18191,7 +18191,7 @@ END;"#;
         let messages = receiver.try_iter().collect::<Vec<QueryProgress>>();
         assert_eq!(messages.len(), 5);
         match &messages[0] {
-            QueryProgress::StatementStart { index } => assert_eq!(*index, 4),
+            QueryProgress::StatementStart { index, .. } => assert_eq!(*index, 4),
             _ => panic!("expected QueryProgress::StatementStart"),
         }
         match &messages[1] {

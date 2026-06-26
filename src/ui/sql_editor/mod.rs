@@ -258,6 +258,7 @@ pub enum QueryProgress {
     },
     StatementStart {
         index: usize,
+        create_result_tab: bool,
     },
     SelectStart {
         index: usize,
