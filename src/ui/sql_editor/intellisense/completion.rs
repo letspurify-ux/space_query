@@ -2407,6 +2407,18 @@ impl SqlEditorWidget {
                 Some(snapshot.preferred_db_type),
             )
         };
+        let qualifier_matches_visible_relation_scope = qualifier
+            .is_some_and(|qualifier| Self::qualifier_matches_visible_relation_scope(qualifier, deep_ctx));
+        let column_tables = if qualifier.is_some_and(|qualifier| {
+            !qualifier_matches_visible_relation_scope
+                && qualified_completion_mode.is_none()
+                && column_tables.len() == 1
+                && Self::completion_identifiers_match(&column_tables[0], qualifier)
+        }) {
+            Vec::new()
+        } else {
+            column_tables
+        };
         let expr_keyword_ctx = {
             let data = intellisense_data
                 .lock()
@@ -2627,12 +2639,27 @@ impl SqlEditorWidget {
                 deep_ctx,
                 Some(snapshot.preferred_db_type),
             );
+        let statement_context_end = Self::expected_keyword_suggestion_context_end(
+            deep_ctx.statement_tokens.as_ref(),
+            deep_ctx.cursor_token_len,
+            &snapshot.prefix,
+        );
+        let statement_locking_words =
+            Self::words_for_keyword_slot(deep_ctx.statement_tokens.as_ref(), statement_context_end);
         let allow_locking_clause_keyword = qualifier.is_none()
-            && Self::cursor_is_at_locking_clause_keyword_slot_for_context_for_db(
+            && (Self::cursor_is_at_locking_clause_keyword_slot_for_context_for_db(
                 deep_ctx,
                 !snapshot.prefix.is_empty(),
                 Some(snapshot.preferred_db_type),
-            );
+            ) || (Self::unclosed_paren_count(deep_ctx.statement_tokens.as_ref(), statement_context_end)
+                == 0
+                && statement_locking_words.iter().any(|word| word == "SELECT")
+                && Self::expected_locking_clause_keyword_candidates(
+                    deep_ctx.statement_tokens.as_ref(),
+                    statement_context_end,
+                    Some(snapshot.preferred_db_type),
+                )
+                .is_some()));
         let allow_dml_error_logging_keyword = qualifier.is_none()
             && Self::expected_dml_error_logging_keyword_candidates_for_context(
                 deep_ctx,
@@ -2647,11 +2674,20 @@ impl SqlEditorWidget {
                 Some(snapshot.preferred_db_type),
             )
             .is_some();
+        let allow_mysql_index_hint_keyword = qualifier.is_none()
+            && Self::expected_mysql_index_hint_keyword_candidates(
+                deep_ctx.statement_tokens.as_ref(),
+                statement_context_end,
+                deep_ctx.phase,
+                Some(snapshot.preferred_db_type),
+            )
+            .is_some();
         let mut expected_keyword_suggestions = if source_allowance.expected_keyword_suggestions
             || allow_dml_returning_into_keyword
             || allow_locking_clause_keyword
             || allow_dml_error_logging_keyword
             || allow_mysql_select_into_file_keyword
+            || allow_mysql_index_hint_keyword
             || at_data_type_position
         {
             Self::collect_expected_keyword_suggestions_with_expression_context(
@@ -10318,15 +10354,19 @@ impl SqlEditorWidget {
             return Some(QualifiedCompletionMode::RelationMembers);
         }
 
-        if Self::qualifier_matches_visible_relation_scope(qualifier, deep_ctx)
-            || data.is_known_relation(qualifier)
-        {
+        let qualifier_matches_visible_relation_scope =
+            Self::qualifier_matches_visible_relation_scope(qualifier, deep_ctx);
+        if qualifier_matches_visible_relation_scope {
             return Some(QualifiedCompletionMode::RelationColumns);
         }
 
         let resolved_tables =
             Self::resolve_column_tables_for_context_for_db(Some(qualifier), deep_ctx, db_type);
-        if resolved_tables
+        let resolved_is_direct_catalog_fallback = !qualifier_matches_visible_relation_scope
+            && resolved_tables.len() == 1
+            && Self::completion_identifiers_match(&resolved_tables[0], qualifier);
+        if !resolved_is_direct_catalog_fallback
+            && resolved_tables
             .iter()
             .any(|table| data.is_known_relation(table))
         {
@@ -35400,11 +35440,26 @@ impl SqlEditorWidget {
         db_type: Option<crate::db::DatabaseType>,
     ) -> Option<&'static [&'static str]> {
         let mysql = crate::sql_text::mysql_compatibility_for_sql("", db_type);
-        if Self::words_for_keyword_slot(tokens, end)
+        let slot_words = Self::words_for_keyword_slot(tokens, end);
+        if slot_words
             .first()
             .is_some_and(|word| word == "SET")
         {
             return None;
+        }
+        if let Some(for_idx) = slot_words.iter().rposition(|word| word == "FOR") {
+            let mode = slot_words.get(for_idx + 1).map(String::as_str);
+            let tail = slot_words.get(for_idx + 2..).unwrap_or(&[]);
+            if matches!(mode, Some("UPDATE" | "SHARE"))
+                && tail.len() == 1
+                && !matches!(tail[0].as_str(), "OF" | "NOWAIT" | "WAIT" | "SKIP" | "LOCKED")
+            {
+                return Some(if mysql {
+                    &["OF", "NOWAIT", "SKIP"]
+                } else {
+                    &["OF", "NOWAIT", "WAIT", "SKIP"]
+                });
+            }
         }
         let words = Self::previous_meaningful_words_upper(tokens, end, 2);
         let last = words.last().map(String::as_str);
@@ -35576,9 +35631,6 @@ impl SqlEditorWidget {
         exclude_current_identifier_chain: bool,
         db_type: Option<crate::db::DatabaseType>,
     ) -> bool {
-        if !deep_ctx.phase.is_column_context() {
-            return false;
-        }
         let tokens = Self::current_query_tokens(deep_ctx);
         let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
         let end = Self::expected_suggestion_context_end(
@@ -35586,6 +35638,12 @@ impl SqlEditorWidget {
             cursor_token_len,
             exclude_current_identifier_chain,
         );
+        if !deep_ctx.phase.is_column_context() {
+            let words = Self::words_for_keyword_slot(tokens, end);
+            if !words.iter().any(|word| word == "SELECT") {
+                return false;
+            }
+        }
         // The row-locking `FOR` clause is only valid at the statement top level;
         // an open paren means the `FOR` belongs to a function/sub-expression
         // (`SUBSTRING(x FROM a FOR |)`, `MODEL`/`PIVOT` `FOR`).
@@ -36975,6 +37033,19 @@ impl SqlEditorWidget {
                 db_type,
             );
             return Self::drop_present_oracle_user_options(filtered, tokens, context_end, db_type);
+        }
+        let statement_locking_words =
+            Self::words_for_keyword_slot(statement_tokens, statement_context_end);
+        if Self::unclosed_paren_count(statement_tokens, statement_context_end) == 0
+            && statement_locking_words.iter().any(|word| word == "SELECT")
+        {
+            if let Some(candidates) = Self::expected_locking_clause_keyword_candidates(
+                statement_tokens,
+                statement_context_end,
+                db_type,
+            ) {
+                return Self::filter_expected_candidates(prefix, candidates);
+            }
         }
 
         let join_target_candidates =
