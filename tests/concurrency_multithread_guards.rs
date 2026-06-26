@@ -451,7 +451,7 @@ fn pooled_query_execution_rechecks_scope_immediately_before_action() {
     );
 
     let lazy_start = content
-        .find("if lazy_fetch_single_statement\n                        && crate::db::query::mysql_executor::MysqlExecutor::is_displayable_select_statement")
+        .find("if lazy_fetch_single_statement\n                        && displayable_result_statement")
         .expect("MySQL lazy displayable SELECT branch should exist");
     let lazy_end = content[lazy_start..]
         .find("SqlEditorWidget::start_mysql_lazy_select")
@@ -1159,6 +1159,89 @@ fn oracle_thin_lazy_fetch_all_applies_fetch_all_timeout() {
 }
 
 #[test]
+fn oracle_thin_batch_select_streams_rows_instead_of_fetch_all() {
+    let content = read_source("src/ui/sql_editor/execution.rs");
+    let batch_start = content
+        .find("fn execute_oracle_thin_batch(")
+        .expect("Oracle Thin batch executor should exist");
+    let batch_end = content[batch_start..]
+        .find("fn oracle_thin_can_emit_dbms_output(")
+        .map(|offset| batch_start + offset)
+        .expect("Oracle Thin DBMS_OUTPUT helper should follow batch executor");
+    let batch_body = &content[batch_start..batch_end];
+    let select_start = batch_body
+        .find("} else if Self::oracle_thin_is_query(&execution_sql) {")
+        .expect("Oracle Thin batch SELECT branch should exist");
+    let select_end = batch_body[select_start..]
+        .find("} else {")
+        .map(|offset| select_start + offset)
+        .expect("Oracle Thin non-query branch should follow SELECT branch");
+    let select_body = &batch_body[select_start..select_end];
+    assert!(
+        select_body.contains("oracle_thin_select_streaming_with_binds_and_cancel(")
+            && !select_body.contains("oracle_thin_select_cells_with_binds_and_cancel("),
+        "Oracle Thin batch SELECT must stream rows through progress events instead of materializing all rows before emitting"
+    );
+
+    let helper_start = content
+        .find("fn oracle_thin_select_streaming_with_binds_and_cancel(")
+        .expect("Oracle Thin streaming SELECT helper should exist");
+    let helper_end = content[helper_start..]
+        .find("fn oracle_thin_fetch_cursor_result_streaming(")
+        .map(|offset| helper_start + offset)
+        .expect("Oracle Thin cursor streaming helper should follow SELECT streaming helper");
+    let helper_body = &content[helper_start..helper_end];
+    assert!(
+        helper_body.contains("query_described_initial_request")
+            && helper_body.contains("oracle_thin_fetch_lazy_rows(")
+            && helper_body.contains("flush_buffered_rows(")
+            && !helper_body.contains("query_described_fetch_all"),
+        "Oracle Thin batch SELECT streaming helper must open an initial cursor and flush row batches instead of using fetch-all"
+    );
+}
+
+#[test]
+fn mysql_and_mariadb_batch_select_streams_rows_instead_of_fetch_all() {
+    let content = read_source("src/ui/sql_editor/execution.rs");
+    let batch_start = content
+        .find("fn execute_mysql_batch(")
+        .expect("MySQL/MariaDB batch executor should exist");
+    let batch_end = content[batch_start..]
+        .find("fn begin_execution_worker")
+        .map(|offset| batch_start + offset)
+        .expect("execution worker helper should follow MySQL/MariaDB batch executor");
+    let batch_body = &content[batch_start..batch_end];
+
+    let streaming_helper_start = content
+        .find("fn execute_mysql_batch_select_streaming")
+        .expect("MySQL/MariaDB batch SELECT streaming helper should exist");
+    let streaming_helper_end = content[streaming_helper_start..]
+        .find("fn execute_mysql_batch(")
+        .map(|offset| streaming_helper_start + offset)
+        .expect("MySQL/MariaDB batch executor should follow streaming helper");
+    let streaming_helper = &content[streaming_helper_start..streaming_helper_end];
+    assert!(
+        streaming_helper.contains("MysqlExecutor::execute_select_streaming(")
+            && streaming_helper.contains("flush_buffered_rows("),
+        "MySQL/MariaDB batch SELECT helper must flush rows through progress events while fetching"
+    );
+
+    let select_branch_start = batch_body
+        .find("if displayable_result_statement {")
+        .expect("MySQL/MariaDB displayable SELECT branch should exist");
+    let select_branch_end = batch_body[select_branch_start..]
+        .find("match execute_mysql_sql(")
+        .map(|offset| select_branch_start + offset)
+        .expect("generic MySQL/MariaDB executor should follow SELECT streaming branch");
+    let select_branch = &batch_body[select_branch_start..select_branch_end];
+    assert!(
+        select_branch.contains("execute_mysql_select_streaming(")
+            && !select_branch.contains("execute_for_db_type_with_cancel("),
+        "MySQL/MariaDB batch SELECT must stream rows instead of materializing all rows before emitting"
+    );
+}
+
+#[test]
 fn oracle_thin_nested_cursor_display_closes_unrendered_cursor_values() {
     let content = read_source("src/ui/sql_editor/execution.rs");
     let start = content
@@ -1405,7 +1488,7 @@ fn regression_04_global_transaction_options_validate_and_update_retained_session
         .find("fn update_transaction_mode_from_controls")
         .expect("transaction mode UI update helper should exist");
     let mode_end = content[mode_start..]
-        .find("fn resolve_result_tab_offset")
+        .find("fn resolve_active_progress_tab_id")
         .map(|offset| mode_start + offset)
         .expect("transaction mode helper should have an end marker");
     let mode_branch = &content[mode_start..mode_end];

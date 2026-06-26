@@ -694,6 +694,7 @@ const UI_DATABASE_TYPE_REGISTRY_FUNCTIONS: &[&str] = &[
     "mysql_compatible_highlight_mode",
     "extract_field_keywords_for",
     "interval_unit_keywords_for",
+    "oracle_storage_completion_enabled_for_db_type",
     "data_type_keywords_for",
 ];
 
@@ -2238,6 +2239,7 @@ const BACKEND_REGISTRY_FILES: &[(&str, &[&str])] = &[
         &[
             "extract_field_keywords_for",
             "interval_unit_keywords_for",
+            "oracle_storage_completion_enabled_for_db_type",
             "data_type_keywords_for",
         ],
     ),

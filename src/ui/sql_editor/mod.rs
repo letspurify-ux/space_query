@@ -25,7 +25,7 @@ use crate::db::{
     DbSessionLease, QueryExecutor, QueryResult, RetainedSessionDisposition,
     RetainedSessionMutationOutcome, RetainedSessionPreflightAction,
     RetainedSessionPreflightDecision, RetainedSessionResolutionAction, RetainedSessionState,
-    SharedConnection, SharedDbSessionLease, TableColumnDetail, TransactionMode,
+    ScriptItem, SharedConnection, SharedDbSessionLease, TableColumnDetail, TransactionMode,
     TransactionSessionState,
 };
 use crate::ui::constants::*;
@@ -1769,11 +1769,41 @@ impl SqlEditorWidget {
         sql: &str,
         script_mode: bool,
     ) -> crate::db::session_policy::SqlKind {
-        if script_mode {
+        let sql_kind = if script_mode {
             crate::db::session_policy::SqlKind::Script
         } else {
             crate::db::session_policy::classify_sql_for_db_type(db_type, sql)
+        };
+        if matches!(sql_kind, crate::db::session_policy::SqlKind::Script) {
+            Self::select_only_script_sql_kind(db_type, sql).unwrap_or(sql_kind)
+        } else {
+            sql_kind
         }
+    }
+
+    fn select_only_script_sql_kind(
+        db_type: DatabaseType,
+        sql: &str,
+    ) -> Option<crate::db::session_policy::SqlKind> {
+        let items = query_text::split_script_items_for_db_type(sql, Some(db_type));
+        if items.is_empty() {
+            return None;
+        }
+
+        let post_processor = crate::db::statement_session_post_processor_for(db_type);
+        items
+            .iter()
+            .all(|item| match item {
+                ScriptItem::Statement(statement) => {
+                    crate::db::session_policy::classify_sql_for_db_type(db_type, statement)
+                        .is_select_like()
+                        && crate::db::statement_cancel_can_reuse_session(
+                            post_processor.effects_for_sql(statement).state_hint,
+                        )
+                }
+                ScriptItem::ToolCommand(_) => false,
+            })
+            .then_some(crate::db::session_policy::SqlKind::SelectLike)
     }
 
     fn set_current_operation_snapshot(

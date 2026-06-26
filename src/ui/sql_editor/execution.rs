@@ -119,6 +119,8 @@ struct OracleThinBatchOutcome {
     retained_state: RetainedSessionState,
     had_error: bool,
     timed_out: bool,
+    interrupted_sql_kind: Option<crate::db::session_policy::SqlKind>,
+    interrupted_state_hint: Option<crate::db::TransactionStatementStateHint>,
     /// Set when a schema sync/clear inside the batch bumped the pool context
     /// epoch; the session must be restored under this refreshed epoch.
     refreshed_pool_context_epoch: Option<u64>,
@@ -126,6 +128,21 @@ struct OracleThinBatchOutcome {
 
 struct OracleThinCursorStreamOutcome {
     cursor_result: CursorResult,
+    was_cancelled: bool,
+}
+
+struct OracleThinSelectStreamOutcome {
+    raw_column_names: Vec<String>,
+    last_select_row: Option<Vec<String>>,
+    result: QueryResult,
+    was_cancelled: bool,
+    timed_out: bool,
+}
+
+struct MySqlSelectStreamOutcome {
+    raw_column_names: Vec<String>,
+    last_select_row: Option<Vec<String>>,
+    result: QueryResult,
     was_cancelled: bool,
 }
 
@@ -531,7 +548,7 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
                             activity: db_activity.to_string(),
                         });
                         SqlEditorWidget::emit_statement_start(
-                            &sender,
+                            sender,
                             index,
                             ResultTabPolicy::Create,
                         );
@@ -632,11 +649,14 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             batch_outcome.had_error,
             session_broken,
             batch_outcome.retained_state,
-            SqlEditorWidget::operation_sql_kind(
-                crate::db::DatabaseType::Oracle,
-                sql_text,
-                script_mode,
-            ),
+            batch_outcome.interrupted_sql_kind.unwrap_or_else(|| {
+                SqlEditorWidget::operation_sql_kind(
+                    crate::db::DatabaseType::Oracle,
+                    sql_text,
+                    script_mode,
+                )
+            }),
+            batch_outcome.interrupted_state_hint.unwrap_or_default(),
             final_auto_commit,
             health_check_ok,
         );
@@ -801,6 +821,8 @@ struct QueryExecutionCleanupGuard {
     oracle_pooled_session_known_transaction_clean: bool,
     oracle_pooled_session_state_delta: RetainedSessionState,
     oracle_pooled_session_state_delta_recorded: bool,
+    oracle_interrupted_statement_sql_kind: Option<crate::db::session_policy::SqlKind>,
+    oracle_interrupted_statement_state_hint: Option<crate::db::TransactionStatementStateHint>,
     execution_metadata: crate::db::session_policy::ExecutionFinishedEvent,
 }
 
@@ -977,6 +999,8 @@ impl QueryExecutionCleanupGuard {
             oracle_pooled_session_known_transaction_clean: false,
             oracle_pooled_session_state_delta: RetainedSessionState::default(),
             oracle_pooled_session_state_delta_recorded: false,
+            oracle_interrupted_statement_sql_kind: None,
+            oracle_interrupted_statement_state_hint: None,
             execution_metadata: crate::db::session_policy::ExecutionFinishedEvent::new(db_type),
         }
     }
@@ -1244,8 +1268,11 @@ impl QueryExecutionCleanupGuard {
     fn protect_oracle_statement_after_interrupt(
         &mut self,
         auto_commit: bool,
+        sql_kind: crate::db::session_policy::SqlKind,
         statement_effects: crate::db::StatementSessionEffects,
     ) {
+        self.oracle_interrupted_statement_sql_kind = Some(sql_kind);
+        self.oracle_interrupted_statement_state_hint = Some(statement_effects.state_hint);
         self.require_oracle_pooled_session_health_check();
         if statement_effects.requires_transaction_decision_after_interrupt(auto_commit) {
             self.protect_oracle_script_session_after_interrupt(auto_commit);
@@ -1268,6 +1295,8 @@ impl QueryExecutionCleanupGuard {
         self.oracle_pooled_session_known_transaction_clean = false;
         self.oracle_pooled_session_state_delta = RetainedSessionState::default();
         self.oracle_pooled_session_state_delta_recorded = false;
+        self.oracle_interrupted_statement_sql_kind = None;
+        self.oracle_interrupted_statement_state_hint = None;
         self.oracle_pooled_session_scope_connection = None;
     }
 
@@ -1363,6 +1392,17 @@ impl QueryExecutionCleanupGuard {
                     || self.oracle_pooled_session_transaction_decision_on_cancel))
     }
 
+    fn oracle_cleanup_prior_retained_state_for_interrupt(&self) -> RetainedSessionState {
+        if self.oracle_pooled_session_state_delta_recorded {
+            self.oracle_pooled_session_state_delta
+        } else {
+            self.oracle_pooled_session
+                .as_ref()
+                .map(|(_, _, _, _, prior_retained_state)| *prior_retained_state)
+                .unwrap_or_default()
+        }
+    }
+
     fn oracle_interrupt_session_decision(
         &self,
         connection_generation: u64,
@@ -1385,12 +1425,10 @@ impl QueryExecutionCleanupGuard {
                 execution_state: crate::db::session_policy::ExecutionState::Finished,
                 worker_done: true,
                 has_connection_error: self.execution_metadata.has_connection_error,
-                sql_kind: self.execution_metadata.sql_kind,
-                prior_retained_state: self
-                    .oracle_pooled_session
-                    .as_ref()
-                    .map(|(_, _, _, _, prior_retained_state)| *prior_retained_state)
-                    .unwrap_or_default(),
+                sql_kind: self
+                    .oracle_interrupted_statement_sql_kind
+                    .unwrap_or(self.execution_metadata.sql_kind),
+                prior_retained_state: self.oracle_cleanup_prior_retained_state_for_interrupt(),
                 lazy_state: crate::db::session_policy::LazyFetchState::None,
                 lazy_close_requested: false,
                 lazy_cancel_requested: false,
@@ -1402,7 +1440,9 @@ impl QueryExecutionCleanupGuard {
                 timeout_settings_restored,
                 health_check_ok,
                 autocommit,
-                state_hint: crate::db::TransactionStatementStateHint::default(),
+                state_hint: self
+                    .oracle_interrupted_statement_state_hint
+                    .unwrap_or_default(),
             },
         )
     }
@@ -1462,6 +1502,32 @@ impl QueryExecutionCleanupGuard {
         }
 
         None
+    }
+
+    fn oracle_cleanup_should_probe_uncommitted_work_after_interrupt(
+        &self,
+        interrupted: bool,
+        interrupt_decision: Option<crate::db::session_policy::SessionDecision>,
+    ) -> bool {
+        if !interrupted {
+            return true;
+        }
+
+        if !matches!(
+            interrupt_decision,
+            Some(crate::db::session_policy::SessionDecision::ReuseSamePhysicalSession)
+        ) {
+            return true;
+        }
+
+        let Some(state_hint) = self.oracle_interrupted_statement_state_hint else {
+            return true;
+        };
+
+        !crate::db::statement_cancel_can_reuse_session(state_hint)
+            || self
+                .oracle_cleanup_prior_retained_state_for_interrupt()
+                .may_have_uncommitted_work()
     }
 
     fn oracle_cleanup_invalidation_decision(
@@ -1588,15 +1654,22 @@ impl Drop for QueryExecutionCleanupGuard {
                     interrupt_decision,
                 ) {
                     decision
-                } else if self.oracle_pooled_session_forced_maybe_dirty
-                    || SqlEditorWidget::oracle_session_may_have_uncommitted_work(
-                        conn.as_ref(),
-                        "sql_editor::cleanup",
-                    )
-                {
-                    reuse_state = TransactionSessionState::MaybeDirty;
-                    crate::db::session_policy::SessionDecision::ReuseSamePhysicalSession
                 } else {
+                    let effective_prior_state =
+                        self.oracle_cleanup_prior_retained_state_for_interrupt();
+                    if effective_prior_state.may_have_uncommitted_work() {
+                        reuse_state = effective_prior_state.transaction_state();
+                    } else if self.oracle_pooled_session_forced_maybe_dirty
+                        || (self.oracle_cleanup_should_probe_uncommitted_work_after_interrupt(
+                            interrupted,
+                            interrupt_decision,
+                        ) && SqlEditorWidget::oracle_session_may_have_uncommitted_work(
+                            conn.as_ref(),
+                            "sql_editor::cleanup",
+                        ))
+                    {
+                        reuse_state = TransactionSessionState::MaybeDirty;
+                    }
                     crate::db::session_policy::SessionDecision::ReuseSamePhysicalSession
                 }
             };
@@ -3568,6 +3641,7 @@ impl SqlEditorWidget {
         session_broken: bool,
         retained_state: RetainedSessionState,
         sql_kind: crate::db::session_policy::SqlKind,
+        state_hint: crate::db::TransactionStatementStateHint,
         auto_commit: bool,
         health_check_ok: bool,
     ) -> crate::db::RetainedSessionDisposition {
@@ -3598,7 +3672,7 @@ impl SqlEditorWidget {
                     timeout_settings_restored: true,
                     health_check_ok,
                     autocommit: auto_commit,
-                    state_hint: crate::db::TransactionStatementStateHint::default(),
+                    state_hint,
                 },
             );
             return Self::oracle_thin_disposition_for_session_decision(retained_state, decision);
@@ -5806,6 +5880,96 @@ impl SqlEditorWidget {
         )
     }
 
+    fn execute_mysql_batch_select_streaming<C: Queryable>(
+        conn: &mut C,
+        sender: &mpsc::Sender<QueryProgress>,
+        session: &Arc<Mutex<SessionState>>,
+        index: usize,
+        sql: &str,
+        cancel_flag: &Arc<Mutex<bool>>,
+        emit_statement_start_event: bool,
+    ) -> Result<MySqlSelectStreamOutcome, MysqlError> {
+        let (heading_enabled, feedback_enabled) = Self::current_output_settings(session);
+        let (colsep, null_text, _trimspool_enabled) = Self::current_text_output_settings(session);
+        let mut raw_column_names: Vec<String> = Vec::new();
+        let mut last_select_row: Option<Vec<String>> = None;
+        let mut buffered_rows: Vec<Vec<String>> = Vec::new();
+        let mut last_flush = Instant::now();
+        let mut has_flushed_rows = false;
+        let mut fetched_rows = 0usize;
+
+        let (mut result, stream_cancelled) =
+            crate::db::query::mysql_executor::MysqlExecutor::execute_select_streaming(
+                conn,
+                sql,
+                &mut |columns| {
+                    raw_column_names = columns
+                        .iter()
+                        .map(|column| column.name.clone())
+                        .collect::<Vec<String>>();
+                    let display_columns =
+                        Self::apply_heading_setting(raw_column_names.clone(), heading_enabled);
+                    if display_columns.is_empty() {
+                        return;
+                    }
+                    if emit_statement_start_event {
+                        Self::emit_statement_start(sender, index, ResultTabPolicy::Create);
+                    }
+                    let _ = sender.send(QueryProgress::SelectStart {
+                        index,
+                        columns: display_columns.clone(),
+                        null_text: null_text.clone(),
+                    });
+                    app::awake();
+                    Self::append_spool_output(session, &[display_columns.join(&colsep)]);
+                },
+                &mut |row| {
+                    if load_mutex_bool(cancel_flag) {
+                        return false;
+                    }
+                    last_select_row = Some(row.clone());
+                    buffered_rows.push(Self::display_row_values(&row, &null_text));
+                    fetched_rows = fetched_rows.saturating_add(1);
+                    if Self::should_flush_progress_rows(
+                        last_flush,
+                        buffered_rows.len(),
+                        has_flushed_rows,
+                    ) {
+                        Self::flush_buffered_rows(
+                            sender,
+                            session,
+                            index,
+                            &mut buffered_rows,
+                            false,
+                        );
+                        last_flush = Instant::now();
+                        has_flushed_rows = true;
+                    }
+                    !load_mutex_bool(cancel_flag)
+                },
+            )?;
+
+        let was_cancelled = stream_cancelled || load_mutex_bool(cancel_flag);
+        Self::flush_buffered_rows(sender, session, index, &mut buffered_rows, was_cancelled);
+        result.row_count = fetched_rows;
+        result.message = format!("{} rows fetched", fetched_rows);
+        if was_cancelled {
+            result.success = false;
+            result.message = Self::cancel_message();
+        }
+        Self::apply_heading_to_result(&mut result, heading_enabled);
+        if !feedback_enabled {
+            result.message.clear();
+        }
+
+        Ok(MySqlSelectStreamOutcome {
+            raw_column_names,
+            last_select_row,
+            result,
+            was_cancelled,
+        })
+    }
+
     fn execute_mysql_batch(
         shared_connection: &crate::db::SharedConnection,
         sender: &mpsc::Sender<QueryProgress>,
@@ -5950,6 +6114,69 @@ impl SqlEditorWidget {
                 }),
             }
         };
+        let execute_mysql_select_streaming =
+            |sql: &str,
+             auto_commit: bool,
+             batch_effects: &crate::db::MySqlBatchSessionEffects,
+             index: usize,
+             emit_statement_start_event: bool|
+             -> Result<MySqlSelectStreamOutcome, MySqlBatchStatementError> {
+                let statement_effects =
+                    SqlEditorWidget::mysql_statement_session_effects_for_sql_for_db_type(
+                        db_type, sql,
+                    );
+                if let Err(message) =
+                    SqlEditorWidget::ensure_mysql_batch_transaction_option_change_allowed(
+                        batch_effects,
+                        statement_effects,
+                    )
+                {
+                    return Err(MySqlBatchStatementError {
+                        message,
+                        effects: statement_effects,
+                        statement_reached_server: false,
+                    });
+                }
+                let statement_reached_server = std::cell::Cell::new(false);
+                match SqlEditorWidget::run_mysql_pooled_action_with_timeout(
+                    shared_connection,
+                    pooled_db_session,
+                    Some(sender),
+                    current_mysql_cancel_context,
+                    current_query_cancel_handle,
+                    cancel_flag,
+                    current_operation_id,
+                    operation_id,
+                    query_timeout,
+                    db_activity,
+                    auto_commit,
+                    false,
+                    false,
+                    None,
+                    sql,
+                    statement_effects,
+                    |mysql_conn| {
+                        statement_reached_server.set(true);
+                        mysql_batch_executed_sql_statement.set(true);
+                        SqlEditorWidget::execute_mysql_batch_select_streaming(
+                            mysql_conn,
+                            sender,
+                            session,
+                            index,
+                            sql,
+                            cancel_flag,
+                            emit_statement_start_event,
+                        )
+                    },
+                ) {
+                    Ok(outcome) => Ok(outcome),
+                    Err(message) => Err(MySqlBatchStatementError {
+                        message,
+                        effects: statement_effects,
+                        statement_reached_server: statement_reached_server.get(),
+                    }),
+                }
+            };
         while !frames.is_empty() {
             if stop_execution || load_mutex_bool(cancel_flag) {
                 break;
@@ -7125,6 +7352,144 @@ impl SqlEditorWidget {
                             ResultTabPolicy::Create,
                         );
                         result_statement_start_emitted = true;
+                    }
+                    if displayable_result_statement {
+                        match execute_mysql_select_streaming(
+                            sql_text.as_str(),
+                            auto_commit,
+                            &mysql_batch_effects,
+                            result_index,
+                            !result_statement_start_emitted,
+                        ) {
+                            Ok(outcome) => {
+                                SqlEditorWidget::apply_successful_mysql_batch_statement_effects(
+                                    sql_text.as_str(),
+                                    auto_commit,
+                                    statement_effects,
+                                    &mut mysql_batch_effects,
+                                );
+                                let stop_after_success =
+                                    SqlEditorWidget::mysql_batch_success_requires_stop(
+                                        statement_effects,
+                                    );
+                                let MySqlSelectStreamOutcome {
+                                    raw_column_names,
+                                    last_select_row,
+                                    mut result,
+                                    was_cancelled,
+                                } = outcome;
+                                SqlEditorWidget::apply_mysql_transaction_feedback_for_db_type(
+                                    db_type,
+                                    &mut result,
+                                    &sql_text,
+                                    auto_commit,
+                                );
+                                if !result.message.trim().is_empty() {
+                                    SqlEditorWidget::append_spool_output(
+                                        session,
+                                        std::slice::from_ref(&result.message),
+                                    );
+                                }
+                                SqlEditorWidget::apply_column_new_value_from_row(
+                                    session,
+                                    &raw_column_names,
+                                    last_select_row.as_deref(),
+                                );
+                                let _ = sender.send(QueryProgress::StatementFinished {
+                                    index: result_index,
+                                    result,
+                                    connection_name: conn_name.clone(),
+                                    timed_out: false,
+                                });
+                                app::awake();
+                                result_index += 1;
+                                if load_mutex_bool(cancel_flag) || was_cancelled {
+                                    stop_execution = true;
+                                }
+                                if stop_after_success {
+                                    SqlEditorWidget::emit_script_message(
+                                        sender,
+                                        session,
+                                        "TRANSACTION",
+                                        "Execution stopped because the DB session requires a commit/rollback/discard decision.",
+                                    );
+                                    stop_execution = true;
+                                }
+                                SqlEditorWidget::emit_timing_if_enabled(
+                                    sender,
+                                    session,
+                                    statement_start.elapsed(),
+                                );
+                            }
+                            Err(error) => {
+                                let MySqlBatchStatementError {
+                                    message,
+                                    effects,
+                                    statement_reached_server,
+                                } = error;
+                                QueryExecutionCleanupGuard::note_mysql_message_if_present(
+                                    &mut execution_metadata,
+                                    &message,
+                                );
+                                let (cancelled, timed_out) =
+                                    SqlEditorWidget::mysql_batch_interruption_flags(&message);
+                                if statement_reached_server && (cancelled || timed_out) {
+                                    SqlEditorWidget::apply_interrupted_mysql_batch_statement_effects(
+                                        sql_text.as_str(),
+                                        auto_commit,
+                                        effects,
+                                        &mut mysql_batch_effects,
+                                    );
+                                } else if statement_reached_server {
+                                    SqlEditorWidget::apply_failed_mysql_batch_statement_effects(
+                                        sql_text.as_str(),
+                                        auto_commit,
+                                        effects,
+                                        &mut mysql_batch_effects,
+                                    );
+                                }
+                                if cancelled || timed_out {
+                                    mysql_batch_interrupted.set(true);
+                                }
+                                if !result_statement_start_emitted {
+                                    SqlEditorWidget::emit_statement_start(
+                                        sender,
+                                        result_index,
+                                        ResultTabPolicy::Create,
+                                    );
+                                }
+                                let mut result = QueryResult::new_error(&sql_text, &message);
+                                result.is_select = true;
+                                if !result.message.trim().is_empty() {
+                                    SqlEditorWidget::append_spool_output(
+                                        session,
+                                        std::slice::from_ref(&result.message),
+                                    );
+                                }
+                                let _ = sender.send(QueryProgress::StatementFinished {
+                                    index: result_index,
+                                    result,
+                                    connection_name: conn_name.clone(),
+                                    timed_out,
+                                });
+                                app::awake();
+                                result_index += 1;
+                                SqlEditorWidget::emit_timing_if_enabled(
+                                    sender,
+                                    session,
+                                    statement_start.elapsed(),
+                                );
+                                if SqlEditorWidget::mysql_batch_statement_error_requires_stop(
+                                    &message,
+                                    cancelled,
+                                    timed_out,
+                                    continue_on_error,
+                                ) {
+                                    stop_execution = true;
+                                }
+                            }
+                        }
+                        continue;
                     }
                     match execute_mysql_sql(sql_text.as_str(), auto_commit, &mysql_batch_effects) {
                         Ok(success) => {
@@ -9917,6 +10282,11 @@ impl SqlEditorWidget {
                                     crate::db::DatabaseType::Oracle,
                                 )
                                 .effects_for_sql(&sql_text);
+                            let statement_sql_kind =
+                                crate::db::session_policy::classify_sql_for_db_type(
+                                    crate::db::DatabaseType::Oracle,
+                                    &sql_text,
+                                );
                             if statement_effects.transaction_option_change_action().is_some() {
                                 let live_may_have_uncommitted_work =
                                     SqlEditorWidget::oracle_session_may_have_uncommitted_work(
@@ -10292,6 +10662,7 @@ impl SqlEditorWidget {
                                         if (cancelled || timed_out) && !has_connection_error {
                                             cleanup.protect_oracle_statement_after_interrupt(
                                                 auto_commit,
+                                                statement_sql_kind,
                                                 statement_effects,
                                             );
                                         } else {
@@ -11428,7 +11799,7 @@ impl SqlEditorWidget {
                                                     false, true, true, false,
                                                 );
                                                 cleanup
-                                                    .protect_oracle_statement_after_interrupt(auto_commit, statement_effects);
+                                                    .protect_oracle_statement_after_interrupt(auto_commit, statement_sql_kind, statement_effects);
                                             } else if was_cancelled {
                                                 query_result.message =
                                                     SqlEditorWidget::cancel_message();
@@ -11438,7 +11809,7 @@ impl SqlEditorWidget {
                                                     true, false, false, false,
                                                 );
                                                 cleanup
-                                                    .protect_oracle_statement_after_interrupt(auto_commit, statement_effects);
+                                                    .protect_oracle_statement_after_interrupt(auto_commit, statement_sql_kind, statement_effects);
                                             }
                                             if !feedback_enabled {
                                                 query_result.message.clear();
@@ -11462,7 +11833,7 @@ impl SqlEditorWidget {
                                             statement_interrupted = timed_out || cancelled;
                                             if statement_interrupted {
                                                 cleanup
-                                                    .protect_oracle_statement_after_interrupt(auto_commit, statement_effects);
+                                                    .protect_oracle_statement_after_interrupt(auto_commit, statement_sql_kind, statement_effects);
                                             }
                                             SqlEditorWidget::invalidate_oracle_pooled_session_after_select_error(
                                                 &mut cleanup,
@@ -11705,6 +12076,7 @@ impl SqlEditorWidget {
                                         if (cancelled || timed_out) && !has_connection_error {
                                             cleanup.protect_oracle_statement_after_interrupt(
                                                 auto_commit,
+                                                statement_sql_kind,
                                                 statement_effects,
                                             );
                                         } else {
@@ -12973,6 +13345,298 @@ impl SqlEditorWidget {
         }
     }
 
+    fn oracle_thin_select_streaming_with_binds_and_cancel(
+        conn: &mut OracleThinSession,
+        sender: &mpsc::Sender<QueryProgress>,
+        session: &Arc<Mutex<SessionState>>,
+        index: usize,
+        sql: &str,
+        cancel_flag: Option<&Arc<Mutex<bool>>>,
+        query_timeout: Option<Duration>,
+    ) -> Result<OracleThinSelectStreamOutcome, String> {
+        let statement_start = Instant::now();
+        let (heading_enabled, feedback_enabled) = Self::current_output_settings(session);
+        let (colsep, null_text, _trimspool_enabled) = Self::current_text_output_settings(session);
+        let resolved = Self::oracle_thin_resolve_binds(sql, session)?;
+        let sql_for_editing = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+        let sql_for_execution = QueryExecutor::rowid_safe_execution_sql(sql, &sql_for_editing);
+        let mut normalize_internal_rowid_alias = sql_for_execution != sql;
+        let mut request = StatementRequest::query(sql_for_execution.clone(), 200);
+        request.binds = resolved
+            .iter()
+            .map(Self::oracle_thin_input_bind_value)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut preview_columns = match conn.describe_request(&request) {
+            Ok(columns) => columns,
+            Err(err)
+                if sql_for_execution != sql
+                    && QueryExecutor::is_retryable_rowid_injection_error(&err.to_string()) =>
+            {
+                normalize_internal_rowid_alias = false;
+                request.sql = sql.to_string();
+                conn.describe_request(&request)
+                    .map_err(|retry_err| retry_err.to_string())?
+            }
+            Err(err) => return Err(err.to_string()),
+        };
+        if sql_for_execution != sql && preview_columns.is_empty() {
+            normalize_internal_rowid_alias = false;
+            request.sql = sql.to_string();
+            preview_columns = conn
+                .describe_request(&request)
+                .map_err(|retry_err| retry_err.to_string())?;
+        }
+
+        let lob_needs_define_fetch =
+            OracleThinSession::described_columns_require_define_fetch(&preview_columns);
+        if lob_needs_define_fetch {
+            request.prefetch_rows = 0;
+        }
+
+        let described_result = if lob_needs_define_fetch {
+            conn.query_described_initial_without_prefetch_request(&request)
+        } else {
+            conn.query_described_initial_request(&request)
+        };
+        let described = match described_result {
+            Ok(described) => described,
+            Err(err)
+                if sql_for_execution != sql
+                    && QueryExecutor::is_retryable_rowid_injection_error(&err.to_string()) =>
+            {
+                normalize_internal_rowid_alias = false;
+                request.sql = sql.to_string();
+                if lob_needs_define_fetch {
+                    conn.query_described_initial_without_prefetch_request(&request)
+                        .map_err(|retry_err| retry_err.to_string())?
+                } else {
+                    conn.query_described_initial_request(&request)
+                        .map_err(|retry_err| retry_err.to_string())?
+                }
+            }
+            Err(err) => return Err(err.to_string()),
+        };
+
+        let raw_column_names = Self::oracle_thin_column_display_names(
+            &described.columns,
+            normalize_internal_rowid_alias,
+        );
+        let column_info =
+            Self::oracle_thin_column_info(&described.columns, normalize_internal_rowid_alias);
+        let column_types = described
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>();
+        let display_columns =
+            Self::apply_heading_setting(raw_column_names.clone(), heading_enabled);
+        let cursor_id = described.result.cursor_id;
+        let mut needs_define_fetch = lob_needs_define_fetch;
+        let mut fetched_rows = 0usize;
+        let mut last_select_row: Option<Vec<String>> = None;
+        let mut buffered_rows: Vec<Vec<String>> = Vec::new();
+        let mut last_flush = Instant::now();
+        let mut has_flushed_rows = false;
+
+        let _ = sender.send(QueryProgress::SelectStart {
+            index,
+            columns: display_columns.clone(),
+            null_text: null_text.clone(),
+        });
+        app::awake();
+        if !display_columns.is_empty() {
+            Self::append_spool_output(session, &[display_columns.join(&colsep)]);
+        }
+
+        let finish_result = |row_count: usize,
+                             last_select_row: Option<Vec<String>>,
+                             success: bool,
+                             message: Option<String>,
+                             was_cancelled: bool,
+                             timed_out: bool|
+         -> OracleThinSelectStreamOutcome {
+            let mut result = QueryResult::new_select_streamed(
+                sql,
+                column_info.clone(),
+                row_count,
+                statement_start.elapsed(),
+            );
+            result.success = success;
+            if let Some(message) = message {
+                result.message = message;
+            }
+            Self::apply_heading_to_result(&mut result, heading_enabled);
+            if !feedback_enabled {
+                result.message.clear();
+            }
+            OracleThinSelectStreamOutcome {
+                raw_column_names: raw_column_names.clone(),
+                last_select_row,
+                result,
+                was_cancelled,
+                timed_out,
+            }
+        };
+
+        if Self::execute_oracle_thin_cancel_requested(cancel_flag) {
+            conn.close_cursor_later(cursor_id);
+            Self::oracle_thin_close_owned_cursor_rows(conn, described.result.rows);
+            Self::flush_buffered_rows(sender, session, index, &mut buffered_rows, true);
+            return Ok(finish_result(
+                fetched_rows,
+                last_select_row,
+                false,
+                Some(Self::cancel_message()),
+                true,
+                false,
+            ));
+        }
+
+        let initial_eof = Self::oracle_thin_result_reached_eof(&described.result);
+        let mut initial_rows = VecDeque::from(described.result.rows);
+        while let Some(row) = initial_rows.pop_front() {
+            if Self::execute_oracle_thin_cancel_requested(cancel_flag) {
+                Self::oracle_thin_close_owned_cursor_values(conn, row);
+                Self::oracle_thin_close_owned_cursor_rows(conn, initial_rows);
+                conn.close_cursor_later(cursor_id);
+                Self::flush_buffered_rows(sender, session, index, &mut buffered_rows, true);
+                return Ok(finish_result(
+                    fetched_rows,
+                    last_select_row,
+                    false,
+                    Some(Self::cancel_message()),
+                    true,
+                    false,
+                ));
+            }
+            let row_data = match Self::oracle_thin_display_row_cells(conn, row, &null_text, 0) {
+                Ok(row) => row,
+                Err(err) => {
+                    Self::oracle_thin_close_owned_cursor_rows(conn, initial_rows);
+                    conn.close_cursor_later(cursor_id);
+                    Self::flush_buffered_rows(sender, session, index, &mut buffered_rows, false);
+                    return Ok(finish_result(
+                        fetched_rows,
+                        last_select_row,
+                        false,
+                        Some(err),
+                        false,
+                        false,
+                    ));
+                }
+            };
+            last_select_row = Some(row_data.clone());
+            buffered_rows.push(row_data);
+            fetched_rows = fetched_rows.saturating_add(1);
+            if Self::should_flush_progress_rows(last_flush, buffered_rows.len(), has_flushed_rows) {
+                Self::flush_buffered_rows(sender, session, index, &mut buffered_rows, false);
+                last_flush = Instant::now();
+                has_flushed_rows = true;
+            }
+        }
+
+        if !initial_eof {
+            if let Some(cursor_id) = cursor_id {
+                loop {
+                    if Self::execute_oracle_thin_cancel_requested(cancel_flag) {
+                        conn.close_cursor_later(Some(cursor_id));
+                        Self::flush_buffered_rows(sender, session, index, &mut buffered_rows, true);
+                        return Ok(finish_result(
+                            fetched_rows,
+                            last_select_row,
+                            false,
+                            Some(Self::cancel_message()),
+                            true,
+                            false,
+                        ));
+                    }
+                    let fetch_result = Self::oracle_thin_fetch_lazy_rows(
+                        conn,
+                        cursor_id,
+                        &column_types,
+                        &mut needs_define_fetch,
+                        200,
+                        &null_text,
+                        &mut fetched_rows,
+                        &mut last_select_row,
+                        query_timeout,
+                        None,
+                    );
+                    let (rows, eof) = match fetch_result {
+                        Ok(result) => result,
+                        Err(err) => {
+                            let was_cancelled = Self::oracle_thin_is_cancel_message(&err)
+                                || Self::execute_oracle_thin_cancel_requested(cancel_flag);
+                            let timed_out =
+                                !was_cancelled && Self::oracle_thin_message_is_timeout(&err);
+                            conn.close_cursor_later(Some(cursor_id));
+                            Self::flush_buffered_rows(
+                                sender,
+                                session,
+                                index,
+                                &mut buffered_rows,
+                                false,
+                            );
+                            return Ok(finish_result(
+                                fetched_rows,
+                                last_select_row,
+                                false,
+                                Some(if was_cancelled {
+                                    Self::cancel_message()
+                                } else if timed_out {
+                                    let timeout_message = Self::timeout_message(query_timeout);
+                                    if err.trim().is_empty() || err == timeout_message {
+                                        timeout_message
+                                    } else {
+                                        format!("{timeout_message}: {err}")
+                                    }
+                                } else {
+                                    err
+                                }),
+                                was_cancelled,
+                                timed_out,
+                            ));
+                        }
+                    };
+                    let no_rows = rows.is_empty();
+                    for row in rows {
+                        buffered_rows.push(row);
+                        if Self::should_flush_progress_rows(
+                            last_flush,
+                            buffered_rows.len(),
+                            has_flushed_rows,
+                        ) {
+                            Self::flush_buffered_rows(
+                                sender,
+                                session,
+                                index,
+                                &mut buffered_rows,
+                                false,
+                            );
+                            last_flush = Instant::now();
+                            has_flushed_rows = true;
+                        }
+                    }
+                    if eof || no_rows {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Self::flush_buffered_rows(sender, session, index, &mut buffered_rows, false);
+        conn.close_cursor_later(cursor_id);
+        Ok(finish_result(
+            fetched_rows,
+            last_select_row,
+            true,
+            None,
+            false,
+            false,
+        ))
+    }
+
     fn oracle_thin_fetch_cursor_result_streaming(
         conn: &mut OracleThinSession,
         sender: &mpsc::Sender<QueryProgress>,
@@ -13409,6 +14073,7 @@ impl SqlEditorWidget {
         Self::oracle_thin_select_cells_with_binds_and_cancel(conn, sql, session, None)
     }
 
+    #[cfg(test)]
     fn oracle_thin_select_cells_with_binds_and_cancel(
         conn: &mut OracleThinSession,
         sql: &str,
@@ -13947,6 +14612,8 @@ impl SqlEditorWidget {
                 retained_state: prior_retained_state,
                 had_error: false,
                 timed_out: false,
+                interrupted_sql_kind: None,
+                interrupted_state_hint: None,
                 refreshed_pool_context_epoch: None,
             };
         }
@@ -13975,6 +14642,8 @@ impl SqlEditorWidget {
                 ),
                 had_error: true,
                 timed_out: false,
+                interrupted_sql_kind: None,
+                interrupted_state_hint: None,
                 refreshed_pool_context_epoch: None,
             };
         }
@@ -13994,6 +14663,8 @@ impl SqlEditorWidget {
         let mut invalid_session = false;
         let mut had_error = false;
         let mut timed_out = false;
+        let mut interrupted_sql_kind = None;
+        let mut interrupted_state_hint = None;
         let mut transaction_mode_applied = false;
         let mut batch_may_report_transaction_work =
             prior_retained_state.may_have_uncommitted_work();
@@ -14776,6 +15447,10 @@ impl SqlEditorWidget {
                     let execution_sql = exec_call.unwrap_or_else(|| sql_to_execute.clone());
                     let head = Self::oracle_thin_statement_head(&execution_sql);
                     let statement_effects = post_processor.effects_for_sql(&execution_sql);
+                    let statement_sql_kind = crate::db::session_policy::classify_sql_for_db_type(
+                        crate::db::DatabaseType::Oracle,
+                        &execution_sql,
+                    );
                     batch_may_report_transaction_work |= statement_effects
                         .may_leave_uncommitted_work()
                         || statement_effects.opens_or_preserves_transaction_state()
@@ -14918,23 +15593,56 @@ impl SqlEditorWidget {
                         }
                     } else if Self::oracle_thin_is_query(&execution_sql) {
                         Self::emit_statement_start(sender, result_index, ResultTabPolicy::Create);
-                        match Self::oracle_thin_select_cells_with_binds_and_cancel(
+                        match Self::oracle_thin_select_streaming_with_binds_and_cancel(
                             conn,
-                            &execution_sql,
+                            sender,
                             session,
+                            result_index,
+                            &execution_sql,
                             Some(cancel_flag),
+                            query_timeout,
                         ) {
-                            Ok((columns, rows)) => {
-                                retained_state =
-                                    Self::oracle_retained_state_after_statement_effects(
-                                        retained_state,
-                                        statement_effects,
-                                        auto_commit,
-                                        false,
-                                        false,
-                                        false,
-                                    );
-                                if auto_commit
+                            Ok(mut stream_outcome) => {
+                                let raw_column_names = stream_outcome.raw_column_names;
+                                let last_select_row = stream_outcome.last_select_row;
+                                let was_cancelled = stream_outcome.was_cancelled;
+                                let statement_timed_out = stream_outcome.timed_out;
+                                let result_success_before_commit = stream_outcome.result.success;
+                                if was_cancelled || statement_timed_out {
+                                    interrupted_sql_kind = Some(statement_sql_kind);
+                                    interrupted_state_hint = Some(statement_effects.state_hint);
+                                }
+                                if !result_success_before_commit {
+                                    had_error = true;
+                                    timed_out |= statement_timed_out;
+                                    invalid_session |= statement_timed_out || conn.is_broken();
+                                    retained_state =
+                                        Self::oracle_retained_state_after_statement_effects(
+                                            retained_state,
+                                            statement_effects,
+                                            auto_commit,
+                                            true,
+                                            false,
+                                            (was_cancelled || statement_timed_out)
+                                                && statement_effects
+                                                    .requires_transaction_decision_after_interrupt(
+                                                        auto_commit,
+                                                    ),
+                                        );
+                                }
+                                if result_success_before_commit {
+                                    retained_state =
+                                        Self::oracle_retained_state_after_statement_effects(
+                                            retained_state,
+                                            statement_effects,
+                                            auto_commit,
+                                            false,
+                                            false,
+                                            false,
+                                        );
+                                }
+                                if result_success_before_commit
+                                    && auto_commit
                                     && Self::oracle_select_effects_need_auto_commit(
                                         statement_effects,
                                     )
@@ -14952,27 +15660,45 @@ impl SqlEditorWidget {
                                             retained_state = retained_state.with_transaction_state(
                                                 TransactionSessionState::DecisionRequired,
                                             );
-                                            statement_error = Some(message);
+                                            stream_outcome.result.success = false;
+                                            if stream_outcome.result.message.trim().is_empty() {
+                                                stream_outcome.result.message = message;
+                                            } else {
+                                                stream_outcome.result.message = format!(
+                                                    "{} | {}",
+                                                    stream_outcome.result.message, message
+                                                );
+                                            }
                                         }
                                     }
                                 }
-                                if statement_error.is_none() {
+                                if result_success_before_commit {
                                     Self::apply_column_new_value_from_row(
                                         session,
-                                        &columns,
-                                        rows.last().map(Vec::as_slice),
+                                        &raw_column_names,
+                                        last_select_row.as_deref(),
                                     );
-                                    Self::emit_oracle_thin_select_result_with_start_option(
-                                        sender,
+                                }
+                                if !stream_outcome.result.message.trim().is_empty() {
+                                    Self::append_spool_output(
                                         session,
-                                        conn_name,
-                                        result_index,
-                                        &display_sql,
-                                        columns,
-                                        rows,
-                                        false,
+                                        std::slice::from_ref(&stream_outcome.result.message),
                                     );
-                                    result_index += 1;
+                                }
+                                let result_success = stream_outcome.result.success;
+                                let _ = sender.send(QueryProgress::StatementFinished {
+                                    index: result_index,
+                                    result: stream_outcome.result,
+                                    connection_name: conn_name.to_string(),
+                                    timed_out: statement_timed_out,
+                                });
+                                app::awake();
+                                result_index += 1;
+                                if was_cancelled
+                                    || statement_timed_out
+                                    || (!result_success && !continue_on_error)
+                                {
+                                    stop_execution = true;
                                 }
                             }
                             Err(message) => statement_error = Some(message),
@@ -15310,6 +16036,10 @@ impl SqlEditorWidget {
                             );
                         timed_out |= statement_timed_out;
                         invalid_session |= statement_timed_out || conn.is_broken();
+                        if load_mutex_bool(cancel_flag) || statement_timed_out {
+                            interrupted_sql_kind = Some(statement_sql_kind);
+                            interrupted_state_hint = Some(statement_effects.state_hint);
+                        }
                         retained_state = Self::oracle_retained_state_after_statement_effects(
                             retained_state,
                             statement_effects,
@@ -15395,6 +16125,8 @@ impl SqlEditorWidget {
             retained_state,
             had_error,
             timed_out,
+            interrupted_sql_kind,
+            interrupted_state_hint,
             refreshed_pool_context_epoch,
         }
     }
@@ -17580,10 +18312,12 @@ impl SqlEditorWidget {
         batch_effects.apply_failed_statement_effects(sql, auto_commit, effects);
     }
 
+    #[cfg(test)]
     fn script_frames_have_remaining_items(frames: &[ScriptExecutionFrame]) -> bool {
         frames.iter().any(|frame| frame.index < frame.items.len())
     }
 
+    #[cfg(test)]
     fn mysql_batch_cancel_left_unprocessed_work(
         cancel_requested: bool,
         script_mode: bool,
@@ -17594,13 +18328,12 @@ impl SqlEditorWidget {
 
     fn mysql_batch_cancel_requires_interrupted_finalization(
         cancel_requested: bool,
-        script_mode: bool,
-        frames: &[ScriptExecutionFrame],
+        _script_mode: bool,
+        _frames: &[ScriptExecutionFrame],
         batch_effects: &crate::db::MySqlBatchSessionEffects,
-        executed_sql_statement: bool,
+        _executed_sql_statement: bool,
     ) -> bool {
-        Self::mysql_batch_cancel_left_unprocessed_work(cancel_requested, script_mode, frames)
-            && (executed_sql_statement || batch_effects.may_require_resolution())
+        cancel_requested && batch_effects.may_require_resolution()
     }
 
     #[cfg(test)]
@@ -22321,7 +23054,11 @@ mod query_execution_cleanup_tests {
             Arc::new(Mutex::new(false)),
             Arc::new(Mutex::new(true)),
         );
-        cleanup.protect_oracle_statement_after_interrupt(true, select_effects);
+        cleanup.protect_oracle_statement_after_interrupt(
+            true,
+            crate::db::session_policy::SqlKind::SelectLike,
+            select_effects,
+        );
         assert!(!cleanup.oracle_pooled_session_invalidated);
         assert!(!cleanup.oracle_pooled_session_transaction_decision_required);
         assert!(cleanup.oracle_pooled_session_requires_health_check);
@@ -22334,10 +23071,91 @@ mod query_execution_cleanup_tests {
             Arc::new(Mutex::new(false)),
             Arc::new(Mutex::new(true)),
         );
-        cleanup.protect_oracle_statement_after_interrupt(false, select_effects);
+        cleanup.protect_oracle_statement_after_interrupt(
+            false,
+            crate::db::session_policy::SqlKind::SelectLike,
+            select_effects,
+        );
         assert!(!cleanup.oracle_pooled_session_invalidated);
         assert!(!cleanup.oracle_pooled_session_transaction_decision_required);
         assert!(cleanup.oracle_pooled_session_requires_health_check);
+    }
+
+    #[test]
+    fn oracle_script_cancel_uses_interrupted_statement_policy() {
+        let (sender, _receiver) = mpsc::channel();
+        let current_operation_id = Arc::new(AtomicU64::new(42));
+        let mut cleanup = new_test_cleanup_guard_with_current_operation(
+            sender,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(false)),
+            Arc::new(Mutex::new(true)),
+            0,
+            current_operation_id,
+        );
+        cleanup.execution_metadata.operation_id = 42;
+        cleanup.execution_metadata.connection_generation = 7;
+        cleanup.execution_metadata.sql_kind = crate::db::session_policy::SqlKind::Script;
+        cleanup.note_execution_outcome(true, false, false, false);
+
+        let select_effects =
+            crate::db::statement_session_post_processor_for(crate::db::DatabaseType::Oracle)
+                .effects_for_sql("SELECT 1 FROM dual");
+        cleanup.protect_oracle_statement_after_interrupt(
+            false,
+            crate::db::session_policy::SqlKind::SelectLike,
+            select_effects,
+        );
+
+        assert_eq!(
+            cleanup.oracle_interrupt_session_decision(7, true, true, true),
+            crate::db::session_policy::SessionDecision::ReuseSamePhysicalSession
+        );
+        assert!(
+            !cleanup.oracle_cleanup_should_probe_uncommitted_work_after_interrupt(
+                true,
+                Some(crate::db::session_policy::SessionDecision::ReuseSamePhysicalSession),
+            ),
+            "plain SELECT cancel must not probe Oracle transaction state and invent dirty work"
+        );
+    }
+
+    #[test]
+    fn oracle_script_cancel_preserves_executed_dirty_delta() {
+        let (sender, _receiver) = mpsc::channel();
+        let mut cleanup = new_test_cleanup_guard(
+            sender,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(false)),
+            Arc::new(Mutex::new(true)),
+        );
+        let post_processor =
+            crate::db::statement_session_post_processor_for(crate::db::DatabaseType::Oracle);
+        SqlEditorWidget::apply_oracle_db_statement_effects(
+            &mut cleanup,
+            post_processor.effects_for_sql("SAVEPOINT sp1"),
+        );
+        cleanup.protect_oracle_statement_after_interrupt(
+            false,
+            crate::db::session_policy::SqlKind::SelectLike,
+            post_processor.effects_for_sql("SELECT 1 FROM dual"),
+        );
+
+        assert_eq!(
+            cleanup
+                .oracle_cleanup_prior_retained_state_for_interrupt()
+                .transaction_state(),
+            TransactionSessionState::MaybeDirty
+        );
+        assert!(
+            cleanup.oracle_cleanup_should_probe_uncommitted_work_after_interrupt(
+                true,
+                Some(crate::db::session_policy::SessionDecision::ReuseSamePhysicalSession),
+            ),
+            "executed dirty work before a cancelled SELECT must remain visible to cleanup"
+        );
     }
 
     #[test]
@@ -22354,7 +23172,11 @@ mod query_execution_cleanup_tests {
             Arc::new(Mutex::new(false)),
             Arc::new(Mutex::new(true)),
         );
-        cleanup.protect_oracle_statement_after_interrupt(true, effects);
+        cleanup.protect_oracle_statement_after_interrupt(
+            true,
+            crate::db::session_policy::SqlKind::SelectLike,
+            effects,
+        );
         assert!(cleanup.oracle_pooled_session_invalidated);
         assert!(!cleanup.oracle_pooled_session_transaction_decision_required);
 
@@ -22366,7 +23188,11 @@ mod query_execution_cleanup_tests {
             Arc::new(Mutex::new(false)),
             Arc::new(Mutex::new(true)),
         );
-        cleanup.protect_oracle_statement_after_interrupt(false, effects);
+        cleanup.protect_oracle_statement_after_interrupt(
+            false,
+            crate::db::session_policy::SqlKind::SelectLike,
+            effects,
+        );
         assert!(!cleanup.oracle_pooled_session_invalidated);
         assert!(cleanup.oracle_pooled_session_transaction_decision_required);
     }
@@ -23703,6 +24529,7 @@ mod query_execution_cleanup_tests {
                 false,
                 RetainedSessionState::default(),
                 crate::db::session_policy::SqlKind::SelectLike,
+                crate::db::TransactionStatementStateHint::default(),
                 true,
                 false,
             ),
@@ -23719,6 +24546,7 @@ mod query_execution_cleanup_tests {
                 false,
                 RetainedSessionState::default(),
                 crate::db::session_policy::SqlKind::SelectLike,
+                crate::db::TransactionStatementStateHint::default(),
                 true,
                 true,
             ),
@@ -23734,6 +24562,7 @@ mod query_execution_cleanup_tests {
             false,
             RetainedSessionState::default(),
             crate::db::session_policy::SqlKind::SelectLike,
+            crate::db::TransactionStatementStateHint::default(),
             false,
             true,
         );
@@ -23754,6 +24583,7 @@ mod query_execution_cleanup_tests {
             false,
             retained_transaction,
             crate::db::session_policy::SqlKind::SelectLike,
+            crate::db::TransactionStatementStateHint::default(),
             false,
             true,
         );
@@ -23768,6 +24598,63 @@ mod query_execution_cleanup_tests {
     }
 
     #[test]
+    fn oracle_select_only_script_operation_uses_select_cancel_policy() {
+        let select_only_kind = SqlEditorWidget::operation_sql_kind(
+            crate::db::DatabaseType::Oracle,
+            "SELECT 1 FROM dual;\nSELECT 2 FROM dual;\nSELECT 3 FROM dual;",
+            true,
+        );
+        assert_eq!(
+            select_only_kind,
+            crate::db::session_policy::SqlKind::SelectLike
+        );
+        assert_eq!(
+            SqlEditorWidget::operation_sql_kind(
+                crate::db::DatabaseType::Oracle,
+                "SELECT 1 FROM dual;\nSELECT 2 FROM dual;\nSELECT 3 FROM dual;",
+                false,
+            ),
+            crate::db::session_policy::SqlKind::SelectLike
+        );
+
+        let disposition = SqlEditorWidget::oracle_thin_execution_disposition(
+            true,
+            true,
+            false,
+            RetainedSessionState::default(),
+            select_only_kind,
+            crate::db::TransactionStatementStateHint::default(),
+            false,
+            true,
+        );
+        assert!(matches!(
+            disposition,
+            crate::db::RetainedSessionDisposition::Retain(state)
+                if crate::db::retained_session_state_preflight_decision(
+                    crate::db::RetainedSessionPreflightAction::Execute,
+                    state,
+                ) == crate::db::RetainedSessionPreflightDecision::Allow
+        ));
+
+        assert_eq!(
+            SqlEditorWidget::operation_sql_kind(
+                crate::db::DatabaseType::Oracle,
+                "SELECT 1 FROM dual;\nUPDATE t SET c = 1;",
+                true,
+            ),
+            crate::db::session_policy::SqlKind::Script
+        );
+        assert_eq!(
+            SqlEditorWidget::operation_sql_kind(
+                crate::db::DatabaseType::Oracle,
+                "SELECT * FROM accounts FOR UPDATE;\nSELECT 1 FROM dual;",
+                true,
+            ),
+            crate::db::session_policy::SqlKind::Script
+        );
+    }
+
+    #[test]
     fn oracle_thin_general_late_cancel_without_error_keeps_existing_behavior() {
         assert!(matches!(
             SqlEditorWidget::oracle_thin_execution_disposition(
@@ -23776,6 +24663,7 @@ mod query_execution_cleanup_tests {
                 false,
                 RetainedSessionState::default(),
                 crate::db::session_policy::SqlKind::SelectLike,
+                crate::db::TransactionStatementStateHint::default(),
                 true,
                 false,
             ),
@@ -23792,6 +24680,7 @@ mod query_execution_cleanup_tests {
                 true,
                 RetainedSessionState::default(),
                 crate::db::session_policy::SqlKind::SelectLike,
+                crate::db::TransactionStatementStateHint::default(),
                 true,
                 false,
             ),
@@ -23806,6 +24695,7 @@ mod query_execution_cleanup_tests {
                     TransactionSessionState::InvalidSession,
                 ),
                 crate::db::session_policy::SqlKind::SelectLike,
+                crate::db::TransactionStatementStateHint::default(),
                 true,
                 false,
             ),
@@ -23822,6 +24712,7 @@ mod query_execution_cleanup_tests {
                 false,
                 RetainedSessionState::default(),
                 crate::db::session_policy::SqlKind::SelectLike,
+                crate::db::TransactionStatementStateHint::default(),
                 true,
                 false,
             ),
@@ -25772,7 +26663,7 @@ mod query_execution_cleanup_tests {
     }
 
     #[test]
-    fn mysql_script_cancel_between_clean_autocommit_on_statements_discards_session() {
+    fn mysql_script_cancel_between_clean_autocommit_on_statements_does_not_finalize() {
         let frames = vec![ScriptExecutionFrame {
             items: vec![
                 ScriptItem::Statement("SELECT 1".to_string()),
@@ -25787,28 +26678,19 @@ mod query_execution_cleanup_tests {
         assert!(!batch_effects.may_require_resolution());
 
         assert!(
-            SqlEditorWidget::mysql_batch_cancel_requires_interrupted_finalization(
+            !SqlEditorWidget::mysql_batch_cancel_requires_interrupted_finalization(
                 true,
                 true,
                 &frames,
                 &batch_effects,
                 true
-            )
+            ),
+            "unexecuted trailing statements must not force session finalization"
         );
-        let decision = batch_effects.decision_after_interrupted_batch(
-            RetainedSessionState::default(),
-            true,
-            true,
-        );
-        assert_eq!(
-            decision.outcome,
-            crate::db::RetainedSessionOutcome::DiscardPhysical
-        );
-        assert!(!decision.requires_session_info_sync);
     }
 
     #[test]
-    fn mysql_script_cancel_between_read_only_autocommit_off_statements_discards_without_decision() {
+    fn mysql_script_cancel_between_read_only_autocommit_off_statements_does_not_finalize() {
         let frames = vec![ScriptExecutionFrame {
             items: vec![
                 ScriptItem::Statement("SELECT 1".to_string()),
@@ -25822,27 +26704,18 @@ mod query_execution_cleanup_tests {
         SqlEditorWidget::mysql_batch_session_effects_for_sql("SELECT 1", false, &mut batch_effects);
 
         assert!(
-            SqlEditorWidget::mysql_batch_cancel_requires_interrupted_finalization(
+            !SqlEditorWidget::mysql_batch_cancel_requires_interrupted_finalization(
                 true,
                 true,
                 &frames,
                 &batch_effects,
                 true
-            )
+            ),
+            "read-only executed statements must not force commit/rollback just because later statements remain"
         );
         assert!(batch_effects
             .retained_state_after_interrupted_batch(RetainedSessionState::default(), true, false)
             .is_none());
-        let decision = batch_effects.decision_after_interrupted_batch(
-            RetainedSessionState::default(),
-            true,
-            false,
-        );
-        assert_eq!(
-            decision.outcome,
-            crate::db::RetainedSessionOutcome::DiscardPhysical
-        );
-        assert!(!decision.requires_session_info_sync);
     }
 
     #[test]
@@ -33341,6 +34214,7 @@ mod mysql_transaction_feedback_tests {
             conn.is_broken(),
             outcome.retained_state,
             crate::db::session_policy::SqlKind::SelectLike,
+            crate::db::TransactionStatementStateHint::default(),
             true,
             false,
         );

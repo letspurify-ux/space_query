@@ -2647,6 +2647,28 @@ fn audit_final_suggestions_for(
             &ctx,
             trigger_has_identifier,
         )
+        || SqlEditorWidget::cursor_is_at_ddl_partition_new_name_slot_for_context(
+            &ctx,
+            trigger_has_identifier,
+        )
+        || SqlEditorWidget::cursor_is_at_ddl_table_index_new_name_slot_for_context(
+            &ctx,
+            trigger_has_identifier,
+        )
+        || SqlEditorWidget::cursor_is_inside_post_table_modifier_value_slot_for_context(
+            &ctx,
+            trigger_has_identifier,
+        )
+        || SqlEditorWidget::cursor_is_inside_oracle_storage_clause_value_slot_for_context(
+            &ctx,
+            trigger_has_identifier,
+            Some(db),
+        )
+        || SqlEditorWidget::cursor_is_inside_oracle_lob_storage_clause_value_slot_for_context(
+            &ctx,
+            trigger_has_identifier,
+            Some(db),
+        )
         || (!at_package_declaration_default_value
             && SqlEditorWidget::cursor_is_at_ddl_identifier_suppression_slot_for_context(
                 &ctx,
@@ -32972,6 +32994,47 @@ fn data_type_plsql_collection_element_offers_types() {
 }
 
 #[test]
+fn data_type_plsql_record_field_offers_types_without_catalog() {
+    use crate::db::DatabaseType::Oracle;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for sql in [
+        "DECLARE TYPE emp_rec IS RECORD (field |); BEGIN NULL; END;",
+        "DECLARE TYPE emp_rec IS RECORD (id NUMBER, field |); BEGIN NULL; END;",
+        "CREATE PACKAGE pkg AS TYPE emp_rec IS RECORD (field |); END;",
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert_eq!(
+            kind,
+            Some(ExpectedObjectSuggestionKind::Type),
+            "PL/SQL RECORD field type slot should resolve only type objects at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            contains(&final_suggestions, "NUMBER") && contains(&final_suggestions, "ADDRESS_T"),
+            "PL/SQL RECORD field type slot lost primitive or user-defined types at `{sql}`: {final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "HR_PKG",
+            "APP_USER",
+            "SCOTT",
+            "SELECT",
+            "WHERE",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into PL/SQL RECORD field type slot at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn data_type_plsql_executable_section_is_not_a_type_position() {
     use crate::db::DatabaseType::Oracle;
     // None of these are declaration/signature positions; they must not offer types.
@@ -51434,6 +51497,70 @@ fn post_table_modifier_tail_slots_do_not_offer_catalog() {
     }
 }
 
+#[test]
+fn post_table_modifier_value_slots_do_not_offer_catalog() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for (db, sql) in [
+        (Oracle, "SELECT * FROM t PARTITION (|"),
+        (Oracle, "SELECT * FROM t PARTITION (app|"),
+        (Oracle, "SELECT * FROM t PARTITION (p1, |"),
+        (Oracle, "SELECT * FROM t PARTITION (p1, app|"),
+        (Oracle, "SELECT * FROM t PARTITION (scott.|"),
+        (Oracle, "SELECT * FROM t SUBPARTITION (|"),
+        (Oracle, "SELECT * FROM t SUBPARTITION (app|"),
+        (Oracle, "SELECT * FROM t SUBPARTITION (scott.|"),
+        (Oracle, "SELECT * FROM t PARTITION FOR (|"),
+        (Oracle, "SELECT * FROM t PARTITION FOR (app|"),
+        (Oracle, "SELECT * FROM t PARTITION FOR (scott.|"),
+        (Oracle, "SELECT * FROM t SAMPLE (|"),
+        (Oracle, "SELECT * FROM t SAMPLE (app|"),
+        (Oracle, "SELECT * FROM t SAMPLE BLOCK (|"),
+        (Oracle, "SELECT * FROM t TABLESAMPLE BERNOULLI (|"),
+        (Oracle, "SELECT * FROM t TABLESAMPLE SYSTEM (app|"),
+        (MySQL, "SELECT * FROM t USE INDEX (|"),
+        (MySQL, "SELECT * FROM t USE INDEX (app|"),
+        (MySQL, "SELECT * FROM t USE INDEX (idx_a, |"),
+        (MySQL, "SELECT * FROM t USE INDEX (idx_a, app|"),
+        (MySQL, "SELECT * FROM t USE INDEX (scott.|"),
+        (MySQL, "SELECT * FROM t IGNORE KEY (|"),
+        (MySQL, "SELECT * FROM t FORCE INDEX FOR JOIN (app|"),
+        (MySQL, "SELECT * FROM t FORCE KEY FOR ORDER BY (scott.|"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert_eq!(
+            kind, None,
+            "post-table modifier value slot should not resolve object kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            keywords.is_empty(),
+            "post-table modifier value slot should not offer keywords at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "APP_USER",
+            "SCOTT",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "EMPNO",
+            "ENAME",
+            "DEPTNO",
+            "DNAME",
+            "SELECT",
+            "WHERE",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into post-table modifier value slot at `{sql}` {db:?}: {final_suggestions:?}"
+            );
+        }
+    }
+}
+
 /// The `XMLTABLE`/`JSON_TABLE` subgrammar (`PASSING`/`COLUMNS`/error clauses) is
 /// only grammatical *inside* the still-open call paren. A depth-blind `has()` used
 /// to leak `COLUMNS` into the surrounding query once the call closed
@@ -51903,6 +52030,94 @@ fn create_table_and_index_definition_tail_offers_options_and_suppresses_relation
         !my.iter().any(|x| x == "ORGANIZATION"),
         "Oracle-only option leaked into MySQL tail: {my:?}"
     );
+}
+
+#[test]
+fn oracle_create_table_index_option_value_slots_do_not_offer_catalog() {
+    use crate::db::DatabaseType::Oracle;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for sql in [
+        "CREATE TABLE t (a NUMBER) TABLESPACE |",
+        "CREATE TABLE t (a NUMBER) TABLESPACE app|",
+        "CREATE TABLE t (a NUMBER) TABLESPACE scott.|",
+        "CREATE TABLE t (a NUMBER) PCTFREE |",
+        "CREATE TABLE t (a NUMBER) PCTFREE app|",
+        "CREATE TABLE t (a NUMBER) STORAGE (|",
+        "CREATE TABLE t (a NUMBER) STORAGE (INITIAL |",
+        "CREATE TABLE t (a NUMBER) STORAGE (INITIAL app|",
+        "CREATE INDEX ix ON t (a) TABLESPACE |",
+        "CREATE INDEX ix ON t (a) TABLESPACE app|",
+        "CREATE INDEX ix ON t (a) TABLESPACE scott.|",
+        "CREATE INDEX ix ON t (a) PCTFREE |",
+        "CREATE INDEX ix ON t (a) PCTFREE app|",
+        "CREATE INDEX ix ON t (a) STORAGE (|",
+        "CREATE INDEX ix ON t (a) STORAGE (INITIAL |",
+        "CREATE INDEX ix ON t (a) STORAGE (INITIAL app|",
+        "ALTER TABLE t STORAGE (|",
+        "ALTER TABLE t STORAGE (INITIAL |",
+        "ALTER TABLE t STORAGE (INITIAL app|",
+        "ALTER INDEX ix STORAGE (|",
+        "ALTER INDEX ix STORAGE (INITIAL |",
+        "ALTER INDEX ix STORAGE (INITIAL app|",
+        "CREATE TABLE t (a CLOB) LOB (a) STORE AS (TABLESPACE |",
+        "CREATE TABLE t (a CLOB) LOB (a) STORE AS (TABLESPACE app|",
+        "CREATE TABLE t (a CLOB) LOB (a) STORE AS lobseg (TABLESPACE |",
+        "CREATE TABLE t (a CLOB) LOB (a) STORE AS lobseg (TABLESPACE app|",
+        "CREATE TABLE t (a CLOB) LOB (a) STORE AS (CHUNK |",
+        "CREATE TABLE t (a CLOB) LOB (a) STORE AS (CHUNK app|",
+        "CREATE TABLE t (a CLOB) LOB (a) STORE AS (PCTVERSION |",
+        "CREATE TABLE t (a CLOB) LOB (a) STORE AS (PCTVERSION app|",
+        "CREATE TABLE t (a CLOB) LOB (a) STORE AS (FREEPOOLS |",
+        "CREATE TABLE t (a CLOB) LOB (a) STORE AS (FREEPOOLS app|",
+        "CREATE TABLE t (a CLOB) LOB (a) STORE AS (STORAGE (INITIAL |",
+        "CREATE TABLE t (a CLOB) LOB (a) STORE AS (STORAGE (INITIAL app|",
+        "CREATE TABLE t (nt nested_type) NESTED TABLE nt STORE AS nt_store (TABLESPACE |",
+        "CREATE TABLE t (nt nested_type) NESTED TABLE nt STORE AS nt_store (TABLESPACE app|",
+        "CREATE TABLE t (nt nested_type) NESTED TABLE nt STORE AS nt_store (STORAGE (INITIAL |",
+        "CREATE TABLE t (nt nested_type) NESTED TABLE nt STORE AS nt_store (STORAGE (INITIAL app|",
+        "CREATE TABLE t (va varray_type) VARRAY va STORE AS LOB (TABLESPACE |",
+        "CREATE TABLE t (va varray_type) VARRAY va STORE AS LOB (TABLESPACE app|",
+        "CREATE TABLE t (va varray_type) VARRAY va STORE AS LOB (CHUNK |",
+        "CREATE TABLE t (va varray_type) VARRAY va STORE AS LOB (CHUNK app|",
+        "CREATE TABLE t (va varray_type) VARRAY va STORE AS LOB (STORAGE (INITIAL |",
+        "CREATE TABLE t (va varray_type) VARRAY va STORE AS LOB (STORAGE (INITIAL app|",
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert_eq!(
+            kind, None,
+            "Oracle CREATE TABLE/INDEX option value slot should not resolve object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "HR_PKG",
+            "ADDRESS_T",
+            "APP_USER",
+            "SCOTT",
+            "EMPNO",
+            "ENAME",
+            "SELECT",
+            "WHERE",
+            "NOT",
+            "NULL",
+            "NTH_VALUE",
+            "NTILE",
+            "NVL",
+            "NVL()",
+            "NEXT_DAY()",
+            "NULLIF()",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into Oracle CREATE TABLE/INDEX option value slot at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
 }
 
 /// Past the object name of a single-object `DROP`/`CREATE`/`ALTER` a bare
@@ -53703,6 +53918,14 @@ fn plsql_declaration_name_slots_do_not_offer_catalog() {
         "DECLARE v| BEGIN NULL; END;",
         "DECLARE v NUMBER; w| BEGIN NULL; END;",
         "CREATE PROCEDURE p IS v| BEGIN NULL; END;",
+        "DECLARE TYPE | IS TABLE OF NUMBER; BEGIN NULL; END;",
+        "DECLARE TYPE ty| IS TABLE OF NUMBER; BEGIN NULL; END;",
+        "DECLARE TYPE t IS TABLE OF NUMBER; SUBTYPE | IS NUMBER; BEGIN NULL; END;",
+        "DECLARE CURSOR | IS SELECT 1 FROM dual; BEGIN NULL; END;",
+        "DECLARE CURSOR c| IS SELECT 1 FROM dual; BEGIN NULL; END;",
+        "CREATE PACKAGE pkg AS FUNCTION | RETURN NUMBER; END;",
+        "CREATE PACKAGE pkg AS FUNCTION f| RETURN NUMBER; END;",
+        "CREATE PACKAGE pkg AS PROCEDURE |; END;",
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
         assert_eq!(
@@ -53733,6 +53956,48 @@ fn plsql_declaration_name_slots_do_not_offer_catalog() {
             final_suggestions.is_empty(),
             "PL/SQL parameter name slot should not offer catalog or keywords at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
         );
+    }
+}
+
+#[test]
+fn plsql_record_field_name_slots_do_not_offer_catalog() {
+    use crate::db::DatabaseType::Oracle;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for sql in [
+        "DECLARE TYPE emp_rec IS RECORD (field| NUMBER); BEGIN NULL; END;",
+        "DECLARE TYPE emp_rec IS RECORD (id NUMBER, field| VARCHAR2(30)); BEGIN NULL; END;",
+        "CREATE PACKAGE pkg AS TYPE emp_rec IS RECORD (field| NUMBER); END;",
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert_eq!(
+            kind, None,
+            "PL/SQL RECORD field name slot should not resolve object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            final_suggestions.is_empty(),
+            "PL/SQL RECORD field name slot should not offer catalog or keywords at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "APP_USER",
+            "SCOTT",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "HR_PKG",
+            "EMP_SEQ",
+            "ADDRESS_T",
+            "SELECT",
+            "WHERE",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into PL/SQL RECORD field name slot at `{sql}`: {final_suggestions:?}"
+            );
+        }
     }
 }
 
@@ -54041,6 +54306,119 @@ fn create_table_final_suggestions_separate_names_types_and_constraint_keywords()
             final_suggestions.is_empty(),
             "new-name slot should stay empty at `{sql}` for {db:?}: keywords={keywords:?} final={final_suggestions:?}"
         );
+    }
+}
+
+#[test]
+fn ddl_internal_new_name_slots_do_not_offer_catalog_or_keywords() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for (db, sql) in [
+        (Oracle, "CREATE TABLE t (CONSTRAINT app| PRIMARY KEY (id))"),
+        (
+            Oracle,
+            "CREATE TABLE t (id NUMBER, CONSTRAINT app| UNIQUE (id))",
+        ),
+        (
+            Oracle,
+            "CREATE TABLE t (id NUMBER CONSTRAINT app| NOT NULL)",
+        ),
+        (
+            Oracle,
+            "CREATE TABLE t (id NUMBER CONSTRAINT app| CHECK (id > 0))",
+        ),
+        (
+            Oracle,
+            "ALTER TABLE t ADD id NUMBER CONSTRAINT app| NOT NULL",
+        ),
+        (Oracle, "ALTER TABLE t ADD CONSTRAINT app| CHECK (id > 0)"),
+        (
+            MySQL,
+            "CREATE TABLE t (id INT CONSTRAINT app| CHECK (id > 0))",
+        ),
+        (
+            MySQL,
+            "ALTER TABLE t ADD id INT CONSTRAINT app| CHECK (id > 0)",
+        ),
+        (
+            MySQL,
+            "CREATE TABLE t (id INT, FOREIGN KEY app| (id) REFERENCES p(id))",
+        ),
+        (
+            MySQL,
+            "CREATE TABLE t (id INT, CONSTRAINT fk FOREIGN KEY app| (id) REFERENCES p(id))",
+        ),
+        (
+            MySQL,
+            "ALTER TABLE t ADD FOREIGN KEY app| (id) REFERENCES p(id)",
+        ),
+        (
+            Oracle,
+            "CREATE TABLE t (id NUMBER) PARTITION BY RANGE (id) (PARTITION app| VALUES LESS THAN (10))",
+        ),
+        (
+            Oracle,
+            "ALTER TABLE t ADD PARTITION app| VALUES LESS THAN (10)",
+        ),
+        (MySQL, "CREATE TABLE t (id INT, INDEX app| (id))"),
+        (MySQL, "CREATE TABLE t (id INT, KEY app| (id))"),
+        (MySQL, "CREATE TABLE t (id INT, UNIQUE app| (id))"),
+        (MySQL, "CREATE TABLE t (id INT, UNIQUE KEY app| (id))"),
+        (MySQL, "CREATE TABLE t (id TEXT, FULLTEXT app| (id))"),
+        (MySQL, "CREATE TABLE t (id POINT, SPATIAL app| (id))"),
+        (
+            MySQL,
+            "CREATE TEMPORARY TABLE t (id INT, KEY app| (id))",
+        ),
+        (MySQL, "ALTER TABLE t ADD UNIQUE app| (id)"),
+        (MySQL, "ALTER TABLE t ADD FULLTEXT app| (id)"),
+        (MySQL, "ALTER TABLE t ADD SPATIAL app| (id)"),
+        (
+            MySQL,
+            "CREATE TABLE t (id INT) PARTITION BY RANGE (id) (PARTITION app| VALUES LESS THAN (10))",
+        ),
+        (
+            MySQL,
+            "CREATE TEMPORARY TABLE t (id INT) PARTITION BY RANGE (id) (PARTITION app| VALUES LESS THAN (10))",
+        ),
+        (
+            MySQL,
+            "ALTER TABLE t ADD PARTITION app| VALUES LESS THAN (10)",
+        ),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert_eq!(
+            kind, None,
+            "internal DDL new-name slot should not resolve object kind at `{sql}` for {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            keywords.is_empty(),
+            "internal DDL new-name slot should not offer keywords at `{sql}` for {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "APP_USER",
+            "SCOTT",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "EMPNO",
+            "ENAME",
+            "DEPTNO",
+            "DNAME",
+            "SELECT",
+            "WHERE",
+            "NOT",
+            "NULL",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into internal DDL new-name slot at `{sql}` for {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
     }
 }
 
@@ -56537,6 +56915,112 @@ fn mysql_show_create_database_name_slots_do_not_offer_schema_object_catalog() {
 }
 
 #[test]
+fn mysql_database_schema_name_slots_do_not_offer_general_catalog() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for db in [MySQL, MariaDB] {
+        for sql in [
+            "ALTER DATABASE |",
+            "ALTER DATABASE app|",
+            "ALTER SCHEMA |",
+            "ALTER SCHEMA app|",
+            "DROP DATABASE |",
+            "DROP DATABASE app|",
+            "DROP DATABASE IF EXISTS |",
+            "DROP DATABASE IF EXISTS app|",
+            "DROP SCHEMA |",
+            "DROP SCHEMA app|",
+            "DROP SCHEMA IF EXISTS |",
+            "DROP SCHEMA IF EXISTS app|",
+        ] {
+            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+            assert!(
+                kind.is_none() || matches!(kind, Some(ExpectedObjectSuggestionKind::NoSuggestions)),
+                "MySQL/MariaDB database/schema name slot should not resolve unrelated object kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+            );
+            for leaked in [
+                "EMP",
+                "DEPT",
+                "EMP_V",
+                "MVIEW_SALES",
+                "RUN_JOB",
+                "CALC_TOTAL",
+                "HR_PKG",
+                "EMP_SEQ",
+                "ADDRESS_T",
+                "APP_USER",
+                "SCOTT",
+                "SELECT",
+                "WHERE",
+            ] {
+                assert!(
+                    !contains(&final_suggestions, leaked),
+                    "{leaked} leaked into MySQL/MariaDB database/schema name slot at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn mysql_unmodeled_admin_object_name_slots_do_not_offer_general_catalog() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for db in [MySQL, MariaDB] {
+        for sql in [
+            "ALTER SERVER |",
+            "ALTER SERVER app|",
+            "DROP SERVER |",
+            "DROP SERVER app|",
+            "DROP SERVER IF EXISTS |",
+            "DROP SERVER IF EXISTS app|",
+            "ALTER RESOURCE GROUP |",
+            "ALTER RESOURCE GROUP app|",
+            "DROP RESOURCE GROUP |",
+            "DROP RESOURCE GROUP app|",
+            "ALTER LOGFILE GROUP |",
+            "ALTER LOGFILE GROUP app|",
+            "DROP LOGFILE GROUP |",
+            "DROP LOGFILE GROUP app|",
+            "ALTER TABLESPACE |",
+            "ALTER TABLESPACE app|",
+            "DROP TABLESPACE |",
+            "DROP TABLESPACE app|",
+        ] {
+            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+            assert!(
+                kind.is_none() || matches!(kind, Some(ExpectedObjectSuggestionKind::NoSuggestions)),
+                "MySQL/MariaDB admin object-name slot should not resolve unrelated object kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+            );
+            for leaked in [
+                "EMP",
+                "DEPT",
+                "EMP_V",
+                "MVIEW_SALES",
+                "RUN_JOB",
+                "CALC_TOTAL",
+                "HR_PKG",
+                "EMP_SEQ",
+                "ADDRESS_T",
+                "APP_USER",
+                "SCOTT",
+                "SELECT",
+                "WHERE",
+            ] {
+                assert!(
+                    !contains(&final_suggestions, leaked),
+                    "{leaked} leaked into MySQL/MariaDB admin object-name slot at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn mysql_describe_table_column_slots_offer_only_target_columns() {
     use crate::db::DatabaseType::MySQL;
 
@@ -58818,6 +59302,57 @@ fn oracle_ddl_value_slots_reject_invalid_prefix_noise() {
 }
 
 #[test]
+fn oracle_unmodeled_admin_object_name_slots_do_not_offer_general_catalog() {
+    use crate::db::DatabaseType::Oracle;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for sql in [
+        "DROP ROLE |",
+        "DROP ROLE app|",
+        "ALTER ROLE |",
+        "ALTER ROLE app|",
+        "DROP PROFILE |",
+        "DROP PROFILE app|",
+        "ALTER PROFILE |",
+        "ALTER PROFILE app|",
+        "DROP TABLESPACE |",
+        "DROP TABLESPACE app|",
+        "ALTER TABLESPACE |",
+        "ALTER TABLESPACE app|",
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert!(
+            kind.is_none() || matches!(kind, Some(ExpectedObjectSuggestionKind::NoSuggestions)),
+            "unmodeled Oracle admin object slot should not resolve unrelated object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "MVIEW_SALES",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "HR_PKG",
+            "EMP_SEQ",
+            "ADDRESS_T",
+            "APP_USER",
+            "SCOTT",
+            "DATA_PUMP_DIR",
+            "APP_CTX",
+            "ORA_EDITION",
+            "SELECT",
+            "WHERE",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into unmodeled Oracle admin object slot at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn oracle_database_link_library_and_java_tails_offer_precise_keywords() {
     use crate::db::DatabaseType::Oracle;
 
@@ -60135,6 +60670,47 @@ fn oracle_create_type_object_member_start_slots_offer_only_member_keywords() {
 }
 
 #[test]
+fn oracle_create_type_object_attribute_name_slots_do_not_offer_catalog() {
+    use crate::db::DatabaseType::Oracle;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for sql in [
+        "CREATE TYPE ty AS OBJECT (att|)",
+        "CREATE OR REPLACE TYPE ty AS OBJECT (att|)",
+        "CREATE TYPE ty AS OBJECT (id NUMBER, att|)",
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert_eq!(
+            kind, None,
+            "CREATE TYPE OBJECT attribute name slot should not resolve existing objects at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            final_suggestions.is_empty(),
+            "CREATE TYPE OBJECT attribute name slot should not offer catalog or keywords at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "HR_PKG",
+            "ADDRESS_T",
+            "APP_USER",
+            "SCOTT",
+            "SELECT",
+            "WHERE",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into CREATE TYPE OBJECT attribute name slot at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn oracle_type_method_name_slots_do_not_offer_catalog() {
     use crate::db::DatabaseType::Oracle;
 
@@ -61074,12 +61650,26 @@ fn prefixed_new_name_slots_do_not_offer_catalog_or_keywords() {
         (Oracle, "CREATE OR REPLACE SYNONYM app|"),
         (Oracle, "CREATE OR REPLACE PUBLIC SYNONYM app|"),
         (Oracle, "CREATE MATERIALIZED VIEW app|"),
+        (Oracle, "CREATE USER app|"),
+        (Oracle, "CREATE ROLE app|"),
+        (Oracle, "CREATE TABLESPACE app|"),
+        (Oracle, "CREATE PROFILE app|"),
+        (Oracle, "CREATE DIRECTORY app|"),
+        (Oracle, "CREATE CONTEXT app|"),
+        (Oracle, "CREATE EDITION app|"),
+        (Oracle, "CREATE LIBRARY app|"),
+        (Oracle, "CREATE OPERATOR app|"),
+        (Oracle, "CREATE INDEXTYPE app|"),
         (Oracle, "ALTER TABLE emp RENAME TO app|"),
         (Oracle, "ALTER TABLE emp RENAME COLUMN old_col TO app|"),
         (Oracle, "ALTER TABLE emp RENAME CONSTRAINT old_ck TO app|"),
         (Oracle, "ALTER TABLE emp RENAME PARTITION old_p TO app|"),
         (MySQL, "CREATE TABLE app|"),
         (MySQL, "CREATE TABLE IF NOT EXISTS app|"),
+        (MySQL, "CREATE DATABASE app|"),
+        (MySQL, "CREATE DATABASE IF NOT EXISTS app|"),
+        (MySQL, "CREATE SCHEMA app|"),
+        (MySQL, "CREATE SCHEMA IF NOT EXISTS app|"),
         (MySQL, "CREATE EVENT app|"),
         (MySQL, "CREATE LOGFILE GROUP app|"),
         (MySQL, "CREATE SERVER app|"),
@@ -61134,10 +61724,24 @@ fn prefixed_new_name_slots_do_not_offer_catalog_or_keywords() {
         (Oracle, "CREATE OR REPLACE PACKAGE n|"),
         (Oracle, "CREATE SYNONYM n|"),
         (Oracle, "CREATE MATERIALIZED VIEW n|"),
+        (Oracle, "CREATE USER n|"),
+        (Oracle, "CREATE ROLE n|"),
+        (Oracle, "CREATE TABLESPACE n|"),
+        (Oracle, "CREATE PROFILE n|"),
+        (Oracle, "CREATE DIRECTORY n|"),
+        (Oracle, "CREATE CONTEXT n|"),
+        (Oracle, "CREATE EDITION n|"),
+        (Oracle, "CREATE LIBRARY n|"),
+        (Oracle, "CREATE OPERATOR n|"),
+        (Oracle, "CREATE INDEXTYPE n|"),
         (Oracle, "ALTER TABLE emp RENAME TO n|"),
         (Oracle, "ALTER TABLE emp RENAME COLUMN old_col TO n|"),
         (MySQL, "CREATE TABLE n|"),
         (MySQL, "CREATE TABLE IF NOT EXISTS n|"),
+        (MySQL, "CREATE DATABASE n|"),
+        (MySQL, "CREATE DATABASE IF NOT EXISTS n|"),
+        (MySQL, "CREATE SCHEMA n|"),
+        (MySQL, "CREATE SCHEMA IF NOT EXISTS n|"),
         (MySQL, "CREATE EVENT n|"),
         (MySQL, "CREATE USER n|"),
         (MySQL, "CREATE ROLE n|"),
