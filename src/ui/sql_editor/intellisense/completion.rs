@@ -2547,6 +2547,28 @@ impl SqlEditorWidget {
         if at_table_alias_name_slot {
             expected_keyword_suggestions.retain(|keyword| keyword.eq_ignore_ascii_case("OF"));
         }
+        let current_query_tokens = Self::current_query_tokens(deep_ctx);
+        let current_query_cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let current_query_context_end = Self::expected_keyword_suggestion_context_end(
+            current_query_tokens,
+            current_query_cursor_token_len,
+            &snapshot.prefix,
+        );
+        let suppress_select_modifier_keywords_in_prefixed_projection =
+            Self::prefixed_select_list_token_has_following_projection_boundary(
+                &snapshot.prefix,
+                current_query_tokens,
+                current_query_context_end,
+                current_query_cursor_token_len,
+            );
+        if suppress_select_modifier_keywords_in_prefixed_projection {
+            expected_keyword_suggestions.retain(|keyword| {
+                !Self::keyword_is_select_modifier_candidate(
+                    keyword,
+                    Some(snapshot.preferred_db_type),
+                )
+            });
+        }
         if at_dedicated_column_slot {
             expected_keyword_suggestions.clear();
         }
@@ -2869,6 +2891,22 @@ impl SqlEditorWidget {
                 expected_keyword_suggestions,
                 true,
             );
+        }
+        if suppress_select_modifier_keywords_in_prefixed_projection {
+            let mut data = intellisense_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let column_scope = if !column_tables.is_empty() {
+                Some(column_tables.as_slice())
+            } else {
+                None
+            };
+            suggestions.retain(|suggestion| {
+                !Self::keyword_is_select_modifier_candidate(
+                    suggestion,
+                    Some(snapshot.preferred_db_type),
+                ) || Self::suggestion_is_scoped_column(&mut data, suggestion, column_scope)
+            });
         }
         let comparison_suggestions = if source_allowance.comparison_suggestions {
             let data = intellisense_data
@@ -17697,6 +17735,61 @@ impl SqlEditorWidget {
         }
     }
 
+    fn prefixed_select_list_token_has_following_projection_boundary(
+        prefix: &str,
+        tokens: &[SqlToken],
+        context_end: usize,
+        cursor_token_len: usize,
+    ) -> bool {
+        if prefix.is_empty() {
+            return false;
+        }
+        let Some(current_idx) = tokens
+            .get(context_end)
+            .and_then(|token| match token {
+                SqlToken::Word(word) if word.eq_ignore_ascii_case(prefix) => Some(context_end),
+                _ => None,
+            })
+        else {
+            return false;
+        };
+
+        let next_start = (current_idx + 1).max(cursor_token_len);
+        let Some(next_idx) = Self::next_meaningful_token_index_after(tokens, next_start) else {
+            return false;
+        };
+        match tokens.get(next_idx) {
+            Some(SqlToken::Word(word)) => word.eq_ignore_ascii_case("FROM"),
+            Some(SqlToken::Symbol(symbol)) => symbol == ",",
+            _ => false,
+        }
+    }
+
+    fn keyword_is_select_modifier_candidate(
+        keyword: &str,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        let upper = keyword.to_ascii_uppercase();
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            matches!(
+                upper.as_str(),
+                "ALL"
+                    | "DISTINCT"
+                    | "DISTINCTROW"
+                    | "HIGH_PRIORITY"
+                    | "STRAIGHT_JOIN"
+                    | "SQL_SMALL_RESULT"
+                    | "SQL_BIG_RESULT"
+                    | "SQL_BUFFER_RESULT"
+                    | "SQL_CACHE"
+                    | "SQL_NO_CACHE"
+                    | "SQL_CALC_FOUND_ROWS"
+            )
+        } else {
+            matches!(upper.as_str(), "ALL" | "DISTINCT" | "UNIQUE")
+        }
+    }
+
     fn expected_create_table_column_definition_tail_keywords(
         tokens: &[SqlToken],
         end: usize,
@@ -20947,6 +21040,70 @@ impl SqlEditorWidget {
                     | "RELAY_LOG_POS"
                     | "REQUIRE_TABLE_PRIMARY_KEY_CHECK"
             ))
+        {
+            return true;
+        }
+
+        false
+    }
+
+    fn cursor_is_at_mysql_literal_only_option_value_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return false;
+        }
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        if Self::unclosed_paren_count(tokens, end) != 0 {
+            return false;
+        }
+
+        let words = Self::meaningful_tokens_before(tokens, end)
+            .into_iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                SqlToken::String(_) => Some("__VALUE__".to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let Some(last) = words.last().map(String::as_str) else {
+            return false;
+        };
+        if !matches!(last, "COMMENT" | "ATTRIBUTE") {
+            return false;
+        }
+
+        let verb_is_create_or_alter =
+            matches!(words.first().map(String::as_str), Some("CREATE" | "ALTER"));
+        if verb_is_create_or_alter
+            && words.get(1).is_some_and(|word| {
+                matches!(
+                    word.as_str(),
+                    "USER" | "FUNCTION" | "PROCEDURE" | "EVENT" | "TABLE"
+                )
+            })
+        {
+            return true;
+        }
+        if verb_is_create_or_alter
+            && words
+                .iter()
+                .any(|word| matches!(word.as_str(), "FUNCTION" | "PROCEDURE" | "EVENT"))
+        {
+            return true;
+        }
+        if words.iter().any(|word| word == "TABLESPACE")
+            || words.windows(2).any(
+                |window| matches!(window, [logfile, group] if logfile == "LOGFILE" && group == "GROUP"),
+            )
         {
             return true;
         }
@@ -34582,6 +34739,13 @@ impl SqlEditorWidget {
         ) {
             return Vec::new();
         }
+        if Self::cursor_is_at_mysql_literal_only_option_value_slot_for_context(
+            deep_ctx,
+            !prefix.is_empty(),
+            db_type,
+        ) {
+            return Vec::new();
+        }
         if !prefix.is_empty()
             && Self::cursor_is_after_complete_sounds_like_tail_for_context(
                 deep_ctx,
@@ -35884,6 +36048,11 @@ impl SqlEditorWidget {
             {
                 return Some(kind);
             }
+            if let Some(kind) =
+                Self::expected_mysql_definer_account_object_suggestion_kind(tokens, context_end)
+            {
+                return Some(kind);
+            }
             if let Some(kind) = Self::expected_mysql_load_file_table_object_suggestion_kind(&words)
             {
                 return Some(kind);
@@ -36807,6 +36976,45 @@ impl SqlEditorWidget {
             _ => false,
         };
         account_slot.then_some(ExpectedObjectSuggestionKind::User)
+    }
+
+    fn expected_mysql_definer_account_object_suggestion_kind(
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> Option<ExpectedObjectSuggestionKind> {
+        let items = Self::meaningful_tokens_before(tokens, end)
+            .into_iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                SqlToken::String(_) => Some("__VALUE__".to_string()),
+                SqlToken::Symbol(symbol) if matches!(symbol.as_str(), "=" | "@") => {
+                    Some(symbol.clone())
+                }
+                SqlToken::Symbol(_) | SqlToken::Comment(_) => None,
+            })
+            .collect::<Vec<_>>();
+        if !matches!(items.first().map(String::as_str), Some("CREATE" | "ALTER")) {
+            return None;
+        }
+        let definer_idx = items.iter().rposition(|item| item == "DEFINER")?;
+        if definer_idx >= 2
+            && matches!(
+                (items.get(definer_idx - 2), items.get(definer_idx - 1)),
+                (Some(sql), Some(security)) if sql == "SQL" && security == "SECURITY"
+            )
+        {
+            return None;
+        }
+
+        let account_tail = items.get(definer_idx + 1..).unwrap_or(&[]);
+        let user_slot = match account_tail {
+            [] => true,
+            [eq] if eq == "=" => true,
+            [_, at] if at == "@" => true,
+            [eq, _, at] if eq == "=" && at == "@" => true,
+            _ => false,
+        };
+        user_slot.then_some(ExpectedObjectSuggestionKind::User)
     }
 
     fn expected_mysql_index_cache_object_suggestion_kind(
@@ -38853,6 +39061,17 @@ impl SqlEditorWidget {
             if !matches!(tokens.get(i), Some(SqlToken::Comment(_))) {
                 return Some(i);
             }
+        }
+        None
+    }
+
+    fn next_meaningful_token_index_after(tokens: &[SqlToken], idx: usize) -> Option<usize> {
+        let mut i = idx.min(tokens.len());
+        while i < tokens.len() {
+            if !matches!(tokens.get(i), Some(SqlToken::Comment(_))) {
+                return Some(i);
+            }
+            i += 1;
         }
         None
     }

@@ -307,6 +307,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "NLS_COMP",
     "NLS_CURRENCY",
     "NLS_DATE_FORMAT",
+    "NLS_DATE_LANGUAGE",
     "NLS_ISO_CURRENCY",
     "NLS_LANGUAGE",
     "NLS_LENGTH_SEMANTICS",
@@ -821,7 +822,9 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "AS",
     "ASC",
     "ASENSITIVE",
+    "ASSIGN_GTIDS_TO_ANONYMOUS_TRANSACTIONS",
     "ATOMIC",
+    "AUTOEXTEND_SIZE",
     "AUTO_INCREMENT",
     "AVG_ROW_LENGTH",
     "BEFORE",
@@ -882,6 +885,7 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "DECIMAL",
     "DECLARE",
     "DEFAULT",
+    "DEFAULT_AUTH",
     "DELAYED",
     "DELETE",
     "DELETE_DOMAIN_ID",
@@ -914,6 +918,7 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "ENFORCED",
     "ENGINE",
     "ENGINES",
+    "ENGINE_ATTRIBUTE",
     "ENUM",
     "ERRORS",
     "ESCAPED",
@@ -931,6 +936,7 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "FETCH",
     "FIELDS",
     "FILE",
+    "FILE_BLOCK_SIZE",
     "FILTER",
     "FINISH",
     "FIRST",
@@ -960,6 +966,7 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "GROUP",
     "GROUPING",
     "GROUPS",
+    "GROUP_REPLICATION",
     "HANDLER",
     "HASH",
     "HAVING",
@@ -980,6 +987,7 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "INDEX",
     "INDEXES",
     "INFILE",
+    "INITIAL_SIZE",
     "INNER",
     "INOUT",
     "INSENSITIVE",
@@ -1036,6 +1044,7 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "MATCH",
     "MAXVALUE",
     "MAX_ROWS",
+    "MAX_SIZE",
     "MEDIUMBLOB",
     "MEDIUMINT",
     "MEDIUMTEXT",
@@ -1065,9 +1074,11 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "NDB",
     "NDBCLUSTER",
     "NESTED",
+    "NETWORK_NAMESPACE",
     "NEW",
     "NEXT",
     "NO",
+    "NODEGROUP",
     "NONE",
     "NOT",
     "NOWAIT",
@@ -1104,6 +1115,7 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "PERSIST",
     "PLUGIN",
     "PLUGINS",
+    "PLUGIN_DIR",
     "POINT",
     "POLYGON",
     "PORT",
@@ -1113,6 +1125,7 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "PRESERVE",
     "PRIMARY",
     "PRIVILEGES",
+    "PRIVILEGE_CHECKS_USER",
     "PROCEDURE",
     "PROCESSLIST",
     "PROFILE",
@@ -1126,11 +1139,14 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "READ_WRITE",
     "REAL",
     "RECURSIVE",
+    "REDO_BUFFER_SIZE",
     "REDUNDANT",
     "REFERENCES",
     "REF_SYSTEM_ID",
     "REGEXP",
     "RELAY_LOG",
+    "RELAY_LOG_FILE",
+    "RELAY_LOG_POS",
     "RELEASE",
     "RENAME",
     "REORGANIZE",
@@ -1139,6 +1155,7 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "REPEATABLE",
     "REPLACE",
     "REQUIRE",
+    "REQUIRE_TABLE_PRIMARY_KEY_CHECK",
     "RESET",
     "RESIGNAL",
     "RESTART",
@@ -1186,12 +1203,42 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "SOME",
     "SONAME",
     "SOUNDS",
+    "SOURCE_AUTO_POSITION",
+    "SOURCE_BIND",
+    "SOURCE_COMPRESSION_ALGORITHMS",
+    "SOURCE_CONNECTION_AUTO_FAILOVER",
+    "SOURCE_CONNECT_RETRY",
+    "SOURCE_DELAY",
+    "SOURCE_HEARTBEAT_PERIOD",
+    "SOURCE_HOST",
+    "SOURCE_LOG_FILE",
+    "SOURCE_LOG_POS",
+    "SOURCE_PASSWORD",
+    "SOURCE_PORT",
+    "SOURCE_PUBLIC_KEY_PATH",
+    "SOURCE_RETRY_COUNT",
+    "SOURCE_SSL",
+    "SOURCE_SSL_CA",
+    "SOURCE_SSL_CAPATH",
+    "SOURCE_SSL_CERT",
+    "SOURCE_SSL_CIPHER",
+    "SOURCE_SSL_CRL",
+    "SOURCE_SSL_CRLPATH",
+    "SOURCE_SSL_KEY",
+    "SOURCE_SSL_VERIFY_SERVER_CERT",
+    "SOURCE_TLS_CIPHERSUITES",
+    "SOURCE_TLS_VERSION",
+    "SOURCE_USER",
+    "SOURCE_ZSTD_COMPRESSION_LEVEL",
     "SPATIAL",
     "SPECIFIC",
     "SQL",
     "SQLEXCEPTION",
     "SQLSTATE",
     "SQLWARNING",
+    "SQL_AFTER_GTIDS",
+    "SQL_AFTER_MTS_GAPS",
+    "SQL_BEFORE_GTIDS",
     "SQL_BIG_RESULT",
     "SQL_BUFFER_RESULT",
     "SQL_CACHE",
@@ -1225,6 +1272,7 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "TEXT",
     "THAN",
     "THEN",
+    "THREAD_PRIORITY",
     "TIES",
     "TIME",
     "TIMESTAMP",
@@ -1243,6 +1291,8 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "UNCOMMITTED",
     "UNDEFINED",
     "UNDO",
+    "UNDOFILE",
+    "UNDO_BUFFER_SIZE",
     "UNICODE",
     "UNION",
     "UNIQUE",
@@ -1266,6 +1316,7 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "VARCHARACTER",
     "VARIABLES",
     "VARYING",
+    "VCPU",
     "VECTOR",
     "VIEW",
     "VIRTUAL",
@@ -1294,6 +1345,9 @@ pub static MYSQL_SQL_KEYWORDS_SET: Lazy<HashSet<&'static str>> =
 #[inline]
 pub(crate) fn is_mysql_sql_keyword(word: &str) -> bool {
     MYSQL_SQL_KEYWORDS_SET.contains(word)
+        || MYSQL_ADMIN_OPTION_KEYWORDS_SET.contains(word)
+        || MYSQL_DYNAMIC_PRIVILEGE_KEYWORDS_SET.contains(word)
+        || MYSQL_ACCOUNT_OPTION_KEYWORDS_SET.contains(word)
 }
 
 /// Database-type-aware keyword check.
@@ -3240,6 +3294,174 @@ const MYSQL_DDL_FRAGMENT_KEYWORDS: &[&str] = &[
 static MYSQL_DDL_FRAGMENT_KEYWORDS_SET: Lazy<HashSet<&'static str>> =
     Lazy::new(|| MYSQL_DDL_FRAGMENT_KEYWORDS.iter().copied().collect());
 
+/// MySQL/MariaDB administrative option names used in replication, resource
+/// group, and NDB tablespace/logfile statements. They should highlight as
+/// syntax tokens, but they are not valid value-expression keywords.
+const MYSQL_ADMIN_OPTION_KEYWORDS: &[&str] = &[
+    "ASSIGN_GTIDS_TO_ANONYMOUS_TRANSACTIONS",
+    "AUTOEXTEND_SIZE",
+    "DEFAULT_AUTH",
+    "ENGINE_ATTRIBUTE",
+    "EXTENT_SIZE",
+    "FILE_BLOCK_SIZE",
+    "GET_SOURCE_PUBLIC_KEY",
+    "GROUP_REPLICATION",
+    "GTID_ONLY",
+    "INITIAL_SIZE",
+    "IO_THREAD",
+    "MAX_SIZE",
+    "MYSQL_ADMIN",
+    "MYSQL_MAIN",
+    "NETWORK_NAMESPACE",
+    "NODEGROUP",
+    "PLUGIN_DIR",
+    "PERSIST_ONLY",
+    "PRIVILEGE_CHECKS_USER",
+    "REDO_BUFFER_SIZE",
+    "REDO_LOG",
+    "RELAY_LOG_FILE",
+    "RELAY_LOG_POS",
+    "REPLICATE_DO_DB",
+    "REPLICATE_DO_TABLE",
+    "REPLICATE_IGNORE_DB",
+    "REPLICATE_IGNORE_TABLE",
+    "REPLICATE_REWRITE_DB",
+    "REPLICATE_WILD_DO_TABLE",
+    "REPLICATE_WILD_IGNORE_TABLE",
+    "REQUIRE_ROW_FORMAT",
+    "REQUIRE_TABLE_PRIMARY_KEY_CHECK",
+    "SOURCE_AUTO_POSITION",
+    "SOURCE_BIND",
+    "SOURCE_COMPRESSION_ALGORITHMS",
+    "SOURCE_CONNECTION_AUTO_FAILOVER",
+    "SOURCE_CONNECT_RETRY",
+    "SOURCE_DELAY",
+    "SOURCE_HEARTBEAT_PERIOD",
+    "SOURCE_HOST",
+    "SOURCE_LOG_FILE",
+    "SOURCE_LOG_POS",
+    "SOURCE_PASSWORD",
+    "SOURCE_PORT",
+    "SOURCE_PUBLIC_KEY_PATH",
+    "SOURCE_RETRY_COUNT",
+    "SOURCE_SSL",
+    "SOURCE_SSL_CA",
+    "SOURCE_SSL_CAPATH",
+    "SOURCE_SSL_CERT",
+    "SOURCE_SSL_CIPHER",
+    "SOURCE_SSL_CRL",
+    "SOURCE_SSL_CRLPATH",
+    "SOURCE_SSL_KEY",
+    "SOURCE_SSL_VERIFY_SERVER_CERT",
+    "SOURCE_TLS_CIPHERSUITES",
+    "SOURCE_TLS_VERSION",
+    "SOURCE_USER",
+    "SOURCE_ZSTD_COMPRESSION_LEVEL",
+    "SQL_AFTER_GTIDS",
+    "SQL_AFTER_MTS_GAPS",
+    "SQL_BEFORE_GTIDS",
+    "SQL_THREAD",
+    "THREAD_PRIORITY",
+    "UNDOFILE",
+    "UNDO_BUFFER_SIZE",
+    "USE_FRM",
+    "USER_RESOURCES",
+    "VCPU",
+];
+
+/// O(1) lookup set for [`MYSQL_ADMIN_OPTION_KEYWORDS`].
+static MYSQL_ADMIN_OPTION_KEYWORDS_SET: Lazy<HashSet<&'static str>> =
+    Lazy::new(|| MYSQL_ADMIN_OPTION_KEYWORDS.iter().copied().collect());
+
+/// MySQL dynamic privilege names. These are syntactic privilege tokens in
+/// GRANT/REVOKE, not value-expression operands.
+const MYSQL_DYNAMIC_PRIVILEGE_KEYWORDS: &[&str] = &[
+    "ALLOW_NONEXISTENT_DEFINER",
+    "APPLICATION_PASSWORD_ADMIN",
+    "AUDIT_ABORT_EXEMPT",
+    "AUDIT_ADMIN",
+    "AUTHENTICATION_POLICY_ADMIN",
+    "BACKUP_ADMIN",
+    "BINLOG_ADMIN",
+    "BINLOG_ENCRYPTION_ADMIN",
+    "CLONE_ADMIN",
+    "CONNECTION_ADMIN",
+    "ENCRYPTION_KEY_ADMIN",
+    "FIREWALL_ADMIN",
+    "FIREWALL_EXEMPT",
+    "FIREWALL_USER",
+    "FLUSH_OPTIMIZER_COSTS",
+    "FLUSH_PRIVILEGES",
+    "FLUSH_STATUS",
+    "FLUSH_TABLES",
+    "FLUSH_USER_RESOURCES",
+    "GROUP_REPLICATION_ADMIN",
+    "GROUP_REPLICATION_STREAM",
+    "INNODB_REDO_LOG_ARCHIVE",
+    "INNODB_REDO_LOG_ENABLE",
+    "MASKING_DICTIONARIES_ADMIN",
+    "NDB_STORED_USER",
+    "OPTIMIZE_LOCAL_TABLE",
+    "PASSWORDLESS_USER_ADMIN",
+    "PERSIST_RO_VARIABLES_ADMIN",
+    "REPLICATION_APPLIER",
+    "REPLICATION_SLAVE_ADMIN",
+    "RESOURCE_GROUP_ADMIN",
+    "RESOURCE_GROUP_USER",
+    "ROLE_ADMIN",
+    "SENSITIVE_VARIABLES_OBSERVER",
+    "SESSION_VARIABLES_ADMIN",
+    "SET_ANY_DEFINER",
+    "SHOW_ROUTINE",
+    "SYSTEM_USER",
+    "SYSTEM_VARIABLES_ADMIN",
+    "TABLE_ENCRYPTION_ADMIN",
+    "TELEMETRY_LOG_ADMIN",
+    "TRANSACTION_GTID_TAG",
+    "XA_RECOVER_ADMIN",
+];
+
+/// O(1) lookup set for [`MYSQL_DYNAMIC_PRIVILEGE_KEYWORDS`].
+static MYSQL_DYNAMIC_PRIVILEGE_KEYWORDS_SET: Lazy<HashSet<&'static str>> =
+    Lazy::new(|| MYSQL_DYNAMIC_PRIVILEGE_KEYWORDS.iter().copied().collect());
+
+/// MySQL account option names used by CREATE/ALTER USER. These should highlight
+/// as syntax in account statements but never complete as expression operands.
+const MYSQL_ACCOUNT_OPTION_KEYWORDS: &[&str] = &[
+    "FAILED_LOGIN_ATTEMPTS",
+    "MAX_CONNECTIONS_PER_HOUR",
+    "MAX_QUERIES_PER_HOUR",
+    "MAX_UPDATES_PER_HOUR",
+    "MAX_USER_CONNECTIONS",
+    "PASSWORD_LOCK_TIME",
+];
+
+/// O(1) lookup set for [`MYSQL_ACCOUNT_OPTION_KEYWORDS`].
+static MYSQL_ACCOUNT_OPTION_KEYWORDS_SET: Lazy<HashSet<&'static str>> =
+    Lazy::new(|| MYSQL_ACCOUNT_OPTION_KEYWORDS.iter().copied().collect());
+
+/// MySQL/MariaDB statement modifiers that are syntax-only heads/modifiers and
+/// should not be offered as operands in value-expression slots.
+const MYSQL_NON_EXPRESSION_MODIFIER_KEYWORDS: &[&str] = &[
+    "HIGH_PRIORITY",
+    "NO_WRITE_TO_BINLOG",
+    "SQL_BIG_RESULT",
+    "SQL_BUFFER_RESULT",
+    "SQL_CACHE",
+    "SQL_CALC_FOUND_ROWS",
+    "SQL_NO_CACHE",
+    "SQL_SMALL_RESULT",
+    "STRAIGHT_JOIN",
+];
+
+/// O(1) lookup set for [`MYSQL_NON_EXPRESSION_MODIFIER_KEYWORDS`].
+static MYSQL_NON_EXPRESSION_MODIFIER_KEYWORDS_SET: Lazy<HashSet<&'static str>> = Lazy::new(|| {
+    MYSQL_NON_EXPRESSION_MODIFIER_KEYWORDS
+        .iter()
+        .copied()
+        .collect()
+});
+
 /// Session/compiler parameters and routine/PL-SQL declaration property keywords.
 /// They only ever appear in `ALTER SESSION SET …`, `SET TRANSACTION …`, a
 /// `PRAGMA`, or a `CREATE FUNCTION/PROCEDURE … <property>` header — never as a
@@ -3254,6 +3476,7 @@ const SESSION_AND_DECLARATION_KEYWORDS: &[&str] = &[
     "NLS_COMP",
     "NLS_CURRENCY",
     "NLS_DATE_FORMAT",
+    "NLS_DATE_LANGUAGE",
     "NLS_ISO_CURRENCY",
     "NLS_LANGUAGE",
     "NLS_LENGTH_SEMANTICS",
@@ -3318,6 +3541,10 @@ pub(crate) fn is_non_expression_keyword_upper(word_upper: &str) -> bool {
         || is_ddl_only_clause_keyword_upper(word_upper)
         || MYSQL_NON_EXPRESSION_COMMAND_KEYWORDS_SET.contains(word_upper)
         || MYSQL_DDL_FRAGMENT_KEYWORDS_SET.contains(word_upper)
+        || MYSQL_ADMIN_OPTION_KEYWORDS_SET.contains(word_upper)
+        || MYSQL_DYNAMIC_PRIVILEGE_KEYWORDS_SET.contains(word_upper)
+        || MYSQL_ACCOUNT_OPTION_KEYWORDS_SET.contains(word_upper)
+        || MYSQL_NON_EXPRESSION_MODIFIER_KEYWORDS_SET.contains(word_upper)
         || SESSION_AND_DECLARATION_KEYWORDS_SET.contains(word_upper)
         || (is_sqlplus_set_option_keyword(word_upper)
             && !is_expression_valid_sqlplus_option_upper(word_upper))
@@ -7732,6 +7959,68 @@ mod tests {
             !is_mysql_sql_keyword("INNODB"),
             "storage engine names should not be promoted to keywords"
         );
+    }
+
+    #[test]
+    fn mysql_keyword_lookup_covers_admin_option_tokens_used_by_completion() {
+        for keyword in MYSQL_ADMIN_OPTION_KEYWORDS {
+            assert!(
+                is_mysql_sql_keyword(keyword),
+                "missing MySQL admin/option keyword: {keyword}"
+            );
+        }
+    }
+
+    #[test]
+    fn mysql_admin_option_keywords_are_not_value_expression_keywords() {
+        for keyword in MYSQL_ADMIN_OPTION_KEYWORDS {
+            assert!(
+                is_non_expression_keyword_upper(keyword),
+                "MySQL admin option should be filtered from value-expression completion: {keyword}"
+            );
+        }
+    }
+
+    #[test]
+    fn mysql_statement_modifier_keywords_are_not_value_expression_keywords() {
+        for keyword in MYSQL_NON_EXPRESSION_MODIFIER_KEYWORDS {
+            assert!(
+                is_mysql_sql_keyword(keyword),
+                "missing MySQL statement modifier keyword: {keyword}"
+            );
+            assert!(
+                is_non_expression_keyword_upper(keyword),
+                "MySQL statement modifier should be filtered from value-expression completion: {keyword}"
+            );
+        }
+    }
+
+    #[test]
+    fn mysql_dynamic_privilege_keywords_highlight_but_do_not_complete_as_values() {
+        for keyword in MYSQL_DYNAMIC_PRIVILEGE_KEYWORDS {
+            assert!(
+                is_mysql_sql_keyword(keyword),
+                "missing MySQL dynamic privilege keyword: {keyword}"
+            );
+            assert!(
+                is_non_expression_keyword_upper(keyword),
+                "MySQL dynamic privilege should be filtered from value-expression completion: {keyword}"
+            );
+        }
+    }
+
+    #[test]
+    fn mysql_account_option_keywords_highlight_but_do_not_complete_as_values() {
+        for keyword in MYSQL_ACCOUNT_OPTION_KEYWORDS {
+            assert!(
+                is_mysql_sql_keyword(keyword),
+                "missing MySQL account option keyword: {keyword}"
+            );
+            assert!(
+                is_non_expression_keyword_upper(keyword),
+                "MySQL account option should be filtered from value-expression completion: {keyword}"
+            );
+        }
     }
 
     #[test]

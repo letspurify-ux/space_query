@@ -132,16 +132,46 @@ fn test_transaction_level_keywords_highlight_as_keywords() {
     mysql_highlighter.set_db_type(crate::db::connection::DatabaseType::MySQL);
     let mysql_text = "SET GLOBAL TRANSACTION ISOLATION LEVEL READ COMMITTED";
     let mysql_styles = mysql_highlighter.generate_styles(mysql_text);
-    for token in ["ISOLATION", "COMMITTED"] {
+    for token in ["GLOBAL", "TRANSACTION", "ISOLATION", "LEVEL", "COMMITTED"] {
         assert_token_has_style(mysql_text, &mysql_styles, token, STYLE_KEYWORD);
+    }
+    let mysql_repeatable_text = "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ";
+    let mysql_repeatable_styles = mysql_highlighter.generate_styles(mysql_repeatable_text);
+    for token in ["SESSION", "REPEATABLE"] {
+        assert_token_has_style(
+            mysql_repeatable_text,
+            &mysql_repeatable_styles,
+            token,
+            STYLE_KEYWORD,
+        );
+    }
+    let mysql_access_text = "START TRANSACTION READ WRITE";
+    let mysql_access_styles = mysql_highlighter.generate_styles(mysql_access_text);
+    for token in ["START", "TRANSACTION", "READ", "WRITE"] {
+        assert_token_has_style(
+            mysql_access_text,
+            &mysql_access_styles,
+            token,
+            STYLE_KEYWORD,
+        );
     }
 
     let mut oracle_highlighter = SqlHighlighter::new();
     oracle_highlighter.set_db_type(crate::db::connection::DatabaseType::Oracle);
     let oracle_text = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED";
     let oracle_styles = oracle_highlighter.generate_styles(oracle_text);
-    for token in ["ISOLATION", "COMMITTED"] {
+    for token in ["TRANSACTION", "ISOLATION", "LEVEL", "COMMITTED"] {
         assert_token_has_style(oracle_text, &oracle_styles, token, STYLE_KEYWORD);
+    }
+    let oracle_access_text = "SET TRANSACTION READ ONLY";
+    let oracle_access_styles = oracle_highlighter.generate_styles(oracle_access_text);
+    for token in ["TRANSACTION", "READ", "ONLY"] {
+        assert_token_has_style(
+            oracle_access_text,
+            &oracle_access_styles,
+            token,
+            STYLE_KEYWORD,
+        );
     }
 
     let oracle_audit_text = "AUDIT CREATE SESSION BY ACCESS";
@@ -152,6 +182,30 @@ fn test_transaction_level_keywords_highlight_as_keywords() {
         "ACCESS",
         STYLE_KEYWORD,
     );
+}
+
+#[test]
+fn test_oracle_date_format_parameters_highlight_as_keywords() {
+    let mut highlighter = SqlHighlighter::new();
+    highlighter.set_db_type(crate::db::connection::DatabaseType::Oracle);
+    let text = "\
+ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD';
+ALTER SESSION SET NLS_TIMESTAMP_FORMAT = 'YYYY-MM-DD HH24:MI:SS';
+ALTER SESSION SET NLS_TIMESTAMP_TZ_FORMAT = 'YYYY-MM-DD HH24:MI:SS TZH:TZM';
+ALTER SESSION SET NLS_DATE_LANGUAGE = AMERICAN";
+    let styles = highlighter.generate_styles(text);
+
+    for token in [
+        "ALTER",
+        "SESSION",
+        "SET",
+        "NLS_DATE_FORMAT",
+        "NLS_TIMESTAMP_FORMAT",
+        "NLS_TIMESTAMP_TZ_FORMAT",
+        "NLS_DATE_LANGUAGE",
+    ] {
+        assert_token_has_style(text, &styles, token, STYLE_KEYWORD);
+    }
 }
 
 #[test]
@@ -2548,6 +2602,54 @@ SHOW WARNINGS;";
             .all(|style| style == STYLE_DEFAULT),
         "storage engine names should remain non-keyword text"
     );
+}
+
+#[test]
+fn test_mysql_admin_option_keywords_highlight_as_keywords() {
+    let text = "\
+CREATE TABLESPACE ts ADD DATAFILE 'ts.ibd' AUTOEXTEND_SIZE 64M ENGINE_ATTRIBUTE '{\"k\":\"v\"}';
+CREATE LOGFILE GROUP lg ADD UNDOFILE 'undo.dat' INITIAL_SIZE 64M REDO_BUFFER_SIZE 8M;
+CREATE RESOURCE GROUP rg TYPE USER VCPU 0-3 THREAD_PRIORITY 5;
+START GROUP_REPLICATION USER repl DEFAULT_AUTH mysql_native_password PASSWORD 'secret';
+CHANGE REPLICATION SOURCE TO SOURCE_HOST = 'db', SOURCE_PASSWORD = 'secret', SOURCE_SSL_VERIFY_SERVER_CERT = 1;
+START REPLICA UNTIL SQL_BEFORE_GTIDS = 'uuid:1-10', RELAY_LOG_FILE = 'relay.000001';
+CHANGE REPLICATION FILTER REPLICATE_DO_DB = (app), REPLICATE_WILD_IGNORE_TABLE = ('tmp.%');
+GRANT APPLICATION_PASSWORD_ADMIN, GROUP_REPLICATION_ADMIN ON *.* TO alice;
+CREATE USER alice FAILED_LOGIN_ATTEMPTS 3 PASSWORD_LOCK_TIME 2 WITH MAX_QUERIES_PER_HOUR 10;
+ALTER INSTANCE RELOAD TLS FOR CHANNEL MYSQL_MAIN;
+SET PERSIST_ONLY sql_mode = 'STRICT_ALL_TABLES';";
+
+    let mut highlighter = SqlHighlighter::new();
+    highlighter.set_db_type(crate::db::connection::DatabaseType::MySQL);
+    let styles = highlighter.generate_styles(text);
+
+    for token in [
+        "AUTOEXTEND_SIZE",
+        "ENGINE_ATTRIBUTE",
+        "UNDOFILE",
+        "INITIAL_SIZE",
+        "REDO_BUFFER_SIZE",
+        "VCPU",
+        "THREAD_PRIORITY",
+        "GROUP_REPLICATION",
+        "DEFAULT_AUTH",
+        "SOURCE_HOST",
+        "SOURCE_PASSWORD",
+        "SOURCE_SSL_VERIFY_SERVER_CERT",
+        "SQL_BEFORE_GTIDS",
+        "RELAY_LOG_FILE",
+        "REPLICATE_DO_DB",
+        "REPLICATE_WILD_IGNORE_TABLE",
+        "APPLICATION_PASSWORD_ADMIN",
+        "GROUP_REPLICATION_ADMIN",
+        "FAILED_LOGIN_ATTEMPTS",
+        "PASSWORD_LOCK_TIME",
+        "MAX_QUERIES_PER_HOUR",
+        "MYSQL_MAIN",
+        "PERSIST_ONLY",
+    ] {
+        assert_token_has_style(text, &styles, token, STYLE_KEYWORD);
+    }
 }
 
 #[test]
