@@ -127,6 +127,34 @@ fn test_keyword_highlighting() {
 }
 
 #[test]
+fn test_transaction_level_keywords_highlight_as_keywords() {
+    let mut mysql_highlighter = SqlHighlighter::new();
+    mysql_highlighter.set_db_type(crate::db::connection::DatabaseType::MySQL);
+    let mysql_text = "SET GLOBAL TRANSACTION ISOLATION LEVEL READ COMMITTED";
+    let mysql_styles = mysql_highlighter.generate_styles(mysql_text);
+    for token in ["ISOLATION", "COMMITTED"] {
+        assert_token_has_style(mysql_text, &mysql_styles, token, STYLE_KEYWORD);
+    }
+
+    let mut oracle_highlighter = SqlHighlighter::new();
+    oracle_highlighter.set_db_type(crate::db::connection::DatabaseType::Oracle);
+    let oracle_text = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED";
+    let oracle_styles = oracle_highlighter.generate_styles(oracle_text);
+    for token in ["ISOLATION", "COMMITTED"] {
+        assert_token_has_style(oracle_text, &oracle_styles, token, STYLE_KEYWORD);
+    }
+
+    let oracle_audit_text = "AUDIT CREATE SESSION BY ACCESS";
+    let oracle_audit_styles = oracle_highlighter.generate_styles(oracle_audit_text);
+    assert_token_has_style(
+        oracle_audit_text,
+        &oracle_audit_styles,
+        "ACCESS",
+        STYLE_KEYWORD,
+    );
+}
+
+#[test]
 fn test_char_datatype_is_highlighted_as_keyword() {
     let highlighter = SqlHighlighter::new();
     let text = "CREATE TABLE t_char (c CHAR(10))";

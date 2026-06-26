@@ -12,6 +12,7 @@ use crate::db::connection::DatabaseType;
 pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "ABSENT",
     "ACCEPT",
+    "ACCESS",
     "ACCESSIBLE",
     "ACCOUNT",
     "ADD",
@@ -80,6 +81,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "COLUMNS",
     "COMMENT",
     "COMMIT",
+    "COMMITTED",
     "COMMIT_LOGGING",
     "COMMIT_WAIT",
     "COMPILE",
@@ -226,6 +228,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "INVISIBLE",
     "IOT",
     "IS",
+    "ISOLATION",
     "ISOLATION_LEVEL",
     "ITERATE",
     "JAVA",
@@ -801,6 +804,7 @@ pub static ORACLE_SQL_KEYWORDS_SET: Lazy<HashSet<&'static str>> =
 // that must still be treated as keywords when db_type=MySQL)
 // ---------------------------------------------------------------------------
 pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
+    "ACCESS",
     "ACCESSIBLE",
     "ACCOUNT",
     "ACTION",
@@ -846,6 +850,7 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "COLUMNS",
     "COMMENT",
     "COMMIT",
+    "COMMITTED",
     "COMPACT",
     "COMPRESSED",
     "CONDITION",

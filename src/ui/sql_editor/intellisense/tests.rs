@@ -1510,6 +1510,153 @@ fn with_clause_after_cte_body_offers_main_query_select() {
     }
 }
 
+#[test]
+fn with_clause_next_cte_name_slot_does_not_offer_catalog() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for (db, sql) in [
+        (Oracle, "WITH c AS (SELECT 1 FROM dual), |"),
+        (Oracle, "WITH c AS (SELECT 1 FROM dual), n|"),
+        (MySQL, "WITH c AS (SELECT 1), |"),
+        (MySQL, "WITH c AS (SELECT 1), n|"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert_eq!(
+            kind, None,
+            "next CTE name slot should not resolve object kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "SELECT",
+            "WITH",
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "EMPNO",
+            "ENAME",
+            "RUN_JOB",
+            "CALC_TOTAL",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into next CTE name slot at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn with_clause_cte_body_open_slot_does_not_offer_catalog() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for (db, sql) in [
+        (Oracle, "WITH c AS |"),
+        (Oracle, "WITH c(col1, col2) AS |"),
+        (Oracle, "WITH c AS | SELECT 1 FROM dual"),
+        (MySQL, "WITH c AS |"),
+        (MySQL, "WITH c(col1, col2) AS |"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert_eq!(
+            kind, None,
+            "CTE body-open slot should not resolve object kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "SELECT",
+            "WITH",
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "EMPNO",
+            "ENAME",
+            "RUN_JOB",
+            "CALC_TOTAL",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into CTE body-open slot at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn output_column_alias_list_slots_do_not_offer_catalog() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for (db, sql) in [
+        (Oracle, "WITH c(|) AS (SELECT empno FROM emp) SELECT * FROM c"),
+        (
+            Oracle,
+            "WITH c(out_col, |) AS (SELECT empno, ename FROM emp) SELECT * FROM c",
+        ),
+        (
+            Oracle,
+            "WITH c(out_col, n|) AS (SELECT empno, ename FROM emp) SELECT * FROM c",
+        ),
+        (MySQL, "WITH c(|) AS (SELECT empno FROM emp) SELECT * FROM c"),
+        (
+            MySQL,
+            "WITH c(out_col, |) AS (SELECT empno, ename FROM emp) SELECT * FROM c",
+        ),
+        (
+            MySQL,
+            "WITH c(out_col, n|) AS (SELECT empno, ename FROM emp) SELECT * FROM c",
+        ),
+        (
+            Oracle,
+            "SELECT * FROM (SELECT empno, ename FROM emp) d(|)",
+        ),
+        (
+            Oracle,
+            "SELECT * FROM (SELECT empno, ename FROM emp) d(out_col, |)",
+        ),
+        (
+            MySQL,
+            "SELECT * FROM (SELECT empno, ename FROM emp) AS d(|)",
+        ),
+        (
+            MySQL,
+            "SELECT * FROM (SELECT empno, ename FROM emp) AS d(out_col, |)",
+        ),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert_eq!(
+            kind, None,
+            "output column-alias list slot should not resolve object kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "EMPNO",
+            "ENAME",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "AS",
+            "SELECT",
+            "NOT",
+            "NULL",
+            "NTH_VALUE",
+            "NTILE",
+            "NVL",
+            "NVL()",
+            "NEXT_DAY()",
+            "NULLIF()",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into output column-alias list slot at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
 /// A completed `BETWEEN lo AND hi` is a complete predicate, so the conjunction
 /// (`AND`/`OR`) and the downstream clause openers must follow it - identical to
 /// any other complete `WHERE`/`HAVING` predicate. Regression guard for the bug
@@ -12377,6 +12524,78 @@ fn tool_command_keyword_slots_are_dialect_scoped() {
             !has(&mysql_set, oracle_only),
             "{oracle_only} leaked into MySQL SET slot: {mysql_set:?}"
         );
+    }
+}
+
+#[test]
+fn mysql_show_keyword_slots_reject_invalid_prefix_noise() {
+    use crate::db::DatabaseType::MySQL;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for sql in [
+        "SHOW z|",
+        "SHOW BINARY z|",
+        "SHOW BINARY LOG z|",
+        "SHOW BINLOG EVENTS z|",
+        "SHOW CHARACTER z|",
+        "SHOW CHARACTER SET z|",
+        "SHOW CREATE z|",
+        "SHOW ENGINE innodb z|",
+        "SHOW EXTENDED z|",
+        "SHOW EXTENDED COLUMNS z|",
+        "SHOW EXTENDED FULL z|",
+        "SHOW FULL z|",
+        "SHOW GLOBAL z|",
+        "SHOW FUNCTION z|",
+        "SHOW FUNCTION STATUS z|",
+        "SHOW INDEX z|",
+        "SHOW INDEX FROM emp z|",
+        "SHOW MASTER z|",
+        "SHOW OPEN z|",
+        "SHOW RELAYLOG EVENTS z|",
+        "SHOW REPLICA z|",
+        "SHOW TABLE z|",
+        "SHOW COLUMNS z|",
+        "SHOW COLUMNS FROM emp z|",
+        "SHOW FULL TABLES z|",
+        "SHOW DATABASES z|",
+        "SHOW EVENTS z|",
+        "SHOW STATUS z|",
+        "SHOW TABLE STATUS z|",
+        "SHOW ERRORS z|",
+        "SHOW COUNT(*) z|",
+        "SHOW GRANTS z|",
+        "SHOW GRANTS FOR root z|",
+        "SHOW PROFILE z|",
+        "SHOW PROFILE CPU FOR QUERY 1 z|",
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, MySQL);
+        assert_eq!(
+            kind, None,
+            "MySQL SHOW keyword slot should not resolve object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "APP_USER",
+            "SCOTT",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "EMPNO",
+            "ENAME",
+            "N_ID",
+            "N_VALUE",
+            "NOT",
+            "NULL",
+            "NVL",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into MySQL SHOW keyword slot at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
     }
 }
 
@@ -24049,6 +24268,57 @@ fn is_predicate_continuations_offer_keywords_and_suppress_columns() {
         "IS keyword continuation leaked without a left operand"
     );
     assert!(!at("SELECT * FROM t WHERE a IS NULL AND b |"));
+
+    for (sql, should_have_boolean_tail) in [
+        ("SELECT * FROM t WHERE a IS NULL |", true),
+        ("SELECT * FROM t WHERE a IS NOT NULL |", true),
+        ("SELECT * FROM t WHERE a IS DISTINCT FROM b |", true),
+        ("SELECT * FROM t WHERE a IS NOT DISTINCT FROM b |", true),
+        ("SELECT * FROM t WHERE payload IS JSON |", false),
+        (
+            "SELECT * FROM t WHERE payload IS JSON OBJECT WITH UNIQUE KEYS |",
+            true,
+        ),
+        (
+            "SELECT * FROM t WHERE payload IS NOT JSON ARRAY STRICT WITHOUT UNIQUE KEYS |",
+            true,
+        ),
+    ] {
+        let (kind, keywords, final_suggestions) =
+            audit_final_suggestions_for(sql, crate::db::DatabaseType::Oracle);
+        assert_eq!(
+            kind, None,
+            "completed IS predicate should not resolve object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        if should_have_boolean_tail {
+            assert!(
+                final_suggestions.iter().any(|value| value == "AND")
+                    || final_suggestions.iter().any(|value| value == "OR"),
+                "completed IS predicate lost boolean continuation at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        } else {
+            assert!(
+                final_suggestions.iter().any(|value| value == "OBJECT"),
+                "open IS JSON option tail lost JSON options at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "EMPNO",
+            "ENAME",
+            "DEPTNO",
+            "DNAME",
+            "RUN_JOB",
+            "CALC_TOTAL",
+        ] {
+            assert!(
+                !final_suggestions.iter().any(|value| value == leaked),
+                "{leaked} leaked after completed IS predicate at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -24344,6 +24614,40 @@ fn is_of_type_slots_offer_type_objects_and_suppress_columns() {
             !has(&got, "ADDR_TYPE") && !has(&got, "EMPLOYEE_T") && !has(&got, "ONLY"),
             "completed IS OF TYPE name should not offer identifiers for `{sql}`: {got:?}"
         );
+    }
+
+    for sql in [
+        "SELECT * FROM emp WHERE obj_col IS OF TYPE (addr_type) |",
+        "SELECT * FROM emp WHERE obj_col IS OF TYPE (ONLY addr_type) |",
+        "SELECT * FROM emp WHERE obj_col IS NOT OF TYPE (addr_type) |",
+        "SELECT * FROM emp WHERE obj_col IS NOT OF TYPE (ONLY addr_type) |",
+    ] {
+        let (kind, keywords, final_suggestions) =
+            audit_final_suggestions_for(sql, crate::db::DatabaseType::Oracle);
+        assert_eq!(
+            kind, None,
+            "completed IS OF TYPE predicate should not resolve object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            has(&final_suggestions, "AND") || has(&final_suggestions, "OR"),
+            "completed IS OF TYPE predicate lost boolean continuation at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "OBJ_COL",
+            "EMPNO",
+            "ADDR_TYPE",
+            "EMPLOYEE_T",
+            "RUN_JOB",
+            "CALC_TOTAL",
+        ] {
+            assert!(
+                !has(&final_suggestions, leaked),
+                "{leaked} leaked after completed IS OF TYPE predicate at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
     }
 
     for db_type in [crate::db::DatabaseType::MySQL, crate::db::DatabaseType::MariaDB] {
@@ -25853,6 +26157,9 @@ fn mysql_structural_keyword_slots_are_dialect_scoped() {
         ("KILL |", "QUERY"),
         ("SET |", "CHARSET"),
         ("SET |", "NAMES"),
+        ("SET |", "PERSIST"),
+        ("SET |", "PERSIST_ONLY"),
+        ("SET |", "GLOBAL"),
         ("SET CHARACTER |", "SET"),
         ("SET CHARACTER SET |", "DEFAULT"),
         ("SET CHARSET |", "DEFAULT"),
@@ -29841,6 +30148,96 @@ fn window_frame_keyword_only_positions_suppress_columns() {
 }
 
 #[test]
+fn window_frame_completed_tails_stay_keyword_only_with_prefixes() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+    let assert_no_noise =
+        |sql: &str, db: crate::db::DatabaseType, suggestions: &[String]| {
+            for leaked in [
+                "EMP",
+                "DEPT",
+                "EMP_V",
+                "APP_USER",
+                "SCOTT",
+                "RUN_JOB",
+                "CALC_TOTAL",
+                "EMPNO",
+                "ENAME",
+                "DEPTNO",
+                "DNAME",
+                "N_ID",
+                "N_VALUE",
+                "NOT",
+                "NULL",
+                "NULLS",
+                "NEXT",
+            ] {
+                assert!(
+                    !contains(suggestions, leaked),
+                    "{leaked} leaked into window-frame tail at `{sql}` {db:?}: {suggestions:?}"
+                );
+            }
+        };
+
+    for (db, sql, expected) in [
+        (
+            Oracle,
+            "SELECT SUM(sal) OVER (ORDER BY sal ROWS CURRENT ROW e|) FROM emp",
+            Some("EXCLUDE"),
+        ),
+        (
+            Oracle,
+            "SELECT SUM(sal) OVER (ORDER BY sal ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW e|) FROM emp",
+            Some("EXCLUDE"),
+        ),
+        (
+            Oracle,
+            "SELECT SUM(sal) OVER (ORDER BY sal ROWS CURRENT ROW EXCLUDE n|) FROM emp",
+            Some("NO"),
+        ),
+        (
+            Oracle,
+            "SELECT SUM(sal) OVER (ORDER BY sal ROWS CURRENT ROW EXCLUDE NO o|) FROM emp",
+            Some("OTHERS"),
+        ),
+        (
+            Oracle,
+            "SELECT SUM(sal) OVER (ORDER BY sal ROWS CURRENT ROW n|) FROM emp",
+            None,
+        ),
+        (
+            Oracle,
+            "SELECT SUM(sal) OVER (ORDER BY sal ROWS CURRENT ROW EXCLUDE NO OTHERS n|) FROM emp",
+            None,
+        ),
+        (
+            Oracle,
+            "SELECT SUM(sal) OVER (ORDER BY sal ROWS CURRENT ROW EXCLUDE TIES n|) FROM emp",
+            None,
+        ),
+        (
+            MySQL,
+            "SELECT SUM(sal) OVER (ORDER BY sal ROWS CURRENT ROW e|) FROM emp",
+            None,
+        ),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert_eq!(
+            kind, None,
+            "window-frame tail should not resolve object kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        if let Some(expected) = expected {
+            assert!(
+                contains(&final_suggestions, expected),
+                "{expected} missing from window-frame tail at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+        assert_no_noise(sql, db, &final_suggestions);
+    }
+}
+
+#[test]
 fn ordinary_between_predicate_is_not_treated_as_window_frame() {
     // No OVER -> a normal range predicate must never offer frame keywords.
     assert_eq!(
@@ -30738,9 +31135,11 @@ fn alias_name_slots_do_not_offer_catalog_or_expression_noise() {
     for (db, sql) in [
         (Oracle, "SELECT col AS | FROM t"),
         (Oracle, "SELECT col AS my| FROM t"),
+        (Oracle, "SELECT col AS n| FROM t"),
         (Oracle, "SELECT a, b AS | FROM t"),
         (MySQL, "SELECT col AS | FROM t"),
         (MySQL, "SELECT col AS my| FROM t"),
+        (MySQL, "SELECT col AS n| FROM t"),
         (MySQL, "SELECT a, b AS | FROM t"),
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
@@ -30756,13 +31155,17 @@ fn alias_name_slots_do_not_offer_catalog_or_expression_noise() {
 
     for (db, sql, allowed_keywords) in [
         (Oracle, "SELECT * FROM emp AS |", &["OF"][..]),
+        (Oracle, "SELECT * FROM emp AS n|", &[][..]),
         (Oracle, "SELECT * FROM emp e JOIN dept AS |", &["OF"][..]),
+        (Oracle, "SELECT * FROM emp e JOIN dept AS n|", &[][..]),
         (Oracle, "SELECT * FROM (SELECT 1 FROM dual) AS |", &[][..]),
         (Oracle, "UPDATE emp AS |", &[][..]),
         (Oracle, "DELETE FROM emp AS |", &[][..]),
         (Oracle, "MERGE INTO emp AS |", &[][..]),
         (MySQL, "SELECT * FROM emp AS |", &[][..]),
+        (MySQL, "SELECT * FROM emp AS n|", &[][..]),
         (MySQL, "SELECT * FROM emp e JOIN dept AS |", &[][..]),
+        (MySQL, "SELECT * FROM emp e JOIN dept AS n|", &[][..]),
         (MySQL, "UPDATE emp AS |", &[][..]),
         (MySQL, "DELETE FROM emp AS |", &[][..]),
     ] {
@@ -31121,6 +31524,43 @@ fn for_update_locking_clause_final_suggestions_stay_slot_specific() {
         assert!(
             !contains(&of_list, leaked),
             "{leaked} leaked before any FOR UPDATE OF column was written: keywords={keywords:?} final={of_list:?}"
+        );
+    }
+
+    for (db, sql) in [
+        (Oracle, "SELECT * FROM emp FOR UPDATE WAIT |"),
+        (Oracle, "SELECT * FROM emp FOR UPDATE WAIT n|"),
+        (Oracle, "SELECT * FROM emp FOR UPDATE OF empno WAIT |"),
+        (Oracle, "SELECT * FROM emp FOR UPDATE OF empno WAIT n|"),
+        (Oracle, "SELECT * FROM emp FOR UPDATE NOWAIT |"),
+        (Oracle, "SELECT * FROM emp FOR UPDATE NOWAIT n|"),
+        (Oracle, "SELECT * FROM emp FOR UPDATE WAIT 5 |"),
+        (Oracle, "SELECT * FROM emp FOR UPDATE WAIT 5 n|"),
+        (Oracle, "SELECT * FROM emp FOR UPDATE SKIP LOCKED |"),
+        (Oracle, "SELECT * FROM emp FOR UPDATE SKIP LOCKED n|"),
+        (Oracle, "SELECT * FROM emp FOR UPDATE OF empno NOWAIT |"),
+        (Oracle, "SELECT * FROM emp FOR UPDATE OF empno NOWAIT n|"),
+        (Oracle, "SELECT * FROM emp FOR UPDATE OF empno WAIT 5 |"),
+        (Oracle, "SELECT * FROM emp FOR UPDATE OF empno WAIT 5 n|"),
+        (Oracle, "SELECT * FROM emp FOR UPDATE OF empno SKIP LOCKED |"),
+        (Oracle, "SELECT * FROM emp FOR UPDATE OF empno SKIP LOCKED n|"),
+        (MySQL, "SELECT * FROM emp FOR UPDATE NOWAIT |"),
+        (MySQL, "SELECT * FROM emp FOR UPDATE NOWAIT n|"),
+        (MySQL, "SELECT * FROM emp FOR UPDATE SKIP LOCKED |"),
+        (MySQL, "SELECT * FROM emp FOR UPDATE SKIP LOCKED n|"),
+        (MySQL, "SELECT * FROM emp FOR SHARE NOWAIT |"),
+        (MySQL, "SELECT * FROM emp FOR SHARE NOWAIT n|"),
+        (MySQL, "SELECT * FROM emp FOR SHARE SKIP LOCKED |"),
+        (MySQL, "SELECT * FROM emp FOR SHARE SKIP LOCKED n|"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert_eq!(
+            kind, None,
+            "completed locking tail should not resolve an object kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            final_suggestions.is_empty(),
+            "completed locking tail should not offer catalog or stale keywords at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
         );
     }
 }
@@ -32399,6 +32839,14 @@ fn xmltable_column_tail_keeps_xmltable_grammar_separate_from_json_table() {
             "{leaked} leaked after completed XMLTABLE PATH: {final_suggestions:?}"
         );
     }
+    let (_kind, keywords, final_suggestions) = audit_final_suggestions_for(
+        "SELECT * FROM XMLTABLE('/r' COLUMNS id NUMBER PATH 'id' n|) xt",
+        Oracle,
+    );
+    assert!(
+        final_suggestions.is_empty(),
+        "completed XMLTABLE PATH tail with prefix should not offer catalog or stale keywords: keywords={keywords:?} final={final_suggestions:?}"
+    );
 }
 
 #[test]
@@ -32631,6 +33079,27 @@ fn json_function_option_tails_offer_handlers_and_wrapper_keywords() {
         "JSON_VALUE completed ON EMPTY should offer ON ERROR handler heads"
     );
     assert!(
+        kw("SELECT JSON_VALUE(payload, '$.amount' RETURNING NUMBER NULL ON EMPTY DEFAULT |) FROM emp", Oracle)
+            .is_empty(),
+        "JSON_VALUE second DEFAULT handler value slot should not be keyword-only"
+    );
+    assert_eq!(
+        kw(
+            "SELECT JSON_VALUE(payload, '$.amount' RETURNING NUMBER NULL ON EMPTY DEFAULT 0 |) FROM emp",
+            Oracle,
+        ),
+        vec!["ON".to_string()],
+        "JSON_VALUE completed second numeric DEFAULT handler should continue with ON"
+    );
+    assert_eq!(
+        kw(
+            "SELECT JSON_VALUE(payload, '$.amount' RETURNING NUMBER NULL ON EMPTY DEFAULT fallback_amt |) FROM emp",
+            Oracle,
+        ),
+        vec!["ON".to_string()],
+        "JSON_VALUE completed second identifier DEFAULT handler should continue with ON"
+    );
+    assert!(
         kw("SELECT JSON_VALUE(payload, '$.amount' RETURNING NUMBER DEFAULT |) FROM emp", Oracle)
             .is_empty(),
         "JSON_VALUE DEFAULT handler value slot should not be keyword-only"
@@ -32761,6 +33230,14 @@ fn json_function_option_keyword_slots_suppress_catalog() {
             "ON",
         ),
         (
+            "SELECT JSON_VALUE(payload, '$.amount' RETURNING NUMBER NULL ON EMPTY DEFAULT 0 |) FROM emp",
+            "ON",
+        ),
+        (
+            "SELECT JSON_VALUE(payload, '$.amount' RETURNING NUMBER NULL ON EMPTY DEFAULT fallback_amt |) FROM emp",
+            "ON",
+        ),
+        (
             "SELECT JSON_QUERY(payload, '$.items' RETURNING CLOB FORMAT |) FROM emp",
             "JSON",
         ),
@@ -32816,6 +33293,14 @@ fn json_function_option_keyword_slots_suppress_catalog() {
             "{leaked} leaked after completed JSON function handler: {final_suggestions:?}"
         );
     }
+    let completed_prefixed =
+        "SELECT JSON_VALUE(payload, '$.amount' RETURNING NUMBER NULL ON ERROR n|) FROM emp";
+    let (_kind, keywords, final_suggestions) =
+        audit_final_suggestions_for(completed_prefixed, Oracle);
+    assert!(
+        final_suggestions.is_empty(),
+        "completed JSON function handler tail with prefix should not offer catalog or stale keywords: keywords={keywords:?} final={final_suggestions:?}"
+    );
 
     let completed_exists = "SELECT JSON_EXISTS(payload, '$' TRUE ON ERROR |) FROM emp";
     let (kind, keywords, final_suggestions) =
@@ -32830,6 +33315,13 @@ fn json_function_option_keyword_slots_suppress_catalog() {
             "{leaked} leaked after completed JSON_EXISTS handler: {final_suggestions:?}"
         );
     }
+    let completed_exists_prefixed = "SELECT JSON_EXISTS(payload, '$' TRUE ON ERROR n|) FROM emp";
+    let (_kind, keywords, final_suggestions) =
+        audit_final_suggestions_for(completed_exists_prefixed, Oracle);
+    assert!(
+        final_suggestions.is_empty(),
+        "completed JSON_EXISTS handler tail with prefix should not offer catalog or stale keywords: keywords={keywords:?} final={final_suggestions:?}"
+    );
 }
 
 #[test]
@@ -33054,6 +33546,9 @@ fn json_generation_option_keyword_slots_suppress_catalog() {
         "SELECT JSON_ARRAY(v RETURNING CLOB |) FROM emp",
         "SELECT JSON_ARRAYAGG(v ABSENT ON NULL RETURNING CLOB |) FROM emp",
         "SELECT JSON_OBJECTAGG(KEY k VALUE v NULL ON NULL RETURNING CLOB |) FROM emp",
+        "SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON NULL WITH UNIQUE KEYS STRICT RETURNING CLOB n|) FROM emp",
+        "SELECT JSON_ARRAY(v RETURNING CLOB n|) FROM emp",
+        "SELECT JSON_ARRAYAGG(v ABSENT ON NULL RETURNING CLOB n|) FROM emp",
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(completed, Oracle);
         assert_eq!(
@@ -33165,8 +33660,16 @@ fn json_table_column_tail_keyword_slots_suppress_catalog() {
             "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id NUMBER PATH '$.id' NULL ON EMPTY ERROR ON ERROR |))",
         ),
         (
+            Oracle,
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id NUMBER PATH '$.id' NULL ON EMPTY ERROR ON ERROR n|))",
+        ),
+        (
             MySQL,
             "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id EXISTS PATH '$.id' TRUE ON ERROR |))",
+        ),
+        (
+            MySQL,
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id EXISTS PATH '$.id' TRUE ON ERROR n|))",
         ),
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
@@ -33357,9 +33860,36 @@ fn row_limiting_clause_final_suggestions_stay_keyword_or_empty() {
             "SELECT * FROM emp ORDER BY empno FETCH FIRST 5 ROWS ONLY |",
             &[],
         ),
+        (
+            Oracle,
+            "SELECT * FROM emp ORDER BY empno FETCH FIRST 5 ROWS ONLY n|",
+            &[],
+        ),
+        (
+            Oracle,
+            "SELECT * FROM emp ORDER BY empno FETCH FIRST 5 ROWS WITH TIES |",
+            &[],
+        ),
+        (
+            Oracle,
+            "SELECT * FROM emp ORDER BY empno FETCH FIRST 5 ROWS WITH TIES n|",
+            &[],
+        ),
         (Oracle, "SELECT * FROM emp OFFSET |", &[]),
         (Oracle, "SELECT * FROM emp OFFSET 10 |", &["ROW", "ROWS"]),
         (Oracle, "SELECT * FROM emp OFFSET 10 ROWS |", &["FETCH"]),
+        (
+            Oracle,
+            "SELECT * FROM emp OFFSET 10 ROWS FETCH NEXT 5 ROWS ONLY |",
+            &[],
+        ),
+        (
+            Oracle,
+            "SELECT * FROM emp OFFSET 10 ROWS FETCH NEXT 5 ROWS ONLY n|",
+            &[],
+        ),
+        (MySQL, "SELECT * FROM orders LIMIT 10 OFFSET 20 n|", &[]),
+        (MySQL, "SELECT * FROM orders LIMIT 10, 20 n|", &[]),
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
         assert_eq!(
@@ -34058,6 +34588,29 @@ fn sounds_like_operator_is_scoped_to_mysql_character_operands() {
 
     let s = suggestions("SELECT ename SOUNDS LIKE 'SMTH' es| FROM emp");
     assert!(!has(&s, "ESCAPE"), "ESCAPE leaked after SOUNDS LIKE: {s:?}");
+
+    let (kind, keywords, final_suggestions) = audit_final_suggestions_for(
+        "SELECT * FROM emp WHERE ename SOUNDS LIKE 'SMTH' |",
+        MySQL,
+    );
+    assert_eq!(
+        kind, None,
+        "completed SOUNDS LIKE tail should not resolve object kind: keywords={keywords:?} final={final_suggestions:?}"
+    );
+    for leaked in ["EMP", "DEPT", "EMP_V", "EMPNO", "ENAME", "SAL"] {
+        assert!(
+            !has(&final_suggestions, leaked),
+            "{leaked} leaked after completed SOUNDS LIKE tail: keywords={keywords:?} final={final_suggestions:?}"
+        );
+    }
+    let (_kind, keywords, final_suggestions) = audit_final_suggestions_for(
+        "SELECT * FROM emp WHERE ename SOUNDS LIKE 'SMTH' n|",
+        MySQL,
+    );
+    assert!(
+        final_suggestions.is_empty(),
+        "completed SOUNDS LIKE tail with prefix should not offer catalog or stale keywords: keywords={keywords:?} final={final_suggestions:?}"
+    );
 }
 
 /// MySQL/MariaDB `NEW`/`OLD` are trigger pseudo rows, not generic expression starters.
@@ -34351,6 +34904,86 @@ fn within_group_keyword_slots_suppress_identifiers_and_offer_fixed_keywords() {
     assert!(!suppresses("SELECT (ename) WITHIN | FROM emp"));
 }
 
+#[test]
+fn ordered_aggregate_tails_stay_keyword_only_with_prefixes() {
+    use crate::db::DatabaseType::Oracle;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+    let assert_no_noise = |sql: &str, suggestions: &[String]| {
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "APP_USER",
+            "SCOTT",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "EMPNO",
+            "ENAME",
+            "DEPTNO",
+            "DNAME",
+            "N_ID",
+            "N_VALUE",
+            "NOT",
+            "NULL",
+            "NEXT",
+        ] {
+            assert!(
+                !contains(suggestions, leaked),
+                "{leaked} leaked into ordered aggregate tail at `{sql}`: {suggestions:?}"
+            );
+        }
+    };
+
+    for (sql, expected) in [
+        (
+            "SELECT max(empno) KEEP (DENSE_RANK f|) FROM emp",
+            Some("FIRST"),
+        ),
+        (
+            "SELECT max(empno) KEEP (DENSE_RANK FIRST o|) FROM emp",
+            Some("ORDER"),
+        ),
+        (
+            "SELECT max(empno) KEEP (DENSE_RANK FIRST n|) FROM emp",
+            None,
+        ),
+        (
+            "SELECT max(empno) KEEP (DENSE_RANK FIRST ORDER BY empno NULLS FIRST n|) FROM emp",
+            None,
+        ),
+        (
+            "SELECT listagg(ename) WITHIN g| FROM emp",
+            Some("GROUP"),
+        ),
+        (
+            "SELECT listagg(ename) WITHIN n| FROM emp",
+            None,
+        ),
+        (
+            "SELECT listagg(ename) WITHIN GROUP n| FROM emp",
+            None,
+        ),
+        (
+            "SELECT listagg(ename) WITHIN GROUP (ORDER BY empno NULLS FIRST n|) FROM emp",
+            None,
+        ),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert_eq!(
+            kind, None,
+            "ordered aggregate tail should not resolve object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        if let Some(expected) = expected {
+            assert!(
+                contains(&final_suggestions, expected),
+                "{expected} missing from ordered aggregate tail at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+        assert_no_noise(sql, &final_suggestions);
+    }
+}
+
 /// `<closed call> KEEP |` / `… OVER |` is an analytic continuation that still
 /// awaits its parenthesised argument (`KEEP (DENSE_RANK …)`, `OVER (…)`/a window
 /// name). Until the argument begins it is not a complete select item, so the
@@ -34468,6 +35101,30 @@ fn escape_offered_only_after_a_like_pattern() {
     ] {
         let s = suggestions(sql);
         assert!(!has(&s, "ESCAPE"), "single-use ESCAPE re-offered for `{sql}`: {s:?}");
+    }
+
+    for sql in [
+        "SELECT * FROM emp WHERE ename LIKE 'a%' |",
+        "SELECT * FROM emp WHERE ename NOT LIKE 'a%' |",
+        "SELECT * FROM emp WHERE ename LIKE 'a%' ESCAPE '\\' |",
+        "SELECT * FROM emp WHERE empno = 1 AND ename LIKE 'a%' ESCAPE '\\' |",
+    ] {
+        let (kind, keywords, final_suggestions) =
+            audit_final_suggestions_for(sql, crate::db::DatabaseType::Oracle);
+        assert_eq!(
+            kind, None,
+            "completed LIKE predicate should not resolve object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            has(&final_suggestions, "AND") || has(&final_suggestions, "OR"),
+            "completed LIKE predicate lost boolean continuation at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in ["EMP", "DEPT", "EMP_V", "EMPNO", "ENAME", "SAL", "RUN_JOB"] {
+            assert!(
+                !has(&final_suggestions, leaked),
+                "{leaked} leaked after completed LIKE predicate at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
     }
 }
 
@@ -35425,6 +36082,29 @@ fn operand_type_operators_match_the_preceding_operand_type() {
         !has(&timezone_value, "EMPNO") && !has(&timezone_value, "HIREDATE"),
         "AT TIME ZONE expression slot leaked non-character columns: {timezone_value:?}"
     );
+    for sql in [
+        "SELECT * FROM emp WHERE hiredate AT LOCAL |",
+        "SELECT * FROM emp WHERE hiredate AT LOCAL n|",
+        "SELECT * FROM emp WHERE hiredate AT TIME ZONE tz |",
+        "SELECT * FROM emp WHERE hiredate AT TIME ZONE tz n|",
+        "SELECT * FROM emp WHERE hiredate AT TIME ZONE 'UTC' |",
+        "SELECT * FROM emp WHERE hiredate AT TIME ZONE 'UTC' n|",
+        "SELECT * FROM emp WHERE hiredate AT TIME ZONE (tz) |",
+        "SELECT * FROM emp WHERE hiredate AT TIME ZONE (tz) n|",
+    ] {
+        let (kind, keywords, final_suggestions) =
+            audit_final_suggestions_for(sql, crate::db::DatabaseType::Oracle);
+        assert_eq!(
+            kind, None,
+            "completed AT TIME ZONE tail should not resolve object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in ["EMP", "DEPT", "EMP_V", "EMPNO", "ENAME", "HIREDATE"] {
+            assert!(
+                !has(&final_suggestions, leaked),
+                "{leaked} leaked after completed AT TIME ZONE tail at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
 
     for sql in [
         "SELECT * FROM emp WHERE | AT TIME ZONE 'UTC'",
@@ -35461,6 +36141,36 @@ fn operand_type_operators_match_the_preceding_operand_type() {
             suppresses(sql, crate::db::DatabaseType::MySQL),
             "MySQL COLLATE collation-name slot leaked columns for `{sql}`"
         );
+    }
+    for (sql, db_type) in [
+        (
+            "SELECT * FROM emp WHERE ename COLLATE BINARY_CI |",
+            crate::db::DatabaseType::Oracle,
+        ),
+        (
+            "SELECT * FROM emp WHERE ename COLLATE BINARY_CI n|",
+            crate::db::DatabaseType::Oracle,
+        ),
+        (
+            "SELECT * FROM emp WHERE ename COLLATE utf8mb4_bin |",
+            crate::db::DatabaseType::MySQL,
+        ),
+        (
+            "SELECT * FROM emp WHERE ename COLLATE utf8mb4_bin n|",
+            crate::db::DatabaseType::MySQL,
+        ),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db_type);
+        assert_eq!(
+            kind, None,
+            "completed COLLATE tail should not resolve object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in ["EMP", "DEPT", "EMP_V", "EMPNO", "ENAME", "SAL"] {
+            assert!(
+                !has(&final_suggestions, leaked),
+                "{leaked} leaked after completed COLLATE tail at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
     }
     for (sql, db_type) in [
         (
@@ -35739,6 +36449,45 @@ fn negated_and_collection_predicate_operators_are_position_aware() {
             "non-element columns leaked into MEMBER OF LHS slot for `{sql}`: {suggestions:?}"
         );
     }
+
+    for sql in [
+        "SELECT * FROM t WHERE elem MEMBER OF parent_nt |",
+        "SELECT * FROM t WHERE elem NOT MEMBER OF parent_nt |",
+        "SELECT * FROM t WHERE child_nt SUBMULTISET OF parent_nt |",
+        "SELECT * FROM t WHERE child_nt NOT SUBMULTISET OF parent_nt |",
+        "SELECT * FROM t WHERE child_nt IS EMPTY |",
+        "SELECT * FROM t WHERE child_nt IS A SET |",
+        "SELECT * FROM t WHERE child_nt MULTISET EXCEPT parent_nt IS EMPTY |",
+    ] {
+        let (kind, keywords, final_suggestions) =
+            audit_final_suggestions_for(sql, crate::db::DatabaseType::Oracle);
+        assert_eq!(
+            kind, None,
+            "completed collection predicate should not resolve object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            has(&final_suggestions, "AND") || has(&final_suggestions, "OR"),
+            "completed collection predicate lost boolean continuation at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "EMPNO",
+            "ENAME",
+            "CHILD_NT",
+            "PARENT_NT",
+            "ELEM",
+            "TXT_COL",
+            "RUN_JOB",
+            "CALC_TOTAL",
+        ] {
+            assert!(
+                !has(&final_suggestions, leaked),
+                "{leaked} leaked after completed collection predicate at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
 }
 
 /// `FIRST`/`LAST` are not standalone-callable functions in Oracle — they only
@@ -35971,6 +36720,74 @@ fn analytic_null_treatment_keywords_are_scoped_to_analytic_call_tails() {
         }
     }
     assert!(!suppresses("SELECT ignore | FROM emp"));
+}
+
+#[test]
+fn analytic_null_treatment_completed_tails_stay_keyword_only_with_prefixes() {
+    use crate::db::DatabaseType::Oracle;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+    let assert_no_noise = |sql: &str, suggestions: &[String]| {
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "APP_USER",
+            "SCOTT",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "EMPNO",
+            "ENAME",
+            "DEPTNO",
+            "DNAME",
+            "N_ID",
+            "N_VALUE",
+            "NOT",
+            "NULL",
+            "NEXT",
+        ] {
+            assert!(
+                !contains(suggestions, leaked),
+                "{leaked} leaked into analytic null-treatment tail at `{sql}`: {suggestions:?}"
+            );
+        }
+    };
+
+    for (sql, expected) in [
+        (
+            "SELECT last_value(empno) IGNORE n| FROM emp",
+            Some("NULLS"),
+        ),
+        (
+            "SELECT nth_value(empno, 1) FROM LAST IGNORE n| FROM emp",
+            Some("NULLS"),
+        ),
+        (
+            "SELECT nth_value(empno, 1) FROM LAST IGNORE NULLS o| FROM emp",
+            Some("OVER"),
+        ),
+        (
+            "SELECT last_value(empno) IGNORE NULLS n| FROM emp",
+            None,
+        ),
+        (
+            "SELECT nth_value(empno, 1) FROM LAST IGNORE NULLS n| FROM emp",
+            None,
+        ),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert_eq!(
+            kind, None,
+            "analytic null-treatment tail should not resolve object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        if let Some(expected) = expected {
+            assert!(
+                contains(&final_suggestions, expected),
+                "{expected} missing from analytic null-treatment tail at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+        assert_no_noise(sql, &final_suggestions);
+    }
 }
 
 #[test]
@@ -39407,6 +40224,11 @@ fn registered_keyword_slot_cases() -> Vec<RegisteredKeywordSlotCase> {
             keywords: &["WAIT", "NOWAIT"],
         },
         RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SET |",
+            keywords: &["TRANSACTION"],
+        },
+        RegisteredKeywordSlotCase {
             db_type: MySQL,
             sql: "COMMIT |",
             keywords: &["WORK", "AND", "CHAIN", "NO", "RELEASE"],
@@ -39564,6 +40386,11 @@ fn registered_keyword_slot_cases() -> Vec<RegisteredKeywordSlotCase> {
         RegisteredKeywordSlotCase {
             db_type: Oracle,
             sql: "SELECT JSON_VALUE(payload, '$.amount' RETURNING NUMBER DEFAULT 0 |) FROM emp",
+            keywords: &["ON"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT JSON_VALUE(payload, '$.amount' RETURNING NUMBER NULL ON EMPTY DEFAULT 0 |) FROM emp",
             keywords: &["ON"],
         },
         RegisteredKeywordSlotCase {
@@ -40195,6 +41022,51 @@ fn registered_keyword_only_slot_cases_keep_final_suggestions_keyword_only() {
     ];
     let mut failures = Vec::new();
     let mut checked = 0usize;
+    let check_final = |sql: &str,
+                       db_type: crate::db::DatabaseType,
+                       failures: &mut Vec<String>,
+                       checked: &mut usize| {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db_type);
+        *checked += 1;
+        if kind.is_some() {
+            failures.push(format!(
+                "keyword-only slot resolved object kind at `{sql}` ({db_type:?}): kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+            ));
+        }
+        for keyword in &keywords {
+            if !contains(&final_suggestions, keyword) {
+                failures.push(format!(
+                    "`{keyword}` missing from final keyword-only suggestions at `{sql}` ({db_type:?}): keywords={keywords:?} final={final_suggestions:?}"
+                ));
+            }
+        }
+        for leaked in catalog_noise {
+            if contains(&final_suggestions, leaked) {
+                failures.push(format!(
+                    "`{leaked}` leaked into final keyword-only suggestions at `{sql}` ({db_type:?}): keywords={keywords:?} final={final_suggestions:?}"
+                ));
+            }
+        }
+    };
+    let check_invalid_prefix = |sql: &str,
+                                db_type: crate::db::DatabaseType,
+                                failures: &mut Vec<String>,
+                                checked: &mut usize| {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db_type);
+        *checked += 1;
+        if kind.is_some() {
+            failures.push(format!(
+                "keyword-only slot with invalid prefix resolved object kind at `{sql}` ({db_type:?}): kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+            ));
+        }
+        for leaked in catalog_noise {
+            if contains(&final_suggestions, leaked) {
+                failures.push(format!(
+                    "`{leaked}` leaked into invalid-prefix keyword-only suggestions at `{sql}` ({db_type:?}): keywords={keywords:?} final={final_suggestions:?}"
+                ));
+            }
+        }
+    };
 
     for case in registered_keyword_slot_cases() {
         let cursor = case.sql.find('|').expect("cursor marker");
@@ -40234,30 +41106,23 @@ fn registered_keyword_only_slot_cases_keep_final_suggestions_keyword_only() {
             continue;
         }
 
-        let (kind, keywords, final_suggestions) =
-            audit_final_suggestions_for(case.sql, case.db_type);
-        checked += 1;
-        if kind.is_some() {
-            failures.push(format!(
-                "keyword-only slot resolved object kind at `{}` ({:?}): kind={kind:?} keywords={keywords:?} final={final_suggestions:?}",
-                case.sql, case.db_type
-            ));
-        }
-        for keyword in &keywords {
-            if !contains(&final_suggestions, keyword) {
-                failures.push(format!(
-                    "`{keyword}` missing from final keyword-only suggestions at `{}` ({:?}): keywords={keywords:?} final={final_suggestions:?}",
-                    case.sql, case.db_type
-                ));
+        check_final(case.sql, case.db_type, &mut failures, &mut checked);
+        check_invalid_prefix(
+            &case.sql.replace('|', "zz|"),
+            case.db_type,
+            &mut failures,
+            &mut checked,
+        );
+        for keyword in case.keywords {
+            let prefix = keyword[..keyword.len().min(2)].to_ascii_lowercase();
+            let prefixed_sql = case.sql.replace('|', &format!("{prefix}|"));
+            let cursor = prefixed_sql.find('|').expect("cursor marker");
+            let plain = prefixed_sql.replace('|', "");
+            let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+            if prefix.is_empty() {
+                continue;
             }
-        }
-        for leaked in catalog_noise {
-            if contains(&final_suggestions, leaked) {
-                failures.push(format!(
-                    "`{leaked}` leaked into final keyword-only suggestions at `{}` ({:?}): keywords={keywords:?} final={final_suggestions:?}",
-                    case.sql, case.db_type
-                ));
-            }
+            check_final(&prefixed_sql, case.db_type, &mut failures, &mut checked);
         }
     }
 
@@ -42532,6 +43397,62 @@ fn remaining_advanced_oracle_query_keyword_slots_are_formalized() {
 }
 
 #[test]
+fn advanced_oracle_query_keyword_slots_reject_invalid_prefix_noise() {
+    use crate::db::DatabaseType::Oracle;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+    let assert_no_noise = |sql: &str, suggestions: &[String]| {
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "APP_USER",
+            "SCOTT",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "EMPNO",
+            "ENAME",
+            "DEPTNO",
+            "DNAME",
+            "N_ID",
+            "N_VALUE",
+            "NOT",
+            "NULL",
+            "NEXT",
+        ] {
+            assert!(
+                !contains(suggestions, leaked),
+                "{leaked} leaked into advanced Oracle keyword slot at `{sql}`: {suggestions:?}"
+            );
+        }
+    };
+
+    for sql in [
+        "SELECT * FROM emp PIVOT (SUM(sal) n|) p",
+        "SELECT * FROM emp PIVOT (SUM(sal) FOR deptno n|) p",
+        "SELECT * FROM emp UNPIVOT n|",
+        "SELECT * FROM emp UNPIVOT INCLUDE n|",
+        "SELECT * FROM emp MATCH_RECOGNIZE (PARTITION n|) mr",
+        "SELECT * FROM emp MATCH_RECOGNIZE (ORDER n|) mr",
+        "SELECT * FROM emp MATCH_RECOGNIZE (AFTER MATCH n|) mr",
+        "SELECT * FROM emp MATCH_RECOGNIZE (AFTER MATCH SKIP n|) mr",
+        "SELECT * FROM emp MATCH_RECOGNIZE (PATTERN (A) n|) mr",
+        "SELECT * FROM emp MODEL n|",
+        "SELECT * FROM emp MODEL PARTITION n|",
+        "SELECT * FROM emp MODEL DIMENSION n|",
+        "SELECT * FROM emp MODEL DIMENSION BY (deptno) MEASURES (sal) n|",
+        "SELECT * FROM emp MODEL DIMENSION BY (deptno) MEASURES (sal) RULES n|",
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert_eq!(
+            kind, None,
+            "advanced Oracle keyword slot should not resolve object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert_no_noise(sql, &final_suggestions);
+    }
+}
+
+#[test]
 fn remaining_mysql_admin_account_keyword_slots_are_formalized() {
     use crate::db::DatabaseType::MySQL;
 
@@ -42694,6 +43615,75 @@ fn remaining_mysql_admin_account_keyword_slots_are_formalized() {
 }
 
 #[test]
+fn mysql_schema_admin_keyword_slots_reject_invalid_prefix_noise() {
+    use crate::db::DatabaseType::MySQL;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+    let assert_no_noise = |sql: &str, suggestions: &[String]| {
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "APP_USER",
+            "SCOTT",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "EMPNO",
+            "ENAME",
+            "DEPTNO",
+            "DNAME",
+            "N_ID",
+            "N_VALUE",
+            "NOT",
+            "NULL",
+            "NEXT",
+        ] {
+            assert!(
+                !contains(suggestions, leaked),
+                "{leaked} leaked into MySQL schema/admin keyword slot at `{sql}`: {suggestions:?}"
+            );
+        }
+    };
+
+    for sql in [
+        "CREATE TABLE t (id INT) n|",
+        "CREATE TABLE t (id INT) DEFAULT n|",
+        "CREATE TABLE engine n|",
+        "CREATE INDEX idx n|",
+        "ALTER TABLE help n|",
+        "ALTER TABLE help ALTER n|",
+        "ALTER TABLE help ALTER c n|",
+        "ALTER TABLE help ALTER c SET n|",
+        "ALTER TABLE help ALTER COLUMN c DROP n|",
+        "CREATE FUNCTION f() n|",
+        "CREATE VIEW as n|",
+        "CREATE TRIGGER trg n|",
+        "CREATE TRIGGER trg BEFORE INSERT n|",
+        "CREATE EVENT e n|",
+        "CREATE EVENT e ON n|",
+        "CREATE EVENT e ON SCHEDULE n|",
+        "CREATE USER u n|",
+        "CREATE USER u IDENTIFIED n|",
+        "ALTER USER u n|",
+        "DROP USER IF n|",
+        "CHECK n|",
+        "ANALYZE TABLE help n|",
+        "ANALYZE TABLE help UPDATE n|",
+        "ANALYZE TABLE help UPDATE HISTOGRAM n|",
+        "FLUSH n|",
+        "KILL n|",
+        "PURGE n|",
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, MySQL);
+        assert_eq!(
+            kind, None,
+            "MySQL schema/admin keyword slot should not resolve object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert_no_noise(sql, &final_suggestions);
+    }
+}
+
+#[test]
 fn remaining_tool_command_keyword_slots_are_formalized() {
     use crate::db::DatabaseType::Oracle;
 
@@ -42791,6 +43781,62 @@ fn remaining_tool_command_keyword_slots_are_formalized() {
         "tool command keyword slot failures:\n{}",
         failures.join("\n")
     );
+}
+
+#[test]
+fn tool_command_keyword_slots_reject_invalid_prefix_noise() {
+    use crate::db::DatabaseType::Oracle;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for sql in [
+        "SET z|",
+        "SET SERVEROUTPUT z|",
+        "SET SERVEROUTPUT ON z|",
+        "SET SERVEROUTPUT ON SIZE z|",
+        "SHOW z|",
+        "SHOW ERRORS z|",
+        "SHOW ERRORS PACKAGE z|",
+        "WHENEVER z|",
+        "WHENEVER SQLERROR z|",
+        "WHENEVER SQLERROR EXIT z|",
+        "CLEAR z|",
+        "CLEAR BREAKS z|",
+        "COMPUTE z|",
+        "COMPUTE SUM z|",
+        "COMPUTE SUM OF amount z|",
+        "COLUMN ename z|",
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert_eq!(
+            kind, None,
+            "tool command keyword slot should not resolve object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "APP_USER",
+            "SCOTT",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "EMPNO",
+            "ENAME",
+            "DEPTNO",
+            "DNAME",
+            "N_ID",
+            "N_VALUE",
+            "NOT",
+            "NULL",
+            "NEXT",
+            "NVL",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into tool command keyword slot at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -42938,6 +43984,95 @@ fn remaining_cte_and_table_expression_keyword_slots_are_formalized() {
         "CTE/table-expression keyword slot failures:\n{}",
         failures.join("\n")
     );
+}
+
+#[test]
+fn cte_table_expression_keyword_slots_reject_invalid_prefix_noise() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+    let assert_no_noise =
+        |sql: &str, db_type: crate::db::DatabaseType, suggestions: &[String]| {
+            for leaked in [
+                "EMP",
+                "DEPT",
+                "EMP_V",
+                "APP_USER",
+                "SCOTT",
+                "RUN_JOB",
+                "CALC_TOTAL",
+                "EMPNO",
+                "ENAME",
+                "DEPTNO",
+                "DNAME",
+                "N_ID",
+                "N_VALUE",
+                "NOT",
+                "NULL",
+                "NEXT",
+            ] {
+                assert!(
+                    !contains(suggestions, leaked),
+                    "{leaked} leaked into CTE/table-expression keyword slot at `{sql}` {db_type:?}: {suggestions:?}"
+                );
+            }
+        };
+
+    for (db_type, sql) in [
+        (
+            Oracle,
+            "WITH q AS (SELECT * FROM emp) n| SELECT * FROM q",
+        ),
+        (
+            Oracle,
+            "WITH q AS (SELECT * FROM emp) SEARCH n| SELECT * FROM q",
+        ),
+        (
+            Oracle,
+            "WITH q AS (SELECT * FROM emp) SEARCH DEPTH n| SELECT * FROM q",
+        ),
+        (
+            Oracle,
+            "WITH q AS (SELECT * FROM emp) SEARCH DEPTH FIRST n| SELECT * FROM q",
+        ),
+        (
+            Oracle,
+            "WITH q AS (SELECT * FROM emp) SEARCH DEPTH FIRST BY deptno n| SELECT * FROM q",
+        ),
+        (
+            Oracle,
+            "WITH q AS (SELECT * FROM emp) CYCLE deptno n| SELECT * FROM q",
+        ),
+        (
+            Oracle,
+            "WITH q AS (SELECT * FROM emp) CYCLE deptno SET is_cycle n| SELECT * FROM q",
+        ),
+        (
+            Oracle,
+            "WITH q AS (SELECT * FROM emp) CYCLE deptno SET is_cycle TO 'Y' n| SELECT * FROM q",
+        ),
+        (Oracle, "SELECT * FROM emp CROSS n|"),
+        (Oracle, "SELECT * FROM emp OUTER n|"),
+        (Oracle, "SELECT * FROM XMLTABLE('/r' n|) xt"),
+        (Oracle, "SELECT * FROM XMLTABLE('/r' PASSING payload n|) xt"),
+        (Oracle, "SELECT * FROM JSON_TABLE(payload, '$' n|) jt"),
+        (
+            MySQL,
+            "WITH n| q AS (SELECT * FROM help) SELECT * FROM q",
+        ),
+        (
+            MySQL,
+            "WITH RECURSIVE q n| (SELECT * FROM help) SELECT * FROM q",
+        ),
+        (MySQL, "SELECT * FROM emp CROSS n|"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db_type);
+        assert_eq!(
+            kind, None,
+            "CTE/table-expression keyword slot should not resolve object kind at `{sql}` {db_type:?}: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert_no_noise(sql, db_type, &final_suggestions);
+    }
 }
 
 #[test]
@@ -43261,6 +44396,63 @@ fn remaining_mysql_account_tail_keyword_slots_are_formalized() {
 }
 
 #[test]
+fn mysql_account_tail_keyword_slots_reject_invalid_prefix_noise() {
+    use crate::db::DatabaseType::MySQL;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for sql in [
+        "CREATE USER u IDENTIFIED BY 'x' z|",
+        "CREATE USER u REQUIRE z|",
+        "CREATE USER u REQUIRE SSL z|",
+        "CREATE USER u ACCOUNT z|",
+        "CREATE USER u PASSWORD z|",
+        "CREATE USER u PASSWORD EXPIRE z|",
+        "CREATE USER u PASSWORD EXPIRE INTERVAL z|",
+        "CREATE USER u PASSWORD HISTORY z|",
+        "CREATE USER u PASSWORD REUSE z|",
+        "CREATE USER u WITH z|",
+        "CREATE USER u WITH MAX_QUERIES_PER_HOUR z|",
+        "ALTER USER u PASSWORD z|",
+        "ALTER USER u PASSWORD EXPIRE z|",
+        "ALTER USER u PASSWORD EXPIRE INTERVAL z|",
+        "ALTER USER u PASSWORD REUSE z|",
+        "ALTER USER u WITH z|",
+        "ALTER USER u DEFAULT z|",
+        "ALTER USER u DEFAULT ROLE z|",
+        "GRANT SELECT ON help TO u z|",
+        "REVOKE SELECT ON help z|",
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, MySQL);
+        assert_eq!(
+            kind, None,
+            "MySQL account-tail keyword slot should not resolve object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "APP_USER",
+            "SCOTT",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "EMPNO",
+            "ENAME",
+            "N_ID",
+            "N_VALUE",
+            "NOT",
+            "NULL",
+            "NVL",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into MySQL account-tail keyword slot at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn remaining_grouping_returning_and_insert_tail_keyword_slots_are_formalized() {
     use crate::db::DatabaseType::{MySQL, Oracle};
 
@@ -43345,6 +44537,70 @@ fn remaining_grouping_returning_and_insert_tail_keyword_slots_are_formalized() {
         "grouping/returning/insert-tail keyword slot failures:\n{}",
         failures.join("\n")
     );
+}
+
+#[test]
+fn grouping_returning_and_insert_tail_slots_reject_invalid_prefix_noise() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+    let assert_no_noise =
+        |sql: &str, db_type: crate::db::DatabaseType, suggestions: &[String]| {
+            for leaked in [
+                "EMP",
+                "DEPT",
+                "EMP_V",
+                "APP_USER",
+                "SCOTT",
+                "RUN_JOB",
+                "CALC_TOTAL",
+                "EMPNO",
+                "ENAME",
+                "DEPTNO",
+                "DNAME",
+                "N_ID",
+                "N_VALUE",
+                "NOT",
+                "NULL",
+                "NEXT",
+            ] {
+                assert!(
+                    !contains(suggestions, leaked),
+                    "{leaked} leaked into grouping/returning/insert-tail keyword slot at `{sql}` {db_type:?}: {suggestions:?}"
+                );
+            }
+        };
+
+    for (db_type, sql) in [
+        (
+            Oracle,
+            "SELECT deptno, COUNT(*) FROM emp GROUP BY GROUPING n|",
+        ),
+        (Oracle, "UPDATE emp SET sal = 1 RETURNING sal n|"),
+        (
+            Oracle,
+            "DELETE FROM emp WHERE empno = 1 RETURNING empno n|",
+        ),
+        (
+            Oracle,
+            "INSERT INTO emp VALUES (1) RETURNING empno n|",
+        ),
+        (
+            MySQL,
+            "INSERT INTO help VALUES (1) ON DUPLICATE n|",
+        ),
+        (
+            MySQL,
+            "INSERT INTO help VALUES (1) ON DUPLICATE KEY n|",
+        ),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db_type);
+        assert_eq!(
+            kind, None,
+            "grouping/returning/insert-tail keyword slot should not resolve object kind at `{sql}` {db_type:?}: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert_no_noise(sql, db_type, &final_suggestions);
+    }
 }
 
 /// Helper: pure keyword tokens of the base suggestion list for `sql` (cursor at
@@ -44017,6 +45273,101 @@ fn expression_construct_tail_keywords_are_complete_and_noise_free() {
     ] {
         for noise in ["THEN", "WHEN", "ELSE", "END"] {
             assert!(!has(sql, noise), "`{noise}` leaked for `{sql}`: {:?}", kw(sql));
+        }
+    }
+}
+
+#[test]
+fn expression_construct_final_suggestions_do_not_leak_operand_catalog() {
+    use crate::db::DatabaseType::Oracle;
+
+    let has = |values: &[String], expected: &str| values.iter().any(|value| value == expected);
+    let assert_no_catalog = |sql: &str, suggestions: &[String]| {
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "EMPNO",
+            "ENAME",
+            "SAL",
+            "DEPTNO",
+            "DNAME",
+            "RUN_JOB",
+            "CALC_TOTAL",
+        ] {
+            assert!(
+                !has(suggestions, leaked),
+                "{leaked} leaked for `{sql}`: {suggestions:?}"
+            );
+        }
+    };
+
+    for (sql, expected_keywords) in [
+        (
+            "SELECT CASE x WHEN 1 | END FROM emp",
+            &["THEN"][..],
+        ),
+        (
+            "SELECT CASE WHEN empno = 1 | END FROM emp",
+            &["THEN"][..],
+        ),
+        (
+            "SELECT CASE WHEN empno = 1 THEN sal | END FROM emp",
+            &["WHEN", "ELSE", "END"][..],
+        ),
+        (
+            "SELECT CASE WHEN empno = 1 THEN sal ELSE 0 | END FROM emp",
+            &["END"][..],
+        ),
+        (
+            "SELECT CASE WHEN empno BETWEEN 1 | END FROM emp",
+            &["AND"][..],
+        ),
+        (
+            "SELECT CASE WHEN empno BETWEEN 1 AND 2 | END FROM emp",
+            &["THEN"][..],
+        ),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert_eq!(
+            kind, None,
+            "expression construct tail should not resolve an object kind for `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for keyword in expected_keywords {
+            assert!(
+                has(&final_suggestions, keyword),
+                "{keyword} missing for `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+        for leaked_clause in ["FROM", "WHERE", "GROUP BY", "HAVING", "ORDER BY"] {
+            assert!(
+                !has(&final_suggestions, leaked_clause),
+                "{leaked_clause} leaked from the outer query for `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+        assert_no_catalog(sql, &final_suggestions);
+    }
+
+    for sql in [
+        "SELECT COALESCE(empno, |) FROM emp",
+        "SELECT NVL(ename, |) FROM emp",
+        "SELECT CASE WHEN | THEN 1 END FROM emp",
+        "SELECT CASE WHEN empno = 1 THEN | END FROM emp",
+        "SELECT CASE WHEN empno = 1 THEN 1 ELSE | END FROM emp",
+        "SELECT CASE WHEN empno = 1 THEN (SELECT | FROM dept) END FROM emp",
+    ] {
+        let (_kind, _keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert!(
+            has(&final_suggestions, "EMPNO")
+                || has(&final_suggestions, "ENAME")
+                || has(&final_suggestions, "DEPTNO"),
+            "operand-start expression slot lost columns for `{sql}`: {final_suggestions:?}"
+        );
+        for leaked_clause in ["FROM", "WHERE", "GROUP BY", "HAVING", "ORDER BY"] {
+            assert!(
+                !has(&final_suggestions, leaked_clause),
+                "{leaked_clause} leaked into operand-start expression slot for `{sql}`: {final_suggestions:?}"
+            );
         }
     }
 }
@@ -45612,6 +46963,8 @@ fn parenthesised_table_clause_constructs_do_not_re_offer_keywords_once_closed() 
 /// already-present clause is not re-offered (the single-use filter composes here).
 #[test]
 fn completed_table_clause_construct_offers_query_continuation() {
+    use crate::db::DatabaseType::Oracle;
+
     let kw = |sql: &str| -> Vec<String> {
         let cursor = sql.find('|').expect("cursor");
         let plain = sql.replace('|', "");
@@ -45628,6 +46981,7 @@ fn completed_table_clause_construct_offers_query_continuation() {
         "SELECT * FROM t PIVOT (sum(x) FOR y IN (1,2)) |",
         "SELECT * FROM t UNPIVOT (x FOR y IN (a,b)) |",
         "SELECT * FROM t MATCH_RECOGNIZE (PATTERN (x) DEFINE x AS y) |",
+        "SELECT * FROM t MODEL DIMENSION BY (a) MEASURES (b) RULES (c=1) |",
     ] {
         let s = kw(sql);
         assert!(
@@ -45636,6 +46990,22 @@ fn completed_table_clause_construct_offers_query_continuation() {
         );
         // Still no re-offer of the construct's own keywords.
         assert!(!has(&s, "FOR") && !has(&s, "IN"), "construct keyword re-offered `{sql}`: {s:?}");
+
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert_eq!(
+            kind, None,
+            "completed construct should not resolve a relation kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            has(&final_suggestions, "WHERE") && has(&final_suggestions, "JOIN"),
+            "completed construct final suggestions lost query continuation `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in ["EMP", "DEPT", "T", "T1", "S", "EMP_V"] {
+            assert!(
+                !has(&final_suggestions, leaked),
+                "{leaked} leaked after completed table-clause construct `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
     }
 
     // The open form is unaffected: only the construct's own keywords, no WHERE.
@@ -46247,6 +47617,35 @@ fn dml_error_logging_final_suggestions_stay_slot_specific() {
             "{leaked} re-offered after completed LOG ERRORS tail: keywords={keywords:?} final={final_suggestions:?}"
         );
     }
+    let (_kind, keywords, final_suggestions) = audit_final_suggestions_for(
+        "INSERT INTO emp VALUES (1) LOG ERRORS REJECT LIMIT UNLIMITED n|",
+        Oracle,
+    );
+    assert!(
+        final_suggestions.is_empty(),
+        "completed LOG ERRORS tail with prefix should not offer catalog or stale keywords: keywords={keywords:?} final={final_suggestions:?}"
+    );
+
+    let (kind, keywords, final_suggestions) = audit_final_suggestions_for(
+        "INSERT INTO emp VALUES (1) LOG ERRORS INTO err$_emp REJECT LIMIT 10 |",
+        Oracle,
+    );
+    assert_eq!(
+        kind, None,
+        "completed numeric LOG ERRORS tail should not resolve object kind: keywords={keywords:?} final={final_suggestions:?}"
+    );
+    assert!(
+        final_suggestions.is_empty(),
+        "completed numeric LOG ERRORS tail should not offer catalog or stale keywords: keywords={keywords:?} final={final_suggestions:?}"
+    );
+    let (_kind, keywords, final_suggestions) = audit_final_suggestions_for(
+        "INSERT INTO emp VALUES (1) LOG ERRORS INTO err$_emp REJECT LIMIT 10 n|",
+        Oracle,
+    );
+    assert!(
+        final_suggestions.is_empty(),
+        "completed numeric LOG ERRORS tail with prefix should not offer catalog or stale keywords: keywords={keywords:?} final={final_suggestions:?}"
+    );
 }
 
 /// `SET TRANSACTION` is dialect-scoped: MySQL offers only `ISOLATION`/`READ` (the
@@ -46268,6 +47667,34 @@ fn set_transaction_options_are_dialect_scoped() {
     let m = kw("SET TRANSACTION |", MySQL);
     assert!(has(&m, "ISOLATION") && has(&m, "READ"), "MySQL SET TRANSACTION missing option: {m:?}");
     assert!(!has(&m, "USE") && !has(&m, "NAME"), "Oracle-only SET TRANSACTION option leaked into MySQL: {m:?}");
+    let m_root = kw("SET |", MySQL);
+    for lead in ["TRANSACTION", "GLOBAL", "SESSION", "NAMES", "CHARSET", "PERSIST", "PERSIST_ONLY"] {
+        assert!(has(&m_root, lead), "MySQL SET tail missing `{lead}`: {m_root:?}");
+    }
+    let m_global = kw("SET GLOBAL |", MySQL);
+    assert!(has(&m_global, "TRANSACTION"), "MySQL SET GLOBAL tail missing TRANSACTION: {m_global:?}");
+    let m_session = kw("SET SESSION |", MySQL);
+    assert!(has(&m_session, "TRANSACTION"), "MySQL SET SESSION tail missing TRANSACTION: {m_session:?}");
+    let m_global_tx = kw("SET GLOBAL TRANSACTION |", MySQL);
+    assert!(
+        has(&m_global_tx, "ISOLATION") && has(&m_global_tx, "READ"),
+        "MySQL SET GLOBAL TRANSACTION missing option: {m_global_tx:?}"
+    );
+    let m_session_tx = kw("SET SESSION TRANSACTION |", MySQL);
+    assert!(
+        has(&m_session_tx, "ISOLATION") && has(&m_session_tx, "READ"),
+        "MySQL SET SESSION TRANSACTION missing option: {m_session_tx:?}"
+    );
+    let m_global_tx_read = kw("SET GLOBAL TRANSACTION READ |", MySQL);
+    assert!(
+        has(&m_global_tx_read, "ONLY") && has(&m_global_tx_read, "WRITE"),
+        "MySQL SET GLOBAL TRANSACTION READ options missing: {m_global_tx_read:?}"
+    );
+    let m_session_tx_read = kw("SET SESSION TRANSACTION READ |", MySQL);
+    assert!(
+        has(&m_session_tx_read, "ONLY") && has(&m_session_tx_read, "WRITE"),
+        "MySQL SET SESSION TRANSACTION READ options missing: {m_session_tx_read:?}"
+    );
     let ml = kw("SET TRANSACTION ISOLATION LEVEL |", MySQL);
     for level in ["SERIALIZABLE", "READ COMMITTED", "REPEATABLE READ", "READ UNCOMMITTED"] {
         assert!(has(&ml, level), "MySQL isolation level `{level}` missing: {ml:?}");
@@ -46285,6 +47712,17 @@ fn set_transaction_options_are_dialect_scoped() {
     assert!(has(&o, "USE") && has(&o, "NAME"));
     let ol = kw("SET TRANSACTION ISOLATION LEVEL |", Oracle);
     assert!(has(&ol, "SERIALIZABLE") && has(&ol, "READ COMMITTED") && !has(&ol, "REPEATABLE READ"));
+
+    let o_root = kw("SET |", Oracle);
+    assert!(has(&o_root, "TRANSACTION"), "Oracle SET root missing TRANSACTION: {o_root:?}");
+
+    let o_tx_use = kw("SET TRANSACTION USE |", Oracle);
+    assert!(has(&o_tx_use, "ROLLBACK"), "Oracle SET TRANSACTION USE missing ROLLBACK: {o_tx_use:?}");
+    let o_tx_use_rollback = kw("SET TRANSACTION USE ROLLBACK |", Oracle);
+    assert!(
+        has(&o_tx_use_rollback, "SEGMENT"),
+        "Oracle SET TRANSACTION USE ROLLBACK missing SEGMENT: {o_tx_use_rollback:?}"
+    );
 }
 
 /// The row-locking tail is dialect-scoped: Oracle has `FOR UPDATE [WAIT n]`,
@@ -47086,6 +48524,11 @@ fn parenthesised_predicate_tail_slots_do_not_offer_catalog() {
         "SELECT a FROM t WHERE (a = b) AND (c = d) |",
         "SELECT a FROM t WHERE (SELECT c FROM s) > 5 |",
         "SELECT a FROM t WHERE x IN (SELECT id FROM s) |",
+        "SELECT a FROM t WHERE x IN (1, 2) |",
+        "SELECT a FROM t WHERE x NOT IN (1, 2) |",
+        "SELECT a FROM t WHERE x = ANY (SELECT id FROM s) |",
+        "SELECT a FROM t WHERE x <> SOME (SELECT id FROM s) |",
+        "SELECT a FROM t WHERE x > ALL (SELECT id FROM s) |",
         "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM s) |",
         "SELECT a FROM t1 JOIN t2 ON (a = b) |",
         "SELECT a FROM t1 JOIN t2 ON (a = b AND c = d) |",
@@ -47467,6 +48910,66 @@ fn prefixed_statement_tail_keyword_slots_do_not_offer_object_catalog() {
 }
 
 #[test]
+fn statement_tail_keyword_slots_reject_invalid_prefix_noise() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for (db, sql) in [
+        (Oracle, "DROP TABLE emp n|"),
+        (Oracle, "DROP TABLE scott.emp n|"),
+        (Oracle, "DROP TABLE emp CASCADE n|"),
+        (Oracle, "TRUNCATE TABLE emp n|"),
+        (Oracle, "TRUNCATE TABLE emp DROP n|"),
+        (Oracle, "COMMENT ON TABLE emp n|"),
+        (Oracle, "COMMENT ON COLUMN emp.sal n|"),
+        (Oracle, "COMMENT ON MATERIALIZED VIEW mview_sales n|"),
+        (Oracle, "CREATE VIEW emp_v n|"),
+        (Oracle, "CREATE MATERIALIZED VIEW mv n|"),
+        (Oracle, "CREATE INDEX emp_idx n|"),
+        (Oracle, "ALTER INDEX emp_idx n|"),
+        (Oracle, "ALTER SEQUENCE emp_seq n|"),
+        (Oracle, "ALTER USER app_user n|"),
+        (Oracle, "ALTER PROCEDURE run_job n|"),
+        (Oracle, "GRANT SELECT ON emp TO scott n|"),
+        (Oracle, "REVOKE SELECT ON emp FROM scott n|"),
+        (MySQL, "CREATE VIEW emp_v n|"),
+        (MySQL, "CREATE TABLE t (a INT) n|"),
+        (MySQL, "CREATE INDEX emp_idx ON emp (empno) n|"),
+        (MySQL, "RENAME TABLE emp n|"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert_eq!(
+            kind, None,
+            "statement-tail keyword slot should not resolve object kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "APP_USER",
+            "SCOTT",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "BI_EMP",
+            "CLEANUP_EVENT",
+            "EMPNO",
+            "ENAME",
+            "N_ID",
+            "N_VALUE",
+            "NOT",
+            "NULL",
+            "NVL",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into statement-tail keyword slot at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn prefixed_dml_column_slots_stay_on_target_relation_columns() {
     use crate::db::DatabaseType::{MySQL, Oracle};
 
@@ -47811,6 +49314,24 @@ fn prefixed_dml_tail_keyword_slots_do_not_offer_object_catalog() {
             "INTO must not appear before a RETURNING expression at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
         );
     }
+
+    for sql in [
+        "INSERT INTO emp VALUES (1, 'A', 10) ON DUPLICATE KEY UPDATE sal = 1 |",
+        "INSERT INTO emp VALUES (1, 'A', 10) ON DUPLICATE KEY UPDATE sal = 1 n|",
+        "INSERT INTO emp VALUES (1, 'A', 10) ON DUPLICATE KEY UPDATE sal = 1, ename = 'A' |",
+        "INSERT INTO emp VALUES (1, 'A', 10) ON DUPLICATE KEY UPDATE sal = 1, ename = 'A' n|",
+    ] {
+        let (kind, keywords, final_suggestions) =
+            audit_final_suggestions_for(sql, crate::db::DatabaseType::MySQL);
+        assert_eq!(
+            kind, None,
+            "completed ON DUPLICATE KEY UPDATE tail should not resolve object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            final_suggestions.is_empty(),
+            "completed ON DUPLICATE KEY UPDATE tail should not offer catalog or stale keywords at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+    }
 }
 
 #[test]
@@ -47877,8 +49398,11 @@ fn dml_returning_into_final_suggestions_stay_slot_specific() {
     for sql in [
         "UPDATE emp SET sal = 1 RETURNING empno INTO |",
         "UPDATE emp SET sal = 1 RETURNING empno INTO :b |",
+        "UPDATE emp SET sal = 1 RETURNING empno INTO :b n|",
         "DELETE FROM emp WHERE empno = 1 RETURNING empno INTO |",
+        "DELETE FROM emp WHERE empno = 1 RETURNING empno INTO :b n|",
         "INSERT INTO emp (empno) VALUES (1) RETURNING empno INTO |",
+        "INSERT INTO emp (empno) VALUES (1) RETURNING empno INTO :b n|",
     ] {
         let (_kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
         for leaked in ["INTO", "RETURNING", "EMP", "DEPT", "EMPNO", "ENAME", "WHERE"] {
@@ -47927,6 +49451,12 @@ fn unprefixed_dml_and_fk_keyword_slots_do_not_offer_object_catalog() {
             Oracle,
             "INSERT INTO emp (a, b) VALUES (1, 2) |",
             &["RETURNING"],
+        ),
+        (Oracle, "INSERT INTO emp VALUES (1), (2) |", &["RETURNING"]),
+        (
+            MySQL,
+            "INSERT INTO emp VALUES (1), (2) |",
+            &["ON DUPLICATE KEY UPDATE"],
         ),
         (Oracle, "DELETE FROM emp WHERE a = 1 |", &["RETURNING"]),
         (
@@ -47983,6 +49513,25 @@ fn unprefixed_dml_and_fk_keyword_slots_do_not_offer_object_catalog() {
         Oracle,
         &insert_select_tail,
     );
+
+    for (db, sql) in [
+        (Oracle, "INSERT INTO emp VALUES (1), |"),
+        (Oracle, "INSERT INTO emp VALUES (1), e|"),
+        (MySQL, "INSERT INTO emp VALUES (1), |"),
+        (MySQL, "INSERT INTO emp VALUES (1), e|"),
+        (Oracle, "INSERT INTO emp (empno) VALUES (1), |"),
+        (MySQL, "REPLACE INTO emp VALUES (1), |"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert_eq!(
+            kind, None,
+            "VALUES row-start slot should not resolve object kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            final_suggestions.is_empty(),
+            "VALUES row-start slot should not offer catalog or stale keywords at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+        );
+    }
 }
 
 #[test]
@@ -48880,6 +50429,57 @@ fn mysql_ddl_statement_tails_suppress_relations() {
     assert!(has(&kw("CREATE USER u |"), "IDENTIFIED"));
 }
 
+#[test]
+fn create_view_column_alias_list_slots_do_not_offer_catalog() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for (db, sql) in [
+        (Oracle, "CREATE VIEW v (|) AS SELECT empno FROM emp"),
+        (Oracle, "CREATE VIEW v (out_col, |) AS SELECT empno, ename FROM emp"),
+        (
+            Oracle,
+            "CREATE OR REPLACE VIEW v (out_col, n|) AS SELECT empno, ename FROM emp",
+        ),
+        (
+            Oracle,
+            "CREATE MATERIALIZED VIEW mv (|) AS SELECT empno FROM emp",
+        ),
+        (
+            Oracle,
+            "CREATE EDITIONING VIEW ev (out_col, |) AS SELECT empno, ename FROM emp",
+        ),
+        (MySQL, "CREATE VIEW v (|) AS SELECT empno FROM emp"),
+        (MySQL, "CREATE VIEW v (out_col, |) AS SELECT empno, ename FROM emp"),
+        (
+            MySQL,
+            "CREATE OR REPLACE VIEW v (out_col, n|) AS SELECT empno, ename FROM emp",
+        ),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert_eq!(
+            kind, None,
+            "CREATE VIEW column-alias slot should not resolve object kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "EMPNO",
+            "ENAME",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "AS",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into CREATE VIEW column-alias slot at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
 /// Non-query admin/utility statement tails suppress the relation catalog past the
 /// object name (and never leak the select-list `FROM` into `AUDIT`), while the
 /// object/identifier slots keep the catalog available. Also locks the MySQL
@@ -48964,8 +50564,12 @@ fn admin_statement_tails_suppress_relations_without_select_noise() {
         "LOAD INDEX INTO CACHE emp IGNORE LEAVES |",
         "LOAD DATA INFILE data_csv REPLACE INTO TABLE emp |",
         "RESET BINARY LOGS AND GTIDS |",
+        "RESET REPLICA FOR CHANNEL ch |",
         "RESET REPLICA ALL FOR CHANNEL ch |",
         "PURGE BINARY LOGS BEFORE ts |",
+        "PURGE BINARY LOGS TO binlog |",
+        "PURGE MASTER LOGS BEFORE ts |",
+        "PURGE MASTER LOGS TO binlog |",
         "LOCK INSTANCE FOR BACKUP |",
         "UNLOCK INSTANCE |",
         "UNLOCK TABLES |",
@@ -49037,13 +50641,29 @@ fn mysql_completed_admin_keyword_only_tails_do_not_offer_object_catalog() {
         "LOAD INDEX INTO CACHE emp IGNORE LEAVES |",
         "LOAD DATA INFILE data_csv REPLACE INTO TABLE emp |",
         "RESET BINARY LOGS AND GTIDS |",
+        "RESET REPLICA FOR CHANNEL ch |",
         "RESET REPLICA ALL FOR CHANNEL ch |",
+        "RESET SLAVE FOR CHANNEL ch |",
+        "RESET SLAVE ALL FOR CHANNEL ch |",
+        "RESET PERSIST max_connections |",
+        "RESET PERSIST IF EXISTS max_connections |",
         "PURGE BINARY LOGS BEFORE ts |",
+        "PURGE BINARY LOGS TO binlog |",
+        "PURGE MASTER LOGS BEFORE ts |",
+        "PURGE MASTER LOGS TO binlog |",
         "START GROUP_REPLICATION USER repl PASSWORD secret |",
+        "START GROUP_REPLICATION USER repl DEFAULT_AUTH auth PASSWORD secret |",
+        "START REPLICA FOR CHANNEL ch |",
         "START REPLICA IO_THREAD SQL_THREAD |",
         "START REPLICA UNTIL SQL_BEFORE_GTIDS gtid_set |",
         "START REPLICA UNTIL SOURCE_LOG_FILE binlog_000001 |",
+        "START SLAVE FOR CHANNEL ch |",
+        "START SLAVE IO_THREAD SQL_THREAD |",
+        "START SLAVE UNTIL SQL_BEFORE_GTIDS gtid_set |",
+        "STOP REPLICA FOR CHANNEL ch |",
         "STOP REPLICA IO_THREAD SQL_THREAD |",
+        "STOP SLAVE FOR CHANNEL ch |",
+        "STOP SLAVE IO_THREAD SQL_THREAD |",
         "CHANGE REPLICATION SOURCE TO SOURCE_HOST host SOURCE_PORT 3306 |",
         "CHANGE REPLICATION FILTER REPLICATE_DO_DB db1 |",
         "CHANGE REPLICATION FILTER REPLICATE_IGNORE_TABLE db1_t1 |",
@@ -49051,6 +50671,7 @@ fn mysql_completed_admin_keyword_only_tails_do_not_offer_object_catalog() {
         "SET DEFAULT ROLE ALL TO alice |",
         "SET ROLE ALL EXCEPT admin |",
         "SET PASSWORD TO RANDOM RETAIN CURRENT PASSWORD |",
+        "SET PASSWORD FOR root TO RANDOM RETAIN CURRENT PASSWORD |",
         "SHOW AUTHORS |",
         "SHOW BINARY LOGS |",
         "SHOW BINARY LOG STATUS |",
@@ -50215,6 +51836,29 @@ fn grant_revoke_slots_are_precise_in_final_suggestions() {
             );
         }
     }
+
+    for (db, sql) in [
+        (Oracle, "GRANT SELECT ON emp TO app_user WITH GRANT OPTION |"),
+        (Oracle, "GRANT SELECT ON emp TO app_user WITH GRANT OPTION n|"),
+        (
+            Oracle,
+            "GRANT CREATE SESSION TO app_user WITH ADMIN OPTION |",
+        ),
+        (
+            Oracle,
+            "GRANT CREATE SESSION TO app_user WITH ADMIN OPTION n|",
+        ),
+        (Oracle, "GRANT app_role TO app_user WITH ADMIN OPTION |"),
+        (Oracle, "GRANT app_role TO app_user WITH ADMIN OPTION n|"),
+        (MySQL, "GRANT SELECT ON emp TO app_user WITH GRANT OPTION |"),
+        (MySQL, "GRANT SELECT ON emp TO app_user WITH GRANT OPTION n|"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert!(
+            final_suggestions.is_empty(),
+            "completed GRANT tail should not offer catalog or stale keywords at `{sql}` {db:?}: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+        );
+    }
 }
 
 #[test]
@@ -50296,7 +51940,9 @@ fn prefixed_grant_revoke_grantee_and_tail_slots_are_precise() {
 
     for (db, sql) in [
         (Oracle, "REVOKE SELECT ON emp FROM app_user F|"),
+        (Oracle, "REVOKE SELECT ON emp FROM app_user n|"),
         (MySQL, "REVOKE SELECT ON emp FROM app_user F|"),
+        (MySQL, "REVOKE SELECT ON emp FROM app_user n|"),
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
         assert!(
@@ -51690,11 +53336,14 @@ fn mysql_prepare_and_deallocate_slots_do_not_offer_object_catalog() {
         "PREPARE app|",
         "PREPARE stmt FROM |",
         "PREPARE stmt FROM app|",
+        "PREPARE stmt FROM sql_text |",
         "DEALLOCATE PREPARE |",
         "DEALLOCATE PREPARE app|",
         "DEALLOCATE PREPARE stmt |",
         "EXECUTE stmt USING app|",
+        "EXECUTE stmt USING arg |",
         "EXECUTE stmt USING @a, app|",
+        "EXECUTE stmt USING @a, arg |",
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, MySQL);
         assert_eq!(
@@ -51732,16 +53381,21 @@ fn mysql_component_plugin_and_handler_value_slots_do_not_offer_catalog() {
     for sql in [
         "INSTALL COMPONENT |",
         "INSTALL COMPONENT app|",
+        "INSTALL COMPONENT file_component |",
         "INSTALL PLUGIN |",
         "INSTALL PLUGIN app|",
         "INSTALL PLUGIN audit_log SONAME |",
         "INSTALL PLUGIN audit_log SONAME app|",
+        "INSTALL PLUGIN audit_log SONAME libaudit |",
         "UNINSTALL COMPONENT |",
         "UNINSTALL COMPONENT app|",
+        "UNINSTALL COMPONENT file_component |",
         "UNINSTALL PLUGIN |",
         "UNINSTALL PLUGIN app|",
+        "UNINSTALL PLUGIN audit_log |",
         "HANDLER emp OPEN AS |",
         "HANDLER emp OPEN AS app|",
+        "HANDLER emp OPEN AS h |",
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, MySQL);
         assert_eq!(
@@ -51856,8 +53510,10 @@ fn mysql_handler_table_slot_offers_only_tables() {
     for sql in [
         "HANDLER emp READ PRIMARY = |",
         "HANDLER emp READ PRIMARY = app|",
+        "HANDLER emp READ PRIMARY = app |",
         "HANDLER emp READ PRIMARY = (|",
         "HANDLER emp READ PRIMARY = (@a, |",
+        "HANDLER emp READ PRIMARY = (@a, app |",
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, MySQL);
         assert_eq!(
@@ -52197,6 +53853,82 @@ fn mysql_statement_value_slots_do_not_offer_object_catalog() {
 }
 
 #[test]
+fn mysql_statement_value_slots_reject_expression_keyword_and_function_noise() {
+    use crate::db::DatabaseType::MySQL;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for sql in [
+        "DELIMITER n|",
+        "SOURCE n|",
+        "HELP n|",
+        "SHOW ENGINE n|",
+        "SHOW BINLOG EVENTS IN n|",
+        "SHOW BINLOG EVENTS FROM n|",
+        "SHOW BINLOG EVENTS LIMIT n|",
+        "SHOW ERRORS LIMIT n|",
+        "SHOW PROFILE FOR QUERY n|",
+        "SHOW PROFILE FOR QUERY 1 OFFSET n|",
+        "EXPLAIN FOR CONNECTION n|",
+        "KILL QUERY n|",
+        "SIGNAL SQLSTATE n|",
+        "SIGNAL SQLSTATE VALUE n|",
+        "START REPLICA FOR CHANNEL n|",
+        "START REPLICA UNTIL SQL_BEFORE_GTIDS n|",
+        "RESET REPLICA FOR CHANNEL n|",
+        "RESET PERSIST n|",
+        "PURGE BINARY LOGS BEFORE n|",
+        "SET PASSWORD TO RANDOM REPLACE n|",
+        "SET CHARACTER SET n|",
+        "LOAD DATA INFILE n|",
+        "LOAD DATA INFILE data_csv INTO TABLE emp CHARACTER SET n|",
+        "LOAD DATA INFILE data_csv INTO TABLE emp FIELDS TERMINATED BY n|",
+        "LOAD DATA INFILE data_csv INTO TABLE emp IGNORE n|",
+        "LOAD XML INFILE n|",
+        "LOAD XML INFILE data_xml ROWS IDENTIFIED BY n|",
+        "SELECT empno INTO OUTFILE n|",
+        "SELECT empno INTO OUTFILE data_txt CHARACTER SET n|",
+        "SELECT empno INTO OUTFILE data_txt FIELDS TERMINATED BY n|",
+        "CLONE LOCAL DATA DIRECTORY n|",
+        "CLONE INSTANCE FROM n|",
+        "IMPORT TABLE FROM n|",
+        "XA START n|",
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, MySQL);
+        assert_eq!(
+            kind, None,
+            "MySQL statement value slot should not resolve object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "EMPNO",
+            "ENAME",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "HR_PKG",
+            "ADDRESS_T",
+            "APP_USER",
+            "SCOTT",
+            "SELECT",
+            "WHERE",
+            "NOT",
+            "NULL",
+            "NTH_VALUE",
+            "NTILE",
+            "NOW()",
+            "NULLIF()",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into MySQL statement value slot at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn mysql_set_account_slots_offer_users_without_relation_noise() {
     use crate::db::DatabaseType::MySQL;
 
@@ -52252,6 +53984,9 @@ fn transaction_and_lock_value_slots_do_not_offer_object_catalog() {
         (Oracle, "COMMIT COMMENT app|"),
         (Oracle, "COMMIT FORCE |"),
         (Oracle, "COMMIT FORCE app|"),
+        (Oracle, "COMMIT WRITE WAIT IMMEDIATE |"),
+        (Oracle, "COMMIT WRITE NOWAIT BATCH |"),
+        (Oracle, "COMMIT WRITE IMMEDIATE WAIT |"),
         (Oracle, "ROLLBACK FORCE |"),
         (Oracle, "ROLLBACK FORCE app|"),
         (Oracle, "SAVEPOINT |"),
@@ -52264,8 +53999,13 @@ fn transaction_and_lock_value_slots_do_not_offer_object_catalog() {
         (Oracle, "SET TRANSACTION NAME app|"),
         (Oracle, "SET TRANSACTION USE ROLLBACK SEGMENT |"),
         (Oracle, "SET TRANSACTION USE ROLLBACK SEGMENT app|"),
+        (Oracle, "SET TRANSACTION READ ONLY |"),
+        (Oracle, "SET TRANSACTION READ WRITE |"),
+        (Oracle, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE |"),
+        (Oracle, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED |"),
         (Oracle, "LOCK TABLE emp IN SHARE MODE WAIT |"),
         (Oracle, "LOCK TABLE emp IN SHARE MODE WAIT d|"),
+        (Oracle, "LOCK TABLE emp IN SHARE MODE NOWAIT |"),
         (MySQL, "SAVEPOINT |"),
         (MySQL, "SAVEPOINT app|"),
         (MySQL, "ROLLBACK TO |"),
@@ -52274,6 +54014,14 @@ fn transaction_and_lock_value_slots_do_not_offer_object_catalog() {
         (MySQL, "ROLLBACK TO SAVEPOINT app|"),
         (MySQL, "RELEASE SAVEPOINT |"),
         (MySQL, "RELEASE SAVEPOINT app|"),
+        (MySQL, "SET TRANSACTION READ ONLY |"),
+        (MySQL, "SET TRANSACTION READ WRITE |"),
+        (MySQL, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED |"),
+        (MySQL, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ |"),
+        (MySQL, "SET GLOBAL TRANSACTION READ ONLY |"),
+        (MySQL, "SET SESSION TRANSACTION READ WRITE |"),
+        (MySQL, "SET GLOBAL TRANSACTION ISOLATION LEVEL READ COMMITTED |"),
+        (MySQL, "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ |"),
         (MySQL, "START TRANSACTION READ ONLY |"),
         (MySQL, "START TRANSACTION READ WRITE |"),
         (MySQL, "START TRANSACTION WITH CONSISTENT SNAPSHOT |"),
@@ -52307,6 +54055,100 @@ fn transaction_and_lock_value_slots_do_not_offer_object_catalog() {
                 "{leaked} leaked into transaction/lock value slot at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
             );
         }
+    }
+}
+
+#[test]
+fn transaction_and_lock_value_slots_reject_expression_keyword_and_function_noise() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for (db, sql) in [
+        (Oracle, "COMMIT COMMENT n|"),
+        (Oracle, "COMMIT FORCE n|"),
+        (Oracle, "ROLLBACK FORCE n|"),
+        (Oracle, "SAVEPOINT n|"),
+        (Oracle, "ROLLBACK TO n|"),
+        (Oracle, "ROLLBACK TO SAVEPOINT n|"),
+        (Oracle, "SET TRANSACTION NAME n|"),
+        (Oracle, "SET TRANSACTION USE ROLLBACK SEGMENT n|"),
+        (Oracle, "LOCK TABLE emp IN SHARE MODE WAIT n|"),
+        (MySQL, "SAVEPOINT n|"),
+        (MySQL, "ROLLBACK TO n|"),
+        (MySQL, "ROLLBACK TO SAVEPOINT n|"),
+        (MySQL, "RELEASE SAVEPOINT n|"),
+        (MySQL, "LOCK TABLES emp AS n|"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert_eq!(
+            kind, None,
+            "transaction/lock value slot should not resolve object kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "EMPNO",
+            "ENAME",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "HR_PKG",
+            "ADDRESS_T",
+            "APP_USER",
+            "SCOTT",
+            "SELECT",
+            "WHERE",
+            "NOT",
+            "NULL",
+            "NTH_VALUE",
+            "NTILE",
+            "NVL",
+            "NVL()",
+            "NEXT_DAY()",
+            "NULLIF()",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into transaction/lock value slot at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn completed_transaction_option_tails_do_not_reoffer_keywords_or_catalog() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    for (db, sql) in [
+        (Oracle, "COMMIT WRITE WAIT IMMEDIATE |"),
+        (Oracle, "COMMIT WRITE WAIT IMMEDIATE n|"),
+        (Oracle, "COMMIT WRITE NOWAIT BATCH |"),
+        (Oracle, "COMMIT WRITE NOWAIT BATCH n|"),
+        (Oracle, "COMMIT WRITE IMMEDIATE WAIT |"),
+        (Oracle, "COMMIT WRITE IMMEDIATE WAIT n|"),
+        (Oracle, "SET TRANSACTION READ ONLY |"),
+        (Oracle, "SET TRANSACTION READ ONLY n|"),
+        (Oracle, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED |"),
+        (Oracle, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED n|"),
+        (MySQL, "SET TRANSACTION READ WRITE |"),
+        (MySQL, "SET TRANSACTION READ WRITE n|"),
+        (MySQL, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ |"),
+        (MySQL, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ n|"),
+        (MySQL, "SET GLOBAL TRANSACTION ISOLATION LEVEL READ COMMITTED |"),
+        (MySQL, "SET GLOBAL TRANSACTION ISOLATION LEVEL READ COMMITTED n|"),
+        (MySQL, "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ |"),
+        (MySQL, "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ n|"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert_eq!(
+            kind, None,
+            "completed transaction option tail should not resolve an object kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            final_suggestions.is_empty(),
+            "completed transaction option tail should not re-offer keywords or catalog at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+        );
     }
 }
 
@@ -52381,6 +54223,64 @@ fn oracle_ddl_value_slots_do_not_offer_object_catalog() {
             "SCOTT",
             "SELECT",
             "WHERE",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into Oracle DDL value slot at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn oracle_ddl_value_slots_reject_invalid_prefix_noise() {
+    use crate::db::DatabaseType::Oracle;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for sql in [
+        "COMMENT ON TABLE emp IS n|",
+        "COMMENT ON COLUMN emp.sal IS n|",
+        "COMMENT ON VIEW emp_v IS n|",
+        "COMMENT ON MATERIALIZED VIEW mview_sales IS n|",
+        "COMMENT ON MINING MODEL model_name IS n|",
+        "COMMENT ON OPERATOR text_op IS n|",
+        "COMMENT ON INDEXTYPE text_itype IS n|",
+        "CREATE USER u IDENTIFIED BY n|",
+        "ALTER USER u IDENTIFIED BY n|",
+        "CREATE DIRECTORY d AS n|",
+        "CREATE TABLESPACE ts DATAFILE n|",
+        "ALTER TABLESPACE ts ADD DATAFILE n|",
+        "CREATE DATABASE LINK l CONNECT TO n|",
+        "CREATE DATABASE LINK l CONNECT TO u IDENTIFIED BY n|",
+        "CREATE DATABASE LINK l USING n|",
+        "CREATE LIBRARY lib AS n|",
+        "CREATE OR REPLACE LIBRARY lib AS n|",
+        "CREATE JAVA SOURCE NAMED src AS n|",
+        "CREATE OR REPLACE JAVA SOURCE NAMED src AS n|",
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert_eq!(
+            kind, None,
+            "Oracle DDL value slot should not resolve object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "HR_PKG",
+            "ADDRESS_T",
+            "APP_USER",
+            "SCOTT",
+            "SELECT",
+            "WHERE",
+            "N_ID",
+            "N_VALUE",
+            "NOT",
+            "NULL",
+            "NVL",
         ] {
             assert!(
                 !contains(&final_suggestions, leaked),
@@ -52528,6 +54428,64 @@ fn oracle_user_option_tails_offer_precise_keywords_without_catalog() {
 }
 
 #[test]
+fn oracle_user_option_keyword_tails_reject_invalid_prefix_noise() {
+    use crate::db::DatabaseType::Oracle;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for sql in [
+        "CREATE USER u z|",
+        "CREATE USER u IDENTIFIED z|",
+        "CREATE USER u IDENTIFIED EXTERNALLY z|",
+        "CREATE USER u IDENTIFIED BY 'secret' z|",
+        "CREATE USER u DEFAULT z|",
+        "CREATE USER u TEMPORARY z|",
+        "CREATE USER u DEFAULT TABLESPACE users z|",
+        "CREATE USER u QUOTA z|",
+        "CREATE USER u QUOTA UNLIMITED z|",
+        "CREATE USER u QUOTA UNLIMITED ON users z|",
+        "CREATE USER u PASSWORD z|",
+        "CREATE USER u PASSWORD EXPIRE z|",
+        "CREATE USER u ACCOUNT z|",
+        "ALTER USER u z|",
+        "ALTER USER u IDENTIFIED z|",
+        "ALTER USER u DEFAULT z|",
+        "ALTER USER u DEFAULT ROLE z|",
+        "ALTER USER u PASSWORD z|",
+        "ALTER USER u ACCOUNT z|",
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert_eq!(
+            kind, None,
+            "Oracle USER option keyword tail should not resolve object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "HR_PKG",
+            "ADDRESS_T",
+            "APP_USER",
+            "SCOTT",
+            "SELECT",
+            "WHERE",
+            "N_ID",
+            "N_VALUE",
+            "NOT",
+            "NULL",
+            "NVL",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into Oracle USER option keyword tail at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn oracle_role_auth_tails_offer_precise_keywords_and_packages() {
     use crate::db::DatabaseType::Oracle;
 
@@ -52637,6 +54595,51 @@ fn oracle_role_auth_tails_offer_precise_keywords_and_packages() {
 }
 
 #[test]
+fn oracle_role_auth_keyword_tails_reject_invalid_prefix_noise() {
+    use crate::db::DatabaseType::Oracle;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for sql in [
+        "CREATE ROLE r z|",
+        "CREATE ROLE r NOT z|",
+        "CREATE ROLE r IDENTIFIED z|",
+        "CREATE ROLE r IDENTIFIED GLOBALLY z|",
+        "ALTER ROLE r z|",
+        "ALTER ROLE r IDENTIFIED z|",
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert_eq!(
+            kind, None,
+            "Oracle ROLE auth keyword tail should not resolve object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "HR_PKG",
+            "ADDRESS_T",
+            "APP_USER",
+            "SCOTT",
+            "SELECT",
+            "WHERE",
+            "N_ID",
+            "N_VALUE",
+            "NOT",
+            "NULL",
+            "NVL",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into Oracle ROLE auth keyword tail at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn oracle_tablespace_tails_offer_precise_keywords_without_catalog() {
     use crate::db::DatabaseType::Oracle;
 
@@ -52722,6 +54725,63 @@ fn oracle_tablespace_tails_offer_precise_keywords_without_catalog() {
 }
 
 #[test]
+fn oracle_tablespace_keyword_tails_reject_invalid_prefix_noise() {
+    use crate::db::DatabaseType::Oracle;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for sql in [
+        "CREATE TABLESPACE ts z|",
+        "CREATE TEMPORARY TABLESPACE ts z|",
+        "CREATE TABLESPACE ts DATAFILE 'ts01.dbf' z|",
+        "CREATE TABLESPACE ts DATAFILE 'ts01.dbf' AUTOEXTEND z|",
+        "CREATE TABLESPACE ts DATAFILE 'ts01.dbf' AUTOEXTEND ON z|",
+        "CREATE TABLESPACE ts DATAFILE 'ts01.dbf' AUTOEXTEND ON NEXT 64M z|",
+        "CREATE TABLESPACE ts DATAFILE 'ts01.dbf' AUTOEXTEND ON MAXSIZE z|",
+        "CREATE TABLESPACE ts DATAFILE 'ts01.dbf' EXTENT z|",
+        "CREATE TABLESPACE ts DATAFILE 'ts01.dbf' EXTENT MANAGEMENT z|",
+        "CREATE TABLESPACE ts DATAFILE 'ts01.dbf' SEGMENT z|",
+        "CREATE TABLESPACE ts DATAFILE 'ts01.dbf' SEGMENT SPACE z|",
+        "CREATE TABLESPACE ts DATAFILE 'ts01.dbf' SEGMENT SPACE MANAGEMENT z|",
+        "ALTER TABLESPACE ts z|",
+        "ALTER TABLESPACE ts ADD z|",
+        "ALTER TABLESPACE ts ADD DATAFILE 'ts02.dbf' z|",
+        "ALTER TABLESPACE ts DROP z|",
+        "ALTER TABLESPACE ts RENAME z|",
+        "ALTER TABLESPACE ts READ z|",
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert_eq!(
+            kind, None,
+            "Oracle TABLESPACE keyword tail should not resolve object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "HR_PKG",
+            "ADDRESS_T",
+            "APP_USER",
+            "SCOTT",
+            "SELECT",
+            "WHERE",
+            "N_ID",
+            "N_VALUE",
+            "NOT",
+            "NULL",
+            "NVL",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into Oracle TABLESPACE keyword tail at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn oracle_materialized_view_tails_offer_precise_keywords_without_catalog() {
     use crate::db::DatabaseType::Oracle;
 
@@ -52800,6 +54860,55 @@ fn oracle_materialized_view_tails_offer_precise_keywords_without_catalog() {
         contains(&final_suggestions, "EMPNO") || contains(&final_suggestions, "ENAME"),
         "MV defining query should keep normal SELECT suggestions: keywords={keywords:?} final={final_suggestions:?}"
     );
+}
+
+#[test]
+fn oracle_materialized_view_keyword_tails_reject_invalid_prefix_noise() {
+    use crate::db::DatabaseType::Oracle;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for sql in [
+        "CREATE MATERIALIZED VIEW mv z|",
+        "CREATE MATERIALIZED VIEW mv BUILD z|",
+        "CREATE MATERIALIZED VIEW mv BUILD IMMEDIATE z|",
+        "CREATE MATERIALIZED VIEW mv REFRESH z|",
+        "CREATE MATERIALIZED VIEW mv REFRESH FAST z|",
+        "CREATE MATERIALIZED VIEW mv REFRESH FAST ON z|",
+        "CREATE MATERIALIZED VIEW mv REFRESH FAST ON DEMAND z|",
+        "CREATE MATERIALIZED VIEW mv ON z|",
+        "CREATE MATERIALIZED VIEW mv ON PREBUILT z|",
+        "CREATE MATERIALIZED VIEW mv ON PREBUILT TABLE z|",
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert_eq!(
+            kind, None,
+            "Oracle materialized-view keyword tail should not resolve object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "HR_PKG",
+            "ADDRESS_T",
+            "APP_USER",
+            "SCOTT",
+            "SELECT",
+            "WHERE",
+            "N_ID",
+            "N_VALUE",
+            "NOT",
+            "NULL",
+            "NVL",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into Oracle materialized-view keyword tail at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -54136,6 +56245,51 @@ fn oracle_profile_limit_slots_offer_resource_keywords_without_catalog() {
 }
 
 #[test]
+fn oracle_profile_limit_slots_reject_invalid_prefix_noise() {
+    use crate::db::DatabaseType::Oracle;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for sql in [
+        "CREATE PROFILE p z|",
+        "ALTER PROFILE p z|",
+        "CREATE PROFILE p LIMIT z|",
+        "ALTER PROFILE p LIMIT z|",
+        "CREATE PROFILE p LIMIT SESSIONS_PER_USER z|",
+        "CREATE PROFILE p LIMIT PASSWORD_VERIFY_FUNCTION z|",
+        "ALTER PROFILE p LIMIT PASSWORD_LIFE_TIME DEFAULT z|",
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert_eq!(
+            kind, None,
+            "PROFILE LIMIT slot should not resolve object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "HR_PKG",
+            "ADDRESS_T",
+            "APP_USER",
+            "SCOTT",
+            "WHERE",
+            "N_ID",
+            "N_VALUE",
+            "NOT",
+            "NULL",
+            "NVL",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into PROFILE LIMIT slot at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn oracle_session_system_parameter_value_slots_do_not_offer_object_catalog() {
     use crate::db::DatabaseType::Oracle;
 
@@ -54198,6 +56352,52 @@ fn oracle_session_system_parameter_value_slots_do_not_offer_object_catalog() {
 }
 
 #[test]
+fn oracle_parameter_value_slots_reject_expression_keyword_and_function_noise() {
+    use crate::db::DatabaseType::Oracle;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for sql in [
+        "ALTER SESSION SET NLS_DATE_FORMAT = n|",
+        "ALTER SESSION SET OPTIMIZER_MODE = n|",
+        "ALTER SYSTEM SET OPEN_CURSORS = n|",
+        "ALTER SYSTEM SET DB_RECOVERY_FILE_DEST = n|",
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert_eq!(
+            kind, None,
+            "Oracle parameter value slot should not resolve object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "HR_PKG",
+            "ADDRESS_T",
+            "APP_USER",
+            "SCOTT",
+            "SELECT",
+            "WHERE",
+            "NOT",
+            "NULL",
+            "NTH_VALUE",
+            "NTILE",
+            "NVL",
+            "NVL()",
+            "NEXT_DAY()",
+            "NULLIF()",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into Oracle parameter value slot at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn prefixed_new_name_slots_do_not_offer_catalog_or_keywords() {
     use crate::db::DatabaseType::{MySQL, Oracle};
 
@@ -54254,6 +56454,57 @@ fn prefixed_new_name_slots_do_not_offer_catalog_or_keywords() {
             "SET",
             "SHOW",
             "WHERE",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into prefixed new-name slot at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+
+    for (db, sql) in [
+        (Oracle, "CREATE TABLE n|"),
+        (Oracle, "CREATE OR REPLACE PACKAGE n|"),
+        (Oracle, "CREATE SYNONYM n|"),
+        (Oracle, "CREATE MATERIALIZED VIEW n|"),
+        (Oracle, "ALTER TABLE emp RENAME TO n|"),
+        (Oracle, "ALTER TABLE emp RENAME COLUMN old_col TO n|"),
+        (MySQL, "CREATE TABLE n|"),
+        (MySQL, "CREATE TABLE IF NOT EXISTS n|"),
+        (MySQL, "CREATE EVENT n|"),
+        (MySQL, "CREATE USER n|"),
+        (MySQL, "CREATE ROLE n|"),
+        (MySQL, "RENAME TABLE emp TO n|"),
+        (MySQL, "RENAME USER alice TO n|"),
+        (MySQL, "ALTER TABLE emp RENAME TO n|"),
+        (MySQL, "ALTER TABLE emp RENAME COLUMN old_col TO n|"),
+        (MySQL, "ALTER EVENT ev RENAME TO n|"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert_eq!(
+            kind, None,
+            "new-name slot should not resolve to an existing object kind at `{sql}`; keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "APP_USER",
+            "SCOTT",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "SELECT",
+            "SET",
+            "SHOW",
+            "WHERE",
+            "NOT",
+            "NULL",
+            "NTH_VALUE",
+            "NTILE",
+            "NVL",
+            "NVL()",
+            "NEXT_DAY()",
+            "NULLIF()",
         ] {
             assert!(
                 !contains(&final_suggestions, leaked),
@@ -54349,11 +56600,14 @@ fn mysql_option_value_slots_do_not_offer_object_catalog_in_final_suggestions() {
         "ALTER DATABASE db DEFAULT CHARACTER SET |",
         "ALTER DATABASE db COLLATE |",
         "ALTER DATABASE db ENCRYPTION |",
+        "ALTER DATABASE db ENCRYPTION Y |",
         "CREATE DATABASE db CHARACTER SET |",
+        "CREATE DATABASE db CHARACTER SET utf8mb4 |",
         "CREATE DATABASE db DEFAULT CHARACTER SET |",
         "CREATE DATABASE db COLLATE |",
         "CREATE DATABASE db ENCRYPTION |",
         "CREATE TABLE t (a INT) ENGINE |",
+        "CREATE TABLE t (a INT) ENGINE InnoDB |",
         "CREATE TABLE t (a INT) DEFAULT CHARACTER SET |",
         "CREATE TABLE t (a INT) DEFAULT CHARSET |",
         "CREATE TABLE t (a INT) CHARACTER SET |",
@@ -54367,6 +56621,7 @@ fn mysql_option_value_slots_do_not_offer_object_catalog_in_final_suggestions() {
         "ALTER RESOURCE GROUP rg VCPU |",
         "ALTER RESOURCE GROUP rg THREAD_PRIORITY |",
         "CREATE SERVER s FOREIGN DATA WRAPPER mysql OPTIONS HOST |",
+        "CREATE SERVER s FOREIGN DATA WRAPPER mysql OPTIONS HOST localhost |",
         "CREATE SERVER s FOREIGN DATA WRAPPER mysql OPTIONS DATABASE |",
         "CREATE SERVER s FOREIGN DATA WRAPPER mysql OPTIONS USER |",
         "CREATE SERVER s FOREIGN DATA WRAPPER mysql OPTIONS PASSWORD |",
@@ -54377,9 +56632,11 @@ fn mysql_option_value_slots_do_not_offer_object_catalog_in_final_suggestions() {
         "ALTER SERVER s OPTIONS OWNER |",
         "ALTER SERVER s OPTIONS SOCKET |",
         "START GROUP_REPLICATION USER |",
+        "START GROUP_REPLICATION USER repl |",
         "START GROUP_REPLICATION DEFAULT_AUTH |",
         "START GROUP_REPLICATION PASSWORD |",
         "CHANGE REPLICATION SOURCE TO SOURCE_HOST |",
+        "CHANGE REPLICATION SOURCE TO SOURCE_HOST host |",
         "CHANGE REPLICATION SOURCE TO SOURCE_USER |",
         "CHANGE REPLICATION SOURCE TO SOURCE_PASSWORD |",
         "CHANGE REPLICATION SOURCE TO SOURCE_PORT |",
@@ -54392,6 +56649,7 @@ fn mysql_option_value_slots_do_not_offer_object_catalog_in_final_suggestions() {
         "ALTER EVENT ev RENAME TO |",
         "CREATE LOGFILE GROUP lg ADD UNDOFILE |",
         "CREATE LOGFILE GROUP lg ADD UNDOFILE 'undo.dat' INITIAL_SIZE |",
+        "CREATE LOGFILE GROUP lg ADD UNDOFILE 'undo.dat' INITIAL_SIZE 10M |",
         "CREATE LOGFILE GROUP lg ADD UNDOFILE 'undo.dat' UNDO_BUFFER_SIZE |",
         "CREATE LOGFILE GROUP lg ADD UNDOFILE 'undo.dat' REDO_BUFFER_SIZE |",
         "CREATE LOGFILE GROUP lg ADD UNDOFILE 'undo.dat' NODEGROUP |",
@@ -54399,6 +56657,7 @@ fn mysql_option_value_slots_do_not_offer_object_catalog_in_final_suggestions() {
         "CREATE LOGFILE GROUP lg ADD UNDOFILE 'undo.dat' ENGINE |",
         "CREATE TABLESPACE ts ADD DATAFILE |",
         "CREATE TABLESPACE ts ADD DATAFILE 'ts.ibd' INITIAL_SIZE |",
+        "CREATE TABLESPACE ts ADD DATAFILE 'ts.ibd' INITIAL_SIZE 10M |",
         "CREATE TABLESPACE ts ADD DATAFILE 'ts.ibd' AUTOEXTEND_SIZE |",
         "CREATE TABLESPACE ts ADD DATAFILE 'ts.ibd' MAX_SIZE |",
         "CREATE TABLESPACE ts ADD DATAFILE 'ts.ibd' ENGINE_ATTRIBUTE |",
@@ -54412,8 +56671,10 @@ fn mysql_option_value_slots_do_not_offer_object_catalog_in_final_suggestions() {
         "ALTER TABLESPACE ts RENAME TO |",
         "ALTER LOGFILE GROUP lg ADD UNDOFILE |",
         "ALTER LOGFILE GROUP lg ADD UNDOFILE 'undo2.dat' INITIAL_SIZE |",
+        "ALTER LOGFILE GROUP lg ADD UNDOFILE 'undo2.dat' INITIAL_SIZE 10M |",
         "ALTER LOGFILE GROUP lg ADD UNDOFILE 'undo2.dat' ENGINE |",
         "DROP LOGFILE GROUP lg ENGINE |",
+        "DROP LOGFILE GROUP lg ENGINE InnoDB |",
     ] {
         let (_kind, _keywords, final_suggestions) = audit_final_suggestions_for(sql, MySQL);
         for leaked in [
@@ -54726,6 +56987,23 @@ fn standard_function_internal_keyword_grammar_is_offered() {
     none("SELECT OVERLAY(name PLACING repl FROM 1 FOR len |", Oracle);
     none("SELECT SUBSTR(name |", Oracle);             // comma-only spelling
     none("SELECT UPPER(name |", Oracle);              // unrelated function
+
+    for (sql, db) in [
+        ("SELECT POSITION('a' IN name n|", Oracle),
+        ("SELECT TRIM(BOTH ' ' FROM name n|", Oracle),
+        ("SELECT SUBSTRING(name FROM 1 FOR len n|", MySQL),
+        ("SELECT OVERLAY(name PLACING repl FROM 1 FOR len n|", Oracle),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert_eq!(
+            kind, None,
+            "completed standard-function tail with prefix should not resolve object kind at `{sql}`; keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            final_suggestions.is_empty(),
+            "completed standard-function tail with prefix should not offer catalog or stale keywords at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+    }
 }
 
 /// Regression: a qualified column slot (`t.|` / alias `a.|`) must keep the
