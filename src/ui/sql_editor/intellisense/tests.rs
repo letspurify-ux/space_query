@@ -52716,6 +52716,14 @@ fn prefixed_object_slots_do_not_merge_statement_keywords() {
             "START",
             "SAVEPOINT",
             "WHERE",
+            "NOT",
+            "NULL",
+            "NTH_VALUE",
+            "NTILE",
+            "NVL",
+            "NVL()",
+            "NEXT_DAY()",
+            "NULLIF()",
         ] {
             assert!(
                 !contains(&final_suggestions, leaked),
@@ -52808,6 +52816,23 @@ fn prefixed_object_slots_stay_within_expected_object_family() {
                 "{item} leaked into prefixed object slot at `{sql}`: {final_suggestions:?}"
             );
         }
+        for item in [
+            "SELECT",
+            "WHERE",
+            "NOT",
+            "NULL",
+            "NTH_VALUE",
+            "NTILE",
+            "NVL",
+            "NVL()",
+            "NEXT_DAY()",
+            "NULLIF()",
+        ] {
+            assert!(
+                !contains(&final_suggestions, item),
+                "{item} leaked into prefixed object slot at `{sql}`: {final_suggestions:?}"
+            );
+        }
     }
 }
 
@@ -52849,6 +52874,16 @@ fn object_kind_matrix_final_suggestions_stay_within_expected_family() {
         "Welcome",
         "WelcomeClass",
         "WelcomeRes",
+        "SELECT",
+        "WHERE",
+        "NOT",
+        "NULL",
+        "NTH_VALUE",
+        "NTILE",
+        "NVL",
+        "NVL()",
+        "NEXT_DAY()",
+        "NULLIF()",
     ];
 
     for (db, sql, expected_kind, expected) in [
@@ -56569,7 +56604,21 @@ fn oracle_synonym_target_final_suggestions_offer_objects_without_keywords() {
                 "{expected} missing from synonym target at `{sql}`: {final_suggestions:?}"
             );
         }
-        for leaked in ["SELECT", "CREATE", "WHERE", "FROM", "JOIN"] {
+        for leaked in [
+            "SELECT",
+            "CREATE",
+            "WHERE",
+            "FROM",
+            "JOIN",
+            "NOT",
+            "NULL",
+            "NTH_VALUE",
+            "NTILE",
+            "NVL",
+            "NVL()",
+            "NEXT_DAY()",
+            "NULLIF()",
+        ] {
             assert!(
                 !contains(&final_suggestions, leaked),
                 "{leaked} leaked into synonym target at `{sql}`: {final_suggestions:?}"
