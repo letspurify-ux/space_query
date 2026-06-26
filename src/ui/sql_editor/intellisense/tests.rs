@@ -562,7 +562,7 @@ fn keyword_only_slots_are_enrolled_in_suppression_chokepoint() {
         // Brand-new-name DDL slots are suppressed through a different gate
         // (`ddl_new_name_position`), which is also valid enrollment.
         let new_name = ctx.ddl_new_name_position
-            || SqlEditorWidget::cursor_is_at_create_object_new_name(&ctx, has);
+            || SqlEditorWidget::cursor_is_at_create_object_new_name(&ctx, has, db);
         let keyword_only = !kw.is_empty() && kind.is_none() && !dtype;
         let suppressed = SqlEditorWidget::cursor_is_at_identifier_suppressing_keyword_slot_for_context(&ctx, has, db)
             || SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot_for_db(&ctx, has, db)
@@ -627,7 +627,7 @@ fn mysql_keyword_only_slots_are_enrolled_in_suppression_chokepoint() {
             SqlEditorWidget::expected_object_suggestion_kind_for_db(&prefix, None, &ctx, db);
         let dtype = SqlEditorWidget::data_type_position_for_context_for_db(&ctx, has, db).is_some();
         let new_name = ctx.ddl_new_name_position
-            || SqlEditorWidget::cursor_is_at_create_object_new_name(&ctx, has);
+            || SqlEditorWidget::cursor_is_at_create_object_new_name(&ctx, has, db);
         let keyword_only = !kw.is_empty() && kind.is_none() && !dtype;
         let suppressed = SqlEditorWidget::cursor_is_at_identifier_suppressing_keyword_slot_for_context(&ctx, has, db)
             || SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot_for_db(&ctx, has, db)
@@ -681,12 +681,14 @@ fn create_object_new_name_slot_suppresses_existing_objects() {
         SqlEditorWidget::cursor_is_at_create_object_new_name(
             &analyze_inline_cursor_sql(sql),
             true,
+            Some(crate::db::DatabaseType::Oracle),
         )
     };
     let is_new_name_at_empty_slot = |sql: &str| {
         SqlEditorWidget::cursor_is_at_create_object_new_name(
             &analyze_inline_cursor_sql(sql),
             false,
+            Some(crate::db::DatabaseType::Oracle),
         )
     };
     for sql in ["CREATE TABLE |", "CREATE DATABASE LINK |"] {
@@ -2282,7 +2284,11 @@ fn audit_final_suggestions_for(
             && create_table_partition_declared_column_suggestions.is_none()
             && alter_table_add_declared_column_suggestions.is_none())
         || (!at_package_declaration_default_value
-            && SqlEditorWidget::cursor_is_at_create_object_new_name(&ctx, trigger_has_identifier))
+            && SqlEditorWidget::cursor_is_at_create_object_new_name(
+                &ctx,
+                trigger_has_identifier,
+                Some(db),
+            ))
         || SqlEditorWidget::cursor_is_at_rename_target_new_name_slot_for_context(
             &ctx,
             trigger_has_identifier,
@@ -2500,9 +2506,20 @@ fn audit_final_suggestions_for(
             Some(db),
         );
     let allow_locking_clause_keyword = qualifier.is_none()
-        && SqlEditorWidget::cursor_is_at_locking_clause_keyword_slot_for_context(&ctx, has);
+        && SqlEditorWidget::cursor_is_at_locking_clause_keyword_slot_for_context_for_db(
+            &ctx,
+            has,
+            Some(db),
+        );
     let allow_dml_error_logging_keyword = qualifier.is_none()
         && SqlEditorWidget::expected_dml_error_logging_keyword_candidates_for_context(
+            &ctx,
+            has,
+            Some(db),
+        )
+        .is_some();
+    let allow_mysql_select_into_file_keyword = qualifier.is_none()
+        && SqlEditorWidget::expected_mysql_select_into_file_keyword_candidates_for_context(
             &ctx,
             has,
             Some(db),
@@ -2513,6 +2530,7 @@ fn audit_final_suggestions_for(
             || allow_dml_returning_into_keyword
             || allow_locking_clause_keyword
             || allow_dml_error_logging_keyword
+            || allow_mysql_select_into_file_keyword
             || at_data_type
         {
         SqlEditorWidget::collect_expected_keyword_suggestions_with_expression_context(
@@ -23609,6 +23627,10 @@ fn json_returning_type_slot_offers_types_and_suppresses_columns() {
     };
     assert!(at_slot("SELECT JSON_VALUE(doc, '$.a' RETURNING |) FROM t"));
     assert!(at_slot("SELECT JSON_QUERY(doc, '$.a' RETURNING |) FROM t"));
+    assert!(at_slot("SELECT JSON_ARRAY(v RETURNING |) FROM t"));
+    assert!(at_slot("SELECT JSON_OBJECT(KEY k VALUE v RETURNING |) FROM t"));
+    assert!(at_slot("SELECT JSON_ARRAYAGG(v RETURNING |) FROM t"));
+    assert!(at_slot("SELECT JSON_OBJECTAGG(KEY k VALUE v RETURNING |) FROM t"));
     // A statement-level DML RETURNING lists columns, not types — not a type slot.
     assert!(!at_slot("UPDATE t SET x = 1 RETURNING | INTO :v"));
     assert!(!at_slot("DELETE FROM t WHERE id = 1 RETURNING |"));
@@ -24533,6 +24555,39 @@ fn interval_unit_slot_suppresses_columns_and_offers_unit_keywords() {
         Some(crate::db::DatabaseType::MySQL),
     );
     assert!(mysql_leading.iter().any(|value| value == "QUARTER"));
+}
+
+#[test]
+fn extract_and_interval_keyword_slots_suppress_catalog_in_final_suggestions() {
+    use crate::db::DatabaseType::Oracle;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for (sql, expected) in [
+        ("SELECT EXTRACT(| FROM hiredate) FROM emp", "YEAR"),
+        ("SELECT EXTRACT(YEAR |) FROM emp", "FROM"),
+        ("SELECT INTERVAL '1' | FROM emp", "DAY"),
+        ("SELECT INTERVAL '1' DAY | FROM emp", "TO"),
+        ("SELECT INTERVAL '1' DAY TO | FROM emp", "SECOND"),
+        ("SELECT INTERVAL '1-2' YEAR TO | FROM emp", "MONTH"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert_eq!(
+            kind, None,
+            "EXTRACT/INTERVAL keyword slot should not resolve object kind at `{sql}`; keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            contains(&final_suggestions, expected),
+            "{expected} missing from EXTRACT/INTERVAL keyword slot at `{sql}`: {final_suggestions:?}"
+        );
+        for leaked in ["EMP", "DEPT", "EMP_V", "EMPNO", "ENAME", "RUN_JOB", "CALC_TOTAL"] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into EXTRACT/INTERVAL keyword slot at `{sql}`: {final_suggestions:?}"
+            );
+        }
+    }
+
 }
 
 #[test]
@@ -26130,6 +26185,10 @@ fn mysql_prepared_and_explain_keyword_slots_are_dialect_scoped() {
             "{expected} missing for MySQL EXPLAIN: {explain:?}"
         );
     }
+    assert!(
+        !has(&explain, "PLAN"),
+        "Oracle-only EXPLAIN PLAN leaked into MySQL EXPLAIN: {explain:?}"
+    );
 
     let explain_format = suggestions("EXPLAIN FORMAT |");
     for expected in ["=", "JSON", "TREE", "TRADITIONAL"] {
@@ -26252,6 +26311,132 @@ fn mysql_prepared_and_explain_keyword_slots_are_dialect_scoped() {
             "{unsupported} leaked after MySQL EXPLAIN ANALYZE schema spec: {explain_analyze_schema:?}"
         );
     }
+}
+
+#[test]
+fn oracle_explain_plan_keyword_slots_are_dialect_scoped() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let suggestions = |sql: &str, db| {
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &analyze_inline_cursor_sql(sql),
+            Some(db),
+        )
+    };
+    let has = |suggestions: &[String], keyword: &str| {
+        suggestions
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(keyword))
+    };
+
+    let explain = suggestions("EXPLAIN |", Oracle);
+    assert!(has(&explain, "PLAN"), "PLAN missing for Oracle EXPLAIN: {explain:?}");
+    for mysql_only in ["ANALYZE", "FORMAT", "TABLE", "REPLACE"] {
+        assert!(
+            !has(&explain, mysql_only),
+            "{mysql_only} leaked into Oracle EXPLAIN: {explain:?}"
+        );
+    }
+
+    let plan = suggestions("EXPLAIN PLAN |", Oracle);
+    for expected in ["SET", "INTO", "FOR"] {
+        assert!(has(&plan, expected), "{expected} missing after EXPLAIN PLAN: {plan:?}");
+    }
+
+    assert_eq!(
+        suggestions("EXPLAIN PLAN SET |", Oracle),
+        vec!["STATEMENT_ID".to_string()]
+    );
+    assert_eq!(
+        suggestions("EXPLAIN PLAN SET STATEMENT_ID |", Oracle),
+        vec!["=".to_string()]
+    );
+    assert!(
+        suggestions("EXPLAIN PLAN SET STATEMENT_ID = |", Oracle).is_empty(),
+        "literal slot after STATEMENT_ID = should not offer keywords"
+    );
+
+    let after_statement_id = suggestions("EXPLAIN PLAN SET STATEMENT_ID = 'q1' |", Oracle);
+    for expected in ["INTO", "FOR"] {
+        assert!(
+            has(&after_statement_id, expected),
+            "{expected} missing after Oracle EXPLAIN PLAN statement id: {after_statement_id:?}"
+        );
+    }
+
+    let after_into = suggestions("EXPLAIN PLAN INTO plan_table |", Oracle);
+    assert!(has(&after_into, "FOR"), "FOR missing after EXPLAIN PLAN INTO table: {after_into:?}");
+    let qualified_table_slot = suggestions("EXPLAIN PLAN INTO app.|", Oracle);
+    assert!(
+        qualified_table_slot.is_empty(),
+        "keyword leaked while Oracle EXPLAIN PLAN INTO still expects a qualified table name: {qualified_table_slot:?}"
+    );
+
+    let for_statement = suggestions("EXPLAIN PLAN FOR |", Oracle);
+    for expected in ["SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "WITH"] {
+        assert!(
+            has(&for_statement, expected),
+            "{expected} missing after Oracle EXPLAIN PLAN FOR: {for_statement:?}"
+        );
+    }
+    for noise in ["PLAN", "ANALYZE", "FORMAT", "TABLE", "REPLACE"] {
+        assert!(
+            !has(&for_statement, noise),
+            "{noise} leaked after Oracle EXPLAIN PLAN FOR: {for_statement:?}"
+        );
+    }
+
+    let mysql_explain = suggestions("EXPLAIN |", MySQL);
+    assert!(
+        !has(&mysql_explain, "PLAN"),
+        "Oracle-only PLAN leaked into MySQL EXPLAIN: {mysql_explain:?}"
+    );
+}
+
+#[test]
+fn oracle_explain_plan_into_offers_plan_table_targets_only() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["PLAN_TABLE".to_string()];
+    data.views = vec!["PLAN_VIEW".to_string()];
+    data.functions = vec!["PLAN_FN".to_string()];
+    data.procedures = vec!["PLAN_PROC".to_string()];
+    data.rebuild_indices();
+
+    let mut suggestions = |sql: &str, db| {
+        let ctx = analyze_inline_cursor_sql(sql);
+        SqlEditorWidget::collect_expected_object_suggestions_for_db(
+            &mut data,
+            "",
+            &ctx,
+            Some(db),
+        )
+    };
+    let has = |items: &[String], value: &str| items.iter().any(|item| item == value);
+
+    for sql in [
+        "EXPLAIN PLAN INTO |",
+        "EXPLAIN PLAN INTO app.|",
+        "EXPLAIN PLAN SET STATEMENT_ID = 'q1' INTO |",
+        "EXPLAIN PLAN SET STATEMENT_ID = 'q1' INTO app.|",
+    ] {
+        let got = suggestions(sql, Oracle);
+        assert!(has(&got, "PLAN_TABLE"), "PLAN_TABLE missing for `{sql}`: {got:?}");
+        for noise in ["PLAN_VIEW", "PLAN_FN", "PLAN_PROC"] {
+            assert!(
+                !has(&got, noise),
+                "{noise} leaked into Oracle EXPLAIN PLAN INTO target for `{sql}`: {got:?}"
+            );
+        }
+    }
+
+    let mysql = suggestions("EXPLAIN PLAN INTO |", MySQL);
+    assert!(
+        !has(&mysql, "PLAN_TABLE"),
+        "Oracle EXPLAIN PLAN INTO object slot leaked into MySQL: {mysql:?}"
+    );
 }
 
 #[test]
@@ -28661,7 +28846,14 @@ fn dml_statement_head_keywords_are_scoped_to_statement_heads() {
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
 
     assert_eq!(kw("DELETE |"), vec!["FROM".to_string()]);
-    assert_eq!(kw("INSERT |"), vec!["INTO".to_string()]);
+    assert_eq!(
+        kw("INSERT |"),
+        vec![
+            "INTO".to_string(),
+            "ALL".to_string(),
+            "FIRST".to_string()
+        ]
+    );
     assert_eq!(kw("MERGE |"), vec!["INTO".to_string()]);
 
     for sql in [
@@ -28893,7 +29085,21 @@ fn mysql_dml_statement_head_keywords_are_dialect_scoped() {
     );
 
     assert_eq!(kw("DELETE |", Oracle), vec!["FROM".to_string()]);
-    assert_eq!(kw("INSERT |", Oracle), vec!["INTO".to_string()]);
+    assert_eq!(
+        kw("INSERT |", Oracle),
+        vec![
+            "INTO".to_string(),
+            "ALL".to_string(),
+            "FIRST".to_string()
+        ]
+    );
+    let mysql_insert = kw("INSERT |", MySQL);
+    for oracle_only in ["ALL", "FIRST"] {
+        assert!(
+            !has(&mysql_insert, oracle_only),
+            "{oracle_only} leaked into MySQL INSERT head: {mysql_insert:?}"
+        );
+    }
     assert_eq!(kw("MERGE |", Oracle), vec!["INTO".to_string()]);
     let oracle_replace = kw("REPLACE |", Oracle);
     for mysql_only in ["DELAYED", "LOW_PRIORITY"] {
@@ -30764,7 +30970,7 @@ fn merge_match_condition_offers_then_and_not_bare_or() {
     );
 }
 
-/// The row-locking clause `… FOR |` (→ `UPDATE`/`SHARE`) and `… FOR UPDATE |`
+/// The row-locking clause `… FOR |` (→ dialect-valid lock mode) and `… FOR UPDATE |`
 /// (→ `OF`/`NOWAIT`/…) are keyword-only slots — a column is never valid. The
 /// trailing-clause phase used to leave them in a column context. They are gated
 /// to the statement top level so the SQL-standard `SUBSTRING(x FROM a FOR |)`
@@ -30773,12 +30979,12 @@ fn merge_match_condition_offers_then_and_not_bare_or() {
 #[test]
 fn for_update_locking_clause_is_keyword_only_not_columns() {
     for (sql, expected) in [
-        ("SELECT * FROM t FOR |", vec!["UPDATE".to_string(), "SHARE".to_string()]),
-        ("SELECT * FROM t WHERE x = 1 FOR |", vec!["UPDATE".to_string(), "SHARE".to_string()]),
-        ("SELECT * FROM t ORDER BY x FOR |", vec!["UPDATE".to_string(), "SHARE".to_string()]),
+        ("SELECT * FROM t FOR |", vec!["UPDATE".to_string()]),
+        ("SELECT * FROM t WHERE x = 1 FOR |", vec!["UPDATE".to_string()]),
+        ("SELECT * FROM t ORDER BY x FOR |", vec!["UPDATE".to_string()]),
         (
             "SELECT * FROM emp e WHERE e.sal > (SELECT avg(sal) FROM emp) FOR |",
-            vec!["UPDATE".to_string(), "SHARE".to_string()],
+            vec!["UPDATE".to_string()],
         ),
         (
             "SELECT * FROM t FOR UPDATE |",
@@ -30843,12 +31049,12 @@ fn for_update_locking_clause_final_suggestions_stay_slot_specific() {
         };
 
     for (db, sql, expected_keywords, forbidden_keywords) in [
-        (Oracle, "SELECT * FROM emp FOR |", &["UPDATE", "SHARE"][..], &[][..]),
+        (Oracle, "SELECT * FROM emp FOR |", &["UPDATE"][..], &["SHARE"][..]),
         (
             Oracle,
             "SELECT * FROM emp WHERE empno = 1 FOR |",
-            &["UPDATE", "SHARE"],
-            &[],
+            &["UPDATE"],
+            &["SHARE"],
         ),
         (
             Oracle,
@@ -30861,6 +31067,12 @@ fn for_update_locking_clause_final_suggestions_stay_slot_specific() {
             "SELECT * FROM emp FOR UPDATE OF empno |",
             &["NOWAIT", "WAIT", "SKIP"],
             &["OF"],
+        ),
+        (
+            MySQL,
+            "SELECT * FROM emp FOR |",
+            &["UPDATE", "SHARE"],
+            &["WAIT"],
         ),
         (
             MySQL,
@@ -31932,6 +32144,261 @@ fn data_type_json_table_columns_clause_offers_types() {
         "SELECT * FROM XMLTABLE('/r' PASSING x COLUMNS id | PATH 'id')", "", Oracle).is_empty());
     assert!(!data_type_suggestions(
         "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id | PATH '$.id'))", "", MySQL).is_empty());
+    assert!(
+        data_type_suggestions(
+            "SELECT * FROM XMLTABLE('/r' PASSING x COLUMNS id | PATH 'id')",
+            "",
+            MySQL
+        )
+        .is_empty(),
+        "Oracle-only XMLTABLE column type grammar leaked into MySQL"
+    );
+}
+
+#[test]
+fn json_table_column_name_tail_offers_ordinality_and_exists_path_keywords() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let kw = |sql: &str, db| {
+        let cursor = sql.find('|').expect("cursor marker");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(db),
+        )
+    };
+    let has = |values: &[String], keyword: &str| {
+        values
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(keyword))
+    };
+
+    for db in [Oracle, MySQL] {
+        let after_name = kw("SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id |))", db);
+        assert!(
+            has(&after_name, "FOR") && has(&after_name, "EXISTS"),
+            "JSON_TABLE column-name tail lost FOR/EXISTS for {db:?}: {after_name:?}"
+        );
+        assert!(
+            has(&after_name, if db == Oracle { "NUMBER" } else { "INT" }),
+            "JSON_TABLE column-name tail lost data types for {db:?}: {after_name:?}"
+        );
+
+        let ordinality = kw("SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id FOR |))", db);
+        assert_eq!(
+            ordinality,
+            vec!["ORDINALITY".to_string()],
+            "JSON_TABLE FOR tail should be keyword-only for {db:?}"
+        );
+
+        let exists_path = kw("SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id EXISTS |))", db);
+        assert_eq!(
+            exists_path,
+            vec!["PATH".to_string()],
+            "JSON_TABLE EXISTS tail should be keyword-only for {db:?}"
+        );
+
+        let after_type = kw("SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id NUMBER |))", db);
+        assert!(
+            has(&after_type, "PATH"),
+            "JSON_TABLE column type tail lost PATH for {db:?}: {after_type:?}"
+        );
+        for invalid in ["FOR", "EXISTS"] {
+            assert!(
+                !has(&after_type, invalid),
+                "{invalid} leaked after a JSON_TABLE column type for {db:?}: {after_type:?}"
+            );
+        }
+
+        let nested = kw("SELECT * FROM JSON_TABLE(d, '$' COLUMNS (NESTED |))", db);
+        assert_eq!(
+            nested,
+            vec!["PATH".to_string()],
+            "JSON_TABLE NESTED tail should be keyword-only for {db:?}"
+        );
+
+        let nested_columns =
+            kw("SELECT * FROM JSON_TABLE(d, '$' COLUMNS (NESTED PATH '$.items[*]' |))", db);
+        assert_eq!(
+            nested_columns,
+            vec!["COLUMNS".to_string()],
+            "JSON_TABLE NESTED PATH tail should offer only COLUMNS for {db:?}"
+        );
+
+        let after_value_path = kw(
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id NUMBER PATH '$.id' |))",
+            db,
+        );
+        assert_eq!(
+            after_value_path,
+            vec![
+                "NULL".to_string(),
+                "ERROR".to_string(),
+                "DEFAULT".to_string()
+            ],
+            "JSON_TABLE value PATH tail should offer only value handler heads for {db:?}"
+        );
+
+        let null_handler = kw(
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id NUMBER PATH '$.id' NULL |))",
+            db,
+        );
+        assert_eq!(
+            null_handler,
+            vec!["ON".to_string()],
+            "JSON_TABLE NULL handler should continue with ON for {db:?}"
+        );
+
+        let after_exists_path = kw(
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id EXISTS PATH '$.id' |))",
+            db,
+        );
+        assert_eq!(
+            after_exists_path,
+            vec!["TRUE".to_string(), "FALSE".to_string(), "ERROR".to_string()],
+            "JSON_TABLE EXISTS PATH tail should offer only exists handler heads for {db:?}"
+        );
+
+        let true_handler = kw(
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id EXISTS PATH '$.id' TRUE |))",
+            db,
+        );
+        assert_eq!(
+            true_handler,
+            vec!["ON".to_string()],
+            "JSON_TABLE TRUE handler should continue with ON for {db:?}"
+        );
+
+        let after_on_empty = kw(
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id NUMBER PATH '$.id' NULL ON EMPTY |))",
+            db,
+        );
+        assert_eq!(
+            after_on_empty,
+            vec![
+                "NULL".to_string(),
+                "ERROR".to_string(),
+                "DEFAULT".to_string()
+            ],
+            "JSON_TABLE completed ON EMPTY should offer ON ERROR handler heads for {db:?}"
+        );
+
+        let second_handler = kw(
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id NUMBER PATH '$.id' NULL ON EMPTY ERROR |))",
+            db,
+        );
+        assert_eq!(
+            second_handler,
+            vec!["ON".to_string()],
+            "JSON_TABLE second handler head should continue with ON for {db:?}"
+        );
+
+        assert!(
+            kw("SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id NUMBER PATH '$.id' DEFAULT |))", db)
+                .is_empty(),
+            "JSON_TABLE DEFAULT handler value slot should not be keyword-only for {db:?}"
+        );
+        assert_eq!(
+            kw(
+                "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id NUMBER PATH '$.id' DEFAULT 0 |))",
+                db,
+            ),
+            vec!["ON".to_string()],
+            "JSON_TABLE completed numeric DEFAULT handler should continue with ON for {db:?}"
+        );
+        assert_eq!(
+            kw(
+                "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id NUMBER PATH '$.id' DEFAULT fallback_amt |))",
+                db,
+            ),
+            vec!["ON".to_string()],
+            "JSON_TABLE completed identifier DEFAULT handler should continue with ON for {db:?}"
+        );
+    }
+}
+
+#[test]
+fn xmltable_column_tail_keeps_xmltable_grammar_separate_from_json_table() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let kw = |sql: &str, db_type| {
+        let cursor = sql.find('|').expect("cursor marker");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(db_type),
+        )
+    };
+    let has = |values: &[String], keyword: &str| {
+        values
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(keyword))
+    };
+
+    let after_name = kw("SELECT * FROM XMLTABLE('/r' COLUMNS id |) xt", Oracle);
+    assert!(
+        has(&after_name, "FOR") && has(&after_name, "NUMBER"),
+        "XMLTABLE column tail lost FOR/data types: {after_name:?}"
+    );
+    for json_only in ["EXISTS", "NESTED", "TRUE", "FALSE"] {
+        assert!(
+            !has(&after_name, json_only),
+            "{json_only} leaked into XMLTABLE column tail: {after_name:?}"
+        );
+    }
+
+    assert_eq!(
+        kw("SELECT * FROM XMLTABLE('/r' COLUMNS id FOR |) xt", Oracle),
+        vec!["ORDINALITY".to_string()],
+        "XMLTABLE FOR tail should be keyword-only"
+    );
+    assert_eq!(
+        kw("SELECT * FROM XMLTABLE('/r' COLUMNS id NUMBER |) xt", Oracle),
+        vec!["PATH".to_string()],
+        "XMLTABLE typed column tail should offer PATH"
+    );
+    assert!(
+        kw("SELECT * FROM XMLTABLE('/r' COLUMNS id EXISTS |) xt", Oracle).is_empty(),
+        "JSON_TABLE EXISTS PATH leaked into XMLTABLE"
+    );
+    assert!(
+        kw(
+            "SELECT * FROM XMLTABLE('/r' COLUMNS id NUMBER PATH 'id' |) xt",
+            Oracle,
+        )
+        .is_empty(),
+        "JSON_TABLE handler heads leaked after XMLTABLE PATH"
+    );
+    for sql in [
+        "SELECT * FROM XMLTABLE('/r' COLUMNS id FOR |) xt",
+        "SELECT * FROM XMLTABLE('/r' COLUMNS id NUMBER |) xt",
+        "SELECT * FROM XMLTABLE('/r' COLUMNS id NUMBER PATH 'id' |) xt",
+    ] {
+        let got = kw(sql, MySQL);
+        assert!(
+            got.is_empty(),
+            "Oracle-only XMLTABLE column-tail grammar leaked into MySQL at `{sql}`: {got:?}"
+        );
+    }
+
+    let (kind, keywords, final_suggestions) = audit_final_suggestions_for(
+        "SELECT * FROM XMLTABLE('/r' COLUMNS id NUMBER PATH 'id' |) xt",
+        Oracle,
+    );
+    assert_eq!(
+        kind, None,
+        "completed XMLTABLE PATH tail should not resolve object kind; keywords={keywords:?} final={final_suggestions:?}"
+    );
+    for leaked in ["EMP", "DEPT", "EMP_V", "EMPNO", "ENAME", "RUN_JOB", "CALC_TOTAL"] {
+        assert!(
+            !final_suggestions.iter().any(|value| value == leaked),
+            "{leaked} leaked after completed XMLTABLE PATH: {final_suggestions:?}"
+        );
+    }
 }
 
 #[test]
@@ -32010,6 +32477,13 @@ fn table_function_path_literal_slots_suppress_identifier_base() {
             "identifier base survived in PATH literal slot for `{sql}`"
         );
     }
+    assert!(
+        !suppresses(
+            "SELECT * FROM XMLTABLE('/r' PASSING x COLUMNS id NUMBER PATH p|)",
+            MySQL,
+        ),
+        "Oracle-only XMLTABLE PATH literal slot should not suppress identifiers in MySQL"
+    );
 
     assert!(
         !data_type_suggestions(
@@ -32058,6 +32532,7 @@ fn json_on_target_keyword_slots_suppress_identifier_base() {
         "SELECT JSON_VALUE(payload, '$.amount' DEFAULT fallback_amt ON |) FROM emp",
         "SELECT JSON_EXISTS(payload, '$' TRUE ON |) FROM emp",
         "SELECT JSON_QUERY(payload, '$' EMPTY ARRAY ON |) FROM emp",
+        "SELECT JSON_QUERY(payload, '$' EMPTY OBJECT ON |) FROM emp",
         "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id NUMBER PATH '$.id' NULL ON |))",
     ] {
         assert!(suppresses(sql), "JSON ON target slot leaked identifiers for `{sql}`");
@@ -32115,6 +32590,597 @@ fn json_on_target_keyword_slots_suppress_identifier_base() {
         has(&join_columns, "ENAME"),
         "ordinary JOIN ON lost column completion: {join_columns:?}"
     );
+}
+
+#[test]
+fn json_function_option_tails_offer_handlers_and_wrapper_keywords() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let kw = |sql: &str, db| {
+        let cursor = sql.find('|').expect("cursor marker");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(db),
+        )
+    };
+
+    assert_eq!(
+        kw("SELECT JSON_VALUE(payload, '$.amount' RETURNING NUMBER |) FROM emp", Oracle),
+        vec![
+            "NULL".to_string(),
+            "ERROR".to_string(),
+            "DEFAULT".to_string()
+        ],
+        "JSON_VALUE RETURNING type tail should offer handler heads"
+    );
+    assert_eq!(
+        kw("SELECT JSON_VALUE(payload, '$.amount' RETURNING NUMBER NULL |) FROM emp", Oracle),
+        vec!["ON".to_string()],
+        "JSON_VALUE NULL handler should continue with ON"
+    );
+    assert_eq!(
+        kw("SELECT JSON_VALUE(payload, '$.amount' RETURNING NUMBER NULL ON EMPTY |) FROM emp", Oracle),
+        vec![
+            "NULL".to_string(),
+            "ERROR".to_string(),
+            "DEFAULT".to_string()
+        ],
+        "JSON_VALUE completed ON EMPTY should offer ON ERROR handler heads"
+    );
+    assert!(
+        kw("SELECT JSON_VALUE(payload, '$.amount' RETURNING NUMBER DEFAULT |) FROM emp", Oracle)
+            .is_empty(),
+        "JSON_VALUE DEFAULT handler value slot should not be keyword-only"
+    );
+    assert_eq!(
+        kw(
+            "SELECT JSON_VALUE(payload, '$.amount' RETURNING NUMBER DEFAULT 0 |) FROM emp",
+            Oracle,
+        ),
+        vec!["ON".to_string()],
+        "JSON_VALUE completed numeric DEFAULT handler should continue with ON"
+    );
+    assert_eq!(
+        kw(
+            "SELECT JSON_VALUE(payload, '$.amount' RETURNING NUMBER DEFAULT fallback_amt |) FROM emp",
+            Oracle,
+        ),
+        vec!["ON".to_string()],
+        "JSON_VALUE completed identifier DEFAULT handler should continue with ON"
+    );
+
+    assert_eq!(
+        kw("SELECT JSON_QUERY(payload, '$.items' RETURNING CLOB |) FROM emp", Oracle),
+        vec![
+            "FORMAT".to_string(),
+            "WITH".to_string(),
+            "WITHOUT".to_string(),
+            "NULL".to_string(),
+            "ERROR".to_string(),
+            "EMPTY".to_string()
+        ],
+        "JSON_QUERY RETURNING type tail should offer format/wrapper/handler heads"
+    );
+    assert_eq!(
+        kw("SELECT JSON_QUERY(payload, '$.items' RETURNING CLOB FORMAT |) FROM emp", Oracle),
+        vec!["JSON".to_string()],
+        "JSON_QUERY FORMAT should continue with JSON"
+    );
+    assert_eq!(
+        kw("SELECT JSON_QUERY(payload, '$.items' RETURNING CLOB FORMAT JSON WITH |) FROM emp", Oracle),
+        vec!["WRAPPER".to_string()],
+        "JSON_QUERY WITH should continue with WRAPPER"
+    );
+    assert_eq!(
+        kw("SELECT JSON_QUERY(payload, '$.items' RETURNING CLOB FORMAT JSON WITH WRAPPER |) FROM emp", Oracle),
+        vec!["PRETTY".to_string(), "ASCII".to_string()],
+        "JSON_QUERY WRAPPER should offer formatting styles"
+    );
+    assert_eq!(
+        kw("SELECT JSON_QUERY(payload, '$.items' RETURNING CLOB FORMAT JSON |) FROM emp", Oracle),
+        vec![
+            "WITH".to_string(),
+            "WITHOUT".to_string(),
+            "NULL".to_string(),
+            "ERROR".to_string(),
+            "EMPTY".to_string()
+        ],
+        "JSON_QUERY FORMAT JSON tail should not re-offer FORMAT"
+    );
+    assert_eq!(
+        kw("SELECT JSON_QUERY(payload, '$.items' RETURNING CLOB FORMAT JSON WITH WRAPPER PRETTY |) FROM emp", Oracle),
+        vec!["NULL".to_string(), "ERROR".to_string(), "EMPTY".to_string()],
+        "JSON_QUERY completed wrapper tail should offer only handler heads"
+    );
+    assert_eq!(
+        kw("SELECT JSON_QUERY(payload, '$.items' RETURNING CLOB EMPTY |) FROM emp", Oracle),
+        vec!["ON".to_string(), "ARRAY".to_string(), "OBJECT".to_string()],
+        "JSON_QUERY EMPTY handler should offer ON/ARRAY/OBJECT"
+    );
+    assert_eq!(
+        kw("SELECT JSON_QUERY(payload, '$.items' RETURNING CLOB EMPTY ARRAY |) FROM emp", Oracle),
+        vec!["ON".to_string()],
+        "JSON_QUERY EMPTY ARRAY should continue with ON"
+    );
+    assert_eq!(
+        kw("SELECT JSON_QUERY(payload, '$.items' RETURNING CLOB EMPTY OBJECT |) FROM emp", Oracle),
+        vec!["ON".to_string()],
+        "JSON_QUERY EMPTY OBJECT should continue with ON"
+    );
+    assert!(
+        !kw("SELECT JSON_QUERY(payload, '$.items' RETURNING CLOB WITH |) FROM emp", MySQL)
+            .iter()
+            .any(|value| value == "WRAPPER"),
+        "Oracle JSON_QUERY wrapper tail leaked into MySQL"
+    );
+
+    assert_eq!(
+        kw("SELECT JSON_EXISTS(payload, '$' |) FROM emp", Oracle),
+        vec!["TRUE".to_string(), "FALSE".to_string(), "ERROR".to_string()],
+        "JSON_EXISTS path tail should offer exists-handler heads"
+    );
+    assert_eq!(
+        kw("SELECT JSON_EXISTS(payload, '$' TRUE |) FROM emp", Oracle),
+        vec!["ON".to_string()],
+        "JSON_EXISTS TRUE handler should continue with ON"
+    );
+    assert!(
+        kw("SELECT JSON_EXISTS(payload, '$' |) FROM emp", MySQL).is_empty(),
+        "Oracle JSON_EXISTS option tail leaked into MySQL"
+    );
+    assert!(
+        kw("SELECT JSON_QUERY(payload, '$' NULL ON |) FROM emp", MySQL).is_empty(),
+        "Oracle JSON_QUERY ON target leaked into MySQL"
+    );
+}
+
+#[test]
+fn json_function_option_keyword_slots_suppress_catalog() {
+    use crate::db::DatabaseType::Oracle;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for (sql, expected) in [
+        (
+            "SELECT JSON_VALUE(payload, '$.amount' RETURNING NUMBER |) FROM emp",
+            "NULL",
+        ),
+        (
+            "SELECT JSON_VALUE(payload, '$.amount' RETURNING NUMBER NULL |) FROM emp",
+            "ON",
+        ),
+        (
+            "SELECT JSON_VALUE(payload, '$.amount' RETURNING NUMBER DEFAULT 0 |) FROM emp",
+            "ON",
+        ),
+        (
+            "SELECT JSON_VALUE(payload, '$.amount' RETURNING NUMBER DEFAULT fallback_amt |) FROM emp",
+            "ON",
+        ),
+        (
+            "SELECT JSON_QUERY(payload, '$.items' RETURNING CLOB FORMAT |) FROM emp",
+            "JSON",
+        ),
+        (
+            "SELECT JSON_QUERY(payload, '$.items' RETURNING CLOB FORMAT JSON WITH |) FROM emp",
+            "WRAPPER",
+        ),
+        (
+            "SELECT JSON_QUERY(payload, '$.items' RETURNING CLOB FORMAT JSON WITH WRAPPER PRETTY |) FROM emp",
+            "NULL",
+        ),
+        (
+            "SELECT JSON_QUERY(payload, '$.items' RETURNING CLOB EMPTY |) FROM emp",
+            "ARRAY",
+        ),
+        (
+            "SELECT JSON_QUERY(payload, '$.items' RETURNING CLOB EMPTY ARRAY |) FROM emp",
+            "ON",
+        ),
+        (
+            "SELECT JSON_QUERY(payload, '$.items' RETURNING CLOB EMPTY OBJECT |) FROM emp",
+            "ON",
+        ),
+        ("SELECT JSON_EXISTS(payload, '$' |) FROM emp", "TRUE"),
+        ("SELECT JSON_EXISTS(payload, '$' TRUE |) FROM emp", "ON"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert_eq!(
+            kind, None,
+            "JSON function option keyword slot should not resolve object kind at `{sql}`; keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            contains(&final_suggestions, expected),
+            "{expected} missing from JSON function option slot at `{sql}`: {final_suggestions:?}"
+        );
+        for leaked in ["EMP", "DEPT", "EMP_V", "EMPNO", "ENAME", "RUN_JOB", "CALC_TOTAL"] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into JSON function option slot at `{sql}`: {final_suggestions:?}"
+            );
+        }
+    }
+
+    let completed = "SELECT JSON_VALUE(payload, '$.amount' RETURNING NUMBER NULL ON ERROR |) FROM emp";
+    let (kind, keywords, final_suggestions) = audit_final_suggestions_for(completed, Oracle);
+    assert_eq!(
+        kind, None,
+        "completed JSON function handler tail should not resolve object kind; keywords={keywords:?} final={final_suggestions:?}"
+    );
+    for leaked in ["EMP", "DEPT", "EMP_V", "EMPNO", "ENAME", "RUN_JOB", "CALC_TOTAL"] {
+        assert!(
+            !contains(&final_suggestions, leaked),
+            "{leaked} leaked after completed JSON function handler: {final_suggestions:?}"
+        );
+    }
+
+    let completed_exists = "SELECT JSON_EXISTS(payload, '$' TRUE ON ERROR |) FROM emp";
+    let (kind, keywords, final_suggestions) =
+        audit_final_suggestions_for(completed_exists, Oracle);
+    assert_eq!(
+        kind, None,
+        "completed JSON_EXISTS handler tail should not resolve object kind; keywords={keywords:?} final={final_suggestions:?}"
+    );
+    for leaked in ["EMP", "DEPT", "EMP_V", "EMPNO", "ENAME", "RUN_JOB", "CALC_TOTAL"] {
+        assert!(
+            !contains(&final_suggestions, leaked),
+            "{leaked} leaked after completed JSON_EXISTS handler: {final_suggestions:?}"
+        );
+    }
+}
+
+#[test]
+fn xmlquery_option_keyword_slots_suppress_catalog_without_hiding_value_slots() {
+    use crate::db::DatabaseType::Oracle;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for (sql, expected) in [
+        ("SELECT XMLQUERY('/root' |) FROM emp", "PASSING"),
+        (
+            "SELECT XMLQUERY('/root' PASSING payload |) FROM emp",
+            "RETURNING",
+        ),
+        ("SELECT XMLQUERY('/root' PASSING BY |) FROM emp", "VALUE"),
+        ("SELECT XMLQUERY('/root' RETURNING |) FROM emp", "CONTENT"),
+        (
+            "SELECT XMLQUERY('/root' RETURNING CONTENT |) FROM emp",
+            "NULL",
+        ),
+        (
+            "SELECT XMLQUERY('/root' RETURNING CONTENT NULL |) FROM emp",
+            "ON",
+        ),
+        (
+            "SELECT XMLQUERY('/root' RETURNING CONTENT NULL ON |) FROM emp",
+            "EMPTY",
+        ),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert_eq!(
+            kind, None,
+            "XMLQUERY option keyword slot should not resolve object kind at `{sql}`; keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            contains(&final_suggestions, expected),
+            "{expected} missing from XMLQUERY option slot at `{sql}`: {final_suggestions:?}"
+        );
+        for leaked in ["EMP", "DEPT", "EMP_V", "EMPNO", "ENAME", "RUN_JOB", "CALC_TOTAL"] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into XMLQUERY option slot at `{sql}`: {final_suggestions:?}"
+            );
+        }
+    }
+
+    for sql in [
+        "SELECT XMLQUERY('/root' PASSING |) FROM emp",
+        "SELECT XMLQUERY('/root' PASSING BY VALUE |) FROM emp",
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert_eq!(
+            kind, None,
+            "XMLQUERY value slot should stay expression-like at `{sql}`; keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            contains(&final_suggestions, "EMPNO") && contains(&final_suggestions, "ENAME"),
+            "XMLQUERY value slot lost source columns at `{sql}`: {final_suggestions:?}"
+        );
+        for leaked in ["EMP", "DEPT", "EMP_V", "RUN_JOB", "CALC_TOTAL"] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into XMLQUERY value slot at `{sql}`: {final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn json_generation_option_tails_are_oracle_scoped_and_keyword_only() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let kw = |sql: &str, db| {
+        let cursor = sql.find('|').expect("cursor marker");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(db),
+        )
+    };
+
+    assert_eq!(
+        kw("SELECT JSON_OBJECT(KEY k VALUE v ABSENT |) FROM emp", Oracle),
+        vec!["ON".to_string()],
+        "JSON_OBJECT ABSENT should continue with ON"
+    );
+    assert_eq!(
+        kw("SELECT JSON_ARRAY(v NULL |) FROM emp", Oracle),
+        vec!["ON".to_string()],
+        "JSON_ARRAY NULL option should continue with ON"
+    );
+    assert_eq!(
+        kw("SELECT JSON_ARRAYAGG(v ABSENT |) FROM emp", Oracle),
+        vec!["ON".to_string()],
+        "JSON_ARRAYAGG ABSENT should continue with ON"
+    );
+    assert_eq!(
+        kw("SELECT JSON_OBJECTAGG(KEY k VALUE v NULL |) FROM emp", Oracle),
+        vec!["ON".to_string()],
+        "JSON_OBJECTAGG NULL option should continue with ON"
+    );
+    assert_eq!(
+        kw("SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON NULL |) FROM emp", Oracle),
+        vec![
+            "WITH".to_string(),
+            "WITHOUT".to_string(),
+            "STRICT".to_string(),
+            "RETURNING".to_string()
+        ],
+        "JSON generation ON NULL tail should offer generation options"
+    );
+    assert_eq!(
+        kw("SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON NULL WITH |) FROM emp", Oracle),
+        vec!["UNIQUE".to_string()],
+        "JSON generation WITH should continue with UNIQUE"
+    );
+    assert_eq!(
+        kw("SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON NULL WITHOUT |) FROM emp", Oracle),
+        vec!["UNIQUE".to_string()],
+        "JSON generation WITHOUT should continue with UNIQUE"
+    );
+    assert_eq!(
+        kw("SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON NULL WITH UNIQUE |) FROM emp", Oracle),
+        vec!["KEYS".to_string()],
+        "JSON generation UNIQUE should continue with KEYS"
+    );
+    assert_eq!(
+        kw("SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON NULL WITHOUT UNIQUE |) FROM emp", Oracle),
+        vec!["KEYS".to_string()],
+        "JSON generation WITHOUT UNIQUE should continue with KEYS"
+    );
+    assert_eq!(
+        kw("SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON NULL WITH UNIQUE KEYS |) FROM emp", Oracle),
+        vec!["STRICT".to_string(), "RETURNING".to_string()],
+        "JSON generation UNIQUE KEYS tail should offer remaining options"
+    );
+    assert_eq!(
+        kw("SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON NULL WITHOUT UNIQUE KEYS |) FROM emp", Oracle),
+        vec!["STRICT".to_string(), "RETURNING".to_string()],
+        "JSON generation WITHOUT UNIQUE KEYS tail should offer remaining options"
+    );
+    assert_eq!(
+        kw("SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON NULL WITH UNIQUE KEYS STRICT |) FROM emp", Oracle),
+        vec!["RETURNING".to_string()],
+        "JSON generation STRICT should continue with RETURNING"
+    );
+    assert!(
+        kw("SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON |) FROM emp", MySQL).is_empty(),
+        "Oracle JSON generation ON target leaked into MySQL"
+    );
+    assert!(
+        kw("SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON NULL WITH UNIQUE KEYS STRICT RETURNING CLOB |) FROM emp", Oracle)
+            .is_empty(),
+        "completed JSON generation RETURNING type tail should not emit keywords"
+    );
+    assert!(
+        kw("SELECT JSON_OBJECT(KEY k VALUE v ABSENT |) FROM emp", MySQL).is_empty(),
+        "Oracle JSON generation ABSENT ON NULL option leaked into MySQL"
+    );
+}
+
+#[test]
+fn json_generation_option_keyword_slots_suppress_catalog() {
+    use crate::db::DatabaseType::Oracle;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for (sql, expected) in [
+        ("SELECT JSON_OBJECT(KEY k VALUE v ABSENT |) FROM emp", "ON"),
+        ("SELECT JSON_ARRAYAGG(v ABSENT |) FROM emp", "ON"),
+        (
+            "SELECT JSON_OBJECTAGG(KEY k VALUE v NULL |) FROM emp",
+            "ON",
+        ),
+        (
+            "SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON NULL WITH |) FROM emp",
+            "UNIQUE",
+        ),
+        (
+            "SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON NULL WITHOUT |) FROM emp",
+            "UNIQUE",
+        ),
+        (
+            "SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON NULL WITH UNIQUE |) FROM emp",
+            "KEYS",
+        ),
+        (
+            "SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON NULL WITHOUT UNIQUE |) FROM emp",
+            "KEYS",
+        ),
+        (
+            "SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON NULL WITHOUT UNIQUE KEYS |) FROM emp",
+            "STRICT",
+        ),
+        (
+            "SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON NULL WITH UNIQUE KEYS STRICT |) FROM emp",
+            "RETURNING",
+        ),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert_eq!(
+            kind, None,
+            "JSON generation option keyword slot should not resolve object kind at `{sql}`; keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            contains(&final_suggestions, expected),
+            "{expected} missing from JSON generation option slot at `{sql}`: {final_suggestions:?}"
+        );
+        for leaked in ["EMP", "DEPT", "EMP_V", "EMPNO", "ENAME", "RUN_JOB", "CALC_TOTAL"] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into JSON generation option slot at `{sql}`: {final_suggestions:?}"
+            );
+        }
+    }
+
+    for completed in [
+        "SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON NULL WITH UNIQUE KEYS STRICT RETURNING CLOB |) FROM emp",
+        "SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON NULL WITHOUT UNIQUE KEYS STRICT RETURNING CLOB |) FROM emp",
+        "SELECT JSON_ARRAY(v RETURNING CLOB |) FROM emp",
+        "SELECT JSON_ARRAYAGG(v ABSENT ON NULL RETURNING CLOB |) FROM emp",
+        "SELECT JSON_OBJECTAGG(KEY k VALUE v NULL ON NULL RETURNING CLOB |) FROM emp",
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(completed, Oracle);
+        assert_eq!(
+            kind, None,
+            "completed JSON generation RETURNING tail should not resolve object kind at `{completed}`; keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in ["EMP", "DEPT", "EMP_V", "EMPNO", "ENAME", "RUN_JOB", "CALC_TOTAL"] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked after completed JSON generation RETURNING tail at `{completed}`: {final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn json_table_column_tail_keyword_slots_suppress_catalog() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for (db, sql, expected) in [
+        (
+            Oracle,
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id FOR |))",
+            "ORDINALITY",
+        ),
+        (
+            Oracle,
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id EXISTS |))",
+            "PATH",
+        ),
+        (
+            MySQL,
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id FOR |))",
+            "ORDINALITY",
+        ),
+        (
+            MySQL,
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id EXISTS |))",
+            "PATH",
+        ),
+        (
+            Oracle,
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (NESTED |))",
+            "PATH",
+        ),
+        (
+            MySQL,
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (NESTED PATH '$.items[*]' |))",
+            "COLUMNS",
+        ),
+        (
+            Oracle,
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id NUMBER PATH '$.id' |))",
+            "NULL",
+        ),
+        (
+            MySQL,
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id NUMBER PATH '$.id' ERROR |))",
+            "ON",
+        ),
+        (
+            Oracle,
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id EXISTS PATH '$.id' TRUE |))",
+            "ON",
+        ),
+        (
+            Oracle,
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id NUMBER PATH '$.id' NULL ON EMPTY |))",
+            "ERROR",
+        ),
+        (
+            MySQL,
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id NUMBER PATH '$.id' NULL ON EMPTY ERROR |))",
+            "ON",
+        ),
+        (
+            Oracle,
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id NUMBER PATH '$.id' DEFAULT 0 |))",
+            "ON",
+        ),
+        (
+            MySQL,
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id NUMBER PATH '$.id' DEFAULT fallback_amt |))",
+            "ON",
+        ),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert_eq!(
+            kind, None,
+            "JSON_TABLE column tail keyword slot should not resolve object kind at `{sql}`; keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            contains(&final_suggestions, expected),
+            "{expected} missing from JSON_TABLE column tail at `{sql}`: {final_suggestions:?}"
+        );
+        for leaked in ["EMP", "DEPT", "EMP_V", "EMPNO", "ENAME", "RUN_JOB", "CALC_TOTAL"] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into JSON_TABLE column tail at `{sql}`: {final_suggestions:?}"
+            );
+        }
+    }
+
+    for (db, sql) in [
+        (
+            Oracle,
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id NUMBER PATH '$.id' NULL ON EMPTY ERROR ON ERROR |))",
+        ),
+        (
+            MySQL,
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id EXISTS PATH '$.id' TRUE ON ERROR |))",
+        ),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert_eq!(
+            kind, None,
+            "completed JSON_TABLE handler tail should not resolve object kind at `{sql}`; keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in ["EMP", "DEPT", "EMP_V", "EMPNO", "ENAME", "RUN_JOB", "CALC_TOTAL"] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked after completed JSON_TABLE handler at `{sql}`: {final_suggestions:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -33259,6 +34325,21 @@ fn within_group_keyword_slots_suppress_identifiers_and_offer_fixed_keywords() {
     assert!(kw("SELECT listagg(ename) WITHIN GROUP | FROM emp", "").is_empty());
     assert!(suppresses("SELECT listagg(ename) WITHIN | FROM emp"));
     assert!(suppresses("SELECT listagg(ename) WITHIN GROUP | FROM emp"));
+    let (kind, keywords, final_suggestions) = audit_final_suggestions_for(
+        "SELECT listagg(ename) WITHIN | FROM emp",
+        crate::db::DatabaseType::Oracle,
+    );
+    assert_eq!(
+        kind, None,
+        "WITHIN GROUP keyword slot should not resolve object kind; keywords={keywords:?} final={final_suggestions:?}"
+    );
+    assert!(final_suggestions.iter().any(|value| value == "GROUP"));
+    for leaked in ["EMP", "DEPT", "EMP_V", "EMPNO", "ENAME", "RUN_JOB", "CALC_TOTAL"] {
+        assert!(
+            !final_suggestions.iter().any(|value| value == leaked),
+            "{leaked} leaked into WITHIN GROUP keyword slot: {final_suggestions:?}"
+        );
+    }
 
     // Lookalikes outside ordered-set aggregate syntax keep normal completion.
     let lookalike = kw("SELECT (ename) WITHIN | FROM emp", "");
@@ -34864,6 +35945,31 @@ fn analytic_null_treatment_keywords_are_scoped_to_analytic_call_tails() {
     assert!(suppresses("SELECT last_value(empno) IGNORE | FROM emp"));
     assert!(suppresses("SELECT nth_value(empno, 1) FROM fir| FROM emp"));
     assert!(suppresses("SELECT nth_value(empno, 1) FROM LAST IGNORE NULLS | FROM emp"));
+    for (sql, expected) in [
+        ("SELECT last_value(empno) RESPECT | FROM emp", "NULLS"),
+        ("SELECT nth_value(empno, 1) FROM LAST IGNORE | FROM emp", "NULLS"),
+        (
+            "SELECT nth_value(empno, 1) FROM LAST IGNORE NULLS | FROM emp",
+            "OVER",
+        ),
+    ] {
+        let (kind, keywords, final_suggestions) =
+            audit_final_suggestions_for(sql, crate::db::DatabaseType::Oracle);
+        assert_eq!(
+            kind, None,
+            "analytic null-treatment keyword slot should not resolve object kind at `{sql}`; keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            final_suggestions.iter().any(|value| value == expected),
+            "{expected} missing from analytic null-treatment keyword slot at `{sql}`: {final_suggestions:?}"
+        );
+        for leaked in ["EMP", "DEPT", "EMP_V", "EMPNO", "ENAME", "RUN_JOB", "CALC_TOTAL"] {
+            assert!(
+                !final_suggestions.iter().any(|value| value == leaked),
+                "{leaked} leaked into analytic null-treatment keyword slot at `{sql}`: {final_suggestions:?}"
+            );
+        }
+    }
     assert!(!suppresses("SELECT ignore | FROM emp"));
 }
 
@@ -34901,6 +36007,30 @@ fn keep_dense_rank_keyword_slots_suppress_columns_and_offer_fixed_keywords() {
     );
     assert!(suppresses("SELECT max(empno) KEEP (DENSE_RANK |) FROM emp"));
     assert!(suppresses("SELECT max(empno) KEEP (DENSE_RANK FIRST |) FROM emp"));
+    for (sql, expected) in [
+        ("SELECT max(empno) KEEP (DENSE_RANK |) FROM emp", "FIRST"),
+        (
+            "SELECT max(empno) KEEP (DENSE_RANK FIRST |) FROM emp",
+            "ORDER",
+        ),
+    ] {
+        let (kind, keywords, final_suggestions) =
+            audit_final_suggestions_for(sql, crate::db::DatabaseType::Oracle);
+        assert_eq!(
+            kind, None,
+            "KEEP DENSE_RANK keyword slot should not resolve object kind at `{sql}`; keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            final_suggestions.iter().any(|value| value == expected),
+            "{expected} missing from KEEP DENSE_RANK keyword slot at `{sql}`: {final_suggestions:?}"
+        );
+        for leaked in ["EMP", "DEPT", "EMP_V", "EMPNO", "ENAME", "RUN_JOB", "CALC_TOTAL"] {
+            assert!(
+                !final_suggestions.iter().any(|value| value == leaked),
+                "{leaked} leaked into KEEP DENSE_RANK keyword slot at `{sql}`: {final_suggestions:?}"
+            );
+        }
+    }
 
     // Outside KEEP's dense-rank aggregate syntax these words keep their normal
     // meaning and do not become keyword-only slots.
@@ -37537,6 +38667,16 @@ fn registered_keyword_slot_cases() -> Vec<RegisteredKeywordSlotCase> {
         },
         RegisteredKeywordSlotCase {
             db_type: Oracle,
+            sql: "SELECT * FROM emp CROSS |",
+            keywords: &["JOIN", "APPLY"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "SELECT * FROM emp CROSS |",
+            keywords: &["JOIN"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
             sql: "SELECT * FROM emp LEFT OUTER |",
             keywords: &["JOIN"],
         },
@@ -37596,6 +38736,31 @@ fn registered_keyword_slot_cases() -> Vec<RegisteredKeywordSlotCase> {
         },
         RegisteredKeywordSlotCase {
             db_type: Oracle,
+            sql: "SELECT * FROM emp WHERE empno MEMBER |",
+            keywords: &["OF"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp WHERE empno NOT MEMBER |",
+            keywords: &["OF"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "SELECT * FROM emp WHERE ename SOUNDS |",
+            keywords: &["LIKE"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp WHERE hiredate AT |",
+            keywords: &["LOCAL", "TIME"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp WHERE hiredate AT TIME |",
+            keywords: &["ZONE"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
             sql: "SELECT * FROM emp WHERE empno = 1 |",
             keywords: &[
                 "AND",
@@ -37637,6 +38802,136 @@ fn registered_keyword_slot_cases() -> Vec<RegisteredKeywordSlotCase> {
         },
         RegisteredKeywordSlotCase {
             db_type: Oracle,
+            sql: "SELECT * FROM emp AS |",
+            keywords: &["OF"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp AS OF |",
+            keywords: &["SCN", "TIMESTAMP"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp VERSIONS |",
+            keywords: &["BETWEEN"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp VERSIONS BETWEEN |",
+            keywords: &["SCN", "TIMESTAMP"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp VERSIONS BETWEEN SCN 1 |",
+            keywords: &["AND"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp SAMPLE |",
+            keywords: &["BLOCK"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp PIVOT (SUM(sal) |) p",
+            keywords: &["FOR"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp PIVOT (SUM(sal) FOR deptno |) p",
+            keywords: &["IN"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp UNPIVOT |",
+            keywords: &["INCLUDE", "EXCLUDE"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp UNPIVOT INCLUDE |",
+            keywords: &["NULLS"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp MATCH_RECOGNIZE (PARTITION |) mr",
+            keywords: &["BY"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp MATCH_RECOGNIZE (ORDER |) mr",
+            keywords: &["BY"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp MATCH_RECOGNIZE (AFTER MATCH |) mr",
+            keywords: &["SKIP"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp MATCH_RECOGNIZE (AFTER MATCH SKIP |) mr",
+            keywords: &["PAST LAST ROW", "TO NEXT ROW", "TO FIRST", "TO LAST"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp MATCH_RECOGNIZE (PATTERN (A) |) mr",
+            keywords: &["DEFINE"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp MODEL |",
+            keywords: &["PARTITION BY", "DIMENSION BY", "MEASURES", "RULES"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp MODEL PARTITION |",
+            keywords: &["BY"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp MODEL DIMENSION |",
+            keywords: &["BY"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp MODEL DIMENSION BY (deptno) MEASURES (sal) |",
+            keywords: &["RULES"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp MODEL DIMENSION BY (deptno) MEASURES (sal) RULES |",
+            keywords: &["UPDATE", "UPSERT", "UPSERT ALL"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "SELECT * FROM emp USE |",
+            keywords: &["INDEX", "KEY"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "SELECT * FROM emp USE INDEX |",
+            keywords: &["FOR"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "SELECT * FROM emp USE INDEX FOR |",
+            keywords: &["JOIN", "ORDER BY", "GROUP BY"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "SELECT * FROM emp USE INDEX FOR ORDER |",
+            keywords: &["BY"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "SELECT * FROM emp USE INDEX FOR GROUP |",
+            keywords: &["BY"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM emp FOR |",
+            keywords: &["UPDATE"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
             sql: "SELECT * FROM emp FOR |",
             keywords: &["UPDATE", "SHARE"],
         },
@@ -37905,8 +39200,68 @@ fn registered_keyword_slot_cases() -> Vec<RegisteredKeywordSlotCase> {
         },
         RegisteredKeywordSlotCase {
             db_type: Oracle,
+            sql: "SELECT EXTRACT(YEAR |) FROM emp",
+            keywords: &["FROM"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
             sql: "SELECT INTERVAL '1' | FROM emp",
             keywords: &["YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT INTERVAL '1' DAY | FROM emp",
+            keywords: &["TO"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT INTERVAL '1' DAY TO | FROM emp",
+            keywords: &["HOUR", "MINUTE", "SECOND"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT INTERVAL '1-2' YEAR TO | FROM emp",
+            keywords: &["MONTH"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT POSITION('a' |",
+            keywords: &["IN"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT TRIM(name |",
+            keywords: &["FROM"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT TRIM(LEADING 'x' |",
+            keywords: &["FROM"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "SELECT SUBSTRING(name |",
+            keywords: &["FROM"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "SELECT SUBSTRING(name FROM 1 |",
+            keywords: &["FOR"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT OVERLAY(name |",
+            keywords: &["PLACING"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT OVERLAY(name PLACING repl |",
+            keywords: &["FROM"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT OVERLAY(name PLACING repl FROM 1 |",
+            keywords: &["FOR"],
         },
         RegisteredKeywordSlotCase {
             db_type: Oracle,
@@ -37927,6 +39282,41 @@ fn registered_keyword_slot_cases() -> Vec<RegisteredKeywordSlotCase> {
             db_type: Oracle,
             sql: "SELECT FIRST_VALUE(sal) | FROM emp",
             keywords: &["OVER", "RESPECT", "IGNORE"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT LISTAGG(ename, ',') WITHIN | FROM emp",
+            keywords: &["GROUP"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT MAX(sal) KEEP (DENSE_RANK |) FROM emp",
+            keywords: &["FIRST", "LAST"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT MAX(sal) KEEP (DENSE_RANK FIRST |) FROM emp",
+            keywords: &["ORDER"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT LAST_VALUE(sal) RESPECT | FROM emp",
+            keywords: &["NULLS"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT NTH_VALUE(sal, 1) FROM | FROM emp",
+            keywords: &["FIRST", "LAST"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT NTH_VALUE(sal, 1) FROM LAST IGNORE | FROM emp",
+            keywords: &["NULLS"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT NTH_VALUE(sal, 1) FROM LAST IGNORE NULLS | FROM emp",
+            keywords: &["OVER"],
         },
         RegisteredKeywordSlotCase {
             db_type: Oracle,
@@ -37983,8 +39373,38 @@ fn registered_keyword_slot_cases() -> Vec<RegisteredKeywordSlotCase> {
         },
         RegisteredKeywordSlotCase {
             db_type: Oracle,
+            sql: "EXPLAIN |",
+            keywords: &["PLAN"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "EXPLAIN PLAN |",
+            keywords: &["SET", "INTO", "FOR"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "EXPLAIN PLAN FOR |",
+            keywords: &["SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "WITH"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
             sql: "COMMIT |",
             keywords: &["WORK", "COMMENT", "WRITE", "FORCE"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "COMMIT WRITE |",
+            keywords: &["WAIT", "NOWAIT", "IMMEDIATE", "BATCH"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "COMMIT WRITE WAIT |",
+            keywords: &["IMMEDIATE", "BATCH"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "COMMIT WRITE IMMEDIATE |",
+            keywords: &["WAIT", "NOWAIT"],
         },
         RegisteredKeywordSlotCase {
             db_type: MySQL,
@@ -37998,8 +39418,78 @@ fn registered_keyword_slot_cases() -> Vec<RegisteredKeywordSlotCase> {
         },
         RegisteredKeywordSlotCase {
             db_type: Oracle,
+            sql: "SET TRANSACTION READ |",
+            keywords: &["ONLY", "WRITE"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SET TRANSACTION ISOLATION |",
+            keywords: &["LEVEL"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SET TRANSACTION ISOLATION LEVEL |",
+            keywords: &["SERIALIZABLE", "READ COMMITTED"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "LOCK |",
+            keywords: &["TABLE"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "LOCK TABLE emp |",
+            keywords: &["IN"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
             sql: "LOCK TABLE emp IN |",
             keywords: &["ROW", "SHARE", "EXCLUSIVE"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "LOCK TABLE emp IN ROW |",
+            keywords: &["SHARE", "EXCLUSIVE"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "LOCK TABLE emp IN SHARE |",
+            keywords: &["UPDATE", "ROW", "MODE"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "LOCK TABLE emp IN SHARE ROW EXCLUSIVE |",
+            keywords: &["MODE"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "LOCK TABLE emp IN SHARE MODE |",
+            keywords: &["NOWAIT", "WAIT"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "GRANT SELECT ON emp |",
+            keywords: &["TO"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "GRANT SELECT ON emp TO scott |",
+            keywords: &["WITH GRANT OPTION"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "GRANT SELECT ON emp TO scott WITH |",
+            keywords: &["GRANT OPTION"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "GRANT SELECT ON emp TO scott WITH GRANT |",
+            keywords: &["OPTION"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "REVOKE SELECT ON emp |",
+            keywords: &["FROM"],
         },
         RegisteredKeywordSlotCase {
             db_type: Oracle,
@@ -38018,8 +39508,223 @@ fn registered_keyword_slot_cases() -> Vec<RegisteredKeywordSlotCase> {
         },
         RegisteredKeywordSlotCase {
             db_type: Oracle,
+            sql: "SELECT * FROM XMLTABLE('/r' COLUMNS id FOR |) xt",
+            keywords: &["ORDINALITY"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM XMLTABLE('/r' COLUMNS id NUMBER |) xt",
+            keywords: &["PATH"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT XMLQUERY('/root' |) FROM emp",
+            keywords: &["PASSING", "RETURNING"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT XMLQUERY('/root' PASSING payload |) FROM emp",
+            keywords: &["AS", "RETURNING"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT XMLQUERY('/root' PASSING BY |) FROM emp",
+            keywords: &["VALUE"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT XMLQUERY('/root' RETURNING |) FROM emp",
+            keywords: &["CONTENT"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT XMLQUERY('/root' RETURNING CONTENT |) FROM emp",
+            keywords: &["NULL"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT XMLQUERY('/root' RETURNING CONTENT NULL |) FROM emp",
+            keywords: &["ON"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT XMLQUERY('/root' RETURNING CONTENT NULL ON |) FROM emp",
+            keywords: &["EMPTY"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT JSON_VALUE(payload, '$.amount' RETURNING NUMBER |) FROM emp",
+            keywords: &["NULL", "ERROR", "DEFAULT"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT JSON_VALUE(payload, '$.amount' RETURNING NUMBER NULL |) FROM emp",
+            keywords: &["ON"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT JSON_VALUE(payload, '$.amount' RETURNING NUMBER DEFAULT 0 |) FROM emp",
+            keywords: &["ON"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT JSON_QUERY(payload, '$.items' RETURNING CLOB |) FROM emp",
+            keywords: &["FORMAT", "WITH", "WITHOUT", "NULL", "ERROR", "EMPTY"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT JSON_QUERY(payload, '$.items' RETURNING CLOB FORMAT |) FROM emp",
+            keywords: &["JSON"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT JSON_QUERY(payload, '$.items' RETURNING CLOB FORMAT JSON WITH |) FROM emp",
+            keywords: &["WRAPPER"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT JSON_QUERY(payload, '$.items' RETURNING CLOB FORMAT JSON |) FROM emp",
+            keywords: &["WITH", "WITHOUT", "NULL", "ERROR", "EMPTY"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT JSON_QUERY(payload, '$.items' RETURNING CLOB FORMAT JSON WITH WRAPPER PRETTY |) FROM emp",
+            keywords: &["NULL", "ERROR", "EMPTY"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT JSON_QUERY(payload, '$.items' RETURNING CLOB EMPTY |) FROM emp",
+            keywords: &["ON", "ARRAY", "OBJECT"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT JSON_QUERY(payload, '$.items' RETURNING CLOB EMPTY ARRAY |) FROM emp",
+            keywords: &["ON"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT JSON_QUERY(payload, '$.items' RETURNING CLOB EMPTY OBJECT |) FROM emp",
+            keywords: &["ON"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT JSON_EXISTS(payload, '$' |) FROM emp",
+            keywords: &["TRUE", "FALSE", "ERROR"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT JSON_EXISTS(payload, '$' TRUE |) FROM emp",
+            keywords: &["ON"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT JSON_OBJECT(KEY k VALUE v ABSENT |) FROM emp",
+            keywords: &["ON"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT JSON_ARRAYAGG(v ABSENT |) FROM emp",
+            keywords: &["ON"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT JSON_OBJECTAGG(KEY k VALUE v NULL |) FROM emp",
+            keywords: &["ON"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON NULL |) FROM emp",
+            keywords: &["WITH", "WITHOUT", "STRICT", "RETURNING"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON NULL WITH |) FROM emp",
+            keywords: &["UNIQUE"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON NULL WITH UNIQUE |) FROM emp",
+            keywords: &["KEYS"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON NULL WITHOUT |) FROM emp",
+            keywords: &["UNIQUE"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON NULL WITHOUT UNIQUE |) FROM emp",
+            keywords: &["KEYS"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON NULL WITHOUT UNIQUE KEYS |) FROM emp",
+            keywords: &["STRICT", "RETURNING"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
             sql: "SELECT * FROM JSON_TABLE(payload, '$' |) jt",
             keywords: &["COLUMNS", "ERROR ON ERROR", "NULL ON ERROR"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "SELECT * FROM JSON_TABLE(payload, '$' |) jt",
+            keywords: &["COLUMNS"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM JSON_TABLE(payload, '$' COLUMNS (id FOR |)) jt",
+            keywords: &["ORDINALITY"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "SELECT * FROM JSON_TABLE(payload, '$' COLUMNS (id EXISTS |)) jt",
+            keywords: &["PATH"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM JSON_TABLE(payload, '$' COLUMNS (id NUMBER |)) jt",
+            keywords: &["PATH"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "SELECT * FROM JSON_TABLE(payload, '$' COLUMNS (NESTED |)) jt",
+            keywords: &["PATH"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM JSON_TABLE(payload, '$' COLUMNS (NESTED PATH '$.items[*]' |)) jt",
+            keywords: &["COLUMNS"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM JSON_TABLE(payload, '$' COLUMNS (id NUMBER PATH '$.id' |)) jt",
+            keywords: &["NULL", "ERROR", "DEFAULT"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "SELECT * FROM JSON_TABLE(payload, '$' COLUMNS (id EXISTS PATH '$.id' |)) jt",
+            keywords: &["TRUE", "FALSE", "ERROR"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM JSON_TABLE(payload, '$' COLUMNS (id NUMBER PATH '$.id' NULL |)) jt",
+            keywords: &["ON"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM JSON_TABLE(payload, '$' COLUMNS (id NUMBER PATH '$.id' NULL ON EMPTY |)) jt",
+            keywords: &["NULL", "ERROR", "DEFAULT"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "SELECT * FROM JSON_TABLE(payload, '$' COLUMNS (id NUMBER PATH '$.id' NULL ON EMPTY ERROR |)) jt",
+            keywords: &["ON"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: Oracle,
+            sql: "SELECT * FROM JSON_TABLE(payload, '$' COLUMNS (id NUMBER PATH '$.id' DEFAULT 0 |)) jt",
+            keywords: &["ON"],
         },
         RegisteredKeywordSlotCase {
             db_type: MySQL,
@@ -38130,6 +39835,236 @@ fn registered_keyword_slot_cases() -> Vec<RegisteredKeywordSlotCase> {
             db_type: MySQL,
             sql: "INSERT INTO help VALUES (1) ON DUPLICATE |",
             keywords: &["KEY UPDATE"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "IMPORT |",
+            keywords: &["TABLE"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "IMPORT TABLE |",
+            keywords: &["FROM"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "INSTALL |",
+            keywords: &["COMPONENT", "PLUGIN"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "INSTALL PLUGIN audit_log |",
+            keywords: &["SONAME"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "UNINSTALL |",
+            keywords: &["COMPONENT", "PLUGIN"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "HANDLER emp |",
+            keywords: &["OPEN", "READ", "CLOSE"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "HANDLER emp OPEN |",
+            keywords: &["AS"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "HANDLER emp READ |",
+            keywords: &["FIRST"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "LOCK INSTANCE |",
+            keywords: &["FOR"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "LOCK INSTANCE FOR |",
+            keywords: &["BACKUP"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "UNLOCK |",
+            keywords: &["INSTANCE", "TABLES"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "RESET REPLICA |",
+            keywords: &["ALL", "FOR"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "RESET REPLICA ALL |",
+            keywords: &["FOR"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "PURGE BINARY LOGS |",
+            keywords: &["BEFORE", "TO"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "START GROUP_REPLICATION |",
+            keywords: &["PASSWORD", "USER"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "START REPLICA |",
+            keywords: &["FOR", "IO_THREAD", "UNTIL"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "STOP REPLICA |",
+            keywords: &["FOR", "IO_THREAD"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "CACHE INDEX emp |",
+            keywords: &["IN", "INDEX", "KEY", "PARTITION"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "CACHE INDEX emp INDEX ix |",
+            keywords: &["IN"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "LOAD INDEX INTO CACHE emp |",
+            keywords: &["IGNORE", "INDEX", "KEY", "PARTITION"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "LOAD INDEX INTO CACHE emp IGNORE |",
+            keywords: &["LEAVES"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "LOCK TABLES emp |",
+            keywords: &["AS", "READ", "WRITE"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "LOCK TABLES emp AS e |",
+            keywords: &["READ", "WRITE"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "LOCK TABLES emp READ |",
+            keywords: &["LOCAL"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "LOCK TABLES emp READ, dept |",
+            keywords: &["AS", "READ", "WRITE"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "LOAD DATA |",
+            keywords: &["CONCURRENT", "INFILE", "LOCAL", "LOW_PRIORITY"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "LOAD DATA LOW_PRIORITY |",
+            keywords: &["INFILE", "LOCAL"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "LOAD DATA INFILE data_csv INTO TABLE emp |",
+            keywords: &["CHARACTER", "COLUMNS", "FIELDS", "IGNORE", "LINES", "SET"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "LOAD XML INFILE data_xml INTO TABLE emp |",
+            keywords: &["CHARACTER", "IGNORE", "ROWS", "SET"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "LOAD DATA INFILE data_csv INTO TABLE emp CHARACTER |",
+            keywords: &["SET"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "LOAD DATA INFILE data_csv INTO TABLE emp FIELDS |",
+            keywords: &["ENCLOSED", "ESCAPED", "OPTIONALLY", "TERMINATED"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "LOAD DATA INFILE data_csv INTO TABLE emp FIELDS TERMINATED |",
+            keywords: &["BY"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "LOAD DATA INFILE data_csv INTO TABLE emp LINES |",
+            keywords: &["STARTING", "TERMINATED"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "LOAD DATA INFILE data_csv INTO TABLE emp IGNORE 1 |",
+            keywords: &["LINES"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "LOAD DATA INFILE data_csv INTO TABLE emp (empno) |",
+            keywords: &["SET"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "LOAD XML INFILE data_xml INTO TABLE emp (empno) |",
+            keywords: &["SET"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "SELECT * FROM emp INTO OUTFILE data_txt |",
+            keywords: &["CHARACTER", "FIELDS", "LINES"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "SELECT empno INTO OUTFILE data_txt |",
+            keywords: &["CHARACTER", "FIELDS", "FROM", "LINES"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "SELECT empno INTO DUMPFILE data_bin |",
+            keywords: &["FROM"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "SELECT * FROM emp INTO OUTFILE data_txt CHARACTER |",
+            keywords: &["SET"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "SELECT * FROM emp INTO OUTFILE data_txt FIELDS |",
+            keywords: &["ENCLOSED", "ESCAPED", "OPTIONALLY", "TERMINATED"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "SELECT * FROM emp INTO OUTFILE data_txt FIELDS TERMINATED |",
+            keywords: &["BY"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "SELECT * FROM emp INTO OUTFILE data_txt LINES |",
+            keywords: &["STARTING", "TERMINATED"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "SELECT empno INTO OUTFILE data_txt CHARACTER SET utf8mb4 |",
+            keywords: &["FIELDS", "FROM", "LINES"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "SELECT empno INTO OUTFILE data_txt FIELDS TERMINATED BY comma |",
+            keywords: &["ENCLOSED", "ESCAPED", "FROM", "LINES", "OPTIONALLY", "TERMINATED"],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "SELECT empno INTO OUTFILE data_txt LINES TERMINATED BY newline |",
+            keywords: &["FROM"],
         },
     ]
 }
@@ -38756,8 +40691,9 @@ fn common_query_keywords_complete_with_empty_and_two_letter_prefixes() {
         Oracle,
     );
 
+    assert_keyword("SELECT * FROM emp FOR |", "UPDATE", Oracle);
     for keyword in ["UPDATE", "SHARE"] {
-        assert_keyword("SELECT * FROM emp FOR |", keyword, Oracle);
+        assert_keyword("SELECT * FROM emp FOR |", keyword, MySQL);
     }
     for keyword in ["OF", "NOWAIT", "WAIT", "SKIP"] {
         assert_keyword("SELECT * FROM emp FOR UPDATE |", keyword, Oracle);
@@ -39627,6 +41563,108 @@ fn statement_structural_keyword_slots_complete_with_empty_and_two_letter_prefixe
     assert_keywords("REPLACE |", &["DELAYED", "INTO", "LOW_PRIORITY"], MySQL);
     assert_keywords("UPDATE |", &["IGNORE", "LOW_PRIORITY"], MySQL);
     assert_keyword("UPDATE LOW_PRIORITY |", "IGNORE", MySQL);
+    assert_keyword("IMPORT |", "TABLE", MySQL);
+    assert_keyword("IMPORT TABLE |", "FROM", MySQL);
+    assert_keywords("INSTALL |", &["COMPONENT", "PLUGIN"], MySQL);
+    assert_keyword("INSTALL PLUGIN audit_log |", "SONAME", MySQL);
+    assert_keywords("UNINSTALL |", &["COMPONENT", "PLUGIN"], MySQL);
+    assert_keywords("HANDLER emp |", &["OPEN", "READ", "CLOSE"], MySQL);
+    assert_keyword("HANDLER emp OPEN |", "AS", MySQL);
+    assert_keyword("HANDLER emp READ |", "FIRST", MySQL);
+    assert_keyword("LOCK INSTANCE |", "FOR", MySQL);
+    assert_keyword("LOCK INSTANCE FOR |", "BACKUP", MySQL);
+    assert_keywords("UNLOCK |", &["INSTANCE", "TABLES"], MySQL);
+    assert_keywords("RESET REPLICA |", &["ALL", "FOR"], MySQL);
+    assert_keyword("RESET REPLICA ALL |", "FOR", MySQL);
+    assert_keywords("PURGE BINARY LOGS |", &["BEFORE", "TO"], MySQL);
+    assert_keywords("START GROUP_REPLICATION |", &["PASSWORD", "USER"], MySQL);
+    assert_keywords(
+        "START REPLICA |",
+        &["FOR", "IO_THREAD", "UNTIL"],
+        MySQL,
+    );
+    assert_keywords("STOP REPLICA |", &["FOR", "IO_THREAD"], MySQL);
+    for (sql, expected) in [
+        ("IMPORT |", "TABLE"),
+        ("IMPORT TABLE |", "FROM"),
+        ("INSTALL |", "COMPONENT"),
+        ("INSTALL PLUGIN audit_log |", "SONAME"),
+        ("UNINSTALL |", "PLUGIN"),
+        ("HANDLER emp |", "READ"),
+        ("HANDLER emp OPEN |", "AS"),
+        ("HANDLER emp READ |", "FIRST"),
+        ("LOCK INSTANCE |", "FOR"),
+        ("LOCK INSTANCE FOR |", "BACKUP"),
+        ("UNLOCK |", "TABLES"),
+        ("RESET REPLICA |", "ALL"),
+        ("RESET REPLICA ALL |", "FOR"),
+        ("PURGE BINARY LOGS |", "BEFORE"),
+        ("START GROUP_REPLICATION |", "USER"),
+        ("START REPLICA |", "UNTIL"),
+        ("STOP REPLICA |", "FOR"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, MySQL);
+        assert_eq!(
+            kind, None,
+            "MySQL utility keyword slot should not resolve object kind at `{sql}`; keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            final_suggestions.iter().any(|value| value == expected),
+            "{expected} missing from MySQL utility keyword slot at `{sql}`: {final_suggestions:?}"
+        );
+        for leaked in ["EMP", "DEPT", "EMP_V", "EMPNO", "ENAME", "RUN_JOB", "CALC_TOTAL"] {
+            assert!(
+                !final_suggestions.iter().any(|value| value == leaked),
+                "{leaked} leaked into MySQL utility keyword slot at `{sql}`: {final_suggestions:?}"
+            );
+        }
+    }
+    assert_keywords(
+        "CACHE INDEX emp |",
+        &["IN", "INDEX", "KEY", "PARTITION"],
+        MySQL,
+    );
+    assert_keyword("CACHE INDEX emp INDEX ix |", "IN", MySQL);
+    assert_keywords(
+        "LOAD INDEX INTO CACHE emp |",
+        &["IGNORE", "INDEX", "KEY", "PARTITION"],
+        MySQL,
+    );
+    assert_keyword("LOAD INDEX INTO CACHE emp IGNORE |", "LEAVES", MySQL);
+    assert_keywords("LOCK TABLES emp |", &["AS", "READ", "WRITE"], MySQL);
+    assert_keywords("LOCK TABLES emp AS e |", &["READ", "WRITE"], MySQL);
+    assert_keyword("LOCK TABLES emp READ |", "LOCAL", MySQL);
+    assert_keywords(
+        "LOCK TABLES emp READ, dept |",
+        &["AS", "READ", "WRITE"],
+        MySQL,
+    );
+    for (sql, expected) in [
+        ("CACHE INDEX emp |", "IN"),
+        ("CACHE INDEX emp INDEX ix |", "IN"),
+        ("LOAD INDEX INTO CACHE emp |", "IGNORE"),
+        ("LOAD INDEX INTO CACHE emp IGNORE |", "LEAVES"),
+        ("LOCK TABLES emp |", "READ"),
+        ("LOCK TABLES emp AS e |", "READ"),
+        ("LOCK TABLES emp READ |", "LOCAL"),
+        ("LOCK TABLES emp READ, dept |", "WRITE"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, MySQL);
+        assert_eq!(
+            kind, None,
+            "MySQL admin keyword slot should not resolve object kind at `{sql}`; keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            final_suggestions.iter().any(|value| value == expected),
+            "{expected} missing from MySQL admin keyword slot at `{sql}`: {final_suggestions:?}"
+        );
+        for leaked in ["EMP", "DEPT", "EMP_V", "EMPNO", "ENAME", "RUN_JOB", "CALC_TOTAL"] {
+            assert!(
+                !final_suggestions.iter().any(|value| value == leaked),
+                "{leaked} leaked into MySQL admin keyword slot at `{sql}`: {final_suggestions:?}"
+            );
+        }
+    }
     assert_keywords(
         "LOAD DATA |",
         &["CONCURRENT", "INFILE", "LOCAL", "LOW_PRIORITY"],
@@ -39678,6 +41716,53 @@ fn statement_structural_keyword_slots_complete_with_empty_and_two_letter_prefixe
         "SET",
         MySQL,
     );
+    for (sql, expected) in [
+        ("LOAD DATA |", "INFILE"),
+        ("LOAD DATA LOW_PRIORITY |", "INFILE"),
+        ("LOAD DATA INFILE data_csv INTO TABLE emp |", "FIELDS"),
+        ("LOAD XML INFILE data_xml INTO TABLE emp |", "ROWS"),
+        (
+            "LOAD DATA INFILE data_csv INTO TABLE emp CHARACTER |",
+            "SET",
+        ),
+        (
+            "LOAD DATA INFILE data_csv INTO TABLE emp FIELDS |",
+            "TERMINATED",
+        ),
+        (
+            "LOAD DATA INFILE data_csv INTO TABLE emp FIELDS TERMINATED |",
+            "BY",
+        ),
+        (
+            "LOAD DATA INFILE data_csv INTO TABLE emp LINES |",
+            "TERMINATED",
+        ),
+        (
+            "LOAD DATA INFILE data_csv INTO TABLE emp IGNORE 1 |",
+            "LINES",
+        ),
+        (
+            "LOAD DATA INFILE data_csv INTO TABLE emp (empno) |",
+            "SET",
+        ),
+        ("LOAD XML INFILE data_xml INTO TABLE emp (empno) |", "SET"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, MySQL);
+        assert_eq!(
+            kind, None,
+            "LOAD file keyword slot should not resolve object kind at `{sql}`; keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            final_suggestions.iter().any(|value| value == expected),
+            "{expected} missing from LOAD file keyword slot at `{sql}`: {final_suggestions:?}"
+        );
+        for leaked in ["EMP", "DEPT", "EMP_V", "EMPNO", "ENAME", "RUN_JOB", "CALC_TOTAL"] {
+            assert!(
+                !final_suggestions.iter().any(|value| value == leaked),
+                "{leaked} leaked into LOAD file keyword slot at `{sql}`: {final_suggestions:?}"
+            );
+        }
+    }
     assert_keywords(
         "SELECT * FROM emp INTO |",
         &["DUMPFILE", "OUTFILE"],
@@ -39733,6 +41818,49 @@ fn statement_structural_keyword_slots_complete_with_empty_and_two_letter_prefixe
         "FROM",
         MySQL,
     );
+    for (sql, expected) in [
+        ("SELECT * FROM emp INTO OUTFILE data_txt |", "CHARACTER"),
+        ("SELECT empno INTO OUTFILE data_txt |", "FROM"),
+        ("SELECT empno INTO DUMPFILE data_bin |", "FROM"),
+        ("SELECT * FROM emp INTO OUTFILE data_txt CHARACTER |", "SET"),
+        (
+            "SELECT * FROM emp INTO OUTFILE data_txt FIELDS |",
+            "TERMINATED",
+        ),
+        (
+            "SELECT * FROM emp INTO OUTFILE data_txt FIELDS TERMINATED |",
+            "BY",
+        ),
+        ("SELECT * FROM emp INTO OUTFILE data_txt LINES |", "TERMINATED"),
+        (
+            "SELECT empno INTO OUTFILE data_txt CHARACTER SET utf8mb4 |",
+            "FROM",
+        ),
+        (
+            "SELECT empno INTO OUTFILE data_txt FIELDS TERMINATED BY comma |",
+            "FROM",
+        ),
+        (
+            "SELECT empno INTO OUTFILE data_txt LINES TERMINATED BY newline |",
+            "FROM",
+        ),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, MySQL);
+        assert_eq!(
+            kind, None,
+            "SELECT INTO file keyword slot should not resolve object kind at `{sql}`; keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            final_suggestions.iter().any(|value| value == expected),
+            "{expected} missing from SELECT INTO file keyword slot at `{sql}`: {final_suggestions:?}"
+        );
+        for leaked in ["EMP", "DEPT", "EMP_V", "EMPNO", "ENAME", "RUN_JOB", "CALC_TOTAL"] {
+            assert!(
+                !final_suggestions.iter().any(|value| value == leaked),
+                "{leaked} leaked into SELECT INTO file keyword slot at `{sql}`: {final_suggestions:?}"
+            );
+        }
+    }
     assert_keywords(
         "SHOW |",
         &[
@@ -39797,6 +41925,10 @@ fn transaction_dcl_and_lock_keyword_slots_complete_with_empty_and_two_letter_pre
         &["WAIT", "NOWAIT", "IMMEDIATE", "BATCH"],
         Oracle,
     );
+    assert_keywords("COMMIT WRITE WAIT |", &["IMMEDIATE", "BATCH"], Oracle);
+    assert_keywords("COMMIT WRITE NOWAIT |", &["IMMEDIATE", "BATCH"], Oracle);
+    assert_keywords("COMMIT WRITE IMMEDIATE |", &["WAIT", "NOWAIT"], Oracle);
+    assert_keywords("COMMIT WRITE BATCH |", &["WAIT", "NOWAIT"], Oracle);
     assert_keywords("ROLLBACK |", &["WORK", "TO SAVEPOINT", "FORCE"], Oracle);
     assert_keyword("ROLLBACK TO |", "SAVEPOINT", Oracle);
     assert_keywords(
@@ -39821,6 +41953,42 @@ fn transaction_dcl_and_lock_keyword_slots_complete_with_empty_and_two_letter_pre
     assert_keyword("GRANT SELECT ON emp |", "TO", Oracle);
     assert_keyword("GRANT SELECT ON emp TO scott |", "WITH GRANT OPTION", Oracle);
     assert_keyword("REVOKE SELECT ON emp |", "FROM", Oracle);
+    for (sql, expected) in [
+        ("COMMIT WRITE |", "WAIT"),
+        ("COMMIT WRITE WAIT |", "IMMEDIATE"),
+        ("COMMIT WRITE IMMEDIATE |", "NOWAIT"),
+        ("SET TRANSACTION READ |", "ONLY"),
+        ("SET TRANSACTION ISOLATION |", "LEVEL"),
+        ("SET TRANSACTION ISOLATION LEVEL |", "SERIALIZABLE"),
+        ("LOCK |", "TABLE"),
+        ("LOCK TABLE emp |", "IN"),
+        ("LOCK TABLE emp IN |", "SHARE"),
+        ("LOCK TABLE emp IN ROW |", "EXCLUSIVE"),
+        ("LOCK TABLE emp IN SHARE |", "MODE"),
+        ("LOCK TABLE emp IN SHARE ROW EXCLUSIVE |", "MODE"),
+        ("LOCK TABLE emp IN SHARE MODE |", "NOWAIT"),
+        ("GRANT SELECT ON emp |", "TO"),
+        ("GRANT SELECT ON emp TO scott |", "WITH GRANT OPTION"),
+        ("GRANT SELECT ON emp TO scott WITH |", "GRANT OPTION"),
+        ("GRANT SELECT ON emp TO scott WITH GRANT |", "OPTION"),
+        ("REVOKE SELECT ON emp |", "FROM"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert_eq!(
+            kind, None,
+            "Oracle transaction/DCL/lock keyword slot should not resolve object kind at `{sql}`; keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            final_suggestions.iter().any(|value| value == expected),
+            "{expected} missing from Oracle transaction/DCL/lock keyword slot at `{sql}`: {final_suggestions:?}"
+        );
+        for leaked in ["EMP", "DEPT", "EMP_V", "EMPNO", "ENAME", "RUN_JOB", "CALC_TOTAL"] {
+            assert!(
+                !final_suggestions.iter().any(|value| value == leaked),
+                "{leaked} leaked into Oracle transaction/DCL/lock keyword slot at `{sql}`: {final_suggestions:?}"
+            );
+        }
+    }
 
     assert_keywords("COMMIT |", &["WORK", "AND", "CHAIN", "NO", "RELEASE"], MySQL);
     assert_keywords(
@@ -39879,8 +42047,12 @@ fn for_update_of_column_list_offers_lock_wait_options() {
     ] {
         assert!(kw(sql, Oracle).is_empty(), "completed locking clause re-offered at `{sql}`: {:?}", kw(sql, Oracle));
     }
-    // The earlier states are unchanged: `FOR |` and `FOR UPDATE |`.
-    assert_eq!(kw("SELECT a FROM t FOR |", Oracle), vec!["UPDATE".to_string(), "SHARE".to_string()]);
+    // The earlier states are unchanged, with the lock mode dialect-scoped.
+    assert_eq!(kw("SELECT a FROM t FOR |", Oracle), vec!["UPDATE".to_string()]);
+    assert_eq!(
+        kw("SELECT a FROM t FOR |", MySQL),
+        vec!["UPDATE".to_string(), "SHARE".to_string()]
+    );
     let bare = kw("SELECT a FROM t FOR UPDATE |", Oracle);
     for opt in ["OF", "NOWAIT", "WAIT", "SKIP"] {
         assert!(has(&bare, opt), "`{opt}` missing at bare FOR UPDATE: {bare:?}");
@@ -40298,6 +42470,59 @@ fn remaining_advanced_oracle_query_keyword_slots_are_formalized() {
             assert_keyword(sql, keyword);
         }
     }
+    for (sql, expected) in [
+        ("SELECT * FROM emp PIVOT (SUM(sal) |) p", "FOR"),
+        (
+            "SELECT * FROM emp PIVOT (SUM(sal) FOR deptno |) p",
+            "IN",
+        ),
+        ("SELECT * FROM emp UNPIVOT |", "INCLUDE"),
+        ("SELECT * FROM emp UNPIVOT INCLUDE |", "NULLS"),
+        (
+            "SELECT * FROM emp MATCH_RECOGNIZE (PARTITION |) mr",
+            "BY",
+        ),
+        ("SELECT * FROM emp MATCH_RECOGNIZE (ORDER |) mr", "BY"),
+        (
+            "SELECT * FROM emp MATCH_RECOGNIZE (AFTER MATCH |) mr",
+            "SKIP",
+        ),
+        (
+            "SELECT * FROM emp MATCH_RECOGNIZE (AFTER MATCH SKIP |) mr",
+            "PAST LAST ROW",
+        ),
+        (
+            "SELECT * FROM emp MATCH_RECOGNIZE (PATTERN (A) |) mr",
+            "DEFINE",
+        ),
+        ("SELECT * FROM emp MODEL |", "PARTITION BY"),
+        ("SELECT * FROM emp MODEL PARTITION |", "BY"),
+        ("SELECT * FROM emp MODEL DIMENSION |", "BY"),
+        (
+            "SELECT * FROM emp MODEL DIMENSION BY (deptno) MEASURES (sal) |",
+            "RULES",
+        ),
+        (
+            "SELECT * FROM emp MODEL DIMENSION BY (deptno) MEASURES (sal) RULES |",
+            "UPSERT",
+        ),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert_eq!(
+            kind, None,
+            "advanced Oracle query keyword slot should not resolve object kind at `{sql}`; keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            final_suggestions.iter().any(|value| value == expected),
+            "{expected} missing from advanced Oracle query keyword slot at `{sql}`: {final_suggestions:?}"
+        );
+        for leaked in ["EMP", "DEPT", "EMP_V", "EMPNO", "ENAME", "RUN_JOB", "CALC_TOTAL"] {
+            assert!(
+                !final_suggestions.iter().any(|value| value == leaked),
+                "{leaked} leaked into advanced Oracle query keyword slot at `{sql}`: {final_suggestions:?}"
+            );
+        }
+    }
 
     assert!(
         failures.is_empty(),
@@ -40682,10 +42907,30 @@ fn remaining_cte_and_table_expression_keyword_slots_are_formalized() {
             "WITH RECURSIVE q | (SELECT * FROM help) SELECT * FROM q",
             &["AS"],
         ),
+        (
+            MySQL,
+            "SELECT * FROM emp CROSS |",
+            &["JOIN"],
+        ),
     ] {
         for keyword in keywords {
             assert_keyword(sql, keyword, db_type);
         }
+    }
+
+    for (db_type, sql, forbidden) in [
+        (MySQL, "SELECT * FROM emp CROSS |", "APPLY"),
+        (MySQL, "SELECT * FROM emp OUTER |", "APPLY"),
+        (Oracle, "SELECT cross | FROM emp", "JOIN"),
+        (Oracle, "SELECT cross | FROM emp", "APPLY"),
+        (MySQL, "SELECT cross | FROM emp", "JOIN"),
+        (MySQL, "SELECT cross | FROM emp", "APPLY"),
+    ] {
+        let suggestions = query_keyword_completion_suggestions(sql, db_type);
+        assert!(
+            !has(&suggestions, forbidden),
+            "{forbidden} leaked outside a dialect-valid table-expression slot at `{sql}` ({db_type:?}): {suggestions:?}"
+        );
     }
 
     assert!(
@@ -43766,6 +46011,81 @@ fn mysql_index_hint_after_table_offers_index_not_clause_continuation() {
     assert!(!has(&kw("SELECT a FROM t |"), "INDEX"));      // ordinary table → continuation
 }
 
+#[test]
+fn mysql_select_modifiers_continue_until_projection_starts() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let kw = |sql: &str, db| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(db),
+        )
+    };
+    let has = |values: &[String], keyword: &str| values.iter().any(|value| value == keyword);
+
+    let after_distinct = kw("SELECT DISTINCT |", MySQL);
+    for expected in ["HIGH_PRIORITY", "STRAIGHT_JOIN", "SQL_SMALL_RESULT", "SQL_BIG_RESULT"] {
+        assert!(
+            has(&after_distinct, expected),
+            "{expected} missing after MySQL SELECT DISTINCT: {after_distinct:?}"
+        );
+    }
+    for invalid in ["ALL", "DISTINCT", "DISTINCTROW", "FROM"] {
+        assert!(
+            !has(&after_distinct, invalid),
+            "{invalid} leaked after MySQL SELECT DISTINCT: {after_distinct:?}"
+        );
+    }
+
+    let after_priority = kw("SELECT HIGH_PRIORITY |", MySQL);
+    for expected in ["STRAIGHT_JOIN", "SQL_BUFFER_RESULT", "SQL_CALC_FOUND_ROWS"] {
+        assert!(
+            has(&after_priority, expected),
+            "{expected} missing after MySQL SELECT HIGH_PRIORITY: {after_priority:?}"
+        );
+    }
+    assert!(
+        !has(&after_priority, "FROM"),
+        "FROM leaked before a projection after MySQL SELECT HIGH_PRIORITY: {after_priority:?}"
+    );
+
+    let after_result = kw("SELECT SQL_SMALL_RESULT |", MySQL);
+    assert!(has(&after_result, "SQL_BUFFER_RESULT"), "{after_result:?}");
+    for invalid in ["HIGH_PRIORITY", "STRAIGHT_JOIN", "SQL_BIG_RESULT"] {
+        assert!(
+            !has(&after_result, invalid),
+            "{invalid} leaked after SQL_SMALL_RESULT: {after_result:?}"
+        );
+    }
+
+    let after_cache = kw("SELECT SQL_NO_CACHE |", MySQL);
+    assert!(has(&after_cache, "SQL_CALC_FOUND_ROWS"), "{after_cache:?}");
+    for invalid in ["HIGH_PRIORITY", "SQL_BUFFER_RESULT", "SQL_CACHE"] {
+        assert!(
+            !has(&after_cache, invalid),
+            "{invalid} leaked after SQL_NO_CACHE: {after_cache:?}"
+        );
+    }
+
+    let after_wildcard = kw("SELECT HIGH_PRIORITY * |", MySQL);
+    assert!(
+        has(&after_wildcard, "FROM"),
+        "FROM missing after MySQL SELECT modifier plus wildcard projection: {after_wildcard:?}"
+    );
+
+    let oracle = kw("SELECT DISTINCT |", Oracle);
+    for mysql_only in ["HIGH_PRIORITY", "STRAIGHT_JOIN", "SQL_SMALL_RESULT"] {
+        assert!(
+            !has(&oracle, mysql_only),
+            "{mysql_only} leaked into Oracle SELECT DISTINCT tail: {oracle:?}"
+        );
+    }
+}
+
 /// `FROM` in the select list is gated on a *top-level* `SELECT`: a `SELECT` buried
 /// in a sub-paren (a CTE body, a scalar subquery) does not put the cursor in a
 /// projection, so `WITH c AS (SELECT …) … |` (in the WITH clause) must not offer
@@ -43952,6 +46272,13 @@ fn set_transaction_options_are_dialect_scoped() {
     for level in ["SERIALIZABLE", "READ COMMITTED", "REPEATABLE READ", "READ UNCOMMITTED"] {
         assert!(has(&ml, level), "MySQL isolation level `{level}` missing: {ml:?}");
     }
+    let mysql_commit_write = kw("COMMIT WRITE |", MySQL);
+    for oracle_only in ["WAIT", "NOWAIT", "IMMEDIATE", "BATCH"] {
+        assert!(
+            !has(&mysql_commit_write, oracle_only),
+            "Oracle COMMIT WRITE option leaked into MySQL: {mysql_commit_write:?}"
+        );
+    }
 
     // Oracle: keeps USE/NAME and its two levels (no REPEATABLE READ).
     let o = kw("SET TRANSACTION |", Oracle);
@@ -43960,9 +46287,8 @@ fn set_transaction_options_are_dialect_scoped() {
     assert!(has(&ol, "SERIALIZABLE") && has(&ol, "READ COMMITTED") && !has(&ol, "REPEATABLE READ"));
 }
 
-/// The row-locking `FOR UPDATE`/`FOR SHARE` tail is dialect-scoped: Oracle's
-/// `WAIT <n>` wait-mode is not valid in MySQL (which has only `NOWAIT`/`SKIP
-/// LOCKED`), so it must not leak there. The shared `OF`/`NOWAIT`/`SKIP` stay.
+/// The row-locking tail is dialect-scoped: Oracle has `FOR UPDATE [WAIT n]`,
+/// while MySQL also has `FOR SHARE` but no Oracle `WAIT <n>` wait-mode.
 #[test]
 fn for_update_wait_mode_is_oracle_only() {
     let kw = |sql: &str, db: crate::db::DatabaseType| -> Vec<String> {
@@ -43979,9 +46305,15 @@ fn for_update_wait_mode_is_oracle_only() {
         let m = kw(sql, MySQL);
         assert!(has(&m, "NOWAIT") && has(&m, "SKIP") && has(&m, "OF"), "MySQL lock option missing `{sql}`: {m:?}");
         assert!(!has(&m, "WAIT"), "Oracle-only WAIT leaked into MySQL `{sql}`: {m:?}");
-
-        let o = kw(sql, Oracle);
-        assert!(has(&o, "WAIT") && has(&o, "NOWAIT") && has(&o, "SKIP"), "Oracle lock option missing `{sql}`: {o:?}");
+    }
+    let o = kw("SELECT a FROM t FOR UPDATE |", Oracle);
+    assert!(has(&o, "WAIT") && has(&o, "NOWAIT") && has(&o, "SKIP"), "Oracle lock option missing: {o:?}");
+    let oracle_share = kw("SELECT a FROM t FOR SHARE |", Oracle);
+    for leaked in ["OF", "NOWAIT", "WAIT", "SKIP", "SELECT", "WHERE"] {
+        assert!(
+            !has(&oracle_share, leaked),
+            "{leaked} leaked after unsupported Oracle FOR SHARE: {oracle_share:?}"
+        );
     }
 }
 
@@ -44555,23 +46887,51 @@ fn post_table_modifier_tail_slots_do_not_offer_catalog() {
 /// `ON`/`USING`). Gated on the innermost open paren being that call's argument list.
 #[test]
 fn xmltable_subgrammar_is_confined_to_the_open_call() {
-    let kw = |sql: &str| {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let kw = |sql: &str, db| {
         SqlEditorWidget::collect_expected_keyword_suggestions(
-            "", &analyze_inline_cursor_sql(sql), Some(crate::db::DatabaseType::Oracle))
+            "", &analyze_inline_cursor_sql(sql), Some(db))
     };
     let has = |v: &Vec<String>, s: &str| v.iter().any(|x| x == s);
 
     // Inside the open call the subgrammar is still offered.
-    assert!(has(&kw("SELECT * FROM XMLTABLE('/a' |"), "PASSING"));
-    assert!(has(&kw("SELECT * FROM XMLTABLE('/a' PASSING x |"), "COLUMNS"));
-    assert!(has(&kw("SELECT * FROM JSON_TABLE(j, '$' |"), "COLUMNS"));
+    assert!(has(&kw("SELECT * FROM XMLTABLE('/a' |", Oracle), "PASSING"));
+    assert!(has(
+        &kw("SELECT * FROM XMLTABLE('/a' PASSING x |", Oracle),
+        "COLUMNS"
+    ));
+    assert!(has(&kw("SELECT * FROM JSON_TABLE(j, '$' |", Oracle), "COLUMNS"));
+    let mysql_json_table = kw("SELECT * FROM JSON_TABLE(j, '$' |", MySQL);
+    assert!(
+        has(&mysql_json_table, "COLUMNS"),
+        "MySQL JSON_TABLE must offer COLUMNS: {mysql_json_table:?}"
+    );
+    for oracle_only in ["ERROR ON ERROR", "NULL ON ERROR"] {
+        assert!(
+            !has(&mysql_json_table, oracle_only),
+            "{oracle_only} leaked into MySQL JSON_TABLE row-source slot: {mysql_json_table:?}"
+        );
+    }
+    for sql in [
+        "SELECT * FROM XMLTABLE('/a' |",
+        "SELECT * FROM XMLTABLE('/a' PASSING x |",
+        "SELECT XMLTABLE('/a' | FROM t",
+        "SELECT JSON_TABLE(j, '$' | FROM t",
+    ] {
+        let s = kw(sql, MySQL);
+        assert!(
+            !has(&s, "PASSING") && !has(&s, "COLUMNS"),
+            "table-source subgrammar leaked outside a MySQL table-source XMLTABLE/JSON_TABLE slot at `{sql}`: {s:?}"
+        );
+    }
     // Once the call closes, `COLUMNS`/`PASSING` must not leak out.
     for sql in [
         "SELECT * FROM XMLTABLE('/a' PASSING c) |",
         "SELECT * FROM t1 JOIN XMLTABLE('/a' PASSING c) v |",
         "SELECT * FROM JSON_TABLE(j, '$' COLUMNS (c NUMBER PATH '$.x')) v |",
     ] {
-        let s = kw(sql);
+        let s = kw(sql, Oracle);
         assert!(!has(&s, "COLUMNS") && !has(&s, "PASSING"),
             "XMLTABLE subgrammar leaked past the closed call at `{sql}`: {s:?}");
     }
@@ -46606,6 +48966,9 @@ fn admin_statement_tails_suppress_relations_without_select_noise() {
         "RESET BINARY LOGS AND GTIDS |",
         "RESET REPLICA ALL FOR CHANNEL ch |",
         "PURGE BINARY LOGS BEFORE ts |",
+        "LOCK INSTANCE FOR BACKUP |",
+        "UNLOCK INSTANCE |",
+        "UNLOCK TABLES |",
         "START GROUP_REPLICATION USER repl PASSWORD secret |",
         "START REPLICA IO_THREAD SQL_THREAD |",
         "START REPLICA UNTIL SQL_BEFORE_GTIDS gtid_set |",
@@ -49893,6 +52256,8 @@ fn transaction_and_lock_value_slots_do_not_offer_object_catalog() {
         (Oracle, "ROLLBACK FORCE app|"),
         (Oracle, "SAVEPOINT |"),
         (Oracle, "SAVEPOINT app|"),
+        (Oracle, "ROLLBACK TO |"),
+        (Oracle, "ROLLBACK TO app|"),
         (Oracle, "ROLLBACK TO SAVEPOINT |"),
         (Oracle, "ROLLBACK TO SAVEPOINT app|"),
         (Oracle, "SET TRANSACTION NAME |"),
@@ -49903,13 +52268,21 @@ fn transaction_and_lock_value_slots_do_not_offer_object_catalog() {
         (Oracle, "LOCK TABLE emp IN SHARE MODE WAIT d|"),
         (MySQL, "SAVEPOINT |"),
         (MySQL, "SAVEPOINT app|"),
+        (MySQL, "ROLLBACK TO |"),
+        (MySQL, "ROLLBACK TO app|"),
         (MySQL, "ROLLBACK TO SAVEPOINT |"),
         (MySQL, "ROLLBACK TO SAVEPOINT app|"),
         (MySQL, "RELEASE SAVEPOINT |"),
         (MySQL, "RELEASE SAVEPOINT app|"),
+        (MySQL, "START TRANSACTION READ ONLY |"),
+        (MySQL, "START TRANSACTION READ WRITE |"),
+        (MySQL, "START TRANSACTION WITH CONSISTENT SNAPSHOT |"),
         (MySQL, "LOCK TABLES emp AS |"),
         (MySQL, "LOCK TABLES emp AS app|"),
         (MySQL, "LOCK TABLES emp AS read|"),
+        (MySQL, "LOCK INSTANCE FOR BACKUP |"),
+        (MySQL, "UNLOCK INSTANCE |"),
+        (MySQL, "UNLOCK TABLES |"),
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
         assert_eq!(
@@ -51844,6 +54217,10 @@ fn prefixed_new_name_slots_do_not_offer_catalog_or_keywords() {
         (Oracle, "ALTER TABLE emp RENAME PARTITION old_p TO app|"),
         (MySQL, "CREATE TABLE app|"),
         (MySQL, "CREATE TABLE IF NOT EXISTS app|"),
+        (MySQL, "CREATE EVENT app|"),
+        (MySQL, "CREATE LOGFILE GROUP app|"),
+        (MySQL, "CREATE SERVER app|"),
+        (MySQL, "CREATE RESOURCE GROUP app|"),
         (MySQL, "CREATE USER app|"),
         (MySQL, "CREATE USER alice, app|"),
         (MySQL, "CREATE USER alice IDENTIFIED BY 'secret', app|"),
@@ -52239,6 +54616,33 @@ fn flashback_as_of_is_oracle_only() {
     assert!(has(&kw("SELECT * FROM emp AS |", Oracle), "OF"));
     assert!(has(&kw("SELECT * FROM emp AS OF |", Oracle), "SCN"));
     assert!(has(&kw("SELECT * FROM emp VERSIONS |", Oracle), "BETWEEN"));
+    assert!(has(
+        &kw("SELECT * FROM emp VERSIONS BETWEEN SCN 1 |", Oracle),
+        "AND"
+    ));
+    for (sql, expected) in [
+        ("SELECT * FROM emp AS |", "OF"),
+        ("SELECT * FROM emp AS OF |", "SCN"),
+        ("SELECT * FROM emp VERSIONS |", "BETWEEN"),
+        ("SELECT * FROM emp VERSIONS BETWEEN |", "SCN"),
+        ("SELECT * FROM emp VERSIONS BETWEEN SCN 1 |", "AND"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert_eq!(
+            kind, None,
+            "flashback keyword slot should not resolve object kind at `{sql}`; keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            final_suggestions.iter().any(|value| value == expected),
+            "{expected} missing from flashback keyword slot at `{sql}`: {final_suggestions:?}"
+        );
+        for leaked in ["EMP", "DEPT", "EMP_V", "EMPNO", "ENAME", "RUN_JOB", "CALC_TOTAL"] {
+            assert!(
+                !final_suggestions.iter().any(|value| value == leaked),
+                "{leaked} leaked into flashback keyword slot at `{sql}`: {final_suggestions:?}"
+            );
+        }
+    }
 
     // MySQL: `AS` is an alias — no flashback `OF`.
     assert!(!has(&kw("SELECT * FROM emp AS |", MySQL), "OF"),
@@ -52276,8 +54680,37 @@ fn standard_function_internal_keyword_grammar_is_offered() {
     eq("SELECT TRIM(LEADING 'x' |", Oracle, &["FROM"]);
     eq("SELECT SUBSTRING(name |", MySQL, &["FROM"]);
     eq("SELECT SUBSTRING(name FROM 1 |", MySQL, &["FOR"]);
+    eq("SELECT OVERLAY(name |", Oracle, &["PLACING"]);
+    eq("SELECT OVERLAY(name PLACING repl |", Oracle, &["FROM"]);
+    eq("SELECT OVERLAY(name PLACING repl FROM 1 |", Oracle, &["FOR"]);
     // Nested complete operand resolves to the outer call's keyword.
     eq("SELECT POSITION(INSTR(a, b) |", Oracle, &["IN"]);
+    for (sql, db, expected) in [
+        ("SELECT POSITION('a' |", Oracle, "IN"),
+        ("SELECT TRIM(name |", Oracle, "FROM"),
+        ("SELECT TRIM(LEADING 'x' |", Oracle, "FROM"),
+        ("SELECT SUBSTRING(name |", MySQL, "FROM"),
+        ("SELECT SUBSTRING(name FROM 1 |", MySQL, "FOR"),
+        ("SELECT OVERLAY(name |", Oracle, "PLACING"),
+        ("SELECT OVERLAY(name PLACING repl |", Oracle, "FROM"),
+        ("SELECT OVERLAY(name PLACING repl FROM 1 |", Oracle, "FOR"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert_eq!(
+            kind, None,
+            "standard function keyword slot should not resolve object kind at `{sql}`; keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            final_suggestions.iter().any(|value| value == expected),
+            "{expected} missing from standard function keyword slot at `{sql}`: {final_suggestions:?}"
+        );
+        for leaked in ["EMP", "DEPT", "EMP_V", "EMPNO", "ENAME", "RUN_JOB", "CALC_TOTAL"] {
+            assert!(
+                !final_suggestions.iter().any(|value| value == leaked),
+                "{leaked} leaked into standard function keyword slot at `{sql}`: {final_suggestions:?}"
+            );
+        }
+    }
 
     // Not keyword slots: the str operand (inside/after the separator), the comma
     // form, `SUBSTR`, the first-arg value slot, and unrelated calls.
@@ -52288,6 +54721,9 @@ fn standard_function_internal_keyword_grammar_is_offered() {
     none("SELECT POSITION('a' IN name |", Oracle);   // inside the search string
     none("SELECT TRIM(BOTH ' ' FROM name |", Oracle);
     none("SELECT SUBSTRING(name, 1 |", MySQL);        // comma form
+    none("SELECT OVERLAY(name PLACING |", Oracle);    // replacement value slot
+    none("SELECT OVERLAY(name PLACING repl FROM |", Oracle); // start value slot
+    none("SELECT OVERLAY(name PLACING repl FROM 1 FOR len |", Oracle);
     none("SELECT SUBSTR(name |", Oracle);             // comma-only spelling
     none("SELECT UPPER(name |", Oracle);              // unrelated function
 }
