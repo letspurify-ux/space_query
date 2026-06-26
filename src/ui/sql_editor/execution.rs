@@ -11732,11 +11732,11 @@ impl SqlEditorWidget {
                                             );
                                         } else {
                                             SqlEditorWidget::emit_statement_start_once(
-                                        &sender,
-                                        index,
-                                        ResultTabPolicy::Defer,
-                                        &mut statement_start_emitted,
-                                    );
+                                                &sender,
+                                                index,
+                                                ResultTabPolicy::Defer,
+                                                &mut statement_start_emitted,
+                                            );
                                             let result =
                                                 QueryResult::new_error(&sql_text, &message);
                                             let _ = sender.send(QueryProgress::StatementFinished {
