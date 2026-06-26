@@ -23727,6 +23727,47 @@ mod query_execution_cleanup_tests {
     }
 
     #[test]
+    fn oracle_thin_cancel_requires_resolution_only_for_retained_transaction_state() {
+        let clean_disposition = SqlEditorWidget::oracle_thin_execution_disposition(
+            true,
+            true,
+            false,
+            RetainedSessionState::default(),
+            crate::db::session_policy::SqlKind::SelectLike,
+            false,
+            true,
+        );
+        assert!(matches!(
+            clean_disposition,
+            crate::db::RetainedSessionDisposition::Retain(state)
+                if crate::db::retained_session_state_preflight_decision(
+                    crate::db::RetainedSessionPreflightAction::Close,
+                    state,
+                ) == crate::db::RetainedSessionPreflightDecision::Allow
+        ));
+
+        let retained_transaction =
+            RetainedSessionState::from_transaction_state(TransactionSessionState::MaybeDirty);
+        let transaction_disposition = SqlEditorWidget::oracle_thin_execution_disposition(
+            true,
+            true,
+            false,
+            retained_transaction,
+            crate::db::session_policy::SqlKind::SelectLike,
+            false,
+            true,
+        );
+        assert!(matches!(
+            transaction_disposition,
+            crate::db::RetainedSessionDisposition::Retain(state)
+                if crate::db::retained_session_state_preflight_decision(
+                    crate::db::RetainedSessionPreflightAction::Close,
+                    state,
+                ) == crate::db::RetainedSessionPreflightDecision::RequireResolution
+        ));
+    }
+
+    #[test]
     fn oracle_thin_general_late_cancel_without_error_keeps_existing_behavior() {
         assert!(matches!(
             SqlEditorWidget::oracle_thin_execution_disposition(
@@ -25805,6 +25846,46 @@ mod query_execution_cleanup_tests {
     }
 
     #[test]
+    fn mysql_and_mariadb_multi_query_interrupts_prompt_only_for_transaction_risk() {
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            let post_processor = crate::db::statement_session_post_processor_for(db_type);
+
+            let mut clean_batch = crate::db::MySqlBatchSessionEffects::default();
+            let select_effects = post_processor.effects_for_sql("SELECT 1");
+            clean_batch.apply_successful_statement_effects("SELECT 1", false, select_effects);
+            let clean_decision = clean_batch.decision_after_interrupted_batch(
+                RetainedSessionState::default(),
+                true,
+                false,
+            );
+            assert_eq!(
+                clean_decision.outcome,
+                crate::db::RetainedSessionOutcome::DiscardPhysical,
+                "{db_type:?} read-only autocommit-off script cancel must not request commit/rollback"
+            );
+            assert!(!clean_decision.requires_session_info_sync);
+
+            let mut dirty_batch = crate::db::MySqlBatchSessionEffects::default();
+            let update_effects = post_processor.effects_for_sql("UPDATE t SET v = 1");
+            dirty_batch.apply_successful_statement_effects(
+                "UPDATE t SET v = 1",
+                false,
+                update_effects,
+            );
+            let dirty_decision = dirty_batch.decision_after_interrupted_batch(
+                RetainedSessionState::default(),
+                true,
+                false,
+            );
+            assert!(matches!(
+                dirty_decision.outcome,
+                crate::db::RetainedSessionOutcome::Retain(state)
+                    if state.requires_transaction_decision()
+            ));
+        }
+    }
+
+    #[test]
     fn mysql_transaction_policy_preserves_prior_dirty_state_after_failed_clear_statement() {
         let ddl_hint = SqlEditorWidget::mysql_session_state_hint_for_sql("CREATE TABLE t (id INT)");
         assert!(ddl_hint.clears_session_state);
@@ -26486,6 +26567,48 @@ mod query_execution_cleanup_tests {
             Some(crate::db::session_policy::SessionDecision::RequirePhysicalSessionResolution),
             "cleanup-only retained state must not become a commit/rollback decision"
         );
+    }
+
+    #[test]
+    fn mysql_and_mariadb_single_query_interrupts_prompt_only_for_transaction_risk() {
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            let post_processor = crate::db::statement_session_post_processor_for(db_type);
+            let select_effects = post_processor.effects_for_sql("SELECT 1");
+            assert_eq!(
+                SqlEditorWidget::mysql_pooled_action_interrupt_policy_decision(
+                    db_type,
+                    RetainedSessionState::default(),
+                    "SELECT 1",
+                    select_effects,
+                    false,
+                    true,
+                    InterruptKind::Cancelled,
+                    None,
+                    true,
+                    true,
+                ),
+                Some(crate::db::session_policy::SessionDecision::ReuseSamePhysicalSession),
+                "{db_type:?} clean SELECT cancel must not request commit/rollback"
+            );
+
+            let update_effects = post_processor.effects_for_sql("UPDATE t SET v = 1");
+            assert_eq!(
+                SqlEditorWidget::mysql_pooled_action_interrupt_policy_decision(
+                    db_type,
+                    RetainedSessionState::default(),
+                    "UPDATE t SET v = 1",
+                    update_effects,
+                    false,
+                    true,
+                    InterruptKind::Cancelled,
+                    None,
+                    true,
+                    true,
+                ),
+                Some(crate::db::session_policy::SessionDecision::RequireCommitOrRollback),
+                "{db_type:?} autocommit-off DML cancel must request commit/rollback"
+            );
+        }
     }
 
     #[test]
