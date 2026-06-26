@@ -54711,6 +54711,7 @@ fn mysql_admin_table_name_slots_offer_only_tables_in_final_suggestions() {
         "LOCK TABLES |",
         "LOCK TABLES emp READ, |",
         "FLUSH TABLES |",
+        "FLUSH LOCAL TABLES |",
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, MySQL);
         assert_eq!(
@@ -54722,7 +54723,20 @@ fn mysql_admin_table_name_slots_offer_only_tables_in_final_suggestions() {
             contains(&final_suggestions, "EMP") && contains(&final_suggestions, "DEPT"),
             "admin table-name slot lost table catalog at `{sql}`: {final_suggestions:?}"
         );
-        for leaked in ["EMP_V", "EMPNO", "RUN_JOB", "SELECT", "WHERE"] {
+        for leaked in [
+            "EMP_V",
+            "EMPNO",
+            "APP_USER",
+            "SCOTT",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "HR_PKG",
+            "ADDRESS_T",
+            "SELECT",
+            "WHERE",
+            "NOW()",
+            "NULLIF()",
+        ] {
             assert!(
                 !contains(&final_suggestions, leaked),
                 "{leaked} leaked into admin table-name slot at `{sql}`: {final_suggestions:?}"
@@ -54924,6 +54938,55 @@ fn grant_revoke_slots_are_precise_in_final_suggestions() {
     use crate::db::DatabaseType::{MySQL, Oracle};
 
     let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for (sql, expected_privileges) in [
+        (
+            "GRANT | ON *.* TO scott",
+            &["SELECT", "APPLICATION_PASSWORD_ADMIN", "BACKUP_ADMIN"][..],
+        ),
+        (
+            "GRANT SELECT, | ON *.* TO scott",
+            &["INSERT", "GROUP_REPLICATION_ADMIN", "XA_RECOVER_ADMIN"],
+        ),
+        (
+            "REVOKE | ON *.* FROM scott",
+            &["IF", "SELECT", "APPLICATION_PASSWORD_ADMIN"],
+        ),
+        (
+            "REVOKE SELECT, | ON *.* FROM scott",
+            &["INSERT", "RESOURCE_GROUP_ADMIN", "SYSTEM_USER"],
+        ),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, MySQL);
+        assert_eq!(
+            kind, None,
+            "MySQL privilege list should not resolve object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for expected in expected_privileges {
+            assert!(
+                contains(&final_suggestions, expected),
+                "{expected} missing from MySQL privilege list at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "APP_USER",
+            "SCOTT",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "EMPNO",
+            "WHERE",
+            "NOW()",
+            "NULLIF()",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into MySQL privilege list at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
 
     for (db, sql, expected) in [
         (
@@ -57381,12 +57444,15 @@ fn mysql_value_expression_slots_do_not_offer_admin_option_keywords() {
             "ASSIGN_GTIDS_TO_ANONYMOUS_TRANSACTIONS",
             "AUTOEXTEND_SIZE",
             "BACKUP_ADMIN",
+            "CHANNEL",
             "ENGINE_ATTRIBUTE",
             "EXTENT_SIZE",
             "FAILED_LOGIN_ATTEMPTS",
             "FIREWALL_ADMIN",
             "GROUP_REPLICATION",
             "GROUP_REPLICATION_ADMIN",
+            "GTIDS",
+            "HISTOGRAM",
             "HIGH_PRIORITY",
             "IO_THREAD",
             "MAX_QUERIES_PER_HOUR",
@@ -57395,8 +57461,11 @@ fn mysql_value_expression_slots_do_not_offer_admin_option_keywords() {
             "NO_WRITE_TO_BINLOG",
             "PASSWORD_LOCK_TIME",
             "PERSIST_ONLY",
+            "RANDOM",
             "REDO_LOG",
             "REPLICATE_DO_DB",
+            "REPLICATION",
+            "RETAIN",
             "RESOURCE_GROUP_ADMIN",
             "SOURCE_HOST",
             "SOURCE_PASSWORD",
@@ -57411,6 +57480,7 @@ fn mysql_value_expression_slots_do_not_offer_admin_option_keywords() {
             "SQL_THREAD",
             "STRAIGHT_JOIN",
             "THREAD_PRIORITY",
+            "TLS",
             "UNDO_BUFFER_SIZE",
             "USE_FRM",
             "USER_RESOURCES",
@@ -57465,6 +57535,51 @@ fn mysql_set_account_slots_offer_users_without_relation_noise() {
             assert!(
                 !contains(&final_suggestions, leaked),
                 "{leaked} leaked into MySQL SET account slot at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn mysql_start_transaction_keyword_slots_do_not_offer_catalog() {
+    use crate::db::DatabaseType::MySQL;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for (sql, expected) in [
+        ("START TRANSACTION |", "READ"),
+        ("START TRANSACTION READ |", "ONLY"),
+        ("START TRANSACTION READ o|", "ONLY"),
+        ("START TRANSACTION WITH |", "CONSISTENT"),
+        ("START TRANSACTION WITH c|", "CONSISTENT"),
+        ("START TRANSACTION WITH CONSISTENT |", "SNAPSHOT"),
+        ("START TRANSACTION WITH CONSISTENT s|", "SNAPSHOT"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, MySQL);
+        assert_eq!(
+            kind, None,
+            "MySQL START TRANSACTION keyword slot should not resolve object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            contains(&final_suggestions, expected),
+            "{expected} missing from MySQL START TRANSACTION keyword slot at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "EMPNO",
+            "ENAME",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "APP_USER",
+            "SCOTT",
+            "NOW()",
+            "NULLIF()",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into MySQL START TRANSACTION keyword slot at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
             );
         }
     }

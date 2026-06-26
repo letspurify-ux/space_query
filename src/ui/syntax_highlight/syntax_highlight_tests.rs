@@ -145,12 +145,32 @@ fn test_transaction_level_keywords_highlight_as_keywords() {
             STYLE_KEYWORD,
         );
     }
+    let mysql_uncommitted_text = "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED";
+    let mysql_uncommitted_styles = mysql_highlighter.generate_styles(mysql_uncommitted_text);
+    for token in ["READ", "UNCOMMITTED"] {
+        assert_token_has_style(
+            mysql_uncommitted_text,
+            &mysql_uncommitted_styles,
+            token,
+            STYLE_KEYWORD,
+        );
+    }
     let mysql_access_text = "START TRANSACTION READ WRITE";
     let mysql_access_styles = mysql_highlighter.generate_styles(mysql_access_text);
     for token in ["START", "TRANSACTION", "READ", "WRITE"] {
         assert_token_has_style(
             mysql_access_text,
             &mysql_access_styles,
+            token,
+            STYLE_KEYWORD,
+        );
+    }
+    let mysql_snapshot_text = "START TRANSACTION WITH CONSISTENT SNAPSHOT";
+    let mysql_snapshot_styles = mysql_highlighter.generate_styles(mysql_snapshot_text);
+    for token in ["WITH", "CONSISTENT", "SNAPSHOT"] {
+        assert_token_has_style(
+            mysql_snapshot_text,
+            &mysql_snapshot_styles,
             token,
             STYLE_KEYWORD,
         );
@@ -2617,7 +2637,11 @@ CHANGE REPLICATION FILTER REPLICATE_DO_DB = (app), REPLICATE_WILD_IGNORE_TABLE =
 GRANT APPLICATION_PASSWORD_ADMIN, GROUP_REPLICATION_ADMIN ON *.* TO alice;
 CREATE USER alice FAILED_LOGIN_ATTEMPTS 3 PASSWORD_LOCK_TIME 2 WITH MAX_QUERIES_PER_HOUR 10;
 ALTER INSTANCE RELOAD TLS FOR CHANNEL MYSQL_MAIN;
-SET PERSIST_ONLY sql_mode = 'STRICT_ALL_TABLES';";
+SET PERSIST_ONLY sql_mode = 'STRICT_ALL_TABLES';
+CHECKSUM TABLE emp QUICK;
+INSTALL PLUGIN auth_socket SONAME 'auth_socket.so';
+UNINSTALL COMPONENT 'file://component_validate_password';
+CREATE DEFINER = root TABLE t (id INT) ENCRYPTION = 'Y' INSERT_METHOD = LAST KEY_BLOCK_SIZE = 8;";
 
     let mut highlighter = SqlHighlighter::new();
     highlighter.set_db_type(crate::db::connection::DatabaseType::MySQL);
@@ -2625,14 +2649,23 @@ SET PERSIST_ONLY sql_mode = 'STRICT_ALL_TABLES';";
 
     for token in [
         "AUTOEXTEND_SIZE",
+        "CHANNEL",
+        "CHECKSUM",
+        "DEFINER",
+        "ENCRYPTION",
         "ENGINE_ATTRIBUTE",
         "UNDOFILE",
         "INITIAL_SIZE",
+        "INSERT_METHOD",
+        "INSTALL",
+        "KEY_BLOCK_SIZE",
         "REDO_BUFFER_SIZE",
         "VCPU",
         "THREAD_PRIORITY",
         "GROUP_REPLICATION",
         "DEFAULT_AUTH",
+        "REPLICATION",
+        "REPLICA",
         "SOURCE_HOST",
         "SOURCE_PASSWORD",
         "SOURCE_SSL_VERIFY_SERVER_CERT",
@@ -2645,8 +2678,10 @@ SET PERSIST_ONLY sql_mode = 'STRICT_ALL_TABLES';";
         "FAILED_LOGIN_ATTEMPTS",
         "PASSWORD_LOCK_TIME",
         "MAX_QUERIES_PER_HOUR",
+        "TLS",
         "MYSQL_MAIN",
         "PERSIST_ONLY",
+        "UNINSTALL",
     ] {
         assert_token_has_style(text, &styles, token, STYLE_KEYWORD);
     }

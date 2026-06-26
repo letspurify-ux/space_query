@@ -858,6 +858,7 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "COMPRESSED",
     "CONDITION",
     "CONNECTION",
+    "CONSISTENT",
     "CONSTRAINT",
     "CONTINUE",
     "CONVERT",
@@ -1345,6 +1346,8 @@ pub static MYSQL_SQL_KEYWORDS_SET: Lazy<HashSet<&'static str>> =
 #[inline]
 pub(crate) fn is_mysql_sql_keyword(word: &str) -> bool {
     MYSQL_SQL_KEYWORDS_SET.contains(word)
+        || MYSQL_NON_EXPRESSION_COMMAND_KEYWORDS_SET.contains(word)
+        || MYSQL_DDL_FRAGMENT_KEYWORDS_SET.contains(word)
         || MYSQL_ADMIN_OPTION_KEYWORDS_SET.contains(word)
         || MYSQL_DYNAMIC_PRIVILEGE_KEYWORDS_SET.contains(word)
         || MYSQL_ACCOUNT_OPTION_KEYWORDS_SET.contains(word)
@@ -3217,6 +3220,7 @@ pub(crate) fn is_ddl_only_clause_keyword_upper(word_upper: &str) -> bool {
 /// function (`REPLACE`, `REPEAT`), a data type (`FLOAT`, `CHAR`), or a query
 /// clause are deliberately excluded so a valid completion is never hidden.
 const MYSQL_NON_EXPRESSION_COMMAND_KEYWORDS: &[&str] = &[
+    "CACHE",
     "FLUSH",
     "KILL",
     "OPTIMIZE",
@@ -3230,6 +3234,7 @@ const MYSQL_NON_EXPRESSION_COMMAND_KEYWORDS: &[&str] = &[
     "CHANGE",
     "SIGNAL",
     "RESIGNAL",
+    "SOURCE",
     "INSTALL",
     "UNINSTALL",
     "CHECKSUM",
@@ -3299,16 +3304,25 @@ static MYSQL_DDL_FRAGMENT_KEYWORDS_SET: Lazy<HashSet<&'static str>> =
 /// syntax tokens, but they are not valid value-expression keywords.
 const MYSQL_ADMIN_OPTION_KEYWORDS: &[&str] = &[
     "ASSIGN_GTIDS_TO_ANONYMOUS_TRANSACTIONS",
+    "AUTHENTICATION",
     "AUTOEXTEND_SIZE",
+    "BUCKETS",
+    "CHANNEL",
+    "CIPHER",
     "DEFAULT_AUTH",
     "ENGINE_ATTRIBUTE",
     "EXTENT_SIZE",
     "FILE_BLOCK_SIZE",
+    "FILTER",
     "GET_SOURCE_PUBLIC_KEY",
     "GROUP_REPLICATION",
+    "GTIDS",
     "GTID_ONLY",
+    "HISTOGRAM",
+    "INITIAL",
     "INITIAL_SIZE",
     "IO_THREAD",
+    "ISSUER",
     "MAX_SIZE",
     "MYSQL_ADMIN",
     "MYSQL_MAIN",
@@ -3317,10 +3331,13 @@ const MYSQL_ADMIN_OPTION_KEYWORDS: &[&str] = &[
     "PLUGIN_DIR",
     "PERSIST_ONLY",
     "PRIVILEGE_CHECKS_USER",
+    "RANDOM",
     "REDO_BUFFER_SIZE",
     "REDO_LOG",
     "RELAY_LOG_FILE",
     "RELAY_LOG_POS",
+    "REPLICA",
+    "REPLICAS",
     "REPLICATE_DO_DB",
     "REPLICATE_DO_TABLE",
     "REPLICATE_IGNORE_DB",
@@ -3328,8 +3345,10 @@ const MYSQL_ADMIN_OPTION_KEYWORDS: &[&str] = &[
     "REPLICATE_REWRITE_DB",
     "REPLICATE_WILD_DO_TABLE",
     "REPLICATE_WILD_IGNORE_TABLE",
+    "REPLICATION",
     "REQUIRE_ROW_FORMAT",
     "REQUIRE_TABLE_PRIMARY_KEY_CHECK",
+    "RETAIN",
     "SOURCE_AUTO_POSITION",
     "SOURCE_BIND",
     "SOURCE_COMPRESSION_ALGORITHMS",
@@ -3362,6 +3381,7 @@ const MYSQL_ADMIN_OPTION_KEYWORDS: &[&str] = &[
     "SQL_BEFORE_GTIDS",
     "SQL_THREAD",
     "THREAD_PRIORITY",
+    "TLS",
     "UNDOFILE",
     "UNDO_BUFFER_SIZE",
     "USE_FRM",
@@ -7982,6 +8002,23 @@ mod tests {
     }
 
     #[test]
+    fn mysql_command_and_ddl_fragment_keywords_highlight_but_do_not_complete_as_values() {
+        for keyword in MYSQL_NON_EXPRESSION_COMMAND_KEYWORDS
+            .iter()
+            .chain(MYSQL_DDL_FRAGMENT_KEYWORDS.iter())
+        {
+            assert!(
+                is_mysql_sql_keyword(keyword),
+                "missing MySQL command/DDL fragment keyword: {keyword}"
+            );
+            assert!(
+                is_non_expression_keyword_upper(keyword),
+                "MySQL command/DDL fragment should be filtered from value-expression completion: {keyword}"
+            );
+        }
+    }
+
+    #[test]
     fn mysql_statement_modifier_keywords_are_not_value_expression_keywords() {
         for keyword in MYSQL_NON_EXPRESSION_MODIFIER_KEYWORDS {
             assert!(
@@ -8168,6 +8205,16 @@ mod tests {
             assert!(
                 seen.insert(*keyword),
                 "duplicate MySQL statement head keyword: {keyword}"
+            );
+        }
+    }
+
+    #[test]
+    fn mysql_statement_head_keywords_stay_in_mysql_keyword_pool() {
+        for keyword in MYSQL_STATEMENT_HEAD_KEYWORDS {
+            assert!(
+                is_mysql_sql_keyword(keyword),
+                "MySQL statement head should be highlighted as a MySQL keyword: {keyword}"
             );
         }
     }

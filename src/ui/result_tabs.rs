@@ -22,9 +22,18 @@ use crate::ui::ResultTableWidget;
 type ResultTabsChangeCallback = Box<dyn FnMut()>;
 type ResultTabsCloseCallback = Box<dyn FnMut(ResultTabCloseTarget)>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct ResultTabId(u64);
+
+impl ResultTabId {
+    pub(crate) fn new(value: u64) -> Self {
+        Self(value.max(1))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ResultTabCloseTarget {
-    Result(usize),
+    Result(ResultTabId),
     ScriptOutput,
 }
 
@@ -49,6 +58,7 @@ pub struct ResultTabsWidget {
     messages_info: Arc<Mutex<TextPane>>,
     messages_errors: Arc<Mutex<TextPane>>,
     explain_plan: Arc<Mutex<TextPane>>,
+    next_result_tab_id: Arc<Mutex<u64>>,
     font_profile: Arc<Mutex<FontProfile>>,
     font_size: Arc<Mutex<u32>>,
     max_cell_display_chars: Arc<Mutex<usize>>,
@@ -62,6 +72,7 @@ pub struct ResultTabsWidget {
 
 #[derive(Clone)]
 struct ResultTab {
+    id: ResultTabId,
     group: Group,
     table: ResultTableWidget,
     status: ResultTabStatus,
@@ -686,6 +697,7 @@ impl ResultTabsWidget {
 
         let data = Arc::new(Mutex::new(Vec::<ResultTab>::new()));
         let active_index = Arc::new(Mutex::new(None));
+        let next_result_tab_id = Arc::new(Mutex::new(1u64));
         let font_profile = Arc::new(Mutex::new(configured_editor_profile()));
         let font_size = Arc::new(Mutex::new(constants::DEFAULT_FONT_SIZE as u32));
         let max_cell_display_chars = Arc::new(Mutex::new(
@@ -1034,6 +1046,7 @@ impl ResultTabsWidget {
             messages_info,
             messages_errors,
             explain_plan,
+            next_result_tab_id,
             font_profile,
             font_size,
             max_cell_display_chars,
@@ -1144,15 +1157,16 @@ impl ResultTabsWidget {
             .collect()
     }
 
-    pub fn lazy_fetch_session_at(&self, index: usize) -> Option<u64> {
+    pub(crate) fn lazy_fetch_session_for_id(&self, id: ResultTabId) -> Option<u64> {
         self.data
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(index)
+            .iter()
+            .find(|tab| tab.id == id)
             .and_then(|tab| tab.table.active_lazy_fetch_session())
     }
 
-    pub fn active_result_index(&self) -> Option<usize> {
+    pub(crate) fn active_result_id(&self) -> Option<ResultTabId> {
         if !self.top_group_is_current(&self.sections.data_grid) {
             return None;
         }
@@ -1160,24 +1174,38 @@ impl ResultTabsWidget {
             .active_index
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let group_matches = index
+        index
             .and_then(|idx| {
                 self.data
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .get(idx)
-                    .map(|tab| tab.group.clone())
+                    .map(|tab| (tab.id, tab.group.clone()))
             })
-            .is_some_and(|group| {
+            .and_then(|(id, group)| {
                 self.data_tabs
                     .value()
                     .is_some_and(|current| current.as_widget_ptr() == group.as_widget_ptr())
-            });
-        if group_matches {
-            index
-        } else {
-            None
-        }
+                    .then_some(id)
+            })
+    }
+
+    pub(crate) fn result_tab_index_for_id(&self, id: ResultTabId) -> Option<usize> {
+        self.data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .position(|tab| tab.id == id)
+    }
+
+    pub(crate) fn reserve_result_tab_id(&self) -> ResultTabId {
+        let mut next_id = self
+            .next_result_tab_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let id = ResultTabId::new(*next_id);
+        *next_id = next_id.saturating_add(1).max(1);
+        id
     }
 
     pub fn append_script_output_lines(&mut self, lines: &[String]) {
@@ -1210,7 +1238,13 @@ impl ResultTabsWidget {
         self.select_explain_plan();
     }
 
-    pub fn start_statement(&mut self, index: usize, _label: &str) {
+    fn start_statement_with_selection(
+        &mut self,
+        index: usize,
+        _label: &str,
+        select_tab: bool,
+        id: Option<ResultTabId>,
+    ) {
         let _pointer_suppress_guard =
             PointerEventSuppressGuard::new(self.suppress_pointer_event_depth.clone());
         let existing_group = self
@@ -1219,12 +1253,14 @@ impl ResultTabsWidget {
         if let Some(group) = existing_group {
             // Extract the group before calling set_value to avoid re-entrant borrow
             // when the tabs callback fires
-            self.select_top_group(&self.sections.data_grid.clone());
-            let _ = self.data_tabs.set_value(&group);
-            *self
-                .active_index
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(index);
+            if select_tab {
+                self.select_top_group(&self.sections.data_grid.clone());
+                let _ = self.data_tabs.set_value(&group);
+                *self
+                    .active_index
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(index);
+            }
             return;
         }
 
@@ -1241,6 +1277,7 @@ impl ResultTabsWidget {
         group.set_label_color(theme::text_secondary());
         group.set_align(Align::Center | Align::Inside);
         group.set_trigger(CallbackTrigger::Closed);
+        let id = id.unwrap_or_else(|| self.reserve_result_tab_id());
         let group_ptr = group.as_widget_ptr() as usize;
         let data_for_close = self.data.clone();
         let on_close_for_group = self.on_close_callback.clone();
@@ -1248,13 +1285,19 @@ impl ResultTabsWidget {
             if app::callback_reason() != CallbackReason::Closed {
                 return;
             }
-            let index = data_for_close
+            let tab_id = data_for_close
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .iter()
-                .position(|tab| tab.group.as_widget_ptr() as usize == group_ptr);
-            if let Some(index) = index {
-                Self::fire_on_close_with(&on_close_for_group, ResultTabCloseTarget::Result(index));
+                .find_map(|tab| {
+                    if tab.group.as_widget_ptr() as usize == group_ptr {
+                        Some(tab.id)
+                    } else {
+                        None
+                    }
+                });
+            if let Some(tab_id) = tab_id {
+                Self::fire_on_close_with(&on_close_for_group, ResultTabCloseTarget::Result(tab_id));
             }
         });
 
@@ -1295,6 +1338,7 @@ impl ResultTabsWidget {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             data.push(ResultTab {
+                id,
                 group,
                 table,
                 status: ResultTabStatus::Running,
@@ -1306,19 +1350,37 @@ impl ResultTabsWidget {
         };
         // Extract the group before calling set_value to avoid re-entrant borrow
         // when the tabs callback fires
-        if let Some(group) = new_group {
-            self.select_top_group(&self.sections.data_grid.clone());
-            let _ = self.data_tabs.set_value(&group);
+        if select_tab {
+            if let Some(group) = new_group {
+                self.select_top_group(&self.sections.data_grid.clone());
+                let _ = self.data_tabs.set_value(&group);
+            }
+            *self
+                .active_index
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(new_index);
         }
         self.reset_tab_strip_left_anchor();
-        *self
-            .active_index
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(new_index);
         self.fire_on_change_callback();
     }
 
-    pub fn start_streaming(&mut self, index: usize, columns: &[String], null_text: &str) {
+    pub(crate) fn ensure_statement_tab_by_id(
+        &mut self,
+        id: ResultTabId,
+        label: &str,
+        select_tab: bool,
+    ) -> Option<usize> {
+        if let Some(index) = self.result_tab_index_for_id(id) {
+            self.start_statement_with_selection(index, label, select_tab, Some(id));
+            return Some(index);
+        }
+
+        let index = self.tab_count();
+        self.start_statement_with_selection(index, label, select_tab, Some(id));
+        self.result_tab_index_for_id(id)
+    }
+
+    fn start_streaming(&mut self, index: usize, columns: &[String], null_text: &str) {
         let status = self
             .data
             .lock()
@@ -1335,7 +1397,18 @@ impl ResultTabsWidget {
         self.fire_on_change_callback();
     }
 
-    pub fn append_rows(&mut self, index: usize, rows: Vec<Vec<String>>) {
+    pub(crate) fn start_streaming_by_id(
+        &mut self,
+        id: ResultTabId,
+        columns: &[String],
+        null_text: &str,
+    ) {
+        if let Some(index) = self.result_tab_index_for_id(id) {
+            self.start_streaming(index, columns, null_text);
+        }
+    }
+
+    fn append_rows(&mut self, index: usize, rows: Vec<Vec<String>>) {
         let rows_len = rows.len();
         let table = {
             let data = self
@@ -1359,7 +1432,13 @@ impl ResultTabsWidget {
         }
     }
 
-    pub fn finish_streaming(&mut self, index: usize) {
+    pub(crate) fn append_rows_by_id(&mut self, id: ResultTabId, rows: Vec<Vec<String>>) {
+        if let Some(index) = self.result_tab_index_for_id(id) {
+            self.append_rows(index, rows);
+        }
+    }
+
+    fn finish_streaming(&mut self, index: usize) {
         let table = self
             .data
             .lock()
@@ -1372,7 +1451,13 @@ impl ResultTabsWidget {
         self.fire_on_change_callback();
     }
 
-    pub fn set_lazy_fetch_session(&mut self, index: usize, session_id: u64) {
+    pub(crate) fn finish_streaming_by_id(&mut self, id: ResultTabId) {
+        if let Some(index) = self.result_tab_index_for_id(id) {
+            self.finish_streaming(index);
+        }
+    }
+
+    fn set_lazy_fetch_session(&mut self, index: usize, session_id: u64) {
         let table = self
             .data
             .lock()
@@ -1385,7 +1470,13 @@ impl ResultTabsWidget {
         self.fire_on_change_callback();
     }
 
-    pub fn mark_lazy_fetch_waiting(&mut self, index: usize, session_id: u64) {
+    pub(crate) fn set_lazy_fetch_session_by_id(&mut self, id: ResultTabId, session_id: u64) {
+        if let Some(index) = self.result_tab_index_for_id(id) {
+            self.set_lazy_fetch_session(index, session_id);
+        }
+    }
+
+    fn mark_lazy_fetch_waiting(&mut self, index: usize, session_id: u64) {
         let tab_parts = self
             .data
             .lock()
@@ -1399,12 +1490,30 @@ impl ResultTabsWidget {
         self.fire_on_change_callback();
     }
 
-    pub fn mark_statement_canceling(&mut self, index: usize) {
+    pub(crate) fn mark_lazy_fetch_waiting_by_id(&mut self, id: ResultTabId, session_id: u64) {
+        if let Some(index) = self.result_tab_index_for_id(id) {
+            self.mark_lazy_fetch_waiting(index, session_id);
+        }
+    }
+
+    fn mark_statement_canceling(&mut self, index: usize) {
         self.mark_statement_status(index, ResultTabStatus::Canceling);
     }
 
-    pub fn mark_statement_cancelled(&mut self, index: usize) {
+    pub(crate) fn mark_statement_canceling_by_id(&mut self, id: ResultTabId) {
+        if let Some(index) = self.result_tab_index_for_id(id) {
+            self.mark_statement_canceling(index);
+        }
+    }
+
+    fn mark_statement_cancelled(&mut self, index: usize) {
         self.mark_statement_status(index, ResultTabStatus::Cancelled);
+    }
+
+    pub(crate) fn mark_statement_cancelled_by_id(&mut self, id: ResultTabId) {
+        if let Some(index) = self.result_tab_index_for_id(id) {
+            self.mark_statement_cancelled(index);
+        }
     }
 
     fn mark_statement_status(&mut self, index: usize, status: ResultTabStatus) {
@@ -1447,7 +1556,7 @@ impl ResultTabsWidget {
         true
     }
 
-    pub fn clear_lazy_fetch_session(&mut self, index: usize, session_id: u64, run_pending: bool) {
+    fn clear_lazy_fetch_session(&mut self, index: usize, session_id: u64, run_pending: bool) {
         let tab_parts = self
             .data
             .lock()
@@ -1464,6 +1573,17 @@ impl ResultTabsWidget {
             table.clear_lazy_fetch_session(session_id, run_pending);
         }
         self.fire_on_change_callback();
+    }
+
+    pub(crate) fn clear_lazy_fetch_session_by_id(
+        &mut self,
+        id: ResultTabId,
+        session_id: u64,
+        run_pending: bool,
+    ) {
+        if let Some(index) = self.result_tab_index_for_id(id) {
+            self.clear_lazy_fetch_session(index, session_id, run_pending);
+        }
     }
 
     pub fn abort_lazy_fetch_session(&mut self, session_id: u64) -> bool {
@@ -1595,7 +1715,7 @@ impl ResultTabsWidget {
         self.tabs.redraw();
     }
 
-    pub fn display_result(&mut self, index: usize, result: &crate::db::QueryResult) {
+    fn display_result(&mut self, index: usize, result: &crate::db::QueryResult) {
         let status = ResultTabStatus::from_query_result(result);
         let table = self
             .set_result_tab_state(index, status, result.row_count)
@@ -1607,10 +1727,30 @@ impl ResultTabsWidget {
         self.fire_on_change_callback();
     }
 
-    pub fn finish_result_status(&mut self, index: usize, result: &crate::db::QueryResult) {
+    pub(crate) fn display_result_by_id(
+        &mut self,
+        id: ResultTabId,
+        result: &crate::db::QueryResult,
+    ) {
+        if let Some(index) = self.result_tab_index_for_id(id) {
+            self.display_result(index, result);
+        }
+    }
+
+    fn finish_result_status(&mut self, index: usize, result: &crate::db::QueryResult) {
         let status = ResultTabStatus::from_query_result(result);
         let _ = self.set_result_tab_state(index, status, result.row_count);
         self.fire_on_change_callback();
+    }
+
+    pub(crate) fn finish_result_status_by_id(
+        &mut self,
+        id: ResultTabId,
+        result: &crate::db::QueryResult,
+    ) {
+        if let Some(index) = self.result_tab_index_for_id(id) {
+            self.finish_result_status(index, result);
+        }
     }
 
     /// Deliver a result-grid edit execution's terminal (DML) result to the
@@ -1619,7 +1759,7 @@ impl ResultTabsWidget {
     /// edits on failure. Unlike `display_result` this does not overwrite the
     /// tab's status/row-count badge, because the editable grid keeps showing
     /// the original result set rather than the DML's affected-row summary.
-    pub fn deliver_result_grid_execution_result(
+    fn deliver_result_grid_execution_result(
         &mut self,
         index: usize,
         result: &crate::db::QueryResult,
@@ -1635,6 +1775,16 @@ impl ResultTabsWidget {
             table.display_result(result);
         }
         self.fire_on_change_callback();
+    }
+
+    pub(crate) fn deliver_result_grid_execution_result_by_id(
+        &mut self,
+        id: ResultTabId,
+        result: &crate::db::QueryResult,
+    ) {
+        if let Some(index) = self.result_tab_index_for_id(id) {
+            self.deliver_result_grid_execution_result(index, result);
+        }
     }
 
     pub fn set_execute_sql_callback(&mut self, callback: ResultGridSqlExecuteCallback) {
@@ -1883,19 +2033,21 @@ impl ResultTabsWidget {
         false
     }
 
-    pub fn close_current_tab_and_take_lazy_fetch(&mut self) -> Option<(usize, Option<u64>)> {
-        let index = (*self
-            .active_index
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()))?;
-
-        self.close_tab_at_and_take_lazy_fetch(index)
+    fn close_current_tab_and_take_lazy_fetch(&mut self) -> Option<(ResultTabId, Option<u64>)> {
+        let id = self.active_result_id()?;
+        self.close_tab_by_id_and_take_lazy_fetch(id)
     }
 
-    pub fn close_tab_at_and_take_lazy_fetch(
+    pub(crate) fn close_tab_by_id_and_take_lazy_fetch(
         &mut self,
-        index: usize,
-    ) -> Option<(usize, Option<u64>)> {
+        id: ResultTabId,
+    ) -> Option<(ResultTabId, Option<u64>)> {
+        let index = self.result_tab_index_for_id(id)?;
+        let (_, lazy_fetch_session) = self.close_tab_at_and_take_lazy_fetch(index)?;
+        Some((id, lazy_fetch_session))
+    }
+
+    fn close_tab_at_and_take_lazy_fetch(&mut self, index: usize) -> Option<(usize, Option<u64>)> {
         let active_before = *self
             .active_index
             .lock()
@@ -1972,27 +2124,6 @@ impl ResultTabsWidget {
             PointerEventSuppressGuard::new(self.suppress_pointer_event_depth.clone());
         self.select_top_group(&self.sections.script_output.clone());
         Self::select_text_tab(&mut self.script_tabs, &self.script_output);
-        self.fire_on_change_callback();
-    }
-
-    pub fn select_data_grid(&mut self, index: usize) {
-        let group = self
-            .data
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(index)
-            .map(|tab| tab.group.clone());
-        let Some(group) = group else {
-            return;
-        };
-        self.select_top_group(&self.sections.data_grid.clone());
-        if !self.data_tabs.was_deleted() && !group.was_deleted() {
-            let _ = self.data_tabs.set_value(&group);
-        }
-        *self
-            .active_index
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(index);
         self.fire_on_change_callback();
     }
 
