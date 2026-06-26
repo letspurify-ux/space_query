@@ -2779,9 +2779,7 @@ impl SqlEditorWidget {
             suggestions
         } else if let Some(suggestions) = oracle_trigger_update_of_column_suggestions.clone() {
             suggestions
-        } else if at_oracle_trigger_when_condition {
-            Vec::new()
-        } else if at_package_declaration_default_value_empty_operand_start {
+        } else if at_oracle_trigger_when_condition || at_package_declaration_default_value_empty_operand_start {
             Vec::new()
         } else if at_keyword_only_identifier_slot
             || at_column_property_argument_slot
@@ -8970,7 +8968,7 @@ impl SqlEditorWidget {
             return Some(Vec::new());
         }
 
-        let before_refs = before.iter().copied().collect::<Vec<_>>();
+        let before_refs = before.to_vec();
         let (table, _after_table) = Self::mysql_identifier_chain(&before_refs, on_idx + 1)?;
         Some(vec![table])
     }
@@ -9847,9 +9845,9 @@ impl SqlEditorWidget {
                 .is_some_and(|(value, is_bind)| Self::is_row_count_tail_word(value, *is_bind))
         };
         let mysql = crate::sql_text::mysql_compatibility_for_sql("", db_type);
-        let oracle_only = matches!(db_type, Some(crate::db::DatabaseType::Oracle));
+        let mysql_family = db_type.is_none_or(|db_type| db_type.is_mysql_or_mariadb());
 
-        if len >= 2 && word(2) == Some("LIMIT") && is_count(1) && !oracle_only {
+        if len >= 2 && word(2) == Some("LIMIT") && is_count(1) && mysql_family {
             return Some(OFFSET_KEYWORDS);
         }
 
@@ -11673,15 +11671,13 @@ impl SqlEditorWidget {
         if !matches!(
             toks.get(last),
             Some(SqlToken::Word(word))
-                if !Self::is_ddl_structural_keyword(word)
-                    && !(word.eq_ignore_ascii_case("NESTED")
-                        && Self::cursor_is_inside_table_function_columns_clause_matching(
-                            tokens,
-                            end,
-                            |table_fn| table_fn.eq_ignore_ascii_case("JSON_TABLE"),
-                        ))
-        )
-        {
+                if !(Self::is_ddl_structural_keyword(word)
+                    || Self::cursor_is_inside_table_function_columns_clause_matching(
+                        tokens,
+                        end,
+                        |table_fn| table_fn.eq_ignore_ascii_case("JSON_TABLE"),
+                    ) && word.eq_ignore_ascii_case("NESTED"))
+        ) {
             return false;
         }
         let anchored = matches!(toks.get(last - 1), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("COLUMNS"))
@@ -11841,8 +11837,10 @@ impl SqlEditorWidget {
             matches!(
                 toks.get(idx),
                 Some(SqlToken::Word(word))
-                    if !Self::is_ddl_structural_keyword(word)
-                        && !(in_json_table && word.eq_ignore_ascii_case("NESTED"))
+                    if !(
+                        Self::is_ddl_structural_keyword(word)
+                            || in_json_table && word.eq_ignore_ascii_case("NESTED")
+                    )
             )
         };
         let is_column_name_anchor = |idx: usize| {
@@ -12013,8 +12011,8 @@ impl SqlEditorWidget {
         if !matches!(
             tail.first(),
             Some(SqlToken::Word(word))
-                if !Self::is_ddl_structural_keyword(word)
-                    && !(in_json_table && word.eq_ignore_ascii_case("NESTED"))
+                if !(Self::is_ddl_structural_keyword(word)
+                    || in_json_table && word.eq_ignore_ascii_case("NESTED"))
         ) {
             return None;
         }
@@ -12320,11 +12318,11 @@ impl SqlEditorWidget {
         words
     }
 
-    fn top_level_tokens_after_open_paren<'a>(
-        tokens: &'a [SqlToken],
+    fn top_level_tokens_after_open_paren(
+        tokens: &[SqlToken],
         open_idx: usize,
         end: usize,
-    ) -> Vec<&'a SqlToken> {
+    ) -> Vec<&SqlToken> {
         let mut depth = 0i32;
         let mut top_level_tokens = Vec::new();
         for token in tokens
@@ -16931,9 +16929,7 @@ impl SqlEditorWidget {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        let Some(select_idx) = words.iter().rposition(|word| word == "SELECT") else {
-            return None;
-        };
+        let select_idx = words.iter().rposition(|word| word == "SELECT")?;
         let tail = &words[select_idx + 1..];
 
         if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
@@ -18627,11 +18623,8 @@ impl SqlEditorWidget {
         }
 
         let current_def = &body[segment_start..];
-        let Some(active_marker) =
-            Self::create_table_definition_active_column_reference_marker(current_def)
-        else {
-            return None;
-        };
+        let active_marker =
+            Self::create_table_definition_active_column_reference_marker(current_def)?;
         if active_marker != "AS" {
             if let Some(column) = Self::create_table_column_name_from_definition(current_def) {
             declared_columns.push(column);
@@ -20306,10 +20299,10 @@ impl SqlEditorWidget {
         (!parts.is_empty() && !expect_name).then_some((parts.join("."), idx))
     }
 
-    fn mysql_load_file_target_table_tail<'a>(
-        tokens: &'a [SqlToken],
+    fn mysql_load_file_target_table_tail(
+        tokens: &[SqlToken],
         end: usize,
-    ) -> Option<(String, Vec<&'a SqlToken>)> {
+    ) -> Option<(String, Vec<&SqlToken>)> {
         let toks = Self::meaningful_tokens_before(tokens, end);
         if !matches!(
             toks.as_slice(),
@@ -20848,7 +20841,7 @@ impl SqlEditorWidget {
                 matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("ON"))
                     .then_some(trigger_idx + 1 + offset)
             })
-            .last()
+            .next_back()
         else {
             return false;
         };
@@ -20929,8 +20922,8 @@ impl SqlEditorWidget {
                 matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("ON"))
                     .then_some(trigger_idx + 1 + offset)
             })
-            .last()?;
-        let before_refs = before.iter().copied().collect::<Vec<_>>();
+            .next_back()?;
+        let before_refs = before.to_vec();
         let (default_scope, parent_scope) =
             Self::oracle_trigger_target_scopes(&before_refs, on_idx)?;
         let event_words = before
@@ -21155,11 +21148,11 @@ impl SqlEditorWidget {
                 matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("ON"))
                     .then_some(trigger_idx + 1 + offset)
             })
-            .last()
+            .next_back()
         else {
             return false;
         };
-        let before_refs = before.iter().copied().collect::<Vec<_>>();
+        let before_refs = before.to_vec();
         Self::oracle_trigger_target_scopes(&before_refs, on_idx)
             .is_some_and(|(_scope, parent_scope)| parent_scope.is_some())
     }
@@ -21339,11 +21332,8 @@ impl SqlEditorWidget {
         }
 
         let current_def = Self::current_create_table_definition(&after_add[segment_start..]);
-        let Some(active_marker) =
-            Self::create_table_definition_active_column_reference_marker(current_def)
-        else {
-            return None;
-        };
+        let active_marker =
+            Self::create_table_definition_active_column_reference_marker(current_def)?;
         if active_marker != "AS" {
             if let Some(column) = column_name_from_alter_definition(current_def) {
             declared_columns.push(column);
@@ -21975,7 +21965,7 @@ impl SqlEditorWidget {
         words: &[String],
     ) -> Option<&'static [&'static str]> {
         let tail = Self::create_object_tail_after_type(words)?;
-        let has_as = tail.iter().any(|word| *word == "AS");
+        let has_as = tail.contains(&"AS");
         if has_as {
             return None;
         }
@@ -22341,9 +22331,7 @@ impl SqlEditorWidget {
     }
 
     fn create_object_tail_after_type(words: &[String]) -> Option<Vec<&str>> {
-        let Some((_, words_after_type)) = Self::leading_ddl_object_type(words) else {
-            return None;
-        };
+        let (_, words_after_type) = Self::leading_ddl_object_type(words)?;
         if words_after_type == 0 {
             return None;
         }
@@ -22373,8 +22361,8 @@ impl SqlEditorWidget {
         match tail.as_slice() {
             [_name] => Some(&["BINDING"]),
             [.., "RETURN"] => None,
-            _ if tail.iter().any(|word| *word == "RETURN")
-                && !tail.iter().any(|word| *word == "USING") =>
+            _ if tail.contains(&"RETURN")
+                && !tail.contains(&"USING") =>
             {
                 Some(&["USING"])
             }
@@ -22390,15 +22378,15 @@ impl SqlEditorWidget {
         match tail.as_slice() {
             [_name] => Some(&["FOR"]),
             [_name, "FOR"] => None,
-            _ if tail.iter().any(|word| *word == "FOR") && !tail.iter().any(|word| *word == "USING") => {
+            _ if tail.contains(&"FOR") && !tail.contains(&"USING") => {
                 Some(&["USING"])
             }
             [.., "USING"] => None,
             [.., "WITH"] => Some(&["LOCAL"]),
             [.., "WITH", "LOCAL"] => Some(&["RANGE"]),
             [.., "WITH", "LOCAL", "RANGE"] => Some(&["PARTITION"]),
-            _ if tail.iter().any(|word| *word == "USING")
-                && !tail.iter().any(|word| *word == "WITH") =>
+            _ if tail.contains(&"USING")
+                && !tail.contains(&"WITH") =>
             {
                 Some(&["WITH"])
             }
@@ -22422,9 +22410,7 @@ impl SqlEditorWidget {
     fn expected_create_context_tail_keywords(
         words: &[String],
     ) -> Option<&'static [&'static str]> {
-        let Some((_, words_after_type)) = Self::leading_ddl_object_type(words) else {
-            return None;
-        };
+        let (_, words_after_type) = Self::leading_ddl_object_type(words)?;
         if words_after_type == 0 {
             return None;
         }
@@ -22501,9 +22487,7 @@ impl SqlEditorWidget {
     fn expected_create_java_object_tail_keywords(
         words: &[String],
     ) -> Option<&'static [&'static str]> {
-        let Some((_, words_after_type)) = Self::leading_ddl_object_type(words) else {
-            return None;
-        };
+        let (_, words_after_type) = Self::leading_ddl_object_type(words)?;
         if words_after_type == 0 {
             return None;
         }
@@ -22516,7 +22500,7 @@ impl SqlEditorWidget {
             ["NAMED"] => None,
             ["NAMED", _name] => Some(&["AS"]),
             [.., "AS"] => Some(&[]),
-            _ if tail.iter().any(|word| *word == "AS") => Some(&[]),
+            _ if tail.contains(&"AS") => Some(&[]),
             _ => Some(&["AS"]),
         }
     }
@@ -22524,9 +22508,7 @@ impl SqlEditorWidget {
     fn expected_create_database_link_tail_keywords(
         words: &[String],
     ) -> Option<&'static [&'static str]> {
-        let Some((_, words_after_type)) = Self::leading_ddl_object_type(words) else {
-            return None;
-        };
+        let (_, words_after_type) = Self::leading_ddl_object_type(words)?;
         if words_after_type == 0 {
             return None;
         }
@@ -22548,7 +22530,7 @@ impl SqlEditorWidget {
             // grammatical.
             [.., "BY"] | [.., "USING"] => Some(&[]),
             _ => {
-                let has_using = tail.iter().any(|word| *word == "USING");
+                let has_using = tail.contains(&"USING");
                 if has_using {
                     return Some(&[]);
                 }
@@ -22556,7 +22538,7 @@ impl SqlEditorWidget {
                     matches!(window, ["IDENTIFIED", "BY", value] if !matches!(*value, "__VALUE__"))
                 });
                 if credential_completed {
-                    if tail.iter().any(|word| *word == "AUTHENTICATED") {
+                    if tail.contains(&"AUTHENTICATED") {
                         Some(&["USING"])
                     } else {
                         Some(&["AUTHENTICATED BY", "USING"])
@@ -22647,9 +22629,7 @@ impl SqlEditorWidget {
     }
 
     fn expected_alter_type_tail_keywords(words: &[String]) -> Option<&'static [&'static str]> {
-        let Some((_, words_after_type)) = Self::leading_ddl_object_type(words) else {
-            return None;
-        };
+        let (_, words_after_type) = Self::leading_ddl_object_type(words)?;
         if words_after_type == 0 {
             return None;
         }
@@ -27032,10 +27012,10 @@ impl SqlEditorWidget {
             matches!(toks.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case(kw))
         };
         let mysql = crate::sql_text::mysql_compatibility_for_sql("", db_type);
-        let oracle_only = matches!(db_type, Some(crate::db::DatabaseType::Oracle));
+        let mysql_family = db_type.is_none_or(|db_type| db_type.is_mysql_or_mariadb());
 
         // `LIMIT |` / `OFFSET |`.
-        if (is_word(n - 1, "LIMIT") && !oracle_only) || (is_word(n - 1, "OFFSET") && !mysql) {
+        if (is_word(n - 1, "LIMIT") && mysql_family) || (is_word(n - 1, "OFFSET") && !mysql) {
             return true;
         }
         // MySQL `LIMIT <offset>, |` — the count after the comma.
@@ -27071,17 +27051,6 @@ impl SqlEditorWidget {
             || Self::cursor_is_after_complete_row_limiting_tail(tokens, end, phase, db_type)
     }
 
-    fn cursor_is_in_row_limiting_clause_for_context(
-        deep_ctx: &intellisense_context::CursorContext,
-        exclude_current_identifier_chain: bool,
-    ) -> bool {
-        Self::cursor_is_in_row_limiting_clause_for_context_for_db(
-            deep_ctx,
-            exclude_current_identifier_chain,
-            None,
-        )
-    }
-
     fn cursor_is_in_row_limiting_clause_for_context_for_db(
         deep_ctx: &intellisense_context::CursorContext,
         exclude_current_identifier_chain: bool,
@@ -27107,6 +27076,18 @@ impl SqlEditorWidget {
             return false;
         }
         Self::cursor_is_in_row_limiting_clause(tokens, end, deep_ctx.phase, db_type)
+    }
+
+    #[cfg(test)]
+    fn cursor_is_in_row_limiting_clause_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> bool {
+        Self::cursor_is_in_row_limiting_clause_for_context_for_db(
+            deep_ctx,
+            exclude_current_identifier_chain,
+            None,
+        )
     }
 
     fn previous_meaningful_words_with_bind_markers_upper(
@@ -34513,7 +34494,7 @@ impl SqlEditorWidget {
                 .is_some_and(|(value, is_bind)| Self::is_row_count_tail_word(value, *is_bind))
         };
         let mysql = crate::sql_text::mysql_compatibility_for_sql("", db_type);
-        let oracle_only = matches!(db_type, Some(crate::db::DatabaseType::Oracle));
+        let mysql_family = db_type.is_none_or(|db_type| db_type.is_mysql_or_mariadb());
 
         // ANSI/Oracle: `FETCH FIRST|NEXT [n [PERCENT]] ROWS ONLY`.
         if !mysql
@@ -34536,7 +34517,7 @@ impl SqlEditorWidget {
             return false;
         }
         // MySQL/MariaDB: `LIMIT count OFFSET offset`.
-        if !oracle_only
+        if mysql_family
             && len >= 4
             && word(4) == Some("LIMIT")
             && is_count(3)
@@ -34548,7 +34529,7 @@ impl SqlEditorWidget {
         // MySQL/MariaDB: `LIMIT offset, count` (commas are skipped by the word
         // collector, so this deliberately also suppresses the invalid
         // `LIMIT offset count` lookalike instead of leaking identifiers).
-        if !oracle_only && len >= 3 && word(3) == Some("LIMIT") && is_count(2) && is_count(1) {
+        if mysql_family && len >= 3 && word(3) == Some("LIMIT") && is_count(2) && is_count(1) {
             return true;
         }
         false
@@ -37966,13 +37947,6 @@ impl SqlEditorWidget {
         tables
     }
 
-    fn resolve_column_tables_for_context(
-        qualifier: Option<&str>,
-        deep_ctx: &intellisense_context::CursorContext,
-    ) -> Vec<String> {
-        Self::resolve_column_tables_for_context_for_db(qualifier, deep_ctx, None)
-    }
-
     fn resolve_column_tables_for_context_for_db(
         qualifier: Option<&str>,
         deep_ctx: &intellisense_context::CursorContext,
@@ -38118,6 +38092,14 @@ impl SqlEditorWidget {
         let mut resolved = resolved;
         prepend_virtual_alias_if_present(&mut resolved, qualifier, deep_ctx);
         resolved
+    }
+
+    #[cfg(test)]
+    fn resolve_column_tables_for_context(
+        qualifier: Option<&str>,
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> Vec<String> {
+        Self::resolve_column_tables_for_context_for_db(qualifier, deep_ctx, None)
     }
 
     fn token_is_qualified_identifier_segment(token: &SqlToken) -> bool {
@@ -38325,6 +38307,7 @@ impl SqlEditorWidget {
             .collect()
     }
 
+    #[cfg(test)]
     fn comparison_lookup_tables_for_context(
         qualifier: Option<&str>,
         deep_ctx: &intellisense_context::CursorContext,
@@ -38374,6 +38357,7 @@ impl SqlEditorWidget {
         Self::column_lookup_table_for_table_ref(table_ref, deep_ctx)
     }
 
+    #[cfg(test)]
     fn collect_qualified_condition_comparison_suggestions(
         data: &IntellisenseData,
         prefix: &str,
@@ -38381,7 +38365,11 @@ impl SqlEditorWidget {
         deep_ctx: &intellisense_context::CursorContext,
     ) -> Vec<String> {
         Self::collect_qualified_condition_comparison_suggestions_for_db(
-            data, prefix, qualifier, deep_ctx, None,
+            data,
+            prefix,
+            qualifier,
+            deep_ctx,
+            None,
         )
     }
 
