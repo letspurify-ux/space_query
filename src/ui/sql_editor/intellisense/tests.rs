@@ -26903,6 +26903,40 @@ fn maintenance_object_targets_are_dialect_scoped() {
         }
     }
 
+    for db in [MySQL, MariaDB] {
+        for sql in [
+            "ANALYZE CLUSTER |",
+            "TRUNCATE CLUSTER |",
+            "PURGE RECYCLEBIN |",
+            "PURGE TABLESPACE |",
+            "PURGE TABLESPACE users |",
+        ] {
+            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+            assert!(
+                kind.is_none() || matches!(kind, Some(ExpectedObjectSuggestionKind::NoSuggestions)),
+                "Oracle-only maintenance target resolved in {db:?} mode at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+            for leaked in [
+                "EMP",
+                "DEPT",
+                "EMP_CLUSTER",
+                "EMP_IDX",
+                "TABLE",
+                "INDEX",
+                "CLUSTER",
+                "RECYCLEBIN",
+                "TABLESPACE",
+                "BEFORE",
+                "TO",
+            ] {
+                assert!(
+                    !contains(&final_suggestions, leaked),
+                    "{leaked} leaked into Oracle-only maintenance target in {db:?} mode at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+                );
+            }
+        }
+    }
+
     for (db, sql, expected_kind, expected) in [
         (
             MySQL,
@@ -26999,6 +27033,50 @@ fn dialect_specific_object_kind_slots_do_not_open_wrong_catalogs() {
             .iter()
             .any(|value| value.eq_ignore_ascii_case(needle))
     };
+    let catalog_or_keyword_noise = [
+        "EMP",
+        "DEPT",
+        "T",
+        "T1",
+        "S",
+        "P",
+        "EMP_V",
+        "MVIEW_SALES",
+        "ADDRESS_T",
+        "APP_USER",
+        "SCOTT",
+        "RUN_JOB",
+        "CALC_TOTAL",
+        "BI_EMP",
+        "CLEANUP_EVENT",
+        "IDX_EMP_NAME",
+        "HR_PKG",
+        "EMP_SEQ",
+        "EMP_SYN",
+        "PUBLIC_EMP",
+        "APP_LINK",
+        "DATA_PUMP_DIR",
+        "APP_LIB",
+        "EMP_CLUSTER",
+        "APP_CTX",
+        "SALES_DIM",
+        "TEXT_OP",
+        "TEXT_ITYPE",
+        "ORA_EDITION",
+        "Welcome",
+        "WelcomeClass",
+        "WelcomeRes",
+        "SELECT",
+        "WHERE",
+        "NOT",
+        "NULL",
+        "NTH_VALUE",
+        "NTILE",
+        "NVL",
+        "NVL()",
+        "NEXT_DAY()",
+        "NULLIF()",
+    ];
 
     for db in [MySQL, MariaDB] {
         for (sql, leaked) in [
@@ -27077,6 +27155,12 @@ fn dialect_specific_object_kind_slots_do_not_open_wrong_catalogs() {
                 !contains(&final_suggestions, leaked),
                 "Oracle-only catalog item {leaked} leaked in {db:?} mode at `{sql}`: {final_suggestions:?}"
             );
+            for item in catalog_or_keyword_noise {
+                assert!(
+                    !contains(&final_suggestions, item),
+                    "{item} leaked into wrong-dialect object slot at `{sql}` for {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+                );
+            }
         }
     }
 
@@ -27091,6 +27175,12 @@ fn dialect_specific_object_kind_slots_do_not_open_wrong_catalogs() {
             !contains(&final_suggestions, "CLEANUP_EVENT"),
             "MySQL event catalog leaked in Oracle mode at `{sql}`: {final_suggestions:?}"
         );
+        for item in catalog_or_keyword_noise {
+            assert!(
+                !contains(&final_suggestions, item),
+                "{item} leaked into MySQL-only object slot in Oracle mode at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
     }
 
     for (db, sql, expected_kind, expected) in [
@@ -54713,6 +54803,114 @@ fn table_sample_prefixed_final_suggestions_are_oracle_only() {
 }
 
 #[test]
+fn mysql_family_oracle_only_post_table_modifier_slots_do_not_offer_catalog() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for db in [MySQL, MariaDB] {
+        for sql in [
+            "SELECT * FROM t PARTITION |",
+            "SELECT * FROM t PARTITION (|",
+            "SELECT * FROM t PARTITION (app|",
+            "SELECT * FROM t SUBPARTITION |",
+            "SELECT * FROM t SUBPARTITION (|",
+            "SELECT * FROM t SUBPARTITION (app|",
+            "SELECT * FROM t SUBPARTITION (s1) |",
+            "SELECT * FROM t PARTITION FOR |",
+            "SELECT * FROM t PARTITION FOR (|",
+            "SELECT * FROM t PARTITION FOR (app|",
+            "SELECT * FROM t PARTITION FOR (1) |",
+            "SELECT * FROM t SAMPLE |",
+            "SELECT * FROM t SAMPLE (|",
+            "SELECT * FROM t SAMPLE (app|",
+            "SELECT * FROM t SAMPLE (10) |",
+            "SELECT * FROM t SAMPLE BLOCK |",
+            "SELECT * FROM t SAMPLE BLOCK (|",
+            "SELECT * FROM t SAMPLE BLOCK (10) |",
+            "SELECT * FROM t TABLESAMPLE |",
+            "SELECT * FROM t TABLESAMPLE BERNOULLI |",
+            "SELECT * FROM t TABLESAMPLE BERNOULLI (|",
+            "SELECT * FROM t TABLESAMPLE BERNOULLI (10) |",
+        ] {
+            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+            assert!(
+                kind.is_none() || matches!(kind, Some(ExpectedObjectSuggestionKind::NoSuggestions)),
+                "Oracle-only post-table modifier slot resolved object kind in {db:?} at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+            assert!(
+                keywords.is_empty(),
+                "Oracle-only post-table modifier slot should not offer keywords in {db:?} at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+            for leaked in [
+                "EMP",
+                "DEPT",
+                "EMP_V",
+                "EMPNO",
+                "ENAME",
+                "APP_USER",
+                "SCOTT",
+                "RUN_JOB",
+                "CALC_TOTAL",
+                "BLOCK",
+                "JOIN",
+                "WHERE",
+                "GROUP BY",
+                "ORDER BY",
+                "SELECT",
+            ] {
+                assert!(
+                    !contains(&final_suggestions, leaked),
+                    "{leaked} leaked into Oracle-only post-table modifier slot in {db:?} at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn mysql_family_partition_selection_tail_keeps_query_continuation() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for db in [MySQL, MariaDB] {
+        for sql in [
+            "SELECT * FROM t PARTITION (p1) |",
+            "SELECT * FROM t PARTITION (p1, p2) |",
+            "SELECT * FROM t PARTITION (p1) x |",
+        ] {
+            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+            assert_eq!(
+                kind, None,
+                "MySQL-family partition selection tail should not resolve object kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+            );
+            assert!(
+                contains(&final_suggestions, "JOIN") && contains(&final_suggestions, "WHERE"),
+                "MySQL-family partition selection tail lost query continuation at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+            );
+            for leaked in [
+                "EMP",
+                "DEPT",
+                "EMP_V",
+                "EMPNO",
+                "ENAME",
+                "APP_USER",
+                "SCOTT",
+                "RUN_JOB",
+                "CALC_TOTAL",
+                "BLOCK",
+            ] {
+                assert!(
+                    !contains(&final_suggestions, leaked),
+                    "{leaked} leaked into MySQL-family partition selection tail at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn post_table_modifier_value_slots_do_not_offer_catalog() {
     use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
@@ -54851,8 +55049,54 @@ fn xmltable_subgrammar_is_confined_to_the_open_call() {
 }
 
 #[test]
+fn mysql_family_oracle_only_xmltable_slots_do_not_offer_catalog() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for db in [MySQL, MariaDB] {
+        for sql in [
+            "SELECT * FROM XMLTABLE('/a' |",
+            "SELECT * FROM XMLTABLE('/a' PASSING |",
+            "SELECT * FROM XMLTABLE('/a' PASSING x |",
+        ] {
+            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+            assert!(
+                kind.is_none() || matches!(kind, Some(ExpectedObjectSuggestionKind::NoSuggestions)),
+                "Oracle-only XMLTABLE slot resolved object kind in {db:?} at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+            assert!(
+                keywords.is_empty(),
+                "Oracle-only XMLTABLE slot should not offer keywords in {db:?} at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+            for leaked in [
+                "EMP",
+                "DEPT",
+                "EMP_V",
+                "EMPNO",
+                "ENAME",
+                "APP_USER",
+                "SCOTT",
+                "RUN_JOB",
+                "CALC_TOTAL",
+                "PASSING",
+                "COLUMNS",
+                "PATH",
+                "SELECT",
+                "WHERE",
+            ] {
+                assert!(
+                    !contains(&final_suggestions, leaked),
+                    "{leaked} leaked into Oracle-only XMLTABLE slot in {db:?} at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn closed_xmltable_and_json_table_tail_slots_do_not_offer_catalog() {
-    use crate::db::DatabaseType::Oracle;
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
     let assert_no_catalog_noise = |sql: &str, final_suggestions: &[String]| {
@@ -54908,6 +55152,32 @@ fn closed_xmltable_and_json_table_tail_slots_do_not_offer_catalog() {
             );
         }
         assert_no_catalog_noise(sql, &final_suggestions);
+    }
+
+    for db in [MySQL, MariaDB] {
+        for (sql, expected_keywords) in [
+            (
+                "SELECT * FROM JSON_TABLE(j, '$' COLUMNS (c INT PATH '$.x')) v |",
+                &["JOIN", "WHERE", "GROUP BY", "ORDER BY"][..],
+            ),
+            (
+                "SELECT * FROM t1 JOIN JSON_TABLE(j, '$' COLUMNS (c INT PATH '$.x')) v |",
+                &["ON", "USING"],
+            ),
+        ] {
+            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+            assert_eq!(
+                kind, None,
+                "closed JSON_TABLE tail should not resolve an object kind in {db:?} at `{sql}`; keywords={keywords:?} final={final_suggestions:?}"
+            );
+            for expected in expected_keywords {
+                assert!(
+                    contains(&final_suggestions, expected),
+                    "{expected} missing after closed JSON_TABLE in {db:?} at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+                );
+            }
+            assert_no_catalog_noise(sql, &final_suggestions);
+        }
     }
 }
 
@@ -66672,6 +66942,639 @@ fn completed_transaction_option_tails_do_not_reoffer_keywords_or_catalog() {
 }
 
 #[test]
+fn mysql_family_oracle_only_ddl_value_slots_do_not_offer_catalog_or_keywords() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for db in [MySQL, MariaDB] {
+        for sql in [
+            "COMMENT ON TABLE emp IS |",
+            "COMMENT ON TABLE emp IS app|",
+            "COMMENT ON COLUMN emp.sal IS |",
+            "COMMENT ON COLUMN emp.sal IS app|",
+            "COMMENT ON VIEW emp_v IS |",
+            "COMMENT ON MATERIALIZED VIEW mview_sales IS |",
+            "COMMENT ON OPERATOR text_op IS |",
+            "COMMENT ON INDEXTYPE text_itype IS |",
+            "CREATE ROLE r IDENTIFIED BY |",
+            "CREATE ROLE r IDENTIFIED BY app|",
+            "CREATE ROLE r IDENTIFIED GLOBALLY AS |",
+            "CREATE ROLE r IDENTIFIED GLOBALLY AS app|",
+            "CREATE ROLE r IDENTIFIED USING |",
+            "CREATE ROLE r IDENTIFIED USING app|",
+            "ALTER ROLE r IDENTIFIED BY |",
+            "ALTER ROLE r IDENTIFIED BY app|",
+            "ALTER ROLE r IDENTIFIED USING |",
+            "ALTER ROLE r IDENTIFIED USING app|",
+            "CREATE DIRECTORY d AS |",
+            "CREATE DIRECTORY d AS app|",
+            "CREATE DATABASE LINK l CONNECT TO |",
+            "CREATE DATABASE LINK l CONNECT TO app|",
+            "CREATE DATABASE LINK l CONNECT TO u IDENTIFIED BY |",
+            "CREATE DATABASE LINK l USING |",
+            "CREATE LIBRARY lib AS |",
+            "CREATE LIBRARY lib AS app|",
+            "CREATE JAVA SOURCE NAMED src AS |",
+            "CREATE JAVA SOURCE NAMED src AS app|",
+            "CREATE OR REPLACE JAVA SOURCE NAMED src AS |",
+            "CREATE OR REPLACE JAVA SOURCE NAMED src AS app|",
+        ] {
+            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+            assert!(
+                kind.is_none() || matches!(kind, Some(ExpectedObjectSuggestionKind::NoSuggestions)),
+                "Oracle-only DDL value slot resolved object kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+            );
+            for leaked in [
+                "EMP",
+                "DEPT",
+                "EMP_V",
+                "MVIEW_SALES",
+                "RUN_JOB",
+                "CALC_TOTAL",
+                "HR_PKG",
+                "ADDRESS_T",
+                "APP_USER",
+                "SCOTT",
+                "SELECT",
+                "WHERE",
+                "NOT",
+                "NULL",
+                "NTH_VALUE",
+                "NTILE",
+                "NVL",
+                "NVL()",
+                "NEXT_DAY()",
+                "NULLIF()",
+            ] {
+                assert!(
+                    !contains(&final_suggestions, leaked),
+                    "{leaked} leaked into MySQL-family Oracle-only DDL value slot at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn mysql_family_oracle_only_role_auth_slots_do_not_offer_catalog_or_keywords() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for db in [MySQL, MariaDB] {
+        for sql in [
+            "CREATE ROLE r IDENTIFIED |",
+            "CREATE ROLE r IDENTIFIED b|",
+            "CREATE ROLE r IDENTIFIED u|",
+            "CREATE ROLE r IDENTIFIED GLOBALLY |",
+            "CREATE ROLE r IDENTIFIED GLOBALLY a|",
+            "CREATE ROLE r NOT |",
+            "CREATE ROLE r NOT i|",
+            "ALTER ROLE r IDENTIFIED |",
+            "ALTER ROLE r IDENTIFIED b|",
+            "ALTER ROLE r IDENTIFIED u|",
+            "ALTER ROLE r NOT |",
+        ] {
+            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+            assert!(
+                kind.is_none() || matches!(kind, Some(ExpectedObjectSuggestionKind::NoSuggestions)),
+                "Oracle-only ROLE auth slot resolved object kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+            );
+            for leaked in [
+                "EMP",
+                "DEPT",
+                "EMP_V",
+                "RUN_JOB",
+                "CALC_TOTAL",
+                "HR_PKG",
+                "APP_USER",
+                "SCOTT",
+                "IDENTIFIED",
+                "BY",
+                "USING",
+                "EXTERNALLY",
+                "GLOBALLY",
+                "NOT",
+                "SELECT",
+                "WHERE",
+                "NULL",
+            ] {
+                assert!(
+                    !contains(&final_suggestions, leaked),
+                    "{leaked} leaked into MySQL-family Oracle-only ROLE auth slot at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn mysql_family_oracle_only_profile_slots_do_not_offer_catalog_or_keywords() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for db in [MySQL, MariaDB] {
+        for sql in [
+            "CREATE PROFILE p |",
+            "CREATE PROFILE p LIMIT |",
+            "CREATE PROFILE p LIMIT SESSIONS_PER_USER |",
+            "CREATE PROFILE p LIMIT SESSIONS_PER_USER 3 |",
+            "CREATE PROFILE p LIMIT PASSWORD_VERIFY_FUNCTION |",
+            "CREATE PROFILE p LIMIT PASSWORD_VERIFY_FUNCTION app|",
+            "ALTER PROFILE p |",
+            "ALTER PROFILE p LIMIT |",
+            "ALTER PROFILE p LIMIT PASSWORD_LIFE_TIME |",
+            "ALTER PROFILE p LIMIT PASSWORD_LIFE_TIME DEFAULT |",
+            "DROP PROFILE |",
+            "DROP PROFILE app|",
+            "ALTER PROFILE |",
+            "ALTER PROFILE app|",
+        ] {
+            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+            assert!(
+                kind.is_none() || matches!(kind, Some(ExpectedObjectSuggestionKind::NoSuggestions)),
+                "Oracle-only PROFILE slot resolved object kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+            );
+            for leaked in [
+                "EMP",
+                "DEPT",
+                "EMP_V",
+                "MVIEW_SALES",
+                "RUN_JOB",
+                "CALC_TOTAL",
+                "HR_PKG",
+                "APP_USER",
+                "SCOTT",
+                "LIMIT",
+                "SESSIONS_PER_USER",
+                "PASSWORD_VERIFY_FUNCTION",
+                "PASSWORD_LIFE_TIME",
+                "DEFAULT",
+                "UNLIMITED",
+                "NULL",
+                "SELECT",
+                "WHERE",
+            ] {
+                assert!(
+                    !contains(&final_suggestions, leaked),
+                    "{leaked} leaked into MySQL-family Oracle-only PROFILE slot at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn mysql_family_oracle_only_extended_object_slots_do_not_offer_catalog_or_keywords() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for db in [MySQL, MariaDB] {
+        for sql in [
+            "CREATE CONTEXT ctx |",
+            "CREATE CONTEXT ctx USING |",
+            "CREATE CONTEXT ctx USING app|",
+            "CREATE CONTEXT ctx USING app.|",
+            "CREATE DIMENSION dim |",
+            "CREATE DIMENSION dim LEVEL |",
+            "CREATE DIMENSION dim LEVEL app|",
+            "CREATE OPERATOR op |",
+            "CREATE OPERATOR op BINDING |",
+            "CREATE OPERATOR op BINDING (|",
+            "CREATE OPERATOR op BINDING (NUMBER) RETURN |",
+            "CREATE OPERATOR op BINDING (NUMBER) RETURN app|",
+            "CREATE OPERATOR op BINDING (NUMBER) RETURN NUMBER USING |",
+            "CREATE OPERATOR op BINDING (NUMBER) RETURN NUMBER USING app|",
+            "CREATE INDEXTYPE it |",
+            "CREATE INDEXTYPE it FOR |",
+            "CREATE INDEXTYPE it FOR app|",
+            "CREATE INDEXTYPE it FOR text_op USING |",
+            "CREATE INDEXTYPE it FOR text_op USING app|",
+            "CREATE EDITION ed |",
+            "CREATE EDITION ed AS |",
+            "CREATE EDITION ed AS CHILD |",
+            "CREATE EDITION ed AS CHILD OF |",
+            "CREATE EDITION ed AS CHILD OF ora|",
+            "ALTER EDITION ed |",
+            "ALTER EDITION ed USABLE |",
+            "DROP EDITION |",
+            "DROP EDITION app|",
+            "DROP EDITION ed |",
+        ] {
+            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+            assert!(
+                kind.is_none() || matches!(kind, Some(ExpectedObjectSuggestionKind::NoSuggestions)),
+                "Oracle-only extended object slot resolved object kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+            );
+            for leaked in [
+                "EMP",
+                "DEPT",
+                "EMP_V",
+                "MVIEW_SALES",
+                "RUN_JOB",
+                "CALC_TOTAL",
+                "HR_PKG",
+                "ADDRESS_T",
+                "TEXT_OP",
+                "TEXT_ITYPE",
+                "APP_USER",
+                "SCOTT",
+                "USING",
+                "BINDING",
+                "RETURN",
+                "FOR",
+                "LEVEL",
+                "HIERARCHY",
+                "ATTRIBUTE",
+                "AS",
+                "CHILD",
+                "OF",
+                "USABLE",
+                "UNUSABLE",
+                "ORA_EDITION",
+                "SELECT",
+                "WHERE",
+                "NULL",
+            ] {
+                assert!(
+                    !contains(&final_suggestions, leaked),
+                    "{leaked} leaked into MySQL-family Oracle-only extended object slot at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn mysql_family_oracle_only_materialized_view_tail_slots_do_not_offer_catalog_or_keywords() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for db in [MySQL, MariaDB] {
+        for sql in [
+            "CREATE MATERIALIZED VIEW mv |",
+            "CREATE MATERIALIZED VIEW mv BUILD |",
+            "CREATE MATERIALIZED VIEW mv BUILD IMMEDIATE |",
+            "CREATE MATERIALIZED VIEW mv REFRESH |",
+            "CREATE MATERIALIZED VIEW mv REFRESH FAST |",
+            "CREATE MATERIALIZED VIEW mv REFRESH FAST ON |",
+            "CREATE MATERIALIZED VIEW mv REFRESH FAST ON DEMAND |",
+            "CREATE MATERIALIZED VIEW mv ON |",
+            "CREATE MATERIALIZED VIEW mv ON PREBUILT |",
+            "CREATE MATERIALIZED VIEW mv ON PREBUILT TABLE |",
+            "CREATE MATERIALIZED VIEW LOG |",
+            "CREATE MATERIALIZED VIEW LOG ON |",
+            "CREATE MATERIALIZED VIEW LOG ON app|",
+            "ALTER MATERIALIZED VIEW mv |",
+            "DROP MATERIALIZED VIEW mv |",
+            "ALTER MATERIALIZED VIEW LOG ON |",
+            "ALTER MATERIALIZED VIEW LOG ON app|",
+            "DROP MATERIALIZED VIEW LOG ON |",
+            "DROP MATERIALIZED VIEW LOG ON app|",
+        ] {
+            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+            assert!(
+                kind.is_none() || matches!(kind, Some(ExpectedObjectSuggestionKind::NoSuggestions)),
+                "Oracle-only materialized-view tail resolved object kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+            );
+            for leaked in [
+                "EMP",
+                "DEPT",
+                "EMP_V",
+                "MVIEW_SALES",
+                "RUN_JOB",
+                "CALC_TOTAL",
+                "HR_PKG",
+                "ADDRESS_T",
+                "APP_USER",
+                "SCOTT",
+                "AS",
+                "BUILD IMMEDIATE",
+                "REFRESH FAST",
+                "ON PREBUILT TABLE",
+                "LOG",
+                "ON",
+                "SELECT",
+                "WHERE",
+                "NULL",
+            ] {
+                assert!(
+                    !contains(&final_suggestions, leaked),
+                    "{leaked} leaked into MySQL-family Oracle-only materialized-view tail at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn mysql_family_oracle_only_synonym_and_database_link_slots_do_not_offer_catalog_or_keywords() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for db in [MySQL, MariaDB] {
+        for sql in [
+            "CREATE SYNONYM syn |",
+            "CREATE SYNONYM syn FOR |",
+            "CREATE SYNONYM syn FOR app|",
+            "CREATE SYNONYM syn FOR app.|",
+            "CREATE PUBLIC SYNONYM syn |",
+            "CREATE PUBLIC SYNONYM syn FOR |",
+            "CREATE OR REPLACE PUBLIC SYNONYM syn FOR app|",
+            "ALTER PUBLIC SYNONYM |",
+            "ALTER PUBLIC SYNONYM app|",
+            "DROP SYNONYM syn |",
+            "DROP PUBLIC SYNONYM |",
+            "DROP PUBLIC SYNONYM app|",
+            "CREATE DATABASE LINK link |",
+            "CREATE PUBLIC DATABASE LINK link |",
+            "CREATE SHARED PUBLIC DATABASE LINK link |",
+            "CREATE DATABASE LINK link CONNECT |",
+            "CREATE DATABASE LINK link CONNECT TO user |",
+            "CREATE DATABASE LINK link CONNECT TO user IDENTIFIED |",
+            "CREATE DATABASE LINK link USING |",
+            "ALTER DATABASE LINK |",
+            "ALTER DATABASE LINK app|",
+            "ALTER PUBLIC DATABASE LINK |",
+            "ALTER PUBLIC DATABASE LINK app|",
+            "DROP DATABASE LINK |",
+            "DROP DATABASE LINK app|",
+            "DROP PUBLIC DATABASE LINK |",
+            "DROP PUBLIC DATABASE LINK app|",
+        ] {
+            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+            assert!(
+                kind.is_none() || matches!(kind, Some(ExpectedObjectSuggestionKind::NoSuggestions)),
+                "Oracle-only synonym/database-link slot resolved object kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+            );
+            for leaked in [
+                "EMP",
+                "DEPT",
+                "EMP_V",
+                "MVIEW_SALES",
+                "EMP_SEQ",
+                "RUN_JOB",
+                "CALC_TOTAL",
+                "HR_PKG",
+                "APP_LINK",
+                "APP_USER",
+                "SCOTT",
+                "FOR",
+                "CONNECT",
+                "IDENTIFIED",
+                "USING",
+                "SHARED",
+                "PUBLIC",
+                "SELECT",
+                "WHERE",
+                "NULL",
+            ] {
+                assert!(
+                    !contains(&final_suggestions, leaked),
+                    "{leaked} leaked into MySQL-family Oracle-only synonym/database-link slot at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn mysql_family_oracle_only_type_package_cluster_slots_do_not_offer_catalog_or_keywords() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for db in [MySQL, MariaDB] {
+        for sql in [
+            "CREATE TYPE ty |",
+            "CREATE TYPE ty AS |",
+            "CREATE TYPE ty AS OBJECT |",
+            "CREATE TYPE ty AS OBJECT (|",
+            "CREATE TYPE ty AS OBJECT (attr |)",
+            "CREATE TYPE ty AS TABLE OF |",
+            "CREATE TYPE ty AS VARRAY(10) OF |",
+            "CREATE TYPE ty UNDER |",
+            "CREATE TYPE BODY |",
+            "CREATE TYPE BODY addr_t |",
+            "CREATE TYPE BODY addr_t AS |",
+            "CREATE OR REPLACE TYPE BODY addr_t AS |",
+            "ALTER TYPE |",
+            "ALTER TYPE addr_t |",
+            "ALTER TYPE BODY |",
+            "ALTER TYPE BODY addr_t |",
+            "DROP TYPE |",
+            "DROP TYPE addr_t |",
+            "DROP TYPE BODY |",
+            "DROP TYPE BODY addr_t |",
+            "CREATE PACKAGE pkg |",
+            "CREATE PACKAGE pkg AS |",
+            "CREATE PACKAGE pkg AS PROCEDURE |",
+            "CREATE PACKAGE BODY |",
+            "CREATE PACKAGE BODY hr_pkg |",
+            "CREATE PACKAGE BODY hr_pkg AS |",
+            "CREATE OR REPLACE PACKAGE BODY hr_pkg AS |",
+            "ALTER PACKAGE |",
+            "ALTER PACKAGE hr_pkg |",
+            "ALTER PACKAGE BODY |",
+            "ALTER PACKAGE BODY hr_pkg |",
+            "DROP PACKAGE |",
+            "DROP PACKAGE hr_pkg |",
+            "DROP PACKAGE BODY |",
+            "DROP PACKAGE BODY hr_pkg |",
+            "CREATE ROLLBACK SEGMENT rb |",
+            "ALTER ROLLBACK SEGMENT |",
+            "ALTER ROLLBACK SEGMENT rb |",
+            "DROP ROLLBACK SEGMENT |",
+            "DROP ROLLBACK SEGMENT rb |",
+            "CREATE CLUSTER cl |",
+            "ALTER CLUSTER |",
+            "ALTER CLUSTER cl |",
+            "DROP CLUSTER |",
+            "DROP CLUSTER cl |",
+        ] {
+            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+            assert!(
+                kind.is_none() || matches!(kind, Some(ExpectedObjectSuggestionKind::NoSuggestions)),
+                "Oracle-only type/package/cluster slot resolved object kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+            );
+            for leaked in [
+                "EMP",
+                "DEPT",
+                "EMP_V",
+                "MVIEW_SALES",
+                "ADDRESS_T",
+                "HR_PKG",
+                "RUN_JOB",
+                "CALC_TOTAL",
+                "EMP_SEQ",
+                "BI_EMP",
+                "IDX_EMP_NAME",
+                "EMP_CLUSTER",
+                "APP_USER",
+                "SCOTT",
+                "AS",
+                "OBJECT",
+                "TABLE OF",
+                "VARRAY",
+                "UNDER",
+                "MEMBER",
+                "PROCEDURE",
+                "FUNCTION",
+                "COMPILE",
+                "ONLINE",
+                "OFFLINE",
+                "TABLESPACE",
+                "STORAGE",
+                "SELECT",
+                "WHERE",
+                "NULL",
+            ] {
+                assert!(
+                    !contains(&final_suggestions, leaked),
+                    "{leaked} leaked into MySQL-family Oracle-only type/package/cluster slot at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn mysql_family_oracle_only_java_object_slots_do_not_offer_catalog_or_keywords() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for db in [MySQL, MariaDB] {
+        for sql in [
+            "CREATE JAVA SOURCE |",
+            "CREATE JAVA SOURCE NAMED src |",
+            "CREATE JAVA SOURCE NAMED src AS |",
+            "CREATE JAVA CLASS |",
+            "CREATE JAVA CLASS cls |",
+            "CREATE JAVA CLASS cls USING |",
+            "CREATE JAVA CLASS cls USING app|",
+            "CREATE JAVA RESOURCE |",
+            "CREATE JAVA RESOURCE NAMED res |",
+            "CREATE JAVA RESOURCE NAMED res USING |",
+            "CREATE OR REPLACE JAVA RESOURCE NAMED res USING app|",
+            "ALTER JAVA SOURCE |",
+            "ALTER JAVA SOURCE welcome |",
+            "ALTER JAVA CLASS |",
+            "ALTER JAVA CLASS welcomeclass |",
+            "DROP JAVA SOURCE |",
+            "DROP JAVA SOURCE welcome |",
+            "DROP JAVA CLASS |",
+            "DROP JAVA CLASS welcomeclass |",
+            "DROP JAVA RESOURCE |",
+            "DROP JAVA RESOURCE welcome_res |",
+        ] {
+            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+            assert!(
+                kind.is_none() || matches!(kind, Some(ExpectedObjectSuggestionKind::NoSuggestions)),
+                "Oracle-only Java object slot resolved object kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+            );
+            for leaked in [
+                "EMP",
+                "DEPT",
+                "EMP_V",
+                "MVIEW_SALES",
+                "ADDRESS_T",
+                "HR_PKG",
+                "RUN_JOB",
+                "CALC_TOTAL",
+                "Welcome",
+                "WelcomeClass",
+                "WelcomeRes",
+                "APP_USER",
+                "SCOTT",
+                "NAMED",
+                "AS",
+                "USING",
+                "COMPILE",
+                "SELECT",
+                "WHERE",
+                "NULL",
+            ] {
+                assert!(
+                    !contains(&final_suggestions, leaked),
+                    "{leaked} leaked into MySQL-family Oracle-only Java object slot at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn mysql_family_oracle_only_extended_admin_object_slots_do_not_offer_catalog_or_keywords() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for db in [MySQL, MariaDB] {
+        for sql in [
+            "DROP DIRECTORY |",
+            "DROP DIRECTORY data_pump_dir |",
+            "DROP LIBRARY |",
+            "DROP LIBRARY app_lib |",
+            "ALTER LIBRARY |",
+            "ALTER LIBRARY app_lib |",
+            "DROP CONTEXT |",
+            "DROP CONTEXT app_ctx |",
+            "DROP DIMENSION |",
+            "DROP DIMENSION sales_dim |",
+            "ALTER DIMENSION |",
+            "ALTER DIMENSION sales_dim |",
+            "DROP OPERATOR |",
+            "DROP OPERATOR text_op |",
+            "ALTER OPERATOR |",
+            "ALTER OPERATOR text_op |",
+            "DROP INDEXTYPE |",
+            "DROP INDEXTYPE text_itype |",
+            "ALTER INDEXTYPE |",
+            "ALTER INDEXTYPE text_itype |",
+        ] {
+            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+            assert!(
+                kind.is_none() || matches!(kind, Some(ExpectedObjectSuggestionKind::NoSuggestions)),
+                "Oracle-only extended admin object slot resolved object kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+            );
+            for leaked in [
+                "EMP",
+                "DEPT",
+                "EMP_V",
+                "MVIEW_SALES",
+                "ADDRESS_T",
+                "HR_PKG",
+                "RUN_JOB",
+                "CALC_TOTAL",
+                "DATA_PUMP_DIR",
+                "APP_LIB",
+                "APP_CTX",
+                "SALES_DIM",
+                "TEXT_OP",
+                "TEXT_ITYPE",
+                "APP_USER",
+                "SCOTT",
+                "COMPILE",
+                "SELECT",
+                "WHERE",
+                "NULL",
+            ] {
+                assert!(
+                    !contains(&final_suggestions, leaked),
+                    "{leaked} leaked into MySQL-family Oracle-only extended admin object slot at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn oracle_ddl_value_slots_do_not_offer_object_catalog() {
     use crate::db::DatabaseType::Oracle;
 
@@ -66853,6 +67756,132 @@ fn oracle_ddl_value_slots_reject_invalid_prefix_noise() {
                 !contains(&final_suggestions, leaked),
                 "{leaked} leaked into Oracle DDL value slot at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
             );
+        }
+    }
+}
+
+#[test]
+fn mysql_family_oracle_only_flashback_slots_do_not_offer_catalog() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for db in [MySQL, MariaDB] {
+        for sql in [
+            "FLASHBACK |",
+            "FLASHBACK TABLE |",
+            "FLASHBACK TABLE emp |",
+            "FLASHBACK TABLE emp TO |",
+            "FLASHBACK TABLE emp TO BEFORE |",
+            "FLASHBACK TABLE emp TO BEFORE DROP |",
+            "FLASHBACK TABLE emp TO BEFORE DROP RENAME TO |",
+            "FLASHBACK DATABASE |",
+            "FLASHBACK DATABASE TO |",
+            "FLASHBACK DATABASE TO SCN |",
+            "FLASHBACK DATABASE TO TIMESTAMP |",
+            "FLASHBACK DATABASE TO RESTORE POINT |",
+        ] {
+            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+            assert!(
+                kind.is_none() || matches!(kind, Some(ExpectedObjectSuggestionKind::NoSuggestions)),
+                "Oracle-only FLASHBACK slot resolved object kind in {db:?} at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+            assert!(
+                keywords.is_empty(),
+                "Oracle-only FLASHBACK slot should not offer keywords in {db:?} at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+            for leaked in [
+                "EMP",
+                "DEPT",
+                "EMP_V",
+                "APP_USER",
+                "SCOTT",
+                "TABLE",
+                "DATABASE",
+                "BEFORE DROP",
+                "SCN",
+                "TIMESTAMP",
+                "RESTORE POINT",
+                "SELECT",
+                "WHERE",
+            ] {
+                assert!(
+                    !contains(&final_suggestions, leaked),
+                    "{leaked} leaked into Oracle-only FLASHBACK slot in {db:?} at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn mysql_family_oracle_only_audit_and_analyze_slots_do_not_offer_catalog_or_keywords() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for db in [MySQL, MariaDB] {
+        for sql in [
+            "AUDIT |",
+            "AUDIT SELECT ON |",
+            "AUDIT SELECT ON emp |",
+            "AUDIT EXECUTE ON |",
+            "AUDIT EXECUTE ON run_job |",
+            "AUDIT CREATE SESSION BY |",
+            "AUDIT CREATE SESSION BY app|",
+            "AUDIT SELECT ON emp BY |",
+            "AUDIT SELECT ON emp WHENEVER |",
+            "AUDIT SELECT ON emp WHENEVER NOT |",
+            "NOAUDIT |",
+            "NOAUDIT SELECT ON |",
+            "NOAUDIT SELECT ON emp |",
+            "NOAUDIT EXECUTE ON |",
+            "NOAUDIT CREATE SESSION BY |",
+            "NOAUDIT SELECT ON emp WHENEVER NOT SUCCESSFUL |",
+            "ANALYZE INDEX |",
+            "ANALYZE INDEX emp_idx |",
+            "ANALYZE INDEX emp_idx VALIDATE |",
+            "ANALYZE INDEX emp_idx VALIDATE STRUCTURE |",
+            "ANALYZE CLUSTER |",
+            "ANALYZE CLUSTER emp_cluster |",
+            "ANALYZE CLUSTER emp_cluster LIST |",
+            "ANALYZE CLUSTER emp_cluster LIST CHAINED ROWS |",
+        ] {
+            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+            assert!(
+                kind.is_none() || matches!(kind, Some(ExpectedObjectSuggestionKind::NoSuggestions)),
+                "Oracle-only AUDIT/ANALYZE slot resolved object kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+            );
+            for leaked in [
+                "EMP",
+                "DEPT",
+                "EMP_V",
+                "MVIEW_SALES",
+                "RUN_JOB",
+                "CALC_TOTAL",
+                "HR_PKG",
+                "EMP_IDX",
+                "EMP_CLUSTER",
+                "APP_USER",
+                "SCOTT",
+                "ON",
+                "BY",
+                "WHENEVER",
+                "ACCESS",
+                "SESSION",
+                "SUCCESSFUL",
+                "VALIDATE STRUCTURE",
+                "LIST CHAINED ROWS",
+                "COMPUTE STATISTICS",
+                "SELECT",
+                "WHERE",
+                "NULL",
+            ] {
+                assert!(
+                    !contains(&final_suggestions, leaked),
+                    "{leaked} leaked into MySQL-family Oracle-only AUDIT/ANALYZE slot at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+                );
+            }
         }
     }
 }
@@ -70040,6 +71069,24 @@ fn prefixed_new_name_slots_do_not_offer_catalog_or_keywords() {
         (MariaDB, "ALTER TABLE emp RENAME KEY old_idx TO app|"),
         (MariaDB, "ALTER EVENT ev RENAME TO app|"),
         (MariaDB, "ALTER TABLESPACE ts RENAME TO app|"),
+        (MySQL, "CREATE SEQUENCE app|"),
+        (MySQL, "CREATE SYNONYM app|"),
+        (MySQL, "CREATE PUBLIC SYNONYM app|"),
+        (MySQL, "CREATE DATABASE LINK app|"),
+        (MySQL, "CREATE PUBLIC DATABASE LINK app|"),
+        (MySQL, "CREATE MATERIALIZED VIEW app|"),
+        (MySQL, "CREATE DIRECTORY app|"),
+        (MySQL, "CREATE LIBRARY app|"),
+        (MySQL, "CREATE JAVA SOURCE NAMED app|"),
+        (MariaDB, "CREATE SEQUENCE app|"),
+        (MariaDB, "CREATE SYNONYM app|"),
+        (MariaDB, "CREATE PUBLIC SYNONYM app|"),
+        (MariaDB, "CREATE DATABASE LINK app|"),
+        (MariaDB, "CREATE PUBLIC DATABASE LINK app|"),
+        (MariaDB, "CREATE MATERIALIZED VIEW app|"),
+        (MariaDB, "CREATE DIRECTORY app|"),
+        (MariaDB, "CREATE LIBRARY app|"),
+        (MariaDB, "CREATE JAVA SOURCE NAMED app|"),
         (MySQL, "CREATE DATABASE app|"),
         (MySQL, "CREATE DATABASE IF NOT EXISTS app|"),
         (MySQL, "CREATE SCHEMA app|"),
@@ -70160,6 +71207,15 @@ fn prefixed_new_name_slots_do_not_offer_catalog_or_keywords() {
         (MySQL, "ALTER TABLE emp RENAME TO n|"),
         (MySQL, "ALTER TABLE emp RENAME COLUMN old_col TO n|"),
         (MySQL, "ALTER EVENT ev RENAME TO n|"),
+        (MySQL, "CREATE SEQUENCE n|"),
+        (MySQL, "CREATE SYNONYM n|"),
+        (MySQL, "CREATE PUBLIC SYNONYM n|"),
+        (MySQL, "CREATE DATABASE LINK n|"),
+        (MySQL, "CREATE PUBLIC DATABASE LINK n|"),
+        (MySQL, "CREATE MATERIALIZED VIEW n|"),
+        (MySQL, "CREATE DIRECTORY n|"),
+        (MySQL, "CREATE LIBRARY n|"),
+        (MySQL, "CREATE JAVA SOURCE NAMED n|"),
         (MariaDB, "CREATE TABLE n|"),
         (MariaDB, "CREATE TABLE IF NOT EXISTS n|"),
         (MariaDB, "CREATE TEMPORARY TABLE n|"),
@@ -70189,6 +71245,15 @@ fn prefixed_new_name_slots_do_not_offer_catalog_or_keywords() {
         (MariaDB, "ALTER TABLE emp RENAME TO n|"),
         (MariaDB, "ALTER TABLE emp RENAME COLUMN old_col TO n|"),
         (MariaDB, "ALTER EVENT ev RENAME TO n|"),
+        (MariaDB, "CREATE SEQUENCE n|"),
+        (MariaDB, "CREATE SYNONYM n|"),
+        (MariaDB, "CREATE PUBLIC SYNONYM n|"),
+        (MariaDB, "CREATE DATABASE LINK n|"),
+        (MariaDB, "CREATE PUBLIC DATABASE LINK n|"),
+        (MariaDB, "CREATE MATERIALIZED VIEW n|"),
+        (MariaDB, "CREATE DIRECTORY n|"),
+        (MariaDB, "CREATE LIBRARY n|"),
+        (MariaDB, "CREATE JAVA SOURCE NAMED n|"),
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
         assert_eq!(
@@ -70285,6 +71350,15 @@ fn empty_new_name_slots_do_not_offer_catalog() {
         (MySQL, "ALTER TABLE emp RENAME TO |"),
         (MySQL, "ALTER TABLE emp RENAME COLUMN old_col TO |"),
         (MySQL, "ALTER TABLE emp RENAME INDEX old_idx TO |"),
+        (MySQL, "CREATE SEQUENCE |"),
+        (MySQL, "CREATE SYNONYM |"),
+        (MySQL, "CREATE PUBLIC SYNONYM |"),
+        (MySQL, "CREATE DATABASE LINK |"),
+        (MySQL, "CREATE PUBLIC DATABASE LINK |"),
+        (MySQL, "CREATE MATERIALIZED VIEW |"),
+        (MySQL, "CREATE DIRECTORY |"),
+        (MySQL, "CREATE LIBRARY |"),
+        (MySQL, "CREATE JAVA SOURCE NAMED |"),
         (MariaDB, "CREATE TABLE |"),
         (MariaDB, "CREATE TABLE IF NOT EXISTS |"),
         (MariaDB, "CREATE TEMPORARY TABLE |"),
@@ -70311,6 +71385,15 @@ fn empty_new_name_slots_do_not_offer_catalog() {
         (MariaDB, "ALTER TABLE emp RENAME TO |"),
         (MariaDB, "ALTER TABLE emp RENAME COLUMN old_col TO |"),
         (MariaDB, "ALTER TABLE emp RENAME INDEX old_idx TO |"),
+        (MariaDB, "CREATE SEQUENCE |"),
+        (MariaDB, "CREATE SYNONYM |"),
+        (MariaDB, "CREATE PUBLIC SYNONYM |"),
+        (MariaDB, "CREATE DATABASE LINK |"),
+        (MariaDB, "CREATE PUBLIC DATABASE LINK |"),
+        (MariaDB, "CREATE MATERIALIZED VIEW |"),
+        (MariaDB, "CREATE DIRECTORY |"),
+        (MariaDB, "CREATE LIBRARY |"),
+        (MariaDB, "CREATE JAVA SOURCE NAMED |"),
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
         assert_eq!(

@@ -2182,6 +2182,11 @@ impl SqlEditorWidget {
                 has_prefix || qualifier.is_some(),
                 Some(snapshot.preferred_db_type),
             )
+            || Self::cursor_is_at_mysql_oracle_only_ddl_value_slot_for_context(
+                deep_ctx,
+                has_prefix || qualifier.is_some(),
+                Some(snapshot.preferred_db_type),
+            )
             || Self::cursor_is_at_next_cte_name_slot_for_context(
                 deep_ctx,
                 has_prefix || qualifier.is_some(),
@@ -9260,6 +9265,383 @@ impl SqlEditorWidget {
             }
     }
 
+    fn cursor_is_at_mysql_oracle_only_flashback_slot(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            || Self::unclosed_paren_count(tokens, end) != 0
+        {
+            return false;
+        }
+
+        let mut words = Vec::new();
+        for token in Self::meaningful_tokens_before(tokens, end) {
+            match token {
+                SqlToken::Symbol(sym) if sym == ";" => words.clear(),
+                SqlToken::Word(word) => words.push(word.to_ascii_uppercase()),
+                _ => {}
+            }
+        }
+        words.first().map(String::as_str) == Some("FLASHBACK")
+    }
+
+    fn cursor_is_at_mysql_oracle_only_flashback_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let context_end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::cursor_is_at_mysql_oracle_only_flashback_slot(tokens, context_end, db_type) || {
+            let statement_tokens = deep_ctx.statement_tokens.as_ref();
+            let statement_context_end = Self::expected_suggestion_context_end(
+                statement_tokens,
+                deep_ctx.cursor_token_len,
+                exclude_current_identifier_chain,
+            );
+            Self::cursor_is_at_mysql_oracle_only_flashback_slot(
+                statement_tokens,
+                statement_context_end,
+                db_type,
+            )
+        }
+    }
+
+    fn cursor_is_at_mysql_oracle_only_maintenance_slot(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            || Self::unclosed_paren_count(tokens, end) != 0
+        {
+            return false;
+        }
+
+        let mut words = Vec::new();
+        for token in Self::meaningful_tokens_before(tokens, end) {
+            match token {
+                SqlToken::Symbol(sym) if sym == ";" => words.clear(),
+                SqlToken::Word(word) => words.push(word.to_ascii_uppercase()),
+                _ => {}
+            }
+        }
+
+        matches!(
+            (words.first().map(String::as_str), words.get(1).map(String::as_str)),
+            (Some("ANALYZE"), Some("INDEX" | "CLUSTER"))
+                | (Some("TRUNCATE"), Some("CLUSTER"))
+                | (
+                    Some("PURGE"),
+                    Some("TABLE" | "INDEX" | "RECYCLEBIN" | "DBA_RECYCLEBIN" | "TABLESPACE"),
+                )
+        )
+    }
+
+    fn cursor_is_at_mysql_oracle_only_maintenance_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let context_end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::cursor_is_at_mysql_oracle_only_maintenance_slot(tokens, context_end, db_type) || {
+            let statement_tokens = deep_ctx.statement_tokens.as_ref();
+            let statement_context_end = Self::expected_suggestion_context_end(
+                statement_tokens,
+                deep_ctx.cursor_token_len,
+                exclude_current_identifier_chain,
+            );
+            Self::cursor_is_at_mysql_oracle_only_maintenance_slot(
+                statement_tokens,
+                statement_context_end,
+                db_type,
+            )
+        }
+    }
+
+    fn cursor_is_at_mysql_oracle_only_ddl_value_slot(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return false;
+        }
+
+        let mut words = Vec::new();
+        for token in Self::meaningful_tokens_before(tokens, end) {
+            match token {
+                SqlToken::Symbol(sym) if sym == ";" => words.clear(),
+                SqlToken::Word(word) => words.push(word.to_ascii_uppercase()),
+                SqlToken::String(_) => words.push("__VALUE__".to_string()),
+                _ => {}
+            }
+        }
+
+        if Self::is_mysql_oracle_only_audit_slot(&words) {
+            return true;
+        }
+
+        if Self::is_mysql_oracle_only_type_package_cluster_or_rollback_slot(&words) {
+            return true;
+        }
+
+        if Self::is_mysql_oracle_only_java_object_slot(&words) {
+            return true;
+        }
+
+        if Self::is_mysql_oracle_only_extended_admin_object_slot(&words) {
+            return true;
+        }
+
+        if Self::unclosed_paren_count(tokens, end) != 0 {
+            return false;
+        }
+
+        if matches!(words.as_slice(), [comment, on_kw, ..] if comment == "COMMENT" && on_kw == "ON")
+            && words.iter().any(|word| word == "IS")
+        {
+            return true;
+        }
+
+        if matches!(words.first().map(String::as_str), Some("CREATE" | "ALTER")) {
+            if let Some(role_idx) = words.iter().position(|word| word == "ROLE") {
+                let mut name_idx = role_idx + 1;
+                if matches!(
+                    words.get(name_idx..name_idx + 3),
+                    Some([if_kw, not_kw, exists_kw])
+                        if if_kw == "IF" && not_kw == "NOT" && exists_kw == "EXISTS"
+                ) {
+                    name_idx += 3;
+                }
+                if words.get(name_idx).is_some() {
+                    let auth_tail = &words[name_idx + 1..];
+                    if auth_tail.iter().any(|word| {
+                        matches!(word.as_str(), "IDENTIFIED" | "GLOBALLY" | "NOT")
+                    }) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        if matches!(
+            words.as_slice(),
+            [verb, profile, ..]
+                if matches!(verb.as_str(), "CREATE" | "ALTER" | "DROP") && profile == "PROFILE"
+        ) {
+            return true;
+        }
+
+        if Self::is_mysql_oracle_only_edition_tail(&words) {
+            return true;
+        }
+
+        if Self::is_mysql_oracle_only_materialized_view_tail(&words) {
+            return true;
+        }
+
+        if Self::is_mysql_oracle_only_synonym_or_database_link_tail(&words) {
+            return true;
+        }
+
+        if matches!(words.first().map(String::as_str), Some("CREATE"))
+            && matches!(
+                words.get(1).map(String::as_str),
+                Some("CONTEXT" | "DIMENSION" | "OPERATOR" | "INDEXTYPE")
+            )
+            && words.get(2).is_some()
+        {
+            return true;
+        }
+
+        if words.first().map(String::as_str) != Some("CREATE") {
+            return false;
+        }
+
+        if words
+            .windows(2)
+            .any(|pair| matches!(pair, [connect, to] if connect == "CONNECT" && to == "TO"))
+            || words
+                .windows(2)
+                .any(|pair| matches!(pair, [identified, by] if identified == "IDENTIFIED" && by == "BY"))
+            || words.iter().any(|word| word == "USING")
+        {
+            return words
+                .windows(2)
+                .any(|pair| matches!(pair, [database, link] if database == "DATABASE" && link == "LINK"));
+        }
+
+        let has_as = words.iter().any(|word| word == "AS");
+        if !has_as {
+            return false;
+        }
+        words.iter().any(|word| matches!(word.as_str(), "DIRECTORY" | "LIBRARY"))
+            || words
+                .windows(2)
+                .any(|pair| matches!(pair, [java, kind] if java == "JAVA" && matches!(kind.as_str(), "SOURCE" | "CLASS" | "RESOURCE")))
+    }
+
+    fn is_mysql_oracle_only_audit_slot(words: &[String]) -> bool {
+        matches!(
+            words.first().map(String::as_str),
+            Some("AUDIT" | "NOAUDIT")
+        )
+    }
+
+    fn is_mysql_oracle_only_type_package_cluster_or_rollback_slot(words: &[String]) -> bool {
+        let Some(verb) = words.first().map(String::as_str) else {
+            return false;
+        };
+        if !matches!(verb, "CREATE" | "ALTER" | "DROP") {
+            return false;
+        }
+        let Some((ty, words_after_type)) = Self::leading_ddl_object_type(words) else {
+            return false;
+        };
+        match ty {
+            "PACKAGE BODY" | "TYPE BODY" | "ROLLBACK SEGMENT" => true,
+            "PACKAGE" | "TYPE" | "CLUSTER" => {
+                words_after_type > 0 || matches!(verb, "ALTER" | "DROP")
+            }
+            _ => false,
+        }
+    }
+
+    fn is_mysql_oracle_only_java_object_slot(words: &[String]) -> bool {
+        let Some(verb) = words.first().map(String::as_str) else {
+            return false;
+        };
+        if !matches!(verb, "CREATE" | "ALTER" | "DROP") {
+            return false;
+        }
+        matches!(
+            Self::leading_ddl_object_type(words).map(|(ty, _)| ty),
+            Some("JAVA SOURCE" | "JAVA CLASS" | "JAVA RESOURCE")
+        )
+    }
+
+    fn is_mysql_oracle_only_extended_admin_object_slot(words: &[String]) -> bool {
+        let Some(verb) = words.first().map(String::as_str) else {
+            return false;
+        };
+        if !matches!(verb, "ALTER" | "DROP") {
+            return false;
+        }
+        matches!(
+            Self::leading_ddl_object_type(words).map(|(ty, _)| ty),
+            Some("DIRECTORY" | "LIBRARY" | "CONTEXT" | "DIMENSION" | "OPERATOR" | "INDEXTYPE")
+        )
+    }
+
+    fn is_mysql_oracle_only_edition_tail(words: &[String]) -> bool {
+        match words {
+            [create, edition, _name, ..] if create == "CREATE" && edition == "EDITION" => true,
+            [verb, edition, ..]
+                if matches!(verb.as_str(), "ALTER" | "DROP") && edition == "EDITION" =>
+            {
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn is_mysql_oracle_only_materialized_view_tail(words: &[String]) -> bool {
+        let Some(verb) = words.first().map(String::as_str) else {
+            return false;
+        };
+        if !matches!(verb, "CREATE" | "ALTER" | "DROP") {
+            return false;
+        }
+
+        let Some(materialized_idx) = words.iter().position(|word| word == "MATERIALIZED") else {
+            return false;
+        };
+        if words.get(materialized_idx + 1).map(String::as_str) != Some("VIEW") {
+            return false;
+        }
+
+        if words
+            .windows(2)
+            .any(|pair| matches!(pair, [as_kw, select] if as_kw == "AS" && select == "SELECT"))
+        {
+            return false;
+        }
+
+        let after_view = &words[materialized_idx + 2..];
+        if after_view.is_empty() {
+            return false;
+        }
+        if after_view.first().map(String::as_str) == Some("LOG") {
+            return true;
+        }
+
+        matches!(verb, "CREATE" | "ALTER" | "DROP")
+            && after_view.iter().any(|word| {
+                !matches!(
+                    word.as_str(),
+                    "IF" | "EXISTS" | "NOT" | "MATERIALIZED" | "VIEW"
+                )
+            })
+    }
+
+    fn is_mysql_oracle_only_synonym_or_database_link_tail(words: &[String]) -> bool {
+        let Some(verb) = words.first().map(String::as_str) else {
+            return false;
+        };
+        if !matches!(verb, "CREATE" | "ALTER" | "DROP") {
+            return false;
+        }
+
+        if words.iter().any(|word| word == "SYNONYM") {
+            return true;
+        }
+
+        words
+            .windows(2)
+            .any(|pair| matches!(pair, [database, link] if database == "DATABASE" && link == "LINK"))
+    }
+
+    fn cursor_is_at_mysql_oracle_only_ddl_value_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let context_end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::cursor_is_at_mysql_oracle_only_ddl_value_slot(tokens, context_end, db_type) || {
+            let statement_tokens = deep_ctx.statement_tokens.as_ref();
+            let statement_context_end = Self::expected_suggestion_context_end(
+                statement_tokens,
+                deep_ctx.cursor_token_len,
+                exclude_current_identifier_chain,
+            );
+            Self::cursor_is_at_mysql_oracle_only_ddl_value_slot(
+                statement_tokens,
+                statement_context_end,
+                db_type,
+            )
+        }
+    }
+
     fn cursor_is_at_mysql_oracle_only_hierarchical_clause_slot(
         tokens: &[SqlToken],
         end: usize,
@@ -9398,6 +9780,73 @@ impl SqlEditorWidget {
                 exclude_current_identifier_chain,
             );
             Self::cursor_is_at_mysql_oracle_only_advanced_table_clause_slot(
+                statement_tokens,
+                statement_context_end,
+                db_type,
+            )
+        }
+    }
+
+    fn cursor_is_at_mysql_oracle_only_post_table_modifier_slot(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return false;
+        }
+
+        let words = Self::meaningful_tokens_before(tokens, end)
+            .iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let Some(from_idx) = words.iter().rposition(|word| word == "FROM" || word == "JOIN")
+        else {
+            return false;
+        };
+        let after_source = &words[from_idx + 1..];
+        if after_source.len() < 2 {
+            return false;
+        }
+        let tail = &after_source[1..];
+        let last = tail.last().map(String::as_str);
+
+        matches!(last, Some("PARTITION" | "SUBPARTITION" | "SAMPLE" | "TABLESAMPLE" | "BLOCK" | "BERNOULLI" | "SYSTEM"))
+            || tail
+                .windows(2)
+                .any(|window| matches!(window, [a, b] if (a == "PARTITION" && b == "FOR")
+                    || (a == "SAMPLE" && b == "BLOCK")
+                    || (a == "TABLESAMPLE" && matches!(b.as_str(), "BERNOULLI" | "SYSTEM"))))
+            || tail.iter().any(|word| word == "SUBPARTITION" || word == "SAMPLE" || word == "TABLESAMPLE")
+    }
+
+    fn cursor_is_at_mysql_oracle_only_post_table_modifier_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let context_end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::cursor_is_at_mysql_oracle_only_post_table_modifier_slot(
+            tokens,
+            context_end,
+            db_type,
+        ) || {
+            let statement_tokens = deep_ctx.statement_tokens.as_ref();
+            let statement_context_end = Self::expected_suggestion_context_end(
+                statement_tokens,
+                deep_ctx.cursor_token_len,
+                exclude_current_identifier_chain,
+            );
+            Self::cursor_is_at_mysql_oracle_only_post_table_modifier_slot(
                 statement_tokens,
                 statement_context_end,
                 db_type,
@@ -10789,6 +11238,9 @@ impl SqlEditorWidget {
                 deep_ctx, true, db_type,
             )
             || Self::cursor_is_inside_oracle_lob_storage_clause_value_slot_for_context(
+                deep_ctx, true, db_type,
+            )
+            || Self::cursor_is_at_mysql_oracle_only_ddl_value_slot_for_context(
                 deep_ctx, true, db_type,
             )
             || (!Self::cursor_is_at_comment_on_column_qualified_name_slot_for_context(
@@ -16316,6 +16768,104 @@ impl SqlEditorWidget {
         Self::table_source_construct_open_paren_position(tokens, end, db_type)
     }
 
+    fn token_introduces_xmltable_table_source(tokens: &[SqlToken], xmltable_idx: usize) -> bool {
+        let meaningful = tokens
+            .iter()
+            .enumerate()
+            .take(xmltable_idx)
+            .filter_map(|(idx, token)| (!matches!(token, SqlToken::Comment(_))).then_some((idx, token)))
+            .collect::<Vec<_>>();
+        let mut head_pos = meaningful.len();
+        while head_pos >= 2 {
+            let dot_pos = head_pos - 1;
+            let qualifier_pos = head_pos - 2;
+            if !matches!(meaningful.get(dot_pos), Some((_, SqlToken::Symbol(sym))) if sym == ".")
+                || !matches!(meaningful.get(qualifier_pos), Some((_, SqlToken::Word(_))))
+            {
+                break;
+            }
+            head_pos -= 2;
+        }
+
+        match head_pos.checked_sub(1).and_then(|idx| meaningful.get(idx)) {
+            None => true,
+            Some((_, SqlToken::Symbol(sym))) => matches!(sym.as_str(), "(" | ","),
+            Some((_, SqlToken::Word(word))) => matches!(
+                word.to_ascii_uppercase().as_str(),
+                "FROM"
+                    | "JOIN"
+                    | "INNER"
+                    | "LEFT"
+                    | "RIGHT"
+                    | "FULL"
+                    | "CROSS"
+                    | "NATURAL"
+                    | "OUTER"
+                    | "APPLY"
+                    | "LATERAL"
+                    | "STRAIGHT_JOIN"
+            ),
+            _ => false,
+        }
+    }
+
+    fn cursor_is_inside_mysql_oracle_only_xmltable_slot(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return false;
+        }
+        let Some((word, open_idx)) = Self::innermost_open_paren_preceding_word_and_index(tokens, end)
+        else {
+            return false;
+        };
+        if !word.eq_ignore_ascii_case("XMLTABLE") {
+            return false;
+        }
+        if tokens.get(open_idx..end).unwrap_or(&[]).iter().any(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("COLUMNS")),
+        ) {
+            return false;
+        }
+        let Some(xmltable_idx) = Self::previous_non_comment_token_index(tokens, open_idx) else {
+            return false;
+        };
+        matches!(tokens.get(xmltable_idx), Some(SqlToken::Word(name)) if name.eq_ignore_ascii_case("XMLTABLE"))
+            && Self::token_introduces_xmltable_table_source(tokens, xmltable_idx)
+    }
+
+    fn cursor_is_inside_mysql_oracle_only_xmltable_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if !matches!(deep_ctx.phase, intellisense_context::SqlPhase::FromClause) {
+            return false;
+        }
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let context_end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::cursor_is_inside_mysql_oracle_only_xmltable_slot(tokens, context_end, db_type) || {
+            let statement_tokens = deep_ctx.statement_tokens.as_ref();
+            let statement_context_end = Self::expected_suggestion_context_end(
+                statement_tokens,
+                deep_ctx.cursor_token_len,
+                exclude_current_identifier_chain,
+            );
+            Self::cursor_is_inside_mysql_oracle_only_xmltable_slot(
+                statement_tokens,
+                statement_context_end,
+                db_type,
+            )
+        }
+    }
+
     /// MySQL object types that accept `DROP <obj> [IF EXISTS] <name>`.
     fn is_mysql_droppable_object_type(word: &str) -> bool {
         matches!(
@@ -17051,6 +17601,11 @@ impl SqlEditorWidget {
                 exclude_current_identifier_chain,
                 db_type,
             )
+            || Self::cursor_is_inside_mysql_oracle_only_xmltable_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
             || Self::cursor_is_at_table_alias_name_slot(deep_ctx, exclude_current_identifier_chain)
             || Self::cursor_is_at_merge_then_action_slot_for_context(
                 deep_ctx,
@@ -17149,12 +17704,32 @@ impl SqlEditorWidget {
                 exclude_current_identifier_chain,
                 db_type,
             )
+            || Self::cursor_is_at_mysql_oracle_only_flashback_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+            || Self::cursor_is_at_mysql_oracle_only_maintenance_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+            || Self::cursor_is_at_mysql_oracle_only_ddl_value_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
             || Self::cursor_is_at_mysql_oracle_only_hierarchical_clause_slot_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
                 db_type,
             )
             || Self::cursor_is_at_mysql_oracle_only_advanced_table_clause_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+            || Self::cursor_is_at_mysql_oracle_only_post_table_modifier_slot_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
                 db_type,
@@ -17503,6 +18078,11 @@ impl SqlEditorWidget {
                 exclude_current_identifier_chain,
                 db_type,
             )
+            || Self::cursor_is_inside_mysql_oracle_only_xmltable_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
             || Self::table_function_path_literal_position_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
@@ -17681,12 +18261,32 @@ impl SqlEditorWidget {
                 exclude_current_identifier_chain,
                 db_type,
             )
+            || Self::cursor_is_at_mysql_oracle_only_flashback_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+            || Self::cursor_is_at_mysql_oracle_only_maintenance_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+            || Self::cursor_is_at_mysql_oracle_only_ddl_value_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
             || Self::cursor_is_at_mysql_oracle_only_hierarchical_clause_slot_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
                 db_type,
             )
             || Self::cursor_is_at_mysql_oracle_only_advanced_table_clause_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+            || Self::cursor_is_at_mysql_oracle_only_post_table_modifier_slot_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
                 db_type,
@@ -17805,6 +18405,10 @@ impl SqlEditorWidget {
             deep_ctx,
             exclude_current_identifier_chain,
             db_type,
+        ) || Self::cursor_is_inside_mysql_oracle_only_xmltable_slot_for_context(
+            deep_ctx,
+            exclude_current_identifier_chain,
+            db_type,
         ) || Self::table_function_path_literal_position_for_context(
             deep_ctx,
             exclude_current_identifier_chain,
@@ -17870,11 +18474,27 @@ impl SqlEditorWidget {
             deep_ctx,
             exclude_current_identifier_chain,
             db_type,
+        ) || Self::cursor_is_at_mysql_oracle_only_flashback_slot_for_context(
+            deep_ctx,
+            exclude_current_identifier_chain,
+            db_type,
+        ) || Self::cursor_is_at_mysql_oracle_only_maintenance_slot_for_context(
+            deep_ctx,
+            exclude_current_identifier_chain,
+            db_type,
+        ) || Self::cursor_is_at_mysql_oracle_only_ddl_value_slot_for_context(
+            deep_ctx,
+            exclude_current_identifier_chain,
+            db_type,
         ) || Self::cursor_is_at_mysql_oracle_only_hierarchical_clause_slot_for_context(
             deep_ctx,
             exclude_current_identifier_chain,
             db_type,
         ) || Self::cursor_is_at_mysql_oracle_only_advanced_table_clause_slot_for_context(
+            deep_ctx,
+            exclude_current_identifier_chain,
+            db_type,
+        ) || Self::cursor_is_at_mysql_oracle_only_post_table_modifier_slot_for_context(
             deep_ctx,
             exclude_current_identifier_chain,
             db_type,
@@ -38947,6 +39567,10 @@ impl SqlEditorWidget {
             {
                 return Some(kind);
             }
+            if Self::cursor_has_statement_start_anchor(tokens, context_end, &["AUDIT", "NOAUDIT"])
+            {
+                return Some(ExpectedObjectSuggestionKind::NoSuggestions);
+            }
         }
 
         if !crate::sql_text::mysql_compatibility_for_sql("", db_type) {
@@ -39008,7 +39632,13 @@ impl SqlEditorWidget {
         if Self::cursor_is_in_statement_structural_head(tokens, context_end)
             && Self::is_create_synonym_target_context(&words)
         {
-            return Some(ExpectedObjectSuggestionKind::SchemaObject);
+            return Some(
+                if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+                    ExpectedObjectSuggestionKind::NoSuggestions
+                } else {
+                    ExpectedObjectSuggestionKind::SchemaObject
+                },
+            );
         }
         if Self::cursor_is_at_oracle_instead_of_trigger_view_target_slot(
             tokens,
