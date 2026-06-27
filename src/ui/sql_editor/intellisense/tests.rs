@@ -1431,34 +1431,36 @@ fn order_by_sort_modifiers_are_dialect_aware() {
     assert!(has(&oracle, "NULLS"), "Oracle offers NULLS: {oracle:?}");
     assert!(has(&oracle, "OFFSET"), "Oracle appends OFFSET: {oracle:?}");
 
-    // `ORDER BY a ASC |`: Oracle still offers NULLS; MySQL goes straight to the
+    // `ORDER BY a ASC |`: Oracle still offers NULLS; MySQL-family goes straight to the
     // downstream openers (no null-ordering keyword exists there).
     assert!(has(
         &kw("SELECT a FROM t ORDER BY a ASC |", Oracle),
         "NULLS"
     ));
-    assert!(!has(
-        &kw("SELECT a FROM t ORDER BY a ASC |", MySQL),
-        "NULLS"
-    ));
-    assert!(has(&kw("SELECT a FROM t ORDER BY a ASC |", MySQL), "LIMIT"));
+    for db in [MySQL, MariaDB] {
+        let got = kw("SELECT a FROM t ORDER BY a ASC |", db);
+        assert!(!has(&got, "NULLS"), "{db:?} must not offer NULLS: {got:?}");
+        assert!(has(&got, "LIMIT"), "{db:?} appends LIMIT: {got:?}");
+    }
 
-    // MySQL allows a trailing `ORDER BY … LIMIT` on DELETE/UPDATE: after a
+    // MySQL-family allows a trailing `ORDER BY … LIMIT` on DELETE/UPDATE: after a
     // complete sort item the slot offers the direction modifiers plus `LIMIT`
     // only (no SELECT-only `FOR UPDATE`/`UNION`).
-    for sql in [
-        "DELETE FROM t ORDER BY a |",
-        "UPDATE t SET a = 1 ORDER BY a |",
-    ] {
-        let got = kw(sql, MySQL);
-        assert!(
-            has(&got, "LIMIT"),
-            "MySQL DML ORDER BY offers LIMIT for `{sql}`: {got:?}"
-        );
-        assert!(
-            !has(&got, "FOR UPDATE") && !has(&got, "UNION"),
-            "no SELECT tails for `{sql}`: {got:?}"
-        );
+    for db in [MySQL, MariaDB] {
+        for sql in [
+            "DELETE FROM t ORDER BY a |",
+            "UPDATE t SET a = 1 ORDER BY a |",
+        ] {
+            let got = kw(sql, db);
+            assert!(
+                has(&got, "LIMIT"),
+                "{db:?} DML ORDER BY offers LIMIT for `{sql}`: {got:?}"
+            );
+            assert!(
+                !has(&got, "FOR UPDATE") && !has(&got, "UNION"),
+                "no SELECT tails for `{sql}` {db:?}: {got:?}"
+            );
+        }
     }
 
     // Analytic window ORDER BY: Oracle offers NULLS + the GROUPS frame unit;
@@ -1497,7 +1499,7 @@ fn alter_table_drop_offers_table_elements_not_object_types() {
         )
     };
     let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     // Oracle: table elements, never the DROP-statement object types.
     let oracle = kw("ALTER TABLE t DROP |", Oracle);
@@ -1518,10 +1520,12 @@ fn alter_table_drop_offers_table_elements_not_object_types() {
         "{qualified:?}"
     );
 
-    // MySQL keeps its own (correct) table-element set.
-    let mysql = kw("ALTER TABLE t DROP |", MySQL);
-    assert!(has(&mysql, "COLUMN") && has(&mysql, "INDEX"), "{mysql:?}");
-    assert!(!mysql.iter().any(|k| k == "PROCEDURE"), "{mysql:?}");
+    // MySQL-family keeps its own (correct) table-element set.
+    for db in [MySQL, MariaDB] {
+        let got = kw("ALTER TABLE t DROP |", db);
+        assert!(has(&got, "COLUMN") && has(&got, "INDEX"), "{db:?}: {got:?}");
+        assert!(!got.iter().any(|k| k == "PROCEDURE"), "{db:?}: {got:?}");
+    }
 
     // The statement head `DROP |` still offers the object-type list.
     let drop_head = kw("DROP |", Oracle);
@@ -1549,7 +1553,7 @@ fn referential_action_on_slot_offers_only_delete_update() {
             Some(db),
         )
     };
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     for sql in [
         "CREATE TABLE t (id NUMBER, CONSTRAINT fk FOREIGN KEY (a) REFERENCES p (b) ON |",
@@ -1561,13 +1565,15 @@ fn referential_action_on_slot_offers_only_delete_update() {
             vec!["DELETE".to_string()],
             "Oracle ON slot for `{sql}`"
         );
-        assert_eq!(
-            kw(sql, MySQL),
-            vec!["DELETE".to_string(), "UPDATE".to_string()],
-            "MySQL ON slot for `{sql}`"
-        );
+        for db in [MySQL, MariaDB] {
+            assert_eq!(
+                kw(sql, db),
+                vec!["DELETE".to_string(), "UPDATE".to_string()],
+                "{db:?} ON slot for `{sql}`"
+            );
+        }
     }
-    for db in [Oracle, MySQL] {
+    for db in [Oracle, MySQL, MariaDB] {
         for sql in [
             "CREATE TABLE t (id NUMBER, CONSTRAINT fk FOREIGN KEY (a) REFERENCES p (b) ON |",
             "ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (a) REFERENCES p (b) ON |",
@@ -1660,7 +1666,7 @@ fn with_clause_after_cte_body_offers_main_query_select() {
     }
 
     // The pre-body slot (after `AS`, awaiting `(`) offers neither.
-    for db in [Oracle, MySQL] {
+    for db in [Oracle, MySQL, MariaDB] {
         let got = kw("WITH c AS |", db);
         assert!(
             !has(&got, "SELECT") && !has(&got, "SEARCH"),
@@ -1671,7 +1677,7 @@ fn with_clause_after_cte_body_offers_main_query_select() {
 
 #[test]
 fn with_clause_next_cte_name_slot_does_not_offer_catalog() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
 
@@ -1680,6 +1686,8 @@ fn with_clause_next_cte_name_slot_does_not_offer_catalog() {
         (Oracle, "WITH c AS (SELECT 1 FROM dual), n|"),
         (MySQL, "WITH c AS (SELECT 1), |"),
         (MySQL, "WITH c AS (SELECT 1), n|"),
+        (MariaDB, "WITH c AS (SELECT 1), |"),
+        (MariaDB, "WITH c AS (SELECT 1), n|"),
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
         assert_eq!(
@@ -1707,7 +1715,7 @@ fn with_clause_next_cte_name_slot_does_not_offer_catalog() {
 
 #[test]
 fn with_clause_cte_body_open_slot_does_not_offer_catalog() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
 
@@ -1717,6 +1725,8 @@ fn with_clause_cte_body_open_slot_does_not_offer_catalog() {
         (Oracle, "WITH c AS | SELECT 1 FROM dual"),
         (MySQL, "WITH c AS |"),
         (MySQL, "WITH c(col1, col2) AS |"),
+        (MariaDB, "WITH c AS |"),
+        (MariaDB, "WITH c(col1, col2) AS |"),
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
         assert_eq!(
@@ -1744,7 +1754,7 @@ fn with_clause_cte_body_open_slot_does_not_offer_catalog() {
 
 #[test]
 fn output_column_alias_list_slots_do_not_offer_catalog() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
 
@@ -1773,6 +1783,18 @@ fn output_column_alias_list_slots_do_not_offer_catalog() {
             MySQL,
             "WITH c(out_col, n|) AS (SELECT empno, ename FROM emp) SELECT * FROM c",
         ),
+        (
+            MariaDB,
+            "WITH c(|) AS (SELECT empno FROM emp) SELECT * FROM c",
+        ),
+        (
+            MariaDB,
+            "WITH c(out_col, |) AS (SELECT empno, ename FROM emp) SELECT * FROM c",
+        ),
+        (
+            MariaDB,
+            "WITH c(out_col, n|) AS (SELECT empno, ename FROM emp) SELECT * FROM c",
+        ),
         (Oracle, "SELECT * FROM (SELECT empno, ename FROM emp) d(|)"),
         (
             Oracle,
@@ -1784,6 +1806,14 @@ fn output_column_alias_list_slots_do_not_offer_catalog() {
         ),
         (
             MySQL,
+            "SELECT * FROM (SELECT empno, ename FROM emp) AS d(out_col, |)",
+        ),
+        (
+            MariaDB,
+            "SELECT * FROM (SELECT empno, ename FROM emp) AS d(|)",
+        ),
+        (
+            MariaDB,
             "SELECT * FROM (SELECT empno, ename FROM emp) AS d(out_col, |)",
         ),
     ] {
@@ -1839,7 +1869,7 @@ fn completed_between_predicate_offers_conjunction_and_clause_openers() {
             Some(db),
         )
     };
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     // Completed BETWEEN -> conjunction + downstream openers, both dialects, in
     // both standalone and second-conjunct positions, and when negated.
@@ -1849,7 +1879,7 @@ fn completed_between_predicate_offers_conjunction_and_clause_openers() {
         "SELECT a FROM t WHERE a = 1 AND x BETWEEN 1 AND 2 |",
         "SELECT a FROM t HAVING count(*) BETWEEN 1 AND 2 |",
     ] {
-        for db in [Oracle, MySQL] {
+        for db in [Oracle, MySQL, MariaDB] {
             let got = kw(sql, db);
             assert!(
                 has(&got, "AND") && has(&got, "OR"),
@@ -1936,7 +1966,7 @@ fn query_clause_continuation_offers_downstream_clause_openers() {
             Some(db),
         )
     };
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     // Complete clauses -> downstream openers (Oracle).
     assert!(has(&kw("SELECT a FROM t |", Oracle), "ORDER BY"));
@@ -1961,12 +1991,12 @@ fn query_clause_continuation_offers_downstream_clause_openers() {
         &kw("SELECT a FROM t WHERE upper(a) = upper(b) |", Oracle),
         "ORDER BY"
     ));
-    // MySQL uses LIMIT, never CONNECT BY / OFFSET-FETCH.
-    assert!(has(&kw("SELECT a FROM t WHERE a = 1 |", MySQL), "LIMIT"));
-    assert!(!has(
-        &kw("SELECT a FROM t WHERE a = 1 |", MySQL),
-        "CONNECT BY"
-    ));
+    // MySQL-family uses LIMIT, never CONNECT BY / OFFSET-FETCH.
+    for db in [MySQL, MariaDB] {
+        let got = kw("SELECT a FROM t WHERE a = 1 |", db);
+        assert!(has(&got, "LIMIT"), "{db:?} uses LIMIT: {got:?}");
+        assert!(!has(&got, "CONNECT BY"), "{db:?} no CONNECT BY: {got:?}");
+    }
 
     // Incomplete / lookalike positions -> no openers.
     for sql in [
@@ -1995,7 +2025,7 @@ fn query_clause_continuation_offers_downstream_clause_openers() {
     ));
 
     // DELETE/UPDATE are not SELECTs: Oracle offers DML RETURNING, not query
-    // clauses; MySQL allows only ORDER BY + LIMIT after the WHERE.
+    // clauses; MySQL-family allows only ORDER BY + LIMIT after the WHERE.
     assert_eq!(
         kw("DELETE FROM emp WHERE a = 1 |", Oracle),
         vec!["RETURNING".to_string()]
@@ -2004,14 +2034,17 @@ fn query_clause_continuation_offers_downstream_clause_openers() {
         kw("UPDATE emp SET a = 1 WHERE b = 2 |", Oracle),
         vec!["RETURNING".to_string()]
     );
-    assert_eq!(
-        kw("DELETE FROM emp WHERE a = 1 |", MySQL),
-        vec!["ORDER BY".to_string(), "LIMIT".to_string()]
-    );
-    assert!(!has(
-        &kw("UPDATE emp SET a = 1 WHERE b = 2 |", MySQL),
-        "GROUP BY"
-    ));
+    for db in [MySQL, MariaDB] {
+        assert_eq!(
+            kw("DELETE FROM emp WHERE a = 1 |", db),
+            vec!["ORDER BY".to_string(), "LIMIT".to_string()],
+            "{db:?} DELETE tail"
+        );
+        assert!(
+            !has(&kw("UPDATE emp SET a = 1 WHERE b = 2 |", db), "GROUP BY"),
+            "{db:?} UPDATE tail must not offer GROUP BY"
+        );
+    }
 }
 
 /// `INSERT/REPLACE INTO t (cols) |` offers the value source (`VALUES`/`SELECT`)
@@ -2029,12 +2062,14 @@ fn insert_after_column_list_offers_value_source() {
             Some(db),
         )
     };
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
     let values_select = vec!["VALUES".to_string(), "SELECT".to_string()];
     assert_eq!(kw("INSERT INTO emp (a, b) |", Oracle), values_select);
     assert_eq!(kw("INSERT INTO emp |", Oracle), values_select);
-    assert_eq!(kw("INSERT INTO emp (a, b) |", MySQL), values_select);
-    assert_eq!(kw("REPLACE INTO emp (a) |", MySQL), values_select);
+    for db in [MySQL, MariaDB] {
+        assert_eq!(kw("INSERT INTO emp (a, b) |", db), values_select);
+        assert_eq!(kw("REPLACE INTO emp (a) |", db), values_select);
+    }
     // Already-supplied source: no value-source re-emission.
     for sql in [
         "INSERT INTO emp VALUES (1, 2) |",
@@ -12510,25 +12545,104 @@ END"#,
 
 #[test]
 fn local_symbol_suggestions_support_select_into_and_returning_into_targets() {
-    let select_into = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+    let assert_local_target = |sql: &str, expected: &str, leaked: &[&str]| {
+        let suggestions = SqlEditorWidget::collect_local_symbol_suggestions_for_test(sql, &[]);
+        assert_has_case_insensitive(&suggestions, expected);
+        for name in leaked {
+            assert!(
+                !suggestions
+                    .iter()
+                    .any(|value| value.eq_ignore_ascii_case(name)),
+                "{name} leaked into local target suggestions for `{sql}`: {suggestions:?}"
+            );
+        }
+    };
+
+    assert_local_target(
         r#"DECLARE
     v_empno NUMBER;
+    v_name VARCHAR2(20);
 BEGIN
     SELECT empno INTO __CODEX_CURSOR__ FROM emp WHERE rownum = 1;
 END;"#,
+        "v_empno",
         &[],
     );
-    assert_has_case_insensitive(&select_into, "v_empno");
 
-    let returning_into = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+    assert_local_target(
+        r#"DECLARE
+    v_empno NUMBER;
+    v_name VARCHAR2(20);
+BEGIN
+    SELECT empno, ename INTO v_empno, __CODEX_CURSOR__ FROM emp WHERE rownum = 1;
+END;"#,
+        "v_name",
+        &[],
+    );
+
+    assert_local_target(
+        r#"DECLARE
+    TYPE empno_tab IS TABLE OF NUMBER;
+    v_empnos empno_tab;
+BEGIN
+    SELECT empno BULK COLLECT INTO __CODEX_CURSOR__ FROM emp;
+END;"#,
+        "v_empnos",
+        &[],
+    );
+
+    assert_local_target(
+        r#"DECLARE
+    v_empno NUMBER;
+BEGIN
+    FETCH cur_emp INTO __CODEX_CURSOR__;
+END;"#,
+        "v_empno",
+        &[],
+    );
+
+    assert_local_target(
+        r#"DECLARE
+    v_cnt NUMBER;
+    v_deptno NUMBER;
+BEGIN
+    EXECUTE IMMEDIATE 'select count(*) from emp where deptno = :1' INTO v_cnt USING __CODEX_CURSOR__;
+END;"#,
+        "v_deptno",
+        &[],
+    );
+
+    assert_local_target(
+        r#"DECLARE
+    v_cnt NUMBER;
+    v_deptno NUMBER;
+BEGIN
+    OPEN c FOR SELECT empno FROM emp WHERE deptno = :1 USING __CODEX_CURSOR__;
+END;"#,
+        "v_deptno",
+        &[],
+    );
+
+    assert_local_target(
         r#"DECLARE
     v_empno NUMBER;
 BEGIN
     DELETE FROM emp WHERE empno = 1 RETURNING empno INTO __CODEX_CURSOR__;
 END;"#,
+        "v_empno",
         &[],
     );
-    assert_has_case_insensitive(&returning_into, "v_empno");
+
+    assert_local_target(
+        r#"DECLARE
+    v_empno NUMBER;
+    v_name VARCHAR2(20);
+BEGIN
+    UPDATE emp SET sal = sal + 1 RETURNING empno, ename INTO v_empno, __CODEX_CURSOR__;
+END;"#,
+        "v_name",
+        &[],
+    );
 }
 
 #[test]
@@ -23399,15 +23513,26 @@ fn plsql_dynamic_sql_using_bind_slots_do_not_offer_schema_catalog() {
     let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
 
     for sql in [
+        "BEGIN SELECT empno INTO | FROM emp WHERE rownum = 1; END;",
+        "BEGIN SELECT empno, ename INTO l_empno, | FROM emp WHERE rownum = 1; END;",
+        "BEGIN SELECT empno BULK COLLECT INTO | FROM emp; END;",
+        "BEGIN SELECT empno BULK COLLECT INTO l_empnos, | FROM emp; END;",
+        "BEGIN FETCH cur_emp INTO |; END;",
+        "BEGIN FETCH cur_emp INTO l_empno, |; END;",
+        "BEGIN FETCH cur_emp BULK COLLECT INTO |; END;",
+        "BEGIN EXECUTE IMMEDIATE 'select count(*) from emp' INTO |; END;",
+        "BEGIN EXECUTE IMMEDIATE 'select empno, ename from emp' INTO l_empno, |; END;",
         "BEGIN EXECUTE IMMEDIATE 'select count(*) from emp where deptno = :1' INTO l_cnt USING |; END;",
         "BEGIN EXECUTE IMMEDIATE 'select count(*) from emp where deptno = :1' USING l_deptno, |; END;",
         "BEGIN OPEN c FOR SELECT empno FROM emp WHERE deptno = :1 USING |; END;",
         "BEGIN OPEN c FOR SELECT empno FROM emp WHERE deptno = :1 USING l_deptno, |; END;",
+        "BEGIN DELETE FROM emp WHERE empno = 1 RETURNING empno INTO |; END;",
+        "BEGIN UPDATE emp SET sal = sal + 1 RETURNING empno, ename INTO l_empno, |; END;",
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
         assert_eq!(
             kind, None,
-            "PL/SQL USING bind slot should not resolve a schema object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            "PL/SQL variable/bind target slot should not resolve a schema object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
         );
         for leaked in [
             "EMP",
@@ -23422,16 +23547,22 @@ fn plsql_dynamic_sql_using_bind_slots_do_not_offer_schema_catalog() {
         ] {
             assert!(
                 !contains(&final_suggestions, leaked),
-                "{leaked} leaked into PL/SQL USING bind slot at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+                "{leaked} leaked into PL/SQL variable/bind target slot at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
             );
         }
     }
 
     for sql in [
+        "BEGIN SELECT empno INTO app| FROM emp WHERE rownum = 1; END;",
+        "BEGIN SELECT empno, ename INTO l_empno, app| FROM emp WHERE rownum = 1; END;",
         "BEGIN SELECT empno INTO scott.| FROM emp WHERE rownum = 1; END;",
         "BEGIN SELECT empno BULK COLLECT INTO scott.| FROM emp; END;",
+        "BEGIN FETCH cur_emp INTO app|; END;",
         "BEGIN FETCH cur_emp INTO scott.|; END;",
+        "BEGIN EXECUTE IMMEDIATE 'select count(*) from emp' INTO app|; END;",
         "BEGIN EXECUTE IMMEDIATE 'select count(*) from emp' INTO scott.|; END;",
+        "BEGIN DELETE FROM emp WHERE empno = 1 RETURNING empno INTO app|; END;",
+        "BEGIN UPDATE emp SET sal = sal + 1 RETURNING empno, ename INTO l_empno, app|; END;",
         "BEGIN EXECUTE IMMEDIATE 'select count(*) from emp where deptno = :1' USING scott.|; END;",
         "BEGIN OPEN c FOR SELECT empno FROM emp WHERE deptno = :1 USING scott.|; END;",
     ] {
@@ -24321,7 +24452,7 @@ fn resolve_qualified_completion_mode_uses_schema_members_for_oracle_object_ddl_c
 
 #[test]
 fn qualified_value_and_keyword_only_slots_do_not_use_schema_members() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let mut data = IntellisenseData::new();
     data.set_members_for_qualifier_with_kinds(
@@ -24432,6 +24563,25 @@ fn qualified_value_and_keyword_only_slots_do_not_use_schema_members() {
         (Oracle, "SELECT * FROM emp e WHERE empno IS e.|"),
         (Oracle, "SELECT * FROM emp e FETCH FIRST 1 ROWS ONLY e.|"),
         (MySQL, "SELECT * FROM emp e WHERE ename COLLATE e.|"),
+        (MariaDB, "CREATE DATABASE db CHARACTER SET scott.|"),
+        (MariaDB, "CREATE USER alice IDENTIFIED BY scott.|"),
+        (MariaDB, "SET NAMES utf8mb4 COLLATE scott.|"),
+        (MariaDB, "SELECT SUBSTRING(name scott.| FROM emp"),
+        (MariaDB, "SELECT match(ename) AGAINST scott.| FROM emp"),
+        (MariaDB, "SELECT * FROM emp WHERE ename SOUNDS scott.|"),
+        (MariaDB, "INSERT INTO emp VALUES (1) ON scott.|"),
+        (MariaDB, "INSERT INTO emp VALUES (1) ON DUPLICATE scott.|"),
+        (MariaDB, "INSERT INTO emp VALUES (1) ON DUPLICATE KEY scott.|"),
+        (
+            MariaDB,
+            "INSERT INTO emp VALUES (1) ON DUPLICATE KEY UPDATE sal = 1 scott.|",
+        ),
+        (MariaDB, "CREATE INDEX ix ON emp (empno) e.|"),
+        (MariaDB, "ALTER TABLE emp ADD COLUMN id INT e.|"),
+        (MariaDB, "CREATE TRIGGER trg BEFORE e.|"),
+        (MariaDB, "SELECT * FROM emp e ORDER e.|"),
+        (MariaDB, "SELECT * FROM emp e GROUP e.|"),
+        (MariaDB, "SELECT * FROM emp e WHERE ename COLLATE e.|"),
     ] {
         let ctx = analyze_inline_cursor_sql(sql);
         let context =
@@ -24469,6 +24619,9 @@ fn qualified_value_and_keyword_only_slots_do_not_use_schema_members() {
         (MySQL, "DROP TABLE scott.|"),
         (MySQL, "SHOW CREATE TABLE scott.|"),
         (MySQL, "SELECT e.| FROM emp e"),
+        (MariaDB, "DROP TABLE scott.|"),
+        (MariaDB, "SHOW CREATE TABLE scott.|"),
+        (MariaDB, "SELECT e.| FROM emp e"),
     ] {
         let ctx = analyze_inline_cursor_sql(sql);
         assert!(
@@ -25731,14 +25884,16 @@ fn join_target_continuation_offers_on_using_and_suppresses_relations() {
         )
     };
     let has = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
-    let mysql_straight = kw_for(
-        "SELECT * FROM a STRAIGHT_JOIN b |",
+    for db in [
         crate::db::DatabaseType::MySQL,
-    );
-    assert!(
-        has(&mysql_straight, "ON") && has(&mysql_straight, "USING"),
-        "MySQL STRAIGHT_JOIN target should offer ON/USING: {mysql_straight:?}"
-    );
+        crate::db::DatabaseType::MariaDB,
+    ] {
+        let mysql_straight = kw_for("SELECT * FROM a STRAIGHT_JOIN b |", db);
+        assert!(
+            has(&mysql_straight, "ON") && has(&mysql_straight, "USING"),
+            "{db:?} STRAIGHT_JOIN target should offer ON/USING: {mysql_straight:?}"
+        );
+    }
     for (db, sql) in [
         (
             crate::db::DatabaseType::Oracle,
@@ -25750,6 +25905,14 @@ fn join_target_continuation_offers_on_using_and_suppresses_relations() {
         ),
         (
             crate::db::DatabaseType::MySQL,
+            "SELECT * FROM a FULL OUTER JOIN b |",
+        ),
+        (
+            crate::db::DatabaseType::MariaDB,
+            "SELECT * FROM a FULL JOIN b |",
+        ),
+        (
+            crate::db::DatabaseType::MariaDB,
             "SELECT * FROM a FULL OUTER JOIN b |",
         ),
     ] {
@@ -25888,7 +26051,7 @@ fn interval_unit_slot_suppresses_columns_and_offers_unit_keywords() {
 
 #[test]
 fn extract_and_interval_keyword_slots_suppress_catalog_in_final_suggestions() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
 
@@ -25960,16 +26123,18 @@ fn extract_and_interval_keyword_slots_suppress_catalog_in_final_suggestions() {
         );
     }
 
-    let (kind, keywords, mysql_compound) =
-        audit_final_suggestions_for("SELECT INTERVAL '1' DAY_HOUR | FROM emp", MySQL);
-    assert_eq!(
-        kind, None,
-        "completed MySQL compound INTERVAL unit should not resolve object kind: keywords={keywords:?} final={mysql_compound:?}"
-    );
-    assert!(
-        mysql_compound.is_empty(),
-        "completed MySQL compound INTERVAL unit should not offer catalog or TO: keywords={keywords:?} final={mysql_compound:?}"
-    );
+    for db in [MySQL, MariaDB] {
+        let (kind, keywords, mysql_compound) =
+            audit_final_suggestions_for("SELECT INTERVAL '1' DAY_HOUR | FROM emp", db);
+        assert_eq!(
+            kind, None,
+            "completed {db:?} compound INTERVAL unit should not resolve object kind: keywords={keywords:?} final={mysql_compound:?}"
+        );
+        assert!(
+            mysql_compound.is_empty(),
+            "completed {db:?} compound INTERVAL unit should not offer catalog or TO: keywords={keywords:?} final={mysql_compound:?}"
+        );
+    }
 }
 
 #[test]
@@ -29856,7 +30021,7 @@ fn comment_on_column_filters_schema_members_to_column_owner_relations() {
 
 #[test]
 fn schema_relation_member_suggestions_filter_by_oracle_object_context() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let drop_table_ctx = analyze_inline_cursor_sql("DROP TABLE scott.|");
     let analyze_table_ctx = analyze_inline_cursor_sql("ANALYZE TABLE scott.|");
@@ -29920,6 +30085,9 @@ fn schema_relation_member_suggestions_filter_by_oracle_object_context() {
     let optimize_table_suggestions = relation_members(&optimize_table_ctx, MySQL);
     let check_table_suggestions = relation_members(&check_table_ctx, MySQL);
     let repair_table_suggestions = relation_members(&repair_table_ctx, MySQL);
+    let mariadb_optimize_table_suggestions = relation_members(&optimize_table_ctx, MariaDB);
+    let mariadb_check_table_suggestions = relation_members(&check_table_ctx, MariaDB);
+    let mariadb_repair_table_suggestions = relation_members(&repair_table_ctx, MariaDB);
     let references_suggestions = relation_members(&references_ctx, Oracle);
     let create_table_references_suggestions =
         relation_members(&create_table_references_ctx, Oracle);
@@ -29942,6 +30110,9 @@ fn schema_relation_member_suggestions_filter_by_oracle_object_context() {
     assert_eq!(optimize_table_suggestions, vec!["EMP".to_string()]);
     assert_eq!(check_table_suggestions, vec!["EMP".to_string()]);
     assert_eq!(repair_table_suggestions, vec!["EMP".to_string()]);
+    assert_eq!(mariadb_optimize_table_suggestions, vec!["EMP".to_string()]);
+    assert_eq!(mariadb_check_table_suggestions, vec!["EMP".to_string()]);
+    assert_eq!(mariadb_repair_table_suggestions, vec!["EMP".to_string()]);
     assert_eq!(references_suggestions, vec!["EMP".to_string()]);
     assert_eq!(create_table_references_suggestions, vec!["EMP".to_string()]);
     assert_eq!(create_index_suggestions, vec!["EMP".to_string()]);
@@ -32168,7 +32339,7 @@ fn window_frame_keyword_only_positions_suppress_columns() {
 
 #[test]
 fn window_frame_completed_tails_stay_keyword_only_with_prefixes() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
     let assert_no_noise = |sql: &str, db: crate::db::DatabaseType, suggestions: &[String]| {
@@ -32271,6 +32442,11 @@ fn window_frame_completed_tails_stay_keyword_only_with_prefixes() {
         ),
         (
             MySQL,
+            "SELECT SUM(sal) OVER (ORDER BY sal ROWS CURRENT ROW e|) FROM emp",
+            None,
+        ),
+        (
+            MariaDB,
             "SELECT SUM(sal) OVER (ORDER BY sal ROWS CURRENT ROW e|) FROM emp",
             None,
         ),
@@ -33399,7 +33575,7 @@ fn table_alias_slot_after_as_suppresses_identifier_base() {
 
 #[test]
 fn alias_name_slots_do_not_offer_catalog_or_expression_noise() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
     let assert_no_identifier_noise =
@@ -33435,6 +33611,10 @@ fn alias_name_slots_do_not_offer_catalog_or_expression_noise() {
         (MySQL, "SELECT col AS my| FROM t"),
         (MySQL, "SELECT col AS n| FROM t"),
         (MySQL, "SELECT a, b AS | FROM t"),
+        (MariaDB, "SELECT col AS | FROM t"),
+        (MariaDB, "SELECT col AS my| FROM t"),
+        (MariaDB, "SELECT col AS n| FROM t"),
+        (MariaDB, "SELECT a, b AS | FROM t"),
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
         assert_eq!(
@@ -33462,6 +33642,12 @@ fn alias_name_slots_do_not_offer_catalog_or_expression_noise() {
         (MySQL, "SELECT * FROM emp e JOIN dept AS n|", &[][..]),
         (MySQL, "UPDATE emp AS |", &[][..]),
         (MySQL, "DELETE FROM emp AS |", &[][..]),
+        (MariaDB, "SELECT * FROM emp AS |", &[][..]),
+        (MariaDB, "SELECT * FROM emp AS n|", &[][..]),
+        (MariaDB, "SELECT * FROM emp e JOIN dept AS |", &[][..]),
+        (MariaDB, "SELECT * FROM emp e JOIN dept AS n|", &[][..]),
+        (MariaDB, "UPDATE emp AS |", &[][..]),
+        (MariaDB, "DELETE FROM emp AS |", &[][..]),
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
         assert_eq!(
@@ -33669,6 +33855,26 @@ fn merge_condition_slots_final_suggestions_stay_column_oriented() {
             "EMPNO", "ENAME", "SAL", "MATCHED", "UPDATE", "DELETE", "INSERT",
         ],
     );
+    assert_columns(
+        "MERGE INTO emp e USING dept d ON (e.empno = d.deptno) WHEN MATCHED THEN UPDATE SET sal = 1 WHERE |",
+        &["EMPNO", "ENAME", "SAL", "DEPTNO", "DNAME"],
+        &["MATCHED", "UPDATE", "DELETE", "INSERT", "VALUES"],
+    );
+    assert_columns(
+        "MERGE INTO emp e USING dept d ON (e.empno = d.deptno) WHEN MATCHED THEN UPDATE SET sal = 1 DELETE WHERE |",
+        &["EMPNO", "ENAME", "SAL", "DEPTNO", "DNAME"],
+        &["MATCHED", "UPDATE", "DELETE", "INSERT", "VALUES"],
+    );
+    assert_columns(
+        "MERGE INTO emp e USING dept d ON (e.empno = d.deptno) WHEN MATCHED THEN UPDATE SET sal = 1 DELETE WHERE e.|",
+        &["EMPNO", "ENAME", "SAL"],
+        &["DEPTNO", "DNAME", "MATCHED", "UPDATE", "DELETE", "INSERT"],
+    );
+    assert_columns(
+        "MERGE INTO emp e USING dept d ON (e.empno = d.deptno) WHEN MATCHED THEN UPDATE SET sal = 1 DELETE WHERE d.|",
+        &["DEPTNO", "DNAME"],
+        &["EMPNO", "ENAME", "SAL", "MATCHED", "UPDATE", "DELETE", "INSERT"],
+    );
 }
 
 /// The MERGE match-condition region (`WHEN [NOT] MATCHED [AND <cond>] |`, before
@@ -33808,7 +34014,7 @@ fn for_update_locking_clause_is_keyword_only_not_columns() {
 
 #[test]
 fn for_update_locking_clause_final_suggestions_stay_slot_specific() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
     let assert_no_catalog_noise = |sql: &str,
@@ -33873,6 +34079,24 @@ fn for_update_locking_clause_final_suggestions_stay_slot_specific() {
         ),
         (
             MySQL,
+            "SELECT * FROM emp FOR UPDATE OF empno |",
+            &["NOWAIT", "SKIP"],
+            &["OF", "WAIT"],
+        ),
+        (
+            MariaDB,
+            "SELECT * FROM emp FOR |",
+            &["UPDATE", "SHARE"],
+            &["WAIT"],
+        ),
+        (
+            MariaDB,
+            "SELECT * FROM emp FOR UPDATE |",
+            &["OF", "NOWAIT", "SKIP"],
+            &["WAIT"],
+        ),
+        (
+            MariaDB,
             "SELECT * FROM emp FOR UPDATE OF empno |",
             &["NOWAIT", "SKIP"],
             &["OF", "WAIT"],
@@ -33946,6 +34170,14 @@ fn for_update_locking_clause_final_suggestions_stay_slot_specific() {
         (MySQL, "SELECT * FROM emp FOR SHARE NOWAIT n|"),
         (MySQL, "SELECT * FROM emp FOR SHARE SKIP LOCKED |"),
         (MySQL, "SELECT * FROM emp FOR SHARE SKIP LOCKED n|"),
+        (MariaDB, "SELECT * FROM emp FOR UPDATE NOWAIT |"),
+        (MariaDB, "SELECT * FROM emp FOR UPDATE NOWAIT n|"),
+        (MariaDB, "SELECT * FROM emp FOR UPDATE SKIP LOCKED |"),
+        (MariaDB, "SELECT * FROM emp FOR UPDATE SKIP LOCKED n|"),
+        (MariaDB, "SELECT * FROM emp FOR SHARE NOWAIT |"),
+        (MariaDB, "SELECT * FROM emp FOR SHARE NOWAIT n|"),
+        (MariaDB, "SELECT * FROM emp FOR SHARE SKIP LOCKED |"),
+        (MariaDB, "SELECT * FROM emp FOR SHARE SKIP LOCKED n|"),
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
         assert_eq!(
@@ -33961,7 +34193,7 @@ fn for_update_locking_clause_final_suggestions_stay_slot_specific() {
 
 #[test]
 fn select_special_column_slots_stay_column_scoped_in_final_suggestions() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let contains = |values: &[String], needle: &str| {
         values
@@ -34003,6 +34235,12 @@ fn select_special_column_slots_stay_column_scoped_in_final_suggestions() {
             &["DEPTNO", "DNAME"],
         ),
         (
+            MariaDB,
+            "SELECT empno, ename, sal FROM emp ORDER BY |",
+            &["EMPNO", "ENAME", "SAL"],
+            &["DEPTNO", "DNAME"],
+        ),
+        (
             Oracle,
             "SELECT deptno, COUNT(*) FROM dept GROUP BY |",
             &["DEPTNO", "DNAME"],
@@ -34010,6 +34248,12 @@ fn select_special_column_slots_stay_column_scoped_in_final_suggestions() {
         ),
         (
             MySQL,
+            "SELECT deptno, COUNT(*) FROM dept GROUP BY |",
+            &["DEPTNO", "DNAME"],
+            &["EMPNO", "ENAME", "SAL"],
+        ),
+        (
+            MariaDB,
             "SELECT deptno, COUNT(*) FROM dept GROUP BY |",
             &["DEPTNO", "DNAME"],
             &["EMPNO", "ENAME", "SAL"],
@@ -35098,7 +35342,7 @@ fn data_type_declaration_after_rowtype_member_still_offers_types() {
 
 #[test]
 fn data_type_json_table_columns_clause_offers_types() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
     assert!(!data_type_suggestions(
         "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id | PATH '$.id'))",
         "",
@@ -35117,26 +35361,28 @@ fn data_type_json_table_columns_clause_offers_types() {
         Oracle
     )
     .is_empty());
-    assert!(!data_type_suggestions(
-        "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id | PATH '$.id'))",
-        "",
-        MySQL
-    )
-    .is_empty());
-    assert!(
-        data_type_suggestions(
-            "SELECT * FROM XMLTABLE('/r' PASSING x COLUMNS id | PATH 'id')",
+    for db in [MySQL, MariaDB] {
+        assert!(!data_type_suggestions(
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id | PATH '$.id'))",
             "",
-            MySQL
+            db
         )
-        .is_empty(),
-        "Oracle-only XMLTABLE column type grammar leaked into MySQL"
-    );
+        .is_empty());
+        assert!(
+            data_type_suggestions(
+                "SELECT * FROM XMLTABLE('/r' PASSING x COLUMNS id | PATH 'id')",
+                "",
+                db
+            )
+            .is_empty(),
+            "Oracle-only XMLTABLE column type grammar leaked into {db:?}"
+        );
+    }
 }
 
 #[test]
 fn json_table_column_name_tail_offers_ordinality_and_exists_path_keywords() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let kw = |sql: &str, db| {
         let cursor = sql.find('|').expect("cursor marker");
@@ -35154,7 +35400,7 @@ fn json_table_column_name_tail_offers_ordinality_and_exists_path_keywords() {
             .any(|value| value.eq_ignore_ascii_case(keyword))
     };
 
-    for db in [Oracle, MySQL] {
+    for db in [Oracle, MySQL, MariaDB] {
         let after_name = kw("SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id |))", db);
         assert!(
             has(&after_name, "FOR") && has(&after_name, "EXISTS"),
@@ -35305,7 +35551,7 @@ fn json_table_column_name_tail_offers_ordinality_and_exists_path_keywords() {
 
 #[test]
 fn xmltable_column_tail_keeps_xmltable_grammar_separate_from_json_table() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let kw = |sql: &str, db_type| {
         let cursor = sql.find('|').expect("cursor marker");
@@ -35364,16 +35610,18 @@ fn xmltable_column_tail_keeps_xmltable_grammar_separate_from_json_table() {
         .is_empty(),
         "JSON_TABLE handler heads leaked after XMLTABLE PATH"
     );
-    for sql in [
-        "SELECT * FROM XMLTABLE('/r' COLUMNS id FOR |) xt",
-        "SELECT * FROM XMLTABLE('/r' COLUMNS id NUMBER |) xt",
-        "SELECT * FROM XMLTABLE('/r' COLUMNS id NUMBER PATH 'id' |) xt",
-    ] {
-        let got = kw(sql, MySQL);
-        assert!(
-            got.is_empty(),
-            "Oracle-only XMLTABLE column-tail grammar leaked into MySQL at `{sql}`: {got:?}"
-        );
+    for db in [MySQL, MariaDB] {
+        for sql in [
+            "SELECT * FROM XMLTABLE('/r' COLUMNS id FOR |) xt",
+            "SELECT * FROM XMLTABLE('/r' COLUMNS id NUMBER |) xt",
+            "SELECT * FROM XMLTABLE('/r' COLUMNS id NUMBER PATH 'id' |) xt",
+        ] {
+            let got = kw(sql, db);
+            assert!(
+                got.is_empty(),
+                "Oracle-only XMLTABLE column-tail grammar leaked into {db:?} at `{sql}`: {got:?}"
+            );
+        }
     }
 
     let (kind, keywords, final_suggestions) = audit_final_suggestions_for(
@@ -35410,7 +35658,7 @@ fn xmltable_column_tail_keeps_xmltable_grammar_separate_from_json_table() {
 
 #[test]
 fn table_function_path_literal_slots_suppress_identifier_base() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let exclude_flag = |sql_with_cursor: &str| {
         let cursor = sql_with_cursor.find('|').expect("cursor marker");
@@ -35472,6 +35720,10 @@ fn table_function_path_literal_slots_suppress_identifier_base() {
             "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id INT PATH p|))",
             MySQL,
         ),
+        (
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id INT PATH p|))",
+            MariaDB,
+        ),
     ] {
         assert!(
             suppresses(sql, db_type),
@@ -35499,6 +35751,10 @@ fn table_function_path_literal_slots_suppress_identifier_base() {
             "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id INT PATH |))",
             MySQL,
         ),
+        (
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id INT PATH |))",
+            MariaDB,
+        ),
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db_type);
         assert_eq!(
@@ -35520,13 +35776,15 @@ fn table_function_path_literal_slots_suppress_identifier_base() {
         final_suggestions.is_empty(),
         "table-function opener should not offer catalog or keywords: keywords={keywords:?} final={final_suggestions:?}"
     );
-    assert!(
-        !suppresses(
-            "SELECT * FROM XMLTABLE('/r' PASSING x COLUMNS id NUMBER PATH p|)",
-            MySQL,
-        ),
-        "Oracle-only XMLTABLE PATH literal slot should not suppress identifiers in MySQL"
-    );
+    for db in [MySQL, MariaDB] {
+        assert!(
+            !suppresses(
+                "SELECT * FROM XMLTABLE('/r' PASSING x COLUMNS id NUMBER PATH p|)",
+                db,
+            ),
+            "Oracle-only XMLTABLE PATH literal slot should not suppress identifiers in {db:?}"
+        );
+    }
 
     assert!(
         !data_type_suggestions(
@@ -35541,7 +35799,7 @@ fn table_function_path_literal_slots_suppress_identifier_base() {
 
 #[test]
 fn json_on_target_keyword_slots_suppress_identifier_base() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let exclude_flag = |sql_with_cursor: &str| {
         let cursor = sql_with_cursor.find('|').expect("cursor marker");
@@ -35620,21 +35878,20 @@ fn json_on_target_keyword_slots_suppress_identifier_base() {
         keywords("SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON er|) FROM emp").is_empty(),
         "JSON ON NULL target must not suggest ERROR"
     );
-    assert!(
-        !suppresses_for(
-            "SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON |) FROM emp",
-            MySQL
-        ),
-        "Oracle JSON ON NULL target must not suppress identifiers in MySQL mode"
-    );
-    assert!(
-        keywords_for(
-            "SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON nu|) FROM emp",
-            MySQL
-        )
-        .is_empty(),
-        "Oracle JSON ON NULL target must not emit keywords in MySQL mode"
-    );
+    for db in [MySQL, MariaDB] {
+        assert!(
+            !suppresses_for("SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON |) FROM emp", db),
+            "Oracle JSON ON NULL target must not suppress identifiers in {db:?} mode"
+        );
+        assert!(
+            keywords_for(
+                "SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON nu|) FROM emp",
+                db
+            )
+            .is_empty(),
+            "Oracle JSON ON NULL target must not emit keywords in {db:?} mode"
+        );
+    }
 
     assert!(
         !suppresses("SELECT * FROM emp e JOIN dept d ON |"),
@@ -35649,7 +35906,7 @@ fn json_on_target_keyword_slots_suppress_identifier_base() {
 
 #[test]
 fn json_function_option_tails_offer_handlers_and_wrapper_keywords() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let kw = |sql: &str, db| {
         let cursor = sql.find('|').expect("cursor marker");
@@ -35819,15 +36076,17 @@ fn json_function_option_tails_offer_handlers_and_wrapper_keywords() {
         vec!["ON".to_string()],
         "JSON_QUERY EMPTY OBJECT should continue with ON"
     );
-    assert!(
-        !kw(
-            "SELECT JSON_QUERY(payload, '$.items' RETURNING CLOB WITH |) FROM emp",
-            MySQL
-        )
-        .iter()
-        .any(|value| value == "WRAPPER"),
-        "Oracle JSON_QUERY wrapper tail leaked into MySQL"
-    );
+    for db in [MySQL, MariaDB] {
+        assert!(
+            !kw(
+                "SELECT JSON_QUERY(payload, '$.items' RETURNING CLOB WITH |) FROM emp",
+                db
+            )
+            .iter()
+            .any(|value| value == "WRAPPER"),
+            "Oracle JSON_QUERY wrapper tail leaked into {db:?}"
+        );
+    }
 
     assert_eq!(
         kw("SELECT JSON_EXISTS(payload, '$' |) FROM emp", Oracle),
@@ -35839,14 +36098,16 @@ fn json_function_option_tails_offer_handlers_and_wrapper_keywords() {
         vec!["ON".to_string()],
         "JSON_EXISTS TRUE handler should continue with ON"
     );
-    assert!(
-        kw("SELECT JSON_EXISTS(payload, '$' |) FROM emp", MySQL).is_empty(),
-        "Oracle JSON_EXISTS option tail leaked into MySQL"
-    );
-    assert!(
-        kw("SELECT JSON_QUERY(payload, '$' NULL ON |) FROM emp", MySQL).is_empty(),
-        "Oracle JSON_QUERY ON target leaked into MySQL"
-    );
+    for db in [MySQL, MariaDB] {
+        assert!(
+            kw("SELECT JSON_EXISTS(payload, '$' |) FROM emp", db).is_empty(),
+            "Oracle JSON_EXISTS option tail leaked into {db:?}"
+        );
+        assert!(
+            kw("SELECT JSON_QUERY(payload, '$' NULL ON |) FROM emp", db).is_empty(),
+            "Oracle JSON_QUERY ON target leaked into {db:?}"
+        );
+    }
 }
 
 #[test]
@@ -36080,7 +36341,7 @@ fn xmlquery_option_keyword_slots_suppress_catalog_without_hiding_value_slots() {
 
 #[test]
 fn json_generation_option_tails_are_oracle_scoped_and_keyword_only() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let kw = |sql: &str, db| {
         let cursor = sql.find('|').expect("cursor marker");
@@ -36188,23 +36449,23 @@ fn json_generation_option_tails_are_oracle_scoped_and_keyword_only() {
         vec!["RETURNING".to_string()],
         "JSON generation STRICT should continue with RETURNING"
     );
-    assert!(
-        kw(
-            "SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON |) FROM emp",
-            MySQL
-        )
-        .is_empty(),
-        "Oracle JSON generation ON target leaked into MySQL"
-    );
+    for db in [MySQL, MariaDB] {
+        assert!(
+            kw("SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON |) FROM emp", db).is_empty(),
+            "Oracle JSON generation ON target leaked into {db:?}"
+        );
+    }
     assert!(
         kw("SELECT JSON_OBJECT(KEY k VALUE v ABSENT ON NULL WITH UNIQUE KEYS STRICT RETURNING CLOB |) FROM emp", Oracle)
             .is_empty(),
         "completed JSON generation RETURNING type tail should not emit keywords"
     );
-    assert!(
-        kw("SELECT JSON_OBJECT(KEY k VALUE v ABSENT |) FROM emp", MySQL).is_empty(),
-        "Oracle JSON generation ABSENT ON NULL option leaked into MySQL"
-    );
+    for db in [MySQL, MariaDB] {
+        assert!(
+            kw("SELECT JSON_OBJECT(KEY k VALUE v ABSENT |) FROM emp", db).is_empty(),
+            "Oracle JSON generation ABSENT ON NULL option leaked into {db:?}"
+        );
+    }
 }
 
 #[test]
@@ -36323,7 +36584,7 @@ fn json_generation_option_keyword_slots_suppress_catalog() {
 
 #[test]
 fn json_table_column_tail_keyword_slots_suppress_catalog() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
 
@@ -36354,7 +36615,17 @@ fn json_table_column_tail_keyword_slots_suppress_catalog() {
             "ORDINALITY",
         ),
         (
+            MariaDB,
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id FOR |))",
+            "ORDINALITY",
+        ),
+        (
             MySQL,
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id FOR O|))",
+            "ORDINALITY",
+        ),
+        (
+            MariaDB,
             "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id FOR O|))",
             "ORDINALITY",
         ),
@@ -36364,7 +36635,17 @@ fn json_table_column_tail_keyword_slots_suppress_catalog() {
             "PATH",
         ),
         (
+            MariaDB,
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id EXISTS |))",
+            "PATH",
+        ),
+        (
             MySQL,
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id EXISTS P|))",
+            "PATH",
+        ),
+        (
+            MariaDB,
             "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id EXISTS P|))",
             "PATH",
         ),
@@ -36384,7 +36665,17 @@ fn json_table_column_tail_keyword_slots_suppress_catalog() {
             "COLUMNS",
         ),
         (
+            MariaDB,
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (NESTED PATH '$.items[*]' |))",
+            "COLUMNS",
+        ),
+        (
             MySQL,
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (NESTED PATH '$.items[*]' C|))",
+            "COLUMNS",
+        ),
+        (
+            MariaDB,
             "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (NESTED PATH '$.items[*]' C|))",
             "COLUMNS",
         ),
@@ -36404,7 +36695,17 @@ fn json_table_column_tail_keyword_slots_suppress_catalog() {
             "ON",
         ),
         (
+            MariaDB,
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id NUMBER PATH '$.id' ERROR |))",
+            "ON",
+        ),
+        (
             MySQL,
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id NUMBER PATH '$.id' ERROR O|))",
+            "ON",
+        ),
+        (
+            MariaDB,
             "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id NUMBER PATH '$.id' ERROR O|))",
             "ON",
         ),
@@ -36434,12 +36735,22 @@ fn json_table_column_tail_keyword_slots_suppress_catalog() {
             "ON",
         ),
         (
+            MariaDB,
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id NUMBER PATH '$.id' NULL ON EMPTY ERROR |))",
+            "ON",
+        ),
+        (
             Oracle,
             "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id NUMBER PATH '$.id' DEFAULT 0 |))",
             "ON",
         ),
         (
             MySQL,
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id NUMBER PATH '$.id' DEFAULT fallback_amt |))",
+            "ON",
+        ),
+        (
+            MariaDB,
             "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id NUMBER PATH '$.id' DEFAULT fallback_amt |))",
             "ON",
         ),
@@ -36475,7 +36786,15 @@ fn json_table_column_tail_keyword_slots_suppress_catalog() {
             "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id EXISTS PATH '$.id' TRUE ON ERROR |))",
         ),
         (
+            MariaDB,
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id EXISTS PATH '$.id' TRUE ON ERROR |))",
+        ),
+        (
             MySQL,
+            "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id EXISTS PATH '$.id' TRUE ON ERROR n|))",
+        ),
+        (
+            MariaDB,
             "SELECT * FROM JSON_TABLE(d, '$' COLUMNS (id EXISTS PATH '$.id' TRUE ON ERROR n|))",
         ),
     ] {
@@ -36484,7 +36803,20 @@ fn json_table_column_tail_keyword_slots_suppress_catalog() {
             kind, None,
             "completed JSON_TABLE handler tail should not resolve object kind at `{sql}`; keywords={keywords:?} final={final_suggestions:?}"
         );
-        for leaked in ["EMP", "DEPT", "EMP_V", "EMPNO", "ENAME", "RUN_JOB", "CALC_TOTAL"] {
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "EMPNO",
+            "ENAME",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "ON",
+            "EMPTY",
+            "ERROR",
+            "NULL",
+            "DEFAULT",
+        ] {
             assert!(
                 !contains(&final_suggestions, leaked),
                 "{leaked} leaked after completed JSON_TABLE handler at `{sql}`: {final_suggestions:?}"
@@ -36495,7 +36827,7 @@ fn json_table_column_tail_keyword_slots_suppress_catalog() {
 
 #[test]
 fn data_type_table_named_columns_is_not_a_type_position() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
     // A table literally named/aliased around "columns" must never offer types.
     // (The position *does* legitimately offer query-clause openers - `WHERE`,
     // `GROUP BY`, `ORDER BY`, … after a complete FROM relation - so assert the
@@ -36505,11 +36837,13 @@ fn data_type_table_named_columns_is_not_a_type_position() {
         "",
         Oracle
     )));
-    assert!(!has_data_type_keyword(&data_type_suggestions(
-        "SELECT * FROM information_schema.columns x |",
-        "",
-        MySQL
-    )));
+    for db in [MySQL, MariaDB] {
+        assert!(!has_data_type_keyword(&data_type_suggestions(
+            "SELECT * FROM information_schema.columns x |",
+            "",
+            db
+        )));
+    }
     // Before the COLUMNS keyword (the JSON expression) is not a type slot either.
     assert!(!has_data_type_keyword(&data_type_suggestions(
         "SELECT * FROM JSON_TABLE(d| , '$' COLUMNS (id NUMBER PATH '$.id'))",
@@ -37788,7 +38122,7 @@ fn mysql_trigger_pseudo_rows_are_scoped_to_trigger_events() {
 /// program declaration keyword and must not appear as a value-expression starter.
 #[test]
 fn cursor_expression_keyword_is_oracle_only() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     fn suggestions(
         sql_with_cursor: &str,
@@ -37830,16 +38164,18 @@ fn cursor_expression_keyword_is_oracle_only() {
     }
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
 
-    let mysql = suggestions("SELECT cu| FROM emp", MySQL, &[]);
-    assert!(
-        !has(&mysql, "CURSOR"),
-        "CURSOR leaked in MySQL value position: {mysql:?}"
-    );
-    let mysql = suggestions("SELECT * FROM emp WHERE cu| = 1", MySQL, &[]);
-    assert!(
-        !has(&mysql, "CURSOR"),
-        "CURSOR leaked in MySQL predicate: {mysql:?}"
-    );
+    for db in [MySQL, MariaDB] {
+        let mysql = suggestions("SELECT cu| FROM emp", db, &[]);
+        assert!(
+            !has(&mysql, "CURSOR"),
+            "CURSOR leaked in {db:?} value position: {mysql:?}"
+        );
+        let mysql = suggestions("SELECT * FROM emp WHERE cu| = 1", db, &[]);
+        assert!(
+            !has(&mysql, "CURSOR"),
+            "CURSOR leaked in {db:?} predicate: {mysql:?}"
+        );
+    }
 
     let oracle = suggestions("SELECT cu| FROM emp", Oracle, &[]);
     assert!(
@@ -37847,11 +38183,13 @@ fn cursor_expression_keyword_is_oracle_only() {
         "Oracle CURSOR expression was hidden: {oracle:?}"
     );
 
-    let mysql = suggestions("SELECT cu| FROM emp", MySQL, &["CURSOR"]);
-    assert!(
-        has(&mysql, "CURSOR"),
-        "column named CURSOR was hidden: {mysql:?}"
-    );
+    for db in [MySQL, MariaDB] {
+        let mysql = suggestions("SELECT cu| FROM emp", db, &["CURSOR"]);
+        assert!(
+            has(&mysql, "CURSOR"),
+            "column named CURSOR was hidden in {db:?}: {mysql:?}"
+        );
+    }
 }
 
 #[test]
@@ -38209,17 +38547,19 @@ fn single_use_postfix_operators_are_not_re_offered() {
         )
     }
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     // First-offer on a fresh operand of the matching type: still offered.
     assert!(has(
         &suggestions("SELECT * FROM t WHERE 'lit' c| ", Oracle),
         "COLLATE"
     ));
-    assert!(has(
-        &suggestions("SELECT * FROM t WHERE a s| ", MySQL),
-        "SOUNDS"
-    ));
+    for db in [MySQL, MariaDB] {
+        assert!(
+            has(&suggestions("SELECT * FROM t WHERE a s| ", db), "SOUNDS"),
+            "SOUNDS missing for {db:?}"
+        );
+    }
     assert!(has(
         &suggestions("SELECT * FROM t WHERE ts a| ", Oracle),
         "AT"
@@ -38240,6 +38580,11 @@ fn single_use_postfix_operators_are_not_re_offered() {
         (
             "SELECT * FROM t WHERE a SOUNDS LIKE 'b' s| ",
             MySQL,
+            "SOUNDS",
+        ),
+        (
+            "SELECT * FROM t WHERE a SOUNDS LIKE 'b' s| ",
+            MariaDB,
             "SOUNDS",
         ),
         ("SELECT * FROM t WHERE ts AT TIME ZONE tz a| ", Oracle, "AT"),
@@ -40070,7 +40415,7 @@ fn binary_prefix_operator_expects_an_operand() {
 /// `AND`/`OR` do not leak.
 #[test]
 fn parenthesized_expression_constructs_suppress_identifier_base() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
     let exclude_flag = |sql_with_cursor: &str| {
@@ -40107,10 +40452,12 @@ fn parenthesized_expression_constructs_suppress_identifier_base() {
         );
     }
 
-    assert!(
-        !suppresses("SELECT CURSOR en| FROM emp", MySQL),
-        "MySQL CURSOR is not a value-expression construct"
-    );
+    for db in [MySQL, MariaDB] {
+        assert!(
+            !suppresses("SELECT CURSOR en| FROM emp", db),
+            "{db:?} CURSOR is not a value-expression construct"
+        );
+    }
     assert!(
         !suppresses("CREATE TABLE IF NOT EXISTS emp|", Oracle),
         "DDL IF NOT EXISTS name slot must keep identifier/object completion"
@@ -40119,10 +40466,12 @@ fn parenthesized_expression_constructs_suppress_identifier_base() {
         !suppresses("SELECT CASE en| FROM emp", Oracle),
         "CASE can accept a selector expression"
     );
-    assert!(
-        !suppresses("SELECT BINARY en| FROM emp", MySQL),
-        "BINARY is a prefix operator, not a parenthesized construct"
-    );
+    for db in [MySQL, MariaDB] {
+        assert!(
+            !suppresses("SELECT BINARY en| FROM emp", db),
+            "BINARY is a prefix operator, not a parenthesized construct in {db:?}"
+        );
+    }
 }
 
 #[test]
@@ -40720,7 +41069,7 @@ fn predicate_open_paren_slots_suppress_columns_only_before_the_list() {
 
 #[test]
 fn string_pattern_slots_filter_columns_to_character_operands() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
     let assert_character_only = |sql: &str, db_type| {
@@ -40745,20 +41094,22 @@ fn string_pattern_slots_filter_columns_to_character_operands() {
         assert_character_only(sql, Oracle);
     }
 
-    for sql in [
-        "SELECT * FROM emp WHERE ename LIKE |",
-        "SELECT * FROM emp WHERE ename REGEXP |",
-        "SELECT * FROM emp WHERE ename RLIKE |",
-        "SELECT group_concat(ename SEPARATOR |) FROM emp",
-        "SELECT group_concat(ename SEPARATOR e|) FROM emp",
-    ] {
-        assert_character_only(sql, MySQL);
+    for db_type in [MySQL, MariaDB] {
+        for sql in [
+            "SELECT * FROM emp WHERE ename LIKE |",
+            "SELECT * FROM emp WHERE ename REGEXP |",
+            "SELECT * FROM emp WHERE ename RLIKE |",
+            "SELECT group_concat(ename SEPARATOR |) FROM emp",
+            "SELECT group_concat(ename SEPARATOR e|) FROM emp",
+        ] {
+            assert_character_only(sql, db_type);
+        }
     }
 }
 
 #[test]
 fn string_pattern_lhs_slots_filter_columns_to_character_operands() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
     let assert_character_only = |sql: &str, db_type| {
@@ -40773,28 +41124,31 @@ fn string_pattern_lhs_slots_filter_columns_to_character_operands() {
         );
     };
 
-    for sql in [
-        "SELECT * FROM emp WHERE | LIKE 'A%'",
-        "SELECT * FROM emp WHERE e| LIKE 'A%'",
-        "SELECT * FROM emp WHERE | NOT LIKE 'A%'",
-        "SELECT * FROM emp WHERE | LIKEC 'A%'",
-    ] {
-        assert_character_only(sql, Oracle);
-        assert_character_only(sql, MySQL);
+    for db_type in [Oracle, MySQL, MariaDB] {
+        for sql in [
+            "SELECT * FROM emp WHERE | LIKE 'A%'",
+            "SELECT * FROM emp WHERE e| LIKE 'A%'",
+            "SELECT * FROM emp WHERE | NOT LIKE 'A%'",
+            "SELECT * FROM emp WHERE | LIKEC 'A%'",
+        ] {
+            assert_character_only(sql, db_type);
+        }
     }
 
-    for sql in [
-        "SELECT * FROM emp WHERE | REGEXP '^A'",
-        "SELECT * FROM emp WHERE | RLIKE '^A'",
-        "SELECT * FROM emp WHERE | SOUNDS LIKE 'SMITH'",
-    ] {
-        assert_character_only(sql, MySQL);
+    for db_type in [MySQL, MariaDB] {
+        for sql in [
+            "SELECT * FROM emp WHERE | REGEXP '^A'",
+            "SELECT * FROM emp WHERE | RLIKE '^A'",
+            "SELECT * FROM emp WHERE | SOUNDS LIKE 'SMITH'",
+        ] {
+            assert_character_only(sql, db_type);
+        }
     }
 }
 
 #[test]
 fn between_bound_slots_filter_columns_to_left_operand_type() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
     let assert_only = |sql: &str, db_type, expected: &str, unexpected: &[&str]| {
@@ -40811,7 +41165,7 @@ fn between_bound_slots_filter_columns_to_left_operand_type() {
         }
     };
 
-    for db_type in [Oracle, MySQL] {
+    for db_type in [Oracle, MySQL, MariaDB] {
         assert_only(
             "SELECT * FROM emp WHERE empno BETWEEN |",
             db_type,
@@ -40847,7 +41201,7 @@ fn between_bound_slots_filter_columns_to_left_operand_type() {
 
 #[test]
 fn between_lhs_slots_filter_columns_to_bound_operand_type() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
     let assert_only = |sql: &str, db_type, expected: &str, unexpected: &[&str]| {
@@ -40864,7 +41218,7 @@ fn between_lhs_slots_filter_columns_to_bound_operand_type() {
         }
     };
 
-    for db_type in [Oracle, MySQL] {
+    for db_type in [Oracle, MySQL, MariaDB] {
         assert_only(
             "SELECT * FROM emp WHERE | BETWEEN empno AND 9999",
             db_type,
@@ -40901,7 +41255,7 @@ fn between_lhs_slots_filter_columns_to_bound_operand_type() {
 
 #[test]
 fn comparison_rhs_slots_filter_columns_to_left_operand_type() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
     let assert_only = |sql: &str, db_type, expected: &str, unexpected: &[&str]| {
@@ -40918,7 +41272,7 @@ fn comparison_rhs_slots_filter_columns_to_left_operand_type() {
         }
     };
 
-    for db_type in [Oracle, MySQL] {
+    for db_type in [Oracle, MySQL, MariaDB] {
         assert_only(
             "SELECT * FROM emp WHERE empno = |",
             db_type,
@@ -40945,7 +41299,7 @@ fn comparison_rhs_slots_filter_columns_to_left_operand_type() {
         );
     }
 
-    for db_type in [Oracle, MySQL] {
+    for db_type in [Oracle, MySQL, MariaDB] {
         assert_only(
             "UPDATE emp SET empno = |",
             db_type,
@@ -40973,12 +41327,14 @@ fn comparison_rhs_slots_filter_columns_to_left_operand_type() {
         assert_only(sql, Oracle, "EMPNO", &["ENAME", "HIREDATE"]);
     }
 
-    assert_only(
-        "SELECT * FROM emp WHERE empno <=> |",
-        MySQL,
-        "EMPNO",
-        &["ENAME", "HIREDATE"],
-    );
+    for db_type in [MySQL, MariaDB] {
+        assert_only(
+            "SELECT * FROM emp WHERE empno <=> |",
+            db_type,
+            "EMPNO",
+            &["ENAME", "HIREDATE"],
+        );
+    }
 
     let unknown_left = typed_emp_suggestions("SELECT * FROM emp WHERE unknown_col = |");
     assert!(
@@ -40989,7 +41345,7 @@ fn comparison_rhs_slots_filter_columns_to_left_operand_type() {
 
 #[test]
 fn comparison_lhs_slots_filter_columns_to_right_operand_type() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
     let assert_only = |sql: &str, db_type, expected: &str, unexpected: &[&str]| {
@@ -41006,7 +41362,7 @@ fn comparison_lhs_slots_filter_columns_to_right_operand_type() {
         }
     };
 
-    for db_type in [Oracle, MySQL] {
+    for db_type in [Oracle, MySQL, MariaDB] {
         assert_only(
             "SELECT * FROM emp WHERE | = empno",
             db_type,
@@ -41040,12 +41396,14 @@ fn comparison_lhs_slots_filter_columns_to_right_operand_type() {
         assert_only(sql, Oracle, "EMPNO", &["ENAME", "HIREDATE"]);
     }
 
-    assert_only(
-        "SELECT * FROM emp WHERE | <=> empno",
-        MySQL,
-        "EMPNO",
-        &["ENAME", "HIREDATE"],
-    );
+    for db_type in [MySQL, MariaDB] {
+        assert_only(
+            "SELECT * FROM emp WHERE | <=> empno",
+            db_type,
+            "EMPNO",
+            &["ENAME", "HIREDATE"],
+        );
+    }
 
     let unknown_right = typed_emp_suggestions("SELECT * FROM emp WHERE | = unknown_col");
     assert!(
@@ -41056,7 +41414,7 @@ fn comparison_lhs_slots_filter_columns_to_right_operand_type() {
 
 #[test]
 fn update_set_tuple_rhs_slots_filter_columns_to_target_column_type() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
     let assert_only = |sql: &str, db_type, expected: &str, unexpected: &[&str]| {
@@ -41073,7 +41431,7 @@ fn update_set_tuple_rhs_slots_filter_columns_to_target_column_type() {
         }
     };
 
-    for db_type in [Oracle, MySQL] {
+    for db_type in [Oracle, MySQL, MariaDB] {
         assert_only(
             "UPDATE emp SET (empno, ename, hiredate) = (|)",
             db_type,
@@ -41115,7 +41473,7 @@ fn update_set_tuple_rhs_slots_filter_columns_to_target_column_type() {
 
 #[test]
 fn update_set_scalar_rhs_slots_filter_columns_to_target_column_type() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
     let assert_only = |sql: &str, db_type, expected: &str, unexpected: &[&str]| {
@@ -41132,7 +41490,7 @@ fn update_set_scalar_rhs_slots_filter_columns_to_target_column_type() {
         }
     };
 
-    for db_type in [Oracle, MySQL] {
+    for db_type in [Oracle, MySQL, MariaDB] {
         assert_only(
             "UPDATE emp SET empno = (|)",
             db_type,
@@ -41324,7 +41682,7 @@ fn on_conflict_do_update_rhs_slots_filter_columns_to_target_column_type() {
 
 #[test]
 fn numeric_operator_rhs_slots_filter_columns_to_numeric_operands() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
     let assert_numeric_only = |sql: &str, db_type| {
@@ -41339,7 +41697,7 @@ fn numeric_operator_rhs_slots_filter_columns_to_numeric_operands() {
         );
     };
 
-    for db_type in [Oracle, MySQL] {
+    for db_type in [Oracle, MySQL, MariaDB] {
         for sql in [
             "SELECT empno + | FROM emp",
             "SELECT empno - | FROM emp",
@@ -41350,8 +41708,10 @@ fn numeric_operator_rhs_slots_filter_columns_to_numeric_operands() {
         }
     }
 
-    for sql in ["SELECT empno MOD | FROM emp", "SELECT empno DIV | FROM emp"] {
-        assert_numeric_only(sql, MySQL);
+    for db_type in [MySQL, MariaDB] {
+        for sql in ["SELECT empno MOD | FROM emp", "SELECT empno DIV | FROM emp"] {
+            assert_numeric_only(sql, db_type);
+        }
     }
 
     let unknown_left = typed_emp_suggestions("SELECT unknown_col + | FROM emp");
@@ -41363,7 +41723,7 @@ fn numeric_operator_rhs_slots_filter_columns_to_numeric_operands() {
 
 #[test]
 fn numeric_operator_lhs_slots_filter_columns_to_numeric_operands() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
     let assert_numeric_only = |sql: &str, db_type| {
@@ -41378,7 +41738,7 @@ fn numeric_operator_lhs_slots_filter_columns_to_numeric_operands() {
         );
     };
 
-    for db_type in [Oracle, MySQL] {
+    for db_type in [Oracle, MySQL, MariaDB] {
         for sql in [
             "SELECT | * empno FROM emp",
             "SELECT e| * empno FROM emp",
@@ -41388,8 +41748,10 @@ fn numeric_operator_lhs_slots_filter_columns_to_numeric_operands() {
         }
     }
 
-    for sql in ["SELECT | MOD empno FROM emp", "SELECT | DIV empno FROM emp"] {
-        assert_numeric_only(sql, MySQL);
+    for db_type in [MySQL, MariaDB] {
+        for sql in ["SELECT | MOD empno FROM emp", "SELECT | DIV empno FROM emp"] {
+            assert_numeric_only(sql, db_type);
+        }
     }
 
     let unknown_right = typed_emp_suggestions("SELECT | * unknown_col FROM emp");
@@ -41401,7 +41763,7 @@ fn numeric_operator_lhs_slots_filter_columns_to_numeric_operands() {
 
 #[test]
 fn additive_operator_lhs_slots_follow_right_operand_type() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
     let assert_has = |sql: &str, db_type, expected: &[&str], unexpected: &[&str]| {
@@ -41439,8 +41801,10 @@ fn additive_operator_lhs_slots_follow_right_operand_type() {
         &["ENAME", "EMPNO"],
     );
 
-    for sql in ["SELECT | + empno FROM emp", "SELECT | - empno FROM emp"] {
-        assert_has(sql, MySQL, &["EMPNO"], &["ENAME", "HIREDATE"]);
+    for db_type in [MySQL, MariaDB] {
+        for sql in ["SELECT | + empno FROM emp", "SELECT | - empno FROM emp"] {
+            assert_has(sql, db_type, &["EMPNO"], &["ENAME", "HIREDATE"]);
+        }
     }
 
     let unknown_right = typed_emp_suggestions("SELECT | + unknown_col FROM emp");
@@ -41537,7 +41901,7 @@ fn oracle_datetime_minus_rhs_slots_allow_datetime_and_numeric_operands() {
 
 #[test]
 fn numeric_function_argument_slots_filter_columns_to_numeric_operands() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
     let assert_numeric_only = |sql: &str, db_type| {
@@ -41552,7 +41916,7 @@ fn numeric_function_argument_slots_filter_columns_to_numeric_operands() {
         );
     };
 
-    for db_type in [Oracle, MySQL] {
+    for db_type in [Oracle, MySQL, MariaDB] {
         for sql in [
             "SELECT ABS(|) FROM emp",
             "SELECT POWER(empno, |) FROM emp",
@@ -41591,7 +41955,7 @@ fn numeric_function_argument_slots_filter_columns_to_numeric_operands() {
 
 #[test]
 fn analytic_function_argument_slots_filter_columns_by_argument_role() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
     let assert_only = |sql: &str, db_type, expected: &str, unexpected: &[&str]| {
@@ -41608,7 +41972,7 @@ fn analytic_function_argument_slots_filter_columns_by_argument_role() {
         }
     };
 
-    for db_type in [Oracle, MySQL] {
+    for db_type in [Oracle, MySQL, MariaDB] {
         assert_only(
             "SELECT LAG(empno, |) OVER (ORDER BY hiredate) FROM emp",
             db_type,
@@ -41650,7 +42014,7 @@ fn analytic_function_argument_slots_filter_columns_by_argument_role() {
 
 #[test]
 fn polymorphic_function_argument_slots_follow_prior_argument_type() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
     let assert_only = |sql: &str, db_type, expected: &str, unexpected: &[&str]| {
@@ -41667,7 +42031,7 @@ fn polymorphic_function_argument_slots_follow_prior_argument_type() {
         }
     };
 
-    for db_type in [Oracle, MySQL] {
+    for db_type in [Oracle, MySQL, MariaDB] {
         assert_only(
             "SELECT COALESCE(empno, |) FROM emp",
             db_type,
@@ -41700,12 +42064,14 @@ fn polymorphic_function_argument_slots_follow_prior_argument_type() {
         "EMPNO",
         &["ENAME", "HIREDATE"],
     );
-    assert_only(
-        "SELECT IFNULL(empno, |) FROM emp",
-        MySQL,
-        "EMPNO",
-        &["ENAME", "HIREDATE"],
-    );
+    for db_type in [MySQL, MariaDB] {
+        assert_only(
+            "SELECT IFNULL(empno, |) FROM emp",
+            db_type,
+            "EMPNO",
+            &["ENAME", "HIREDATE"],
+        );
+    }
     assert_only(
         "SELECT NVL2(ename, empno, |) FROM emp",
         Oracle,
@@ -41722,7 +42088,7 @@ fn polymorphic_function_argument_slots_follow_prior_argument_type() {
 
 #[test]
 fn polymorphic_function_first_argument_slots_follow_later_argument_type() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
     let assert_only = |sql: &str, db_type, expected: &str, unexpected: &[&str]| {
@@ -41739,7 +42105,7 @@ fn polymorphic_function_first_argument_slots_follow_later_argument_type() {
         }
     };
 
-    for db_type in [Oracle, MySQL] {
+    for db_type in [Oracle, MySQL, MariaDB] {
         assert_only(
             "SELECT COALESCE(|, hiredate, empno) FROM emp",
             db_type,
@@ -41760,12 +42126,14 @@ fn polymorphic_function_first_argument_slots_follow_later_argument_type() {
         "EMPNO",
         &["ENAME", "HIREDATE"],
     );
-    assert_only(
-        "SELECT IFNULL(|, ename) FROM emp",
-        MySQL,
-        "ENAME",
-        &["EMPNO", "HIREDATE"],
-    );
+    for db_type in [MySQL, MariaDB] {
+        assert_only(
+            "SELECT IFNULL(|, ename) FROM emp",
+            db_type,
+            "ENAME",
+            &["EMPNO", "HIREDATE"],
+        );
+    }
 
     let unknown_later = typed_emp_suggestions("SELECT NVL(|, custom_expr) FROM emp");
     assert!(
@@ -41782,7 +42150,7 @@ fn polymorphic_function_first_argument_slots_follow_later_argument_type() {
 
 #[test]
 fn case_result_slots_follow_prior_result_type_when_known() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
     let assert_only = |sql: &str, db_type, expected: &str, unexpected: &[&str]| {
@@ -41799,7 +42167,7 @@ fn case_result_slots_follow_prior_result_type_when_known() {
         }
     };
 
-    for db_type in [Oracle, MySQL] {
+    for db_type in [Oracle, MySQL, MariaDB] {
         assert_only(
             "SELECT CASE WHEN empno = 1 THEN empno ELSE | END FROM emp",
             db_type,
@@ -41833,12 +42201,14 @@ fn case_result_slots_follow_prior_result_type_when_known() {
         "EMPNO",
         &["ENAME", "HIREDATE"],
     );
-    assert_only(
-        "SELECT CASE WHEN empno = 1 THEN | WHEN empno = 2 THEN ename END FROM emp",
-        MySQL,
-        "ENAME",
-        &["EMPNO", "HIREDATE"],
-    );
+    for db_type in [MySQL, MariaDB] {
+        assert_only(
+            "SELECT CASE WHEN empno = 1 THEN | WHEN empno = 2 THEN ename END FROM emp",
+            db_type,
+            "ENAME",
+            &["EMPNO", "HIREDATE"],
+        );
+    }
     assert_only(
         "SELECT CASE ename WHEN 'A' THEN | ELSE hiredate END FROM emp",
         Oracle,
@@ -41862,7 +42232,7 @@ fn case_result_slots_follow_prior_result_type_when_known() {
 
 #[test]
 fn character_function_argument_slots_filter_columns_to_character_operands() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
     let assert_character_only = |sql: &str, db_type| {
@@ -41877,7 +42247,7 @@ fn character_function_argument_slots_filter_columns_to_character_operands() {
         );
     };
 
-    for db_type in [Oracle, MySQL] {
+    for db_type in [Oracle, MySQL, MariaDB] {
         for sql in [
             "SELECT UPPER(|) FROM emp",
             "SELECT LENGTH(|) FROM emp",
@@ -41903,13 +42273,15 @@ fn character_function_argument_slots_filter_columns_to_character_operands() {
     assert_character_only("SELECT TO_NUMBER(ename, |) FROM emp", Oracle);
     assert_character_only("SELECT NUMTODSINTERVAL(1, |) FROM emp", Oracle);
     assert_character_only("SELECT NUMTOYMINTERVAL(1, |) FROM emp", Oracle);
-    assert_character_only("SELECT STR_TO_DATE(|, '%Y-%m-%d') FROM emp", MySQL);
-    assert_character_only("SELECT DATE_FORMAT(hiredate, |) FROM emp", MySQL);
+    for db_type in [MySQL, MariaDB] {
+        assert_character_only("SELECT STR_TO_DATE(|, '%Y-%m-%d') FROM emp", db_type);
+        assert_character_only("SELECT DATE_FORMAT(hiredate, |) FROM emp", db_type);
+    }
 }
 
 #[test]
 fn extract_source_slots_filter_columns_to_datetime_operands() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
     let assert_datetime_only = |sql: &str, db_type| {
@@ -41924,7 +42296,7 @@ fn extract_source_slots_filter_columns_to_datetime_operands() {
         );
     };
 
-    for db_type in [Oracle, MySQL] {
+    for db_type in [Oracle, MySQL, MariaDB] {
         assert_datetime_only("SELECT EXTRACT(YEAR FROM |) FROM emp", db_type);
         assert_datetime_only("SELECT EXTRACT(MONTH FROM h|) FROM emp", db_type);
     }
@@ -41938,7 +42310,7 @@ fn extract_source_slots_filter_columns_to_datetime_operands() {
 
 #[test]
 fn datetime_function_argument_slots_filter_columns_to_datetime_operands() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
     let assert_datetime_only = |sql: &str, db_type| {
@@ -41976,25 +42348,29 @@ fn datetime_function_argument_slots_filter_columns_to_datetime_operands() {
     let sql = "SELECT ADD_MONTHS(hiredate, |) FROM emp";
     assert_numeric_only(sql, Oracle);
 
-    for sql in [
-        "SELECT DATEDIFF(|, hiredate) FROM emp",
-        "SELECT DATEDIFF(hiredate, |) FROM emp",
-        "SELECT TIMESTAMPDIFF(DAY, |, hiredate) FROM emp",
-        "SELECT TIMESTAMPDIFF(DAY, hiredate, |) FROM emp",
-        "SELECT TIMESTAMPADD(DAY, 1, |) FROM emp",
-        "SELECT DATE_ADD(|, INTERVAL 1 DAY) FROM emp",
-        "SELECT DATE_SUB(|, INTERVAL 1 DAY) FROM emp",
-    ] {
-        assert_datetime_only(sql, MySQL);
+    for db_type in [MySQL, MariaDB] {
+        for sql in [
+            "SELECT DATEDIFF(|, hiredate) FROM emp",
+            "SELECT DATEDIFF(hiredate, |) FROM emp",
+            "SELECT TIMESTAMPDIFF(DAY, |, hiredate) FROM emp",
+            "SELECT TIMESTAMPDIFF(DAY, hiredate, |) FROM emp",
+            "SELECT TIMESTAMPADD(DAY, 1, |) FROM emp",
+            "SELECT DATE_ADD(|, INTERVAL 1 DAY) FROM emp",
+            "SELECT DATE_SUB(|, INTERVAL 1 DAY) FROM emp",
+        ] {
+            assert_datetime_only(sql, db_type);
+        }
     }
 
     let sql = "SELECT TIMESTAMPADD(DAY, |, hiredate) FROM emp";
-    assert_numeric_only(sql, MySQL);
+    for db_type in [MySQL, MariaDB] {
+        assert_numeric_only(sql, db_type);
+    }
 }
 
 #[test]
 fn overloaded_function_argument_slots_filter_to_supported_type_families() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
     let assert_has = |sql: &str, db_type, expected: &[&str], unexpected: &[&str]| {
@@ -42017,15 +42393,19 @@ fn overloaded_function_argument_slots_filter_to_supported_type_families() {
         assert_has(sql, Oracle, &["EMPNO", "HIREDATE"], &["ENAME"]);
     }
 
-    for sql in ["SELECT ROUND(|) FROM emp", "SELECT TRUNCATE(|, 1) FROM emp"] {
-        assert_has(sql, MySQL, &["EMPNO"], &["ENAME", "HIREDATE"]);
+    for db_type in [MySQL, MariaDB] {
+        for sql in ["SELECT ROUND(|) FROM emp", "SELECT TRUNCATE(|, 1) FROM emp"] {
+            assert_has(sql, db_type, &["EMPNO"], &["ENAME", "HIREDATE"]);
+        }
     }
-    assert_has(
-        "SELECT ROUND(hiredate, |) FROM emp",
-        MySQL,
-        &["EMPNO"],
-        &["ENAME", "HIREDATE"],
-    );
+    for db_type in [MySQL, MariaDB] {
+        assert_has(
+            "SELECT ROUND(hiredate, |) FROM emp",
+            db_type,
+            &["EMPNO"],
+            &["ENAME", "HIREDATE"],
+        );
+    }
 
     assert_has(
         "SELECT ROUND(empno, |) FROM emp",
@@ -42043,7 +42423,7 @@ fn overloaded_function_argument_slots_filter_to_supported_type_families() {
 
 #[test]
 fn in_list_slots_filter_columns_to_left_operand_type() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
     let assert_only = |sql: &str, db_type, expected: &str, unexpected: &[&str]| {
@@ -42060,7 +42440,7 @@ fn in_list_slots_filter_columns_to_left_operand_type() {
         }
     };
 
-    for db_type in [Oracle, MySQL] {
+    for db_type in [Oracle, MySQL, MariaDB] {
         assert_only(
             "SELECT * FROM emp WHERE empno IN (|)",
             db_type,
@@ -42102,7 +42482,7 @@ fn in_list_slots_filter_columns_to_left_operand_type() {
 
 #[test]
 fn in_lhs_slots_filter_columns_to_list_operand_type() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
     let assert_only = |sql: &str, db_type, expected: &str, unexpected: &[&str]| {
@@ -42119,7 +42499,7 @@ fn in_lhs_slots_filter_columns_to_list_operand_type() {
         }
     };
 
-    for db_type in [Oracle, MySQL] {
+    for db_type in [Oracle, MySQL, MariaDB] {
         assert_only(
             "SELECT * FROM emp WHERE | IN (empno, 1)",
             db_type,
@@ -42161,7 +42541,7 @@ fn in_lhs_slots_filter_columns_to_list_operand_type() {
 
 #[test]
 fn insert_values_slots_filter_columns_to_target_column_type() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
     let assert_only = |sql: &str, db_type, expected: &str, unexpected: &[&str]| {
@@ -42178,7 +42558,7 @@ fn insert_values_slots_filter_columns_to_target_column_type() {
         }
     };
 
-    for db_type in [Oracle, MySQL] {
+    for db_type in [Oracle, MySQL, MariaDB] {
         assert_only(
             "INSERT INTO emp (empno, ename, hiredate) VALUES (|)",
             db_type,
@@ -42205,7 +42585,7 @@ fn insert_values_slots_filter_columns_to_target_column_type() {
         );
     }
 
-    for db_type in [Oracle, MySQL] {
+    for db_type in [Oracle, MySQL, MariaDB] {
         assert_only(
             "INSERT INTO emp VALUES (|)",
             db_type,
@@ -42238,7 +42618,7 @@ fn insert_values_slots_filter_columns_to_target_column_type() {
         "VALUES slot without a matching target column must not over-filter candidates: {unknown_target:?}"
     );
 
-    for db_type in [Oracle, MySQL] {
+    for db_type in [Oracle, MySQL, MariaDB] {
         assert_only(
             "INSERT INTO emp (hiredate) VALUES (TO_DATE(|, 'YYYY-MM-DD'))",
             db_type,
@@ -42275,7 +42655,7 @@ fn insert_values_slots_filter_columns_to_target_column_type() {
 
 #[test]
 fn insert_select_slots_filter_columns_to_target_column_type() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
     let assert_only = |sql: &str, db_type, expected: &str, unexpected: &[&str]| {
@@ -42292,7 +42672,7 @@ fn insert_select_slots_filter_columns_to_target_column_type() {
         }
     };
 
-    for db_type in [Oracle, MySQL] {
+    for db_type in [Oracle, MySQL, MariaDB] {
         assert_only(
             "INSERT INTO emp (empno, ename, hiredate) SELECT | FROM emp",
             db_type,
@@ -42332,7 +42712,7 @@ fn insert_select_slots_filter_columns_to_target_column_type() {
         "nested SELECT inside INSERT projection must not inherit outer target type: {nested_select:?}"
     );
 
-    for db_type in [Oracle, MySQL] {
+    for db_type in [Oracle, MySQL, MariaDB] {
         assert_only(
             "INSERT INTO emp (hiredate) SELECT TO_DATE(|, 'YYYY-MM-DD') FROM emp",
             db_type,
@@ -42350,7 +42730,7 @@ fn insert_select_slots_filter_columns_to_target_column_type() {
 
 #[test]
 fn subquery_only_open_paren_slots_offer_subquery_keywords_and_suppress_columns() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
     let prefix_for = |sql_with_cursor: &str| {
@@ -42399,14 +42779,16 @@ fn subquery_only_open_paren_slots_offer_subquery_keywords_and_suppress_columns()
         kw_for("SELECT * FROM emp WHERE EXISTS (sel|)", Oracle),
         vec!["SELECT".to_string()]
     );
-    assert!(
-        suppresses_for("SELECT * FROM emp WHERE EXISTS (|)", MySQL),
-        "MySQL EXISTS subquery slot must also suppress columns"
-    );
-    assert!(
-        !suppresses_for("SELECT CURSOR (|) FROM emp", MySQL),
-        "MySQL CURSOR is not an Oracle cursor-expression subquery"
-    );
+    for db_type in [MySQL, MariaDB] {
+        assert!(
+            suppresses_for("SELECT * FROM emp WHERE EXISTS (|)", db_type),
+            "{db_type:?} EXISTS subquery slot must also suppress columns"
+        );
+        assert!(
+            !suppresses_for("SELECT CURSOR (|) FROM emp", db_type),
+            "{db_type:?} CURSOR is not an Oracle cursor-expression subquery"
+        );
+    }
     assert!(
         !suppresses_for("SELECT * FROM emp WHERE empno IN (|)", Oracle),
         "IN list body can be an expression list, so columns remain valid"
@@ -44867,7 +45249,7 @@ fn registered_keyword_only_slot_cases_keep_final_suggestions_keyword_only() {
 
 #[test]
 fn critical_keyword_prefixes_rank_expected_keyword_first() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let mut failures = Vec::new();
     let assert_first = |failures: &mut Vec<String>,
@@ -44954,9 +45336,11 @@ fn critical_keyword_prefixes_rank_expected_keyword_first() {
         Oracle,
     );
 
-    assert_first(&mut failures, "SELECT * FROM help wh|", "WHERE", MySQL);
-    assert_first(&mut failures, "SELECT * FROM help jo|", "JOIN", MySQL);
-    assert_first(&mut failures, "SELECT * FROM help li|", "LIMIT", MySQL);
+    for db_type in [MySQL, MariaDB] {
+        assert_first(&mut failures, "SELECT * FROM help wh|", "WHERE", db_type);
+        assert_first(&mut failures, "SELECT * FROM help jo|", "JOIN", db_type);
+        assert_first(&mut failures, "SELECT * FROM help li|", "LIMIT", db_type);
+    }
 
     assert!(
         failures.is_empty(),
@@ -44967,7 +45351,7 @@ fn critical_keyword_prefixes_rank_expected_keyword_first() {
 
 #[test]
 fn multi_word_keyword_prefixes_complete_through_each_word_boundary() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let has = |suggestions: &[String], keyword: &str| {
         suggestions
@@ -45016,20 +45400,22 @@ fn multi_word_keyword_prefixes_complete_through_each_word_boundary() {
         Oracle,
     );
 
-    assert_has("SELECT * FROM help LEFT o|", "OUTER", MySQL);
-    assert_has("SELECT * FROM help LEFT OUTER jo|", "JOIN", MySQL);
-    assert_has("SELECT * FROM help GROUP b|", "BY", MySQL);
-    assert_has("SELECT * FROM help ORDER b|", "BY", MySQL);
-    assert_has(
-        "INSERT INTO help VALUES (1) ON DUPLICATE ke|",
-        "KEY UPDATE",
-        MySQL,
-    );
-    assert_has(
-        "INSERT INTO help VALUES (1) ON DUPLICATE KEY up|",
-        "UPDATE",
-        MySQL,
-    );
+    for db_type in [MySQL, MariaDB] {
+        assert_has("SELECT * FROM help LEFT o|", "OUTER", db_type);
+        assert_has("SELECT * FROM help LEFT OUTER jo|", "JOIN", db_type);
+        assert_has("SELECT * FROM help GROUP b|", "BY", db_type);
+        assert_has("SELECT * FROM help ORDER b|", "BY", db_type);
+        assert_has(
+            "INSERT INTO help VALUES (1) ON DUPLICATE ke|",
+            "KEY UPDATE",
+            db_type,
+        );
+        assert_has(
+            "INSERT INTO help VALUES (1) ON DUPLICATE KEY up|",
+            "UPDATE",
+            db_type,
+        );
+    }
 
     assert!(
         failures.is_empty(),
@@ -45040,7 +45426,7 @@ fn multi_word_keyword_prefixes_complete_through_each_word_boundary() {
 
 #[test]
 fn keyword_suggestions_do_not_cross_invalid_clause_boundaries() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let has = |suggestions: &[String], keyword: &str| {
         suggestions
@@ -45084,13 +45470,19 @@ fn keyword_suggestions_do_not_cross_invalid_clause_boundaries() {
     assert_not_has("SELECT * FROM emp RIGHT OUTER ap|", "APPLY", Oracle);
     assert_not_has("SELECT * FROM emp FULL OUTER ap|", "APPLY", Oracle);
 
-    assert_not_has("SELECT * FROM help GROUP BY topic wh|", "WHERE", MySQL);
-    assert_not_has("SELECT * FROM help ORDER BY topic gr|", "GROUP BY", MySQL);
-    assert_not_has(
-        "INSERT INTO help VALUES (1) ON DUPLICATE KEY UPDATE id = 1 wh|",
-        "WHERE",
-        MySQL,
-    );
+    for db_type in [MySQL, MariaDB] {
+        assert_not_has("SELECT * FROM help GROUP BY topic wh|", "WHERE", db_type);
+        assert_not_has(
+            "SELECT * FROM help ORDER BY topic gr|",
+            "GROUP BY",
+            db_type,
+        );
+        assert_not_has(
+            "INSERT INTO help VALUES (1) ON DUPLICATE KEY UPDATE id = 1 wh|",
+            "WHERE",
+            db_type,
+        );
+    }
 
     assert!(
         failures.is_empty(),
@@ -45125,7 +45517,7 @@ fn registered_keyword_slot_cases_are_backed_by_non_empty_production_slots() {
 
 #[test]
 fn common_query_keywords_complete_with_empty_and_two_letter_prefixes() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let has = |suggestions: &[String], keyword: &str| {
         suggestions
@@ -45344,8 +45736,10 @@ fn common_query_keywords_complete_with_empty_and_two_letter_prefixes() {
     );
 
     assert_keyword("SELECT * FROM emp FOR |", "UPDATE", Oracle);
-    for keyword in ["UPDATE", "SHARE"] {
-        assert_keyword("SELECT * FROM emp FOR |", keyword, MySQL);
+    for db_type in [MySQL, MariaDB] {
+        for keyword in ["UPDATE", "SHARE"] {
+            assert_keyword("SELECT * FROM emp FOR |", keyword, db_type);
+        }
     }
     for keyword in ["OF", "NOWAIT", "WAIT", "SKIP"] {
         assert_keyword("SELECT * FROM emp FOR UPDATE |", keyword, Oracle);
@@ -45378,32 +45772,34 @@ fn common_query_keywords_complete_with_empty_and_two_letter_prefixes() {
         assert_keyword("|", keyword, MySQL);
     }
 
-    for keyword in [
-        "JOIN",
-        "WHERE",
-        "LEFT JOIN",
-        "RIGHT JOIN",
-        "LEFT OUTER JOIN",
-        "RIGHT OUTER JOIN",
-        "INNER JOIN",
-        "CROSS JOIN",
-        "NATURAL JOIN",
-        "STRAIGHT_JOIN",
-        "GROUP BY",
-        "HAVING",
-        "ORDER BY",
-        "LIMIT",
-        "FOR UPDATE",
-    ] {
-        assert_keyword("SELECT * FROM help |", keyword, MySQL);
-    }
+    for db_type in [MySQL, MariaDB] {
+        for keyword in [
+            "JOIN",
+            "WHERE",
+            "LEFT JOIN",
+            "RIGHT JOIN",
+            "LEFT OUTER JOIN",
+            "RIGHT OUTER JOIN",
+            "INNER JOIN",
+            "CROSS JOIN",
+            "NATURAL JOIN",
+            "STRAIGHT_JOIN",
+            "GROUP BY",
+            "HAVING",
+            "ORDER BY",
+            "LIMIT",
+            "FOR UPDATE",
+        ] {
+            assert_keyword("SELECT * FROM help |", keyword, db_type);
+        }
 
-    assert_keyword("SELECT * FROM help WHERE id = 1 |", "LIMIT", MySQL);
+        assert_keyword("SELECT * FROM help WHERE id = 1 |", "LIMIT", db_type);
+    }
 }
 
 #[test]
 fn broad_keyword_grammar_slots_complete_with_empty_and_two_letter_prefixes() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let has = |suggestions: &[String], keyword: &str| {
         suggestions
@@ -45556,9 +45952,11 @@ fn broad_keyword_grammar_slots_complete_with_empty_and_two_letter_prefixes() {
             Oracle,
         );
     }
-    for keyword in ["UNION", "UNION ALL", "INTERSECT", "EXCEPT"] {
-        assert_keyword("SELECT * FROM help |", keyword, MySQL);
-        assert_keyword("SELECT * FROM help WHERE id = 1 |", keyword, MySQL);
+    for db_type in [MySQL, MariaDB] {
+        for keyword in ["UNION", "UNION ALL", "INTERSECT", "EXCEPT"] {
+            assert_keyword("SELECT * FROM help |", keyword, db_type);
+            assert_keyword("SELECT * FROM help WHERE id = 1 |", keyword, db_type);
+        }
     }
 
     for keyword in ["SELECT", "WITH"] {
@@ -45577,30 +45975,42 @@ fn broad_keyword_grammar_slots_complete_with_empty_and_two_letter_prefixes() {
         );
     }
 
-    assert_keyword("SELECT * FROM emp WHERE ename SOUNDS |", "LIKE", MySQL);
+    for db_type in [MySQL, MariaDB] {
+        assert_keyword("SELECT * FROM emp WHERE ename SOUNDS |", "LIKE", db_type);
+    }
     for keyword in ["LOCAL", "TIME"] {
         assert_keyword("SELECT * FROM emp WHERE hiredate AT |", keyword, Oracle);
     }
     assert_keyword("SELECT * FROM emp WHERE hiredate AT TIME |", "ZONE", Oracle);
-    for keyword in ["SELECT", "INSERT", "UPDATE", "DELETE", "REPLACE"] {
-        assert_keyword("EXPLAIN |", keyword, MySQL);
+    for db_type in [MySQL, MariaDB] {
+        for keyword in ["SELECT", "INSERT", "UPDATE", "DELETE", "REPLACE"] {
+            assert_keyword("EXPLAIN |", keyword, db_type);
+        }
     }
-    for keyword in ["ANALYZE", "FORMAT", "FOR"] {
-        assert_keyword("EXPLAIN | SELECT * FROM help", keyword, MySQL);
+    for db_type in [MySQL, MariaDB] {
+        for keyword in ["ANALYZE", "FORMAT", "FOR"] {
+            assert_keyword("EXPLAIN | SELECT * FROM help", keyword, db_type);
+        }
     }
-    for keyword in ["TABLE", "VIEW", "INDEX", "DATABASE", "SCHEMA", "USER"] {
-        assert_keyword("CREATE |", keyword, MySQL);
+    for db_type in [MySQL, MariaDB] {
+        for keyword in ["TABLE", "VIEW", "INDEX", "DATABASE", "SCHEMA", "USER"] {
+            assert_keyword("CREATE |", keyword, db_type);
+        }
     }
-    for keyword in [
-        "INT", "VARCHAR", "CHAR", "DATE", "DATETIME", "TEXT", "BLOB", "JSON",
-    ] {
-        assert_keyword("CREATE TABLE t (c |)", keyword, MySQL);
+    for db_type in [MySQL, MariaDB] {
+        for keyword in [
+            "INT", "VARCHAR", "CHAR", "DATE", "DATETIME", "TEXT", "BLOB", "JSON",
+        ] {
+            assert_keyword("CREATE TABLE t (c |)", keyword, db_type);
+        }
     }
-    for keyword in [
-        "BINARY", "CHAR", "DATE", "DATETIME", "DECIMAL", "DOUBLE", "FLOAT", "JSON", "NCHAR",
-        "REAL", "SIGNED", "TIME", "UNSIGNED", "YEAR",
-    ] {
-        assert_keyword("SELECT CAST(empno AS |) FROM emp", keyword, MySQL);
+    for db_type in [MySQL, MariaDB] {
+        for keyword in [
+            "BINARY", "CHAR", "DATE", "DATETIME", "DECIMAL", "DOUBLE", "FLOAT", "JSON", "NCHAR",
+            "REAL", "SIGNED", "TIME", "UNSIGNED", "YEAR",
+        ] {
+            assert_keyword("SELECT CAST(empno AS |) FROM emp", keyword, db_type);
+        }
     }
 }
 
@@ -49962,7 +50372,7 @@ fn column_property_argument_slots_do_not_leak_the_property_catalog() {
             Some(db),
         )
     };
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
     let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
 
     // The argument slot offers no property keyword (a value/name/string follows).
@@ -49973,6 +50383,9 @@ fn column_property_argument_slots_do_not_leak_the_property_catalog() {
         ("CREATE TABLE t (a INT DEFAULT |", MySQL),
         ("CREATE TABLE t (a INT COMMENT |", MySQL),
         ("CREATE TABLE t (a INT DEFAULT 5 COMMENT |", MySQL),
+        ("CREATE TABLE t (a INT DEFAULT |", MariaDB),
+        ("CREATE TABLE t (a INT COMMENT |", MariaDB),
+        ("CREATE TABLE t (a INT DEFAULT 5 COMMENT |", MariaDB),
     ] {
         let s = kw(sql, db);
         for leaked in [
@@ -50038,8 +50451,18 @@ fn column_property_argument_slots_do_not_leak_the_property_catalog() {
             "COMMENT",
         ),
         (
+            "CREATE TABLE t (a INT DEFAULT 5 COMMENT 'x' |",
+            MariaDB,
+            "COMMENT",
+        ),
+        (
             "CREATE TABLE t (a INT AUTO_INCREMENT |",
             MySQL,
+            "AUTO_INCREMENT",
+        ),
+        (
+            "CREATE TABLE t (a INT AUTO_INCREMENT |",
+            MariaDB,
             "AUTO_INCREMENT",
         ),
         ("ALTER TABLE t ADD a NUMBER DEFAULT 5 |", Oracle, "DEFAULT"),
@@ -50063,7 +50486,7 @@ fn column_property_argument_slots_do_not_leak_the_property_catalog() {
 
 #[test]
 fn column_property_argument_slots_do_not_offer_object_catalog_in_final_suggestions() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
 
@@ -50078,6 +50501,12 @@ fn column_property_argument_slots_do_not_offer_object_catalog_in_final_suggestio
         (MySQL, "CREATE TABLE t (a INT COMMENT |"),
         (MySQL, "CREATE TABLE t (a INT DEFAULT 5 COMMENT |"),
         (MySQL, "ALTER TABLE t ADD a INT DEFAULT |"),
+        (MariaDB, "CREATE TABLE t (a INT DEFAULT |"),
+        (MariaDB, "CREATE TABLE t (a INT DEFAULT C|"),
+        (MariaDB, "CREATE TABLE t (a TIMESTAMP ON UPDATE |"),
+        (MariaDB, "CREATE TABLE t (a INT COMMENT |"),
+        (MariaDB, "CREATE TABLE t (a INT DEFAULT 5 COMMENT |"),
+        (MariaDB, "ALTER TABLE t ADD a INT DEFAULT |"),
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
         assert_eq!(
@@ -50964,7 +51393,10 @@ fn single_use_dml_trailing_clauses_are_not_re_offered() {
     }
     for sql in [
         "UPDATE t SET a=1 RETURNING a INTO :b |",
+        "UPDATE t SET a=1 RETURNING a, b INTO :a_bind, |",
+        "UPDATE t SET a=1 RETURNING a, b INTO :a_bind, :b_bind |",
         "INSERT INTO t (a) VALUES (1) RETURNING a INTO :b |",
+        "INSERT INTO t (a) VALUES (1) RETURNING a, b INTO :a_bind, |",
         "UPDATE t SET a=1 RETURNING a INTO |",
     ] {
         assert!(
@@ -51725,7 +52157,7 @@ fn hierarchical_query_continuation_is_oracle_only() {
         )
     };
     let has = |v: &[String], s: &str| v.iter().any(|x| x == s);
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let oracle_start = kw("SELECT * FROM emp START WITH mgr IS NULL |", Oracle);
     assert!(has(&oracle_start, "CONNECT BY"), "{oracle_start:?}");
@@ -51765,37 +52197,41 @@ fn hierarchical_query_continuation_is_oracle_only() {
         }
     }
 
-    for sql in [
-        "SELECT * FROM emp START WITH mgr IS NULL |",
-        "SELECT * FROM emp CONNECT BY PRIOR empno = mgr |",
-        "SELECT * FROM emp START WITH mgr IS NULL co|",
-        "SELECT * FROM emp CONNECT BY PRIOR empno = mgr st|",
-    ] {
-        let got = kw(sql, MySQL);
-        for leaked in ["CONNECT BY", "START WITH", "OFFSET", "FETCH", "MINUS"] {
-            assert!(
-                !has(&got, leaked),
-                "{leaked} leaked in MySQL for `{sql}`: {got:?}"
-            );
+    for db in [MySQL, MariaDB] {
+        for sql in [
+            "SELECT * FROM emp START WITH mgr IS NULL |",
+            "SELECT * FROM emp CONNECT BY PRIOR empno = mgr |",
+            "SELECT * FROM emp START WITH mgr IS NULL co|",
+            "SELECT * FROM emp CONNECT BY PRIOR empno = mgr st|",
+        ] {
+            let got = kw(sql, db);
+            for leaked in ["CONNECT BY", "START WITH", "OFFSET", "FETCH", "MINUS"] {
+                assert!(
+                    !has(&got, leaked),
+                    "{leaked} leaked in {db:?} for `{sql}`: {got:?}"
+                );
+            }
         }
     }
 }
 
 #[test]
 fn oracle_predicate_and_hierarchical_keywords_do_not_leak_in_mysql_mode() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let kw = |sql: &str, db: crate::db::DatabaseType| -> Vec<String> {
         expected_keyword_slot_suggestions(sql, db)
     };
     let has = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
 
-    let mysql_after_operand = kw("SELECT * FROM emp WHERE empno M|", MySQL);
-    for leaked in ["MEMBER OF", "SUBMULTISET OF"] {
-        assert!(
-            !has(&mysql_after_operand, leaked),
-            "{leaked} leaked after MySQL predicate operand: {mysql_after_operand:?}"
-        );
+    for db in [MySQL, MariaDB] {
+        let mysql_after_operand = kw("SELECT * FROM emp WHERE empno M|", db);
+        for leaked in ["MEMBER OF", "SUBMULTISET OF"] {
+            assert!(
+                !has(&mysql_after_operand, leaked),
+                "{leaked} leaked after {db:?} predicate operand: {mysql_after_operand:?}"
+            );
+        }
     }
 
     let oracle_after_operand = kw("SELECT * FROM emp WHERE empno M|", Oracle);
@@ -51810,12 +52246,14 @@ fn oracle_predicate_and_hierarchical_keywords_do_not_leak_in_mysql_mode() {
         "Oracle SUBMULTISET predicate tail was lost: {oracle_after_subset:?}"
     );
 
-    let mysql_after_comparison = kw("SELECT * FROM emp WHERE empno = R|", MySQL);
-    for leaked in ["ROWNUM", "ROWID"] {
-        assert!(
-            !has(&mysql_after_comparison, leaked),
-            "{leaked} leaked into MySQL comparison operand slot: {mysql_after_comparison:?}"
-        );
+    for db in [MySQL, MariaDB] {
+        let mysql_after_comparison = kw("SELECT * FROM emp WHERE empno = R|", db);
+        for leaked in ["ROWNUM", "ROWID"] {
+            assert!(
+                !has(&mysql_after_comparison, leaked),
+                "{leaked} leaked into {db:?} comparison operand slot: {mysql_after_comparison:?}"
+            );
+        }
     }
 
     let oracle_after_comparison = kw("SELECT * FROM emp WHERE empno = R|", Oracle);
@@ -51824,12 +52262,14 @@ fn oracle_predicate_and_hierarchical_keywords_do_not_leak_in_mysql_mode() {
         "Oracle pseudo-column operands were lost: {oracle_after_comparison:?}"
     );
 
-    let mysql_operand_start = kw("SELECT * FROM emp WHERE R|", MySQL);
-    for leaked in ["ROWNUM", "ROWID"] {
-        assert!(
-            !has(&mysql_operand_start, leaked),
-            "{leaked} leaked into MySQL operand-start slot: {mysql_operand_start:?}"
-        );
+    for db in [MySQL, MariaDB] {
+        let mysql_operand_start = kw("SELECT * FROM emp WHERE R|", db);
+        for leaked in ["ROWNUM", "ROWID"] {
+            assert!(
+                !has(&mysql_operand_start, leaked),
+                "{leaked} leaked into {db:?} operand-start slot: {mysql_operand_start:?}"
+            );
+        }
     }
     let oracle_operand_start = kw("SELECT * FROM emp WHERE R|", Oracle);
     assert!(
@@ -51837,26 +52277,32 @@ fn oracle_predicate_and_hierarchical_keywords_do_not_leak_in_mysql_mode() {
         "Oracle operand-start pseudo-columns were lost: {oracle_operand_start:?}"
     );
 
-    let mysql_multiset_start = kw("SELECT * FROM emp WHERE MUL|", MySQL);
-    assert!(
-        !has(&mysql_multiset_start, "MULTISET"),
-        "Oracle MULTISET constructor leaked into MySQL operand-start slot: {mysql_multiset_start:?}"
-    );
-
-    for (sql, leaked) in [
-        ("SELECT * FROM emp CONNECT |", "BY"),
-        ("SELECT * FROM emp START |", "WITH"),
-        ("SELECT * FROM emp ORDER SIBLINGS |", "BY"),
-    ] {
-        let got = kw(sql, MySQL);
+    for db in [MySQL, MariaDB] {
+        let mysql_multiset_start = kw("SELECT * FROM emp WHERE MUL|", db);
         assert!(
-            !has(&got, leaked),
-            "{leaked} leaked from Oracle hierarchical continuation in MySQL at `{sql}`: {got:?}"
+            !has(&mysql_multiset_start, "MULTISET"),
+            "Oracle MULTISET constructor leaked into {db:?} operand-start slot: {mysql_multiset_start:?}"
         );
     }
 
-    assert!(has(&kw("SELECT * FROM emp ORDER |", MySQL), "BY"));
-    assert!(has(&kw("SELECT * FROM emp GROUP |", MySQL), "BY"));
+    for db in [MySQL, MariaDB] {
+        for (sql, leaked) in [
+            ("SELECT * FROM emp CONNECT |", "BY"),
+            ("SELECT * FROM emp START |", "WITH"),
+            ("SELECT * FROM emp ORDER SIBLINGS |", "BY"),
+        ] {
+            let got = kw(sql, db);
+            assert!(
+                !has(&got, leaked),
+                "{leaked} leaked from Oracle hierarchical continuation in {db:?} at `{sql}`: {got:?}"
+            );
+        }
+    }
+
+    for db in [MySQL, MariaDB] {
+        assert!(has(&kw("SELECT * FROM emp ORDER |", db), "BY"));
+        assert!(has(&kw("SELECT * FROM emp GROUP |", db), "BY"));
+    }
     assert!(has(&kw("SELECT * FROM emp CONNECT |", Oracle), "BY"));
     assert!(has(&kw("SELECT * FROM emp START |", Oracle), "WITH"));
     assert!(has(&kw("SELECT * FROM emp ORDER SIBLINGS |", Oracle), "BY"));
@@ -53363,6 +53809,11 @@ fn derived_table_and_table_function_tail_slots_do_not_offer_catalog() {
             &["JOIN", "WHERE", "GROUP BY", "ORDER BY"],
         ),
         (
+            MySQL,
+            "SELECT * FROM JSON_TABLE(j, '$' COLUMNS (c INT PATH '$.x')) AS v |",
+            &["JOIN", "WHERE", "GROUP BY", "ORDER BY"],
+        ),
+        (
             Oracle,
             "SELECT a FROM t1 JOIN (SELECT b FROM s) |",
             &["ON", "USING"],
@@ -53390,6 +53841,11 @@ fn derived_table_and_table_function_tail_slots_do_not_offer_catalog() {
         (
             Oracle,
             "SELECT * FROM t1 JOIN my_func(x) |",
+            &["ON", "USING"],
+        ),
+        (
+            MySQL,
+            "SELECT * FROM emp JOIN JSON_TABLE(j, '$' COLUMNS (c INT PATH '$.x')) AS v |",
             &["ON", "USING"],
         ),
     ] {
@@ -53657,7 +54113,7 @@ fn post_table_modifier_value_slots_do_not_offer_catalog() {
 /// `ON`/`USING`). Gated on the innermost open paren being that call's argument list.
 #[test]
 fn xmltable_subgrammar_is_confined_to_the_open_call() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let kw = |sql: &str, db| {
         SqlEditorWidget::collect_expected_keyword_suggestions(
@@ -53678,28 +54134,32 @@ fn xmltable_subgrammar_is_confined_to_the_open_call() {
         &kw("SELECT * FROM JSON_TABLE(j, '$' |", Oracle),
         "COLUMNS"
     ));
-    let mysql_json_table = kw("SELECT * FROM JSON_TABLE(j, '$' |", MySQL);
-    assert!(
-        has(&mysql_json_table, "COLUMNS"),
-        "MySQL JSON_TABLE must offer COLUMNS: {mysql_json_table:?}"
-    );
-    for oracle_only in ["ERROR ON ERROR", "NULL ON ERROR"] {
+    for db in [MySQL, MariaDB] {
+        let mysql_json_table = kw("SELECT * FROM JSON_TABLE(j, '$' |", db);
         assert!(
-            !has(&mysql_json_table, oracle_only),
-            "{oracle_only} leaked into MySQL JSON_TABLE row-source slot: {mysql_json_table:?}"
+            has(&mysql_json_table, "COLUMNS"),
+            "{db:?} JSON_TABLE must offer COLUMNS: {mysql_json_table:?}"
         );
+        for oracle_only in ["ERROR ON ERROR", "NULL ON ERROR"] {
+            assert!(
+                !has(&mysql_json_table, oracle_only),
+                "{oracle_only} leaked into {db:?} JSON_TABLE row-source slot: {mysql_json_table:?}"
+            );
+        }
     }
-    for sql in [
-        "SELECT * FROM XMLTABLE('/a' |",
-        "SELECT * FROM XMLTABLE('/a' PASSING x |",
-        "SELECT XMLTABLE('/a' | FROM t",
-        "SELECT JSON_TABLE(j, '$' | FROM t",
-    ] {
-        let s = kw(sql, MySQL);
-        assert!(
-            !has(&s, "PASSING") && !has(&s, "COLUMNS"),
-            "table-source subgrammar leaked outside a MySQL table-source XMLTABLE/JSON_TABLE slot at `{sql}`: {s:?}"
-        );
+    for db in [MySQL, MariaDB] {
+        for sql in [
+            "SELECT * FROM XMLTABLE('/a' |",
+            "SELECT * FROM XMLTABLE('/a' PASSING x |",
+            "SELECT XMLTABLE('/a' | FROM t",
+            "SELECT JSON_TABLE(j, '$' | FROM t",
+        ] {
+            let s = kw(sql, db);
+            assert!(
+                !has(&s, "PASSING") && !has(&s, "COLUMNS"),
+                "table-source subgrammar leaked outside a {db:?} table-source XMLTABLE/JSON_TABLE slot at `{sql}`: {s:?}"
+            );
+        }
     }
     // Once the call closes, `COLUMNS`/`PASSING` must not leak out.
     for sql in [
@@ -53932,7 +54392,7 @@ fn using_join_column_list_completes_the_join() {
             Some(db),
         )
     };
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
     let has = |v: &Vec<String>, s: &str| v.iter().any(|x| x == s);
 
     for sql in [
@@ -53949,10 +54409,12 @@ fn using_join_column_list_completes_the_join() {
             "USING column list wrongly offered the predicate conjunction tail at `{sql}`: {s:?}"
         );
     }
-    assert!(has(
-        &kw("SELECT a FROM t1 JOIN t2 USING (a) |", MySQL),
-        "WHERE"
-    ));
+    for db in [MySQL, MariaDB] {
+        assert!(
+            has(&kw("SELECT a FROM t1 JOIN t2 USING (a) |", db), "WHERE"),
+            "USING clause missing MySQL-family join continuation for {db:?}"
+        );
+    }
     // Inside the still-open column list, no query-level continuation.
     let s = kw("SELECT a FROM t1 JOIN t2 USING (a, |", Oracle);
     assert!(
@@ -53963,7 +54425,7 @@ fn using_join_column_list_completes_the_join() {
 
 #[test]
 fn using_join_column_list_final_suggestions_do_not_offer_catalog() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
     let assert_no_catalog_noise =
@@ -53994,6 +54456,7 @@ fn using_join_column_list_final_suggestions_do_not_offer_catalog() {
         (Oracle, "SELECT a FROM t1 JOIN t2 USING (a) |"),
         (Oracle, "SELECT a FROM t1 JOIN t2 USING (a, b) |"),
         (MySQL, "SELECT a FROM t1 JOIN t2 USING (a) |"),
+        (MariaDB, "SELECT a FROM t1 JOIN t2 USING (a) |"),
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
         assert_eq!(
@@ -54023,6 +54486,8 @@ fn using_join_column_list_final_suggestions_do_not_offer_catalog() {
         (Oracle, "SELECT * FROM emp e JOIN dept d USING (d.d|)"),
         (MySQL, "SELECT * FROM emp e JOIN dept d USING (e.|)"),
         (MySQL, "SELECT * FROM emp e JOIN dept d USING (d.d|)"),
+        (MariaDB, "SELECT * FROM emp e JOIN dept d USING (e.|)"),
+        (MariaDB, "SELECT * FROM emp e JOIN dept d USING (d.d|)"),
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
         assert_eq!(
@@ -54969,7 +55434,7 @@ fn dml_target_column_slots_stay_scoped_across_statement_variants() {
 
 #[test]
 fn dml_target_object_slots_offer_only_table_targets() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
 
@@ -55016,6 +55481,24 @@ fn dml_target_object_slots_offer_only_table_targets() {
         (MySQL, "REPLACE INTO e|"),
         (MySQL, "REPLACE INTO scott.|"),
         (MySQL, "REPLACE INTO scott.e|"),
+        (MariaDB, "UPDATE |"),
+        (MariaDB, "UPDATE e|"),
+        (MariaDB, "UPDATE scott.|"),
+        (MariaDB, "UPDATE scott.e|"),
+        (MariaDB, "DELETE FROM |"),
+        (MariaDB, "DELETE FROM e|"),
+        (MariaDB, "DELETE LOW_PRIORITY FROM |"),
+        (MariaDB, "DELETE QUICK FROM e|"),
+        (MariaDB, "DELETE FROM scott.|"),
+        (MariaDB, "DELETE FROM scott.e|"),
+        (MariaDB, "INSERT INTO |"),
+        (MariaDB, "INSERT INTO e|"),
+        (MariaDB, "INSERT INTO scott.|"),
+        (MariaDB, "INSERT INTO scott.e|"),
+        (MariaDB, "REPLACE INTO |"),
+        (MariaDB, "REPLACE INTO e|"),
+        (MariaDB, "REPLACE INTO scott.|"),
+        (MariaDB, "REPLACE INTO scott.e|"),
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
         assert_eq!(
@@ -55054,7 +55537,7 @@ fn dml_target_object_slots_offer_only_table_targets() {
 
 #[test]
 fn dml_value_expression_slots_offer_values_without_object_catalog_noise() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
     let assert_no_object_catalog_noise =
@@ -55123,6 +55606,27 @@ fn dml_value_expression_slots_offer_values_without_object_catalog_noise() {
             MySQL,
             "INSERT INTO emp (empno, ename, sal) VALUES (1, 'A', 10) ON DUPLICATE KEY UPDATE sal = VALUES(empno), ename = VALUES(|)",
         ),
+        (MariaDB, "INSERT INTO emp (empno, ename, sal) VALUES (|)"),
+        (MariaDB, "INSERT INTO emp (empno, ename, sal) VALUES (d|)"),
+        (MariaDB, "REPLACE INTO emp (empno, ename, sal) VALUES (|)"),
+        (MariaDB, "INSERT INTO emp SET sal = |"),
+        (MariaDB, "INSERT INTO emp SET sal = d|"),
+        (
+            MariaDB,
+            "INSERT INTO emp VALUES (1, 'A', 10) ON DUPLICATE KEY UPDATE sal = |",
+        ),
+        (
+            MariaDB,
+            "INSERT INTO emp VALUES (1, 'A', 10) ON DUPLICATE KEY UPDATE sal = d|",
+        ),
+        (
+            MariaDB,
+            "INSERT INTO emp (empno, ename, sal) VALUES (1, 'A', 10) ON DUPLICATE KEY UPDATE sal = VALUES(|)",
+        ),
+        (
+            MariaDB,
+            "INSERT INTO emp (empno, ename, sal) VALUES (1, 'A', 10) ON DUPLICATE KEY UPDATE sal = VALUES(empno), ename = VALUES(|)",
+        ),
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
         assert_eq!(
@@ -55161,6 +55665,20 @@ fn dml_value_expression_slots_offer_values_without_object_catalog_noise() {
         ),
         (MySQL, "INSERT INTO scott.dept SET s_dname = |"),
         (MySQL, "INSERT INTO scott.dept SET s_dname = d|"),
+        (
+            MariaDB,
+            "INSERT INTO scott.dept (s_deptno, s_dname) VALUES (|)",
+        ),
+        (
+            MariaDB,
+            "INSERT INTO scott.dept (s_deptno, s_dname) VALUES (d|)",
+        ),
+        (
+            MariaDB,
+            "REPLACE INTO scott.dept (s_deptno, s_dname) VALUES (|)",
+        ),
+        (MariaDB, "INSERT INTO scott.dept SET s_dname = |"),
+        (MariaDB, "INSERT INTO scott.dept SET s_dname = d|"),
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
         assert_eq!(
@@ -55211,47 +55729,49 @@ fn dml_value_expression_slots_offer_values_without_object_catalog_noise() {
         assert_no_object_catalog_noise(Oracle, sql, &final_suggestions);
     }
 
-    for (sql, expected, leaked) in [
-        (
-            "UPDATE emp e, dept d SET e.sal = d.|",
-            &["DEPTNO"][..],
-            &["DNAME", "EMPNO", "ENAME", "SAL"][..],
-        ),
-        (
-            "UPDATE emp e JOIN dept d ON e.deptno = d.deptno SET d.dname = e.|",
-            &["EMPNO", "ENAME", "SAL"][..],
-            &["DEPTNO", "DNAME"][..],
-        ),
-        (
-            "UPDATE emp AS e JOIN dept AS d ON e.deptno = d.deptno SET e.sal = d.|",
-            &["DEPTNO"][..],
-            &["DNAME", "EMPNO", "ENAME", "SAL"][..],
-        ),
-    ] {
-        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, MySQL);
-        assert_eq!(
-            kind, None,
-            "qualified multi-table UPDATE value-expression slot should not resolve an object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
-        );
-        for expected_column in expected {
-            assert!(
-                contains(&final_suggestions, expected_column),
-                "{expected_column} missing from qualified multi-table UPDATE value-expression slot at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+    for db in [MySQL, MariaDB] {
+        for (sql, expected, leaked) in [
+            (
+                "UPDATE emp e, dept d SET e.sal = d.|",
+                &["DEPTNO"][..],
+                &["DNAME", "EMPNO", "ENAME", "SAL"][..],
+            ),
+            (
+                "UPDATE emp e JOIN dept d ON e.deptno = d.deptno SET d.dname = e.|",
+                &["EMPNO", "ENAME", "SAL"][..],
+                &["DEPTNO", "DNAME"][..],
+            ),
+            (
+                "UPDATE emp AS e JOIN dept AS d ON e.deptno = d.deptno SET e.sal = d.|",
+                &["DEPTNO"][..],
+                &["DNAME", "EMPNO", "ENAME", "SAL"][..],
+            ),
+        ] {
+            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+            assert_eq!(
+                kind, None,
+                "qualified multi-table UPDATE value-expression slot should not resolve an object kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
             );
+            for expected_column in expected {
+                assert!(
+                    contains(&final_suggestions, expected_column),
+                    "{expected_column} missing from qualified multi-table UPDATE value-expression slot at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+                );
+            }
+            for leaked_column in leaked {
+                assert!(
+                    !contains(&final_suggestions, leaked_column),
+                    "{leaked_column} leaked into qualified multi-table UPDATE value-expression slot at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+                );
+            }
+            assert_no_object_catalog_noise(db, sql, &final_suggestions);
         }
-        for leaked_column in leaked {
-            assert!(
-                !contains(&final_suggestions, leaked_column),
-                "{leaked_column} leaked into qualified multi-table UPDATE value-expression slot at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
-            );
-        }
-        assert_no_object_catalog_noise(MySQL, sql, &final_suggestions);
     }
 }
 
 #[test]
 fn prefixed_dml_tail_keyword_slots_do_not_offer_object_catalog() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
 
@@ -55285,6 +55805,23 @@ fn prefixed_dml_tail_keyword_slots_do_not_offer_object_catalog() {
         ),
         (
             MySQL,
+            "INSERT INTO emp VALUES (1) ON DUPLICATE KEY U|",
+            "UPDATE",
+        ),
+        (MariaDB, "UPDATE emp SET sal = 1 W|", "WHERE"),
+        (MariaDB, "DELETE FROM emp W|", "WHERE"),
+        (
+            MariaDB,
+            "INSERT INTO emp VALUES (1) ON D|",
+            "DUPLICATE KEY UPDATE",
+        ),
+        (
+            MariaDB,
+            "INSERT INTO emp VALUES (1) ON DUPLICATE K|",
+            "KEY UPDATE",
+        ),
+        (
+            MariaDB,
             "INSERT INTO emp VALUES (1) ON DUPLICATE KEY U|",
             "UPDATE",
         ),
@@ -55330,22 +55867,23 @@ fn prefixed_dml_tail_keyword_slots_do_not_offer_object_catalog() {
         );
     }
 
-    for sql in [
-        "INSERT INTO emp VALUES (1, 'A', 10) ON DUPLICATE KEY UPDATE sal = 1 |",
-        "INSERT INTO emp VALUES (1, 'A', 10) ON DUPLICATE KEY UPDATE sal = 1 n|",
-        "INSERT INTO emp VALUES (1, 'A', 10) ON DUPLICATE KEY UPDATE sal = 1, ename = 'A' |",
-        "INSERT INTO emp VALUES (1, 'A', 10) ON DUPLICATE KEY UPDATE sal = 1, ename = 'A' n|",
-    ] {
-        let (kind, keywords, final_suggestions) =
-            audit_final_suggestions_for(sql, crate::db::DatabaseType::MySQL);
-        assert_eq!(
-            kind, None,
-            "completed ON DUPLICATE KEY UPDATE tail should not resolve object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
-        );
-        assert!(
-            final_suggestions.is_empty(),
-            "completed ON DUPLICATE KEY UPDATE tail should not offer catalog or stale keywords at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
-        );
+    for db in [MySQL, MariaDB] {
+        for sql in [
+            "INSERT INTO emp VALUES (1, 'A', 10) ON DUPLICATE KEY UPDATE sal = 1 |",
+            "INSERT INTO emp VALUES (1, 'A', 10) ON DUPLICATE KEY UPDATE sal = 1 n|",
+            "INSERT INTO emp VALUES (1, 'A', 10) ON DUPLICATE KEY UPDATE sal = 1, ename = 'A' |",
+            "INSERT INTO emp VALUES (1, 'A', 10) ON DUPLICATE KEY UPDATE sal = 1, ename = 'A' n|",
+        ] {
+            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+            assert_eq!(
+                kind, None,
+                "completed ON DUPLICATE KEY UPDATE tail should not resolve object kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+            );
+            assert!(
+                final_suggestions.is_empty(),
+                "completed ON DUPLICATE KEY UPDATE tail should not offer catalog or stale keywords at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
     }
 }
 
@@ -55417,10 +55955,16 @@ fn dml_returning_into_final_suggestions_stay_slot_specific() {
         "UPDATE emp SET sal = 1 RETURNING empno INTO |",
         "UPDATE emp SET sal = 1 RETURNING empno INTO :b |",
         "UPDATE emp SET sal = 1 RETURNING empno INTO :b n|",
+        "UPDATE emp SET sal = 1 RETURNING empno, ename INTO :b_empno, |",
+        "UPDATE emp SET sal = 1 RETURNING empno, ename INTO :b_empno, n|",
         "DELETE FROM emp WHERE empno = 1 RETURNING empno INTO |",
         "DELETE FROM emp WHERE empno = 1 RETURNING empno INTO :b n|",
+        "DELETE FROM emp WHERE empno = 1 RETURNING empno, ename INTO :b_empno, |",
+        "DELETE FROM emp WHERE empno = 1 RETURNING empno, ename INTO :b_empno, n|",
         "INSERT INTO emp (empno) VALUES (1) RETURNING empno INTO |",
         "INSERT INTO emp (empno) VALUES (1) RETURNING empno INTO :b n|",
+        "INSERT INTO emp (empno) VALUES (1) RETURNING empno, ename INTO :b_empno, |",
+        "INSERT INTO emp (empno) VALUES (1) RETURNING empno, ename INTO :b_empno, n|",
     ] {
         let (_kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
         for leaked in [
@@ -55442,7 +55986,7 @@ fn dml_returning_into_final_suggestions_stay_slot_specific() {
 
 #[test]
 fn unprefixed_dml_and_fk_keyword_slots_do_not_offer_object_catalog() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
     let assert_no_catalog_noise =
@@ -55472,6 +56016,8 @@ fn unprefixed_dml_and_fk_keyword_slots_do_not_offer_object_catalog() {
         (Oracle, "INSERT INTO emp (a, b) |", &["VALUES", "SELECT"]),
         (MySQL, "INSERT INTO emp (a, b) |", &["VALUES", "SELECT"]),
         (MySQL, "REPLACE INTO emp (a) |", &["VALUES", "SELECT"]),
+        (MariaDB, "INSERT INTO emp (a, b) |", &["VALUES", "SELECT"]),
+        (MariaDB, "REPLACE INTO emp (a) |", &["VALUES", "SELECT"]),
         (Oracle, "INSERT INTO emp VALUES (1, 2) |", &["RETURNING"]),
         (
             Oracle,
@@ -55481,6 +56027,11 @@ fn unprefixed_dml_and_fk_keyword_slots_do_not_offer_object_catalog() {
         (Oracle, "INSERT INTO emp VALUES (1), (2) |", &["RETURNING"]),
         (
             MySQL,
+            "INSERT INTO emp VALUES (1), (2) |",
+            &["ON DUPLICATE KEY UPDATE"],
+        ),
+        (
+            MariaDB,
             "INSERT INTO emp VALUES (1), (2) |",
             &["ON DUPLICATE KEY UPDATE"],
         ),
@@ -55497,7 +56048,18 @@ fn unprefixed_dml_and_fk_keyword_slots_do_not_offer_object_catalog() {
             "UPDATE emp SET a = 1 WHERE b = 2 |",
             &["ORDER BY", "LIMIT"],
         ),
+        (
+            MariaDB,
+            "DELETE FROM emp WHERE a = 1 |",
+            &["ORDER BY", "LIMIT"],
+        ),
+        (
+            MariaDB,
+            "UPDATE emp SET a = 1 WHERE b = 2 |",
+            &["ORDER BY", "LIMIT"],
+        ),
         (MySQL, "SELECT a FROM t LIMIT 5 |", &["OFFSET"]),
+        (MariaDB, "SELECT a FROM t LIMIT 5 |", &["OFFSET"]),
         (
             Oracle,
             "CREATE TABLE c (id NUMBER, FOREIGN KEY (id) REFERENCES p (id) ON |)",
@@ -55505,6 +56067,11 @@ fn unprefixed_dml_and_fk_keyword_slots_do_not_offer_object_catalog() {
         ),
         (
             MySQL,
+            "CREATE TABLE c (id INT, FOREIGN KEY (id) REFERENCES p (id) ON |)",
+            &["DELETE", "UPDATE"],
+        ),
+        (
+            MariaDB,
             "CREATE TABLE c (id INT, FOREIGN KEY (id) REFERENCES p (id) ON |)",
             &["DELETE", "UPDATE"],
         ),
@@ -55548,8 +56115,11 @@ fn unprefixed_dml_and_fk_keyword_slots_do_not_offer_object_catalog() {
         (Oracle, "INSERT INTO emp VALUES (1), e|"),
         (MySQL, "INSERT INTO emp VALUES (1), |"),
         (MySQL, "INSERT INTO emp VALUES (1), e|"),
+        (MariaDB, "INSERT INTO emp VALUES (1), |"),
+        (MariaDB, "INSERT INTO emp VALUES (1), e|"),
         (Oracle, "INSERT INTO emp (empno) VALUES (1), |"),
         (MySQL, "REPLACE INTO emp VALUES (1), |"),
+        (MariaDB, "REPLACE INTO emp VALUES (1), |"),
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
         assert_eq!(
@@ -55565,7 +56135,7 @@ fn unprefixed_dml_and_fk_keyword_slots_do_not_offer_object_catalog() {
 
 #[test]
 fn prefixed_query_clause_tail_slots_do_not_offer_object_catalog() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
 
@@ -55610,6 +56180,11 @@ fn prefixed_query_clause_tail_slots_do_not_offer_object_catalog() {
         (MySQL, "SELECT empno FROM emp O|", "ORDER BY"),
         (MySQL, "SELECT empno FROM emp WHERE empno = 1 L|", "LIMIT"),
         (MySQL, "SELECT empno FROM emp ORDER BY empno L|", "LIMIT"),
+        (MariaDB, "SELECT empno FROM emp W|", "WHERE"),
+        (MariaDB, "SELECT empno FROM emp G|", "GROUP BY"),
+        (MariaDB, "SELECT empno FROM emp O|", "ORDER BY"),
+        (MariaDB, "SELECT empno FROM emp WHERE empno = 1 L|", "LIMIT"),
+        (MariaDB, "SELECT empno FROM emp ORDER BY empno L|", "LIMIT"),
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
         assert!(
@@ -55804,7 +56379,7 @@ fn prefixed_join_and_set_operator_slots_do_not_offer_object_catalog() {
 
 #[test]
 fn dml_source_object_slots_offer_relation_sources_without_catalog_noise() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
 
@@ -55886,6 +56461,90 @@ fn dml_source_object_slots_offer_relation_sources_without_catalog_noise() {
         ),
         (
             MySQL,
+            "DELETE emp FROM emp STRAIGHT_JOIN |",
+            &["EMP", "DEPT", "EMP_V"][..],
+        ),
+        (
+            MariaDB,
+            "DELETE FROM emp USING |",
+            &["EMP", "DEPT", "EMP_V"][..],
+        ),
+        (MariaDB, "DELETE FROM emp USING e|", &["EMP", "EMP_V"][..]),
+        (
+            MariaDB,
+            "DELETE FROM emp USING scott.|",
+            &["EMP", "EMP_V"][..],
+        ),
+        (
+            MariaDB,
+            "DELETE FROM emp USING scott.e|",
+            &["EMP", "EMP_V"][..],
+        ),
+        (MariaDB, "DELETE emp FROM |", &["EMP", "DEPT", "EMP_V"][..]),
+        (MariaDB, "DELETE emp FROM e|", &["EMP", "EMP_V"][..]),
+        (
+            MariaDB,
+            "DELETE emp FROM scott.|",
+            &["EMP", "EMP_V"][..],
+        ),
+        (
+            MariaDB,
+            "DELETE LOW_PRIORITY emp FROM |",
+            &["EMP", "DEPT", "EMP_V"][..],
+        ),
+        (
+            MariaDB,
+            "DELETE emp.* FROM |",
+            &["EMP", "DEPT", "EMP_V"][..],
+        ),
+        (
+            MariaDB,
+            "DELETE emp, dept FROM |",
+            &["EMP", "DEPT", "EMP_V"][..],
+        ),
+        (MariaDB, "UPDATE emp JOIN |", &["EMP", "DEPT", "EMP_V"][..]),
+        (MariaDB, "UPDATE emp JOIN e|", &["EMP", "EMP_V"][..]),
+        (
+            MariaDB,
+            "UPDATE emp JOIN scott.|",
+            &["EMP", "EMP_V"][..],
+        ),
+        (
+            MariaDB,
+            "UPDATE emp JOIN scott.e|",
+            &["EMP", "EMP_V"][..],
+        ),
+        (
+            MariaDB,
+            "UPDATE emp LEFT JOIN |",
+            &["EMP", "DEPT", "EMP_V"][..],
+        ),
+        (
+            MariaDB,
+            "UPDATE emp STRAIGHT_JOIN |",
+            &["EMP", "DEPT", "EMP_V"][..],
+        ),
+        (MariaDB, "UPDATE emp, |", &["EMP", "DEPT", "EMP_V"][..]),
+        (MariaDB, "UPDATE emp, e|", &["EMP", "EMP_V"][..]),
+        (MariaDB, "UPDATE emp, scott.|", &["EMP", "EMP_V"][..]),
+        (MariaDB, "UPDATE emp, scott.e|", &["EMP", "EMP_V"][..]),
+        (
+            MariaDB,
+            "DELETE emp FROM emp JOIN |",
+            &["EMP", "DEPT", "EMP_V"][..],
+        ),
+        (
+            MariaDB,
+            "DELETE emp FROM emp JOIN e|",
+            &["EMP", "EMP_V"][..],
+        ),
+        (
+            MariaDB,
+            "DELETE emp FROM emp JOIN scott.|",
+            &["EMP", "EMP_V"][..],
+        ),
+        (
+            MariaDB,
             "DELETE emp FROM emp STRAIGHT_JOIN |",
             &["EMP", "DEPT", "EMP_V"][..],
         ),
@@ -57602,7 +58261,7 @@ fn create_table_final_suggestions_separate_names_types_and_constraint_keywords()
 
 #[test]
 fn ddl_internal_new_name_slots_do_not_offer_catalog_or_keywords() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
 
@@ -57630,7 +58289,15 @@ fn ddl_internal_new_name_slots_do_not_offer_catalog_or_keywords() {
             "CREATE TABLE t (id INT CONSTRAINT app| CHECK (id > 0))",
         ),
         (
+            MariaDB,
+            "CREATE TABLE t (id INT CONSTRAINT app| CHECK (id > 0))",
+        ),
+        (
             MySQL,
+            "ALTER TABLE t ADD id INT CONSTRAINT app| CHECK (id > 0)",
+        ),
+        (
+            MariaDB,
             "ALTER TABLE t ADD id INT CONSTRAINT app| CHECK (id > 0)",
         ),
         (
@@ -57638,11 +58305,23 @@ fn ddl_internal_new_name_slots_do_not_offer_catalog_or_keywords() {
             "CREATE TABLE t (id INT, FOREIGN KEY app| (id) REFERENCES p(id))",
         ),
         (
+            MariaDB,
+            "CREATE TABLE t (id INT, FOREIGN KEY app| (id) REFERENCES p(id))",
+        ),
+        (
             MySQL,
             "CREATE TABLE t (id INT, CONSTRAINT fk FOREIGN KEY app| (id) REFERENCES p(id))",
         ),
         (
+            MariaDB,
+            "CREATE TABLE t (id INT, CONSTRAINT fk FOREIGN KEY app| (id) REFERENCES p(id))",
+        ),
+        (
             MySQL,
+            "ALTER TABLE t ADD FOREIGN KEY app| (id) REFERENCES p(id)",
+        ),
+        (
+            MariaDB,
             "ALTER TABLE t ADD FOREIGN KEY app| (id) REFERENCES p(id)",
         ),
         (
@@ -57659,15 +58338,32 @@ fn ddl_internal_new_name_slots_do_not_offer_catalog_or_keywords() {
         (MySQL, "CREATE TABLE t (id INT, UNIQUE KEY app| (id))"),
         (MySQL, "CREATE TABLE t (id TEXT, FULLTEXT app| (id))"),
         (MySQL, "CREATE TABLE t (id POINT, SPATIAL app| (id))"),
+        (MariaDB, "CREATE TABLE t (id INT, INDEX app| (id))"),
+        (MariaDB, "CREATE TABLE t (id INT, KEY app| (id))"),
+        (MariaDB, "CREATE TABLE t (id INT, UNIQUE app| (id))"),
+        (MariaDB, "CREATE TABLE t (id INT, UNIQUE KEY app| (id))"),
+        (MariaDB, "CREATE TABLE t (id TEXT, FULLTEXT app| (id))"),
+        (MariaDB, "CREATE TABLE t (id POINT, SPATIAL app| (id))"),
         (
             MySQL,
+            "CREATE TEMPORARY TABLE t (id INT, KEY app| (id))",
+        ),
+        (
+            MariaDB,
             "CREATE TEMPORARY TABLE t (id INT, KEY app| (id))",
         ),
         (MySQL, "ALTER TABLE t ADD UNIQUE app| (id)"),
         (MySQL, "ALTER TABLE t ADD FULLTEXT app| (id)"),
         (MySQL, "ALTER TABLE t ADD SPATIAL app| (id)"),
+        (MariaDB, "ALTER TABLE t ADD UNIQUE app| (id)"),
+        (MariaDB, "ALTER TABLE t ADD FULLTEXT app| (id)"),
+        (MariaDB, "ALTER TABLE t ADD SPATIAL app| (id)"),
         (
             MySQL,
+            "CREATE TABLE t (id INT) PARTITION BY RANGE (id) (PARTITION app| VALUES LESS THAN (10))",
+        ),
+        (
+            MariaDB,
             "CREATE TABLE t (id INT) PARTITION BY RANGE (id) (PARTITION app| VALUES LESS THAN (10))",
         ),
         (
@@ -57675,7 +58371,15 @@ fn ddl_internal_new_name_slots_do_not_offer_catalog_or_keywords() {
             "CREATE TEMPORARY TABLE t (id INT) PARTITION BY RANGE (id) (PARTITION app| VALUES LESS THAN (10))",
         ),
         (
+            MariaDB,
+            "CREATE TEMPORARY TABLE t (id INT) PARTITION BY RANGE (id) (PARTITION app| VALUES LESS THAN (10))",
+        ),
+        (
             MySQL,
+            "ALTER TABLE t ADD PARTITION app| VALUES LESS THAN (10)",
+        ),
+        (
+            MariaDB,
             "ALTER TABLE t ADD PARTITION app| VALUES LESS THAN (10)",
         ),
     ] {
@@ -57829,7 +58533,7 @@ fn mysql_family_ddl_statement_tails_suppress_relations() {
 
 #[test]
 fn create_view_column_alias_list_slots_do_not_offer_catalog() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
 
@@ -57858,6 +58562,15 @@ fn create_view_column_alias_list_slots_do_not_offer_catalog() {
         ),
         (
             MySQL,
+            "CREATE OR REPLACE VIEW v (out_col, n|) AS SELECT empno, ename FROM emp",
+        ),
+        (MariaDB, "CREATE VIEW v (|) AS SELECT empno FROM emp"),
+        (
+            MariaDB,
+            "CREATE VIEW v (out_col, |) AS SELECT empno, ename FROM emp",
+        ),
+        (
+            MariaDB,
             "CREATE OR REPLACE VIEW v (out_col, n|) AS SELECT empno, ename FROM emp",
         ),
     ] {
@@ -57891,7 +58604,7 @@ fn create_view_column_alias_list_slots_do_not_offer_catalog() {
 /// (an existing object is named there, unlike a `CREATE` slot).
 #[test]
 fn admin_statement_tails_suppress_relations_without_select_noise() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
     let idsupp = |sql: &str, db: crate::db::DatabaseType| {
         let excl = sql
             .strip_suffix('|')
@@ -57952,6 +58665,16 @@ fn admin_statement_tails_suppress_relations_without_select_noise() {
     assert!(idsupp("PURGE TABLESPACE |", Oracle));
     assert!(idsupp("PURGE TABLE emp |", Oracle));
     assert!(idsupp("CALL my_proc(1) |", Oracle));
+    let (kind, keywords, final_suggestions) =
+        audit_final_suggestions_for("CALL my_proc(1) |", Oracle);
+    assert_eq!(
+        kind, None,
+        "completed Oracle CALL tail should not resolve object kind: keywords={keywords:?} final={final_suggestions:?}"
+    );
+    assert!(
+        final_suggestions.is_empty(),
+        "completed Oracle CALL tail should not offer catalog or stale keywords: keywords={keywords:?} final={final_suggestions:?}"
+    );
     assert!(
         idsupp("ASSOCIATE STATISTICS WITH COLUMNS emp.sal |", Oracle)
             && has(
@@ -57983,71 +58706,80 @@ fn admin_statement_tails_suppress_relations_without_select_noise() {
         "audit object slot keeps catalog"
     );
 
-    // MySQL admin tails.
-    for sql in [
-        "FLUSH PRIVILEGES |",
-        "FLUSH LOCAL |",
-        "FLUSH LOCAL PRIVILEGES |",
-        "FLUSH TABLES FOR EXPORT |",
-        "CHECK TABLE emp QUICK |",
-        "CHECK TABLE emp FOR UPGRADE |",
-        "REPAIR TABLE emp QUICK EXTENDED |",
-        "OPTIMIZE TABLE emp |",
-        "ANALYZE TABLE emp UPDATE HISTOGRAM ON salary WITH 32 BUCKETS AUTO UPDATE |",
-        "CACHE INDEX emp IN keycache |",
-        "LOAD INDEX INTO CACHE emp IGNORE LEAVES |",
-        "LOAD DATA INFILE data_csv REPLACE INTO TABLE emp |",
-        "RESET BINARY LOGS AND GTIDS |",
-        "RESET REPLICA FOR CHANNEL ch |",
-        "RESET REPLICA ALL FOR CHANNEL ch |",
-        "PURGE BINARY LOGS BEFORE ts |",
-        "PURGE BINARY LOGS TO binlog |",
-        "PURGE MASTER LOGS BEFORE ts |",
-        "PURGE MASTER LOGS TO binlog |",
-        "LOCK INSTANCE FOR BACKUP |",
-        "UNLOCK INSTANCE |",
-        "UNLOCK TABLES |",
-        "START GROUP_REPLICATION USER repl PASSWORD secret |",
-        "START REPLICA IO_THREAD SQL_THREAD |",
-        "START REPLICA UNTIL SQL_BEFORE_GTIDS gtid_set |",
-        "START REPLICA UNTIL SOURCE_LOG_FILE binlog_000001 |",
-        "STOP REPLICA IO_THREAD SQL_THREAD |",
-        "CHANGE REPLICATION SOURCE TO SOURCE_HOST host SOURCE_PORT 3306 |",
-        "CHANGE REPLICATION FILTER REPLICATE_DO_DB db1 |",
-        "CHANGE REPLICATION FILTER REPLICATE_IGNORE_TABLE db1_t1 |",
-        "SET NAMES utf8mb4 COLLATE utf8mb4_bin |",
-        "SET DEFAULT ROLE ALL TO alice |",
-        "SET ROLE ALL EXCEPT admin |",
-        "SET PASSWORD TO RANDOM RETAIN CURRENT PASSWORD |",
-    ] {
+    // MySQL-family admin tails.
+    for db in [MySQL, MariaDB] {
+        for sql in [
+            "FLUSH PRIVILEGES |",
+            "FLUSH LOCAL |",
+            "FLUSH LOCAL PRIVILEGES |",
+            "FLUSH TABLES FOR EXPORT |",
+            "CHECK TABLE emp QUICK |",
+            "CHECK TABLE emp FOR UPGRADE |",
+            "REPAIR TABLE emp QUICK EXTENDED |",
+            "OPTIMIZE TABLE emp |",
+            "ANALYZE TABLE emp UPDATE HISTOGRAM ON salary WITH 32 BUCKETS AUTO UPDATE |",
+            "CACHE INDEX emp IN keycache |",
+            "LOAD INDEX INTO CACHE emp IGNORE LEAVES |",
+            "LOAD DATA INFILE data_csv REPLACE INTO TABLE emp |",
+            "RESET BINARY LOGS AND GTIDS |",
+            "RESET REPLICA FOR CHANNEL ch |",
+            "RESET REPLICA ALL FOR CHANNEL ch |",
+            "PURGE BINARY LOGS BEFORE ts |",
+            "PURGE BINARY LOGS TO binlog |",
+            "PURGE MASTER LOGS BEFORE ts |",
+            "PURGE MASTER LOGS TO binlog |",
+            "LOCK INSTANCE FOR BACKUP |",
+            "UNLOCK INSTANCE |",
+            "UNLOCK TABLES |",
+            "START GROUP_REPLICATION USER repl PASSWORD secret |",
+            "START REPLICA IO_THREAD SQL_THREAD |",
+            "START REPLICA UNTIL SQL_BEFORE_GTIDS gtid_set |",
+            "START REPLICA UNTIL SOURCE_LOG_FILE binlog_000001 |",
+            "STOP REPLICA IO_THREAD SQL_THREAD |",
+            "CHANGE REPLICATION SOURCE TO SOURCE_HOST host SOURCE_PORT 3306 |",
+            "CHANGE REPLICATION FILTER REPLICATE_DO_DB db1 |",
+            "CHANGE REPLICATION FILTER REPLICATE_IGNORE_TABLE db1_t1 |",
+            "SET NAMES utf8mb4 COLLATE utf8mb4_bin |",
+            "SET DEFAULT ROLE ALL TO alice |",
+            "SET ROLE ALL EXCEPT admin |",
+            "SET PASSWORD TO RANDOM RETAIN CURRENT PASSWORD |",
+        ] {
+            assert!(
+                idsupp(sql, db),
+                "{db:?} admin tail must suppress catalog at `{sql}`"
+            );
+        }
         assert!(
-            idsupp(sql, MySQL),
-            "MySQL admin tail must suppress catalog at `{sql}`"
+            has(&kw("FLUSH LOCAL |", db), "PRIVILEGES"),
+            "FLUSH option list lost for {db:?}"
         );
-    }
-    assert!(
-        has(&kw("FLUSH LOCAL |", MySQL), "PRIVILEGES"),
-        "FLUSH option list lost"
-    );
-    assert!(
-        !idsupp("OPTIMIZE TABLE |", MySQL),
-        "optimize table slot keeps catalog"
-    );
-    assert!(idsupp("CALL my_proc(1) |", MySQL));
+        assert!(
+            !idsupp("OPTIMIZE TABLE |", db),
+            "optimize table slot keeps catalog for {db:?}"
+        );
+        assert!(idsupp("CALL my_proc(1) |", db));
+        let (kind, keywords, final_suggestions) =
+            audit_final_suggestions_for("CALL my_proc(1) |", db);
+        assert_eq!(
+            kind, None,
+            "completed {db:?} CALL tail should not resolve object kind: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            final_suggestions.is_empty(),
+            "completed {db:?} CALL tail should not offer catalog or stale keywords: keywords={keywords:?} final={final_suggestions:?}"
+        );
 
-    // MySQL `DROP <object> |` name slot offers the catalog alongside `IF`.
-    assert!(
-        !idsupp("DROP TABLE |", MySQL),
-        "drop-table name slot keeps catalog"
-    );
-    assert!(!idsupp("DROP VIEW |", MySQL));
-    assert!(!idsupp("DROP TEMPORARY TABLE |", MySQL));
-    assert!(
-        has(&kw("DROP TABLE |", MySQL), "IF"),
-        "IF EXISTS still offered"
-    );
-    // Past the name it suppresses again.
-    assert!(idsupp("DROP TABLE t |", MySQL));
+        // `DROP <object> |` name slot offers the catalog alongside `IF`.
+        assert!(
+            !idsupp("DROP TABLE |", db),
+            "drop-table name slot keeps catalog for {db:?}"
+        );
+        assert!(!idsupp("DROP VIEW |", db));
+        assert!(!idsupp("DROP TEMPORARY TABLE |", db));
+        assert!(has(&kw("DROP TABLE |", db), "IF"), "IF EXISTS still offered");
+        // Past the name it suppresses again.
+        assert!(idsupp("DROP TABLE t |", db));
+    }
 }
 
 #[test]
@@ -59841,56 +60573,58 @@ fn mysql_family_account_host_tail_slots_do_not_offer_catalog() {
 }
 #[test]
 fn grant_revoke_slots_are_precise_in_final_suggestions() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
 
-    for (sql, expected_privileges) in [
-        (
-            "GRANT | ON *.* TO scott",
-            &["SELECT", "APPLICATION_PASSWORD_ADMIN", "BACKUP_ADMIN"][..],
-        ),
-        (
-            "GRANT SELECT, | ON *.* TO scott",
-            &["INSERT", "GROUP_REPLICATION_ADMIN", "XA_RECOVER_ADMIN"],
-        ),
-        (
-            "REVOKE | ON *.* FROM scott",
-            &["IF", "SELECT", "APPLICATION_PASSWORD_ADMIN"],
-        ),
-        (
-            "REVOKE SELECT, | ON *.* FROM scott",
-            &["INSERT", "RESOURCE_GROUP_ADMIN", "SYSTEM_USER"],
-        ),
-    ] {
-        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, MySQL);
-        assert_eq!(
-            kind, None,
-            "MySQL privilege list should not resolve object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
-        );
-        for expected in expected_privileges {
-            assert!(
-                contains(&final_suggestions, expected),
-                "{expected} missing from MySQL privilege list at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
-            );
-        }
-        for leaked in [
-            "EMP",
-            "DEPT",
-            "EMP_V",
-            "APP_USER",
-            "SCOTT",
-            "RUN_JOB",
-            "CALC_TOTAL",
-            "EMPNO",
-            "WHERE",
-            "NOW()",
-            "NULLIF()",
+    for db in [MySQL, MariaDB] {
+        for (sql, expected_privileges) in [
+            (
+                "GRANT | ON *.* TO scott",
+                &["SELECT", "APPLICATION_PASSWORD_ADMIN", "BACKUP_ADMIN"][..],
+            ),
+            (
+                "GRANT SELECT, | ON *.* TO scott",
+                &["INSERT", "GROUP_REPLICATION_ADMIN", "XA_RECOVER_ADMIN"],
+            ),
+            (
+                "REVOKE | ON *.* FROM scott",
+                &["IF", "SELECT", "APPLICATION_PASSWORD_ADMIN"],
+            ),
+            (
+                "REVOKE SELECT, | ON *.* FROM scott",
+                &["INSERT", "RESOURCE_GROUP_ADMIN", "SYSTEM_USER"],
+            ),
         ] {
-            assert!(
-                !contains(&final_suggestions, leaked),
-                "{leaked} leaked into MySQL privilege list at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+            assert_eq!(
+                kind, None,
+                "MySQL-family privilege list should not resolve object kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
             );
+            for expected in expected_privileges {
+                assert!(
+                    contains(&final_suggestions, expected),
+                    "{expected} missing from MySQL-family privilege list at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+                );
+            }
+            for leaked in [
+                "EMP",
+                "DEPT",
+                "EMP_V",
+                "APP_USER",
+                "SCOTT",
+                "RUN_JOB",
+                "CALC_TOTAL",
+                "EMPNO",
+                "WHERE",
+                "NOW()",
+                "NULLIF()",
+            ] {
+                assert!(
+                    !contains(&final_suggestions, leaked),
+                    "{leaked} leaked into MySQL-family privilege list at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+                );
+            }
         }
     }
 
@@ -59917,6 +60651,16 @@ fn grant_revoke_slots_are_precise_in_final_suggestions() {
         ),
         (
             MySQL,
+            "REVOKE SELECT ON | FROM scott",
+            ExpectedObjectSuggestionKind::RelationOrSequence,
+        ),
+        (
+            MariaDB,
+            "GRANT SELECT ON | TO scott",
+            ExpectedObjectSuggestionKind::RelationOrSequence,
+        ),
+        (
+            MariaDB,
             "REVOKE SELECT ON | FROM scott",
             ExpectedObjectSuggestionKind::RelationOrSequence,
         ),
@@ -60002,6 +60746,18 @@ fn grant_revoke_slots_are_precise_in_final_suggestions() {
             "EMP",
             &["RUN_JOB", "CALC_TOTAL", "APP_USER", "SCOTT", "EMPNO"],
         ),
+        (
+            MariaDB,
+            "GRANT SELECT ON emp| TO scott",
+            "EMP",
+            &["RUN_JOB", "CALC_TOTAL", "APP_USER", "SCOTT", "EMPNO"],
+        ),
+        (
+            MariaDB,
+            "REVOKE SELECT ON emp| FROM scott",
+            "EMP",
+            &["RUN_JOB", "CALC_TOTAL", "APP_USER", "SCOTT", "EMPNO"],
+        ),
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
         assert!(
@@ -60033,6 +60789,10 @@ fn grant_revoke_slots_are_precise_in_final_suggestions() {
         (MySQL, "GRANT SELECT ON emp TO scott, |"),
         (MySQL, "REVOKE SELECT ON emp FROM |"),
         (MySQL, "REVOKE SELECT ON emp FROM scott, |"),
+        (MariaDB, "GRANT SELECT ON emp TO |"),
+        (MariaDB, "GRANT SELECT ON emp TO scott, |"),
+        (MariaDB, "REVOKE SELECT ON emp FROM |"),
+        (MariaDB, "REVOKE SELECT ON emp FROM scott, |"),
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
         assert_eq!(
@@ -60078,6 +60838,14 @@ fn grant_revoke_slots_are_precise_in_final_suggestions() {
             MySQL,
             "GRANT SELECT ON emp TO app_user WITH GRANT OPTION n|",
         ),
+        (
+            MariaDB,
+            "GRANT SELECT ON emp TO app_user WITH GRANT OPTION |",
+        ),
+        (
+            MariaDB,
+            "GRANT SELECT ON emp TO app_user WITH GRANT OPTION n|",
+        ),
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
         assert!(
@@ -60089,7 +60857,7 @@ fn grant_revoke_slots_are_precise_in_final_suggestions() {
 
 #[test]
 fn prefixed_grant_revoke_grantee_and_tail_slots_are_precise() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
 
@@ -60104,6 +60872,13 @@ fn prefixed_grant_revoke_grantee_and_tail_slots_are_precise() {
         (MySQL, "REVOKE SELECT ON emp FROM app|", "APP_USER"),
         (
             MySQL,
+            "REVOKE ALL PRIVILEGES, GRANT OPTION FROM app|",
+            "APP_USER",
+        ),
+        (MariaDB, "GRANT SELECT ON emp TO app|", "APP_USER"),
+        (MariaDB, "REVOKE SELECT ON emp FROM app|", "APP_USER"),
+        (
+            MariaDB,
             "REVOKE ALL PRIVILEGES, GRANT OPTION FROM app|",
             "APP_USER",
         ),
@@ -60168,6 +60943,11 @@ fn prefixed_grant_revoke_grantee_and_tail_slots_are_precise() {
             "GRANT SELECT ON emp TO app_user W|",
             "WITH GRANT OPTION",
         ),
+        (
+            MariaDB,
+            "GRANT SELECT ON emp TO app_user W|",
+            "WITH GRANT OPTION",
+        ),
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
         assert!(
@@ -60197,6 +60977,8 @@ fn prefixed_grant_revoke_grantee_and_tail_slots_are_precise() {
         (Oracle, "REVOKE SELECT ON emp FROM app_user n|"),
         (MySQL, "REVOKE SELECT ON emp FROM app_user F|"),
         (MySQL, "REVOKE SELECT ON emp FROM app_user n|"),
+        (MariaDB, "REVOKE SELECT ON emp FROM app_user F|"),
+        (MariaDB, "REVOKE SELECT ON emp FROM app_user n|"),
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
         assert!(
@@ -61123,7 +61905,7 @@ fn mysql_dedicated_column_scopes_are_mysql_dialect_only() {
 
 #[test]
 fn ddl_object_target_slots_are_precise_in_final_suggestions() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
 
@@ -61147,6 +61929,14 @@ fn ddl_object_target_slots_are_precise_in_final_suggestions() {
         (MySQL, "CREATE TABLE child (parent_id INT REFERENCES |)"),
         (
             MySQL,
+            "ALTER TABLE child ADD CONSTRAINT fk_parent FOREIGN KEY (parent_id) REFERENCES |",
+        ),
+        (MariaDB, "CREATE INDEX idx_emp ON |"),
+        (MariaDB, "DROP INDEX idx_emp ON |"),
+        (MariaDB, "CREATE TRIGGER trg BEFORE INSERT ON |"),
+        (MariaDB, "CREATE TABLE child (parent_id INT REFERENCES |)"),
+        (
+            MariaDB,
             "ALTER TABLE child ADD CONSTRAINT fk_parent FOREIGN KEY (parent_id) REFERENCES |",
         ),
     ] {
@@ -61436,7 +62226,7 @@ fn oracle_prefixed_object_slots_keep_schema_name_suggestions() {
 
 #[test]
 fn prefixed_object_slots_do_not_merge_statement_keywords() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
 
@@ -61455,6 +62245,15 @@ fn prefixed_object_slots_do_not_merge_statement_keywords() {
         (MySQL, "GRANT SELECT ON s| TO scott"),
         (MySQL, "CREATE INDEX ix ON s|"),
         (MySQL, "CREATE TABLE child (parent_id INT REFERENCES s|)"),
+        (MariaDB, "DROP TABLE s|"),
+        (MariaDB, "SHOW CREATE TABLE s|"),
+        (MariaDB, "SHOW COLUMNS FROM s|"),
+        (MariaDB, "GRANT SELECT ON s| TO scott"),
+        (MariaDB, "CREATE INDEX ix ON s|"),
+        (
+            MariaDB,
+            "CREATE TABLE child (parent_id INT REFERENCES s|)",
+        ),
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
         assert!(
@@ -61902,7 +62701,7 @@ fn prefixed_object_slots_stay_within_expected_object_family() {
 
 #[test]
 fn object_kind_matrix_final_suggestions_stay_within_expected_family() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
     let all_fixture_objects = [
@@ -62294,7 +63093,19 @@ fn object_kind_matrix_final_suggestions_stay_within_expected_family() {
             &["APP_USER", "SCOTT"],
         ),
         (
+            MariaDB,
+            "DROP USER |",
+            ExpectedObjectSuggestionKind::User,
+            &["APP_USER", "SCOTT"],
+        ),
+        (
             MySQL,
+            "ALTER TABLE |",
+            ExpectedObjectSuggestionKind::Table,
+            &["EMP", "DEPT", "T", "T1", "S", "P"],
+        ),
+        (
+            MariaDB,
             "ALTER TABLE |",
             ExpectedObjectSuggestionKind::Table,
             &["EMP", "DEPT", "T", "T1", "S", "P"],
@@ -62306,7 +63117,19 @@ fn object_kind_matrix_final_suggestions_stay_within_expected_family() {
             &["EMP", "DEPT", "T", "T1", "S", "P"],
         ),
         (
+            MariaDB,
+            "CACHE INDEX |",
+            ExpectedObjectSuggestionKind::Table,
+            &["EMP", "DEPT", "T", "T1", "S", "P"],
+        ),
+        (
             MySQL,
+            "CACHE INDEX emp, |",
+            ExpectedObjectSuggestionKind::Table,
+            &["EMP", "DEPT", "T", "T1", "S", "P"],
+        ),
+        (
+            MariaDB,
             "CACHE INDEX emp, |",
             ExpectedObjectSuggestionKind::Table,
             &["EMP", "DEPT", "T", "T1", "S", "P"],
@@ -62318,7 +63141,19 @@ fn object_kind_matrix_final_suggestions_stay_within_expected_family() {
             &["EMP", "DEPT", "T", "T1", "S", "P"],
         ),
         (
+            MariaDB,
+            "LOAD INDEX INTO CACHE |",
+            ExpectedObjectSuggestionKind::Table,
+            &["EMP", "DEPT", "T", "T1", "S", "P"],
+        ),
+        (
             MySQL,
+            "LOAD INDEX INTO CACHE emp, |",
+            ExpectedObjectSuggestionKind::Table,
+            &["EMP", "DEPT", "T", "T1", "S", "P"],
+        ),
+        (
+            MariaDB,
             "LOAD INDEX INTO CACHE emp, |",
             ExpectedObjectSuggestionKind::Table,
             &["EMP", "DEPT", "T", "T1", "S", "P"],
@@ -62330,7 +63165,19 @@ fn object_kind_matrix_final_suggestions_stay_within_expected_family() {
             &["EMP_V"],
         ),
         (
+            MariaDB,
+            "ALTER VIEW |",
+            ExpectedObjectSuggestionKind::View,
+            &["EMP_V"],
+        ),
+        (
             MySQL,
+            "DROP VIEW IF EXISTS |",
+            ExpectedObjectSuggestionKind::View,
+            &["EMP_V"],
+        ),
+        (
+            MariaDB,
             "DROP VIEW IF EXISTS |",
             ExpectedObjectSuggestionKind::View,
             &["EMP_V"],
@@ -62342,7 +63189,19 @@ fn object_kind_matrix_final_suggestions_stay_within_expected_family() {
             &["EMP_V"],
         ),
         (
+            MariaDB,
+            "DROP VIEW emp_v, |",
+            ExpectedObjectSuggestionKind::View,
+            &["EMP_V"],
+        ),
+        (
             MySQL,
+            "DROP VIEW IF EXISTS emp_v, |",
+            ExpectedObjectSuggestionKind::View,
+            &["EMP_V"],
+        ),
+        (
+            MariaDB,
             "DROP VIEW IF EXISTS emp_v, |",
             ExpectedObjectSuggestionKind::View,
             &["EMP_V"],
@@ -62354,7 +63213,19 @@ fn object_kind_matrix_final_suggestions_stay_within_expected_family() {
             &["CALC_TOTAL"],
         ),
         (
+            MariaDB,
+            "SHOW CREATE FUNCTION |",
+            ExpectedObjectSuggestionKind::Function,
+            &["CALC_TOTAL"],
+        ),
+        (
             MySQL,
+            "ALTER FUNCTION |",
+            ExpectedObjectSuggestionKind::Function,
+            &["CALC_TOTAL"],
+        ),
+        (
+            MariaDB,
             "ALTER FUNCTION |",
             ExpectedObjectSuggestionKind::Function,
             &["CALC_TOTAL"],
@@ -62366,7 +63237,19 @@ fn object_kind_matrix_final_suggestions_stay_within_expected_family() {
             &["CALC_TOTAL"],
         ),
         (
+            MariaDB,
+            "DROP FUNCTION |",
+            ExpectedObjectSuggestionKind::Function,
+            &["CALC_TOTAL"],
+        ),
+        (
             MySQL,
+            "DROP FUNCTION IF EXISTS |",
+            ExpectedObjectSuggestionKind::Function,
+            &["CALC_TOTAL"],
+        ),
+        (
+            MariaDB,
             "DROP FUNCTION IF EXISTS |",
             ExpectedObjectSuggestionKind::Function,
             &["CALC_TOTAL"],
@@ -62378,7 +63261,19 @@ fn object_kind_matrix_final_suggestions_stay_within_expected_family() {
             &["RUN_JOB"],
         ),
         (
+            MariaDB,
+            "SHOW CREATE PROCEDURE |",
+            ExpectedObjectSuggestionKind::Procedure,
+            &["RUN_JOB"],
+        ),
+        (
             MySQL,
+            "ALTER PROCEDURE |",
+            ExpectedObjectSuggestionKind::Procedure,
+            &["RUN_JOB"],
+        ),
+        (
+            MariaDB,
             "ALTER PROCEDURE |",
             ExpectedObjectSuggestionKind::Procedure,
             &["RUN_JOB"],
@@ -62390,7 +63285,19 @@ fn object_kind_matrix_final_suggestions_stay_within_expected_family() {
             &["RUN_JOB"],
         ),
         (
+            MariaDB,
+            "DROP PROCEDURE |",
+            ExpectedObjectSuggestionKind::Procedure,
+            &["RUN_JOB"],
+        ),
+        (
             MySQL,
+            "DROP PROCEDURE IF EXISTS |",
+            ExpectedObjectSuggestionKind::Procedure,
+            &["RUN_JOB"],
+        ),
+        (
+            MariaDB,
             "DROP PROCEDURE IF EXISTS |",
             ExpectedObjectSuggestionKind::Procedure,
             &["RUN_JOB"],
@@ -62402,7 +63309,19 @@ fn object_kind_matrix_final_suggestions_stay_within_expected_family() {
             &["BI_EMP"],
         ),
         (
+            MariaDB,
+            "SHOW CREATE TRIGGER |",
+            ExpectedObjectSuggestionKind::Trigger,
+            &["BI_EMP"],
+        ),
+        (
             MySQL,
+            "DROP TRIGGER |",
+            ExpectedObjectSuggestionKind::Trigger,
+            &["BI_EMP"],
+        ),
+        (
+            MariaDB,
             "DROP TRIGGER |",
             ExpectedObjectSuggestionKind::Trigger,
             &["BI_EMP"],
@@ -62414,7 +63333,19 @@ fn object_kind_matrix_final_suggestions_stay_within_expected_family() {
             &["BI_EMP"],
         ),
         (
+            MariaDB,
+            "DROP TRIGGER IF EXISTS |",
+            ExpectedObjectSuggestionKind::Trigger,
+            &["BI_EMP"],
+        ),
+        (
             MySQL,
+            "ALTER TRIGGER |",
+            ExpectedObjectSuggestionKind::Trigger,
+            &["BI_EMP"],
+        ),
+        (
+            MariaDB,
             "ALTER TRIGGER |",
             ExpectedObjectSuggestionKind::Trigger,
             &["BI_EMP"],
@@ -62426,7 +63357,19 @@ fn object_kind_matrix_final_suggestions_stay_within_expected_family() {
             &["IDX_EMP_NAME"],
         ),
         (
+            MariaDB,
+            "DROP INDEX |",
+            ExpectedObjectSuggestionKind::Index,
+            &["IDX_EMP_NAME"],
+        ),
+        (
             MySQL,
+            "SHOW CREATE EVENT |",
+            ExpectedObjectSuggestionKind::Event,
+            &["CLEANUP_EVENT"],
+        ),
+        (
+            MariaDB,
             "SHOW CREATE EVENT |",
             ExpectedObjectSuggestionKind::Event,
             &["CLEANUP_EVENT"],
@@ -62438,7 +63381,19 @@ fn object_kind_matrix_final_suggestions_stay_within_expected_family() {
             &["CLEANUP_EVENT"],
         ),
         (
+            MariaDB,
+            "ALTER EVENT |",
+            ExpectedObjectSuggestionKind::Event,
+            &["CLEANUP_EVENT"],
+        ),
+        (
             MySQL,
+            "ALTER DEFINER root EVENT |",
+            ExpectedObjectSuggestionKind::Event,
+            &["CLEANUP_EVENT"],
+        ),
+        (
+            MariaDB,
             "ALTER DEFINER root EVENT |",
             ExpectedObjectSuggestionKind::Event,
             &["CLEANUP_EVENT"],
@@ -62450,7 +63405,19 @@ fn object_kind_matrix_final_suggestions_stay_within_expected_family() {
             &["CLEANUP_EVENT"],
         ),
         (
+            MariaDB,
+            "ALTER DEFINER = root EVENT |",
+            ExpectedObjectSuggestionKind::Event,
+            &["CLEANUP_EVENT"],
+        ),
+        (
             MySQL,
+            "DROP EVENT |",
+            ExpectedObjectSuggestionKind::Event,
+            &["CLEANUP_EVENT"],
+        ),
+        (
+            MariaDB,
             "DROP EVENT |",
             ExpectedObjectSuggestionKind::Event,
             &["CLEANUP_EVENT"],
@@ -62462,7 +63429,19 @@ fn object_kind_matrix_final_suggestions_stay_within_expected_family() {
             &["CLEANUP_EVENT"],
         ),
         (
+            MariaDB,
+            "DROP EVENT IF EXISTS |",
+            ExpectedObjectSuggestionKind::Event,
+            &["CLEANUP_EVENT"],
+        ),
+        (
             MySQL,
+            "SHOW CREATE USER |",
+            ExpectedObjectSuggestionKind::User,
+            &["APP_USER", "SCOTT"],
+        ),
+        (
+            MariaDB,
             "SHOW CREATE USER |",
             ExpectedObjectSuggestionKind::User,
             &["APP_USER", "SCOTT"],
@@ -63554,37 +64533,133 @@ fn mysql_family_statement_value_slots_do_not_offer_object_catalog() {
                 "HELP scott.|",
                 "SHOW ENGINE |",
                 "SHOW ENGINE innodb |",
+                "SHOW BINLOG EVENTS IN |",
+                "SHOW BINLOG EVENTS IN binlog_000001 |",
+                "SHOW BINLOG EVENTS FROM |",
+                "SHOW BINLOG EVENTS FROM 4 |",
+                "SHOW BINLOG EVENTS LIMIT |",
+                "SHOW BINLOG EVENTS LIMIT 10, |",
+                "SHOW BINLOG EVENTS LIMIT 10, 20 |",
                 "SHOW ERRORS LIMIT |",
+                "SHOW ERRORS LIMIT 10 |",
                 "SHOW ERRORS LIMIT 10, |",
+                "SHOW ERRORS LIMIT 10, 20 |",
                 "SHOW WARNINGS LIMIT |",
+                "SHOW WARNINGS LIMIT 10 |",
                 "SHOW WARNINGS LIMIT 10, |",
+                "SHOW WARNINGS LIMIT 10, 20 |",
+                "SHOW PROFILE FOR QUERY |",
+                "SHOW PROFILE FOR QUERY 1 OFFSET |",
+                "SHOW PROFILE FOR QUERY 1 OFFSET 10 |",
+                "SHOW PROFILE LIMIT |",
+                "SHOW PROFILE LIMIT 10, |",
+                "SHOW PROFILE OFFSET |",
+                "SHOW PROFILE OFFSET 10 |",
+                "EXPLAIN FOR CONNECTION |",
+                "EXPLAIN FOR CONNECTION app|",
+                "EXPLAIN FOR CONNECTION scott.|",
+                "EXPLAIN FOR SCHEMA |",
+                "EXPLAIN FOR SCHEMA app|",
+                "EXPLAIN FOR SCHEMA scott.|",
+                "EXPLAIN FOR DATABASE |",
+                "EXPLAIN FOR DATABASE app|",
+                "EXPLAIN FOR DATABASE scott.|",
+                "EXPLAIN FORMAT = JSON FOR DATABASE |",
+                "EXPLAIN FORMAT = JSON FOR DATABASE app|",
+                "EXPLAIN FORMAT = JSON FOR DATABASE scott.|",
                 "KILL |",
                 "KILL QUERY |",
                 "KILL QUERY d|",
                 "KILL QUERY scott.|",
+                "KILL CONNECTION |",
+                "KILL CONNECTION d|",
+                "KILL CONNECTION scott.|",
+                "SIGNAL |",
                 "SIGNAL SQLSTATE |",
                 "SIGNAL SQLSTATE app|",
+                "SIGNAL SQLSTATE scott.|",
                 "SIGNAL SQLSTATE VALUE |",
+                "SIGNAL SQLSTATE VALUE app|",
                 "SIGNAL SQLSTATE VALUE scott.|",
+                "RESIGNAL |",
+                "RESIGNAL SQLSTATE |",
+                "RESIGNAL SQLSTATE app|",
+                "RESIGNAL SQLSTATE scott.|",
+                "RESIGNAL SQLSTATE VALUE |",
+                "RESIGNAL SQLSTATE VALUE app|",
+                "RESIGNAL SQLSTATE VALUE scott.|",
+                "SET PASSWORD TO RANDOM REPLACE |",
+                "SET PASSWORD TO RANDOM REPLACE app|",
+                "SET PASSWORD TO RANDOM REPLACE scott.|",
                 "SET CHARACTER SET |",
                 "SET CHARACTER SET app|",
+                "SET CHARACTER SET scott.|",
                 "SET CHARSET |",
+                "SET CHARSET app|",
+                "SET CHARSET scott.|",
                 "SET NAMES |",
                 "SET NAMES app|",
+                "SET NAMES scott.|",
                 "SET NAMES utf8mb4 COLLATE |",
+                "SET NAMES utf8mb4 COLLATE app|",
                 "SET NAMES utf8mb4 COLLATE scott.|",
                 "LOAD DATA INFILE |",
                 "LOAD DATA INFILE app|",
+                "LOAD DATA INFILE scott.|",
+                "LOAD DATA LOW_PRIORITY LOCAL INFILE |",
+                "LOAD DATA LOW_PRIORITY LOCAL INFILE app|",
+                "LOAD DATA LOW_PRIORITY LOCAL INFILE scott.|",
+                "LOAD DATA INFILE data_csv REPLACE |",
+                "LOAD DATA INFILE data_csv IGNORE |",
                 "LOAD DATA INFILE data_csv INTO TABLE emp CHARACTER SET |",
+                "LOAD DATA INFILE data_csv INTO TABLE emp CHARACTER SET app|",
+                "LOAD DATA INFILE data_csv INTO TABLE emp CHARACTER SET scott.|",
+                "LOAD DATA INFILE data_csv INTO TABLE emp FIELDS TERMINATED BY |",
                 "LOAD DATA INFILE data_csv INTO TABLE emp FIELDS TERMINATED BY app|",
+                "LOAD DATA INFILE data_csv INTO TABLE emp FIELDS TERMINATED BY scott.|",
+                "LOAD DATA INFILE data_csv INTO TABLE emp FIELDS ESCAPED BY |",
+                "LOAD DATA INFILE data_csv INTO TABLE emp FIELDS ESCAPED BY app|",
+                "LOAD DATA INFILE data_csv INTO TABLE emp FIELDS ESCAPED BY scott.|",
                 "LOAD DATA INFILE data_csv INTO TABLE emp SET ename = |",
+                "LOAD DATA INFILE data_csv INTO TABLE emp SET ename = app|",
                 "LOAD DATA INFILE data_csv INTO TABLE emp SET ename = scott.|",
+                "LOAD DATA INFILE data_csv INTO TABLE emp SET ename = val, sal = |",
+                "LOAD DATA INFILE data_csv INTO TABLE emp SET ename = val, sal = app|",
+                "LOAD DATA INFILE data_csv INTO TABLE emp SET ename = val, sal = scott.|",
+                "LOAD XML INFILE |",
+                "LOAD XML INFILE app|",
+                "LOAD XML INFILE scott.|",
+                "LOAD XML INFILE data_xml INTO TABLE emp CHARACTER SET |",
+                "LOAD XML INFILE data_xml INTO TABLE emp CHARACTER SET app|",
+                "LOAD XML INFILE data_xml INTO TABLE emp CHARACTER SET scott.|",
+                "LOAD XML INFILE data_xml INTO TABLE emp ROWS IDENTIFIED BY |",
+                "LOAD XML INFILE data_xml INTO TABLE emp ROWS IDENTIFIED BY app|",
+                "LOAD XML INFILE data_xml INTO TABLE emp ROWS IDENTIFIED BY scott.|",
                 "SELECT empno INTO OUTFILE |",
                 "SELECT empno INTO OUTFILE app|",
+                "SELECT empno INTO OUTFILE scott.|",
+                "SELECT empno INTO DUMPFILE |",
+                "SELECT empno INTO DUMPFILE app|",
+                "SELECT empno INTO DUMPFILE scott.|",
                 "SELECT empno INTO OUTFILE data_txt CHARACTER SET |",
+                "SELECT empno INTO OUTFILE data_txt CHARACTER SET app|",
+                "SELECT empno INTO OUTFILE data_txt CHARACTER SET scott.|",
+                "SELECT empno INTO OUTFILE data_txt FIELDS TERMINATED BY |",
+                "SELECT empno INTO OUTFILE data_txt FIELDS TERMINATED BY app|",
                 "SELECT empno INTO OUTFILE data_txt FIELDS TERMINATED BY scott.|",
                 "XA START |",
                 "XA START app|",
+                "XA START scott.|",
+                "XA START xid |",
+                "XA END |",
+                "XA END app|",
+                "XA END scott.|",
+                "XA PREPARE |",
+                "XA PREPARE app|",
+                "XA PREPARE scott.|",
+                "XA COMMIT |",
+                "XA COMMIT app|",
+                "XA COMMIT scott.|",
                 "XA COMMIT xid |",
             ][..],
         ),
@@ -64277,10 +65352,60 @@ fn transaction_and_lock_value_slots_do_not_offer_object_catalog() {
         (MariaDB, "SET TRANSACTION READ WRITE n|"),
         (MariaDB, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED |"),
         (MariaDB, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED n|"),
+        (
+            MariaDB,
+            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ |",
+        ),
+        (
+            MariaDB,
+            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ n|",
+        ),
+        (
+            MariaDB,
+            "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED |",
+        ),
+        (
+            MariaDB,
+            "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED n|",
+        ),
+        (MariaDB, "SET GLOBAL TRANSACTION READ ONLY |"),
+        (MariaDB, "SET GLOBAL TRANSACTION READ ONLY n|"),
+        (MariaDB, "SET SESSION TRANSACTION READ WRITE |"),
+        (MariaDB, "SET SESSION TRANSACTION READ WRITE n|"),
+        (
+            MariaDB,
+            "SET GLOBAL TRANSACTION ISOLATION LEVEL READ COMMITTED |",
+        ),
+        (
+            MariaDB,
+            "SET GLOBAL TRANSACTION ISOLATION LEVEL READ COMMITTED n|",
+        ),
+        (
+            MariaDB,
+            "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ |",
+        ),
+        (
+            MariaDB,
+            "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ n|",
+        ),
+        (
+            MariaDB,
+            "SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED |",
+        ),
+        (
+            MariaDB,
+            "SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED n|",
+        ),
         (MariaDB, "START TRANSACTION READ ONLY |"),
         (MariaDB, "START TRANSACTION READ ONLY n|"),
+        (MariaDB, "START TRANSACTION READ WRITE |"),
+        (MariaDB, "START TRANSACTION READ WRITE n|"),
         (MariaDB, "START TRANSACTION WITH CONSISTENT SNAPSHOT |"),
         (MariaDB, "START TRANSACTION WITH CONSISTENT SNAPSHOT n|"),
+        (MariaDB, "LOCK TABLES emp AS |"),
+        (MariaDB, "LOCK TABLES emp AS app|"),
+        (MariaDB, "LOCK TABLES emp AS scott.|"),
+        (MariaDB, "LOCK TABLES emp AS read|"),
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
         assert_eq!(
@@ -64318,7 +65443,7 @@ fn transaction_and_lock_value_slots_do_not_offer_object_catalog() {
 
 #[test]
 fn transaction_and_lock_value_slots_reject_expression_keyword_and_function_noise() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
 
@@ -64337,6 +65462,11 @@ fn transaction_and_lock_value_slots_reject_expression_keyword_and_function_noise
         (MySQL, "ROLLBACK TO SAVEPOINT n|"),
         (MySQL, "RELEASE SAVEPOINT n|"),
         (MySQL, "LOCK TABLES emp AS n|"),
+        (MariaDB, "SAVEPOINT n|"),
+        (MariaDB, "ROLLBACK TO n|"),
+        (MariaDB, "ROLLBACK TO SAVEPOINT n|"),
+        (MariaDB, "RELEASE SAVEPOINT n|"),
+        (MariaDB, "LOCK TABLES emp AS n|"),
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
         assert_eq!(
@@ -64376,7 +65506,7 @@ fn transaction_and_lock_value_slots_reject_expression_keyword_and_function_noise
 
 #[test]
 fn completed_transaction_option_tails_do_not_reoffer_keywords_or_catalog() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     for (db, sql) in [
         (Oracle, "COMMIT WRITE WAIT IMMEDIATE |"),
@@ -64436,6 +65566,60 @@ fn completed_transaction_option_tails_do_not_reoffer_keywords_or_catalog() {
             MySQL,
             "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED scott.|",
         ),
+        (MariaDB, "SET TRANSACTION READ WRITE |"),
+        (MariaDB, "SET TRANSACTION READ WRITE n|"),
+        (MariaDB, "SET TRANSACTION READ WRITE scott.|"),
+        (MariaDB, "SET TRANSACTION READ ONLY |"),
+        (MariaDB, "SET TRANSACTION READ ONLY n|"),
+        (MariaDB, "SET TRANSACTION READ ONLY scott.|"),
+        (
+            MariaDB,
+            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE |",
+        ),
+        (
+            MariaDB,
+            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE n|",
+        ),
+        (
+            MariaDB,
+            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE scott.|",
+        ),
+        (
+            MariaDB,
+            "SET TRANSACTION ISOLATION LEVEL READ COMMITTED |",
+        ),
+        (
+            MariaDB,
+            "SET TRANSACTION ISOLATION LEVEL READ COMMITTED n|",
+        ),
+        (
+            MariaDB,
+            "SET TRANSACTION ISOLATION LEVEL READ COMMITTED scott.|",
+        ),
+        (
+            MariaDB,
+            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ |",
+        ),
+        (
+            MariaDB,
+            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ n|",
+        ),
+        (
+            MariaDB,
+            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ scott.|",
+        ),
+        (
+            MariaDB,
+            "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED |",
+        ),
+        (
+            MariaDB,
+            "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED n|",
+        ),
+        (
+            MariaDB,
+            "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED scott.|",
+        ),
         (MySQL, "SET GLOBAL TRANSACTION READ ONLY |"),
         (MySQL, "SET GLOBAL TRANSACTION READ ONLY n|"),
         (MySQL, "SET GLOBAL TRANSACTION READ ONLY scott.|"),
@@ -64476,6 +65660,48 @@ fn completed_transaction_option_tails_do_not_reoffer_keywords_or_catalog() {
         ),
         (
             MySQL,
+            "SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED scott.|",
+        ),
+        (MariaDB, "SET GLOBAL TRANSACTION READ ONLY |"),
+        (MariaDB, "SET GLOBAL TRANSACTION READ ONLY n|"),
+        (MariaDB, "SET GLOBAL TRANSACTION READ ONLY scott.|"),
+        (MariaDB, "SET SESSION TRANSACTION READ WRITE |"),
+        (MariaDB, "SET SESSION TRANSACTION READ WRITE n|"),
+        (MariaDB, "SET SESSION TRANSACTION READ WRITE scott.|"),
+        (
+            MariaDB,
+            "SET GLOBAL TRANSACTION ISOLATION LEVEL READ COMMITTED |",
+        ),
+        (
+            MariaDB,
+            "SET GLOBAL TRANSACTION ISOLATION LEVEL READ COMMITTED n|",
+        ),
+        (
+            MariaDB,
+            "SET GLOBAL TRANSACTION ISOLATION LEVEL READ COMMITTED scott.|",
+        ),
+        (
+            MariaDB,
+            "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ |",
+        ),
+        (
+            MariaDB,
+            "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ n|",
+        ),
+        (
+            MariaDB,
+            "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ scott.|",
+        ),
+        (
+            MariaDB,
+            "SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED |",
+        ),
+        (
+            MariaDB,
+            "SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED n|",
+        ),
+        (
+            MariaDB,
             "SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED scott.|",
         ),
     ] {
@@ -64528,14 +65754,19 @@ fn oracle_ddl_value_slots_do_not_offer_object_catalog() {
         "COMMENT ON INDEXTYPE text_itype IS scott.|",
         "CREATE USER u IDENTIFIED BY |",
         "CREATE USER u IDENTIFIED BY app|",
+        "CREATE USER u IDENTIFIED BY scott.|",
         "ALTER USER u IDENTIFIED BY |",
         "ALTER USER u IDENTIFIED BY app|",
+        "ALTER USER u IDENTIFIED BY scott.|",
         "CREATE DIRECTORY d AS |",
         "CREATE DIRECTORY d AS app|",
+        "CREATE DIRECTORY d AS scott.|",
         "CREATE TABLESPACE ts DATAFILE |",
         "CREATE TABLESPACE ts DATAFILE app|",
+        "CREATE TABLESPACE ts DATAFILE scott.|",
         "ALTER TABLESPACE ts ADD DATAFILE |",
         "ALTER TABLESPACE ts ADD DATAFILE app|",
+        "ALTER TABLESPACE ts ADD DATAFILE scott.|",
         "CREATE DATABASE LINK l CONNECT TO |",
         "CREATE DATABASE LINK l CONNECT TO app|",
         "CREATE DATABASE LINK l CONNECT TO u IDENTIFIED BY |",
@@ -64560,8 +65791,11 @@ fn oracle_ddl_value_slots_do_not_offer_object_catalog() {
         "ALTER INDEX idx_emp REBUILD TABLESPACE app|",
         "ALTER INDEX idx_emp REBUILD TABLESPACE scott.|",
         "ALTER INDEX idx_emp REBUILD PCTFREE |",
+        "ALTER INDEX idx_emp REBUILD PCTFREE app|",
+        "ALTER INDEX idx_emp REBUILD PCTFREE scott.|",
         "ALTER INDEX idx_emp REBUILD STORAGE (INITIAL |",
         "ALTER INDEX idx_emp REBUILD STORAGE (INITIAL app|",
+        "ALTER INDEX idx_emp REBUILD STORAGE (INITIAL scott.|",
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
         assert_eq!(
@@ -64620,6 +65854,12 @@ fn oracle_ddl_value_slots_reject_invalid_prefix_noise() {
         "CREATE DIRECTORY d AS n|",
         "CREATE TABLESPACE ts DATAFILE n|",
         "ALTER TABLESPACE ts ADD DATAFILE n|",
+        "CREATE DATABASE LINK l CONNECT TO u IDENTIFIED BY scott.n|",
+        "CREATE DATABASE LINK l USING scott.n|",
+        "CREATE LIBRARY lib AS scott.n|",
+        "CREATE OR REPLACE LIBRARY lib AS scott.n|",
+        "CREATE JAVA SOURCE NAMED src AS scott.n|",
+        "CREATE OR REPLACE JAVA SOURCE NAMED src AS scott.n|",
         "CREATE DATABASE LINK l CONNECT TO n|",
         "CREATE DATABASE LINK l CONNECT TO u IDENTIFIED BY n|",
         "CREATE DATABASE LINK l USING n|",
@@ -64630,6 +65870,7 @@ fn oracle_ddl_value_slots_reject_invalid_prefix_noise() {
         "ALTER INDEX idx_emp REBUILD TABLESPACE n|",
         "ALTER INDEX idx_emp REBUILD PCTFREE n|",
         "ALTER INDEX idx_emp REBUILD STORAGE (INITIAL n|",
+        "ALTER INDEX idx_emp REBUILD STORAGE (INITIAL scott.n|",
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
         assert_eq!(
@@ -64672,16 +65913,21 @@ fn oracle_admin_tail_value_slots_do_not_offer_object_catalog() {
         "ANALYZE TABLE emp COMPUTE STATISTICS |",
         "ANALYZE TABLE emp ESTIMATE STATISTICS SAMPLE |",
         "ANALYZE TABLE emp ESTIMATE STATISTICS SAMPLE app|",
+        "ANALYZE TABLE emp ESTIMATE STATISTICS SAMPLE scott.|",
         "ANALYZE INDEX emp_idx VALIDATE STRUCTURE |",
         "ANALYZE CLUSTER emp_cluster LIST CHAINED ROWS |",
         "FLASHBACK DATABASE TO SCN |",
         "FLASHBACK DATABASE TO SCN app|",
+        "FLASHBACK DATABASE TO SCN scott.|",
         "FLASHBACK DATABASE TO TIMESTAMP |",
         "FLASHBACK DATABASE TO TIMESTAMP app|",
+        "FLASHBACK DATABASE TO TIMESTAMP scott.|",
         "FLASHBACK DATABASE TO RESTORE POINT |",
         "FLASHBACK DATABASE TO RESTORE POINT app|",
+        "FLASHBACK DATABASE TO RESTORE POINT scott.|",
         "FLASHBACK TABLE emp TO BEFORE DROP RENAME TO |",
         "FLASHBACK TABLE emp TO BEFORE DROP RENAME TO app|",
+        "FLASHBACK TABLE emp TO BEFORE DROP RENAME TO scott.|",
         "PURGE RECYCLEBIN |",
         "PURGE TABLESPACE users |",
         "PURGE TABLE emp |",
@@ -67783,20 +69029,57 @@ fn prefixed_new_name_slots_do_not_offer_catalog_or_keywords() {
         (MariaDB, "CREATE TABLE app|"),
         (MariaDB, "CREATE TABLE IF NOT EXISTS app|"),
         (MariaDB, "CREATE TABLE scott.|"),
+        (MariaDB, "CREATE TEMPORARY TABLE app|"),
+        (MariaDB, "CREATE TEMPORARY TABLE scott.|"),
         (MariaDB, "CREATE INDEX app|"),
+        (MariaDB, "CREATE INDEX scott.|"),
+        (MariaDB, "CREATE UNIQUE INDEX app|"),
+        (MariaDB, "CREATE FULLTEXT INDEX app|"),
+        (MariaDB, "CREATE SPATIAL INDEX app|"),
+        (MariaDB, "CREATE TRIGGER app|"),
+        (MariaDB, "CREATE DEFINER root TRIGGER app|"),
+        (MariaDB, "CREATE DEFINER = root TRIGGER app|"),
+        (MariaDB, "CREATE TRIGGER scott.|"),
         (MariaDB, "CREATE FUNCTION app|"),
         (MariaDB, "CREATE DEFINER root FUNCTION app|"),
+        (MariaDB, "CREATE DEFINER = root FUNCTION app|"),
+        (MariaDB, "CREATE FUNCTION IF NOT EXISTS app|"),
+        (MariaDB, "CREATE FUNCTION scott.|"),
         (MariaDB, "CREATE PROCEDURE app|"),
         (MariaDB, "CREATE DEFINER root PROCEDURE app|"),
+        (MariaDB, "CREATE DEFINER = root PROCEDURE app|"),
+        (MariaDB, "CREATE PROCEDURE IF NOT EXISTS app|"),
+        (MariaDB, "CREATE PROCEDURE scott.|"),
         (MariaDB, "CREATE EVENT app|"),
         (MariaDB, "CREATE DEFINER root EVENT app|"),
+        (MariaDB, "CREATE DEFINER = root EVENT app|"),
+        (MariaDB, "CREATE EVENT IF NOT EXISTS app|"),
+        (MariaDB, "CREATE DATABASE app|"),
+        (MariaDB, "CREATE DATABASE IF NOT EXISTS app|"),
+        (MariaDB, "CREATE SCHEMA app|"),
+        (MariaDB, "CREATE SCHEMA IF NOT EXISTS app|"),
+        (MariaDB, "CREATE LOGFILE GROUP app|"),
+        (MariaDB, "CREATE SERVER app|"),
+        (MariaDB, "CREATE RESOURCE GROUP app|"),
         (MariaDB, "CREATE USER app|"),
+        (MariaDB, "CREATE USER scott.|"),
+        (MariaDB, "CREATE USER alice, app|"),
+        (MariaDB, "CREATE USER alice, scott.|"),
+        (MariaDB, "CREATE USER alice IDENTIFIED BY 'secret', app|"),
         (MariaDB, "CREATE ROLE app|"),
+        (MariaDB, "CREATE ROLE scott.|"),
+        (MariaDB, "CREATE ROLE report_reader, app|"),
+        (MariaDB, "CREATE ROLE report_reader, scott.|"),
         (MariaDB, "RENAME TABLE emp TO app|"),
+        (MariaDB, "RENAME TABLE emp TO emp2, dept TO app|"),
         (MariaDB, "RENAME USER alice TO app|"),
+        (MariaDB, "RENAME USER alice TO bob, scott TO app|"),
         (MariaDB, "ALTER TABLE emp RENAME TO app|"),
         (MariaDB, "ALTER TABLE emp RENAME COLUMN old_col TO app|"),
+        (MariaDB, "ALTER TABLE emp RENAME INDEX old_idx TO app|"),
+        (MariaDB, "ALTER TABLE emp RENAME KEY old_idx TO app|"),
         (MariaDB, "ALTER EVENT ev RENAME TO app|"),
+        (MariaDB, "ALTER TABLESPACE ts RENAME TO app|"),
         (MySQL, "CREATE DATABASE app|"),
         (MySQL, "CREATE DATABASE IF NOT EXISTS app|"),
         (MySQL, "CREATE SCHEMA app|"),
@@ -67919,13 +69202,26 @@ fn prefixed_new_name_slots_do_not_offer_catalog_or_keywords() {
         (MySQL, "ALTER EVENT ev RENAME TO n|"),
         (MariaDB, "CREATE TABLE n|"),
         (MariaDB, "CREATE TABLE IF NOT EXISTS n|"),
+        (MariaDB, "CREATE TEMPORARY TABLE n|"),
         (MariaDB, "CREATE INDEX n|"),
+        (MariaDB, "CREATE UNIQUE INDEX n|"),
+        (MariaDB, "CREATE FULLTEXT INDEX n|"),
+        (MariaDB, "CREATE SPATIAL INDEX n|"),
+        (MariaDB, "CREATE TRIGGER n|"),
+        (MariaDB, "CREATE DEFINER root TRIGGER n|"),
         (MariaDB, "CREATE FUNCTION n|"),
         (MariaDB, "CREATE DEFINER root FUNCTION n|"),
+        (MariaDB, "CREATE FUNCTION IF NOT EXISTS n|"),
         (MariaDB, "CREATE PROCEDURE n|"),
         (MariaDB, "CREATE DEFINER root PROCEDURE n|"),
+        (MariaDB, "CREATE PROCEDURE IF NOT EXISTS n|"),
+        (MariaDB, "CREATE DATABASE n|"),
+        (MariaDB, "CREATE DATABASE IF NOT EXISTS n|"),
+        (MariaDB, "CREATE SCHEMA n|"),
+        (MariaDB, "CREATE SCHEMA IF NOT EXISTS n|"),
         (MariaDB, "CREATE EVENT n|"),
         (MariaDB, "CREATE DEFINER root EVENT n|"),
+        (MariaDB, "CREATE EVENT IF NOT EXISTS n|"),
         (MariaDB, "CREATE USER n|"),
         (MariaDB, "CREATE ROLE n|"),
         (MariaDB, "RENAME TABLE emp TO n|"),
@@ -68031,19 +69327,30 @@ fn empty_new_name_slots_do_not_offer_catalog() {
         (MySQL, "ALTER TABLE emp RENAME INDEX old_idx TO |"),
         (MariaDB, "CREATE TABLE |"),
         (MariaDB, "CREATE TABLE IF NOT EXISTS |"),
+        (MariaDB, "CREATE TEMPORARY TABLE |"),
         (MariaDB, "CREATE INDEX |"),
         (MariaDB, "CREATE FUNCTION |"),
         (MariaDB, "CREATE DEFINER root FUNCTION |"),
+        (MariaDB, "CREATE DEFINER = root FUNCTION |"),
+        (MariaDB, "CREATE FUNCTION IF NOT EXISTS |"),
         (MariaDB, "CREATE PROCEDURE |"),
         (MariaDB, "CREATE DEFINER root PROCEDURE |"),
+        (MariaDB, "CREATE DEFINER = root PROCEDURE |"),
+        (MariaDB, "CREATE PROCEDURE IF NOT EXISTS |"),
         (MariaDB, "CREATE EVENT |"),
         (MariaDB, "CREATE DEFINER root EVENT |"),
+        (MariaDB, "CREATE DEFINER = root EVENT |"),
+        (MariaDB, "CREATE EVENT IF NOT EXISTS |"),
+        (MariaDB, "CREATE DEFINER root TRIGGER |"),
+        (MariaDB, "CREATE DEFINER = root TRIGGER |"),
         (MariaDB, "CREATE USER |"),
         (MariaDB, "CREATE ROLE |"),
         (MariaDB, "RENAME TABLE emp TO |"),
+        (MariaDB, "RENAME TABLE emp TO emp2, dept TO |"),
         (MariaDB, "RENAME USER alice TO |"),
         (MariaDB, "ALTER TABLE emp RENAME TO |"),
         (MariaDB, "ALTER TABLE emp RENAME COLUMN old_col TO |"),
+        (MariaDB, "ALTER TABLE emp RENAME INDEX old_idx TO |"),
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
         assert_eq!(
@@ -69311,7 +70618,7 @@ fn alias_column_list_final_suggestions_stay_on_projection_columns() {
 
 #[test]
 fn out_of_scope_qualified_relation_does_not_offer_catalog_columns() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     let contains = |values: &[String], needle: &str| {
         values
@@ -69319,7 +70626,7 @@ fn out_of_scope_qualified_relation_does_not_offer_catalog_columns() {
             .any(|value| value.eq_ignore_ascii_case(needle))
     };
 
-    for db in [Oracle, MySQL] {
+    for db in [Oracle, MySQL, MariaDB] {
         for sql in [
             "SELECT dept.| FROM emp",
             "SELECT dept.d| FROM emp",
