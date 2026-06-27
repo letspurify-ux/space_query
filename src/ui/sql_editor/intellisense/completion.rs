@@ -1079,6 +1079,21 @@ fn oracle_storage_completion_enabled_for_db_type(db_type: Option<crate::db::Data
     }
 }
 
+fn oracle_on_duplicate_completion_enabled_for_db_type(
+    db_type: Option<crate::db::DatabaseType>,
+) -> bool {
+    use crate::db::DatabaseType;
+
+    let Some(db_type) = db_type else {
+        return false;
+    };
+    match db_type {
+        DatabaseType::Oracle => true,
+        DatabaseType::MySQL => false,
+        DatabaseType::MariaDB => false,
+    }
+}
+
 fn order_by_sort_modifier_keywords(
     slot: OrderBySortModifierSlot,
     db_type: Option<crate::db::DatabaseType>,
@@ -1131,10 +1146,16 @@ fn window_order_by_sort_modifier_keywords(
                 &["NULLS", "ROWS", "RANGE", "GROUPS"]
             }
         }
-        WindowOrderBySortModifierSlot::AfterNulls => &["FIRST", "LAST"],
+        WindowOrderBySortModifierSlot::AfterNulls => {
+            if mysql {
+                &[]
+            } else {
+                &["FIRST", "LAST"]
+            }
+        }
         WindowOrderBySortModifierSlot::AfterNullOrdering => {
             if mysql {
-                &["ROWS", "RANGE"]
+                &[]
             } else {
                 &["ROWS", "RANGE", "GROUPS"]
             }
@@ -6775,6 +6796,29 @@ impl SqlEditorWidget {
             || Self::cursor_is_at_mysql_on_duplicate_after_on_tail(tokens, end, db_type)
     }
 
+    fn cursor_is_at_oracle_mysql_on_duplicate_tail(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if !oracle_on_duplicate_completion_enabled_for_db_type(db_type)
+            || !Self::top_level_values_clause_present_before(tokens, end)
+        {
+            return false;
+        }
+        let words = Self::words_for_keyword_slot(tokens, end);
+        if !matches!(words.first().map(String::as_str), Some("INSERT")) {
+            return false;
+        }
+        if Self::top_level_word_pair_present_before(tokens, end, "ON", "DUPLICATE") {
+            return true;
+        }
+        matches!(
+            Self::previous_meaningful_words_upper(tokens, end, 1).as_slice(),
+            [on] if on == "ON"
+        )
+    }
+
     fn cursor_is_at_mysql_on_duplicate_after_on_tail(
         tokens: &[SqlToken],
         end: usize,
@@ -6808,6 +6852,21 @@ impl SqlEditorWidget {
             exclude_current_identifier_chain,
         );
         Self::cursor_is_at_mysql_on_duplicate_keyword_tail(tokens, end, db_type)
+    }
+
+    fn cursor_is_at_oracle_mysql_on_duplicate_tail_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::cursor_is_at_oracle_mysql_on_duplicate_tail(tokens, end, db_type)
     }
 
     fn cursor_is_after_complete_mysql_on_duplicate_assignment_tail(
@@ -9395,6 +9454,34 @@ impl SqlEditorWidget {
             return true;
         }
 
+        if Self::is_mysql_oracle_only_explain_plan_option_slot(&words) {
+            return true;
+        }
+
+        if Self::is_mysql_oracle_only_session_system_parameter_slot(&words) {
+            return true;
+        }
+
+        if Self::is_mysql_oracle_only_database_admin_slot(&words) {
+            return true;
+        }
+
+        if Self::is_mysql_oracle_only_user_option_slot(&words) {
+            return true;
+        }
+
+        if Self::is_mysql_oracle_only_tablespace_value_slot(&words) {
+            return true;
+        }
+
+        if Self::is_mysql_oracle_only_sequence_value_slot(&words) {
+            return true;
+        }
+
+        if Self::is_mysql_oracle_only_physical_option_value_slot(&words) {
+            return true;
+        }
+
         if Self::is_mysql_oracle_only_type_package_cluster_or_rollback_slot(&words) {
             return true;
         }
@@ -9500,6 +9587,203 @@ impl SqlEditorWidget {
             words.first().map(String::as_str),
             Some("AUDIT" | "NOAUDIT")
         )
+    }
+
+    fn is_mysql_oracle_only_explain_plan_option_slot(words: &[String]) -> bool {
+        if !matches!(
+            words.get(0..2),
+            Some([explain, plan]) if explain == "EXPLAIN" && plan == "PLAN"
+        ) {
+            return false;
+        }
+        words
+            .iter()
+            .skip(2)
+            .any(|word| matches!(word.as_str(), "SET" | "INTO" | "FOR"))
+    }
+
+    fn is_mysql_oracle_only_session_system_parameter_slot(words: &[String]) -> bool {
+        matches!(
+            words.get(0..2),
+            Some([alter, scope])
+                if alter == "ALTER" && matches!(scope.as_str(), "SESSION" | "SYSTEM")
+        )
+    }
+
+    fn is_mysql_oracle_only_database_admin_slot(words: &[String]) -> bool {
+        match words {
+            [verb, restore, point, ..]
+                if matches!(verb.as_str(), "CREATE" | "DROP")
+                    && restore == "RESTORE"
+                    && point == "POINT" =>
+            {
+                true
+            }
+            [verb, pluggable, database, ..]
+                if matches!(verb.as_str(), "CREATE" | "ALTER" | "DROP")
+                    && pluggable == "PLUGGABLE"
+                    && database == "DATABASE" =>
+            {
+                true
+            }
+            [alter, database, action, ..]
+                if alter == "ALTER"
+                    && database == "DATABASE"
+                    && matches!(
+                        action.as_str(),
+                        "ADD"
+                            | "ARCHIVELOG"
+                            | "BACKUP"
+                            | "DATAFILE"
+                            | "MOUNT"
+                            | "NOARCHIVELOG"
+                            | "OPEN"
+                            | "RENAME"
+                            | "TEMPFILE"
+                    ) =>
+            {
+                true
+            }
+            [create, file_kind, ..]
+                if create == "CREATE" && matches!(file_kind.as_str(), "SPFILE" | "PFILE") =>
+            {
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn is_mysql_oracle_only_tablespace_value_slot(words: &[String]) -> bool {
+        let Some(verb) = words.first().map(String::as_str) else {
+            return false;
+        };
+        if !matches!(verb, "CREATE" | "ALTER") {
+            return false;
+        }
+
+        let Some((ty, words_after_type)) = Self::leading_ddl_object_type(words) else {
+            return false;
+        };
+        if ty != "TABLESPACE" || words_after_type == 0 {
+            return false;
+        }
+
+        let tail_start = words.len().saturating_sub(words_after_type);
+        let tail = words[tail_start..]
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        match (verb, tail.as_slice()) {
+            ("CREATE", [_name, file_keyword, ..])
+                if matches!(*file_keyword, "DATAFILE" | "TEMPFILE") =>
+            {
+                true
+            }
+            ("ALTER", [_name, "READ", ..]) => true,
+            ("ALTER", [_name, action, file_keyword, ..])
+                if matches!(*action, "ADD" | "DROP") && *file_keyword == "TEMPFILE" =>
+            {
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn is_mysql_oracle_only_user_option_slot(words: &[String]) -> bool {
+        let Some(verb) = words.first().map(String::as_str) else {
+            return false;
+        };
+        if !matches!(verb, "CREATE" | "ALTER") {
+            return false;
+        }
+
+        let Some((ty, words_after_type)) = Self::leading_ddl_object_type(words) else {
+            return false;
+        };
+        if ty != "USER" || words_after_type == 0 {
+            return false;
+        }
+
+        let tail_start = words.len().saturating_sub(words_after_type);
+        let tail = words[tail_start..]
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        match tail.as_slice() {
+            [_name, "IDENTIFIED", mode, ..] if matches!(*mode, "EXTERNALLY" | "GLOBALLY") => {
+                true
+            }
+            [_name, "DEFAULT", "TABLESPACE", ..]
+            | [_name, "TEMPORARY", "TABLESPACE", ..]
+            | [_name, "QUOTA", ..]
+            | [_name, "PROFILE", ..] => true,
+            _ => false,
+        }
+    }
+
+    fn is_mysql_oracle_only_sequence_value_slot(words: &[String]) -> bool {
+        let Some(verb) = words.first().map(String::as_str) else {
+            return false;
+        };
+        if !matches!(verb, "CREATE" | "ALTER") {
+            return false;
+        }
+
+        let Some((ty, words_after_type)) = Self::leading_ddl_object_type(words) else {
+            return false;
+        };
+        if ty != "SEQUENCE" || words_after_type == 0 {
+            return false;
+        }
+
+        let tail_start = words.len().saturating_sub(words_after_type);
+        let tail = words[tail_start..]
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        matches!(
+            tail.as_slice(),
+            [.., "START", "WITH"]
+                | [.., "START", "WITH", _]
+                | [.., "INCREMENT", "BY"]
+                | [.., "INCREMENT", "BY", _]
+                | [.., "MINVALUE"]
+                | [.., "MINVALUE", _]
+                | [.., "MAXVALUE"]
+                | [.., "MAXVALUE", _]
+                | [.., "CACHE"]
+                | [.., "CACHE", _]
+        )
+    }
+
+    fn is_mysql_oracle_only_physical_option_value_slot(words: &[String]) -> bool {
+        let Some(verb) = words.first().map(String::as_str) else {
+            return false;
+        };
+        if !matches!(verb, "CREATE" | "ALTER") {
+            return false;
+        }
+
+        let Some((ty, words_after_type)) = Self::leading_ddl_object_type(words) else {
+            return false;
+        };
+        if !matches!(ty, "TABLE" | "INDEX") || words_after_type == 0 {
+            return false;
+        }
+
+        words.iter().any(|word| {
+            matches!(
+                word.as_str(),
+                "TABLESPACE"
+                    | "PCTFREE"
+                    | "STORAGE"
+                    | "INITIAL"
+                    | "NEXT"
+                    | "MINEXTENTS"
+                    | "MAXEXTENTS"
+                    | "PCTINCREASE"
+            )
+        })
     }
 
     fn is_mysql_oracle_only_type_package_cluster_or_rollback_slot(words: &[String]) -> bool {
@@ -9744,16 +10028,18 @@ impl SqlEditorWidget {
             return false;
         };
 
-        toks[model_pos + 1..].iter().any(|token| {
-            matches!(
-                token,
-                SqlToken::Word(word)
-                    if matches!(
-                        word.to_ascii_uppercase().as_str(),
-                        "PARTITION" | "DIMENSION" | "MEASURES" | "RULES"
-                    )
-            )
-        })
+        let model_tail = &toks[model_pos + 1..];
+        model_tail.is_empty()
+            || model_tail.iter().any(|token| {
+                matches!(
+                    token,
+                    SqlToken::Word(word)
+                        if matches!(
+                            word.to_ascii_uppercase().as_str(),
+                            "PARTITION" | "DIMENSION" | "MEASURES" | "RULES"
+                        )
+                )
+            })
     }
 
     fn cursor_is_at_mysql_oracle_only_advanced_table_clause_slot_for_context(
@@ -12794,6 +13080,45 @@ impl SqlEditorWidget {
         Self::cursor_is_at_window_frame_keyword_only_position(tokens, end, db_type)
     }
 
+    fn cursor_is_at_mysql_unsupported_window_tail(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return false;
+        }
+        if matches!(
+            Self::window_order_by_sort_modifier_slot(tokens, end),
+            Some(
+                WindowOrderBySortModifierSlot::AfterNulls
+                    | WindowOrderBySortModifierSlot::AfterNullOrdering
+            )
+        ) {
+            return true;
+        }
+        Self::window_spec_top_level_parts(tokens, end).is_some_and(|parts| {
+            parts
+                .iter()
+                .any(|part| matches!(part.as_str(), "GROUPS" | "EXCLUDE"))
+        })
+    }
+
+    fn cursor_is_at_mysql_unsupported_window_tail_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::cursor_is_at_mysql_unsupported_window_tail(tokens, end, db_type)
+    }
+
     fn keep_dense_rank_top_level_words(tokens: &[SqlToken], end: usize) -> Option<Vec<String>> {
         let mut paren_stack: Vec<(usize, Option<String>)> = Vec::new();
         let mut last_word: Option<String> = None;
@@ -13277,7 +13602,48 @@ impl SqlEditorWidget {
     }
 
     fn mysql_tool_command_has_no_sql_argument(command: &str) -> bool {
-        matches!(command, "DELIMITER" | "SOURCE" | "USE" | "SHUTDOWN")
+        matches!(
+            command,
+            "ACCEPT"
+                | "ARCHIVE"
+                | "BREAK"
+                | "CLEAR"
+                | "COLUMN"
+                | "COMPUTE"
+                | "CONN"
+                | "CONNECT"
+                | "DEFINE"
+                | "DELIMITER"
+                | "DISC"
+                | "DISCONNECT"
+                | "EXIT"
+                | "GET"
+                | "HOST"
+                | "PASSWORD"
+                | "PASSW"
+                | "PASSWO"
+                | "PASSWOR"
+                | "PAUSE"
+                | "PROMPT"
+                | "QUIT"
+                | "R"
+                | "RECOVER"
+                | "RUN"
+                | "SAVE"
+                | "SHUTDOWN"
+                | "SOURCE"
+                | "SPOOL"
+                | "STARTUP"
+                | "STORE"
+                | "TIMING"
+                | "TTITLE"
+                | "BTITLE"
+                | "REPHEADER"
+                | "REPFOOTER"
+                | "UNDEFINE"
+                | "USE"
+                | "WHENEVER"
+        )
     }
 
     fn cursor_is_at_symbol_tool_argument_slot(toks: &[&SqlToken]) -> bool {
@@ -17019,6 +17385,210 @@ impl SqlEditorWidget {
         }
     }
 
+    fn cursor_is_at_oracle_mysql_only_utility_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return false;
+        }
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            deep_ctx.cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        let words = Self::words_for_keyword_slot(tokens, end);
+        Self::is_mysql_only_utility_slot(&words)
+    }
+
+    fn is_mysql_only_utility_slot(words: &[String]) -> bool {
+        match words {
+            [handler, ..] if handler == "HANDLER" => true,
+            [show, open, ..] if show == "SHOW" && open == "OPEN" => true,
+            [flush, ..] if flush == "FLUSH" => true,
+            [cache, index, ..] if cache == "CACHE" && index == "INDEX" => true,
+            [load, index, ..] if load == "LOAD" && index == "INDEX" => true,
+            [import, table, ..] if import == "IMPORT" && table == "TABLE" => true,
+            [lock, instance, ..] if lock == "LOCK" && instance == "INSTANCE" => true,
+            [unlock, instance, ..] if unlock == "UNLOCK" && instance == "INSTANCE" => true,
+            [clone, ..] if clone == "CLONE" => true,
+            [kill, ..] if kill == "KILL" => true,
+            [signal, ..] if matches!(signal.as_str(), "SIGNAL" | "RESIGNAL") => true,
+            [purge, target, ..]
+                if purge == "PURGE" && matches!(target.as_str(), "BINARY" | "MASTER") =>
+            {
+                true
+            }
+            [reset, target, ..]
+                if reset == "RESET"
+                    && matches!(
+                        target.as_str(),
+                        "BINARY" | "MASTER" | "PERSIST" | "REPLICA" | "SLAVE"
+                    ) =>
+            {
+                true
+            }
+            [verb, logfile, group, ..]
+                if matches!(verb.as_str(), "CREATE" | "ALTER" | "DROP")
+                    && logfile == "LOGFILE"
+                    && group == "GROUP" =>
+            {
+                true
+            }
+            [verb, resource, group, ..]
+                if matches!(verb.as_str(), "CREATE" | "ALTER" | "DROP" | "SET")
+                    && resource == "RESOURCE"
+                    && group == "GROUP" =>
+            {
+                true
+            }
+            [alter, instance, ..] if alter == "ALTER" && instance == "INSTANCE" => true,
+            [verb, server, ..]
+                if matches!(verb.as_str(), "CREATE" | "ALTER" | "DROP")
+                    && server == "SERVER" =>
+            {
+                true
+            }
+            [verb, target, ..]
+                if matches!(verb.as_str(), "INSTALL" | "UNINSTALL")
+                    && matches!(target.as_str(), "COMPONENT" | "PLUGIN") =>
+            {
+                true
+            }
+            [start_or_stop, group_replication, ..]
+                if matches!(start_or_stop.as_str(), "START" | "STOP")
+                    && group_replication == "GROUP_REPLICATION" =>
+            {
+                true
+            }
+            [start_or_stop, target, ..]
+                if matches!(start_or_stop.as_str(), "START" | "STOP")
+                    && matches!(target.as_str(), "REPLICA" | "SLAVE") =>
+            {
+                true
+            }
+            [change, target, ..]
+                if change == "CHANGE" && matches!(target.as_str(), "REPLICATION" | "MASTER") =>
+            {
+                true
+            }
+            [load, target, ..] if load == "LOAD" && matches!(target.as_str(), "DATA" | "XML") => {
+                true
+            }
+            [xa, ..] if xa == "XA" => true,
+            _ => false,
+        }
+    }
+
+    fn is_mysql_only_ddl_prefix_slot(words: &[String]) -> bool {
+        match words {
+            [verb, algorithm, ..]
+                if matches!(verb.as_str(), "CREATE" | "ALTER") && algorithm == "ALGORITHM" =>
+            {
+                true
+            }
+            [verb, definer, ..]
+                if matches!(verb.as_str(), "CREATE" | "ALTER") && definer == "DEFINER" =>
+            {
+                true
+            }
+            [verb, sql, ..]
+                if matches!(verb.as_str(), "CREATE" | "ALTER") && sql == "SQL" =>
+            {
+                true
+            }
+            [create, spatial, ..] if create == "CREATE" && spatial == "SPATIAL" => true,
+            _ => false,
+        }
+    }
+
+    fn cursor_is_at_oracle_mysql_only_ddl_prefix_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return false;
+        }
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            deep_ctx.cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        let words = Self::words_for_keyword_slot(tokens, end);
+        Self::is_mysql_only_ddl_prefix_slot(&words)
+    }
+
+    fn is_mysql_only_schema_database_admin_slot(words: &[String]) -> bool {
+        match words {
+            [create, object_type, if_kw, ..]
+                if create == "CREATE"
+                    && matches!(object_type.as_str(), "DATABASE" | "SCHEMA")
+                    && if_kw == "IF" =>
+            {
+                true
+            }
+            [drop, schema, ..] if drop == "DROP" && schema == "SCHEMA" => true,
+            [drop, database, if_kw, ..]
+                if drop == "DROP" && database == "DATABASE" && if_kw == "IF" =>
+            {
+                true
+            }
+            [alter, schema, ..] if alter == "ALTER" && schema == "SCHEMA" => true,
+            [create, object_type, _name, tail @ ..]
+                if create == "CREATE"
+                    && matches!(object_type.as_str(), "DATABASE" | "SCHEMA")
+                    && tail.iter().any(|word| {
+                        matches!(
+                            word.as_str(),
+                            "DEFAULT" | "CHARACTER" | "CHARSET" | "COLLATE" | "ENCRYPTION"
+                        )
+                    }) =>
+            {
+                true
+            }
+            [alter, object_type, _name, tail @ ..]
+                if alter == "ALTER"
+                    && matches!(object_type.as_str(), "DATABASE" | "SCHEMA")
+                    && tail.iter().any(|word| {
+                        matches!(
+                            word.as_str(),
+                            "DEFAULT"
+                                | "CHARACTER"
+                                | "CHARSET"
+                                | "COLLATE"
+                                | "ENCRYPTION"
+                                | "READ"
+                        )
+                    }) =>
+            {
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn cursor_is_at_oracle_mysql_only_schema_database_admin_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return false;
+        }
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            deep_ctx.cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        let words = Self::words_for_keyword_slot(tokens, end);
+        Self::is_mysql_only_schema_database_admin_slot(&words)
+    }
+
     fn cursor_is_at_mysql_handler_read_value_slot(tokens: &[SqlToken], end: usize) -> bool {
         let items = Self::meaningful_tokens_before(tokens, end)
             .into_iter()
@@ -17588,6 +18158,11 @@ impl SqlEditorWidget {
                 deep_ctx,
                 exclude_current_identifier_chain,
             )
+            || Self::cursor_is_at_oracle_mysql_style_recursive_cte_tail_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
             || Self::cursor_is_at_cte_body_open_paren_slot_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
@@ -17744,6 +18319,11 @@ impl SqlEditorWidget {
                 exclude_current_identifier_chain,
                 db_type,
             )
+            || Self::cursor_is_at_oracle_mysql_on_duplicate_tail_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
             || Self::cursor_is_after_complete_mysql_on_duplicate_assignment_tail_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
@@ -17784,6 +18364,21 @@ impl SqlEditorWidget {
                 db_type,
             )
             || Self::cursor_is_at_mysql_oracle_only_associate_statistics_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+            || Self::cursor_is_at_oracle_mysql_only_utility_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+            || Self::cursor_is_at_oracle_mysql_only_ddl_prefix_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+            || Self::cursor_is_at_oracle_mysql_only_schema_database_admin_slot_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
                 db_type,
@@ -17975,7 +18570,22 @@ impl SqlEditorWidget {
                 exclude_current_identifier_chain,
                 db_type,
             )
+            || Self::cursor_is_at_opposite_dialect_row_limiting_tail_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+            || Self::cursor_is_at_oracle_mysql_index_hint_tail_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
             || Self::cursor_is_at_window_frame_keyword_only_position_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+            || Self::cursor_is_at_mysql_unsupported_window_tail_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
                 db_type,
@@ -18296,6 +18906,11 @@ impl SqlEditorWidget {
                 exclude_current_identifier_chain,
                 db_type,
             )
+            || Self::cursor_is_at_oracle_mysql_on_duplicate_tail_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
             || Self::cursor_is_after_complete_mysql_on_duplicate_assignment_tail_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
@@ -18402,6 +19017,18 @@ impl SqlEditorWidget {
             deep_ctx,
             exclude_current_identifier_chain,
         ) || Self::table_source_construct_open_paren_position_for_context(
+            deep_ctx,
+            exclude_current_identifier_chain,
+            db_type,
+        ) || Self::cursor_is_at_opposite_dialect_row_limiting_tail_for_context(
+            deep_ctx,
+            exclude_current_identifier_chain,
+            db_type,
+        ) || Self::cursor_is_at_oracle_mysql_index_hint_tail_for_context(
+            deep_ctx,
+            exclude_current_identifier_chain,
+            db_type,
+        ) || Self::cursor_is_at_mysql_unsupported_window_tail_for_context(
             deep_ctx,
             exclude_current_identifier_chain,
             db_type,
@@ -20877,7 +21504,10 @@ impl SqlEditorWidget {
         let tail = &words[object_idx + 1..];
         let completed_character = tail
             .windows(3)
-            .any(|window| matches!(window, [character, set, _value] if character == "CHARACTER" && set == "SET"));
+            .any(|window| matches!(window, [character, set, _value] if character == "CHARACTER" && set == "SET"))
+            || tail
+                .windows(2)
+                .any(|window| matches!(window, [charset, _value] if charset == "CHARSET"));
         let completed_collate = tail
             .windows(2)
             .any(|window| matches!(window, [collate, _value] if collate == "COLLATE"));
@@ -20891,7 +21521,7 @@ impl SqlEditorWidget {
         candidates
             .into_iter()
             .filter(|candidate| match candidate.to_ascii_uppercase().as_str() {
-                "CHARACTER" => !completed_character,
+                "CHARACTER" | "CHARSET" => !completed_character,
                 "COLLATE" => !completed_collate,
                 "ENCRYPTION" => !completed_encryption,
                 "READ" => !completed_read,
@@ -22508,6 +23138,9 @@ impl SqlEditorWidget {
         {
             return Some(candidates);
         }
+        if Self::cursor_is_at_oracle_mysql_on_duplicate_tail(tokens, end, db_type) {
+            return Some(&[]);
+        }
         let returning_done = has_returning || (is_dml && has_log);
         // The statement's own `WHERE` must be counted at the top level — a `WHERE`
         // inside a subquery in a SET value / predicate (`SET a = (SELECT … WHERE …)`)
@@ -22703,6 +23336,65 @@ impl SqlEditorWidget {
             "ORDER" | "GROUP" if in_index_hint_purpose_tail => Some(&["BY"]),
             _ => None,
         }
+    }
+
+    fn cursor_is_at_oracle_mysql_index_hint_tail(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return false;
+        }
+        let words = Self::previous_meaningful_words_upper(tokens, end, 6);
+        match words.as_slice() {
+            [.., lead, index]
+                if matches!(lead.as_str(), "USE" | "IGNORE" | "FORCE")
+                    && matches!(index.as_str(), "INDEX" | "KEY") =>
+            {
+                true
+            }
+            [.., lead, index, for_kw]
+                if matches!(lead.as_str(), "USE" | "IGNORE" | "FORCE")
+                    && matches!(index.as_str(), "INDEX" | "KEY")
+                    && for_kw == "FOR" =>
+            {
+                true
+            }
+            [.., lead, index, for_kw, purpose]
+                if matches!(lead.as_str(), "USE" | "IGNORE" | "FORCE")
+                    && matches!(index.as_str(), "INDEX" | "KEY")
+                    && for_kw == "FOR"
+                    && matches!(purpose.as_str(), "JOIN" | "ORDER" | "GROUP") =>
+            {
+                true
+            }
+            [.., lead, index, for_kw, purpose, by]
+                if matches!(lead.as_str(), "USE" | "IGNORE" | "FORCE")
+                    && matches!(index.as_str(), "INDEX" | "KEY")
+                    && for_kw == "FOR"
+                    && matches!(purpose.as_str(), "ORDER" | "GROUP")
+                    && by == "BY" =>
+            {
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn cursor_is_at_oracle_mysql_index_hint_tail_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let context_end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::cursor_is_at_oracle_mysql_index_hint_tail(tokens, context_end, db_type)
     }
 
     fn expected_flashback_query_keyword_candidates(
@@ -23021,6 +23713,40 @@ impl SqlEditorWidget {
                     && (matches!(tail, [read, uncommitted] if read == "READ" && uncommitted == "UNCOMMITTED")
                         || matches!(tail, [repeatable, read] if repeatable == "REPEATABLE" && read == "READ")))
         };
+        let mysql_oracle_only_tail = || {
+            mysql
+                && match words.as_slice() {
+                    [commit, ..]
+                        if commit == "COMMIT"
+                            && words
+                                .iter()
+                                .any(|word| matches!(word.as_str(), "WRITE" | "FORCE")) =>
+                    {
+                        true
+                    }
+                    [rollback, ..]
+                        if rollback == "ROLLBACK" && words.iter().any(|word| word == "FORCE") =>
+                    {
+                        true
+                    }
+                    [set, transaction, tail @ ..]
+                        if set == "SET"
+                            && transaction == "TRANSACTION"
+                            && matches!(
+                                tail.first().map(String::as_str),
+                                Some("NAME" | "USE")
+                            ) =>
+                    {
+                        true
+                    }
+                    [lock, table, ..] if lock == "LOCK" && table == "TABLE" => true,
+                    _ => false,
+                }
+        };
+
+        if mysql_oracle_only_tail() {
+            return true;
+        }
 
         match first {
             Some("SAVEPOINT") => return true,
@@ -23571,7 +24297,7 @@ impl SqlEditorWidget {
         }
 
         if matches!(words.as_slice(), [verb, object, ..] if matches!(verb.as_str(), "ALTER" | "CREATE") && matches!(object.as_str(), "DATABASE" | "SCHEMA"))
-            && matches!(last, "SET" | "COLLATE" | "ENCRYPTION")
+            && matches!(last, "SET" | "CHARSET" | "COLLATE" | "ENCRYPTION")
         {
             return true;
         }
@@ -26748,19 +27474,26 @@ impl SqlEditorWidget {
             (words.as_slice(), current_word.as_deref()),
             ([set], Some("TRANSACTION")) if set == "SET"
         ) {
-            return Some(&["READ", "ISOLATION", "USE", "NAME"]);
+            return if mysql {
+                Some(&["ISOLATION", "READ"])
+            } else {
+                Some(&["READ", "ISOLATION", "USE", "NAME"])
+            };
         }
-        if matches!(words.as_slice(), [set, transaction, use_word] if set == "SET" && transaction == "TRANSACTION" && use_word == "USE")
+        if !mysql
+            && matches!(words.as_slice(), [set, transaction, use_word] if set == "SET" && transaction == "TRANSACTION" && use_word == "USE")
         {
             return Some(&["ROLLBACK"]);
         }
-        if matches!(
+        if !mysql
+            && matches!(
             words.as_slice(),
             [set, transaction, use_word, rollback] if set == "SET"
                 && transaction == "TRANSACTION"
                 && use_word == "USE"
                 && rollback == "ROLLBACK"
-        ) {
+        )
+        {
             return Some(&["SEGMENT"]);
         }
         if mysql {
@@ -29050,6 +29783,45 @@ impl SqlEditorWidget {
             exclude_current_identifier_chain,
         );
         Self::cursor_is_at_next_cte_name_slot(tokens, end)
+    }
+
+    fn cursor_is_at_oracle_mysql_style_recursive_cte_tail(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            || Self::unclosed_paren_count(tokens, end) != 0
+        {
+            return false;
+        }
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        if !matches!(
+            toks.get(0..2),
+            Some([SqlToken::Word(with_kw), SqlToken::Word(recursive)])
+                if with_kw.eq_ignore_ascii_case("WITH")
+                    && recursive.eq_ignore_ascii_case("RECURSIVE")
+        ) {
+            return false;
+        }
+
+        toks.iter()
+            .skip(2)
+            .any(|token| matches!(token, SqlToken::Word(word) if !word.eq_ignore_ascii_case("AS")))
+    }
+
+    fn cursor_is_at_oracle_mysql_style_recursive_cte_tail_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            deep_ctx.cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::cursor_is_at_oracle_mysql_style_recursive_cte_tail(tokens, end, db_type)
     }
 
     fn cursor_is_at_cte_body_open_paren_slot(tokens: &[SqlToken], end: usize) -> bool {
@@ -31615,6 +32387,80 @@ impl SqlEditorWidget {
         Self::cursor_is_in_row_limiting_clause(tokens, end, deep_ctx.phase, db_type)
     }
 
+    fn cursor_is_at_opposite_dialect_row_limiting_tail(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        let Some(select_idx) = toks.iter().rposition(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("SELECT")),
+        ) else {
+            return false;
+        };
+        if !toks[select_idx + 1..].iter().any(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("FROM")),
+        ) {
+            return false;
+        }
+
+        let keyword_is_tail_marker = |idx: usize| -> bool {
+            if idx == 0 {
+                return false;
+            }
+            match toks.get(idx - 1) {
+                Some(SqlToken::Symbol(symbol)) if symbol == "," => false,
+                Some(SqlToken::Word(word))
+                    if matches!(
+                        word.to_ascii_uppercase().as_str(),
+                        "SELECT" | "FROM" | "JOIN" | "APPLY" | "LATERAL" | "BY"
+                    ) =>
+                {
+                    false
+                }
+                Some(SqlToken::Comment(_)) | None => false,
+                _ => true,
+            }
+        };
+
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            if toks.iter().enumerate().any(|(idx, token)| {
+                matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("FETCH"))
+                    && keyword_is_tail_marker(idx)
+            }) {
+                return true;
+            }
+
+            return toks.iter().enumerate().any(|(idx, token)| {
+                matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("OFFSET"))
+                    && keyword_is_tail_marker(idx)
+                    && !toks[select_idx + 1..idx].iter().any(
+                        |before| matches!(before, SqlToken::Word(word) if word.eq_ignore_ascii_case("LIMIT")),
+                    )
+            });
+        }
+
+        toks.iter().enumerate().any(|(idx, token)| {
+            matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("LIMIT"))
+                && keyword_is_tail_marker(idx)
+        })
+    }
+
+    fn cursor_is_at_opposite_dialect_row_limiting_tail_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::cursor_is_at_opposite_dialect_row_limiting_tail(tokens, end, db_type)
+    }
+
     #[cfg(test)]
     fn cursor_is_in_row_limiting_clause_for_context(
         deep_ctx: &intellisense_context::CursorContext,
@@ -33296,11 +34142,11 @@ impl SqlEditorWidget {
         const MYSQL_LOGFILE_ALTER_OPTION_HEAD_KEYWORDS: &[&str] =
             &["ENGINE", "INITIAL_SIZE", "WAIT"];
         const MYSQL_CREATE_DATABASE_OPTION_HEAD_KEYWORDS: &[&str] =
-            &["CHARACTER", "COLLATE", "DEFAULT", "ENCRYPTION"];
+            &["CHARACTER", "CHARSET", "COLLATE", "DEFAULT", "ENCRYPTION"];
         const MYSQL_ALTER_DATABASE_OPTION_HEAD_KEYWORDS: &[&str] =
-            &["CHARACTER", "COLLATE", "DEFAULT", "ENCRYPTION", "READ"];
+            &["CHARACTER", "CHARSET", "COLLATE", "DEFAULT", "ENCRYPTION", "READ"];
         const MYSQL_DATABASE_AFTER_DEFAULT_KEYWORDS: &[&str] =
-            &["CHARACTER", "COLLATE", "ENCRYPTION"];
+            &["CHARACTER", "CHARSET", "COLLATE", "ENCRYPTION"];
         const MYSQL_CREATE_AFTER_DEFINER_KEYWORDS: &[&str] =
             &["EVENT", "FUNCTION", "PROCEDURE", "SQL", "TRIGGER", "VIEW"];
         const MYSQL_ALTER_AFTER_DEFINER_KEYWORDS: &[&str] = &["EVENT", "SQL", "VIEW"];
@@ -34132,7 +34978,7 @@ impl SqlEditorWidget {
                                         None
                                     }
                                 }
-                                Some("COLLATE" | "ENCRYPTION") => {
+                                Some("CHARSET" | "COLLATE" | "ENCRYPTION") => {
                                     if idx + 3 == words.len() {
                                         Some(database_option_heads(verb))
                                     } else {
@@ -34154,7 +35000,7 @@ impl SqlEditorWidget {
                             None
                         }
                     }
-                    "COLLATE" | "ENCRYPTION" => {
+                    "CHARSET" | "COLLATE" | "ENCRYPTION" => {
                         if idx + 2 == words.len() {
                             Some(database_option_heads(verb))
                         } else {
@@ -39468,6 +40314,57 @@ impl SqlEditorWidget {
 
         let words = Self::previous_meaningful_words_upper(tokens, context_end, 16);
 
+        if Self::cursor_is_at_opposite_dialect_row_limiting_tail(tokens, context_end, db_type) {
+            return Some(ExpectedObjectSuggestionKind::NoSuggestions);
+        }
+        if Self::cursor_is_at_oracle_mysql_index_hint_tail(tokens, context_end, db_type) {
+            return Some(ExpectedObjectSuggestionKind::NoSuggestions);
+        }
+        if Self::cursor_is_at_oracle_mysql_style_recursive_cte_tail(
+            tokens,
+            context_end,
+            db_type,
+        ) {
+            return Some(ExpectedObjectSuggestionKind::NoSuggestions);
+        }
+        if Self::cursor_is_at_mysql_unsupported_window_tail(tokens, context_end, db_type) {
+            return Some(ExpectedObjectSuggestionKind::NoSuggestions);
+        }
+
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            && matches!(
+                words.get(0..2),
+                Some([lock, table]) if lock == "LOCK" && table == "TABLE"
+            )
+        {
+            return Some(ExpectedObjectSuggestionKind::NoSuggestions);
+        }
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            && Self::is_mysql_oracle_only_session_system_parameter_slot(&words)
+        {
+            return Some(ExpectedObjectSuggestionKind::NoSuggestions);
+        }
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            && Self::is_mysql_oracle_only_database_admin_slot(&words)
+        {
+            return Some(ExpectedObjectSuggestionKind::NoSuggestions);
+        }
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            && Self::is_mysql_only_utility_slot(&words)
+        {
+            return Some(ExpectedObjectSuggestionKind::NoSuggestions);
+        }
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            && Self::is_mysql_only_ddl_prefix_slot(&words)
+        {
+            return Some(ExpectedObjectSuggestionKind::NoSuggestions);
+        }
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            && Self::is_mysql_only_schema_database_admin_slot(&words)
+        {
+            return Some(ExpectedObjectSuggestionKind::NoSuggestions);
+        }
+
         if let Some(kind) = Self::expected_dml_target_object_suggestion_kind(
             tokens,
             context_end,
@@ -40695,11 +41592,8 @@ impl SqlEditorWidget {
     fn cursor_is_at_mysql_alter_table_add_index_option_tail(
         tokens: &[SqlToken],
         end: usize,
-        db_type: Option<crate::db::DatabaseType>,
+        _db_type: Option<crate::db::DatabaseType>,
     ) -> bool {
-        if !crate::sql_text::mysql_compatibility_for_sql("", db_type) {
-            return false;
-        }
         let toks = Self::meaningful_tokens_before(tokens, end);
         if !matches!(toks.first(), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("ALTER"))
             || !toks.iter().any(
@@ -40758,11 +41652,8 @@ impl SqlEditorWidget {
     fn cursor_is_at_mysql_create_table_inline_index_option_tail(
         tokens: &[SqlToken],
         end: usize,
-        db_type: Option<crate::db::DatabaseType>,
+        _db_type: Option<crate::db::DatabaseType>,
     ) -> bool {
-        if !crate::sql_text::mysql_compatibility_for_sql("", db_type) {
-            return false;
-        }
         let toks = Self::meaningful_tokens_before(tokens, end);
         if !matches!(toks.first(), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("CREATE"))
             || !toks.iter().any(

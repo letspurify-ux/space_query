@@ -1816,6 +1816,43 @@ fn mysql_family_oracle_only_cte_search_cycle_slots_do_not_offer_catalog() {
 }
 
 #[test]
+fn oracle_mode_mysql_style_recursive_cte_tail_does_not_offer_catalog_or_stale_keywords() {
+    use crate::db::DatabaseType::Oracle;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for sql in [
+        "WITH RECURSIVE |",
+        "WITH RECURSIVE n|",
+        "WITH RECURSIVE c |",
+        "WITH RECURSIVE c(col1, col2) |",
+        "WITH RECURSIVE c AS |",
+        "WITH RECURSIVE c AS (SELECT 1 FROM dual) |",
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert!(
+            kind.is_none() || matches!(kind, Some(ExpectedObjectSuggestionKind::NoSuggestions)),
+            "Oracle-mode MySQL-style recursive CTE tail resolved object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "EMPNO",
+            "ENAME",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "RECURSIVE",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into Oracle-mode MySQL-style recursive CTE tail at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn output_column_alias_list_slots_do_not_offer_catalog() {
     use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
@@ -13160,6 +13197,70 @@ fn tool_command_keyword_slots_are_dialect_scoped() {
                     Some(db),
                 ),
                 "{db:?} freeform/no-argument command `{sql}` was not suppressed"
+            );
+        }
+    }
+
+    for db in [MySQL, MariaDB] {
+        for sql in [
+            "ACCEPT |",
+            "ACCEPT app_user PROMPT |",
+            "ARCHIVE |",
+            "BREAK |",
+            "CLEAR |",
+            "COLUMN ename |",
+            "COMPUTE SUM OF amount |",
+            "CONN |",
+            "CONNECT |",
+            "DEFINE |",
+            "DISC |",
+            "DISCONNECT |",
+            "EXIT |",
+            "GET |",
+            "HOST |",
+            "PASSWORD |",
+            "PASSW |",
+            "PASSWO |",
+            "PASSWOR |",
+            "PAUSE |",
+            "UNDEFINE |",
+            "PROMPT |",
+            "QUIT |",
+            "R |",
+            "RECOVER |",
+            "RUN |",
+            "SAVE |",
+            "SPOOL |",
+            "SPOOL out.log |",
+            "STARTUP |",
+            "STORE |",
+            "TIMING |",
+            "WHENEVER |",
+            "WHENEVER SQLERROR |",
+            "WHENEVER SQLERROR EXIT |",
+            "TTITLE |",
+            "BTITLE |",
+            "REPHEADER |",
+            "REPFOOTER |",
+        ] {
+            let ctx = analyze_inline_cursor_sql(sql);
+            assert!(
+                SqlEditorWidget::cursor_is_at_tool_no_sql_argument_slot_for_context_for_db(
+                    &ctx,
+                    false,
+                    Some(db),
+                ),
+                "{db:?} Oracle/SQL*Plus-only tool command `{sql}` should suppress SQL catalog fallback"
+            );
+
+            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+            assert_eq!(
+                kind, None,
+                "{db:?} Oracle/SQL*Plus-only tool command should not resolve object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+            assert!(
+                final_suggestions.is_empty(),
+                "{db:?} Oracle/SQL*Plus-only tool command leaked suggestions at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
             );
         }
     }
@@ -27283,6 +27384,648 @@ fn dialect_specific_object_kind_slots_do_not_open_wrong_catalogs() {
 }
 
 #[test]
+fn oracle_mode_mysql_only_utility_slots_do_not_offer_catalog_or_keywords() {
+    use crate::db::DatabaseType::Oracle;
+
+    let contains = |values: &[String], needle: &str| {
+        values
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(needle))
+    };
+
+    for sql in [
+        "HANDLER |",
+        "HANDLER emp |",
+        "HANDLER emp OPEN |",
+        "HANDLER emp READ |",
+        "HANDLER emp READ FIRST |",
+        "SHOW OPEN |",
+        "SHOW OPEN TABLES |",
+        "SHOW OPEN TABLES FROM |",
+        "SHOW OPEN TABLES FROM app |",
+        "SHOW DATABASES |",
+        "SHOW SCHEMAS |",
+        "SHOW TABLES |",
+        "SHOW TABLES FROM |",
+        "SHOW TABLES FROM app |",
+        "SHOW COLUMNS |",
+        "SHOW COLUMNS FROM |",
+        "SHOW COLUMNS FROM emp |",
+        "SHOW INDEX |",
+        "SHOW INDEX FROM |",
+        "SHOW INDEX FROM emp |",
+        "SHOW CREATE |",
+        "SHOW CREATE TABLE |",
+        "SHOW CREATE DATABASE |",
+        "SHOW VARIABLES |",
+        "SHOW STATUS |",
+        "SHOW WARNINGS |",
+        "SHOW ERRORS LIMIT |",
+        "SHOW ENGINE |",
+        "SHOW ENGINE INNODB |",
+        "SHOW BINARY |",
+        "SHOW BINARY LOGS |",
+        "SHOW MASTER |",
+        "SHOW MASTER STATUS |",
+        "SHOW REPLICA |",
+        "SHOW REPLICA STATUS |",
+        "SHOW SLAVE |",
+        "SHOW SLAVE STATUS |",
+        "CREATE LOGFILE GROUP |",
+        "CREATE LOGFILE GROUP lg |",
+        "CREATE LOGFILE GROUP lg ADD |",
+        "CREATE LOGFILE GROUP lg ADD UNDOFILE |",
+        "CREATE LOGFILE GROUP lg ADD UNDOFILE app|",
+        "CREATE LOGFILE GROUP lg ADD UNDOFILE 'undo.dat' INITIAL_SIZE |",
+        "CREATE LOGFILE GROUP lg ADD UNDOFILE 'undo.dat' INITIAL_SIZE app|",
+        "CREATE LOGFILE GROUP lg ADD UNDOFILE 'undo.dat' COMMENT |",
+        "CREATE LOGFILE GROUP lg ADD UNDOFILE 'undo.dat' COMMENT app|",
+        "ALTER LOGFILE GROUP |",
+        "ALTER LOGFILE GROUP lg |",
+        "ALTER LOGFILE GROUP lg ADD UNDOFILE |",
+        "ALTER LOGFILE GROUP lg ADD UNDOFILE app|",
+        "DROP LOGFILE GROUP |",
+        "DROP LOGFILE GROUP lg |",
+        "DROP LOGFILE GROUP lg ENGINE |",
+        "DROP LOGFILE GROUP lg ENGINE app|",
+        "CREATE RESOURCE GROUP |",
+        "CREATE RESOURCE GROUP rg |",
+        "CREATE RESOURCE GROUP rg TYPE |",
+        "CREATE RESOURCE GROUP rg TYPE USER VCPU |",
+        "CREATE RESOURCE GROUP rg TYPE USER VCPU app|",
+        "CREATE RESOURCE GROUP rg TYPE USER THREAD_PRIORITY |",
+        "CREATE RESOURCE GROUP rg TYPE USER THREAD_PRIORITY app|",
+        "ALTER RESOURCE GROUP |",
+        "ALTER RESOURCE GROUP rg |",
+        "ALTER RESOURCE GROUP rg VCPU |",
+        "ALTER RESOURCE GROUP rg VCPU app|",
+        "ALTER RESOURCE GROUP rg THREAD_PRIORITY |",
+        "ALTER RESOURCE GROUP rg THREAD_PRIORITY app|",
+        "DROP RESOURCE GROUP |",
+        "DROP RESOURCE GROUP rg |",
+        "ALTER INSTANCE |",
+        "ALTER INSTANCE RELOAD |",
+        "ALTER INSTANCE RELOAD TLS |",
+        "ALTER INSTANCE ROTATE |",
+        "CREATE SERVER |",
+        "CREATE SERVER srv |",
+        "CREATE SERVER srv FOREIGN |",
+        "ALTER SERVER |",
+        "ALTER SERVER srv |",
+        "DROP SERVER |",
+        "DROP SERVER srv |",
+        "CLONE |",
+        "CLONE LOCAL |",
+        "CLONE LOCAL DATA |",
+        "CLONE LOCAL DATA DIRECTORY |",
+        "CLONE INSTANCE |",
+        "CLONE INSTANCE FROM |",
+        "KILL |",
+        "KILL QUERY |",
+        "SIGNAL |",
+        "SIGNAL SQLSTATE |",
+        "SIGNAL SQLSTATE VALUE |",
+        "SIGNAL SQLSTATE VALUE state SET |",
+        "RESIGNAL |",
+        "RESIGNAL SQLSTATE |",
+        "RESIGNAL SQLSTATE VALUE |",
+        "RESIGNAL SET |",
+        "INSTALL COMPONENT |",
+        "INSTALL COMPONENT app|",
+        "INSTALL PLUGIN |",
+        "INSTALL PLUGIN plugin SONAME |",
+        "UNINSTALL COMPONENT |",
+        "UNINSTALL PLUGIN |",
+        "FLUSH |",
+        "FLUSH LOCAL |",
+        "FLUSH BINARY |",
+        "FLUSH BINARY LOGS |",
+        "FLUSH TABLES FOR |",
+        "FLUSH TABLES WITH |",
+        "FLUSH TABLES WITH READ |",
+        "CACHE INDEX |",
+        "CACHE INDEX emp |",
+        "CACHE INDEX emp IN |",
+        "LOAD INDEX |",
+        "LOAD INDEX INTO |",
+        "LOAD INDEX INTO CACHE |",
+        "LOAD INDEX INTO CACHE emp |",
+        "LOAD INDEX INTO CACHE emp IGNORE |",
+        "IMPORT TABLE |",
+        "IMPORT TABLE FROM |",
+        "IMPORT TABLE FROM data_dir |",
+        "LOCK INSTANCE |",
+        "LOCK INSTANCE FOR |",
+        "UNLOCK INSTANCE |",
+        "PURGE BINARY |",
+        "PURGE BINARY LOGS |",
+        "PURGE BINARY LOGS BEFORE |",
+        "PURGE MASTER LOGS TO |",
+        "RESET BINARY |",
+        "RESET BINARY LOGS |",
+        "RESET BINARY LOGS AND |",
+        "SET RESOURCE GROUP |",
+        "SET RESOURCE GROUP rg |",
+        "SET RESOURCE GROUP rg FOR |",
+        "START GROUP_REPLICATION |",
+        "START GROUP_REPLICATION USER |",
+        "START REPLICA |",
+        "START REPLICA FOR |",
+        "START REPLICA FOR CHANNEL |",
+        "START REPLICA UNTIL |",
+        "START REPLICA UNTIL SQL_BEFORE_GTIDS |",
+        "START SLAVE |",
+        "STOP GROUP_REPLICATION |",
+        "STOP REPLICA |",
+        "STOP REPLICA FOR |",
+        "STOP REPLICA FOR CHANNEL |",
+        "STOP SLAVE |",
+        "RESET REPLICA |",
+        "RESET SLAVE |",
+        "CHANGE REPLICATION SOURCE TO |",
+        "CHANGE MASTER TO |",
+        "LOAD DATA |",
+        "LOAD DATA INFILE |",
+        "LOAD XML |",
+        "LOAD XML INFILE |",
+        "XA |",
+        "XA START |",
+        "XA START xid |",
+        "XA END |",
+        "XA END xid |",
+        "XA END xid SUSPEND |",
+        "XA COMMIT |",
+        "XA COMMIT xid |",
+        "XA COMMIT xid ONE |",
+        "XA RECOVER |",
+        "XA RECOVER CONVERT |",
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert!(
+            kind.is_none() || matches!(kind, Some(ExpectedObjectSuggestionKind::NoSuggestions)),
+            "MySQL-only utility slot resolved object kind in Oracle mode at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "HR_PKG",
+            "ADDRESS_T",
+            "APP_USER",
+            "SCOTT",
+            "OPEN",
+            "READ",
+            "CLOSE",
+            "TABLES",
+            "DATABASES",
+            "SCHEMAS",
+            "COLUMNS",
+            "INDEX",
+            "CREATE",
+            "VARIABLES",
+            "STATUS",
+            "WARNINGS",
+            "ERRORS",
+            "LIMIT",
+            "ENGINE",
+            "FROM",
+            "LIKE",
+            "WHERE",
+            "GROUP",
+            "ADD",
+            "UNDOFILE",
+            "TYPE",
+            "SYSTEM",
+            "USER",
+            "VCPU",
+            "THREAD_PRIORITY",
+            "ENABLE",
+            "DISABLE",
+            "RELOAD",
+            "ROTATE",
+            "TLS",
+            "KEYRING",
+            "BINLOG",
+            "INNODB",
+            "SERVER",
+            "FOREIGN",
+            "CLONE",
+            "LOCAL",
+            "DIRECTORY",
+            "KILL",
+            "CONNECTION",
+            "QUERY",
+            "SIGNAL",
+            "RESIGNAL",
+            "SQLSTATE",
+            "VALUE",
+            "MYSQL_ERRNO",
+            "MESSAGE_TEXT",
+            "DATA",
+            "XML",
+            "INFILE",
+            "COMPONENT",
+            "PLUGIN",
+            "SONAME",
+            "GROUP_REPLICATION",
+            "REPLICA",
+            "SLAVE",
+            "SOURCE",
+            "MASTER",
+            "BINARY",
+            "MASTER",
+            "LOGS",
+            "BEFORE",
+            "TO",
+            "GTIDS",
+            "CACHE",
+            "LEAVES",
+            "INSTANCE",
+            "BACKUP",
+            "GROUP_REPLICATION",
+            "IO_THREAD",
+            "SQL_THREAD",
+            "UNTIL",
+            "CHANNEL",
+            "XA",
+            "BEGIN",
+            "END",
+            "PREPARE",
+            "RECOVER",
+            "ROLLBACK",
+            "JOIN",
+            "RESUME",
+            "SUSPEND",
+            "MIGRATE",
+            "PHASE",
+            "CONVERT",
+            "XID",
+            "SELECT",
+            "NOT",
+            "NULL",
+            "NTH_VALUE",
+            "NTILE",
+            "NVL",
+            "NVL()",
+            "NEXT_DAY()",
+            "NULLIF()",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into MySQL-only utility slot in Oracle mode at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn oracle_mode_mysql_only_ddl_prefix_slots_do_not_offer_catalog_or_keywords() {
+    use crate::db::DatabaseType::Oracle;
+
+    let contains = |values: &[String], needle: &str| {
+        values
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(needle))
+    };
+
+    for sql in [
+        "CREATE ALGORITHM |",
+        "CREATE ALGORITHM MERGE |",
+        "CREATE ALGORITHM MERGE DEFINER |",
+        "CREATE ALGORITHM MERGE DEFINER root |",
+        "CREATE ALGORITHM MERGE SQL |",
+        "CREATE ALGORITHM MERGE SQL SECURITY |",
+        "CREATE ALGORITHM MERGE SQL SECURITY DEFINER |",
+        "CREATE DEFINER |",
+        "CREATE DEFINER root |",
+        "CREATE DEFINER = |",
+        "CREATE DEFINER = root |",
+        "CREATE DEFINER root SQL |",
+        "CREATE DEFINER root SQL SECURITY |",
+        "CREATE DEFINER root SQL SECURITY INVOKER |",
+        "CREATE SQL |",
+        "CREATE SQL SECURITY |",
+        "CREATE SQL SECURITY DEFINER |",
+        "CREATE SQL SECURITY INVOKER |",
+        "CREATE SPATIAL |",
+        "CREATE SPATIAL REFERENCE |",
+        "CREATE SPATIAL REFERENCE SYSTEM |",
+        "ALTER ALGORITHM |",
+        "ALTER ALGORITHM TEMPTABLE |",
+        "ALTER ALGORITHM TEMPTABLE DEFINER |",
+        "ALTER ALGORITHM TEMPTABLE DEFINER root |",
+        "ALTER DEFINER |",
+        "ALTER DEFINER root |",
+        "ALTER DEFINER = |",
+        "ALTER DEFINER = root |",
+        "ALTER SQL |",
+        "ALTER SQL SECURITY |",
+        "ALTER SQL SECURITY DEFINER |",
+        "ALTER SQL SECURITY INVOKER |",
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert!(
+            kind.is_none() || matches!(kind, Some(ExpectedObjectSuggestionKind::NoSuggestions)),
+            "MySQL-only DDL prefix slot resolved object kind in Oracle mode at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "MVIEW_SALES",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "HR_PKG",
+            "ADDRESS_T",
+            "APP_USER",
+            "SCOTT",
+            "ALGORITHM",
+            "MERGE",
+            "TEMPTABLE",
+            "UNDEFINED",
+            "DEFINER",
+            "INVOKER",
+            "SECURITY",
+            "SPATIAL",
+            "REFERENCE",
+            "SYSTEM",
+            "EVENT",
+            "VIEW",
+            "TRIGGER",
+            "SELECT",
+            "WHERE",
+            "NOT",
+            "NULL",
+            "NTH_VALUE",
+            "NTILE",
+            "NVL",
+            "NVL()",
+            "NEXT_DAY()",
+            "NULLIF()",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into MySQL-only DDL prefix slot in Oracle mode at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn oracle_mode_mysql_only_schema_database_admin_slots_do_not_offer_catalog_or_keywords() {
+    use crate::db::DatabaseType::Oracle;
+
+    let contains = |values: &[String], needle: &str| {
+        values
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(needle))
+    };
+
+    for sql in [
+        "CREATE DATABASE IF |",
+        "CREATE DATABASE IF NOT |",
+        "CREATE DATABASE IF NOT EXISTS |",
+        "CREATE SCHEMA IF |",
+        "CREATE SCHEMA IF NOT |",
+        "CREATE SCHEMA IF NOT EXISTS |",
+        "DROP DATABASE IF |",
+        "DROP DATABASE IF EXISTS |",
+        "DROP SCHEMA |",
+        "DROP SCHEMA IF |",
+        "DROP SCHEMA IF EXISTS |",
+        "CREATE DATABASE db DEFAULT |",
+        "CREATE DATABASE db DEFAULT CHARACTER |",
+        "CREATE DATABASE db DEFAULT CHARACTER SET |",
+        "CREATE DATABASE db CHARACTER |",
+        "CREATE DATABASE db CHARACTER SET |",
+        "CREATE DATABASE db CHARACTER SET utf8mb4 |",
+        "CREATE DATABASE db COLLATE |",
+        "CREATE DATABASE db COLLATE utf8mb4_bin |",
+        "CREATE DATABASE db ENCRYPTION |",
+        "CREATE DATABASE db ENCRYPTION Y |",
+        "CREATE SCHEMA db DEFAULT |",
+        "CREATE SCHEMA db DEFAULT COLLATE |",
+        "CREATE SCHEMA db DEFAULT CHARSET |",
+        "CREATE SCHEMA db CHARACTER SET |",
+        "ALTER DATABASE db DEFAULT |",
+        "ALTER DATABASE db DEFAULT CHARACTER |",
+        "ALTER DATABASE db DEFAULT CHARACTER SET |",
+        "ALTER DATABASE db DEFAULT CHARSET |",
+        "ALTER DATABASE db CHARACTER |",
+        "ALTER DATABASE db CHARACTER SET |",
+        "ALTER DATABASE db CHARSET |",
+        "ALTER DATABASE db CHARACTER SET utf8mb4 |",
+        "ALTER DATABASE db CHARSET utf8mb4 |",
+        "ALTER DATABASE db COLLATE |",
+        "ALTER DATABASE db COLLATE utf8mb4_bin |",
+        "ALTER DATABASE db ENCRYPTION |",
+        "ALTER DATABASE db ENCRYPTION Y |",
+        "ALTER DATABASE db READ |",
+        "ALTER DATABASE db READ ONLY |",
+        "ALTER SCHEMA |",
+        "ALTER SCHEMA db |",
+        "ALTER SCHEMA db DEFAULT |",
+        "ALTER SCHEMA db DEFAULT CHARSET |",
+        "ALTER SCHEMA db CHARACTER |",
+        "ALTER SCHEMA db CHARACTER SET |",
+        "ALTER SCHEMA db CHARSET |",
+        "ALTER SCHEMA db CHARSET utf8mb4 |",
+        "ALTER SCHEMA db COLLATE |",
+        "ALTER SCHEMA db ENCRYPTION |",
+        "ALTER SCHEMA db READ |",
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert!(
+            kind.is_none() || matches!(kind, Some(ExpectedObjectSuggestionKind::NoSuggestions)),
+            "MySQL-only schema/database admin slot resolved object kind in Oracle mode at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "MVIEW_SALES",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "HR_PKG",
+            "ADDRESS_T",
+            "APP_USER",
+            "SCOTT",
+            "IF",
+            "NOT",
+            "EXISTS",
+            "SCHEMA",
+            "DEFAULT",
+            "CHARACTER",
+            "SET",
+            "CHARSET",
+            "COLLATE",
+            "ENCRYPTION",
+            "READ",
+            "ONLY",
+            "WRITE",
+            "SELECT",
+            "WHERE",
+            "NULL",
+            "NTH_VALUE",
+            "NTILE",
+            "NVL",
+            "NVL()",
+            "NEXT_DAY()",
+            "NULLIF()",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into MySQL-only schema/database admin slot in Oracle mode at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn oracle_mode_mysql_only_schema_object_option_slots_do_not_offer_catalog_or_keywords() {
+    use crate::db::DatabaseType::Oracle;
+
+    let contains = |values: &[String], needle: &str| {
+        values
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(needle))
+    };
+
+    for sql in [
+        "CREATE TABLE t (a INT) ENGINE |",
+        "CREATE TABLE t (a INT) ENGINE InnoDB |",
+        "CREATE TABLE t (a INT) DEFAULT CHARSET |",
+        "CREATE TABLE t (a INT) CHARSET |",
+        "CREATE TABLE t (a INT) AUTO_INCREMENT |",
+        "CREATE TABLE t (a INT) COMMENT |",
+        "CREATE TABLE t (a INT) COMMENT 'doc' |",
+        "CREATE TABLE t (a INT) COMMENT n|",
+        "CREATE TABLE t (a INT) ROW_FORMAT |",
+        "CREATE TABLE t (a INT) ROW_FORMAT DYNAMIC |",
+        "CREATE TABLE t (a INT) ROW_FORMAT n|",
+        "CREATE INDEX idx_emp ON emp (empno) ALGORITHM |",
+        "CREATE INDEX idx_emp ON emp (empno) ALGORITHM DEFAULT |",
+        "CREATE INDEX idx_emp ON emp (empno) ALGORITHM d|",
+        "CREATE INDEX idx_emp ON emp (empno) LOCK |",
+        "CREATE INDEX idx_emp ON emp (empno) LOCK NONE |",
+        "CREATE INDEX idx_emp ON emp (empno) LOCK n|",
+        "CREATE INDEX idx_emp ON emp (empno) COMMENT |",
+        "CREATE INDEX idx_emp ON emp (empno) COMMENT 'doc' |",
+        "CREATE INDEX idx_emp ON emp (empno) COMMENT n|",
+        "CREATE INDEX idx_emp ON emp (empno) KEY_BLOCK_SIZE |",
+        "CREATE INDEX idx_emp ON emp (empno) KEY_BLOCK_SIZE 8 |",
+        "CREATE INDEX idx_emp ON emp (empno) KEY_BLOCK_SIZE d|",
+        "CREATE INDEX idx_emp ON emp (empno) WITH PARSER |",
+        "CREATE INDEX idx_emp ON emp (empno) WITH PARSER app|",
+        "CREATE INDEX idx_emp ON emp (empno) ENGINE_ATTRIBUTE |",
+        "CREATE INDEX idx_emp ON emp (empno) ENGINE_ATTRIBUTE n|",
+        "CREATE INDEX idx_emp ON emp (empno) SECONDARY_ENGINE_ATTRIBUTE |",
+        "CREATE INDEX idx_emp ON emp (empno) SECONDARY_ENGINE_ATTRIBUTE n|",
+        "CREATE INDEX idx_emp ON emp (empno) VISIBLE |",
+        "CREATE INDEX idx_emp ON emp (empno) INVISIBLE |",
+        "ALTER TABLE emp ADD INDEX idx_emp (empno) COMMENT |",
+        "ALTER TABLE emp ADD INDEX idx_emp (empno) COMMENT 'doc' |",
+        "ALTER TABLE emp ADD INDEX idx_emp (empno) COMMENT n|",
+        "ALTER TABLE emp ADD INDEX idx_emp (empno) KEY_BLOCK_SIZE |",
+        "ALTER TABLE emp ADD INDEX idx_emp (empno) KEY_BLOCK_SIZE 8 |",
+        "ALTER TABLE emp ADD INDEX idx_emp (empno) KEY_BLOCK_SIZE d|",
+        "ALTER TABLE emp ADD INDEX idx_emp (empno) WITH PARSER |",
+        "ALTER TABLE emp ADD INDEX idx_emp (empno) WITH PARSER app|",
+        "ALTER TABLE emp ADD INDEX idx_emp (empno) ENGINE_ATTRIBUTE |",
+        "ALTER TABLE emp ADD INDEX idx_emp (empno) ENGINE_ATTRIBUTE n|",
+        "ALTER TABLE emp ADD INDEX idx_emp (empno) SECONDARY_ENGINE_ATTRIBUTE |",
+        "ALTER TABLE emp ADD INDEX idx_emp (empno) SECONDARY_ENGINE_ATTRIBUTE n|",
+        "ALTER TABLE emp ADD INDEX idx_emp (empno) VISIBLE |",
+        "ALTER TABLE emp ADD INDEX idx_emp (empno) INVISIBLE |",
+        "ALTER TABLE emp ADD UNIQUE idx_emp (empno) COMMENT |",
+        "ALTER TABLE emp ADD UNIQUE idx_emp (empno) COMMENT 'doc' |",
+        "ALTER TABLE emp ADD UNIQUE idx_emp (empno) COMMENT n|",
+        "ALTER TABLE emp ADD FULLTEXT idx_emp (ename) WITH PARSER |",
+        "ALTER TABLE emp ADD FULLTEXT idx_emp (ename) WITH PARSER app|",
+        "ALTER TABLE emp ADD SPATIAL idx_emp (geom) COMMENT |",
+        "ALTER TABLE emp ADD SPATIAL idx_emp (geom) COMMENT n|",
+        "ALTER TABLE emp ADD PRIMARY KEY (empno) COMMENT |",
+        "ALTER TABLE emp ADD PRIMARY KEY (empno) COMMENT 'doc' |",
+        "ALTER TABLE emp ADD PRIMARY KEY (empno) COMMENT n|",
+        "ALTER TABLE emp ADD PRIMARY KEY (empno) KEY_BLOCK_SIZE |",
+        "ALTER TABLE emp ADD PRIMARY KEY (empno) KEY_BLOCK_SIZE 8 |",
+        "ALTER TABLE emp ADD PRIMARY KEY (empno) KEY_BLOCK_SIZE d|",
+        "CREATE TABLE t (a INT, INDEX idx_a (a) COMMENT |",
+        "CREATE TABLE t (a INT, INDEX idx_a (a) COMMENT 'doc' |",
+        "CREATE TABLE t (a INT, INDEX idx_a (a) COMMENT n|",
+        "CREATE TABLE t (a INT, UNIQUE idx_a (a) COMMENT |",
+        "CREATE TABLE t (a INT, UNIQUE idx_a (a) COMMENT n|",
+        "CREATE TABLE t (a INT, FULLTEXT idx_a (a) WITH PARSER |",
+        "CREATE TABLE t (a INT, FULLTEXT idx_a (a) WITH PARSER app|",
+        "CREATE TABLE t (a POINT, SPATIAL idx_a (a) COMMENT |",
+        "CREATE TABLE t (a POINT, SPATIAL idx_a (a) COMMENT n|",
+        "CREATE TABLE t (a INT, PRIMARY KEY (a) KEY_BLOCK_SIZE |",
+        "CREATE TABLE t (a INT, PRIMARY KEY (a) KEY_BLOCK_SIZE 8 |",
+        "CREATE TABLE t (a INT, PRIMARY KEY (a) KEY_BLOCK_SIZE d|",
+        "DROP INDEX idx_emp ON emp ALGORITHM |",
+        "DROP INDEX idx_emp ON emp ALGORITHM DEFAULT |",
+        "DROP INDEX idx_emp ON emp ALGORITHM d|",
+        "DROP INDEX idx_emp ON emp LOCK |",
+        "DROP INDEX idx_emp ON emp LOCK NONE |",
+        "DROP INDEX idx_emp ON emp LOCK n|",
+        "ALTER TABLE emp DROP INDEX idx_emp ALGORITHM |",
+        "ALTER TABLE emp DROP INDEX idx_emp ALGORITHM DEFAULT |",
+        "ALTER TABLE emp DROP INDEX idx_emp ALGORITHM d|",
+        "ALTER TABLE emp DROP INDEX idx_emp LOCK |",
+        "ALTER TABLE emp DROP INDEX idx_emp LOCK NONE |",
+        "ALTER TABLE emp DROP INDEX idx_emp LOCK n|",
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert!(
+            kind.is_none() || matches!(kind, Some(ExpectedObjectSuggestionKind::NoSuggestions)),
+            "MySQL-only schema-object option slot resolved object kind in Oracle mode at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "MVIEW_SALES",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "HR_PKG",
+            "ADDRESS_T",
+            "APP_USER",
+            "SCOTT",
+            "ENGINE",
+            "CHARSET",
+            "AUTO_INCREMENT",
+            "ROW_FORMAT",
+            "ALGORITHM",
+            "LOCK",
+            "KEY_BLOCK_SIZE",
+            "WITH",
+            "PARSER",
+            "ENGINE_ATTRIBUTE",
+            "SECONDARY_ENGINE_ATTRIBUTE",
+            "VISIBLE",
+            "INVISIBLE",
+            "SELECT",
+            "WHERE",
+            "NOT",
+            "NULL",
+            "NTH_VALUE",
+            "NTILE",
+            "NVL",
+            "NVL()",
+            "NEXT_DAY()",
+            "NULLIF()",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into MySQL-only schema-object option slot in Oracle mode at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn mysql_family_structural_keyword_slots_are_dialect_scoped() {
     mysql_structural_keyword_slots_are_dialect_scoped();
     mariadb_structural_keyword_slots_are_dialect_scoped();
@@ -27473,14 +28216,18 @@ fn mysql_structural_keyword_slots_are_dialect_scoped() {
         ("CREATE SCHEMA |", "IF"),
         ("CREATE DATABASE db |", "DEFAULT"),
         ("CREATE DATABASE db |", "CHARACTER"),
+        ("CREATE DATABASE db |", "CHARSET"),
         ("CREATE DATABASE db |", "COLLATE"),
         ("CREATE DATABASE db |", "ENCRYPTION"),
         ("CREATE SCHEMA db DEFAULT |", "CHARACTER"),
+        ("CREATE SCHEMA db DEFAULT |", "CHARSET"),
         ("CREATE SCHEMA db DEFAULT |", "COLLATE"),
         ("CREATE SCHEMA db DEFAULT |", "ENCRYPTION"),
         ("CREATE DATABASE db CHARACTER |", "SET"),
         ("CREATE DATABASE db DEFAULT CHARACTER |", "SET"),
         ("CREATE DATABASE db CHARACTER SET utf8mb4 |", "COLLATE"),
+        ("CREATE DATABASE db DEFAULT CHARSET utf8mb4 |", "ENCRYPTION"),
+        ("CREATE DATABASE db CHARSET utf8mb4 |", "COLLATE"),
         ("CREATE DATABASE db DEFAULT CHARACTER SET utf8mb4 |", "ENCRYPTION"),
         ("CREATE DATABASE db COLLATE utf8mb4_bin |", "DEFAULT"),
         ("CREATE DATABASE db ENCRYPTION Y |", "CHARACTER"),
@@ -27757,10 +28504,17 @@ fn mysql_structural_keyword_slots_are_dialect_scoped() {
         ("ALTER DATABASE |", "DEFAULT"),
         ("ALTER DATABASE |", "READ"),
         ("ALTER SCHEMA db |", "CHARACTER"),
+        ("ALTER SCHEMA db |", "CHARSET"),
         ("ALTER SCHEMA db |", "READ"),
         ("ALTER DATABASE db DEFAULT |", "CHARACTER"),
+        ("ALTER DATABASE db DEFAULT |", "CHARSET"),
+        ("ALTER SCHEMA db DEFAULT |", "CHARACTER"),
+        ("ALTER SCHEMA db DEFAULT |", "CHARSET"),
         ("ALTER DATABASE db CHARACTER |", "SET"),
         ("ALTER DATABASE db CHARACTER SET utf8mb4 |", "READ"),
+        ("ALTER DATABASE db DEFAULT CHARSET utf8mb4 |", "READ"),
+        ("ALTER DATABASE db CHARSET utf8mb4 |", "READ"),
+        ("ALTER SCHEMA db CHARSET utf8mb4 |", "READ"),
         ("ALTER DATABASE db COLLATE utf8mb4_bin |", "ENCRYPTION"),
         ("ALTER DATABASE db ENCRYPTION Y |", "READ"),
         ("ALTER DATABASE db READ |", "ONLY"),
@@ -28104,9 +28858,19 @@ fn mysql_structural_keyword_slots_are_dialect_scoped() {
         ),
         ("ALTER USER alice COMMENT |", "ACCOUNT"),
         ("CREATE DATABASE db CHARACTER SET utf8mb4 |", "CHARACTER"),
+        ("CREATE DATABASE db CHARSET utf8mb4 |", "CHARACTER"),
+        ("CREATE DATABASE db CHARSET utf8mb4 |", "CHARSET"),
         (
             "CREATE DATABASE db DEFAULT CHARACTER SET utf8mb4 |",
             "CHARACTER",
+        ),
+        (
+            "CREATE DATABASE db DEFAULT CHARSET utf8mb4 |",
+            "CHARACTER",
+        ),
+        (
+            "CREATE DATABASE db DEFAULT CHARSET utf8mb4 |",
+            "CHARSET",
         ),
         (
             "CREATE DATABASE db DEFAULT COLLATE utf8mb4_bin |",
@@ -28116,6 +28880,10 @@ fn mysql_structural_keyword_slots_are_dialect_scoped() {
         ("CREATE DATABASE db COLLATE utf8mb4_bin |", "COLLATE"),
         ("CREATE DATABASE db ENCRYPTION Y |", "ENCRYPTION"),
         ("ALTER DATABASE db CHARACTER SET utf8mb4 |", "CHARACTER"),
+        ("ALTER DATABASE db CHARSET utf8mb4 |", "CHARACTER"),
+        ("ALTER DATABASE db CHARSET utf8mb4 |", "CHARSET"),
+        ("ALTER SCHEMA db CHARSET utf8mb4 |", "CHARACTER"),
+        ("ALTER SCHEMA db CHARSET utf8mb4 |", "CHARSET"),
         ("ALTER DATABASE db DEFAULT COLLATE utf8mb4_bin |", "COLLATE"),
         ("ALTER DATABASE db DEFAULT ENCRYPTION Y |", "ENCRYPTION"),
         ("ALTER DATABASE db COLLATE utf8mb4_bin |", "COLLATE"),
@@ -32966,14 +33734,84 @@ fn window_frame_completed_tails_stay_keyword_only_with_prefixes() {
             None,
         ),
         (
+            MySQL,
+            "SELECT SUM(sal) OVER (ORDER BY sal NULLS |) FROM emp",
+            None,
+        ),
+        (
+            MySQL,
+            "SELECT SUM(sal) OVER (ORDER BY sal NULLS FIRST |) FROM emp",
+            None,
+        ),
+        (
+            MySQL,
+            "SELECT SUM(sal) OVER (ORDER BY sal ROWS CURRENT ROW EXCLUDE |) FROM emp",
+            None,
+        ),
+        (
+            MySQL,
+            "SELECT SUM(sal) OVER (ORDER BY sal ROWS CURRENT ROW EXCLUDE CURRENT |) FROM emp",
+            None,
+        ),
+        (
+            MySQL,
+            "SELECT SUM(sal) OVER (ORDER BY sal ROWS CURRENT ROW EXCLUDE NO |) FROM emp",
+            None,
+        ),
+        (
+            MySQL,
+            "SELECT SUM(sal) OVER (ORDER BY sal GROUPS |) FROM emp",
+            None,
+        ),
+        (
+            MySQL,
+            "SELECT SUM(sal) OVER (ORDER BY sal GROUPS CURRENT ROW |) FROM emp",
+            None,
+        ),
+        (
             MariaDB,
             "SELECT SUM(sal) OVER (ORDER BY sal ROWS CURRENT ROW e|) FROM emp",
             None,
         ),
+        (
+            MariaDB,
+            "SELECT SUM(sal) OVER (ORDER BY sal NULLS |) FROM emp",
+            None,
+        ),
+        (
+            MariaDB,
+            "SELECT SUM(sal) OVER (ORDER BY sal NULLS FIRST |) FROM emp",
+            None,
+        ),
+        (
+            MariaDB,
+            "SELECT SUM(sal) OVER (ORDER BY sal ROWS CURRENT ROW EXCLUDE |) FROM emp",
+            None,
+        ),
+        (
+            MariaDB,
+            "SELECT SUM(sal) OVER (ORDER BY sal ROWS CURRENT ROW EXCLUDE CURRENT |) FROM emp",
+            None,
+        ),
+        (
+            MariaDB,
+            "SELECT SUM(sal) OVER (ORDER BY sal ROWS CURRENT ROW EXCLUDE NO |) FROM emp",
+            None,
+        ),
+        (
+            MariaDB,
+            "SELECT SUM(sal) OVER (ORDER BY sal GROUPS |) FROM emp",
+            None,
+        ),
+        (
+            MariaDB,
+            "SELECT SUM(sal) OVER (ORDER BY sal GROUPS CURRENT ROW |) FROM emp",
+            None,
+        ),
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
-        assert_eq!(
-            kind, None,
+        assert!(
+            kind.is_none() || matches!(kind, Some(ExpectedObjectSuggestionKind::NoSuggestions)),
             "window-frame tail should not resolve object kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
         );
         if let Some(expected) = expected {
@@ -32983,6 +33821,16 @@ fn window_frame_completed_tails_stay_keyword_only_with_prefixes() {
             );
         }
         assert_no_noise(sql, db, &final_suggestions);
+        if matches!(db, MySQL | MariaDB) {
+            for leaked in [
+                "FIRST", "LAST", "CURRENT", "ROW", "GROUP", "TIES", "NO", "OTHERS", "EXCLUDE",
+            ] {
+                assert!(
+                    !contains(&final_suggestions, leaked),
+                    "{leaked} leaked into MySQL-family unsupported window tail at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+                );
+            }
+        }
     }
 }
 
@@ -37757,6 +38605,67 @@ fn row_limiting_keyword_candidates_are_dialect_scoped() {
         has(&oracle_fetch, "FIRST") && has(&oracle_fetch, "NEXT"),
         "{oracle_fetch:?}"
     );
+}
+
+#[test]
+fn opposite_dialect_row_limiting_tails_do_not_offer_catalog_or_stale_keywords() {
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+    let assert_clean = |db: crate::db::DatabaseType, sql: &str, leaked: &[&str]| {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert!(
+            kind.is_none() || matches!(kind, Some(ExpectedObjectSuggestionKind::NoSuggestions)),
+            "opposite-dialect row-limiting tail resolved object kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for value in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "APP_USER",
+            "SCOTT",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "EMPNO",
+            "ENAME",
+            "DEPTNO",
+            "DNAME",
+            "*",
+        ] {
+            assert!(
+                !contains(&final_suggestions, value),
+                "{value} leaked into opposite-dialect row-limiting tail at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+        for value in leaked {
+            assert!(
+                !contains(&keywords, value) && !contains(&final_suggestions, value),
+                "{value} leaked into opposite-dialect row-limiting tail at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    };
+
+    for db in [MySQL, MariaDB] {
+        for sql in [
+            "SELECT * FROM emp ORDER BY empno FETCH |",
+            "SELECT * FROM emp ORDER BY empno FETCH FIRST |",
+            "SELECT * FROM emp ORDER BY empno FETCH FIRST 5 ROWS |",
+            "SELECT * FROM emp OFFSET 10 |",
+            "SELECT * FROM emp OFFSET 10 ROWS |",
+        ] {
+            assert_clean(db, sql, &["FIRST", "NEXT", "ROW", "ROWS", "ONLY", "WITH", "TIES", "FETCH"]);
+        }
+    }
+
+    for sql in [
+        "SELECT * FROM emp LIMIT |",
+        "SELECT * FROM emp LIMIT 10 |",
+        "SELECT * FROM emp LIMIT 10 OFFSET |",
+        "SELECT * FROM emp LIMIT 10 OFFSET 20 |",
+        "SELECT * FROM emp LIMIT 10, |",
+    ] {
+        assert_clean(Oracle, sql, &["OFFSET", "LIMIT"]);
+    }
 }
 
 #[test]
@@ -52994,22 +53903,32 @@ fn mysql_family_oracle_only_advanced_table_clause_slots_do_not_offer_catalog() {
             "SELECT * FROM emp PIVOT (SUM(sal) |)",
             "SELECT * FROM emp PIVOT (SUM(sal) FOR |)",
             "SELECT * FROM emp PIVOT (SUM(sal) FOR deptno |)",
+            "SELECT * FROM emp PIVOT (SUM(sal) FOR deptno IN (|))",
+            "SELECT * FROM emp PIVOT (SUM(sal) FOR deptno IN (10 AS d10, |))",
             "SELECT * FROM emp UNPIVOT INCLUDE |",
             "SELECT * FROM emp UNPIVOT INCLUDE NULLS (|)",
             "SELECT * FROM emp UNPIVOT (|)",
             "SELECT * FROM emp UNPIVOT (sal |)",
             "SELECT * FROM emp UNPIVOT (sal FOR |)",
             "SELECT * FROM emp UNPIVOT (sal FOR qtr |)",
+            "SELECT * FROM emp UNPIVOT (sal FOR qtr IN (|))",
+            "SELECT * FROM emp UNPIVOT (sal FOR qtr IN (q1 AS 'Q1', |))",
             "SELECT * FROM emp MATCH_RECOGNIZE (|)",
             "SELECT * FROM emp MATCH_RECOGNIZE (PARTITION |)",
             "SELECT * FROM emp MATCH_RECOGNIZE (ORDER |)",
             "SELECT * FROM emp MATCH_RECOGNIZE (AFTER MATCH |)",
+            "SELECT * FROM emp MATCH_RECOGNIZE (MEASURES |)",
             "SELECT * FROM emp MATCH_RECOGNIZE (PATTERN (A) |)",
+            "SELECT * FROM emp MATCH_RECOGNIZE (PATTERN (A) DEFINE |)",
+            "SELECT * FROM emp MATCH_RECOGNIZE (PATTERN (A) DEFINE A AS |)",
+            "SELECT * FROM emp MODEL |",
             "SELECT * FROM emp MODEL PARTITION |",
             "SELECT * FROM emp MODEL PARTITION BY (|)",
             "SELECT * FROM emp MODEL DIMENSION |",
             "SELECT * FROM emp MODEL DIMENSION BY (deptno) MEASURES (sal) |",
             "SELECT * FROM emp MODEL DIMENSION BY (deptno) MEASURES (sal) RULES |",
+            "SELECT * FROM emp MODEL DIMENSION BY (deptno) MEASURES (sal) RULES (|)",
+            "SELECT * FROM emp MODEL DIMENSION BY (deptno) MEASURES (sal) RULES (sal[|])",
         ] {
             let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
             assert!(
@@ -53401,6 +54320,66 @@ fn mysql_family_index_hint_after_table_offers_index_not_clause_continuation() {
 }
 
 #[test]
+fn oracle_mode_mysql_index_hint_keyword_tails_do_not_offer_catalog_or_hint_keywords() {
+    use crate::db::DatabaseType::Oracle;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for sql in ["SELECT a FROM t USE |", "SELECT a FROM t IGNORE |", "SELECT a FROM t FORCE |"] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert_eq!(
+            kind, None,
+            "Oracle table-alias tail should stay a query continuation at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            contains(&final_suggestions, "JOIN") && contains(&final_suggestions, "WHERE"),
+            "Oracle table-alias tail lost query continuation at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in ["INDEX", "KEY"] {
+            assert!(
+                !contains(&keywords, leaked) && !contains(&final_suggestions, leaked),
+                "{leaked} leaked as a MySQL index-hint keyword in Oracle mode at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+
+    for sql in [
+        "SELECT a FROM t USE |",
+        "SELECT a FROM t IGNORE |",
+        "SELECT a FROM t FORCE |",
+        "SELECT a FROM t USE INDEX |",
+        "SELECT a FROM t USE INDEX FOR |",
+        "SELECT a FROM t USE INDEX FOR ORDER |",
+        "SELECT a FROM t USE INDEX FOR GROUP |",
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert!(
+            kind.is_none() || matches!(kind, Some(ExpectedObjectSuggestionKind::NoSuggestions)),
+            "Oracle-mode MySQL index-hint tail resolved object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "APP_USER",
+            "SCOTT",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "EMPNO",
+            "ENAME",
+            "INDEX",
+            "KEY",
+            "BY",
+        ] {
+            assert!(
+                !contains(&keywords, leaked) && !contains(&final_suggestions, leaked),
+                "{leaked} leaked into Oracle-mode MySQL index-hint tail at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn mysql_family_index_hint_prefixed_final_suggestions_stay_slot_specific() {
     use crate::db::DatabaseType::{MariaDB, MySQL};
 
@@ -53571,12 +54550,29 @@ fn mysql_family_select_modifiers_continue_until_projection_starts() {
         );
     }
 
-    let oracle = kw("SELECT DISTINCT |", Oracle);
-    for mysql_only in ["HIGH_PRIORITY", "STRAIGHT_JOIN", "SQL_SMALL_RESULT"] {
-        assert!(
-            !has(&oracle, mysql_only),
-            "{mysql_only} leaked into Oracle SELECT DISTINCT tail: {oracle:?}"
-        );
+    for sql in [
+        "SELECT |",
+        "SELECT ALL |",
+        "SELECT DISTINCT |",
+        "SELECT UNIQUE |",
+        "SELECT s|",
+    ] {
+        let oracle = kw(sql, Oracle);
+        for mysql_only in [
+            "HIGH_PRIORITY",
+            "STRAIGHT_JOIN",
+            "SQL_SMALL_RESULT",
+            "SQL_BIG_RESULT",
+            "SQL_BUFFER_RESULT",
+            "SQL_CACHE",
+            "SQL_NO_CACHE",
+            "SQL_CALC_FOUND_ROWS",
+        ] {
+            assert!(
+                !has(&oracle, mysql_only),
+                "{mysql_only} leaked into Oracle SELECT modifier slot at `{sql}`: {oracle:?}"
+            );
+        }
     }
 }
 
@@ -54933,6 +55929,10 @@ fn post_table_modifier_value_slots_do_not_offer_catalog() {
         (Oracle, "SELECT * FROM t SAMPLE BLOCK (|"),
         (Oracle, "SELECT * FROM t TABLESAMPLE BERNOULLI (|"),
         (Oracle, "SELECT * FROM t TABLESAMPLE SYSTEM (app|"),
+        (Oracle, "SELECT * FROM t USE INDEX (|"),
+        (Oracle, "SELECT * FROM t USE INDEX (app|"),
+        (Oracle, "SELECT * FROM t FORCE KEY FOR ORDER BY (scott.|"),
+        (Oracle, "SELECT * FROM t IGNORE KEY (idx_a, |"),
         (MySQL, "SELECT * FROM t USE INDEX (|"),
         (MySQL, "SELECT * FROM t USE INDEX (app|"),
         (MySQL, "SELECT * FROM t USE INDEX (idx_a, |"),
@@ -57114,6 +58114,19 @@ fn unprefixed_dml_and_fk_keyword_slots_do_not_offer_object_catalog() {
         invalid_mysql_upsert.is_empty(),
         "invalid SELECT-level ON DUPLICATE should not offer MySQL upsert keywords: kind={kind:?} keywords={keywords:?} final={invalid_mysql_upsert:?}"
     );
+
+    for sql in [
+        "INSERT INTO emp VALUES (1) ON DUPLICATE |",
+        "INSERT INTO emp VALUES (1) ON DUPLICATE KEY |",
+        "INSERT INTO emp VALUES (1) ON DUPLICATE KEY UPDATE |",
+        "INSERT INTO emp VALUES (1) ON DUPLICATE KEY UPDATE sal = 1 |",
+    ] {
+        let (kind, keywords, invalid_oracle_upsert) = audit_final_suggestions_for(sql, Oracle);
+        assert!(
+            invalid_oracle_upsert.is_empty(),
+            "Oracle mode should not continue invalid MySQL ON DUPLICATE tail: kind={kind:?} keywords={keywords:?} final={invalid_oracle_upsert:?}"
+        );
+    }
 
     let (kind, keywords, insert_select_tail) =
         audit_final_suggestions_for("INSERT INTO emp (a, b) SELECT x, y FROM s |", Oracle);
@@ -66942,6 +67955,237 @@ fn completed_transaction_option_tails_do_not_reoffer_keywords_or_catalog() {
 }
 
 #[test]
+fn mysql_family_oracle_only_transaction_and_lock_slots_do_not_offer_catalog_or_keywords() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for db in [MySQL, MariaDB] {
+        for sql in [
+            "COMMIT WRITE |",
+            "COMMIT WRITE WAIT |",
+            "COMMIT WRITE WAIT IMMEDIATE |",
+            "COMMIT WRITE NOWAIT BATCH |",
+            "COMMIT FORCE |",
+            "COMMIT FORCE app|",
+            "ROLLBACK FORCE |",
+            "ROLLBACK FORCE app|",
+            "SET TRANSACTION NAME |",
+            "SET TRANSACTION NAME app|",
+            "SET TRANSACTION USE |",
+            "SET TRANSACTION USE ROLLBACK |",
+            "SET TRANSACTION USE ROLLBACK SEGMENT |",
+            "SET TRANSACTION USE ROLLBACK SEGMENT app|",
+            "LOCK TABLE |",
+            "LOCK TABLE emp |",
+            "LOCK TABLE emp IN |",
+            "LOCK TABLE emp IN SHARE |",
+            "LOCK TABLE emp IN SHARE MODE |",
+            "LOCK TABLE emp IN SHARE MODE WAIT |",
+            "LOCK TABLE emp IN SHARE MODE WAIT 5 |",
+        ] {
+            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+            assert!(
+                kind.is_none() || matches!(kind, Some(ExpectedObjectSuggestionKind::NoSuggestions)),
+                "Oracle-only transaction/lock slot resolved object kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+            );
+            for leaked in [
+                "EMP",
+                "DEPT",
+                "EMP_V",
+                "RUN_JOB",
+                "CALC_TOTAL",
+                "HR_PKG",
+                "ADDRESS_T",
+                "APP_USER",
+                "SCOTT",
+                "TABLE",
+                "IN",
+                "ROW",
+                "SHARE",
+                "MODE",
+                "WAIT",
+                "NOWAIT",
+                "USE",
+                "ROLLBACK",
+                "SEGMENT",
+                "NAME",
+                "SELECT",
+                "WHERE",
+                "NOT",
+                "NULL",
+                "NTH_VALUE",
+                "NTILE",
+                "NVL",
+                "NVL()",
+                "NEXT_DAY()",
+                "NULLIF()",
+            ] {
+                assert!(
+                    !contains(&final_suggestions, leaked),
+                    "{leaked} leaked into MySQL-family Oracle-only transaction/lock slot at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn mysql_family_oracle_only_session_system_parameter_slots_do_not_offer_catalog_or_keywords() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for db in [MySQL, MariaDB] {
+        for sql in [
+            "ALTER SESSION |",
+            "ALTER SESSION SET |",
+            "ALTER SESSION SET NLS_DATE_FORMAT |",
+            "ALTER SESSION SET NLS_DATE_FORMAT = |",
+            "ALTER SESSION SET NLS_DATE_FORMAT = app|",
+            "ALTER SESSION SET CURRENT_SCHEMA |",
+            "ALTER SESSION SET CURRENT_SCHEMA = |",
+            "ALTER SESSION SET CURRENT_SCHEMA = app|",
+            "ALTER SYSTEM |",
+            "ALTER SYSTEM SET |",
+            "ALTER SYSTEM SET OPEN_CURSORS |",
+            "ALTER SYSTEM SET OPEN_CURSORS = |",
+            "ALTER SYSTEM SET OPEN_CURSORS = app|",
+            "ALTER SYSTEM SET DB_RECOVERY_FILE_DEST = |",
+            "ALTER SYSTEM SET DB_RECOVERY_FILE_DEST = app|",
+        ] {
+            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+            assert!(
+                kind.is_none() || matches!(kind, Some(ExpectedObjectSuggestionKind::NoSuggestions)),
+                "Oracle-only SESSION/SYSTEM parameter slot resolved object kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+            );
+            for leaked in [
+                "EMP",
+                "DEPT",
+                "EMP_V",
+                "RUN_JOB",
+                "CALC_TOTAL",
+                "HR_PKG",
+                "ADDRESS_T",
+                "APP_USER",
+                "SCOTT",
+                "SET",
+                "CURRENT_SCHEMA",
+                "NLS_DATE_FORMAT",
+                "OPEN_CURSORS",
+                "SELECT",
+                "WHERE",
+                "NOT",
+                "NULL",
+                "NTH_VALUE",
+                "NTILE",
+                "NVL",
+                "NVL()",
+                "NEXT_DAY()",
+                "NULLIF()",
+            ] {
+                assert!(
+                    !contains(&final_suggestions, leaked),
+                    "{leaked} leaked into MySQL-family Oracle-only SESSION/SYSTEM parameter slot at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn mysql_family_oracle_only_database_admin_slots_do_not_offer_catalog_or_keywords() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for db in [MySQL, MariaDB] {
+        for sql in [
+            "CREATE RESTORE POINT |",
+            "CREATE RESTORE POINT rp |",
+            "DROP RESTORE POINT |",
+            "DROP RESTORE POINT rp |",
+            "CREATE PLUGGABLE DATABASE |",
+            "CREATE PLUGGABLE DATABASE pdb |",
+            "ALTER PLUGGABLE DATABASE |",
+            "ALTER PLUGGABLE DATABASE pdb |",
+            "DROP PLUGGABLE DATABASE |",
+            "DROP PLUGGABLE DATABASE pdb |",
+            "ALTER DATABASE BACKUP |",
+            "ALTER DATABASE BACKUP CONTROLFILE |",
+            "ALTER DATABASE BACKUP CONTROLFILE TO |",
+            "ALTER DATABASE BACKUP CONTROLFILE TO app|",
+            "ALTER DATABASE ADD |",
+            "ALTER DATABASE ADD LOGFILE |",
+            "ALTER DATABASE ADD LOGFILE GROUP |",
+            "ALTER DATABASE ADD LOGFILE GROUP 1 |",
+            "ALTER DATABASE ADD DATAFILE |",
+            "ALTER DATABASE ADD DATAFILE app|",
+            "ALTER DATABASE RENAME |",
+            "ALTER DATABASE RENAME FILE |",
+            "ALTER DATABASE RENAME FILE app|",
+            "ALTER DATABASE RENAME FILE old TO |",
+            "ALTER DATABASE RENAME FILE old TO app|",
+            "ALTER DATABASE DATAFILE |",
+            "ALTER DATABASE DATAFILE app|",
+            "ALTER DATABASE DATAFILE df RESIZE |",
+            "ALTER DATABASE TEMPFILE |",
+            "ALTER DATABASE TEMPFILE app|",
+            "ALTER DATABASE MOUNT |",
+            "ALTER DATABASE OPEN |",
+            "ALTER DATABASE OPEN RESETLOGS |",
+            "ALTER DATABASE ARCHIVELOG |",
+            "ALTER DATABASE NOARCHIVELOG |",
+            "CREATE SPFILE |",
+            "CREATE SPFILE FROM |",
+            "CREATE SPFILE FROM PFILE |",
+            "CREATE PFILE |",
+            "CREATE PFILE FROM |",
+            "CREATE PFILE FROM SPFILE |",
+        ] {
+            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+            assert!(
+                kind.is_none() || matches!(kind, Some(ExpectedObjectSuggestionKind::NoSuggestions)),
+                "Oracle-only database admin slot resolved object kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+            );
+            for leaked in [
+                "EMP",
+                "DEPT",
+                "EMP_V",
+                "RUN_JOB",
+                "CALC_TOTAL",
+                "HR_PKG",
+                "ADDRESS_T",
+                "APP_USER",
+                "SCOTT",
+                "DATABASE",
+                "RESTORE",
+                "POINT",
+                "PLUGGABLE",
+                "SPFILE",
+                "PFILE",
+                "FROM",
+                "SELECT",
+                "WHERE",
+                "NOT",
+                "NULL",
+                "NTH_VALUE",
+                "NTILE",
+                "NVL",
+                "NVL()",
+                "NEXT_DAY()",
+                "NULLIF()",
+            ] {
+                assert!(
+                    !contains(&final_suggestions, leaked),
+                    "{leaked} leaked into MySQL-family Oracle-only database admin slot at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn mysql_family_oracle_only_ddl_value_slots_do_not_offer_catalog_or_keywords() {
     use crate::db::DatabaseType::{MariaDB, MySQL};
 
@@ -66979,6 +68223,95 @@ fn mysql_family_oracle_only_ddl_value_slots_do_not_offer_catalog_or_keywords() {
             "CREATE JAVA SOURCE NAMED src AS app|",
             "CREATE OR REPLACE JAVA SOURCE NAMED src AS |",
             "CREATE OR REPLACE JAVA SOURCE NAMED src AS app|",
+            "CREATE USER u IDENTIFIED EXTERNALLY |",
+            "CREATE USER u IDENTIFIED EXTERNALLY AS |",
+            "CREATE USER u IDENTIFIED EXTERNALLY AS app|",
+            "CREATE USER u IDENTIFIED GLOBALLY |",
+            "CREATE USER u IDENTIFIED GLOBALLY AS |",
+            "CREATE USER u IDENTIFIED GLOBALLY AS app|",
+            "ALTER USER u IDENTIFIED EXTERNALLY |",
+            "ALTER USER u IDENTIFIED EXTERNALLY AS |",
+            "ALTER USER u IDENTIFIED EXTERNALLY AS app|",
+            "ALTER USER u IDENTIFIED GLOBALLY |",
+            "ALTER USER u IDENTIFIED GLOBALLY AS |",
+            "ALTER USER u IDENTIFIED GLOBALLY AS app|",
+            "CREATE USER u DEFAULT TABLESPACE |",
+            "CREATE USER u DEFAULT TABLESPACE app|",
+            "CREATE USER u TEMPORARY TABLESPACE |",
+            "CREATE USER u TEMPORARY TABLESPACE app|",
+            "CREATE USER u QUOTA 10M ON |",
+            "CREATE USER u QUOTA 10M ON app|",
+            "CREATE USER u PROFILE |",
+            "CREATE USER u PROFILE app|",
+            "ALTER USER u DEFAULT TABLESPACE |",
+            "ALTER USER u DEFAULT TABLESPACE app|",
+            "ALTER USER u TEMPORARY TABLESPACE |",
+            "ALTER USER u TEMPORARY TABLESPACE app|",
+            "ALTER USER u QUOTA 10M ON |",
+            "ALTER USER u QUOTA 10M ON app|",
+            "ALTER USER u PROFILE |",
+            "ALTER USER u PROFILE app|",
+            "CREATE TABLESPACE ts DATAFILE |",
+            "CREATE TABLESPACE ts DATAFILE app|",
+            "CREATE TABLESPACE ts DATAFILE 'ts01.dbf' SIZE |",
+            "CREATE TABLESPACE ts DATAFILE 'ts01.dbf' SIZE app|",
+            "CREATE TABLESPACE ts DATAFILE 'ts01.dbf' AUTOEXTEND ON NEXT |",
+            "CREATE TABLESPACE ts DATAFILE 'ts01.dbf' AUTOEXTEND ON NEXT app|",
+            "CREATE TEMPORARY TABLESPACE ts TEMPFILE |",
+            "CREATE TEMPORARY TABLESPACE ts TEMPFILE app|",
+            "ALTER TABLESPACE ts DROP DATAFILE |",
+            "ALTER TABLESPACE ts DROP DATAFILE app|",
+            "ALTER TABLESPACE ts READ ONLY |",
+            "ALTER TABLESPACE ts RENAME TO |",
+            "ALTER TABLESPACE ts RENAME TO app|",
+            "CREATE SEQUENCE seq START WITH |",
+            "CREATE SEQUENCE seq START WITH app|",
+            "CREATE SEQUENCE seq INCREMENT BY |",
+            "CREATE SEQUENCE seq INCREMENT BY app|",
+            "CREATE SEQUENCE seq CACHE |",
+            "CREATE SEQUENCE seq CACHE app|",
+            "ALTER SEQUENCE seq START WITH |",
+            "ALTER SEQUENCE seq START WITH app|",
+            "ALTER SEQUENCE seq INCREMENT BY |",
+            "ALTER SEQUENCE seq INCREMENT BY app|",
+            "ALTER SEQUENCE seq CACHE |",
+            "ALTER SEQUENCE seq CACHE app|",
+            "CREATE TABLE t (a NUMBER) TABLESPACE |",
+            "CREATE TABLE t (a NUMBER) TABLESPACE app|",
+            "CREATE TABLE t (a NUMBER) PCTFREE |",
+            "CREATE TABLE t (a NUMBER) PCTFREE app|",
+            "CREATE TABLE t (a NUMBER) STORAGE (INITIAL |",
+            "CREATE TABLE t (a NUMBER) STORAGE (INITIAL app|",
+            "CREATE INDEX ix ON t (a) TABLESPACE |",
+            "CREATE INDEX ix ON t (a) TABLESPACE app|",
+            "CREATE INDEX ix ON t (a) PCTFREE |",
+            "CREATE INDEX ix ON t (a) PCTFREE app|",
+            "CREATE INDEX ix ON t (a) STORAGE (INITIAL |",
+            "CREATE INDEX ix ON t (a) STORAGE (INITIAL app|",
+            "ALTER TABLE t STORAGE (INITIAL |",
+            "ALTER TABLE t STORAGE (INITIAL app|",
+            "ALTER INDEX ix STORAGE (INITIAL |",
+            "ALTER INDEX ix STORAGE (INITIAL app|",
+            "CREATE TABLE t (a CLOB) LOB (a) STORE AS (TABLESPACE |",
+            "CREATE TABLE t (a CLOB) LOB (a) STORE AS (TABLESPACE app|",
+            "CREATE TABLE t (a CLOB) LOB (a) STORE AS (CHUNK |",
+            "CREATE TABLE t (a CLOB) LOB (a) STORE AS (CHUNK app|",
+            "CREATE TABLE t (a CLOB) LOB (a) STORE AS (PCTVERSION |",
+            "CREATE TABLE t (a CLOB) LOB (a) STORE AS (PCTVERSION app|",
+            "CREATE TABLE t (a CLOB) LOB (a) STORE AS (FREEPOOLS |",
+            "CREATE TABLE t (a CLOB) LOB (a) STORE AS (FREEPOOLS app|",
+            "CREATE TABLE t (a CLOB) LOB (a) STORE AS (STORAGE (INITIAL |",
+            "CREATE TABLE t (a CLOB) LOB (a) STORE AS (STORAGE (INITIAL app|",
+            "CREATE TABLE t (nt nested_type) NESTED TABLE nt STORE AS nt_store (TABLESPACE |",
+            "CREATE TABLE t (nt nested_type) NESTED TABLE nt STORE AS nt_store (TABLESPACE app|",
+            "CREATE TABLE t (nt nested_type) NESTED TABLE nt STORE AS nt_store (STORAGE (INITIAL |",
+            "CREATE TABLE t (nt nested_type) NESTED TABLE nt STORE AS nt_store (STORAGE (INITIAL app|",
+            "CREATE TABLE t (va varray_type) VARRAY va STORE AS LOB (TABLESPACE |",
+            "CREATE TABLE t (va varray_type) VARRAY va STORE AS LOB (TABLESPACE app|",
+            "CREATE TABLE t (va varray_type) VARRAY va STORE AS LOB (CHUNK |",
+            "CREATE TABLE t (va varray_type) VARRAY va STORE AS LOB (CHUNK app|",
+            "CREATE TABLE t (va varray_type) VARRAY va STORE AS LOB (STORAGE (INITIAL |",
+            "CREATE TABLE t (va varray_type) VARRAY va STORE AS LOB (STORAGE (INITIAL app|",
         ] {
             let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
             assert!(
@@ -67027,13 +68360,19 @@ fn mysql_family_oracle_only_role_auth_slots_do_not_offer_catalog_or_keywords() {
             "CREATE ROLE r IDENTIFIED |",
             "CREATE ROLE r IDENTIFIED b|",
             "CREATE ROLE r IDENTIFIED u|",
+            "CREATE ROLE r IDENTIFIED EXTERNALLY |",
+            "CREATE ROLE r IDENTIFIED EXTERNALLY app|",
             "CREATE ROLE r IDENTIFIED GLOBALLY |",
             "CREATE ROLE r IDENTIFIED GLOBALLY a|",
+            "CREATE ROLE r IDENTIFIED GLOBALLY AS |",
+            "CREATE ROLE r IDENTIFIED GLOBALLY AS app|",
             "CREATE ROLE r NOT |",
             "CREATE ROLE r NOT i|",
             "ALTER ROLE r IDENTIFIED |",
             "ALTER ROLE r IDENTIFIED b|",
             "ALTER ROLE r IDENTIFIED u|",
+            "ALTER ROLE r IDENTIFIED EXTERNALLY |",
+            "ALTER ROLE r IDENTIFIED EXTERNALLY app|",
             "ALTER ROLE r NOT |",
         ] {
             let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
@@ -67297,7 +68636,13 @@ fn mysql_family_oracle_only_synonym_and_database_link_slots_do_not_offer_catalog
             "CREATE DATABASE LINK link CONNECT |",
             "CREATE DATABASE LINK link CONNECT TO user |",
             "CREATE DATABASE LINK link CONNECT TO user IDENTIFIED |",
+            "CREATE DATABASE LINK link CONNECT TO user IDENTIFIED BY |",
+            "CREATE DATABASE LINK link CONNECT TO user IDENTIFIED BY app|",
+            "CREATE DATABASE LINK link AUTHENTICATED |",
+            "CREATE DATABASE LINK link AUTHENTICATED BY |",
+            "CREATE DATABASE LINK link AUTHENTICATED BY app|",
             "CREATE DATABASE LINK link USING |",
+            "CREATE DATABASE LINK link USING app|",
             "ALTER DATABASE LINK |",
             "ALTER DATABASE LINK app|",
             "ALTER PUBLIC DATABASE LINK |",
@@ -67880,6 +69225,64 @@ fn mysql_family_oracle_only_audit_and_analyze_slots_do_not_offer_catalog_or_keyw
                 assert!(
                     !contains(&final_suggestions, leaked),
                     "{leaked} leaked into MySQL-family Oracle-only AUDIT/ANALYZE slot at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn mysql_family_oracle_only_explain_plan_option_slots_do_not_offer_catalog_or_keywords() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for db in [MySQL, MariaDB] {
+        for sql in [
+            "EXPLAIN PLAN SET |",
+            "EXPLAIN PLAN SET STATEMENT_ID |",
+            "EXPLAIN PLAN SET STATEMENT_ID = |",
+            "EXPLAIN PLAN SET STATEMENT_ID = app|",
+            "EXPLAIN PLAN SET STATEMENT_ID = 'q1' |",
+            "EXPLAIN PLAN SET STATEMENT_ID = 'q1' INTO |",
+            "EXPLAIN PLAN SET STATEMENT_ID = 'q1' INTO app|",
+            "EXPLAIN PLAN SET STATEMENT_ID = 'q1' INTO plan_table |",
+            "EXPLAIN PLAN INTO |",
+            "EXPLAIN PLAN INTO app|",
+            "EXPLAIN PLAN INTO plan_table |",
+            "EXPLAIN PLAN FOR |",
+            "EXPLAIN PLAN FOR SELECT |",
+        ] {
+            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+            assert!(
+                kind.is_none() || matches!(kind, Some(ExpectedObjectSuggestionKind::NoSuggestions)),
+                "Oracle-only EXPLAIN PLAN option slot resolved object kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+            );
+            for leaked in [
+                "EMP",
+                "DEPT",
+                "EMP_V",
+                "MVIEW_SALES",
+                "RUN_JOB",
+                "CALC_TOTAL",
+                "APP_USER",
+                "SCOTT",
+                "PLAN_TABLE",
+                "PLAN",
+                "STATEMENT_ID",
+                "INTO",
+                "FOR",
+                "SELECT",
+                "UPDATE",
+                "DELETE",
+                "MERGE",
+                "WITH",
+                "WHERE",
+                "NULL",
+            ] {
+                assert!(
+                    !contains(&final_suggestions, leaked),
+                    "{leaked} leaked into MySQL-family Oracle-only EXPLAIN PLAN option slot at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
                 );
             }
         }
@@ -71608,6 +73011,10 @@ fn mysql_option_value_slots_do_not_offer_object_catalog_in_final_suggestions() {
             "ALTER USER alice PASSWORD REUSE INTERVAL |",
             "ALTER USER alice WITH MAX_CONNECTIONS_PER_HOUR |",
             "ALTER DATABASE db DEFAULT CHARACTER SET |",
+            "ALTER DATABASE db DEFAULT CHARSET |",
+            "ALTER SCHEMA db DEFAULT CHARSET |",
+            "ALTER DATABASE db CHARSET |",
+            "ALTER SCHEMA db CHARSET |",
             "ALTER DATABASE db COLLATE |",
             "ALTER DATABASE db ENCRYPTION |",
             "ALTER DATABASE db ENCRYPTION Y |",
@@ -71616,6 +73023,8 @@ fn mysql_option_value_slots_do_not_offer_object_catalog_in_final_suggestions() {
             "CREATE DATABASE db CHARACTER SET |",
             "CREATE DATABASE db CHARACTER SET utf8mb4 |",
             "CREATE DATABASE db DEFAULT CHARACTER SET |",
+            "CREATE DATABASE db DEFAULT CHARSET |",
+            "CREATE DATABASE db CHARSET |",
             "CREATE DATABASE db COLLATE |",
             "CREATE DATABASE db ENCRYPTION |",
             "CREATE DATABASE db DEFAULT COLLATE utf8mb4_bin |",
@@ -71625,6 +73034,7 @@ fn mysql_option_value_slots_do_not_offer_object_catalog_in_final_suggestions() {
             "CREATE TABLE t (a INT) DEFAULT CHARACTER SET |",
             "CREATE TABLE t (a INT) DEFAULT CHARSET |",
             "CREATE TABLE t (a INT) CHARACTER SET |",
+            "CREATE TABLE t (a INT) CHARSET |",
             "CREATE TABLE t (a INT) COLLATE |",
             "CREATE TABLE t (a INT) COLLATE utf8mb4_bin |",
             "CREATE TABLE t (a INT) AUTO_INCREMENT |",
@@ -71875,16 +73285,23 @@ fn mysql_prefixed_option_value_slots_do_not_offer_catalog_or_keywords() {
             "ALTER USER alice PASSWORD REUSE INTERVAL d|",
             "ALTER USER alice WITH MAX_CONNECTIONS_PER_HOUR d|",
             "ALTER DATABASE db DEFAULT CHARACTER SET s|",
+            "ALTER DATABASE db DEFAULT CHARSET s|",
+            "ALTER SCHEMA db DEFAULT CHARSET s|",
+            "ALTER DATABASE db CHARSET s|",
+            "ALTER SCHEMA db CHARSET s|",
             "ALTER DATABASE db COLLATE s|",
             "ALTER DATABASE db ENCRYPTION s|",
             "CREATE DATABASE db CHARACTER SET s|",
             "CREATE DATABASE db DEFAULT CHARACTER SET s|",
+            "CREATE DATABASE db DEFAULT CHARSET s|",
+            "CREATE DATABASE db CHARSET s|",
             "CREATE DATABASE db COLLATE s|",
             "CREATE DATABASE db ENCRYPTION s|",
             "CREATE TABLE t (a INT) ENGINE app|",
             "CREATE TABLE t (a INT) DEFAULT CHARACTER SET app|",
             "CREATE TABLE t (a INT) DEFAULT CHARSET app|",
             "CREATE TABLE t (a INT) CHARACTER SET app|",
+            "CREATE TABLE t (a INT) CHARSET app|",
             "CREATE TABLE t (a INT) COLLATE app|",
             "CREATE TABLE t (a INT) AUTO_INCREMENT d|",
             "CREATE TABLE t (a INT) COMMENT app|",
