@@ -4739,7 +4739,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                     })
                                     .or(relation_body_range)
                                     .or_else(|| {
-                                        (!explicit_columns.is_empty()).then_some(TokenRange {
+                                        explicit_column_range.is_some().then_some(TokenRange {
                                             start: idx,
                                             end: relation_output_end.max(idx.saturating_add(1)),
                                         })
@@ -4759,7 +4759,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 {
                                     if uses_virtual_alias_scope
                                         || derived_alias.is_some()
-                                        || !explicit_columns.is_empty()
+                                        || explicit_column_range.is_some()
                                     {
                                         all_subqueries.push(ParsedSubqueryEntry {
                                             subquery: SubqueryDefinition {

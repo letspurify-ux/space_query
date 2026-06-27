@@ -1695,6 +1695,21 @@ impl IntellisenseData {
         None
     }
 
+    pub fn qualifier_member_has_kind_metadata(&self, qualifier: &str, candidate: &str) -> bool {
+        let candidate_upper = NameEntry::lookup_upper(candidate.trim());
+        if candidate_upper.is_empty() {
+            return false;
+        }
+
+        for key in Self::qualifier_lookup_keys(qualifier) {
+            if let Some(member_kinds) = self.member_kinds_by_qualifier.get(&key) {
+                return member_kinds.contains_key(&candidate_upper);
+            }
+        }
+
+        false
+    }
+
     pub fn qualifier_member_name_matching_kinds(
         &self,
         qualifier: &str,

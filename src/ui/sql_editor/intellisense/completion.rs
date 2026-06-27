@@ -837,6 +837,7 @@ enum AnalyticNullTreatmentCall {
 enum ExpectedObjectSuggestionKind {
     NoSuggestions,
     Any,
+    SchemaObject,
     Routine,
     Executable,
     RelationOrSequence,
@@ -2587,6 +2588,15 @@ impl SqlEditorWidget {
             || at_create_table_partition_column_slot
             || at_alter_table_add_declared_column_slot
             || at_alter_table_partition_column_slot;
+        let mysql_delete_target_list_suggestions = if qualifier.is_none() {
+            Self::mysql_delete_target_list_suggestions_for_context(
+                deep_ctx,
+                &snapshot.prefix,
+                Some(snapshot.preferred_db_type),
+            )
+        } else {
+            None
+        };
         let include_columns = !has_local_record_member_scope
             && (!at_keyword_only_slot || at_dedicated_column_slot)
             && (matches!(
@@ -2746,8 +2756,8 @@ impl SqlEditorWidget {
             Vec::new()
         };
         // Replace (not merge) the base catalog with the object-kind list whenever
-        // the grammar expects a schema object. Even an `Any` slot (`DESC`/`AUDIT`/
-        // `CREATE SYNONYM` target) admits every *object kind*, not arbitrary SQL
+        // the grammar expects a schema object. Even a schema-wide slot (`DESC`/
+        // `AUDIT`/`CREATE SYNONYM` target) admits every *object kind*, not arbitrary SQL
         // keywords or language functions from the flat base catalog.
         let expected_object_kind = if qualifier.is_none() && !at_dedicated_column_slot {
             Self::expected_object_suggestion_kind_for_db(
@@ -2961,6 +2971,8 @@ impl SqlEditorWidget {
             } else {
                 Vec::new()
             }
+        } else if let Some(suggestions) = mysql_delete_target_list_suggestions.clone() {
+            suggestions
         } else if replace_table_context_with_expected_objects {
             expected_object_suggestions.clone()
         } else if let Some(suggestions) = create_table_declared_column_suggestions.clone() {
@@ -11121,7 +11133,6 @@ impl SqlEditorWidget {
             "TRIGGER",
             "PACKAGE",
             "TYPE",
-            "BODY",
             "DATABASE",
             "TABLESPACE",
             "USER",
@@ -16089,6 +16100,21 @@ impl SqlEditorWidget {
         if Self::mysql_show_create_database_value_non_catalog_slot(tokens, end) {
             return true;
         }
+        if Self::mysql_set_system_variable_name_non_catalog_slot(tokens, end) {
+            return true;
+        }
+        if Self::mysql_set_system_variable_value_non_catalog_slot(tokens, end) {
+            return true;
+        }
+        if Self::mysql_user_account_tail_non_catalog_slot(tokens, end) {
+            return true;
+        }
+        if Self::mysql_definer_account_tail_non_catalog_slot(tokens, end) {
+            return true;
+        }
+        if Self::mysql_set_password_account_tail_non_catalog_slot(tokens, end) {
+            return true;
+        }
         if Self::mysql_table_structure_column_pattern_complete_non_catalog_slot(tokens, end) {
             return true;
         }
@@ -16223,6 +16249,186 @@ impl SqlEditorWidget {
         }
 
         false
+    }
+
+    fn mysql_set_system_variable_name_non_catalog_slot(tokens: &[SqlToken], end: usize) -> bool {
+        let items = Self::meaningful_tokens_before(tokens, end)
+            .into_iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                SqlToken::Symbol(symbol) if symbol == "," => Some(symbol.clone()),
+                SqlToken::Symbol(_) | SqlToken::String(_) | SqlToken::Comment(_) => None,
+            })
+            .collect::<Vec<_>>();
+        if items.first().map(String::as_str) != Some("SET") {
+            return false;
+        }
+
+        let scoped_set = matches!(
+            items.get(1).map(String::as_str),
+            Some("GLOBAL" | "SESSION" | "PERSIST" | "PERSIST_ONLY")
+        );
+        let segment_start = items
+            .iter()
+            .rposition(|item| item == ",")
+            .map_or(1, |idx| idx + 1);
+        let segment = items.get(segment_start..).unwrap_or(&[]);
+        let scoped_segment_head = matches!(
+            segment,
+            [scope]
+                if matches!(
+                    scope.as_str(),
+                    "GLOBAL" | "SESSION" | "PERSIST" | "PERSIST_ONLY"
+                )
+        );
+        (scoped_set && segment.len() <= 1) || scoped_segment_head
+    }
+
+    fn mysql_set_system_variable_value_non_catalog_slot(tokens: &[SqlToken], end: usize) -> bool {
+        let items = Self::meaningful_tokens_before(tokens, end)
+            .into_iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                SqlToken::String(_) => Some("__VALUE__".to_string()),
+                SqlToken::Symbol(symbol) if matches!(symbol.as_str(), "=" | "," | "." | "@") => {
+                    Some(symbol.clone())
+                }
+                SqlToken::Symbol(_) | SqlToken::Comment(_) => None,
+            })
+            .collect::<Vec<_>>();
+        if items.first().map(String::as_str) != Some("SET") {
+            return false;
+        }
+
+        let scoped_set = matches!(
+            items.get(1).map(String::as_str),
+            Some("GLOBAL" | "SESSION" | "PERSIST" | "PERSIST_ONLY")
+        );
+        let segment_start = items
+            .iter()
+            .rposition(|item| item == ",")
+            .map_or(1, |idx| idx + 1);
+        let segment = items.get(segment_start..).unwrap_or(&[]);
+        let Some(eq_idx) = segment.iter().position(|item| item == "=") else {
+            return false;
+        };
+        if eq_idx == 0 {
+            return false;
+        }
+
+        let scoped_segment_head = matches!(
+            segment.first().map(String::as_str),
+            Some("GLOBAL" | "SESSION" | "LOCAL" | "PERSIST" | "PERSIST_ONLY")
+        );
+        let qualified_system_variable = matches!(
+            (segment.first().map(String::as_str), segment.get(1).map(String::as_str)),
+            (Some("@"), Some("@"))
+        );
+        scoped_set || scoped_segment_head || qualified_system_variable
+    }
+
+    fn mysql_user_account_tail_non_catalog_slot(tokens: &[SqlToken], end: usize) -> bool {
+        const USER_OPTION_HEADS: &[&str] = &[
+            "ACCOUNT",
+            "ADD",
+            "ATTRIBUTE",
+            "COMMENT",
+            "DEFAULT",
+            "DISCARD",
+            "DROP",
+            "FAILED_LOGIN_ATTEMPTS",
+            "IDENTIFIED",
+            "MODIFY",
+            "PASSWORD",
+            "PASSWORD_LOCK_TIME",
+            "REQUIRE",
+            "WITH",
+        ];
+
+        let items = Self::meaningful_tokens_before(tokens, end)
+            .into_iter()
+            .filter_map(Self::mysql_user_account_slot_item)
+            .collect::<Vec<_>>();
+        if !matches!(items.as_slice(), [verb, user, ..] if matches!(verb.as_str(), "CREATE" | "ALTER") && user == "USER")
+        {
+            return false;
+        }
+
+        let mut account_idx = 2;
+        if items.first().map(String::as_str) == Some("CREATE")
+            && matches!(
+                items.get(account_idx..account_idx + 3),
+                Some([if_kw, not_kw, exists_kw])
+                    if if_kw == "IF" && not_kw == "NOT" && exists_kw == "EXISTS"
+            )
+        {
+            account_idx += 3;
+        } else if items.first().map(String::as_str) == Some("ALTER")
+            && matches!(
+                items.get(account_idx..account_idx + 2),
+                Some([if_kw, exists_kw]) if if_kw == "IF" && exists_kw == "EXISTS"
+            )
+        {
+            account_idx += 2;
+        }
+
+        let account_tail = items.get(account_idx..).unwrap_or(&[]);
+        if account_tail
+            .iter()
+            .any(|item| USER_OPTION_HEADS.contains(&item.as_str()))
+        {
+            return false;
+        }
+
+        account_tail.iter().any(|item| item == "@")
+    }
+
+    fn mysql_definer_account_tail_non_catalog_slot(tokens: &[SqlToken], end: usize) -> bool {
+        let items = Self::meaningful_tokens_before(tokens, end)
+            .into_iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                SqlToken::String(_) => Some("__VALUE__".to_string()),
+                SqlToken::Symbol(symbol) if matches!(symbol.as_str(), "=" | "@") => {
+                    Some(symbol.clone())
+                }
+                SqlToken::Symbol(_) | SqlToken::Comment(_) => None,
+            })
+            .collect::<Vec<_>>();
+        if !matches!(items.first().map(String::as_str), Some("CREATE" | "ALTER")) {
+            return false;
+        }
+        let Some(definer_idx) = items.iter().rposition(|item| item == "DEFINER") else {
+            return false;
+        };
+        if definer_idx >= 2
+            && matches!(
+                (items.get(definer_idx - 2), items.get(definer_idx - 1)),
+                (Some(sql), Some(security)) if sql == "SQL" && security == "SECURITY"
+            )
+        {
+            return false;
+        }
+
+        items
+            .get(definer_idx + 1..)
+            .is_some_and(|account_tail| account_tail.iter().any(|item| item == "@"))
+    }
+
+    fn mysql_set_password_account_tail_non_catalog_slot(tokens: &[SqlToken], end: usize) -> bool {
+        let items = Self::meaningful_tokens_before(tokens, end)
+            .into_iter()
+            .filter_map(Self::mysql_user_account_slot_item)
+            .collect::<Vec<_>>();
+        matches!(
+            items.as_slice(),
+            [set, password, for_kw, tail @ ..]
+                if set == "SET"
+                    && password == "PASSWORD"
+                    && for_kw == "FOR"
+                    && tail.iter().any(|item| item == "@")
+                    && !tail.iter().any(|item| item == "TO")
+        )
     }
 
     /// Oracle `ALTER SESSION/SYSTEM SET <parameter> [=] <value>` names runtime
@@ -17843,10 +18049,10 @@ impl SqlEditorWidget {
     /// Returns `None` while the target is still being typed (the cursor's word is
     /// excluded by the caller, leaving the leading keyword as the last token) so
     /// table completion keeps working there. `UPDATE` is recognized by its
-    /// dedicated `UpdateTarget` phase, which excludes post-`JOIN` positions
-    /// (those become `FromClause`); `DELETE` shares `FromClause` with `SELECT`, so
-    /// it is keyed on the leading `DELETE` and limited to the single-table form
-    /// (no `JOIN`/comma) to avoid a MySQL multi-table delete's join targets.
+    /// dedicated `UpdateTarget` phase; `DELETE` shares `FromClause` with
+    /// `SELECT`, so it is keyed on the leading `DELETE` and limited to the
+    /// single-table form (no `JOIN`/comma) to avoid MySQL multi-table DML join
+    /// targets.
     fn expected_dml_target_keyword_candidates(
         tokens: &[SqlToken],
         end: usize,
@@ -17892,6 +18098,8 @@ impl SqlEditorWidget {
                 | "INTO"
                 | "FROM"
                 | "USING"
+                | "JOIN"
+                | "STRAIGHT_JOIN"
                 | "SET"
                 | "VALUES"
                 | "LOW_PRIORITY"
@@ -17922,6 +18130,7 @@ impl SqlEditorWidget {
                 if matches!(phase, SqlPhase::FromClause | SqlPhase::DeleteTarget)
                     && !toks.iter().any(|token| {
                         matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("JOIN"))
+                            || matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("STRAIGHT_JOIN"))
                             || matches!(token, SqlToken::Symbol(sym) if sym == ",")
                     }) =>
             {
@@ -17935,6 +18144,249 @@ impl SqlEditorWidget {
                     Some(&["WHERE"])
                 }
             }
+            _ => None,
+        }
+    }
+
+    fn expected_dml_target_object_suggestion_kind(
+        tokens: &[SqlToken],
+        end: usize,
+        phase: intellisense_context::SqlPhase,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<ExpectedObjectSuggestionKind> {
+        use intellisense_context::SqlPhase;
+
+        if Self::top_level_word_pair_present_before(tokens, end, "LOG", "ERRORS") {
+            return None;
+        }
+        if Self::expected_dml_target_keyword_candidates(tokens, end, phase, db_type).is_some() {
+            return None;
+        }
+
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        let lead = toks.iter().find_map(|token| match token {
+            SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+            _ => None,
+        })?;
+
+        match lead.as_str() {
+            "UPDATE"
+                if matches!(phase, SqlPhase::UpdateTarget)
+                    && !toks.iter().any(|token| {
+                        matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("JOIN"))
+                            || matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("STRAIGHT_JOIN"))
+                            || matches!(token, SqlToken::Symbol(sym) if sym == ",")
+                    }) =>
+            {
+                Some(ExpectedObjectSuggestionKind::Table)
+            }
+            "INSERT" | "REPLACE"
+                if matches!(phase, SqlPhase::IntoClause)
+                    && toks.iter().any(|token| {
+                        matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("INTO"))
+                    }) =>
+            {
+                Some(ExpectedObjectSuggestionKind::Table)
+            }
+            "MERGE"
+                if matches!(phase, SqlPhase::IntoClause | SqlPhase::MergeTarget)
+                    && toks.iter().any(|token| {
+                        matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("INTO"))
+                    }) =>
+            {
+                (!toks.iter().any(|token| {
+                    matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("USING"))
+                }))
+                .then_some(ExpectedObjectSuggestionKind::Table)
+            }
+            "DELETE"
+                if matches!(phase, SqlPhase::FromClause | SqlPhase::DeleteTarget)
+                    && toks.iter().any(|token| {
+                        matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("FROM"))
+                    })
+                    && !(crate::sql_text::mysql_compatibility_for_sql("", db_type)
+                        && Self::mysql_delete_from_anchor_has_target_list(&toks))
+                    && !toks.iter().any(|token| {
+                        matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("JOIN"))
+                            || matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("STRAIGHT_JOIN"))
+                            || matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("USING"))
+                            || matches!(token, SqlToken::Symbol(sym) if sym == ",")
+                    }) =>
+            {
+                Some(ExpectedObjectSuggestionKind::Table)
+            }
+            _ => None,
+        }
+    }
+
+    fn mysql_delete_from_anchor_has_target_list(tokens: &[&SqlToken]) -> bool {
+        let Some(delete_idx) = tokens.iter().position(
+            |token| matches!(*token, SqlToken::Word(word) if word.eq_ignore_ascii_case("DELETE")),
+        ) else {
+            return false;
+        };
+        let Some(from_idx) = tokens.iter().position(
+            |token| matches!(*token, SqlToken::Word(word) if word.eq_ignore_ascii_case("FROM")),
+        ) else {
+            return false;
+        };
+        if from_idx <= delete_idx + 1 {
+            return false;
+        }
+        tokens[(delete_idx + 1)..from_idx].iter().any(|token| match *token {
+            SqlToken::Word(word) => !matches!(
+                word.to_ascii_uppercase().as_str(),
+                "LOW_PRIORITY" | "QUICK" | "IGNORE"
+            ),
+            SqlToken::Symbol(sym) => sym == "," || sym == "*" || sym == ".",
+            _ => false,
+        })
+    }
+
+    fn mysql_delete_target_list_suggestions_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        prefix: &str,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<Vec<String>> {
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return None;
+        }
+
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let context_end =
+            Self::expected_suggestion_context_end(tokens, deep_ctx.cursor_token_len, !prefix.is_empty());
+        let depths = crate::ui::sql_depth::paren_depths(tokens);
+        let delete_idx = tokens.iter().enumerate().find_map(|(idx, token)| {
+            (crate::ui::sql_depth::is_top_level_depth(&depths, idx)
+                && matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("DELETE")))
+            .then_some(idx)
+        })?;
+        if context_end <= delete_idx {
+            return None;
+        }
+
+        let from_idx = tokens.iter().enumerate().skip(delete_idx + 1).find_map(|(idx, token)| {
+            (crate::ui::sql_depth::is_top_level_depth(&depths, idx)
+                && matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("FROM")))
+            .then_some(idx)
+        })?;
+        if context_end > from_idx {
+            return None;
+        }
+        if (delete_idx + 1..context_end).any(|idx| {
+            crate::ui::sql_depth::is_top_level_depth(&depths, idx)
+                && matches!(tokens.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("FROM"))
+        }) {
+            return None;
+        }
+
+        let prefix_lookup = Self::completion_identifier_lookup_upper(prefix);
+        let mut seen = HashSet::new();
+        let mut suggestions = Vec::new();
+        for table_ref in &deep_ctx.tables_in_scope {
+            let candidate = table_ref.alias.as_ref().unwrap_or(&table_ref.name);
+            let lookup = Self::completion_identifier_lookup_upper(candidate);
+            if !lookup.starts_with(&prefix_lookup) || !seen.insert(lookup.clone()) {
+                continue;
+            }
+            if table_ref.alias.is_some() {
+                suggestions.push(candidate.clone());
+            } else {
+                suggestions.push(lookup);
+            }
+        }
+
+        Some(suggestions)
+    }
+
+    fn expected_table_source_object_suggestion_kind(
+        tokens: &[SqlToken],
+        end: usize,
+        phase: intellisense_context::SqlPhase,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<ExpectedObjectSuggestionKind> {
+        let last_idx = Self::previous_non_comment_token_index(tokens, end)?;
+        let depths = crate::ui::sql_depth::paren_depths(tokens);
+        if !crate::ui::sql_depth::is_top_level_depth(&depths, last_idx)
+            || Self::cursor_is_before_current_query_from_clause(tokens, end)
+            || tokens
+                .iter()
+                .enumerate()
+                .skip(end.min(tokens.len()))
+                .any(|(idx, token)| {
+                    crate::ui::sql_depth::is_top_level_depth(&depths, idx)
+                        && matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("FROM"))
+                })
+        {
+            return None;
+        }
+
+        let meaningful = Self::meaningful_tokens_before(tokens, end);
+        let query_head = Self::first_top_level_query_head(tokens, end);
+        let lead = meaningful.iter().find_map(|token| match token {
+            SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+            _ => None,
+        });
+        let source_anchor_is_dml_using = matches!(
+            meaningful.last(),
+            Some(SqlToken::Word(word))
+                if word.eq_ignore_ascii_case("USING")
+                    && matches!(lead.as_deref(), Some("MERGE" | "DELETE"))
+        );
+        let mysql_compatible = crate::sql_text::mysql_compatibility_for_sql("", db_type);
+        let source_anchor_is_mysql_dml_relation = mysql_compatible
+            && matches!(lead.as_deref(), Some("UPDATE" | "DELETE"))
+            && (matches!(
+                meaningful.last(),
+                Some(SqlToken::Word(word))
+                    if word.eq_ignore_ascii_case("JOIN")
+                        || word.eq_ignore_ascii_case("STRAIGHT_JOIN")
+            ) || matches!(meaningful.last(), Some(SqlToken::Symbol(sym)) if sym == ","));
+        let source_anchor_is_mysql_delete_from = mysql_compatible
+            && matches!(lead.as_deref(), Some("DELETE"))
+            && matches!(
+                meaningful.last(),
+                Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("FROM")
+            )
+            && Self::mysql_delete_from_anchor_has_target_list(&meaningful);
+
+        if !(query_head.is_some()
+            && matches!(phase, intellisense_context::SqlPhase::FromClause)
+            || (phase.is_table_context()
+                && (source_anchor_is_dml_using
+                    || source_anchor_is_mysql_dml_relation
+                    || source_anchor_is_mysql_delete_from)))
+            || Self::expected_dml_target_keyword_candidates(tokens, end, phase, db_type).is_some()
+            || Self::expected_mysql_index_hint_keyword_candidates(tokens, end, phase, db_type)
+                .is_some()
+            || !Self::expected_query_clause_continuation_keywords(tokens, end, phase, db_type)
+                .is_empty()
+        {
+            return None;
+        }
+
+        match meaningful.last()? {
+            SqlToken::Word(word)
+                if matches!(
+                    word.to_ascii_uppercase().as_str(),
+                    "FROM" | "JOIN" | "STRAIGHT_JOIN" | "APPLY"
+                ) =>
+            {
+                Some(ExpectedObjectSuggestionKind::ColumnOwner)
+            }
+            SqlToken::Word(word)
+                if (word.eq_ignore_ascii_case("USING") && source_anchor_is_dml_using)
+                    || (word.eq_ignore_ascii_case("JOIN")
+                        && source_anchor_is_mysql_dml_relation)
+                    || (word.eq_ignore_ascii_case("STRAIGHT_JOIN")
+                        && source_anchor_is_mysql_dml_relation) =>
+            {
+                Some(ExpectedObjectSuggestionKind::ColumnOwner)
+            }
+            SqlToken::Symbol(sym) if sym == "," && source_anchor_is_mysql_dml_relation => {
+                Some(ExpectedObjectSuggestionKind::ColumnOwner)
+            }
+            SqlToken::Symbol(sym) if sym == "," => Some(ExpectedObjectSuggestionKind::ColumnOwner),
             _ => None,
         }
     }
@@ -24830,6 +25282,7 @@ impl SqlEditorWidget {
                     "TABLE",
                     "VIEW",
                     "MATERIALIZED",
+                    "EDITION",
                     "EDITIONING",
                     "MINING",
                     "OPERATOR",
@@ -24852,8 +25305,8 @@ impl SqlEditorWidget {
                     Some("MATERIALIZED") => return Some(&["VIEW"]),
                     Some("MINING") => return Some(&["MODEL"]),
                     Some(
-                        "TABLE" | "COLUMN" | "VIEW" | "EDITIONING" | "OPERATOR" | "INDEXTYPE"
-                        | "MODEL",
+                        "TABLE" | "COLUMN" | "VIEW" | "EDITION" | "EDITIONING" | "OPERATOR"
+                        | "INDEXTYPE" | "MODEL",
                     ) => return None,
                     Some(_) => return Some(&["IS"]),
                     None => {}
@@ -29219,6 +29672,7 @@ impl SqlEditorWidget {
                 | "FULL"
                 | "CROSS"
                 | "NATURAL"
+                | "STRAIGHT_JOIN"
                 | "OUTER"
                 | "ON"
                 | "USING"
@@ -37656,6 +38110,15 @@ impl SqlEditorWidget {
 
         let words = Self::previous_meaningful_words_upper(tokens, context_end, 16);
 
+        if let Some(kind) = Self::expected_dml_target_object_suggestion_kind(
+            tokens,
+            context_end,
+            deep_ctx.phase,
+            db_type,
+        ) {
+            return Some(kind);
+        }
+
         if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
             if let Some(kind) =
                 Self::expected_mysql_show_grants_using_object_suggestion_kind(tokens, context_end)
@@ -37708,9 +38171,17 @@ impl SqlEditorWidget {
                 return Some(kind);
             }
             if let Some(kind) =
+                Self::expected_mysql_create_table_like_object_suggestion_kind(tokens, context_end)
+            {
+                return Some(kind);
+            }
+            if let Some(kind) =
                 Self::expected_mysql_index_cache_object_suggestion_kind(tokens, context_end)
             {
                 return Some(kind);
+            }
+            if Self::cursor_is_at_mysql_drop_index_on_table_target_slot(tokens, context_end) {
+                return Some(ExpectedObjectSuggestionKind::Table);
             }
             if let Some(kind) =
                 Self::expected_mysql_handler_table_object_suggestion_kind(tokens, context_end)
@@ -37783,7 +38254,7 @@ impl SqlEditorWidget {
         if Self::cursor_is_in_statement_structural_head(tokens, context_end)
             && Self::is_create_synonym_target_context(&words)
         {
-            return Some(ExpectedObjectSuggestionKind::Any);
+            return Some(ExpectedObjectSuggestionKind::SchemaObject);
         }
         if Self::cursor_is_at_create_on_table_target_slot(tokens, context_end) {
             return Some(ExpectedObjectSuggestionKind::Table);
@@ -37813,9 +38284,26 @@ impl SqlEditorWidget {
                     return Some(ExpectedObjectSuggestionKind::ColumnOwner);
                 }
                 [.., last] if matches!(last.as_str(), "DESC" | "DESCRIBE") => {
-                    return Some(ExpectedObjectSuggestionKind::Any);
+                    return Some(ExpectedObjectSuggestionKind::SchemaObject);
                 }
                 _ => {}
+            }
+        }
+
+        let query_tokens = Self::current_query_tokens(deep_ctx);
+        let query_context_end = Self::expected_suggestion_context_end(
+            query_tokens,
+            Self::cursor_token_len_in_current_query(deep_ctx),
+            exclude_current_identifier_chain,
+        );
+        if qualifier.is_none() {
+            if let Some(kind) = Self::expected_table_source_object_suggestion_kind(
+                query_tokens,
+                query_context_end,
+                deep_ctx.phase,
+                db_type,
+            ) {
+                return Some(kind);
             }
         }
 
@@ -37906,6 +38394,9 @@ impl SqlEditorWidget {
             [.., a, b, c] if *a == "COMMENT" && *b == "ON" && *c == "INDEXTYPE" => {
                 Some(ExpectedObjectSuggestionKind::Indextype)
             }
+            [.., a, b, c] if *a == "COMMENT" && *b == "ON" && *c == "EDITION" => {
+                Some(ExpectedObjectSuggestionKind::Edition)
+            }
             [.., a, b, c, d]
                 if *a == "COMMENT" && *b == "ON" && *c == "MINING" && *d == "MODEL" =>
             {
@@ -37921,6 +38412,18 @@ impl SqlEditorWidget {
                 Some(oracle_only_kind(ExpectedObjectSuggestionKind::Table))
             }
             [.., prev, last] if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "TYPE" => {
+                Some(oracle_only_kind(ExpectedObjectSuggestionKind::Type))
+            }
+            [.., object_type, body]
+                if words.first().map(String::as_str) == Some("CREATE")
+                    && *body == "BODY"
+                    && *object_type == "TYPE" =>
+            {
+                Some(oracle_only_kind(ExpectedObjectSuggestionKind::Type))
+            }
+            [.., verb, object_type, body]
+                if *verb == "ALTER" && *body == "BODY" && *object_type == "TYPE" =>
+            {
                 Some(oracle_only_kind(ExpectedObjectSuggestionKind::Type))
             }
             [.., a, b, c] if *a == "DROP" && *b == "TYPE" && *c == "BODY" => {
@@ -37959,6 +38462,18 @@ impl SqlEditorWidget {
                 Some(ExpectedObjectSuggestionKind::Function)
             }
             [.., prev, last] if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "PACKAGE" => {
+                Some(oracle_only_kind(ExpectedObjectSuggestionKind::Package))
+            }
+            [.., object_type, body]
+                if words.first().map(String::as_str) == Some("CREATE")
+                    && *body == "BODY"
+                    && *object_type == "PACKAGE" =>
+            {
+                Some(oracle_only_kind(ExpectedObjectSuggestionKind::Package))
+            }
+            [.., verb, object_type, body]
+                if *verb == "ALTER" && *body == "BODY" && *object_type == "PACKAGE" =>
+            {
                 Some(oracle_only_kind(ExpectedObjectSuggestionKind::Package))
             }
             [.., a, b, c] if *a == "DROP" && *b == "PACKAGE" && *c == "BODY" => {
@@ -38463,6 +38978,31 @@ impl SqlEditorWidget {
         .then_some(ExpectedObjectSuggestionKind::Table)
     }
 
+    fn expected_mysql_create_table_like_object_suggestion_kind(
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> Option<ExpectedObjectSuggestionKind> {
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        let items = toks
+            .iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                SqlToken::Symbol(symbol) if symbol == "." => Some(symbol.clone()),
+                SqlToken::Symbol(_) | SqlToken::String(_) | SqlToken::Comment(_) => None,
+            })
+            .collect::<Vec<_>>();
+        if items.first().map(String::as_str) != Some("CREATE")
+            || !items.iter().any(|item| item == "TABLE")
+            || items.iter().any(|item| item == "SELECT")
+        {
+            return None;
+        }
+        let like_idx = items.iter().rposition(|item| item == "LIKE")?;
+        let tail = items.get(like_idx + 1..)?;
+        (tail.is_empty() || matches!(tail, [_, dot] if dot == "."))
+            .then_some(ExpectedObjectSuggestionKind::Table)
+    }
+
     fn expected_mysql_admin_table_list_object_suggestion_kind(
         tokens: &[SqlToken],
         end: usize,
@@ -38657,11 +39197,6 @@ impl SqlEditorWidget {
             [set, password, for_kw] if set == "SET" && password == "PASSWORD" && for_kw == "FOR" => {
                 true
             }
-            [set, password, for_kw, .., at]
-                if set == "SET" && password == "PASSWORD" && for_kw == "FOR" && at == "@" =>
-            {
-                true
-            }
             _ => false,
         };
         account_slot.then_some(ExpectedObjectSuggestionKind::User)
@@ -38699,8 +39234,6 @@ impl SqlEditorWidget {
         let user_slot = match account_tail {
             [] => true,
             [eq] if eq == "=" => true,
-            [_, at] if at == "@" => true,
-            [eq, _, at] if eq == "=" && at == "@" => true,
             _ => false,
         };
         user_slot.then_some(ExpectedObjectSuggestionKind::User)
@@ -38854,7 +39387,7 @@ impl SqlEditorWidget {
         // not restricted to the GRANT privilege sets, so any non-empty option
         // list resolves the `ON` slot to an object of any kind.
         if matches!(words[verb_idx].as_str(), "AUDIT" | "NOAUDIT") {
-            return Some(ExpectedObjectSuggestionKind::Any);
+            return Some(ExpectedObjectSuggestionKind::SchemaObject);
         }
         if privilege_words
             .iter()
@@ -39094,6 +39627,12 @@ impl SqlEditorWidget {
         let suggestions = match kind {
             ExpectedObjectSuggestionKind::NoSuggestions => Vec::new(),
             ExpectedObjectSuggestionKind::Any => data.get_object_suggestions(prefix),
+            ExpectedObjectSuggestionKind::SchemaObject => {
+                let mut suggestions = data.get_object_suggestions(prefix);
+                suggestions
+                    .retain(|suggestion| !Self::matches_string_list_case_insensitive(&data.users, suggestion));
+                suggestions
+            }
             ExpectedObjectSuggestionKind::Routine => data.get_routine_object_suggestions(prefix),
             ExpectedObjectSuggestionKind::Executable => data.get_executable_object_suggestions(prefix),
             ExpectedObjectSuggestionKind::RelationOrSequence => {
@@ -39144,7 +39683,10 @@ impl SqlEditorWidget {
 
         if matches!(kind, ExpectedObjectSuggestionKind::NoSuggestions)
             || prefix.is_empty()
-            || matches!(kind, ExpectedObjectSuggestionKind::User)
+            || matches!(
+                kind,
+                ExpectedObjectSuggestionKind::SchemaObject | ExpectedObjectSuggestionKind::User
+            )
             || crate::sql_text::mysql_compatibility_for_sql("", db_type)
         {
             return suggestions;
@@ -39198,6 +39740,43 @@ impl SqlEditorWidget {
         match kind {
             ExpectedObjectSuggestionKind::NoSuggestions => false,
             ExpectedObjectSuggestionKind::Any => true,
+            ExpectedObjectSuggestionKind::SchemaObject => {
+                !Self::matches_string_list_case_insensitive(&data.users, candidate)
+                    && (Self::matches_string_list_case_insensitive(&data.tables, candidate)
+                        || Self::matches_string_list_case_insensitive(&data.views, candidate)
+                        || Self::matches_string_list_case_insensitive(
+                            &data.materialized_views,
+                            candidate,
+                        )
+                        || Self::matches_string_list_case_insensitive(&data.types, candidate)
+                        || Self::matches_string_list_case_insensitive(&data.triggers, candidate)
+                        || Self::matches_string_list_case_insensitive(&data.events, candidate)
+                        || Self::matches_string_list_case_insensitive(&data.indexes, candidate)
+                        || Self::matches_string_list_case_insensitive(&data.procedures, candidate)
+                        || Self::matches_string_list_case_insensitive(&data.functions, candidate)
+                        || Self::matches_string_list_case_insensitive(&data.packages, candidate)
+                        || Self::matches_string_list_case_insensitive(&data.sequences, candidate)
+                        || Self::matches_string_list_case_insensitive(&data.synonyms, candidate)
+                        || Self::matches_string_list_case_insensitive(
+                            &data.public_synonyms,
+                            candidate,
+                        )
+                        || Self::matches_string_list_case_insensitive(
+                            &data.database_links,
+                            candidate,
+                        )
+                        || Self::matches_string_list_case_insensitive(&data.directories, candidate)
+                        || Self::matches_string_list_case_insensitive(&data.libraries, candidate)
+                        || Self::matches_string_list_case_insensitive(&data.clusters, candidate)
+                        || Self::matches_string_list_case_insensitive(&data.contexts, candidate)
+                        || Self::matches_string_list_case_insensitive(&data.dimensions, candidate)
+                        || Self::matches_string_list_case_insensitive(&data.operators, candidate)
+                        || Self::matches_string_list_case_insensitive(&data.indextypes, candidate)
+                        || Self::matches_string_list_case_insensitive(&data.editions, candidate)
+                        || Self::matches_string_list_case_insensitive(&data.java_sources, candidate)
+                        || Self::matches_string_list_case_insensitive(&data.java_classes, candidate)
+                        || Self::matches_string_list_case_insensitive(&data.java_resources, candidate))
+            }
             ExpectedObjectSuggestionKind::Routine => {
                 Self::matches_string_list_case_insensitive(&data.procedures, candidate)
                     || Self::matches_string_list_case_insensitive(&data.functions, candidate)
@@ -39310,7 +39889,33 @@ impl SqlEditorWidget {
     ) -> Option<&'static [QualifiedMemberKind]> {
         match kind {
             ExpectedObjectSuggestionKind::NoSuggestions => Some(&[]),
-            ExpectedObjectSuggestionKind::Any => None,
+            ExpectedObjectSuggestionKind::Any | ExpectedObjectSuggestionKind::SchemaObject => Some(&[
+                QualifiedMemberKind::Table,
+                QualifiedMemberKind::View,
+                QualifiedMemberKind::MaterializedView,
+                QualifiedMemberKind::Type,
+                QualifiedMemberKind::Trigger,
+                QualifiedMemberKind::Event,
+                QualifiedMemberKind::Index,
+                QualifiedMemberKind::Procedure,
+                QualifiedMemberKind::Function,
+                QualifiedMemberKind::Package,
+                QualifiedMemberKind::Sequence,
+                QualifiedMemberKind::Synonym,
+                QualifiedMemberKind::PublicSynonym,
+                QualifiedMemberKind::DatabaseLink,
+                QualifiedMemberKind::Directory,
+                QualifiedMemberKind::Library,
+                QualifiedMemberKind::Cluster,
+                QualifiedMemberKind::Context,
+                QualifiedMemberKind::Dimension,
+                QualifiedMemberKind::Operator,
+                QualifiedMemberKind::Indextype,
+                QualifiedMemberKind::Edition,
+                QualifiedMemberKind::JavaSource,
+                QualifiedMemberKind::JavaClass,
+                QualifiedMemberKind::JavaResource,
+            ]),
             ExpectedObjectSuggestionKind::Routine => Some(&[
                 QualifiedMemberKind::Procedure,
                 QualifiedMemberKind::Function,
@@ -39548,8 +40153,33 @@ impl SqlEditorWidget {
         else {
             return suggestions;
         };
-        if matches!(kind, ExpectedObjectSuggestionKind::Any) {
-            return suggestions;
+
+        if matches!(
+            kind,
+            ExpectedObjectSuggestionKind::Any | ExpectedObjectSuggestionKind::SchemaObject
+        ) {
+            let Some(expected_kinds) = Self::expected_qualifier_member_kinds_for_db(kind, db_type)
+            else {
+                return suggestions;
+            };
+            let mut filtered = Vec::new();
+            let mut seen = HashSet::new();
+            for suggestion in &suggestions {
+                match data.qualifier_member_matches_kinds(qualifier, suggestion, expected_kinds) {
+                    Some(false) if data.qualifier_member_has_kind_metadata(qualifier, suggestion) => {
+                        continue;
+                    }
+                    Some(true) | None => {}
+                    Some(false) => {}
+                }
+                if seen.insert(Self::completion_identifier_lookup_upper(suggestion)) {
+                    filtered.push(suggestion.clone());
+                }
+                if filtered.len() >= MAX_MERGED_SUGGESTIONS {
+                    break;
+                }
+            }
+            return filtered;
         }
 
         let mut filtered = Vec::new();
@@ -39679,10 +40309,49 @@ impl SqlEditorWidget {
                     .then_some(ExpectedObjectSuggestionKind::RelationOrSequence)
             });
         let Some(kind) = kind else { return suggestions };
-        if matches!(kind, ExpectedObjectSuggestionKind::Any) {
+        if matches!(
+            kind,
+            ExpectedObjectSuggestionKind::Any | ExpectedObjectSuggestionKind::SchemaObject
+        ) {
             let all_suggestions = data.get_member_suggestions(qualifier, prefix, false);
-            return if all_suggestions.is_empty() {
-                suggestions
+            if all_suggestions.is_empty() {
+                return suggestions;
+            }
+            let Some(expected_kinds) = Self::expected_qualifier_member_kinds_for_db(kind, db_type)
+            else {
+                return all_suggestions;
+            };
+            let mut filtered = Vec::new();
+            let mut saw_kind_metadata = false;
+            let mut seen = HashSet::new();
+            for suggestion in &all_suggestions {
+                match data.qualifier_member_matches_kinds(qualifier, suggestion, expected_kinds) {
+                    Some(true) => {
+                        saw_kind_metadata = true;
+                        if seen.insert(Self::completion_identifier_lookup_upper(suggestion)) {
+                            filtered.push(suggestion.clone());
+                        }
+                    }
+                    Some(false) if data.qualifier_member_has_kind_metadata(qualifier, suggestion) => {
+                        saw_kind_metadata = true;
+                    }
+                    Some(false) => {
+                        if seen.insert(Self::completion_identifier_lookup_upper(suggestion)) {
+                            filtered.push(suggestion.clone());
+                        }
+                    }
+                    None => {
+                        if seen.insert(Self::completion_identifier_lookup_upper(suggestion)) {
+                            filtered.push(suggestion.clone());
+                        }
+                    }
+                }
+                if filtered.len() >= MAX_MERGED_SUGGESTIONS {
+                    break;
+                }
+            }
+            return if saw_kind_metadata {
+                filtered
             } else {
                 all_suggestions
             };
@@ -41139,6 +41808,147 @@ impl SqlEditorWidget {
         tables
     }
 
+    fn cursor_is_mysql_multi_table_update_set_target(
+        deep_ctx: &intellisense_context::CursorContext,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            || !matches!(deep_ctx.phase, intellisense_context::SqlPhase::DmlSetTargetList)
+        {
+            return false;
+        }
+
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let Some((update_idx, set_idx, depths)) =
+            Self::top_level_update_set_bounds(tokens, deep_ctx.cursor_token_len)
+        else {
+            return false;
+        };
+
+        tokens
+            .iter()
+            .enumerate()
+            .take(set_idx)
+            .skip(update_idx + 1)
+            .any(|(idx, token)| {
+                crate::ui::sql_depth::is_top_level_depth(&depths, idx)
+                    && (matches!(token, SqlToken::Symbol(sym) if sym == ",")
+                        || matches!(
+                            token,
+                            SqlToken::Word(word)
+                                if word.eq_ignore_ascii_case("JOIN")
+                                    || word.eq_ignore_ascii_case("STRAIGHT_JOIN")
+                        ))
+            })
+    }
+
+    fn top_level_update_set_bounds(
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> Option<(usize, usize, Vec<usize>)> {
+        let end = end.min(tokens.len());
+        let depths = crate::ui::sql_depth::paren_depths(tokens);
+        let update_idx = tokens.iter().enumerate().take(end).find_map(|(idx, token)| {
+            (crate::ui::sql_depth::is_top_level_depth(&depths, idx)
+                && matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("UPDATE")))
+            .then_some(idx)
+        })?;
+        let set_idx = tokens
+            .iter()
+            .enumerate()
+            .take(end)
+            .skip(update_idx + 1)
+            .find_map(|(idx, token)| {
+                (crate::ui::sql_depth::is_top_level_depth(&depths, idx)
+                    && matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("SET")))
+                .then_some(idx)
+            })?;
+        Some((update_idx, set_idx, depths))
+    }
+
+    fn relation_name_ending_at(tokens: &[SqlToken], end_idx: usize) -> Option<String> {
+        if !matches!(tokens.get(end_idx), Some(SqlToken::Word(_) | SqlToken::String(_))) {
+            return None;
+        }
+
+        let mut start_idx = end_idx;
+        while start_idx >= 2
+            && matches!(tokens.get(start_idx - 1), Some(SqlToken::Symbol(sym)) if sym == ".")
+            && matches!(tokens.get(start_idx - 2), Some(SqlToken::Word(_) | SqlToken::String(_)))
+        {
+            start_idx -= 2;
+        }
+
+        let mut name = String::new();
+        for idx in start_idx..=end_idx {
+            match &tokens[idx] {
+                SqlToken::Word(word) | SqlToken::String(word) => name.push_str(word),
+                SqlToken::Symbol(sym) if sym == "." => name.push('.'),
+                _ => return None,
+            }
+        }
+        Some(name)
+    }
+
+    fn mysql_multi_table_update_qualified_target_scope(
+        deep_ctx: &intellisense_context::CursorContext,
+        qualifier: &str,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<Vec<String>> {
+        if !Self::cursor_is_mysql_multi_table_update_set_target(deep_ctx, db_type) {
+            return None;
+        }
+
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let (update_idx, set_idx, depths) =
+            Self::top_level_update_set_bounds(tokens, deep_ctx.cursor_token_len)?;
+
+        for idx in update_idx + 1..set_idx {
+            if !crate::ui::sql_depth::is_top_level_depth(&depths, idx)
+                || !matches!(tokens.get(idx), Some(SqlToken::Word(word)) if Self::completion_identifiers_match(word, qualifier))
+            {
+                continue;
+            }
+            if matches!(tokens.get(idx.saturating_sub(1)), Some(SqlToken::Symbol(sym)) if sym == ".")
+            {
+                continue;
+            }
+
+            let Some(prev_idx) = Self::previous_non_comment_token_index(tokens, idx) else {
+                continue;
+            };
+            let relation_idx = match tokens.get(prev_idx) {
+                Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("AS") => {
+                    Self::previous_non_comment_token_index(tokens, prev_idx)?
+                }
+                Some(SqlToken::Word(word))
+                    if !matches!(
+                        word.to_ascii_uppercase().as_str(),
+                        "UPDATE"
+                            | "JOIN"
+                            | "STRAIGHT_JOIN"
+                            | "LEFT"
+                            | "RIGHT"
+                            | "INNER"
+                            | "CROSS"
+                            | "ON"
+                            | "USING"
+                            | "SET"
+                    ) =>
+                {
+                    prev_idx
+                }
+                _ => continue,
+            };
+
+            if let Some(relation) = Self::relation_name_ending_at(tokens, relation_idx) {
+                return Some(vec![relation]);
+            }
+        }
+
+        None
+    }
+
     fn resolve_column_tables_for_context_for_db(
         qualifier: Option<&str>,
         deep_ctx: &intellisense_context::CursorContext,
@@ -41217,6 +42027,9 @@ impl SqlEditorWidget {
                 ) {
                     return Self::resolve_focused_column_lookup_tables(focused_tables, deep_ctx);
                 }
+                if Self::cursor_is_mysql_multi_table_update_set_target(deep_ctx, db_type) {
+                    return Self::resolve_all_scope_column_lookup_tables(deep_ctx);
+                }
                 return focused_tables.to_vec();
             }
             return Self::resolve_all_scope_column_lookup_tables(deep_ctx);
@@ -41234,6 +42047,11 @@ impl SqlEditorWidget {
                 deep_ctx,
                 qualifier,
             ) {
+                return scope;
+            }
+            if let Some(scope) =
+                Self::mysql_multi_table_update_qualified_target_scope(deep_ctx, qualifier, db_type)
+            {
                 return scope;
             }
         }
