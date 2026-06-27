@@ -326,15 +326,13 @@ impl CompletionSourcePolicy {
             // qualified column list entirely).
             base_catalog_suggestions: !self.at_tool_bind_name_slot
                 && !self.suppress_free_sql_catalog_argument_sources,
-            wildcard_suggestions: !(
-                !qualifier_is_none
-                    || self.at_keyword_only_identifier_slot
-                    || self.at_keyword_only_slot
-                    || self.at_tool_bind_name_slot
-                    || self.suppress_free_sql_catalog_argument_sources
-                    || expr_keyword_ctx.follows_operand == Some(true)
-                    || expr_keyword_ctx.at_bind_variable_name
-            ),
+            wildcard_suggestions: !(!qualifier_is_none
+                || self.at_keyword_only_identifier_slot
+                || self.at_keyword_only_slot
+                || self.at_tool_bind_name_slot
+                || self.suppress_free_sql_catalog_argument_sources
+                || expr_keyword_ctx.follows_operand == Some(true)
+                || expr_keyword_ctx.at_bind_variable_name),
             comparison_suggestions: qualifier.is_some()
                 && !self.at_keyword_only_identifier_slot
                 && !self.at_keyword_only_slot
@@ -413,9 +411,28 @@ enum ExpectedOperandTypes {
 /// belongs to a *different* operand, so a back-scan for "is this operator already
 /// applied to the current operand" must stop here.
 const OPERAND_SEGMENT_BOUNDARY_KEYWORDS: &[&str] = &[
-    "AND", "OR", "WHERE", "HAVING", "ON", "WHEN", "THEN", "ELSE", "SELECT", "FROM",
-    "GROUP", "ORDER", "BY", "START", "CONNECT", "SET", "VALUES", "USING", "RETURNING",
-    "CASE", "INTO", "BETWEEN",
+    "AND",
+    "OR",
+    "WHERE",
+    "HAVING",
+    "ON",
+    "WHEN",
+    "THEN",
+    "ELSE",
+    "SELECT",
+    "FROM",
+    "GROUP",
+    "ORDER",
+    "BY",
+    "START",
+    "CONNECT",
+    "SET",
+    "VALUES",
+    "USING",
+    "RETURNING",
+    "CASE",
+    "INTO",
+    "BETWEEN",
 ];
 
 /// Single-use postfix operators already present in the cursor's current operand
@@ -452,8 +469,10 @@ struct InsertValuesTarget {
     column_list_close_idx: Option<usize>,
 }
 
-const DATETIME_OR_NUMERIC_OPERAND_TYPES: &[PrecedingOperandType] =
-    &[PrecedingOperandType::Datetime, PrecedingOperandType::Numeric];
+const DATETIME_OR_NUMERIC_OPERAND_TYPES: &[PrecedingOperandType] = &[
+    PrecedingOperandType::Datetime,
+    PrecedingOperandType::Numeric,
+];
 
 /// Niladic temporal value keywords/functions that stand as complete operands
 /// without a following argument list. Shared by operand-type inference and
@@ -527,9 +546,34 @@ const PLSQL_PREDEFINED_EXCEPTIONS: &[&str] = &[
 /// (`expected_plsql_block_statement_keyword_candidates`) so both agree on what a
 /// statement position admits.
 const PLSQL_STATEMENT_KEYWORDS: &[&str] = &[
-    "IF", "CASE", "LOOP", "WHILE", "FOR", "FORALL", "GOTO", "NULL", "RETURN", "RAISE", "BEGIN",
-    "DECLARE", "OPEN", "CLOSE", "FETCH", "EXECUTE", "COMMIT", "ROLLBACK", "SAVEPOINT", "SET",
-    "LOCK", "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "WITH", "PIPE",
+    "IF",
+    "CASE",
+    "LOOP",
+    "WHILE",
+    "FOR",
+    "FORALL",
+    "GOTO",
+    "NULL",
+    "RETURN",
+    "RAISE",
+    "BEGIN",
+    "DECLARE",
+    "OPEN",
+    "CLOSE",
+    "FETCH",
+    "EXECUTE",
+    "COMMIT",
+    "ROLLBACK",
+    "SAVEPOINT",
+    "SET",
+    "LOCK",
+    "SELECT",
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "MERGE",
+    "WITH",
+    "PIPE",
 ];
 
 /// Maps a recognised `CREATE SEQUENCE` option word to its `&'static str` form so
@@ -563,8 +607,12 @@ fn debug_assert_unreachable_option(word: &str) -> &'static str {
 
 const JSON_ERROR_EMPTY_OPTION_FUNCTION_WORDS: &[&str] =
     &["JSON_EXISTS", "JSON_QUERY", "JSON_TABLE", "JSON_VALUE"];
-const JSON_ON_NULL_OPTION_FUNCTION_WORDS: &[&str] =
-    &["JSON_ARRAY", "JSON_ARRAYAGG", "JSON_OBJECT", "JSON_OBJECTAGG"];
+const JSON_ON_NULL_OPTION_FUNCTION_WORDS: &[&str] = &[
+    "JSON_ARRAY",
+    "JSON_ARRAYAGG",
+    "JSON_OBJECT",
+    "JSON_OBJECTAGG",
+];
 const JSON_ERROR_EMPTY_TARGET_WORDS: &[&str] = &["ERROR", "EMPTY"];
 const JSON_NULL_TARGET_WORDS: &[&str] = &["NULL"];
 const JSON_VALUE_HANDLER_HEAD_WORDS: &[&str] = &["NULL", "ERROR", "DEFAULT"];
@@ -718,14 +766,10 @@ enum IntervalUnitSlot {
     Leading,
     /// `INTERVAL '5' DAY |` — only `TO` (or end of literal) may follow,
     /// depending on the leading unit.
-    AwaitingTo {
-        leading_unit: IntervalLeadingUnit,
-    },
+    AwaitingTo { leading_unit: IntervalLeadingUnit },
     /// `INTERVAL '5' DAY TO |` — the trailing qualifier unit, constrained by
     /// the leading unit.
-    Trailing {
-        leading_unit: IntervalLeadingUnit,
-    },
+    Trailing { leading_unit: IntervalLeadingUnit },
 }
 
 /// Fixed keyword tail of an `ORDER BY` sort key.
@@ -922,9 +966,7 @@ impl ClauseCompletionPolicy {
 }
 
 /// Datetime field keywords valid in `EXTRACT(<field> FROM …)` for the dialect.
-fn extract_field_keywords_for(
-    db_type: Option<crate::db::DatabaseType>,
-) -> &'static [&'static str] {
+fn extract_field_keywords_for(db_type: Option<crate::db::DatabaseType>) -> &'static [&'static str] {
     use crate::db::DatabaseType;
 
     const ORACLE_FIELDS: &[&str] = &[
@@ -1026,9 +1068,7 @@ fn interval_unit_keywords_for(
     }
 }
 
-fn oracle_storage_completion_enabled_for_db_type(
-    db_type: Option<crate::db::DatabaseType>,
-) -> bool {
+fn oracle_storage_completion_enabled_for_db_type(db_type: Option<crate::db::DatabaseType>) -> bool {
     use crate::db::DatabaseType;
 
     let db_type = db_type.unwrap_or(DatabaseType::Oracle);
@@ -1046,8 +1086,7 @@ fn order_by_sort_modifier_keywords(
     // MySQL/MariaDB have no `NULLS FIRST/LAST` syntax, so the null-ordering
     // modifiers are pure noise there. Oracle (and the dialect-agnostic default)
     // keep them.
-    let supports_nulls_ordering =
-        !db_type.is_some_and(DatabaseType::is_mysql_or_mariadb);
+    let supports_nulls_ordering = !db_type.is_some_and(DatabaseType::is_mysql_or_mariadb);
 
     match slot {
         OrderBySortModifierSlot::AfterSortKey => {
@@ -1172,9 +1211,7 @@ fn within_group_keywords(slot: WithinGroupSlot) -> &'static [&'static str] {
     }
 }
 
-fn analytic_null_treatment_keywords(
-    slot: AnalyticNullTreatmentSlot,
-) -> &'static [&'static str] {
+fn analytic_null_treatment_keywords(slot: AnalyticNullTreatmentSlot) -> &'static [&'static str] {
     match slot {
         AnalyticNullTreatmentSlot::AfterAnalyticCall => &["IGNORE", "RESPECT", "OVER"],
         AnalyticNullTreatmentSlot::AfterNthValueCall => &["FROM", "IGNORE", "RESPECT", "OVER"],
@@ -1185,13 +1222,10 @@ fn analytic_null_treatment_keywords(
     }
 }
 
-fn analytic_null_treatment_slot_suppresses_columns(
-    slot: AnalyticNullTreatmentSlot,
-) -> bool {
+fn analytic_null_treatment_slot_suppresses_columns(slot: AnalyticNullTreatmentSlot) -> bool {
     !matches!(
         slot,
-        AnalyticNullTreatmentSlot::AfterAnalyticCall
-            | AnalyticNullTreatmentSlot::AfterNthValueCall
+        AnalyticNullTreatmentSlot::AfterAnalyticCall | AnalyticNullTreatmentSlot::AfterNthValueCall
     )
 }
 
@@ -1336,20 +1370,8 @@ fn mysql_data_type_keywords(position: DataTypePosition) -> &'static [&'static st
     ];
     // The grammar that `CAST(expr AS type)` accepts in MySQL/MariaDB.
     const MYSQL_CAST_TYPES: &[&str] = &[
-        "BINARY",
-        "CHAR",
-        "DATE",
-        "DATETIME",
-        "DECIMAL",
-        "DOUBLE",
-        "FLOAT",
-        "JSON",
-        "NCHAR",
-        "REAL",
-        "SIGNED",
-        "TIME",
-        "UNSIGNED",
-        "YEAR",
+        "BINARY", "CHAR", "DATE", "DATETIME", "DECIMAL", "DOUBLE", "FLOAT", "JSON", "NCHAR",
+        "REAL", "SIGNED", "TIME", "UNSIGNED", "YEAR",
     ];
 
     match position {
@@ -1620,7 +1642,9 @@ impl SqlEditorWidget {
 
         let cache = TOKENIZED_STATEMENT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
         let (token_ends, statement_tokens) = {
-            let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut guard = cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(entry) = guard.get(statement_text) {
                 entry.clone()
             } else {
@@ -1809,13 +1833,13 @@ impl SqlEditorWidget {
         let spawn_result = thread::Builder::new()
             .name("intellisense-parse-worker".to_string())
             .spawn(move || {
-                    let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                        let (expanded_statement, text_bind_names) =
-                            Self::expanded_statement_window_and_text_binds_from_shadow(
-                                &text_shadow_for_thread,
-                                snapshot_for_thread.cursor_pos_usize,
-                                Some(snapshot_for_thread.preferred_db_type),
-                            );
+                let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                    let (expanded_statement, text_bind_names) =
+                        Self::expanded_statement_window_and_text_binds_from_shadow(
+                            &text_shadow_for_thread,
+                            snapshot_for_thread.cursor_pos_usize,
+                            Some(snapshot_for_thread.preferred_db_type),
+                        );
                     let routine_cache = {
                         let cache = routine_symbol_cache_for_thread
                             .lock()
@@ -1996,13 +2020,16 @@ impl SqlEditorWidget {
         let has_prefix = !snapshot.prefix.is_empty();
         let context =
             Self::classify_intellisense_context(deep_ctx, deep_ctx.statement_tokens.as_ref());
-        let data_type_position = qualifier.is_none().then(|| {
-            Self::data_type_position_for_context_for_db(
-                deep_ctx,
-                has_prefix,
-                Some(snapshot.preferred_db_type),
-            )
-        }).flatten();
+        let data_type_position = qualifier
+            .is_none()
+            .then(|| {
+                Self::data_type_position_for_context_for_db(
+                    deep_ctx,
+                    has_prefix,
+                    Some(snapshot.preferred_db_type),
+                )
+            })
+            .flatten();
         let at_data_type_position = data_type_position.is_some()
             && !Self::cursor_is_at_create_table_element_keyword_slot_for_context(
                 deep_ctx,
@@ -2227,8 +2254,8 @@ impl SqlEditorWidget {
                 has_prefix,
                 Some(snapshot.preferred_db_type),
             );
-        let at_table_alias_name_slot = qualifier.is_none()
-            && Self::cursor_is_at_table_alias_name_slot(deep_ctx, has_prefix);
+        let at_table_alias_name_slot =
+            qualifier.is_none() && Self::cursor_is_at_table_alias_name_slot(deep_ctx, has_prefix);
         // The cursor may sit in a slot whose grammar is keyword/value-only — a
         // data type, a row-limiting argument, a pure window-frame keyword, an
         // EXTRACT field, an INTERVAL unit, or a punctuation-only operator opener
@@ -2279,16 +2306,15 @@ impl SqlEditorWidget {
                     .statement_end
                     .saturating_sub(analysis.statement_start),
             );
-        let local_record_member_suggestions = qualifier
-            .and_then(|qualifier| {
-                Self::collect_local_record_member_suggestions(
-                    qualifier,
-                    &snapshot.prefix,
-                    cursor_in_statement,
-                    snapshot.raw_qualifier.as_deref(),
-                    analysis,
-                )
-            });
+        let local_record_member_suggestions = qualifier.and_then(|qualifier| {
+            Self::collect_local_record_member_suggestions(
+                qualifier,
+                &snapshot.prefix,
+                cursor_in_statement,
+                snapshot.raw_qualifier.as_deref(),
+                analysis,
+            )
+        });
         let has_resolved_local_record_member_scope = local_record_member_suggestions.is_some();
         let local_rowtype_member_sources = qualifier
             .map(|qualifier| {
@@ -2336,10 +2362,8 @@ impl SqlEditorWidget {
             qualified_completion_mode,
             Some(QualifiedCompletionMode::RelationMembers | QualifiedCompletionMode::ObjectMembers)
         );
-        let mysql_compatible = crate::sql_text::mysql_compatibility_for_sql(
-            "",
-            Some(snapshot.preferred_db_type),
-        );
+        let mysql_compatible =
+            crate::sql_text::mysql_compatibility_for_sql("", Some(snapshot.preferred_db_type));
         let mysql_table_structure_column_scope = if qualifier.is_none() && mysql_compatible {
             Self::mysql_table_structure_column_scope_for_context(
                 deep_ctx,
@@ -2413,8 +2437,9 @@ impl SqlEditorWidget {
                 Some(snapshot.preferred_db_type),
             )
         };
-        let qualifier_matches_visible_relation_scope = qualifier
-            .is_some_and(|qualifier| Self::qualifier_matches_visible_relation_scope(qualifier, deep_ctx));
+        let qualifier_matches_visible_relation_scope = qualifier.is_some_and(|qualifier| {
+            Self::qualifier_matches_visible_relation_scope(qualifier, deep_ctx)
+        });
         let column_tables = if qualifier.is_some_and(|qualifier| {
             !at_comment_on_column_qualified_name_slot
                 && !qualifier_matches_visible_relation_scope
@@ -2480,11 +2505,8 @@ impl SqlEditorWidget {
             at_tool_no_sql_argument_slot,
             effective_expr_keyword_ctx,
         );
-        let source_allowance = source_policy.allowance(
-            context,
-            qualifier,
-            effective_expr_keyword_ctx,
-        );
+        let source_allowance =
+            source_policy.allowance(context, qualifier, effective_expr_keyword_ctx);
         let session_bind_names = if source_allowance.session_bind_names {
             Self::session_bind_names(connection)
         } else {
@@ -2556,19 +2578,16 @@ impl SqlEditorWidget {
             }
         }
         let at_mysql_load_file_column_slot = qualifier.is_none()
-            && crate::sql_text::mysql_compatibility_for_sql(
-                "",
-                Some(snapshot.preferred_db_type),
-            )
+            && crate::sql_text::mysql_compatibility_for_sql("", Some(snapshot.preferred_db_type))
             && Self::mysql_load_file_column_scope_for_context(deep_ctx, false).is_some();
-        let at_mysql_table_structure_column_slot = qualifier.is_none()
-            && mysql_table_structure_column_scope.is_some();
-        let at_mysql_analyze_histogram_column_slot = qualifier.is_none()
-            && mysql_analyze_histogram_column_scope.is_some();
-        let at_mysql_alter_table_index_column_slot = qualifier.is_none()
-            && mysql_alter_table_index_column_scope.is_some();
-        let at_mysql_handler_read_where_column_slot = qualifier.is_none()
-            && mysql_handler_read_where_column_scope.is_some();
+        let at_mysql_table_structure_column_slot =
+            qualifier.is_none() && mysql_table_structure_column_scope.is_some();
+        let at_mysql_analyze_histogram_column_slot =
+            qualifier.is_none() && mysql_analyze_histogram_column_scope.is_some();
+        let at_mysql_alter_table_index_column_slot =
+            qualifier.is_none() && mysql_alter_table_index_column_scope.is_some();
+        let at_mysql_handler_read_where_column_slot =
+            qualifier.is_none() && mysql_handler_read_where_column_scope.is_some();
         let at_reference_column_slot = qualifier.is_none() && reference_column_scope.is_some();
         let at_oracle_trigger_update_of_column_slot =
             qualifier.is_none() && oracle_trigger_update_of_column_scope.is_some();
@@ -2612,16 +2631,16 @@ impl SqlEditorWidget {
                 && (qualifier.is_some()
                     || matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll)
                     || at_dedicated_column_slot)));
-        let comparison_lookup_tables = if has_local_record_member_scope || qualified_mode_uses_members
-        {
-            Vec::new()
-        } else {
-            Self::comparison_lookup_tables_for_context_for_db(
-                qualifier,
-                deep_ctx,
-                Some(snapshot.preferred_db_type),
-            )
-        };
+        let comparison_lookup_tables =
+            if has_local_record_member_scope || qualified_mode_uses_members {
+                Vec::new()
+            } else {
+                Self::comparison_lookup_tables_for_context_for_db(
+                    qualifier,
+                    deep_ctx,
+                    Some(snapshot.preferred_db_type),
+                )
+            };
         let qualified_member_suggestions = match (qualifier, qualified_completion_mode) {
             (Some(qualifier), Some(QualifiedCompletionMode::RelationMembers)) => {
                 let mut data = intellisense_data
@@ -2667,8 +2686,10 @@ impl SqlEditorWidget {
                 deep_ctx,
                 !snapshot.prefix.is_empty(),
                 Some(snapshot.preferred_db_type),
-            ) || (Self::unclosed_paren_count(deep_ctx.statement_tokens.as_ref(), statement_context_end)
-                == 0
+            ) || (Self::unclosed_paren_count(
+                deep_ctx.statement_tokens.as_ref(),
+                statement_context_end,
+            ) == 0
                 && statement_locking_words.iter().any(|word| word == "SELECT")
                 && Self::expected_locking_clause_keyword_candidates(
                     deep_ctx.statement_tokens.as_ref(),
@@ -2746,21 +2767,20 @@ impl SqlEditorWidget {
         if at_dedicated_column_slot {
             expected_keyword_suggestions.clear();
         }
-        let expected_object_suggestions = if source_allowance.expected_object_suggestions
-            && !at_dedicated_column_slot
-        {
-            let mut data = intellisense_data
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            Self::collect_expected_object_suggestions_for_db(
-                &mut data,
-                &snapshot.prefix,
-                deep_ctx,
-                Some(snapshot.preferred_db_type),
-            )
-        } else {
-            Vec::new()
-        };
+        let expected_object_suggestions =
+            if source_allowance.expected_object_suggestions && !at_dedicated_column_slot {
+                let mut data = intellisense_data
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                Self::collect_expected_object_suggestions_for_db(
+                    &mut data,
+                    &snapshot.prefix,
+                    deep_ctx,
+                    Some(snapshot.preferred_db_type),
+                )
+            } else {
+                Vec::new()
+            };
         // Replace (not merge) the base catalog with the object-kind list whenever
         // the grammar expects a schema object. Even a schema-wide slot (`DESC`/
         // `AUDIT`/`CREATE SYNONYM` target) admits every *object kind*, not arbitrary SQL
@@ -2983,13 +3003,14 @@ impl SqlEditorWidget {
             expected_object_suggestions.clone()
         } else if let Some(suggestions) = create_table_declared_column_suggestions.clone() {
             suggestions
-        } else if let Some(suggestions) =
-            create_table_partition_declared_column_suggestions.clone()
+        } else if let Some(suggestions) = create_table_partition_declared_column_suggestions.clone()
         {
             suggestions
         } else if let Some(suggestions) = oracle_trigger_update_of_column_suggestions.clone() {
             suggestions
-        } else if at_oracle_trigger_when_condition || at_package_declaration_default_value_empty_operand_start {
+        } else if at_oracle_trigger_when_condition
+            || at_package_declaration_default_value_empty_operand_start
+        {
             Vec::new()
         } else if at_keyword_only_identifier_slot
             || at_column_property_argument_slot
@@ -3160,18 +3181,20 @@ impl SqlEditorWidget {
             matches!(context, SqlContext::TableName),
             qualifier.is_some(),
         );
-        let mut suggestions = if !local_suggestions.is_empty()
-            && source_allowance.prepend_local_symbol_suggestions
-        {
-            Self::prepend_local_symbol_suggestions(suggestions, local_suggestions)
-        } else {
-            suggestions
-        };
+        let mut suggestions =
+            if !local_suggestions.is_empty() && source_allowance.prepend_local_symbol_suggestions {
+                Self::prepend_local_symbol_suggestions(suggestions, local_suggestions)
+            } else {
+                suggestions
+            };
 
         // Offer an FK-based join condition as the top suggestion when filling
         // in a JOIN ... ON clause between two related tables.
         if qualifier.is_none()
-            && matches!(deep_ctx.phase, intellisense_context::SqlPhase::JoinCondition)
+            && matches!(
+                deep_ctx.phase,
+                intellisense_context::SqlPhase::JoinCondition
+            )
         {
             let real_tables = Self::auto_join_condition_tables_for_context(deep_ctx);
             let real_table_refs: Vec<&intellisense_context::ScopedTableRef> =
@@ -3197,10 +3220,8 @@ impl SqlEditorWidget {
                         Self::build_auto_join_condition(&data, right, lefts)
                     };
                     if let Some(condition) = condition {
-                        if Self::completion_suggestion_matches_prefix(
-                            &condition,
-                            &snapshot.prefix,
-                        ) && !suggestions.iter().any(|s| s == &condition)
+                        if Self::completion_suggestion_matches_prefix(&condition, &snapshot.prefix)
+                            && !suggestions.iter().any(|s| s == &condition)
                         {
                             suggestions.insert(0, condition);
                         }
@@ -3367,10 +3388,11 @@ impl SqlEditorWidget {
             ExpectedOperandTypes::Single(expected_type) => {
                 Self::operand_type_matches_expected(actual_type, expected_type)
             }
-            ExpectedOperandTypes::AnyOf(expected_types) => expected_types
-                .iter()
-                .copied()
-                .any(|expected_type| Self::operand_type_matches_expected(actual_type, expected_type)),
+            ExpectedOperandTypes::AnyOf(expected_types) => {
+                expected_types.iter().copied().any(|expected_type| {
+                    Self::operand_type_matches_expected(actual_type, expected_type)
+                })
+            }
         }
     }
 
@@ -3467,14 +3489,9 @@ impl SqlEditorWidget {
         );
         let in_mysql_top_level_value_expression = expr_keyword_ctx.in_mysql_do_value_expression
             || expr_keyword_ctx.in_mysql_set_assignment_value_expression;
-        let in_plsql_value_expression =
-            !crate::sql_text::mysql_compatibility_for_sql("", db_type)
-                && expr_keyword_ctx.in_plsql_value_expression;
-        if !prefer_columns
-            && matches!(
-                statement_start, Some(StatementStartContext::TopLevel)
-            )
-        {
+        let in_plsql_value_expression = !crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            && expr_keyword_ctx.in_plsql_value_expression;
+        if !prefer_columns && matches!(statement_start, Some(StatementStartContext::TopLevel)) {
             Self::append_top_level_statement_head_suggestions(&mut suggestions, prefix, db_type);
         }
         // The base catalog mixes columns, relations, objects and functions (kept
@@ -3539,7 +3556,8 @@ impl SqlEditorWidget {
         // function/package is kept.
         if in_mysql_top_level_value_expression {
             suggestions.retain(|suggestion| {
-                !data.is_known_relation(suggestion) || data.is_language_function(&suggestion.to_ascii_uppercase(), db_type)
+                !data.is_known_relation(suggestion)
+                    || data.is_language_function(&suggestion.to_ascii_uppercase(), db_type)
             });
         }
         if !prefer_columns
@@ -3840,7 +3858,10 @@ impl SqlEditorWidget {
         relation_anchor(
             Self::current_query_tokens(deep_ctx),
             Self::cursor_token_len_in_current_query(deep_ctx),
-        ) || relation_anchor(deep_ctx.statement_tokens.as_ref(), deep_ctx.cursor_token_len)
+        ) || relation_anchor(
+            deep_ctx.statement_tokens.as_ref(),
+            deep_ctx.cursor_token_len,
+        )
     }
 
     /// Whether a single base-catalog entry can stand where the cursor begins a
@@ -3897,7 +3918,9 @@ impl SqlEditorWidget {
     ) -> &'static [&'static str] {
         match db_type.map(crate::db::DatabaseType::sql_dialect) {
             Some(crate::db::SqlDialect::MySql) => crate::sql_text::mysql_statement_head_keywords(),
-            None | Some(crate::db::SqlDialect::Oracle) => crate::sql_text::statement_head_keywords(),
+            None | Some(crate::db::SqlDialect::Oracle) => {
+                crate::sql_text::statement_head_keywords()
+            }
         }
     }
 
@@ -3926,7 +3949,9 @@ impl SqlEditorWidget {
         db_type: Option<crate::db::DatabaseType>,
     ) -> bool {
         match ctx {
-            StatementStartContext::TopLevel => Self::keyword_begins_top_level_statement_for_db(upper, db_type),
+            StatementStartContext::TopLevel => {
+                Self::keyword_begins_top_level_statement_for_db(upper, db_type)
+            }
             StatementStartContext::Plsql(policy) => {
                 if policy.allow_statements && PLSQL_STATEMENT_KEYWORDS.contains(&upper) {
                     return true;
@@ -4075,8 +4100,22 @@ impl SqlEditorWidget {
         // pseudo-columns in any query; MySQL/MariaDB use a narrower operand-start
         // list below.
         const OPERAND_START_KEYWORDS: &[&str] = &[
-            "CASE", "CAST", "EXISTS", "NOT", "NULL", "TRUE", "FALSE", "UNKNOWN", "INTERVAL",
-            "DATE", "TIMESTAMP", "TIME", "ROWNUM", "ROWID", "MULTISET", "BINARY",
+            "CASE",
+            "CAST",
+            "EXISTS",
+            "NOT",
+            "NULL",
+            "TRUE",
+            "FALSE",
+            "UNKNOWN",
+            "INTERVAL",
+            "DATE",
+            "TIMESTAMP",
+            "TIME",
+            "ROWNUM",
+            "ROWID",
+            "MULTISET",
+            "BINARY",
         ];
         const MYSQL_OPERAND_START_KEYWORDS: &[&str] = &[
             "CASE",
@@ -4097,14 +4136,17 @@ impl SqlEditorWidget {
         // `SELECT ALL`, `UNION ALL`, `COUNT(DISTINCT x)`. They always sit at such
         // an anchor, so gating on `follows_quantifier_anchor` removes the noise of
         // offering them as a general operand without hiding a valid one.
-        const SELECT_QUANTIFIER_KEYWORDS: &[&str] =
-            &["ALL", "DISTINCT", "UNIQUE", "DISTINCTROW"];
+        const SELECT_QUANTIFIER_KEYWORDS: &[&str] = &["ALL", "DISTINCT", "UNIQUE", "DISTINCTROW"];
         const MULTISET_OPERATOR_MODIFIER_KEYWORDS: &[&str] = &["ALL", "DISTINCT"];
         const QUANTIFIED_COMPARISON_KEYWORDS: &[&str] = &["ALL", "ANY", "SOME"];
         // Hierarchical pseudo-columns/operators: grammatical only in a query that
         // has a `CONNECT BY` clause, where an operand is expected.
         const HIERARCHICAL_KEYWORDS: &[&str] = &[
-            "LEVEL", "PRIOR", "CONNECT_BY_ROOT", "CONNECT_BY_ISCYCLE", "CONNECT_BY_ISLEAF",
+            "LEVEL",
+            "PRIOR",
+            "CONNECT_BY_ROOT",
+            "CONNECT_BY_ISCYCLE",
+            "CONNECT_BY_ISLEAF",
         ];
         // Operators/continuations valid *after a complete operand*. Continuations
         // that require a *specific* preceding operand are excluded here and gated
@@ -4115,8 +4157,8 @@ impl SqlEditorWidget {
         // (datetime), `COLLATE` (character), `SUBMULTISET`/`MULTISET`
         // (collection). Every other operator is grammatical after any operand.
         const AFTER_OPERAND_KEYWORDS: &[&str] = &[
-            "AND", "OR", "NOT", "IN", "IS", "LIKE", "LIKE2", "LIKE4", "LIKEC", "BETWEEN",
-            "DIV", "MOD", "XOR", "REGEXP", "RLIKE",
+            "AND", "OR", "NOT", "IN", "IS", "LIKE", "LIKE2", "LIKE4", "LIKEC", "BETWEEN", "DIV",
+            "MOD", "XOR", "REGEXP", "RLIKE",
         ];
         // Analytic/aggregate continuations: grammatical only immediately after a
         // closed call `…)` — `SUM(x) OVER`, `MAX(x) KEEP (...)`,
@@ -4421,8 +4463,11 @@ impl SqlEditorWidget {
         // *before* the finished operand and misread a complete operand as an
         // operand-start — leaking columns/`*` after `c = 'x' `/`SELECT empno `.
         // Mirrors the flag `collect_expected_keyword_suggestions` already passes.
-        let end =
-            Self::expected_suggestion_context_end(tokens, cursor_len, exclude_current_identifier_chain);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_len,
+            exclude_current_identifier_chain,
+        );
         let mut follows_operand = Self::cursor_follows_complete_operand(tokens, end);
         let construct_continuation_keywords =
             Self::expected_expression_construct_continuation_keywords(tokens, end);
@@ -4510,10 +4555,12 @@ impl SqlEditorWidget {
                     Some(SqlToken::Word(word))
                         if Self::name_introduces_call(data, &word.to_ascii_uppercase(), db_type)
                 ),
-                Some(SqlToken::Word(word)) => matches!(
-                    word.to_ascii_uppercase().as_str(),
-                    "SELECT" | "UNION" | "EXCEPT" | "INTERSECT" | "MINUS"
-                ) && !follows_multiset_operator_modifier_anchor,
+                Some(SqlToken::Word(word)) => {
+                    matches!(
+                        word.to_ascii_uppercase().as_str(),
+                        "SELECT" | "UNION" | "EXCEPT" | "INTERSECT" | "MINUS"
+                    ) && !follows_multiset_operator_modifier_anchor
+                }
                 _ => false,
             }
         };
@@ -4546,8 +4593,7 @@ impl SqlEditorWidget {
                     Self::mysql_explain_schema_slot(full_tokens, full_end),
                     Some(MysqlExplainSchemaSlot::SchemaName)
                 ) || Self::mysql_explain_connection_value_slot(full_tokens, full_end));
-        let prev_operand_type =
-            Self::preceding_operand_type(tokens, end, data, column_scope);
+        let prev_operand_type = Self::preceding_operand_type(tokens, end, data, column_scope);
         let expected_operand_type =
             Self::expected_operand_type(tokens, end, data, column_scope, db_type);
         let is_predicate_left_operand_type =
@@ -4577,16 +4623,39 @@ impl SqlEditorWidget {
             && match Self::meaningful_tokens_before(tokens, end).last() {
                 Some(SqlToken::Symbol(sym)) => matches!(
                     sym.as_str(),
-                    ":=" | "=>" | "=" | "<" | ">" | "<=" | ">=" | "<>" | "!=" | "^="
-                        | "+" | "-" | "*" | "/" | "||"
+                    ":=" | "=>"
+                        | "="
+                        | "<"
+                        | ">"
+                        | "<="
+                        | ">="
+                        | "<>"
+                        | "!="
+                        | "^="
+                        | "+"
+                        | "-"
+                        | "*"
+                        | "/"
+                        | "||"
                 ),
                 Some(SqlToken::Word(word)) => {
-                    word.eq_ignore_ascii_case("DEFAULT")
-                        && in_package_declaration_default_value
+                    word.eq_ignore_ascii_case("DEFAULT") && in_package_declaration_default_value
                         || matches!(
                             word.to_ascii_uppercase().as_str(),
-                            "AND" | "OR" | "NOT" | "IN" | "LIKE" | "BETWEEN" | "MOD" | "XOR"
-                                | "DIV" | "RETURN" | "RAISE" | "IF" | "ELSIF" | "WHILE"
+                            "AND"
+                                | "OR"
+                                | "NOT"
+                                | "IN"
+                                | "LIKE"
+                                | "BETWEEN"
+                                | "MOD"
+                                | "XOR"
+                                | "DIV"
+                                | "RETURN"
+                                | "RAISE"
+                                | "IF"
+                                | "ELSIF"
+                                | "WHILE"
                         )
                 }
                 _ => false,
@@ -4704,10 +4773,15 @@ impl SqlEditorWidget {
             PendingDeclare,
             // A block body; `in_exception` once its `EXCEPTION` handler section
             // has begun.
-            Block { in_exception: bool },
+            Block {
+                in_exception: bool,
+            },
             // `awaiting_then` between `IF`/`ELSIF` and `THEN` (the condition);
             // `in_else` once the `ELSE` arm has begun.
-            If { awaiting_then: bool, in_else: bool },
+            If {
+                awaiting_then: bool,
+                in_else: bool,
+            },
             Loop,
             // A `CASE`: `is_statement` distinguishes a PL/SQL `CASE` statement
             // (its arms are statements) from a `CASE` value expression (arms are
@@ -4773,7 +4847,9 @@ impl SqlEditorWidget {
                             };
                         }
                     } else {
-                        stack.push(Frame::Block { in_exception: false });
+                        stack.push(Frame::Block {
+                            in_exception: false,
+                        });
                     }
                 }
                 "IF" => stack.push(Frame::If {
@@ -4786,8 +4862,15 @@ impl SqlEditorWidget {
                     }
                 }
                 "ELSE" => {
-                    if let Some(Frame::If { in_else, awaiting_then })
-                    | Some(Frame::Case { in_else, awaiting_then, .. }) = stack.last_mut()
+                    if let Some(Frame::If {
+                        in_else,
+                        awaiting_then,
+                    })
+                    | Some(Frame::Case {
+                        in_else,
+                        awaiting_then,
+                        ..
+                    }) = stack.last_mut()
                     {
                         *in_else = true;
                         *awaiting_then = false;
@@ -4806,7 +4889,11 @@ impl SqlEditorWidget {
                     in_else: false,
                 }),
                 "WHEN" => match stack.last_mut() {
-                    Some(Frame::Case { past_selector, awaiting_then, .. }) => {
+                    Some(Frame::Case {
+                        past_selector,
+                        awaiting_then,
+                        ..
+                    }) => {
                         *past_selector = true;
                         *awaiting_then = true;
                     }
@@ -4826,8 +4913,10 @@ impl SqlEditorWidget {
                 _ => {}
             }
 
-            prev_is_stmt_boundary =
-                matches!(upper.as_str(), "THEN" | "LOOP" | "ELSE" | "BEGIN" | "EXCEPTION");
+            prev_is_stmt_boundary = matches!(
+                upper.as_str(),
+                "THEN" | "LOOP" | "ELSE" | "BEGIN" | "EXCEPTION"
+            );
             last_word_upper = Some(upper);
         }
 
@@ -4867,7 +4956,10 @@ impl SqlEditorWidget {
                     ..Default::default()
                 })
             }
-            Some(Frame::If { awaiting_then, in_else }) => {
+            Some(Frame::If {
+                awaiting_then,
+                in_else,
+            }) => {
                 if awaiting_then || !prev_is_boundary {
                     return None;
                 }
@@ -5167,8 +5259,10 @@ impl SqlEditorWidget {
             )
         };
         if let Some(SqlToken::Word(word)) = tokens.get(idx) {
-            if matches!(word.to_ascii_uppercase().as_str(), "DATE" | "TIMESTAMP" | "TIME")
-                && !is_qualified(idx)
+            if matches!(
+                word.to_ascii_uppercase().as_str(),
+                "DATE" | "TIMESTAMP" | "TIME"
+            ) && !is_qualified(idx)
                 && !matches!(
                     idx.checked_sub(1).and_then(|prev_idx| tokens.get(prev_idx)),
                     Some(SqlToken::Word(prev))
@@ -5213,9 +5307,7 @@ impl SqlEditorWidget {
         tokens: &[&SqlToken],
         end_exclusive: usize,
     ) -> bool {
-        let word_at = |idx: usize, expected: &str| {
-            matches!(tokens.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case(expected))
-        };
+        let word_at = |idx: usize, expected: &str| matches!(tokens.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case(expected));
 
         if Self::temporal_literal_base_ending_before(tokens, end_exclusive).is_some() {
             return true;
@@ -5228,8 +5320,9 @@ impl SqlEditorWidget {
             && prev_idx >= 3
             && word_at(prev_idx - 1, "TIME")
             && word_at(prev_idx - 2, "WITH")
-            && Self::temporal_literal_base_ending_before(tokens, prev_idx - 2)
-                .is_some_and(|base| base.eq_ignore_ascii_case("TIMESTAMP") || base.eq_ignore_ascii_case("TIME"))
+            && Self::temporal_literal_base_ending_before(tokens, prev_idx - 2).is_some_and(|base| {
+                base.eq_ignore_ascii_case("TIMESTAMP") || base.eq_ignore_ascii_case("TIME")
+            })
         {
             return true;
         }
@@ -5239,8 +5332,9 @@ impl SqlEditorWidget {
             && word_at(prev_idx - 1, "TIME")
             && word_at(prev_idx - 2, "LOCAL")
             && word_at(prev_idx - 3, "WITH")
-            && Self::temporal_literal_base_ending_before(tokens, prev_idx - 3)
-                .is_some_and(|base| base.eq_ignore_ascii_case("TIMESTAMP") || base.eq_ignore_ascii_case("TIME"))
+            && Self::temporal_literal_base_ending_before(tokens, prev_idx - 3).is_some_and(|base| {
+                base.eq_ignore_ascii_case("TIMESTAMP") || base.eq_ignore_ascii_case("TIME")
+            })
     }
 
     fn string_is_typed_temporal_literal(before: &[&SqlToken]) -> bool {
@@ -5328,11 +5422,15 @@ impl SqlEditorWidget {
                     || last_word_is(1, "RLIKE")
                     || Self::cursor_follows_group_concat_separator(tokens, end)))
         {
-            return Some(ExpectedOperandTypes::Single(PrecedingOperandType::Character));
+            return Some(ExpectedOperandTypes::Single(
+                PrecedingOperandType::Character,
+            ));
         }
 
         if Self::current_pattern_lhs_expected_type(tokens, end, mysql_compatible) {
-            return Some(ExpectedOperandTypes::Single(PrecedingOperandType::Character));
+            return Some(ExpectedOperandTypes::Single(
+                PrecedingOperandType::Character,
+            ));
         }
         if let Some(expected_type) =
             Self::current_comparison_lhs_expected_type(tokens, end, data, column_scope)
@@ -5357,7 +5455,9 @@ impl SqlEditorWidget {
         if !mysql_compatible
             && Self::current_submultiset_lhs_expected_type(tokens, end, data, column_scope)
         {
-            return Some(ExpectedOperandTypes::Single(PrecedingOperandType::Collection));
+            return Some(ExpectedOperandTypes::Single(
+                PrecedingOperandType::Collection,
+            ));
         }
         if !mysql_compatible {
             if let Some(expected_type) =
@@ -5370,7 +5470,9 @@ impl SqlEditorWidget {
             return Some(ExpectedOperandTypes::Single(PrecedingOperandType::Datetime));
         }
         if Self::current_collate_lhs_expected_type(tokens, end) {
-            return Some(ExpectedOperandTypes::Single(PrecedingOperandType::Character));
+            return Some(ExpectedOperandTypes::Single(
+                PrecedingOperandType::Character,
+            ));
         }
         if let Some(expected_type) =
             Self::current_comparison_rhs_expected_type(tokens, end, data, column_scope)
@@ -5402,7 +5504,9 @@ impl SqlEditorWidget {
             return Some(ExpectedOperandTypes::Single(PrecedingOperandType::Numeric));
         }
         if !mysql_compatible && Self::current_datetime_minus_rhs(tokens, end, data, column_scope) {
-            return Some(ExpectedOperandTypes::AnyOf(DATETIME_OR_NUMERIC_OPERAND_TYPES));
+            return Some(ExpectedOperandTypes::AnyOf(
+                DATETIME_OR_NUMERIC_OPERAND_TYPES,
+            ));
         }
 
         if let Some(expected_type) =
@@ -5415,21 +5519,20 @@ impl SqlEditorWidget {
         {
             return Some(ExpectedOperandTypes::Single(expected_type));
         }
-        if let Some(expected_type) =
-            Self::current_function_argument_expected_type(
-                tokens,
-                end,
-                data,
-                column_scope,
-                mysql_compatible,
-            )
-        {
+        if let Some(expected_type) = Self::current_function_argument_expected_type(
+            tokens,
+            end,
+            data,
+            column_scope,
+            mysql_compatible,
+        ) {
             return Some(expected_type);
         }
         if Self::cursor_is_at_extract_source_operand(tokens, end) {
             return Some(ExpectedOperandTypes::Single(PrecedingOperandType::Datetime));
         }
-        if let Some(expected_type) = Self::current_update_set_tuple_expected_type(tokens, end, data) {
+        if let Some(expected_type) = Self::current_update_set_tuple_expected_type(tokens, end, data)
+        {
             return Some(ExpectedOperandTypes::Single(expected_type));
         }
         if let Some(expected_type) = Self::current_insert_values_expected_type(tokens, end, data) {
@@ -5443,19 +5546,24 @@ impl SqlEditorWidget {
         {
             return Some(ExpectedOperandTypes::Single(expected_type));
         }
-        if let Some(expected_type) = Self::current_update_set_scalar_expected_type(tokens, end, data)
+        if let Some(expected_type) =
+            Self::current_update_set_scalar_expected_type(tokens, end, data)
         {
             return Some(ExpectedOperandTypes::Single(expected_type));
         }
 
         if !mysql_compatible {
             if Self::cursor_follows_at_time_zone_operator(tokens, end) {
-                return Some(ExpectedOperandTypes::Single(PrecedingOperandType::Character));
+                return Some(ExpectedOperandTypes::Single(
+                    PrecedingOperandType::Character,
+                ));
             }
             if last_word_is(1, "OF")
                 && (last_word_is(2, "MEMBER") || last_word_is(2, "SUBMULTISET"))
             {
-                return Some(ExpectedOperandTypes::Single(PrecedingOperandType::Collection));
+                return Some(ExpectedOperandTypes::Single(
+                    PrecedingOperandType::Collection,
+                ));
             }
             if Self::cursor_follows_multiset_operator_modifier_anchor(&meaningful)
                 || ((last_word_is(1, "ALL") || last_word_is(1, "DISTINCT"))
@@ -5464,7 +5572,9 @@ impl SqlEditorWidget {
                         || last_word_is(2, "INTERSECT"))
                     && last_word_is(3, "MULTISET"))
             {
-                return Some(ExpectedOperandTypes::Single(PrecedingOperandType::Collection));
+                return Some(ExpectedOperandTypes::Single(
+                    PrecedingOperandType::Collection,
+                ));
             }
         }
 
@@ -5531,7 +5641,8 @@ impl SqlEditorWidget {
             return false;
         };
         let Some(SqlToken::Word(function_name)) =
-            Self::previous_non_comment_token_index(tokens, open_idx).and_then(|idx| tokens.get(idx))
+            Self::previous_non_comment_token_index(tokens, open_idx)
+                .and_then(|idx| tokens.get(idx))
         else {
             return false;
         };
@@ -5558,7 +5669,10 @@ impl SqlEditorWidget {
         false
     }
 
-    fn unqualified_function_name_before_open(tokens: &[SqlToken], open_idx: usize) -> Option<String> {
+    fn unqualified_function_name_before_open(
+        tokens: &[SqlToken],
+        open_idx: usize,
+    ) -> Option<String> {
         let name_idx = Self::previous_non_comment_token_index(tokens, open_idx)?;
         let Some(SqlToken::Word(word)) = tokens.get(name_idx) else {
             return None;
@@ -5573,7 +5687,11 @@ impl SqlEditorWidget {
         Some(word.to_ascii_uppercase())
     }
 
-    fn current_function_argument_index(tokens: &[SqlToken], open_idx: usize, limit: usize) -> usize {
+    fn current_function_argument_index(
+        tokens: &[SqlToken],
+        open_idx: usize,
+        limit: usize,
+    ) -> usize {
         let mut argument_index = 0usize;
         let mut nested = 0i32;
         for token in &tokens[(open_idx + 1)..limit] {
@@ -5602,10 +5720,37 @@ impl SqlEditorWidget {
         mysql_compatible: bool,
     ) -> Option<ExpectedOperandTypes> {
         const NUMERIC_ARGUMENT_FUNCTIONS: &[&str] = &[
-            "ABS", "ACOS", "ASIN", "ATAN", "ATAN2", "CEIL", "CEILING", "COS", "COSH", "EXP",
-            "FLOOR", "LN", "LOG", "MOD", "POWER", "POW", "REMAINDER", "SIGN", "SIN", "SINH",
-            "SQRT", "TAN", "TANH", "SUM", "AVG", "STDDEV", "STDDEV_POP", "STDDEV_SAMP",
-            "VARIANCE", "VAR_POP", "VAR_SAMP",
+            "ABS",
+            "ACOS",
+            "ASIN",
+            "ATAN",
+            "ATAN2",
+            "CEIL",
+            "CEILING",
+            "COS",
+            "COSH",
+            "EXP",
+            "FLOOR",
+            "LN",
+            "LOG",
+            "MOD",
+            "POWER",
+            "POW",
+            "REMAINDER",
+            "SIGN",
+            "SIN",
+            "SINH",
+            "SQRT",
+            "TAN",
+            "TANH",
+            "SUM",
+            "AVG",
+            "STDDEV",
+            "STDDEV_POP",
+            "STDDEV_SAMP",
+            "VARIANCE",
+            "VAR_POP",
+            "VAR_SAMP",
         ];
         const CHARACTER_ARGUMENT_FUNCTIONS: &[&str] = &[
             "ASCII",
@@ -5637,7 +5782,9 @@ impl SqlEditorWidget {
             return Some(ExpectedOperandTypes::Single(PrecedingOperandType::Numeric));
         }
         if CHARACTER_ARGUMENT_FUNCTIONS.contains(&name) {
-            return Some(ExpectedOperandTypes::Single(PrecedingOperandType::Character));
+            return Some(ExpectedOperandTypes::Single(
+                PrecedingOperandType::Character,
+            ));
         }
         if DATETIME_ARGUMENT_FUNCTIONS.contains(&name) {
             return Some(ExpectedOperandTypes::Single(PrecedingOperandType::Datetime));
@@ -5713,10 +5860,12 @@ impl SqlEditorWidget {
                 1 => Some(PrecedingOperandType::Character),
                 _ => None,
             },
-            "TO_DATE" | "TO_TIMESTAMP" | "TO_TIMESTAMP_TZ" | "STR_TO_DATE" => match argument_index {
-                0 | 1 => Some(PrecedingOperandType::Character),
-                _ => None,
-            },
+            "TO_DATE" | "TO_TIMESTAMP" | "TO_TIMESTAMP_TZ" | "STR_TO_DATE" => {
+                match argument_index {
+                    0 | 1 => Some(PrecedingOperandType::Character),
+                    _ => None,
+                }
+            }
             "TO_CHAR" | "TO_NCHAR" | "DATE_FORMAT" | "TIME_FORMAT" => match argument_index {
                 1 => Some(PrecedingOperandType::Character),
                 _ => None,
@@ -5769,19 +5918,26 @@ impl SqlEditorWidget {
             "ROUND" if argument_index == 1 && mysql_compatible => {
                 Some(ExpectedOperandTypes::Single(PrecedingOperandType::Numeric))
             }
-            "ROUND" | "TRUNC" if argument_index == 0 => {
-                Some(ExpectedOperandTypes::AnyOf(DATETIME_OR_NUMERIC_OPERAND_TYPES))
-            }
+            "ROUND" | "TRUNC" if argument_index == 0 => Some(ExpectedOperandTypes::AnyOf(
+                DATETIME_OR_NUMERIC_OPERAND_TYPES,
+            )),
             "TRUNCATE" if mysql_compatible && argument_index == 0 => {
                 Some(ExpectedOperandTypes::Single(PrecedingOperandType::Numeric))
             }
             "ROUND" | "TRUNC" if argument_index == 1 => {
-                let (start, end) =
-                    Self::top_level_function_argument_bounds_before_cursor(tokens, open_idx, limit, 0)?;
-                match Self::expected_type_from_argument_range(tokens, start, end, data, column_scope)? {
-                    PrecedingOperandType::Datetime => {
-                        Some(ExpectedOperandTypes::Single(PrecedingOperandType::Character))
-                    }
+                let (start, end) = Self::top_level_function_argument_bounds_before_cursor(
+                    tokens, open_idx, limit, 0,
+                )?;
+                match Self::expected_type_from_argument_range(
+                    tokens,
+                    start,
+                    end,
+                    data,
+                    column_scope,
+                )? {
+                    PrecedingOperandType::Datetime => Some(ExpectedOperandTypes::Single(
+                        PrecedingOperandType::Character,
+                    )),
                     PrecedingOperandType::Numeric | PrecedingOperandType::FloatingNumeric => {
                         Some(ExpectedOperandTypes::Single(PrecedingOperandType::Numeric))
                     }
@@ -5899,7 +6055,8 @@ impl SqlEditorWidget {
             }
         }
 
-        (argument_index == target_argument_index).then_some((argument_start, limit.min(tokens.len())))
+        (argument_index == target_argument_index)
+            .then_some((argument_start, limit.min(tokens.len())))
     }
 
     fn top_level_function_argument_bounds_after_cursor(
@@ -5908,8 +6065,8 @@ impl SqlEditorWidget {
         limit: usize,
         target_argument_index: usize,
     ) -> Option<(usize, usize)> {
-        let close_idx =
-            Self::matching_close_paren_index_before(tokens, open_idx, tokens.len()).unwrap_or(tokens.len());
+        let close_idx = Self::matching_close_paren_index_before(tokens, open_idx, tokens.len())
+            .unwrap_or(tokens.len());
         if close_idx <= limit {
             return None;
         }
@@ -6035,10 +6192,17 @@ impl SqlEditorWidget {
         }
 
         let active_result_start = frame.active_result_start?;
-        Self::next_case_result_range_after_cursor(tokens, active_result_start)
-            .and_then(|(start, result_end)| {
-                Self::expected_type_from_argument_range(tokens, start, result_end, data, column_scope)
-            })
+        Self::next_case_result_range_after_cursor(tokens, active_result_start).and_then(
+            |(start, result_end)| {
+                Self::expected_type_from_argument_range(
+                    tokens,
+                    start,
+                    result_end,
+                    data,
+                    column_scope,
+                )
+            },
+        )
     }
 
     fn next_case_result_range_after_cursor(
@@ -6066,16 +6230,12 @@ impl SqlEditorWidget {
                     case_depth -= 1;
                 }
                 SqlToken::Word(word)
-                    if nested == 0
-                        && case_depth == 1
-                        && word.eq_ignore_ascii_case("THEN") =>
+                    if nested == 0 && case_depth == 1 && word.eq_ignore_ascii_case("THEN") =>
                 {
                     pending_result_start = Some(idx + 1);
                 }
                 SqlToken::Word(word)
-                    if nested == 0
-                        && case_depth == 1
-                        && word.eq_ignore_ascii_case("ELSE") =>
+                    if nested == 0 && case_depth == 1 && word.eq_ignore_ascii_case("ELSE") =>
                 {
                     if let Some(start) = pending_result_start.take() {
                         if start >= active_result_start {
@@ -6085,9 +6245,7 @@ impl SqlEditorWidget {
                     pending_result_start = Some(idx + 1);
                 }
                 SqlToken::Word(word)
-                    if nested == 0
-                        && case_depth == 1
-                        && word.eq_ignore_ascii_case("WHEN") =>
+                    if nested == 0 && case_depth == 1 && word.eq_ignore_ascii_case("WHEN") =>
                 {
                     if let Some(start) = pending_result_start.take() {
                         if start >= active_result_start {
@@ -6228,7 +6386,8 @@ impl SqlEditorWidget {
             }
             _ => false,
         };
-        if !is_numeric_operator || Self::cursor_follows_complete_operand(tokens, op_idx) != Some(true)
+        if !is_numeric_operator
+            || Self::cursor_follows_complete_operand(tokens, op_idx) != Some(true)
         {
             return false;
         }
@@ -6297,7 +6456,9 @@ impl SqlEditorWidget {
                 if mysql_compatible {
                     Some(ExpectedOperandTypes::Single(PrecedingOperandType::Numeric))
                 } else {
-                    Some(ExpectedOperandTypes::AnyOf(DATETIME_OR_NUMERIC_OPERAND_TYPES))
+                    Some(ExpectedOperandTypes::AnyOf(
+                        DATETIME_OR_NUMERIC_OPERAND_TYPES,
+                    ))
                 }
             }
             PrecedingOperandType::Datetime if !mysql_compatible && op == "-" => {
@@ -6441,21 +6602,23 @@ impl SqlEditorWidget {
         let select_idx = Self::current_select_list_anchor_before_cursor(tokens, limit)?;
         let projection_index = Self::current_select_projection_index(tokens, select_idx, limit);
         let insert_target = Self::insert_target_before_source_anchor(tokens, select_idx)?;
-        let target_column =
-            match (insert_target.column_list_open_idx, insert_target.column_list_close_idx) {
-                (Some(column_list_open_idx), Some(column_list_close_idx)) => {
-                    Self::nth_identifier_in_paren_list(
-                        tokens,
-                        column_list_open_idx,
-                        column_list_close_idx,
-                        projection_index,
-                    )?
-                }
-                _ => data
-                    .get_columns_for_table(&insert_target.table_name)
-                    .get(projection_index)
-                    .cloned()?,
-            };
+        let target_column = match (
+            insert_target.column_list_open_idx,
+            insert_target.column_list_close_idx,
+        ) {
+            (Some(column_list_open_idx), Some(column_list_close_idx)) => {
+                Self::nth_identifier_in_paren_list(
+                    tokens,
+                    column_list_open_idx,
+                    column_list_close_idx,
+                    projection_index,
+                )?
+            }
+            _ => data
+                .get_columns_for_table(&insert_target.table_name)
+                .get(projection_index)
+                .cloned()?,
+        };
 
         match data.get_column_meta(&insert_target.table_name, &target_column) {
             Some(meta) => match Self::classify_type_display(&meta.type_display) {
@@ -6485,7 +6648,8 @@ impl SqlEditorWidget {
             Self::matching_open_paren_index_before_close(tokens, target_list_close_idx)?;
         let set_idx = Self::set_keyword_before_tuple_target(tokens, target_list_open_idx)?;
         let table_name = Self::update_set_target_table_before_set(tokens, set_idx)?;
-        let argument_index = Self::current_function_argument_index(tokens, value_list_open_idx, limit);
+        let argument_index =
+            Self::current_function_argument_index(tokens, value_list_open_idx, limit);
         let target_column = Self::nth_identifier_in_paren_list(
             tokens,
             target_list_open_idx,
@@ -6611,7 +6775,10 @@ impl SqlEditorWidget {
         }
         let words = Self::words_for_keyword_slot(tokens, end);
         matches!(
-            (words.first().map(String::as_str), words.last().map(String::as_str)),
+            (
+                words.first().map(String::as_str),
+                words.last().map(String::as_str)
+            ),
             (Some("INSERT"), Some("ON"))
         ) && !Self::top_level_word_pair_present_before(tokens, end, "ON", "DUPLICATE")
     }
@@ -6704,13 +6871,11 @@ impl SqlEditorWidget {
         )
     }
 
-    fn dml_set_target_table_before_anchor(
-        tokens: &[SqlToken],
-        set_idx: usize,
-    ) -> Option<String> {
+    fn dml_set_target_table_before_anchor(tokens: &[SqlToken], set_idx: usize) -> Option<String> {
         match tokens.get(set_idx) {
             Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("SET") => {
-                if let Some(on_idx) = Self::on_conflict_do_update_on_index_before_set(tokens, set_idx)
+                if let Some(on_idx) =
+                    Self::on_conflict_do_update_on_index_before_set(tokens, set_idx)
                 {
                     return Self::insert_target_before_source_anchor(tokens, on_idx)
                         .map(|target| target.table_name);
@@ -6855,7 +7020,10 @@ impl SqlEditorWidget {
         None
     }
 
-    fn set_keyword_before_tuple_target(tokens: &[SqlToken], target_open_idx: usize) -> Option<usize> {
+    fn set_keyword_before_tuple_target(
+        tokens: &[SqlToken],
+        target_open_idx: usize,
+    ) -> Option<usize> {
         let mut depth = 0i32;
         for idx in (0..target_open_idx.min(tokens.len())).rev() {
             match &tokens[idx] {
@@ -6979,21 +7147,23 @@ impl SqlEditorWidget {
         let values_idx = Self::values_keyword_before_insert_row_tuple(tokens, row_open_idx)?;
         let argument_index = Self::current_function_argument_index(tokens, row_open_idx, limit);
         let insert_target = Self::insert_target_before_source_anchor(tokens, values_idx)?;
-        let target_column =
-            match (insert_target.column_list_open_idx, insert_target.column_list_close_idx) {
-                (Some(column_list_open_idx), Some(column_list_close_idx)) => {
-                    Self::nth_identifier_in_paren_list(
-                        tokens,
-                        column_list_open_idx,
-                        column_list_close_idx,
-                        argument_index,
-                    )?
-                }
-                _ => data
-                    .get_columns_for_table(&insert_target.table_name)
-                    .get(argument_index)
-                    .cloned()?,
-            };
+        let target_column = match (
+            insert_target.column_list_open_idx,
+            insert_target.column_list_close_idx,
+        ) {
+            (Some(column_list_open_idx), Some(column_list_close_idx)) => {
+                Self::nth_identifier_in_paren_list(
+                    tokens,
+                    column_list_open_idx,
+                    column_list_close_idx,
+                    argument_index,
+                )?
+            }
+            _ => data
+                .get_columns_for_table(&insert_target.table_name)
+                .get(argument_index)
+                .cloned()?,
+        };
 
         match data.get_column_meta(&insert_target.table_name, &target_column) {
             Some(meta) => match Self::classify_type_display(&meta.type_display) {
@@ -7115,7 +7285,8 @@ impl SqlEditorWidget {
         let next_idx = Self::next_non_comment_token_index(tokens, insert_idx + 1)?;
         let column_list = match tokens.get(next_idx) {
             Some(SqlToken::Symbol(sym)) if sym == "(" => {
-                let close_idx = Self::matching_close_paren_index_before(tokens, next_idx, anchor_idx)?;
+                let close_idx =
+                    Self::matching_close_paren_index_before(tokens, next_idx, anchor_idx)?;
                 Some((next_idx, close_idx))
             }
             Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("VALUES") => None,
@@ -7164,10 +7335,7 @@ impl SqlEditorWidget {
         None
     }
 
-    fn merge_target_table_before_action(
-        tokens: &[SqlToken],
-        action_idx: usize,
-    ) -> Option<String> {
+    fn merge_target_table_before_action(tokens: &[SqlToken], action_idx: usize) -> Option<String> {
         let mut depth = 0i32;
         for idx in (0..action_idx.min(tokens.len())).rev() {
             match &tokens[idx] {
@@ -7306,7 +7474,9 @@ impl SqlEditorWidget {
             }
         }
 
-        (index == target_index).then_some(current_identifier).flatten()
+        (index == target_index)
+            .then_some(current_identifier)
+            .flatten()
     }
 
     fn current_comparison_rhs_expected_type(
@@ -7382,8 +7552,10 @@ impl SqlEditorWidget {
             return false;
         };
         let operator_upper = operator_word.to_ascii_uppercase();
-        matches!(operator_upper.as_str(), "LIKE" | "LIKE2" | "LIKE4" | "LIKEC")
-            || (mysql_compatible && matches!(operator_upper.as_str(), "REGEXP" | "RLIKE"))
+        matches!(
+            operator_upper.as_str(),
+            "LIKE" | "LIKE2" | "LIKE4" | "LIKEC"
+        ) || (mysql_compatible && matches!(operator_upper.as_str(), "REGEXP" | "RLIKE"))
     }
 
     fn current_comparison_lhs_expected_type(
@@ -8032,20 +8204,21 @@ impl SqlEditorWidget {
                     match upper.as_str() {
                         "AND" => {}
                         "BETWEEN" => {
-                            let left_end = match Self::previous_non_comment_token_index(tokens, *idx)
-                            {
-                                Some(not_idx)
-                                    if matches!(
-                                        tokens.get(not_idx),
-                                        Some(SqlToken::Word(word))
-                                            if word.eq_ignore_ascii_case("NOT")
-                                    ) && Self::cursor_follows_complete_operand(tokens, not_idx)
-                                        == Some(true) =>
-                                {
-                                    not_idx
-                                }
-                                _ => *idx,
-                            };
+                            let left_end =
+                                match Self::previous_non_comment_token_index(tokens, *idx) {
+                                    Some(not_idx)
+                                        if matches!(
+                                            tokens.get(not_idx),
+                                            Some(SqlToken::Word(word))
+                                                if word.eq_ignore_ascii_case("NOT")
+                                        ) && Self::cursor_follows_complete_operand(
+                                            tokens, not_idx,
+                                        ) == Some(true) =>
+                                    {
+                                        not_idx
+                                    }
+                                    _ => *idx,
+                                };
                             let left_type =
                                 Self::preceding_operand_type(tokens, left_end, data, column_scope);
                             return match left_type {
@@ -8186,14 +8359,21 @@ impl SqlEditorWidget {
 
         let tokens: Vec<SqlToken> = before.iter().map(|token| (*token).clone()).collect();
         let close_idx = tokens.len().saturating_sub(1);
-        let Some(open_idx) = Self::matching_open_paren_index_before_close(&tokens, close_idx) else {
+        let Some(open_idx) = Self::matching_open_paren_index_before_close(&tokens, close_idx)
+        else {
             return PrecedingOperandType::Unknown;
         };
         if !Self::open_paren_can_be_grouped_expression(before, open_idx) {
             return PrecedingOperandType::Unknown;
         }
-        Self::expected_type_from_argument_range(&tokens, open_idx + 1, close_idx, data, column_scope)
-            .unwrap_or(PrecedingOperandType::Unknown)
+        Self::expected_type_from_argument_range(
+            &tokens,
+            open_idx + 1,
+            close_idx,
+            data,
+            column_scope,
+        )
+        .unwrap_or(PrecedingOperandType::Unknown)
     }
 
     fn open_paren_can_be_grouped_expression(before: &[&SqlToken], open_idx: usize) -> bool {
@@ -8498,9 +8678,7 @@ impl SqlEditorWidget {
                     prev_top_word = None;
                     prev_top_was_dot = sym == ".";
                 }
-                SqlToken::Word(word)
-                    if depth == 0 && word.eq_ignore_ascii_case("VALUES") =>
-                {
+                SqlToken::Word(word) if depth == 0 && word.eq_ignore_ascii_case("VALUES") => {
                     let is_relation_name = prev_top_was_dot
                         || prev_top_word
                             .as_deref()
@@ -8511,7 +8689,9 @@ impl SqlEditorWidget {
                             .take(visible_end)
                             .skip(idx + 1)
                             .find(|token| !matches!(token, SqlToken::Comment(_)))
-                            .is_some_and(|token| matches!(token, SqlToken::Symbol(sym) if sym == "("))
+                            .is_some_and(
+                                |token| matches!(token, SqlToken::Symbol(sym) if sym == "("),
+                            )
                     {
                         return true;
                     }
@@ -8691,21 +8871,22 @@ impl SqlEditorWidget {
                         clause = QueryClause::GroupBy;
                     } else if (prev_top_word.as_deref() == Some("ORDER") && upper == "BY")
                         || matches!(
-                        upper.as_str(),
-                        "WHERE"
-                            | "HAVING"
-                            | "QUALIFY"
-                            | "MODEL"
-                            | "WINDOW"
-                            | "OFFSET"
-                            | "FETCH"
-                            | "FOR"
-                            | "UNION"
-                            | "INTERSECT"
-                            | "EXCEPT"
-                            | "MINUS"
-                            | "RETURNING"
-                    ) {
+                            upper.as_str(),
+                            "WHERE"
+                                | "HAVING"
+                                | "QUALIFY"
+                                | "MODEL"
+                                | "WINDOW"
+                                | "OFFSET"
+                                | "FETCH"
+                                | "FOR"
+                                | "UNION"
+                                | "INTERSECT"
+                                | "EXCEPT"
+                                | "MINUS"
+                                | "RETURNING"
+                        )
+                    {
                         clause = QueryClause::Other;
                     }
                     prev_top_word = Some(upper);
@@ -8732,9 +8913,7 @@ impl SqlEditorWidget {
             {
                 continue;
             }
-            let prev = idx
-                .checked_sub(1)
-                .and_then(|idx| top_level_tokens.get(idx));
+            let prev = idx.checked_sub(1).and_then(|idx| top_level_tokens.get(idx));
             if matches!(prev, Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("INTO"))
                 || matches!(prev, Some(SqlToken::Symbol(sym)) if sym == ".")
             {
@@ -8765,9 +8944,7 @@ impl SqlEditorWidget {
             {
                 continue;
             }
-            let prev = idx
-                .checked_sub(1)
-                .and_then(|idx| top_level_tokens.get(idx));
+            let prev = idx.checked_sub(1).and_then(|idx| top_level_tokens.get(idx));
             if matches!(prev, Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("INTO"))
                 || matches!(prev, Some(SqlToken::Symbol(sym)) if sym == ".")
             {
@@ -8842,15 +9019,14 @@ impl SqlEditorWidget {
                 Self::top_level_values_clause_present_before(tokens, log_idx)
                     && Self::cursor_immediately_follows_complete_operand(tokens, log_idx)
             }
-            "UPDATE" | "DELETE" | "MERGE" => Self::cursor_follows_complete_predicate(tokens, log_idx),
+            "UPDATE" | "DELETE" | "MERGE" => {
+                Self::cursor_follows_complete_predicate(tokens, log_idx)
+            }
             _ => false,
         }
     }
 
-    fn error_logging_top_level_tokens_before(
-        tokens: &[SqlToken],
-        end: usize,
-    ) -> Vec<&SqlToken> {
+    fn error_logging_top_level_tokens_before(tokens: &[SqlToken], end: usize) -> Vec<&SqlToken> {
         let mut depth = 0i32;
         let mut top_level_tokens = Vec::new();
         for token in tokens.get(..end.min(tokens.len())).unwrap_or(tokens) {
@@ -9045,9 +9221,12 @@ impl SqlEditorWidget {
         column_scope: &[String],
     ) -> Option<PrecedingOperandType> {
         let mut argument_index = 0usize;
-        while let Some((start, end)) =
-            Self::top_level_function_argument_bounds_before_cursor(tokens, open_idx, close_idx, argument_index)
-        {
+        while let Some((start, end)) = Self::top_level_function_argument_bounds_before_cursor(
+            tokens,
+            open_idx,
+            close_idx,
+            argument_index,
+        ) {
             if Self::argument_range_is_null_literal(tokens, start, end) {
                 argument_index += 1;
                 continue;
@@ -9065,8 +9244,12 @@ impl SqlEditorWidget {
         data: &IntellisenseData,
         column_scope: &[String],
     ) -> Option<PrecedingOperandType> {
-        let (start, end) =
-            Self::top_level_function_argument_bounds_before_cursor(tokens, open_idx, close_idx, argument_index)?;
+        let (start, end) = Self::top_level_function_argument_bounds_before_cursor(
+            tokens,
+            open_idx,
+            close_idx,
+            argument_index,
+        )?;
         Self::expected_type_from_argument_range(tokens, start, end, data, column_scope)
     }
 
@@ -9085,14 +9268,43 @@ impl SqlEditorWidget {
     /// `Unknown` so the type-gated operators stay withheld rather than guessed.
     fn function_return_operand_type(name: &str) -> PrecedingOperandType {
         const DATETIME_FUNCTIONS: &[&str] = &[
-            "TO_DATE", "TO_TIMESTAMP", "TO_TIMESTAMP_TZ", "FROM_TZ", "ADD_MONTHS", "LAST_DAY",
-            "NEXT_DAY", "DATE_ADD", "DATE_SUB", "ADDDATE", "SUBDATE", "TIMESTAMPADD",
-            "NUMTODSINTERVAL", "NUMTOYMINTERVAL",
+            "TO_DATE",
+            "TO_TIMESTAMP",
+            "TO_TIMESTAMP_TZ",
+            "FROM_TZ",
+            "ADD_MONTHS",
+            "LAST_DAY",
+            "NEXT_DAY",
+            "DATE_ADD",
+            "DATE_SUB",
+            "ADDDATE",
+            "SUBDATE",
+            "TIMESTAMPADD",
+            "NUMTODSINTERVAL",
+            "NUMTOYMINTERVAL",
         ];
         const CHARACTER_FUNCTIONS: &[&str] = &[
-            "TO_CHAR", "TO_NCHAR", "SUBSTR", "SUBSTRB", "UPPER", "LOWER", "INITCAP", "TRIM",
-            "LTRIM", "RTRIM", "LPAD", "RPAD", "REPLACE", "CONCAT", "REGEXP_REPLACE",
-            "REGEXP_SUBSTR", "TRANSLATE", "REVERSE", "SOUNDEX", "DATE_FORMAT", "TIME_FORMAT",
+            "TO_CHAR",
+            "TO_NCHAR",
+            "SUBSTR",
+            "SUBSTRB",
+            "UPPER",
+            "LOWER",
+            "INITCAP",
+            "TRIM",
+            "LTRIM",
+            "RTRIM",
+            "LPAD",
+            "RPAD",
+            "REPLACE",
+            "CONCAT",
+            "REGEXP_REPLACE",
+            "REGEXP_SUBSTR",
+            "TRANSLATE",
+            "REVERSE",
+            "SOUNDEX",
+            "DATE_FORMAT",
+            "TIME_FORMAT",
         ];
         const NUMERIC_FUNCTIONS: &[&str] = &[
             "ABS",
@@ -9175,7 +9387,10 @@ impl SqlEditorWidget {
     /// (a qualified-name `.` is part of the operand, not a boundary) or a clause/
     /// boolean keyword — so an operator bound to an *earlier* operand does not
     /// count. A keyword reached before a boundary is an applied postfix operator.
-    fn cursor_applied_postfix_operators(tokens: &[SqlToken], end: usize) -> AppliedPostfixOperators {
+    fn cursor_applied_postfix_operators(
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> AppliedPostfixOperators {
         let before = Self::meaningful_tokens_before(tokens, end);
         let mut depth = 0i32;
         let mut applied = AppliedPostfixOperators::default();
@@ -9198,19 +9413,17 @@ impl SqlEditorWidget {
                 // (operator, comma, `=`, `||`, …) ends the current operand chain.
                 SqlToken::Symbol(sym) if sym == "." => {}
                 SqlToken::Symbol(_) => return applied,
-                SqlToken::Word(word) => {
-                    match word.to_ascii_uppercase().as_str() {
-                        "COLLATE" => applied.collate = true,
-                        "AT" => applied.at_clause = true,
-                        "SOUNDS" => applied.sounds = true,
-                        "OF" => saw_of = true,
-                        "MEMBER" if saw_of => applied.member = true,
-                        other if OPERAND_SEGMENT_BOUNDARY_KEYWORDS.contains(&other) => {
-                            return applied;
-                        }
-                        _ => {}
+                SqlToken::Word(word) => match word.to_ascii_uppercase().as_str() {
+                    "COLLATE" => applied.collate = true,
+                    "AT" => applied.at_clause = true,
+                    "SOUNDS" => applied.sounds = true,
+                    "OF" => saw_of = true,
+                    "MEMBER" if saw_of => applied.member = true,
+                    other if OPERAND_SEGMENT_BOUNDARY_KEYWORDS.contains(&other) => {
+                        return applied;
                     }
-                }
+                    _ => {}
+                },
                 _ => {}
             }
         }
@@ -9325,8 +9538,10 @@ impl SqlEditorWidget {
                 SqlToken::Word(word) => {
                     let upper = word.to_ascii_uppercase();
                     if upper == "LIKE" {
-                        let Some((sounds_idx, SqlToken::Word(prev))) =
-                            pos.checked_sub(1).and_then(|prev_pos| meaningful.get(prev_pos)).copied()
+                        let Some((sounds_idx, SqlToken::Word(prev))) = pos
+                            .checked_sub(1)
+                            .and_then(|prev_pos| meaningful.get(prev_pos))
+                            .copied()
                         else {
                             return false;
                         };
@@ -9488,17 +9703,12 @@ impl SqlEditorWidget {
         }
         let end = Self::expected_suggestion_context_end(tokens, deep_ctx.cursor_token_len, true);
         let before = Self::meaningful_tokens_before(tokens, end);
-        let trigger_idx = before
-            .iter()
-            .position(
-                |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("TRIGGER")),
-            )?;
-        if !before
-            .get(..trigger_idx)
-            .unwrap_or(&[])
-            .iter()
-            .any(|token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("CREATE")))
-        {
+        let trigger_idx = before.iter().position(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("TRIGGER")),
+        )?;
+        if !before.get(..trigger_idx).unwrap_or(&[]).iter().any(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("CREATE")),
+        ) {
             return None;
         }
         let header = before.get(trigger_idx + 1..).unwrap_or(&[]);
@@ -9515,12 +9725,12 @@ impl SqlEditorWidget {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        let allows_new = event_words.iter().any(|word| {
-            matches!(word.as_str(), "INSERT" | "UPDATE")
-        });
-        let allows_old = event_words.iter().any(|word| {
-            matches!(word.as_str(), "UPDATE" | "DELETE")
-        });
+        let allows_new = event_words
+            .iter()
+            .any(|word| matches!(word.as_str(), "INSERT" | "UPDATE"));
+        let allows_old = event_words
+            .iter()
+            .any(|word| matches!(word.as_str(), "UPDATE" | "DELETE"));
         let qualifier_upper = Self::completion_identifier_lookup_upper(qualifier);
         let allowed = match qualifier_upper.as_str() {
             "NEW" => allows_new,
@@ -9586,10 +9796,7 @@ impl SqlEditorWidget {
         let Some((op_idx, SqlToken::Word(word))) = meaningful.last().copied() else {
             return None;
         };
-        if !matches!(
-            word.to_ascii_uppercase().as_str(),
-            "MEMBER" | "SUBMULTISET"
-        ) {
+        if !matches!(word.to_ascii_uppercase().as_str(), "MEMBER" | "SUBMULTISET") {
             return None;
         }
         if matches!(
@@ -9693,17 +9900,17 @@ impl SqlEditorWidget {
             .collect();
 
         matches!(
-            meaningful.as_slice(),
-            [.., (at_idx, SqlToken::Word(at)), (_, SqlToken::Word(time)), (_, SqlToken::Word(zone))]
-                if at.eq_ignore_ascii_case("AT")
-                    && time.eq_ignore_ascii_case("TIME")
-                    && zone.eq_ignore_ascii_case("ZONE")
-                    && Self::cursor_follows_complete_operand(tokens, *at_idx) == Some(true)
-                    && !matches!(
-                        at_idx.checked_sub(1).and_then(|idx| tokens.get(idx)),
-                        Some(SqlToken::Symbol(sym)) if sym == "."
-                    )
+        meaningful.as_slice(),
+        [.., (at_idx, SqlToken::Word(at)), (_, SqlToken::Word(time)), (_, SqlToken::Word(zone))]
+            if at.eq_ignore_ascii_case("AT")
+                && time.eq_ignore_ascii_case("TIME")
+                && zone.eq_ignore_ascii_case("ZONE")
+                && Self::cursor_follows_complete_operand(tokens, *at_idx) == Some(true)
+                && !matches!(
+                    at_idx.checked_sub(1).and_then(|idx| tokens.get(idx)),
+                    Some(SqlToken::Symbol(sym)) if sym == "."
                 )
+            )
     }
 
     fn cursor_is_after_complete_at_time_zone_tail(
@@ -9839,9 +10046,7 @@ impl SqlEditorWidget {
                         nested -= 1;
                     }
                 }
-                SqlToken::Word(word)
-                    if nested == 0 && word.eq_ignore_ascii_case("SEPARATOR") =>
-                {
+                SqlToken::Word(word) if nested == 0 && word.eq_ignore_ascii_case("SEPARATOR") => {
                     return false;
                 }
                 _ => {}
@@ -9937,7 +10142,9 @@ impl SqlEditorWidget {
     /// `CASE` whose `END CASE` tail is not expression material.
     fn cursor_follows_case_expression_end(tokens: &[SqlToken], end: usize) -> bool {
         let toks = tokens.get(..end.min(tokens.len())).unwrap_or(tokens);
-        let Some(last_idx) = toks.iter().rposition(|token| !matches!(token, SqlToken::Comment(_)))
+        let Some(last_idx) = toks
+            .iter()
+            .rposition(|token| !matches!(token, SqlToken::Comment(_)))
         else {
             return false;
         };
@@ -9988,7 +10195,12 @@ impl SqlEditorWidget {
                 "END" => {
                     let closed = stack.pop();
                     if idx == last_idx {
-                        return matches!(closed, Some(Frame::Case { is_statement: false }));
+                        return matches!(
+                            closed,
+                            Some(Frame::Case {
+                                is_statement: false
+                            })
+                        );
                     }
                     skip_end_qualifier = true;
                 }
@@ -10017,9 +10229,33 @@ impl SqlEditorWidget {
         // Operators and expression-introducing clause keywords after which a fresh
         // operand is expected (so a binary operator is *not* grammatical).
         const OPERAND_EXPECTING_PREV: &[&str] = &[
-            "AND", "OR", "NOT", "IN", "IS", "LIKE", "LIKE2", "LIKE4", "LIKEC", "BETWEEN",
-            "ESCAPE", "MEMBER", "SUBMULTISET", "MULTISET", "AT", "COLLATE", "DIV", "MOD", "XOR",
-            "REGEXP", "RLIKE", "SOUNDS", "SEPARATOR", "AGAINST", "SELECT", "WHERE", "HAVING",
+            "AND",
+            "OR",
+            "NOT",
+            "IN",
+            "IS",
+            "LIKE",
+            "LIKE2",
+            "LIKE4",
+            "LIKEC",
+            "BETWEEN",
+            "ESCAPE",
+            "MEMBER",
+            "SUBMULTISET",
+            "MULTISET",
+            "AT",
+            "COLLATE",
+            "DIV",
+            "MOD",
+            "XOR",
+            "REGEXP",
+            "RLIKE",
+            "SOUNDS",
+            "SEPARATOR",
+            "AGAINST",
+            "SELECT",
+            "WHERE",
+            "HAVING",
             "ON",
             "SET",
             "VALUES",
@@ -10154,7 +10390,8 @@ impl SqlEditorWidget {
                 SqlToken::Word(word) => match word.to_ascii_uppercase().as_str() {
                     "BETWEEN" => stack.push(Frame::Between { depth }),
                     "AND" => {
-                        if matches!(stack.last(), Some(Frame::Between { depth: d }) if *d == depth) {
+                        if matches!(stack.last(), Some(Frame::Between { depth: d }) if *d == depth)
+                        {
                             stack.pop();
                         }
                     }
@@ -10200,7 +10437,9 @@ impl SqlEditorWidget {
                 }
                 Frame::Case { state } => {
                     return match state {
-                        CaseState::Selector if follows_case_keyword || follows_operand == Some(true) => {
+                        CaseState::Selector
+                            if follows_case_keyword || follows_operand == Some(true) =>
+                        {
                             &["WHEN"]
                         }
                         CaseState::AwaitingThen if follows_operand == Some(true) => &["THEN"],
@@ -10275,10 +10514,7 @@ impl SqlEditorWidget {
         qualifier: &str,
         deep_ctx: &intellisense_context::CursorContext,
     ) -> bool {
-        deep_ctx
-            .tables_in_scope
-            .iter()
-            .any(|table_ref| {
+        deep_ctx.tables_in_scope.iter().any(|table_ref| {
             Self::completion_identifiers_match(&table_ref.name, qualifier)
                 || table_ref
                     .alias
@@ -10356,9 +10592,9 @@ impl SqlEditorWidget {
         if Self::cursor_is_in_invalid_set_operation_branch_for_context(deep_ctx, true) {
             return None;
         }
-        if Self::data_type_position_for_context_for_db(deep_ctx, true, db_type)
-            .is_some_and(|position| !Self::data_type_position_allows_user_type_objects(position, db_type))
-        {
+        if Self::data_type_position_for_context_for_db(deep_ctx, true, db_type).is_some_and(
+            |position| !Self::data_type_position_allows_user_type_objects(position, db_type),
+        ) {
             return None;
         }
 
@@ -10408,8 +10644,8 @@ impl SqlEditorWidget {
             && Self::completion_identifiers_match(&resolved_tables[0], qualifier);
         if !resolved_is_direct_catalog_fallback
             && resolved_tables
-            .iter()
-            .any(|table| data.is_known_relation(table))
+                .iter()
+                .any(|table| data.is_known_relation(table))
         {
             return Some(QualifiedCompletionMode::RelationColumns);
         }
@@ -10446,11 +10682,8 @@ impl SqlEditorWidget {
             return !Self::data_type_position_allows_user_type_objects(position, db_type);
         }
 
-        Self::cursor_is_at_identifier_suppressing_keyword_slot_for_context(
-                deep_ctx, true, db_type,
-            ) || Self::cursor_is_at_column_suppressing_keyword_slot_for_db(
-                deep_ctx, true, db_type,
-            )
+        Self::cursor_is_at_identifier_suppressing_keyword_slot_for_context(deep_ctx, true, db_type)
+            || Self::cursor_is_at_column_suppressing_keyword_slot_for_db(deep_ctx, true, db_type)
     }
 
     fn qualified_column_owner_resolves_to_relation_columns(
@@ -10461,11 +10694,8 @@ impl SqlEditorWidget {
     ) -> bool {
         if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
             let tokens = deep_ctx.statement_tokens.as_ref();
-            let end = Self::expected_suggestion_context_end(
-                tokens,
-                deep_ctx.cursor_token_len,
-                true,
-            );
+            let end =
+                Self::expected_suggestion_context_end(tokens, deep_ctx.cursor_token_len, true);
             let words = Self::previous_meaningful_words_upper(tokens, end, 16);
             if matches!(
                 Self::expected_mysql_show_object_suggestion_kind(&words),
@@ -10480,11 +10710,8 @@ impl SqlEditorWidget {
 
         if !crate::sql_text::mysql_compatibility_for_sql("", db_type) {
             let tokens = deep_ctx.statement_tokens.as_ref();
-            let end = Self::expected_suggestion_context_end(
-                tokens,
-                deep_ctx.cursor_token_len,
-                true,
-            );
+            let end =
+                Self::expected_suggestion_context_end(tokens, deep_ctx.cursor_token_len, true);
             if matches!(
                 Self::expected_oracle_associate_statistics_object_suggestion_kind(tokens, end),
                 Some(ExpectedObjectSuggestionKind::ColumnOwner)
@@ -10556,9 +10783,7 @@ impl SqlEditorWidget {
         let words = Self::previous_meaningful_words_with_bind_markers_upper(tokens, end, 5);
         let len = words.len();
         let tail = |from_end: usize| len.checked_sub(from_end).and_then(|idx| words.get(idx));
-        let word = |from_end: usize| {
-            tail(from_end).map(|(value, _)| value.as_str())
-        };
+        let word = |from_end: usize| tail(from_end).map(|(value, _)| value.as_str());
         let is_count = |from_end: usize| {
             tail(from_end)
                 .is_some_and(|(value, is_bind)| Self::is_row_count_tail_word(value, *is_bind))
@@ -10578,10 +10803,7 @@ impl SqlEditorWidget {
             return Some(FETCH_DIRECTION_KEYWORDS);
         }
 
-        if len >= 2
-            && word(2).is_some_and(Self::is_row_limit_unit)
-            && word(1) == Some("WITH")
-        {
+        if len >= 2 && word(2).is_some_and(Self::is_row_limit_unit) && word(1) == Some("WITH") {
             return Some(TIES_KEYWORDS);
         }
 
@@ -10773,16 +10995,14 @@ impl SqlEditorWidget {
         }
     }
 
-    fn window_partition_tail_can_transition_to_order_by(
-        tokens: &[SqlToken],
-        end: usize,
-    ) -> bool {
+    fn window_partition_tail_can_transition_to_order_by(tokens: &[SqlToken], end: usize) -> bool {
         let Some(parts) = Self::window_spec_top_level_parts(tokens, end) else {
             return false;
         };
-        let Some(partition_idx) = parts.windows(2).position(|pair| {
-            pair[0] == "PARTITION" && pair[1] == "BY"
-        }) else {
+        let Some(partition_idx) = parts
+            .windows(2)
+            .position(|pair| pair[0] == "PARTITION" && pair[1] == "BY")
+        else {
             return false;
         };
         let tail = &parts[partition_idx + 2..];
@@ -10854,9 +11074,8 @@ impl SqlEditorWidget {
             .filter(|(_, token)| !matches!(token, SqlToken::Comment(_)))
             .collect();
         let is_word = |token: &SqlToken| matches!(token, SqlToken::Word(_));
-        let is_symbol = |token: &SqlToken, sym: &str| {
-            matches!(token, SqlToken::Symbol(value) if value == sym)
-        };
+        let is_symbol =
+            |token: &SqlToken, sym: &str| matches!(token, SqlToken::Symbol(value) if value == sym);
 
         let mut i = indexed.len().checked_sub(1)?;
         if !is_symbol(indexed[i].1, "%") {
@@ -11289,7 +11508,10 @@ impl SqlEditorWidget {
             }
         }
 
-        segment.iter().position(|word| word == "TO").is_some_and(|idx| idx > 0)
+        segment
+            .iter()
+            .position(|word| word == "TO")
+            .is_some_and(|idx| idx > 0)
     }
 
     fn cursor_is_at_ddl_partition_new_name_slot_for_context(
@@ -11457,10 +11679,9 @@ impl SqlEditorWidget {
         ) {
             return None;
         }
-        tokens
-            .iter()
-            .take(8)
-            .position(|token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("TABLE")))
+        tokens.iter().take(8).position(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("TABLE")),
+        )
     }
 
     fn ddl_table_index_name_intro_words(words: &[String], required_op: Option<&str>) -> bool {
@@ -11559,10 +11780,14 @@ impl SqlEditorWidget {
         }
 
         match action_words.as_slice() {
-            [op, object_type] if op == "DROP" && matches!(object_type.as_str(), "INDEX" | "KEY") => {
+            [op, object_type]
+                if op == "DROP" && matches!(object_type.as_str(), "INDEX" | "KEY") =>
+            {
                 Some(ExpectedObjectSuggestionKind::Index)
             }
-            [op, object_type] if op == "RENAME" && matches!(object_type.as_str(), "INDEX" | "KEY") => {
+            [op, object_type]
+                if op == "RENAME" && matches!(object_type.as_str(), "INDEX" | "KEY") =>
+            {
                 Some(ExpectedObjectSuggestionKind::Index)
             }
             [op, object_type, ..]
@@ -11703,7 +11928,11 @@ impl SqlEditorWidget {
             .rev()
             .find_map(|(idx, pair)| (pair[0] == "ORDER" && pair[1] == "BY").then_some(idx))?;
         let order_tail = &parts[order_idx + 2..];
-        if order_tail.is_empty() || order_tail.iter().any(|part| Self::is_window_frame_unit(part)) {
+        if order_tail.is_empty()
+            || order_tail
+                .iter()
+                .any(|part| Self::is_window_frame_unit(part))
+        {
             return None;
         }
         let sort_tail = match order_tail.iter().rposition(|part| part == ",") {
@@ -11715,9 +11944,7 @@ impl SqlEditorWidget {
         }
 
         match sort_tail {
-            [prefix @ .., last]
-                if last == "NULLS" && !prefix.is_empty() =>
-            {
+            [prefix @ .., last] if last == "NULLS" && !prefix.is_empty() => {
                 Some(WindowOrderBySortModifierSlot::AfterNulls)
             }
             [prefix @ .., prev, last]
@@ -11942,8 +12169,7 @@ impl SqlEditorWidget {
         match Self::keep_dense_rank_top_level_words(tokens, end)?.as_slice() {
             [word] if word == "DENSE_RANK" => Some(KeepDenseRankSlot::AfterDenseRank),
             [dense_rank, direction]
-                if dense_rank == "DENSE_RANK"
-                    && matches!(direction.as_str(), "FIRST" | "LAST") =>
+                if dense_rank == "DENSE_RANK" && matches!(direction.as_str(), "FIRST" | "LAST") =>
             {
                 Some(KeepDenseRankSlot::AfterRankDirection)
             }
@@ -12124,12 +12350,8 @@ impl SqlEditorWidget {
                 Some(AnalyticNullTreatmentSlot::AfterNthValueFromDirection)
             }
             _ => Self::closed_analytic_null_treatment_call(&toks).map(|call| match call {
-                AnalyticNullTreatmentCall::General => {
-                    AnalyticNullTreatmentSlot::AfterAnalyticCall
-                }
-                AnalyticNullTreatmentCall::NthValue => {
-                    AnalyticNullTreatmentSlot::AfterNthValueCall
-                }
+                AnalyticNullTreatmentCall::General => AnalyticNullTreatmentSlot::AfterAnalyticCall,
+                AnalyticNullTreatmentCall::NthValue => AnalyticNullTreatmentSlot::AfterNthValueCall,
             }),
         }
     }
@@ -12296,8 +12518,8 @@ impl SqlEditorWidget {
         let Some(var_idx) = last.checked_sub(1) else {
             return false;
         };
-        let at_statement_head =
-            var_idx == 0 || matches!(toks.get(var_idx - 1), Some(SqlToken::Symbol(sym)) if sym == ";");
+        let at_statement_head = var_idx == 0
+            || matches!(toks.get(var_idx - 1), Some(SqlToken::Symbol(sym)) if sym == ";");
         at_statement_head
             && matches!(toks.get(var_idx), Some(SqlToken::Word(word)) if matches!(word.to_ascii_uppercase().as_str(), "VAR" | "VARIABLE"))
             && matches!(toks.get(last), Some(SqlToken::Word(word)) if !Self::token_is_language_keyword(&word.to_ascii_uppercase()))
@@ -12322,7 +12544,8 @@ impl SqlEditorWidget {
         let Some(last) = toks.len().checked_sub(1) else {
             return false;
         };
-        let is_print_at_head = |idx: usize| Self::tool_command_word_at_statement_head(&toks, idx, &["PRINT"]);
+        let is_print_at_head =
+            |idx: usize| Self::tool_command_word_at_statement_head(&toks, idx, &["PRINT"]);
 
         is_print_at_head(last)
             || (matches!(toks.get(last), Some(SqlToken::Symbol(sym)) if sym == ":")
@@ -12379,9 +12602,10 @@ impl SqlEditorWidget {
                     idx,
                     Self::TOOL_NO_SQL_ARGUMENT_COMMANDS,
                 )
-                && !toks.iter().skip(idx + 1).any(|token| {
-                    matches!(token, SqlToken::Symbol(sym) if sym == ";")
-                })
+                && !toks
+                    .iter()
+                    .skip(idx + 1)
+                    .any(|token| matches!(token, SqlToken::Symbol(sym) if sym == ";"))
         })
     }
 
@@ -12409,9 +12633,10 @@ impl SqlEditorWidget {
             }
         }
         command_start.is_some_and(|idx| {
-            !toks.iter().skip(idx + 1).any(|token| {
-                matches!(token, SqlToken::Symbol(sym) if sym == ";")
-            })
+            !toks
+                .iter()
+                .skip(idx + 1)
+                .any(|token| matches!(token, SqlToken::Symbol(sym) if sym == ";"))
         })
     }
 
@@ -12512,7 +12737,7 @@ impl SqlEditorWidget {
                 | "ORDER"
                 | "OVERRIDING"
                 | "STATIC"
-            )
+        )
     }
 
     fn cursor_is_at_alter_type_attribute_type(tokens: &[SqlToken], end: usize) -> bool {
@@ -12547,7 +12772,9 @@ impl SqlEditorWidget {
             .collect::<Vec<_>>();
         words.iter().any(|word| word == "ALTER")
             && words.iter().any(|word| word == "TYPE")
-            && words.iter().any(|word| matches!(word.as_str(), "ADD" | "MODIFY"))
+            && words
+                .iter()
+                .any(|word| matches!(word.as_str(), "ADD" | "MODIFY"))
             && words.iter().any(|word| word == "ATTRIBUTE")
     }
 
@@ -12639,9 +12866,7 @@ impl SqlEditorWidget {
             match token {
                 SqlToken::Comment(_) => {}
                 SqlToken::Symbol(sym) if sym == "(" => {
-                    let follows_table_fn = last_word.as_deref().is_some_and(|word| {
-                        matches_table_function(word)
-                    });
+                    let follows_table_fn = last_word.as_deref().is_some_and(&matches_table_function);
                     stack.push(Frame {
                         follows_table_fn,
                         columns_seen: false,
@@ -12801,9 +13026,9 @@ impl SqlEditorWidget {
         toks: &[&SqlToken],
         in_json_table: bool,
     ) -> Option<&'static [&'static str]> {
-        let columns_idx = toks.iter().rposition(|token| {
-            matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("COLUMNS"))
-        })?;
+        let columns_idx = toks.iter().rposition(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("COLUMNS")),
+        )?;
         let mut tail_start = columns_idx + 1;
         let mut depth = 0i32;
         for (idx, token) in toks.iter().enumerate().skip(columns_idx + 1) {
@@ -12839,9 +13064,9 @@ impl SqlEditorWidget {
         }
 
         if in_json_table {
-            if let Some(path_idx) = tail.iter().rposition(|token| {
-                matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("PATH"))
-            }) {
+            if let Some(path_idx) = tail.iter().rposition(
+                |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("PATH")),
+            ) {
                 if !tail
                     .get(path_idx + 1)
                     .is_some_and(|token| matches!(token, SqlToken::String(_)))
@@ -12884,8 +13109,7 @@ impl SqlEditorWidget {
                     if matches!(
                         words_after_path.as_slice(),
                         [.., prev, last] if prev == "ON" && last == "EMPTY"
-                    )
-                    {
+                    ) {
                         return Some(&["NULL", "ERROR", "DEFAULT"]);
                     }
                     match tail.last()? {
@@ -12911,9 +13135,9 @@ impl SqlEditorWidget {
                     _ => {}
                 }
             }
-        } else if let Some(path_idx) = tail.iter().rposition(|token| {
-            matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("PATH"))
-        }) {
+        } else if let Some(path_idx) = tail.iter().rposition(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("PATH")),
+        ) {
             if !tail
                 .get(path_idx + 1)
                 .is_some_and(|token| matches!(token, SqlToken::String(_)))
@@ -13135,11 +13359,9 @@ impl SqlEditorWidget {
             return None;
         }
 
-        if Self::cursor_is_inside_table_function_columns_clause_matching(
-            tokens,
-            end,
-            |word| word.eq_ignore_ascii_case("JSON_TABLE"),
-        ) && Self::json_table_handler_precedes_on(&toks, last)
+        if Self::cursor_is_inside_table_function_columns_clause_matching(tokens, end, |word| {
+            word.eq_ignore_ascii_case("JSON_TABLE")
+        }) && Self::json_table_handler_precedes_on(&toks, last)
         {
             return Some(JSON_ERROR_EMPTY_TARGET_WORDS);
         }
@@ -13193,11 +13415,7 @@ impl SqlEditorWidget {
     ) -> Option<(String, usize)> {
         let mut stack: Vec<(Option<String>, usize)> = Vec::new();
         let mut last_word: Option<String> = None;
-        for (idx, token) in tokens
-            .iter()
-            .enumerate()
-            .take(end.min(tokens.len()))
-        {
+        for (idx, token) in tokens.iter().enumerate().take(end.min(tokens.len())) {
             match token {
                 SqlToken::Comment(_) => {}
                 SqlToken::Symbol(sym) if sym == "(" => stack.push((last_word.take(), idx)),
@@ -13220,11 +13438,7 @@ impl SqlEditorWidget {
     ) -> Vec<String> {
         let mut depth = 0i32;
         let mut words = Vec::new();
-        for token in tokens
-            .iter()
-            .take(end.min(tokens.len()))
-            .skip(open_idx + 1)
-        {
+        for token in tokens.iter().take(end.min(tokens.len())).skip(open_idx + 1) {
             match token {
                 SqlToken::Symbol(sym) if sym == "(" => depth += 1,
                 SqlToken::Symbol(sym) if sym == ")" => depth = (depth - 1).max(0),
@@ -13242,11 +13456,7 @@ impl SqlEditorWidget {
     ) -> Vec<&SqlToken> {
         let mut depth = 0i32;
         let mut top_level_tokens = Vec::new();
-        for token in tokens
-            .iter()
-            .take(end.min(tokens.len()))
-            .skip(open_idx + 1)
-        {
+        for token in tokens.iter().take(end.min(tokens.len())).skip(open_idx + 1) {
             match token {
                 SqlToken::Symbol(sym) if sym == "(" => {
                     if depth == 0 {
@@ -13343,8 +13553,8 @@ impl SqlEditorWidget {
             "JSON_QUERY" => {
                 let last = last?;
                 let has_format_json = windows_contain("FORMAT", "JSON");
-                let has_wrapper = windows_contain("WITH", "WRAPPER")
-                    || windows_contain("WITHOUT", "WRAPPER");
+                let has_wrapper =
+                    windows_contain("WITH", "WRAPPER") || windows_contain("WITHOUT", "WRAPPER");
                 if last == "FORMAT" {
                     return Some(&["JSON"]);
                 }
@@ -13437,13 +13647,7 @@ impl SqlEditorWidget {
                 Some("RETURNING") => Some(&["CONTENT"]),
                 Some("CONTENT") => Some(&["NULL"]),
                 Some("NULL") => Some(&["ON"]),
-                Some("ON")
-                    if words
-                        .iter()
-                        .rev()
-                        .nth(1)
-                        .is_some_and(|prev| prev == "NULL") =>
-                {
+                Some("ON") if words.iter().rev().nth(1).is_some_and(|prev| prev == "NULL") => {
                     Some(&["EMPTY"])
                 }
                 _ => None,
@@ -13648,7 +13852,10 @@ impl SqlEditorWidget {
             Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("CONSTRUCTOR") => {
                 Some(&["FUNCTION"])
             }
-            _ if Self::cursor_is_at_create_type_object_member_catalog_suppressed_slot(tokens, end) => {
+            _ if Self::cursor_is_at_create_type_object_member_catalog_suppressed_slot(
+                tokens, end,
+            ) =>
+            {
                 Some(&[])
             }
             _ => None,
@@ -13707,8 +13914,8 @@ impl SqlEditorWidget {
             cursor_token_len,
             exclude_current_identifier_chain,
         );
-        Self::expected_create_type_object_member_keyword_candidates(tokens, end, db_type)
-            .or_else(|| {
+        Self::expected_create_type_object_member_keyword_candidates(tokens, end, db_type).or_else(
+            || {
                 let statement_tokens = deep_ctx.statement_tokens.as_ref();
                 let statement_end = Self::expected_suggestion_context_end(
                     statement_tokens,
@@ -13720,7 +13927,8 @@ impl SqlEditorWidget {
                     statement_end,
                     db_type,
                 )
-            })
+            },
+        )
     }
 
     fn cursor_is_inside_create_type_object_member_list(tokens: &[SqlToken], end: usize) -> bool {
@@ -13831,33 +14039,36 @@ impl SqlEditorWidget {
             return None;
         }
 
-        let package_idx = toks
-            .iter()
-            .position(|token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("PACKAGE")))?;
-        if !toks
-            .get(..package_idx)
-            .unwrap_or(&[])
-            .iter()
-            .any(|token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("CREATE")))
-        {
+        let package_idx = toks.iter().position(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("PACKAGE")),
+        )?;
+        if !toks.get(..package_idx).unwrap_or(&[]).iter().any(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("CREATE")),
+        ) {
             return None;
         }
-        let opener_idx = toks
-            .iter()
-            .enumerate()
-            .skip(package_idx + 1)
-            .find_map(|(idx, token)| {
-                matches!(
-                    token,
-                    SqlToken::Word(word)
-                        if word.eq_ignore_ascii_case("AS") || word.eq_ignore_ascii_case("IS")
-                )
-                .then_some(idx)
-            })?;
-        if last == opener_idx
-            || matches!(toks.get(last), Some(SqlToken::Symbol(sym)) if sym == ";")
+        let opener_idx =
+            toks.iter()
+                .enumerate()
+                .skip(package_idx + 1)
+                .find_map(|(idx, token)| {
+                    matches!(
+                        token,
+                        SqlToken::Word(word)
+                            if word.eq_ignore_ascii_case("AS") || word.eq_ignore_ascii_case("IS")
+                    )
+                    .then_some(idx)
+                })?;
+        if last == opener_idx || matches!(toks.get(last), Some(SqlToken::Symbol(sym)) if sym == ";")
         {
-            Some(&["FUNCTION", "PROCEDURE", "TYPE", "SUBTYPE", "CURSOR", "PRAGMA"])
+            Some(&[
+                "FUNCTION",
+                "PROCEDURE",
+                "TYPE",
+                "SUBTYPE",
+                "CURSOR",
+                "PRAGMA",
+            ])
         } else {
             None
         }
@@ -13910,7 +14121,8 @@ impl SqlEditorWidget {
             _ if tail.len() >= 4
                 && tail.first().map(String::as_str) == Some("TYPE")
                 && tail.get(2).map(String::as_str) == Some("IS")
-                && tail.iter().any(|word| word == "OF") => {
+                && tail.iter().any(|word| word == "OF") =>
+            {
                 Some(&[])
             }
             [.., _name, constant, _type_name] if constant == "CONSTANT" => {
@@ -13939,8 +14151,7 @@ impl SqlEditorWidget {
         let last = tail.last().map(String::as_str)?;
         if matches!(
             last,
-            "AS"
-                | "CONSTRUCTOR"
+            "AS" | "CONSTRUCTOR"
                 | "FUNCTION"
                 | "IN"
                 | "IS"
@@ -14009,14 +14220,12 @@ impl SqlEditorWidget {
         end: usize,
         db_type: Option<crate::db::DatabaseType>,
     ) -> Option<&'static [&'static str]> {
-        Self::expected_type_method_completed_signature_tail_keyword_candidates(
-            tokens, end, db_type,
-        )
-        .or_else(|| {
-            Self::expected_package_routine_completed_signature_tail_keyword_candidates(
-                tokens, end, db_type,
-            )
-        })
+        Self::expected_type_method_completed_signature_tail_keyword_candidates(tokens, end, db_type)
+            .or_else(|| {
+                Self::expected_package_routine_completed_signature_tail_keyword_candidates(
+                    tokens, end, db_type,
+                )
+            })
     }
 
     fn expected_package_member_start_keyword_candidates_for_context(
@@ -14067,23 +14276,25 @@ impl SqlEditorWidget {
             Some(SqlToken::Word(word))
                 if word.eq_ignore_ascii_case("IS") || word.eq_ignore_ascii_case("AS") =>
             {
-                let declaration_head = toks
-                    .get(..last_idx)
-                    .unwrap_or(&[])
-                    .iter()
-                    .rev()
-                    .find_map(|token| match token {
+                let declaration_head = toks.get(..last_idx).unwrap_or(&[]).iter().rev().find_map(
+                    |token| match token {
                         SqlToken::Word(word)
                             if matches!(
                                 word.to_ascii_uppercase().as_str(),
-                                "FUNCTION" | "PROCEDURE" | "PACKAGE" | "BODY" | "TYPE"
-                                    | "SUBTYPE" | "CURSOR"
+                                "FUNCTION"
+                                    | "PROCEDURE"
+                                    | "PACKAGE"
+                                    | "BODY"
+                                    | "TYPE"
+                                    | "SUBTYPE"
+                                    | "CURSOR"
                             ) =>
                         {
                             Some(word.to_ascii_uppercase())
                         }
                         _ => None,
-                    });
+                    },
+                );
                 matches!(
                     declaration_head.as_deref(),
                     Some("FUNCTION" | "PROCEDURE" | "PACKAGE" | "BODY")
@@ -14098,15 +14309,17 @@ impl SqlEditorWidget {
         end: usize,
         db_type: Option<crate::db::DatabaseType>,
     ) -> Option<&'static [&'static str]> {
-        Self::cursor_is_at_plsql_declaration_start(tokens, end, db_type).then_some(&[
-            "FUNCTION",
-            "PROCEDURE",
-            "TYPE",
-            "SUBTYPE",
-            "CURSOR",
-            "PRAGMA",
-            "BEGIN",
-        ][..])
+        Self::cursor_is_at_plsql_declaration_start(tokens, end, db_type).then_some(
+            &[
+                "FUNCTION",
+                "PROCEDURE",
+                "TYPE",
+                "SUBTYPE",
+                "CURSOR",
+                "PRAGMA",
+                "BEGIN",
+            ][..],
+        )
     }
 
     fn expected_plsql_declaration_start_keyword_candidates_for_context(
@@ -14182,12 +14395,9 @@ impl SqlEditorWidget {
         ) else {
             return false;
         };
-        if !toks
-            .get(..package_idx)
-            .unwrap_or(&[])
-            .iter()
-            .any(|token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("CREATE")))
-        {
+        if !toks.get(..package_idx).unwrap_or(&[]).iter().any(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("CREATE")),
+        ) {
             return false;
         }
         let Some(opener_idx) =
@@ -14259,7 +14469,11 @@ impl SqlEditorWidget {
             deep_ctx.cursor_token_len,
             exclude_current_identifier_chain,
         );
-        Self::cursor_is_in_package_declaration_default_value(statement_tokens, statement_end, db_type)
+        Self::cursor_is_in_package_declaration_default_value(
+            statement_tokens,
+            statement_end,
+            db_type,
+        )
     }
 
     fn cursor_is_at_package_declaration_default_value_operand_start_for_context(
@@ -14274,7 +14488,8 @@ impl SqlEditorWidget {
             cursor_token_len,
             exclude_current_identifier_chain,
         );
-        if Self::cursor_is_at_package_declaration_default_value_operand_start(tokens, end, db_type) {
+        if Self::cursor_is_at_package_declaration_default_value_operand_start(tokens, end, db_type)
+        {
             return true;
         }
         let statement_tokens = deep_ctx.statement_tokens.as_ref();
@@ -14321,22 +14536,20 @@ impl SqlEditorWidget {
             cursor_token_len,
             exclude_current_identifier_chain,
         );
-        Self::expected_type_method_completed_signature_tail_keyword_candidates(
-            tokens, end, db_type,
-        )
-        .or_else(|| {
-            let statement_tokens = deep_ctx.statement_tokens.as_ref();
-            let statement_end = Self::expected_suggestion_context_end(
-                statement_tokens,
-                deep_ctx.cursor_token_len,
-                exclude_current_identifier_chain,
-            );
-            Self::expected_type_method_completed_signature_tail_keyword_candidates(
-                statement_tokens,
-                statement_end,
-                db_type,
-            )
-        })
+        Self::expected_type_method_completed_signature_tail_keyword_candidates(tokens, end, db_type)
+            .or_else(|| {
+                let statement_tokens = deep_ctx.statement_tokens.as_ref();
+                let statement_end = Self::expected_suggestion_context_end(
+                    statement_tokens,
+                    deep_ctx.cursor_token_len,
+                    exclude_current_identifier_chain,
+                );
+                Self::expected_type_method_completed_signature_tail_keyword_candidates(
+                    statement_tokens,
+                    statement_end,
+                    db_type,
+                )
+            })
     }
 
     /// True when the cursor is at a PL/SQL type slot: a routine parameter type
@@ -14349,15 +14562,9 @@ impl SqlEditorWidget {
             return false;
         }
         let last = toks.len() - 1;
-        let is_word = |idx: usize, kw: &str| {
-            matches!(toks.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case(kw))
-        };
-        let is_symbol = |idx: usize, sym: &str| {
-            matches!(toks.get(idx), Some(SqlToken::Symbol(value)) if value == sym)
-        };
-        let is_plain_identifier = |idx: usize| {
-            matches!(toks.get(idx), Some(SqlToken::Word(word)) if !Self::is_plsql_non_type_keyword(word))
-        };
+        let is_word = |idx: usize, kw: &str| matches!(toks.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case(kw));
+        let is_symbol = |idx: usize, sym: &str| matches!(toks.get(idx), Some(SqlToken::Symbol(value)) if value == sym);
+        let is_plain_identifier = |idx: usize| matches!(toks.get(idx), Some(SqlToken::Word(word)) if !Self::is_plsql_non_type_keyword(word));
 
         // Function/cursor `RETURN |` signature type — a `RETURN <expr>` statement
         // lives inside the body, so it is excluded by the routine-header check
@@ -14426,12 +14633,8 @@ impl SqlEditorWidget {
         if last == 0 {
             return false;
         }
-        let is_plain_identifier = |idx: usize| {
-            matches!(toks.get(idx), Some(SqlToken::Word(word)) if !Self::is_plsql_non_type_keyword(word))
-        };
-        let is_symbol = |idx: usize, sym: &str| {
-            matches!(toks.get(idx), Some(SqlToken::Symbol(value)) if value == sym)
-        };
+        let is_plain_identifier = |idx: usize| matches!(toks.get(idx), Some(SqlToken::Word(word)) if !Self::is_plsql_non_type_keyword(word));
+        let is_symbol = |idx: usize, sym: &str| matches!(toks.get(idx), Some(SqlToken::Symbol(value)) if value == sym);
 
         Self::cursor_is_inside_plsql_record_field_list(tokens, end)
             && is_plain_identifier(last)
@@ -14536,12 +14739,13 @@ impl SqlEditorWidget {
                     let name_is_identifier = last_word
                         .as_deref()
                         .is_some_and(|word| !Self::is_plsql_non_type_keyword(word));
-                    let preceded_by_routine_keyword = second_last_word.as_deref().is_some_and(|word| {
-                        matches!(
-                            word.to_ascii_uppercase().as_str(),
-                            "FUNCTION" | "PROCEDURE" | "CURSOR"
-                        )
-                    });
+                    let preceded_by_routine_keyword =
+                        second_last_word.as_deref().is_some_and(|word| {
+                            matches!(
+                                word.to_ascii_uppercase().as_str(),
+                                "FUNCTION" | "PROCEDURE" | "CURSOR"
+                            )
+                        });
                     param_paren_stack.push(name_is_identifier && preceded_by_routine_keyword);
                     last_word = None;
                     second_last_word = None;
@@ -14590,9 +14794,7 @@ impl SqlEditorWidget {
         {
             match token {
                 SqlToken::Symbol(sym) if sym == "(" || sym == "[" => depth += 1,
-                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => {
-                    depth = (depth - 1).max(0)
-                }
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => depth = (depth - 1).max(0),
                 SqlToken::Symbol(sym) if sym == "," && depth == 0 => segment_start = idx + 1,
                 _ => {}
             }
@@ -14826,11 +15028,13 @@ impl SqlEditorWidget {
             }
         }
         match stack.last() {
-            Some(frame) if frame.follows_extract && !frame.seen_from => Some(if last_was_open_paren {
-                ExtractArgPosition::Field
-            } else {
-                ExtractArgPosition::AwaitingFrom
-            }),
+            Some(frame) if frame.follows_extract && !frame.seen_from => {
+                Some(if last_was_open_paren {
+                    ExtractArgPosition::Field
+                } else {
+                    ExtractArgPosition::AwaitingFrom
+                })
+            }
             _ => None,
         }
     }
@@ -14871,15 +15075,16 @@ impl SqlEditorWidget {
             match token {
                 SqlToken::Comment(_) => {}
                 SqlToken::Symbol(sym) if sym == "(" => {
-                    let func = last_word.as_deref().map(str::to_ascii_uppercase).and_then(
-                        |word| match word.as_str() {
+                    let func = last_word
+                        .as_deref()
+                        .map(str::to_ascii_uppercase)
+                        .and_then(|word| match word.as_str() {
                             "TRIM" => Some("TRIM"),
                             "SUBSTRING" => Some("SUBSTRING"),
                             "POSITION" => Some("POSITION"),
                             "OVERLAY" => Some("OVERLAY"),
                             _ => None,
-                        },
-                    );
+                        });
                     stack.push(Frame {
                         func,
                         seen_from: false,
@@ -15006,15 +15211,16 @@ impl SqlEditorWidget {
             match token {
                 SqlToken::Comment(_) => {}
                 SqlToken::Symbol(sym) if sym == "(" => {
-                    let func = last_word.as_deref().map(str::to_ascii_uppercase).and_then(
-                        |word| match word.as_str() {
+                    let func = last_word
+                        .as_deref()
+                        .map(str::to_ascii_uppercase)
+                        .and_then(|word| match word.as_str() {
                             "TRIM" => Some("TRIM"),
                             "SUBSTRING" => Some("SUBSTRING"),
                             "POSITION" => Some("POSITION"),
                             "OVERLAY" => Some("OVERLAY"),
                             _ => None,
-                        },
-                    );
+                        });
                     stack.push(Frame {
                         func,
                         seen_from: false,
@@ -15200,13 +15406,9 @@ impl SqlEditorWidget {
 
     fn completed_interval_operand_type(before: &[&SqlToken]) -> Option<PrecedingOperandType> {
         let last = before.len().checked_sub(1)?;
-        let is_interval = |idx: usize| {
-            matches!(before.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("INTERVAL"))
-        };
+        let is_interval = |idx: usize| matches!(before.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("INTERVAL"));
         let is_string = |idx: usize| matches!(before.get(idx), Some(SqlToken::String(_)));
-        let is_to = |idx: usize| {
-            matches!(before.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("TO"))
-        };
+        let is_to = |idx: usize| matches!(before.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("TO"));
 
         let last_unit = Self::completed_interval_unit_ending_at(before, last)?.0;
         if last_unit.checked_sub(1).is_some_and(is_string)
@@ -15215,9 +15417,9 @@ impl SqlEditorWidget {
             return Some(PrecedingOperandType::Other);
         }
         if last_unit.checked_sub(1).is_some_and(is_to) {
-            let first_unit = last_unit
-                .checked_sub(2)
-                .and_then(|idx| Self::completed_interval_unit_ending_at(before, idx).map(|(idx, _)| idx))?;
+            let first_unit = last_unit.checked_sub(2).and_then(|idx| {
+                Self::completed_interval_unit_ending_at(before, idx).map(|(idx, _)| idx)
+            })?;
             if first_unit.checked_sub(1).is_some_and(is_string)
                 && first_unit.checked_sub(2).is_some_and(is_interval)
             {
@@ -15246,21 +15448,16 @@ impl SqlEditorWidget {
     fn interval_unit_position(tokens: &[SqlToken], end: usize) -> Option<IntervalUnitSlot> {
         let toks = Self::meaningful_tokens_before(tokens, end);
         let last = toks.len().checked_sub(1)?;
-        let is_interval = |idx: usize| {
-            matches!(toks.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("INTERVAL"))
-        };
+        let is_interval = |idx: usize| matches!(toks.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("INTERVAL"));
         let is_string = |idx: usize| matches!(toks.get(idx), Some(SqlToken::String(_)));
-        let is_to = |idx: usize| {
-            matches!(toks.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("TO"))
-        };
+        let is_to = |idx: usize| matches!(toks.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("TO"));
 
         // `INTERVAL '<value>' |` -> leading qualifier unit.
         if is_string(last) && last.checked_sub(1).is_some_and(is_interval) {
             return Some(IntervalUnitSlot::Leading);
         }
         // `INTERVAL '<value>' <unit> |` -> only `TO` (or end) follows.
-        if let Some((unit_idx, leading_unit)) =
-            Self::completed_interval_unit_ending_at(&toks, last)
+        if let Some((unit_idx, leading_unit)) = Self::completed_interval_unit_ending_at(&toks, last)
         {
             if unit_idx.checked_sub(1).is_some_and(is_string)
                 && unit_idx.checked_sub(2).is_some_and(is_interval)
@@ -15368,9 +15565,7 @@ impl SqlEditorWidget {
         PARENTHESIZED_EXPRESSION_CONSTRUCT_WORDS.contains(&upper.as_str())
     }
 
-    fn phase_allows_expression_construct_open_paren(
-        phase: intellisense_context::SqlPhase,
-    ) -> bool {
+    fn phase_allows_expression_construct_open_paren(phase: intellisense_context::SqlPhase) -> bool {
         matches!(
             phase,
             intellisense_context::SqlPhase::SelectList
@@ -15694,10 +15889,7 @@ impl SqlEditorWidget {
         }
     }
 
-    fn is_predicate_of_type_completed_type_tail_position(
-        tokens: &[SqlToken],
-        end: usize,
-    ) -> bool {
+    fn is_predicate_of_type_completed_type_tail_position(tokens: &[SqlToken], end: usize) -> bool {
         let Some(open_idx) = Self::innermost_unclosed_open_paren_index(tokens, end) else {
             return false;
         };
@@ -15781,8 +15973,10 @@ impl SqlEditorWidget {
         if !Self::is_quantified_comparison_keyword(word) {
             return false;
         }
-        let Some((comparison_idx, SqlToken::Symbol(sym))) =
-            keyword_pos.checked_sub(1).and_then(|idx| meaningful.get(idx)).copied()
+        let Some((comparison_idx, SqlToken::Symbol(sym))) = keyword_pos
+            .checked_sub(1)
+            .and_then(|idx| meaningful.get(idx))
+            .copied()
         else {
             return false;
         };
@@ -15810,8 +16004,10 @@ impl SqlEditorWidget {
         if sym != "(" {
             return None;
         }
-        let Some((introducer_idx, SqlToken::Word(word))) =
-            open_pos.checked_sub(1).and_then(|pos| meaningful.get(pos)).copied()
+        let Some((introducer_idx, SqlToken::Word(word))) = open_pos
+            .checked_sub(1)
+            .and_then(|pos| meaningful.get(pos))
+            .copied()
         else {
             return None;
         };
@@ -15829,8 +16025,11 @@ impl SqlEditorWidget {
         if upper == "CURSOR" && !crate::sql_text::mysql_compatibility_for_sql("", db_type) {
             return Some(SUBQUERY_START_KEYWORDS);
         }
-        if Self::quantified_comparison_keyword_at_meaningful_index(tokens, &meaningful, open_pos - 1)
-        {
+        if Self::quantified_comparison_keyword_at_meaningful_index(
+            tokens,
+            &meaningful,
+            open_pos - 1,
+        ) {
             return Some(SUBQUERY_START_KEYWORDS);
         }
         // `IN (` deliberately stays outside this slot: an expression list is valid
@@ -16036,17 +16235,15 @@ impl SqlEditorWidget {
         match words.as_slice() {
             [install, component, ..] if install == "INSTALL" && component == "COMPONENT" => true,
             [install, plugin, ..] if install == "INSTALL" && plugin == "PLUGIN" => true,
-            [uninstall, component, ..]
-                if uninstall == "UNINSTALL" && component == "COMPONENT" =>
-            {
+            [uninstall, component, ..] if uninstall == "UNINSTALL" && component == "COMPONENT" => {
                 true
             }
             [uninstall, plugin, ..] if uninstall == "UNINSTALL" && plugin == "PLUGIN" => true,
             [handler, ..]
                 if handler == "HANDLER"
-                    && words
-                        .windows(2)
-                        .any(|window| matches!(window, [open, as_kw] if open == "OPEN" && as_kw == "AS")) =>
+                    && words.windows(2).any(
+                        |window| matches!(window, [open, as_kw] if open == "OPEN" && as_kw == "AS"),
+                    ) =>
             {
                 true
             }
@@ -16081,9 +16278,9 @@ impl SqlEditorWidget {
         if tail.len() < 2 {
             return false;
         }
-        let comparison_idx = tail.iter().position(|item| {
-            matches!(item.as_str(), "=" | "<" | ">" | "<=" | ">=")
-        });
+        let comparison_idx = tail
+            .iter()
+            .position(|item| matches!(item.as_str(), "=" | "<" | ">" | "<=" | ">="));
         let Some(comparison_idx) = comparison_idx else {
             return false;
         };
@@ -16182,11 +16379,7 @@ impl SqlEditorWidget {
         if matches!(words.as_slice(), [load, kind, ..] if load == "LOAD" && matches!(kind.as_str(), "DATA" | "XML"))
         {
             if let Some(infile_idx) = words.iter().position(|word| word == "INFILE") {
-                if !words
-                    .iter()
-                    .skip(infile_idx + 1)
-                    .any(|word| word == "INTO")
-                {
+                if !words.iter().skip(infile_idx + 1).any(|word| word == "INTO") {
                     return true;
                 }
             }
@@ -16198,16 +16391,14 @@ impl SqlEditorWidget {
                     && local == "LOCAL"
                     && data == "DATA"
                     && directory == "DIRECTORY"
-        )
-        {
+        ) {
             return true;
         }
         if matches!(
             words.as_slice(),
             [clone, instance, from, ..]
                 if clone == "CLONE" && instance == "INSTANCE" && from == "FROM"
-        )
-        {
+        ) {
             return true;
         }
         if matches!(
@@ -16388,7 +16579,10 @@ impl SqlEditorWidget {
             Some("GLOBAL" | "SESSION" | "LOCAL" | "PERSIST" | "PERSIST_ONLY")
         );
         let qualified_system_variable = matches!(
-            (segment.first().map(String::as_str), segment.get(1).map(String::as_str)),
+            (
+                segment.first().map(String::as_str),
+                segment.get(1).map(String::as_str)
+            ),
             (Some("@"), Some("@"))
         );
         scoped_set || scoped_segment_head || qualified_system_variable
@@ -16567,8 +16761,7 @@ impl SqlEditorWidget {
         exclude_current_identifier_chain: bool,
         db_type: Option<crate::db::DatabaseType>,
     ) -> bool {
-        let oracle_analytic_extensions =
-            !crate::sql_text::mysql_compatibility_for_sql("", db_type);
+        let oracle_analytic_extensions = !crate::sql_text::mysql_compatibility_for_sql("", db_type);
         Self::cursor_is_at_pure_clause_keyword_continuation_for_context(
             deep_ctx,
             exclude_current_identifier_chain,
@@ -16960,8 +17153,7 @@ impl SqlEditorWidget {
         exclude_current_identifier_chain: bool,
         db_type: Option<crate::db::DatabaseType>,
     ) -> bool {
-        let oracle_analytic_extensions =
-            !crate::sql_text::mysql_compatibility_for_sql("", db_type);
+        let oracle_analytic_extensions = !crate::sql_text::mysql_compatibility_for_sql("", db_type);
         Self::data_type_position_for_context_for_db(
             deep_ctx,
             exclude_current_identifier_chain,
@@ -17429,10 +17621,7 @@ impl SqlEditorWidget {
             deep_ctx,
             exclude_current_identifier_chain,
             db_type,
-        ) || Self::collate_name_position_for_context(
-            deep_ctx,
-            exclude_current_identifier_chain,
-        )
+        ) || Self::collate_name_position_for_context(deep_ctx, exclude_current_identifier_chain)
     }
 
     /// True when the cursor is inside an Oracle `TABLESAMPLE`/row-sampling clause
@@ -17445,7 +17634,10 @@ impl SqlEditorWidget {
     /// value-only, so no keyword is emitted (the popup simply stays empty).
     fn cursor_is_in_table_sample_clause(tokens: &[SqlToken], end: usize) -> bool {
         Self::innermost_open_paren_preceding_word(tokens, end).is_some_and(|word| {
-            matches!(word.to_ascii_uppercase().as_str(), "SAMPLE" | "SEED" | "BLOCK")
+            matches!(
+                word.to_ascii_uppercase().as_str(),
+                "SAMPLE" | "SEED" | "BLOCK"
+            )
         })
     }
 
@@ -17485,9 +17677,9 @@ impl SqlEditorWidget {
         if !matches!(words.first().map(String::as_str), Some("CREATE" | "ALTER"))
             || !words.iter().any(|word| word == "TABLE")
             || !words.iter().any(|word| word == "LOB")
-            || !words.windows(2).any(
-                |window| matches!(window, [store, as_kw] if store == "STORE" && as_kw == "AS"),
-            )
+            || !words
+                .windows(2)
+                .any(|window| matches!(window, [store, as_kw] if store == "STORE" && as_kw == "AS"))
         {
             return false;
         }
@@ -17573,9 +17765,7 @@ impl SqlEditorWidget {
                 Some(OrderBySortModifierSlot::AfterDirection)
             }
             [.., last] if *last == "NULLS" => Some(OrderBySortModifierSlot::AfterNulls),
-            [.., prev, last]
-                if *prev == "NULLS" && matches!(last.as_str(), "FIRST" | "LAST") =>
-            {
+            [.., prev, last] if *prev == "NULLS" && matches!(last.as_str(), "FIRST" | "LAST") => {
                 Some(OrderBySortModifierSlot::AfterNullOrdering)
             }
             // `<sort-key> |` - a complete sort key with no modifier yet. All
@@ -17807,8 +17997,7 @@ impl SqlEditorWidget {
             "NAN", "INFINITE",
         ];
         const ORACLE_IS_TAIL_NO_COLLECTION: &[&str] = &[
-            "NOT", "NULL", "TRUE", "FALSE", "UNKNOWN", "DISTINCT", "JSON", "OF", "NAN",
-            "INFINITE",
+            "NOT", "NULL", "TRUE", "FALSE", "UNKNOWN", "DISTINCT", "JSON", "OF", "NAN", "INFINITE",
         ];
         const ORACLE_IS_TAIL_NO_FLOATING: &[&str] = &[
             "NOT", "NULL", "TRUE", "FALSE", "UNKNOWN", "DISTINCT", "JSON", "OF", "EMPTY", "A",
@@ -17918,9 +18107,8 @@ impl SqlEditorWidget {
                         .then_some(*idx)
                 })
         };
-        let is_tail = |from_end: usize| {
-            is_anchor_index(from_end).is_some_and(left_operand_before_is)
-        };
+        let is_tail =
+            |from_end: usize| is_anchor_index(from_end).is_some_and(left_operand_before_is);
         let is_not_tail = |from_end: usize| {
             word_at(from_end, "NOT")
                 && is_anchor_index(from_end + 1).is_some_and(left_operand_before_is)
@@ -18099,8 +18287,7 @@ impl SqlEditorWidget {
 
         is_word_at(1, "A")
             && (is_anchor_idx(2).is_some_and(follows_is_operand)
-                || (is_word_at(2, "NOT")
-                    && is_anchor_idx(3).is_some_and(follows_is_operand)))
+                || (is_word_at(2, "NOT") && is_anchor_idx(3).is_some_and(follows_is_operand)))
     }
 
     /// Structural keyword hint for the position right after a *complete* DML
@@ -18300,14 +18487,16 @@ impl SqlEditorWidget {
         if from_idx <= delete_idx + 1 {
             return false;
         }
-        tokens[(delete_idx + 1)..from_idx].iter().any(|token| match *token {
-            SqlToken::Word(word) => !matches!(
-                word.to_ascii_uppercase().as_str(),
-                "LOW_PRIORITY" | "QUICK" | "IGNORE"
-            ),
-            SqlToken::Symbol(sym) => sym == "," || sym == "*" || sym == ".",
-            _ => false,
-        })
+        tokens[(delete_idx + 1)..from_idx]
+            .iter()
+            .any(|token| match *token {
+                SqlToken::Word(word) => !matches!(
+                    word.to_ascii_uppercase().as_str(),
+                    "LOW_PRIORITY" | "QUICK" | "IGNORE"
+                ),
+                SqlToken::Symbol(sym) => sym == "," || sym == "*" || sym == ".",
+                _ => false,
+            })
     }
 
     fn mysql_delete_target_list_suggestions_for_context(
@@ -18320,8 +18509,11 @@ impl SqlEditorWidget {
         }
 
         let tokens = deep_ctx.statement_tokens.as_ref();
-        let context_end =
-            Self::expected_suggestion_context_end(tokens, deep_ctx.cursor_token_len, !prefix.is_empty());
+        let context_end = Self::expected_suggestion_context_end(
+            tokens,
+            deep_ctx.cursor_token_len,
+            !prefix.is_empty(),
+        );
         let depths = crate::ui::sql_depth::paren_depths(tokens);
         let delete_idx = tokens.iter().enumerate().find_map(|(idx, token)| {
             (crate::ui::sql_depth::is_top_level_depth(&depths, idx)
@@ -18332,11 +18524,16 @@ impl SqlEditorWidget {
             return None;
         }
 
-        let from_idx = tokens.iter().enumerate().skip(delete_idx + 1).find_map(|(idx, token)| {
-            (crate::ui::sql_depth::is_top_level_depth(&depths, idx)
+        let from_idx =
+            tokens
+                .iter()
+                .enumerate()
+                .skip(delete_idx + 1)
+                .find_map(|(idx, token)| {
+                    (crate::ui::sql_depth::is_top_level_depth(&depths, idx)
                 && matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("FROM")))
             .then_some(idx)
-        })?;
+                })?;
         if context_end > from_idx {
             return None;
         }
@@ -18417,8 +18614,7 @@ impl SqlEditorWidget {
             )
             && Self::mysql_delete_from_anchor_has_target_list(&meaningful);
 
-        if !(query_head.is_some()
-            && matches!(phase, intellisense_context::SqlPhase::FromClause)
+        if !(query_head.is_some() && matches!(phase, intellisense_context::SqlPhase::FromClause)
             || (phase.is_table_context()
                 && (source_anchor_is_dml_using
                     || source_anchor_is_mysql_dml_relation
@@ -18767,7 +18963,10 @@ impl SqlEditorWidget {
                 .find(|token| !matches!(token, SqlToken::Comment(_)))
                 .is_some_and(|token| token_completes_operand(token))
         };
-        if !toks.last().is_some_and(|token| token_completes_operand(token)) {
+        if !toks
+            .last()
+            .is_some_and(|token| token_completes_operand(token))
+        {
             return false;
         }
 
@@ -18793,7 +18992,9 @@ impl SqlEditorWidget {
             return false;
         }
         let prev_word_idx = |before: usize| {
-            (0..before).rev().find(|idx| matches!(toks[*idx], SqlToken::Word(_)))
+            (0..before)
+                .rev()
+                .find(|idx| matches!(toks[*idx], SqlToken::Word(_)))
         };
         let Some(distinct_idx) = prev_word_idx(from_idx) else {
             return false;
@@ -18803,14 +19004,10 @@ impl SqlEditorWidget {
             return false;
         }
         match prev_word_idx(distinct_idx) {
-            Some(is_idx)
-                if matches!(toks[is_idx], SqlToken::Word(word) if word.eq_ignore_ascii_case("IS")) =>
-            {
+            Some(is_idx) if matches!(toks[is_idx], SqlToken::Word(word) if word.eq_ignore_ascii_case("IS")) => {
                 slice_ends_with_operand(&toks[..is_idx])
             }
-            Some(not_idx)
-                if matches!(toks[not_idx], SqlToken::Word(word) if word.eq_ignore_ascii_case("NOT")) =>
-            {
+            Some(not_idx) if matches!(toks[not_idx], SqlToken::Word(word) if word.eq_ignore_ascii_case("NOT")) => {
                 prev_word_idx(not_idx).is_some_and(|is_idx| {
                     matches!(toks[is_idx], SqlToken::Word(word) if word.eq_ignore_ascii_case("IS"))
                         && slice_ends_with_operand(&toks[..is_idx])
@@ -18910,7 +19107,10 @@ impl SqlEditorWidget {
                     is_tail = false;
                 }
                 SqlToken::Symbol(sym) => {
-                    if matches!(sym.as_str(), "=" | "<" | ">" | "<=" | ">=" | "<>" | "!=" | "^=") {
+                    if matches!(
+                        sym.as_str(),
+                        "=" | "<" | ">" | "<=" | ">=" | "<>" | "!=" | "^="
+                    ) {
                         saw_predicate_operator = true;
                         expecting_operand = true;
                         is_tail = false;
@@ -18994,11 +19194,11 @@ impl SqlEditorWidget {
             }
         }
         let mut after_depth = depth;
-        let has_top_level_from_after_cursor = tokens
-            .iter()
-            .skip(end.min(tokens.len()))
-            .any(|token| {
-                match token {
+        let has_top_level_from_after_cursor =
+            tokens
+                .iter()
+                .skip(end.min(tokens.len()))
+                .any(|token| match token {
                     SqlToken::Symbol(sym) if sym == "(" => {
                         after_depth += 1;
                         false
@@ -19007,12 +19207,13 @@ impl SqlEditorWidget {
                         after_depth = (after_depth - 1).max(0);
                         false
                     }
-                    SqlToken::Word(word) if after_depth == 0 && word.eq_ignore_ascii_case("FROM") => {
+                    SqlToken::Word(word)
+                        if after_depth == 0 && word.eq_ignore_ascii_case("FROM") =>
+                    {
                         true
                     }
                     _ => false,
-                }
-            });
+                });
 
         let toks = Self::meaningful_tokens_before(tokens, end);
         let current_projection_is_dml_head_word = matches!(
@@ -19100,10 +19301,22 @@ impl SqlEditorWidget {
                     Some(SqlToken::Symbol(prev)) => matches!(prev.as_str(), "," | "(" | "."),
                     Some(SqlToken::Word(prev)) => matches!(
                         prev.to_ascii_uppercase().as_str(),
-                        "SELECT" | "UNION" | "INTERSECT" | "EXCEPT" | "MINUS" | "ALL"
-                            | "DISTINCT" | "DISTINCTROW" | "HIGH_PRIORITY" | "STRAIGHT_JOIN"
-                            | "SQL_BIG_RESULT" | "SQL_BUFFER_RESULT" | "SQL_CALC_FOUND_ROWS"
-                            | "SQL_CACHE" | "SQL_NO_CACHE" | "SQL_SMALL_RESULT"
+                        "SELECT"
+                            | "UNION"
+                            | "INTERSECT"
+                            | "EXCEPT"
+                            | "MINUS"
+                            | "ALL"
+                            | "DISTINCT"
+                            | "DISTINCTROW"
+                            | "HIGH_PRIORITY"
+                            | "STRAIGHT_JOIN"
+                            | "SQL_BIG_RESULT"
+                            | "SQL_BUFFER_RESULT"
+                            | "SQL_CALC_FOUND_ROWS"
+                            | "SQL_CACHE"
+                            | "SQL_NO_CACHE"
+                            | "SQL_SMALL_RESULT"
                     ),
                     _ => false,
                 }
@@ -19158,7 +19371,10 @@ impl SqlEditorWidget {
             ) {
                 return None;
             }
-            if !tail.iter().all(|word| MYSQL_SELECT_MODIFIERS.contains(&word.as_str())) {
+            if !tail
+                .iter()
+                .all(|word| MYSQL_SELECT_MODIFIERS.contains(&word.as_str()))
+            {
                 return None;
             }
             let modifier_stage = |keyword: &str| match keyword {
@@ -19172,7 +19388,8 @@ impl SqlEditorWidget {
                 _ => None,
             };
             let last_stage = tail.iter().filter_map(|word| modifier_stage(word)).max();
-            let stage_available = |stage: usize| tail.is_empty() || last_stage.is_some_and(|seen| stage > seen);
+            let stage_available =
+                |stage: usize| tail.is_empty() || last_stage.is_some_and(|seen| stage > seen);
             let has_any = |group: &[&str]| tail.iter().any(|word| group.contains(&word.as_str()));
             let priority_seen = has_any(&["HIGH_PRIORITY"]);
             let straight_join_seen = has_any(&["STRAIGHT_JOIN"]);
@@ -19233,13 +19450,10 @@ impl SqlEditorWidget {
         if prefix.is_empty() {
             return false;
         }
-        let Some(current_idx) = tokens
-            .get(context_end)
-            .and_then(|token| match token {
-                SqlToken::Word(word) if word.eq_ignore_ascii_case(prefix) => Some(context_end),
-                _ => None,
-            })
-        else {
+        let Some(current_idx) = tokens.get(context_end).and_then(|token| match token {
+            SqlToken::Word(word) if word.eq_ignore_ascii_case(prefix) => Some(context_end),
+            _ => None,
+        }) else {
             return false;
         };
 
@@ -19323,7 +19537,10 @@ impl SqlEditorWidget {
             return None;
         }
 
-        let after_def_open = Self::meaningful_tokens_before(&tokens[def_open + 1..visible_end], visible_end - def_open - 1);
+        let after_def_open = Self::meaningful_tokens_before(
+            &tokens[def_open + 1..visible_end],
+            visible_end - def_open - 1,
+        );
         let def = Self::current_create_table_definition(&after_def_open);
         // Element start — the first item (`CREATE TABLE t (|`) or a fresh post-comma
         // item (`… (a NUMBER, |`): a new column (the name is the user's, suppressed
@@ -19334,7 +19551,13 @@ impl SqlEditorWidget {
             if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
                 return None;
             }
-            return Some(&["CONSTRAINT", "PRIMARY KEY", "UNIQUE", "FOREIGN KEY", "CHECK"]);
+            return Some(&[
+                "CONSTRAINT",
+                "PRIMARY KEY",
+                "UNIQUE",
+                "FOREIGN KEY",
+                "CHECK",
+            ]);
         }
         // Inside a sub-paren of the element (`CHECK (expr |`, `NUMBER(precision |`, a
         // `REFERENCES t (col |` list) a column/expression is expected, not an
@@ -19411,8 +19634,7 @@ impl SqlEditorWidget {
             _ => after_add,
         };
         let def = Self::current_create_table_definition(after_add);
-        let had_column_keyword =
-            matches!(def.first(), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("COLUMN"));
+        let had_column_keyword = matches!(def.first(), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("COLUMN"));
         let def = if had_column_keyword { &def[1..] } else { def };
         if def.is_empty() {
             // `MODIFY |` names an existing column — defer to the column path.
@@ -19426,7 +19648,13 @@ impl SqlEditorWidget {
             if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
                 return None;
             }
-            return Some(&["CONSTRAINT", "PRIMARY KEY", "UNIQUE", "FOREIGN KEY", "CHECK"]);
+            return Some(&[
+                "CONSTRAINT",
+                "PRIMARY KEY",
+                "UNIQUE",
+                "FOREIGN KEY",
+                "CHECK",
+            ]);
         }
         // Inside a sub-paren of the element (`FOREIGN KEY (col |`, `CHECK (expr |`,
         // `NUMBER(precision |`, or a `REFERENCES t (col |` list) a column/expression
@@ -19516,8 +19744,13 @@ impl SqlEditorWidget {
             }
         }
         let has = |kw: &str| present.iter().any(|word| word == kw);
-        const SINGLE_USE: &[&str] =
-            &["DEFAULT", "COLLATE", "COMMENT", "AUTO_INCREMENT", "IDENTITY"];
+        const SINGLE_USE: &[&str] = &[
+            "DEFAULT",
+            "COLLATE",
+            "COMMENT",
+            "AUTO_INCREMENT",
+            "IDENTITY",
+        ];
         candidates
             .into_iter()
             .filter(|candidate| {
@@ -19847,9 +20080,10 @@ impl SqlEditorWidget {
             return candidates;
         };
         let option_completed = |option: &str| {
-            region.iter().position(|item| item == option).is_some_and(|idx| {
-                option == "WAIT" || region.get(idx + 1).is_some()
-            })
+            region
+                .iter()
+                .position(|item| item == option)
+                .is_some_and(|idx| option == "WAIT" || region.get(idx + 1).is_some())
         };
 
         candidates
@@ -19931,10 +20165,9 @@ impl SqlEditorWidget {
             "READS",
             "SQL",
         ];
-        if !candidates
-            .iter()
-            .any(|candidate| ROUTINE_CHARACTERISTICS.contains(&candidate.to_ascii_uppercase().as_str()))
-        {
+        if !candidates.iter().any(|candidate| {
+            ROUTINE_CHARACTERISTICS.contains(&candidate.to_ascii_uppercase().as_str())
+        }) {
             return candidates;
         }
 
@@ -19985,9 +20218,9 @@ impl SqlEditorWidget {
             name_idx + 1
         };
         let tail = words.get(tail_start..).unwrap_or(&[]);
-        let completed_language = tail
-            .windows(2)
-            .any(|window| matches!(window, [language, sql] if language == "LANGUAGE" && sql == "SQL"));
+        let completed_language = tail.windows(2).any(
+            |window| matches!(window, [language, sql] if language == "LANGUAGE" && sql == "SQL"),
+        );
         let completed_determinism = tail.iter().any(|word| word == "DETERMINISTIC");
         let completed_data_access = tail.windows(2).any(|window| {
             matches!(window, [a, b] if matches!(a.as_str(), "CONTAINS" | "NO") && b == "SQL")
@@ -20074,9 +20307,9 @@ impl SqlEditorWidget {
                 matches!(window, [disable, on, value]
                     if disable == "DISABLE" && on == "ON" && matches!(value.as_str(), "REPLICA" | "SLAVE"))
             });
-        let completed_rename = tail.windows(3).any(|window| {
-            matches!(window, [rename, to, _value] if rename == "RENAME" && to == "TO")
-        });
+        let completed_rename = tail.windows(3).any(
+            |window| matches!(window, [rename, to, _value] if rename == "RENAME" && to == "TO"),
+        );
 
         candidates
             .into_iter()
@@ -20150,8 +20383,7 @@ impl SqlEditorWidget {
             return candidates;
         }
         let tail = words.get(account_idx + 1..).unwrap_or(&[]);
-        if !tail.iter().any(|word| word == "WITH") || tail.iter().any(|word| word == "IDENTIFIED")
-        {
+        if !tail.iter().any(|word| word == "WITH") || tail.iter().any(|word| word == "IDENTIFIED") {
             return candidates;
         }
         let limit_completed = |option: &str| {
@@ -20280,10 +20512,12 @@ impl SqlEditorWidget {
                     && interval == "INTERVAL"
                     && day == "DAY")
         });
-        let completed_require_none = tail
-            .windows(2)
-            .any(|window| matches!(window, [require, none] if require == "REQUIRE" && none == "NONE"));
-        let completed_ssl_or_x509 = tail.iter().any(|item| matches!(item.as_str(), "SSL" | "X509"));
+        let completed_require_none = tail.windows(2).any(
+            |window| matches!(window, [require, none] if require == "REQUIRE" && none == "NONE"),
+        );
+        let completed_ssl_or_x509 = tail
+            .iter()
+            .any(|item| matches!(item.as_str(), "SSL" | "X509"));
         let completed_tls_option = |option: &str| completed_pair(option);
         let completed_require = completed_require_none
             || completed_ssl_or_x509
@@ -20653,9 +20887,7 @@ impl SqlEditorWidget {
                             def_open = Some(idx);
                         }
                     }
-                    SqlToken::Symbol(sym) if sym == ")" || sym == "]" => {
-                        depth = (depth - 1).max(0)
-                    }
+                    SqlToken::Symbol(sym) if sym == ")" || sym == "]" => depth = (depth - 1).max(0),
                     _ => {}
                 }
             }
@@ -20684,9 +20916,7 @@ impl SqlEditorWidget {
         for (idx, token) in toks.iter().enumerate() {
             match token {
                 SqlToken::Symbol(sym) if sym == "(" || sym == "[" => depth += 1,
-                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => {
-                    depth = (depth - 1).max(0)
-                }
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => depth = (depth - 1).max(0),
                 SqlToken::Word(word) if depth == 0 && idx > 1 => {
                     match word.to_ascii_uppercase().as_str() {
                         "ADD" | "MODIFY" | "CHANGE" => governing_idx = Some(idx),
@@ -20833,9 +21063,7 @@ impl SqlEditorWidget {
                         create_table_def_open = Some(idx);
                     }
                 }
-                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => {
-                    depth = (depth - 1).max(0)
-                }
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => depth = (depth - 1).max(0),
                 _ => {}
             }
         }
@@ -20886,7 +21114,7 @@ impl SqlEditorWidget {
             Self::create_table_definition_active_column_reference_marker(current_def)?;
         if active_marker != "AS" {
             if let Some(column) = Self::create_table_column_name_from_definition(current_def) {
-            declared_columns.push(column);
+                declared_columns.push(column);
             }
         }
 
@@ -21064,15 +21292,17 @@ impl SqlEditorWidget {
     fn create_table_constraint_tail(def: &[&SqlToken]) -> Option<&'static [&'static str]> {
         // `CONSTRAINT |` — a brand-new constraint name is expected next, not a
         // keyword. Suppress the column-property catalog (the generic fallback).
-        if matches!(def.last(), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("CONSTRAINT")) {
+        if matches!(def.last(), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("CONSTRAINT"))
+        {
             return Some(&[]);
         }
         // `CONSTRAINT <name> |` — the constraint *type* slot. Table-level when the
         // definition itself is the constraint, inline when it names a column
         // constraint (`col type CONSTRAINT name |`).
-        if let (Some(SqlToken::Word(keyword)), Some(SqlToken::Word(_name))) =
-            (def.len().checked_sub(2).and_then(|i| def.get(i)), def.last())
-        {
+        if let (Some(SqlToken::Word(keyword)), Some(SqlToken::Word(_name))) = (
+            def.len().checked_sub(2).and_then(|i| def.get(i)),
+            def.last(),
+        ) {
             if keyword.eq_ignore_ascii_case("CONSTRAINT") {
                 let table_level = matches!(
                     def.first(),
@@ -21081,7 +21311,14 @@ impl SqlEditorWidget {
                 return Some(if table_level {
                     &["PRIMARY KEY", "UNIQUE", "FOREIGN KEY", "CHECK"]
                 } else {
-                    &["PRIMARY KEY", "UNIQUE", "CHECK", "REFERENCES", "NOT NULL", "NULL"]
+                    &[
+                        "PRIMARY KEY",
+                        "UNIQUE",
+                        "CHECK",
+                        "REFERENCES",
+                        "NOT NULL",
+                        "NULL",
+                    ]
                 });
             }
         }
@@ -21094,11 +21331,10 @@ impl SqlEditorWidget {
         // `UNIQUE (cols) |`, `CHECK (expr) |`, or one still awaiting its `(cols)`)
         // admits no keyword — only the structural `(`/`,`/`)` — so suppress the
         // column-property catalog that the generic fallback would otherwise leak.
-        let last_is_closed_paren =
-            matches!(def.last(), Some(SqlToken::Symbol(sym)) if *sym == ")");
-        let has_foreign = def
-            .iter()
-            .any(|token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("FOREIGN")));
+        let last_is_closed_paren = matches!(def.last(), Some(SqlToken::Symbol(sym)) if *sym == ")");
+        let has_foreign = def.iter().any(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("FOREIGN")),
+        );
         if has_foreign && last_is_closed_paren {
             Some(&["REFERENCES"])
         } else {
@@ -21202,10 +21438,23 @@ impl SqlEditorWidget {
             }
         } else if on_available {
             &[
-                "ON", "CONSTRAINT", "NOT NULL", "NULL", "PRIMARY KEY", "UNIQUE", "CHECK",
+                "ON",
+                "CONSTRAINT",
+                "NOT NULL",
+                "NULL",
+                "PRIMARY KEY",
+                "UNIQUE",
+                "CHECK",
             ]
         } else {
-            &["CONSTRAINT", "NOT NULL", "NULL", "PRIMARY KEY", "UNIQUE", "CHECK"]
+            &[
+                "CONSTRAINT",
+                "NOT NULL",
+                "NULL",
+                "PRIMARY KEY",
+                "UNIQUE",
+                "CHECK",
+            ]
         };
         ReferencesClauseTail::Continue(keywords)
     }
@@ -21256,17 +21505,15 @@ impl SqlEditorWidget {
             match token {
                 SqlToken::Symbol(sym) if sym == "(" || sym == "[" => depth += 1,
                 SqlToken::Symbol(sym) if sym == ")" || sym == "]" => depth = (depth - 1).max(0),
-                SqlToken::Word(word) if depth == 0 => {
-                    match word.to_ascii_uppercase().as_str() {
-                        "WHEN" => {
-                            has_when = true;
-                            last_when_open = true;
-                        }
-                        "THEN" => last_when_open = false,
-                        "ELSE" => has_else = true,
-                        _ => {}
+                SqlToken::Word(word) if depth == 0 => match word.to_ascii_uppercase().as_str() {
+                    "WHEN" => {
+                        has_when = true;
+                        last_when_open = true;
                     }
-                }
+                    "THEN" => last_when_open = false,
+                    "ELSE" => has_else = true,
+                    _ => {}
+                },
                 _ => {}
             }
         }
@@ -21275,7 +21522,11 @@ impl SqlEditorWidget {
         let last_word = last.and_then(word_upper);
         // `INSERT ALL |` / `INSERT FIRST |` — the very start of the body.
         if toks.len() == 2 {
-            return Some(if is_first { &["WHEN"] } else { &["INTO", "WHEN"] });
+            return Some(if is_first {
+                &["WHEN"]
+            } else {
+                &["INTO", "WHEN"]
+            });
         }
         // `… THEN |` / `… ELSE |` — a fresh target begins with `INTO`.
         if matches!(last_word.as_deref(), Some("THEN") | Some("ELSE")) {
@@ -21363,9 +21614,9 @@ impl SqlEditorWidget {
         // {n | UNLIMITED}]`. It follows the optional RETURNING, so once `LOG`
         // appears RETURNING is no longer offerable (handled via `returning_done`).
         let is_dml = matches!(head, "INSERT" | "UPDATE" | "DELETE" | "MERGE");
-        if let Some(candidates) = Self::expected_dml_error_logging_keyword_candidates(
-            tokens, end, db_type,
-        ) {
+        if let Some(candidates) =
+            Self::expected_dml_error_logging_keyword_candidates(tokens, end, db_type)
+        {
             return Some(candidates);
         }
         let returning_done = has_returning || (is_dml && has_log);
@@ -21409,13 +21660,8 @@ impl SqlEditorWidget {
                     // open and the cursor is in its assignment list (`… UPDATE a =
                     // 1 |` → only a further `, b = 2`). A column or relation named
                     // `duplicate` before `VALUES` must not suppress the clause.
-                    (!Self::top_level_word_pair_present_before(
-                        tokens,
-                        end,
-                        "ON",
-                        "DUPLICATE",
-                    ))
-                    .then_some(&["ON DUPLICATE KEY UPDATE"])
+                    (!Self::top_level_word_pair_present_before(tokens, end, "ON", "DUPLICATE"))
+                        .then_some(&["ON DUPLICATE KEY UPDATE"])
                 } else {
                     Some(&["RETURNING"])
                 }
@@ -21578,9 +21824,7 @@ impl SqlEditorWidget {
     ) -> Option<&'static [&'static str]> {
         // Flashback (`AS OF`, `VERSIONS BETWEEN`) is Oracle-only. In MySQL a table's
         // `AS` introduces an alias (a new name), so `OF` must not be offered there.
-        if !phase.is_table_context()
-            || crate::sql_text::mysql_compatibility_for_sql("", db_type)
-        {
+        if !phase.is_table_context() || crate::sql_text::mysql_compatibility_for_sql("", db_type) {
             return None;
         }
 
@@ -22114,7 +22358,10 @@ impl SqlEditorWidget {
             }
             [flush, option, logs]
                 if flush == "FLUSH"
-                    && matches!(option.as_str(), "BINARY" | "ENGINE" | "ERROR" | "GENERAL" | "RELAY" | "SLOW")
+                    && matches!(
+                        option.as_str(),
+                        "BINARY" | "ENGINE" | "ERROR" | "GENERAL" | "RELAY" | "SLOW"
+                    )
                     && logs == "LOGS" =>
             {
                 true
@@ -22122,7 +22369,10 @@ impl SqlEditorWidget {
             [flush, modifier, option, logs]
                 if flush == "FLUSH"
                     && matches!(modifier.as_str(), "LOCAL" | "NO_WRITE_TO_BINLOG")
-                    && matches!(option.as_str(), "BINARY" | "ENGINE" | "ERROR" | "GENERAL" | "RELAY" | "SLOW")
+                    && matches!(
+                        option.as_str(),
+                        "BINARY" | "ENGINE" | "ERROR" | "GENERAL" | "RELAY" | "SLOW"
+                    )
                     && logs == "LOGS" =>
             {
                 true
@@ -22306,8 +22556,7 @@ impl SqlEditorWidget {
         end: usize,
     ) -> bool {
         if !matches!(
-            Self::previous_non_comment_token_index(tokens, end)
-                .and_then(|idx| tokens.get(idx)),
+            Self::previous_non_comment_token_index(tokens, end).and_then(|idx| tokens.get(idx)),
             Some(SqlToken::Word(_))
         ) {
             return false;
@@ -22407,8 +22656,7 @@ impl SqlEditorWidget {
         {
             if matches!(
                 last,
-                "BY"
-                    | "CIPHER"
+                "BY" | "CIPHER"
                     | "ISSUER"
                     | "SUBJECT"
                     | "COMMENT"
@@ -22428,8 +22676,7 @@ impl SqlEditorWidget {
                     if password == "PASSWORD"
                         && matches!(option.as_str(), "EXPIRE" | "REUSE")
                         && interval == "INTERVAL"
-            )
-            {
+            ) {
                 return true;
             }
         }
@@ -22630,7 +22877,10 @@ impl SqlEditorWidget {
         if idx >= words.len() {
             return None;
         }
-        if matches!(words.get(idx).map(String::as_str), Some("IGNORE" | "REPLACE")) {
+        if matches!(
+            words.get(idx).map(String::as_str),
+            Some("IGNORE" | "REPLACE")
+        ) {
             idx += 1;
         }
         if !matches!(words.get(idx).map(String::as_str), Some("INTO")) {
@@ -22651,11 +22901,7 @@ impl SqlEditorWidget {
             return false;
         };
         match tail {
-            [character, set]
-                if character == "CHARACTER" && set == "SET" =>
-            {
-                true
-            }
+            [character, set] if character == "CHARACTER" && set == "SET" => true,
             [field_clause, option, by]
                 if kind == "DATA"
                     && matches!(field_clause.as_str(), "COLUMNS" | "FIELDS")
@@ -22691,10 +22937,7 @@ impl SqlEditorWidget {
         }
     }
 
-    fn mysql_identifier_chain(
-        tokens: &[&SqlToken],
-        start: usize,
-    ) -> Option<(String, usize)> {
+    fn mysql_identifier_chain(tokens: &[&SqlToken], start: usize) -> Option<(String, usize)> {
         let mut idx = start;
         let mut parts = Vec::new();
         let mut expect_name = true;
@@ -22803,9 +23046,8 @@ impl SqlEditorWidget {
             }
         }
 
-        ((starts_with_open_column_list && depth > 0)
-            || (in_load_set_clause && !segment_has_equals))
-        .then_some(vec![table])
+        ((starts_with_open_column_list && depth > 0) || (in_load_set_clause && !segment_has_equals))
+            .then_some(vec![table])
     }
 
     fn mysql_analyze_histogram_column_scope_for_context(
@@ -23073,20 +23315,14 @@ impl SqlEditorWidget {
         let update_idx = before.iter().rposition(
             |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("UPDATE")),
         )?;
-        if !before
-            .get(..update_idx)
-            .unwrap_or(&[])
-            .iter()
-            .any(|token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("TRIGGER")))
-        {
+        if !before.get(..update_idx).unwrap_or(&[]).iter().any(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("TRIGGER")),
+        ) {
             return None;
         }
-        if !before
-            .get(..update_idx)
-            .unwrap_or(&[])
-            .iter()
-            .any(|token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("CREATE")))
-        {
+        if !before.get(..update_idx).unwrap_or(&[]).iter().any(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("CREATE")),
+        ) {
             return None;
         }
 
@@ -23118,9 +23354,7 @@ impl SqlEditorWidget {
             .unwrap_or(&[])
             .iter()
             .filter_map(|token| match token {
-                SqlToken::Word(word) => {
-                    Some(Self::completion_identifier_lookup_upper(word))
-                }
+                SqlToken::Word(word) => Some(Self::completion_identifier_lookup_upper(word)),
                 _ => None,
             })
             .collect::<HashSet<_>>();
@@ -23221,8 +23455,7 @@ impl SqlEditorWidget {
             Self::previous_non_comment_token(tokens, chain_start),
             Some(SqlToken::Symbol(symbol)) if symbol == ":"
         );
-        let context_end =
-            Self::expected_suggestion_context_end(tokens, cursor_token_len, true);
+        let context_end = Self::expected_suggestion_context_end(tokens, cursor_token_len, true);
         if Self::cursor_is_inside_oracle_trigger_when_condition(tokens, context_end) {
             return !bind_prefixed;
         }
@@ -23232,20 +23465,14 @@ impl SqlEditorWidget {
 
     fn cursor_is_after_oracle_trigger_body_start(tokens: &[SqlToken], end: usize) -> bool {
         let before = Self::meaningful_tokens_before(tokens, end);
-        let Some(trigger_idx) = before
-            .iter()
-            .position(
-                |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("TRIGGER")),
-            )
-        else {
+        let Some(trigger_idx) = before.iter().position(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("TRIGGER")),
+        ) else {
             return false;
         };
-        if !before
-            .get(..trigger_idx)
-            .unwrap_or(&[])
-            .iter()
-            .any(|token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("CREATE")))
-        {
+        if !before.get(..trigger_idx).unwrap_or(&[]).iter().any(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("CREATE")),
+        ) {
             return false;
         }
         let Some(on_idx) = before
@@ -23262,17 +23489,13 @@ impl SqlEditorWidget {
             return false;
         };
 
-        before
-            .get(on_idx + 1..)
-            .unwrap_or(&[])
-            .iter()
-            .any(|token| {
-                matches!(
-                    token,
-                    SqlToken::Word(word)
-                        if matches!(word.to_ascii_uppercase().as_str(), "DECLARE" | "BEGIN")
-                )
-            })
+        before.get(on_idx + 1..).unwrap_or(&[]).iter().any(|token| {
+            matches!(
+                token,
+                SqlToken::Word(word)
+                    if matches!(word.to_ascii_uppercase().as_str(), "DECLARE" | "BEGIN")
+            )
+        })
     }
 
     fn oracle_trigger_when_condition_context(
@@ -23280,10 +23503,12 @@ impl SqlEditorWidget {
         end: usize,
         db_type: Option<crate::db::DatabaseType>,
     ) -> Option<(Vec<String>, Vec<String>)> {
-        Self::oracle_trigger_correlation_context(tokens, end, db_type).and_then(|(scope, aliases)| {
-            Self::cursor_is_inside_oracle_trigger_when_condition(tokens, end)
-                .then_some((scope, aliases))
-        })
+        Self::oracle_trigger_correlation_context(tokens, end, db_type).and_then(
+            |(scope, aliases)| {
+                Self::cursor_is_inside_oracle_trigger_when_condition(tokens, end)
+                    .then_some((scope, aliases))
+            },
+        )
     }
 
     fn oracle_trigger_correlation_context(
@@ -23315,17 +23540,12 @@ impl SqlEditorWidget {
             return None;
         }
         let before = Self::meaningful_tokens_before(tokens, end);
-        let trigger_idx = before
-            .iter()
-            .position(
-                |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("TRIGGER")),
-            )?;
-        if !before
-            .get(..trigger_idx)
-            .unwrap_or(&[])
-            .iter()
-            .any(|token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("CREATE")))
-        {
+        let trigger_idx = before.iter().position(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("TRIGGER")),
+        )?;
+        if !before.get(..trigger_idx).unwrap_or(&[]).iter().any(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("CREATE")),
+        ) {
             return None;
         }
 
@@ -23547,12 +23767,9 @@ impl SqlEditorWidget {
         ) else {
             return false;
         };
-        if !before
-            .get(..trigger_idx)
-            .unwrap_or(&[])
-            .iter()
-            .any(|token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("CREATE")))
-        {
+        if !before.get(..trigger_idx).unwrap_or(&[]).iter().any(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("CREATE")),
+        ) {
             return false;
         }
         let Some(on_idx) = before
@@ -23752,7 +23969,7 @@ impl SqlEditorWidget {
             Self::create_table_definition_active_column_reference_marker(current_def)?;
         if active_marker != "AS" {
             if let Some(column) = column_name_from_alter_definition(current_def) {
-            declared_columns.push(column);
+                declared_columns.push(column);
             }
         }
 
@@ -23924,8 +24141,14 @@ impl SqlEditorWidget {
         const LINE_OPTIONS: &[&str] = &["STARTING", "TERMINATED"];
         const AFTER_FIELD_VALUE: &[&str] =
             &["ENCLOSED", "ESCAPED", "LINES", "OPTIONALLY", "TERMINATED"];
-        const AFTER_FIELD_VALUE_BEFORE_FROM: &[&str] =
-            &["ENCLOSED", "ESCAPED", "FROM", "LINES", "OPTIONALLY", "TERMINATED"];
+        const AFTER_FIELD_VALUE_BEFORE_FROM: &[&str] = &[
+            "ENCLOSED",
+            "ESCAPED",
+            "FROM",
+            "LINES",
+            "OPTIONALLY",
+            "TERMINATED",
+        ];
         const AFTER_LINE_VALUE_BEFORE_FROM: &[&str] = &["FROM"];
 
         let words = Self::meaningful_tokens_before(tokens, end)
@@ -23944,9 +24167,11 @@ impl SqlEditorWidget {
             [dumpfile, _file] if dumpfile == "DUMPFILE" => {
                 before_from.then_some(DUMPFILE_TAIL_BEFORE_FROM)
             }
-            [outfile, _file] if outfile == "OUTFILE" => {
-                Some(if before_from { OUTFILE_TAIL_BEFORE_FROM } else { OUTFILE_TAIL })
-            }
+            [outfile, _file] if outfile == "OUTFILE" => Some(if before_from {
+                OUTFILE_TAIL_BEFORE_FROM
+            } else {
+                OUTFILE_TAIL
+            }),
             [outfile, _file, character] if outfile == "OUTFILE" && character == "CHARACTER" => {
                 Some(&["SET"])
             }
@@ -24064,7 +24289,8 @@ impl SqlEditorWidget {
         end: usize,
         db_type: Option<crate::db::DatabaseType>,
     ) -> bool {
-        if Self::expected_mysql_select_into_file_keyword_candidates(tokens, end, db_type).is_none() {
+        if Self::expected_mysql_select_into_file_keyword_candidates(tokens, end, db_type).is_none()
+        {
             return false;
         }
         let words = Self::meaningful_tokens_before(tokens, end)
@@ -24075,8 +24301,7 @@ impl SqlEditorWidget {
                 SqlToken::Symbol(_) | SqlToken::Comment(_) => None,
             })
             .collect::<Vec<_>>();
-        Self::mysql_select_into_file_tail(&words)
-            .is_some_and(|tail| !tail.is_empty())
+        Self::mysql_select_into_file_tail(&words).is_some_and(|tail| !tail.is_empty())
     }
 
     fn expected_mysql_select_into_file_keyword_candidates_for_context(
@@ -24183,7 +24408,10 @@ impl SqlEditorWidget {
             "MATERIALIZED",
         ];
         let mut idx = 1; // skip the head verb
-        while words.get(idx).is_some_and(|word| Self::is_ddl_object_type_modifier(word)) {
+        while words
+            .get(idx)
+            .is_some_and(|word| Self::is_ddl_object_type_modifier(word))
+        {
             idx += 1;
         }
         let ty = TYPES
@@ -24293,15 +24521,26 @@ impl SqlEditorWidget {
         let has_as = words.iter().any(|word| word == "AS");
         let closed_paren = Self::has_closed_top_level_paren(tokens, end);
         let toks = Self::meaningful_tokens_before(tokens, end);
-        let last_is_close_paren =
-            matches!(toks.last(), Some(SqlToken::Symbol(sym)) if sym == ")");
+        let last_is_close_paren = matches!(toks.last(), Some(SqlToken::Symbol(sym)) if sym == ")");
 
         match ty {
             "TABLE" if !has_as => Some(if last_is_close_paren {
                 &[
-                    "TABLESPACE", "PCTFREE", "STORAGE", "LOGGING", "NOLOGGING", "COMPRESS",
-                    "NOCOMPRESS", "CACHE", "NOCACHE", "PARALLEL", "NOPARALLEL", "ORGANIZATION",
-                    "PARTITION BY", "ENABLE", "DISABLE",
+                    "TABLESPACE",
+                    "PCTFREE",
+                    "STORAGE",
+                    "LOGGING",
+                    "NOLOGGING",
+                    "COMPRESS",
+                    "NOCOMPRESS",
+                    "CACHE",
+                    "NOCACHE",
+                    "PARALLEL",
+                    "NOPARALLEL",
+                    "ORGANIZATION",
+                    "PARTITION BY",
+                    "ENABLE",
+                    "DISABLE",
                 ]
             } else if closed_paren {
                 &[] // deeper in the physical-attributes region
@@ -24311,8 +24550,18 @@ impl SqlEditorWidget {
             "INDEX" if words.iter().any(|word| word == "ON") => {
                 if last_is_close_paren {
                     Some(&[
-                        "TABLESPACE", "PCTFREE", "STORAGE", "LOGGING", "NOLOGGING", "COMPRESS",
-                        "NOCOMPRESS", "PARALLEL", "NOPARALLEL", "ONLINE", "REVERSE", "LOCAL",
+                        "TABLESPACE",
+                        "PCTFREE",
+                        "STORAGE",
+                        "LOGGING",
+                        "NOLOGGING",
+                        "COMPRESS",
+                        "NOCOMPRESS",
+                        "PARALLEL",
+                        "NOPARALLEL",
+                        "ONLINE",
+                        "REVERSE",
+                        "LOCAL",
                         "GLOBAL",
                     ])
                 } else if closed_paren {
@@ -24342,9 +24591,9 @@ impl SqlEditorWidget {
             "EDITION" => Self::expected_create_edition_tail_keywords(words),
             "USER" => Self::expected_oracle_user_tail_keywords(words, tokens, end, false),
             "ROLE" => Self::expected_oracle_role_tail_keywords(words, tokens, end),
-            "TABLESPACE" => Self::expected_oracle_create_tablespace_tail_keywords(
-                words, tokens, end,
-            ),
+            "TABLESPACE" => {
+                Self::expected_oracle_create_tablespace_tail_keywords(words, tokens, end)
+            }
             "PROFILE" => Self::expected_oracle_profile_tail_keywords(words),
             "ROLLBACK SEGMENT" if words_after_type == 1 => Some(&["TABLESPACE", "STORAGE"]),
             "ROLLBACK SEGMENT" => Some(&[]),
@@ -24406,9 +24655,7 @@ impl SqlEditorWidget {
             [.., "REFRESH", "ON"] => Some(&["DEMAND", "COMMIT"]),
             [.., "REFRESH", _method, "ON"] => Some(&["DEMAND", "COMMIT"]),
             [.., "ON"] => Some(&["PREBUILT"]),
-            [.., "REFRESH", _method, "ON", mode]
-                if matches!(*mode, "DEMAND" | "COMMIT") =>
-            {
+            [.., "REFRESH", _method, "ON", mode] if matches!(*mode, "DEMAND" | "COMMIT") => {
                 Some(&["AS"])
             }
             [.., "ON", "PREBUILT"] => Some(&["TABLE"]),
@@ -24542,8 +24789,9 @@ impl SqlEditorWidget {
             [.., "IDENTIFIED", "BY"] => Some(&[]),
             [.., "IDENTIFIED", "BY", _value] => Some(options),
             [.., "IDENTIFIED", "EXTERNALLY"] | [.., "IDENTIFIED", "GLOBALLY"] => Some(&["AS"]),
-            [.., "IDENTIFIED", "EXTERNALLY", "AS"]
-            | [.., "IDENTIFIED", "GLOBALLY", "AS"] => Some(&[]),
+            [.., "IDENTIFIED", "EXTERNALLY", "AS"] | [.., "IDENTIFIED", "GLOBALLY", "AS"] => {
+                Some(&[])
+            }
             [.., "IDENTIFIED", "EXTERNALLY", "AS", _value]
             | [.., "IDENTIFIED", "GLOBALLY", "AS", _value] => Some(options),
             [.., "DEFAULT"] => {
@@ -24554,8 +24802,9 @@ impl SqlEditorWidget {
                 }
             }
             [.., "DEFAULT", "TABLESPACE"] | [.., "TEMPORARY", "TABLESPACE"] => Some(&[]),
-            [.., "DEFAULT", "TABLESPACE", _value]
-            | [.., "TEMPORARY", "TABLESPACE", _value] => Some(options),
+            [.., "DEFAULT", "TABLESPACE", _value] | [.., "TEMPORARY", "TABLESPACE", _value] => {
+                Some(options)
+            }
             [.., "TEMPORARY"] => Some(&["TABLESPACE"]),
             [.., "QUOTA"] => Some(&["UNLIMITED"]),
             [.., "QUOTA", _amount] => Some(&["ON"]),
@@ -24603,7 +24852,8 @@ impl SqlEditorWidget {
         }
         let tail_start = words.len().saturating_sub(words_after_type);
         let tail = &words[tail_start..];
-        let completed = |option: &str| match option {
+        let completed = |option: &str| {
+            match option {
             "IDENTIFIED" => tail.windows(3).any(
                 |window| matches!(window, [identified, by, _value] if identified == "IDENTIFIED" && by == "BY"),
             ) || tail.windows(4).any(|window| {
@@ -24634,6 +24884,7 @@ impl SqlEditorWidget {
                 |window| matches!(window, [default, role, _value] if default == "DEFAULT" && role == "ROLE"),
             ),
             _ => false,
+        }
         };
 
         candidates
@@ -24728,8 +24979,7 @@ impl SqlEditorWidget {
     ) -> Option<&'static [&'static str]> {
         let tail = Self::object_tail_items_after_type_with_values(words, tokens, end)?;
         let tail_refs = tail.iter().map(String::as_str).collect::<Vec<_>>();
-        if let Some(candidates) =
-            Self::expected_oracle_tablespace_common_tail_keywords(&tail_refs)
+        if let Some(candidates) = Self::expected_oracle_tablespace_common_tail_keywords(&tail_refs)
         {
             return Some(candidates);
         }
@@ -24759,8 +25009,7 @@ impl SqlEditorWidget {
     ) -> Option<&'static [&'static str]> {
         let tail = Self::object_tail_items_after_type_with_values(words, tokens, end)?;
         let tail_refs = tail.iter().map(String::as_str).collect::<Vec<_>>();
-        if let Some(candidates) =
-            Self::expected_oracle_tablespace_common_tail_keywords(&tail_refs)
+        if let Some(candidates) = Self::expected_oracle_tablespace_common_tail_keywords(&tail_refs)
         {
             return Some(candidates);
         }
@@ -24792,9 +25041,7 @@ impl SqlEditorWidget {
         }
     }
 
-    fn expected_oracle_profile_tail_keywords(
-        words: &[String],
-    ) -> Option<&'static [&'static str]> {
+    fn expected_oracle_profile_tail_keywords(words: &[String]) -> Option<&'static [&'static str]> {
         let tail = Self::create_object_tail_after_type(words)?;
         const LIMIT_VALUES: &[&str] = &["DEFAULT", "UNLIMITED"];
         const VERIFY_FUNCTION_VALUES: &[&str] = &["DEFAULT", "NULL"];
@@ -24855,8 +25102,11 @@ impl SqlEditorWidget {
             return candidates;
         };
         let resources = Self::oracle_profile_resource_keywords();
-        let is_resource =
-            |word: &str| resources.iter().any(|resource| resource.eq_ignore_ascii_case(word));
+        let is_resource = |word: &str| {
+            resources
+                .iter()
+                .any(|resource| resource.eq_ignore_ascii_case(word))
+        };
         let mut used_resources = Vec::new();
         for (idx, word) in tail.iter().enumerate().skip(limit_idx + 1) {
             if !is_resource(word) {
@@ -24904,18 +25154,12 @@ impl SqlEditorWidget {
         }
     }
 
-    fn expected_create_operator_tail_keywords(
-        words: &[String],
-    ) -> Option<&'static [&'static str]> {
+    fn expected_create_operator_tail_keywords(words: &[String]) -> Option<&'static [&'static str]> {
         let tail = Self::create_object_tail_after_type(words)?;
         match tail.as_slice() {
             [_name] => Some(&["BINDING"]),
             [.., "RETURN"] => None,
-            _ if tail.contains(&"RETURN")
-                && !tail.contains(&"USING") =>
-            {
-                Some(&["USING"])
-            }
+            _ if tail.contains(&"RETURN") && !tail.contains(&"USING") => Some(&["USING"]),
             [.., "USING"] => None,
             _ => Some(&[]),
         }
@@ -24928,25 +25172,17 @@ impl SqlEditorWidget {
         match tail.as_slice() {
             [_name] => Some(&["FOR"]),
             [_name, "FOR"] => None,
-            _ if tail.contains(&"FOR") && !tail.contains(&"USING") => {
-                Some(&["USING"])
-            }
+            _ if tail.contains(&"FOR") && !tail.contains(&"USING") => Some(&["USING"]),
             [.., "USING"] => None,
             [.., "WITH"] => Some(&["LOCAL"]),
             [.., "WITH", "LOCAL"] => Some(&["RANGE"]),
             [.., "WITH", "LOCAL", "RANGE"] => Some(&["PARTITION"]),
-            _ if tail.contains(&"USING")
-                && !tail.contains(&"WITH") =>
-            {
-                Some(&["WITH"])
-            }
+            _ if tail.contains(&"USING") && !tail.contains(&"WITH") => Some(&["WITH"]),
             _ => Some(&[]),
         }
     }
 
-    fn expected_create_edition_tail_keywords(
-        words: &[String],
-    ) -> Option<&'static [&'static str]> {
+    fn expected_create_edition_tail_keywords(words: &[String]) -> Option<&'static [&'static str]> {
         let tail = Self::create_object_tail_after_type(words)?;
         match tail.as_slice() {
             [_name] => Some(&["AS"]),
@@ -24957,9 +25193,7 @@ impl SqlEditorWidget {
         }
     }
 
-    fn expected_create_context_tail_keywords(
-        words: &[String],
-    ) -> Option<&'static [&'static str]> {
+    fn expected_create_context_tail_keywords(words: &[String]) -> Option<&'static [&'static str]> {
         let (_, words_after_type) = Self::leading_ddl_object_type(words)?;
         if words_after_type == 0 {
             return None;
@@ -24991,8 +25225,7 @@ impl SqlEditorWidget {
             .skip(words.len().saturating_sub(words_after_type))
             .map(String::as_str)
             .collect::<Vec<_>>();
-        matches!(tail.as_slice(), [_name, "USING"])
-            .then_some(ExpectedObjectSuggestionKind::Package)
+        matches!(tail.as_slice(), [_name, "USING"]).then_some(ExpectedObjectSuggestionKind::Package)
     }
 
     fn expected_create_extended_object_reference_kind(
@@ -25121,20 +25354,37 @@ impl SqlEditorWidget {
         match ty {
             "TABLE" => None, // dedicated ADD/DROP/MODIFY/RENAME arm
             "INDEX" if words_after_type == 1 => Some(&[
-                "REBUILD", "RENAME", "COALESCE", "MODIFY", "MONITORING", "NOMONITORING",
-                "UNUSABLE", "ENABLE", "DISABLE", "PARAMETERS",
+                "REBUILD",
+                "RENAME",
+                "COALESCE",
+                "MODIFY",
+                "MONITORING",
+                "NOMONITORING",
+                "UNUSABLE",
+                "ENABLE",
+                "DISABLE",
+                "PARAMETERS",
             ]),
             "SEQUENCE" if words_after_type == 1 => Some(&[
-                "INCREMENT BY", "MINVALUE", "NOMINVALUE", "MAXVALUE", "NOMAXVALUE", "CACHE",
-                "NOCACHE", "CYCLE", "NOCYCLE", "ORDER", "NOORDER",
+                "INCREMENT BY",
+                "MINVALUE",
+                "NOMINVALUE",
+                "MAXVALUE",
+                "NOMAXVALUE",
+                "CACHE",
+                "NOCACHE",
+                "CYCLE",
+                "NOCYCLE",
+                "ORDER",
+                "NOORDER",
             ]),
             "USER" => Self::expected_oracle_user_tail_keywords(words, tokens, end, true),
             "VIEW" if words_after_type == 1 => {
                 Some(&["COMPILE", "READ", "ENABLE", "DISABLE", "MODIFY", "ADD"])
             }
-            "MATERIALIZED VIEW" if words_after_type == 1 => {
-                Some(&["COMPILE", "REFRESH", "REBUILD", "ENABLE", "DISABLE", "MODIFY"])
-            }
+            "MATERIALIZED VIEW" if words_after_type == 1 => Some(&[
+                "COMPILE", "REFRESH", "REBUILD", "ENABLE", "DISABLE", "MODIFY",
+            ]),
             "LIBRARY" | "DIMENSION" | "OPERATOR" | "INDEXTYPE" | "JAVA SOURCE" | "JAVA CLASS"
                 if words_after_type == 1 =>
             {
@@ -25163,15 +25413,13 @@ impl SqlEditorWidget {
             }
             // Deeper option regions and the remaining alterable objects: suppress
             // the catalog without guessing the (large) option grammar.
-            "INDEX" | "SEQUENCE" | "VIEW" | "MATERIALIZED VIEW" | "PROCEDURE"
-            | "FUNCTION" | "PACKAGE" | "PACKAGE BODY" | "TRIGGER" | "TYPE BODY"
-            | "DATABASE LINK" | "LIBRARY" | "CLUSTER" | "DIMENSION" | "OPERATOR"
-            | "INDEXTYPE" | "EDITION" | "ROLLBACK SEGMENT" | "JAVA SOURCE" | "JAVA CLASS" => {
-                Some(&[])
+            "INDEX" | "SEQUENCE" | "VIEW" | "MATERIALIZED VIEW" | "PROCEDURE" | "FUNCTION"
+            | "PACKAGE" | "PACKAGE BODY" | "TRIGGER" | "TYPE BODY" | "DATABASE LINK"
+            | "LIBRARY" | "CLUSTER" | "DIMENSION" | "OPERATOR" | "INDEXTYPE" | "EDITION"
+            | "ROLLBACK SEGMENT" | "JAVA SOURCE" | "JAVA CLASS" => Some(&[]),
+            "TABLESPACE" => {
+                Self::expected_oracle_alter_tablespace_tail_keywords(words, tokens, end)
             }
-            "TABLESPACE" => Self::expected_oracle_alter_tablespace_tail_keywords(
-                words, tokens, end,
-            ),
             "ROLE" => Self::expected_oracle_role_tail_keywords(words, tokens, end),
             "PROFILE" => Self::expected_oracle_profile_tail_keywords(words),
             _ => None,
@@ -25271,12 +25519,15 @@ impl SqlEditorWidget {
                             .skip(2)
                             .any(|word| matches!(*word, "TO" | "BEFORE" | "SCN" | "TIMESTAMP")) =>
                     {
-                        Some(&["TO BEFORE DROP", "TO SCN", "TO TIMESTAMP", "TO RESTORE POINT"])
+                        Some(&[
+                            "TO BEFORE DROP",
+                            "TO SCN",
+                            "TO TIMESTAMP",
+                            "TO RESTORE POINT",
+                        ])
                     }
                     ["FLASHBACK", "DATABASE"] => Some(&["TO"]),
-                    ["FLASHBACK", "DATABASE", "TO"] => {
-                        Some(&["SCN", "TIMESTAMP", "RESTORE POINT"])
-                    }
+                    ["FLASHBACK", "DATABASE", "TO"] => Some(&["SCN", "TIMESTAMP", "RESTORE POINT"]),
                     [.., "BEFORE", "DROP", "RENAME", "TO"] => Some(&[]),
                     [.., "TO"] => Some(&["BEFORE DROP", "SCN", "TIMESTAMP", "RESTORE POINT"]),
                     [.., "BEFORE"] => Some(&["DROP"]),
@@ -25312,14 +25563,24 @@ impl SqlEditorWidget {
                     || matches!(
                         last,
                         Some(
-                            "WITH" | "FROM" | "COLUMNS" | "FUNCTIONS" | "PACKAGES" | "TYPES"
-                                | "INDEXES" | "INDEXTYPES"
+                            "WITH"
+                                | "FROM"
+                                | "COLUMNS"
+                                | "FUNCTIONS"
+                                | "PACKAGES"
+                                | "TYPES"
+                                | "INDEXES"
+                                | "INDEXTYPES"
                         )
                     )
                 {
                     return None;
                 }
-                Some(if first == "ASSOCIATE" { &["USING"] } else { &[] })
+                Some(if first == "ASSOCIATE" {
+                    &["USING"]
+                } else {
+                    &[]
+                })
             }
             _ => None,
         }
@@ -25368,9 +25629,7 @@ impl SqlEditorWidget {
             // object *kind*/name is still being chosen the name follows (a relation/
             // column — keep it available, `None`); past the name `IS` introduces the
             // literal, and once `IS` is present nothing more is offered here.
-            [comment, on, rest @ ..]
-                if comment == "COMMENT" && on == "ON" && !rest.is_empty() =>
-            {
+            [comment, on, rest @ ..] if comment == "COMMENT" && on == "ON" && !rest.is_empty() => {
                 if rest.iter().any(|word| word == "IS") {
                     // The comment text is a string literal — never a relation — so
                     // suppress the catalog rather than leaving the slot open.
@@ -25421,8 +25680,7 @@ impl SqlEditorWidget {
             // `CREATE [OR REPLACE] [FORCE] VIEW v |` → `AS` (the defining query). A
             // materialized view has its own option grammar (BUILD/REFRESH/…), so it
             // is excluded here.
-            if !words.iter().any(|word| word == "MATERIALIZED")
-                && position_after("VIEW") == Some(1)
+            if !words.iter().any(|word| word == "MATERIALIZED") && position_after("VIEW") == Some(1)
             {
                 return Some(&["AS"]);
             }
@@ -25453,9 +25711,7 @@ impl SqlEditorWidget {
         if let Some(candidates) = Self::expected_drop_object_tail_keywords(&words) {
             return Some(candidates);
         }
-        if let Some(candidates) =
-            Self::expected_create_object_tail_keywords(&words, tokens, end)
-        {
+        if let Some(candidates) = Self::expected_create_object_tail_keywords(&words, tokens, end) {
             return Some(candidates);
         }
         if let Some(candidates) = Self::expected_alter_object_tail_keywords(&words, tokens, end) {
@@ -25605,7 +25861,8 @@ impl SqlEditorWidget {
         ) {
             return Some(&["READ", "ISOLATION", "USE", "NAME"]);
         }
-        if matches!(words.as_slice(), [set, transaction, use_word] if set == "SET" && transaction == "TRANSACTION" && use_word == "USE") {
+        if matches!(words.as_slice(), [set, transaction, use_word] if set == "SET" && transaction == "TRANSACTION" && use_word == "USE")
+        {
             return Some(&["ROLLBACK"]);
         }
         if matches!(
@@ -25768,9 +26025,15 @@ impl SqlEditorWidget {
             {
                 Some(&["WAIT", "NOWAIT"])
             }
-            [rollback] if rollback == "ROLLBACK" && mysql => {
-                Some(&["WORK", "AND", "CHAIN", "NO", "RELEASE", "TO", "TO SAVEPOINT"])
-            }
+            [rollback] if rollback == "ROLLBACK" && mysql => Some(&[
+                "WORK",
+                "AND",
+                "CHAIN",
+                "NO",
+                "RELEASE",
+                "TO",
+                "TO SAVEPOINT",
+            ]),
             [rollback] if rollback == "ROLLBACK" => Some(&["WORK", "TO SAVEPOINT", "FORCE"]),
             [rollback, to] if rollback == "ROLLBACK" && to == "TO" => Some(&["SAVEPOINT"]),
             [set, transaction] if set == "SET" && transaction == "TRANSACTION" => {
@@ -25781,7 +26044,9 @@ impl SqlEditorWidget {
                     Some(&["READ", "ISOLATION", "USE", "NAME"])
                 }
             }
-            [set, transaction, read] if set == "SET" && transaction == "TRANSACTION" && read == "READ" => {
+            [set, transaction, read]
+                if set == "SET" && transaction == "TRANSACTION" && read == "READ" =>
+            {
                 Some(&["ONLY", "WRITE"])
             }
             [set, transaction, isolation]
@@ -25808,9 +26073,7 @@ impl SqlEditorWidget {
                     Some(&["SERIALIZABLE", "READ COMMITTED"])
                 }
             }
-            [start] if mysql && start == "START" => {
-                Some(&["TRANSACTION", "REPLICA", "SLAVE"])
-            }
+            [start] if mysql && start == "START" => Some(&["TRANSACTION", "REPLICA", "SLAVE"]),
             [start, transaction] if mysql && start == "START" && transaction == "TRANSACTION" => {
                 Some(&["READ", "WITH"])
             }
@@ -25953,8 +26216,9 @@ impl SqlEditorWidget {
             return None;
         }
         let words = Self::words_for_keyword_slot(tokens, end);
-        let is_keyword =
-            |word: &str| crate::sql_text::is_sql_keyword_for_db(word, crate::db::DatabaseType::Oracle);
+        let is_keyword = |word: &str| {
+            crate::sql_text::is_sql_keyword_for_db(word, crate::db::DatabaseType::Oracle)
+        };
 
         // `FORALL <idx> IN <bounds> [SAVE EXCEPTIONS] |` is followed by exactly one
         // bound DML statement. After the bound (a complete operand) the DML verbs are
@@ -25964,7 +26228,10 @@ impl SqlEditorWidget {
             let after = &words[forall_idx..];
             let has_in = after.iter().any(|word| word == "IN");
             let has_dml = after.iter().any(|word| {
-                matches!(word.as_str(), "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "EXECUTE")
+                matches!(
+                    word.as_str(),
+                    "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "EXECUTE"
+                )
             });
             if has_in && !has_dml {
                 if words.last().map(String::as_str) == Some("EXCEPTIONS") {
@@ -26008,9 +26275,7 @@ impl SqlEditorWidget {
                 Some(&["INTO"])
             }
             // `FETCH <cur> BULK |` → `COLLECT`.
-            [.., fetch, name, bulk]
-                if fetch == "FETCH" && bulk == "BULK" && !is_keyword(name) =>
-            {
+            [.., fetch, name, bulk] if fetch == "FETCH" && bulk == "BULK" && !is_keyword(name) => {
                 Some(&["COLLECT"])
             }
             // `FETCH <cur> |` — the destination opener.
@@ -26046,10 +26311,9 @@ impl SqlEditorWidget {
 
         let toks = Self::meaningful_tokens_before(tokens, end);
         let is_label_word = |token: &SqlToken| match token {
-            SqlToken::Word(word) => !crate::sql_text::is_sql_keyword_for_db(
-                word,
-                crate::db::DatabaseType::Oracle,
-            ),
+            SqlToken::Word(word) => {
+                !crate::sql_text::is_sql_keyword_for_db(word, crate::db::DatabaseType::Oracle)
+            }
             _ => false,
         };
 
@@ -26156,10 +26420,9 @@ impl SqlEditorWidget {
 
         let toks = Self::meaningful_tokens_before(tokens, visible_end);
         let is_loop_index_word = |token: &SqlToken| match token {
-            SqlToken::Word(word) => !crate::sql_text::is_sql_keyword_for_db(
-                word,
-                crate::db::DatabaseType::Oracle,
-            ),
+            SqlToken::Word(word) => {
+                !crate::sql_text::is_sql_keyword_for_db(word, crate::db::DatabaseType::Oracle)
+            }
             _ => false,
         };
 
@@ -26216,13 +26479,15 @@ impl SqlEditorWidget {
             Self::meaningful_tokens_before(tokens, end).last(),
             Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("PRAGMA")
         )
-        .then_some(&[
-            "AUTONOMOUS_TRANSACTION",
-            "EXCEPTION_INIT",
-            "INLINE",
-            "RESTRICT_REFERENCES",
-            "SERIALLY_REUSABLE",
-        ][..])
+        .then_some(
+            &[
+                "AUTONOMOUS_TRANSACTION",
+                "EXCEPTION_INIT",
+                "INLINE",
+                "RESTRICT_REFERENCES",
+                "SERIALLY_REUSABLE",
+            ][..],
+        )
     }
 
     fn expected_plsql_pragma_name_keyword_candidates_for_context(
@@ -26275,9 +26540,7 @@ impl SqlEditorWidget {
             Some(SqlToken::Word(word)) => Some(word.as_str()),
             _ => None,
         };
-        let token_symbol = |idx: usize, expected: &str| {
-            matches!(tokens.get(idx), Some(SqlToken::Symbol(sym)) if sym == expected)
-        };
+        let token_symbol = |idx: usize, expected: &str| matches!(tokens.get(idx), Some(SqlToken::Symbol(sym)) if sym == expected);
         let follows_pragma_word = |name_idx: usize| {
             name_idx
                 .checked_sub(1)
@@ -26295,7 +26558,8 @@ impl SqlEditorWidget {
             }
 
             if token_symbol(last_idx, ")") {
-                if let Some(open_idx) = Self::matching_open_paren_index_before_close(tokens, last_idx)
+                if let Some(open_idx) =
+                    Self::matching_open_paren_index_before_close(tokens, last_idx)
                 {
                     if let Some(name_idx) = Self::previous_non_comment_token_index(tokens, open_idx)
                     {
@@ -26518,9 +26782,7 @@ impl SqlEditorWidget {
                 return Some(&["THEN"])
             }
             [.., authid] if authid == "AUTHID" => return Some(&["CURRENT_USER", "DEFINER"]),
-            [.., for_word, each] if for_word == "FOR" && each == "EACH" => {
-                return Some(&["ROW"])
-            }
+            [.., for_word, each] if for_word == "FOR" && each == "EACH" => return Some(&["ROW"]),
             _ => {}
         }
 
@@ -26669,9 +26931,8 @@ impl SqlEditorWidget {
                 if Self::oracle_trigger_when_condition_context(tokens, end, db_type).is_some() {
                     return None;
                 }
-                if let Some(referencing_idx) = create_tail
-                    .iter()
-                    .rposition(|word| word == "REFERENCING")
+                if let Some(referencing_idx) =
+                    create_tail.iter().rposition(|word| word == "REFERENCING")
                 {
                     let ref_tail = &create_tail[referencing_idx + 1..];
                     let allows_old = contains("UPDATE") || contains("DELETE");
@@ -26735,12 +26996,8 @@ impl SqlEditorWidget {
                     if !allows_parent {
                         return Some(match (allows_old, allows_new, used_old, used_new) {
                             (true, true, true, true) => TRIGGER_BODY_START,
-                            (true, true, true, false) => {
-                                TRIGGER_REFERENCING_AFTER_OLD_NO_PARENT
-                            }
-                            (true, true, false, true) => {
-                                TRIGGER_REFERENCING_AFTER_NEW_NO_PARENT
-                            }
+                            (true, true, true, false) => TRIGGER_REFERENCING_AFTER_OLD_NO_PARENT,
+                            (true, true, false, true) => TRIGGER_REFERENCING_AFTER_NEW_NO_PARENT,
                             (true, true, false, false) => TRIGGER_REFERENCING_START_OLD_NEW,
                             (true, false, true, false) => TRIGGER_BODY_START,
                             (true, false, false, false) => TRIGGER_REFERENCING_START_OLD,
@@ -26749,35 +27006,41 @@ impl SqlEditorWidget {
                             _ => TRIGGER_BODY_START,
                         });
                     }
-                    return Some(match (allows_old, allows_new, used_old, used_new, used_parent) {
-                        (true, true, true, true, true) => TRIGGER_BODY_START,
-                        (true, true, true, true, false) => TRIGGER_REFERENCING_AFTER_OLD_NEW,
-                        (true, true, true, false, true) => TRIGGER_REFERENCING_AFTER_OLD_PARENT,
-                        (true, true, false, true, true) => TRIGGER_REFERENCING_AFTER_NEW_PARENT,
-                        (true, true, true, false, false) => TRIGGER_REFERENCING_AFTER_OLD,
-                        (true, true, false, true, false) => TRIGGER_REFERENCING_AFTER_NEW,
-                        (true, true, false, false, true) => TRIGGER_REFERENCING_AFTER_PARENT,
-                        (true, true, false, false, false) => TRIGGER_REFERENCING_START,
-                        (true, false, true, false, true) => TRIGGER_BODY_START,
-                        (true, false, true, false, false) => {
-                            TRIGGER_REFERENCING_AFTER_SINGLE_EVENT
-                        }
-                        (true, false, false, false, true) => TRIGGER_REFERENCING_AFTER_PARENT_OLD,
-                        (true, false, false, false, false) => {
-                            TRIGGER_REFERENCING_START_OLD_PARENT
-                        }
-                        (false, true, false, true, true) => TRIGGER_BODY_START,
-                        (false, true, false, true, false) => {
-                            TRIGGER_REFERENCING_AFTER_SINGLE_EVENT
-                        }
-                        (false, true, false, false, true) => TRIGGER_REFERENCING_AFTER_PARENT_NEW,
-                        (false, true, false, false, false) => {
-                            TRIGGER_REFERENCING_START_NEW_PARENT
-                        }
-                        (false, false, false, false, true) => TRIGGER_BODY_START,
-                        (false, false, false, false, false) => &["PARENT"],
-                        _ => TRIGGER_BODY_START,
-                    });
+                    return Some(
+                        match (allows_old, allows_new, used_old, used_new, used_parent) {
+                            (true, true, true, true, true) => TRIGGER_BODY_START,
+                            (true, true, true, true, false) => TRIGGER_REFERENCING_AFTER_OLD_NEW,
+                            (true, true, true, false, true) => TRIGGER_REFERENCING_AFTER_OLD_PARENT,
+                            (true, true, false, true, true) => TRIGGER_REFERENCING_AFTER_NEW_PARENT,
+                            (true, true, true, false, false) => TRIGGER_REFERENCING_AFTER_OLD,
+                            (true, true, false, true, false) => TRIGGER_REFERENCING_AFTER_NEW,
+                            (true, true, false, false, true) => TRIGGER_REFERENCING_AFTER_PARENT,
+                            (true, true, false, false, false) => TRIGGER_REFERENCING_START,
+                            (true, false, true, false, true) => TRIGGER_BODY_START,
+                            (true, false, true, false, false) => {
+                                TRIGGER_REFERENCING_AFTER_SINGLE_EVENT
+                            }
+                            (true, false, false, false, true) => {
+                                TRIGGER_REFERENCING_AFTER_PARENT_OLD
+                            }
+                            (true, false, false, false, false) => {
+                                TRIGGER_REFERENCING_START_OLD_PARENT
+                            }
+                            (false, true, false, true, true) => TRIGGER_BODY_START,
+                            (false, true, false, true, false) => {
+                                TRIGGER_REFERENCING_AFTER_SINGLE_EVENT
+                            }
+                            (false, true, false, false, true) => {
+                                TRIGGER_REFERENCING_AFTER_PARENT_NEW
+                            }
+                            (false, true, false, false, false) => {
+                                TRIGGER_REFERENCING_START_NEW_PARENT
+                            }
+                            (false, false, false, false, true) => TRIGGER_BODY_START,
+                            (false, false, false, false, false) => &["PARENT"],
+                            _ => TRIGGER_BODY_START,
+                        },
+                    );
                 }
                 let has_for_each = contains("EACH");
                 let has_when = contains("WHEN");
@@ -26806,9 +27069,7 @@ impl SqlEditorWidget {
                     return Some(&["INSERT", "UPDATE", "DELETE"])
                 }
                 Some("OF") => return None,
-                Some("BEFORE" | "AFTER" | "OR") => {
-                    return Some(&["INSERT", "UPDATE", "DELETE"])
-                }
+                Some("BEFORE" | "AFTER" | "OR") => return Some(&["INSERT", "UPDATE", "DELETE"]),
                 _ => {}
             }
             // The trigger timing point (`CREATE TRIGGER trg |`).
@@ -27000,9 +27261,7 @@ impl SqlEditorWidget {
             match token {
                 SqlToken::Symbol(sym) if sym == "(" => depth += 1,
                 SqlToken::Symbol(sym) if sym == ")" => depth = (depth - 1).max(0),
-                SqlToken::Word(word)
-                    if depth == 1 && word.eq_ignore_ascii_case(body_keyword) =>
-                {
+                SqlToken::Word(word) if depth == 1 && word.eq_ignore_ascii_case(body_keyword) => {
                     return true;
                 }
                 _ => {}
@@ -27037,9 +27296,7 @@ impl SqlEditorWidget {
                 SqlToken::Symbol(sym) if sym == ")" => {
                     depth = (depth - 1).max(0);
                 }
-                SqlToken::Word(word)
-                    if depth == 1 && word.eq_ignore_ascii_case(body_keyword) =>
-                {
+                SqlToken::Word(word) if depth == 1 && word.eq_ignore_ascii_case(body_keyword) => {
                     after_body_keyword = true;
                     saw_item = false;
                 }
@@ -27191,9 +27448,7 @@ impl SqlEditorWidget {
             match token {
                 SqlToken::Symbol(sym) if sym == "(" => depth += 1,
                 SqlToken::Symbol(sym) if sym == ")" => depth = (depth - 1).max(0),
-                SqlToken::Word(word)
-                    if depth == 0 && word.eq_ignore_ascii_case(body_keyword) =>
-                {
+                SqlToken::Word(word) if depth == 0 && word.eq_ignore_ascii_case(body_keyword) => {
                     return true;
                 }
                 _ => {}
@@ -27236,9 +27491,7 @@ impl SqlEditorWidget {
             match token {
                 SqlToken::Symbol(sym) if sym == "(" => depth += 1,
                 SqlToken::Symbol(sym) if sym == ")" => depth = (depth - 1).max(0),
-                SqlToken::Word(word)
-                    if depth == 0 && word.eq_ignore_ascii_case(clause_keyword) =>
-                {
+                SqlToken::Word(word) if depth == 0 && word.eq_ignore_ascii_case(clause_keyword) => {
                     in_clause = true;
                 }
                 _ => {}
@@ -27288,8 +27541,7 @@ impl SqlEditorWidget {
             // Inside the body paren the grammar is `col FOR name IN (…)` (like
             // PIVOT); the `INCLUDE|EXCLUDE NULLS` modifier is only valid before it.
             if Self::cursor_inside_construct_body(tokens, end, "UNPIVOT") {
-                if !Self::construct_body_has_top_level_item_before_cursor(tokens, end, "UNPIVOT")
-                {
+                if !Self::construct_body_has_top_level_item_before_cursor(tokens, end, "UNPIVOT") {
                     return None;
                 }
                 if Self::construct_body_has_top_level_word_before_cursor(
@@ -27304,16 +27556,10 @@ impl SqlEditorWidget {
             }
             return Some(&["INCLUDE", "EXCLUDE"]);
         }
-        if (matches!(
-            phase,
-            intellisense_context::SqlPhase::MatchRecognizeClause
-        ) || phase.is_table_context())
+        if (matches!(phase, intellisense_context::SqlPhase::MatchRecognizeClause)
+            || phase.is_table_context())
             && Self::table_clause_construct_is_open(tokens, end, "MATCH_RECOGNIZE")
-            && Self::table_clause_construct_has_table_source_anchor(
-                tokens,
-                end,
-                "MATCH_RECOGNIZE",
-            )
+            && Self::table_clause_construct_has_table_source_anchor(tokens, end, "MATCH_RECOGNIZE")
         {
             let match_recognize_body_words =
                 Self::construct_body_top_level_words_before_cursor(tokens, end, "MATCH_RECOGNIZE");
@@ -27608,10 +27854,7 @@ impl SqlEditorWidget {
                 Some("INTERVAL") if has("PASSWORD") && (has("EXPIRE") || has("REUSE")) => {
                     return Some(&["DAY"]);
                 }
-                _ if has("PASSWORD")
-                    && has("INTERVAL")
-                    && (has("EXPIRE") || has("REUSE")) =>
-                {
+                _ if has("PASSWORD") && has("INTERVAL") && (has("EXPIRE") || has("REUSE")) => {
                     return Some(&["DAY"]);
                 }
                 Some("WITH") if has("IDENTIFIED") => {
@@ -27633,9 +27876,7 @@ impl SqlEditorWidget {
                 _ if has("IDENTIFIED") && has("WITH") && !has("BY") => {
                     return Some(&["AND", "AS", "BY", "INITIAL"]);
                 }
-                _ if has("IDENTIFIED") && has("BY") => {
-                    return Some(user_after_auth_keywords)
-                }
+                _ if has("IDENTIFIED") && has("BY") => return Some(user_after_auth_keywords),
                 _ => {}
             }
         }
@@ -27677,7 +27918,7 @@ impl SqlEditorWidget {
                 "SLAVE",
             ]),
             "KILL" => Some(&["CONNECTION", "QUERY"]),
-        "PURGE" if words.len() == 1 => Some(&["BINARY", "MASTER"]),
+            "PURGE" if words.len() == 1 => Some(&["BINARY", "MASTER"]),
             _ => None,
         }
     }
@@ -27747,7 +27988,9 @@ impl SqlEditorWidget {
                 let cte_has_top_level_set = cte_top_level_words.iter().any(|word| word == "SET");
                 match cte_top_level_words.as_slice() {
                     [.., search] if search == "SEARCH" => return Some(&["DEPTH", "BREADTH"]),
-                    [.., search, depth] if search == "SEARCH" && matches!(depth.as_str(), "DEPTH" | "BREADTH") => {
+                    [.., search, depth]
+                        if search == "SEARCH" && matches!(depth.as_str(), "DEPTH" | "BREADTH") =>
+                    {
                         return Some(&["FIRST"])
                     }
                     [.., depth, first_word]
@@ -27760,9 +28003,7 @@ impl SqlEditorWidget {
                         return Some(&["SET"])
                     }
                     [.., cycle, _col] if cycle == "CYCLE" => return Some(&["SET"]),
-                    [.., cycle, _col, set, _mark]
-                        if cycle == "CYCLE" && set == "SET" =>
-                    {
+                    [.., cycle, _col, set, _mark] if cycle == "CYCLE" && set == "SET" => {
                         return Some(&["TO"])
                     }
                     [.., set, _mark, to, _value] if set == "SET" && to == "TO" => {
@@ -27799,11 +28040,9 @@ impl SqlEditorWidget {
                 if in_table_context
                     && !mysql
                     && !matches!(
-                    words
-                        .get(words.len().saturating_sub(2))
-                        .map(String::as_str),
-                    Some("LEFT" | "RIGHT" | "FULL")
-                ) =>
+                        words.get(words.len().saturating_sub(2)).map(String::as_str),
+                        Some("LEFT" | "RIGHT" | "FULL")
+                    ) =>
             {
                 return Some(&["APPLY"])
             }
@@ -27981,7 +28220,9 @@ impl SqlEditorWidget {
             .collect::<Vec<_>>();
         if top_words.first().map(String::as_str) != Some("CREATE")
             || !top_words.iter().any(|word| word == "VIEW")
-            || top_words.iter().any(|word| word == "AS" || word == "SELECT")
+            || top_words
+                .iter()
+                .any(|word| word == "AS" || word == "SELECT")
         {
             return false;
         }
@@ -28209,14 +28450,10 @@ impl SqlEditorWidget {
                 .enumerate()
                 .any(|(idx, word)| word == keyword && !word_is_routine_name(idx))
         };
-        let last_is_routine_name = words
-            .len()
-            .checked_sub(1)
-            .is_some_and(word_is_routine_name);
+        let last_is_routine_name = words.len().checked_sub(1).is_some_and(word_is_routine_name);
 
         if first == "CREATE" && has("FUNCTION") && !has_routine_clause_word("RETURNS") {
-            if !last_is_routine_name && matches!(last, Some("FUNCTION" | "IF" | "NOT" | "EXISTS"))
-            {
+            if !last_is_routine_name && matches!(last, Some("FUNCTION" | "IF" | "NOT" | "EXISTS")) {
                 return None;
             }
             return Some(&["RETURNS"]);
@@ -28349,26 +28586,28 @@ impl SqlEditorWidget {
                 {
                     return Some(candidates);
                 }
-                if has("EVERY") && last.is_some_and(|word| {
-                    matches!(
-                        word,
-                        "YEAR"
-                            | "QUARTER"
-                            | "MONTH"
-                            | "DAY"
-                            | "HOUR"
-                            | "MINUTE"
-                            | "WEEK"
-                            | "SECOND"
-                            | "YEAR_MONTH"
-                            | "DAY_HOUR"
-                            | "DAY_MINUTE"
-                            | "DAY_SECOND"
-                            | "HOUR_MINUTE"
-                            | "HOUR_SECOND"
-                            | "MINUTE_SECOND"
-                    )
-                }) {
+                if has("EVERY")
+                    && last.is_some_and(|word| {
+                        matches!(
+                            word,
+                            "YEAR"
+                                | "QUARTER"
+                                | "MONTH"
+                                | "DAY"
+                                | "HOUR"
+                                | "MINUTE"
+                                | "WEEK"
+                                | "SECOND"
+                                | "YEAR_MONTH"
+                                | "DAY_HOUR"
+                                | "DAY_MINUTE"
+                                | "DAY_SECOND"
+                                | "HOUR_MINUTE"
+                                | "HOUR_SECOND"
+                                | "MINUTE_SECOND"
+                        )
+                    })
+                {
                     return Some(MYSQL_CREATE_EVENT_TAIL_KEYWORDS);
                 }
             }
@@ -28467,7 +28706,11 @@ impl SqlEditorWidget {
             && matches!(
                 last,
                 Some(
-                    "PRIVILEGES" | "STATUS" | "HOSTS" | "LOGS" | "USER_RESOURCES"
+                    "PRIVILEGES"
+                        | "STATUS"
+                        | "HOSTS"
+                        | "LOGS"
+                        | "USER_RESOURCES"
                         | "OPTIMIZER_COSTS"
                 )
             )
@@ -28491,8 +28734,7 @@ impl SqlEditorWidget {
         let words = Self::words_for_keyword_slot(tokens, end);
         let mysql = crate::sql_text::mysql_compatibility_for_sql("", db_type);
         let last = words.last().map(String::as_str);
-        let in_group_by_tail =
-            Self::top_level_word_pair_present_before(tokens, end, "GROUP", "BY");
+        let in_group_by_tail = Self::top_level_word_pair_present_before(tokens, end, "GROUP", "BY");
         let at_group_by_tail =
             Self::cursor_is_at_top_level_word_pair_tail(tokens, end, "GROUP", "BY");
 
@@ -28562,9 +28804,7 @@ impl SqlEditorWidget {
         })
     }
 
-    fn grouping_returning_and_insert_tail_suppresses_columns(
-        candidates: &[&str],
-    ) -> bool {
+    fn grouping_returning_and_insert_tail_suppresses_columns(candidates: &[&str]) -> bool {
         !matches!(candidates, ["ROLLUP", "CUBE", "GROUPING SETS"])
     }
 
@@ -28675,12 +28915,19 @@ impl SqlEditorWidget {
                 Some(&["ON", "OFF", "TRUE", "FALSE"])
             }
             [show] if show == "SHOW" => Some(&["USER", "ALL", "ERRORS", "PARAMETER", "VERSION"]),
-            [show, errors] if show == "SHOW" && errors == "ERRORS" => {
-                Some(&["PACKAGE", "PROCEDURE", "FUNCTION", "TRIGGER", "TYPE", "VIEW"])
-            }
+            [show, errors] if show == "SHOW" && errors == "ERRORS" => Some(&[
+                "PACKAGE",
+                "PROCEDURE",
+                "FUNCTION",
+                "TRIGGER",
+                "TYPE",
+                "VIEW",
+            ]),
             [spool] if spool == "SPOOL" => Some(&["OFF", "OUT", "APPEND"]),
             [whenever] if whenever == "WHENEVER" => Some(&["SQLERROR", "OSERROR"]),
-            [whenever, error] if whenever == "WHENEVER" && matches!(error.as_str(), "SQLERROR" | "OSERROR") => {
+            [whenever, error]
+                if whenever == "WHENEVER" && matches!(error.as_str(), "SQLERROR" | "OSERROR") =>
+            {
                 Some(&["EXIT", "CONTINUE"])
             }
             [whenever, error, exit]
@@ -28719,7 +28966,8 @@ impl SqlEditorWidget {
                 SqlToken::Word(word) if depth == 0 && Self::is_set_operation_keyword(word) => {
                     if idx < visible_end {
                         // Skip the operator (and a trailing `ALL`) into the branch.
-                        start = if matches!(tokens.get(idx + 1), Some(SqlToken::Word(w)) if w.eq_ignore_ascii_case("ALL")) {
+                        start = if matches!(tokens.get(idx + 1), Some(SqlToken::Word(w)) if w.eq_ignore_ascii_case("ALL"))
+                        {
                             idx + 2
                         } else {
                             idx + 1
@@ -28739,17 +28987,21 @@ impl SqlEditorWidget {
     /// GROUP BY a` must not re-suggest `GROUP BY`). Repeatable openers (`AND`/`OR`/
     /// `JOIN`/the set operators) are deliberately excluded.
     const SINGLE_USE_CLAUSE_KEYWORDS: &'static [&'static str] = &[
-        "WHERE", "GROUP BY", "HAVING", "ORDER BY", "OFFSET", "FETCH", "LIMIT",
-        "FOR UPDATE", "CONNECT BY", "START WITH",
+        "WHERE",
+        "GROUP BY",
+        "HAVING",
+        "ORDER BY",
+        "OFFSET",
+        "FETCH",
+        "LIMIT",
+        "FOR UPDATE",
+        "CONNECT BY",
+        "START WITH",
     ];
 
     /// Whether `keyword` is a single-use clause already present (as a contiguous
     /// word sequence at paren depth 0) in the cursor's set-operation branch.
-    fn single_use_clause_present_in_branch(
-        keyword: &str,
-        tokens: &[SqlToken],
-        end: usize,
-    ) -> bool {
+    fn single_use_clause_present_in_branch(keyword: &str, tokens: &[SqlToken], end: usize) -> bool {
         let upper = keyword.to_ascii_uppercase();
         if !Self::SINGLE_USE_CLAUSE_KEYWORDS.contains(&upper.as_str()) {
             return false;
@@ -29055,48 +29307,75 @@ impl SqlEditorWidget {
                 "EXCEPT",
             ],
             (SqlPhase::WhereClause, false) => &[
-                "CONNECT BY", "START WITH", "GROUP BY", "HAVING", "ORDER BY", "OFFSET", "FETCH",
-                "FOR UPDATE", "UNION", "UNION ALL", "INTERSECT", "MINUS", "EXCEPT",
+                "CONNECT BY",
+                "START WITH",
+                "GROUP BY",
+                "HAVING",
+                "ORDER BY",
+                "OFFSET",
+                "FETCH",
+                "FOR UPDATE",
+                "UNION",
+                "UNION ALL",
+                "INTERSECT",
+                "MINUS",
+                "EXCEPT",
             ],
-            (SqlPhase::WhereClause, true) => {
-                &[
-                    "GROUP BY",
-                    "HAVING",
-                    "ORDER BY",
-                    "LIMIT",
-                    "FOR UPDATE",
-                    "UNION",
-                    "UNION ALL",
-                    "INTERSECT",
-                    "EXCEPT",
-                ]
-            }
+            (SqlPhase::WhereClause, true) => &[
+                "GROUP BY",
+                "HAVING",
+                "ORDER BY",
+                "LIMIT",
+                "FOR UPDATE",
+                "UNION",
+                "UNION ALL",
+                "INTERSECT",
+                "EXCEPT",
+            ],
             // The hierarchical clauses pair up in either order. Both are emitted
             // here; the single-use-clause filter on the continuation output drops
             // whichever partner is already present in the current branch.
             (SqlPhase::StartWithClause, false) => &[
-                "CONNECT BY", "GROUP BY", "HAVING", "ORDER BY", "OFFSET", "FETCH",
-                "FOR UPDATE", "UNION", "UNION ALL", "INTERSECT", "MINUS", "EXCEPT",
+                "CONNECT BY",
+                "GROUP BY",
+                "HAVING",
+                "ORDER BY",
+                "OFFSET",
+                "FETCH",
+                "FOR UPDATE",
+                "UNION",
+                "UNION ALL",
+                "INTERSECT",
+                "MINUS",
+                "EXCEPT",
             ],
             (SqlPhase::ConnectByClause, false) => &[
-                "START WITH", "GROUP BY", "HAVING", "ORDER BY", "OFFSET", "FETCH",
-                "FOR UPDATE", "UNION", "UNION ALL", "INTERSECT", "MINUS", "EXCEPT",
+                "START WITH",
+                "GROUP BY",
+                "HAVING",
+                "ORDER BY",
+                "OFFSET",
+                "FETCH",
+                "FOR UPDATE",
+                "UNION",
+                "UNION ALL",
+                "INTERSECT",
+                "MINUS",
+                "EXCEPT",
             ],
             (SqlPhase::StartWithClause | SqlPhase::ConnectByClause, true) => &[],
-            (SqlPhase::GroupByClause, false) => {
-                &[
-                    "HAVING",
-                    "ORDER BY",
-                    "OFFSET",
-                    "FETCH",
-                    "FOR UPDATE",
-                    "UNION",
-                    "UNION ALL",
-                    "INTERSECT",
-                    "MINUS",
-                    "EXCEPT",
-                ]
-            }
+            (SqlPhase::GroupByClause, false) => &[
+                "HAVING",
+                "ORDER BY",
+                "OFFSET",
+                "FETCH",
+                "FOR UPDATE",
+                "UNION",
+                "UNION ALL",
+                "INTERSECT",
+                "MINUS",
+                "EXCEPT",
+            ],
             (SqlPhase::GroupByClause, true) => &[
                 "HAVING",
                 "ORDER BY",
@@ -29253,7 +29532,8 @@ impl SqlEditorWidget {
         }
 
         let words = Self::previous_meaningful_words_upper(tokens, end, 3);
-        if matches!(words.as_slice(), [.., order, siblings] if order == "ORDER" && siblings == "SIBLINGS") {
+        if matches!(words.as_slice(), [.., order, siblings] if order == "ORDER" && siblings == "SIBLINGS")
+        {
             return &[];
         }
 
@@ -29380,8 +29660,23 @@ impl SqlEditorWidget {
                 MYSQL_AFTER_COMPARISON_OPERATOR_KEYWORDS
             }
             Some(false) if follows_comparison_operator => &[
-                "ALL", "ANY", "SOME", "CASE", "CAST", "EXISTS", "NOT", "NULL", "TRUE", "FALSE",
-                "UNKNOWN", "INTERVAL", "DATE", "TIMESTAMP", "TIME", "ROWNUM", "ROWID",
+                "ALL",
+                "ANY",
+                "SOME",
+                "CASE",
+                "CAST",
+                "EXISTS",
+                "NOT",
+                "NULL",
+                "TRUE",
+                "FALSE",
+                "UNKNOWN",
+                "INTERVAL",
+                "DATE",
+                "TIMESTAMP",
+                "TIME",
+                "ROWNUM",
+                "ROWID",
             ],
             Some(false) if mysql => MYSQL_OPERAND_START_KEYWORDS,
             Some(false) => &[
@@ -29450,8 +29745,18 @@ impl SqlEditorWidget {
             Some(SqlToken::Symbol(sym)) => matches!(sym.as_str(), "(" | ","),
             Some(SqlToken::Word(word)) => matches!(
                 word.to_ascii_uppercase().as_str(),
-                "FROM" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "CROSS"
-                    | "NATURAL" | "OUTER" | "APPLY" | "LATERAL" | "STRAIGHT_JOIN"
+                "FROM"
+                    | "JOIN"
+                    | "INNER"
+                    | "LEFT"
+                    | "RIGHT"
+                    | "FULL"
+                    | "CROSS"
+                    | "NATURAL"
+                    | "OUTER"
+                    | "APPLY"
+                    | "LATERAL"
+                    | "STRAIGHT_JOIN"
             ),
             _ => false,
         }
@@ -29565,7 +29870,9 @@ impl SqlEditorWidget {
             return false;
         };
         match toks.get(name_idx) {
-            Some(SqlToken::Word(w)) => !Self::word_breaks_from_relation_tail(&w.to_ascii_uppercase()),
+            Some(SqlToken::Word(w)) => {
+                !Self::word_breaks_from_relation_tail(&w.to_ascii_uppercase())
+            }
             Some(SqlToken::Symbol(sym)) if sym == ")" => {
                 Self::paren_closes_post_table_modifier(toks, name_idx)
             }
@@ -29588,7 +29895,8 @@ impl SqlEditorWidget {
         };
         let cur = open_idx.checked_sub(1)?;
         let w = word_at(cur)?;
-        let is_lead = |w: &str| matches!(w, "PARTITION" | "SUBPARTITION" | "SAMPLE" | "TABLESAMPLE");
+        let is_lead =
+            |w: &str| matches!(w, "PARTITION" | "SUBPARTITION" | "SAMPLE" | "TABLESAMPLE");
         // Oracle/ANSI modifier: the lead keyword directly, or one method/`FOR` filler
         // (`SAMPLE BLOCK (…)`, `TABLESAMPLE BERNOULLI (…)`, `PARTITION FOR (…)`).
         if is_lead(&w) {
@@ -29605,7 +29913,8 @@ impl SqlEditorWidget {
         // {JOIN | ORDER BY | GROUP BY}` purpose, then the mandatory `INDEX`/`KEY`, to
         // the `USE`/`IGNORE`/`FORCE` lead.
         let nb = |d: usize| open_idx.checked_sub(d).and_then(word_at);
-        let is_hint_lead = |w: &Option<String>| matches!(w.as_deref(), Some("USE" | "IGNORE" | "FORCE"));
+        let is_hint_lead =
+            |w: &Option<String>| matches!(w.as_deref(), Some("USE" | "IGNORE" | "FORCE"));
         let is_index = |w: &Option<String>| matches!(w.as_deref(), Some("INDEX" | "KEY"));
         let (w1, w2, w3, w4, w5) = (nb(1), nb(2), nb(3), nb(4), nb(5));
         if is_index(&w1) && is_hint_lead(&w2) {
@@ -29865,9 +30174,9 @@ impl SqlEditorWidget {
             return None;
         }
 
-        let index_idx = toks
-            .iter()
-            .position(|token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("INDEX")))?;
+        let index_idx = toks.iter().position(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("INDEX")),
+        )?;
         let mut idx = index_idx + 1;
         if matches!(
             toks.get(idx..idx + 3),
@@ -29943,9 +30252,9 @@ impl SqlEditorWidget {
             return None;
         }
 
-        let table_idx = toks
-            .iter()
-            .position(|token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("TABLE")))?;
+        let table_idx = toks.iter().position(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("TABLE")),
+        )?;
         let mut idx = table_idx + 1;
         if matches!(
             toks.get(idx..idx + 3),
@@ -30014,9 +30323,7 @@ impl SqlEditorWidget {
             Some(SqlToken::Word(word)) => Some(word.to_ascii_uppercase()),
             _ => None,
         };
-        let is_symbol = |idx: usize, sym: &str| {
-            matches!(toks.get(idx), Some(SqlToken::Symbol(value)) if value == sym)
-        };
+        let is_symbol = |idx: usize, sym: &str| matches!(toks.get(idx), Some(SqlToken::Symbol(value)) if value == sym);
         let any_word = |kw: &str| {
             toks.iter()
                 .any(|token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case(kw)))
@@ -30090,7 +30397,11 @@ impl SqlEditorWidget {
         deep_ctx: &intellisense_context::CursorContext,
         exclude_current_identifier_chain: bool,
     ) -> Option<DataTypePosition> {
-        Self::data_type_position_for_context_for_db(deep_ctx, exclude_current_identifier_chain, None)
+        Self::data_type_position_for_context_for_db(
+            deep_ctx,
+            exclude_current_identifier_chain,
+            None,
+        )
     }
 
     fn data_type_position_for_context_for_db(
@@ -30113,9 +30424,7 @@ impl SqlEditorWidget {
                     )
                 })
                 .or_else(|| {
-                    Self::expected_package_declaration_tail_keyword_candidates(
-                        tokens, end, db_type,
-                    )
+                    Self::expected_package_declaration_tail_keyword_candidates(tokens, end, db_type)
                 })
                 .is_some();
         let position = Self::data_type_position_for_db(tokens, end, db_type).or_else(|| {
@@ -30160,20 +30469,22 @@ impl SqlEditorWidget {
             })
             .is_some();
         let statement_position =
-            Self::data_type_position_for_db(statement_tokens, statement_end, db_type).or_else(|| {
-                (!statement_context_blocks_type_fallback && exclude_current_identifier_chain)
-                    .then(|| {
-                        Self::data_type_position_for_db(
-                            statement_tokens,
-                            Self::context_end_before_current_word(
+            Self::data_type_position_for_db(statement_tokens, statement_end, db_type).or_else(
+                || {
+                    (!statement_context_blocks_type_fallback && exclude_current_identifier_chain)
+                        .then(|| {
+                            Self::data_type_position_for_db(
                                 statement_tokens,
-                                deep_ctx.cursor_token_len,
-                            )?,
-                            db_type,
-                        )
-                    })
-                    .flatten()
-            });
+                                Self::context_end_before_current_word(
+                                    statement_tokens,
+                                    deep_ctx.cursor_token_len,
+                                )?,
+                                db_type,
+                            )
+                        })
+                        .flatten()
+                },
+            );
         if let Some(position) = statement_position {
             return Self::data_type_position_allowed_for_db(position, db_type).then_some(position);
         }
@@ -30213,7 +30524,6 @@ impl SqlEditorWidget {
             && !matches!(position, DataTypePosition::ToolVariable)
     }
 
-
     /// True when the cursor sits right after a standalone `AS` — an alias-name
     /// slot that introduces a brand-new identifier (`expr AS |`, `relation
     /// AS |`). Such a slot is never an existing column/relation/keyword, so
@@ -30252,8 +30562,10 @@ impl SqlEditorWidget {
         deep_ctx: &intellisense_context::CursorContext,
         exclude_current_identifier_chain: bool,
     ) -> bool {
-        matches!(sql_context_for_phase(deep_ctx.phase), SqlContext::ColumnOrAll)
-            && Self::cursor_word_is_alias_name_after_as(deep_ctx, exclude_current_identifier_chain)
+        matches!(
+            sql_context_for_phase(deep_ctx.phase),
+            SqlContext::ColumnOrAll
+        ) && Self::cursor_word_is_alias_name_after_as(deep_ctx, exclude_current_identifier_chain)
     }
 
     /// True when the cursor sits at the alias-name slot right after `AS` in a
@@ -30283,15 +30595,10 @@ impl SqlEditorWidget {
         let limit = end.min(tokens.len());
         let is_top_level = |idx| crate::ui::sql_depth::is_top_level_depth(&depths, idx);
 
-        if tokens
-            .iter()
-            .enumerate()
-            .take(limit)
-            .any(|(idx, token)| {
-                is_top_level(idx)
-                    && matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("FROM"))
-            })
-        {
+        if tokens.iter().enumerate().take(limit).any(|(idx, token)| {
+            is_top_level(idx)
+                && matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("FROM"))
+        }) {
             return false;
         }
 
@@ -30329,9 +30636,7 @@ impl SqlEditorWidget {
         if n == 0 {
             return false;
         }
-        let is_word = |idx: usize, kw: &str| {
-            matches!(toks.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case(kw))
-        };
+        let is_word = |idx: usize, kw: &str| matches!(toks.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case(kw));
         let mysql = crate::sql_text::mysql_compatibility_for_sql("", db_type);
         let mysql_family = db_type.is_none_or(|db_type| db_type.is_mysql_or_mariadb());
 
@@ -30497,7 +30802,9 @@ impl SqlEditorWidget {
         suggestions
     }
 
-    fn expected_database_link_keyword_candidates(words: &[String]) -> Option<&'static [&'static str]> {
+    fn expected_database_link_keyword_candidates(
+        words: &[String],
+    ) -> Option<&'static [&'static str]> {
         const LINK_KEYWORDS: &[&str] = &["LINK"];
         const DATABASE_LINK_MODIFIERS: &[&str] = &["PUBLIC", "DATABASE"];
         const DATABASE_KEYWORDS: &[&str] = &["DATABASE"];
@@ -30576,9 +30883,7 @@ impl SqlEditorWidget {
             {
                 Some(JAVA_CREATE_DROP_OBJECT_TYPES)
             }
-            [.., verb, java]
-                if matches!(verb.as_str(), "CREATE" | "DROP") && *java == "JAVA" =>
-            {
+            [.., verb, java] if matches!(verb.as_str(), "CREATE" | "DROP") && *java == "JAVA" => {
                 Some(JAVA_CREATE_DROP_OBJECT_TYPES)
             }
             [.., verb, java] if *verb == "ALTER" && *java == "JAVA" => {
@@ -30692,9 +30997,7 @@ impl SqlEditorWidget {
                 }
                 if let Some(into_idx) = rest.iter().rposition(|part| part == "INTO") {
                     let after_into = &rest[into_idx + 1..];
-                    if after_into.is_empty()
-                        || after_into.last().is_some_and(|part| part == ".")
-                    {
+                    if after_into.is_empty() || after_into.last().is_some_and(|part| part == ".") {
                         return Some(&[]);
                     }
                     return Some(FOR_KEYWORD);
@@ -30804,13 +31107,14 @@ impl SqlEditorWidget {
             .enumerate()
             .rev()
             .find_map(|(idx, token)| {
-            let SqlToken::Word(word) = token else {
-                return None;
-            };
-            let upper = word.to_ascii_uppercase();
-            (anchors.contains(&upper.as_str()) && Self::token_can_begin_statement_at(tokens, idx))
-            .then_some(idx)
-        })
+                let SqlToken::Word(word) = token else {
+                    return None;
+                };
+                let upper = word.to_ascii_uppercase();
+                (anchors.contains(&upper.as_str())
+                    && Self::token_can_begin_statement_at(tokens, idx))
+                .then_some(idx)
+            })
     }
 
     fn cursor_has_statement_start_anchor(
@@ -30842,9 +31146,9 @@ impl SqlEditorWidget {
             .rposition(|token| matches!(token, SqlToken::Symbol(sym) if sym == ","))
             .map_or(0, |idx| idx + 1);
         let segment = &tail[segment_start..];
-        segment.iter().any(|token| {
-            matches!(token, SqlToken::Symbol(sym) if matches!(sym.as_str(), "=" | ":="))
-        })
+        segment.iter().any(
+            |token| matches!(token, SqlToken::Symbol(sym) if matches!(sym.as_str(), "=" | ":=")),
+        )
     }
 
     fn mysql_explain_format_json_into_slot(
@@ -31086,14 +31390,19 @@ impl SqlEditorWidget {
 
     fn cursor_is_in_statement_structural_head(tokens: &[SqlToken], end: usize) -> bool {
         let toks = Self::meaningful_tokens_with_indices_before(tokens, end);
-        let Some(anchor_pos) = toks.iter().enumerate().rev().find_map(|(pos, (idx, token))| {
-            let SqlToken::Word(word) = token else {
-                return None;
-            };
-            (Self::is_statement_structural_anchor_word(&word.to_ascii_uppercase())
-                && Self::token_can_begin_statement_at(tokens, *idx))
-            .then_some(pos)
-        }) else {
+        let Some(anchor_pos) = toks
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(pos, (idx, token))| {
+                let SqlToken::Word(word) = token else {
+                    return None;
+                };
+                (Self::is_statement_structural_anchor_word(&word.to_ascii_uppercase())
+                    && Self::token_can_begin_statement_at(tokens, *idx))
+                .then_some(pos)
+            })
+        else {
             return false;
         };
 
@@ -31173,8 +31482,11 @@ impl SqlEditorWidget {
 
     fn cursor_is_in_object_command_head(tokens: &[SqlToken], end: usize) -> bool {
         let toks = Self::meaningful_tokens_with_indices_before(tokens, end);
-        let Some(anchor_pos) =
-            toks.iter().enumerate().rev().find_map(|(pos, (idx, token))| {
+        let Some(anchor_pos) = toks
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(pos, (idx, token))| {
                 let SqlToken::Word(word) = token else {
                     return None;
                 };
@@ -31182,21 +31494,23 @@ impl SqlEditorWidget {
                 (matches!(
                     upper.as_str(),
                     "CALL" | "DESC" | "DESCRIBE" | "EXEC" | "EXECUTE" | "EXPLAIN"
-                )
-                    && Self::token_can_begin_statement_at(tokens, *idx))
+                ) && Self::token_can_begin_statement_at(tokens, *idx))
                 .then_some(pos)
             })
         else {
             return false;
         };
 
-        !toks.iter().skip(anchor_pos + 1).any(|(_, token)| match token {
-            SqlToken::Symbol(sym) => sym == ";",
-            SqlToken::Word(word) => Self::word_is_statement_structural_boundary_after_anchor(
-                &word.to_ascii_uppercase(),
-            ),
-            _ => false,
-        })
+        !toks
+            .iter()
+            .skip(anchor_pos + 1)
+            .any(|(_, token)| match token {
+                SqlToken::Symbol(sym) => sym == ";",
+                SqlToken::Word(word) => Self::word_is_statement_structural_boundary_after_anchor(
+                    &word.to_ascii_uppercase(),
+                ),
+                _ => false,
+            })
     }
 
     fn cursor_is_at_foreign_key_references_table_slot(tokens: &[SqlToken], end: usize) -> bool {
@@ -31217,8 +31531,9 @@ impl SqlEditorWidget {
             return false;
         }
 
-        toks.iter()
-            .any(|token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("TABLE")))
+        toks.iter().any(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("TABLE")),
+        )
     }
 
     fn cursor_is_at_create_on_table_target_slot(tokens: &[SqlToken], end: usize) -> bool {
@@ -31231,18 +31546,30 @@ impl SqlEditorWidget {
             return false;
         }
 
-        let Some(object_idx) = toks[..on_idx].iter().enumerate().rev().find_map(|(idx, (_, token))| {
-            let SqlToken::Word(word) = token else {
-                return None;
-            };
-            matches!(word.to_ascii_uppercase().as_str(), "INDEX" | "TRIGGER").then_some(idx)
-        }) else {
+        let Some(object_idx) =
+            toks[..on_idx]
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(idx, (_, token))| {
+                    let SqlToken::Word(word) = token else {
+                        return None;
+                    };
+                    matches!(word.to_ascii_uppercase().as_str(), "INDEX" | "TRIGGER").then_some(idx)
+                })
+        else {
             return false;
         };
-        let Some(create_idx) = toks[..object_idx].iter().enumerate().rev().find_map(|(idx, (_, token))| {
-            matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("CREATE"))
-                .then_some(idx)
-        }) else {
+        let Some(create_idx) =
+            toks[..object_idx]
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(idx, (_, token))| {
+                    matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("CREATE"))
+                        .then_some(idx)
+                })
+        else {
             return false;
         };
 
@@ -31250,67 +31577,69 @@ impl SqlEditorWidget {
             return false;
         }
 
-        if toks[object_idx + 1..on_idx].iter().any(|(_, token)| match token {
-            SqlToken::Symbol(sym) => sym == ";",
-            SqlToken::Word(word) => matches!(
-                word.to_ascii_uppercase().as_str(),
-                "BEGIN"
-                    | "DECLARE"
-                    | "ELSE"
-                    | "EXCEPT"
-                    | "EXCEPTION"
-                    | "FROM"
-                    | "GROUP"
-                    | "HAVING"
-                    | "INTERSECT"
-                    | "JOIN"
-                    | "LOOP"
-                    | "MINUS"
-                    | "ORDER"
-                    | "SELECT"
-                    | "THEN"
-                    | "UNION"
-                    | "VALUES"
-                    | "WHERE"
-                    | "WITH"
-            ),
-            _ => false,
-        }) {
+        if toks[object_idx + 1..on_idx]
+            .iter()
+            .any(|(_, token)| match token {
+                SqlToken::Symbol(sym) => sym == ";",
+                SqlToken::Word(word) => matches!(
+                    word.to_ascii_uppercase().as_str(),
+                    "BEGIN"
+                        | "DECLARE"
+                        | "ELSE"
+                        | "EXCEPT"
+                        | "EXCEPTION"
+                        | "FROM"
+                        | "GROUP"
+                        | "HAVING"
+                        | "INTERSECT"
+                        | "JOIN"
+                        | "LOOP"
+                        | "MINUS"
+                        | "ORDER"
+                        | "SELECT"
+                        | "THEN"
+                        | "UNION"
+                        | "VALUES"
+                        | "WHERE"
+                        | "WITH"
+                ),
+                _ => false,
+            })
+        {
             return false;
         }
 
-        !toks[create_idx + 1..object_idx].iter().any(|(_, token)| match token {
-            SqlToken::Symbol(sym) => sym == ";",
-            SqlToken::Word(word) => matches!(
-                word.to_ascii_uppercase().as_str(),
-                "BEGIN"
-                    | "DECLARE"
-                    | "ELSE"
-                    | "EXCEPT"
-                    | "EXCEPTION"
-                    | "FROM"
-                    | "GROUP"
-                    | "HAVING"
-                    | "INTERSECT"
-                    | "JOIN"
-                    | "LOOP"
-                    | "MINUS"
-                    | "ORDER"
-                    | "SELECT"
-                    | "THEN"
-                    | "UNION"
-                    | "VALUES"
-                    | "WHERE"
-                    | "WITH"
-            ),
-            _ => false,
-        })
+        !toks[create_idx + 1..object_idx]
+            .iter()
+            .any(|(_, token)| match token {
+                SqlToken::Symbol(sym) => sym == ";",
+                SqlToken::Word(word) => matches!(
+                    word.to_ascii_uppercase().as_str(),
+                    "BEGIN"
+                        | "DECLARE"
+                        | "ELSE"
+                        | "EXCEPT"
+                        | "EXCEPTION"
+                        | "FROM"
+                        | "GROUP"
+                        | "HAVING"
+                        | "INTERSECT"
+                        | "JOIN"
+                        | "LOOP"
+                        | "MINUS"
+                        | "ORDER"
+                        | "SELECT"
+                        | "THEN"
+                        | "UNION"
+                        | "VALUES"
+                        | "WHERE"
+                        | "WITH"
+                ),
+                _ => false,
+            })
     }
 
-    fn cursor_is_at_mysql_drop_index_on_table_target_slot(
-        tokens: &[SqlToken],
-        end: usize,
-    ) -> bool {
+    fn cursor_is_at_mysql_drop_index_on_table_target_slot(tokens: &[SqlToken], end: usize) -> bool {
         let words = Self::previous_meaningful_words_upper(tokens, end, 4);
         matches!(
             words.as_slice(),
@@ -31481,13 +31810,13 @@ impl SqlEditorWidget {
                 tokens,
                 end,
                 words.as_slice(),
+                db_type,
             );
         }
         if Self::is_create_synonym_name_written_context(&words) {
             return Some(&["FOR"]);
         }
-        if let Some(candidates) =
-            Self::expected_oracle_explain_plan_keyword_candidates(tokens, end)
+        if let Some(candidates) = Self::expected_oracle_explain_plan_keyword_candidates(tokens, end)
         {
             return Some(candidates);
         }
@@ -31578,9 +31907,7 @@ impl SqlEditorWidget {
             [.., prev, last] if *prev == "CREATE" && *last == "PUBLIC" => {
                 Some(&["SYNONYM", "DATABASE", "ROLLBACK"])
             }
-            [.., prev, last]
-                if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "PUBLIC" =>
-            {
+            [.., prev, last] if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "PUBLIC" => {
                 Some(&["SYNONYM", "DATABASE"])
             }
             [.., a, b, c, d]
@@ -31609,7 +31936,13 @@ impl SqlEditorWidget {
             [.., last]
                 if *last == "PURGE" && Self::cursor_at_statement_head_verb(tokens, end, last) =>
             {
-                Some(&["TABLE", "INDEX", "RECYCLEBIN", "DBA_RECYCLEBIN", "TABLESPACE"])
+                Some(&[
+                    "TABLE",
+                    "INDEX",
+                    "RECYCLEBIN",
+                    "DBA_RECYCLEBIN",
+                    "TABLESPACE",
+                ])
             }
             [.., last]
                 if *last == "ANALYZE" && Self::cursor_at_statement_head_verb(tokens, end, last) =>
@@ -31631,6 +31964,7 @@ impl SqlEditorWidget {
         tokens: &[SqlToken],
         end: usize,
         words: &[String],
+        db_type: Option<crate::db::DatabaseType>,
     ) -> Option<&'static [&'static str]> {
         const MYSQL_CREATE_OBJECT_TYPE_KEYWORDS: &[&str] = &[
             "ALGORITHM",
@@ -31720,8 +32054,7 @@ impl SqlEditorWidget {
             "RETAIN",
             "WITH",
         ];
-        const MYSQL_ALTER_USER_AUTH_TAIL_KEYWORDS: &[&str] =
-            &["REPLACE", "RETAIN"];
+        const MYSQL_ALTER_USER_AUTH_TAIL_KEYWORDS: &[&str] = &["REPLACE", "RETAIN"];
         const MYSQL_ALTER_USER_REQUIRE_KEYWORDS: &[&str] =
             &["CIPHER", "ISSUER", "NONE", "SSL", "SUBJECT", "X509"];
         const MYSQL_ALTER_USER_REQUIRE_AFTER_TLS_KEYWORDS: &[&str] =
@@ -31737,8 +32070,7 @@ impl SqlEditorWidget {
         const MYSQL_ALTER_USER_PASSWORD_EXPIRE_KEYWORDS: &[&str] =
             &["DEFAULT", "INTERVAL", "NEVER"];
         const MYSQL_ALTER_USER_PASSWORD_REQUIRE_KEYWORDS: &[&str] = &["CURRENT"];
-        const MYSQL_ALTER_USER_PASSWORD_CURRENT_KEYWORDS: &[&str] =
-            &["DEFAULT", "OPTIONAL"];
+        const MYSQL_ALTER_USER_PASSWORD_CURRENT_KEYWORDS: &[&str] = &["DEFAULT", "OPTIONAL"];
         const MYSQL_ALTER_USER_DEFAULT_ROLE_KEYWORDS: &[&str] = &["ALL", "NONE"];
         const MYSQL_CREATE_USER_OPTION_HEAD_KEYWORDS: &[&str] = &[
             "ACCOUNT",
@@ -31792,15 +32124,16 @@ impl SqlEditorWidget {
             "FOR", "DELETE", "INSERT", "REPLACE", "SELECT", "TABLE", "UPDATE", "WITH",
         ];
         const MYSQL_EXPLAIN_OPTION_OR_STATEMENT_HEAD_KEYWORDS: &[&str] = &[
-            "ANALYZE", "FORMAT", "FOR", "DELETE", "INSERT", "REPLACE", "SELECT", "TABLE",
-            "UPDATE", "WITH",
+            "ANALYZE", "FORMAT", "FOR", "DELETE", "INSERT", "REPLACE", "SELECT", "TABLE", "UPDATE",
+            "WITH",
         ];
         const MYSQL_EXPLAIN_ANALYZE_STATEMENT_HEAD_KEYWORDS: &[&str] =
             &["DELETE", "SELECT", "TABLE", "UPDATE", "WITH"];
         const MYSQL_EXPLAIN_ANALYZE_STATEMENT_HEAD_OR_FOR_KEYWORDS: &[&str] =
             &["FOR", "DELETE", "SELECT", "TABLE", "UPDATE", "WITH"];
-        const MYSQL_EXPLAIN_ANALYZE_OPTION_OR_HEAD_KEYWORDS: &[&str] =
-            &["DELETE", "FORMAT", "FOR", "SELECT", "TABLE", "UPDATE", "WITH"];
+        const MYSQL_EXPLAIN_ANALYZE_OPTION_OR_HEAD_KEYWORDS: &[&str] = &[
+            "DELETE", "FORMAT", "FOR", "SELECT", "TABLE", "UPDATE", "WITH",
+        ];
         const MYSQL_FLUSH_HEAD_KEYWORDS: &[&str] = &[
             "BINARY",
             "ENGINE",
@@ -31827,8 +32160,7 @@ impl SqlEditorWidget {
         const MYSQL_CHECK_TABLE_OPTION_KEYWORDS: &[&str] =
             &["CHANGED", "EXTENDED", "FAST", "FOR", "MEDIUM", "QUICK"];
         const MYSQL_CHECKSUM_TABLE_OPTION_KEYWORDS: &[&str] = &["EXTENDED", "QUICK"];
-        const MYSQL_REPAIR_TABLE_OPTION_KEYWORDS: &[&str] =
-            &["EXTENDED", "QUICK", "USE_FRM"];
+        const MYSQL_REPAIR_TABLE_OPTION_KEYWORDS: &[&str] = &["EXTENDED", "QUICK", "USE_FRM"];
         const MYSQL_CHANGE_REPLICATION_FILTER_KEYWORDS: &[&str] = &[
             "REPLICATE_DO_DB",
             "REPLICATE_DO_TABLE",
@@ -31879,8 +32211,16 @@ impl SqlEditorWidget {
             "SOURCE_ZSTD_COMPRESSION_LEVEL",
         ];
         const MYSQL_TRANSACTION_TAIL_KEYWORDS: &[&str] = &["AND", "NO", "RELEASE", "WORK"];
-        const MYSQL_REPLICATION_THREAD_OR_OPTION_KEYWORDS: &[&str] =
-            &["DEFAULT_AUTH", "FOR", "IO_THREAD", "PASSWORD", "PLUGIN_DIR", "SQL_THREAD", "UNTIL", "USER"];
+        const MYSQL_REPLICATION_THREAD_OR_OPTION_KEYWORDS: &[&str] = &[
+            "DEFAULT_AUTH",
+            "FOR",
+            "IO_THREAD",
+            "PASSWORD",
+            "PLUGIN_DIR",
+            "SQL_THREAD",
+            "UNTIL",
+            "USER",
+        ];
         const MYSQL_REPLICATION_UNTIL_KEYWORDS: &[&str] = &[
             "RELAY_LOG_FILE",
             "SQL_AFTER_GTIDS",
@@ -31909,19 +32249,24 @@ impl SqlEditorWidget {
         const MYSQL_SET_ROLE_HEAD_KEYWORDS: &[&str] = &["ALL", "DEFAULT", "NONE"];
         const MYSQL_SET_PASSWORD_AUTH_KEYWORDS: &[&str] = &["FOR", "TO"];
         const MYSQL_SET_PASSWORD_TAIL_KEYWORDS: &[&str] = &["REPLACE", "RETAIN"];
-        const MYSQL_LOAD_FILE_OPTIONS: &[&str] =
-            &["CONCURRENT", "INFILE", "LOCAL", "LOW_PRIORITY"];
+        const MYSQL_LOAD_FILE_OPTIONS: &[&str] = &["CONCURRENT", "INFILE", "LOCAL", "LOW_PRIORITY"];
         const MYSQL_LOAD_AFTER_PRIORITY: &[&str] = &["INFILE", "LOCAL"];
         const MYSQL_LOAD_AFTER_INFILE_PATH: &[&str] = &["IGNORE", "INTO", "REPLACE"];
         const MYSQL_LOAD_DATA_TABLE_TAIL_KEYWORDS: &[&str] =
             &["CHARACTER", "COLUMNS", "FIELDS", "IGNORE", "LINES", "SET"];
-        const MYSQL_LOAD_XML_TABLE_TAIL_KEYWORDS: &[&str] =
-            &["CHARACTER", "IGNORE", "ROWS", "SET"];
+        const MYSQL_LOAD_XML_TABLE_TAIL_KEYWORDS: &[&str] = &["CHARACTER", "IGNORE", "ROWS", "SET"];
         const MYSQL_LOAD_DATA_FIELD_OPTIONS: &[&str] =
             &["ENCLOSED", "ESCAPED", "OPTIONALLY", "TERMINATED"];
         const MYSQL_LOAD_DATA_LINE_OPTIONS: &[&str] = &["STARTING", "TERMINATED"];
-        const MYSQL_LOAD_DATA_AFTER_FIELD_VALUE_KEYWORDS: &[&str] =
-            &["ENCLOSED", "ESCAPED", "IGNORE", "LINES", "OPTIONALLY", "SET", "TERMINATED"];
+        const MYSQL_LOAD_DATA_AFTER_FIELD_VALUE_KEYWORDS: &[&str] = &[
+            "ENCLOSED",
+            "ESCAPED",
+            "IGNORE",
+            "LINES",
+            "OPTIONALLY",
+            "SET",
+            "TERMINATED",
+        ];
         const MYSQL_CACHE_INDEX_AFTER_TABLE_KEYWORDS: &[&str] =
             &["IN", "INDEX", "KEY", "PARTITION"];
         const MYSQL_LOAD_INDEX_AFTER_TABLE_KEYWORDS: &[&str] =
@@ -31929,32 +32274,22 @@ impl SqlEditorWidget {
         const MYSQL_CREATE_INDEX_MODIFIERS: &[&str] = &["FULLTEXT", "SPATIAL", "UNIQUE"];
         const MYSQL_INDEX_TYPE_KEYWORDS: &[&str] = &["BTREE", "HASH"];
         const MYSQL_VIEW_PREFIX_AFTER_VERB: &[&str] = &["ALGORITHM", "DEFINER", "SQL", "VIEW"];
-        const MYSQL_VIEW_PREFIX_AFTER_REPLACE: &[&str] =
-            &["ALGORITHM", "DEFINER", "SQL", "VIEW"];
-        const MYSQL_VIEW_PREFIX_AFTER_ALGORITHM: &[&str] =
-            &["DEFINER", "SQL", "VIEW"];
-        const MYSQL_VIEW_ALGORITHM_VALUES: &[&str] =
-            &["MERGE", "TEMPTABLE", "UNDEFINED"];
+        const MYSQL_VIEW_PREFIX_AFTER_REPLACE: &[&str] = &["ALGORITHM", "DEFINER", "SQL", "VIEW"];
+        const MYSQL_VIEW_PREFIX_AFTER_ALGORITHM: &[&str] = &["DEFINER", "SQL", "VIEW"];
+        const MYSQL_VIEW_ALGORITHM_VALUES: &[&str] = &["MERGE", "TEMPTABLE", "UNDEFINED"];
         const MYSQL_VIEW_SECURITY_VALUES: &[&str] = &["DEFINER", "INVOKER"];
         const MYSQL_TRIGGER_TIMING_KEYWORDS: &[&str] = &["AFTER", "BEFORE"];
         const MYSQL_TRIGGER_EVENT_KEYWORDS: &[&str] = &["DELETE", "INSERT", "UPDATE"];
         const MYSQL_TRIGGER_ORDER_KEYWORDS: &[&str] = &["FOLLOWS", "PRECEDES"];
         const MYSQL_SERVER_OPTION_KEYWORDS: &[&str] = &[
-            "DATABASE",
-            "HOST",
-            "OWNER",
-            "PASSWORD",
-            "PORT",
-            "SOCKET",
-            "USER",
+            "DATABASE", "HOST", "OWNER", "PASSWORD", "PORT", "SOCKET", "USER",
         ];
         const MYSQL_RESOURCE_GROUP_TYPE_VALUES: &[&str] = &["SYSTEM", "USER"];
         const MYSQL_RESOURCE_GROUP_CREATE_AFTER_TYPE_KEYWORDS: &[&str] =
             &["VCPU", "THREAD_PRIORITY", "ENABLE", "DISABLE"];
         const MYSQL_RESOURCE_GROUP_AFTER_VCPU_KEYWORDS: &[&str] =
             &["THREAD_PRIORITY", "ENABLE", "DISABLE"];
-        const MYSQL_RESOURCE_GROUP_AFTER_THREAD_PRIORITY_KEYWORDS: &[&str] =
-            &["ENABLE", "DISABLE"];
+        const MYSQL_RESOURCE_GROUP_AFTER_THREAD_PRIORITY_KEYWORDS: &[&str] = &["ENABLE", "DISABLE"];
         const MYSQL_RESOURCE_GROUP_ATTRIBUTE_HEAD_KEYWORDS: &[&str] =
             &["VCPU", "THREAD_PRIORITY", "ENABLE", "DISABLE"];
         const MYSQL_TABLESPACE_CREATE_OPTION_HEAD_KEYWORDS: &[&str] = &[
@@ -32048,8 +32383,9 @@ impl SqlEditorWidget {
         ];
         const MYSQL_CREATE_EVENT_AFTER_INTERVAL_KEYWORDS: &[&str] =
             &["COMMENT", "DISABLE", "DO", "ENABLE", "ENDS", "ON", "STARTS"];
-        const MYSQL_ALTER_EVENT_AFTER_INTERVAL_KEYWORDS: &[&str] =
-            &["COMMENT", "DISABLE", "DO", "ENABLE", "ENDS", "ON", "RENAME", "STARTS"];
+        const MYSQL_ALTER_EVENT_AFTER_INTERVAL_KEYWORDS: &[&str] = &[
+            "COMMENT", "DISABLE", "DO", "ENABLE", "ENDS", "ON", "RENAME", "STARTS",
+        ];
         const MYSQL_CREATE_IF_NOT_EXISTS_OBJECT_TYPES: &[&str] =
             &["DATABASE", "ROLE", "SCHEMA", "TABLE", "USER"];
         const MYSQL_DROP_IF_EXISTS_OBJECT_TYPES: &[&str] = &[
@@ -32080,7 +32416,8 @@ impl SqlEditorWidget {
             .collect();
         let expected_lock_tables_candidates =
             |items: &[String]| -> Option<&'static [&'static str]> {
-                if !matches!(items, [a, b, ..] if a == "LOCK" && matches!(b.as_str(), "TABLE" | "TABLES")) {
+                if !matches!(items, [a, b, ..] if a == "LOCK" && matches!(b.as_str(), "TABLE" | "TABLES"))
+                {
                     return None;
                 }
                 let tail = &items[2..];
@@ -32105,7 +32442,9 @@ impl SqlEditorWidget {
                 }
                 if matches!(segment.get(idx).map(String::as_str), Some("AS")) {
                     idx += 1;
-                    if idx >= segment.len() || matches!(segment.get(idx).map(String::as_str), Some(".")) {
+                    if idx >= segment.len()
+                        || matches!(segment.get(idx).map(String::as_str), Some("."))
+                    {
                         return Some(&[]);
                     }
                     idx += 1;
@@ -32188,30 +32527,29 @@ impl SqlEditorWidget {
                     MYSQL_CACHE_INDEX_AFTER_TABLE_KEYWORDS,
                 )
             };
-        let expected_load_index_candidates =
-            |items: &[String]| -> Option<&'static [&'static str]> {
-                if !matches!(items, [a, b, ..] if a == "LOAD" && b == "INDEX") {
-                    return None;
+        let expected_load_index_candidates = |items: &[String]| -> Option<&'static [&'static str]> {
+            if !matches!(items, [a, b, ..] if a == "LOAD" && b == "INDEX") {
+                return None;
+            }
+            match items {
+                [_, _] => return Some(&["INTO"]),
+                [_, _, into_kw] if into_kw == "INTO" => return Some(&["CACHE"]),
+                [_, _, into_kw, cache_kw] if into_kw == "INTO" && cache_kw == "CACHE" => {
+                    return Some(&[]);
                 }
-                match items {
-                    [_, _] => return Some(&["INTO"]),
-                    [_, _, into_kw] if into_kw == "INTO" => return Some(&["CACHE"]),
-                    [_, _, into_kw, cache_kw] if into_kw == "INTO" && cache_kw == "CACHE" => {
-                        return Some(&[]);
-                    }
-                    [_, _, into_kw, cache_kw, rest @ ..]
-                        if into_kw == "INTO" && cache_kw == "CACHE" =>
-                    {
-                        let segment = index_cache_segment_after_comma(rest);
-                        return expected_index_cache_table_list_candidates(
-                            segment,
-                            MYSQL_LOAD_INDEX_AFTER_TABLE_KEYWORDS,
-                        );
-                    }
-                    _ => {}
+                [_, _, into_kw, cache_kw, rest @ ..]
+                    if into_kw == "INTO" && cache_kw == "CACHE" =>
+                {
+                    let segment = index_cache_segment_after_comma(rest);
+                    return expected_index_cache_table_list_candidates(
+                        segment,
+                        MYSQL_LOAD_INDEX_AFTER_TABLE_KEYWORDS,
+                    );
                 }
-                None
-            };
+                _ => {}
+            }
+            None
+        };
 
         if let Some(candidates) = expected_cache_index_candidates(&index_cache_items) {
             return Some(candidates);
@@ -32293,9 +32631,7 @@ impl SqlEditorWidget {
                     }
                 }
 
-                if words.get(idx).map(String::as_str) == Some("VIEW")
-                    && idx + 2 == words.len()
-                {
+                if words.get(idx).map(String::as_str) == Some("VIEW") && idx + 2 == words.len() {
                     return Some(&["AS"]);
                 }
 
@@ -32400,9 +32736,7 @@ impl SqlEditorWidget {
                     return Some(&["ROW"]);
                 }
 
-                if words.get(idx).map(String::as_str) == Some("ROW")
-                    && idx + 1 == words.len()
-                {
+                if words.get(idx).map(String::as_str) == Some("ROW") && idx + 1 == words.len() {
                     return Some(MYSQL_TRIGGER_ORDER_KEYWORDS);
                 }
 
@@ -32429,216 +32763,213 @@ impl SqlEditorWidget {
             }
         };
 
-        let expected_event_tail_candidates = |words: &[String],
-                                             idx: usize,
-                                             verb: &str|
-         -> Option<&'static [&'static str]> {
-            if idx >= words.len() {
-                return Some(event_tail_candidates(verb));
-            }
-
-            match words[idx].as_str() {
-                "ON" => match words.get(idx + 1).map(String::as_str) {
-                    None => Some(&["COMPLETION"]),
-                    Some("COMPLETION") => {
-                        if idx + 2 == words.len() {
-                            return Some(&["NOT", "PRESERVE"]);
-                        }
-                        if words.get(idx + 2).map(String::as_str) == Some("NOT") {
-                            if idx + 3 == words.len() {
-                                return Some(&["PRESERVE"]);
-                            }
-                            if words.get(idx + 3).map(String::as_str) == Some("PRESERVE")
-                                && idx + 4 == words.len()
-                            {
-                                return Some(event_tail_candidates(verb));
-                            }
-                            return None;
-                        }
-                        if words.get(idx + 2).map(String::as_str) == Some("PRESERVE")
-                            && idx + 3 == words.len()
-                        {
-                            return Some(event_tail_candidates(verb));
-                        }
-                        None
-                    }
-                    _ => None,
-                },
-                "DISABLE" => {
-                    if idx + 1 == words.len() {
-                        Some(&["ON"])
-                    } else if words.get(idx + 1).map(String::as_str) == Some("ON")
-                        && idx + 2 == words.len()
-                    {
-                        Some(&["REPLICA", "SLAVE"])
-                    } else if idx + 3 == words.len()
-                        && words.get(idx + 1).map(String::as_str) == Some("ON")
-                        && matches!(
-                            words.get(idx + 2).map(String::as_str),
-                            Some("REPLICA" | "SLAVE")
-                        )
-                    {
-                        Some(event_tail_candidates(verb))
-                    } else {
-                        None
-                    }
-                }
-                "ENABLE" => {
-                    if idx + 1 == words.len() {
-                        Some(event_tail_candidates(verb))
-                    } else {
-                        None
-                    }
-                }
-                "RENAME" if verb == "ALTER" => {
-                    if idx + 1 == words.len() {
-                        Some(&["TO"])
-                    } else {
-                        None
-                    }
-                }
-                "COMMENT" | "DO" => None,
-                _ => None,
-            }
-        };
-
-        let expected_event_candidates =
-            |words: &[String]| -> Option<&'static [&'static str]> {
-                let verb_pos = words
-                    .iter()
-                    .rposition(|word| matches!(word.as_str(), "ALTER" | "CREATE"))?;
-                let verb = words[verb_pos].as_str();
-                let mut idx = verb_pos + 1;
+        let expected_event_tail_candidates =
+            |words: &[String], idx: usize, verb: &str| -> Option<&'static [&'static str]> {
                 if idx >= words.len() {
-                    return None;
-                }
-
-                if words.get(idx).map(String::as_str) == Some("DEFINER") {
-                    if idx + 1 >= words.len() {
-                        return None;
-                    }
-                    idx += 2;
-                }
-
-                if words.get(idx).map(String::as_str) != Some("EVENT") {
-                    return None;
-                }
-                idx += 1;
-
-                if verb == "CREATE" {
-                    if idx == words.len() {
-                        return Some(&["IF"]);
-                    }
-                    if words.get(idx).map(String::as_str) == Some("IF") {
-                        if idx + 1 == words.len() {
-                            return Some(&["NOT"]);
-                        }
-                        if words.get(idx + 1).map(String::as_str) != Some("NOT") {
-                            return None;
-                        }
-                        if idx + 2 == words.len() {
-                            return Some(&["EXISTS"]);
-                        }
-                        if words.get(idx + 2).map(String::as_str) != Some("EXISTS") {
-                            return None;
-                        }
-                        idx += 3;
-                    }
-                }
-
-                if idx >= words.len() {
-                    return None;
-                }
-
-                idx += 1;
-                let first_clause_idx = idx;
-                if idx == words.len() {
-                    return if verb == "CREATE" {
-                        Some(&["ON"])
-                    } else {
-                        Some(event_tail_candidates(verb))
-                    };
+                    return Some(event_tail_candidates(verb));
                 }
 
                 match words[idx].as_str() {
-                    "ON" => {
-                        if idx + 1 == words.len() {
-                            return if verb == "CREATE" && idx == first_clause_idx {
-                                Some(&["SCHEDULE"])
-                            } else if idx == first_clause_idx {
-                                Some(&["COMPLETION", "SCHEDULE"])
-                            } else {
-                                Some(&["COMPLETION"])
-                            };
-                        }
-                        match words.get(idx + 1).map(String::as_str) {
-                            Some("SCHEDULE") => {
-                                if idx + 2 == words.len() {
-                                    return Some(MYSQL_EVENT_SCHEDULE_HEAD_KEYWORDS);
-                                }
-                                match words.get(idx + 2).map(String::as_str) {
-                                    Some("AT") => {
-                                        if idx + 4 == words.len() {
-                                            Some(event_tail_candidates(verb))
-                                        } else if idx + 4 < words.len() {
-                                            expected_event_tail_candidates(words, idx + 4, verb)
-                                        } else {
-                                            None
-                                        }
-                                    }
-                                    Some("EVERY") => {
-                                        if idx + 4 == words.len() {
-                                            return Some(MYSQL_EVENT_INTERVAL_UNIT_KEYWORDS);
-                                        }
-                                        if idx + 5 == words.len()
-                                            && MYSQL_EVENT_INTERVAL_UNIT_KEYWORDS
-                                                .contains(&words[idx + 4].as_str())
-                                        {
-                                            return Some(event_after_interval_candidates(verb));
-                                        }
-                                        if idx + 5 < words.len()
-                                            && MYSQL_EVENT_INTERVAL_UNIT_KEYWORDS
-                                                .contains(&words[idx + 4].as_str())
-                                        {
-                                            return expected_event_tail_candidates(
-                                                words,
-                                                idx + 5,
-                                                verb,
-                                            );
-                                        }
-                                        None
-                                    }
-                                    _ => None,
-                                }
+                    "ON" => match words.get(idx + 1).map(String::as_str) {
+                        None => Some(&["COMPLETION"]),
+                        Some("COMPLETION") => {
+                            if idx + 2 == words.len() {
+                                return Some(&["NOT", "PRESERVE"]);
                             }
-                            Some("COMPLETION") => {
-                                if idx + 2 == words.len() {
-                                    return Some(&["NOT", "PRESERVE"]);
+                            if words.get(idx + 2).map(String::as_str) == Some("NOT") {
+                                if idx + 3 == words.len() {
+                                    return Some(&["PRESERVE"]);
                                 }
-                                if words.get(idx + 2).map(String::as_str) == Some("NOT") {
-                                    if idx + 3 == words.len() {
-                                        return Some(&["PRESERVE"]);
-                                    }
-                                    if words.get(idx + 3).map(String::as_str) == Some("PRESERVE")
-                                        && idx + 4 == words.len()
-                                    {
-                                        return Some(event_tail_candidates(verb));
-                                    }
-                                    return None;
-                                }
-                                if words.get(idx + 2).map(String::as_str) == Some("PRESERVE")
-                                    && idx + 3 == words.len()
+                                if words.get(idx + 3).map(String::as_str) == Some("PRESERVE")
+                                    && idx + 4 == words.len()
                                 {
                                     return Some(event_tail_candidates(verb));
                                 }
-                                None
+                                return None;
                             }
-                            _ => None,
+                            if words.get(idx + 2).map(String::as_str) == Some("PRESERVE")
+                                && idx + 3 == words.len()
+                            {
+                                return Some(event_tail_candidates(verb));
+                            }
+                            None
+                        }
+                        _ => None,
+                    },
+                    "DISABLE" => {
+                        if idx + 1 == words.len() {
+                            Some(&["ON"])
+                        } else if words.get(idx + 1).map(String::as_str) == Some("ON")
+                            && idx + 2 == words.len()
+                        {
+                            Some(&["REPLICA", "SLAVE"])
+                        } else if idx + 3 == words.len()
+                            && words.get(idx + 1).map(String::as_str) == Some("ON")
+                            && matches!(
+                                words.get(idx + 2).map(String::as_str),
+                                Some("REPLICA" | "SLAVE")
+                            )
+                        {
+                            Some(event_tail_candidates(verb))
+                        } else {
+                            None
                         }
                     }
-                    _ => expected_event_tail_candidates(words, idx, verb),
+                    "ENABLE" => {
+                        if idx + 1 == words.len() {
+                            Some(event_tail_candidates(verb))
+                        } else {
+                            None
+                        }
+                    }
+                    "RENAME" if verb == "ALTER" => {
+                        if idx + 1 == words.len() {
+                            Some(&["TO"])
+                        } else {
+                            None
+                        }
+                    }
+                    "COMMENT" | "DO" => None,
+                    _ => None,
                 }
             };
+
+        let expected_event_candidates = |words: &[String]| -> Option<&'static [&'static str]> {
+            let verb_pos = words
+                .iter()
+                .rposition(|word| matches!(word.as_str(), "ALTER" | "CREATE"))?;
+            let verb = words[verb_pos].as_str();
+            let mut idx = verb_pos + 1;
+            if idx >= words.len() {
+                return None;
+            }
+
+            if words.get(idx).map(String::as_str) == Some("DEFINER") {
+                if idx + 1 >= words.len() {
+                    return None;
+                }
+                idx += 2;
+            }
+
+            if words.get(idx).map(String::as_str) != Some("EVENT") {
+                return None;
+            }
+            idx += 1;
+
+            if verb == "CREATE" {
+                if idx == words.len() {
+                    return Some(&["IF"]);
+                }
+                if words.get(idx).map(String::as_str) == Some("IF") {
+                    if idx + 1 == words.len() {
+                        return Some(&["NOT"]);
+                    }
+                    if words.get(idx + 1).map(String::as_str) != Some("NOT") {
+                        return None;
+                    }
+                    if idx + 2 == words.len() {
+                        return Some(&["EXISTS"]);
+                    }
+                    if words.get(idx + 2).map(String::as_str) != Some("EXISTS") {
+                        return None;
+                    }
+                    idx += 3;
+                }
+            }
+
+            if idx >= words.len() {
+                return None;
+            }
+
+            idx += 1;
+            let first_clause_idx = idx;
+            if idx == words.len() {
+                return if verb == "CREATE" {
+                    Some(&["ON"])
+                } else {
+                    Some(event_tail_candidates(verb))
+                };
+            }
+
+            match words[idx].as_str() {
+                "ON" => {
+                    if idx + 1 == words.len() {
+                        return if verb == "CREATE" && idx == first_clause_idx {
+                            Some(&["SCHEDULE"])
+                        } else if idx == first_clause_idx {
+                            Some(&["COMPLETION", "SCHEDULE"])
+                        } else {
+                            Some(&["COMPLETION"])
+                        };
+                    }
+                    match words.get(idx + 1).map(String::as_str) {
+                        Some("SCHEDULE") => {
+                            if idx + 2 == words.len() {
+                                return Some(MYSQL_EVENT_SCHEDULE_HEAD_KEYWORDS);
+                            }
+                            match words.get(idx + 2).map(String::as_str) {
+                                Some("AT") => {
+                                    if idx + 4 == words.len() {
+                                        Some(event_tail_candidates(verb))
+                                    } else if idx + 4 < words.len() {
+                                        expected_event_tail_candidates(words, idx + 4, verb)
+                                    } else {
+                                        None
+                                    }
+                                }
+                                Some("EVERY") => {
+                                    if idx + 4 == words.len() {
+                                        return Some(MYSQL_EVENT_INTERVAL_UNIT_KEYWORDS);
+                                    }
+                                    if idx + 5 == words.len()
+                                        && MYSQL_EVENT_INTERVAL_UNIT_KEYWORDS
+                                            .contains(&words[idx + 4].as_str())
+                                    {
+                                        return Some(event_after_interval_candidates(verb));
+                                    }
+                                    if idx + 5 < words.len()
+                                        && MYSQL_EVENT_INTERVAL_UNIT_KEYWORDS
+                                            .contains(&words[idx + 4].as_str())
+                                    {
+                                        return expected_event_tail_candidates(
+                                            words,
+                                            idx + 5,
+                                            verb,
+                                        );
+                                    }
+                                    None
+                                }
+                                _ => None,
+                            }
+                        }
+                        Some("COMPLETION") => {
+                            if idx + 2 == words.len() {
+                                return Some(&["NOT", "PRESERVE"]);
+                            }
+                            if words.get(idx + 2).map(String::as_str) == Some("NOT") {
+                                if idx + 3 == words.len() {
+                                    return Some(&["PRESERVE"]);
+                                }
+                                if words.get(idx + 3).map(String::as_str) == Some("PRESERVE")
+                                    && idx + 4 == words.len()
+                                {
+                                    return Some(event_tail_candidates(verb));
+                                }
+                                return None;
+                            }
+                            if words.get(idx + 2).map(String::as_str) == Some("PRESERVE")
+                                && idx + 3 == words.len()
+                            {
+                                return Some(event_tail_candidates(verb));
+                            }
+                            None
+                        }
+                        _ => None,
+                    }
+                }
+                _ => expected_event_tail_candidates(words, idx, verb),
+            }
+        };
 
         if let Some(candidates) = expected_event_candidates(words) {
             return Some(candidates);
@@ -32731,84 +33062,83 @@ impl SqlEditorWidget {
                 }
             };
 
-        let expected_routine_candidates =
-            |words: &[String]| -> Option<&'static [&'static str]> {
-                let verb_pos = words
-                    .iter()
-                    .rposition(|word| matches!(word.as_str(), "ALTER" | "CREATE"))?;
-                let verb = words[verb_pos].as_str();
-                let mut idx = verb_pos + 1;
-                if idx >= words.len() {
+        let expected_routine_candidates = |words: &[String]| -> Option<&'static [&'static str]> {
+            let verb_pos = words
+                .iter()
+                .rposition(|word| matches!(word.as_str(), "ALTER" | "CREATE"))?;
+            let verb = words[verb_pos].as_str();
+            let mut idx = verb_pos + 1;
+            if idx >= words.len() {
+                return None;
+            }
+
+            if verb == "CREATE" && words.get(idx).map(String::as_str) == Some("DEFINER") {
+                if idx + 1 >= words.len() {
                     return None;
                 }
+                idx += 2;
+            }
 
-                if verb == "CREATE" && words.get(idx).map(String::as_str) == Some("DEFINER") {
-                    if idx + 1 >= words.len() {
+            let routine_kind = words.get(idx).map(String::as_str)?;
+            if !matches!(routine_kind, "FUNCTION" | "PROCEDURE") {
+                return None;
+            }
+            idx += 1;
+
+            if verb == "CREATE" {
+                if idx == words.len() {
+                    return Some(&["IF"]);
+                }
+                if words.get(idx).map(String::as_str) == Some("IF") {
+                    if idx + 1 == words.len() {
+                        return Some(&["NOT"]);
+                    }
+                    if words.get(idx + 1).map(String::as_str) != Some("NOT") {
                         return None;
                     }
-                    idx += 2;
+                    if idx + 2 == words.len() {
+                        return Some(&["EXISTS"]);
+                    }
+                    if words.get(idx + 2).map(String::as_str) != Some("EXISTS") {
+                        return None;
+                    }
+                    idx += 3;
                 }
+            }
 
-                let routine_kind = words.get(idx).map(String::as_str)?;
-                if !matches!(routine_kind, "FUNCTION" | "PROCEDURE") {
+            if idx >= words.len() {
+                return None;
+            }
+
+            // Routine name. Parameter-list symbols are intentionally ignored by
+            // the word collector, so this covers both `name |` and `name () |`.
+            idx += 1;
+            if idx == words.len() {
+                return if routine_kind == "FUNCTION" && verb == "CREATE" {
+                    Some(&["RETURNS"])
+                } else {
+                    Some(MYSQL_ROUTINE_CHARACTERISTIC_HEAD_KEYWORDS)
+                };
+            }
+
+            if routine_kind == "FUNCTION" && verb == "CREATE" {
+                if words.get(idx).map(String::as_str) != Some("RETURNS") {
                     return None;
                 }
                 idx += 1;
-
-                if verb == "CREATE" {
-                    if idx == words.len() {
-                        return Some(&["IF"]);
-                    }
-                    if words.get(idx).map(String::as_str) == Some("IF") {
-                        if idx + 1 == words.len() {
-                            return Some(&["NOT"]);
-                        }
-                        if words.get(idx + 1).map(String::as_str) != Some("NOT") {
-                            return None;
-                        }
-                        if idx + 2 == words.len() {
-                            return Some(&["EXISTS"]);
-                        }
-                        if words.get(idx + 2).map(String::as_str) != Some("EXISTS") {
-                            return None;
-                        }
-                        idx += 3;
-                    }
-                }
-
                 if idx >= words.len() {
                     return None;
                 }
-
-                // Routine name. Parameter-list symbols are intentionally ignored by
-                // the word collector, so this covers both `name |` and `name () |`.
+                // Return type. Complex types may contain multiple words; use the
+                // last word as the start of the characteristic tail when present.
                 idx += 1;
                 if idx == words.len() {
-                    return if routine_kind == "FUNCTION" && verb == "CREATE" {
-                        Some(&["RETURNS"])
-                    } else {
-                        Some(MYSQL_ROUTINE_CHARACTERISTIC_HEAD_KEYWORDS)
-                    };
+                    return Some(MYSQL_ROUTINE_CHARACTERISTIC_HEAD_KEYWORDS);
                 }
+            }
 
-                if routine_kind == "FUNCTION" && verb == "CREATE" {
-                    if words.get(idx).map(String::as_str) != Some("RETURNS") {
-                        return None;
-                    }
-                    idx += 1;
-                    if idx >= words.len() {
-                        return None;
-                    }
-                    // Return type. Complex types may contain multiple words; use the
-                    // last word as the start of the characteristic tail when present.
-                    idx += 1;
-                    if idx == words.len() {
-                        return Some(MYSQL_ROUTINE_CHARACTERISTIC_HEAD_KEYWORDS);
-                    }
-                }
-
-                expected_routine_characteristic_candidates(words, idx)
-            };
+            expected_routine_characteristic_candidates(words, idx)
+        };
 
         if let Some(candidates) = expected_routine_candidates(words) {
             return Some(candidates);
@@ -32895,131 +33225,129 @@ impl SqlEditorWidget {
                 }
             };
 
-        let expected_database_candidates =
-            |words: &[String]| -> Option<&'static [&'static str]> {
-                let verb_pos = words
-                    .iter()
-                    .rposition(|word| matches!(word.as_str(), "ALTER" | "CREATE"))?;
-                let verb = words[verb_pos].as_str();
-                let mut idx = verb_pos + 1;
-                if !matches!(
-                    words.get(idx).map(String::as_str),
-                    Some("DATABASE" | "SCHEMA")
-                ) {
-                    return None;
-                }
-                idx += 1;
+        let expected_database_candidates = |words: &[String]| -> Option<&'static [&'static str]> {
+            let verb_pos = words
+                .iter()
+                .rposition(|word| matches!(word.as_str(), "ALTER" | "CREATE"))?;
+            let verb = words[verb_pos].as_str();
+            let mut idx = verb_pos + 1;
+            if !matches!(
+                words.get(idx).map(String::as_str),
+                Some("DATABASE" | "SCHEMA")
+            ) {
+                return None;
+            }
+            idx += 1;
 
-                if verb == "CREATE" {
-                    if idx == words.len() {
-                        return Some(&["IF"]);
+            if verb == "CREATE" {
+                if idx == words.len() {
+                    return Some(&["IF"]);
+                }
+                if words.get(idx).map(String::as_str) == Some("IF") {
+                    if idx + 1 == words.len() {
+                        return Some(&["NOT"]);
                     }
-                    if words.get(idx).map(String::as_str) == Some("IF") {
-                        if idx + 1 == words.len() {
-                            return Some(&["NOT"]);
-                        }
-                        if words.get(idx + 1).map(String::as_str) != Some("NOT") {
-                            return None;
-                        }
-                        if idx + 2 == words.len() {
-                            return Some(&["EXISTS"]);
-                        }
-                        if words.get(idx + 2).map(String::as_str) != Some("EXISTS") {
-                            return None;
-                        }
-                        idx += 3;
+                    if words.get(idx + 1).map(String::as_str) != Some("NOT") {
+                        return None;
                     }
+                    if idx + 2 == words.len() {
+                        return Some(&["EXISTS"]);
+                    }
+                    if words.get(idx + 2).map(String::as_str) != Some("EXISTS") {
+                        return None;
+                    }
+                    idx += 3;
                 }
+            }
 
-                if idx >= words.len() {
-                    return if verb == "ALTER" {
-                        Some(database_option_heads(verb))
-                    } else {
-                        None
-                    };
-                }
+            if idx >= words.len() {
+                return if verb == "ALTER" {
+                    Some(database_option_heads(verb))
+                } else {
+                    None
+                };
+            }
 
-                let current = words[idx].as_str();
-                if database_option_heads(verb).contains(&current) {
-                    return expected_database_option_candidates(words, idx, verb);
-                }
+            let current = words[idx].as_str();
+            if database_option_heads(verb).contains(&current) {
+                return expected_database_option_candidates(words, idx, verb);
+            }
 
-                idx += 1;
-                expected_database_option_candidates(words, idx, verb)
-            };
+            idx += 1;
+            expected_database_option_candidates(words, idx, verb)
+        };
 
         if let Some(candidates) = expected_database_candidates(words) {
             return Some(candidates);
         }
 
-        let expected_server_candidates =
-            |words: &[String]| -> Option<&'static [&'static str]> {
-                let verb_pos = words
-                    .iter()
-                    .rposition(|word| matches!(word.as_str(), "ALTER" | "CREATE"))?;
-                let verb = words[verb_pos].as_str();
-                let mut idx = verb_pos + 1;
-                if words.get(idx).map(String::as_str) != Some("SERVER") {
+        let expected_server_candidates = |words: &[String]| -> Option<&'static [&'static str]> {
+            let verb_pos = words
+                .iter()
+                .rposition(|word| matches!(word.as_str(), "ALTER" | "CREATE"))?;
+            let verb = words[verb_pos].as_str();
+            let mut idx = verb_pos + 1;
+            if words.get(idx).map(String::as_str) != Some("SERVER") {
+                return None;
+            }
+            idx += 1;
+
+            if verb == "CREATE" {
+                if idx >= words.len() {
                     return None;
                 }
                 idx += 1;
-
-                if verb == "CREATE" {
-                    if idx >= words.len() {
-                        return None;
-                    }
-                    idx += 1;
-                    if idx == words.len() {
-                        return Some(&["FOREIGN"]);
-                    }
-                    if words.get(idx).map(String::as_str) != Some("FOREIGN") {
-                        return None;
-                    }
-                    idx += 1;
-                    if idx == words.len() {
-                        return Some(&["DATA"]);
-                    }
-                    if words.get(idx).map(String::as_str) != Some("DATA") {
-                        return None;
-                    }
-                    idx += 1;
-                    if idx == words.len() {
-                        return Some(&["WRAPPER"]);
-                    }
-                    if words.get(idx).map(String::as_str) != Some("WRAPPER") {
-                        return None;
-                    }
-                    idx += 1;
-                    if idx >= words.len() {
-                        return None;
-                    }
-                    idx += 1;
-                    if idx == words.len() {
-                        return Some(&["OPTIONS"]);
-                    }
-                } else {
-                    if idx >= words.len() {
-                        return None;
-                    }
-                    idx += 1;
-                    if idx == words.len() {
-                        return Some(&["OPTIONS"]);
-                    }
+                if idx == words.len() {
+                    return Some(&["FOREIGN"]);
                 }
-
-                if words.get(idx).map(String::as_str) == Some("OPTIONS") {
-                    if idx + 1 == words.len() {
-                        return Some(MYSQL_SERVER_OPTION_KEYWORDS);
-                    }
-                    if MYSQL_SERVER_OPTION_KEYWORDS.contains(&words[idx + 1].as_str())
-                        && idx + 3 == words.len()
-                    {
-                        return Some(MYSQL_SERVER_OPTION_KEYWORDS);
-                    }
+                if words.get(idx).map(String::as_str) != Some("FOREIGN") {
+                    return None;
                 }
+                idx += 1;
+                if idx == words.len() {
+                    return Some(&["DATA"]);
+                }
+                if words.get(idx).map(String::as_str) != Some("DATA") {
+                    return None;
+                }
+                idx += 1;
+                if idx == words.len() {
+                    return Some(&["WRAPPER"]);
+                }
+                if words.get(idx).map(String::as_str) != Some("WRAPPER") {
+                    return None;
+                }
+                idx += 1;
+                if idx >= words.len() {
+                    return None;
+                }
+                idx += 1;
+                if idx == words.len() {
+                    return Some(&["OPTIONS"]);
+                }
+            } else {
+                if idx >= words.len() {
+                    return None;
+                }
+                idx += 1;
+                if idx == words.len() {
+                    return Some(&["OPTIONS"]);
+                }
+            }
 
-                None
-            };
+            if words.get(idx).map(String::as_str) == Some("OPTIONS") {
+                if idx + 1 == words.len() {
+                    return Some(MYSQL_SERVER_OPTION_KEYWORDS);
+                }
+                if MYSQL_SERVER_OPTION_KEYWORDS.contains(&words[idx + 1].as_str())
+                    && idx + 3 == words.len()
+                {
+                    return Some(MYSQL_SERVER_OPTION_KEYWORDS);
+                }
+            }
+
+            None
+        };
 
         if let Some(candidates) = expected_server_candidates(words) {
             return Some(candidates);
@@ -33149,10 +33477,7 @@ impl SqlEditorWidget {
             .collect();
         let account_segment_is_complete = |segment: &[String]| {
             !segment.is_empty()
-                && !matches!(
-                    segment.last().map(String::as_str),
-                    Some("@" | "." | ",")
-                )
+                && !matches!(segment.last().map(String::as_str), Some("@" | "." | ","))
         };
         let alter_user_after_auth_candidates = |tail: &[String]| -> &'static [&'static str] {
             if tail.iter().any(|item| item == "PASSWORD") {
@@ -33169,41 +33494,26 @@ impl SqlEditorWidget {
                     [a, b, c] if a == "IDENTIFIED" && b == "BY" && c == "RANDOM" => {
                         Some(&["PASSWORD"])
                     }
-                    [a, b, c]
-                        if a == "IDENTIFIED" && b == "BY" && c == "__VALUE__" =>
-                    {
+                    [a, b, c] if a == "IDENTIFIED" && b == "BY" && c == "__VALUE__" => {
                         Some(MYSQL_ALTER_USER_AUTH_TAIL_KEYWORDS)
                     }
                     [a, b, c, d]
-                        if a == "IDENTIFIED"
-                            && b == "BY"
-                            && c == "RANDOM"
-                            && d == "PASSWORD" =>
+                        if a == "IDENTIFIED" && b == "BY" && c == "RANDOM" && d == "PASSWORD" =>
                     {
                         Some(MYSQL_ALTER_USER_AUTH_TAIL_KEYWORDS)
                     }
                     [a, b] if a == "IDENTIFIED" && b == "WITH" => None,
-                    [a, b, _plugin] if a == "IDENTIFIED" && b == "WITH" => {
-                        Some(&["AS", "BY"])
-                    }
-                    [a, b, _plugin, d]
-                        if a == "IDENTIFIED" && b == "WITH" && d == "BY" =>
-                    {
+                    [a, b, _plugin] if a == "IDENTIFIED" && b == "WITH" => Some(&["AS", "BY"]),
+                    [a, b, _plugin, d] if a == "IDENTIFIED" && b == "WITH" && d == "BY" => {
                         Some(&["RANDOM"])
                     }
                     [a, b, _plugin, d, e]
-                        if a == "IDENTIFIED"
-                            && b == "WITH"
-                            && d == "BY"
-                            && e == "RANDOM" =>
+                        if a == "IDENTIFIED" && b == "WITH" && d == "BY" && e == "RANDOM" =>
                     {
                         Some(&["PASSWORD"])
                     }
                     [a, b, _plugin, d, e]
-                        if a == "IDENTIFIED"
-                            && b == "WITH"
-                            && d == "BY"
-                            && e == "__VALUE__" =>
+                        if a == "IDENTIFIED" && b == "WITH" && d == "BY" && e == "__VALUE__" =>
                     {
                         Some(MYSQL_ALTER_USER_AUTH_TAIL_KEYWORDS)
                     }
@@ -33218,10 +33528,7 @@ impl SqlEditorWidget {
                     }
                     [a, b, _plugin, d] if a == "IDENTIFIED" && b == "WITH" && d == "AS" => None,
                     [a, b, _plugin, d, e]
-                        if a == "IDENTIFIED"
-                            && b == "WITH"
-                            && d == "AS"
-                            && e == "__VALUE__" =>
+                        if a == "IDENTIFIED" && b == "WITH" && d == "AS" && e == "__VALUE__" =>
                     {
                         Some(MYSQL_ALTER_USER_AFTER_AUTH_KEYWORDS)
                     }
@@ -33245,7 +33552,10 @@ impl SqlEditorWidget {
                     [a, b] if a == "REQUIRE" && matches!(b.as_str(), "SSL" | "X509") => {
                         Some(MYSQL_ALTER_USER_REQUIRE_AFTER_TLS_KEYWORDS)
                     }
-                    [a, b] if a == "REQUIRE" && matches!(b.as_str(), "CIPHER" | "ISSUER" | "SUBJECT") => {
+                    [a, b]
+                        if a == "REQUIRE"
+                            && matches!(b.as_str(), "CIPHER" | "ISSUER" | "SUBJECT") =>
+                    {
                         None
                     }
                     [a, b, c]
@@ -33274,9 +33584,7 @@ impl SqlEditorWidget {
                         Some(MYSQL_ALTER_USER_AFTER_AUTH_KEYWORDS)
                     }
                     [a, b, c] if a == "PASSWORD" && b == "EXPIRE" && c == "INTERVAL" => None,
-                    [a, b, c, _n]
-                        if a == "PASSWORD" && b == "EXPIRE" && c == "INTERVAL" =>
-                    {
+                    [a, b, c, _n] if a == "PASSWORD" && b == "EXPIRE" && c == "INTERVAL" => {
                         Some(&["DAY"])
                     }
                     [a, b] if a == "PASSWORD" && b == "HISTORY" => Some(&["DEFAULT"]),
@@ -33288,10 +33596,7 @@ impl SqlEditorWidget {
                         Some(&["DEFAULT"])
                     }
                     [a, b, c, d]
-                        if a == "PASSWORD"
-                            && b == "REUSE"
-                            && c == "INTERVAL"
-                            && d != "DEFAULT" =>
+                        if a == "PASSWORD" && b == "REUSE" && c == "INTERVAL" && d != "DEFAULT" =>
                     {
                         Some(&["DAY"])
                     }
@@ -33320,16 +33625,11 @@ impl SqlEditorWidget {
                     [a, b, c] if a == "IDENTIFIED" && b == "BY" && c == "RANDOM" => {
                         Some(&["PASSWORD"])
                     }
-                    [a, b, c]
-                        if a == "IDENTIFIED" && b == "BY" && c == "__VALUE__" =>
-                    {
+                    [a, b, c] if a == "IDENTIFIED" && b == "BY" && c == "__VALUE__" => {
                         Some(MYSQL_CREATE_USER_AFTER_AUTH_KEYWORDS)
                     }
                     [a, b, c, d]
-                        if a == "IDENTIFIED"
-                            && b == "BY"
-                            && c == "RANDOM"
-                            && d == "PASSWORD" =>
+                        if a == "IDENTIFIED" && b == "BY" && c == "RANDOM" && d == "PASSWORD" =>
                     {
                         Some(MYSQL_CREATE_USER_AFTER_AUTH_KEYWORDS)
                     }
@@ -33337,24 +33637,16 @@ impl SqlEditorWidget {
                     [a, b, _plugin] if a == "IDENTIFIED" && b == "WITH" => {
                         Some(&["AND", "AS", "BY", "INITIAL"])
                     }
-                    [a, b, _plugin, d]
-                        if a == "IDENTIFIED" && b == "WITH" && d == "BY" =>
-                    {
+                    [a, b, _plugin, d] if a == "IDENTIFIED" && b == "WITH" && d == "BY" => {
                         Some(&["RANDOM"])
                     }
                     [a, b, _plugin, d, e]
-                        if a == "IDENTIFIED"
-                            && b == "WITH"
-                            && d == "BY"
-                            && e == "RANDOM" =>
+                        if a == "IDENTIFIED" && b == "WITH" && d == "BY" && e == "RANDOM" =>
                     {
                         Some(&["PASSWORD"])
                     }
                     [a, b, _plugin, d, e]
-                        if a == "IDENTIFIED"
-                            && b == "WITH"
-                            && d == "BY"
-                            && e == "__VALUE__" =>
+                        if a == "IDENTIFIED" && b == "WITH" && d == "BY" && e == "__VALUE__" =>
                     {
                         Some(MYSQL_CREATE_USER_AFTER_AUTH_KEYWORDS)
                     }
@@ -33367,22 +33659,15 @@ impl SqlEditorWidget {
                     {
                         Some(MYSQL_CREATE_USER_AFTER_AUTH_KEYWORDS)
                     }
-                    [a, b, _plugin, d] if a == "IDENTIFIED" && b == "WITH" && d == "AS" => {
-                        None
-                    }
+                    [a, b, _plugin, d] if a == "IDENTIFIED" && b == "WITH" && d == "AS" => None,
                     [a, b, _plugin, d, e]
-                        if a == "IDENTIFIED"
-                            && b == "WITH"
-                            && d == "AS"
-                            && e == "__VALUE__" =>
+                        if a == "IDENTIFIED" && b == "WITH" && d == "AS" && e == "__VALUE__" =>
                     {
                         Some(MYSQL_CREATE_USER_AFTER_AUTH_KEYWORDS)
                     }
                     [.., last] if last == "AND" => Some(&["IDENTIFIED"]),
                     [.., last] if last == "INITIAL" => Some(&["AUTHENTICATION"]),
-                    [.., a, b] if a == "INITIAL" && b == "AUTHENTICATION" => {
-                        Some(&["IDENTIFIED"])
-                    }
+                    [.., a, b] if a == "INITIAL" && b == "AUTHENTICATION" => Some(&["IDENTIFIED"]),
                     [.., a, b, c]
                         if a == "INITIAL" && b == "AUTHENTICATION" && c == "IDENTIFIED" =>
                     {
@@ -33559,122 +33844,117 @@ impl SqlEditorWidget {
             return Some(candidates);
         }
 
-        let expected_alter_user_candidates =
-            |items: &[String]| -> Option<&'static [&'static str]> {
-                if !matches!(
-                    items,
-                    [a, b, ..] if a == "ALTER" && b == "USER"
-                ) {
-                    return None;
-                }
-                let mut idx = 2;
+        let expected_alter_user_candidates = |items: &[String]| -> Option<&'static [&'static str]> {
+            if !matches!(
+                items,
+                [a, b, ..] if a == "ALTER" && b == "USER"
+            ) {
+                return None;
+            }
+            let mut idx = 2;
+            if idx == items.len() {
+                return Some(&["IF"]);
+            }
+            if items.get(idx).map(String::as_str) == Some("IF") {
+                idx += 1;
                 if idx == items.len() {
-                    return Some(&["IF"]);
+                    return Some(&["EXISTS"]);
                 }
-                if items.get(idx).map(String::as_str) == Some("IF") {
-                    idx += 1;
-                    if idx == items.len() {
-                        return Some(&["EXISTS"]);
-                    }
-                    if items.get(idx).map(String::as_str) != Some("EXISTS") {
-                        return None;
-                    }
-                    idx += 1;
-                }
-                if idx >= items.len() {
+                if items.get(idx).map(String::as_str) != Some("EXISTS") {
                     return None;
                 }
+                idx += 1;
+            }
+            if idx >= items.len() {
+                return None;
+            }
 
-                let after_user = &items[idx..];
-                let option_start = after_user
-                    .iter()
-                    .position(|item| MYSQL_ALTER_USER_OPTION_HEAD_KEYWORDS.contains(&item.as_str()));
-                let account_segment = &after_user[..option_start.unwrap_or(after_user.len())];
-                if !account_segment_is_complete(account_segment) {
-                    if option_start.is_some() {
-                        return Some(&[]);
-                    }
-                    return None;
+            let after_user = &items[idx..];
+            let option_start = after_user
+                .iter()
+                .position(|item| MYSQL_ALTER_USER_OPTION_HEAD_KEYWORDS.contains(&item.as_str()));
+            let account_segment = &after_user[..option_start.unwrap_or(after_user.len())];
+            if !account_segment_is_complete(account_segment) {
+                if option_start.is_some() {
+                    return Some(&[]);
                 }
-                let Some(option_start) = option_start else {
-                    return Some(MYSQL_ALTER_USER_OPTION_HEAD_KEYWORDS);
-                };
-                let tail = &after_user[option_start..];
-                match tail.first().map(String::as_str) {
-                    Some("IDENTIFIED") => expected_alter_user_auth_candidates(tail),
-                    Some("DISCARD") => match tail {
-                        [word] if word == "DISCARD" => Some(&["OLD"]),
-                        [a, b] if a == "DISCARD" && b == "OLD" => Some(&["PASSWORD"]),
-                        [a, b, c] if a == "DISCARD" && b == "OLD" && c == "PASSWORD" => {
-                            Some(MYSQL_ALTER_USER_AFTER_AUTH_KEYWORDS)
-                        }
-                        _ => None,
-                    },
-                    Some("ADD" | "MODIFY") => match tail {
-                        [.., factor] if matches!(factor.as_str(), "2" | "3") => {
-                            Some(&["FACTOR"])
-                        }
-                        [.., factor, last]
-                            if matches!(factor.as_str(), "2" | "3") && last == "FACTOR" =>
-                        {
-                            Some(&["IDENTIFIED"])
-                        }
-                        _ => None,
-                    },
-                    Some("DROP") => match tail {
-                        [.., factor] if matches!(factor.as_str(), "2" | "3") => {
-                            Some(&["FACTOR"])
-                        }
-                        [.., factor, last]
-                            if matches!(factor.as_str(), "2" | "3") && last == "FACTOR" =>
-                        {
-                            Some(MYSQL_ALTER_USER_AFTER_AUTH_KEYWORDS)
-                        }
-                        _ => None,
-                    },
-                    Some("REQUIRE") => expected_alter_user_require_candidates(tail),
-                    Some("WITH") => match tail {
-                        [word] if word == "WITH" => Some(MYSQL_ALTER_USER_RESOURCE_KEYWORDS),
-                        [.., option, _value]
-                            if MYSQL_ALTER_USER_RESOURCE_KEYWORDS.contains(&option.as_str()) =>
-                        {
-                            Some(MYSQL_ALTER_USER_RESOURCE_KEYWORDS)
-                        }
-                        _ => None,
-                    },
-                    Some("PASSWORD") => expected_alter_user_password_candidates(tail),
-                    Some("FAILED_LOGIN_ATTEMPTS") => {
-                        if tail.len() >= 2 {
-                            Some(MYSQL_ALTER_USER_AFTER_AUTH_KEYWORDS)
-                        } else {
-                            None
-                        }
-                    }
-                    Some("PASSWORD_LOCK_TIME") => {
-                        if tail.len() >= 2 {
-                            Some(MYSQL_ALTER_USER_AFTER_AUTH_KEYWORDS)
-                        } else {
-                            Some(&["UNBOUNDED"])
-                        }
-                    }
-                    Some("ACCOUNT") => match tail {
-                        [word] if word == "ACCOUNT" => Some(&["LOCK", "UNLOCK"]),
-                        [a, b] if a == "ACCOUNT" && matches!(b.as_str(), "LOCK" | "UNLOCK") => {
-                            Some(MYSQL_ALTER_USER_AFTER_AUTH_KEYWORDS)
-                        }
-                        _ => None,
-                    },
-                    Some("DEFAULT") => match tail {
-                        [word] if word == "DEFAULT" => Some(&["ROLE"]),
-                        [a, b] if a == "DEFAULT" && b == "ROLE" => {
-                            Some(MYSQL_ALTER_USER_DEFAULT_ROLE_KEYWORDS)
-                        }
-                        _ => None,
-                    },
-                    Some("COMMENT" | "ATTRIBUTE") => None,
-                    _ => None,
-                }
+                return None;
+            }
+            let Some(option_start) = option_start else {
+                return Some(MYSQL_ALTER_USER_OPTION_HEAD_KEYWORDS);
             };
+            let tail = &after_user[option_start..];
+            match tail.first().map(String::as_str) {
+                Some("IDENTIFIED") => expected_alter_user_auth_candidates(tail),
+                Some("DISCARD") => match tail {
+                    [word] if word == "DISCARD" => Some(&["OLD"]),
+                    [a, b] if a == "DISCARD" && b == "OLD" => Some(&["PASSWORD"]),
+                    [a, b, c] if a == "DISCARD" && b == "OLD" && c == "PASSWORD" => {
+                        Some(MYSQL_ALTER_USER_AFTER_AUTH_KEYWORDS)
+                    }
+                    _ => None,
+                },
+                Some("ADD" | "MODIFY") => match tail {
+                    [.., factor] if matches!(factor.as_str(), "2" | "3") => Some(&["FACTOR"]),
+                    [.., factor, last]
+                        if matches!(factor.as_str(), "2" | "3") && last == "FACTOR" =>
+                    {
+                        Some(&["IDENTIFIED"])
+                    }
+                    _ => None,
+                },
+                Some("DROP") => match tail {
+                    [.., factor] if matches!(factor.as_str(), "2" | "3") => Some(&["FACTOR"]),
+                    [.., factor, last]
+                        if matches!(factor.as_str(), "2" | "3") && last == "FACTOR" =>
+                    {
+                        Some(MYSQL_ALTER_USER_AFTER_AUTH_KEYWORDS)
+                    }
+                    _ => None,
+                },
+                Some("REQUIRE") => expected_alter_user_require_candidates(tail),
+                Some("WITH") => match tail {
+                    [word] if word == "WITH" => Some(MYSQL_ALTER_USER_RESOURCE_KEYWORDS),
+                    [.., option, _value]
+                        if MYSQL_ALTER_USER_RESOURCE_KEYWORDS.contains(&option.as_str()) =>
+                    {
+                        Some(MYSQL_ALTER_USER_RESOURCE_KEYWORDS)
+                    }
+                    _ => None,
+                },
+                Some("PASSWORD") => expected_alter_user_password_candidates(tail),
+                Some("FAILED_LOGIN_ATTEMPTS") => {
+                    if tail.len() >= 2 {
+                        Some(MYSQL_ALTER_USER_AFTER_AUTH_KEYWORDS)
+                    } else {
+                        None
+                    }
+                }
+                Some("PASSWORD_LOCK_TIME") => {
+                    if tail.len() >= 2 {
+                        Some(MYSQL_ALTER_USER_AFTER_AUTH_KEYWORDS)
+                    } else {
+                        Some(&["UNBOUNDED"])
+                    }
+                }
+                Some("ACCOUNT") => match tail {
+                    [word] if word == "ACCOUNT" => Some(&["LOCK", "UNLOCK"]),
+                    [a, b] if a == "ACCOUNT" && matches!(b.as_str(), "LOCK" | "UNLOCK") => {
+                        Some(MYSQL_ALTER_USER_AFTER_AUTH_KEYWORDS)
+                    }
+                    _ => None,
+                },
+                Some("DEFAULT") => match tail {
+                    [word] if word == "DEFAULT" => Some(&["ROLE"]),
+                    [a, b] if a == "DEFAULT" && b == "ROLE" => {
+                        Some(MYSQL_ALTER_USER_DEFAULT_ROLE_KEYWORDS)
+                    }
+                    _ => None,
+                },
+                Some("COMMENT" | "ATTRIBUTE") => None,
+                _ => None,
+            }
+        };
 
         if let Some(candidates) = expected_alter_user_candidates(&user_statement_items) {
             return Some(candidates);
@@ -33722,8 +34002,7 @@ impl SqlEditorWidget {
             })
         };
         let table_name_segment_is_complete = |segment: &[String]| {
-            !segment.is_empty()
-                && !matches!(segment.last().map(String::as_str), Some("," | "."))
+            !segment.is_empty() && !matches!(segment.last().map(String::as_str), Some("," | "."))
         };
         let expected_analyze_table_candidates =
             |tail: &[String], table_segment: &[String]| -> Option<&'static [&'static str]> {
@@ -33739,9 +34018,7 @@ impl SqlEditorWidget {
                 match tail {
                     [word] if word == "UPDATE" => Some(&["HISTOGRAM"]),
                     [a, b] if a == "UPDATE" && b == "HISTOGRAM" => Some(&["ON"]),
-                    [a, b, c, cols @ ..]
-                        if a == "UPDATE" && b == "HISTOGRAM" && c == "ON" =>
-                    {
+                    [a, b, c, cols @ ..] if a == "UPDATE" && b == "HISTOGRAM" && c == "ON" => {
                         if !table_name_segment_is_complete(cols) {
                             return None;
                         }
@@ -33785,7 +34062,10 @@ impl SqlEditorWidget {
         let expected_table_maintenance_candidates =
             |items: &[String]| -> Option<&'static [&'static str]> {
                 let verb = items.first()?.as_str();
-                if !matches!(verb, "ANALYZE" | "CHECK" | "CHECKSUM" | "OPTIMIZE" | "REPAIR") {
+                if !matches!(
+                    verb,
+                    "ANALYZE" | "CHECK" | "CHECKSUM" | "OPTIMIZE" | "REPAIR"
+                ) {
                     return None;
                 }
 
@@ -33859,9 +34139,9 @@ impl SqlEditorWidget {
                     }
                     "REPAIR" => {
                         if tail.is_empty()
-                            || tail
-                                .last()
-                                .is_some_and(|last| MYSQL_REPAIR_TABLE_OPTION_KEYWORDS.contains(&last.as_str()))
+                            || tail.last().is_some_and(|last| {
+                                MYSQL_REPAIR_TABLE_OPTION_KEYWORDS.contains(&last.as_str())
+                            })
                         {
                             Some(MYSQL_REPAIR_TABLE_OPTION_KEYWORDS)
                         } else {
@@ -33989,7 +34269,9 @@ impl SqlEditorWidget {
                         Some(head)
                     }
                     [rows] if kind == "XML" && rows == "ROWS" => Some(&["IDENTIFIED"]),
-                    [rows, identified] if kind == "XML" && rows == "ROWS" && identified == "IDENTIFIED" => {
+                    [rows, identified]
+                        if kind == "XML" && rows == "ROWS" && identified == "IDENTIFIED" =>
+                    {
                         Some(&["BY"])
                     }
                     [rows, identified, by, _value]
@@ -34009,11 +34291,7 @@ impl SqlEditorWidget {
         }
 
         if let Some(candidates) =
-            Self::expected_mysql_select_into_file_keyword_candidates(
-                tokens,
-                end,
-                Some(crate::db::DatabaseType::MySQL),
-            )
+            Self::expected_mysql_select_into_file_keyword_candidates(tokens, end, db_type)
         {
             return Some(candidates);
         }
@@ -34131,9 +34409,9 @@ impl SqlEditorWidget {
             };
         let expected_resource_group_candidates =
             |items: &[String]| -> Option<&'static [&'static str]> {
-                let verb_pos = items
-                    .iter()
-                    .position(|word| matches!(word.as_str(), "ALTER" | "CREATE" | "DROP" | "SET"))?;
+                let verb_pos = items.iter().position(|word| {
+                    matches!(word.as_str(), "ALTER" | "CREATE" | "DROP" | "SET")
+                })?;
                 let verb = items[verb_pos].as_str();
                 let mut idx = verb_pos + 1;
 
@@ -34209,229 +34487,219 @@ impl SqlEditorWidget {
                     [.., option, _value] if option_heads.contains(&option.as_str())
                 )
             };
-        let disk_data_option_tail_candidates =
-            |items: &[String],
-             option_start: usize,
-             option_heads: &'static [&'static str]|
-             -> Option<&'static [&'static str]> {
-                if option_start == items.len() {
-                    return Some(option_heads);
+        let disk_data_option_tail_candidates = |items: &[String],
+                                                option_start: usize,
+                                                option_heads: &'static [&'static str]|
+         -> Option<&'static [&'static str]> {
+            if option_start == items.len() {
+                return Some(option_heads);
+            }
+            if option_start > items.len() {
+                return None;
+            }
+            let tail = &items[option_start..];
+            match tail {
+                [last] if *last == "WAIT" => Some(option_heads),
+                [.., option, _value] if option_heads.contains(&option.as_str()) => {
+                    Some(option_heads)
                 }
-                if option_start > items.len() {
+                _ => None,
+            }
+        };
+        let expected_disk_data_candidates = |items: &[String]| -> Option<&'static [&'static str]> {
+            let verb_pos = items
+                .iter()
+                .position(|word| matches!(word.as_str(), "ALTER" | "CREATE" | "DROP"))?;
+            let verb = items[verb_pos].as_str();
+            let mut idx = verb_pos + 1;
+
+            if matches!(verb, "ALTER" | "CREATE" | "DROP")
+                && items.get(idx).map(String::as_str) == Some("UNDO")
+            {
+                if idx + 1 == items.len() {
+                    return Some(&["TABLESPACE"]);
+                }
+                idx += 1;
+            }
+
+            if items.get(idx).map(String::as_str) == Some("TABLESPACE") {
+                idx += 1;
+                if verb == "DROP" {
                     return None;
                 }
-                let tail = &items[option_start..];
-                match tail {
-                    [last] if *last == "WAIT" => Some(option_heads),
-                    [.., option, _value] if option_heads.contains(&option.as_str()) => {
-                        Some(option_heads)
-                    }
-                    _ => None,
+                if idx >= items.len() {
+                    return None;
                 }
-            };
-        let expected_disk_data_candidates =
-            |items: &[String]| -> Option<&'static [&'static str]> {
-                let verb_pos = items
-                    .iter()
-                    .position(|word| matches!(word.as_str(), "ALTER" | "CREATE" | "DROP"))?;
-                let verb = items[verb_pos].as_str();
-                let mut idx = verb_pos + 1;
-
-                if matches!(verb, "ALTER" | "CREATE" | "DROP")
-                    && items.get(idx).map(String::as_str) == Some("UNDO")
-                {
-                    if idx + 1 == items.len() {
-                        return Some(&["TABLESPACE"]);
-                    }
-                    idx += 1;
+                idx += 1;
+                if idx == items.len() {
+                    return if verb == "ALTER" {
+                        Some(MYSQL_TABLESPACE_ALTER_OPTION_HEAD_KEYWORDS)
+                    } else {
+                        Some(MYSQL_TABLESPACE_CREATE_OPTION_HEAD_KEYWORDS)
+                    };
                 }
 
-                if items.get(idx).map(String::as_str) == Some("TABLESPACE") {
-                    idx += 1;
-                    if verb == "DROP" {
-                        return None;
-                    }
-                    if idx >= items.len() {
-                        return None;
-                    }
-                    idx += 1;
-                    if idx == items.len() {
-                        return if verb == "ALTER" {
-                            Some(MYSQL_TABLESPACE_ALTER_OPTION_HEAD_KEYWORDS)
-                        } else {
-                            Some(MYSQL_TABLESPACE_CREATE_OPTION_HEAD_KEYWORDS)
-                        };
-                    }
-
-                    match items.get(idx).map(String::as_str) {
-                        Some("ADD" | "DROP") if verb == "ALTER" => {
-                            if idx + 1 == items.len() {
-                                return Some(&["DATAFILE"]);
-                            }
-                            if items.get(idx + 1).map(String::as_str) == Some("DATAFILE")
-                            {
-                                return disk_data_option_tail_candidates(
-                                    items,
-                                    idx + 3,
-                                    MYSQL_TABLESPACE_ALTER_AFTER_FILE_KEYWORDS,
-                                );
-                            }
+                match items.get(idx).map(String::as_str) {
+                    Some("ADD" | "DROP") if verb == "ALTER" => {
+                        if idx + 1 == items.len() {
+                            return Some(&["DATAFILE"]);
                         }
-                        Some("ADD") if verb == "CREATE" => {
-                            if idx + 1 == items.len() {
-                                return Some(&["DATAFILE"]);
+                        if items.get(idx + 1).map(String::as_str) == Some("DATAFILE") {
+                            return disk_data_option_tail_candidates(
+                                items,
+                                idx + 3,
+                                MYSQL_TABLESPACE_ALTER_AFTER_FILE_KEYWORDS,
+                            );
+                        }
+                    }
+                    Some("ADD") if verb == "CREATE" => {
+                        if idx + 1 == items.len() {
+                            return Some(&["DATAFILE"]);
+                        }
+                        if items.get(idx + 1).map(String::as_str) == Some("DATAFILE") {
+                            return disk_data_option_tail_candidates(
+                                items,
+                                idx + 3,
+                                MYSQL_TABLESPACE_CREATE_AFTER_FILE_KEYWORDS,
+                            );
+                        }
+                    }
+                    Some("USE") if verb == "CREATE" => {
+                        if idx + 1 == items.len() {
+                            return Some(&["LOGFILE"]);
+                        }
+                        if items.get(idx + 1).map(String::as_str) == Some("LOGFILE") {
+                            if idx + 2 == items.len() {
+                                return Some(&["GROUP"]);
                             }
-                            if items.get(idx + 1).map(String::as_str) == Some("DATAFILE")
-                            {
+                            if items.get(idx + 2).map(String::as_str) == Some("GROUP") {
                                 return disk_data_option_tail_candidates(
                                     items,
-                                    idx + 3,
+                                    idx + 4,
                                     MYSQL_TABLESPACE_CREATE_AFTER_FILE_KEYWORDS,
                                 );
                             }
                         }
-                        Some("USE") if verb == "CREATE" => {
-                            if idx + 1 == items.len() {
-                                return Some(&["LOGFILE"]);
-                            }
-                            if items.get(idx + 1).map(String::as_str) == Some("LOGFILE") {
-                                if idx + 2 == items.len() {
-                                    return Some(&["GROUP"]);
-                                }
-                                if items.get(idx + 2).map(String::as_str) == Some("GROUP")
-                                {
-                                    return disk_data_option_tail_candidates(
-                                        items,
-                                        idx + 4,
-                                        MYSQL_TABLESPACE_CREATE_AFTER_FILE_KEYWORDS,
-                                    );
-                                }
-                            }
-                        }
-                        Some("RENAME") if verb == "ALTER" => {
-                            if idx + 1 == items.len() {
-                                return Some(&["TO"]);
-                            }
-                        }
-                        Some("SET") if verb == "ALTER" => {
-                            if idx + 1 == items.len() {
-                                return Some(&["ACTIVE", "INACTIVE"]);
-                            }
-                        }
-                        Some("WAIT") => {
-                            return if verb == "ALTER" {
-                                Some(MYSQL_TABLESPACE_ALTER_OPTION_HEAD_KEYWORDS)
-                            } else {
-                                Some(MYSQL_TABLESPACE_CREATE_AFTER_FILE_KEYWORDS)
-                            };
-                        }
-                        Some(option)
-                            if verb == "ALTER"
-                                && MYSQL_TABLESPACE_ALTER_OPTION_HEAD_KEYWORDS
-                                    .contains(&option) =>
-                        {
-                            if disk_data_option_after_value(
-                                items,
-                                MYSQL_TABLESPACE_ALTER_OPTION_HEAD_KEYWORDS,
-                            ) {
-                                return Some(MYSQL_TABLESPACE_ALTER_OPTION_HEAD_KEYWORDS);
-                            }
-                        }
-                        Some(option)
-                            if verb == "CREATE"
-                                && MYSQL_TABLESPACE_CREATE_AFTER_FILE_KEYWORDS
-                                    .contains(&option) =>
-                        {
-                            if disk_data_option_after_value(
-                                items,
-                                MYSQL_TABLESPACE_CREATE_AFTER_FILE_KEYWORDS,
-                            ) {
-                                return Some(MYSQL_TABLESPACE_CREATE_AFTER_FILE_KEYWORDS);
-                            }
-                        }
-                        _ => {}
                     }
-                    return None;
-                }
-
-                if items.get(idx).map(String::as_str) == Some("LOGFILE") {
-                    if idx + 1 == items.len() {
-                        return Some(&["GROUP"]);
+                    Some("RENAME") if verb == "ALTER" => {
+                        if idx + 1 == items.len() {
+                            return Some(&["TO"]);
+                        }
                     }
-                    if items.get(idx + 1).map(String::as_str) != Some("GROUP") {
-                        return None;
+                    Some("SET") if verb == "ALTER" => {
+                        if idx + 1 == items.len() {
+                            return Some(&["ACTIVE", "INACTIVE"]);
+                        }
                     }
-                    idx += 2;
-                    if idx >= items.len() {
-                        return None;
-                    }
-                    idx += 1;
-                    if idx == items.len() {
-                        return match verb {
-                            "CREATE" | "ALTER" => Some(&["ADD"]),
-                            "DROP" => Some(&["ENGINE"]),
-                            _ => None,
+                    Some("WAIT") => {
+                        return if verb == "ALTER" {
+                            Some(MYSQL_TABLESPACE_ALTER_OPTION_HEAD_KEYWORDS)
+                        } else {
+                            Some(MYSQL_TABLESPACE_CREATE_AFTER_FILE_KEYWORDS)
                         };
                     }
-                    match items.get(idx).map(String::as_str) {
-                        Some("ADD") if matches!(verb, "ALTER" | "CREATE") => {
-                            if idx + 1 == items.len() {
-                                return Some(&["UNDOFILE"]);
-                            }
-                            if items.get(idx + 1).map(String::as_str) == Some("UNDOFILE")
-                            {
-                                return if verb == "ALTER" {
-                                    disk_data_option_tail_candidates(
-                                        items,
-                                        idx + 3,
-                                        MYSQL_LOGFILE_ALTER_OPTION_HEAD_KEYWORDS,
-                                    )
-                                } else {
-                                    disk_data_option_tail_candidates(
-                                        items,
-                                        idx + 3,
-                                        MYSQL_LOGFILE_CREATE_OPTION_HEAD_KEYWORDS,
-                                    )
-                                };
-                            }
+                    Some(option)
+                        if verb == "ALTER"
+                            && MYSQL_TABLESPACE_ALTER_OPTION_HEAD_KEYWORDS.contains(&option) =>
+                    {
+                        if disk_data_option_after_value(
+                            items,
+                            MYSQL_TABLESPACE_ALTER_OPTION_HEAD_KEYWORDS,
+                        ) {
+                            return Some(MYSQL_TABLESPACE_ALTER_OPTION_HEAD_KEYWORDS);
                         }
-                        Some("WAIT") if matches!(verb, "ALTER" | "CREATE") => {
+                    }
+                    Some(option)
+                        if verb == "CREATE"
+                            && MYSQL_TABLESPACE_CREATE_AFTER_FILE_KEYWORDS.contains(&option) =>
+                    {
+                        if disk_data_option_after_value(
+                            items,
+                            MYSQL_TABLESPACE_CREATE_AFTER_FILE_KEYWORDS,
+                        ) {
+                            return Some(MYSQL_TABLESPACE_CREATE_AFTER_FILE_KEYWORDS);
+                        }
+                    }
+                    _ => {}
+                }
+                return None;
+            }
+
+            if items.get(idx).map(String::as_str) == Some("LOGFILE") {
+                if idx + 1 == items.len() {
+                    return Some(&["GROUP"]);
+                }
+                if items.get(idx + 1).map(String::as_str) != Some("GROUP") {
+                    return None;
+                }
+                idx += 2;
+                if idx >= items.len() {
+                    return None;
+                }
+                idx += 1;
+                if idx == items.len() {
+                    return match verb {
+                        "CREATE" | "ALTER" => Some(&["ADD"]),
+                        "DROP" => Some(&["ENGINE"]),
+                        _ => None,
+                    };
+                }
+                match items.get(idx).map(String::as_str) {
+                    Some("ADD") if matches!(verb, "ALTER" | "CREATE") => {
+                        if idx + 1 == items.len() {
+                            return Some(&["UNDOFILE"]);
+                        }
+                        if items.get(idx + 1).map(String::as_str) == Some("UNDOFILE") {
                             return if verb == "ALTER" {
-                                Some(MYSQL_LOGFILE_ALTER_OPTION_HEAD_KEYWORDS)
+                                disk_data_option_tail_candidates(
+                                    items,
+                                    idx + 3,
+                                    MYSQL_LOGFILE_ALTER_OPTION_HEAD_KEYWORDS,
+                                )
                             } else {
-                                Some(MYSQL_LOGFILE_CREATE_OPTION_HEAD_KEYWORDS)
+                                disk_data_option_tail_candidates(
+                                    items,
+                                    idx + 3,
+                                    MYSQL_LOGFILE_CREATE_OPTION_HEAD_KEYWORDS,
+                                )
                             };
                         }
-                        Some(option)
-                            if verb == "CREATE"
-                                && MYSQL_LOGFILE_CREATE_OPTION_HEAD_KEYWORDS
-                                    .contains(&option) =>
-                        {
-                            if disk_data_option_after_value(
-                                items,
-                                MYSQL_LOGFILE_CREATE_OPTION_HEAD_KEYWORDS,
-                            ) {
-                                return Some(MYSQL_LOGFILE_CREATE_OPTION_HEAD_KEYWORDS);
-                            }
-                        }
-                        Some(option)
-                            if verb == "ALTER"
-                                && MYSQL_LOGFILE_ALTER_OPTION_HEAD_KEYWORDS
-                                    .contains(&option) =>
-                        {
-                            if disk_data_option_after_value(
-                                items,
-                                MYSQL_LOGFILE_ALTER_OPTION_HEAD_KEYWORDS,
-                            ) {
-                                return Some(MYSQL_LOGFILE_ALTER_OPTION_HEAD_KEYWORDS);
-                            }
-                        }
-                        _ => {}
                     }
+                    Some("WAIT") if matches!(verb, "ALTER" | "CREATE") => {
+                        return if verb == "ALTER" {
+                            Some(MYSQL_LOGFILE_ALTER_OPTION_HEAD_KEYWORDS)
+                        } else {
+                            Some(MYSQL_LOGFILE_CREATE_OPTION_HEAD_KEYWORDS)
+                        };
+                    }
+                    Some(option)
+                        if verb == "CREATE"
+                            && MYSQL_LOGFILE_CREATE_OPTION_HEAD_KEYWORDS.contains(&option) =>
+                    {
+                        if disk_data_option_after_value(
+                            items,
+                            MYSQL_LOGFILE_CREATE_OPTION_HEAD_KEYWORDS,
+                        ) {
+                            return Some(MYSQL_LOGFILE_CREATE_OPTION_HEAD_KEYWORDS);
+                        }
+                    }
+                    Some(option)
+                        if verb == "ALTER"
+                            && MYSQL_LOGFILE_ALTER_OPTION_HEAD_KEYWORDS.contains(&option) =>
+                    {
+                        if disk_data_option_after_value(
+                            items,
+                            MYSQL_LOGFILE_ALTER_OPTION_HEAD_KEYWORDS,
+                        ) {
+                            return Some(MYSQL_LOGFILE_ALTER_OPTION_HEAD_KEYWORDS);
+                        }
+                    }
+                    _ => {}
                 }
+            }
 
-                None
-            };
+            None
+        };
 
         if let Some(candidates) = expected_disk_data_candidates(&disk_data_items) {
             return Some(candidates);
@@ -34448,7 +34716,9 @@ impl SqlEditorWidget {
                         Some(&["FILTER", "SOURCE"])
                     }
                     [change, replication, source]
-                        if change == "CHANGE" && replication == "REPLICATION" && source == "SOURCE" =>
+                        if change == "CHANGE"
+                            && replication == "REPLICATION"
+                            && source == "SOURCE" =>
                     {
                         Some(&["TO"])
                     }
@@ -34480,7 +34750,9 @@ impl SqlEditorWidget {
                         None
                     }
                     [change, replication, filter, tail @ ..]
-                        if change == "CHANGE" && replication == "REPLICATION" && filter == "FILTER" =>
+                        if change == "CHANGE"
+                            && replication == "REPLICATION"
+                            && filter == "FILTER" =>
                     {
                         if tail.is_empty()
                             || matches!(
@@ -34547,7 +34819,8 @@ impl SqlEditorWidget {
 
         match words {
             [.., a, b]
-                if *a == "CREATE" && MYSQL_CREATE_IF_NOT_EXISTS_OBJECT_TYPES.contains(&b.as_str()) =>
+                if *a == "CREATE"
+                    && MYSQL_CREATE_IF_NOT_EXISTS_OBJECT_TYPES.contains(&b.as_str()) =>
             {
                 Some(&["IF"])
             }
@@ -34566,11 +34839,7 @@ impl SqlEditorWidget {
             {
                 Some(&["EXISTS"])
             }
-            [.., a, b, c]
-                if *a == "CREATE" && *b == "TEMPORARY" && *c == "TABLE" =>
-            {
-                Some(&["IF"])
-            }
+            [.., a, b, c] if *a == "CREATE" && *b == "TEMPORARY" && *c == "TABLE" => Some(&["IF"]),
             [.., a, b, c, d]
                 if *a == "CREATE" && *b == "TEMPORARY" && *c == "TABLE" && *d == "IF" =>
             {
@@ -34597,37 +34866,23 @@ impl SqlEditorWidget {
             {
                 Some(&["EXISTS"])
             }
-            [.., a, b, c]
-                if *a == "DROP" && *b == "TEMPORARY" && *c == "TABLE" =>
-            {
-                Some(&["IF"])
-            }
+            [.., a, b, c] if *a == "DROP" && *b == "TEMPORARY" && *c == "TABLE" => Some(&["IF"]),
             [.., a, b, c, d]
                 if *a == "DROP" && *b == "TEMPORARY" && *c == "TABLE" && *d == "IF" =>
             {
                 Some(&["EXISTS"])
             }
-            [.., a, b]
-                if *a == "CREATE" && MYSQL_CREATE_INDEX_MODIFIERS.contains(&b.as_str()) =>
-            {
+            [.., a, b] if *a == "CREATE" && MYSQL_CREATE_INDEX_MODIFIERS.contains(&b.as_str()) => {
                 if *b == "SPATIAL" {
                     Some(&["INDEX", "REFERENCE"])
                 } else {
                     Some(&["INDEX"])
                 }
             }
-            [.., a, b, c]
-                if *a == "CREATE"
-                    && *b == "SPATIAL"
-                    && *c == "REFERENCE" =>
-            {
+            [.., a, b, c] if *a == "CREATE" && *b == "SPATIAL" && *c == "REFERENCE" => {
                 Some(&["SYSTEM"])
             }
-            [.., a, b, _index_name]
-                if *a == "CREATE" && *b == "INDEX" =>
-            {
-                Some(&["ON", "USING"])
-            }
+            [.., a, b, _index_name] if *a == "CREATE" && *b == "INDEX" => Some(&["ON", "USING"]),
             [.., a, b, c, _index_name]
                 if *a == "CREATE"
                     && MYSQL_CREATE_INDEX_MODIFIERS.contains(&b.as_str())
@@ -34635,9 +34890,7 @@ impl SqlEditorWidget {
             {
                 Some(&["ON", "USING"])
             }
-            [.., a, b, _index_name, c]
-                if *a == "CREATE" && *b == "INDEX" && *c == "USING" =>
-            {
+            [.., a, b, _index_name, c] if *a == "CREATE" && *b == "INDEX" && *c == "USING" => {
                 Some(MYSQL_INDEX_TYPE_KEYWORDS)
             }
             [.., a, b, c, _index_name, d]
@@ -34665,20 +34918,14 @@ impl SqlEditorWidget {
             {
                 Some(&["ON"])
             }
-            [.., a, b, _index_name]
-                if *a == "DROP" && *b == "INDEX" =>
-            {
-                Some(&["ON"])
-            }
+            [.., a, b, _index_name] if *a == "DROP" && *b == "INDEX" => Some(&["ON"]),
             [.., a, b, _index_name, c, _table_name]
                 if *a == "DROP" && *b == "INDEX" && *c == "ON" =>
             {
                 Some(&["ALGORITHM", "LOCK"])
             }
             [.., last] if *last == "CHANGE" => Some(&["REPLICATION"]),
-            [.., a, b] if *a == "CHANGE" && *b == "REPLICATION" => {
-                Some(&["FILTER", "SOURCE"])
-            }
+            [.., a, b] if *a == "CHANGE" && *b == "REPLICATION" => Some(&["FILTER", "SOURCE"]),
             [.., a, b, c] if *a == "CHANGE" && *b == "REPLICATION" && *c == "SOURCE" => {
                 Some(&["TO"])
             }
@@ -34692,13 +34939,13 @@ impl SqlEditorWidget {
             }
             [.., last] if *last == "CLONE" => Some(&["INSTANCE", "LOCAL"]),
             [.., a, b] if *a == "CLONE" && *b == "LOCAL" => Some(&["DATA"]),
-            [.., a, b, c] if *a == "CLONE" && *b == "LOCAL" && *c == "DATA" => {
-                Some(&["DIRECTORY"])
-            }
+            [.., a, b, c] if *a == "CLONE" && *b == "LOCAL" && *c == "DATA" => Some(&["DIRECTORY"]),
             [.., a, b] if *a == "CLONE" && *b == "INSTANCE" => Some(&["FROM"]),
             [.., last] if *last == "COMMIT" => Some(MYSQL_TRANSACTION_TAIL_KEYWORDS),
             [.., last] if *last == "DEALLOCATE" => Some(&["PREPARE"]),
-            [.., last] if *last == "EXPLAIN" => Some(MYSQL_EXPLAIN_OPTION_OR_STATEMENT_HEAD_KEYWORDS),
+            [.., last] if *last == "EXPLAIN" => {
+                Some(MYSQL_EXPLAIN_OPTION_OR_STATEMENT_HEAD_KEYWORDS)
+            }
             [.., a, b] if *a == "EXPLAIN" && *b == "FORMAT" => {
                 Some(&["=", "JSON", "TREE", "TRADITIONAL"])
             }
@@ -34712,8 +34959,8 @@ impl SqlEditorWidget {
             {
                 if *c == "JSON" {
                     Some(&[
-                        "INTO", "FOR", "DELETE", "INSERT", "REPLACE", "SELECT", "TABLE",
-                        "UPDATE", "WITH",
+                        "INTO", "FOR", "DELETE", "INSERT", "REPLACE", "SELECT", "TABLE", "UPDATE",
+                        "WITH",
                     ])
                 } else {
                     Some(MYSQL_EXPLAINABLE_STATEMENT_HEAD_OR_FOR_KEYWORDS)
@@ -34727,8 +34974,8 @@ impl SqlEditorWidget {
             {
                 if *d == "JSON" {
                     Some(&[
-                        "INTO", "FOR", "DELETE", "INSERT", "REPLACE", "SELECT", "TABLE",
-                        "UPDATE", "WITH",
+                        "INTO", "FOR", "DELETE", "INSERT", "REPLACE", "SELECT", "TABLE", "UPDATE",
+                        "WITH",
                     ])
                 } else {
                     Some(MYSQL_EXPLAINABLE_STATEMENT_HEAD_OR_FOR_KEYWORDS)
@@ -34779,14 +35026,21 @@ impl SqlEditorWidget {
             }
             [.., prev, last]
                 if matches!(prev.as_str(), "FLUSH" | "LOCAL" | "NO_WRITE_TO_BINLOG")
-                    && matches!(last.as_str(), "BINARY" | "ENGINE" | "ERROR" | "GENERAL" | "RELAY" | "SLOW") =>
+                    && matches!(
+                        last.as_str(),
+                        "BINARY" | "ENGINE" | "ERROR" | "GENERAL" | "RELAY" | "SLOW"
+                    ) =>
             {
                 Some(&["LOGS"])
             }
-            [.., a, b, c] if *a == "FLUSH" && matches!(b.as_str(), "TABLE" | "TABLES") && *c == "FOR" => {
+            [.., a, b, c]
+                if *a == "FLUSH" && matches!(b.as_str(), "TABLE" | "TABLES") && *c == "FOR" =>
+            {
                 Some(&["EXPORT"])
             }
-            [.., a, b, c] if *a == "FLUSH" && matches!(b.as_str(), "TABLE" | "TABLES") && *c == "WITH" => {
+            [.., a, b, c]
+                if *a == "FLUSH" && matches!(b.as_str(), "TABLE" | "TABLES") && *c == "WITH" =>
+            {
                 Some(&["READ"])
             }
             [.., a, b, c, d]
@@ -34889,15 +35143,11 @@ impl SqlEditorWidget {
             // it must not leak the `RENAME TABLE`/`RENAME USER` object list.
             [.., last] if *last == "LOCK" => Some(&["INSTANCE", "TABLES"]),
             [.., a, b] if *a == "LOCK" && *b == "INSTANCE" => Some(&["FOR"]),
-            [.., a, b, c] if *a == "LOCK" && *b == "INSTANCE" && *c == "FOR" => {
-                Some(&["BACKUP"])
-            }
+            [.., a, b, c] if *a == "LOCK" && *b == "INSTANCE" && *c == "FOR" => Some(&["BACKUP"]),
             [.., a, b] if *a == "LOCK" && matches!(b.as_str(), "TABLE" | "TABLES") => {
                 Some(&["AS", "READ", "WRITE"])
             }
-            [.., a, b, _table]
-                if *a == "LOCK" && matches!(b.as_str(), "TABLE" | "TABLES") =>
-            {
+            [.., a, b, _table] if *a == "LOCK" && matches!(b.as_str(), "TABLE" | "TABLES") => {
                 Some(&["AS", "READ", "WRITE"])
             }
             [.., a, b, c]
@@ -34924,9 +35174,7 @@ impl SqlEditorWidget {
             [.., last] if *last == "LOAD" => Some(&["DATA", "INDEX", "XML"]),
             [.., a, b] if *a == "LOAD" && *b == "INDEX" => Some(&["INTO"]),
             [.., a, b, c] if *a == "LOAD" && *b == "INDEX" && *c == "INTO" => Some(&["CACHE"]),
-            [.., a, b, c, d]
-                if *a == "LOAD" && *b == "INDEX" && *c == "INTO" && *d == "CACHE" =>
-            {
+            [.., a, b, c, d] if *a == "LOAD" && *b == "INDEX" && *c == "INTO" && *d == "CACHE" => {
                 Some(&["IGNORE"])
             }
             [.., a, b, c, d, e]
@@ -35018,14 +35266,12 @@ impl SqlEditorWidget {
             {
                 Some(&["BEFORE", "TO"])
             }
-            [.., last] if *last == "RESET" => Some(&["BINARY", "MASTER", "PERSIST", "REPLICA", "SLAVE"]),
-            [.., a, b] if *a == "RESET" && *b == "BINARY" => Some(&["LOGS"]),
-            [.., a, b, c] if *a == "RESET" && *b == "BINARY" && *c == "LOGS" => {
-                Some(&["AND"])
+            [.., last] if *last == "RESET" => {
+                Some(&["BINARY", "MASTER", "PERSIST", "REPLICA", "SLAVE"])
             }
-            [.., a, b, c, d]
-                if *a == "RESET" && *b == "BINARY" && *c == "LOGS" && *d == "AND" =>
-            {
+            [.., a, b] if *a == "RESET" && *b == "BINARY" => Some(&["LOGS"]),
+            [.., a, b, c] if *a == "RESET" && *b == "BINARY" && *c == "LOGS" => Some(&["AND"]),
+            [.., a, b, c, d] if *a == "RESET" && *b == "BINARY" && *c == "LOGS" && *d == "AND" => {
                 Some(&["GTIDS"])
             }
             [.., a, b] if *a == "RESET" && matches!(b.as_str(), "REPLICA" | "SLAVE") => {
@@ -35050,10 +35296,10 @@ impl SqlEditorWidget {
                 Some(&["CHANNEL"])
             }
             [.., a, b] if *a == "RESET" && *b == "PERSIST" => Some(&["IF"]),
-            [.., a, b, c] if *a == "RESET" && *b == "PERSIST" && *c == "IF" => {
-                Some(&["EXISTS"])
+            [.., a, b, c] if *a == "RESET" && *b == "PERSIST" && *c == "IF" => Some(&["EXISTS"]),
+            [.., last] if *last == "START" => {
+                Some(&["GROUP_REPLICATION", "REPLICA", "SLAVE", "TRANSACTION"])
             }
-            [.., last] if *last == "START" => Some(&["GROUP_REPLICATION", "REPLICA", "SLAVE", "TRANSACTION"]),
             [.., a, b] if *a == "START" && *b == "GROUP_REPLICATION" => {
                 Some(MYSQL_START_GROUP_REPLICATION_OPTIONS)
             }
@@ -35064,9 +35310,7 @@ impl SqlEditorWidget {
             {
                 Some(MYSQL_START_GROUP_REPLICATION_OPTIONS)
             }
-            [.., a, b] if *a == "START" && *b == "TRANSACTION" => {
-                Some(&["READ", "WITH"])
-            }
+            [.., a, b] if *a == "START" && *b == "TRANSACTION" => Some(&["READ", "WITH"]),
             [.., a, b, c] if *a == "START" && *b == "TRANSACTION" && *c == "READ" => {
                 Some(&["ONLY", "WRITE"])
             }
@@ -35120,42 +35364,26 @@ impl SqlEditorWidget {
             [.., a, b] if *a == "SET" && matches!(b.as_str(), "CHARSET" | "NAMES") => {
                 Some(&["DEFAULT"])
             }
-            [.., a, b, c] if *a == "SET" && *b == "CHARACTER" && *c == "SET" => {
-                Some(&["DEFAULT"])
-            }
-            [a, b, c] if *a == "SET" && *b == "NAMES" && *c != "DEFAULT" => {
-                Some(&["COLLATE"])
-            }
+            [.., a, b, c] if *a == "SET" && *b == "CHARACTER" && *c == "SET" => Some(&["DEFAULT"]),
+            [a, b, c] if *a == "SET" && *b == "NAMES" && *c != "DEFAULT" => Some(&["COLLATE"]),
             [.., a, b] if *a == "SET" && *b == "DEFAULT" => Some(&["ROLE"]),
             [.., a, b, c] if *a == "SET" && *b == "DEFAULT" && *c == "ROLE" => {
                 Some(MYSQL_SET_DEFAULT_ROLE_HEAD_KEYWORDS)
             }
-            [.., a, b, c, _role_specifier]
-                if *a == "SET" && *b == "DEFAULT" && *c == "ROLE" =>
-            {
+            [.., a, b, c, _role_specifier] if *a == "SET" && *b == "DEFAULT" && *c == "ROLE" => {
                 Some(&["TO"])
             }
             [.., a, b] if *a == "SET" && *b == "ROLE" => Some(MYSQL_SET_ROLE_HEAD_KEYWORDS),
-            [.., a, b, c] if *a == "SET" && *b == "ROLE" && *c == "ALL" => {
-                Some(&["EXCEPT"])
-            }
-            [.., a, b] if *a == "SET" && *b == "PASSWORD" => {
-                Some(MYSQL_SET_PASSWORD_AUTH_KEYWORDS)
-            }
-            [.., a, b, c, _user] if *a == "SET" && *b == "PASSWORD" && *c == "FOR" => {
-                Some(&["TO"])
-            }
-            [.., a, b, c] if *a == "SET" && *b == "PASSWORD" && *c == "TO" => {
-                Some(&["RANDOM"])
-            }
+            [.., a, b, c] if *a == "SET" && *b == "ROLE" && *c == "ALL" => Some(&["EXCEPT"]),
+            [.., a, b] if *a == "SET" && *b == "PASSWORD" => Some(MYSQL_SET_PASSWORD_AUTH_KEYWORDS),
+            [.., a, b, c, _user] if *a == "SET" && *b == "PASSWORD" && *c == "FOR" => Some(&["TO"]),
+            [.., a, b, c] if *a == "SET" && *b == "PASSWORD" && *c == "TO" => Some(&["RANDOM"]),
             [.., a, b, c, _user, d]
                 if *a == "SET" && *b == "PASSWORD" && *c == "FOR" && *d == "TO" =>
             {
                 Some(&["RANDOM"])
             }
-            [.., a, b, c, d]
-                if *a == "SET" && *b == "PASSWORD" && *c == "TO" && *d == "RANDOM" =>
-            {
+            [.., a, b, c, d] if *a == "SET" && *b == "PASSWORD" && *c == "TO" && *d == "RANDOM" => {
                 Some(MYSQL_SET_PASSWORD_TAIL_KEYWORDS)
             }
             [.., a, b, c, _user, d, e]
@@ -35262,22 +35490,16 @@ impl SqlEditorWidget {
                 Some(&["JOIN", "RESUME"])
             }
             [.., a, b, _xid] if *a == "XA" && *b == "END" => Some(&["SUSPEND"]),
-            [.., a, b, _xid, d] if *a == "XA" && *b == "END" && *d == "SUSPEND" => {
-                Some(&["FOR"])
-            }
+            [.., a, b, _xid, d] if *a == "XA" && *b == "END" && *d == "SUSPEND" => Some(&["FOR"]),
             [.., a, b, _xid, d, e]
                 if *a == "XA" && *b == "END" && *d == "SUSPEND" && *e == "FOR" =>
             {
                 Some(&["MIGRATE"])
             }
             [.., a, b, _xid] if *a == "XA" && *b == "COMMIT" => Some(&["ONE"]),
-            [.., a, b, _xid, d] if *a == "XA" && *b == "COMMIT" && *d == "ONE" => {
-                Some(&["PHASE"])
-            }
+            [.., a, b, _xid, d] if *a == "XA" && *b == "COMMIT" && *d == "ONE" => Some(&["PHASE"]),
             [.., a, b] if *a == "XA" && *b == "RECOVER" => Some(&["CONVERT"]),
-            [.., a, b, c] if *a == "XA" && *b == "RECOVER" && *c == "CONVERT" => {
-                Some(&["XID"])
-            }
+            [.., a, b, c] if *a == "XA" && *b == "RECOVER" && *c == "CONVERT" => Some(&["XID"]),
             _ => None,
         }
     }
@@ -35380,9 +35602,7 @@ impl SqlEditorWidget {
 
         match words {
             [.., last] if *last == "DELETE" => Some(MYSQL_DELETE_HEAD),
-            [.., verb, last]
-                if *verb == "DELETE" && *last == "LOW_PRIORITY" =>
-            {
+            [.., verb, last] if *verb == "DELETE" && *last == "LOW_PRIORITY" => {
                 Some(MYSQL_DELETE_AFTER_LOW_PRIORITY)
             }
             [.., verb, last] if *verb == "DELETE" && *last == "QUICK" => {
@@ -35421,9 +35641,7 @@ impl SqlEditorWidget {
             [.., verb, last] if *verb == "INSERT" && *last == "IGNORE" => {
                 Some(MYSQL_INSERT_AFTER_IGNORE)
             }
-            [.., verb, _priority, last]
-                if *verb == "INSERT" && *last == "IGNORE" =>
-            {
+            [.., verb, _priority, last] if *verb == "INSERT" && *last == "IGNORE" => {
                 Some(MYSQL_INSERT_AFTER_IGNORE)
             }
             [.., last] if *last == "REPLACE" => Some(MYSQL_REPLACE_HEAD),
@@ -35459,7 +35677,8 @@ impl SqlEditorWidget {
             (last, None)
         } else if matches!(last_word.as_str(), "DELETE" | "UPDATE") {
             let on = last.checked_sub(1)?;
-            if !matches!(toks.get(on), Some((_, SqlToken::Word(word))) if word.eq_ignore_ascii_case("ON")) {
+            if !matches!(toks.get(on), Some((_, SqlToken::Word(word))) if word.eq_ignore_ascii_case("ON"))
+            {
                 return None;
             }
             (on, Some(last_word.clone()))
@@ -35483,17 +35702,23 @@ impl SqlEditorWidget {
         if !Self::token_can_begin_statement_at(tokens, first_idx) {
             return None;
         }
-        let references_idx = toks[..on].iter().enumerate().rev().find_map(|(idx, (_, token))| {
-            matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("REFERENCES"))
-                .then_some(idx)
-        })?;
-        let table_idx = toks[..references_idx]
-            .iter()
-            .enumerate()
-            .find_map(|(idx, (_, token))| {
-                matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("TABLE"))
-                    .then_some(idx)
-            })?;
+        let references_idx =
+            toks[..on]
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(idx, (_, token))| {
+                    matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("REFERENCES"))
+                        .then_some(idx)
+                })?;
+        let table_idx =
+            toks[..references_idx]
+                .iter()
+                .enumerate()
+                .find_map(|(idx, (_, token))| {
+                    matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("TABLE"))
+                        .then_some(idx)
+                })?;
         if toks[table_idx + 1..references_idx]
             .iter()
             .any(|(_, token)| match token {
@@ -35514,13 +35739,21 @@ impl SqlEditorWidget {
             // `ON UPDATE`.
             None if mysql => Some(&["DELETE", "UPDATE"]),
             None => Some(&["DELETE"]),
-            Some("DELETE") if mysql => {
-                Some(&["CASCADE", "SET NULL", "SET DEFAULT", "NO ACTION", "RESTRICT"])
-            }
+            Some("DELETE") if mysql => Some(&[
+                "CASCADE",
+                "SET NULL",
+                "SET DEFAULT",
+                "NO ACTION",
+                "RESTRICT",
+            ]),
             Some("DELETE") => Some(&["CASCADE", "SET NULL"]),
-            Some("UPDATE") if mysql => {
-                Some(&["CASCADE", "SET NULL", "SET DEFAULT", "NO ACTION", "RESTRICT"])
-            }
+            Some("UPDATE") if mysql => Some(&[
+                "CASCADE",
+                "SET NULL",
+                "SET DEFAULT",
+                "NO ACTION",
+                "RESTRICT",
+            ]),
             Some("UPDATE") => Some(&[]),
             _ => None,
         }
@@ -35555,7 +35788,10 @@ impl SqlEditorWidget {
     }
 
     fn is_create_synonym_name_written_context(words: &[String]) -> bool {
-        if words.last().is_none_or(|word| word == "SYNONYM" || word == "PUBLIC") {
+        if words
+            .last()
+            .is_none_or(|word| word == "SYNONYM" || word == "PUBLIC")
+        {
             return false;
         }
         if words.iter().any(|word| word == "FOR") {
@@ -35755,7 +35991,8 @@ impl SqlEditorWidget {
         }
         // Right after `MATCHED` (no condition yet): close with `THEN` or open the
         // optional `AND` condition.
-        if matches!(toks.last(), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("MATCHED")) {
+        if matches!(toks.last(), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("MATCHED"))
+        {
             return Some(&["THEN", "AND"]);
         }
         // After `MATCHED AND <predicate>`: extend or close the condition once the
@@ -35939,7 +36176,8 @@ impl SqlEditorWidget {
                     }
                     Some(SqlToken::Word(prev_word))
                         if is_set_op(prev_word)
-                            && toks.len()
+                            && toks
+                                .len()
                                 .checked_sub(2)
                                 .is_some_and(|idx| !is_multiset_set_op(&toks, idx)) =>
                     {
@@ -35985,7 +36223,10 @@ impl SqlEditorWidget {
         let Some(for_idx) = words.iter().rposition(|word| word == "FOR") else {
             return false;
         };
-        if !matches!(words.get(for_idx + 1).map(String::as_str), Some("UPDATE" | "SHARE")) {
+        if !matches!(
+            words.get(for_idx + 1).map(String::as_str),
+            Some("UPDATE" | "SHARE")
+        ) {
             return false;
         }
         if words.get(for_idx + 2).map(String::as_str) != Some("OF") {
@@ -36011,10 +36252,7 @@ impl SqlEditorWidget {
     ) -> Option<&'static [&'static str]> {
         let mysql = crate::sql_text::mysql_compatibility_for_sql("", db_type);
         let slot_words = Self::words_for_keyword_slot(tokens, end);
-        if slot_words
-            .first()
-            .is_some_and(|word| word == "SET")
-        {
+        if slot_words.first().is_some_and(|word| word == "SET") {
             return None;
         }
         if let Some(for_idx) = slot_words.iter().rposition(|word| word == "FOR") {
@@ -36022,7 +36260,10 @@ impl SqlEditorWidget {
             let tail = slot_words.get(for_idx + 2..).unwrap_or(&[]);
             if matches!(mode, Some("UPDATE" | "SHARE"))
                 && tail.len() == 1
-                && !matches!(tail[0].as_str(), "OF" | "NOWAIT" | "WAIT" | "SKIP" | "LOCKED")
+                && !matches!(
+                    tail[0].as_str(),
+                    "OF" | "NOWAIT" | "WAIT" | "SKIP" | "LOCKED"
+                )
             {
                 return Some(if mysql {
                     &["OF", "NOWAIT", "SKIP"]
@@ -36263,13 +36504,7 @@ impl SqlEditorWidget {
         const SET_AUTOCOMMIT_VALUES: &[&str] = &["ON", "OFF", "TRUE", "FALSE"];
         const SET_SERVEROUTPUT_AFTER_ON: &[&str] = &["SIZE"];
         const SET_SERVEROUTPUT_AFTER_SIZE: &[&str] = &["UNLIMITED"];
-        const ORACLE_SHOW_HEAD: &[&str] = &[
-            "USER",
-            "ALL",
-            "ERRORS",
-            "PARAMETER",
-            "VERSION",
-        ];
+        const ORACLE_SHOW_HEAD: &[&str] = &["USER", "ALL", "ERRORS", "PARAMETER", "VERSION"];
         const MYSQL_SHOW_HEAD: &[&str] = &[
             "AUTHORS",
             "BINARY",
@@ -36333,16 +36568,9 @@ impl SqlEditorWidget {
             "VIEW",
         ];
         const MYSQL_SHOW_AFTER_ENGINE: &[&str] = &["STATUS", "MUTEX"];
-        const MYSQL_SHOW_AFTER_FULL: &[&str] =
-            &["COLUMNS", "FIELDS", "PROCESSLIST", "TABLES"];
+        const MYSQL_SHOW_AFTER_FULL: &[&str] = &["COLUMNS", "FIELDS", "PROCESSLIST", "TABLES"];
         const MYSQL_SHOW_AFTER_EXTENDED: &[&str] = &[
-            "COLUMNS",
-            "FIELDS",
-            "FULL",
-            "INDEX",
-            "INDEXES",
-            "KEYS",
-            "TABLES",
+            "COLUMNS", "FIELDS", "FULL", "INDEX", "INDEXES", "KEYS", "TABLES",
         ];
         const MYSQL_SHOW_AFTER_EXTENDED_FULL: &[&str] = &["COLUMNS", "FIELDS", "TABLES"];
         const MYSQL_SHOW_AFTER_GLOBAL_SESSION: &[&str] = &["STATUS", "VARIABLES"];
@@ -36389,11 +36617,13 @@ impl SqlEditorWidget {
                 idx,
                 Self::TOOL_NO_SQL_ARGUMENT_COMMANDS,
             )
-                .then_some((idx, upper))
+            .then_some((idx, upper))
         })?;
-        if toks.iter().skip(command_idx + 1).any(|token| {
-            matches!(token, SqlToken::Symbol(sym) if sym == ";")
-        }) {
+        if toks
+            .iter()
+            .skip(command_idx + 1)
+            .any(|token| matches!(token, SqlToken::Symbol(sym) if sym == ";"))
+        {
             return None;
         }
 
@@ -36418,10 +36648,8 @@ impl SqlEditorWidget {
                 && matches!(tail_tokens[2], SqlToken::Symbol(sym) if sym == "*")
                 && matches!(tail_tokens[3], SqlToken::Symbol(sym) if sym == ")")
         };
-        let mysql_show_column_topic =
-            |word: &str| matches!(word, "COLUMNS" | "FIELDS");
-        let mysql_show_index_topic =
-            |word: &str| matches!(word, "INDEX" | "INDEXES" | "KEYS");
+        let mysql_show_column_topic = |word: &str| matches!(word, "COLUMNS" | "FIELDS");
+        let mysql_show_index_topic = |word: &str| matches!(word, "INDEX" | "INDEXES" | "KEYS");
 
         if mysql_compatible {
             return match command.as_str() {
@@ -36433,15 +36661,13 @@ impl SqlEditorWidget {
                     {
                         Some(NONE)
                     }
-                    _ if Self::mysql_show_database_name_tail_state(&tail_words).is_some_and(
-                        |completed_database| !completed_database,
-                    ) =>
+                    _ if Self::mysql_show_database_name_tail_state(&tail_words)
+                        .is_some_and(|completed_database| !completed_database) =>
                     {
                         Some(NONE)
                     }
-                    _ if Self::mysql_show_database_name_tail_state(&tail_words).is_some_and(
-                        |completed_database| completed_database,
-                    ) =>
+                    _ if Self::mysql_show_database_name_tail_state(&tail_words)
+                        .is_some_and(|completed_database| completed_database) =>
                     {
                         Some(MYSQL_SHOW_FILTER)
                     }
@@ -36460,9 +36686,7 @@ impl SqlEditorWidget {
                     [topic] if topic == "ENGINE" => Some(NONE),
                     [topic, _engine] if topic == "ENGINE" => Some(MYSQL_SHOW_AFTER_ENGINE),
                     [topic] if topic == "EXTENDED" => Some(MYSQL_SHOW_AFTER_EXTENDED),
-                    [modifier, topic]
-                        if modifier == "EXTENDED" && topic == "FULL" =>
-                    {
+                    [modifier, topic] if modifier == "EXTENDED" && topic == "FULL" => {
                         Some(MYSQL_SHOW_AFTER_EXTENDED_FULL)
                     }
                     [modifier, topic]
@@ -36475,9 +36699,7 @@ impl SqlEditorWidget {
                     {
                         Some(MYSQL_SHOW_FROM_TABLE)
                     }
-                    [modifier, topic]
-                        if modifier == "EXTENDED" && topic == "TABLES" =>
-                    {
+                    [modifier, topic] if modifier == "EXTENDED" && topic == "TABLES" => {
                         Some(MYSQL_SHOW_FROM_IN_OR_FILTER)
                     }
                     [modifier, topic, source_kw, _table]
@@ -36494,9 +36716,7 @@ impl SqlEditorWidget {
                     {
                         Some(MYSQL_SHOW_INDEX_FROM_OR_FILTER)
                     }
-                    [modifier, topic, _db]
-                        if modifier == "EXTENDED" && topic == "TABLES" =>
-                    {
+                    [modifier, topic, _db] if modifier == "EXTENDED" && topic == "TABLES" => {
                         Some(MYSQL_SHOW_FILTER)
                     }
                     [extended, full, topic]
@@ -36525,9 +36745,7 @@ impl SqlEditorWidget {
                         Some(MYSQL_SHOW_FILTER)
                     }
                     [topic] if topic == "FULL" => Some(MYSQL_SHOW_AFTER_FULL),
-                    [modifier, topic]
-                        if modifier == "FULL" && mysql_show_column_topic(topic) =>
-                    {
+                    [modifier, topic] if modifier == "FULL" && mysql_show_column_topic(topic) => {
                         Some(MYSQL_SHOW_FROM_TABLE)
                     }
                     [modifier, topic] if modifier == "FULL" && topic == "TABLES" => {
@@ -36540,9 +36758,7 @@ impl SqlEditorWidget {
                     {
                         Some(MYSQL_SHOW_FROM_OR_FILTER)
                     }
-                    [modifier, topic, _table]
-                        if modifier == "FULL" && topic == "TABLES" =>
-                    {
+                    [modifier, topic, _table] if modifier == "FULL" && topic == "TABLES" => {
                         Some(MYSQL_SHOW_FILTER)
                     }
                     [modifier] if matches!(modifier.as_str(), "GLOBAL" | "SESSION") => {
@@ -36564,9 +36780,7 @@ impl SqlEditorWidget {
                         Some(MYSQL_SHOW_FILTER)
                     }
                     [topic] if topic == "GRANTS" => Some(MYSQL_SHOW_GRANTS_AFTER_TOPIC),
-                    [topic, for_kw, _user]
-                        if topic == "GRANTS" && for_kw == "FOR" =>
-                    {
+                    [topic, for_kw, _user] if topic == "GRANTS" && for_kw == "FOR" => {
                         Some(MYSQL_SHOW_GRANTS_AFTER_USER)
                     }
                     [topic] if mysql_show_index_topic(topic) => Some(MYSQL_SHOW_FROM_TABLE),
@@ -36616,7 +36830,8 @@ impl SqlEditorWidget {
                     }
                     [topic] if topic == "RELAYLOG" => Some(&["EVENTS"]),
                     [topic, events]
-                        if matches!(topic.as_str(), "BINLOG" | "RELAYLOG") && events == "EVENTS" =>
+                        if matches!(topic.as_str(), "BINLOG" | "RELAYLOG")
+                            && events == "EVENTS" =>
                     {
                         Some(MYSQL_SHOW_LOG_EVENTS_TAIL)
                     }
@@ -36659,8 +36874,15 @@ impl SqlEditorWidget {
                     [topic]
                         if matches!(
                             topic.as_str(),
-                            "CHARSET" | "COLLATION" | "DATABASES" | "EVENTS" | "SCHEMAS" | "STATUS"
-                                | "TABLES" | "TRIGGERS" | "VARIABLES"
+                            "CHARSET"
+                                | "COLLATION"
+                                | "DATABASES"
+                                | "EVENTS"
+                                | "SCHEMAS"
+                                | "STATUS"
+                                | "TABLES"
+                                | "TRIGGERS"
+                                | "VARIABLES"
                         ) =>
                     {
                         if matches!(topic.as_str(), "EVENTS" | "TABLES" | "TRIGGERS") {
@@ -36702,14 +36924,10 @@ impl SqlEditorWidget {
             "CLEAR" => match tail_words.as_slice() {
                 [] => Some(CLEAR_HEAD),
                 [first] if matches!(first.as_str(), "BREAKS" | "COMPUTES") => Some(CLEAR_CONNECTOR),
-                [first, second]
-                    if second == "CLEAR" && first == "BREAKS" =>
-                {
+                [first, second] if second == "CLEAR" && first == "BREAKS" => {
                     Some(CLEAR_AFTER_CONNECTOR_COMPUTES)
                 }
-                [first, second]
-                    if second == "CLEAR" && first == "COMPUTES" =>
-                {
+                [first, second] if second == "CLEAR" && first == "COMPUTES" => {
                     Some(CLEAR_AFTER_CONNECTOR_BREAKS)
                 }
                 _ => Some(NONE),
@@ -36721,7 +36939,9 @@ impl SqlEditorWidget {
             },
             "COMPUTE" => match tail_words.as_slice() {
                 [] => Some(COMPUTE_HEAD),
-                [first] if matches!(first.as_str(), "SUM" | "COUNT") => Some(COMPUTE_AFTER_AGGREGATE),
+                [first] if matches!(first.as_str(), "SUM" | "COUNT") => {
+                    Some(COMPUTE_AFTER_AGGREGATE)
+                }
                 [first, second, _]
                     if matches!(first.as_str(), "SUM" | "COUNT") && second == "OF" =>
                 {
@@ -36755,7 +36975,9 @@ impl SqlEditorWidget {
                 [option, value] if option == "SERVEROUTPUT" && value == "ON" => {
                     Some(SET_SERVEROUTPUT_AFTER_ON)
                 }
-                [option, value, size] if option == "SERVEROUTPUT" && value == "ON" && size == "SIZE" => {
+                [option, value, size]
+                    if option == "SERVEROUTPUT" && value == "ON" && size == "SIZE" =>
+                {
                     Some(SET_SERVEROUTPUT_AFTER_SIZE)
                 }
                 _ => Some(NONE),
@@ -36788,7 +37010,9 @@ impl SqlEditorWidget {
             }
             "WHENEVER" => match tail_words.as_slice() {
                 [] => Some(WHENEVER_HEAD),
-                [first] if matches!(first.as_str(), "SQLERROR" | "OSERROR") => Some(WHENEVER_ACTION),
+                [first] if matches!(first.as_str(), "SQLERROR" | "OSERROR") => {
+                    Some(WHENEVER_ACTION)
+                }
                 _ => Some(NONE),
             },
             _ if Self::TOOL_NO_SQL_ARGUMENT_COMMANDS.contains(&command.as_str()) => Some(NONE),
@@ -36838,10 +37062,8 @@ impl SqlEditorWidget {
             deep_ctx.cursor_token_len,
             prefix,
         );
-        if Self::cursor_is_in_invalid_set_operation_branch_for_context(
-            deep_ctx,
-            !prefix.is_empty(),
-        ) {
+        if Self::cursor_is_in_invalid_set_operation_branch_for_context(deep_ctx, !prefix.is_empty())
+        {
             return Vec::new();
         }
         if Self::cursor_is_at_create_view_column_alias_list_slot_for_context(
@@ -36883,21 +37105,15 @@ impl SqlEditorWidget {
             return Vec::new();
         }
         if !prefix.is_empty()
-            && Self::cursor_is_after_complete_sounds_like_tail_for_context(
-                deep_ctx,
-                true,
-                db_type,
-            )
+            && Self::cursor_is_after_complete_sounds_like_tail_for_context(deep_ctx, true, db_type)
         {
             return Vec::new();
         }
-        if let Some(candidates) =
-            Self::expected_set_operator_keyword_candidates(
-                statement_tokens,
-                statement_context_end,
-                db_type,
-            )
-        {
+        if let Some(candidates) = Self::expected_set_operator_keyword_candidates(
+            statement_tokens,
+            statement_context_end,
+            db_type,
+        ) {
             return Self::filter_expected_candidates(prefix, candidates);
         }
         if let Some(candidates) = Self::expected_create_type_constructor_return_keyword_candidates(
@@ -36911,8 +37127,7 @@ impl SqlEditorWidget {
                 statement_context_end,
                 db_type,
             )
-        })
-        {
+        }) {
             return Self::filter_expected_candidates(prefix, candidates);
         }
         if let Some(candidates) = Self::expected_create_type_object_member_keyword_candidates(
@@ -36926,8 +37141,7 @@ impl SqlEditorWidget {
                 statement_context_end,
                 db_type,
             )
-        })
-        {
+        }) {
             return Self::filter_expected_candidates(prefix, candidates);
         }
         if let Some(candidates) =
@@ -36958,18 +37172,16 @@ impl SqlEditorWidget {
         {
             return Self::filter_expected_candidates(prefix, candidates);
         }
-        if let Some(candidates) = Self::expected_plsql_declaration_start_keyword_candidates(
-            tokens,
-            context_end,
-            db_type,
-        )
-        .or_else(|| {
-            Self::expected_plsql_declaration_start_keyword_candidates(
-                statement_tokens,
-                statement_context_end,
-                db_type,
-            )
-        }) {
+        if let Some(candidates) =
+            Self::expected_plsql_declaration_start_keyword_candidates(tokens, context_end, db_type)
+                .or_else(|| {
+                    Self::expected_plsql_declaration_start_keyword_candidates(
+                        statement_tokens,
+                        statement_context_end,
+                        db_type,
+                    )
+                })
+        {
             return Self::filter_expected_candidates(prefix, candidates);
         }
         if Self::cursor_is_at_plsql_record_field_type(tokens, context_end)
@@ -36980,18 +37192,16 @@ impl SqlEditorWidget {
                 data_type_keywords_for(db_type, DataTypePosition::Plsql),
             );
         }
-        if let Some(candidates) = Self::expected_package_declaration_tail_keyword_candidates(
-            tokens,
-            context_end,
-            db_type,
-        )
-        .or_else(|| {
-            Self::expected_package_declaration_tail_keyword_candidates(
-                statement_tokens,
-                statement_context_end,
-                db_type,
-            )
-        }) {
+        if let Some(candidates) =
+            Self::expected_package_declaration_tail_keyword_candidates(tokens, context_end, db_type)
+                .or_else(|| {
+                    Self::expected_package_declaration_tail_keyword_candidates(
+                        statement_tokens,
+                        statement_context_end,
+                        db_type,
+                    )
+                })
+        {
             return Self::filter_expected_candidates(prefix, candidates);
         }
         if Self::cursor_is_at_package_declaration_default_value_operand_start(
@@ -37005,11 +37215,9 @@ impl SqlEditorWidget {
         ) {
             return Self::filter_expected_candidates(prefix, &["NULL", "CASE", "TRUE", "FALSE"]);
         }
-        if let Some(position) = Self::data_type_position_for_context_for_db(
-            deep_ctx,
-            !prefix.is_empty(),
-            db_type,
-        ) {
+        if let Some(position) =
+            Self::data_type_position_for_context_for_db(deep_ctx, !prefix.is_empty(), db_type)
+        {
             if position != DataTypePosition::TypeObject {
                 let mut candidates = Self::filter_expected_candidates(
                     prefix,
@@ -37022,20 +37230,21 @@ impl SqlEditorWidget {
                         db_type,
                     )
                 {
-                    candidates.extend(Self::filter_expected_candidates(prefix, table_function_tail));
+                    candidates.extend(Self::filter_expected_candidates(
+                        prefix,
+                        table_function_tail,
+                    ));
                     candidates.sort();
                     candidates.dedup();
                 }
                 return candidates;
             }
         }
-        if let Some(candidates) =
-            Self::expected_table_function_column_tail_keyword_candidates(
-                tokens,
-                context_end,
-                db_type,
-            )
-        {
+        if let Some(candidates) = Self::expected_table_function_column_tail_keyword_candidates(
+            tokens,
+            context_end,
+            db_type,
+        ) {
             return Self::filter_expected_candidates(prefix, candidates);
         }
         if Self::phase_allows_expression_construct_open_paren(deep_ctx.phase)
@@ -37044,119 +37253,102 @@ impl SqlEditorWidget {
         {
             return Vec::new();
         }
-        if let Some(candidates) = Self::expected_create_sequence_option_keywords(
-            tokens,
-            context_end,
-            db_type,
-        )
-        .or_else(|| {
-            Self::expected_create_sequence_option_keywords(
-                statement_tokens,
-                statement_context_end,
-                db_type,
+        if let Some(candidates) =
+            Self::expected_create_sequence_option_keywords(tokens, context_end, db_type).or_else(
+                || {
+                    Self::expected_create_sequence_option_keywords(
+                        statement_tokens,
+                        statement_context_end,
+                        db_type,
+                    )
+                },
             )
-        })
         {
             return Self::filter_expected_candidates(prefix, &candidates);
         }
-        if let Some(candidates) = Self::expected_transaction_and_dcl_keyword_candidates(
-            tokens,
-            context_end,
-            db_type,
-        )
-        .or_else(|| {
-            Self::expected_transaction_and_dcl_keyword_candidates(
-                statement_tokens,
-                statement_context_end,
-                db_type,
-            )
-        })
-        {
-            return Self::filter_expected_candidates(prefix, candidates);
-        }
-        if let Some(candidates) = Self::expected_plsql_block_statement_keyword_candidates(
-            tokens,
-            context_end,
-            db_type,
-        )
-        .or_else(|| {
-            Self::expected_plsql_block_statement_keyword_candidates(
-                statement_tokens,
-                statement_context_end,
-                db_type,
-            )
-        })
-        {
-            return Self::filter_expected_candidates(prefix, &candidates);
-        }
-        if let Some(candidates) = Self::expected_plsql_cursor_statement_keywords(
-            tokens,
-            context_end,
-            db_type,
-        )
-        .or_else(|| {
-            Self::expected_plsql_cursor_statement_keywords(
-                statement_tokens,
-                statement_context_end,
-                db_type,
-            )
-        })
-        {
-            return Self::filter_expected_candidates(prefix, candidates);
-        }
-        if let Some(candidates) = Self::expected_plsql_pragma_name_keyword_candidates(
-            tokens,
-            context_end,
-            db_type,
-        )
-        .or_else(|| {
-            Self::expected_plsql_pragma_name_keyword_candidates(
-                statement_tokens,
-                statement_context_end,
-                db_type,
-            )
-        })
-        {
-            return Self::filter_expected_candidates(prefix, candidates);
-        }
-        if let Some(candidates) = Self::expected_plsql_pragma_argument_keyword_candidates(
-            tokens,
-            context_end,
-            db_type,
-        )
-        .or_else(|| {
-            Self::expected_plsql_pragma_argument_keyword_candidates(
-                statement_tokens,
-                statement_context_end,
-                db_type,
-            )
-        })
+        if let Some(candidates) =
+            Self::expected_transaction_and_dcl_keyword_candidates(tokens, context_end, db_type)
+                .or_else(|| {
+                    Self::expected_transaction_and_dcl_keyword_candidates(
+                        statement_tokens,
+                        statement_context_end,
+                        db_type,
+                    )
+                })
         {
             return Self::filter_expected_candidates(prefix, candidates);
         }
         if let Some(candidates) =
-            Self::expected_plsql_end_qualifier_keywords(tokens, context_end, db_type).or_else(|| {
-                Self::expected_plsql_end_qualifier_keywords(
-                    statement_tokens,
-                    statement_context_end,
-                    db_type,
-                )
-            })
+            Self::expected_plsql_block_statement_keyword_candidates(tokens, context_end, db_type)
+                .or_else(|| {
+                    Self::expected_plsql_block_statement_keyword_candidates(
+                        statement_tokens,
+                        statement_context_end,
+                        db_type,
+                    )
+                })
+        {
+            return Self::filter_expected_candidates(prefix, &candidates);
+        }
+        if let Some(candidates) =
+            Self::expected_plsql_cursor_statement_keywords(tokens, context_end, db_type).or_else(
+                || {
+                    Self::expected_plsql_cursor_statement_keywords(
+                        statement_tokens,
+                        statement_context_end,
+                        db_type,
+                    )
+                },
+            )
         {
             return Self::filter_expected_candidates(prefix, candidates);
         }
-        if let Some(candidates) = Self::expected_plsql_and_routine_keyword_candidates(
-            tokens,
-            context_end,
-            db_type,
-        )
-        .or_else(|| {
-            Self::expected_plsql_and_routine_keyword_candidates(
-                statement_tokens,
-                statement_context_end,
-                db_type,
+        if let Some(candidates) =
+            Self::expected_plsql_pragma_name_keyword_candidates(tokens, context_end, db_type)
+                .or_else(|| {
+                    Self::expected_plsql_pragma_name_keyword_candidates(
+                        statement_tokens,
+                        statement_context_end,
+                        db_type,
+                    )
+                })
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(candidates) =
+            Self::expected_plsql_pragma_argument_keyword_candidates(tokens, context_end, db_type)
+                .or_else(|| {
+                    Self::expected_plsql_pragma_argument_keyword_candidates(
+                        statement_tokens,
+                        statement_context_end,
+                        db_type,
+                    )
+                })
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(candidates) =
+            Self::expected_plsql_end_qualifier_keywords(tokens, context_end, db_type).or_else(
+                || {
+                    Self::expected_plsql_end_qualifier_keywords(
+                        statement_tokens,
+                        statement_context_end,
+                        db_type,
+                    )
+                },
             )
-        })
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(candidates) =
+            Self::expected_plsql_and_routine_keyword_candidates(tokens, context_end, db_type)
+                .or_else(|| {
+                    Self::expected_plsql_and_routine_keyword_candidates(
+                        statement_tokens,
+                        statement_context_end,
+                        db_type,
+                    )
+                })
         {
             return Self::filter_expected_candidates(prefix, candidates);
         }
@@ -37173,22 +37365,19 @@ impl SqlEditorWidget {
                 db_type,
                 deep_ctx.phase,
             )
-        })
-        {
+        }) {
             return Self::filter_expected_candidates(prefix, candidates);
         }
-        if let Some(candidates) = Self::expected_mysql_select_into_file_keyword_candidates(
-            tokens,
-            context_end,
-            db_type,
-        )
-        .or_else(|| {
-            Self::expected_mysql_select_into_file_keyword_candidates(
-                statement_tokens,
-                statement_context_end,
-                db_type,
-            )
-        }) {
+        if let Some(candidates) =
+            Self::expected_mysql_select_into_file_keyword_candidates(tokens, context_end, db_type)
+                .or_else(|| {
+                    Self::expected_mysql_select_into_file_keyword_candidates(
+                        statement_tokens,
+                        statement_context_end,
+                        db_type,
+                    )
+                })
+        {
             return Self::filter_expected_candidates(prefix, candidates);
         }
         if let Some(candidates) = Self::expected_cte_and_table_expression_keyword_candidates(
@@ -37204,8 +37393,7 @@ impl SqlEditorWidget {
                 deep_ctx.phase,
                 db_type,
             )
-        })
-        {
+        }) {
             return Self::filter_expected_candidates(prefix, candidates);
         }
         if let Some((candidates, src_tokens, src_end)) =
@@ -37257,50 +37445,46 @@ impl SqlEditorWidget {
             );
         }
         if !prefix.is_empty() {
-            if let Some(candidates) =
+            if let Some(candidates) = Self::expected_mysql_on_duplicate_after_on_keyword_candidates(
+                tokens,
+                context_end,
+                db_type,
+            )
+            .or_else(|| {
                 Self::expected_mysql_on_duplicate_after_on_keyword_candidates(
-                    tokens,
-                    context_end,
+                    statement_tokens,
+                    statement_context_end,
                     db_type,
                 )
+            }) {
+                return Self::filter_expected_candidates(prefix, candidates);
+            }
+        }
+        if let Some(candidates) =
+            Self::expected_grouping_returning_and_insert_tail_keyword_candidates(
+                tokens,
+                context_end,
+                db_type,
+            )
+            .or_else(|| {
+                Self::expected_grouping_returning_and_insert_tail_keyword_candidates(
+                    statement_tokens,
+                    statement_context_end,
+                    db_type,
+                )
+            })
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(candidates) =
+            Self::expected_tool_command_supplement_keyword_candidates(tokens, context_end, db_type)
                 .or_else(|| {
-                    Self::expected_mysql_on_duplicate_after_on_keyword_candidates(
+                    Self::expected_tool_command_supplement_keyword_candidates(
                         statement_tokens,
                         statement_context_end,
                         db_type,
                     )
                 })
-            {
-                return Self::filter_expected_candidates(prefix, candidates);
-            }
-        }
-        if let Some(candidates) = Self::expected_grouping_returning_and_insert_tail_keyword_candidates(
-            tokens,
-            context_end,
-            db_type,
-        )
-        .or_else(|| {
-            Self::expected_grouping_returning_and_insert_tail_keyword_candidates(
-                statement_tokens,
-                statement_context_end,
-                db_type,
-            )
-        })
-        {
-            return Self::filter_expected_candidates(prefix, candidates);
-        }
-        if let Some(candidates) = Self::expected_tool_command_supplement_keyword_candidates(
-            tokens,
-            context_end,
-            db_type,
-        )
-        .or_else(|| {
-            Self::expected_tool_command_supplement_keyword_candidates(
-                statement_tokens,
-                statement_context_end,
-                db_type,
-            )
-        })
         {
             return Self::filter_expected_candidates(prefix, candidates);
         }
@@ -37460,11 +37644,9 @@ impl SqlEditorWidget {
             return Self::filter_expected_candidates(prefix, candidates);
         }
 
-        if let Some(position) = Self::data_type_position_for_context_for_db(
-            deep_ctx,
-            !prefix.is_empty(),
-            db_type,
-        ) {
+        if let Some(position) =
+            Self::data_type_position_for_context_for_db(deep_ctx, !prefix.is_empty(), db_type)
+        {
             return Self::filter_expected_candidates(
                 prefix,
                 data_type_keywords_for(db_type, position),
@@ -37502,9 +37684,7 @@ impl SqlEditorWidget {
             );
         }
 
-        if let Some(slot) =
-            Self::order_by_sort_modifier_slot(tokens, context_end, deep_ctx.phase)
-        {
+        if let Some(slot) = Self::order_by_sort_modifier_slot(tokens, context_end, deep_ctx.phase) {
             // A complete sort item admits the sort modifiers *and* the query's
             // downstream clauses (`ORDER BY a |` → ASC/DESC/NULLS + OFFSET/FETCH/
             // FOR UPDATE/UNION/…). The sort-modifier slot used to shadow the clause
@@ -37538,9 +37718,12 @@ impl SqlEditorWidget {
             }
         }
 
-        if let Some(candidates) =
-            Self::expected_dml_target_keyword_candidates(tokens, context_end, deep_ctx.phase, db_type)
-        {
+        if let Some(candidates) = Self::expected_dml_target_keyword_candidates(
+            tokens,
+            context_end,
+            deep_ctx.phase,
+            db_type,
+        ) {
             return Self::filter_expected_candidates(prefix, candidates);
         }
         if let Some(candidates) =
@@ -37553,43 +37736,39 @@ impl SqlEditorWidget {
         {
             return Self::filter_expected_candidates(prefix, candidates);
         }
-        if let Some(candidates) =
-            Self::expected_table_sample_keyword_candidates(
-                tokens,
-                context_end,
-                deep_ctx.phase,
-                db_type,
-            )
-        {
-            return Self::filter_expected_candidates(prefix, candidates);
-        }
-        if let Some(candidates) =
-            Self::expected_flashback_query_keyword_candidates(
-                tokens,
-                context_end,
-                deep_ctx.phase,
-                db_type,
-            )
-        {
-            return Self::filter_expected_candidates(prefix, candidates);
-        }
-        if let Some(candidates) =
-            Self::expected_mysql_index_hint_keyword_candidates(tokens, context_end, deep_ctx.phase, db_type)
-        {
-            return Self::filter_expected_candidates(prefix, candidates);
-        }
-        if let Some(candidates) = Self::expected_transaction_and_dcl_keyword_candidates(
+        if let Some(candidates) = Self::expected_table_sample_keyword_candidates(
             tokens,
             context_end,
+            deep_ctx.phase,
             db_type,
-        )
-        .or_else(|| {
-            Self::expected_transaction_and_dcl_keyword_candidates(
-                statement_tokens,
-                statement_context_end,
-                db_type,
-            )
-        })
+        ) {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(candidates) = Self::expected_flashback_query_keyword_candidates(
+            tokens,
+            context_end,
+            deep_ctx.phase,
+            db_type,
+        ) {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(candidates) = Self::expected_mysql_index_hint_keyword_candidates(
+            tokens,
+            context_end,
+            deep_ctx.phase,
+            db_type,
+        ) {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(candidates) =
+            Self::expected_transaction_and_dcl_keyword_candidates(tokens, context_end, db_type)
+                .or_else(|| {
+                    Self::expected_transaction_and_dcl_keyword_candidates(
+                        statement_tokens,
+                        statement_context_end,
+                        db_type,
+                    )
+                })
         {
             return Self::filter_expected_candidates(prefix, candidates);
         }
@@ -37618,23 +37797,22 @@ impl SqlEditorWidget {
             }
         }
 
-        let join_target_candidates =
-            Self::expected_join_target_keyword_candidates(
-                tokens,
-                context_end,
-                deep_ctx.phase,
-                db_type,
-            )
-                .or_else(|| {
-                    (!prefix.is_empty()).then(|| {
-                        Self::expected_join_target_keyword_candidates(
-                            tokens,
-                            context_end,
-                            intellisense_context::SqlPhase::FromClause,
-                            db_type,
-                        )
-                    })?
-                });
+        let join_target_candidates = Self::expected_join_target_keyword_candidates(
+            tokens,
+            context_end,
+            deep_ctx.phase,
+            db_type,
+        )
+        .or_else(|| {
+            (!prefix.is_empty()).then(|| {
+                Self::expected_join_target_keyword_candidates(
+                    tokens,
+                    context_end,
+                    intellisense_context::SqlPhase::FromClause,
+                    db_type,
+                )
+            })?
+        });
         if let Some(candidates) = join_target_candidates {
             return Self::filter_expected_candidates(prefix, candidates);
         }
@@ -37671,13 +37849,11 @@ impl SqlEditorWidget {
                 return filtered;
             }
         }
-        if let Some(candidates) =
-            Self::expected_statement_structural_keyword_candidates(
-                statement_tokens,
-                statement_context_end,
-                db_type,
-            )
-        {
+        if let Some(candidates) = Self::expected_statement_structural_keyword_candidates(
+            statement_tokens,
+            statement_context_end,
+            db_type,
+        ) {
             let filtered = Self::drop_present_mysql_table_maintenance_options(
                 Self::filter_expected_candidates(prefix, candidates),
                 statement_tokens,
@@ -37762,13 +37938,11 @@ impl SqlEditorWidget {
                 | intellisense_context::SqlPhase::DeleteTarget
                 | intellisense_context::SqlPhase::MergeTarget
         ) {
-            if let Some(candidates) =
-                Self::expected_dml_statement_head_keyword_candidates(
-                    statement_tokens,
-                    statement_context_end,
-                    db_type,
-                )
-            {
+            if let Some(candidates) = Self::expected_dml_statement_head_keyword_candidates(
+                statement_tokens,
+                statement_context_end,
+                db_type,
+            ) {
                 return Self::filter_expected_candidates(prefix, candidates);
             }
         }
@@ -37782,20 +37956,20 @@ impl SqlEditorWidget {
         {
             return Self::filter_expected_candidates(prefix, &candidates);
         }
-        if Self::cursor_is_at_mysql_alter_table_add_index_option_tail(
-            tokens,
-            context_end,
-            db_type,
-        ) || Self::cursor_is_at_mysql_create_table_inline_index_option_tail(
+        if Self::cursor_is_at_mysql_alter_table_add_index_option_tail(tokens, context_end, db_type)
+            || Self::cursor_is_at_mysql_create_table_inline_index_option_tail(
+                tokens,
+                context_end,
+                db_type,
+            )
+        {
+            return Vec::new();
+        }
+        if let Some(candidates) = Self::expected_create_table_column_definition_tail_keywords(
             tokens,
             context_end,
             db_type,
         ) {
-            return Vec::new();
-        }
-        if let Some(candidates) =
-            Self::expected_create_table_column_definition_tail_keywords(tokens, context_end, db_type)
-        {
             return Self::drop_present_single_use_column_properties(
                 Self::filter_expected_candidates(prefix, candidates),
                 tokens,
@@ -37833,14 +38007,12 @@ impl SqlEditorWidget {
             }
             return result;
         }
-        if let Some(candidates) =
-            Self::expected_is_predicate_keyword_candidates(
-                tokens,
-                context_end,
-                db_type,
-                expr_keyword_ctx.map(|ctx| ctx.is_predicate_left_operand_type),
-            )
-        {
+        if let Some(candidates) = Self::expected_is_predicate_keyword_candidates(
+            tokens,
+            context_end,
+            db_type,
+            expr_keyword_ctx.map(|ctx| ctx.is_predicate_left_operand_type),
+        ) {
             return Self::filter_expected_candidates(prefix, candidates);
         }
         if let Some(candidates) = Self::expected_negated_predicate_operator_keyword_candidates(
@@ -37943,15 +38115,13 @@ impl SqlEditorWidget {
             // before `JOIN`, so both continuations are offered; `INNER`/`CROSS`/
             // `NATURAL` take only `JOIN`. MySQL/MariaDB have no FULL join form.
             [.., last]
-                if in_table_context
-                    && matches!(last.as_str(), "LEFT" | "RIGHT")
-                        || (in_table_context && !mysql && *last == "FULL") =>
+                if in_table_context && matches!(last.as_str(), "LEFT" | "RIGHT")
+                    || (in_table_context && !mysql && *last == "FULL") =>
             {
                 &["OUTER", "JOIN"]
             }
             [.., last]
-                if in_table_context
-                    && matches!(last.as_str(), "INNER" | "CROSS" | "NATURAL") =>
+                if in_table_context && matches!(last.as_str(), "INNER" | "CROSS" | "NATURAL") =>
             {
                 &["JOIN"]
             }
@@ -37984,7 +38154,10 @@ impl SqlEditorWidget {
             );
             if !predicate_tail.is_empty() {
                 for keyword in Self::filter_expected_candidates(prefix, predicate_tail) {
-                    if !result.iter().any(|existing| existing.eq_ignore_ascii_case(&keyword)) {
+                    if !result
+                        .iter()
+                        .any(|existing| existing.eq_ignore_ascii_case(&keyword))
+                    {
                         result.push(keyword);
                     }
                 }
@@ -37992,7 +38165,10 @@ impl SqlEditorWidget {
         }
         if !tail.is_empty() {
             for keyword in Self::filter_expected_candidates(prefix, tail) {
-                if !result.iter().any(|existing| existing.eq_ignore_ascii_case(&keyword)) {
+                if !result
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(&keyword))
+                {
                     result.push(keyword);
                 }
             }
@@ -38033,7 +38209,10 @@ impl SqlEditorWidget {
                 tokens,
                 context_end,
             ) {
-                if !result.iter().any(|existing| existing.eq_ignore_ascii_case(&keyword)) {
+                if !result
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(&keyword))
+                {
                     result.push(keyword);
                 }
             }
@@ -38049,7 +38228,8 @@ impl SqlEditorWidget {
         if is_bind {
             return true;
         }
-        !Self::is_row_limit_unit(trimmed) && !matches!(trimmed, "PERCENT" | "ONLY" | "WITH" | "TIES")
+        !Self::is_row_limit_unit(trimmed)
+            && !matches!(trimmed, "PERCENT" | "ONLY" | "WITH" | "TIES")
     }
 
     fn is_fetch_row_limit_direction(word: &str) -> bool {
@@ -38060,10 +38240,7 @@ impl SqlEditorWidget {
         matches!(word, "ROW" | "ROWS")
     }
 
-    fn fetch_row_limit_prefix_before_unit(
-        words: &[(String, bool)],
-        unit_from_end: usize,
-    ) -> bool {
+    fn fetch_row_limit_prefix_before_unit(words: &[(String, bool)], unit_from_end: usize) -> bool {
         let len = words.len();
         let word = |from_end: usize| {
             len.checked_sub(from_end)
@@ -38210,12 +38387,8 @@ impl SqlEditorWidget {
                 db_type,
             )
             .is_some()
-            || Self::expected_package_member_start_keyword_candidates(
-                tokens,
-                context_end,
-                db_type,
-            )
-            .is_some()
+            || Self::expected_package_member_start_keyword_candidates(tokens, context_end, db_type)
+                .is_some()
             || Self::expected_package_declaration_tail_keyword_candidates(
                 tokens,
                 context_end,
@@ -38230,8 +38403,9 @@ impl SqlEditorWidget {
             exclude_current_identifier_chain,
             db_type,
         )
-        .is_some_and(|position| Self::data_type_position_allows_user_type_objects(position, db_type))
-        {
+        .is_some_and(|position| {
+            Self::data_type_position_allows_user_type_objects(position, db_type)
+        }) {
             return Some(ExpectedObjectSuggestionKind::Type);
         }
 
@@ -38268,12 +38442,10 @@ impl SqlEditorWidget {
             {
                 return Some(kind);
             }
-            if let Some(kind) =
-                Self::expected_mysql_drop_index_option_value_object_suggestion_kind(
-                    tokens,
-                    context_end,
-                )
-            {
+            if let Some(kind) = Self::expected_mysql_drop_index_option_value_object_suggestion_kind(
+                tokens,
+                context_end,
+            ) {
                 return Some(kind);
             }
             if let Some(kind) =
@@ -38291,9 +38463,10 @@ impl SqlEditorWidget {
             {
                 return Some(kind);
             }
-            if let Some(kind) =
-                Self::expected_mysql_set_password_account_object_suggestion_kind(tokens, context_end)
-            {
+            if let Some(kind) = Self::expected_mysql_set_password_account_object_suggestion_kind(
+                tokens,
+                context_end,
+            ) {
                 return Some(kind);
             }
             if let Some(kind) =
@@ -38358,15 +38531,10 @@ impl SqlEditorWidget {
             if let Some(kind) = Self::expected_rollback_segment_object_suggestion_kind(&words) {
                 return Some(kind);
             }
-            if Self::cursor_has_statement_start_anchor(
-                tokens,
-                context_end,
-                &["AUDIT", "NOAUDIT"],
-            ) {
-                if let Some(kind) = Self::expected_oracle_audit_user_object_suggestion_kind(
-                    tokens,
-                    context_end,
-                ) {
+            if Self::cursor_has_statement_start_anchor(tokens, context_end, &["AUDIT", "NOAUDIT"]) {
+                if let Some(kind) =
+                    Self::expected_oracle_audit_user_object_suggestion_kind(tokens, context_end)
+                {
                     return Some(kind);
                 }
             }
@@ -38578,9 +38746,7 @@ impl SqlEditorWidget {
             [.., a, b, c] if *a == "DROP" && *b == "TYPE" && *c == "BODY" => {
                 Some(oracle_only_kind(ExpectedObjectSuggestionKind::Type))
             }
-            [.., prev, last]
-                if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "TRIGGER" =>
-            {
+            [.., prev, last] if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "TRIGGER" => {
                 Some(ExpectedObjectSuggestionKind::Trigger)
             }
             [.., prev, last] if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "EVENT" => {
@@ -38711,9 +38877,7 @@ impl SqlEditorWidget {
             {
                 None
             }
-            [.., prev, last]
-                if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "LINK" =>
-            {
+            [.., prev, last] if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "LINK" => {
                 Some(oracle_only_kind(ExpectedObjectSuggestionKind::DatabaseLink))
             }
             [.., a, b, c]
@@ -38732,9 +38896,7 @@ impl SqlEditorWidget {
             [.., prev, last] if *prev == "DROP" && *last == "DIRECTORY" => {
                 Some(oracle_only_kind(ExpectedObjectSuggestionKind::Directory))
             }
-            [.., prev, last]
-                if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "LIBRARY" =>
-            {
+            [.., prev, last] if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "LIBRARY" => {
                 Some(oracle_only_kind(ExpectedObjectSuggestionKind::Library))
             }
             [.., prev, last]
@@ -38892,9 +39054,9 @@ impl SqlEditorWidget {
         end: usize,
     ) -> Option<ExpectedObjectSuggestionKind> {
         let toks = Self::meaningful_tokens_before(tokens, end);
-        let show_idx = toks.iter().rposition(|token| {
-            matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("SHOW"))
-        })?;
+        let show_idx = toks.iter().rposition(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("SHOW")),
+        )?;
         let tail = &toks[show_idx + 1..];
         let word_positions = tail
             .iter()
@@ -38949,12 +39111,7 @@ impl SqlEditorWidget {
         let topic = tail[..tail.len() - 1]
             .iter()
             .rev()
-            .find(|word| {
-                !matches!(
-                    word.as_str(),
-                    "EXTENDED" | "FULL" | "GLOBAL" | "SESSION"
-                )
-            })
+            .find(|word| !matches!(word.as_str(), "EXTENDED" | "FULL" | "GLOBAL" | "SESSION"))
             .map(String::as_str);
         matches!(
             topic,
@@ -38974,9 +39131,10 @@ impl SqlEditorWidget {
         let Some(show_idx) = words.iter().rposition(|word| word == "SHOW") else {
             return false;
         };
-        words
-            .get(show_idx + 1..)
-            .is_some_and(|tail| tail.iter().any(|word| matches!(word.as_str(), "LIKE" | "WHERE")))
+        words.get(show_idx + 1..).is_some_and(|tail| {
+            tail.iter()
+                .any(|word| matches!(word.as_str(), "LIKE" | "WHERE"))
+        })
     }
 
     fn mysql_show_database_name_value_non_catalog_slot(tokens: &[SqlToken], end: usize) -> bool {
@@ -39253,9 +39411,15 @@ impl SqlEditorWidget {
             {
                 true
             }
-            [verb, table_kw] if matches!(verb.as_str(), "CHECK" | "REPAIR") && table_kw == "TABLE" => true,
+            [verb, table_kw]
+                if matches!(verb.as_str(), "CHECK" | "REPAIR") && table_kw == "TABLE" =>
+            {
+                true
+            }
             [verb, table_kw, .., comma]
-                if matches!(verb.as_str(), "CHECK" | "REPAIR") && table_kw == "TABLE" && comma == "," =>
+                if matches!(verb.as_str(), "CHECK" | "REPAIR")
+                    && table_kw == "TABLE"
+                    && comma == "," =>
             {
                 true
             }
@@ -39265,7 +39429,11 @@ impl SqlEditorWidget {
             {
                 true
             }
-            [lock, table_kw] if lock == "LOCK" && matches!(table_kw.as_str(), "TABLE" | "TABLES") => true,
+            [lock, table_kw]
+                if lock == "LOCK" && matches!(table_kw.as_str(), "TABLE" | "TABLES") =>
+            {
+                true
+            }
             [lock, table_kw, .., comma]
                 if lock == "LOCK"
                     && matches!(table_kw.as_str(), "TABLE" | "TABLES")
@@ -39363,8 +39531,8 @@ impl SqlEditorWidget {
             "TRIGGER" => Some(ExpectedObjectSuggestionKind::Trigger),
             "USER" | "ROLE" => Some(ExpectedObjectSuggestionKind::User),
             "DATABASE" | "SCHEMA" | "SERVER" => Some(ExpectedObjectSuggestionKind::NoSuggestions),
-            "PACKAGE" | "TYPE" | "SEQUENCE" | "SYNONYM" | "DIRECTORY" | "LIBRARY"
-            | "CLUSTER" | "CONTEXT" | "DIMENSION" | "OPERATOR" | "INDEXTYPE" | "EDITION" => {
+            "PACKAGE" | "TYPE" | "SEQUENCE" | "SYNONYM" | "DIRECTORY" | "LIBRARY" | "CLUSTER"
+            | "CONTEXT" | "DIMENSION" | "OPERATOR" | "INDEXTYPE" | "EDITION" => {
                 Some(ExpectedObjectSuggestionKind::NoSuggestions)
             }
             _ => None,
@@ -39403,9 +39571,9 @@ impl SqlEditorWidget {
             return None;
         }
 
-        let on_idx = toks.iter().position(|token| {
-            matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("ON"))
-        })?;
+        let on_idx = toks.iter().position(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("ON")),
+        )?;
         let mut idx = on_idx + 1;
         if !matches!(toks.get(idx), Some(SqlToken::Word(_))) {
             return None;
@@ -39417,16 +39585,17 @@ impl SqlEditorWidget {
             idx += 2;
         }
 
-        toks.get(idx..).is_some_and(|tail| {
-            tail.iter().any(|token| {
-                matches!(
-                    token,
-                    SqlToken::Word(word)
-                        if matches!(word.to_ascii_uppercase().as_str(), "ALGORITHM" | "LOCK")
-                )
+        toks.get(idx..)
+            .is_some_and(|tail| {
+                tail.iter().any(|token| {
+                    matches!(
+                        token,
+                        SqlToken::Word(word)
+                            if matches!(word.to_ascii_uppercase().as_str(), "ALGORITHM" | "LOCK")
+                    )
+                })
             })
-        })
-        .then_some(ExpectedObjectSuggestionKind::NoSuggestions)
+            .then_some(ExpectedObjectSuggestionKind::NoSuggestions)
     }
 
     fn cursor_is_at_mysql_alter_table_add_index_option_tail(
@@ -39439,16 +39608,16 @@ impl SqlEditorWidget {
         }
         let toks = Self::meaningful_tokens_before(tokens, end);
         if !matches!(toks.first(), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("ALTER"))
-            || !toks
-                .iter()
-                .any(|token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("TABLE")))
+            || !toks.iter().any(
+                |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("TABLE")),
+            )
         {
             return false;
         }
 
-        let Some(add_idx) = toks.iter().position(|token| {
-            matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("ADD"))
-        }) else {
+        let Some(add_idx) = toks.iter().position(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("ADD")),
+        ) else {
             return false;
         };
         let add_tail_has_index = toks[add_idx + 1..].iter().any(|token| {
@@ -39502,9 +39671,9 @@ impl SqlEditorWidget {
         }
         let toks = Self::meaningful_tokens_before(tokens, end);
         if !matches!(toks.first(), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("CREATE"))
-            || !toks
-                .iter()
-                .any(|token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("TABLE")))
+            || !toks.iter().any(
+                |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("TABLE")),
+            )
         {
             return false;
         }
@@ -39537,7 +39706,8 @@ impl SqlEditorWidget {
             .enumerate()
             .rev()
             .find_map(|(idx, token)| {
-                matches!(token, SqlToken::Symbol(sym) if sym == "," || sym == "(").then_some(idx + 1)
+                matches!(token, SqlToken::Symbol(sym) if sym == "," || sym == "(")
+                    .then_some(idx + 1)
             })
             .unwrap_or(0);
         let segment = &toks[segment_start..open_idx];
@@ -39608,9 +39778,7 @@ impl SqlEditorWidget {
             .collect();
         let user_slot = match items.as_slice() {
             [rename, user] if rename == "RENAME" && user == "USER" => true,
-            [rename, user, .., comma]
-                if rename == "RENAME" && user == "USER" && comma == "," =>
-            {
+            [rename, user, .., comma] if rename == "RENAME" && user == "USER" && comma == "," => {
                 true
             }
             _ => false,
@@ -39628,16 +39796,11 @@ impl SqlEditorWidget {
             .collect::<Vec<_>>();
         let user_slot = match items.as_slice() {
             [verb, object_type]
-                if matches!(verb.as_str(), "ALTER" | "DROP")
-                    && object_type == "USER" =>
+                if matches!(verb.as_str(), "ALTER" | "DROP") && object_type == "USER" =>
             {
                 true
             }
-            [drop, object_type]
-                if drop == "DROP" && object_type == "ROLE" =>
-            {
-                true
-            }
+            [drop, object_type] if drop == "DROP" && object_type == "ROLE" => true,
             [verb, object_type, if_kw, exists_kw]
                 if matches!(verb.as_str(), "ALTER" | "DROP")
                     && object_type == "USER"
@@ -39662,9 +39825,7 @@ impl SqlEditorWidget {
                 true
             }
             [drop, object_type, .., comma]
-                if drop == "DROP"
-                    && object_type == "ROLE"
-                    && comma == "," =>
+                if drop == "DROP" && object_type == "ROLE" && comma == "," =>
             {
                 true
             }
@@ -39700,9 +39861,7 @@ impl SqlEditorWidget {
                 true
             }
             [set, role, .., comma] if set == "SET" && role == "ROLE" && comma == "," => true,
-            [set, default, role] if set == "SET" && default == "DEFAULT" && role == "ROLE" => {
-                true
-            }
+            [set, default, role] if set == "SET" && default == "DEFAULT" && role == "ROLE" => true,
             [set, default, role, .., separator]
                 if set == "SET"
                     && default == "DEFAULT"
@@ -39865,7 +40024,10 @@ impl SqlEditorWidget {
         }
     }
 
-    fn grant_revoke_verb_before_separator(tokens: &[SqlToken], separator_idx: usize) -> Option<&str> {
+    fn grant_revoke_verb_before_separator(
+        tokens: &[SqlToken],
+        separator_idx: usize,
+    ) -> Option<&str> {
         for token in tokens.get(..separator_idx.min(tokens.len()))? {
             if let SqlToken::Word(word) = token {
                 if word.eq_ignore_ascii_case("GRANT") {
@@ -40107,9 +40269,7 @@ impl SqlEditorWidget {
         }
 
         match tokens.get(cursor_token_len.saturating_sub(1)) {
-            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case(prefix) => {
-                cursor_token_len - 1
-            }
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case(prefix) => cursor_token_len - 1,
             _ => end,
         }
     }
@@ -40157,12 +40317,15 @@ impl SqlEditorWidget {
             ExpectedObjectSuggestionKind::NoSuggestions => Vec::new(),
             ExpectedObjectSuggestionKind::SchemaObject => {
                 let mut suggestions = data.get_object_suggestions(prefix);
-                suggestions
-                    .retain(|suggestion| !Self::matches_string_list_case_insensitive(&data.users, suggestion));
+                suggestions.retain(|suggestion| {
+                    !Self::matches_string_list_case_insensitive(&data.users, suggestion)
+                });
                 suggestions
             }
             ExpectedObjectSuggestionKind::Routine => data.get_routine_object_suggestions(prefix),
-            ExpectedObjectSuggestionKind::Executable => data.get_executable_object_suggestions(prefix),
+            ExpectedObjectSuggestionKind::Executable => {
+                data.get_executable_object_suggestions(prefix)
+            }
             ExpectedObjectSuggestionKind::RelationOrSequence => {
                 data.get_relation_or_sequence_object_suggestions(prefix)
             }
@@ -40191,18 +40354,26 @@ impl SqlEditorWidget {
             ExpectedObjectSuggestionKind::DatabaseLink => {
                 data.get_database_link_object_suggestions(prefix)
             }
-            ExpectedObjectSuggestionKind::Directory => data.get_directory_object_suggestions(prefix),
+            ExpectedObjectSuggestionKind::Directory => {
+                data.get_directory_object_suggestions(prefix)
+            }
             ExpectedObjectSuggestionKind::Library => data.get_library_object_suggestions(prefix),
             ExpectedObjectSuggestionKind::Cluster => data.get_cluster_object_suggestions(prefix),
             ExpectedObjectSuggestionKind::Context => data.get_context_object_suggestions(prefix),
-            ExpectedObjectSuggestionKind::Dimension => data.get_dimension_object_suggestions(prefix),
+            ExpectedObjectSuggestionKind::Dimension => {
+                data.get_dimension_object_suggestions(prefix)
+            }
             ExpectedObjectSuggestionKind::Operator => data.get_operator_object_suggestions(prefix),
-            ExpectedObjectSuggestionKind::Indextype => data.get_indextype_object_suggestions(prefix),
+            ExpectedObjectSuggestionKind::Indextype => {
+                data.get_indextype_object_suggestions(prefix)
+            }
             ExpectedObjectSuggestionKind::Edition => data.get_edition_object_suggestions(prefix),
             ExpectedObjectSuggestionKind::JavaSource => {
                 data.get_java_source_object_suggestions(prefix)
             }
-            ExpectedObjectSuggestionKind::JavaClass => data.get_java_class_object_suggestions(prefix),
+            ExpectedObjectSuggestionKind::JavaClass => {
+                data.get_java_class_object_suggestions(prefix)
+            }
             ExpectedObjectSuggestionKind::JavaResource => {
                 data.get_java_resource_object_suggestions(prefix)
             }
@@ -40242,19 +40413,11 @@ impl SqlEditorWidget {
         if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
             match kind {
                 ExpectedObjectSuggestionKind::Routine => {
-                    return Self::matches_string_list_case_insensitive(
-                        &data.procedures,
-                        candidate,
-                    );
+                    return Self::matches_string_list_case_insensitive(&data.procedures, candidate);
                 }
                 ExpectedObjectSuggestionKind::Executable => {
-                    return Self::matches_string_list_case_insensitive(
-                        &data.procedures,
-                        candidate,
-                    ) || Self::matches_string_list_case_insensitive(
-                        &data.functions,
-                        candidate,
-                    );
+                    return Self::matches_string_list_case_insensitive(&data.procedures, candidate)
+                        || Self::matches_string_list_case_insensitive(&data.functions, candidate);
                 }
                 ExpectedObjectSuggestionKind::RelationOrSequence
                 | ExpectedObjectSuggestionKind::ColumnOwner => {
@@ -40300,9 +40463,18 @@ impl SqlEditorWidget {
                         || Self::matches_string_list_case_insensitive(&data.operators, candidate)
                         || Self::matches_string_list_case_insensitive(&data.indextypes, candidate)
                         || Self::matches_string_list_case_insensitive(&data.editions, candidate)
-                        || Self::matches_string_list_case_insensitive(&data.java_sources, candidate)
-                        || Self::matches_string_list_case_insensitive(&data.java_classes, candidate)
-                        || Self::matches_string_list_case_insensitive(&data.java_resources, candidate))
+                        || Self::matches_string_list_case_insensitive(
+                            &data.java_sources,
+                            candidate,
+                        )
+                        || Self::matches_string_list_case_insensitive(
+                            &data.java_classes,
+                            candidate,
+                        )
+                        || Self::matches_string_list_case_insensitive(
+                            &data.java_resources,
+                            candidate,
+                        ))
             }
             ExpectedObjectSuggestionKind::Routine => {
                 Self::matches_string_list_case_insensitive(&data.procedures, candidate)
@@ -40318,7 +40490,10 @@ impl SqlEditorWidget {
             ExpectedObjectSuggestionKind::RelationOrSequence => {
                 Self::matches_string_list_case_insensitive(&data.tables, candidate)
                     || Self::matches_string_list_case_insensitive(&data.views, candidate)
-                    || Self::matches_string_list_case_insensitive(&data.materialized_views, candidate)
+                    || Self::matches_string_list_case_insensitive(
+                        &data.materialized_views,
+                        candidate,
+                    )
                     || Self::matches_string_list_case_insensitive(&data.sequences, candidate)
                     || Self::matches_string_list_case_insensitive(&data.synonyms, candidate)
                     || Self::matches_string_list_case_insensitive(&data.public_synonyms, candidate)
@@ -40326,7 +40501,10 @@ impl SqlEditorWidget {
             ExpectedObjectSuggestionKind::ColumnOwner => {
                 Self::matches_string_list_case_insensitive(&data.tables, candidate)
                     || Self::matches_string_list_case_insensitive(&data.views, candidate)
-                    || Self::matches_string_list_case_insensitive(&data.materialized_views, candidate)
+                    || Self::matches_string_list_case_insensitive(
+                        &data.materialized_views,
+                        candidate,
+                    )
                     || Self::matches_string_list_case_insensitive(&data.synonyms, candidate)
                     || Self::matches_string_list_case_insensitive(&data.public_synonyms, candidate)
             }
@@ -40486,7 +40664,9 @@ impl SqlEditorWidget {
             ExpectedObjectSuggestionKind::PublicSynonym => {
                 Some(&[QualifiedMemberKind::PublicSynonym])
             }
-            ExpectedObjectSuggestionKind::DatabaseLink => Some(&[QualifiedMemberKind::DatabaseLink]),
+            ExpectedObjectSuggestionKind::DatabaseLink => {
+                Some(&[QualifiedMemberKind::DatabaseLink])
+            }
             ExpectedObjectSuggestionKind::Directory => Some(&[QualifiedMemberKind::Directory]),
             ExpectedObjectSuggestionKind::Library => Some(&[QualifiedMemberKind::Library]),
             ExpectedObjectSuggestionKind::Cluster => Some(&[QualifiedMemberKind::Cluster]),
@@ -40497,7 +40677,9 @@ impl SqlEditorWidget {
             ExpectedObjectSuggestionKind::Edition => Some(&[QualifiedMemberKind::Edition]),
             ExpectedObjectSuggestionKind::JavaSource => Some(&[QualifiedMemberKind::JavaSource]),
             ExpectedObjectSuggestionKind::JavaClass => Some(&[QualifiedMemberKind::JavaClass]),
-            ExpectedObjectSuggestionKind::JavaResource => Some(&[QualifiedMemberKind::JavaResource]),
+            ExpectedObjectSuggestionKind::JavaResource => {
+                Some(&[QualifiedMemberKind::JavaResource])
+            }
             ExpectedObjectSuggestionKind::User => Some(&[QualifiedMemberKind::User]),
         }
     }
@@ -40675,16 +40857,16 @@ impl SqlEditorWidget {
             });
             return suggestions;
         }
-        let Some(kind) =
-            Self::expected_object_suggestion_kind_for_db(prefix, Some(qualifier), deep_ctx, db_type)
-        else {
+        let Some(kind) = Self::expected_object_suggestion_kind_for_db(
+            prefix,
+            Some(qualifier),
+            deep_ctx,
+            db_type,
+        ) else {
             return suggestions;
         };
 
-        if matches!(
-            kind,
-            ExpectedObjectSuggestionKind::SchemaObject
-        ) {
+        if matches!(kind, ExpectedObjectSuggestionKind::SchemaObject) {
             let Some(expected_kinds) = Self::expected_qualifier_member_kinds_for_db(kind, db_type)
             else {
                 return suggestions;
@@ -40693,7 +40875,9 @@ impl SqlEditorWidget {
             let mut seen = HashSet::new();
             for suggestion in &suggestions {
                 match data.qualifier_member_matches_kinds(qualifier, suggestion, expected_kinds) {
-                    Some(false) if data.qualifier_member_has_kind_metadata(qualifier, suggestion) => {
+                    Some(false)
+                        if data.qualifier_member_has_kind_metadata(qualifier, suggestion) =>
+                    {
                         continue;
                     }
                     Some(true) | None => {}
@@ -40724,11 +40908,7 @@ impl SqlEditorWidget {
                 }
             }
             if !Self::suggestion_matches_expected_object_kind_for_qualifier(
-                data,
-                qualifier,
-                suggestion,
-                kind,
-                db_type,
+                data, qualifier, suggestion, kind, db_type,
             ) {
                 continue;
             }
@@ -40828,18 +41008,20 @@ impl SqlEditorWidget {
         db_type: Option<crate::db::DatabaseType>,
     ) -> Vec<String> {
         let suggestions = data.get_member_suggestions(qualifier, prefix, true);
-        let kind = Self::expected_object_suggestion_kind_for_db(prefix, Some(qualifier), deep_ctx, db_type)
-            .or_else(|| {
-                let context =
-                    Self::classify_intellisense_context(deep_ctx, deep_ctx.statement_tokens.as_ref());
-                matches!(context, SqlContext::TableName)
-                    .then_some(ExpectedObjectSuggestionKind::RelationOrSequence)
-            });
+        let kind = Self::expected_object_suggestion_kind_for_db(
+            prefix,
+            Some(qualifier),
+            deep_ctx,
+            db_type,
+        )
+        .or_else(|| {
+            let context =
+                Self::classify_intellisense_context(deep_ctx, deep_ctx.statement_tokens.as_ref());
+            matches!(context, SqlContext::TableName)
+                .then_some(ExpectedObjectSuggestionKind::RelationOrSequence)
+        });
         let Some(kind) = kind else { return suggestions };
-        if matches!(
-            kind,
-            ExpectedObjectSuggestionKind::SchemaObject
-        ) {
+        if matches!(kind, ExpectedObjectSuggestionKind::SchemaObject) {
             let all_suggestions = data.get_member_suggestions(qualifier, prefix, false);
             if all_suggestions.is_empty() {
                 return suggestions;
@@ -40859,7 +41041,9 @@ impl SqlEditorWidget {
                             filtered.push(suggestion.clone());
                         }
                     }
-                    Some(false) if data.qualifier_member_has_kind_metadata(qualifier, suggestion) => {
+                    Some(false)
+                        if data.qualifier_member_has_kind_metadata(qualifier, suggestion) =>
+                    {
                         saw_kind_metadata = true;
                     }
                     Some(false) => {
@@ -40883,7 +41067,8 @@ impl SqlEditorWidget {
                 all_suggestions
             };
         }
-        let Some(expected_kinds) = Self::expected_qualifier_member_kinds_for_db(kind, db_type) else {
+        let Some(expected_kinds) = Self::expected_qualifier_member_kinds_for_db(kind, db_type)
+        else {
             return suggestions;
         };
 
@@ -40937,9 +41122,9 @@ impl SqlEditorWidget {
         db_type: Option<crate::db::DatabaseType>,
     ) -> Vec<String> {
         match Self::expected_object_suggestion_kind_for_db(prefix, None, deep_ctx, db_type) {
-            Some(kind) => {
-                Self::collect_expected_object_suggestions_for_kind_for_db(data, prefix, kind, db_type)
-            }
+            Some(kind) => Self::collect_expected_object_suggestions_for_kind_for_db(
+                data, prefix, kind, db_type,
+            ),
             None => Vec::new(),
         }
     }
@@ -41033,7 +41218,8 @@ impl SqlEditorWidget {
         virtual_table_columns: &HashMap<String, Vec<String>>,
         intellisense_data: &Arc<Mutex<IntellisenseData>>,
     ) -> Vec<String> {
-        if let Some(columns) = Self::virtual_table_columns_for_lookup(virtual_table_columns, table) {
+        if let Some(columns) = Self::virtual_table_columns_for_lookup(virtual_table_columns, table)
+        {
             return columns.to_vec();
         }
 
@@ -41234,7 +41420,11 @@ impl SqlEditorWidget {
             return None;
         }
 
-        let all_tables = lefts.iter().copied().chain(std::iter::once(right)).collect::<Vec<_>>();
+        let all_tables = lefts
+            .iter()
+            .copied()
+            .chain(std::iter::once(right))
+            .collect::<Vec<_>>();
         for right_index in (1..all_tables.len()).rev() {
             let right = all_tables[right_index];
             let right_q = Self::auto_join_qualifier(right);
@@ -41508,9 +41698,9 @@ impl SqlEditorWidget {
         // bare `*` argument of `COUNT(*)` — the one function that admits it — with
         // the cursor sitting immediately after the `(`. Any other call
         // (`SUM(|)`, `NVL(|, 0)`, `TRIM(|)`) takes a value expression, never `*`.
-        let cursor_right_after_open = Self::meaningful_tokens_before(tokens, end).last().is_some_and(
-            |token| matches!(token, SqlToken::Symbol(sym) if sym == "("),
-        );
+        let cursor_right_after_open = Self::meaningful_tokens_before(tokens, end)
+            .last()
+            .is_some_and(|token| matches!(token, SqlToken::Symbol(sym) if sym == "("));
         let enclosing_call_is_count = Self::innermost_open_paren_preceding_word(tokens, end)
             .is_some_and(|word| word.eq_ignore_ascii_case("COUNT"));
         if cursor_right_after_open && enclosing_call_is_count {
@@ -41779,7 +41969,11 @@ impl SqlEditorWidget {
 
         for subq in &body_ctx.subqueries {
             if let Some(columns) = Self::explicit_subquery_columns_for_completion(&body_ctx, subq) {
-                Self::insert_virtual_table_columns(&mut virtual_table_columns, &subq.alias, columns);
+                Self::insert_virtual_table_columns(
+                    &mut virtual_table_columns,
+                    &subq.alias,
+                    columns,
+                );
                 continue;
             }
             let relation_tokens = intellisense_context::token_range_slice(
@@ -41822,7 +42016,11 @@ impl SqlEditorWidget {
                 connection,
             );
             if !columns.is_empty() {
-                Self::insert_virtual_table_columns(&mut virtual_table_columns, &subq.alias, columns);
+                Self::insert_virtual_table_columns(
+                    &mut virtual_table_columns,
+                    &subq.alias,
+                    columns,
+                );
             }
         }
 
@@ -41946,8 +42144,7 @@ impl SqlEditorWidget {
                 .into_iter()
                 .map(|column| Self::completion_identifier_lookup_upper(&column))
                 .collect();
-            common_columns
-                .retain(|(_, upper)| allowed.contains(upper));
+            common_columns.retain(|(_, upper)| allowed.contains(upper));
         }
 
         let prefix_upper = Self::completion_identifier_lookup_upper(prefix);
@@ -42033,12 +42230,13 @@ impl SqlEditorWidget {
 
         if let SqlToken::Word(word) = &token {
             if matches!(word.to_ascii_uppercase().as_str(), "ALL" | "DISTINCT") {
-            token_idx = Self::previous_meaningful_token_index_before(tokens, token_idx).unwrap_or(0);
-            let Some(previous_token) = tokens.get(token_idx) else {
-                return false;
-            };
-            token = previous_token;
-        }
+                token_idx =
+                    Self::previous_meaningful_token_index_before(tokens, token_idx).unwrap_or(0);
+                let Some(previous_token) = tokens.get(token_idx) else {
+                    return false;
+                };
+                token = previous_token;
+            }
         }
 
         matches!(
@@ -42206,7 +42404,10 @@ impl SqlEditorWidget {
         relation_name: &str,
         columns: Vec<String>,
     ) {
-        virtual_table_columns.insert(Self::completion_identifier_lookup_upper(relation_name), columns);
+        virtual_table_columns.insert(
+            Self::completion_identifier_lookup_upper(relation_name),
+            columns,
+        );
     }
 
     fn is_cursor_inside_subquery_explicit_column_list(
@@ -42340,7 +42541,10 @@ impl SqlEditorWidget {
         db_type: Option<crate::db::DatabaseType>,
     ) -> bool {
         if !crate::sql_text::mysql_compatibility_for_sql("", db_type)
-            || !matches!(deep_ctx.phase, intellisense_context::SqlPhase::DmlSetTargetList)
+            || !matches!(
+                deep_ctx.phase,
+                intellisense_context::SqlPhase::DmlSetTargetList
+            )
         {
             return false;
         }
@@ -42375,11 +42579,15 @@ impl SqlEditorWidget {
     ) -> Option<(usize, usize, Vec<usize>)> {
         let end = end.min(tokens.len());
         let depths = crate::ui::sql_depth::paren_depths(tokens);
-        let update_idx = tokens.iter().enumerate().take(end).find_map(|(idx, token)| {
-            (crate::ui::sql_depth::is_top_level_depth(&depths, idx)
-                && matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("UPDATE")))
-            .then_some(idx)
-        })?;
+        let update_idx = tokens
+            .iter()
+            .enumerate()
+            .take(end)
+            .find_map(|(idx, token)| {
+                (crate::ui::sql_depth::is_top_level_depth(&depths, idx)
+                    && matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("UPDATE")))
+                .then_some(idx)
+            })?;
         let set_idx = tokens
             .iter()
             .enumerate()
@@ -42394,14 +42602,20 @@ impl SqlEditorWidget {
     }
 
     fn relation_name_ending_at(tokens: &[SqlToken], end_idx: usize) -> Option<String> {
-        if !matches!(tokens.get(end_idx), Some(SqlToken::Word(_) | SqlToken::String(_))) {
+        if !matches!(
+            tokens.get(end_idx),
+            Some(SqlToken::Word(_) | SqlToken::String(_))
+        ) {
             return None;
         }
 
         let mut start_idx = end_idx;
         while start_idx >= 2
             && matches!(tokens.get(start_idx - 1), Some(SqlToken::Symbol(sym)) if sym == ".")
-            && matches!(tokens.get(start_idx - 2), Some(SqlToken::Word(_) | SqlToken::String(_)))
+            && matches!(
+                tokens.get(start_idx - 2),
+                Some(SqlToken::Word(_) | SqlToken::String(_))
+            )
         {
             start_idx -= 2;
         }
@@ -42562,18 +42776,15 @@ impl SqlEditorWidget {
             return Self::resolve_all_scope_column_lookup_tables(deep_ctx);
         };
 
-        if let Some(scope) = Self::oracle_trigger_when_alias_column_scope_for_qualifier(
-            deep_ctx,
-            qualifier,
-            db_type,
-        ) {
+        if let Some(scope) =
+            Self::oracle_trigger_when_alias_column_scope_for_qualifier(deep_ctx, qualifier, db_type)
+        {
             return scope;
         }
         if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
-            if let Some(scope) = Self::mysql_trigger_pseudo_row_column_scope_for_qualifier(
-                deep_ctx,
-                qualifier,
-            ) {
+            if let Some(scope) =
+                Self::mysql_trigger_pseudo_row_column_scope_for_qualifier(deep_ctx, qualifier)
+            {
                 return scope;
             }
             if let Some(scope) =
@@ -42621,9 +42832,7 @@ impl SqlEditorWidget {
             .iter()
             .any(|var| var.eq_ignore_ascii_case(qualifier))
         {
-            return intellisense_context::resolve_all_scope_tables(
-                &deep_ctx.tables_in_scope,
-            );
+            return intellisense_context::resolve_all_scope_tables(&deep_ctx.tables_in_scope);
         }
 
         let mut resolved = resolved;
@@ -42777,10 +42986,11 @@ impl SqlEditorWidget {
 
         let current_query_tokens = Self::current_query_tokens(deep_ctx);
         let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
-        let current_query_tables = intellisense_context::collect_tables_in_statement_declared_before_cursor(
-            current_query_tokens,
-            cursor_token_len,
-        );
+        let current_query_tables =
+            intellisense_context::collect_tables_in_statement_declared_before_cursor(
+                current_query_tokens,
+                cursor_token_len,
+            );
         if current_query_tables.is_empty() {
             return deep_ctx.tables_in_scope_before_cursor.clone();
         }
@@ -42902,11 +43112,7 @@ impl SqlEditorWidget {
         deep_ctx: &intellisense_context::CursorContext,
     ) -> Vec<String> {
         Self::collect_qualified_condition_comparison_suggestions_for_db(
-            data,
-            prefix,
-            qualifier,
-            deep_ctx,
-            None,
+            data, prefix, qualifier, deep_ctx, None,
         )
     }
 
@@ -42962,9 +43168,11 @@ impl SqlEditorWidget {
             deep_ctx.phase,
             intellisense_context::SqlPhase::MatchRecognizeClause
         )
-        .then(|| intellisense_context::extract_match_recognize_pattern_variables(
-            Self::current_query_tokens(deep_ctx),
-        ))
+        .then(|| {
+            intellisense_context::extract_match_recognize_pattern_variables(
+                Self::current_query_tokens(deep_ctx),
+            )
+        })
         .filter(|variables| {
             variables
                 .iter()
@@ -43279,10 +43487,7 @@ impl SqlEditorWidget {
         }
     }
 
-    fn resolve_table_column_load_key(
-        data: &IntellisenseData,
-        table_name: &str,
-    ) -> Option<String> {
+    fn resolve_table_column_load_key(data: &IntellisenseData, table_name: &str) -> Option<String> {
         let candidates = Self::table_lookup_key_candidates(table_name);
         let normalized = candidates.first()?.trim();
         if normalized.is_empty() {
@@ -43502,7 +43707,8 @@ impl SqlEditorWidget {
     }
 
     fn completion_identifiers_match(left: &str, right: &str) -> bool {
-        Self::completion_identifier_lookup_upper(left) == Self::completion_identifier_lookup_upper(right)
+        Self::completion_identifier_lookup_upper(left)
+            == Self::completion_identifier_lookup_upper(right)
     }
 
     fn is_unquoted_completion_identifier(text: &str) -> bool {
