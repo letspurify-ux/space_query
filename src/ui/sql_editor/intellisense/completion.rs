@@ -836,7 +836,6 @@ enum AnalyticNullTreatmentCall {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExpectedObjectSuggestionKind {
     NoSuggestions,
-    Any,
     SchemaObject,
     Routine,
     Executable,
@@ -39725,12 +39724,10 @@ impl SqlEditorWidget {
             .into_iter()
             .filter_map(Self::mysql_user_account_slot_item)
             .collect::<Vec<_>>();
-        let account_slot = match items.as_slice() {
-            [set, password, for_kw] if set == "SET" && password == "PASSWORD" && for_kw == "FOR" => {
-                true
-            }
-            _ => false,
-        };
+        let account_slot = matches!(
+            items.as_slice(),
+            [set, password, for_kw] if set == "SET" && password == "PASSWORD" && for_kw == "FOR"
+        );
         account_slot.then_some(ExpectedObjectSuggestionKind::User)
     }
 
@@ -40158,7 +40155,6 @@ impl SqlEditorWidget {
 
         let suggestions = match kind {
             ExpectedObjectSuggestionKind::NoSuggestions => Vec::new(),
-            ExpectedObjectSuggestionKind::Any => data.get_object_suggestions(prefix),
             ExpectedObjectSuggestionKind::SchemaObject => {
                 let mut suggestions = data.get_object_suggestions(prefix);
                 suggestions
@@ -40271,7 +40267,6 @@ impl SqlEditorWidget {
 
         match kind {
             ExpectedObjectSuggestionKind::NoSuggestions => false,
-            ExpectedObjectSuggestionKind::Any => true,
             ExpectedObjectSuggestionKind::SchemaObject => {
                 !Self::matches_string_list_case_insensitive(&data.users, candidate)
                     && (Self::matches_string_list_case_insensitive(&data.tables, candidate)
@@ -40421,7 +40416,7 @@ impl SqlEditorWidget {
     ) -> Option<&'static [QualifiedMemberKind]> {
         match kind {
             ExpectedObjectSuggestionKind::NoSuggestions => Some(&[]),
-            ExpectedObjectSuggestionKind::Any | ExpectedObjectSuggestionKind::SchemaObject => Some(&[
+            ExpectedObjectSuggestionKind::SchemaObject => Some(&[
                 QualifiedMemberKind::Table,
                 QualifiedMemberKind::View,
                 QualifiedMemberKind::MaterializedView,
@@ -40688,7 +40683,7 @@ impl SqlEditorWidget {
 
         if matches!(
             kind,
-            ExpectedObjectSuggestionKind::Any | ExpectedObjectSuggestionKind::SchemaObject
+            ExpectedObjectSuggestionKind::SchemaObject
         ) {
             let Some(expected_kinds) = Self::expected_qualifier_member_kinds_for_db(kind, db_type)
             else {
@@ -40843,7 +40838,7 @@ impl SqlEditorWidget {
         let Some(kind) = kind else { return suggestions };
         if matches!(
             kind,
-            ExpectedObjectSuggestionKind::Any | ExpectedObjectSuggestionKind::SchemaObject
+            ExpectedObjectSuggestionKind::SchemaObject
         ) {
             let all_suggestions = data.get_member_suggestions(qualifier, prefix, false);
             if all_suggestions.is_empty() {
@@ -42412,8 +42407,8 @@ impl SqlEditorWidget {
         }
 
         let mut name = String::new();
-        for idx in start_idx..=end_idx {
-            match &tokens[idx] {
+        for token in tokens.iter().take(end_idx + 1).skip(start_idx) {
+            match token {
                 SqlToken::Word(word) | SqlToken::String(word) => name.push_str(word),
                 SqlToken::Symbol(sym) if sym == "." => name.push('.'),
                 _ => return None,
