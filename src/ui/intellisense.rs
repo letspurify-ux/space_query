@@ -1161,10 +1161,10 @@ impl IntellisenseData {
         // be invoked as its own statement (`CALL`/`EXEC`/a PL/SQL call), never
         // as a token inside a value expression — only functions can. So they
         // are skipped in an expression/column context (`prefer_columns`), while
-        // packages (a `pkg.func` namespace), functions, sequences and types stay
-        // available. The catalog populates `procedure_entries` strictly from
-        // `object_type = 'PROCEDURE'` (functions land in `function_entries`), so
-        // this never hides a callable function.
+        // packages (a `pkg.func` namespace), functions, and Oracle sequences/
+        // types stay available. The catalog populates `procedure_entries`
+        // strictly from `object_type = 'PROCEDURE'` (functions land in
+        // `function_entries`), so this never hides a callable function.
         if !prefer_columns
             && Self::push_matching_entries(
                 &self.procedure_entries,
@@ -1199,13 +1199,15 @@ impl IntellisenseData {
             return suggestions;
         }
 
-        if Self::push_matching_entries(
-            &self.sequence_entries,
-            &prefix_upper,
-            prefix,
-            &mut suggestions,
-            &mut seen,
-        ) {
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            && Self::push_matching_entries(
+                &self.sequence_entries,
+                &prefix_upper,
+                prefix,
+                &mut suggestions,
+                &mut seen,
+            )
+        {
             return suggestions;
         }
 
@@ -6511,6 +6513,40 @@ mod intellisense_tests {
                 );
                 assert!(
                     suggestions.iter().any(|name| name == "ADDR_FUNC"),
+                    "{db_type:?} {label} catalog should keep ordinary functions: {suggestions:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mysql_general_catalog_excludes_oracle_sequence_objects() {
+        let mut data = IntellisenseData::new();
+        data.sequences = vec!["EMP_SEQ".to_string()];
+        data.functions = vec!["EMP_FUNC".to_string()];
+        data.rebuild_indices();
+
+        let oracle = Some(crate::db::DatabaseType::Oracle);
+        let oracle_general = data.get_suggestions_for_db("EMP", false, None, false, false, oracle);
+        assert!(
+            oracle_general.iter().any(|name| name == "EMP_SEQ"),
+            "Oracle general catalog should keep sequence objects: {oracle_general:?}"
+        );
+
+        for db_type in [
+            crate::db::DatabaseType::MySQL,
+            crate::db::DatabaseType::MariaDB,
+        ] {
+            let db = Some(db_type);
+            for (prefer_columns, label) in [(false, "general"), (true, "expression")] {
+                let suggestions =
+                    data.get_suggestions_for_db("EMP", false, None, false, prefer_columns, db);
+                assert!(
+                    !suggestions.iter().any(|name| name == "EMP_SEQ"),
+                    "{db_type:?} {label} catalog must not offer Oracle sequence objects: {suggestions:?}"
+                );
+                assert!(
+                    suggestions.iter().any(|name| name == "EMP_FUNC"),
                     "{db_type:?} {label} catalog should keep ordinary functions: {suggestions:?}"
                 );
             }

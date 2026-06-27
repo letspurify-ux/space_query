@@ -2277,6 +2277,12 @@ impl SqlEditorWidget {
                 !snapshot.prefix.is_empty(),
                 Some(snapshot.preferred_db_type),
             );
+        let at_completed_oracle_sequence_pseudocolumn = qualifier.is_none()
+            && Self::cursor_is_after_oracle_sequence_pseudocolumn_for_context(
+                deep_ctx,
+                !snapshot.prefix.is_empty(),
+                Some(snapshot.preferred_db_type),
+            );
         let at_column_property_argument_slot = qualifier.is_none()
             && Self::cursor_is_at_column_property_argument_slot_for_context(
                 deep_ctx,
@@ -3010,6 +3016,7 @@ impl SqlEditorWidget {
             suggestions
         } else if at_oracle_trigger_when_condition
             || at_package_declaration_default_value_empty_operand_start
+            || at_completed_oracle_sequence_pseudocolumn
         {
             Vec::new()
         } else if at_keyword_only_identifier_slot
@@ -9195,6 +9202,209 @@ impl SqlEditorWidget {
         )
     }
 
+    fn cursor_is_at_mysql_oracle_only_dml_error_logging_slot(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            || Self::unclosed_paren_count(tokens, end) != 0
+        {
+            return false;
+        }
+
+        let words = Self::meaningful_tokens_before(tokens, end)
+            .iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if !matches!(
+            words.first().map(String::as_str),
+            Some("INSERT" | "UPDATE" | "DELETE" | "MERGE")
+        ) {
+            return false;
+        }
+
+        Self::expected_dml_error_logging_keyword_candidates(tokens, end, None).is_some()
+            || Self::cursor_is_after_complete_dml_error_logging_tail(tokens, end, None)
+            || Self::top_level_word_pair_present_before(tokens, end, "LOG", "ERRORS")
+    }
+
+    fn cursor_is_at_mysql_oracle_only_dml_error_logging_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let context_end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::cursor_is_at_mysql_oracle_only_dml_error_logging_slot(tokens, context_end, db_type)
+            || {
+                let statement_tokens = deep_ctx.statement_tokens.as_ref();
+                let statement_context_end = Self::expected_suggestion_context_end(
+                    statement_tokens,
+                    deep_ctx.cursor_token_len,
+                    exclude_current_identifier_chain,
+                );
+                Self::cursor_is_at_mysql_oracle_only_dml_error_logging_slot(
+                    statement_tokens,
+                    statement_context_end,
+                    db_type,
+                )
+            }
+    }
+
+    fn cursor_is_at_mysql_oracle_only_hierarchical_clause_slot(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            || Self::unclosed_paren_count(tokens, end) != 0
+        {
+            return false;
+        }
+
+        let words = Self::meaningful_tokens_before(tokens, end)
+            .iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let Some(select_idx) = words.iter().rposition(|word| word == "SELECT") else {
+            return false;
+        };
+        let Some(from_pos) = words[select_idx + 1..]
+            .iter()
+            .position(|word| word == "FROM")
+            .map(|idx| select_idx + 1 + idx)
+        else {
+            return false;
+        };
+        let after_from = &words[from_pos + 1..];
+        if after_from.len() < 2 {
+            return false;
+        }
+
+        let after_relation_tail = &after_from[1..];
+        matches!(
+            after_relation_tail.last().map(String::as_str),
+            Some("CONNECT" | "START")
+        ) || after_relation_tail
+            .windows(2)
+            .any(|window| matches!(window, [a, b] if (a == "CONNECT" && b == "BY")
+                || (a == "START" && b == "WITH")
+                || (a == "ORDER" && b == "SIBLINGS")))
+    }
+
+    fn cursor_is_at_mysql_oracle_only_hierarchical_clause_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let context_end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::cursor_is_at_mysql_oracle_only_hierarchical_clause_slot(
+            tokens,
+            context_end,
+            db_type,
+        ) || {
+            let statement_tokens = deep_ctx.statement_tokens.as_ref();
+            let statement_context_end = Self::expected_suggestion_context_end(
+                statement_tokens,
+                deep_ctx.cursor_token_len,
+                exclude_current_identifier_chain,
+            );
+            Self::cursor_is_at_mysql_oracle_only_hierarchical_clause_slot(
+                statement_tokens,
+                statement_context_end,
+                db_type,
+            )
+        }
+    }
+
+    fn cursor_is_at_mysql_oracle_only_advanced_table_clause_slot(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return false;
+        }
+
+        for keyword in ["PIVOT", "UNPIVOT", "MATCH_RECOGNIZE"] {
+            if Self::table_clause_construct_has_table_source_anchor(tokens, end, keyword)
+                && Self::table_clause_construct_is_open(tokens, end, keyword)
+            {
+                return true;
+            }
+        }
+
+        if !Self::table_clause_construct_has_table_source_anchor(tokens, end, "MODEL") {
+            return false;
+        }
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        let Some(model_pos) = toks.iter().rposition(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("MODEL")),
+        ) else {
+            return false;
+        };
+
+        toks[model_pos + 1..].iter().any(|token| {
+            matches!(
+                token,
+                SqlToken::Word(word)
+                    if matches!(
+                        word.to_ascii_uppercase().as_str(),
+                        "PARTITION" | "DIMENSION" | "MEASURES" | "RULES"
+                    )
+            )
+        })
+    }
+
+    fn cursor_is_at_mysql_oracle_only_advanced_table_clause_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let context_end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::cursor_is_at_mysql_oracle_only_advanced_table_clause_slot(
+            tokens,
+            context_end,
+            db_type,
+        ) || {
+            let statement_tokens = deep_ctx.statement_tokens.as_ref();
+            let statement_context_end = Self::expected_suggestion_context_end(
+                statement_tokens,
+                deep_ctx.cursor_token_len,
+                exclude_current_identifier_chain,
+            );
+            Self::cursor_is_at_mysql_oracle_only_advanced_table_clause_slot(
+                statement_tokens,
+                statement_context_end,
+                db_type,
+            )
+        }
+    }
+
     fn type_display_from_token_range(
         tokens: &[SqlToken],
         start: usize,
@@ -10595,6 +10805,11 @@ impl SqlEditorWidget {
         if Self::data_type_position_for_context_for_db(deep_ctx, true, db_type).is_some_and(
             |position| !Self::data_type_position_allows_user_type_objects(position, db_type),
         ) {
+            return None;
+        }
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            && Self::cursor_is_at_sequence_pseudocolumn_owner_slot_for_context(deep_ctx, true)
+        {
             return None;
         }
 
@@ -16929,6 +17144,21 @@ impl SqlEditorWidget {
                 db_type,
             )
             .is_some()
+            || Self::cursor_is_at_mysql_oracle_only_dml_error_logging_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+            || Self::cursor_is_at_mysql_oracle_only_hierarchical_clause_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+            || Self::cursor_is_at_mysql_oracle_only_advanced_table_clause_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
             || Self::cursor_is_after_complete_dml_error_logging_tail_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
@@ -16974,6 +17204,11 @@ impl SqlEditorWidget {
                 db_type,
             )
             || Self::cursor_is_at_transaction_or_lock_value_non_catalog_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+            || Self::cursor_is_at_mysql_oracle_only_associate_statistics_slot_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
                 db_type,
@@ -17446,6 +17681,16 @@ impl SqlEditorWidget {
                 exclude_current_identifier_chain,
                 db_type,
             )
+            || Self::cursor_is_at_mysql_oracle_only_hierarchical_clause_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+            || Self::cursor_is_at_mysql_oracle_only_advanced_table_clause_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
             || Self::cursor_is_at_mysql_on_duplicate_keyword_tail_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
@@ -17618,6 +17863,18 @@ impl SqlEditorWidget {
             exclude_current_identifier_chain,
             db_type,
         ) || Self::cursor_is_inside_oracle_lob_storage_clause_value_slot_for_context(
+            deep_ctx,
+            exclude_current_identifier_chain,
+            db_type,
+        ) || Self::cursor_is_at_mysql_oracle_only_dml_error_logging_slot_for_context(
+            deep_ctx,
+            exclude_current_identifier_chain,
+            db_type,
+        ) || Self::cursor_is_at_mysql_oracle_only_hierarchical_clause_slot_for_context(
+            deep_ctx,
+            exclude_current_identifier_chain,
+            db_type,
+        ) || Self::cursor_is_at_mysql_oracle_only_advanced_table_clause_slot_for_context(
             deep_ctx,
             exclude_current_identifier_chain,
             db_type,
@@ -18371,6 +18628,9 @@ impl SqlEditorWidget {
         })?;
 
         let mysql_compatible = crate::sql_text::mysql_compatibility_for_sql("", db_type);
+        if mysql_compatible && lead == "MERGE" {
+            return Some(&[]);
+        }
 
         match lead.as_str() {
             "UPDATE" if matches!(phase, SqlPhase::UpdateTarget) => Some(&["SET"]),
@@ -18413,15 +18673,21 @@ impl SqlEditorWidget {
         if Self::top_level_word_pair_present_before(tokens, end, "LOG", "ERRORS") {
             return None;
         }
-        if Self::expected_dml_target_keyword_candidates(tokens, end, phase, db_type).is_some() {
-            return None;
-        }
-
         let toks = Self::meaningful_tokens_before(tokens, end);
         let lead = toks.iter().find_map(|token| match token {
             SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
             _ => None,
         })?;
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            && lead == "MERGE"
+            && matches!(phase, SqlPhase::IntoClause | SqlPhase::MergeTarget)
+        {
+            return Some(ExpectedObjectSuggestionKind::NoSuggestions);
+        }
+
+        if Self::expected_dml_target_keyword_candidates(tokens, end, phase, db_type).is_some() {
+            return None;
+        }
 
         match lead.as_str() {
             "UPDATE"
@@ -21597,6 +21863,9 @@ impl SqlEditorWidget {
             .collect::<Vec<_>>();
         let head = words.first()?.as_str();
         let mysql = crate::sql_text::mysql_compatibility_for_sql("", db_type);
+        if Self::cursor_is_at_mysql_oracle_only_dml_error_logging_slot(tokens, end, db_type) {
+            return Some(&[]);
+        }
         let contains = |keyword: &str| words.iter().any(|word| word == keyword);
         // `RETURNING` and `LOG` must be counted only at the statement top level —
         // both also occur *inside* a closed function call (`f(x RETURNING y)`, the
@@ -27978,7 +28247,15 @@ impl SqlEditorWidget {
                 return Some(&["RECURSIVE"]);
             }
             if mysql && has("RECURSIVE") && !has("AS") {
-                return Some(&["AS"]);
+                let cte_name_started = cte_top_level_words
+                    .iter()
+                    .skip_while(|word| *word != "RECURSIVE")
+                    .skip(1)
+                    .any(|word| !matches!(word.as_str(), "," | "(" | ")"));
+                return cte_name_started.then_some(&["AS"]);
+            }
+            if mysql && saw_top_level_as && (saw_top_level_search || saw_top_level_cycle) {
+                return Some(&[]);
             }
             if mysql && after_complete_cte_body && saw_top_level_as {
                 // MySQL CTEs have no SEARCH/CYCLE; the main query follows.
@@ -28091,6 +28368,20 @@ impl SqlEditorWidget {
         if !matches!(toks.first(), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("WITH"))
         {
             return false;
+        }
+        match toks.as_slice() {
+            [SqlToken::Word(with_kw)]
+                if with_kw.eq_ignore_ascii_case("WITH") =>
+            {
+                return true;
+            }
+            [SqlToken::Word(with_kw), SqlToken::Word(recursive)]
+                if with_kw.eq_ignore_ascii_case("WITH")
+                    && recursive.eq_ignore_ascii_case("RECURSIVE") =>
+            {
+                return true;
+            }
+            _ => {}
         }
         if !matches!(toks.last(), Some(SqlToken::Symbol(sym)) if sym == ",") {
             return false;
@@ -31636,6 +31927,52 @@ impl SqlEditorWidget {
                         | "WITH"
                 ),
                 _ => false,
+            })
+    }
+
+    fn cursor_is_at_oracle_instead_of_trigger_view_target_slot(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return false;
+        }
+        if !Self::cursor_is_at_create_on_table_target_slot(tokens, end) {
+            return false;
+        }
+
+        let toks = Self::meaningful_tokens_with_indices_before(tokens, end);
+        if !matches!(toks.last(), Some((_, SqlToken::Word(word))) if word.eq_ignore_ascii_case("ON"))
+        {
+            return false;
+        }
+
+        let Some(trigger_idx) = toks.iter().rposition(|(_, token)| {
+            matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("TRIGGER"))
+        }) else {
+            return false;
+        };
+        let Some(create_idx) = toks[..trigger_idx].iter().rposition(|(_, token)| {
+            matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("CREATE"))
+        }) else {
+            return false;
+        };
+
+        if !Self::token_can_begin_statement_at(tokens, toks[create_idx].0) {
+            return false;
+        }
+
+        toks[trigger_idx + 1..toks.len() - 1]
+            .windows(2)
+            .any(|pair| {
+                matches!(
+                    pair,
+                    [
+                        (_, SqlToken::Word(first)),
+                        (_, SqlToken::Word(second))
+                    ] if first.eq_ignore_ascii_case("INSTEAD") && second.eq_ignore_ascii_case("OF")
+                )
             })
     }
 
@@ -38337,6 +38674,99 @@ impl SqlEditorWidget {
         Self::expected_object_suggestion_kind_for_db(prefix, qualifier, deep_ctx, None)
     }
 
+    fn cursor_is_at_oracle_sequence_pseudocolumn_owner_slot(
+        tokens: &[SqlToken],
+        context_end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        !crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            && Self::cursor_is_at_sequence_pseudocolumn_owner_slot(tokens, context_end)
+    }
+
+    fn cursor_is_at_sequence_pseudocolumn_owner_slot(
+        tokens: &[SqlToken],
+        context_end: usize,
+    ) -> bool {
+        let mut idx = context_end.min(tokens.len());
+        if matches!(tokens.get(idx), Some(SqlToken::Symbol(sym)) if sym == ".") {
+            return Self::token_is_sequence_pseudocolumn(tokens.get(idx + 1));
+        }
+
+        while matches!(
+            tokens.get(idx),
+            Some(SqlToken::Word(_) | SqlToken::String(_))
+        ) {
+            idx += 1;
+            if !matches!(tokens.get(idx), Some(SqlToken::Symbol(sym)) if sym == ".") {
+                break;
+            }
+            if Self::token_is_sequence_pseudocolumn(tokens.get(idx + 1)) {
+                return true;
+            }
+            if matches!(tokens.get(idx + 1), Some(SqlToken::Symbol(sym)) if sym == ".")
+                && Self::token_is_sequence_pseudocolumn(tokens.get(idx + 2))
+            {
+                return true;
+            }
+            idx += 1;
+        }
+
+        false
+    }
+
+    fn cursor_is_at_sequence_pseudocolumn_owner_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> bool {
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let context_end = Self::expected_suggestion_context_end(
+            tokens,
+            deep_ctx.cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::cursor_is_at_sequence_pseudocolumn_owner_slot(tokens, context_end)
+    }
+
+    fn cursor_is_after_oracle_sequence_pseudocolumn_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let context_end = Self::expected_suggestion_context_end(
+            tokens,
+            deep_ctx.cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::cursor_is_after_oracle_sequence_pseudocolumn(tokens, context_end, db_type)
+    }
+
+    fn cursor_is_after_oracle_sequence_pseudocolumn(
+        tokens: &[SqlToken],
+        context_end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) || context_end < 3 {
+            return false;
+        }
+
+        Self::token_is_sequence_pseudocolumn(tokens.get(context_end - 1))
+            && matches!(tokens.get(context_end - 2), Some(SqlToken::Symbol(sym)) if sym == ".")
+            && matches!(
+                tokens.get(context_end - 3),
+                Some(SqlToken::Word(_) | SqlToken::String(_))
+            )
+    }
+
+    fn token_is_sequence_pseudocolumn(token: Option<&SqlToken>) -> bool {
+        matches!(
+            token,
+            Some(SqlToken::Word(word))
+                if word.eq_ignore_ascii_case("NEXTVAL")
+                    || word.eq_ignore_ascii_case("CURRVAL")
+        )
+    }
+
     fn expected_object_suggestion_kind_for_db(
         prefix: &str,
         qualifier: Option<&str>,
@@ -38364,6 +38794,13 @@ impl SqlEditorWidget {
             cursor_token_len,
             exclude_current_identifier_chain,
         );
+        if Self::cursor_is_at_oracle_sequence_pseudocolumn_owner_slot(
+            tokens,
+            context_end,
+            db_type,
+        ) {
+            return Some(ExpectedObjectSuggestionKind::Sequence);
+        }
         if Self::cursor_is_at_plsql_record_field_type(tokens, context_end)
             && Self::data_type_position_allowed_for_db(DataTypePosition::Plsql, db_type)
         {
@@ -38573,6 +39010,13 @@ impl SqlEditorWidget {
         {
             return Some(ExpectedObjectSuggestionKind::SchemaObject);
         }
+        if Self::cursor_is_at_oracle_instead_of_trigger_view_target_slot(
+            tokens,
+            context_end,
+            db_type,
+        ) {
+            return Some(ExpectedObjectSuggestionKind::View);
+        }
         if Self::cursor_is_at_create_on_table_target_slot(tokens, context_end) {
             return Some(ExpectedObjectSuggestionKind::Table);
         }
@@ -38643,7 +39087,19 @@ impl SqlEditorWidget {
                 ExpectedObjectSuggestionKind::NoSuggestions
             }
         };
+        if mysql_compatible
+            && matches!(
+                words.first().map(String::as_str),
+                Some("ASSOCIATE" | "DISASSOCIATE")
+            )
+            && words.iter().any(|word| word == "STATISTICS")
+        {
+            return Some(ExpectedObjectSuggestionKind::NoSuggestions);
+        }
         match words.as_slice() {
+            [last] if mysql_compatible && *last == "TRUNCATE" => {
+                Some(ExpectedObjectSuggestionKind::Table)
+            }
             [.., prev, last]
                 if *last == "TABLE"
                     && ((!mysql_compatible
@@ -38675,21 +39131,21 @@ impl SqlEditorWidget {
                 Some(ExpectedObjectSuggestionKind::Table)
             }
             [.., a, b, c] if *a == "COMMENT" && *b == "ON" && *c == "TABLE" => {
-                Some(ExpectedObjectSuggestionKind::Table)
+                Some(oracle_only_kind(ExpectedObjectSuggestionKind::Table))
             }
             [.., a, b, c] if *a == "COMMENT" && *b == "ON" && *c == "COLUMN" => {
-                Some(ExpectedObjectSuggestionKind::ColumnOwner)
+                Some(oracle_only_kind(ExpectedObjectSuggestionKind::ColumnOwner))
             }
             [.., prev, last] if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "VIEW" => {
                 Some(ExpectedObjectSuggestionKind::View)
             }
             [.., a, b, c] if *a == "COMMENT" && *b == "ON" && *c == "VIEW" => {
-                Some(ExpectedObjectSuggestionKind::View)
+                Some(oracle_only_kind(ExpectedObjectSuggestionKind::View))
             }
             [.., a, b, c, d]
                 if *a == "COMMENT" && *b == "ON" && *c == "EDITIONING" && *d == "VIEW" =>
             {
-                Some(ExpectedObjectSuggestionKind::View)
+                Some(oracle_only_kind(ExpectedObjectSuggestionKind::View))
             }
             [.., a, b, c]
                 if matches!(a.as_str(), "ALTER" | "DROP")
@@ -38703,21 +39159,23 @@ impl SqlEditorWidget {
             [.., a, b, c, d]
                 if *a == "COMMENT" && *b == "ON" && *c == "MATERIALIZED" && *d == "VIEW" =>
             {
-                Some(ExpectedObjectSuggestionKind::MaterializedView)
+                Some(oracle_only_kind(
+                    ExpectedObjectSuggestionKind::MaterializedView,
+                ))
             }
             [.., a, b, c] if *a == "COMMENT" && *b == "ON" && *c == "OPERATOR" => {
-                Some(ExpectedObjectSuggestionKind::Operator)
+                Some(oracle_only_kind(ExpectedObjectSuggestionKind::Operator))
             }
             [.., a, b, c] if *a == "COMMENT" && *b == "ON" && *c == "INDEXTYPE" => {
-                Some(ExpectedObjectSuggestionKind::Indextype)
+                Some(oracle_only_kind(ExpectedObjectSuggestionKind::Indextype))
             }
             [.., a, b, c] if *a == "COMMENT" && *b == "ON" && *c == "EDITION" => {
-                Some(ExpectedObjectSuggestionKind::Edition)
+                Some(oracle_only_kind(ExpectedObjectSuggestionKind::Edition))
             }
             [.., a, b, c, d]
                 if *a == "COMMENT" && *b == "ON" && *c == "MINING" && *d == "MODEL" =>
             {
-                Some(ExpectedObjectSuggestionKind::NoSuggestions)
+                Some(oracle_only_kind(ExpectedObjectSuggestionKind::NoSuggestions))
             }
             [.., a, b, c, d, e]
                 if matches!(a.as_str(), "ALTER" | "CREATE" | "DROP")
@@ -38746,7 +39204,10 @@ impl SqlEditorWidget {
             [.., a, b, c] if *a == "DROP" && *b == "TYPE" && *c == "BODY" => {
                 Some(oracle_only_kind(ExpectedObjectSuggestionKind::Type))
             }
-            [.., prev, last] if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "TRIGGER" => {
+            [.., prev, last] if *prev == "ALTER" && *last == "TRIGGER" => {
+                Some(oracle_only_kind(ExpectedObjectSuggestionKind::Trigger))
+            }
+            [.., prev, last] if *prev == "DROP" && *last == "TRIGGER" => {
                 Some(ExpectedObjectSuggestionKind::Trigger)
             }
             [.., prev, last] if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "EVENT" => {
@@ -38768,10 +39229,13 @@ impl SqlEditorWidget {
             {
                 Some(ExpectedObjectSuggestionKind::NoSuggestions)
             }
+            [.., prev, last] if *last == "INDEX" && *prev == "ALTER" => {
+                Some(oracle_only_kind(ExpectedObjectSuggestionKind::Index))
+            }
             [.., prev, last]
-                if (matches!(prev.as_str(), "ALTER" | "DROP")
-                    || (!mysql_compatible && matches!(prev.as_str(), "ANALYZE" | "PURGE")))
-                    && *last == "INDEX" =>
+                if *last == "INDEX"
+                    && (*prev == "DROP"
+                        || (!mysql_compatible && matches!(prev.as_str(), "ANALYZE" | "PURGE"))) =>
             {
                 Some(ExpectedObjectSuggestionKind::Index)
             }
@@ -40073,13 +40537,6 @@ impl SqlEditorWidget {
         if privilege_words.is_empty() {
             return None;
         }
-        // `AUDIT`/`NOAUDIT` object options apply to objects of any type
-        // (tables, views, sequences, procedures, …), and their option list is
-        // not restricted to the GRANT privilege sets, so any non-empty option
-        // list resolves the `ON` slot to an object of any kind.
-        if matches!(words[verb_idx].as_str(), "AUDIT" | "NOAUDIT") {
-            return Some(ExpectedObjectSuggestionKind::SchemaObject);
-        }
         if privilege_words
             .iter()
             .all(|word| Self::is_executable_object_privilege(word))
@@ -40091,6 +40548,13 @@ impl SqlEditorWidget {
             .all(|word| Self::is_relation_or_sequence_object_privilege(word))
         {
             return Some(ExpectedObjectSuggestionKind::RelationOrSequence);
+        }
+        // `AUDIT`/`NOAUDIT` also accept audit options that are broader than
+        // GRANT/REVOKE object privileges. Keep those object audit slots open,
+        // but only after the precise privilege families above have had a chance
+        // to narrow the catalog.
+        if matches!(words[verb_idx].as_str(), "AUDIT" | "NOAUDIT") {
+            return Some(ExpectedObjectSuggestionKind::SchemaObject);
         }
 
         None
@@ -40220,6 +40684,36 @@ impl SqlEditorWidget {
             },
             _ => None,
         }
+    }
+
+    fn cursor_is_at_mysql_oracle_only_associate_statistics_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return false;
+        }
+
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let context_end = Self::expected_suggestion_context_end(
+            tokens,
+            deep_ctx.cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        if !Self::cursor_has_statement_start_anchor(
+            tokens,
+            context_end,
+            &["ASSOCIATE", "DISASSOCIATE"],
+        ) {
+            return false;
+        }
+
+        let words = Self::previous_meaningful_words_upper(tokens, context_end, 16);
+        matches!(
+            words.first().map(String::as_str),
+            Some("ASSOCIATE" | "DISASSOCIATE")
+        ) && words.iter().any(|word| word == "STATISTICS")
     }
 
     fn is_executable_object_privilege(word: &str) -> bool {
