@@ -1572,6 +1572,17 @@ impl OracleThinSession {
         request: &StatementRequest,
     ) -> Result<DescribedQueryResult, OracleThinError> {
         let described_columns = self.describe_request(request)?;
+        self.query_described_fetch_all_request_with_columns(request, described_columns)
+    }
+
+    /// Same as `query_described_fetch_all_request` but reuses column metadata the
+    /// caller already obtained from `describe_request`, avoiding a second
+    /// describe round trip (which re-executes the statement server-side).
+    pub fn query_described_fetch_all_request_with_columns(
+        &mut self,
+        request: &StatementRequest,
+        described_columns: Vec<ColumnMetadata>,
+    ) -> Result<DescribedQueryResult, OracleThinError> {
         let requires_define_fetch = columns_require_define_fetch_for_values(&described_columns);
         let requires_deferred_fetch =
             requires_define_fetch || columns_require_object_metadata_for_values(&described_columns);
@@ -1650,6 +1661,17 @@ impl OracleThinSession {
         request: &StatementRequest,
     ) -> Result<DescribedQueryResult, OracleThinError> {
         let described_columns = self.describe_request(request)?;
+        self.query_described_initial_request_with_columns(request, described_columns)
+    }
+
+    /// Same as `query_described_initial_request` but reuses column metadata the
+    /// caller already obtained from `describe_request`, avoiding a second
+    /// describe round trip (which re-executes the statement server-side).
+    pub fn query_described_initial_request_with_columns(
+        &mut self,
+        request: &StatementRequest,
+        described_columns: Vec<ColumnMetadata>,
+    ) -> Result<DescribedQueryResult, OracleThinError> {
         let result = if columns_require_object_metadata_for_values(&described_columns) {
             let mut result = self.query_described_initial_without_prefetch_request(request)?;
             result.columns = described_columns;

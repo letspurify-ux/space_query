@@ -4366,7 +4366,10 @@ impl SqlEditorWidget {
                         let described_result = if lob_needs_define_fetch {
                             conn.query_described_initial_without_prefetch_request(&request)
                         } else {
-                            conn.query_described_initial_request(&request)
+                            conn.query_described_initial_request_with_columns(
+                                &request,
+                                preview_columns,
+                            )
                         };
                         let described = match described_result {
                             Ok(described) => described,
@@ -13397,7 +13400,7 @@ impl SqlEditorWidget {
         let described_result = if lob_needs_define_fetch {
             conn.query_described_initial_without_prefetch_request(&request)
         } else {
-            conn.query_described_initial_request(&request)
+            conn.query_described_initial_request_with_columns(&request, preview_columns)
         };
         let described = match described_result {
             Ok(described) => described,
@@ -14112,22 +14115,27 @@ impl SqlEditorWidget {
             }
             Err(err) => return Err(err.to_string()),
         };
-        if sql_for_execution != sql && columns.is_empty() {
+        let result = if sql_for_execution != sql && columns.is_empty() {
+            // The rowid-injected describe returned no columns; the stale columns
+            // can't be reused, so retry against the original SQL (re-describes).
             normalize_internal_rowid_alias = false;
             request.sql = sql.to_string();
-        }
-        let result = match conn.query_described_fetch_all_request(&request) {
-            Ok(result) => result,
-            Err(err)
-                if sql_for_execution != sql
-                    && QueryExecutor::is_retryable_rowid_injection_error(&err.to_string()) =>
-            {
-                normalize_internal_rowid_alias = false;
-                request.sql = sql.to_string();
-                conn.query_described_fetch_all_request(&request)
-                    .map_err(|retry_err| retry_err.to_string())?
+            conn.query_described_fetch_all_request(&request)
+                .map_err(|err| err.to_string())?
+        } else {
+            match conn.query_described_fetch_all_request_with_columns(&request, columns) {
+                Ok(result) => result,
+                Err(err)
+                    if sql_for_execution != sql
+                        && QueryExecutor::is_retryable_rowid_injection_error(&err.to_string()) =>
+                {
+                    normalize_internal_rowid_alias = false;
+                    request.sql = sql.to_string();
+                    conn.query_described_fetch_all_request(&request)
+                        .map_err(|retry_err| retry_err.to_string())?
+                }
+                Err(err) => return Err(err.to_string()),
             }
-            Err(err) => return Err(err.to_string()),
         };
         Self::oracle_thin_described_result_to_cells(
             conn,
