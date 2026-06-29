@@ -209,13 +209,14 @@ impl QueryTabsWidget {
         child_count: i32,
         width: i32,
         height: i32,
-        total_tab_width: i32,
-        available_tab_strip_width: i32,
     ) -> bool {
-        child_count > 0
-            && width > 0
-            && height > 0
-            && Self::has_actual_tab_strip_overflow(total_tab_width, available_tab_strip_width)
+        // Consume wheel events whenever the strip exists, regardless of whether
+        // our width estimate detects overflow. FLTK routes wheel to the widget
+        // under the cursor, so this handler only fires over the tab strip (body
+        // scrolling is unaffected). Gating on an estimated overflow let FLTK's
+        // native strip-scroll leak through at the estimate boundary and snap the
+        // header right. Mirrors `ResultTabsWidget`.
+        child_count > 0 && width > 0 && height > 0
     }
 
     fn estimated_tab_strip_width(tabs: &Tabs) -> i32 {
@@ -267,13 +268,7 @@ impl QueryTabsWidget {
     }
 
     fn should_reapply_tab_overflow_mode_on_wheel_for_tabs(tabs: &Tabs) -> bool {
-        Self::should_reapply_tab_overflow_mode_on_wheel(
-            tabs.children(),
-            tabs.w(),
-            tabs.h(),
-            Self::estimated_tab_strip_width(tabs),
-            Self::estimated_available_tab_strip_width(tabs),
-        )
+        Self::should_reapply_tab_overflow_mode_on_wheel(tabs.children(), tabs.w(), tabs.h())
     }
 
     fn tab_strip_left_anchor_reset_mode(
@@ -689,20 +684,21 @@ mod tests {
 
     #[test]
     fn mouse_wheel_overflow_reapply_allows_single_tab() {
+        // No tabs: nothing to re-pin.
         assert!(!QueryTabsWidget::should_reapply_tab_overflow_mode_on_wheel(
-            0, 320, 240, 420, 280
+            0, 320, 240
         ));
-        assert!(!QueryTabsWidget::should_reapply_tab_overflow_mode_on_wheel(
-            1, 320, 240, 280, 280
-        ));
+        // Any existing strip consumes the wheel, regardless of overflow, so the
+        // native FLTK strip-scroll can never snap the header right.
         assert!(QueryTabsWidget::should_reapply_tab_overflow_mode_on_wheel(
-            1, 320, 240, 420, 280
+            1, 320, 240
+        ));
+        // Degenerate geometry is ignored.
+        assert!(!QueryTabsWidget::should_reapply_tab_overflow_mode_on_wheel(
+            1, 0, 240
         ));
         assert!(!QueryTabsWidget::should_reapply_tab_overflow_mode_on_wheel(
-            1, 0, 240, 420, 280
-        ));
-        assert!(!QueryTabsWidget::should_reapply_tab_overflow_mode_on_wheel(
-            1, 320, 0, 420, 280
+            1, 320, 0
         ));
     }
 
