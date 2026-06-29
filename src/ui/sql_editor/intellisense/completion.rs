@@ -1855,7 +1855,7 @@ impl SqlEditorWidget {
             .name("intellisense-parse-worker".to_string())
             .spawn(move || {
                 let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                    let (expanded_statement, text_bind_names) =
+                    let (expanded_statement, text_bind_names, package_spec_symbols) =
                         Self::expanded_statement_window_and_text_binds_from_shadow(
                             &text_shadow_for_thread,
                             snapshot_for_thread.cursor_pos_usize,
@@ -1879,6 +1879,7 @@ impl SqlEditorWidget {
                             snapshot_for_thread.buffer_revision,
                             &expanded_statement,
                             text_bind_names,
+                            &package_spec_symbols,
                         )
                     });
                     let analysis = Self::build_intellisense_analysis_from_routine_cache(
@@ -15126,43 +15127,112 @@ impl SqlEditorWidget {
                 tokens, end, db_type,
             )
             .is_some()
+            // Routine parameter lists and routine signature headers (including the
+            // `RETURN <type>` slot) carry their own data-type/keyword grammar — they
+            // are never a simple-declaration `NOT NULL`/`DEFAULT` tail.
+            || Self::cursor_is_inside_routine_param_list(tokens, end)
+            || Self::cursor_is_in_routine_header(tokens, end)
         {
             return None;
         }
-        let opener_idx = words
+
+        // Scope the tail to the *current* declaration only — the meaningful tokens
+        // after the most recent `;` that follows the package opener (`AS`/`IS`).
+        // Without this, an earlier completed declaration would bleed into the next
+        // one (`g NUMBER; h |`), masking `h`'s data-type slot.
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        let mut seen_package = false;
+        let opener_pos = toks.iter().position(|token| match token {
+            SqlToken::Word(word) if word.eq_ignore_ascii_case("PACKAGE") => {
+                seen_package = true;
+                false
+            }
+            SqlToken::Word(word) => {
+                seen_package
+                    && (word.eq_ignore_ascii_case("AS") || word.eq_ignore_ascii_case("IS"))
+            }
+            _ => false,
+        })?;
+        let decl_start = toks
             .iter()
             .enumerate()
-            .skip(package_idx + 1)
-            .find_map(|(idx, word)| matches!(word.as_str(), "AS" | "IS").then_some(idx))?;
-        let toks = Self::meaningful_tokens_before(tokens, end);
-        if toks.iter().skip(opener_idx + 1).any(|token| {
+            .skip(opener_pos + 1)
+            .rev()
+            .find_map(|(idx, token)| {
+                matches!(token, SqlToken::Symbol(sym) if sym == ";").then_some(idx + 1)
+            })
+            .unwrap_or(opener_pos + 1);
+        let decl_tokens = &toks[decl_start..];
+
+        // A default-value expression slot (`g NUMBER DEFAULT |`, `g NUMBER := |`)
+        // is governed by the default-value grammar, never this tail.
+        if decl_tokens.iter().any(|token| {
             matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("DEFAULT"))
                 || matches!(token, SqlToken::Symbol(sym) if sym == ":=")
         }) {
             return None;
         }
-        let tail = &words[opener_idx + 1..];
-        match tail {
-            [.., _name, constant] if constant == "CONSTANT" => None,
-            [.., cursor, _name] if cursor == "CURSOR" => Some(&["IS"]),
+
+        let tail: Vec<String> = decl_tokens
+            .iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                _ => None,
+            })
+            .collect();
+        if tail.is_empty() {
+            return None;
+        }
+
+        // Declaration kinds that have their own grammar past the leading keyword.
+        // Their *type* slots (`CURSOR c IS |`, `SUBTYPE s IS |`, `TYPE t IS TABLE
+        // OF |`) fall through to the data-type grammar by returning `None` here.
+        match tail.first().map(String::as_str) {
+            Some("CURSOR") => {
+                return match tail.as_slice() {
+                    // `CURSOR c |` → only `IS` (its query follows `IS`).
+                    [_cursor, _name] => Some(&["IS"]),
+                    _ => None,
+                };
+            }
+            Some("SUBTYPE") => {
+                return match tail.as_slice() {
+                    // `SUBTYPE s |` → `IS`.
+                    [_subtype, _name] => Some(&["IS"]),
+                    // `SUBTYPE s IS <base> |` → complete, no further keyword.
+                    [_subtype, _name, is_word, _base, ..] if is_word == "IS" => Some(&[]),
+                    // `SUBTYPE s IS |` → the base-type slot.
+                    _ => None,
+                };
+            }
+            Some("TYPE") => {
+                // `TYPE t IS TABLE OF <elem> |` (and friends) is complete; the
+                // element-type slot (`… TABLE OF |`) and record field slots fall
+                // through to the data-type grammar, so require a token after `OF`.
+                let of_complete = tail.get(2).map(String::as_str) == Some("IS")
+                    && tail
+                        .iter()
+                        .position(|word| word == "OF")
+                        .is_some_and(|of_pos| of_pos + 1 < tail.len());
+                return of_complete.then_some(&[][..]);
+            }
+            Some("FUNCTION" | "PROCEDURE" | "PRAGMA") => return None,
+            _ => {}
+        }
+
+        // Plain variable/constant declaration tail.
+        match tail.as_slice() {
+            // `g |` / `g CONSTANT |` → still the data-type slot.
+            [_name] => None,
+            [_name, constant] if constant == "CONSTANT" => None,
+            // `g <type> NOT |` → `NULL`.
             [.., last] if last == "NOT" => Some(&["NULL"]),
-            [.., subtype, _name, is_word, _type_name]
-                if subtype == "SUBTYPE" && is_word == "IS" =>
-            {
-                Some(&[])
+            // `g <type> NOT NULL |` → only `DEFAULT` remains.
+            [.., not_word, null_word] if not_word == "NOT" && null_word == "NULL" => {
+                Some(&["DEFAULT"])
             }
-            _ if tail.len() >= 4
-                && tail.first().map(String::as_str) == Some("TYPE")
-                && tail.get(2).map(String::as_str) == Some("IS")
-                && tail.iter().any(|word| word == "OF") =>
-            {
-                Some(&[])
-            }
-            [.., _name, constant, _type_name] if constant == "CONSTANT" => {
-                Some(&["NOT NULL", "DEFAULT"])
-            }
-            [.., _name, _type_name] => Some(&["NOT NULL", "DEFAULT"]),
-            _ => None,
+            // `g <type> |` / `g CONSTANT <type> |` → `NOT NULL` / `DEFAULT`.
+            _ => Some(&["NOT NULL", "DEFAULT"]),
         }
     }
 
@@ -15181,6 +15251,17 @@ impl SqlEditorWidget {
             .iter()
             .rposition(|word| matches!(word.as_str(), "FUNCTION" | "PROCEDURE"))?;
         let tail = &words[routine_idx..];
+        // Once the routine's body opener (`IS`/`AS`) has appeared, the cursor is
+        // past the signature — inside the declaration/body section — so this is no
+        // longer a completed-signature tail (`FUNCTION f RETURN NUMBER IS v |` is a
+        // local variable's data-type slot, not an `IS`/`AS` re-offer).
+        if tail
+            .iter()
+            .skip(1)
+            .any(|word| word == "IS" || word == "AS")
+        {
+            return None;
+        }
         let last = tail.last().map(String::as_str)?;
         if matches!(
             last,
@@ -15635,6 +15716,17 @@ impl SqlEditorWidget {
 
         // RECORD field type — `TYPE r IS RECORD (field |)`.
         if Self::cursor_is_at_plsql_record_field_type(tokens, end) {
+            return true;
+        }
+
+        // SUBTYPE base type — `SUBTYPE st IS |`. The base type follows the
+        // declaration's `IS`, so anchor on `SUBTYPE <name> IS` directly before the
+        // cursor inside a declaration region.
+        if is_word(last, "IS")
+            && last >= 2
+            && is_word(last - 2, "SUBTYPE")
+            && Self::cursor_is_in_plsql_declaration_region(tokens, end)
+        {
             return true;
         }
 

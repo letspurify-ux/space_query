@@ -74304,3 +74304,274 @@ fn comment_on_column_final_suggestions_use_qualified_relation_columns() {
         }
     }
 }
+
+
+
+
+
+
+/// Data-type recommendation inside PL/SQL package specs, package bodies, and
+/// standalone routine headers. Every position below is a *type slot* — a
+/// parameter type (incl. `IN`/`OUT`/`IN OUT`/`NOCOPY` modes), a function/cursor
+/// `RETURN` type, a variable/constant type, a collection element type, a record
+/// field type, or a subtype base type — so it must resolve to the type catalog
+/// (primitive `NUMBER` + user-defined `ADDRESS_T`) and never offer the
+/// completed-declaration keyword tail (`NOT NULL`/`DEFAULT`) nor leak relations,
+/// routines, or SQL clause keywords. Regression guard for the package/body and
+/// procedure `IN OUT` data-type recommendation bug.
+#[test]
+fn oracle_plsql_data_type_slots_offer_types() {
+    use crate::db::DatabaseType::Oracle;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    let type_slots = [
+        // ── Standalone procedure / function parameter & return types ──
+        "CREATE OR REPLACE PROCEDURE p(a |",
+        "CREATE OR REPLACE PROCEDURE p(a IN |",
+        "CREATE OR REPLACE PROCEDURE p(a OUT |",
+        "CREATE OR REPLACE PROCEDURE p(a IN OUT |",
+        "CREATE OR REPLACE PROCEDURE p(a IN OUT NOCOPY |",
+        "CREATE OR REPLACE PROCEDURE p(a IN NUMBER, b |",
+        "CREATE OR REPLACE PROCEDURE p(a IN NUMBER, b IN OUT |",
+        "CREATE OR REPLACE FUNCTION f(x IN NUMBER) RETURN |",
+        "CREATE OR REPLACE FUNCTION f RETURN |",
+        // ── Package spec: variable / constant / parameter / return types ──
+        "CREATE PACKAGE pkg AS g |",
+        "CREATE PACKAGE pkg AS g CONSTANT |",
+        "CREATE PACKAGE pkg AS g NUMBER; h |",
+        "CREATE PACKAGE pkg AS FUNCTION f(p |",
+        "CREATE PACKAGE pkg AS FUNCTION f(p IN |",
+        "CREATE PACKAGE pkg AS FUNCTION f(p IN OUT |",
+        "CREATE PACKAGE pkg AS FUNCTION f RETURN |",
+        "CREATE PACKAGE pkg AS FUNCTION f(p NUMBER) RETURN |",
+        "CREATE PACKAGE pkg AS PROCEDURE p(a IN |",
+        "CREATE PACKAGE pkg AS PROCEDURE p(a IN NUMBER, b |",
+        // ── Package spec: collection element / record field / subtype base ──
+        "CREATE PACKAGE pkg AS TYPE t IS TABLE OF |",
+        "CREATE PACKAGE pkg AS TYPE r IS RECORD (f1 |",
+        "CREATE PACKAGE pkg AS TYPE r IS RECORD (f1 NUMBER, f2 |",
+        "CREATE PACKAGE pkg AS SUBTYPE s IS |",
+        // ── Package body: routine signatures and local declarations ──
+        "CREATE PACKAGE BODY pkg AS g |",
+        "CREATE PACKAGE BODY pkg AS FUNCTION f(p IN |",
+        "CREATE PACKAGE BODY pkg AS FUNCTION f(p IN OUT NOCOPY |",
+        "CREATE PACKAGE BODY pkg AS FUNCTION f RETURN |",
+        "CREATE PACKAGE BODY pkg AS FUNCTION f RETURN NUMBER IS v |",
+        "CREATE PACKAGE BODY pkg AS FUNCTION f RETURN NUMBER IS v NUMBER; w |",
+        "CREATE PACKAGE BODY pkg AS PROCEDURE p IS v |",
+        "CREATE PACKAGE BODY pkg AS PROCEDURE p(a IN |",
+        "CREATE PACKAGE BODY pkg AS PROCEDURE p(a IN OUT |",
+    ];
+
+    for sql in type_slots {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert_eq!(
+            kind,
+            Some(ExpectedObjectSuggestionKind::Type),
+            "type slot should resolve to the type catalog at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            contains(&final_suggestions, "NUMBER"),
+            "primitive type NUMBER missing at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            contains(&final_suggestions, "ADDRESS_T"),
+            "user-defined type ADDRESS_T missing at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for spurious in ["NOT NULL", "DEFAULT", "IS"] {
+            assert!(
+                !contains(&keywords, spurious),
+                "{spurious} wrongly offered at type slot `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+        for leaked in ["EMP", "DEPT", "RUN_JOB", "CALC_TOTAL", "HR_PKG", "SCOTT", "SELECT", "WHERE"] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into type slot `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
+/// The completed-declaration keyword tails inside a package spec/body remain
+/// intact after the type-slot fix: a finished `name <type>` offers `NOT NULL`/
+/// `DEFAULT`, `… NOT` offers `NULL`, `CURSOR c`/`SUBTYPE s` offer `IS`, and none
+/// of them resolve existing objects. Guards against the fix over-correcting and
+/// swallowing the legitimate tail keywords.
+#[test]
+fn oracle_package_declaration_keyword_tails_are_preserved() {
+    use crate::db::DatabaseType::Oracle;
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for (sql, expected, forbidden) in [
+        ("CREATE PACKAGE pkg AS g NUMBER |", "DEFAULT", "NUMBER"),
+        ("CREATE PACKAGE pkg AS g CONSTANT NUMBER |", "DEFAULT", "NUMBER"),
+        ("CREATE PACKAGE pkg AS g VARCHAR2(30) |", "NOT NULL", "VARCHAR2"),
+        ("CREATE PACKAGE pkg AS g NUMBER NOT |", "NULL", "NUMBER"),
+        ("CREATE PACKAGE pkg AS CURSOR c |", "IS", "NUMBER"),
+        ("CREATE PACKAGE pkg AS SUBTYPE s |", "IS", "NUMBER"),
+        ("CREATE PACKAGE BODY pkg AS g NUMBER |", "DEFAULT", "NUMBER"),
+        ("CREATE PACKAGE BODY pkg AS CURSOR c |", "IS", "NUMBER"),
+        // A second declaration's tail after a `;` is scoped correctly, too.
+        ("CREATE PACKAGE pkg AS a NUMBER; b NUMBER |", "DEFAULT", "NUMBER"),
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert_eq!(
+            kind, None,
+            "declaration keyword tail should not resolve objects at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            contains(&final_suggestions, expected),
+            "{expected} missing from declaration tail at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            !contains(&keywords, forbidden),
+            "{forbidden} wrongly offered at completed declaration tail `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in ["EMP", "DEPT", "RUN_JOB", "HR_PKG", "SCOTT", "SELECT", "WHERE"] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into declaration tail `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+}
+
+
+
+
+
+
+
+
+/// Cross-statement package-spec resolution: globals (variables, constants,
+/// cursors) declared in a `CREATE PACKAGE <name>` spec are suggested while
+/// editing the matching `CREATE PACKAGE BODY <name>` in the same buffer — inside
+/// a routine body, inside the package initialization section, and across a
+/// reasonable text gap. The body's own parameters/locals remain available too.
+#[test]
+fn package_spec_globals_are_visible_in_body() {
+    let has = |suggestions: &[String], name: &str| {
+        suggestions.iter().any(|value| value.eq_ignore_ascii_case(name))
+    };
+
+    // Spec globals visible inside a body routine, alongside the routine's params.
+    let in_routine = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+        "CREATE OR REPLACE PACKAGE hr_pkg AS\n  g_max CONSTANT NUMBER := 100;\n  g_name VARCHAR2(50);\n  PROCEDURE process(p_id IN NUMBER);\nEND hr_pkg;\n/\n\nCREATE OR REPLACE PACKAGE BODY hr_pkg AS\n  PROCEDURE process(p_id IN NUMBER) IS\n    v_local NUMBER;\n  BEGIN\n    __CODEX_CURSOR__NULL;\n  END;\nEND hr_pkg;\n/",
+        &[],
+    );
+    for expected in ["g_max", "g_name", "p_id", "v_local"] {
+        assert!(has(&in_routine, expected), "{expected} missing: {in_routine:?}");
+    }
+
+    // Spec globals visible in the package initialization section.
+    let in_init = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+        "CREATE OR REPLACE PACKAGE hr_pkg AS\n  g_v NUMBER;\n  g_cur_name VARCHAR2(30);\nEND;\n/\nCREATE OR REPLACE PACKAGE BODY hr_pkg AS\nBEGIN\n  __CODEX_CURSOR__NULL;\nEND;\n/",
+        &[],
+    );
+    for expected in ["g_v", "g_cur_name"] {
+        assert!(has(&in_init, expected), "{expected} missing from init section: {in_init:?}");
+    }
+
+    // Spec cursors are visible; schema-qualified package names match by last segment.
+    let cursor_global = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+        "CREATE PACKAGE pkg AS\n  CURSOR c_emp IS SELECT 1 FROM dual;\n  g_flag BOOLEAN;\nEND;\n/\nCREATE PACKAGE BODY pkg AS\n  PROCEDURE p IS BEGIN __CODEX_CURSOR__NULL; END;\nEND;\n/",
+        &[],
+    );
+    for expected in ["c_emp", "g_flag"] {
+        assert!(has(&cursor_global, expected), "{expected} missing: {cursor_global:?}");
+    }
+
+    let qualified = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+        "CREATE PACKAGE hr.pkg AS\n  g_qual NUMBER;\nEND;\n/\nCREATE PACKAGE BODY hr.pkg AS\n  PROCEDURE p IS BEGIN __CODEX_CURSOR__NULL; END;\nEND;\n/",
+        &[],
+    );
+    assert!(has(&qualified, "g_qual"), "schema-qualified spec global missing: {qualified:?}");
+
+    // The spec may also appear after the body in the buffer.
+    let body_first = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+        "CREATE PACKAGE BODY pkg AS\n  PROCEDURE p IS BEGIN __CODEX_CURSOR__NULL; END;\nEND;\n/\nCREATE PACKAGE pkg AS\n  g_after NUMBER;\nEND;\n/",
+        &[],
+    );
+    assert!(has(&body_first, "g_after"), "spec-after-body global missing: {body_first:?}");
+}
+
+/// Cross-statement spec resolution stays scoped and safe: a non-matching
+/// package's globals never leak, a body with no spec yields nothing extra, the
+/// `PACKAGE BODY` keyword is never mistaken for a spec, and the spec's subprogram
+/// *parameters* are not exposed (only the package's own globals are).
+#[test]
+fn package_spec_resolution_is_scoped_and_safe() {
+    let has = |suggestions: &[String], name: &str| {
+        suggestions.iter().any(|value| value.eq_ignore_ascii_case(name))
+    };
+
+    // A different package's spec must not leak into this body.
+    let mismatch = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+        "CREATE PACKAGE other AS\n  g_other NUMBER;\nEND;\n/\nCREATE PACKAGE BODY pkg AS\n  PROCEDURE p IS BEGIN __CODEX_CURSOR__NULL; END;\nEND;\n/",
+        &[],
+    );
+    assert!(!has(&mismatch, "g_other"), "foreign package global leaked: {mismatch:?}");
+
+    // No spec present: only the body's own symbols (here, none) are offered.
+    let no_spec = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+        "CREATE PACKAGE BODY pkg AS\n  g_body_only NUMBER;\n  PROCEDURE p IS BEGIN __CODEX_CURSOR__NULL; END;\nEND;\n/",
+        &[],
+    );
+    assert!(has(&no_spec, "g_body_only"), "body-level global missing: {no_spec:?}");
+
+    // The spec's subprogram parameters are NOT package globals, so they must not
+    // appear in an unrelated routine's body.
+    let spec_param = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+        "CREATE PACKAGE pkg AS\n  g_real NUMBER;\n  PROCEDURE other_proc(p_spec_only IN NUMBER);\nEND;\n/\nCREATE PACKAGE BODY pkg AS\n  PROCEDURE p IS BEGIN __CODEX_CURSOR__NULL; END;\nEND;\n/",
+        &[],
+    );
+    assert!(has(&spec_param, "g_real"), "spec global missing: {spec_param:?}");
+    assert!(
+        !has(&spec_param, "p_spec_only"),
+        "spec subprogram parameter leaked as a global: {spec_param:?}"
+    );
+}
+
+/// Cross-statement spec resolution must stay fast on very large buffers: the
+/// spec is located by a bounded byte scan around the body (not a full-buffer
+/// tokenization). An adjacent spec is found even with megabytes of unrelated
+/// text before it, while a spec pushed beyond the bounded search window is not
+/// scanned for — which is exactly what keeps the cost independent of file size.
+#[test]
+fn package_spec_resolution_is_bounded_on_large_buffers() {
+    let has = |suggestions: &[String], name: &str| {
+        suggestions.iter().any(|value| value.eq_ignore_ascii_case(name))
+    };
+
+    // Just over 1 MB of unrelated statements (exceeds the search radius) before
+    // an adjacent spec+body pair.
+    let filler = "SELECT 1 FROM dual;\n".repeat(60_000);
+    assert!(filler.len() > (1 << 20));
+
+    let adjacent = format!(
+        "{filler}CREATE PACKAGE big_pkg AS\n  g_big NUMBER;\nEND;\n/\nCREATE PACKAGE BODY big_pkg AS\n  PROCEDURE p IS BEGIN __CODEX_CURSOR__NULL; END;\nEND;\n/"
+    );
+    let start = std::time::Instant::now();
+    let suggestions = SqlEditorWidget::collect_local_symbol_suggestions_for_test(&adjacent, &[]);
+    let elapsed = start.elapsed();
+    assert!(has(&suggestions, "g_big"), "adjacent spec global missing: {suggestions:?}");
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "spec resolution too slow on a large buffer: {elapsed:?}"
+    );
+
+    // A spec separated from the body by more than the search radius is out of
+    // scope by design (keeps the scan bounded); resolution simply returns nothing
+    // rather than scanning the whole buffer.
+    let far = format!(
+        "CREATE PACKAGE far_pkg AS\n  g_far NUMBER;\nEND;\n/\n{filler}CREATE PACKAGE BODY far_pkg AS\n  PROCEDURE p IS BEGIN __CODEX_CURSOR__NULL; END;\nEND;\n/"
+    );
+    let far_suggestions = SqlEditorWidget::collect_local_symbol_suggestions_for_test(&far, &[]);
+    assert!(
+        !has(&far_suggestions, "g_far"),
+        "spec beyond the bounded search window should not be scanned: {far_suggestions:?}"
+    );
+}

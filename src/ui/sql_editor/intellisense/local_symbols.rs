@@ -326,7 +326,7 @@ impl SqlEditorWidget {
         text_shadow: &Arc<Mutex<HighlightShadowState>>,
         cursor_pos: usize,
         preferred_db_type: Option<crate::db::connection::DatabaseType>,
-    ) -> (ExpandedStatementWindow, Vec<String>) {
+    ) -> (ExpandedStatementWindow, Vec<String>, Vec<ParsedDeclarationSymbol>) {
         let guard = text_shadow
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -336,7 +336,26 @@ impl SqlEditorWidget {
             &guard.text,
             expanded.statement_start,
         );
-        (expanded, text_bind_names)
+        let package_spec_symbols = Self::package_spec_symbols_for_body(
+            &guard.text,
+            &expanded.text,
+            expanded.statement_start,
+        );
+        (expanded, text_bind_names, package_spec_symbols)
+    }
+
+    /// Cross-statement package-spec globals visible while editing a package body.
+    /// Returns empty (and does no full-text work beyond a tiny header check) when
+    /// the statement is not a `CREATE … PACKAGE BODY`.
+    fn package_spec_symbols_for_body(
+        full_text: &str,
+        body_statement_text: &str,
+        body_statement_start: usize,
+    ) -> Vec<ParsedDeclarationSymbol> {
+        let Some(name) = Self::package_body_name_upper(body_statement_text) else {
+            return Vec::new();
+        };
+        Self::extract_package_spec_symbols(full_text, &name, body_statement_start)
     }
 
     fn build_intellisense_analysis_from_routine_cache(
@@ -370,6 +389,7 @@ impl SqlEditorWidget {
         buffer_revision: u64,
         expanded_statement: &ExpandedStatementWindow,
         text_bind_names: Vec<String>,
+        package_spec_symbols: &[ParsedDeclarationSymbol],
     ) -> RoutineSymbolCacheEntry {
         let mysql_compatible =
             sql_text::mysql_compatibility_for_sql(&expanded_statement.text, None);
@@ -381,6 +401,7 @@ impl SqlEditorWidget {
             &expanded_statement.text,
             &token_spans,
             mysql_compatible,
+            package_spec_symbols,
         );
         let alias_context =
             super::query_text::collect_local_alias_context_from_spans(&token_spans);
@@ -1290,6 +1311,7 @@ impl SqlEditorWidget {
         statement_text: &str,
         token_spans: &[SqlTokenSpan],
         mysql_compatible: bool,
+        extra_root_symbols: &[ParsedDeclarationSymbol],
     ) -> (Vec<LocalScope>, Vec<LocalSymbolEntry>) {
         let statement_len = statement_text.len();
         let root_begins_with_begin = token_spans.iter().find_map(|span| match &span.token {
@@ -1314,6 +1336,26 @@ impl SqlEditorWidget {
         }];
         let mut symbols = Vec::new();
         let mut seen_symbol_keys = HashSet::new();
+        // Cross-statement package-spec globals are visible throughout the body, so
+        // they live in the root scope (id 0) declared at offset 0.
+        for symbol in extra_root_symbols {
+            Self::push_local_symbol_with_metadata_and_sources(
+                &mut symbols,
+                &mut seen_symbol_keys,
+                0,
+                symbol.name.clone(),
+                0,
+                symbol.type_display.clone(),
+                symbol.members.clone(),
+                symbol.member_entries.clone(),
+                symbol.member_source_upper.clone(),
+                symbol.member_source_uppers.clone(),
+                symbol.member_source_is_rowtype,
+                symbol.member_source_is_collection_like,
+                symbol.member_source_allows_visible_members,
+                symbol.suggest_name,
+            );
+        }
         let mut block_stack = Vec::<LocalBlockFrame>::new();
         let mut root_decl_start_idx = None;
         let mut root_decl_end_idx = None;
@@ -2942,6 +2984,314 @@ impl SqlEditorWidget {
         None
     }
 
+    /// The package name (last identifier segment, upper-cased) of a
+    /// `CREATE [OR REPLACE] PACKAGE BODY <name>` statement, if `statement_text` is
+    /// one. Used to find the matching package spec for cross-statement symbol
+    /// resolution (spec-declared globals must be visible while editing the body).
+    fn package_body_name_upper(statement_text: &str) -> Option<String> {
+        let spans = super::query_text::tokenize_sql_spanned(statement_text);
+        let package_idx = spans.iter().position(|span| {
+            matches!(&span.token, SqlToken::Word(word) if word.eq_ignore_ascii_case("PACKAGE"))
+        })?;
+        if !spans.get(..package_idx).unwrap_or(&[]).iter().any(|span| {
+            matches!(&span.token, SqlToken::Word(word) if word.eq_ignore_ascii_case("CREATE"))
+        }) {
+            return None;
+        }
+        let body_idx = Self::next_meaningful_token_idx(&spans, package_idx + 1)?;
+        if !matches!(&spans[body_idx].token, SqlToken::Word(word) if word.eq_ignore_ascii_case("BODY"))
+        {
+            return None;
+        }
+        Self::qualified_name_last_segment_upper(&spans, body_idx + 1)
+    }
+
+    /// The last identifier segment (upper-cased) of a possibly schema-qualified
+    /// name (`hr.my_pkg` → `MY_PKG`) starting at the first meaningful token at or
+    /// after `start`.
+    fn qualified_name_last_segment_upper(spans: &[SqlTokenSpan], start: usize) -> Option<String> {
+        let mut idx = Self::next_meaningful_token_idx(spans, start)?;
+        let mut last =
+            Self::token_word(&spans[idx].token).and_then(Self::local_identifier_from_word)?;
+        loop {
+            let Some(dot_idx) = Self::next_meaningful_token_idx(spans, idx + 1) else {
+                break;
+            };
+            if !Self::token_symbol_at(spans, dot_idx, ".") {
+                break;
+            }
+            let Some(seg_idx) = Self::next_meaningful_token_idx(spans, dot_idx + 1) else {
+                break;
+            };
+            let Some(seg) =
+                Self::token_word(&spans[seg_idx].token).and_then(Self::local_identifier_from_word)
+            else {
+                break;
+            };
+            last = seg;
+            idx = seg_idx;
+        }
+        Some(last.to_ascii_uppercase())
+    }
+
+    /// Maximum bytes scanned on each side of the package body when locating its
+    /// matching spec, so the search stays bounded (and fast) regardless of total
+    /// buffer size — a package spec sits immediately before its body in practice.
+    const PACKAGE_SPEC_SEARCH_RADIUS: usize = 1 << 20;
+    /// Maximum bytes of the matched spec that are tokenized (a single package
+    /// spec is far smaller; this only caps a pathological/unterminated spec).
+    const PACKAGE_SPEC_MAX_TOKENIZE_BYTES: usize = 256 * 1024;
+
+    fn is_sql_identifier_byte(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'#')
+    }
+
+    /// The byte range `[start, end)` of the next identifier word at or after
+    /// `from`, skipping leading ASCII whitespace. `None` if none remains.
+    fn next_identifier_word_range(bytes: &[u8], from: usize) -> Option<(usize, usize)> {
+        let mut idx = from;
+        while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+            idx += 1;
+        }
+        let start = idx;
+        while idx < bytes.len() && Self::is_sql_identifier_byte(bytes[idx]) {
+            idx += 1;
+        }
+        (idx > start).then_some((start, idx))
+    }
+
+    /// Package-level declarations (variables, constants, cursors, types) of the
+    /// `CREATE [OR REPLACE] PACKAGE <target>` *spec* near `body_statement_start`,
+    /// for cross-statement resolution while editing the matching package body. The
+    /// spec's subprogram signatures (`PROCEDURE`/`FUNCTION`) and their parameters
+    /// are intentionally excluded — only the package's own globals are visible.
+    ///
+    /// Performance: a cheap byte-level scan over a bounded window (no tokenization)
+    /// locates the spec header, then only the matched spec region is tokenized — so
+    /// cost is independent of overall buffer size.
+    fn extract_package_spec_symbols(
+        full_text: &str,
+        target_name_upper: &str,
+        body_statement_start: usize,
+    ) -> Vec<ParsedDeclarationSymbol> {
+        let Some(spec_start) =
+            Self::find_package_spec_header(full_text, target_name_upper, body_statement_start)
+        else {
+            return Vec::new();
+        };
+
+        let slice_end = Self::clamp_to_char_boundary_local(
+            full_text,
+            full_text
+                .len()
+                .min(spec_start + Self::PACKAGE_SPEC_MAX_TOKENIZE_BYTES),
+        );
+        let slice = full_text.get(spec_start..slice_end).unwrap_or("");
+        let spans = super::query_text::tokenize_sql_spanned(slice);
+
+        // The slice begins at the spec's `PACKAGE` keyword; find its `AS`/`IS`
+        // opener (depth 0, before any `;`).
+        let mut opener = None;
+        for (i, span) in spans.iter().enumerate() {
+            match &span.token {
+                SqlToken::Comment(_) => {}
+                SqlToken::Symbol(sym) if sym == ";" => break,
+                SqlToken::Word(word)
+                    if word.eq_ignore_ascii_case("AS") || word.eq_ignore_ascii_case("IS") =>
+                {
+                    opener = Some(i);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let Some(opener_idx) = opener else {
+            return Vec::new();
+        };
+
+        // The spec ends at its own `END` — the depth-0 `END` that is not the
+        // closer of an inner `CASE`/`IF`/`LOOP` (which can appear inside a
+        // default-value expression).
+        let decl_start = opener_idx + 1;
+        let mut paren_depth = 0usize;
+        let mut block_depth = 0usize;
+        let mut prev_is_end = false;
+        let mut decl_end = spans.len();
+        let mut cursor = decl_start;
+        while cursor < spans.len() {
+            match &spans[cursor].token {
+                SqlToken::Comment(_) => {
+                    cursor += 1;
+                    continue;
+                }
+                SqlToken::Symbol(sym) if sym == "(" => paren_depth += 1,
+                SqlToken::Symbol(sym) if sym == ")" => {
+                    paren_depth = paren_depth.saturating_sub(1)
+                }
+                SqlToken::Word(word) if paren_depth == 0 => {
+                    let upper = word.to_ascii_uppercase();
+                    match upper.as_str() {
+                        "CASE" | "IF" | "LOOP" if !prev_is_end => block_depth += 1,
+                        "END" => {
+                            if block_depth == 0 {
+                                decl_end = cursor;
+                                break;
+                            }
+                            block_depth -= 1;
+                        }
+                        _ => {}
+                    }
+                    prev_is_end = upper == "END";
+                    cursor += 1;
+                    continue;
+                }
+                _ => {}
+            }
+            prev_is_end = false;
+            cursor += 1;
+        }
+
+        Self::collect_declaration_items_symbols(&spans, decl_start, decl_end)
+    }
+
+    /// Byte offset of the `PACKAGE` keyword of the matching `CREATE [OR REPLACE]
+    /// PACKAGE <target>` spec, searched within a bounded window around the body.
+    /// Pure byte scanning — no tokenization — so it is cheap on huge buffers.
+    fn find_package_spec_header(
+        full_text: &str,
+        target_name_upper: &str,
+        body_statement_start: usize,
+    ) -> Option<usize> {
+        let bytes = full_text.as_bytes();
+        let n = bytes.len();
+        let lo = body_statement_start.saturating_sub(Self::PACKAGE_SPEC_SEARCH_RADIUS);
+        let hi = n.min(body_statement_start.saturating_add(Self::PACKAGE_SPEC_SEARCH_RADIUS));
+
+        let mut i = lo;
+        while i + 7 <= hi {
+            let b = bytes[i];
+            if (b == b'P' || b == b'p')
+                && bytes[i + 1..i + 7].eq_ignore_ascii_case(b"ACKAGE")
+                && (i == 0 || !Self::is_sql_identifier_byte(bytes[i - 1]))
+                && !Self::is_sql_identifier_byte(bytes[i + 7])
+                && Self::package_spec_candidate_matches(bytes, i, target_name_upper)
+            {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Whether the `PACKAGE` keyword at `package_idx` heads a `CREATE [OR REPLACE …]
+    /// PACKAGE <target> …` *spec* (not a `PACKAGE BODY`, not `ALTER`/`DROP`). All
+    /// checks are byte-level; comments embedded between the keywords are not
+    /// handled (vanishingly rare and only cause a graceful miss).
+    fn package_spec_candidate_matches(
+        bytes: &[u8],
+        package_idx: usize,
+        target_name_upper: &str,
+    ) -> bool {
+        // First word after `PACKAGE`: `BODY` ⇒ this is the body, not the spec.
+        let Some((first_start, first_end)) =
+            Self::next_identifier_word_range(bytes, package_idx + 7)
+        else {
+            return false;
+        };
+        if bytes[first_start..first_end].eq_ignore_ascii_case(b"BODY") {
+            return false;
+        }
+
+        // Resolve the (optionally schema-qualified) name's last segment.
+        let mut last_start = first_start;
+        let mut last_end = first_end;
+        loop {
+            let mut dot = last_end;
+            while dot < bytes.len() && bytes[dot].is_ascii_whitespace() {
+                dot += 1;
+            }
+            if dot >= bytes.len() || bytes[dot] != b'.' {
+                break;
+            }
+            let Some((seg_start, seg_end)) = Self::next_identifier_word_range(bytes, dot + 1) else {
+                break;
+            };
+            last_start = seg_start;
+            last_end = seg_end;
+        }
+        if !bytes[last_start..last_end].eq_ignore_ascii_case(target_name_upper.as_bytes()) {
+            return false;
+        }
+
+        // Walk back over the optional `[OR REPLACE] [EDITIONABLE|NONEDITIONABLE]
+        // [FORCE]` modifiers to require a leading `CREATE`; stop at a statement
+        // boundary (`;`).
+        let mut end = package_idx;
+        loop {
+            while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+                end -= 1;
+            }
+            if end == 0 {
+                return false;
+            }
+            if bytes[end - 1] == b';' {
+                return false;
+            }
+            let mut start = end;
+            while start > 0 && Self::is_sql_identifier_byte(bytes[start - 1]) {
+                start -= 1;
+            }
+            if start == end {
+                return false;
+            }
+            let word = &bytes[start..end];
+            if word.eq_ignore_ascii_case(b"CREATE") {
+                return true;
+            }
+            if word.eq_ignore_ascii_case(b"OR")
+                || word.eq_ignore_ascii_case(b"REPLACE")
+                || word.eq_ignore_ascii_case(b"EDITIONABLE")
+                || word.eq_ignore_ascii_case(b"NONEDITIONABLE")
+                || word.eq_ignore_ascii_case(b"FORCE")
+            {
+                end = start;
+                continue;
+            }
+            return false;
+        }
+    }
+
+    /// Parse the simple declaration items (`name [CONSTANT] type`, `CURSOR …`,
+    /// `TYPE …`) in `spans[start..end]`, splitting on top-level `;`.
+    fn collect_declaration_items_symbols(
+        spans: &[SqlTokenSpan],
+        start: usize,
+        end: usize,
+    ) -> Vec<ParsedDeclarationSymbol> {
+        let end = end.min(spans.len());
+        let mut symbols = Vec::new();
+        let mut idx = start;
+        while idx < end {
+            let Some(item_start) = Self::next_meaningful_token_idx(spans, idx) else {
+                break;
+            };
+            if item_start >= end {
+                break;
+            }
+            let item_end = Self::find_statement_item_end(spans, item_start, end);
+            if item_end <= item_start {
+                idx = idx.saturating_add(1);
+                continue;
+            }
+            if let Some(symbol) = Self::extract_declaration_symbol_from_item(&spans[item_start..item_end])
+            {
+                symbols.push(symbol);
+            }
+            idx = item_end;
+        }
+        symbols
+    }
+
     fn parse_routine_header(tokens: &[SqlTokenSpan], idx: usize) -> Option<ParsedRoutineHeader> {
         let name_idx = Self::next_meaningful_token_idx(tokens, idx + 1)?;
         let name_word = Self::token_word(&tokens[name_idx].token)?;
@@ -3457,7 +3807,14 @@ impl SqlEditorWidget {
         let expanded = Self::expanded_statement_window_in_text(full_text, cursor_pos);
         let text_bind_names =
             Self::collect_text_var_bind_names_before_statement(full_text, expanded.statement_start);
-        let routine_cache = Self::build_routine_symbol_cache_entry(0, &expanded, text_bind_names);
+        let package_spec_symbols =
+            Self::package_spec_symbols_for_body(full_text, &expanded.text, expanded.statement_start);
+        let routine_cache = Self::build_routine_symbol_cache_entry(
+            0,
+            &expanded,
+            text_bind_names,
+            &package_spec_symbols,
+        );
         (routine_cache, expanded)
     }
 
@@ -3472,6 +3829,7 @@ impl SqlEditorWidget {
             session_bind_names,
         )
     }
+
 
     #[cfg(test)]
     fn collect_local_symbol_suggestions_with_prefix_for_test(
@@ -3777,3 +4135,4 @@ impl SqlEditorWidget {
         Some(data.get_column_suggestions(prefix, Some(&sources)))
     }
 }
+
