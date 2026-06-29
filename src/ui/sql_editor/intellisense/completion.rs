@@ -249,6 +249,26 @@ struct CompletionSourceAllowance {
     context_name_suggestions: bool,
 }
 
+/// Cursor/slot facts the completion merge stage needs that are independent of the
+/// computed source vectors. Bundled so `merge_completion_sources` (the single
+/// merge pipeline shared by the production `apply_intellisense_with_context` path
+/// and the `audit_final_suggestions_for` test harness) takes a manageable
+/// argument list. Everything here is either `Copy` or a borrow, so the struct is
+/// cheap to build at each call site.
+struct CompletionMergeContext<'a> {
+    deep_ctx: &'a intellisense_context::CursorContext,
+    context: SqlContext,
+    qualifier: Option<&'a str>,
+    prefix: &'a str,
+    db_type: Option<crate::db::DatabaseType>,
+    source_allowance: CompletionSourceAllowance,
+    expr_keyword_ctx: ExpressionKeywordContext,
+    replace_table_context_with_expected_objects: bool,
+    suppress_select_modifier_keywords: bool,
+    at_data_type_position: bool,
+    at_tool_no_sql_argument_slot: bool,
+}
+
 impl CompletionSourcePolicy {
     fn new(
         restrict_to_relation_columns: bool,
@@ -2800,34 +2820,24 @@ impl SqlEditorWidget {
         if at_dedicated_column_slot {
             expected_keyword_suggestions.clear();
         }
-        let expected_object_suggestions =
-            if source_allowance.expected_object_suggestions && !at_dedicated_column_slot {
-                let mut data = intellisense_data
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                Self::collect_expected_object_suggestions_for_db(
-                    &mut data,
-                    &snapshot.prefix,
-                    deep_ctx,
-                    Some(snapshot.preferred_db_type),
-                )
-            } else {
-                Vec::new()
-            };
-        // Replace (not merge) the base catalog with the object-kind list whenever
-        // the grammar expects a schema object. Even a schema-wide slot (`DESC`/
-        // `AUDIT`/`CREATE SYNONYM` target) admits every *object kind*, not arbitrary SQL
-        // keywords or language functions from the flat base catalog.
-        let expected_object_kind = if qualifier.is_none() && !at_dedicated_column_slot {
-            Self::expected_object_suggestion_kind_for_db(
+        let (expected_object_kind, expected_object_suggestions) =
+            Self::resolve_expected_object_completion_suggestions(
+                intellisense_data,
+                connection,
                 &snapshot.prefix,
-                None,
+                qualifier,
+                at_dedicated_column_slot,
                 deep_ctx,
-                Some(snapshot.preferred_db_type),
-            )
-        } else {
-            None
-        };
+                snapshot.preferred_db_type,
+                source_allowance,
+                &session_bind_names,
+                cursor_in_statement,
+                analysis,
+            );
+        // Replace (not merge) the base catalog with the object-kind list whenever
+        // the grammar expects a schema object. If that filtered object-kind list
+        // is empty, the fallback above intentionally widens to the full
+        // completion catalog so the popup does not disappear.
         let replace_table_context_with_expected_objects = expected_object_kind.is_some();
 
         let allow_empty_prefix = qualifier.is_some()
@@ -2997,7 +3007,7 @@ impl SqlEditorWidget {
             false
         };
 
-        let mut suggestions = if has_resolved_local_record_member_scope {
+        let suggestions = if has_resolved_local_record_member_scope {
             Self::merge_suggestions_with_context_aliases(
                 local_record_member_suggestions,
                 local_rowtype_member_suggestions,
@@ -3109,36 +3119,8 @@ impl SqlEditorWidget {
                 )
             }
         };
-        if !expected_object_suggestions.is_empty() && !replace_table_context_with_expected_objects {
-            suggestions = Self::merge_suggestions_with_context_aliases(
-                suggestions,
-                expected_object_suggestions,
-                true,
-            );
-        }
-        if !expected_keyword_suggestions.is_empty() {
-            suggestions = Self::merge_suggestions_with_context_aliases(
-                suggestions,
-                expected_keyword_suggestions,
-                true,
-            );
-        }
-        if suppress_select_modifier_keywords_in_prefixed_projection {
-            let mut data = intellisense_data
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let column_scope = if !column_tables.is_empty() {
-                Some(column_tables.as_slice())
-            } else {
-                None
-            };
-            suggestions.retain(|suggestion| {
-                !Self::keyword_is_select_modifier_candidate(
-                    suggestion,
-                    Some(snapshot.preferred_db_type),
-                ) || Self::suggestion_is_scoped_column(&mut data, suggestion, column_scope)
-            });
-        }
+        // Qualified-comparison suggestions need a data lock, so they are computed
+        // here and handed to the shared merge pipeline as a plain vector.
         let comparison_suggestions = if source_allowance.comparison_suggestions {
             let data = intellisense_data
                 .lock()
@@ -3157,88 +3139,21 @@ impl SqlEditorWidget {
         } else {
             Vec::new()
         };
-        if !comparison_suggestions.is_empty() {
-            suggestions = Self::merge_qualified_condition_comparison_suggestions(
-                suggestions,
-                comparison_suggestions,
-                deep_ctx.phase,
-            );
-        }
-        // A column wildcard (`*` / `t.*`) is column material, so every
-        // column-suppressing keyword-only slot must drop it just like the
-        // identifier base does. `at_keyword_only_identifier_slot` covers the
-        // clause-continuation slots; `at_keyword_only_slot` covers the
-        // value/keyword-only slots enumerated at the suppression chokepoint
-        // (EXTRACT field, data type, INTERVAL unit, window-frame bound,
-        // row-limit count), where `EXTRACT(| FROM d)` previously leaked `*`.
-        // It is also operand material, so it is dropped right after a complete
-        // operand (`SELECT empno |`, `SELECT 'x' |`) where only an operator/
-        // comma/`FROM` can follow; the wildcard still appears at an operand-start
-        // (`SELECT |`, `SELECT a, |`) and for a qualified scope (`t.|`). A bind
-        // name slot (`= :|`) is likewise not a wildcard position.
-        let wildcard_suggestions = if !source_allowance.wildcard_suggestions {
-            Vec::new()
-        } else {
-            Self::collect_clause_wildcard_suggestions(&snapshot.prefix, qualifier, deep_ctx)
-        };
-        if !wildcard_suggestions.is_empty() {
-            suggestions = Self::merge_suggestions_with_context_aliases(
-                suggestions,
-                wildcard_suggestions,
-                true,
-            );
-        }
-        if source_allowance.derived_column_suggestions {
-            let derived_columns = Self::collect_derived_columns_for_context(deep_ctx);
-            suggestions = if Self::cursor_is_in_query_level_order_by(deep_ctx) {
-                Self::merge_suggestions_with_prioritized_derived_columns(
-                    suggestions,
-                    &snapshot.prefix,
-                    derived_columns,
-                )
-            } else {
-                Self::merge_suggestions_with_derived_columns(
-                    suggestions,
-                    &snapshot.prefix,
-                    derived_columns,
-                )
-            };
-        }
-        let context_name_suggestions = if source_allowance.context_name_suggestions {
-            Self::collect_context_name_suggestions(&snapshot.prefix, deep_ctx, context)
-        } else {
-            Vec::new()
-        };
-        let suggestions = Self::maybe_merge_suggestions_with_context_aliases(
-            suggestions,
-            context_name_suggestions,
-            matches!(context, SqlContext::TableName),
-            qualifier.is_some(),
-        );
-        let mut suggestions =
-            if !local_suggestions.is_empty() && source_allowance.prepend_local_symbol_suggestions {
-                Self::prepend_local_symbol_suggestions(suggestions, local_suggestions)
-            } else {
-                suggestions
-            };
 
-        // Offer an FK-based join condition as the top suggestion when filling
-        // in a JOIN ... ON clause between two related tables.
-        if qualifier.is_none()
+        // Build the FK-based auto-join condition (if any) before the merge: it
+        // needs foreign-key metadata and a data lock, and lazily triggers FK
+        // loads (a refresh re-runs this branch when each load completes). The
+        // shared merge pipeline only inserts the resulting string at the front.
+        let auto_join_condition = if qualifier.is_none()
             && matches!(
                 deep_ctx.phase,
                 intellisense_context::SqlPhase::JoinCondition
-            )
-        {
+            ) {
             let real_tables = Self::auto_join_condition_tables_for_context(deep_ctx);
             let real_table_refs: Vec<&intellisense_context::ScopedTableRef> =
                 real_tables.iter().collect();
             if let [lefts @ .., right] = real_table_refs.as_slice() {
                 if !lefts.is_empty() {
-                    // Foreign keys are loaded lazily (only here, when a JOIN is
-                    // actually being written) to keep ordinary column
-                    // completion to a single query per table. A refresh fires
-                    // when each load completes, re-running this branch.
                     for table in &real_tables {
                         Self::request_table_foreign_keys(
                             &table.name,
@@ -3247,22 +3162,19 @@ impl SqlEditorWidget {
                             connection,
                         );
                     }
-                    let condition = {
-                        let data = intellisense_data
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        Self::build_auto_join_condition(&data, right, lefts)
-                    };
-                    if let Some(condition) = condition {
-                        if Self::completion_suggestion_matches_prefix(&condition, &snapshot.prefix)
-                            && !suggestions.iter().any(|s| s == &condition)
-                        {
-                            suggestions.insert(0, condition);
-                        }
-                    }
+                    let data = intellisense_data
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    Self::build_auto_join_condition(&data, right, lefts)
+                } else {
+                    None
                 }
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
 
         let should_refresh_when_columns_ready = include_columns && columns_loading;
         if should_refresh_when_columns_ready {
@@ -3273,28 +3185,43 @@ impl SqlEditorWidget {
             runtime.clear_pending_intellisense();
         }
 
-        if Self::should_append_exact_catalog_keyword_after_context_filters(
-            context,
-            qualifier,
-            source_allowance,
-            effective_expr_keyword_ctx,
-            at_data_type_position,
-            at_tool_no_sql_argument_slot,
-            replace_table_context_with_expected_objects,
-            Self::cursor_prefix_starts_relation_name_slot(deep_ctx),
-            Self::exact_keyword_expected_before_current_identifier(
-                &snapshot.prefix,
+        let select_modifier_column_scope = if !column_tables.is_empty() {
+            Some(column_tables.clone())
+        } else {
+            None
+        };
+        let suggestions = Self::merge_completion_sources(
+            suggestions,
+            expected_object_suggestions,
+            expected_keyword_suggestions,
+            comparison_suggestions,
+            local_suggestions,
+            auto_join_condition,
+            CompletionMergeContext {
                 deep_ctx,
-                Some(snapshot.preferred_db_type),
-                effective_expr_keyword_ctx,
-            ),
-        ) {
-            Self::append_exact_catalog_keyword_suggestion(
-                &mut suggestions,
-                &snapshot.prefix,
-                Some(snapshot.preferred_db_type),
-            );
-        }
+                context,
+                qualifier,
+                prefix: &snapshot.prefix,
+                db_type: Some(snapshot.preferred_db_type),
+                source_allowance,
+                expr_keyword_ctx: effective_expr_keyword_ctx,
+                replace_table_context_with_expected_objects,
+                suppress_select_modifier_keywords:
+                    suppress_select_modifier_keywords_in_prefixed_projection,
+                at_data_type_position,
+                at_tool_no_sql_argument_slot,
+            },
+            |suggestion| {
+                let mut data = intellisense_data
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                Self::suggestion_is_scoped_column(
+                    &mut data,
+                    suggestion,
+                    select_modifier_column_scope.as_deref(),
+                )
+            },
+        );
 
         if suggestions.is_empty() {
             intellisense_popup
@@ -3352,6 +3279,143 @@ impl SqlEditorWidget {
         )));
         let mut editor = editor.clone();
         let _ = editor.take_focus();
+    }
+
+    /// The completion merge pipeline: folds every already-computed source vector
+    /// into the final, ordered, deduplicated, capped suggestion list. This is the
+    /// single source of truth for merge ORDER and the per-source `prefer_aliases`
+    /// flags, shared by the production `apply_intellisense_with_context` path and
+    /// the `audit_final_suggestions_for` test harness so the two cannot drift.
+    ///
+    /// Inputs that require IO or a data lock (the base catalog list, expected
+    /// objects/keywords, the qualified-comparison list, local symbols, and the
+    /// optional auto-join condition) are computed by the caller and passed in. The
+    /// purely cursor-derived sources (wildcard, derived columns, context names) and
+    /// the trailing exact-keyword append are derived here from `cx` so neither
+    /// caller can reorder or omit them. The select-modifier retain needs a
+    /// scoped-column probe against live data, supplied as `is_scoped_column`.
+    fn merge_completion_sources(
+        mut suggestions: Vec<String>,
+        expected_object_suggestions: Vec<String>,
+        expected_keyword_suggestions: Vec<String>,
+        comparison_suggestions: Vec<String>,
+        local_suggestions: Vec<String>,
+        auto_join_condition: Option<String>,
+        cx: CompletionMergeContext<'_>,
+        mut is_scoped_column: impl FnMut(&str) -> bool,
+    ) -> Vec<String> {
+        let CompletionMergeContext {
+            deep_ctx,
+            context,
+            qualifier,
+            prefix,
+            db_type,
+            source_allowance,
+            expr_keyword_ctx,
+            replace_table_context_with_expected_objects,
+            suppress_select_modifier_keywords,
+            at_data_type_position,
+            at_tool_no_sql_argument_slot,
+        } = cx;
+
+        if !expected_object_suggestions.is_empty() && !replace_table_context_with_expected_objects {
+            suggestions = Self::merge_suggestions_with_context_aliases(
+                suggestions,
+                expected_object_suggestions,
+                true,
+            );
+        }
+        if !expected_keyword_suggestions.is_empty() {
+            suggestions = Self::merge_suggestions_with_context_aliases(
+                suggestions,
+                expected_keyword_suggestions,
+                true,
+            );
+        }
+        if suppress_select_modifier_keywords {
+            suggestions.retain(|suggestion| {
+                !Self::keyword_is_select_modifier_candidate(suggestion, db_type)
+                    || is_scoped_column(suggestion)
+            });
+        }
+        if !comparison_suggestions.is_empty() {
+            suggestions = Self::merge_qualified_condition_comparison_suggestions(
+                suggestions,
+                comparison_suggestions,
+                deep_ctx.phase,
+            );
+        }
+        let wildcard_suggestions = if !source_allowance.wildcard_suggestions {
+            Vec::new()
+        } else {
+            Self::collect_clause_wildcard_suggestions(prefix, qualifier, deep_ctx)
+        };
+        if !wildcard_suggestions.is_empty() {
+            suggestions =
+                Self::merge_suggestions_with_context_aliases(suggestions, wildcard_suggestions, true);
+        }
+        if source_allowance.derived_column_suggestions {
+            let derived_columns = Self::collect_derived_columns_for_context(deep_ctx);
+            suggestions = if Self::cursor_is_in_query_level_order_by(deep_ctx) {
+                Self::merge_suggestions_with_prioritized_derived_columns(
+                    suggestions,
+                    prefix,
+                    derived_columns,
+                )
+            } else {
+                Self::merge_suggestions_with_derived_columns(suggestions, prefix, derived_columns)
+            };
+        }
+        let context_name_suggestions = if source_allowance.context_name_suggestions {
+            Self::collect_context_name_suggestions(prefix, deep_ctx, context)
+        } else {
+            Vec::new()
+        };
+        let suggestions = Self::maybe_merge_suggestions_with_context_aliases(
+            suggestions,
+            context_name_suggestions,
+            matches!(context, SqlContext::TableName),
+            qualifier.is_some(),
+        );
+        let mut suggestions =
+            if !local_suggestions.is_empty() && source_allowance.prepend_local_symbol_suggestions {
+                Self::prepend_local_symbol_suggestions(suggestions, local_suggestions)
+            } else {
+                suggestions
+            };
+
+        // Offer an FK-based join condition as the top suggestion when filling in a
+        // JOIN ... ON clause. The condition itself is built by the caller (it needs
+        // foreign-key metadata and a data lock); here it is only inserted, with the
+        // same prefix-match and dedup guard the inline path used.
+        if let Some(condition) = auto_join_condition {
+            if Self::completion_suggestion_matches_prefix(&condition, prefix)
+                && !suggestions.iter().any(|s| s == &condition)
+            {
+                suggestions.insert(0, condition);
+            }
+        }
+
+        if Self::should_append_exact_catalog_keyword_after_context_filters(
+            context,
+            qualifier,
+            source_allowance,
+            expr_keyword_ctx,
+            at_data_type_position,
+            at_tool_no_sql_argument_slot,
+            replace_table_context_with_expected_objects,
+            Self::cursor_prefix_starts_relation_name_slot(deep_ctx),
+            Self::exact_keyword_expected_before_current_identifier(
+                prefix,
+                deep_ctx,
+                db_type,
+                expr_keyword_ctx,
+            ),
+        ) {
+            Self::append_exact_catalog_keyword_suggestion(&mut suggestions, prefix, db_type);
+        }
+
+        suggestions
     }
 
     /// Column suggestions for a position that is restricted to a concrete
@@ -42395,6 +42459,131 @@ impl SqlEditorWidget {
         kind: ExpectedObjectSuggestionKind,
         db_type: Option<crate::db::DatabaseType>,
     ) -> Vec<String> {
+        Self::collect_expected_object_or_completion_fallback_suggestions_for_db(
+            data,
+            prefix,
+            kind,
+            db_type,
+            Vec::new(),
+        )
+    }
+
+    fn resolve_expected_object_completion_suggestions(
+        intellisense_data: &Arc<Mutex<IntellisenseData>>,
+        connection: &SharedConnection,
+        prefix: &str,
+        qualifier: Option<&str>,
+        at_dedicated_column_slot: bool,
+        deep_ctx: &intellisense_context::CursorContext,
+        db_type: crate::db::DatabaseType,
+        source_allowance: CompletionSourceAllowance,
+        existing_session_bind_names: &[String],
+        cursor_in_statement: usize,
+        analysis: &IntellisenseAnalysis,
+    ) -> (Option<ExpectedObjectSuggestionKind>, Vec<String>) {
+        let expected_object_kind = if qualifier.is_none() && !at_dedicated_column_slot {
+            Self::expected_object_suggestion_kind_for_db(prefix, None, deep_ctx, Some(db_type))
+        } else {
+            None
+        };
+        let suggestions = if source_allowance.expected_object_suggestions
+            && !at_dedicated_column_slot
+        {
+            Self::collect_expected_object_suggestions_for_completion_context(
+                intellisense_data,
+                connection,
+                prefix,
+                expected_object_kind,
+                Some(db_type),
+                source_allowance,
+                existing_session_bind_names,
+                cursor_in_statement,
+                analysis,
+            )
+        } else {
+            Vec::new()
+        };
+        (expected_object_kind, suggestions)
+    }
+
+    fn collect_expected_object_suggestions_for_completion_context(
+        intellisense_data: &Arc<Mutex<IntellisenseData>>,
+        connection: &SharedConnection,
+        prefix: &str,
+        kind: Option<ExpectedObjectSuggestionKind>,
+        db_type: Option<crate::db::DatabaseType>,
+        source_allowance: CompletionSourceAllowance,
+        existing_session_bind_names: &[String],
+        cursor_in_statement: usize,
+        analysis: &IntellisenseAnalysis,
+    ) -> Vec<String> {
+        let Some(kind) = kind else {
+            return Vec::new();
+        };
+
+        let mut data = intellisense_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let suggestions =
+            Self::collect_filtered_expected_object_suggestions_for_kind_for_db(
+                &mut data, prefix, kind, db_type,
+            );
+        if !suggestions.is_empty()
+            || !Self::expected_object_kind_allows_all_completion_fallback(kind)
+        {
+            return suggestions;
+        }
+
+        let fallback_session_bind_names = if source_allowance.session_bind_names {
+            existing_session_bind_names.to_vec()
+        } else {
+            Self::session_bind_names(connection)
+        };
+        let fallback_local_suggestions = Self::collect_local_symbol_suggestions(
+            prefix,
+            cursor_in_statement,
+            analysis,
+            &fallback_session_bind_names,
+        );
+        Self::collect_all_completion_fallback_suggestions_for_db(
+            &mut data,
+            prefix,
+            db_type,
+            fallback_local_suggestions,
+        )
+    }
+
+    fn collect_expected_object_or_completion_fallback_suggestions_for_db(
+        data: &mut IntellisenseData,
+        prefix: &str,
+        kind: ExpectedObjectSuggestionKind,
+        db_type: Option<crate::db::DatabaseType>,
+        local_suggestions: Vec<String>,
+    ) -> Vec<String> {
+        let suggestions =
+            Self::collect_filtered_expected_object_suggestions_for_kind_for_db(
+                data, prefix, kind, db_type,
+            );
+        if suggestions.is_empty()
+            && Self::expected_object_kind_allows_all_completion_fallback(kind)
+        {
+            Self::collect_all_completion_fallback_suggestions_for_db(
+                data,
+                prefix,
+                db_type,
+                local_suggestions,
+            )
+        } else {
+            suggestions
+        }
+    }
+
+    fn collect_filtered_expected_object_suggestions_for_kind_for_db(
+        data: &mut IntellisenseData,
+        prefix: &str,
+        kind: ExpectedObjectSuggestionKind,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Vec<String> {
         if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
             match kind {
                 ExpectedObjectSuggestionKind::Routine => {
@@ -42420,7 +42609,7 @@ impl SqlEditorWidget {
             }
         }
 
-        let suggestions = match kind {
+        let mut suggestions = match kind {
             ExpectedObjectSuggestionKind::NoSuggestions => Vec::new(),
             ExpectedObjectSuggestionKind::SchemaObject => {
                 let mut suggestions = data.get_object_suggestions(prefix);
@@ -42487,20 +42676,75 @@ impl SqlEditorWidget {
             ExpectedObjectSuggestionKind::User => data.get_user_suggestions(prefix),
         };
 
-        if matches!(kind, ExpectedObjectSuggestionKind::NoSuggestions)
-            || prefix.is_empty()
-            || matches!(
+        if !matches!(kind, ExpectedObjectSuggestionKind::NoSuggestions)
+            && !prefix.is_empty()
+            && !matches!(
                 kind,
                 ExpectedObjectSuggestionKind::SchemaObject | ExpectedObjectSuggestionKind::User
             )
-            || crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            && !crate::sql_text::mysql_compatibility_for_sql("", db_type)
         {
-            return suggestions;
+            suggestions = Self::merge_suggestions_with_context_aliases(
+                suggestions,
+                data.get_user_suggestions(prefix),
+                false,
+            );
         }
 
+        suggestions
+    }
+
+    fn expected_object_kind_allows_all_completion_fallback(
+        kind: ExpectedObjectSuggestionKind,
+    ) -> bool {
+        !matches!(
+            kind,
+            ExpectedObjectSuggestionKind::NoSuggestions
+                | ExpectedObjectSuggestionKind::SchemaObject
+                | ExpectedObjectSuggestionKind::User
+        )
+    }
+
+    fn collect_all_completion_fallback_suggestions_for_db(
+        data: &mut IntellisenseData,
+        prefix: &str,
+        db_type: Option<crate::db::DatabaseType>,
+        local_suggestions: Vec<String>,
+    ) -> Vec<String> {
+        let mut suggestions = Self::prepend_local_symbol_suggestions(Vec::new(), local_suggestions);
+        suggestions = Self::merge_suggestions_with_context_aliases(
+            suggestions,
+            crate::ui::intellisense::language_catalog_suggestions_for_db(prefix, false, db_type),
+            false,
+        );
+
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            suggestions = Self::merge_suggestions_with_context_aliases(
+                suggestions,
+                data.get_object_suggestions(prefix),
+                false,
+            );
+            return Self::merge_suggestions_with_context_aliases(
+                suggestions,
+                data.get_column_suggestions(prefix, None),
+                false,
+            );
+        }
+
+        for extra in [
+            data.get_table_object_suggestions(prefix),
+            data.get_view_object_suggestions(prefix),
+            data.get_procedure_object_suggestions(prefix),
+            data.get_function_object_suggestions(prefix),
+            data.get_trigger_object_suggestions(prefix),
+            data.get_event_object_suggestions(prefix),
+            data.get_index_object_suggestions(prefix),
+        ] {
+            suggestions = Self::merge_suggestions_with_context_aliases(suggestions, extra, false);
+        }
         Self::merge_suggestions_with_context_aliases(
             suggestions,
-            data.get_user_suggestions(prefix),
+            data.get_column_suggestions(prefix, None),
             false,
         )
     }
@@ -43222,6 +43466,7 @@ impl SqlEditorWidget {
         Self::collect_expected_object_suggestions_for_db(data, prefix, deep_ctx, None)
     }
 
+    #[cfg(test)]
     fn collect_expected_object_suggestions_for_db(
         data: &mut IntellisenseData,
         prefix: &str,

@@ -628,6 +628,23 @@ fn language_catalog_for_db_type(
     }
 }
 
+pub(crate) fn language_catalog_suggestions_for_db(
+    prefix: &str,
+    prefer_columns: bool,
+    db_type: Option<crate::db::DatabaseType>,
+) -> Vec<String> {
+    let mut suggestions = Vec::new();
+    let mut seen = HashSet::new();
+    IntellisenseData::append_language_catalog_suggestions_for_db(
+        prefix,
+        prefer_columns,
+        db_type,
+        &mut suggestions,
+        &mut seen,
+    );
+    suggestions
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct NameEntry {
     name: String,
@@ -959,6 +976,64 @@ impl IntellisenseData {
         )
     }
 
+    fn append_language_catalog_suggestions_for_db(
+        prefix: &str,
+        prefer_columns: bool,
+        db_type: Option<crate::db::DatabaseType>,
+        suggestions: &mut Vec<String>,
+        seen: &mut HashSet<String>,
+    ) {
+        let prefix_upper = Self::entry_lookup_prefix_upper(prefix);
+        if prefix_upper.is_empty() {
+            return;
+        }
+
+        let (keywords, functions) = language_catalog_for_db_type(db_type);
+        let start = keywords.partition_point(|kw| *kw < prefix_upper.as_str());
+        for keyword in &keywords[start..] {
+            if !keyword.starts_with(prefix_upper.as_str()) {
+                break;
+            }
+            // In an expression/column context, keywords that can only begin a
+            // statement/command or only modify DDL/storage/constraint clauses
+            // are irrelevant noise.
+            if prefer_columns && crate::sql_text::is_non_expression_keyword_upper(keyword) {
+                continue;
+            }
+            if !suggestion_matches_completion_prefix(keyword, prefix) {
+                continue;
+            }
+            if seen.insert((*keyword).to_string()) {
+                suggestions.push((*keyword).to_string());
+            }
+            if suggestions.len() >= MAX_SUGGESTIONS {
+                return;
+            }
+        }
+
+        let start = functions.partition_point(|f| *f < prefix_upper.as_str());
+        for func in &functions[start..] {
+            if !func.starts_with(prefix_upper.as_str()) {
+                break;
+            }
+            // Skip functions that are also keywords (e.g. MAX, TO_CHAR,
+            // SYSDATE); those are emitted by the keyword loop as bare names.
+            if keywords.binary_search(func).is_ok() {
+                continue;
+            }
+            let rendered = format!("{func}{FUNCTION_SUFFIX}");
+            if !suggestion_matches_completion_prefix(&rendered, prefix) {
+                continue;
+            }
+            if seen.insert(rendered.to_uppercase()) {
+                suggestions.push(rendered);
+            }
+            if suggestions.len() >= MAX_SUGGESTIONS {
+                break;
+            }
+        }
+    }
+
     pub fn get_suggestions_for_db(
         &mut self,
         prefix: &str,
@@ -1050,58 +1125,13 @@ impl IntellisenseData {
         // so skip them – the caller already has context-specific entries
         // (tables, views, columns) for empty-prefix completions.
         if !prefix_upper.is_empty() {
-            let (keywords, functions) = language_catalog_for_db_type(db_type);
-            {
-                let start = keywords.partition_point(|kw| *kw < prefix_upper.as_str());
-                for keyword in &keywords[start..] {
-                    if !keyword.starts_with(prefix_upper.as_str()) {
-                        break;
-                    }
-                    // In an expression/column context, keywords that can only
-                    // begin a statement or command (CREATE/DROP/GRANT/SPOOL/
-                    // FLUSH/…) or that only modify a DDL object/storage/
-                    // constraint clause (STORAGE/TABLESPACE/CONSTRAINT/CASCADE/…)
-                    // can never appear, so they are dropped as irrelevant noise.
-                    if prefer_columns && crate::sql_text::is_non_expression_keyword_upper(keyword) {
-                        continue;
-                    }
-                    if !suggestion_matches_completion_prefix(keyword, prefix) {
-                        continue;
-                    }
-                    if seen.insert((*keyword).to_string()) {
-                        suggestions.push((*keyword).to_string());
-                    }
-                    if suggestions.len() >= MAX_SUGGESTIONS {
-                        break;
-                    }
-                }
-            }
-
-            {
-                let start = functions.partition_point(|f| *f < prefix_upper.as_str());
-                for func in &functions[start..] {
-                    if !func.starts_with(prefix_upper.as_str()) {
-                        break;
-                    }
-                    // Skip functions that are also keywords (e.g. MAX, TO_CHAR,
-                    // SYSDATE); they are emitted by the keyword loop above as the
-                    // bare name, so rendering `NAME()` here too would duplicate
-                    // the entry (e.g. `MAX` and `MAX()`).
-                    if keywords.binary_search(func).is_ok() {
-                        continue;
-                    }
-                    let rendered = format!("{func}{FUNCTION_SUFFIX}");
-                    if !suggestion_matches_completion_prefix(&rendered, prefix) {
-                        continue;
-                    }
-                    if seen.insert(rendered.to_uppercase()) {
-                        suggestions.push(rendered);
-                    }
-                    if suggestions.len() >= MAX_SUGGESTIONS {
-                        break;
-                    }
-                }
-            }
+            Self::append_language_catalog_suggestions_for_db(
+                prefix,
+                prefer_columns,
+                db_type,
+                &mut suggestions,
+                &mut seen,
+            );
         }
 
         // Add tables/views in non-table context after language items.

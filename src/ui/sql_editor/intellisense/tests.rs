@@ -3009,7 +3009,7 @@ fn audit_final_suggestions_for(
     };
     let replace_table_context_with_expected_objects =
         qualifier.is_none() && expected_object_kind.is_some();
-    let mut suggestions = if !qualified_member_suggestions.is_empty() {
+    let suggestions = if !qualified_member_suggestions.is_empty() {
         qualified_member_suggestions
     } else if at_data_type {
         if data_type_position.is_some_and(|position| {
@@ -3165,23 +3165,8 @@ fn audit_final_suggestions_for(
     if at_dedicated_column_slot {
         expected_keywords.clear();
     }
-    if !expected_keywords.is_empty() {
-        suggestions = SqlEditorWidget::merge_suggestions_with_context_aliases(
-            suggestions,
-            expected_keywords.clone(),
-            true,
-        );
-    }
-    if suppress_select_modifier_keywords_in_prefixed_projection {
-        suggestions.retain(|suggestion| {
-            !SqlEditorWidget::keyword_is_select_modifier_candidate(suggestion, Some(db))
-                || SqlEditorWidget::suggestion_is_scoped_column(
-                    &mut data,
-                    suggestion,
-                    column_scope.as_deref(),
-                )
-        });
-    }
+    // Qualified-comparison suggestions (a data-locked source in production) are
+    // computed here and handed to the shared merge pipeline as a plain vector.
     let comparison_suggestions = if source_allowance.comparison_suggestions {
         qualifier
             .as_deref()
@@ -3194,52 +3179,11 @@ fn audit_final_suggestions_for(
     } else {
         Vec::new()
     };
-    if !comparison_suggestions.is_empty() {
-        suggestions = SqlEditorWidget::merge_qualified_condition_comparison_suggestions(
-            suggestions,
-            comparison_suggestions,
-            ctx.phase,
-        );
-    }
-    let wildcard_suggestions = if source_allowance.wildcard_suggestions {
-        SqlEditorWidget::collect_clause_wildcard_suggestions(&prefix, qualifier.as_deref(), &ctx)
-    } else {
-        Vec::new()
-    };
-    if !wildcard_suggestions.is_empty() {
-        suggestions = SqlEditorWidget::merge_suggestions_with_context_aliases(
-            suggestions,
-            wildcard_suggestions,
-            true,
-        );
-    }
-    if source_allowance.derived_column_suggestions {
-        let derived_columns = SqlEditorWidget::collect_derived_columns_for_context(&ctx);
-        suggestions = if SqlEditorWidget::cursor_is_in_query_level_order_by(&ctx) {
-            SqlEditorWidget::merge_suggestions_with_prioritized_derived_columns(
-                suggestions,
-                &prefix,
-                derived_columns,
-            )
-        } else {
-            SqlEditorWidget::merge_suggestions_with_derived_columns(
-                suggestions,
-                &prefix,
-                derived_columns,
-            )
-        };
-    }
-    let context_name_suggestions = if source_allowance.context_name_suggestions {
-        SqlEditorWidget::collect_context_name_suggestions(&prefix, &ctx, context)
-    } else {
-        Vec::new()
-    };
-    suggestions = SqlEditorWidget::maybe_merge_suggestions_with_context_aliases(
-        suggestions,
-        context_name_suggestions,
-        matches!(context, SqlContext::TableName),
-        qualifier.is_some(),
-    );
+    // PL/SQL local declarations are out of scope for this SQL-only harness, but
+    // trigger correlation/WHEN aliases are merged into the local source exactly as
+    // production does (`apply_intellisense_with_context`), so the shared pipeline
+    // prepends them in the same position rather than appending them last.
+    let mut local_suggestions: Vec<String> = Vec::new();
     if qualifier.is_none() {
         let trigger_alias_suggestions = if expr_keyword_ctx.at_bind_variable_name {
             SqlEditorWidget::oracle_trigger_correlation_alias_suggestions_for_context(
@@ -3256,34 +3200,44 @@ fn audit_final_suggestions_for(
                 Some(db),
             )
         };
-        suggestions = SqlEditorWidget::merge_suggestions_with_context_aliases(
-            suggestions,
+        local_suggestions = SqlEditorWidget::merge_suggestions_with_context_aliases(
+            local_suggestions,
             trigger_alias_suggestions,
             false,
         );
     }
-    if SqlEditorWidget::should_append_exact_catalog_keyword_after_context_filters(
-        context,
-        qualifier.as_deref(),
-        source_allowance,
-        expr_keyword_ctx,
-        at_data_type,
-        false,
-        replace_table_context_with_expected_objects,
-        SqlEditorWidget::cursor_prefix_starts_relation_name_slot(&ctx),
-        SqlEditorWidget::exact_keyword_expected_before_current_identifier(
-            &prefix,
-            &ctx,
-            Some(db),
+    // Fold every source through the SAME merge pipeline production uses, so this
+    // harness can no longer drift from `apply_intellisense_with_context` on merge
+    // order, the per-source `prefer_aliases` flags, or which sources participate.
+    let suggestions = SqlEditorWidget::merge_completion_sources(
+        suggestions,
+        expected_object_suggestions,
+        expected_keywords.clone(),
+        comparison_suggestions,
+        local_suggestions,
+        None,
+        CompletionMergeContext {
+            deep_ctx: &ctx,
+            context,
+            qualifier: qualifier.as_deref(),
+            prefix: &prefix,
+            db_type: Some(db),
+            source_allowance,
             expr_keyword_ctx,
-        ),
-    ) {
-        SqlEditorWidget::append_exact_catalog_keyword_suggestion(
-            &mut suggestions,
-            &prefix,
-            Some(db),
-        );
-    }
+            replace_table_context_with_expected_objects,
+            suppress_select_modifier_keywords:
+                suppress_select_modifier_keywords_in_prefixed_projection,
+            at_data_type_position: at_data_type,
+            at_tool_no_sql_argument_slot: false,
+        },
+        |suggestion| {
+            SqlEditorWidget::suggestion_is_scoped_column(
+                &mut data,
+                suggestion,
+                column_scope.as_deref(),
+            )
+        },
+    );
     (expected_object_kind, expected_keywords, suggestions)
 }
 
@@ -10001,6 +9955,97 @@ fn merge_suggestions_with_context_aliases_respects_max_without_aliases() {
     let merged = SqlEditorWidget::merge_suggestions_with_context_aliases(base, vec![], false);
 
     assert_eq!(merged.len(), MAX_MERGED_SUGGESTIONS);
+}
+
+/// Integration guard for the merge stage of the completion pipeline.
+///
+/// The primitive `merge_suggestions_with_context_aliases` is unit-tested above
+/// in isolation, but production layers *many* merges (base catalog → expected
+/// keywords → comparisons → wildcards → derived columns → context names → trigger
+/// aliases) over real multi-source contexts. No single feature test asserts the
+/// invariants that must hold across that whole chain, so a regression in any one
+/// merge call (a dropped dedup, a flipped `prefer_aliases`, a removed cap) could
+/// pass every feature test while shipping duplicate, over-long, or mis-ordered
+/// popups. `audit_final_suggestions_for` reconstructs the production merge order;
+/// this test pins three cross-cutting contracts on its final list across a
+/// battery of contexts where several sources qualify at once:
+///
+/// 1. no two entries share a completion lookup key (dedup invariant);
+/// 2. the list never exceeds `MAX_MERGED_SUGGESTIONS` (cap invariant);
+/// 3. expected keywords are prepended ahead of base-catalog object names
+///    (the `prefer_aliases = true` priority contract) — checked vacuously when a
+///    context surfaces no objects, meaningfully when it surfaces both.
+#[test]
+fn final_pipeline_suggestions_uphold_merge_dedup_cap_and_keyword_priority() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    // Pure object names from the `audit_final_suggestions_for` fixture catalog.
+    // Used only for the ordering invariant; columns/keywords are excluded so the
+    // check compares keywords against genuine catalog objects.
+    let object_names = [
+        "EMP", "DEPT", "T", "T1", "S", "P", "EMP_V", "MVIEW_SALES", "ADDRESS_T", "RUN_JOB",
+        "CALC_TOTAL", "HR_PKG", "EMP_SEQ", "EMP_SYN",
+    ];
+
+    let battery = [
+        ("SELECT | FROM emp e", Oracle),
+        ("SELECT e| FROM emp", Oracle),
+        ("SELECT * FROM e|", Oracle),
+        ("SELECT * FROM emp WHERE e|", Oracle),
+        ("SELECT * FROM emp WHERE empno = |", Oracle),
+        ("SELECT * FROM t JOIN s ON t.|", Oracle),
+        ("SELECT empno FROM emp ORDER BY |", Oracle),
+        ("SELECT empno AS r FROM emp ORDER BY r|", Oracle),
+        ("UPDATE emp SET |", Oracle),
+        ("INSERT INTO emp (|", Oracle),
+        ("SELECT * FROM emp e WHERE e.|", Oracle),
+        ("SELECT | FROM emp", MySQL),
+        ("SELECT * FROM emp WHERE e|", MySQL),
+        ("SELECT * FROM e|", MySQL),
+    ];
+
+    for (sql, db) in battery {
+        let (_kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+
+        // (2) cap invariant.
+        assert!(
+            final_suggestions.len() <= MAX_MERGED_SUGGESTIONS,
+            "final list exceeded the {MAX_MERGED_SUGGESTIONS} cap at `{sql}` ({db:?}): len={}",
+            final_suggestions.len()
+        );
+
+        // (1) dedup invariant: no repeated completion lookup key.
+        let mut seen: HashSet<String> = HashSet::new();
+        for item in &final_suggestions {
+            let key = SqlEditorWidget::completion_identifier_lookup_upper(item);
+            assert!(
+                seen.insert(key.clone()),
+                "duplicate completion `{item}` (key `{key}`) in final list at `{sql}` ({db:?}): {final_suggestions:?}"
+            );
+        }
+
+        // (3) keyword-priority invariant: any expected keyword that survives into
+        // the final list must precede every catalog object that also survives.
+        let position = |needle: &str| {
+            final_suggestions
+                .iter()
+                .position(|s| s.eq_ignore_ascii_case(needle))
+        };
+        let last_keyword_index = keywords
+            .iter()
+            .filter_map(|kw| position(kw))
+            .max();
+        if let Some(last_kw) = last_keyword_index {
+            for obj in object_names {
+                if let Some(obj_index) = position(obj) {
+                    assert!(
+                        last_kw < obj_index,
+                        "expected keyword ordered after catalog object `{obj}` at `{sql}` ({db:?}): {final_suggestions:?}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -30601,6 +30646,124 @@ fn collect_expected_object_suggestions_filter_extended_oracle_object_types() {
 }
 
 #[test]
+fn expected_object_suggestions_fall_back_to_all_completions_when_kind_has_no_matches() {
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["EMP".to_string()];
+    data.procedures = vec!["RUN_JOB".to_string()];
+    data.functions = vec!["CALC_TOTAL".to_string()];
+    data.packages = vec!["HR_PKG".to_string()];
+    data.rebuild_indices();
+
+    let ctx = analyze_inline_cursor_sql("DROP CONTEXT |");
+    let suggestions = SqlEditorWidget::collect_expected_object_suggestions(&mut data, "", &ctx);
+
+    for expected in ["EMP", "RUN_JOB", "CALC_TOTAL", "HR_PKG"] {
+        assert!(
+            suggestions.iter().any(|value| value == expected),
+            "{expected} missing from all-completion fallback: {suggestions:?}"
+        );
+    }
+    assert!(
+        !suggestions.iter().any(|value| value == "SELECT"),
+        "empty-prefix all-completion fallback must not dump keyword catalog entries: {suggestions:?}"
+    );
+
+    let prefixed_ctx = analyze_inline_cursor_sql("DROP CONTEXT run|");
+    let prefixed = SqlEditorWidget::collect_expected_object_suggestions(
+        &mut data,
+        "run",
+        &prefixed_ctx,
+    );
+    assert_eq!(prefixed, vec!["RUN_JOB".to_string()]);
+
+    let keyword_ctx = analyze_inline_cursor_sql("DROP CONTEXT sel|");
+    let keyword_suggestions = SqlEditorWidget::collect_expected_object_suggestions(
+        &mut data,
+        "sel",
+        &keyword_ctx,
+    );
+    assert!(
+        keyword_suggestions.iter().any(|value| value == "SELECT"),
+        "keyword missing from all-completion fallback: {keyword_suggestions:?}"
+    );
+
+    const CURSOR_MARKER: &str = "__CODEX_CURSOR__";
+    let script_with_cursor = format!(
+        "DECLARE\n  v_total NUMBER;\nBEGIN\n  DROP CONTEXT v{CURSOR_MARKER}\nEND;"
+    );
+    let cursor = script_with_cursor.find(CURSOR_MARKER).unwrap();
+    let script = script_with_cursor.replacen(CURSOR_MARKER, "", 1);
+    let (routine_cache, expanded) =
+        SqlEditorWidget::build_routine_symbol_cache_bundle_for_test(&script, cursor);
+    let analysis = SqlEditorWidget::build_intellisense_analysis_from_routine_cache(
+        &routine_cache,
+        expanded.cursor_in_statement,
+    );
+    let intellisense_data = Arc::new(Mutex::new(data));
+    let connection = create_shared_connection();
+    let (kind, with_locals) = SqlEditorWidget::resolve_expected_object_completion_suggestions(
+        &intellisense_data,
+        &connection,
+        "v",
+        None,
+        false,
+        analysis.context.as_ref(),
+        crate::db::DatabaseType::Oracle,
+        CompletionSourceAllowance {
+            session_bind_names: false,
+            local_suggestions: true,
+            expected_keyword_suggestions: true,
+            expected_object_suggestions: true,
+            prepend_local_symbol_suggestions: true,
+            base_catalog_suggestions: true,
+            wildcard_suggestions: true,
+            comparison_suggestions: false,
+            derived_column_suggestions: true,
+            context_name_suggestions: true,
+        },
+        &[],
+        expanded.cursor_in_statement,
+        &analysis,
+    );
+    assert_eq!(kind, Some(ExpectedObjectSuggestionKind::Context));
+    assert!(
+        with_locals.iter().any(|value| value == "v_total"),
+        "declared local symbol missing from production all-completion fallback: {with_locals:?}"
+    );
+}
+
+#[test]
+fn mysql_expected_object_fallback_uses_mysql_object_families() {
+    use crate::db::DatabaseType::MySQL;
+
+    let mut data = IntellisenseData::new();
+    data.procedures = vec!["RUN_JOB".to_string()];
+    data.functions = vec!["CALC_TOTAL".to_string()];
+    data.materialized_views = vec!["MVIEW_SALES".to_string()];
+    data.packages = vec!["HR_PKG".to_string()];
+    data.types = vec!["ADDRESS_T".to_string()];
+    data.sequences = vec!["EMP_SEQ".to_string()];
+    data.rebuild_indices();
+
+    let ctx = analyze_inline_cursor_sql("LOCK TABLES |");
+    let suggestions = SqlEditorWidget::collect_expected_object_suggestions_for_db(
+        &mut data,
+        "",
+        &ctx,
+        Some(MySQL),
+    );
+
+    assert!(suggestions.iter().any(|value| value == "RUN_JOB"));
+    assert!(suggestions.iter().any(|value| value == "CALC_TOTAL"));
+    for leaked in ["MVIEW_SALES", "HR_PKG", "ADDRESS_T", "EMP_SEQ"] {
+        assert!(
+            !suggestions.iter().any(|value| value == leaked),
+            "{leaked} leaked into MySQL all-completion fallback: {suggestions:?}"
+        );
+    }
+}
+
+#[test]
 fn table_context_expected_object_suggestions_filter_maintenance_table_targets() {
     let mut data = IntellisenseData::new();
     data.tables = vec!["EMP".to_string()];
@@ -32179,7 +32342,8 @@ fn mysql_family_qualified_schema_member_slots_use_mysql_object_kinds() {
         );
         }
 
-        for sql in ["ALTER TRIGGER app.emp|"] {
+        {
+            let sql = "ALTER TRIGGER app.emp|";
             let ctx = analyze_inline_cursor_sql(sql);
             let context =
                 SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
@@ -40140,6 +40304,39 @@ fn single_use_postfix_operators_are_not_re_offered() {
         ),
         "COLLATE wrongly suppressed on a fresh operand by an earlier operand's COLLATE"
     );
+
+    // The suppression must also survive the *full* completion pipeline, not just
+    // the `base_suggestions_for_context` stage probed above: a later merge stage
+    // (expected keywords, wildcards, derived columns, context names) must not
+    // re-introduce a spent postfix operator. `audit_final_suggestions_for`
+    // reconstructs the production merge order, so a regression that re-offers the
+    // keyword downstream of the base catalog is caught here. (Mirrors the
+    // end-to-end tail of `escape_offered_only_after_a_like_pattern`.)
+    for (sql, db, kw) in [
+        (
+            "SELECT * FROM t WHERE 'lit' COLLATE my_coll c| ",
+            Oracle,
+            "COLLATE",
+        ),
+        ("SELECT * FROM t WHERE a SOUNDS LIKE 'b' s| ", MySQL, "SOUNDS"),
+        (
+            "SELECT * FROM t WHERE a SOUNDS LIKE 'b' s| ",
+            MariaDB,
+            "SOUNDS",
+        ),
+        ("SELECT * FROM t WHERE ts AT TIME ZONE tz a| ", Oracle, "AT"),
+        (
+            "SELECT * FROM t WHERE x MEMBER OF coll m| ",
+            Oracle,
+            "MEMBER",
+        ),
+    ] {
+        let (_kind, _keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+        assert!(
+            !has(&final_suggestions, kw),
+            "single-use {kw} re-offered through the full merge pipeline for `{sql}`: {final_suggestions:?}"
+        );
+    }
 }
 
 /// Set-quantifiers are grammatical only at the start of a select list, aggregate
@@ -57387,7 +57584,8 @@ fn dml_target_column_slots_stay_scoped_across_statement_variants() {
         kind, None,
         "EXCLUDED qualifier should not resolve an object kind: keywords={keywords:?} final={excluded_suggestions:?}"
     );
-    for expected in ["ENAME"] {
+    {
+        let expected = "ENAME";
         assert!(
             contains(&excluded_suggestions, expected),
             "{expected} missing from EXCLUDED qualified column slot: keywords={keywords:?} final={excluded_suggestions:?}"
@@ -62123,7 +62321,7 @@ fn mysql_family_load_file_closed_column_list_tail_offers_only_set() {
         ),
     ] {
         for sql in sqls {
-            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(*sql, db);
+            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
             assert_eq!(
                 kind, None,
                 "LOAD file closed column-list tail should not resolve an object kind at `{sql}` for {db:?}: keywords={keywords:?} final={final_suggestions:?}"
@@ -66902,7 +67100,7 @@ fn mysql_family_statement_value_slots_do_not_offer_object_catalog() {
         ),
     ] {
         for sql in sqls {
-            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(*sql, db);
+            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
             assert_eq!(
                 kind, None,
                 "MySQL-family statement value slot should not resolve object kind at `{sql}` for {db:?}: keywords={keywords:?} final={final_suggestions:?}"
@@ -67022,7 +67220,7 @@ fn mysql_family_statement_value_slots_reject_expression_keyword_and_function_noi
         ),
     ] {
         for sql in sqls {
-            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(*sql, db);
+            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
             assert_eq!(
                 kind, None,
                 "MySQL-family statement value slot should not resolve object kind at `{sql}` for {db:?}: keywords={keywords:?} final={final_suggestions:?}"
@@ -67189,7 +67387,7 @@ fn mysql_family_set_system_variable_value_slots_do_not_offer_object_catalog() {
         ),
     ] {
         for sql in sqls {
-            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(*sql, db);
+            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
             assert_eq!(
                 kind, None,
                 "MySQL-family SET system-variable value slot should not resolve object kind at `{sql}` for {db:?}: keywords={keywords:?} final={final_suggestions:?}"
@@ -67279,7 +67477,7 @@ fn mysql_family_set_system_variable_name_slots_do_not_offer_object_catalog() {
         ),
     ] {
         for sql in sqls {
-            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(*sql, db);
+            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
             assert_eq!(
                 kind, None,
                 "MySQL-family SET system-variable name slot should not resolve object kind at `{sql}` for {db:?}: keywords={keywords:?} final={final_suggestions:?}"
