@@ -611,6 +611,7 @@ pub static MYSQL_FUNCTIONS_SET: once_cell::sync::Lazy<std::collections::HashSet<
     once_cell::sync::Lazy::new(|| MYSQL_FUNCTIONS.iter().copied().collect());
 
 const FUNCTION_SUFFIX: &str = "()";
+const ORACLE_BUILTIN_PACKAGES: &[&str] = &["DBMS_OUTPUT"];
 
 const MAX_SUGGESTIONS: usize = 50;
 type LanguageCatalog = (&'static [&'static str], &'static [&'static str]);
@@ -1500,6 +1501,25 @@ impl IntellisenseData {
     pub fn get_package_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
         self.ensure_base_indices();
         Self::suggestions_from_entry_groups(prefix, &[&self.package_entries])
+    }
+
+    pub fn get_oracle_builtin_package_suggestions_for_db(
+        prefix: &str,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Vec<String> {
+        let mut suggestions = Vec::new();
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return suggestions;
+        }
+        let prefix_upper = Self::entry_lookup_prefix_upper(prefix);
+        let mut seen: HashSet<String> = HashSet::new();
+        Self::append_oracle_builtin_package_suggestions(
+            &prefix_upper,
+            prefix,
+            &mut suggestions,
+            &mut seen,
+        );
+        suggestions
     }
 
     pub fn get_sequence_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
@@ -2453,7 +2473,10 @@ impl IntellisenseData {
             "SYNONYM"
         } else if has(&self.procedure_entries) {
             "PROCEDURE"
-        } else if has(&self.package_entries) {
+        } else if has(&self.package_entries)
+            || (!crate::sql_text::mysql_compatibility_for_sql("", db_type)
+                && Self::is_oracle_builtin_package(&upper))
+        {
             "PACKAGE"
         } else if has(&self.function_entries) {
             "FUNCTION"
@@ -2964,6 +2987,33 @@ impl IntellisenseData {
             }
         }
         suggestions.len() >= MAX_SUGGESTIONS
+    }
+
+    fn append_oracle_builtin_package_suggestions(
+        prefix_upper: &str,
+        raw_prefix: &str,
+        suggestions: &mut Vec<String>,
+        seen: &mut HashSet<String>,
+    ) {
+        for package in ORACLE_BUILTIN_PACKAGES {
+            if suggestions.len() >= MAX_SUGGESTIONS {
+                break;
+            }
+            if !package.starts_with(prefix_upper) {
+                continue;
+            }
+            if !raw_prefix.is_empty() && !suggestion_matches_completion_prefix(package, raw_prefix)
+            {
+                continue;
+            }
+            if seen.insert((*package).to_string()) {
+                suggestions.push((*package).to_string());
+            }
+        }
+    }
+
+    fn is_oracle_builtin_package(name_upper: &str) -> bool {
+        ORACLE_BUILTIN_PACKAGES.contains(&name_upper)
     }
 
     /// Fuzzy (ordered-subsequence) relevance score for a candidate that is *not*

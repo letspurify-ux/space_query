@@ -2803,8 +2803,14 @@ fn audit_final_suggestions_for(
             Some(db),
         )
         .is_some();
+    let in_plsql_executable_block = SqlEditorWidget::cursor_in_plsql_executable_block_for_context(
+        &ctx,
+        trigger_has_identifier,
+        Some(db),
+    );
     if SqlEditorWidget::context_suppresses_completion(context)
         || (ctx.ddl_new_name_position
+            && !in_plsql_executable_block
             && !at_data_type_for_suppressed_name
             && !at_package_declaration_default_value
             && !ddl_new_name_allows_keyword_suggestions
@@ -2814,6 +2820,7 @@ fn audit_final_suggestions_for(
             && create_table_partition_declared_column_suggestions.is_none()
             && alter_table_add_declared_column_suggestions.is_none())
         || (!at_package_declaration_default_value
+            && !in_plsql_executable_block
             && SqlEditorWidget::cursor_is_at_create_object_new_name(
                 &ctx,
                 trigger_has_identifier,
@@ -2846,6 +2853,7 @@ fn audit_final_suggestions_for(
             Some(db),
         )
         || (!at_package_declaration_default_value
+            && !in_plsql_executable_block
             && SqlEditorWidget::cursor_is_at_ddl_identifier_suppression_slot_for_context(
                 &ctx,
                 trigger_has_identifier,
@@ -3033,7 +3041,43 @@ fn audit_final_suggestions_for(
         || at_package_declaration_default_value_empty_operand_start
         || at_column_property_argument_slot
         || at_completed_oracle_sequence_pseudocolumn
-        || (at_keyword_only && !at_data_type && !at_dedicated_column_slot)
+        || SqlEditorWidget::cursor_is_at_mysql_schema_object_keyword_slot_for_context(
+            &ctx,
+            trigger_has_identifier,
+            Some(db),
+        )
+        || SqlEditorWidget::cursor_is_at_mysql_option_value_slot_for_context(
+            &ctx,
+            trigger_has_identifier,
+            Some(db),
+        )
+        || SqlEditorWidget::cursor_is_at_mysql_literal_only_option_value_slot_for_context(
+            &ctx,
+            trigger_has_identifier,
+            Some(db),
+        )
+        || SqlEditorWidget::cursor_is_at_oracle_comment_text_value_slot_for_context(
+            &ctx,
+            trigger_has_identifier,
+            Some(db),
+        )
+        || ((at_keyword_only && !at_data_type && !at_dedicated_column_slot)
+            && !(SqlEditorWidget::plsql_statement_start_allows_bare_calls(expr_keyword_ctx)
+                && !SqlEditorWidget::cursor_is_at_plsql_goto_label_slot_for_context(
+                    &ctx,
+                    trigger_has_identifier,
+                    Some(db),
+                )
+                && !SqlEditorWidget::cursor_is_at_plsql_label_definition_slot_for_context(
+                    &ctx,
+                    trigger_has_identifier,
+                    Some(db),
+                ))
+            && !expr_keyword_ctx.at_plsql_value_operand
+            && !(expr_keyword_ctx.in_plsql_value_expression
+                && expr_keyword_ctx.statement_start.is_none()
+                && expr_keyword_ctx.follows_operand == Some(true)
+                && !expr_keyword_ctx.at_exception_name))
         || !source_allowance.base_catalog_suggestions
     {
         Vec::new()
@@ -25001,6 +25045,121 @@ fn collect_expected_keyword_suggestions_complete_common_clause_tails() {
 }
 
 #[test]
+fn oracle_package_body_insert_statement_offers_dml_keywords() {
+    let package_body = r#"
+CREATE OR REPLACE NONEDITIONABLE PACKAGE BODY "SYSTEM"."OQT_DEEP_PKG" AS
+  PROCEDURE log_msg(p_tag IN VARCHAR2, p_msg IN VARCHAR2, p_depth IN NUMBER) IS
+  BEGIN
+    INSERT __CURSOR__ into oqt_t_log(log_id, tag, msg, depth)
+    values (oqt_seq_log.NEXTVAL, SUBSTR(p_tag,1,30), SUBSTR(p_msg,1,4000), p_depth);
+  END;
+END;
+"#;
+    let sql = package_body.replace("__CURSOR__", "|");
+    let (_kind, _keywords, final_suggestions) =
+        audit_final_suggestions_for(&sql, crate::db::DatabaseType::Oracle);
+    assert!(
+        final_suggestions.iter().any(|value| value == "INTO"),
+        "INSERT inside package body should offer INTO, got: {final_suggestions:?}"
+    );
+
+    let package_body = r#"
+CREATE OR REPLACE NONEDITIONABLE PACKAGE BODY "SYSTEM"."OQT_DEEP_PKG" AS
+  PROCEDURE log_msg(p_tag IN VARCHAR2, p_msg IN VARCHAR2, p_depth IN NUMBER) IS
+  BEGIN
+    INSERT into oqt_t_log(log_id, tag, msg, depth) __CURSOR__
+    values (oqt_seq_log.NEXTVAL, SUBSTR(p_tag,1,30), SUBSTR(p_msg,1,4000), p_depth);
+  END;
+END;
+"#;
+    let sql = package_body.replace("__CURSOR__", "|");
+    let (_kind, _keywords, final_suggestions) =
+        audit_final_suggestions_for(&sql, crate::db::DatabaseType::Oracle);
+    assert!(
+        final_suggestions.iter().any(|value| value == "VALUES"),
+        "INSERT column list inside package body should offer VALUES, got: {final_suggestions:?}"
+    );
+
+    let package_body = r#"
+CREATE OR REPLACE NONEDITIONABLE PACKAGE BODY "SYSTEM"."OQT_DEEP_PKG" AS
+  PROCEDURE log_msg(p_tag IN VARCHAR2, p_msg IN VARCHAR2, p_depth IN NUMBER) IS
+  BEGIN
+    INSERT into oqt_t_log(log_id, tag, msg, depth)
+    values (oqt_seq_log.NEXTVAL, SUBSTR(p_tag,1,30), SUBSTR(p_msg,1,4000), p_depth);
+    DBMS_OUT__CURSOR__
+  END;
+END;
+"#;
+    let sql = package_body.replace("__CURSOR__", "|");
+    let (_kind, _keywords, final_suggestions) =
+        audit_final_suggestions_for(&sql, crate::db::DatabaseType::Oracle);
+    assert!(
+        final_suggestions.iter().any(|value| value == "DBMS_OUTPUT"),
+        "package body should offer DBMS_OUTPUT at a PL/SQL call statement, got: {final_suggestions:?}"
+    );
+}
+
+#[test]
+fn oracle_package_body_plsql_keywords_are_offered_inside_nested_blocks() {
+    let package_body = r#"
+CREATE OR REPLACE NONEDITIONABLE PACKAGE BODY "SYSTEM"."OQT_DEEP_PKG" AS
+
+  FUNCTION f_calc(p_n IN NUMBER) RETURN NUMBER IS
+    v NUMBER := 0;
+  BEGIN
+    IF p_n IS NULL THEN
+      v := -1;
+    ELSE
+      CASE
+        WHEN p_n < 0 THEN
+          v := p_n * p_n;
+        WHEN p_n BETWEEN 0 AND 10 THEN
+          DECLARE
+            x NUMBER := p_n + 100;
+          BEGIN
+            v := x - 50;
+          END;
+        ELSE
+          v := p_n + 999;
+      END CASE;
+    END IF;
+
+    RETURN v;
+  EXCEPTION
+    WHEN OTHERS THEN
+      log_msg('F_CALC', SQLERRM, 999);
+      RETURN NULL;
+  END;
+END;
+"#;
+
+    let cases = [
+        ("IS NULL THEN", "IS NUL__CURSOR__ THEN", "NULL"),
+        ("IS NULL THEN", "IS NULL TH__CURSOR__", "THEN"),
+        ("END IF;\n\n    RETURN", "END IF;\n\n    RET__CURSOR__", "RETURN"),
+        ("EXCEPTION\n    WHEN", "EXCEPTION\n    WH__CURSOR__", "WHEN"),
+        ("WHEN OTHERS", "WHEN OTH__CURSOR__", "OTHERS"),
+        ("OTHERS THEN", "OTHERS TH__CURSOR__", "THEN"),
+        ("RETURN NULL", "RETURN NUL__CURSOR__", "NULL"),
+        ("CASE\n        WHEN", "CASE\n        WH__CURSOR__", "WHEN"),
+        ("p_n BETWEEN", "p_n BET__CURSOR__", "BETWEEN"),
+        ("END;\n        ELSE", "END;\n        EL__CURSOR__", "ELSE"),
+    ];
+
+    for (target, replacement, expected) in cases {
+        let sql = package_body
+            .replace(target, replacement)
+            .replace("__CURSOR__", "|");
+        let (_kind, keywords, final_suggestions) =
+            audit_final_suggestions_for(&sql, crate::db::DatabaseType::Oracle);
+        assert!(
+            final_suggestions.iter().any(|value| value == expected),
+            "{expected} should be offered for target `{target}`, keywords={keywords:?}, final={final_suggestions:?}"
+        );
+    }
+}
+
+#[test]
 fn extract_field_slot_suppresses_columns_and_offers_field_keywords() {
     let at_field = |sql: &str| {
         SqlEditorWidget::extract_field_position_for_context(&analyze_inline_cursor_sql(sql), false)
@@ -45117,7 +45276,13 @@ fn query_keyword_completion_suggestions(
         expr_kw,
     )
     .allowance(context, None, expr_kw);
-    let mut suggestions = if at_keyword_only_identifier_slot || at_keyword_only_slot {
+    let mut suggestions = if at_keyword_only_identifier_slot
+        || at_keyword_only_slot
+        || SqlEditorWidget::cursor_is_at_mysql_schema_object_keyword_slot_for_context(
+            &deep_ctx,
+            exclude_current_identifier_chain,
+            Some(db_type),
+        ) {
         Vec::new()
     } else {
         SqlEditorWidget::base_suggestions_for_context(
