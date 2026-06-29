@@ -174,6 +174,28 @@ impl HighlightShadowState {
         self.text.get(start..end).map(ToString::to_string)
     }
 
+    /// Like [`text_range_string`], but also returns the UTF-8 char boundary the
+    /// slice actually begins at. A mid-character `start` is backed up to the
+    /// previous boundary; any caller that maps slice-relative offsets back to
+    /// absolute buffer offsets MUST use this aligned start, not the requested
+    /// one. Otherwise every `abs = start + rel` desyncs by 1-2 bytes — e.g. a
+    /// multibyte (Korean) block comment before the cursor shifts an IntelliSense
+    /// replacement into the typed word (`pr` + `procedure` -> `pprocedure`).
+    pub(crate) fn text_range_string_with_aligned_start(
+        &self,
+        start: usize,
+        end: usize,
+    ) -> Option<(String, usize)> {
+        let start = Self::clamp_boundary(&self.text, start.min(self.text.len()));
+        let end = Self::clamp_boundary(&self.text, end.min(self.text.len()));
+        if end < start {
+            return Some((String::new(), start));
+        }
+        self.text
+            .get(start..end)
+            .map(|slice| (slice.to_string(), start))
+    }
+
     /// Returns true when `pos` (a cursor byte offset) sits inside a string
     /// literal or comment, as classified by the syntax highlighter. These are
     /// positions where IntelliSense must stay silent: completing keywords,
@@ -866,6 +888,30 @@ mod tests {
     /// Returns the cursor offset right after `needle` in `text`.
     fn after(text: &str, needle: &str) -> usize {
         text.find(needle).expect("needle present") + needle.len()
+    }
+
+    #[test]
+    fn text_range_string_with_aligned_start_backs_up_mid_character_start() {
+        // A mixed Korean/English block comment before the typed word. When the
+        // IntelliSense window start (cursor - WINDOW) lands inside a 3-byte
+        // Korean char, the reported start MUST be the boundary the slice begins
+        // at, or absolute offsets desync and only the tail of the prefix is
+        // replaced (the `pr` -> `pprocedure` bug).
+        let sql = "/* 한글 comment 영문 */\npr";
+        let shadow = shadow_for(sql);
+
+        let han = sql.find('한').expect("korean anchor");
+        let mid = han + 1; // mid-character byte offset
+        assert!(!sql.is_char_boundary(mid));
+
+        let (text, aligned) = shadow
+            .text_range_string_with_aligned_start(mid, sql.len())
+            .expect("range");
+
+        assert_eq!(aligned, han, "start backs up to the char boundary");
+        assert!(sql.is_char_boundary(aligned));
+        // The reported start maps the slice back to absolute offsets exactly.
+        assert_eq!(&sql[aligned..aligned + text.len()], text);
     }
 
     #[test]

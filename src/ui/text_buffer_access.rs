@@ -76,12 +76,14 @@ pub(crate) fn bounded_text_window(
         return (String::new(), start);
     }
 
-    if with_current_shadow(buffer, shadow, |shadow| {
-        shadow.text_range_string(start as usize, end as usize)
-    })
-    .is_some()
-    {
-        return (text_range(buffer, shadow, start, end), start);
+    // Report the boundary-aligned start the slice actually begins at: a
+    // mid-character window start (cursor - WINDOW landing inside a multibyte
+    // char) is backed up to the previous UTF-8 boundary by the slice, so
+    // returning the raw `start` desyncs callers' `abs = start + rel` math.
+    if let Some((text, aligned_start)) = with_current_shadow(buffer, shadow, |shadow| {
+        shadow.text_range_string_with_aligned_start(start as usize, end as usize)
+    }) {
+        return (text, aligned_start as i32);
     }
 
     if let Some(text) = buffer.text_range(start, end) {
