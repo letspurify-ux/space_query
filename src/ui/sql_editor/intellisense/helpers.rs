@@ -719,6 +719,17 @@ impl SqlEditorWidget {
     ) -> (usize, usize) {
         if let Some((start, end)) = range {
             if start != end {
+                // A stored completion range can drift out of sync with the live
+                // buffer (async popup-show timing, fast-path prefix filtering, or
+                // an empty-prefix keyword popup that the user then types into). If
+                // the range starts *inside* the identifier word under the cursor,
+                // returning it verbatim replaces only the tail and leaves a
+                // dangling prefix character — e.g. typing `pr` then choosing
+                // `procedure` yields `pprocedure`. Anchor the bounds to the live
+                // word so the whole typed prefix is always replaced.
+                if !word.is_empty() && word_start <= cursor_pos && cursor_pos <= word_end {
+                    return (start.min(word_start), end.max(cursor_pos));
+                }
                 return (start, end);
             }
             if word_start == cursor_pos && word_end > cursor_pos {

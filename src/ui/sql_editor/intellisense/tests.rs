@@ -74575,3 +74575,61 @@ fn package_spec_resolution_is_bounded_on_large_buffers() {
         "spec beyond the bounded search window should not be scanned: {far_suggestions:?}"
     );
 }
+
+/// A completion range that drifted to start *inside* the word under the cursor
+/// must not leave a dangling prefix character. Regression for "pr" + selecting
+/// "procedure" inserting "pprocedure": the replacement is re-anchored to the
+/// live word so the whole typed prefix ("pr") is replaced.
+#[test]
+fn completion_replacement_range_anchors_to_word_when_range_drifts_inside_word() {
+    // "pr" typed at the start of the buffer, cursor after it; a stale range that
+    // begins at the 'r' (start=1) must be widened back to the word start (0).
+    let drifted_start = SqlEditorWidget::completion_replacement_range_from_word_bounds(
+        "pr", 0, 2, 2, Some((1, 2)),
+    );
+    assert_eq!(drifted_start, (0, 2), "range starting inside the word leaked a prefix char");
+
+    // A stale range whose end lags behind the cursor must extend to the cursor so
+    // the trailing typed chars are replaced too (would otherwise leave "...r").
+    let drifted_end = SqlEditorWidget::completion_replacement_range_from_word_bounds(
+        "pr", 0, 2, 2, Some((0, 1)),
+    );
+    assert_eq!(drifted_end, (0, 2), "range ending before the cursor left a trailing char");
+
+    // An already-correct range is unchanged.
+    let aligned = SqlEditorWidget::completion_replacement_range_from_word_bounds(
+        "pr", 0, 2, 2, Some((0, 2)),
+    );
+    assert_eq!(aligned, (0, 2));
+
+    // Mid-buffer word (e.g. after "CREATE OR REPLACE ") behaves the same.
+    let mid = SqlEditorWidget::completion_replacement_range_from_word_bounds(
+        "pr", 18, 20, 20, Some((19, 20)),
+    );
+    assert_eq!(mid, (18, 20));
+}
+
+/// The word-anchoring guard must not disturb the already-correct paths: a
+/// qualified member slot (`a.pr|`), the zero-length forward-identifier range, and
+/// the no-range fallback all keep their existing behavior.
+#[test]
+fn completion_replacement_range_preserves_aligned_and_empty_cases() {
+    // Qualified member: range already equals the word bounds → unchanged.
+    let qualified = SqlEditorWidget::completion_replacement_range_from_word_bounds(
+        "pr", 5, 7, 7, Some((5, 7)),
+    );
+    assert_eq!(qualified, (5, 7));
+
+    // Zero-length range with a forward identifier (e.g. `a.|a`) keeps extending
+    // over the forward word, not the word-anchoring path.
+    let zero_len = SqlEditorWidget::completion_replacement_range_from_word_bounds(
+        "", 3, 4, 3, Some((3, 3)),
+    );
+    assert_eq!(zero_len, (3, 4));
+
+    // No stored range: fall back to the plain word/cursor bounds.
+    let no_range = SqlEditorWidget::completion_replacement_range_from_word_bounds(
+        "pr", 0, 2, 2, None,
+    );
+    assert_eq!(no_range, (0, 2));
+}
