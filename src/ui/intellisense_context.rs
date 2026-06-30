@@ -2881,7 +2881,15 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
         };
 
     while idx < tokens.len() {
-        if cursor_snapshot.is_none() && idx == cursor_token_len {
+        // Snapshot at the first token index that reaches or passes the cursor.
+        // A relation reference can consume its trailing alias in one step (`he a`
+        // parsed together), advancing `idx` from before the cursor to past it; an
+        // exact `idx == cursor_token_len` check would skip the snapshot there and
+        // fall through to the post-loop fallback, which reflects the phase at
+        // end-of-statement (e.g. `JoinCondition` for a trailing `… ON`) rather
+        // than the cursor's `FromClause`. `>=` captures the phase as it stood
+        // before the straddling token was processed.
+        if cursor_snapshot.is_none() && idx >= cursor_token_len {
             cursor_snapshot = Some(snapshot_cursor_state(
                 depth,
                 query_depth,

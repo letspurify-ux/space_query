@@ -109,6 +109,24 @@ fn phase_from_clause() {
 }
 
 #[test]
+fn from_relation_with_alias_keeps_table_context_when_followed_by_join_on() {
+    // The relation reference `he a` is parsed in one step, advancing the token
+    // index from before the cursor (`he|`) to past it. The cursor snapshot must
+    // still capture the `FromClause` phase at the relation slot, not the phase
+    // the statement ends in (`JoinCondition` for the trailing `… ON`).
+    for sql in [
+        "SELECT * FROM he| a JOIN help b ON",
+        "SELECT * FROM he| a JOIN help b ON b.id = a.id",
+        "SELECT * FROM emp e JOIN he| b ON",
+        "SELECT * FROM he| a",
+    ] {
+        let ctx = analyze(sql);
+        assert_eq!(ctx.phase, SqlPhase::FromClause, "phase for `{sql}`");
+        assert!(ctx.phase.is_table_context(), "table context for `{sql}`");
+    }
+}
+
+#[test]
 fn alter_table_foreign_key_references_target_is_table_context() {
     let ctx = analyze(
         "ALTER TABLE orders ADD CONSTRAINT fk_orders_customer FOREIGN KEY (customer_id) REFERENCES |",
