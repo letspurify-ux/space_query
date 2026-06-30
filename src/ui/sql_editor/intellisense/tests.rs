@@ -3338,11 +3338,11 @@ fn audit_final_suggestions_impl(
             at_package_declaration_default_value,
             restrict_to_relation_columns,
         );
-        SqlEditorWidget::widen_to_full_catalog_when_empty(
+        SqlEditorWidget::append_full_catalog_tail(
             &mut data,
             suggestions,
             &prefix,
-            Some(db),
+            context,
             offer_full_catalog_tail,
         )
     } else {
@@ -3351,77 +3351,162 @@ fn audit_final_suggestions_impl(
     (expected_object_kind, expected_keywords, suggestions)
 }
 
-/// Unit-level contract of the widen helper: widens to the full catalog only when
-/// the context result is empty AND the slot offers it; otherwise unchanged.
+/// Unit-level contract of the full-catalog tail helper: when the slot offers it,
+/// the prefix-matched catalog is appended *below* the context suggestions
+/// (context order preserved, deduped); a suppressed slot leaves the input as-is.
 #[test]
-fn full_catalog_safety_net_widens_only_when_context_is_empty() {
-    let db = Some(crate::db::DatabaseType::Oracle);
+fn full_catalog_tail_appends_below_context_suggestions() {
+    use crate::ui::SqlContext;
     let mut data = IntellisenseData::new();
     data.tables = vec!["EMP".to_string(), "EMPLOYEE".to_string()];
     data.rebuild_indices();
 
-    // Non-empty context result → trusted unchanged, no catalog appended.
-    let kept = SqlEditorWidget::widen_to_full_catalog_when_empty(
+    // Offered: context match "EMP" stays on top, the rest of the catalog
+    // ("EMPLOYEE") is appended below, and the existing "EMP" is not duplicated.
+    let appended = SqlEditorWidget::append_full_catalog_tail(
         &mut data,
-        vec!["SCOPED_COL".to_string()],
+        vec!["EMP".to_string()],
         "emp",
-        db,
+        SqlContext::ColumnName,
         true,
     );
-    assert_eq!(kept, vec!["SCOPED_COL".to_string()]);
+    assert_eq!(appended.first().map(String::as_str), Some("EMP"));
+    assert!(appended.iter().any(|s| s == "EMPLOYEE"));
+    assert_eq!(appended.iter().filter(|s| s.as_str() == "EMP").count(), 1);
 
-    // Empty context at an offered position → widened to the full catalog.
-    let widened =
-        SqlEditorWidget::widen_to_full_catalog_when_empty(&mut data, Vec::new(), "emp", db, true);
-    assert!(
-        widened.iter().any(|s| s == "EMP") && widened.iter().any(|s| s == "EMPLOYEE"),
-        "empty context must widen to the catalog: {widened:?}"
+    // Offered with an empty context → tail still surfaces the whole catalog.
+    let from_empty = SqlEditorWidget::append_full_catalog_tail(
+        &mut data,
+        Vec::new(),
+        "emp",
+        SqlContext::ColumnName,
+        true,
     );
+    assert!(from_empty.iter().any(|s| s == "EMP") && from_empty.iter().any(|s| s == "EMPLOYEE"));
 
-    // Empty context but suppressed slot (`offer == false`) → stays empty.
-    let suppressed =
-        SqlEditorWidget::widen_to_full_catalog_when_empty(&mut data, Vec::new(), "emp", db, false);
+    // Suppressed slot (`offer == false`) → input returned unchanged, no tail.
+    let suppressed = SqlEditorWidget::append_full_catalog_tail(
+        &mut data,
+        Vec::new(),
+        "emp",
+        SqlContext::ColumnName,
+        false,
+    );
     assert!(suppressed.is_empty());
 }
 
-/// Production-path coverage of the safety-net GATE: at the full production output
-/// (precision core + widen), the catalog must NOT leak into deliberately narrowed
-/// slots — the regression that the precision audit alone can no longer catch now
-/// that the widen is production-only. Uses `audit_final_suggestions_with_safety_net_for`,
-/// which applies the exact gate + widen production uses.
+/// Commercial-grade type-appropriateness: the tail only offers items that are
+/// grammatically referenceable at the slot. A FROM/target slot gets relation
+/// sources only (no columns, triggers, indexes, keywords); an expression slot
+/// gets columns + relations + referenceable routines/types, but never
+/// non-referenceable objects like triggers or indexes.
 #[test]
-fn full_catalog_safety_net_does_not_leak_into_narrowed_slots() {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+fn full_catalog_tail_is_type_appropriate_per_slot() {
+    use crate::ui::SqlContext;
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["EMP".to_string()];
+    data.views = vec!["EMP_V".to_string()];
+    data.triggers = vec!["EMP_TRG".to_string()];
+    data.indexes = vec!["EMP_IDX".to_string()];
+    data.functions = vec!["EMP_FN".to_string()];
+    data.set_columns_for_table("EMP", vec!["EMP_COL".to_string()]);
+    data.rebuild_indices();
+
+    // FROM/target slot: relation sources only.
+    let from_tail =
+        SqlEditorWidget::collect_full_catalog_tail_for_context(&mut data, "emp", SqlContext::TableName);
+    assert!(has(&from_tail, "EMP") && has(&from_tail, "EMP_V"), "FROM tail keeps relations");
+    assert!(
+        !has(&from_tail, "EMP_COL")
+            && !has(&from_tail, "EMP_TRG")
+            && !has(&from_tail, "EMP_IDX")
+            && !has(&from_tail, "EMP_FN"),
+        "FROM tail must exclude columns/triggers/indexes/functions: {from_tail:?}"
+    );
+
+    // Expression slot: columns + relations + referenceable routines, but no
+    // triggers/indexes.
+    let expr_tail = SqlEditorWidget::collect_full_catalog_tail_for_context(
+        &mut data,
+        "emp",
+        SqlContext::ColumnName,
+    );
+    assert!(
+        has(&expr_tail, "EMP_COL") && has(&expr_tail, "EMP") && has(&expr_tail, "EMP_FN"),
+        "expression tail keeps columns/relations/routines: {expr_tail:?}"
+    );
+    assert!(
+        !has(&expr_tail, "EMP_TRG") && !has(&expr_tail, "EMP_IDX"),
+        "expression tail must exclude non-referenceable triggers/indexes: {expr_tail:?}"
+    );
+}
+
+/// Production-path coverage of the safety-net GATE. The full-catalog tail is
+/// offered at every identifier-bearing slot (free column/relation positions AND
+/// object/target slots like `FROM`/`UPDATE`), but must stay OUT of slots where a
+/// catalog item is grammatically nonsense (keyword-only, completed operand,
+/// variable/bind target, data-type, completed default). Uses
+/// `audit_final_suggestions_with_safety_net_for`, which applies the exact gate +
+/// tail production uses — the regression the precision audit no longer catches.
+#[test]
+fn full_catalog_safety_net_targets_identifier_slots_only() {
+    use crate::db::DatabaseType::Oracle;
 
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
 
-    // Deliberately narrowed positions: an empty/non-matching prefix here must
-    // stay silent (or keyword-only) rather than dumping the object/column catalog.
-    // A column (`EMPNO`) and a procedure (`RUN_JOB`) are never valid at any of
-    // these slots, so their presence is an unambiguous signal that the full
-    // catalog leaked through the widen.
-    for (sql, db) in [
-        ("UPDATE |", Oracle),                                  // DML target → tables only (kind slot)
-        ("SELECT EXTRACT(| FROM hiredate) FROM emp", Oracle),  // EXTRACT field → keyword-only
-        ("SELECT * FROM emp e WHERE ename LIKE 'a%' |", Oracle), // completed predicate → keyword-only
-        ("BEGIN SELECT empno INTO | FROM emp; END;", Oracle),  // INTO target → variable slot
-        ("DROP DATABASE IF EXISTS |", MySQL),                  // schema-name slot
-        ("CREATE PACKAGE pkg AS g NUMBER DEFAULT 1 |", Oracle), // completed default value
+    // Nonsense positions: a column (`EMPNO`) and a procedure (`RUN_JOB`) are never
+    // valid here, so their presence signals the catalog leaked through the tail.
+    for sql in [
+        "SELECT EXTRACT(| FROM hiredate) FROM emp",     // EXTRACT field → keyword-only
+        "SELECT * FROM emp e WHERE ename LIKE 'a%' |",  // completed predicate → keyword-only
+        "BEGIN SELECT empno INTO | FROM emp; END;",     // INTO target → variable slot
+        "CREATE PACKAGE pkg AS g NUMBER DEFAULT 1 |",   // completed default value
     ] {
         let (_kind, _keywords, final_suggestions) =
-            audit_final_suggestions_with_safety_net_for(sql, db);
+            audit_final_suggestions_with_safety_net_for(sql, Oracle);
         assert!(
             !has(&final_suggestions, "EMPNO") && !has(&final_suggestions, "RUN_JOB"),
-            "full catalog leaked into a narrowed slot at `{sql}`: {final_suggestions:?}"
+            "full catalog leaked into a nonsense slot at `{sql}`: {final_suggestions:?}"
         );
     }
 
-    // A free relation position whose context match is non-empty stays trusted
-    // (no extra columns/objects appended below the relations).
-    let (_k, _kw, from_slot) = audit_final_suggestions_with_safety_net_for(
-        "SELECT * FROM em| a JOIN dept b ON b.id = a.id",
-        Oracle,
-    );
+    // Object-kind slots get their exact kind from the precision core, NOT the
+    // generic tail — so a COLUMN (`EMPNO`) must never leak into them (regression:
+    // columns appeared at `CALL |`/`GRANT ON |`/`DROP TRIGGER |`).
+    for sql in [
+        "CALL |",            // routine target
+        "GRANT SELECT ON |", // grantable object
+        "DROP TRIGGER |",    // trigger name
+    ] {
+        let (_kind, _keywords, final_suggestions) =
+            audit_final_suggestions_with_safety_net_for(sql, Oracle);
+        assert!(
+            !has(&final_suggestions, "EMPNO") && !has(&final_suggestions, "DEPTNO"),
+            "a column leaked into an object-kind slot at `{sql}`: {final_suggestions:?}"
+        );
+    }
+
+    // Identifier-bearing positions: the tail must surface the out-of-scope catalog
+    // below the context match (`DEPT`/its column `DEPTNO` is not in `emp`'s scope,
+    // `RUN_JOB` is a procedure not in the FROM/UPDATE target list).
+    for (sql, marker) in [
+        ("SELECT * FROM emp WHERE de|", "DEPT"),  // free column position
+        ("SELECT de| FROM emp", "DEPT"),          // select list
+        ("UPDATE emp SET x = de|", "DEPT"),       // SET value expression
+    ] {
+        let (_k, _kw, out) = audit_final_suggestions_with_safety_net_for(sql, Oracle);
+        assert!(
+            has(&out, marker) || has(&out, "DEPTNO"),
+            "full-catalog tail must surface out-of-scope catalog at `{sql}`: {out:?}"
+        );
+    }
+
+    // FROM/object target slots also get the tail (per the chosen scope): the
+    // relation match stays on top, but objects/columns appear below it.
+    let (_k, _kw, from_slot) =
+        audit_final_suggestions_with_safety_net_for("SELECT * FROM em| a JOIN dept b ON b.id = a.id", Oracle);
     assert!(
         has(&from_slot, "EMP"),
         "relation suggestion must survive at a FROM slot with trailing alias+join: {from_slot:?}"

@@ -3289,15 +3289,15 @@ impl SqlEditorWidget {
             },
         );
 
-        let suggestions = if offer_full_catalog_tail && suggestions.is_empty() {
+        let suggestions = if offer_full_catalog_tail {
             let mut data = intellisense_data
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            Self::widen_to_full_catalog_when_empty(
+            Self::append_full_catalog_tail(
                 &mut data,
                 suggestions,
                 &snapshot.prefix,
-                Some(snapshot.preferred_db_type),
+                context,
                 offer_full_catalog_tail,
             )
         } else {
@@ -3499,40 +3499,77 @@ impl SqlEditorWidget {
         suggestions
     }
 
-    /// Full-catalog safety net for context mis-detection. When the context-driven
-    /// merge produced *nothing*, fall back to the entire prefix-matched catalog
-    /// (relations, objects, columns, keywords) so a wanted item is never hidden by
-    /// a wrong phase/kind/scope judgement. Only widens when the result is empty —
-    /// a non-empty context result is trusted as-is, preserving every deliberately
-    /// narrowed slot. `offer` gates out keyword/value-only, scoped-column,
-    /// data-type and qualified positions so a non-matching prefix there still
-    /// stays silent rather than dumping the catalog.
-    fn widen_to_full_catalog_when_empty(
+    /// Referenceable catalog for the full-catalog tail, scoped to the slot's
+    /// grammar category so only grammatically-valid items can appear. A
+    /// table/target slot (`SqlContext::TableName`: FROM / UPDATE|DELETE|MERGE
+    /// target) offers only relation sources (tables/views/MVs/synonyms/schemas).
+    /// A column/expression slot offers columns, relations (as qualifiers), and
+    /// referenceable routines/sequences/types/schemas. Non-referenceable objects
+    /// (triggers, indexes, events, operators, clusters, …) and the raw keyword
+    /// catalog are intentionally excluded — context keywords are supplied by the
+    /// precision core, not this tail.
+    fn collect_full_catalog_tail_for_context(
+        data: &mut IntellisenseData,
+        prefix: &str,
+        context: SqlContext,
+    ) -> Vec<String> {
+        if matches!(context, SqlContext::TableName) {
+            return data.get_relation_suggestions(prefix);
+        }
+        // Column/expression slot: items referenceable inside an expression —
+        // columns, relations (as qualifiers / scalar subquery sources), and
+        // value-producing objects (functions, packages for `pkg.fn`, types for
+        // `CAST`). Bare procedures (not callable in an expression) and schema/user
+        // names are intentionally excluded.
+        let mut out = data.get_relation_or_sequence_object_suggestions(prefix);
+        for extra in [
+            data.get_function_object_suggestions(prefix),
+            data.get_package_object_suggestions(prefix),
+            data.get_type_object_suggestions(prefix),
+            data.get_column_suggestions(prefix, None),
+        ] {
+            out = Self::merge_suggestions_with_context_aliases(out, extra, false);
+        }
+        out
+    }
+
+    /// Production "precision core + full-catalog fallback" layer. Appends the
+    /// referenceable catalog for this slot (see `collect_full_catalog_tail_for_context`)
+    /// below the context-driven suggestions as a lower-priority tail — context
+    /// matches stay on top in their order, items already present are deduped out,
+    /// and the merged list is capped. This guards against context mis-detection:
+    /// even when the phase/kind/scope is judged wrongly, a wanted (grammatically
+    /// valid) item still survives below instead of being hidden. `offer` gates out
+    /// keyword/value-only, scoped-column, data-type, variable/bind and qualified
+    /// positions so a deliberately narrowed slot stays clean.
+    fn append_full_catalog_tail(
         data: &mut IntellisenseData,
         merged: Vec<String>,
         prefix: &str,
-        db_type: Option<crate::db::DatabaseType>,
+        context: SqlContext,
         offer: bool,
     ) -> Vec<String> {
-        if !offer || !merged.is_empty() {
+        if !offer {
             return merged;
         }
-        let mut fallback =
-            Self::collect_all_completion_fallback_suggestions_for_db(data, prefix, db_type, Vec::new());
-        fallback.truncate(crate::ui::intellisense::MAX_SUGGESTIONS);
-        fallback
+        let tail = Self::collect_full_catalog_tail_for_context(data, prefix, context);
+        let mut merged = Self::merge_suggestions_with_context_aliases(merged, tail, false);
+        merged.truncate(crate::ui::intellisense::MAX_SUGGESTIONS);
+        merged
     }
 
-    /// Gate for the full-catalog safety net: true only at a free
-    /// column/relation/expression position where the base catalog is genuinely
-    /// the answer. Object-kind slots (`replace_table_context_with_expected_objects`:
-    /// `FROM`, `INSERT INTO`, `CALL`, `GRANT`, …) defer to the existing kind-aware
-    /// empty fallback; variable/bind/object-name contexts, completed operands
-    /// (`x AT TIME ZONE tz |`, `DEFAULT 1 |`), and every keyword/value-only,
-    /// scoped-column, data-type and property slot are excluded so a non-matching
-    /// prefix there stays silent instead of dumping the catalog. Single source of
-    /// truth shared by `apply_intellisense_with_context` (production) and the
-    /// safety-net test harness so the two cannot drift.
+    /// Gate for the full-catalog safety net: true only at a free column/relation/
+    /// expression position whose grammar has NO specific expected object kind.
+    /// Object-kind slots (`replace_table_context_with_expected_objects`: `FROM`,
+    /// `INSERT INTO`, `UPDATE`/`DELETE`/`MERGE` target, `CALL`, `GRANT`, `DROP
+    /// TRIGGER`, …) are excluded — the precision core already shows the exact valid
+    /// kind there (relations / routines / objects), so a generic tail would only
+    /// add wrong-type noise (e.g. columns at `CALL |`). Also excluded:
+    /// variable/bind/generated-name contexts (`SELECT … INTO |`, `USING :b`, DDL
+    /// new names), completed operands (`x AT TIME ZONE tz |`, `DEFAULT 1 |`), and
+    /// every keyword/value-only, scoped-column, data-type and property slot. Single
+    /// source of truth shared by `apply_intellisense_with_context` (production) and
+    /// the safety-net test harness so the two cannot drift.
     #[allow(clippy::too_many_arguments)]
     fn cursor_offers_full_catalog_safety_net(
         qualifier: Option<&str>,
@@ -3551,9 +3588,9 @@ impl SqlEditorWidget {
     ) -> bool {
         qualifier.is_none()
             && !replace_table_context_with_expected_objects
-            && matches!(
+            && !matches!(
                 context,
-                SqlContext::ColumnName | SqlContext::ColumnOrAll | SqlContext::TableName
+                SqlContext::VariableName | SqlContext::BindValue | SqlContext::GeneratedName
             )
             && expr_keyword_ctx.follows_operand != Some(true)
             && base_catalog_suggestions
