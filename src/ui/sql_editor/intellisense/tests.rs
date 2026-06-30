@@ -2375,9 +2375,38 @@ fn mysql_context_and_suggestions_for_inline_sql(
     (context, suggestions)
 }
 
+// Precision-core view: the shared `merge_completion_sources` output, WITHOUT the
+// production full-catalog safety net. Every precision/no-noise regression test
+// uses this so it keeps asserting the exact, un-widened result.
 fn audit_final_suggestions_for(
     sql: &str,
     db: crate::db::DatabaseType,
+) -> (
+    Option<ExpectedObjectSuggestionKind>,
+    Vec<String>,
+    Vec<String>,
+) {
+    audit_final_suggestions_impl(sql, db, false)
+}
+
+// Production-equivalent view: precision core + the full-catalog safety net layered
+// on top exactly as `apply_intellisense_with_context` does. Used only by the
+// safety-net test to verify the gate fires/suppresses at the right slots.
+fn audit_final_suggestions_with_safety_net_for(
+    sql: &str,
+    db: crate::db::DatabaseType,
+) -> (
+    Option<ExpectedObjectSuggestionKind>,
+    Vec<String>,
+    Vec<String>,
+) {
+    audit_final_suggestions_impl(sql, db, true)
+}
+
+fn audit_final_suggestions_impl(
+    sql: &str,
+    db: crate::db::DatabaseType,
+    apply_safety_net: bool,
 ) -> (
     Option<ExpectedObjectSuggestionKind>,
     Vec<String>,
@@ -3250,6 +3279,14 @@ fn audit_final_suggestions_for(
             false,
         );
     }
+    // This harness verifies the PRECISION CORE only — the shared
+    // `merge_completion_sources` output. The production full-catalog safety net
+    // (`widen_to_full_catalog_when_empty`) is a separate post-merge layer applied
+    // only in `apply_intellisense_with_context`; it is covered by its own unit
+    // test (`full_catalog_safety_net_widens_only_when_context_is_empty`) and is
+    // intentionally NOT folded in here, so these tests keep asserting the precise,
+    // un-widened result.
+    //
     // Fold every source through the SAME merge pipeline production uses, so this
     // harness can no longer drift from `apply_intellisense_with_context` on merge
     // order, the per-source `prefer_aliases` flags, or which sources participate.
@@ -3282,7 +3319,113 @@ fn audit_final_suggestions_for(
             )
         },
     );
+    // Production layers the full-catalog safety net on top of the merge output;
+    // mirror that here only when explicitly requested, using the SAME shared gate
+    // predicate production uses so the two cannot drift.
+    let suggestions = if apply_safety_net {
+        let offer_full_catalog_tail = SqlEditorWidget::cursor_offers_full_catalog_safety_net(
+            qualifier.as_deref(),
+            replace_table_context_with_expected_objects,
+            context,
+            expr_keyword_ctx,
+            source_allowance.base_catalog_suggestions,
+            at_keyword_only,
+            at_value_only_no_expected_keyword_slot,
+            at_completed_oracle_sequence_pseudocolumn,
+            at_column_property_argument_slot,
+            at_dedicated_column_slot,
+            at_data_type,
+            at_package_declaration_default_value,
+            restrict_to_relation_columns,
+        );
+        SqlEditorWidget::widen_to_full_catalog_when_empty(
+            &mut data,
+            suggestions,
+            &prefix,
+            Some(db),
+            offer_full_catalog_tail,
+        )
+    } else {
+        suggestions
+    };
     (expected_object_kind, expected_keywords, suggestions)
+}
+
+/// Unit-level contract of the widen helper: widens to the full catalog only when
+/// the context result is empty AND the slot offers it; otherwise unchanged.
+#[test]
+fn full_catalog_safety_net_widens_only_when_context_is_empty() {
+    let db = Some(crate::db::DatabaseType::Oracle);
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["EMP".to_string(), "EMPLOYEE".to_string()];
+    data.rebuild_indices();
+
+    // Non-empty context result → trusted unchanged, no catalog appended.
+    let kept = SqlEditorWidget::widen_to_full_catalog_when_empty(
+        &mut data,
+        vec!["SCOPED_COL".to_string()],
+        "emp",
+        db,
+        true,
+    );
+    assert_eq!(kept, vec!["SCOPED_COL".to_string()]);
+
+    // Empty context at an offered position → widened to the full catalog.
+    let widened =
+        SqlEditorWidget::widen_to_full_catalog_when_empty(&mut data, Vec::new(), "emp", db, true);
+    assert!(
+        widened.iter().any(|s| s == "EMP") && widened.iter().any(|s| s == "EMPLOYEE"),
+        "empty context must widen to the catalog: {widened:?}"
+    );
+
+    // Empty context but suppressed slot (`offer == false`) → stays empty.
+    let suppressed =
+        SqlEditorWidget::widen_to_full_catalog_when_empty(&mut data, Vec::new(), "emp", db, false);
+    assert!(suppressed.is_empty());
+}
+
+/// Production-path coverage of the safety-net GATE: at the full production output
+/// (precision core + widen), the catalog must NOT leak into deliberately narrowed
+/// slots — the regression that the precision audit alone can no longer catch now
+/// that the widen is production-only. Uses `audit_final_suggestions_with_safety_net_for`,
+/// which applies the exact gate + widen production uses.
+#[test]
+fn full_catalog_safety_net_does_not_leak_into_narrowed_slots() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
+
+    // Deliberately narrowed positions: an empty/non-matching prefix here must
+    // stay silent (or keyword-only) rather than dumping the object/column catalog.
+    // A column (`EMPNO`) and a procedure (`RUN_JOB`) are never valid at any of
+    // these slots, so their presence is an unambiguous signal that the full
+    // catalog leaked through the widen.
+    for (sql, db) in [
+        ("UPDATE |", Oracle),                                  // DML target → tables only (kind slot)
+        ("SELECT EXTRACT(| FROM hiredate) FROM emp", Oracle),  // EXTRACT field → keyword-only
+        ("SELECT * FROM emp e WHERE ename LIKE 'a%' |", Oracle), // completed predicate → keyword-only
+        ("BEGIN SELECT empno INTO | FROM emp; END;", Oracle),  // INTO target → variable slot
+        ("DROP DATABASE IF EXISTS |", MySQL),                  // schema-name slot
+        ("CREATE PACKAGE pkg AS g NUMBER DEFAULT 1 |", Oracle), // completed default value
+    ] {
+        let (_kind, _keywords, final_suggestions) =
+            audit_final_suggestions_with_safety_net_for(sql, db);
+        assert!(
+            !has(&final_suggestions, "EMPNO") && !has(&final_suggestions, "RUN_JOB"),
+            "full catalog leaked into a narrowed slot at `{sql}`: {final_suggestions:?}"
+        );
+    }
+
+    // A free relation position whose context match is non-empty stays trusted
+    // (no extra columns/objects appended below the relations).
+    let (_k, _kw, from_slot) = audit_final_suggestions_with_safety_net_for(
+        "SELECT * FROM em| a JOIN dept b ON b.id = a.id",
+        Oracle,
+    );
+    assert!(
+        has(&from_slot, "EMP"),
+        "relation suggestion must survive at a FROM slot with trailing alias+join: {from_slot:?}"
+    );
 }
 
 #[test]

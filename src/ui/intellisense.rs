@@ -613,7 +613,7 @@ pub static MYSQL_FUNCTIONS_SET: once_cell::sync::Lazy<std::collections::HashSet<
 const FUNCTION_SUFFIX: &str = "()";
 const ORACLE_BUILTIN_PACKAGES: &[&str] = &["DBMS_OUTPUT"];
 
-const MAX_SUGGESTIONS: usize = 50;
+pub(crate) const MAX_SUGGESTIONS: usize = 50;
 type LanguageCatalog = (&'static [&'static str], &'static [&'static str]);
 const ORACLE_LANGUAGE_CATALOG: LanguageCatalog = (SQL_KEYWORDS, ORACLE_FUNCTIONS);
 const MYSQL_LANGUAGE_CATALOG: LanguageCatalog = (sql_text::MYSQL_SQL_KEYWORDS, MYSQL_FUNCTIONS);

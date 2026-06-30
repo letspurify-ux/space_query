@@ -3241,6 +3241,21 @@ impl SqlEditorWidget {
         } else {
             None
         };
+        let offer_full_catalog_tail = Self::cursor_offers_full_catalog_safety_net(
+            qualifier,
+            replace_table_context_with_expected_objects,
+            context,
+            effective_expr_keyword_ctx,
+            source_allowance.base_catalog_suggestions,
+            at_keyword_only_identifier_slot || at_keyword_only_slot,
+            at_value_only_no_expected_keyword_slot,
+            at_completed_oracle_sequence_pseudocolumn,
+            at_column_property_argument_slot,
+            at_dedicated_column_slot,
+            at_data_type_position,
+            at_package_declaration_default_value,
+            restrict_to_relation_columns,
+        );
         let suggestions = Self::merge_completion_sources(
             suggestions,
             expected_object_suggestions,
@@ -3273,6 +3288,21 @@ impl SqlEditorWidget {
                 )
             },
         );
+
+        let suggestions = if offer_full_catalog_tail && suggestions.is_empty() {
+            let mut data = intellisense_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Self::widen_to_full_catalog_when_empty(
+                &mut data,
+                suggestions,
+                &snapshot.prefix,
+                Some(snapshot.preferred_db_type),
+                offer_full_catalog_tail,
+            )
+        } else {
+            suggestions
+        };
 
         if suggestions.is_empty() {
             intellisense_popup
@@ -3467,6 +3497,74 @@ impl SqlEditorWidget {
         }
 
         suggestions
+    }
+
+    /// Full-catalog safety net for context mis-detection. When the context-driven
+    /// merge produced *nothing*, fall back to the entire prefix-matched catalog
+    /// (relations, objects, columns, keywords) so a wanted item is never hidden by
+    /// a wrong phase/kind/scope judgement. Only widens when the result is empty —
+    /// a non-empty context result is trusted as-is, preserving every deliberately
+    /// narrowed slot. `offer` gates out keyword/value-only, scoped-column,
+    /// data-type and qualified positions so a non-matching prefix there still
+    /// stays silent rather than dumping the catalog.
+    fn widen_to_full_catalog_when_empty(
+        data: &mut IntellisenseData,
+        merged: Vec<String>,
+        prefix: &str,
+        db_type: Option<crate::db::DatabaseType>,
+        offer: bool,
+    ) -> Vec<String> {
+        if !offer || !merged.is_empty() {
+            return merged;
+        }
+        let mut fallback =
+            Self::collect_all_completion_fallback_suggestions_for_db(data, prefix, db_type, Vec::new());
+        fallback.truncate(crate::ui::intellisense::MAX_SUGGESTIONS);
+        fallback
+    }
+
+    /// Gate for the full-catalog safety net: true only at a free
+    /// column/relation/expression position where the base catalog is genuinely
+    /// the answer. Object-kind slots (`replace_table_context_with_expected_objects`:
+    /// `FROM`, `INSERT INTO`, `CALL`, `GRANT`, …) defer to the existing kind-aware
+    /// empty fallback; variable/bind/object-name contexts, completed operands
+    /// (`x AT TIME ZONE tz |`, `DEFAULT 1 |`), and every keyword/value-only,
+    /// scoped-column, data-type and property slot are excluded so a non-matching
+    /// prefix there stays silent instead of dumping the catalog. Single source of
+    /// truth shared by `apply_intellisense_with_context` (production) and the
+    /// safety-net test harness so the two cannot drift.
+    #[allow(clippy::too_many_arguments)]
+    fn cursor_offers_full_catalog_safety_net(
+        qualifier: Option<&str>,
+        replace_table_context_with_expected_objects: bool,
+        context: SqlContext,
+        expr_keyword_ctx: ExpressionKeywordContext,
+        base_catalog_suggestions: bool,
+        at_keyword_only: bool,
+        at_value_only_no_expected_keyword_slot: bool,
+        at_completed_oracle_sequence_pseudocolumn: bool,
+        at_column_property_argument_slot: bool,
+        at_dedicated_column_slot: bool,
+        at_data_type: bool,
+        at_package_declaration_default_value: bool,
+        restrict_to_relation_columns: bool,
+    ) -> bool {
+        qualifier.is_none()
+            && !replace_table_context_with_expected_objects
+            && matches!(
+                context,
+                SqlContext::ColumnName | SqlContext::ColumnOrAll | SqlContext::TableName
+            )
+            && expr_keyword_ctx.follows_operand != Some(true)
+            && base_catalog_suggestions
+            && !at_keyword_only
+            && !at_value_only_no_expected_keyword_slot
+            && !at_completed_oracle_sequence_pseudocolumn
+            && !at_column_property_argument_slot
+            && !at_dedicated_column_slot
+            && !at_data_type
+            && !at_package_declaration_default_value
+            && !restrict_to_relation_columns
     }
 
     /// Column suggestions for a position that is restricted to a concrete
