@@ -338,15 +338,11 @@ impl ResultTabsWidget {
     }
 
     fn layout_active_tab_child(tabs: &mut Tabs) {
-        let (x, y, w, h) = Self::content_bounds(tabs);
-        if let Some(widget) = tabs.value() {
-            if let Some(mut group) = widget.as_group() {
-                group.resize(x, y, w, h);
-                tabs.set_label_size((constants::TAB_HEADER_HEIGHT - 8).max(8));
-                tabs.redraw();
-                return;
-            }
-        }
+        // Reposition *every* child to the same content bounds, not just the active
+        // one. FLTK's Fl_Tabs derives its header height from the minimum top-gap
+        // across all children (child.y() - tabs.y()); leaving inactive children at
+        // a stale y after the tabs widget moves during a splitter drag makes that
+        // minimum diverge from TAB_HEADER_HEIGHT, so the header shrinks or grows.
         Self::layout_children(tabs);
         tabs.set_label_size((constants::TAB_HEADER_HEIGHT - 8).max(8));
         tabs.redraw();
