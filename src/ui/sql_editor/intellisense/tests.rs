@@ -75875,3 +75875,1171 @@ fn plsql_extended_constructs_offer_suggestions() {
     }
     assert!(failures.is_empty(), "extended construct gaps:\n{}", failures.join("\n"));
 }
+
+#[test]
+fn plsql_cursor_and_bulk_statement_tails_offer_expected_keywords() {
+    use crate::db::DatabaseType::Oracle;
+
+    let has = |s: &[String], k: &str| s.iter().any(|x| x.eq_ignore_ascii_case(k));
+    let d = "DECLARE TYPE num_tab IS TABLE OF NUMBER; arr num_tab := num_tab(); \
+        CURSOR c_emp IS SELECT empno FROM emp;";
+    let mut failures = Vec::new();
+
+    let cases: &[(String, &[&str])] = &[
+        (
+            format!("{d} BEGIN OPEN c_emp __CODEX_CURSOR__ END;"),
+            &["FOR"],
+        ),
+        (
+            format!("{d} BEGIN OPEN c_emp FOR __CODEX_CURSOR__ END;"),
+            &["SELECT", "WITH"],
+        ),
+        (
+            format!("{d} BEGIN FETCH c_emp __CODEX_CURSOR__ END;"),
+            &["INTO", "BULK COLLECT"],
+        ),
+        (
+            format!("{d} BEGIN FETCH c_emp BULK __CODEX_CURSOR__ END;"),
+            &["COLLECT"],
+        ),
+        (
+            format!("{d} BEGIN FETCH c_emp BULK COLLECT __CODEX_CURSOR__ END;"),
+            &["INTO"],
+        ),
+        (
+            format!("{d} BEGIN FORALL i IN 1 .. arr.COUNT __CODEX_CURSOR__ ; END;"),
+            &[
+                "INSERT",
+                "UPDATE",
+                "DELETE",
+                "MERGE",
+                "EXECUTE IMMEDIATE",
+                "SAVE EXCEPTIONS",
+            ],
+        ),
+        (
+            format!("{d} BEGIN FORALL i IN INDICES OF arr __CODEX_CURSOR__ ; END;"),
+            &[
+                "INSERT",
+                "UPDATE",
+                "DELETE",
+                "MERGE",
+                "EXECUTE IMMEDIATE",
+                "SAVE EXCEPTIONS",
+            ],
+        ),
+        (
+            format!("{d} BEGIN FORALL i IN VALUES OF arr __CODEX_CURSOR__ ; END;"),
+            &[
+                "INSERT",
+                "UPDATE",
+                "DELETE",
+                "MERGE",
+                "EXECUTE IMMEDIATE",
+                "SAVE EXCEPTIONS",
+            ],
+        ),
+        (
+            format!(
+                "{d} BEGIN FORALL i IN 1 .. arr.COUNT SAVE EXCEPTIONS __CODEX_CURSOR__ ; END;"
+            ),
+            &["INSERT", "UPDATE", "DELETE", "MERGE", "EXECUTE IMMEDIATE"],
+        ),
+    ];
+
+    for (sql, expected) in cases {
+        let suggestions = query_completion_suggestions_with_locals(sql, Oracle);
+        if suggestions.is_empty() {
+            failures.push(format!("EMPTY at `{}`", sql.split("BEGIN").last().unwrap().trim()));
+            continue;
+        }
+        for keyword in *expected {
+            if !has(&suggestions, keyword) {
+                failures.push(format!(
+                    "`{keyword}` missing at `{}`: {suggestions:?}",
+                    sql.split("BEGIN").last().unwrap().trim()
+                ));
+            }
+        }
+        for leaked in ["EMP", "DEPT", "EMPNO", "ENAME", "SAL"] {
+            if has(&suggestions, leaked) {
+                failures.push(format!(
+                    "`{leaked}` leaked into keyword-only tail at `{}`: {suggestions:?}",
+                    sql.split("BEGIN").last().unwrap().trim()
+                ));
+            }
+        }
+    }
+
+    assert!(failures.is_empty(), "PL/SQL cursor/bulk keyword gaps:\n{}", failures.join("\n"));
+}
+
+#[test]
+fn plsql_embedded_sql_clauses_offer_scoped_catalog_suggestions() {
+    use crate::db::DatabaseType::Oracle;
+
+    let has = |s: &[String], k: &str| s.iter().any(|x| x.eq_ignore_ascii_case(k));
+    let mut failures = Vec::new();
+
+    let cases: &[(&str, &[&str], &[&str])] = &[
+        (
+            "BEGIN SELECT | INTO v FROM emp; END;",
+            &["EMPNO", "ENAME", "SAL"],
+            &["DNAME"],
+        ),
+        (
+            "BEGIN SELECT empno INTO v FROM |; END;",
+            &["EMP", "DEPT"],
+            &["EMPNO", "DNAME"],
+        ),
+        (
+            "BEGIN SELECT empno INTO v FROM emp WHERE |; END;",
+            &["EMPNO", "ENAME", "SAL"],
+            &["DNAME"],
+        ),
+        (
+            "BEGIN SELECT deptno, COUNT(*) INTO v1, v2 FROM emp GROUP BY |; END;",
+            &["EMPNO", "ENAME", "SAL"],
+            &["DNAME"],
+        ),
+        (
+            "BEGIN SELECT empno INTO v FROM emp ORDER BY |; END;",
+            &["EMPNO", "ENAME", "SAL"],
+            &["DNAME"],
+        ),
+        (
+            "DECLARE CURSOR c IS SELECT | FROM dept; BEGIN NULL; END;",
+            &["DEPTNO", "DNAME"],
+            &["EMPNO", "ENAME", "SAL"],
+        ),
+        (
+            "BEGIN OPEN c FOR SELECT | FROM dept; END;",
+            &["DEPTNO", "DNAME"],
+            &["EMPNO", "ENAME", "SAL"],
+        ),
+        (
+            "BEGIN FOR r IN (SELECT | FROM dept) LOOP NULL; END LOOP; END;",
+            &["DEPTNO", "DNAME"],
+            &["EMPNO", "ENAME", "SAL"],
+        ),
+        (
+            "BEGIN INSERT INTO emp SELECT | FROM dept; END;",
+            &["DEPTNO"],
+            &["EMPNO", "ENAME", "SAL", "DNAME"],
+        ),
+        (
+            "BEGIN UPDATE emp SET |; END;",
+            &["EMPNO", "ENAME", "SAL"],
+            &["DNAME"],
+        ),
+        (
+            "BEGIN UPDATE emp SET sal = sal + 1 WHERE |; END;",
+            &["EMPNO", "ENAME", "SAL"],
+            &["DNAME"],
+        ),
+        (
+            "BEGIN DELETE FROM emp WHERE |; END;",
+            &["EMPNO", "ENAME", "SAL"],
+            &["DNAME"],
+        ),
+        (
+            "BEGIN MERGE INTO emp e USING dept d ON (|) WHEN MATCHED THEN UPDATE SET sal = 1; END;",
+            &["EMPNO", "DEPTNO", "DNAME"],
+            &[],
+        ),
+        (
+            "BEGIN MERGE INTO emp e USING dept d ON (e.deptno = d.deptno) WHEN MATCHED THEN UPDATE SET |; END;",
+            &["EMPNO", "ENAME", "SAL"],
+            &["DNAME"],
+        ),
+    ];
+
+    for (sql, expected, forbidden) in cases {
+        let (_, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        if final_suggestions.is_empty() {
+            failures.push(format!("EMPTY final suggestions at `{sql}`; keywords={keywords:?}"));
+            continue;
+        }
+        for column_or_table in *expected {
+            if !has(&final_suggestions, column_or_table) {
+                failures.push(format!(
+                    "`{column_or_table}` missing at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+                ));
+            }
+        }
+        for leaked in *forbidden {
+            if has(&final_suggestions, leaked) {
+                failures.push(format!(
+                    "`{leaked}` leaked at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+                ));
+            }
+        }
+    }
+
+    assert!(failures.is_empty(), "PL/SQL embedded SQL suggestion gaps:\n{}", failures.join("\n"));
+}
+
+#[test]
+fn plsql_local_symbols_surface_in_additional_expression_positions() {
+    use crate::db::DatabaseType::Oracle;
+
+    let has = |s: &[String], k: &str| s.iter().any(|x| x.eq_ignore_ascii_case(k));
+    let d = "DECLARE v_num NUMBER; c_limit CONSTANT NUMBER := 10; b_flag BOOLEAN; \
+        TYPE num_tab IS TABLE OF NUMBER; arr num_tab := num_tab(); \
+        CURSOR c_emp IS SELECT empno FROM emp;";
+    let mut failures = Vec::new();
+
+    let cases: &[(String, &[&str])] = &[
+        (
+            format!("{d} BEGIN IF NOT __CODEX_CURSOR__ THEN NULL; END IF; END;"),
+            &["v_num", "c_limit", "b_flag"],
+        ),
+        (
+            format!("{d} BEGIN CASE v_num WHEN __CODEX_CURSOR__ THEN NULL; END CASE; END;"),
+            &["v_num", "c_limit"],
+        ),
+        (
+            format!("{d} BEGIN LOOP EXIT WHEN __CODEX_CURSOR__; END LOOP; END;"),
+            &["v_num", "c_limit", "b_flag"],
+        ),
+        (
+            format!(
+                "{d} BEGIN WHILE NVL(v_num, __CODEX_CURSOR__) > 0 LOOP NULL; END LOOP; END;"
+            ),
+            &["v_num", "c_limit"],
+        ),
+        (
+            format!("{d} BEGIN FOR i IN REVERSE 1 .. __CODEX_CURSOR__ LOOP NULL; END LOOP; END;"),
+            &["v_num", "c_limit"],
+        ),
+        (
+            format!("{d} BEGIN some_proc(a => v_num, b => __CODEX_CURSOR__); END;"),
+            &["v_num", "c_limit", "b_flag"],
+        ),
+        (
+            format!(
+                "{d} BEGIN EXECUTE IMMEDIATE 'begin p(:x); end;' USING IN __CODEX_CURSOR__; END;"
+            ),
+            &["v_num", "c_limit", "b_flag"],
+        ),
+        (
+            format!(
+                "{d} BEGIN EXECUTE IMMEDIATE 'begin p(:x); end;' USING OUT __CODEX_CURSOR__; END;"
+            ),
+            &["v_num", "c_limit", "b_flag"],
+        ),
+        (
+            format!(
+                "{d} BEGIN OPEN c_emp FOR SELECT empno FROM emp WHERE deptno = :x USING __CODEX_CURSOR__; END;"
+            ),
+            &["v_num", "c_limit", "b_flag"],
+        ),
+        (
+            format!("{d} BEGIN SELECT NVL(sal, __CODEX_CURSOR__) INTO v_num FROM emp; END;"),
+            &["v_num", "c_limit"],
+        ),
+        (
+            format!("{d} BEGIN INSERT INTO emp(empno, sal) SELECT __CODEX_CURSOR__, sal FROM emp; END;"),
+            &["v_num", "c_limit"],
+        ),
+    ];
+
+    for (sql, expected) in cases {
+        let suggestions = query_completion_suggestions_with_locals(sql, Oracle);
+        if suggestions.is_empty() {
+            failures.push(format!("EMPTY at `{}`", sql.split("BEGIN").last().unwrap().trim()));
+            continue;
+        }
+        for symbol in *expected {
+            if !has(&suggestions, symbol) {
+                failures.push(format!(
+                    "`{symbol}` missing at `{}`: {suggestions:?}",
+                    sql.split("BEGIN").last().unwrap().trim()
+                ));
+            }
+        }
+    }
+
+    assert!(failures.is_empty(), "PL/SQL local-symbol expression gaps:\n{}", failures.join("\n"));
+}
+
+#[test]
+fn plsql_record_and_rowtype_member_completion_covers_nested_shapes() {
+    let mut failures = Vec::new();
+    let has = |s: &[String], k: &str| s.iter().any(|x| x.eq_ignore_ascii_case(k));
+
+    let nested_record = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        "DECLARE TYPE child_rec IS RECORD (leaf_id NUMBER, leaf_name VARCHAR2(20)); \
+         TYPE parent_rec IS RECORD (child child_rec, status VARCHAR2(1)); \
+         v_parent parent_rec; \
+         BEGIN v_parent.child.__CODEX_CURSOR__ END;",
+        "v_parent.child",
+        "",
+    );
+    match nested_record {
+        Some(s) if has(&s, "leaf_id") && has(&s, "leaf_name") => {}
+        other => failures.push(format!("nested record members missing: {other:?}")),
+    }
+
+    let indexed_record = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        "DECLARE TYPE item_rec IS RECORD (item_id NUMBER, item_name VARCHAR2(20)); \
+         TYPE item_tab IS TABLE OF item_rec INDEX BY PLS_INTEGER; \
+         l_items item_tab; \
+         BEGIN l_items(1).__CODEX_CURSOR__ END;",
+        "l_items",
+        "",
+    );
+    match indexed_record {
+        Some(s) if has(&s, "item_id") && has(&s, "item_name") => {}
+        other => failures.push(format!("indexed collection record members missing: {other:?}")),
+    }
+
+    let rowtype = SqlEditorWidget::collect_local_rowtype_member_suggestions_for_test(
+        "DECLARE r_emp emp%ROWTYPE; BEGIN r_emp.__CODEX_CURSOR__ END;",
+        "r_emp",
+        "",
+        "EMP",
+        &["EMPNO", "ENAME", "SAL"],
+    );
+    match rowtype {
+        Some(s) if has(&s, "EMPNO") && has(&s, "ENAME") && has(&s, "SAL") => {}
+        other => failures.push(format!("table rowtype members missing: {other:?}")),
+    }
+
+    let cursor_rowtype = SqlEditorWidget::collect_local_member_suggestions_for_test(
+        "DECLARE CURSOR c_emp IS SELECT empno, ename AS employee_name FROM emp; \
+         r_emp c_emp%ROWTYPE; \
+         BEGIN r_emp.__CODEX_CURSOR__ END;",
+        "r_emp",
+        "",
+        "EMP",
+        &["EMPNO", "ENAME", "SAL"],
+    );
+    match cursor_rowtype {
+        Some(s) if has(&s, "empno") && has(&s, "employee_name") => {}
+        other => failures.push(format!("cursor rowtype members missing: {other:?}")),
+    }
+
+    assert!(failures.is_empty(), "PL/SQL member completion gaps:\n{}", failures.join("\n"));
+}
+
+#[test]
+fn plsql_nested_sql_clause_variants_offer_scoped_suggestions() {
+    use crate::db::DatabaseType::Oracle;
+
+    let has = |s: &[String], k: &str| s.iter().any(|x| x.eq_ignore_ascii_case(k));
+    let mut failures = Vec::new();
+
+    let cases: &[(&str, &[&str], &[&str])] = &[
+        (
+            "BEGIN SELECT deptno, COUNT(*) INTO v1, v2 FROM emp GROUP BY deptno HAVING |; END;",
+            &["EMPNO", "ENAME", "SAL"],
+            &["DNAME"],
+        ),
+        (
+            "BEGIN SELECT empno INTO v FROM emp START WITH | CONNECT BY PRIOR empno = empno; END;",
+            &["EMPNO", "ENAME", "SAL"],
+            &["DNAME"],
+        ),
+        (
+            "BEGIN SELECT empno INTO v FROM emp CONNECT BY PRIOR empno = |; END;",
+            &["EMPNO", "SAL"],
+            &["DNAME"],
+        ),
+        (
+            "BEGIN SELECT empno INTO v FROM emp CONNECT BY PRIOR | = empno; END;",
+            &["EMPNO", "SAL"],
+            &["DNAME"],
+        ),
+        (
+            "BEGIN SELECT empno INTO v FROM emp CONNECT BY PRIOR empno = empno ORDER SIBLINGS BY |; END;",
+            &["EMPNO", "ENAME", "SAL"],
+            &["DNAME"],
+        ),
+        (
+            "BEGIN SELECT empno INTO v FROM emp WHERE EXISTS (SELECT | FROM dept); END;",
+            &["DEPTNO", "DNAME"],
+            &[],
+        ),
+        (
+            "BEGIN SELECT empno INTO v FROM emp WHERE empno IN (SELECT | FROM dept); END;",
+            &["DEPTNO", "DNAME"],
+            &[],
+        ),
+        (
+            "BEGIN SELECT empno INTO v FROM emp WHERE EXISTS (SELECT 1 FROM dept WHERE |); END;",
+            &["DEPTNO", "DNAME"],
+            &[],
+        ),
+        (
+            "BEGIN SELECT | INTO v FROM (SELECT deptno, dname FROM dept) d; END;",
+            &["DEPTNO", "DNAME"],
+            &["EMPNO", "ENAME", "SAL"],
+        ),
+        (
+            "BEGIN OPEN c FOR WITH d AS (SELECT deptno, dname FROM dept) SELECT | FROM d; END;",
+            &["DEPTNO", "DNAME"],
+            &["EMPNO", "ENAME", "SAL"],
+        ),
+        (
+            "BEGIN FOR r IN (WITH d AS (SELECT deptno FROM dept) SELECT | FROM d) LOOP NULL; END LOOP; END;",
+            &["DEPTNO"],
+            &["EMPNO", "ENAME", "SAL"],
+        ),
+        (
+            "BEGIN SELECT e.| INTO v FROM emp e JOIN dept d ON e.empno = d.deptno; END;",
+            &["EMPNO", "ENAME", "SAL"],
+            &["DNAME"],
+        ),
+        (
+            "BEGIN INSERT INTO emp SELECT deptno FROM dept WHERE |; END;",
+            &["DEPTNO", "DNAME"],
+            &["EMPNO", "ENAME", "SAL"],
+        ),
+        (
+            "BEGIN INSERT INTO emp SELECT deptno FROM dept GROUP BY |; END;",
+            &["DEPTNO", "DNAME"],
+            &["EMPNO", "ENAME", "SAL"],
+        ),
+        (
+            "BEGIN INSERT INTO emp SELECT deptno FROM dept ORDER BY |; END;",
+            &["DEPTNO", "DNAME"],
+            &["EMPNO", "ENAME", "SAL"],
+        ),
+        (
+            "DECLARE CURSOR c IS WITH d AS (SELECT deptno, dname FROM dept) SELECT | FROM d; BEGIN NULL; END;",
+            &["DEPTNO", "DNAME"],
+            &["EMPNO", "ENAME", "SAL"],
+        ),
+    ];
+
+    for (sql, expected, forbidden) in cases {
+        let (_, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        if final_suggestions.is_empty() {
+            failures.push(format!("EMPTY final suggestions at `{sql}`; keywords={keywords:?}"));
+            continue;
+        }
+        for column in *expected {
+            if !has(&final_suggestions, column) {
+                failures.push(format!(
+                    "`{column}` missing at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+                ));
+            }
+        }
+        for leaked in *forbidden {
+            if has(&final_suggestions, leaked) {
+                failures.push(format!(
+                    "`{leaked}` leaked at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "PL/SQL nested SQL clause suggestion gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn plsql_routine_trigger_and_complex_value_positions_offer_suggestions() {
+    use crate::db::DatabaseType::Oracle;
+
+    let has = |s: &[String], k: &str| s.iter().any(|x| x.eq_ignore_ascii_case(k));
+    let d = "DECLARE v_num NUMBER; c_limit CONSTANT NUMBER := 10; b_flag BOOLEAN; \
+        TYPE num_tab IS TABLE OF NUMBER; arr num_tab := num_tab();";
+    let mut failures = Vec::new();
+
+    let local_cases: &[(String, &[&str])] = &[
+        (
+            format!("{d} BEGIN IF v_num BETWEEN __CODEX_CURSOR__ AND c_limit THEN NULL; END IF; END;"),
+            &["v_num", "c_limit"],
+        ),
+        (
+            format!("{d} BEGIN IF v_num IN (__CODEX_CURSOR__) THEN NULL; END IF; END;"),
+            &["v_num", "c_limit"],
+        ),
+        (
+            format!("{d} BEGIN IF v_num NOT IN (__CODEX_CURSOR__) THEN NULL; END IF; END;"),
+            &["v_num", "c_limit"],
+        ),
+        (
+            format!("{d} BEGIN v_num := GREATEST(__CODEX_CURSOR__, c_limit); END;"),
+            &["v_num", "c_limit", "b_flag"],
+        ),
+        (
+            format!("{d} BEGIN v_num := ABS(__CODEX_CURSOR__); END;"),
+            &["v_num", "c_limit"],
+        ),
+        (
+            format!("{d} BEGIN CASE WHEN __CODEX_CURSOR__ THEN NULL; END CASE; END;"),
+            &["v_num", "c_limit", "b_flag"],
+        ),
+        (
+            format!("{d} BEGIN arr.EXTEND(__CODEX_CURSOR__); END;"),
+            &["v_num", "c_limit"],
+        ),
+        (
+            format!("{d} BEGIN v_num := arr(__CODEX_CURSOR__); END;"),
+            &["v_num", "c_limit"],
+        ),
+        (
+            format!("{d} BEGIN arr(__CODEX_CURSOR__) := v_num; END;"),
+            &["v_num", "c_limit"],
+        ),
+        (
+            format!(
+                "{d} BEGIN SELECT empno INTO v_num FROM emp WHERE sal BETWEEN __CODEX_CURSOR__ AND c_limit; END;"
+            ),
+            &["v_num", "c_limit"],
+        ),
+        (
+            format!("{d} BEGIN SELECT empno INTO v_num FROM emp WHERE sal IN (__CODEX_CURSOR__); END;"),
+            &["v_num", "c_limit"],
+        ),
+        (
+            format!(
+                "{d} BEGIN UPDATE emp SET sal = NVL(__CODEX_CURSOR__, sal) WHERE b_flag OR sal > 0; END;"
+            ),
+            &["v_num", "c_limit", "b_flag"],
+        ),
+        (
+            format!("{d} BEGIN DELETE FROM emp WHERE sal BETWEEN __CODEX_CURSOR__ AND c_limit; END;"),
+            &["v_num", "c_limit"],
+        ),
+        (
+            "CREATE OR REPLACE PROCEDURE p(p_id IN NUMBER) IS v_local NUMBER; BEGIN some_proc(__CODEX_CURSOR__); END;".to_string(),
+            &["p_id", "v_local"],
+        ),
+        (
+            "CREATE OR REPLACE FUNCTION f(p_id IN NUMBER) RETURN NUMBER IS v_local NUMBER; BEGIN RETURN p_id + __CODEX_CURSOR__; END;".to_string(),
+            &["p_id", "v_local"],
+        ),
+        (
+            "CREATE PACKAGE BODY pkg AS g_pkg NUMBER; PROCEDURE p IS v_local NUMBER; BEGIN v_local := __CODEX_CURSOR__; END; END;".to_string(),
+            &["g_pkg", "v_local"],
+        ),
+        (
+            "CREATE PACKAGE BODY pkg AS g_pkg NUMBER; FUNCTION f RETURN NUMBER IS BEGIN RETURN __CODEX_CURSOR__; END; END;".to_string(),
+            &["g_pkg", "NULL", "CASE"],
+        ),
+        (
+            "CREATE PROCEDURE outer_p IS v_outer NUMBER; PROCEDURE inner_p IS v_inner NUMBER; BEGIN v_inner := __CODEX_CURSOR__; END; BEGIN NULL; END;".to_string(),
+            &["v_outer", "v_inner"],
+        ),
+        (
+            "CREATE TRIGGER trg BEFORE INSERT ON emp FOR EACH ROW DECLARE v_local NUMBER; BEGIN IF v_local = __CODEX_CURSOR__ THEN NULL; END IF; END;".to_string(),
+            &["v_local", "NULL", "CASE"],
+        ),
+        (
+            "CREATE TRIGGER trg BEFORE UPDATE ON emp FOR EACH ROW DECLARE b_flag BOOLEAN; BEGIN IF b_flag AND __CODEX_CURSOR__ THEN NULL; END IF; END;".to_string(),
+            &["b_flag", "NULL", "CASE"],
+        ),
+        (
+            "BEGIN RAISE_APPLICATION_ERROR(-20000, __CODEX_CURSOR__); END;".to_string(),
+            &["NULL", "CASE"],
+        ),
+        (
+            "BEGIN NULL; EXCEPTION WHEN NO_DATA_FOUND OR __CODEX_CURSOR__ THEN NULL; END;".to_string(),
+            &["TOO_MANY_ROWS", "ZERO_DIVIDE", "OTHERS"],
+        ),
+    ];
+
+    for (sql, expected) in local_cases {
+        let suggestions = query_completion_suggestions_with_locals(sql, Oracle);
+        if suggestions.is_empty() {
+            failures.push(format!("EMPTY at `{}`", sql.replace('\n', " ")));
+            continue;
+        }
+        for item in *expected {
+            if !has(&suggestions, item) {
+                failures.push(format!("`{item}` missing at `{sql}`: {suggestions:?}"));
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "PL/SQL routine/trigger/value-position suggestion gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn plsql_qualified_embedded_sql_alias_positions_offer_scoped_columns() {
+    use crate::db::DatabaseType::Oracle;
+
+    let has = |s: &[String], k: &str| s.iter().any(|x| x.eq_ignore_ascii_case(k));
+    let mut failures = Vec::new();
+
+    let cases: &[(&str, &[&str], &[&str])] = &[
+        (
+            "BEGIN SELECT e.| INTO v FROM emp e; END;",
+            &["EMPNO", "ENAME", "SAL"],
+            &["DEPTNO", "DNAME"],
+        ),
+        (
+            "BEGIN SELECT d.| INTO v FROM dept d; END;",
+            &["DEPTNO", "DNAME"],
+            &["EMPNO", "ENAME", "SAL"],
+        ),
+        (
+            "BEGIN SELECT COUNT(*) INTO v FROM emp e JOIN dept d ON e.| = d.deptno; END;",
+            &["EMPNO", "ENAME", "SAL"],
+            &["DEPTNO", "DNAME"],
+        ),
+        (
+            "BEGIN SELECT COUNT(*) INTO v FROM emp e JOIN dept d ON d.| = e.empno; END;",
+            &["DEPTNO", "DNAME"],
+            &["EMPNO", "ENAME", "SAL"],
+        ),
+        (
+            "BEGIN SELECT empno INTO v FROM emp e WHERE e.| = 1; END;",
+            &["EMPNO", "SAL"],
+            &["DEPTNO", "DNAME"],
+        ),
+        (
+            "BEGIN SELECT empno INTO v FROM emp e WHERE EXISTS (SELECT 1 FROM dept d WHERE d.| = e.empno); END;",
+            &["DEPTNO", "DNAME"],
+            &[],
+        ),
+        (
+            "BEGIN SELECT empno INTO v FROM emp e WHERE EXISTS (SELECT 1 FROM dept d WHERE d.deptno = e.|); END;",
+            &["EMPNO", "ENAME", "SAL"],
+            &["DNAME"],
+        ),
+        (
+            "BEGIN OPEN c FOR SELECT e.| FROM emp e WHERE e.empno = :x; END;",
+            &["EMPNO", "ENAME", "SAL"],
+            &["DEPTNO", "DNAME"],
+        ),
+        (
+            "DECLARE CURSOR c IS SELECT d.| FROM dept d; BEGIN NULL; END;",
+            &["DEPTNO", "DNAME"],
+            &["EMPNO", "ENAME", "SAL"],
+        ),
+        (
+            "BEGIN FOR r IN (SELECT d.| FROM dept d) LOOP NULL; END LOOP; END;",
+            &["DEPTNO", "DNAME"],
+            &["EMPNO", "ENAME", "SAL"],
+        ),
+        (
+            "BEGIN MERGE INTO emp e USING dept d ON (d.| = e.empno) WHEN MATCHED THEN UPDATE SET sal = 1; END;",
+            &["DEPTNO", "DNAME"],
+            &["ENAME", "SAL"],
+        ),
+        (
+            "BEGIN MERGE INTO emp e USING dept d ON (d.deptno = e.|) WHEN MATCHED THEN UPDATE SET sal = 1; END;",
+            &["EMPNO", "ENAME", "SAL"],
+            &["DNAME"],
+        ),
+        (
+            "BEGIN INSERT INTO emp SELECT d.| FROM dept d; END;",
+            &["DEPTNO"],
+            &["EMPNO", "ENAME", "SAL", "DNAME"],
+        ),
+        (
+            "BEGIN INSERT INTO emp SELECT deptno FROM dept d WHERE d.| = 1; END;",
+            &["DEPTNO"],
+            &["EMPNO", "ENAME", "SAL", "DNAME"],
+        ),
+    ];
+
+    for (sql, expected, forbidden) in cases {
+        let (_, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        if final_suggestions.is_empty() {
+            failures.push(format!("EMPTY final suggestions at `{sql}`; keywords={keywords:?}"));
+            continue;
+        }
+        for column in *expected {
+            if !has(&final_suggestions, column) {
+                failures.push(format!(
+                    "`{column}` missing at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+                ));
+            }
+        }
+        for leaked in *forbidden {
+            if has(&final_suggestions, leaked) {
+                failures.push(format!(
+                    "`{leaked}` leaked at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "PL/SQL qualified embedded SQL alias suggestion gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn plsql_deeper_local_scope_and_clause_value_positions_offer_symbols() {
+    use crate::db::DatabaseType::Oracle;
+
+    let has = |s: &[String], k: &str| s.iter().any(|x| x.eq_ignore_ascii_case(k));
+    let mut failures = Vec::new();
+
+    let cases: &[(String, &[&str], &[&str])] = &[
+        (
+            "CREATE PACKAGE BODY pkg AS g_pkg NUMBER; BEGIN g_pkg := __CODEX_CURSOR__; END;"
+                .to_string(),
+            &["g_pkg", "NULL", "CASE"],
+            &[],
+        ),
+        (
+            "CREATE PACKAGE pkg AS g_spec NUMBER; END; / CREATE PACKAGE BODY pkg AS BEGIN g_spec := __CODEX_CURSOR__; END; /"
+                .to_string(),
+            &["g_spec", "NULL", "CASE"],
+            &[],
+        ),
+        (
+            "CREATE PACKAGE BODY pkg AS g_pkg NUMBER; BEGIN DECLARE v_inner NUMBER; BEGIN v_inner := __CODEX_CURSOR__; END; END;"
+                .to_string(),
+            &["g_pkg", "v_inner"],
+            &[],
+        ),
+        (
+            "CREATE OR REPLACE PROCEDURE p(p_id IN NUMBER, p_flag IN BOOLEAN) IS v_local NUMBER; BEGIN IF p_flag AND __CODEX_CURSOR__ THEN NULL; END IF; END;"
+                .to_string(),
+            &["p_id", "p_flag", "v_local"],
+            &[],
+        ),
+        (
+            "CREATE OR REPLACE PROCEDURE p(p_id IN NUMBER) IS v_local NUMBER; BEGIN DECLARE v_inner NUMBER; BEGIN v_inner := __CODEX_CURSOR__; END; END;"
+                .to_string(),
+            &["p_id", "v_local", "v_inner"],
+            &[],
+        ),
+        (
+            "CREATE OR REPLACE PROCEDURE p IS v_outer NUMBER; BEGIN DECLARE v_inner NUMBER; BEGIN NULL; END; v_outer := __CODEX_CURSOR__; END;"
+                .to_string(),
+            &["v_outer"],
+            &["v_inner"],
+        ),
+        (
+            "DECLARE CURSOR c_emp IS SELECT empno FROM emp; v_num NUMBER; BEGIN OPEN c_emp; FETCH c_emp INTO __CODEX_CURSOR__; END;"
+                .to_string(),
+            &["v_num"],
+            &[],
+        ),
+        (
+            "DECLARE v_num NUMBER; BEGIN FOR rec IN (SELECT empno FROM emp) LOOP v_num := __CODEX_CURSOR__; END LOOP; END;"
+                .to_string(),
+            &["v_num", "rec"],
+            &[],
+        ),
+        (
+            "DECLARE v_num NUMBER; CURSOR c_emp IS SELECT empno FROM emp; BEGIN FOR rec IN c_emp LOOP v_num := __CODEX_CURSOR__; END LOOP; END;"
+                .to_string(),
+            &["v_num", "rec"],
+            &[],
+        ),
+        (
+            "DECLARE v_num NUMBER; BEGIN <<outer_loop>> LOOP EXIT outer_loop WHEN v_num > __CODEX_CURSOR__; END LOOP; END;"
+                .to_string(),
+            &["v_num"],
+            &[],
+        ),
+        (
+            "DECLARE v_num NUMBER; BEGIN WHILE v_num < __CODEX_CURSOR__ LOOP NULL; END LOOP; END;"
+                .to_string(),
+            &["v_num"],
+            &[],
+        ),
+        (
+            "DECLARE v_msg VARCHAR2(100); BEGIN NULL; EXCEPTION WHEN OTHERS THEN v_msg := __CODEX_CURSOR__; END;"
+                .to_string(),
+            &["v_msg", "NULL", "CASE"],
+            &[],
+        ),
+        (
+            "DECLARE v_num NUMBER; BEGIN SELECT empno INTO v_num FROM emp WHERE ROWNUM <= __CODEX_CURSOR__; END;"
+                .to_string(),
+            &["v_num", "NULL", "CASE"],
+            &[],
+        ),
+        (
+            "DECLARE v_num NUMBER; BEGIN SELECT empno INTO v_num FROM emp ORDER BY NVL(__CODEX_CURSOR__, empno); END;"
+                .to_string(),
+            &["v_num", "NULL", "CASE"],
+            &[],
+        ),
+        (
+            "DECLARE v_num NUMBER; BEGIN EXECUTE IMMEDIATE 'select 1 from dual' INTO __CODEX_CURSOR__; END;"
+                .to_string(),
+            &["v_num"],
+            &[],
+        ),
+        (
+            "DECLARE e_custom EXCEPTION; BEGIN IF TRUE THEN RAISE __CODEX_CURSOR__; END IF; END;"
+                .to_string(),
+            &["e_custom"],
+            &[],
+        ),
+    ];
+
+    for (sql, expected, forbidden) in cases {
+        let suggestions = query_completion_suggestions_with_locals(sql, Oracle);
+        if suggestions.is_empty() {
+            failures.push(format!("EMPTY at `{}`", sql.replace('\n', " ")));
+            continue;
+        }
+        for item in *expected {
+            if !has(&suggestions, item) {
+                failures.push(format!("`{item}` missing at `{sql}`: {suggestions:?}"));
+            }
+        }
+        for leaked in *forbidden {
+            if has(&suggestions, leaked) {
+                failures.push(format!("`{leaked}` leaked at `{sql}`: {suggestions:?}"));
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "PL/SQL deep local-scope/value-position suggestion gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn plsql_embedded_sql_tail_and_analytic_slots_offer_contextual_suggestions() {
+    use crate::db::DatabaseType::Oracle;
+
+    let has = |s: &[String], k: &str| s.iter().any(|x| x.eq_ignore_ascii_case(k));
+    let mut failures = Vec::new();
+
+    let cases: &[(&str, &[&str], &[&str])] = &[
+        (
+            "BEGIN SELECT empno INTO v FROM emp ORDER BY empno OFFSET 10 |; END;",
+            &["ROW", "ROWS"],
+            &["WHERE", "GROUP BY"],
+        ),
+        (
+            "BEGIN SELECT empno INTO v FROM emp ORDER BY empno OFFSET 10 ROWS |; END;",
+            &["FETCH"],
+            &["WHERE", "GROUP BY"],
+        ),
+        (
+            "BEGIN SELECT empno INTO v FROM emp ORDER BY empno FETCH FIRST 10 ROWS |; END;",
+            &["ONLY", "WITH"],
+            &["WHERE", "GROUP BY"],
+        ),
+        (
+            "BEGIN SELECT SUM(sal) OVER (|) INTO v FROM emp; END;",
+            &["PARTITION BY", "ORDER BY", "ROWS"],
+            &["WHERE", "GROUP BY"],
+        ),
+        (
+            "BEGIN SELECT SUM(sal) OVER (PARTITION |) INTO v FROM emp; END;",
+            &["BY"],
+            &["WHERE", "GROUP BY"],
+        ),
+        (
+            "BEGIN SELECT SUM(sal) OVER (ORDER |) INTO v FROM emp; END;",
+            &["BY"],
+            &["WHERE", "GROUP BY"],
+        ),
+        (
+            "BEGIN SELECT SUM(sal) OVER (PARTITION BY |) INTO v FROM emp; END;",
+            &["EMPNO", "ENAME", "SAL"],
+            &["DNAME"],
+        ),
+        (
+            "BEGIN SELECT SUM(sal) OVER (ORDER BY |) INTO v FROM emp; END;",
+            &["EMPNO", "ENAME", "SAL"],
+            &["DNAME"],
+        ),
+        (
+            "BEGIN SELECT SUM(sal) OVER (ORDER BY sal ROWS |) INTO v FROM emp; END;",
+            &["BETWEEN", "CURRENT", "UNBOUNDED"],
+            &["WHERE", "GROUP BY"],
+        ),
+        (
+            "BEGIN SELECT empno INTO v FROM emp WHERE ename IS |; END;",
+            &["NULL", "NOT"],
+            &["WHERE", "GROUP BY"],
+        ),
+        (
+            "BEGIN SELECT empno INTO v FROM emp WHERE ename IS NOT |; END;",
+            &["NULL"],
+            &["WHERE", "GROUP BY"],
+        ),
+    ];
+
+    for (sql, expected, forbidden) in cases {
+        let (_, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        if final_suggestions.is_empty() {
+            failures.push(format!("EMPTY final suggestions at `{sql}`; keywords={keywords:?}"));
+            continue;
+        }
+        for item in *expected {
+            if !has(&final_suggestions, item) {
+                failures.push(format!(
+                    "`{item}` missing at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+                ));
+            }
+        }
+        for leaked in *forbidden {
+            if has(&final_suggestions, leaked) {
+                failures.push(format!(
+                    "`{leaked}` leaked at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "PL/SQL embedded SQL tail/analytic suggestion gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn plsql_returning_predicate_and_window_value_positions_offer_locals() {
+    use crate::db::DatabaseType::Oracle;
+
+    let has = |s: &[String], k: &str| s.iter().any(|x| x.eq_ignore_ascii_case(k));
+    let d = "DECLARE v_num NUMBER; v_str VARCHAR2(100); b_flag BOOLEAN; \
+        TYPE num_tab IS TABLE OF NUMBER; arr num_tab := num_tab();";
+    let mut failures = Vec::new();
+
+    let cases: &[(String, &[&str])] = &[
+        (
+            format!("{d} BEGIN UPDATE emp SET sal = __CODEX_CURSOR__ RETURNING sal INTO v_num; END;"),
+            &["v_num", "NULL", "CASE"],
+        ),
+        (
+            format!("{d} BEGIN UPDATE emp SET sal = 1 RETURNING sal INTO v_num, __CODEX_CURSOR__; END;"),
+            &["v_num", "arr"],
+        ),
+        (
+            format!("{d} BEGIN DELETE FROM emp WHERE empno = __CODEX_CURSOR__ RETURNING empno INTO v_num; END;"),
+            &["v_num", "NULL", "CASE"],
+        ),
+        (
+            format!("{d} BEGIN INSERT INTO emp (empno, sal) VALUES (v_num, __CODEX_CURSOR__) RETURNING empno INTO v_num; END;"),
+            &["v_num", "NULL", "CASE"],
+        ),
+        (
+            format!("{d} BEGIN MERGE INTO emp e USING dept d ON (e.deptno = d.deptno) WHEN MATCHED THEN UPDATE SET sal = __CODEX_CURSOR__; END;"),
+            &["v_num", "NULL", "CASE"],
+        ),
+        (
+            format!("{d} BEGIN MERGE INTO emp e USING dept d ON (e.deptno = d.deptno) WHEN NOT MATCHED THEN INSERT (empno, sal) VALUES (__CODEX_CURSOR__, v_num); END;"),
+            &["v_num", "NULL", "CASE"],
+        ),
+        (
+            format!("{d} BEGIN SELECT empno INTO v_num FROM emp WHERE ename LIKE __CODEX_CURSOR__; END;"),
+            &["v_str", "NULL", "CASE"],
+        ),
+        (
+            format!("{d} BEGIN SELECT empno INTO v_num FROM emp WHERE b_flag OR ename LIKE __CODEX_CURSOR__; END;"),
+            &["v_str", "NULL", "CASE"],
+        ),
+        (
+            format!("{d} BEGIN SELECT SUM(sal) OVER (PARTITION BY NVL(__CODEX_CURSOR__, deptno)) INTO v_num FROM emp; END;"),
+            &["v_num", "NULL", "CASE"],
+        ),
+        (
+            format!("{d} BEGIN SELECT SUM(sal) OVER (ORDER BY NVL(__CODEX_CURSOR__, sal)) INTO v_num FROM emp; END;"),
+            &["v_num", "NULL", "CASE"],
+        ),
+        (
+            format!("{d} BEGIN SELECT empno INTO v_num FROM emp WHERE EXISTS (SELECT 1 FROM dept WHERE dname LIKE __CODEX_CURSOR__); END;"),
+            &["v_str"],
+        ),
+        (
+            format!("{d} BEGIN FORALL i IN 1 .. arr.COUNT UPDATE emp SET sal = __CODEX_CURSOR__ WHERE empno = arr(i); END;"),
+            &["v_num", "NULL", "CASE"],
+        ),
+    ];
+
+    for (sql, expected) in cases {
+        let suggestions = query_completion_suggestions_with_locals(sql, Oracle);
+        if suggestions.is_empty() {
+            failures.push(format!("EMPTY at `{}`", sql.replace('\n', " ")));
+            continue;
+        }
+        for item in *expected {
+            if !has(&suggestions, item) {
+                failures.push(format!("`{item}` missing at `{sql}`: {suggestions:?}"));
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "PL/SQL RETURNING/predicate/window value-position gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn create_statement_keyword_matrix_offers_expected_keywords_across_dialects() {
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
+
+    let has = |s: &[String], k: &str| s.iter().any(|x| x.eq_ignore_ascii_case(k));
+    let mut failures = Vec::new();
+
+    let cases: &[(crate::db::DatabaseType, &str, &[&str], &[&str])] = &[
+        (
+            Oracle,
+            "CREATE |",
+            &[
+                "TABLE",
+                "VIEW",
+                "INDEX",
+                "SEQUENCE",
+                "TRIGGER",
+                "PROCEDURE",
+                "FUNCTION",
+                "PACKAGE",
+                "TYPE",
+                "SYNONYM",
+            ],
+            &[],
+        ),
+        (Oracle, "CREATE OR |", &["REPLACE"], &["TABLE", "INDEX"]),
+        (
+            Oracle,
+            "CREATE OR REPLACE |",
+            &["VIEW", "PROCEDURE", "FUNCTION", "PACKAGE", "TRIGGER", "TYPE", "SYNONYM"],
+            &[],
+        ),
+        (Oracle, "CREATE MATERIALIZED |", &["VIEW"], &["TABLE"]),
+        (Oracle, "CREATE MATERIALIZED VIEW LOG |", &["ON"], &["AS"]),
+        (Oracle, "CREATE GLOBAL |", &["TEMPORARY"], &["VIEW"]),
+        (Oracle, "CREATE GLOBAL TEMPORARY |", &["TABLE"], &["VIEW"]),
+        (Oracle, "CREATE UNIQUE |", &["INDEX"], &["TABLE"]),
+        (Oracle, "CREATE BITMAP |", &["INDEX"], &["TABLE"]),
+        (Oracle, "CREATE PUBLIC |", &["SYNONYM", "DATABASE"], &["TABLE"]),
+        (Oracle, "CREATE DATABASE |", &["LINK"], &["TABLE"]),
+        (Oracle, "CREATE PUBLIC DATABASE |", &["LINK"], &["TABLE"]),
+        (Oracle, "CREATE ROLLBACK |", &["SEGMENT"], &["TABLE"]),
+        (Oracle, "CREATE JAVA |", &["SOURCE", "CLASS", "RESOURCE"], &["TABLE"]),
+        (Oracle, "CREATE JAVA SOURCE |", &["NAMED"], &["AS"]),
+        (Oracle, "CREATE PACKAGE |", &["BODY"], &["TABLE"]),
+        (Oracle, "CREATE VIEW v |", &["AS"], &["WHERE"]),
+        (
+            Oracle,
+            "CREATE TABLE t (id NUMBER) |",
+            &["TABLESPACE", "PARTITION BY", "LOGGING"],
+            &["WHERE"],
+        ),
+        (Oracle, "CREATE INDEX idx_emp |", &["ON"], &["WHERE"]),
+        (
+            Oracle,
+            "CREATE SEQUENCE seq |",
+            &["START WITH", "INCREMENT BY", "MINVALUE", "MAXVALUE", "CACHE", "NOCACHE"],
+            &["WHERE"],
+        ),
+        (
+            Oracle,
+            "CREATE MATERIALIZED VIEW mv |",
+            &["AS", "BUILD IMMEDIATE", "REFRESH FAST", "ON PREBUILT TABLE"],
+            &["WHERE"],
+        ),
+        (Oracle, "CREATE MATERIALIZED VIEW mv BUILD |", &["IMMEDIATE"], &["WHERE"]),
+        (
+            Oracle,
+            "CREATE MATERIALIZED VIEW mv REFRESH |",
+            &["FAST", "COMPLETE", "FORCE"],
+            &["WHERE"],
+        ),
+        (
+            Oracle,
+            "CREATE MATERIALIZED VIEW mv REFRESH FAST ON |",
+            &["DEMAND", "COMMIT"],
+            &["WHERE"],
+        ),
+        (
+            Oracle,
+            "CREATE TRIGGER trg BEFORE |",
+            &["INSERT", "UPDATE", "DELETE"],
+            &["TABLE"],
+        ),
+        (Oracle, "CREATE TRIGGER trg BEFORE INSERT |", &["ON"], &["WHERE"]),
+        (
+            MySQL,
+            "CREATE |",
+            &["TABLE", "DATABASE", "INDEX", "VIEW", "USER", "TRIGGER"],
+            &[],
+        ),
+        (MySQL, "CREATE DATABASE IF |", &["NOT"], &["TABLE"]),
+        (MySQL, "CREATE DATABASE IF NOT |", &["EXISTS"], &["TABLE"]),
+        (
+            MySQL,
+            "CREATE DATABASE db DEFAULT |",
+            &["CHARACTER", "CHARSET", "COLLATE", "ENCRYPTION"],
+            &["TABLE"],
+        ),
+        (
+            MySQL,
+            "CREATE TABLE t (a INT) |",
+            &["ENGINE", "DEFAULT CHARSET", "COMMENT", "ROW_FORMAT"],
+            &["WHERE"],
+        ),
+        (
+            MySQL,
+            "CREATE INDEX idx_emp ON emp (empno) |",
+            &["USING"],
+            &["WHERE"],
+        ),
+        (MySQL, "CREATE TRIGGER trg BEFORE |", &["INSERT", "UPDATE", "DELETE"], &["TABLE"]),
+        (MySQL, "CREATE TRIGGER trg BEFORE INSERT |", &["ON"], &["WHERE"]),
+        (
+            MariaDB,
+            "CREATE |",
+            &["TABLE", "DATABASE", "INDEX", "VIEW", "USER", "TRIGGER"],
+            &[],
+        ),
+        (MariaDB, "CREATE DATABASE IF |", &["NOT"], &["TABLE"]),
+        (MariaDB, "CREATE DATABASE IF NOT |", &["EXISTS"], &["TABLE"]),
+        (
+            MariaDB,
+            "CREATE TABLE t (a INT) |",
+            &["ENGINE", "DEFAULT CHARSET", "COMMENT", "ROW_FORMAT"],
+            &["WHERE"],
+        ),
+        (
+            MariaDB,
+            "CREATE INDEX idx_emp ON emp (empno) |",
+            &["USING"],
+            &["WHERE"],
+        ),
+    ];
+
+    for (db_type, sql, expected, forbidden) in cases {
+        let suggestions = query_keyword_completion_suggestions(sql, *db_type);
+        if suggestions.is_empty() {
+            failures.push(format!("EMPTY at {db_type:?} `{sql}`"));
+            continue;
+        }
+        for keyword in *expected {
+            if !has(&suggestions, keyword) {
+                failures.push(format!(
+                    "`{keyword}` missing at {db_type:?} `{sql}`: {suggestions:?}"
+                ));
+            }
+        }
+        for leaked in *forbidden {
+            if has(&suggestions, leaked) {
+                failures.push(format!(
+                    "`{leaked}` leaked at {db_type:?} `{sql}`: {suggestions:?}"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "CREATE statement keyword suggestion gaps:\n{}",
+        failures.join("\n")
+    );
+}

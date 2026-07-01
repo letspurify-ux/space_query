@@ -7632,6 +7632,30 @@ impl SqlEditorWidget {
         None
     }
 
+    fn current_query_select_anchor_before_cursor(tokens: &[SqlToken], end: usize) -> Option<usize> {
+        let mut depth = 0i32;
+        for idx in (0..end.min(tokens.len())).rev() {
+            match &tokens[idx] {
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => depth += 1,
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => {
+                    if depth > 0 {
+                        depth -= 1;
+                    }
+                }
+                SqlToken::Word(word) if depth == 0 => match word.to_ascii_uppercase().as_str() {
+                    "SELECT" => return Some(idx),
+                    "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "VALUES" | "RETURNING" => {
+                        return None
+                    }
+                    _ => {}
+                },
+                SqlToken::Symbol(sym) if depth == 0 && sym == ";" => return None,
+                _ => {}
+            }
+        }
+        None
+    }
+
     fn current_select_projection_index(
         tokens: &[SqlToken],
         select_idx: usize,
@@ -45774,6 +45798,103 @@ impl SqlEditorWidget {
         tables
     }
 
+    fn resolve_insert_source_query_column_lookup_tables(
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> Option<Vec<String>> {
+        if !matches!(
+            deep_ctx.phase,
+            intellisense_context::SqlPhase::SelectList
+                | intellisense_context::SqlPhase::WhereClause
+                | intellisense_context::SqlPhase::GroupByClause
+                | intellisense_context::SqlPhase::HavingClause
+                | intellisense_context::SqlPhase::OrderByClause
+                | intellisense_context::SqlPhase::JoinCondition
+        ) {
+            return None;
+        }
+
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let limit = deep_ctx.cursor_token_len.min(tokens.len());
+        let in_select_list = matches!(deep_ctx.phase, intellisense_context::SqlPhase::SelectList);
+        if !in_select_list && Self::cursor_in_call_argument_list(tokens, limit) {
+            return None;
+        }
+        let select_idx = if in_select_list {
+            Self::current_select_list_anchor_before_cursor(tokens, limit)?
+        } else {
+            Self::current_query_select_anchor_before_cursor(tokens, limit)?
+        };
+        if in_select_list {
+            let mut select_list_depth = 0i32;
+            for token in &tokens[(select_idx + 1)..limit] {
+                match token {
+                    SqlToken::Symbol(sym) if sym == "(" || sym == "[" => {
+                        select_list_depth += 1
+                    }
+                    SqlToken::Symbol(sym) if sym == ")" || sym == "]" => {
+                        if select_list_depth > 0 {
+                            select_list_depth -= 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if select_list_depth > 0 {
+                return None;
+            }
+        }
+        Self::insert_target_before_source_anchor(tokens, select_idx)?;
+
+        let source_tokens = tokens.get(select_idx..)?;
+        let mut source_end = source_tokens.len();
+        let mut depth = 0i32;
+        for (idx, token) in source_tokens.iter().enumerate() {
+            match token {
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => depth += 1,
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => {
+                    if depth > 0 {
+                        depth -= 1;
+                    }
+                }
+                SqlToken::Symbol(sym) if depth == 0 && sym == ";" => {
+                    source_end = idx;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let source_tokens = &source_tokens[..source_end];
+        let mut source_tables = intellisense_context::collect_tables_in_statement(source_tokens);
+        if source_tables.is_empty() && in_select_list {
+            // At `SELECT | FROM ...`, removing the cursor leaves `SELECT FROM ...`.
+            // Pad the projection slot so the source FROM can still be parsed.
+            let mut padded_source_tokens = source_tokens.to_vec();
+            let insert_at = limit
+                .saturating_sub(select_idx)
+                .min(padded_source_tokens.len());
+            padded_source_tokens.insert(
+                insert_at,
+                SqlToken::Word("__sq_completion_expr".to_string()),
+            );
+            source_tables = intellisense_context::collect_tables_in_statement(&padded_source_tokens);
+        }
+        if source_tables.is_empty() {
+            return None;
+        }
+
+        let mut tables = Vec::new();
+        let mut seen = HashSet::new();
+        for table_ref in &source_tables {
+            let lookup_table = Self::column_lookup_table_for_table_ref(table_ref, deep_ctx);
+            let key = Self::completion_identifier_lookup_upper(&lookup_table);
+            if seen.insert(key) {
+                tables.push(lookup_table);
+            }
+        }
+
+        (!tables.is_empty()).then_some(tables)
+    }
+
     fn cursor_is_mysql_multi_table_update_set_target(
         deep_ctx: &intellisense_context::CursorContext,
         db_type: Option<crate::db::DatabaseType>,
@@ -45998,6 +46119,11 @@ impl SqlEditorWidget {
                 {
                     return load_file_scope;
                 }
+            }
+            if let Some(insert_source_tables) =
+                Self::resolve_insert_source_query_column_lookup_tables(deep_ctx)
+            {
+                return insert_source_tables;
             }
             if let Some(focused_tables) = focused_tables {
                 if matches!(
