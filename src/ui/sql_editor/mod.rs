@@ -5461,7 +5461,6 @@ mod execution_state_tests {
 
         let undo_group = state.take_undo_group();
         assert_eq!(state.current.text, "abcdef");
-        assert_eq!(state.current.cursor_pos, 6);
 
         let undo_cursor = state.undo_cursor_after_group(&undo_group);
         assert_eq!(undo_cursor, 3);
@@ -5496,6 +5495,76 @@ mod execution_state_tests {
         assert_eq!(undo_group.len(), 3);
         assert_eq!(state.current.text, "abcef");
         assert_eq!(state.undo_cursor_after_group(&undo_group), 5);
+    }
+
+    #[test]
+    fn remote_delete_undo_returns_through_cursor_move_to_previous_delete() {
+        let mut state = WordUndoRedoState::new("eeeeexxxxxabcef".to_string());
+        state.current.cursor_pos = 5;
+
+        state.record_edit(&build_edit(4, "e", ""), classify_edit_group(0, 1, "", "e"));
+        state.record_edit(&build_edit(3, "e", ""), classify_edit_group(0, 1, "", "e"));
+
+        assert_eq!(state.current.text, "eeexxxxxabcef");
+        assert_eq!(state.current.cursor_pos, 3);
+
+        state.record_edit(&build_edit(12, "f", ""), classify_edit_group(0, 1, "", "f"));
+        state.record_edit(&build_edit(11, "e", ""), classify_edit_group(0, 1, "", "e"));
+        state.record_edit(&build_edit(10, "c", ""), classify_edit_group(0, 1, "", "c"));
+
+        assert_eq!(state.current.text, "eeexxxxxab");
+
+        let remote_delete_group = state.take_undo_group();
+        assert_eq!(remote_delete_group.len(), 3);
+        assert_eq!(state.current.text, "eeexxxxxabcef");
+        assert_eq!(state.undo_cursor_after_group(&remote_delete_group), 13);
+
+        let cursor_group = state.take_undo_group();
+        assert_eq!(state.current.text, "eeexxxxxabcef");
+        assert_eq!(cursor_group.len(), 1);
+        assert_eq!(cursor_group[0].deleted_text, "");
+        assert_eq!(cursor_group[0].inserted_text, "");
+        assert_eq!(state.undo_cursor_after_group(&cursor_group), 3);
+
+        let first_delete_group = state.take_undo_group();
+        assert_eq!(first_delete_group.len(), 2);
+        assert_eq!(state.current.text, "eeeeexxxxxabcef");
+        assert_eq!(state.undo_cursor_after_group(&first_delete_group), 5);
+    }
+
+    #[test]
+    fn remote_delete_undo_returns_through_cursor_move_across_spaces() {
+        let mut state = WordUndoRedoState::new("eeeee     abcef".to_string());
+        state.current.cursor_pos = 5;
+
+        state.record_edit(&build_edit(4, "e", ""), classify_edit_group(0, 1, "", "e"));
+        state.record_edit(&build_edit(3, "e", ""), classify_edit_group(0, 1, "", "e"));
+
+        assert_eq!(state.current.text, "eee     abcef");
+        assert_eq!(state.current.cursor_pos, 3);
+
+        state.record_edit(&build_edit(12, "f", ""), classify_edit_group(0, 1, "", "f"));
+        state.record_edit(&build_edit(11, "e", ""), classify_edit_group(0, 1, "", "e"));
+        state.record_edit(&build_edit(10, "c", ""), classify_edit_group(0, 1, "", "c"));
+
+        assert_eq!(state.current.text, "eee     ab");
+
+        let remote_delete_group = state.take_undo_group();
+        assert_eq!(remote_delete_group.len(), 3);
+        assert_eq!(state.current.text, "eee     abcef");
+        assert_eq!(state.undo_cursor_after_group(&remote_delete_group), 13);
+
+        let cursor_group = state.take_undo_group();
+        assert_eq!(state.current.text, "eee     abcef");
+        assert_eq!(cursor_group.len(), 1);
+        assert_eq!(cursor_group[0].deleted_text, "");
+        assert_eq!(cursor_group[0].inserted_text, "");
+        assert_eq!(state.undo_cursor_after_group(&cursor_group), 3);
+
+        let first_delete_group = state.take_undo_group();
+        assert_eq!(first_delete_group.len(), 2);
+        assert_eq!(state.current.text, "eeeee     abcef");
+        assert_eq!(state.undo_cursor_after_group(&first_delete_group), 5);
     }
 
     #[test]

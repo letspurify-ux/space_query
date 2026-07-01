@@ -172,6 +172,12 @@ impl WordUndoRedoState {
         let current_text = self.current.text.as_str();
         let (edit_start, edit_end) = Self::normalized_replace_range(current_text, edit);
 
+        if Self::cursor_distance_chars(current_text, current_cursor, edit_start)
+            >= REMOTE_EDIT_CURSOR_DISTANCE
+        {
+            return false;
+        }
+
         let near_current_cursor = edit_start <= current_cursor.saturating_add(12)
             && current_cursor <= edit_end.saturating_add(12);
         let deleted_size = edit.deleted_len.max(edit.deleted_text.len());
@@ -237,7 +243,7 @@ impl WordUndoRedoState {
         merge_group: bool,
         edit_group: EditGroup,
     ) {
-        if merge_group || edit_group.operation == EditOperation::Delete {
+        if merge_group || edit_group.operation == EditOperation::Other {
             return;
         }
 
