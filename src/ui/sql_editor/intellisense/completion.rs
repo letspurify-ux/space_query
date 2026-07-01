@@ -4749,6 +4749,46 @@ impl SqlEditorWidget {
         None
     }
 
+    /// True when the cursor sits right after a PL/SQL range operator (`low .. |`),
+    /// the upper-bound operand slot of a `FOR i IN low .. high` header. The range
+    /// is two adjacent `.` symbols; a single `.` is a qualified-name accessor, so
+    /// both dots must be present.
+    fn cursor_follows_plsql_range_operator(tokens: &[SqlToken], end: usize) -> bool {
+        let before = Self::meaningful_tokens_before(tokens, end);
+        matches!(
+            before.as_slice(),
+            [.., SqlToken::Symbol(first), SqlToken::Symbol(second)]
+                if first == "." && second == "."
+        )
+    }
+
+    fn cursor_allows_plsql_diagnostic_keyword(tokens: &[SqlToken], end: usize) -> bool {
+        if !Self::cursor_in_plsql_executable_block(tokens, end) {
+            return false;
+        }
+        match Self::meaningful_tokens_before(tokens, end).last() {
+            Some(SqlToken::Symbol(sym)) => matches!(
+                sym.as_str(),
+                ":=" | "=>"
+                    | "="
+                    | "<"
+                    | ">"
+                    | "<="
+                    | ">="
+                    | "<>"
+                    | "!="
+                    | "^="
+                    | "+"
+                    | "-"
+                    | "*"
+                    | "/"
+                    | "||"
+            ),
+            Some(SqlToken::Word(word)) => word.eq_ignore_ascii_case("RETURN"),
+            _ => false,
+        }
+    }
+
     /// True when the cursor sits inside a routine *call's* argument list —
     /// `proc(|)`, `dbms_output.put_line(|)`, `pkg.fn(a, |)`. An argument is a
     /// value expression, so a variable/function/literal completes but a bare
@@ -4970,7 +5010,7 @@ impl SqlEditorWidget {
         // introduce an operand — never begin a statement — so the expression
         // keyword allowlist is safe to run without hiding the statement keywords
         // valid at a block statement start (`BEGIN |`, `; |`, `THEN |`).
-        let at_plsql_value_operand = in_plsql_value_expression
+        let mut at_plsql_value_operand = in_plsql_value_expression
             && match Self::meaningful_tokens_before(tokens, end).last() {
                 Some(SqlToken::Symbol(sym)) => matches!(
                     sym.as_str(),
@@ -5007,6 +5047,11 @@ impl SqlEditorWidget {
                                 | "IF"
                                 | "ELSIF"
                                 | "WHILE"
+                                // `EXECUTE IMMEDIATE |` opens the dynamic-SQL string
+                                // operand; the `cursor_follows_complete_operand` scan
+                                // can't classify the `IMMEDIATE` keyword tail, so name
+                                // it here explicitly.
+                                | "IMMEDIATE"
                         )
                 }
                 _ => false,
@@ -5046,6 +5091,48 @@ impl SqlEditorWidget {
                 _ => None,
             }
         };
+        // Beyond the fixed operator/keyword allowlist above, any position inside a
+        // PL/SQL value expression that is *not* a statement start and does *not*
+        // follow a complete operand is itself an operand start — e.g. the searched-
+        // /simple-`CASE` condition (`CASE WHEN |`, `CASE x WHEN |`), a nested call
+        // argument (`f(a, |)`), or a `FOR` range bound (`1 .. |`). Statement starts
+        // (`BEGIN |`, `; |`, `THEN |`, `LOOP |`) are excluded by `statement_start`,
+        // and keyword-tail slots after a complete operand (`a = b |`) by
+        // `follows_operand == Some(true)`; the exception-name and declaration/label
+        // name slots are excluded so their dedicated handling stays in charge.
+        // Restrict to a genuine PL/SQL executable block: `in_plsql_value_expression`
+        // is also set by a lone `:=`/`=>`, a package-spec default and — crucially —
+        // any open call-argument paren, which would otherwise pull SQL/DDL paren
+        // slots (`CREATE TABLE t (|`, `EXTRACT(|`, `REFERENCES p (id) ON |`) into the
+        // value-operand path. Inside a block the paren/comma/`WHEN`/range positions
+        // are all real operand starts.
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            && Self::cursor_in_plsql_executable_block(tokens, end)
+            && !at_plsql_value_operand
+            && statement_start.is_none()
+            && !at_exception_name
+            && !at_plsql_for_loop_index_slot
+            && !at_plsql_declaration_object_name_slot
+            && !at_plsql_routine_parameter_name_slot
+            // An embedded SQL statement inside the block can still land the cursor at
+            // a dedicated keyword-only slot (an `EXTRACT(|` field, an `INTERVAL` unit,
+            // a data-type position, a window-frame bound, …). Those own their keyword
+            // set and must stay catalog-free, so never promote them to a value operand.
+            && !Self::cursor_is_at_column_suppressing_keyword_slot_for_db(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+            && !Self::cursor_is_at_identifier_suppressing_keyword_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+            && (follows_operand == Some(false)
+                || Self::cursor_follows_plsql_range_operator(tokens, end))
+        {
+            at_plsql_value_operand = true;
+        }
         ExpressionKeywordContext {
             construct_continuation_keywords,
             in_order_by,
@@ -8735,6 +8822,15 @@ impl SqlEditorWidget {
     /// parenthesised group rather than a call.
     fn call_name_before_close(before: &[&SqlToken]) -> Option<String> {
         Self::call_name_and_open_index_before_close(before).map(|(name, _)| name)
+    }
+
+    fn closed_call_name_before_cursor(tokens: &[SqlToken], end: usize) -> Option<String> {
+        let before = Self::meaningful_tokens_before(tokens, end);
+        if matches!(before.last(), Some(SqlToken::Symbol(sym)) if sym == ")") {
+            Self::call_name_before_close(&before)
+        } else {
+            None
+        }
     }
 
     fn closed_paren_operand_type_before_close(
@@ -13781,7 +13877,7 @@ impl SqlEditorWidget {
         let anchors = if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
             &["DELETE", "INSERT", "REPLACE", "UPDATE"][..]
         } else {
-            &["DELETE", "INSERT", "MERGE"][..]
+            &["DELETE", "INSERT", "MERGE", "UPDATE"][..]
         };
         let anchor_idx = Self::statement_start_anchor_index(tokens, end, anchors)?;
         Some(
@@ -18686,6 +18782,10 @@ impl SqlEditorWidget {
                 deep_ctx,
                 exclude_current_identifier_chain,
             )
+            || Self::cursor_is_at_merge_update_set_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+            )
             || Self::cursor_is_at_merge_when_keyword_slot_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
@@ -20379,9 +20479,17 @@ impl SqlEditorWidget {
         if mysql_compatible && lead == "MERGE" {
             return Some(&[]);
         }
+        let has_set = toks.iter().any(|token| {
+            matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("SET"))
+        });
 
         match lead.as_str() {
-            "UPDATE" if matches!(phase, SqlPhase::UpdateTarget) => Some(&["SET"]),
+            "UPDATE"
+                if !has_set
+                    && (matches!(phase, SqlPhase::UpdateTarget) || !mysql_compatible) =>
+            {
+                Some(&["SET"])
+            }
             "INSERT" | "REPLACE" if matches!(phase, SqlPhase::IntoClause) => {
                 Some(&["VALUES", "SELECT"])
             }
@@ -23605,7 +23713,18 @@ impl SqlEditorWidget {
             return None;
         }
 
-        let toks = Self::meaningful_tokens_before(tokens, end);
+        let merge_toks: Option<Vec<&SqlToken>> =
+            Self::statement_start_anchor_index(tokens, end, &["MERGE"]).map(|anchor_idx| {
+                tokens
+                    .get(anchor_idx..end)
+                    .unwrap_or(&[])
+                    .iter()
+                    .filter(|token| !matches!(token, SqlToken::Comment(_)))
+                    .collect()
+            });
+        let toks = merge_toks
+            .or_else(|| Self::dml_statement_tokens_before(tokens, end, db_type))
+            .unwrap_or_else(|| Self::meaningful_tokens_before(tokens, end));
         let words = toks
             .iter()
             .filter_map(|token| match token {
@@ -28928,7 +29047,15 @@ impl SqlEditorWidget {
             let control_expression_complete =
                 Self::cursor_follows_complete_operand(tokens, end) == Some(true);
             let last_index = |keyword: &str| words.iter().rposition(|word| word == keyword);
-            let last_if = last_index("IF").or_else(|| last_index("ELSIF"));
+            // An `ELSIF` opens a fresh condition sub-clause exactly like the leading
+            // `IF`, so the "current condition" anchor is the *latest* of the two —
+            // not `IF` preferentially. Otherwise `IF … THEN …; ELSIF |` is misread as
+            // "after THEN" (the opening IF still has a later THEN) and offers the
+            // `ELSIF/ELSE/END IF` continuations instead of the awaited condition.
+            let last_if = last_index("IF")
+                .into_iter()
+                .chain(last_index("ELSIF"))
+                .max();
             let last_then = last_index("THEN");
             let last_end = last_index("END");
             let last_loop = last_index("LOOP");
@@ -32727,6 +32854,61 @@ impl SqlEditorWidget {
             && !matches!(position, DataTypePosition::ToolVariable)
     }
 
+    fn expected_plsql_routine_parameter_mode_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            || !Self::cursor_is_inside_routine_param_list(tokens, end)
+        {
+            return None;
+        }
+
+        let visible_end = end.min(tokens.len());
+        let open_idx = Self::nearest_unclosed_open_paren_before(tokens, visible_end)?;
+        let mut segment_start = open_idx + 1;
+        let mut depth = 0i32;
+        for (idx, token) in tokens
+            .iter()
+            .enumerate()
+            .take(visible_end)
+            .skip(open_idx + 1)
+        {
+            match token {
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => depth += 1,
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => depth = (depth - 1).max(0),
+                SqlToken::Symbol(sym) if sym == "," && depth == 0 => segment_start = idx + 1,
+                _ => {}
+            }
+        }
+
+        let segment = tokens
+            .get(segment_start..visible_end)
+            .unwrap_or(&[])
+            .iter()
+            .filter(|token| !matches!(token, SqlToken::Comment(_)))
+            .collect::<Vec<_>>();
+        let plain_parameter_name = |token: &SqlToken| {
+            matches!(token, SqlToken::Word(word) if !Self::is_plsql_non_type_keyword(word))
+        };
+        let word_is = |idx: usize, keyword: &str| {
+            matches!(segment.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case(keyword))
+        };
+
+        match segment.as_slice() {
+            [name] if plain_parameter_name(name) => Some(&["IN", "OUT", "IN OUT"]),
+            [name, _in_kw] if plain_parameter_name(name) && word_is(1, "IN") => Some(&["OUT"]),
+            [name, _out_kw] if plain_parameter_name(name) && word_is(1, "OUT") => Some(&["NOCOPY"]),
+            [name, _in_kw, _out_kw]
+                if plain_parameter_name(name) && word_is(1, "IN") && word_is(2, "OUT") =>
+            {
+                Some(&["NOCOPY"])
+            }
+            _ => None,
+        }
+    }
+
     /// True when the cursor sits right after a standalone `AS` — an alias-name
     /// slot that introduces a brand-new identifier (`expr AS |`, `relation
     /// AS |`). Such a slot is never an existing column/relation/keyword, so
@@ -34063,6 +34245,7 @@ impl SqlEditorWidget {
             "SESSION",
         ];
         const CREATE_OBJECT_TYPE_KEYWORDS: &[&str] = &[
+            "OR",
             "TABLE",
             "VIEW",
             "MATERIALIZED",
@@ -38113,19 +38296,12 @@ impl SqlEditorWidget {
             || crate::ui::intellisense::suggestion_matches_completion_prefix(suggestion, prefix)
     }
 
-    /// True when the active query's leading keyword is `MERGE`, i.e. the cursor
-    /// is inside a MERGE statement (or its merge-action clauses). Used to gate
-    /// the `WHEN MATCHED`/`WHEN NOT MATCHED` keyword hints, which are MERGE-only:
-    /// a `CASE WHEN |` branch in a SELECT/PL-SQL block must not offer `MATCHED`.
-    fn statement_is_merge(tokens: &[SqlToken]) -> bool {
-        tokens
-            .iter()
-            .find_map(|token| match token {
-                SqlToken::Comment(_) => None,
-                SqlToken::Word(word) => Some(word.eq_ignore_ascii_case("MERGE")),
-                _ => Some(false),
-            })
-            .unwrap_or(false)
+    /// True when the cursor's current statement segment is a MERGE statement
+    /// (top-level or embedded in a PL/SQL block). Used to gate the `WHEN MATCHED`/
+    /// `WHEN NOT MATCHED` keyword hints, which are MERGE-only: a `CASE WHEN |`
+    /// branch in a SELECT/PL-SQL block must not offer `MATCHED`.
+    fn statement_is_merge(tokens: &[SqlToken], end: usize) -> bool {
+        Self::statement_start_anchor_index(tokens, end, &["MERGE"]).is_some()
     }
 
     /// True when the cursor sits inside an unclosed `CASE … END` expression. A
@@ -38192,7 +38368,8 @@ impl SqlEditorWidget {
         tokens: &[SqlToken],
         end: usize,
     ) -> Option<&'static [&'static str]> {
-        if !Self::statement_is_merge(tokens) || Self::cursor_is_inside_unclosed_case(tokens, end) {
+        if !Self::statement_is_merge(tokens, end) || Self::cursor_is_inside_unclosed_case(tokens, end)
+        {
             return None;
         }
         let toks = Self::meaningful_tokens_before(tokens, end);
@@ -38217,6 +38394,24 @@ impl SqlEditorWidget {
         }
     }
 
+    fn merge_update_set_keywords(tokens: &[SqlToken], end: usize) -> Option<&'static [&'static str]> {
+        if !Self::statement_is_merge(tokens, end) || Self::cursor_is_inside_unclosed_case(tokens, end)
+        {
+            return None;
+        }
+
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        match toks.as_slice() {
+            [.., SqlToken::Word(then_kw), SqlToken::Word(update_kw)]
+                if then_kw.eq_ignore_ascii_case("THEN")
+                    && update_kw.eq_ignore_ascii_case("UPDATE") =>
+            {
+                Some(&["SET"])
+            }
+            _ => None,
+        }
+    }
+
     fn cursor_is_at_merge_then_action_slot_for_context(
         deep_ctx: &intellisense_context::CursorContext,
         exclude_current_identifier_chain: bool,
@@ -38229,6 +38424,20 @@ impl SqlEditorWidget {
             exclude_current_identifier_chain,
         );
         Self::merge_then_action_keywords(tokens, end).is_some()
+    }
+
+    fn cursor_is_at_merge_update_set_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::merge_update_set_keywords(tokens, end).is_some()
     }
 
     /// Whether the cursor is at the MERGE match-condition keyword slot — right
@@ -38267,7 +38476,8 @@ impl SqlEditorWidget {
         tokens: &[SqlToken],
         end: usize,
     ) -> Option<&'static [&'static str]> {
-        if !Self::statement_is_merge(tokens) || Self::cursor_is_inside_unclosed_case(tokens, end) {
+        if !Self::statement_is_merge(tokens, end) || Self::cursor_is_inside_unclosed_case(tokens, end)
+        {
             return None;
         }
         let toks = Self::meaningful_tokens_before(tokens, end);
@@ -38309,7 +38519,8 @@ impl SqlEditorWidget {
         tokens: &[SqlToken],
         end: usize,
     ) -> Option<&'static [&'static str]> {
-        if !Self::statement_is_merge(tokens) || Self::cursor_is_inside_unclosed_case(tokens, end) {
+        if !Self::statement_is_merge(tokens, end) || Self::cursor_is_inside_unclosed_case(tokens, end)
+        {
             return None;
         }
 
@@ -38347,7 +38558,8 @@ impl SqlEditorWidget {
         tokens: &[SqlToken],
         end: usize,
     ) -> Option<&'static [&'static str]> {
-        if !Self::statement_is_merge(tokens) || Self::cursor_is_inside_unclosed_case(tokens, end) {
+        if !Self::statement_is_merge(tokens, end) || Self::cursor_is_inside_unclosed_case(tokens, end)
+        {
             return None;
         }
         let toks = Self::meaningful_tokens_before(tokens, end);
@@ -39468,6 +39680,23 @@ impl SqlEditorWidget {
                 return candidates;
             }
         }
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            && expr_keyword_ctx.is_some_and(|ctx| {
+                ctx.at_plsql_value_operand
+                    && !ctx.at_exception_name
+                    && ctx.follows_operand != Some(true)
+            })
+            && (Self::cursor_allows_plsql_diagnostic_keyword(tokens, context_end)
+                || Self::cursor_allows_plsql_diagnostic_keyword(
+                    statement_tokens,
+                    statement_context_end,
+                ))
+        {
+            let candidates = Self::filter_expected_candidates(prefix, &["SQLCODE", "SQLERRM"]);
+            if !candidates.is_empty() {
+                return candidates;
+            }
+        }
         if !prefix.is_empty()
             && (matches!(
                 Self::cursor_statement_start_context(tokens, context_end),
@@ -39596,6 +39825,24 @@ impl SqlEditorWidget {
                     prefix,
                     data_type_keywords_for(db_type, position),
                 );
+                if let Some(parameter_modes) =
+                    Self::expected_plsql_routine_parameter_mode_keyword_candidates(
+                        tokens,
+                        context_end,
+                        db_type,
+                    )
+                    .or_else(|| {
+                        Self::expected_plsql_routine_parameter_mode_keyword_candidates(
+                            statement_tokens,
+                            statement_context_end,
+                            db_type,
+                        )
+                    })
+                {
+                    candidates.extend(Self::filter_expected_candidates(prefix, parameter_modes));
+                    candidates.sort();
+                    candidates.dedup();
+                }
                 if let Some(table_function_tail) =
                     Self::expected_table_function_column_tail_keyword_candidates(
                         tokens,
@@ -40377,6 +40624,18 @@ impl SqlEditorWidget {
                         result.push(keyword);
                     }
                 }
+                if Self::closed_call_name_before_cursor(tokens, context_end)
+                    .is_some_and(|name| name.eq_ignore_ascii_case("LISTAGG"))
+                {
+                    for keyword in Self::filter_expected_candidates(prefix, &["WITHIN GROUP"]) {
+                        if !result
+                            .iter()
+                            .any(|existing| existing.eq_ignore_ascii_case(&keyword))
+                        {
+                            result.push(keyword);
+                        }
+                    }
+                }
             }
             return result;
         }
@@ -40400,6 +40659,9 @@ impl SqlEditorWidget {
             return Self::filter_expected_candidates(prefix, candidates);
         }
         if let Some(candidates) = Self::merge_then_action_keywords(tokens, context_end) {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(candidates) = Self::merge_update_set_keywords(tokens, context_end) {
             return Self::filter_expected_candidates(prefix, candidates);
         }
         if let Some(candidates) = Self::merge_action_start_keywords(tokens, context_end) {

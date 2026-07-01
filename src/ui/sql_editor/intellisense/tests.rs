@@ -60192,6 +60192,187 @@ fn plsql_construct_keyword_slots_final_suggestions_stay_keyword_only() {
 }
 
 #[test]
+fn oracle_plsql_requested_completion_regressions_are_suggested() {
+    use crate::db::DatabaseType::Oracle;
+
+    let has = |values: &[String], needle: &str| {
+        values.iter().any(|value| value.eq_ignore_ascii_case(needle))
+    };
+    let mut failures = Vec::new();
+
+    for (sql, expected) in [
+        (
+            "BEGIN NULL; EXCEPTION WHEN OTHERS THEN v_msg := sq|; END;",
+            &["SQLERRM", "SQLCODE"][..],
+        ),
+        ("BEGIN IF v_status i| THEN NULL; END IF; END;", &["IN"]),
+        (
+            "CREATE OR REPLACE PROCEDURE p(p_value o| NUMBER) IS BEGIN NULL; END;",
+            &["OUT"],
+        ),
+        ("CREATE o| VIEW v AS SELECT * FROM emp", &["OR"]),
+        ("SELECT * FROM xml|", &["XMLTABLE"]),
+        ("MERGE |", &["INTO"]),
+        (
+            "BEGIN MERGE INTO t USING s ON (t.a = s.a) | END;",
+            &["WHEN"],
+        ),
+        (
+            "BEGIN MERGE INTO t USING s ON (t.a = s.a) WHEN | END;",
+            &["MATCHED", "NOT"],
+        ),
+        (
+            "BEGIN MERGE INTO t USING s ON (t.a = s.a) WHEN NOT | END;",
+            &["MATCHED"],
+        ),
+        ("BEGIN UPDATE emp | END;", &["SET"]),
+        (
+            "SELECT * FROM dual CONNECT BY |",
+            &[
+                "NOCYCLE",
+                "PRIOR",
+                "LEVEL",
+                "CONNECT_BY_ROOT",
+                "CONNECT_BY_ISCYCLE",
+                "CONNECT_BY_ISLEAF",
+            ],
+        ),
+        ("SELECT * FROM emp e INNER |", &["JOIN"]),
+        ("SELECT * FROM emp e JOIN dept d |", &["ON"]),
+        ("SELECT lis| FROM emp", &["LISTAGG"]),
+        ("SELECT deptno, COUNT(*) FROM emp |", &["GROUP BY"]),
+        ("SELECT deptno, COUNT(*) FROM emp GROUP |", &["BY"]),
+        (
+            "SELECT deptno, COUNT(*) FROM emp GROUP BY |",
+            &["ROLLUP", "CUBE", "GROUPING SETS"],
+        ),
+    ] {
+        let (_kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        for keyword in expected {
+            if !has(&final_suggestions, keyword) {
+                failures.push(format!(
+                    "`{keyword}` missing at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+                ));
+            }
+        }
+    }
+
+    let exception_body_suggestions = print_command_bind_suggestions_for_test(
+        r#"DECLARE
+    v_message VARCHAR2(4000);
+BEGIN
+    NULL;
+EXCEPTION
+    WHEN OTHERS THEN
+        v_mes__CODEX_CURSOR__ := SQLERRM;
+END;"#,
+        &[],
+    );
+    if !has(&exception_body_suggestions, "v_message") {
+        failures.push(format!(
+            "`v_message` missing inside exception handler body: {exception_body_suggestions:?}"
+        ));
+    }
+
+    assert!(
+        failures.is_empty(),
+        "requested Oracle PL/SQL completion regressions:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn oracle_plsql_requested_completion_bulk_matrix_is_suggested() {
+    use crate::db::DatabaseType::Oracle;
+
+    let has = |values: &[String], needle: &str| {
+        values.iter().any(|value| value.eq_ignore_ascii_case(needle))
+    };
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "DECLARE v_message VARCHAR2(4000); BEGIN NULL; EXCEPTION WHEN OTHERS THEN v_message := sql|; END;",
+            &["SQLERRM", "SQLCODE"],
+        ),
+        (
+            "DECLARE v NUMBER; BEGIN IF v no| THEN NULL; END IF; END;",
+            &["NOT"],
+        ),
+        (
+            "DECLARE v NUMBER; BEGIN IF v NOT | THEN NULL; END IF; END;",
+            &["IN"],
+        ),
+        (
+            "CREATE OR REPLACE FUNCTION f(p_value i| NUMBER) RETURN NUMBER IS BEGIN RETURN p_value; END;",
+            &["IN", "IN OUT"],
+        ),
+        (
+            "CREATE OR REPLACE PROCEDURE p(p_value IN o| NUMBER) IS BEGIN NULL; END;",
+            &["OUT"],
+        ),
+        ("CREATE OR |", &["REPLACE"]),
+        ("SELECT * FROM XMLTABLE('/r' PASSING xmltype('<r/>') |)", &["COLUMNS"]),
+        (
+            "MERGE INTO t USING s ON (t.a = s.a) WHEN MATCHED |",
+            &["THEN", "AND"],
+        ),
+        (
+            "MERGE INTO t USING s ON (t.a = s.a) WHEN MATCHED THEN UPDATE |",
+            &["SET"],
+        ),
+        (
+            "BEGIN MERGE INTO t USING s ON (t.a = s.a) WHEN MATCHED THEN UPDATE SET t.b = s.b | END;",
+            &["WHERE", "DELETE WHERE", "WHEN"],
+        ),
+        (
+            "SELECT LEVEL FROM dual CONNECT |",
+            &["BY"],
+        ),
+        (
+            "SELECT LEVEL FROM dual CONNECT BY LEVEL |",
+            &["IS", "IN", "LIKE", "BETWEEN", "NOT"],
+        ),
+        (
+            "SELECT * FROM emp e LEFT |",
+            &["OUTER", "JOIN"],
+        ),
+        (
+            "SELECT * FROM emp e LEFT OUTER |",
+            &["JOIN"],
+        ),
+        (
+            "SELECT * FROM emp e JOIN dept d ON |",
+            &["CASE", "CAST", "EXISTS", "NOT"],
+        ),
+        (
+            "SELECT LISTAGG(ename, ',') | FROM emp",
+            &["WITHIN GROUP", "OVER"],
+        ),
+        (
+            "SELECT deptno, LISTAGG(ename, ',') WITHIN GROUP (ORDER BY ename) FROM emp GROUP BY deptno |",
+            &["ORDER BY", "HAVING"],
+        ),
+    ];
+
+    let mut failures = Vec::new();
+    for (sql, expected) in cases {
+        let (_kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        for keyword in *expected {
+            if !has(&final_suggestions, keyword) {
+                failures.push(format!(
+                    "`{keyword}` missing at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "bulk requested Oracle PL/SQL completion matrix failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
 fn plsql_pragma_name_slot_stays_keyword_only() {
     use crate::db::DatabaseType::{MySQL, Oracle};
 
@@ -75224,3 +75405,114 @@ fn completion_replacement_range_preserves_aligned_and_empty_cases() {
     );
     assert_eq!(no_range, (0, 2));
 }
+
+/// Broad coverage guard: inside a PL/SQL block, IntelliSense must offer *something*
+/// at every statement start, control-flow condition, value-operand and embedded-SQL
+/// position — the recurring "nothing is suggested inside PL/SQL" complaint. Each
+/// case lists keywords/identifiers that MUST appear; the `must_offer` check doubles
+/// as a non-empty guard. Nested BEGIN/IF/CASE/LOOP/FOR combinations are exercised so
+/// a mis-scoped frame can't silently blank the suggestions.
+#[test]
+fn plsql_constructs_always_offer_suggestions() {
+    use crate::db::DatabaseType::Oracle;
+
+    let has = |suggestions: &[String], keyword: &str| {
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case(keyword))
+    };
+    let mut failures = Vec::new();
+
+    // (sql, at least one of these keywords/identifiers must be offered)
+    let cases: &[(&str, &[&str])] = &[
+        // ---- block bodies / statement starts ----
+        ("BEGIN | END;", &["IF", "LOOP", "NULL", "RETURN"]),
+        ("BEGIN NULL; | END;", &["IF", "LOOP", "NULL"]),
+        ("DECLARE v NUMBER; BEGIN | END;", &["IF", "SELECT", "NULL"]),
+        ("BEGIN BEGIN | END; END;", &["IF", "NULL", "RETURN"]),
+        ("BEGIN NULL; BEGIN | END; END;", &["IF", "NULL"]),
+        // ---- IF family ----
+        ("BEGIN IF | THEN NULL; END IF; END;", &["NULL", "CASE", "TRUE", "FALSE"]),
+        ("BEGIN IF a = | THEN NULL; END IF; END;", &["NULL", "CASE"]),
+        ("BEGIN IF a = 1 THEN | END IF; END;", &["IF", "NULL", "ELSIF", "ELSE"]),
+        ("BEGIN IF a = 1 THEN NULL; ELSIF | THEN NULL; END IF; END;", &["NULL", "CASE"]),
+        ("BEGIN IF a = 1 THEN NULL; ELSIF b = 2 THEN | END IF; END;", &["IF", "NULL", "ELSE"]),
+        ("BEGIN IF a = 1 THEN NULL; ELSE | END IF; END;", &["IF", "NULL"]),
+        ("BEGIN IF a = 1 THEN NULL; END IF; | END;", &["IF", "NULL"]),
+        // ---- statement CASE ----
+        ("BEGIN CASE x WHEN | THEN NULL; END CASE; END;", &["NULL", "CASE", "TRUE", "FALSE"]),
+        ("BEGIN CASE WHEN | THEN NULL; END CASE; END;", &["NULL", "CASE", "TRUE", "FALSE"]),
+        ("BEGIN CASE WHEN a = 1 THEN | END CASE; END;", &["IF", "NULL", "WHEN", "ELSE"]),
+        ("BEGIN CASE WHEN a = 1 THEN NULL; ELSE | END CASE; END;", &["IF", "NULL"]),
+        // ---- LOOP / WHILE / FOR ----
+        ("BEGIN LOOP | END LOOP; END;", &["IF", "NULL", "EXIT", "CONTINUE"]),
+        ("BEGIN LOOP NULL; | END LOOP; END;", &["IF", "EXIT"]),
+        ("BEGIN WHILE | LOOP NULL; END LOOP; END;", &["NULL", "CASE", "TRUE", "FALSE"]),
+        ("BEGIN WHILE x < 1 LOOP | END LOOP; END;", &["IF", "NULL", "EXIT"]),
+        ("BEGIN FOR i IN 1 .. | LOOP NULL; END LOOP; END;", &["NULL", "CASE", "TRUE", "FALSE"]),
+        ("BEGIN FOR i IN 1 .. 10 LOOP | END LOOP; END;", &["IF", "NULL", "EXIT"]),
+        ("BEGIN FOR r IN (SELECT | FROM emp) LOOP NULL; END LOOP; END;", &["EMPNO", "ENAME"]),
+        ("BEGIN FOR r IN (SELECT * FROM emp) LOOP | END LOOP; END;", &["IF", "NULL", "EXIT"]),
+        // ---- nested constructs ----
+        ("BEGIN IF a THEN LOOP | END LOOP; END IF; END;", &["IF", "NULL", "EXIT"]),
+        ("BEGIN LOOP IF a THEN | END IF; END LOOP; END;", &["IF", "NULL", "ELSIF"]),
+        ("BEGIN IF a THEN CASE WHEN b THEN | END CASE; END IF; END;", &["IF", "NULL", "WHEN"]),
+        ("BEGIN LOOP CASE WHEN b THEN | END CASE; END LOOP; END;", &["IF", "NULL", "WHEN"]),
+        ("BEGIN FOR i IN 1..10 LOOP IF a THEN | END IF; END LOOP; END;", &["IF", "NULL", "ELSIF"]),
+        ("BEGIN IF a THEN IF b THEN | END IF; END IF; END;", &["IF", "NULL", "ELSIF"]),
+        ("BEGIN LOOP LOOP | END LOOP; END LOOP; END;", &["IF", "NULL", "EXIT"]),
+        ("BEGIN CASE WHEN a THEN IF b THEN | END IF; END CASE; END;", &["IF", "NULL", "ELSIF"]),
+        // ---- assignment / expressions / call arguments ----
+        ("BEGIN x := | END;", &["NULL", "CASE", "TRUE", "FALSE"]),
+        ("BEGIN x := a + | END;", &["NULL", "CASE"]),
+        ("BEGIN x := func(|) END;", &["NULL", "CASE", "TRUE", "FALSE"]),
+        ("BEGIN dbms_output.put_line(a, |); END;", &["NULL", "CASE", "TRUE", "FALSE"]),
+        ("BEGIN proc(p => |); END;", &["NULL", "CASE"]),
+        // ---- dynamic SQL ----
+        ("BEGIN EXECUTE IMMEDIATE | END;", &["NULL", "CASE", "TRUE", "FALSE"]),
+        // ---- embedded DML ----
+        ("BEGIN SELECT | INTO v FROM emp; END;", &["EMPNO", "ENAME"]),
+        ("BEGIN SELECT empno INTO v FROM | END;", &["EMP", "DEPT"]),
+        ("BEGIN UPDATE emp SET | END;", &["EMPNO", "ENAME"]),
+        ("BEGIN DELETE FROM | END;", &["EMP", "DEPT"]),
+        // ---- RETURN / RAISE / EXCEPTION ----
+        ("CREATE FUNCTION f RETURN NUMBER IS BEGIN RETURN | END;", &["NULL", "CASE"]),
+        ("BEGIN RAISE | END;", &["NO_DATA_FOUND", "TOO_MANY_ROWS"]),
+        ("BEGIN NULL; EXCEPTION WHEN | THEN NULL; END;", &["NO_DATA_FOUND", "OTHERS"]),
+        ("BEGIN NULL; EXCEPTION WHEN NO_DATA_FOUND THEN | END;", &["IF", "NULL", "RAISE", "WHEN"]),
+        // ---- routine headers with body ----
+        ("CREATE PROCEDURE p IS BEGIN | END;", &["IF", "NULL", "RETURN"]),
+        ("CREATE OR REPLACE PROCEDURE p AS BEGIN | END;", &["IF", "NULL"]),
+    ];
+
+    for (sql, must_offer_any) in cases {
+        let suggestions = query_keyword_completion_suggestions(sql, Oracle);
+        if suggestions.is_empty() {
+            failures.push(format!("EMPTY suggestions at `{sql}`"));
+            continue;
+        }
+        if !must_offer_any.iter().any(|keyword| has(&suggestions, keyword)) {
+            failures.push(format!(
+                "none of {must_offer_any:?} offered at `{sql}`: {suggestions:?}"
+            ));
+        }
+    }
+
+    // Cursor-name slots (`OPEN|FETCH|CLOSE <cur>`) resolve declared cursors through
+    // the local-symbol path, so a declared cursor must surface there.
+    for (script, verb) in [
+        ("DECLARE CURSOR emp_cur IS SELECT * FROM emp;\nBEGIN\n    OPEN __CODEX_CURSOR__\nEND;", "OPEN"),
+        ("DECLARE CURSOR emp_cur IS SELECT * FROM emp;\nBEGIN\n    FETCH __CODEX_CURSOR__\nEND;", "FETCH"),
+        ("DECLARE CURSOR emp_cur IS SELECT * FROM emp;\nBEGIN\n    CLOSE __CODEX_CURSOR__\nEND;", "CLOSE"),
+    ] {
+        let locals = SqlEditorWidget::collect_local_symbol_suggestions_for_test(script, &[]);
+        if !has(&locals, "emp_cur") {
+            failures.push(format!(
+                "declared cursor `emp_cur` not offered at `{verb} |`: {locals:?}"
+            ));
+        }
+    }
+
+    assert!(failures.is_empty(), "PL/SQL suggestion gaps:\n{}", failures.join("\n"));
+}
+
