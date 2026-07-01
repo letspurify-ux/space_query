@@ -3061,6 +3061,40 @@ fn audit_final_suggestions_impl(
     };
     let replace_table_context_with_expected_objects =
         qualifier.is_none() && expected_object_kind.is_some();
+    // Mirrors the same `at_keyword_only_identifier_slot` gate in
+    // `apply_intellisense_with_context` (completion.rs), including the PL/SQL
+    // GOTO/EXIT-CONTINUE-label and named-object `END` exceptions to the
+    // bare-calls allowance — kept in sync by hand since this harness
+    // reimplements the production merge for test isolation.
+    let at_plsql_keyword_only_identifier_slot_with_bare_call_exception = at_keyword_only
+        && !at_data_type
+        && !at_dedicated_column_slot
+        && !(SqlEditorWidget::plsql_statement_start_allows_bare_calls(expr_keyword_ctx)
+            && !SqlEditorWidget::cursor_is_at_plsql_goto_label_slot_for_context(
+                &ctx,
+                trigger_has_identifier,
+                Some(db),
+            )
+            && !SqlEditorWidget::cursor_is_at_plsql_exit_continue_label_slot_for_context(
+                &ctx,
+                trigger_has_identifier,
+                Some(db),
+            )
+            && !SqlEditorWidget::cursor_is_at_plsql_named_end_target_slot_for_context(
+                &ctx,
+                trigger_has_identifier,
+                Some(db),
+            )
+            && !SqlEditorWidget::cursor_is_at_plsql_label_definition_slot_for_context(
+                &ctx,
+                trigger_has_identifier,
+                Some(db),
+            ))
+        && !expr_keyword_ctx.at_plsql_value_operand
+        && !(expr_keyword_ctx.in_plsql_value_expression
+            && expr_keyword_ctx.statement_start.is_none()
+            && expr_keyword_ctx.follows_operand == Some(true)
+            && !expr_keyword_ctx.at_exception_name);
     let suggestions = if !qualified_member_suggestions.is_empty() {
         qualified_member_suggestions
     } else if at_data_type {
@@ -3105,23 +3139,7 @@ fn audit_final_suggestions_impl(
             trigger_has_identifier,
             Some(db),
         )
-        || ((at_keyword_only && !at_data_type && !at_dedicated_column_slot)
-            && !(SqlEditorWidget::plsql_statement_start_allows_bare_calls(expr_keyword_ctx)
-                && !SqlEditorWidget::cursor_is_at_plsql_goto_label_slot_for_context(
-                    &ctx,
-                    trigger_has_identifier,
-                    Some(db),
-                )
-                && !SqlEditorWidget::cursor_is_at_plsql_label_definition_slot_for_context(
-                    &ctx,
-                    trigger_has_identifier,
-                    Some(db),
-                ))
-            && !expr_keyword_ctx.at_plsql_value_operand
-            && !(expr_keyword_ctx.in_plsql_value_expression
-                && expr_keyword_ctx.statement_start.is_none()
-                && expr_keyword_ctx.follows_operand == Some(true)
-                && !expr_keyword_ctx.at_exception_name))
+        || at_plsql_keyword_only_identifier_slot_with_bare_call_exception
         || !source_allowance.base_catalog_suggestions
     {
         Vec::new()
@@ -75569,6 +75587,22 @@ fn plsql_constructs_always_offer_suggestions() {
         ("BEGIN PIPE ROW(|); END;", &["NULL", "CASE"]),
         ("BEGIN INSERT INTO emp VALUES (|); END;", &["NULL", "CASE"]),
         ("BEGIN UPDATE emp SET sal = | WHERE empno = 1; END;", &["NULL", "CASE"]),
+        // ---- constructs nested inside ELSIF/ELSE branches specifically (as
+        // opposed to the leading THEN branch) — regression coverage for the
+        // "past-THEN IF body" heuristic that used to key off the wrong IF
+        // occurrence and swallow a nested construct's own condition slot ----
+        ("BEGIN IF a THEN NULL; ELSIF b THEN WHILE | LOOP NULL; END LOOP; END IF; END;", &["NULL", "CASE", "TRUE", "FALSE"]),
+        ("BEGIN IF a THEN NULL; ELSE WHILE | LOOP NULL; END LOOP; END IF; END;", &["NULL", "CASE", "TRUE", "FALSE"]),
+        ("BEGIN IF a THEN NULL; ELSIF b THEN FOR i IN | .. 10 LOOP NULL; END LOOP; END IF; END;", &["NULL", "CASE", "TRUE", "FALSE"]),
+        // ---- doubly-nested IF/WHILE and CASE-value-as-operand inside a nested
+        // CASE statement's WHEN condition ----
+        ("BEGIN IF a THEN IF b THEN WHILE | LOOP NULL; END LOOP; END IF; END IF; END;", &["NULL", "CASE", "TRUE", "FALSE"]),
+        ("BEGIN IF a THEN CASE WHEN v = (CASE WHEN | THEN 1 ELSE 2 END) THEN NULL; END CASE; END IF; END;", &["NULL", "CASE", "TRUE", "FALSE"]),
+        // ---- nested DECLARE/BEGIN sub-block and FORALL/labelled LOOP inside an
+        // IF THEN body ----
+        ("BEGIN IF a THEN DECLARE x NUMBER; BEGIN | END; END IF; END;", &["IF", "NULL", "DECLARE"]),
+        ("BEGIN IF a THEN FORALL i IN 1 .. 10 | ; END IF; END;", &["INSERT", "UPDATE", "DELETE"]),
+        ("BEGIN IF a THEN <<lbl>> LOOP | END LOOP lbl; END IF; END;", &["IF", "NULL", "EXIT"]),
     ];
 
     for (sql, must_offer_any) in cases {
@@ -75602,7 +75636,239 @@ fn plsql_constructs_always_offer_suggestions() {
     assert!(failures.is_empty(), "PL/SQL suggestion gaps:\n{}", failures.join("\n"));
 }
 
+#[test]
+fn plsql_nested_construct_combinations_never_offer_empty_suggestions() {
+    // Combinatorial stress test: every statement-body wrapper (BEGIN/IF/CASE/
+    // LOOP/WHILE/FOR, with and without a preceding sibling statement) nested
+    // inside every other wrapper, up to depth 3, must still offer *some*
+    // statement-start keyword at the innermost cursor slot. Depth-blind
+    // `contains()` scans over the token stream (the recurring bug class in
+    // this file's history) tend to get confused only once real nesting
+    // exists, so a flat hand-picked list under-tests this; a full cross
+    // product exercises orderings a human wouldn't think to write by hand.
+    use crate::db::DatabaseType::Oracle;
 
+    struct Wrapper {
+        name: &'static str,
+        // `{}` is the inner statement-start slot.
+        template: &'static str,
+    }
+
+    let wrappers: &[Wrapper] = &[
+        Wrapper { name: "BEGIN", template: "BEGIN {} END;" },
+        Wrapper { name: "BEGIN_AFTER_NULL", template: "BEGIN NULL; {} END;" },
+        Wrapper { name: "IF_THEN", template: "IF v = 1 THEN {} END IF;" },
+        Wrapper { name: "IF_ELSIF", template: "IF v = 1 THEN NULL; ELSIF v = 2 THEN {} END IF;" },
+        Wrapper { name: "IF_ELSE", template: "IF v = 1 THEN NULL; ELSE {} END IF;" },
+        Wrapper { name: "CASE_WHEN", template: "CASE WHEN v = 1 THEN {} END CASE;" },
+        Wrapper { name: "CASE_ELSE", template: "CASE WHEN v = 1 THEN NULL; ELSE {} END CASE;" },
+        Wrapper { name: "LOOP", template: "LOOP {} END LOOP;" },
+        Wrapper { name: "LOOP_AFTER_NULL", template: "LOOP NULL; {} END LOOP;" },
+        Wrapper { name: "WHILE", template: "WHILE v < 10 LOOP {} END LOOP;" },
+        Wrapper { name: "FOR_RANGE", template: "FOR i IN 1 .. 10 LOOP {} END LOOP;" },
+        Wrapper {
+            name: "BEGIN_EXCEPTION",
+            template: "BEGIN {} EXCEPTION WHEN OTHERS THEN NULL; END;",
+        },
+    ];
+
+    let statement_keywords = ["IF", "NULL", "CASE", "LOOP", "RETURN", "EXIT", "FOR", "WHILE"];
+    let has_any = |suggestions: &[String], keywords: &[&str]| {
+        keywords
+            .iter()
+            .any(|keyword| suggestions.iter().any(|s| s.eq_ignore_ascii_case(keyword)))
+    };
+
+    let wrap = |names: &[&str]| -> String {
+        let mut body = "|".to_string();
+        for name in names.iter().rev() {
+            let wrapper = wrappers.iter().find(|w| &w.name == name).unwrap();
+            body = wrapper.template.replace("{}", &body);
+        }
+        format!("BEGIN {body} END;")
+    };
+
+    let mut failures = Vec::new();
+    let mut tested = 0usize;
+
+    // Depth 1: every wrapper alone.
+    for w in wrappers {
+        let sql = wrap(&[w.name]);
+        tested += 1;
+        let suggestions = query_keyword_completion_suggestions(&sql, Oracle);
+        if suggestions.is_empty() {
+            failures.push(format!("EMPTY at depth 1 [{}]: `{sql}`", w.name));
+        } else if !has_any(&suggestions, &statement_keywords) {
+            failures.push(format!(
+                "no statement keyword at depth 1 [{}]: `{sql}` -> {suggestions:?}",
+                w.name
+            ));
+        }
+    }
+
+    // Depth 2: every ordered pair (outer, inner).
+    for outer in wrappers {
+        for inner in wrappers {
+            let sql = wrap(&[outer.name, inner.name]);
+            tested += 1;
+            let suggestions = query_keyword_completion_suggestions(&sql, Oracle);
+            if suggestions.is_empty() {
+                failures.push(format!(
+                    "EMPTY at depth 2 [{}>{}]: `{sql}`",
+                    outer.name, inner.name
+                ));
+            } else if !has_any(&suggestions, &statement_keywords) {
+                failures.push(format!(
+                    "no statement keyword at depth 2 [{}>{}]: `{sql}` -> {suggestions:?}",
+                    outer.name, inner.name
+                ));
+            }
+        }
+    }
+
+    // Depth 3: sample every wrapper as the innermost and outermost layer,
+    // cycling the middle layer through the full wrapper set so every
+    // wrapper is exercised as outer/middle/inner at least once each.
+    for (i, outer) in wrappers.iter().enumerate() {
+        for (j, middle) in wrappers.iter().enumerate() {
+            let inner = &wrappers[(i + j + 1) % wrappers.len()];
+            let sql = wrap(&[outer.name, middle.name, inner.name]);
+            tested += 1;
+            let suggestions = query_keyword_completion_suggestions(&sql, Oracle);
+            if suggestions.is_empty() {
+                failures.push(format!(
+                    "EMPTY at depth 3 [{}>{}>{}]: `{sql}`",
+                    outer.name, middle.name, inner.name
+                ));
+            } else if !has_any(&suggestions, &statement_keywords) {
+                failures.push(format!(
+                    "no statement keyword at depth 3 [{}>{}>{}]: `{sql}` -> {suggestions:?}",
+                    outer.name, middle.name, inner.name
+                ));
+            }
+        }
+    }
+
+    assert!(tested > 150, "expected a large combinatorial sweep, only ran {tested}");
+    assert!(
+        failures.is_empty(),
+        "nested PL/SQL suggestion gaps ({} cases tested):\n{}",
+        tested,
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn plsql_nested_construct_condition_slots_never_offer_empty_suggestions() {
+    // Same idea as `plsql_nested_construct_combinations_never_offer_empty_suggestions`
+    // but the cursor sits in the *condition/expression* slot (IF/WHILE condition,
+    // CASE selector/WHEN condition, FOR loop range) rather than a statement body,
+    // nested inside every other statement-body wrapper.
+    use crate::db::DatabaseType::Oracle;
+
+    struct BodyWrapper {
+        name: &'static str,
+        template: &'static str,
+    }
+    let body_wrappers: &[BodyWrapper] = &[
+        BodyWrapper { name: "BEGIN", template: "BEGIN {} END;" },
+        BodyWrapper { name: "IF_THEN", template: "IF v = 1 THEN {} END IF;" },
+        BodyWrapper { name: "CASE_WHEN", template: "CASE WHEN v = 1 THEN {} END CASE;" },
+        BodyWrapper { name: "LOOP", template: "LOOP {} END LOOP;" },
+        BodyWrapper { name: "WHILE", template: "WHILE v < 10 LOOP {} END LOOP;" },
+        BodyWrapper { name: "FOR_RANGE", template: "FOR i IN 1 .. 10 LOOP {} END LOOP;" },
+    ];
+
+    // Each condition slot as a standalone statement (cursor marked with `|`).
+    let condition_slots: &[(&str, &str)] = &[
+        ("IF_COND", "IF | THEN NULL; END IF;"),
+        ("IF_ELSIF_COND", "IF v = 1 THEN NULL; ELSIF | THEN NULL; END IF;"),
+        ("WHILE_COND", "WHILE | LOOP NULL; END LOOP;"),
+        ("CASE_SELECTOR", "CASE | WHEN 1 THEN NULL; END CASE;"),
+        ("CASE_WHEN_COND", "CASE WHEN | THEN NULL; END CASE;"),
+        ("FOR_RANGE_LOW", "FOR i IN | .. 10 LOOP NULL; END LOOP;"),
+        ("FOR_RANGE_HIGH", "FOR i IN 1 .. | LOOP NULL; END LOOP;"),
+        ("EXIT_WHEN_COND", "LOOP EXIT WHEN | ; END LOOP;"),
+    ];
+
+    let expression_keywords = ["NULL", "CASE", "TRUE", "FALSE"];
+    let has_any = |suggestions: &[String], keywords: &[&str]| {
+        keywords
+            .iter()
+            .any(|keyword| suggestions.iter().any(|s| s.eq_ignore_ascii_case(keyword)))
+    };
+
+    let mut failures = Vec::new();
+    let mut tested = 0usize;
+
+    for outer in body_wrappers {
+        for (slot_name, slot_sql) in condition_slots {
+            let sql = format!("BEGIN {} END;", outer.template.replace("{}", slot_sql));
+            tested += 1;
+            let suggestions = query_keyword_completion_suggestions(&sql, Oracle);
+            // `CASE selector | WHEN ...` is a deliberately ambiguous grammar
+            // slot (it precedes a literal `WHEN`, so it could be either a
+            // simple-CASE selector expression or a searched-CASE about to
+            // type `WHEN` directly) — by design only `WHEN` is guaranteed
+            // there, regardless of nesting (see `plsql_constructs_always_offer_suggestions`).
+            let expected: &[&str] = if *slot_name == "CASE_SELECTOR" {
+                &["WHEN"]
+            } else {
+                &expression_keywords
+            };
+            if suggestions.is_empty() {
+                failures.push(format!(
+                    "EMPTY at [{}>{}]: `{sql}`",
+                    outer.name, slot_name
+                ));
+            } else if !has_any(&suggestions, expected) {
+                failures.push(format!(
+                    "none of {expected:?} offered at [{}>{}]: `{sql}` -> {suggestions:?}",
+                    outer.name, slot_name
+                ));
+            }
+        }
+    }
+
+    // Depth 3: two layers of statement-body wrapper around each condition
+    // slot, so a bug that only surfaces two levels down (like the IF-body
+    // "past THEN" heuristic that used to swallow a nested WHILE/FOR/CASE
+    // condition) is caught even when it takes an extra layer to reach.
+    for outer1 in body_wrappers {
+        for outer2 in body_wrappers {
+            for (slot_name, slot_sql) in condition_slots {
+                let nested = outer2.template.replace("{}", slot_sql);
+                let sql = format!("BEGIN {} END;", outer1.template.replace("{}", &nested));
+                tested += 1;
+                let suggestions = query_keyword_completion_suggestions(&sql, Oracle);
+                let expected: &[&str] = if *slot_name == "CASE_SELECTOR" {
+                    &["WHEN"]
+                } else {
+                    &expression_keywords
+                };
+                if suggestions.is_empty() {
+                    failures.push(format!(
+                        "EMPTY at [{}>{}>{}]: `{sql}`",
+                        outer1.name, outer2.name, slot_name
+                    ));
+                } else if !has_any(&suggestions, expected) {
+                    failures.push(format!(
+                        "none of {expected:?} offered at [{}>{}>{}]: `{sql}` -> {suggestions:?}",
+                        outer1.name, outer2.name, slot_name
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(tested > 30, "expected a large combinatorial sweep, only ran {tested}");
+    assert!(
+        failures.is_empty(),
+        "nested PL/SQL condition-slot suggestion gaps ({} cases tested):\n{}",
+        tested,
+        failures.join("\n")
+    );
+}
 
 #[test]
 fn plsql_goto_offers_block_labels() {
@@ -77042,4 +77308,325 @@ fn create_statement_keyword_matrix_offers_expected_keywords_across_dialects() {
         "CREATE statement keyword suggestion gaps:\n{}",
         failures.join("\n")
     );
+}
+
+/// Bulk matrix: a variable declared through every scalar-precision, modifier,
+/// `%TYPE`/`%ROWTYPE`, subtype, collection, record, and cursor form must be
+/// recognized as a local symbol later in the block, alongside routine
+/// parameters (every mode + `DEFAULT`/`NOCOPY`), FOR-loop index/cursor
+/// records, SQL*Plus `VAR`/`VARIABLE` binds, and package-spec globals seen
+/// from the body — every declaration "shape" this editor's local-symbol
+/// parser is expected to understand.
+#[test]
+fn plsql_variable_declaration_forms_bulk_matrix_are_recognized_as_locals() {
+    let has = |s: &[String], want: &str| s.iter().any(|x| x.eq_ignore_ascii_case(want));
+    let mut failures = Vec::new();
+
+    let decls = "DECLARE \
+        v01 NUMBER; \
+        v02 NUMBER(10); \
+        v03 NUMBER(10,2); \
+        v04 VARCHAR2(100); \
+        v05 VARCHAR2(100 CHAR); \
+        v06 VARCHAR2(100 BYTE); \
+        v07 CHAR(1); \
+        v08 NCHAR(1); \
+        v09 NVARCHAR2(50); \
+        v10 DATE; \
+        v11 TIMESTAMP; \
+        v12 TIMESTAMP(6); \
+        v13 TIMESTAMP WITH TIME ZONE; \
+        v14 TIMESTAMP WITH LOCAL TIME ZONE; \
+        v15 BOOLEAN; \
+        v16 PLS_INTEGER; \
+        v17 BINARY_INTEGER; \
+        v18 SIMPLE_INTEGER; \
+        v19 CLOB; \
+        v20 BLOB; \
+        v21 RAW(100); \
+        v22 LONG; \
+        v23 XMLTYPE; \
+        v24 CONSTANT NUMBER := 1; \
+        v25 NUMBER DEFAULT 0; \
+        v26 NUMBER NOT NULL := 0; \
+        v27 emp.empno%TYPE; \
+        v28 v01%TYPE; \
+        SUBTYPE my_num IS NUMBER(5); \
+        v29 my_num; \
+        TYPE num_tab IS TABLE OF NUMBER INDEX BY PLS_INTEGER; \
+        v30 num_tab; \
+        TYPE num_varray IS VARRAY(10) OF NUMBER; \
+        v31 num_varray; \
+        TYPE emp_rec_t IS RECORD (id NUMBER, nm VARCHAR2(10)); \
+        v32 emp_rec_t; \
+        v33 SYS_REFCURSOR; \
+        e01 EXCEPTION; \
+        CURSOR emp_cur IS SELECT * FROM emp; \
+        v34 emp%ROWTYPE; \
+        v35 emp_cur%ROWTYPE;";
+
+    let all_vars = [
+        "v01","v02","v03","v04","v05","v06","v07","v08","v09","v10",
+        "v11","v12","v13","v14","v15","v16","v17","v18","v19","v20",
+        "v21","v22","v23","v24","v25","v26","v27","v28","v29","v30",
+        "v31","v32","v33","v34","v35","e01","emp_cur",
+    ];
+
+    let sql = format!("{decls} BEGIN x := __CODEX_CURSOR__ ; END;");
+    let s = SqlEditorWidget::collect_local_symbol_suggestions_for_test(&sql, &[]);
+    for var in all_vars {
+        if !has(&s, var) {
+            failures.push(format!("declared local `{var}` not recognized: {s:?}"));
+        }
+    }
+
+    // Parameter modes + defaults + NOCOPY.
+    let params_sql = "CREATE PROCEDURE p(\
+        p1 IN NUMBER, \
+        p2 OUT VARCHAR2, \
+        p3 IN OUT NUMBER, \
+        p4 IN NUMBER DEFAULT 0, \
+        p5 IN OUT NOCOPY VARCHAR2, \
+        p6 NUMBER := 1) \
+        IS BEGIN x := __CODEX_CURSOR__ ; END;";
+    let s = SqlEditorWidget::collect_local_symbol_suggestions_for_test(params_sql, &[]);
+    for p in ["p1", "p2", "p3", "p4", "p5", "p6"] {
+        if !has(&s, p) {
+            failures.push(format!("routine parameter `{p}` not recognized: {s:?}"));
+        }
+    }
+
+    // Cursor FOR loop implicit record.
+    let for_loop_sql =
+        "BEGIN FOR r IN (SELECT empno, ename FROM emp) LOOP x := __CODEX_CURSOR__ ; END LOOP; END;";
+    let s = SqlEditorWidget::collect_local_symbol_suggestions_for_test(for_loop_sql, &[]);
+    if !has(&s, "r") {
+        failures.push(format!("cursor FOR-loop record `r` not recognized: {s:?}"));
+    }
+
+    // Named-cursor FOR loop.
+    let named_cursor_for_loop_sql = "DECLARE CURSOR c IS SELECT empno FROM emp; \
+        BEGIN FOR r IN c LOOP x := __CODEX_CURSOR__ ; END LOOP; END;";
+    let s =
+        SqlEditorWidget::collect_local_symbol_suggestions_for_test(named_cursor_for_loop_sql, &[]);
+    if !has(&s, "r") {
+        failures.push(format!("named-cursor FOR-loop record `r` not recognized: {s:?}"));
+    }
+
+    // SQL*Plus `VAR`/`VARIABLE` bind declarations.
+    let var_sql = "VAR v_bind NUMBER;\nBEGIN\n :v_bind := __CODEX_CURSOR__ ;\nEND;";
+    let s = SqlEditorWidget::collect_local_symbol_suggestions_for_test(var_sql, &[]);
+    if !has(&s, "v_bind") {
+        failures.push(format!("`VAR` bind `v_bind` not recognized: {s:?}"));
+    }
+
+    let variable_sql = "VARIABLE v_bind2 VARCHAR2(10)\nBEGIN\n :v_bind2 := __CODEX_CURSOR__ ;\nEND;";
+    let s = SqlEditorWidget::collect_local_symbol_suggestions_for_test(variable_sql, &[]);
+    if !has(&s, "v_bind2") {
+        failures.push(format!("`VARIABLE` bind `v_bind2` not recognized: {s:?}"));
+    }
+
+    // Package-spec variable visible from the package body.
+    let pkg_sql = "CREATE PACKAGE pkg IS g_num NUMBER; END pkg; / \
+        CREATE PACKAGE BODY pkg IS PROCEDURE p IS BEGIN x := __CODEX_CURSOR__ ; END; END pkg;";
+    let s = SqlEditorWidget::collect_local_symbol_suggestions_for_test(pkg_sql, &[]);
+    if !has(&s, "g_num") {
+        failures.push(format!("package-spec global `g_num` not recognized in body: {s:?}"));
+    }
+
+    assert!(
+        failures.is_empty(),
+        "PL/SQL declaration-recognition gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// Bulk matrix: every canonical Oracle PL/SQL scalar/subtype name must be
+/// offered at every declaration-shaped type slot (variable, parameter,
+/// function return, collection element, record field, subtype target) — not
+/// just a hand-picked subset.
+#[test]
+fn plsql_declaration_type_slot_bulk_matrix_offers_all_known_types() {
+    use crate::db::DatabaseType::Oracle;
+    let canonical_types = [
+        "NUMBER", "VARCHAR2", "NVARCHAR2", "CHAR", "NCHAR", "DATE", "TIMESTAMP",
+        "INTERVAL", "CLOB", "NCLOB", "BLOB", "BFILE", "RAW", "LONG", "ROWID",
+        "UROWID", "XMLTYPE", "BOOLEAN", "INTEGER", "INT", "SMALLINT", "DECIMAL",
+        "NUMERIC", "REAL", "BINARY_FLOAT", "BINARY_DOUBLE", "PLS_INTEGER",
+        "BINARY_INTEGER", "SIMPLE_INTEGER", "SYS_REFCURSOR",
+        "NATURAL", "NATURALN", "POSITIVE", "POSITIVEN", "SIGNTYPE",
+    ];
+    let positions: &[(&str, &str)] = &[
+        ("var decl", "DECLARE v __CODEX_CURSOR__ BEGIN NULL; END;"),
+        ("param IN", "CREATE PROCEDURE p(x IN __CODEX_CURSOR__) IS BEGIN NULL; END;"),
+        ("function return", "CREATE FUNCTION f RETURN __CODEX_CURSOR__ IS BEGIN RETURN 1; END;"),
+        ("collection element", "DECLARE TYPE t IS TABLE OF __CODEX_CURSOR__ ; BEGIN NULL; END;"),
+        ("record field", "DECLARE TYPE r IS RECORD (f __CODEX_CURSOR__); BEGIN NULL; END;"),
+        ("subtype target", "DECLARE SUBTYPE s IS __CODEX_CURSOR__ ; BEGIN NULL; END;"),
+    ];
+
+    let mut failures = Vec::new();
+    for (label, sql) in positions {
+        let ctx = analyze_inline_cursor_sql(&sql.replace("__CODEX_CURSOR__", "|"));
+        let s = SqlEditorWidget::collect_expected_keyword_suggestions("", &ctx, Some(Oracle));
+        for t in canonical_types {
+            if !s.iter().any(|x| x.eq_ignore_ascii_case(t)) {
+                failures.push(format!("`{t}` missing at [{label}]: {s:?}"));
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "PL/SQL declaration type-slot gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn plsql_create_or_replace_editionable_offers_object_types() {
+    use crate::db::DatabaseType::Oracle;
+    let has = |s: &[String], k: &str| s.iter().any(|x| x.eq_ignore_ascii_case(k));
+    let mut failures = Vec::new();
+    for sql in [
+        "CREATE OR REPLACE NONEDITIONABLE |",
+        "CREATE OR REPLACE EDITIONABLE |",
+        "CREATE NONEDITIONABLE |",
+        "CREATE EDITIONABLE |",
+    ] {
+        let s = query_keyword_completion_suggestions(sql, Oracle);
+        for kw in ["PACKAGE", "PROCEDURE", "FUNCTION", "TYPE", "TRIGGER", "VIEW"] {
+            if !has(&s, kw) {
+                failures.push(format!("`{kw}` missing at `{sql}`: {s:?}"));
+            }
+        }
+    }
+    for sql in ["CREATE |", "CREATE OR REPLACE |"] {
+        let s = query_keyword_completion_suggestions(sql, Oracle);
+        for kw in ["EDITIONABLE", "NONEDITIONABLE"] {
+            if !has(&s, kw) {
+                failures.push(format!("`{kw}` missing at `{sql}`: {s:?}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "EDITIONABLE/NONEDITIONABLE gaps:\n{}", failures.join("\n"));
+}
+
+#[test]
+fn plsql_local_type_declaration_offers_ref_cursor_and_kinds() {
+    use crate::db::DatabaseType::Oracle;
+    let has = |s: &[String], k: &str| s.iter().any(|x| x.eq_ignore_ascii_case(k));
+    let mut failures = Vec::new();
+
+    let s = query_keyword_completion_suggestions(
+        "DECLARE TYPE t_rc IS | BEGIN NULL; END;", Oracle);
+    for kw in ["RECORD", "TABLE OF", "VARRAY", "REF CURSOR"] {
+        if !has(&s, kw) {
+            failures.push(format!("`{kw}` missing at local `TYPE t IS |`: {s:?}"));
+        }
+    }
+
+    let s = query_keyword_completion_suggestions(
+        "DECLARE TYPE t_rc IS REF | BEGIN NULL; END;", Oracle);
+    if !has(&s, "CURSOR") {
+        failures.push(format!("`CURSOR` missing at `TYPE t IS REF |`: {s:?}"));
+    }
+
+    let s = query_keyword_completion_suggestions(
+        "CREATE PACKAGE pkg IS TYPE t_rc IS | END pkg;", Oracle);
+    for kw in ["RECORD", "TABLE OF", "VARRAY", "REF CURSOR"] {
+        if !has(&s, kw) {
+            failures.push(format!("`{kw}` missing at package-spec `TYPE t IS |`: {s:?}"));
+        }
+    }
+
+    assert!(failures.is_empty(), "local TYPE spec-kind gaps:\n{}", failures.join("\n"));
+}
+
+#[test]
+fn plsql_open_cursor_for_dynamic_sql_offers_using() {
+    use crate::db::DatabaseType::Oracle;
+    let has = |s: &[String], k: &str| s.iter().any(|x| x.eq_ignore_ascii_case(k));
+
+    let s = query_keyword_completion_suggestions(
+        "DECLARE v_sql VARCHAR2(100); p_rc SYS_REFCURSOR; \
+         BEGIN OPEN p_rc FOR v_sql |; END;", Oracle);
+    assert!(has(&s, "USING"), "USING missing at `OPEN cur FOR dynamic_sql |`: {s:?}");
+
+    // A static embedded query must not offer USING there.
+    let s = query_keyword_completion_suggestions(
+        "DECLARE p_rc SYS_REFCURSOR; BEGIN OPEN p_rc FOR SELECT * FROM emp |; END;", Oracle);
+    assert!(!has(&s, "USING"), "USING wrongly offered after a static query: {s:?}");
+}
+
+#[test]
+fn plsql_for_loop_range_qualified_bound_offers_loop() {
+    use crate::db::DatabaseType::Oracle;
+    let has = |s: &[String], k: &str| s.iter().any(|x| x.eq_ignore_ascii_case(k));
+    let mut failures = Vec::new();
+    for sql in [
+        "DECLARE t some_tab; BEGIN FOR i IN 1..t.COUNT | NULL; END LOOP; END;",
+        "DECLARE t some_tab; BEGIN FOR i IN 1..t.COUNT() | NULL; END LOOP; END;",
+        "BEGIN FOR i IN 1..10 | NULL; END LOOP; END;",
+    ] {
+        let s = query_keyword_completion_suggestions(sql, Oracle);
+        if !has(&s, "LOOP") {
+            failures.push(format!("LOOP missing at `{sql}`: {s:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "FOR-range LOOP gaps:\n{}", failures.join("\n"));
+}
+
+#[test]
+fn plsql_raise_application_error_is_suggested_as_statement() {
+    use crate::db::DatabaseType::Oracle;
+    let s = query_keyword_completion_suggestions("BEGIN raise_appl| ; END;", Oracle);
+    assert_eq!(s, vec!["RAISE_APPLICATION_ERROR".to_string()]);
+    let s = query_keyword_completion_suggestions("BEGIN | ; END;", Oracle);
+    assert!(
+        s.iter().any(|x| x.eq_ignore_ascii_case("RAISE_APPLICATION_ERROR")),
+        "RAISE_APPLICATION_ERROR missing at a bare statement start: {s:?}"
+    );
+}
+
+#[test]
+fn plsql_exit_continue_offer_enclosing_loop_label() {
+    let has = |s: &[String], k: &str| s.iter().any(|x| x.eq_ignore_ascii_case(k));
+    let s = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+        "BEGIN <<outer_loop>> FOR k IN 1..3 LOOP EXIT __CODEX_CURSOR__; END LOOP; END;", &[]);
+    assert!(has(&s, "outer_loop"), "label missing at `EXIT |`: {s:?}");
+    let s = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+        "BEGIN <<outer_loop>> FOR k IN 1..3 LOOP CONTINUE __CODEX_CURSOR__; END LOOP; END;", &[]);
+    assert!(has(&s, "outer_loop"), "label missing at `CONTINUE |`: {s:?}");
+}
+
+#[test]
+fn plsql_named_object_end_offers_enclosing_name() {
+    let has = |s: &[String], k: &str| s.iter().any(|x| x.eq_ignore_ascii_case(k));
+    let mut failures = Vec::new();
+
+    for (label, sql, expected_name) in [
+        ("package body", "CREATE PACKAGE BODY oqt_deep_pkg IS PROCEDURE p IS BEGIN NULL; END; END __CODEX_CURSOR__;", Some("oqt_deep_pkg")),
+        ("package spec", "CREATE PACKAGE oqt_deep_pkg IS PROCEDURE p; END __CODEX_CURSOR__;", Some("oqt_deep_pkg")),
+        ("procedure", "CREATE PROCEDURE p_deep IS BEGIN NULL; END __CODEX_CURSOR__;", Some("p_deep")),
+        ("function", "CREATE FUNCTION f_deep RETURN NUMBER IS BEGIN RETURN 1; END __CODEX_CURSOR__;", Some("f_deep")),
+        ("type body", "CREATE TYPE BODY ty_deep IS MEMBER PROCEDURE p IS BEGIN NULL; END; END __CODEX_CURSOR__;", Some("ty_deep")),
+        ("nested local procedure", "CREATE PACKAGE BODY oqt_deep_pkg IS PROCEDURE inner_p IS BEGIN NULL; END __CODEX_CURSOR__; END oqt_deep_pkg;", Some("inner_p")),
+        ("inner IF must not leak the package name", "CREATE PACKAGE BODY oqt_deep_pkg IS PROCEDURE p IS BEGIN IF 1=1 THEN NULL; END __CODEX_CURSOR__; END; END oqt_deep_pkg;", None),
+        ("trigger has no named END", "CREATE TRIGGER trg BEFORE INSERT ON t FOR EACH ROW BEGIN NULL; END __CODEX_CURSOR__;", None),
+        ("anonymous block has no named END", "BEGIN NULL; END __CODEX_CURSOR__;", None),
+    ] {
+        let s = SqlEditorWidget::collect_local_symbol_suggestions_for_test(sql, &[]);
+        match expected_name {
+            Some(name) if !has(&s, name) => {
+                failures.push(format!("[{label}] `{name}` missing: {s:?}"))
+            }
+            None if !s.is_empty() => {
+                failures.push(format!("[{label}] unexpected name suggestion: {s:?}"))
+            }
+            _ => {}
+        }
+    }
+
+    assert!(failures.is_empty(), "named END-target gaps:\n{}", failures.join("\n"));
 }

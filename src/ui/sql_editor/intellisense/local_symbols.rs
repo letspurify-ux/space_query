@@ -469,6 +469,24 @@ impl SqlEditorWidget {
         ) {
             return Self::plsql_block_label_suggestions(analysis.context.as_ref(), prefix);
         }
+        // `EXIT |` / `CONTINUE |` name the enclosing loop label to leave/skip —
+        // also a block label, never a value symbol.
+        if Self::cursor_is_at_plsql_exit_continue_label_slot_for_context(
+            analysis.context.as_ref(),
+            !prefix.is_empty(),
+            None,
+        ) {
+            return Self::plsql_block_label_suggestions(analysis.context.as_ref(), prefix);
+        }
+        // The closing `END |` of a named `PACKAGE`/`PROCEDURE`/`FUNCTION`/`TYPE
+        // BODY` may repeat that object's own name — not a value symbol either.
+        if Self::cursor_is_at_plsql_named_end_target_slot_for_context(
+            analysis.context.as_ref(),
+            !prefix.is_empty(),
+            None,
+        ) {
+            return Self::plsql_named_end_target_suggestions(analysis.context.as_ref(), prefix);
+        }
         // A `RAISE |`/`EXCEPTION WHEN |` name is an exception. Exceptions ARE scoped
         // value symbols, but so are ordinary variables/cursors; retain only the ones
         // whose block declaration is `name EXCEPTION;` (scanned from the tokens), which

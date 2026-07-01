@@ -31,12 +31,53 @@ pub const STYLE_QUOTED_IDENTIFIER: char = 'N';
 static ORACLE_FUNCTIONS_SET: Lazy<HashSet<&'static str>> =
     Lazy::new(|| ORACLE_FUNCTIONS.iter().copied().collect());
 
+/// Oracle's predefined PL/SQL exceptions (`PACKAGE STANDARD`) — `NO_DATA_FOUND`,
+/// `TOO_MANY_ROWS`, etc. Not reserved keywords, so they are absent from
+/// `sql_text::is_sql_keyword_for_db`, and not real functions either, but they are
+/// well-known built-ins a user expects to see highlighted like one rather than as
+/// a plain identifier. Folded into the same builtin lookup as
+/// `function_catalog_for_db_type` purely for highlighting; grammar/completion
+/// logic elsewhere keeps its own dedicated list (`PLSQL_PREDEFINED_EXCEPTIONS`).
+const ORACLE_PLSQL_PREDEFINED_EXCEPTIONS: &[&str] = &[
+    "ACCESS_INTO_NULL",
+    "CASE_NOT_FOUND",
+    "COLLECTION_IS_NULL",
+    "CURSOR_ALREADY_OPEN",
+    "DUP_VAL_ON_INDEX",
+    "INVALID_CURSOR",
+    "INVALID_NUMBER",
+    "LOGIN_DENIED",
+    "NO_DATA_FOUND",
+    "NO_DATA_NEEDED",
+    "NOT_LOGGED_ON",
+    "PROGRAM_ERROR",
+    "ROWTYPE_MISMATCH",
+    "SELF_IS_NULL",
+    "STORAGE_ERROR",
+    "SUBSCRIPT_BEYOND_COUNT",
+    "SUBSCRIPT_OUTSIDE_LIMIT",
+    "SYS_INVALID_ROWID",
+    "TIMEOUT_ON_RESOURCE",
+    "TOO_MANY_ROWS",
+    "VALUE_ERROR",
+    "ZERO_DIVIDE",
+];
+
+static ORACLE_PLSQL_PREDEFINED_EXCEPTIONS_SET: Lazy<HashSet<&'static str>> =
+    Lazy::new(|| ORACLE_PLSQL_PREDEFINED_EXCEPTIONS.iter().copied().collect());
+
 fn function_catalog_for_db_type(db_type: DatabaseType) -> &'static HashSet<&'static str> {
     match db_type {
         DatabaseType::Oracle => &ORACLE_FUNCTIONS_SET,
         DatabaseType::MySQL => &MYSQL_FUNCTIONS_SET,
         DatabaseType::MariaDB => &MYSQL_FUNCTIONS_SET,
     }
+}
+
+fn is_builtin_highlight_word(upper: &str, db_type: DatabaseType) -> bool {
+    function_catalog_for_db_type(db_type).contains(upper)
+        || (db_type == DatabaseType::Oracle
+            && ORACLE_PLSQL_PREDEFINED_EXCEPTIONS_SET.contains(upper))
 }
 
 fn mysql_compatible_highlight_mode(db_type: DatabaseType) -> bool {
@@ -1307,7 +1348,7 @@ impl<'a> FoldedWord<'a> {
                 sql_text::is_oracle_sql_keyword(upper_ref)
                     || sql_text::is_mysql_sql_keyword(upper_ref),
                 sql_text::is_sql_keyword_for_db(upper_ref, db_type),
-                function_catalog_for_db_type(db_type).contains(upper_ref),
+                is_builtin_highlight_word(upper_ref, db_type),
                 is_alias_eligible_plsql_control_keyword(upper_ref),
             )
         };

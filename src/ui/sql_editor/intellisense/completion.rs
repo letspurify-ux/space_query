@@ -594,6 +594,7 @@ const PLSQL_STATEMENT_KEYWORDS: &[&str] = &[
     "MERGE",
     "WITH",
     "PIPE",
+    "RAISE_APPLICATION_ERROR",
 ];
 
 /// Maps a recognised `CREATE SEQUENCE` option word to its `&'static str` form so
@@ -1328,6 +1329,11 @@ fn oracle_data_type_keywords(position: DataTypePosition) -> &'static [&'static s
         "PLS_INTEGER",
         "BINARY_INTEGER",
         "SIMPLE_INTEGER",
+        "NATURAL",
+        "NATURALN",
+        "POSITIVE",
+        "POSITIVEN",
+        "SIGNTYPE",
         "BINARY_FLOAT",
         "BINARY_DOUBLE",
         "FLOAT",
@@ -1339,6 +1345,7 @@ fn oracle_data_type_keywords(position: DataTypePosition) -> &'static [&'static s
         "BLOB",
         "BFILE",
         "RAW",
+        "LONG",
         "ROWID",
         "UROWID",
         "XMLTYPE",
@@ -2589,6 +2596,14 @@ impl SqlEditorWidget {
                 deep_ctx,
                 !snapshot.prefix.is_empty(),
                 Some(snapshot.preferred_db_type),
+            ) || Self::cursor_is_at_plsql_exit_continue_label_slot_for_context(
+                deep_ctx,
+                !snapshot.prefix.is_empty(),
+                Some(snapshot.preferred_db_type),
+            ) || Self::cursor_is_at_plsql_named_end_target_slot_for_context(
+                deep_ctx,
+                !snapshot.prefix.is_empty(),
+                Some(snapshot.preferred_db_type),
             ) || Self::cursor_is_at_plsql_exception_name_for_context(
                 deep_ctx,
                 !snapshot.prefix.is_empty(),
@@ -3137,6 +3152,16 @@ impl SqlEditorWidget {
             || (at_keyword_only_slot && !at_dedicated_column_slot))
             && !(Self::plsql_statement_start_allows_bare_calls(effective_expr_keyword_ctx)
                 && !Self::cursor_is_at_plsql_goto_label_slot_for_context(
+                    deep_ctx,
+                    has_prefix || qualifier.is_some(),
+                    Some(snapshot.preferred_db_type),
+                )
+                && !Self::cursor_is_at_plsql_exit_continue_label_slot_for_context(
+                    deep_ctx,
+                    has_prefix || qualifier.is_some(),
+                    Some(snapshot.preferred_db_type),
+                )
+                && !Self::cursor_is_at_plsql_named_end_target_slot_for_context(
                     deep_ctx,
                     has_prefix || qualifier.is_some(),
                     Some(snapshot.preferred_db_type),
@@ -11762,7 +11787,8 @@ impl SqlEditorWidget {
         const VALUE_COMPLETE_PREV: &[&str] = &[
             "NULL", "TRUE", "FALSE", "UNKNOWN", "LEVEL", "ROWNUM", "ROWID", "DUAL", "DEFAULT",
         ];
-        match Self::meaningful_tokens_before(tokens, end).last() {
+        let meaningful = Self::meaningful_tokens_before(tokens, end);
+        match meaningful.last() {
             None => Some(false),
             Some(SqlToken::String(_)) => Some(true),
             Some(SqlToken::Comment(_)) => None,
@@ -11789,6 +11815,15 @@ impl SqlEditorWidget {
                 }
                 if PARENTHESIZED_EXPRESSION_CONSTRUCT_WORDS.contains(&upper.as_str()) {
                     return Some(false);
+                }
+                // A word directly following `.` is a qualified member
+                // (`t.COUNT`, `pkg.SOME_FUNCTION`) — a completed identifier
+                // even when it happens to spell a keyword/built-in function
+                // name, since `.` never precedes an operator/keyword position.
+                if meaningful.len() >= 2
+                    && matches!(meaningful[meaningful.len() - 2], SqlToken::Symbol(sym) if sym == ".")
+                {
+                    return Some(true);
                 }
                 if !Self::token_is_language_keyword(&upper) {
                     return Some(true);
@@ -16441,6 +16476,7 @@ impl SqlEditorWidget {
                 | "TYPE"
                 | "SUBTYPE"
                 | "CURSOR"
+                | "REF"
                 | "PRAGMA"
                 | "FUNCTION"
                 | "PROCEDURE"
@@ -19522,6 +19558,12 @@ impl SqlEditorWidget {
                 db_type,
             )
             .is_some()
+            || Self::expected_plsql_local_type_spec_kind_keyword_candidates_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+            .is_some()
             || Self::expected_plsql_pragma_name_keyword_candidates_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
@@ -19540,6 +19582,16 @@ impl SqlEditorWidget {
                 db_type,
             )
             || Self::cursor_is_at_plsql_goto_label_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+            || Self::cursor_is_at_plsql_exit_continue_label_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+            || Self::cursor_is_at_plsql_named_end_target_slot_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
                 db_type,
@@ -28068,13 +28120,29 @@ impl SqlEditorWidget {
             }
             // `CREATE [OR REPLACE] TYPE ty AS |` → the type-spec kind. The downstream
             // grammars already complete from there (`AS TABLE OF |`→types, `AS OBJECT
-            // (attrs)`/`AS VARRAY(n) OF |`→types). A TYPE *body* (`TYPE BODY ty AS |`)
-            // is the method-implementation grammar, so it is excluded.
+            // (attrs)`/`AS VARRAY(n) OF |`→types, `AS REF CURSOR [RETURN …]`). A TYPE
+            // *body* (`TYPE BODY ty AS |`) is the method-implementation grammar, so
+            // it is excluded.
             if words.iter().any(|word| word == "TYPE")
                 && !words.iter().any(|word| word == "BODY")
                 && (position_after("AS") == Some(0) || position_after("IS") == Some(0))
             {
-                return Some(&["OBJECT", "TABLE OF", "VARRAY"]);
+                return Some(&["OBJECT", "TABLE OF", "VARRAY", "REF CURSOR"]);
+            }
+            // `CREATE [OR REPLACE] TYPE ty IS/AS REF |` → `CURSOR`. Anchored on `REF`
+            // directly following the spec-kind `IS`/`AS` (not, say, an object
+            // attribute's `REF <other_type>`, which follows a column name/`OF`
+            // instead) and outside the attribute-list parens.
+            if words.iter().any(|word| word == "TYPE")
+                && !words.iter().any(|word| word == "BODY")
+                && Self::unclosed_paren_count(tokens, end) == 0
+                && matches!(
+                    words.as_slice(),
+                    [.., is_or_as, ref_word]
+                        if matches!(is_or_as.as_str(), "IS" | "AS") && ref_word == "REF"
+                )
+            {
+                return Some(&["CURSOR"]);
             }
         }
 
@@ -28642,6 +28710,28 @@ impl SqlEditorWidget {
             }
         }
 
+        // `OPEN <cur> FOR <dynamic-sql-expr> |` — once the dynamic-SQL string
+        // expression is complete, an optional `USING <binds>` follows. A static
+        // embedded query (`FOR SELECT|WITH ...`) never takes `USING` here (its
+        // predicates hold literal/bound values directly), so this is scoped to
+        // a `FOR` target that is not itself a query.
+        if let Some(open_idx) = words.iter().position(|word| word == "OPEN") {
+            if let Some(for_idx) = words[open_idx..]
+                .iter()
+                .position(|word| word == "FOR")
+                .map(|idx| open_idx + idx)
+            {
+                let after_for = &words[for_idx + 1..];
+                if !after_for.is_empty()
+                    && !matches!(after_for[0].as_str(), "SELECT" | "WITH")
+                    && !after_for.iter().any(|word| word == "USING")
+                    && Self::cursor_immediately_follows_complete_operand(tokens, end)
+                {
+                    return Some(&["USING"]);
+                }
+            }
+        }
+
         match words.as_slice() {
             // `OPEN <cur> |` — the query opener follows.
             [.., open, name] if open == "OPEN" && !is_keyword(name) => Some(&["FOR"]),
@@ -28747,6 +28837,195 @@ impl SqlEditorWidget {
         labels
     }
 
+    /// The enclosing named PL/SQL object (`PACKAGE [BODY]`, `PROCEDURE`,
+    /// `FUNCTION`, `TYPE BODY`) whose closing `END` admits repeating the name —
+    /// `END <name>;` — found by scanning the statement's construct stack up to
+    /// the cursor. Anonymous constructs (`IF`/`LOOP`/`CASE`, a bare/`DECLARE`d
+    /// `BEGIN…END` block, and `TRIGGER`, whose body Oracle never lets you name
+    /// after `END`) push a nameless frame so a name surfaces only at the exact
+    /// `END` that closes a genuinely named object — not at every `END` in the
+    /// statement.
+    fn expected_plsql_named_end_target(tokens: &[SqlToken], end: usize) -> Option<String> {
+        #[derive(Clone)]
+        enum Frame {
+            Named(String, bool),
+            Anonymous(bool),
+        }
+        let toks = tokens.get(..end.min(tokens.len()))?;
+        if !matches!(toks.last(), Some(SqlToken::Word(w)) if w.eq_ignore_ascii_case("END")) {
+            return None;
+        }
+        let mut stack: Vec<Frame> = Vec::new();
+        let mut last_popped_name: Option<String> = None;
+        let mut idx = 0usize;
+        while idx < toks.len() {
+            let SqlToken::Word(word) = &toks[idx] else {
+                idx += 1;
+                continue;
+            };
+            let upper = word.to_ascii_uppercase();
+            match upper.as_str() {
+                "PACKAGE" => {
+                    let mut j = idx + 1;
+                    if matches!(toks.get(j), Some(SqlToken::Word(w)) if w.eq_ignore_ascii_case("BODY"))
+                    {
+                        j += 1;
+                    }
+                    if let Some(SqlToken::Word(name)) = toks.get(j) {
+                        stack.push(Frame::Named(name.clone(), true));
+                        idx = j + 1;
+                        continue;
+                    }
+                }
+                "PROCEDURE" | "FUNCTION" => {
+                    if let Some(SqlToken::Word(name)) = toks.get(idx + 1) {
+                        let name = name.clone();
+                        // A package-spec/standalone-forward declaration
+                        // (`PROCEDURE p(...);`) has no body and thus no
+                        // matching `END` — only a full definition (`IS`/`AS`
+                        // reached before the declaration's own `;`) does. Look
+                        // ahead past the parameter list to tell them apart so
+                        // a spec-only declaration never pushes a stray frame
+                        // that would misalign a later, unrelated `END`.
+                        let mut j = idx + 2;
+                        let mut paren_depth: i32 = 0;
+                        let mut found_body = false;
+                        while j < toks.len() {
+                            match &toks[j] {
+                                SqlToken::Symbol(sym) if sym == "(" => paren_depth += 1,
+                                SqlToken::Symbol(sym) if sym == ")" => paren_depth -= 1,
+                                SqlToken::Symbol(sym) if sym == ";" && paren_depth <= 0 => break,
+                                SqlToken::Word(w)
+                                    if paren_depth <= 0
+                                        && matches!(w.to_ascii_uppercase().as_str(), "IS" | "AS") =>
+                                {
+                                    found_body = true;
+                                    break;
+                                }
+                                _ => {}
+                            }
+                            j += 1;
+                        }
+                        if found_body {
+                            stack.push(Frame::Named(name, true));
+                        }
+                        idx = j + 1;
+                        continue;
+                    }
+                }
+                "TYPE" => {
+                    // `TYPE BODY name IS …` (a body, needs its own `END`) vs a
+                    // plain `TYPE name IS …` local/spec declaration (RECORD,
+                    // collection, or object-type spec — none take an `END`).
+                    let is_body = matches!(
+                        toks.get(idx + 1),
+                        Some(SqlToken::Word(w)) if w.eq_ignore_ascii_case("BODY")
+                    );
+                    let name_idx = if is_body { idx + 2 } else { idx + 1 };
+                    if let Some(SqlToken::Word(name)) = toks.get(name_idx) {
+                        if is_body {
+                            stack.push(Frame::Named(name.clone(), true));
+                        }
+                        idx = name_idx + 1;
+                        continue;
+                    }
+                }
+                "DECLARE" | "TRIGGER" => stack.push(Frame::Anonymous(true)),
+                "IF" | "LOOP" | "CASE" => stack.push(Frame::Anonymous(false)),
+                "BEGIN" => {
+                    let consumed_existing = match stack.last_mut() {
+                        Some(Frame::Named(_, awaiting) | Frame::Anonymous(awaiting))
+                            if *awaiting =>
+                        {
+                            *awaiting = false;
+                            true
+                        }
+                        _ => false,
+                    };
+                    if !consumed_existing {
+                        stack.push(Frame::Anonymous(false));
+                    }
+                }
+                "END" => {
+                    last_popped_name = match stack.pop() {
+                        Some(Frame::Named(name, _)) => Some(name),
+                        _ => None,
+                    };
+                }
+                _ => {}
+            }
+            idx += 1;
+        }
+        last_popped_name
+    }
+
+    fn cursor_is_at_plsql_named_end_target_slot(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return false;
+        }
+        Self::expected_plsql_named_end_target(tokens, end).is_some()
+    }
+
+    fn cursor_is_at_plsql_named_end_target_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let context_end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        if Self::cursor_is_at_plsql_named_end_target_slot(tokens, context_end, db_type) {
+            return true;
+        }
+
+        let statement_tokens = deep_ctx.statement_tokens.as_ref();
+        let statement_end = Self::expected_suggestion_context_end(
+            statement_tokens,
+            deep_ctx.cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::cursor_is_at_plsql_named_end_target_slot(statement_tokens, statement_end, db_type)
+    }
+
+    /// The suggestion(s) at a named-object `END |` slot: just the one enclosing
+    /// name, filtered by the typed prefix.
+    fn plsql_named_end_target_suggestions(
+        deep_ctx: &intellisense_context::CursorContext,
+        prefix: &str,
+    ) -> Vec<String> {
+        let exclude_current_identifier_chain = !prefix.is_empty();
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let context_end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        let name = Self::expected_plsql_named_end_target(tokens, context_end).or_else(|| {
+            let statement_tokens = deep_ctx.statement_tokens.as_ref();
+            let statement_end = Self::expected_suggestion_context_end(
+                statement_tokens,
+                deep_ctx.cursor_token_len,
+                exclude_current_identifier_chain,
+            );
+            Self::expected_plsql_named_end_target(statement_tokens, statement_end)
+        });
+        match name {
+            Some(name) if name.to_ascii_uppercase().starts_with(&prefix.to_ascii_uppercase()) => {
+                vec![name]
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// Exception names declared in the current block as `name EXCEPTION;`, offered at
     /// an exception-name slot (`RAISE |`, `EXCEPTION WHEN |`). These are declaration
     /// symbols the value-symbol table intentionally leaves out of exception slots, so
@@ -28835,6 +29114,67 @@ impl SqlEditorWidget {
             exclude_current_identifier_chain,
         );
         Self::cursor_is_at_plsql_goto_label_slot(statement_tokens, statement_end, db_type)
+    }
+
+    /// True at an `EXIT |` / `CONTINUE |` label slot — the optional loop label
+    /// naming which enclosing loop to leave/skip (`EXIT outer_loop [WHEN …];`).
+    /// Shares the block's `<<label>>` markers with `GOTO`
+    /// (`plsql_block_label_suggestions`) since this codebase does not model
+    /// per-loop label scope precisely either.
+    fn cursor_is_at_plsql_exit_continue_label_slot(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            || !Self::cursor_in_plsql_executable_block(tokens, end)
+        {
+            return false;
+        }
+
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        let is_label_word = |token: &SqlToken| match token {
+            SqlToken::Word(word) => {
+                !crate::sql_text::is_sql_keyword_for_db(word, crate::db::DatabaseType::Oracle)
+            }
+            _ => false,
+        };
+
+        matches!(
+            toks.as_slice(),
+            [.., SqlToken::Word(kw)]
+                if matches!(kw.to_ascii_uppercase().as_str(), "EXIT" | "CONTINUE")
+        ) || matches!(
+            toks.as_slice(),
+            [.., SqlToken::Word(kw), label]
+                if matches!(kw.to_ascii_uppercase().as_str(), "EXIT" | "CONTINUE")
+                    && is_label_word(label)
+        )
+    }
+
+    fn cursor_is_at_plsql_exit_continue_label_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let context_end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        if Self::cursor_is_at_plsql_exit_continue_label_slot(tokens, context_end, db_type) {
+            return true;
+        }
+
+        let statement_tokens = deep_ctx.statement_tokens.as_ref();
+        let statement_end = Self::expected_suggestion_context_end(
+            statement_tokens,
+            deep_ctx.cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::cursor_is_at_plsql_exit_continue_label_slot(statement_tokens, statement_end, db_type)
     }
 
     fn cursor_is_at_plsql_label_definition_slot(
@@ -28947,6 +29287,76 @@ impl SqlEditorWidget {
             exclude_current_identifier_chain,
         );
         Self::cursor_is_at_plsql_for_loop_index_slot(statement_tokens, statement_end, db_type)
+    }
+
+    /// PL/SQL declaration-region `TYPE <name> IS|AS |` — the local type-spec
+    /// kind. Unlike a schema-level `CREATE TYPE`, a local type can never be an
+    /// `OBJECT` (object types are SQL-only), so this is a distinct list from
+    /// `CREATE TYPE`'s. `RECORD`/`TABLE OF`/`VARRAY` already complete downstream
+    /// from there; `REF CURSOR [RETURN …]` needs its own `REF |` → `CURSOR` step.
+    fn expected_plsql_local_type_spec_kind_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            || !Self::cursor_is_in_plsql_declaration_region(tokens, end)
+        {
+            return None;
+        }
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        let last = toks.len().checked_sub(1)?;
+        let is_word = |idx: usize, kw: &str| {
+            matches!(toks.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case(kw))
+        };
+        let is_plain_identifier = |idx: usize| {
+            matches!(toks.get(idx), Some(SqlToken::Word(word)) if !Self::is_plsql_non_type_keyword(word))
+        };
+
+        if (is_word(last, "IS") || is_word(last, "AS"))
+            && last >= 2
+            && is_plain_identifier(last - 1)
+            && is_word(last - 2, "TYPE")
+        {
+            return Some(&["RECORD", "TABLE OF", "VARRAY", "REF CURSOR"]);
+        }
+        if is_word(last, "REF")
+            && last >= 3
+            && (is_word(last - 1, "IS") || is_word(last - 1, "AS"))
+            && is_plain_identifier(last - 2)
+            && is_word(last - 3, "TYPE")
+        {
+            return Some(&["CURSOR"]);
+        }
+        None
+    }
+
+    fn expected_plsql_local_type_spec_kind_keyword_candidates_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let context_end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::expected_plsql_local_type_spec_kind_keyword_candidates(tokens, context_end, db_type)
+            .or_else(|| {
+                let statement_tokens = deep_ctx.statement_tokens.as_ref();
+                let statement_end = Self::expected_suggestion_context_end(
+                    statement_tokens,
+                    deep_ctx.cursor_token_len,
+                    exclude_current_identifier_chain,
+                );
+                Self::expected_plsql_local_type_spec_kind_keyword_candidates(
+                    statement_tokens,
+                    statement_end,
+                    db_type,
+                )
+            })
     }
 
     fn expected_plsql_pragma_name_keyword_candidates(
@@ -29206,6 +29616,8 @@ impl SqlEditorWidget {
             return false;
         }
         if Self::expected_plsql_cursor_statement_keywords(tokens, end, db_type).is_some()
+            || Self::expected_plsql_local_type_spec_kind_keyword_candidates(tokens, end, db_type)
+                .is_some()
             || Self::expected_plsql_pragma_name_keyword_candidates(tokens, end, db_type).is_some()
             || Self::plsql_pragma_argument_slot(tokens, end, db_type).is_some()
             || Self::cursor_is_after_completed_plsql_pragma_tail(tokens, end, db_type)
@@ -29296,12 +29708,16 @@ impl SqlEditorWidget {
             if last_if.is_some_and(|idx| last_then.is_none_or(|then_idx| then_idx < idx)) {
                 return control_expression_complete.then_some(&["THEN"][..]);
             }
-            if last_if.is_some_and(|idx| {
-                last_then.is_some_and(|then_idx| then_idx > idx)
-                    && last_end.is_none_or(|end_idx| end_idx < idx)
-            }) {
-                return Some(&["ELSIF", "ELSE", "END IF"]);
-            }
+            // The "past THEN, inside the IF body" continuations (`ELSIF`/`ELSE`/
+            // `END IF`) are deliberately NOT offered here: at a genuine IF-body
+            // statement-start slot, `expected_plsql_block_statement_keyword_candidates`
+            // already resolves them correctly via the nesting-aware construct
+            // stack (`plsql_keyword_policy`) earlier in the suggestion pipeline.
+            // A word-position check here can't tell a fresh IF-body slot apart
+            // from one where a nested WHILE/FOR/CASE/LOOP opened after this
+            // THEN is still unclosed (no `END` exists yet either way), which
+            // wrongly re-offered ELSIF/ELSE/END IF instead of that nested
+            // construct's own condition/expression keywords.
             if last_while.is_some_and(|idx| last_loop.is_none_or(|loop_idx| loop_idx < idx)) {
                 return control_expression_complete.then_some(&["LOOP"][..]);
             }
@@ -34474,6 +34890,8 @@ impl SqlEditorWidget {
         ];
         const CREATE_OBJECT_TYPE_KEYWORDS: &[&str] = &[
             "OR",
+            "EDITIONABLE",
+            "NONEDITIONABLE",
             "TABLE",
             "VIEW",
             "MATERIALIZED",
@@ -34505,6 +34923,8 @@ impl SqlEditorWidget {
             "PUBLIC",
         ];
         const CREATE_OR_REPLACE_OBJECT_TYPE_KEYWORDS: &[&str] = &[
+            "EDITIONABLE",
+            "NONEDITIONABLE",
             "TABLE",
             "VIEW",
             "MATERIALIZED",
@@ -34623,6 +35043,23 @@ impl SqlEditorWidget {
                 if *a == "CREATE" && *b == "OR" && *c == "REPLACE" && *d == "EDITIONING" =>
             {
                 Some(&["VIEW"])
+            }
+            // `CREATE [OR REPLACE] {EDITIONABLE|NONEDITIONABLE} |` → the object type
+            // that clause applies to (function/procedure/package/type/trigger/view/
+            // synonym, all of which support the editioning modifier).
+            [.., prev, last]
+                if *prev == "CREATE"
+                    && matches!(last.as_str(), "EDITIONABLE" | "NONEDITIONABLE") =>
+            {
+                Some(CREATE_OR_REPLACE_OBJECT_TYPE_KEYWORDS)
+            }
+            [.., a, b, c, d]
+                if *a == "CREATE"
+                    && *b == "OR"
+                    && *c == "REPLACE"
+                    && matches!(d.as_str(), "EDITIONABLE" | "NONEDITIONABLE") =>
+            {
+                Some(CREATE_OR_REPLACE_OBJECT_TYPE_KEYWORDS)
             }
             [.., prev, last]
                 if matches!(prev.as_str(), "CREATE" | "DROP")
@@ -40149,6 +40586,20 @@ impl SqlEditorWidget {
                 },
             )
         {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(candidates) = Self::expected_plsql_local_type_spec_kind_keyword_candidates(
+            tokens,
+            context_end,
+            db_type,
+        )
+        .or_else(|| {
+            Self::expected_plsql_local_type_spec_kind_keyword_candidates(
+                statement_tokens,
+                statement_context_end,
+                db_type,
+            )
+        }) {
             return Self::filter_expected_candidates(prefix, candidates);
         }
         if let Some(candidates) =

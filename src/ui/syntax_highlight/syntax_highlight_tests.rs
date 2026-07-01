@@ -378,6 +378,30 @@ ORDER BY trim.a;";
 }
 
 #[test]
+fn test_predefined_plsql_exceptions_are_highlighted() {
+    let highlighter = SqlHighlighter::new();
+    let text = "BEGIN\n\
+    SELECT 1 INTO v FROM dual;\n\
+EXCEPTION\n\
+    WHEN NO_DATA_FOUND THEN\n\
+        RAISE_APPLICATION_ERROR(-20001, 'x');\n\
+    WHEN TOO_MANY_ROWS THEN\n\
+        NULL;\n\
+END;";
+    let styles = highlighter.generate_styles(text);
+
+    for token in ["NO_DATA_FOUND", "TOO_MANY_ROWS"] {
+        let start = text.find(token).unwrap();
+        assert!(
+            styles[start..start + token.len()]
+                .chars()
+                .all(|c| c == STYLE_FUNCTION),
+            "predefined exception `{token}` should be highlighted like a builtin"
+        );
+    }
+}
+
+#[test]
 fn test_function_name_alias_after_dot_is_not_function_highlighted() {
     let highlighter = SqlHighlighter::new();
     let text = "SELECT o.trim, o.count, o.max FROM orders o";
