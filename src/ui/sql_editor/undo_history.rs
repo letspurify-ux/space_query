@@ -26,6 +26,8 @@ struct BufferEdit {
     deleted_text: String,
 }
 
+const REMOTE_EDIT_CURSOR_DISTANCE: usize = 5;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct UndoSnapshot {
     text: String,
@@ -212,6 +214,57 @@ impl WordUndoRedoState {
         !text.as_bytes()[start..end].contains(&b'\n')
     }
 
+    fn cursor_distance_chars(text: &str, left: usize, right: usize) -> usize {
+        let left = Self::clamp_to_char_boundary(text, left.min(text.len()));
+        let right = Self::clamp_to_char_boundary(text, right.min(text.len()));
+        let (start, end) = if left <= right {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        text.get(start..end)
+            .map(|range| range.chars().count())
+            .unwrap_or_else(|| end.saturating_sub(start))
+    }
+
+    fn delta_changes_text(delta: &UndoDelta) -> bool {
+        !delta.deleted_text.is_empty() || !delta.inserted_text.is_empty()
+    }
+
+    fn record_cursor_move_if_remote(&mut self, replace_start: usize, merge_group: bool) {
+        if merge_group || self.deltas.is_empty() {
+            return;
+        }
+
+        let current_cursor = Self::clamp_to_char_boundary(
+            &self.current.text,
+            self.current.cursor_pos.min(self.current.text.len()),
+        );
+        let next_cursor =
+            Self::clamp_to_char_boundary(&self.current.text, replace_start.min(self.current.text.len()));
+        if current_cursor == next_cursor
+            || Self::cursor_distance_chars(&self.current.text, current_cursor, next_cursor)
+                < REMOTE_EDIT_CURSOR_DISTANCE
+        {
+            return;
+        }
+
+        let group_id = self.next_group_id();
+        let delta = UndoDelta {
+            start: next_cursor,
+            deleted_text: String::new(),
+            inserted_text: String::new(),
+            before_cursor: current_cursor,
+            after_cursor: next_cursor,
+            group_id,
+        };
+        Self::apply_delta_to_snapshot(&mut self.current, &delta, false);
+        self.deltas.push(delta);
+        self.index = self.deltas.len();
+        self.active_group = None;
+        self.trim_history_if_needed();
+    }
+
     fn truncate_redo_history(&mut self) {
         if self.index >= self.deltas.len() {
             return;
@@ -338,7 +391,6 @@ impl WordUndoRedoState {
         self.normalize_index();
         self.truncate_redo_history();
 
-        let before_cursor = self.current.cursor_pos;
         let (replace_start, replace_end) = Self::normalized_replace_range(&self.current.text, edit);
         let deleted_text = self
             .current
@@ -354,6 +406,8 @@ impl WordUndoRedoState {
         };
 
         let merge_group = self.should_merge_into_active_group(edit_group, &normalized_edit);
+        self.record_cursor_move_if_remote(replace_start, merge_group);
+        let before_cursor = self.current.cursor_pos;
         let group_id = if merge_group {
             self.active_group
                 .map(|(_, id)| id)
@@ -517,7 +571,7 @@ impl WordUndoRedoState {
         for (idx, delta) in self.deltas.iter().enumerate() {
             Self::apply_delta_to_snapshot(&mut snapshot, delta, false);
             let next_group = self.deltas.get(idx.saturating_add(1)).map(|d| d.group_id);
-            if next_group != Some(delta.group_id) {
+            if next_group != Some(delta.group_id) && Self::delta_changes_text(delta) {
                 snapshots.push(snapshot.clone());
             }
         }
@@ -721,6 +775,10 @@ impl SqlEditorWidget {
     }
 
     fn apply_delta_to_buffer(buffer: &mut TextBuffer, delta: &UndoDelta, reverse: bool) {
+        if !WordUndoRedoState::delta_changes_text(delta) {
+            return;
+        }
+
         let buffer_len = buffer.length().max(0) as usize;
         let start = delta.start.min(buffer_len);
         let delete_len = if reverse {

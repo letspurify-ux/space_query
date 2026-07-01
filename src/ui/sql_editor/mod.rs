@@ -5480,6 +5480,34 @@ mod execution_state_tests {
     }
 
     #[test]
+    fn undo_inserts_cursor_step_before_remote_new_edit() {
+        let mut state = WordUndoRedoState::new("alpha beta".to_string());
+        state.record_edit(&build_edit(5, "", "x"), classify_edit_group(1, 0, "x", ""));
+        state.record_edit(&build_edit(11, "", "y"), classify_edit_group(1, 0, "y", ""));
+
+        let undo_group = state.take_undo_group();
+
+        assert_eq!(state.current.text, "alphax beta");
+        assert_eq!(undo_group.len(), 1);
+        assert_eq!(undo_group[0].before_cursor, 11);
+        assert_eq!(state.undo_cursor_after_group(&undo_group), 11);
+
+        let cursor_group = state.take_undo_group();
+
+        assert_eq!(state.current.text, "alphax beta");
+        assert_eq!(cursor_group.len(), 1);
+        assert_eq!(cursor_group[0].deleted_text, "");
+        assert_eq!(cursor_group[0].inserted_text, "");
+        assert_eq!(state.undo_cursor_after_group(&cursor_group), 6);
+
+        let first_edit_group = state.take_undo_group();
+
+        assert_eq!(state.current.text, "alpha beta");
+        assert_eq!(first_edit_group.len(), 1);
+        assert_eq!(state.undo_cursor_after_group(&first_edit_group), 10);
+    }
+
+    #[test]
     fn undo_cursor_after_group_uses_group_start_for_grouped_insertion_with_trailing_text() {
         let mut state = WordUndoRedoState::new("xyz".to_string());
         state.current.cursor_pos = 0;
@@ -5553,7 +5581,7 @@ mod execution_state_tests {
                 "alphax betay".to_string()
             ]
         );
-        assert_eq!(state.index, 2);
+        assert_eq!(state.index, 3);
     }
 
     #[test]
