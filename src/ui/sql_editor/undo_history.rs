@@ -398,6 +398,10 @@ impl WordUndoRedoState {
         group_id
     }
 
+    fn finish_active_group(&mut self) {
+        self.active_group = None;
+    }
+
     fn record_edit(&mut self, edit: &BufferEdit, edit_group: EditGroup) {
         self.normalize_index();
         self.truncate_redo_history();

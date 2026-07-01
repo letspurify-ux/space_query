@@ -98,6 +98,7 @@ impl SqlEditorWidget {
         let connection_for_insert = connection.clone();
         let text_shadow_for_insert = text_shadow.clone();
         let preferred_insert_position_for_insert = self.preferred_insert_position.clone();
+        let undo_redo_state_for_insert = self.undo_redo_state.clone();
         {
             let mut popup = intellisense_popup
                 .lock()
@@ -157,6 +158,10 @@ impl SqlEditorWidget {
 
                 let inserted = Self::completion_insert_text(&selected);
                 let caret_offset = Self::completion_caret_offset(&inserted);
+                undo_redo_state_for_insert
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .finish_active_group();
                 if start != end {
                     buffer_for_insert.replace(start as i32, end as i32, &inserted);
                     editor_for_insert.set_insert_position((start + caret_offset) as i32);

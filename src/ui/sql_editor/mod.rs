@@ -5498,6 +5498,37 @@ mod execution_state_tests {
     }
 
     #[test]
+    fn intellisense_replacement_after_delete_undoes_to_prefix_before_deleted_text() {
+        let mut state = WordUndoRedoState::new("create".to_string());
+
+        state.record_edit(&build_edit(5, "e", ""), classify_edit_group(0, 1, "", "e"));
+        state.record_edit(&build_edit(4, "t", ""), classify_edit_group(0, 1, "", "t"));
+        state.record_edit(&build_edit(3, "a", ""), classify_edit_group(0, 1, "", "a"));
+
+        assert_eq!(state.current.text, "cre");
+        assert_eq!(state.current.cursor_pos, 3);
+
+        state.finish_active_group();
+        state.record_edit(
+            &build_edit(0, "cre", "create"),
+            classify_edit_group("create".len() as i32, "cre".len() as i32, "create", "cre"),
+        );
+
+        assert_eq!(state.current.text, "create");
+        assert_eq!(state.current.cursor_pos, 6);
+
+        let completion_group = state.take_undo_group();
+        assert_eq!(completion_group.len(), 1);
+        assert_eq!(state.current.text, "cre");
+        assert_eq!(state.undo_cursor_after_group(&completion_group), 3);
+
+        let delete_group = state.take_undo_group();
+        assert_eq!(delete_group.len(), 3);
+        assert_eq!(state.current.text, "create");
+        assert_eq!(state.undo_cursor_after_group(&delete_group), 6);
+    }
+
+    #[test]
     fn remote_delete_undo_returns_through_cursor_move_to_previous_delete() {
         let mut state = WordUndoRedoState::new("eeeeexxxxxabcef".to_string());
         state.current.cursor_pos = 5;
