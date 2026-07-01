@@ -231,8 +231,13 @@ impl WordUndoRedoState {
         !delta.deleted_text.is_empty() || !delta.inserted_text.is_empty()
     }
 
-    fn record_cursor_move_if_remote(&mut self, replace_start: usize, merge_group: bool) {
-        if merge_group || self.deltas.is_empty() {
+    fn record_cursor_move_if_remote(
+        &mut self,
+        replace_start: usize,
+        merge_group: bool,
+        edit_group: EditGroup,
+    ) {
+        if merge_group || edit_group.operation == EditOperation::Delete {
             return;
         }
 
@@ -406,7 +411,7 @@ impl WordUndoRedoState {
         };
 
         let merge_group = self.should_merge_into_active_group(edit_group, &normalized_edit);
-        self.record_cursor_move_if_remote(replace_start, merge_group);
+        self.record_cursor_move_if_remote(replace_start, merge_group, edit_group);
         let before_cursor = self.current.cursor_pos;
         let group_id = if merge_group {
             self.active_group
@@ -628,16 +633,23 @@ impl WordUndoRedoState {
         let earliest_delta = group.last().unwrap_or(latest_delta);
 
         // Undo cursor policy:
-        // - Undoing a single deletion should land at the end of restored text.
+        // - Undoing a deletion group should land at the end of restored text.
         // - Undoing grouped edits should restore the cursor before the group's
         //   first edit (earliest delta), not before the latest sub-edit.
-        let is_single_deletion_undo = group.len() == 1
-            && latest_delta.inserted_text.is_empty()
-            && !latest_delta.deleted_text.is_empty();
-        let cursor = if is_single_deletion_undo {
-            latest_delta
-                .start
-                .saturating_add(latest_delta.deleted_text.len())
+        let all_deletions = group
+            .iter()
+            .all(|delta| delta.inserted_text.is_empty() && !delta.deleted_text.is_empty());
+        let cursor = if all_deletions {
+            let restored_start = group
+                .iter()
+                .map(|delta| delta.start)
+                .min()
+                .unwrap_or(latest_delta.start);
+            let restored_len = group
+                .iter()
+                .map(|delta| delta.deleted_text.len())
+                .sum::<usize>();
+            restored_start.saturating_add(restored_len)
         } else {
             earliest_delta.before_cursor
         }

@@ -5468,6 +5468,37 @@ mod execution_state_tests {
     }
 
     #[test]
+    fn undo_cursor_after_group_moves_to_end_of_restored_backspace_group() {
+        let mut state = WordUndoRedoState::new("abcef".to_string());
+
+        state.record_edit(&build_edit(4, "f", ""), classify_edit_group(0, 1, "", "f"));
+        state.record_edit(&build_edit(3, "e", ""), classify_edit_group(0, 1, "", "e"));
+        state.record_edit(&build_edit(2, "c", ""), classify_edit_group(0, 1, "", "c"));
+
+        let undo_group = state.take_undo_group();
+
+        assert_eq!(undo_group.len(), 3);
+        assert_eq!(state.current.text, "abcef");
+        assert_eq!(state.undo_cursor_after_group(&undo_group), 5);
+    }
+
+    #[test]
+    fn undo_cursor_after_group_moves_to_end_of_restored_forward_delete_group() {
+        let mut state = WordUndoRedoState::new("abcef".to_string());
+        state.current.cursor_pos = 2;
+
+        state.record_edit(&build_edit(2, "c", ""), classify_edit_group(0, 1, "", "c"));
+        state.record_edit(&build_edit(2, "e", ""), classify_edit_group(0, 1, "", "e"));
+        state.record_edit(&build_edit(2, "f", ""), classify_edit_group(0, 1, "", "f"));
+
+        let undo_group = state.take_undo_group();
+
+        assert_eq!(undo_group.len(), 3);
+        assert_eq!(state.current.text, "abcef");
+        assert_eq!(state.undo_cursor_after_group(&undo_group), 5);
+    }
+
+    #[test]
     fn undo_cursor_after_group_restores_previous_cursor_for_insertion() {
         let mut state = WordUndoRedoState::new("abc".to_string());
         state.record_edit(&build_edit(3, "", "x"), classify_edit_group(1, 0, "x", ""));
@@ -5504,7 +5535,35 @@ mod execution_state_tests {
 
         assert_eq!(state.current.text, "alpha beta");
         assert_eq!(first_edit_group.len(), 1);
-        assert_eq!(state.undo_cursor_after_group(&first_edit_group), 10);
+        assert_eq!(state.undo_cursor_after_group(&first_edit_group), 5);
+
+        let first_cursor_group = state.take_undo_group();
+
+        assert_eq!(state.current.text, "alpha beta");
+        assert_eq!(first_cursor_group.len(), 1);
+        assert_eq!(first_cursor_group[0].deleted_text, "");
+        assert_eq!(first_cursor_group[0].inserted_text, "");
+        assert_eq!(state.undo_cursor_after_group(&first_cursor_group), 10);
+    }
+
+    #[test]
+    fn undo_inserts_cursor_step_before_first_remote_edit() {
+        let mut state = WordUndoRedoState::new("alpha beta".to_string());
+        state.record_edit(&build_edit(0, "", "x"), classify_edit_group(1, 0, "x", ""));
+
+        let undo_group = state.take_undo_group();
+
+        assert_eq!(state.current.text, "alpha beta");
+        assert_eq!(undo_group.len(), 1);
+        assert_eq!(state.undo_cursor_after_group(&undo_group), 0);
+
+        let cursor_group = state.take_undo_group();
+
+        assert_eq!(state.current.text, "alpha beta");
+        assert_eq!(cursor_group.len(), 1);
+        assert_eq!(cursor_group[0].deleted_text, "");
+        assert_eq!(cursor_group[0].inserted_text, "");
+        assert_eq!(state.undo_cursor_after_group(&cursor_group), 10);
     }
 
     #[test]
@@ -5581,7 +5640,7 @@ mod execution_state_tests {
                 "alphax betay".to_string()
             ]
         );
-        assert_eq!(state.index, 3);
+        assert_eq!(state.index, 4);
     }
 
     #[test]
