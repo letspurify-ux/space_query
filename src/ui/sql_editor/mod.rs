@@ -5859,6 +5859,104 @@ mod execution_state_tests {
     }
 
     #[test]
+    fn intellisense_replacement_uses_actual_cursor_before_completion_after_cursor_move() {
+        let mut state = WordUndoRedoState::new("alpha beta".to_string());
+
+        state.sync_current_cursor(5);
+        state.prepare_completion_edit();
+        state.record_edit(
+            &build_edit(0, "alpha", "alphabet"),
+            classify_edit_group(
+                "alphabet".len() as i32,
+                "alpha".len() as i32,
+                "alphabet",
+                "alpha",
+            ),
+        );
+        state.finish_completion_edit_cursor(8, true);
+
+        assert_eq!(state.current.text, "alphabet beta");
+        assert_eq!(state.current.cursor_pos, 8);
+
+        let completion_group = state.take_undo_group();
+        assert_eq!(completion_group.len(), 1);
+        assert_eq!(state.current.text, "alpha beta");
+        assert_eq!(state.undo_cursor_after_group(&completion_group), 5);
+    }
+
+    #[test]
+    fn noop_replacement_is_not_recorded_as_undo_step() {
+        let mut state = WordUndoRedoState::new("varcha".to_string());
+
+        state.record_edit(
+            &build_edit(0, "varcha", "varcha"),
+            classify_edit_group(
+                "varcha".len() as i32,
+                "varcha".len() as i32,
+                "varcha",
+                "varcha",
+            ),
+        );
+
+        assert_eq!(state.current.text, "varcha");
+        assert!(state.deltas.is_empty());
+        assert_eq!(state.index, 0);
+    }
+
+    #[test]
+    fn noop_completion_after_undo_preserves_redo_stack() {
+        let mut state = WordUndoRedoState::new("abc".to_string());
+
+        state.record_edit(&build_edit(3, "", "x"), classify_edit_group(1, 0, "x", ""));
+        let undo_group = state.take_undo_group();
+        assert_eq!(undo_group.len(), 1);
+        assert_eq!(state.current.text, "abc");
+
+        state.finish_active_group();
+        state.record_edit(
+            &build_edit(0, "abc", "abc"),
+            classify_edit_group("abc".len() as i32, "abc".len() as i32, "abc", "abc"),
+        );
+        state.finish_completion_edit_cursor(3, false);
+
+        assert_eq!(state.current.text, "abc");
+        assert_eq!(state.index, 0);
+        assert_eq!(state.deltas.len(), 1);
+
+        let redo_group = state.take_redo_group();
+        assert_eq!(redo_group.len(), 1);
+        assert_eq!(state.current.text, "abcx");
+        assert_eq!(state.current.cursor_pos, 4);
+    }
+
+    #[test]
+    fn noop_function_completion_can_move_cursor_without_recording_undo_step() {
+        let mut state = WordUndoRedoState::new("NVL()".to_string());
+
+        state.record_edit(&build_edit(5, "", "x"), classify_edit_group(1, 0, "x", ""));
+        let undo_group = state.take_undo_group();
+        assert_eq!(undo_group.len(), 1);
+        assert_eq!(state.current.text, "NVL()");
+
+        state.finish_active_group();
+        state.record_edit(
+            &build_edit(0, "NVL()", "NVL()"),
+            classify_edit_group("NVL()".len() as i32, "NVL()".len() as i32, "NVL()", "NVL()"),
+        );
+        state.finish_completion_edit_cursor(4, false);
+
+        assert_eq!(state.current.text, "NVL()");
+        assert_eq!(state.current.cursor_pos, 4);
+        assert_eq!(state.index, 0);
+        assert_eq!(state.deltas.len(), 1);
+
+        let redo_group = state.take_redo_group();
+        assert_eq!(redo_group.len(), 1);
+        assert_eq!(state.current.text, "NVL()x");
+        assert_eq!(state.current.cursor_pos, 6);
+    }
+
+    #[test]
     fn remote_delete_undo_returns_through_cursor_move_to_previous_delete() {
         let mut state = WordUndoRedoState::new("eeeeexxxxxabcef".to_string());
         state.current.cursor_pos = 5;

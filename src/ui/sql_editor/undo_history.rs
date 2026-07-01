@@ -417,6 +417,13 @@ impl WordUndoRedoState {
         self.completion_edit_group_id = None;
     }
 
+    fn sync_current_cursor(&mut self, cursor_pos: usize) {
+        self.current.cursor_pos = Self::clamp_to_char_boundary(
+            &self.current.text,
+            cursor_pos.min(self.current.text.len()),
+        );
+    }
+
     fn prepare_completion_edit(&mut self) {
         self.active_group = None;
         self.suppress_next_remote_cursor_move = true;
@@ -444,7 +451,6 @@ impl WordUndoRedoState {
 
     fn record_edit(&mut self, edit: &BufferEdit, edit_group: EditGroup) {
         self.normalize_index();
-        self.truncate_redo_history();
 
         let (replace_start, replace_end) = Self::normalized_replace_range(&self.current.text, edit);
         let deleted_text = self
@@ -459,6 +465,15 @@ impl WordUndoRedoState {
             inserted_text: edit.inserted_text.clone(),
             deleted_text,
         };
+
+        if normalized_edit.deleted_text == normalized_edit.inserted_text {
+            self.suppress_next_remote_cursor_move = false;
+            self.finish_group_after_next_edit = false;
+            self.completion_edit_group_id = None;
+            return;
+        }
+
+        self.truncate_redo_history();
 
         let finish_group_after_edit = self.finish_group_after_next_edit;
         self.finish_group_after_next_edit = false;

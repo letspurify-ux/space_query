@@ -164,6 +164,7 @@ impl SqlEditorWidget {
                     let mut undo_state = undo_redo_state_for_insert
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    undo_state.sync_current_cursor(cursor_pos_usize);
                     if completion_changes_text {
                         undo_state.prepare_completion_edit();
                     } else {
@@ -559,6 +560,7 @@ impl SqlEditorWidget {
                                         let mut undo_state = undo_redo_state_for_handle
                                             .lock()
                                             .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                        undo_state.sync_current_cursor(cursor_pos_usize);
                                         if completion_changes_text {
                                             undo_state.prepare_completion_edit();
                                         } else {
