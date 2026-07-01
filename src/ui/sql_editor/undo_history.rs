@@ -60,6 +60,8 @@ struct WordUndoRedoState {
     active_group: Option<(EditGroup, u64)>,
     next_group_id: u64,
     applying_history: bool,
+    suppress_next_remote_cursor_move: bool,
+    finish_group_after_next_edit: bool,
 }
 
 impl WordUndoRedoState {
@@ -75,6 +77,8 @@ impl WordUndoRedoState {
             active_group: None,
             next_group_id: 1,
             applying_history: false,
+            suppress_next_remote_cursor_move: false,
+            finish_group_after_next_edit: false,
         }
     }
 
@@ -243,6 +247,12 @@ impl WordUndoRedoState {
         merge_group: bool,
         edit_group: EditGroup,
     ) {
+        let suppress_remote_cursor_move = self.suppress_next_remote_cursor_move;
+        self.suppress_next_remote_cursor_move = false;
+        if suppress_remote_cursor_move {
+            return;
+        }
+
         if merge_group || edit_group.operation == EditOperation::Other {
             return;
         }
@@ -400,6 +410,27 @@ impl WordUndoRedoState {
 
     fn finish_active_group(&mut self) {
         self.active_group = None;
+        self.suppress_next_remote_cursor_move = false;
+        self.finish_group_after_next_edit = false;
+    }
+
+    fn prepare_completion_edit(&mut self) {
+        self.active_group = None;
+        self.suppress_next_remote_cursor_move = true;
+        self.finish_group_after_next_edit = true;
+    }
+
+    fn finish_completion_edit_cursor(&mut self, cursor_pos: usize, changed_text: bool) {
+        let cursor = Self::clamp_to_char_boundary(
+            &self.current.text,
+            cursor_pos.min(self.current.text.len()),
+        );
+        self.current.cursor_pos = cursor;
+        if changed_text && self.index == self.deltas.len() {
+            if let Some(delta) = self.deltas.last_mut() {
+                delta.after_cursor = cursor;
+            }
+        }
     }
 
     fn record_edit(&mut self, edit: &BufferEdit, edit_group: EditGroup) {
@@ -420,6 +451,8 @@ impl WordUndoRedoState {
             deleted_text,
         };
 
+        let finish_group_after_edit = self.finish_group_after_next_edit;
+        self.finish_group_after_next_edit = false;
         let merge_group = self.should_merge_into_active_group(edit_group, &normalized_edit);
         self.record_cursor_move_if_remote(replace_start, merge_group, edit_group);
         let before_cursor = self.current.cursor_pos;
@@ -450,7 +483,11 @@ impl WordUndoRedoState {
         );
         self.deltas.push(delta);
         self.index = self.deltas.len();
-        self.active_group = Some((edit_group, group_id));
+        self.active_group = if finish_group_after_edit {
+            None
+        } else {
+            Some((edit_group, group_id))
+        };
         self.trim_history_if_needed();
     }
 
@@ -794,6 +831,8 @@ impl SqlEditorWidget {
         state.active_group = None;
         state.next_group_id = 1;
         state.applying_history = false;
+        state.suppress_next_remote_cursor_move = false;
+        state.finish_group_after_next_edit = false;
     }
 
     fn apply_delta_to_buffer(buffer: &mut TextBuffer, delta: &UndoDelta, reverse: bool) {
@@ -841,6 +880,8 @@ impl SqlEditorWidget {
             state.active_group = None;
             state.next_group_id = 1;
             state.applying_history = false;
+            state.suppress_next_remote_cursor_move = false;
+            state.finish_group_after_next_edit = false;
         }
         *self
             .history_cursor

@@ -5177,6 +5177,8 @@ mod execution_state_tests {
             active_group: Some((classify_edit_group(1, 1, "2", "1"), 1)),
             next_group_id: 2,
             applying_history: true,
+            suppress_next_remote_cursor_move: true,
+            finish_group_after_next_edit: true,
         }));
 
         SqlEditorWidget::reset_word_undo_state(&undo_state);
@@ -5192,6 +5194,8 @@ mod execution_state_tests {
         assert!(state.active_group.is_none());
         assert_eq!(state.next_group_id, 1);
         assert!(!state.applying_history);
+        assert!(!state.suppress_next_remote_cursor_move);
+        assert!(!state.finish_group_after_next_edit);
     }
 
     #[test]
@@ -5508,7 +5512,7 @@ mod execution_state_tests {
         assert_eq!(state.current.text, "cre");
         assert_eq!(state.current.cursor_pos, 3);
 
-        state.finish_active_group();
+        state.prepare_completion_edit();
         state.record_edit(
             &build_edit(0, "cre", "create"),
             classify_edit_group("create".len() as i32, "cre".len() as i32, "create", "cre"),
@@ -5526,6 +5530,159 @@ mod execution_state_tests {
         assert_eq!(delete_group.len(), 3);
         assert_eq!(state.current.text, "create");
         assert_eq!(state.undo_cursor_after_group(&delete_group), 6);
+    }
+
+    #[test]
+    fn intellisense_replacement_after_delete_undoes_to_prefix_with_prior_cursor_step() {
+        let mut state = WordUndoRedoState::new("create".to_string());
+        state.current.cursor_pos = 0;
+
+        state.record_edit(&build_edit(5, "e", ""), classify_edit_group(0, 1, "", "e"));
+        state.record_edit(&build_edit(4, "t", ""), classify_edit_group(0, 1, "", "t"));
+
+        assert_eq!(state.current.text, "crea");
+        assert_eq!(state.current.cursor_pos, 4);
+
+        state.prepare_completion_edit();
+        state.record_edit(
+            &build_edit(0, "crea", "create"),
+            classify_edit_group("create".len() as i32, "crea".len() as i32, "create", "crea"),
+        );
+
+        assert_eq!(state.current.text, "create");
+        assert_eq!(state.current.cursor_pos, 6);
+
+        let completion_group = state.take_undo_group();
+        assert_eq!(completion_group.len(), 1);
+        assert_eq!(state.current.text, "crea");
+        assert_eq!(state.undo_cursor_after_group(&completion_group), 4);
+
+        let delete_group = state.take_undo_group();
+        assert_eq!(delete_group.len(), 2);
+        assert_eq!(state.current.text, "create");
+        assert_eq!(state.undo_cursor_after_group(&delete_group), 6);
+    }
+
+    #[test]
+    fn intellisense_replacement_after_long_prefix_delete_does_not_insert_cursor_step() {
+        let mut state = WordUndoRedoState::new("varchar2".to_string());
+
+        state.record_edit(&build_edit(7, "2", ""), classify_edit_group(0, 1, "", "2"));
+        state.record_edit(&build_edit(6, "r", ""), classify_edit_group(0, 1, "", "r"));
+
+        assert_eq!(state.current.text, "varcha");
+        assert_eq!(state.current.cursor_pos, 6);
+
+        state.prepare_completion_edit();
+        state.record_edit(
+            &build_edit(0, "varcha", "varchar2"),
+            classify_edit_group(
+                "varchar2".len() as i32,
+                "varcha".len() as i32,
+                "varchar2",
+                "varcha",
+            ),
+        );
+
+        assert_eq!(state.current.text, "varchar2");
+        assert_eq!(state.current.cursor_pos, 8);
+
+        let completion_group = state.take_undo_group();
+        assert_eq!(completion_group.len(), 1);
+        assert_eq!(state.current.text, "varcha");
+        assert_eq!(state.undo_cursor_after_group(&completion_group), 6);
+
+        let delete_group = state.take_undo_group();
+        assert_eq!(delete_group.len(), 2);
+        assert_eq!(state.current.text, "varchar2");
+        assert_eq!(state.undo_cursor_after_group(&delete_group), 8);
+    }
+
+    #[test]
+    fn edit_after_intellisense_replacement_starts_new_undo_group() {
+        let mut state = WordUndoRedoState::new("varchar2".to_string());
+
+        state.record_edit(&build_edit(7, "2", ""), classify_edit_group(0, 1, "", "2"));
+        state.record_edit(&build_edit(6, "r", ""), classify_edit_group(0, 1, "", "r"));
+        state.prepare_completion_edit();
+        state.record_edit(
+            &build_edit(0, "varcha", "varchar2"),
+            classify_edit_group(
+                "varchar2".len() as i32,
+                "varcha".len() as i32,
+                "varchar2",
+                "varcha",
+            ),
+        );
+
+        state.record_edit(&build_edit(8, "", "x"), classify_edit_group(1, 0, "x", ""));
+
+        let typing_group = state.take_undo_group();
+        assert_eq!(typing_group.len(), 1);
+        assert_eq!(state.current.text, "varchar2");
+        assert_eq!(state.undo_cursor_after_group(&typing_group), 8);
+
+        let completion_group = state.take_undo_group();
+        assert_eq!(completion_group.len(), 1);
+        assert_eq!(state.current.text, "varcha");
+        assert_eq!(state.undo_cursor_after_group(&completion_group), 6);
+    }
+
+    #[test]
+    fn delete_after_intellisense_replacement_starts_new_undo_group() {
+        let mut state = WordUndoRedoState::new("varchar2".to_string());
+
+        state.record_edit(&build_edit(7, "2", ""), classify_edit_group(0, 1, "", "2"));
+        state.record_edit(&build_edit(6, "r", ""), classify_edit_group(0, 1, "", "r"));
+        state.prepare_completion_edit();
+        state.record_edit(
+            &build_edit(0, "varcha", "varchar2"),
+            classify_edit_group(
+                "varchar2".len() as i32,
+                "varcha".len() as i32,
+                "varchar2",
+                "varcha",
+            ),
+        );
+
+        state.record_edit(&build_edit(7, "2", ""), classify_edit_group(0, 1, "", "2"));
+
+        let delete_group = state.take_undo_group();
+        assert_eq!(delete_group.len(), 1);
+        assert_eq!(state.current.text, "varchar2");
+        assert_eq!(state.undo_cursor_after_group(&delete_group), 8);
+
+        let completion_group = state.take_undo_group();
+        assert_eq!(completion_group.len(), 1);
+        assert_eq!(state.current.text, "varcha");
+        assert_eq!(state.undo_cursor_after_group(&completion_group), 6);
+    }
+
+    #[test]
+    fn edit_after_function_completion_uses_caret_offset_cursor() {
+        let mut state = WordUndoRedoState::new("n".to_string());
+
+        state.prepare_completion_edit();
+        state.record_edit(
+            &build_edit(0, "n", "NVL()"),
+            classify_edit_group("NVL()".len() as i32, "n".len() as i32, "NVL()", "n"),
+        );
+        state.finish_completion_edit_cursor(4, true);
+
+        assert_eq!(state.current.text, "NVL()");
+        assert_eq!(state.current.cursor_pos, 4);
+
+        state.record_edit(&build_edit(4, "", "x"), classify_edit_group(1, 0, "x", ""));
+
+        let typing_group = state.take_undo_group();
+        assert_eq!(typing_group.len(), 1);
+        assert_eq!(state.current.text, "NVL()");
+        assert_eq!(state.undo_cursor_after_group(&typing_group), 4);
+
+        let completion_group = state.take_undo_group();
+        assert_eq!(completion_group.len(), 1);
+        assert_eq!(state.current.text, "n");
+        assert_eq!(state.undo_cursor_after_group(&completion_group), 1);
     }
 
     #[test]

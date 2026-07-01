@@ -158,10 +158,18 @@ impl SqlEditorWidget {
 
                 let inserted = Self::completion_insert_text(&selected);
                 let caret_offset = Self::completion_caret_offset(&inserted);
-                undo_redo_state_for_insert
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .finish_active_group();
+                let completion_changes_text =
+                    Self::completion_changes_text(&buffer_for_insert, start, end, &inserted);
+                {
+                    let mut undo_state = undo_redo_state_for_insert
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if completion_changes_text {
+                        undo_state.prepare_completion_edit();
+                    } else {
+                        undo_state.finish_active_group();
+                    }
+                }
                 if start != end {
                     buffer_for_insert.replace(start as i32, end as i32, &inserted);
                     editor_for_insert.set_insert_position((start + caret_offset) as i32);
@@ -170,6 +178,15 @@ impl SqlEditorWidget {
                     editor_for_insert
                         .set_insert_position((cursor_pos_usize + caret_offset) as i32);
                 }
+                let after_cursor = if start != end {
+                    start.saturating_add(caret_offset)
+                } else {
+                    cursor_pos_usize.saturating_add(caret_offset)
+                };
+                undo_redo_state_for_insert
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .finish_completion_edit_cursor(after_cursor, completion_changes_text);
                 Self::sync_preferred_insert_position_from_editor(
                     &preferred_insert_position_for_insert,
                     &editor_for_insert,
@@ -198,6 +215,7 @@ impl SqlEditorWidget {
         let dnd_drop_state_for_handle = Arc::new(Mutex::new(DndDropState::Idle));
         let dnd_scroll_origin_for_handle = Arc::new(Mutex::new(None::<(i32, i32)>));
         let preferred_insert_position_for_handle = self.preferred_insert_position.clone();
+        let undo_redo_state_for_handle = self.undo_redo_state.clone();
         let display_metrics_ready_for_handle = self.display_metrics_ready.clone();
 
         editor.handle(move |ed, ev| {
@@ -531,19 +549,48 @@ impl SqlEditorWidget {
                                     );
 
                                     let inserted = Self::completion_insert_text(&selected);
+                                    let completion_changes_text = Self::completion_changes_text(
+                                        &buffer_for_handle,
+                                        start,
+                                        end,
+                                        &inserted,
+                                    );
+                                    {
+                                        let mut undo_state = undo_redo_state_for_handle
+                                            .lock()
+                                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                        if completion_changes_text {
+                                            undo_state.prepare_completion_edit();
+                                        } else {
+                                            undo_state.finish_active_group();
+                                        }
+                                    }
+                                    let caret_offset = Self::completion_caret_offset(&inserted);
                                     if start != end {
                                         buffer_for_handle.replace(
                                             start as i32,
                                             end as i32,
                                             &inserted,
                                         );
-                                        ed.set_insert_position((start + inserted.len()) as i32);
+                                        ed.set_insert_position((start + caret_offset) as i32);
                                     } else {
                                         buffer_for_handle.insert(cursor_pos, &inserted);
                                         ed.set_insert_position(
-                                            (cursor_pos_usize + inserted.len()) as i32,
+                                            (cursor_pos_usize + caret_offset) as i32,
                                         );
                                     }
+                                    let after_cursor = if start != end {
+                                        start.saturating_add(caret_offset)
+                                    } else {
+                                        cursor_pos_usize.saturating_add(caret_offset)
+                                    };
+                                    undo_redo_state_for_handle
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                        .finish_completion_edit_cursor(
+                                            after_cursor,
+                                            completion_changes_text,
+                                        );
                                     Self::finalize_completion_after_selection(
                                         &intellisense_runtime_for_handle,
                                     );

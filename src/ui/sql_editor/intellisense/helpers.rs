@@ -693,6 +693,24 @@ impl SqlEditorWidget {
         }
     }
 
+    fn completion_changes_text(
+        buffer: &TextBuffer,
+        start: usize,
+        end: usize,
+        inserted: &str,
+    ) -> bool {
+        if start == end {
+            return !inserted.is_empty();
+        }
+
+        let start_i32 = start.min(i32::MAX as usize) as i32;
+        let end_i32 = end.min(i32::MAX as usize) as i32;
+        buffer
+            .text_range(start_i32, end_i32)
+            .map(|deleted| deleted != inserted)
+            .unwrap_or(true)
+    }
+
     fn completion_replacement_range(
         buffer: &TextBuffer,
         text_shadow: &Arc<Mutex<HighlightShadowState>>,
