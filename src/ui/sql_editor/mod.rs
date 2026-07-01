@@ -5862,6 +5862,7 @@ mod execution_state_tests {
     fn intellisense_replacement_uses_actual_cursor_before_completion_after_cursor_move() {
         let mut state = WordUndoRedoState::new("alpha beta".to_string());
 
+        state.record_cursor_move_to_if_remote(5);
         state.sync_current_cursor(5);
         state.prepare_completion_edit();
         state.record_edit(
@@ -5882,6 +5883,124 @@ mod execution_state_tests {
         assert_eq!(completion_group.len(), 1);
         assert_eq!(state.current.text, "alpha beta");
         assert_eq!(state.undo_cursor_after_group(&completion_group), 5);
+
+        let cursor_group = state.take_undo_group();
+        assert_eq!(cursor_group.len(), 1);
+        assert_eq!(cursor_group[0].deleted_text, "");
+        assert_eq!(cursor_group[0].inserted_text, "");
+        assert_eq!(state.current.text, "alpha beta");
+        assert_eq!(state.undo_cursor_after_group(&cursor_group), 10);
+    }
+
+    #[test]
+    fn redo_remote_intellisense_replacement_replays_cursor_step_before_completion() {
+        let mut state = WordUndoRedoState::new("alpha beta".to_string());
+
+        state.record_cursor_move_to_if_remote(5);
+        state.sync_current_cursor(5);
+        state.prepare_completion_edit();
+        state.record_edit(
+            &build_edit(0, "alpha", "alphabet"),
+            classify_edit_group(
+                "alphabet".len() as i32,
+                "alpha".len() as i32,
+                "alphabet",
+                "alpha",
+            ),
+        );
+        state.finish_completion_edit_cursor(8, true);
+
+        let completion_undo = state.take_undo_group();
+        assert_eq!(completion_undo.len(), 1);
+        assert_eq!(state.current.text, "alpha beta");
+        assert_eq!(state.undo_cursor_after_group(&completion_undo), 5);
+
+        let cursor_undo = state.take_undo_group();
+        assert_eq!(cursor_undo.len(), 1);
+        assert_eq!(state.current.text, "alpha beta");
+        assert_eq!(state.undo_cursor_after_group(&cursor_undo), 10);
+
+        let cursor_redo = state.take_redo_group();
+        assert_eq!(cursor_redo.len(), 1);
+        assert_eq!(cursor_redo[0].deleted_text, "");
+        assert_eq!(cursor_redo[0].inserted_text, "");
+        assert_eq!(state.current.text, "alpha beta");
+        assert_eq!(state.current.cursor_pos, 5);
+
+        let completion_redo = state.take_redo_group();
+        assert_eq!(completion_redo.len(), 1);
+        assert_eq!(state.current.text, "alphabet beta");
+        assert_eq!(state.current.cursor_pos, 8);
+    }
+
+    #[test]
+    fn intellisense_replacement_after_local_delete_does_not_record_cursor_step_to_word_start() {
+        let mut state = WordUndoRedoState::new("varchar2".to_string());
+
+        state.record_edit(&build_edit(7, "2", ""), classify_edit_group(0, 1, "", "2"));
+        state.record_edit(&build_edit(6, "r", ""), classify_edit_group(0, 1, "", "r"));
+
+        state.record_cursor_move_to_if_remote(6);
+        state.sync_current_cursor(6);
+        state.prepare_completion_edit();
+        state.record_edit(
+            &build_edit(0, "varcha", "varchar2"),
+            classify_edit_group(
+                "varchar2".len() as i32,
+                "varcha".len() as i32,
+                "varchar2",
+                "varcha",
+            ),
+        );
+        state.finish_completion_edit_cursor(8, true);
+
+        let completion_group = state.take_undo_group();
+        assert_eq!(completion_group.len(), 1);
+        assert_eq!(state.current.text, "varcha");
+        assert_eq!(state.undo_cursor_after_group(&completion_group), 6);
+
+        let delete_group = state.take_undo_group();
+        assert_eq!(delete_group.len(), 2);
+        assert_eq!(state.current.text, "varchar2");
+        assert_eq!(state.undo_cursor_after_group(&delete_group), 8);
+    }
+
+    #[test]
+    fn intellisense_replacement_after_remote_delete_returns_through_cursor_step() {
+        let mut state = WordUndoRedoState::new("eeeee     ab".to_string());
+        state.current.cursor_pos = 5;
+
+        state.record_edit(&build_edit(4, "e", ""), classify_edit_group(0, 1, "", "e"));
+        state.record_edit(&build_edit(3, "e", ""), classify_edit_group(0, 1, "", "e"));
+
+        assert_eq!(state.current.text, "eee     ab");
+        assert_eq!(state.current.cursor_pos, 3);
+
+        state.record_cursor_move_to_if_remote(10);
+        state.sync_current_cursor(10);
+        state.prepare_completion_edit();
+        state.record_edit(
+            &build_edit(8, "ab", "abcef"),
+            classify_edit_group("abcef".len() as i32, "ab".len() as i32, "abcef", "ab"),
+        );
+        state.finish_completion_edit_cursor(13, true);
+
+        let completion_group = state.take_undo_group();
+        assert_eq!(completion_group.len(), 1);
+        assert_eq!(state.current.text, "eee     ab");
+        assert_eq!(state.undo_cursor_after_group(&completion_group), 10);
+
+        let cursor_group = state.take_undo_group();
+        assert_eq!(cursor_group.len(), 1);
+        assert_eq!(cursor_group[0].deleted_text, "");
+        assert_eq!(cursor_group[0].inserted_text, "");
+        assert_eq!(state.current.text, "eee     ab");
+        assert_eq!(state.undo_cursor_after_group(&cursor_group), 3);
+
+        let delete_group = state.take_undo_group();
+        assert_eq!(delete_group.len(), 2);
+        assert_eq!(state.current.text, "eeeee     ab");
+        assert_eq!(state.undo_cursor_after_group(&delete_group), 5);
     }
 
     #[test]

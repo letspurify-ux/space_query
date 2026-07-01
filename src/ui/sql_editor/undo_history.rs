@@ -424,6 +424,42 @@ impl WordUndoRedoState {
         );
     }
 
+    fn record_cursor_move_to_if_remote(&mut self, cursor_pos: usize) {
+        self.normalize_index();
+
+        let current_cursor = Self::clamp_to_char_boundary(
+            &self.current.text,
+            self.current.cursor_pos.min(self.current.text.len()),
+        );
+        let next_cursor = Self::clamp_to_char_boundary(
+            &self.current.text,
+            cursor_pos.min(self.current.text.len()),
+        );
+        if current_cursor == next_cursor
+            || Self::cursor_distance_chars(&self.current.text, current_cursor, next_cursor)
+                < REMOTE_EDIT_CURSOR_DISTANCE
+        {
+            return;
+        }
+
+        self.truncate_redo_history();
+
+        let group_id = self.next_group_id();
+        let delta = UndoDelta {
+            start: next_cursor,
+            deleted_text: String::new(),
+            inserted_text: String::new(),
+            before_cursor: current_cursor,
+            after_cursor: next_cursor,
+            group_id,
+        };
+        Self::apply_delta_to_snapshot(&mut self.current, &delta, false);
+        self.deltas.push(delta);
+        self.index = self.deltas.len();
+        self.active_group = None;
+        self.trim_history_if_needed();
+    }
+
     fn prepare_completion_edit(&mut self) {
         self.active_group = None;
         self.suppress_next_remote_cursor_move = true;
