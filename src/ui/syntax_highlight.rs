@@ -28,9 +28,6 @@ pub const STYLE_BLOCK_COMMENT: char = 'L';
 pub const STYLE_Q_QUOTE_STRING: char = 'M';
 pub const STYLE_QUOTED_IDENTIFIER: char = 'N';
 
-static ORACLE_FUNCTIONS_SET: Lazy<HashSet<&'static str>> =
-    Lazy::new(|| ORACLE_FUNCTIONS.iter().copied().collect());
-
 /// Oracle's predefined PL/SQL exceptions (`PACKAGE STANDARD`) — `NO_DATA_FOUND`,
 /// `TOO_MANY_ROWS`, etc. Not reserved keywords, so they are absent from
 /// `sql_text::is_sql_keyword_for_db`, and not real functions either, but they are
@@ -63,8 +60,13 @@ const ORACLE_PLSQL_PREDEFINED_EXCEPTIONS: &[&str] = &[
     "ZERO_DIVIDE",
 ];
 
-static ORACLE_PLSQL_PREDEFINED_EXCEPTIONS_SET: Lazy<HashSet<&'static str>> =
-    Lazy::new(|| ORACLE_PLSQL_PREDEFINED_EXCEPTIONS.iter().copied().collect());
+static ORACLE_FUNCTIONS_SET: Lazy<HashSet<&'static str>> = Lazy::new(|| {
+    ORACLE_FUNCTIONS
+        .iter()
+        .chain(ORACLE_PLSQL_PREDEFINED_EXCEPTIONS.iter())
+        .copied()
+        .collect()
+});
 
 fn function_catalog_for_db_type(db_type: DatabaseType) -> &'static HashSet<&'static str> {
     match db_type {
@@ -76,8 +78,6 @@ fn function_catalog_for_db_type(db_type: DatabaseType) -> &'static HashSet<&'sta
 
 fn is_builtin_highlight_word(upper: &str, db_type: DatabaseType) -> bool {
     function_catalog_for_db_type(db_type).contains(upper)
-        || (db_type == DatabaseType::Oracle
-            && ORACLE_PLSQL_PREDEFINED_EXCEPTIONS_SET.contains(upper))
 }
 
 fn mysql_compatible_highlight_mode(db_type: DatabaseType) -> bool {

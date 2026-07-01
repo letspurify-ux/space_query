@@ -1307,6 +1307,36 @@ fn is_create_on_table_target(tokens: &[SqlToken], idx: usize) -> bool {
     saw_create_keyword && saw_object_keyword
 }
 
+/// True when `idx` sits inside the header of a `CREATE [OR REPLACE] TRIGGER`
+/// statement — a `CREATE` … `TRIGGER` pair precedes it with no intervening `;`.
+/// Used to spot the trigger *body* opener (`BEGIN`/`DECLARE`); openers of
+/// nested blocks inside the body always follow a `;` (or a later scan hits the
+/// body's own statements), so only the first one matches.
+fn is_create_trigger_statement_scope(tokens: &[SqlToken], idx: usize) -> bool {
+    let mut scan_idx = idx;
+    let mut saw_trigger_keyword = false;
+
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        match tokens.get(scan_idx) {
+            Some(SqlToken::Comment(_)) => continue,
+            Some(SqlToken::Symbol(sym)) if sym == ";" => return false,
+            Some(SqlToken::Word(word)) => {
+                let upper = word.to_ascii_uppercase();
+                if upper == "CREATE" {
+                    return saw_trigger_keyword;
+                }
+                if upper == "TRIGGER" {
+                    saw_trigger_keyword = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    false
+}
+
 fn is_create_table_target(tokens: &[SqlToken], idx: usize) -> bool {
     let mut scan_idx = idx;
     let mut saw_create_keyword = false;
@@ -3609,6 +3639,19 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         depth_frames[depth].statement_kind = StatementKind::ExecuteImmediate;
                         depth_frames[depth].returning_clause_active = false;
                         depth_frames[depth].postgres_conflict_update_active = false;
+                        relation_state.clear();
+                    }
+                    "BEGIN" | "DECLARE" if is_create_trigger_statement_scope(tokens, idx) => {
+                        // A trigger body begins: the header's DML event keywords
+                        // (`BEFORE INSERT OR UPDATE ON emp`) parsed as a DML
+                        // statement (`INSERT` → statement kind, `ON emp` →
+                        // IntoClause), which would otherwise bleed table-target
+                        // context over the whole PL/SQL body. Only the *first*
+                        // body opener resets — nested `BEGIN`s follow a `;`, so
+                        // the trigger-scope scan (which stops at `;`) skips them.
+                        depth_frames[depth].phase = SqlPhase::Initial;
+                        depth_frames[depth].statement_kind = StatementKind::Unknown;
+                        depth_frames[depth].returning_clause_active = false;
                         relation_state.clear();
                     }
                     "WITH" if with_starts_non_cte_query_head(tokens, idx) => {

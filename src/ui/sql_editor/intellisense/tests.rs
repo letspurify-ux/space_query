@@ -60213,7 +60213,9 @@ fn plsql_construct_keyword_slots_final_suggestions_stay_keyword_only() {
         ("BEGIN FETCH c | END;", &["INTO", "BULK COLLECT"]),
         ("BEGIN FETCH c BULK | END;", &["COLLECT"]),
         ("BEGIN FETCH c BULK COLLECT | END;", &["INTO"]),
-        ("BEGIN FORALL i IN 1..10 SAVE | END;", &["SAVE EXCEPTIONS"]),
+        // A typed `SAVE` has spent the compound candidate's first word — the
+        // slot awaits exactly its `EXCEPTIONS` tail.
+        ("BEGIN FORALL i IN 1..10 SAVE | END;", &["EXCEPTIONS"]),
         ("BEGIN IF empno = 1 THEN NULL; END |; END;", &["IF"]),
         ("BEGIN LOOP NULL; END |; END;", &["LOOP"]),
     ] {
@@ -77629,4 +77631,259 @@ fn plsql_named_object_end_offers_enclosing_name() {
     }
 
     assert!(failures.is_empty(), "named END-target gaps:\n{}", failures.join("\n"));
+}
+
+
+/// Exhaustive breadth guard for "nothing is suggested inside PL/SQL": every
+/// known construct slot — declaration-section grammars, executable-statement
+/// tails, expression/condition operands, cursor/dynamic-SQL/FORALL statements,
+/// exception sections, routine/package/trigger bodies — must offer at least one
+/// of its grammatical continuations through the full keyword pipeline (locals
+/// merged where the slot names a declared symbol). Slots whose only valid
+/// continuation is a *fresh name* (or an operator symbol) are asserted
+/// separately to at least stay free of catalog noise.
+#[test]
+fn plsql_known_construct_slots_offer_expected_suggestions() {
+    use crate::db::DatabaseType::Oracle;
+
+    let has = |suggestions: &[String], keyword: &str| {
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case(keyword))
+    };
+    let mut failures = Vec::new();
+
+    // (sql, use_locals_pipeline, at least one of these must be offered)
+    let cases: &[(&str, bool, &[&str])] = &[
+        // ---- declaration section: item grammars ----
+        ("DECLARE | BEGIN NULL; END;", false, &["CURSOR", "TYPE", "PRAGMA", "BEGIN"]),
+        ("DECLARE v | BEGIN NULL; END;", false, &["NUMBER", "VARCHAR2"]),
+        ("DECLARE v NUMBER := | BEGIN NULL; END;", false, &["NULL", "CASE"]),
+        ("DECLARE v NUMBER DEFAULT | BEGIN NULL; END;", false, &["NULL", "CASE"]),
+        ("DECLARE v NUMBER NOT | BEGIN NULL; END;", false, &["NULL"]),
+        ("DECLARE v NUMBER NOT NULL | BEGIN NULL; END;", false, &["DEFAULT"]),
+        ("DECLARE v CONSTANT | BEGIN NULL; END;", false, &["NUMBER", "VARCHAR2"]),
+        ("DECLARE v emp.empno%| BEGIN NULL; END;", false, &["TYPE"]),
+        ("DECLARE r emp%| BEGIN NULL; END;", false, &["TYPE", "ROWTYPE"]),
+        ("DECLARE CURSOR c | BEGIN NULL; END;", false, &["IS", "RETURN"]),
+        ("DECLARE CURSOR c IS | BEGIN NULL; END;", false, &["SELECT", "WITH"]),
+        ("DECLARE CURSOR c (p NUMBER) | BEGIN NULL; END;", false, &["IS", "RETURN"]),
+        ("DECLARE CURSOR c IS SELECT | FROM emp; BEGIN NULL; END;", false, &["EMPNO", "ENAME"]),
+        ("DECLARE CURSOR c (p |) IS SELECT 1 FROM dual; BEGIN NULL; END;", false, &["NUMBER", "IN"]),
+        ("DECLARE TYPE t IS | BEGIN NULL; END;", false, &["RECORD", "TABLE OF", "VARRAY", "REF CURSOR"]),
+        ("DECLARE TYPE t IS TABLE | BEGIN NULL; END;", false, &["OF"]),
+        ("DECLARE TYPE t IS TABLE OF | BEGIN NULL; END;", false, &["NUMBER", "VARCHAR2"]),
+        ("DECLARE TYPE t IS TABLE OF NUMBER | BEGIN NULL; END;", false, &["INDEX BY", "NOT NULL"]),
+        ("DECLARE TYPE t IS TABLE OF NUMBER INDEX | BEGIN NULL; END;", false, &["BY"]),
+        ("DECLARE TYPE t IS TABLE OF NUMBER INDEX BY | BEGIN NULL; END;", false, &["PLS_INTEGER", "VARCHAR2"]),
+        ("DECLARE TYPE t IS VARRAY(10) | BEGIN NULL; END;", false, &["OF"]),
+        ("DECLARE TYPE t IS VARRAY(10) OF | BEGIN NULL; END;", false, &["NUMBER", "VARCHAR2"]),
+        ("DECLARE TYPE t IS VARRAY(10) OF NUMBER | BEGIN NULL; END;", false, &["NOT NULL"]),
+        ("DECLARE TYPE t IS RECORD (f |); BEGIN NULL; END;", false, &["NUMBER", "VARCHAR2"]),
+        ("DECLARE TYPE t IS REF | BEGIN NULL; END;", false, &["CURSOR"]),
+        ("DECLARE TYPE t IS REF CURSOR | BEGIN NULL; END;", false, &["RETURN"]),
+        ("DECLARE SUBTYPE t IS | BEGIN NULL; END;", false, &["NUMBER", "VARCHAR2"]),
+        ("DECLARE e EXCEPTION; PRAGMA | BEGIN NULL; END;", false, &["EXCEPTION_INIT", "AUTONOMOUS_TRANSACTION"]),
+        ("DECLARE e EXCEPTION; PRAGMA EXCEPTION_INIT(|); BEGIN NULL; END;", true, &["e"]),
+        ("DECLARE PROCEDURE p IS BEGIN | END; BEGIN NULL; END;", false, &["IF", "NULL"]),
+        ("DECLARE FUNCTION f RETURN | BEGIN NULL; END;", false, &["NUMBER", "VARCHAR2"]),
+        // ---- executable statement tails ----
+        ("BEGIN EXECUTE | END;", false, &["IMMEDIATE"]),
+        ("BEGIN EXECUTE IMMEDIATE | END;", false, &["NULL", "CASE"]),
+        ("BEGIN EXECUTE IMMEDIATE 'select 1' | END;", false, &["INTO", "USING", "BULK COLLECT INTO"]),
+        ("BEGIN EXECUTE IMMEDIATE 'select 1' BULK | END;", false, &["COLLECT"]),
+        ("BEGIN EXECUTE IMMEDIATE 'select 1' BULK COLLECT | END;", false, &["INTO"]),
+        ("DECLARE v NUMBER; BEGIN EXECUTE IMMEDIATE 'select 1' INTO | END;", true, &["v"]),
+        ("DECLARE v NUMBER; BEGIN EXECUTE IMMEDIATE 'select 1' INTO v | END;", false, &["USING"]),
+        ("DECLARE v NUMBER; BEGIN EXECUTE IMMEDIATE 'select 1' USING | END;", true, &["v"]),
+        ("DECLARE CURSOR c IS SELECT 1 FROM dual; BEGIN OPEN c | END;", false, &["FOR"]),
+        ("DECLARE rc SYS_REFCURSOR; BEGIN OPEN rc FOR | END;", false, &["SELECT", "WITH"]),
+        ("DECLARE CURSOR c IS SELECT 1 FROM dual; BEGIN FETCH c | END;", false, &["INTO", "BULK COLLECT"]),
+        ("DECLARE CURSOR c IS SELECT 1 FROM dual; BEGIN FETCH c BULK | END;", false, &["COLLECT"]),
+        ("DECLARE CURSOR c IS SELECT 1 FROM dual; BEGIN FETCH c BULK COLLECT | END;", false, &["INTO"]),
+        ("DECLARE CURSOR c IS SELECT 1 FROM dual; t tt; BEGIN FETCH c BULK COLLECT INTO t | END;", false, &["LIMIT"]),
+        ("BEGIN PIPE | END;", false, &["ROW"]),
+        ("BEGIN PIPE ROW(|); END;", false, &["NULL", "CASE"]),
+        ("BEGIN FORALL i IN | ; END;", false, &["NULL", "CASE"]),
+        ("BEGIN FORALL i IN INDICES | ; END;", false, &["OF"]),
+        ("BEGIN FORALL i IN VALUES | ; END;", false, &["OF"]),
+        ("DECLARE t tt; BEGIN FORALL i IN INDICES OF | ; END;", true, &["t"]),
+        ("BEGIN FORALL i IN 1 .. 10 | ; END;", false, &["INSERT", "UPDATE", "DELETE", "SAVE EXCEPTIONS"]),
+        ("BEGIN FORALL i IN 1 .. 10 SAVE | ; END;", false, &["EXCEPTIONS"]),
+        ("BEGIN FOR i IN REVERSE | LOOP NULL; END LOOP; END;", false, &["NULL", "CASE"]),
+        ("BEGIN SAVEPOINT sp; ROLLBACK TO | END;", false, &["SAVEPOINT"]),
+        ("BEGIN UPDATE emp SET sal = 1; COMMIT; | END;", false, &["IF", "NULL"]),
+        ("BEGIN SELECT empno BULK COLLECT | FROM emp; END;", false, &["FROM", "EMPNO"]),
+        ("DECLARE t tt; BEGIN SELECT empno BULK COLLECT INTO | FROM emp; END;", true, &["t"]),
+        // ---- expression / condition operands ----
+        ("BEGIN v := | END;", false, &["NULL", "CASE", "SQLCODE"]),
+        ("BEGIN v := a + | END;", false, &["NULL", "CASE"]),
+        ("BEGIN v := a || __CODEX_CURSOR__ END;", false, &["NULL", "CASE"]),
+        ("BEGIN v := NOT | END;", false, &["NULL", "CASE", "TRUE", "FALSE"]),
+        ("BEGIN v := NVL(|, 0); END;", false, &["NULL", "CASE"]),
+        ("BEGIN proc(p => |); END;", false, &["NULL", "CASE"]),
+        ("BEGIN IF v IS | THEN NULL; END IF; END;", false, &["NULL", "NOT"]),
+        ("BEGIN IF v BETWEEN | AND 10 THEN NULL; END IF; END;", false, &["NULL", "CASE"]),
+        ("BEGIN IF v IN (|) THEN NULL; END IF; END;", false, &["NULL", "CASE"]),
+        ("BEGIN IF v | THEN NULL; END IF; END;", false, &["THEN"]),
+        ("BEGIN IF v = 1 | THEN NULL; END IF; END;", false, &["THEN"]),
+        // ---- expression-CASE (value CASE): arm-value slots are operands, the
+        // tail offers WHEN/ELSE/END (never the statement form's END CASE) ----
+        ("BEGIN v := CASE WHEN | THEN 1 END; END;", false, &["NULL", "CASE", "TRUE", "FALSE"]),
+        ("BEGIN v := CASE WHEN a THEN | END; END;", false, &["NULL", "CASE", "TRUE", "FALSE"]),
+        ("BEGIN v := CASE WHEN a THEN 1 ELSE | END; END;", false, &["NULL", "CASE", "TRUE", "FALSE"]),
+        ("BEGIN v := CASE WHEN a THEN 1 | END; END;", false, &["WHEN", "ELSE", "END"]),
+        ("BEGIN v := CASE x WHEN | THEN 1 END; END;", false, &["NULL", "CASE", "TRUE", "FALSE"]),
+        ("BEGIN v := CASE WHEN x THEN NVL(|, 0) ELSE 2 END; END;", false, &["NULL", "CASE", "TRUE", "FALSE"]),
+        // ---- exception sections ----
+        ("BEGIN NULL; EXCEPTION | END;", false, &["WHEN"]),
+        ("BEGIN NULL; EXCEPTION WHEN | THEN NULL; END;", false, &["OTHERS", "NO_DATA_FOUND"]),
+        ("BEGIN NULL; EXCEPTION WHEN NO_DATA_FOUND | THEN NULL; END;", false, &["THEN"]),
+        ("BEGIN NULL; EXCEPTION WHEN NO_DATA_FOUND OR | THEN NULL; END;", false, &["OTHERS", "TOO_MANY_ROWS"]),
+        ("BEGIN NULL; EXCEPTION WHEN OTHERS THEN | END;", false, &["IF", "NULL", "RAISE"]),
+        ("BEGIN NULL; EXCEPTION WHEN OTHERS THEN v := | END;", false, &["SQLCODE", "SQLERRM"]),
+        ("BEGIN RAISE | END;", false, &["NO_DATA_FOUND", "TOO_MANY_ROWS"]),
+        // ---- routine / package / trigger bodies ----
+        ("CREATE PROCEDURE p IS | BEGIN NULL; END;", false, &["CURSOR", "TYPE", "BEGIN"]),
+        ("CREATE PROCEDURE p (x |) IS BEGIN NULL; END;", false, &["NUMBER", "IN"]),
+        ("CREATE PROCEDURE p (x IN OUT |) IS BEGIN NULL; END;", false, &["NUMBER", "VARCHAR2"]),
+        ("CREATE FUNCTION f RETURN | IS BEGIN NULL; END;", false, &["NUMBER", "VARCHAR2"]),
+        ("CREATE FUNCTION f RETURN NUMBER | IS BEGIN NULL; END;", false, &["DETERMINISTIC", "PIPELINED", "IS"]),
+        ("CREATE FUNCTION f RETURN NUMBER IS BEGIN RETURN | END;", false, &["NULL", "CASE"]),
+        ("CREATE PACKAGE pkg IS | END;", false, &["FUNCTION", "PROCEDURE", "CURSOR"]),
+        ("CREATE PACKAGE BODY pkg IS PROCEDURE p IS BEGIN | END; END;", false, &["IF", "NULL"]),
+        ("CREATE PACKAGE BODY pkg IS PROCEDURE p IS BEGIN NULL; END; BEGIN | END;", false, &["IF", "NULL"]),
+        // ---- trigger bodies: the header's DML-event keywords must not bleed
+        // table-target context into the PL/SQL body ----
+        ("CREATE TRIGGER trg BEFORE INSERT ON emp FOR EACH ROW BEGIN | END;", false, &["IF", "NULL"]),
+        ("CREATE TRIGGER trg BEFORE INSERT OR UPDATE ON emp FOR EACH ROW BEGIN IF | THEN NULL; END IF; END;", false, &["NULL", "CASE", "TRUE", "FALSE"]),
+        ("CREATE TRIGGER trg BEFORE UPDATE ON emp FOR EACH ROW BEGIN v := | END;", false, &["NULL", "CASE"]),
+        ("CREATE TRIGGER trg BEFORE DELETE ON emp FOR EACH ROW DECLARE v NUMBER; BEGIN | END;", false, &["IF", "NULL"]),
+        ("CREATE TRIGGER trg BEFORE INSERT ON emp FOR EACH ROW BEGIN SELECT | INTO v FROM emp; END;", false, &["EMPNO", "ENAME"]),
+        ("CREATE TRIGGER trg BEFORE INSERT ON emp FOR EACH ROW BEGIN CASE WHEN | THEN NULL; END CASE; END;", false, &["NULL", "CASE", "TRUE", "FALSE"]),
+        // ---- embedded DML inside blocks ----
+        ("DECLARE v NUMBER; BEGIN SELECT empno INTO | FROM emp; END;", true, &["v"]),
+        ("DECLARE v NUMBER; BEGIN UPDATE emp SET sal = | ; END;", true, &["v"]),
+        ("DECLARE v NUMBER; BEGIN UPDATE emp SET sal = 1 RETURNING sal INTO | ; END;", true, &["v"]),
+        ("BEGIN DELETE FROM | END;", false, &["EMP", "DEPT"]),
+        ("BEGIN LOCK TABLE | END;", false, &["EMP", "DEPT"]),
+        // ---- cursor attributes ----
+        ("DECLARE CURSOR c IS SELECT 1 FROM dual; BEGIN OPEN c; IF c%| THEN NULL; END IF; END;", false, &["FOUND", "NOTFOUND", "ROWCOUNT", "ISOPEN"]),
+        ("BEGIN UPDATE emp SET sal = 1; IF SQL%| THEN NULL; END IF; END;", false, &["ROWCOUNT", "FOUND"]),
+    ];
+
+    for (sql, with_locals, must_offer_any) in cases {
+        let suggestions = if *with_locals {
+            query_completion_suggestions_with_locals(sql, Oracle)
+        } else {
+            query_keyword_completion_suggestions(sql, Oracle)
+        };
+        if suggestions.is_empty() {
+            failures.push(format!("EMPTY suggestions at `{sql}`"));
+            continue;
+        }
+        if !must_offer_any.iter().any(|keyword| has(&suggestions, keyword)) {
+            failures.push(format!(
+                "none of {must_offer_any:?} offered at `{sql}`: {suggestions:?}"
+            ));
+        }
+    }
+
+    // Fresh-name definition slots and post-operand positions where only an
+    // operator/`;` may follow: an empty list is the correct answer, but the
+    // relation catalog must never leak into them.
+    let name_or_operator_only: &[&str] = &[
+        "BEGIN SAVEPOINT | END;",
+        "CREATE PACKAGE pkg IS PROCEDURE | END;",
+        "BEGIN v := 'abc' | END;",
+        "BEGIN v := 123 | END;",
+        "BEGIN IF a THEN v := 1 | END IF; END;",
+    ];
+    for sql in name_or_operator_only {
+        let suggestions = query_keyword_completion_suggestions(sql, Oracle);
+        for table in ["EMP", "DEPT", "HELP"] {
+            if has(&suggestions, table) {
+                failures.push(format!(
+                    "catalog table {table} leaked into name/operator-only slot `{sql}`: {suggestions:?}"
+                ));
+            }
+        }
+    }
+
+    assert!(failures.is_empty(), "PL/SQL construct-slot gaps:\n{}", failures.join("\n"));
+}
+
+/// Nesting stress for the newly hardened slot classes: the expression-`CASE`
+/// arm slots and the executable statement tails must keep their answers when
+/// wrapped in every statement-body construct, alone and in pairs — the
+/// depth-blind word-scan bug class only shows up once real nesting exists.
+#[test]
+fn plsql_statement_tails_and_value_case_survive_nesting() {
+    use crate::db::DatabaseType::Oracle;
+
+    let wrappers: &[&str] = &[
+        "BEGIN {} END;",
+        "IF v = 1 THEN {} END IF;",
+        "IF v = 1 THEN NULL; ELSE {} END IF;",
+        "LOOP {} END LOOP;",
+        "WHILE v < 10 LOOP {} END LOOP;",
+        "FOR i IN 1 .. 10 LOOP {} END LOOP;",
+        "CASE WHEN v = 1 THEN {} END CASE;",
+        "BEGIN NULL; {} EXCEPTION WHEN OTHERS THEN NULL; END;",
+    ];
+    // (label, inner statement with `|` cursor, at least one of these offered)
+    let slots: &[(&str, &str, &[&str])] = &[
+        ("case-when", "x := CASE WHEN | THEN 1 END;", &["NULL", "CASE", "TRUE", "FALSE"]),
+        ("case-then", "x := CASE WHEN a THEN | END;", &["NULL", "CASE", "TRUE", "FALSE"]),
+        ("case-else", "x := CASE WHEN a THEN 1 ELSE | END;", &["NULL", "CASE", "TRUE", "FALSE"]),
+        ("case-tail", "x := CASE WHEN a THEN 1 | END;", &["WHEN", "ELSE", "END"]),
+        ("case-call-arg", "x := CASE WHEN a THEN NVL(|, 0) END;", &["NULL", "CASE", "TRUE", "FALSE"]),
+        ("exec-imm-tail", "EXECUTE IMMEDIATE 'select 1' | ;", &["INTO", "USING"]),
+        ("fetch-limit", "FETCH c BULK COLLECT INTO t | ;", &["LIMIT"]),
+        ("forall-indices", "FORALL f IN INDICES | ;", &["OF"]),
+        ("pipe-row", "PIPE | ;", &["ROW"]),
+        ("for-reverse", "FOR r2 IN REVERSE | LOOP NULL; END LOOP;", &["NULL", "CASE", "TRUE", "FALSE"]),
+        ("rollback-to", "ROLLBACK TO | ;", &["SAVEPOINT"]),
+    ];
+
+    let has_any = |suggestions: &[String], keywords: &[&str]| {
+        keywords
+            .iter()
+            .any(|keyword| suggestions.iter().any(|s| s.eq_ignore_ascii_case(keyword)))
+    };
+    let mut failures = Vec::new();
+    let mut tested = 0usize;
+
+    for (depth2, outer) in [(false, None), (true, Some(()))] {
+        let _ = outer;
+        for (i, wrapper) in wrappers.iter().enumerate() {
+            for (label, slot_sql, expected) in slots {
+                let body = if depth2 {
+                    // Cycle a second wrapper so each (wrapper, slot) pair is also
+                    // exercised one level deeper inside a different construct.
+                    let second = wrappers[(i + 1) % wrappers.len()];
+                    wrapper.replace("{}", &second.replace("{}", slot_sql))
+                } else {
+                    wrapper.replace("{}", slot_sql)
+                };
+                let sql = format!("BEGIN {body} END;");
+                tested += 1;
+                let suggestions = query_keyword_completion_suggestions(&sql, Oracle);
+                if suggestions.is_empty() {
+                    failures.push(format!("EMPTY at [{label}] depth2={depth2}: `{sql}`"));
+                } else if !has_any(&suggestions, expected) {
+                    failures.push(format!(
+                        "none of {expected:?} at [{label}] depth2={depth2}: `{sql}` -> {suggestions:?}"
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(tested > 150, "expected a large combinatorial sweep, only ran {tested}");
+    assert!(
+        failures.is_empty(),
+        "nested statement-tail/value-CASE gaps ({tested} cases tested):\n{}",
+        failures.join("\n")
+    );
 }

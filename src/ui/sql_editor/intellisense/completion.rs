@@ -393,6 +393,7 @@ enum MysqlExplainIntoSlot {
 enum PlsqlPragmaArgumentSlot {
     AwaitingOpen,
     ValueOnly,
+    ExceptionName,
     RestrictReferencesOption,
     CompletedTail,
 }
@@ -5056,7 +5057,8 @@ impl SqlEditorWidget {
         let is_predicate_left_operand_type =
             Self::current_is_predicate_left_operand_type(tokens, end, data, column_scope);
         let in_package_declaration_default_value =
-            Self::cursor_is_in_package_declaration_default_value(tokens, end, db_type);
+            Self::cursor_is_in_package_declaration_default_value(tokens, end, db_type)
+                || Self::cursor_is_in_plsql_declaration_default_value(tokens, end, db_type);
         if in_package_declaration_default_value
             && matches!(
                 Self::meaningful_tokens_before(tokens, end).last(),
@@ -5118,6 +5120,9 @@ impl SqlEditorWidget {
                                 // can't classify the `IMMEDIATE` keyword tail, so name
                                 // it here explicitly.
                                 | "IMMEDIATE"
+                                // `FOR i IN REVERSE |` opens the range's low bound —
+                                // an operand slot just like the bare `IN |`.
+                                | "REVERSE"
                         )
                 }
                 _ => false,
@@ -5521,11 +5526,22 @@ impl SqlEditorWidget {
                         ..Default::default()
                     })
                 } else {
+                    // A value-expression `CASE` arm: the `WHEN`/`ELSE`/`END`
+                    // continuations only follow a *finished* arm value
+                    // (`THEN 1 |`). Right after `THEN`/`ELSE` — or inside an
+                    // unfinished arm value such as an open call paren
+                    // (`THEN NVL(|`) — the arm still awaits its value, an
+                    // operand slot governed by the expression allowlist.
+                    if Self::cursor_follows_complete_operand(tokens, end) != Some(true) {
+                        return None;
+                    }
                     Some(PlsqlKeywordPolicy {
                         allow_when: !in_else,
                         allow_else: !in_else,
                         allow_end: true,
-                        end_keyword: Some("END CASE"),
+                        // An expression `CASE` closes with a bare `END`, not the
+                        // statement form's `END CASE`.
+                        end_keyword: Some("END"),
                         ..Default::default()
                     })
                 }
@@ -5573,6 +5589,14 @@ impl SqlEditorWidget {
 
     fn cursor_is_at_plsql_exception_name(tokens: &[SqlToken], end: usize) -> bool {
         if Self::cursor_is_at_raise_exception_name(tokens, end) {
+            return true;
+        }
+        // `PRAGMA EXCEPTION_INIT(|` — the first pragma argument names a
+        // declared exception.
+        if matches!(
+            Self::plsql_pragma_argument_slot(tokens, end, None),
+            Some(PlsqlPragmaArgumentSlot::ExceptionName)
+        ) {
             return true;
         }
         #[derive(Clone, Copy)]
@@ -16203,6 +16227,38 @@ impl SqlEditorWidget {
         marker_seen
     }
 
+    /// True when the cursor sits in the default-value expression of a PL/SQL
+    /// *declaration item* — `DECLARE v NUMBER DEFAULT |` / `:= 1 + |`, or the
+    /// same inside a routine's `IS`/`AS` declaration section. The block-declared
+    /// counterpart of [`Self::cursor_is_in_package_declaration_default_value`]
+    /// (which requires a `CREATE … PACKAGE` header): the marker must appear in
+    /// the *current* item (no `;`, region opener, or item keyword in between).
+    fn cursor_is_in_plsql_declaration_default_value(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            || !Self::cursor_is_in_plsql_declaration_region(tokens, end)
+        {
+            return false;
+        }
+        for token in Self::meaningful_tokens_before(tokens, end).iter().rev() {
+            match token {
+                SqlToken::Symbol(sym) if sym == ";" => return false,
+                SqlToken::Symbol(sym) if sym == ":=" => return true,
+                SqlToken::Word(word) => match word.to_ascii_uppercase().as_str() {
+                    "DEFAULT" => return true,
+                    "DECLARE" | "IS" | "AS" | "BEGIN" | "CURSOR" | "TYPE" | "SUBTYPE"
+                    | "PRAGMA" => return false,
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        false
+    }
+
     fn cursor_is_at_package_declaration_default_value_operand_start(
         tokens: &[SqlToken],
         end: usize,
@@ -16400,6 +16456,12 @@ impl SqlEditorWidget {
                     || is_word(last - 1, "DECLARE")
                     || is_word(last - 1, "IS")
                     || is_word(last - 1, "AS"))
+                // A `TYPE t IS |`/`SUBTYPE t IS |` spec-kind slot is not a
+                // variable declaration: `TYPE t IS TABLE |` must await `OF`,
+                // not read `TABLE` as a fresh variable name after the `IS`.
+                && !(last >= 3
+                    && (is_word(last - 1, "IS") || is_word(last - 1, "AS"))
+                    && (is_word(last - 3, "TYPE") || is_word(last - 3, "SUBTYPE")))
             {
                 return true;
             }
@@ -19841,6 +19903,7 @@ impl SqlEditorWidget {
             Some(
                 PlsqlPragmaArgumentSlot::AwaitingOpen
                     | PlsqlPragmaArgumentSlot::ValueOnly
+                    | PlsqlPragmaArgumentSlot::ExceptionName
                     | PlsqlPragmaArgumentSlot::CompletedTail
             )
         ) || Self::cursor_is_after_completed_plsql_pragma_tail_for_context(
@@ -28220,6 +28283,23 @@ impl SqlEditorWidget {
         }
 
         let mysql = crate::sql_text::mysql_compatibility_for_sql("", db_type);
+        // Inside a PL/SQL block every arm below anchors on the statement's
+        // *leading* verb, which the block prefix (`BEGIN …;`) hides — rescope to
+        // the statement containing the cursor (`BEGIN SAVEPOINT sp; ROLLBACK TO |`
+        // → `[ROLLBACK, TO]`) and rerun. The rescoped slice contains no further
+        // depth-0 boundary before the cursor, so the recursion takes this branch
+        // at most once.
+        if !mysql && Self::cursor_in_plsql_executable_block(tokens, end) {
+            let start = Self::plsql_statement_slot_start(tokens, end);
+            if start > 0 {
+                let scoped = tokens.get(start..)?;
+                return Self::expected_transaction_and_dcl_keyword_candidates(
+                    scoped,
+                    end.checked_sub(start)?,
+                    db_type,
+                );
+            }
+        }
         let toks = Self::meaningful_tokens_before(tokens, end);
         let visible_words = toks
             .iter()
@@ -28564,6 +28644,50 @@ impl SqlEditorWidget {
         }
     }
 
+    /// Token index where the PL/SQL statement containing the cursor begins —
+    /// just past the last depth-0 statement boundary (`;`, or a body-opening
+    /// `BEGIN`/`THEN`/`ELSE`/`LOOP`/`EXCEPTION`/`DECLARE` keyword). Boundary
+    /// words inside parens are expression content (`CASE … THEN` in an embedded
+    /// query), not statement boundaries, so depth is tracked.
+    fn plsql_statement_slot_start(tokens: &[SqlToken], end: usize) -> usize {
+        let visible_end = end.min(tokens.len());
+        let mut depth = 0i32;
+        let mut start = 0usize;
+        for (idx, token) in tokens.iter().take(visible_end).enumerate() {
+            match token {
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => depth += 1,
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => depth -= 1,
+                SqlToken::Symbol(sym) if sym == ";" && depth <= 0 => start = idx + 1,
+                SqlToken::Word(word) if depth <= 0 => {
+                    if matches!(
+                        word.to_ascii_uppercase().as_str(),
+                        "BEGIN" | "THEN" | "ELSE" | "LOOP" | "EXCEPTION" | "DECLARE"
+                    ) {
+                        start = idx + 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        start
+    }
+
+    /// Uppercased words of the PL/SQL statement containing the cursor (scoped by
+    /// [`Self::plsql_statement_slot_start`]), so a statement-tail scan can't latch
+    /// onto keywords from an earlier statement in the same block.
+    fn words_for_plsql_statement_slot(tokens: &[SqlToken], end: usize) -> Vec<String> {
+        let start = Self::plsql_statement_slot_start(tokens, end);
+        tokens
+            .get(start..end.min(tokens.len()))
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn words_for_keyword_slot(tokens: &[SqlToken], end: usize) -> Vec<String> {
         let visible_end = end.min(tokens.len());
         let visible_words = tokens
@@ -28624,9 +28748,30 @@ impl SqlEditorWidget {
                     SqlToken::Word(word) => Some(word.as_str()),
                     _ => None,
                 });
-            return (policy.allow_when
-                && prev_word.is_some_and(|word| word.eq_ignore_ascii_case("EXCEPTION")))
-            .then_some(vec!["WHEN"]);
+            if policy.allow_when
+                && prev_word.is_some_and(|word| word.eq_ignore_ascii_case("EXCEPTION"))
+            {
+                return Some(vec!["WHEN"]);
+            }
+            // A value-expression `CASE` arm tail (`v := CASE WHEN a THEN 1 |`):
+            // the policy carries the exact continuations, including the bare
+            // `END` (not the statement form's `END CASE`). The selector-only
+            // policy (`allow_when` without `allow_end`) stays with the richer
+            // `expected_plsql_and_routine_keyword_candidates` source.
+            if policy.allow_end {
+                let mut candidates: Vec<&'static str> = Vec::new();
+                if policy.allow_when {
+                    candidates.push("WHEN");
+                }
+                if policy.allow_else {
+                    candidates.push("ELSE");
+                }
+                if let Some(end_keyword) = policy.end_keyword {
+                    candidates.push(end_keyword);
+                }
+                return Some(candidates);
+            }
+            return None;
         }
 
         let mut candidates: Vec<&'static str> = PLSQL_STATEMENT_KEYWORDS.to_vec();
@@ -28688,6 +28833,15 @@ impl SqlEditorWidget {
                 )
             });
             if has_in && !has_dml {
+                // The sparse-bound forms: `FORALL i IN INDICES |` / `VALUES |`
+                // await their `OF <collection>`.
+                if matches!(words.last().map(String::as_str), Some("INDICES" | "VALUES")) {
+                    return Some(&["OF"]);
+                }
+                // `FORALL … SAVE |` awaits exactly `EXCEPTIONS`.
+                if words.last().map(String::as_str) == Some("SAVE") {
+                    return Some(&["EXCEPTIONS"]);
+                }
                 if words.last().map(String::as_str) == Some("EXCEPTIONS") {
                     return Some(&["INSERT", "UPDATE", "DELETE", "MERGE", "EXECUTE IMMEDIATE"]);
                 }
@@ -28730,6 +28884,64 @@ impl SqlEditorWidget {
                     return Some(&["USING"]);
                 }
             }
+        }
+
+        // Statement-scoped tails: these anchor on the statement's *leading* verb,
+        // so they scan only the words of the statement containing the cursor —
+        // an earlier `EXECUTE IMMEDIATE …;` in the same block must not leak its
+        // tail into the next statement.
+        let stmt_words = Self::words_for_plsql_statement_slot(tokens, end);
+        let stmt_last = stmt_words.last().map(String::as_str);
+
+        // `PIPE |` → `ROW` (pipelined-function emission).
+        if stmt_words.len() == 1 && stmt_words[0] == "PIPE" {
+            return Some(&["ROW"]);
+        }
+
+        // `EXECUTE IMMEDIATE <sql-expr> |` — the result/bind clauses follow the
+        // complete dynamic-SQL expression: `INTO`/`USING`/`BULK COLLECT INTO`,
+        // then `USING` after the `INTO` targets.
+        if stmt_words.first().map(String::as_str) == Some("EXECUTE")
+            && stmt_words.get(1).map(String::as_str) == Some("IMMEDIATE")
+            && !stmt_words.iter().any(|word| word == "USING")
+        {
+            let has_into = stmt_words.iter().any(|word| word == "INTO");
+            if stmt_last == Some("BULK") {
+                return Some(&["COLLECT"]);
+            }
+            if stmt_last == Some("COLLECT") {
+                return Some(&["INTO"]);
+            }
+            // The word list drops literals, so "the operand is complete" is a
+            // token question: the dynamic-SQL string right after `IMMEDIATE`
+            // (`EXECUTE IMMEDIATE 'x' |`) is a `String` token invisible above.
+            // A trailing keyword (`IMMEDIATE |`, `INTO |`) still awaits its
+            // operand/targets, so those slots stay with the operand path.
+            let prev_awaits_operand = matches!(
+                Self::meaningful_tokens_before(tokens, end).last(),
+                Some(SqlToken::Word(word))
+                    if matches!(word.to_ascii_uppercase().as_str(), "IMMEDIATE" | "INTO")
+            );
+            if !prev_awaits_operand
+                && Self::cursor_immediately_follows_complete_operand(tokens, end)
+            {
+                if has_into {
+                    return Some(&["USING"]);
+                }
+                return Some(&["INTO", "USING", "BULK COLLECT INTO"]);
+            }
+        }
+
+        // `FETCH <cur> BULK COLLECT INTO <targets> |` → the optional `LIMIT`.
+        if stmt_words.first().map(String::as_str) == Some("FETCH")
+            && stmt_words.iter().any(|word| word == "BULK")
+            && stmt_words.iter().any(|word| word == "COLLECT")
+            && stmt_words.iter().any(|word| word == "INTO")
+            && !stmt_words.iter().any(|word| word == "LIMIT")
+            && stmt_last != Some("INTO")
+            && Self::cursor_immediately_follows_complete_operand(tokens, end)
+        {
+            return Some(&["LIMIT"]);
         }
 
         match words.as_slice() {
@@ -29359,6 +29571,152 @@ impl SqlEditorWidget {
             })
     }
 
+    /// Keyword tails of the PL/SQL declaration-item grammars that a bare
+    /// word-position scan can't classify — the `CURSOR`/collection-`TYPE`
+    /// sub-grammars and the variable `NOT NULL` constraint:
+    /// `CURSOR c |`→`IS`/`RETURN`, `CURSOR c IS |`→`SELECT`/`WITH`,
+    /// `TYPE t IS TABLE |`→`OF`, `… TABLE OF <type> |`→`INDEX BY`/`NOT NULL`,
+    /// `… INDEX BY |`→ the index types, `… VARRAY(n) |`/`REF CURSOR |` tails,
+    /// and `v <type> NOT [NULL] |`. Scoped to the declaration *item* containing
+    /// the cursor so a keyword from an earlier item (or the enclosing routine
+    /// header) can't leak in.
+    fn expected_plsql_declaration_tail_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            || !Self::cursor_is_in_plsql_declaration_region(tokens, end)
+        {
+            return None;
+        }
+        // The current declaration item: tokens since the last `;`, `DECLARE`, or
+        // a routine-header `IS`/`AS` (a `TYPE t IS …`/`CURSOR c IS …` item keeps
+        // its own `IS`, so only the `IS`/`AS` completing a pending
+        // `FUNCTION`/`PROCEDURE`/`PACKAGE` header is a boundary).
+        let visible_end = end.min(tokens.len());
+        let mut item_start = 0usize;
+        let mut pending_routine_header = false;
+        for (idx, token) in tokens.iter().take(visible_end).enumerate() {
+            match token {
+                SqlToken::Symbol(sym) if sym == ";" => {
+                    item_start = idx + 1;
+                    pending_routine_header = false;
+                }
+                SqlToken::Word(word) => match word.to_ascii_uppercase().as_str() {
+                    "FUNCTION" | "PROCEDURE" | "PACKAGE" => pending_routine_header = true,
+                    "DECLARE" | "BEGIN" => {
+                        item_start = idx + 1;
+                        pending_routine_header = false;
+                    }
+                    "IS" | "AS" if pending_routine_header => {
+                        item_start = idx + 1;
+                        pending_routine_header = false;
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        let item: Vec<String> = tokens
+            .get(item_start..visible_end)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                _ => None,
+            })
+            .collect();
+        let last = item.last().map(String::as_str);
+        let has = |keyword: &str| item.iter().any(|word| word == keyword);
+        let prev_token_is_close_paren = matches!(
+            Self::meaningful_tokens_before(tokens, end).last(),
+            Some(SqlToken::Symbol(sym)) if sym == ")"
+        );
+        let is_keyword = |word: &str| {
+            crate::sql_text::is_sql_keyword_for_db(word, crate::db::DatabaseType::Oracle)
+        };
+
+        // ---- collection/ref-cursor TYPE sub-grammar ----
+        if has("TYPE") || has("SUBTYPE") {
+            if matches!(item.as_slice(), [.., ref_word, cur] if ref_word == "REF" && cur == "CURSOR")
+            {
+                return Some(&["RETURN"]);
+            }
+            if matches!(item.as_slice(), [.., is_word, table] if is_word == "IS" && table == "TABLE")
+            {
+                return Some(&["OF"]);
+            }
+            // `VARRAY(10) |` — the size literal is itself a word token, so
+            // anchor on the closing paren with `VARRAY` present and its `OF`
+            // still missing.
+            if prev_token_is_close_paren && has("VARRAY") && !has("OF") {
+                return Some(&["OF"]);
+            }
+            if last == Some("INDEX") && has("TABLE") && has("OF") {
+                return Some(&["BY"]);
+            }
+            if matches!(item.as_slice(), [.., index, by] if index == "INDEX" && by == "BY") {
+                return Some(&["PLS_INTEGER", "BINARY_INTEGER", "VARCHAR2"]);
+            }
+            // `TABLE OF <type> |` / `VARRAY(n) OF <type> |` — the optional
+            // element-constraint / organization tails after a complete type.
+            if has("OF")
+                && !has("INDEX")
+                && !has("NOT")
+                && !matches!(last, Some("OF" | "TABLE" | "VARRAY" | "IS" | "AS"))
+                && Self::cursor_immediately_follows_complete_operand(tokens, end)
+            {
+                if has("TABLE") {
+                    return Some(&["INDEX BY", "NOT NULL"]);
+                }
+                if has("VARRAY") {
+                    return Some(&["NOT NULL"]);
+                }
+            }
+            if last == Some("NOT") {
+                return Some(&["NULL"]);
+            }
+            return None;
+        }
+
+        // ---- CURSOR declaration sub-grammar (not the `REF CURSOR` type) ----
+        if item.first().is_some_and(|head| head == "CURSOR") {
+            let after = &item[1..];
+            let past_is = after.iter().any(|word| word == "IS");
+            match after {
+                // `CURSOR c [(params)] [RETURN t] IS |` — the query begins.
+                [name, .., is_word] if !is_keyword(name) && is_word == "IS" => {
+                    return Some(&["SELECT", "WITH"])
+                }
+                // `CURSOR c |` (or `CURSOR c (params) |`) — the spec tail. Once
+                // `IS` is present the item is inside its query, whose parens
+                // must not re-offer the spec keywords.
+                [name] if !is_keyword(name) => return Some(&["IS", "RETURN"]),
+                [name, ..] if !is_keyword(name) && !past_is && prev_token_is_close_paren => {
+                    return Some(&["IS", "RETURN"])
+                }
+                _ => return None,
+            }
+        }
+
+        // ---- plain variable/constant item: `v <type> NOT [NULL] |` ----
+        if item
+            .first()
+            .is_some_and(|head| !is_keyword(head))
+            && item.len() >= 2
+            && !has("PRAGMA")
+        {
+            if last == Some("NOT") {
+                return Some(&["NULL"]);
+            }
+            if matches!(item.as_slice(), [.., not, null] if not == "NOT" && null == "NULL") {
+                return Some(&["DEFAULT"]);
+            }
+        }
+        None
+    }
+
     fn expected_plsql_pragma_name_keyword_candidates(
         tokens: &[SqlToken],
         end: usize,
@@ -29493,6 +29851,11 @@ impl SqlEditorWidget {
 
         if pragma_name.eq_ignore_ascii_case("RESTRICT_REFERENCES") && argument_idx >= 1 {
             Some(PlsqlPragmaArgumentSlot::RestrictReferencesOption)
+        } else if pragma_name.eq_ignore_ascii_case("EXCEPTION_INIT") && argument_idx == 0 {
+            // `PRAGMA EXCEPTION_INIT(<exception>, <errcode>)` — the first
+            // argument names a *declared* exception, so the local exception
+            // symbols are offered there (the error number stays value-only).
+            Some(PlsqlPragmaArgumentSlot::ExceptionName)
         } else {
             Some(PlsqlPragmaArgumentSlot::ValueOnly)
         }
@@ -29618,6 +29981,8 @@ impl SqlEditorWidget {
         if Self::expected_plsql_cursor_statement_keywords(tokens, end, db_type).is_some()
             || Self::expected_plsql_local_type_spec_kind_keyword_candidates(tokens, end, db_type)
                 .is_some()
+            || Self::expected_plsql_declaration_tail_keyword_candidates(tokens, end, db_type)
+                .is_some()
             || Self::expected_plsql_pragma_name_keyword_candidates(tokens, end, db_type).is_some()
             || Self::plsql_pragma_argument_slot(tokens, end, db_type).is_some()
             || Self::cursor_is_after_completed_plsql_pragma_tail(tokens, end, db_type)
@@ -29697,7 +30062,6 @@ impl SqlEditorWidget {
                 .chain(last_index("ELSIF"))
                 .max();
             let last_then = last_index("THEN");
-            let last_end = last_index("END");
             let last_loop = last_index("LOOP");
             let last_while = last_index("WHILE");
             let last_for = last_index("FOR");
@@ -29737,11 +30101,15 @@ impl SqlEditorWidget {
                 if current_case_when_awaits_then {
                     return control_expression_complete.then_some(&["THEN"][..]);
                 }
-                if last_case.is_some_and(|idx| {
-                    last_then.is_some_and(|then_idx| then_idx > idx)
-                        && last_end.is_none_or(|end_idx| end_idx < idx)
-                }) {
-                    return Some(&["WHEN", "ELSE", "END CASE"]);
+                // The `WHEN`/`ELSE`/`END CASE` continuations only follow a
+                // *finished* arm value or the bare selector slot (`CASE |`,
+                // deliberately ambiguous — see the locked design note). Right
+                // after `THEN`/`ELSE`, or inside an unfinished arm value such as
+                // an open call paren (`THEN NVL(|`), the arm awaits its value —
+                // an operand slot, not a continuation.
+                let at_bare_selector = last == Some("CASE");
+                if !control_expression_complete && !at_bare_selector {
+                    return None;
                 }
                 return Some(&["WHEN", "ELSE", "END CASE"]);
             }
@@ -29796,6 +30164,13 @@ impl SqlEditorWidget {
             return Some(&["AUTHID", "IS", "AS"]);
         }
         if contains("TRIGGER") {
+            // Once the trigger *body* has begun (`… FOR EACH ROW BEGIN …`), the
+            // cursor is in ordinary PL/SQL code — the header-progression
+            // keywords below (`WHEN`/`DECLARE`/`BEGIN`, referencing aliases)
+            // must not shadow the body's own statement/expression sources.
+            if Self::cursor_is_after_oracle_trigger_body_start(tokens, end) {
+                return None;
+            }
             const TRIGGER_BODY_START_WITH_REFERENCING: &[&str] =
                 &["REFERENCING", "FOR EACH ROW", "WHEN", "DECLARE", "BEGIN"];
             const TRIGGER_BODY_START: &[&str] = &["FOR EACH ROW", "WHEN", "DECLARE", "BEGIN"];
@@ -40336,7 +40711,13 @@ impl SqlEditorWidget {
             && Self::cursor_is_at_plsql_exception_name(tokens, context_end)
         {
             let candidates = Self::filter_expected_candidates(prefix, PLSQL_PREDEFINED_EXCEPTIONS);
-            let candidates = if Self::cursor_is_at_raise_exception_name(tokens, context_end) {
+            // `OTHERS` is the handler-only catch-all: it can be neither raised
+            // nor bound to an error code by `PRAGMA EXCEPTION_INIT`.
+            let candidates = if Self::cursor_is_at_raise_exception_name(tokens, context_end)
+                || matches!(
+                    Self::plsql_pragma_argument_slot(tokens, context_end, db_type),
+                    Some(PlsqlPragmaArgumentSlot::ExceptionName)
+                ) {
                 candidates.into_iter().filter(|c| c != "OTHERS").collect()
             } else {
                 candidates
@@ -40595,6 +40976,20 @@ impl SqlEditorWidget {
         )
         .or_else(|| {
             Self::expected_plsql_local_type_spec_kind_keyword_candidates(
+                statement_tokens,
+                statement_context_end,
+                db_type,
+            )
+        }) {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(candidates) = Self::expected_plsql_declaration_tail_keyword_candidates(
+            tokens,
+            context_end,
+            db_type,
+        )
+        .or_else(|| {
+            Self::expected_plsql_declaration_tail_keyword_candidates(
                 statement_tokens,
                 statement_context_end,
                 db_type,
