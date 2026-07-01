@@ -45427,6 +45427,25 @@ fn query_keyword_completion_suggestions(
     sql_with_cursor: &str,
     db_type: crate::db::DatabaseType,
 ) -> Vec<String> {
+    query_completion_suggestions_impl(sql_with_cursor, db_type, false)
+}
+
+/// Same pipeline as [`query_keyword_completion_suggestions`] but also merges the
+/// block's local symbols (declared variables, constants, cursors, parameters, …)
+/// through the real collection + position gate, so a test can assert a declared
+/// variable actually surfaces at a given cursor slot.
+fn query_completion_suggestions_with_locals(
+    sql_with_cursor: &str,
+    db_type: crate::db::DatabaseType,
+) -> Vec<String> {
+    query_completion_suggestions_impl(sql_with_cursor, db_type, true)
+}
+
+fn query_completion_suggestions_impl(
+    sql_with_cursor: &str,
+    db_type: crate::db::DatabaseType,
+    include_locals: bool,
+) -> Vec<String> {
     let cursor = sql_with_cursor.find('|').expect("cursor");
     let sql = sql_with_cursor.replace('|', "");
     let (routine_cache, expanded) =
@@ -45560,6 +45579,29 @@ fn query_keyword_completion_suggestions(
             &prefix,
             Some(db_type),
         );
+    }
+    if include_locals {
+        let at_name_only_local_symbol_slot =
+            SqlEditorWidget::cursor_is_at_plsql_goto_label_slot_for_context(
+                &deep_ctx,
+                !prefix.is_empty(),
+                Some(db_type),
+            ) || SqlEditorWidget::cursor_is_at_plsql_exception_name_for_context(
+                &deep_ctx,
+                !prefix.is_empty(),
+            );
+        if source_allowance.local_suggestions || at_name_only_local_symbol_slot {
+            let locals = SqlEditorWidget::collect_local_symbol_suggestions(
+                &prefix,
+                expanded.cursor_in_statement,
+                &analysis,
+                &[],
+            );
+            if !locals.is_empty() && source_allowance.prepend_local_symbol_suggestions {
+                suggestions =
+                    SqlEditorWidget::prepend_local_symbol_suggestions(suggestions, locals);
+            }
+        }
     }
     suggestions
 }
@@ -75483,6 +75525,26 @@ fn plsql_constructs_always_offer_suggestions() {
         // ---- routine headers with body ----
         ("CREATE PROCEDURE p IS BEGIN | END;", &["IF", "NULL", "RETURN"]),
         ("CREATE OR REPLACE PROCEDURE p AS BEGIN | END;", &["IF", "NULL"]),
+        // ---- EXIT/CONTINUE WHEN guards ----
+        ("BEGIN LOOP EXIT WHEN | ; END LOOP; END;", &["NULL", "CASE", "TRUE", "FALSE"]),
+        ("BEGIN LOOP CONTINUE WHEN | ; END LOOP; END;", &["NULL", "CASE", "TRUE", "FALSE"]),
+        // ---- FORALL ----
+        ("BEGIN FORALL i IN 1 .. 10 | ; END;", &["INSERT", "UPDATE", "DELETE"]),
+        // ---- nested block with its own EXCEPTION section ----
+        ("BEGIN BEGIN NULL; EXCEPTION WHEN | THEN NULL; END; END;", &["NO_DATA_FOUND", "OTHERS"]),
+        ("BEGIN BEGIN | EXCEPTION WHEN OTHERS THEN NULL; END; END;", &["IF", "NULL", "RETURN"]),
+        // ---- deeply nested IF/LOOP/IF/CASE ----
+        ("BEGIN IF a THEN LOOP IF b THEN CASE WHEN c THEN | END CASE; END IF; END LOOP; END IF; END;", &["IF", "NULL", "WHEN"]),
+        // ---- sub-block after preceding statements ----
+        ("BEGIN NULL; DECLARE v NUMBER; BEGIN | END; END;", &["IF", "NULL"]),
+        // ---- CASE selector slot (offers the searched-CASE `WHEN`), `WHEN … AND` ----
+        ("BEGIN CASE | WHEN 1 THEN NULL; END CASE; END;", &["WHEN"]),
+        ("BEGIN CASE WHEN a = 1 AND | THEN NULL; END CASE; END;", &["NULL", "CASE", "TRUE", "FALSE"]),
+        // ---- call-statement arguments, PIPE ROW, VALUES ----
+        ("BEGIN raise_application_error(-20001, |); END;", &["NULL", "CASE"]),
+        ("BEGIN PIPE ROW(|); END;", &["NULL", "CASE"]),
+        ("BEGIN INSERT INTO emp VALUES (|); END;", &["NULL", "CASE"]),
+        ("BEGIN UPDATE emp SET sal = | WHERE empno = 1; END;", &["NULL", "CASE"]),
     ];
 
     for (sql, must_offer_any) in cases {
@@ -75516,3 +75578,151 @@ fn plsql_constructs_always_offer_suggestions() {
     assert!(failures.is_empty(), "PL/SQL suggestion gaps:\n{}", failures.join("\n"));
 }
 
+
+
+#[test]
+fn plsql_goto_offers_block_labels() {
+    // `<<label>>` markers in the executable body are offered at a `GOTO |` target.
+    let s = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+        "BEGIN\n  <<retry>>\n  NULL;\n  <<done>>\n  GOTO __CODEX_CURSOR__\nEND;",
+        &[],
+    );
+    assert_has_case_insensitive(&s, "retry");
+    assert_has_case_insensitive(&s, "done");
+
+    // Prefix-filtered.
+    let s2 = SqlEditorWidget::collect_local_symbol_suggestions_with_prefix_for_test(
+        "BEGIN\n  <<retry>>\n  <<reset>>\n  <<done>>\n  GOTO re__CODEX_CURSOR__\nEND;",
+        "re",
+        &[],
+    );
+    assert_has_case_insensitive(&s2, "retry");
+    assert_has_case_insensitive(&s2, "reset");
+    assert!(
+        !s2.iter().any(|x| x.eq_ignore_ascii_case("done")),
+        "prefix `re` should exclude `done`: {s2:?}"
+    );
+
+    // Labels must NOT leak at a non-GOTO statement start.
+    let s3 = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+        "BEGIN\n  <<retry>>\n  __CODEX_CURSOR__NULL;\nEND;",
+        &[],
+    );
+    assert!(
+        !s3.iter().any(|x| x.eq_ignore_ascii_case("retry")),
+        "label leaked at a non-GOTO position: {s3:?}"
+    );
+}
+
+/// Mass coverage: every kind of PL/SQL local (scalar, constant, `%TYPE`, `%ROWTYPE`,
+/// record, cursor, ref-cursor, exception, routine parameter, FOR-loop index, nested-
+/// block var) must surface at the value/name positions where it is grammatical, and
+/// only there — verified through the full completion pipeline (base + keywords +
+/// local-symbol merge + position gate), not the raw symbol collector.
+#[test]
+fn plsql_local_variables_are_suggested_across_positions() {
+    use crate::db::DatabaseType::Oracle;
+    let has = |s: &[String], want: &str| s.iter().any(|x| x.eq_ignore_ascii_case(want));
+    let mut failures = Vec::new();
+
+    // Shared declaration section exercising each variable kind.
+    let decls = "DECLARE \
+        v_num NUMBER := 0; \
+        c_flag CONSTANT VARCHAR2(1) := 'Y'; \
+        v_sal emp.sal%TYPE; \
+        r_emp emp%ROWTYPE; \
+        e_custom EXCEPTION; \
+        CURSOR emp_cur IS SELECT * FROM emp; \
+        v_rc SYS_REFCURSOR;";
+
+    // Value positions: every non-exception local is a valid operand and must appear.
+    let value_vars = ["v_num", "c_flag", "v_sal", "r_emp", "emp_cur", "v_rc"];
+    let value_positions: &[(&str, String)] = &[
+        ("assignment RHS", format!("{decls} BEGIN v_num := | ; END;")),
+        ("arith operand", format!("{decls} BEGIN v_num := 1 + | ; END;")),
+        ("IF condition", format!("{decls} BEGIN IF | THEN NULL; END IF; END;")),
+        ("WHILE condition", format!("{decls} BEGIN WHILE | LOOP NULL; END LOOP; END;")),
+        ("CASE WHEN", format!("{decls} BEGIN CASE WHEN | THEN NULL; END CASE; END;")),
+        ("call argument", format!("{decls} BEGIN dbms_output.put_line(|); END;")),
+        ("nth call argument", format!("{decls} BEGIN some_proc(1, |); END;")),
+        ("RETURN value", format!("CREATE FUNCTION f RETURN NUMBER IS {decls_body} BEGIN RETURN | ; END;", decls_body = decls.trim_start_matches("DECLARE"))),
+        ("embedded WHERE", format!("{decls} BEGIN SELECT sal INTO v_sal FROM emp WHERE sal > | ; END;")),
+    ];
+    for (label, sql) in value_positions {
+        let s = query_completion_suggestions_with_locals(sql, Oracle);
+        for var in value_vars {
+            if !has(&s, var) {
+                failures.push(format!("`{var}` missing at [{label}] `{sql}`: {:?}", &s));
+            }
+        }
+    }
+
+    // Prefix filtering: typing `v_` narrows to the v_-prefixed locals only.
+    let s = query_completion_suggestions_with_locals(
+        &format!("{decls} BEGIN x := v_| ; END;"), Oracle);
+    for want in ["v_num", "v_sal", "v_rc"] {
+        if !has(&s, want) {
+            failures.push(format!("prefix `v_` dropped `{want}`: {s:?}"));
+        }
+    }
+    if has(&s, "c_flag") {
+        failures.push(format!("prefix `v_` leaked `c_flag`: {s:?}"));
+    }
+
+    // Routine parameters and the FOR-loop index are locals too.
+    let s = query_completion_suggestions_with_locals(
+        "CREATE PROCEDURE p(p_id IN NUMBER, p_name IN VARCHAR2) IS BEGIN x := | ; END;", Oracle);
+    for want in ["p_id", "p_name"] {
+        if !has(&s, want) {
+            failures.push(format!("routine parameter `{want}` missing: {s:?}"));
+        }
+    }
+    let s = query_completion_suggestions_with_locals(
+        "BEGIN FOR i IN 1 .. 10 LOOP x := i + | ; END LOOP; END;", Oracle);
+    if !has(&s, "i") {
+        failures.push(format!("FOR-loop index `i` missing in loop body: {s:?}"));
+    }
+
+    // Nested block: inner sees both scopes; the outer must not see the inner var.
+    let nested_inner = "DECLARE v_out NUMBER; BEGIN DECLARE v_in NUMBER; BEGIN v_in := | ; END; END;";
+    let s = query_completion_suggestions_with_locals(nested_inner, Oracle);
+    for want in ["v_in", "v_out"] {
+        if !has(&s, want) {
+            failures.push(format!("nested inner position dropped `{want}`: {s:?}"));
+        }
+    }
+    let nested_outer = "DECLARE v_out NUMBER; BEGIN DECLARE v_in NUMBER; BEGIN NULL; END; v_out := | ; END;";
+    let s = query_completion_suggestions_with_locals(nested_outer, Oracle);
+    if !has(&s, "v_out") {
+        failures.push(format!("outer var `v_out` missing after nested block: {s:?}"));
+    }
+    if has(&s, "v_in") {
+        failures.push(format!("inner var `v_in` leaked into outer scope: {s:?}"));
+    }
+
+    // Exception-name slots: only declared exceptions (scope-correct), never a scalar.
+    for (label, sql) in [
+        ("RAISE", format!("{decls} BEGIN RAISE | ; END;")),
+        ("EXCEPTION WHEN", format!("{decls} BEGIN NULL; EXCEPTION WHEN | THEN NULL; END;")),
+    ] {
+        let s = query_completion_suggestions_with_locals(&sql, Oracle);
+        if !has(&s, "e_custom") {
+            failures.push(format!("declared exception `e_custom` missing at [{label}]: {:?}", &s));
+        }
+        if has(&s, "v_num") {
+            failures.push(format!("scalar `v_num` leaked into exception slot [{label}]: {:?}", &s));
+        }
+    }
+
+    // Explicit RECORD-type members complete on the qualified member slot.
+    let members = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        "DECLARE TYPE rec IS RECORD (id NUMBER, nm VARCHAR2(10)); v rec; BEGIN x := v.__CODEX_CURSOR__ ; END;",
+        "v", "");
+    match members {
+        Some(m) if m.iter().any(|x| x.eq_ignore_ascii_case("id"))
+            && m.iter().any(|x| x.eq_ignore_ascii_case("nm")) => {}
+        other => failures.push(format!("record members not offered on `v.`: {other:?}")),
+    }
+
+    assert!(failures.is_empty(), "PL/SQL variable suggestion gaps:\n{}", failures.join("\n"));
+}

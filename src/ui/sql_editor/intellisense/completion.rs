@@ -2580,16 +2580,30 @@ impl SqlEditorWidget {
         } else {
             Vec::new()
         };
-        let mut local_suggestions = if source_allowance.local_suggestions {
-            Self::collect_local_symbol_suggestions(
-                &snapshot.prefix,
-                cursor_in_statement,
-                analysis,
-                &session_bind_names,
-            )
-        } else {
-            Vec::new()
-        };
+        // `GOTO |` / `RAISE |` / `EXCEPTION WHEN |` are identifier-suppressing keyword
+        // slots (so `source_allowance.local_suggestions` is off), yet each still admits
+        // one local-symbol kind — a block label or a declared exception. Collect those
+        // there too; `collect_local_symbol_suggestions` returns only the slot's kind.
+        let at_name_only_local_symbol_slot = qualifier.is_none()
+            && (Self::cursor_is_at_plsql_goto_label_slot_for_context(
+                deep_ctx,
+                !snapshot.prefix.is_empty(),
+                Some(snapshot.preferred_db_type),
+            ) || Self::cursor_is_at_plsql_exception_name_for_context(
+                deep_ctx,
+                !snapshot.prefix.is_empty(),
+            ));
+        let mut local_suggestions =
+            if source_allowance.local_suggestions || at_name_only_local_symbol_slot {
+                Self::collect_local_symbol_suggestions(
+                    &snapshot.prefix,
+                    cursor_in_statement,
+                    analysis,
+                    &session_bind_names,
+                )
+            } else {
+                Vec::new()
+            };
         if qualifier.is_none() {
             let trigger_alias_suggestions = if effective_expr_keyword_ctx.at_bind_variable_name {
                 Self::oracle_trigger_correlation_alias_suggestions_for_context(
@@ -28582,6 +28596,105 @@ impl SqlEditorWidget {
             [.., SqlToken::Word(goto), label]
                 if goto.eq_ignore_ascii_case("GOTO") && is_label_word(label)
         )
+    }
+
+    /// Label names declared as `<<label>>` anywhere in the current block, offered at
+    /// a `GOTO |` target slot. The tokenizer emits a whole `<<label>>` marker as one
+    /// `Word`, so strip the `<<`/`>>` fence and keep the inner identifier. Filtered by
+    /// the typed prefix; duplicates collapsed.
+    fn plsql_block_label_suggestions(
+        deep_ctx: &intellisense_context::CursorContext,
+        prefix: &str,
+    ) -> Vec<String> {
+        let prefix_upper = prefix.to_ascii_uppercase();
+        let mut seen = std::collections::HashSet::new();
+        let mut labels = Vec::new();
+        for token in deep_ctx.statement_tokens.as_ref() {
+            let SqlToken::Word(word) = token else {
+                continue;
+            };
+            let trimmed = word.trim();
+            let Some(inner) = trimmed
+                .strip_prefix("<<")
+                .and_then(|rest| rest.strip_suffix(">>"))
+                .map(str::trim)
+                .filter(|inner| !inner.is_empty())
+            else {
+                continue;
+            };
+            if !inner.to_ascii_uppercase().starts_with(&prefix_upper) {
+                continue;
+            }
+            if seen.insert(inner.to_ascii_uppercase()) {
+                labels.push(inner.to_string());
+            }
+        }
+        labels
+    }
+
+    /// Exception names declared in the current block as `name EXCEPTION;`, offered at
+    /// an exception-name slot (`RAISE |`, `EXCEPTION WHEN |`). These are declaration
+    /// symbols the value-symbol table intentionally leaves out of exception slots, so
+    /// scan the block tokens directly for the `<ident> EXCEPTION ;` shape (the section
+    /// keyword `EXCEPTION` is preceded by a statement/`;`, never an identifier + `;`).
+    fn plsql_block_exception_declarations(
+        deep_ctx: &intellisense_context::CursorContext,
+        prefix: &str,
+    ) -> Vec<String> {
+        let prefix_upper = prefix.to_ascii_uppercase();
+        let meaningful: Vec<&SqlToken> = deep_ctx
+            .statement_tokens
+            .as_ref()
+            .iter()
+            .filter(|token| !matches!(token, SqlToken::Comment(_)))
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        let mut names = Vec::new();
+        for window in meaningful.windows(3) {
+            let [name_token, exception_token, terminator] = window else {
+                continue;
+            };
+            let (SqlToken::Word(name), SqlToken::Word(keyword)) = (name_token, exception_token)
+            else {
+                continue;
+            };
+            if !keyword.eq_ignore_ascii_case("EXCEPTION")
+                || !matches!(terminator, SqlToken::Symbol(sym) if sym == ";")
+                || crate::sql_text::is_sql_keyword_for_db(name, crate::db::DatabaseType::Oracle)
+            {
+                continue;
+            }
+            if !name.to_ascii_uppercase().starts_with(&prefix_upper) {
+                continue;
+            }
+            if seen.insert(name.to_ascii_uppercase()) {
+                names.push(name.clone());
+            }
+        }
+        names
+    }
+
+    fn cursor_is_at_plsql_exception_name_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let context_end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        if Self::cursor_is_at_plsql_exception_name(tokens, context_end) {
+            return true;
+        }
+        let statement_tokens = deep_ctx.statement_tokens.as_ref();
+        let statement_end = Self::expected_suggestion_context_end(
+            statement_tokens,
+            deep_ctx.cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::cursor_is_at_plsql_exception_name(statement_tokens, statement_end)
     }
 
     fn cursor_is_at_plsql_goto_label_slot_for_context(

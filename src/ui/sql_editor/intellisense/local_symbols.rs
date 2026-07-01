@@ -459,6 +459,32 @@ impl SqlEditorWidget {
                 .statement_end
                 .saturating_sub(analysis.statement_start),
         );
+
+        // A `GOTO |` target is a block label — never a value symbol — and labels are
+        // not in the value-symbol table, so short-circuit to the label scan.
+        if Self::cursor_is_at_plsql_goto_label_slot_for_context(
+            analysis.context.as_ref(),
+            !prefix.is_empty(),
+            None,
+        ) {
+            return Self::plsql_block_label_suggestions(analysis.context.as_ref(), prefix);
+        }
+        // A `RAISE |`/`EXCEPTION WHEN |` name is an exception. Exceptions ARE scoped
+        // value symbols, but so are ordinary variables/cursors; retain only the ones
+        // whose block declaration is `name EXCEPTION;` (scanned from the tokens), which
+        // keeps the result both exception-only and scope-correct (the scoped collection
+        // below already dropped out-of-scope declarations).
+        let exception_name_filter = Self::cursor_is_at_plsql_exception_name_for_context(
+            analysis.context.as_ref(),
+            !prefix.is_empty(),
+        )
+        .then(|| {
+            Self::plsql_block_exception_declarations(analysis.context.as_ref(), prefix)
+                .into_iter()
+                .map(|name| name.to_ascii_uppercase())
+                .collect::<HashSet<_>>()
+        });
+
         let mut suggestions = Vec::new();
         let mut seen_dynamic_symbols = HashSet::new();
 
@@ -498,6 +524,14 @@ impl SqlEditorWidget {
                     suggestions.push(name);
                 }
             }
+        }
+
+        // At an exception-name slot, drop every non-exception symbol and stop — a bind
+        // or session variable is never a valid exception name.
+        if let Some(exception_names) = exception_name_filter {
+            suggestions
+                .retain(|name| exception_names.contains(&name.to_ascii_uppercase()));
+            return suggestions;
         }
 
         for name in analysis.text_bind_names.iter() {
