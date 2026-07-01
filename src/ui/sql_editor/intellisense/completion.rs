@@ -2748,6 +2748,33 @@ impl SqlEditorWidget {
                     Some(snapshot.preferred_db_type),
                 )
             }
+            // `<sequence>.|` — the only members of a sequence are the pseudocolumns
+            // `NEXTVAL`/`CURRVAL`. Gated on the qualifier resolving to a known sequence
+            // so `<table>.|`/`<package>.|` are unaffected. Oracle-only.
+            (Some(qualifier), _)
+                if !crate::sql_text::mysql_compatibility_for_sql(
+                    "",
+                    Some(snapshot.preferred_db_type),
+                ) =>
+            {
+                let is_sequence = {
+                    let data = intellisense_data
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    Self::matches_string_list_case_insensitive(&data.sequences, qualifier)
+                };
+                if is_sequence {
+                    ["NEXTVAL", "CURRVAL"]
+                        .into_iter()
+                        .filter(|pseudo| {
+                            Self::completion_suggestion_matches_prefix(pseudo, &snapshot.prefix)
+                        })
+                        .map(str::to_string)
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            }
             _ => Vec::new(),
         };
         let allow_dml_returning_into_keyword =
@@ -12561,6 +12588,60 @@ impl SqlEditorWidget {
         Self::type_attribute_candidates(tokens, end, db_type).is_some()
     }
 
+    /// `<cursor>%|` / `SQL%|` inside an executable block — the PL/SQL cursor
+    /// attributes. Distinct from the declaration-only `%TYPE`/`%ROWTYPE` slot
+    /// (`type_attribute_candidates`, gated to a data-type position): in executable
+    /// code a `name %` is always a cursor-attribute reference (Oracle has no modulo
+    /// operator — `MOD` is a function), so the whole catalog is suppressed and only
+    /// the attribute keywords are grammatical. `SQL` (the implicit cursor) also
+    /// carries the FORALL bulk attributes.
+    fn plsql_cursor_attribute_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            || !Self::cursor_in_plsql_executable_block(tokens, end)
+            || Self::type_attribute_candidates(tokens, end, db_type).is_some()
+        {
+            return None;
+        }
+        const ATTRIBUTES: &[&str] = &["FOUND", "NOTFOUND", "ROWCOUNT", "ISOPEN"];
+        const SQL_ATTRIBUTES: &[&str] = &[
+            "FOUND",
+            "NOTFOUND",
+            "ROWCOUNT",
+            "ISOPEN",
+            "BULK_ROWCOUNT",
+            "BULK_EXCEPTIONS",
+        ];
+        match Self::meaningful_tokens_before(tokens, end).as_slice() {
+            [.., SqlToken::Word(name), SqlToken::Symbol(pct)] if pct == "%" => {
+                Some(if name.eq_ignore_ascii_case("SQL") {
+                    SQL_ATTRIBUTES
+                } else {
+                    ATTRIBUTES
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn cursor_is_at_plsql_cursor_attribute_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::plsql_cursor_attribute_candidates(tokens, end, db_type).is_some()
+    }
+
     /// Privilege hints for the `GRANT |` / `REVOKE |` privilege list, before the
     /// `ON`/`TO`/`FROM` separator. Emission only — a role name is also valid here
     /// (`GRANT my_role TO u`), so identifiers are NOT suppressed; the privileges
@@ -18745,6 +18826,11 @@ impl SqlEditorWidget {
                         exclude_current_identifier_chain,
                     )
                     .is_some_and(analytic_null_treatment_slot_suppresses_columns)))
+            || Self::cursor_is_at_plsql_cursor_attribute_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
             || Self::cursor_is_at_is_predicate_keyword_position_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
@@ -19229,6 +19315,11 @@ impl SqlEditorWidget {
                     )
                     .is_some_and(analytic_null_treatment_slot_suppresses_columns)))
             || Self::cursor_is_at_type_attribute_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+            || Self::cursor_is_at_plsql_cursor_attribute_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
                 db_type,
@@ -40305,6 +40396,12 @@ impl SqlEditorWidget {
         }
 
         if let Some(candidates) = Self::type_attribute_candidates(tokens, context_end, db_type) {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+
+        if let Some(candidates) =
+            Self::plsql_cursor_attribute_candidates(tokens, context_end, db_type)
+        {
             return Self::filter_expected_candidates(prefix, candidates);
         }
 

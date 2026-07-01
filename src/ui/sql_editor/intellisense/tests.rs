@@ -3042,6 +3042,21 @@ fn audit_final_suggestions_impl(
                 Some(db),
             )
         }
+        (Some(qualifier), _)
+            if !crate::sql_text::mysql_compatibility_for_sql("", Some(db))
+                && SqlEditorWidget::matches_string_list_case_insensitive(
+                    &data.sequences,
+                    qualifier,
+                ) =>
+        {
+            ["NEXTVAL", "CURRVAL"]
+                .into_iter()
+                .filter(|pseudo| {
+                    SqlEditorWidget::completion_suggestion_matches_prefix(pseudo, &prefix)
+                })
+                .map(str::to_string)
+                .collect()
+        }
         _ => Vec::new(),
     };
     let replace_table_context_with_expected_objects =
@@ -45446,8 +45461,17 @@ fn query_completion_suggestions_impl(
     db_type: crate::db::DatabaseType,
     include_locals: bool,
 ) -> Vec<String> {
-    let cursor = sql_with_cursor.find('|').expect("cursor");
-    let sql = sql_with_cursor.replace('|', "");
+    // The `|` marker collides with the `||` concatenation operator, so honor the
+    // explicit `__CODEX_CURSOR__` marker first for SQL that contains pipes.
+    const MARKER: &str = "__CODEX_CURSOR__";
+    let (cursor, sql) = if let Some(pos) = sql_with_cursor.find(MARKER) {
+        (pos, sql_with_cursor.replacen(MARKER, "", 1))
+    } else {
+        (
+            sql_with_cursor.find('|').expect("cursor"),
+            sql_with_cursor.replace('|', ""),
+        )
+    };
     let (routine_cache, expanded) =
         SqlEditorWidget::build_routine_symbol_cache_bundle_for_test(&sql, cursor);
     let analysis = SqlEditorWidget::build_intellisense_analysis_from_routine_cache(
@@ -75725,4 +75749,129 @@ fn plsql_local_variables_are_suggested_across_positions() {
     }
 
     assert!(failures.is_empty(), "PL/SQL variable suggestion gaps:\n{}", failures.join("\n"));
+}
+
+/// Cursor attributes: `<cursor>%|` and the implicit `SQL%|` inside an executable
+/// block offer only the attribute keywords, and the object catalog is suppressed
+/// (previously `SQL%|` leaked the whole schema catalog).
+#[test]
+fn plsql_cursor_attributes_are_offered_and_suppress_catalog() {
+    use crate::db::DatabaseType::Oracle;
+    let has = |s: &[String], k: &str| s.iter().any(|x| x.eq_ignore_ascii_case(k));
+    let mut failures = Vec::new();
+
+    let sql_cur = query_completion_suggestions_with_locals(
+        "BEGIN IF SQL%__CODEX_CURSOR__ THEN NULL; END IF; END;", Oracle);
+    for kw in ["FOUND", "NOTFOUND", "ROWCOUNT", "ISOPEN", "BULK_ROWCOUNT", "BULK_EXCEPTIONS"] {
+        if !has(&sql_cur, kw) {
+            failures.push(format!("`{kw}` missing at `SQL%|`: {sql_cur:?}"));
+        }
+    }
+    for leaked in ["HR_PKG", "CALC_TOTAL", "EMP_SEQ", "NULL", "CASE"] {
+        if has(&sql_cur, leaked) {
+            failures.push(format!("`{leaked}` leaked at `SQL%|`: {sql_cur:?}"));
+        }
+    }
+
+    let named = query_completion_suggestions_with_locals(
+        "DECLARE CURSOR c IS SELECT 1 FROM dual; BEGIN IF c%__CODEX_CURSOR__ THEN NULL; END IF; END;", Oracle);
+    for kw in ["FOUND", "NOTFOUND", "ROWCOUNT", "ISOPEN"] {
+        if !has(&named, kw) {
+            failures.push(format!("`{kw}` missing at `c%|`: {named:?}"));
+        }
+    }
+    // A named cursor has no bulk attributes.
+    if has(&named, "BULK_ROWCOUNT") {
+        failures.push(format!("`BULK_ROWCOUNT` wrongly offered for a named cursor: {named:?}"));
+    }
+    // Prefix filtering.
+    let pref = query_completion_suggestions_with_locals(
+        "BEGIN IF SQL%NOT__CODEX_CURSOR__ THEN NULL; END IF; END;", Oracle);
+    if !has(&pref, "NOTFOUND") || has(&pref, "FOUND") {
+        failures.push(format!("prefix `NOT` should keep only NOTFOUND: {pref:?}"));
+    }
+
+    // `%TYPE`/`%ROWTYPE` in a declaration must NOT become cursor attributes.
+    let decl = query_completion_suggestions_with_locals(
+        "DECLARE v emp.sal%__CODEX_CURSOR__ ; BEGIN NULL; END;", Oracle);
+    if has(&decl, "FOUND") {
+        failures.push(format!("cursor attribute leaked into a `%TYPE` declaration slot: {decl:?}"));
+    }
+    if !has(&decl, "TYPE") {
+        failures.push(format!("`%TYPE` slot lost its TYPE keyword: {decl:?}"));
+    }
+
+    assert!(failures.is_empty(), "cursor-attribute gaps:\n{}", failures.join("\n"));
+}
+
+/// Sequence pseudocolumns: `<sequence>.|` offers `NEXTVAL`/`CURRVAL`, gated to a
+/// real sequence qualifier so a table/other qualifier is unaffected.
+#[test]
+fn oracle_sequence_qualifier_offers_pseudocolumns() {
+    use crate::db::DatabaseType::Oracle;
+    let contains = |s: &[String], k: &str| s.iter().any(|x| x.eq_ignore_ascii_case(k));
+
+    for sql in ["SELECT emp_seq.| FROM dual", "INSERT INTO emp (empno) VALUES (emp_seq.|)"] {
+        let (_, _, fin) = audit_final_suggestions_for(sql, Oracle);
+        assert!(contains(&fin, "NEXTVAL") && contains(&fin, "CURRVAL"),
+            "sequence pseudocolumns missing at `{sql}`: {fin:?}");
+    }
+
+    // Prefix filter.
+    let (_, _, fin) = audit_final_suggestions_for("SELECT emp_seq.CURR| FROM dual", Oracle);
+    assert!(fin.iter().any(|x| x.eq_ignore_ascii_case("CURRVAL"))
+        && !fin.iter().any(|x| x.eq_ignore_ascii_case("NEXTVAL")),
+        "prefix `CURR` should keep only CURRVAL: {fin:?}");
+
+    // A non-sequence qualifier gets no pseudocolumns.
+    let (_, _, fin) = audit_final_suggestions_for("SELECT emp.| FROM dual", Oracle);
+    assert!(!fin.iter().any(|x| x.eq_ignore_ascii_case("NEXTVAL")),
+        "NEXTVAL leaked onto a table qualifier: {fin:?}");
+}
+
+/// Extended construct coverage: dynamic SQL binds, bulk/collection statements,
+/// named-parameter association, RETURNING INTO targets, richer embedded DML,
+/// concatenation operands, and loop-label EXIT guards all offer suggestions (never
+/// blank). Uses the `__CODEX_CURSOR__` marker so `||` does not collide with `|`.
+#[test]
+fn plsql_extended_constructs_offer_suggestions() {
+    use crate::db::DatabaseType::Oracle;
+    let has = |s: &[String], k: &str| s.iter().any(|x| x.eq_ignore_ascii_case(k));
+    let d = "DECLARE v_num NUMBER; v_str VARCHAR2(100); b_flag BOOLEAN; \
+        TYPE num_tab IS TABLE OF NUMBER; arr num_tab := num_tab(); \
+        CURSOR c_emp IS SELECT empno FROM emp;";
+    let mut failures = Vec::new();
+
+    // (sql-with-marker, one-of keywords/identifiers that must appear)
+    let cases: &[(String, &[&str])] = &[
+        (format!("{d} BEGIN FETCH c_emp BULK COLLECT INTO __CODEX_CURSOR__ ; END;"), &["arr", "v_num"]),
+        (format!("{d} BEGIN SELECT empno BULK COLLECT INTO __CODEX_CURSOR__ FROM emp; END;"), &["arr", "v_num"]),
+        (format!("{d} BEGIN FORALL i IN 1 .. arr.COUNT __CODEX_CURSOR__ ; END;"), &["INSERT", "UPDATE", "DELETE"]),
+        (format!("{d} BEGIN some_proc(p_id => __CODEX_CURSOR__); END;"), &["v_num", "NULL", "CASE"]),
+        (format!("{d} BEGIN some_proc(a, p_nm => __CODEX_CURSOR__); END;"), &["v_num", "NULL", "CASE"]),
+        (format!("{d} BEGIN UPDATE emp SET sal = 1 RETURNING sal INTO __CODEX_CURSOR__ ; END;"), &["v_num", "arr"]),
+        (format!("{d} BEGIN INSERT INTO emp (sal) VALUES (1) RETURNING empno INTO __CODEX_CURSOR__ ; END;"), &["v_num"]),
+        (format!("{d} BEGIN INSERT INTO emp (empno, sal) VALUES (__CODEX_CURSOR__, 1); END;"), &["v_num", "NULL", "CASE"]),
+        (format!("{d} BEGIN UPDATE emp SET sal = __CODEX_CURSOR__, deptno = 2; END;"), &["v_num", "NULL", "CASE"]),
+        (format!("{d} BEGIN MERGE INTO emp e USING dept d ON (e.deptno = d.deptno) WHEN MATCHED THEN UPDATE SET sal = __CODEX_CURSOR__ ; END;"), &["v_num", "NULL", "CASE"]),
+        (format!("{d} BEGIN v_str := v_str || __CODEX_CURSOR__ ; END;"), &["v_str", "NULL", "CASE"]),
+        (format!("{d} BEGIN v_str := 'x' || __CODEX_CURSOR__ ; END;"), &["v_str", "NULL", "CASE"]),
+        (format!("{d} BEGIN b_flag := __CODEX_CURSOR__ ; END;"), &["b_flag", "NULL", "TRUE", "FALSE"]),
+        (format!("{d} BEGIN IF b_flag AND __CODEX_CURSOR__ THEN NULL; END IF; END;"), &["b_flag", "NULL", "CASE"]),
+        (format!("{d} BEGIN <<lp>> LOOP EXIT __CODEX_CURSOR__ ; END LOOP; END;"), &["WHEN"]),
+        (format!("{d} BEGIN <<lp>> LOOP EXIT lp WHEN __CODEX_CURSOR__ ; END LOOP; END;"), &["v_num", "NULL", "CASE"]),
+        (format!("{d} BEGIN EXECUTE IMMEDIATE 'x' USING __CODEX_CURSOR__ ; END;"), &["v_num", "NULL", "CASE"]),
+        (format!("{d} BEGIN EXECUTE IMMEDIATE 'x' INTO __CODEX_CURSOR__ ; END;"), &["v_num"]),
+        (format!("{d} BEGIN v_num := nvl(v_num, __CODEX_CURSOR__); END;"), &["v_num", "NULL", "CASE"]),
+    ];
+    for (sql, want_any) in cases {
+        let s = query_completion_suggestions_with_locals(sql, Oracle);
+        if s.is_empty() {
+            failures.push(format!("EMPTY at `{}`", sql.split("BEGIN").last().unwrap().trim()));
+        } else if !want_any.iter().any(|k| has(&s, k)) {
+            failures.push(format!("none of {want_any:?} at `{}`: {s:?}",
+                sql.split("BEGIN").last().unwrap().trim()));
+        }
+    }
+    assert!(failures.is_empty(), "extended construct gaps:\n{}", failures.join("\n"));
 }
