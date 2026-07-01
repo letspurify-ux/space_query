@@ -4945,7 +4945,7 @@ mod execution_state_tests {
         classify_edit_group, inserted_text, load_mutex_bool, load_mutex_bool_option,
         try_mark_query_running, BufferEdit, EditGranularity, EditOperation, HighlightShadowState,
         IntellisenseRuntimeState, QueryProgress, SqlEditorWidget, UndoDelta, UndoSnapshot,
-        WordUndoRedoState, STYLE_DEFAULT,
+        WordUndoRedoState, MAX_WORD_UNDO_HISTORY, STYLE_DEFAULT,
     };
     use fltk::app;
     use fltk::enums::Event;
@@ -5179,6 +5179,7 @@ mod execution_state_tests {
             applying_history: true,
             suppress_next_remote_cursor_move: true,
             finish_group_after_next_edit: true,
+            completion_edit_group_id: Some(1),
         }));
 
         SqlEditorWidget::reset_word_undo_state(&undo_state);
@@ -5196,6 +5197,7 @@ mod execution_state_tests {
         assert!(!state.applying_history);
         assert!(!state.suppress_next_remote_cursor_move);
         assert!(!state.finish_group_after_next_edit);
+        assert_eq!(state.completion_edit_group_id, None);
     }
 
     #[test]
@@ -5683,6 +5685,177 @@ mod execution_state_tests {
         assert_eq!(completion_group.len(), 1);
         assert_eq!(state.current.text, "n");
         assert_eq!(state.undo_cursor_after_group(&completion_group), 1);
+    }
+
+    #[test]
+    fn redo_function_completion_restores_caret_offset_cursor() {
+        let mut state = WordUndoRedoState::new("n".to_string());
+
+        state.prepare_completion_edit();
+        state.record_edit(
+            &build_edit(0, "n", "NVL()"),
+            classify_edit_group("NVL()".len() as i32, "n".len() as i32, "NVL()", "n"),
+        );
+        state.finish_completion_edit_cursor(4, true);
+
+        let undo_group = state.take_undo_group();
+        assert_eq!(undo_group.len(), 1);
+        assert_eq!(state.current.text, "n");
+
+        let redo_group = state.take_redo_group();
+        assert_eq!(redo_group.len(), 1);
+        assert_eq!(state.current.text, "NVL()");
+        assert_eq!(state.current.cursor_pos, 4);
+    }
+
+    #[test]
+    fn function_completion_after_undo_truncates_redo_and_keeps_caret_offset() {
+        let mut state = WordUndoRedoState::new("n".to_string());
+
+        state.record_edit(&build_edit(1, "", "x"), classify_edit_group(1, 0, "x", ""));
+
+        let stale_group = state.take_undo_group();
+        assert_eq!(stale_group.len(), 1);
+        assert_eq!(state.current.text, "n");
+
+        state.prepare_completion_edit();
+        state.record_edit(
+            &build_edit(0, "n", "NVL()"),
+            classify_edit_group("NVL()".len() as i32, "n".len() as i32, "NVL()", "n"),
+        );
+        state.finish_completion_edit_cursor(4, true);
+
+        assert_eq!(state.deltas.len(), 1);
+        assert_eq!(state.current.text, "NVL()");
+        assert_eq!(state.current.cursor_pos, 4);
+
+        let completion_group = state.take_undo_group();
+        assert_eq!(completion_group.len(), 1);
+        assert_eq!(state.current.text, "n");
+
+        let redo_group = state.take_redo_group();
+        assert_eq!(redo_group.len(), 1);
+        assert_eq!(state.current.text, "NVL()");
+        assert_eq!(state.current.cursor_pos, 4);
+    }
+
+    #[test]
+    fn function_completion_after_history_trim_keeps_caret_offset() {
+        let mut state = WordUndoRedoState::new("n".to_string());
+
+        for _ in 0..=MAX_WORD_UNDO_HISTORY {
+            let start = state.current.text.len();
+            state.record_edit(
+                &build_edit(start, "", ";"),
+                classify_edit_group(1, 0, ";", ""),
+            );
+        }
+
+        state.current.cursor_pos = 1;
+        state.prepare_completion_edit();
+        state.record_edit(
+            &build_edit(0, "n", "NVL()"),
+            classify_edit_group("NVL()".len() as i32, "n".len() as i32, "NVL()", "n"),
+        );
+        state.finish_completion_edit_cursor(4, true);
+
+        assert_eq!(state.current.cursor_pos, 4);
+
+        let completion_group = state.take_undo_group();
+        assert_eq!(completion_group.len(), 1);
+        assert!(state.current.text.starts_with('n'));
+
+        let redo_group = state.take_redo_group();
+        assert_eq!(redo_group.len(), 1);
+        assert!(state.current.text.starts_with("NVL()"));
+        assert_eq!(state.current.cursor_pos, 4);
+    }
+
+    #[test]
+    fn redo_intellisense_replacement_restores_completion_cursor() {
+        let mut state = WordUndoRedoState::new("varchar2".to_string());
+
+        state.record_edit(&build_edit(7, "2", ""), classify_edit_group(0, 1, "", "2"));
+        state.record_edit(&build_edit(6, "r", ""), classify_edit_group(0, 1, "", "r"));
+        state.prepare_completion_edit();
+        state.record_edit(
+            &build_edit(0, "varcha", "varchar2"),
+            classify_edit_group(
+                "varchar2".len() as i32,
+                "varcha".len() as i32,
+                "varchar2",
+                "varcha",
+            ),
+        );
+        state.finish_completion_edit_cursor(8, true);
+
+        let completion_group = state.take_undo_group();
+        assert_eq!(completion_group.len(), 1);
+        assert_eq!(state.current.text, "varcha");
+
+        let redo_group = state.take_redo_group();
+        assert_eq!(redo_group.len(), 1);
+        assert_eq!(state.current.text, "varchar2");
+        assert_eq!(state.current.cursor_pos, 8);
+    }
+
+    #[test]
+    fn redo_chain_after_completion_and_followup_typing_keeps_group_boundaries() {
+        let mut state = WordUndoRedoState::new("varchar2".to_string());
+
+        state.record_edit(&build_edit(7, "2", ""), classify_edit_group(0, 1, "", "2"));
+        state.record_edit(&build_edit(6, "r", ""), classify_edit_group(0, 1, "", "r"));
+        state.prepare_completion_edit();
+        state.record_edit(
+            &build_edit(0, "varcha", "varchar2"),
+            classify_edit_group(
+                "varchar2".len() as i32,
+                "varcha".len() as i32,
+                "varchar2",
+                "varcha",
+            ),
+        );
+        state.finish_completion_edit_cursor(8, true);
+        state.record_edit(&build_edit(8, "", "x"), classify_edit_group(1, 0, "x", ""));
+
+        let typing_undo = state.take_undo_group();
+        assert_eq!(typing_undo.len(), 1);
+        assert_eq!(state.current.text, "varchar2");
+        assert_eq!(state.undo_cursor_after_group(&typing_undo), 8);
+
+        let completion_undo = state.take_undo_group();
+        assert_eq!(completion_undo.len(), 1);
+        assert_eq!(state.current.text, "varcha");
+        assert_eq!(state.undo_cursor_after_group(&completion_undo), 6);
+
+        let completion_redo = state.take_redo_group();
+        assert_eq!(completion_redo.len(), 1);
+        assert_eq!(state.current.text, "varchar2");
+        assert_eq!(state.current.cursor_pos, 8);
+
+        let typing_redo = state.take_redo_group();
+        assert_eq!(typing_redo.len(), 1);
+        assert_eq!(state.current.text, "varchar2x");
+        assert_eq!(state.current.cursor_pos, 9);
+    }
+
+    #[test]
+    fn completion_cursor_finish_without_edit_does_not_rewrite_previous_delta() {
+        let mut state = WordUndoRedoState::new("abc".to_string());
+
+        state.record_edit(&build_edit(3, "", "x"), classify_edit_group(1, 0, "x", ""));
+        let previous_after_cursor = state.deltas.last().map(|delta| delta.after_cursor);
+
+        state.prepare_completion_edit();
+        state.finish_completion_edit_cursor(0, true);
+
+        assert_eq!(
+            state.deltas.last().map(|delta| delta.after_cursor),
+            previous_after_cursor
+        );
+        assert!(!state.suppress_next_remote_cursor_move);
+        assert!(!state.finish_group_after_next_edit);
+        assert_eq!(state.completion_edit_group_id, None);
     }
 
     #[test]

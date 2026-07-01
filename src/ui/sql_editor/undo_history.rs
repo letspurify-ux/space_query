@@ -62,6 +62,7 @@ struct WordUndoRedoState {
     applying_history: bool,
     suppress_next_remote_cursor_move: bool,
     finish_group_after_next_edit: bool,
+    completion_edit_group_id: Option<u64>,
 }
 
 impl WordUndoRedoState {
@@ -79,6 +80,7 @@ impl WordUndoRedoState {
             applying_history: false,
             suppress_next_remote_cursor_move: false,
             finish_group_after_next_edit: false,
+            completion_edit_group_id: None,
         }
     }
 
@@ -412,12 +414,14 @@ impl WordUndoRedoState {
         self.active_group = None;
         self.suppress_next_remote_cursor_move = false;
         self.finish_group_after_next_edit = false;
+        self.completion_edit_group_id = None;
     }
 
     fn prepare_completion_edit(&mut self) {
         self.active_group = None;
         self.suppress_next_remote_cursor_move = true;
         self.finish_group_after_next_edit = true;
+        self.completion_edit_group_id = None;
     }
 
     fn finish_completion_edit_cursor(&mut self, cursor_pos: usize, changed_text: bool) {
@@ -426,9 +430,14 @@ impl WordUndoRedoState {
             cursor_pos.min(self.current.text.len()),
         );
         self.current.cursor_pos = cursor;
-        if changed_text && self.index == self.deltas.len() {
+        let completion_group_id = self.completion_edit_group_id.take();
+        self.suppress_next_remote_cursor_move = false;
+        self.finish_group_after_next_edit = false;
+        if changed_text && completion_group_id.is_some() && self.index == self.deltas.len() {
             if let Some(delta) = self.deltas.last_mut() {
-                delta.after_cursor = cursor;
+                if Some(delta.group_id) == completion_group_id {
+                    delta.after_cursor = cursor;
+                }
             }
         }
     }
@@ -463,6 +472,9 @@ impl WordUndoRedoState {
         } else {
             self.next_group_id()
         };
+        if finish_group_after_edit {
+            self.completion_edit_group_id = Some(group_id);
+        }
 
         Self::apply_edit_to_snapshot(&mut self.current, &normalized_edit);
         let after_cursor = self.current.cursor_pos;
@@ -833,6 +845,7 @@ impl SqlEditorWidget {
         state.applying_history = false;
         state.suppress_next_remote_cursor_move = false;
         state.finish_group_after_next_edit = false;
+        state.completion_edit_group_id = None;
     }
 
     fn apply_delta_to_buffer(buffer: &mut TextBuffer, delta: &UndoDelta, reverse: bool) {
@@ -882,6 +895,7 @@ impl SqlEditorWidget {
             state.applying_history = false;
             state.suppress_next_remote_cursor_move = false;
             state.finish_group_after_next_edit = false;
+            state.completion_edit_group_id = None;
         }
         *self
             .history_cursor
