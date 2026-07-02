@@ -1027,10 +1027,29 @@ impl SqlEditorWidget {
                                 &text_shadow_for_handle,
                                 word_start,
                             );
-                            if Self::should_auto_trigger_intellisense_for_forced_char(
-                                &word,
-                                qualifier.as_deref(),
-                            ) {
+                            // A space right after `END` auto-opens the popup when
+                            // the slot has a known completion (the enclosing
+                            // object's name / the construct qualifier) — those
+                            // never get a 2-char prefix to trigger on otherwise.
+                            let end_slot_auto_trigger = ch.is_whitespace()
+                                && word.is_empty()
+                                && qualifier.is_none()
+                                && {
+                                    let guard = text_shadow_for_handle
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                    Self::plsql_end_auto_trigger_applies_in_text(
+                                        &guard.text,
+                                        cursor_pos.max(0) as usize,
+                                        Some(intellisense_runtime_for_handle.cached_db_type()),
+                                    )
+                                };
+                            if end_slot_auto_trigger
+                                || Self::should_auto_trigger_intellisense_for_forced_char(
+                                    &word,
+                                    qualifier.as_deref(),
+                                )
+                            {
                                 Self::schedule_keyup_intellisense_debounce(
                                     &intellisense_runtime_for_handle,
                                     cursor_pos,

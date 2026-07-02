@@ -561,6 +561,130 @@ const PLSQL_PREDEFINED_EXCEPTIONS: &[&str] = &[
     "ZERO_DIVIDE",
 ];
 
+/// Frequently used members of the Oracle-supplied PL/SQL packages, offered at a
+/// `<package>.|` qualifier (`dbms_output.|` → `PUT_LINE`). A curated static
+/// catalog — the supplied packages are not in the user's object catalog, so
+/// without this the qualifier resolves to nothing. Routine names only (plus a
+/// few widely used constants); not exhaustive.
+const ORACLE_BUILTIN_PACKAGE_MEMBERS: &[(&str, &[&str])] = &[
+    (
+        "DBMS_OUTPUT",
+        &["PUT_LINE", "PUT", "NEW_LINE", "GET_LINE", "GET_LINES", "ENABLE", "DISABLE"],
+    ),
+    (
+        "DBMS_LOB",
+        &[
+            "APPEND", "COMPARE", "CONVERTTOBLOB", "CONVERTTOCLOB", "COPY", "CREATETEMPORARY",
+            "ERASE", "FILECLOSE", "FILEEXISTS", "FILEOPEN", "FREETEMPORARY", "GETLENGTH",
+            "INSTR", "ISOPEN", "ISTEMPORARY", "READ", "SUBSTR", "TRIM", "WRITE", "WRITEAPPEND",
+        ],
+    ),
+    (
+        "DBMS_SQL",
+        &[
+            "OPEN_CURSOR", "PARSE", "BIND_VARIABLE", "DEFINE_COLUMN", "EXECUTE",
+            "EXECUTE_AND_FETCH", "FETCH_ROWS", "COLUMN_VALUE", "VARIABLE_VALUE",
+            "CLOSE_CURSOR", "IS_OPEN", "LAST_ERROR_POSITION", "RETURN_RESULT",
+            "TO_REFCURSOR", "TO_CURSOR_NUMBER", "NATIVE",
+        ],
+    ),
+    (
+        "DBMS_UTILITY",
+        &[
+            "FORMAT_ERROR_STACK", "FORMAT_ERROR_BACKTRACE", "FORMAT_CALL_STACK", "GET_TIME",
+            "GET_CPU_TIME", "COMMA_TO_TABLE", "TABLE_TO_COMMA", "COMPILE_SCHEMA",
+            "GET_HASH_VALUE", "DB_VERSION",
+        ],
+    ),
+    (
+        "DBMS_RANDOM",
+        &["VALUE", "STRING", "NORMAL", "RANDOM", "SEED", "INITIALIZE", "TERMINATE"],
+    ),
+    (
+        "DBMS_METADATA",
+        &[
+            "GET_DDL", "GET_DEPENDENT_DDL", "GET_GRANTED_DDL", "SET_TRANSFORM_PARAM",
+            "SESSION_TRANSFORM",
+        ],
+    ),
+    (
+        "DBMS_STATS",
+        &[
+            "GATHER_TABLE_STATS", "GATHER_SCHEMA_STATS", "GATHER_INDEX_STATS",
+            "GATHER_DATABASE_STATS", "GATHER_DICTIONARY_STATS", "DELETE_TABLE_STATS",
+            "SET_TABLE_STATS", "EXPORT_TABLE_STATS", "IMPORT_TABLE_STATS", "LOCK_TABLE_STATS",
+            "UNLOCK_TABLE_STATS",
+        ],
+    ),
+    ("DBMS_XPLAN", &["DISPLAY", "DISPLAY_CURSOR", "DISPLAY_AWR", "DISPLAY_PLAN"]),
+    (
+        "DBMS_APPLICATION_INFO",
+        &[
+            "SET_MODULE", "SET_ACTION", "SET_CLIENT_INFO", "READ_MODULE", "READ_CLIENT_INFO",
+            "SET_SESSION_LONGOPS",
+        ],
+    ),
+    (
+        "DBMS_SESSION",
+        &[
+            "SET_IDENTIFIER", "CLEAR_IDENTIFIER", "SET_CONTEXT", "CLEAR_CONTEXT", "SET_NLS",
+            "RESET_PACKAGE", "SLEEP", "UNIQUE_SESSION_ID",
+        ],
+    ),
+    (
+        "DBMS_SCHEDULER",
+        &[
+            "CREATE_JOB", "DROP_JOB", "ENABLE", "DISABLE", "RUN_JOB", "STOP_JOB",
+            "SET_ATTRIBUTE", "SET_JOB_ARGUMENT_VALUE", "CREATE_SCHEDULE", "CREATE_PROGRAM",
+        ],
+    ),
+    ("DBMS_LOCK", &["SLEEP", "REQUEST", "RELEASE", "ALLOCATE_UNIQUE"]),
+    ("DBMS_JOB", &["SUBMIT", "REMOVE", "RUN", "CHANGE", "WHAT", "NEXT_DATE", "BROKEN"]),
+    ("DBMS_CRYPTO", &["HASH", "MAC", "ENCRYPT", "DECRYPT", "RANDOMBYTES", "RANDOMINTEGER"]),
+    (
+        "DBMS_ASSERT",
+        &[
+            "SIMPLE_SQL_NAME", "QUALIFIED_SQL_NAME", "SCHEMA_NAME", "SQL_OBJECT_NAME",
+            "ENQUOTE_LITERAL", "ENQUOTE_NAME",
+        ],
+    ),
+    ("DBMS_MVIEW", &["REFRESH", "REFRESH_ALL_MVIEWS", "REFRESH_DEPENDENT", "EXPLAIN_MVIEW"]),
+    (
+        "DBMS_ALERT",
+        &["REGISTER", "REMOVE", "SIGNAL", "WAITANY", "WAITONE", "SET_DEFAULTS"],
+    ),
+    (
+        "DBMS_PIPE",
+        &[
+            "CREATE_PIPE", "PACK_MESSAGE", "UNPACK_MESSAGE", "SEND_MESSAGE", "RECEIVE_MESSAGE",
+            "REMOVE_PIPE", "PURGE",
+        ],
+    ),
+    (
+        "UTL_FILE",
+        &[
+            "FOPEN", "FCLOSE", "FCLOSE_ALL", "GET_LINE", "PUT_LINE", "PUT", "PUTF", "NEW_LINE",
+            "FFLUSH", "FREMOVE", "FRENAME", "FCOPY", "FGETATTR", "IS_OPEN",
+        ],
+    ),
+    (
+        "UTL_RAW",
+        &[
+            "CAST_TO_RAW", "CAST_TO_VARCHAR2", "CAST_TO_NVARCHAR2", "CAST_TO_NUMBER",
+            "CAST_FROM_NUMBER", "LENGTH", "SUBSTR", "CONCAT", "BIT_AND", "BIT_OR", "BIT_XOR",
+        ],
+    ),
+    (
+        "UTL_HTTP",
+        &[
+            "REQUEST", "BEGIN_REQUEST", "SET_HEADER", "WRITE_TEXT", "GET_RESPONSE",
+            "READ_TEXT", "READ_LINE", "END_RESPONSE", "SET_WALLET",
+        ],
+    ),
+    ("UTL_ENCODE", &["BASE64_ENCODE", "BASE64_DECODE", "QUOTED_PRINTABLE_ENCODE", "QUOTED_PRINTABLE_DECODE"]),
+    ("UTL_INADDR", &["GET_HOST_ADDRESS", "GET_HOST_NAME"]),
+];
+
 /// Procedural statement keywords that can open a PL/SQL block statement. Shared
 /// by the base-catalog statement-start filter (`keyword_begins_statement`) and
 /// the grammar-aware block-statement keyword source
@@ -2605,6 +2729,10 @@ impl SqlEditorWidget {
                 deep_ctx,
                 !snapshot.prefix.is_empty(),
                 Some(snapshot.preferred_db_type),
+            ) || Self::cursor_is_at_plsql_open_for_source_slot_for_context(
+                deep_ctx,
+                !snapshot.prefix.is_empty(),
+                Some(snapshot.preferred_db_type),
             ) || Self::cursor_is_at_plsql_exception_name_for_context(
                 deep_ctx,
                 !snapshot.prefix.is_empty(),
@@ -2766,7 +2894,10 @@ impl SqlEditorWidget {
             }
             // `<sequence>.|` — the only members of a sequence are the pseudocolumns
             // `NEXTVAL`/`CURRVAL`. Gated on the qualifier resolving to a known sequence
-            // so `<table>.|`/`<package>.|` are unaffected. Oracle-only.
+            // so `<table>.|`/`<package>.|` are unaffected. `<builtin pkg>.|`
+            // (`dbms_output.|`) and the package currently being edited
+            // (`my_pkg.<spec/body global>`) resolve their members likewise.
+            // Oracle-only.
             (Some(qualifier), _)
                 if !crate::sql_text::mysql_compatibility_for_sql(
                     "",
@@ -2787,8 +2918,17 @@ impl SqlEditorWidget {
                         })
                         .map(str::to_string)
                         .collect()
+                } else if let Some(members) = Self::oracle_builtin_package_member_suggestions(
+                    qualifier,
+                    &snapshot.prefix,
+                ) {
+                    members
                 } else {
-                    Vec::new()
+                    Self::own_package_qualified_member_suggestions(
+                        analysis,
+                        qualifier,
+                        &snapshot.prefix,
+                    )
                 }
             }
             _ => Vec::new(),
@@ -3584,16 +3724,18 @@ impl SqlEditorWidget {
             return data.get_relation_suggestions(prefix);
         }
         // Column/expression slot: items referenceable inside an expression —
-        // columns, relations (as qualifiers / scalar subquery sources), and
+        // columns, relations (as qualifiers / scalar subquery sources),
         // value-producing objects (functions, packages for `pkg.fn`, types for
-        // `CAST`). Bare procedures (not callable in an expression) and schema/user
-        // names are intentionally excluded.
+        // `CAST`), and schemas (qualifier heads: `scott.f()`, `scott.t.col`,
+        // `scott.seq.NEXTVAL`). Bare procedures (not callable in an expression)
+        // are intentionally excluded.
         let mut out = data.get_relation_or_sequence_object_suggestions(prefix);
         for extra in [
             data.get_function_object_suggestions(prefix),
             data.get_package_object_suggestions(prefix),
             data.get_type_object_suggestions(prefix),
             data.get_column_suggestions(prefix, None),
+            data.get_user_suggestions(prefix),
         ] {
             out = Self::merge_suggestions_with_context_aliases(out, extra, false);
         }
@@ -4410,7 +4552,9 @@ impl SqlEditorWidget {
         }
 
         match data.suggestion_type_label(suggestion, db_type) {
-            Some("FUNCTION" | "PACKAGE" | "TYPE" | "SEQUENCE") => true,
+            // A schema/user is a valid qualifier head inside a value expression
+            // (`v := scott.pkg.fn(...)`), just like a package.
+            Some("FUNCTION" | "PACKAGE" | "TYPE" | "SEQUENCE" | "USER") => true,
             Some("KEYWORD") => true,
             Some(_) => false,
             None => !Self::suggestion_is_known_plsql_non_expression_object(data, suggestion),
@@ -28986,6 +29130,56 @@ impl SqlEditorWidget {
         }
     }
 
+    /// The query/dynamic-SQL source slot of `OPEN <cursor> FOR |`. The slot's
+    /// keywords (`SELECT`/`WITH`) make it identifier-suppressing, yet a local
+    /// variable holding dynamic SQL is equally grammatical there
+    /// (`OPEN rc FOR v_sql`), so the local-symbol source is re-admitted via
+    /// `at_name_only_local_symbol_slot` while the object catalog stays out.
+    fn cursor_is_at_plsql_open_for_source_slot(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            || !Self::cursor_in_plsql_executable_block(tokens, end)
+        {
+            return false;
+        }
+        let words = Self::words_for_keyword_slot(tokens, end);
+        matches!(
+            words.as_slice(),
+            [.., open, name, for_word]
+                if open == "OPEN"
+                    && for_word == "FOR"
+                    && !crate::sql_text::is_sql_keyword_for_db(name, crate::db::DatabaseType::Oracle)
+        )
+    }
+
+    fn cursor_is_at_plsql_open_for_source_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let context_end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        if Self::cursor_is_at_plsql_open_for_source_slot(tokens, context_end, db_type) {
+            return true;
+        }
+
+        let statement_tokens = deep_ctx.statement_tokens.as_ref();
+        let statement_end = Self::expected_suggestion_context_end(
+            statement_tokens,
+            deep_ctx.cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::cursor_is_at_plsql_open_for_source_slot(statement_tokens, statement_end, db_type)
+    }
+
     fn cursor_is_at_plsql_goto_label_slot(
         tokens: &[SqlToken],
         end: usize,
@@ -29180,6 +29374,53 @@ impl SqlEditorWidget {
             return false;
         }
         Self::expected_plsql_named_end_target(tokens, end).is_some()
+    }
+
+    /// Cheap pre-check for the `END `-space auto-trigger: the characters right
+    /// before the cursor, past any whitespace, form the bare word `END`.
+    fn cursor_follows_end_keyword_word_in_text(text: &str, cursor: usize) -> bool {
+        let head = match text.get(..cursor.min(text.len())) {
+            Some(head) => head,
+            None => return false,
+        };
+        let trimmed = head.trim_end();
+        let word_start = trimmed
+            .rfind(|ch: char| !crate::sql_text::is_identifier_char(ch))
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
+        trimmed
+            .get(word_start..)
+            .is_some_and(|word| word.eq_ignore_ascii_case("END"))
+    }
+
+    /// Whether typing a space after `END` should auto-open the popup: the slot
+    /// has a *known* completion — the enclosing named object (`END my_proc`) or
+    /// the enclosing construct's qualifier (`END IF`/`LOOP`/`CASE`). An `END`
+    /// with nothing to offer (anonymous block, SQL `CASE … END`) stays quiet, so
+    /// this never turns every space into a popup. The full statement scan only
+    /// runs after the cheap "previous word is END" text check.
+    fn plsql_end_auto_trigger_applies_in_text(
+        full_text: &str,
+        cursor: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            || !Self::cursor_follows_end_keyword_word_in_text(full_text, cursor)
+        {
+            return false;
+        }
+        let expanded =
+            Self::expanded_statement_window_in_text_for_db_type(full_text, cursor, db_type);
+        let spans = super::query_text::tokenize_sql_spanned(&expanded.text);
+        let mut tokens = Vec::with_capacity(spans.len());
+        let mut token_ends = Vec::with_capacity(spans.len());
+        for span in spans {
+            token_ends.push(span.end);
+            tokens.push(span.token);
+        }
+        let end_idx = token_ends.partition_point(|end| *end <= expanded.cursor_in_statement);
+        Self::expected_plsql_named_end_target(&tokens, end_idx).is_some()
+            || Self::expected_plsql_end_qualifier_keywords(&tokens, end_idx, db_type).is_some()
     }
 
     fn cursor_is_at_plsql_named_end_target_slot_for_context(
@@ -47919,6 +48160,97 @@ impl SqlEditorWidget {
     fn completion_identifiers_match(left: &str, right: &str) -> bool {
         Self::completion_identifier_lookup_upper(left)
             == Self::completion_identifier_lookup_upper(right)
+    }
+
+    /// Members of an Oracle-supplied package at a `<pkg>.|` qualifier
+    /// (`dbms_output.|` → `PUT_LINE`, …). `Some` (possibly empty after prefix
+    /// filtering) when the qualifier names a known supplied package, `None`
+    /// otherwise so other qualifier resolutions can run.
+    fn oracle_builtin_package_member_suggestions(
+        qualifier: &str,
+        prefix: &str,
+    ) -> Option<Vec<String>> {
+        let qualifier_upper = Self::completion_identifier_lookup_upper(qualifier);
+        let members = ORACLE_BUILTIN_PACKAGE_MEMBERS
+            .iter()
+            .find_map(|(package, members)| (*package == qualifier_upper).then_some(*members))?;
+        Some(
+            members
+                .iter()
+                .filter(|member| Self::completion_suggestion_matches_prefix(member, prefix))
+                .map(|member| (*member).to_string())
+                .collect(),
+        )
+    }
+
+    /// Members of the package currently being edited, at a `<pkg>.|` qualifier
+    /// whose name matches the statement's own `CREATE PACKAGE [BODY] <pkg>`:
+    /// inside a package, `pkg.symbol` legally qualifies the package-level
+    /// declarations (spec globals merged into the body's root scope plus the
+    /// body's own top-level items) — nested routine locals are excluded.
+    fn own_package_qualified_member_suggestions(
+        analysis: &IntellisenseAnalysis,
+        qualifier: &str,
+        prefix: &str,
+    ) -> Vec<String> {
+        let Some(package_name) =
+            Self::statement_package_name(analysis.context.statement_tokens.as_ref())
+        else {
+            return Vec::new();
+        };
+        if !Self::completion_identifiers_match(&package_name, qualifier) {
+            return Vec::new();
+        }
+        let mut seen = HashSet::new();
+        analysis
+            .local_symbols
+            .iter()
+            .filter(|symbol| symbol.scope_id == 0 && symbol.suggest_name)
+            .filter(|symbol| Self::completion_suggestion_matches_prefix(&symbol.name, prefix))
+            .filter(|symbol| seen.insert(symbol.upper.clone()))
+            .map(|symbol| symbol.name.clone())
+            .collect()
+    }
+
+    /// The object name of a `CREATE [OR REPLACE] [(NON)EDITIONABLE] PACKAGE
+    /// [BODY] [schema.]<name>` statement, or `None` when the statement is not a
+    /// package spec/body. A schema-qualified name resolves to its last segment.
+    fn statement_package_name(tokens: &[SqlToken]) -> Option<String> {
+        let meaningful: Vec<&SqlToken> = tokens
+            .iter()
+            .filter(|token| !matches!(token, SqlToken::Comment(_)))
+            .collect();
+        let word_at = |idx: usize| match meaningful.get(idx) {
+            Some(SqlToken::Word(word)) => Some(word.as_str()),
+            _ => None,
+        };
+        if !word_at(0)?.eq_ignore_ascii_case("CREATE") {
+            return None;
+        }
+        let mut idx = 1;
+        loop {
+            match word_at(idx)?.to_ascii_uppercase().as_str() {
+                "PACKAGE" => {
+                    idx += 1;
+                    break;
+                }
+                "OR" | "REPLACE" | "EDITIONABLE" | "NONEDITIONABLE" => idx += 1,
+                _ => return None,
+            }
+        }
+        if word_at(idx).is_some_and(|word| word.eq_ignore_ascii_case("BODY")) {
+            idx += 1;
+        }
+        let mut name = word_at(idx)?.to_string();
+        idx += 1;
+        while matches!(meaningful.get(idx), Some(SqlToken::Symbol(sym)) if sym.as_str() == ".") {
+            let Some(next) = word_at(idx + 1) else {
+                break;
+            };
+            name = next.to_string();
+            idx += 2;
+        }
+        Some(name)
     }
 
     fn is_unquoted_completion_identifier(text: &str) -> bool {

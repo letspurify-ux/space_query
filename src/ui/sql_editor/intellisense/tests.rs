@@ -3042,20 +3042,23 @@ fn audit_final_suggestions_impl(
                 Some(db),
             )
         }
-        (Some(qualifier), _)
-            if !crate::sql_text::mysql_compatibility_for_sql("", Some(db))
-                && SqlEditorWidget::matches_string_list_case_insensitive(
-                    &data.sequences,
-                    qualifier,
-                ) =>
-        {
-            ["NEXTVAL", "CURRVAL"]
-                .into_iter()
-                .filter(|pseudo| {
-                    SqlEditorWidget::completion_suggestion_matches_prefix(pseudo, &prefix)
-                })
-                .map(str::to_string)
-                .collect()
+        (Some(qualifier), _) if !crate::sql_text::mysql_compatibility_for_sql("", Some(db)) => {
+            if SqlEditorWidget::matches_string_list_case_insensitive(&data.sequences, qualifier) {
+                ["NEXTVAL", "CURRVAL"]
+                    .into_iter()
+                    .filter(|pseudo| {
+                        SqlEditorWidget::completion_suggestion_matches_prefix(pseudo, &prefix)
+                    })
+                    .map(str::to_string)
+                    .collect()
+            } else {
+                // Mirrors the production builtin-package member branch; the
+                // own-package (same-buffer) member source needs the analysis
+                // pipeline this harness does not build, so it is covered by its
+                // own helper-level tests instead.
+                SqlEditorWidget::oracle_builtin_package_member_suggestions(qualifier, &prefix)
+                    .unwrap_or_default()
+            }
         }
         _ => Vec::new(),
     };
@@ -45628,6 +45631,18 @@ fn query_completion_suggestions_impl(
                 &deep_ctx,
                 !prefix.is_empty(),
                 Some(db_type),
+            ) || SqlEditorWidget::cursor_is_at_plsql_exit_continue_label_slot_for_context(
+                &deep_ctx,
+                !prefix.is_empty(),
+                Some(db_type),
+            ) || SqlEditorWidget::cursor_is_at_plsql_named_end_target_slot_for_context(
+                &deep_ctx,
+                !prefix.is_empty(),
+                Some(db_type),
+            ) || SqlEditorWidget::cursor_is_at_plsql_open_for_source_slot_for_context(
+                &deep_ctx,
+                !prefix.is_empty(),
+                Some(db_type),
             ) || SqlEditorWidget::cursor_is_at_plsql_exception_name_for_context(
                 &deep_ctx,
                 !prefix.is_empty(),
@@ -60651,10 +60666,12 @@ fn plsql_for_loop_header_slots_do_not_offer_catalog() {
     use crate::db::DatabaseType::Oracle;
 
     let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+    // Schemas (APP_USER/SCOTT) are deliberately absent from this list: a
+    // schema is a valid expression qualifier head (`FOR i IN scott.pkg.lo ..`),
+    // so it belongs in value-operand slots (see
+    // `schemas_are_offered_as_expression_qualifier_heads`).
     let assert_no_catalog_noise = |sql: &str, suggestions: &[String]| {
-        for leaked in [
-            "EMP", "DEPT", "EMP_V", "APP_USER", "SCOTT", "RUN_JOB", "SELECT", "WHERE",
-        ] {
+        for leaked in ["EMP", "DEPT", "EMP_V", "RUN_JOB", "SELECT", "WHERE"] {
             assert!(
                 !contains(suggestions, leaked),
                 "{leaked} leaked into PL/SQL FOR loop header at `{sql}`: {suggestions:?}"
@@ -60846,13 +60863,15 @@ fn plsql_value_expression_final_suggestions_do_not_offer_non_expression_catalog(
     use crate::db::DatabaseType::Oracle;
 
     let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+    // Schemas (APP_USER/SCOTT) are deliberately absent from this list: a
+    // schema is a valid expression qualifier head (`v := scott.pkg.fn(...)`),
+    // so it belongs in value-operand slots (see
+    // `schemas_are_offered_as_expression_qualifier_heads`).
     let assert_no_catalog_noise = |sql: &str, suggestions: &[String]| {
         for leaked in [
             "EMP",
             "DEPT",
             "EMP_V",
-            "APP_USER",
-            "SCOTT",
             "RUN_JOB",
             "BI_EMP",
             "CLEANUP_EVENT",
@@ -77886,4 +77905,261 @@ fn plsql_statement_tails_and_value_case_survive_nesting() {
         "nested statement-tail/value-CASE gaps ({tested} cases tested):\n{}",
         failures.join("\n")
     );
+}
+
+/// `<supplied package>.|` resolves the curated member catalog — `dbms_output.|`
+/// → `PUT_LINE` — through the faithful qualified-member pipeline, with prefix
+/// filtering and no object-catalog leakage into the member list.
+#[test]
+fn oracle_builtin_package_qualifier_offers_member_routines() {
+    use crate::db::DatabaseType::Oracle;
+    let contains = |values: &[String], needle: &str| {
+        values.iter().any(|value| value.eq_ignore_ascii_case(needle))
+    };
+
+    for (sql, expected) in [
+        ("BEGIN dbms_output.| END;", "PUT_LINE"),
+        ("BEGIN dbms_output.pu| END;", "PUT_LINE"),
+        ("BEGIN v := dbms_random.| END;", "VALUE"),
+        ("BEGIN dbms_stats.gather| END;", "GATHER_TABLE_STATS"),
+        ("BEGIN utl_file.| END;", "FOPEN"),
+        ("BEGIN DBMS_LOB.| END;", "GETLENGTH"),
+        ("SELECT dbms_lob.getl|(c) FROM t1", "GETLENGTH"),
+        ("BEGIN EXECUTE IMMEDIATE dbms_metadata.| END;", "GET_DDL"),
+        ("CREATE PROCEDURE p IS BEGIN dbms_application_info.set| END;", "SET_MODULE"),
+    ] {
+        let (_kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert!(
+            contains(&final_suggestions, expected),
+            "{expected} missing at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        for leaked in ["EMP", "DEPT", "RUN_JOB", "HR_PKG", "SCOTT"] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "catalog {leaked} leaked into builtin package members at `{sql}`: {final_suggestions:?}"
+            );
+        }
+    }
+
+    // The prefix filter narrows the member list.
+    let (_kind, _keywords, filtered) =
+        audit_final_suggestions_for("BEGIN dbms_output.pu| END;", Oracle);
+    assert!(
+        !contains(&filtered, "ENABLE"),
+        "prefix `pu` should exclude ENABLE: {filtered:?}"
+    );
+
+    // A qualifier that is not a supplied package is unaffected.
+    let (_kind, _keywords, unknown) =
+        audit_final_suggestions_for("BEGIN no_such_pkg.| END;", Oracle);
+    assert!(
+        !contains(&unknown, "PUT_LINE"),
+        "builtin members leaked for an unknown qualifier: {unknown:?}"
+    );
+}
+
+/// Inside a package spec/body, `pkg.|` with the package's own name offers the
+/// package-level declarations (spec globals + body globals) and never a nested
+/// routine's locals; a different qualifier resolves to nothing.
+#[test]
+fn own_package_qualifier_offers_package_level_symbols() {
+    let script = "CREATE OR REPLACE PACKAGE my_pkg IS\n  g_limit CONSTANT NUMBER := 10;\n  g_name VARCHAR2(30);\nEND my_pkg;\n/\nCREATE OR REPLACE PACKAGE BODY my_pkg IS\n  g_state NUMBER := 0;\n  PROCEDURE run_all IS\n    l_local NUMBER;\n  BEGIN\n    l_local := my_pkg.__CODEX_CURSOR__\n  END;\nEND my_pkg;";
+    let cursor = script.find("__CODEX_CURSOR__").unwrap();
+    let clean = script.replace("__CODEX_CURSOR__", "");
+    let (routine_cache, expanded) =
+        SqlEditorWidget::build_routine_symbol_cache_bundle_for_test(&clean, cursor);
+    let analysis = SqlEditorWidget::build_intellisense_analysis_from_routine_cache(
+        &routine_cache,
+        expanded.cursor_in_statement,
+    );
+
+    let members =
+        SqlEditorWidget::own_package_qualified_member_suggestions(&analysis, "my_pkg", "");
+    let has = |needle: &str| members.iter().any(|m| m.eq_ignore_ascii_case(needle));
+    assert!(has("g_state"), "body global missing: {members:?}");
+    assert!(has("g_limit"), "spec global missing: {members:?}");
+    assert!(has("g_name"), "spec global missing: {members:?}");
+    assert!(!has("l_local"), "nested routine local leaked: {members:?}");
+
+    // Prefix filtering.
+    let filtered =
+        SqlEditorWidget::own_package_qualified_member_suggestions(&analysis, "MY_PKG", "g_l");
+    assert!(
+        filtered.iter().any(|m| m.eq_ignore_ascii_case("g_limit"))
+            && !filtered.iter().any(|m| m.eq_ignore_ascii_case("g_state")),
+        "prefix filter wrong: {filtered:?}"
+    );
+
+    // A different qualifier is not this package.
+    let other =
+        SqlEditorWidget::own_package_qualified_member_suggestions(&analysis, "other_pkg", "");
+    assert!(other.is_empty(), "foreign qualifier resolved own-package members: {other:?}");
+}
+
+
+/// Schemas are valid qualifier heads inside expressions (`v := scott.pkg.fn`),
+/// so a schema/user name must surface at assignment/condition/call-argument
+/// operand slots and (via the full-catalog tail) in a select list — the
+/// reported "변수 할당 뒤에 스키마 추천이 안 뜸" class.
+#[test]
+fn schemas_are_offered_as_expression_qualifier_heads() {
+    use crate::db::DatabaseType::Oracle;
+    let contains = |values: &[String], needle: &str| {
+        values.iter().any(|value| value.eq_ignore_ascii_case(needle))
+    };
+
+    for sql in [
+        "BEGIN v := sco| END;",
+        "DECLARE v NUMBER; BEGIN v := app_us| END;",
+        "BEGIN IF sco| THEN NULL; END IF; END;",
+        "BEGIN dbms_output.put_line(sco|); END;",
+    ] {
+        let (_kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        let expected = if sql.contains("app_us") { "APP_USER" } else { "SCOTT" };
+        assert!(
+            contains(&final_suggestions, expected),
+            "schema {expected} missing at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+    }
+
+    // Empty-prefix operand slot lists schemas among the referenceable objects.
+    let (_kind, _keywords, operand) = audit_final_suggestions_for("BEGIN v := | END;", Oracle);
+    assert!(
+        contains(&operand, "SCOTT") && contains(&operand, "APP_USER"),
+        "schemas missing from the empty-prefix operand pool: {operand:?}"
+    );
+
+    // Select-list identifier slot reaches schemas through the catalog tail.
+    let (_kind, _keywords, select_list) =
+        audit_final_suggestions_with_safety_net_for("SELECT sco| FROM emp", Oracle);
+    assert!(
+        contains(&select_list, "SCOTT"),
+        "schema missing from the select-list catalog tail: {select_list:?}"
+    );
+
+    // Schemas stay out where they are not grammatical: after a complete operand.
+    let (_kind, _keywords, after_operand) =
+        audit_final_suggestions_with_safety_net_for("BEGIN v := 'x' sco| END;", Oracle);
+    assert!(
+        !contains(&after_operand, "SCOTT"),
+        "schema offered right after a complete operand: {after_operand:?}"
+    );
+}
+
+/// `OPEN <cursor> FOR |` admits both a query (`SELECT`/`WITH`) and a local
+/// variable holding dynamic SQL — the locals must not be suppressed by the
+/// slot's keyword classification; the `USING` tail and its bind operands keep
+/// working after the source expression.
+#[test]
+fn plsql_open_for_source_offers_locals_and_query_keywords() {
+    use crate::db::DatabaseType::Oracle;
+    let has = |s: &[String], k: &str| s.iter().any(|x| x.eq_ignore_ascii_case(k));
+    let mut failures = Vec::new();
+
+    for wrapper in [
+        "DECLARE v_sql VARCHAR2(100); rc SYS_REFCURSOR; BEGIN {} END;",
+        "CREATE PROCEDURE p IS v_sql VARCHAR2(100); rc SYS_REFCURSOR; BEGIN {} END;",
+        "CREATE OR REPLACE PACKAGE BODY pkg IS PROCEDURE p IS v_sql VARCHAR2(100); rc SYS_REFCURSOR; BEGIN {} END; END;",
+    ] {
+        let source_slot = wrapper.replace("{}", "OPEN rc FOR | ;");
+        let s = query_completion_suggestions_with_locals(&source_slot, Oracle);
+        for expected in ["v_sql", "SELECT", "WITH"] {
+            if !has(&s, expected) {
+                failures.push(format!("{expected} missing at `{source_slot}`: {s:?}"));
+            }
+        }
+
+        let using_slot = wrapper.replace("{}", "OPEN rc FOR v_sql | ;");
+        let s = query_completion_suggestions_with_locals(&using_slot, Oracle);
+        if !has(&s, "USING") {
+            failures.push(format!("USING missing at `{using_slot}`: {s:?}"));
+        }
+
+        let bind_slot = wrapper.replace("{}", "OPEN rc FOR v_sql USING | ;");
+        let s = query_completion_suggestions_with_locals(&bind_slot, Oracle);
+        if !has(&s, "v_sql") {
+            failures.push(format!("bind local missing at `{bind_slot}`: {s:?}"));
+        }
+    }
+
+    // Prefix filtering at the source slot.
+    let s = query_completion_suggestions_with_locals(
+        "DECLARE v_sql VARCHAR2(100); rc SYS_REFCURSOR; BEGIN OPEN rc FOR v_s| ; END;",
+        Oracle,
+    );
+    assert!(has(&s, "v_sql"), "prefix-filtered local missing at `OPEN rc FOR v_s|`: {s:?}");
+
+    assert!(failures.is_empty(), "OPEN-FOR source gaps:\n{}", failures.join("\n"));
+}
+
+/// The named `END |` completion must survive the *full* production pipeline
+/// (locals position gate included — the test harness now mirrors the
+/// production `at_name_only_local_symbol_slot` exactly), across realistic
+/// package-body layouts.
+#[test]
+fn plsql_named_end_completion_works_through_full_pipeline() {
+    use crate::db::DatabaseType::Oracle;
+    let has = |s: &[String], k: &str| s.iter().any(|x| x.eq_ignore_ascii_case(k));
+    let mut failures = Vec::new();
+
+    for (sql, expected) in [
+        ("CREATE PACKAGE BODY pkg IS PROCEDURE p IS BEGIN NULL; END |", "p"),
+        ("CREATE PACKAGE BODY pkg IS PROCEDURE p IS BEGIN NULL; END p; END |", "pkg"),
+        ("CREATE PACKAGE BODY pkg IS PROCEDURE p IS BEGIN NULL; END |; END;", "p"),
+        ("CREATE PROCEDURE prc IS BEGIN NULL; END |", "prc"),
+        ("CREATE PACKAGE pkg2 IS PROCEDURE p; END |", "pkg2"),
+        ("CREATE PACKAGE BODY pkg IS PROCEDURE a IS BEGIN NULL; END a; PROCEDURE b IS BEGIN NULL; END |", "b"),
+        ("CREATE PACKAGE BODY pkg IS PROCEDURE p IS BEGIN NULL; END p; END pk|", "pkg"),
+        ("SELECT 1 FROM dual;\n/\nCREATE OR REPLACE PACKAGE BODY pkg IS\n  PROCEDURE p IS\n  BEGIN\n    NULL;\n  END |\nEND pkg;\n/", "p"),
+        ("CREATE OR REPLACE PACKAGE BODY pkg IS\n  PROCEDURE a IS\n  BEGIN\n    NULL;\n  END |\n  PROCEDURE b IS\n  BEGIN\n    NULL;\n  END b;\nEND pkg;", "a"),
+    ] {
+        let s = query_completion_suggestions_with_locals(sql, Oracle);
+        if !has(&s, expected) {
+            failures.push(format!("`{expected}` missing at `{sql}`: {s:?}"));
+        }
+    }
+
+    assert!(failures.is_empty(), "named END pipeline gaps:\n{}", failures.join("\n"));
+}
+
+/// The `END `-space auto-trigger fires exactly where the slot has a known
+/// completion: the enclosing named object or a construct qualifier — never for
+/// an anonymous block's `END`, a SQL `CASE … END`, or an unrelated word.
+#[test]
+fn plsql_end_space_auto_trigger_is_slot_precise() {
+    use crate::db::DatabaseType::Oracle;
+    let applies = |script: &str| {
+        let cursor = script.find('|').expect("cursor");
+        let text = script.replace('|', "");
+        SqlEditorWidget::plsql_end_auto_trigger_applies_in_text(&text, cursor, Some(Oracle))
+    };
+
+    // Named objects and construct qualifiers → trigger.
+    for script in [
+        "CREATE PACKAGE BODY pkg IS PROCEDURE p IS BEGIN NULL; END |",
+        "CREATE PROCEDURE prc IS BEGIN NULL; END |",
+        "CREATE PACKAGE pkg2 IS PROCEDURE p; END |",
+        "BEGIN IF a = 1 THEN NULL; END |",
+        "BEGIN LOOP NULL; END | END;",
+    ] {
+        assert!(applies(script), "auto-trigger missing at `{script}`");
+    }
+
+    // Nothing to offer → stay quiet.
+    for script in [
+        "BEGIN NULL; END |",
+        "SELECT CASE WHEN a = 1 THEN 1 END | FROM emp",
+        "CREATE PROCEDURE prc IS BEGIN NULL; ENDX |",
+        "CREATE PROCEDURE prc IS BEGIN NULL; |",
+        "SELECT week_end | FROM emp",
+    ] {
+        assert!(!applies(script), "auto-trigger misfired at `{script}`");
+    }
+
+    // MySQL stored programs use a different grammar — no trigger.
+    assert!(!SqlEditorWidget::plsql_end_auto_trigger_applies_in_text(
+        "CREATE PROCEDURE prc() BEGIN SELECT 1; END ",
+        44,
+        Some(crate::db::DatabaseType::MySQL),
+    ));
 }
