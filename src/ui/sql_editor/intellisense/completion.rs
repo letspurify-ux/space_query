@@ -29146,12 +29146,13 @@ impl SqlEditorWidget {
             return false;
         }
         let words = Self::words_for_keyword_slot(tokens, end);
+        let is_keyword = |word: &str| {
+            crate::sql_text::is_sql_keyword_for_db(word, crate::db::DatabaseType::Oracle)
+        };
         matches!(
             words.as_slice(),
             [.., open, name, for_word]
-                if open == "OPEN"
-                    && for_word == "FOR"
-                    && !crate::sql_text::is_sql_keyword_for_db(name, crate::db::DatabaseType::Oracle)
+                if open == "OPEN" && for_word == "FOR" && !is_keyword(name)
         )
     }
 
