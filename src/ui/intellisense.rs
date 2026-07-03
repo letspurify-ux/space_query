@@ -3357,7 +3357,25 @@ impl IntellisensePopup {
         }
 
         if suggestions.is_empty() {
+            // Hiding the shown popup hands key-window status back to the main
+            // window, which aborts an in-progress composition just like the
+            // show transition below. Keep the stale popup until composition
+            // ends; the next keyup refresh will hide or repopulate it.
+            if self.window.shown() && fltk::app::compose_state() > 0 {
+                crate::ui::sql_editor::ime_trace(|| "popup hide deferred (composing)".to_string());
+                return;
+            }
             self.hide();
+            return;
+        }
+
+        // Showing a new top-level window makes it macOS's key window, which
+        // ends the editor's in-progress IME composition and leaves the first
+        // Hangul syllable decomposed into jamo. Defer the first show until
+        // composition ends (the next keyup debounce re-triggers it);
+        // refreshing an already-visible popup keeps the key window unchanged.
+        if !self.window.shown() && fltk::app::compose_state() > 0 {
+            crate::ui::sql_editor::ime_trace(|| "popup show deferred (composing)".to_string());
             return;
         }
 
@@ -3381,6 +3399,12 @@ impl IntellisensePopup {
         let clamped_x = x.clamp(sx, max_x);
         self.window.set_pos(clamped_x, y);
         if !self.window.shown() {
+            crate::ui::sql_editor::ime_trace(|| {
+                format!(
+                    "popup first show: compose_state={}",
+                    fltk::app::compose_state()
+                )
+            });
             self.window.show();
         }
         *self

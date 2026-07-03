@@ -29424,6 +29424,46 @@ impl SqlEditorWidget {
             || Self::expected_plsql_end_qualifier_keywords(&tokens, end_idx, db_type).is_some()
     }
 
+    /// Whether typing a space in an `EXECUTE IMMEDIATE` statement should
+    /// auto-open the popup for a known tail keyword such as `USING` after
+    /// `INTO <target>`. This intentionally stays scoped to `EXECUTE IMMEDIATE`
+    /// so ordinary PL/SQL spaces do not become popup triggers.
+    fn plsql_execute_immediate_tail_auto_trigger_applies_in_text(
+        full_text: &str,
+        cursor: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return false;
+        }
+        let head = match full_text.get(..cursor.min(full_text.len())) {
+            Some(head) => head,
+            None => return false,
+        };
+        if !head.chars().last().is_some_and(char::is_whitespace) {
+            return false;
+        }
+
+        let expanded =
+            Self::expanded_statement_window_in_text_for_db_type(full_text, cursor, db_type);
+        let spans = super::query_text::tokenize_sql_spanned(&expanded.text);
+        let mut tokens = Vec::with_capacity(spans.len());
+        let mut token_ends = Vec::with_capacity(spans.len());
+        for span in spans {
+            token_ends.push(span.end);
+            tokens.push(span.token);
+        }
+        let end_idx = token_ends.partition_point(|end| *end <= expanded.cursor_in_statement);
+        let stmt_words = Self::words_for_plsql_statement_slot(&tokens, end_idx);
+        if stmt_words.first().map(String::as_str) != Some("EXECUTE")
+            || stmt_words.get(1).map(String::as_str) != Some("IMMEDIATE")
+        {
+            return false;
+        }
+
+        Self::expected_plsql_cursor_statement_keywords(&tokens, end_idx, db_type).is_some()
+    }
+
     fn cursor_is_at_plsql_named_end_target_slot_for_context(
         deep_ctx: &intellisense_context::CursorContext,
         exclude_current_identifier_chain: bool,

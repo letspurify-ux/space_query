@@ -47,6 +47,9 @@ use tns_thin::OracleThinCancelHandle;
 
 mod execution;
 mod formatter;
+pub mod hangul_repair;
+#[cfg(target_os = "macos")]
+pub(crate) mod macos_ime;
 mod intellisense;
 mod intellisense_host;
 mod intellisense_state;
@@ -142,6 +145,16 @@ fn update_alert_pump_state_after_display(queue_is_empty: bool, pump_scheduled: &
     } else {
         *pump_scheduled = true;
         true
+    }
+}
+
+/// stderr trace for the macOS IME first-syllable-decomposition investigation.
+/// Enabled with SPACE_QUERY_IME_TRACE=1; the message closure is not evaluated
+/// otherwise. Compare against `cargo run --bin verify_ime_minimal`.
+pub(crate) fn ime_trace(message: impl FnOnce() -> String) {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if *ENABLED.get_or_init(|| std::env::var_os("SPACE_QUERY_IME_TRACE").is_some()) {
+        eprintln!("[ime] {}", message());
     }
 }
 

@@ -77714,6 +77714,17 @@ fn plsql_known_construct_slots_offer_expected_suggestions() {
         ("BEGIN EXECUTE IMMEDIATE 'select 1' BULK COLLECT | END;", false, &["INTO"]),
         ("DECLARE v NUMBER; BEGIN EXECUTE IMMEDIATE 'select 1' INTO | END;", true, &["v"]),
         ("DECLARE v NUMBER; BEGIN EXECUTE IMMEDIATE 'select 1' INTO v | END;", false, &["USING"]),
+        ("DECLARE v NUMBER; BEGIN EXECUTE IMMEDIATE 'select 1' INTO v us| END;", false, &["USING"]),
+        (
+            "DECLARE v NUMBER; BEGIN EXECUTE IMMEDIATE 'select 1' INTO v __CODEX_CURSOR__ END;",
+            true,
+            &["USING"],
+        ),
+        (
+            "CREATE PACKAGE BODY pkg IS PROCEDURE p IS v NUMBER; BEGIN EXECUTE IMMEDIATE 'select 1' INTO v __CODEX_CURSOR__ END p; END pkg;",
+            true,
+            &["USING"],
+        ),
         ("DECLARE v NUMBER; BEGIN EXECUTE IMMEDIATE 'select 1' USING | END;", true, &["v"]),
         ("DECLARE CURSOR c IS SELECT 1 FROM dual; BEGIN OPEN c | END;", false, &["FOR"]),
         ("DECLARE rc SYS_REFCURSOR; BEGIN OPEN rc FOR | END;", false, &["SELECT", "WITH"]),
@@ -78162,4 +78173,33 @@ fn plsql_end_space_auto_trigger_is_slot_precise() {
         44,
         Some(crate::db::DatabaseType::MySQL),
     ));
+}
+
+#[test]
+fn plsql_execute_immediate_tail_space_auto_trigger_is_slot_precise() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+    let applies = |script: &str| {
+        let cursor = script.find('|').expect("cursor");
+        let text = script.replace('|', "");
+        SqlEditorWidget::plsql_execute_immediate_tail_auto_trigger_applies_in_text(
+            &text,
+            cursor,
+            Some(Oracle),
+        )
+    };
+
+    assert!(applies(
+        "CREATE PACKAGE BODY pkg IS PROCEDURE p IS v NUMBER; BEGIN EXECUTE IMMEDIATE 'select 1' INTO v |END p; END pkg;"
+    ));
+    assert!(applies("BEGIN EXECUTE IMMEDIATE 'select 1' |END;"));
+
+    assert!(!applies("BEGIN EXECUTE IMMEDIATE |END;"));
+    assert!(!applies("BEGIN NULL; |END;"));
+    assert!(
+        !SqlEditorWidget::plsql_execute_immediate_tail_auto_trigger_applies_in_text(
+            "BEGIN EXECUTE IMMEDIATE 'select 1' INTO v ",
+            "BEGIN EXECUTE IMMEDIATE 'select 1' INTO v ".len(),
+            Some(MySQL),
+        )
+    );
 }

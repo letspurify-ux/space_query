@@ -185,6 +185,108 @@ fn incremental_direct_rehighlight_end_for_text(
 }
 
 #[test]
+fn enter_key_is_handled_during_ime_composition() {
+    assert!(SqlEditorWidget::should_handle_enter_during_ime_composition(
+        1
+    ));
+    assert!(!SqlEditorWidget::should_handle_enter_during_ime_composition(0));
+}
+
+#[test]
+fn ime_enter_committed_text_strips_newlines_without_losing_marked_text() {
+    assert_eq!(SqlEditorWidget::ime_enter_committed_text("\n", "동"), "동");
+    assert_eq!(
+        SqlEditorWidget::ime_enter_committed_text("동\n\n", "도"),
+        "동"
+    );
+    assert_eq!(
+        SqlEditorWidget::ime_enter_committed_text("\r\n", "길"),
+        "길"
+    );
+}
+
+#[test]
+fn ime_user_selection_replacement_drops_replaced_marked_prefix_only_when_new_text_remains() {
+    assert_eq!(
+        SqlEditorWidget::ime_user_selection_replacement_text("동홍", "동"),
+        "홍"
+    );
+    assert_eq!(
+        SqlEditorWidget::ime_user_selection_replacement_text("홍", "동"),
+        "홍"
+    );
+    assert_eq!(
+        SqlEditorWidget::ime_user_selection_replacement_text("동", "동"),
+        "동"
+    );
+}
+
+#[test]
+fn selection_is_current_ime_marked_range_only_matches_active_marked_tail() {
+    assert!(SqlEditorWidget::selection_is_current_ime_marked_range(
+        Some((6, 9)),
+        9,
+        3
+    ));
+    assert!(!SqlEditorWidget::selection_is_current_ime_marked_range(
+        Some((0, 9)),
+        9,
+        3
+    ));
+    assert!(!SqlEditorWidget::selection_is_current_ime_marked_range(
+        Some((0, 9)),
+        9,
+        0
+    ));
+}
+
+#[test]
+fn user_replacement_selection_excludes_live_ime_marked_tail() {
+    assert!(!SqlEditorWidget::selection_is_user_replacement_range(
+        Some((6, 9)),
+        9,
+        3
+    ));
+    assert!(SqlEditorWidget::selection_is_user_replacement_range(
+        Some((0, 9)),
+        9,
+        3
+    ));
+    assert!(SqlEditorWidget::selection_is_user_replacement_range(
+        Some((0, 9)),
+        9,
+        0
+    ));
+    assert!(!SqlEditorWidget::selection_is_user_replacement_range(
+        None, 9, 3
+    ));
+}
+
+#[test]
+fn ime_reset_keys_are_limited_to_cursor_or_selection_changes() {
+    assert!(SqlEditorWidget::key_may_change_cursor_or_selection(
+        fltk::enums::Key::Left,
+        fltk::enums::Key::Left,
+        false
+    ));
+    assert!(SqlEditorWidget::key_may_change_cursor_or_selection(
+        fltk::enums::Key::from_char('a'),
+        fltk::enums::Key::from_char('a'),
+        true
+    ));
+    assert!(SqlEditorWidget::key_may_change_cursor_or_selection(
+        fltk::enums::Key::from_char('ㅁ'),
+        fltk::enums::Key::from_char('a'),
+        true
+    ));
+    assert!(!SqlEditorWidget::key_may_change_cursor_or_selection(
+        fltk::enums::Key::from_char('홍'),
+        fltk::enums::Key::from_char('h'),
+        false
+    ));
+}
+
+#[test]
 fn update_alert_pump_state_after_display_reschedules_when_queue_not_empty() {
     let mut pump_scheduled = true;
     let should_schedule = update_alert_pump_state_after_display(false, &mut pump_scheduled);

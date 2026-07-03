@@ -807,6 +807,14 @@ impl SqlEditorWidget {
             if ins <= 0 && del <= 0 {
                 return;
             }
+            crate::ui::sql_editor::ime_trace(|| {
+                format!(
+                    "modify pos={pos} ins={ins} del={del} deleted_text={deleted_text:?} \
+                     compose_state={} selection={:?}",
+                    fltk::app::compose_state(),
+                    buf.selection_position(),
+                )
+            });
             if load_mutex_bool(&suppress_buffer_callbacks) {
                 return;
             }

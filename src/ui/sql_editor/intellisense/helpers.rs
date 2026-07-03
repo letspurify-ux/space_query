@@ -626,6 +626,144 @@ impl SqlEditorWidget {
         has_selected && matches!(key, Key::Tab | Key::Enter | Key::KPEnter)
     }
 
+    pub(crate) fn should_handle_enter_during_ime_composition(compose_state: i32) -> bool {
+        compose_state > 0
+    }
+
+    pub(crate) fn selection_is_current_ime_marked_range(
+        selection: Option<(i32, i32)>,
+        caret: i32,
+        compose_state: i32,
+    ) -> bool {
+        const MAX_HANGUL_MARKED_BYTES: i32 = 6;
+        let Some((start, end)) = selection else {
+            return false;
+        };
+        if start == end
+            || compose_state <= 0
+            || compose_state > MAX_HANGUL_MARKED_BYTES
+            || caret < 0
+        {
+            return false;
+        }
+        let (start, end) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        end == caret && start == caret.saturating_sub(compose_state)
+    }
+
+    pub(crate) fn selection_is_user_replacement_range(
+        selection: Option<(i32, i32)>,
+        caret: i32,
+        compose_state: i32,
+    ) -> bool {
+        let Some((start, end)) = selection else {
+            return false;
+        };
+        start != end && !Self::selection_is_current_ime_marked_range(selection, caret, compose_state)
+    }
+
+    pub(crate) fn key_may_change_cursor_or_selection(
+        key: Key,
+        shortcut_key: Key,
+        ctrl_or_cmd: bool,
+    ) -> bool {
+        matches!(
+            key,
+            Key::Left | Key::Right | Key::Up | Key::Down | Key::Home | Key::End | Key::PageUp
+                | Key::PageDown
+        ) || (ctrl_or_cmd && Self::matches_alpha_shortcut(shortcut_key, 'a'))
+    }
+
+    pub(crate) fn ime_user_selection_replacement_text(
+        event_text: &str,
+        replaced_marked_text: &str,
+    ) -> String {
+        if !replaced_marked_text.is_empty()
+            && event_text.len() > replaced_marked_text.len()
+            && event_text.starts_with(replaced_marked_text)
+        {
+            event_text[replaced_marked_text.len()..].to_string()
+        } else {
+            event_text.to_string()
+        }
+    }
+
+    fn reset_ime_composition_state() {
+        #[cfg(target_os = "macos")]
+        {
+            fltk::draw::reset_spot();
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            app::compose_reset();
+        }
+    }
+
+    pub(crate) fn ime_enter_committed_text(event_text: &str, marked_text: &str) -> String {
+        let committed = event_text
+            .chars()
+            .filter(|ch| !matches!(*ch, '\n' | '\r'))
+            .collect::<String>();
+        if committed.is_empty() {
+            marked_text.to_string()
+        } else {
+            committed
+        }
+    }
+
+    fn handle_ime_enter_auto_indent(
+        editor: &mut TextEditor,
+        buffer: &mut TextBuffer,
+        text_shadow: &Arc<Mutex<HighlightShadowState>>,
+    ) -> bool {
+        let insert_pos = editor.insert_position().max(0) as usize;
+        let compose_len = app::compose_state().max(0) as usize;
+        let marked_start = insert_pos.saturating_sub(compose_len);
+        let marked_text = buffer
+            .text_range(marked_start as i32, insert_pos as i32)
+            .unwrap_or_default();
+        let delete_len = app::compose()
+            .unwrap_or(compose_len as i32)
+            .max(0) as usize;
+        let effective_delete_len = if delete_len == 0 && compose_len > 0 && !marked_text.is_empty()
+        {
+            compose_len
+        } else {
+            delete_len
+        };
+        let replace_start = insert_pos.saturating_sub(effective_delete_len);
+        let committed = Self::ime_enter_committed_text(&app::event_text(), &marked_text);
+        if replace_start != insert_pos {
+            let current = buffer
+                .text_range(replace_start as i32, insert_pos as i32)
+                .unwrap_or_default();
+            if current == committed {
+                buffer.unselect();
+            } else {
+                buffer.replace(replace_start as i32, insert_pos as i32, &committed);
+            }
+        } else if !committed.is_empty() {
+            buffer.unselect();
+            buffer.insert(insert_pos as i32, &committed);
+        } else {
+            buffer.unselect();
+        }
+
+        Self::reset_ime_composition_state();
+        buffer.unselect();
+        let cursor = replace_start.saturating_add(committed.len());
+        editor.set_insert_position(cursor.min(i32::MAX as usize) as i32);
+        let indent = Self::enter_indent_for_anchor(buffer, text_shadow, cursor as i32);
+        let inserted = format!("\n{indent}");
+        buffer.insert(cursor.min(i32::MAX as usize) as i32, &inserted);
+        editor.set_insert_position((cursor + inserted.len()).min(i32::MAX as usize) as i32);
+        editor.show_insert_position();
+        true
+    }
+
     fn handle_enter_auto_indent(
         editor: &mut TextEditor,
         buffer: &mut TextBuffer,
@@ -645,10 +783,7 @@ impl SqlEditorWidget {
             .map(|(start, _)| start)
             .unwrap_or(insert_pos)
             .max(0);
-        let line_start = text_buffer_access::line_start(buffer, Some(text_shadow), anchor).max(0);
-        let line_text =
-            text_buffer_access::text_range(buffer, Some(text_shadow), line_start, anchor);
-        let indent = Self::leading_indent_prefix(&line_text);
+        let indent = Self::enter_indent_for_anchor(buffer, text_shadow, anchor);
         let inserted = format!("\n{indent}");
 
         if let Some((start, end)) = selection {
@@ -664,6 +799,17 @@ impl SqlEditorWidget {
         editor.set_insert_position(insert_pos + inserted.len() as i32);
         editor.show_insert_position();
         true
+    }
+
+    fn enter_indent_for_anchor(
+        buffer: &TextBuffer,
+        text_shadow: &Arc<Mutex<HighlightShadowState>>,
+        anchor: i32,
+    ) -> String {
+        let line_start = text_buffer_access::line_start(buffer, Some(text_shadow), anchor).max(0);
+        let line_text =
+            text_buffer_access::text_range(buffer, Some(text_shadow), line_start, anchor);
+        Self::leading_indent_prefix(&line_text).to_string()
     }
 
     fn leading_indent_prefix(line_text: &str) -> &str {
@@ -933,6 +1079,15 @@ impl SqlEditorWidget {
                 if buffer_for_timeout.length() != buffer_len {
                     return;
                 }
+
+                crate::ui::sql_editor::ime_trace(|| {
+                    format!(
+                        "keyup-debounce fired: caret={} compose_state={} selection={:?}",
+                        editor_for_timeout.insert_position(),
+                        app::compose_state(),
+                        buffer_for_timeout.selection_position(),
+                    )
+                });
 
                 Self::trigger_intellisense(
                     &editor_for_timeout,

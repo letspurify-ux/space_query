@@ -48,6 +48,7 @@ enum EnterKeyupSuppression {
     None,
     PopupConfirm,
     CtrlEnterExecute,
+    ImeCompositionEnter,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -1,4 +1,321 @@
 impl SqlEditorWidget {
+    /// Apply a merge produced by [`crate::ui::sql_editor::hangul_repair`] for
+    /// the macOS broken-first-Hangul-key bug.
+    #[cfg(target_os = "macos")]
+    fn apply_hangul_first_key_repair_edit(
+        buffer: &mut TextBuffer,
+        edit: Option<crate::ui::sql_editor::hangul_repair::RepairEdit>,
+    ) {
+        if let Some(edit) = edit {
+            crate::ui::sql_editor::ime_trace(|| format!("hangul repair merge {edit:?}"));
+            buffer.replace(edit.start as i32, edit.end as i32, &edit.replacement);
+        }
+    }
+
+    /// Swallow duplicate navigation/editing-key dispatches caused by a
+    /// pending IME composition on macOS.
+    ///
+    /// With a syllable still composing, one physical arrow or BackSpace press
+    /// reaches the editor as a burst of FL_KEYBOARD dispatches (commit/marked
+    /// dispatch with `compose_state>0`, then duplicate action dispatches —
+    /// FLTK's cocoa layer processes the event through both
+    /// performKeyEquivalent and keyDown; the bare-TextEditor probe shows 2x,
+    /// the app 4x). Arrows moved 4 lines per press; BackSpace while composing
+    /// ㅎ deleted the composing jamo AND the preceding newline. The burst
+    /// arrives within well under a millisecond, while even the fastest key
+    /// auto-repeat is ~15ms apart, so a same-key dispatch inside a 5ms window
+    /// cannot be a real keystroke. The first dispatch of the burst passes
+    /// through and performs the single move/delete; the rest of the burst is
+    /// consumed.
+    #[cfg(target_os = "macos")]
+    fn nav_key_is_duplicate_dispatch(
+        slot: &Arc<Mutex<Option<(Key, std::time::Instant)>>>,
+        key: Key,
+    ) -> bool {
+        const BURST_WINDOW: std::time::Duration = std::time::Duration::from_millis(5);
+        if !matches!(
+            key,
+            Key::Up
+                | Key::Down
+                | Key::Left
+                | Key::Right
+                | Key::Home
+                | Key::End
+                | Key::PageUp
+                | Key::PageDown
+                | Key::BackSpace
+                | Key::Delete
+        ) {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((previous_key, anchored_at)) = *guard {
+            if previous_key == key && now.duration_since(anchored_at) < BURST_WINDOW {
+                return true;
+            }
+        }
+        *guard = Some((key, now));
+        false
+    }
+
+    /// Ask the IME to drop a pending composition, after the current event
+    /// finishes dispatching.
+    ///
+    /// Needed for events that bypass `[[view inputContext] handleEvent:]` —
+    /// Cmd/Ctrl shortcuts (FLTK's performKeyEquivalent zeroes only
+    /// `Fl::compose_state`) and mouse clicks — where the IME otherwise still
+    /// believes it is composing and commits the stale syllable into the next
+    /// keystroke (홍길동 → Cmd+A → retype = 동홍길동). Events the IME does
+    /// see (plain arrows, etc.) must NOT trigger this: the IME finalizes the
+    /// composition itself, and calling discardMarkedText from inside its own
+    /// event processing makes it re-dispatch the key (arrows jumped 4 lines).
+    /// Deferring to a zero-delay timeout keeps the call out of any in-flight
+    /// dispatch; it still runs before the next keystroke can arrive.
+    #[cfg(target_os = "macos")]
+    fn schedule_macos_ime_discard(editor: &TextEditor) {
+        let Some(window) = editor.window() else {
+            return;
+        };
+        app::add_timeout3(0.0, move |_| {
+            if window.was_deleted() || !window.shown() {
+                return;
+            }
+            crate::ui::sql_editor::ime_trace(|| "deferred discardMarkedText".to_string());
+            crate::ui::sql_editor::macos_ime::discard_marked_text(
+                window.raw_handle() as *mut _,
+            );
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    fn finish_macos_ime_before_cursor_or_selection_change(
+        editor: &mut TextEditor,
+        buffer: &mut TextBuffer,
+        repair_state: &Arc<Mutex<crate::ui::sql_editor::hangul_repair::FirstKeyRepairState>>,
+    ) {
+        fltk::draw::reset_spot();
+        let caret = editor.insert_position().max(0) as usize;
+        let reader = buffer.clone();
+        let edit = repair_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .flush(caret, &|start, end| {
+                reader.text_range(start as i32, end as i32)
+            });
+        if let Some(edit) = edit {
+            let old_len = edit.end.saturating_sub(edit.start);
+            let new_len = edit.replacement.len();
+            crate::ui::sql_editor::ime_trace(|| format!("hangul repair merge {edit:?}"));
+            buffer.replace(edit.start as i32, edit.end as i32, &edit.replacement);
+            if caret >= edit.end {
+                let new_caret = caret.saturating_sub(old_len).saturating_add(new_len);
+                editor.set_insert_position(new_caret.min(i32::MAX as usize) as i32);
+            } else if caret > edit.start {
+                editor.set_insert_position((edit.start + new_len).min(i32::MAX as usize) as i32);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn marked_text_replaced_by_user_selection(
+        buffer: &TextBuffer,
+        selection: (i32, i32),
+        caret: i32,
+        compose_state: i32,
+    ) -> String {
+        if compose_state <= 0 {
+            return String::new();
+        }
+
+        let (selection_start, selection_end) = if selection.0 <= selection.1 {
+            selection
+        } else {
+            (selection.1, selection.0)
+        };
+        let compose_len = compose_state;
+        let candidates = [
+            caret
+                .checked_sub(compose_len)
+                .map(|start| (start, caret)),
+            selection_end
+                .checked_sub(compose_len)
+                .map(|start| (start, selection_end)),
+        ];
+
+        for range in candidates.into_iter().flatten() {
+            let (start, end) = range;
+            if start >= selection_start && end <= selection_end && start < end {
+                return buffer.text_range(start, end).unwrap_or_default();
+            }
+        }
+
+        String::new()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn remember_macos_ime_marked_text(
+        editor: &TextEditor,
+        buffer: &TextBuffer,
+        marked_text: &Arc<Mutex<String>>,
+    ) {
+        let selection = buffer.selection_position();
+        if !Self::selection_is_current_ime_marked_range(
+            selection,
+            editor.insert_position(),
+            fltk::app::compose_state(),
+        ) {
+            return;
+        }
+
+        let Some((raw_start, raw_end)) = selection else {
+            return;
+        };
+        let (start, end) = if raw_start <= raw_end {
+            (raw_start, raw_end)
+        } else {
+            (raw_end, raw_start)
+        };
+        *marked_text
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            buffer.text_range(start, end).unwrap_or_default();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn marked_text_snapshot_in_selection(
+        buffer: &TextBuffer,
+        selection: (i32, i32),
+        marked_text: &Arc<Mutex<String>>,
+    ) -> String {
+        let marked = marked_text
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if marked.is_empty() {
+            return String::new();
+        }
+
+        let (selection_start, selection_end) = if selection.0 <= selection.1 {
+            selection
+        } else {
+            (selection.1, selection.0)
+        };
+        let Ok(marked_len) = i32::try_from(marked.len()) else {
+            return String::new();
+        };
+        let Some(marked_start) = selection_end.checked_sub(marked_len) else {
+            return String::new();
+        };
+        if marked_start < selection_start {
+            return String::new();
+        }
+
+        if buffer
+            .text_range(marked_start, selection_end)
+            .as_deref()
+            == Some(marked.as_str())
+        {
+            marked
+        } else {
+            String::new()
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn handle_macos_user_selection_text_input(
+        editor: &mut TextEditor,
+        buffer: &mut TextBuffer,
+        repair_state: &Arc<Mutex<crate::ui::sql_editor::hangul_repair::FirstKeyRepairState>>,
+        marked_text: &Arc<Mutex<String>>,
+    ) -> bool {
+        let key = fltk::app::event_key();
+        if matches!(key, Key::Enter | Key::KPEnter | Key::Tab) {
+            return false;
+        }
+
+        let state = fltk::app::event_state();
+        if state.contains(fltk::enums::Shortcut::Ctrl)
+            || state.contains(fltk::enums::Shortcut::Command)
+            || state.contains(fltk::enums::Shortcut::Alt)
+        {
+            return false;
+        }
+
+        let event_text = fltk::app::event_text();
+        if event_text.is_empty() {
+            return false;
+        }
+
+        let selection = buffer.selection_position();
+        if !Self::selection_is_user_replacement_range(
+            selection,
+            editor.insert_position(),
+            fltk::app::compose_state(),
+        ) {
+            return false;
+        }
+        let Some((raw_start, raw_end)) = selection else {
+            return false;
+        };
+        let (selection_start, selection_end) = if raw_start <= raw_end {
+            (raw_start, raw_end)
+        } else {
+            (raw_end, raw_start)
+        };
+
+        let mut replaced_marked_text = Self::marked_text_replaced_by_user_selection(
+            buffer,
+            (selection_start, selection_end),
+            editor.insert_position(),
+            fltk::app::compose_state(),
+        );
+        if replaced_marked_text.is_empty() {
+            replaced_marked_text = Self::marked_text_snapshot_in_selection(
+                buffer,
+                (selection_start, selection_end),
+                marked_text,
+            );
+        }
+        if fltk::app::compose().is_none() {
+            crate::ui::sql_editor::ime_trace(|| {
+                "selection-input: compose()=None, falling through".to_string()
+            });
+            return false;
+        }
+
+        let inserted =
+            Self::ime_user_selection_replacement_text(&event_text, &replaced_marked_text);
+        crate::ui::sql_editor::ime_trace(|| {
+            format!(
+                "selection-input: sel=({selection_start},{selection_end}) event={event_text:?} \
+                 replaced_marked={replaced_marked_text:?} inserted={inserted:?}"
+            )
+        });
+        buffer.replace(selection_start, selection_end, &inserted);
+        let cursor = selection_start
+            .max(0)
+            .saturating_add(inserted.len().min(i32::MAX as usize) as i32);
+        editor.set_insert_position(cursor);
+
+        let compose_len = fltk::app::compose_state().max(0);
+        if compose_len > 0 && compose_len <= inserted.len().min(i32::MAX as usize) as i32 {
+            buffer.select(cursor - compose_len, cursor);
+        } else {
+            buffer.unselect();
+        }
+        editor.show_insert_position();
+        repair_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .reset();
+        marked_text
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        true
+    }
+
     fn invoke_context_action_callback(
         callback: &SqlEditorContextActionCallback,
         action: SqlEditorContextAction,
@@ -221,6 +538,15 @@ impl SqlEditorWidget {
         let preferred_insert_position_for_handle = self.preferred_insert_position.clone();
         let undo_redo_state_for_handle = self.undo_redo_state.clone();
         let display_metrics_ready_for_handle = self.display_metrics_ready.clone();
+        #[cfg(target_os = "macos")]
+        let hangul_repair_for_handle = Arc::new(Mutex::new(
+            crate::ui::sql_editor::hangul_repair::FirstKeyRepairState::default(),
+        ));
+        #[cfg(target_os = "macos")]
+        let macos_ime_marked_text_for_handle = Arc::new(Mutex::new(String::new()));
+        #[cfg(target_os = "macos")]
+        let nav_key_dedupe_for_handle: Arc<Mutex<Option<(Key, std::time::Instant)>>> =
+            Arc::new(Mutex::new(None));
 
         editor.handle(move |ed, ev| {
             if Self::should_consume_pointer_event_until_display_metrics_ready(
@@ -316,6 +642,15 @@ impl SqlEditorWidget {
                     false
                 }
                 Event::Push => {
+                    #[cfg(target_os = "macos")]
+                    {
+                        Self::finish_macos_ime_before_cursor_or_selection_change(
+                            ed,
+                            &mut buffer_for_handle,
+                            &hangul_repair_for_handle,
+                        );
+                        Self::schedule_macos_ime_discard(ed);
+                    }
                     let clicked_pos = ed.xy_to_position(
                         fltk::app::event_x(),
                         fltk::app::event_y(),
@@ -431,6 +766,22 @@ impl SqlEditorWidget {
                 Event::KeyDown => {
                     let key = fltk::app::event_key();
                     let original_key = fltk::app::event_original_key();
+                    crate::ui::sql_editor::ime_trace(|| {
+                        format!(
+                            "KeyDown key={key:?} text={:?} compose_state={} caret={} selection={:?}",
+                            fltk::app::event_text(),
+                            fltk::app::compose_state(),
+                            ed.insert_position(),
+                            buffer_for_handle.selection_position(),
+                        )
+                    });
+                    #[cfg(target_os = "macos")]
+                    if Self::nav_key_is_duplicate_dispatch(&nav_key_dedupe_for_handle, key) {
+                        crate::ui::sql_editor::ime_trace(|| {
+                            format!("swallow duplicate nav dispatch {key:?}")
+                        });
+                        return true;
+                    }
                     let shortcut_key = Self::shortcut_key_for_layout(key, original_key);
                     let popup_visible = intellisense_popup_for_handle
                         .lock()
@@ -441,6 +792,30 @@ impl SqlEditorWidget {
                         || state.contains(fltk::enums::Shortcut::Command);
                     let shift = state.contains(fltk::enums::Shortcut::Shift);
                     let alt = state.contains(fltk::enums::Shortcut::Alt);
+
+                    #[cfg(target_os = "macos")]
+                    if Self::handle_macos_user_selection_text_input(
+                        ed,
+                        &mut buffer_for_handle,
+                        &hangul_repair_for_handle,
+                        &macos_ime_marked_text_for_handle,
+                    ) {
+                        return true;
+                    }
+
+                    #[cfg(target_os = "macos")]
+                    if Self::key_may_change_cursor_or_selection(key, shortcut_key, ctrl_or_cmd) {
+                        Self::finish_macos_ime_before_cursor_or_selection_change(
+                            ed,
+                            &mut buffer_for_handle,
+                            &hangul_repair_for_handle,
+                        );
+                        // Only Cmd/Ctrl-modified keys bypass the IME; plain
+                        // arrows are seen and finalized by the IME itself.
+                        if ctrl_or_cmd {
+                            Self::schedule_macos_ime_discard(ed);
+                        }
+                    }
 
                     if ctrl_or_cmd && shift && matches!(key, Key::Up | Key::Down) {
                         if popup_visible {
@@ -707,6 +1082,49 @@ impl SqlEditorWidget {
                         }
                     }
 
+                    #[cfg(target_os = "macos")]
+                    if !alt
+                        && matches!(key, Key::Enter | Key::KPEnter)
+                        && matches!(
+                            *enter_keyup_suppression_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                            EnterKeyupSuppression::ImeCompositionEnter
+                        )
+                    {
+                        return true;
+                    }
+
+                    #[cfg(target_os = "macos")]
+                    if !alt
+                        && matches!(key, Key::Enter | Key::KPEnter)
+                        && Self::should_handle_enter_during_ime_composition(
+                            fltk::app::compose_state(),
+                        )
+                    {
+                        *enter_keyup_suppression_for_handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            EnterKeyupSuppression::ImeCompositionEnter;
+                        let handled = Self::handle_ime_enter_auto_indent(
+                            ed,
+                            &mut buffer_for_handle,
+                            &text_shadow_for_handle,
+                        );
+                        if handled {
+                            intellisense_popup_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .hide();
+                            intellisense_runtime_for_handle.clear_ui_tracking();
+                            Self::invalidate_keyup_debounce_with_parse_generation(
+                                &intellisense_runtime_for_handle,
+                                true,
+                            );
+                        }
+                        return true;
+                    }
+
                     if !alt && matches!(key, Key::Enter | Key::KPEnter) {
                         let handled = Self::handle_enter_auto_indent(
                             ed,
@@ -773,6 +1191,46 @@ impl SqlEditorWidget {
                     false
                 }
                 Event::KeyUp => {
+                    crate::ui::sql_editor::ime_trace(|| {
+                        format!(
+                            "KeyUp key={:?} text={:?} compose_state={} caret={} selection={:?}",
+                            fltk::app::event_key(),
+                            fltk::app::event_text(),
+                            fltk::app::compose_state(),
+                            ed.insert_position(),
+                            buffer_for_handle.selection_position(),
+                        )
+                    });
+                    // The Hangul first-key repair is evaluated on KeyUp:
+                    // unlike KeyDown, a KeyUp always arrives after the
+                    // keystroke's text/compose state has been applied,
+                    // regardless of whether the custom handler runs before or
+                    // after the editor's default handling.
+                    #[cfg(target_os = "macos")]
+                    {
+                        Self::remember_macos_ime_marked_text(
+                            ed,
+                            &buffer_for_handle,
+                            &macos_ime_marked_text_for_handle,
+                        );
+                        let mods = fltk::app::event_state();
+                        let has_command_modifiers = mods
+                            .contains(fltk::enums::Shortcut::Ctrl)
+                            || mods.contains(fltk::enums::Shortcut::Command)
+                            || mods.contains(fltk::enums::Shortcut::Alt);
+                        let reader = buffer_for_handle.clone();
+                        let edit = hangul_repair_for_handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .on_key_event(
+                                &fltk::app::event_text(),
+                                has_command_modifiers,
+                                fltk::app::compose_state().max(0) as usize,
+                                ed.insert_position().max(0) as usize,
+                                &|start, end| reader.text_range(start as i32, end as i32),
+                            );
+                        Self::apply_hangul_first_key_repair_edit(&mut buffer_for_handle, edit);
+                    }
                     let popup_visible = intellisense_popup_for_handle
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -889,6 +1347,20 @@ impl SqlEditorWidget {
                         }
                     }
 
+                    if matches!(key, Key::Enter | Key::KPEnter)
+                        && matches!(
+                            *enter_keyup_suppression_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                            EnterKeyupSuppression::ImeCompositionEnter
+                        )
+                    {
+                        *enter_keyup_suppression_for_handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            EnterKeyupSuppression::None;
+                        return true;
+                    }
                     if matches!(key, Key::Enter | Key::KPEnter)
                         && matches!(
                             *enter_keyup_suppression_for_handle
@@ -1044,7 +1516,21 @@ impl SqlEditorWidget {
                                         Some(intellisense_runtime_for_handle.cached_db_type()),
                                     )
                                 };
+                            let execute_immediate_tail_auto_trigger = ch.is_whitespace()
+                                && word.is_empty()
+                                && qualifier.is_none()
+                                && {
+                                    let guard = text_shadow_for_handle
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                    Self::plsql_execute_immediate_tail_auto_trigger_applies_in_text(
+                                        &guard.text,
+                                        cursor_pos.max(0) as usize,
+                                        Some(intellisense_runtime_for_handle.cached_db_type()),
+                                    )
+                                };
                             if end_slot_auto_trigger
+                                || execute_immediate_tail_auto_trigger
                                 || Self::should_auto_trigger_intellisense_for_forced_char(
                                     &word,
                                     qualifier.as_deref(),
@@ -1125,6 +1611,18 @@ impl SqlEditorWidget {
                     false
                 }
                 Event::Unfocus => {
+                    #[cfg(target_os = "macos")]
+                    {
+                        fltk::draw::reset_spot();
+                        let reader = buffer_for_handle.clone();
+                        let edit = hangul_repair_for_handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .flush(reader.length().max(0) as usize, &|start, end| {
+                                reader.text_range(start as i32, end as i32)
+                            });
+                        Self::apply_hangul_first_key_repair_edit(&mut buffer_for_handle, edit);
+                    }
                     widget_for_shortcuts.hide_signature_popup();
                     let unfocus_x = fltk::app::event_x_root();
                     let unfocus_y = fltk::app::event_y_root();
