@@ -3404,10 +3404,8 @@ fn send_break_signal(
     protocol_version: u16,
     supports_oob: bool,
 ) -> Result<BreakSignal, OracleThinError> {
-    if supports_oob {
-        if send_oob_break(stream)? {
-            return Ok(BreakSignal::Oob);
-        }
+    if supports_oob && send_oob_break(stream)? {
+        return Ok(BreakSignal::Oob);
     }
 
     write_marker_packet(stream, protocol_version, TNS_MARKER_TYPE_INTERRUPT)?;
@@ -10313,6 +10311,8 @@ struct ZoneInfo {
     offsets: Vec<i32>,
 }
 
+type ZoneInfoCache = Mutex<HashMap<&'static str, Option<Arc<ZoneInfo>>>>;
+
 impl ZoneInfo {
     fn offset_at(&self, unix_seconds: i64) -> Option<i32> {
         let after = self
@@ -10327,8 +10327,7 @@ impl ZoneInfo {
     }
 }
 
-static ZONE_INFO_CACHE: OnceCell<Mutex<HashMap<&'static str, Option<Arc<ZoneInfo>>>>> =
-    OnceCell::new();
+static ZONE_INFO_CACHE: OnceCell<ZoneInfoCache> = OnceCell::new();
 
 fn timezone_region_offset_minutes(region_id: u16, value: &crate::OracleDateTime) -> Option<i16> {
     let zone_name = crate::oracle_zones::oracle_zone_name(region_id)?;
@@ -13806,6 +13805,32 @@ mod tests {
         OracleIntervalYearMonth, OracleVectorValue, RefCursorValue, StatementRequest,
     };
 
+    fn execute_read_state_with_columns(columns: Vec<ThinColumn>) -> ExecuteReadState {
+        ExecuteReadState {
+            columns,
+            ..ExecuteReadState::default()
+        }
+    }
+
+    fn capabilities_with_ttc_field_version(ttc_field_version: u8) -> OracleThinCapabilities {
+        OracleThinCapabilities {
+            ttc_field_version,
+            ..OracleThinCapabilities::default()
+        }
+    }
+
+    #[cfg(unix)]
+    fn capabilities_with_charset(
+        protocol_version: Option<u16>,
+        charset_id: u16,
+    ) -> OracleThinCapabilities {
+        OracleThinCapabilities {
+            protocol_version,
+            charset_id,
+            ..OracleThinCapabilities::default()
+        }
+    }
+
     fn test_session_with_stream(stream: TcpStream) -> OracleThinSession {
         OracleThinSession {
             stream,
@@ -13911,93 +13936,91 @@ mod tests {
 
     #[test]
     fn write_data_packet_uses_protocol_specific_length_and_data_flags_for_chunks() {
-        for protocol_version in [314] {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let addr = listener.local_addr().unwrap();
-            let server = std::thread::spawn(move || {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut packets = Vec::new();
-                for _ in 0..3 {
-                    let mut header = [0u8; 8];
-                    stream.read_exact(&mut header).unwrap();
-                    let size = if protocol_version >= 315 {
-                        u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize
-                    } else {
-                        u16::from_be_bytes([header[0], header[1]]) as usize
-                    };
-                    let mut body = vec![0u8; size - 8];
-                    stream.read_exact(&mut body).unwrap();
-                    packets.push((header, body));
-                }
-                packets
-            });
-            let mut stream = TcpStream::connect(addr).unwrap();
-
-            write_data_packet(&mut stream, protocol_version, 2, &[1, 2, 3, 4, 5]).unwrap();
-            drop(stream);
-            let packets = server.join().unwrap();
-
-            for (index, ((header, body), expected_payload)) in packets
-                .iter()
-                .zip([&[1, 2][..], &[3, 4][..], &[5][..]])
-                .enumerate()
-            {
-                let expected_size = 10 + expected_payload.len();
-                if protocol_version >= 315 {
-                    assert_eq!(
-                        u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize,
-                        expected_size,
-                        "{protocol_version} packet {index}"
-                    );
+        let protocol_version = 314;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut packets = Vec::new();
+            for _ in 0..3 {
+                let mut header = [0u8; 8];
+                stream.read_exact(&mut header).unwrap();
+                let size = if protocol_version >= 315 {
+                    u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize
                 } else {
-                    assert_eq!(
-                        u16::from_be_bytes([header[0], header[1]]) as usize,
-                        expected_size,
-                        "{protocol_version} packet {index}"
-                    );
-                }
+                    u16::from_be_bytes([header[0], header[1]]) as usize
+                };
+                let mut body = vec![0u8; size - 8];
+                stream.read_exact(&mut body).unwrap();
+                packets.push((header, body));
+            }
+            packets
+        });
+        let mut stream = TcpStream::connect(addr).unwrap();
+
+        write_data_packet(&mut stream, protocol_version, 2, &[1, 2, 3, 4, 5]).unwrap();
+        drop(stream);
+        let packets = server.join().unwrap();
+
+        for (index, ((header, body), expected_payload)) in packets
+            .iter()
+            .zip([&[1, 2][..], &[3, 4][..], &[5][..]])
+            .enumerate()
+        {
+            let expected_size = 10 + expected_payload.len();
+            if protocol_version >= 315 {
                 assert_eq!(
-                    header[4], TNS_PACKET_TYPE_DATA,
+                    u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize,
+                    expected_size,
                     "{protocol_version} packet {index}"
                 );
-                assert_eq!(&body[0..2], &[0, 0], "{protocol_version} packet {index}");
+            } else {
                 assert_eq!(
-                    &body[2..],
-                    expected_payload,
+                    u16::from_be_bytes([header[0], header[1]]) as usize,
+                    expected_size,
                     "{protocol_version} packet {index}"
                 );
             }
+            assert_eq!(
+                header[4], TNS_PACKET_TYPE_DATA,
+                "{protocol_version} packet {index}"
+            );
+            assert_eq!(&body[0..2], &[0, 0], "{protocol_version} packet {index}");
+            assert_eq!(
+                &body[2..],
+                expected_payload,
+                "{protocol_version} packet {index}"
+            );
         }
     }
 
     #[test]
     fn write_eof_data_packet_matches_python_oracledb_logoff_close_packet() {
-        for protocol_version in [314] {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let addr = listener.local_addr().unwrap();
-            let server = std::thread::spawn(move || {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut header = [0u8; 8];
-                stream.read_exact(&mut header).unwrap();
-                let body =
-                    read_tns_test_packet_body_after_header(&mut stream, protocol_version, header);
-                (header, body)
-            });
-            let mut stream = TcpStream::connect(addr).unwrap();
+        let protocol_version = 314;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut header = [0u8; 8];
+            stream.read_exact(&mut header).unwrap();
+            let body =
+                read_tns_test_packet_body_after_header(&mut stream, protocol_version, header);
+            (header, body)
+        });
+        let mut stream = TcpStream::connect(addr).unwrap();
 
-            write_eof_data_packet(&mut stream, protocol_version).unwrap();
-            drop(stream);
-            let (header, body) = server.join().unwrap();
+        write_eof_data_packet(&mut stream, protocol_version).unwrap();
+        drop(stream);
+        let (header, body) = server.join().unwrap();
 
-            let size = if protocol_version >= 315 {
-                u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize
-            } else {
-                u16::from_be_bytes([header[0], header[1]]) as usize
-            };
-            assert_eq!(size, 10, "{protocol_version}");
-            assert_eq!(header[4], TNS_PACKET_TYPE_DATA, "{protocol_version}");
-            assert_eq!(body, TNS_DATA_FLAGS_EOF.to_be_bytes(), "{protocol_version}");
-        }
+        let size = if protocol_version >= 315 {
+            u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize
+        } else {
+            u16::from_be_bytes([header[0], header[1]]) as usize
+        };
+        assert_eq!(size, 10, "{protocol_version}");
+        assert_eq!(header[4], TNS_PACKET_TYPE_DATA, "{protocol_version}");
+        assert_eq!(body, TNS_DATA_FLAGS_EOF.to_be_bytes(), "{protocol_version}");
     }
 
     #[test]
@@ -15287,55 +15310,54 @@ mod tests {
         // go-ora (protocol 314) style: after BreakConnection the read path reads
         // first. If the server already sends data, the client does not send an
         // eager RESET marker.
-        for protocol_version in [314] {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let addr = listener.local_addr().unwrap();
-            let server = std::thread::spawn(move || {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut data_body = Vec::new();
-                data_body.extend_from_slice(&TNS_DATA_FLAGS_END_OF_RESPONSE.to_be_bytes());
-                data_body.extend_from_slice(&[TNS_MSG_TYPE_ERROR]);
-                stream
-                    .write_all(&tns_test_packet(
-                        protocol_version,
-                        TNS_PACKET_TYPE_DATA,
-                        &data_body,
-                    ))
-                    .unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_millis(100)))
-                    .unwrap();
-                let mut header = [0u8; 8];
-                let err = stream.read_exact(&mut header).unwrap_err();
-                assert!(
-                    matches!(
-                        err.kind(),
-                        std::io::ErrorKind::WouldBlock
-                            | std::io::ErrorKind::TimedOut
-                            | std::io::ErrorKind::UnexpectedEof
-                    ),
-                    "protocol {protocol_version}: direct data drain should not send RESET: {err}"
-                );
-                std::thread::sleep(Duration::from_millis(200));
-            });
-            let stream = TcpStream::connect(addr).unwrap();
-            let mut session = test_session_with_stream(stream);
-            session.capabilities.protocol_version = Some(protocol_version);
+        let protocol_version = 314;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut data_body = Vec::new();
+            data_body.extend_from_slice(&TNS_DATA_FLAGS_END_OF_RESPONSE.to_be_bytes());
+            data_body.extend_from_slice(&[TNS_MSG_TYPE_ERROR]);
+            stream
+                .write_all(&tns_test_packet(
+                    protocol_version,
+                    TNS_PACKET_TYPE_DATA,
+                    &data_body,
+                ))
+                .unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            let mut header = [0u8; 8];
+            let err = stream.read_exact(&mut header).unwrap_err();
+            assert!(
+                matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::UnexpectedEof
+                ),
+                "protocol {protocol_version}: direct data drain should not send RESET: {err}"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut session = test_session_with_stream(stream);
+        session.capabilities.protocol_version = Some(protocol_version);
 
-            let started = std::time::Instant::now();
-            session
-                .drain_cancel_response(BreakSignal::InBand)
-                .unwrap_or_else(|err| panic!("protocol {protocol_version} drain failed: {err}"));
-            assert!(
-                started.elapsed() < CANCEL_RESET_DRAIN_TIMEOUT,
-                "protocol {protocol_version}: drain should stop on the data packet, not time out"
-            );
-            assert!(
-                !session.is_broken(),
-                "protocol {protocol_version}: connection should remain reusable"
-            );
-            server.join().unwrap();
-        }
+        let started = std::time::Instant::now();
+        session
+            .drain_cancel_response(BreakSignal::InBand)
+            .unwrap_or_else(|err| panic!("protocol {protocol_version} drain failed: {err}"));
+        assert!(
+            started.elapsed() < CANCEL_RESET_DRAIN_TIMEOUT,
+            "protocol {protocol_version}: drain should stop on the data packet, not time out"
+        );
+        assert!(
+            !session.is_broken(),
+            "protocol {protocol_version}: connection should remain reusable"
+        );
+        server.join().unwrap();
     }
 
     #[test]
@@ -16889,8 +16911,10 @@ mod tests {
 
     #[test]
     fn nclob_inout_text_binds_keep_utf8_when_nchar_charset_is_utf8() {
-        let mut caps = OracleThinCapabilities::default();
-        caps.ncharset_id = ORACLE_CHARSET_AL32UTF8;
+        let caps = OracleThinCapabilities {
+            ncharset_id: ORACLE_CHARSET_AL32UTF8,
+            ..OracleThinCapabilities::default()
+        };
         let bind = BindValue::InOut {
             column_type: OracleColumnType::Nclob,
             max_len: 20,
@@ -16955,9 +16979,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn decodes_korean_native_charset_bytes_with_negotiated_server_charset() {
-        let mut ksc_caps = OracleThinCapabilities::default();
-        ksc_caps.protocol_version = Some(314);
-        ksc_caps.charset_id = ORACLE_CHARSET_KO16KSC5601;
+        let ksc_caps = capabilities_with_charset(Some(314), ORACLE_CHARSET_KO16KSC5601);
         assert_eq!(
             decode_oracle_text("한글".as_bytes(), CS_FORM_IMPLICIT, &ksc_caps).unwrap(),
             "한글"
@@ -16967,9 +16989,7 @@ mod tests {
             "한글"
         );
 
-        let mut mswin_caps = OracleThinCapabilities::default();
-        mswin_caps.protocol_version = Some(314);
-        mswin_caps.charset_id = ORACLE_CHARSET_KO16MSWIN949;
+        let mswin_caps = capabilities_with_charset(Some(314), ORACLE_CHARSET_KO16MSWIN949);
         assert_eq!(
             decode_oracle_text("한글".as_bytes(), CS_FORM_IMPLICIT, &mswin_caps).unwrap(),
             "한글"
@@ -16987,15 +17007,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn encodes_korean_varchar_binds_as_utf8_even_with_native_server_charset() {
-        let mut ksc_caps = OracleThinCapabilities::default();
-        ksc_caps.charset_id = ORACLE_CHARSET_KO16KSC5601;
+        let ksc_caps = capabilities_with_charset(None, ORACLE_CHARSET_KO16KSC5601);
         assert_eq!(
             encode_oracle_bind_text("한글", CS_FORM_IMPLICIT, &ksc_caps).unwrap(),
             "한글".as_bytes()
         );
 
-        let mut mswin_caps = OracleThinCapabilities::default();
-        mswin_caps.charset_id = ORACLE_CHARSET_KO16MSWIN949;
+        let mswin_caps = capabilities_with_charset(None, ORACLE_CHARSET_KO16MSWIN949);
         assert_eq!(
             encode_oracle_bind_text("힣", CS_FORM_IMPLICIT, &mswin_caps).unwrap(),
             "힣".as_bytes()
@@ -17005,8 +17023,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn decodes_vendor_native_charset_table_bytes_with_negotiated_server_charset() {
-        let mut cp1252_caps = OracleThinCapabilities::default();
-        cp1252_caps.charset_id = 178;
+        let cp1252_caps = capabilities_with_charset(None, 178);
         assert_eq!(
             decode_oracle_text(&[0xc3, 0xa9], CS_FORM_IMPLICIT, &cp1252_caps).unwrap(),
             "é"
@@ -17016,24 +17033,19 @@ mod tests {
             "“Hi”"
         );
 
-        let mut sjis_caps = OracleThinCapabilities::default();
-        sjis_caps.charset_id = ORACLE_CHARSET_JA16SJIS;
+        let sjis_caps = capabilities_with_charset(None, ORACLE_CHARSET_JA16SJIS);
         assert_eq!(
             decode_oracle_text(&[0x93, 0xfa, 0x96, 0x7b], CS_FORM_IMPLICIT, &sjis_caps).unwrap(),
             "日本"
         );
 
-        let mut gbk_caps = OracleThinCapabilities::default();
-        gbk_caps.protocol_version = Some(314);
-        gbk_caps.charset_id = ORACLE_CHARSET_ZHS16GBK;
+        let gbk_caps = capabilities_with_charset(Some(314), ORACLE_CHARSET_ZHS16GBK);
         assert_eq!(
             decode_oracle_text(&[0xba, 0xba, 0xd7, 0xd6], CS_FORM_IMPLICIT, &gbk_caps).unwrap(),
             "汉字"
         );
 
-        let mut big5_caps = OracleThinCapabilities::default();
-        big5_caps.protocol_version = Some(314);
-        big5_caps.charset_id = ORACLE_CHARSET_ZHT16BIG5;
+        let big5_caps = capabilities_with_charset(Some(314), ORACLE_CHARSET_ZHT16BIG5);
         assert_eq!(
             decode_oracle_text(&[0xa4, 0xa4, 0xa4, 0xe5], CS_FORM_IMPLICIT, &big5_caps).unwrap(),
             "中文"
@@ -17043,9 +17055,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn native_charset_mapping_uses_go_ora_for_314_and_python_oracledb_for_modern_protocols() {
-        let mut legacy_euc_jp_caps = OracleThinCapabilities::default();
-        legacy_euc_jp_caps.protocol_version = Some(314);
-        legacy_euc_jp_caps.charset_id = 830;
+        let legacy_euc_jp_caps = capabilities_with_charset(Some(314), 830);
         assert_eq!(
             decode_oracle_text(
                 &[0xc6, 0xfc, 0xcb, 0xdc],
@@ -17056,9 +17066,7 @@ mod tests {
             "日本"
         );
 
-        let mut modern_euc_kr_caps = OracleThinCapabilities::default();
-        modern_euc_kr_caps.protocol_version = Some(315);
-        modern_euc_kr_caps.charset_id = 830;
+        let modern_euc_kr_caps = capabilities_with_charset(Some(315), 830);
         assert_eq!(
             decode_oracle_text(
                 &[0xc7, 0xd1, 0xb1, 0xdb],
@@ -17069,9 +17077,7 @@ mod tests {
             "한글"
         );
 
-        let mut modern_gbk_caps = OracleThinCapabilities::default();
-        modern_gbk_caps.protocol_version = Some(318);
-        modern_gbk_caps.charset_id = 846;
+        let modern_gbk_caps = capabilities_with_charset(Some(318), 846);
         assert_eq!(
             decode_oracle_text(
                 &[0xba, 0xba, 0xd7, 0xd6],
@@ -17082,9 +17088,7 @@ mod tests {
             "汉字"
         );
 
-        let mut modern_cp949_caps = OracleThinCapabilities::default();
-        modern_cp949_caps.protocol_version = Some(319);
-        modern_cp949_caps.charset_id = 852;
+        let modern_cp949_caps = capabilities_with_charset(Some(319), 852);
         assert_eq!(
             decode_oracle_text(
                 &[0xc7, 0xd1, 0xb1, 0xdb],
@@ -17095,9 +17099,7 @@ mod tests {
             "한글"
         );
 
-        let mut modern_big5_caps = OracleThinCapabilities::default();
-        modern_big5_caps.protocol_version = Some(315);
-        modern_big5_caps.charset_id = 829;
+        let modern_big5_caps = capabilities_with_charset(Some(315), 829);
         assert_eq!(
             decode_oracle_text(
                 &[0xa4, 0xa4, 0xa4, 0xe5],
@@ -17108,9 +17110,7 @@ mod tests {
             "中文"
         );
 
-        let mut modern_gb18030_caps = OracleThinCapabilities::default();
-        modern_gb18030_caps.protocol_version = Some(315);
-        modern_gb18030_caps.charset_id = 870;
+        let modern_gb18030_caps = capabilities_with_charset(Some(315), 870);
         assert_eq!(
             decode_oracle_text(
                 &[0xba, 0xba, 0xd7, 0xd6],
@@ -17125,9 +17125,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn nchar_native_charset_mapping_follows_modern_python_oracledb_table() {
-        let mut caps = OracleThinCapabilities::default();
-        caps.protocol_version = Some(315);
-        caps.ncharset_id = 830;
+        let caps = OracleThinCapabilities {
+            protocol_version: Some(315),
+            ncharset_id: 830,
+            ..OracleThinCapabilities::default()
+        };
 
         assert_eq!(
             decode_oracle_text(&[0xc7, 0xd1, 0xb1, 0xdb], CS_FORM_NCHAR, &caps).unwrap(),
@@ -17141,8 +17143,10 @@ mod tests {
 
     #[test]
     fn decodes_utf8_nchar_when_server_reports_utf8_national_charset() {
-        let mut utf8_caps = OracleThinCapabilities::default();
-        utf8_caps.ncharset_id = ORACLE_CHARSET_UTF8;
+        let mut utf8_caps = OracleThinCapabilities {
+            ncharset_id: ORACLE_CHARSET_UTF8,
+            ..OracleThinCapabilities::default()
+        };
         assert_eq!(
             decode_oracle_text("한".as_bytes(), CS_FORM_NCHAR, &utf8_caps).unwrap(),
             "한"
@@ -17215,8 +17219,7 @@ mod tests {
 
     #[test]
     fn row_scanner_decodes_interval_day_second_columns() {
-        let mut state = ExecuteReadState::default();
-        state.columns = vec![ThinColumn {
+        let mut state = execute_read_state_with_columns(vec![ThinColumn {
             name: "DURATION".to_string(),
             column_type: OracleColumnType::IntervalDaySecond,
             ora_type_num: ORA_TYPE_NUM_INTERVAL_DS,
@@ -17224,7 +17227,7 @@ mod tests {
             buffer_size: 11,
             schema_name: String::new(),
             type_name: String::new(),
-        }];
+        }]);
         let mut row = vec![11];
         row.extend_from_slice(&[128, 0, 0, 2, 72, 83, 94, 155, 46, 2, 0]);
         let mut cursor = PacketCursor::with_capabilities(&row, &OracleThinCapabilities::default());
@@ -17239,8 +17242,7 @@ mod tests {
 
     #[test]
     fn row_scanner_decodes_binary_float_columns_as_numbers() {
-        let mut state = ExecuteReadState::default();
-        state.columns = vec![ThinColumn {
+        let mut state = execute_read_state_with_columns(vec![ThinColumn {
             name: "VALUE".to_string(),
             column_type: OracleColumnType::BinaryFloat,
             ora_type_num: ORA_TYPE_NUM_BINARY_FLOAT,
@@ -17248,7 +17250,7 @@ mod tests {
             buffer_size: 4,
             schema_name: String::new(),
             type_name: String::new(),
-        }];
+        }]);
         let mut row = vec![4];
         row.extend_from_slice(&[195, 6, 115, 51]);
         let mut cursor = PacketCursor::with_capabilities(&row, &OracleThinCapabilities::default());
@@ -17263,8 +17265,7 @@ mod tests {
 
     #[test]
     fn row_scanner_decodes_go_ora_binary_float_alias_columns_as_numbers() {
-        let mut state = ExecuteReadState::default();
-        state.columns = vec![
+        let mut state = execute_read_state_with_columns(vec![
             ThinColumn {
                 name: "BF".to_string(),
                 column_type: OracleColumnType::BinaryFloat,
@@ -17283,7 +17284,7 @@ mod tests {
                 schema_name: String::new(),
                 type_name: String::new(),
             },
-        ];
+        ]);
         let mut row = vec![4];
         row.extend_from_slice(&[195, 6, 115, 51]);
         row.push(8);
@@ -18012,8 +18013,7 @@ mod tests {
 
     #[test]
     fn row_scanner_decodes_vendor_negotiated_alias_types() {
-        let mut state = ExecuteReadState::default();
-        state.columns = vec![
+        let mut state = execute_read_state_with_columns(vec![
             ThinColumn {
                 name: "N".to_string(),
                 column_type: OracleColumnType::Number,
@@ -18104,7 +18104,7 @@ mod tests {
                 schema_name: String::new(),
                 type_name: String::new(),
             },
-        ];
+        ]);
         let caps = OracleThinCapabilities::default();
         let mut row = Vec::new();
         write_bytes_with_length_for_capabilities(
@@ -18166,8 +18166,7 @@ mod tests {
 
     #[test]
     fn row_scanner_decodes_vbi_as_raw_like_go_ora_for_protocol_314() {
-        let mut state = ExecuteReadState::default();
-        state.columns = vec![ThinColumn {
+        let mut state = execute_read_state_with_columns(vec![ThinColumn {
             name: "VBI".to_string(),
             column_type: OracleColumnType::Raw,
             ora_type_num: TNS_DATA_TYPE_VBI,
@@ -18175,7 +18174,7 @@ mod tests {
             buffer_size: 3,
             schema_name: String::new(),
             type_name: String::new(),
-        }];
+        }]);
         let mut caps = OracleThinCapabilities {
             protocol_version: Some(314),
             ..OracleThinCapabilities::default()
@@ -18195,8 +18194,7 @@ mod tests {
 
     #[test]
     fn row_scanner_decodes_vbi_as_text_like_python_oracledb_for_modern_protocols() {
-        let mut state = ExecuteReadState::default();
-        state.columns = vec![ThinColumn {
+        let mut state = execute_read_state_with_columns(vec![ThinColumn {
             name: "VBI".to_string(),
             column_type: OracleColumnType::Varchar,
             ora_type_num: TNS_DATA_TYPE_VBI,
@@ -18204,7 +18202,7 @@ mod tests {
             buffer_size: 3,
             schema_name: String::new(),
             type_name: String::new(),
-        }];
+        }]);
         let caps = OracleThinCapabilities {
             protocol_version: Some(315),
             ..OracleThinCapabilities::default()
@@ -18273,8 +18271,7 @@ mod tests {
 
     #[test]
     fn row_scanner_decodes_timestamp_ltz_columns_as_timestamps() {
-        let mut state = ExecuteReadState::default();
-        state.columns = vec![ThinColumn {
+        let mut state = execute_read_state_with_columns(vec![ThinColumn {
             name: "TS_LTZ".to_string(),
             column_type: OracleColumnType::Timestamp,
             ora_type_num: ORA_TYPE_NUM_TIMESTAMP_LTZ,
@@ -18282,7 +18279,7 @@ mod tests {
             buffer_size: 11,
             schema_name: String::new(),
             type_name: String::new(),
-        }];
+        }]);
         let row = [11, 120, 124, 1, 2, 4, 5, 6, 0, 1, 226, 64];
         let mut cursor = PacketCursor::with_capabilities(&row, &OracleThinCapabilities::default());
 
@@ -18306,8 +18303,7 @@ mod tests {
 
     #[test]
     fn row_scanner_decodes_extended_timestamptz_columns_as_timestamps() {
-        let mut state = ExecuteReadState::default();
-        state.columns = vec![ThinColumn {
+        let mut state = execute_read_state_with_columns(vec![ThinColumn {
             name: "TS_TZ".to_string(),
             column_type: OracleColumnType::Timestamp,
             ora_type_num: ORA_TYPE_NUM_TIMESTAMP_TZ_EXT,
@@ -18315,7 +18311,7 @@ mod tests {
             buffer_size: 13,
             schema_name: String::new(),
             type_name: String::new(),
-        }];
+        }]);
         let row = [13, 120, 124, 1, 2, 4, 5, 6, 7, 91, 202, 0, 25, 105];
         let mut cursor = PacketCursor::with_capabilities(&row, &OracleThinCapabilities::default());
 
@@ -18467,7 +18463,7 @@ mod tests {
             type_name: String::new(),
         };
 
-        assert!(columns_require_define_fetch_for_values(&[column.clone()]));
+        assert!(columns_require_define_fetch_for_values(std::slice::from_ref(&column)));
 
         let thin = define_column_metadata(&column);
         assert_eq!(thin.column_type, OracleColumnType::Raw);
@@ -18483,8 +18479,7 @@ mod tests {
             ORA_TYPE_NUM_BLOB,
             TNS_DATA_TYPE_DBLOB,
         ] {
-            let mut caps = OracleThinCapabilities::default();
-            caps.ttc_field_version = TNS_CCAP_FIELD_VERSION_20_1;
+            let caps = capabilities_with_ttc_field_version(TNS_CCAP_FIELD_VERSION_20_1);
             let column = ThinColumn {
                 name: "LOB".to_string(),
                 column_type: OracleColumnType::Clob,
@@ -18517,8 +18512,7 @@ mod tests {
 
     #[test]
     fn json_metadata_writer_uses_python_oracledb_json_tail() {
-        let mut caps = OracleThinCapabilities::default();
-        caps.ttc_field_version = TNS_CCAP_FIELD_VERSION_20_1;
+        let caps = capabilities_with_ttc_field_version(TNS_CCAP_FIELD_VERSION_20_1);
         let column = ThinColumn {
             name: "JSON".to_string(),
             column_type: OracleColumnType::Json,
@@ -18614,8 +18608,7 @@ mod tests {
 
     #[test]
     fn row_scanner_decodes_rowid_and_urowid_columns_as_text() {
-        let mut state = ExecuteReadState::default();
-        state.columns = vec![
+        let mut state = execute_read_state_with_columns(vec![
             ThinColumn {
                 name: "RID".to_string(),
                 column_type: OracleColumnType::Rowid,
@@ -18634,7 +18627,7 @@ mod tests {
                 schema_name: String::new(),
                 type_name: String::new(),
             },
-        ];
+        ]);
         let row = [
             18, 1, 1, 1, 2, 0, 1, 3, 1, 4, 1, 0, 13, 1, 0, 0, 0, 1, 0, 2, 0, 0, 0, 3, 0, 4,
         ];
@@ -18653,8 +18646,7 @@ mod tests {
 
     #[test]
     fn row_scanner_decodes_null_rowid_and_urowid_columns() {
-        let mut state = ExecuteReadState::default();
-        state.columns = vec![
+        let mut state = execute_read_state_with_columns(vec![
             ThinColumn {
                 name: "RID".to_string(),
                 column_type: OracleColumnType::Rowid,
@@ -18673,7 +18665,7 @@ mod tests {
                 schema_name: String::new(),
                 type_name: String::new(),
             },
-        ];
+        ]);
         let row = [0, 0];
         let mut cursor = PacketCursor::with_capabilities(&row, &OracleThinCapabilities::default());
 
@@ -19062,8 +19054,7 @@ mod tests {
 
     #[test]
     fn row_scanner_decodes_json_columns_from_prefetched_oson() {
-        let mut state = ExecuteReadState::default();
-        state.columns = vec![ThinColumn {
+        let mut state = execute_read_state_with_columns(vec![ThinColumn {
             name: "J".to_string(),
             column_type: OracleColumnType::Json,
             ora_type_num: ORA_TYPE_NUM_JSON,
@@ -19071,7 +19062,7 @@ mod tests {
             buffer_size: TNS_JSON_MAX_LENGTH,
             schema_name: String::new(),
             type_name: String::new(),
-        }];
+        }]);
         let oson = [
             0xff, 0x4a, 0x5a, 0x01, 0x00, 0x12, 0x00, 0x03, 0x02, b'o', b'k',
         ];
@@ -19103,8 +19094,7 @@ mod tests {
 
     #[test]
     fn row_scanner_decodes_flagged_djson_columns_as_json() {
-        let mut state = ExecuteReadState::default();
-        state.columns = vec![ThinColumn {
+        let mut state = execute_read_state_with_columns(vec![ThinColumn {
             name: "J".to_string(),
             column_type: oracle_column_type_from_ora_type(ORA_TYPE_NUM_DJSON),
             ora_type_num: ORA_TYPE_NUM_DJSON,
@@ -19112,7 +19102,7 @@ mod tests {
             buffer_size: TNS_JSON_MAX_LENGTH,
             schema_name: String::new(),
             type_name: String::new(),
-        }];
+        }]);
         let json = br#"{"k":"v"}"#;
         let mut row = Vec::new();
         write_ub4(&mut row, json.len() as u32);
@@ -19142,8 +19132,7 @@ mod tests {
 
     #[test]
     fn row_scanner_decodes_xmltype_string_payload_as_text() {
-        let mut state = ExecuteReadState::default();
-        state.columns = vec![ThinColumn {
+        let mut state = execute_read_state_with_columns(vec![ThinColumn {
             name: "X".to_string(),
             column_type: OracleColumnType::Xml,
             ora_type_num: ORA_TYPE_NUM_OBJECT,
@@ -19151,7 +19140,7 @@ mod tests {
             buffer_size: TNS_MAX_LONG_LENGTH,
             schema_name: String::new(),
             type_name: String::new(),
-        }];
+        }]);
         let mut xml_payload = vec![TNS_OBJ_NO_PREFIX_SEG, 1, 0, 1];
         xml_payload.extend_from_slice(&TNS_XML_TYPE_STRING.to_be_bytes());
         xml_payload.extend_from_slice(b"<root>ok</root>");
@@ -19181,8 +19170,7 @@ mod tests {
 
     #[test]
     fn row_scanner_decodes_xmltype_lob_payload_as_locator() {
-        let mut state = ExecuteReadState::default();
-        state.columns = vec![ThinColumn {
+        let mut state = execute_read_state_with_columns(vec![ThinColumn {
             name: "X".to_string(),
             column_type: OracleColumnType::Xml,
             ora_type_num: ORA_TYPE_NUM_OBJECT,
@@ -19190,7 +19178,7 @@ mod tests {
             buffer_size: TNS_MAX_LONG_LENGTH,
             schema_name: String::new(),
             type_name: String::new(),
-        }];
+        }]);
         let mut xml_payload = vec![TNS_OBJ_NO_PREFIX_SEG, 1, 0, 1];
         xml_payload.extend_from_slice(&TNS_XML_TYPE_LOB.to_be_bytes());
         xml_payload.extend_from_slice(b"xml-locator");
@@ -19220,8 +19208,7 @@ mod tests {
 
     #[test]
     fn row_scanner_decodes_degenerate_xmltype_lob_payload_as_locator() {
-        let mut state = ExecuteReadState::default();
-        state.columns = vec![ThinColumn {
+        let mut state = execute_read_state_with_columns(vec![ThinColumn {
             name: "X".to_string(),
             column_type: OracleColumnType::Xml,
             ora_type_num: ORA_TYPE_NUM_OBJECT,
@@ -19229,7 +19216,7 @@ mod tests {
             buffer_size: TNS_MAX_LONG_LENGTH,
             schema_name: String::new(),
             type_name: String::new(),
-        }];
+        }]);
         let mut xml_payload = vec![TNS_OBJ_IS_DEGENERATE, 1, 0, 1];
         xml_payload.extend_from_slice(&TNS_XML_TYPE_LOB.to_be_bytes());
         xml_payload.extend_from_slice(b"degenerate-xml-locator");
@@ -19678,8 +19665,7 @@ mod tests {
 
     #[test]
     fn row_scanner_decodes_bfile_columns_as_locator_lobs() {
-        let mut state = ExecuteReadState::default();
-        state.columns = vec![ThinColumn {
+        let mut state = execute_read_state_with_columns(vec![ThinColumn {
             name: "BF".to_string(),
             column_type: OracleColumnType::Bfile,
             ora_type_num: ORA_TYPE_NUM_BFILE,
@@ -19687,7 +19673,7 @@ mod tests {
             buffer_size: 1,
             schema_name: String::new(),
             type_name: String::new(),
-        }];
+        }]);
         let mut row = Vec::new();
         write_ub4(&mut row, 1);
         write_bytes_with_length_for_capabilities(
@@ -19708,8 +19694,7 @@ mod tests {
 
     #[test]
     fn row_scanner_decodes_vector_columns_as_text() {
-        let mut state = ExecuteReadState::default();
-        state.columns = vec![ThinColumn {
+        let mut state = execute_read_state_with_columns(vec![ThinColumn {
             name: "V".to_string(),
             column_type: OracleColumnType::Vector,
             ora_type_num: ORA_TYPE_NUM_VECTOR,
@@ -19717,7 +19702,7 @@ mod tests {
             buffer_size: 1,
             schema_name: String::new(),
             type_name: String::new(),
-        }];
+        }]);
         let vector = [
             0xdb, 0, 0, 0x12, 2, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 195, 6, 115, 51, 60, 249, 140,
             204,
@@ -19758,9 +19743,11 @@ mod tests {
 
     #[test]
     fn client_capabilities_keep_python_oracledb_314_plus_defaults() {
-        let mut capabilities = OracleThinCapabilities::default();
-        capabilities.ttc_field_version = default_ttc_field_version(319);
-        capabilities.supports_end_of_response = true;
+        let capabilities = OracleThinCapabilities {
+            ttc_field_version: default_ttc_field_version(319),
+            supports_end_of_response: true,
+            ..OracleThinCapabilities::default()
+        };
 
         let compile_caps = client_compile_caps(&capabilities).unwrap();
         assert_eq!(compile_caps.len(), 53);
@@ -21333,32 +21320,34 @@ mod tests {
 
     #[test]
     fn row_scanner_reuses_previous_batch_row_for_duplicate_bit_vector_columns() {
-        let mut state = ExecuteReadState::default();
-        state.columns = vec![
-            ThinColumn {
-                name: "A".to_string(),
-                column_type: OracleColumnType::Varchar,
-                ora_type_num: ORA_TYPE_NUM_VARCHAR,
-                charset_form: 1,
-                buffer_size: 10,
-                schema_name: String::new(),
-                type_name: String::new(),
-            },
-            ThinColumn {
-                name: "B".to_string(),
-                column_type: OracleColumnType::Varchar,
-                ora_type_num: ORA_TYPE_NUM_VARCHAR,
-                charset_form: 1,
-                buffer_size: 10,
-                schema_name: String::new(),
-                type_name: String::new(),
-            },
-        ];
-        state.last_row = Some(vec![
-            OracleValue::Text("old-a".to_string()),
-            OracleValue::Text("old-b".to_string()),
-        ]);
-        state.bit_vector = Some(vec![0b0000_0010]);
+        let mut state = ExecuteReadState {
+            columns: vec![
+                ThinColumn {
+                    name: "A".to_string(),
+                    column_type: OracleColumnType::Varchar,
+                    ora_type_num: ORA_TYPE_NUM_VARCHAR,
+                    charset_form: 1,
+                    buffer_size: 10,
+                    schema_name: String::new(),
+                    type_name: String::new(),
+                },
+                ThinColumn {
+                    name: "B".to_string(),
+                    column_type: OracleColumnType::Varchar,
+                    ora_type_num: ORA_TYPE_NUM_VARCHAR,
+                    charset_form: 1,
+                    buffer_size: 10,
+                    schema_name: String::new(),
+                    type_name: String::new(),
+                },
+            ],
+            last_row: Some(vec![
+                OracleValue::Text("old-a".to_string()),
+                OracleValue::Text("old-b".to_string()),
+            ]),
+            bit_vector: Some(vec![0b0000_0010]),
+            ..ExecuteReadState::default()
+        };
 
         let mut cursor = PacketCursor::with_capabilities(
             &[3, b'n', b'e', b'w'],
