@@ -129,6 +129,10 @@ struct ExpressionKeywordContext {
     /// Whether the cursor is in a DML value position (`INSERT … VALUES (…|)`,
     /// `UPDATE … SET col = |`) where the `DEFAULT` value keyword is grammatical.
     in_dml_value_position: bool,
+    /// Whether the cursor is specifically inside an `INSERT ... VALUES (...)`
+    /// expression list. These slots can use columns, but functions/literals are
+    /// just as valid, so they should not run in column-preferred mode.
+    in_values_clause: bool,
     /// Whether the cursor is in MySQL's top-level `DO` expression list. The
     /// slot is a value expression, not a statement/object position, so statement
     /// heads and relation names from the flat base catalog are noise.
@@ -822,6 +826,7 @@ impl ExpressionKeywordContext {
             follows_quantified_comparison_operator: false,
             has_connect_by: false,
             in_dml_value_position: false,
+            in_values_clause: false,
             in_mysql_do_value_expression: false,
             in_mysql_help_topic_argument: false,
             in_mysql_set_assignment_value_expression: false,
@@ -2569,7 +2574,13 @@ impl SqlEditorWidget {
             })
             .unwrap_or_default();
         for source in &local_rowtype_member_sources {
-            Self::request_table_columns(source, intellisense_data, column_sender, connection);
+            Self::request_table_columns_for_db(
+                source,
+                intellisense_data,
+                column_sender,
+                connection,
+                Some(snapshot.preferred_db_type),
+            );
         }
         let mut local_rowtype_member_suggestions = if !local_rowtype_member_sources.is_empty() {
             let mut data = intellisense_data
@@ -2791,12 +2802,47 @@ impl SqlEditorWidget {
                 deep_ctx,
                 !snapshot.prefix.is_empty(),
                 Some(snapshot.preferred_db_type),
+            ) || Self::cursor_is_at_rollback_to_savepoint_name_slot_for_context(
+                deep_ctx,
+                !snapshot.prefix.is_empty(),
+                Some(snapshot.preferred_db_type),
             ) || Self::cursor_is_at_plsql_exception_name_for_context(
                 deep_ctx,
                 !snapshot.prefix.is_empty(),
             ));
+        let at_plsql_statement_start_local_symbol_slot = qualifier.is_none()
+            && !snapshot.prefix.is_empty()
+            && Self::plsql_statement_start_allows_bare_calls(effective_expr_keyword_ctx)
+            && !Self::cursor_is_at_plsql_goto_label_slot_for_context(
+                deep_ctx,
+                true,
+                Some(snapshot.preferred_db_type),
+            )
+            && !Self::cursor_is_at_plsql_exit_continue_label_slot_for_context(
+                deep_ctx,
+                true,
+                Some(snapshot.preferred_db_type),
+            )
+            && !Self::cursor_is_at_plsql_named_end_target_slot_for_context(
+                deep_ctx,
+                true,
+                Some(snapshot.preferred_db_type),
+            )
+            && !Self::cursor_is_after_plsql_end_keyword_for_context(
+                deep_ctx,
+                true,
+                Some(snapshot.preferred_db_type),
+            )
+            && !Self::cursor_is_at_plsql_label_definition_slot_for_context(
+                deep_ctx,
+                true,
+                Some(snapshot.preferred_db_type),
+            );
         let mut local_suggestions =
-            if source_allowance.local_suggestions || at_name_only_local_symbol_slot {
+            if source_allowance.local_suggestions
+                || at_name_only_local_symbol_slot
+                || at_plsql_statement_start_local_symbol_slot
+            {
                 Self::collect_local_symbol_suggestions(
                     &snapshot.prefix,
                     cursor_in_statement,
@@ -3226,17 +3272,24 @@ impl SqlEditorWidget {
                         .iter()
                         .any(|s| s.alias.eq_ignore_ascii_case(table));
                 if !is_virtual {
-                    Self::request_table_columns(
+                    Self::request_table_columns_for_resolved_scope(
                         table,
                         intellisense_data,
                         column_sender,
                         connection,
+                        Some(snapshot.preferred_db_type),
                     );
                 }
             }
 
             for table in &comparison_lookup_tables {
-                Self::request_table_columns(table, intellisense_data, column_sender, connection);
+                Self::request_table_columns_for_resolved_scope(
+                    table,
+                    intellisense_data,
+                    column_sender,
+                    connection,
+                    Some(snapshot.preferred_db_type),
+                );
             }
         }
 
@@ -4039,7 +4092,8 @@ impl SqlEditorWidget {
 
         let statement_start = expr_keyword_ctx.statement_start;
         let prefer_columns = statement_start.is_none()
-            && matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll);
+            && matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll)
+            && !expr_keyword_ctx.in_values_clause;
         let mut suggestions = data.get_suggestions_for_db(
             prefix,
             include_columns,
@@ -4068,6 +4122,13 @@ impl SqlEditorWidget {
                 {
                     suggestions.push(package);
                 }
+            }
+            if !prefix.is_empty() && !crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+                suggestions = Self::merge_suggestions_with_context_aliases(
+                    suggestions,
+                    data.get_user_suggestions(prefix),
+                    false,
+                );
             }
         }
         // The base catalog mixes columns, relations, objects and functions (kept
@@ -4440,7 +4501,8 @@ impl SqlEditorWidget {
     /// Whether a single base-catalog entry can stand where the cursor begins a
     /// statement. Keyword entries defer to `keyword_begins_statement`; non-keyword
     /// entries (identifiers, `NAME()` functions) are admitted only as a PL/SQL
-    /// block's bare procedure/package call.
+    /// block's bare procedure/package call, or an Oracle schema/user qualifier
+    /// head for a qualified call (`schema.proc(...)`).
     fn suggestion_begins_statement(
         data: &IntellisenseData,
         suggestion: &str,
@@ -4453,17 +4515,23 @@ impl SqlEditorWidget {
         {
             return true;
         }
+        let label = data.suggestion_type_label(suggestion, db_type);
+        if matches!(ctx, StatementStartContext::Plsql(policy) if policy.allow_statements)
+            && !crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            && matches!(label, Some("USER"))
+        {
+            return true;
+        }
         if data.is_language_keyword(&upper, db_type) {
             return Self::keyword_begins_statement(&upper, ctx, db_type);
         }
         match ctx {
             StatementStartContext::TopLevel => false,
             StatementStartContext::Plsql(policy) => {
-                policy.allow_statements
-                    && matches!(
-                        data.suggestion_type_label(suggestion, db_type),
-                        Some("PROCEDURE" | "PACKAGE")
-                    )
+                if !policy.allow_statements {
+                    return false;
+                }
+                matches!(label, Some("PROCEDURE" | "PACKAGE"))
             }
         }
     }
@@ -5245,6 +5313,7 @@ impl SqlEditorWidget {
             intellisense_context::SqlPhase::SetClause
                 | intellisense_context::SqlPhase::ValuesClause
         );
+        let in_values_clause = matches!(deep_ctx.phase, intellisense_context::SqlPhase::ValuesClause);
         let full_tokens = deep_ctx.statement_tokens.as_ref();
         let full_end = Self::expected_suggestion_context_end(
             full_tokens,
@@ -5437,6 +5506,7 @@ impl SqlEditorWidget {
             follows_quantified_comparison_operator,
             has_connect_by,
             in_dml_value_position,
+            in_values_clause,
             in_mysql_do_value_expression,
             in_mysql_help_topic_argument,
             in_mysql_set_assignment_value_expression,
@@ -14374,6 +14444,9 @@ impl SqlEditorWidget {
         if Self::cursor_is_at_tool_variable_type(tokens, end) {
             return Some(DataTypePosition::ToolVariable);
         }
+        if Self::cursor_is_at_mysql_routine_parameter_type(tokens, end, db_type) {
+            return Some(DataTypePosition::Plsql);
+        }
         if Self::is_predicate_of_type_type_object_position(tokens, end) {
             return Some(DataTypePosition::TypeObject);
         }
@@ -16100,15 +16173,12 @@ impl SqlEditorWidget {
                 };
             }
             Some("TYPE") => {
-                // `TYPE t IS TABLE OF <elem> |` (and friends) is complete; the
-                // element-type slot (`… TABLE OF |`) and record field slots fall
-                // through to the data-type grammar, so require a token after `OF`.
-                let of_complete = tail.get(2).map(String::as_str) == Some("IS")
-                    && tail
-                        .iter()
-                        .position(|word| word == "OF")
-                        .is_some_and(|of_pos| of_pos + 1 < tail.len());
-                return of_complete.then_some(&[][..]);
+                // Collection/ref-cursor TYPE declarations have their own detailed
+                // tail grammar (`TABLE OF <type> |` -> `INDEX BY`/`NOT NULL`,
+                // `INDEX BY |` -> index types). Let the PL/SQL declaration-tail
+                // handler below own those slots instead of swallowing them here
+                // as a completed package declaration.
+                return None;
             }
             Some("FUNCTION" | "PROCEDURE" | "PRAGMA") => return None,
             _ => {}
@@ -16793,6 +16863,7 @@ impl SqlEditorWidget {
                 | "EXCEPTION"
                 | "RETURN"
                 | "IN"
+                | "INOUT"
                 | "OUT"
                 | "NOCOPY"
                 | "NOT"
@@ -25992,8 +26063,8 @@ impl SqlEditorWidget {
         deep_ctx: &intellisense_context::CursorContext,
         exclude_current_identifier_chain: bool,
     ) -> Option<Vec<String>> {
-        let tokens = deep_ctx.statement_tokens.as_ref();
-        let cursor_token_len = deep_ctx.cursor_token_len;
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
         let end = Self::expected_suggestion_context_end(
             tokens,
             cursor_token_len,
@@ -29411,6 +29482,55 @@ impl SqlEditorWidget {
         labels
     }
 
+    fn plsql_savepoint_suggestions(
+        deep_ctx: &intellisense_context::CursorContext,
+        prefix: &str,
+    ) -> Vec<String> {
+        let prefix_upper = Self::local_identifier_lookup_upper(prefix);
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            deep_ctx.cursor_token_len,
+            !prefix.is_empty(),
+        )
+        .min(tokens.len());
+        let mut seen = std::collections::HashSet::new();
+        let mut savepoints = Vec::new();
+
+        for (idx, token) in tokens.iter().take(end).enumerate() {
+            let SqlToken::Word(word) = token else {
+                continue;
+            };
+            if !word.eq_ignore_ascii_case("SAVEPOINT") {
+                continue;
+            }
+            let statement_start = Self::plsql_statement_slot_start(tokens, idx);
+            if Self::next_non_comment_token_index(tokens, statement_start) != Some(idx) {
+                continue;
+            }
+            let Some(name_idx) = Self::next_non_comment_token_index(tokens, idx + 1) else {
+                continue;
+            };
+            if name_idx >= end {
+                continue;
+            }
+            let Some(name) = Self::token_word(&tokens[name_idx])
+                .and_then(Self::local_identifier_suggestion_from_word)
+            else {
+                continue;
+            };
+            let upper = Self::local_identifier_lookup_upper(&name);
+            if !Self::local_symbol_matches_prefix(&name, &upper, &prefix_upper) {
+                continue;
+            }
+            if seen.insert(upper) {
+                savepoints.push(name);
+            }
+        }
+
+        savepoints
+    }
+
     /// The enclosing named PL/SQL object (`PACKAGE [BODY]`, `PROCEDURE`,
     /// `FUNCTION`, `TYPE BODY`) whose closing `END` admits repeating the name —
     /// `END <name>;` — found by scanning the statement's construct stack up to
@@ -29703,6 +29823,45 @@ impl SqlEditorWidget {
         Self::cursor_is_at_plsql_named_end_target_slot(statement_tokens, statement_end, db_type)
     }
 
+    fn cursor_is_after_plsql_end_keyword(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return false;
+        }
+        let Some(end_idx) = Self::previous_non_comment_token_index(tokens, end) else {
+            return false;
+        };
+        matches!(tokens.get(end_idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("END"))
+    }
+
+    fn cursor_is_after_plsql_end_keyword_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let context_end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        if Self::cursor_is_after_plsql_end_keyword(tokens, context_end, db_type) {
+            return true;
+        }
+
+        let statement_tokens = deep_ctx.statement_tokens.as_ref();
+        let statement_end = Self::expected_suggestion_context_end(
+            statement_tokens,
+            deep_ctx.cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::cursor_is_after_plsql_end_keyword(statement_tokens, statement_end, db_type)
+    }
+
     /// The suggestion(s) at a named-object `END |` slot: just the one enclosing
     /// name, filtered by the typed prefix.
     fn plsql_named_end_target_suggestions(
@@ -29797,6 +29956,62 @@ impl SqlEditorWidget {
             exclude_current_identifier_chain,
         );
         Self::cursor_is_at_plsql_exception_name(statement_tokens, statement_end)
+    }
+
+    fn cursor_is_at_rollback_to_savepoint_name_slot(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if Self::unclosed_paren_count(tokens, end) != 0 {
+            return false;
+        }
+
+        let mysql = crate::sql_text::mysql_compatibility_for_sql("", db_type);
+        let words = if !mysql && Self::cursor_in_plsql_executable_block(tokens, end) {
+            Self::words_for_plsql_statement_slot(tokens, end)
+        } else {
+            Self::words_for_keyword_slot(tokens, end)
+        };
+
+        matches!(
+            words.as_slice(),
+            [rollback, to]
+                if rollback == "ROLLBACK" && to == "TO"
+        ) || matches!(
+            words.as_slice(),
+            [rollback, to, savepoint]
+                if rollback == "ROLLBACK" && to == "TO" && savepoint == "SAVEPOINT"
+        )
+    }
+
+    fn cursor_is_at_rollback_to_savepoint_name_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let context_end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        if Self::cursor_is_at_rollback_to_savepoint_name_slot(tokens, context_end, db_type) {
+            return true;
+        }
+
+        let statement_tokens = deep_ctx.statement_tokens.as_ref();
+        let statement_end = Self::expected_suggestion_context_end(
+            statement_tokens,
+            deep_ctx.cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::cursor_is_at_rollback_to_savepoint_name_slot(
+            statement_tokens,
+            statement_end,
+            db_type,
+        )
     }
 
     fn cursor_is_at_plsql_goto_label_slot_for_context(
@@ -30081,11 +30296,10 @@ impl SqlEditorWidget {
         end: usize,
         db_type: Option<crate::db::DatabaseType>,
     ) -> Option<&'static [&'static str]> {
-        if crate::sql_text::mysql_compatibility_for_sql("", db_type)
-            || !Self::cursor_is_in_plsql_declaration_region(tokens, end)
-        {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
             return None;
         }
+        let in_declaration_region = Self::cursor_is_in_plsql_declaration_region(tokens, end);
         // The current declaration item: tokens since the last `;`, `DECLARE`, or
         // a routine-header `IS`/`AS` (a `TYPE t IS …`/`CURSOR c IS …` item keeps
         // its own `IS`, so only the `IS`/`AS` completing a pending
@@ -30123,6 +30337,14 @@ impl SqlEditorWidget {
                 _ => None,
             })
             .collect();
+        if !in_declaration_region
+            && !matches!(
+                item.first().map(String::as_str),
+                Some("TYPE" | "SUBTYPE" | "CURSOR")
+            )
+        {
+            return None;
+        }
         let last = item.last().map(String::as_str);
         let has = |keyword: &str| item.iter().any(|word| word == keyword);
         let prev_token_is_close_paren = matches!(
@@ -30172,6 +30394,9 @@ impl SqlEditorWidget {
             }
             if last == Some("NOT") {
                 return Some(&["NULL"]);
+            }
+            if has("INDEX") || has("NOT") {
+                return Some(&[]);
             }
             return None;
         }
@@ -32296,6 +32521,16 @@ impl SqlEditorWidget {
                 .any(|(idx, word)| word == keyword && !word_is_routine_name(idx))
         };
         let last_is_routine_name = words.len().checked_sub(1).is_some_and(word_is_routine_name);
+        let routine_body_started = routine_kind_idx.is_some_and(|idx| {
+            words
+                .iter()
+                .skip(idx + 1)
+                .any(|word| word == "BEGIN")
+        });
+
+        if first == "CREATE" && (has("FUNCTION") || has("PROCEDURE")) && routine_body_started {
+            return None;
+        }
 
         if first == "CREATE" && has("FUNCTION") && !has_routine_clause_word("RETURNS") {
             if !last_is_routine_name && matches!(last, Some("FUNCTION" | "IF" | "NOT" | "EXISTS")) {
@@ -34286,6 +34521,9 @@ impl SqlEditorWidget {
         if let Some(position) = position {
             return Self::data_type_position_allowed_for_db(position, db_type).then_some(position);
         }
+        if Self::current_routine_body_statement_range(deep_ctx).is_some() {
+            return None;
+        }
         let statement_tokens = deep_ctx.statement_tokens.as_ref();
         let statement_end = Self::expected_suggestion_context_end(
             statement_tokens,
@@ -34421,6 +34659,138 @@ impl SqlEditorWidget {
                 Some(&["NOCOPY"])
             }
             _ => None,
+        }
+    }
+
+    fn expected_mysql_routine_parameter_mode_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            || !Self::cursor_is_inside_routine_param_list(tokens, end)
+        {
+            return None;
+        }
+
+        let visible_end = end.min(tokens.len());
+        let open_idx = Self::nearest_unclosed_open_paren_before(tokens, visible_end)?;
+        if !Self::routine_param_open_keyword(tokens, open_idx)?
+            .eq_ignore_ascii_case("PROCEDURE")
+        {
+            return None;
+        }
+
+        Self::routine_parameter_segment(tokens, open_idx, visible_end)
+            .is_empty()
+            .then_some(&["IN", "OUT", "INOUT"])
+    }
+
+    fn cursor_is_at_mysql_routine_parameter_type(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            || !Self::cursor_is_inside_routine_param_list(tokens, end)
+        {
+            return false;
+        }
+
+        let visible_end = end.min(tokens.len());
+        let Some(open_idx) = Self::nearest_unclosed_open_paren_before(tokens, visible_end) else {
+            return false;
+        };
+        if Self::routine_param_open_keyword(tokens, open_idx).is_none() {
+            return false;
+        }
+
+        let segment = Self::routine_parameter_segment(tokens, open_idx, visible_end);
+        match segment.as_slice() {
+            [name] => Self::token_is_mysql_routine_parameter_name(name),
+            [mode, name]
+                if Self::token_is_mysql_routine_parameter_mode(mode)
+                    && Self::token_is_mysql_routine_parameter_name(name) =>
+            {
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn routine_parameter_segment<'a>(
+        tokens: &'a [SqlToken],
+        open_idx: usize,
+        visible_end: usize,
+    ) -> Vec<&'a SqlToken> {
+        let mut segment_start = open_idx + 1;
+        let mut depth = 0i32;
+        for (idx, token) in tokens
+            .iter()
+            .enumerate()
+            .take(visible_end)
+            .skip(open_idx + 1)
+        {
+            match token {
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => depth += 1,
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => depth = (depth - 1).max(0),
+                SqlToken::Symbol(sym) if sym == "," && depth == 0 => segment_start = idx + 1,
+                _ => {}
+            }
+        }
+
+        tokens
+            .get(segment_start..visible_end)
+            .unwrap_or(&[])
+            .iter()
+            .filter(|token| !matches!(token, SqlToken::Comment(_)))
+            .collect()
+    }
+
+    fn routine_param_open_keyword(tokens: &[SqlToken], open_idx: usize) -> Option<&str> {
+        let name_idx = Self::previous_non_comment_token_index(tokens, open_idx)?;
+        if !Self::token_is_plsql_routine_name_segment(tokens.get(name_idx)) {
+            return None;
+        }
+
+        let mut chain_start_idx = name_idx;
+        loop {
+            let prev_idx = Self::previous_non_comment_token_index(tokens, chain_start_idx)?;
+            if !matches!(tokens.get(prev_idx), Some(SqlToken::Symbol(sym)) if sym == ".") {
+                return match tokens.get(prev_idx) {
+                    Some(SqlToken::Word(word))
+                        if matches!(
+                            word.to_ascii_uppercase().as_str(),
+                            "FUNCTION" | "PROCEDURE" | "CURSOR"
+                        ) =>
+                    {
+                        Some(word.as_str())
+                    }
+                    _ => None,
+                };
+            }
+
+            let owner_idx = Self::previous_non_comment_token_index(tokens, prev_idx)?;
+            if !Self::token_is_plsql_routine_name_segment(tokens.get(owner_idx)) {
+                return None;
+            }
+            chain_start_idx = owner_idx;
+        }
+    }
+
+    fn token_is_mysql_routine_parameter_mode(token: &SqlToken) -> bool {
+        matches!(
+            token,
+            SqlToken::Word(word)
+                if matches!(word.to_ascii_uppercase().as_str(), "IN" | "OUT" | "INOUT")
+        )
+    }
+
+    fn token_is_mysql_routine_parameter_name(token: &SqlToken) -> bool {
+        match token {
+            SqlToken::Word(word) => !Self::is_plsql_non_type_keyword(word),
+            SqlToken::String(value) => crate::sql_text::is_quoted_identifier(value),
+            _ => false,
         }
     }
 
@@ -35103,6 +35473,7 @@ impl SqlEditorWidget {
                 | "RESIGNAL"
                 | "ROLLBACK"
                 | "SET"
+                | "SHOW"
                 | "SIGNAL"
                 | "START"
                 | "STOP"
@@ -36539,6 +36910,29 @@ impl SqlEditorWidget {
         const MYSQL_XA_HEAD_KEYWORDS: &[&str] = &[
             "BEGIN", "COMMIT", "END", "PREPARE", "RECOVER", "ROLLBACK", "START",
         ];
+        const MYSQL_SIGNAL_CONDITION_ITEMS: &[&str] = &[
+            "CLASS_ORIGIN",
+            "SUBCLASS_ORIGIN",
+            "MESSAGE_TEXT",
+            "MYSQL_ERRNO",
+            "CONSTRAINT_CATALOG",
+            "CONSTRAINT_SCHEMA",
+            "CONSTRAINT_NAME",
+            "CATALOG_NAME",
+            "SCHEMA_NAME",
+            "TABLE_NAME",
+            "COLUMN_NAME",
+            "CURSOR_NAME",
+        ];
+
+        if let Some(candidates) =
+            Self::expected_mysql_routine_parameter_mode_keyword_candidates(tokens, end, db_type)
+        {
+            return Some(candidates);
+        }
+        if Self::cursor_is_inside_routine_param_list(tokens, end) {
+            return None;
+        }
 
         let lock_table_items: Vec<String> = Self::meaningful_tokens_before(tokens, end)
             .into_iter()
@@ -36690,6 +37084,39 @@ impl SqlEditorWidget {
             return Some(candidates);
         }
         if let Some(candidates) = expected_load_index_candidates(&index_cache_items) {
+            return Some(candidates);
+        }
+
+        let signal_items: Vec<String> = Self::meaningful_tokens_before(tokens, end)
+            .into_iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                SqlToken::String(_) => Some("__VALUE__".to_string()),
+                SqlToken::Symbol(sym) if matches!(sym.as_str(), "," | "=") => Some(sym.clone()),
+                SqlToken::Symbol(_) | SqlToken::Comment(_) => None,
+            })
+            .collect();
+        let expected_signal_condition_item_candidates =
+            |items: &[String]| -> Option<&'static [&'static str]> {
+                let signal_idx = items
+                    .iter()
+                    .rposition(|item| matches!(item.as_str(), "SIGNAL" | "RESIGNAL"))?;
+                let tail = &items[signal_idx + 1..];
+                let set_idx = tail.iter().position(|item| item == "SET")?;
+                let after_set = &tail[set_idx + 1..];
+                let segment_start = after_set
+                    .iter()
+                    .rposition(|item| item == ",")
+                    .map_or(0, |idx| idx + 1);
+                let segment = &after_set[segment_start..];
+                if segment.is_empty()
+                    || (segment.len() == 1 && segment.first().map(String::as_str) != Some("="))
+                {
+                    return Some(MYSQL_SIGNAL_CONDITION_ITEMS);
+                }
+                None
+            };
+        if let Some(candidates) = expected_signal_condition_item_candidates(&signal_items) {
             return Some(candidates);
         }
 
@@ -37270,6 +37697,14 @@ impl SqlEditorWidget {
                 if idx == words.len() {
                     return Some(MYSQL_ROUTINE_CHARACTERISTIC_HEAD_KEYWORDS);
                 }
+            }
+
+            if words
+                .iter()
+                .skip(idx)
+                .any(|word| word == "BEGIN")
+            {
+                return None;
             }
 
             expected_routine_characteristic_candidates(words, idx)
@@ -39644,8 +40079,8 @@ impl SqlEditorWidget {
         exclude_current_identifier_chain: bool,
         db_type: Option<crate::db::DatabaseType>,
     ) -> Option<&'static [&'static str]> {
-        let tokens = deep_ctx.statement_tokens.as_ref();
-        let cursor_token_len = deep_ctx.cursor_token_len;
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
         let end = Self::expected_suggestion_context_end(
             tokens,
             cursor_token_len,
@@ -41356,15 +41791,38 @@ impl SqlEditorWidget {
         let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
         let context_end =
             Self::expected_keyword_suggestion_context_end(tokens, cursor_token_len, prefix);
-        let statement_tokens = deep_ctx.statement_tokens.as_ref();
+        let full_statement_tokens = deep_ctx.statement_tokens.as_ref();
+        let in_routine_body_statement =
+            Self::current_routine_body_statement_range(deep_ctx).is_some();
+        let (statement_tokens, statement_cursor_token_len) = if in_routine_body_statement {
+            (tokens, cursor_token_len)
+        } else {
+            (full_statement_tokens, deep_ctx.cursor_token_len)
+        };
         let statement_context_end = Self::expected_keyword_suggestion_context_end(
             statement_tokens,
-            deep_ctx.cursor_token_len,
+            statement_cursor_token_len,
             prefix,
         );
         if Self::cursor_is_in_invalid_set_operation_branch_for_context(deep_ctx, !prefix.is_empty())
         {
             return Vec::new();
+        }
+        if let Some(candidates) =
+            Self::expected_mysql_routine_parameter_mode_keyword_candidates(
+                statement_tokens,
+                statement_context_end,
+                db_type,
+            )
+            .or_else(|| {
+                Self::expected_mysql_routine_parameter_mode_keyword_candidates(
+                    tokens,
+                    context_end,
+                    db_type,
+                )
+            })
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
         }
         if Self::cursor_is_at_create_view_column_alias_list_slot_for_context(
             deep_ctx,
@@ -42928,8 +43386,19 @@ impl SqlEditorWidget {
         ) {
             return None;
         }
-        let tokens = deep_ctx.statement_tokens.as_ref();
-        let cursor_token_len = deep_ctx.cursor_token_len;
+        let statement_tokens = deep_ctx.statement_tokens.as_ref();
+        let routine_body_range = Self::current_routine_body_statement_range(deep_ctx);
+        let tokens = routine_body_range
+            .map(|range| intellisense_context::token_range_slice(statement_tokens, range))
+            .unwrap_or(statement_tokens);
+        let cursor_token_len = routine_body_range
+            .map(|range| {
+                deep_ctx
+                    .cursor_token_len
+                    .saturating_sub(range.start)
+                    .min(range.end.saturating_sub(range.start))
+            })
+            .unwrap_or(deep_ctx.cursor_token_len);
         let context_end = Self::expected_suggestion_context_end(
             tokens,
             cursor_token_len,
@@ -43008,8 +43477,8 @@ impl SqlEditorWidget {
 
         if crate::sql_text::mysql_compatibility_for_sql("", db_type)
             && matches!(
-                words.get(0..2),
-                Some([lock, table]) if lock == "LOCK" && table == "TABLE"
+                words.as_slice(),
+                [lock, table] if lock == "LOCK" && table == "TABLE"
             )
         {
             return Some(ExpectedObjectSuggestionKind::NoSuggestions);
@@ -47035,11 +47504,110 @@ impl SqlEditorWidget {
         suggestions
     }
 
+    fn current_routine_body_statement_range(
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> Option<intellisense_context::TokenRange> {
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let cursor = deep_ctx.cursor_token_len.min(tokens.len());
+        let mut depth = 0i32;
+        let mut saw_create = false;
+        let mut saw_routine_kind = false;
+        let mut saw_mysql_function_returns = false;
+        let mut saw_oracle_body_intro = false;
+        let mut body_begin_idx = None;
+
+        for (idx, token) in tokens.iter().enumerate().take(cursor) {
+            match token {
+                SqlToken::Symbol(sym) if sym == "(" || sym == "[" => depth += 1,
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => {
+                    depth = (depth - 1).max(0);
+                }
+                SqlToken::Symbol(sym) if depth == 0 && sym == ";" => {
+                    if body_begin_idx.is_none() {
+                        saw_create = false;
+                        saw_routine_kind = false;
+                    }
+                }
+                SqlToken::Word(word) if depth == 0 => {
+                    let upper = word.to_ascii_uppercase();
+                    match upper.as_str() {
+                        "CREATE" if body_begin_idx.is_none() => {
+                            saw_create = true;
+                            saw_routine_kind = false;
+                            saw_mysql_function_returns = false;
+                            saw_oracle_body_intro = false;
+                        }
+                        "FUNCTION" | "PROCEDURE" if saw_create && body_begin_idx.is_none() => {
+                            saw_routine_kind = true;
+                        }
+                        "RETURNS" if saw_routine_kind && body_begin_idx.is_none() => {
+                            saw_mysql_function_returns = true;
+                        }
+                        "IS" | "AS" if saw_routine_kind && body_begin_idx.is_none() => {
+                            saw_oracle_body_intro = true;
+                        }
+                        "BEGIN"
+                            if saw_routine_kind
+                                && !saw_oracle_body_intro
+                                && (saw_mysql_function_returns
+                                    || tokens
+                                        .iter()
+                                        .take(idx)
+                                        .any(|token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("PROCEDURE")))) =>
+                        {
+                            body_begin_idx = Some(idx);
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let body_begin_idx = body_begin_idx?;
+        let mut start = body_begin_idx + 1;
+        for idx in (body_begin_idx + 1..cursor).rev() {
+            match tokens.get(idx) {
+                Some(SqlToken::Symbol(sym)) if sym == ";" => {
+                    start = idx + 1;
+                    break;
+                }
+                Some(SqlToken::Word(word))
+                    if matches!(
+                        word.to_ascii_uppercase().as_str(),
+                        "BEGIN" | "THEN" | "ELSE" | "LOOP" | "DO"
+                    ) =>
+                {
+                    start = idx + 1;
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        let mut end = tokens.len();
+        for idx in cursor..tokens.len() {
+            if matches!(tokens.get(idx), Some(SqlToken::Symbol(sym)) if sym == ";") {
+                end = idx;
+                break;
+            }
+        }
+        (start < end).then_some(intellisense_context::TokenRange { start, end })
+    }
+
     fn current_query_tokens(deep_ctx: &intellisense_context::CursorContext) -> &[SqlToken] {
         deep_ctx
             .active_query_range
             .map(|range| {
                 intellisense_context::token_range_slice(deep_ctx.statement_tokens.as_ref(), range)
+            })
+            .or_else(|| {
+                Self::current_routine_body_statement_range(deep_ctx).map(|range| {
+                    intellisense_context::token_range_slice(
+                        deep_ctx.statement_tokens.as_ref(),
+                        range,
+                    )
+                })
             })
             .unwrap_or_else(|| deep_ctx.statement_tokens.as_ref())
     }
@@ -47052,6 +47620,14 @@ impl SqlEditorWidget {
                     .cursor_token_len
                     .saturating_sub(range.start)
                     .min(range.end.saturating_sub(range.start))
+            })
+            .or_else(|| {
+                Self::current_routine_body_statement_range(deep_ctx).map(|range| {
+                    deep_ctx
+                        .cursor_token_len
+                        .saturating_sub(range.start)
+                        .min(range.end.saturating_sub(range.start))
+                })
             })
             .unwrap_or(deep_ctx.cursor_token_len)
     }
@@ -48372,11 +48948,71 @@ impl SqlEditorWidget {
         column_sender: &mpsc::Sender<ColumnLoadUpdate>,
         connection: &SharedConnection,
     ) {
+        let db_type = Self::connection_db_type_for_column_request(connection);
+        Self::request_table_columns_for_db(
+            table_name,
+            intellisense_data,
+            column_sender,
+            connection,
+            db_type,
+        );
+    }
+
+    fn request_table_columns_for_db(
+        table_name: &str,
+        intellisense_data: &Arc<Mutex<IntellisenseData>>,
+        column_sender: &mpsc::Sender<ColumnLoadUpdate>,
+        connection: &SharedConnection,
+        db_type: Option<crate::db::DatabaseType>,
+    ) {
+        Self::request_table_columns_with_policy(
+            table_name,
+            intellisense_data,
+            column_sender,
+            connection,
+            db_type,
+            false,
+        );
+    }
+
+    fn request_table_columns_for_resolved_scope(
+        table_name: &str,
+        intellisense_data: &Arc<Mutex<IntellisenseData>>,
+        column_sender: &mpsc::Sender<ColumnLoadUpdate>,
+        connection: &SharedConnection,
+        db_type: Option<crate::db::DatabaseType>,
+    ) {
+        Self::request_table_columns_with_policy(
+            table_name,
+            intellisense_data,
+            column_sender,
+            connection,
+            db_type,
+            true,
+        );
+    }
+
+    fn request_table_columns_with_policy(
+        table_name: &str,
+        intellisense_data: &Arc<Mutex<IntellisenseData>>,
+        column_sender: &mpsc::Sender<ColumnLoadUpdate>,
+        connection: &SharedConnection,
+        db_type: Option<crate::db::DatabaseType>,
+        allow_resolved_uncataloged_table: bool,
+    ) {
         let table_key = {
             let mut data = intellisense_data
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let Some(selected) = Self::resolve_table_column_load_key(&data, table_name) else {
+            let Some(selected) =
+                Self::resolve_table_column_load_key_for_db(&data, table_name, db_type).or_else(
+                    || {
+                        allow_resolved_uncataloged_table
+                            .then(|| Self::normalized_table_column_load_key(table_name, db_type))
+                            .flatten()
+                    },
+                )
+            else {
                 return;
             };
             if !data.mark_columns_loading(&selected) {
@@ -48409,6 +49045,16 @@ impl SqlEditorWidget {
                 cache_columns: false,
             });
             app::awake();
+        }
+    }
+
+    fn connection_db_type_for_column_request(
+        connection: &SharedConnection,
+    ) -> Option<crate::db::DatabaseType> {
+        match connection.try_lock() {
+            Ok(conn_guard) => Some(conn_guard.db_type()),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner().db_type()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
         }
     }
 
@@ -48460,13 +49106,43 @@ impl SqlEditorWidget {
         }
     }
 
-    fn resolve_table_column_load_key(data: &IntellisenseData, table_name: &str) -> Option<String> {
+    fn column_load_key_for_db(
+        normalized: &str,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> String {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            normalized.to_string()
+        } else {
+            normalized.to_ascii_uppercase()
+        }
+    }
+
+    fn normalized_table_column_load_key(
+        table_name: &str,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<String> {
         let candidates = Self::table_lookup_key_candidates(table_name);
         let normalized = candidates.first()?.trim();
         if normalized.is_empty() {
             return None;
         }
+        Some(Self::column_load_key_for_db(normalized, db_type))
+    }
 
+    fn resolve_table_column_load_key(data: &IntellisenseData, table_name: &str) -> Option<String> {
+        Self::resolve_table_column_load_key_for_db(data, table_name, None)
+    }
+
+    fn resolve_table_column_load_key_for_db(
+        data: &IntellisenseData,
+        table_name: &str,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<String> {
+        let candidates = Self::table_lookup_key_candidates(table_name);
+        let normalized = candidates.first()?.trim();
+        if normalized.is_empty() {
+            return None;
+        }
         let has_unquoted_dot = Self::has_unquoted_dot(table_name);
         if has_unquoted_dot {
             let segments = Self::relation_name_segments(table_name)?;
@@ -48476,13 +49152,13 @@ impl SqlEditorWidget {
                 if data.qualifier_has_member(&qualifier, member, true)
                     || data.qualifier_has_member(&qualifier, member, false)
                 {
-                    return Some(normalized.to_ascii_uppercase());
+                    return Some(Self::column_load_key_for_db(normalized, db_type));
                 }
             }
         }
 
         if !has_unquoted_dot && data.is_known_relation(normalized) {
-            return Some(normalized.to_ascii_uppercase());
+            return Some(Self::column_load_key_for_db(normalized, db_type));
         }
 
         if !normalized.contains('.') {
@@ -48490,22 +49166,21 @@ impl SqlEditorWidget {
                 if data.qualifier_has_member(default_qualifier, normalized, true)
                     || data.qualifier_has_member(default_qualifier, normalized, false)
                 {
-                    return Some(
-                        format!("{}.{}", default_qualifier, normalized).to_ascii_uppercase(),
-                    );
+                    let qualified = format!("{}.{}", default_qualifier, normalized);
+                    return Some(Self::column_load_key_for_db(&qualified, db_type));
                 }
             }
         }
 
         if data.is_known_relation(normalized) {
-            return Some(normalized.to_ascii_uppercase());
+            return Some(Self::column_load_key_for_db(normalized, db_type));
         }
 
         candidates
             .iter()
             .skip(1)
             .find(|candidate| data.is_known_relation(candidate))
-            .map(|candidate| candidate.to_ascii_uppercase())
+            .map(|candidate| Self::column_load_key_for_db(candidate, db_type))
     }
 
     fn table_lookup_key_candidates(table_name: &str) -> Vec<String> {

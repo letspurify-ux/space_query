@@ -3984,6 +3984,7 @@ fn incomplete_quoted_identifier_start_before_cursor(
         let (prev_idx, ch) = text.get(..idx)?.char_indices().next_back()?;
         if matches!(ch, '"' | '`' | '[')
             && quoted_identifier_start_context(text, prev_idx)
+            && !inside_single_quoted_literal(text, prev_idx)
             && !has_unescaped_identifier_delimiter(
                 text,
                 prev_idx + ch.len_utf8(),
@@ -3997,6 +3998,26 @@ fn incomplete_quoted_identifier_start_before_cursor(
     }
 
     None
+}
+
+fn inside_single_quoted_literal(text: &str, pos: usize) -> bool {
+    let mut idx = 0usize;
+    let mut in_string = false;
+    while idx < pos.min(text.len()) {
+        let Some(ch) = text[idx..].chars().next() else {
+            break;
+        };
+        if ch == '\'' {
+            let next_idx = idx + ch.len_utf8();
+            if in_string && text[next_idx..].starts_with('\'') {
+                idx = next_idx + 1;
+                continue;
+            }
+            in_string = !in_string;
+        }
+        idx += ch.len_utf8();
+    }
+    in_string
 }
 
 fn quoted_identifier_start_context(text: &str, quote_idx: usize) -> bool {

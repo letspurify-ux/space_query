@@ -2389,7 +2389,12 @@ impl SqlEditorWidget {
             Arc::new(Mutex::new(None));
         let object_context_callback: ObjectContextCallback = Arc::new(Mutex::new(None));
         let context_action_callback: SqlEditorContextActionCallback = Arc::new(Mutex::new(None));
-        let intellisense_runtime = Arc::new(IntellisenseRuntimeState::new());
+        let initial_db_type = match connection.lock() {
+            Ok(conn_guard) => conn_guard.db_type(),
+            Err(poisoned) => poisoned.into_inner().db_type(),
+        };
+        let intellisense_runtime =
+            Arc::new(IntellisenseRuntimeState::new_for_db_type(initial_db_type));
         let history_cursor = Arc::new(Mutex::new(None::<usize>));
         let history_original = Arc::new(Mutex::new(None::<String>));
         let history_navigation_entries = Arc::new(Mutex::new(None::<Vec<QueryHistoryEntry>>));
@@ -5259,6 +5264,13 @@ mod execution_state_tests {
         assert_eq!(next, 1);
         assert_eq!(runtime.current_keyup_generation(), 1);
         assert!(runtime.take_keyup_timeout_handle().is_none());
+    }
+
+    #[test]
+    fn intellisense_runtime_can_start_with_connection_db_type() {
+        let runtime = IntellisenseRuntimeState::new_for_db_type(crate::db::DatabaseType::MariaDB);
+
+        assert_eq!(runtime.cached_db_type(), crate::db::DatabaseType::MariaDB);
     }
 
     #[test]

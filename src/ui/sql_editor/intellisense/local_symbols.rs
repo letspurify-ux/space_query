@@ -39,6 +39,7 @@ struct LocalScopeBuilder {
 
 #[derive(Clone)]
 struct ParsedRoutineHeader {
+    name: String,
     body_keyword_idx: usize,
     decl_start_idx: usize,
     parameters: Vec<ParsedDeclarationSymbol>,
@@ -486,6 +487,23 @@ impl SqlEditorWidget {
             None,
         ) {
             return Self::plsql_named_end_target_suggestions(analysis.context.as_ref(), prefix);
+        }
+        if Self::cursor_is_after_plsql_end_keyword_for_context(
+            analysis.context.as_ref(),
+            !prefix.is_empty(),
+            None,
+        ) {
+            return Vec::new();
+        }
+        // `ROLLBACK TO |` names a previously created savepoint in the same block.
+        // It is not a value symbol and the object catalog is suppressed there, so
+        // offer only savepoint statement names seen before the cursor.
+        if Self::cursor_is_at_rollback_to_savepoint_name_slot_for_context(
+            analysis.context.as_ref(),
+            !prefix.is_empty(),
+            None,
+        ) {
+            return Self::plsql_savepoint_suggestions(analysis.context.as_ref(), prefix);
         }
         // A `RAISE |`/`EXCEPTION WHEN |` name is an exception. Exceptions ARE scoped
         // value symbols, but so are ordinary variables/cursors; retain only the ones
@@ -1435,6 +1453,46 @@ impl SqlEditorWidget {
                 SqlToken::Symbol(sym) if sym == ";" => {
                     pending_loop_var = None;
                 }
+                SqlToken::Symbol(sym) if mysql_compatible && sym == "@" => {
+                    if let Some(SqlTokenSpan {
+                        token: SqlToken::Word(name),
+                        end,
+                        ..
+                    }) = token_spans.get(idx + 1)
+                    {
+                        let previous = token_spans
+                            .get(..idx)
+                            .unwrap_or(&[])
+                            .iter()
+                            .rev()
+                            .find(|span| !matches!(span.token, SqlToken::Comment(_)))
+                            .map(|span| &span.token);
+                        let follows_account_name = matches!(
+                            previous,
+                            Some(SqlToken::Word(word)) if !word.eq_ignore_ascii_case("SET")
+                        ) || matches!(previous, Some(SqlToken::String(_)))
+                            || matches!(previous, Some(SqlToken::Symbol(prev)) if prev == "@");
+                        if !follows_account_name {
+                            let scope_id = Self::current_local_parent_scope_id(&block_stack);
+                            Self::push_local_symbol_with_metadata_and_sources(
+                                &mut symbols,
+                                &mut seen_symbol_keys,
+                                scope_id,
+                                name.clone(),
+                                *end,
+                                None,
+                                Vec::new(),
+                                Vec::new(),
+                                None,
+                                Vec::new(),
+                                false,
+                                false,
+                                false,
+                                true,
+                            );
+                        }
+                    }
+                }
                 SqlToken::Word(word) => {
                     let upper = word.to_ascii_uppercase();
 
@@ -1456,6 +1514,33 @@ impl SqlEditorWidget {
                     {
                         if let Some(parsed) = Self::parse_routine_header(token_spans, idx) {
                             let parent_scope = Self::current_local_parent_scope_id(&block_stack);
+                            if matches!(
+                                scopes[parent_scope].scope.kind,
+                                LocalScopeKind::PackageBody
+                                    | LocalScopeKind::Routine
+                                    | LocalScopeKind::DeclareBlock
+                            ) {
+                                let routine_symbol = Self::parsed_routine_symbol(
+                                    parsed.name.clone(),
+                                    parsed.return_type_display.clone(),
+                                );
+                                Self::push_local_symbol_with_metadata_and_sources(
+                                    &mut symbols,
+                                    &mut seen_symbol_keys,
+                                    parent_scope,
+                                    routine_symbol.name,
+                                    token.start,
+                                    routine_symbol.type_display,
+                                    routine_symbol.members,
+                                    routine_symbol.member_entries,
+                                    routine_symbol.member_source_upper,
+                                    routine_symbol.member_source_uppers,
+                                    routine_symbol.member_source_is_rowtype,
+                                    routine_symbol.member_source_is_collection_like,
+                                    routine_symbol.member_source_allows_visible_members,
+                                    routine_symbol.suggest_name,
+                                );
+                            }
                             let scope_depth = scopes[parent_scope].scope.depth.saturating_add(1);
                             let scope_id = scopes.len();
                             let scope_start = token_spans
@@ -1921,7 +2006,10 @@ impl SqlEditorWidget {
         let first_upper = first_word.to_ascii_uppercase();
 
         match first_upper.as_str() {
-            "PROCEDURE" | "FUNCTION" | "SUBTYPE" | "PRAGMA" | "EXCEPTION" => {
+            "PROCEDURE" | "FUNCTION" => {
+                return Self::extract_routine_declaration_symbol_from_item(item, first_idx);
+            }
+            "SUBTYPE" | "PRAGMA" | "EXCEPTION" => {
                 return None;
             }
             "TYPE" => {
@@ -1953,7 +2041,7 @@ impl SqlEditorWidget {
             _ => {}
         }
 
-        let name = Self::local_identifier_suggestion_from_word(first_word)?;
+        let name = Self::local_declaration_identifier_suggestion_from_word(first_word)?;
 
         let next_meaningful = item[first_idx + 1..]
             .iter()
@@ -2133,6 +2221,61 @@ impl SqlEditorWidget {
             member_source_allows_visible_members: member_source_is_rowtype,
             suggest_name: false,
         })
+    }
+
+    fn extract_routine_declaration_symbol_from_item(
+        item: &[SqlTokenSpan],
+        routine_keyword_idx: usize,
+    ) -> Option<ParsedDeclarationSymbol> {
+        let name_idx = Self::next_meaningful_token_idx(item, routine_keyword_idx + 1)?;
+        let name = Self::token_word(&item[name_idx].token)
+            .and_then(Self::local_declaration_identifier_suggestion_from_word)?;
+        let is_function = Self::token_word(&item[routine_keyword_idx].token)
+            .is_some_and(|word| word.eq_ignore_ascii_case("FUNCTION"));
+
+        let mut return_type_display = None;
+        if is_function {
+            let mut depth = 0usize;
+            let mut idx = name_idx + 1;
+            while idx < item.len() {
+                match &item[idx].token {
+                    SqlToken::Comment(_) => {}
+                    SqlToken::Symbol(sym) if sym == "(" => depth = depth.saturating_add(1),
+                    SqlToken::Symbol(sym) if sym == ")" => depth = depth.saturating_sub(1),
+                    SqlToken::Word(word)
+                        if depth == 0 && word.eq_ignore_ascii_case("RETURN") =>
+                    {
+                        return_type_display =
+                            Self::next_meaningful_token_idx(item, idx + 1).and_then(|type_idx| {
+                                Self::scalar_type_display_at_idx(item, type_idx)
+                            });
+                        break;
+                    }
+                    _ => {}
+                }
+                idx += 1;
+            }
+        }
+
+        Some(Self::parsed_routine_symbol(name, return_type_display))
+    }
+
+    fn parsed_routine_symbol(
+        name: String,
+        type_display: Option<String>,
+    ) -> ParsedDeclarationSymbol {
+        ParsedDeclarationSymbol {
+            name,
+            type_display,
+            members: Vec::new(),
+            member_entries: Vec::new(),
+            member_source_upper: None,
+            member_source_uppers: Vec::new(),
+            member_source_is_rowtype: false,
+            member_source_is_collection_like: false,
+            member_source_allows_visible_members: false,
+            suggest_name: true,
+        }
     }
 
     fn extract_declaration_member_source(
@@ -3112,11 +3255,12 @@ impl SqlEditorWidget {
         (idx > start).then_some((start, idx))
     }
 
-    /// Package-level declarations (variables, constants, cursors, types) of the
+    /// Package-level declarations (variables, constants, cursors, types, routine
+    /// names) of the
     /// `CREATE [OR REPLACE] PACKAGE <target>` *spec* near `body_statement_start`,
     /// for cross-statement resolution while editing the matching package body. The
-    /// spec's subprogram signatures (`PROCEDURE`/`FUNCTION`) and their parameters
-    /// are intentionally excluded — only the package's own globals are visible.
+    /// spec's subprogram parameters are intentionally excluded — only the package's
+    /// own callable routine names and globals are visible.
     ///
     /// Performance: a cheap byte-level scan over a bounded window (no tokenization)
     /// locates the spec header, then only the matched spec region is tokenized — so
@@ -3347,7 +3491,7 @@ impl SqlEditorWidget {
     fn parse_routine_header(tokens: &[SqlTokenSpan], idx: usize) -> Option<ParsedRoutineHeader> {
         let name_idx = Self::next_meaningful_token_idx(tokens, idx + 1)?;
         let name_word = Self::token_word(&tokens[name_idx].token)?;
-        let _ = Self::local_identifier_from_word(name_word)?;
+        let name = Self::local_declaration_identifier_suggestion_from_word(name_word)?;
 
         let mut scan_idx = Self::next_meaningful_token_idx(tokens, name_idx + 1).unwrap_or(tokens.len());
         let mut parameters = Vec::new();
@@ -3381,6 +3525,7 @@ impl SqlEditorWidget {
                         return None;
                     }
                     return Some(ParsedRoutineHeader {
+                        name,
                         body_keyword_idx: scan_idx,
                         decl_start_idx: scan_idx.saturating_add(1),
                         parameters,
@@ -3403,6 +3548,7 @@ impl SqlEditorWidget {
                 }
                 SqlToken::Word(word) if paren_depth == 0 && word.eq_ignore_ascii_case("BEGIN") => {
                     return Some(ParsedRoutineHeader {
+                        name,
                         body_keyword_idx: scan_idx,
                         decl_start_idx: scan_idx,
                         parameters,
@@ -3416,6 +3562,7 @@ impl SqlEditorWidget {
                         && word.eq_ignore_ascii_case("RETURN") =>
                 {
                     return Some(ParsedRoutineHeader {
+                        name,
                         body_keyword_idx: scan_idx,
                         decl_start_idx: scan_idx,
                         parameters,
@@ -3788,6 +3935,23 @@ impl SqlEditorWidget {
     }
 
     fn local_identifier_from_word(word: &str) -> Option<String> {
+        Self::local_identifier_from_word_with_keyword_policy(word, false)
+    }
+
+    fn local_declaration_identifier_from_word(word: &str) -> Option<String> {
+        let normalized = Self::local_identifier_from_word_with_keyword_policy(word, true)?;
+        if !sql_text::is_quoted_identifier(word.trim())
+            && Self::is_plsql_non_type_keyword(&normalized)
+        {
+            return None;
+        }
+        Some(normalized)
+    }
+
+    fn local_identifier_from_word_with_keyword_policy(
+        word: &str,
+        allow_contextual_keywords: bool,
+    ) -> Option<String> {
         let trimmed = word.trim();
         if trimmed.starts_with("<<") && trimmed.ends_with(">>") {
             return None;
@@ -3805,7 +3969,10 @@ impl SqlEditorWidget {
             return None;
         }
 
-        if !is_quoted && sql_text::is_oracle_sql_keyword(&normalized.to_ascii_uppercase()) {
+        if !allow_contextual_keywords
+            && !is_quoted
+            && sql_text::is_oracle_sql_keyword(&normalized.to_ascii_uppercase())
+        {
             return None;
         }
 
@@ -3814,6 +3981,16 @@ impl SqlEditorWidget {
 
     fn local_identifier_suggestion_from_word(word: &str) -> Option<String> {
         let normalized = Self::local_identifier_from_word(word)?;
+        let trimmed = word.trim();
+        if sql_text::is_quoted_identifier(trimmed) {
+            Some(trimmed.to_string())
+        } else {
+            Some(normalized)
+        }
+    }
+
+    fn local_declaration_identifier_suggestion_from_word(word: &str) -> Option<String> {
+        let normalized = Self::local_declaration_identifier_from_word(word)?;
         let trimmed = word.trim();
         if sql_text::is_quoted_identifier(trimmed) {
             Some(trimmed.to_string())
@@ -4187,4 +4364,3 @@ impl SqlEditorWidget {
         Some(data.get_column_suggestions(prefix, Some(&sources)))
     }
 }
-

@@ -94,6 +94,12 @@ impl IntellisenseRuntimeState {
         }
     }
 
+    pub(crate) fn new_for_db_type(db_type: crate::db::connection::DatabaseType) -> Self {
+        let state = Self::new();
+        state.update_cached_db_type(db_type);
+        state
+    }
+
     pub(crate) fn completion_range(&self) -> Option<IntellisenseCompletionRange> {
         self.completion_range
             .lock()

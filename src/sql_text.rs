@@ -420,6 +420,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "QUIT",
     "QUOTES",
     "RAISE",
+    "RAISE_APPLICATION_ERROR",
     "RANGE",
     "RANK",
     "RAW",

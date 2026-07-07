@@ -457,11 +457,12 @@ impl SqlEditorWidget {
                         Self::resolve_table_column_load_key(&data, &table_lookup).is_some()
                     };
                     if should_prefetch {
-                        Self::request_table_columns(
+                        Self::request_table_columns_for_db(
                             &table_lookup,
                             &intellisense_data_for_insert,
                             &column_sender_for_insert,
                             &connection_for_insert,
+                            preferred_db_type,
                         );
                     }
                 }

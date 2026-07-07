@@ -411,6 +411,14 @@ END;";
             "predefined exception `{token}` should be highlighted like a builtin"
         );
     }
+
+    let raise_start = text.find("RAISE_APPLICATION_ERROR").unwrap();
+    assert!(
+        styles[raise_start..raise_start + "RAISE_APPLICATION_ERROR".len()]
+            .chars()
+            .all(|c| c == STYLE_KEYWORD),
+        "RAISE_APPLICATION_ERROR should be highlighted as a PL/SQL keyword"
+    );
 }
 
 #[test]

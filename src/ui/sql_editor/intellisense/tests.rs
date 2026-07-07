@@ -8422,6 +8422,60 @@ fn request_table_columns_uses_default_qualifier_for_unqualified_name() {
 }
 
 #[test]
+fn mysql_column_load_key_preserves_table_name_case() {
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["cfb_user".to_string()];
+    data.rebuild_indices();
+
+    assert_eq!(
+        SqlEditorWidget::resolve_table_column_load_key_for_db(
+            &data,
+            "cfb_user",
+            Some(crate::db::DatabaseType::MySQL),
+        ),
+        Some("cfb_user".to_string())
+    );
+    assert_eq!(
+        SqlEditorWidget::resolve_table_column_load_key_for_db(
+            &data,
+            "cfb_user",
+            Some(crate::db::DatabaseType::MariaDB),
+        ),
+        Some("cfb_user".to_string())
+    );
+    assert_eq!(
+        SqlEditorWidget::resolve_table_column_load_key_for_db(
+            &data,
+            "cfb_user",
+            Some(crate::db::DatabaseType::Oracle),
+        ),
+        Some("CFB_USER".to_string())
+    );
+}
+
+#[test]
+fn request_resolved_mysql_scope_columns_without_catalog_entry() {
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let _conn_guard = connection.lock().ok();
+
+    SqlEditorWidget::request_table_columns_for_resolved_scope(
+        "cfb_user",
+        &data,
+        &sender,
+        &connection,
+        Some(crate::db::DatabaseType::MySQL),
+    );
+
+    let update = receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("resolved FROM-scope table should request columns even before catalog load");
+    assert_eq!(update.table, "cfb_user");
+    assert!(!update.cache_columns);
+}
+
+#[test]
 fn request_table_columns_keeps_selected_qualifier_for_qualified_name() {
     let data = Arc::new(Mutex::new(IntellisenseData::new()));
     {
@@ -45737,11 +45791,45 @@ fn query_completion_suggestions_impl(
                 &deep_ctx,
                 !prefix.is_empty(),
                 Some(db_type),
+            ) || SqlEditorWidget::cursor_is_at_rollback_to_savepoint_name_slot_for_context(
+                &deep_ctx,
+                !prefix.is_empty(),
+                Some(db_type),
             ) || SqlEditorWidget::cursor_is_at_plsql_exception_name_for_context(
                 &deep_ctx,
                 !prefix.is_empty(),
             );
-        if source_allowance.local_suggestions || at_name_only_local_symbol_slot {
+        let at_plsql_statement_start_local_symbol_slot = !prefix.is_empty()
+            && SqlEditorWidget::plsql_statement_start_allows_bare_calls(expr_kw)
+            && !SqlEditorWidget::cursor_is_at_plsql_goto_label_slot_for_context(
+                &deep_ctx,
+                true,
+                Some(db_type),
+            )
+            && !SqlEditorWidget::cursor_is_at_plsql_exit_continue_label_slot_for_context(
+                &deep_ctx,
+                true,
+                Some(db_type),
+            )
+            && !SqlEditorWidget::cursor_is_at_plsql_named_end_target_slot_for_context(
+                &deep_ctx,
+                true,
+                Some(db_type),
+            )
+            && !SqlEditorWidget::cursor_is_after_plsql_end_keyword_for_context(
+                &deep_ctx,
+                true,
+                Some(db_type),
+            )
+            && !SqlEditorWidget::cursor_is_at_plsql_label_definition_slot_for_context(
+                &deep_ctx,
+                true,
+                Some(db_type),
+            );
+        if source_allowance.local_suggestions
+            || at_name_only_local_symbol_slot
+            || at_plsql_statement_start_local_symbol_slot
+        {
             let locals = SqlEditorWidget::collect_local_symbol_suggestions(
                 &prefix,
                 expanded.cursor_in_statement,
@@ -51627,6 +51715,7 @@ fn statement_start_drops_object_and_function_noise() {
         data.functions = vec!["SUMMARIZE".to_string()];
         data.sequences = vec!["SEQ_ID".to_string()];
         data.packages = vec!["SCHED_PKG".to_string()];
+        data.users = vec!["SYSTEM".to_string()];
         data.rebuild_indices();
         data
     };
@@ -51677,6 +51766,10 @@ fn statement_start_drops_object_and_function_noise() {
     assert!(
         has(&blk, "SYNC_DATA"),
         "procedure call dropped from PL/SQL statement start: {blk:?}"
+    );
+    assert!(
+        has(&blk, "SYSTEM"),
+        "schema qualifier head dropped from PL/SQL statement start: {blk:?}"
     );
     assert!(
         !blk.iter().any(|x| x.ends_with("()")),
@@ -53617,6 +53710,10 @@ fn loop_exit_guard_and_wrapped_query_continuations_are_offered() {
     );
     assert_eq!(
         kw("BEGIN LOOP CONTINUE | END LOOP; END;"),
+        vec!["WHEN".to_string()]
+    );
+    assert_eq!(
+        kw("BEGIN LOOP EXIT W| END LOOP; END;"),
         vec!["WHEN".to_string()]
     );
 
@@ -60766,8 +60863,10 @@ fn plsql_label_target_slots_do_not_offer_catalog() {
 
     for sql in [
         "BEGIN LOOP EXIT |; END LOOP; END;",
+        "BEGIN LOOP EXIT W|; END LOOP; END;",
         "BEGIN LOOP EXIT done |; END LOOP; END;",
         "BEGIN LOOP CONTINUE |; END LOOP; END;",
+        "BEGIN LOOP CONTINUE W|; END LOOP; END;",
         "BEGIN LOOP CONTINUE done |; END LOOP; END;",
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
@@ -74895,6 +74994,66 @@ fn qualified_alias_column_slot_yields_relation_columns() {
 }
 
 #[test]
+fn mysql_alias_and_where_columns_work_for_lowercase_uncataloged_table() {
+    use crate::db::DatabaseType::MySQL;
+
+    let contains = |values: &[String], needle: &str| {
+        values
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(needle))
+    };
+    let mut data = IntellisenseData::new();
+    data.set_columns_for_table(
+        "cfb_user",
+        vec![
+            "user_id".to_string(),
+            "user_name".to_string(),
+            "created_at".to_string(),
+        ],
+    );
+
+    for (sql, qualifier) in [
+        ("select a.| from cfb_user a", Some("a")),
+        ("select * from cfb_user a where |", None),
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        let context =
+            SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
+        let column_tables =
+            SqlEditorWidget::resolve_column_tables_for_context_for_db(qualifier, &ctx, Some(MySQL));
+        assert_eq!(
+            column_tables,
+            vec!["cfb_user".to_string()],
+            "column scope for `{sql}`"
+        );
+        let expr_ctx = SqlEditorWidget::expression_keyword_context(
+            &ctx,
+            &data,
+            &column_tables,
+            false,
+            Some(MySQL),
+        );
+        let suggestions = SqlEditorWidget::base_suggestions_for_context(
+            &mut data,
+            "",
+            qualifier,
+            Some(column_tables.as_slice()),
+            true,
+            context,
+            false,
+            Some(MySQL),
+            expr_ctx,
+        );
+        for expected in ["user_id", "user_name", "created_at"] {
+            assert!(
+                contains(&suggestions, expected),
+                "`{expected}` missing at `{sql}`: {suggestions:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn qualified_alias_column_slot_respects_alias_shadowing() {
     use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
@@ -75500,7 +75659,7 @@ fn oracle_package_declaration_keyword_tails_are_preserved() {
 
 
 /// Cross-statement package-spec resolution: globals (variables, constants,
-/// cursors) declared in a `CREATE PACKAGE <name>` spec are suggested while
+/// cursors) and routine names declared in a `CREATE PACKAGE <name>` spec are suggested while
 /// editing the matching `CREATE PACKAGE BODY <name>` in the same buffer — inside
 /// a routine body, inside the package initialization section, and across a
 /// reasonable text gap. The body's own parameters/locals remain available too.
@@ -75512,12 +75671,16 @@ fn package_spec_globals_are_visible_in_body() {
 
     // Spec globals visible inside a body routine, alongside the routine's params.
     let in_routine = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
-        "CREATE OR REPLACE PACKAGE hr_pkg AS\n  g_max CONSTANT NUMBER := 100;\n  g_name VARCHAR2(50);\n  PROCEDURE process(p_id IN NUMBER);\nEND hr_pkg;\n/\n\nCREATE OR REPLACE PACKAGE BODY hr_pkg AS\n  PROCEDURE process(p_id IN NUMBER) IS\n    v_local NUMBER;\n  BEGIN\n    __CODEX_CURSOR__NULL;\n  END;\nEND hr_pkg;\n/",
+        "CREATE OR REPLACE PACKAGE hr_pkg AS\n  g_max CONSTANT NUMBER := 100;\n  g_name VARCHAR2(50);\n  FUNCTION calc_total(p_calc_arg IN NUMBER) RETURN NUMBER;\n  PROCEDURE write_log;\n  PROCEDURE process(p_id IN NUMBER);\nEND hr_pkg;\n/\n\nCREATE OR REPLACE PACKAGE BODY hr_pkg AS\n  PROCEDURE process(p_id IN NUMBER) IS\n    v_local NUMBER;\n  BEGIN\n    __CODEX_CURSOR__NULL;\n  END;\nEND hr_pkg;\n/",
         &[],
     );
-    for expected in ["g_max", "g_name", "p_id", "v_local"] {
+    for expected in ["g_max", "g_name", "calc_total", "write_log", "p_id", "v_local"] {
         assert!(has(&in_routine, expected), "{expected} missing: {in_routine:?}");
     }
+    assert!(
+        !has(&in_routine, "p_calc_arg"),
+        "spec subprogram parameter leaked as a package symbol: {in_routine:?}"
+    );
 
     // Spec globals visible in the package initialization section.
     let in_init = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
@@ -75554,7 +75717,7 @@ fn package_spec_globals_are_visible_in_body() {
 /// Cross-statement spec resolution stays scoped and safe: a non-matching
 /// package's globals never leak, a body with no spec yields nothing extra, the
 /// `PACKAGE BODY` keyword is never mistaken for a spec, and the spec's subprogram
-/// *parameters* are not exposed (only the package's own globals are).
+/// *parameters* are not exposed (only the package's own globals/routine names are).
 #[test]
 fn package_spec_resolution_is_scoped_and_safe() {
     let has = |suggestions: &[String], name: &str| {
@@ -75582,6 +75745,10 @@ fn package_spec_resolution_is_scoped_and_safe() {
         &[],
     );
     assert!(has(&spec_param, "g_real"), "spec global missing: {spec_param:?}");
+    assert!(
+        has(&spec_param, "other_proc"),
+        "spec subprogram name missing: {spec_param:?}"
+    );
     assert!(
         !has(&spec_param, "p_spec_only"),
         "spec subprogram parameter leaked as a global: {spec_param:?}"
@@ -76111,6 +76278,70 @@ fn plsql_goto_offers_block_labels() {
     );
 }
 
+#[test]
+fn plsql_rollback_to_offers_prior_savepoints() {
+    let s = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+        "BEGIN\n  SAVEPOINT sp1;\n  ROLLBACK TO __CODEX_CURSOR__;\n  SAVEPOINT sp2;\nEND;",
+        &[],
+    );
+    assert_has_case_insensitive(&s, "sp1");
+    assert!(
+        !s.iter().any(|x| x.eq_ignore_ascii_case("sp2")),
+        "future savepoint leaked into ROLLBACK TO slot: {s:?}"
+    );
+
+    let prefixed = SqlEditorWidget::collect_local_symbol_suggestions_with_prefix_for_test(
+        "BEGIN\n  SAVEPOINT sp1;\n  SAVEPOINT other_point;\n  ROLLBACK TO sp__CODEX_CURSOR__;\nEND;",
+        "sp",
+        &[],
+    );
+    assert_has_case_insensitive(&prefixed, "sp1");
+    assert!(
+        !prefixed
+            .iter()
+            .any(|x| x.eq_ignore_ascii_case("other_point")),
+        "prefix `sp` should exclude other savepoints: {prefixed:?}"
+    );
+}
+
+#[test]
+fn plsql_rollback_to_savepoint_completion_works_through_full_pipeline() {
+    use crate::db::DatabaseType::Oracle;
+    let has = |values: &[String], needle: &str| {
+        values.iter().any(|value| value.eq_ignore_ascii_case(needle))
+    };
+
+    let sql = "\
+        DECLARE \
+            p_n NUMBER := 0; \
+            v_sum NUMBER := 1; \
+        BEGIN \
+            SAVEPOINT sp1; \
+            BEGIN \
+                IF p_n = 0 THEN \
+                    v_sum := v_sum / p_n; \
+                END IF; \
+            EXCEPTION \
+                WHEN ZERO_DIVIDE THEN \
+                    ROLLBACK TO sp__CODEX_CURSOR__; \
+            END; \
+        END;";
+    let suggestions = query_completion_suggestions_with_locals(sql, Oracle);
+    assert!(
+        has(&suggestions, "sp1"),
+        "savepoint `sp1` missing from ROLLBACK TO slot: {suggestions:?}"
+    );
+
+    let explicit_savepoint_keyword = query_completion_suggestions_with_locals(
+        "BEGIN SAVEPOINT sp1; ROLLBACK TO SAVEPOINT __CODEX_CURSOR__; END;",
+        Oracle,
+    );
+    assert!(
+        has(&explicit_savepoint_keyword, "sp1"),
+        "`ROLLBACK TO SAVEPOINT |` should offer savepoint names: {explicit_savepoint_keyword:?}"
+    );
+}
+
 /// Mass coverage: every kind of PL/SQL local (scalar, constant, `%TYPE`, `%ROWTYPE`,
 /// record, cursor, ref-cursor, exception, routine parameter, FOR-loop index, nested-
 /// block var) must surface at the value/name positions where it is grammatical, and
@@ -76195,6 +76426,31 @@ fn plsql_local_variables_are_suggested_across_positions() {
     }
     if has(&s, "v_in") {
         failures.push(format!("inner var `v_in` leaked into outer scope: {s:?}"));
+    }
+
+    // Contextual Oracle keywords can be valid PL/SQL identifiers; a nested
+    // declaration named `INNER` must still surface as a local symbol.
+    let keyword_named_inner = "\
+        DECLARE \
+            p_grp NUMBER := 0; \
+            p_n NUMBER := 5; \
+            v_flag VARCHAR2(20); \
+        BEGIN \
+            CASE \
+                WHEN p_grp = 0 THEN \
+                    v_flag := 'G0_' || TO_CHAR(p_n); \
+                    IF p_n BETWEEN 3 AND 7 THEN \
+                        DECLARE \
+                            INNER NUMBER := p_n * 11; \
+                        BEGIN \
+                            v_flag := TO_CHAR(inn__CODEX_CURSOR__); \
+                        END; \
+                    END IF; \
+            END CASE; \
+        END;";
+    let s = query_completion_suggestions_with_locals(keyword_named_inner, Oracle);
+    if !has(&s, "INNER") {
+        failures.push(format!("contextual keyword local `INNER` missing: {s:?}"));
     }
 
     // Exception-name slots: only declared exceptions (scope-correct), never a scalar.
@@ -77354,6 +77610,517 @@ fn plsql_returning_predicate_and_window_value_positions_offer_locals() {
 }
 
 #[test]
+fn mysql_family_common_sql_basics_offer_final_suggestions() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let has = |suggestions: &[String], expected: &str| {
+        suggestions
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(expected))
+    };
+    let mut failures = Vec::new();
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "|",
+            &["SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "ALTER", "DROP"],
+        ),
+        ("SEL|", &["SELECT"]),
+        ("SELECT | FROM emp", &["EMPNO", "ENAME"]),
+        ("SELECT COUNT(|) FROM emp", &["EMPNO", "ENAME"]),
+        ("SELECT * FROM |", &["EMP", "DEPT"]),
+        ("SELECT * FROM emp WHERE |", &["EMPNO", "ENAME", "CASE", "NULL"]),
+        (
+            "SELECT * FROM emp e JOIN dept d ON |",
+            &["EMPNO", "DEPTNO"],
+        ),
+        ("SELECT * FROM emp GROUP BY |", &["EMPNO", "ENAME"]),
+        ("SELECT * FROM emp ORDER BY |", &["EMPNO", "ENAME"]),
+        ("INSERT INTO |", &["EMP", "DEPT"]),
+        ("INSERT INTO emp (|)", &["EMPNO", "ENAME"]),
+        ("UPDATE |", &["EMP", "DEPT"]),
+        ("UPDATE emp SET |", &["EMPNO", "ENAME", "SAL"]),
+        ("DELETE FROM |", &["EMP", "DEPT"]),
+    ];
+
+    for db in [MySQL, MariaDB] {
+        for (sql, expected) in cases {
+            let (kind, keywords, suggestions) = audit_final_suggestions_for(sql, db);
+            if suggestions.is_empty() {
+                failures.push(format!(
+                    "EMPTY at {db:?} `{sql}` (kind={kind:?}, keywords={keywords:?})"
+                ));
+                continue;
+            }
+            for item in *expected {
+                if !has(&suggestions, item) {
+                    failures.push(format!(
+                        "`{item}` missing at {db:?} `{sql}`: kind={kind:?} keywords={keywords:?} final={suggestions:?}"
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "MySQL-family common SQL completion gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn mysql_family_object_completion_bulk_matrix_includes_query_and_schema_objects() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let has = |suggestions: &[String], expected: &str| {
+        suggestions
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(expected))
+    };
+    let mut failures = Vec::new();
+    let cases: &[(&str, Option<ExpectedObjectSuggestionKind>, &[&str])] = &[
+        (
+            "SELECT * FROM |",
+            Some(ExpectedObjectSuggestionKind::ColumnOwner),
+            &["EMP", "DEPT", "EMP_V"],
+        ),
+        (
+            "SELECT * FROM emp JOIN |",
+            Some(ExpectedObjectSuggestionKind::ColumnOwner),
+            &["EMP", "DEPT", "EMP_V"],
+        ),
+        ("INSERT INTO |", Some(ExpectedObjectSuggestionKind::Table), &["EMP", "DEPT"]),
+        ("UPDATE |", Some(ExpectedObjectSuggestionKind::Table), &["EMP", "DEPT"]),
+        ("DELETE FROM |", Some(ExpectedObjectSuggestionKind::Table), &["EMP", "DEPT"]),
+        ("LOCK TABLES |", Some(ExpectedObjectSuggestionKind::Table), &["EMP", "DEPT"]),
+        (
+            "SHOW COLUMNS FROM |",
+            Some(ExpectedObjectSuggestionKind::ColumnOwner),
+            &["EMP", "DEPT", "EMP_V"],
+        ),
+        ("ALTER TABLE |", Some(ExpectedObjectSuggestionKind::Table), &["EMP", "DEPT"]),
+        ("SHOW CREATE TABLE |", Some(ExpectedObjectSuggestionKind::Table), &["EMP", "DEPT"]),
+        ("ALTER VIEW |", Some(ExpectedObjectSuggestionKind::View), &["EMP_V"]),
+        ("DROP VIEW |", Some(ExpectedObjectSuggestionKind::View), &["EMP_V"]),
+        ("SHOW CREATE VIEW |", Some(ExpectedObjectSuggestionKind::View), &["EMP_V"]),
+        ("SHOW CREATE PROCEDURE |", Some(ExpectedObjectSuggestionKind::Procedure), &["RUN_JOB"]),
+        ("DROP PROCEDURE |", Some(ExpectedObjectSuggestionKind::Procedure), &["RUN_JOB"]),
+        ("SHOW CREATE FUNCTION |", Some(ExpectedObjectSuggestionKind::Function), &["CALC_TOTAL"]),
+        ("DROP FUNCTION |", Some(ExpectedObjectSuggestionKind::Function), &["CALC_TOTAL"]),
+        ("SHOW CREATE TRIGGER |", Some(ExpectedObjectSuggestionKind::Trigger), &["BI_EMP"]),
+        ("DROP TRIGGER |", Some(ExpectedObjectSuggestionKind::Trigger), &["BI_EMP"]),
+        ("DROP INDEX |", Some(ExpectedObjectSuggestionKind::Index), &["IDX_EMP_NAME"]),
+        ("SHOW CREATE EVENT |", Some(ExpectedObjectSuggestionKind::Event), &["CLEANUP_EVENT"]),
+        ("ALTER EVENT |", Some(ExpectedObjectSuggestionKind::Event), &["CLEANUP_EVENT"]),
+        ("DROP EVENT |", Some(ExpectedObjectSuggestionKind::Event), &["CLEANUP_EVENT"]),
+        ("SHOW CREATE USER |", Some(ExpectedObjectSuggestionKind::User), &["APP_USER", "SCOTT", "SYSTEM"]),
+        ("DROP USER |", Some(ExpectedObjectSuggestionKind::User), &["APP_USER", "SCOTT", "SYSTEM"]),
+    ];
+
+    for db in [MySQL, MariaDB] {
+        for (sql, expected_kind, expected_items) in cases {
+            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+            if kind != *expected_kind {
+                failures.push(format!(
+                    "kind mismatch at {db:?} `{sql}`: expected {expected_kind:?}, got {kind:?}; keywords={keywords:?} final={final_suggestions:?}"
+                ));
+            }
+            if final_suggestions.is_empty() {
+                failures.push(format!(
+                    "EMPTY at {db:?} `{sql}`: kind={kind:?} keywords={keywords:?}"
+                ));
+                continue;
+            }
+            for item in *expected_items {
+                if !has(&final_suggestions, item) {
+                    failures.push(format!(
+                        "`{item}` missing at {db:?} `{sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "MySQL-family object completion bulk gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn mysql_family_routine_body_object_completion_bulk_matrix() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let has = |suggestions: &[String], expected: &str| {
+        suggestions
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(expected))
+    };
+    let mut failures = Vec::new();
+
+    let procedure_body_cases: &[(&str, Option<ExpectedObjectSuggestionKind>, &[&str])] = &[
+        (
+            "SELECT * FROM |;",
+            Some(ExpectedObjectSuggestionKind::ColumnOwner),
+            &["EMP", "DEPT", "EMP_V"],
+        ),
+        (
+            "SELECT * FROM emp JOIN | ON 1 = 1;",
+            Some(ExpectedObjectSuggestionKind::ColumnOwner),
+            &["EMP", "DEPT", "EMP_V"],
+        ),
+        ("SELECT | FROM emp;", None, &["EMPNO", "ENAME"]),
+        ("SELECT e.| FROM emp e;", None, &["EMPNO", "ENAME", "SAL"]),
+        (
+            "SELECT * FROM emp WHERE |;",
+            None,
+            &["EMPNO", "ENAME", "CASE", "NULL"],
+        ),
+        (
+            "INSERT INTO | (empno) VALUES (1);",
+            Some(ExpectedObjectSuggestionKind::Table),
+            &["EMP", "DEPT"],
+        ),
+        ("INSERT INTO emp (|) VALUES (1);", None, &["EMPNO", "ENAME"]),
+        (
+            "UPDATE | SET sal = 1;",
+            Some(ExpectedObjectSuggestionKind::Table),
+            &["EMP", "DEPT"],
+        ),
+        ("UPDATE emp SET | = 1;", None, &["EMPNO", "ENAME", "SAL"]),
+        (
+            "DELETE FROM |;",
+            Some(ExpectedObjectSuggestionKind::Table),
+            &["EMP", "DEPT"],
+        ),
+        (
+            "CALL |();",
+            Some(ExpectedObjectSuggestionKind::Routine),
+            &["RUN_JOB"],
+        ),
+        (
+            "SHOW COLUMNS FROM |;",
+            Some(ExpectedObjectSuggestionKind::ColumnOwner),
+            &["EMP", "DEPT", "EMP_V"],
+        ),
+        (
+            "SHOW CREATE TABLE |;",
+            Some(ExpectedObjectSuggestionKind::Table),
+            &["EMP", "DEPT"],
+        ),
+        (
+            "SHOW CREATE VIEW |;",
+            Some(ExpectedObjectSuggestionKind::View),
+            &["EMP_V"],
+        ),
+        (
+            "SHOW CREATE PROCEDURE |;",
+            Some(ExpectedObjectSuggestionKind::Procedure),
+            &["RUN_JOB"],
+        ),
+        (
+            "SHOW CREATE FUNCTION |;",
+            Some(ExpectedObjectSuggestionKind::Function),
+            &["CALC_TOTAL"],
+        ),
+        (
+            "SHOW CREATE TRIGGER |;",
+            Some(ExpectedObjectSuggestionKind::Trigger),
+            &["BI_EMP"],
+        ),
+        (
+            "SHOW CREATE EVENT |;",
+            Some(ExpectedObjectSuggestionKind::Event),
+            &["CLEANUP_EVENT"],
+        ),
+        (
+            "SHOW CREATE USER |;",
+            Some(ExpectedObjectSuggestionKind::User),
+            &["APP_USER", "SCOTT", "SYSTEM"],
+        ),
+        (
+            "DROP PROCEDURE |;",
+            Some(ExpectedObjectSuggestionKind::Procedure),
+            &["RUN_JOB"],
+        ),
+        (
+            "DROP FUNCTION |;",
+            Some(ExpectedObjectSuggestionKind::Function),
+            &["CALC_TOTAL"],
+        ),
+        (
+            "DROP TRIGGER |;",
+            Some(ExpectedObjectSuggestionKind::Trigger),
+            &["BI_EMP"],
+        ),
+        (
+            "DROP INDEX |;",
+            Some(ExpectedObjectSuggestionKind::Index),
+            &["IDX_EMP_NAME"],
+        ),
+        (
+            "ALTER EVENT | ENABLE;",
+            Some(ExpectedObjectSuggestionKind::Event),
+            &["CLEANUP_EVENT"],
+        ),
+        (
+            "LOCK TABLES | READ;",
+            Some(ExpectedObjectSuggestionKind::Table),
+            &["EMP", "DEPT"],
+        ),
+        (
+            "GRANT EXECUTE ON | TO app_user;",
+            Some(ExpectedObjectSuggestionKind::Executable),
+            &["RUN_JOB", "CALC_TOTAL"],
+        ),
+    ];
+
+    let function_body_cases: &[(&str, Option<ExpectedObjectSuggestionKind>, &[&str])] = &[
+        (
+            "SET v_id = (SELECT COUNT(*) FROM |);",
+            Some(ExpectedObjectSuggestionKind::ColumnOwner),
+            &["EMP", "DEPT", "EMP_V"],
+        ),
+        (
+            "SELECT | INTO v_id FROM emp;",
+            None,
+            &["EMPNO", "ENAME", "SAL"],
+        ),
+        (
+            "SELECT e.| INTO v_id FROM emp e;",
+            None,
+            &["EMPNO", "ENAME", "SAL"],
+        ),
+        (
+            "IF EXISTS (SELECT 1 FROM emp WHERE |) THEN SET v_id = 1; END IF;",
+            None,
+            &["EMPNO", "ENAME", "CASE", "NULL"],
+        ),
+        (
+            "SET v_id = calc_total((SELECT COUNT(*) FROM |));",
+            Some(ExpectedObjectSuggestionKind::ColumnOwner),
+            &["EMP", "DEPT", "EMP_V"],
+        ),
+        (
+            "SET v_id = (SELECT COUNT(*) FROM emp JOIN | ON 1 = 1);",
+            Some(ExpectedObjectSuggestionKind::ColumnOwner),
+            &["EMP", "DEPT", "EMP_V"],
+        ),
+        (
+            "RETURN (SELECT COUNT(*) FROM |);",
+            Some(ExpectedObjectSuggestionKind::ColumnOwner),
+            &["EMP", "DEPT", "EMP_V"],
+        ),
+        (
+            "RETURN (SELECT COUNT(*) FROM emp WHERE |);",
+            None,
+            &["EMPNO", "ENAME", "CASE", "NULL"],
+        ),
+        (
+            "UPDATE | SET sal = 1;",
+            Some(ExpectedObjectSuggestionKind::Table),
+            &["EMP", "DEPT"],
+        ),
+        ("UPDATE emp SET | = 1;", None, &["EMPNO", "ENAME", "SAL"]),
+        (
+            "DELETE FROM |;",
+            Some(ExpectedObjectSuggestionKind::Table),
+            &["EMP", "DEPT"],
+        ),
+        (
+            "CALL |();",
+            Some(ExpectedObjectSuggestionKind::Routine),
+            &["RUN_JOB"],
+        ),
+        (
+            "SHOW CREATE FUNCTION |;",
+            Some(ExpectedObjectSuggestionKind::Function),
+            &["CALC_TOTAL"],
+        ),
+        (
+            "SHOW CREATE PROCEDURE |;",
+            Some(ExpectedObjectSuggestionKind::Procedure),
+            &["RUN_JOB"],
+        ),
+    ];
+
+    for db in [MySQL, MariaDB] {
+        for (body_sql, expected_kind, expected_items) in procedure_body_cases {
+            let sql = format!("CREATE PROCEDURE p()\nBEGIN\n    {body_sql}\nEND");
+            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(&sql, db);
+            if kind != *expected_kind {
+                failures.push(format!(
+                    "procedure kind mismatch at {db:?} `{body_sql}`: expected {expected_kind:?}, got {kind:?}; keywords={keywords:?} final={final_suggestions:?}"
+                ));
+            }
+            if final_suggestions.is_empty() {
+                failures.push(format!(
+                    "procedure EMPTY at {db:?} `{body_sql}`: kind={kind:?} keywords={keywords:?}"
+                ));
+                continue;
+            }
+            for item in *expected_items {
+                if !has(&final_suggestions, item) {
+                    failures.push(format!(
+                        "`{item}` missing in procedure body at {db:?} `{body_sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+                    ));
+                }
+            }
+        }
+
+        for (body_sql, expected_kind, expected_items) in function_body_cases {
+            let sql = format!(
+                "CREATE FUNCTION f() RETURNS INT\nBEGIN\n    DECLARE v_id INT DEFAULT 0;\n    {body_sql}\n    RETURN v_id;\nEND"
+            );
+            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(&sql, db);
+            if kind != *expected_kind {
+                failures.push(format!(
+                    "function kind mismatch at {db:?} `{body_sql}`: expected {expected_kind:?}, got {kind:?}; keywords={keywords:?} final={final_suggestions:?}"
+                ));
+            }
+            if final_suggestions.is_empty() {
+                failures.push(format!(
+                    "function EMPTY at {db:?} `{body_sql}`: kind={kind:?} keywords={keywords:?}"
+                ));
+                continue;
+            }
+            for item in *expected_items {
+                if !has(&final_suggestions, item) {
+                    failures.push(format!(
+                        "`{item}` missing in function body at {db:?} `{body_sql}`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "MySQL-family routine body object completion gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn mysql_family_definer_procedure_parameter_and_call_argument_completion() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let has = |suggestions: &[String], expected: &str| {
+        suggestions
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(expected))
+    };
+    let mut failures = Vec::new();
+
+    let parameter_cases: &[(&str, &[&str])] = &[
+        (
+            r#"CREATE DEFINER=`root`@`%` PROCEDURE `cfb_assert_eq_int`(|) BEGIN END"#,
+            &["IN", "OUT", "INOUT"],
+        ),
+        (
+            r#"CREATE DEFINER=`root`@`%` PROCEDURE `cfb_assert_eq_int`(IN p_expected BIGINT, |) BEGIN END"#,
+            &["IN", "OUT", "INOUT"],
+        ),
+        (
+            r#"CREATE DEFINER=`root`@`%` PROCEDURE `cfb_assert_eq_int`(IN p_expected |) BEGIN END"#,
+            &["BIGINT", "TEXT"],
+        ),
+        (
+            r#"CREATE DEFINER=`root`@`%` PROCEDURE `cfb_assert_eq_int`(IN p_expected BIGINT, in p_actual BIGINT, IN p_message |) BEGIN END"#,
+            &["BIGINT", "TEXT"],
+        ),
+    ];
+
+    let body_cases: &[(&str, &[&str])] = &[
+        (
+            r#"CREATE DEFINER=`root`@`%` PROCEDURE `cfb_assert_eq_int`(IN p_expected BIGINT, in p_actual BIGINT, IN p_message TEXT)
+BEGIN
+    INSERT INTO cfb_assert_log (test_name, detail_text)
+    VALUES ('ASSERT_EQ_INT', CON|);
+END"#,
+            &["CONCAT"],
+        ),
+        (
+            r#"CREATE DEFINER=`root`@`%` PROCEDURE `cfb_assert_eq_int`(IN p_expected BIGINT, in p_actual BIGINT, IN p_message TEXT)
+BEGIN
+    IF COALESCE(p_expected, -999999999) <> COALESCE(p_actual, -999999999) THEN
+        CALL cfb_fail(
+            CONCAT('ASSERT_EQ_INT FAILED: ', p_message, ' [expected=', p_|)
+        );
+    END IF;
+END"#,
+            &["p_expected", "p_actual"],
+        ),
+        (
+            r#"CREATE DEFINER=`root`@`%` PROCEDURE `cfb_fail`(IN p_message TEXT)
+BEGIN
+    SE|
+END"#,
+            &["SET"],
+        ),
+        (
+            r#"CREATE DEFINER=`root`@`%` PROCEDURE `cfb_fail`(IN p_message TEXT)
+BEGIN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_|;
+END"#,
+            &["MESSAGE_TEXT"],
+        ),
+        (
+            r#"CREATE DEFINER=`root`@`%` PROCEDURE `cfb_fail`(IN p_message TEXT)
+BEGIN
+    SET @cfb_fail_msg = LEFT(COALESCE(p_message, 'UNKNOWN FAILURE'), 128);
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = @cfb_|;
+END"#,
+            &["cfb_fail_msg"],
+        ),
+    ];
+
+    for db in [MySQL, MariaDB] {
+        for (sql, expected) in parameter_cases {
+            let (_, keywords, suggestions) = audit_final_suggestions_for(sql, db);
+            if suggestions.is_empty() {
+                failures.push(format!(
+                    "EMPTY parameter suggestions at {db:?} `{sql}`; keywords={keywords:?}"
+                ));
+                continue;
+            }
+            for item in *expected {
+                if !has(&suggestions, item) {
+                    failures.push(format!(
+                        "`{item}` missing at {db:?} `{sql}`: keywords={keywords:?} final={suggestions:?}"
+                    ));
+                }
+            }
+        }
+
+        for (sql, expected) in body_cases {
+            let suggestions = query_completion_suggestions_with_locals(sql, db);
+            if suggestions.is_empty() {
+                failures.push(format!(
+                    "EMPTY body suggestions at {db:?} `{}`",
+                    sql.replace('\n', " ")
+                ));
+                continue;
+            }
+            for item in *expected {
+                if !has(&suggestions, item) {
+                    failures.push(format!(
+                        "`{item}` missing at {db:?} `{sql}`: {suggestions:?}"
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "MySQL-family definer procedure completion gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
 fn create_statement_keyword_matrix_offers_expected_keywords_across_dialects() {
     use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
@@ -78236,7 +79003,7 @@ END;"#,
 /// routine's locals; a different qualifier resolves to nothing.
 #[test]
 fn own_package_qualifier_offers_package_level_symbols() {
-    let script = "CREATE OR REPLACE PACKAGE my_pkg IS\n  g_limit CONSTANT NUMBER := 10;\n  g_name VARCHAR2(30);\nEND my_pkg;\n/\nCREATE OR REPLACE PACKAGE BODY my_pkg IS\n  g_state NUMBER := 0;\n  PROCEDURE run_all IS\n    l_local NUMBER;\n  BEGIN\n    l_local := my_pkg.__CODEX_CURSOR__\n  END;\nEND my_pkg;";
+    let script = "CREATE OR REPLACE PACKAGE my_pkg IS\n  g_limit CONSTANT NUMBER := 10;\n  g_name VARCHAR2(30);\n  FUNCTION spec_calc RETURN NUMBER;\nEND my_pkg;\n/\nCREATE OR REPLACE PACKAGE BODY my_pkg IS\n  g_state NUMBER := 0;\n  FUNCTION body_calc RETURN NUMBER IS BEGIN RETURN 1; END;\n  PROCEDURE run_all IS\n    l_local NUMBER;\n  BEGIN\n    l_local := my_pkg.__CODEX_CURSOR__\n  END;\nEND my_pkg;";
     let cursor = script.find("__CODEX_CURSOR__").unwrap();
     let clean = script.replace("__CODEX_CURSOR__", "");
     let (routine_cache, expanded) =
@@ -78252,6 +79019,9 @@ fn own_package_qualifier_offers_package_level_symbols() {
     assert!(has("g_state"), "body global missing: {members:?}");
     assert!(has("g_limit"), "spec global missing: {members:?}");
     assert!(has("g_name"), "spec global missing: {members:?}");
+    assert!(has("spec_calc"), "spec function missing: {members:?}");
+    assert!(has("body_calc"), "body function missing: {members:?}");
+    assert!(has("run_all"), "body procedure missing: {members:?}");
     assert!(!has("l_local"), "nested routine local leaked: {members:?}");
 
     // Prefix filtering.
@@ -78269,6 +79039,117 @@ fn own_package_qualifier_offers_package_level_symbols() {
     assert!(other.is_empty(), "foreign qualifier resolved own-package members: {other:?}");
 }
 
+#[test]
+fn same_package_routines_are_suggested_inside_other_routines() {
+    use crate::db::DatabaseType::Oracle;
+    let has = |values: &[String], needle: &str| {
+        values.iter().any(|value| value.eq_ignore_ascii_case(needle))
+    };
+
+    let body_private_function = "\
+        CREATE OR REPLACE PACKAGE BODY my_pkg IS \
+          FUNCTION calc_total RETURN NUMBER IS \
+          BEGIN \
+            RETURN 1; \
+          END; \
+          PROCEDURE run_all IS \
+            v_total NUMBER; \
+          BEGIN \
+            v_total := calc__CODEX_CURSOR__; \
+          END; \
+        END my_pkg;";
+    let suggestions = query_completion_suggestions_with_locals(body_private_function, Oracle);
+    assert!(
+        has(&suggestions, "calc_total"),
+        "body-declared sibling function missing inside package procedure: {suggestions:?}"
+    );
+
+    let spec_public_function = "\
+        CREATE OR REPLACE PACKAGE my_pkg IS \
+          FUNCTION spec_calc RETURN NUMBER; \
+        END my_pkg; \
+        / \
+        CREATE OR REPLACE PACKAGE BODY my_pkg IS \
+          PROCEDURE run_all IS \
+            v_total NUMBER; \
+          BEGIN \
+            v_total := spec__CODEX_CURSOR__; \
+          END; \
+          FUNCTION spec_calc RETURN NUMBER IS \
+          BEGIN \
+            RETURN 1; \
+          END; \
+        END my_pkg;";
+    let suggestions = query_completion_suggestions_with_locals(spec_public_function, Oracle);
+    assert!(
+        has(&suggestions, "spec_calc"),
+        "spec-declared package function missing before its body definition: {suggestions:?}"
+    );
+}
+
+#[test]
+fn package_body_local_survives_q_quotes_and_cursor_for_update_loop() {
+    use crate::db::DatabaseType::Oracle;
+    let has = |values: &[String], needle: &str| {
+        values.iter().any(|value| value.eq_ignore_ascii_case(needle))
+    };
+
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY deep_pkg IS
+  TYPE t_vc_tab IS TABLE OF VARCHAR2(100) INDEX BY PLS_INTEGER;
+
+  PROCEDURE run_extreme (p_dept_id NUMBER) IS
+    v_names t_vc_tab;
+    v_note VARCHAR2 (4000);
+    v_plsql VARCHAR2 (32767);
+    v_salary NUMBER;
+  BEGIN
+    v_names (1) := q'[alpha ; beta / gamma -- delta]';
+    v_names (2) := q'[
+line-1
+/
+line-2 ; END;
+]';
+    v_names (3) := q'~"quoted"; /*text*/ / final~';
+    <<outer_loop>>
+    FOR r IN (
+      SELECT emp_id,
+             emp_name,
+             salary
+      FROM qt_boss_emp
+      WHERE dept_id = p_dept_id
+      ORDER BY emp_id
+      FOR UPDATE OF salary,
+                    status
+    ) LOOP
+      BEGIN
+        v_sal__CODEX_CURSOR__ := NVL (r.salary, 0) +
+          CASE
+            WHEN MOD (r.emp_id, 2) = 0 THEN
+              17
+            ELSE
+              29
+          END;
+      END;
+    END LOOP;
+  END run_extreme;
+END deep_pkg;"#;
+
+    let raw_locals = SqlEditorWidget::collect_local_symbol_suggestions_with_prefix_for_test(
+        sql,
+        "v_sal",
+        &[],
+    );
+    assert!(
+        has(&raw_locals, "v_salary"),
+        "raw local collection lost `v_salary`: {raw_locals:?}"
+    );
+
+    let suggestions = query_completion_suggestions_with_locals(sql, Oracle);
+    assert!(
+        has(&suggestions, "v_salary"),
+        "`v_salary` missing at package-body assignment LHS: {suggestions:?}"
+    );
+}
 
 /// Schemas are valid qualifier heads inside expressions (`v := scott.pkg.fn`),
 /// so a schema/user name must surface at assignment/condition/call-argument
@@ -78324,6 +79205,59 @@ fn schemas_are_offered_as_expression_qualifier_heads() {
         !contains(&after_operand, "SCOTT"),
         "schema offered right after a complete operand: {after_operand:?}"
     );
+}
+
+#[test]
+fn schemas_are_offered_as_plsql_call_qualifier_heads() {
+    use crate::db::DatabaseType::Oracle;
+    let contains = |values: &[String], needle: &str| {
+        values.iter().any(|value| value.eq_ignore_ascii_case(needle))
+    };
+
+    let sql = "VAR v_p_cursor REFCURSOR
+BEGIN
+  syst|
+END;";
+    let (_kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+    assert!(
+        contains(&final_suggestions, "SYSTEM"),
+        "SYSTEM missing as PL/SQL call qualifier head: keywords={keywords:?} final={final_suggestions:?}"
+    );
+}
+
+#[test]
+fn package_body_collection_type_index_by_keywords_are_offered() {
+    use crate::db::DatabaseType::Oracle;
+    let contains = |values: &[String], needle: &str| {
+        values.iter().any(|value| value.eq_ignore_ascii_case(needle))
+    };
+    let package_body = |collection_tail: &str| {
+        format!(
+            r#"CREATE OR REPLACE PACKAGE BODY "SYSTEM"."OQT_DEEP_PKG" AS
+    FUNCTION f_deep (p_grp IN NUMBER, p_n IN NUMBER, p_txt IN VARCHAR2) RETURN NUMBER IS
+        v NUMBER := 0;
+        TYPE t_num_tab IS TABLE OF NUMBER {collection_tail};
+        a t_num_tab;
+    BEGIN
+        RETURN v;
+    END;
+END;"#
+        )
+    };
+
+    for (tail, expected) in [
+        ("|", "INDEX BY"),
+        ("ind|", "INDEX BY"),
+        ("INDEX |", "BY"),
+        ("INDEX BY |", "PLS_INTEGER"),
+    ] {
+        let sql = package_body(tail);
+        let (_kind, keywords, suggestions) = audit_final_suggestions_for(&sql, Oracle);
+        assert!(
+            contains(&suggestions, expected),
+            "{expected} missing in package-body collection type tail `{tail}`: keywords={keywords:?} final={suggestions:?}"
+        );
+    }
 }
 
 #[test]
