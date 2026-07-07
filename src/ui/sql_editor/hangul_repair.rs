@@ -498,7 +498,10 @@ mod tests {
         // typing 장영환 with the broken first key, keyed by KeyDown order.
         let buffer = std::sync::Mutex::new(String::new());
         let read = |start: usize, end: usize| -> Option<String> {
-            buffer.lock().ok().and_then(|guard| guard.get(start..end).map(str::to_string))
+            buffer
+                .lock()
+                .ok()
+                .and_then(|guard| guard.get(start..end).map(str::to_string))
         };
 
         let mut state = FirstKeyRepairState::default();
@@ -541,7 +544,10 @@ mod tests {
     fn repair_arms_only_on_the_exact_failure_signature() {
         let buffer = std::sync::Mutex::new(String::new());
         let read = |start: usize, end: usize| -> Option<String> {
-            buffer.lock().ok().and_then(|guard| guard.get(start..end).map(str::to_string))
+            buffer
+                .lock()
+                .ok()
+                .and_then(|guard| guard.get(start..end).map(str::to_string))
         };
 
         // Healthy composition: first key already marked (compose_state>0).
@@ -576,7 +582,10 @@ mod tests {
         // state disarms, the jamo the user actually typed is preserved.
         let buffer = std::sync::Mutex::new("ㅈ ".to_string());
         let read = |start: usize, end: usize| -> Option<String> {
-            buffer.lock().ok().and_then(|guard| guard.get(start..end).map(str::to_string))
+            buffer
+                .lock()
+                .ok()
+                .and_then(|guard| guard.get(start..end).map(str::to_string))
         };
         let mut state = FirstKeyRepairState::default();
         assert_eq!(state.on_key_event("ㅈ", false, 0, 3, &read), None);
@@ -588,7 +597,10 @@ mod tests {
     fn reset_discards_stranded_jamo_before_selection_replacement() {
         let buffer = std::sync::Mutex::new("ㅈ다".to_string());
         let read = |start: usize, end: usize| -> Option<String> {
-            buffer.lock().ok().and_then(|guard| guard.get(start..end).map(str::to_string))
+            buffer
+                .lock()
+                .ok()
+                .and_then(|guard| guard.get(start..end).map(str::to_string))
         };
         let mut state = FirstKeyRepairState::default();
         assert_eq!(state.on_key_event("ㅈ", false, 0, 3, &read), None);
@@ -604,7 +616,10 @@ mod tests {
     fn flush_merges_and_disarms() {
         let buffer = std::sync::Mutex::new("ㅈㅏㅇ".to_string());
         let read = |start: usize, end: usize| -> Option<String> {
-            buffer.lock().ok().and_then(|guard| guard.get(start..end).map(str::to_string))
+            buffer
+                .lock()
+                .ok()
+                .and_then(|guard| guard.get(start..end).map(str::to_string))
         };
         let mut state = FirstKeyRepairState {
             stranded_pos: Some(0),

@@ -48,11 +48,11 @@ use tns_thin::OracleThinCancelHandle;
 mod execution;
 mod formatter;
 pub mod hangul_repair;
-#[cfg(target_os = "macos")]
-pub(crate) mod macos_ime;
 mod intellisense;
 mod intellisense_host;
 mod intellisense_state;
+#[cfg(target_os = "macos")]
+pub(crate) mod macos_ime;
 // 공통 파싱/토큰 유틸(실행, 인텔리센스, 포맷팅 공통 경로)
 pub(crate) mod query_text;
 

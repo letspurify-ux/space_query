@@ -18463,7 +18463,9 @@ mod tests {
             type_name: String::new(),
         };
 
-        assert!(columns_require_define_fetch_for_values(std::slice::from_ref(&column)));
+        assert!(columns_require_define_fetch_for_values(
+            std::slice::from_ref(&column)
+        ));
 
         let thin = define_column_metadata(&column);
         assert_eq!(thin.column_type, OracleColumnType::Raw);
