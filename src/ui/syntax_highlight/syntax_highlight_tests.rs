@@ -127,6 +127,18 @@ fn test_keyword_highlighting() {
 }
 
 #[test]
+fn test_oracle_sequence_options_highlight_as_keywords() {
+    let mut highlighter = SqlHighlighter::new();
+    highlighter.set_db_type(crate::db::connection::DatabaseType::Oracle);
+    let text = r#"CREATE SEQUENCE "SYSTEM"."MVIEW$_ADVSEQ_GENERIC" MINVALUE 1 MAXVALUE 4294967295 INCREMENT BY 1 START WITH 1 CACHE 50 NOORDER NOCYCLE NOKEEP NOSCALE GLOBAL;"#;
+    let styles = highlighter.generate_styles(text);
+
+    for token in ["CACHE", "NOORDER", "NOCYCLE", "NOKEEP", "NOSCALE", "GLOBAL"] {
+        assert_token_has_style(text, &styles, token, STYLE_KEYWORD);
+    }
+}
+
+#[test]
 fn test_transaction_level_keywords_highlight_as_keywords() {
     let mut mysql_highlighter = SqlHighlighter::new();
     mysql_highlighter.set_db_type(crate::db::connection::DatabaseType::MySQL);

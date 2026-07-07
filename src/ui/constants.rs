@@ -81,7 +81,7 @@ pub const TABLE_ROW_HEIGHT: i32 = 26;
 pub const TABLE_CELL_PADDING: i32 = 4;
 
 /// Default maximum number of characters shown per result cell.
-pub const RESULT_CELL_MAX_DISPLAY_CHARS_DEFAULT: u32 = 50;
+pub const RESULT_CELL_MAX_DISPLAY_CHARS_DEFAULT: u32 = 150;
 
 /// Minimum allowed maximum for result cell preview length.
 pub const RESULT_CELL_MAX_DISPLAY_CHARS_MIN: u32 = 8;

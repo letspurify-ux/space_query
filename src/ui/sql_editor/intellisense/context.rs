@@ -1527,9 +1527,18 @@ impl SqlEditorWidget {
             return false;
         }
 
+        let range_text = Self::completion_range_text(buffer, text_shadow, start, cursor_pos);
+        if Self::fast_path_requires_full_analysis_after_qualifier_transition(
+            &range_text,
+            cursor > end,
+            typed_char,
+        ) {
+            return false;
+        }
+
         // Fast path: keep existing suggestions and just filter by the current in-range prefix.
         // This avoids re-tokenizing/re-analyzing SQL on each extra identifier keystroke.
-        let prefix = Self::prefix_in_completion_range(buffer, text_shadow, start, cursor_pos);
+        let prefix = Self::completion_prefix_from_range_text(&range_text);
         let qualifier = Self::qualifier_before_word(buffer, text_shadow, start);
         if Self::should_hide_fast_path_after_delete(&prefix, qualifier.as_deref(), key) {
             intellisense_popup
@@ -1663,7 +1672,24 @@ impl SqlEditorWidget {
         qualifier.is_some() || Self::has_min_intellisense_prefix(word)
     }
 
-    fn prefix_in_completion_range(
+    fn should_auto_trigger_intellisense_for_identifier_char(
+        word: &str,
+        qualifier: Option<&str>,
+    ) -> bool {
+        qualifier.is_some() || Self::has_min_intellisense_prefix(word)
+    }
+
+    fn fast_path_requires_full_analysis_after_qualifier_transition(
+        range_text: &str,
+        cursor_exceeded_range: bool,
+        typed_char: Option<char>,
+    ) -> bool {
+        cursor_exceeded_range
+            && typed_char.is_some_and(Self::is_completion_prefix_char)
+            && Self::last_unquoted_dot(range_text).is_some()
+    }
+
+    fn completion_range_text(
         buffer: &TextBuffer,
         text_shadow: &Arc<Mutex<HighlightShadowState>>,
         start: usize,
@@ -1671,8 +1697,7 @@ impl SqlEditorWidget {
     ) -> String {
         let cursor = cursor_pos.max(0) as usize;
         let end = cursor.max(start);
-        let text = text_buffer_access::text_range(buffer, Some(text_shadow), start as i32, end as i32);
-        Self::completion_prefix_from_range_text(&text)
+        text_buffer_access::text_range(buffer, Some(text_shadow), start as i32, end as i32)
     }
 
     fn completion_prefix_from_range_text(text: &str) -> String {

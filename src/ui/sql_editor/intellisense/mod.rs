@@ -74,6 +74,7 @@ struct IntellisenseTriggerSnapshot {
     word_start: usize,
     qualifier: Option<String>,
     raw_qualifier: Option<String>,
+    signature_scan_text: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

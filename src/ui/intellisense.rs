@@ -4087,6 +4087,14 @@ pub struct EnclosingCall {
     pub open_paren: usize,
 }
 
+/// Lookup key for a routine call: `QUALIFIER.NAME` uppercased.
+pub fn signature_key_for_call(call: &EnclosingCall) -> String {
+    match &call.qualifier {
+        Some(qualifier) => format!("{}.{}", qualifier.to_uppercase(), call.name.to_uppercase()),
+        None => call.name.to_uppercase(),
+    }
+}
+
 /// Find the innermost function/procedure call whose argument list contains the
 /// cursor, counting top-level commas to determine the active argument. Skips
 /// string literals, quoted identifiers, and comments. Returns `None` when the

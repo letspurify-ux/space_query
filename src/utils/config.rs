@@ -14,7 +14,7 @@ const LEGACY_APP_DIR_NAME: &str = "oracle_query_tool";
 const MAX_RECENT_CONNECTIONS: usize = 50;
 pub const MAX_RECENT_SQL_FILES: usize = 10;
 const MAX_QUERY_HISTORY_ENTRIES: usize = 100;
-const DEFAULT_RESULT_CELL_MAX_CHARS: u32 = 50;
+const DEFAULT_RESULT_CELL_MAX_CHARS: u32 = 150;
 pub const DEFAULT_CONNECTION_POOL_SIZE: u32 = 12;
 pub const MIN_CONNECTION_POOL_SIZE: u32 = 1;
 pub const MAX_CONNECTION_POOL_SIZE: u32 = 16;
@@ -451,6 +451,14 @@ mod tests {
         assert_eq!(
             AppConfig::new().lazy_fetch_batch_size,
             super::DEFAULT_LAZY_FETCH_BATCH_SIZE
+        );
+    }
+
+    #[test]
+    fn app_config_defaults_result_cell_max_chars_to_one_hundred_fifty() {
+        assert_eq!(
+            AppConfig::new().result_cell_max_chars,
+            super::DEFAULT_RESULT_CELL_MAX_CHARS
         );
     }
 

@@ -77,6 +77,38 @@ Docker listener는 `FREE`, `freepdb1` 서비스가 `READY`로 보여야 한다.
 docker exec oracle bash -lc "lsnrctl status"
 ```
 
+## 로컬 Docker 테스트 서버 시작
+
+Docker 런타임은 Colima를 사용한다. Docker API 연결이 안 되거나 `colima is not running`이 보이면 먼저 Colima를 시작한다.
+
+```sh
+colima start
+```
+
+이미 만들어진 기본 테스트 컨테이너는 다음 명령으로 다시 켠다. 컨테이너가 멈춰 있어도 같은 명령을 사용한다.
+
+```sh
+docker restart oracle
+```
+
+`oracle` 컨테이너가 없는 새 환경에서는 한 번만 생성한다. 초기 생성은 이미지 다운로드와 DB 초기화 때문에 몇 분 걸릴 수 있다.
+
+```sh
+docker run -d --name oracle \
+  -p 1521:1521 \
+  -e ORACLE_PASSWORD=password \
+  gvenzl/oracle-free
+```
+
+서버가 준비되면 컨테이너 로그에 `DATABASE IS READY TO USE!`가 출력된다. 그 뒤 listener와 접속을 확인한다.
+
+```sh
+docker logs --tail 80 oracle
+docker exec oracle bash -lc "lsnrctl status"
+nc -vz 127.0.0.1 1521
+docker exec oracle bash -lc "echo 'select 1 from dual;' | sqlplus -s system/password@//127.0.0.1:1521/FREE"
+```
+
 ## 선택적 Oracle Net 설정
 
 별도 `TNS_ADMIN`을 사용할 때는 다음 `sqlnet.ora`를 둘 수 있다.

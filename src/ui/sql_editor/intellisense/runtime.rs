@@ -1561,7 +1561,15 @@ impl SqlEditorWidget {
                             }
                         } else if sql_text::is_identifier_char(ch) {
                             // Alphanumeric typed - show/update popup if word is long enough
-                            if Self::has_min_intellisense_prefix(&word) {
+                            let qualifier = Self::qualifier_before_word(
+                                &buffer_for_handle,
+                                &text_shadow_for_handle,
+                                word_start,
+                            );
+                            if Self::should_auto_trigger_intellisense_for_identifier_char(
+                                &word,
+                                qualifier.as_deref(),
+                            ) {
                                 Self::schedule_keyup_intellisense_debounce(
                                     &intellisense_runtime_for_handle,
                                     cursor_pos,

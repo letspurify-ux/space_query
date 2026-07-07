@@ -2432,9 +2432,23 @@ fn audit_final_suggestions_impl(
     data.views = vec!["EMP_V".to_string()];
     data.materialized_views = vec!["MVIEW_SALES".to_string()];
     data.types = vec!["ADDRESS_T".to_string()];
-    data.users = vec!["APP_USER".to_string(), "SCOTT".to_string()];
+    data.users = vec![
+        "APP_USER".to_string(),
+        "SCOTT".to_string(),
+        "SYSTEM".to_string(),
+    ];
     data.procedures = vec!["RUN_JOB".to_string()];
     data.functions = vec!["CALC_TOTAL".to_string()];
+    let qt_split_signature = "QT_SPLIT_FN(P_USER_ID IN NUMBER) RETURN CLOB".to_string();
+    let qt_split_arg_start = qt_split_signature.find("P_USER_ID").unwrap();
+    let qt_split_arg_end = qt_split_signature.find(") RETURN").unwrap();
+    data.set_signature(
+        "SYSTEM.QT_SPLIT_FN".to_string(),
+        Some(SignatureLabel {
+            text: qt_split_signature,
+            arg_spans: vec![(qt_split_arg_start, qt_split_arg_end)],
+        }),
+    );
     data.triggers = vec!["BI_EMP".to_string()];
     data.events = vec!["CLEANUP_EVENT".to_string()];
     data.indexes = vec!["IDX_EMP_NAME".to_string()];
@@ -3174,6 +3188,27 @@ fn audit_final_suggestions_impl(
             restrict_to_relation_columns,
             Some(db),
             expr_keyword_ctx,
+        )
+    };
+    let signature_argument_suggestions = if !crate::sql_text::mysql_compatibility_for_sql(
+        "",
+        Some(db),
+    ) {
+        SqlEditorWidget::cached_signature_named_argument_suggestions(
+            &data,
+            s.get(..cursor).unwrap_or(&s),
+            &prefix,
+        )
+    } else {
+        Vec::new()
+    };
+    let suggestions = if signature_argument_suggestions.is_empty() {
+        suggestions
+    } else {
+        SqlEditorWidget::merge_suggestions_with_context_aliases(
+            suggestions,
+            signature_argument_suggestions,
+            true,
         )
     };
     let allow_dml_returning_into_keyword =
@@ -8032,6 +8067,45 @@ fn fast_path_prefix_preserves_quoted_identifier_body() {
 }
 
 #[test]
+fn fast_path_reanalyzes_when_prefix_crosses_qualifier_dot() {
+    assert!(
+        SqlEditorWidget::fast_path_requires_full_analysis_after_qualifier_transition(
+            "DBMS_OUTPUT.P",
+            true,
+            Some('P'),
+        )
+    );
+    assert!(
+        SqlEditorWidget::fast_path_requires_full_analysis_after_qualifier_transition(
+            r#""SYSTEM"."OQT_DEEP_PKG".P"#,
+            true,
+            Some('P'),
+        )
+    );
+    assert!(
+        !SqlEditorWidget::fast_path_requires_full_analysis_after_qualifier_transition(
+            "PUT",
+            true,
+            Some('T'),
+        )
+    );
+    assert!(
+        !SqlEditorWidget::fast_path_requires_full_analysis_after_qualifier_transition(
+            r#""DBMS.OUTPUT"#,
+            true,
+            Some('T'),
+        )
+    );
+    assert!(
+        !SqlEditorWidget::fast_path_requires_full_analysis_after_qualifier_transition(
+            "DBMS_OUTPUT.P",
+            false,
+            Some('P'),
+        )
+    );
+}
+
+#[test]
 fn condition_comparison_suffix_ignores_bracket_identifier_dots() {
     assert_eq!(
         SqlEditorWidget::condition_comparison_completion_suffix("[Order.Detail] = 1"),
@@ -8055,6 +8129,22 @@ fn auto_trigger_forced_char_requires_qualifier_or_two_chars() {
     assert!(SqlEditorWidget::should_auto_trigger_intellisense_for_forced_char("ab", None));
     assert!(SqlEditorWidget::should_auto_trigger_intellisense_for_forced_char("한글", None));
     assert!(SqlEditorWidget::should_auto_trigger_intellisense_for_forced_char("", Some("t")));
+}
+
+#[test]
+fn auto_trigger_identifier_char_allows_one_char_after_qualifier() {
+    assert!(!SqlEditorWidget::should_auto_trigger_intellisense_for_identifier_char(
+        "p",
+        None,
+    ));
+    assert!(SqlEditorWidget::should_auto_trigger_intellisense_for_identifier_char(
+        "pu",
+        None,
+    ));
+    assert!(SqlEditorWidget::should_auto_trigger_intellisense_for_identifier_char(
+        "p",
+        Some("DBMS_OUTPUT"),
+    ));
 }
 
 #[test]
@@ -27164,6 +27254,7 @@ fn collect_expected_keyword_suggestions_include_ddl_object_type_tokens() {
         SqlEditorWidget::collect_expected_keyword_suggestions("", &create_synonym_name_ctx, None);
 
     assert!(create_suggestions.iter().any(|value| value == "EDITIONING"));
+    assert!(create_suggestions.iter().any(|value| value == "FORCE"));
     for value in [
         "DIRECTORY",
         "TABLESPACE",
@@ -27189,6 +27280,9 @@ fn collect_expected_keyword_suggestions_include_ddl_object_type_tokens() {
     assert!(create_or_replace_suggestions
         .iter()
         .any(|value| value == "INDEX"));
+    assert!(create_or_replace_suggestions
+        .iter()
+        .any(|value| value == "FORCE"));
     assert!(create_or_replace_suggestions
         .iter()
         .any(|value| value == "EDITIONING"));
@@ -48054,8 +48148,10 @@ fn broad_keyword_grammar_slots_complete_with_empty_and_two_letter_prefixes() {
     ] {
         assert_keyword("CREATE |", keyword, Oracle);
     }
+    assert_keyword("CREATE |", "FORCE", Oracle);
     assert_keyword("CREATE OR |", "REPLACE", Oracle);
     for keyword in [
+        "FORCE",
         "TABLE",
         "VIEW",
         "PACKAGE",
@@ -48066,6 +48162,10 @@ fn broad_keyword_grammar_slots_complete_with_empty_and_two_letter_prefixes() {
     ] {
         assert_keyword("CREATE OR REPLACE |", keyword, Oracle);
     }
+    for keyword in ["NONEDITIONABLE", "EDITIONABLE", "EDITIONING", "VIEW"] {
+        assert_keyword("CREATE OR REPLACE FORCE |", keyword, Oracle);
+    }
+    assert_keyword("CREATE OR REPLACE FORCE NONEDITIONABLE |", "VIEW", Oracle);
     for keyword in ["TABLE", "SESSION", "SYSTEM", "USER", "INDEX"] {
         assert_keyword("ALTER |", keyword, Oracle);
     }
@@ -48885,6 +48985,11 @@ fn statement_structural_keyword_slots_complete_with_empty_and_two_letter_prefixe
             "NOCYCLE",
             "ORDER",
             "NOORDER",
+            "KEEP",
+            "NOKEEP",
+            "SCALE",
+            "NOSCALE",
+            "GLOBAL",
         ],
         Oracle,
     );
@@ -53002,8 +53107,21 @@ fn create_sequence_option_list_offers_only_remaining_options() {
             && has(&start, "INCREMENT BY")
             && has(&start, "CACHE")
             && has(&start, "CYCLE")
-            && has(&start, "ORDER"),
+            && has(&start, "ORDER")
+            && has(&start, "NOKEEP")
+            && has(&start, "NOSCALE")
+            && has(&start, "GLOBAL"),
         "start option list incomplete: {start:?}"
+    );
+    let qualified_start = kw(r#"CREATE SEQUENCE "SYSTEM"."MVIEW$_ADVSEQ_GENERIC" |"#);
+    assert!(
+        has(&qualified_start, "CACHE")
+            && has(&qualified_start, "NOORDER")
+            && has(&qualified_start, "NOCYCLE")
+            && has(&qualified_start, "NOKEEP")
+            && has(&qualified_start, "NOSCALE")
+            && has(&qualified_start, "GLOBAL"),
+        "qualified sequence option list incomplete: {qualified_start:?}"
     );
 
     // After a complete value-bearing option, the used one is gone; the rest remain.
@@ -53028,6 +53146,22 @@ fn create_sequence_option_list_offers_only_remaining_options() {
     // A bare option (NOCACHE) is also single-use and a boundary.
     assert!(!has(&kw("CREATE SEQUENCE seq NOCACHE |"), "CACHE"));
     assert!(!has(&kw("CREATE SEQUENCE seq NOCACHE |"), "NOCACHE"));
+    assert!(!has(&kw("CREATE SEQUENCE seq NOKEEP |"), "KEEP"));
+    assert!(!has(&kw("CREATE SEQUENCE seq NOKEEP |"), "NOKEEP"));
+    assert!(!has(&kw("CREATE SEQUENCE seq NOSCALE |"), "SCALE"));
+    assert!(!has(&kw("CREATE SEQUENCE seq NOSCALE |"), "NOSCALE"));
+    assert!(!has(&kw("CREATE SEQUENCE seq GLOBAL |"), "GLOBAL"));
+    assert!(!has(&kw("CREATE SEQUENCE seq GLOBAL |"), "SESSION"));
+
+    let after_user_options = kw(
+        r#"CREATE SEQUENCE "SYSTEM"."MVIEW$_ADVSEQ_GENERIC" CACHE 50 NOORDER NOCYCLE NOKEEP NOSCALE GLOBAL |"#,
+    );
+    for used in ["CACHE", "NOORDER", "NOCYCLE", "NOKEEP", "NOSCALE", "GLOBAL"] {
+        assert!(
+            !has(&after_user_options, used),
+            "`{used}` re-offered after user sequence options: {after_user_options:?}"
+        );
+    }
 
     // No predicate-operator or table-catalog noise at the boundaries (the regression).
     for sql in [
@@ -75182,6 +75316,48 @@ fn comment_on_column_final_suggestions_use_qualified_relation_columns() {
     }
 }
 
+#[test]
+fn oracle_package_routine_parameter_type_tails_offer_default() {
+    use crate::db::DatabaseType::Oracle;
+
+    let has = |values: &[String], needle: &str| {
+        values.iter().any(|value| value.eq_ignore_ascii_case(needle))
+    };
+    let package_sql = |param: &str| {
+        format!(
+            "CREATE OR REPLACE NONEDITIONABLE PACKAGE \"SYSTEM\".\"OQT_DEEP_PKG\" AS
+  TYPE t_rc IS REF CURSOR;
+  PROCEDURE p_deep_run({param});
+END oqt_deep_pkg;"
+        )
+    };
+
+    for param in [
+        "p_limit IN NUMBER |",
+        "p_limit NUMBER |",
+        "p_limit IN NUMBER def|",
+    ] {
+        let suggestions = query_keyword_completion_suggestions(&package_sql(param), Oracle);
+        assert!(
+            has(&suggestions, "DEFAULT"),
+            "DEFAULT missing after routine IN parameter type `{param}`: {suggestions:?}"
+        );
+    }
+
+    for param in [
+        "p_limit OUT NUMBER |",
+        "p_limit IN OUT NUMBER |",
+        "p_limit IN NUMBER DEFAULT |",
+        "p_limit IN NUMBER := |",
+    ] {
+        let suggestions = query_keyword_completion_suggestions(&package_sql(param), Oracle);
+        assert!(
+            !has(&suggestions, "DEFAULT"),
+            "DEFAULT wrongly offered at routine parameter tail `{param}`: {suggestions:?}"
+        );
+    }
+}
+
 
 
 
@@ -77206,8 +77382,29 @@ fn create_statement_keyword_matrix_offers_expected_keywords_across_dialects() {
         (
             Oracle,
             "CREATE OR REPLACE |",
-            &["VIEW", "PROCEDURE", "FUNCTION", "PACKAGE", "TRIGGER", "TYPE", "SYNONYM"],
+            &[
+                "FORCE",
+                "VIEW",
+                "PROCEDURE",
+                "FUNCTION",
+                "PACKAGE",
+                "TRIGGER",
+                "TYPE",
+                "SYNONYM",
+            ],
             &[],
+        ),
+        (
+            Oracle,
+            "CREATE OR REPLACE FORCE |",
+            &["NONEDITIONABLE", "EDITIONABLE", "EDITIONING", "VIEW"],
+            &["TABLE", "PACKAGE"],
+        ),
+        (
+            Oracle,
+            "CREATE OR REPLACE FORCE NONEDITIONABLE |",
+            &["VIEW"],
+            &["TABLE", "PACKAGE"],
         ),
         (Oracle, "CREATE MATERIALIZED |", &["VIEW"], &["TABLE"]),
         (Oracle, "CREATE MATERIALIZED VIEW LOG |", &["ON"], &["AS"]),
@@ -77233,7 +77430,19 @@ fn create_statement_keyword_matrix_offers_expected_keywords_across_dialects() {
         (
             Oracle,
             "CREATE SEQUENCE seq |",
-            &["START WITH", "INCREMENT BY", "MINVALUE", "MAXVALUE", "CACHE", "NOCACHE"],
+            &[
+                "START WITH",
+                "INCREMENT BY",
+                "MINVALUE",
+                "MAXVALUE",
+                "CACHE",
+                "NOCACHE",
+                "NOORDER",
+                "NOCYCLE",
+                "NOKEEP",
+                "NOSCALE",
+                "GLOBAL",
+            ],
             &["WHERE"],
         ),
         (
@@ -77515,6 +77724,37 @@ fn plsql_declaration_type_slot_bulk_matrix_offers_all_known_types() {
 }
 
 #[test]
+fn plsql_qualified_quoted_routine_parameter_slots_offer_modes_and_types() {
+    use crate::db::DatabaseType::Oracle;
+    let has = |s: &[String], k: &str| s.iter().any(|x| x.eq_ignore_ascii_case(k));
+    let mut failures = Vec::new();
+
+    let mode_suggestions = query_keyword_completion_suggestions(
+        r#"CREATE OR REPLACE NONEDITIONABLE PROCEDURE "SYSTEM"."GET_HELP" (p_cursor |) AS BEGIN NULL; END;"#,
+        Oracle,
+    );
+    if !has(&mode_suggestions, "OUT") {
+        failures.push(format!("`OUT` missing in qualified quoted parameter mode slot: {mode_suggestions:?}"));
+    }
+
+    let type_suggestions = query_keyword_completion_suggestions(
+        r#"CREATE OR REPLACE NONEDITIONABLE PROCEDURE "SYSTEM"."GET_HELP" (p_cursor OUT sys|) AS BEGIN NULL; END;"#,
+        Oracle,
+    );
+    if !has(&type_suggestions, "SYS_REFCURSOR") {
+        failures.push(format!(
+            "`SYS_REFCURSOR` missing in qualified quoted OUT parameter type slot: {type_suggestions:?}"
+        ));
+    }
+
+    assert!(
+        failures.is_empty(),
+        "Qualified quoted routine parameter completion gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
 fn plsql_create_or_replace_editionable_offers_object_types() {
     use crate::db::DatabaseType::Oracle;
     let has = |s: &[String], k: &str| s.iter().any(|x| x.eq_ignore_ascii_case(k));
@@ -77640,6 +77880,7 @@ fn plsql_named_object_end_offers_enclosing_name() {
         ("package body", "CREATE PACKAGE BODY oqt_deep_pkg IS PROCEDURE p IS BEGIN NULL; END; END __CODEX_CURSOR__;", Some("oqt_deep_pkg")),
         ("package spec", "CREATE PACKAGE oqt_deep_pkg IS PROCEDURE p; END __CODEX_CURSOR__;", Some("oqt_deep_pkg")),
         ("procedure", "CREATE PROCEDURE p_deep IS BEGIN NULL; END __CODEX_CURSOR__;", Some("p_deep")),
+        ("qualified quoted procedure", r#"CREATE OR REPLACE NONEDITIONABLE PROCEDURE "SYSTEM"."QT_SPLIT_PROC" IS BEGIN NULL; END __CODEX_CURSOR__;"#, Some("QT_SPLIT_PROC")),
         ("function", "CREATE FUNCTION f_deep RETURN NUMBER IS BEGIN RETURN 1; END __CODEX_CURSOR__;", Some("f_deep")),
         ("type body", "CREATE TYPE BODY ty_deep IS MEMBER PROCEDURE p IS BEGIN NULL; END; END __CODEX_CURSOR__;", Some("ty_deep")),
         ("nested local procedure", "CREATE PACKAGE BODY oqt_deep_pkg IS PROCEDURE inner_p IS BEGIN NULL; END __CODEX_CURSOR__; END oqt_deep_pkg;", Some("inner_p")),
@@ -77948,6 +78189,17 @@ fn oracle_builtin_package_qualifier_offers_member_routines() {
         ("SELECT dbms_lob.getl|(c) FROM t1", "GETLENGTH"),
         ("BEGIN EXECUTE IMMEDIATE dbms_metadata.| END;", "GET_DDL"),
         ("CREATE PROCEDURE p IS BEGIN dbms_application_info.set| END;", "SET_MODULE"),
+        (
+            r#"CREATE OR REPLACE NONEDITIONABLE PACKAGE BODY "SYSTEM"."OQT_DEEP_PKG" AS
+  PROCEDURE log_msg(p_tag IN VARCHAR2, p_msg IN VARCHAR2, p_depth IN NUMBER) IS
+  BEGIN
+    INSERT INTO oqt_t_log(log_id, tag, msg, depth)
+    VALUES (oqt_seq_log.NEXTVAL, SUBSTR(p_tag,1,30), SUBSTR(p_msg,1,4000), p_depth);
+    DBMS_OUTPUT.PU|
+  END;
+END;"#,
+            "PUT_LINE",
+        ),
     ] {
         let (_kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
         assert!(
@@ -78032,11 +78284,18 @@ fn schemas_are_offered_as_expression_qualifier_heads() {
     for sql in [
         "BEGIN v := sco| END;",
         "DECLARE v NUMBER; BEGIN v := app_us| END;",
+        "VAR v_result CLOB\nDECLARE\n  v_p_user_id NUMBER := 0;\nBEGIN\n  :v_result := syst|\nEND;",
         "BEGIN IF sco| THEN NULL; END IF; END;",
         "BEGIN dbms_output.put_line(sco|); END;",
     ] {
         let (_kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
-        let expected = if sql.contains("app_us") { "APP_USER" } else { "SCOTT" };
+        let expected = if sql.contains("app_us") {
+            "APP_USER"
+        } else if sql.contains("syst") {
+            "SYSTEM"
+        } else {
+            "SCOTT"
+        };
         assert!(
             contains(&final_suggestions, expected),
             "schema {expected} missing at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
@@ -78064,6 +78323,32 @@ fn schemas_are_offered_as_expression_qualifier_heads() {
     assert!(
         !contains(&after_operand, "SCOTT"),
         "schema offered right after a complete operand: {after_operand:?}"
+    );
+}
+
+#[test]
+fn cached_signature_arguments_are_offered_as_named_call_parameters() {
+    use crate::db::DatabaseType::Oracle;
+    let contains = |values: &[String], needle: &str| {
+        values.iter().any(|value| value.eq_ignore_ascii_case(needle))
+    };
+
+    let (_kind, keywords, final_suggestions) = audit_final_suggestions_for(
+        "VAR v_result CLOB\nDECLARE\n  v_p_user_id NUMBER := 0;\nBEGIN\n  :v_result := SYSTEM.QT_SPLIT_FN(\n    P_|\n  );\nEND;",
+        Oracle,
+    );
+    assert!(
+        contains(&final_suggestions, "P_USER_ID"),
+        "signature argument missing in named-argument slot: keywords={keywords:?} final={final_suggestions:?}"
+    );
+
+    let (_kind, _keywords, value_slot) = audit_final_suggestions_for(
+        "VAR v_result CLOB\nDECLARE\n  v_p_user_id NUMBER := 0;\nBEGIN\n  :v_result := SYSTEM.QT_SPLIT_FN(\n    P_USER_ID => |\n  );\nEND;",
+        Oracle,
+    );
+    assert!(
+        !contains(&value_slot, "P_USER_ID"),
+        "signature argument leaked into named-argument value slot: {value_slot:?}"
     );
 }
 
@@ -78128,6 +78413,26 @@ fn plsql_named_end_completion_works_through_full_pipeline() {
         ("CREATE PACKAGE BODY pkg IS PROCEDURE p IS BEGIN NULL; END p; END |", "pkg"),
         ("CREATE PACKAGE BODY pkg IS PROCEDURE p IS BEGIN NULL; END |; END;", "p"),
         ("CREATE PROCEDURE prc IS BEGIN NULL; END |", "prc"),
+        (r#"CREATE OR REPLACE NONEDITIONABLE PROCEDURE "SYSTEM"."QT_SPLIT_PROC"
+(
+    p_status IN VARCHAR2,
+    p_rc     OUT SYS_REFCURSOR
+)
+IS
+BEGIN
+    OPEN p_rc FOR
+        SELECT
+            CASE
+                WHEN v.NOTE_PREVIEW LIKE '%;%' THEN 'HAS_SEMI'
+                WHEN v.note_preview LIKE '%/%' THEN 'HAS_SLASH'
+                ELSE 'PLAIN'
+            END AS note_kind
+        FROM QT_SPLIT_V v
+        WHERE v.STATUS_CD = p_status
+        ORDER BY v.user_id;
+END |;
+/"#, "QT_SPLIT_PROC"),
+        (r#"CREATE OR REPLACE NONEDITIONABLE PROCEDURE "SYSTEM"."QT_SPLIT_PROC" IS BEGIN NULL; END qt|"#, "QT_SPLIT_PROC"),
         ("CREATE PACKAGE pkg2 IS PROCEDURE p; END |", "pkg2"),
         ("CREATE PACKAGE BODY pkg IS PROCEDURE a IS BEGIN NULL; END a; PROCEDURE b IS BEGIN NULL; END |", "b"),
         ("CREATE PACKAGE BODY pkg IS PROCEDURE p IS BEGIN NULL; END p; END pk|", "pkg"),
@@ -78159,6 +78464,7 @@ fn plsql_end_space_auto_trigger_is_slot_precise() {
     for script in [
         "CREATE PACKAGE BODY pkg IS PROCEDURE p IS BEGIN NULL; END |",
         "CREATE PROCEDURE prc IS BEGIN NULL; END |",
+        r#"CREATE OR REPLACE NONEDITIONABLE PROCEDURE "SYSTEM"."QT_SPLIT_PROC" IS BEGIN NULL; END |"#,
         "CREATE PACKAGE pkg2 IS PROCEDURE p; END |",
         "BEGIN IF a = 1 THEN NULL; END |",
         "BEGIN LOOP NULL; END | END;",
