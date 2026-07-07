@@ -626,10 +626,12 @@ impl SqlEditorWidget {
         has_selected && matches!(key, Key::Tab | Key::Enter | Key::KPEnter)
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn should_handle_enter_during_ime_composition(compose_state: i32) -> bool {
         compose_state > 0
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn selection_is_current_ime_marked_range(
         selection: Option<(i32, i32)>,
         caret: i32,
@@ -654,6 +656,7 @@ impl SqlEditorWidget {
         end == caret && start == caret.saturating_sub(compose_state)
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn selection_is_user_replacement_range(
         selection: Option<(i32, i32)>,
         caret: i32,
@@ -665,6 +668,7 @@ impl SqlEditorWidget {
         start != end && !Self::selection_is_current_ime_marked_range(selection, caret, compose_state)
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn key_may_change_cursor_or_selection(
         key: Key,
         shortcut_key: Key,
@@ -677,6 +681,7 @@ impl SqlEditorWidget {
         ) || (ctrl_or_cmd && Self::matches_alpha_shortcut(shortcut_key, 'a'))
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn ime_user_selection_replacement_text(
         event_text: &str,
         replaced_marked_text: &str,
@@ -691,6 +696,7 @@ impl SqlEditorWidget {
         }
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn reset_ime_composition_state() {
         #[cfg(target_os = "macos")]
         {
@@ -702,6 +708,7 @@ impl SqlEditorWidget {
         }
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn ime_enter_committed_text(event_text: &str, marked_text: &str) -> String {
         let committed = event_text
             .chars()
@@ -714,6 +721,7 @@ impl SqlEditorWidget {
         }
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn handle_ime_enter_auto_indent(
         editor: &mut TextEditor,
         buffer: &mut TextBuffer,

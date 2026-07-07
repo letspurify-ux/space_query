@@ -360,16 +360,16 @@ fn sql_editor_alert_calls_use_wrapper_function() {
         "legacy per-alert recursive retry helper should not remain"
     );
     assert_eq!(
-        mod_src.matches("fltk::dialog::alert_default(").count(),
+        mod_src.matches("crate::ui::alert_on_main(").count(),
         1,
-        "mod.rs should call fltk::dialog::alert_default only inside queue drain"
+        "mod.rs should call crate::ui::alert_on_main only inside queue drain"
     );
 
     let file_checks = [("execution.rs", include_str!("execution.rs"))];
 
     for (name, source) in file_checks {
         assert_eq!(
-            source.matches("fltk::dialog::alert_default(").count(),
+            source.matches("crate::ui::alert_on_main(").count(),
             0,
             "{name} should route alerts through SqlEditorWidget::show_alert_dialog"
         );

@@ -48,6 +48,7 @@ enum EnterKeyupSuppression {
     None,
     PopupConfirm,
     CtrlEnterExecute,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     ImeCompositionEnter,
 }
 

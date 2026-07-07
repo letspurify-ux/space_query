@@ -1736,7 +1736,7 @@ impl ObjectBrowserWidget {
                         previous_scope.as_deref(),
                     );
                     Self::emit_status_callback(&status_callback, &err);
-                    fltk::dialog::alert_default(&err);
+                    crate::ui::alert_on_main(&err);
                     return;
                 }
                 if scope_switch_in_progress.swap(true, Ordering::AcqRel) {
@@ -2184,7 +2184,7 @@ impl ObjectBrowserWidget {
                                 );
                             }
                             Err(err) => {
-                                fltk::dialog::alert_default(&format!(
+                                crate::ui::alert_on_main(&format!(
                                     "Failed to get table structure: {}",
                                     err
                                 ));
@@ -2203,7 +2203,7 @@ impl ObjectBrowserWidget {
                                 );
                             }
                             Err(err) => {
-                                fltk::dialog::alert_default(&format!(
+                                crate::ui::alert_on_main(&format!(
                                     "Failed to get indexes: {}",
                                     err
                                 ));
@@ -2223,7 +2223,7 @@ impl ObjectBrowserWidget {
                                 );
                             }
                             Err(err) => {
-                                fltk::dialog::alert_default(&format!(
+                                crate::ui::alert_on_main(&format!(
                                     "Failed to get constraints: {}",
                                     err
                                 ));
@@ -2241,7 +2241,7 @@ impl ObjectBrowserWidget {
                                 );
                             }
                             Err(err) => {
-                                fltk::dialog::alert_default(&format!(
+                                crate::ui::alert_on_main(&format!(
                                     "Failed to get sequence info: {}",
                                     err
                                 ));
@@ -2259,7 +2259,7 @@ impl ObjectBrowserWidget {
                                 );
                             }
                             Err(err) => {
-                                fltk::dialog::alert_default(&format!(
+                                crate::ui::alert_on_main(&format!(
                                     "Failed to get synonym info: {}",
                                     err
                                 ));
@@ -2273,7 +2273,7 @@ impl ObjectBrowserWidget {
                                 );
                             }
                             Err(err) => {
-                                fltk::dialog::alert_default(&format!(
+                                crate::ui::alert_on_main(&format!(
                                     "Failed to generate DDL: {}",
                                     err
                                 ));
@@ -2288,7 +2288,7 @@ impl ObjectBrowserWidget {
                             let sql = match result {
                                 Ok(sql) => Some(sql),
                                 Err(err) => {
-                                    fltk::dialog::alert_default(&format!(
+                                    crate::ui::alert_on_main(&format!(
                                         "Failed to load routine arguments: {}",
                                         err
                                     ));
@@ -2353,7 +2353,7 @@ impl ObjectBrowserWidget {
                                     tree.redraw();
                                 }
                                 Err(err) => {
-                                    fltk::dialog::alert_default(&format!(
+                                    crate::ui::alert_on_main(&format!(
                                         "Failed to load package routines: {}",
                                         err
                                     ));
@@ -2463,7 +2463,7 @@ impl ObjectBrowserWidget {
                                         &status_callback,
                                         &err,
                                     );
-                                    fltk::dialog::alert_default(
+                                    crate::ui::alert_on_main(
                                         &ObjectBrowserWidget::scope_switch_failure_message(
                                             db_type,
                                             &target_scope,
@@ -2497,7 +2497,7 @@ impl ObjectBrowserWidget {
                                 );
                             }
                             Err(err) => {
-                                fltk::dialog::alert_default(&format!(
+                                crate::ui::alert_on_main(&format!(
                                     "Failed to check compilation status: {}",
                                     err
                                 ));

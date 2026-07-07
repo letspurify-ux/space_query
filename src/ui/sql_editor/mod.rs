@@ -2072,7 +2072,7 @@ impl SqlEditorWidget {
             return;
         };
 
-        fltk::dialog::alert_default(&message);
+        crate::ui::alert_on_main(&message);
 
         if should_continue {
             Self::schedule_alert_pump(0.0);
@@ -2672,7 +2672,7 @@ impl SqlEditorWidget {
             RetainedSessionResolutionAction::Commit,
         );
         let result = if transaction_action_allowed {
-            let choice = fltk::dialog::choice2_default(
+            let choice = crate::ui::choice2_on_main(
                 &format!(
                     "This tab has a cancelled statement with an uncertain transaction state.\nResolve it before {}.",
                     action_verb
@@ -2683,7 +2683,7 @@ impl SqlEditorWidget {
             );
             match choice {
                 Some(1) => {
-                    let decision = fltk::dialog::choice2_default(
+                    let decision = crate::ui::choice2_on_main(
                         "Choose how to resolve the retained transaction.",
                         "Cancel",
                         "Commit",
@@ -2699,7 +2699,7 @@ impl SqlEditorWidget {
                 _ => return false,
             }
         } else {
-            let choice = fltk::dialog::choice2_default(
+            let choice = crate::ui::choice2_on_main(
                 &format!(
                     "This tab has a {} DB session that commit/rollback cannot resolve.\nDiscard it before {}.",
                     retained_state.label(),
@@ -3311,7 +3311,7 @@ impl SqlEditorWidget {
                             } => match result {
                                 Ok(QuickDescribeData::TableColumns(columns)) => {
                                     if columns.is_empty() {
-                                        fltk::dialog::message_default(&format!(
+                                        crate::ui::message_on_main(&format!(
                                             "No table or view found with name: {}",
                                             object_name.to_uppercase()
                                         ));
@@ -3349,7 +3349,7 @@ impl SqlEditorWidget {
                                             "Not connected to database",
                                         );
                                     } else {
-                                        fltk::dialog::message_default(&format!(
+                                        crate::ui::message_on_main(&format!(
                                             "Object not found or not accessible: {} ({})",
                                             object_name.to_uppercase(),
                                             err
@@ -3638,7 +3638,30 @@ impl SqlEditorWidget {
 
     #[cfg(test)]
     fn build_explain_plan_result_request(plan_text: &str) -> ResultTabRequest {
-        Self::build_text_result_request("Explain Plan", plan_text, "Explain plan loaded")
+        let rows = if plan_text.is_empty() {
+            Vec::new()
+        } else {
+            plan_text
+                .lines()
+                .map(|line| vec![line.to_string()])
+                .collect()
+        };
+        ResultTabRequest {
+            label: "Explain Plan".to_string(),
+            result: QueryResult {
+                sql: String::new(),
+                columns: vec![ColumnInfo {
+                    name: "Text".to_string(),
+                    data_type: "VARCHAR2".to_string(),
+                }],
+                row_count: rows.len(),
+                rows,
+                execution_time: Duration::from_secs(0),
+                message: "Explain plan loaded".to_string(),
+                is_select: true,
+                success: true,
+            },
+        }
     }
 
     fn build_quick_describe_result_request(
@@ -6339,18 +6362,18 @@ mod explain_plan_tests {
     }
 
     #[test]
-    fn build_explain_plan_result_keeps_line_column() {
+    fn build_explain_plan_result_uses_text_column_only() {
         let result = SqlEditorWidget::build_explain_plan_result_request(
             "Plan hash value: 1\nTABLE ACCESS FULL",
         );
 
-        assert_eq!(result.result.columns[0].name, "Line");
-        assert_eq!(result.result.columns[1].name, "Text");
+        assert_eq!(result.result.columns.len(), 1);
+        assert_eq!(result.result.columns[0].name, "Text");
         assert_eq!(
             result.result.rows,
             vec![
-                vec!["1".to_string(), "Plan hash value: 1".to_string()],
-                vec!["2".to_string(), "TABLE ACCESS FULL".to_string()],
+                vec!["Plan hash value: 1".to_string()],
+                vec!["TABLE ACCESS FULL".to_string()],
             ]
         );
     }

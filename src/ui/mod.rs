@@ -20,7 +20,16 @@ pub mod syntax_highlight;
 pub(crate) mod text_buffer_access;
 pub mod theme;
 
-use fltk::{app, prelude::WidgetExt, window::Window};
+use fltk::{
+    app,
+    button::Button,
+    enums::{Align, CallbackTrigger, Event, FrameType, Key},
+    frame::Frame,
+    group::{Flex, FlexType},
+    input::Input,
+    prelude::*,
+    window::Window,
+};
 
 use crate::utils::arithmetic::safe_div;
 
@@ -72,6 +81,315 @@ pub fn center_on_main(window: &mut Window) {
         )
     };
     window.set_pos(x, y);
+}
+
+fn dialog_prompt_height(text: &str) -> i32 {
+    let line_count = text.lines().count().max(1) as i32;
+    (line_count * 22 + 16).clamp(56, 140)
+}
+
+fn dialog_button_width(label: &str) -> i32 {
+    let text_width = label.chars().count() as i32 * 8 + 28;
+    text_width.clamp(constants::BUTTON_WIDTH, 180)
+}
+
+fn finish_modal_dialog(dialog: Window) {
+    while dialog.shown() {
+        app::wait();
+    }
+
+    Window::delete(dialog);
+}
+
+fn choice2_on_main_with_title(title: &str, txt: &str, b0: &str, b1: &str, b2: &str) -> Option<i32> {
+    let choices = [(2, b2), (1, b1), (0, b0)]
+        .into_iter()
+        .filter(|(_, label)| !label.is_empty())
+        .collect::<Vec<_>>();
+
+    let current_group = fltk::group::Group::try_current();
+    fltk::group::Group::set_current(None::<&fltk::group::Group>);
+
+    let width = 520;
+    let prompt_height = dialog_prompt_height(txt);
+    let height = constants::DIALOG_MARGIN * 2
+        + prompt_height
+        + constants::DIALOG_SPACING
+        + constants::BUTTON_ROW_HEIGHT;
+    let mut dialog = Window::default().with_size(width, height).with_label(title);
+    center_on_main(&mut dialog);
+    dialog.set_color(theme::panel_raised());
+    dialog.make_modal(true);
+
+    let mut main_flex = Flex::default()
+        .with_pos(constants::DIALOG_MARGIN, constants::DIALOG_MARGIN)
+        .with_size(
+            width - constants::DIALOG_MARGIN * 2,
+            height - constants::DIALOG_MARGIN * 2,
+        );
+    main_flex.set_type(FlexType::Column);
+    main_flex.set_spacing(constants::DIALOG_SPACING);
+
+    let mut prompt_frame = Frame::default().with_label(txt);
+    prompt_frame.set_label_color(theme::text_primary());
+    prompt_frame.set_align(Align::Left | Align::Inside | Align::Wrap);
+    main_flex.fixed(&prompt_frame, prompt_height);
+
+    let mut button_flex = Flex::default();
+    button_flex.set_type(FlexType::Row);
+    button_flex.set_spacing(constants::DIALOG_SPACING);
+
+    let _spacer = Frame::default();
+
+    let result = std::sync::Arc::new(std::sync::Mutex::new(None::<i32>));
+    let mut buttons = Vec::new();
+    for (choice_index, label) in choices {
+        let mut button = Button::default()
+            .with_size(dialog_button_width(label), constants::BUTTON_HEIGHT)
+            .with_label(label);
+        button.set_color(if choice_index == 0 {
+            theme::button_cancel()
+        } else if choice_index == 1 {
+            theme::button_primary()
+        } else {
+            theme::button_secondary()
+        });
+        button.set_label_color(theme::text_primary());
+        button.set_frame(FrameType::RFlatBox);
+
+        let result_for_button = result.clone();
+        let mut dialog_for_button = dialog.clone();
+        button.set_callback(move |_| {
+            *result_for_button
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(choice_index);
+            dialog_for_button.hide();
+            app::awake();
+        });
+
+        let button_width = button.width();
+        button_flex.fixed(&button, button_width);
+        buttons.push((choice_index, button));
+    }
+    button_flex.end();
+    main_flex.fixed(&button_flex, constants::BUTTON_ROW_HEIGHT);
+    main_flex.end();
+    dialog.end();
+    fltk::group::Group::set_current(current_group.as_ref());
+
+    {
+        let result = result.clone();
+        dialog.set_callback(move |window| {
+            *result
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            window.hide();
+            app::awake();
+        });
+    }
+
+    {
+        let result = result.clone();
+        let default_choice = if buttons.iter().any(|(index, _)| *index == 1) {
+            Some(1)
+        } else if buttons.iter().any(|(index, _)| *index == 0) {
+            Some(0)
+        } else {
+            buttons.first().map(|(index, _)| *index)
+        };
+        dialog.handle(move |window, event| match event {
+            Event::KeyDown if matches!(app::event_key(), Key::Enter | Key::KPEnter) => {
+                *result
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = default_choice;
+                window.hide();
+                app::awake();
+                true
+            }
+            Event::KeyDown if app::event_key() == Key::Escape => {
+                *result
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                window.hide();
+                app::awake();
+                true
+            }
+            _ => false,
+        });
+    }
+
+    dialog.show();
+    let focus_button_index = buttons
+        .iter()
+        .position(|(index, _)| *index == 1)
+        .or_else(|| (!buttons.is_empty()).then_some(0));
+    if let Some(index) = focus_button_index {
+        buttons[index].1.take_focus().ok();
+    }
+
+    finish_modal_dialog(dialog);
+    let choice = *result
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    choice
+}
+
+pub fn alert_on_main(txt: &str) {
+    let _ = choice2_on_main_with_title("Alert", txt, "Close", "", "");
+}
+
+pub fn message_on_main(txt: &str) {
+    let _ = choice2_on_main_with_title("Message", txt, "Close", "", "");
+}
+
+pub fn choice2_on_main(txt: &str, b0: &str, b1: &str, b2: &str) -> Option<i32> {
+    choice2_on_main_with_title("Question", txt, b0, b1, b2)
+}
+
+pub fn input_on_main(txt: &str, deflt: &str) -> Option<String> {
+    let current_group = fltk::group::Group::try_current();
+    fltk::group::Group::set_current(None::<&fltk::group::Group>);
+
+    let width = 520;
+    let prompt_height = dialog_prompt_height(txt);
+    let height = constants::DIALOG_MARGIN * 2
+        + prompt_height
+        + constants::DIALOG_SPACING
+        + constants::INPUT_ROW_HEIGHT
+        + constants::DIALOG_SPACING
+        + constants::BUTTON_ROW_HEIGHT;
+    let mut dialog = Window::default()
+        .with_size(width, height)
+        .with_label("Input");
+    center_on_main(&mut dialog);
+    dialog.set_color(theme::panel_raised());
+    dialog.make_modal(true);
+
+    let mut main_flex = Flex::default()
+        .with_pos(constants::DIALOG_MARGIN, constants::DIALOG_MARGIN)
+        .with_size(
+            width - constants::DIALOG_MARGIN * 2,
+            height - constants::DIALOG_MARGIN * 2,
+        );
+    main_flex.set_type(FlexType::Column);
+    main_flex.set_spacing(constants::DIALOG_SPACING);
+
+    let mut prompt_frame = Frame::default().with_label(txt);
+    prompt_frame.set_label_color(theme::text_primary());
+    prompt_frame.set_align(Align::Left | Align::Inside | Align::Wrap);
+    main_flex.fixed(&prompt_frame, prompt_height);
+
+    let mut input = Input::default();
+    input.set_color(theme::input_bg());
+    input.set_text_color(theme::text_primary());
+    input.set_value(deflt);
+    input.set_trigger(CallbackTrigger::EnterKeyAlways);
+    main_flex.fixed(&input, constants::INPUT_ROW_HEIGHT);
+
+    let mut button_flex = Flex::default();
+    button_flex.set_type(FlexType::Row);
+    button_flex.set_spacing(constants::DIALOG_SPACING);
+
+    let _spacer = Frame::default();
+
+    let mut ok_btn = Button::default()
+        .with_size(constants::BUTTON_WIDTH, constants::BUTTON_HEIGHT)
+        .with_label("OK");
+    ok_btn.set_color(theme::button_primary());
+    ok_btn.set_label_color(theme::text_primary());
+    ok_btn.set_frame(FrameType::RFlatBox);
+
+    let mut cancel_btn = Button::default()
+        .with_size(constants::BUTTON_WIDTH, constants::BUTTON_HEIGHT)
+        .with_label("Cancel");
+    cancel_btn.set_color(theme::button_cancel());
+    cancel_btn.set_label_color(theme::text_primary());
+    cancel_btn.set_frame(FrameType::RFlatBox);
+
+    button_flex.fixed(&ok_btn, constants::BUTTON_WIDTH);
+    button_flex.fixed(&cancel_btn, constants::BUTTON_WIDTH);
+    button_flex.end();
+    main_flex.fixed(&button_flex, constants::BUTTON_ROW_HEIGHT);
+    main_flex.end();
+    dialog.end();
+    fltk::group::Group::set_current(current_group.as_ref());
+
+    let result = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+
+    {
+        let result = result.clone();
+        let mut dialog = dialog.clone();
+        let input = input.clone();
+        ok_btn.set_callback(move |_| {
+            *result
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(input.value());
+            dialog.hide();
+            app::awake();
+        });
+    }
+
+    {
+        let result = result.clone();
+        let mut dialog = dialog.clone();
+        let mut input_cb = input.clone();
+        let input_value = input.clone();
+        input_cb.set_callback(move |_| {
+            *result
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(input_value.value());
+            dialog.hide();
+            app::awake();
+        });
+    }
+
+    {
+        let result = result.clone();
+        let mut dialog = dialog.clone();
+        cancel_btn.set_callback(move |_| {
+            *result
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            dialog.hide();
+            app::awake();
+        });
+    }
+
+    {
+        let result = result.clone();
+        dialog.set_callback(move |window| {
+            *result
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            window.hide();
+            app::awake();
+        });
+    }
+
+    {
+        let result = result.clone();
+        dialog.handle(move |window, event| match event {
+            Event::KeyDown if app::event_key() == Key::Escape => {
+                *result
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                window.hide();
+                app::awake();
+                true
+            }
+            _ => false,
+        });
+    }
+
+    dialog.show();
+    input.take_focus().ok();
+
+    finish_modal_dialog(dialog);
+    let value = result
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    value
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

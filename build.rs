@@ -260,9 +260,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if target_os == "windows" {
-        if let Err(e) = embed_windows_icon() {
-            println!("cargo:warning=Failed to embed Windows icon resource: {}", e);
-        }
+        let _ = embed_windows_icon();
     }
 
     Ok(())

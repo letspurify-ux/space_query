@@ -513,17 +513,17 @@ impl FindReplaceDialog {
                                     .lock()
                                     .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                                     match_end.min(text.len()) as i32;
-                                fltk::dialog::message_default(
+                                crate::ui::message_on_main(
                                     "Reached end, searching from beginning...",
                                 );
                             } else {
                                 *search_pos
                                     .lock()
                                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = 0;
-                                fltk::dialog::message_default("Text not found");
+                                crate::ui::message_on_main("Text not found");
                             }
                         } else {
-                            fltk::dialog::message_default("Text not found");
+                            crate::ui::message_on_main("Text not found");
                         }
                     }
                     DialogMessage::Replace {
@@ -579,7 +579,7 @@ impl FindReplaceDialog {
                                 search_text.clone();
                         }
                         if search_text.is_empty() {
-                            fltk::dialog::message_default("Search text is empty");
+                            crate::ui::message_on_main("Search text is empty");
                             continue;
                         }
                         let text = buffer.text();
@@ -623,7 +623,7 @@ impl FindReplaceDialog {
                         *search_pos
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner()) = 0;
-                        fltk::dialog::message_default(&format!("Replaced {} occurrences", count));
+                        crate::ui::message_on_main(&format!("Replaced {} occurrences", count));
                     }
                     DialogMessage::Close => {
                         save_find_replace_state(

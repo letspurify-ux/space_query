@@ -264,7 +264,7 @@ impl LogViewerDialog {
                         detail_buffer.set_text("");
                     }
                     DialogMessage::ClearLog => {
-                        let choice = fltk::dialog::choice2_default(
+                        let choice = crate::ui::choice2_on_main(
                             "Are you sure you want to clear all application logs?",
                             "Cancel",
                             "Clear All",
@@ -286,7 +286,7 @@ impl LogViewerDialog {
                                     count_label.set_label("0 entries");
                                 }
                                 Err(err) => {
-                                    fltk::dialog::alert_default(&format!(
+                                    crate::ui::alert_on_main(&format!(
                                         "Failed to clear application log: {}",
                                         err
                                     ));
@@ -328,13 +328,13 @@ impl LogViewerDialog {
                             };
                             match std::fs::write(&path, output) {
                                 Ok(()) => {
-                                    fltk::dialog::message_default(&format!(
+                                    crate::ui::message_on_main(&format!(
                                         "Log exported to {}",
                                         path.display()
                                     ));
                                 }
                                 Err(err) => {
-                                    fltk::dialog::alert_default(&format!(
+                                    crate::ui::alert_on_main(&format!(
                                         "Failed to export log: {}",
                                         err
                                     ));

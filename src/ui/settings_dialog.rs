@@ -37,7 +37,7 @@ fn validate_size(label: &str, value: &str) -> Option<u32> {
     match value.trim().parse::<u32>() {
         Ok(size) if (8..=48).contains(&size) => Some(size),
         _ => {
-            fltk::dialog::alert_default(&format!(
+            crate::ui::alert_on_main(&format!(
                 "{} size must be a number between 8 and 48.",
                 label
             ));
@@ -50,7 +50,7 @@ fn validate_ui_size(value: &str) -> Option<u32> {
     match value.trim().parse::<u32>() {
         Ok(size) if (8..=24).contains(&size) => Some(size),
         _ => {
-            fltk::dialog::alert_default("Global UI size must be a number between 8 and 24.");
+            crate::ui::alert_on_main("Global UI size must be a number between 8 and 24.");
             None
         }
     }
@@ -65,7 +65,7 @@ fn validate_result_cell_max_chars(value: &str) -> Option<u32> {
             Some(size)
         }
         _ => {
-            fltk::dialog::alert_default(&format!(
+            crate::ui::alert_on_main(&format!(
                 "Cell preview max length must be a number between {} and {}.",
                 RESULT_CELL_MAX_DISPLAY_CHARS_MIN, RESULT_CELL_MAX_DISPLAY_CHARS_MAX
             ));
@@ -80,7 +80,7 @@ fn validate_lazy_fetch_batch_size(value: &str) -> Option<u32> {
             Some(size)
         }
         _ => {
-            fltk::dialog::alert_default(&format!(
+            crate::ui::alert_on_main(&format!(
                 "Lazy fetch size must be a number between {} and {}.",
                 MIN_LAZY_FETCH_BATCH_SIZE, MAX_LAZY_FETCH_BATCH_SIZE
             ));
@@ -95,7 +95,7 @@ fn validate_connection_pool_size(value: &str) -> Option<u32> {
             Some(size)
         }
         _ => {
-            fltk::dialog::alert_default(&format!(
+            crate::ui::alert_on_main(&format!(
                 "Connection pool size must be a number between {} and {}.",
                 MIN_CONNECTION_POOL_SIZE, MAX_CONNECTION_POOL_SIZE
             ));
@@ -112,7 +112,7 @@ fn validate_cancel_timeout_seconds(value: &str) -> Option<u32> {
             Some(seconds)
         }
         _ => {
-            fltk::dialog::alert_default(&format!(
+            crate::ui::alert_on_main(&format!(
                 "Cancel timeout must be a number between {} and {} seconds.",
                 MIN_CANCEL_TIMEOUT_SECONDS, MAX_CANCEL_TIMEOUT_SECONDS
             ));
@@ -247,6 +247,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     let mut selected_value = Frame::default();
     selected_value.set_label(&current_font);
     selected_value.set_label_color(theme::text_secondary());
+    selected_value.set_align(Align::Left | Align::Inside);
     selected_row.fixed(&selected_label, FORM_LABEL_WIDTH);
     selected_row.end();
     font_flex.fixed(&selected_row, CHECKBOX_ROW_HEIGHT);
@@ -261,8 +262,6 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     editor_size_input.set_value(&config.editor_font_size.to_string());
     editor_size_input.set_color(theme::input_bg());
     editor_size_input.set_text_color(theme::text_primary());
-    editor_size_row.fixed(&editor_size_input, NUMERIC_INPUT_WIDTH);
-    let _editor_size_spacer = Frame::default();
     editor_size_row.end();
     font_flex.fixed(&editor_size_row, INPUT_ROW_HEIGHT);
 
@@ -276,8 +275,6 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     result_size_input.set_value(&config.result_font_size.to_string());
     result_size_input.set_color(theme::input_bg());
     result_size_input.set_text_color(theme::text_primary());
-    result_size_row.fixed(&result_size_input, NUMERIC_INPUT_WIDTH);
-    let _result_size_spacer = Frame::default();
     result_size_row.end();
     font_flex.fixed(&result_size_row, INPUT_ROW_HEIGHT);
 
@@ -291,8 +288,6 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     global_size_input.set_value(&config.ui_font_size.to_string());
     global_size_input.set_color(theme::input_bg());
     global_size_input.set_text_color(theme::text_primary());
-    global_size_row.fixed(&global_size_input, NUMERIC_INPUT_WIDTH);
-    let _global_size_spacer = Frame::default();
     global_size_row.end();
     font_flex.fixed(&global_size_row, INPUT_ROW_HEIGHT);
 
@@ -308,7 +303,6 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     result_group.set_label("Result View");
     result_group.set_color(theme::panel_bg());
     result_group.set_label_color(theme::text_secondary());
-    result_group.set_align(Align::Center | Align::Inside);
     result_group.begin();
 
     let mut result_flex = Flex::new(
@@ -331,8 +325,6 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     result_cell_max_input.set_value(&config.result_cell_max_chars.to_string());
     result_cell_max_input.set_color(theme::input_bg());
     result_cell_max_input.set_text_color(theme::text_primary());
-    result_cell_max_row.fixed(&result_cell_max_input, NUMERIC_INPUT_WIDTH);
-    let _result_cell_max_spacer = Frame::default();
     result_cell_max_row.end();
     result_flex.fixed(&result_cell_max_row, INPUT_ROW_HEIGHT);
 
@@ -346,8 +338,6 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     lazy_fetch_batch_input.set_value(&config.normalized_lazy_fetch_batch_size().to_string());
     lazy_fetch_batch_input.set_color(theme::input_bg());
     lazy_fetch_batch_input.set_text_color(theme::text_primary());
-    lazy_fetch_batch_row.fixed(&lazy_fetch_batch_input, NUMERIC_INPUT_WIDTH);
-    let _lazy_fetch_batch_spacer = Frame::default();
     lazy_fetch_batch_row.end();
     result_flex.fixed(&lazy_fetch_batch_row, INPUT_ROW_HEIGHT);
 
@@ -375,7 +365,6 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     connection_group.set_label("Connection");
     connection_group.set_color(theme::panel_bg());
     connection_group.set_label_color(theme::text_secondary());
-    connection_group.set_align(Align::Center | Align::Inside);
     connection_group.begin();
 
     let mut connection_flex = Flex::new(
@@ -398,8 +387,6 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     pool_size_input.set_value(&config.normalized_connection_pool_size().to_string());
     pool_size_input.set_color(theme::input_bg());
     pool_size_input.set_text_color(theme::text_primary());
-    pool_size_row.fixed(&pool_size_input, NUMERIC_INPUT_WIDTH);
-    let _pool_size_spacer = Frame::default();
     pool_size_row.end();
     connection_flex.fixed(&pool_size_row, INPUT_ROW_HEIGHT);
 
@@ -413,8 +400,6 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     cancel_timeout_input.set_value(&config.normalized_cancel_timeout_seconds().to_string());
     cancel_timeout_input.set_color(theme::input_bg());
     cancel_timeout_input.set_text_color(theme::text_primary());
-    cancel_timeout_row.fixed(&cancel_timeout_input, NUMERIC_INPUT_WIDTH);
-    let _cancel_timeout_spacer = Frame::default();
     cancel_timeout_row.end();
     connection_flex.fixed(&cancel_timeout_row, INPUT_ROW_HEIGHT);
 
@@ -575,7 +560,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
             .trim()
             .to_string();
         if font.is_empty() {
-            fltk::dialog::alert_default("Please select a font.");
+            crate::ui::alert_on_main("Please select a font.");
             return;
         }
         *result_for_ok

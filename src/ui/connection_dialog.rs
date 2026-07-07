@@ -21,14 +21,17 @@ use crate::db::{
     DatabaseType, OracleDriverMode, OracleNetworkProtocol, TransactionAccessMode,
     TransactionIsolation,
 };
-use crate::ui::center_on_main;
 use crate::ui::constants::*;
 use crate::ui::theme;
+use crate::ui::{center_on_main, configured_ui_font_size};
+use crate::utils::arithmetic::safe_div;
 use crate::utils::AppConfig;
 
 const SAVED_CONNECTIONS_COLUMN_WIDTH: i32 = 200;
 const CONNECTION_DETAILS_COLUMN_WIDTH: i32 = 300;
-const ADVANCED_SETTINGS_COLUMN_WIDTH: i32 = CONNECTION_DETAILS_COLUMN_WIDTH;
+const ADVANCED_SETTINGS_COLUMN_BASE_WIDTH: i32 = CONNECTION_DETAILS_COLUMN_WIDTH;
+const ADVANCED_SETTINGS_COLUMN_REFERENCE_UI_SIZE: i32 = 14;
+const ADVANCED_SETTINGS_COLUMN_MAX_WIDTH: i32 = 520;
 const CONNECTION_DIALOG_COLUMN_SPACING: i32 = DIALOG_SPACING + 4;
 /// Height of the DB Selection section for the rows currently visible. Oracle
 /// shows the driver row, and the Oracle Mode row is only shown when the driver
@@ -353,12 +356,24 @@ fn set_mysql_collation_choice_options(choice: &mut InputChoice, charset: &str, c
     );
 }
 
-fn connection_dialog_width() -> i32 {
+fn advanced_settings_column_width_for_ui_size(ui_font_size: i32) -> i32 {
+    let ui_font_size = ui_font_size.max(ADVANCED_SETTINGS_COLUMN_REFERENCE_UI_SIZE);
+    let scaled_width = ADVANCED_SETTINGS_COLUMN_BASE_WIDTH * ui_font_size
+        + ADVANCED_SETTINGS_COLUMN_REFERENCE_UI_SIZE
+        - 1;
+    let scaled_width = safe_div(scaled_width, ADVANCED_SETTINGS_COLUMN_REFERENCE_UI_SIZE);
+    scaled_width.clamp(
+        ADVANCED_SETTINGS_COLUMN_BASE_WIDTH,
+        ADVANCED_SETTINGS_COLUMN_MAX_WIDTH,
+    )
+}
+
+fn connection_dialog_width_for_ui_size(ui_font_size: i32) -> i32 {
     DIALOG_MARGIN * 2
         + SAVED_CONNECTIONS_COLUMN_WIDTH
         + CONNECTION_DIALOG_COLUMN_SPACING
         + CONNECTION_DETAILS_COLUMN_WIDTH
-        + ADVANCED_SETTINGS_COLUMN_WIDTH
+        + advanced_settings_column_width_for_ui_size(ui_font_size)
         + CONNECTION_DIALOG_COLUMN_SPACING
 }
 
@@ -878,7 +893,10 @@ impl ConnectionDialog {
         let current_group = fltk::group::Group::try_current();
         fltk::group::Group::set_current(None::<&fltk::group::Group>);
 
-        let dialog_w = connection_dialog_width();
+        let ui_font_size = configured_ui_font_size();
+        let advanced_settings_column_width =
+            advanced_settings_column_width_for_ui_size(ui_font_size);
+        let dialog_w = connection_dialog_width_for_ui_size(ui_font_size);
         let dialog_h = 545;
         let mut dialog = Window::default()
             .with_size(dialog_w, dialog_h)
@@ -1278,7 +1296,7 @@ impl ConnectionDialog {
         advanced_col.resizable(&spacer_frame);
 
         advanced_col.end();
-        details_row.fixed(&advanced_col, ADVANCED_SETTINGS_COLUMN_WIDTH);
+        details_row.fixed(&advanced_col, advanced_settings_column_width);
         details_row.end();
         content_row.end();
         root.resizable(&content_row);
@@ -1811,7 +1829,7 @@ impl ConnectionDialog {
                         }
                         Err(err) => {
                             keyring_load_failed = true;
-                            fltk::dialog::alert_default(&err);
+                            crate::ui::alert_on_main(&err);
                             pass_input_cb.value()
                         }
                     };
@@ -1904,7 +1922,7 @@ impl ConnectionDialog {
                     // Double click to connect immediately
                     if app::event_clicks() && !keyring_load_failed {
                         if password.is_empty() {
-                            fltk::dialog::alert_default(
+                            crate::ui::alert_on_main(
                                 "No password is saved for this connection. Enter a password before connecting.",
                             );
                             return;
@@ -1978,7 +1996,7 @@ impl ConnectionDialog {
             ) {
                 Ok(info) => info,
                 Err(message) => {
-                    fltk::dialog::alert_default(&message);
+                    crate::ui::alert_on_main(&message);
                     return;
                 }
             };
@@ -2053,7 +2071,7 @@ impl ConnectionDialog {
             ) {
                 Ok(info) => info,
                 Err(message) => {
-                    fltk::dialog::alert_default(&message);
+                    crate::ui::alert_on_main(&message);
                     *test_in_progress_for_test
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
@@ -2123,7 +2141,7 @@ impl ConnectionDialog {
             ) {
                 Ok(info) => info,
                 Err(message) => {
-                    fltk::dialog::alert_default(&message);
+                    crate::ui::alert_on_main(&message);
                     return;
                 }
             };
@@ -2152,7 +2170,7 @@ impl ConnectionDialog {
                 match message {
                     DialogMessage::DeleteSelected => {
                         if let Some(selected) = saved_browser.selected_text() {
-                            let choice = fltk::dialog::choice2_default(
+                            let choice = crate::ui::choice2_on_main(
                                 &format!("Delete connection '{}'?", selected),
                                 "Cancel",
                                 "Delete",
@@ -2166,19 +2184,19 @@ impl ConnectionDialog {
                                 let removal_error = cfg.remove_connection(&selected).err();
                                 if let Err(e) = cfg.save() {
                                     *cfg = previous_config;
-                                    fltk::dialog::alert_default(&format!(
+                                    crate::ui::alert_on_main(&format!(
                                         "Failed to save config: {}",
                                         e
                                     ));
                                 } else {
                                     populate_saved_connections(&mut saved_browser, &cfg);
                                     if let Some(error_message) = removal_error {
-                                        fltk::dialog::alert_default(&error_message);
+                                        crate::ui::alert_on_main(&error_message);
                                     }
                                 }
                             }
                         } else {
-                            fltk::dialog::alert_default("Please select a connection to delete");
+                            crate::ui::alert_on_main("Please select a connection to delete");
                         }
                     }
                     DialogMessage::Test(info) => {
@@ -2202,10 +2220,10 @@ impl ConnectionDialog {
                     }
                     DialogMessage::TestResult(result) => match result {
                         Ok(_) => {
-                            fltk::dialog::message_default("Connection successful!");
+                            crate::ui::message_on_main("Connection successful!");
                         }
                         Err(e) => {
-                            fltk::dialog::alert_default(&format!("Connection failed: {}", e));
+                            crate::ui::alert_on_main(&format!("Connection failed: {}", e));
                         }
                     },
                     DialogMessage::Save(info) => {
@@ -2213,7 +2231,7 @@ impl ConnectionDialog {
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                         if let Err(e) = cfg.add_recent_connection(info.clone()) {
-                            fltk::dialog::alert_default(&e);
+                            crate::ui::alert_on_main(&e);
                         } else if let Err(e) = cfg.save() {
                             let cleanup_error =
                                 crate::utils::credential_store::delete_password(&info.name).err();
@@ -2225,7 +2243,7 @@ impl ConnectionDialog {
                                     cleanup_error
                                 ));
                             }
-                            fltk::dialog::alert_default(&message);
+                            crate::ui::alert_on_main(&message);
                         } else {
                             populate_saved_connections(&mut saved_browser, &cfg);
                         }
@@ -2236,7 +2254,7 @@ impl ConnectionDialog {
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
                             if let Err(e) = cfg.add_recent_connection(info.clone()) {
-                                fltk::dialog::alert_default(&e);
+                                crate::ui::alert_on_main(&e);
                                 continue;
                             }
                             if let Err(e) = cfg.save() {
@@ -2251,7 +2269,7 @@ impl ConnectionDialog {
                                         cleanup_error
                                     ));
                                 }
-                                fltk::dialog::alert_default(&message);
+                                crate::ui::alert_on_main(&message);
                                 continue;
                             }
                         }
@@ -2295,7 +2313,8 @@ impl ConnectionDialog {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_connection_info, choice_index_from_oracle_thin_protocol, connection_dialog_width,
+        advanced_settings_column_width_for_ui_size, build_connection_info,
+        choice_index_from_oracle_thin_protocol, connection_dialog_width_for_ui_size,
         oracle_thin_protocol_from_choice_index, OracleConnectMode,
     };
     use crate::db::{
@@ -2309,14 +2328,42 @@ mod tests {
     }
 
     #[test]
-    fn connection_dialog_width_covers_fixed_columns_and_spacing() {
+    fn connection_dialog_width_covers_fixed_columns_and_scaled_advanced_column() {
+        let ui_font_size = 14;
         let required_width = crate::ui::constants::DIALOG_MARGIN * 2
             + super::SAVED_CONNECTIONS_COLUMN_WIDTH
             + super::CONNECTION_DETAILS_COLUMN_WIDTH
-            + super::ADVANCED_SETTINGS_COLUMN_WIDTH
+            + advanced_settings_column_width_for_ui_size(ui_font_size)
             + super::CONNECTION_DIALOG_COLUMN_SPACING * 2;
 
-        assert_eq!(connection_dialog_width(), required_width);
+        assert_eq!(
+            connection_dialog_width_for_ui_size(ui_font_size),
+            required_width
+        );
+        assert_eq!(
+            advanced_settings_column_width_for_ui_size(ui_font_size),
+            super::ADVANCED_SETTINGS_COLUMN_BASE_WIDTH
+        );
+    }
+
+    #[test]
+    fn advanced_settings_column_width_grows_for_larger_ui_fonts() {
+        let base_width = advanced_settings_column_width_for_ui_size(14);
+        let larger_width = advanced_settings_column_width_for_ui_size(18);
+
+        assert_eq!(
+            advanced_settings_column_width_for_ui_size(8),
+            base_width,
+            "smaller UI fonts should keep the current minimum column width"
+        );
+        assert!(
+            larger_width > base_width,
+            "larger UI fonts should widen the advanced settings column"
+        );
+        assert!(
+            advanced_settings_column_width_for_ui_size(24) > larger_width,
+            "maximum supported UI font size should get the widest advanced column"
+        );
     }
 
     #[test]

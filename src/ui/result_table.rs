@@ -2879,7 +2879,7 @@ impl ResultTableWidget {
                                     if err.is_empty() {
                                         return false;
                                     }
-                                    fltk::dialog::alert_default(&err);
+                                    crate::ui::alert_on_main(&err);
                                     return true;
                                 }
                             }
@@ -3060,7 +3060,7 @@ impl ResultTableWidget {
                                 if err.is_empty() {
                                     return false;
                                 }
-                                fltk::dialog::alert_default(&err);
+                                crate::ui::alert_on_main(&err);
                                 return true;
                             }
                         }
@@ -3126,7 +3126,7 @@ impl ResultTableWidget {
                             // Clipboard text can be delivered to this widget via non-edit paths
                             // (e.g. drag/drop). Only surface actionable errors to users.
                             if !err.is_empty() {
-                                fltk::dialog::alert_default(&err);
+                                crate::ui::alert_on_main(&err);
                             }
                             true
                         }
@@ -3445,7 +3445,7 @@ impl ResultTableWidget {
         active_inline_edit: &Arc<Mutex<Option<ActiveInlineEdit>>>,
     ) -> Option<String> {
         let Some((x, y, w, h)) = table.find_cell(TableContext::Cell, row, col) else {
-            return fltk::dialog::input_default(
+            return crate::ui::input_on_main(
                 "Value (blank/NULL -> NULL, '=expr' -> SQL)",
                 current_value,
             );
@@ -3624,7 +3624,7 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if save_pending {
-            fltk::dialog::alert_default("Save is in progress. Wait for completion before editing.");
+            crate::ui::alert_on_main("Save is in progress. Wait for completion before editing.");
             return true;
         }
 
@@ -3642,7 +3642,7 @@ impl ResultTableWidget {
         };
 
         if col_idx == rowid_col {
-            fltk::dialog::alert_default("ROWID column cannot be edited.");
+            crate::ui::alert_on_main("ROWID column cannot be edited.");
             return true;
         }
         if !is_editable_column {
@@ -3656,7 +3656,7 @@ impl ResultTableWidget {
             .get(col_idx)
             .is_some();
         if !column_exists {
-            fltk::dialog::alert_default("Selected column is out of range.");
+            crate::ui::alert_on_main("Selected column is out of range.");
             return true;
         }
 
@@ -3691,7 +3691,7 @@ impl ResultTableWidget {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let Some(row_data) = data.get_mut(row_idx) else {
                 drop(data);
-                fltk::dialog::alert_default("Selected row is out of range.");
+                crate::ui::alert_on_main("Selected row is out of range.");
                 return true;
             };
             if col_idx >= row_data.len() {
@@ -4169,7 +4169,7 @@ impl ResultTableWidget {
         let mut table = table.clone();
         table.redraw();
         if skipped_cells > 0 {
-            fltk::dialog::alert_default(&format!(
+            crate::ui::alert_on_main(&format!(
                 "Pasted {} cell(s), but {} cell(s) were skipped (outside table bounds).",
                 changed_cells, skipped_cells
             ));
@@ -6566,7 +6566,7 @@ impl ResultTableWidget {
             table.cols().max(0) as usize,
             context_cell,
         ) else {
-            fltk::dialog::alert_default("Select a single cell to update.");
+            crate::ui::alert_on_main("Select a single cell to update.");
             return;
         };
 
@@ -6587,7 +6587,7 @@ impl ResultTableWidget {
                 match Self::rowid_for_row(row_index, &headers_snapshot, &data_guard) {
                     Ok(v) => v,
                     Err(err) => {
-                        fltk::dialog::alert_default(&err);
+                        crate::ui::alert_on_main(&err);
                         return;
                     }
                 };
@@ -6599,16 +6599,16 @@ impl ResultTableWidget {
             (rowid_col, rowid_value, current_value)
         };
         if col_index == rowid_col {
-            fltk::dialog::alert_default("ROWID cell cannot be updated.");
+            crate::ui::alert_on_main("ROWID cell cannot be updated.");
             return;
         }
 
         let Some(column_name) = headers_snapshot.get(col_index).cloned() else {
-            fltk::dialog::alert_default("Selected column is out of range.");
+            crate::ui::alert_on_main("Selected column is out of range.");
             return;
         };
         let Some(column_identifier) = Self::editable_column_identifier(&column_name) else {
-            fltk::dialog::alert_default(
+            crate::ui::alert_on_main(
                 "Selected column cannot be mapped to an editable column name.",
             );
             return;
@@ -6618,14 +6618,14 @@ impl ResultTableWidget {
             "New value for {} (blank/NULL -> NULL, '=expr' -> SQL expression)",
             column_name
         );
-        let Some(input) = fltk::dialog::input_default(&prompt, &current_value) else {
+        let Some(input) = crate::ui::input_on_main(&prompt, &current_value) else {
             return;
         };
 
         let table_name = match Self::resolve_target_table(&source_sql_text) {
             Ok(name) => name,
             Err(err) => {
-                fltk::dialog::alert_default(&err);
+                crate::ui::alert_on_main(&err);
                 return;
             }
         };
@@ -6641,7 +6641,7 @@ impl ResultTableWidget {
             match Self::sql_literal_from_input_with_null_text(&input, &current_null_text) {
                 Ok(value) => value,
                 Err(err) => {
-                    fltk::dialog::alert_default(&err);
+                    crate::ui::alert_on_main(&err);
                     return;
                 }
             },
@@ -6649,7 +6649,7 @@ impl ResultTableWidget {
         );
         let script = Self::compose_edit_script(&sql, &source_sql_text);
         if let Err(err) = Self::try_execute_sql(execute_sql_callback, script) {
-            fltk::dialog::alert_default(&err);
+            crate::ui::alert_on_main(&err);
         }
     }
 
@@ -6677,14 +6677,14 @@ impl ResultTableWidget {
             match Self::selected_rowids(table, &headers_snapshot, &data_guard) {
                 Ok(v) => v,
                 Err(err) => {
-                    fltk::dialog::alert_default(&err);
+                    crate::ui::alert_on_main(&err);
                     return;
                 }
             }
         };
 
         let delete_count = rowids.len();
-        let confirm = fltk::dialog::choice2_default(
+        let confirm = crate::ui::choice2_on_main(
             &format!("Delete {} selected row(s)?", delete_count),
             "Cancel",
             "Delete",
@@ -6697,7 +6697,7 @@ impl ResultTableWidget {
         let table_name = match Self::resolve_target_table(&source_sql_text) {
             Ok(name) => name,
             Err(err) => {
-                fltk::dialog::alert_default(&err);
+                crate::ui::alert_on_main(&err);
                 return;
             }
         };
@@ -6719,7 +6719,7 @@ impl ResultTableWidget {
         );
         let script = Self::compose_edit_script(&sql, &source_sql_text);
         if let Err(err) = Self::try_execute_sql(execute_sql_callback, script) {
-            fltk::dialog::alert_default(&err);
+            crate::ui::alert_on_main(&err);
         }
     }
 
@@ -6744,7 +6744,7 @@ impl ResultTableWidget {
         let table_name = match Self::resolve_target_table(&source_sql_text) {
             Ok(name) => name,
             Err(err) => {
-                fltk::dialog::alert_default(&err);
+                crate::ui::alert_on_main(&err);
                 return;
             }
         };
@@ -6760,7 +6760,7 @@ impl ResultTableWidget {
             })
             .collect();
         if editable_columns.is_empty() {
-            fltk::dialog::alert_default("No editable columns are available for INSERT.");
+            crate::ui::alert_on_main("No editable columns are available for INSERT.");
             return;
         }
 
@@ -6791,7 +6791,7 @@ impl ResultTableWidget {
                 "Value for {} (blank/NULL -> NULL, '=expr' -> SQL expression)",
                 column_name
             );
-            let Some(input) = fltk::dialog::input_default(&prompt, &default_value) else {
+            let Some(input) = crate::ui::input_on_main(&prompt, &default_value) else {
                 return;
             };
             column_names.push(column_identifier);
@@ -6799,7 +6799,7 @@ impl ResultTableWidget {
                 match Self::sql_literal_from_input_with_null_text(&input, &current_null_text) {
                     Ok(value) => value,
                     Err(err) => {
-                        fltk::dialog::alert_default(&err);
+                        crate::ui::alert_on_main(&err);
                         return;
                     }
                 };
@@ -6807,7 +6807,7 @@ impl ResultTableWidget {
         }
 
         if column_names.is_empty() || value_literals.is_empty() {
-            fltk::dialog::alert_default("No values were provided for INSERT.");
+            crate::ui::alert_on_main("No values were provided for INSERT.");
             return;
         }
 
@@ -6819,7 +6819,7 @@ impl ResultTableWidget {
         );
         let script = Self::compose_edit_script(&sql, &source_sql_text);
         if let Err(err) = Self::try_execute_sql(execute_sql_callback, script) {
-            fltk::dialog::alert_default(&err);
+            crate::ui::alert_on_main(&err);
         }
     }
 
@@ -7015,7 +7015,7 @@ impl ResultTableWidget {
                         active_inline_edit,
                     ) {
                         if !err.is_empty() {
-                            fltk::dialog::alert_default(&err);
+                            crate::ui::alert_on_main(&err);
                         }
                     }
                 }

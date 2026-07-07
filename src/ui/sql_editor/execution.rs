@@ -23832,9 +23832,9 @@ mod query_execution_cleanup_tests {
             text: SqlEditorWidget::render_explain_plan(&plan),
         };
         assert_result_routes_only(
-            "Oracle explain output must route only to Explain Plan",
+            "Oracle explain output must route to Data Grid as a new explain tab",
             &explain_event,
-            &[ResultPaneRoute::ExplainPlan],
+            &[ResultPaneRoute::DataGrid],
         );
     }
 
@@ -29348,7 +29348,7 @@ mod mysql_batch_execution_regression_tests {
                 }
                 QueryProgress::ExplainPlanOutput { .. } => assert_eq!(
                     routes,
-                    &[ResultPaneRoute::ExplainPlan],
+                    &[ResultPaneRoute::DataGrid],
                     "{label}\n{progress_summary}"
                 ),
                 QueryProgress::StatementFinished { result, .. } => {
@@ -29401,9 +29401,9 @@ mod mysql_batch_execution_regression_tests {
         };
         assert_result_routes_only(
             "MySQL/MariaDB explain progress",
-            "MySQL/MariaDB explain output must route only to Explain Plan",
+            "MySQL/MariaDB explain output must route to Data Grid as a new explain tab",
             &explain_event,
-            &[ResultPaneRoute::ExplainPlan],
+            &[ResultPaneRoute::DataGrid],
         );
     }
 

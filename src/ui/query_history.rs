@@ -661,11 +661,11 @@ impl QueryHistoryDialog {
                                 }
                             }
                         } else {
-                            fltk::dialog::alert_default("Please select a query from the list");
+                            crate::ui::alert_on_main("Please select a query from the list");
                         }
                     }
                     DialogMessage::ClearHistory => {
-                        let choice = fltk::dialog::choice2_default(
+                        let choice = crate::ui::choice2_on_main(
                             "Are you sure you want to clear all query history?",
                             "Cancel",
                             "Clear All",
@@ -697,7 +697,7 @@ impl QueryHistoryDialog {
                                     preview_flex_for_error.layout();
                                 }
                                 Err(err) => {
-                                    fltk::dialog::alert_default(&format!(
+                                    crate::ui::alert_on_main(&format!(
                                         "Failed to clear query history: {}",
                                         err
                                     ));

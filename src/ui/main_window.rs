@@ -2598,8 +2598,6 @@ pub(crate) enum ResultPaneRoute {
     DbmsOutput,
     MessagesInfo,
     MessagesErrors,
-    #[cfg(test)]
-    ExplainPlan,
 }
 
 fn statement_finished_result_routes(
@@ -2655,7 +2653,7 @@ pub(crate) fn result_pane_routes_for_progress_with_script_context(
             ResultMessageKind::Info => vec![ResultPaneRoute::MessagesInfo],
             ResultMessageKind::Error => vec![ResultPaneRoute::MessagesErrors],
         },
-        QueryProgress::ExplainPlanOutput { .. } => vec![ResultPaneRoute::ExplainPlan],
+        QueryProgress::ExplainPlanOutput { .. } => vec![ResultPaneRoute::DataGrid],
         QueryProgress::StatementFinished { result, .. } => statement_finished_result_routes(
             result,
             script_transcript,
@@ -2962,19 +2960,19 @@ fn update_transaction_mode_from_controls(state: &Arc<Mutex<AppState>>) {
             s.has_active_lazy_fetches(),
             "changing transaction mode",
         ) {
-            fltk::dialog::alert_default(&message);
+            crate::ui::alert_on_main(&message);
             s.sync_transaction_mode_controls();
             s.set_status_message(&message);
             return;
         }
         if let Some(message) = s.retained_transaction_option_blocker("transaction mode") {
-            fltk::dialog::alert_default(&message);
+            crate::ui::alert_on_main(&message);
             s.sync_transaction_mode_controls();
             s.set_status_message(&message);
             return;
         }
         let Some((db_type, _, current_mode, _)) = s.transaction_control_state() else {
-            fltk::dialog::alert_default(&format_connection_busy_message());
+            crate::ui::alert_on_main(&format_connection_busy_message());
             return;
         };
         (
@@ -2991,7 +2989,7 @@ fn update_transaction_mode_from_controls(state: &Arc<Mutex<AppState>>) {
     {
         let retained_plan = RetainedSessionOptionChangePlan::new(&connection, retained_editors);
         if let Err(err) = retained_plan.validate_transaction_option_change("transaction mode") {
-            fltk::dialog::alert_default(&err);
+            crate::ui::alert_on_main(&err);
             (format!("Transaction mode unchanged: {}", err), true, false)
         } else {
             crate::db::clear_pool_session_context_for_shared_connection(&shared_connection);
@@ -3009,7 +3007,7 @@ fn update_transaction_mode_from_controls(state: &Arc<Mutex<AppState>>) {
                         "Updating transaction mode",
                     );
                     if let Some(message) = first_retained_outcome_message(&retained_outcomes) {
-                        fltk::dialog::alert_default(&format!(
+                        crate::ui::alert_on_main(&format!(
                         "Transaction mode was changed, but a retained session could not be updated. It was restored or discarded according to session safety: {}",
                         message
                     ));
@@ -3017,14 +3015,14 @@ fn update_transaction_mode_from_controls(state: &Arc<Mutex<AppState>>) {
                     (format!("Transaction mode: {}", mode.label()), true, true)
                 }
                 Err(err) => {
-                    fltk::dialog::alert_default(&err);
+                    crate::ui::alert_on_main(&err);
                     (format!("Transaction mode unchanged: {}", err), true, false)
                 }
             }
         }
     } else {
         let busy_message = format_connection_busy_message();
-        fltk::dialog::alert_default(&busy_message);
+        crate::ui::alert_on_main(&busy_message);
         (busy_message, false, false)
     };
 
@@ -3038,7 +3036,7 @@ fn update_transaction_mode_from_controls(state: &Arc<Mutex<AppState>>) {
     drop(s);
 
     if mode_applied && mode != previous_mode {
-        fltk::dialog::message_default(transaction_mode_new_transaction_notice());
+        crate::ui::message_on_main(transaction_mode_new_transaction_notice());
     }
 }
 
@@ -3326,7 +3324,7 @@ impl MainWindow {
         }
 
         if let Some(alert_msg) = deferred_alert {
-            fltk::dialog::alert_default(&alert_msg);
+            crate::ui::alert_on_main(&alert_msg);
         }
 
         if let Some(tab_id) = created_tab {
@@ -3395,7 +3393,7 @@ impl MainWindow {
         ) {
             Ok(export) => export,
             Err(message) => {
-                fltk::dialog::alert_default(&message);
+                crate::ui::alert_on_main(&message);
                 return;
             }
         };
@@ -3432,7 +3430,7 @@ impl MainWindow {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_any_query_running();
         if query_running {
-            fltk::dialog::alert_default("A query is running. Stop it before closing tabs.");
+            crate::ui::alert_on_main("A query is running. Stop it before closing tabs.");
             return;
         }
         let lazy_fetch_sessions = {
@@ -3486,7 +3484,7 @@ impl MainWindow {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_any_query_running();
         if query_running {
-            fltk::dialog::alert_default("A query is running. Stop it before closing grid tabs.");
+            crate::ui::alert_on_main("A query is running. Stop it before closing grid tabs.");
             return;
         }
         let lazy_fetch_sessions = {
@@ -3537,7 +3535,7 @@ impl MainWindow {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_any_query_running();
         if query_running {
-            fltk::dialog::alert_default("A query is running. Stop it before clearing results.");
+            crate::ui::alert_on_main("A query is running. Stop it before clearing results.");
             return;
         }
         let lazy_fetch_sessions = {
@@ -3907,7 +3905,7 @@ impl MainWindow {
         }
 
         let tab_label = tab_label.unwrap_or_else(|| "Query".to_string());
-        let choice = fltk::dialog::choice2_default(
+        let choice = crate::ui::choice2_on_main(
             &format!(
                 "Tab '{}' has unsaved changes.\nDo you want to save before {}?",
                 tab_label, action_verb
@@ -3922,7 +3920,7 @@ impl MainWindow {
                 SaveTabOutcome::Saved => true,
                 SaveTabOutcome::Cancelled => false,
                 SaveTabOutcome::Failed(err) => {
-                    fltk::dialog::alert_default(&format!("Failed to save SQL file: {}", err));
+                    crate::ui::alert_on_main(&format!("Failed to save SQL file: {}", err));
                     false
                 }
             },
@@ -3943,7 +3941,7 @@ impl MainWindow {
                 .unwrap_or_else(|| "Query".to_string())
         };
         matches!(
-            fltk::dialog::choice2_default(
+            crate::ui::choice2_on_main(
                 &format!(
                     "Tab '{}' has a running query or open lazy fetch.\nCancel it and close the tab?",
                     tab_label
@@ -3968,7 +3966,7 @@ impl MainWindow {
         }
 
         matches!(
-            fltk::dialog::choice2_default(
+            crate::ui::choice2_on_main(
                 "A query is running or a lazy fetch is open.\nCancel it and exit?",
                 "Keep Open",
                 "Cancel and Exit",
@@ -4017,7 +4015,7 @@ impl MainWindow {
             RetainedSessionResolutionAction::Commit,
         );
         let result = if transaction_action_allowed {
-            let choice = fltk::dialog::choice2_default(
+            let choice = crate::ui::choice2_on_main(
                 &format!(
                     "Tab '{}' has a DB session that may need commit, rollback, or discard.\nChoose how to {}.",
                     tab_label, action_prompt
@@ -4028,7 +4026,7 @@ impl MainWindow {
             );
             match choice {
                 Some(1) => {
-                    let decision = fltk::dialog::choice2_default(
+                    let decision = crate::ui::choice2_on_main(
                         &format!(
                             "Choose how to resolve the DB session before {}.",
                             resolution_context
@@ -4047,7 +4045,7 @@ impl MainWindow {
                 _ => return false,
             }
         } else {
-            let choice = fltk::dialog::choice2_default(
+            let choice = crate::ui::choice2_on_main(
                 &format!(
                     "Tab '{}' has a {} DB session that commit/rollback cannot resolve.\nDiscard it to {}.",
                     tab_label,
@@ -4065,7 +4063,7 @@ impl MainWindow {
         };
 
         if let Err(err) = result {
-            fltk::dialog::alert_default(&format!("Failed to resolve DB session: {}", err));
+            crate::ui::alert_on_main(&format!("Failed to resolve DB session: {}", err));
             return false;
         }
 
@@ -4968,7 +4966,7 @@ impl MainWindow {
                 match MainWindow::clone_result_tabs_for_edit_action(&state_for_edit_check) {
                     Ok(tabs) => tabs,
                     Err(err) => {
-                        fltk::dialog::alert_default(&err);
+                        crate::ui::alert_on_main(&err);
                         app::redraw();
                         return;
                     }
@@ -4996,7 +4994,7 @@ impl MainWindow {
                 s.refresh_result_edit_controls();
             }
             if let Some(err) = error_message {
-                fltk::dialog::alert_default(&err);
+                crate::ui::alert_on_main(&err);
             }
             app::redraw();
         });
@@ -5010,7 +5008,7 @@ impl MainWindow {
                 match MainWindow::clone_result_tabs_for_edit_action(&state_for_edit_insert) {
                     Ok(tabs) => tabs,
                     Err(err) => {
-                        fltk::dialog::alert_default(&err);
+                        crate::ui::alert_on_main(&err);
                         app::redraw();
                         return;
                     }
@@ -5030,7 +5028,7 @@ impl MainWindow {
                 s.refresh_result_edit_controls();
             }
             if let Some(err) = error_message {
-                fltk::dialog::alert_default(&err);
+                crate::ui::alert_on_main(&err);
             }
             app::redraw();
         });
@@ -5044,7 +5042,7 @@ impl MainWindow {
                 match MainWindow::clone_result_tabs_for_edit_action(&state_for_edit_delete) {
                     Ok(tabs) => tabs,
                     Err(err) => {
-                        fltk::dialog::alert_default(&err);
+                        crate::ui::alert_on_main(&err);
                         app::redraw();
                         return;
                     }
@@ -5064,7 +5062,7 @@ impl MainWindow {
                 s.refresh_result_edit_controls();
             }
             if let Some(err) = error_message {
-                fltk::dialog::alert_default(&err);
+                crate::ui::alert_on_main(&err);
             }
             app::redraw();
         });
@@ -5078,7 +5076,7 @@ impl MainWindow {
                 match MainWindow::clone_result_tabs_for_edit_action(&state_for_edit_save) {
                     Ok(tabs) => tabs,
                     Err(err) => {
-                        fltk::dialog::alert_default(&err);
+                        crate::ui::alert_on_main(&err);
                         app::redraw();
                         return;
                     }
@@ -5098,7 +5096,7 @@ impl MainWindow {
                 s.refresh_result_edit_controls();
             }
             if let Some(err) = error_message {
-                fltk::dialog::alert_default(&err);
+                crate::ui::alert_on_main(&err);
             }
             app::redraw();
         });
@@ -5112,7 +5110,7 @@ impl MainWindow {
                 match MainWindow::clone_result_tabs_for_edit_action(&state_for_edit_cancel) {
                     Ok(tabs) => tabs,
                     Err(err) => {
-                        fltk::dialog::alert_default(&err);
+                        crate::ui::alert_on_main(&err);
                         app::redraw();
                         return;
                     }
@@ -5132,7 +5130,7 @@ impl MainWindow {
                 s.refresh_result_edit_controls();
             }
             if let Some(err) = error_message {
-                fltk::dialog::alert_default(&err);
+                crate::ui::alert_on_main(&err);
             }
             app::redraw();
         });
@@ -6719,7 +6717,7 @@ impl MainWindow {
                 QueryProgress::ExplainPlanOutput { text } => {
                     let mut result_tabs = s.result_tabs.clone();
                     drop(s);
-                    result_tabs.set_explain_plan_text(&text);
+                    result_tabs.append_explain_plan_tab(&text);
                 }
                 QueryProgress::PromptInput { .. } => {}
                 QueryProgress::RequestCancelOldestLazyFetchForSessionPool { response } => {
@@ -6833,7 +6831,7 @@ impl MainWindow {
                         .map(apply_retained_scope_update)
                         .and_then(|outcomes| first_retained_outcome_message(&outcomes))
                     {
-                        fltk::dialog::alert_default(&format!(
+                        crate::ui::alert_on_main(&format!(
                             "Scope was changed, but a retained session could not be updated: \n{}",
                             message
                         ));
@@ -6863,7 +6861,7 @@ impl MainWindow {
                         .map(apply_retained_scope_update)
                         .and_then(|outcomes| first_retained_outcome_message(&outcomes))
                     {
-                        fltk::dialog::alert_default(&format!(
+                        crate::ui::alert_on_main(&format!(
                             "Scope was changed, but a retained session could not be updated: \n{}",
                             message
                         ));
@@ -7296,7 +7294,7 @@ impl MainWindow {
                     )
                 };
                 if let Some(message) = block_message {
-                    fltk::dialog::alert_default(&message);
+                    crate::ui::alert_on_main(&message);
                     return true;
                 }
 
@@ -7385,7 +7383,7 @@ impl MainWindow {
                     )
                 };
                 if let Some(message) = block_message {
-                    fltk::dialog::alert_default(&message);
+                    crate::ui::alert_on_main(&message);
                     return true;
                 }
 
@@ -7402,7 +7400,7 @@ impl MainWindow {
                     try_lock_connection_with_activity(&connection, "Disconnecting session")
                 else {
                     let busy_message = format_connection_busy_message();
-                    fltk::dialog::alert_default(&busy_message);
+                    crate::ui::alert_on_main(&busy_message);
                     let mut s = state
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -7446,7 +7444,7 @@ impl MainWindow {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .active_editor_tab_id;
                 if let SaveTabOutcome::Failed(err) = MainWindow::save_tab(state, tab_id, false) {
-                    fltk::dialog::alert_default(&format!("Failed to save SQL file: {}", err));
+                    crate::ui::alert_on_main(&format!("Failed to save SQL file: {}", err));
                 }
                 true
             }
@@ -7456,7 +7454,7 @@ impl MainWindow {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .active_editor_tab_id;
                 if let SaveTabOutcome::Failed(err) = MainWindow::save_tab(state, tab_id, true) {
-                    fltk::dialog::alert_default(&format!("Failed to save SQL file: {}", err));
+                    crate::ui::alert_on_main(&format!("Failed to save SQL file: {}", err));
                 }
                 true
             }
@@ -7841,7 +7839,7 @@ impl MainWindow {
                         s.has_active_lazy_fetches(),
                         "changing auto-commit",
                     ) {
-                        fltk::dialog::alert_default(&message);
+                        crate::ui::alert_on_main(&message);
                         s.set_status_message(&message);
                         if let Some(mut item) = item.take() {
                             if enabled {
@@ -7853,7 +7851,7 @@ impl MainWindow {
                         return true;
                     }
                     if let Some(message) = s.retained_transaction_option_blocker("auto-commit") {
-                        fltk::dialog::alert_default(&message);
+                        crate::ui::alert_on_main(&message);
                         if let Some(mut item) = item.take() {
                             if enabled {
                                 item.clear();
@@ -7879,7 +7877,7 @@ impl MainWindow {
                     if let Err(err) =
                         retained_plan.validate_transaction_option_change("auto-commit")
                     {
-                        fltk::dialog::alert_default(&err);
+                        crate::ui::alert_on_main(&err);
                         let mut s = state
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -7900,7 +7898,7 @@ impl MainWindow {
                         return true;
                     }
                     if let Err(err) = connection.set_auto_commit(enabled) {
-                        fltk::dialog::alert_default(&err);
+                        crate::ui::alert_on_main(&err);
                         let mut s = state
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -7928,14 +7926,14 @@ impl MainWindow {
                         "Updating auto-commit setting",
                     );
                     if let Some(message) = first_retained_outcome_message(&retained_outcomes) {
-                        fltk::dialog::alert_default(&format!(
+                        crate::ui::alert_on_main(&format!(
                             "Auto-commit was changed, but a retained session could not be updated. It was restored or discarded according to session safety: {}",
                             message
                         ));
                     }
                 } else {
                     let busy_message = format_connection_busy_message();
-                    fltk::dialog::alert_default(&busy_message);
+                    crate::ui::alert_on_main(&busy_message);
                     let mut s = state
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -8052,7 +8050,7 @@ impl MainWindow {
                         save_result.map_err(|err| err.to_string())
                     });
                     if let Err(err) = save_result {
-                        fltk::dialog::alert_default(&format!("Failed to save settings: {}", err));
+                        crate::ui::alert_on_main(&format!("Failed to save settings: {}", err));
                     }
                 }
                 true
@@ -8498,7 +8496,7 @@ impl MainWindow {
                 .map(apply_retained_scope_update)
                 .and_then(|outcomes| first_retained_outcome_message(&outcomes))
             {
-                fltk::dialog::alert_default(&format!(
+                crate::ui::alert_on_main(&format!(
                     "Scope was changed, but a retained session could not be updated: \n{}",
                     message
                 ));
@@ -8919,7 +8917,7 @@ impl MainWindow {
                             drop(s);
 
                             if let Some(alert_msg) = deferred_alert.take() {
-                                fltk::dialog::alert_default(&alert_msg);
+                                crate::ui::alert_on_main(&alert_msg);
                             }
 
                             if let Some(tab_id) = created_tab_for_open {
@@ -9786,7 +9784,7 @@ mod tests {
             QueryProgress::ExplainPlanOutput {
                 text: "plan".to_string(),
             },
-            &[ResultPaneRoute::ExplainPlan],
+            &[ResultPaneRoute::DataGrid],
         );
 
         let select = QueryResult::new_select(

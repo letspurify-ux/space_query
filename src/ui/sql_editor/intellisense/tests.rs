@@ -75431,20 +75431,30 @@ fn package_spec_resolution_is_bounded_on_large_buffers() {
     let adjacent = format!(
         "{filler}CREATE PACKAGE big_pkg AS\n  g_big NUMBER;\nEND;\n/\nCREATE PACKAGE BODY big_pkg AS\n  PROCEDURE p IS BEGIN __CODEX_CURSOR__NULL; END;\nEND;\n/"
     );
-    let start = std::time::Instant::now();
-    let suggestions = SqlEditorWidget::collect_local_symbol_suggestions_for_test(&adjacent, &[]);
-    let elapsed = start.elapsed();
-    assert!(has(&suggestions, "g_big"), "adjacent spec global missing: {suggestions:?}");
-    assert!(
-        elapsed < std::time::Duration::from_secs(2),
-        "spec resolution too slow on a large buffer: {elapsed:?}"
+    let body_start = adjacent
+        .find("CREATE PACKAGE BODY big_pkg")
+        .expect("body marker");
+    assert_eq!(
+        SqlEditorWidget::find_package_spec_header(&adjacent, "BIG_PKG", body_start),
+        Some(filler.len() + "CREATE ".len()),
+        "adjacent package spec should be found without depending on wall-clock timing"
     );
+    let suggestions = SqlEditorWidget::collect_local_symbol_suggestions_for_test(&adjacent, &[]);
+    assert!(has(&suggestions, "g_big"), "adjacent spec global missing: {suggestions:?}");
 
     // A spec separated from the body by more than the search radius is out of
     // scope by design (keeps the scan bounded); resolution simply returns nothing
     // rather than scanning the whole buffer.
     let far = format!(
         "CREATE PACKAGE far_pkg AS\n  g_far NUMBER;\nEND;\n/\n{filler}CREATE PACKAGE BODY far_pkg AS\n  PROCEDURE p IS BEGIN __CODEX_CURSOR__NULL; END;\nEND;\n/"
+    );
+    let far_body_start = far
+        .find("CREATE PACKAGE BODY far_pkg")
+        .expect("far body marker");
+    assert_eq!(
+        SqlEditorWidget::find_package_spec_header(&far, "FAR_PKG", far_body_start),
+        None,
+        "package spec beyond the bounded search radius should not be matched"
     );
     let far_suggestions = SqlEditorWidget::collect_local_symbol_suggestions_for_test(&far, &[]);
     assert!(

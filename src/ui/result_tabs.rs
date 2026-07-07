@@ -8,8 +8,10 @@ use fltk::{
 use std::any::Any;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::db::query::result_messages;
+use crate::db::{ColumnInfo, QueryResult};
 use crate::ui::constants;
 use crate::ui::font_settings::{configured_editor_profile, FontProfile};
 use crate::ui::result_table::{
@@ -57,7 +59,6 @@ pub struct ResultTabsWidget {
     dbms_output: Arc<Mutex<TextPane>>,
     messages_info: Arc<Mutex<TextPane>>,
     messages_errors: Arc<Mutex<TextPane>>,
-    explain_plan: Arc<Mutex<TextPane>>,
     next_result_tab_id: Arc<Mutex<u64>>,
     font_profile: Arc<Mutex<FontProfile>>,
     font_size: Arc<Mutex<u32>>,
@@ -73,6 +74,7 @@ pub struct ResultTabsWidget {
 #[derive(Clone)]
 struct ResultTab {
     id: ResultTabId,
+    title: String,
     group: Group,
     table: ResultTableWidget,
     status: ResultTabStatus,
@@ -85,7 +87,6 @@ struct ResultSections {
     script_output: Group,
     dbms_output: Group,
     messages: Group,
-    explain_plan: Group,
 }
 
 #[derive(Clone)]
@@ -201,13 +202,12 @@ impl Drop for PointerEventSuppressGuard {
 impl ResultTabsWidget {
     const INNER_TAB_TOP_GAP: i32 = 10;
 
-    fn top_level_tab_labels() -> [&'static str; 5] {
+    fn top_level_tab_labels() -> [&'static str; 4] {
         [
             " Data Grid ",
             " Script Output ",
             " DBMS Output ",
             " Messages ",
-            " Explain Plan ",
         ]
     }
 
@@ -506,6 +506,20 @@ impl ResultTabsWidget {
         format!(" {} ", Self::result_tab_title(index, status, row_count))
     }
 
+    fn result_tab_label_for_title(
+        title: &str,
+        index: usize,
+        status: ResultTabStatus,
+        row_count: usize,
+    ) -> String {
+        let title = title.trim();
+        if title.is_empty() || title == "Result" {
+            Self::result_tab_label(index, status, row_count)
+        } else {
+            format!(" {} ({}) ", title, row_count)
+        }
+    }
+
     fn tabs_contains_group(tabs: &Tabs, group: &Group) -> bool {
         !tabs.was_deleted() && !group.was_deleted() && tabs.find(group) < tabs.children()
     }
@@ -542,6 +556,7 @@ impl ResultTabsWidget {
 
     fn update_tab_group_label(
         &mut self,
+        title: &str,
         index: usize,
         mut group: Group,
         status: ResultTabStatus,
@@ -550,7 +565,9 @@ impl ResultTabsWidget {
         if self.data_tabs.was_deleted() || group.was_deleted() {
             return;
         }
-        group.set_label(&Self::result_tab_label(index, status, row_count));
+        group.set_label(&Self::result_tab_label_for_title(
+            title, index, status, row_count,
+        ));
         group.redraw();
         self.data_tabs.redraw();
     }
@@ -569,13 +586,13 @@ impl ResultTabsWidget {
             data.get_mut(index).map(|tab| {
                 tab.status = status;
                 tab.row_count = row_count;
-                (tab.group.clone(), tab.table.clone())
+                (tab.title.clone(), tab.group.clone(), tab.table.clone())
             })
         };
-        if let Some((group, _)) = tab_parts.as_ref() {
-            self.update_tab_group_label(index, group.clone(), status, row_count);
+        if let Some((title, group, _)) = tab_parts.as_ref() {
+            self.update_tab_group_label(title, index, group.clone(), status, row_count);
         }
-        tab_parts
+        tab_parts.map(|(_, group, table)| (group, table))
     }
 
     fn style_tabs(tabs: &mut Tabs) {
@@ -642,7 +659,6 @@ impl ResultTabsWidget {
         f(&self.dbms_output);
         f(&self.messages_info);
         f(&self.messages_errors);
-        f(&self.explain_plan);
     }
 
     fn append_lines_to_pane(pane: &Arc<Mutex<TextPane>>, lines: &[String]) {
@@ -717,7 +733,7 @@ impl ResultTabsWidget {
         let text_size = *font_size
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let [data_grid_label, script_output_label, dbms_output_label, messages_label, explain_label] =
+        let [data_grid_label, script_output_label, dbms_output_label, messages_label] =
             Self::top_level_tab_labels();
         let [script_output_output_label, script_output_errors_label] =
             Self::script_output_tab_labels();
@@ -819,20 +835,6 @@ impl ResultTabsWidget {
         messages_section.resizable(&messages_tabs);
         messages_section.end();
 
-        let explain_section =
-            Self::create_section_group(section_x, section_y, section_w, section_h, explain_label);
-        explain_section.begin();
-        let explain_plan_pane = Self::create_text_pane(
-            section_x,
-            section_y,
-            section_w,
-            section_h,
-            "",
-            text_profile,
-            text_size,
-        );
-        explain_section.resizable(&explain_plan_pane.group);
-        explain_section.end();
         tabs.end();
         let _ = tabs.set_value(&data_grid_section);
         let _ = script_tabs.set_value(&script_output_pane.group);
@@ -843,7 +845,6 @@ impl ResultTabsWidget {
             script_output: script_section,
             dbms_output: dbms_section,
             messages: messages_section,
-            explain_plan: explain_section,
         };
 
         let script_output = Arc::new(Mutex::new(script_output_pane));
@@ -851,7 +852,6 @@ impl ResultTabsWidget {
         let dbms_output = Arc::new(Mutex::new(dbms_output_pane));
         let messages_info = Arc::new(Mutex::new(messages_info_pane));
         let messages_errors = Arc::new(Mutex::new(messages_errors_pane));
-        let explain_plan = Arc::new(Mutex::new(explain_plan_pane));
 
         let data_for_cb = data.clone();
         let active_for_cb = active_index.clone();
@@ -1002,7 +1002,6 @@ impl ResultTabsWidget {
         let mut script_tabs_for_resize = script_tabs.clone();
         let mut messages_tabs_for_resize = messages_tabs.clone();
         let dbms_output_for_resize = dbms_output.clone();
-        let explain_plan_for_resize = explain_plan.clone();
         tabs.resize_callback(move |t, _, _, _, _| {
             Self::layout_children(t);
             Self::layout_active_inner_tabs(
@@ -1020,12 +1019,6 @@ impl ResultTabsWidget {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 Self::layout_text_pane_in_group(&sections_for_resize.dbms_output, &mut pane);
             }
-            {
-                let mut pane = explain_plan_for_resize
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                Self::layout_text_pane_in_group(&sections_for_resize.explain_plan, &mut pane);
-            }
         });
 
         Self {
@@ -1041,7 +1034,6 @@ impl ResultTabsWidget {
             dbms_output,
             messages_info,
             messages_errors,
-            explain_plan,
             next_result_tab_id,
             font_profile,
             font_size,
@@ -1229,15 +1221,38 @@ impl ResultTabsWidget {
         Self::append_lines_to_pane(pane, lines);
     }
 
-    pub fn set_explain_plan_text(&mut self, text: &str) {
-        Self::set_pane_text(&self.explain_plan, text);
-        self.select_explain_plan();
+    fn text_result(sql: &str, text: &str, message: &str) -> QueryResult {
+        let rows = if text.is_empty() {
+            Vec::new()
+        } else {
+            text.lines().map(|line| vec![line.to_string()]).collect()
+        };
+        QueryResult {
+            sql: sql.to_string(),
+            columns: vec![ColumnInfo {
+                name: "Text".to_string(),
+                data_type: "VARCHAR2".to_string(),
+            }],
+            row_count: rows.len(),
+            rows,
+            execution_time: Duration::ZERO,
+            message: message.to_string(),
+            is_select: true,
+            success: true,
+        }
+    }
+
+    pub fn append_explain_plan_tab(&mut self, text: &str) {
+        let tab_id = self.reserve_result_tab_id();
+        self.ensure_statement_tab_by_id(tab_id, "Explain Plan", true);
+        let result = Self::text_result("Explain Plan", text, "Explain plan loaded");
+        self.display_result_by_id(tab_id, &result);
     }
 
     fn start_statement_with_selection(
         &mut self,
         index: usize,
-        _label: &str,
+        label: &str,
         select_tab: bool,
         id: Option<ResultTabId>,
     ) {
@@ -1263,7 +1278,9 @@ impl ResultTabsWidget {
         self.data_tabs.begin();
         // Use explicit tab content bounds to avoid relying on hard-coded header height.
         let (x, y, w, h) = Self::content_bounds(&self.data_tabs);
-        let mut group = Group::new(x, y, w, h, None).with_label(&Self::result_tab_label(
+        let title = label.trim().to_string();
+        let mut group = Group::new(x, y, w, h, None).with_label(&Self::result_tab_label_for_title(
+            &title,
             index,
             ResultTabStatus::Running,
             0,
@@ -1335,6 +1352,7 @@ impl ResultTabsWidget {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             data.push(ResultTab {
                 id,
+                title,
                 group,
                 table,
                 status: ResultTabStatus::Running,
@@ -2140,11 +2158,6 @@ impl ResultTabsWidget {
         self.fire_on_change_callback();
     }
 
-    pub fn select_explain_plan(&mut self) {
-        self.select_top_group(&self.sections.explain_plan.clone());
-        self.fire_on_change_callback();
-    }
-
     pub fn clear_current_support_section(&mut self) -> bool {
         if self.top_group_is_current(&self.sections.script_output) {
             Self::clear_pane(&self.script_output);
@@ -2154,8 +2167,6 @@ impl ResultTabsWidget {
         } else if self.top_group_is_current(&self.sections.messages) {
             Self::clear_pane(&self.messages_info);
             Self::clear_pane(&self.messages_errors);
-        } else if self.top_group_is_current(&self.sections.explain_plan) {
-            Self::clear_pane(&self.explain_plan);
         } else {
             return false;
         }
@@ -2193,8 +2204,7 @@ mod tests {
                 " Data Grid ",
                 " Script Output ",
                 " DBMS Output ",
-                " Messages ",
-                " Explain Plan "
+                " Messages "
             ]
         );
         assert_eq!(
@@ -2295,6 +2305,42 @@ mod tests {
         assert_eq!(
             ResultTabsWidget::result_tab_label(6, ResultTabStatus::Cancelled, 0),
             " Cancelled (0) "
+        );
+    }
+
+    #[test]
+    fn result_tab_label_uses_custom_title_when_present() {
+        assert_eq!(
+            ResultTabsWidget::result_tab_label_for_title(
+                "Explain Plan",
+                0,
+                ResultTabStatus::Done,
+                12
+            ),
+            " Explain Plan (12) "
+        );
+        assert_eq!(
+            ResultTabsWidget::result_tab_label_for_title("Result", 0, ResultTabStatus::Done, 12),
+            " Done (12) "
+        );
+    }
+
+    #[test]
+    fn explain_plan_text_result_uses_text_column_only() {
+        let result = ResultTabsWidget::text_result(
+            "Explain Plan",
+            "Plan hash value: 1\nTABLE ACCESS FULL",
+            "loaded",
+        );
+
+        assert_eq!(result.columns.len(), 1);
+        assert_eq!(result.columns[0].name, "Text");
+        assert_eq!(
+            result.rows,
+            vec![
+                vec!["Plan hash value: 1".to_string()],
+                vec!["TABLE ACCESS FULL".to_string()],
+            ]
         );
     }
 
