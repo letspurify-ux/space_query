@@ -1697,6 +1697,28 @@ impl IntellisenseData {
         false
     }
 
+    pub fn qualifier_relation_member_name(
+        &self,
+        qualifier: &str,
+        candidate: &str,
+    ) -> Option<String> {
+        let candidate_upper = NameEntry::lookup_upper(candidate.trim());
+        if candidate_upper.is_empty() {
+            return None;
+        }
+
+        for key in Self::qualifier_lookup_keys(qualifier) {
+            if let Some(entries) = self.relation_member_entries_by_qualifier.get(&key) {
+                return entries
+                    .iter()
+                    .find(|entry| entry.upper == candidate_upper)
+                    .map(|entry| entry.name.clone());
+            }
+        }
+
+        None
+    }
+
     pub fn get_member_suggestions(
         &mut self,
         qualifier: &str,
@@ -2005,6 +2027,36 @@ impl IntellisenseData {
 
     pub fn default_qualifier_name(&self) -> Option<&str> {
         self.default_qualifier_name.as_deref()
+    }
+
+    pub fn canonical_qualifier_name(&self, qualifier: &str) -> Option<String> {
+        let qualifier = qualifier.trim();
+        if qualifier.is_empty() {
+            return None;
+        }
+
+        let mut exact_matches = self
+            .users
+            .iter()
+            .filter(|schema| schema.as_str() == qualifier);
+        match (exact_matches.next(), exact_matches.next()) {
+            (Some(schema), None) => return Some(schema.clone()),
+            (Some(_), Some(_)) => return None,
+            _ => {}
+        }
+
+        let mut matches = self
+            .users
+            .iter()
+            .filter(|schema| schema.eq_ignore_ascii_case(qualifier));
+        match (matches.next(), matches.next()) {
+            (Some(schema), None) => Some(schema.clone()),
+            (None, None) => self
+                .default_qualifier_name()
+                .filter(|default| default.eq_ignore_ascii_case(qualifier))
+                .map(str::to_string),
+            _ => None,
+        }
     }
 
     pub fn qualifier_has_member(

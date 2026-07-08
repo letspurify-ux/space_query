@@ -328,6 +328,21 @@ fn apply_relation_members_to_intellisense(
     }
 }
 
+fn canonical_intellisense_scope(
+    data: &IntellisenseData,
+    scope: Option<String>,
+    db_type: DatabaseType,
+) -> Option<String> {
+    let scope = scope
+        .map(|scope| scope.trim().to_string())
+        .filter(|scope| !scope.is_empty())?;
+    if crate::sql_text::mysql_compatibility_for_sql("", Some(db_type)) {
+        Some(data.canonical_qualifier_name(&scope).unwrap_or(scope))
+    } else {
+        Some(scope)
+    }
+}
+
 fn add_object_name_to_intellisense_list(
     data: &mut IntellisenseData,
     name: &str,
@@ -366,15 +381,26 @@ fn apply_selected_scope_objects_to_intellisense(
     data: &mut IntellisenseData,
     schema_objects: &HashMap<String, Vec<(String, String)>>,
     selected_scope: Option<&str>,
+    db_type: DatabaseType,
 ) {
     let Some(selected_scope) = selected_scope else {
         return;
     };
-    let Some(objects) = schema_objects
+
+    let objects = if let Some((_, objects)) = schema_objects
         .iter()
         .find(|(qualifier, _)| qualifier.as_str() == selected_scope)
-        .map(|(_, objects)| objects)
-    else {
+    {
+        objects
+    } else if crate::sql_text::mysql_compatibility_for_sql("", Some(db_type)) {
+        let mut matches = schema_objects
+            .iter()
+            .filter(|(qualifier, _)| qualifier.eq_ignore_ascii_case(selected_scope));
+        match (matches.next(), matches.next()) {
+            (Some((_, objects)), None) => objects,
+            _ => return,
+        }
+    } else {
         return;
     };
 
@@ -553,6 +579,7 @@ impl SchemaMetadataLoader for OracleSchemaMetadataLoader {
             &mut data,
             &schema_objects,
             selected_owner.as_deref(),
+            DatabaseType::Oracle,
         );
         apply_public_synonyms_to_intellisense(&mut data, &schema_objects);
         context.ensure_current().ok()?;
@@ -601,7 +628,10 @@ impl SchemaMetadataLoader for MysqlSchemaMetadataLoader {
             }
         };
         context.ensure_current().ok()?;
-        if !current_database.is_empty() && !schemas.iter().any(|schema| schema == &current_database)
+        if !current_database.is_empty()
+            && !schemas
+                .iter()
+                .any(|schema| schema.eq_ignore_ascii_case(&current_database))
         {
             schemas.push(current_database.clone());
         }
@@ -641,6 +671,8 @@ impl SchemaMetadataLoader for MysqlSchemaMetadataLoader {
 
         let mut data = IntellisenseData::new();
         data.users = schemas;
+        let selected_schema =
+            canonical_intellisense_scope(&data, selected_schema, expected_db_type);
         data.set_default_qualifier(selected_schema.clone());
         apply_schema_objects_to_intellisense(&mut data, &schema_objects);
         apply_relation_members_to_intellisense(&mut data, &relation_members);
@@ -648,6 +680,7 @@ impl SchemaMetadataLoader for MysqlSchemaMetadataLoader {
             &mut data,
             &schema_objects,
             selected_schema.as_deref(),
+            expected_db_type,
         );
         context.ensure_current().ok()?;
         Some(data)
@@ -5882,10 +5915,12 @@ impl MainWindow {
         Self::merge_unique_names(&mut data.events, &snapshot.events);
         Self::merge_unique_names(&mut data.synonyms, &snapshot.synonyms);
         Self::merge_unique_names(&mut data.packages, &snapshot.packages);
-        if let Some(scope) = snapshot.selected_scope.as_deref() {
-            data.set_default_qualifier(Some(scope.to_string()));
-            data.set_members_for_qualifier_with_kinds(scope, snapshot.qualified_members());
-            data.set_relation_members_for_qualifier(scope, snapshot.relation_members());
+        if let Some(scope) =
+            canonical_intellisense_scope(&data, snapshot.selected_scope.clone(), snapshot.db_type)
+        {
+            data.set_default_qualifier(Some(scope.clone()));
+            data.set_members_for_qualifier_with_kinds(&scope, snapshot.qualified_members());
+            data.set_relation_members_for_qualifier(&scope, snapshot.relation_members());
         }
         data.rebuild_indices();
         data
@@ -5932,13 +5967,34 @@ impl MainWindow {
         db_type: DatabaseType,
         update_scope: Option<&str>,
         current_scope: Option<&str>,
+        available_scopes: &[String],
     ) -> bool {
         let Some(current_scope) = current_scope else {
             return true;
         };
-        update_scope.is_some_and(|update_scope| {
-            db_type.scope_values_match(Some(update_scope), Some(current_scope))
-        })
+        let Some(update_scope) = update_scope else {
+            return false;
+        };
+        if db_type.scope_values_match(Some(update_scope), Some(current_scope)) {
+            return true;
+        }
+        if !matches!(db_type, DatabaseType::MySQL | DatabaseType::MariaDB) {
+            return false;
+        }
+        let update_scope = update_scope.trim();
+        let current_scope = current_scope.trim();
+        if update_scope.is_empty()
+            || current_scope.is_empty()
+            || !update_scope.eq_ignore_ascii_case(current_scope)
+        {
+            return false;
+        }
+        available_scopes
+            .iter()
+            .filter(|scope| scope.eq_ignore_ascii_case(current_scope))
+            .take(2)
+            .count()
+            == 1
     }
 
     fn metadata_pool_session_context(
@@ -5986,7 +6042,10 @@ impl MainWindow {
         highlight_data.columns = MainWindow::collect_highlight_columns(&data);
 
         Some(SchemaUpdate {
-            selected_scope: data.default_qualifier().map(str::to_string),
+            selected_scope: data
+                .default_qualifier_name()
+                .or_else(|| data.default_qualifier())
+                .map(str::to_string),
             data,
             highlight_data,
             connection_generation,
@@ -8379,6 +8438,7 @@ impl MainWindow {
                 snapshot.db_type,
                 snapshot.selected_scope.as_deref(),
                 current_scope.as_deref(),
+                &snapshot.available_scopes,
             ) {
                 return;
             }
@@ -8674,6 +8734,7 @@ impl MainWindow {
                                     update.db_type,
                                     update.selected_scope.as_deref(),
                                     current_scope.as_deref(),
+                                    &update.data.users,
                                 ) {
                                     continue;
                                 }
@@ -9409,7 +9470,12 @@ mod tests {
         data.set_default_qualifier(Some("SYSTEM".to_string()));
         apply_schema_objects_to_intellisense(&mut data, &schema_objects);
         apply_relation_members_to_intellisense(&mut data, &relation_members);
-        apply_selected_scope_objects_to_intellisense(&mut data, &schema_objects, Some("SYSTEM"));
+        apply_selected_scope_objects_to_intellisense(
+            &mut data,
+            &schema_objects,
+            Some("SYSTEM"),
+            crate::db::DatabaseType::Oracle,
+        );
         apply_public_synonyms_to_intellisense(&mut data, &schema_objects);
 
         assert!(data.tables.contains(&"OQT_THIN_META_T".to_string()));
@@ -9436,6 +9502,149 @@ mod tests {
     }
 
     #[test]
+    fn mysql_metadata_selected_scope_matches_schema_case_insensitively() {
+        let mut schema_objects = HashMap::new();
+        schema_objects.insert(
+            "SalesDb".to_string(),
+            vec![
+                ("OrderLine".to_string(), "TABLE".to_string()),
+                ("OrderLineView".to_string(), "VIEW".to_string()),
+                ("RunBilling".to_string(), "PROCEDURE".to_string()),
+                ("CalcTotal".to_string(), "FUNCTION".to_string()),
+            ],
+        );
+
+        let mut data = IntellisenseData::new();
+        data.users = vec!["SalesDb".to_string()];
+        data.set_default_qualifier(Some("salesdb".to_string()));
+        apply_schema_objects_to_intellisense(&mut data, &schema_objects);
+        apply_selected_scope_objects_to_intellisense(
+            &mut data,
+            &schema_objects,
+            Some("salesdb"),
+            crate::db::DatabaseType::MySQL,
+        );
+
+        assert!(data.tables.contains(&"OrderLine".to_string()));
+        assert!(data.views.contains(&"OrderLineView".to_string()));
+        assert!(data.procedures.contains(&"RunBilling".to_string()));
+        assert!(data.functions.contains(&"CalcTotal".to_string()));
+    }
+
+    #[test]
+    fn selected_scope_objects_preserve_oracle_case_sensitivity() {
+        let mut schema_objects = HashMap::new();
+        schema_objects.insert(
+            "MixedCase".to_string(),
+            vec![("QuotedOnly".to_string(), "TABLE".to_string())],
+        );
+
+        let mut data = IntellisenseData::new();
+        apply_schema_objects_to_intellisense(&mut data, &schema_objects);
+        apply_selected_scope_objects_to_intellisense(
+            &mut data,
+            &schema_objects,
+            Some("mixedcase"),
+            crate::db::DatabaseType::Oracle,
+        );
+
+        assert!(!data.tables.contains(&"QuotedOnly".to_string()));
+    }
+
+    #[test]
+    fn mysql_metadata_ambiguous_case_scope_does_not_choose_arbitrary_schema() {
+        let mut schema_objects = HashMap::new();
+        schema_objects.insert(
+            "SalesDb".to_string(),
+            vec![("UpperOrderLine".to_string(), "TABLE".to_string())],
+        );
+        schema_objects.insert(
+            "salesdb".to_string(),
+            vec![("LowerOrderLine".to_string(), "TABLE".to_string())],
+        );
+
+        let mut data = IntellisenseData::new();
+        apply_schema_objects_to_intellisense(&mut data, &schema_objects);
+        apply_selected_scope_objects_to_intellisense(
+            &mut data,
+            &schema_objects,
+            Some("SALESDB"),
+            crate::db::DatabaseType::MySQL,
+        );
+
+        assert!(data.tables.is_empty());
+    }
+
+    #[test]
+    fn canonical_intellisense_scope_uses_catalog_schema_case() {
+        let mut data = IntellisenseData::new();
+        data.users = vec!["SalesDb".to_string(), "ArchiveDb".to_string()];
+
+        assert_eq!(
+            canonical_intellisense_scope(
+                &data,
+                Some("salesdb".to_string()),
+                crate::db::DatabaseType::MySQL,
+            ),
+            Some("SalesDb".to_string())
+        );
+        assert_eq!(
+            canonical_intellisense_scope(
+                &data,
+                Some("  archivedb  ".to_string()),
+                crate::db::DatabaseType::MariaDB,
+            ),
+            Some("ArchiveDb".to_string())
+        );
+    }
+
+    #[test]
+    fn canonical_intellisense_scope_preserves_oracle_scope_case() {
+        let mut data = IntellisenseData::new();
+        data.users = vec!["MixedCase".to_string()];
+
+        assert_eq!(
+            canonical_intellisense_scope(
+                &data,
+                Some("mixedcase".to_string()),
+                crate::db::DatabaseType::Oracle,
+            ),
+            Some("mixedcase".to_string())
+        );
+    }
+
+    #[test]
+    fn canonical_intellisense_scope_preserves_ambiguous_mysql_scope_case() {
+        let mut data = IntellisenseData::new();
+        data.users = vec!["SalesDb".to_string(), "salesdb".to_string()];
+
+        assert_eq!(
+            canonical_intellisense_scope(
+                &data,
+                Some("SALESDB".to_string()),
+                crate::db::DatabaseType::MySQL,
+            ),
+            Some("SALESDB".to_string())
+        );
+    }
+
+    #[test]
+    fn canonical_intellisense_scope_prefers_exact_mysql_case_match() {
+        let mut data = IntellisenseData::new();
+        data.users = vec!["SalesDb".to_string(), "salesdb".to_string()];
+        data.set_default_qualifier(Some("SalesDb".to_string()));
+
+        assert_eq!(
+            canonical_intellisense_scope(
+                &data,
+                Some("salesdb".to_string()),
+                crate::db::DatabaseType::MySQL,
+            ),
+            Some("salesdb".to_string())
+        );
+    }
+
+    #[test]
     fn sql_file_paths_match_accepts_same_path() {
         let path = std::env::temp_dir().join("space_query_same.sql");
 
@@ -9456,32 +9665,86 @@ mod tests {
         assert!(MainWindow::schema_update_scope_matches(
             DatabaseType::Oracle,
             Some(" SCOTT "),
-            Some("SCOTT")
+            Some("SCOTT"),
+            &[]
         ));
         assert!(!MainWindow::schema_update_scope_matches(
             DatabaseType::Oracle,
             Some(" SCOTT "),
-            Some("scott")
+            Some("scott"),
+            &[]
         ));
         assert!(!MainWindow::schema_update_scope_matches(
             DatabaseType::MySQL,
             Some(" SCOTT "),
-            Some("scott")
+            Some("scott"),
+            &[]
         ));
         assert!(MainWindow::schema_update_scope_matches(
             DatabaseType::Oracle,
             Some("SCOTT"),
-            None
+            None,
+            &[]
         ));
         assert!(!MainWindow::schema_update_scope_matches(
             DatabaseType::Oracle,
             Some("SCOTT"),
-            Some("HR")
+            Some("HR"),
+            &[]
         ));
         assert!(!MainWindow::schema_update_scope_matches(
             DatabaseType::Oracle,
             None,
-            Some("HR")
+            Some("HR"),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn schema_update_scope_matches_unique_mysql_catalog_case() {
+        let available_scopes = vec!["SalesDb".to_string()];
+
+        assert!(MainWindow::schema_update_scope_matches(
+            DatabaseType::MySQL,
+            Some("SalesDb"),
+            Some("salesdb"),
+            &available_scopes
+        ));
+        assert!(MainWindow::schema_update_scope_matches(
+            DatabaseType::MariaDB,
+            Some("SALESDB"),
+            Some("SalesDb"),
+            &available_scopes
+        ));
+        assert!(!MainWindow::schema_update_scope_matches(
+            DatabaseType::Oracle,
+            Some("SalesDb"),
+            Some("salesdb"),
+            &available_scopes
+        ));
+        assert!(!MainWindow::schema_update_scope_matches(
+            DatabaseType::MySQL,
+            Some("SalesDb"),
+            Some("OtherDb"),
+            &available_scopes
+        ));
+    }
+
+    #[test]
+    fn schema_update_scope_rejects_ambiguous_mysql_case_variants() {
+        let available_scopes = vec!["SalesDb".to_string(), "salesdb".to_string()];
+
+        assert!(!MainWindow::schema_update_scope_matches(
+            DatabaseType::MySQL,
+            Some("SalesDb"),
+            Some("salesdb"),
+            &available_scopes
+        ));
+        assert!(MainWindow::schema_update_scope_matches(
+            DatabaseType::MySQL,
+            Some("salesdb"),
+            Some("salesdb"),
+            &available_scopes
         ));
     }
 

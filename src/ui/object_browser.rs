@@ -201,7 +201,20 @@ impl ObjectBrowserMetadataSnapshot {
     pub fn to_intellisense_data(&self) -> IntellisenseData {
         let mut data = IntellisenseData::new();
         data.users = self.available_scopes.clone();
-        data.set_default_qualifier(self.selected_scope.clone());
+        let selected_scope = self
+            .selected_scope
+            .as_deref()
+            .map(str::trim)
+            .filter(|scope| !scope.is_empty())
+            .map(|scope| {
+                if crate::sql_text::mysql_compatibility_for_sql("", Some(self.db_type)) {
+                    data.canonical_qualifier_name(scope)
+                        .unwrap_or_else(|| scope.to_string())
+                } else {
+                    scope.to_string()
+                }
+            });
+        data.set_default_qualifier(selected_scope.clone());
         data.tables = self.tables.clone();
         data.views = self.views.clone();
         data.procedures = self.procedures.clone();
@@ -211,7 +224,7 @@ impl ObjectBrowserMetadataSnapshot {
         data.events = self.events.clone();
         data.synonyms = self.synonyms.clone();
         data.packages = self.packages.clone();
-        if let Some(scope) = self.selected_scope.as_deref() {
+        if let Some(scope) = selected_scope.as_deref() {
             data.set_members_for_qualifier_with_kinds(scope, self.qualified_members());
             data.set_relation_members_for_qualifier(scope, self.relation_members());
         }
@@ -7289,7 +7302,7 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
         if !current_database.is_empty()
             && !available_scopes
                 .iter()
-                .any(|scope| scope == &current_database)
+                .any(|scope| scope.eq_ignore_ascii_case(&current_database))
         {
             available_scopes.push(current_database.clone());
         }
@@ -7298,7 +7311,16 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
         let selected_scope = requested_scope
             .filter(|scope| !scope.trim().is_empty())
             .or_else(|| (!current_database.is_empty()).then_some(current_database.clone()))
-            .or_else(|| available_scopes.first().cloned());
+            .or_else(|| available_scopes.first().cloned())
+            .map(|scope| {
+                let mut matches = available_scopes
+                    .iter()
+                    .filter(|available| available.eq_ignore_ascii_case(&scope));
+                match (matches.next(), matches.next()) {
+                    (Some(available), None) => available.clone(),
+                    _ => scope,
+                }
+            });
 
         if let Some(ref selected_scope) = selected_scope {
             if let Err(err) = mysql_conn.as_mut().select_db(selected_scope) {
@@ -7824,6 +7846,51 @@ mod tests {
         let highlight_data = snapshot.to_highlight_data();
         assert_eq!(highlight_data.tables, vec!["EMP".to_string()]);
         assert_eq!(highlight_data.views, vec!["EMP_VIEW".to_string()]);
+    }
+
+    #[test]
+    fn metadata_snapshot_canonicalizes_selected_scope_for_editor_metadata() {
+        let cache = ObjectCache {
+            tables: vec!["OrderLine".to_string()],
+            views: vec!["OrderLineView".to_string()],
+            ..Default::default()
+        };
+
+        let snapshot = ObjectBrowserMetadataSnapshot::from_cache(
+            DatabaseType::MySQL,
+            7,
+            vec!["SalesDb".to_string()],
+            Some("salesdb".to_string()),
+            &cache,
+        );
+
+        let mut data = snapshot.to_intellisense_data();
+        assert_eq!(data.default_qualifier_name(), Some("SalesDb"));
+        assert!(data
+            .get_member_suggestions("SalesDb", "Order", true)
+            .contains(&"OrderLine".to_string()));
+        assert!(data
+            .get_member_suggestions("salesdb", "Order", true)
+            .contains(&"OrderLineView".to_string()));
+    }
+
+    #[test]
+    fn metadata_snapshot_preserves_oracle_selected_scope_case_for_editor_metadata() {
+        let cache = ObjectCache {
+            tables: vec!["EMP".to_string()],
+            ..Default::default()
+        };
+
+        let snapshot = ObjectBrowserMetadataSnapshot::from_cache(
+            DatabaseType::Oracle,
+            7,
+            vec!["MixedCase".to_string()],
+            Some("mixedcase".to_string()),
+            &cache,
+        );
+
+        let data = snapshot.to_intellisense_data();
+        assert_eq!(data.default_qualifier_name(), Some("mixedcase"));
     }
 
     #[test]

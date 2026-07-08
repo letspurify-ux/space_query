@@ -28658,73 +28658,79 @@ fn dialect_specific_object_kind_slots_do_not_open_wrong_catalogs() {
         "NULLIF()",
     ];
 
-    for db in [MySQL, MariaDB] {
-        for (sql, leaked) in [
-            ("DROP PACKAGE |", "HR_PKG"),
-            ("DROP PACKAGE IF EXISTS |", "HR_PKG"),
-            ("DROP PACKAGE BODY |", "HR_PKG"),
-            ("DROP PACKAGE BODY IF EXISTS |", "HR_PKG"),
-            ("ALTER TYPE |", "ADDRESS_T"),
-            ("DROP TYPE IF EXISTS |", "ADDRESS_T"),
-            ("DROP TYPE BODY |", "ADDRESS_T"),
-            ("DROP TYPE BODY IF EXISTS |", "ADDRESS_T"),
-            ("DROP SEQUENCE |", "EMP_SEQ"),
-            ("DROP SEQUENCE IF EXISTS |", "EMP_SEQ"),
-            ("DROP SYNONYM |", "EMP_SYN"),
-            ("DROP SYNONYM IF EXISTS |", "EMP_SYN"),
-            ("DROP PUBLIC SYNONYM |", "PUBLIC_EMP"),
-            ("DROP PUBLIC SYNONYM IF EXISTS |", "PUBLIC_EMP"),
-            ("DROP DATABASE LINK |", "APP_LINK"),
-            ("DROP DATABASE LINK IF EXISTS |", "APP_LINK"),
-            ("DROP PUBLIC DATABASE LINK |", "APP_LINK"),
-            ("DROP PUBLIC DATABASE LINK IF EXISTS |", "APP_LINK"),
-            ("ALTER DATABASE LINK |", "APP_LINK"),
-            ("ALTER PUBLIC DATABASE LINK |", "APP_LINK"),
-            ("ALTER MATERIALIZED VIEW |", "MVIEW_SALES"),
-            ("DROP MATERIALIZED VIEW IF EXISTS |", "MVIEW_SALES"),
-            ("DROP DIRECTORY |", "DATA_PUMP_DIR"),
-            ("DROP DIRECTORY IF EXISTS |", "DATA_PUMP_DIR"),
-            ("ALTER LIBRARY |", "APP_LIB"),
-            ("DROP LIBRARY IF EXISTS |", "APP_LIB"),
-            ("ANALYZE CLUSTER |", "EMP_CLUSTER"),
-            ("DROP CLUSTER IF EXISTS |", "EMP_CLUSTER"),
-            ("DROP CONTEXT |", "APP_CTX"),
-            ("DROP CONTEXT IF EXISTS |", "APP_CTX"),
-            ("ALTER DIMENSION |", "SALES_DIM"),
-            ("DROP DIMENSION IF EXISTS |", "SALES_DIM"),
-            ("DROP OPERATOR |", "TEXT_OP"),
-            ("DROP OPERATOR IF EXISTS |", "TEXT_OP"),
-            ("ALTER INDEX |", "IDX_EMP_NAME"),
-            ("ALTER INDEXTYPE |", "TEXT_ITYPE"),
-            ("DROP INDEXTYPE IF EXISTS |", "TEXT_ITYPE"),
-            ("DROP EDITION |", "ORA_EDITION"),
-            ("DROP EDITION IF EXISTS |", "ORA_EDITION"),
-            ("ALTER TRIGGER |", "BI_EMP"),
-            ("ALTER JAVA SOURCE |", "Welcome"),
-            ("DROP JAVA SOURCE |", "Welcome"),
-            ("DROP JAVA SOURCE IF EXISTS |", "Welcome"),
-            ("ALTER JAVA CLASS |", "WelcomeClass"),
-            ("DROP JAVA CLASS |", "WelcomeClass"),
-            ("DROP JAVA CLASS IF EXISTS |", "WelcomeClass"),
-            ("DROP JAVA RESOURCE |", "WelcomeRes"),
-            ("DROP JAVA RESOURCE IF EXISTS |", "WelcomeRes"),
-            ("COMMENT ON TABLE |", "EMP"),
-            ("COMMENT ON TABLE app.|", "EMP"),
-            ("COMMENT ON COLUMN |", "EMP"),
-            ("COMMENT ON COLUMN app.|", "EMP"),
-            ("COMMENT ON VIEW |", "EMP_V"),
-            ("COMMENT ON VIEW app.|", "EMP_VIEW"),
-            ("COMMENT ON EDITIONING VIEW |", "EMP_V"),
-            ("COMMENT ON EDITIONING VIEW app.|", "EMP_VIEW"),
-            ("COMMENT ON MATERIALIZED VIEW |", "MVIEW_SALES"),
-            ("COMMENT ON MATERIALIZED VIEW app.|", "EMP_MV"),
-            ("COMMENT ON OPERATOR |", "TEXT_OP"),
-            ("COMMENT ON OPERATOR app.|", "EMP_OP"),
-            ("COMMENT ON INDEXTYPE |", "TEXT_ITYPE"),
-            ("COMMENT ON INDEXTYPE app.|", "EMP_ITYPE"),
-            ("COMMENT ON EDITION |", "ORA_EDITION"),
-            ("COMMENT ON EDITION app.|", "EMP_EDITION"),
-        ] {
+    let oracle_only_object_slots = [
+        ("ALTER TYPE |", "ADDRESS_T"),
+        ("DROP TYPE IF EXISTS |", "ADDRESS_T"),
+        ("DROP TYPE BODY |", "ADDRESS_T"),
+        ("DROP TYPE BODY IF EXISTS |", "ADDRESS_T"),
+        ("DROP SYNONYM |", "EMP_SYN"),
+        ("DROP SYNONYM IF EXISTS |", "EMP_SYN"),
+        ("DROP PUBLIC SYNONYM |", "PUBLIC_EMP"),
+        ("DROP PUBLIC SYNONYM IF EXISTS |", "PUBLIC_EMP"),
+        ("DROP DATABASE LINK |", "APP_LINK"),
+        ("DROP DATABASE LINK IF EXISTS |", "APP_LINK"),
+        ("DROP PUBLIC DATABASE LINK |", "APP_LINK"),
+        ("DROP PUBLIC DATABASE LINK IF EXISTS |", "APP_LINK"),
+        ("ALTER DATABASE LINK |", "APP_LINK"),
+        ("ALTER PUBLIC DATABASE LINK |", "APP_LINK"),
+        ("ALTER MATERIALIZED VIEW |", "MVIEW_SALES"),
+        ("DROP MATERIALIZED VIEW IF EXISTS |", "MVIEW_SALES"),
+        ("DROP DIRECTORY |", "DATA_PUMP_DIR"),
+        ("DROP DIRECTORY IF EXISTS |", "DATA_PUMP_DIR"),
+        ("ALTER LIBRARY |", "APP_LIB"),
+        ("DROP LIBRARY IF EXISTS |", "APP_LIB"),
+        ("ANALYZE CLUSTER |", "EMP_CLUSTER"),
+        ("DROP CLUSTER IF EXISTS |", "EMP_CLUSTER"),
+        ("DROP CONTEXT |", "APP_CTX"),
+        ("DROP CONTEXT IF EXISTS |", "APP_CTX"),
+        ("ALTER DIMENSION |", "SALES_DIM"),
+        ("DROP DIMENSION IF EXISTS |", "SALES_DIM"),
+        ("DROP OPERATOR |", "TEXT_OP"),
+        ("DROP OPERATOR IF EXISTS |", "TEXT_OP"),
+        ("ALTER INDEX |", "IDX_EMP_NAME"),
+        ("ALTER INDEXTYPE |", "TEXT_ITYPE"),
+        ("DROP INDEXTYPE IF EXISTS |", "TEXT_ITYPE"),
+        ("DROP EDITION |", "ORA_EDITION"),
+        ("DROP EDITION IF EXISTS |", "ORA_EDITION"),
+        ("ALTER TRIGGER |", "BI_EMP"),
+        ("ALTER JAVA SOURCE |", "Welcome"),
+        ("DROP JAVA SOURCE |", "Welcome"),
+        ("DROP JAVA SOURCE IF EXISTS |", "Welcome"),
+        ("ALTER JAVA CLASS |", "WelcomeClass"),
+        ("DROP JAVA CLASS |", "WelcomeClass"),
+        ("DROP JAVA CLASS IF EXISTS |", "WelcomeClass"),
+        ("DROP JAVA RESOURCE |", "WelcomeRes"),
+        ("DROP JAVA RESOURCE IF EXISTS |", "WelcomeRes"),
+        ("COMMENT ON TABLE |", "EMP"),
+        ("COMMENT ON TABLE app.|", "EMP"),
+        ("COMMENT ON COLUMN |", "EMP"),
+        ("COMMENT ON COLUMN app.|", "EMP"),
+        ("COMMENT ON VIEW |", "EMP_V"),
+        ("COMMENT ON VIEW app.|", "EMP_VIEW"),
+        ("COMMENT ON EDITIONING VIEW |", "EMP_V"),
+        ("COMMENT ON EDITIONING VIEW app.|", "EMP_VIEW"),
+        ("COMMENT ON MATERIALIZED VIEW |", "MVIEW_SALES"),
+        ("COMMENT ON MATERIALIZED VIEW app.|", "EMP_MV"),
+        ("COMMENT ON OPERATOR |", "TEXT_OP"),
+        ("COMMENT ON OPERATOR app.|", "EMP_OP"),
+        ("COMMENT ON INDEXTYPE |", "TEXT_ITYPE"),
+        ("COMMENT ON INDEXTYPE app.|", "EMP_ITYPE"),
+        ("COMMENT ON EDITION |", "ORA_EDITION"),
+        ("COMMENT ON EDITION app.|", "EMP_EDITION"),
+    ];
+    let mysql_only_package_object_slots = [
+        ("DROP PACKAGE |", "HR_PKG"),
+        ("DROP PACKAGE IF EXISTS |", "HR_PKG"),
+        ("DROP PACKAGE BODY |", "HR_PKG"),
+        ("DROP PACKAGE BODY IF EXISTS |", "HR_PKG"),
+    ];
+
+    for (db, cases) in [
+        (MySQL, oracle_only_object_slots.as_slice()),
+        (MariaDB, oracle_only_object_slots.as_slice()),
+        (MySQL, mysql_only_package_object_slots.as_slice()),
+    ] {
+        for (sql, leaked) in cases {
             let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
             assert_eq!(
                 kind,
@@ -29798,6 +29804,17 @@ fn mysql_structural_keyword_slots_are_dialect_scoped() {
         ("CREATE INDEX ix USING |", "BTREE"),
         ("CREATE INDEX ix USING |", "HASH"),
         ("CREATE INDEX ix USING BTREE |", "ON"),
+        ("CREATE INDEX ix ON emp (empno) |", "ALGORITHM"),
+        ("CREATE INDEX ix ON emp (empno) |", "COMMENT"),
+        ("CREATE INDEX ix ON emp (empno) |", "KEY_BLOCK_SIZE"),
+        ("CREATE INDEX ix ON emp (empno) |", "LOCK"),
+        ("CREATE INDEX ix ON emp (empno) |", "USING"),
+        ("CREATE INDEX ix ON emp (empno) |", "WITH"),
+        ("CREATE INDEX ix ON emp (empno) WITH |", "PARSER"),
+        ("CREATE INDEX ix ON emp (empno) ALGORITHM |", "DEFAULT"),
+        ("CREATE INDEX ix ON emp (empno) ALGORITHM |", "INPLACE"),
+        ("CREATE INDEX ix ON emp (empno) LOCK |", "NONE"),
+        ("CREATE INDEX ix ON emp (empno) LOCK |", "SHARED"),
         ("CREATE UNIQUE INDEX ix |", "ON"),
         ("CREATE UNIQUE INDEX ix USING HASH |", "ON"),
         ("CREATE FULLTEXT INDEX ix |", "ON"),
@@ -29869,6 +29886,10 @@ fn mysql_structural_keyword_slots_are_dialect_scoped() {
         ("DROP TABLE IF |", "EXISTS"),
         ("DROP DATABASE |", "IF"),
         ("DROP SCHEMA |", "IF"),
+        ("DROP SPATIAL |", "REFERENCE"),
+        ("DROP SPATIAL REFERENCE |", "SYSTEM"),
+        ("DROP SPATIAL REFERENCE SYSTEM |", "IF"),
+        ("DROP SPATIAL REFERENCE SYSTEM IF |", "EXISTS"),
         ("DROP USER |", "IF"),
         ("DROP ROLE |", "IF"),
         ("DROP VIEW |", "IF"),
@@ -29884,6 +29905,10 @@ fn mysql_structural_keyword_slots_are_dialect_scoped() {
         ("DROP INDEX ix |", "ON"),
         ("DROP INDEX ix ON emp |", "ALGORITHM"),
         ("DROP INDEX ix ON emp |", "LOCK"),
+        ("DROP INDEX ix ON emp ALGORITHM |", "DEFAULT"),
+        ("DROP INDEX ix ON emp ALGORITHM |", "INPLACE"),
+        ("DROP INDEX ix ON emp LOCK |", "NONE"),
+        ("DROP INDEX ix ON emp LOCK |", "SHARED"),
         ("ALTER ALGORITHM |", "MERGE"),
         ("ALTER ALGORITHM |", "TEMPTABLE"),
         ("ALTER ALGORITHM |", "UNDEFINED"),
@@ -30265,6 +30290,7 @@ fn mysql_structural_keyword_slots_are_dialect_scoped() {
             "FAILED_LOGIN_ATTEMPTS",
         ),
         ("CREATE USER alice DEFAULT ROLE |", "REQUIRE"),
+        ("CREATE ROLE report_reader |", "WITH"),
         ("CREATE USER alice COMMENT |", "ACCOUNT"),
         (
             "CREATE USER alice IDENTIFIED BY RANDOM PASSWORD |",
@@ -30432,6 +30458,9 @@ fn mysql_structural_keyword_slots_are_dialect_scoped() {
             "ALTER SERVER s OPTIONS USER alice PASSWORD secret |",
             "PASSWORD",
         ),
+        ("DROP INDEX |", "IF"),
+        ("DROP INDEX ix ON emp |", "WAIT"),
+        ("DROP INDEX ix ON emp |", "NOWAIT"),
     ] {
         let got = suggestions(sql);
         assert!(
@@ -30441,7 +30470,7 @@ fn mysql_structural_keyword_slots_are_dialect_scoped() {
     }
 
     let create_or_replace = suggestions("CREATE OR REPLACE |");
-    for oracle_only in ["PACKAGE", "TYPE", "TRIGGER", "USER", "SYNONYM"] {
+    for oracle_only in ["PACKAGE", "ROLE", "TYPE", "TRIGGER", "USER", "SYNONYM"] {
         assert!(
             !has(&create_or_replace, oracle_only),
             "{oracle_only} leaked into MySQL CREATE OR REPLACE: {create_or_replace:?}"
@@ -30728,12 +30757,16 @@ fn mariadb_structural_keyword_slots_are_dialect_scoped() {
         "FULLTEXT",
         "FUNCTION",
         "INDEX",
+        "PACKAGE",
         "PROCEDURE",
+        "ROLE",
         "SCHEMA",
+        "SEQUENCE",
         "TABLE",
         "TEMPORARY",
         "TRIGGER",
         "USER",
+        "VECTOR",
         "VIEW",
         "SQL",
     ] {
@@ -30743,10 +30776,8 @@ fn mariadb_structural_keyword_slots_are_dialect_scoped() {
         );
     }
     for oracle_only in [
-        "PACKAGE",
         "SYNONYM",
         "DIRECTORY",
-        "SEQUENCE",
         "MATERIALIZED",
         "EDITIONING",
         "JAVA",
@@ -30760,6 +30791,7 @@ fn mariadb_structural_keyword_slots_are_dialect_scoped() {
 
     for (sql, expected) in [
         ("CREATE OR REPLACE |", "VIEW"),
+        ("CREATE OR REPLACE |", "ROLE"),
         ("CREATE TABLE |", "IF"),
         ("CREATE TABLE IF |", "NOT"),
         ("CREATE TABLE IF NOT |", "EXISTS"),
@@ -30780,6 +30812,39 @@ fn mariadb_structural_keyword_slots_are_dialect_scoped() {
         ("CREATE USER alice |", "IDENTIFIED"),
         ("CREATE USER alice |", "REQUIRE"),
         ("CREATE USER alice |", "WITH"),
+        ("CREATE ROLE |", "IF"),
+        ("CREATE ROLE IF |", "NOT"),
+        ("CREATE ROLE IF NOT |", "EXISTS"),
+        ("CREATE ROLE report_reader |", "WITH"),
+        ("CREATE ROLE report_reader WITH |", "ADMIN"),
+        ("CREATE ROLE report_reader WITH ADMIN |", "CURRENT_ROLE"),
+        ("CREATE ROLE report_reader WITH ADMIN |", "CURRENT_USER"),
+        ("CREATE OR REPLACE ROLE |", "IF"),
+        ("CREATE OR REPLACE ROLE IF |", "NOT"),
+        ("CREATE OR REPLACE ROLE IF NOT |", "EXISTS"),
+        ("CREATE OR REPLACE ROLE report_reader |", "WITH"),
+        ("CREATE OR REPLACE ROLE report_reader WITH |", "ADMIN"),
+        ("CREATE INDEX |", "IF"),
+        ("CREATE INDEX IF |", "NOT"),
+        ("CREATE INDEX IF NOT |", "EXISTS"),
+        ("CREATE INDEX ix USING |", "RTREE"),
+        ("CREATE INDEX ix ON emp (empno) |", "CLUSTERING"),
+        ("CREATE INDEX ix ON emp (empno) |", "DISTANCE"),
+        ("CREATE INDEX ix ON emp (empno) |", "IGNORED"),
+        ("CREATE INDEX ix ON emp (empno) |", "NOWAIT"),
+        ("CREATE INDEX ix ON emp (empno) |", "WAIT"),
+        ("CREATE INDEX ix ON emp (empno) CLUSTERING |", "YES"),
+        ("CREATE INDEX ix ON emp (empno) DISTANCE |", "COSINE"),
+        ("CREATE INDEX ix ON emp (empno) NOT |", "IGNORED"),
+        ("CREATE INDEX ix ON emp (empno) ALGORITHM |", "INSTANT"),
+        ("CREATE VECTOR |", "INDEX"),
+        ("CREATE OR REPLACE VECTOR |", "INDEX"),
+        ("DROP INDEX |", "IF"),
+        ("DROP INDEX IF |", "EXISTS"),
+        ("DROP INDEX IF EXISTS ix |", "ON"),
+        ("DROP INDEX ix |", "ON"),
+        ("DROP INDEX ix ON emp |", "WAIT"),
+        ("DROP INDEX ix ON emp |", "NOWAIT"),
         ("INSTALL |", "PLUGIN"),
         ("INSTALL |", "COMPONENT"),
         ("UNINSTALL |", "PLUGIN"),
@@ -30795,6 +30860,14 @@ fn mariadb_structural_keyword_slots_are_dialect_scoped() {
         assert!(
             has(&got, expected),
             "{expected} missing for MariaDB keyword slot `{sql}`: {got:?}"
+        );
+    }
+
+    let drop_index_tail = suggestions("DROP INDEX ix ON emp |");
+    for mysql_only in ["ALGORITHM", "LOCK"] {
+        assert!(
+            !has(&drop_index_tail, mysql_only),
+            "{mysql_only} leaked into MariaDB DROP INDEX tail: {drop_index_tail:?}"
         );
     }
 }
@@ -54688,6 +54761,190 @@ fn create_sequence_option_list_offers_only_remaining_options() {
     assert!(!has(&kw("CREATE TABLE foo (x SEQUENCE |)"), "INCREMENT BY"));
 }
 
+#[test]
+fn mariadb_create_sequence_option_list_offers_mariadb_options_only() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let kw = |sql: &str, db: crate::db::DatabaseType| -> Vec<String> {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            &prefix,
+            &analyze_inline_cursor_sql(sql),
+            Some(db),
+        )
+    };
+    let suppressed = |sql: &str| {
+        let cursor = sql.find('|').expect("cursor");
+        let plain = sql.replace('|', "");
+        let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+        SqlEditorWidget::cursor_is_at_identifier_suppressing_keyword_slot_for_context(
+            &analyze_inline_cursor_sql(sql),
+            !prefix.is_empty(),
+            Some(MariaDB),
+        )
+    };
+    let has = |values: &[String], expected: &str| values.iter().any(|value| value == expected);
+
+    for sql in [
+        "CREATE SEQUENCE seq |",
+        "CREATE SEQUENCE IF NOT EXISTS seq |",
+        "CREATE OR REPLACE SEQUENCE seq |",
+        "CREATE TEMPORARY SEQUENCE seq |",
+        "CREATE SEQUENCE `seq` |",
+    ] {
+        let suggestions = kw(sql, MariaDB);
+        for expected in [
+            "AS",
+            "START WITH",
+            "INCREMENT BY",
+            "MINVALUE",
+            "NO MINVALUE",
+            "MAXVALUE",
+            "NO MAXVALUE",
+            "CACHE",
+            "NOCACHE",
+            "CYCLE",
+            "NOCYCLE",
+            "NO CYCLE",
+            "ENGINE",
+        ] {
+            assert!(
+                has(&suggestions, expected),
+                "{expected} missing from MariaDB sequence options at `{sql}`: {suggestions:?}"
+            );
+        }
+        for oracle_only in ["ORDER", "NOORDER", "KEEP", "NOKEEP", "SCALE", "NOSCALE", "GLOBAL"] {
+            assert!(
+                !has(&suggestions, oracle_only),
+                "Oracle-only sequence option {oracle_only} leaked into MariaDB at `{sql}`: {suggestions:?}"
+            );
+        }
+        assert!(
+            !has(&suggestions, "RESTART"),
+            "ALTER-only sequence option RESTART leaked into MariaDB CREATE at `{sql}`: {suggestions:?}"
+        );
+    }
+
+    for sql in ["ALTER SEQUENCE seq |", "ALTER SEQUENCE IF EXISTS seq |"] {
+        let suggestions = kw(sql, MariaDB);
+        for expected in [
+            "START WITH",
+            "INCREMENT BY",
+            "MINVALUE",
+            "NO MINVALUE",
+            "MAXVALUE",
+            "NO MAXVALUE",
+            "CACHE",
+            "CYCLE",
+            "NOCYCLE",
+            "NO CYCLE",
+            "RESTART",
+        ] {
+            assert!(
+                has(&suggestions, expected),
+                "{expected} missing from MariaDB ALTER SEQUENCE options at `{sql}`: {suggestions:?}"
+            );
+        }
+        for create_only in ["AS", "ENGINE", "NOCACHE"] {
+            assert!(
+                !has(&suggestions, create_only),
+                "CREATE-only sequence option {create_only} leaked into MariaDB ALTER at `{sql}`: {suggestions:?}"
+            );
+        }
+    }
+
+    let after_start = kw("CREATE SEQUENCE seq START WITH 1 |", MariaDB);
+    assert!(
+        !has(&after_start, "START WITH"),
+        "START WITH re-offered after value: {after_start:?}"
+    );
+    assert!(
+        has(&after_start, "INCREMENT BY"),
+        "INCREMENT BY missing after START WITH: {after_start:?}"
+    );
+    assert!(
+        has(&after_start, "ENGINE"),
+        "ENGINE missing after START WITH: {after_start:?}"
+    );
+
+    let after_engine = kw("CREATE SEQUENCE seq ENGINE InnoDB |", MariaDB);
+    assert!(!has(&after_engine, "ENGINE"));
+    assert!(has(&after_engine, "START WITH"));
+
+    let after_alter_start = kw("ALTER SEQUENCE seq START WITH 1 |", MariaDB);
+    assert!(!has(&after_alter_start, "START WITH"));
+    assert!(has(&after_alter_start, "INCREMENT BY"));
+    assert!(has(&after_alter_start, "RESTART"));
+
+    assert_eq!(
+        kw("CREATE SEQUENCE seq AS |", MariaDB),
+        vec![
+            "TINYINT".to_string(),
+            "SMALLINT".to_string(),
+            "MEDIUMINT".to_string(),
+            "INT".to_string(),
+            "INTEGER".to_string(),
+            "BIGINT".to_string(),
+        ]
+    );
+    let after_as_type = kw("CREATE SEQUENCE seq AS BIGINT |", MariaDB);
+    assert!(!has(&after_as_type, "AS"));
+    assert!(has(&after_as_type, "SIGNED"));
+    assert!(has(&after_as_type, "UNSIGNED"));
+    assert!(has(&after_as_type, "START WITH"));
+    let after_as_signed = kw("CREATE SEQUENCE seq AS BIGINT UNSIGNED |", MariaDB);
+    assert!(!has(&after_as_signed, "AS"));
+    assert!(has(&after_as_signed, "START WITH"));
+
+    assert_eq!(
+        kw("CREATE SEQUENCE seq NO |", MariaDB),
+        vec![
+            "MINVALUE".to_string(),
+            "MAXVALUE".to_string(),
+            "CYCLE".to_string(),
+        ]
+    );
+    let after_no_minvalue = kw("CREATE SEQUENCE seq NO MINVALUE |", MariaDB);
+    assert!(!has(&after_no_minvalue, "MINVALUE"));
+    assert!(!has(&after_no_minvalue, "NOMINVALUE"));
+    assert!(!has(&after_no_minvalue, "NO MINVALUE"));
+    assert!(has(&after_no_minvalue, "MAXVALUE"));
+
+    let after_increment_equals = kw("CREATE SEQUENCE seq INCREMENT = 3 |", MariaDB);
+    assert!(!has(&after_increment_equals, "INCREMENT BY"));
+    assert!(has(&after_increment_equals, "START WITH"));
+
+    let after_restart = kw("ALTER SEQUENCE seq RESTART |", MariaDB);
+    assert!(!has(&after_restart, "RESTART"));
+    assert!(has(&after_restart, "WITH"));
+    assert!(has(&after_restart, "START WITH"));
+    assert!(kw("ALTER SEQUENCE seq RESTART WITH |", MariaDB).is_empty());
+    assert!(suppressed("ALTER SEQUENCE seq RESTART WITH |"));
+    let after_restart_with_value = kw("ALTER SEQUENCE seq RESTART WITH 42 |", MariaDB);
+    assert!(!has(&after_restart_with_value, "RESTART"));
+    assert!(has(&after_restart_with_value, "START WITH"));
+
+    assert_eq!(
+        kw("CREATE SEQUENCE seq INCREMENT |", MariaDB),
+        vec!["BY".to_string()]
+    );
+    assert!(kw("CREATE SEQUENCE seq CACHE |", MariaDB).is_empty());
+    assert!(suppressed("CREATE SEQUENCE seq CACHE |"));
+    assert!(kw("ALTER SEQUENCE seq START WITH |", MariaDB).is_empty());
+    assert!(suppressed("ALTER SEQUENCE seq START WITH |"));
+
+    assert!(
+        kw("CREATE SEQUENCE seq |", MySQL).is_empty(),
+        "MySQL should not enable MariaDB sequence option keywords"
+    );
+    assert!(
+        kw("ALTER SEQUENCE seq |", MySQL).is_empty(),
+        "MySQL should not enable MariaDB ALTER SEQUENCE option keywords"
+    );
+}
+
 /// PL/SQL cursor statements: `OPEN <cur> FOR |` opens a query (`SELECT`/`WITH`),
 /// and `FETCH <cur> |` opens the destination (`INTO` / `BULK COLLECT`). Gated to an
 /// executable block so the SQL row-limiting `FETCH FIRST …` is never mistaken for a
@@ -57306,9 +57563,9 @@ fn for_update_wait_mode_is_oracle_only() {
     }
 }
 
-/// MySQL `CREATE INDEX` offers `ON <table>` and `USING <type>` each at most once —
-/// neither is re-offered after it is present (`CREATE INDEX i ON t (a) |` → `USING`
-/// only, not `ON` again), and a fully-specified index offers nothing more.
+/// MySQL-family `CREATE INDEX` offers `ON <table>` before the indexed-column list,
+/// then the dialect-specific index options after the list closes. `ON` itself is
+/// single-use; `USING` remains available as an index option after the column list.
 #[test]
 fn mysql_family_create_index_on_and_using_are_single_use() {
     use crate::db::DatabaseType::{MariaDB, MySQL};
@@ -57346,24 +57603,46 @@ fn mysql_family_create_index_on_and_using_are_single_use() {
         assert!(kw("CREATE INDEX i ON using |", db).is_empty());
         assert!(kw("CREATE INDEX i ON scott.using |", db).is_empty());
         assert!(kw("CREATE INDEX i ON t USING |", db).is_empty());
-        assert_eq!(
-            kw("CREATE INDEX i ON t (a) |", db),
-            vec!["USING".to_string()],
-            "USING should be available only after indexed-column list for {db:?}"
+        let after_columns = kw("CREATE INDEX i ON t (a) |", db);
+        for expected in ["ALGORITHM", "COMMENT", "KEY_BLOCK_SIZE", "LOCK", "USING", "WITH"] {
+            assert!(
+                after_columns.iter().any(|keyword| keyword == expected),
+                "{expected} missing after CREATE INDEX column list for {db:?}: {after_columns:?}"
+            );
+        }
+        assert!(
+            !after_columns.iter().any(|keyword| keyword == "ON"),
+            "ON re-offered after CREATE INDEX column list for {db:?}: {after_columns:?}"
         );
         assert_eq!(
             kw("CREATE INDEX i USING BTREE |", db),
             vec!["ON".to_string()],
             "ON should be available only after USING BTREE for {db:?}"
         );
-        assert_eq!(
-            kw("CREATE INDEX i USING |", db),
-            vec!["BTREE".to_string(), "HASH".to_string()],
-            "USING types for {db:?}"
-        );
+        let using_types = kw("CREATE INDEX i USING |", db);
+        for expected in ["BTREE", "HASH"] {
+            assert!(
+                using_types.iter().any(|keyword| keyword == expected),
+                "{expected} missing from CREATE INDEX USING types for {db:?}: {using_types:?}"
+            );
+        }
+        if db == MariaDB {
+            assert!(
+                using_types.iter().any(|keyword| keyword == "RTREE"),
+                "RTREE missing from MariaDB CREATE INDEX USING types: {using_types:?}"
+            );
+        }
         assert!(kw("CREATE INDEX i USING BTREE ON using |", db).is_empty());
-        assert!(kw("CREATE INDEX i ON t (a) USING BTREE |", db).is_empty());
-        assert!(kw("CREATE INDEX i USING BTREE ON t (a) |", db).is_empty());
+        assert!(
+            !kw("CREATE INDEX i ON t (a) USING BTREE |", db)
+                .iter()
+                .any(|keyword| keyword == "USING")
+        );
+        assert!(
+            !kw("CREATE INDEX i USING BTREE ON t (a) |", db)
+                .iter()
+                .any(|keyword| keyword == "ON")
+        );
     }
 }
 
@@ -64978,6 +65257,59 @@ fn mysql_family_user_account_slots_are_precise_in_final_suggestions() {
             }
         }
     }
+
+    for sql in [
+        "CREATE ROLE report_reader WITH ADMIN |",
+        "CREATE ROLE IF NOT EXISTS report_reader WITH ADMIN |",
+        "CREATE OR REPLACE ROLE report_reader WITH ADMIN |",
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, MariaDB);
+        assert_eq!(
+            kind,
+            Some(ExpectedObjectSuggestionKind::User),
+            "MariaDB CREATE ROLE WITH ADMIN should resolve the admin target as a user/role slot at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            contains(&final_suggestions, "APP_USER") && contains(&final_suggestions, "SCOTT"),
+            "MariaDB CREATE ROLE WITH ADMIN lost user/role catalog at `{sql}`: {final_suggestions:?}"
+        );
+        for leaked in ["EMP", "DEPT", "EMP_V", "RUN_JOB", "SELECT", "WHERE"] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into MariaDB CREATE ROLE WITH ADMIN target at `{sql}`: {final_suggestions:?}"
+            );
+        }
+    }
+
+    for sql in [
+        "CREATE ROLE report_reader WITH ADMIN app|",
+        "CREATE OR REPLACE ROLE report_reader WITH ADMIN app|",
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, MariaDB);
+        assert_eq!(
+            kind,
+            Some(ExpectedObjectSuggestionKind::User),
+            "prefixed MariaDB CREATE ROLE WITH ADMIN should resolve the admin target as a user/role slot at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            contains(&final_suggestions, "APP_USER"),
+            "prefixed MariaDB CREATE ROLE WITH ADMIN lost matching user/role catalog at `{sql}`: {final_suggestions:?}"
+        );
+        for leaked in ["SCOTT", "EMP", "DEPT", "EMP_V", "RUN_JOB", "SELECT", "WHERE"] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into prefixed MariaDB CREATE ROLE WITH ADMIN target at `{sql}`: {final_suggestions:?}"
+            );
+        }
+    }
+
+    let (kind, _keywords, _final_suggestions) =
+        audit_final_suggestions_for("CREATE ROLE report_reader WITH ADMIN |", MySQL);
+    assert_ne!(
+        kind,
+        Some(ExpectedObjectSuggestionKind::User),
+        "MySQL CREATE ROLE should not enable MariaDB-only WITH ADMIN account slots"
+    );
 }
 
 #[test]
@@ -66656,6 +66988,7 @@ fn ddl_object_target_slots_are_precise_in_final_suggestions() {
         ),
         (MariaDB, "CREATE INDEX idx_emp ON |"),
         (MariaDB, "DROP INDEX idx_emp ON |"),
+        (MariaDB, "DROP INDEX IF EXISTS idx_emp ON |"),
         (MariaDB, "CREATE TRIGGER trg BEFORE INSERT ON |"),
         (MariaDB, "CREATE TABLE child (parent_id INT REFERENCES |)"),
         (
@@ -67716,6 +68049,42 @@ fn object_kind_matrix_final_suggestions_stay_within_expected_family() {
             &["HR_PKG"],
         ),
         (
+            MariaDB,
+            "DROP PACKAGE |",
+            ExpectedObjectSuggestionKind::Package,
+            &["HR_PKG"],
+        ),
+        (
+            MariaDB,
+            "ALTER PACKAGE |",
+            ExpectedObjectSuggestionKind::Package,
+            &["HR_PKG"],
+        ),
+        (
+            MariaDB,
+            "ALTER PACKAGE BODY |",
+            ExpectedObjectSuggestionKind::Package,
+            &["HR_PKG"],
+        ),
+        (
+            MariaDB,
+            "DROP PACKAGE BODY |",
+            ExpectedObjectSuggestionKind::Package,
+            &["HR_PKG"],
+        ),
+        (
+            MariaDB,
+            "CREATE PACKAGE BODY |",
+            ExpectedObjectSuggestionKind::Package,
+            &["HR_PKG"],
+        ),
+        (
+            MariaDB,
+            "CREATE OR REPLACE PACKAGE BODY |",
+            ExpectedObjectSuggestionKind::Package,
+            &["HR_PKG"],
+        ),
+        (
             Oracle,
             "DROP SEQUENCE |",
             ExpectedObjectSuggestionKind::Sequence,
@@ -68379,6 +68748,75 @@ fn mysql_family_object_slots_exclude_oracle_only_relation_families() {
                 );
             }
         }
+    }
+}
+
+#[test]
+fn mariadb_sequence_object_slots_offer_sequences_without_enabling_mysql_sequences() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for sql in [
+        "DROP SEQUENCE |",
+        "DROP SEQUENCE IF EXISTS |",
+        "ALTER SEQUENCE |",
+        "DROP SEQUENCE app.emp|",
+        "DROP SEQUENCE IF EXISTS app.emp|",
+        "ALTER SEQUENCE app.emp|",
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, MariaDB);
+        assert_eq!(
+            kind,
+            Some(ExpectedObjectSuggestionKind::Sequence),
+            "MariaDB sequence DDL should resolve to sequence objects at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            contains(&final_suggestions, "EMP_SEQ"),
+            "MariaDB sequence DDL should offer sequences at `{sql}`: {final_suggestions:?}"
+        );
+
+        let (kind, _keywords, final_suggestions) = audit_final_suggestions_for(sql, MySQL);
+        assert_ne!(
+            kind,
+            Some(ExpectedObjectSuggestionKind::Sequence),
+            "MySQL should not enable sequence object slots at `{sql}`"
+        );
+        assert!(
+            !contains(&final_suggestions, "EMP_SEQ"),
+            "MySQL should not leak sequences at `{sql}`: {final_suggestions:?}"
+        );
+    }
+}
+
+#[test]
+fn mariadb_show_create_sequence_offers_sequences_without_enabling_mysql_sequences() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
+
+    for sql in ["SHOW CREATE SEQUENCE |", "SHOW CREATE SEQUENCE app.emp|"] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, MariaDB);
+        assert_eq!(
+            kind,
+            Some(ExpectedObjectSuggestionKind::Sequence),
+            "MariaDB SHOW CREATE SEQUENCE should resolve to sequence objects at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            contains(&final_suggestions, "EMP_SEQ"),
+            "MariaDB SHOW CREATE SEQUENCE should offer sequences at `{sql}`: {final_suggestions:?}"
+        );
+
+        let (kind, _keywords, final_suggestions) = audit_final_suggestions_for(sql, MySQL);
+        assert_ne!(
+            kind,
+            Some(ExpectedObjectSuggestionKind::Sequence),
+            "MySQL should not enable SHOW CREATE SEQUENCE object slots at `{sql}`"
+        );
+        assert!(
+            !contains(&final_suggestions, "EMP_SEQ"),
+            "MySQL should not leak sequences at `{sql}`: {final_suggestions:?}"
+        );
     }
 }
 
@@ -71299,54 +71737,62 @@ fn mysql_family_oracle_only_type_package_cluster_slots_do_not_offer_catalog_or_k
 
     let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
 
-    for db in [MySQL, MariaDB] {
-        for sql in [
-            "CREATE TYPE ty |",
-            "CREATE TYPE ty AS |",
-            "CREATE TYPE ty AS OBJECT |",
-            "CREATE TYPE ty AS OBJECT (|",
-            "CREATE TYPE ty AS OBJECT (attr |)",
-            "CREATE TYPE ty AS TABLE OF |",
-            "CREATE TYPE ty AS VARRAY(10) OF |",
-            "CREATE TYPE ty UNDER |",
-            "CREATE TYPE BODY |",
-            "CREATE TYPE BODY addr_t |",
-            "CREATE TYPE BODY addr_t AS |",
-            "CREATE OR REPLACE TYPE BODY addr_t AS |",
-            "ALTER TYPE |",
-            "ALTER TYPE addr_t |",
-            "ALTER TYPE BODY |",
-            "ALTER TYPE BODY addr_t |",
-            "DROP TYPE |",
-            "DROP TYPE addr_t |",
-            "DROP TYPE BODY |",
-            "DROP TYPE BODY addr_t |",
-            "CREATE PACKAGE pkg |",
-            "CREATE PACKAGE pkg AS |",
-            "CREATE PACKAGE pkg AS PROCEDURE |",
-            "CREATE PACKAGE BODY |",
-            "CREATE PACKAGE BODY hr_pkg |",
-            "CREATE PACKAGE BODY hr_pkg AS |",
-            "CREATE OR REPLACE PACKAGE BODY hr_pkg AS |",
-            "ALTER PACKAGE |",
-            "ALTER PACKAGE hr_pkg |",
-            "ALTER PACKAGE BODY |",
-            "ALTER PACKAGE BODY hr_pkg |",
-            "DROP PACKAGE |",
-            "DROP PACKAGE hr_pkg |",
-            "DROP PACKAGE BODY |",
-            "DROP PACKAGE BODY hr_pkg |",
-            "CREATE ROLLBACK SEGMENT rb |",
-            "ALTER ROLLBACK SEGMENT |",
-            "ALTER ROLLBACK SEGMENT rb |",
-            "DROP ROLLBACK SEGMENT |",
-            "DROP ROLLBACK SEGMENT rb |",
-            "CREATE CLUSTER cl |",
-            "ALTER CLUSTER |",
-            "ALTER CLUSTER cl |",
-            "DROP CLUSTER |",
-            "DROP CLUSTER cl |",
-        ] {
+    let common_oracle_only_sql = [
+        "CREATE TYPE ty |",
+        "CREATE TYPE ty AS |",
+        "CREATE TYPE ty AS OBJECT |",
+        "CREATE TYPE ty AS OBJECT (|",
+        "CREATE TYPE ty AS OBJECT (attr |)",
+        "CREATE TYPE ty AS TABLE OF |",
+        "CREATE TYPE ty AS VARRAY(10) OF |",
+        "CREATE TYPE ty UNDER |",
+        "CREATE TYPE BODY |",
+        "CREATE TYPE BODY addr_t |",
+        "CREATE TYPE BODY addr_t AS |",
+        "CREATE OR REPLACE TYPE BODY addr_t AS |",
+        "ALTER TYPE |",
+        "ALTER TYPE addr_t |",
+        "ALTER TYPE BODY |",
+        "ALTER TYPE BODY addr_t |",
+        "DROP TYPE |",
+        "DROP TYPE addr_t |",
+        "DROP TYPE BODY |",
+        "DROP TYPE BODY addr_t |",
+        "CREATE ROLLBACK SEGMENT rb |",
+        "ALTER ROLLBACK SEGMENT |",
+        "ALTER ROLLBACK SEGMENT rb |",
+        "DROP ROLLBACK SEGMENT |",
+        "DROP ROLLBACK SEGMENT rb |",
+        "CREATE CLUSTER cl |",
+        "ALTER CLUSTER |",
+        "ALTER CLUSTER cl |",
+        "DROP CLUSTER |",
+        "DROP CLUSTER cl |",
+    ];
+    let mysql_only_package_sql = [
+        "CREATE PACKAGE pkg |",
+        "CREATE PACKAGE pkg AS |",
+        "CREATE PACKAGE pkg AS PROCEDURE |",
+        "CREATE PACKAGE BODY |",
+        "CREATE PACKAGE BODY hr_pkg |",
+        "CREATE PACKAGE BODY hr_pkg AS |",
+        "CREATE OR REPLACE PACKAGE BODY hr_pkg AS |",
+        "ALTER PACKAGE |",
+        "ALTER PACKAGE hr_pkg |",
+        "ALTER PACKAGE BODY |",
+        "ALTER PACKAGE BODY hr_pkg |",
+        "DROP PACKAGE |",
+        "DROP PACKAGE hr_pkg |",
+        "DROP PACKAGE BODY |",
+        "DROP PACKAGE BODY hr_pkg |",
+    ];
+
+    for (db, sql_cases) in [
+        (MySQL, common_oracle_only_sql.as_slice()),
+        (MariaDB, common_oracle_only_sql.as_slice()),
+        (MySQL, mysql_only_package_sql.as_slice()),
+    ] {
+        for sql in sql_cases {
             let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
             assert!(
                 kind.is_none() || matches!(kind, Some(ExpectedObjectSuggestionKind::NoSuggestions)),
@@ -75028,26 +75474,47 @@ fn prefixed_new_name_slots_do_not_offer_catalog_or_keywords() {
         (MariaDB, "CREATE TABLE scott.|"),
         (MariaDB, "CREATE TEMPORARY TABLE app|"),
         (MariaDB, "CREATE TEMPORARY TABLE scott.|"),
+        (MariaDB, "CREATE OR REPLACE TABLE app|"),
+        (MariaDB, "CREATE OR REPLACE TABLE scott.|"),
+        (MariaDB, "CREATE OR REPLACE TEMPORARY TABLE app|"),
+        (MariaDB, "CREATE OR REPLACE TEMPORARY TABLE scott.|"),
         (MariaDB, "CREATE INDEX app|"),
         (MariaDB, "CREATE INDEX scott.|"),
         (MariaDB, "CREATE UNIQUE INDEX app|"),
         (MariaDB, "CREATE FULLTEXT INDEX app|"),
         (MariaDB, "CREATE SPATIAL INDEX app|"),
         (MariaDB, "CREATE TRIGGER app|"),
+        (MariaDB, "CREATE OR REPLACE TRIGGER app|"),
+        (MariaDB, "CREATE OR REPLACE TRIGGER scott.|"),
+        (MariaDB, "CREATE OR REPLACE DEFINER root TRIGGER app|"),
         (MariaDB, "CREATE DEFINER root TRIGGER app|"),
         (MariaDB, "CREATE DEFINER = root TRIGGER app|"),
         (MariaDB, "CREATE TRIGGER scott.|"),
         (MariaDB, "CREATE FUNCTION app|"),
+        (MariaDB, "CREATE OR REPLACE FUNCTION app|"),
+        (MariaDB, "CREATE OR REPLACE FUNCTION scott.|"),
+        (MariaDB, "CREATE OR REPLACE DEFINER root FUNCTION app|"),
         (MariaDB, "CREATE DEFINER root FUNCTION app|"),
         (MariaDB, "CREATE DEFINER = root FUNCTION app|"),
         (MariaDB, "CREATE FUNCTION IF NOT EXISTS app|"),
         (MariaDB, "CREATE FUNCTION scott.|"),
         (MariaDB, "CREATE PROCEDURE app|"),
+        (MariaDB, "CREATE OR REPLACE PROCEDURE app|"),
+        (MariaDB, "CREATE OR REPLACE PROCEDURE scott.|"),
+        (MariaDB, "CREATE OR REPLACE DEFINER root PROCEDURE app|"),
         (MariaDB, "CREATE DEFINER root PROCEDURE app|"),
         (MariaDB, "CREATE DEFINER = root PROCEDURE app|"),
         (MariaDB, "CREATE PROCEDURE IF NOT EXISTS app|"),
         (MariaDB, "CREATE PROCEDURE scott.|"),
+        (MariaDB, "CREATE PACKAGE app|"),
+        (MariaDB, "CREATE PACKAGE scott.|"),
+        (MariaDB, "CREATE PACKAGE IF NOT EXISTS app|"),
+        (MariaDB, "CREATE OR REPLACE PACKAGE app|"),
+        (MariaDB, "CREATE OR REPLACE DEFINER root PACKAGE app|"),
         (MariaDB, "CREATE EVENT app|"),
+        (MariaDB, "CREATE OR REPLACE EVENT app|"),
+        (MariaDB, "CREATE OR REPLACE EVENT scott.|"),
+        (MariaDB, "CREATE OR REPLACE DEFINER root EVENT app|"),
         (MariaDB, "CREATE DEFINER root EVENT app|"),
         (MariaDB, "CREATE DEFINER = root EVENT app|"),
         (MariaDB, "CREATE EVENT IF NOT EXISTS app|"),
@@ -75064,6 +75531,8 @@ fn prefixed_new_name_slots_do_not_offer_catalog_or_keywords() {
         (MariaDB, "CREATE USER alice, scott.|"),
         (MariaDB, "CREATE USER alice IDENTIFIED BY 'secret', app|"),
         (MariaDB, "CREATE ROLE app|"),
+        (MariaDB, "CREATE OR REPLACE ROLE app|"),
+        (MariaDB, "CREATE OR REPLACE ROLE IF NOT EXISTS app|"),
         (MariaDB, "CREATE ROLE scott.|"),
         (MariaDB, "CREATE ROLE report_reader, app|"),
         (MariaDB, "CREATE ROLE report_reader, scott.|"),
@@ -75087,6 +75556,9 @@ fn prefixed_new_name_slots_do_not_offer_catalog_or_keywords() {
         (MySQL, "CREATE LIBRARY app|"),
         (MySQL, "CREATE JAVA SOURCE NAMED app|"),
         (MariaDB, "CREATE SEQUENCE app|"),
+        (MariaDB, "CREATE OR REPLACE SEQUENCE app|"),
+        (MariaDB, "CREATE TEMPORARY SEQUENCE app|"),
+        (MariaDB, "CREATE OR REPLACE TEMPORARY SEQUENCE app|"),
         (MariaDB, "CREATE SYNONYM app|"),
         (MariaDB, "CREATE PUBLIC SYNONYM app|"),
         (MariaDB, "CREATE DATABASE LINK app|"),
@@ -75227,33 +75699,52 @@ fn prefixed_new_name_slots_do_not_offer_catalog_or_keywords() {
         (MariaDB, "CREATE TABLE n|"),
         (MariaDB, "CREATE TABLE IF NOT EXISTS n|"),
         (MariaDB, "CREATE TEMPORARY TABLE n|"),
+        (MariaDB, "CREATE OR REPLACE TABLE n|"),
+        (MariaDB, "CREATE OR REPLACE TEMPORARY TABLE n|"),
         (MariaDB, "CREATE INDEX n|"),
         (MariaDB, "CREATE UNIQUE INDEX n|"),
         (MariaDB, "CREATE FULLTEXT INDEX n|"),
         (MariaDB, "CREATE SPATIAL INDEX n|"),
         (MariaDB, "CREATE TRIGGER n|"),
+        (MariaDB, "CREATE OR REPLACE TRIGGER n|"),
+        (MariaDB, "CREATE OR REPLACE DEFINER root TRIGGER n|"),
         (MariaDB, "CREATE DEFINER root TRIGGER n|"),
         (MariaDB, "CREATE FUNCTION n|"),
+        (MariaDB, "CREATE OR REPLACE FUNCTION n|"),
+        (MariaDB, "CREATE OR REPLACE DEFINER root FUNCTION n|"),
         (MariaDB, "CREATE DEFINER root FUNCTION n|"),
         (MariaDB, "CREATE FUNCTION IF NOT EXISTS n|"),
         (MariaDB, "CREATE PROCEDURE n|"),
+        (MariaDB, "CREATE OR REPLACE PROCEDURE n|"),
+        (MariaDB, "CREATE OR REPLACE DEFINER root PROCEDURE n|"),
         (MariaDB, "CREATE DEFINER root PROCEDURE n|"),
         (MariaDB, "CREATE PROCEDURE IF NOT EXISTS n|"),
+        (MariaDB, "CREATE PACKAGE n|"),
+        (MariaDB, "CREATE PACKAGE IF NOT EXISTS n|"),
+        (MariaDB, "CREATE OR REPLACE PACKAGE n|"),
+        (MariaDB, "CREATE OR REPLACE DEFINER root PACKAGE n|"),
         (MariaDB, "CREATE DATABASE n|"),
         (MariaDB, "CREATE DATABASE IF NOT EXISTS n|"),
         (MariaDB, "CREATE SCHEMA n|"),
         (MariaDB, "CREATE SCHEMA IF NOT EXISTS n|"),
         (MariaDB, "CREATE EVENT n|"),
+        (MariaDB, "CREATE OR REPLACE EVENT n|"),
+        (MariaDB, "CREATE OR REPLACE DEFINER root EVENT n|"),
         (MariaDB, "CREATE DEFINER root EVENT n|"),
         (MariaDB, "CREATE EVENT IF NOT EXISTS n|"),
         (MariaDB, "CREATE USER n|"),
         (MariaDB, "CREATE ROLE n|"),
+        (MariaDB, "CREATE OR REPLACE ROLE n|"),
+        (MariaDB, "CREATE OR REPLACE ROLE IF NOT EXISTS n|"),
         (MariaDB, "RENAME TABLE emp TO n|"),
         (MariaDB, "RENAME USER alice TO n|"),
         (MariaDB, "ALTER TABLE emp RENAME TO n|"),
         (MariaDB, "ALTER TABLE emp RENAME COLUMN old_col TO n|"),
         (MariaDB, "ALTER EVENT ev RENAME TO n|"),
         (MariaDB, "CREATE SEQUENCE n|"),
+        (MariaDB, "CREATE OR REPLACE SEQUENCE n|"),
+        (MariaDB, "CREATE TEMPORARY SEQUENCE n|"),
+        (MariaDB, "CREATE OR REPLACE TEMPORARY SEQUENCE n|"),
         (MariaDB, "CREATE SYNONYM n|"),
         (MariaDB, "CREATE PUBLIC SYNONYM n|"),
         (MariaDB, "CREATE DATABASE LINK n|"),
@@ -75370,23 +75861,36 @@ fn empty_new_name_slots_do_not_offer_catalog() {
         (MariaDB, "CREATE TABLE |"),
         (MariaDB, "CREATE TABLE IF NOT EXISTS |"),
         (MariaDB, "CREATE TEMPORARY TABLE |"),
+        (MariaDB, "CREATE OR REPLACE TABLE |"),
+        (MariaDB, "CREATE OR REPLACE TEMPORARY TABLE |"),
         (MariaDB, "CREATE INDEX |"),
         (MariaDB, "CREATE FUNCTION |"),
+        (MariaDB, "CREATE OR REPLACE FUNCTION |"),
+        (MariaDB, "CREATE OR REPLACE DEFINER root FUNCTION |"),
         (MariaDB, "CREATE DEFINER root FUNCTION |"),
         (MariaDB, "CREATE DEFINER = root FUNCTION |"),
         (MariaDB, "CREATE FUNCTION IF NOT EXISTS |"),
         (MariaDB, "CREATE PROCEDURE |"),
+        (MariaDB, "CREATE OR REPLACE PROCEDURE |"),
+        (MariaDB, "CREATE OR REPLACE DEFINER root PROCEDURE |"),
         (MariaDB, "CREATE DEFINER root PROCEDURE |"),
         (MariaDB, "CREATE DEFINER = root PROCEDURE |"),
         (MariaDB, "CREATE PROCEDURE IF NOT EXISTS |"),
+        (MariaDB, "CREATE PACKAGE IF NOT EXISTS |"),
         (MariaDB, "CREATE EVENT |"),
+        (MariaDB, "CREATE OR REPLACE EVENT |"),
+        (MariaDB, "CREATE OR REPLACE DEFINER root EVENT |"),
         (MariaDB, "CREATE DEFINER root EVENT |"),
         (MariaDB, "CREATE DEFINER = root EVENT |"),
         (MariaDB, "CREATE EVENT IF NOT EXISTS |"),
+        (MariaDB, "CREATE OR REPLACE TRIGGER |"),
+        (MariaDB, "CREATE OR REPLACE DEFINER root TRIGGER |"),
         (MariaDB, "CREATE DEFINER root TRIGGER |"),
         (MariaDB, "CREATE DEFINER = root TRIGGER |"),
         (MariaDB, "CREATE USER |"),
         (MariaDB, "CREATE ROLE |"),
+        (MariaDB, "CREATE OR REPLACE ROLE |"),
+        (MariaDB, "CREATE OR REPLACE ROLE IF NOT EXISTS |"),
         (MariaDB, "RENAME TABLE emp TO |"),
         (MariaDB, "RENAME TABLE emp TO emp2, dept TO |"),
         (MariaDB, "RENAME USER alice TO |"),
@@ -75394,6 +75898,9 @@ fn empty_new_name_slots_do_not_offer_catalog() {
         (MariaDB, "ALTER TABLE emp RENAME COLUMN old_col TO |"),
         (MariaDB, "ALTER TABLE emp RENAME INDEX old_idx TO |"),
         (MariaDB, "CREATE SEQUENCE |"),
+        (MariaDB, "CREATE OR REPLACE SEQUENCE |"),
+        (MariaDB, "CREATE TEMPORARY SEQUENCE |"),
+        (MariaDB, "CREATE OR REPLACE TEMPORARY SEQUENCE |"),
         (MariaDB, "CREATE SYNONYM |"),
         (MariaDB, "CREATE PUBLIC SYNONYM |"),
         (MariaDB, "CREATE DATABASE LINK |"),
@@ -75675,6 +76182,11 @@ fn mysql_option_value_slots_do_not_offer_object_catalog_in_final_suggestions() {
             "CREATE FUNCTION f RETURNS INT COMMENT |",
             "CREATE DEFINER root FUNCTION f RETURNS INT COMMENT |",
             "CREATE FUNCTION IF NOT EXISTS f RETURNS INT COMMENT |",
+            "CREATE FUNCTION f RETURNS INTEGER SONAME |",
+            "CREATE FUNCTION f RETURNS INTEGER SONAME udf_lib |",
+            "CREATE FUNCTION f RETURNS INTEGER SONAME app|",
+            "CREATE AGGREGATE FUNCTION f RETURNS INTEGER SONAME |",
+            "CREATE AGGREGATE FUNCTION f RETURNS INTEGER SONAME udf_lib |",
             "ALTER FUNCTION f COMMENT |",
             "CREATE PROCEDURE p COMMENT |",
             "CREATE DEFINER root PROCEDURE p COMMENT |",
@@ -75773,11 +76285,114 @@ fn mysql_option_value_slots_do_not_offer_object_catalog_in_final_suggestions() {
                 "NOW()",
                 "NULLIF()",
             ] {
+                if db == MariaDB && leaked == "NOT" && sql.contains("INDEX") {
+                    continue;
+                }
                 assert!(
                 !contains(&final_suggestions, leaked),
                 "{leaked} leaked into MySQL option value slot at `{sql}` for {db:?}: {final_suggestions:?}"
             );
             }
+        }
+    }
+
+    for sql in [
+        "DROP INDEX idx_emp ON emp WAIT |",
+        "DROP INDEX idx_emp ON emp WAIT 5 |",
+        "DROP INDEX idx_emp ON emp NOWAIT |",
+    ] {
+        let (_kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, MariaDB);
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "APP_USER",
+            "SCOTT",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "SELECT",
+            "WHERE",
+            "NOT",
+            "SQL",
+            "NULL",
+            "NOW()",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into MariaDB DROP INDEX wait option slot at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+            );
+        }
+    }
+
+    for sql in [
+        "CREATE SPATIAL REFERENCE SYSTEM |",
+        "CREATE OR REPLACE SPATIAL REFERENCE SYSTEM |",
+        "CREATE SPATIAL REFERENCE SYSTEM 4326 NAME |",
+        "CREATE SPATIAL REFERENCE SYSTEM 4326 NAME n|",
+        "CREATE SPATIAL REFERENCE SYSTEM 4326 DEFINITION |",
+        "CREATE SPATIAL REFERENCE SYSTEM 4326 DESCRIPTION |",
+        "CREATE SPATIAL REFERENCE SYSTEM 4326 ORGANIZATION |",
+        "CREATE SPATIAL REFERENCE SYSTEM 4326 ORGANIZATION org|",
+        "CREATE SPATIAL REFERENCE SYSTEM 4326 ORGANIZATION 'EPSG' IDENTIFIED BY |",
+        "CREATE SPATIAL REFERENCE SYSTEM 4326 ORGANIZATION 'EPSG' IDENTIFIED BY x|",
+        "DROP SPATIAL REFERENCE SYSTEM |",
+        "DROP SPATIAL REFERENCE SYSTEM 4326 |",
+        "DROP SPATIAL REFERENCE SYSTEM IF EXISTS |",
+        "DROP SPATIAL REFERENCE SYSTEM IF EXISTS 4326 |",
+    ] {
+        let (_kind, _keywords, final_suggestions) = audit_final_suggestions_for(sql, MySQL);
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "APP_USER",
+            "SCOTT",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "SELECT",
+            "WHERE",
+            "NOT",
+            "SQL",
+            "NULL",
+            "NTH_VALUE",
+            "NTILE",
+            "NOW()",
+            "NULLIF()",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into MySQL SRS value slot at `{sql}`: {final_suggestions:?}"
+            );
+        }
+    }
+
+    for sql in [
+        "CREATE PACKAGE pkg COMMENT |",
+        "CREATE PACKAGE pkg COMMENT n|",
+        "CREATE PACKAGE BODY pkg COMMENT |",
+        "CREATE PACKAGE BODY pkg COMMENT n|",
+        "CREATE OR REPLACE DEFINER root PACKAGE pkg COMMENT |",
+        "CREATE OR REPLACE DEFINER root PACKAGE pkg COMMENT n|",
+    ] {
+        let (_kind, _keywords, final_suggestions) = audit_final_suggestions_for(sql, MariaDB);
+        for leaked in [
+            "EMP",
+            "DEPT",
+            "EMP_V",
+            "APP_USER",
+            "SCOTT",
+            "RUN_JOB",
+            "CALC_TOTAL",
+            "SELECT",
+            "WHERE",
+            "NOT",
+            "SQL",
+            "NULL",
+        ] {
+            assert!(
+                !contains(&final_suggestions, leaked),
+                "{leaked} leaked into MariaDB package COMMENT value slot at `{sql}`: {final_suggestions:?}"
+            );
         }
     }
 }
@@ -79209,6 +79824,118 @@ fn mysql_family_common_sql_basics_offer_final_suggestions() {
 }
 
 #[test]
+fn mysql_family_column_load_keys_use_catalog_case_for_schema_qualified_relations() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+    use crate::ui::intellisense::QualifiedMemberKind;
+
+    let mut data = IntellisenseData::new();
+    data.users = vec!["SalesDb".to_string()];
+    data.set_default_qualifier(Some("SalesDb".to_string()));
+    data.set_members_for_qualifier_with_kinds(
+        "SalesDb",
+        vec![
+            ("OrderLine".to_string(), Some(QualifiedMemberKind::Table)),
+            ("OrderLineView".to_string(), Some(QualifiedMemberKind::View)),
+        ],
+    );
+    data.set_relation_members_for_qualifier(
+        "SalesDb",
+        vec!["OrderLine".to_string(), "OrderLineView".to_string()],
+    );
+    data.rebuild_indices();
+
+    for db in [MySQL, MariaDB] {
+        assert_eq!(
+            SqlEditorWidget::resolve_table_column_load_key_for_db(
+                &data,
+                "salesdb.orderline",
+                Some(db),
+            ),
+            Some("SalesDb.OrderLine".to_string()),
+            "{db:?} should query INFORMATION_SCHEMA with catalog-cased schema/table names"
+        );
+        assert_eq!(
+            SqlEditorWidget::resolve_table_column_load_key_for_db(&data, "orderline", Some(db)),
+            Some("SalesDb.OrderLine".to_string()),
+            "{db:?} should use the selected schema's catalog-cased member for unqualified tables"
+        );
+        assert_eq!(
+            SqlEditorWidget::resolve_table_column_load_key_for_db(
+                &data,
+                "salesdb.orderlineview",
+                Some(db),
+            ),
+            Some("SalesDb.OrderLineView".to_string()),
+            "{db:?} should canonicalize view column-load keys too"
+        );
+    }
+}
+
+#[test]
+fn mysql_family_column_load_keys_preserve_exact_case_schema_variant() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+    use crate::ui::intellisense::QualifiedMemberKind;
+
+    let mut data = IntellisenseData::new();
+    data.users = vec!["SalesDb".to_string(), "salesdb".to_string()];
+    data.set_default_qualifier(Some("SalesDb".to_string()));
+    data.set_members_for_qualifier_with_kinds(
+        "salesdb",
+        vec![("OrderLine".to_string(), Some(QualifiedMemberKind::Table))],
+    );
+    data.set_relation_members_for_qualifier("salesdb", vec!["OrderLine".to_string()]);
+    data.rebuild_indices();
+
+    for db in [MySQL, MariaDB] {
+        assert_eq!(
+            SqlEditorWidget::resolve_table_column_load_key_for_db(
+                &data,
+                "salesdb.orderline",
+                Some(db),
+            ),
+            Some("salesdb.OrderLine".to_string()),
+            "{db:?} should not rewrite an exact case-only schema variant to the default schema"
+        );
+    }
+}
+
+#[test]
+fn mysql_family_mixed_case_schema_qualified_alias_uses_loaded_columns() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+    use crate::ui::intellisense::QualifiedMemberKind;
+
+    let mut data = IntellisenseData::new();
+    data.users = vec!["SalesDb".to_string()];
+    data.set_default_qualifier(Some("SalesDb".to_string()));
+    data.set_members_for_qualifier_with_kinds(
+        "SalesDb",
+        vec![("OrderLine".to_string(), Some(QualifiedMemberKind::Table))],
+    );
+    data.set_relation_members_for_qualifier("SalesDb", vec!["OrderLine".to_string()]);
+    data.set_columns_for_table(
+        "SalesDb.OrderLine",
+        vec!["OrderID".to_string(), "LineTotal".to_string()],
+    );
+    data.rebuild_indices();
+
+    for db in [MySQL, MariaDB] {
+        let mut data = data.clone();
+        let suggestions = query_completion_suggestions_with_data(
+            "SELECT ol.| FROM salesdb.orderline ol",
+            db,
+            true,
+            &mut data,
+        );
+        assert!(
+            suggestions
+                .iter()
+                .any(|suggestion| suggestion.eq_ignore_ascii_case("OrderID")),
+            "{db:?} alias completion should use columns loaded under the canonical schema-qualified key: {suggestions:?}"
+        );
+    }
+}
+
+#[test]
 fn mysql_family_object_completion_bulk_matrix_includes_query_and_schema_objects() {
     use crate::db::DatabaseType::{MariaDB, MySQL};
 
@@ -79279,6 +80006,19 @@ fn mysql_family_object_completion_bulk_matrix_includes_query_and_schema_objects(
                 }
             }
         }
+    }
+
+    let (kind, keywords, final_suggestions) =
+        audit_final_suggestions_for("DROP INDEX IF EXISTS |", MariaDB);
+    if kind != Some(ExpectedObjectSuggestionKind::Index) {
+        failures.push(format!(
+            "kind mismatch at MariaDB `DROP INDEX IF EXISTS |`: expected Index, got {kind:?}; keywords={keywords:?} final={final_suggestions:?}"
+        ));
+    }
+    if !has(&final_suggestions, "IDX_EMP_NAME") {
+        failures.push(format!(
+            "`IDX_EMP_NAME` missing at MariaDB `DROP INDEX IF EXISTS |`: kind={kind:?} keywords={keywords:?} final={final_suggestions:?}"
+        ));
     }
 
     assert!(
@@ -80485,12 +81225,102 @@ fn create_statement_keyword_matrix_offers_expected_keywords_across_dialects() {
                 "PROCEDURE",
                 "FUNCTION",
                 "EVENT",
+                "SPATIAL",
             ],
-            &[],
+            &["SEQUENCE"],
+        ),
+        (MySQL, "CREATE PACKAGE |", &[], &["BODY", "IF"]),
+        (
+            MySQL,
+            "CREATE OR REPLACE |",
+            &["SPATIAL", "VIEW"],
+            &[
+                "EVENT",
+                "FUNCTION",
+                "PACKAGE",
+                "PROCEDURE",
+                "SEQUENCE",
+                "TABLE",
+                "TEMPORARY",
+                "TRIGGER",
+            ],
+        ),
+        (
+            MySQL,
+            "CREATE OR REPLACE SPATIAL |",
+            &["REFERENCE"],
+            &["INDEX", "VIEW"],
+        ),
+        (
+            MySQL,
+            "CREATE OR REPLACE SPATIAL REFERENCE |",
+            &["SYSTEM"],
+            &["VIEW"],
+        ),
+        (
+            MySQL,
+            "CREATE OR REPLACE SPATIAL REFERENCE SYSTEM 4326 |",
+            &["DEFINITION", "DESCRIPTION", "NAME", "ORGANIZATION"],
+            &["INDEX", "TABLE"],
+        ),
+        (MySQL, "CREATE AGGREGATE |", &["FUNCTION"], &["TABLE"]),
+        (
+            MySQL,
+            "CREATE OR REPLACE DEFINER root |",
+            &["SQL", "VIEW"],
+            &["EVENT", "FUNCTION", "PACKAGE", "PROCEDURE", "TABLE", "TRIGGER"],
         ),
         (MySQL, "CREATE PR|", &["PROCEDURE"], &["PRIMARY"]),
         (MySQL, "CREATE DATABASE IF |", &["NOT"], &["TABLE"]),
         (MySQL, "CREATE DATABASE IF NOT |", &["EXISTS"], &["TABLE"]),
+        (
+            MySQL,
+            "CREATE SPATIAL REFERENCE |",
+            &["SYSTEM"],
+            &["INDEX", "TABLE"],
+        ),
+        (
+            MySQL,
+            "CREATE SPATIAL REFERENCE SYSTEM 4326 |",
+            &["DEFINITION", "DESCRIPTION", "NAME", "ORGANIZATION"],
+            &["INDEX", "TABLE"],
+        ),
+        (
+            MySQL,
+            "CREATE SPATIAL REFERENCE SYSTEM 4326 ORGANIZATION 'EPSG' |",
+            &["IDENTIFIED"],
+            &["NAME", "TABLE"],
+        ),
+        (
+            MySQL,
+            "CREATE SPATIAL REFERENCE SYSTEM 4326 ORGANIZATION 'EPSG' IDENTIFIED |",
+            &["BY"],
+            &["NAME", "TABLE"],
+        ),
+        (
+            MySQL,
+            "CREATE SPATIAL REFERENCE SYSTEM 4326 ORGANIZATION 'EPSG' IDENTIFIED BY 4326 |",
+            &["DEFINITION", "DESCRIPTION", "NAME", "ORGANIZATION"],
+            &["INDEX", "TABLE"],
+        ),
+        (
+            MySQL,
+            "CREATE FUNCTION f RETURNS INTEGER |",
+            &["SONAME", "DETERMINISTIC"],
+            &["TABLE"],
+        ),
+        (
+            MySQL,
+            "CREATE AGGREGATE FUNCTION f RETURNS INTEGER |",
+            &["SONAME"],
+            &["TABLE"],
+        ),
+        (
+            MySQL,
+            "CREATE FUNCTION IF NOT EXISTS f RETURNS STRING |",
+            &["SONAME"],
+            &["TABLE"],
+        ),
         (
             MySQL,
             "CREATE DATABASE db DEFAULT |",
@@ -80506,11 +81336,22 @@ fn create_statement_keyword_matrix_offers_expected_keywords_across_dialects() {
         (
             MySQL,
             "CREATE INDEX idx_emp ON emp (empno) |",
-            &["USING"],
+            &["ALGORITHM", "COMMENT", "KEY_BLOCK_SIZE", "LOCK", "USING", "WITH"],
             &["WHERE"],
         ),
         (MySQL, "CREATE TRIGGER trg BEFORE |", &["INSERT", "UPDATE", "DELETE"], &["TABLE"]),
-        (MySQL, "CREATE TRIGGER trg BEFORE INSERT |", &["ON"], &["WHERE"]),
+        (MySQL, "CREATE TRIGGER trg BEFORE INSERT |", &["ON"], &["OR", "WHERE"]),
+        (MySQL, "CREATE TRIGGER trg BEFORE UPDATE |", &["ON"], &["OF", "OR"]),
+        (MySQL, "CREATE TRIGGER trg BEFORE INSERT OR |", &[], &["UPDATE", "DELETE"]),
+        (MySQL, "DROP SPATIAL |", &["REFERENCE"], &["TABLE"]),
+        (MySQL, "DROP SPATIAL REFERENCE |", &["SYSTEM"], &["TABLE"]),
+        (MySQL, "DROP SPATIAL REFERENCE SYSTEM |", &["IF"], &["TABLE"]),
+        (
+            MySQL,
+            "DROP SPATIAL REFERENCE SYSTEM IF |",
+            &["EXISTS"],
+            &["TABLE"],
+        ),
         (
             MariaDB,
             "CREATE |",
@@ -80523,9 +81364,255 @@ fn create_statement_keyword_matrix_offers_expected_keywords_across_dialects() {
                 "TRIGGER",
                 "PROCEDURE",
                 "FUNCTION",
+                "PACKAGE",
                 "EVENT",
+                "SEQUENCE",
+                "SPATIAL",
+                "VECTOR",
             ],
             &[],
+        ),
+        (
+            MariaDB,
+            "CREATE OR REPLACE |",
+            &[
+                "EVENT",
+                "FULLTEXT",
+                "FUNCTION",
+                "INDEX",
+                "PACKAGE",
+                "PROCEDURE",
+                "SEQUENCE",
+                "SPATIAL",
+                "TABLE",
+                "TEMPORARY",
+                "TRIGGER",
+                "UNIQUE",
+                "VECTOR",
+                "VIEW",
+            ],
+            &[],
+        ),
+        (
+            MariaDB,
+            "CREATE OR REPLACE DEFINER root |",
+            &["EVENT", "FUNCTION", "PACKAGE", "PROCEDURE", "SQL", "TRIGGER", "VIEW"],
+            &["TABLE"],
+        ),
+        (MariaDB, "CREATE PACKAGE |", &["BODY", "IF"], &["TABLE"]),
+        (MariaDB, "CREATE SPATIAL |", &["INDEX"], &["REFERENCE", "TABLE"]),
+        (MariaDB, "CREATE VECTOR |", &["INDEX"], &["TABLE"]),
+        (MariaDB, "CREATE OR REPLACE VECTOR |", &["INDEX"], &["TABLE"]),
+        (MariaDB, "CREATE OR REPLACE INDEX |", &["IF"], &["TABLE"]),
+        (
+            MariaDB,
+            "CREATE OR REPLACE INDEX IF |",
+            &["NOT"],
+            &["TABLE"],
+        ),
+        (
+            MariaDB,
+            "CREATE OR REPLACE INDEX IF NOT |",
+            &["EXISTS"],
+            &["TABLE"],
+        ),
+        (MariaDB, "CREATE PACKAGE IF |", &["NOT"], &["TABLE"]),
+        (MariaDB, "CREATE PACKAGE IF NOT |", &["EXISTS"], &["TABLE"]),
+        (
+            MariaDB,
+            "CREATE PACKAGE pkg |",
+            &["AS", "COMMENT", "IS", "SQL"],
+            &["TABLE"],
+        ),
+        (MariaDB, "CREATE PACKAGE pkg SQL |", &["SECURITY"], &["TABLE"]),
+        (
+            MariaDB,
+            "CREATE PACKAGE pkg SQL SECURITY |",
+            &["DEFINER", "INVOKER"],
+            &["TABLE"],
+        ),
+        (
+            MariaDB,
+            "CREATE PACKAGE pkg SQL SECURITY INVOKER |",
+            &["AS", "COMMENT", "IS"],
+            &["SQL", "TABLE"],
+        ),
+        (
+            MariaDB,
+            "CREATE PACKAGE pkg COMMENT 'doc' |",
+            &["AS", "IS", "SQL"],
+            &["COMMENT", "TABLE"],
+        ),
+        (
+            MariaDB,
+            "CREATE PACKAGE pkg COMMENT 'doc' SQL |",
+            &["SECURITY"],
+            &["TABLE"],
+        ),
+        (
+            MariaDB,
+            "CREATE PACKAGE pkg COMMENT 'doc' SQL SECURITY INVOKER |",
+            &["AS", "IS"],
+            &["COMMENT", "SQL", "TABLE"],
+        ),
+        (MariaDB, "CREATE PACKAGE BODY |", &["IF"], &["TABLE"]),
+        (MariaDB, "CREATE PACKAGE BODY IF |", &["NOT"], &["TABLE"]),
+        (
+            MariaDB,
+            "CREATE PACKAGE BODY IF NOT |",
+            &["EXISTS"],
+            &["TABLE"],
+        ),
+        (
+            MariaDB,
+            "CREATE PACKAGE BODY pkg |",
+            &["AS", "COMMENT", "IS", "SQL"],
+            &["TABLE"],
+        ),
+        (
+            MariaDB,
+            "CREATE PACKAGE BODY pkg COMMENT 'doc' |",
+            &["AS", "IS", "SQL"],
+            &["COMMENT", "TABLE"],
+        ),
+        (
+            MariaDB,
+            "CREATE OR REPLACE DEFINER root PACKAGE |",
+            &["BODY", "IF"],
+            &["TABLE"],
+        ),
+        (
+            MariaDB,
+            "CREATE OR REPLACE TEMPORARY |",
+            &["SEQUENCE", "TABLE"],
+            &["VIEW"],
+        ),
+        (MariaDB, "CREATE TEMPORARY |", &["SEQUENCE", "TABLE"], &["VIEW"]),
+        (MariaDB, "CREATE SEQUENCE |", &["IF"], &["TABLE"]),
+        (MariaDB, "CREATE SEQUENCE IF |", &["NOT"], &["TABLE"]),
+        (MariaDB, "CREATE SEQUENCE IF NOT |", &["EXISTS"], &["TABLE"]),
+        (MariaDB, "CREATE TEMPORARY SEQUENCE |", &["IF"], &["TABLE"]),
+        (MariaDB, "CREATE OR REPLACE TEMPORARY SEQUENCE |", &["IF"], &["TABLE"]),
+        (
+            MariaDB,
+            "CREATE OR REPLACE FUNCTION f |",
+            &["RETURNS"],
+            &["TABLE"],
+        ),
+        (MariaDB, "CREATE AGGREGATE |", &["FUNCTION"], &["TABLE"]),
+        (
+            MariaDB,
+            "CREATE OR REPLACE DEFINER root FUNCTION f |",
+            &["RETURNS"],
+            &["TABLE"],
+        ),
+        (
+            MariaDB,
+            "CREATE OR REPLACE FUNCTION f RETURNS INTEGER |",
+            &["SONAME", "DETERMINISTIC"],
+            &["TABLE"],
+        ),
+        (
+            MariaDB,
+            "CREATE OR REPLACE AGGREGATE FUNCTION f RETURNS INTEGER |",
+            &["SONAME"],
+            &["TABLE"],
+        ),
+        (
+            MariaDB,
+            "CREATE OR REPLACE PROCEDURE p |",
+            &["COMMENT", "LANGUAGE", "SQL"],
+            &["RETURNS", "TABLE"],
+        ),
+        (
+            MariaDB,
+            "CREATE OR REPLACE EVENT ev |",
+            &["ON"],
+            &["TABLE"],
+        ),
+        (
+            MariaDB,
+            "CREATE OR REPLACE DEFINER root EVENT ev |",
+            &["ON"],
+            &["TABLE"],
+        ),
+        (
+            MariaDB,
+            "CREATE TRIGGER trg BEFORE INSERT |",
+            &["ON", "OR"],
+            &["TABLE"],
+        ),
+        (
+            MariaDB,
+            "CREATE TRIGGER trg BEFORE INSERT OR |",
+            &["DELETE", "UPDATE"],
+            &["ON", "TABLE"],
+        ),
+        (
+            MariaDB,
+            "CREATE TRIGGER trg BEFORE INSERT OR UPDATE |",
+            &["ON", "OR"],
+            &["TABLE"],
+        ),
+        (
+            MariaDB,
+            "CREATE TRIGGER trg BEFORE INSERT OR UPDATE OR |",
+            &["DELETE"],
+            &["ON", "TABLE"],
+        ),
+        (
+            MariaDB,
+            "CREATE TRIGGER trg BEFORE INSERT OR UPDATE OR DELETE |",
+            &["ON"],
+            &["OR", "TABLE"],
+        ),
+        (
+            MariaDB,
+            "CREATE TRIGGER trg BEFORE UPDATE |",
+            &["OF", "ON", "OR"],
+            &["TABLE"],
+        ),
+        (
+            MariaDB,
+            "CREATE TRIGGER trg BEFORE UPDATE OF ename |",
+            &["ON", "OR"],
+            &["OF", "TABLE"],
+        ),
+        (
+            MariaDB,
+            "CREATE TRIGGER trg BEFORE UPDATE OF ename OR |",
+            &["DELETE", "INSERT"],
+            &["ON", "UPDATE", "TABLE"],
+        ),
+        (
+            MariaDB,
+            "CREATE TRIGGER trg BEFORE UPDATE OF ename OR INSERT |",
+            &["ON", "OR"],
+            &["OF", "TABLE"],
+        ),
+        (
+            MariaDB,
+            "CREATE TRIGGER trg BEFORE UPDATE OF ename ON emp |",
+            &["FOR"],
+            &["OF", "OR", "TABLE"],
+        ),
+        (
+            MariaDB,
+            "CREATE OR REPLACE TRIGGER trg |",
+            &["AFTER", "BEFORE"],
+            &["TABLE"],
+        ),
+        (
+            MariaDB,
+            "CREATE OR REPLACE DEFINER root TRIGGER trg |",
+            &["AFTER", "BEFORE"],
+            &["TABLE"],
+        ),
+        (
+            MariaDB,
+            "CREATE OR REPLACE TRIGGER trg BEFORE INSERT |",
+            &["ON"],
+            &["WHERE"],
         ),
         (MariaDB, "CREATE PR|", &["PROCEDURE"], &["PRIMARY"]),
         (MariaDB, "CREATE DATABASE IF |", &["NOT"], &["TABLE"]),
@@ -80538,8 +81625,14 @@ fn create_statement_keyword_matrix_offers_expected_keywords_across_dialects() {
         ),
         (
             MariaDB,
+            "CREATE OR REPLACE TABLE t (a INT) |",
+            &["ENGINE", "DEFAULT CHARSET", "COMMENT", "ROW_FORMAT"],
+            &["WHERE"],
+        ),
+        (
+            MariaDB,
             "CREATE INDEX idx_emp ON emp (empno) |",
-            &["USING"],
+            &["ALGORITHM", "CLUSTERING", "COMMENT", "DISTANCE", "IGNORED", "LOCK", "USING"],
             &["WHERE"],
         ),
     ];

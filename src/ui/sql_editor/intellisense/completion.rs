@@ -750,6 +750,49 @@ const ORACLE_SEQUENCE_OPTION_KEYWORDS: &[&str] = &[
     "SESSION",
 ];
 
+const MARIADB_CREATE_SEQUENCE_OPTION_KEYWORDS: &[&str] = &[
+    "AS",
+    "START WITH",
+    "INCREMENT BY",
+    "MINVALUE",
+    "NOMINVALUE",
+    "NO MINVALUE",
+    "MAXVALUE",
+    "NOMAXVALUE",
+    "NO MAXVALUE",
+    "CACHE",
+    "NOCACHE",
+    "CYCLE",
+    "NOCYCLE",
+    "NO CYCLE",
+    "ENGINE",
+];
+
+const MARIADB_ALTER_SEQUENCE_OPTION_KEYWORDS: &[&str] = &[
+    "START WITH",
+    "INCREMENT BY",
+    "MINVALUE",
+    "NOMINVALUE",
+    "NO MINVALUE",
+    "MAXVALUE",
+    "NOMAXVALUE",
+    "NO MAXVALUE",
+    "CACHE",
+    "CYCLE",
+    "NOCYCLE",
+    "NO CYCLE",
+    "RESTART",
+];
+
+const MARIADB_SEQUENCE_TYPE_KEYWORDS: &[&str] =
+    &["TINYINT", "SMALLINT", "MEDIUMINT", "INT", "INTEGER", "BIGINT"];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SequenceOptionStatementKind {
+    Create,
+    Alter,
+}
+
 /// Maps a recognised `CREATE SEQUENCE` option word to its `&'static str` form so
 /// the option-list classifier can record it without allocating. Bare and
 /// value-bearing options both pass through; an unrecognised word never reaches
@@ -758,14 +801,18 @@ fn option_canonical(word: &str) -> &'static str {
     match word {
         "START WITH" => "START WITH",
         "INCREMENT BY" => "INCREMENT BY",
+        "AS" => "AS",
         "MINVALUE" => "MINVALUE",
         "MAXVALUE" => "MAXVALUE",
         "NOMINVALUE" => "NOMINVALUE",
         "NOMAXVALUE" => "NOMAXVALUE",
+        "NO MINVALUE" => "NO MINVALUE",
+        "NO MAXVALUE" => "NO MAXVALUE",
         "CACHE" => "CACHE",
         "NOCACHE" => "NOCACHE",
         "CYCLE" => "CYCLE",
         "NOCYCLE" => "NOCYCLE",
+        "NO CYCLE" => "NO CYCLE",
         "ORDER" => "ORDER",
         "NOORDER" => "NOORDER",
         "KEEP" => "KEEP",
@@ -774,6 +821,8 @@ fn option_canonical(word: &str) -> &'static str {
         "NOSCALE" => "NOSCALE",
         "GLOBAL" => "GLOBAL",
         "SESSION" => "SESSION",
+        "ENGINE" => "ENGINE",
+        "RESTART" => "RESTART",
         other => debug_assert_unreachable_option(other),
     }
 }
@@ -10466,7 +10515,9 @@ impl SqlEditorWidget {
             return true;
         }
 
-        if Self::is_mysql_oracle_only_sequence_value_slot(&words) {
+        if !matches!(db_type, Some(crate::db::DatabaseType::MariaDB))
+            && Self::is_mysql_oracle_only_sequence_value_slot(&words)
+        {
             return true;
         }
 
@@ -10499,12 +10550,16 @@ impl SqlEditorWidget {
         if matches!(words.first().map(String::as_str), Some("CREATE" | "ALTER")) {
             if let Some(role_idx) = words.iter().position(|word| word == "ROLE") {
                 let mut name_idx = role_idx + 1;
-                if matches!(
+                if words.get(name_idx).map(String::as_str) == Some("IF") {
+                    if matches!(
                     words.get(name_idx..name_idx + 3),
                     Some([if_kw, not_kw, exists_kw])
                         if if_kw == "IF" && not_kw == "NOT" && exists_kw == "EXISTS"
                 ) {
-                    name_idx += 3;
+                        name_idx += 3;
+                    } else {
+                        return false;
+                    }
                 }
                 if words.get(name_idx).is_some() {
                     let auth_tail = &words[name_idx + 1..];
@@ -12714,7 +12769,7 @@ impl SqlEditorWidget {
                 Self::expected_suggestion_context_end(tokens, deep_ctx.cursor_token_len, true);
             let words = Self::previous_meaningful_words_upper(tokens, end, 16);
             if matches!(
-                Self::expected_mysql_show_object_suggestion_kind(&words),
+                Self::expected_mysql_show_object_suggestion_kind(&words, db_type),
                 Some(ExpectedObjectSuggestionKind::ColumnOwner)
             ) {
                 return false;
@@ -22875,12 +22930,19 @@ impl SqlEditorWidget {
         }
         let has = |kw: &str| present.iter().any(|word| word == kw);
         let charset_present = has("CHARSET") || has("CHARACTER");
+        let visibility_present = has("VISIBLE") || has("INVISIBLE");
+        let ignored_present = has("IGNORED");
         candidates
             .into_iter()
             .filter(|candidate| match candidate.to_ascii_uppercase().as_str() {
-                "ENGINE" | "AUTO_INCREMENT" | "COMMENT" | "ROW_FORMAT" | "COLLATE" => {
+                "ALGORITHM" | "AUTO_INCREMENT" | "CLUSTERING" | "COLLATE" | "COMMENT"
+                | "DISTANCE" | "ENGINE" | "ENGINE_ATTRIBUTE" | "KEY_BLOCK_SIZE" | "LOCK"
+                | "M" | "NOWAIT" | "ROW_FORMAT" | "SECONDARY_ENGINE_ATTRIBUTE" | "WAIT"
+                | "WITH" => {
                     !has(&candidate.to_ascii_uppercase())
                 }
+                "IGNORED" | "NOT" => !ignored_present,
+                "INVISIBLE" | "VISIBLE" => !visibility_present,
                 "DEFAULT CHARSET" | "CHARACTER SET" => !charset_present,
                 _ => true,
             })
@@ -25158,7 +25220,7 @@ impl SqlEditorWidget {
         )
     }
 
-    /// Keyword slots of an Oracle `CREATE SEQUENCE [schema.]name <option>*` option
+    /// Keyword slots of an Oracle `CREATE|ALTER SEQUENCE [schema.]name <option>*` option
     /// list. Each option is single-use (and several form mutually-exclusive pairs,
     /// e.g. `CACHE`/`NOCACHE`), so at an option boundary the remaining (not-yet-used)
     /// options are offered and never re-offered. Returns:
@@ -25175,15 +25237,26 @@ impl SqlEditorWidget {
         end: usize,
         db_type: Option<crate::db::DatabaseType>,
     ) -> Option<Vec<&'static str>> {
-        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+        let mysql_compatible = crate::sql_text::mysql_compatibility_for_sql("", db_type);
+        let mariadb_sequence = matches!(db_type, Some(crate::db::DatabaseType::MariaDB));
+        if mysql_compatible && !mariadb_sequence {
             return None;
         }
         if Self::unclosed_paren_count(tokens, end) != 0 {
             return None;
         }
-        let opts = Self::create_sequence_option_words(tokens, end)?;
+        let (statement_kind, opts) = Self::create_sequence_option_words(tokens, end)?;
+        let supported_options = if mariadb_sequence {
+            match statement_kind {
+                SequenceOptionStatementKind::Create => MARIADB_CREATE_SEQUENCE_OPTION_KEYWORDS,
+                SequenceOptionStatementKind::Alter => MARIADB_ALTER_SEQUENCE_OPTION_KEYWORDS,
+            }
+        } else {
+            ORACLE_SEQUENCE_OPTION_KEYWORDS
+        };
 
         let mut present: Vec<&'static str> = Vec::new();
+        let mut extra_candidates: Vec<&'static str> = Vec::new();
         let mut i = 0;
         while i < opts.len() {
             match opts[i].as_str() {
@@ -25196,6 +25269,10 @@ impl SqlEditorWidget {
                         present.push("START WITH");
                         i += 3;
                     }
+                    Some(value) if mariadb_sequence && !Self::is_sequence_option_start_word(value) => {
+                        present.push("START WITH");
+                        i += 2;
+                    }
                     _ => return None,
                 },
                 "INCREMENT" => match opts.get(i + 1).map(String::as_str) {
@@ -25207,18 +25284,92 @@ impl SqlEditorWidget {
                         present.push("INCREMENT BY");
                         i += 3;
                     }
+                    Some(value) if mariadb_sequence && !Self::is_sequence_option_start_word(value) => {
+                        present.push("INCREMENT BY");
+                        i += 2;
+                    }
                     _ => return None,
                 },
-                option @ ("MINVALUE" | "MAXVALUE" | "CACHE") => {
+                "AS" => {
+                    if !supported_options.contains(&"AS") {
+                        return None;
+                    }
+                    let Some(type_word) = opts.get(i + 1).map(String::as_str) else {
+                        return Some(MARIADB_SEQUENCE_TYPE_KEYWORDS.to_vec());
+                    };
+                    if !MARIADB_SEQUENCE_TYPE_KEYWORDS.contains(&type_word) {
+                        return None;
+                    }
+                    present.push("AS");
+                    if matches!(
+                        opts.get(i + 2).map(String::as_str),
+                        Some("SIGNED" | "UNSIGNED")
+                    ) {
+                        i += 3;
+                    } else {
+                        if i + 2 == opts.len() {
+                            extra_candidates.extend(["SIGNED", "UNSIGNED"]);
+                        }
+                        i += 2;
+                    }
+                }
+                option @ ("MINVALUE" | "MAXVALUE" | "CACHE" | "ENGINE") => {
+                    if !supported_options.contains(&option) {
+                        return None;
+                    }
                     if i + 1 >= opts.len() {
                         return Some(Vec::new()); // value slot
                     }
                     present.push(option_canonical(option));
                     i += 2;
                 }
+                "NO" if mariadb_sequence => match opts.get(i + 1).map(String::as_str) {
+                    None => return Some(vec!["MINVALUE", "MAXVALUE", "CYCLE"]),
+                    Some(option @ ("MINVALUE" | "MAXVALUE" | "CYCLE")) => {
+                        let canonical = match option {
+                            "MINVALUE" => "NO MINVALUE",
+                            "MAXVALUE" => "NO MAXVALUE",
+                            "CYCLE" => "NO CYCLE",
+                            _ => unreachable!(),
+                        };
+                        if !supported_options.contains(&canonical) {
+                            return None;
+                        }
+                        present.push(option_canonical(canonical));
+                        i += 2;
+                    }
+                    _ => return None,
+                },
+                "RESTART" => {
+                    if !supported_options.contains(&"RESTART") {
+                        return None;
+                    }
+                    match opts.get(i + 1).map(String::as_str) {
+                        None => {
+                            present.push("RESTART");
+                            extra_candidates.push("WITH");
+                            i += 1;
+                        }
+                        Some("WITH") => {
+                            if i + 2 >= opts.len() {
+                                return Some(Vec::new());
+                            }
+                            present.push("RESTART");
+                            i += 3;
+                        }
+                        Some(value) if !Self::is_sequence_option_start_word(value) => {
+                            present.push("RESTART");
+                            i += 2;
+                        }
+                        _ => return None,
+                    }
+                }
                 option @ ("NOMINVALUE" | "NOMAXVALUE" | "NOCACHE" | "CYCLE" | "NOCYCLE"
                 | "ORDER" | "NOORDER" | "KEEP" | "NOKEEP" | "SCALE" | "NOSCALE" | "GLOBAL"
                 | "SESSION") => {
+                    if !supported_options.contains(&option) {
+                        return None;
+                    }
                     present.push(option_canonical(option));
                     i += 1;
                 }
@@ -25237,21 +25388,27 @@ impl SqlEditorWidget {
         if !has("INCREMENT BY") {
             remaining.push("INCREMENT BY");
         }
-        if !has("MINVALUE") && !has("NOMINVALUE") {
+        if !has("AS") {
+            remaining.push("AS");
+        }
+        if !has("MINVALUE") && !has("NOMINVALUE") && !has("NO MINVALUE") {
             remaining.push("MINVALUE");
             remaining.push("NOMINVALUE");
+            remaining.push("NO MINVALUE");
         }
-        if !has("MAXVALUE") && !has("NOMAXVALUE") {
+        if !has("MAXVALUE") && !has("NOMAXVALUE") && !has("NO MAXVALUE") {
             remaining.push("MAXVALUE");
             remaining.push("NOMAXVALUE");
+            remaining.push("NO MAXVALUE");
         }
         if !has("CACHE") && !has("NOCACHE") {
             remaining.push("CACHE");
             remaining.push("NOCACHE");
         }
-        if !has("CYCLE") && !has("NOCYCLE") {
+        if !has("CYCLE") && !has("NOCYCLE") && !has("NO CYCLE") {
             remaining.push("CYCLE");
             remaining.push("NOCYCLE");
+            remaining.push("NO CYCLE");
         }
         if !has("ORDER") && !has("NOORDER") {
             remaining.push("ORDER");
@@ -25269,33 +25426,69 @@ impl SqlEditorWidget {
             remaining.push("GLOBAL");
             remaining.push("SESSION");
         }
+        if !has("ENGINE") {
+            remaining.push("ENGINE");
+        }
+        if !has("RESTART") {
+            remaining.push("RESTART");
+        }
+        remaining.retain(|option| supported_options.contains(option));
+        remaining.extend(extra_candidates);
         Some(remaining)
     }
 
-    fn create_sequence_option_words(tokens: &[SqlToken], end: usize) -> Option<Vec<String>> {
-        let create_idx = Self::next_non_comment_token_index(tokens, 0)?;
-        if !matches!(tokens.get(create_idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("CREATE"))
-        {
-            return None;
-        }
+    fn create_sequence_option_words(
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> Option<(SequenceOptionStatementKind, Vec<String>)> {
+        let (statement_kind, seq_idx) = Self::sequence_option_header(tokens)?;
 
-        let mut scan = create_idx + 1;
-        let seq_idx = loop {
-            let idx = Self::next_non_comment_token_index(tokens, scan)?;
-            let Some(SqlToken::Word(word)) = tokens.get(idx) else {
+        let mut name_start = seq_idx + 1;
+        let if_exists_tail = || -> Option<usize> {
+            let if_idx = Self::next_non_comment_token_index(tokens, name_start)?;
+            let Some(SqlToken::Word(if_kw)) = tokens.get(if_idx) else {
                 return None;
             };
-            match word.to_ascii_uppercase().as_str() {
-                "OR" | "REPLACE" => scan = idx + 1,
-                "SEQUENCE" => break idx,
-                _ => return None,
+            if !if_kw.eq_ignore_ascii_case("IF") {
+                return None;
+            }
+            match statement_kind {
+                SequenceOptionStatementKind::Create => {
+                    let not_idx = Self::next_non_comment_token_index(tokens, if_idx + 1)?;
+                    let exists_idx = Self::next_non_comment_token_index(tokens, not_idx + 1)?;
+                    match (tokens.get(not_idx), tokens.get(exists_idx)) {
+                        (Some(SqlToken::Word(not_kw)), Some(SqlToken::Word(exists_kw)))
+                            if not_kw.eq_ignore_ascii_case("NOT")
+                                && exists_kw.eq_ignore_ascii_case("EXISTS") =>
+                        {
+                            Some(exists_idx)
+                        }
+                        _ => None,
+                    }
+                }
+                SequenceOptionStatementKind::Alter => {
+                    let exists_idx = Self::next_non_comment_token_index(tokens, if_idx + 1)?;
+                    match tokens.get(exists_idx) {
+                        Some(SqlToken::Word(exists_kw)) if exists_kw.eq_ignore_ascii_case("EXISTS") => {
+                            Some(exists_idx)
+                        }
+                        _ => None,
+                    }
+                }
             }
         };
+        if let Some(exists_idx) = if_exists_tail() {
+            name_start = exists_idx + 1;
+        } else if Self::next_non_comment_token_index(tokens, name_start).is_some_and(|idx| {
+            matches!(tokens.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("IF"))
+        }) {
+            return None;
+        }
 
         // Skip the sequence name, including `"SCHEMA"."NAME"` / schema.name. No
         // name yet (`CREATE SEQUENCE |`) or a dangling qualifier (`schema.|`) is
         // still a name slot, not an option list.
-        let (_, option_start) = Self::plsql_qualified_identifier_last_segment(tokens, seq_idx + 1)?;
+        let (_, option_start) = Self::plsql_qualified_identifier_last_segment(tokens, name_start)?;
         if Self::next_non_comment_token_index(tokens, option_start)
             .is_some_and(|idx| matches!(tokens.get(idx), Some(SqlToken::Symbol(sym)) if sym == "."))
         {
@@ -25316,7 +25509,71 @@ impl SqlEditorWidget {
             }
             idx = token_idx + 1;
         }
-        Some(words)
+        Some((statement_kind, words))
+    }
+
+    fn sequence_option_header(
+        tokens: &[SqlToken],
+    ) -> Option<(SequenceOptionStatementKind, usize)> {
+        let first_idx = Self::next_non_comment_token_index(tokens, 0)?;
+        let Some(SqlToken::Word(first_word)) = tokens.get(first_idx) else {
+            return None;
+        };
+
+        let first_upper = first_word.to_ascii_uppercase();
+        match first_upper.as_str() {
+            "CREATE" => {
+                let mut scan = first_idx + 1;
+                loop {
+                    let idx = Self::next_non_comment_token_index(tokens, scan)?;
+                    let Some(SqlToken::Word(word)) = tokens.get(idx) else {
+                        return None;
+                    };
+                    match word.to_ascii_uppercase().as_str() {
+                        "OR" | "REPLACE" | "TEMPORARY" => scan = idx + 1,
+                        "SEQUENCE" => return Some((SequenceOptionStatementKind::Create, idx)),
+                        _ => return None,
+                    }
+                }
+            }
+            "ALTER" => {
+                let idx = Self::next_non_comment_token_index(tokens, first_idx + 1)?;
+                if matches!(tokens.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("SEQUENCE"))
+                {
+                    Some((SequenceOptionStatementKind::Alter, idx))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn is_sequence_option_start_word(word: &str) -> bool {
+        matches!(
+            word,
+            "AS" | "START"
+                | "INCREMENT"
+                | "MINVALUE"
+                | "NOMINVALUE"
+                | "MAXVALUE"
+                | "NOMAXVALUE"
+                | "CACHE"
+                | "NOCACHE"
+                | "CYCLE"
+                | "NOCYCLE"
+                | "NO"
+                | "ENGINE"
+                | "RESTART"
+                | "ORDER"
+                | "NOORDER"
+                | "KEEP"
+                | "NOKEEP"
+                | "SCALE"
+                | "NOSCALE"
+                | "GLOBAL"
+                | "SESSION"
+        )
     }
 
     /// Context wrapper enrolling the `CREATE SEQUENCE` option/value slots in the
@@ -25364,6 +25621,9 @@ impl SqlEditorWidget {
             exclude_current_identifier_chain,
         );
         let words = Self::previous_meaningful_words_upper(tokens, end, 3);
+        if matches!(words.as_slice(), [drop, index] if drop == "DROP" && index == "INDEX") {
+            return false;
+        }
         if matches!(words.as_slice(), [drop, user, if_kw] if drop == "DROP" && user == "USER" && if_kw == "IF")
         {
             return true;
@@ -25997,11 +26257,34 @@ impl SqlEditorWidget {
         let words = Self::meaningful_tokens_before(tokens, end)
             .into_iter()
             .filter_map(|token| match token {
-                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                SqlToken::Word(word) => {
+                    if word.chars().all(|ch| ch.is_ascii_digit()) {
+                        Some("__VALUE__".to_string())
+                    } else {
+                        Some(word.to_ascii_uppercase())
+                    }
+                }
                 SqlToken::String(_) => Some("__VALUE__".to_string()),
                 _ => None,
             })
             .collect::<Vec<_>>();
+        if words.first().map(String::as_str) == Some("DROP")
+            && matches!(
+                words.get(1..4),
+                Some([spatial, reference, system])
+                    if spatial == "SPATIAL" && reference == "REFERENCE" && system == "SYSTEM"
+            )
+        {
+            let mut idx = 4;
+            if words.get(idx).map(String::as_str) == Some("IF") {
+                idx += 1;
+                if words.get(idx).map(String::as_str) != Some("EXISTS") {
+                    return false;
+                }
+                idx += 1;
+            }
+            return idx >= words.len() || idx + 1 == words.len();
+        }
         let Some(last) = words.last().map(String::as_str) else {
             return false;
         };
@@ -26197,6 +26480,12 @@ impl SqlEditorWidget {
             && words
                 .iter()
                 .any(|word| matches!(word.as_str(), "FUNCTION" | "PROCEDURE" | "EVENT"))
+        {
+            return true;
+        }
+        if matches!(db_type, Some(crate::db::DatabaseType::MariaDB))
+            && matches!(words.first().map(String::as_str), Some("CREATE"))
+            && words.iter().any(|word| word == "PACKAGE")
         {
             return true;
         }
@@ -33014,6 +33303,58 @@ impl SqlEditorWidget {
             "NDB",
             "PERFORMANCE_SCHEMA",
         ];
+        const MYSQL_ROUTINE_CHARACTERISTIC_OR_UDF_SONAME_KEYWORDS: &[&str] = &[
+            "LANGUAGE",
+            "DETERMINISTIC",
+            "NOT",
+            "CONTAINS",
+            "NO",
+            "READS",
+            "MODIFIES",
+            "SQL",
+            "COMMENT",
+            "SONAME",
+        ];
+        const MYSQL_TRIGGER_EVENT_KEYWORDS: &[&str] = &["DELETE", "INSERT", "UPDATE"];
+        const MYSQL_TRIGGER_AFTER_INSERT_EVENTS: &[&str] = &["DELETE", "UPDATE"];
+        const MYSQL_TRIGGER_AFTER_UPDATE_EVENTS: &[&str] = &["DELETE", "INSERT"];
+        const MYSQL_TRIGGER_AFTER_DELETE_EVENTS: &[&str] = &["INSERT", "UPDATE"];
+        const MYSQL_TRIGGER_ONLY_INSERT_EVENT: &[&str] = &["INSERT"];
+        const MYSQL_TRIGGER_ONLY_UPDATE_EVENT: &[&str] = &["UPDATE"];
+        const MYSQL_TRIGGER_ONLY_DELETE_EVENT: &[&str] = &["DELETE"];
+        const MYSQL_CREATE_INDEX_OPTION_KEYWORDS: &[&str] = &[
+            "ALGORITHM",
+            "COMMENT",
+            "ENGINE_ATTRIBUTE",
+            "INVISIBLE",
+            "KEY_BLOCK_SIZE",
+            "LOCK",
+            "SECONDARY_ENGINE_ATTRIBUTE",
+            "USING",
+            "VISIBLE",
+            "WITH",
+        ];
+        const MARIADB_CREATE_INDEX_OPTION_KEYWORDS: &[&str] = &[
+            "ALGORITHM",
+            "CLUSTERING",
+            "COMMENT",
+            "DISTANCE",
+            "IGNORED",
+            "KEY_BLOCK_SIZE",
+            "LOCK",
+            "M",
+            "NOT",
+            "NOWAIT",
+            "USING",
+            "WAIT",
+            "WITH",
+        ];
+        const MYSQL_INDEX_ALGORITHM_VALUES: &[&str] = &["COPY", "DEFAULT", "INPLACE"];
+        const MARIADB_INDEX_ALGORITHM_VALUES: &[&str] =
+            &["COPY", "DEFAULT", "INPLACE", "INSTANT", "NOCOPY"];
+        const MYSQL_INDEX_LOCK_VALUES: &[&str] = &["DEFAULT", "EXCLUSIVE", "NONE", "SHARED"];
+        const MARIADB_INDEX_CLUSTERING_VALUES: &[&str] = &["NO", "YES"];
+        const MARIADB_INDEX_DISTANCE_VALUES: &[&str] = &["COSINE", "EUCLIDEAN"];
 
         if first == "CREATE" && has("TABLE") {
             if Self::unclosed_paren_count(tokens, end) != 0 {
@@ -33076,6 +33417,7 @@ impl SqlEditorWidget {
             ]);
         }
         if first == "CREATE" && has("INDEX") {
+            let mariadb = matches!(db_type, Some(crate::db::DatabaseType::MariaDB));
             let index_name_idx = words
                 .iter()
                 .position(|word| word == "INDEX")
@@ -33091,13 +33433,50 @@ impl SqlEditorWidget {
                         idx
                     }
                 });
-            let word_is_index_name = |idx: usize| index_name_idx == Some(idx);
+            let Some(index_name_idx) = index_name_idx else {
+                return None;
+            };
+            match words.get(index_name_idx).map(String::as_str) {
+                None => {
+                    return if mariadb && last == Some("INDEX") {
+                        Some(&["IF"])
+                    } else {
+                        None
+                    };
+                }
+                Some("IF") if mariadb && index_name_idx + 1 == words.len() => {
+                    return Some(&["NOT"]);
+                }
+                Some("IF")
+                    if mariadb
+                        && words.get(index_name_idx + 1).map(String::as_str) == Some("NOT")
+                        && index_name_idx + 2 == words.len() =>
+                {
+                    return Some(&["EXISTS"]);
+                }
+                Some("IF")
+                    if mariadb
+                        && words.get(index_name_idx + 1).map(String::as_str) == Some("NOT")
+                        && words.get(index_name_idx + 2).map(String::as_str) == Some("EXISTS")
+                        && index_name_idx + 3 == words.len() =>
+                {
+                    return None;
+                }
+                Some("IF") if !mariadb => return None,
+                _ => {}
+            }
+            let word_is_index_name = |idx: usize| index_name_idx == idx;
             let has_option_word = |keyword: &str| {
                 words
                     .iter()
                     .enumerate()
                     .any(|(idx, word)| word == keyword && !word_is_index_name(idx))
             };
+            let last_meaningful = Self::meaningful_tokens_before(tokens, end).into_iter().last();
+            let last_meaningful_word = last_meaningful.and_then(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                _ => None,
+            });
             let last_idx = words.len().saturating_sub(1);
             // Inside the indexed-column list (`ON t (a |`) the cursor names a column,
             // not an index option — leave it to the column path.
@@ -33118,23 +33497,120 @@ impl SqlEditorWidget {
                 if has_option_word("ON") && !has_column_list {
                     return Some(&[]);
                 }
-                return Some(&["BTREE", "HASH"]);
+                return if mariadb {
+                    Some(&["BTREE", "HASH", "RTREE"])
+                } else {
+                    Some(&["BTREE", "HASH"])
+                };
+            }
+            if has_column_list {
+                match last_meaningful_word.as_deref() {
+                    Some("ALGORITHM") => {
+                        return if mariadb {
+                            Some(MARIADB_INDEX_ALGORITHM_VALUES)
+                        } else {
+                            Some(MYSQL_INDEX_ALGORITHM_VALUES)
+                        };
+                    }
+                    Some("CLUSTERING") if mariadb => return Some(MARIADB_INDEX_CLUSTERING_VALUES),
+                    Some("DISTANCE") if mariadb => return Some(MARIADB_INDEX_DISTANCE_VALUES),
+                    Some("LOCK") => return Some(MYSQL_INDEX_LOCK_VALUES),
+                    Some("NOT") if mariadb => return Some(&["IGNORED"]),
+                    Some("WITH") => return Some(&["PARSER"]),
+                    Some(
+                        "COMMENT" | "ENGINE_ATTRIBUTE" | "KEY_BLOCK_SIZE" | "M" | "PARSER"
+                        | "SECONDARY_ENGINE_ATTRIBUTE" | "WAIT",
+                    ) => return Some(&[]),
+                    _ => {}
+                }
             }
             // `ON <table>` and `USING <type>` are each single-use, so do not
             // re-offer one already present (`CREATE INDEX i ON t (a) |` → `USING`).
-            if matches!(last, Some("BTREE" | "HASH")) {
+            if matches!(last, Some("BTREE" | "HASH" | "RTREE")) {
                 return Some(if has_option_word("ON") { &[] } else { &["ON"] });
             }
             // `USING` follows the *column list*, not the bare table — so it is only
             // grammatical once the `(…)` has closed (`ON t (a) |`). At `ON t |` the
             // column list is still expected: offer nothing (the `(` is punctuation).
-            return Some(match (has_option_word("ON"), has_option_word("USING")) {
-                (false, false) => &["ON", "USING"],
-                (true, false) if has_column_list => &["USING"],
-                (true, false) => &[],
-                (false, true) => &["ON"],
-                (true, true) => &[],
+            return Some(match (has_option_word("ON"), has_option_word("USING"), has_column_list) {
+                (false, false, _) => &["ON", "USING"],
+                (true, _, true) if mariadb => MARIADB_CREATE_INDEX_OPTION_KEYWORDS,
+                (true, _, true) => MYSQL_CREATE_INDEX_OPTION_KEYWORDS,
+                (true, false, false) => &[],
+                (false, true, _) => &["ON"],
+                (true, true, false) => &[],
             });
+        }
+        if first == "DROP" && has("INDEX") {
+            let mariadb = matches!(db_type, Some(crate::db::DatabaseType::MariaDB));
+            let index_name_idx = words
+                .iter()
+                .position(|word| word == "INDEX")
+                .map(|idx| idx + 1)
+                .map(|idx| {
+                    if matches!(
+                        words.get(idx..idx + 2),
+                        Some([if_kw, exists_kw]) if if_kw == "IF" && exists_kw == "EXISTS"
+                    ) {
+                        idx + 2
+                    } else {
+                        idx
+                    }
+                });
+            let Some(index_name_idx) = index_name_idx else {
+                return None;
+            };
+            match words.get(index_name_idx).map(String::as_str) {
+                None => {
+                    return if mariadb && last == Some("INDEX") {
+                        Some(&["IF"])
+                    } else {
+                        None
+                    };
+                }
+                Some("IF") if mariadb && index_name_idx + 1 == words.len() => {
+                    return Some(&["EXISTS"]);
+                }
+                Some("IF") if !mariadb => return None,
+                _ => {}
+            }
+
+            let last_meaningful = Self::meaningful_tokens_before(tokens, end).into_iter().last();
+            let last_meaningful_word = last_meaningful.and_then(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                _ => None,
+            });
+            match last_meaningful_word.as_deref() {
+                Some("ALGORITHM") if !mariadb => return Some(MYSQL_INDEX_ALGORITHM_VALUES),
+                Some("LOCK") if !mariadb => return Some(MYSQL_INDEX_LOCK_VALUES),
+                Some("WAIT") if mariadb => return Some(&[]),
+                Some("NOWAIT") if mariadb => return Some(&[]),
+                _ => {}
+            }
+
+            if last == Some("ON") {
+                return None;
+            }
+            let has_on = words
+                .iter()
+                .enumerate()
+                .any(|(idx, word)| word == "ON" && idx > index_name_idx);
+            if !has_on {
+                return Some(&["ON"]);
+            }
+            if mariadb
+                && words
+                    .iter()
+                    .skip_while(|word| word.as_str() != "ON")
+                    .any(|word| matches!(word.as_str(), "NOWAIT" | "WAIT"))
+            {
+                return Some(&[]);
+            }
+            return if mariadb {
+                Some(&["NOWAIT", "WAIT"])
+            } else {
+                Some(&["ALGORITHM", "LOCK"])
+            };
         }
         if let Some(alter_table_tail_words) = Self::alter_table_tail_words_after_target(tokens, end)
         {
@@ -33210,6 +33686,15 @@ impl SqlEditorWidget {
                 .any(|(idx, word)| word == keyword && !word_is_routine_name(idx))
         };
         let last_is_routine_name = words.len().checked_sub(1).is_some_and(word_is_routine_name);
+        let aggregate_routine = routine_kind_idx.is_some_and(|idx| {
+            idx > 0 && words.get(idx - 1).map(String::as_str) == Some("AGGREGATE")
+        });
+        let last_is_udf_return_type = words.len() >= 2
+            && words[words.len() - 2] == "RETURNS"
+            && matches!(
+                words.last().map(String::as_str),
+                Some("STRING" | "INTEGER" | "REAL" | "DECIMAL")
+            );
         let routine_body_started = routine_kind_idx.is_some_and(|idx| {
             words
                 .iter()
@@ -33221,6 +33706,10 @@ impl SqlEditorWidget {
             return None;
         }
 
+        if first == "CREATE" && last == Some("AGGREGATE") && routine_kind_idx.is_none() {
+            return Some(&["FUNCTION"]);
+        }
+
         if first == "CREATE" && has("FUNCTION") && !has_routine_clause_word("RETURNS") {
             if !last_is_routine_name && matches!(last, Some("FUNCTION" | "IF" | "NOT" | "EXISTS")) {
                 return None;
@@ -33228,6 +33717,12 @@ impl SqlEditorWidget {
             return Some(&["RETURNS"]);
         }
         if first == "CREATE" && (has("FUNCTION") || has("PROCEDURE")) {
+            if has_routine_clause_word("SONAME") {
+                return Some(&[]);
+            }
+            if last == Some("SONAME") && !last_is_routine_name {
+                return Some(&[]);
+            }
             if last == Some("NOT") && !last_is_routine_name {
                 if words.len() >= 2 && words[words.len() - 2] == "IF" {
                     return None;
@@ -33263,19 +33758,31 @@ impl SqlEditorWidget {
             {
                 return None;
             }
-            return Some(&[
-                "LANGUAGE",
-                "DETERMINISTIC",
-                "NOT",
-                "CONTAINS",
-                "NO",
-                "READS",
-                "MODIFIES",
-                "SQL",
-                "COMMENT",
-            ]);
+            return Some(
+                if routine_kind_idx.is_some()
+                    && aggregate_routine
+                    && routine_kind_idx.is_some_and(|idx| words.iter().skip(idx + 1).any(|word| word == "RETURNS"))
+                {
+                    &["SONAME"]
+                } else if last_is_udf_return_type {
+                    MYSQL_ROUTINE_CHARACTERISTIC_OR_UDF_SONAME_KEYWORDS
+                } else {
+                    &[
+                        "LANGUAGE",
+                        "DETERMINISTIC",
+                        "NOT",
+                        "CONTAINS",
+                        "NO",
+                        "READS",
+                        "MODIFIES",
+                        "SQL",
+                        "COMMENT",
+                    ]
+                },
+            );
         }
         if first == "CREATE" && has("TRIGGER") {
+            let mariadb = matches!(db_type, Some(crate::db::DatabaseType::MariaDB));
             let trigger_name_idx = words
                 .iter()
                 .position(|word| word == "TRIGGER")
@@ -33307,16 +33814,91 @@ impl SqlEditorWidget {
             if !last_is_trigger_name && matches!(last, Some("TRIGGER" | "IF" | "NOT")) {
                 return None;
             }
-            if !last_is_trigger_name && matches!(last, Some("BEFORE" | "AFTER")) {
-                return Some(&["DELETE", "INSERT", "UPDATE"]);
-            }
-            if !last_is_trigger_name && matches!(last, Some("INSERT" | "UPDATE" | "DELETE")) {
-                return Some(&["ON"]);
-            }
             if has_trigger_clause_word("ON") {
                 return None;
             }
-            return Some(&["BEFORE", "AFTER"]);
+
+            let after_trigger_name_idx = trigger_name_idx.map_or(words.len(), |idx| idx + 1);
+            let Some(timing_idx) = words
+                .iter()
+                .enumerate()
+                .skip(after_trigger_name_idx)
+                .find_map(|(idx, word)| {
+                    matches!(word.as_str(), "BEFORE" | "AFTER").then_some(idx)
+                })
+            else {
+                return Some(&["BEFORE", "AFTER"]);
+            };
+
+            let mut idx = timing_idx + 1;
+            if idx >= words.len() {
+                return Some(MYSQL_TRIGGER_EVENT_KEYWORDS);
+            }
+
+            let mut seen_insert = false;
+            let mut seen_update = false;
+            let mut seen_delete = false;
+            loop {
+                let event_was_update = match words.get(idx).map(String::as_str) {
+                    Some("INSERT") if !seen_insert => {
+                        seen_insert = true;
+                        false
+                    }
+                    Some("UPDATE") if !seen_update => {
+                        seen_update = true;
+                        true
+                    }
+                    Some("DELETE") if !seen_delete => {
+                        seen_delete = true;
+                        false
+                    }
+                    _ => return None,
+                };
+                idx += 1;
+                let mut consumed_update_of = false;
+                if event_was_update && mariadb && words.get(idx).map(String::as_str) == Some("OF")
+                {
+                    idx += 1;
+                    if idx == words.len() {
+                        return None;
+                    }
+                    consumed_update_of = true;
+                    while idx < words.len()
+                        && !matches!(words.get(idx).map(String::as_str), Some("ON" | "OR"))
+                    {
+                        idx += 1;
+                    }
+                }
+                let remaining_event_candidates = match (seen_insert, seen_update, seen_delete) {
+                    (false, false, false) => MYSQL_TRIGGER_EVENT_KEYWORDS,
+                    (true, false, false) => MYSQL_TRIGGER_AFTER_INSERT_EVENTS,
+                    (false, true, false) => MYSQL_TRIGGER_AFTER_UPDATE_EVENTS,
+                    (false, false, true) => MYSQL_TRIGGER_AFTER_DELETE_EVENTS,
+                    (true, true, false) => MYSQL_TRIGGER_ONLY_DELETE_EVENT,
+                    (true, false, true) => MYSQL_TRIGGER_ONLY_UPDATE_EVENT,
+                    (false, true, true) => MYSQL_TRIGGER_ONLY_INSERT_EVENT,
+                    (true, true, true) => &[],
+                };
+                if idx == words.len() {
+                    return Some(if event_was_update && mariadb && !consumed_update_of {
+                        &["OF", "ON", "OR"]
+                    } else if mariadb && !remaining_event_candidates.is_empty() {
+                        &["ON", "OR"]
+                    } else {
+                        &["ON"]
+                    });
+                }
+                if words.get(idx).map(String::as_str) != Some("OR") {
+                    return None;
+                }
+                if !mariadb || remaining_event_candidates.is_empty() {
+                    return None;
+                }
+                idx += 1;
+                if idx == words.len() {
+                    return Some(remaining_event_candidates);
+                }
+            }
         }
         if first == "CREATE" && has("EVENT") {
             if matches!(last, Some("EVENT" | "IF" | "NOT")) {
@@ -36846,11 +37428,19 @@ impl SqlEditorWidget {
     }
 
     fn cursor_is_at_mysql_drop_index_on_table_target_slot(tokens: &[SqlToken], end: usize) -> bool {
-        let words = Self::previous_meaningful_words_upper(tokens, end, 4);
+        let words = Self::previous_meaningful_words_upper(tokens, end, 6);
         matches!(
             words.as_slice(),
             [drop_kw, index_kw, _index_name, on_kw]
                 if drop_kw == "DROP" && index_kw == "INDEX" && on_kw == "ON"
+        ) || matches!(
+            words.as_slice(),
+            [drop_kw, index_kw, if_kw, exists_kw, _index_name, on_kw]
+                if drop_kw == "DROP"
+                    && index_kw == "INDEX"
+                    && if_kw == "IF"
+                    && exists_kw == "EXISTS"
+                    && on_kw == "ON"
         )
     }
 
@@ -37216,6 +37806,225 @@ impl SqlEditorWidget {
         }
     }
 
+    fn expected_mariadb_package_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        if !matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) {
+            return None;
+        }
+
+        let words = Self::meaningful_tokens_before(tokens, end)
+            .into_iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                SqlToken::String(_) => Some("__VALUE__".to_string()),
+                SqlToken::Symbol(_) => None,
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let create_pos = words.iter().rposition(|word| word == "CREATE")?;
+        let mut idx = create_pos + 1;
+        if idx >= words.len() {
+            return None;
+        }
+
+        if words.get(idx).map(String::as_str) == Some("OR") {
+            if words.get(idx + 1).map(String::as_str) != Some("REPLACE") {
+                return None;
+            }
+            idx += 2;
+        }
+
+        if words.get(idx).map(String::as_str) == Some("DEFINER") {
+            if idx + 1 >= words.len() {
+                return None;
+            }
+            idx += 2;
+        }
+
+        if words.get(idx).map(String::as_str) != Some("PACKAGE") {
+            return None;
+        }
+        idx += 1;
+
+        if idx == words.len() {
+            return Some(&["BODY", "IF"]);
+        }
+
+        if words.get(idx).map(String::as_str) == Some("BODY") {
+            idx += 1;
+            if idx == words.len() {
+                return Some(&["IF"]);
+            }
+        }
+
+        if words.get(idx).map(String::as_str) == Some("IF") {
+            if idx + 1 == words.len() {
+                return Some(&["NOT"]);
+            }
+            if words.get(idx + 1).map(String::as_str) != Some("NOT") {
+                return None;
+            }
+            if idx + 2 == words.len() {
+                return Some(&["EXISTS"]);
+            }
+            if words.get(idx + 2).map(String::as_str) != Some("EXISTS") {
+                return None;
+            }
+            idx += 3;
+        }
+
+        if idx >= words.len() {
+            return None;
+        }
+
+        idx += 1;
+        if idx == words.len() {
+            return Some(Self::mariadb_package_tail_candidates(false, false));
+        }
+
+        let mut has_comment = false;
+        let mut has_sql_security = false;
+        while idx < words.len() {
+            match words.get(idx).map(String::as_str) {
+                Some("COMMENT") if !has_comment => {
+                    if idx + 1 == words.len() {
+                        return None;
+                    }
+                    if words.get(idx + 1).map(String::as_str) != Some("__VALUE__") {
+                        return None;
+                    }
+                    has_comment = true;
+                    idx += 2;
+                }
+                Some("SQL") if !has_sql_security => {
+                    if idx + 1 == words.len() {
+                        return Some(&["SECURITY"]);
+                    }
+                    if words.get(idx + 1).map(String::as_str) != Some("SECURITY") {
+                        return None;
+                    }
+                    if idx + 2 == words.len() {
+                        return Some(&["DEFINER", "INVOKER"]);
+                    }
+                    if !matches!(
+                        words.get(idx + 2).map(String::as_str),
+                        Some("DEFINER" | "INVOKER")
+                    ) {
+                        return None;
+                    }
+                    has_sql_security = true;
+                    idx += 3;
+                }
+                Some("AS" | "IS") => return None,
+                _ => return None,
+            }
+
+            if idx == words.len() {
+                return Some(Self::mariadb_package_tail_candidates(
+                    has_comment,
+                    has_sql_security,
+                ));
+            }
+        }
+
+        None
+    }
+
+    fn mariadb_package_tail_candidates(
+        has_comment: bool,
+        has_sql_security: bool,
+    ) -> &'static [&'static str] {
+        match (has_comment, has_sql_security) {
+            (false, false) => &["AS", "COMMENT", "IS", "SQL"],
+            (true, false) => &["AS", "IS", "SQL"],
+            (false, true) => &["AS", "COMMENT", "IS"],
+            (true, true) => &["AS", "IS"],
+        }
+    }
+
+    fn expected_mariadb_create_role_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        words: &[String],
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        if !matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) {
+            return None;
+        }
+        if Self::meaningful_tokens_before(tokens, end)
+            .last()
+            .is_some_and(|token| matches!(token, SqlToken::Symbol(sym) if sym == ","))
+        {
+            return None;
+        }
+
+        let create_idx = words.iter().rposition(|word| word == "CREATE")?;
+        let mut idx = create_idx + 1;
+        let has_or_replace = words.get(idx).map(String::as_str) == Some("OR")
+            && words.get(idx + 1).map(String::as_str) == Some("REPLACE");
+        if words.get(idx).map(String::as_str) == Some("OR")
+            && words.get(idx + 1).map(String::as_str) == Some("REPLACE")
+        {
+            idx += 2;
+        }
+        if words.get(idx).map(String::as_str) != Some("ROLE") {
+            return None;
+        }
+        idx += 1;
+        if idx == words.len() {
+            return if has_or_replace {
+                Some(&["IF"])
+            } else {
+                None
+            };
+        }
+        if words.get(idx).map(String::as_str) == Some("IF") {
+            if !has_or_replace {
+                if words.get(idx + 1).map(String::as_str) == Some("NOT")
+                    && words.get(idx + 2).map(String::as_str) == Some("EXISTS")
+                {
+                    idx += 3;
+                } else {
+                    return None;
+                }
+            } else {
+            if idx + 1 == words.len() {
+                return Some(&["NOT"]);
+            }
+            if words.get(idx + 1).map(String::as_str) == Some("NOT") {
+                if idx + 2 == words.len() {
+                    return Some(&["EXISTS"]);
+                }
+                if words.get(idx + 2).map(String::as_str) != Some("EXISTS") {
+                    return None;
+                }
+                idx += 3;
+            } else {
+                return None;
+            }
+            }
+        }
+        if idx >= words.len() {
+            return None;
+        }
+
+        idx += 1;
+        match words.get(idx).map(String::as_str) {
+            None => Some(&["WITH"]),
+            Some("WITH") if idx + 1 == words.len() => Some(&["ADMIN"]),
+            Some("WITH")
+                if words.get(idx + 1).map(String::as_str) == Some("ADMIN")
+                    && idx + 2 == words.len() =>
+            {
+                Some(&["CURRENT_ROLE", "CURRENT_USER"])
+            }
+            _ => None,
+        }
+    }
+
     fn expected_mysql_statement_structural_keyword_candidates(
         tokens: &[SqlToken],
         end: usize,
@@ -37224,6 +38033,7 @@ impl SqlEditorWidget {
     ) -> Option<&'static [&'static str]> {
         const MYSQL_CREATE_OBJECT_TYPE_KEYWORDS: &[&str] = &[
             "ALGORITHM",
+            "AGGREGATE",
             "DATABASE",
             "DEFINER",
             "EVENT",
@@ -37246,7 +38056,55 @@ impl SqlEditorWidget {
             "USER",
             "VIEW",
         ];
-        const MYSQL_CREATE_OR_REPLACE_OBJECT_TYPE_KEYWORDS: &[&str] = &["VIEW"];
+        const MARIADB_CREATE_OBJECT_TYPE_KEYWORDS: &[&str] = &[
+            "ALGORITHM",
+            "AGGREGATE",
+            "DATABASE",
+            "DEFINER",
+            "EVENT",
+            "FULLTEXT",
+            "FUNCTION",
+            "INDEX",
+            "LOGFILE",
+            "OR",
+            "PACKAGE",
+            "PROCEDURE",
+            "RESOURCE",
+            "ROLE",
+            "SCHEMA",
+            "SEQUENCE",
+            "SERVER",
+            "SQL",
+            "SPATIAL",
+            "TABLE",
+            "TABLESPACE",
+            "TEMPORARY",
+            "TRIGGER",
+            "USER",
+            "VECTOR",
+            "VIEW",
+        ];
+        const MYSQL_CREATE_TEMPORARY_OBJECT_TYPE_KEYWORDS: &[&str] = &["TABLE"];
+        const MARIADB_CREATE_TEMPORARY_OBJECT_TYPE_KEYWORDS: &[&str] = &["SEQUENCE", "TABLE"];
+        const MYSQL_CREATE_OR_REPLACE_OBJECT_TYPE_KEYWORDS: &[&str] = &["SPATIAL", "VIEW"];
+        const MARIADB_CREATE_OR_REPLACE_OBJECT_TYPE_KEYWORDS: &[&str] = &[
+            "AGGREGATE",
+            "EVENT",
+            "FULLTEXT",
+            "FUNCTION",
+            "INDEX",
+            "PACKAGE",
+            "PROCEDURE",
+            "ROLE",
+            "SEQUENCE",
+            "SPATIAL",
+            "TABLE",
+            "TEMPORARY",
+            "TRIGGER",
+            "UNIQUE",
+            "VECTOR",
+            "VIEW",
+        ];
         const MYSQL_ALTER_OBJECT_TYPE_KEYWORDS: &[&str] = &[
             "ALGORITHM",
             "DATABASE",
@@ -37529,17 +38387,48 @@ impl SqlEditorWidget {
             &["IGNORE", "INDEX", "KEY", "PARTITION"];
         const MYSQL_CREATE_INDEX_MODIFIERS: &[&str] = &["FULLTEXT", "SPATIAL", "UNIQUE"];
         const MYSQL_INDEX_TYPE_KEYWORDS: &[&str] = &["BTREE", "HASH"];
+        const MARIADB_INDEX_TYPE_KEYWORDS: &[&str] = &["BTREE", "HASH", "RTREE"];
         const MYSQL_VIEW_PREFIX_AFTER_VERB: &[&str] = &["ALGORITHM", "DEFINER", "SQL", "VIEW"];
-        const MYSQL_VIEW_PREFIX_AFTER_REPLACE: &[&str] = &["ALGORITHM", "DEFINER", "SQL", "VIEW"];
+        const MYSQL_VIEW_PREFIX_AFTER_REPLACE: &[&str] =
+            &["ALGORITHM", "DEFINER", "SPATIAL", "SQL", "VIEW"];
+        const MARIADB_VIEW_PREFIX_AFTER_REPLACE: &[&str] = &[
+            "AGGREGATE",
+            "ALGORITHM",
+            "DEFINER",
+            "EVENT",
+            "FULLTEXT",
+            "FUNCTION",
+            "INDEX",
+            "PACKAGE",
+            "PROCEDURE",
+            "ROLE",
+            "SEQUENCE",
+            "SPATIAL",
+            "SQL",
+            "TABLE",
+            "TEMPORARY",
+            "TRIGGER",
+            "UNIQUE",
+            "VECTOR",
+            "VIEW",
+        ];
         const MYSQL_VIEW_PREFIX_AFTER_ALGORITHM: &[&str] = &["DEFINER", "SQL", "VIEW"];
         const MYSQL_VIEW_ALGORITHM_VALUES: &[&str] = &["MERGE", "TEMPTABLE", "UNDEFINED"];
         const MYSQL_VIEW_SECURITY_VALUES: &[&str] = &["DEFINER", "INVOKER"];
         const MYSQL_TRIGGER_TIMING_KEYWORDS: &[&str] = &["AFTER", "BEFORE"];
         const MYSQL_TRIGGER_EVENT_KEYWORDS: &[&str] = &["DELETE", "INSERT", "UPDATE"];
+        const MYSQL_TRIGGER_AFTER_INSERT_EVENTS: &[&str] = &["DELETE", "UPDATE"];
+        const MYSQL_TRIGGER_AFTER_UPDATE_EVENTS: &[&str] = &["DELETE", "INSERT"];
+        const MYSQL_TRIGGER_AFTER_DELETE_EVENTS: &[&str] = &["INSERT", "UPDATE"];
+        const MYSQL_TRIGGER_ONLY_INSERT_EVENT: &[&str] = &["INSERT"];
+        const MYSQL_TRIGGER_ONLY_UPDATE_EVENT: &[&str] = &["UPDATE"];
+        const MYSQL_TRIGGER_ONLY_DELETE_EVENT: &[&str] = &["DELETE"];
         const MYSQL_TRIGGER_ORDER_KEYWORDS: &[&str] = &["FOLLOWS", "PRECEDES"];
         const MYSQL_SERVER_OPTION_KEYWORDS: &[&str] = &[
             "DATABASE", "HOST", "OWNER", "PASSWORD", "PORT", "SOCKET", "USER",
         ];
+        const MYSQL_SRS_ATTRIBUTE_HEAD_KEYWORDS: &[&str] =
+            &["DEFINITION", "DESCRIPTION", "NAME", "ORGANIZATION"];
         const MYSQL_RESOURCE_GROUP_TYPE_VALUES: &[&str] = &["SYSTEM", "USER"];
         const MYSQL_RESOURCE_GROUP_CREATE_AFTER_TYPE_KEYWORDS: &[&str] =
             &["VCPU", "THREAD_PRIORITY", "ENABLE", "DISABLE"];
@@ -37602,6 +38491,11 @@ impl SqlEditorWidget {
             &["CHARACTER", "CHARSET", "COLLATE", "ENCRYPTION"];
         const MYSQL_CREATE_AFTER_DEFINER_KEYWORDS: &[&str] =
             &["EVENT", "FUNCTION", "PROCEDURE", "SQL", "TRIGGER", "VIEW"];
+        const MARIADB_CREATE_AFTER_DEFINER_KEYWORDS: &[&str] =
+            &["EVENT", "FUNCTION", "PACKAGE", "PROCEDURE", "SQL", "TRIGGER", "VIEW"];
+        const MYSQL_CREATE_OR_REPLACE_AFTER_DEFINER_KEYWORDS: &[&str] = &["SQL", "VIEW"];
+        const MARIADB_CREATE_OR_REPLACE_AFTER_DEFINER_KEYWORDS: &[&str] =
+            &["EVENT", "FUNCTION", "PACKAGE", "PROCEDURE", "SQL", "TRIGGER", "VIEW"];
         const MYSQL_ALTER_AFTER_DEFINER_KEYWORDS: &[&str] = &["EVENT", "SQL", "VIEW"];
         const MYSQL_ROUTINE_CHARACTERISTIC_HEAD_KEYWORDS: &[&str] = &[
             "COMMENT",
@@ -37612,6 +38506,18 @@ impl SqlEditorWidget {
             "NO",
             "NOT",
             "READS",
+            "SQL",
+        ];
+        const MYSQL_ROUTINE_CHARACTERISTIC_OR_UDF_SONAME_KEYWORDS: &[&str] = &[
+            "COMMENT",
+            "CONTAINS",
+            "DETERMINISTIC",
+            "LANGUAGE",
+            "MODIFIES",
+            "NO",
+            "NOT",
+            "READS",
+            "SONAME",
             "SQL",
         ];
         const MYSQL_ROUTINE_SQL_TAIL_KEYWORDS: &[&str] = &["DATA", "SECURITY"];
@@ -37870,6 +38776,160 @@ impl SqlEditorWidget {
             return Some(candidates);
         }
 
+        let srs_items: Vec<String> = Self::meaningful_tokens_before(tokens, end)
+            .into_iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => {
+                    if word.chars().all(|ch| ch.is_ascii_digit()) {
+                        Some("__VALUE__".to_string())
+                    } else {
+                        Some(word.to_ascii_uppercase())
+                    }
+                }
+                SqlToken::String(_) => Some("__VALUE__".to_string()),
+                SqlToken::Symbol(_) | SqlToken::Comment(_) => None,
+            })
+            .collect();
+        let expected_spatial_reference_system_candidates =
+            |items: &[String]| -> Option<&'static [&'static str]> {
+                if matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) {
+                    return None;
+                }
+                let verb = items.first().map(String::as_str)?;
+                if !matches!(verb, "CREATE" | "DROP") {
+                    return None;
+                }
+
+                let mut idx = 1;
+                let mut create_or_replace = false;
+                if verb == "CREATE" {
+                    if matches!(
+                        items.get(idx..idx + 2),
+                        Some([or_kw, replace_kw]) if or_kw == "OR" && replace_kw == "REPLACE"
+                    ) {
+                        idx += 2;
+                        create_or_replace = true;
+                    }
+                }
+                if items.get(idx).map(String::as_str) != Some("SPATIAL") {
+                    return None;
+                }
+                idx += 1;
+                if idx == items.len() {
+                    return Some(if create_or_replace {
+                        &["REFERENCE"]
+                    } else {
+                        &["INDEX", "REFERENCE"]
+                    });
+                }
+                if items.get(idx).map(String::as_str) != Some("REFERENCE") {
+                    return None;
+                }
+                idx += 1;
+                if idx == items.len() {
+                    return Some(&["SYSTEM"]);
+                }
+                if items.get(idx).map(String::as_str) != Some("SYSTEM") {
+                    return None;
+                }
+                idx += 1;
+                if verb == "DROP" {
+                    if idx == items.len() {
+                        return Some(&["IF"]);
+                    }
+                    if items.get(idx).map(String::as_str) == Some("IF") {
+                        idx += 1;
+                        if idx == items.len() {
+                            return Some(&["EXISTS"]);
+                        }
+                        if items.get(idx).map(String::as_str) != Some("EXISTS") {
+                            return None;
+                        }
+                        idx += 1;
+                    }
+                    return if idx >= items.len() || idx + 1 == items.len() {
+                        Some(&[])
+                    } else {
+                        None
+                    };
+                }
+                if idx >= items.len() {
+                    return Some(&[]);
+                }
+
+                idx += 1; // SRID value.
+                if idx == items.len() {
+                    return Some(MYSQL_SRS_ATTRIBUTE_HEAD_KEYWORDS);
+                }
+
+                while idx < items.len() {
+                    match items.get(idx).map(String::as_str) {
+                        Some("NAME" | "DEFINITION" | "DESCRIPTION") => {
+                            idx += 1;
+                            if idx >= items.len() {
+                                return Some(&[]);
+                            }
+                            if items.get(idx).map(String::as_str) != Some("__VALUE__") {
+                                return if idx + 1 == items.len() {
+                                    Some(&[])
+                                } else {
+                                    None
+                                };
+                            }
+                            idx += 1;
+                        }
+                        Some("ORGANIZATION") => {
+                            idx += 1;
+                            if idx >= items.len() {
+                                return Some(&[]);
+                            }
+                            if items.get(idx).map(String::as_str) != Some("__VALUE__") {
+                                return if idx + 1 == items.len() {
+                                    Some(&[])
+                                } else {
+                                    None
+                                };
+                            }
+                            idx += 1;
+                            if idx == items.len() {
+                                return Some(&["IDENTIFIED"]);
+                            }
+                            if items.get(idx).map(String::as_str) != Some("IDENTIFIED") {
+                                return None;
+                            }
+                            idx += 1;
+                            if idx == items.len() {
+                                return Some(&["BY"]);
+                            }
+                            if items.get(idx).map(String::as_str) != Some("BY") {
+                                return None;
+                            }
+                            idx += 1;
+                            if idx >= items.len() {
+                                return Some(&[]);
+                            }
+                            if items.get(idx).map(String::as_str) != Some("__VALUE__") {
+                                return if idx + 1 == items.len() {
+                                    Some(&[])
+                                } else {
+                                    None
+                                };
+                            }
+                            idx += 1;
+                        }
+                        _ => return None,
+                    }
+                    if idx == items.len() {
+                        return Some(MYSQL_SRS_ATTRIBUTE_HEAD_KEYWORDS);
+                    }
+                }
+
+                None
+            };
+        if let Some(candidates) = expected_spatial_reference_system_candidates(&srs_items) {
+            return Some(candidates);
+        }
+
         let expected_view_prefix_candidates =
             |words: &[String]| -> Option<&'static [&'static str]> {
                 let verb_pos = words
@@ -37877,6 +38937,7 @@ impl SqlEditorWidget {
                     .rposition(|word| matches!(word.as_str(), "ALTER" | "CREATE"))?;
                 let verb = words[verb_pos].as_str();
                 let mut idx = verb_pos + 1;
+                let mut create_or_replace = false;
                 if idx >= words.len() {
                     return None;
                 }
@@ -37893,7 +38954,11 @@ impl SqlEditorWidget {
                         return None;
                     }
                     idx += 2;
+                    create_or_replace = true;
                     if idx == words.len() {
+                        if matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) {
+                            return Some(MARIADB_VIEW_PREFIX_AFTER_REPLACE);
+                        }
                         return Some(MYSQL_VIEW_PREFIX_AFTER_REPLACE);
                     }
                 }
@@ -37918,6 +38983,15 @@ impl SqlEditorWidget {
                     idx += 2;
                     if idx == words.len() {
                         if verb == "CREATE" {
+                            if create_or_replace {
+                                if matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) {
+                                    return Some(MARIADB_CREATE_OR_REPLACE_AFTER_DEFINER_KEYWORDS);
+                                }
+                                return Some(MYSQL_CREATE_OR_REPLACE_AFTER_DEFINER_KEYWORDS);
+                            }
+                            if matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) {
+                                return Some(MARIADB_CREATE_AFTER_DEFINER_KEYWORDS);
+                            }
                             return Some(MYSQL_CREATE_AFTER_DEFINER_KEYWORDS);
                         }
                         return Some(MYSQL_ALTER_AFTER_DEFINER_KEYWORDS);
@@ -37954,12 +39028,117 @@ impl SqlEditorWidget {
             return Some(candidates);
         }
 
-        let expected_create_trigger_candidates =
+        let expected_mariadb_package_candidates =
             |words: &[String]| -> Option<&'static [&'static str]> {
+                if !matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) {
+                    return None;
+                }
                 let create_pos = words.iter().rposition(|word| word == "CREATE")?;
                 let mut idx = create_pos + 1;
                 if idx >= words.len() {
                     return None;
+                }
+
+                if words.get(idx).map(String::as_str) == Some("OR") {
+                    if words.get(idx + 1).map(String::as_str) != Some("REPLACE") {
+                        return None;
+                    }
+                    idx += 2;
+                }
+
+                if words.get(idx).map(String::as_str) == Some("DEFINER") {
+                    if idx + 1 >= words.len() {
+                        return None;
+                    }
+                    idx += 2;
+                }
+
+                if words.get(idx).map(String::as_str) != Some("PACKAGE") {
+                    return None;
+                }
+                idx += 1;
+
+                if idx == words.len() {
+                    return Some(&["BODY", "IF"]);
+                }
+
+                if words.get(idx).map(String::as_str) == Some("BODY") {
+                    idx += 1;
+                    if idx == words.len() {
+                        return Some(&["IF"]);
+                    }
+                }
+
+                if words.get(idx).map(String::as_str) == Some("IF") {
+                    if idx + 1 == words.len() {
+                        return Some(&["NOT"]);
+                    }
+                    if words.get(idx + 1).map(String::as_str) != Some("NOT") {
+                        return None;
+                    }
+                    if idx + 2 == words.len() {
+                        return Some(&["EXISTS"]);
+                    }
+                    if words.get(idx + 2).map(String::as_str) != Some("EXISTS") {
+                        return None;
+                    }
+                    idx += 3;
+                }
+
+                if idx >= words.len() {
+                    return None;
+                }
+
+                idx += 1;
+                if idx == words.len() {
+                    return Some(&["AS", "COMMENT", "IS", "SQL"]);
+                }
+
+                match words.get(idx).map(String::as_str) {
+                    Some("SQL") => {
+                        if idx + 1 == words.len() {
+                            Some(&["SECURITY"])
+                        } else if words.get(idx + 1).map(String::as_str) == Some("SECURITY") {
+                            if idx + 2 == words.len() {
+                                Some(MYSQL_VIEW_SECURITY_VALUES)
+                            } else if MYSQL_VIEW_SECURITY_VALUES
+                                .contains(&words[idx + 2].as_str())
+                                && idx + 3 == words.len()
+                            {
+                                Some(&["AS", "IS"])
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    Some("COMMENT") => None,
+                    _ => None,
+                }
+            };
+
+        if let Some(candidates) = expected_mariadb_package_candidates(words) {
+            return Some(candidates);
+        }
+
+        let expected_create_trigger_candidates =
+            |words: &[String]| -> Option<&'static [&'static str]> {
+                let mariadb = matches!(db_type, Some(crate::db::DatabaseType::MariaDB));
+                let create_pos = words.iter().rposition(|word| word == "CREATE")?;
+                let mut idx = create_pos + 1;
+                if idx >= words.len() {
+                    return None;
+                }
+
+                if words.get(idx).map(String::as_str) == Some("OR") {
+                    if !matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) {
+                        return None;
+                    }
+                    if words.get(idx + 1).map(String::as_str) != Some("REPLACE") {
+                        return None;
+                    }
+                    idx += 2;
                 }
 
                 if words.get(idx).map(String::as_str) == Some("DEFINER") {
@@ -38014,9 +39193,73 @@ impl SqlEditorWidget {
                 if !MYSQL_TRIGGER_EVENT_KEYWORDS.contains(&words[idx].as_str()) {
                     return None;
                 }
-                idx += 1;
-                if idx == words.len() {
-                    return Some(&["ON"]);
+
+                let mut seen_insert = false;
+                let mut seen_update = false;
+                let mut seen_delete = false;
+                loop {
+                    let event_was_update = match words.get(idx).map(String::as_str) {
+                        Some("INSERT") if !seen_insert => {
+                            seen_insert = true;
+                            false
+                        }
+                        Some("UPDATE") if !seen_update => {
+                            seen_update = true;
+                            true
+                        }
+                        Some("DELETE") if !seen_delete => {
+                            seen_delete = true;
+                            false
+                        }
+                        _ => return None,
+                    };
+                    idx += 1;
+                    let mut consumed_update_of = false;
+                    if event_was_update
+                        && mariadb
+                        && words.get(idx).map(String::as_str) == Some("OF")
+                    {
+                        idx += 1;
+                        if idx == words.len() {
+                            return None;
+                        }
+                        consumed_update_of = true;
+                        while idx < words.len()
+                            && !matches!(words.get(idx).map(String::as_str), Some("ON" | "OR"))
+                        {
+                            idx += 1;
+                        }
+                    }
+                    let remaining_event_candidates = match (seen_insert, seen_update, seen_delete)
+                    {
+                        (false, false, false) => MYSQL_TRIGGER_EVENT_KEYWORDS,
+                        (true, false, false) => MYSQL_TRIGGER_AFTER_INSERT_EVENTS,
+                        (false, true, false) => MYSQL_TRIGGER_AFTER_UPDATE_EVENTS,
+                        (false, false, true) => MYSQL_TRIGGER_AFTER_DELETE_EVENTS,
+                        (true, true, false) => MYSQL_TRIGGER_ONLY_DELETE_EVENT,
+                        (true, false, true) => MYSQL_TRIGGER_ONLY_UPDATE_EVENT,
+                        (false, true, true) => MYSQL_TRIGGER_ONLY_INSERT_EVENT,
+                        (true, true, true) => &[],
+                    };
+                    if idx == words.len() {
+                        return Some(if event_was_update && mariadb && !consumed_update_of {
+                            &["OF", "ON", "OR"]
+                        } else if mariadb && !remaining_event_candidates.is_empty() {
+                            &["ON", "OR"]
+                        } else {
+                            &["ON"]
+                        });
+                    }
+                    if words.get(idx).map(String::as_str) != Some("OR") {
+                        break;
+                    }
+                    if !mariadb || remaining_event_candidates.is_empty() {
+                        return None;
+                    }
+                    idx += 1;
+                    if idx == words.len() {
+                        return Some(remaining_event_candidates);
+                    }
                 }
 
                 if words.get(idx).map(String::as_str) != Some("ON") {
@@ -38152,13 +39395,23 @@ impl SqlEditorWidget {
                 .rposition(|word| matches!(word.as_str(), "ALTER" | "CREATE"))?;
             let verb = words[verb_pos].as_str();
             let mut idx = verb_pos + 1;
-            if idx >= words.len() {
-                return None;
-            }
-
-            if words.get(idx).map(String::as_str) == Some("DEFINER") {
-                if idx + 1 >= words.len() {
+                if idx >= words.len() {
                     return None;
+                }
+
+                if verb == "CREATE" && words.get(idx).map(String::as_str) == Some("OR") {
+                    if !matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) {
+                        return None;
+                    }
+                    if words.get(idx + 1).map(String::as_str) != Some("REPLACE") {
+                        return None;
+                    }
+                    idx += 2;
+                }
+
+                if words.get(idx).map(String::as_str) == Some("DEFINER") {
+                    if idx + 1 >= words.len() {
+                        return None;
                 }
                 idx += 2;
             }
@@ -38384,6 +39637,16 @@ impl SqlEditorWidget {
                 return None;
             }
 
+            if verb == "CREATE" && words.get(idx).map(String::as_str) == Some("OR") {
+                if !matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) {
+                    return None;
+                }
+                if words.get(idx + 1).map(String::as_str) != Some("REPLACE") {
+                    return None;
+                }
+                idx += 2;
+            }
+
             if verb == "CREATE" && words.get(idx).map(String::as_str) == Some("DEFINER") {
                 if idx + 1 >= words.len() {
                     return None;
@@ -38391,8 +39654,20 @@ impl SqlEditorWidget {
                 idx += 2;
             }
 
+            let aggregate_function = verb == "CREATE"
+                && words.get(idx).map(String::as_str) == Some("AGGREGATE");
+            if aggregate_function {
+                idx += 1;
+                if idx == words.len() {
+                    return Some(&["FUNCTION"]);
+                }
+            }
+
             let routine_kind = words.get(idx).map(String::as_str)?;
             if !matches!(routine_kind, "FUNCTION" | "PROCEDURE") {
+                return None;
+            }
+            if aggregate_function && routine_kind != "FUNCTION" {
                 return None;
             }
             idx += 1;
@@ -38443,10 +39718,30 @@ impl SqlEditorWidget {
                 }
                 // Return type. Complex types may contain multiple words; use the
                 // last word as the start of the characteristic tail when present.
+                let return_type = words.get(idx).map(String::as_str);
                 idx += 1;
                 if idx == words.len() {
-                    return Some(MYSQL_ROUTINE_CHARACTERISTIC_HEAD_KEYWORDS);
+                    return Some(if aggregate_function {
+                        &["SONAME"]
+                    } else if matches!(
+                        return_type,
+                        Some("STRING" | "INTEGER" | "REAL" | "DECIMAL")
+                    ) {
+                        MYSQL_ROUTINE_CHARACTERISTIC_OR_UDF_SONAME_KEYWORDS
+                    } else {
+                        MYSQL_ROUTINE_CHARACTERISTIC_HEAD_KEYWORDS
+                    });
                 }
+            }
+
+            if aggregate_function {
+                if words.get(idx).map(String::as_str) == Some("SONAME") {
+                    return Some(&[]);
+                }
+                return None;
+            }
+            if words.get(idx).map(String::as_str) == Some("SONAME") {
+                return Some(&[]);
             }
 
             if words
@@ -40128,7 +41423,11 @@ impl SqlEditorWidget {
         // heads the current statement (`CREATE/ALTER/DROP |`, also after a `;`),
         // never as a trailing sub-clause (`ALTER TABLE t DROP |`).
         if Self::cursor_at_statement_head_verb(tokens, end, "CREATE") {
-            return Some(MYSQL_CREATE_OBJECT_TYPE_KEYWORDS);
+            return if matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) {
+                Some(MARIADB_CREATE_OBJECT_TYPE_KEYWORDS)
+            } else {
+                Some(MYSQL_CREATE_OBJECT_TYPE_KEYWORDS)
+            };
         }
         if Self::cursor_at_statement_head_verb(tokens, end, "ALTER") {
             return Some(MYSQL_ALTER_OBJECT_TYPE_KEYWORDS);
@@ -40136,6 +41435,23 @@ impl SqlEditorWidget {
         if Self::cursor_at_statement_head_verb(tokens, end, "DROP") {
             return Some(MYSQL_DROP_OBJECT_TYPE_KEYWORDS);
         }
+
+        if let Some(candidates) =
+            Self::expected_mariadb_create_role_keyword_candidates(tokens, end, words, db_type)
+        {
+            return Some(candidates);
+        }
+
+        let mariadb = matches!(db_type, Some(crate::db::DatabaseType::MariaDB));
+        let create_index_modifier = |word: &str| {
+            MYSQL_CREATE_INDEX_MODIFIERS.contains(&word)
+                || (mariadb && matches!(word, "VECTOR"))
+        };
+        let index_type_keywords = if mariadb {
+            MARIADB_INDEX_TYPE_KEYWORDS
+        } else {
+            MYSQL_INDEX_TYPE_KEYWORDS
+        };
 
         match words {
             [.., a, b]
@@ -40156,6 +41472,57 @@ impl SqlEditorWidget {
                     && MYSQL_CREATE_IF_NOT_EXISTS_OBJECT_TYPES.contains(&b.as_str())
                     && *c == "IF"
                     && *d == "NOT" =>
+            {
+                Some(&["EXISTS"])
+            }
+            [.., a, b]
+                if *a == "CREATE"
+                    && *b == "SEQUENCE"
+                    && matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) =>
+            {
+                Some(&["IF"])
+            }
+            [.., a, b, c]
+                if *a == "CREATE"
+                    && *b == "SEQUENCE"
+                    && *c == "IF"
+                    && matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) =>
+            {
+                Some(&["NOT"])
+            }
+            [.., a, b, c, d]
+                if *a == "CREATE"
+                    && *b == "SEQUENCE"
+                    && *c == "IF"
+                    && *d == "NOT"
+                    && matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) =>
+            {
+                Some(&["EXISTS"])
+            }
+            [.., a, b, c]
+                if *a == "CREATE"
+                    && *b == "TEMPORARY"
+                    && *c == "SEQUENCE"
+                    && matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) =>
+            {
+                Some(&["IF"])
+            }
+            [.., a, b, c, d]
+                if *a == "CREATE"
+                    && *b == "TEMPORARY"
+                    && *c == "SEQUENCE"
+                    && *d == "IF"
+                    && matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) =>
+            {
+                Some(&["NOT"])
+            }
+            [.., a, b, c, d, e]
+                if *a == "CREATE"
+                    && *b == "TEMPORARY"
+                    && *c == "SEQUENCE"
+                    && *d == "IF"
+                    && *e == "NOT"
+                    && matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) =>
             {
                 Some(&["EXISTS"])
             }
@@ -40192,49 +41559,56 @@ impl SqlEditorWidget {
             {
                 Some(&["EXISTS"])
             }
-            [.., a, b] if *a == "CREATE" && MYSQL_CREATE_INDEX_MODIFIERS.contains(&b.as_str()) => {
-                if *b == "SPATIAL" {
+            [.., a, b] if *a == "CREATE" && create_index_modifier(b.as_str()) => {
+                if *b == "SPATIAL"
+                    && !matches!(db_type, Some(crate::db::DatabaseType::MariaDB))
+                {
                     Some(&["INDEX", "REFERENCE"])
                 } else {
                     Some(&["INDEX"])
                 }
             }
-            [.., a, b, c] if *a == "CREATE" && *b == "SPATIAL" && *c == "REFERENCE" => {
+            [.., a, b, c]
+                if *a == "CREATE"
+                    && *b == "SPATIAL"
+                    && *c == "REFERENCE"
+                    && !matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) =>
+            {
                 Some(&["SYSTEM"])
             }
             [.., a, b, _index_name] if *a == "CREATE" && *b == "INDEX" => Some(&["ON", "USING"]),
             [.., a, b, c, _index_name]
                 if *a == "CREATE"
-                    && MYSQL_CREATE_INDEX_MODIFIERS.contains(&b.as_str())
+                    && create_index_modifier(b.as_str())
                     && *c == "INDEX" =>
             {
                 Some(&["ON", "USING"])
             }
             [.., a, b, _index_name, c] if *a == "CREATE" && *b == "INDEX" && *c == "USING" => {
-                Some(MYSQL_INDEX_TYPE_KEYWORDS)
+                Some(index_type_keywords)
             }
             [.., a, b, c, _index_name, d]
                 if *a == "CREATE"
-                    && MYSQL_CREATE_INDEX_MODIFIERS.contains(&b.as_str())
+                    && create_index_modifier(b.as_str())
                     && *c == "INDEX"
                     && *d == "USING" =>
             {
-                Some(MYSQL_INDEX_TYPE_KEYWORDS)
+                Some(index_type_keywords)
             }
             [.., a, b, _index_name, c, d]
                 if *a == "CREATE"
                     && *b == "INDEX"
                     && *c == "USING"
-                    && MYSQL_INDEX_TYPE_KEYWORDS.contains(&d.as_str()) =>
+                    && index_type_keywords.contains(&d.as_str()) =>
             {
                 Some(&["ON"])
             }
             [.., a, b, c, _index_name, d, e]
                 if *a == "CREATE"
-                    && MYSQL_CREATE_INDEX_MODIFIERS.contains(&b.as_str())
+                    && create_index_modifier(b.as_str())
                     && *c == "INDEX"
                     && *d == "USING"
-                    && MYSQL_INDEX_TYPE_KEYWORDS.contains(&e.as_str()) =>
+                    && index_type_keywords.contains(&e.as_str()) =>
             {
                 Some(&["ON"])
             }
@@ -40430,9 +41804,89 @@ impl SqlEditorWidget {
             [.., a, b, _plugin] if *a == "INSTALL" && *b == "PLUGIN" => Some(&["SONAME"]),
             [.., prev, last] if *prev == "CREATE" && *last == "OR" => Some(&["REPLACE"]),
             [.., a, b, c] if *a == "CREATE" && *b == "OR" && *c == "REPLACE" => {
-                Some(MYSQL_CREATE_OR_REPLACE_OBJECT_TYPE_KEYWORDS)
+                if matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) {
+                    Some(MARIADB_CREATE_OR_REPLACE_OBJECT_TYPE_KEYWORDS)
+                } else {
+                    Some(MYSQL_CREATE_OR_REPLACE_OBJECT_TYPE_KEYWORDS)
+                }
             }
-            [.., prev, last] if *prev == "CREATE" && *last == "TEMPORARY" => Some(&["TABLE"]),
+            [.., a, b, c, d]
+                if *a == "CREATE"
+                    && *b == "OR"
+                    && *c == "REPLACE"
+                    && *d == "SPATIAL"
+                    && !matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) =>
+            {
+                Some(&["REFERENCE"])
+            }
+            [.., a, b, c, d, e]
+                if *a == "CREATE"
+                    && *b == "OR"
+                    && *c == "REPLACE"
+                    && *d == "SPATIAL"
+                    && *e == "REFERENCE"
+                    && !matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) =>
+            {
+                Some(&["SYSTEM"])
+            }
+            [.., a, b, c, d]
+                if *a == "CREATE"
+                    && *b == "OR"
+                    && *c == "REPLACE"
+                    && create_index_modifier(d.as_str())
+                    && matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) =>
+            {
+                Some(&["INDEX"])
+            }
+            [.., a, b, c, d]
+                if *a == "CREATE"
+                    && *b == "OR"
+                    && *c == "REPLACE"
+                    && *d == "TEMPORARY"
+                    && matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) =>
+            {
+                Some(MARIADB_CREATE_TEMPORARY_OBJECT_TYPE_KEYWORDS)
+            }
+            [.., a, b, c, d, e]
+                if *a == "CREATE"
+                    && *b == "OR"
+                    && *c == "REPLACE"
+                    && *d == "TEMPORARY"
+                    && *e == "SEQUENCE"
+                    && matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) =>
+            {
+                Some(&["IF"])
+            }
+            [.., a, b, c, d, e, f]
+                if *a == "CREATE"
+                    && *b == "OR"
+                    && *c == "REPLACE"
+                    && *d == "TEMPORARY"
+                    && *e == "SEQUENCE"
+                    && *f == "IF"
+                    && matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) =>
+            {
+                Some(&["NOT"])
+            }
+            [.., a, b, c, d, e, f, g]
+                if *a == "CREATE"
+                    && *b == "OR"
+                    && *c == "REPLACE"
+                    && *d == "TEMPORARY"
+                    && *e == "SEQUENCE"
+                    && *f == "IF"
+                    && *g == "NOT"
+                    && matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) =>
+            {
+                Some(&["EXISTS"])
+            }
+            [.., prev, last] if *prev == "CREATE" && *last == "TEMPORARY" => {
+                if matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) {
+                    Some(MARIADB_CREATE_TEMPORARY_OBJECT_TYPE_KEYWORDS)
+                } else {
+                    Some(MYSQL_CREATE_TEMPORARY_OBJECT_TYPE_KEYWORDS)
+                }
+            }
             [.., prev, last] if *prev == "DROP" && *last == "TEMPORARY" => Some(&["TABLE"]),
             [.., prev, last]
                 if matches!(prev.as_str(), "CREATE" | "ALTER" | "DROP") && *last == "LOGFILE" =>
@@ -40444,8 +41898,19 @@ impl SqlEditorWidget {
             {
                 Some(&["GROUP"])
             }
-            [.., prev, last] if *prev == "CREATE" && *last == "SPATIAL" => Some(&["REFERENCE"]),
-            [.., a, b, c] if *a == "CREATE" && *b == "SPATIAL" && *c == "REFERENCE" => {
+            [.., prev, last]
+                if *prev == "CREATE"
+                    && *last == "SPATIAL"
+                    && !matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) =>
+            {
+                Some(&["REFERENCE"])
+            }
+            [.., a, b, c]
+                if *a == "CREATE"
+                    && *b == "SPATIAL"
+                    && *c == "REFERENCE"
+                    && !matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) =>
+            {
                 Some(&["SYSTEM"])
             }
             [.., last]
@@ -42580,6 +44045,35 @@ impl SqlEditorWidget {
         {
             return Self::filter_expected_candidates(prefix, candidates);
         }
+        if let Some(candidates) =
+            Self::expected_mariadb_package_keyword_candidates(tokens, context_end, db_type).or_else(
+                || {
+                    Self::expected_mariadb_package_keyword_candidates(
+                        statement_tokens,
+                        statement_context_end,
+                        db_type,
+                    )
+                },
+            )
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(candidates) = Self::expected_mariadb_create_role_keyword_candidates(
+            tokens,
+            context_end,
+            &Self::words_for_keyword_slot(tokens, context_end),
+            db_type,
+        )
+        .or_else(|| {
+            Self::expected_mariadb_create_role_keyword_candidates(
+                statement_tokens,
+                statement_context_end,
+                &Self::words_for_keyword_slot(statement_tokens, statement_context_end),
+                db_type,
+            )
+        }) {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
         if Self::cursor_is_at_create_view_column_alias_list_slot_for_context(
             deep_ctx,
             !prefix.is_empty(),
@@ -43741,6 +45235,7 @@ impl SqlEditorWidget {
             && Self::expected_mysql_role_account_object_suggestion_kind(
                 statement_tokens,
                 statement_context_end,
+                db_type,
             )
             .is_some()
         {
@@ -44388,7 +45883,7 @@ impl SqlEditorWidget {
             {
                 return Some(kind);
             }
-            if let Some(kind) = Self::expected_mysql_show_object_suggestion_kind(&words) {
+            if let Some(kind) = Self::expected_mysql_show_object_suggestion_kind(&words, db_type) {
                 return Some(kind);
             }
             if let Some(kind) =
@@ -44396,7 +45891,9 @@ impl SqlEditorWidget {
             {
                 return Some(kind);
             }
-            if let Some(kind) = Self::expected_mysql_drop_if_exists_object_suggestion_kind(&words) {
+            if let Some(kind) =
+                Self::expected_mysql_drop_if_exists_object_suggestion_kind(&words, db_type)
+            {
                 return Some(kind);
             }
             if let Some(kind) =
@@ -44407,6 +45904,7 @@ impl SqlEditorWidget {
             if let Some(kind) = Self::expected_mysql_drop_index_option_value_object_suggestion_kind(
                 tokens,
                 context_end,
+                db_type,
             ) {
                 return Some(kind);
             }
@@ -44421,7 +45919,7 @@ impl SqlEditorWidget {
                 return Some(kind);
             }
             if let Some(kind) =
-                Self::expected_mysql_role_account_object_suggestion_kind(tokens, context_end)
+                Self::expected_mysql_role_account_object_suggestion_kind(tokens, context_end, db_type)
             {
                 return Some(kind);
             }
@@ -44615,6 +46113,13 @@ impl SqlEditorWidget {
                 kind
             }
         };
+        let oracle_or_mariadb_kind = |kind: ExpectedObjectSuggestionKind| {
+            if !mysql_compatible || matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) {
+                kind
+            } else {
+                ExpectedObjectSuggestionKind::NoSuggestions
+            }
+        };
         let mysql_only_kind = |kind: ExpectedObjectSuggestionKind| {
             if mysql_compatible {
                 kind
@@ -44785,27 +46290,27 @@ impl SqlEditorWidget {
                 Some(ExpectedObjectSuggestionKind::Function)
             }
             [.., prev, last] if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "PACKAGE" => {
-                Some(oracle_only_kind(ExpectedObjectSuggestionKind::Package))
+                Some(oracle_or_mariadb_kind(ExpectedObjectSuggestionKind::Package))
             }
             [.., object_type, body]
                 if words.first().map(String::as_str) == Some("CREATE")
                     && *body == "BODY"
                     && *object_type == "PACKAGE" =>
             {
-                Some(oracle_only_kind(ExpectedObjectSuggestionKind::Package))
+                Some(oracle_or_mariadb_kind(ExpectedObjectSuggestionKind::Package))
             }
             [.., verb, object_type, body]
                 if *verb == "ALTER" && *body == "BODY" && *object_type == "PACKAGE" =>
             {
-                Some(oracle_only_kind(ExpectedObjectSuggestionKind::Package))
+                Some(oracle_or_mariadb_kind(ExpectedObjectSuggestionKind::Package))
             }
             [.., a, b, c] if *a == "DROP" && *b == "PACKAGE" && *c == "BODY" => {
-                Some(oracle_only_kind(ExpectedObjectSuggestionKind::Package))
+                Some(oracle_or_mariadb_kind(ExpectedObjectSuggestionKind::Package))
             }
             [.., prev, last]
                 if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "SEQUENCE" =>
             {
-                Some(oracle_only_kind(ExpectedObjectSuggestionKind::Sequence))
+                Some(oracle_or_mariadb_kind(ExpectedObjectSuggestionKind::Sequence))
             }
             [.., prev, last] if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "SYNONYM" => {
                 Some(oracle_only_kind(ExpectedObjectSuggestionKind::Synonym))
@@ -44958,6 +46463,7 @@ impl SqlEditorWidget {
 
     fn expected_mysql_show_object_suggestion_kind(
         words: &[String],
+        db_type: Option<crate::db::DatabaseType>,
     ) -> Option<ExpectedObjectSuggestionKind> {
         let show_pos = words.iter().rposition(|word| word == "SHOW")?;
         let tail = &words[show_pos + 1..];
@@ -44979,6 +46485,13 @@ impl SqlEditorWidget {
                     "VIEW" => Some(ExpectedObjectSuggestionKind::View),
                     _ => None,
                 }
+            }
+            [create, object_type]
+                if create == "CREATE"
+                    && object_type == "SEQUENCE"
+                    && matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) =>
+            {
+                Some(ExpectedObjectSuggestionKind::Sequence)
             }
             [grants, for_kw] if grants == "GRANTS" && for_kw == "FOR" => {
                 Some(ExpectedObjectSuggestionKind::User)
@@ -45447,6 +46960,7 @@ impl SqlEditorWidget {
 
     fn expected_mysql_drop_if_exists_object_suggestion_kind(
         words: &[String],
+        db_type: Option<crate::db::DatabaseType>,
     ) -> Option<ExpectedObjectSuggestionKind> {
         let tail = match words {
             [drop_kw, object_type, if_kw, exists]
@@ -45529,6 +47043,12 @@ impl SqlEditorWidget {
             "PROCEDURE" => Some(ExpectedObjectSuggestionKind::Procedure),
             "TRIGGER" => Some(ExpectedObjectSuggestionKind::Trigger),
             "USER" | "ROLE" => Some(ExpectedObjectSuggestionKind::User),
+            "INDEX" if matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) => {
+                Some(ExpectedObjectSuggestionKind::Index)
+            }
+            "SEQUENCE" if matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) => {
+                Some(ExpectedObjectSuggestionKind::Sequence)
+            }
             "DATABASE" | "SCHEMA" | "SERVER" => Some(ExpectedObjectSuggestionKind::NoSuggestions),
             "PACKAGE" | "TYPE" | "SEQUENCE" | "SYNONYM" | "DIRECTORY" | "LIBRARY" | "CLUSTER"
             | "CONTEXT" | "DIMENSION" | "OPERATOR" | "INDEXTYPE" | "EDITION" => {
@@ -45562,6 +47082,7 @@ impl SqlEditorWidget {
     fn expected_mysql_drop_index_option_value_object_suggestion_kind(
         tokens: &[SqlToken],
         end: usize,
+        db_type: Option<crate::db::DatabaseType>,
     ) -> Option<ExpectedObjectSuggestionKind> {
         let toks = Self::meaningful_tokens_before(tokens, end);
         if !matches!(toks.first(), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("DROP"))
@@ -45584,14 +47105,18 @@ impl SqlEditorWidget {
             idx += 2;
         }
 
+        let mariadb = matches!(db_type, Some(crate::db::DatabaseType::MariaDB));
         toks.get(idx..)
             .is_some_and(|tail| {
-                tail.iter().any(|token| {
-                    matches!(
-                        token,
-                        SqlToken::Word(word)
-                            if matches!(word.to_ascii_uppercase().as_str(), "ALGORITHM" | "LOCK")
-                    )
+                tail.iter().any(|token| match token {
+                    SqlToken::Word(word) => {
+                        matches!(
+                            word.to_ascii_uppercase().as_str(),
+                            "ALGORITHM" | "LOCK"
+                        ) || (mariadb
+                            && matches!(word.to_ascii_uppercase().as_str(), "WAIT" | "NOWAIT"))
+                    }
+                    _ => false,
                 })
             })
             .then_some(ExpectedObjectSuggestionKind::NoSuggestions)
@@ -45841,6 +47366,7 @@ impl SqlEditorWidget {
     fn expected_mysql_role_account_object_suggestion_kind(
         tokens: &[SqlToken],
         end: usize,
+        db_type: Option<crate::db::DatabaseType>,
     ) -> Option<ExpectedObjectSuggestionKind> {
         let items = Self::meaningful_tokens_before(tokens, end)
             .into_iter()
@@ -45865,7 +47391,44 @@ impl SqlEditorWidget {
             }
             _ => false,
         };
-        role_or_account_slot.then_some(ExpectedObjectSuggestionKind::User)
+        (role_or_account_slot
+            || (matches!(db_type, Some(crate::db::DatabaseType::MariaDB))
+                && Self::mariadb_create_role_admin_account_slot(&items)))
+        .then_some(ExpectedObjectSuggestionKind::User)
+    }
+
+    fn mariadb_create_role_admin_account_slot(items: &[String]) -> bool {
+        if items.first().map(String::as_str) != Some("CREATE") {
+            return false;
+        }
+
+        let mut idx = 1;
+        if items.get(idx).map(String::as_str) == Some("OR")
+            && items.get(idx + 1).map(String::as_str) == Some("REPLACE")
+        {
+            idx += 2;
+        }
+        if items.get(idx).map(String::as_str) != Some("ROLE") {
+            return false;
+        }
+        idx += 1;
+        if items.get(idx).map(String::as_str) == Some("IF") {
+            if items.get(idx + 1).map(String::as_str) != Some("NOT")
+                || items.get(idx + 2).map(String::as_str) != Some("EXISTS")
+            {
+                return false;
+            }
+            idx += 3;
+        }
+        if idx >= items.len() {
+            return false;
+        }
+
+        idx += 1;
+        matches!(
+            items.get(idx..),
+            Some([with_kw, admin]) if with_kw == "WITH" && admin == "ADMIN"
+        )
     }
 
     fn expected_mysql_set_password_account_object_suggestion_kind(
@@ -50197,10 +51760,10 @@ impl SqlEditorWidget {
             if segments.len() >= 2 {
                 let qualifier = segments[..segments.len() - 1].join(".");
                 let member = segments.last()?;
-                if data.qualifier_has_member(&qualifier, member, true)
-                    || data.qualifier_has_member(&qualifier, member, false)
+                if let Some(canonical_key) =
+                    Self::canonical_relation_column_load_key(data, &qualifier, member, db_type)
                 {
-                    return Some(Self::column_load_key_for_db(normalized, db_type));
+                    return Some(canonical_key);
                 }
             }
         }
@@ -50211,11 +51774,14 @@ impl SqlEditorWidget {
 
         if !normalized.contains('.') {
             if let Some(default_qualifier) = data.default_qualifier() {
-                if data.qualifier_has_member(default_qualifier, normalized, true)
-                    || data.qualifier_has_member(default_qualifier, normalized, false)
+                if let Some(canonical_key) = Self::canonical_relation_column_load_key(
+                    data,
+                    default_qualifier,
+                    normalized,
+                    db_type,
+                )
                 {
-                    let qualified = format!("{}.{}", default_qualifier, normalized);
-                    return Some(Self::column_load_key_for_db(&qualified, db_type));
+                    return Some(canonical_key);
                 }
             }
         }
@@ -50229,6 +51795,33 @@ impl SqlEditorWidget {
             .skip(1)
             .find(|candidate| data.is_known_relation(candidate))
             .map(|candidate| Self::column_load_key_for_db(candidate, db_type))
+    }
+
+    fn canonical_relation_column_load_key(
+        data: &IntellisenseData,
+        qualifier: &str,
+        member: &str,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<String> {
+        use crate::ui::intellisense::QualifiedMemberKind;
+
+        let canonical_member = data
+            .qualifier_relation_member_name(qualifier, member)
+            .or_else(|| {
+                data.qualifier_member_name_matching_kinds(
+                    qualifier,
+                    member,
+                    &[QualifiedMemberKind::Table, QualifiedMemberKind::View],
+                )
+            })?;
+        let canonical_qualifier = if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            data.canonical_qualifier_name(qualifier)
+                .unwrap_or_else(|| qualifier.to_string())
+        } else {
+            qualifier.to_string()
+        };
+        let qualified = format!("{}.{}", canonical_qualifier, canonical_member);
+        Some(Self::column_load_key_for_db(&qualified, db_type))
     }
 
     fn table_lookup_key_candidates(table_name: &str) -> Vec<String> {
