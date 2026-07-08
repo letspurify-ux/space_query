@@ -81581,21 +81581,6 @@ fn mysql_family_statement_references_runtime_temp_table(
     })
 }
 
-fn mysql_family_statement_contains_word(
-    token_spans: &[crate::ui::sql_editor::SqlTokenSpan],
-    idx: usize,
-    expected: &str,
-) -> bool {
-    let start = token_spans
-        .iter()
-        .take(idx)
-        .rposition(|span| matches!(&span.token, SqlToken::Symbol(symbol) if symbol == ";"))
-        .map_or(0, |pos| pos + 1);
-    token_spans[start..=idx].iter().any(|span| {
-        token_word_text(Some(&span.token)).is_some_and(|word| word.eq_ignore_ascii_case(expected))
-    })
-}
-
 #[test]
 fn mysql_family_test_scripts_actual_object_references_are_suggested() {
     let mut failures = Vec::new();

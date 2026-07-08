@@ -7801,6 +7801,14 @@ impl SqlEditorWidget {
         else {
             return false;
         };
+        let depths = crate::ui::sql_depth::paren_depths(tokens);
+        let assignment_depth = depths.get(eq_idx).copied().unwrap_or(0);
+        if (eq_idx + 1..end.min(tokens.len())).any(|idx| {
+            depths.get(idx).copied().unwrap_or(0) == assignment_depth
+                && matches!(tokens.get(idx), Some(SqlToken::Symbol(sym)) if sym == ",")
+        }) {
+            return false;
+        }
         (anchor_idx + 1..eq_idx).any(|idx| matches!(tokens.get(idx), Some(SqlToken::Word(_))))
     }
 
