@@ -2970,13 +2970,23 @@ impl IntellisenseData {
             return suggestions.len() >= MAX_SUGGESTIONS;
         }
         let start = entries.partition_point(|entry| entry.upper.as_str() < prefix_upper);
+        let allow_plain_fallback_for_quoted_prefix = identifier_quote_delimiter(raw_prefix)
+            .is_some()
+            && !raw_prefix.is_empty()
+            && !entries
+                .iter()
+                .skip(start)
+                .take_while(|entry| entry.upper.starts_with(prefix_upper))
+                .any(|entry| suggestion_matches_completion_prefix(&entry.name, raw_prefix));
         for entry in entries.iter().skip(start) {
             if !entry.upper.starts_with(prefix_upper) {
                 break;
             }
-            if !raw_prefix.is_empty()
-                && !suggestion_matches_completion_prefix(&entry.name, raw_prefix)
-            {
+            let matches_prefix = raw_prefix.is_empty()
+                || suggestion_matches_completion_prefix(&entry.name, raw_prefix)
+                || (allow_plain_fallback_for_quoted_prefix
+                    && identifier_quote_delimiter(&entry.name).is_none());
+            if !matches_prefix {
                 continue;
             }
             if seen.insert(entry.upper.clone()) {
@@ -3838,9 +3848,7 @@ fn identifier_matches_completion_prefix(candidate: &str, prefix: &str) -> bool {
     };
 
     if identifier_quote_delimiter(candidate) != Some(prefix_delimiter) {
-        let unquoted_prefix = strip_incomplete_identifier_quote(prefix);
-        let candidate_lookup = strip_matching_identifier_quotes(candidate);
-        return starts_with_ignore_ascii_case(candidate_lookup.as_ref(), unquoted_prefix);
+        return false;
     }
 
     starts_with_ignore_ascii_case(

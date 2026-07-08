@@ -192,7 +192,7 @@ impl SqlEditorWidget {
                     return Self::mysql_expand_window_to_routine_header(
                         text,
                         cursor_pos,
-                        exact,
+                        Self::trim_expanded_statement_leading_block_comment_fragment(text, cursor_pos, exact),
                         preferred_db_type,
                     );
                 }
@@ -283,7 +283,46 @@ impl SqlEditorWidget {
                 )
             })
             .unwrap_or((0, text_len));
-        Self::statement_window_from_bounds(text, cursor_pos, statement_start, statement_end)
+        let expanded = Self::statement_window_from_bounds(text, cursor_pos, statement_start, statement_end);
+        Self::trim_expanded_statement_leading_block_comment_fragment(text, cursor_pos, expanded)
+    }
+
+    fn trim_expanded_statement_leading_block_comment_fragment(
+        full_text: &str,
+        cursor_pos: usize,
+        expanded: ExpandedStatementWindow,
+    ) -> ExpandedStatementWindow {
+        if !Self::expanded_statement_starts_inside_block_comment(&expanded) {
+            return expanded;
+        }
+        let prefix = expanded
+            .text
+            .get(..expanded.cursor_in_statement.min(expanded.text.len()))
+            .unwrap_or("");
+        let Some(close_idx) = prefix.find("*/") else {
+            return expanded;
+        };
+        let mut new_start = expanded
+            .statement_start
+            .saturating_add(close_idx)
+            .saturating_add(2)
+            .min(expanded.statement_end);
+        while new_start < expanded.statement_end {
+            let Some(rest) = full_text.get(new_start..expanded.statement_end) else {
+                break;
+            };
+            let Some(ch) = rest.chars().next() else {
+                break;
+            };
+            if !ch.is_whitespace() {
+                break;
+            }
+            new_start = new_start.saturating_add(ch.len_utf8());
+        }
+        if new_start >= cursor_pos || new_start >= expanded.statement_end {
+            return expanded;
+        }
+        Self::statement_window_from_bounds(full_text, cursor_pos, new_start, expanded.statement_end)
     }
 
     fn mysql_expand_window_to_routine_header(
@@ -296,15 +335,7 @@ impl SqlEditorWidget {
             return expanded;
         }
         let prefix = full_text.get(..cursor_pos.min(full_text.len())).unwrap_or("");
-        let prefix_lower = prefix.to_ascii_lowercase();
-        let routine_start_candidates = [
-            Self::mysql_last_create_routine_header_start(prefix),
-            prefix_lower.rfind("create procedure"),
-            prefix_lower.rfind("create function"),
-            prefix_lower.rfind("create trigger"),
-            prefix_lower.rfind("create event"),
-            prefix_lower.rfind("create definer"),
-        ]
+        let routine_start_candidates = [Self::mysql_last_create_routine_header_start(prefix)]
         .into_iter()
         .flatten()
             .filter(|idx| {

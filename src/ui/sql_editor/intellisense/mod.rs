@@ -167,6 +167,7 @@ include!("context.rs");
 include!("popup.rs");
 
 #[cfg(test)]
+#[allow(dead_code)]
 mod intellisense_regression_tests {
     use super::*;
     use crate::db::create_shared_connection;
