@@ -3838,7 +3838,9 @@ fn identifier_matches_completion_prefix(candidate: &str, prefix: &str) -> bool {
     };
 
     if identifier_quote_delimiter(candidate) != Some(prefix_delimiter) {
-        return false;
+        let unquoted_prefix = strip_incomplete_identifier_quote(prefix);
+        let candidate_lookup = strip_matching_identifier_quotes(candidate);
+        return starts_with_ignore_ascii_case(candidate_lookup.as_ref(), unquoted_prefix);
     }
 
     starts_with_ignore_ascii_case(
@@ -3985,6 +3987,7 @@ fn incomplete_quoted_identifier_start_before_cursor(
         if matches!(ch, '"' | '`' | '[')
             && quoted_identifier_start_context(text, prev_idx)
             && !inside_single_quoted_literal(text, prev_idx)
+            && !inside_sql_comment(text, prev_idx)
             && !has_unescaped_identifier_delimiter(
                 text,
                 prev_idx + ch.len_utf8(),
@@ -4003,10 +4006,20 @@ fn incomplete_quoted_identifier_start_before_cursor(
 fn inside_single_quoted_literal(text: &str, pos: usize) -> bool {
     let mut idx = 0usize;
     let mut in_string = false;
-    while idx < pos.min(text.len()) {
+    let limit = pos.min(text.len());
+    while idx < limit {
         let Some(ch) = text[idx..].chars().next() else {
             break;
         };
+        if !in_string {
+            if let Some(end) = oracle_q_quote_end(text, idx) {
+                if limit < end {
+                    return true;
+                }
+                idx = end;
+                continue;
+            }
+        }
         if ch == '\'' {
             let next_idx = idx + ch.len_utf8();
             if in_string && text[next_idx..].starts_with('\'') {
@@ -4018,6 +4031,98 @@ fn inside_single_quoted_literal(text: &str, pos: usize) -> bool {
         idx += ch.len_utf8();
     }
     in_string
+}
+
+fn oracle_q_quote_end(text: &str, start_idx: usize) -> Option<usize> {
+    let mut iter = text.get(start_idx..)?.char_indices();
+    let (_, q) = iter.next()?;
+    if !matches!(q, 'q' | 'Q') {
+        return None;
+    }
+    let (_, quote) = iter.next()?;
+    if quote != '\'' {
+        return None;
+    }
+    let (open_rel, open) = iter.next()?;
+    let close = match open {
+        '[' => ']',
+        '(' => ')',
+        '{' => '}',
+        '<' => '>',
+        other => other,
+    };
+    let body_start = start_idx + open_rel + open.len_utf8();
+    for (rel, ch) in text.get(body_start..)?.char_indices() {
+        if ch != close {
+            continue;
+        }
+        let close_idx = body_start + rel;
+        let after_close = close_idx + ch.len_utf8();
+        if text.get(after_close..)?.starts_with('\'') {
+            return Some(after_close + 1);
+        }
+    }
+    Some(text.len())
+}
+
+fn inside_sql_comment(text: &str, pos: usize) -> bool {
+    let mut iter = text.char_indices().peekable();
+    let mut in_single = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+
+    while let Some((idx, ch)) = iter.next() {
+        if idx >= pos {
+            break;
+        }
+
+        if in_line_comment {
+            if ch == '\n' || ch == '\r' {
+                in_line_comment = false;
+            }
+            continue;
+        }
+        if in_block_comment {
+            if ch == '*' && iter.peek().is_some_and(|(_, next)| *next == '/') {
+                iter.next();
+                in_block_comment = false;
+            }
+            continue;
+        }
+        if in_single {
+            if ch == '\'' {
+                if iter.peek().is_some_and(|(_, next)| *next == '\'') {
+                    iter.next();
+                } else {
+                    in_single = false;
+                }
+            }
+            continue;
+        }
+
+        if !in_single {
+            if let Some(end) = oracle_q_quote_end(text, idx) {
+                while iter.peek().is_some_and(|(next_idx, _)| *next_idx < end) {
+                    iter.next();
+                }
+                continue;
+            }
+        }
+
+        if ch == '\'' {
+            in_single = true;
+        } else if ch == '-' && iter.peek().is_some_and(|(_, next)| *next == '-') {
+            iter.next();
+            in_line_comment = true;
+        } else if ch == '#' {
+            in_line_comment = true;
+        } else if ch == '/' && iter.peek().is_some_and(|(_, next)| *next == '*') {
+            iter.next();
+            in_block_comment = true;
+        }
+    }
+
+    in_line_comment || in_block_comment
 }
 
 fn quoted_identifier_start_context(text: &str, quote_idx: usize) -> bool {
@@ -5186,6 +5291,48 @@ mod intellisense_tests {
 
         assert_eq!(word, "ci");
         assert_eq!(sql.get(start..cursor), Some("ci"));
+    }
+
+    #[test]
+    fn get_word_at_cursor_ignores_bracket_inside_single_quoted_literal() {
+        let sql = "SELECT CONCAT(' [expected=', p_)";
+        let cursor = sql.find("p_").expect("expected cursor anchor") + 2;
+        let (word, start, _) = get_word_at_cursor(sql, cursor);
+
+        assert_eq!(word, "p_");
+        assert_eq!(sql.get(start..cursor), Some("p_"));
+    }
+
+    #[test]
+    fn get_word_at_cursor_ignores_quote_inside_oracle_q_literal() {
+        let sql = r#"INSERT INTO t VALUES (q'[RETURNING test ; / '' " ]');
+BEGIN
+  pkg.proc(p_)"#;
+        let cursor = sql.find("p_").expect("expected cursor anchor") + 2;
+        let (word, start, _) = get_word_at_cursor(sql, cursor);
+
+        assert_eq!(word, "p_");
+        assert_eq!(sql.get(start..cursor), Some("p_"));
+    }
+
+    #[test]
+    fn get_word_at_cursor_ignores_quote_inside_line_comment() {
+        let sql = "-- \"not an identifier\nSELECT v_na";
+        let cursor = sql.len();
+        let (word, start, _) = get_word_at_cursor(sql, cursor);
+
+        assert_eq!(word, "v_na");
+        assert_eq!(sql.get(start..cursor), Some("v_na"));
+    }
+
+    #[test]
+    fn get_word_at_cursor_ignores_quote_inside_block_comment() {
+        let sql = "/* \"not an identifier */\nSELECT v_na";
+        let cursor = sql.len();
+        let (word, start, _) = get_word_at_cursor(sql, cursor);
+
+        assert_eq!(word, "v_na");
+        assert_eq!(sql.get(start..cursor), Some("v_na"));
     }
 
     #[test]

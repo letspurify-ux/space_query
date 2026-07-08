@@ -75,6 +75,7 @@ struct IntellisenseTriggerSnapshot {
     qualifier: Option<String>,
     raw_qualifier: Option<String>,
     signature_scan_text: String,
+    text_after_cursor: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

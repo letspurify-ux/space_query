@@ -1,6 +1,9 @@
 use crate::db::{QueryExecutor, SessionState, ToolCommand};
 
 const INTELLISENSE_TEXT_BIND_SCAN_WINDOW: usize = 256 * 1024;
+const PLSQL_COLLECTION_METHODS: &[&str] = &[
+    "COUNT", "DELETE", "EXISTS", "EXTEND", "FIRST", "LAST", "LIMIT", "NEXT", "PRIOR", "TRIM",
+];
 
 #[derive(Clone)]
 struct ExpandedStatementWindow {
@@ -15,6 +18,8 @@ enum LocalBlockKind {
     Routine,
     Declare,
     Loop,
+    While,
+    Repeat,
     Begin,
     If,
     Case,
@@ -50,6 +55,12 @@ struct ParsedRoutineHeader {
 #[derive(Clone)]
 struct ParsedPackageBodyHeader {
     body_keyword_idx: usize,
+    decl_start_idx: usize,
+}
+
+#[derive(Clone)]
+struct ParsedCompoundTriggerHeader {
+    trigger_keyword_idx: usize,
     decl_start_idx: usize,
 }
 
@@ -124,10 +135,36 @@ impl SqlEditorWidget {
                 text,
                 cursor_pos.saturating_add(radius).min(text_len),
             );
+            if start > 0
+                && !Self::text_prefix_ends_in_idle_lex_state(text, start, preferred_db_type)
+            {
+                let exact = Self::exact_statement_window_in_text_for_db_type(
+                    text,
+                    cursor_pos,
+                    preferred_db_type,
+                );
+                return Self::mysql_expand_window_to_routine_header(
+                    text,
+                    cursor_pos,
+                    exact,
+                    preferred_db_type,
+                );
+            }
             let window = text.get(start..end).unwrap_or("");
             let rel_cursor = cursor_pos.saturating_sub(start).min(window.len());
+            let initial_mysql_delimiter = super::query_text::active_mysql_delimiter_before_offset(
+                text,
+                start,
+                preferred_db_type,
+                None,
+            );
             let (stmt_start, stmt_end) =
-                Self::statement_bounds_in_text_for_db_type(window, rel_cursor, preferred_db_type);
+                super::query_text::statement_bounds_in_text_for_db_type_with_mysql_delimiter(
+                    window,
+                    rel_cursor,
+                    preferred_db_type,
+                    initial_mysql_delimiter.as_deref(),
+                );
             let touches_left = stmt_start == 0 && start > 0;
             let touches_right = stmt_end == window.len() && end < text_len;
 
@@ -146,10 +183,35 @@ impl SqlEditorWidget {
                     start.saturating_add(stmt_start),
                     start.saturating_add(stmt_end),
                 );
-                if Self::expanded_statement_requires_exact_bounds(text, &expanded) {
-                    return Self::exact_statement_window_in_text_for_db_type(
+                if Self::expanded_statement_starts_inside_block_comment(&expanded) {
+                    let exact = Self::exact_statement_window_in_text_for_db_type(
                         text,
                         cursor_pos,
+                        preferred_db_type,
+                    );
+                    return Self::mysql_expand_window_to_routine_header(
+                        text,
+                        cursor_pos,
+                        exact,
+                        preferred_db_type,
+                    );
+                }
+                let expanded = Self::mysql_expand_window_to_routine_header(
+                    text,
+                    cursor_pos,
+                    expanded,
+                    preferred_db_type,
+                );
+                if Self::expanded_statement_requires_exact_bounds(text, &expanded) {
+                    let exact = Self::exact_statement_window_in_text_for_db_type(
+                        text,
+                        cursor_pos,
+                        preferred_db_type,
+                    );
+                    return Self::mysql_expand_window_to_routine_header(
+                        text,
+                        cursor_pos,
+                        exact,
                         preferred_db_type,
                     );
                 }
@@ -168,6 +230,36 @@ impl SqlEditorWidget {
         }
     }
 
+    fn expanded_statement_starts_inside_block_comment(expanded: &ExpandedStatementWindow) -> bool {
+        let prefix = expanded
+            .text
+            .get(..expanded.cursor_in_statement.min(expanded.text.len()))
+            .unwrap_or("");
+        let first_open = prefix.find("/*");
+        let first_close = prefix.find("*/");
+        matches!((first_open, first_close), (None, Some(_)))
+            || matches!((first_open, first_close), (Some(open), Some(close)) if close < open)
+    }
+
+    fn text_prefix_ends_in_idle_lex_state(
+        text: &str,
+        offset: usize,
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
+    ) -> bool {
+        let Some(prefix) = text.get(..offset.min(text.len())) else {
+            return true;
+        };
+        let mut engine = crate::sql_parser_engine::SqlParserEngine::new();
+        engine.set_mysql_mode(crate::sql_text::mysql_compatibility_for_sql(
+            text,
+            preferred_db_type,
+        ));
+        for line in prefix.split_inclusive('\n') {
+            engine.process_line(line.strip_suffix('\n').unwrap_or(line));
+        }
+        engine.is_idle()
+    }
+
     fn exact_statement_window_in_text_for_db_type(
         text: &str,
         cursor_pos: usize,
@@ -176,13 +268,288 @@ impl SqlEditorWidget {
         let text_len = text.len();
         let cursor_pos = Self::clamp_to_char_boundary_local(text, cursor_pos.min(text_len));
         let (statement_start, statement_end) =
-            QueryExecutor::statement_bounds_at_cursor_for_db_type(
+            QueryExecutor::statement_spans_for_db_type_with_mysql_delimiter(
                 text,
-                cursor_pos,
                 preferred_db_type,
+                None,
             )
+            .into_iter()
+            .find(|(start, end)| cursor_pos >= *start && cursor_pos < *end)
+            .or_else(|| {
+                QueryExecutor::statement_bounds_at_cursor_for_db_type(
+                    text,
+                    cursor_pos,
+                    preferred_db_type,
+                )
+            })
             .unwrap_or((0, text_len));
         Self::statement_window_from_bounds(text, cursor_pos, statement_start, statement_end)
+    }
+
+    fn mysql_expand_window_to_routine_header(
+        full_text: &str,
+        cursor_pos: usize,
+        expanded: ExpandedStatementWindow,
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
+    ) -> ExpandedStatementWindow {
+        if !crate::sql_text::mysql_compatibility_for_sql("", preferred_db_type) {
+            return expanded;
+        }
+        let prefix = full_text.get(..cursor_pos.min(full_text.len())).unwrap_or("");
+        let prefix_lower = prefix.to_ascii_lowercase();
+        let routine_start_candidates = [
+            Self::mysql_last_create_routine_header_start(prefix),
+            prefix_lower.rfind("create procedure"),
+            prefix_lower.rfind("create function"),
+            prefix_lower.rfind("create trigger"),
+            prefix_lower.rfind("create event"),
+            prefix_lower.rfind("create definer"),
+        ]
+        .into_iter()
+        .flatten()
+            .filter(|idx| {
+                Self::text_prefix_ends_in_idle_lex_state(full_text, *idx, preferred_db_type)
+                    || Self::mysql_text_before_routine_start_ends_with_explicit_end_delimiter(
+                        full_text, *idx,
+                    )
+            })
+            .max();
+        let Some(routine_start) = routine_start_candidates else {
+            return expanded;
+        };
+        let mut routine_end = Self::mysql_trim_explicit_end_delimiter_from_statement_end(
+            full_text,
+            routine_start,
+            expanded.statement_end,
+        );
+        if routine_end == expanded.statement_end {
+            if let Some(delimited_end) =
+                Self::mysql_routine_body_end_before_cursor_by_active_delimiter(
+                    full_text,
+                    routine_start,
+                    cursor_pos,
+                    preferred_db_type,
+                )
+            {
+                routine_end = delimited_end;
+            }
+        }
+        if cursor_pos > routine_end {
+            return expanded;
+        }
+        if expanded.statement_start == 0
+            && routine_start > 0
+            && Self::mysql_text_before_routine_start_ends_with_explicit_end_delimiter(
+                full_text,
+                routine_start,
+            )
+        {
+            return Self::statement_window_from_bounds(
+                full_text,
+                cursor_pos,
+                routine_start,
+                routine_end,
+            );
+        }
+        if routine_start >= expanded.statement_start {
+            if routine_start > expanded.statement_start
+                && Self::mysql_statement_prefix_is_orphan_routine_terminator(
+                    full_text,
+                    expanded.statement_start,
+                    routine_start,
+                )
+            {
+                return Self::statement_window_from_bounds(
+                    full_text,
+                    cursor_pos,
+                    routine_start,
+                    routine_end,
+                );
+            }
+            if routine_end < expanded.statement_end {
+                return Self::statement_window_from_bounds(
+                    full_text,
+                    cursor_pos,
+                    expanded.statement_start,
+                    routine_end,
+                );
+            }
+            return expanded;
+        }
+
+        Self::statement_window_from_bounds(
+            full_text,
+            cursor_pos,
+            routine_start,
+            routine_end,
+        )
+    }
+
+    fn mysql_trim_explicit_end_delimiter_from_statement_end(
+        full_text: &str,
+        routine_start: usize,
+        statement_end: usize,
+    ) -> usize {
+        let Some(statement) = full_text.get(routine_start.min(full_text.len())..statement_end.min(full_text.len())) else {
+            return statement_end;
+        };
+        Self::mysql_explicit_end_delimiter_body_len(statement)
+            .map(|body_len| routine_start.saturating_add(body_len))
+            .unwrap_or(statement_end)
+    }
+
+    fn mysql_routine_body_end_before_cursor_by_active_delimiter(
+        full_text: &str,
+        routine_start: usize,
+        cursor_pos: usize,
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
+    ) -> Option<usize> {
+        let delimiter = super::query_text::active_mysql_delimiter_before_offset(
+            full_text,
+            routine_start,
+            preferred_db_type,
+            None,
+        )?;
+        if delimiter == ";" || delimiter.is_empty() {
+            return None;
+        }
+
+        let segment = full_text.get(routine_start.min(full_text.len())..cursor_pos.min(full_text.len()))?;
+        let mut search_start = 0usize;
+        while let Some(rel_idx) = segment.get(search_start..)?.find(&delimiter) {
+            let delimiter_idx = search_start + rel_idx;
+            let before = segment.get(..delimiter_idx)?.trim_end();
+            if let Some(body_len) = Self::mysql_explicit_end_delimiter_body_len_without_suffix(before)
+            {
+                return Some(routine_start.saturating_add(body_len));
+            }
+            search_start = delimiter_idx.saturating_add(delimiter.len());
+        }
+
+        None
+    }
+
+    fn mysql_last_create_routine_header_start(prefix: &str) -> Option<usize> {
+        let token_spans = super::query_text::tokenize_sql_spanned_with_mysql_compat(prefix, true);
+        let mut last_start = None;
+        for (idx, span) in token_spans.iter().enumerate() {
+            let SqlToken::Word(word) = &span.token else {
+                continue;
+            };
+            if !word.eq_ignore_ascii_case("CREATE") {
+                continue;
+            }
+
+            let mut seen_words = 0usize;
+            for next in token_spans.iter().skip(idx + 1) {
+                match &next.token {
+                    SqlToken::Symbol(symbol) if symbol == ";" => break,
+                    SqlToken::Word(next_word) => {
+                        seen_words += 1;
+                        if matches!(
+                            next_word.to_ascii_uppercase().as_str(),
+                            "PROCEDURE" | "FUNCTION" | "TRIGGER" | "EVENT"
+                        ) {
+                            last_start = Some(span.start);
+                            break;
+                        }
+                        if seen_words >= 12 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        last_start
+    }
+
+    fn mysql_text_before_routine_start_ends_with_explicit_end_delimiter(
+        full_text: &str,
+        routine_start: usize,
+    ) -> bool {
+        let before = full_text
+            .get(..routine_start.min(full_text.len()))
+            .unwrap_or("")
+            .trim_end();
+        Self::mysql_explicit_end_delimiter_body_len(before).is_some()
+    }
+
+    fn mysql_explicit_end_delimiter_body_len(text: &str) -> Option<usize> {
+        let trimmed = text.trim_end();
+        let spans = super::query_text::tokenize_sql_spanned_with_mysql_compat(trimmed, true);
+        let last_word = spans
+            .iter()
+            .rev()
+            .find(|span| matches!(span.token, SqlToken::Word(_)))?;
+        let SqlToken::Word(word) = &last_word.token else {
+            return None;
+        };
+        if !word.eq_ignore_ascii_case("END") {
+            return None;
+        }
+        let delimiter = trimmed.get(last_word.end..)?.trim_start();
+        if Self::mysql_suffix_looks_like_explicit_delimiter(delimiter) {
+            Some(last_word.end)
+        } else {
+            None
+        }
+    }
+
+    fn mysql_explicit_end_delimiter_body_len_without_suffix(text: &str) -> Option<usize> {
+        let trimmed = text.trim_end();
+        let spans = super::query_text::tokenize_sql_spanned_with_mysql_compat(trimmed, true);
+        let last_word = spans
+            .iter()
+            .rev()
+            .find(|span| matches!(span.token, SqlToken::Word(_)))?;
+        let SqlToken::Word(word) = &last_word.token else {
+            return None;
+        };
+        word.eq_ignore_ascii_case("END").then_some(last_word.end)
+    }
+
+    fn mysql_suffix_looks_like_explicit_delimiter(suffix: &str) -> bool {
+        !suffix.is_empty()
+            && suffix != ";"
+            && suffix.chars().all(|ch| {
+                !ch.is_whitespace()
+                    && !crate::sql_text::is_identifier_char(ch)
+                    && !matches!(ch, '\'' | '"' | '`' | '(' | ')' | ',')
+            })
+    }
+
+    fn mysql_statement_prefix_is_orphan_routine_terminator(
+        full_text: &str,
+        start: usize,
+        end: usize,
+    ) -> bool {
+        let Some(prefix) = full_text.get(start.min(full_text.len())..end.min(full_text.len())) else {
+            return false;
+        };
+        if Self::mysql_explicit_end_delimiter_body_len(prefix).is_some() {
+            return true;
+        }
+        let mut words = Vec::new();
+        for span in super::query_text::tokenize_sql_spanned_with_mysql_compat(prefix, true) {
+            match span.token {
+                SqlToken::Comment(_) => {}
+                SqlToken::Word(word) => words.push(word.to_ascii_uppercase()),
+                SqlToken::Symbol(symbol) if matches!(symbol.as_str(), "$" | "/" | ";") => {}
+                _ => {
+                    if !prefix
+                        .get(span.start..span.end)
+                        .unwrap_or("")
+                        .chars()
+                        .all(|ch| ch.is_whitespace() || matches!(ch, '$' | '/' | ';'))
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        matches!(words.as_slice(), [end_word] if end_word == "END")
+            || matches!(words.as_slice(), [end_word, _] if end_word == "END")
     }
 
     fn statement_window_from_bounds(
@@ -333,9 +700,10 @@ impl SqlEditorWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let expanded =
             Self::expanded_statement_window_in_text_for_db_type(&guard.text, cursor_pos, preferred_db_type);
-        let text_bind_names = Self::collect_text_var_bind_names_before_statement(
+        let text_bind_names = Self::collect_text_bind_names_before_statement(
             &guard.text,
             expanded.statement_start,
+            preferred_db_type,
         );
         let package_spec_symbols = Self::package_spec_symbols_for_body(
             &guard.text,
@@ -391,9 +759,10 @@ impl SqlEditorWidget {
         expanded_statement: &ExpandedStatementWindow,
         text_bind_names: Vec<String>,
         package_spec_symbols: &[ParsedDeclarationSymbol],
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
     ) -> RoutineSymbolCacheEntry {
         let mysql_compatible =
-            sql_text::mysql_compatibility_for_sql(&expanded_statement.text, None);
+            sql_text::mysql_compatibility_for_sql(&expanded_statement.text, preferred_db_type);
         let token_spans: Vec<SqlTokenSpan> = super::query_text::tokenize_sql_spanned_with_mysql_compat(
             &expanded_statement.text,
             mysql_compatible,
@@ -633,8 +1002,30 @@ impl SqlEditorWidget {
                 }
             }
         }
+        if scope.member_source_is_collection_like {
+            Self::append_plsql_collection_method_suggestions(
+                &mut suggestions,
+                &mut seen,
+                &prefix_upper,
+            );
+        }
 
         Some(suggestions)
+    }
+
+    fn append_plsql_collection_method_suggestions(
+        suggestions: &mut Vec<String>,
+        seen: &mut HashSet<String>,
+        prefix_upper: &str,
+    ) {
+        for method in PLSQL_COLLECTION_METHODS {
+            if !Self::local_symbol_matches_prefix(method, method, prefix_upper) {
+                continue;
+            }
+            if seen.insert((*method).to_string()) {
+                suggestions.push((*method).to_string());
+            }
+        }
     }
 
     fn filter_local_symbol_suggestions_by_expected_operand_type(
@@ -1430,6 +1821,7 @@ impl SqlEditorWidget {
         let mut root_decl_start_idx = None;
         let mut root_decl_end_idx = None;
         let mut root_awaiting_body_begin = false;
+        let mut root_awaiting_compound_trigger_section = false;
         let mut pending_loop_var = None::<ParsedForLoopRecord>;
         let mut skip_token_idx = None::<usize>;
         let mut idx = 0usize;
@@ -1460,19 +1852,7 @@ impl SqlEditorWidget {
                         ..
                     }) = token_spans.get(idx + 1)
                     {
-                        let previous = token_spans
-                            .get(..idx)
-                            .unwrap_or(&[])
-                            .iter()
-                            .rev()
-                            .find(|span| !matches!(span.token, SqlToken::Comment(_)))
-                            .map(|span| &span.token);
-                        let follows_account_name = matches!(
-                            previous,
-                            Some(SqlToken::Word(word)) if !word.eq_ignore_ascii_case("SET")
-                        ) || matches!(previous, Some(SqlToken::String(_)))
-                            || matches!(previous, Some(SqlToken::Symbol(prev)) if prev == "@");
-                        if !follows_account_name {
+                        if !Self::mysql_at_symbol_follows_account_name(token_spans, idx) {
                             let scope_id = Self::current_local_parent_scope_id(&block_stack);
                             Self::push_local_symbol_with_metadata_and_sources(
                                 &mut symbols,
@@ -1505,6 +1885,19 @@ impl SqlEditorWidget {
                             root_decl_start_idx = Some(parsed.decl_start_idx);
                             root_awaiting_body_begin = true;
                             idx = parsed.body_keyword_idx.saturating_add(1);
+                            continue;
+                        }
+                    }
+
+                    if upper == "COMPOUND"
+                        && root_decl_start_idx.is_none()
+                        && block_stack.is_empty()
+                    {
+                        if let Some(parsed) = Self::parse_compound_trigger_header(token_spans, idx)
+                        {
+                            root_decl_start_idx = Some(parsed.decl_start_idx);
+                            root_awaiting_compound_trigger_section = true;
+                            idx = parsed.trigger_keyword_idx.saturating_add(1);
                             continue;
                         }
                     }
@@ -1595,12 +1988,21 @@ impl SqlEditorWidget {
                     }
 
                     match upper.as_str() {
+                        "BEFORE" | "AFTER" | "INSTEAD" => {
+                            if root_awaiting_compound_trigger_section && block_stack.is_empty() {
+                                root_decl_end_idx = Some(idx);
+                                root_awaiting_compound_trigger_section = false;
+                            }
+                        }
                         "DECLARE" => {
                             if Self::current_scope_uses_mysql_declare_statements(&scopes, &block_stack)
                             {
                                 let scope_id = Self::current_local_parent_scope_id(&block_stack);
-                                let item_end =
-                                    Self::find_statement_item_end(token_spans, idx, token_spans.len());
+                                let item_end = Self::find_mysql_declare_statement_item_end(
+                                    token_spans,
+                                    idx,
+                                    token_spans.len(),
+                                );
                                 let item = &token_spans[idx..item_end];
                                 let declared_at = Self::declaration_item_declared_at(item);
                                 for declaration in
@@ -1709,6 +2111,28 @@ impl SqlEditorWidget {
                                 scope_id,
                                 awaiting_body_begin: false,
                             });
+                        }
+                        "WHILE" => {
+                            if !prev_is_end {
+                                block_stack.push(LocalBlockFrame {
+                                    kind: LocalBlockKind::While,
+                                    scope_id: None,
+                                    awaiting_body_begin: false,
+                                });
+                            }
+                        }
+                        "REPEAT" => {
+                            if !Self::next_meaningful_token_idx(token_spans, idx + 1)
+                                .is_some_and(|next_idx| {
+                                    Self::token_symbol_at(token_spans, next_idx, "(")
+                                })
+                            {
+                                block_stack.push(LocalBlockFrame {
+                                    kind: LocalBlockKind::Repeat,
+                                    scope_id: None,
+                                    awaiting_body_begin: false,
+                                });
+                            }
                         }
                         "IF" => {
                             if !prev_is_end {
@@ -1819,6 +2243,26 @@ impl SqlEditorWidget {
                                     );
                                     skip_token_idx = suffix_idx;
                                     pending_loop_var = None;
+                                }
+                                Some("WHILE") => {
+                                    Self::pop_local_block_kind(
+                                        &mut block_stack,
+                                        &mut scopes,
+                                        LocalBlockKind::While,
+                                        token.start,
+                                        idx.saturating_add(1),
+                                    );
+                                    skip_token_idx = suffix_idx;
+                                }
+                                Some("REPEAT") => {
+                                    Self::pop_local_block_kind(
+                                        &mut block_stack,
+                                        &mut scopes,
+                                        LocalBlockKind::Repeat,
+                                        token.start,
+                                        idx.saturating_add(1),
+                                    );
+                                    skip_token_idx = suffix_idx;
                                 }
                                 Some("CASE") => {
                                     Self::pop_local_block_kind(
@@ -2644,6 +3088,66 @@ impl SqlEditorWidget {
         item_end
     }
 
+    fn find_mysql_declare_statement_item_end(
+        token_spans: &[SqlTokenSpan],
+        item_start: usize,
+        limit: usize,
+    ) -> usize {
+        let mut item_end = item_start;
+        let mut paren_depth = 0usize;
+        let mut block_depth = 0usize;
+        let mut previous_word_upper: Option<String> = None;
+
+        while item_end < limit {
+            match &token_spans[item_end].token {
+                SqlToken::Comment(_) => {}
+                SqlToken::Symbol(sym) if sym == "(" => {
+                    paren_depth = paren_depth.saturating_add(1);
+                }
+                SqlToken::Symbol(sym) if sym == ")" => {
+                    paren_depth = paren_depth.saturating_sub(1);
+                }
+                SqlToken::Symbol(sym) if sym == ";" && paren_depth == 0 && block_depth == 0 => {
+                    item_end += 1;
+                    break;
+                }
+                SqlToken::Word(word) if paren_depth == 0 => {
+                    let upper = word.to_ascii_uppercase();
+                    let previous_was_end =
+                        previous_word_upper.as_deref().is_some_and(|prev| prev == "END");
+                    match upper.as_str() {
+                        "BEGIN" | "REPEAT" => {
+                            block_depth = block_depth.saturating_add(1);
+                        }
+                        "IF" if !previous_was_end
+                            && !Self::next_meaningful_token_idx(token_spans, item_end + 1)
+                                .is_some_and(|next_idx| {
+                                    Self::token_symbol_at(token_spans, next_idx, "(")
+                                }) =>
+                        {
+                            block_depth = block_depth.saturating_add(1);
+                        }
+                        "CASE" if !previous_was_end => {
+                            block_depth = block_depth.saturating_add(1);
+                        }
+                        "WHILE" | "LOOP" if !previous_was_end => {
+                            block_depth = block_depth.saturating_add(1);
+                        }
+                        "END" | "UNTIL" if block_depth > 0 => {
+                            block_depth = block_depth.saturating_sub(1);
+                        }
+                        _ => {}
+                    }
+                    previous_word_upper = Some(upper);
+                }
+                _ => {}
+            }
+            item_end += 1;
+        }
+
+        item_end
+    }
+
     fn parse_for_loop_record(tokens: &[SqlTokenSpan], idx: usize) -> Option<ParsedForLoopRecord> {
         let name_idx = Self::next_meaningful_token_idx(tokens, idx + 1)?;
         let name =
@@ -3177,6 +3681,28 @@ impl SqlEditorWidget {
         }
 
         None
+    }
+
+    fn parse_compound_trigger_header(
+        tokens: &[SqlTokenSpan],
+        compound_idx: usize,
+    ) -> Option<ParsedCompoundTriggerHeader> {
+        let trigger_idx = Self::next_meaningful_token_idx(tokens, compound_idx + 1)?;
+        let trigger_word = Self::token_word(&tokens[trigger_idx].token)?;
+        if !trigger_word.eq_ignore_ascii_case("TRIGGER") {
+            return None;
+        }
+
+        if !tokens.get(..compound_idx).unwrap_or(&[]).iter().any(|span| {
+            matches!(&span.token, SqlToken::Word(word) if word.eq_ignore_ascii_case("CREATE"))
+        }) {
+            return None;
+        }
+
+        Some(ParsedCompoundTriggerHeader {
+            trigger_keyword_idx: trigger_idx,
+            decl_start_idx: trigger_idx.saturating_add(1),
+        })
     }
 
     /// The package name (last identifier segment, upper-cased) of a
@@ -3749,6 +4275,36 @@ impl SqlEditorWidget {
         )
     }
 
+    fn collect_text_bind_names_before_statement(
+        full_text: &str,
+        statement_start: usize,
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
+    ) -> Vec<String> {
+        let mut names = Self::collect_text_var_bind_names_before_statement(full_text, statement_start);
+        if sql_text::mysql_compatibility_for_sql(full_text, preferred_db_type) {
+            Self::extend_text_bind_names(
+                &mut names,
+                Self::collect_text_mysql_user_var_names_before_statement(
+                    full_text,
+                    statement_start,
+                ),
+            );
+        }
+        names
+    }
+
+    fn extend_text_bind_names(names: &mut Vec<String>, extra: Vec<String>) {
+        let mut seen = names
+            .iter()
+            .map(|name| name.to_ascii_uppercase())
+            .collect::<HashSet<_>>();
+        for name in extra {
+            if seen.insert(name.to_ascii_uppercase()) {
+                names.push(name);
+            }
+        }
+    }
+
     fn collect_text_var_bind_names_before_statement(
         full_text: &str,
         statement_start: usize,
@@ -3782,6 +4338,58 @@ impl SqlEditorWidget {
             }
         }
         names
+    }
+
+    fn collect_text_mysql_user_var_names_before_statement(
+        full_text: &str,
+        statement_start: usize,
+    ) -> Vec<String> {
+        let statement_start =
+            Self::clamp_to_char_boundary_local(full_text, statement_start.min(full_text.len()));
+        let tentative_start = statement_start.saturating_sub(INTELLISENSE_TEXT_BIND_SCAN_WINDOW);
+        let scan_start = full_text
+            .get(..tentative_start)
+            .and_then(|prefix| prefix.rfind('\n').map(|idx| idx + 1))
+            .unwrap_or(0);
+        let scan_start = Self::clamp_to_char_boundary_local(full_text, scan_start);
+        let prefix = full_text.get(scan_start..statement_start).unwrap_or("");
+        let token_spans = super::query_text::tokenize_sql_spanned_with_mysql_compat(prefix, true);
+
+        let mut names = Vec::new();
+        let mut seen = HashSet::new();
+        for (idx, span) in token_spans.iter().enumerate() {
+            if !matches!(&span.token, SqlToken::Symbol(symbol) if symbol == "@") {
+                continue;
+            }
+            let Some(SqlTokenSpan {
+                token: SqlToken::Word(name),
+                ..
+            }) = token_spans.get(idx + 1)
+            else {
+                continue;
+            };
+            if Self::mysql_at_symbol_follows_account_name(&token_spans, idx) {
+                continue;
+            }
+            if seen.insert(name.to_ascii_uppercase()) {
+                names.push(name.clone());
+            }
+        }
+        names
+    }
+
+    fn mysql_at_symbol_follows_account_name(token_spans: &[SqlTokenSpan], at_idx: usize) -> bool {
+        let previous = token_spans
+            .get(..at_idx)
+            .unwrap_or(&[])
+            .iter()
+            .rev()
+            .find(|span| !matches!(span.token, SqlToken::Comment(_)))
+            .map(|span| &span.token);
+
+        matches!(previous, Some(SqlToken::Word(word)) if !word.eq_ignore_ascii_case("SET"))
+            || matches!(previous, Some(SqlToken::String(_)))
+            || matches!(previous, Some(SqlToken::Symbol(prev)) if prev == "@")
     }
 
     fn current_local_parent_scope_id(block_stack: &[LocalBlockFrame]) -> usize {
@@ -4035,7 +4643,7 @@ impl SqlEditorWidget {
     ) -> (RoutineSymbolCacheEntry, ExpandedStatementWindow) {
         let expanded = Self::expanded_statement_window_in_text(full_text, cursor_pos);
         let text_bind_names =
-            Self::collect_text_var_bind_names_before_statement(full_text, expanded.statement_start);
+            Self::collect_text_bind_names_before_statement(full_text, expanded.statement_start, None);
         let package_spec_symbols =
             Self::package_spec_symbols_for_body(full_text, &expanded.text, expanded.statement_start);
         let routine_cache = Self::build_routine_symbol_cache_entry(
@@ -4043,6 +4651,30 @@ impl SqlEditorWidget {
             &expanded,
             text_bind_names,
             &package_spec_symbols,
+            None,
+        );
+        (routine_cache, expanded)
+    }
+
+    #[cfg(test)]
+    fn build_routine_symbol_cache_bundle_for_test_for_db_type(
+        full_text: &str,
+        cursor_pos: usize,
+        db_type: Option<crate::db::connection::DatabaseType>,
+    ) -> (RoutineSymbolCacheEntry, ExpandedStatementWindow) {
+        let expanded = Self::expanded_statement_window_in_text_for_db_type(
+            full_text, cursor_pos, db_type,
+        );
+        let text_bind_names =
+            Self::collect_text_bind_names_before_statement(full_text, expanded.statement_start, db_type);
+        let package_spec_symbols =
+            Self::package_spec_symbols_for_body(full_text, &expanded.text, expanded.statement_start);
+        let routine_cache = Self::build_routine_symbol_cache_entry(
+            0,
+            &expanded,
+            text_bind_names,
+            &package_spec_symbols,
+            db_type,
         );
         (routine_cache, expanded)
     }

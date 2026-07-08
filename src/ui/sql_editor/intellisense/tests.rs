@@ -38,8 +38,13 @@ fn load_intellisense_test_file(name: &str) -> &'static str {
             path.push("test");
             path.push(name);
             let script = Box::leak(
-                std::fs::read_to_string(path)
-                    .unwrap_or_default()
+                std::fs::read_to_string(&path)
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "failed to load Oracle intellisense test script `{}`: {err}",
+                            path.display()
+                        )
+                    })
                     .into_boxed_str(),
             );
             lock_or_recover(cache).insert(name.to_string(), script);
@@ -68,8 +73,13 @@ fn load_mariadb_intellisense_test_file(name: &str) -> &'static str {
             path.push("test_mariadb");
             path.push(name);
             let script = Box::leak(
-                std::fs::read_to_string(path)
-                    .unwrap_or_default()
+                std::fs::read_to_string(&path)
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "failed to load MariaDB intellisense test script `{}`: {err}",
+                            path.display()
+                        )
+                    })
                     .into_boxed_str(),
             );
             lock_or_recover(cache).insert(name.to_string(), script);
@@ -78,15 +88,684 @@ fn load_mariadb_intellisense_test_file(name: &str) -> &'static str {
     }
 }
 
+#[derive(Default)]
+struct MysqlFamilyScriptCatalog {
+    tables: Vec<String>,
+    views: Vec<String>,
+    materialized_views: Vec<String>,
+    types: Vec<String>,
+    procedures: Vec<String>,
+    functions: Vec<String>,
+    packages: Vec<String>,
+    sequences: Vec<String>,
+    synonyms: Vec<String>,
+    triggers: Vec<String>,
+    indexes: Vec<String>,
+    columns: HashMap<String, Vec<String>>,
+    signatures: HashMap<String, crate::ui::intellisense::SignatureLabel>,
+}
+
+fn token_word_eq(token: Option<&SqlToken>, expected: &str) -> bool {
+    matches!(token, Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case(expected))
+}
+
+fn token_word_text(token: Option<&SqlToken>) -> Option<&str> {
+    match token {
+        Some(SqlToken::Word(word)) => Some(word.trim_matches('`')),
+        _ => None,
+    }
+}
+
+fn push_unique_case_insensitive(values: &mut Vec<String>, value: &str) {
+    let value = value.trim_matches(|ch| ch == '`' || ch == '"').trim();
+    if value.is_empty() || values.iter().any(|item| item.eq_ignore_ascii_case(value)) {
+        return;
+    }
+    values.push(value.to_string());
+}
+
+fn matching_paren_index(tokens: &[SqlToken], open_idx: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (idx, token) in tokens.iter().enumerate().skip(open_idx) {
+        match token {
+            SqlToken::Symbol(symbol) if symbol == "(" => depth = depth.saturating_add(1),
+            SqlToken::Symbol(symbol) if symbol == ")" => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn collect_create_table_columns(tokens: &[SqlToken], open_idx: usize) -> Vec<String> {
+    let Some(close_idx) = matching_paren_index(tokens, open_idx) else {
+        return Vec::new();
+    };
+    let mut columns = Vec::new();
+    let mut depth = 0usize;
+    let mut at_item_start = true;
+    for token in tokens.iter().take(close_idx).skip(open_idx + 1) {
+        match token {
+            SqlToken::Symbol(symbol) if symbol == "(" => depth = depth.saturating_add(1),
+            SqlToken::Symbol(symbol) if symbol == ")" => depth = depth.saturating_sub(1),
+            SqlToken::Symbol(symbol) if symbol == "," && depth == 0 => at_item_start = true,
+            SqlToken::Word(word) if depth == 0 && at_item_start => {
+                if !matches!(
+                    word.to_ascii_uppercase().as_str(),
+                    "PRIMARY"
+                        | "UNIQUE"
+                        | "KEY"
+                        | "INDEX"
+                        | "CONSTRAINT"
+                        | "FOREIGN"
+                        | "CHECK"
+                        | "FULLTEXT"
+                        | "SPATIAL"
+                ) {
+                    push_unique_case_insensitive(&mut columns, word);
+                }
+                at_item_start = false;
+            }
+            _ if depth == 0 && at_item_start => at_item_start = false,
+            _ => {}
+        }
+    }
+    columns
+}
+
+fn mysql_family_catalog_from_script(script: &str) -> MysqlFamilyScriptCatalog {
+    let tokens = super::query_text::tokenize_sql_with_mysql_compat(script, true);
+    let mut catalog = MysqlFamilyScriptCatalog::default();
+    let mut idx = 0usize;
+    while idx < tokens.len() {
+        if token_word_eq(tokens.get(idx), "CREATE") {
+            let mut kind_idx = idx + 1;
+            if token_word_eq(tokens.get(kind_idx), "OR")
+                && token_word_eq(tokens.get(kind_idx + 1), "REPLACE")
+            {
+                kind_idx += 2;
+            }
+            let Some(kind) = token_word_text(tokens.get(kind_idx)) else {
+                idx += 1;
+                continue;
+            };
+            let name_idx = kind_idx + 1;
+            match kind.to_ascii_uppercase().as_str() {
+                "TABLE" => {
+                    if let Some(name) = token_word_text(tokens.get(name_idx)) {
+                        push_unique_case_insensitive(&mut catalog.tables, name);
+                        if matches!(
+                            tokens.get(name_idx + 1),
+                            Some(SqlToken::Symbol(symbol)) if symbol == "("
+                        ) {
+                            catalog.columns.insert(
+                                name.to_ascii_uppercase(),
+                                collect_create_table_columns(&tokens, name_idx + 1),
+                            );
+                        }
+                    }
+                }
+                "VIEW" => {
+                    if let Some(name) = token_word_text(tokens.get(name_idx)) {
+                        push_unique_case_insensitive(&mut catalog.views, name);
+                        let statement_end = tokens
+                            .iter()
+                            .enumerate()
+                            .skip(name_idx + 1)
+                            .find_map(|(idx, token)| {
+                                matches!(token, SqlToken::Symbol(symbol) if symbol == ";")
+                                    .then_some(idx)
+                            })
+                            .unwrap_or(tokens.len());
+                        if let Some(as_idx) = tokens
+                            .iter()
+                            .enumerate()
+                            .take(statement_end)
+                            .skip(name_idx + 1)
+                            .find_map(|(idx, token)| token_word_eq(Some(token), "AS").then_some(idx))
+                        {
+                            let columns =
+                                intellisense_context::extract_select_list_columns(&tokens[as_idx + 1..statement_end]);
+                            if !columns.is_empty() {
+                                catalog.columns.insert(name.to_ascii_uppercase(), columns);
+                            }
+                        }
+                    }
+                }
+                "PROCEDURE" => {
+                    if let Some(name) = token_word_text(tokens.get(name_idx)) {
+                        push_unique_case_insensitive(&mut catalog.procedures, name);
+                    }
+                }
+                "FUNCTION" => {
+                    if let Some(name) = token_word_text(tokens.get(name_idx)) {
+                        push_unique_case_insensitive(&mut catalog.functions, name);
+                    }
+                }
+                "TRIGGER" => {
+                    if let Some(name) = token_word_text(tokens.get(name_idx)) {
+                        push_unique_case_insensitive(&mut catalog.triggers, name);
+                    }
+                }
+                "INDEX" => {
+                    if let Some(name) = token_word_text(tokens.get(name_idx)) {
+                        push_unique_case_insensitive(&mut catalog.indexes, name);
+                    }
+                }
+                _ => {}
+            }
+        }
+        idx += 1;
+    }
+    catalog
+}
+
+fn intellisense_data_from_mysql_family_catalog(
+    catalog: &MysqlFamilyScriptCatalog,
+) -> IntellisenseData {
+    let mut data = IntellisenseData::new();
+    data.tables = catalog.tables.clone();
+    data.views = catalog.views.clone();
+    data.materialized_views = catalog.materialized_views.clone();
+    data.types = catalog.types.clone();
+    data.procedures = catalog.procedures.clone();
+    data.functions = catalog.functions.clone();
+    data.packages = catalog.packages.clone();
+    data.sequences = catalog.sequences.clone();
+    data.synonyms = catalog.synonyms.clone();
+    data.triggers = catalog.triggers.clone();
+    data.indexes = catalog.indexes.clone();
+    for relation in catalog
+        .tables
+        .iter()
+        .chain(catalog.views.iter())
+        .chain(catalog.materialized_views.iter())
+    {
+        if let Some(columns) = catalog.columns.get(&relation.to_ascii_uppercase()) {
+            data.set_columns_for_table(relation, columns.clone());
+        }
+    }
+    for (key, label) in &catalog.signatures {
+        data.set_signature(key.clone(), Some(label.clone()));
+    }
+    data.rebuild_indices();
+    data
+}
+
+fn mysql_family_intellisense_scripts() -> [(&'static str, crate::db::DatabaseType, &'static str); 8]
+{
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    [
+        (
+            "test_mysql/test1.txt",
+            MySQL,
+            load_mariadb_intellisense_test_file("test1.txt"),
+        ),
+        (
+            "test_mysql/test2.txt",
+            MySQL,
+            load_mariadb_intellisense_test_file("test2.txt"),
+        ),
+        (
+            "test_mysql/test3.txt",
+            MySQL,
+            load_mariadb_intellisense_test_file("test3.txt"),
+        ),
+        (
+            "test_mariadb/test4.txt",
+            MariaDB,
+            load_mariadb_intellisense_test_file("test4.txt"),
+        ),
+        (
+            "test_mariadb/test5.txt",
+            MariaDB,
+            load_mariadb_intellisense_test_file("test5.txt"),
+        ),
+        (
+            "test_mariadb/test6.txt",
+            MariaDB,
+            load_mariadb_intellisense_test_file("test6.txt"),
+        ),
+        (
+            "test_mariadb/test7.txt",
+            MariaDB,
+            load_mariadb_intellisense_test_file("test7.txt"),
+        ),
+        (
+            "test_mariadb/test8.txt",
+            MariaDB,
+            load_mariadb_intellisense_test_file("test8.txt"),
+        ),
+    ]
+}
+
+fn oracle_test_all_intellisense_scripts() -> [(&'static str, &'static str); 15] {
+    [
+        ("test/test1.txt", load_intellisense_test_file("test1.txt")),
+        ("test/test2.txt", load_intellisense_test_file("test2.txt")),
+        ("test/test3.txt", load_intellisense_test_file("test3.txt")),
+        ("test/test4.txt", load_intellisense_test_file("test4.txt")),
+        ("test/test5.txt", load_intellisense_test_file("test5.txt")),
+        ("test/test6.txt", load_intellisense_test_file("test6.txt")),
+        ("test/test7.txt", load_intellisense_test_file("test7.txt")),
+        ("test/test8.txt", load_intellisense_test_file("test8.txt")),
+        ("test/test9.txt", load_intellisense_test_file("test9.txt")),
+        ("test/test10.txt", load_intellisense_test_file("test10.txt")),
+        ("test/test11.txt", load_intellisense_test_file("test11.txt")),
+        ("test/test18.sql", load_intellisense_test_file("test18.sql")),
+        ("test/test22.sql", load_intellisense_test_file("test22.sql")),
+        ("test/test23.sql", load_intellisense_test_file("test23.sql")),
+        ("test/test26.sql", load_intellisense_test_file("test26.sql")),
+    ]
+}
+
+fn sorted_mysql_family_script_files_from_disk() -> Vec<String> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    for dir_name in ["test_mysql", "test_mariadb"] {
+        let dir = root.join(dir_name);
+        for entry in std::fs::read_dir(&dir)
+            .unwrap_or_else(|err| panic!("failed to read `{}`: {err}", dir.display()))
+        {
+            let entry = entry.unwrap_or_else(|err| {
+                panic!("failed to read entry under `{}`: {err}", dir.display())
+            });
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
+                continue;
+            };
+            if !matches!(ext, "sql" | "txt") {
+                continue;
+            }
+            let file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_else(|| panic!("non-UTF8 script path `{}`", path.display()));
+            files.push(format!("{dir_name}/{file_name}"));
+        }
+    }
+    files.sort();
+    files
+}
+
+fn sorted_oracle_test_all_active_script_files_from_disk() -> Vec<String> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test/test_all.sql");
+    let script = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("failed to read `{}`: {err}", path.display()));
+    let mut files = Vec::new();
+    for line in script.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("--") || !line.starts_with('@') {
+            continue;
+        }
+        let include = line
+            .trim_start_matches('@')
+            .trim_end_matches(';')
+            .trim();
+        if !include.is_empty() {
+            files.push(include.to_string());
+        }
+    }
+    files.sort();
+    files
+}
+
+fn mysql_family_script_sql_word_count(script: &str) -> usize {
+    super::query_text::tokenize_sql_spanned_with_mysql_compat(script, true)
+        .iter()
+        .filter(|span| {
+            matches!(span.token, SqlToken::Word(_))
+                && !mysql_family_byte_is_inside_single_quoted_literal(script, span.start)
+        })
+        .count()
+}
+
+fn oracle_script_sql_word_count(script: &str) -> usize {
+    super::query_text::tokenize_sql_spanned(script)
+        .iter()
+        .filter(|span| {
+            matches!(span.token, SqlToken::Word(_))
+                && !mysql_family_byte_is_inside_single_quoted_literal(script, span.start)
+                && !oracle_byte_is_inside_non_sqlplus_text_line(script, span.start)
+        })
+        .count()
+}
+
+#[test]
+fn script_audit_targets_match_current_test_files() {
+    let mut mysql_targets = mysql_family_intellisense_scripts()
+        .iter()
+        .map(|(label, _, _)| (*label).to_string())
+        .collect::<Vec<_>>();
+    mysql_targets.sort();
+    let mysql_disk_files = sorted_mysql_family_script_files_from_disk();
+    assert_eq!(
+        mysql_targets, mysql_disk_files,
+        "MySQL/MariaDB intellisense script audits must cover every script file under test_mysql/ and test_mariadb/"
+    );
+
+    let mut oracle_targets = oracle_test_all_intellisense_scripts()
+        .iter()
+        .map(|(label, _)| (*label).to_string())
+        .collect::<Vec<_>>();
+    oracle_targets.sort();
+    let oracle_test_all_files = sorted_oracle_test_all_active_script_files_from_disk();
+    assert_eq!(
+        oracle_targets, oracle_test_all_files,
+        "Oracle intellisense script audits must match active @-includes in test/test_all.sql"
+    );
+
+    for (label, _, script) in mysql_family_intellisense_scripts() {
+        let word_count = mysql_family_script_sql_word_count(script);
+        assert!(
+            word_count > 100,
+            "{label} should contribute substantial SQL tokens to the MySQL/MariaDB audit, got {word_count}"
+        );
+    }
+
+    for (label, script) in oracle_test_all_intellisense_scripts() {
+        let word_count = oracle_script_sql_word_count(script);
+        assert!(
+            word_count > 20,
+            "{label} should contribute SQL tokens to the Oracle test_all audit, got {word_count}"
+        );
+    }
+}
+
+fn script_object_name_at(tokens: &[SqlToken], start_idx: usize) -> Option<(String, usize)> {
+    let mut idx = start_idx;
+    let mut last = token_word_text(tokens.get(idx))?;
+    loop {
+        let dot_idx = idx + 1;
+        let next_idx = idx + 2;
+        if !matches!(tokens.get(dot_idx), Some(SqlToken::Symbol(symbol)) if symbol == ".") {
+            break;
+        }
+        let Some(next) = token_word_text(tokens.get(next_idx)) else {
+            break;
+        };
+        last = next;
+        idx = next_idx;
+    }
+    Some((last.trim_matches('"').to_string(), idx + 1))
+}
+
+fn oracle_create_kind_and_name_idx(tokens: &[SqlToken], create_idx: usize) -> Option<(String, usize)> {
+    let mut idx = create_idx + 1;
+    while let Some(word) = token_word_text(tokens.get(idx)) {
+        match word.to_ascii_uppercase().as_str() {
+            "OR" | "REPLACE" | "EDITIONABLE" | "NONEDITIONABLE" | "FORCE" => idx += 1,
+            _ => break,
+        }
+    }
+
+    let kind = token_word_text(tokens.get(idx))?.to_ascii_uppercase();
+    if kind == "MATERIALIZED" && token_word_eq(tokens.get(idx + 1), "VIEW") {
+        return Some(("MATERIALIZED VIEW".to_string(), idx + 2));
+    }
+
+    let mut name_idx = idx + 1;
+    if matches!(kind.as_str(), "PACKAGE" | "TYPE") && token_word_eq(tokens.get(name_idx), "BODY") {
+        name_idx += 1;
+    }
+    Some((kind, name_idx))
+}
+
+fn script_signature_label(
+    routine_name: &str,
+    parameter_names: &[String],
+) -> crate::ui::intellisense::SignatureLabel {
+    let mut text = routine_name.to_ascii_uppercase();
+    text.push('(');
+    let mut arg_spans = Vec::new();
+    for (idx, name) in parameter_names.iter().enumerate() {
+        if idx > 0 {
+            text.push_str(", ");
+        }
+        let start = text.len();
+        text.push_str(name);
+        text.push_str(" IN UNKNOWN");
+        arg_spans.push((start, text.len()));
+    }
+    text.push(')');
+    crate::ui::intellisense::SignatureLabel { text, arg_spans }
+}
+
+fn script_parameter_name_from_item(item: &[SqlToken]) -> Option<String> {
+    let mut words = item.iter().filter_map(|token| token_word_text(Some(token)));
+    let first = words.next()?.trim_matches('"');
+    let name = if matches!(first.to_ascii_uppercase().as_str(), "IN" | "OUT" | "INOUT") {
+        words.next()?.trim_matches('"')
+    } else {
+        first
+    };
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+fn script_parameter_names_from_open_paren(tokens: &[SqlToken], open_idx: usize) -> Vec<String> {
+    let Some(close_idx) = matching_paren_index(tokens, open_idx) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    let mut item_start = open_idx + 1;
+    let mut depth = 0usize;
+    for idx in open_idx + 1..close_idx {
+        match &tokens[idx] {
+            SqlToken::Symbol(symbol) if symbol == "(" => depth = depth.saturating_add(1),
+            SqlToken::Symbol(symbol) if symbol == ")" => depth = depth.saturating_sub(1),
+            SqlToken::Symbol(symbol) if symbol == "," && depth == 0 => {
+                if let Some(name) = script_parameter_name_from_item(&tokens[item_start..idx]) {
+                    names.push(name);
+                }
+                item_start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    if let Some(name) = script_parameter_name_from_item(&tokens[item_start..close_idx]) {
+        names.push(name);
+    }
+    names
+}
+
+fn oracle_insert_signature(
+    catalog: &mut MysqlFamilyScriptCatalog,
+    key: String,
+    routine_name: &str,
+    parameter_names: &[String],
+) {
+    if parameter_names.is_empty() {
+        return;
+    }
+    catalog
+        .signatures
+        .entry(key.to_ascii_uppercase())
+        .or_insert_with(|| script_signature_label(routine_name, parameter_names));
+}
+
+fn oracle_collect_script_signatures(script: &str, catalog: &mut MysqlFamilyScriptCatalog) {
+    let tokens = super::query_text::tokenize_sql(script);
+    let mut current_package = None::<String>;
+    let mut idx = 0usize;
+
+    while idx < tokens.len() {
+        if token_word_eq(tokens.get(idx), "CREATE") {
+            if let Some((kind, name_idx)) = oracle_create_kind_and_name_idx(&tokens, idx) {
+                if kind == "PACKAGE" {
+                    if let Some((name, _)) = script_object_name_at(&tokens, name_idx) {
+                        current_package = Some(name);
+                    }
+                } else if matches!(kind.as_str(), "PROCEDURE" | "FUNCTION") {
+                    if let Some((name, after_name_idx)) = script_object_name_at(&tokens, name_idx) {
+                        if matches!(tokens.get(after_name_idx), Some(SqlToken::Symbol(symbol)) if symbol == "(")
+                        {
+                            let params = script_parameter_names_from_open_paren(&tokens, after_name_idx);
+                            oracle_insert_signature(catalog, name.to_ascii_uppercase(), &name, &params);
+                        }
+                    }
+                }
+            }
+        }
+
+        if matches!(
+            token_word_text(tokens.get(idx)).map(|word| word.to_ascii_uppercase()),
+            Some(word) if matches!(word.as_str(), "PROCEDURE" | "FUNCTION")
+        ) {
+            let Some((name, after_name_idx)) = script_object_name_at(&tokens, idx + 1) else {
+                idx += 1;
+                continue;
+            };
+            if matches!(tokens.get(after_name_idx), Some(SqlToken::Symbol(symbol)) if symbol == "(")
+            {
+                let params = script_parameter_names_from_open_paren(&tokens, after_name_idx);
+                oracle_insert_signature(catalog, name.to_ascii_uppercase(), &name, &params);
+                if let Some(package) = current_package.as_deref() {
+                    oracle_insert_signature(
+                        catalog,
+                        format!("{package}.{name}"),
+                        &name,
+                        &params,
+                    );
+                }
+            }
+        }
+
+        idx += 1;
+    }
+}
+
+fn oracle_catalog_from_test_all_scripts() -> MysqlFamilyScriptCatalog {
+    let mut catalog = MysqlFamilyScriptCatalog::default();
+
+    for (_, script) in oracle_test_all_intellisense_scripts() {
+        oracle_collect_script_signatures(script, &mut catalog);
+        let tokens = super::query_text::tokenize_sql(script);
+        let mut idx = 0usize;
+        while idx < tokens.len() {
+            if !token_word_eq(tokens.get(idx), "CREATE") {
+                idx += 1;
+                continue;
+            }
+
+            let Some((kind, name_idx)) = oracle_create_kind_and_name_idx(&tokens, idx) else {
+                idx += 1;
+                continue;
+            };
+            let Some((name, after_name_idx)) = script_object_name_at(&tokens, name_idx) else {
+                idx += 1;
+                continue;
+            };
+
+            match kind.as_str() {
+                "TABLE" => {
+                    push_unique_case_insensitive(&mut catalog.tables, &name);
+                    if matches!(tokens.get(after_name_idx), Some(SqlToken::Symbol(symbol)) if symbol == "(")
+                    {
+                        catalog.columns.insert(
+                            name.to_ascii_uppercase(),
+                            collect_create_table_columns(&tokens, after_name_idx),
+                        );
+                    }
+                }
+                "VIEW" => {
+                    push_unique_case_insensitive(&mut catalog.views, &name);
+                    let statement_end = tokens
+                        .iter()
+                        .enumerate()
+                        .skip(after_name_idx)
+                        .find_map(|(idx, token)| {
+                            matches!(token, SqlToken::Symbol(symbol) if symbol == ";")
+                                .then_some(idx)
+                        })
+                        .unwrap_or(tokens.len());
+                    if let Some(as_idx) = tokens
+                        .iter()
+                        .enumerate()
+                        .take(statement_end)
+                        .skip(after_name_idx)
+                        .find_map(|(idx, token)| token_word_eq(Some(token), "AS").then_some(idx))
+                    {
+                        let columns = intellisense_context::extract_select_list_columns(
+                            &tokens[as_idx + 1..statement_end],
+                        );
+                        if !columns.is_empty() {
+                            catalog.columns.insert(name.to_ascii_uppercase(), columns);
+                        }
+                    }
+                }
+                "MATERIALIZED VIEW" => push_unique_case_insensitive(
+                    &mut catalog.materialized_views,
+                    &name,
+                ),
+                "PROCEDURE" => push_unique_case_insensitive(&mut catalog.procedures, &name),
+                "FUNCTION" => push_unique_case_insensitive(&mut catalog.functions, &name),
+                "PACKAGE" => push_unique_case_insensitive(&mut catalog.packages, &name),
+                "SEQUENCE" => push_unique_case_insensitive(&mut catalog.sequences, &name),
+                "SYNONYM" => push_unique_case_insensitive(&mut catalog.synonyms, &name),
+                "TYPE" => push_unique_case_insensitive(&mut catalog.types, &name),
+                "TRIGGER" => push_unique_case_insensitive(&mut catalog.triggers, &name),
+                "INDEX" => push_unique_case_insensitive(&mut catalog.indexes, &name),
+                _ => {}
+            }
+
+            idx += 1;
+        }
+    }
+
+    catalog
+}
+
+fn mysql_family_script_keyword_or_function(word: &str) -> bool {
+    let upper = word.trim_matches('`').to_ascii_uppercase();
+    crate::sql_text::is_mysql_sql_keyword(&upper)
+        || crate::ui::intellisense::MYSQL_FUNCTIONS_SET.contains(upper.as_str())
+}
+
+fn mysql_family_completion_has_keyword_or_function(suggestions: &[String], expected: &str) -> bool {
+    let expected = expected.to_ascii_uppercase();
+    suggestions.iter().any(|value| {
+        let value_upper = value.to_ascii_uppercase();
+        value_upper == expected
+            || value
+                .strip_suffix("()")
+                .is_some_and(|name| name.eq_ignore_ascii_case(&expected))
+            || value_upper
+                .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                .any(|part| part == expected)
+    })
+}
+
+fn mysql_family_partial_keyword_prefix(word: &str) -> String {
+    let len = word.chars().count();
+    let take = len.saturating_sub(1).clamp(1, 4);
+    word.chars().take(take).collect()
+}
+
 fn cached_statement_spans_for_test_script(sql: &str) -> Vec<(usize, usize)> {
+    cached_statement_spans_for_test_script_for_db(sql, None)
+}
+
+fn cached_statement_spans_for_test_script_for_db(
+    sql: &str,
+    db_type: Option<crate::db::DatabaseType>,
+) -> Vec<(usize, usize)> {
     static SPANS: OnceLock<Mutex<HashMap<String, Vec<(usize, usize)>>>> = OnceLock::new();
     let cache = SPANS.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(spans) = lock_or_recover(cache).get(sql).cloned() {
+    let key = format!("{db_type:?}\n{sql}");
+    if let Some(spans) = lock_or_recover(cache).get(&key).cloned() {
         return spans;
     }
 
-    let spans = super::query_text::statement_spans_in_text_for_db_type(sql, None);
-    lock_or_recover(cache).insert(sql.to_string(), spans.clone());
+    let spans = super::query_text::statement_spans_in_text_for_db_type(sql, db_type);
+    lock_or_recover(cache).insert(key, spans.clone());
     spans
 }
 
@@ -97,6 +776,13 @@ fn simple_single_statement_bounds(sql: &str) -> Option<(usize, usize)> {
 fn analyze_full_script_marker(
     script_with_cursor: &str,
 ) -> (String, usize, intellisense_context::CursorContext) {
+    analyze_full_script_marker_for_db(script_with_cursor, None)
+}
+
+fn analyze_full_script_marker_for_db(
+    script_with_cursor: &str,
+    db_type: Option<crate::db::DatabaseType>,
+) -> (String, usize, intellisense_context::CursorContext) {
     const CURSOR_MARKER: &str = "__CODEX_CURSOR__";
 
     let cursor = script_with_cursor
@@ -104,10 +790,12 @@ fn analyze_full_script_marker(
         .expect("cursor marker should exist");
     let sql = script_with_cursor.replacen(CURSOR_MARKER, "", 1);
     let (stmt_start, stmt_end) = simple_single_statement_bounds(&sql).unwrap_or_else(|| {
-        cached_statement_spans_for_test_script(&sql)
+        cached_statement_spans_for_test_script_for_db(&sql, db_type)
             .into_iter()
             .find(|(start, end)| cursor >= *start && cursor < *end)
-            .unwrap_or_else(|| SqlEditorWidget::statement_bounds_in_text(&sql, cursor))
+            .unwrap_or_else(|| {
+                SqlEditorWidget::statement_bounds_in_text_for_db_type(&sql, cursor, db_type)
+            })
     });
     let statement = sql.get(stmt_start..stmt_end).unwrap_or("").to_string();
     let cursor_in_statement = cursor.saturating_sub(stmt_start).min(statement.len());
@@ -2526,6 +3214,13 @@ fn audit_final_suggestions_impl(
             ("EMP_USER".to_string(), Some(QualifiedMemberKind::User)),
         ],
     );
+    data.set_members_for_qualifier_with_kinds(
+        "QT_MYSQL_FINAL_BOSS",
+        vec![(
+            "SP_RUN_FINAL_BOSS".to_string(),
+            Some(QualifiedMemberKind::Procedure),
+        )],
+    );
     data.set_relation_members_for_qualifier(
         "APP",
         vec![
@@ -2809,6 +3504,19 @@ fn audit_final_suggestions_impl(
     let column_scope = (!column_tables.is_empty()).then(|| column_tables.clone());
     let expr_keyword_ctx =
         SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables, has, Some(db));
+    let early_signature_argument_suggestions = if !crate::sql_text::mysql_compatibility_for_sql(
+        "",
+        Some(db),
+    )
+    {
+        SqlEditorWidget::cached_signature_named_argument_suggestions(
+            &data,
+            signature_scan_text_before_cursor_for_test(&s, cursor),
+            &prefix,
+        )
+    } else {
+        Vec::new()
+    };
     let at_data_type_for_suppressed_name =
         SqlEditorWidget::data_type_position_for_context_for_db(&ctx, has, Some(db)).is_some();
     let ddl_new_name_allows_keyword_suggestions = !has_qualifier
@@ -2851,7 +3559,7 @@ fn audit_final_suggestions_impl(
         trigger_has_identifier,
         Some(db),
     );
-    if SqlEditorWidget::context_suppresses_completion(context)
+    let suppresses_existing_identifier_completion = SqlEditorWidget::context_suppresses_completion(context)
         || (ctx.ddl_new_name_position
             && !in_plsql_executable_block
             && !at_data_type_for_suppressed_name
@@ -2913,6 +3621,12 @@ fn audit_final_suggestions_impl(
             &ctx,
             trigger_has_identifier,
         )
+        || SqlEditorWidget::cursor_is_in_invalid_set_operation_branch_for_context(
+            &ctx,
+            trigger_has_identifier,
+        );
+    if suppresses_existing_identifier_completion
+        && early_signature_argument_suggestions.is_empty()
     {
         return (None, Vec::new(), Vec::new());
     }
@@ -3190,18 +3904,7 @@ fn audit_final_suggestions_impl(
             expr_keyword_ctx,
         )
     };
-    let signature_argument_suggestions = if !crate::sql_text::mysql_compatibility_for_sql(
-        "",
-        Some(db),
-    ) {
-        SqlEditorWidget::cached_signature_named_argument_suggestions(
-            &data,
-            s.get(..cursor).unwrap_or(&s),
-            &prefix,
-        )
-    } else {
-        Vec::new()
-    };
+    let signature_argument_suggestions = early_signature_argument_suggestions;
     let suggestions = if signature_argument_suggestions.is_empty() {
         suggestions
     } else {
@@ -3381,6 +4084,12 @@ fn audit_final_suggestions_impl(
                 suppress_select_modifier_keywords_in_prefixed_projection,
             at_data_type_position: at_data_type,
             at_tool_no_sql_argument_slot: false,
+            force_prepend_local_symbol_suggestions: false,
+            prefix_is_followed_by_call_paren:
+                SqlEditorWidget::cursor_prefix_is_followed_by_call_paren_for_context(
+                    &ctx,
+                    !prefix.is_empty(),
+                ),
         },
         |suggestion| {
             SqlEditorWidget::suggestion_is_scoped_column(
@@ -6146,6 +6855,220 @@ fn mysql_family_create_table_definition_keywords_include_numeric_types_and_nulla
             mysql_context_and_suggestions_for_inline_sql("CREATE TABLE demo (id INT NU|)", db);
         assert_ne!(null_context, SqlContext::TableName);
         assert_has_case_insensitive(&null_suggestions, "NULL");
+
+        let (_, _, type_suggestions) =
+            audit_final_suggestions_for("CREATE TABLE dept (dept_id |)", db);
+        assert_has_case_insensitive(&type_suggestions, "INT");
+        assert_has_case_insensitive(&type_suggestions, "VARCHAR");
+
+        for sql in [
+            "CREATE TABLE dept (
+    dept_id INT NOT NULL,
+    parent_dept_id INT NULL,
+    dept_code |)",
+            "CREATE TABLE dept (
+    dept_id INT NOT NULL,
+    parent_dept_id INT NULL,
+    dept_code |",
+            "CREATE TABLE dept (
+    dept_id INT NOT NULL,
+    parent_dept_id INT NULL,
+    dept_code VA|)",
+            "CREATE TABLE dept (
+    dept_id INT NOT NULL,
+    parent_dept_id INT NULL,
+    dept_code VA|",
+        ] {
+            let (_, _, suggestions) = audit_final_suggestions_for(sql, db);
+            assert_has_case_insensitive(&suggestions, "VARCHAR");
+        }
+
+        for sql in [
+            "CREATE TABLE dept (|",
+            "CREATE TABLE dept (dept_id INT NOT NULL, |",
+            "CREATE TABLE dept (dept_id INT NOT NULL, KEY idx_dept_parent (dept_id), |",
+            "CREATE TABLE dept (
+    dept_id INT NOT NULL,
+    parent_dept_id INT NULL,
+    dept_code VARCHAR(20) NOT NULL,
+    dept_name VARCHAR(100) NOT NULL,
+    sort_no INT NOT NULL,
+    |",
+        ] {
+            let (_, _, suggestions) = audit_final_suggestions_for(sql, db);
+            for expected in ["CONSTRAINT", "PRIMARY KEY", "UNIQUE", "FOREIGN KEY"] {
+                assert_has_case_insensitive(&suggestions, expected);
+            }
+        }
+
+        for (sql, expected) in [
+            (
+                "CREATE TABLE dept (
+    dept_id INT NOT NULL,
+    parent_dept_id INT NULL,
+    dept_code VARCHAR(20) NOT NULL,
+    dept_name VARCHAR(100) NOT NULL,
+    sort_no INT NOT NULL,
+    PR|",
+                "PRIMARY KEY",
+            ),
+            (
+                "CREATE TABLE dept (
+    dept_id INT NOT NULL,
+    parent_dept_id INT NULL,
+    dept_code VARCHAR(20) NOT NULL,
+    dept_name VARCHAR(100) NOT NULL,
+    sort_no INT NOT NULL,
+    UN|",
+                "UNIQUE",
+            ),
+            (
+                "CREATE TABLE dept (
+    dept_id INT NOT NULL,
+    parent_dept_id INT NULL,
+    dept_code VARCHAR(20) NOT NULL,
+    dept_name VARCHAR(100) NOT NULL,
+    sort_no INT NOT NULL,
+    PRIMARY |",
+                "KEY",
+            ),
+            (
+                "CREATE TABLE dept (
+    dept_id INT NOT NULL,
+    parent_dept_id INT NULL,
+    dept_code VARCHAR(20) NOT NULL,
+    dept_name VARCHAR(100) NOT NULL,
+    sort_no INT NOT NULL,
+    UNIQUE KE|",
+                "KEY",
+            ),
+            (
+                "CREATE TABLE dept (
+    dept_id INT NOT NULL,
+    parent_dept_id INT NULL,
+    dept_code VARCHAR(20) NOT NULL,
+    dept_name VARCHAR(100) NOT NULL,
+    sort_no INT NOT NULL,
+    PRIMARY KEY (dept_id),
+    UNIQUE KEY uk_dept_code (dept_code),
+    KEY idx_dept_parent (parent_dept_id),
+    CO|",
+                "CONSTRAINT",
+            ),
+            (
+                "CREATE TABLE dept (
+    dept_id INT NOT NULL,
+    parent_dept_id INT NULL,
+    dept_code VARCHAR(20) NOT NULL,
+    dept_name VARCHAR(100) NOT NULL,
+    sort_no INT NOT NULL,
+    PRIMARY KEY (dept_id),
+    UNIQUE KEY uk_dept_code (dept_code),
+    KEY idx_dept_parent (parent_dept_id),
+    CONSTRAINT fk_dept_parent
+        FO|",
+                "FOREIGN KEY",
+            ),
+            (
+                "CREATE TABLE dept (
+    dept_id INT NOT NULL,
+    parent_dept_id INT NULL,
+    dept_code VARCHAR(20) NOT NULL,
+    dept_name VARCHAR(100) NOT NULL,
+    sort_no INT NOT NULL,
+    PRIMARY KEY (dept_id),
+    UNIQUE KEY uk_dept_code (dept_code),
+    KEY idx_dept_parent (parent_dept_id),
+    CONSTRAINT fk_dept_parent
+        FOREIGN |",
+                "KEY",
+            ),
+            (
+                "CREATE TABLE dept (
+    dept_id INT NOT NULL,
+    parent_dept_id INT NULL,
+    dept_code VARCHAR(20) NOT NULL,
+    dept_name VARCHAR(100) NOT NULL,
+    sort_no INT NOT NULL,
+    PRIMARY KEY (dept_id),
+    UNIQUE KEY uk_dept_code (dept_code),
+    KEY idx_dept_parent (parent_dept_id),
+    CONSTRAINT fk_dept_parent
+        FOREIGN KEY (parent_dept_id) RE|",
+                "REFERENCES",
+            ),
+            (
+                "CREATE TABLE dept (
+    dept_id INT NOT NULL,
+    parent_dept_id INT NULL,
+    dept_code VARCHAR(20) NOT NULL,
+    dept_name VARCHAR(100) NOT NULL,
+    sort_no INT NOT NULL,
+    PRIMARY KEY (dept_id),
+    UNIQUE KEY uk_dept_code (dept_code),
+    KEY idx_dept_parent (parent_dept_id),
+    CONSTRAINT fk_dept_parent
+        FOREIGN KEY (parent_dept_id) REFERENCES dept (dept_id),
+    CONSTRAINT chk_dept_self
+        CH|",
+                "CHECK",
+            ),
+            (
+                "CREATE TABLE dept (
+    dept_id INT NOT NULL,
+    parent_dept_id INT NULL,
+    dept_code VARCHAR(20) NOT NULL,
+    dept_name VARCHAR(100) NOT NULL,
+    sort_no INT NOT NULL,
+    PRIMARY KEY (dept_id),
+    UNIQUE KEY uk_dept_code (dept_code),
+    KEY idx_dept_parent (parent_dept_id),
+    CONSTRAINT fk_dept_parent
+        FOREIGN KEY (parent_dept_id) REFERENCES dept (dept_id),
+    CONSTRAINT chk_dept_self
+        CHECK (parent_dept_id IS NULL OR parent_dept_id <> dept_id)
+) EN|",
+                "ENGINE",
+            ),
+            (
+                "CREATE TABLE dept (
+    dept_id INT NOT NULL,
+    parent_dept_id INT NULL,
+    dept_code VARCHAR(20) NOT NULL,
+    dept_name VARCHAR(100) NOT NULL,
+    sort_no INT NOT NULL,
+    PRIMARY KEY (dept_id),
+    UNIQUE KEY uk_dept_code (dept_code),
+    KEY idx_dept_parent (parent_dept_id),
+    CONSTRAINT fk_dept_parent
+        FOREIGN KEY (parent_dept_id) REFERENCES dept (dept_id),
+    CONSTRAINT chk_dept_self
+        CHECK (parent_dept_id IS NULL OR parent_dept_id <> dept_id)
+) ENGINE = In|",
+                "InnoDB",
+            ),
+        ] {
+            let (_, _, suggestions) = audit_final_suggestions_for(sql, db);
+            assert_has_case_insensitive(&suggestions, expected);
+        }
+
+        let (_, _, constraint_type_suggestions) = audit_final_suggestions_for(
+            "CREATE TABLE dept (dept_id INT NOT NULL, CONSTRAINT fk_dept_parent |)",
+            db,
+        );
+        for expected in ["PRIMARY KEY", "UNIQUE", "FOREIGN KEY", "CHECK"] {
+            assert_has_case_insensitive(&constraint_type_suggestions, expected);
+        }
+
+        let (_, _, primary_tail_suggestions) =
+            audit_final_suggestions_for("CREATE TABLE dept (dept_id INT, PRIMARY |)", db);
+        assert_has_case_insensitive(&primary_tail_suggestions, "KEY");
+
+        let (_, _, foreign_tail_suggestions) = audit_final_suggestions_for(
+            "CREATE TABLE dept (dept_id INT, CONSTRAINT fk_dept_parent FOREIGN |)",
+            db,
+        );
+        assert_has_case_insensitive(&foreign_tail_suggestions, "KEY");
     }
 }
 
@@ -45630,40 +46553,6 @@ fn query_completion_suggestions_impl(
     db_type: crate::db::DatabaseType,
     include_locals: bool,
 ) -> Vec<String> {
-    // The `|` marker collides with the `||` concatenation operator, so honor the
-    // explicit `__CODEX_CURSOR__` marker first for SQL that contains pipes.
-    const MARKER: &str = "__CODEX_CURSOR__";
-    let (cursor, sql) = if let Some(pos) = sql_with_cursor.find(MARKER) {
-        (pos, sql_with_cursor.replacen(MARKER, "", 1))
-    } else {
-        (
-            sql_with_cursor.find('|').expect("cursor"),
-            sql_with_cursor.replace('|', ""),
-        )
-    };
-    let (routine_cache, expanded) =
-        SqlEditorWidget::build_routine_symbol_cache_bundle_for_test(&sql, cursor);
-    let analysis = SqlEditorWidget::build_intellisense_analysis_from_routine_cache(
-        &routine_cache,
-        expanded.cursor_in_statement,
-    );
-    let deep_ctx = analysis.context.clone();
-    let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
-
-    if SqlEditorWidget::cursor_alias_declaration_blocks_completion(
-        analysis.cursor_in_alias_declaration,
-        None,
-        &prefix,
-        &deep_ctx,
-        Some(db_type),
-    ) {
-        return Vec::new();
-    }
-
-    let context = SqlEditorWidget::classify_intellisense_context(
-        &deep_ctx,
-        deep_ctx.statement_tokens.as_ref(),
-    );
     let mut data = IntellisenseData::new();
     data.tables = vec!["EMP".into(), "HELP".into(), "DEPT".into()];
     data.set_columns_for_table(
@@ -45679,7 +46568,103 @@ fn query_completion_suggestions_impl(
     data.set_columns_for_table("DEPT", vec!["DEPTNO".into(), "DNAME".into()]);
     data.rebuild_indices();
 
-    let column_tables = SqlEditorWidget::resolve_column_tables_for_context(None, &deep_ctx);
+    query_completion_suggestions_with_data(sql_with_cursor, db_type, include_locals, &mut data)
+}
+
+fn query_completion_suggestions_with_data(
+    sql_with_cursor: &str,
+    db_type: crate::db::DatabaseType,
+    include_locals: bool,
+    data: &mut IntellisenseData,
+) -> Vec<String> {
+    // The `|` marker collides with the `||` concatenation operator, so honor the
+    // explicit `__CODEX_CURSOR__` marker first for SQL that contains pipes.
+    const MARKER: &str = "__CODEX_CURSOR__";
+    let (cursor, sql) = if let Some(pos) = sql_with_cursor.find(MARKER) {
+        (pos, sql_with_cursor.replacen(MARKER, "", 1))
+    } else {
+        (
+            sql_with_cursor.find('|').expect("cursor"),
+            sql_with_cursor.replace('|', ""),
+        )
+    };
+    let (routine_cache, expanded) =
+        SqlEditorWidget::build_routine_symbol_cache_bundle_for_test_for_db_type(
+            &sql,
+            cursor,
+            Some(db_type),
+        );
+    let analysis = SqlEditorWidget::build_intellisense_analysis_from_routine_cache(
+        &routine_cache,
+        expanded.cursor_in_statement,
+    );
+    let deep_ctx = analysis.context.clone();
+    let (prefix, word_start, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+    let prefix_is_followed_by_call_paren =
+        SqlEditorWidget::text_after_cursor_starts_with_call_paren(sql.get(cursor..).unwrap_or(""))
+            || SqlEditorWidget::cursor_prefix_is_followed_by_call_paren_for_context(
+                &deep_ctx,
+                !prefix.is_empty(),
+            );
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, word_start);
+    let data_for_virtual = Arc::new(Mutex::new(data.clone()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns = collect_virtual_columns_from_relations(
+        &deep_ctx,
+        &data_for_virtual,
+        &sender,
+        &connection,
+    );
+    data.replace_virtual_table_columns(virtual_table_columns);
+
+    let early_signature_argument_suggestions = if !crate::sql_text::mysql_compatibility_for_sql(
+        "",
+        Some(db_type),
+    )
+    {
+        SqlEditorWidget::cached_signature_named_argument_suggestions(
+            data,
+            signature_scan_text_before_cursor_for_test(&sql, cursor),
+            &prefix,
+        )
+    } else {
+        Vec::new()
+    };
+    let early_builtin_function_call_suggestions =
+        SqlEditorWidget::collect_builtin_function_call_suggestions_for_slot(
+            &prefix,
+            Some(db_type),
+            prefix_is_followed_by_call_paren,
+        );
+    let early_expected_keyword_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions_with_expression_context(
+            &prefix,
+            &deep_ctx,
+            Some(db_type),
+            None,
+        );
+    if SqlEditorWidget::cursor_alias_declaration_blocks_completion(
+        analysis.cursor_in_alias_declaration,
+        None,
+        &prefix,
+        &deep_ctx,
+        Some(db_type),
+    ) && early_signature_argument_suggestions.is_empty()
+        && early_builtin_function_call_suggestions.is_empty()
+        && early_expected_keyword_suggestions.is_empty()
+    {
+        return Vec::new();
+    }
+    let context = SqlEditorWidget::classify_intellisense_context(
+        &deep_ctx,
+        deep_ctx.statement_tokens.as_ref(),
+    );
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context_for_db(
+        qualifier.as_deref(),
+        &deep_ctx,
+        Some(db_type),
+    );
     let column_scope = (!column_tables.is_empty()).then(|| column_tables.clone());
     let include_columns = matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll);
     let expr_kw = SqlEditorWidget::expression_keyword_context(
@@ -45715,20 +46700,22 @@ fn query_completion_suggestions_impl(
         false,
         expr_kw,
     )
-    .allowance(context, None, expr_kw);
-    let mut suggestions = if at_keyword_only_identifier_slot
-        || at_keyword_only_slot
-        || SqlEditorWidget::cursor_is_at_mysql_schema_object_keyword_slot_for_context(
-            &deep_ctx,
-            exclude_current_identifier_chain,
-            Some(db_type),
-        ) {
+    .allowance(context, qualifier.as_deref(), expr_kw);
+    let mut suggestions = if qualifier.is_none()
+        && (at_keyword_only_identifier_slot
+            || at_keyword_only_slot
+            || SqlEditorWidget::cursor_is_at_mysql_schema_object_keyword_slot_for_context(
+                &deep_ctx,
+                exclude_current_identifier_chain,
+                Some(db_type),
+            ))
+    {
         Vec::new()
     } else {
         SqlEditorWidget::base_suggestions_for_context(
-            &mut data,
+            data,
             &prefix,
-            None,
+            qualifier.as_deref(),
             column_scope.as_deref(),
             include_columns,
             context,
@@ -45750,6 +46737,70 @@ fn query_completion_suggestions_impl(
             expected_keywords,
             true,
         );
+    }
+    let builtin_function_call_suggestions = if !at_data_type_position {
+        SqlEditorWidget::collect_builtin_function_call_suggestions_for_slot(
+            &prefix,
+            Some(db_type),
+            prefix_is_followed_by_call_paren,
+        )
+    } else {
+        Vec::new()
+    };
+    if !builtin_function_call_suggestions.is_empty() {
+        suggestions = SqlEditorWidget::merge_suggestions_with_context_aliases(
+            suggestions,
+            builtin_function_call_suggestions,
+            true,
+        );
+    }
+    let force_context_name_qualifier_head = qualifier.is_none()
+        && SqlEditorWidget::cursor_prefix_is_followed_by_qualifier_dot_for_context(
+            &deep_ctx,
+            !prefix.is_empty(),
+        );
+    let context_name_context = if force_context_name_qualifier_head {
+        SqlContext::ColumnName
+    } else {
+        context
+    };
+    let context_names =
+        if source_allowance.context_name_suggestions || force_context_name_qualifier_head {
+            SqlEditorWidget::collect_context_name_suggestions(
+                &prefix,
+                &deep_ctx,
+                context_name_context,
+            )
+        } else {
+            Vec::new()
+        };
+    suggestions = SqlEditorWidget::maybe_merge_suggestions_with_context_aliases(
+        suggestions,
+        context_names,
+        matches!(context, SqlContext::TableName) || force_context_name_qualifier_head,
+        qualifier.is_some(),
+    );
+    let mysql_trigger_pseudo_rows = if force_context_name_qualifier_head {
+        SqlEditorWidget::collect_mysql_trigger_pseudo_row_suggestions(&prefix, expr_kw, Some(db_type))
+    } else {
+        Vec::new()
+    };
+    suggestions = SqlEditorWidget::maybe_merge_suggestions_with_context_aliases(
+        suggestions,
+        mysql_trigger_pseudo_rows,
+        force_context_name_qualifier_head,
+        qualifier.is_some(),
+    );
+    if !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type))
+    {
+        let signature_argument_suggestions = early_signature_argument_suggestions;
+        if !signature_argument_suggestions.is_empty() {
+            suggestions = SqlEditorWidget::merge_suggestions_with_context_aliases(
+                suggestions,
+                signature_argument_suggestions,
+                true,
+            );
+        }
     }
     if SqlEditorWidget::should_append_exact_catalog_keyword_after_context_filters(
         context,
@@ -45826,9 +46877,19 @@ fn query_completion_suggestions_impl(
                 true,
                 Some(db_type),
             );
+        let at_mysql_set_local_assignment_target_slot =
+            SqlEditorWidget::cursor_is_at_mysql_set_local_assignment_target_slot_for_context(
+                &deep_ctx,
+                !prefix.is_empty(),
+                Some(db_type),
+            );
+        let at_prefixed_routine_local_symbol_slot = qualifier.is_none()
+            && !prefix.is_empty();
         if source_allowance.local_suggestions
             || at_name_only_local_symbol_slot
             || at_plsql_statement_start_local_symbol_slot
+            || at_mysql_set_local_assignment_target_slot
+            || at_prefixed_routine_local_symbol_slot
         {
             let locals = SqlEditorWidget::collect_local_symbol_suggestions(
                 &prefix,
@@ -45836,11 +46897,248 @@ fn query_completion_suggestions_impl(
                 &analysis,
                 &[],
             );
-            if !locals.is_empty() && source_allowance.prepend_local_symbol_suggestions {
+            if !locals.is_empty()
+                && (source_allowance.prepend_local_symbol_suggestions
+                    || at_mysql_set_local_assignment_target_slot
+                    || at_prefixed_routine_local_symbol_slot)
+            {
                 suggestions =
                     SqlEditorWidget::prepend_local_symbol_suggestions(suggestions, locals);
             }
         }
+    }
+    suggestions
+}
+
+fn signature_scan_text_before_cursor_for_test(sql: &str, cursor: usize) -> &str {
+    const SIGNATURE_SCAN_WINDOW: usize = 4000;
+    let mut window_start = cursor.saturating_sub(SIGNATURE_SCAN_WINDOW);
+    while window_start < cursor && !sql.is_char_boundary(window_start) {
+        window_start += 1;
+    }
+    let raw = sql.get(window_start..cursor).unwrap_or("");
+    if window_start > 0 {
+        if let Some(newline) = raw.find('\n') {
+            return &raw[newline + 1..];
+        }
+    }
+    raw
+}
+
+fn query_completion_suggestions_from_context_with_data(
+    statement: &str,
+    cursor: usize,
+    deep_ctx: &intellisense_context::CursorContext,
+    db_type: crate::db::DatabaseType,
+    data: &mut IntellisenseData,
+) -> Vec<String> {
+    let (prefix, word_start, _) = crate::ui::intellisense::get_word_at_cursor(statement, cursor);
+    let prefix_is_followed_by_call_paren =
+        SqlEditorWidget::text_after_cursor_starts_with_call_paren(
+            statement.get(cursor..).unwrap_or(""),
+        ) || SqlEditorWidget::cursor_prefix_is_followed_by_call_paren_for_context(
+            deep_ctx,
+            !prefix.is_empty(),
+        );
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(statement, word_start);
+    let data_for_virtual = Arc::new(Mutex::new(data.clone()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(deep_ctx, &data_for_virtual, &sender, &connection);
+    data.replace_virtual_table_columns(virtual_table_columns);
+    let context = SqlEditorWidget::classify_intellisense_context(
+        deep_ctx,
+        deep_ctx.statement_tokens.as_ref(),
+    );
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context_for_db(
+        qualifier.as_deref(),
+        deep_ctx,
+        Some(db_type),
+    );
+    let column_scope = (!column_tables.is_empty()).then(|| column_tables.clone());
+    let include_columns = matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll);
+    let expr_kw = SqlEditorWidget::expression_keyword_context(
+        deep_ctx,
+        data,
+        &column_tables,
+        !prefix.is_empty(),
+        Some(db_type),
+    );
+    let exclude_current_identifier_chain = !prefix.is_empty();
+    let at_keyword_only_identifier_slot =
+        SqlEditorWidget::cursor_is_at_identifier_suppressing_keyword_slot_for_context(
+            deep_ctx,
+            exclude_current_identifier_chain,
+            Some(db_type),
+        );
+    let at_keyword_only_slot = SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot_for_db(
+        deep_ctx,
+        exclude_current_identifier_chain,
+        Some(db_type),
+    );
+    let at_data_type_position = SqlEditorWidget::data_type_position_for_context_for_db(
+        deep_ctx,
+        exclude_current_identifier_chain,
+        Some(db_type),
+    )
+    .is_some();
+    let source_allowance = CompletionSourcePolicy::new(
+        false,
+        at_keyword_only_identifier_slot,
+        at_keyword_only_slot,
+        false,
+        false,
+        expr_kw,
+    )
+    .allowance(context, qualifier.as_deref(), expr_kw);
+    let expected_object_kind = SqlEditorWidget::expected_object_suggestion_kind_for_db(
+        &prefix,
+        qualifier.as_deref(),
+        deep_ctx,
+        Some(db_type),
+    );
+    let expected_object_suggestions = if qualifier.is_none() && expected_object_kind.is_some() {
+        SqlEditorWidget::collect_expected_object_suggestions_for_db(
+            data,
+            &prefix,
+            deep_ctx,
+            Some(db_type),
+        )
+    } else {
+        Vec::new()
+    };
+
+    let mut suggestions = if !expected_object_suggestions.is_empty() {
+        expected_object_suggestions
+    } else if qualifier.is_none()
+        && (at_keyword_only_identifier_slot
+            || at_keyword_only_slot
+            || SqlEditorWidget::cursor_is_at_mysql_schema_object_keyword_slot_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                Some(db_type),
+            ))
+    {
+        Vec::new()
+    } else {
+        SqlEditorWidget::base_suggestions_for_context(
+            data,
+            &prefix,
+            qualifier.as_deref(),
+            column_scope.as_deref(),
+            include_columns,
+            context,
+            false,
+            Some(db_type),
+            expr_kw,
+        )
+    };
+
+    let expected_keywords =
+        SqlEditorWidget::collect_expected_keyword_suggestions_with_expression_context(
+            &prefix,
+            deep_ctx,
+            Some(db_type),
+            Some(expr_kw),
+        );
+    if !expected_keywords.is_empty() {
+        suggestions = SqlEditorWidget::merge_suggestions_with_context_aliases(
+            suggestions,
+            expected_keywords,
+            true,
+        );
+    }
+    let builtin_function_call_suggestions = if !at_data_type_position {
+        SqlEditorWidget::collect_builtin_function_call_suggestions_for_slot(
+            &prefix,
+            Some(db_type),
+            prefix_is_followed_by_call_paren,
+        )
+    } else {
+        Vec::new()
+    };
+    if !builtin_function_call_suggestions.is_empty() {
+        suggestions = SqlEditorWidget::merge_suggestions_with_context_aliases(
+            suggestions,
+            builtin_function_call_suggestions,
+            true,
+        );
+    }
+    let force_context_name_qualifier_head = qualifier.is_none()
+        && SqlEditorWidget::cursor_prefix_is_followed_by_qualifier_dot_for_context(
+            deep_ctx,
+            !prefix.is_empty(),
+        );
+    let context_name_context = if force_context_name_qualifier_head {
+        SqlContext::ColumnName
+    } else {
+        context
+    };
+    let context_names =
+        if source_allowance.context_name_suggestions || force_context_name_qualifier_head {
+            SqlEditorWidget::collect_context_name_suggestions(
+                &prefix,
+                deep_ctx,
+                context_name_context,
+            )
+        } else {
+            Vec::new()
+        };
+    suggestions = SqlEditorWidget::maybe_merge_suggestions_with_context_aliases(
+        suggestions,
+        context_names,
+        matches!(context, SqlContext::TableName) || force_context_name_qualifier_head,
+        qualifier.is_some(),
+    );
+    let mysql_trigger_pseudo_rows = if force_context_name_qualifier_head {
+        SqlEditorWidget::collect_mysql_trigger_pseudo_row_suggestions(&prefix, expr_kw, Some(db_type))
+    } else {
+        Vec::new()
+    };
+    suggestions = SqlEditorWidget::maybe_merge_suggestions_with_context_aliases(
+        suggestions,
+        mysql_trigger_pseudo_rows,
+        force_context_name_qualifier_head,
+        qualifier.is_some(),
+    );
+    if !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type))
+    {
+        let signature_argument_suggestions =
+            SqlEditorWidget::cached_signature_named_argument_suggestions(
+                data,
+                signature_scan_text_before_cursor_for_test(statement, cursor),
+                &prefix,
+            );
+        if !signature_argument_suggestions.is_empty() {
+            suggestions = SqlEditorWidget::merge_suggestions_with_context_aliases(
+                suggestions,
+                signature_argument_suggestions,
+                true,
+            );
+        }
+    }
+    if SqlEditorWidget::should_append_exact_catalog_keyword_after_context_filters(
+        context,
+        None,
+        source_allowance,
+        expr_kw,
+        at_data_type_position,
+        false,
+        false,
+        SqlEditorWidget::cursor_prefix_starts_relation_name_slot(deep_ctx),
+        SqlEditorWidget::exact_keyword_expected_before_current_identifier(
+            &prefix,
+            deep_ctx,
+            Some(db_type),
+            expr_kw,
+        ),
+    ) {
+        SqlEditorWidget::append_exact_catalog_keyword_suggestion(
+            &mut suggestions,
+            &prefix,
+            Some(db_type),
+        );
     }
     suggestions
 }
@@ -45898,7 +47196,7 @@ fn expected_keyword_slot_suggestions(
 }
 
 fn registered_keyword_slot_cases() -> Vec<RegisteredKeywordSlotCase> {
-    use crate::db::DatabaseType::{MySQL, Oracle};
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
 
     vec![
         RegisteredKeywordSlotCase {
@@ -46367,6 +47665,62 @@ fn registered_keyword_slot_cases() -> Vec<RegisteredKeywordSlotCase> {
             ],
         },
         RegisteredKeywordSlotCase {
+            db_type: MySQL,
+            sql: "CREATE |",
+            keywords: &[
+                "ALGORITHM",
+                "DATABASE",
+                "DEFINER",
+                "EVENT",
+                "FULLTEXT",
+                "FUNCTION",
+                "INDEX",
+                "LOGFILE",
+                "OR",
+                "PROCEDURE",
+                "RESOURCE",
+                "ROLE",
+                "SCHEMA",
+                "SERVER",
+                "SQL",
+                "SPATIAL",
+                "TABLE",
+                "TABLESPACE",
+                "TEMPORARY",
+                "TRIGGER",
+                "USER",
+                "VIEW",
+            ],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MariaDB,
+            sql: "CREATE |",
+            keywords: &[
+                "ALGORITHM",
+                "DATABASE",
+                "DEFINER",
+                "EVENT",
+                "FULLTEXT",
+                "FUNCTION",
+                "INDEX",
+                "LOGFILE",
+                "OR",
+                "PROCEDURE",
+                "RESOURCE",
+                "ROLE",
+                "SCHEMA",
+                "SERVER",
+                "SQL",
+                "SPATIAL",
+                "TABLE",
+                "TABLESPACE",
+                "TEMPORARY",
+                "TRIGGER",
+                "USER",
+                "VIEW",
+            ],
+        },
+        RegisteredKeywordSlotCase {
             db_type: Oracle,
             sql: "ALTER |",
             keywords: &[
@@ -46492,6 +47846,26 @@ fn registered_keyword_slot_cases() -> Vec<RegisteredKeywordSlotCase> {
         },
         RegisteredKeywordSlotCase {
             db_type: MySQL,
+            sql: "CREATE TABLE t (c INT |)",
+            keywords: &[
+                "AUTO_INCREMENT",
+                "CHECK",
+                "COLLATE",
+                "COMMENT",
+                "CONSTRAINT",
+                "DEFAULT",
+                "GENERATED",
+                "INVISIBLE",
+                "NOT NULL",
+                "NULL",
+                "PRIMARY KEY",
+                "REFERENCES",
+                "UNIQUE",
+                "VISIBLE",
+            ],
+        },
+        RegisteredKeywordSlotCase {
+            db_type: MariaDB,
             sql: "CREATE TABLE t (c INT |)",
             keywords: &[
                 "AUTO_INCREMENT",
@@ -48399,9 +49773,26 @@ fn broad_keyword_grammar_slots_complete_with_empty_and_two_letter_prefixes() {
         }
     }
     for db_type in [MySQL, MariaDB] {
-        for keyword in ["TABLE", "VIEW", "INDEX", "DATABASE", "SCHEMA", "USER"] {
+        for keyword in [
+            "TABLE",
+            "VIEW",
+            "INDEX",
+            "DATABASE",
+            "SCHEMA",
+            "USER",
+            "PROCEDURE",
+            "FUNCTION",
+            "TRIGGER",
+            "EVENT",
+        ] {
             assert_keyword("CREATE |", keyword, db_type);
         }
+        assert_keyword("CREATE PROCEDURE sp_build_monthly_rollup(|)", "IN", db_type);
+        assert_keyword(
+            "CREATE PROCEDURE sp_build_monthly_rollup(IN p_ym |)",
+            "CHAR",
+            db_type,
+        );
     }
     for db_type in [MySQL, MariaDB] {
         for keyword in [
@@ -52690,7 +54081,7 @@ fn create_table_constraint_slots_are_precise() {
     // data-type path serves it and the type position is not suppressed.
     assert!(!has(&kw("CREATE TABLE t (a NUMBER, b |"), "CONSTRAINT"));
     assert!(!suppressed("CREATE TABLE t (a NUMBER, b |"));
-    // MySQL element start is left to its own schema-object handler (no Oracle set).
+    // MySQL element start also offers table-level constraint/index introducers.
     for db_type in [
         crate::db::DatabaseType::MySQL,
         crate::db::DatabaseType::MariaDB,
@@ -52706,7 +54097,12 @@ fn create_table_constraint_slots_are_precise() {
                 Some(db_type),
             )
         };
-        assert!(!mysql_start.iter().any(|k| k == "FOREIGN KEY"));
+        for expected in ["CONSTRAINT", "PRIMARY KEY", "UNIQUE", "FOREIGN KEY"] {
+            assert!(
+                mysql_start.iter().any(|k| k == expected),
+                "MySQL-family element start missing `{expected}`: {mysql_start:?}"
+            );
+        }
     }
 }
 
@@ -61386,7 +62782,6 @@ fn create_table_final_suggestions_separate_names_types_and_constraint_keywords()
         (Oracle, "CREATE TABLE t (CONSTRAINT |"),
         (Oracle, "CREATE TABLE t (a INT, CONSTRAINT |"),
         (Oracle, "CREATE TABLE t (scott.|"),
-        (MySQL, "CREATE TABLE t (|"),
         (MySQL, "CREATE TABLE t (scott.|"),
     ] {
         let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
@@ -61399,6 +62794,20 @@ fn create_table_final_suggestions_separate_names_types_and_constraint_keywords()
             "new-name slot should stay empty at `{sql}` for {db:?}: keywords={keywords:?} final={final_suggestions:?}"
         );
     }
+
+    let (kind, keywords, final_suggestions) =
+        audit_final_suggestions_for("CREATE TABLE t (|", MySQL);
+    assert_eq!(
+        kind, None,
+        "MySQL CREATE TABLE element start should not resolve object kind: keywords={keywords:?} final={final_suggestions:?}"
+    );
+    for expected in ["CONSTRAINT", "PRIMARY KEY", "UNIQUE", "FOREIGN KEY"] {
+        assert!(
+            contains(&final_suggestions, expected),
+            "{expected} missing from MySQL CREATE TABLE element start: keywords={keywords:?} final={final_suggestions:?}"
+        );
+    }
+    assert_no_catalog("CREATE TABLE t (|", MySQL, &final_suggestions);
 }
 
 #[test]
@@ -67012,15 +68421,26 @@ fn mysql_family_call_slots_offer_procedures_not_functions() {
             }
         }
 
-        for sql in ["CALL app.emp|", "CALL app.|"] {
+        for sql in [
+            "CALL app.emp|",
+            "CALL app.|",
+            "CALL `app`.`emp|",
+            "CALL `app`.|",
+            "CALL `qt_mysql_final_boss`.`sp|",
+        ] {
             let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
             assert_eq!(
                 kind,
                 Some(ExpectedObjectSuggestionKind::Routine),
                 "MySQL-family qualified CALL slot should resolve to routine/procedure objects at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
             );
+            let expected_procedure = if sql.contains("qt_mysql_final_boss") {
+                "SP_RUN_FINAL_BOSS"
+            } else {
+                "EMP_PROC"
+            };
             assert!(
-                contains(&final_suggestions, "EMP_PROC"),
+                contains(&final_suggestions, expected_procedure),
                 "qualified procedure missing from MySQL-family CALL slot at `{sql}` {db:?}: {final_suggestions:?}"
             );
             for leaked in ["EMP_FUNC", "EMP_PKG", "EMP_TYPE", "EMP", "EMP_VIEW"] {
@@ -76923,6 +78343,45 @@ fn plsql_record_and_rowtype_member_completion_covers_nested_shapes() {
         other => failures.push(format!("indexed collection record members missing: {other:?}")),
     }
 
+    let collection_count = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        "DECLARE TYPE item_rec IS RECORD (code VARCHAR2(20)); \
+         TYPE item_tab IS TABLE OF item_rec INDEX BY PLS_INTEGER; \
+         l_items item_tab; \
+         BEGIN l_items.CO__CODEX_CURSOR__ END;",
+        "l_items",
+        "CO",
+    );
+    match collection_count {
+        Some(s) if has(&s, "code") && has(&s, "COUNT") => {}
+        other => failures.push(format!("collection COUNT/member suggestions missing: {other:?}")),
+    }
+
+    let collection_first = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        "DECLARE TYPE item_rec IS RECORD (code VARCHAR2(20)); \
+         TYPE item_tab IS TABLE OF item_rec INDEX BY PLS_INTEGER; \
+         l_items item_tab; \
+         BEGIN l_items.FI__CODEX_CURSOR__ END;",
+        "l_items",
+        "FI",
+    );
+    match collection_first {
+        Some(s) if has(&s, "FIRST") => {}
+        other => failures.push(format!("collection FIRST suggestion missing: {other:?}")),
+    }
+
+    let collection_next = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        "DECLARE TYPE item_rec IS RECORD (code VARCHAR2(20)); \
+         TYPE item_tab IS TABLE OF item_rec INDEX BY PLS_INTEGER; \
+         l_items item_tab; \
+         BEGIN l_items.NE__CODEX_CURSOR__ END;",
+        "l_items",
+        "NE",
+    );
+    match collection_next {
+        Some(s) if has(&s, "NEXT") => {}
+        other => failures.push(format!("collection NEXT suggestion missing: {other:?}")),
+    }
+
     let rowtype = SqlEditorWidget::collect_local_rowtype_member_suggestions_for_test(
         "DECLARE r_emp emp%ROWTYPE; BEGIN r_emp.__CODEX_CURSOR__ END;",
         "r_emp",
@@ -77322,6 +78781,12 @@ fn plsql_deeper_local_scope_and_clause_value_positions_offer_symbols() {
             "CREATE PACKAGE pkg AS g_spec NUMBER; END; / CREATE PACKAGE BODY pkg AS BEGIN g_spec := __CODEX_CURSOR__; END; /"
                 .to_string(),
             &["g_spec", "NULL", "CASE"],
+            &[],
+        ),
+        (
+            "CREATE OR REPLACE TRIGGER trg FOR INSERT ON emp COMPOUND TRIGGER g_rows PLS_INTEGER := 0; AFTER EACH ROW IS BEGIN g_rows := __CODEX_CURSOR__; END AFTER EACH ROW; END;"
+                .to_string(),
+            &["g_rows", "NULL", "CASE"],
             &[],
         ),
         (
@@ -77749,6 +79214,2789 @@ fn mysql_family_object_completion_bulk_matrix_includes_query_and_schema_objects(
 }
 
 #[test]
+fn mysql_family_test_scripts_catalog_objects_are_suggested_by_kind() {
+    let has = |suggestions: &[String], expected: &str| {
+        suggestions
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(expected)
+                || value
+                    .strip_suffix("()")
+                    .is_some_and(|name| name.eq_ignore_ascii_case(expected)))
+    };
+    let prefix_for = |name: &str| name.chars().take(4).collect::<String>();
+    let mut failures = Vec::new();
+
+    for (label, db, script) in mysql_family_intellisense_scripts() {
+        let catalog = mysql_family_catalog_from_script(script);
+        let mut data = intellisense_data_from_mysql_family_catalog(&catalog);
+        assert!(
+            !catalog.tables.is_empty(),
+            "{label} should contribute table objects to the script catalog"
+        );
+
+        for (kind_name, slot, objects) in [
+            ("table", "DROP TABLE ", catalog.tables.as_slice()),
+            ("view", "DROP VIEW ", catalog.views.as_slice()),
+            ("procedure", "DROP PROCEDURE ", catalog.procedures.as_slice()),
+            ("function", "DROP FUNCTION ", catalog.functions.as_slice()),
+            ("trigger", "DROP TRIGGER ", catalog.triggers.as_slice()),
+        ] {
+            for object in objects {
+                let prefix = prefix_for(object);
+                let sql = format!("{slot}{prefix}|");
+                let suggestions = SqlEditorWidget::collect_expected_object_suggestions_for_db(
+                    &mut data,
+                    &prefix,
+                    &analyze_inline_cursor_sql(&sql),
+                    Some(db),
+                );
+                if !has(&suggestions, object) {
+                    failures.push(format!(
+                        "{label} {kind_name} `{object}` missing at `{sql}`: {suggestions:?}"
+                    ));
+                }
+            }
+        }
+
+        for procedure in &catalog.procedures {
+            let prefix = prefix_for(procedure);
+            let sql = format!("CALL {prefix}|()");
+            let suggestions = SqlEditorWidget::collect_expected_object_suggestions_for_db(
+                &mut data,
+                &prefix,
+                &analyze_inline_cursor_sql(&sql),
+                Some(db),
+            );
+            if !has(&suggestions, procedure) {
+                failures.push(format!(
+                    "{label} procedure `{procedure}` missing at `{sql}`: {suggestions:?}"
+                ));
+            }
+        }
+
+        for table in &catalog.tables {
+            let table_prefix = prefix_for(table);
+            let table_sql = format!("SELECT * FROM {table_prefix}|");
+            let table_suggestions = SqlEditorWidget::collect_expected_object_suggestions_for_db(
+                &mut data,
+                &table_prefix,
+                &analyze_inline_cursor_sql(&table_sql),
+                Some(db),
+            );
+            if !has(&table_suggestions, table) {
+                failures.push(format!(
+                    "{label} table `{table}` missing at `{table_sql}`: {table_suggestions:?}"
+                ));
+            }
+
+            let Some(columns) = catalog.columns.get(&table.to_ascii_uppercase()) else {
+                failures.push(format!("{label} table `{table}` has no extracted columns"));
+                continue;
+            };
+            let column_tables = [table.clone()];
+            for column in columns {
+                let prefix = prefix_for(column);
+                let suggestions = data.get_suggestions_for_db(
+                    &prefix,
+                    true,
+                    Some(&column_tables),
+                    false,
+                    true,
+                    Some(db),
+                );
+                if !has(&suggestions, column) {
+                    failures.push(format!(
+                        "{label} column `{table}.{column}` missing for prefix `{prefix}`: {suggestions:?}"
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "MySQL/MariaDB script catalog completion gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn mysql_family_test_scripts_keyword_tokens_are_reachable_from_catalog() {
+    let mut failures = Vec::new();
+    let mut tested = 0usize;
+
+    for (label, db, script) in mysql_family_intellisense_scripts() {
+        let token_spans = super::query_text::tokenize_sql_spanned_with_mysql_compat(script, true);
+        let mut seen_keywords = HashSet::new();
+
+        for span in &token_spans {
+            let SqlToken::Word(word) = &span.token else {
+                continue;
+            };
+            if word.starts_with('`') || word.ends_with('`') {
+                continue;
+            }
+            if !mysql_family_script_keyword_or_function(word) {
+                continue;
+            }
+
+            let expected = word.trim_matches('`').to_ascii_uppercase();
+            if !seen_keywords.insert(expected.clone()) {
+                continue;
+            }
+
+            let prefix = mysql_family_partial_keyword_prefix(&expected);
+            let suggestions = crate::ui::intellisense::language_catalog_suggestions_for_db(
+                &prefix,
+                false,
+                Some(db),
+            );
+            tested += 1;
+            if !mysql_family_completion_has_keyword_or_function(&suggestions, &expected) {
+                failures.push(format!(
+                    "{label} `{expected}` missing from language catalog for prefix `{prefix}`: {suggestions:?}"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        tested > 200,
+        "script keyword sweep should cover a broad set of distinct keywords/functions, only tested {tested}"
+    );
+    assert!(
+        failures.is_empty(),
+        "MySQL/MariaDB script keyword catalog gaps ({} distinct script keywords/functions tested):\n{}",
+        tested,
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn mysql_family_test_scripts_keyword_slots_complete_with_two_letter_prefixes() {
+    let mut failures = Vec::new();
+    let mut tested_prefix = 0usize;
+    let mut tested_required_prefix = 0usize;
+
+    for (label, db, script) in mysql_family_intellisense_scripts() {
+        let catalog = mysql_family_catalog_from_script(script);
+        let token_spans = super::query_text::tokenize_sql_spanned_with_mysql_compat(script, true);
+        for (idx, span) in token_spans.iter().enumerate() {
+            if mysql_family_byte_is_inside_single_quoted_literal(script, span.start) {
+                continue;
+            }
+            let SqlToken::Word(word) = &span.token else {
+                continue;
+            };
+            let expected = word.trim_matches('`').to_ascii_uppercase();
+            if expected.len() < 3 || !crate::sql_text::is_mysql_sql_keyword(&expected) {
+                continue;
+            }
+
+            let prefix: String = expected.chars().take(2).collect();
+            let required_slot =
+                mysql_family_required_script_keyword_slot(&token_spans, idx, &expected);
+            if required_slot {
+                tested_required_prefix += 1;
+            }
+            let prefixed_keywords = mysql_family_script_slot_expected_keywords(
+                script,
+                span,
+                &prefix,
+                db,
+                &catalog,
+            );
+            if !mysql_family_completion_has_keyword_or_function(&prefixed_keywords, &expected) {
+                if required_slot {
+                    failures.push(format!(
+                        "{label} required keyword `{expected}` was not classified as an expected keyword at `{prefix}` prefix byte {}: keywords={prefixed_keywords:?}",
+                        span.start
+                    ));
+                }
+                continue;
+            }
+            let prefixed_suggestions = mysql_family_script_slot_suggestions(
+                script,
+                span,
+                &prefix,
+                db,
+                &catalog,
+                MysqlFamilyScriptSlotQuery::Context,
+            );
+            tested_prefix += 1;
+            if !mysql_family_script_slot_has_expected(
+                &prefixed_suggestions,
+                &expected,
+                MysqlFamilyScriptSlotExpected::Keyword,
+            ) {
+                failures.push(format!(
+                    "{label} keyword `{expected}` missing from final suggestions at `{prefix}` prefix byte {}: keywords={prefixed_keywords:?} final={prefixed_suggestions:?}",
+                    span.start
+                ));
+            }
+        }
+    }
+
+    assert!(
+        tested_prefix > 100,
+        "script keyword two-letter prefix sweep should cover many real keyword slots, only tested {tested_prefix}"
+    );
+    assert!(
+        tested_required_prefix > 20,
+        "script required-keyword sweep should cover actual CREATE object slots, only tested {tested_required_prefix}"
+    );
+    assert!(
+        failures.is_empty(),
+        "MySQL/MariaDB script keyword-slot completion gaps (prefix={tested_prefix}, required={tested_required_prefix}):\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn mysql_family_full_script_create_table_constraints_and_engine_survive_leading_noise() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let script = r#"-- FINAL BOSS SCRIPT FOR A MYSQL QUERY TOOL
+-- Target: MySQL 8.0+ / 8.4
+-- If you do not have CREATE DATABASE privilege, remove the first 3 lines and run in an existing schema.
+
+DROP DATABASE IF EXISTS qt_mysql_final_boss;
+CREATE DATABASE qt_mysql_final_boss CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+USE qt_mysql_final_boss;
+
+SET NAMES utf8mb4;
+
+SET @versioned_comment_executed = 0;
+/*!80000 SET @versioned_comment_executed = 1 */;
+
+# line comment torture: ; ; ; DELIMITER $$ should not matter here
+
+/*
+  block comment torture:
+  ; ; ;
+  DELIMITER $$
+  CREATE PROCEDURE fake_proc() BEGIN SELECT 1; END$$
+*/
+
+CREATE TABLE dept (
+    dept_id INT NOT NULL,
+    parent_dept_id INT NULL,
+    dept_code VARCHAR(20) NOT NULL,
+    dept_name VARCHAR(100) NOT NULL,
+    sort_no INT NOT NULL,
+    PRIMARY KEY (dept_id),
+    UNIQUE KEY uk_dept_code (dept_code),
+    KEY idx_dept_parent (parent_dept_id),
+    CONSTRAINT fk_dept_parent
+        FOREIGN KEY (parent_dept_id) REFERENCES dept (dept_id),
+    CONSTRAINT chk_dept_self
+        CHECK (parent_dept_id IS NULL OR parent_dept_id <> dept_id)
+) engine = InnoDB;"#;
+    let catalog = mysql_family_catalog_from_script(script);
+    let cases = [
+        ("PRIMARY KEY", "PR", "PRIMARY"),
+        ("UNIQUE KEY", "UN", "UNIQUE"),
+        ("CONSTRAINT fk_dept_parent", "CO", "CONSTRAINT"),
+        ("engine = InnoDB", "en", "ENGINE"),
+        ("InnoDB;", "In", "InnoDB"),
+    ];
+    let mut failures = Vec::new();
+
+    for db in [MySQL, MariaDB] {
+        for (needle, prefix, expected) in cases {
+            let marked = script.replacen(needle, &format!("{prefix}|"), 1);
+            assert_ne!(marked, script, "test setup should replace `{needle}`");
+            let mut data = intellisense_data_from_mysql_family_catalog(&catalog);
+            let suggestions = query_completion_suggestions_with_data(&marked, db, true, &mut data);
+            if !mysql_family_completion_has_keyword_or_function(&suggestions, expected) {
+                failures.push(format!(
+                    "{db:?} `{expected}` missing for `{needle}` with prefix `{prefix}`: {suggestions:?}"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "MySQL-family full-script CREATE TABLE completion gaps after leading noise:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn mysql_family_second_delimited_trigger_insert_column_list_uses_current_trigger() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let script_with_delimiter = r#"DELIMITER @@@
+CREATE TRIGGER trg_run_case_bu
+BEFORE UPDATE ON run_case
+FOR EACH ROW
+BEGIN
+    SET NEW.owner_name = LOWER(TRIM(NEW.owner_name));
+    SET NEW.status_code = UPPER(TRIM(NEW.status_code));
+END@@@
+
+CREATE TRIGGER trg_run_case_ai
+AFTER INSERT ON run_case
+FOR EACH ROW
+BEGIN
+    INSERT INTO run_audit (
+        run_id, __CODEX_CURSOR__
+    )
+END@@@"#;
+    let script_without_directive = script_with_delimiter
+        .strip_prefix("DELIMITER @@@\n")
+        .expect("test script starts with delimiter directive");
+    let mut failures = Vec::new();
+
+    for db in [MySQL, MariaDB] {
+        for (label, script) in [
+            ("with DELIMITER directive", script_with_delimiter),
+            ("bare END@@@ fragment", script_without_directive),
+        ] {
+            let mut data = IntellisenseData::new();
+            data.tables = vec!["run_case".into(), "run_audit".into()];
+            data.set_columns_for_table(
+                "run_case",
+                vec![
+                    "run_id".into(),
+                    "owner_name".into(),
+                    "status_code".into(),
+                ],
+            );
+            data.set_columns_for_table(
+                "run_audit",
+                vec![
+                    "run_id".into(),
+                    "event_type".into(),
+                    "owner_name".into(),
+                    "status_code".into(),
+                    "created_at".into(),
+                ],
+            );
+            data.rebuild_indices();
+
+            let suggestions = query_completion_suggestions_with_data(script, db, true, &mut data);
+            let cursor = script.find("__CODEX_CURSOR__").expect("cursor marker");
+            let sql_without_cursor = script.replacen("__CODEX_CURSOR__", "", 1);
+            let (_, expanded) = SqlEditorWidget::build_routine_symbol_cache_bundle_for_test_for_db_type(
+                &sql_without_cursor,
+                cursor,
+                Some(db),
+            );
+            for expected in ["event_type", "created_at"] {
+                if !suggestions
+                    .iter()
+                    .any(|suggestion| suggestion.eq_ignore_ascii_case(expected))
+                {
+                    failures.push(format!(
+                        "{db:?} `{expected}` missing in second trigger INSERT column list ({label}): {suggestions:?}; expanded_start={} expanded=`{}`",
+                        expanded.statement_start,
+                        expanded.text.replace('\n', "\\n")
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "MySQL-family second CREATE TRIGGER completion gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn mysql_family_second_explicit_delimited_routine_fragment_uses_current_create() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let cases = [
+        (
+            "procedure",
+            r#"CREATE PROCEDURE p1()
+BEGIN
+    SET @x = 1;
+END@@@
+
+CREATE PROCEDURE p2(IN p_name VARCHAR(20))
+BEGIN
+    SELECT p_|;
+END@@@"#,
+            "p_name",
+        ),
+        (
+            "function",
+            r#"CREATE FUNCTION f1() RETURNS INT
+BEGIN
+    RETURN 1;
+END@@@
+
+CREATE FUNCTION f2() RETURNS INT
+BEGIN
+    DECLARE v_total INT DEFAULT 0;
+    RETURN v_|;
+END@@@"#,
+            "v_total",
+        ),
+        (
+            "event",
+            r#"CREATE EVENT ev1
+ON SCHEDULE EVERY 1 DAY
+DO
+BEGIN
+    SET @x = 1;
+END@@@
+
+CREATE EVENT ev2
+ON SCHEDULE EVERY 1 DAY
+DO
+BEGIN
+    INSERT INTO run_audit (
+        run_id, __CODEX_CURSOR__
+    );
+END@@@"#,
+            "event_type",
+        ),
+    ];
+    let mut failures = Vec::new();
+    let definer_sql = r#"CREATE PROCEDURE p1()
+BEGIN
+    SET @x = 1;
+END@@@
+
+CREATE DEFINER=`root`@`%` PROCEDURE p2(IN p_name VARCHAR(20))
+BEGIN
+    SE|
+END@@@"#;
+
+    for db in [MySQL, MariaDB] {
+        let definer_cursor = definer_sql.find('|').expect("cursor");
+        let definer_without_cursor = definer_sql.replace('|', "");
+        let (_, definer_expanded) =
+            SqlEditorWidget::build_routine_symbol_cache_bundle_for_test_for_db_type(
+                &definer_without_cursor,
+                definer_cursor,
+                Some(db),
+            );
+        if !definer_expanded
+            .text
+            .starts_with("CREATE DEFINER=`root`@`%` PROCEDURE p2")
+        {
+            failures.push(format!(
+                "{db:?} second explicit-delimited definer procedure did not recover current CREATE: expanded_start={} expanded=`{}`",
+                definer_expanded.statement_start,
+                definer_expanded.text.replace('\n', "\\n")
+            ));
+        }
+
+        for (label, sql, expected) in cases {
+            let mut data = IntellisenseData::new();
+            data.tables = vec!["run_audit".into()];
+            data.set_columns_for_table(
+                "run_audit",
+                vec!["run_id".into(), "event_type".into(), "created_at".into()],
+            );
+            data.rebuild_indices();
+
+            let suggestions = if label == "event" {
+                query_completion_suggestions_with_data(sql, db, true, &mut data)
+            } else {
+                query_completion_suggestions_with_locals(sql, db)
+            };
+            if !suggestions
+                .iter()
+                .any(|suggestion| suggestion.eq_ignore_ascii_case(expected))
+            {
+                let (cursor, sql_without_cursor) = if let Some(pos) = sql.find("__CODEX_CURSOR__") {
+                    (pos, sql.replacen("__CODEX_CURSOR__", "", 1))
+                } else {
+                    (sql.find('|').expect("cursor"), sql.replace('|', ""))
+                };
+                let (_, expanded) =
+                    SqlEditorWidget::build_routine_symbol_cache_bundle_for_test_for_db_type(
+                        &sql_without_cursor,
+                        cursor,
+                        Some(db),
+                    );
+                failures.push(format!(
+                    "{db:?} `{expected}` missing in second explicit-delimited {label}: {suggestions:?}; expanded_start={} expanded=`{}`",
+                    expanded.statement_start,
+                    expanded.text.replace('\n', "\\n")
+                ));
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "MySQL-family second explicit-delimited routine completion gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn oracle_full_script_create_table_constraints_survive_leading_noise() {
+    let script = r#"PROMPT setup
+
+/*
+  block comment torture:
+  ; ; ;
+  CREATE OR REPLACE PROCEDURE fake_proc IS BEGIN NULL; END;
+*/
+
+CREATE TABLE dept (
+    dept_id NUMBER NOT NULL,
+    parent_dept_id NUMBER NULL,
+    dept_code VARCHAR2(20) NOT NULL,
+    dept_name VARCHAR2(100) NOT NULL,
+    sort_no NUMBER NOT NULL,
+    PRIMARY KEY (dept_id),
+    UNIQUE (dept_code),
+    CONSTRAINT fk_dept_parent
+        FOREIGN KEY (parent_dept_id) REFERENCES dept (dept_id),
+    CONSTRAINT chk_dept_self
+        CHECK (parent_dept_id IS NULL OR parent_dept_id <> dept_id)
+);"#;
+    let cases = [
+        ("PRIMARY KEY", "PR", "PRIMARY"),
+        ("UNIQUE (dept_code)", "UN", "UNIQUE"),
+        ("CONSTRAINT fk_dept_parent", "CO", "CONSTRAINT"),
+        ("FOREIGN KEY", "FO", "FOREIGN"),
+        ("CHECK (parent_dept_id", "CH", "CHECK"),
+    ];
+    let mut failures = Vec::new();
+
+    for (needle, prefix, expected) in cases {
+        let marked = script.replacen(needle, &format!("{prefix}|"), 1);
+        assert_ne!(marked, script, "test setup should replace `{needle}`");
+        let mut data = IntellisenseData::new();
+        let suggestions = query_completion_suggestions_with_data(
+            &marked,
+            crate::db::DatabaseType::Oracle,
+            true,
+            &mut data,
+        );
+        if !mysql_family_completion_has_keyword_or_function(&suggestions, expected) {
+            failures.push(format!(
+                "`{expected}` missing for `{needle}` with prefix `{prefix}`: {suggestions:?}"
+            ));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "Oracle full-script CREATE TABLE completion gaps after leading noise:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn mysql_family_test_scripts_actual_builtin_function_calls_are_suggested() {
+    let mut failures = Vec::new();
+    let mut tested = 0usize;
+
+    for (label, db, script) in mysql_family_intellisense_scripts() {
+        let catalog = mysql_family_catalog_from_script(script);
+        let token_spans = super::query_text::tokenize_sql_spanned_with_mysql_compat(script, true);
+        for (idx, span) in token_spans.iter().enumerate() {
+            if mysql_family_byte_is_inside_single_quoted_literal(script, span.start) {
+                continue;
+            }
+            let Some(word) = token_word_text(Some(&span.token)) else {
+                continue;
+            };
+            let expected = word.trim_matches('`').to_ascii_uppercase();
+            if expected.chars().count() <= 2
+                || !crate::ui::intellisense::MYSQL_FUNCTIONS_SET.contains(expected.as_str())
+            {
+                continue;
+            }
+            if !matches!(
+                token_spans.get(idx + 1).map(|span| &span.token),
+                Some(SqlToken::Symbol(symbol)) if symbol == "("
+            ) {
+                continue;
+            }
+            if matches!(mysql_family_previous_meaningful_symbol(&token_spans, idx), Some(".")) {
+                continue;
+            }
+
+            let prefix = mysql_family_two_char_prefix(&expected);
+            let prefixed_sql = mysql_family_script_with_token_prefix_cursor(script, span, &prefix);
+            let (_statement, _cursor, prefixed_ctx) =
+                analyze_full_script_marker_for_db(&prefixed_sql, Some(db));
+            if SqlEditorWidget::data_type_position_for_context_for_db(
+                &prefixed_ctx,
+                true,
+                Some(db),
+            )
+            .is_some()
+            {
+                continue;
+            }
+            let suggestions = mysql_family_script_slot_suggestions(
+                script,
+                span,
+                &prefix,
+                db,
+                &catalog,
+                MysqlFamilyScriptSlotQuery::Full,
+            );
+            tested += 1;
+            if !mysql_family_completion_has_keyword_or_function(&suggestions, &expected) {
+                failures.push(format!(
+                    "{label} builtin function `{expected}` missing at `{prefix}` prefix byte {}: {suggestions:?}",
+                    span.start
+                ));
+            }
+        }
+    }
+
+    assert!(
+        tested > 100,
+        "MySQL/MariaDB builtin-function call audit should cover many real calls, only tested {tested}"
+    );
+    assert!(
+        failures.is_empty(),
+        "MySQL/MariaDB builtin-function completion gaps (calls={tested}):\n{}",
+        failures.join("\n")
+    );
+}
+
+fn mysql_family_previous_word_upper(
+    token_spans: &[crate::ui::sql_editor::SqlTokenSpan],
+    idx: usize,
+    ordinal: usize,
+) -> Option<String> {
+    token_spans
+        .iter()
+        .take(idx)
+        .rev()
+        .filter_map(|span| token_word_text(Some(&span.token)))
+        .nth(ordinal)
+        .map(|word| word.to_ascii_uppercase())
+}
+
+fn mysql_family_next_word_upper(
+    token_spans: &[crate::ui::sql_editor::SqlTokenSpan],
+    idx: usize,
+) -> Option<String> {
+    token_spans
+        .iter()
+        .skip(idx + 1)
+        .filter_map(|span| token_word_text(Some(&span.token)))
+        .next()
+        .map(|word| word.to_ascii_uppercase())
+}
+
+fn mysql_family_next_meaningful_symbol(
+    token_spans: &[crate::ui::sql_editor::SqlTokenSpan],
+    idx: usize,
+) -> Option<&str> {
+    token_spans.iter().skip(idx + 1).find_map(|span| match &span.token {
+        SqlToken::Symbol(symbol) => Some(symbol.as_str()),
+        SqlToken::Comment(_) => None,
+        _ => None,
+    })
+}
+
+fn mysql_family_previous_meaningful_symbol(
+    token_spans: &[crate::ui::sql_editor::SqlTokenSpan],
+    idx: usize,
+) -> Option<&str> {
+    for span in token_spans.iter().take(idx).rev() {
+        match &span.token {
+            SqlToken::Symbol(symbol) => return Some(symbol.as_str()),
+            SqlToken::Comment(_) => {}
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn mysql_family_at_symbol_follows_account_name(
+    token_spans: &[crate::ui::sql_editor::SqlTokenSpan],
+    at_idx: usize,
+) -> bool {
+    let previous = token_spans
+        .get(..at_idx)
+        .unwrap_or(&[])
+        .iter()
+        .rev()
+        .find(|span| !matches!(span.token, SqlToken::Comment(_)))
+        .map(|span| &span.token);
+
+    matches!(previous, Some(SqlToken::Word(word)) if !word.eq_ignore_ascii_case("SET"))
+        || matches!(previous, Some(SqlToken::String(_)))
+        || matches!(previous, Some(SqlToken::Symbol(symbol)) if symbol == "@")
+}
+
+fn mysql_family_declaration_type_word(word: &str) -> bool {
+    matches!(
+        word.to_ascii_uppercase().as_str(),
+        "TINYINT"
+            | "SMALLINT"
+            | "MEDIUMINT"
+            | "INT"
+            | "INTEGER"
+            | "BIGINT"
+            | "DECIMAL"
+            | "NUMERIC"
+            | "FLOAT"
+            | "DOUBLE"
+            | "REAL"
+            | "BIT"
+            | "BOOL"
+            | "BOOLEAN"
+            | "DATE"
+            | "DATETIME"
+            | "TIMESTAMP"
+            | "TIME"
+            | "YEAR"
+            | "CHAR"
+            | "VARCHAR"
+            | "BINARY"
+            | "VARBINARY"
+            | "TINYBLOB"
+            | "BLOB"
+            | "MEDIUMBLOB"
+            | "LONGBLOB"
+            | "TINYTEXT"
+            | "TEXT"
+            | "MEDIUMTEXT"
+            | "LONGTEXT"
+            | "ENUM"
+            | "SET"
+            | "JSON"
+            | "GEOMETRY"
+            | "POINT"
+            | "LINESTRING"
+            | "POLYGON"
+    )
+}
+
+fn mysql_family_parameter_name_in_tokens(
+    token_spans: &[crate::ui::sql_editor::SqlTokenSpan],
+    start: usize,
+    end: usize,
+) -> Option<(String, usize)> {
+    token_spans
+        .iter()
+        .take(end)
+        .skip(start)
+        .filter_map(|span| token_word_text(Some(&span.token)).map(|word| (word, span.end)))
+        .find(|(word, _)| {
+            !matches!(
+                word.to_ascii_uppercase().as_str(),
+                "IN" | "OUT" | "INOUT" | "NOCOPY"
+            )
+        })
+        .map(|(word, end)| (word.trim_matches('`').to_ascii_uppercase(), end))
+}
+
+fn mysql_family_declared_local_symbols(
+    token_spans: &[crate::ui::sql_editor::SqlTokenSpan],
+) -> HashMap<String, usize> {
+    let tokens: Vec<SqlToken> = token_spans.iter().map(|span| span.token.clone()).collect();
+    let mut symbols = HashMap::new();
+
+    for (idx, span) in token_spans.iter().enumerate() {
+        let Some(word) = token_word_text(Some(&span.token)) else {
+            continue;
+        };
+        let upper = word.to_ascii_uppercase();
+
+        if matches!(upper.as_str(), "PROCEDURE" | "FUNCTION")
+            && mysql_family_token_is_create_routine_declaration(token_spans, idx)
+        {
+            let Some(open_idx) = mysql_family_routine_parameter_open_paren(token_spans, idx) else {
+                continue;
+            };
+            let Some(close_idx) = matching_paren_index(&tokens, open_idx) else {
+                continue;
+            };
+            let mut item_start = open_idx + 1;
+            let mut depth = 0usize;
+            for item_end in open_idx + 1..=close_idx {
+                match token_spans.get(item_end).map(|span| &span.token) {
+                    Some(SqlToken::Symbol(symbol)) if symbol == "(" => {
+                        depth = depth.saturating_add(1)
+                    }
+                    Some(SqlToken::Symbol(symbol)) if symbol == ")" && item_end != close_idx => {
+                        depth = depth.saturating_sub(1)
+                    }
+                    Some(SqlToken::Symbol(symbol)) if symbol == "," && depth == 0 => {
+                        if let Some((name, name_end)) =
+                            mysql_family_parameter_name_in_tokens(token_spans, item_start, item_end)
+                        {
+                            symbols.entry(name).or_insert(name_end);
+                        }
+                        item_start = item_end + 1;
+                    }
+                    Some(SqlToken::Symbol(symbol)) if symbol == ")" && item_end == close_idx => {
+                        if let Some((name, name_end)) =
+                            mysql_family_parameter_name_in_tokens(token_spans, item_start, item_end)
+                        {
+                            symbols.entry(name).or_insert(name_end);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        } else if upper == "DECLARE" {
+            let next_upper = mysql_family_next_word_upper(token_spans, idx);
+            if matches!(
+                next_upper.as_deref(),
+                Some("CONTINUE" | "EXIT" | "UNDO" | "HANDLER" | "CONDITION" | "CURSOR")
+            ) {
+                continue;
+            }
+            let mut pending_names = Vec::new();
+            for name_idx in idx + 1..token_spans.len() {
+                match &token_spans[name_idx].token {
+                    SqlToken::Symbol(symbol) if symbol == "," => continue,
+                    SqlToken::Symbol(symbol) if symbol == ";" => break,
+                    SqlToken::Word(name) => {
+                        let clean = name.trim_matches('`');
+                        if matches!(
+                            clean.to_ascii_uppercase().as_str(),
+                            "CONDITION" | "CURSOR"
+                        ) {
+                            pending_names.clear();
+                            break;
+                        }
+                        if mysql_family_declaration_type_word(clean) {
+                            for (name, end) in pending_names {
+                                symbols.entry(name).or_insert(end);
+                            }
+                            break;
+                        }
+                        pending_names.push((clean.to_ascii_uppercase(), token_spans[name_idx].end));
+                    }
+                    _ => break,
+                }
+            }
+        }
+    }
+
+    symbols
+}
+
+fn mysql_family_routine_parameter_open_paren(
+    token_spans: &[crate::ui::sql_editor::SqlTokenSpan],
+    routine_keyword_idx: usize,
+) -> Option<usize> {
+    let mut idx = routine_keyword_idx + 1;
+    if !matches!(token_spans.get(idx).map(|span| &span.token), Some(SqlToken::Word(_))) {
+        return None;
+    }
+    idx += 1;
+    while matches!(token_spans.get(idx).map(|span| &span.token), Some(SqlToken::Symbol(symbol)) if symbol == ".")
+        && matches!(
+            token_spans.get(idx + 1).map(|span| &span.token),
+            Some(SqlToken::Word(_))
+        )
+    {
+        idx += 2;
+    }
+    matches!(token_spans.get(idx).map(|span| &span.token), Some(SqlToken::Symbol(symbol)) if symbol == "(")
+        .then_some(idx)
+}
+
+fn mysql_family_token_is_create_routine_declaration(
+    token_spans: &[crate::ui::sql_editor::SqlTokenSpan],
+    idx: usize,
+) -> bool {
+    let statement_start = token_spans
+        .iter()
+        .take(idx)
+        .rposition(|span| matches!(&span.token, SqlToken::Symbol(symbol) if symbol == ";"))
+        .map_or(0, |pos| pos + 1);
+    token_spans
+        .iter()
+        .take(idx)
+        .skip(statement_start)
+        .filter_map(|span| token_word_text(Some(&span.token)))
+        .next()
+        .is_some_and(|word| word.eq_ignore_ascii_case("CREATE"))
+}
+
+fn mysql_family_script_with_token_prefix_cursor(
+    script: &str,
+    span: &crate::ui::sql_editor::SqlTokenSpan,
+    prefix: &str,
+) -> String {
+    let mut edited = String::new();
+    edited.push_str(&script[..span.start]);
+    edited.push_str(prefix);
+    edited.push_str("__CODEX_CURSOR__");
+    edited.push_str(&script[span.end..]);
+    edited
+}
+
+fn mysql_family_script_with_cursor_at(script: &str, byte: usize) -> String {
+    let mut edited = String::new();
+    edited.push_str(&script[..byte]);
+    edited.push_str("__CODEX_CURSOR__");
+    edited.push_str(&script[byte..]);
+    edited
+}
+
+#[derive(Clone, Copy)]
+enum MysqlFamilyScriptSlotQuery {
+    Context,
+    Full,
+}
+
+#[derive(Clone, Copy)]
+enum MysqlFamilyScriptSlotExpected {
+    Keyword,
+    Object,
+    Identifier,
+}
+
+fn mysql_family_two_char_prefix(value: &str) -> String {
+    value.trim_matches('`').chars().take(2).collect()
+}
+
+fn mysql_family_script_slot_suggestions(
+    script: &str,
+    span: &crate::ui::sql_editor::SqlTokenSpan,
+    prefix: &str,
+    db: crate::db::DatabaseType,
+    catalog: &MysqlFamilyScriptCatalog,
+    query: MysqlFamilyScriptSlotQuery,
+) -> Vec<String> {
+    let sql = mysql_family_script_with_token_prefix_cursor(script, span, prefix);
+    let mut data = intellisense_data_from_mysql_family_catalog(catalog);
+    match query {
+        MysqlFamilyScriptSlotQuery::Context => {
+            let (statement, cursor, deep_ctx) = analyze_full_script_marker_for_db(&sql, Some(db));
+            query_completion_suggestions_from_context_with_data(
+                &statement, cursor, &deep_ctx, db, &mut data,
+            )
+        }
+        MysqlFamilyScriptSlotQuery::Full => {
+            query_completion_suggestions_with_data(&sql, db, true, &mut data)
+        }
+    }
+}
+
+fn mysql_family_script_slot_expected_keywords(
+    script: &str,
+    span: &crate::ui::sql_editor::SqlTokenSpan,
+    prefix: &str,
+    db: crate::db::DatabaseType,
+    catalog: &MysqlFamilyScriptCatalog,
+) -> Vec<String> {
+    let sql = mysql_family_script_with_token_prefix_cursor(script, span, prefix);
+    let mut data = intellisense_data_from_mysql_family_catalog(catalog);
+    let (statement, cursor, deep_ctx) = analyze_full_script_marker_for_db(&sql, Some(db));
+    let (actual_prefix, word_start, _) =
+        crate::ui::intellisense::get_word_at_cursor(&statement, cursor);
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&statement, word_start);
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context_for_db(
+        qualifier.as_deref(),
+        &deep_ctx,
+        Some(db),
+    );
+    let data_for_virtual = Arc::new(Mutex::new(data.clone()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data_for_virtual, &sender, &connection);
+    data.replace_virtual_table_columns(virtual_table_columns);
+    let expr_kw = SqlEditorWidget::expression_keyword_context(
+        &deep_ctx,
+        &data,
+        &column_tables,
+        !actual_prefix.is_empty(),
+        Some(db),
+    );
+    SqlEditorWidget::collect_expected_keyword_suggestions_with_expression_context(
+        &actual_prefix,
+        &deep_ctx,
+        Some(db),
+        Some(expr_kw),
+    )
+}
+
+fn mysql_family_required_script_keyword_slot(
+    token_spans: &[crate::ui::sql_editor::SqlTokenSpan],
+    idx: usize,
+    expected: &str,
+) -> bool {
+    const CREATE_OBJECT_TYPES: &[&str] = &[
+        "DATABASE",
+        "EVENT",
+        "FUNCTION",
+        "INDEX",
+        "PROCEDURE",
+        "ROLE",
+        "SCHEMA",
+        "TABLE",
+        "TRIGGER",
+        "USER",
+        "VIEW",
+    ];
+    let prev = mysql_family_previous_word_upper(token_spans, idx, 0);
+    let prev2 = mysql_family_previous_word_upper(token_spans, idx, 1);
+    let prev3 = mysql_family_previous_word_upper(token_spans, idx, 2);
+
+    CREATE_OBJECT_TYPES.contains(&expected)
+        && (matches!(prev.as_deref(), Some("CREATE"))
+            || matches!(
+                (prev3.as_deref(), prev2.as_deref(), prev.as_deref()),
+                (Some("CREATE"), Some("OR"), Some("REPLACE"))
+            ))
+}
+
+fn mysql_family_script_slot_has_expected(
+    suggestions: &[String],
+    expected: &str,
+    expected_kind: MysqlFamilyScriptSlotExpected,
+) -> bool {
+    match expected_kind {
+        MysqlFamilyScriptSlotExpected::Keyword => {
+            mysql_family_completion_has_keyword_or_function(suggestions, expected)
+        }
+        MysqlFamilyScriptSlotExpected::Object => suggestions.iter().any(|value| {
+            value.eq_ignore_ascii_case(expected)
+                || value
+                    .strip_suffix("()")
+                    .is_some_and(|name| name.eq_ignore_ascii_case(expected))
+        }),
+        MysqlFamilyScriptSlotExpected::Identifier => suggestions
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(expected)),
+    }
+}
+
+fn oracle_script_slot_expected_keywords(
+    script: &str,
+    span: &crate::ui::sql_editor::SqlTokenSpan,
+    prefix: &str,
+) -> Vec<String> {
+    let sql = mysql_family_script_with_token_prefix_cursor(script, span, prefix);
+    let mut data = IntellisenseData::new();
+    let (statement, cursor, deep_ctx) =
+        analyze_full_script_marker_for_db(&sql, Some(crate::db::DatabaseType::Oracle));
+    let (actual_prefix, word_start, _) =
+        crate::ui::intellisense::get_word_at_cursor(&statement, cursor);
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&statement, word_start);
+    let column_tables = SqlEditorWidget::resolve_column_tables_for_context_for_db(
+        qualifier.as_deref(),
+        &deep_ctx,
+        Some(crate::db::DatabaseType::Oracle),
+    );
+    let data_for_virtual = Arc::new(Mutex::new(data.clone()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data_for_virtual, &sender, &connection);
+    data.replace_virtual_table_columns(virtual_table_columns);
+    let expr_kw = SqlEditorWidget::expression_keyword_context(
+        &deep_ctx,
+        &data,
+        &column_tables,
+        !actual_prefix.is_empty(),
+        Some(crate::db::DatabaseType::Oracle),
+    );
+    SqlEditorWidget::collect_expected_keyword_suggestions_with_expression_context(
+        &actual_prefix,
+        &deep_ctx,
+        Some(crate::db::DatabaseType::Oracle),
+        Some(expr_kw),
+    )
+}
+
+fn oracle_script_slot_suggestions(
+    script: &str,
+    span: &crate::ui::sql_editor::SqlTokenSpan,
+    prefix: &str,
+) -> Vec<String> {
+    let sql = mysql_family_script_with_token_prefix_cursor(script, span, prefix);
+    let mut data = IntellisenseData::new();
+    let (statement, cursor, deep_ctx) =
+        analyze_full_script_marker_for_db(&sql, Some(crate::db::DatabaseType::Oracle));
+    query_completion_suggestions_from_context_with_data(
+        &statement,
+        cursor,
+        &deep_ctx,
+        crate::db::DatabaseType::Oracle,
+        &mut data,
+    )
+}
+
+fn oracle_script_slot_suggestions_with_catalog(
+    script: &str,
+    span: &crate::ui::sql_editor::SqlTokenSpan,
+    prefix: &str,
+    catalog: &MysqlFamilyScriptCatalog,
+    query: MysqlFamilyScriptSlotQuery,
+) -> Vec<String> {
+    let sql = mysql_family_script_with_token_prefix_cursor(script, span, prefix);
+    let mut data = intellisense_data_from_mysql_family_catalog(catalog);
+    match query {
+        MysqlFamilyScriptSlotQuery::Context => {
+            let (statement, cursor, deep_ctx) =
+                analyze_full_script_marker_for_db(&sql, Some(crate::db::DatabaseType::Oracle));
+            query_completion_suggestions_from_context_with_data(
+                &statement,
+                cursor,
+                &deep_ctx,
+                crate::db::DatabaseType::Oracle,
+                &mut data,
+            )
+        }
+        MysqlFamilyScriptSlotQuery::Full => query_completion_suggestions_with_data(
+            &sql,
+            crate::db::DatabaseType::Oracle,
+            true,
+            &mut data,
+        ),
+    }
+}
+
+fn oracle_required_script_keyword_slot(
+    token_spans: &[crate::ui::sql_editor::SqlTokenSpan],
+    idx: usize,
+    expected: &str,
+) -> bool {
+    const CREATE_OBJECT_TYPES: &[&str] = &[
+        "PACKAGE",
+        "PROCEDURE",
+        "FUNCTION",
+        "TRIGGER",
+        "TYPE",
+        "TABLE",
+        "VIEW",
+        "SEQUENCE",
+        "SYNONYM",
+        "INDEX",
+    ];
+    let prev = mysql_family_previous_word_upper(token_spans, idx, 0);
+    let prev2 = mysql_family_previous_word_upper(token_spans, idx, 1);
+    let prev3 = mysql_family_previous_word_upper(token_spans, idx, 2);
+
+    CREATE_OBJECT_TYPES.contains(&expected)
+        && (matches!(prev.as_deref(), Some("CREATE"))
+            || matches!(
+                (prev3.as_deref(), prev2.as_deref(), prev.as_deref()),
+                (Some("CREATE"), Some("OR"), Some("REPLACE"))
+            ))
+}
+
+fn oracle_byte_is_inside_non_sqlplus_text_line(script: &str, byte: usize) -> bool {
+    let line_start = script[..byte].rfind('\n').map_or(0, |idx| idx + 1);
+    let line_end = script[byte..]
+        .find('\n')
+        .map_or(script.len(), |idx| byte + idx);
+    let trimmed = script[line_start..line_end].trim_start();
+    let upper = trimmed.to_ascii_uppercase();
+    upper.starts_with("PROMPT")
+        || upper.starts_with("REM ")
+        || upper == "REM"
+        || upper.starts_with("REMARK")
+}
+
+fn oracle_actual_local_reference_slot(
+    token_spans: &[crate::ui::sql_editor::SqlTokenSpan],
+    idx: usize,
+    word: &str,
+) -> bool {
+    let clean = word.trim_matches('"');
+    let clean_upper = clean.to_ascii_uppercase();
+    if clean.chars().count() <= 2
+        || !matches!(
+            clean_upper.get(..2),
+            Some("P_" | "V_" | "L_" | "G_" | "C_" | "R_")
+        )
+    {
+        return false;
+    }
+
+    let prev = mysql_family_previous_word_upper(token_spans, idx, 0);
+    let prev2 = mysql_family_previous_word_upper(token_spans, idx, 1);
+    let next = mysql_family_next_word_upper(token_spans, idx);
+    let prev_symbol = mysql_family_previous_meaningful_symbol(token_spans, idx);
+    let next_symbol = mysql_family_next_meaningful_symbol(token_spans, idx);
+
+    if matches!(prev_symbol, Some("." | ":")) || matches!(prev.as_deref(), Some("PRINT")) {
+        return false;
+    }
+    if matches!(
+        prev.as_deref(),
+        Some(
+            "DECLARE"
+                | "PROCEDURE"
+                | "FUNCTION"
+                | "CURSOR"
+                | "TYPE"
+                | "SUBTYPE"
+                | "IN"
+                | "OUT"
+                | "INOUT"
+                | "NOCOPY"
+                | "EXCEPTION"
+                | "END"
+        )
+    ) {
+        return false;
+    }
+    if matches!(prev2.as_deref(), Some("PROCEDURE" | "FUNCTION"))
+        || mysql_family_token_is_in_routine_parameter_list(token_spans, idx)
+    {
+        return false;
+    }
+    if matches!(next_symbol, Some("(" | "." | "=")) {
+        return false;
+    }
+    if next.as_deref().is_some_and(|word| {
+        !matches!(
+            word,
+            "AND"
+                | "OR"
+                | "THEN"
+                | "LOOP"
+                | "IS"
+                | "IN"
+                | "NOT"
+                | "LIKE"
+                | "BETWEEN"
+                | "FROM"
+                | "WHERE"
+                | "GROUP"
+                | "ORDER"
+                | "HAVING"
+                | "END"
+                | "ELSE"
+                | "WHEN"
+                | "SAVE"
+                | "EXCEPTIONS"
+                | "RETURNING"
+                | "INTO"
+                | "USING"
+                | "ON"
+                | "CONNECT"
+                | "START"
+                | "JOIN"
+        )
+    }) {
+        return false;
+    }
+    if matches!(
+        next.as_deref(),
+        Some(
+            "NUMBER"
+                | "VARCHAR2"
+                | "VARCHAR"
+                | "CHAR"
+                | "DATE"
+                | "TIMESTAMP"
+                | "BOOLEAN"
+                | "CLOB"
+                | "BLOB"
+                | "SYS_REFCURSOR"
+                | "REF"
+                | "EXCEPTION"
+                | "CONSTANT"
+        )
+    ) {
+        return false;
+    }
+
+    true
+}
+
+#[test]
+fn oracle_full_script_prefixed_create_object_slot_preserves_prefix() {
+    let script = load_intellisense_test_file("test2.txt");
+    let marked = script.replacen("CREATE OR REPLACE PACKAGE", "CREATE OR REPLACE PA__CODEX_CURSOR__", 1);
+    assert_ne!(marked, script, "expected CREATE PACKAGE in test2.txt");
+    let (statement, cursor, deep_ctx) =
+        analyze_full_script_marker_for_db(&marked, Some(crate::db::DatabaseType::Oracle));
+    let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&statement, cursor);
+    assert_eq!(
+        prefix, "PA",
+        "full-script Oracle CREATE object prefix was not preserved; cursor={cursor}, statement=`{}`",
+        statement.replace('\n', "\\n")
+    );
+
+    let suggestions = SqlEditorWidget::collect_expected_keyword_suggestions_with_expression_context(
+        &prefix,
+        &deep_ctx,
+        Some(crate::db::DatabaseType::Oracle),
+        None,
+    );
+    assert!(
+        mysql_family_completion_has_keyword_or_function(&suggestions, "PACKAGE"),
+        "PACKAGE missing at full-script CREATE OR REPLACE PA|: {suggestions:?}; statement=`{}`",
+        statement.replace('\n', "\\n")
+    );
+}
+
+#[test]
+fn oracle_test_all_scripts_actual_local_references_are_suggested() {
+    let mut failures = Vec::new();
+    let mut tested = 0usize;
+
+    for (label, script) in oracle_test_all_intellisense_scripts() {
+        let token_spans = super::query_text::tokenize_sql_spanned(script);
+
+        for (idx, span) in token_spans.iter().enumerate() {
+            if mysql_family_byte_is_inside_single_quoted_literal(script, span.start)
+                || oracle_byte_is_inside_non_sqlplus_text_line(script, span.start)
+            {
+                continue;
+            }
+            let Some(word) = token_word_text(Some(&span.token)) else {
+                continue;
+            };
+            let before_token = script[..span.start].trim_end();
+            if before_token.ends_with('.') || before_token.ends_with(':') {
+                continue;
+            }
+            if !oracle_actual_local_reference_slot(&token_spans, idx, word) {
+                continue;
+            }
+
+            let prefix = mysql_family_two_char_prefix(word);
+            let sql = mysql_family_script_with_token_prefix_cursor(script, span, &prefix);
+            let (statement, cursor, _) =
+                analyze_full_script_marker_for_db(&sql, Some(crate::db::DatabaseType::Oracle));
+            let mut statement_with_cursor = statement;
+            statement_with_cursor.insert_str(cursor, "__CODEX_CURSOR__");
+            let mut data = IntellisenseData::new();
+            let suggestions = query_completion_suggestions_with_data(
+                &statement_with_cursor,
+                crate::db::DatabaseType::Oracle,
+                true,
+                &mut data,
+            );
+            let suggestions = if mysql_family_script_slot_has_expected(
+                &suggestions,
+                word,
+                MysqlFamilyScriptSlotExpected::Identifier,
+            ) {
+                suggestions
+            } else {
+                let mut full_data = IntellisenseData::new();
+                query_completion_suggestions_with_data(
+                    &sql,
+                    crate::db::DatabaseType::Oracle,
+                    true,
+                    &mut full_data,
+                )
+            };
+            tested += 1;
+            if !mysql_family_script_slot_has_expected(
+                &suggestions,
+                word,
+                MysqlFamilyScriptSlotExpected::Identifier,
+            ) {
+                failures.push(format!(
+                    "{label} local `{word}` missing at `{prefix}` prefix byte {}: {suggestions:?}",
+                    span.start
+                ));
+            }
+        }
+    }
+
+    assert!(
+        tested > 100,
+        "Oracle test_all local-reference sweep should cover many real local references, only tested {tested}"
+    );
+    assert!(
+        failures.is_empty(),
+        "Oracle test_all local-reference completion gaps (refs={tested}):\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn oracle_test_all_scripts_keyword_slots_complete_with_two_letter_prefixes() {
+    let mut failures = Vec::new();
+    let mut tested_prefix = 0usize;
+    let mut tested_required_prefix = 0usize;
+
+    for (label, script) in oracle_test_all_intellisense_scripts() {
+        let token_spans = super::query_text::tokenize_sql_spanned(script);
+
+        for (idx, span) in token_spans.iter().enumerate() {
+            if mysql_family_byte_is_inside_single_quoted_literal(script, span.start) {
+                continue;
+            }
+            if oracle_byte_is_inside_non_sqlplus_text_line(script, span.start) {
+                continue;
+            }
+            let SqlToken::Word(word) = &span.token else {
+                continue;
+            };
+            let expected = word.trim_matches('"').to_ascii_uppercase();
+            if expected.len() < 3 || !crate::sql_text::is_oracle_sql_keyword(&expected) {
+                continue;
+            }
+
+            let prefix: String = expected.chars().take(2).collect();
+            let required_slot =
+                oracle_required_script_keyword_slot(&token_spans, idx, &expected);
+            if required_slot {
+                tested_required_prefix += 1;
+            }
+            let prefixed_keywords = oracle_script_slot_expected_keywords(script, span, &prefix);
+            if !mysql_family_completion_has_keyword_or_function(&prefixed_keywords, &expected) {
+                if required_slot {
+                    failures.push(format!(
+                        "{label} required keyword `{expected}` was not classified as an expected keyword at `{prefix}` prefix byte {}: keywords={prefixed_keywords:?}",
+                        span.start
+                    ));
+                }
+                continue;
+            }
+
+            let prefixed_suggestions = oracle_script_slot_suggestions(script, span, &prefix);
+            tested_prefix += 1;
+            if !mysql_family_script_slot_has_expected(
+                &prefixed_suggestions,
+                &expected,
+                MysqlFamilyScriptSlotExpected::Keyword,
+            ) {
+                failures.push(format!(
+                    "{label} keyword `{expected}` missing from final suggestions at `{prefix}` prefix byte {}: keywords={prefixed_keywords:?} final={prefixed_suggestions:?}",
+                    span.start
+                ));
+            }
+        }
+    }
+
+    assert!(
+        tested_prefix > 200,
+        "Oracle test_all keyword two-letter prefix sweep should cover many real keyword slots, only tested {tested_prefix}"
+    );
+    assert!(
+        tested_required_prefix > 20,
+        "Oracle required-keyword sweep should cover actual CREATE object slots, only tested {tested_required_prefix}"
+    );
+    assert!(
+        failures.is_empty(),
+        "Oracle test_all keyword-slot completion gaps (prefix={tested_prefix}, required={tested_required_prefix}):\n{}",
+        failures.join("\n")
+    );
+}
+
+fn oracle_builtin_function_name(word: &str) -> bool {
+    let upper = word.trim_matches('"').to_ascii_uppercase();
+    crate::ui::intellisense::ORACLE_FUNCTIONS
+        .binary_search(&upper.as_str())
+        .is_ok()
+}
+
+#[test]
+fn oracle_test_all_scripts_actual_builtin_function_calls_are_suggested() {
+    let catalog = oracle_catalog_from_test_all_scripts();
+    let mut failures = Vec::new();
+    let mut tested = 0usize;
+
+    for (label, script) in oracle_test_all_intellisense_scripts() {
+        let token_spans = super::query_text::tokenize_sql_spanned(script);
+
+        for (idx, span) in token_spans.iter().enumerate() {
+            if mysql_family_byte_is_inside_single_quoted_literal(script, span.start)
+                || oracle_byte_is_inside_non_sqlplus_text_line(script, span.start)
+            {
+                continue;
+            }
+            let Some(word) = token_word_text(Some(&span.token)) else {
+                continue;
+            };
+            let expected = word.trim_matches('"').to_ascii_uppercase();
+            if expected.chars().count() <= 2 || !oracle_builtin_function_name(&expected) {
+                continue;
+            }
+            if !matches!(
+                token_spans.get(idx + 1).map(|span| &span.token),
+                Some(SqlToken::Symbol(symbol)) if symbol == "("
+            ) {
+                continue;
+            }
+            if matches!(mysql_family_previous_meaningful_symbol(&token_spans, idx), Some(".")) {
+                continue;
+            }
+
+            let prefix = mysql_family_two_char_prefix(&expected);
+            let suggestions = oracle_script_slot_suggestions_with_catalog(
+                script,
+                span,
+                &prefix,
+                &catalog,
+                MysqlFamilyScriptSlotQuery::Full,
+            );
+            tested += 1;
+            if !mysql_family_completion_has_keyword_or_function(&suggestions, &expected) {
+                failures.push(format!(
+                    "{label} builtin function `{expected}` missing at `{prefix}` prefix byte {}: {suggestions:?}",
+                    span.start
+                ));
+            }
+        }
+    }
+
+    assert!(
+        tested > 100,
+        "Oracle test_all builtin-function call audit should cover many real calls, only tested {tested}"
+    );
+    assert!(
+        failures.is_empty(),
+        "Oracle test_all builtin-function completion gaps (calls={tested}):\n{}",
+        failures.join("\n")
+    );
+}
+
+fn oracle_package_reference_slot(
+    token_spans: &[crate::ui::sql_editor::SqlTokenSpan],
+    idx: usize,
+) -> bool {
+    matches!(mysql_family_next_meaningful_symbol(token_spans, idx), Some("."))
+}
+
+fn oracle_sequence_reference_slot(
+    token_spans: &[crate::ui::sql_editor::SqlTokenSpan],
+    idx: usize,
+) -> bool {
+    matches!(mysql_family_next_meaningful_symbol(token_spans, idx), Some("."))
+        && matches!(
+            mysql_family_next_word_upper(token_spans, idx).as_deref(),
+            Some("NEXTVAL" | "CURRVAL")
+        )
+}
+
+#[test]
+fn oracle_test_all_scripts_actual_object_references_are_suggested() {
+    let catalog = oracle_catalog_from_test_all_scripts();
+    let relation_names: HashSet<String> = catalog
+        .tables
+        .iter()
+        .chain(catalog.views.iter())
+        .chain(catalog.materialized_views.iter())
+        .map(|name| name.to_ascii_uppercase())
+        .collect();
+    let package_names: HashSet<String> = catalog
+        .packages
+        .iter()
+        .map(|name| name.to_ascii_uppercase())
+        .collect();
+    let procedure_names: HashSet<String> = catalog
+        .procedures
+        .iter()
+        .map(|name| name.to_ascii_uppercase())
+        .collect();
+    let function_names: HashSet<String> = catalog
+        .functions
+        .iter()
+        .map(|name| name.to_ascii_uppercase())
+        .collect();
+    let sequence_names: HashSet<String> = catalog
+        .sequences
+        .iter()
+        .map(|name| name.to_ascii_uppercase())
+        .collect();
+    let mut failures = Vec::new();
+    let mut tested = 0usize;
+    let mut tested_prefix = 0usize;
+
+    assert!(
+        !catalog.tables.is_empty() && !catalog.packages.is_empty(),
+        "Oracle test_all catalog should include tables and packages"
+    );
+
+    for (label, script) in oracle_test_all_intellisense_scripts() {
+        let token_spans = super::query_text::tokenize_sql_spanned(script);
+
+        for (idx, span) in token_spans.iter().enumerate() {
+            if mysql_family_byte_is_inside_single_quoted_literal(script, span.start)
+                || oracle_byte_is_inside_non_sqlplus_text_line(script, span.start)
+            {
+                continue;
+            }
+            let Some(word) = token_word_text(Some(&span.token)) else {
+                continue;
+            };
+            let word_upper = word.trim_matches('"').to_ascii_uppercase();
+            let prev = mysql_family_previous_word_upper(&token_spans, idx, 0);
+            let prev2 = mysql_family_previous_word_upper(&token_spans, idx, 1);
+
+            let should_test = if relation_names.contains(&word_upper) {
+                mysql_family_relation_reference_slot(&token_spans, idx)
+            } else if package_names.contains(&word_upper) {
+                oracle_package_reference_slot(&token_spans, idx)
+                    && !matches!(prev.as_deref(), Some("PACKAGE"))
+            } else if sequence_names.contains(&word_upper) {
+                oracle_sequence_reference_slot(&token_spans, idx)
+            } else if procedure_names.contains(&word_upper) {
+                matches!(prev.as_deref(), Some("EXEC" | "EXECUTE" | "CALL"))
+                    || (matches!(mysql_family_next_meaningful_symbol(&token_spans, idx), Some("("))
+                        && !matches!(prev.as_deref(), Some("PROCEDURE"))
+                        && !matches!(prev2.as_deref(), Some("CREATE")))
+            } else if function_names.contains(&word_upper) {
+                matches!(mysql_family_next_meaningful_symbol(&token_spans, idx), Some("("))
+                    && !matches!(prev.as_deref(), Some("FUNCTION"))
+                    && !matches!(prev2.as_deref(), Some("CREATE"))
+            } else {
+                false
+            };
+            if !should_test {
+                continue;
+            }
+
+            let prefix = mysql_family_two_char_prefix(word);
+            let suggestions = oracle_script_slot_suggestions_with_catalog(
+                script,
+                span,
+                &prefix,
+                &catalog,
+                MysqlFamilyScriptSlotQuery::Context,
+            );
+            let suggestions = if mysql_family_script_slot_has_expected(
+                &suggestions,
+                word,
+                MysqlFamilyScriptSlotExpected::Object,
+            ) {
+                suggestions
+            } else {
+                oracle_script_slot_suggestions_with_catalog(
+                    script,
+                    span,
+                    &prefix,
+                    &catalog,
+                    MysqlFamilyScriptSlotQuery::Full,
+                )
+            };
+            tested += 1;
+            tested_prefix += 1;
+            if !mysql_family_script_slot_has_expected(
+                &suggestions,
+                word,
+                MysqlFamilyScriptSlotExpected::Object,
+            ) {
+                failures.push(format!(
+                    "{label} object `{word}` missing at `{prefix}` prefix byte {}: {suggestions:?}",
+                    span.start
+                ));
+            }
+        }
+    }
+
+    assert!(
+        tested > 100,
+        "Oracle test_all object-reference audit should cover many real references, only tested {tested}"
+    );
+    assert!(
+        failures.is_empty(),
+        "Oracle test_all object reference completion gaps (refs={tested}, prefix={tested_prefix}):\n{}",
+        failures.join("\n")
+    );
+}
+
+fn signature_label_contains_argument(
+    label: &crate::ui::intellisense::SignatureLabel,
+    expected: &str,
+) -> bool {
+    label.arg_spans.iter().any(|&(start, end)| {
+        label
+            .text
+            .get(start..end)
+            .and_then(|argument| argument.split_whitespace().next())
+            .is_some_and(|name| name.trim_matches('"').eq_ignore_ascii_case(expected))
+    })
+}
+
+#[test]
+fn oracle_test_all_scripts_actual_named_arguments_are_suggested() {
+    let catalog = oracle_catalog_from_test_all_scripts();
+    let mut failures = Vec::new();
+    let mut tested = 0usize;
+
+    assert!(
+        catalog.signatures.len() > 20,
+        "Oracle test_all signature catalog should include package and routine signatures, got {}",
+        catalog.signatures.len()
+    );
+
+    for (label, script) in oracle_test_all_intellisense_scripts() {
+        let token_spans = super::query_text::tokenize_sql_spanned(script);
+
+        for (idx, span) in token_spans.iter().enumerate() {
+            if mysql_family_byte_is_inside_single_quoted_literal(script, span.start)
+                || oracle_byte_is_inside_non_sqlplus_text_line(script, span.start)
+            {
+                continue;
+            }
+            let Some(word) = token_word_text(Some(&span.token)) else {
+                continue;
+            };
+            let clean = word.trim_matches('"');
+            if clean.chars().count() <= 2 {
+                continue;
+            }
+            if !matches!(
+                token_spans.get(idx + 1).map(|span| &span.token),
+                Some(SqlToken::Symbol(symbol)) if symbol == "=>"
+            ) {
+                continue;
+            }
+
+            let original_sql = mysql_family_script_with_cursor_at(script, span.end);
+            let cursor = original_sql
+                .find("__CODEX_CURSOR__")
+                .expect("cursor marker should exist");
+            let scan_sql = original_sql.replacen("__CODEX_CURSOR__", "", 1);
+            let Some(call) = crate::ui::intellisense::enclosing_call_at_cursor(&scan_sql, cursor)
+            else {
+                failures.push(format!(
+                    "{label} named argument `{clean}` at byte {} is not inside a detected call",
+                    span.start
+                ));
+                continue;
+            };
+            let key = crate::ui::intellisense::signature_key_for_call(&call);
+            let Some(signature) = catalog
+                .signatures
+                .get(&key)
+                .or_else(|| catalog.signatures.get(&call.name.to_ascii_uppercase()))
+            else {
+                failures.push(format!(
+                    "{label} named argument `{clean}` at byte {} has no cached signature for `{key}`",
+                    span.start
+                ));
+                continue;
+            };
+            if !signature_label_contains_argument(signature, clean) {
+                failures.push(format!(
+                    "{label} named argument `{clean}` at byte {} is missing from cached signature `{key}`: {}",
+                    span.start,
+                    signature.text
+                ));
+                continue;
+            }
+
+            let prefix = mysql_family_two_char_prefix(clean);
+            let suggestions = oracle_script_slot_suggestions_with_catalog(
+                script,
+                span,
+                &prefix,
+                &catalog,
+                MysqlFamilyScriptSlotQuery::Full,
+            );
+            tested += 1;
+            if !mysql_family_script_slot_has_expected(
+                &suggestions,
+                clean,
+                MysqlFamilyScriptSlotExpected::Identifier,
+            ) {
+                failures.push(format!(
+                    "{label} named argument `{clean}` missing at `{prefix}` prefix byte {}: key={key} suggestions={suggestions:?}",
+                    span.start,
+                ));
+            }
+        }
+    }
+
+    assert!(
+        tested > 25,
+        "Oracle test_all named-argument audit should cover many real named parameters, only tested {tested}"
+    );
+    assert!(
+        failures.is_empty(),
+        "Oracle test_all named-argument completion gaps (refs={tested}):\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn oracle_test_all_scripts_actual_sqlplus_binds_are_suggested() {
+    let mut failures = Vec::new();
+    let mut tested = 0usize;
+
+    for (label, script) in oracle_test_all_intellisense_scripts() {
+        let token_spans = super::query_text::tokenize_sql_spanned(script);
+        let mut declared_binds = HashSet::new();
+
+        for (idx, span) in token_spans.iter().enumerate() {
+            if mysql_family_byte_is_inside_single_quoted_literal(script, span.start)
+                || oracle_byte_is_inside_non_sqlplus_text_line(script, span.start)
+            {
+                continue;
+            }
+
+            if matches!(
+                token_word_text(Some(&span.token)).map(|word| word.to_ascii_uppercase()),
+                Some(word) if matches!(word.as_str(), "VAR" | "VARIABLE")
+            ) {
+                if let Some(name) = token_spans
+                    .get(idx + 1)
+                    .and_then(|span| token_word_text(Some(&span.token)))
+                {
+                    declared_binds.insert(name.trim_matches('"').to_ascii_uppercase());
+                }
+                continue;
+            }
+
+            let Some(word) = token_word_text(Some(&span.token)) else {
+                continue;
+            };
+            let clean = word.trim_matches('"');
+            if clean.chars().count() <= 2 {
+                continue;
+            }
+            let Some(prev_idx) = idx.checked_sub(1) else {
+                continue;
+            };
+            if !matches!(
+                token_spans.get(prev_idx).map(|span| &span.token),
+                Some(SqlToken::Symbol(symbol)) if symbol == ":"
+            ) {
+                continue;
+            }
+            if !declared_binds.contains(&clean.to_ascii_uppercase()) {
+                continue;
+            }
+
+            let prefix = mysql_family_two_char_prefix(clean);
+            let sql = mysql_family_script_with_token_prefix_cursor(script, span, &prefix);
+            let mut data = IntellisenseData::new();
+            let suggestions = query_completion_suggestions_with_data(
+                &sql,
+                crate::db::DatabaseType::Oracle,
+                true,
+                &mut data,
+            );
+            tested += 1;
+            if !mysql_family_script_slot_has_expected(
+                &suggestions,
+                clean,
+                MysqlFamilyScriptSlotExpected::Identifier,
+            ) {
+                failures.push(format!(
+                    "{label} SQL*Plus bind `{clean}` missing after `:{prefix}` prefix byte {}: {suggestions:?}",
+                    span.start
+                ));
+            }
+        }
+    }
+
+    assert!(
+        tested > 15,
+        "Oracle test_all SQL*Plus bind audit should cover many real bind references, only tested {tested}"
+    );
+    assert!(
+        failures.is_empty(),
+        "Oracle test_all SQL*Plus bind completion gaps (refs={tested}):\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn oracle_plsql_package_and_table_function_object_slots_offer_catalog() {
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["QT_EMP".to_string()];
+    data.functions = vec!["QT_PIPE_EMP".to_string(), "QT_BOSS_PAIRS".to_string()];
+    data.packages = vec!["OQT_DEMO_PKG".to_string(), "QT_TORTURE_PKG".to_string()];
+    data.rebuild_indices();
+    let has = |suggestions: &[String], expected: &str| {
+        suggestions
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(expected))
+    };
+    let cases = [
+        ("BEGIN oq|.proc_in_only('x'); END;", "OQT_DEMO_PKG"),
+        (
+            "SELECT * FROM TABLE(qt_pi|(NULL))",
+            "QT_PIPE_EMP",
+        ),
+        (
+            "SELECT * FROM TABLE(qt_to|.pipe_sales(NULL))",
+            "QT_TORTURE_PKG",
+        ),
+        (
+            "SELECT * FROM TABLE(qt_bo|(10)) p",
+            "QT_BOSS_PAIRS",
+        ),
+    ];
+
+    for (sql, expected) in cases {
+        let mut data = data.clone();
+        let suggestions =
+            query_completion_suggestions_with_data(sql, crate::db::DatabaseType::Oracle, true, &mut data);
+        assert!(
+            has(&suggestions, expected),
+            "{expected} missing at `{sql}`: {suggestions:?}"
+        );
+    }
+}
+
+#[test]
+fn oracle_test_all_scripts_catalog_columns_are_suggested_by_relation() {
+    let catalog = oracle_catalog_from_test_all_scripts();
+    let mut column_names = HashSet::new();
+    for columns in catalog.columns.values() {
+        for column in columns {
+            column_names.insert(column.to_ascii_uppercase());
+        }
+    }
+    let mut failures = Vec::new();
+    let mut tested = 0usize;
+    let mut data = intellisense_data_from_mysql_family_catalog(&catalog);
+
+    assert!(
+        column_names.len() > 50,
+        "Oracle test_all catalog should extract many table/view columns, got {}",
+        column_names.len()
+    );
+
+    for relation in catalog
+        .tables
+        .iter()
+        .chain(catalog.views.iter())
+        .chain(catalog.materialized_views.iter())
+    {
+        let Some(columns) = catalog.columns.get(&relation.to_ascii_uppercase()) else {
+            continue;
+        };
+        let column_tables = [relation.clone()];
+        for column in columns {
+            if column.chars().count() <= 2 {
+                continue;
+            }
+            let prefix = mysql_family_two_char_prefix(column);
+            let suggestions = data.get_suggestions_for_db(
+                &prefix,
+                true,
+                Some(&column_tables),
+                false,
+                true,
+                Some(crate::db::DatabaseType::Oracle),
+            );
+            tested += 1;
+            if !mysql_family_script_slot_has_expected(
+                &suggestions,
+                column,
+                MysqlFamilyScriptSlotExpected::Identifier,
+            ) {
+                failures.push(format!(
+                    "Oracle catalog column `{relation}.{column}` missing at `{prefix}` prefix: {suggestions:?}"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        tested > 100,
+        "Oracle test_all catalog-column audit should cover many columns, only tested {tested}"
+    );
+    assert!(
+        failures.is_empty(),
+        "Oracle test_all catalog column completion gaps (refs={tested}):\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn oracle_test_all_scripts_actual_relation_qualifiers_are_suggested() {
+    let catalog = oracle_catalog_from_test_all_scripts();
+    let mut failures = Vec::new();
+    let mut tested = 0usize;
+
+    for (label, script) in oracle_test_all_intellisense_scripts() {
+        let token_spans = super::query_text::tokenize_sql_spanned(script);
+
+        for (idx, span) in token_spans.iter().enumerate() {
+            if mysql_family_byte_is_inside_single_quoted_literal(script, span.start)
+                || oracle_byte_is_inside_non_sqlplus_text_line(script, span.start)
+            {
+                continue;
+            }
+            let Some(word) = token_word_text(Some(&span.token)) else {
+                continue;
+            };
+            let clean = word.trim_matches('"');
+            if clean.chars().count() <= 2 {
+                continue;
+            }
+            if !clean
+                .chars()
+                .next()
+                .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
+            {
+                continue;
+            }
+            if !matches!(
+                token_spans.get(idx + 1).map(|span| &span.token),
+                Some(SqlToken::Symbol(symbol)) if symbol == "."
+            ) || !matches!(
+                token_spans.get(idx + 2).map(|span| &span.token),
+                Some(SqlToken::Word(_))
+            ) {
+                continue;
+            }
+            if matches!(
+                token_spans.get(idx.saturating_sub(1)).map(|span| &span.token),
+                Some(SqlToken::Symbol(symbol)) if matches!(symbol.as_str(), "." | "@" | ":")
+            ) {
+                continue;
+            }
+
+            let original_sql = mysql_family_script_with_cursor_at(script, span.end);
+            let (_, _, original_ctx) =
+                analyze_full_script_marker_for_db(&original_sql, Some(crate::db::DatabaseType::Oracle));
+            if !SqlEditorWidget::qualifier_matches_visible_relation_scope(clean, &original_ctx) {
+                continue;
+            }
+
+            let prefix = mysql_family_two_char_prefix(clean);
+            let suggestions = oracle_script_slot_suggestions_with_catalog(
+                script,
+                span,
+                &prefix,
+                &catalog,
+                MysqlFamilyScriptSlotQuery::Full,
+            );
+            tested += 1;
+            if !mysql_family_script_slot_has_expected(
+                &suggestions,
+                clean,
+                MysqlFamilyScriptSlotExpected::Identifier,
+            ) {
+                failures.push(format!(
+                    "{label} relation qualifier `{clean}` missing at `{prefix}` prefix byte {}: {suggestions:?}",
+                    span.start
+                ));
+            }
+        }
+    }
+
+    assert!(
+        tested > 30,
+        "Oracle test_all relation-qualifier audit should cover many real references, only tested {tested}"
+    );
+    assert!(
+        failures.is_empty(),
+        "Oracle test_all relation-qualifier completion gaps (refs={tested}):\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn oracle_test_all_scripts_actual_local_record_members_are_suggested() {
+    let mut failures = Vec::new();
+    let mut tested = 0usize;
+
+    for (label, script) in oracle_test_all_intellisense_scripts() {
+        let token_spans = super::query_text::tokenize_sql_spanned(script);
+
+        for span in &token_spans {
+            if mysql_family_byte_is_inside_single_quoted_literal(script, span.start)
+                || oracle_byte_is_inside_non_sqlplus_text_line(script, span.start)
+            {
+                continue;
+            }
+            let Some(word) = token_word_text(Some(&span.token)) else {
+                continue;
+            };
+            let clean = word.trim_matches('"');
+            if clean.chars().count() <= 2 {
+                continue;
+            }
+            let before_token = script[..span.start].trim_end();
+            if !before_token.ends_with('.') {
+                continue;
+            }
+
+            let prefix = mysql_family_two_char_prefix(word);
+            let prefixed_sql = mysql_family_script_with_token_prefix_cursor(script, span, &prefix);
+            let cursor = prefixed_sql
+                .find("__CODEX_CURSOR__")
+                .expect("cursor marker should exist");
+            let sql = prefixed_sql.replacen("__CODEX_CURSOR__", "", 1);
+            let word_start = cursor.saturating_sub(prefix.len());
+            let Some(qualifier) = SqlEditorWidget::qualifier_before_word_in_text(&sql, word_start)
+            else {
+                continue;
+            };
+            let Some(suggestions) =
+                SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+                    &prefixed_sql,
+                    &qualifier,
+                    &prefix,
+                )
+            else {
+                continue;
+            };
+            tested += 1;
+            if !mysql_family_script_slot_has_expected(
+                &suggestions,
+                word,
+                MysqlFamilyScriptSlotExpected::Identifier,
+            ) {
+                failures.push(format!(
+                    "{label} local member `{qualifier}.{word}` missing at `{prefix}` prefix byte {}: {suggestions:?}",
+                    span.start
+                ));
+            }
+        }
+    }
+
+    assert!(
+        tested > 50,
+        "Oracle test_all local-record-member audit should cover many real members, only tested {tested}"
+    );
+    assert!(
+        failures.is_empty(),
+        "Oracle test_all local record-member completion gaps (refs={tested}):\n{}",
+        failures.join("\n")
+    );
+}
+
+fn mysql_family_audit_script_slot_two_letter_prefix(
+    failures: &mut Vec<String>,
+    tested_prefix: &mut usize,
+    label: &str,
+    db: crate::db::DatabaseType,
+    script: &str,
+    catalog: &MysqlFamilyScriptCatalog,
+    span: &crate::ui::sql_editor::SqlTokenSpan,
+    expected: &str,
+    expected_kind: MysqlFamilyScriptSlotExpected,
+    query: MysqlFamilyScriptSlotQuery,
+) {
+    let prefix = mysql_family_two_char_prefix(expected);
+    let prefixed_suggestions =
+        mysql_family_script_slot_suggestions(script, span, &prefix, db, &catalog, query);
+    *tested_prefix += 1;
+    if !mysql_family_script_slot_has_expected(&prefixed_suggestions, expected, expected_kind) {
+        failures.push(format!(
+            "{label} `{expected}` missing at `{prefix}` prefix byte {}: {prefixed_suggestions:?}",
+            span.start
+        ));
+    }
+}
+
+fn mysql_family_byte_is_inside_single_quoted_literal(script: &str, byte: usize) -> bool {
+    let mut chars = script.char_indices().peekable();
+    let mut in_single = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+
+    while let Some((idx, ch)) = chars.next() {
+        if idx >= byte {
+            break;
+        }
+
+        if in_line_comment {
+            if ch == '\n' || ch == '\r' {
+                in_line_comment = false;
+            }
+            continue;
+        }
+        if in_block_comment {
+            if ch == '*' && chars.peek().is_some_and(|(_, next)| *next == '/') {
+                chars.next();
+                in_block_comment = false;
+            }
+            continue;
+        }
+        if in_single {
+            if ch == '\\' {
+                chars.next();
+                continue;
+            }
+            if ch == '\'' {
+                if chars.peek().is_some_and(|(_, next)| *next == '\'') {
+                    chars.next();
+                } else {
+                    in_single = false;
+                }
+            }
+            continue;
+        }
+
+        if ch == '\'' {
+            in_single = true;
+        } else if ch == '-' && chars.peek().is_some_and(|(_, next)| *next == '-') {
+            chars.next();
+            in_line_comment = true;
+        } else if ch == '#' {
+            in_line_comment = true;
+        } else if ch == '/' && chars.peek().is_some_and(|(_, next)| *next == '*') {
+            chars.next();
+            in_block_comment = true;
+        }
+    }
+
+    in_single
+}
+
+fn mysql_family_relation_reference_slot(
+    token_spans: &[crate::ui::sql_editor::SqlTokenSpan],
+    idx: usize,
+) -> bool {
+    let prev = mysql_family_previous_word_upper(token_spans, idx, 0);
+    let prev2 = mysql_family_previous_word_upper(token_spans, idx, 1);
+    let prev3 = mysql_family_previous_word_upper(token_spans, idx, 2);
+
+    match prev.as_deref() {
+        Some("FROM" | "JOIN" | "UPDATE" | "REFERENCES") => true,
+        Some("INTO") => matches!(
+            prev2.as_deref(),
+            Some("INSERT" | "REPLACE" | "IGNORE" | "PRIORITY")
+        ) || matches!(prev3.as_deref(), Some("INSERT" | "REPLACE")),
+        Some("ON") => matches!(
+            prev2.as_deref(),
+            Some("INSERT" | "UPDATE" | "DELETE" | "INDEX" | "KEY")
+        ) || matches!(prev3.as_deref(), Some("TRIGGER" | "INDEX" | "KEY")),
+        _ => false,
+    }
+}
+
+fn mysql_family_token_is_in_routine_parameter_list(
+    token_spans: &[crate::ui::sql_editor::SqlTokenSpan],
+    idx: usize,
+) -> bool {
+    for span in token_spans.iter().take(idx).rev() {
+        match &span.token {
+            SqlToken::Comment(_) => {}
+            SqlToken::Symbol(symbol) if symbol == ";" => return false,
+            SqlToken::Word(word) => match word.to_ascii_uppercase().as_str() {
+                "FUNCTION" | "PROCEDURE" => return true,
+                "BEGIN" | "RETURN" | "RETURNS" => return false,
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    false
+}
+
+fn mysql_family_token_is_inside_create_table_definition(
+    token_spans: &[crate::ui::sql_editor::SqlTokenSpan],
+    idx: usize,
+) -> bool {
+    let mut create_table_depth = 0usize;
+    for (scan_idx, span) in token_spans.iter().take(idx + 1).enumerate() {
+        if create_table_depth > 0 {
+            if scan_idx == idx {
+                return true;
+            }
+            match &span.token {
+                SqlToken::Symbol(symbol) if symbol == "(" => {
+                    create_table_depth = create_table_depth.saturating_add(1)
+                }
+                SqlToken::Symbol(symbol) if symbol == ")" => {
+                    create_table_depth = create_table_depth.saturating_sub(1)
+                }
+                SqlToken::Symbol(symbol) if symbol == ";" && create_table_depth == 0 => {}
+                _ => {}
+            }
+            continue;
+        }
+
+        if !matches!(&span.token, SqlToken::Symbol(symbol) if symbol == "(") {
+            continue;
+        }
+
+        let prev = mysql_family_previous_word_upper(token_spans, scan_idx, 0);
+        let prev2 = mysql_family_previous_word_upper(token_spans, scan_idx, 1);
+        let prev3 = mysql_family_previous_word_upper(token_spans, scan_idx, 2);
+        let prev4 = mysql_family_previous_word_upper(token_spans, scan_idx, 3);
+        if matches!(prev2.as_deref(), Some("TABLE"))
+            && (matches!(prev3.as_deref(), Some("CREATE"))
+                || (matches!(prev3.as_deref(), Some("TEMPORARY"))
+                    && matches!(prev4.as_deref(), Some("CREATE"))))
+            && prev.is_some()
+        {
+            create_table_depth = 1;
+        }
+    }
+
+    false
+}
+
+fn mysql_family_token_is_inside_insert_target_column_list(
+    token_spans: &[crate::ui::sql_editor::SqlTokenSpan],
+    idx: usize,
+) -> bool {
+    let mut depth = 0usize;
+    let mut open_idx = None;
+    for (scan_idx, span) in token_spans.iter().take(idx).enumerate().rev() {
+        match &span.token {
+            SqlToken::Symbol(symbol) if symbol == ")" => depth = depth.saturating_add(1),
+            SqlToken::Symbol(symbol) if symbol == "(" => {
+                if depth == 0 {
+                    open_idx = Some(scan_idx);
+                    break;
+                }
+                depth = depth.saturating_sub(1);
+            }
+            SqlToken::Symbol(symbol) if symbol == ";" && depth == 0 => return false,
+            _ => {}
+        }
+    }
+
+    let Some(open_idx) = open_idx else {
+        return false;
+    };
+    let prev2 = mysql_family_previous_word_upper(token_spans, open_idx, 1);
+    let prev3 = mysql_family_previous_word_upper(token_spans, open_idx, 2);
+    let prev4 = mysql_family_previous_word_upper(token_spans, open_idx, 3);
+
+    matches!(prev2.as_deref(), Some("INTO"))
+        && (matches!(prev3.as_deref(), Some("INSERT" | "REPLACE"))
+            || matches!(prev4.as_deref(), Some("INSERT" | "REPLACE")))
+}
+
+fn mysql_family_statement_references_runtime_temp_table(
+    token_spans: &[crate::ui::sql_editor::SqlTokenSpan],
+    idx: usize,
+) -> bool {
+    let start = token_spans
+        .iter()
+        .take(idx)
+        .rposition(|span| matches!(&span.token, SqlToken::Symbol(symbol) if symbol == ";"))
+        .map_or(0, |pos| pos + 1);
+    let end = token_spans
+        .iter()
+        .enumerate()
+        .skip(idx + 1)
+        .find_map(|(scan_idx, span)| {
+            matches!(&span.token, SqlToken::Symbol(symbol) if symbol == ";").then_some(scan_idx)
+        })
+        .unwrap_or(token_spans.len());
+
+    token_spans[start..end].iter().any(|span| {
+        token_word_text(Some(&span.token)).is_some_and(|word| {
+            word.trim_matches('`')
+                .to_ascii_lowercase()
+                .starts_with("tmp_")
+        })
+    })
+}
+
+fn mysql_family_statement_contains_word(
+    token_spans: &[crate::ui::sql_editor::SqlTokenSpan],
+    idx: usize,
+    expected: &str,
+) -> bool {
+    let start = token_spans
+        .iter()
+        .take(idx)
+        .rposition(|span| matches!(&span.token, SqlToken::Symbol(symbol) if symbol == ";"))
+        .map_or(0, |pos| pos + 1);
+    token_spans[start..=idx].iter().any(|span| {
+        token_word_text(Some(&span.token)).is_some_and(|word| word.eq_ignore_ascii_case(expected))
+    })
+}
+
+#[test]
+fn mysql_family_test_scripts_actual_object_references_are_suggested() {
+    let mut failures = Vec::new();
+    let mut tested = 0usize;
+    let mut tested_prefix = 0usize;
+
+    for (label, db, script) in mysql_family_intellisense_scripts() {
+        let catalog = mysql_family_catalog_from_script(script);
+        let token_spans = super::query_text::tokenize_sql_spanned_with_mysql_compat(script, true);
+        let relation_names: HashSet<String> = catalog
+            .tables
+            .iter()
+            .chain(catalog.views.iter())
+            .map(|name| name.to_ascii_uppercase())
+            .collect();
+        let procedure_names: HashSet<String> = catalog
+            .procedures
+            .iter()
+            .map(|name| name.to_ascii_uppercase())
+            .collect();
+        let function_names: HashSet<String> = catalog
+            .functions
+            .iter()
+            .map(|name| name.to_ascii_uppercase())
+            .collect();
+
+        for (idx, span) in token_spans.iter().enumerate() {
+            if mysql_family_byte_is_inside_single_quoted_literal(script, span.start) {
+                continue;
+            }
+            let Some(word) = token_word_text(Some(&span.token)) else {
+                continue;
+            };
+            let word_upper = word.to_ascii_uppercase();
+            let prev = mysql_family_previous_word_upper(&token_spans, idx, 0);
+            let prev2 = mysql_family_previous_word_upper(&token_spans, idx, 1);
+
+            let should_test = if relation_names.contains(&word_upper) {
+                mysql_family_relation_reference_slot(&token_spans, idx)
+            } else if procedure_names.contains(&word_upper) {
+                matches!(prev.as_deref(), Some("CALL"))
+            } else if function_names.contains(&word_upper) {
+                matches!(
+                    mysql_family_next_meaningful_symbol(&token_spans, idx),
+                    Some("(")
+                ) && !matches!(prev.as_deref(), Some("FUNCTION"))
+                    && !matches!(prev2.as_deref(), Some("CREATE"))
+            } else {
+                false
+            };
+            if !should_test {
+                continue;
+            }
+
+            mysql_family_audit_script_slot_two_letter_prefix(
+                &mut failures,
+                &mut tested_prefix,
+                label,
+                db,
+                script,
+                &catalog,
+                span,
+                word,
+                MysqlFamilyScriptSlotExpected::Object,
+                MysqlFamilyScriptSlotQuery::Context,
+            );
+            tested += 1;
+        }
+    }
+
+    assert!(
+        tested > 100,
+        "actual object reference audit should cover many script references, only tested {tested}"
+    );
+    assert!(
+        failures.is_empty(),
+        "MySQL/MariaDB script object reference completion gaps (refs={tested}, prefix={tested_prefix}):\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn mysql_family_test_scripts_actual_local_references_are_suggested() {
+    let mut failures = Vec::new();
+    let mut tested = 0usize;
+    let mut tested_prefix = 0usize;
+    let mut declared_total = 0usize;
+
+    for (label, db, script) in mysql_family_intellisense_scripts() {
+        let catalog = mysql_family_catalog_from_script(script);
+        let token_spans = super::query_text::tokenize_sql_spanned_with_mysql_compat(script, true);
+        let declared_symbols = mysql_family_declared_local_symbols(&token_spans);
+        declared_total += declared_symbols.len();
+
+        for (idx, span) in token_spans.iter().enumerate() {
+            if mysql_family_byte_is_inside_single_quoted_literal(script, span.start) {
+                continue;
+            }
+            let Some(word) = token_word_text(Some(&span.token)) else {
+                continue;
+            };
+            let clean = word.trim_matches('`');
+            let clean_upper = clean.to_ascii_uppercase();
+            let Some(declaration_end) = declared_symbols.get(&clean_upper) else {
+                continue;
+            };
+            if span.start <= *declaration_end {
+                continue;
+            }
+            let prev = mysql_family_previous_word_upper(&token_spans, idx, 0);
+            if matches!(
+                prev.as_deref(),
+                Some("DECLARE" | "IN" | "OUT" | "INOUT")
+            ) {
+                continue;
+            }
+            if mysql_family_token_is_in_routine_parameter_list(&token_spans, idx) {
+                continue;
+            }
+
+            mysql_family_audit_script_slot_two_letter_prefix(
+                &mut failures,
+                &mut tested_prefix,
+                label,
+                db,
+                script,
+                &catalog,
+                span,
+                word,
+                MysqlFamilyScriptSlotExpected::Identifier,
+                MysqlFamilyScriptSlotQuery::Full,
+            );
+            tested += 1;
+        }
+    }
+
+    assert!(
+        declared_total > 20,
+        "actual local reference audit should discover declared routine parameters/local variables, only found {declared_total}"
+    );
+    assert!(
+        tested > 100,
+        "actual local reference audit should cover many script references, only tested {tested}"
+    );
+    assert!(
+        failures.is_empty(),
+        "MySQL/MariaDB script local reference completion gaps (refs={tested}, prefix={tested_prefix}):\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn mysql_family_test_scripts_actual_user_variables_are_suggested() {
+    let mut failures = Vec::new();
+    let mut tested = 0usize;
+    let mut tested_prefix = 0usize;
+
+    for (label, db, script) in mysql_family_intellisense_scripts() {
+        let catalog = mysql_family_catalog_from_script(script);
+        let token_spans = super::query_text::tokenize_sql_spanned_with_mysql_compat(script, true);
+        let mut seen_user_vars = HashSet::new();
+
+        for (idx, span) in token_spans.iter().enumerate() {
+            if mysql_family_byte_is_inside_single_quoted_literal(script, span.start) {
+                continue;
+            }
+            let Some(word) = token_word_text(Some(&span.token)) else {
+                continue;
+            };
+            let Some(at_idx) = idx.checked_sub(1) else {
+                continue;
+            };
+            if !matches!(
+                token_spans.get(at_idx).map(|span| &span.token),
+                Some(SqlToken::Symbol(symbol)) if symbol == "@"
+            ) {
+                continue;
+            }
+            if mysql_family_at_symbol_follows_account_name(&token_spans, at_idx) {
+                continue;
+            }
+            let clean = word.trim_matches('`');
+            if clean.chars().count() <= 2 {
+                continue;
+            }
+            let clean_upper = clean.to_ascii_uppercase();
+            if !seen_user_vars.contains(&clean_upper) {
+                seen_user_vars.insert(clean_upper);
+                continue;
+            }
+
+            mysql_family_audit_script_slot_two_letter_prefix(
+                &mut failures,
+                &mut tested_prefix,
+                label,
+                db,
+                script,
+                &catalog,
+                span,
+                clean,
+                MysqlFamilyScriptSlotExpected::Identifier,
+                MysqlFamilyScriptSlotQuery::Full,
+            );
+            tested += 1;
+        }
+    }
+
+    assert!(
+        tested > 10,
+        "actual user-variable audit should cover many script references, only tested {tested}"
+    );
+    assert!(
+        failures.is_empty(),
+        "MySQL/MariaDB script user-variable completion gaps (refs={tested}, prefix={tested_prefix}):\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn mysql_family_test_scripts_actual_relation_qualifiers_are_suggested() {
+    let mut failures = Vec::new();
+    let mut tested = 0usize;
+    let mut tested_prefix = 0usize;
+
+    for (label, db, script) in mysql_family_intellisense_scripts() {
+        let catalog = mysql_family_catalog_from_script(script);
+        let token_spans = super::query_text::tokenize_sql_spanned_with_mysql_compat(script, true);
+
+        for (idx, span) in token_spans.iter().enumerate() {
+            if mysql_family_byte_is_inside_single_quoted_literal(script, span.start) {
+                continue;
+            }
+            let Some(word) = token_word_text(Some(&span.token)) else {
+                continue;
+            };
+            let clean = word.trim_matches('`');
+            if clean.chars().count() <= 2 {
+                continue;
+            }
+            if !clean
+                .chars()
+                .next()
+                .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
+            {
+                continue;
+            }
+            if !matches!(
+                token_spans.get(idx + 1).map(|span| &span.token),
+                Some(SqlToken::Symbol(symbol)) if symbol == "."
+            ) || !matches!(
+                token_spans.get(idx + 2).map(|span| &span.token),
+                Some(SqlToken::Word(_))
+            ) {
+                continue;
+            }
+            if matches!(
+                token_spans.get(idx.saturating_sub(1)).map(|span| &span.token),
+                Some(SqlToken::Symbol(symbol)) if matches!(symbol.as_str(), "." | "@" | ":")
+            ) {
+                continue;
+            }
+
+            let original_sql = mysql_family_script_with_cursor_at(script, span.end);
+            let (_, _, original_ctx) = analyze_full_script_marker_for_db(&original_sql, Some(db));
+            if SqlEditorWidget::resolve_column_tables_for_context_for_db(
+                Some(clean),
+                &original_ctx,
+                Some(db),
+            )
+            .is_empty()
+            {
+                continue;
+            }
+
+            mysql_family_audit_script_slot_two_letter_prefix(
+                &mut failures,
+                &mut tested_prefix,
+                label,
+                db,
+                script,
+                &catalog,
+                span,
+                clean,
+                MysqlFamilyScriptSlotExpected::Identifier,
+                MysqlFamilyScriptSlotQuery::Full,
+            );
+            tested += 1;
+        }
+    }
+
+    assert!(
+        tested > 20,
+        "actual relation-qualifier audit should cover many script references, only tested {tested}"
+    );
+    assert!(
+        failures.is_empty(),
+        "MySQL/MariaDB script relation-qualifier completion gaps (refs={tested}, prefix={tested_prefix}):\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn mysql_family_test_scripts_actual_column_references_are_suggested() {
+    let mut failures = Vec::new();
+    let mut tested = 0usize;
+    let mut tested_prefix = 0usize;
+
+    for (label, db, script) in mysql_family_intellisense_scripts() {
+        let catalog = mysql_family_catalog_from_script(script);
+        let mut column_names = HashSet::new();
+        for columns in catalog.columns.values() {
+            for column in columns {
+                column_names.insert(column.to_ascii_uppercase());
+            }
+        }
+        let relation_names: HashSet<String> = catalog
+            .tables
+            .iter()
+            .chain(catalog.views.iter())
+            .map(|name| name.to_ascii_uppercase())
+            .collect();
+        let token_spans = super::query_text::tokenize_sql_spanned_with_mysql_compat(script, true);
+
+        for (idx, span) in token_spans.iter().enumerate() {
+            if mysql_family_byte_is_inside_single_quoted_literal(script, span.start) {
+                continue;
+            }
+            if mysql_family_token_is_inside_create_table_definition(&token_spans, idx) {
+                continue;
+            }
+            if mysql_family_token_is_inside_insert_target_column_list(&token_spans, idx) {
+                continue;
+            }
+            if mysql_family_statement_references_runtime_temp_table(&token_spans, idx) {
+                continue;
+            }
+            let Some(word) = token_word_text(Some(&span.token)) else {
+                continue;
+            };
+            if word.trim_matches('`').chars().count() <= 2 {
+                continue;
+            }
+            let word_upper = word.trim_matches('`').to_ascii_uppercase();
+            if !column_names.contains(&word_upper) || relation_names.contains(&word_upper) {
+                continue;
+            }
+            let prev = mysql_family_previous_word_upper(&token_spans, idx, 0);
+            let next = mysql_family_next_word_upper(&token_spans, idx);
+            if word_upper == "GROUP" && matches!(next.as_deref(), Some("BY")) {
+                continue;
+            }
+            if matches!(
+                prev.as_deref(),
+                Some(
+                    "CREATE"
+                        | "ALTER"
+                        | "TABLE"
+                        | "INDEX"
+                        | "KEY"
+                        | "CONSTRAINT"
+                        | "PRIMARY"
+                        | "FOREIGN"
+                        | "REFERENCES"
+                        | "DECLARE"
+                        | "IN"
+                        | "OUT"
+                        | "INOUT"
+                        | "AS"
+                )
+            ) {
+                continue;
+            }
+
+            mysql_family_audit_script_slot_two_letter_prefix(
+                &mut failures,
+                &mut tested_prefix,
+                label,
+                db,
+                script,
+                &catalog,
+                span,
+                word,
+                MysqlFamilyScriptSlotExpected::Identifier,
+                MysqlFamilyScriptSlotQuery::Full,
+            );
+            tested += 1;
+        }
+    }
+
+    assert!(
+        tested > 100,
+        "actual column reference audit should cover many script references, only tested {tested}"
+    );
+    assert!(
+        failures.is_empty(),
+        "MySQL/MariaDB script column reference completion gaps (refs={tested}, prefix={tested_prefix}):\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
 fn mysql_family_routine_body_object_completion_bulk_matrix() {
     use crate::db::DatabaseType::{MariaDB, MySQL};
 
@@ -78009,7 +82257,10 @@ fn mysql_family_definer_procedure_parameter_and_call_argument_completion() {
     let has = |suggestions: &[String], expected: &str| {
         suggestions
             .iter()
-            .any(|value| value.eq_ignore_ascii_case(expected))
+            .any(|value| value.eq_ignore_ascii_case(expected)
+                || value
+                    .strip_suffix("()")
+                    .is_some_and(|name| name.eq_ignore_ascii_case(expected)))
     };
     let mut failures = Vec::new();
 
@@ -78116,6 +82367,660 @@ END"#,
     assert!(
         failures.is_empty(),
         "MySQL-family definer procedure completion gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn mysql_family_delimited_routine_local_symbol_completion() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let has = |suggestions: &[String], expected: &str| {
+        suggestions
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(expected))
+    };
+    let mut failures = Vec::new();
+    let cases: &[(&str, &[&str])] = &[
+        (
+            r#"DELIMITER //
+CREATE PROCEDURE p(IN p_name VARCHAR(20))
+BEGIN
+    DECLARE v_name VARCHAR(20);
+    SET v_name = p_|;
+END//
+DELIMITER ;"#,
+            &["p_name"],
+        ),
+        (
+            r#"DELIMITER //
+CREATE PROCEDURE p(IN p_name VARCHAR(20))
+BEGIN
+    DECLARE v_name VARCHAR(20);
+    SET v_name = p_name;
+    SELECT v_|;
+END//
+DELIMITER ;"#,
+            &["v_name"],
+        ),
+        (
+            r#"DELIMITER //
+CREATE PROCEDURE p()
+BEGIN
+    DECLARE v_top_emp_id INT DEFAULT 0;
+    INSERT INTO sales_summary (summary_json)
+    VALUES (
+        JSON_OBJECT(
+            'top_emp_id', v_to|
+        )
+    );
+END//
+DELIMITER ;"#,
+            &["v_top_emp_id"],
+        ),
+    ];
+
+    for db in [MySQL, MariaDB] {
+        for (sql, expected) in cases {
+            let suggestions = query_completion_suggestions_with_locals(sql, db);
+            for item in *expected {
+                if !has(&suggestions, item) {
+                    failures.push(format!(
+                        "`{item}` missing at {db:?} `{}`: {suggestions:?}",
+                        sql.replace('\n', " ")
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "MySQL-family delimited routine local symbol gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn mysql_family_test1_deep_routine_json_object_local_symbol_completion() {
+    let script = load_mariadb_intellisense_test_file("test1.txt");
+    let marked = script.replacen(
+        "'top_emp_id', v_top_emp_id",
+        "'top_emp_id', v_to|",
+        1,
+    );
+    assert_ne!(marked, script, "expected test1 JSON_OBJECT local target");
+
+    let suggestions = query_completion_suggestions_with_locals(&marked, crate::db::DatabaseType::MySQL);
+    assert!(
+        suggestions
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case("v_top_emp_id")),
+        "v_top_emp_id missing in test1 deep routine JSON_OBJECT slot: {suggestions:?}"
+    );
+}
+
+#[test]
+fn mysql_test1_final_select_column_lists_suggest_table_columns() {
+    use crate::db::DatabaseType::MySQL;
+
+    let script = load_mariadb_intellisense_test_file("test1.txt");
+    let catalog = mysql_family_catalog_from_script(script);
+    let replace_last = |needle: &str, replacement: &str| {
+        let idx = script
+            .rfind(needle)
+            .unwrap_or_else(|| panic!("test setup should find `{needle}`"));
+        format!("{}{}{}", &script[..idx], replacement, &script[idx + needle.len()..])
+    };
+    let cases = [
+        ("SELECT\n    summary_key,", "SELECT\n    su|", "summary_key"),
+        ("    `group`,", "    `gr|`,", "group"),
+        ("SELECT\n    step_name,", "SELECT\n    st|", "step_name"),
+        ("SELECT\n    order_id,", "SELECT\n    or|", "order_id"),
+    ];
+    let mut failures = Vec::new();
+
+    for (needle, replacement, expected) in cases {
+        let marked = replace_last(needle, replacement);
+        assert_ne!(marked, script, "test setup should replace `{needle}`");
+        let mut data = intellisense_data_from_mysql_family_catalog(&catalog);
+        let suggestions = query_completion_suggestions_with_data(&marked, MySQL, true, &mut data);
+        if !suggestions.iter().any(|suggestion| {
+            suggestion.eq_ignore_ascii_case(expected)
+                || suggestion
+                    .trim_matches('`')
+                    .eq_ignore_ascii_case(expected)
+        }) {
+            failures.push(format!(
+                "`{expected}` missing for final test1 SELECT replacement `{replacement}`: {suggestions:?}"
+            ));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "MySQL test1 final SELECT column completion gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn mysql_test1_final_boss_routine_decl_transaction_upsert_savepoint_and_set_slots() {
+    use crate::db::DatabaseType::MySQL;
+
+    let script = load_mariadb_intellisense_test_file("test1.txt");
+    let catalog = mysql_family_catalog_from_script(script);
+    let has = |suggestions: &[String], expected: &str| {
+        suggestions
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(expected)
+                || value
+                    .strip_suffix("()")
+                    .is_some_and(|name| name.eq_ignore_ascii_case(expected)))
+    };
+    let replace_once = |needle: &str, replacement: &str| {
+        let marked = script.replacen(needle, replacement, 1);
+        assert_ne!(marked, script, "test setup should replace `{needle}`");
+        marked
+    };
+    let cases = [
+        ("DECLARE CONTINUE HANDLER FOR NOT FOUND", "DECLARE CO|", "CONTINUE"),
+        (
+            "DECLARE CONTINUE HANDLER FOR NOT FOUND",
+            "DECLARE CONTINUE HA|",
+            "HANDLER",
+        ),
+        (
+            "DECLARE CONTINUE HANDLER FOR NOT FOUND",
+            "DECLARE CONTINUE HANDLER FO|",
+            "FOR",
+        ),
+        (
+            "DECLARE CONTINUE HANDLER FOR NOT FOUND",
+            "DECLARE CONTINUE HANDLER FOR NO|",
+            "NOT",
+        ),
+        (
+            "DECLARE CONTINUE HANDLER FOR NOT FOUND",
+            "DECLARE CONTINUE HANDLER FOR NOT FO|",
+            "FOUND",
+        ),
+        ("DECLARE EXIT HANDLER FOR SQLEXCEPTION", "DECLARE EX|", "EXIT"),
+        (
+            "DECLARE EXIT HANDLER FOR SQLEXCEPTION",
+            "DECLARE EXIT HA|",
+            "HANDLER",
+        ),
+        (
+            "DECLARE EXIT HANDLER FOR SQLEXCEPTION",
+            "DECLARE EXIT HANDLER FO|",
+            "FOR",
+        ),
+        (
+            "DECLARE EXIT HANDLER FOR SQLEXCEPTION",
+            "DECLARE EXIT HANDLER FOR SQ|",
+            "SQLEXCEPTION",
+        ),
+        ("START TRANSACTION;", "ST|", "START"),
+        ("START TRANSACTION;", "START TR|", "TRANSACTION"),
+        (
+            "ON DUPLICATE KEY UPDATE\n        dept_name",
+            "ON DUPLICATE KEY UPDATE\n        de|",
+            "dept_name",
+        ),
+        (
+            "dept_name = CONCAT(VALUES(dept_name), ' / touched'),\n        sort_no",
+            "dept_name = CONCAT(VALUES(dept_name), ' / touched'),\n        so|",
+            "sort_no",
+        ),
+        (
+            "RELEASE SAVEPOINT sp_before_rollback_test;",
+            "RE|",
+            "RELEASE",
+        ),
+        (
+            "ROLLBACK TO SAVEPOINT sp_before_rollback_test;",
+            "ROLLBACK TO SAVEPOINT sp|",
+            "sp_before_rollback_test",
+        ),
+        (
+            "RELEASE SAVEPOINT sp_before_rollback_test;",
+            "RELEASE SAVEPOINT sp|",
+            "sp_before_rollback_test",
+        ),
+        (
+            "SET v_emp_count = v_emp_count + 1;",
+            "SET v_| = v_emp_count + 1;",
+            "v_emp_count",
+        ),
+        (
+            "SET v_emp_count = v_emp_count + 1;",
+            "SET v_emp_count = v_| + 1;",
+            "v_emp_count",
+        ),
+        (
+            "SET v_salary_sum = v_salary_sum + v_base_salary;",
+            "SET v_| = v_salary_sum + v_base_salary;",
+            "v_salary_sum",
+        ),
+        (
+            "SET v_salary_sum = v_salary_sum + v_base_salary;",
+            "SET v_salary_sum = v_| + v_base_salary;",
+            "v_salary_sum",
+        ),
+        (
+            "SET v_salary_sum = v_salary_sum + v_base_salary;",
+            "SET v_salary_sum = v_salary_sum + v_|;",
+            "v_base_salary",
+        ),
+    ];
+    let mut failures = Vec::new();
+
+    for (needle, replacement, expected) in cases {
+        let marked = replace_once(needle, replacement);
+        let mut data = intellisense_data_from_mysql_family_catalog(&catalog);
+        let suggestions = query_completion_suggestions_with_data(&marked, MySQL, true, &mut data);
+        if !has(&suggestions, expected) {
+            failures.push(format!(
+                "`{expected}` missing for replacement `{replacement}` from `{needle}`: {suggestions:?}"
+            ));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "MySQL test1 final boss routine completion gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn mysql_family_declare_handler_keyword_matrix_is_complete() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "CREATE PROCEDURE p()\nBEGIN\n    DECLARE |\nEND",
+            &["CONDITION", "CONTINUE", "CURSOR", "EXIT", "UNDO"],
+        ),
+        (
+            "CREATE PROCEDURE p()\nBEGIN\n    DECLARE CO|\nEND",
+            &["CONDITION", "CONTINUE"],
+        ),
+        (
+            "CREATE PROCEDURE p()\nBEGIN\n    DECLARE CU|\nEND",
+            &["CURSOR"],
+        ),
+        (
+            "CREATE PROCEDURE p()\nBEGIN\n    DECLARE EX|\nEND",
+            &["EXIT"],
+        ),
+        (
+            "CREATE PROCEDURE p()\nBEGIN\n    DECLARE UN|\nEND",
+            &["UNDO"],
+        ),
+        (
+            "CREATE PROCEDURE p()\nBEGIN\n    DECLARE CONTINUE |\nEND",
+            &["HANDLER"],
+        ),
+        (
+            "CREATE PROCEDURE p()\nBEGIN\n    DECLARE CONTINUE HA|\nEND",
+            &["HANDLER"],
+        ),
+        (
+            "CREATE PROCEDURE p()\nBEGIN\n    DECLARE EXIT |\nEND",
+            &["HANDLER"],
+        ),
+        (
+            "CREATE PROCEDURE p()\nBEGIN\n    DECLARE EXIT HA|\nEND",
+            &["HANDLER"],
+        ),
+        (
+            "CREATE PROCEDURE p()\nBEGIN\n    DECLARE CONTINUE HANDLER |\nEND",
+            &["FOR"],
+        ),
+        (
+            "CREATE PROCEDURE p()\nBEGIN\n    DECLARE CONTINUE HANDLER FO|\nEND",
+            &["FOR"],
+        ),
+        (
+            "CREATE PROCEDURE p()\nBEGIN\n    DECLARE CONTINUE HANDLER FOR |\nEND",
+            &["MYSQL_ERRNO", "NOT", "SQLEXCEPTION", "SQLSTATE", "SQLWARNING"],
+        ),
+        (
+            "CREATE PROCEDURE p()\nBEGIN\n    DECLARE CONTINUE HANDLER FOR NO|\nEND",
+            &["NOT"],
+        ),
+        (
+            "CREATE PROCEDURE p()\nBEGIN\n    DECLARE CONTINUE HANDLER FOR SQ|\nEND",
+            &["SQLEXCEPTION", "SQLSTATE", "SQLWARNING"],
+        ),
+        (
+            "CREATE PROCEDURE p()\nBEGIN\n    DECLARE CONTINUE HANDLER FOR MY|\nEND",
+            &["MYSQL_ERRNO"],
+        ),
+        (
+            "CREATE PROCEDURE p()\nBEGIN\n    DECLARE CONTINUE HANDLER FOR NOT |\nEND",
+            &["FOUND"],
+        ),
+        (
+            "CREATE PROCEDURE p()\nBEGIN\n    DECLARE CONTINUE HANDLER FOR NOT FO|\nEND",
+            &["FOUND"],
+        ),
+    ];
+    let mut failures = Vec::new();
+
+    for db in [MySQL, MariaDB] {
+        for (sql, expected_keywords) in cases {
+            let suggestions = query_keyword_completion_suggestions(sql, db);
+            for expected in *expected_keywords {
+                if !mysql_family_completion_has_keyword_or_function(&suggestions, expected) {
+                    failures.push(format!(
+                        "{db:?} `{expected}` missing at `{}`: {suggestions:?}",
+                        sql.replace('\n', " ")
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "MySQL-family DECLARE/HANDLER keyword matrix gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn mysql_family_routine_body_control_keyword_completion() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let mut failures = Vec::new();
+    let cases: &[(&str, &[&str])] = &[
+        (
+            r#"CREATE PROCEDURE p()
+BEGIN
+    BEGI|
+END"#,
+            &["BEGIN"],
+        ),
+        (
+            r#"CREATE PROCEDURE p()
+BEGIN
+    IF v_id = 1 THE|
+END"#,
+            &["THEN"],
+        ),
+        (
+            r#"CREATE PROCEDURE p()
+BEGIN
+    WHILE v_id < 10 D|
+END"#,
+            &["DO"],
+        ),
+        (
+            r#"CREATE PROCEDURE p()
+BEGIN
+    REPEAT
+        SET v_id = v_id + 1;
+    UNTI|
+END"#,
+            &["UNTIL"],
+        ),
+        (
+            r#"CREATE PROCEDURE p()
+BEGIN
+    my_loop: LOOP
+        LEA|
+    END LOOP;
+END"#,
+            &["LEAVE"],
+        ),
+        (
+            r#"CREATE PROCEDURE p()
+BEGIN
+    DECLARE CONTINUE HAND|
+END"#,
+            &["HANDLER"],
+        ),
+        (
+            r#"CREATE PROCEDURE p()
+BEGIN
+    DECLARE CONTINUE HANDLER F|
+END"#,
+            &["FOR"],
+        ),
+        (
+            r#"CREATE PROCEDURE p()
+BEGIN
+    DECLARE CONTINUE HANDLER FOR NOT F|
+END"#,
+            &["FOUND"],
+        ),
+        (
+            r#"CREATE PROCEDURE p()
+BEGIN
+    GET DIAGNOSTICS CONDITION 1 v_errno = MYSQ|
+END"#,
+            &["MYSQL_ERRNO"],
+        ),
+        (
+            r#"CREATE PROCEDURE p()
+BEGIN
+    GET DIAGNOSTICS CONDITION 1 v_msg = MESS|
+END"#,
+            &["MESSAGE_TEXT"],
+        ),
+        (
+            r#"CREATE PROCEDURE p()
+BEGIN
+    FETCH cur_name INT|
+END"#,
+            &["INTO"],
+        ),
+        (
+            r#"CREATE PROCEDURE p()
+BEGIN
+    WHILE v_id < 10 DO
+        SET v_id = v_id + 1;
+    END WH|
+END"#,
+            &["WHILE"],
+        ),
+        (
+            r#"CREATE PROCEDURE p()
+BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        GET DIAGNOSTICS CONDITION 1
+            v_state = RETURNED_SQLSTATE,
+            v_errno = MYSQL_ERRNO,
+            v_msg = MESSAGE_TEXT;
+
+        ROLLBACK;
+
+        INSERT INTO error_log (
+            step_name,
+            sql_state,
+            mysql_errno,
+            message_text
+        )
+        VALUES (
+            'UNEXPECTED_EXCEPTION',
+            v_state,
+            v_errno,
+            LEFT(v_msg, 512)
+        );
+
+        RESIGNAL;
+    END;
+
+    ST|
+END"#,
+            &["START"],
+        ),
+        (
+            r#"CREATE PROCEDURE p()
+BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        GET DIAGNOSTICS CONDITION 1
+            v_state = RETURNED_SQLSTATE,
+            v_errno = MYSQL_ERRNO,
+            v_msg = MESSAGE_TEXT;
+
+        ROLLBACK;
+
+        INSERT INTO error_log (
+            step_name,
+            sql_state,
+            mysql_errno,
+            message_text
+        )
+        VALUES (
+            'UNEXPECTED_EXCEPTION',
+            v_state,
+            v_errno,
+            LEFT(v_msg, 512)
+        );
+
+        RESIGNAL;
+    END;
+
+    START TR|
+END"#,
+            &["TRANSACTION"],
+        ),
+    ];
+
+    for db in [MySQL, MariaDB] {
+        for (sql, expected) in cases {
+            let suggestions = query_keyword_completion_suggestions(sql, db);
+            if suggestions.is_empty() {
+                failures.push(format!(
+                    "EMPTY keyword suggestions at {db:?} `{}`",
+                    sql.replace('\n', " ")
+                ));
+                continue;
+            }
+            for keyword in *expected {
+                if !mysql_family_completion_has_keyword_or_function(&suggestions, keyword) {
+                    failures.push(format!(
+                        "`{keyword}` missing at {db:?} `{}`: {suggestions:?}",
+                        sql.replace('\n', " ")
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "MySQL-family routine body keyword completion gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn mysql_family_handler_then_start_transaction_keyword_completion_in_full_routine() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let script = r#"DELIMITER @@@
+CREATE PROCEDURE p()
+BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        GET DIAGNOSTICS CONDITION 1
+            v_state = RETURNED_SQLSTATE,
+            v_errno = MYSQL_ERRNO,
+            v_msg = MESSAGE_TEXT;
+
+        ROLLBACK;
+
+        INSERT INTO error_log (
+            step_name,
+            sql_state,
+            mysql_errno,
+            message_text
+        )
+        VALUES (
+            'UNEXPECTED_EXCEPTION',
+            v_state,
+            v_errno,
+            LEFT(v_msg, 512)
+        );
+
+        RESIGNAL;
+    END;
+
+    START TRANSACTION;
+END@@@
+DELIMITER ;"#;
+    let cases = [
+        ("START TRANSACTION", "ST|", "START"),
+        ("START TRANSACTION", "ST|ART", "START"),
+        ("TRANSACTION;", "TR|", "TRANSACTION"),
+        ("TRANSACTION;", "TR|ANSACTION", "TRANSACTION"),
+    ];
+    let mut failures = Vec::new();
+
+    for db in [MySQL, MariaDB] {
+        for (needle, replacement, expected) in cases {
+            let marked = script.replacen(needle, replacement, 1);
+            assert_ne!(marked, script, "test setup should replace `{needle}`");
+            let mut data = IntellisenseData::new();
+            let suggestions = query_completion_suggestions_with_data(&marked, db, true, &mut data);
+            if !suggestions
+                .iter()
+                .any(|suggestion| suggestion.eq_ignore_ascii_case(expected))
+            {
+                let cursor = marked.find('|').expect("cursor");
+                let sql_without_cursor = marked.replace('|', "");
+                let (routine_cache, expanded) =
+                    SqlEditorWidget::build_routine_symbol_cache_bundle_for_test_for_db_type(
+                        &sql_without_cursor,
+                        cursor,
+                        Some(db),
+                    );
+                let analysis = SqlEditorWidget::build_intellisense_analysis_from_routine_cache(
+                    &routine_cache,
+                    expanded.cursor_in_statement,
+                );
+                let deep_ctx = analysis.context;
+                let (prefix, _, _) =
+                    crate::ui::intellisense::get_word_at_cursor(&sql_without_cursor, cursor);
+                let tokens = SqlEditorWidget::current_query_tokens(&deep_ctx);
+                let cursor_token_len =
+                    SqlEditorWidget::cursor_token_len_in_current_query(&deep_ctx);
+                let context_end = SqlEditorWidget::expected_keyword_suggestion_context_end(
+                    tokens,
+                    cursor_token_len,
+                    &prefix,
+                );
+                let expected_keywords =
+                    SqlEditorWidget::collect_expected_keyword_suggestions_with_expression_context(
+                        &prefix,
+                        &deep_ctx,
+                        Some(db),
+                        None,
+                    );
+                let inside_mysql_routine =
+                    SqlEditorWidget::cursor_is_inside_mysql_routine_body_for_context(
+                        &deep_ctx,
+                        Some(db),
+                    );
+                failures.push(format!(
+                    "{db:?} `{expected}` missing for `{needle}` as `{replacement}`: {suggestions:?}; expected_keywords={expected_keywords:?} inside_mysql_routine={inside_mysql_routine} prefix={prefix:?} cursor_token_len={cursor_token_len} context_end={context_end} tokens={tokens:?} statement_cursor={} statement_tokens={:?}",
+                    deep_ctx.cursor_token_len,
+                    deep_ctx.statement_tokens
+                ));
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "MySQL-family handler followed by START TRANSACTION completion gaps:\n{}",
         failures.join("\n")
     );
 }
@@ -78241,9 +83146,20 @@ fn create_statement_keyword_matrix_offers_expected_keywords_across_dialects() {
         (
             MySQL,
             "CREATE |",
-            &["TABLE", "DATABASE", "INDEX", "VIEW", "USER", "TRIGGER"],
+            &[
+                "TABLE",
+                "DATABASE",
+                "INDEX",
+                "VIEW",
+                "USER",
+                "TRIGGER",
+                "PROCEDURE",
+                "FUNCTION",
+                "EVENT",
+            ],
             &[],
         ),
+        (MySQL, "CREATE PR|", &["PROCEDURE"], &["PRIMARY"]),
         (MySQL, "CREATE DATABASE IF |", &["NOT"], &["TABLE"]),
         (MySQL, "CREATE DATABASE IF NOT |", &["EXISTS"], &["TABLE"]),
         (
@@ -78269,9 +83185,20 @@ fn create_statement_keyword_matrix_offers_expected_keywords_across_dialects() {
         (
             MariaDB,
             "CREATE |",
-            &["TABLE", "DATABASE", "INDEX", "VIEW", "USER", "TRIGGER"],
+            &[
+                "TABLE",
+                "DATABASE",
+                "INDEX",
+                "VIEW",
+                "USER",
+                "TRIGGER",
+                "PROCEDURE",
+                "FUNCTION",
+                "EVENT",
+            ],
             &[],
         ),
+        (MariaDB, "CREATE PR|", &["PROCEDURE"], &["PRIMARY"]),
         (MariaDB, "CREATE DATABASE IF |", &["NOT"], &["TABLE"]),
         (MariaDB, "CREATE DATABASE IF NOT |", &["EXISTS"], &["TABLE"]),
         (
