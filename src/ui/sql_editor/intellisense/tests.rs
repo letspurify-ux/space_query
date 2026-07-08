@@ -101,6 +101,7 @@ struct MysqlFamilyScriptCatalog {
     synonyms: Vec<String>,
     triggers: Vec<String>,
     indexes: Vec<String>,
+    users: Vec<String>,
     columns: HashMap<String, Vec<String>>,
     signatures: HashMap<String, crate::ui::intellisense::SignatureLabel>,
 }
@@ -177,6 +178,134 @@ fn collect_create_table_columns(tokens: &[SqlToken], open_idx: usize) -> Vec<Str
     columns
 }
 
+fn collect_mysql_create_routine_names_from_text(script: &str, keyword: &str) -> Vec<String> {
+    let upper = script.to_ascii_uppercase();
+    let marker = format!("CREATE {keyword}");
+    let mut names = Vec::new();
+    let mut search_start = 0usize;
+    while let Some(relative_idx) = upper
+        .get(search_start..)
+        .and_then(|tail| tail.find(&marker))
+    {
+        let mut idx = search_start + relative_idx + marker.len();
+        while script
+            .as_bytes()
+            .get(idx)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            idx += 1;
+        }
+        if upper.get(idx..).is_some_and(|tail| tail.starts_with("IF ")) {
+            search_start = idx.saturating_add(1);
+            continue;
+        }
+        let name_start = idx;
+        if script.as_bytes().get(idx) == Some(&b'`') {
+            idx += 1;
+            while script.as_bytes().get(idx).is_some_and(|byte| *byte != b'`') {
+                idx += 1;
+            }
+            let name = script.get(name_start + 1..idx).unwrap_or("");
+            push_unique_case_insensitive(&mut names, name);
+        } else {
+            while script.as_bytes().get(idx).is_some_and(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'$' | b'.')
+            }) {
+                idx += 1;
+            }
+            let name = script.get(name_start..idx).unwrap_or("");
+            push_unique_case_insensitive(&mut names, name);
+        }
+        search_start = idx.saturating_add(1);
+    }
+    names
+}
+
+fn mysql_identifier_from_text(text: &str, mut idx: usize) -> Option<(String, usize)> {
+    while text
+        .as_bytes()
+        .get(idx)
+        .is_some_and(|byte| byte.is_ascii_whitespace())
+    {
+        idx += 1;
+    }
+    let start = idx;
+    if text.as_bytes().get(idx) == Some(&b'`') {
+        idx += 1;
+        while text.as_bytes().get(idx).is_some_and(|byte| *byte != b'`') {
+            idx += 1;
+        }
+        return Some((text.get(start + 1..idx)?.to_string(), idx.saturating_add(1)));
+    }
+    while text.as_bytes().get(idx).is_some_and(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'$' | b'.')
+    }) {
+        idx += 1;
+    }
+    (idx > start).then(|| (text.get(start..idx).unwrap_or("").to_string(), idx))
+}
+
+fn mysql_select_columns_from_text(select_sql: &str) -> Vec<String> {
+    let upper = select_sql.to_ascii_uppercase();
+    let Some(select_idx) = upper.find("SELECT") else {
+        return Vec::new();
+    };
+    let Some(from_rel_idx) = upper.get(select_idx..).and_then(|tail| tail.find("FROM")) else {
+        return Vec::new();
+    };
+    let list = select_sql
+        .get(select_idx + "SELECT".len()..select_idx + from_rel_idx)
+        .unwrap_or("");
+    let mut columns = Vec::new();
+    for item in list.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let item_upper = item.to_ascii_uppercase();
+        let name = item_upper
+            .rsplit_once(" AS ")
+            .and_then(|(_, alias)| mysql_identifier_from_text(alias, 0).map(|(name, _)| name))
+            .or_else(|| {
+                item.rsplit_once('.')
+                    .and_then(|(_, tail)| mysql_identifier_from_text(tail.trim(), 0).map(|(name, _)| name))
+            })
+            .or_else(|| mysql_identifier_from_text(item, 0).map(|(name, _)| name));
+        if let Some(name) = name {
+            push_unique_case_insensitive(&mut columns, &name);
+        }
+    }
+    columns
+}
+
+fn collect_mysql_temporary_tables_from_text(script: &str) -> Vec<(String, Vec<String>)> {
+    let upper = script.to_ascii_uppercase();
+    let marker = "CREATE TEMPORARY TABLE";
+    let mut tables = Vec::new();
+    let mut search_start = 0usize;
+    while let Some(relative_idx) = upper
+        .get(search_start..)
+        .and_then(|tail| tail.find(marker))
+    {
+        let idx = search_start + relative_idx + marker.len();
+        let Some((name, after_name)) = mysql_identifier_from_text(script, idx) else {
+            search_start = idx.saturating_add(1);
+            continue;
+        };
+        let tail = script.get(after_name..).unwrap_or("");
+        let tail_upper = upper.get(after_name..).unwrap_or("");
+        let columns = if let Some(as_idx) = tail_upper.find(" AS") {
+            let select_sql = tail.get(as_idx + " AS".len()..).unwrap_or("");
+            mysql_select_columns_from_text(select_sql)
+        } else {
+            Vec::new()
+        };
+        tables.push((name, columns));
+        search_start = after_name.saturating_add(1);
+    }
+    tables
+}
+
 fn mysql_family_catalog_from_script(script: &str) -> MysqlFamilyScriptCatalog {
     let tokens = super::query_text::tokenize_sql_with_mysql_compat(script, true);
     let mut catalog = MysqlFamilyScriptCatalog::default();
@@ -188,6 +317,9 @@ fn mysql_family_catalog_from_script(script: &str) -> MysqlFamilyScriptCatalog {
                 && token_word_eq(tokens.get(kind_idx + 1), "REPLACE")
             {
                 kind_idx += 2;
+            }
+            if token_word_eq(tokens.get(kind_idx), "TEMPORARY") {
+                kind_idx += 1;
             }
             let Some(kind) = token_word_text(tokens.get(kind_idx)) else {
                 idx += 1;
@@ -206,6 +338,33 @@ fn mysql_family_catalog_from_script(script: &str) -> MysqlFamilyScriptCatalog {
                                 name.to_ascii_uppercase(),
                                 collect_create_table_columns(&tokens, name_idx + 1),
                             );
+                        } else {
+                            let statement_end = tokens
+                                .iter()
+                                .enumerate()
+                                .skip(name_idx + 1)
+                                .find_map(|(idx, token)| {
+                                    matches!(token, SqlToken::Symbol(symbol) if symbol == ";")
+                                        .then_some(idx)
+                                })
+                                .unwrap_or(tokens.len());
+                            if let Some(as_idx) = tokens
+                                .iter()
+                                .enumerate()
+                                .take(statement_end)
+                                .skip(name_idx + 1)
+                                .find_map(|(idx, token)| {
+                                    token_word_eq(Some(token), "AS").then_some(idx)
+                                })
+                            {
+                                let columns =
+                                    intellisense_context::extract_select_list_columns(
+                                        &tokens[as_idx + 1..statement_end],
+                                    );
+                                if !columns.is_empty() {
+                                    catalog.columns.insert(name.to_ascii_uppercase(), columns);
+                                }
+                            }
                         }
                     }
                 }
@@ -256,10 +415,34 @@ fn mysql_family_catalog_from_script(script: &str) -> MysqlFamilyScriptCatalog {
                         push_unique_case_insensitive(&mut catalog.indexes, name);
                     }
                 }
+                "DATABASE" | "SCHEMA" => {
+                    let mut schema_name_idx = name_idx;
+                    if token_word_eq(tokens.get(schema_name_idx), "IF")
+                        && token_word_eq(tokens.get(schema_name_idx + 1), "NOT")
+                        && token_word_eq(tokens.get(schema_name_idx + 2), "EXISTS")
+                    {
+                        schema_name_idx += 3;
+                    }
+                    if let Some(name) = token_word_text(tokens.get(schema_name_idx)) {
+                        push_unique_case_insensitive(&mut catalog.users, name);
+                    }
+                }
                 _ => {}
             }
         }
         idx += 1;
+    }
+    for name in collect_mysql_create_routine_names_from_text(script, "PROCEDURE") {
+        push_unique_case_insensitive(&mut catalog.procedures, &name);
+    }
+    for name in collect_mysql_create_routine_names_from_text(script, "FUNCTION") {
+        push_unique_case_insensitive(&mut catalog.functions, &name);
+    }
+    for (table, columns) in collect_mysql_temporary_tables_from_text(script) {
+        push_unique_case_insensitive(&mut catalog.tables, &table);
+        if !columns.is_empty() {
+            catalog.columns.insert(table.to_ascii_uppercase(), columns);
+        }
     }
     catalog
 }
@@ -279,6 +462,7 @@ fn intellisense_data_from_mysql_family_catalog(
     data.synonyms = catalog.synonyms.clone();
     data.triggers = catalog.triggers.clone();
     data.indexes = catalog.indexes.clone();
+    data.users = catalog.users.clone();
     for relation in catalog
         .tables
         .iter()
@@ -291,6 +475,21 @@ fn intellisense_data_from_mysql_family_catalog(
     }
     for (key, label) in &catalog.signatures {
         data.set_signature(key.clone(), Some(label.clone()));
+    }
+    let mut members_by_qualifier = HashMap::<String, Vec<String>>::new();
+    for key in catalog.signatures.keys() {
+        let Some((qualifier, member)) = key.rsplit_once('.') else {
+            continue;
+        };
+        push_unique_case_insensitive(
+            members_by_qualifier
+                .entry(qualifier.to_string())
+                .or_default(),
+            member,
+        );
+    }
+    for (qualifier, members) in members_by_qualifier {
+        data.set_members_for_qualifier(&qualifier, members);
     }
     data.rebuild_indices();
     data
@@ -580,82 +779,91 @@ fn oracle_collect_script_signatures(script: &str, catalog: &mut MysqlFamilyScrip
     }
 }
 
+fn oracle_collect_script_catalog_entries(script: &str, catalog: &mut MysqlFamilyScriptCatalog) {
+    oracle_collect_script_signatures(script, catalog);
+    let tokens = super::query_text::tokenize_sql(script);
+    let mut idx = 0usize;
+    while idx < tokens.len() {
+        if !token_word_eq(tokens.get(idx), "CREATE") {
+            idx += 1;
+            continue;
+        }
+
+        let Some((kind, name_idx)) = oracle_create_kind_and_name_idx(&tokens, idx) else {
+            idx += 1;
+            continue;
+        };
+        let Some((name, after_name_idx)) = script_object_name_at(&tokens, name_idx) else {
+            idx += 1;
+            continue;
+        };
+
+        match kind.as_str() {
+            "TABLE" => {
+                push_unique_case_insensitive(&mut catalog.tables, &name);
+                if matches!(tokens.get(after_name_idx), Some(SqlToken::Symbol(symbol)) if symbol == "(")
+                {
+                    catalog.columns.insert(
+                        name.to_ascii_uppercase(),
+                        collect_create_table_columns(&tokens, after_name_idx),
+                    );
+                }
+            }
+            "VIEW" => {
+                push_unique_case_insensitive(&mut catalog.views, &name);
+                let statement_end = tokens
+                    .iter()
+                    .enumerate()
+                    .skip(after_name_idx)
+                    .find_map(|(idx, token)| {
+                        matches!(token, SqlToken::Symbol(symbol) if symbol == ";")
+                            .then_some(idx)
+                    })
+                    .unwrap_or(tokens.len());
+                if let Some(as_idx) = tokens
+                    .iter()
+                    .enumerate()
+                    .take(statement_end)
+                    .skip(after_name_idx)
+                    .find_map(|(idx, token)| token_word_eq(Some(token), "AS").then_some(idx))
+                {
+                    let columns = intellisense_context::extract_select_list_columns(
+                        &tokens[as_idx + 1..statement_end],
+                    );
+                    if !columns.is_empty() {
+                        catalog.columns.insert(name.to_ascii_uppercase(), columns);
+                    }
+                }
+            }
+            "MATERIALIZED VIEW" => {
+                push_unique_case_insensitive(&mut catalog.materialized_views, &name)
+            }
+            "PROCEDURE" => push_unique_case_insensitive(&mut catalog.procedures, &name),
+            "FUNCTION" => push_unique_case_insensitive(&mut catalog.functions, &name),
+            "PACKAGE" => push_unique_case_insensitive(&mut catalog.packages, &name),
+            "SEQUENCE" => push_unique_case_insensitive(&mut catalog.sequences, &name),
+            "SYNONYM" => push_unique_case_insensitive(&mut catalog.synonyms, &name),
+            "TYPE" => push_unique_case_insensitive(&mut catalog.types, &name),
+            "TRIGGER" => push_unique_case_insensitive(&mut catalog.triggers, &name),
+            "INDEX" => push_unique_case_insensitive(&mut catalog.indexes, &name),
+            _ => {}
+        }
+
+        idx += 1;
+    }
+}
+
+fn oracle_catalog_from_test1_script() -> MysqlFamilyScriptCatalog {
+    let mut catalog = MysqlFamilyScriptCatalog::default();
+    oracle_collect_script_catalog_entries(load_intellisense_test_file("test1.txt"), &mut catalog);
+    catalog
+}
+
 fn oracle_catalog_from_test_all_scripts() -> MysqlFamilyScriptCatalog {
     let mut catalog = MysqlFamilyScriptCatalog::default();
 
     for (_, script) in oracle_test_all_intellisense_scripts() {
-        oracle_collect_script_signatures(script, &mut catalog);
-        let tokens = super::query_text::tokenize_sql(script);
-        let mut idx = 0usize;
-        while idx < tokens.len() {
-            if !token_word_eq(tokens.get(idx), "CREATE") {
-                idx += 1;
-                continue;
-            }
-
-            let Some((kind, name_idx)) = oracle_create_kind_and_name_idx(&tokens, idx) else {
-                idx += 1;
-                continue;
-            };
-            let Some((name, after_name_idx)) = script_object_name_at(&tokens, name_idx) else {
-                idx += 1;
-                continue;
-            };
-
-            match kind.as_str() {
-                "TABLE" => {
-                    push_unique_case_insensitive(&mut catalog.tables, &name);
-                    if matches!(tokens.get(after_name_idx), Some(SqlToken::Symbol(symbol)) if symbol == "(")
-                    {
-                        catalog.columns.insert(
-                            name.to_ascii_uppercase(),
-                            collect_create_table_columns(&tokens, after_name_idx),
-                        );
-                    }
-                }
-                "VIEW" => {
-                    push_unique_case_insensitive(&mut catalog.views, &name);
-                    let statement_end = tokens
-                        .iter()
-                        .enumerate()
-                        .skip(after_name_idx)
-                        .find_map(|(idx, token)| {
-                            matches!(token, SqlToken::Symbol(symbol) if symbol == ";")
-                                .then_some(idx)
-                        })
-                        .unwrap_or(tokens.len());
-                    if let Some(as_idx) = tokens
-                        .iter()
-                        .enumerate()
-                        .take(statement_end)
-                        .skip(after_name_idx)
-                        .find_map(|(idx, token)| token_word_eq(Some(token), "AS").then_some(idx))
-                    {
-                        let columns = intellisense_context::extract_select_list_columns(
-                            &tokens[as_idx + 1..statement_end],
-                        );
-                        if !columns.is_empty() {
-                            catalog.columns.insert(name.to_ascii_uppercase(), columns);
-                        }
-                    }
-                }
-                "MATERIALIZED VIEW" => push_unique_case_insensitive(
-                    &mut catalog.materialized_views,
-                    &name,
-                ),
-                "PROCEDURE" => push_unique_case_insensitive(&mut catalog.procedures, &name),
-                "FUNCTION" => push_unique_case_insensitive(&mut catalog.functions, &name),
-                "PACKAGE" => push_unique_case_insensitive(&mut catalog.packages, &name),
-                "SEQUENCE" => push_unique_case_insensitive(&mut catalog.sequences, &name),
-                "SYNONYM" => push_unique_case_insensitive(&mut catalog.synonyms, &name),
-                "TYPE" => push_unique_case_insensitive(&mut catalog.types, &name),
-                "TRIGGER" => push_unique_case_insensitive(&mut catalog.triggers, &name),
-                "INDEX" => push_unique_case_insensitive(&mut catalog.indexes, &name),
-                _ => {}
-            }
-
-            idx += 1;
-        }
+        oracle_collect_script_catalog_entries(script, &mut catalog);
     }
 
     catalog
@@ -3439,6 +3647,13 @@ fn audit_final_suggestions_impl(
     let column_scope = (!column_tables.is_empty()).then(|| column_tables.clone());
     let expr_keyword_ctx =
         SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables, has, Some(db));
+    let mysql_named_value_suggestions = SqlEditorWidget::mysql_named_value_suggestions_for_context(
+        &mut data,
+        &prefix,
+        &ctx,
+        has,
+        Some(db),
+    );
     let early_signature_argument_suggestions = if !crate::sql_text::mysql_compatibility_for_sql(
         "",
         Some(db),
@@ -3562,6 +3777,7 @@ fn audit_final_suggestions_impl(
         );
     if suppresses_existing_identifier_completion
         && early_signature_argument_suggestions.is_empty()
+        && mysql_named_value_suggestions.is_empty()
     {
         return (None, Vec::new(), Vec::new());
     }
@@ -3763,6 +3979,8 @@ fn audit_final_suggestions_impl(
             && !expr_keyword_ctx.at_exception_name);
     let suggestions = if !qualified_member_suggestions.is_empty() {
         qualified_member_suggestions
+    } else if !mysql_named_value_suggestions.is_empty() {
+        mysql_named_value_suggestions.clone()
     } else if at_data_type {
         if data_type_position.is_some_and(|position| {
             SqlEditorWidget::data_type_position_allows_user_type_objects(position, Some(db))
@@ -46620,6 +46838,7 @@ fn query_completion_suggestions_with_data(
                 !prefix.is_empty(),
             );
     let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, word_start);
+    let raw_qualifier = SqlEditorWidget::raw_qualifier_before_word_in_text(&sql, word_start);
     let data_for_virtual = Arc::new(Mutex::new(data.clone()));
     let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
     let connection = create_shared_connection();
@@ -46657,6 +46876,13 @@ fn query_completion_suggestions_with_data(
             Some(db_type),
             None,
         );
+    let mysql_named_value_suggestions = SqlEditorWidget::mysql_named_value_suggestions_for_context(
+        data,
+        &prefix,
+        &deep_ctx,
+        !prefix.is_empty(),
+        Some(db_type),
+    );
     if SqlEditorWidget::cursor_alias_declaration_blocks_completion(
         analysis.cursor_in_alias_declaration,
         None,
@@ -46669,6 +46895,7 @@ fn query_completion_suggestions_with_data(
     ) && early_signature_argument_suggestions.is_empty()
         && early_builtin_function_call_suggestions.is_empty()
         && early_expected_keyword_suggestions.is_empty()
+        && SqlEditorWidget::exact_catalog_keyword_for_prefix(&prefix, Some(db_type)).is_none()
     {
         return Vec::new();
     }
@@ -46712,12 +46939,42 @@ fn query_completion_suggestions_with_data(
         exclude_current_identifier_chain,
         Some(db_type),
     );
-    let at_data_type_position = SqlEditorWidget::data_type_position_for_context_for_db(
+    let data_type_position = SqlEditorWidget::data_type_position_for_context_for_db(
         &deep_ctx,
         exclude_current_identifier_chain,
         Some(db_type),
-    )
-    .is_some();
+    );
+    let at_data_type_position = data_type_position.is_some();
+    let local_record_member_suggestions = qualifier.as_deref().and_then(|qualifier| {
+        SqlEditorWidget::collect_local_record_member_suggestions(
+            qualifier,
+            &prefix,
+            expanded.cursor_in_statement,
+            raw_qualifier.as_deref(),
+            &analysis,
+        )
+    });
+    let has_resolved_local_record_member_scope = local_record_member_suggestions.is_some();
+    let local_rowtype_member_sources = qualifier
+        .as_deref()
+        .map(|qualifier| {
+            SqlEditorWidget::local_rowtype_member_sources_for_qualifier(
+                qualifier,
+                expanded.cursor_in_statement,
+                raw_qualifier.as_deref(),
+                &analysis,
+            )
+        })
+        .unwrap_or_default();
+    let local_rowtype_member_suggestions = if !local_rowtype_member_sources.is_empty() {
+        data.get_column_suggestions(&prefix, Some(&local_rowtype_member_sources))
+    } else {
+        Vec::new()
+    };
+    let qualified_member_suggestions = qualifier
+        .as_deref()
+        .map(|qualifier| data.get_member_suggestions(qualifier, &prefix, false))
+        .unwrap_or_default();
     let create_table_declared_column_suggestions = if qualifier.is_none() {
         SqlEditorWidget::create_table_declared_column_suggestions_for_context(
             &deep_ctx,
@@ -46746,10 +47003,73 @@ fn query_completion_suggestions_with_data(
         expr_kw,
     )
     .allowance(context, qualifier.as_deref(), expr_kw);
-    let mut suggestions = if let Some(suggestions) = create_table_declared_column_suggestions {
+    let at_value_only_no_expected_keyword_slot = qualifier.is_none()
+        && SqlEditorWidget::cursor_is_at_value_only_no_expected_keyword_slot_for_context(
+            &deep_ctx,
+            !prefix.is_empty(),
+            Some(db_type),
+        );
+    let at_completed_oracle_sequence_pseudocolumn = qualifier.is_none()
+        && SqlEditorWidget::cursor_is_after_oracle_sequence_pseudocolumn_for_context(
+            &deep_ctx,
+            !prefix.is_empty(),
+            Some(db_type),
+        );
+    let at_column_property_argument_slot = qualifier.is_none()
+        && SqlEditorWidget::cursor_is_at_column_property_argument_slot_for_context(
+            &deep_ctx,
+            !prefix.is_empty(),
+            Some(db_type),
+        );
+    let expected_object_kind = if qualifier.is_none() {
+        SqlEditorWidget::expected_object_suggestion_kind_for_db(
+            &prefix,
+            None,
+            &deep_ctx,
+            Some(db_type),
+        )
+    } else {
+        None
+    };
+    let expected_object_suggestions = if source_allowance.expected_object_suggestions {
+        expected_object_kind
+            .map(|kind| {
+                SqlEditorWidget::collect_expected_object_suggestions_for_kind_for_db(
+                    data,
+                    &prefix,
+                    kind,
+                    Some(db_type),
+                )
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let replace_table_context_with_expected_objects = expected_object_kind.is_some();
+    let at_dedicated_column_slot = create_table_declared_column_suggestions.is_some()
+        || create_table_storage_column_suggestions.is_some();
+    let mut suggestions = if has_resolved_local_record_member_scope {
+        SqlEditorWidget::merge_suggestions_with_context_aliases(
+            local_record_member_suggestions.unwrap_or_default(),
+            local_rowtype_member_suggestions,
+            false,
+        )
+    } else if !local_rowtype_member_sources.is_empty() {
+        local_rowtype_member_suggestions
+    } else if !qualified_member_suggestions.is_empty() {
+        qualified_member_suggestions
+    } else if !mysql_named_value_suggestions.is_empty() {
+        mysql_named_value_suggestions
+    } else if replace_table_context_with_expected_objects {
+        expected_object_suggestions
+    } else if let Some(suggestions) = create_table_declared_column_suggestions {
         suggestions
     } else if let Some(suggestions) = create_table_storage_column_suggestions {
         suggestions
+    } else if data_type_position.is_some_and(|position| {
+        SqlEditorWidget::data_type_position_allows_user_type_objects(position, Some(db_type))
+    }) {
+        data.get_type_object_suggestions(&prefix)
     } else if qualifier.is_none()
         && ((at_keyword_only_identifier_slot && !at_column_target_list)
             || (at_keyword_only_slot && !at_column_target_list)
@@ -46829,6 +47149,33 @@ fn query_completion_suggestions_with_data(
         matches!(context, SqlContext::TableName) || force_context_name_qualifier_head,
         qualifier.is_some(),
     );
+    let local_qualifier_head_suggestions = if force_context_name_qualifier_head
+        && (SqlEditorWidget::collect_local_record_member_suggestions(
+            &prefix,
+            "",
+            expanded.cursor_in_statement,
+            None,
+            &analysis,
+        )
+        .is_some()
+            || !SqlEditorWidget::local_rowtype_member_sources_for_qualifier(
+                &prefix,
+                expanded.cursor_in_statement,
+                None,
+                &analysis,
+            )
+            .is_empty())
+    {
+        vec![prefix.clone()]
+    } else {
+        Vec::new()
+    };
+    suggestions = SqlEditorWidget::maybe_merge_suggestions_with_context_aliases(
+        suggestions,
+        local_qualifier_head_suggestions,
+        force_context_name_qualifier_head,
+        false,
+    );
     let mysql_trigger_pseudo_rows = if force_context_name_qualifier_head {
         SqlEditorWidget::collect_mysql_trigger_pseudo_row_suggestions(&prefix, expr_kw, Some(db_type))
     } else {
@@ -46851,7 +47198,14 @@ fn query_completion_suggestions_with_data(
             );
         }
     }
-    if SqlEditorWidget::should_append_exact_catalog_keyword_after_context_filters(
+    let expected_keyword_before_current_identifier =
+        SqlEditorWidget::expected_catalog_keyword_before_current_identifier(
+            &prefix,
+            &deep_ctx,
+            Some(db_type),
+            expr_kw,
+        );
+    if SqlEditorWidget::should_append_expected_catalog_keyword_after_context_filters(
         context,
         None,
         source_allowance,
@@ -46860,18 +47214,11 @@ fn query_completion_suggestions_with_data(
         false,
         false,
         SqlEditorWidget::cursor_prefix_starts_relation_name_slot(&deep_ctx),
-        SqlEditorWidget::exact_keyword_expected_before_current_identifier(
-            &prefix,
-            &deep_ctx,
-            Some(db_type),
-            expr_kw,
-        ),
+        expected_keyword_before_current_identifier.as_deref(),
     ) {
-        SqlEditorWidget::append_exact_catalog_keyword_suggestion(
-            &mut suggestions,
-            &prefix,
-            Some(db_type),
-        );
+        if let Some(keyword) = expected_keyword_before_current_identifier {
+            SqlEditorWidget::append_catalog_keyword_suggestion(&mut suggestions, &keyword);
+        }
     }
     if include_locals {
         let at_name_only_local_symbol_slot =
@@ -46892,6 +47239,14 @@ fn query_completion_suggestions_with_data(
                 !prefix.is_empty(),
                 Some(db_type),
             ) || SqlEditorWidget::cursor_is_at_rollback_to_savepoint_name_slot_for_context(
+                &deep_ctx,
+                !prefix.is_empty(),
+                Some(db_type),
+            ) || SqlEditorWidget::cursor_is_at_mysql_leave_iterate_label_slot_for_context(
+                &deep_ctx,
+                !prefix.is_empty(),
+                Some(db_type),
+            ) || SqlEditorWidget::cursor_is_at_mysql_prepared_statement_handle_reference_slot_for_context(
                 &deep_ctx,
                 !prefix.is_empty(),
                 Some(db_type),
@@ -46940,14 +47295,17 @@ fn query_completion_suggestions_with_data(
             || at_mysql_set_local_assignment_target_slot
             || at_prefixed_routine_local_symbol_slot
         {
-            let locals = SqlEditorWidget::collect_local_symbol_suggestions(
+            let locals = SqlEditorWidget::collect_local_symbol_suggestions_for_db(
                 &prefix,
                 expanded.cursor_in_statement,
                 &analysis,
                 &[],
+                Some(db_type),
             );
             if !locals.is_empty()
                 && (source_allowance.prepend_local_symbol_suggestions
+                    || at_name_only_local_symbol_slot
+                    || at_plsql_statement_start_local_symbol_slot
                     || at_mysql_set_local_assignment_target_slot
                     || at_prefixed_routine_local_symbol_slot)
             {
@@ -46956,7 +47314,1493 @@ fn query_completion_suggestions_with_data(
             }
         }
     }
+    let offer_full_catalog_tail = SqlEditorWidget::cursor_offers_full_catalog_safety_net(
+        qualifier.as_deref(),
+        replace_table_context_with_expected_objects,
+        context,
+        expr_kw,
+        source_allowance.base_catalog_suggestions,
+        at_keyword_only_identifier_slot || at_keyword_only_slot,
+        at_value_only_no_expected_keyword_slot,
+        at_completed_oracle_sequence_pseudocolumn,
+        at_column_property_argument_slot,
+        at_dedicated_column_slot,
+        at_data_type_position,
+        false,
+        false,
+    );
+    suggestions = SqlEditorWidget::append_full_catalog_tail(
+        data,
+        suggestions,
+        &prefix,
+        context,
+        offer_full_catalog_tail,
+    );
     suggestions
+}
+
+#[derive(Debug)]
+struct IntellisenseSweepMissing {
+    start: usize,
+    end: usize,
+    line: usize,
+    column: usize,
+    word: String,
+    prefix: String,
+    suggestion_sample: Vec<String>,
+    suggestion_count: usize,
+}
+
+struct IntellisenseSweepRun {
+    checked: usize,
+    missing: Vec<IntellisenseSweepMissing>,
+}
+
+fn oracle_test1_intellisense_data() -> IntellisenseData {
+    let catalog = oracle_catalog_from_test1_script();
+    let mut data = intellisense_data_from_mysql_family_catalog(&catalog);
+
+    for table in ["DUAL"] {
+        push_unique_case_insensitive(&mut data.tables, table);
+    }
+    data.set_columns_for_table("DUAL", vec!["DUMMY".to_string()]);
+
+    for package in ["DBMS_OUTPUT", "DBMS_RANDOM"] {
+        push_unique_case_insensitive(&mut data.packages, package);
+    }
+    data.set_members_for_qualifier_with_kinds(
+        "DBMS_OUTPUT",
+        vec![(
+            "PUT_LINE".to_string(),
+            Some(QualifiedMemberKind::Procedure),
+        )],
+    );
+    data.set_members_for_qualifier_with_kinds(
+        "DBMS_RANDOM",
+        vec![("VALUE".to_string(), Some(QualifiedMemberKind::Function))],
+    );
+    for type_name in ["SYS_REFCURSOR"] {
+        push_unique_case_insensitive(&mut data.types, type_name);
+    }
+
+    data.rebuild_indices();
+    data
+}
+
+fn mysql_test_intellisense_data(file_name: &str) -> IntellisenseData {
+    let catalog = mysql_family_catalog_from_script(load_mariadb_intellisense_test_file(file_name));
+    let mut data = intellisense_data_from_mysql_family_catalog(&catalog);
+    data.rebuild_indices();
+    data
+}
+
+fn intellisense_sweep_completion_prefix(word: &str) -> Option<String> {
+    let word = word.trim_matches(|ch| matches!(ch, '"' | '`'));
+    if word.is_empty()
+        || !word.is_ascii()
+        || word.chars().all(|ch| ch.is_ascii_digit())
+        || !word
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$' | '#'))
+    {
+        return None;
+    }
+    let first = word.chars().next()?;
+    if !first.is_ascii_alphabetic() && !matches!(first, '_' | '$' | '#') {
+        return None;
+    }
+
+    let len = word.chars().count();
+    let take = if len <= 1 {
+        len
+    } else {
+        len.saturating_sub(1).clamp(1, 4)
+    };
+    Some(word.chars().take(take).collect())
+}
+
+fn intellisense_sweep_suggestion_matches_word(suggestion: &str, expected: &str) -> bool {
+    let expected = expected
+        .trim_matches(|ch| matches!(ch, '"' | '`'))
+        .to_ascii_uppercase();
+    let normalized = suggestion
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '`'))
+        .trim_end_matches("()")
+        .to_ascii_uppercase();
+
+    if normalized == expected {
+        return true;
+    }
+    if normalized
+        .split_once('(')
+        .is_some_and(|(head, _)| head.trim().eq_ignore_ascii_case(&expected))
+    {
+        return true;
+    }
+    normalized
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && !matches!(ch, '_' | '$' | '#'))
+        .any(|part| part == expected)
+}
+
+fn intellisense_sweep_line_column(script: &str, offset: usize) -> (usize, usize) {
+    let before = script.get(..offset).unwrap_or("");
+    let line = before.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let line_start = before.rfind('\n').map_or(0, |idx| idx + 1);
+    let column = script
+        .get(line_start..offset)
+        .unwrap_or("")
+        .chars()
+        .count()
+        + 1;
+    (line, column)
+}
+
+fn intellisense_sweep_line_text(script: &str, offset: usize) -> String {
+    let line_start = script
+        .get(..offset)
+        .and_then(|text| text.rfind('\n'))
+        .map_or(0, |idx| idx + 1);
+    let line_end = script
+        .get(offset..)
+        .and_then(|text| text.find('\n'))
+        .map_or(script.len(), |idx| offset + idx);
+    script
+        .get(line_start..line_end)
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+fn intellisense_sweep_word_is_prompt_body(script: &str, span: &SqlTokenSpan) -> bool {
+    let line_start = script
+        .get(..span.start)
+        .and_then(|text| text.rfind('\n'))
+        .map_or(0, |idx| idx + 1);
+    let line_end = script
+        .get(span.start..)
+        .and_then(|text| text.find('\n'))
+        .map_or(script.len(), |idx| span.start + idx);
+    let line = script.get(line_start..line_end).unwrap_or("");
+    let trimmed = line.trim_start();
+    if !trimmed
+        .split_whitespace()
+        .next()
+        .is_some_and(|head| head.eq_ignore_ascii_case("PROMPT"))
+    {
+        return false;
+    }
+    let first_word_start = line_start + line.len().saturating_sub(trimmed.len());
+    let first_word_end = first_word_start + "PROMPT".len();
+    span.start >= first_word_end
+}
+
+fn intellisense_sweep_word_is_literal_or_comment_body(script: &str, offset: usize) -> bool {
+    let bytes = script.as_bytes();
+    let mut idx = 0usize;
+    let end = offset.min(bytes.len());
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+
+    while idx < end {
+        let byte = bytes[idx];
+        let next = bytes.get(idx + 1).copied();
+
+        if in_line_comment {
+            if byte == b'\n' {
+                in_line_comment = false;
+            }
+            idx += 1;
+            continue;
+        }
+        if in_block_comment {
+            if byte == b'*' && next == Some(b'/') {
+                in_block_comment = false;
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+            continue;
+        }
+        if in_single {
+            if byte == b'\\' {
+                idx = idx.saturating_add(2);
+            } else if byte == b'\'' && next == Some(b'\'') {
+                idx += 2;
+            } else if byte == b'\'' {
+                in_single = false;
+                idx += 1;
+            } else {
+                idx += 1;
+            }
+            continue;
+        }
+        if in_double {
+            if byte == b'\\' {
+                idx = idx.saturating_add(2);
+            } else if byte == b'"' && next == Some(b'"') {
+                idx += 2;
+            } else if byte == b'"' {
+                in_double = false;
+                idx += 1;
+            } else {
+                idx += 1;
+            }
+            continue;
+        }
+
+        match (byte, next) {
+            (b'-', Some(b'-')) => {
+                in_line_comment = true;
+                idx += 2;
+            }
+            (b'#', _) => {
+                in_line_comment = true;
+                idx += 1;
+            }
+            (b'/', Some(b'*')) => {
+                in_block_comment = true;
+                idx += 2;
+            }
+            (b'\'', _) => {
+                in_single = true;
+                idx += 1;
+            }
+            (b'"', _) => {
+                in_double = true;
+                idx += 1;
+            }
+            _ => {
+                idx += 1;
+            }
+        }
+    }
+
+    in_single || in_double || in_line_comment || in_block_comment
+}
+
+fn intellisense_sweep_word_starts_line(sql: &str, word_start: usize) -> bool {
+    let line_start = sql
+        .get(..word_start)
+        .and_then(|text| text.rfind('\n'))
+        .map_or(0, |idx| idx + 1);
+    sql.get(line_start..word_start)
+        .unwrap_or("")
+        .trim()
+        .is_empty()
+}
+
+fn intellisense_sweep_line_prefix_after_last_separator(sql: &str, word_start: usize) -> String {
+    let line_start = sql
+        .get(..word_start)
+        .and_then(|text| text.rfind('\n'))
+        .map_or(0, |idx| idx + 1);
+    let prefix = sql.get(line_start..word_start).unwrap_or("");
+    let start = prefix
+        .rfind(|ch| matches!(ch, '(' | ','))
+        .map_or(0, |idx| idx + 1);
+    prefix.get(start..).unwrap_or("").trim().to_ascii_uppercase()
+}
+
+fn intellisense_sweep_next_meaningful_word(sql: &str, start: usize) -> Option<String> {
+    let after = sql.get(start..)?;
+    super::query_text::tokenize_sql(after)
+        .into_iter()
+        .find_map(|token| token_word_text(Some(&token)).map(str::to_string))
+}
+
+fn intellisense_sweep_previous_meaningful_word(tokens: &[SqlToken], end: usize) -> Option<&str> {
+    tokens
+        .get(..end.min(tokens.len()))
+        .unwrap_or(tokens)
+        .iter()
+        .rev()
+        .find_map(|token| token_word_text(Some(token)))
+}
+
+fn intellisense_sweep_current_statement_tokens_before_cursor(
+    sql: &str,
+    cursor: usize,
+) -> Vec<SqlToken> {
+    let before_cursor = sql.get(..cursor).unwrap_or("");
+    let tokens = super::query_text::tokenize_sql(before_cursor);
+    let start = tokens
+        .iter()
+        .rposition(|token| {
+            matches!(token, SqlToken::Symbol(symbol) if symbol == ";" || symbol == "/")
+        })
+        .map_or(0, |idx| idx + 1);
+    tokens.get(start..).unwrap_or(&[]).to_vec()
+}
+
+fn intellisense_sweep_is_create_element_name_definition(
+    sql: &str,
+    cursor: usize,
+    word_start: usize,
+) -> bool {
+    if !intellisense_sweep_word_starts_line(sql, word_start) {
+        return false;
+    }
+    let tokens = intellisense_sweep_current_statement_tokens_before_cursor(sql, cursor);
+    let Some(create_idx) = tokens
+        .iter()
+        .position(|token| token_word_eq(Some(token), "CREATE"))
+    else {
+        return false;
+    };
+    let Some((kind, name_idx)) = oracle_create_kind_and_name_idx(&tokens, create_idx) else {
+        return false;
+    };
+    let Some((_, after_name_idx)) = script_object_name_at(&tokens, name_idx) else {
+        return false;
+    };
+    let tail = tokens.get(after_name_idx..).unwrap_or(&[]);
+    if !tail
+        .iter()
+        .any(|token| matches!(token, SqlToken::Symbol(symbol) if symbol == "("))
+    {
+        return false;
+    }
+
+    kind == "TABLE" || (kind == "TYPE" && tail.iter().any(|token| token_word_eq(Some(token), "OBJECT")))
+}
+
+fn intellisense_sweep_is_mysql_type_lead(word: &str) -> bool {
+    matches!(
+        word.to_ascii_uppercase().as_str(),
+        "BIGINT"
+            | "BINARY"
+            | "BIT"
+            | "BLOB"
+            | "BOOL"
+            | "BOOLEAN"
+            | "CHAR"
+            | "DATE"
+            | "DATETIME"
+            | "DEC"
+            | "DECIMAL"
+            | "DOUBLE"
+            | "ENUM"
+            | "FLOAT"
+            | "INT"
+            | "INTEGER"
+            | "JSON"
+            | "LONGBLOB"
+            | "LONGTEXT"
+            | "MEDIUMBLOB"
+            | "MEDIUMINT"
+            | "MEDIUMTEXT"
+            | "NUMERIC"
+            | "REAL"
+            | "SET"
+            | "SMALLINT"
+            | "TEXT"
+            | "TIME"
+            | "TIMESTAMP"
+            | "TINYBLOB"
+            | "TINYINT"
+            | "TINYTEXT"
+            | "VARBINARY"
+            | "VARCHAR"
+            | "YEAR"
+    )
+}
+
+fn intellisense_sweep_is_mysql_routine_parameter_definition(
+    sql: &str,
+    cursor: usize,
+    word_start: usize,
+    db_type: crate::db::DatabaseType,
+) -> bool {
+    if !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type)) {
+        return false;
+    }
+
+    let before = sql.get(..word_start).unwrap_or("").to_ascii_uppercase();
+    let create_idx = [
+        before.rfind("CREATE PROCEDURE"),
+        before.rfind("CREATE FUNCTION"),
+    ]
+    .into_iter()
+    .flatten()
+    .max();
+    let Some(create_idx) = create_idx else {
+        return false;
+    };
+    if before
+        .get(create_idx..)
+        .is_some_and(|tail| tail.contains("BEGIN"))
+    {
+        return false;
+    }
+
+    let prefix = intellisense_sweep_line_prefix_after_last_separator(sql, word_start);
+    if !(prefix.is_empty() || matches!(prefix.as_str(), "IN" | "OUT" | "INOUT")) {
+        return false;
+    }
+
+    intellisense_sweep_next_meaningful_word(sql, cursor)
+        .is_some_and(|word| intellisense_sweep_is_mysql_type_lead(&word))
+}
+
+fn intellisense_sweep_is_mysql_user_variable_assignment_target(
+    sql: &str,
+    cursor: usize,
+    word_start: usize,
+    db_type: crate::db::DatabaseType,
+) -> bool {
+    if !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type))
+        || !sql
+            .get(..word_start)
+            .unwrap_or("")
+            .trim_end()
+            .ends_with('@')
+    {
+        return false;
+    }
+
+    let tokens = intellisense_sweep_current_statement_tokens_before_cursor(sql, cursor);
+    if !tokens
+        .iter()
+        .find_map(|token| token_word_text(Some(token)))
+        .is_some_and(|word| word.eq_ignore_ascii_case("SET"))
+    {
+        return false;
+    }
+
+    cursor <= sql.len()
+        && sql
+            .get(cursor..)
+            .unwrap_or("")
+            .trim_start()
+            .starts_with('=')
+}
+
+fn intellisense_sweep_is_mysql_first_user_variable(
+    sql: &str,
+    word_start: usize,
+    original_word: &str,
+    db_type: crate::db::DatabaseType,
+) -> bool {
+    if !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type))
+        || word_start == 0
+        || sql.as_bytes().get(word_start - 1) != Some(&b'@')
+    {
+        return false;
+    }
+    let needle = format!("@{}", original_word.trim_matches('`'));
+    !sql
+        .get(..word_start - 1)
+        .unwrap_or("")
+        .to_ascii_uppercase()
+        .contains(&needle.to_ascii_uppercase())
+}
+
+fn intellisense_sweep_is_mysql_window_name_forward_reference(
+    sql: &str,
+    cursor: usize,
+    original_word: &str,
+    db_type: crate::db::DatabaseType,
+) -> bool {
+    if !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type)) {
+        return false;
+    }
+    let tokens = intellisense_sweep_current_statement_tokens_before_cursor(sql, cursor);
+    let current_idx = tokens.len().saturating_sub(1);
+    if !intellisense_sweep_previous_meaningful_word(&tokens, current_idx)
+        .is_some_and(|word| word.eq_ignore_ascii_case("OVER"))
+    {
+        return false;
+    }
+    let upper_tail = sql.get(cursor..).unwrap_or("").to_ascii_uppercase();
+    let name = original_word.trim_matches('`').to_ascii_uppercase();
+    upper_tail.contains("WINDOW") && upper_tail.contains(&format!("{name} AS"))
+}
+
+fn intellisense_sweep_is_mysql_name_definition_by_previous_word(
+    tokens: &[SqlToken],
+    current_idx: usize,
+    db_type: crate::db::DatabaseType,
+) -> bool {
+    if !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type)) {
+        return false;
+    }
+    match intellisense_sweep_previous_meaningful_word(tokens, current_idx)
+        .map(|word| word.to_ascii_uppercase())
+        .as_deref()
+    {
+        Some("SAVEPOINT" | "PREPARE" | "DECLARE" | "AS" | "WITH" | "RECURSIVE") => true,
+        _ => false,
+    }
+}
+
+fn intellisense_sweep_is_definition_slot(
+    sql: &str,
+    cursor: usize,
+    word_start: usize,
+    original_word: &str,
+    db_type: crate::db::DatabaseType,
+    deep_ctx: &intellisense_context::CursorContext,
+) -> bool {
+    let tokens = super::query_text::tokenize_sql(sql.get(..cursor).unwrap_or(""));
+    let current_idx = tokens.len().saturating_sub(1);
+    if intellisense_sweep_is_mysql_name_definition_by_previous_word(&tokens, current_idx, db_type) {
+        return true;
+    }
+    if intellisense_sweep_is_mysql_first_user_variable(sql, word_start, original_word, db_type) {
+        return true;
+    }
+    if intellisense_sweep_is_mysql_window_name_forward_reference(
+        sql,
+        cursor,
+        original_word,
+        db_type,
+    ) {
+        return true;
+    }
+    if intellisense_sweep_previous_meaningful_word(&tokens, current_idx)
+        .is_some_and(|word| word.eq_ignore_ascii_case("CONSTRAINT"))
+    {
+        return true;
+    }
+    if intellisense_sweep_previous_meaningful_word(&tokens, current_idx)
+        .is_some_and(|word| word.eq_ignore_ascii_case("FOR"))
+        && intellisense_sweep_next_meaningful_word(sql, cursor)
+            .is_some_and(|word| word.eq_ignore_ascii_case("IN"))
+    {
+        return true;
+    }
+    if intellisense_sweep_is_create_element_name_definition(sql, cursor, word_start) {
+        return true;
+    }
+    if intellisense_sweep_is_mysql_routine_parameter_definition(sql, cursor, word_start, db_type) {
+        return true;
+    }
+    if intellisense_sweep_is_mysql_user_variable_assignment_target(
+        sql,
+        cursor,
+        word_start,
+        db_type,
+    ) {
+        return true;
+    }
+
+    let original_upper = original_word
+        .trim_matches(|ch| matches!(ch, '"' | '`'))
+        .to_ascii_uppercase();
+    if crate::sql_text::is_sql_keyword_for_db(&original_upper, db_type)
+        || !intellisense_sweep_word_starts_line(sql, word_start)
+    {
+        return false;
+    }
+
+    let statement_tokens = deep_ctx.statement_tokens.as_ref();
+    let statement_end = SqlEditorWidget::expected_suggestion_context_end(
+        statement_tokens,
+        deep_ctx.cursor_token_len,
+        true,
+    );
+    if !SqlEditorWidget::cursor_is_in_plsql_declaration_region(statement_tokens, statement_end) {
+        return false;
+    }
+
+    intellisense_sweep_next_meaningful_word(sql, cursor).is_some()
+}
+
+fn intellisense_sweep_word_skip_context(
+    script_with_cursor: &str,
+    db_type: crate::db::DatabaseType,
+    original_word: &str,
+) -> bool {
+    const MARKER: &str = "__CODEX_CURSOR__";
+    let Some(cursor) = script_with_cursor.find(MARKER) else {
+        return true;
+    };
+    let sql = script_with_cursor.replacen(MARKER, "", 1);
+    let (routine_cache, expanded) =
+        SqlEditorWidget::build_routine_symbol_cache_bundle_for_test_for_db_type(
+            &sql,
+            cursor,
+            Some(db_type),
+        );
+    let analysis = SqlEditorWidget::build_intellisense_analysis_from_routine_cache(
+        &routine_cache,
+        expanded.cursor_in_statement,
+    );
+    let deep_ctx = analysis.context.clone();
+    let (_, word_start, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+
+    analysis.cursor_in_alias_declaration
+        || deep_ctx.ddl_new_name_position
+        || SqlEditorWidget::cursor_is_at_create_object_new_name(
+            &deep_ctx,
+            true,
+            Some(db_type),
+        )
+        || SqlEditorWidget::cursor_is_at_rename_target_new_name_slot_for_context(&deep_ctx, true)
+        || SqlEditorWidget::cursor_is_at_ddl_partition_new_name_slot_for_context(&deep_ctx, true)
+        || SqlEditorWidget::cursor_is_at_ddl_table_index_new_name_slot_for_context(&deep_ctx, true)
+        || SqlEditorWidget::cursor_is_inside_post_table_modifier_value_slot_for_context(&deep_ctx, true)
+        || SqlEditorWidget::cursor_is_at_mysql_oracle_only_ddl_value_slot_for_context(
+            &deep_ctx,
+            true,
+            Some(db_type),
+        )
+        || SqlEditorWidget::cursor_is_at_plsql_named_end_target_slot_for_context(
+            &deep_ctx,
+            true,
+            Some(db_type),
+        )
+        || SqlEditorWidget::cursor_is_at_plsql_declaration_object_name_slot_for_context(
+            &deep_ctx,
+            true,
+            Some(db_type),
+        )
+        || intellisense_sweep_is_definition_slot(
+            &sql,
+            cursor,
+            word_start,
+            original_word,
+            db_type,
+            &deep_ctx,
+        )
+}
+
+fn intellisense_sweep_render_out(
+    script: &str,
+    checked: usize,
+    missing: &[IntellisenseSweepMissing],
+    source_label: &str,
+    db_type: crate::db::DatabaseType,
+    metadata_label: Option<&str>,
+) -> String {
+    let mut output = String::with_capacity(script.len() + missing.len() * 96 + 512);
+    let mut cursor = 0usize;
+    for miss in missing {
+        output.push_str(script.get(cursor..miss.start).unwrap_or(""));
+        output.push_str("[[");
+        output.push_str(script.get(miss.start..miss.end).unwrap_or(&miss.word));
+        output.push_str("]]");
+        cursor = miss.end;
+    }
+    output.push_str(script.get(cursor..).unwrap_or(""));
+
+    output.push_str("\n\n-- =========================================================\n");
+    output.push_str("-- IntelliSense sweep report generated by intellisense sweep\n");
+    output.push_str(&format!("-- source: {source_label}\n"));
+    output.push_str(&format!("-- db: {db_type:?}\n"));
+    if let Some(metadata_label) = metadata_label {
+        output.push_str(&format!("-- metadata: {metadata_label}\n"));
+    }
+    output.push_str(&format!("-- checked: {checked}\n"));
+    output.push_str(&format!("-- missing: {}\n", missing.len()));
+    output.push_str("-- marker: [[word]] means not suggested for the tested prefix\n");
+    if missing.is_empty() {
+        output.push_str("-- missing tokens: none\n");
+    } else {
+        output.push_str("-- missing tokens:\n");
+        for miss in missing {
+            let suggestions = if miss.suggestion_sample.is_empty() {
+                "[]".to_string()
+            } else {
+                format!("[{}]", miss.suggestion_sample.join(", "))
+            };
+            output.push_str(&format!(
+                "--   {}:{} word={} prefix={} suggestions={} total={} line={}\n",
+                miss.line,
+                miss.column,
+                miss.word,
+                miss.prefix,
+                suggestions,
+                miss.suggestion_count,
+                intellisense_sweep_line_text(script, miss.start)
+            ));
+        }
+    }
+    output.push_str("-- =========================================================\n");
+    output
+}
+
+fn intellisense_sweep_panic_payload_text(err: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = err.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = err.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "panic".to_string()
+}
+
+fn intellisense_sweep_run(
+    script: &str,
+    db_type: crate::db::DatabaseType,
+    base_data: &IntellisenseData,
+) -> IntellisenseSweepRun {
+    const MARKER: &str = "__CODEX_CURSOR__";
+
+    let spans = match db_type {
+        crate::db::DatabaseType::MySQL | crate::db::DatabaseType::MariaDB => {
+            super::query_text::tokenize_sql_spanned_with_mysql_compat(script, true)
+        }
+        crate::db::DatabaseType::Oracle => super::query_text::tokenize_sql_spanned(script),
+    };
+    let mut missing = Vec::new();
+    let mut checked = 0usize;
+
+    for span in spans {
+        let SqlToken::Word(word) = &span.token else {
+            continue;
+        };
+        let Some(prefix) = intellisense_sweep_completion_prefix(word) else {
+            continue;
+        };
+        if intellisense_sweep_word_is_prompt_body(script, &span) {
+            continue;
+        }
+        if intellisense_sweep_word_is_literal_or_comment_body(script, span.start) {
+            continue;
+        }
+
+        let marked = format!(
+            "{}{}{}{}",
+            script.get(..span.start).unwrap_or(""),
+            prefix,
+            MARKER,
+            script.get(span.end..).unwrap_or("")
+        );
+        let skip = panic::catch_unwind(AssertUnwindSafe(|| {
+            intellisense_sweep_word_skip_context(&marked, db_type, word)
+        }))
+        .unwrap_or(false);
+        if skip {
+            continue;
+        }
+
+        checked += 1;
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            let mut data = base_data.clone();
+            query_completion_suggestions_with_data(&marked, db_type, true, &mut data)
+        }));
+
+        let (matched, suggestion_sample, suggestion_count) = match result {
+            Ok(suggestions) => {
+                let matched = suggestions
+                    .iter()
+                    .any(|suggestion| intellisense_sweep_suggestion_matches_word(suggestion, word));
+                let count = suggestions.len();
+                let sample = suggestions.into_iter().take(16).collect::<Vec<_>>();
+                (matched, sample, count)
+            }
+            Err(err) => (
+                false,
+                vec![format!(
+                    "<panic: {}>",
+                    intellisense_sweep_panic_payload_text(err.as_ref())
+                )],
+                0,
+            ),
+        };
+
+        if !matched {
+            let (line, column) = intellisense_sweep_line_column(script, span.start);
+            missing.push(IntellisenseSweepMissing {
+                start: span.start,
+                end: span.end,
+                line,
+                column,
+                word: word.clone(),
+                prefix,
+                suggestion_sample,
+                suggestion_count,
+            });
+        }
+    }
+
+    IntellisenseSweepRun { checked, missing }
+}
+
+fn intellisense_sweep_db_type_from_env(value: &str) -> Option<crate::db::DatabaseType> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "oracle" | "ora" => Some(crate::db::DatabaseType::Oracle),
+        "mysql" => Some(crate::db::DatabaseType::MySQL),
+        "mariadb" | "maria" => Some(crate::db::DatabaseType::MariaDB),
+        _ => None,
+    }
+}
+
+fn intellisense_sweep_add_names(target: &mut Vec<String>, value: Option<&serde_json::Value>) {
+    let Some(value) = value else {
+        return;
+    };
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                if let Some(name) = item.as_str() {
+                    push_unique_case_insensitive(target, name);
+                } else if let Some(name) = item.get("name").and_then(serde_json::Value::as_str) {
+                    push_unique_case_insensitive(target, name);
+                }
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for key in map.keys() {
+                push_unique_case_insensitive(target, key);
+            }
+        }
+        serde_json::Value::String(name) => push_unique_case_insensitive(target, name),
+        _ => {}
+    }
+}
+
+fn intellisense_sweep_string_array(value: &serde_json::Value) -> Vec<String> {
+    match value {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|item| {
+                item.as_str()
+                    .or_else(|| item.get("name").and_then(serde_json::Value::as_str))
+                    .map(str::to_string)
+            })
+            .collect(),
+        serde_json::Value::String(value) => vec![value.to_string()],
+        _ => Vec::new(),
+    }
+}
+
+fn intellisense_sweep_apply_columns_from_map(data: &mut IntellisenseData, value: &serde_json::Value) {
+    let Some(map) = value.as_object() else {
+        return;
+    };
+    for (table, columns_value) in map {
+        let columns = intellisense_sweep_string_array(columns_value);
+        if !columns.is_empty() {
+            data.set_columns_for_table(table, columns);
+        }
+    }
+}
+
+fn intellisense_sweep_kind_from_value(value: Option<&serde_json::Value>) -> Option<QualifiedMemberKind> {
+    value
+        .and_then(serde_json::Value::as_str)
+        .and_then(QualifiedMemberKind::from_object_type_name)
+}
+
+fn intellisense_sweep_member_with_kind(
+    value: &serde_json::Value,
+) -> Option<(String, Option<QualifiedMemberKind>)> {
+    if let Some(name) = value.as_str() {
+        return Some((name.to_string(), None));
+    }
+    let name = value.get("name").and_then(serde_json::Value::as_str)?;
+    let kind = intellisense_sweep_kind_from_value(value.get("type").or_else(|| value.get("kind")));
+    Some((name.to_string(), kind))
+}
+
+fn intellisense_sweep_apply_members(data: &mut IntellisenseData, value: Option<&serde_json::Value>) {
+    let Some(serde_json::Value::Object(map)) = value else {
+        return;
+    };
+    for (qualifier, members_value) in map {
+        let members = match members_value {
+            serde_json::Value::Array(items) => items
+                .iter()
+                .filter_map(intellisense_sweep_member_with_kind)
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        if members.is_empty() {
+            continue;
+        }
+        if members.iter().any(|(_, kind)| kind.is_some()) {
+            data.set_members_for_qualifier_with_kinds(qualifier, members);
+        } else {
+            data.set_members_for_qualifier(
+                qualifier,
+                members.into_iter().map(|(name, _)| name).collect(),
+            );
+        }
+    }
+}
+
+fn intellisense_sweep_apply_relation_members(
+    data: &mut IntellisenseData,
+    value: Option<&serde_json::Value>,
+) {
+    let Some(serde_json::Value::Object(map)) = value else {
+        return;
+    };
+    for (qualifier, members_value) in map {
+        let members = intellisense_sweep_string_array(members_value);
+        if !members.is_empty() {
+            data.set_relation_members_for_qualifier(qualifier, members);
+        }
+    }
+}
+
+fn intellisense_sweep_signature_label_from_value(
+    key: &str,
+    value: &serde_json::Value,
+) -> Option<SignatureLabel> {
+    if let Some(text) = value.as_str() {
+        return Some(SignatureLabel {
+            text: text.to_string(),
+            arg_spans: Vec::new(),
+        });
+    }
+
+    let text = value
+        .get("text")
+        .or_else(|| value.get("label"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            let args = value.get("args").map(intellisense_sweep_string_array)?;
+            if args.is_empty() {
+                None
+            } else {
+                Some(format!("{}({})", key, args.join(", ")))
+            }
+        })?;
+
+    Some(SignatureLabel {
+        text,
+        arg_spans: Vec::new(),
+    })
+}
+
+fn intellisense_sweep_apply_signatures(data: &mut IntellisenseData, value: Option<&serde_json::Value>) {
+    let Some(value) = value else {
+        return;
+    };
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, label_value) in map {
+                data.set_signature(
+                    key.to_ascii_uppercase(),
+                    intellisense_sweep_signature_label_from_value(key, label_value),
+                );
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                let Some(key) = item
+                    .get("key")
+                    .or_else(|| item.get("name"))
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+                data.set_signature(
+                    key.to_ascii_uppercase(),
+                    intellisense_sweep_signature_label_from_value(key, item),
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn intellisense_sweep_column_meta_from_value(value: &serde_json::Value) -> Option<ColumnMeta> {
+    let object = value.as_object()?;
+    Some(ColumnMeta {
+        type_display: object
+            .get("type")
+            .or_else(|| object.get("data_type"))
+            .or_else(|| object.get("type_display"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        nullable: object
+            .get("nullable")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true),
+        is_primary_key: object
+            .get("primary_key")
+            .or_else(|| object.get("is_primary_key"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+fn intellisense_sweep_apply_column_meta(data: &mut IntellisenseData, value: Option<&serde_json::Value>) {
+    let Some(serde_json::Value::Object(tables)) = value else {
+        return;
+    };
+    for (table, columns_value) in tables {
+        let Some(columns) = columns_value.as_object() else {
+            continue;
+        };
+        let meta = columns
+            .iter()
+            .filter_map(|(column, meta_value)| {
+                intellisense_sweep_column_meta_from_value(meta_value)
+                    .map(|meta| (column.clone(), meta))
+            })
+            .collect::<HashMap<_, _>>();
+        if !meta.is_empty() {
+            data.set_column_meta_for_table(table, meta);
+        }
+    }
+}
+
+fn intellisense_sweep_fk_from_value(value: &serde_json::Value) -> Option<ForeignKeyMeta> {
+    Some(ForeignKeyMeta {
+        columns: intellisense_sweep_string_array(value.get("columns")?),
+        ref_table: value
+            .get("ref_table")
+            .or_else(|| value.get("referenced_table"))
+            .and_then(serde_json::Value::as_str)?
+            .to_string(),
+        ref_columns: intellisense_sweep_string_array(
+            value
+                .get("ref_columns")
+                .or_else(|| value.get("referenced_columns"))?,
+        ),
+    })
+}
+
+fn intellisense_sweep_apply_foreign_keys(data: &mut IntellisenseData, value: Option<&serde_json::Value>) {
+    let Some(serde_json::Value::Object(tables)) = value else {
+        return;
+    };
+    for (table, fks_value) in tables {
+        let fks = match fks_value {
+            serde_json::Value::Array(items) => items
+                .iter()
+                .filter_map(intellisense_sweep_fk_from_value)
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        if !fks.is_empty() {
+            data.set_foreign_keys_for_table(table, fks);
+        }
+    }
+}
+
+fn intellisense_sweep_apply_object_entry(data: &mut IntellisenseData, object: &serde_json::Map<String, serde_json::Value>) {
+    let Some(name) = object.get("name").and_then(serde_json::Value::as_str) else {
+        return;
+    };
+    let kind = object
+        .get("type")
+        .or_else(|| object.get("kind"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("TABLE")
+        .to_ascii_uppercase();
+
+    match kind.as_str() {
+        "TABLE" | "BASE TABLE" => push_unique_case_insensitive(&mut data.tables, name),
+        "VIEW" | "EDITIONING VIEW" => push_unique_case_insensitive(&mut data.views, name),
+        "MATERIALIZED VIEW" | "MVIEW" => {
+            push_unique_case_insensitive(&mut data.materialized_views, name)
+        }
+        "TYPE" | "TYPE BODY" => push_unique_case_insensitive(&mut data.types, name),
+        "TRIGGER" => push_unique_case_insensitive(&mut data.triggers, name),
+        "EVENT" => push_unique_case_insensitive(&mut data.events, name),
+        "INDEX" => push_unique_case_insensitive(&mut data.indexes, name),
+        "PROCEDURE" => push_unique_case_insensitive(&mut data.procedures, name),
+        "FUNCTION" => push_unique_case_insensitive(&mut data.functions, name),
+        "PACKAGE" | "PACKAGE BODY" => push_unique_case_insensitive(&mut data.packages, name),
+        "SEQUENCE" => push_unique_case_insensitive(&mut data.sequences, name),
+        "SYNONYM" => push_unique_case_insensitive(&mut data.synonyms, name),
+        "PUBLIC SYNONYM" => push_unique_case_insensitive(&mut data.public_synonyms, name),
+        "DATABASE LINK" => push_unique_case_insensitive(&mut data.database_links, name),
+        "DIRECTORY" => push_unique_case_insensitive(&mut data.directories, name),
+        "LIBRARY" => push_unique_case_insensitive(&mut data.libraries, name),
+        "CLUSTER" => push_unique_case_insensitive(&mut data.clusters, name),
+        "CONTEXT" => push_unique_case_insensitive(&mut data.contexts, name),
+        "DIMENSION" => push_unique_case_insensitive(&mut data.dimensions, name),
+        "OPERATOR" => push_unique_case_insensitive(&mut data.operators, name),
+        "INDEXTYPE" => push_unique_case_insensitive(&mut data.indextypes, name),
+        "EDITION" => push_unique_case_insensitive(&mut data.editions, name),
+        "JAVA SOURCE" => push_unique_case_insensitive(&mut data.java_sources, name),
+        "JAVA CLASS" => push_unique_case_insensitive(&mut data.java_classes, name),
+        "JAVA RESOURCE" => push_unique_case_insensitive(&mut data.java_resources, name),
+        "USER" | "SCHEMA" => push_unique_case_insensitive(&mut data.users, name),
+        _ => {}
+    }
+
+    if let Some(columns) = object.get("columns") {
+        let columns = intellisense_sweep_string_array(columns);
+        if !columns.is_empty() {
+            data.set_columns_for_table(name, columns);
+        }
+    }
+    if let Some(members) = object.get("members") {
+        let members = match members {
+            serde_json::Value::Array(items) => items
+                .iter()
+                .filter_map(intellisense_sweep_member_with_kind)
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        if !members.is_empty() {
+            if members.iter().any(|(_, kind)| kind.is_some()) {
+                data.set_members_for_qualifier_with_kinds(name, members);
+            } else {
+                data.set_members_for_qualifier(
+                    name,
+                    members.into_iter().map(|(name, _)| name).collect(),
+                );
+            }
+        }
+    }
+    if let Some(relation_members) = object.get("relation_members") {
+        let relation_members = intellisense_sweep_string_array(relation_members);
+        if !relation_members.is_empty() {
+            data.set_relation_members_for_qualifier(name, relation_members);
+        }
+    }
+}
+
+fn intellisense_sweep_apply_metadata_value(data: &mut IntellisenseData, value: &serde_json::Value) {
+    intellisense_sweep_add_names(&mut data.tables, value.get("tables"));
+    intellisense_sweep_add_names(&mut data.views, value.get("views"));
+    intellisense_sweep_add_names(&mut data.materialized_views, value.get("materialized_views"));
+    intellisense_sweep_add_names(&mut data.types, value.get("types"));
+    intellisense_sweep_add_names(&mut data.triggers, value.get("triggers"));
+    intellisense_sweep_add_names(&mut data.events, value.get("events"));
+    intellisense_sweep_add_names(&mut data.indexes, value.get("indexes"));
+    intellisense_sweep_add_names(&mut data.procedures, value.get("procedures"));
+    intellisense_sweep_add_names(&mut data.functions, value.get("functions"));
+    intellisense_sweep_add_names(&mut data.packages, value.get("packages"));
+    intellisense_sweep_add_names(&mut data.sequences, value.get("sequences"));
+    intellisense_sweep_add_names(&mut data.synonyms, value.get("synonyms"));
+    intellisense_sweep_add_names(&mut data.public_synonyms, value.get("public_synonyms"));
+    intellisense_sweep_add_names(&mut data.database_links, value.get("database_links"));
+    intellisense_sweep_add_names(&mut data.directories, value.get("directories"));
+    intellisense_sweep_add_names(&mut data.libraries, value.get("libraries"));
+    intellisense_sweep_add_names(&mut data.clusters, value.get("clusters"));
+    intellisense_sweep_add_names(&mut data.contexts, value.get("contexts"));
+    intellisense_sweep_add_names(&mut data.dimensions, value.get("dimensions"));
+    intellisense_sweep_add_names(&mut data.operators, value.get("operators"));
+    intellisense_sweep_add_names(&mut data.indextypes, value.get("indextypes"));
+    intellisense_sweep_add_names(&mut data.editions, value.get("editions"));
+    intellisense_sweep_add_names(&mut data.java_sources, value.get("java_sources"));
+    intellisense_sweep_add_names(&mut data.java_classes, value.get("java_classes"));
+    intellisense_sweep_add_names(&mut data.java_resources, value.get("java_resources"));
+    intellisense_sweep_add_names(&mut data.users, value.get("users"));
+
+    if let Some(columns) = value.get("columns") {
+        intellisense_sweep_apply_columns_from_map(data, columns);
+    }
+    if let Some(objects) = value.get("objects").and_then(serde_json::Value::as_array) {
+        for object in objects.iter().filter_map(serde_json::Value::as_object) {
+            intellisense_sweep_apply_object_entry(data, object);
+        }
+    }
+    intellisense_sweep_apply_members(data, value.get("members"));
+    intellisense_sweep_apply_relation_members(data, value.get("relation_members"));
+    intellisense_sweep_apply_signatures(data, value.get("signatures"));
+    intellisense_sweep_apply_column_meta(data, value.get("column_meta"));
+    intellisense_sweep_apply_foreign_keys(data, value.get("foreign_keys"));
+    data.rebuild_indices();
+}
+
+fn intellisense_sweep_data_from_metadata_path(path: &PathBuf) -> IntellisenseData {
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|err| panic!("failed to read metadata `{}`: {err}", path.display()));
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or_else(|err| panic!("failed to parse metadata `{}`: {err}", path.display()));
+    let mut data = IntellisenseData::new();
+    intellisense_sweep_apply_metadata_value(&mut data, &value);
+    data
+}
+
+fn intellisense_sweep_metadata_path_from_config(
+    config: &serde_json::Value,
+) -> Option<PathBuf> {
+    config
+        .get("metadata_file")
+        .or_else(|| config.get("metadata_path"))
+        .or_else(|| config.get("meta_file"))
+        .or_else(|| config.get("meta_path"))
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+}
+
+fn intellisense_sweep_data_from_config(
+    config: &serde_json::Value,
+    metadata_path: Option<&PathBuf>,
+) -> (IntellisenseData, Option<String>) {
+    let mut data = metadata_path
+        .map(intellisense_sweep_data_from_metadata_path)
+        .unwrap_or_else(IntellisenseData::new);
+
+    let explicit_metadata_label = config
+        .get("metadata_label")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let mut metadata_label = explicit_metadata_label
+        .clone()
+        .or_else(|| metadata_path.map(|path| path.display().to_string()));
+    if let Some(metadata) = config.get("metadata") {
+        intellisense_sweep_apply_metadata_value(&mut data, metadata);
+        metadata_label = explicit_metadata_label.or_else(|| Some("inline config metadata".to_string()));
+    } else if metadata_path.is_none() {
+        intellisense_sweep_apply_metadata_value(&mut data, config);
+        metadata_label =
+            explicit_metadata_label.or_else(|| Some("top-level config metadata".to_string()));
+    }
+    data.rebuild_indices();
+    (data, metadata_label)
+}
+
+fn intellisense_sweep_path_from_config(
+    config: &serde_json::Value,
+    keys: &[&str],
+) -> Option<PathBuf> {
+    keys.iter()
+        .find_map(|key| config.get(*key).and_then(serde_json::Value::as_str))
+        .map(PathBuf::from)
+}
+
+fn intellisense_sweep_bool_from_str(value: &str) -> bool {
+    !matches!(
+        value.trim(),
+        "0" | "false" | "FALSE" | "False" | "no" | "NO" | "No"
+    )
+}
+
+fn intellisense_sweep_bool_from_config(
+    config: &serde_json::Value,
+    key: &str,
+    default: bool,
+) -> bool {
+    match config.get(key) {
+        Some(serde_json::Value::Bool(value)) => *value,
+        Some(serde_json::Value::Number(value)) => value.as_i64().unwrap_or(0) != 0,
+        Some(serde_json::Value::String(value)) => intellisense_sweep_bool_from_str(value),
+        _ => default,
+    }
+}
+
+fn intellisense_sweep_db_type_from_config(
+    config: &serde_json::Value,
+) -> Option<crate::db::DatabaseType> {
+    config
+        .get("db")
+        .or_else(|| config.get("database"))
+        .or_else(|| config.get("database_type"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(intellisense_sweep_db_type_from_env)
+}
+
+fn intellisense_sweep_config_from_path(path: &PathBuf) -> serde_json::Value {
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|err| panic!("failed to read sweep config `{}`: {err}", path.display()));
+    serde_json::from_str(&text)
+        .unwrap_or_else(|err| panic!("failed to parse sweep config `{}`: {err}", path.display()))
+}
+
+fn intellisense_sweep_out_path(input_path: &PathBuf) -> PathBuf {
+    let file_name = input_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("intellisense.sql");
+    input_path.with_file_name(format!("{file_name}.out"))
+}
+
+fn intellisense_sweep_source_label(input_path: &PathBuf) -> String {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    input_path
+        .strip_prefix(&manifest)
+        .ok()
+        .and_then(|path| path.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| input_path.display().to_string())
+}
+
+fn intellisense_sweep_generate_report_for_file(
+    input_path: &PathBuf,
+    db_type: crate::db::DatabaseType,
+    data: &IntellisenseData,
+    metadata_label: Option<&str>,
+    out_path: &PathBuf,
+    fail_on_missing: bool,
+) -> IntellisenseSweepRun {
+    let script = std::fs::read_to_string(input_path)
+        .unwrap_or_else(|err| panic!("failed to read `{}`: {err}", input_path.display()));
+    let run = intellisense_sweep_run(&script, db_type, data);
+    let source_label = intellisense_sweep_source_label(input_path);
+    let out = intellisense_sweep_render_out(
+        &script,
+        run.checked,
+        &run.missing,
+        &source_label,
+        db_type,
+        metadata_label,
+    );
+    std::fs::write(out_path, out)
+        .unwrap_or_else(|err| panic!("failed to write `{}`: {err}", out_path.display()));
+
+    assert!(
+        run.checked > 0,
+        "IntelliSense sweep did not check any tokens for `{}`",
+        input_path.display()
+    );
+    if fail_on_missing {
+        assert!(
+            run.missing.is_empty(),
+            "IntelliSense sweep found {} missing tokens; report written to `{}`",
+            run.missing.len(),
+            out_path.display()
+        );
+    }
+    run
+}
+
+#[test]
+fn oracle_test1_words_generate_out_report() {
+    use crate::db::DatabaseType::Oracle;
+
+    let input_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test/test1.txt");
+    let base_data = oracle_test1_intellisense_data();
+    let out_path = intellisense_sweep_out_path(&input_path);
+    intellisense_sweep_generate_report_for_file(
+        &input_path,
+        Oracle,
+        &base_data,
+        Some("test/test1.txt inferred catalog + Oracle built-ins"),
+        &out_path,
+        true,
+    );
+}
+
+#[test]
+fn mysql_test1_words_generate_out_report() {
+    use crate::db::DatabaseType::MySQL;
+
+    let input_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_mysql/test1.txt");
+    let base_data = mysql_test_intellisense_data("test1.txt");
+    let out_path = intellisense_sweep_out_path(&input_path);
+    intellisense_sweep_generate_report_for_file(
+        &input_path,
+        MySQL,
+        &base_data,
+        Some("test_mysql/test1.txt inferred catalog"),
+        &out_path,
+        true,
+    );
+}
+
+#[test]
+fn mysql_test2_words_generate_out_report() {
+    use crate::db::DatabaseType::MySQL;
+
+    let input_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_mysql/test2.txt");
+    let base_data = mysql_test_intellisense_data("test2.txt");
+    let out_path = intellisense_sweep_out_path(&input_path);
+    intellisense_sweep_generate_report_for_file(
+        &input_path,
+        MySQL,
+        &base_data,
+        Some("test_mysql/test2.txt inferred catalog"),
+        &out_path,
+        false,
+    );
+}
+
+#[test]
+fn mysql_test3_words_generate_out_report() {
+    use crate::db::DatabaseType::MySQL;
+
+    let input_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_mysql/test3.txt");
+    let base_data = mysql_test_intellisense_data("test3.txt");
+    let out_path = intellisense_sweep_out_path(&input_path);
+    intellisense_sweep_generate_report_for_file(
+        &input_path,
+        MySQL,
+        &base_data,
+        Some("test_mysql/test3.txt inferred catalog"),
+        &out_path,
+        false,
+    );
+}
+
+#[test]
+fn intellisense_words_generate_out_report_from_env() {
+    let config_path = std::env::var_os("SPACE_QUERY_INTELLISENSE_SWEEP_CONFIG").map(PathBuf::from);
+    let config = config_path.as_ref().map(intellisense_sweep_config_from_path);
+    let input_path = if let Some(config) = config.as_ref() {
+        intellisense_sweep_path_from_config(config, &["input_file", "file", "source"])
+            .or_else(|| std::env::var_os("SPACE_QUERY_INTELLISENSE_SWEEP_FILE").map(PathBuf::from))
+            .unwrap_or_else(|| {
+                panic!(
+                    "sweep config `{}` did not set input_file",
+                    config_path.as_ref().unwrap().display()
+                )
+            })
+    } else {
+        let Some(input) = std::env::var_os("SPACE_QUERY_INTELLISENSE_SWEEP_FILE") else {
+            return;
+        };
+        PathBuf::from(input)
+    };
+    let db_type = config
+        .as_ref()
+        .and_then(intellisense_sweep_db_type_from_config)
+        .or_else(|| {
+            std::env::var("SPACE_QUERY_INTELLISENSE_SWEEP_DB")
+                .ok()
+                .and_then(|value| intellisense_sweep_db_type_from_env(&value))
+        })
+        .unwrap_or(crate::db::DatabaseType::Oracle);
+    let metadata_path = config
+        .as_ref()
+        .and_then(intellisense_sweep_metadata_path_from_config)
+        .or_else(|| std::env::var_os("SPACE_QUERY_INTELLISENSE_SWEEP_META").map(PathBuf::from));
+    let out_path = config
+        .as_ref()
+        .and_then(|config| {
+            intellisense_sweep_path_from_config(
+                config,
+                &["output_file", "out_file", "output", "out"],
+            )
+        })
+        .or_else(|| std::env::var_os("SPACE_QUERY_INTELLISENSE_SWEEP_OUT").map(PathBuf::from))
+        .unwrap_or_else(|| intellisense_sweep_out_path(&input_path));
+    let fail_on_missing = config
+        .as_ref()
+        .map(|config| {
+            intellisense_sweep_bool_from_config(
+                config,
+                "fail_on_missing",
+                std::env::var("SPACE_QUERY_INTELLISENSE_SWEEP_FAIL")
+                    .map(|value| intellisense_sweep_bool_from_str(&value))
+                    .unwrap_or(true),
+            )
+        })
+        .unwrap_or_else(|| {
+            std::env::var("SPACE_QUERY_INTELLISENSE_SWEEP_FAIL")
+                .map(|value| intellisense_sweep_bool_from_str(&value))
+                .unwrap_or(true)
+        });
+
+    let (data, metadata_label) = if let Some(config) = config.as_ref() {
+        intellisense_sweep_data_from_config(config, metadata_path.as_ref())
+    } else {
+        let mut data = metadata_path
+            .as_ref()
+            .map(intellisense_sweep_data_from_metadata_path)
+            .unwrap_or_else(IntellisenseData::new);
+        data.rebuild_indices();
+        (
+            data,
+            metadata_path.as_ref().map(|path| path.display().to_string()),
+        )
+    };
+
+    intellisense_sweep_generate_report_for_file(
+        &input_path,
+        db_type,
+        &data,
+        metadata_label.as_deref(),
+        &out_path,
+        fail_on_missing,
+    );
 }
 
 fn signature_scan_text_before_cursor_for_test(sql: &str, cursor: usize) -> &str {
@@ -47200,7 +49044,14 @@ fn query_completion_suggestions_from_context_with_data(
             );
         }
     }
-    if SqlEditorWidget::should_append_exact_catalog_keyword_after_context_filters(
+    let expected_keyword_before_current_identifier =
+        SqlEditorWidget::expected_catalog_keyword_before_current_identifier(
+            &prefix,
+            deep_ctx,
+            Some(db_type),
+            expr_kw,
+        );
+    if SqlEditorWidget::should_append_expected_catalog_keyword_after_context_filters(
         context,
         None,
         source_allowance,
@@ -47209,18 +49060,11 @@ fn query_completion_suggestions_from_context_with_data(
         false,
         false,
         SqlEditorWidget::cursor_prefix_starts_relation_name_slot(deep_ctx),
-        SqlEditorWidget::exact_keyword_expected_before_current_identifier(
-            &prefix,
-            deep_ctx,
-            Some(db_type),
-            expr_kw,
-        ),
+        expected_keyword_before_current_identifier.as_deref(),
     ) {
-        SqlEditorWidget::append_exact_catalog_keyword_suggestion(
-            &mut suggestions,
-            &prefix,
-            Some(db_type),
-        );
+        if let Some(keyword) = expected_keyword_before_current_identifier {
+            SqlEditorWidget::append_catalog_keyword_suggestion(&mut suggestions, &keyword);
+        }
     }
     suggestions
 }
@@ -69467,9 +71311,6 @@ fn mysql_family_statement_value_slots_do_not_offer_object_catalog() {
                 "SOURCE |",
                 "SOURCE app|",
                 "SOURCE scott.|",
-                "USE |",
-                "USE app|",
-                "USE scott.|",
                 "SHUTDOWN |",
                 "HELP |",
                 "HELP contents|",
@@ -69785,9 +71626,6 @@ fn mysql_family_statement_value_slots_do_not_offer_object_catalog() {
                 "SOURCE |",
                 "SOURCE app|",
                 "SOURCE scott.|",
-                "USE |",
-                "USE app|",
-                "USE scott.|",
                 "HELP |",
                 "HELP contents|",
                 "HELP scott.|",
@@ -69966,6 +71804,60 @@ fn mysql_family_statement_value_slots_do_not_offer_object_catalog() {
                 assert!(
                     !contains(&final_suggestions, leaked),
                     "{leaked} leaked into {db:?} statement value slot at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn mysql_family_named_value_slots_offer_schema_and_charset_values() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let contains = |values: &[String], needle: &str| {
+        values
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(needle))
+    };
+
+    for db in [MySQL, MariaDB] {
+        let (kind, keywords, use_suggestions) = audit_final_suggestions_for("USE app|", db);
+        assert_eq!(
+            kind, None,
+            "USE schema slot should remain a value slot for {db:?}: keywords={keywords:?} final={use_suggestions:?}"
+        );
+        assert!(
+            contains(&use_suggestions, "APP_USER"),
+            "schema missing from USE slot for {db:?}: {use_suggestions:?}"
+        );
+        for noise in ["EMP", "RUN_JOB", "CALC_TOTAL", "SELECT"] {
+            assert!(
+                !contains(&use_suggestions, noise),
+                "{noise} leaked into USE schema slot for {db:?}: {use_suggestions:?}"
+            );
+        }
+
+        for (sql, expected) in [
+            ("SET NAMES utf8|", "utf8mb4"),
+            ("CREATE DATABASE db CHARACTER SET utf8|", "utf8mb4"),
+            (
+                "CREATE DATABASE db CHARACTER SET utf8mb4 COLLATE utf8|",
+                "utf8mb4_0900_ai_ci",
+            ),
+        ] {
+            let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
+            assert_eq!(
+                kind, None,
+                "named MySQL value slot should not resolve object kind at `{sql}` for {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+            );
+            assert!(
+                contains(&final_suggestions, expected),
+                "{expected} missing at `{sql}` for {db:?}: {final_suggestions:?}"
+            );
+            for noise in ["EMP", "RUN_JOB", "CALC_TOTAL", "SELECT"] {
+                assert!(
+                    !contains(&final_suggestions, noise),
+                    "{noise} leaked into named value slot at `{sql}` for {db:?}: {final_suggestions:?}"
                 );
             }
         }
@@ -80987,6 +82879,194 @@ END"#,
         failures.is_empty(),
         "MySQL-family routine body keyword completion gaps:\n{}",
         failures.join("\n")
+    );
+}
+
+fn assert_mysql_fixture_completion_cases(file_name: &str, cases: &[(&str, &str, &str)]) {
+    let script = load_mariadb_intellisense_test_file(file_name);
+    let has = |suggestions: &[String], expected: &str| {
+        suggestions
+            .iter()
+            .any(|value| intellisense_sweep_suggestion_matches_word(value, expected))
+    };
+
+    let mut failures = Vec::new();
+    for (needle, replacement, expected) in cases {
+        let marked = script.replacen(needle, replacement, 1);
+        if marked == script {
+            failures.push(format!("test setup failed to replace `{needle}`"));
+            continue;
+        }
+
+        let mut data = mysql_test_intellisense_data(file_name);
+        let suggestions = query_completion_suggestions_with_data(
+            &marked,
+            crate::db::DatabaseType::MySQL,
+            true,
+            &mut data,
+        );
+        if !has(&suggestions, expected) {
+            failures.push(format!(
+                "`{expected}` missing for `{}` in {file_name}: {suggestions:?}",
+                replacement.replace('\n', " ")
+            ));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "MySQL fixture completion gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn mysql_test2_actual_completion_regressions() {
+    assert_mysql_fixture_completion_cases(
+        "test2.txt",
+        &[
+            (
+                ")\nBEGIN\n    IF NOT p_condition THEN",
+                ")\nBEGI|\n    IF NOT p_condition THEN",
+                "BEGIN",
+            ),
+            (
+                "WHEN task_id = 2003 THEN 'done'",
+                "WHEN task_id = 2003 THE| 'done'",
+                "THEN",
+            ),
+            (
+                "WHERE task_id IN (2002, 2003, 2005);",
+                "WHER| task_id IN (2002, 2003, 2005);",
+                "WHERE",
+            ),
+            (
+                "CALL sp_touch_rank(@rank_var, 5);",
+                "CALL sp_t|(@rank_var, 5);",
+                "sp_touch_rank",
+            ),
+            (
+                "fn_priority_weight(v_priority)",
+                "fn_p|(v_priority)",
+                "fn_priority_weight",
+            ),
+            ("WHEN 'RUNNING' THEN", "WHE| 'RUNNING' THEN", "WHEN"),
+            (
+                "ELSE\n                SET v_other_count",
+                "ELS|\n                SET v_other_count",
+                "ELSE",
+            ),
+            ("END REPEAT;", "EN| REPEAT;", "END"),
+            ("UNION ALL\n\n        SELECT", "UNION AL|\n\n        SELECT", "ALL"),
+            (
+                "UNION ALL\n\n        SELECT",
+                "UNION ALL\n\n        SELE|",
+                "SELECT",
+            ),
+            ("FROM node AS c\n        JOIN", "FROM node AS c\n        JOI|", "JOIN"),
+            (
+                "JOIN node_tree AS p\n          ON",
+                "JOIN node| AS p\n          ON",
+                "node_tree",
+            ),
+            (
+                "JOIN node_tree AS p\n          ON",
+                "JOIN node_tree A| p\n          ON",
+                "AS",
+            ),
+            (
+                "INTO\n        v_top_owner",
+                "INT|\n        v_top_owner",
+                "INTO",
+            ),
+            (
+                "CALL sp_run_parser_killer();",
+                "CALL sp_r|();",
+                "sp_run_parser_killer",
+            ),
+        ],
+    );
+}
+
+#[test]
+fn mysql_test3_actual_completion_regressions() {
+    assert_mysql_fixture_completion_cases(
+        "test3.txt",
+        &[
+            (
+                ")\nBEGIN\n    IF NOT p_condition THEN",
+                ")\nBEGI|\n    IF NOT p_condition THEN",
+                "BEGIN",
+            ),
+            (
+                "WHEN run_id = 4003 THEN ' done '",
+                "WHEN run_id = 4003 THE| ' done '",
+                "THEN",
+            ),
+            (
+                "WHERE run_id IN (4002, 4003, 4005);",
+                "WHER| run_id IN (4002, 4003, 4005);",
+                "WHERE",
+            ),
+            (
+                "CALL sp_shift_rank(@rank_var, 4);",
+                "CALL sp_s|(@rank_var, 4);",
+                "sp_shift_rank",
+            ),
+            (
+                "fn_priority_factor(v_priority)",
+                "fn_p|(v_priority)",
+                "fn_priority_factor",
+            ),
+            ("WHEN 'RUNNING' THEN", "WHE| 'RUNNING' THEN", "WHEN"),
+            (
+                "ELSE\n                SET v_other_count",
+                "ELS|\n                SET v_other_count",
+                "ELSE",
+            ),
+            ("END REPEAT;", "EN| REPEAT;", "END"),
+            ("UNION ALL\n\n        SELECT", "UNION AL|\n\n        SELECT", "ALL"),
+            (
+                "UNION ALL\n\n        SELECT",
+                "UNION ALL\n\n        SELE|",
+                "SELECT",
+            ),
+            (
+                "FROM stage_node AS c\n        JOIN",
+                "FROM stage_node AS c\n        JOI|",
+                "JOIN",
+            ),
+            (
+                "JOIN node_tree AS p\n          ON",
+                "JOIN node| AS p\n          ON",
+                "node_tree",
+            ),
+            (
+                "JOIN node_tree AS p\n          ON",
+                "JOIN node_tree A| p\n          ON",
+                "AS",
+            ),
+            (
+                "FROM run_minutes AS rm\n    ),",
+                "FROM run| AS rm\n    ),",
+                "run_minutes",
+            ),
+            (
+                "FROM owner_rollup\n    )",
+                "FROM owner| \n    )",
+                "owner_rollup",
+            ),
+            (
+                "INTO\n        v_top_owner",
+                "INT|\n        v_top_owner",
+                "INTO",
+            ),
+            (
+                "CALL sp_run_ultra_final_boss();",
+                "CALL sp_r|();",
+                "sp_run_ultra_final_boss",
+            ),
+        ],
     );
 }
 

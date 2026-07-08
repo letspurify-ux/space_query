@@ -1,0 +1,385 @@
+Prompt 프로시저 테스트1
+
+/* ============================================================
+   OQT(Oracle Query Tool) - Procedure/Function Test Script
+   - IN / OUT / IN OUT
+   - Scalar function in SELECT
+   - SYS_REFCURSOR OUT procedure
+   - SYS_REFCURSOR return function
+   - Pipelined table function (TABLE(...) 조회)
+   - "프로시저 실행 후 테이블로 결과 확인" 패턴
+   ================================================================== */
+
+-- TOAD/SQL*Plus 호환: DBMS_OUTPUT 표시
+SET SERVEROUTPUT ON;
+
+-- =========================================================
+-- 0) CLEANUP (존재하면 삭제)
+-- =========================================================
+
+BEGIN EXECUTE IMMEDIATE 'DROP PACKAGE oqt_demo_pkg'; EXCEPTION WHEN OTHERS THEN NULL; END;
+/
+BEGIN EXECUTE IMMEDIATE 'DROP TYPE oqt_row_tab'; EXCEPTION WHEN OTHERS THEN NULL; END;
+/
+BEGIN EXECUTE IMMEDIATE 'DROP TYPE oqt_row'; EXCEPTION WHEN OTHERS THEN NULL; END;
+/
+BEGIN EXECUTE IMMEDIATE 'DROP TABLE oqt_tmp_result PURGE'; EXCEPTION WHEN OTHERS THEN NULL; END;
+/
+BEGIN EXECUTE IMMEDIATE 'DROP TABLE oqt_run_log PURGE'; EXCEPTION WHEN OTHERS THEN NULL; END;
+/
+BEGIN EXECUTE IMMEDIATE 'DROP TABLE oqt_emp'; EXCEPTION WHEN OTHERS THEN NULL; END;
+/
+
+-- =========================================================
+-- 1) TEST DATA / TABLES
+-- =========================================================
+
+-- 샘플 데이터 테이블
+CREATE TABLE oqt_emp (
+  emp_id   NUMBER       CONSTRAINT pk_oqt_emp22 PRIMARY KEY,
+  emp_name VARCHAR2(50) NOT NULL,
+  sal      NUMBER       NOT NULL
+);
+
+INSERT INTO oqt_emp(emp_id, emp_name, sal) VALUES (100, 'ALICE',  5000);
+INSERT INTO oqt_emp(emp_id, emp_name, sal) VALUES (101, 'BOB',    7000);
+INSERT INTO oqt_emp(emp_id, emp_name, sal) VALUES (102, 'CAROL',  9000);
+INSERT INTO oqt_emp(emp_id, emp_name, sal) VALUES (103, 'DAVE',  12000);
+COMMIT;
+
+-- 실행 로그 테이블(프로시저 실행 흔적 확인용)
+CREATE TABLE oqt_run_log (
+  run_id   NUMBER,
+  run_ts   TIMESTAMP DEFAULT SYSTIMESTAMP,
+  msg      VARCHAR2(4000)
+);
+
+-- "프로시저 실행 결과를 테이블로 확인" 패턴용 임시 결과 테이블
+-- (GTT가 권한/환경 따라 이슈가 있을 수 있어 일반 테이블로 구성)
+CREATE TABLE oqt_tmp_result (
+  run_id   NUMBER,
+  row_no   NUMBER,
+  payload  VARCHAR2(4000)
+);
+
+-- =========================================================
+-- 2) TYPES (PIPELINED FUNCTION)
+-- =========================================================
+
+CREATE OR REPLACE TYPE oqt_row AS OBJECT (
+  emp_id   NUMBER,
+  emp_name VARCHAR2(50),
+  sal      NUMBER
+);
+/
+
+CREATE OR REPLACE TYPE oqt_row_tab AS TABLE OF oqt_row;
+/
+
+-- =========================================================
+-- 3) PACKAGE 생성 (프로시저/함수 모음)
+-- =========================================================
+
+CREATE OR REPLACE PACKAGE oqt_demo_pkg AS
+  -- (A) IN 파라미터만: 단순 실행 + DBMS_OUTPUT + 로그
+  PROCEDURE proc_in_only(p_tag IN VARCHAR2);
+
+  -- (B) OUT 포함: 이전 급여 반환 + 상태 메시지
+  PROCEDURE proc_out_params(
+    p_emp_id   IN  NUMBER,
+    p_raise_by IN  NUMBER,
+    p_old_sal  OUT NUMBER,
+    p_new_sal  OUT NUMBER,
+    p_status   OUT VARCHAR2
+  );
+
+  -- (C) IN OUT: 카운터 증가
+  PROCEDURE proc_inout_counter(p_counter IN OUT NUMBER);
+
+  -- (D) OUT SYS_REFCURSOR: 결과셋 반환
+  PROCEDURE proc_refcursor_out(
+    p_min_sal IN  NUMBER,
+    p_rc      OUT SYS_REFCURSOR
+  );
+
+  -- (E) 스칼라 함수: emp_id의 급여 반환
+  FUNCTION func_get_sal(p_emp_id IN NUMBER) RETURN NUMBER;
+
+  -- (F) SYS_REFCURSOR 반환 함수(툴에서 지원 시 결과 그리드로 표시)
+  FUNCTION func_refcursor(p_min_sal IN NUMBER) RETURN SYS_REFCURSOR;
+
+  -- (G) PIPELINED TABLE FUNCTION: SELECT * FROM TABLE(...) 형태
+  FUNCTION func_pipe_rows(p_min_sal IN NUMBER)
+    RETURN oqt_row_tab PIPELINED;
+
+  -- (H) "프로시저 실행 후 테이블로 결과 확인" 패턴
+  PROCEDURE proc_fill_result_table(
+    p_run_id  IN NUMBER,
+    p_min_sal IN NUMBER
+  );
+END oqt_demo_pkg;
+/
+SHOW ERRORS
+
+CREATE OR REPLACE PACKAGE BODY oqt_demo_pkg AS
+
+  PROCEDURE log_msg(p_run_id NUMBER, p_msg VARCHAR2) IS
+  BEGIN
+    INSERT INTO oqt_run_log(run_id, msg) VALUES (p_run_id, p_msg);
+  END;
+
+  PROCEDURE proc_in_only(p_tag IN VARCHAR2) IS
+    v_run_id NUMBER := TRUNC(DBMS_RANDOM.VALUE(100000, 999999));
+  BEGIN
+    DBMS_OUTPUT.PUT_LINE('[proc_in_only] tag=' || p_tag || ', run_id=' || v_run_id);
+    log_msg(v_run_id, '[proc_in_only] tag=' || p_tag);
+    COMMIT;
+  END;
+
+  PROCEDURE proc_out_params(
+    p_emp_id   IN  NUMBER,
+    p_raise_by IN  NUMBER,
+    p_old_sal  OUT NUMBER,
+    p_new_sal  OUT NUMBER,
+    p_status   OUT VARCHAR2
+  ) IS
+  BEGIN
+    SELECT sal INTO p_old_sal FROM oqt_emp WHERE emp_id = p_emp_id FOR UPDATE;
+
+    p_new_sal := p_old_sal + p_raise_by;
+
+    UPDATE oqt_emp
+       SET sal = p_new_sal
+     WHERE emp_id = p_emp_id;
+
+    p_status := 'OK';
+    DBMS_OUTPUT.PUT_LINE('[proc_out_params] emp_id='||p_emp_id||', old='||p_old_sal||', new='||p_new_sal);
+
+    COMMIT;
+  EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+      p_old_sal := NULL;
+      p_new_sal := NULL;
+      p_status := 'NOT_FOUND';
+      DBMS_OUTPUT.PUT_LINE('[proc_out_params] emp_id='||p_emp_id||' not found');
+  END;
+
+  PROCEDURE proc_inout_counter(p_counter IN OUT NUMBER) IS
+  BEGIN
+    p_counter := NVL(p_counter, 0) + 1;
+    DBMS_OUTPUT.PUT_LINE('[proc_inout_counter] counter=' || p_counter);
+  END;
+
+  PROCEDURE proc_refcursor_out(
+    p_min_sal IN  NUMBER,
+    p_rc      OUT SYS_REFCURSOR
+  ) IS
+  BEGIN
+    OPEN p_rc FOR
+      SELECT emp_id, emp_name, sal
+        FROM oqt_emp
+       WHERE sal >= p_min_sal
+       ORDER BY sal;
+  END;
+
+  FUNCTION func_get_sal(p_emp_id IN NUMBER) RETURN NUMBER IS
+    v_sal NUMBER;
+  BEGIN
+    SELECT sal INTO v_sal FROM oqt_emp WHERE emp_id = p_emp_id;
+    RETURN v_sal;
+  EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+      RETURN NULL;
+  END;
+
+  FUNCTION func_refcursor(p_min_sal IN NUMBER) RETURN SYS_REFCURSOR IS
+    rc SYS_REFCURSOR;
+  BEGIN
+    OPEN rc FOR
+      SELECT emp_id, emp_name, sal
+        FROM oqt_emp
+       WHERE sal >= p_min_sal
+       ORDER BY emp_id;
+    RETURN rc;
+  END;
+
+  FUNCTION func_pipe_rows(p_min_sal IN NUMBER)
+    RETURN oqt_row_tab PIPELINED
+  IS
+  BEGIN
+    FOR r IN (SELECT emp_id, emp_name, sal
+                FROM oqt_emp
+               WHERE sal >= p_min_sal
+               ORDER BY sal)
+    LOOP
+      PIPE ROW(oqt_row(r.emp_id, r.emp_name, r.sal));
+    END LOOP;
+    RETURN;
+  END;
+
+  PROCEDURE proc_fill_result_table(
+    p_run_id  IN NUMBER,
+    p_min_sal IN NUMBER
+  ) IS
+    v_row_no NUMBER := 0;
+  BEGIN
+    -- 이전 실행 흔적 제거(같은 run_id로 재실행 가능)
+    DELETE FROM oqt_tmp_result WHERE run_id = p_run_id;
+
+    FOR r IN (SELECT emp_id, emp_name, sal
+                FROM oqt_emp
+               WHERE sal >= p_min_sal
+               ORDER BY sal)
+    LOOP
+      v_row_no := v_row_no + 1;
+      INSERT INTO oqt_tmp_result(run_id, row_no, payload)
+      VALUES (p_run_id, v_row_no,
+              'emp_id='||r.emp_id||', name='||r.emp_name||', sal='||r.sal);
+    END LOOP;
+
+    log_msg(p_run_id, '[proc_fill_result_table] min_sal='||p_min_sal||', rows='||v_row_no);
+    COMMIT;
+  END;
+
+END oqt_demo_pkg;
+/
+SHOW ERRORS
+
+
+-- =========================================================
+-- 4) 실행 검증 - PROCEDURE (IN only)
+-- =========================================================
+
+BEGIN
+  oqt_demo_pkg.proc_in_only('HELLO_TOAD');
+END;
+/
+SELECT * FROM oqt_run_log ORDER BY run_ts DESC;
+
+-- =========================================================
+-- 5) 실행 검증 - PROCEDURE (OUT params)
+-- =========================================================
+
+DECLARE
+  v_old_sal NUMBER;
+  v_new_sal NUMBER;
+  v_status  VARCHAR2(50);
+BEGIN
+  oqt_demo_pkg.proc_out_params(
+    p_emp_id   => 101,
+    p_raise_by => 500,
+    p_old_sal  => v_old_sal,
+    p_new_sal  => v_new_sal,
+    p_status   => v_status
+  );
+
+  DBMS_OUTPUT.PUT_LINE('status='||v_status||', old='||v_old_sal||', new='||v_new_sal);
+END;
+/
+SELECT * FROM oqt_emp ORDER BY emp_id;
+
+-- =========================================================
+-- 6) 실행 검증 - PROCEDURE (IN OUT)
+-- =========================================================
+
+DECLARE
+  v_counter NUMBER := 0;
+BEGIN
+  oqt_demo_pkg.proc_inout_counter(v_counter);
+  oqt_demo_pkg.proc_inout_counter(v_counter);
+  oqt_demo_pkg.proc_inout_counter(v_counter);
+  DBMS_OUTPUT.PUT_LINE('final counter='||v_counter);
+END;
+/
+
+-- =========================================================
+-- 7) 실행 검증 - PROCEDURE (OUT SYS_REFCURSOR)
+-- =========================================================
+
+DECLARE
+  rc SYS_REFCURSOR;
+  v_emp_id   NUMBER;
+  v_emp_name VARCHAR2(50);
+  v_sal      NUMBER;
+BEGIN
+  oqt_demo_pkg.proc_refcursor_out(p_min_sal => 8000, p_rc => rc);
+
+  LOOP
+    FETCH rc INTO v_emp_id, v_emp_name, v_sal;
+    EXIT WHEN rc%NOTFOUND;
+    DBMS_OUTPUT.PUT_LINE('row: '||v_emp_id||', '||v_emp_name||', '||v_sal);
+  END LOOP;
+  CLOSE rc;
+END;
+/
+
+-- =========================================================
+-- 8) 실행 검증 - FUNCTION (scalar) : SELECT에서 사용
+-- =========================================================
+
+SELECT oqt_demo_pkg.func_get_sal(100) AS sal_100 FROM dual;
+
+SELECT emp_id, emp_name, oqt_demo_pkg.func_get_sal(emp_id) AS sal_by_func
+  FROM oqt_emp
+ ORDER BY emp_id;
+
+-- =========================================================
+-- 9) 실행 검증 - FUNCTION (PIPELINED) : TABLE(...) 조회
+-- =========================================================
+
+SELECT *
+  FROM TABLE(oqt_demo_pkg.func_pipe_rows(7000))
+ ORDER BY sal;
+
+-- =========================================================
+-- 10) 실행 검증 - FUNCTION (RETURN SYS_REFCURSOR) : PL/SQL로 FETCH
+-- =========================================================
+
+DECLARE
+  rc SYS_REFCURSOR;
+  v_emp_id   NUMBER;
+  v_emp_name VARCHAR2(50);
+  v_sal      NUMBER;
+BEGIN
+  rc := oqt_demo_pkg.func_refcursor(9000);
+
+  LOOP
+    FETCH rc INTO v_emp_id, v_emp_name, v_sal;
+    EXIT WHEN rc%NOTFOUND;
+    DBMS_OUTPUT.PUT_LINE('row: '||v_emp_id||', '||v_emp_name||', '||v_sal);
+  END LOOP;
+
+  CLOSE rc;
+END;
+/
+
+-- =========================================================
+-- 11) 실행 검증 - "프로시저 실행 후 테이블로 결과 확인" 패턴
+-- =========================================================
+
+DECLARE
+  v_run_id NUMBER := 20260127; -- 원하는 run_id로 바꿔도 됨
+BEGIN
+  oqt_demo_pkg.proc_fill_result_table(p_run_id => v_run_id, p_min_sal => 7000);
+  DBMS_OUTPUT.PUT_LINE('filled result table with run_id='||v_run_id);
+END;
+/
+
+SELECT * FROM oqt_tmp_result WHERE run_id = 20260127 ORDER BY row_no;
+
+SELECT * FROM oqt_run_log WHERE run_id = 20260127 ORDER BY run_ts DESC;
+
+-- =========================================================
+-- DONE.
+-- =========================================================
+
+-- =========================================================
+-- IntelliSense sweep report generated by intellisense sweep
+-- source: test/test1.txt
+-- db: Oracle
+-- metadata: test/test1.txt inferred catalog + Oracle built-ins
+-- checked: 635
+-- missing: 0
+-- marker: [[word]] means not suggested for the tested prefix
+-- missing tokens: none
+-- =========================================================

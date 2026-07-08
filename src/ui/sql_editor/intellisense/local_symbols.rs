@@ -848,11 +848,28 @@ impl SqlEditorWidget {
         names
     }
 
+    #[allow(dead_code)]
     fn collect_local_symbol_suggestions(
         prefix: &str,
         cursor_in_statement: usize,
         analysis: &IntellisenseAnalysis,
         session_bind_names: &[String],
+    ) -> Vec<String> {
+        Self::collect_local_symbol_suggestions_for_db(
+            prefix,
+            cursor_in_statement,
+            analysis,
+            session_bind_names,
+            None,
+        )
+    }
+
+    fn collect_local_symbol_suggestions_for_db(
+        prefix: &str,
+        cursor_in_statement: usize,
+        analysis: &IntellisenseAnalysis,
+        session_bind_names: &[String],
+        db_type: Option<crate::db::DatabaseType>,
     ) -> Vec<String> {
         let prefix_upper = Self::local_identifier_lookup_upper(prefix);
         let cursor_in_statement = cursor_in_statement.min(
@@ -866,7 +883,7 @@ impl SqlEditorWidget {
         if Self::cursor_is_at_plsql_goto_label_slot_for_context(
             analysis.context.as_ref(),
             !prefix.is_empty(),
-            None,
+            db_type,
         ) {
             return Self::plsql_block_label_suggestions(analysis.context.as_ref(), prefix);
         }
@@ -875,7 +892,7 @@ impl SqlEditorWidget {
         if Self::cursor_is_at_plsql_exit_continue_label_slot_for_context(
             analysis.context.as_ref(),
             !prefix.is_empty(),
-            None,
+            db_type,
         ) {
             return Self::plsql_block_label_suggestions(analysis.context.as_ref(), prefix);
         }
@@ -884,14 +901,14 @@ impl SqlEditorWidget {
         if Self::cursor_is_at_plsql_named_end_target_slot_for_context(
             analysis.context.as_ref(),
             !prefix.is_empty(),
-            None,
+            db_type,
         ) {
             return Self::plsql_named_end_target_suggestions(analysis.context.as_ref(), prefix);
         }
         if Self::cursor_is_after_plsql_end_keyword_for_context(
             analysis.context.as_ref(),
             !prefix.is_empty(),
-            None,
+            db_type,
         ) {
             return Vec::new();
         }
@@ -901,9 +918,26 @@ impl SqlEditorWidget {
         if Self::cursor_is_at_rollback_to_savepoint_name_slot_for_context(
             analysis.context.as_ref(),
             !prefix.is_empty(),
-            None,
+            db_type,
         ) {
             return Self::plsql_savepoint_suggestions(analysis.context.as_ref(), prefix);
+        }
+        if Self::cursor_is_at_mysql_leave_iterate_label_slot_for_context(
+            analysis.context.as_ref(),
+            !prefix.is_empty(),
+            db_type,
+        ) {
+            return Self::mysql_block_label_suggestions(analysis.context.as_ref(), prefix);
+        }
+        if Self::cursor_is_at_mysql_prepared_statement_handle_reference_slot_for_context(
+            analysis.context.as_ref(),
+            !prefix.is_empty(),
+            db_type,
+        ) {
+            return Self::mysql_prepared_statement_handle_suggestions(
+                analysis.context.as_ref(),
+                prefix,
+            );
         }
         // A `RAISE |`/`EXCEPTION WHEN |` name is an exception. Exceptions ARE scoped
         // value symbols, but so are ordinary variables/cursors; retain only the ones
