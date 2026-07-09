@@ -946,6 +946,18 @@ impl SqlEditorWidget {
         idx
     }
 
+    fn clamp_to_char_boundary_forward_local(text: &str, idx: usize) -> usize {
+        let mut idx = idx.min(text.len());
+        if text.is_char_boundary(idx) {
+            return idx;
+        }
+
+        while idx < text.len() && !text.is_char_boundary(idx) {
+            idx += 1;
+        }
+        idx
+    }
+
     fn raw_cursor_position(buffer: &TextBuffer, pos: i32) -> i32 {
         let buffer_len = buffer.length().max(0);
         pos.clamp(0, buffer_len)

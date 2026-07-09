@@ -32660,8 +32660,8 @@ impl SqlEditorWidget {
     /// has a *known* completion — the enclosing named object (`END my_proc`) or
     /// the enclosing construct's qualifier (`END IF`/`LOOP`/`CASE`). An `END`
     /// with nothing to offer (anonymous block, SQL `CASE … END`) stays quiet, so
-    /// this never turns every space into a popup. The full statement scan only
-    /// runs after the cheap "previous word is END" text check.
+    /// this never turns every space into a popup. The bounded statement scan
+    /// only runs after the cheap "previous word is END" text check.
     fn plsql_end_auto_trigger_applies_in_text(
         full_text: &str,
         cursor: usize,
@@ -32672,8 +32672,8 @@ impl SqlEditorWidget {
         {
             return false;
         }
-        let expanded =
-            Self::expanded_statement_window_in_text_for_db_type(full_text, cursor, db_type);
+        let bounded = Self::bounded_intellisense_parse_text_from_text(full_text, cursor);
+        let expanded = Self::expanded_statement_window_in_bounded_text_for_db_type(&bounded, db_type);
         let spans = super::query_text::tokenize_sql_spanned(&expanded.text);
         let mut tokens = Vec::with_capacity(spans.len());
         let mut token_ends = Vec::with_capacity(spans.len());
@@ -32684,6 +32684,22 @@ impl SqlEditorWidget {
         let end_idx = token_ends.partition_point(|end| *end <= expanded.cursor_in_statement);
         Self::expected_plsql_named_end_target(&tokens, end_idx).is_some()
             || Self::expected_plsql_end_qualifier_keywords(&tokens, end_idx, db_type).is_some()
+    }
+
+    const PLSQL_EXECUTE_IMMEDIATE_TAIL_AUTO_TRIGGER_LOOKBEHIND_BYTES: usize = 16 * 1024;
+
+    fn plsql_execute_immediate_tail_auto_trigger_prefix(
+        full_text: &str,
+        cursor: usize,
+    ) -> Option<&str> {
+        let cursor = Self::clamp_to_char_boundary_local(full_text, cursor.min(full_text.len()));
+        let start = Self::clamp_to_char_boundary_local(
+            full_text,
+            cursor.saturating_sub(
+                Self::PLSQL_EXECUTE_IMMEDIATE_TAIL_AUTO_TRIGGER_LOOKBEHIND_BYTES,
+            ),
+        );
+        full_text.get(start..cursor)
     }
 
     /// Whether typing a space in an `EXECUTE IMMEDIATE` statement should
@@ -32698,7 +32714,7 @@ impl SqlEditorWidget {
         if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
             return false;
         }
-        let head = match full_text.get(..cursor.min(full_text.len())) {
+        let head = match Self::plsql_execute_immediate_tail_auto_trigger_prefix(full_text, cursor) {
             Some(head) => head,
             None => return false,
         };
@@ -32706,16 +32722,12 @@ impl SqlEditorWidget {
             return false;
         }
 
-        let expanded =
-            Self::expanded_statement_window_in_text_for_db_type(full_text, cursor, db_type);
-        let spans = super::query_text::tokenize_sql_spanned(&expanded.text);
+        let spans = super::query_text::tokenize_sql_spanned(head);
         let mut tokens = Vec::with_capacity(spans.len());
-        let mut token_ends = Vec::with_capacity(spans.len());
         for span in spans {
-            token_ends.push(span.end);
             tokens.push(span.token);
         }
-        let end_idx = token_ends.partition_point(|end| *end <= expanded.cursor_in_statement);
+        let end_idx = tokens.len();
         let stmt_words = Self::words_for_plsql_statement_slot(&tokens, end_idx);
         if stmt_words.first().map(String::as_str) != Some("EXECUTE")
             || stmt_words.get(1).map(String::as_str) != Some("IMMEDIATE")

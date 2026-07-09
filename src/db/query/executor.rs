@@ -1640,6 +1640,7 @@ impl QueryExecutor {
         engine.is_idle()
     }
 
+    #[cfg(test)]
     pub(crate) fn statement_spans_for_db_type_with_mysql_delimiter(
         sql: &str,
         preferred_db_type: Option<crate::db::connection::DatabaseType>,

@@ -1021,9 +1021,9 @@ fn analyze_full_script_marker_for_db(
         .find(CURSOR_MARKER)
         .expect("cursor marker should exist");
     let sql = script_with_cursor.replacen(CURSOR_MARKER, "", 1);
-    let expanded = SqlEditorWidget::expanded_statement_window_in_text_for_db_type(
-        &sql,
-        cursor,
+    let bounded = SqlEditorWidget::bounded_intellisense_parse_text_from_text(&sql, cursor);
+    let expanded = SqlEditorWidget::expanded_statement_window_in_bounded_text_for_db_type(
+        &bounded,
         db_type,
     );
     let statement = expanded.text;
@@ -6176,15 +6176,18 @@ fn statement_context_for_mysql_db_type_keeps_double_dash_arithmetic_as_code() {
 }
 
 #[test]
-fn expanded_statement_window_for_mysql_db_type_keeps_double_dash_arithmetic_as_code() {
+fn bounded_statement_window_for_mysql_db_type_keeps_double_dash_arithmetic_as_code() {
     let sql = "SELECT 5--2;\nSELECT 9;\n";
     let cursor = sql.find("5--2").unwrap_or(0);
     for db in [
         crate::db::connection::DatabaseType::MySQL,
         crate::db::connection::DatabaseType::MariaDB,
     ] {
-        let expanded =
-            SqlEditorWidget::expanded_statement_window_in_text_for_db_type(sql, cursor, Some(db));
+        let bounded = SqlEditorWidget::bounded_intellisense_parse_text_from_text(sql, cursor);
+        let expanded = SqlEditorWidget::expanded_statement_window_in_bounded_text_for_db_type(
+            &bounded,
+            Some(db),
+        );
 
         assert_eq!(
             expanded.text,
@@ -6195,65 +6198,74 @@ fn expanded_statement_window_for_mysql_db_type_keeps_double_dash_arithmetic_as_c
 }
 
 #[test]
-fn expanded_statement_exact_bounds_ignores_plsql_words_inside_identifiers() {
-    let statement = "SELECT begin_date, declared_at, package_body_label FROM audit_log";
-    let expanded = ExpandedStatementWindow {
-        statement_start: 8,
-        statement_end: 8 + statement.len(),
-        text: statement.to_string(),
-        cursor_in_statement: statement.find("begin_date").unwrap_or(0),
-    };
-    let full_text = format!("SELECT 0;\n{statement};\nSELECT 1;");
+fn async_intellisense_parse_text_is_hard_capped_around_cursor() {
+    let prefix_pad = "SELECT pad_col FROM pad_table;\n"
+        .repeat(SqlEditorWidget::BOUNDED_INTELLISENSE_PARSE_LOOKBEHIND_BYTES / 28 + 64);
+    let suffix_pad = "SELECT tail_col FROM tail_table;\n"
+        .repeat(SqlEditorWidget::BOUNDED_INTELLISENSE_PARSE_LOOKAHEAD_BYTES / 31 + 64);
 
+    let mut sql = String::from("VAR far_outside NUMBER\n");
+    sql.push_str(&prefix_pad);
+    sql.push_str("VAR near_bind NUMBER\nBEGIN\n    ");
+    let cursor = sql.len();
+    sql.push_str("NULL;\nEND;\n");
+    sql.push_str(&suffix_pad);
+    sql.push_str("SELECT far_tail_marker FROM dual;\n");
+
+    let bounded = SqlEditorWidget::bounded_intellisense_parse_text_from_text(&sql, cursor);
     assert!(
-        !SqlEditorWidget::expanded_statement_requires_exact_bounds(&full_text, &expanded),
-        "identifier substrings should not force exact full-script statement bounds"
+        bounded.text.len() <= SqlEditorWidget::BOUNDED_INTELLISENSE_PARSE_WINDOW_BYTES,
+        "async parse text exceeded the hard cap: {} > {}",
+        bounded.text.len(),
+        SqlEditorWidget::BOUNDED_INTELLISENSE_PARSE_WINDOW_BYTES
     );
-}
-
-#[test]
-fn expanded_statement_exact_bounds_ignores_plsql_words_inside_literals_and_comments() {
-    let statement = "SELECT 'BEGIN', col FROM emp -- DECLARE package body";
-    let expanded = ExpandedStatementWindow {
-        statement_start: 8,
-        statement_end: 8 + statement.len(),
-        text: statement.to_string(),
-        cursor_in_statement: statement.find("col").unwrap_or(0),
-    };
-    let full_text = format!("SELECT 0;\n{statement};\nSELECT 1;");
-
+    assert!(bounded.start > 0, "test setup should force a non-zero window start");
     assert!(
-        !SqlEditorWidget::expanded_statement_requires_exact_bounds(&full_text, &expanded),
-        "literal/comment text should not force exact full-script statement bounds"
+        !bounded.text.contains("far_outside"),
+        "async parse text should not copy far prefix text outside the cap"
     );
-}
-
-#[test]
-fn expanded_statement_exact_bounds_detects_real_plsql_tokens() {
-    let procedure = "CREATE OR REPLACE PROCEDURE p IS\nBEGIN\n    NULL;\nEND;";
-    let procedure_window = ExpandedStatementWindow {
-        statement_start: 8,
-        statement_end: 8 + procedure.len(),
-        text: procedure.to_string(),
-        cursor_in_statement: procedure.find("NULL").unwrap_or(0),
-    };
-    let full_text = format!("SELECT 0;\n{procedure}\n/\nSELECT 1;");
     assert!(
-        SqlEditorWidget::expanded_statement_requires_exact_bounds(&full_text, &procedure_window),
-        "real PL/SQL block tokens still require exact full-script statement bounds"
+        !bounded.text.contains("far_tail_marker"),
+        "async parse text should not copy far suffix text outside the cap"
+    );
+    assert!(
+        bounded.text.contains("near_bind"),
+        "nearby bind declarations should remain visible inside the capped window"
     );
 
-    let package_body = "CREATE OR REPLACE PACKAGE /* editioned */ BODY p AS\nEND;";
-    let package_window = ExpandedStatementWindow {
-        statement_start: 8,
-        statement_end: 8 + package_body.len(),
-        text: package_body.to_string(),
-        cursor_in_statement: package_body.find("BODY").unwrap_or(0),
-    };
-    let full_text = format!("SELECT 0;\n{package_body}\n/\nSELECT 1;");
+    let expanded = SqlEditorWidget::expanded_statement_window_in_bounded_text_for_db_type(
+        &bounded,
+        Some(crate::db::connection::DatabaseType::Oracle),
+    );
     assert!(
-        SqlEditorWidget::expanded_statement_requires_exact_bounds(&full_text, &package_window),
-        "PACKAGE BODY tokens separated by comments still require exact bounds"
+        expanded.statement_start >= bounded.start,
+        "expanded statement start should remain an absolute offset inside the bounded window"
+    );
+    assert!(
+        expanded.cursor_in_statement <= expanded.text.len(),
+        "cursor should remain relative to the bounded statement text"
+    );
+
+    let relative_statement_start = expanded
+        .statement_start
+        .saturating_sub(bounded.start)
+        .min(bounded.text.len());
+    let text_bind_names = SqlEditorWidget::collect_text_bind_names_before_statement(
+        &bounded.text,
+        relative_statement_start,
+        Some(crate::db::connection::DatabaseType::Oracle),
+    );
+    assert!(
+        text_bind_names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("near_bind")),
+        "near bind should be collected from the capped prefix: {text_bind_names:?}"
+    );
+    assert!(
+        text_bind_names
+            .iter()
+            .all(|name| !name.eq_ignore_ascii_case("far_outside")),
+        "far bind outside the cap should not be scanned: {text_bind_names:?}"
     );
 }
 
@@ -16034,7 +16046,7 @@ fn prepend_local_symbol_suggestions_dedups_quoted_identifier_equivalents() {
 }
 
 #[test]
-fn large_routine_cache_analysis_keeps_far_declarations_visible() {
+fn large_routine_cache_analysis_stays_bounded() {
     let mut sql = String::from("CREATE OR REPLACE PROCEDURE demo_proc IS\n");
     sql.push_str("    v_far NUMBER := 1;\n");
     for idx in 0..10_000 {
@@ -16065,7 +16077,16 @@ fn large_routine_cache_analysis_keeps_far_declarations_visible() {
         sql.len() > INTELLISENSE_STATEMENT_WINDOW as usize,
         "generated procedure should exceed the default statement window"
     );
-    assert_has_case_insensitive(&suggestions, "v_far");
+    assert!(
+        expanded.text.len() <= SqlEditorWidget::BOUNDED_INTELLISENSE_PARSE_WINDOW_BYTES,
+        "routine analysis should stay inside the bounded intellisense window"
+    );
+    assert!(
+        !suggestions
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case("v_far")),
+        "far declaration outside the bounded window should not be scanned: {suggestions:?}"
+    );
 }
 
 #[test]
@@ -86419,6 +86440,12 @@ fn plsql_end_space_auto_trigger_is_slot_precise() {
     ] {
         assert!(applies(script), "auto-trigger missing at `{script}`");
     }
+    let long_prefix = "BEGIN NULL; END;\n"
+        .repeat(SqlEditorWidget::BOUNDED_INTELLISENSE_PARSE_LOOKBEHIND_BYTES / 8);
+    assert!(
+        applies(&format!("{long_prefix}BEGIN IF a = 1 THEN NULL; END |")),
+        "auto-trigger should use the local bounded END window"
+    );
 
     // Nothing to offer → stay quiet.
     for script in [
@@ -86456,9 +86483,21 @@ fn plsql_execute_immediate_tail_space_auto_trigger_is_slot_precise() {
         "CREATE PACKAGE BODY pkg IS PROCEDURE p IS v NUMBER; BEGIN EXECUTE IMMEDIATE 'select 1' INTO v |END p; END pkg;"
     ));
     assert!(applies("BEGIN EXECUTE IMMEDIATE 'select 1' |END;"));
+    let long_prefix = "BEGIN NULL; END;\n"
+        .repeat(SqlEditorWidget::PLSQL_EXECUTE_IMMEDIATE_TAIL_AUTO_TRIGGER_LOOKBEHIND_BYTES / 8);
+    let long_text = format!("{long_prefix}BEGIN EXECUTE IMMEDIATE 'select 1' INTO v ");
+    assert!(
+        SqlEditorWidget::plsql_execute_immediate_tail_auto_trigger_applies_in_text(
+            &long_text,
+            long_text.len(),
+            Some(Oracle),
+        ),
+        "auto-trigger should use the local EXECUTE IMMEDIATE window"
+    );
 
     assert!(!applies("BEGIN EXECUTE IMMEDIATE |END;"));
     assert!(!applies("BEGIN NULL; |END;"));
+    assert!(!applies("EXECUTE IMMEDIATE 'select 1' |"));
     assert!(
         !SqlEditorWidget::plsql_execute_immediate_tail_auto_trigger_applies_in_text(
             "BEGIN EXECUTE IMMEDIATE 'select 1' INTO v ",
