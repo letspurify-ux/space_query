@@ -49432,6 +49432,7 @@ fn intellisense_sweep_generate_report_for_file(
 }
 
 #[test]
+#[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
 fn oracle_test1_words_generate_out_report() {
     oracle_test_words_generate_out_report("test1.txt", false);
 }
@@ -49454,56 +49455,67 @@ fn oracle_test_words_generate_out_report(file_name: &str, fail_on_missing: bool)
 }
 
 #[test]
+#[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
 fn oracle_test2_words_generate_out_report() {
     oracle_test_words_generate_out_report("test2.txt", false);
 }
 
 #[test]
+#[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
 fn oracle_test3_words_generate_out_report() {
     oracle_test_words_generate_out_report("test3.txt", false);
 }
 
 #[test]
+#[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
 fn oracle_test4_words_generate_out_report() {
     oracle_test_words_generate_out_report("test4.txt", false);
 }
 
 #[test]
+#[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
 fn oracle_test5_words_generate_out_report() {
     oracle_test_words_generate_out_report("test5.txt", false);
 }
 
 #[test]
+#[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
 fn oracle_test6_words_generate_out_report() {
     oracle_test_words_generate_out_report("test6.txt", false);
 }
 
 #[test]
+#[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
 fn oracle_test7_words_generate_out_report() {
     oracle_test_words_generate_out_report("test7.txt", false);
 }
 
 #[test]
+#[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
 fn oracle_test8_words_generate_out_report() {
     oracle_test_words_generate_out_report("test8.txt", false);
 }
 
 #[test]
+#[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
 fn oracle_test9_words_generate_out_report() {
     oracle_test_words_generate_out_report("test9.txt", false);
 }
 
 #[test]
+#[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
 fn oracle_test10_words_generate_out_report() {
     oracle_test_words_generate_out_report("test10.txt", false);
 }
 
 #[test]
+#[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
 fn oracle_test11_words_generate_out_report() {
     oracle_test_words_generate_out_report("test11.txt", false);
 }
 
 #[test]
+#[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
 fn mysql_test1_words_generate_out_report() {
     use crate::db::DatabaseType::MySQL;
 
@@ -49521,6 +49533,7 @@ fn mysql_test1_words_generate_out_report() {
 }
 
 #[test]
+#[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
 fn mysql_test2_words_generate_out_report() {
     use crate::db::DatabaseType::MySQL;
 
@@ -49538,6 +49551,7 @@ fn mysql_test2_words_generate_out_report() {
 }
 
 #[test]
+#[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
 fn mysql_test3_words_generate_out_report() {
     use crate::db::DatabaseType::MySQL;
 
@@ -49572,31 +49586,37 @@ fn mariadb_test_words_generate_out_report(file_name: &str, fail_on_missing: bool
 }
 
 #[test]
+#[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
 fn mariadb_test4_words_generate_out_report() {
     mariadb_test_words_generate_out_report("test4.txt", false);
 }
 
 #[test]
+#[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
 fn mariadb_test5_words_generate_out_report() {
     mariadb_test_words_generate_out_report("test5.txt", false);
 }
 
 #[test]
+#[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
 fn mariadb_test6_words_generate_out_report() {
     mariadb_test_words_generate_out_report("test6.txt", false);
 }
 
 #[test]
+#[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
 fn mariadb_test7_words_generate_out_report() {
     mariadb_test_words_generate_out_report("test7.txt", false);
 }
 
 #[test]
+#[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
 fn mariadb_test8_words_generate_out_report() {
     mariadb_test_words_generate_out_report("test8.txt", false);
 }
 
 #[test]
+#[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
 fn intellisense_words_generate_out_report_from_env() {
     let config_path = std::env::var_os("SPACE_QUERY_INTELLISENSE_SWEEP_CONFIG").map(PathBuf::from);
     let config = config_path.as_ref().map(intellisense_sweep_config_from_path);

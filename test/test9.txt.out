@@ -280,7 +280,7 @@ CREATE OR REPLACE PACKAGE BODY fmt_pkg_extreme AS
         PRAGMA EXCEPTION_INIT (e_bulk_errors, - 24381);
         PROCEDURE ensure_mode IS
         BEGIN
-            IF l_mode NOT IN ('NORMAL', 'STRICT', 'AGGRESSIVE', 'DRYRUN') THEN
+            IF l_mode [[NOT]] IN ('NORMAL', 'STRICT', 'AGGRESSIVE', 'DRYRUN') THEN
                 RAISE e_bad_mode;
             END IF;
         END ensure_mode;
@@ -571,10 +571,11 @@ ORDER BY audit_id;
 -- db: Oracle
 -- metadata: test Oracle inferred catalog + Oracle built-ins
 -- checked: 947
--- missing: 5
+-- missing: 6
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens:
 --   254:25 word=cp_root_id prefix=cp_r suggestions=[] total=0 line=CURSOR c_units (cp_root_id NUMBER) IS
+--   283:23 word=NOT prefix=NO suggestions=[] total=0 line=IF l_mode NOT IN ('NORMAL', 'STRICT', 'AGGRESSIVE', 'DRYRUN') THEN
 --   287:18 word=decorate_note prefix=deco suggestions=[deco, DECODE, DECOMPOSE(), dept_code, direct_report_cnt] total=5 line=FUNCTION decorate_note (p_old IN VARCHAR2, p_score IN NUMBER, p_seq IN PLS_INTEGER) RETURN VARCHAR2 IS
 --   300:19 word=apply_one prefix=appl suggestions=[appl, APPLY] total=2 line=PROCEDURE apply_one (p_row IN c_units%ROWTYPE, p_pos IN PLS_INTEGER) IS
 --   304:23 word=sp_apply_one prefix=sp_a suggestions=[qt_split_tab] total=1 line=SAVEPOINT sp_apply_one;
