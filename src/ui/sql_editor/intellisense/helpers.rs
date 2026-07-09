@@ -297,6 +297,9 @@ impl SqlEditorWidget {
                 column_sender,
                 connection,
             );
+            for column in Self::recursive_cte_anchor_columns_from_body_tokens(body_tokens) {
+                Self::push_unique_completion_name(&mut columns, &column);
+            }
             columns.extend(recursive_generated_columns);
             Self::dedup_column_names_case_insensitive(&mut columns);
             return (columns, wildcard_tables);

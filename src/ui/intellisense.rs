@@ -242,6 +242,7 @@ pub const ORACLE_FUNCTIONS: &[&str] = &[
     "XMLSERIALIZE",
     "XMLTABLE",
     "XMLTRANSFORM",
+    "XMLTYPE",
     "XPATH",
 ];
 
@@ -611,7 +612,31 @@ pub static MYSQL_FUNCTIONS_SET: once_cell::sync::Lazy<std::collections::HashSet<
     once_cell::sync::Lazy::new(|| MYSQL_FUNCTIONS.iter().copied().collect());
 
 const FUNCTION_SUFFIX: &str = "()";
-const ORACLE_BUILTIN_PACKAGES: &[&str] = &["DBMS_OUTPUT"];
+const ORACLE_BUILTIN_PACKAGES: &[&str] = &[
+    "DBMS_OUTPUT",
+    "DBMS_LOB",
+    "DBMS_SQL",
+    "DBMS_UTILITY",
+    "DBMS_RANDOM",
+    "DBMS_METADATA",
+    "DBMS_STATS",
+    "DBMS_XPLAN",
+    "DBMS_APPLICATION_INFO",
+    "DBMS_SESSION",
+    "DBMS_SCHEDULER",
+    "DBMS_LOCK",
+    "DBMS_JOB",
+    "DBMS_CRYPTO",
+    "DBMS_ASSERT",
+    "DBMS_MVIEW",
+    "DBMS_ALERT",
+    "DBMS_PIPE",
+    "UTL_FILE",
+    "UTL_RAW",
+    "UTL_HTTP",
+    "UTL_ENCODE",
+    "UTL_INADDR",
+];
 
 pub(crate) const MAX_SUGGESTIONS: usize = 50;
 type LanguageCatalog = (&'static [&'static str], &'static [&'static str]);

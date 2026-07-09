@@ -1,0 +1,301 @@
+prompt 프로시저 테스트 4
+SET SERVEROUTPUT ON SIZE UNLIMITED;
+
+PROMPT === [0] DROP OLD OBJECTS (IGNORE ERRORS) ===
+
+BEGIN
+  EXECUTE IMMEDIATE 'DROP SYNONYM oqt_syn';
+EXCEPTION WHEN OTHERS THEN NULL;
+END;
+/
+
+BEGIN
+  EXECUTE IMMEDIATE 'DROP PACKAGE oqt_pkg';
+EXCEPTION WHEN OTHERS THEN NULL;
+END;
+/
+
+BEGIN
+  EXECUTE IMMEDIATE 'DROP TABLE oqt_call_log PURGE';
+EXCEPTION WHEN OTHERS THEN NULL;
+END;
+/
+
+BEGIN
+  EXECUTE IMMEDIATE 'DROP SEQUENCE oqt_call_log_seq';
+EXCEPTION WHEN OTHERS THEN NULL;
+END;
+/
+
+PROMPT === [1] CREATE TABLE/SEQUENCE ===
+
+CREATE TABLE oqt_call_log (
+  id         NUMBER PRIMARY KEY,
+  tag        VARCHAR2(50),
+  msg        VARCHAR2(4000),
+  n1         NUMBER,
+  n2         NUMBER,
+  dt1        DATE,
+  ts1        TIMESTAMP,
+  created_at DATE DEFAULT SYSDATE
+);
+
+CREATE SEQUENCE oqt_call_log_seq START WITH 1 INCREMENT BY 1;
+
+PROMPT === [2] CREATE PACKAGE (PROCS/FUNCS/REF CURSOR/OVERLOAD/DEFAULT/EXCEPTIONS) ===
+
+CREATE OR REPLACE PACKAGE oqt_pkg AS
+  PROCEDURE log_msg(p_tag IN VARCHAR2, p_msg IN VARCHAR2, p_n1 IN NUMBER DEFAULT NULL);
+
+  PROCEDURE p_basic(
+    p_in_num   IN  NUMBER,
+    p_in_txt   IN  VARCHAR2 DEFAULT 'DEF',
+    p_out_txt  OUT VARCHAR2,
+    p_inout_n  IN OUT NUMBER
+  );
+
+  PROCEDURE p_over(p_txt IN VARCHAR2);
+  PROCEDURE p_over(p_num IN NUMBER, p_txt IN VARCHAR2);
+
+  PROCEDURE p_refcur(p_tag IN VARCHAR2, p_rc OUT SYS_REFCURSOR);
+
+  PROCEDURE p_raise(p_mode IN VARCHAR2);
+
+  FUNCTION f_sum(p_a IN NUMBER, p_b IN NUMBER) RETURN NUMBER;
+  FUNCTION f_echo(p_txt IN VARCHAR2) RETURN VARCHAR2;
+  FUNCTION f_dateadd(p_d IN DATE, p_days IN NUMBER DEFAULT 1) RETURN DATE;
+END oqt_pkg;
+/
+SHOW ERRORS PACKAGE [[oqt_pkg]];
+
+CREATE OR REPLACE PACKAGE BODY oqt_pkg AS
+  PROCEDURE log_msg(p_tag IN VARCHAR2, p_msg IN VARCHAR2, p_n1 IN NUMBER DEFAULT NULL) IS
+  BEGIN
+    INSERT INTO oqt_call_log(id, tag, msg, n1, created_at)
+    VALUES (oqt_call_log_seq.NEXTVAL, p_tag, p_msg, p_n1, SYSDATE);
+  END;
+
+  PROCEDURE p_basic(
+    p_in_num   IN  NUMBER,
+    p_in_txt   IN  VARCHAR2 DEFAULT 'DEF',
+    p_out_txt  OUT VARCHAR2,
+    p_inout_n  IN OUT NUMBER
+  ) IS
+  BEGIN
+    p_out_txt := 'IN_NUM='||p_in_num||', IN_TXT='||p_in_txt||', INOUT='||p_inout_n;
+    p_inout_n := NVL(p_inout_n,0) + p_in_num;
+
+    log_msg('P_BASIC', p_out_txt, p_in_num);
+    DBMS_OUTPUT.PUT_LINE('[p_basic] out='||p_out_txt||' / inout='||p_inout_n);
+  END;
+
+  PROCEDURE p_over(p_txt IN VARCHAR2) IS
+  BEGIN
+    log_msg('P_OVER1', p_txt);
+    DBMS_OUTPUT.PUT_LINE('[p_over(txt)] '||NVL(p_txt,'<NULL>'));
+  END;
+
+  PROCEDURE p_over(p_num IN NUMBER, p_txt IN VARCHAR2) IS
+  BEGIN
+    log_msg('P_OVER2', p_txt, p_num);
+    DBMS_OUTPUT.PUT_LINE('[p_over(num,txt)] '||p_num||' / '||NVL(p_txt,'<NULL>'));
+  END;
+
+  PROCEDURE p_refcur(p_tag IN VARCHAR2, p_rc OUT SYS_REFCURSOR) IS
+  BEGIN
+    OPEN p_rc FOR
+      SELECT id, tag, msg, n1, created_at
+      FROM oqt_call_log
+      WHERE tag LIKE p_tag||'%'
+      ORDER BY id DESC;
+  END;
+
+  PROCEDURE p_raise(p_mode IN VARCHAR2) IS
+  BEGIN
+    IF p_mode = 'NO_DATA_FOUND' THEN
+      DECLARE [[v]] NUMBER;
+      BEGIN
+        SELECT n1 INTO v FROM oqt_call_log WHERE id = -9999;
+      END;
+    ELSIF p_mode = 'APP' THEN
+      RAISE_APPLICATION_ERROR(-20001, 'oqt_pkg.p_raise app error');
+    ELSE
+      DBMS_OUTPUT.PUT_LINE('[p_raise] ok');
+    END IF;
+  END;
+
+  FUNCTION f_sum(p_a IN NUMBER, p_b IN NUMBER) RETURN NUMBER IS
+  BEGIN
+    RETURN NVL(p_a,0) + NVL(p_b,0);
+  END;
+
+  FUNCTION f_echo(p_txt IN VARCHAR2) RETURN VARCHAR2 IS
+  BEGIN
+    RETURN 'ECHO:'||p_txt;
+  END;
+
+  FUNCTION f_dateadd(p_d IN DATE, p_days IN NUMBER DEFAULT 1) RETURN DATE IS
+  BEGIN
+    RETURN p_d + p_days;
+  END;
+END oqt_pkg;
+/
+SHOW ERRORS PACKAGE BODY [[oqt_pkg]];
+
+PROMPT === [3] CREATE SYNONYM (OPTIONAL CALL FORM) ===
+
+CREATE SYNONYM oqt_syn FOR oqt_pkg;
+
+PROMPT === [4] SEED DATA VIA PROCEDURE ===
+
+BEGIN
+  oqt_pkg.log_msg('SEED', 'seed row 1', 1);
+  oqt_pkg.log_msg('SEED', 'seed row 2', 2);
+  oqt_pkg.log_msg('SEED', 'seed row 3', 3);
+END;
+/
+
+PROMPT === [5] CALL VARIANTS: EXEC/BEGIN/DEFAULT/NAMED/POSITIONAL/NULL/UNICODE ===
+
+-- (A) EXEC style (works if your tool emulates SQL*Plus/TOAD EXEC)
+EXEC oqt_pkg.p_over('hello from EXEC');
+EXEC oqt_pkg.p_over(10, 'hello from EXEC overload');
+
+-- (B) Anonymous block + named notation
+DECLARE
+  v_out   VARCHAR2(4000);
+  v_inout NUMBER := 5;
+BEGIN
+  oqt_pkg.p_basic(
+    p_in_num  => 3,
+    p_in_txt  => 'ABC',
+    p_out_txt => v_out,
+    p_inout_n => v_inout
+  );
+  DBMS_OUTPUT.PUT_LINE('[named] v_out='||v_out);
+  DBMS_OUTPUT.PUT_LINE('[named] v_inout='||v_inout);
+END;
+/
+
+-- (C) Default parameter omission
+DECLARE
+  v_out   VARCHAR2(4000);
+  v_inout NUMBER := 100;
+BEGIN
+  oqt_pkg.p_basic(7, p_out_txt => v_out, p_inout_n => v_inout); -- p_in_txt omitted
+  DBMS_OUTPUT.PUT_LINE('[default] out='||v_out||', inout='||v_inout);
+END;
+/
+
+-- (D) Positional notation
+DECLARE
+  v_out   VARCHAR2(4000);
+  v_inout NUMBER := 1;
+BEGIN
+  oqt_pkg.p_basic(2, 'POS', v_out, v_inout);
+  DBMS_OUTPUT.PUT_LINE('[positional] out='||v_out||', inout='||v_inout);
+END;
+/
+
+-- (E) NULL / empty / unicode / quote escaping
+BEGIN
+  oqt_pkg.p_over(NULL);
+  oqt_pkg.p_over('');
+  oqt_pkg.p_over('한글/emoji😀/quotes''test');
+  oqt_syn.[[p_over]]('via synonym call');
+END;
+/
+
+PROMPT === [6] FUNCTION IN SELECT (DUAL + TABLE) ===
+
+SELECT
+  oqt_pkg.f_sum(10, 20) AS sum_10_20,
+  oqt_pkg.f_echo('abc') AS echo_abc,
+  TO_CHAR(oqt_pkg.f_dateadd(SYSDATE, 2), 'YYYY-MM-DD') AS plus2
+FROM dual;
+
+SELECT id, tag, oqt_pkg.f_echo(msg) AS echo_msg
+FROM oqt_call_log
+WHERE oqt_pkg.f_sum(NVL(n1,0), 1) >= 1
+ORDER BY oqt_pkg.f_sum(NVL(n1,0), 0) DESC;
+
+PROMPT === [8] REF CURSOR OUT TEST (FETCH + DBMS_OUTPUT DUMP) ===
+
+DECLARE
+  rc SYS_REFCURSOR;
+  v_id NUMBER;
+  v_tag VARCHAR2(50);
+  v_msg VARCHAR2(4000);
+  v_n1  NUMBER;
+  v_created DATE;
+  v_cnt NUMBER := 0;
+BEGIN
+  oqt_pkg.p_refcur('P_%', rc);
+
+  LOOP
+    FETCH rc INTO v_id, v_tag, v_msg, v_n1, v_created;
+    EXIT WHEN rc%NOTFOUND;
+    v_cnt := v_cnt + 1;
+    DBMS_OUTPUT.PUT_LINE('RC['||v_cnt||']: '||v_id||' | '||v_tag||' | '||SUBSTR(v_msg,1,60));
+    EXIT WHEN v_cnt >= 20; -- limit spam
+  END LOOP;
+
+  CLOSE rc;
+  DBMS_OUTPUT.PUT_LINE('[refcur] fetched='||v_cnt);
+END;
+/
+
+PROMPT === [9] EXCEPTION CASES (EXPECTED ERRORS) ===
+
+-- (A) OK
+BEGIN
+  oqt_pkg.p_raise('OK');
+END;
+/
+
+PROMPT === [10] TRANSACTION TEST (ROLLBACK/COMMIT) ===
+
+BEGIN
+  oqt_pkg.log_msg('TX', 'before rollback', 1);
+END;
+/
+
+ROLLBACK;
+
+SELECT COUNT(*) AS tx_count_after_rollback
+FROM oqt_call_log
+WHERE tag='TX' AND msg='before rollback';
+
+BEGIN
+  oqt_pkg.log_msg('TX', 'before commit', 2);
+END;
+/
+
+COMMIT;
+
+SELECT COUNT(*) AS tx_count_after_commit
+FROM oqt_call_log
+WHERE tag='TX' AND msg='before commit';
+
+PROMPT === [11] FINAL VERIFY LOG TABLE (RECENT FIRST) ===
+
+SELECT id, tag, SUBSTR(msg,1,120) AS msg, n1, created_at
+FROM oqt_call_log
+ORDER BY id DESC;
+
+PROMPT === DONE ===
+
+-- =========================================================
+-- IntelliSense sweep report generated by intellisense sweep
+-- source: test/test2.txt
+-- db: Oracle
+-- metadata: test Oracle inferred catalog + Oracle built-ins
+-- checked: 449
+-- missing: 4
+-- marker: [[word]] means not suggested for the tested prefix
+-- missing tokens:
+--   69:21 word=oqt_pkg prefix=oqt_ suggestions=[] total=0 line=SHOW ERRORS PACKAGE oqt_pkg;
+--   116:15 word=v prefix=v suggestions=[VIRTUAL] total=1 line=DECLARE v NUMBER;
+--   143:26 word=oqt_pkg prefix=oqt_ suggestions=[] total=0 line=SHOW ERRORS PACKAGE BODY oqt_pkg;
+--   205:11 word=p_over prefix=p_ov suggestions=[] total=0 line=oqt_syn.p_over('via synonym call');
+-- =========================================================

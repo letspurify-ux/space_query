@@ -1,0 +1,1033 @@
+/* =====================================================================
+   QT_EXTREME_PARSER_FORMATTER_TORTURE.sql
+   목적:
+     - Statement splitter 검증
+     - BEGIN..END / ; / / 처리 검증
+     - 주석 / 문자열 / q-quote / dynamic SQL 검증
+     - SQL + PL/SQL + DDL + DML + package + trigger + view 검증
+     - formatter의 들여쓰기 / 정렬 / nested block 처리 검증
+   ===================================================================== */
+
+/* ---------------------------------------------------------------------
+   00. CLEANUP
+   --------------------------------------------------------------------- */
+
+BEGIN
+    EXECUTE IMMEDIATE 'DROP TRIGGER qt_sales_ctrg';
+EXCEPTION
+    WHEN OTHERS THEN
+        NULL;
+END;
+/
+
+BEGIN
+    EXECUTE IMMEDIATE 'DROP VIEW qt_complex_v';
+EXCEPTION
+    WHEN OTHERS THEN
+        NULL;
+END;
+/
+
+BEGIN
+    EXECUTE IMMEDIATE 'DROP PACKAGE qt_torture_pkg';
+EXCEPTION
+    WHEN OTHERS THEN
+        NULL;
+END;
+/
+
+BEGIN
+    EXECUTE IMMEDIATE 'DROP TYPE qt_sale_obj_tab';
+EXCEPTION
+    WHEN OTHERS THEN
+        NULL;
+END;
+/
+
+BEGIN
+    EXECUTE IMMEDIATE 'DROP TYPE qt_sale_obj';
+EXCEPTION
+    WHEN OTHERS THEN
+        NULL;
+END;
+/
+
+BEGIN
+    EXECUTE IMMEDIATE 'DROP TABLE qt_sales PURGE';
+EXCEPTION
+    WHEN OTHERS THEN
+        NULL;
+END;
+/
+
+BEGIN
+    EXECUTE IMMEDIATE 'DROP TABLE qt_employees PURGE';
+EXCEPTION
+    WHEN OTHERS THEN
+        NULL;
+END;
+/
+
+BEGIN
+    EXECUTE IMMEDIATE 'DROP TABLE qt_departments PURGE';
+EXCEPTION
+    WHEN OTHERS THEN
+        NULL;
+END;
+/
+
+BEGIN
+    EXECUTE IMMEDIATE 'DROP TABLE qt_audit_log PURGE';
+EXCEPTION
+    WHEN OTHERS THEN
+        NULL;
+END;
+/
+
+BEGIN
+    EXECUTE IMMEDIATE 'DROP SEQUENCE qt_seq';
+EXCEPTION
+    WHEN OTHERS THEN
+        NULL;
+END;
+/
+
+/* ---------------------------------------------------------------------
+   01. BASE OBJECTS
+   --------------------------------------------------------------------- */
+
+CREATE TABLE qt_departments (
+    dept_id        NUMBER         CONSTRAINT qt_departments_pk PRIMARY KEY,
+    dept_name      VARCHAR2 (100) CONSTRAINT qt_departments_uq UNIQUE NOT NULL,
+    parent_dept_id NUMBER         NULL,
+    status         VARCHAR2 (10)  DEFAULT 'ACTIVE' NOT NULL,
+    created_at     TIMESTAMP      DEFAULT SYSTIMESTAMP NOT NULL,
+    CONSTRAINT qt_departments_fk_parent FOREIGN KEY (parent_dept_id) REFERENCES qt_departments (dept_id),
+    CONSTRAINT qt_departments_status_ck CHECK (status IN ('ACTIVE', 'INACTIVE'))
+);
+/
+
+CREATE TABLE qt_employees (
+    emp_id       NUMBER              CONSTRAINT qt_employees_pk PRIMARY KEY,
+    dept_id      NUMBER              NOT NULL,
+    manager_id   NUMBER              NULL,
+    emp_name     VARCHAR2 (200 CHAR) NOT NULL,
+    email        VARCHAR2 (320),
+    hire_date    DATE                DEFAULT TRUNC (SYSDATE) NOT NULL,
+    salary       NUMBER (12, 2),
+    bonus_pct    NUMBER (5, 2),
+    profile_json CLOB,
+    remarks      VARCHAR2 (4000),
+    upper_name   VARCHAR2 (320),
+    CONSTRAINT qt_employees_fk_dept FOREIGN KEY (dept_id) REFERENCES qt_departments (dept_id),
+    CONSTRAINT qt_employees_fk_manager FOREIGN KEY (manager_id) REFERENCES qt_employees (emp_id),
+    CONSTRAINT qt_employees_profile_json_ck CHECK (profile_json IS JSON)
+);
+/
+
+CREATE TABLE qt_sales (
+    sale_id    NUMBER          CONSTRAINT qt_sales_pk PRIMARY KEY,
+    emp_id     NUMBER          NOT NULL,
+    sale_date  DATE            NOT NULL,
+    amount     NUMBER (12, 2)  NOT NULL,
+    status     VARCHAR2 (20)   NOT NULL,
+    note       VARCHAR2 (1000),
+    created_at TIMESTAMP       DEFAULT SYSTIMESTAMP NOT NULL,
+    CONSTRAINT qt_sales_fk_emp FOREIGN KEY (emp_id) REFERENCES qt_employees (emp_id),
+    CONSTRAINT qt_sales_status_ck CHECK (status IN ('NEW', 'PAID', 'CANCELLED', 'PENDING'))
+);
+/
+
+CREATE TABLE qt_audit_log (
+    log_id      NUMBER         GENERATED ALWAYS AS IDENTITY CONSTRAINT qt_audit_log_pk PRIMARY KEY,
+    log_ts      TIMESTAMP      DEFAULT SYSTIMESTAMP NOT NULL,
+    module_name VARCHAR2 (100),
+    action_name VARCHAR2 (100),
+    detail_text CLOB
+);
+/
+
+CREATE SEQUENCE qt_seq START WITH 1000 INCREMENT BY 1 NOCACHE;
+/
+
+/* ---------------------------------------------------------------------
+   02. SEED DATA
+   --------------------------------------------------------------------- */
+
+INSERT ALL
+    INTO qt_departments (dept_id, dept_name, parent_dept_id, status)
+    VALUES (10, 'ENGINEERING', NULL, 'ACTIVE')
+    INTO qt_departments (dept_id, dept_name, parent_dept_id, status)
+    VALUES (20, 'PLATFORM', 10, 'ACTIVE')
+    INTO qt_departments (dept_id, dept_name, parent_dept_id, status)
+    VALUES (30, 'DATA', 10, 'ACTIVE')
+    INTO qt_departments (dept_id, dept_name, parent_dept_id, status)
+    VALUES (40, 'SALES', NULL, 'ACTIVE')
+    INTO qt_departments (dept_id, dept_name, parent_dept_id, status)
+    VALUES (50, 'OPS', 10, 'INACTIVE')
+SELECT 1
+FROM DUAL;
+/
+
+INSERT ALL
+    INTO qt_employees (emp_id, dept_id, manager_id, emp_name, email, hire_date, salary, bonus_pct, profile_json, remarks)
+    VALUES (1, 10, NULL, 'Alice Root', 'alice@example.com', DATE '2022-01-01', 12000, 15, q'!{"skills":["Architecture","Oracle"],"level":"L6","flags":{"lead":true}}!', 'root manager')
+    INTO qt_employees (emp_id, dept_id, manager_id, emp_name, email, hire_date, salary, bonus_pct, profile_json, remarks)
+    VALUES (2, 20, 1, 'Bob Platform', 'bob@example.com', DATE '2022-03-01', 8000, 10, q'!{"skills":["Rust","SQL"],"level":"L4","flags":{"lead":true}}!', 'platform lead; contains semicolon; parser must ignore inside string')
+    INTO qt_employees (emp_id, dept_id, manager_id, emp_name, email, hire_date, salary, bonus_pct, profile_json, remarks)
+    VALUES (3, 30, 1, 'Carol Data', 'carol@example.com', DATE '2022-04-01', 7800, 8, q'!{"skills":["ETL","PLSQL"],"level":"L4","flags":{"lead":true}}!', 'data lead')
+    INTO qt_employees (emp_id, dept_id, manager_id, emp_name, email, hire_date, salary, bonus_pct, profile_json, remarks)
+    VALUES (4, 40, 1, 'Dave Sales', 'dave@example.com', DATE '2022-05-01', 7000, 20, q'!{"skills":["Negotiation","CRM"],"level":"L4","flags":{"lead":true}}!', 'sales lead')
+    INTO qt_employees (emp_id, dept_id, manager_id, emp_name, email, hire_date, salary, bonus_pct, profile_json, remarks)
+    VALUES (5, 20, 2, 'Erin Engine', 'erin@example.com', DATE '2023-01-10', 5000, 5, q'!{"skills":["Rust","UI","Parser"],"level":"L3","flags":{"lead":false}}!', q'[contains tricky chars: ; / -- /* */ ' " ]')
+    INTO qt_employees (emp_id, dept_id, manager_id, emp_name, email, hire_date, salary, bonus_pct, profile_json, remarks)
+    VALUES (6, 30, 3, 'Frank Analyst', 'frank@example.com', DATE '2023-02-10', 4900, 4, q'!{"skills":["Python","Analytics"],"level":"L3","flags":{"lead":false}}!', 'analyst')
+    INTO qt_employees (emp_id, dept_id, manager_id, emp_name, email, hire_date, salary, bonus_pct, profile_json, remarks)
+    VALUES (7, 40, 4, 'Grace AE', 'grace@example.com', DATE '2023-03-10', 4500, 12, q'!{"skills":["Salesforce","Excel"],"level":"L3","flags":{"lead":false}}!', 'ae')
+SELECT 1
+FROM DUAL;
+/
+
+INSERT ALL
+    INTO qt_sales (sale_id, emp_id, sale_date, amount, status, note)
+    VALUES (100, 4, DATE '2026-01-01', 90.00, 'NEW', 'n1')
+    INTO qt_sales (sale_id, emp_id, sale_date, amount, status, note)
+    VALUES (101, 4, DATE '2026-01-02', 150.00, 'PAID', 'n2')
+    INTO qt_sales (sale_id, emp_id, sale_date, amount, status, note)
+    VALUES (102, 4, DATE '2026-01-03', 900.00, 'PAID', 'n3')
+    INTO qt_sales (sale_id, emp_id, sale_date, amount, status, note)
+    VALUES (103, 7, DATE '2026-01-01', 50.00, 'PENDING', 'contains ; semicolon')
+    INTO qt_sales (sale_id, emp_id, sale_date, amount, status, note)
+    VALUES (104, 7, DATE '2026-01-02', 400.00, 'NEW', 'contains / slash')
+    INTO qt_sales (sale_id, emp_id, sale_date, amount, status, note)
+    VALUES (105, 7, DATE '2026-01-03', 800.00, 'PAID', q'[contains -- and /* fake comments */ ]')
+    INTO qt_sales (sale_id, emp_id, sale_date, amount, status, note)
+    VALUES (106, 2, DATE '2026-02-01', 600.00, 'PAID', 'platform upsell')
+    INTO qt_sales (sale_id, emp_id, sale_date, amount, status, note)
+    VALUES (107, 3, DATE '2026-02-02', 300.00, 'CANCELLED', 'cancelled row')
+    INTO qt_sales (sale_id, emp_id, sale_date, amount, status, note)
+    VALUES (108, 5, DATE '2026-02-03', 120.00, 'NEW', 'engineer internal')
+    INTO qt_sales (sale_id, emp_id, sale_date, amount, status, note)
+    VALUES (109, 6, DATE '2026-02-04', 220.00, 'PENDING', 'analyst support')
+SELECT 1
+FROM DUAL;
+/
+
+COMMIT;
+/
+
+/* ---------------------------------------------------------------------
+   03. TYPES
+   --------------------------------------------------------------------- */
+
+CREATE OR REPLACE TYPE qt_sale_obj AS
+    OBJECT (sale_id NUMBER, emp_id NUMBER, amount NUMBER, tag VARCHAR2 (200));
+/
+
+CREATE OR REPLACE TYPE qt_sale_obj_tab AS
+    TABLE OF qt_sale_obj;
+/
+
+/* ---------------------------------------------------------------------
+   04. PACKAGE SPEC
+   --------------------------------------------------------------------- */
+
+CREATE OR REPLACE PACKAGE qt_torture_pkg AUTHID DEFINER IS
+    SUBTYPE t_name IS VARCHAR2 (200 CHAR);
+    TYPE t_refcur IS REF CURSOR;
+    TYPE t_num_nt IS TABLE OF NUMBER;
+    TYPE t_name_aat IS TABLE OF t_name INDEX BY PLS_INTEGER;
+    g_run_id NUMBER := 0;
+    PROCEDURE AUDIT (p_module VARCHAR2, p_action VARCHAR2, p_detail CLOB);
+    FUNCTION get_employee_report (p_dept_id NUMBER, p_min_salary NUMBER DEFAULT 0) RETURN t_refcur;
+    FUNCTION pipe_sales (p_emp_id NUMBER DEFAULT NULL) RETURN qt_sale_obj_tab PIPELINED;
+    PROCEDURE complex_block (p_dept_id NUMBER, p_raise_pct NUMBER DEFAULT 1.5, p_mode VARCHAR2 DEFAULT 'DEEP');
+END qt_torture_pkg;
+/
+
+/* ---------------------------------------------------------------------
+   05. PACKAGE BODY
+   --------------------------------------------------------------------- */
+
+CREATE OR REPLACE PACKAGE BODY qt_torture_pkg IS
+    PROCEDURE AUDIT (p_module VARCHAR2, p_action VARCHAR2, p_detail CLOB) IS
+        PRAGMA AUTONOMOUS_TRANSACTION;
+    BEGIN
+        INSERT INTO qt_audit_log (module_name, action_name, detail_text)
+        VALUES (p_module, p_action, p_detail);
+        COMMIT;
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+    END AUDIT;
+
+    FUNCTION get_employee_report (p_dept_id NUMBER, p_min_salary NUMBER DEFAULT 0) RETURN t_refcur IS
+        l_rc t_refcur;
+    BEGIN
+        OPEN l_rc FOR
+            WITH base AS (
+                SELECT e.emp_id,
+                    e.emp_name,
+                    e.salary,
+                    e.bonus_pct,
+                    d.dept_name,
+                    NVL (
+                        (
+                            SELECT SUM (s.amount)
+                            FROM qt_sales s
+                            WHERE s.emp_id = e.emp_id
+                        ),
+                        0
+                    ) AS total_sales
+                FROM qt_employees e
+                JOIN qt_departments d
+                    ON d.dept_id = e.dept_id
+                WHERE e.dept_id = p_dept_id
+            ),
+            ranked AS (
+                SELECT b.*,
+                    DENSE_RANK () OVER (
+                        ORDER BY b.salary DESC NULLS LAST
+                    ) AS salary_rank
+                FROM base b
+            )
+            SELECT r.emp_id,
+                r.emp_name,
+                r.dept_name,
+                r.salary,
+                r.bonus_pct,
+                r.total_sales,
+                r.salary_rank
+            FROM ranked r
+            WHERE r.salary >= p_min_salary
+            ORDER BY r.salary_rank,
+                r.emp_id;
+        RETURN l_rc;
+    END get_employee_report;
+
+    FUNCTION pipe_sales (p_emp_id NUMBER DEFAULT NULL) RETURN qt_sale_obj_tab PIPELINED IS
+    BEGIN
+        FOR rec IN (
+            SELECT s.sale_id,
+                s.emp_id,
+                s.amount,
+                CASE
+                    WHEN s.amount < 100 THEN 'LOW'
+                    WHEN s.amount BETWEEN 100 AND 500 THEN 'MID'
+                    ELSE 'HIGH'
+                END AS tag
+            FROM qt_sales s
+            WHERE p_emp_id IS NULL
+                OR s.emp_id = p_emp_id
+            ORDER BY s.sale_id
+        ) LOOP
+            PIPE ROW (qt_sale_obj (rec.sale_id, rec.emp_id, rec.amount, rec.tag));
+        END LOOP;
+        RETURN;
+    END pipe_sales;
+
+    PROCEDURE complex_block (p_dept_id NUMBER, p_raise_pct NUMBER DEFAULT 1.5, p_mode VARCHAR2 DEFAULT 'DEEP') IS
+        l_ids t_num_nt;
+        l_sql CLOB;
+        l_count NUMBER := 0;
+        l_rows NUMBER := 0;
+        l_mode VARCHAR2 (30) := NVL (p_mode, 'DEEP');
+        e_bulk
+    EXCEPTION;
+        PRAGMA EXCEPTION_INIT (e_bulk, - 24381);
+        CURSOR c_emp (cp_dept_id NUMBER) IS
+            SELECT emp_id,
+                emp_name,
+                salary
+            FROM qt_employees
+            WHERE dept_id = cp_dept_id
+            ORDER BY emp_id
+            FOR
+            UPDATE OF salary SKIP LOCKED;
+        BEGIN
+            g_run_id := g_run_id + 1;
+            AUDIT ('qt_torture_pkg', 'complex_block.begin', 'run=' || g_run_id || '; dept=' || p_dept_id || '; mode=' || l_mode);
+            SELECT emp_id BULK COLLECT INTO l_ids
+            FROM qt_employees
+            WHERE dept_id = p_dept_id
+            ORDER BY emp_id;
+            IF l_ids.COUNT > 0 THEN
+                FORALL i IN 1..l_ids.COUNT SAVE EXCEPTIONS
+                    UPDATE qt_employees
+                    SET salary = ROUND (NVL (salary, 0) * (1 + p_raise_pct / 100), 2),
+                        remarks = NVL (remarks, '') ||
+                        CASE
+                            WHEN remarks IS NULL THEN
+                                ''
+                            ELSE
+                                ' | '
+                        END || 'raised:' || TO_CHAR (SYSTIMESTAMP, 'YYYY-MM-DD HH24:MI:SS.FF3')
+                    WHERE emp_id = l_ids (i);
+            END IF;
+            <<outer_loop>>
+            FOR r IN c_emp (p_dept_id) LOOP
+                DECLARE
+                    l_local NUMBER := 0;
+                    l_msg VARCHAR2 (4000);
+                BEGIN
+                    l_local :=
+                        CASE
+                            WHEN r.salary IS NULL THEN
+                                - 1
+                            WHEN r.salary < 3000 THEN
+                                1
+                            WHEN r.salary BETWEEN 3000 AND 7000 THEN
+                                CASE
+                                    WHEN MOD (r.emp_id, 2) = 0 THEN
+                                        2
+                                    ELSE
+                                        3
+                                END
+                            ELSE
+                                4
+                        END;
+                    l_msg := q'[
+BEGIN; this is not a real block delimiter for the outer parser.
+It contains semicolons ;;;;; and slashes / / / and comment markers -- /* */
+END;
+]';
+                    IF l_mode = 'DEEP' THEN
+                        FOR i IN 1..2 LOOP
+                            FOR j IN REVERSE 1..2 LOOP
+                                EXIT outer_loop WHEN i = 2
+                                    AND j = 1
+                                    AND r.emp_id > 1000000;
+                                l_count := l_count + i + j + l_local;
+                            END LOOP;
+                        END LOOP;
+                    ELSE
+                        l_count := l_count + l_local;
+                    END IF;
+                    AUDIT ('qt_torture_pkg', 'complex_block.row', 'emp=' || r.emp_id || '; class=' || l_local || '; msg=' || SUBSTR (l_msg, 1, 80));
+                EXCEPTION
+                    WHEN ZERO_DIVIDE THEN
+                        AUDIT ('qt_torture_pkg', 'complex_block.zero_divide', 'emp=' || r.emp_id);
+                    WHEN OTHERS THEN
+                        AUDIT ('qt_torture_pkg', 'complex_block.row_error', 'emp=' || r.emp_id || '; err=' || SQLERRM);
+                END;
+            END LOOP outer_loop;
+            l_sql := q'[
+            UPDATE qt_sales
+               SET note =
+                       NVL(note, '') ||
+                       CASE
+                           WHEN note IS NULL THEN ''
+                           ELSE ' | '
+                       END ||
+                       'mode=' || :b_mode ||
+                       '; ts=' || TO_CHAR(SYSTIMESTAMP, 'YYYY-MM-DD"T"HH24:MI:SS')
+             WHERE emp_id IN
+                   (
+                       SELECT emp_id
+                       FROM qt_employees
+                       WHERE dept_id = :b_dept_id
+                   )
+        ]';
+            EXECUTE IMMEDIATE l_sql USING l_mode, p_dept_id;
+            l_rows := SQL%ROWCOUNT;
+            $IF DBMS_DB_VERSION.VERSION >= 12 $THEN AUDIT ('qt_torture_pkg', 'complex_block.ccflag', 'conditional-compilation=true');
+            $ELSE AUDIT ('qt_torture_pkg', 'complex_block.ccflag', 'conditional-compilation=false');
+            $END AUDIT ('qt_torture_pkg', 'complex_block.end', 'updated=' || l_rows || '; aggregate=' || l_count);
+        EXCEPTION
+            WHEN e_bulk THEN
+                AUDIT ('qt_torture_pkg', 'complex_block.bulk_error', 'bulk exception raised');
+                RAISE;
+            WHEN OTHERS THEN
+                AUDIT ('qt_torture_pkg', 'complex_block.fatal', SQLERRM);
+                RAISE;
+    END complex_block;
+END qt_torture_pkg;
+/
+
+/* ---------------------------------------------------------------------
+   06. COMPOUND TRIGGER
+   --------------------------------------------------------------------- */
+
+CREATE OR REPLACE TRIGGER qt_sales_ctrg
+    FOR INSERT OR UPDATE OF amount, status
+    ON qt_sales COMPOUND TRIGGER g_rows PLS_INTEGER := 0;
+    BEFORE STATEMENT IS
+    BEGIN
+        qt_torture_pkg.AUDIT ('qt_sales_ctrg', 'before statement', 'start');
+    END BEFORE STATEMENT;
+    BEFORE EACH ROW IS
+    BEGIN
+        :NEW.status := NVL (:NEW.status, 'NEW');
+        IF :NEW.amount < 0 THEN
+            RAISE_APPLICATION_ERROR (- 20001, 'Amount must be non-negative');
+        END IF;
+    END BEFORE EACH ROW;
+    AFTER EACH ROW IS
+    BEGIN
+        g_rows := g_rows + 1;
+    END AFTER EACH ROW;
+    AFTER STATEMENT IS
+    BEGIN
+        qt_torture_pkg.AUDIT ('qt_sales_ctrg', 'after statement', 'rows=' || g_rows);
+    END AFTER STATEMENT;
+END qt_sales_ctrg;
+/
+
+/* ---------------------------------------------------------------------
+   07. VIEW
+   --------------------------------------------------------------------- */
+
+CREATE OR REPLACE VIEW qt_complex_v AS
+    SELECT d.dept_id,
+        d.dept_name,
+        e.emp_id,
+        e.emp_name,
+        SUM (s.amount) OVER (
+            PARTITION BY d.dept_id
+        ) AS dept_total,
+        AVG (s.amount) OVER (
+            PARTITION BY d.dept_id,
+            e.emp_id
+        ) AS emp_avg,
+        ROW_NUMBER () OVER (
+            PARTITION BY d.dept_id
+            ORDER BY NVL (s.amount, 0) DESC,
+            e.emp_id
+        ) AS rn
+    FROM qt_departments d
+    JOIN qt_employees e
+        ON e.dept_id = d.dept_id
+    LEFT JOIN qt_sales s
+        ON s.emp_id = e.emp_id;
+/
+
+/* ---------------------------------------------------------------------
+   08. PACKAGE / TRIGGER EXERCISE
+   --------------------------------------------------------------------- */
+
+BEGIN
+    qt_torture_pkg.complex_block (20, 2.25, 'DEEP');
+    qt_torture_pkg.complex_block (30, 1.10, 'SHALLOW');
+END;
+/
+
+/* ---------------------------------------------------------------------
+   09. PURE SQL TORTURE
+   --------------------------------------------------------------------- */
+
+/* 09-01. WITH FUNCTION: SQL 안에 로컬 함수 */
+
+WITH
+    FUNCTION score_fn (p_salary NUMBER, p_bonus NUMBER) RETURN NUMBER IS
+    BEGIN
+        RETURN ROUND (NVL (p_salary, 0) * (1 + NVL (p_bonus, 0) / 100), 2);
+    END;
+SELECT e.emp_id,
+    e.emp_name,
+    score_fn (e.salary, e.bonus_pct) AS score
+FROM qt_employees e
+ORDER BY e.emp_id;
+/
+
+/* 09-02. Recursive subquery factoring + SEARCH + CYCLE */
+
+WITH dept_tree (dept_id, parent_dept_id, dept_name, lvl, path_txt) AS (
+    SELECT
+        d.dept_id,
+        d.parent_dept_id,
+        d.dept_name,
+        1 AS lvl,
+        '/' || d.dept_name AS path_txt
+    FROM qt_departments d
+    WHERE d.parent_dept_id IS NULL
+    UNION ALL
+    SELECT
+        c.dept_id,
+        c.parent_dept_id,
+        c.dept_name,
+        p.lvl + 1,
+        p.path_txt || '/' || c.dept_name
+    FROM qt_departments c
+    JOIN dept_tree p
+        ON p.dept_id = c.parent_dept_id
+)
+SEARCH DEPTH FIRST BY dept_id SET dfs_ord
+CYCLE dept_id SET is_cycle TO 'Y' DEFAULT 'N'
+SELECT
+    dept_id,
+    parent_dept_id,
+    dept_name,
+    lvl,
+    path_txt,
+    dfs_ord,
+    is_cycle
+FROM dept_tree
+ORDER BY dfs_ord;
+/
+
+/* 09-03. CONNECT BY NOCYCLE */
+
+SELECT LPAD (' ', 2 * (LEVEL - 1)) || dept_name AS dept_tree,
+    dept_id,
+    parent_dept_id,
+    SYS_CONNECT_BY_PATH (dept_name, '/') AS full_path
+FROM qt_departments
+START WITH parent_dept_id IS NULL
+CONNECT BY NOCYCLE PRIOR dept_id = parent_dept_id
+ORDER SIBLINGS BY dept_name;
+/
+
+/* 09-04. 엄청난 중첩 쿼리 */
+
+SELECT *
+FROM (
+        SELECT /*+ qb_name(main_q) leading(e d) use_hash(d) */
+            e.emp_id,
+            e.emp_name,
+            d.dept_name,
+            x.total_amount,
+            x.avg_amount,
+            x.sale_cnt,
+            (
+                SELECT MAX(s2.amount)
+                FROM qt_sales s2
+                WHERE s2.emp_id = e.emp_id
+            ) AS max_amount,
+            CASE
+                WHEN x.sale_cnt = 0 THEN 'NO_SALES'
+                WHEN x.total_amount > (
+                    SELECT AVG(dept_sum)
+                    FROM (
+                            SELECT SUM (s3.amount) AS dept_sum
+                            FROM qt_sales s3
+                            JOIN qt_employees e3
+                                ON e3.emp_id = s3.emp_id
+                            GROUP BY e3.dept_id
+                        )
+                ) THEN
+                    CASE
+                        WHEN EXISTS (
+                            SELECT 1
+                            FROM qt_sales sx
+                            WHERE sx.emp_id = e.emp_id
+                                AND sx.status = 'PAID'
+                                AND sx.amount > (
+                                    SELECT NVL (AVG(sy.amount), 0)
+                                    FROM qt_sales sy
+                                    WHERE sy.emp_id = sx.emp_id
+                                )
+                        ) THEN 'ABOVE_DEPT_AND_SELF_AVG'
+                        ELSE 'ABOVE_DEPT_AVG'
+                    END
+                ELSE
+                    CASE
+                        WHEN NVL (x.avg_amount, 0) > 0 THEN
+                            CASE
+                                WHEN x.avg_amount >= 500 THEN 'MID_PLUS'
+                                ELSE 'NORMAL'
+                            END
+                        ELSE 'NORMAL'
+                    END
+            END AS rank_bucket,
+            ROW_NUMBER () OVER (
+                PARTITION BY d.dept_id
+                ORDER BY x.total_amount DESC NULLS LAST,
+                e.emp_id
+            ) AS rn
+        FROM qt_employees e
+        JOIN qt_departments d
+            ON d.dept_id = e.dept_id
+        CROSS APPLY (
+            SELECT NVL (SUM (s.amount), 0) AS total_amount,
+                NVL (AVG(s.amount), 0) AS avg_amount,
+                COUNT(*) AS sale_cnt
+            FROM qt_sales s
+            WHERE s.emp_id = e.emp_id
+                AND s.status IN ('NEW', 'PAID', 'PENDING')
+        ) x
+        WHERE EXISTS (
+                SELECT 1
+                FROM qt_sales ex
+                WHERE ex.emp_id = e.emp_id
+                    OR (ex.emp_id = e.emp_id
+                        AND ex.note LIKE '%;%')
+            )
+    ) q
+WHERE q.rn <= 3
+ORDER BY q.dept_name,
+    q.rn,
+    q.emp_id;
+/
+
+/* 09-05. 구식 outer join (+) */
+
+SELECT d.dept_name,
+    e.emp_name
+FROM qt_departments d,
+    qt_employees e
+WHERE d.dept_id = e.dept_id (+)
+ORDER BY d.dept_id,
+    e.emp_id;
+/
+
+/* 09-06. analytic + KEEP + LISTAGG + FETCH FIRST */
+
+-- SELECT e.dept_id,
+-- MAX (e.salary) KEEP (DENSE_RANK LAST ORDER BY e.hire_date) AS newest_emp_salary,
+-- LISTAGG (e.emp_name, ', ') WITHIN
+-- GROUP (ORDER BY e.emp_name)
+-- ON OVERFLOW TRUNCATE '...'
+-- WITH COUNT AS members
+-- FROM qt_employees e
+-- GROUP BY e.dept_id
+-- ORDER BY e.dept_id;
+-- /
+
+SELECT emp_id,
+    emp_name,
+    salary
+FROM qt_employees
+ORDER BY salary DESC NULLS LAST
+FETCH FIRST 3 ROWS WITH TIES;
+/
+
+/* 09-07. PIVOT */
+
+SELECT *
+FROM (
+        SELECT TO_CHAR (sale_date, 'YYYY-MM') AS ym,
+            status,
+            amount
+        FROM qt_sales
+    )
+PIVOT (
+    SUM (amount) AS amt
+    FOR status IN ('NEW' AS NEW, 'PAID' AS PAID, 'PENDING' AS PENDING, 'CANCELLED' AS CANCELLED)
+)
+ORDER BY ym;
+/
+
+/* 09-08. UNPIVOT */
+
+SELECT *
+FROM (
+        SELECT emp_id,
+            salary AS base_salary,
+            NVL (salary, 0) * NVL (bonus_pct, 0) / 100 AS bonus_amount
+        FROM qt_employees
+    )
+UNPIVOT INCLUDE NULLS (
+    metric_value
+    FOR metric_name IN (base_salary AS 'BASE_SALARY', bonus_amount AS 'BONUS_AMOUNT')
+)
+ORDER BY emp_id,
+    metric_name;
+/
+
+/* 09-09. MATCH_RECOGNIZE */
+
+SELECT *
+FROM qt_sales
+MATCH_RECOGNIZE (
+    PARTITION BY emp_id
+    ORDER BY sale_date,
+        sale_id
+    MEASURES MATCH_NUMBER () AS match_no,
+        CLASSIFIER () AS cls,
+        FIRST (sale_date) AS start_dt,
+        LAST (sale_date) AS end_dt,
+        SUM (amount) AS total_amt
+    ALL ROWS PER MATCH
+    PATTERN (low + mid * high)
+    DEFINE low AS low.amount < 100,
+        mid AS mid.amount BETWEEN 100 AND 500,
+        high AS high.amount > 500
+)
+ORDER BY emp_id,
+    sale_id;
+/
+
+/* 09-10. MODEL */
+
+SELECT dept_id,
+    month_no,
+    total_amt
+FROM (
+        SELECT e.dept_id,
+            EXTRACT (MONTH FROM s.sale_date) AS month_no,
+            SUM (s.amount) AS total_amt
+        FROM qt_sales s
+        JOIN qt_employees e
+            ON e.emp_id = s.emp_id
+        GROUP BY e.dept_id,
+            EXTRACT (MONTH FROM s.sale_date)
+    )
+MODEL
+    PARTITION BY (dept_id)
+    DIMENSION BY (month_no)
+    MEASURES (total_amt)
+    RULES UPSERT (total_amt [ FOR month_no FROM 1 TO 12 INCREMENT 1 ] = NVL (total_amt [ CV (month_no) ], 0))
+ORDER BY dept_id,
+    month_no;
+/
+
+/* 09-11. JSON_TABLE */
+
+SELECT jt.emp_id,
+    jt.skill
+FROM JSON_TABLE (q'![
+        {"emp_id":1,"skills":["SQL","PLSQL","ARCH"]},
+        {"emp_id":2,"skills":["Rust","FLTK"]},
+        {"emp_id":3,"skills":["ETL","JSON"]}
+    ]!', '$[*]' COLUMNS (
+        emp_id NUMBER PATH '$.emp_id',
+        NESTED PATH '$.skills[*]' COLUMNS (
+            skill VARCHAR2 (30) PATH '$'
+        )
+    )) jt
+ORDER BY jt.emp_id,
+    jt.skill;
+/
+
+/* 09-12. XMLTABLE */
+
+SELECT x.emp_id,
+    x.tag
+FROM XMLTABLE ('/root/item' PASSING XMLTYPE ('<root>
+            <item><emp_id>1</emp_id><tag>A</tag></item>
+            <item><emp_id>2</emp_id><tag>B</tag></item>
+            <item><emp_id>3</emp_id><tag>C</tag></item>
+         </root>') COLUMNS emp_id NUMBER PATH 'emp_id', tag VARCHAR2 (10) PATH 'tag') x
+ORDER BY x.emp_id;
+/
+
+/* 09-13. TABLE function */
+
+SELECT *
+FROM TABLE (qt_torture_pkg.pipe_sales (NULL))
+ORDER BY sale_id;
+/
+
+/* 09-14. JSON_VALUE + quoted alias */
+
+SELECT e.emp_id AS "Emp#",
+    e.emp_name AS "Employee Name",
+    JSON_VALUE (e.profile_json, '$.level' RETURNING VARCHAR2 (20)) AS "Level"
+FROM qt_employees e
+ORDER BY 1;
+/
+
+/* 09-15. view reference */
+
+SELECT *
+FROM qt_complex_v
+WHERE rn <= 2
+ORDER BY dept_id,
+    rn,
+    emp_id;
+/
+
+/* ---------------------------------------------------------------------
+   10. DML TORTURE
+   --------------------------------------------------------------------- */
+
+/* 10-01. MERGE */
+
+MERGE INTO qt_sales dst
+USING (
+        SELECT 2001 AS sale_id,
+            5 AS emp_id,
+            DATE '2026-03-01' AS sale_date,
+            777.77 AS amount,
+            'PAID' AS status,
+            'merged row' AS note
+        FROM DUAL
+        UNION ALL
+        SELECT 100 AS sale_id,
+            4 AS emp_id,
+            DATE '2026-03-02' AS sale_date,
+            999.99 AS amount,
+            'PAID' AS status,
+            'updated by merge' AS note
+        FROM DUAL
+    ) src
+    ON (dst.sale_id = src.sale_id)
+WHEN MATCHED THEN
+    UPDATE SET dst.[[amount]] = src.amount,
+        dst.[[status]] = src.status,
+        dst.[[note]] = src.note
+    DELETE
+    WHERE src.status = 'CANCELLED'
+WHEN NOT MATCHED THEN
+    INSERT (sale_id, emp_id, sale_date, amount, status, note) VALUES (src.sale_id, src.emp_id, src.sale_date, src.amount, src.status, src.note);
+/
+
+/* 10-02. conditional multitable insert */
+
+INSERT ALL
+    WHEN [[amount]] >= 500 THEN
+        INTO qt_audit_log (module_name, action_name, detail_text)
+        VALUES ('INSERT ALL', 'HIGH_SALE', 'sale_id=' || sale_id || '; amount=' || amount)
+    WHEN [[amount]] < 500 THEN
+        INTO qt_audit_log (module_name, action_name, detail_text)
+        VALUES ('INSERT ALL', 'LOW_SALE', 'sale_id=' || sale_id || '; amount=' || amount)
+SELECT sale_id,
+    [[amount]]
+FROM qt_sales
+WHERE sale_id BETWEEN 100 AND 109;
+/
+
+/* ---------------------------------------------------------------------
+   11. PL/SQL ANONYMOUS BLOCK TORTURE
+   --------------------------------------------------------------------- */
+
+/* 11-01. nested proc + nested func + savepoint + returning */
+
+-- DECLARE
+-- l_new_sale_id NUMBER;
+-- l_rows PLS_INTEGER := 0;
+-- PROCEDURE nested_proc (p_emp_id NUMBER) IS FUNCTION nested_fn (p_text VARCHAR2) RETURN VARCHAR2 IS
+-- BEGIN
+-- RETURN REPLACE (p_text, ';', ':');
+-- END nested_fn;
+-- BEGIN
+-- INSERT INTO qt_sales (sale_id, emp_id, sale_date, amount, status, note)
+-- VALUES (qt_seq.NEXTVAL, p_emp_id, SYSDATE, 123.45, 'NEW', nested_fn (q'[inline ; note / /* */ -- text]'))
+-- RETURNING sale_id
+-- INTO l_new_sale_id;
+-- END nested_proc;
+-- BEGIN
+-- SAVEPOINT sp_before_nested;
+-- FOR r IN (
+-- SELECT emp_id
+-- FROM qt_employees
+-- WHERE emp_id IN (1, 2, 3)
+-- ORDER BY emp_id
+-- ) LOOP
+-- nested_proc (r.emp_id);
+-- l_rows := l_rows + 1;
+-- END LOOP;
+-- DBMS_OUTPUT.PUT_LINE ('rows=' || l_rows || ', last_sale_id=' || l_new_sale_id);
+-- ROLLBACK TO sp_before_nested;
+-- END;
+/
+
+/* 11-02. dynamic SQL + ref cursor */
+
+DECLARE
+    l_rc SYS_REFCURSOR;
+    l_emp_id NUMBER;
+    l_emp_name VARCHAR2 (200);
+    l_total NUMBER;
+    l_sql VARCHAR2 (32767);
+BEGIN
+    l_sql := q'[
+        SELECT
+            e.emp_id,
+            e.emp_name,
+            NVL(SUM(s.amount), 0) AS total_amount
+        FROM qt_employees e
+        LEFT JOIN qt_sales s
+          ON s.emp_id = e.emp_id
+         AND s.status <> 'CANCELLED'
+        WHERE e.emp_name LIKE :b_name
+        GROUP BY e.emp_id, e.emp_name
+        HAVING NVL(SUM(s.amount), 0) >= :b_min_total
+        ORDER BY e.emp_id
+    ]';
+    OPEN l_rc FOR
+        l_sql
+        USING 'A%',
+            0;
+    LOOP
+        FETCH l_rc
+        INTO l_emp_id,
+            l_emp_name,
+            l_total;
+        EXIT WHEN l_rc%NOTFOUND;
+        DBMS_OUTPUT.PUT_LINE (l_emp_id || ':' || l_emp_name || ':' || l_total);
+    END LOOP;
+    CLOSE l_rc;
+END;
+/
+
+/* 11-03. semicolon, slash, fake comment markers inside string/comment */
+
+DECLARE
+    l_txt CLOB := q'[
+select ';' as semi, '/' as slash from dual;
+/* this is not a real outer comment end for the parser test */
+-- fake single line comment inside string
+BEGIN
+END;
+]';
+BEGIN
+    DBMS_OUTPUT.PUT_LINE (SUBSTR (l_txt, 1, 120));
+END;
+/
+
+/* 11-04. nested declare/begin/exception/end */
+
+DECLARE
+    l_val NUMBER := 10;
+BEGIN
+    DECLARE
+        l_inner NUMBER := 0;
+    BEGIN
+        l_inner := l_val / 2;
+        BEGIN
+            l_inner := l_inner + 1;
+            IF l_inner > 0 THEN
+                NULL;
+            ELSE
+                RAISE ZERO_DIVIDE;
+            END IF;
+        EXCEPTION
+            WHEN ZERO_DIVIDE THEN
+                l_inner := - 999;
+        END;
+        DBMS_OUTPUT.PUT_LINE ('l_inner=' || l_inner);
+    EXCEPTION
+        WHEN OTHERS THEN
+            DBMS_OUTPUT.PUT_LINE (SQLERRM);
+    END;
+END;
+/
+
+/* ---------------------------------------------------------------------
+   12. FINAL CHECK QUERIES
+   --------------------------------------------------------------------- */
+
+SELECT COUNT(*) AS dept_cnt
+FROM qt_departments;
+/
+
+SELECT COUNT(*) AS emp_cnt
+FROM qt_employees;
+/
+
+SELECT COUNT(*) AS sale_cnt
+FROM qt_sales;
+/
+
+SELECT COUNT(*) AS audit_cnt
+FROM qt_audit_log;
+
+/
+
+-- =========================================================
+-- IntelliSense sweep report generated by intellisense sweep
+-- source: test/test11.txt
+-- db: Oracle
+-- metadata: test Oracle inferred catalog + Oracle built-ins
+-- checked: 445
+-- missing: 6
+-- marker: [[word]] means not suggested for the tested prefix
+-- missing tokens:
+--   856:20 word=amount prefix=amou suggestions=[] total=0 line=UPDATE SET dst.amount = src.amount,
+--   857:13 word=status prefix=stat suggestions=[STATEMENT] total=1 line=dst.status = src.status,
+--   858:13 word=note prefix=not suggestions=[NOT] total=1 line=dst.note = src.note
+--   868:10 word=amount prefix=amou suggestions=[] total=0 line=WHEN amount >= 500 THEN
+--   871:10 word=amount prefix=amou suggestions=[] total=0 line=WHEN amount < 500 THEN
+--   875:5 word=amount prefix=amou suggestions=[] total=0 line=amount
+-- =========================================================

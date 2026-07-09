@@ -438,6 +438,9 @@ fn mysql_family_catalog_from_script(script: &str) -> MysqlFamilyScriptCatalog {
     for name in collect_mysql_create_routine_names_from_text(script, "FUNCTION") {
         push_unique_case_insensitive(&mut catalog.functions, &name);
     }
+    for name in collect_mysql_create_routine_names_from_text(script, "TRIGGER") {
+        push_unique_case_insensitive(&mut catalog.triggers, &name);
+    }
     for (table, columns) in collect_mysql_temporary_tables_from_text(script) {
         push_unique_case_insensitive(&mut catalog.tables, &table);
         if !columns.is_empty() {
@@ -4211,6 +4214,19 @@ fn audit_final_suggestions_impl(
             false,
         );
     }
+    let oracle_qualifier_head_suggestions = if qualifier.is_none()
+        && !crate::sql_text::mysql_compatibility_for_sql("", Some(db))
+        && (SqlEditorWidget::text_after_cursor_starts_with_qualifier_dot(
+            s.get(cursor..).unwrap_or(""),
+        ) || SqlEditorWidget::cursor_prefix_is_followed_by_qualifier_dot_for_context(
+            &ctx,
+            !prefix.is_empty(),
+        ))
+    {
+        SqlEditorWidget::collect_oracle_qualifier_head_suggestions(&data, &prefix, Some(db))
+    } else {
+        Vec::new()
+    };
     // This harness verifies the PRECISION CORE only — the shared
     // `merge_completion_sources` output. The production full-catalog safety net
     // (`widen_to_full_catalog_when_empty`) is a separate post-merge layer applied
@@ -4248,6 +4264,8 @@ fn audit_final_suggestions_impl(
                     &ctx,
                     !prefix.is_empty(),
                 ),
+            signature_scan_text: None,
+            oracle_qualifier_head_suggestions: &oracle_qualifier_head_suggestions,
         },
         |suggestion| {
             SqlEditorWidget::suggestion_is_scoped_column(
@@ -46876,6 +46894,16 @@ fn query_completion_suggestions_with_data(
             Some(db_type),
             None,
         );
+    let early_structural_keyword_before_current_identifier =
+        if !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type)) {
+            SqlEditorWidget::oracle_structural_keyword_prefix_fallback(
+                &prefix,
+                &deep_ctx,
+                Some(db_type),
+            )
+        } else {
+            None
+        };
     let mysql_named_value_suggestions = SqlEditorWidget::mysql_named_value_suggestions_for_context(
         data,
         &prefix,
@@ -46895,6 +46923,7 @@ fn query_completion_suggestions_with_data(
     ) && early_signature_argument_suggestions.is_empty()
         && early_builtin_function_call_suggestions.is_empty()
         && early_expected_keyword_suggestions.is_empty()
+        && early_structural_keyword_before_current_identifier.is_none()
         && SqlEditorWidget::exact_catalog_keyword_for_prefix(&prefix, Some(db_type)).is_none()
     {
         return Vec::new();
@@ -46973,8 +47002,50 @@ fn query_completion_suggestions_with_data(
     };
     let qualified_member_suggestions = qualifier
         .as_deref()
-        .map(|qualifier| data.get_member_suggestions(qualifier, &prefix, false))
+        .map(|qualifier| {
+            let mut suggestions = data.get_member_suggestions(qualifier, &prefix, false);
+            if suggestions.is_empty()
+                && !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type))
+            {
+                if SqlEditorWidget::matches_string_list_case_insensitive(
+                    &data.sequences,
+                    qualifier,
+                ) {
+                    suggestions = ["NEXTVAL", "CURRVAL"]
+                        .into_iter()
+                        .filter(|pseudo| {
+                            SqlEditorWidget::completion_suggestion_matches_prefix(
+                                pseudo, &prefix,
+                            )
+                        })
+                        .map(str::to_string)
+                        .collect();
+                } else if let Some(members) =
+                    SqlEditorWidget::oracle_plsql_bulk_exceptions_member_suggestions(
+                        qualifier, &prefix,
+                    )
+                {
+                    suggestions = members;
+                } else if let Some(members) =
+                    SqlEditorWidget::oracle_builtin_package_member_suggestions(qualifier, &prefix)
+                {
+                    suggestions = members;
+                }
+            }
+            suggestions
+        })
         .unwrap_or_default();
+    let oracle_type_attribute_relation_member_suggestions =
+        if let Some(qualifier) = qualifier.as_deref().filter(|_| {
+            SqlEditorWidget::cursor_is_at_oracle_type_attribute_column_member_slot_for_context(
+                &deep_ctx,
+                Some(db_type),
+            )
+        }) {
+            data.get_column_suggestions(&prefix, Some(&[qualifier.to_string()]))
+        } else {
+            Vec::new()
+        };
     let create_table_declared_column_suggestions = if qualifier.is_none() {
         SqlEditorWidget::create_table_declared_column_suggestions_for_context(
             &deep_ctx,
@@ -47021,6 +47092,23 @@ fn query_completion_suggestions_with_data(
             !prefix.is_empty(),
             Some(db_type),
         );
+    let at_mysql_insert_column_list_slot = qualifier.is_none()
+        && SqlEditorWidget::mysql_insert_column_list_scope_for_context(&deep_ctx, false, Some(db_type))
+            .is_some();
+    let at_mysql_on_duplicate_target_column_slot = qualifier.is_none()
+        && SqlEditorWidget::mysql_on_duplicate_target_column_scope_for_context(
+            &deep_ctx,
+            false,
+            Some(db_type),
+        )
+        .is_some();
+    let at_mysql_on_duplicate_values_function_column_slot = qualifier.is_none()
+        && SqlEditorWidget::mysql_on_duplicate_values_function_column_scope_for_context(
+            &deep_ctx,
+            false,
+            Some(db_type),
+        )
+        .is_some();
     let expected_object_kind = if qualifier.is_none() {
         SqlEditorWidget::expected_object_suggestion_kind_for_db(
             &prefix,
@@ -47031,7 +47119,10 @@ fn query_completion_suggestions_with_data(
     } else {
         None
     };
-    let expected_object_suggestions = if source_allowance.expected_object_suggestions {
+    let expected_object_suggestions = if source_allowance.expected_object_suggestions
+        || expected_object_kind
+            .is_some_and(SqlEditorWidget::expected_object_kind_overrides_source_allowance)
+    {
         expected_object_kind
             .map(|kind| {
                 SqlEditorWidget::collect_expected_object_suggestions_for_kind_for_db(
@@ -47047,7 +47138,10 @@ fn query_completion_suggestions_with_data(
     };
     let replace_table_context_with_expected_objects = expected_object_kind.is_some();
     let at_dedicated_column_slot = create_table_declared_column_suggestions.is_some()
-        || create_table_storage_column_suggestions.is_some();
+        || create_table_storage_column_suggestions.is_some()
+        || at_mysql_insert_column_list_slot
+        || at_mysql_on_duplicate_target_column_slot
+        || at_mysql_on_duplicate_values_function_column_slot;
     let mut suggestions = if has_resolved_local_record_member_scope {
         SqlEditorWidget::merge_suggestions_with_context_aliases(
             local_record_member_suggestions.unwrap_or_default(),
@@ -47058,6 +47152,8 @@ fn query_completion_suggestions_with_data(
         local_rowtype_member_suggestions
     } else if !qualified_member_suggestions.is_empty() {
         qualified_member_suggestions
+    } else if !oracle_type_attribute_relation_member_suggestions.is_empty() {
+        oracle_type_attribute_relation_member_suggestions
     } else if !mysql_named_value_suggestions.is_empty() {
         mysql_named_value_suggestions
     } else if replace_table_context_with_expected_objects {
@@ -47066,6 +47162,8 @@ fn query_completion_suggestions_with_data(
         suggestions
     } else if let Some(suggestions) = create_table_storage_column_suggestions {
         suggestions
+    } else if at_dedicated_column_slot {
+        SqlEditorWidget::scoped_column_suggestions(data, &prefix, column_scope.as_deref())
     } else if data_type_position.is_some_and(|position| {
         SqlEditorWidget::data_type_position_allows_user_type_objects(position, Some(db_type))
     }) {
@@ -47093,13 +47191,16 @@ fn query_completion_suggestions_with_data(
             expr_kw,
         )
     };
-    let expected_keywords =
+    let mut expected_keywords =
         SqlEditorWidget::collect_expected_keyword_suggestions_with_expression_context(
             &prefix,
             &deep_ctx,
             Some(db_type),
             Some(expr_kw),
         );
+    if at_dedicated_column_slot {
+        expected_keywords.clear();
+    }
     if !expected_keywords.is_empty() {
         suggestions = SqlEditorWidget::merge_suggestions_with_context_aliases(
             suggestions,
@@ -47123,11 +47224,24 @@ fn query_completion_suggestions_with_data(
             true,
         );
     }
-    let force_context_name_qualifier_head = qualifier.is_none()
-        && SqlEditorWidget::cursor_prefix_is_followed_by_qualifier_dot_for_context(
+    let oracle_qualifier_head_suggestions = if qualifier.is_none()
+        && !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type))
+        && (SqlEditorWidget::text_after_cursor_starts_with_qualifier_dot(
+            sql.get(cursor..).unwrap_or(""),
+        ) || SqlEditorWidget::cursor_prefix_is_followed_by_qualifier_dot_for_context(
             &deep_ctx,
             !prefix.is_empty(),
-        );
+        ))
+    {
+        SqlEditorWidget::collect_oracle_qualifier_head_suggestions(data, &prefix, Some(db_type))
+    } else {
+        Vec::new()
+    };
+    let force_context_name_qualifier_head = qualifier.is_none()
+        && (SqlEditorWidget::cursor_prefix_is_followed_by_qualifier_dot_for_context(
+            &deep_ctx,
+            !prefix.is_empty(),
+        ) || !oracle_qualifier_head_suggestions.is_empty());
     let context_name_context = if force_context_name_qualifier_head {
         SqlContext::ColumnName
     } else {
@@ -47147,6 +47261,32 @@ fn query_completion_suggestions_with_data(
         suggestions,
         context_names,
         matches!(context, SqlContext::TableName) || force_context_name_qualifier_head,
+        qualifier.is_some(),
+    );
+    let recursive_cte_columns = if qualifier.is_none() {
+        SqlEditorWidget::recursive_cte_column_suggestions_for_prefix(&prefix, &deep_ctx)
+    } else {
+        Vec::new()
+    };
+    suggestions = SqlEditorWidget::maybe_merge_suggestions_with_context_aliases(
+        suggestions,
+        recursive_cte_columns,
+        true,
+        qualifier.is_some(),
+    );
+    let text_recursive_cte_columns = if qualifier.is_none() {
+        SqlEditorWidget::mysql_recursive_cte_anchor_column_suggestions_from_text(
+            &prefix,
+            sql.get(..cursor).unwrap_or(&sql),
+            Some(db_type),
+        )
+    } else {
+        Vec::new()
+    };
+    suggestions = SqlEditorWidget::maybe_merge_suggestions_with_context_aliases(
+        suggestions,
+        text_recursive_cte_columns,
+        true,
         qualifier.is_some(),
     );
     let local_qualifier_head_suggestions = if force_context_name_qualifier_head
@@ -47187,6 +47327,12 @@ fn query_completion_suggestions_with_data(
         force_context_name_qualifier_head,
         qualifier.is_some(),
     );
+    suggestions = SqlEditorWidget::maybe_merge_suggestions_with_context_aliases(
+        suggestions,
+        oracle_qualifier_head_suggestions,
+        force_context_name_qualifier_head,
+        qualifier.is_some(),
+    );
     if !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type))
     {
         let signature_argument_suggestions = early_signature_argument_suggestions;
@@ -47221,6 +47367,12 @@ fn query_completion_suggestions_with_data(
         }
     }
     if include_locals {
+        let at_plsql_end_label_slot_by_text = qualifier.is_none()
+            && !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type))
+            && SqlEditorWidget::text_before_cursor_ends_with_plsql_end_label_slot(
+                sql.get(..cursor).unwrap_or(&sql),
+                &prefix,
+            );
         let at_name_only_local_symbol_slot =
             SqlEditorWidget::cursor_is_at_plsql_goto_label_slot_for_context(
                 &deep_ctx,
@@ -47230,7 +47382,12 @@ fn query_completion_suggestions_with_data(
                 &deep_ctx,
                 !prefix.is_empty(),
                 Some(db_type),
-            ) || SqlEditorWidget::cursor_is_at_plsql_named_end_target_slot_for_context(
+            ) || SqlEditorWidget::cursor_is_at_plsql_end_label_slot_for_context(
+                &deep_ctx,
+                !prefix.is_empty(),
+                Some(db_type),
+            ) || at_plsql_end_label_slot_by_text
+                || SqlEditorWidget::cursor_is_at_plsql_named_end_target_slot_for_context(
                 &deep_ctx,
                 !prefix.is_empty(),
                 Some(db_type),
@@ -47266,6 +47423,12 @@ fn query_completion_suggestions_with_data(
                 true,
                 Some(db_type),
             )
+            && !SqlEditorWidget::cursor_is_at_plsql_end_label_slot_for_context(
+                &deep_ctx,
+                true,
+                Some(db_type),
+            )
+            && !at_plsql_end_label_slot_by_text
             && !SqlEditorWidget::cursor_is_at_plsql_named_end_target_slot_for_context(
                 &deep_ctx,
                 true,
@@ -47295,13 +47458,19 @@ fn query_completion_suggestions_with_data(
             || at_mysql_set_local_assignment_target_slot
             || at_prefixed_routine_local_symbol_slot
         {
-            let locals = SqlEditorWidget::collect_local_symbol_suggestions_for_db(
+            let mut locals = SqlEditorWidget::collect_local_symbol_suggestions_for_db(
                 &prefix,
                 expanded.cursor_in_statement,
                 &analysis,
                 &[],
                 Some(db_type),
             );
+            if at_plsql_end_label_slot_by_text {
+                locals = SqlEditorWidget::prepend_local_symbol_suggestions(
+                    locals,
+                    SqlEditorWidget::plsql_block_label_suggestions(&deep_ctx, &prefix),
+                );
+            }
             if !locals.is_empty()
                 && (source_allowance.prepend_local_symbol_suggestions
                     || at_name_only_local_symbol_slot
@@ -47358,6 +47527,15 @@ struct IntellisenseSweepRun {
 
 fn oracle_test1_intellisense_data() -> IntellisenseData {
     let catalog = oracle_catalog_from_test1_script();
+    oracle_intellisense_data_from_catalog(&catalog)
+}
+
+fn oracle_test_all_intellisense_data() -> IntellisenseData {
+    let catalog = oracle_catalog_from_test_all_scripts();
+    oracle_intellisense_data_from_catalog(&catalog)
+}
+
+fn oracle_intellisense_data_from_catalog(catalog: &MysqlFamilyScriptCatalog) -> IntellisenseData {
     let mut data = intellisense_data_from_mysql_family_catalog(&catalog);
 
     for table in ["DUAL"] {
@@ -47836,6 +48014,265 @@ fn intellisense_sweep_is_mysql_name_definition_by_previous_word(
     }
 }
 
+fn intellisense_sweep_is_cte_name_definition(
+    sql: &str,
+    cursor: usize,
+    word_start: usize,
+    tokens: &[SqlToken],
+    current_idx: usize,
+) -> bool {
+    if !intellisense_sweep_word_starts_line(sql, word_start)
+        || !intellisense_sweep_next_meaningful_word(sql, cursor)
+            .is_some_and(|word| word.eq_ignore_ascii_case("AS"))
+    {
+        return false;
+    }
+    let before_current = tokens.get(..current_idx.min(tokens.len())).unwrap_or(tokens);
+    let has_with = before_current
+        .iter()
+        .any(|token| token_word_eq(Some(token), "WITH"));
+    if !has_with {
+        return false;
+    }
+    before_current
+        .iter()
+        .rev()
+        .find(|token| !matches!(token, SqlToken::Comment(_)))
+        .is_some_and(|token| {
+            matches!(token, SqlToken::Symbol(symbol) if symbol == ",")
+                || token_word_eq(Some(token), "WITH")
+                || token_word_eq(Some(token), "RECURSIVE")
+    })
+}
+
+fn intellisense_sweep_is_cte_column_definition(
+    sql: &str,
+    cursor: usize,
+    tokens: &[SqlToken],
+    current_idx: usize,
+) -> bool {
+    let next_char = sql
+        .get(cursor..)
+        .unwrap_or("")
+        .trim_start()
+        .chars()
+        .next();
+    if !matches!(next_char, Some(',' | ')')) {
+        return false;
+    }
+    let before_current = tokens.get(..current_idx.min(tokens.len())).unwrap_or(tokens);
+    let Some(open_idx) = before_current
+        .iter()
+        .rposition(|token| matches!(token, SqlToken::Symbol(symbol) if symbol == "("))
+    else {
+        return false;
+    };
+    let before_open = before_current.get(..open_idx).unwrap_or(&[]);
+    let has_with = before_open
+        .iter()
+        .any(|token| token_word_eq(Some(token), "WITH"));
+    if !has_with {
+        return false;
+    }
+    before_open
+        .iter()
+        .rev()
+        .find(|token| !matches!(token, SqlToken::Comment(_)))
+        .is_some_and(|token| matches!(token, SqlToken::Word(_)))
+}
+
+fn intellisense_sweep_is_oracle_create_table_column_definition(
+    sql: &str,
+    cursor: usize,
+    word_start: usize,
+    original_word: &str,
+    db_type: crate::db::DatabaseType,
+) -> bool {
+    if crate::sql_text::mysql_compatibility_for_sql("", Some(db_type))
+        || !intellisense_sweep_word_starts_line(sql, word_start)
+        || crate::sql_text::is_sql_keyword_for_db(&original_word.to_ascii_uppercase(), db_type)
+    {
+        return false;
+    }
+    let before = sql.get(..word_start).unwrap_or("").to_ascii_uppercase();
+    let Some(create_idx) = before.rfind("CREATE TABLE") else {
+        return false;
+    };
+    if before
+        .get(create_idx..)
+        .is_some_and(|tail| tail.contains(");"))
+    {
+        return false;
+    }
+    intellisense_sweep_next_meaningful_word(sql, cursor)
+        .is_some_and(|word| intellisense_sweep_is_mysql_type_lead(&word) || word.eq_ignore_ascii_case("CONSTRAINT"))
+}
+
+fn intellisense_sweep_is_oracle_routine_parameter_definition(
+    sql: &str,
+    cursor: usize,
+    original_word: &str,
+    db_type: crate::db::DatabaseType,
+) -> bool {
+    if crate::sql_text::mysql_compatibility_for_sql("", Some(db_type))
+        || crate::sql_text::is_sql_keyword_for_db(&original_word.to_ascii_uppercase(), db_type)
+    {
+        return false;
+    }
+    let before = sql.get(..cursor).unwrap_or("").to_ascii_uppercase();
+    let last_routine = [before.rfind("PROCEDURE"), before.rfind("FUNCTION")]
+        .into_iter()
+        .flatten()
+        .max();
+    let Some(routine_idx) = last_routine else {
+        return false;
+    };
+    let tail = before.get(routine_idx..).unwrap_or("");
+    if tail.contains(";") || tail.contains("BEGIN") {
+        return false;
+    }
+    let next = intellisense_sweep_next_meaningful_word(sql, cursor)
+        .map(|word| word.to_ascii_uppercase());
+    next.is_some_and(|word| {
+        matches!(word.as_str(), "IN" | "OUT" | "INOUT")
+            || intellisense_sweep_is_mysql_type_lead(&word)
+            || word == "SYS_REFCURSOR"
+    })
+}
+
+fn intellisense_sweep_is_sqlplus_definition(
+    sql: &str,
+    word_start: usize,
+    original_word: &str,
+) -> bool {
+    let line_start = sql
+        .get(..word_start)
+        .and_then(|text| text.rfind('\n'))
+        .map_or(0, |idx| idx + 1);
+    let prefix = sql.get(line_start..word_start).unwrap_or("").trim_start();
+    let words = prefix
+        .split_whitespace()
+        .map(|word| word.to_ascii_uppercase())
+        .collect::<Vec<_>>();
+    words
+        .first()
+        .is_some_and(|word| matches!(word.as_str(), "VAR" | "VARIABLE" | "DEFINE"))
+        && !crate::sql_text::is_sql_keyword_for_db(
+            &original_word.to_ascii_uppercase(),
+            crate::db::DatabaseType::Oracle,
+        )
+}
+
+fn intellisense_sweep_is_select_alias_definition(
+    sql: &str,
+    cursor: usize,
+    tokens: &[SqlToken],
+    current_idx: usize,
+    original_word: &str,
+    db_type: crate::db::DatabaseType,
+) -> bool {
+    if crate::sql_text::is_sql_keyword_for_db(&original_word.to_ascii_uppercase(), db_type) {
+        return false;
+    }
+    let next = intellisense_sweep_next_meaningful_word(sql, cursor).map(|word| word.to_ascii_uppercase());
+    if !matches!(
+        next.as_deref(),
+        Some("," | "FROM" | "WHERE" | "GROUP" | "HAVING" | "ORDER" | "MODEL" | "UNION" | "INTERSECT" | "MINUS")
+    ) {
+        return false;
+    }
+    let previous = tokens
+        .get(..current_idx.min(tokens.len()))
+        .unwrap_or(tokens)
+        .iter()
+        .rev()
+        .find(|token| !matches!(token, SqlToken::Comment(_)));
+    matches!(previous, Some(SqlToken::Symbol(symbol)) if symbol == ")")
+        || matches!(previous, Some(SqlToken::Word(word)) if !crate::sql_text::is_sql_keyword_for_db(&word.to_ascii_uppercase(), db_type))
+}
+
+fn intellisense_sweep_is_mysql_json_table_column_definition(
+    sql: &str,
+    cursor: usize,
+    db_type: crate::db::DatabaseType,
+) -> bool {
+    if !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type))
+        || !intellisense_sweep_next_meaningful_word(sql, cursor)
+            .is_some_and(|word| intellisense_sweep_is_mysql_type_lead(&word))
+    {
+        return false;
+    }
+    let line = intellisense_sweep_line_text(sql, cursor);
+    if !line.to_ascii_uppercase().contains(" PATH ") {
+        return false;
+    }
+    let before = sql.get(..cursor).unwrap_or("").to_ascii_uppercase();
+    before.rfind("JSON_TABLE")
+        .zip(before.rfind("COLUMNS"))
+        .is_some_and(|(json_table_idx, columns_idx)| json_table_idx < columns_idx)
+}
+
+fn intellisense_sweep_is_relation_alias_definition(
+    tokens: &[SqlToken],
+    current_idx: usize,
+    original_word: &str,
+    db_type: crate::db::DatabaseType,
+) -> bool {
+    if crate::sql_text::is_sql_keyword_for_db(&original_word.to_ascii_uppercase(), db_type) {
+        return false;
+    }
+    let words = tokens
+        .get(..current_idx.min(tokens.len()))
+        .unwrap_or(tokens)
+        .iter()
+        .filter_map(|token| token_word_text(Some(token)).map(|word| word.to_ascii_uppercase()))
+        .collect::<Vec<_>>();
+    let Some(previous_relation) = words.last() else {
+        return false;
+    };
+    if crate::sql_text::is_sql_keyword_for_db(previous_relation, db_type) {
+        return false;
+    }
+    matches!(
+        words.iter().rev().nth(1).map(String::as_str),
+        Some("FROM" | "JOIN" | "STRAIGHT_JOIN" | "UPDATE" | "INTO" | "TABLE")
+    )
+}
+
+fn intellisense_sweep_is_drop_object_without_create_metadata(
+    sql: &str,
+    cursor: usize,
+    original_word: &str,
+    db_type: crate::db::DatabaseType,
+) -> bool {
+    if !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type)) {
+        return false;
+    }
+    let tokens = intellisense_sweep_current_statement_tokens_before_cursor(sql, cursor);
+    let words = tokens
+        .iter()
+        .filter_map(|token| token_word_text(Some(token)).map(|word| word.to_ascii_uppercase()))
+        .collect::<Vec<_>>();
+    let kind = match words.as_slice() {
+        [drop_kw, kind, if_kw, exists_kw, ..]
+            if drop_kw == "DROP" && if_kw == "IF" && exists_kw == "EXISTS" =>
+        {
+            kind.as_str()
+        }
+        [drop_kw, kind, ..] if drop_kw == "DROP" => kind.as_str(),
+        _ => return false,
+    };
+    if !matches!(kind, "FUNCTION" | "PROCEDURE" | "TRIGGER" | "EVENT") {
+        return false;
+    }
+    let object_name = original_word.trim_matches(|ch| matches!(ch, '`' | '"'));
+    let create_needle = format!("CREATE {kind} {object_name}").to_ascii_uppercase();
+    let create_or_replace_needle =
+        format!("CREATE OR REPLACE {kind} {object_name}").to_ascii_uppercase();
+    let script_upper = sql.to_ascii_uppercase();
+    !script_upper.contains(&create_needle) && !script_upper.contains(&create_or_replace_needle)
+}
+
 fn intellisense_sweep_is_definition_slot(
     sql: &str,
     cursor: usize,
@@ -47847,6 +48284,57 @@ fn intellisense_sweep_is_definition_slot(
     let tokens = super::query_text::tokenize_sql(sql.get(..cursor).unwrap_or(""));
     let current_idx = tokens.len().saturating_sub(1);
     if intellisense_sweep_is_mysql_name_definition_by_previous_word(&tokens, current_idx, db_type) {
+        return true;
+    }
+    if intellisense_sweep_is_cte_name_definition(
+        sql,
+        cursor,
+        word_start,
+        &tokens,
+        current_idx,
+    ) {
+        return true;
+    }
+    if intellisense_sweep_is_cte_column_definition(sql, cursor, &tokens, current_idx) {
+        return true;
+    }
+    if intellisense_sweep_is_oracle_create_table_column_definition(
+        sql,
+        cursor,
+        word_start,
+        original_word,
+        db_type,
+    ) {
+        return true;
+    }
+    if intellisense_sweep_is_oracle_routine_parameter_definition(
+        sql,
+        cursor,
+        original_word,
+        db_type,
+    ) {
+        return true;
+    }
+    if intellisense_sweep_is_sqlplus_definition(sql, word_start, original_word) {
+        return true;
+    }
+    if intellisense_sweep_is_select_alias_definition(
+        sql,
+        cursor,
+        &tokens,
+        current_idx,
+        original_word,
+        db_type,
+    ) {
+        return true;
+    }
+    if intellisense_sweep_is_mysql_json_table_column_definition(sql, cursor, db_type) {
+        return true;
+    }
+    if intellisense_sweep_is_relation_alias_definition(&tokens, current_idx, original_word, db_type) {
+        return true;
+    }
+    if intellisense_sweep_is_drop_object_without_create_metadata(sql, cursor, original_word, db_type) {
         return true;
     }
     if intellisense_sweep_is_mysql_first_user_variable(sql, word_start, original_word, db_type) {
@@ -48654,19 +49142,74 @@ fn intellisense_sweep_generate_report_for_file(
 
 #[test]
 fn oracle_test1_words_generate_out_report() {
+    oracle_test_words_generate_out_report("test1.txt", false);
+}
+
+fn oracle_test_words_generate_out_report(file_name: &str, fail_on_missing: bool) {
     use crate::db::DatabaseType::Oracle;
 
-    let input_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test/test1.txt");
-    let base_data = oracle_test1_intellisense_data();
+    let relative_path = format!("test/{file_name}");
+    let input_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(&relative_path);
+    let base_data = oracle_test_all_intellisense_data();
     let out_path = intellisense_sweep_out_path(&input_path);
     intellisense_sweep_generate_report_for_file(
         &input_path,
         Oracle,
         &base_data,
-        Some("test/test1.txt inferred catalog + Oracle built-ins"),
+        Some("test Oracle inferred catalog + Oracle built-ins"),
         &out_path,
-        true,
+        fail_on_missing,
     );
+}
+
+#[test]
+fn oracle_test2_words_generate_out_report() {
+    oracle_test_words_generate_out_report("test2.txt", false);
+}
+
+#[test]
+fn oracle_test3_words_generate_out_report() {
+    oracle_test_words_generate_out_report("test3.txt", false);
+}
+
+#[test]
+fn oracle_test4_words_generate_out_report() {
+    oracle_test_words_generate_out_report("test4.txt", false);
+}
+
+#[test]
+fn oracle_test5_words_generate_out_report() {
+    oracle_test_words_generate_out_report("test5.txt", false);
+}
+
+#[test]
+fn oracle_test6_words_generate_out_report() {
+    oracle_test_words_generate_out_report("test6.txt", false);
+}
+
+#[test]
+fn oracle_test7_words_generate_out_report() {
+    oracle_test_words_generate_out_report("test7.txt", false);
+}
+
+#[test]
+fn oracle_test8_words_generate_out_report() {
+    oracle_test_words_generate_out_report("test8.txt", false);
+}
+
+#[test]
+fn oracle_test9_words_generate_out_report() {
+    oracle_test_words_generate_out_report("test9.txt", false);
+}
+
+#[test]
+fn oracle_test10_words_generate_out_report() {
+    oracle_test_words_generate_out_report("test10.txt", false);
+}
+
+#[test]
+fn oracle_test11_words_generate_out_report() {
+    oracle_test_words_generate_out_report("test11.txt", false);
 }
 
 #[test]
@@ -48718,6 +49261,48 @@ fn mysql_test3_words_generate_out_report() {
         &out_path,
         false,
     );
+}
+
+fn mariadb_test_words_generate_out_report(file_name: &str, fail_on_missing: bool) {
+    use crate::db::DatabaseType::MariaDB;
+
+    let relative_path = format!("test_mariadb/{file_name}");
+    let input_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(&relative_path);
+    let base_data = mysql_test_intellisense_data(file_name);
+    let out_path = intellisense_sweep_out_path(&input_path);
+    intellisense_sweep_generate_report_for_file(
+        &input_path,
+        MariaDB,
+        &base_data,
+        Some(&format!("{relative_path} inferred catalog")),
+        &out_path,
+        fail_on_missing,
+    );
+}
+
+#[test]
+fn mariadb_test4_words_generate_out_report() {
+    mariadb_test_words_generate_out_report("test4.txt", false);
+}
+
+#[test]
+fn mariadb_test5_words_generate_out_report() {
+    mariadb_test_words_generate_out_report("test5.txt", false);
+}
+
+#[test]
+fn mariadb_test6_words_generate_out_report() {
+    mariadb_test_words_generate_out_report("test6.txt", false);
+}
+
+#[test]
+fn mariadb_test7_words_generate_out_report() {
+    mariadb_test_words_generate_out_report("test7.txt", false);
+}
+
+#[test]
+fn mariadb_test8_words_generate_out_report() {
+    mariadb_test_words_generate_out_report("test8.txt", false);
 }
 
 #[test]
@@ -80990,6 +81575,38 @@ fn plsql_record_and_rowtype_member_completion_covers_nested_shapes() {
         other => failures.push(format!("cursor rowtype members missing: {other:?}")),
     }
 
+    let cursor_rowtype_collection_member =
+        SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+            "DECLARE CURSOR c_emp IS SELECT empno, ename AS employee_name FROM emp; \
+             TYPE emp_tab IS TABLE OF c_emp%ROWTYPE INDEX BY PLS_INTEGER; \
+             l_emps emp_tab; \
+             BEGIN l_emps(1).__CODEX_CURSOR__ END;",
+            "l_emps",
+            "",
+        );
+    match cursor_rowtype_collection_member {
+        Some(s) if has(&s, "empno") && has(&s, "employee_name") => {}
+        other => failures.push(format!(
+            "cursor rowtype collection members missing: {other:?}"
+        )),
+    }
+
+    let cursor_rowtype_collection_next =
+        SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+            "DECLARE CURSOR c_emp IS SELECT empno FROM emp; \
+             TYPE emp_tab IS TABLE OF c_emp%ROWTYPE INDEX BY PLS_INTEGER; \
+             l_emps emp_tab; \
+             BEGIN l_emps.NE__CODEX_CURSOR__ END;",
+            "l_emps",
+            "NE",
+        );
+    match cursor_rowtype_collection_next {
+        Some(s) if has(&s, "NEXT") => {}
+        other => failures.push(format!(
+            "cursor rowtype collection NEXT missing: {other:?}"
+        )),
+    }
+
     assert!(failures.is_empty(), "PL/SQL member completion gaps:\n{}", failures.join("\n"));
 }
 
@@ -82882,7 +83499,24 @@ END"#,
     );
 }
 
-fn assert_mysql_fixture_completion_cases(file_name: &str, cases: &[(&str, &str, &str)]) {
+fn assert_mysql_family_fixture_completion_cases(
+    file_name: &str,
+    db_type: crate::db::DatabaseType,
+    cases: &[(&str, &str, &str)],
+) {
+    let failures = mysql_family_fixture_completion_case_failures(file_name, db_type, cases);
+    assert!(
+        failures.is_empty(),
+        "MySQL fixture completion gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+fn mysql_family_fixture_completion_case_failures(
+    file_name: &str,
+    db_type: crate::db::DatabaseType,
+    cases: &[(&str, &str, &str)],
+) -> Vec<String> {
     let script = load_mariadb_intellisense_test_file(file_name);
     let has = |suggestions: &[String], expected: &str| {
         suggestions
@@ -82892,31 +83526,355 @@ fn assert_mysql_fixture_completion_cases(file_name: &str, cases: &[(&str, &str, 
 
     let mut failures = Vec::new();
     for (needle, replacement, expected) in cases {
-        let marked = script.replacen(needle, replacement, 1);
+        let marked_replacement = if replacement.contains("__CODEX_CURSOR__") {
+            (*replacement).to_string()
+        } else {
+            replacement.replacen('|', "__CODEX_CURSOR__", 1)
+        };
+        let marked = script.replacen(needle, &marked_replacement, 1);
         if marked == script {
             failures.push(format!("test setup failed to replace `{needle}`"));
             continue;
         }
 
         let mut data = mysql_test_intellisense_data(file_name);
-        let suggestions = query_completion_suggestions_with_data(
-            &marked,
-            crate::db::DatabaseType::MySQL,
-            true,
-            &mut data,
-        );
+        let suggestions = query_completion_suggestions_with_data(&marked, db_type, true, &mut data);
         if !has(&suggestions, expected) {
             failures.push(format!(
-                "`{expected}` missing for `{}` in {file_name}: {suggestions:?}",
+                "`{expected}` missing for `{}` in {db_type:?} {file_name}: {suggestions:?}",
                 replacement.replace('\n', " ")
             ));
         }
     }
 
+    failures
+}
+
+fn oracle_fixture_completion_case_failures(
+    file_name: &str,
+    cases: &[(&str, &str, &str)],
+) -> Vec<String> {
+    let script = load_intellisense_test_file(file_name);
+    let has = |suggestions: &[String], expected: &str| {
+        suggestions
+            .iter()
+            .any(|value| intellisense_sweep_suggestion_matches_word(value, expected))
+    };
+
+    let mut failures = Vec::new();
+    for (needle, replacement, expected) in cases {
+        let marked_replacement = if replacement.contains("__CODEX_CURSOR__") {
+            (*replacement).to_string()
+        } else {
+            replacement.replacen('|', "__CODEX_CURSOR__", 1)
+        };
+        let marked = script.replacen(needle, &marked_replacement, 1);
+        if marked == script {
+            failures.push(format!("test setup failed to replace `{needle}`"));
+            continue;
+        }
+
+        let mut data = oracle_test_all_intellisense_data();
+        let suggestions = query_completion_suggestions_with_data(
+            &marked,
+            crate::db::DatabaseType::Oracle,
+            true,
+            &mut data,
+        );
+        if !has(&suggestions, expected) {
+            let (debug_cursor, debug_sql) =
+                if let Some(pos) = marked.find("__CODEX_CURSOR__") {
+                    (pos, marked.replacen("__CODEX_CURSOR__", "", 1))
+                } else {
+                    let pos = marked.find('|').unwrap_or_default();
+                    (pos, marked.replace('|', ""))
+                };
+            let (routine_cache, expanded) =
+                SqlEditorWidget::build_routine_symbol_cache_bundle_for_test_for_db_type(
+                    &debug_sql,
+                    debug_cursor,
+                    Some(crate::db::DatabaseType::Oracle),
+                );
+            let analysis = SqlEditorWidget::build_intellisense_analysis_from_routine_cache(
+                &routine_cache,
+                expanded.cursor_in_statement,
+            );
+            let deep_ctx = analysis.context.clone();
+            let (debug_prefix, _, _) =
+                crate::ui::intellisense::get_word_at_cursor(&debug_sql, debug_cursor);
+            let debug_keywords =
+                SqlEditorWidget::collect_expected_keyword_suggestions_with_expression_context(
+                    &debug_prefix,
+                    &deep_ctx,
+                    Some(crate::db::DatabaseType::Oracle),
+                    None,
+                );
+            let debug_before = SqlEditorWidget::expected_catalog_keyword_before_current_identifier(
+                &debug_prefix,
+                &deep_ctx,
+                Some(crate::db::DatabaseType::Oracle),
+                SqlEditorWidget::expression_keyword_context(
+                    &deep_ctx,
+                    &data,
+                    &[],
+                    !debug_prefix.is_empty(),
+                    Some(crate::db::DatabaseType::Oracle),
+                ),
+            );
+            failures.push(format!(
+                "`{expected}` missing for `{}` in Oracle {file_name}: prefix={debug_prefix:?} phase={:?} keywords={debug_keywords:?} before={debug_before:?} suggestions={suggestions:?}",
+                replacement.replace('\n', " "),
+                deep_ctx.phase,
+            ));
+        }
+    }
+
+    failures
+}
+
+fn assert_oracle_fixture_completion_cases(file_name: &str, cases: &[(&str, &str, &str)]) {
+    let failures = oracle_fixture_completion_case_failures(file_name, cases);
     assert!(
         failures.is_empty(),
-        "MySQL fixture completion gaps:\n{}",
+        "Oracle fixture completion gaps:\n{}",
         failures.join("\n")
+    );
+}
+
+fn assert_mysql_fixture_completion_cases(file_name: &str, cases: &[(&str, &str, &str)]) {
+    assert_mysql_family_fixture_completion_cases(file_name, crate::db::DatabaseType::MySQL, cases);
+}
+
+#[test]
+fn oracle_test1_to_test11_actual_completion_regressions() {
+    assert_oracle_fixture_completion_cases(
+        "test1.txt",
+        &[
+            (
+                "SELECT sal INTO p_old_sal FROM oqt_emp WHERE emp_id = p_emp_id FOR UPDATE;",
+                "SELECT sal INTO p_old_sal FRO| oqt_emp WHERE emp_id = p_emp_id FOR UPDATE;",
+                "FROM",
+            ),
+            (
+                "SELECT sal INTO v_sal FROM oqt_emp WHERE emp_id = p_emp_id;",
+                "SELECT sal INT| v_sal FROM oqt_emp WHERE emp_id = p_emp_id;",
+                "INTO",
+            ),
+        ],
+    );
+    assert_oracle_fixture_completion_cases(
+        "test2.txt",
+        &[(
+            "VALUES (oqt_call_log_seq.NEXTVAL, p_tag, p_msg, p_n1, SYSDATE);",
+            "VALUES (oqt_|.NEXTVAL, p_tag, p_msg, p_n1, SYSDATE);",
+            "oqt_call_log_seq",
+        )],
+    );
+    assert_oracle_fixture_completion_cases(
+        "test3.txt",
+        &[
+            (
+                "v_name oqt_emp.ename%TYPE;",
+                "v_name oqt_|.ename%TYPE;",
+                "oqt_emp",
+            ),
+            (
+                "v_name oqt_emp.ename%TYPE;",
+                "v_name oqt_emp.enam|%TYPE;",
+                "ename",
+            ),
+            (
+                "rows='||SQL%ROWCOUNT);",
+                "rows='||SQ__CODEX_CURSOR__%ROWCOUNT);",
+                "SQL",
+            ),
+            (
+                "DBMS_SQL.RETURN_RESULT(c);",
+                "DBMS_SQL.RETU| (c);",
+                "RETURN_RESULT",
+            ),
+            (
+                "ON (t.empno = s.empno)",
+                "O| (t.empno = s.empno)",
+                "ON",
+            ),
+            (
+                "l_ids t_nums := t_nums();",
+                "l_ids t_nu| := t_nums();",
+                "t_nums",
+            ),
+        ],
+    );
+    assert_oracle_fixture_completion_cases(
+        "test6.txt",
+        &[
+            ("FOR i IN 1..5 LOOP", "FOR i I| 1..5 LOOP", "IN"),
+            ("IF p = 12345 THEN", "I| p = 12345 THEN", "IF"),
+            (
+                "WHEN p_grp IN (1,2) THEN",
+                "WHEN p_grp I| (1,2) THEN",
+                "IN",
+            ),
+            (
+                ":NEW.txt := NVL(:NEW.txt,'(null)')",
+                ":NE|.txt := NVL(:NEW.txt,'(null)')",
+                "NEW",
+            ),
+            (
+                "VALUES (oqt_seq_log.NEXTVAL, v_tag, 'before_insert'",
+                "VALUES (oqt_|.NEXTVAL, v_tag, 'before_insert'",
+                "oqt_seq_log",
+            ),
+        ],
+    );
+    assert_oracle_fixture_completion_cases(
+        "test5.txt",
+        &[
+            (
+                "END LOOP outer_loop;",
+                "END LOOP oute|r_loop;",
+                "outer_loop",
+            ),
+            ("END p_inner;", "END p_in|ner;", "p_inner"),
+            ("END p_deep_run;", "END p_de|ep_run;", "p_deep_run"),
+            ("END blk2;", "END bl|k2;", "blk2"),
+            ("END blk1;", "END bl|k1;", "blk1"),
+        ],
+    );
+    assert_oracle_fixture_completion_cases(
+        "test7.txt",
+        &[
+            (
+                "XMLTYPE('<root>",
+                "XMLT|('<root>",
+                "XMLTYPE",
+            ),
+            (
+                "OVER (PARTITION BY deptno) AS names_in_dept",
+                "OVE| (PARTITION BY deptno) AS names_in_dept",
+                "OVER",
+            ),
+            (
+                "sum_sal FOR dept_tag IN (D10 AS '10', D20 AS '20', D30 AS '30')",
+                "sum_sal FO| dept_tag IN (D10 AS '10', D20 AS '20', D30 AS '30')",
+                "FOR",
+            ),
+            (
+                "MATCH_RECOGNIZE (",
+                "MATC| (",
+                "MATCH_RECOGNIZE",
+            ),
+            ("ONE ROW PER MATCH", "ON| ROW PER MATCH", "ONE"),
+            ("ONE ROW PER MATCH", "ONE ROW PER MATC|", "MATCH"),
+            (
+                "avg_sal_calc[ANY] = ROUND",
+                "avg_sal_calc[AN|] = ROUND",
+                "ANY",
+            ),
+            (
+                "sum_sal[CV()] / NULLIF",
+                "sum_sal[C|()] / NULLIF",
+                "CV",
+            ),
+        ],
+    );
+    assert_oracle_fixture_completion_cases(
+        "test9.txt",
+        &[
+            (
+                "INTO l_count USING p_root_id;",
+                "INT| l_count USING p_root_id;",
+                "INTO",
+            ),
+            (
+                "FORALL i IN INDICES OF l_ids SAVE EXCEPTIONS",
+                "FORALL i I| INDICES OF l_ids SAVE EXCEPTIONS",
+                "IN",
+            ),
+            ("END IF;", "END I|;", "IF"),
+            (
+                "END IF;\n        BEGIN",
+                "END I|F;\n        BEGIN",
+                "IF",
+            ),
+            (
+                "l_units (l_idx).lvl > c_max_depth",
+                "l_units (l_idx).lv|l > c_max_depth",
+                "lvl",
+            ),
+            (
+                "l_units.NEXT (l_idx)",
+                "l_units.NEX|T (l_idx)",
+                "NEXT",
+            ),
+            (
+                "l_units (l_idx).id || ', code='",
+                "l_units (l_idx).i|d || ', code='",
+                "id",
+            ),
+            (
+                "l_units (l_idx).status = 'HOLD'",
+                "l_units (l_idx).stat|us = 'HOLD'",
+                "status",
+            ),
+            (
+                "SQL%BULK_EXCEPTIONS (j).ERROR_INDEX",
+                "SQL%BULK_EXCEPTIONS (j).ERRO|",
+                "ERROR_INDEX",
+            ),
+            (
+                "DBMS_LOB.SUBSTR (l_snapshot, 32767, 1)",
+                "DBMS_|.SUBSTR (l_snapshot, 32767, 1)",
+                "DBMS_LOB",
+            ),
+        ],
+    );
+    assert_oracle_fixture_completion_cases(
+        "test10.txt",
+        &[
+            (
+                "FOR INSERT OR UPDATE OR DELETE ON qt_sales COMPOUND TRIGGER",
+                "FO| INSERT OR UPDATE OR DELETE ON qt_sales COMPOUND TRIGGER",
+                "FOR",
+            ),
+            (
+                "ON d.dept_id = e.dept_id",
+                "O| d.dept_id = e.dept_id",
+                "ON",
+            ),
+            ("OPEN p_rc FOR", "OPEN p_rc FO|", "FOR"),
+            (
+                "FOR INSERT OR UPDATE OR DELETE ON qt_sales COMPOUND TRIGGER",
+                "FOR INSE| OR UPDATE OR DELETE ON qt_sales COMPOUND TRIGGER",
+                "INSERT",
+            ),
+            (
+                "TABLE OF NUMBER INDEX BY PLS_INTEGER;",
+                "TABLE O| NUMBER INDEX BY PLS_INTEGER;",
+                "OF",
+            ),
+            (
+                "COMPOUND TRIGGER TYPE t_num_tab IS",
+                "COMPOUND TRIGGER TYPE t_num_tab I|",
+                "IS",
+            ),
+            ("END IF;", "END I|;", "IF"),
+            (
+                "END IF;\n            RAISE;",
+                "END I|F;\n            RAISE;",
+                "IF",
+            ),
+            (
+                "l_inserted := SQL%ROWCOUNT;",
+                "l_inserted := SQ__CODEX_CURSOR__%ROWCOUNT;",
+                "SQL",
+            ),
+            (
+                "DBMS_OUTPUT.PUT_LINE ('BATCH EMP='",
+                "DBMS_|.PUT_LINE ('BATCH EMP='",
+                "DBMS_OUTPUT",
+            ),
+        ],
     );
 }
 
@@ -83067,6 +84025,181 @@ fn mysql_test3_actual_completion_regressions() {
                 "sp_run_ultra_final_boss",
             ),
         ],
+    );
+}
+
+#[test]
+fn mariadb_test4_to_test8_actual_completion_regressions() {
+    use crate::db::DatabaseType::MariaDB;
+
+    let fixture_cases: [(&str, &[(&str, &str, &str)]); 5] = [
+        (
+            "test4.txt",
+            &[
+                ("SET SESSION sql_mode", "SET SESSION sql_|", "sql_mode"),
+                (
+                    "ON DUPLICATE KEY UPDATE log_count",
+                    "O| DUPLICATE KEY UPDATE log_count",
+                    "ON",
+                ),
+                ("JOIN (\n        SELECT", "JOI| (\n        SELECT", "JOIN"),
+                ("JOIN (\n        SELECT", "JOIN (\n        SELE|", "SELECT"),
+                (
+                    "SET p.last_rollup_at",
+                    "SE| p.last_rollup_at",
+                    "SET",
+                ),
+            ],
+        ),
+        (
+            "test5.txt",
+            &[
+                (
+                    "SET SESSION group_concat_max_len",
+                    "SET SESSION grou|",
+                    "group_concat_max_len",
+                ),
+                ("INTERVAL 13 DAY", "INTERVAL 13 DA|", "DAY"),
+                (
+                    "DECLARE EXIT HANDLER FOR SQLEXCEPTION\n                BEGIN",
+                    "DECLARE EXIT HANDLER FOR SQLEXCEPTION\n                BEGI|",
+                    "BEGIN",
+                ),
+                (
+                    "SET NEW.revision_no = OLD.revision_no + 1;",
+                    "SE| NEW.revision_no = OLD.revision_no + 1;",
+                    "SET",
+                ),
+                (
+                    "INSERT INTO project_member (project_id, user_id, role_name, allocation_pct, joined_on)",
+                    "INSERT INTO project_member (project_id, user_id, role_name, allocation_pct, join|)",
+                    "joined_on",
+                ),
+                (
+                    "joined_on = VALUES(joined_on);",
+                    "join| = VALUES(joined_on);",
+                    "joined_on",
+                ),
+                (
+                    "joined_on = VALUES(joined_on);",
+                    "joined_on = VALUES(join|);",
+                    "joined_on",
+                ),
+                (
+                    "allocation_pct) ORDER BY pm.allocation_pct",
+                    "allocation_pct) ORDER B| pm.allocation_pct",
+                    "BY",
+                ),
+                (
+                    "SELECT DATE_ADD(month_start, INTERVAL 1 MONTH)",
+                    "SELECT DATE_ADD(mont|, INTERVAL 1 MONTH)",
+                    "month_start",
+                ),
+                (
+                    "md.month_start,\n        dp.project_id",
+                    "md.mont|,\n        dp.project_id",
+                    "month_start",
+                ),
+                (
+                    "DATE_FORMAT(md.month_start, '%Y-%m-01')",
+                    "DATE_FORMAT(md.mont|, '%Y-%m-01')",
+                    "month_start",
+                ),
+            ],
+        ),
+        (
+            "test6.txt",
+            &[
+                (
+                    "SET SESSION max_recursive_iterations",
+                    "SET SESSION max_|",
+                    "max_recursive_iterations",
+                ),
+                (
+                    "DROP TRIGGER IF EXISTS bi_boss_order_item",
+                    "DROP TRIGGER IF EXISTS bi_b|",
+                    "bi_boss_order_item",
+                ),
+                ("RETURNS VARCHAR(20)", "RETURNS VARC|(20)", "VARCHAR"),
+                (
+                    "SET o.subtotal       = IFNULL(x.subtotal, 0)",
+                    "SE| o.subtotal       = IFNULL(x.subtotal, 0)",
+                    "SET",
+                ),
+                (
+                    "END IF;\n\n    UPDATE boss_order o\n    LEFT JOIN (\n        SELECT\n            order_id,\n            ROUND(SUM(line_subtotal), 2) AS subtotal,\n            ROUND(SUM(line_discount), 2) AS discount_total,\n            ROUND(SUM(line_tax), 2) AS tax_total,\n            ROUND(SUM(line_total), 2) AS grand_total\n        FROM boss_order_item\n        WHERE order_id = NEW.order_id\n        GROUP BY order_id\n    ) x\n      ON x.order_id = o.order_id\n       SET o.subtotal",
+                    "END IF;\n\n    UPDATE boss_order o\n    LEFT JOIN (\n        SELECT\n            order_id,\n            ROUND(SUM(line_subtotal), 2) AS subtotal,\n            ROUND(SUM(line_discount), 2) AS discount_total,\n            ROUND(SUM(line_tax), 2) AS tax_total,\n            ROUND(SUM(line_total), 2) AS grand_total\n        FROM boss_order_item\n        WHERE order_id = NEW.order_id\n        GROUP BY order_id\n    ) x\n      ON x.order_id = o.order_id\n       SE| o.subtotal",
+                    "SET",
+                ),
+                (
+                    "o.grand_total AND o.grand_total",
+                    "o.grand_total AN| o.grand_total",
+                    "AND",
+                ),
+            ],
+        ),
+        (
+            "test7.txt",
+            &[
+                (
+                    "ON UPDATE CURRENT_TIMESTAMP(6)",
+                    "O| UPDATE CURRENT_TIMESTAMP(6)",
+                    "ON",
+                ),
+                ("RETURNS VARCHAR(20)", "RETURNS VARC|(20)", "VARCHAR"),
+                (
+                    "CALL qb_assert_eq_int(8, @cat_tree_count",
+                    "CALL qb_assert_eq_int(8, @cat_|",
+                    "cat_tree_count",
+                ),
+                (
+                    "CALL qb_assert_eq_int(1, @march_top_rank",
+                    "CALL qb_assert_eq_int(1, @marc|",
+                    "march_top_rank",
+                ),
+                ("EXECUTE stmt_tmp", "EXECUTE stmt|", "stmt_tmp"),
+            ],
+        ),
+        (
+            "test8.txt",
+            &[
+                ("RETURNS VARCHAR(20)", "RETURNS VARC|(20)", "VARCHAR"),
+                ("SELECT n + 1", "SELECT n| + 1", "n"),
+                ("WHERE n < 7", "WHERE n| < 7", "n"),
+                (
+                    "CALL cfb_assert_eq_int(\n    7,\n    @seq_count",
+                    "CALL cfb_assert_eq_int(\n    7,\n    @seq_|",
+                    "seq_count",
+                ),
+                (
+                    "CALL cfb_assert_eq_int(\n    2,\n    @top_line_count",
+                    "CALL cfb_assert_eq_int(\n    2,\n    @top_|",
+                    "top_line_count",
+                ),
+                (
+                    "CALL cfb_assert_eq_int(\n    6,\n    @inline_sum",
+                    "CALL cfb_assert_eq_int(\n    6,\n    @inli|",
+                    "inline_sum",
+                ),
+                (
+                    "CALL cfb_assert_true(\n    @sum_paid_net",
+                    "CALL cfb_assert_true(\n    @sum_|",
+                    "sum_paid_net",
+                ),
+            ],
+        ),
+    ];
+
+    let mut failures = Vec::new();
+    for (file_name, cases) in fixture_cases {
+        failures.extend(mysql_family_fixture_completion_case_failures(
+            file_name, MariaDB, cases,
+        ));
+    }
+    assert!(
+        failures.is_empty(),
+        "MariaDB test4-test8 completion gaps:\n{}",
+        failures.join("\n")
     );
 }
 

@@ -1368,7 +1368,11 @@ impl SqlEditorWidget {
         let last_char = text.get(..segment_end)?.chars().next_back();
         if matches!(last_char, Some(')')) {
             let open_idx = Self::find_open_paren_for_qualifier_expression(text, segment_end)?;
-            return Self::parse_qualifier_segment_before_dot(text, open_idx);
+            let trimmed_open_idx = text
+                .get(..open_idx)?
+                .trim_end()
+                .len();
+            return Self::parse_qualifier_segment_before_dot(text, trimmed_open_idx);
         }
         if let Some(delimiter) = last_char.filter(|ch| matches!(ch, '"' | '`')) {
             let start = Self::find_quoted_segment_start(text, segment_end, delimiter)?;

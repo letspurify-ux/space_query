@@ -84,6 +84,7 @@ struct ParsedDeclarationSymbol {
     member_source_is_collection_like: bool,
     member_source_allows_visible_members: bool,
     suggest_name: bool,
+    is_type_symbol: bool,
 }
 
 #[derive(Default)]
@@ -592,6 +593,8 @@ impl SqlEditorWidget {
         let text_len = text.len();
         let statement_start =
             Self::clamp_to_char_boundary_local(text, statement_start.min(text_len));
+        let statement_start =
+            Self::statement_start_with_leading_plsql_label(text, statement_start);
         let statement_end = Self::clamp_to_char_boundary_local(
             text,
             statement_end.max(statement_start).min(text_len),
@@ -609,6 +612,47 @@ impl SqlEditorWidget {
             text: statement_text,
             cursor_in_statement,
         }
+    }
+
+    fn statement_start_with_leading_plsql_label(text: &str, statement_start: usize) -> usize {
+        let mut label_end = statement_start.min(text.len());
+        while label_end > 0 {
+            let Some(prefix) = text.get(..label_end) else {
+                return statement_start;
+            };
+            let Some((idx, ch)) = prefix.char_indices().next_back() else {
+                return statement_start;
+            };
+            if !ch.is_whitespace() {
+                break;
+            }
+            label_end = idx;
+        }
+        let Some(prefix) = text.get(..label_end) else {
+            return statement_start;
+        };
+        if !prefix.ends_with(">>") {
+            return statement_start;
+        }
+        let Some(label_start) = prefix.rfind("<<") else {
+            return statement_start;
+        };
+        let Some(label_text) = text.get(label_start..label_end) else {
+            return statement_start;
+        };
+        let inner = label_text
+            .strip_prefix("<<")
+            .and_then(|rest| rest.strip_suffix(">>"))
+            .map(str::trim)
+            .unwrap_or("");
+        if inner.is_empty()
+            || !inner
+                .chars()
+                .all(|ch| crate::sql_text::is_identifier_char(ch))
+        {
+            return statement_start;
+        }
+        label_start
     }
 
     fn expanded_statement_requires_exact_bounds(
@@ -896,6 +940,16 @@ impl SqlEditorWidget {
         ) {
             return Self::plsql_block_label_suggestions(analysis.context.as_ref(), prefix);
         }
+        if Self::cursor_is_at_plsql_end_label_slot_for_context(
+            analysis.context.as_ref(),
+            !prefix.is_empty(),
+            db_type,
+        ) {
+            let labels = Self::plsql_block_label_suggestions(analysis.context.as_ref(), prefix);
+            if !labels.is_empty() {
+                return labels;
+            }
+        }
         // The closing `END |` of a named `PACKAGE`/`PROCEDURE`/`FUNCTION`/`TYPE
         // BODY` may repeat that object's own name — not a value symbol either.
         if Self::cursor_is_at_plsql_named_end_target_slot_for_context(
@@ -934,10 +988,23 @@ impl SqlEditorWidget {
             !prefix.is_empty(),
             db_type,
         ) {
-            return Self::mysql_prepared_statement_handle_suggestions(
+            let mut suggestions = Self::mysql_prepared_statement_handle_suggestions(
                 analysis.context.as_ref(),
                 prefix,
             );
+            let mut seen = suggestions
+                .iter()
+                .map(|name| name.to_ascii_uppercase())
+                .collect::<HashSet<_>>();
+            for name in analysis.text_bind_names.iter() {
+                let upper = name.to_ascii_uppercase();
+                if Self::local_symbol_matches_prefix(name, &upper, &prefix_upper)
+                    && seen.insert(upper)
+                {
+                    suggestions.push(name.clone());
+                }
+            }
+            return suggestions;
         }
         // A `RAISE |`/`EXCEPTION WHEN |` name is an exception. Exceptions ARE scoped
         // value symbols, but so are ordinary variables/cursors; retain only the ones
@@ -1755,7 +1822,7 @@ impl SqlEditorWidget {
         for symbol in analysis.local_symbols.iter() {
             if symbol.declared_at > cursor_in_statement
                 || symbol.upper != source_upper
-                || (symbol.suggest_name && !allow_visible_symbols)
+                || (symbol.suggest_name && !allow_visible_symbols && !symbol.is_type_symbol)
             {
                 continue;
             }
@@ -1797,7 +1864,7 @@ impl SqlEditorWidget {
             return true;
         }
 
-        upper.starts_with(prefix_upper) && upper != prefix_upper
+        upper.starts_with(prefix_upper)
     }
 
     fn deepest_local_scope_at_cursor(scopes: &[LocalScope], cursor_byte: usize) -> usize {
@@ -1880,6 +1947,7 @@ impl SqlEditorWidget {
                 symbol.member_source_is_collection_like,
                 symbol.member_source_allows_visible_members,
                 symbol.suggest_name,
+                symbol.is_type_symbol,
             );
         }
         let mut block_stack = Vec::<LocalBlockFrame>::new();
@@ -1934,6 +2002,7 @@ impl SqlEditorWidget {
                                 false,
                                 false,
                                 true,
+                                false,
                             );
                         }
                     }
@@ -1997,6 +2066,7 @@ impl SqlEditorWidget {
                                     routine_symbol.member_source_is_collection_like,
                                     routine_symbol.member_source_allows_visible_members,
                                     routine_symbol.suggest_name,
+                                    routine_symbol.is_type_symbol,
                                 );
                             }
                             let scope_depth = scopes[parent_scope].scope.depth.saturating_add(1);
@@ -2040,6 +2110,7 @@ impl SqlEditorWidget {
                                     parameter.member_source_is_collection_like,
                                     parameter.member_source_allows_visible_members,
                                     parameter.suggest_name,
+                                    parameter.is_type_symbol,
                                 );
                             }
                             block_stack.push(LocalBlockFrame {
@@ -2088,6 +2159,7 @@ impl SqlEditorWidget {
                                         declaration.member_source_is_collection_like,
                                         declaration.member_source_allows_visible_members,
                                         declaration.suggest_name,
+                                        declaration.is_type_symbol,
                                     );
                                 }
                                 idx = item_end.saturating_sub(1);
@@ -2168,6 +2240,7 @@ impl SqlEditorWidget {
                                     false,
                                     true,
                                     true,
+                                    false,
                                 );
                                 next_scope_id
                             });
@@ -2500,6 +2573,7 @@ impl SqlEditorWidget {
                     declaration.member_source_is_collection_like,
                     declaration.member_source_allows_visible_members,
                     declaration.suggest_name,
+                    declaration.is_type_symbol,
                 );
             }
 
@@ -2545,6 +2619,7 @@ impl SqlEditorWidget {
                     member_source_is_collection_like: false,
                     member_source_allows_visible_members: member_source_is_rowtype,
                     suggest_name: true,
+                    is_type_symbol: false,
                 });
             }
             _ => {}
@@ -2579,6 +2654,7 @@ impl SqlEditorWidget {
             member_source_is_collection_like: false,
             member_source_allows_visible_members: member_source_is_rowtype,
             suggest_name: true,
+            is_type_symbol: false,
         })
     }
 
@@ -2639,7 +2715,8 @@ impl SqlEditorWidget {
             member_source_is_rowtype: false,
             member_source_is_collection_like: false,
             member_source_allows_visible_members: false,
-            suggest_name: false,
+            suggest_name: true,
+            is_type_symbol: true,
         })
     }
 
@@ -2710,11 +2787,17 @@ impl SqlEditorWidget {
         }
 
         let source_idx = Self::next_meaningful_token_idx(item, of_idx?.saturating_add(1))?;
-        let (member_source, source_end_idx) =
-            Self::extract_declaration_type_source_name(item, source_idx)?;
-        let member_source_is_rowtype =
-            Self::declaration_type_source_has_percent_kind(item, source_end_idx, "ROWTYPE");
-        let member_source_upper = Some(member_source.to_ascii_uppercase());
+        let (member_source_upper, member_source_is_rowtype) =
+            if let Some((member_source, source_end_idx)) =
+                Self::extract_declaration_type_source_name(item, source_idx)
+            {
+                (
+                    Some(member_source.to_ascii_uppercase()),
+                    Self::declaration_type_source_has_percent_kind(item, source_end_idx, "ROWTYPE"),
+                )
+            } else {
+                (None, false)
+            };
         let member_source_uppers =
             Self::rowtype_source_uppers_from_single(&member_source_upper, member_source_is_rowtype);
 
@@ -2728,7 +2811,8 @@ impl SqlEditorWidget {
             member_source_is_rowtype,
             member_source_is_collection_like: true,
             member_source_allows_visible_members: member_source_is_rowtype,
-            suggest_name: false,
+            suggest_name: true,
+            is_type_symbol: true,
         })
     }
 
@@ -2784,6 +2868,7 @@ impl SqlEditorWidget {
             member_source_is_collection_like: false,
             member_source_allows_visible_members: false,
             suggest_name: true,
+            is_type_symbol: false,
         }
     }
 
@@ -3108,6 +3193,7 @@ impl SqlEditorWidget {
                 member_source_is_collection_like: false,
                 member_source_allows_visible_members: false,
                 suggest_name: true,
+                is_type_symbol: false,
             })
             .collect()
     }
@@ -3302,7 +3388,10 @@ impl SqlEditorWidget {
                     if candidate.declared_at > symbol.declared_at {
                         continue;
                     }
-                    if candidate.suggest_name && !symbol.member_source_allows_visible_members {
+                    if candidate.suggest_name
+                        && !symbol.member_source_allows_visible_members
+                        && !candidate.is_type_symbol
+                    {
                         continue;
                     }
                     let Some(scope_rank) = scope_ranks.get(&candidate.scope_id).copied() else {
@@ -4280,6 +4369,7 @@ impl SqlEditorWidget {
             member_source_is_collection_like: false,
             member_source_allows_visible_members: member_source_is_rowtype,
             suggest_name: true,
+            is_type_symbol: false,
         })
     }
 
@@ -4350,6 +4440,13 @@ impl SqlEditorWidget {
             Self::extend_text_bind_names(
                 &mut names,
                 Self::collect_text_mysql_user_var_names_before_statement(
+                    full_text,
+                    statement_start,
+                ),
+            );
+            Self::extend_text_bind_names(
+                &mut names,
+                Self::collect_text_mysql_prepared_statement_handles_before_statement(
                     full_text,
                     statement_start,
                 ),
@@ -4443,6 +4540,42 @@ impl SqlEditorWidget {
         names
     }
 
+    fn collect_text_mysql_prepared_statement_handles_before_statement(
+        full_text: &str,
+        statement_start: usize,
+    ) -> Vec<String> {
+        let statement_start =
+            Self::clamp_to_char_boundary_local(full_text, statement_start.min(full_text.len()));
+        let tentative_start = statement_start.saturating_sub(INTELLISENSE_TEXT_BIND_SCAN_WINDOW);
+        let scan_start = full_text
+            .get(..tentative_start)
+            .and_then(|prefix| prefix.rfind('\n').map(|idx| idx + 1))
+            .unwrap_or(0);
+        let scan_start = Self::clamp_to_char_boundary_local(full_text, scan_start);
+        let prefix = full_text.get(scan_start..statement_start).unwrap_or("");
+        let token_spans = super::query_text::tokenize_sql_spanned_with_mysql_compat(prefix, true);
+
+        let mut names = Vec::new();
+        let mut seen = HashSet::new();
+        for (idx, span) in token_spans.iter().enumerate() {
+            if !matches!(&span.token, SqlToken::Word(word) if word.eq_ignore_ascii_case("PREPARE"))
+            {
+                continue;
+            }
+            let Some(SqlTokenSpan {
+                token: SqlToken::Word(name),
+                ..
+            }) = token_spans.get(idx + 1)
+            else {
+                continue;
+            };
+            if seen.insert(name.to_ascii_uppercase()) {
+                names.push(name.clone());
+            }
+        }
+        names
+    }
+
     fn mysql_at_symbol_follows_account_name(token_spans: &[SqlTokenSpan], at_idx: usize) -> bool {
         let previous = token_spans
             .get(..at_idx)
@@ -4452,7 +4585,7 @@ impl SqlEditorWidget {
             .find(|span| !matches!(span.token, SqlToken::Comment(_)))
             .map(|span| &span.token);
 
-        matches!(previous, Some(SqlToken::Word(word)) if !word.eq_ignore_ascii_case("SET"))
+        matches!(previous, Some(SqlToken::Word(word)) if !matches!(word.to_ascii_uppercase().as_str(), "SET" | "INTO"))
             || matches!(previous, Some(SqlToken::String(_)))
             || matches!(previous, Some(SqlToken::Symbol(prev)) if prev == "@")
     }
@@ -4546,6 +4679,7 @@ impl SqlEditorWidget {
         member_source_is_collection_like: bool,
         member_source_allows_visible_members: bool,
         suggest_name: bool,
+        is_type_symbol: bool,
     ) {
         let upper = Self::local_identifier_lookup_upper(&name);
         if !seen_symbol_keys.insert((scope_id, declared_at, upper.clone())) {
@@ -4565,6 +4699,7 @@ impl SqlEditorWidget {
             member_source_is_collection_like,
             member_source_allows_visible_members,
             suggest_name,
+            is_type_symbol,
         });
     }
 

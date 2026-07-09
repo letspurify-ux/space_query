@@ -503,6 +503,7 @@ pub(crate) struct LocalSymbolEntry {
     member_source_is_collection_like: bool,
     member_source_allows_visible_members: bool,
     suggest_name: bool,
+    is_type_symbol: bool,
 }
 
 #[derive(Clone)]
