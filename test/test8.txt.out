@@ -119,7 +119,7 @@ CREATE OR REPLACE TYPE oqt_obj AS
         FUNCTION peek RETURN VARCHAR2);
 /
 
-SHOW ERRORS TYPE [[oqt_obj]]
+SHOW ERRORS TYPE oqt_obj
 
 CREATE OR REPLACE TYPE BODY oqt_obj AS
     MEMBER
@@ -130,7 +130,7 @@ CREATE OR REPLACE TYPE BODY oqt_obj AS
 END;
 /
 
-SHOW ERRORS TYPE BODY [[oqt_obj]]
+SHOW ERRORS TYPE BODY oqt_obj
 
 PROMPT [4] package spec
 
@@ -143,7 +143,7 @@ CREATE OR REPLACE PACKAGE oqt_mega_pkg AS
 END oqt_mega_pkg;
 /
 
-SHOW ERRORS PACKAGE [[oqt_mega_pkg]]
+SHOW ERRORS PACKAGE oqt_mega_pkg
 
 PROMPT [5] package body (deep nesting)
 
@@ -385,7 +385,7 @@ CREATE OR REPLACE PACKAGE BODY oqt_mega_pkg AS
 END oqt_mega_pkg;
 /
 
-SHOW ERRORS PACKAGE BODY [[oqt_mega_pkg]]
+SHOW ERRORS PACKAGE BODY oqt_mega_pkg
 
 PROMPT [6] trigger (extra nesting surface)
 
@@ -412,7 +412,7 @@ BEGIN
 END;
 /
 
-SHOW ERRORS TRIGGER [[oqt_trg_test_bi]]
+SHOW ERRORS TRIGGER oqt_trg_test_bi
 
 PROMPT [7] execute
 
@@ -478,17 +478,12 @@ select * from [[EMP]];
 -- db: Oracle
 -- metadata: test Oracle inferred catalog + Oracle built-ins
 -- checked: 762
--- missing: 10
+-- missing: 5
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens:
 --   13:24 word=SQL prefix=SQ suggestions=[] total=0 line=WHENEVER SQLERROR EXIT SQL.SQLCODE
 --   118:13 word=id prefix=i suggestions=[IS] total=1 line=OBJECT (id NUMBER, txt VARCHAR2 (2000), MEMBER
 --   118:24 word=txt prefix=tx suggestions=[] total=0 line=OBJECT (id NUMBER, txt VARCHAR2 (2000), MEMBER
---   122:18 word=oqt_obj prefix=oqt_ suggestions=[] total=0 line=SHOW ERRORS TYPE oqt_obj
---   133:23 word=oqt_obj prefix=oqt_ suggestions=[] total=0 line=SHOW ERRORS TYPE BODY oqt_obj
---   146:21 word=oqt_mega_pkg prefix=oqt_ suggestions=[] total=0 line=SHOW ERRORS PACKAGE oqt_mega_pkg
 --   313:19 word=sp1 prefix=sp suggestions=[spec, qt_split_logs, qt_split_seq, qt_split_users, qt_split_v, qt_seq_emp, qt_split_fn, qt_split_pkg, qt_split_obj, qt_split_tab, step, sale_type] total=12 line=SAVEPOINT sp1;
---   388:26 word=oqt_mega_pkg prefix=oqt_ suggestions=[] total=0 line=SHOW ERRORS PACKAGE BODY oqt_mega_pkg
---   415:21 word=oqt_trg_test_bi prefix=oqt_ suggestions=[] total=0 line=SHOW ERRORS TRIGGER oqt_trg_test_bi
 --   473:15 word=EMP prefix=EM suggestions=[qt_emp, qt_employees, qt_emp_sales_v, qt_emp_summary_v, oqt_emp, oqt_t_emp, qt_boss_emp, qt_boss_emp_v] total=8 line=select * from EMP;
 -- =========================================================

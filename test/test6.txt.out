@@ -71,7 +71,7 @@ CREATE OR REPLACE TYPE oqt_obj AS OBJECT (
   MEMBER FUNCTION peek RETURN VARCHAR2
 );
 /
-SHOW ERRORS TYPE [[oqt_obj]]
+SHOW ERRORS TYPE oqt_obj
 
 CREATE OR REPLACE TYPE BODY oqt_obj AS
   MEMBER FUNCTION peek RETURN VARCHAR2 IS
@@ -80,7 +80,7 @@ CREATE OR REPLACE TYPE BODY oqt_obj AS
   END;
 END;
 /
-SHOW ERRORS TYPE BODY [[oqt_obj]]
+SHOW ERRORS TYPE BODY oqt_obj
 
 PROMPT [4] package spec
 
@@ -93,7 +93,7 @@ CREATE OR REPLACE PACKAGE oqt_mega_pkg AS
   FUNCTION f_deep(p_grp IN NUMBER, p_n IN NUMBER, p_txt IN VARCHAR2) RETURN NUMBER;
 END oqt_mega_pkg;
 /
-SHOW ERRORS PACKAGE [[oqt_mega_pkg]]
+SHOW ERRORS PACKAGE oqt_mega_pkg
 
 PROMPT [5] package body (deep nesting)
 
@@ -333,7 +333,7 @@ CREATE OR REPLACE PACKAGE BODY oqt_mega_pkg AS
 
 END oqt_mega_pkg;
 /
-SHOW ERRORS PACKAGE BODY [[oqt_mega_pkg]]
+SHOW ERRORS PACKAGE BODY oqt_mega_pkg
 
 PROMPT [6] trigger (extra nesting surface)
 
@@ -359,7 +359,7 @@ BEGIN
   VALUES (oqt_seq_log.NEXTVAL, v_tag, 'before_insert', 1, 'id='||NVL(:NEW.id,-1));
 END;
 /
-SHOW ERRORS TRIGGER [[oqt_trg_test_bi]]
+SHOW ERRORS TRIGGER oqt_trg_test_bi
 
 PROMPT [7] execute
 
@@ -406,14 +406,9 @@ PROMPT [DONE]
 -- db: Oracle
 -- metadata: test Oracle inferred catalog + Oracle built-ins
 -- checked: 757
--- missing: 7
+-- missing: 2
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens:
 --   9:24 word=SQL prefix=SQ suggestions=[] total=0 line=WHENEVER SQLERROR EXIT SQL.SQLCODE
---   74:18 word=oqt_obj prefix=oqt_ suggestions=[] total=0 line=SHOW ERRORS TYPE oqt_obj
---   83:23 word=oqt_obj prefix=oqt_ suggestions=[] total=0 line=SHOW ERRORS TYPE BODY oqt_obj
---   96:21 word=oqt_mega_pkg prefix=oqt_ suggestions=[] total=0 line=SHOW ERRORS PACKAGE oqt_mega_pkg
 --   267:15 word=sp1 prefix=sp suggestions=[spec, qt_split_logs, qt_split_seq, qt_split_users, qt_split_v, qt_seq_emp, qt_split_fn, qt_split_pkg, qt_split_obj, qt_split_tab, step, sale_type] total=12 line=SAVEPOINT sp1;
---   336:26 word=oqt_mega_pkg prefix=oqt_ suggestions=[] total=0 line=SHOW ERRORS PACKAGE BODY oqt_mega_pkg
---   362:21 word=oqt_trg_test_bi prefix=oqt_ suggestions=[] total=0 line=SHOW ERRORS TRIGGER oqt_trg_test_bi
 -- =========================================================

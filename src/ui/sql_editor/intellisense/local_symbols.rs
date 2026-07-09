@@ -646,9 +646,7 @@ impl SqlEditorWidget {
             .map(str::trim)
             .unwrap_or("");
         if inner.is_empty()
-            || !inner
-                .chars()
-                .all(|ch| crate::sql_text::is_identifier_char(ch))
+            || !inner.chars().all(crate::sql_text::is_identifier_char)
         {
             return statement_start;
         }

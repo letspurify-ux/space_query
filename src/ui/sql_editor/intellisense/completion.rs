@@ -2778,12 +2778,15 @@ impl SqlEditorWidget {
                 analysis,
             )
         });
+        let outer_cursor_for_loop_qualifier = qualifier.map(str::to_string).or_else(|| {
+            Self::qualifier_before_prefix_at_text_end(&snapshot.signature_scan_text, &snapshot.prefix)
+        });
         let outer_cursor_for_loop_record_member_suggestions =
             if local_record_member_suggestions
                 .as_ref()
                 .is_none_or(Vec::is_empty)
             {
-                qualifier.and_then(|qualifier| {
+                outer_cursor_for_loop_qualifier.as_deref().and_then(|qualifier| {
                     Self::plsql_outer_cursor_for_loop_record_member_suggestions_from_text(
                         &snapshot.signature_scan_text,
                         qualifier,
@@ -5395,7 +5398,6 @@ impl SqlEditorWidget {
             "LAST",
             "MATCH",
             "MATCH_RECOGNIZE",
-            "NOT",
             "OF",
             "ONE",
             "ON",
@@ -5480,15 +5482,14 @@ impl SqlEditorWidget {
             .take(4)
             .collect::<Vec<_>>();
 
-        if matches_prefix("ON") {
-            if (words.first().map(String::as_str) == Some("INSERT")
+        if matches_prefix("ON")
+            && ((words.first().map(String::as_str) == Some("INSERT")
                 && lookahead_words.iter().any(|word| word == "DUPLICATE"))
                 || Self::cursor_is_at_mysql_on_duplicate_after_on_tail(tokens, end, db_type)
                 || matches!(last, Some("CURRENT_TIMESTAMP" | "CURRENT_TIMESTAMP()"))
-                || Self::mysql_column_default_current_timestamp_before_cursor(tokens, end)
-            {
-                return Some("ON".to_string());
-            }
+                || Self::mysql_column_default_current_timestamp_before_cursor(tokens, end))
+        {
+            return Some("ON".to_string());
         }
         if matches_prefix("JOIN") && has("UPDATE") && !has("SET") {
             return Some("JOIN".to_string());
@@ -5642,7 +5643,7 @@ impl SqlEditorWidget {
         }
         let expression_candidates =
             Self::expected_expression_construct_continuation_keywords(direct_tokens, direct_end);
-        if let Some(keyword) = single(&expression_candidates) {
+        if let Some(keyword) = single(expression_candidates) {
             return Some(keyword);
         }
         if let Some(keyword) =
@@ -18588,9 +18589,7 @@ impl SqlEditorWidget {
             return None;
         }
         let toks = Self::meaningful_tokens_before(tokens, end);
-        let Some(last) = toks.last() else {
-            return None;
-        };
+        let last = toks.last()?;
         match last {
             SqlToken::Word(word) => {
                 let upper = word.to_ascii_uppercase();
@@ -20793,7 +20792,7 @@ impl SqlEditorWidget {
             .take(cursor_limit.saturating_add(1))
             .enumerate()
             .any(|(idx, pair)| {
-                idx + 1 <= cursor_limit
+                idx < cursor_limit
                     && matches!(&pair[0], SqlToken::Symbol(symbol) if symbol == "@")
                     && matches!(&pair[1], SqlToken::Word(_))
             })
@@ -30256,6 +30255,65 @@ impl SqlEditorWidget {
             .then_some(ExpectedObjectSuggestionKind::Package)
     }
 
+    fn expected_oracle_show_errors_object_suggestion_kind(
+        words: &[String],
+    ) -> Option<ExpectedObjectSuggestionKind> {
+        let show_pos = words.iter().rposition(|word| word == "SHOW")?;
+        let tail = &words[show_pos + 1..];
+        match tail {
+            [errors, object_type] if errors == "ERRORS" => match object_type.as_str() {
+                "PROCEDURE" => Some(ExpectedObjectSuggestionKind::Procedure),
+                "FUNCTION" => Some(ExpectedObjectSuggestionKind::Function),
+                "PACKAGE" => Some(ExpectedObjectSuggestionKind::Package),
+                "TYPE" => Some(ExpectedObjectSuggestionKind::Type),
+                "TRIGGER" => Some(ExpectedObjectSuggestionKind::Trigger),
+                "VIEW" => Some(ExpectedObjectSuggestionKind::View),
+                _ => None,
+            },
+            [errors, object_type, body]
+                if errors == "ERRORS"
+                    && body == "BODY"
+                    && matches!(object_type.as_str(), "PACKAGE" | "TYPE") =>
+            {
+                match object_type.as_str() {
+                    "PACKAGE" => Some(ExpectedObjectSuggestionKind::Package),
+                    "TYPE" => Some(ExpectedObjectSuggestionKind::Type),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn current_identifier_extending_prefix_index(
+        tokens: &[SqlToken],
+        context_end: usize,
+        prefix: &str,
+    ) -> Option<usize> {
+        if prefix.is_empty() {
+            return None;
+        }
+        let extends_prefix = |token: Option<&SqlToken>| {
+            let Some(SqlToken::Word(word)) = token else {
+                return false;
+            };
+            word.len() > prefix.len()
+                && !Self::token_is_language_keyword(&word.to_ascii_uppercase())
+                && word
+                    .get(..prefix.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        };
+        [
+            context_end.checked_sub(1),
+            Some(context_end),
+            context_end.checked_add(1),
+            context_end.checked_add(2),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|idx| extends_prefix(tokens.get(*idx)))
+    }
+
     fn oracle_tablespace_file_options() -> &'static [&'static str] {
         &[
             "SIZE",
@@ -32743,6 +32801,46 @@ impl SqlEditorWidget {
                         .collect::<Vec<_>>()
                 })
             })
+    }
+
+    fn qualifier_before_prefix_at_text_end(text_before_cursor: &str, prefix: &str) -> Option<String> {
+        let word_start_from_prefix = text_before_cursor.len().checked_sub(prefix.len());
+        if let Some(word_start) = word_start_from_prefix {
+            if let Some(qualifier) = Self::qualifier_before_word_in_text(text_before_cursor, word_start)
+            {
+                return Some(qualifier);
+            }
+        }
+
+        let word_start = word_start_from_prefix.unwrap_or_else(|| {
+            let mut word_start = text_before_cursor.len();
+            for (idx, ch) in text_before_cursor.char_indices().rev() {
+                if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$' | '#') {
+                    word_start = idx;
+                } else {
+                    break;
+                }
+            }
+            word_start
+        });
+        Self::simple_unquoted_qualifier_before_word_start(text_before_cursor, word_start)
+    }
+
+    fn simple_unquoted_qualifier_before_word_start(text: &str, word_start: usize) -> Option<String> {
+        if word_start == 0 || text.as_bytes().get(word_start - 1) != Some(&b'.') {
+            return None;
+        }
+        let dot_idx = word_start - 1;
+        let mut qualifier_start = dot_idx;
+        while qualifier_start > 0 {
+            let byte = text.as_bytes()[qualifier_start - 1];
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'#') {
+                qualifier_start -= 1;
+            } else {
+                break;
+            }
+        }
+        (qualifier_start < dot_idx).then(|| text[qualifier_start..dot_idx].to_string())
     }
 
     fn plsql_cursor_for_loop_projection_from_tokens(
@@ -35635,9 +35733,7 @@ impl SqlEditorWidget {
                         idx
                     }
                 });
-            let Some(index_name_idx) = index_name_idx else {
-                return None;
-            };
+            let index_name_idx = index_name_idx?;
             match words.get(index_name_idx).map(String::as_str) {
                 None => {
                     return if mariadb && last == Some("INDEX") {
@@ -35759,9 +35855,7 @@ impl SqlEditorWidget {
                         idx
                     }
                 });
-            let Some(index_name_idx) = index_name_idx else {
-                return None;
-            };
+            let index_name_idx = index_name_idx?;
             match words.get(index_name_idx).map(String::as_str) {
                 None => {
                     return if mariadb && last == Some("INDEX") {
@@ -41053,14 +41147,14 @@ impl SqlEditorWidget {
 
                 let mut idx = 1;
                 let mut create_or_replace = false;
-                if verb == "CREATE" {
-                    if matches!(
+                if verb == "CREATE"
+                    && matches!(
                         items.get(idx..idx + 2),
                         Some([or_kw, replace_kw]) if or_kw == "OR" && replace_kw == "REPLACE"
-                    ) {
-                        idx += 2;
-                        create_or_replace = true;
-                    }
+                    )
+                {
+                    idx += 2;
+                    create_or_replace = true;
                 }
                 if items.get(idx).map(String::as_str) != Some("SPATIAL") {
                     return None;
@@ -47686,25 +47780,6 @@ impl SqlEditorWidget {
         {
             return Self::filter_expected_candidates(prefix, candidates);
         }
-        if let Some(candidates) =
-            Self::expected_table_alias_as_keyword_candidates(tokens, context_end, deep_ctx.phase)
-                .or_else(|| {
-                    Self::expected_table_alias_as_keyword_candidates(
-                        statement_tokens,
-                        statement_context_end,
-                        deep_ctx.phase,
-                    )
-                })
-                .or_else(|| {
-                    Self::expected_table_alias_as_keyword_candidates(
-                        full_statement_tokens,
-                        full_statement_context_end,
-                        deep_ctx.phase,
-                    )
-                })
-        {
-            return Self::filter_expected_candidates(prefix, candidates);
-        }
         if let Some((candidates, src_tokens, src_end)) =
             Self::expected_select_list_from_keyword_candidates(tokens, context_end, db_type)
                 .map(|candidates| (candidates, tokens, context_end))
@@ -47769,14 +47844,6 @@ impl SqlEditorWidget {
             expr_keyword_ctx.map(|ctx| ctx.is_predicate_left_operand_type),
         ) {
             return Self::filter_expected_candidates(prefix, candidates);
-        }
-        if !prefix.is_empty()
-            && Self::completion_suggestion_matches_prefix("NOT", prefix)
-            && (Self::cursor_follows_complete_operand(tokens, context_end) == Some(true)
-                || Self::cursor_follows_complete_operand(statement_tokens, statement_context_end)
-                    == Some(true))
-        {
-            return vec!["NOT".to_string()];
         }
         if let Some(candidates) = Self::expected_negated_predicate_operator_keyword_candidates(
             tokens,
@@ -47997,6 +48064,32 @@ impl SqlEditorWidget {
                 tokens,
                 context_end,
             ) {
+                if !result
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(&keyword))
+                {
+                    result.push(keyword);
+                }
+            }
+        }
+        if let Some(candidates) =
+            Self::expected_table_alias_as_keyword_candidates(tokens, context_end, deep_ctx.phase)
+                .or_else(|| {
+                    Self::expected_table_alias_as_keyword_candidates(
+                        statement_tokens,
+                        statement_context_end,
+                        deep_ctx.phase,
+                    )
+                })
+                .or_else(|| {
+                    Self::expected_table_alias_as_keyword_candidates(
+                        full_statement_tokens,
+                        full_statement_context_end,
+                        deep_ctx.phase,
+                    )
+                })
+        {
+            for keyword in Self::filter_expected_candidates(prefix, candidates) {
                 if !result
                     .iter()
                     .any(|existing| existing.eq_ignore_ascii_case(&keyword))
@@ -48491,6 +48584,22 @@ impl SqlEditorWidget {
                 Self::expected_oracle_explain_plan_object_suggestion_kind(tokens, context_end)
             {
                 return Some(kind);
+            }
+            if let Some(identifier_idx) =
+                Self::current_identifier_extending_prefix_index(tokens, context_end, prefix)
+            {
+                let show_errors_words = Self::meaningful_tokens_before(tokens, identifier_idx)
+                    .into_iter()
+                    .filter_map(|token| match token {
+                        SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                        SqlToken::Symbol(_) | SqlToken::String(_) | SqlToken::Comment(_) => None,
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(kind) =
+                    Self::expected_oracle_show_errors_object_suggestion_kind(&show_errors_words)
+                {
+                    return Some(kind);
+                }
             }
             if let Some(kind) = Self::expected_create_context_package_object_suggestion_kind(&words)
             {

@@ -139,7 +139,7 @@ CREATE OR REPLACE PACKAGE BODY fmt_pkg_extreme AS
     FUNCTION calc_score (p_qty IN NUMBER, p_price IN NUMBER, p_status IN VARCHAR2, p_depth IN PLS_INTEGER DEFAULT 0) RETURN NUMBER IS
         l_score NUMBER := 0;
         l_multiplier NUMBER := 1;
-        l_status [[t_status]] := UPPER (TRIM (NVL (p_status, 'NEW')));
+        l_status t_status := UPPER (TRIM (NVL (p_status, 'NEW')));
         FUNCTION base_score (p_qty_inner IN NUMBER, p_price_inner IN NUMBER) RETURN NUMBER IS
             l_base NUMBER := 0;
         BEGIN
@@ -229,7 +229,7 @@ CREATE OR REPLACE PACKAGE BODY fmt_pkg_extreme AS
             CONNECT BY PRIOR id = parent_id
             ORDER SIBLINGS BY id
         ) LOOP
-            push ('[' || r.[[lvl]] || '] ' || 'ID=' || r.id || ', PARENT=' || NVL (TO_CHAR (r.parent_id), 'NULL') || ', CODE=' || r.tree_code || ', QTY=' || NVL (TO_CHAR (r.qty), 'NULL') || ', PRICE=' || NVL (TO_CHAR (r.price, 'FM9999990.00'), 'NULL') || ', STATUS=' || NVL (r.status, 'NULL') || ', BAND=' ||
+            push ('[' || r.lvl || '] ' || 'ID=' || r.id || ', PARENT=' || NVL (TO_CHAR (r.parent_id), 'NULL') || ', CODE=' || r.tree_code || ', QTY=' || NVL (TO_CHAR (r.qty), 'NULL') || ', PRICE=' || NVL (TO_CHAR (r.price, 'FM9999990.00'), 'NULL') || ', STATUS=' || NVL (r.status, 'NULL') || ', BAND=' ||
             CASE
                         WHEN NVL (r.price, 0) >= 50 THEN
                     'HIGH'
@@ -261,7 +261,7 @@ CREATE OR REPLACE PACKAGE BODY fmt_pkg_extreme AS
             note,
             LEVEL AS lvl
         FROM fmtx_unit
-        START WITH id = [[cp_root_id]]
+        START WITH id = cp_root_id
         CONNECT BY PRIOR id = parent_id
         ORDER SIBLINGS BY id;
         TYPE t_units_tab IS TABLE OF c_units%ROWTYPE INDEX BY PLS_INTEGER;
@@ -571,13 +571,10 @@ ORDER BY audit_id;
 -- db: Oracle
 -- metadata: test Oracle inferred catalog + Oracle built-ins
 -- checked: 947
--- missing: 8
+-- missing: 5
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens:
---   142:18 word=t_status prefix=t_st suggestions=[] total=0 line=l_status t_status := UPPER (TRIM (NVL (p_status, 'NEW')));
---   232:28 word=lvl prefix=lv suggestions=[log_level] total=1 line=push ('[' || r.lvl || '] ' || 'ID=' || r.id || ', PARENT=' || NVL (TO_CHAR (r.parent_id), 'NULL') || ', CODE=' || r.tree_code || ', QTY=' || NVL (TO_CHAR (r.qty), 'NULL') || ', PRICE=' || NVL (TO_CHAR (r.price, 'FM9999990.00'), 'NULL') || ', STATUS=' || NVL (r.status, 'NULL') || ', BAND=' ||
 --   254:25 word=cp_root_id prefix=cp_r suggestions=[] total=0 line=CURSOR c_units (cp_root_id NUMBER) IS
---   264:25 word=cp_root_id prefix=cp_r suggestions=[] total=0 line=START WITH id = cp_root_id
 --   287:18 word=decorate_note prefix=deco suggestions=[deco, DECODE, DECOMPOSE(), dept_code, direct_report_cnt] total=5 line=FUNCTION decorate_note (p_old IN VARCHAR2, p_score IN NUMBER, p_seq IN PLS_INTEGER) RETURN VARCHAR2 IS
 --   300:19 word=apply_one prefix=appl suggestions=[appl, APPLY] total=2 line=PROCEDURE apply_one (p_row IN c_units%ROWTYPE, p_pos IN PLS_INTEGER) IS
 --   304:23 word=sp_apply_one prefix=sp_a suggestions=[qt_split_tab] total=1 line=SAVEPOINT sp_apply_one;

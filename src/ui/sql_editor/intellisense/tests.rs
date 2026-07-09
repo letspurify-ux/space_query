@@ -12105,12 +12105,21 @@ fn plsql_outer_cursor_for_loop_record_member_suggestions_cover_split_statement_w
     assert_ne!(marked, script, "test setup should replace cursor FOR loop member");
     let cursor = marked.find("__CODEX_CURSOR__").expect("cursor marker");
     let sql = marked.replacen("__CODEX_CURSOR__", "", 1);
+    let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
     let before = sql.get(..cursor).unwrap_or(&sql);
+    let suffix = before
+        .get(before.len().saturating_sub(40)..)
+        .unwrap_or(before);
+    assert_eq!(
+        SqlEditorWidget::qualifier_before_prefix_at_text_end(before, &prefix).as_deref(),
+        Some("r"),
+        "prefix={prefix:?} suffix={suffix:?}"
+    );
 
     let suggestions = SqlEditorWidget::plsql_outer_cursor_for_loop_record_member_suggestions_from_text(
         before,
         "r",
-        "lv",
+        &prefix,
         Some(crate::db::DatabaseType::Oracle),
     )
     .expect("outer cursor FOR loop record should resolve");
@@ -47116,13 +47125,17 @@ fn query_completion_suggestions_with_data(
             &analysis,
         )
     });
+    let text_before_cursor = sql.get(..cursor).unwrap_or(&sql);
+    let outer_cursor_for_loop_qualifier = qualifier.clone().or_else(|| {
+        SqlEditorWidget::qualifier_before_prefix_at_text_end(text_before_cursor, &prefix)
+    });
     let outer_cursor_for_loop_record_member_suggestions = if local_record_member_suggestions
         .as_ref()
         .is_none_or(Vec::is_empty)
     {
-        qualifier.as_deref().and_then(|qualifier| {
+        outer_cursor_for_loop_qualifier.as_deref().and_then(|qualifier| {
             SqlEditorWidget::plsql_outer_cursor_for_loop_record_member_suggestions_from_text(
-                sql.get(..cursor).unwrap_or(&sql),
+                text_before_cursor,
                 qualifier,
                 &prefix,
                 Some(db_type),
@@ -83952,6 +83965,16 @@ fn oracle_test1_to_test11_actual_completion_regressions() {
                 "oqt_syn.p_over('via synonym call');",
                 "oqt_syn.p_ov|er('via synonym call');",
                 "p_over",
+            ),
+            (
+                "SHOW ERRORS PACKAGE oqt_pkg;",
+                "SHOW ERRORS PACKAGE oqt_|pkg;",
+                "oqt_pkg",
+            ),
+            (
+                "SHOW ERRORS PACKAGE BODY oqt_pkg;",
+                "SHOW ERRORS PACKAGE BODY oqt_|pkg;",
+                "oqt_pkg",
             ),
         ],
     );
