@@ -5978,7 +5978,7 @@ impl MainWindow {
         if db_type.scope_values_match(Some(update_scope), Some(current_scope)) {
             return true;
         }
-        if !matches!(db_type, DatabaseType::MySQL | DatabaseType::MariaDB) {
+        if !db_type.is_mysql_or_mariadb() {
             return false;
         }
         let update_scope = update_scope.trim();

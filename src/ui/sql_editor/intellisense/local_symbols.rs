@@ -1035,9 +1035,28 @@ impl SqlEditorWidget {
             }
         }
         let mut scoped_suggestions = vec![Vec::new(); scope_chain.len()];
+        let allow_type_symbols = Self::data_type_position_for_context_for_db(
+            analysis.context.as_ref(),
+            !prefix.is_empty(),
+            db_type,
+        )
+        .is_some()
+            || (!crate::sql_text::mysql_compatibility_for_sql("", db_type)
+                && Self::cursor_is_in_plsql_declaration_region(
+                    analysis.context.statement_tokens.as_ref(),
+                    analysis.context.cursor_token_len,
+                )
+                && !Self::cursor_is_at_plsql_declaration_start(
+                    analysis.context.statement_tokens.as_ref(),
+                    analysis.context.cursor_token_len,
+                    db_type,
+                ));
 
         for symbol in analysis.local_symbols.iter() {
-            if !symbol.suggest_name || symbol.declared_at > cursor_in_statement {
+            if !symbol.suggest_name
+                || (symbol.is_type_symbol && !allow_type_symbols)
+                || symbol.declared_at > cursor_in_statement
+            {
                 continue;
             }
             let Some(scope_rank) = scope_rank_by_id
@@ -1059,6 +1078,24 @@ impl SqlEditorWidget {
                     suggestions.push(name);
                 }
             }
+        }
+        if !prefix.is_empty()
+            && !crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            && matches!(
+                analysis.context.phase,
+                crate::ui::sql_editor::intellisense::intellisense_context::SqlPhase::Initial
+            )
+            && Self::cursor_in_plsql_executable_block_for_context(
+                analysis.context.as_ref(),
+                !prefix.is_empty(),
+                db_type,
+            )
+            && crate::ui::intellisense::suggestion_matches_completion_prefix("IF", prefix)
+            && !suggestions
+                .iter()
+                .any(|suggestion| suggestion.eq_ignore_ascii_case("IF"))
+        {
+            suggestions.insert(0, "IF".to_string());
         }
 
         // At an exception-name slot, drop every non-exception symbol and stop — a bind

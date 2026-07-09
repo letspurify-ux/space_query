@@ -1672,6 +1672,15 @@ fn mysql_data_type_keywords(position: DataTypePosition) -> &'static [&'static st
     }
 }
 
+fn completion_db_type_is_mariadb(db_type: Option<crate::db::DatabaseType>) -> bool {
+    match db_type {
+        Some(crate::db::DatabaseType::Oracle) => false,
+        Some(crate::db::DatabaseType::MySQL) => false,
+        Some(crate::db::DatabaseType::MariaDB) => true,
+        None => false,
+    }
+}
+
 impl SqlEditorWidget {
     const ORACLE_PIVOT_AGGREGATE_FUNCTIONS: &'static [&'static str] = &[
         "ANY_VALUE()",
@@ -3515,7 +3524,20 @@ impl SqlEditorWidget {
         } else {
             Vec::new()
         };
-        if at_table_alias_name_slot {
+        if early_expected_keyword_suggestions
+            .iter()
+            .any(|keyword| keyword.eq_ignore_ascii_case("TRANSACTION"))
+            && !expected_keyword_suggestions
+                .iter()
+                .any(|keyword| keyword.eq_ignore_ascii_case("TRANSACTION"))
+        {
+            expected_keyword_suggestions.insert(0, "TRANSACTION".to_string());
+        }
+        if at_table_alias_name_slot
+            && !expected_keyword_suggestions
+                .iter()
+                .any(|keyword| keyword.eq_ignore_ascii_case("TRANSACTION"))
+        {
             expected_keyword_suggestions.retain(|keyword| keyword.eq_ignore_ascii_case("OF"));
         }
         let current_query_tokens = Self::current_query_tokens(deep_ctx);
@@ -3785,6 +3807,15 @@ impl SqlEditorWidget {
             }
         } else if let Some(suggestions) = mysql_delete_target_list_suggestions.clone() {
             suggestions
+        } else if at_column_target_list && !column_tables.is_empty() {
+            let mut data = intellisense_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Self::scoped_column_suggestions(
+                &mut data,
+                &snapshot.prefix,
+                Some(column_tables.as_slice()),
+            )
         } else if replace_table_context_with_expected_objects {
             expected_object_suggestions.clone()
         } else if let Some(suggestions) = create_table_declared_column_suggestions.clone() {
@@ -4019,6 +4050,10 @@ impl SqlEditorWidget {
         );
         let oracle_qualifier_head_suggestions = if qualifier.is_none()
             && !crate::sql_text::mysql_compatibility_for_sql("", Some(snapshot.preferred_db_type))
+            && !matches!(
+                expected_object_kind,
+                Some(ExpectedObjectSuggestionKind::Sequence)
+            )
             && (Self::text_after_cursor_starts_with_qualifier_dot(&snapshot.text_after_cursor)
                 || Self::cursor_prefix_is_followed_by_qualifier_dot_for_context(
                     deep_ctx,
@@ -4474,6 +4509,7 @@ impl SqlEditorWidget {
                 SqlContext::VariableName | SqlContext::BindValue | SqlContext::GeneratedName
             )
             && expr_keyword_ctx.follows_operand != Some(true)
+            && expr_keyword_ctx.statement_start.is_none()
             && base_catalog_suggestions
             && !at_keyword_only
             && !at_value_only_no_expected_keyword_slot
@@ -4662,13 +4698,15 @@ impl SqlEditorWidget {
                     db_type,
                 )
             });
-            for keyword in ["STORE", "WHENEVER"] {
-                if crate::ui::intellisense::suggestion_matches_completion_prefix(keyword, prefix)
-                    && suggestions
-                        .iter()
-                        .all(|suggestion| !suggestion.eq_ignore_ascii_case(keyword))
-                {
-                    suggestions.push(keyword.to_string());
+            if !crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+                for keyword in ["STORE", "WHENEVER"] {
+                    if crate::ui::intellisense::suggestion_matches_completion_prefix(keyword, prefix)
+                        && suggestions
+                            .iter()
+                            .all(|suggestion| !suggestion.eq_ignore_ascii_case(keyword))
+                    {
+                        suggestions.push(keyword.to_string());
+                    }
                 }
             }
             return suggestions;
@@ -5029,7 +5067,6 @@ impl SqlEditorWidget {
                         | "EXCEPTION"
                         | "EXIT"
                         | "FIRST"
-                        | "FOR"
                         | "FROM"
                         | "GROUP"
                         | "HAVING"
@@ -5060,13 +5097,13 @@ impl SqlEditorWidget {
                         | "RETURNING"
                         | "ROW"
                         | "ROWS"
-                        | "SELECT"
                         | "SET"
                         | "SQL"
                         | "STATEMENT"
                         | "USING"
                         | "SYSTIMESTAMP"
                         | "TABLE"
+                        | "TRANSACTION"
                         | "UPDATE"
                         | "UPDATING"
                         | "VALUES"
@@ -5101,6 +5138,32 @@ impl SqlEditorWidget {
         if prefix.is_empty() {
             return None;
         }
+        if Self::cursor_is_at_plsql_declaration_object_name_slot_for_context(
+            deep_ctx, true, db_type,
+        ) || Self::cursor_is_at_plsql_routine_parameter_name_slot_for_context(
+            deep_ctx, true, db_type,
+        ) || {
+            let tokens = Self::current_query_tokens(deep_ctx);
+            let end = Self::expected_suggestion_context_end(
+                tokens,
+                Self::cursor_token_len_in_current_query(deep_ctx),
+                true,
+            );
+            Self::cursor_is_at_plsql_declaration_start(tokens, end, db_type)
+        } {
+            return None;
+        }
+        if Self::cursor_is_after_completed_grant_revoke_grantee_tail_for_context(
+            deep_ctx, true, db_type,
+        ) {
+            return None;
+        }
+        if !prefix.is_empty()
+            && Self::plsql_statement_start_allows_bare_calls(expr_keyword_ctx)
+            && crate::ui::intellisense::suggestion_matches_completion_prefix("IF", prefix)
+        {
+            return Some("IF".to_string());
+        }
 
         if let Some(position) = Self::extract_field_position_for_context(deep_ctx, true) {
             let candidates = match position {
@@ -5118,6 +5181,27 @@ impl SqlEditorWidget {
             Self::structural_keyword_prefix_fallback(prefix, deep_ctx, db_type, expr_keyword_ctx)
         {
             return Some(keyword);
+        }
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            Self::cursor_token_len_in_current_query(deep_ctx),
+            true,
+        );
+        let statement_tokens = deep_ctx.statement_tokens.as_ref();
+        let statement_end =
+            Self::expected_suggestion_context_end(statement_tokens, deep_ctx.cursor_token_len, true);
+        if Self::expected_transaction_and_dcl_keyword_candidates(tokens, end, db_type)
+            .or_else(|| {
+                Self::expected_transaction_and_dcl_keyword_candidates(
+                    statement_tokens,
+                    statement_end,
+                    db_type,
+                )
+            })
+            .is_some_and(|candidates| candidates.is_empty())
+        {
+            return None;
         }
         if let Some(keyword) = Self::context_expected_keyword_before_current_identifier(
             prefix,
@@ -5162,8 +5246,13 @@ impl SqlEditorWidget {
             return Some("ELSE".to_string());
         }
         if matches_prefix("END")
-            && (Self::cursor_is_inside_mysql_routine_body_for_context(deep_ctx, db_type)
-                || !crate::sql_text::mysql_compatibility_for_sql("", db_type))
+            && (expr_keyword_ctx
+                .construct_continuation_keywords
+                .iter()
+                .any(|keyword| keyword.eq_ignore_ascii_case("END"))
+                || Self::cursor_is_inside_mysql_routine_body_for_context(deep_ctx, db_type)
+                || (!crate::sql_text::mysql_compatibility_for_sql("", db_type)
+                    && expr_keyword_ctx.in_plsql_value_expression))
         {
             return Some("END".to_string());
         }
@@ -5663,6 +5752,8 @@ impl SqlEditorWidget {
                 .iter()
                 .any(|suggestion| suggestion.eq_ignore_ascii_case(&upper))
         };
+        let direct_query_tokens = Self::current_query_tokens(&before_ctx);
+        let direct_query_end = Self::cursor_token_len_in_current_query(&before_ctx);
         if Self::expected_dml_target_keyword_candidates(
             direct_tokens,
             direct_end,
@@ -5704,6 +5795,11 @@ impl SqlEditorWidget {
         if matches_exact(Self::expected_query_clause_continuation_keywords(
             direct_tokens,
             direct_end,
+            before_ctx.phase,
+            db_type,
+        )) || matches_exact(Self::expected_query_clause_continuation_keywords(
+            direct_query_tokens,
+            direct_query_end,
             before_ctx.phase,
             db_type,
         )) || matches_exact(
@@ -9554,18 +9650,19 @@ impl SqlEditorWidget {
         start_idx: usize,
     ) -> Option<(String, usize)> {
         let mut idx = start_idx;
+        let mut parts = Vec::new();
         loop {
             match tokens.get(idx) {
                 Some(SqlToken::Word(word)) => {
-                    let relation_name = word.clone();
+                    parts.push(word.clone());
                     let Some(dot_idx) = Self::next_non_comment_token_index(tokens, idx + 1) else {
-                        return Some((relation_name, idx + 1));
+                        return Some((parts.join("."), idx + 1));
                     };
                     if matches!(tokens.get(dot_idx), Some(SqlToken::Symbol(sym)) if sym == ".") {
                         idx = Self::next_non_comment_token_index(tokens, dot_idx + 1)?;
                         continue;
                     }
-                    return Some((relation_name, dot_idx));
+                    return Some((parts.join("."), dot_idx));
                 }
                 _ => return None,
             }
@@ -11597,7 +11694,7 @@ impl SqlEditorWidget {
             return true;
         }
 
-        if !matches!(db_type, Some(crate::db::DatabaseType::MariaDB))
+        if !completion_db_type_is_mariadb(db_type)
             && Self::is_mysql_oracle_only_sequence_value_slot(&words)
         {
             return true;
@@ -19772,6 +19869,7 @@ impl SqlEditorWidget {
         tokens: &[SqlToken],
         end: usize,
         db_type: Option<crate::db::DatabaseType>,
+        allow_table_introducer: bool,
     ) -> Option<&'static [&'static str]> {
         const SUBQUERY_START_KEYWORDS: &[&str] = &["SELECT", "WITH"];
         let meaningful: Vec<(usize, &SqlToken)> = tokens
@@ -19806,6 +19904,43 @@ impl SqlEditorWidget {
         }
 
         let upper = word.to_ascii_uppercase();
+        let prev_before_introducer = open_pos
+            .checked_sub(2)
+            .and_then(|pos| meaningful.get(pos))
+            .map(|(_, token)| *token);
+        let prev_prev_before_introducer = open_pos
+            .checked_sub(3)
+            .and_then(|pos| meaningful.get(pos))
+            .map(|(_, token)| *token);
+        let prev_prev_is_select = matches!(
+            prev_prev_before_introducer,
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("SELECT")
+        );
+        let introducer_starts_select_item = prev_before_introducer.is_none_or(|token| {
+            matches!(
+                token,
+                SqlToken::Word(word)
+                    if matches!(
+                        word.to_ascii_uppercase().as_str(),
+                        "SELECT" | "THEN" | "ELSE" | "WHEN" | "AND" | "OR" | "NOT" | "BY"
+                            | "WHERE" | "HAVING"
+                    )
+            )
+                || matches!(
+                    token,
+                    SqlToken::Symbol(sym)
+                        if matches!(
+                            sym.as_str(),
+                            "," | "+" | "-" | "/" | "%" | "||" | "=" | "<" | ">"
+                        ) || (sym == "*" && !prev_prev_is_select)
+                )
+        });
+        let table_introducer_position = !introducer_starts_select_item
+            && (allow_table_introducer
+                || !Self::cursor_is_before_current_query_from_clause(tokens, introducer_idx + 1));
+        if table_introducer_position && matches!(upper.as_str(), "JOIN" | "FROM") {
+            return Some(SUBQUERY_START_KEYWORDS);
+        }
         if upper == "EXISTS" {
             return Some(SUBQUERY_START_KEYWORDS);
         }
@@ -19839,7 +19974,12 @@ impl SqlEditorWidget {
             cursor_token_len,
             exclude_current_identifier_chain,
         );
-        Self::expected_subquery_start_keyword_candidates(tokens, end, db_type)
+        Self::expected_subquery_start_keyword_candidates(
+            tokens,
+            end,
+            db_type,
+            deep_ctx.phase.is_table_context(),
+        )
     }
 
     /// True when a table-source construct keyword has been written in a `FROM`
@@ -20581,6 +20721,21 @@ impl SqlEditorWidget {
         }
         if matches!(words.as_slice(), [import, table, from, ..] if import == "IMPORT" && table == "TABLE" && from == "FROM")
         {
+            return true;
+        }
+        if matches!(
+            words.as_slice(),
+            [alter_or_drop, object_type]
+                if matches!(alter_or_drop.as_str(), "ALTER" | "DROP")
+                    && matches!(object_type.as_str(), "DATABASE" | "SCHEMA")
+        ) || matches!(
+            words.as_slice(),
+            [drop, object_type, if_kw, exists]
+                if drop == "DROP"
+                    && matches!(object_type.as_str(), "DATABASE" | "SCHEMA")
+                    && if_kw == "IF"
+                    && exists == "EXISTS"
+        ) {
             return true;
         }
         if Self::mysql_select_into_file_value_non_catalog_slot(&words) {
@@ -26899,7 +27054,7 @@ impl SqlEditorWidget {
         db_type: Option<crate::db::DatabaseType>,
     ) -> Option<Vec<&'static str>> {
         let mysql_compatible = crate::sql_text::mysql_compatibility_for_sql("", db_type);
-        let mariadb_sequence = matches!(db_type, Some(crate::db::DatabaseType::MariaDB));
+        let mariadb_sequence = completion_db_type_is_mariadb(db_type);
         if mysql_compatible && !mariadb_sequence {
             return None;
         }
@@ -26991,7 +27146,7 @@ impl SqlEditorWidget {
                             "MINVALUE" => "NO MINVALUE",
                             "MAXVALUE" => "NO MAXVALUE",
                             "CYCLE" => "NO CYCLE",
-                            _ => unreachable!(),
+                            _ => return None,
                         };
                         if !supported_options.contains(&canonical) {
                             return None;
@@ -27306,6 +27461,13 @@ impl SqlEditorWidget {
         exclude_current_identifier_chain: bool,
         db_type: Option<crate::db::DatabaseType>,
     ) -> bool {
+        if Self::cursor_is_after_completed_grant_revoke_grantee_tail_for_context(
+            deep_ctx,
+            exclude_current_identifier_chain,
+            db_type,
+        ) {
+            return true;
+        }
         let tokens = Self::current_query_tokens(deep_ctx);
         let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
         let end = Self::expected_suggestion_context_end(
@@ -27338,6 +27500,53 @@ impl SqlEditorWidget {
         Self::expected_transaction_and_dcl_keyword_candidates(tokens, end, db_type).is_some()
     }
 
+    fn cursor_is_after_completed_grant_revoke_grantee_tail_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        _db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        let check = |tokens: &[SqlToken], end: usize| {
+            if matches!(
+                Self::meaningful_tokens_before(tokens, end).last(),
+                Some(SqlToken::Symbol(symbol)) if symbol == ","
+            ) {
+                return false;
+            }
+            let words = Self::previous_meaningful_words_upper(tokens, end, 32);
+            let Some(first) = words.first().map(String::as_str) else {
+                return false;
+            };
+            let separator = match first {
+                "GRANT" => "TO",
+                "REVOKE" => "FROM",
+                _ => return false,
+            };
+            let Some(separator_idx) = words.iter().rposition(|word| word == separator) else {
+                return false;
+            };
+            words.len() > separator_idx + 1
+                && !matches!(words.last().map(String::as_str), Some("TO" | "FROM"))
+        };
+
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            Self::cursor_token_len_in_current_query(deep_ctx),
+            exclude_current_identifier_chain,
+        );
+        if check(tokens, end) {
+            return true;
+        }
+
+        let statement_tokens = deep_ctx.statement_tokens.as_ref();
+        let statement_end = Self::expected_suggestion_context_end(
+            statement_tokens,
+            deep_ctx.cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        check(statement_tokens, statement_end)
+    }
+
     /// Transaction/lock statements also contain identifier-looking value slots
     /// that are not schema-object names: savepoint names, transaction names,
     /// commit comments/transaction ids, Oracle lock wait seconds, and MySQL
@@ -27349,15 +27558,22 @@ impl SqlEditorWidget {
         exclude_current_identifier_chain: bool,
         db_type: Option<crate::db::DatabaseType>,
     ) -> bool {
-        let tokens = Self::current_query_tokens(deep_ctx);
+        let mut tokens = Self::current_query_tokens(deep_ctx);
         let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
-        let end = Self::expected_suggestion_context_end(
+        let mut end = Self::expected_suggestion_context_end(
             tokens,
             cursor_token_len,
             exclude_current_identifier_chain,
         );
-        let words = Self::words_for_keyword_slot(tokens, end);
         let mysql = crate::sql_text::mysql_compatibility_for_sql("", db_type);
+        if !mysql && Self::cursor_in_plsql_executable_block(tokens, end) {
+            let start = Self::plsql_statement_slot_start(tokens, end);
+            if start > 0 {
+                tokens = tokens.get(start..).unwrap_or(&[]);
+                end = end.saturating_sub(start);
+            }
+        }
+        let words = Self::words_for_keyword_slot(tokens, end);
         let first = words.first().map(String::as_str);
         let last = words.last().map(String::as_str);
         let has = |keyword: &str| words.iter().any(|word| word == keyword);
@@ -28277,7 +28493,7 @@ impl SqlEditorWidget {
         {
             return true;
         }
-        if matches!(db_type, Some(crate::db::DatabaseType::MariaDB))
+        if completion_db_type_is_mariadb(db_type)
             && matches!(words.first().map(String::as_str), Some("CREATE"))
             && words.iter().any(|word| word == "PACKAGE")
         {
@@ -31533,6 +31749,9 @@ impl SqlEditorWidget {
             && words.last().is_some_and(|word| word != "ON")
         {
             return Some(&["FROM"]);
+        }
+        if words.first().is_some_and(|word| word == "REVOKE") && contains("FROM") {
+            return Some(&[]);
         }
 
         match words.as_slice() {
@@ -35846,7 +36065,7 @@ impl SqlEditorWidget {
             ]);
         }
         if first == "CREATE" && has("INDEX") {
-            let mariadb = matches!(db_type, Some(crate::db::DatabaseType::MariaDB));
+            let mariadb = completion_db_type_is_mariadb(db_type);
             let index_name_idx = words
                 .iter()
                 .position(|word| word == "INDEX")
@@ -35969,7 +36188,7 @@ impl SqlEditorWidget {
             });
         }
         if first == "DROP" && has("INDEX") {
-            let mariadb = matches!(db_type, Some(crate::db::DatabaseType::MariaDB));
+            let mariadb = completion_db_type_is_mariadb(db_type);
             let index_name_idx = words
                 .iter()
                 .position(|word| word == "INDEX")
@@ -36207,7 +36426,7 @@ impl SqlEditorWidget {
             );
         }
         if first == "CREATE" && has("TRIGGER") {
-            let mariadb = matches!(db_type, Some(crate::db::DatabaseType::MariaDB));
+            let mariadb = completion_db_type_is_mariadb(db_type);
             let trigger_name_idx = words
                 .iter()
                 .position(|word| word == "TRIGGER")
@@ -40260,7 +40479,7 @@ impl SqlEditorWidget {
         end: usize,
         db_type: Option<crate::db::DatabaseType>,
     ) -> Option<&'static [&'static str]> {
-        if !matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) {
+        if !completion_db_type_is_mariadb(db_type) {
             return None;
         }
 
@@ -40400,7 +40619,7 @@ impl SqlEditorWidget {
         words: &[String],
         db_type: Option<crate::db::DatabaseType>,
     ) -> Option<&'static [&'static str]> {
-        if !matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) {
+        if !completion_db_type_is_mariadb(db_type) {
             return None;
         }
         if Self::meaningful_tokens_before(tokens, end)
@@ -41266,7 +41485,7 @@ impl SqlEditorWidget {
             .collect();
         let expected_spatial_reference_system_candidates =
             |items: &[String]| -> Option<&'static [&'static str]> {
-                if matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) {
+                if completion_db_type_is_mariadb(db_type) {
                     return None;
                 }
                 let verb = items.first().map(String::as_str)?;
@@ -41430,7 +41649,7 @@ impl SqlEditorWidget {
                     idx += 2;
                     create_or_replace = true;
                     if idx == words.len() {
-                        if matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) {
+                        if completion_db_type_is_mariadb(db_type) {
                             return Some(MARIADB_VIEW_PREFIX_AFTER_REPLACE);
                         }
                         return Some(MYSQL_VIEW_PREFIX_AFTER_REPLACE);
@@ -41458,12 +41677,12 @@ impl SqlEditorWidget {
                     if idx == words.len() {
                         if verb == "CREATE" {
                             if create_or_replace {
-                                if matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) {
+                                if completion_db_type_is_mariadb(db_type) {
                                     return Some(MARIADB_CREATE_OR_REPLACE_AFTER_DEFINER_KEYWORDS);
                                 }
                                 return Some(MYSQL_CREATE_OR_REPLACE_AFTER_DEFINER_KEYWORDS);
                             }
-                            if matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) {
+                            if completion_db_type_is_mariadb(db_type) {
                                 return Some(MARIADB_CREATE_AFTER_DEFINER_KEYWORDS);
                             }
                             return Some(MYSQL_CREATE_AFTER_DEFINER_KEYWORDS);
@@ -41504,7 +41723,7 @@ impl SqlEditorWidget {
 
         let expected_mariadb_package_candidates =
             |words: &[String]| -> Option<&'static [&'static str]> {
-                if !matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) {
+                if !completion_db_type_is_mariadb(db_type) {
                     return None;
                 }
                 let create_pos = words.iter().rposition(|word| word == "CREATE")?;
@@ -41598,7 +41817,7 @@ impl SqlEditorWidget {
 
         let expected_create_trigger_candidates =
             |words: &[String]| -> Option<&'static [&'static str]> {
-                let mariadb = matches!(db_type, Some(crate::db::DatabaseType::MariaDB));
+                let mariadb = completion_db_type_is_mariadb(db_type);
                 let create_pos = words.iter().rposition(|word| word == "CREATE")?;
                 let mut idx = create_pos + 1;
                 if idx >= words.len() {
@@ -41606,7 +41825,7 @@ impl SqlEditorWidget {
                 }
 
                 if words.get(idx).map(String::as_str) == Some("OR") {
-                    if !matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) {
+                    if !completion_db_type_is_mariadb(db_type) {
                         return None;
                     }
                     if words.get(idx + 1).map(String::as_str) != Some("REPLACE") {
@@ -41874,7 +42093,7 @@ impl SqlEditorWidget {
                 }
 
                 if verb == "CREATE" && words.get(idx).map(String::as_str) == Some("OR") {
-                    if !matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) {
+                    if !completion_db_type_is_mariadb(db_type) {
                         return None;
                     }
                     if words.get(idx + 1).map(String::as_str) != Some("REPLACE") {
@@ -42191,7 +42410,7 @@ impl SqlEditorWidget {
             }
 
             if verb == "CREATE" && words.get(idx).map(String::as_str) == Some("OR") {
-                if !matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) {
+                if !completion_db_type_is_mariadb(db_type) {
                     return None;
                 }
                 if words.get(idx + 1).map(String::as_str) != Some("REPLACE") {
@@ -43978,7 +44197,7 @@ impl SqlEditorWidget {
         // heads the current statement (`CREATE/ALTER/DROP |`, also after a `;`),
         // never as a trailing sub-clause (`ALTER TABLE t DROP |`).
         if Self::cursor_at_statement_head_verb(tokens, end, "CREATE") {
-            return if matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) {
+            return if completion_db_type_is_mariadb(db_type) {
                 Some(MARIADB_CREATE_OBJECT_TYPE_KEYWORDS)
             } else {
                 Some(MYSQL_CREATE_OBJECT_TYPE_KEYWORDS)
@@ -43997,7 +44216,7 @@ impl SqlEditorWidget {
             return Some(candidates);
         }
 
-        let mariadb = matches!(db_type, Some(crate::db::DatabaseType::MariaDB));
+        let mariadb = completion_db_type_is_mariadb(db_type);
         let create_index_modifier = |word: &str| {
             MYSQL_CREATE_INDEX_MODIFIERS.contains(&word)
                 || (mariadb && matches!(word, "VECTOR"))
@@ -44033,7 +44252,7 @@ impl SqlEditorWidget {
             [.., a, b]
                 if *a == "CREATE"
                     && *b == "SEQUENCE"
-                    && matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) =>
+                    && completion_db_type_is_mariadb(db_type) =>
             {
                 Some(&["IF"])
             }
@@ -44041,7 +44260,7 @@ impl SqlEditorWidget {
                 if *a == "CREATE"
                     && *b == "SEQUENCE"
                     && *c == "IF"
-                    && matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) =>
+                    && completion_db_type_is_mariadb(db_type) =>
             {
                 Some(&["NOT"])
             }
@@ -44050,7 +44269,7 @@ impl SqlEditorWidget {
                     && *b == "SEQUENCE"
                     && *c == "IF"
                     && *d == "NOT"
-                    && matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) =>
+                    && completion_db_type_is_mariadb(db_type) =>
             {
                 Some(&["EXISTS"])
             }
@@ -44058,7 +44277,7 @@ impl SqlEditorWidget {
                 if *a == "CREATE"
                     && *b == "TEMPORARY"
                     && *c == "SEQUENCE"
-                    && matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) =>
+                    && completion_db_type_is_mariadb(db_type) =>
             {
                 Some(&["IF"])
             }
@@ -44067,7 +44286,7 @@ impl SqlEditorWidget {
                     && *b == "TEMPORARY"
                     && *c == "SEQUENCE"
                     && *d == "IF"
-                    && matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) =>
+                    && completion_db_type_is_mariadb(db_type) =>
             {
                 Some(&["NOT"])
             }
@@ -44077,7 +44296,7 @@ impl SqlEditorWidget {
                     && *c == "SEQUENCE"
                     && *d == "IF"
                     && *e == "NOT"
-                    && matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) =>
+                    && completion_db_type_is_mariadb(db_type) =>
             {
                 Some(&["EXISTS"])
             }
@@ -44116,7 +44335,7 @@ impl SqlEditorWidget {
             }
             [.., a, b] if *a == "CREATE" && create_index_modifier(b.as_str()) => {
                 if *b == "SPATIAL"
-                    && !matches!(db_type, Some(crate::db::DatabaseType::MariaDB))
+                    && !completion_db_type_is_mariadb(db_type)
                 {
                     Some(&["INDEX", "REFERENCE"])
                 } else {
@@ -44127,7 +44346,7 @@ impl SqlEditorWidget {
                 if *a == "CREATE"
                     && *b == "SPATIAL"
                     && *c == "REFERENCE"
-                    && !matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) =>
+                    && !completion_db_type_is_mariadb(db_type) =>
             {
                 Some(&["SYSTEM"])
             }
@@ -44359,7 +44578,7 @@ impl SqlEditorWidget {
             [.., a, b, _plugin] if *a == "INSTALL" && *b == "PLUGIN" => Some(&["SONAME"]),
             [.., prev, last] if *prev == "CREATE" && *last == "OR" => Some(&["REPLACE"]),
             [.., a, b, c] if *a == "CREATE" && *b == "OR" && *c == "REPLACE" => {
-                if matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) {
+                if completion_db_type_is_mariadb(db_type) {
                     Some(MARIADB_CREATE_OR_REPLACE_OBJECT_TYPE_KEYWORDS)
                 } else {
                     Some(MYSQL_CREATE_OR_REPLACE_OBJECT_TYPE_KEYWORDS)
@@ -44370,7 +44589,7 @@ impl SqlEditorWidget {
                     && *b == "OR"
                     && *c == "REPLACE"
                     && *d == "SPATIAL"
-                    && !matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) =>
+                    && !completion_db_type_is_mariadb(db_type) =>
             {
                 Some(&["REFERENCE"])
             }
@@ -44380,7 +44599,7 @@ impl SqlEditorWidget {
                     && *c == "REPLACE"
                     && *d == "SPATIAL"
                     && *e == "REFERENCE"
-                    && !matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) =>
+                    && !completion_db_type_is_mariadb(db_type) =>
             {
                 Some(&["SYSTEM"])
             }
@@ -44389,7 +44608,7 @@ impl SqlEditorWidget {
                     && *b == "OR"
                     && *c == "REPLACE"
                     && create_index_modifier(d.as_str())
-                    && matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) =>
+                    && completion_db_type_is_mariadb(db_type) =>
             {
                 Some(&["INDEX"])
             }
@@ -44398,7 +44617,7 @@ impl SqlEditorWidget {
                     && *b == "OR"
                     && *c == "REPLACE"
                     && *d == "TEMPORARY"
-                    && matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) =>
+                    && completion_db_type_is_mariadb(db_type) =>
             {
                 Some(MARIADB_CREATE_TEMPORARY_OBJECT_TYPE_KEYWORDS)
             }
@@ -44408,7 +44627,7 @@ impl SqlEditorWidget {
                     && *c == "REPLACE"
                     && *d == "TEMPORARY"
                     && *e == "SEQUENCE"
-                    && matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) =>
+                    && completion_db_type_is_mariadb(db_type) =>
             {
                 Some(&["IF"])
             }
@@ -44419,7 +44638,7 @@ impl SqlEditorWidget {
                     && *d == "TEMPORARY"
                     && *e == "SEQUENCE"
                     && *f == "IF"
-                    && matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) =>
+                    && completion_db_type_is_mariadb(db_type) =>
             {
                 Some(&["NOT"])
             }
@@ -44431,12 +44650,12 @@ impl SqlEditorWidget {
                     && *e == "SEQUENCE"
                     && *f == "IF"
                     && *g == "NOT"
-                    && matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) =>
+                    && completion_db_type_is_mariadb(db_type) =>
             {
                 Some(&["EXISTS"])
             }
             [.., prev, last] if *prev == "CREATE" && *last == "TEMPORARY" => {
-                if matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) {
+                if completion_db_type_is_mariadb(db_type) {
                     Some(MARIADB_CREATE_TEMPORARY_OBJECT_TYPE_KEYWORDS)
                 } else {
                     Some(MYSQL_CREATE_TEMPORARY_OBJECT_TYPE_KEYWORDS)
@@ -44456,7 +44675,7 @@ impl SqlEditorWidget {
             [.., prev, last]
                 if *prev == "CREATE"
                     && *last == "SPATIAL"
-                    && !matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) =>
+                    && !completion_db_type_is_mariadb(db_type) =>
             {
                 Some(&["REFERENCE"])
             }
@@ -44464,7 +44683,7 @@ impl SqlEditorWidget {
                 if *a == "CREATE"
                     && *b == "SPATIAL"
                     && *c == "REFERENCE"
-                    && !matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) =>
+                    && !completion_db_type_is_mariadb(db_type) =>
             {
                 Some(&["SYSTEM"])
             }
@@ -46561,6 +46780,14 @@ impl SqlEditorWidget {
         let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
         let context_end =
             Self::expected_keyword_suggestion_context_end(tokens, cursor_token_len, prefix);
+        if !prefix.is_empty()
+            && expr_keyword_ctx.is_some_and(|ctx| {
+                ctx.at_plsql_declaration_object_name_slot
+                    || ctx.at_plsql_routine_parameter_name_slot
+            })
+        {
+            return Vec::new();
+        }
         let full_statement_tokens = deep_ctx.statement_tokens.as_ref();
         let in_routine_body_statement =
             Self::current_routine_body_statement_range(deep_ctx).is_some()
@@ -46580,6 +46807,52 @@ impl SqlEditorWidget {
             deep_ctx.cursor_token_len,
             prefix,
         );
+        if !prefix.is_empty()
+            && (Self::cursor_is_at_plsql_declaration_start(tokens, context_end, db_type)
+                || Self::cursor_is_at_plsql_declaration_start(
+                    statement_tokens,
+                    statement_context_end,
+                    db_type,
+                ))
+        {
+            return Vec::new();
+        }
+        if Self::oracle_trigger_update_of_column_slot_context(
+            deep_ctx,
+            !prefix.is_empty(),
+            db_type,
+        )
+        .is_some()
+        {
+            return Vec::new();
+        }
+        if !prefix.is_empty()
+            && crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            && Self::cursor_is_inside_mysql_routine_body_for_context(deep_ctx, db_type)
+        {
+            let mysql_routine_structural = ["WHERE", "WHEN", "ELSE", "JOIN"]
+                .into_iter()
+                .filter(|keyword| {
+                    crate::ui::intellisense::suggestion_matches_completion_prefix(keyword, prefix)
+                })
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if !mysql_routine_structural.is_empty() {
+                return mysql_routine_structural;
+            }
+        }
+        if !prefix.is_empty()
+            && !crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            && matches!(deep_ctx.phase, intellisense_context::SqlPhase::Initial)
+            && Self::cursor_in_plsql_executable_block_for_context(
+                deep_ctx,
+                !prefix.is_empty(),
+                db_type,
+            )
+            && crate::ui::intellisense::suggestion_matches_completion_prefix("IF", prefix)
+        {
+            return vec!["IF".to_string()];
+        }
         if Self::cursor_is_in_invalid_set_operation_branch_for_context(deep_ctx, !prefix.is_empty())
         {
             return Vec::new();
@@ -47430,9 +47703,19 @@ impl SqlEditorWidget {
         {
             return Self::filter_expected_candidates(prefix, candidates);
         }
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            && Self::cursor_is_at_mysql_handler_read_value_slot(tokens, context_end)
+        {
+            return Vec::new();
+        }
 
         if let Some(candidates) =
-            Self::expected_subquery_start_keyword_candidates(tokens, context_end, db_type)
+            Self::expected_subquery_start_keyword_candidates(
+                tokens,
+                context_end,
+                db_type,
+                deep_ctx.phase.is_table_context(),
+            )
         {
             return Self::filter_expected_candidates(prefix, candidates);
         }
@@ -47841,6 +48124,17 @@ impl SqlEditorWidget {
                 return prefix_filtered;
             }
             return filtered;
+        }
+        if Self::cursor_is_at_mysql_statement_value_non_catalog_slot_for_context(
+            deep_ctx,
+            !prefix.is_empty(),
+            db_type,
+        ) || Self::cursor_is_at_mysql_component_plugin_or_handler_value_slot_for_context(
+            deep_ctx,
+            !prefix.is_empty(),
+            db_type,
+        ) {
+            return Vec::new();
         }
         if crate::sql_text::mysql_compatibility_for_sql("", db_type)
             && Self::expected_mysql_role_account_object_suggestion_kind(
@@ -48878,7 +49172,7 @@ impl SqlEditorWidget {
             }
         };
         let oracle_or_mariadb_kind = |kind: ExpectedObjectSuggestionKind| {
-            if !mysql_compatible || matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) {
+            if !mysql_compatible || completion_db_type_is_mariadb(db_type) {
                 kind
             } else {
                 ExpectedObjectSuggestionKind::NoSuggestions
@@ -49253,7 +49547,7 @@ impl SqlEditorWidget {
             [create, object_type]
                 if create == "CREATE"
                     && object_type == "SEQUENCE"
-                    && matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) =>
+                    && completion_db_type_is_mariadb(db_type) =>
             {
                 Some(ExpectedObjectSuggestionKind::Sequence)
             }
@@ -49807,13 +50101,13 @@ impl SqlEditorWidget {
             "PROCEDURE" => Some(ExpectedObjectSuggestionKind::Procedure),
             "TRIGGER" => Some(ExpectedObjectSuggestionKind::Trigger),
             "USER" | "ROLE" => Some(ExpectedObjectSuggestionKind::User),
-            "INDEX" if matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) => {
+            "INDEX" if completion_db_type_is_mariadb(db_type) => {
                 Some(ExpectedObjectSuggestionKind::Index)
             }
-            "SEQUENCE" if matches!(db_type, Some(crate::db::DatabaseType::MariaDB)) => {
+            "SEQUENCE" if completion_db_type_is_mariadb(db_type) => {
                 Some(ExpectedObjectSuggestionKind::Sequence)
             }
-            "DATABASE" | "SCHEMA" => Some(ExpectedObjectSuggestionKind::User),
+            "DATABASE" | "SCHEMA" => Some(ExpectedObjectSuggestionKind::NoSuggestions),
             "SERVER" => Some(ExpectedObjectSuggestionKind::NoSuggestions),
             "PACKAGE" | "TYPE" | "SEQUENCE" | "SYNONYM" | "DIRECTORY" | "LIBRARY" | "CLUSTER"
             | "CONTEXT" | "DIMENSION" | "OPERATOR" | "INDEXTYPE" | "EDITION" => {
@@ -49870,7 +50164,7 @@ impl SqlEditorWidget {
             idx += 2;
         }
 
-        let mariadb = matches!(db_type, Some(crate::db::DatabaseType::MariaDB));
+        let mariadb = completion_db_type_is_mariadb(db_type);
         toks.get(idx..)
             .is_some_and(|tail| {
                 tail.iter().any(|token| match token {
@@ -50157,7 +50451,7 @@ impl SqlEditorWidget {
             _ => false,
         };
         (role_or_account_slot
-            || (matches!(db_type, Some(crate::db::DatabaseType::MariaDB))
+            || (completion_db_type_is_mariadb(db_type)
                 && Self::mariadb_create_role_admin_account_slot(&items)))
         .then_some(ExpectedObjectSuggestionKind::User)
     }
@@ -53880,17 +54174,32 @@ impl SqlEditorWidget {
     fn resolve_current_select_source_column_lookup_tables(
         deep_ctx: &intellisense_context::CursorContext,
     ) -> Option<Vec<String>> {
-        if !matches!(deep_ctx.phase, intellisense_context::SqlPhase::SelectList) {
+        if !matches!(
+            deep_ctx.phase,
+            intellisense_context::SqlPhase::SelectList
+                | intellisense_context::SqlPhase::LockingColumnList
+        ) {
             return None;
         }
 
         let tokens = Self::current_query_tokens(deep_ctx);
         let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
-        if !Self::cursor_is_before_current_query_from_clause(tokens, cursor_token_len) {
+        if matches!(deep_ctx.phase, intellisense_context::SqlPhase::SelectList)
+            && !Self::cursor_is_before_current_query_from_clause(tokens, cursor_token_len)
+        {
             return None;
         }
 
-        let source_tables = intellisense_context::collect_tables_in_statement(tokens);
+        let mut source_tables = intellisense_context::collect_tables_in_statement(tokens);
+        if source_tables.is_empty()
+            && matches!(
+                deep_ctx.phase,
+                intellisense_context::SqlPhase::LockingColumnList
+            )
+        {
+            source_tables =
+                intellisense_context::collect_tables_in_statement(deep_ctx.statement_tokens.as_ref());
+        }
         if source_tables.is_empty() {
             return None;
         }
@@ -53906,6 +54215,53 @@ impl SqlEditorWidget {
         }
 
         (!tables.is_empty()).then_some(tables)
+    }
+
+    fn resolve_for_update_of_column_lookup_tables(
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> Option<Vec<String>> {
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let end = Self::expected_suggestion_context_end(tokens, deep_ctx.cursor_token_len, true);
+        let words = Self::previous_meaningful_words_upper(tokens, end, 8);
+        if !words.windows(3).any(
+            |window| matches!(window, [for_kw, update, of] if for_kw == "FOR" && update == "UPDATE" && of == "OF"),
+        ) {
+            return None;
+        }
+
+        let source_tables = intellisense_context::collect_tables_in_statement(tokens);
+        if source_tables.is_empty() {
+            if let Some(table) = Self::last_from_relation_before(tokens, end) {
+                return Some(vec![table]);
+            }
+        }
+        if source_tables.is_empty() {
+            return None;
+        }
+
+        let mut tables = Vec::new();
+        let mut seen = HashSet::new();
+        for table_ref in &source_tables {
+            let lookup_table = Self::column_lookup_table_for_table_ref(table_ref, deep_ctx);
+            let key = Self::completion_identifier_lookup_upper(&lookup_table);
+            if seen.insert(key) {
+                tables.push(lookup_table);
+            }
+        }
+        (!tables.is_empty()).then_some(tables)
+    }
+
+    fn last_from_relation_before(tokens: &[SqlToken], end: usize) -> Option<String> {
+        let mut idx = end.min(tokens.len());
+        while let Some(prev_idx) = Self::previous_non_comment_token_index(tokens, idx) {
+            if matches!(tokens.get(prev_idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("FROM"))
+            {
+                let table_idx = Self::next_non_comment_token_index(tokens, prev_idx + 1)?;
+                return Self::relation_name_ending_at(tokens, table_idx);
+            }
+            idx = prev_idx;
+        }
+        None
     }
 
     fn cursor_is_mysql_multi_table_update_set_target(
@@ -54154,6 +54510,11 @@ impl SqlEditorWidget {
                 Self::resolve_insert_source_query_column_lookup_tables(deep_ctx)
             {
                 return insert_source_tables;
+            }
+            if let Some(for_update_scope) =
+                Self::resolve_for_update_of_column_lookup_tables(deep_ctx)
+            {
+                return for_update_scope;
             }
             if let Some(select_source_tables) =
                 Self::resolve_current_select_source_column_lookup_tables(deep_ctx)

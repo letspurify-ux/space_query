@@ -3502,6 +3502,7 @@ fn audit_final_suggestions_impl(
         "SCOTT",
         vec![
             ("EMP".to_string(), Some(QualifiedMemberKind::Table)),
+            ("DEPT".to_string(), Some(QualifiedMemberKind::Table)),
             ("EMP_V".to_string(), Some(QualifiedMemberKind::View)),
             ("RUN_JOB".to_string(), Some(QualifiedMemberKind::Procedure)),
             (
@@ -3511,7 +3512,10 @@ fn audit_final_suggestions_impl(
             ("ADDRESS_T".to_string(), Some(QualifiedMemberKind::Type)),
         ],
     );
-    data.set_relation_members_for_qualifier("SCOTT", vec!["EMP".to_string(), "EMP_V".to_string()]);
+    data.set_relation_members_for_qualifier(
+        "SCOTT",
+        vec!["EMP".to_string(), "DEPT".to_string(), "EMP_V".to_string()],
+    );
     data.set_columns_for_table(
         "EMP",
         vec!["EMPNO".to_string(), "ENAME".to_string(), "SAL".to_string()],
@@ -4228,7 +4232,24 @@ fn audit_final_suggestions_impl(
     } else {
         Vec::new()
     };
-    if at_table_alias_name_slot {
+    if has
+        && (SqlEditorWidget::cursor_is_at_plsql_declaration_object_name_slot_for_context(
+            &ctx,
+            true,
+            Some(db),
+        ) || SqlEditorWidget::cursor_is_at_plsql_routine_parameter_name_slot_for_context(
+            &ctx,
+            true,
+            Some(db),
+        ))
+    {
+        expected_keywords.clear();
+    }
+    if at_table_alias_name_slot
+        && !expected_keywords
+            .iter()
+            .any(|keyword| keyword.eq_ignore_ascii_case("TRANSACTION"))
+    {
         expected_keywords.retain(|keyword| keyword.eq_ignore_ascii_case("OF"));
     }
     let current_query_tokens = SqlEditorWidget::current_query_tokens(&ctx);
@@ -4299,6 +4320,10 @@ fn audit_final_suggestions_impl(
     }
     let oracle_qualifier_head_suggestions = if qualifier.is_none()
         && !crate::sql_text::mysql_compatibility_for_sql("", Some(db))
+        && !matches!(
+            expected_object_kind,
+            Some(ExpectedObjectSuggestionKind::Sequence)
+        )
         && (SqlEditorWidget::text_after_cursor_starts_with_qualifier_dot(
             s.get(cursor..).unwrap_or(""),
         ) || SqlEditorWidget::cursor_prefix_is_followed_by_qualifier_dot_for_context(
@@ -47351,6 +47376,8 @@ fn query_completion_suggestions_with_data(
         oracle_type_attribute_relation_member_suggestions
     } else if !mysql_named_value_suggestions.is_empty() {
         mysql_named_value_suggestions
+    } else if at_column_target_list && column_scope.is_some() {
+        SqlEditorWidget::scoped_column_suggestions(data, &prefix, column_scope.as_deref())
     } else if replace_table_context_with_expected_objects {
         expected_object_suggestions
     } else if let Some(suggestions) = create_table_declared_column_suggestions {
@@ -47367,6 +47394,16 @@ fn query_completion_suggestions_with_data(
         && ((at_keyword_only_identifier_slot && !at_column_target_list)
             || (at_keyword_only_slot && !at_column_target_list)
             || SqlEditorWidget::cursor_is_at_mysql_schema_object_keyword_slot_for_context(
+                &deep_ctx,
+                exclude_current_identifier_chain,
+                Some(db_type),
+            )
+            || SqlEditorWidget::cursor_is_at_transaction_or_lock_keyword_slot_for_context(
+                &deep_ctx,
+                exclude_current_identifier_chain,
+                Some(db_type),
+            )
+            || SqlEditorWidget::cursor_is_at_transaction_or_lock_value_non_catalog_slot_for_context(
                 &deep_ctx,
                 exclude_current_identifier_chain,
                 Some(db_type),
@@ -47393,6 +47430,15 @@ fn query_completion_suggestions_with_data(
             Some(db_type),
             Some(expr_kw),
         );
+    if early_expected_keyword_suggestions
+        .iter()
+        .any(|keyword| keyword.eq_ignore_ascii_case("TRANSACTION"))
+        && !expected_keywords
+            .iter()
+            .any(|keyword| keyword.eq_ignore_ascii_case("TRANSACTION"))
+    {
+        expected_keywords.insert(0, "TRANSACTION".to_string());
+    }
     if at_dedicated_column_slot {
         expected_keywords.clear();
     }
@@ -47421,6 +47467,10 @@ fn query_completion_suggestions_with_data(
     }
     let oracle_qualifier_head_suggestions = if qualifier.is_none()
         && !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type))
+        && !matches!(
+            expected_object_kind,
+            Some(ExpectedObjectSuggestionKind::Sequence)
+        )
         && (SqlEditorWidget::text_after_cursor_starts_with_qualifier_dot(
             sql.get(cursor..).unwrap_or(""),
         ) || SqlEditorWidget::cursor_prefix_is_followed_by_qualifier_dot_for_context(

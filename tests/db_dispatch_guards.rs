@@ -697,6 +697,7 @@ const UI_DATABASE_TYPE_REGISTRY_FUNCTIONS: &[&str] = &[
     "oracle_storage_completion_enabled_for_db_type",
     "oracle_on_duplicate_completion_enabled_for_db_type",
     "data_type_keywords_for",
+    "completion_db_type_is_mariadb",
 ];
 
 fn ui_database_type_registry_function(name: &str) -> bool {
@@ -2243,6 +2244,7 @@ const BACKEND_REGISTRY_FILES: &[(&str, &[&str])] = &[
             "oracle_storage_completion_enabled_for_db_type",
             "oracle_on_duplicate_completion_enabled_for_db_type",
             "data_type_keywords_for",
+            "completion_db_type_is_mariadb",
         ],
     ),
     ("src/ui/object_browser.rs", &["object_browser_behavior_for"]),
