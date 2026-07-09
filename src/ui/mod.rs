@@ -90,12 +90,12 @@ fn dialog_text_columns(text: &str) -> i32 {
 }
 
 fn dialog_prompt_height(text: &str, available_width: i32) -> i32 {
-    let columns_per_line = ((available_width - 16) / 8).max(1);
+    let columns_per_line = safe_div(available_width - 16, 8).max(1);
     let line_count = text
         .lines()
         .map(|line| {
             let columns = dialog_text_columns(line).max(1);
-            (columns + columns_per_line - 1) / columns_per_line
+            safe_div(columns + columns_per_line - 1, columns_per_line)
         })
         .sum::<i32>()
         .max(1);
