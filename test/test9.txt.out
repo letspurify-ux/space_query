@@ -197,12 +197,12 @@ CREATE OR REPLACE PACKAGE BODY fmt_pkg_extreme AS
         EXCEPTION
             WHEN VALUE_ERROR THEN
                 l_score := - 1;
-        END [[score_policy]];
+        END score_policy;
         RETURN l_score;
     EXCEPTION
         WHEN OTHERS THEN
             RETURN - 999999;
-    END [[calc_score]];
+    END calc_score;
 
     ----------------------------------------------------------------------------
     -- current snapshot
@@ -245,7 +245,7 @@ CREATE OR REPLACE PACKAGE BODY fmt_pkg_extreme AS
     EXCEPTION
         WHEN OTHERS THEN
             RETURN 'SNAPSHOT ERROR: ' || SQLERRM;
-    END [[render_snapshot]];
+    END render_snapshot;
 
     ----------------------------------------------------------------------------
     -- main processor
@@ -283,7 +283,7 @@ CREATE OR REPLACE PACKAGE BODY fmt_pkg_extreme AS
             IF l_mode NOT IN ('NORMAL', 'STRICT', 'AGGRESSIVE', 'DRYRUN') THEN
                 RAISE e_bad_mode;
             END IF;
-        END [[ensure_mode]];
+        END ensure_mode;
         FUNCTION [[decorate_note]] (p_old IN VARCHAR2, p_score IN NUMBER, p_seq IN PLS_INTEGER) RETURN VARCHAR2 IS
         BEGIN
             RETURN SUBSTR (NVL (p_old, '') ||
@@ -326,7 +326,7 @@ purpose: formatter stress test
             EXCEPTION
                 WHEN OTHERS THEN
                     AUDIT ('INNER_RULES', 'inner_rules failed for id=' || p_row.id);
-            END [[inner_rules]];
+            END inner_rules;
             CASE
                 WHEN l_score >= 150 THEN
                     l_new_status := 'DONE';
@@ -372,7 +372,7 @@ USING (
                 IF l_mode = 'STRICT' THEN
                     RAISE;
                 END IF;
-        END [[apply_one]];
+        END apply_one;
     BEGIN
         ensure_mode;
         g_exec_count := g_exec_count + 1;
@@ -388,17 +388,17 @@ USING (
         l_idx := l_units.FIRST;
         <<scan_loop>>
         WHILE l_idx IS NOT NULL LOOP
-            IF l_units (l_idx).[[lvl]] > c_max_depth THEN
-                l_idx := l_units.[[NEXT]] (l_idx);
+            IF l_units (l_idx).lvl > c_max_depth THEN
+                l_idx := l_units.NEXT (l_idx);
                 CONTINUE scan_loop;
             END IF;
             BEGIN
                 CASE
                     WHEN l_mode = 'DRYRUN' THEN
-                        AUDIT ('DRYRUN', 'skip id=' || l_units (l_idx).[[id]] || ', code=' || l_units (l_idx).code);
+                        AUDIT ('DRYRUN', 'skip id=' || l_units (l_idx).id || ', code=' || l_units (l_idx).code);
                     WHEN l_mode = 'AGGRESSIVE' THEN
                         apply_one (l_units (l_idx), l_idx);
-                        IF l_units (l_idx).[[status]] = 'HOLD' THEN
+                        IF l_units (l_idx).status = 'HOLD' THEN
                             apply_one (l_units (l_idx), l_idx);
                         END IF;
                     ELSE
@@ -411,8 +411,8 @@ USING (
                         RAISE;
                     END IF;
             END;
-            l_idx := l_units.[[NEXT]] (l_idx);
-        END LOOP [[scan_loop]];
+            l_idx := l_units.NEXT (l_idx);
+        END LOOP scan_loop;
         IF l_mode <> 'DRYRUN'
                 AND l_ids.COUNT > 0 THEN
             BEGIN
@@ -432,7 +432,7 @@ USING (
                         AUDIT ('FORALL_ERR', 'index=' || SQL%BULK_EXCEPTIONS (j).ERROR_INDEX || ', code=' || SQL%BULK_EXCEPTIONS (j).ERROR_CODE);
                     END LOOP;
             END;
-        END [[IF]];
+        END IF;
         BEGIN
             EXECUTE IMMEDIATE q'[
                 SELECT COUNT(*)
@@ -452,7 +452,7 @@ USING (
         WHEN OTHERS THEN
             AUDIT ('FATAL', 'validate_and_process failed for root_id=' || p_root_id || ': ' || SQLERRM);
             RAISE;
-    END [[validate_and_process]];
+    END validate_and_process;
 
     ----------------------------------------------------------------------------
     -- orchestrator
@@ -512,11 +512,11 @@ USING (
         EXCEPTION
             WHEN OTHERS THEN
                 add_line (p_text, 'FINAL SUMMARY ERROR');
-        END [[summary_block]];
+        END summary_block;
     EXCEPTION
         WHEN OTHERS THEN
             p_text := 'RUN_EXTREME_ERROR: ' || SQLERRM;
-    END [[run_extreme]];
+    END run_extreme;
 BEGIN
     g_last_mode :=
     CASE
@@ -570,32 +570,16 @@ ORDER BY audit_id;
 -- source: test/test9.txt
 -- db: Oracle
 -- metadata: test Oracle inferred catalog + Oracle built-ins
--- checked: 954
--- missing: 24
+-- checked: 947
+-- missing: 8
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens:
 --   142:18 word=t_status prefix=t_st suggestions=[] total=0 line=l_status t_status := UPPER (TRIM (NVL (p_status, 'NEW')));
---   200:13 word=score_policy prefix=scor suggestions=[SYS_REFCURSOR] total=1 line=END score_policy;
---   205:9 word=calc_score prefix=calc suggestions=[channel_code] total=1 line=END calc_score;
 --   232:28 word=lvl prefix=lv suggestions=[log_level] total=1 line=push ('[' || r.lvl || '] ' || 'ID=' || r.id || ', PARENT=' || NVL (TO_CHAR (r.parent_id), 'NULL') || ', CODE=' || r.tree_code || ', QTY=' || NVL (TO_CHAR (r.qty), 'NULL') || ', PRICE=' || NVL (TO_CHAR (r.price, 'FM9999990.00'), 'NULL') || ', STATUS=' || NVL (r.status, 'NULL') || ', BAND=' ||
---   248:9 word=render_snapshot prefix=rend suggestions=[] total=0 line=END render_snapshot;
 --   254:25 word=cp_root_id prefix=cp_r suggestions=[] total=0 line=CURSOR c_units (cp_root_id NUMBER) IS
 --   264:25 word=cp_root_id prefix=cp_r suggestions=[] total=0 line=START WITH id = cp_root_id
---   286:13 word=ensure_mode prefix=ensu suggestions=[] total=0 line=END ensure_mode;
 --   287:18 word=decorate_note prefix=deco suggestions=[deco, DECODE, DECOMPOSE(), dept_code, direct_report_cnt] total=5 line=FUNCTION decorate_note (p_old IN VARCHAR2, p_score IN NUMBER, p_seq IN PLS_INTEGER) RETURN VARCHAR2 IS
 --   300:19 word=apply_one prefix=appl suggestions=[appl, APPLY] total=2 line=PROCEDURE apply_one (p_row IN c_units%ROWTYPE, p_pos IN PLS_INTEGER) IS
 --   304:23 word=sp_apply_one prefix=sp_a suggestions=[qt_split_tab] total=1 line=SAVEPOINT sp_apply_one;
---   329:17 word=inner_rules prefix=inne suggestions=[INNER] total=1 line=END inner_rules;
---   375:13 word=apply_one prefix=appl suggestions=[APPLY] total=1 line=END apply_one;
---   391:32 word=lvl prefix=lv suggestions=[] total=0 line=IF l_units (l_idx).lvl > c_max_depth THEN
---   392:34 word=NEXT prefix=NEX suggestions=[NEXT_DAY()] total=1 line=l_idx := l_units.NEXT (l_idx);
---   398:72 word=id prefix=i suggestions=[] total=0 line=AUDIT ('DRYRUN', 'skip id=' || l_units (l_idx).id || ', code=' || l_units (l_idx).code);
---   401:44 word=status prefix=stat suggestions=[STATEMENT] total=1 line=IF l_units (l_idx).status = 'HOLD' THEN
---   414:30 word=NEXT prefix=NEX suggestions=[NEXT_DAY()] total=1 line=l_idx := l_units.NEXT (l_idx);
---   415:18 word=scan_loop prefix=scan suggestions=[] total=0 line=END LOOP scan_loop;
 --   419:24 word=i prefix=i suggestions=[IN, INTERVAL, IS, INITCAP(), INSERTCHILDXML(), INSERTCHILDXMLAFTER(), INSERTCHILDXMLBEFORE(), INSERTXMLBEFORE(), INSTR(), id] total=10 line=FORALL i IN INDICES OF l_ids SAVE EXCEPTIONS
---   435:13 word=IF prefix=I suggestions=[IS] total=1 line=END IF;
---   455:9 word=validate_and_process prefix=vali suggestions=[VALIDATE, VALIDATE_CONVERSION()] total=2 line=END validate_and_process;
---   515:13 word=summary_block prefix=summ suggestions=[qt_emp_summary_v] total=1 line=END summary_block;
---   519:9 word=run_extreme prefix=run_ suggestions=[oqt_run_log, run_id, run_ts, final_running_amt] total=4 line=END run_extreme;
 -- =========================================================

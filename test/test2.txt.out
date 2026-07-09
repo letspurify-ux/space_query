@@ -202,7 +202,7 @@ BEGIN
   oqt_pkg.p_over(NULL);
   oqt_pkg.p_over('');
   oqt_pkg.p_over('한글/emoji😀/quotes''test');
-  oqt_syn.[[p_over]]('via synonym call');
+  oqt_syn.p_over('via synonym call');
 END;
 /
 
@@ -291,11 +291,10 @@ PROMPT === DONE ===
 -- db: Oracle
 -- metadata: test Oracle inferred catalog + Oracle built-ins
 -- checked: 449
--- missing: 4
+-- missing: 3
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens:
 --   69:21 word=oqt_pkg prefix=oqt_ suggestions=[] total=0 line=SHOW ERRORS PACKAGE oqt_pkg;
 --   116:15 word=v prefix=v suggestions=[VIRTUAL] total=1 line=DECLARE v NUMBER;
 --   143:26 word=oqt_pkg prefix=oqt_ suggestions=[] total=0 line=SHOW ERRORS PACKAGE BODY oqt_pkg;
---   205:11 word=p_over prefix=p_ov suggestions=[] total=0 line=oqt_syn.p_over('via synonym call');
 -- =========================================================

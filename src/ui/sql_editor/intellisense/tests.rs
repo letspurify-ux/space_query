@@ -103,6 +103,9 @@ struct MysqlFamilyScriptCatalog {
     indexes: Vec<String>,
     users: Vec<String>,
     columns: HashMap<String, Vec<String>>,
+    type_members: HashMap<String, Vec<String>>,
+    collection_element_types: HashMap<String, String>,
+    synonym_targets: HashMap<String, String>,
     signatures: HashMap<String, crate::ui::intellisense::SignatureLabel>,
 }
 
@@ -479,6 +482,15 @@ fn intellisense_data_from_mysql_family_catalog(
     for (key, label) in &catalog.signatures {
         data.set_signature(key.clone(), Some(label.clone()));
     }
+    for (type_name, members) in &catalog.type_members {
+        data.set_members_for_qualifier(type_name, members.clone());
+    }
+    for (collection_type, element_type) in &catalog.collection_element_types {
+        data.set_collection_element_type_for_type(collection_type, element_type);
+    }
+    for (synonym, target) in &catalog.synonym_targets {
+        data.set_synonym_target(synonym, target);
+    }
     let mut members_by_qualifier = HashMap::<String, Vec<String>>::new();
     for key in catalog.signatures.keys() {
         let Some((qualifier, member)) = key.rsplit_once('.') else {
@@ -845,8 +857,79 @@ fn oracle_collect_script_catalog_entries(script: &str, catalog: &mut MysqlFamily
             "FUNCTION" => push_unique_case_insensitive(&mut catalog.functions, &name),
             "PACKAGE" => push_unique_case_insensitive(&mut catalog.packages, &name),
             "SEQUENCE" => push_unique_case_insensitive(&mut catalog.sequences, &name),
-            "SYNONYM" => push_unique_case_insensitive(&mut catalog.synonyms, &name),
-            "TYPE" => push_unique_case_insensitive(&mut catalog.types, &name),
+            "SYNONYM" => {
+                push_unique_case_insensitive(&mut catalog.synonyms, &name);
+                let statement_end = tokens
+                    .iter()
+                    .enumerate()
+                    .skip(after_name_idx)
+                    .find_map(|(idx, token)| {
+                        matches!(token, SqlToken::Symbol(symbol) if symbol == ";")
+                            .then_some(idx)
+                    })
+                    .unwrap_or(tokens.len());
+                if let Some(for_idx) = tokens
+                    .iter()
+                    .enumerate()
+                    .take(statement_end)
+                    .skip(after_name_idx)
+                    .find_map(|(idx, token)| token_word_eq(Some(token), "FOR").then_some(idx))
+                {
+                    if let Some((target, _)) = script_object_name_at(&tokens, for_idx + 1) {
+                        catalog
+                            .synonym_targets
+                            .insert(name.to_ascii_uppercase(), target.to_ascii_uppercase());
+                    }
+                }
+            }
+            "TYPE" => {
+                push_unique_case_insensitive(&mut catalog.types, &name);
+                let statement_end = tokens
+                    .iter()
+                    .enumerate()
+                    .skip(after_name_idx)
+                    .find_map(|(idx, token)| {
+                        matches!(token, SqlToken::Symbol(symbol) if symbol == ";")
+                            .then_some(idx)
+                    })
+                    .unwrap_or(tokens.len());
+                let body_idx = tokens
+                    .iter()
+                    .enumerate()
+                    .take(statement_end)
+                    .skip(after_name_idx)
+                    .find_map(|(idx, token)| {
+                        (token_word_eq(Some(token), "AS")
+                            || token_word_eq(Some(token), "IS"))
+                        .then_some(idx + 1)
+                    })
+                    .and_then(|idx| {
+                        (idx < statement_end).then_some(idx)
+                    });
+                if let Some(body_idx) = body_idx {
+                    if token_word_eq(tokens.get(body_idx), "OBJECT")
+                        && matches!(tokens.get(body_idx + 1), Some(SqlToken::Symbol(symbol)) if symbol == "(")
+                    {
+                        let members = collect_create_table_columns(&tokens, body_idx + 1);
+                        if !members.is_empty() {
+                            catalog
+                                .type_members
+                                .insert(name.to_ascii_uppercase(), members);
+                        }
+                    } else if token_word_eq(tokens.get(body_idx), "TABLE")
+                        && token_word_eq(tokens.get(body_idx + 1), "OF")
+                    {
+                        if let Some((element_type, _)) =
+                            script_object_name_at(&tokens, body_idx + 2)
+                        {
+                            catalog.collection_element_types.insert(
+                                name.to_ascii_uppercase(),
+                                element_type.to_ascii_uppercase(),
+                            );
+                        }
+                    }
+                }
+            }
             "TRIGGER" => push_unique_case_insensitive(&mut catalog.triggers, &name),
             "INDEX" => push_unique_case_insensitive(&mut catalog.indexes, &name),
             _ => {}
@@ -11983,6 +12066,56 @@ END;"#,
     for expected in ["empno", "employee_name", "total_comp"] {
         assert_has_case_insensitive(&suggestions, expected);
     }
+}
+
+#[test]
+fn local_record_member_suggestions_include_hierarchical_cursor_for_loop_projection_fields() {
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        r#"BEGIN
+    FOR r IN (
+        SELECT LEVEL AS lvl,
+               id,
+               parent_id
+          FROM fmtx_unit
+         START WITH id = p_root_id
+       CONNECT BY PRIOR id = parent_id
+         ORDER SIBLINGS BY id
+    ) LOOP
+        push('[' || r.lv__CODEX_CURSOR__l || '] ' ||
+             CASE
+                 WHEN r.id IS NULL THEN 'NONE'
+                 ELSE 'SOME'
+             END);
+    END LOOP;
+END;"#,
+        "r",
+        "lv",
+    )
+    .expect("hierarchical cursor FOR loop record should be visible inside loop body");
+
+    assert_has_case_insensitive(&suggestions, "lvl");
+}
+
+#[test]
+fn plsql_outer_cursor_for_loop_record_member_suggestions_cover_split_statement_window() {
+    let script = load_intellisense_test_file("test9.txt");
+    let needle = "push ('[' || r.lvl || '] '";
+    let replacement = "push ('[' || r.lv__CODEX_CURSOR__l || '] '";
+    let marked = script.replacen(needle, replacement, 1);
+    assert_ne!(marked, script, "test setup should replace cursor FOR loop member");
+    let cursor = marked.find("__CODEX_CURSOR__").expect("cursor marker");
+    let sql = marked.replacen("__CODEX_CURSOR__", "", 1);
+    let before = sql.get(..cursor).unwrap_or(&sql);
+
+    let suggestions = SqlEditorWidget::plsql_outer_cursor_for_loop_record_member_suggestions_from_text(
+        before,
+        "r",
+        "lv",
+        Some(crate::db::DatabaseType::Oracle),
+    )
+    .expect("outer cursor FOR loop record should resolve");
+
+    assert_has_case_insensitive(&suggestions, "lvl");
 }
 
 #[test]
@@ -46983,7 +47116,23 @@ fn query_completion_suggestions_with_data(
             &analysis,
         )
     });
-    let has_resolved_local_record_member_scope = local_record_member_suggestions.is_some();
+    let outer_cursor_for_loop_record_member_suggestions = if local_record_member_suggestions
+        .as_ref()
+        .is_none_or(Vec::is_empty)
+    {
+        qualifier.as_deref().and_then(|qualifier| {
+            SqlEditorWidget::plsql_outer_cursor_for_loop_record_member_suggestions_from_text(
+                sql.get(..cursor).unwrap_or(&sql),
+                qualifier,
+                &prefix,
+                Some(db_type),
+            )
+        })
+    } else {
+        None
+    };
+    let has_resolved_local_record_member_scope = local_record_member_suggestions.is_some()
+        || outer_cursor_for_loop_record_member_suggestions.is_some();
     let local_rowtype_member_sources = qualifier
         .as_deref()
         .map(|qualifier| {
@@ -47000,6 +47149,22 @@ fn query_completion_suggestions_with_data(
     } else {
         Vec::new()
     };
+    let has_local_record_member_scope =
+        has_resolved_local_record_member_scope || !local_rowtype_member_sources.is_empty();
+    let local_schema_type_member_suggestions = if has_local_record_member_scope {
+        Vec::new()
+    } else if let Some(qualifier) = qualifier.as_deref() {
+        SqlEditorWidget::local_schema_type_member_suggestions(
+            data,
+            qualifier,
+            &prefix,
+            expanded.cursor_in_statement,
+            raw_qualifier.as_deref(),
+            &analysis,
+        )
+    } else {
+        Vec::new()
+    };
     let qualified_member_suggestions = qualifier
         .as_deref()
         .map(|qualifier| {
@@ -47007,7 +47172,14 @@ fn query_completion_suggestions_with_data(
             if suggestions.is_empty()
                 && !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type))
             {
-                if SqlEditorWidget::matches_string_list_case_insensitive(
+                if let Some(target) = SqlEditorWidget::oracle_synonym_target_with_member_cache(
+                    data,
+                    qualifier,
+                    false,
+                    Some(db_type),
+                ) {
+                    suggestions = data.get_member_suggestions(&target, &prefix, false);
+                } else if SqlEditorWidget::matches_string_list_case_insensitive(
                     &data.sequences,
                     qualifier,
                 ) {
@@ -47143,13 +47315,23 @@ fn query_completion_suggestions_with_data(
         || at_mysql_on_duplicate_target_column_slot
         || at_mysql_on_duplicate_values_function_column_slot;
     let mut suggestions = if has_resolved_local_record_member_scope {
+        let local_record_member_suggestions =
+            if local_record_member_suggestions.as_ref().is_some_and(|values| !values.is_empty()) {
+                local_record_member_suggestions.unwrap_or_default()
+            } else {
+                outer_cursor_for_loop_record_member_suggestions
+                    .or(local_record_member_suggestions)
+                    .unwrap_or_default()
+            };
         SqlEditorWidget::merge_suggestions_with_context_aliases(
-            local_record_member_suggestions.unwrap_or_default(),
+            local_record_member_suggestions,
             local_rowtype_member_suggestions,
             false,
         )
     } else if !local_rowtype_member_sources.is_empty() {
         local_rowtype_member_suggestions
+    } else if !local_schema_type_member_suggestions.is_empty() {
+        local_schema_type_member_suggestions
     } else if !qualified_member_suggestions.is_empty() {
         qualified_member_suggestions
     } else if !oracle_type_attribute_relation_member_suggestions.is_empty() {
@@ -47373,6 +47555,30 @@ fn query_completion_suggestions_with_data(
                 sql.get(..cursor).unwrap_or(&sql),
                 &prefix,
             );
+        let plsql_named_end_target_suggestions_by_text = if qualifier.is_none()
+            && !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type))
+        {
+            SqlEditorWidget::plsql_named_end_target_suggestions_from_statement_text(
+                &expanded.text,
+                expanded.cursor_in_statement,
+                &prefix,
+                Some(db_type),
+            )
+        } else {
+            Vec::new()
+        };
+        let plsql_cursor_parameter_suggestions = if qualifier.is_none()
+            && !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type))
+        {
+            SqlEditorWidget::plsql_cursor_parameter_suggestions_from_statement_text(
+                &expanded.text,
+                expanded.cursor_in_statement,
+                &prefix,
+                Some(db_type),
+            )
+        } else {
+            Vec::new()
+        };
         let at_name_only_local_symbol_slot =
             SqlEditorWidget::cursor_is_at_plsql_goto_label_slot_for_context(
                 &deep_ctx,
@@ -47387,6 +47593,7 @@ fn query_completion_suggestions_with_data(
                 !prefix.is_empty(),
                 Some(db_type),
             ) || at_plsql_end_label_slot_by_text
+                || !plsql_named_end_target_suggestions_by_text.is_empty()
                 || SqlEditorWidget::cursor_is_at_plsql_named_end_target_slot_for_context(
                 &deep_ctx,
                 !prefix.is_empty(),
@@ -47429,6 +47636,7 @@ fn query_completion_suggestions_with_data(
                 Some(db_type),
             )
             && !at_plsql_end_label_slot_by_text
+            && plsql_named_end_target_suggestions_by_text.is_empty()
             && !SqlEditorWidget::cursor_is_at_plsql_named_end_target_slot_for_context(
                 &deep_ctx,
                 true,
@@ -47457,6 +47665,7 @@ fn query_completion_suggestions_with_data(
             || at_plsql_statement_start_local_symbol_slot
             || at_mysql_set_local_assignment_target_slot
             || at_prefixed_routine_local_symbol_slot
+            || !plsql_cursor_parameter_suggestions.is_empty()
         {
             let mut locals = SqlEditorWidget::collect_local_symbol_suggestions_for_db(
                 &prefix,
@@ -47469,6 +47678,18 @@ fn query_completion_suggestions_with_data(
                 locals = SqlEditorWidget::prepend_local_symbol_suggestions(
                     locals,
                     SqlEditorWidget::plsql_block_label_suggestions(&deep_ctx, &prefix),
+                );
+            }
+            if !plsql_named_end_target_suggestions_by_text.is_empty() {
+                locals = SqlEditorWidget::prepend_local_symbol_suggestions(
+                    locals,
+                    plsql_named_end_target_suggestions_by_text,
+                );
+            }
+            if !plsql_cursor_parameter_suggestions.is_empty() {
+                locals = SqlEditorWidget::prepend_local_symbol_suggestions(
+                    locals,
+                    plsql_cursor_parameter_suggestions,
                 );
             }
             if !locals.is_empty()
@@ -48867,6 +49088,34 @@ fn intellisense_sweep_apply_foreign_keys(data: &mut IntellisenseData, value: Opt
     }
 }
 
+fn intellisense_sweep_apply_collection_element_types(
+    data: &mut IntellisenseData,
+    value: Option<&serde_json::Value>,
+) {
+    let Some(serde_json::Value::Object(types)) = value else {
+        return;
+    };
+    for (collection_type, element_type) in types {
+        if let Some(element_type) = element_type.as_str() {
+            data.set_collection_element_type_for_type(collection_type, element_type);
+        }
+    }
+}
+
+fn intellisense_sweep_apply_synonym_targets(
+    data: &mut IntellisenseData,
+    value: Option<&serde_json::Value>,
+) {
+    let Some(serde_json::Value::Object(synonyms)) = value else {
+        return;
+    };
+    for (synonym, target) in synonyms {
+        if let Some(target) = target.as_str() {
+            data.set_synonym_target(synonym, target);
+        }
+    }
+}
+
 fn intellisense_sweep_apply_object_entry(data: &mut IntellisenseData, object: &serde_json::Map<String, serde_json::Value>) {
     let Some(name) = object.get("name").and_then(serde_json::Value::as_str) else {
         return;
@@ -48941,6 +49190,23 @@ fn intellisense_sweep_apply_object_entry(data: &mut IntellisenseData, object: &s
             data.set_relation_members_for_qualifier(name, relation_members);
         }
     }
+    if let Some(element_type) = object
+        .get("collection_element_type")
+        .or_else(|| object.get("element_type"))
+        .and_then(serde_json::Value::as_str)
+    {
+        data.set_collection_element_type_for_type(name, element_type);
+    }
+    if matches!(kind.as_str(), "SYNONYM" | "PUBLIC SYNONYM") {
+        if let Some(target) = object
+            .get("target")
+            .or_else(|| object.get("target_name"))
+            .or_else(|| object.get("table_name"))
+            .and_then(serde_json::Value::as_str)
+        {
+            data.set_synonym_target(name, target);
+        }
+    }
 }
 
 fn intellisense_sweep_apply_metadata_value(data: &mut IntellisenseData, value: &serde_json::Value) {
@@ -48981,6 +49247,18 @@ fn intellisense_sweep_apply_metadata_value(data: &mut IntellisenseData, value: &
     }
     intellisense_sweep_apply_members(data, value.get("members"));
     intellisense_sweep_apply_relation_members(data, value.get("relation_members"));
+    intellisense_sweep_apply_collection_element_types(
+        data,
+        value
+            .get("collection_element_types")
+            .or_else(|| value.get("collection_types")),
+    );
+    intellisense_sweep_apply_synonym_targets(
+        data,
+        value
+            .get("synonym_targets")
+            .or_else(|| value.get("synonym_target_by_name")),
+    );
     intellisense_sweep_apply_signatures(data, value.get("signatures"));
     intellisense_sweep_apply_column_meta(data, value.get("column_meta"));
     intellisense_sweep_apply_foreign_keys(data, value.get("foreign_keys"));
@@ -83664,11 +83942,18 @@ fn oracle_test1_to_test11_actual_completion_regressions() {
     );
     assert_oracle_fixture_completion_cases(
         "test2.txt",
-        &[(
-            "VALUES (oqt_call_log_seq.NEXTVAL, p_tag, p_msg, p_n1, SYSDATE);",
-            "VALUES (oqt_|.NEXTVAL, p_tag, p_msg, p_n1, SYSDATE);",
-            "oqt_call_log_seq",
-        )],
+        &[
+            (
+                "VALUES (oqt_call_log_seq.NEXTVAL, p_tag, p_msg, p_n1, SYSDATE);",
+                "VALUES (oqt_|.NEXTVAL, p_tag, p_msg, p_n1, SYSDATE);",
+                "oqt_call_log_seq",
+            ),
+            (
+                "oqt_syn.p_over('via synonym call');",
+                "oqt_syn.p_ov|er('via synonym call');",
+                "p_over",
+            ),
+        ],
     );
     assert_oracle_fixture_completion_cases(
         "test3.txt",
@@ -83736,9 +84021,18 @@ fn oracle_test1_to_test11_actual_completion_regressions() {
                 "outer_loop",
             ),
             ("END p_inner;", "END p_in|ner;", "p_inner"),
+            ("END p_inner;", "END p_in|;", "p_inner"),
             ("END p_deep_run;", "END p_de|ep_run;", "p_deep_run"),
+            ("END p_deep_run;", "END p_de|;", "p_deep_run"),
+            ("END oqt_deep_pkg;", "END oqt_|;", "oqt_deep_pkg"),
             ("END blk2;", "END bl|k2;", "blk2"),
             ("END blk1;", "END bl|k1;", "blk1"),
+            ("t.EXTEND(3);", "t.EXTE|ND(3);", "EXTEND"),
+            (
+                "t(i).k||','||t(i).v",
+                "t(i).k__CODEX_CURSOR__||','||t(i).v",
+                "k",
+            ),
         ],
     );
     assert_oracle_fixture_completion_cases(
@@ -83791,6 +84085,11 @@ fn oracle_test1_to_test11_actual_completion_regressions() {
                 "FORALL i I| INDICES OF l_ids SAVE EXCEPTIONS",
                 "IN",
             ),
+            (
+                "l_status t_status := UPPER",
+                "l_status t_st|atus := UPPER",
+                "t_status",
+            ),
             ("END IF;", "END I|;", "IF"),
             (
                 "END IF;\n        BEGIN",
@@ -83800,6 +84099,16 @@ fn oracle_test1_to_test11_actual_completion_regressions() {
             (
                 "l_units (l_idx).lvl > c_max_depth",
                 "l_units (l_idx).lv|l > c_max_depth",
+                "lvl",
+            ),
+            (
+                "START WITH id = cp_root_id",
+                "START WITH id = cp_r|oot_id",
+                "cp_root_id",
+            ),
+            (
+                "push ('[' || r.lvl || '] '",
+                "push ('[' || r.lv__CODEX_CURSOR__l || '] '",
                 "lvl",
             ),
             (
@@ -83821,6 +84130,11 @@ fn oracle_test1_to_test11_actual_completion_regressions() {
                 "SQL%BULK_EXCEPTIONS (j).ERROR_INDEX",
                 "SQL%BULK_EXCEPTIONS (j).ERRO|",
                 "ERROR_INDEX",
+            ),
+            (
+                "END;\n        END IF;\n        BEGIN",
+                "END;\n        END I|;\n        BEGIN",
+                "IF",
             ),
             (
                 "DBMS_LOB.SUBSTR (l_snapshot, 32767, 1)",
@@ -83873,6 +84187,11 @@ fn oracle_test1_to_test11_actual_completion_regressions() {
                 "DBMS_OUTPUT.PUT_LINE ('BATCH EMP='",
                 "DBMS_|.PUT_LINE ('BATCH EMP='",
                 "DBMS_OUTPUT",
+            ),
+            (
+                "log_msg ('qt_pkg_extreme', 'load_bonus_sales_error', SQLERRM);\n            END IF;\n            RAISE;",
+                "log_msg ('qt_pkg_extreme', 'load_bonus_sales_error', SQLERRM);\n            END I|;\n            RAISE;",
+                "IF",
             ),
         ],
     );
@@ -85969,6 +86288,8 @@ END |;
         (r#"CREATE OR REPLACE NONEDITIONABLE PROCEDURE "SYSTEM"."QT_SPLIT_PROC" IS BEGIN NULL; END qt|"#, "QT_SPLIT_PROC"),
         ("CREATE PACKAGE pkg2 IS PROCEDURE p; END |", "pkg2"),
         ("CREATE PACKAGE BODY pkg IS PROCEDURE a IS BEGIN NULL; END a; PROCEDURE b IS BEGIN NULL; END |", "b"),
+        ("CREATE PACKAGE BODY pkg IS PROCEDURE p IS BEGIN NULL; END p|; END pkg;", "p"),
+        ("CREATE PACKAGE BODY pkg IS PROCEDURE p IS BEGIN <<lp>> LOOP NULL; END LOOP lp; END p|; END pkg;", "p"),
         ("CREATE PACKAGE BODY pkg IS PROCEDURE p IS BEGIN NULL; END p; END pk|", "pkg"),
         ("SELECT 1 FROM dual;\n/\nCREATE OR REPLACE PACKAGE BODY pkg IS\n  PROCEDURE p IS\n  BEGIN\n    NULL;\n  END |\nEND pkg;\n/", "p"),
         ("CREATE OR REPLACE PACKAGE BODY pkg IS\n  PROCEDURE a IS\n  BEGIN\n    NULL;\n  END |\n  PROCEDURE b IS\n  BEGIN\n    NULL;\n  END b;\nEND pkg;", "a"),

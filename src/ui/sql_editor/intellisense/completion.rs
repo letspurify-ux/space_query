@@ -2778,7 +2778,24 @@ impl SqlEditorWidget {
                 analysis,
             )
         });
-        let has_resolved_local_record_member_scope = local_record_member_suggestions.is_some();
+        let outer_cursor_for_loop_record_member_suggestions =
+            if local_record_member_suggestions
+                .as_ref()
+                .is_none_or(Vec::is_empty)
+            {
+                qualifier.and_then(|qualifier| {
+                    Self::plsql_outer_cursor_for_loop_record_member_suggestions_from_text(
+                        &snapshot.signature_scan_text,
+                        qualifier,
+                        &snapshot.prefix,
+                        Some(snapshot.preferred_db_type),
+                    )
+                })
+            } else {
+                None
+            };
+        let has_resolved_local_record_member_scope = local_record_member_suggestions.is_some()
+            || outer_cursor_for_loop_record_member_suggestions.is_some();
         let local_rowtype_member_sources = qualifier
             .map(|qualifier| {
                 Self::local_rowtype_member_sources_for_qualifier(
@@ -2808,10 +2825,34 @@ impl SqlEditorWidget {
         };
         let has_local_record_member_scope =
             has_resolved_local_record_member_scope || !local_rowtype_member_sources.is_empty();
+        let local_schema_type_member_suggestions = if has_local_record_member_scope {
+            Vec::new()
+        } else if let Some(qualifier) = qualifier {
+            let mut data = intellisense_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Self::local_schema_type_member_suggestions(
+                &mut data,
+                qualifier,
+                &snapshot.prefix,
+                cursor_in_statement,
+                snapshot.raw_qualifier.as_deref(),
+                analysis,
+            )
+        } else {
+            Vec::new()
+        };
         let mut local_record_member_suggestions =
-            local_record_member_suggestions.unwrap_or_default();
+            if local_record_member_suggestions.as_ref().is_some_and(|values| !values.is_empty()) {
+                local_record_member_suggestions.unwrap_or_default()
+            } else {
+                outer_cursor_for_loop_record_member_suggestions
+                    .or(local_record_member_suggestions)
+                    .unwrap_or_default()
+            };
         let local_rowtype_column_tables = local_rowtype_member_sources.clone();
-        let qualified_completion_mode = if has_local_record_member_scope {
+        let qualified_completion_mode =
+            if has_local_record_member_scope || !local_schema_type_member_suggestions.is_empty() {
             None
         } else {
             qualifier.and_then(|qualifier| {
@@ -2992,6 +3033,30 @@ impl SqlEditorWidget {
                 &snapshot.signature_scan_text,
                 &snapshot.prefix,
             );
+        let plsql_named_end_target_suggestions_by_text = if qualifier.is_none()
+            && !crate::sql_text::mysql_compatibility_for_sql("", Some(snapshot.preferred_db_type))
+        {
+            Self::plsql_named_end_target_suggestions_from_statement_text(
+                expanded_statement_text,
+                cursor_in_statement,
+                &snapshot.prefix,
+                Some(snapshot.preferred_db_type),
+            )
+        } else {
+            Vec::new()
+        };
+        let plsql_cursor_parameter_suggestions = if qualifier.is_none()
+            && !crate::sql_text::mysql_compatibility_for_sql("", Some(snapshot.preferred_db_type))
+        {
+            Self::plsql_cursor_parameter_suggestions_from_statement_text(
+                expanded_statement_text,
+                cursor_in_statement,
+                &snapshot.prefix,
+                Some(snapshot.preferred_db_type),
+            )
+        } else {
+            Vec::new()
+        };
         let at_name_only_local_symbol_slot = qualifier.is_none()
             && (Self::cursor_is_at_plsql_goto_label_slot_for_context(
                 deep_ctx,
@@ -3006,6 +3071,7 @@ impl SqlEditorWidget {
                 !snapshot.prefix.is_empty(),
                 Some(snapshot.preferred_db_type),
             ) || at_plsql_end_label_slot_by_text
+            || !plsql_named_end_target_suggestions_by_text.is_empty()
             || Self::cursor_is_at_plsql_named_end_target_slot_for_context(
                 deep_ctx,
                 !snapshot.prefix.is_empty(),
@@ -3048,6 +3114,7 @@ impl SqlEditorWidget {
                 true,
                 Some(snapshot.preferred_db_type),
             )
+            && plsql_named_end_target_suggestions_by_text.is_empty()
             && !Self::cursor_is_at_plsql_named_end_target_slot_for_context(
                 deep_ctx,
                 true,
@@ -3077,6 +3144,7 @@ impl SqlEditorWidget {
                 || at_plsql_statement_start_local_symbol_slot
                 || at_mysql_set_local_assignment_target_slot
                 || at_prefixed_routine_local_symbol_slot
+                || !plsql_cursor_parameter_suggestions.is_empty()
             {
                 Self::collect_local_symbol_suggestions_for_db(
                     &snapshot.prefix,
@@ -3113,6 +3181,18 @@ impl SqlEditorWidget {
                 local_suggestions = Self::prepend_local_symbol_suggestions(
                     local_suggestions,
                     Self::plsql_block_label_suggestions(deep_ctx, &snapshot.prefix),
+                );
+            }
+            if !plsql_named_end_target_suggestions_by_text.is_empty() {
+                local_suggestions = Self::prepend_local_symbol_suggestions(
+                    local_suggestions,
+                    plsql_named_end_target_suggestions_by_text,
+                );
+            }
+            if !plsql_cursor_parameter_suggestions.is_empty() {
+                local_suggestions = Self::prepend_local_symbol_suggestions(
+                    local_suggestions,
+                    plsql_cursor_parameter_suggestions,
                 );
             }
         }
@@ -3490,6 +3570,7 @@ impl SqlEditorWidget {
             || !signature_argument_suggestions.is_empty()
             || has_local_record_member_scope
             || !qualified_member_suggestions.is_empty()
+            || !local_schema_type_member_suggestions.is_empty()
             || at_create_table_declared_column_slot
             || at_create_table_storage_column_slot
             || at_create_table_partition_column_slot
@@ -3668,6 +3749,8 @@ impl SqlEditorWidget {
             )
         } else if !local_rowtype_member_sources.is_empty() {
             local_rowtype_member_suggestions
+        } else if !local_schema_type_member_suggestions.is_empty() {
+            local_schema_type_member_suggestions
         } else if !qualified_member_suggestions.is_empty() {
             qualified_member_suggestions
         } else if !oracle_type_attribute_relation_member_suggestions.is_empty() {
@@ -5077,7 +5160,7 @@ impl SqlEditorWidget {
     fn oracle_structural_keyword_prefix_fallback(
         prefix: &str,
         deep_ctx: &intellisense_context::CursorContext,
-        _db_type: Option<crate::db::DatabaseType>,
+        db_type: Option<crate::db::DatabaseType>,
     ) -> Option<String> {
         let matches_prefix = |keyword: &str| {
             crate::ui::intellisense::suggestion_matches_completion_prefix(keyword, prefix)
@@ -5108,6 +5191,13 @@ impl SqlEditorWidget {
             .last()
             .is_some_and(|token| matches!(token, SqlToken::Symbol(symbol) if symbol == "%"));
 
+        if let Some(candidates) = Self::expected_plsql_end_qualifier_keywords(tokens, end, db_type) {
+            let mut candidates = Self::filter_expected_candidates(prefix, candidates).into_iter();
+            let first = candidates.next();
+            if first.is_some() && candidates.next().is_none() {
+                return first;
+            }
+        }
         if matches_prefix("SQL")
             && Self::cursor_in_plsql_executable_block(tokens, end)
             && (Self::next_meaningful_token_is_symbol(tokens, end, "%")
@@ -13595,11 +13685,14 @@ impl SqlEditorWidget {
             {
                 return Some(QualifiedCompletionMode::RelationColumns);
             }
-            if data.has_members_for_qualifier(qualifier, false) {
+            if Self::qualifier_has_members_or_oracle_synonym_target(data, qualifier, false, db_type)
+            {
                 return Some(QualifiedCompletionMode::ObjectMembers);
             }
             if Self::expected_object_kind_allows_relation_member_cache(kind)
-                && data.has_members_for_qualifier(qualifier, true)
+                && Self::qualifier_has_members_or_oracle_synonym_target(
+                    data, qualifier, true, db_type,
+                )
             {
                 return Some(QualifiedCompletionMode::RelationMembers);
             }
@@ -13607,7 +13700,7 @@ impl SqlEditorWidget {
 
         if expected_object_kind.is_none()
             && matches!(context, SqlContext::TableName)
-            && data.has_members_for_qualifier(qualifier, true)
+            && Self::qualifier_has_members_or_oracle_synonym_target(data, qualifier, true, db_type)
         {
             return Some(QualifiedCompletionMode::RelationMembers);
         }
@@ -13631,11 +13724,37 @@ impl SqlEditorWidget {
             return Some(QualifiedCompletionMode::RelationColumns);
         }
 
-        if data.has_members_for_qualifier(qualifier, false) {
+        if Self::qualifier_has_members_or_oracle_synonym_target(data, qualifier, false, db_type) {
             return Some(QualifiedCompletionMode::ObjectMembers);
         }
 
         None
+    }
+
+    fn qualifier_has_members_or_oracle_synonym_target(
+        data: &IntellisenseData,
+        qualifier: &str,
+        relation_only: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        data.has_members_for_qualifier(qualifier, relation_only)
+            || Self::oracle_synonym_target_with_member_cache(data, qualifier, relation_only, db_type)
+                .is_some()
+    }
+
+    fn oracle_synonym_target_with_member_cache(
+        data: &IntellisenseData,
+        qualifier: &str,
+        relation_only: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<String> {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return None;
+        }
+
+        let target = data.synonym_target(qualifier)?;
+        data.has_members_for_qualifier(target, relation_only)
+            .then(|| target.to_string())
     }
 
     fn cursor_is_at_qualified_identifier_suppression_slot_for_context(
@@ -32038,6 +32157,21 @@ impl SqlEditorWidget {
                         Some(Frame::Named(name, _)) => Some(name),
                         _ => None,
                     };
+                    let mut j = idx + 1;
+                    while j < toks.len() {
+                        match &toks[j] {
+                            SqlToken::Comment(_) => j += 1,
+                            SqlToken::Symbol(sym) if sym == ";" => {
+                                j += 1;
+                                break;
+                            }
+                            SqlToken::Word(_) | SqlToken::String(_) => j += 1,
+                            SqlToken::Symbol(sym) if sym == "." => j += 1,
+                            _ => break,
+                        }
+                    }
+                    idx = j;
+                    continue;
                 }
                 _ => {}
             }
@@ -32279,6 +32413,381 @@ impl SqlEditorWidget {
             }
             _ => Vec::new(),
         }
+    }
+
+    fn plsql_named_end_target_suggestions_from_statement_text(
+        statement_text: &str,
+        cursor_in_statement: usize,
+        prefix: &str,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Vec<String> {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return Vec::new();
+        }
+        let cursor = cursor_in_statement.min(statement_text.len());
+        let scan_cursor = if !prefix.is_empty()
+            && statement_text
+                .get(..cursor)
+                .is_some_and(|head| head.ends_with(prefix))
+        {
+            cursor.saturating_sub(prefix.len())
+        } else {
+            cursor
+        };
+        let spans = super::query_text::tokenize_sql_spanned(statement_text);
+        let mut tokens = Vec::with_capacity(spans.len());
+        let mut token_ends = Vec::with_capacity(spans.len());
+        for span in spans {
+            token_ends.push(span.end);
+            tokens.push(span.token);
+        }
+        let end = token_ends.partition_point(|token_end| *token_end <= scan_cursor);
+        let Some(name) = Self::expected_plsql_named_end_target(&tokens, end) else {
+            return Vec::new();
+        };
+        if name.to_ascii_uppercase().starts_with(&prefix.to_ascii_uppercase()) {
+            vec![name]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn local_schema_type_member_suggestions(
+        data: &mut crate::ui::intellisense::IntellisenseData,
+        qualifier: &str,
+        prefix: &str,
+        cursor_in_statement: usize,
+        raw_qualifier: Option<&str>,
+        analysis: &IntellisenseAnalysis,
+    ) -> Vec<String> {
+        let Some((type_name, indexed)) = Self::local_schema_type_source_for_qualifier(
+            qualifier,
+            cursor_in_statement,
+            raw_qualifier,
+            analysis,
+        ) else {
+            return Vec::new();
+        };
+
+        if indexed {
+            let Some(element_type) = data.collection_element_type_for_type(&type_name) else {
+                return Vec::new();
+            };
+            let element_type = element_type.to_string();
+            return data.get_member_suggestions(&element_type, prefix, false);
+        }
+
+        let mut suggestions = data.get_member_suggestions(&type_name, prefix, false);
+        if data.collection_element_type_for_type(&type_name).is_some() {
+            suggestions = Self::prepend_local_symbol_suggestions(
+                suggestions,
+                Self::plsql_collection_method_suggestions(prefix),
+            );
+        }
+        suggestions
+    }
+
+    fn plsql_cursor_parameter_suggestions_from_statement_text(
+        statement_text: &str,
+        cursor_in_statement: usize,
+        prefix: &str,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Vec<String> {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return Vec::new();
+        }
+
+        let cursor = cursor_in_statement.min(statement_text.len());
+        let spans = super::query_text::tokenize_sql_spanned(statement_text);
+        let tokens: Vec<SqlToken> = spans.iter().map(|span| span.token.clone()).collect();
+        let token_ends: Vec<usize> = spans.iter().map(|span| span.end).collect();
+        let end = token_ends.partition_point(|token_end| *token_end <= cursor);
+        let prefix_upper = prefix.to_ascii_uppercase();
+        let mut suggestions = Vec::new();
+        let mut seen = HashSet::new();
+
+        let mut idx = 0usize;
+        while idx < end {
+            if !matches!(tokens.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("CURSOR"))
+            {
+                idx += 1;
+                continue;
+            }
+
+            let Some(name_idx) = Self::next_non_comment_token_index(&tokens, idx + 1) else {
+                break;
+            };
+            let Some(open_idx) = Self::next_non_comment_token_index(&tokens, name_idx + 1) else {
+                idx += 1;
+                continue;
+            };
+            if !matches!(tokens.get(open_idx), Some(SqlToken::Symbol(symbol)) if symbol == "(") {
+                idx += 1;
+                continue;
+            }
+
+            let Some(close_idx) = Self::matching_symbol_token_index(&tokens, open_idx, "(", ")")
+            else {
+                idx += 1;
+                continue;
+            };
+            let Some(is_idx) = Self::cursor_declaration_query_is_token_index(&tokens, close_idx + 1)
+            else {
+                idx = close_idx.saturating_add(1);
+                continue;
+            };
+            let item_end_idx = Self::cursor_declaration_item_end_token_index(&tokens, is_idx + 1);
+            let item_end = item_end_idx
+                .and_then(|idx| spans.get(idx).map(|span| span.start))
+                .unwrap_or(statement_text.len());
+            if cursor <= spans.get(is_idx).map_or(0, |span| span.end) || cursor > item_end {
+                idx = item_end_idx.unwrap_or(close_idx.saturating_add(1));
+                continue;
+            }
+
+            Self::append_plsql_cursor_parameter_suggestions(
+                &tokens,
+                open_idx + 1,
+                close_idx,
+                &prefix_upper,
+                &mut suggestions,
+                &mut seen,
+            );
+            idx = item_end_idx.unwrap_or(close_idx.saturating_add(1));
+        }
+
+        suggestions
+    }
+
+    fn matching_symbol_token_index(
+        tokens: &[SqlToken],
+        open_idx: usize,
+        open_symbol: &str,
+        close_symbol: &str,
+    ) -> Option<usize> {
+        if !matches!(tokens.get(open_idx), Some(SqlToken::Symbol(symbol)) if symbol == open_symbol) {
+            return None;
+        }
+
+        let mut depth = 0usize;
+        for (idx, token) in tokens.iter().enumerate().skip(open_idx) {
+            match token {
+                SqlToken::Symbol(symbol) if symbol == open_symbol => {
+                    depth = depth.saturating_add(1);
+                }
+                SqlToken::Symbol(symbol) if symbol == close_symbol => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some(idx);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        None
+    }
+
+    fn cursor_declaration_query_is_token_index(tokens: &[SqlToken], start: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        let mut idx = start;
+        while idx < tokens.len() {
+            match &tokens[idx] {
+                SqlToken::Comment(_) => {}
+                SqlToken::Symbol(symbol) if symbol == "(" => depth = depth.saturating_add(1),
+                SqlToken::Symbol(symbol) if symbol == ")" => depth = depth.saturating_sub(1),
+                SqlToken::Symbol(symbol) if symbol == ";" && depth == 0 => return None,
+                SqlToken::Word(word)
+                    if depth == 0
+                        && (word.eq_ignore_ascii_case("IS")
+                            || word.eq_ignore_ascii_case("AS")) =>
+                {
+                    return Some(idx);
+                }
+                _ => {}
+            }
+            idx += 1;
+        }
+
+        None
+    }
+
+    fn cursor_declaration_item_end_token_index(tokens: &[SqlToken], start: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        for (idx, token) in tokens.iter().enumerate().skip(start) {
+            match token {
+                SqlToken::Comment(_) => {}
+                SqlToken::Symbol(symbol) if symbol == "(" => depth = depth.saturating_add(1),
+                SqlToken::Symbol(symbol) if symbol == ")" => depth = depth.saturating_sub(1),
+                SqlToken::Symbol(symbol) if symbol == ";" && depth == 0 => return Some(idx),
+                _ => {}
+            }
+        }
+
+        None
+    }
+
+    fn append_plsql_cursor_parameter_suggestions(
+        tokens: &[SqlToken],
+        start: usize,
+        end: usize,
+        prefix_upper: &str,
+        suggestions: &mut Vec<String>,
+        seen: &mut HashSet<String>,
+    ) {
+        let mut item_start = start;
+        let mut depth = 0usize;
+        let mut idx = start;
+        while idx <= end {
+            let at_item_end = idx == end;
+            let at_top_level_comma = !at_item_end
+                && depth == 0
+                && matches!(tokens.get(idx), Some(SqlToken::Symbol(symbol)) if symbol == ",");
+            if at_item_end || at_top_level_comma {
+                if let Some(name) =
+                    Self::plsql_cursor_parameter_name_from_tokens(tokens, item_start, idx)
+                {
+                    let upper = Self::local_identifier_lookup_upper(&name);
+                    if Self::local_symbol_matches_prefix(&name, &upper, prefix_upper)
+                        && seen.insert(upper)
+                    {
+                        suggestions.push(name);
+                    }
+                }
+                item_start = idx.saturating_add(1);
+            } else {
+                match tokens.get(idx) {
+                    Some(SqlToken::Symbol(symbol)) if symbol == "(" => {
+                        depth = depth.saturating_add(1);
+                    }
+                    Some(SqlToken::Symbol(symbol)) if symbol == ")" => {
+                        depth = depth.saturating_sub(1);
+                    }
+                    _ => {}
+                }
+            }
+            idx += 1;
+        }
+    }
+
+    fn plsql_cursor_parameter_name_from_tokens(
+        tokens: &[SqlToken],
+        start: usize,
+        end: usize,
+    ) -> Option<String> {
+        tokens
+            .get(start..end)?
+            .iter()
+            .find_map(|token| Self::token_word(token).and_then(Self::local_identifier_suggestion_from_word))
+    }
+
+    fn plsql_outer_cursor_for_loop_record_member_suggestions_from_text(
+        text_before_cursor: &str,
+        qualifier: &str,
+        prefix: &str,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<Vec<String>> {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return None;
+        }
+
+        let spans = super::query_text::tokenize_sql_spanned(text_before_cursor);
+        let tokens: Vec<SqlToken> = spans.into_iter().map(|span| span.token).collect();
+        let qualifier_upper = Self::local_identifier_lookup_upper(qualifier);
+        if qualifier_upper.is_empty() {
+            return None;
+        }
+
+        let mut loop_stack = Vec::<Option<(String, Vec<String>)>>::new();
+        let mut idx = 0usize;
+        while idx < tokens.len() {
+            match tokens.get(idx) {
+                Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("FOR") => {
+                    if let Some((name, members, loop_idx)) =
+                        Self::plsql_cursor_for_loop_projection_from_tokens(&tokens, idx)
+                    {
+                        loop_stack.push(Some((name, members)));
+                        idx = loop_idx.saturating_add(1);
+                        continue;
+                    }
+                }
+                Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("LOOP") => {
+                    if !Self::previous_meaningful_word_is_token(&tokens, idx, "END") {
+                        loop_stack.push(None);
+                    }
+                }
+                Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("END") => {
+                    if Self::next_meaningful_word_is_token(&tokens, idx + 1, "LOOP") {
+                        loop_stack.pop();
+                    }
+                }
+                _ => {}
+            }
+            idx += 1;
+        }
+
+        loop_stack
+            .iter()
+            .rev()
+            .filter_map(Option::as_ref)
+            .find_map(|(name, members)| {
+                (Self::local_identifier_lookup_upper(name) == qualifier_upper).then(|| {
+                    let prefix_upper = Self::local_identifier_lookup_upper(prefix);
+                    members
+                        .iter()
+                        .filter(|member| {
+                            let upper = Self::local_identifier_lookup_upper(member);
+                            Self::local_symbol_matches_prefix(member, &upper, &prefix_upper)
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+            })
+    }
+
+    fn plsql_cursor_for_loop_projection_from_tokens(
+        tokens: &[SqlToken],
+        for_idx: usize,
+    ) -> Option<(String, Vec<String>, usize)> {
+        let name_idx = Self::next_non_comment_token_index(tokens, for_idx + 1)?;
+        let name = Self::token_word(tokens.get(name_idx)?)
+            .and_then(Self::local_identifier_suggestion_from_word)?;
+        let in_idx = Self::next_non_comment_token_index(tokens, name_idx + 1)?;
+        if !matches!(tokens.get(in_idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("IN"))
+        {
+            return None;
+        }
+        let open_idx = Self::next_non_comment_token_index(tokens, in_idx + 1)?;
+        if !matches!(tokens.get(open_idx), Some(SqlToken::Symbol(symbol)) if symbol == "(") {
+            return None;
+        }
+        let close_idx = Self::matching_symbol_token_index(tokens, open_idx, "(", ")")?;
+        let loop_idx = Self::next_non_comment_token_index(tokens, close_idx + 1)?;
+        if !matches!(tokens.get(loop_idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("LOOP"))
+        {
+            return None;
+        }
+
+        let body_tokens = tokens.get(open_idx + 1..close_idx).unwrap_or(&[]);
+        let (mut members, _) = Self::extract_select_projection_members_and_source(body_tokens);
+        Self::dedup_column_names_case_insensitive(&mut members);
+        Some((name, members, loop_idx))
+    }
+
+    fn previous_meaningful_word_is_token(
+        tokens: &[SqlToken],
+        idx: usize,
+        expected: &str,
+    ) -> bool {
+        Self::previous_non_comment_token_index(tokens, idx)
+            .and_then(|idx| Self::token_word(tokens.get(idx)?))
+            .is_some_and(|word| word.eq_ignore_ascii_case(expected))
+    }
+
+    fn next_meaningful_word_is_token(tokens: &[SqlToken], idx: usize, expected: &str) -> bool {
+        Self::next_non_comment_token_index(tokens, idx)
+            .and_then(|idx| Self::token_word(tokens.get(idx)?))
+            .is_some_and(|word| word.eq_ignore_ascii_case(expected))
     }
 
     /// Exception names declared in the current block as `name EXCEPTION;`, offered at
@@ -50637,6 +51146,19 @@ impl SqlEditorWidget {
         db_type: Option<crate::db::DatabaseType>,
     ) -> Vec<String> {
         let mut suggestions = data.get_member_suggestions(qualifier, prefix, false);
+        let mut member_qualifier = qualifier.to_string();
+        if suggestions.is_empty() {
+            if let Some(target) =
+                Self::oracle_synonym_target_with_member_cache(data, qualifier, false, db_type)
+            {
+                let target_suggestions = data.get_member_suggestions(&target, prefix, false);
+                if !target_suggestions.is_empty() {
+                    member_qualifier = target;
+                    suggestions = target_suggestions;
+                }
+            }
+        }
+        let member_qualifier = member_qualifier.as_str();
         if !crate::sql_text::mysql_compatibility_for_sql("", db_type)
             && Self::cursor_is_at_plsql_exception_name(
                 deep_ctx.statement_tokens.as_ref(),
@@ -50644,7 +51166,11 @@ impl SqlEditorWidget {
             )
         {
             suggestions.retain(|suggestion| {
-                !Self::qualified_member_has_known_schema_object_kind(data, qualifier, suggestion)
+                !Self::qualified_member_has_known_schema_object_kind(
+                    data,
+                    member_qualifier,
+                    suggestion,
+                )
             });
             return suggestions;
         }
@@ -50674,9 +51200,13 @@ impl SqlEditorWidget {
             let mut filtered = Vec::new();
             let mut seen = HashSet::new();
             for suggestion in &suggestions {
-                match data.qualifier_member_matches_kinds(qualifier, suggestion, expected_kinds) {
+                match data.qualifier_member_matches_kinds(
+                    member_qualifier,
+                    suggestion,
+                    expected_kinds,
+                ) {
                     Some(false)
-                        if data.qualifier_member_has_kind_metadata(qualifier, suggestion) =>
+                        if data.qualifier_member_has_kind_metadata(member_qualifier, suggestion) =>
                     {
                         continue;
                     }
@@ -50701,14 +51231,18 @@ impl SqlEditorWidget {
                 Self::expected_qualifier_member_kinds_for_db(kind, db_type)
             {
                 if data
-                    .qualifier_member_matches_kinds(qualifier, suggestion, expected_kinds)
+                    .qualifier_member_matches_kinds(member_qualifier, suggestion, expected_kinds)
                     .is_some()
                 {
                     saw_kind_metadata = true;
                 }
             }
             if !Self::suggestion_matches_expected_object_kind_for_qualifier(
-                data, qualifier, suggestion, kind, db_type,
+                data,
+                member_qualifier,
+                suggestion,
+                kind,
+                db_type,
             ) {
                 continue;
             }
@@ -50740,7 +51274,11 @@ impl SqlEditorWidget {
                     {
                         return false;
                     }
-                    !Self::suggestion_is_known_relation_for_qualifier(data, qualifier, suggestion)
+                    !Self::suggestion_is_known_relation_for_qualifier(
+                        data,
+                        member_qualifier,
+                        suggestion,
+                    )
                 })
                 .collect()
         } else if filtered.is_empty() && !saw_kind_metadata {

@@ -22,7 +22,7 @@ DECLARE
             IF SQLCODE NOT IN (- 4043, - 4080, - 942, - 2289) THEN
                 RAISE;
             END IF;
-    END [[safe_drop]];
+    END safe_drop;
 
 BEGIN
     safe_drop ('drop trigger qt_sales_ct');
@@ -407,9 +407,9 @@ CREATE OR REPLACE PACKAGE BODY qt_pkg_extreme IS
                 END LOOP;
             ELSE
                 log_msg ('qt_pkg_extreme', 'load_bonus_sales_error', SQLERRM);
-            END [[IF]];
+            END IF;
             RAISE;
-    END [[load_bonus_sales]];
+    END load_bonus_sales;
 
     PROCEDURE open_emp_cursor (p_dept_id IN NUMBER, p_min_amount IN NUMBER DEFAULT 0, p_rc OUT SYS_REFCURSOR) IS
         v_sql CLOB;
@@ -563,7 +563,7 @@ BEGIN
             LIMIT 3;
         EXIT WHEN l_batch.COUNT = 0;
         FOR i IN 1..l_batch.COUNT LOOP
-            DBMS_OUTPUT.PUT_LINE ('BATCH EMP=' || l_batch (i).[[emp_id]] || ':' || l_batch (i).emp_name);
+            DBMS_OUTPUT.PUT_LINE ('BATCH EMP=' || l_batch (i).emp_id || ':' || l_batch (i).emp_name);
         END LOOP;
     END LOOP;
     CLOSE c_emp;
@@ -855,16 +855,15 @@ ORDER BY log_id;
 -- source: test/test10.txt
 -- db: Oracle
 -- metadata: test Oracle inferred catalog + Oracle built-ins
--- checked: 1435
--- missing: 53
+-- checked: 1430
+-- missing: 49
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens:
---   25:9 word=safe_drop prefix=safe suggestions=[] total=0 line=END safe_drop;
 --   91:60 word=amount prefix=amou suggestions=[] total=0 line=ALTER TABLE qt_sales ADD CONSTRAINT qt_sales_amt_ck CHECK (amount >= 0
 --   92:13 word=tax prefix=ta suggestions=[TABLE, TAN(), TANH(), tag, status, status_cd, status_code, upper_tag, same_status_cnt, total_amt] total=10 line=AND tax >= 0);
 --   95:26 word=sale_dt prefix=sale suggestions=[sale_amount, sale_id, sale_month, sale_type, sale_year, qt_sales, qt_sales_seq, qt_emp_sales_v, qt_seq_sales, qt_sale_obj, qt_sale_obj_tab, sales_rank] total=12 line=ON qt_sales (emp_id, sale_dt DESC);
 --   104:22 word=note prefix=not suggestions=[NOT] total=1 line=ON COLUMN qt_emp.note IS '자유 메모: q-quote, --, / * pseudo-comment * / 테스트';
---   120:9 word=qt_bi_sales prefix=qt_b suggestions=[qt_boss_pkg, qt_boss_pairs, qt_boss_audit_seq, qt_boss_pair_obj, qt_boss_pair_tab, qt_boss_audit, qt_boss_cfg, qt_boss_dept, qt_boss_emp, qt_boss_emp_v, qt_obj_emp, qt_obj_emp_tab, qt_sale_obj, qt_sale_obj_tab, qt_split_obj, qt_split_tab] total=16 line=END qt_bi_sales;
+--   120:9 word=qt_bi_sales prefix=qt_b suggestions=[] total=0 line=END qt_bi_sales;
 --   194:6 word=sale_base prefix=sale suggestions=[sale, qt_sales, qt_sales_seq, qt_emp_sales_v, qt_seq_sales, qt_sale_obj, qt_sale_obj_tab, sales_rank, sale_amount, sale_dt, sale_id, sale_month, sale_type, sale_year] total=14 line=WITH sale_base AS (
 --   205:62 word=sale_dt prefix=sale suggestions=[sale_amount, sale_id, sale_month, sale_type, sale_year] total=5 line=ROW_NUMBER () OVER (PARTITION BY e.emp_id ORDER BY s.sale_dt DESC, s.amount DESC) AS rn
 --   205:78 word=amount prefix=amou suggestions=[] total=0 line=ROW_NUMBER () OVER (PARTITION BY e.emp_id ORDER BY s.sale_dt DESC, s.amount DESC) AS rn
@@ -875,14 +874,12 @@ ORDER BY log_id;
 --   238:13 word=ON prefix=O suggestions=[] total=0 line=ON s.emp_id = e.emp_id
 --   259:5 word=g_emp_ids prefix=g_em suggestions=[] total=0 line=g_emp_ids t_num_tab;
 --   260:5 word=g_idx prefix=g_id suggestions=[] total=0 line=g_idx PLS_INTEGER := 0;
---   285:5 word=qt_sales_ct prefix=qt_s suggestions=[qt_split_pkg, qt_split_fn, qt_sales_seq, qt_seq, qt_seq_emp, qt_seq_sales, qt_split_seq, qt_sale_obj, qt_sale_obj_tab, qt_split_obj, qt_split_tab, qt_sales, qt_split_logs, qt_split_users, qt_split_v, oqt_syn] total=32 line=END qt_sales_ct;
+--   285:5 word=qt_sales_ct prefix=qt_s suggestions=[] total=0 line=END qt_sales_ct;
 --   295:32 word=t_emp_rec prefix=t_em suggestions=[] total=0 line=TYPE t_emp_tab IS TABLE OF t_emp_rec INDEX BY PLS_INTEGER;
 --   299:23 word=t_vc4000 prefix=t_vc suggestions=[] total=0 line=g_banner CONSTANT t_vc4000 := q'[
 --   381:19 word=active_yn prefix=acti suggestions=[] total=0 line=AND e.active_yn = 'Y';
 --   382:26 word=p_text prefix=p_te suggestions=[] total=0 line=PROCEDURE DEBUG (p_text VARCHAR2) IS
 --   394:16 word=i prefix=i suggestions=[IN, INTERVAL, IS, INITCAP(), INSERTCHILDXML(), INSERTCHILDXMLAFTER(), INSERTCHILDXMLBEFORE(), INSERTXMLBEFORE(), INSTR(), id] total=10 line=FORALL i IN INDICES OF l_rows SAVE EXCEPTIONS
---   410:17 word=IF prefix=I suggestions=[IS] total=1 line=END IF;
---   412:9 word=load_bonus_sales prefix=load suggestions=[] total=0 line=END load_bonus_sales;
 --   471:10 word=bonus_src prefix=bonu suggestions=[bonu, bonus, bonus_pct] total=3 line=WITH bonus_src AS (
 --   483:17 word=active_yn prefix=acti suggestions=[] total=0 line=WHERE e.active_yn = 'Y'
 --   489:17 word=sale_dt prefix=sale suggestions=[sale_amount, sale_id, sale_month, sale_type, sale_year] total=5 line=AND dst.sale_dt = src.sale_dt
@@ -896,7 +893,6 @@ ORDER BY log_id;
 --   521:9 word=status prefix=stat suggestions=[STATEMENT] total=1 line=WHERE s.status = 'CANCEL'
 --   526:19 word=active_yn prefix=acti suggestions=[] total=0 line=AND e.active_yn = 'N'
 --   554:11 word=active_yn prefix=acti suggestions=[] total=0 line=WHERE active_yn = 'Y'
---   566:63 word=emp_id prefix=emp_ suggestions=[] total=0 line=DBMS_OUTPUT.PUT_LINE ('BATCH EMP=' || l_batch (i).emp_id || ':' || l_batch (i).emp_name);
 --   577:15 word=calc_bonus prefix=calc suggestions=[channel_code] total=1 line=WITH FUNCTION calc_bonus (p_amount NUMBER) RETURN NUMBER IS
 --   577:27 word=p_amount prefix=p_am suggestions=[] total=0 line=WITH FUNCTION calc_bonus (p_amount NUMBER) RETURN NUMBER IS
 --   585:5 word=calc_bonus prefix=calc suggestions=[channel_code] total=1 line=calc_bonus (NVL (e.salary, 0)) AS calc_bonus

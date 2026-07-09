@@ -1160,6 +1160,18 @@ impl SqlEditorWidget {
         }
     }
 
+    fn plsql_collection_method_suggestions(prefix: &str) -> Vec<String> {
+        let prefix_upper = Self::local_member_suggestion_lookup_upper(prefix);
+        let mut suggestions = Vec::new();
+        let mut seen = HashSet::new();
+        Self::append_plsql_collection_method_suggestions(
+            &mut suggestions,
+            &mut seen,
+            &prefix_upper,
+        );
+        suggestions
+    }
+
     fn filter_local_symbol_suggestions_by_expected_operand_type(
         suggestions: &mut Vec<String>,
         cursor_in_statement: usize,
@@ -1618,6 +1630,30 @@ impl SqlEditorWidget {
         }
 
         Some(scope)
+    }
+
+    fn local_schema_type_source_for_qualifier(
+        qualifier: &str,
+        cursor_in_statement: usize,
+        raw_qualifier: Option<&str>,
+        analysis: &IntellisenseAnalysis,
+    ) -> Option<(String, bool)> {
+        let segments = Self::local_qualifier_segments(qualifier, raw_qualifier);
+        if segments.len() != 1 {
+            return None;
+        }
+        let segment_indexed =
+            Self::local_qualifier_indexed_segment_flags(segments.len(), raw_qualifier);
+        let base_symbol = Self::visible_local_symbol_for_qualifier(
+            segments.first()?,
+            cursor_in_statement,
+            analysis,
+        )?;
+        let source = base_symbol.member_source_upper.clone()?;
+        if base_symbol.member_source_is_rowtype {
+            return None;
+        }
+        Some((source, segment_indexed.first().copied().unwrap_or(false)))
     }
 
     fn local_qualifier_segments(qualifier: &str, raw_qualifier: Option<&str>) -> Vec<String> {
@@ -2592,7 +2628,10 @@ impl SqlEditorWidget {
             "PROCEDURE" | "FUNCTION" => {
                 return Self::extract_routine_declaration_symbol_from_item(item, first_idx);
             }
-            "SUBTYPE" | "PRAGMA" | "EXCEPTION" => {
+            "SUBTYPE" => {
+                return Self::extract_subtype_type_symbol_from_item(item, first_idx);
+            }
+            "PRAGMA" | "EXCEPTION" => {
                 return None;
             }
             "TYPE" => {
@@ -2811,6 +2850,47 @@ impl SqlEditorWidget {
             member_source_is_rowtype,
             member_source_is_collection_like: true,
             member_source_allows_visible_members: member_source_is_rowtype,
+            suggest_name: true,
+            is_type_symbol: true,
+        })
+    }
+
+    fn extract_subtype_type_symbol_from_item(
+        item: &[SqlTokenSpan],
+        subtype_keyword_idx: usize,
+    ) -> Option<ParsedDeclarationSymbol> {
+        let name_idx = Self::next_meaningful_token_idx(item, subtype_keyword_idx + 1)?;
+        let name =
+            Self::token_word(&item[name_idx].token).and_then(Self::local_identifier_from_word)?;
+
+        let mut idx = name_idx + 1;
+        let mut saw_is = false;
+        while idx < item.len() {
+            match &item[idx].token {
+                SqlToken::Comment(_) => {}
+                SqlToken::Word(word) if word.eq_ignore_ascii_case("IS") => {
+                    saw_is = Self::next_meaningful_token_idx(item, idx + 1).is_some();
+                    break;
+                }
+                SqlToken::Symbol(sym) if sym == ";" => break,
+                _ => {}
+            }
+            idx += 1;
+        }
+        if !saw_is {
+            return None;
+        }
+
+        Some(ParsedDeclarationSymbol {
+            name,
+            type_display: None,
+            members: Vec::new(),
+            member_entries: Vec::new(),
+            member_source_upper: None,
+            member_source_uppers: Vec::new(),
+            member_source_is_rowtype: false,
+            member_source_is_collection_like: false,
+            member_source_allows_visible_members: false,
             suggest_name: true,
             is_type_symbol: true,
         })

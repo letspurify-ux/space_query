@@ -215,7 +215,7 @@ CREATE OR REPLACE PACKAGE BODY oqt_deep_pkg AS
       END LOOP outer_loop;
 
       v_depth := v_depth - 1;
-    END [[p_inner]];
+    END p_inner;
 
   BEGIN
     log_msg('P_DEEP_RUN', 'start limit='||p_limit, v_depth);
@@ -277,20 +277,20 @@ CREATE OR REPLACE PACKAGE BODY oqt_deep_pkg AS
     DECLARE
       t oqt_deep_tab := oqt_deep_tab();
     BEGIN
-      t.[[EXTEND]](3);
+      t.EXTEND(3);
       t(1) := oqt_deep_obj(1, 'A');
       t(2) := oqt_deep_obj(2, 'B');
       t(3) := oqt_deep_obj(3, 'C');
 
       FOR i IN 1..t.COUNT LOOP
-        log_msg('COLL', 't('||i||')='||t(i).[[k]]||','||t(i).v, 77);
+        log_msg('COLL', 't('||i||')='||t(i).k||','||t(i).v, 77);
       END LOOP;
     END;
 
     log_msg('P_DEEP_RUN', 'done', v_depth);
-  END [[p_deep_run]];
+  END p_deep_run;
 
-END [[oqt_deep_pkg]];
+END oqt_deep_pkg;
 /
 SHOW ERRORS
 
@@ -399,17 +399,12 @@ PROMPT =======================================================================
 -- source: test/test5.txt
 -- db: Oracle
 -- metadata: test Oracle inferred catalog + Oracle built-ins
--- checked: 569
--- missing: 9
+-- checked: 566
+-- missing: 4
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens:
 --   17:12 word=object_name prefix=obje suggestions=[OBJECT, qt_obj_emp, qt_obj_emp_tab] total=3 line=SELECT object_name, object_type
 --   17:25 word=object_type prefix=obje suggestions=[OBJECT, qt_obj_emp, qt_obj_emp_tab] total=3 line=SELECT object_name, object_type
 --   18:10 word=user_objects prefix=user suggestions=[qt_split_users] total=1 line=FROM user_objects
 --   19:11 word=object_name prefix=obje suggestions=[OBJECT, qt_obj_emp, qt_obj_emp_tab] total=3 line=WHERE object_name IN (
---   218:9 word=p_inner prefix=p_in suggestions=[] total=0 line=END p_inner;
---   280:9 word=EXTEND prefix=EXTE suggestions=[] total=0 line=t.EXTEND(3);
---   286:45 word=k prefix=k suggestions=[] total=0 line=log_msg('COLL', 't('||i||')='||t(i).k||','||t(i).v, 77);
---   291:7 word=p_deep_run prefix=p_de suggestions=[] total=0 line=END p_deep_run;
---   293:5 word=oqt_deep_pkg prefix=oqt_ suggestions=[] total=0 line=END oqt_deep_pkg;
 -- =========================================================

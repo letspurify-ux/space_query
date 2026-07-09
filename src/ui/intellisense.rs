@@ -887,6 +887,8 @@ pub struct IntellisenseData {
     member_entries_by_qualifier: HashMap<String, Vec<NameEntry>>,
     member_kinds_by_qualifier: HashMap<String, HashMap<String, HashSet<QualifiedMemberKind>>>,
     relation_member_entries_by_qualifier: HashMap<String, Vec<NameEntry>>,
+    collection_element_type_by_type: HashMap<String, String>,
+    synonym_target_by_synonym: HashMap<String, String>,
     all_columns_entries: Vec<NameEntry>,
     all_columns_dirty: bool,
     relations_upper: HashSet<String>,
@@ -972,6 +974,8 @@ impl IntellisenseData {
             member_entries_by_qualifier: HashMap::new(),
             member_kinds_by_qualifier: HashMap::new(),
             relation_member_entries_by_qualifier: HashMap::new(),
+            collection_element_type_by_type: HashMap::new(),
+            synonym_target_by_synonym: HashMap::new(),
             all_columns_entries: Vec::new(),
             all_columns_dirty: false,
             relations_upper: HashSet::new(),
@@ -1700,6 +1704,46 @@ impl IntellisenseData {
         }
         self.relation_member_entries_by_qualifier
             .insert(key, Self::build_entries(&members));
+    }
+
+    pub fn set_collection_element_type_for_type(
+        &mut self,
+        collection_type: &str,
+        element_type: &str,
+    ) {
+        let key = Self::normalize_qualifier_lookup_key(collection_type);
+        let element = Self::normalize_qualifier_lookup_key(element_type);
+        if key.is_empty() || element.is_empty() {
+            return;
+        }
+        self.collection_element_type_by_type.insert(key, element);
+    }
+
+    pub fn collection_element_type_for_type(&self, collection_type: &str) -> Option<&str> {
+        for key in Self::qualifier_lookup_keys(collection_type) {
+            if let Some(element_type) = self.collection_element_type_by_type.get(&key) {
+                return Some(element_type.as_str());
+            }
+        }
+        None
+    }
+
+    pub fn set_synonym_target(&mut self, synonym: &str, target: &str) {
+        let key = Self::normalize_qualifier_lookup_key(synonym);
+        let target = Self::normalize_qualifier_lookup_key(target);
+        if key.is_empty() || target.is_empty() {
+            return;
+        }
+        self.synonym_target_by_synonym.insert(key, target);
+    }
+
+    pub fn synonym_target(&self, synonym: &str) -> Option<&str> {
+        for key in Self::qualifier_lookup_keys(synonym) {
+            if let Some(target) = self.synonym_target_by_synonym.get(&key) {
+                return Some(target.as_str());
+            }
+        }
+        None
     }
 
     pub fn has_members_for_qualifier(&self, qualifier: &str, relation_only: bool) -> bool {

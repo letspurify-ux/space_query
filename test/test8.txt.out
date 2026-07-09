@@ -360,7 +360,7 @@ CREATE OR REPLACE PACKAGE BODY oqt_mega_pkg AS
             ROLLBACK;
             log_msg ('ERR', 'others', 999, 'code=' || SQLCODE || ' msg=' || SQLERRM);
             RAISE;
-    END [[run_torture]];
+    END run_torture;
 
     PROCEDURE open_rc (p_grp IN NUMBER, p_rc OUT SYS_REFCURSOR) IS
     BEGIN
@@ -477,8 +477,8 @@ select * from [[EMP]];
 -- source: test/test8.txt
 -- db: Oracle
 -- metadata: test Oracle inferred catalog + Oracle built-ins
--- checked: 764
--- missing: 11
+-- checked: 762
+-- missing: 10
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens:
 --   13:24 word=SQL prefix=SQ suggestions=[] total=0 line=WHENEVER SQLERROR EXIT SQL.SQLCODE
@@ -488,7 +488,6 @@ select * from [[EMP]];
 --   133:23 word=oqt_obj prefix=oqt_ suggestions=[] total=0 line=SHOW ERRORS TYPE BODY oqt_obj
 --   146:21 word=oqt_mega_pkg prefix=oqt_ suggestions=[] total=0 line=SHOW ERRORS PACKAGE oqt_mega_pkg
 --   313:19 word=sp1 prefix=sp suggestions=[spec, qt_split_logs, qt_split_seq, qt_split_users, qt_split_v, qt_seq_emp, qt_split_fn, qt_split_pkg, qt_split_obj, qt_split_tab, step, sale_type] total=12 line=SAVEPOINT sp1;
---   363:9 word=run_torture prefix=run_ suggestions=[oqt_run_log, run_id, run_ts, final_running_amt] total=4 line=END run_torture;
 --   388:26 word=oqt_mega_pkg prefix=oqt_ suggestions=[] total=0 line=SHOW ERRORS PACKAGE BODY oqt_mega_pkg
 --   415:21 word=oqt_trg_test_bi prefix=oqt_ suggestions=[] total=0 line=SHOW ERRORS TRIGGER oqt_trg_test_bi
 --   473:15 word=EMP prefix=EM suggestions=[qt_emp, qt_employees, qt_emp_sales_v, qt_emp_summary_v, oqt_emp, oqt_t_emp, qt_boss_emp, qt_boss_emp_v] total=8 line=select * from EMP;
