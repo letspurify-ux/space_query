@@ -279,6 +279,21 @@ struct CompletionMergeContext<'a> {
     oracle_qualifier_head_suggestions: &'a [String],
 }
 
+/// Result of the shared completion computation (`compute_intellisense_suggestions`).
+/// `Suppressed` maps to the production early-returns that clear the popup/UI
+/// state outright; `Computed` carries the final merged suggestion list plus the
+/// facts the UI layer still needs (description scope, pending-refresh flag).
+enum IntellisenseCompletionComputation {
+    Suppressed,
+    Computed(IntellisenseComputedSuggestions),
+}
+
+struct IntellisenseComputedSuggestions {
+    suggestions: Vec<String>,
+    column_tables: Vec<String>,
+    should_refresh_when_columns_ready: bool,
+}
+
 impl CompletionSourcePolicy {
     fn new(
         restrict_to_relation_columns: bool,
@@ -329,10 +344,25 @@ impl CompletionSourcePolicy {
                 && !is_table_name_context
                 && !after_complete_operand
                 && !self.restrict_to_relation_columns,
+            // A keyword-only slot inside a column-restricted clause (e.g. the
+            // recursive-CTE `SEARCH DEPTH FIRST |`/`… BY col |` tail, which the
+            // phase machine leaves in `RecursiveCteColumnList`) suppresses every
+            // identifier source elsewhere; the slot's fixed keyword (`BY`/`SET`)
+            // must still come from this source, so the restriction yields to the
+            // keyword-only flags.
+            // Likewise, a keyword-only slot that the phase machine still labels
+            // `VariableName` (the tail after a complete `EXECUTE IMMEDIATE …
+            // INTO v |` / `FETCH … INTO t |` target) has a fixed continuation
+            // keyword (`USING`/`LIMIT`) that only this source can supply.
             expected_keyword_suggestions: qualifier_is_none
-                && !self.restrict_to_relation_columns
+                && !(self.restrict_to_relation_columns
+                    && !self.at_keyword_only_identifier_slot
+                    && !self.at_keyword_only_slot)
                 && !self.suppress_expected_keyword_sources
-                && !matches!(context, SqlContext::VariableName | SqlContext::BindValue),
+                && !(matches!(context, SqlContext::VariableName)
+                    && !self.at_keyword_only_identifier_slot
+                    && !self.at_keyword_only_slot)
+                && !matches!(context, SqlContext::BindValue),
             expected_object_suggestions: qualifier_is_none
                 && !self.restrict_to_relation_columns
                 && !self.at_tool_bind_name_slot
@@ -2373,6 +2403,109 @@ impl SqlEditorWidget {
         analysis: &IntellisenseAnalysis,
         expanded_statement_text: &str,
     ) {
+        let computed = match Self::compute_intellisense_suggestions(
+            intellisense_data,
+            column_sender,
+            connection,
+            snapshot,
+            analysis,
+            expanded_statement_text,
+            true,
+        ) {
+            IntellisenseCompletionComputation::Suppressed => {
+                Self::clear_intellisense_ui_state(intellisense_popup, runtime);
+                return;
+            }
+            IntellisenseCompletionComputation::Computed(computed) => computed,
+        };
+        if computed.should_refresh_when_columns_ready {
+            runtime.set_pending_intellisense(Some(PendingIntellisense {
+                cursor_pos: snapshot.cursor_pos,
+            }));
+        } else {
+            runtime.clear_pending_intellisense();
+        }
+        let IntellisenseComputedSuggestions {
+            suggestions,
+            column_tables,
+            ..
+        } = computed;
+
+        if suggestions.is_empty() {
+            intellisense_popup
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .hide();
+            runtime.clear_completion_range();
+            return;
+        }
+
+        let popup_width = Self::INTELLISENSE_POPUP_WIDTH;
+        // Mirror IntellisensePopup's row height (font size + 6, min 20) so the
+        // vertical clamp keeps the actual popup on screen.
+        let row_h = (crate::ui::configured_ui_font_size() + 6).max(20);
+        let popup_height = (suggestions.len().min(10) as i32) * row_h + 10;
+        let (popup_x, popup_y) =
+            Self::popup_screen_position(editor, snapshot.cursor_pos, popup_width, popup_height);
+        struct PopupShowInProgressReset {
+            runtime: Arc<IntellisenseRuntimeState>,
+        }
+        impl Drop for PopupShowInProgressReset {
+            fn drop(&mut self) {
+                self.runtime
+                    .set_popup_transition_state(IntellisensePopupTransitionState::Idle);
+            }
+        }
+        runtime.set_popup_transition_state(IntellisensePopupTransitionState::Showing);
+        let _popup_show_reset = PopupShowInProgressReset {
+            runtime: runtime.clone(),
+        };
+        let descriptions = {
+            let data = intellisense_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Self::build_suggestion_details(
+                &data,
+                &suggestions,
+                &column_tables,
+                snapshot.qualifier.as_deref(),
+                Some(snapshot.preferred_db_type),
+            )
+        };
+        intellisense_popup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .show_suggestions_with_descriptions(suggestions, descriptions, popup_x, popup_y);
+        let completion_start = if snapshot.prefix.is_empty() {
+            snapshot.cursor_pos_usize
+        } else {
+            snapshot.word_start
+        };
+        runtime.set_completion_range(Some(IntellisenseCompletionRange::new(
+            completion_start,
+            snapshot.cursor_pos_usize,
+        )));
+        let mut editor = editor.clone();
+        let _ = editor.take_focus();
+    }
+
+    /// The full production completion computation: every source, gate and the
+    /// shared merge pipeline plus the full-catalog safety net, WITHOUT any UI
+    /// side effects. This is the single source of truth for what the popup
+    /// offers, shared by `apply_intellisense_with_context` (production) and the
+    /// sweep/regression test harness (`query_completion_suggestions_with_data`)
+    /// so the two cannot drift. `include_locals` is `true` in production; the
+    /// keyword-only test harness passes `false` to keep local symbols out of
+    /// its assertions.
+    fn compute_intellisense_suggestions(
+        intellisense_data: &Arc<Mutex<IntellisenseData>>,
+        column_sender: &mpsc::Sender<ColumnLoadUpdate>,
+        connection: &SharedConnection,
+        snapshot: &IntellisenseTriggerSnapshot,
+        analysis: &IntellisenseAnalysis,
+        expanded_statement_text: &str,
+        include_locals: bool,
+    ) -> IntellisenseCompletionComputation {
         let deep_ctx = analysis.context.as_ref();
         let qualifier = snapshot.qualifier.as_deref();
         let has_prefix = !snapshot.prefix.is_empty();
@@ -2684,15 +2817,13 @@ impl SqlEditorWidget {
             )
             .is_none()
         {
-            Self::clear_intellisense_ui_state(intellisense_popup, runtime);
-            return;
+            return IntellisenseCompletionComputation::Suppressed;
         }
         if Self::cursor_is_in_invalid_set_operation_branch_for_context(
             deep_ctx,
             has_prefix || qualifier.is_some(),
         ) {
-            Self::clear_intellisense_ui_state(intellisense_popup, runtime);
-            return;
+            return IntellisenseCompletionComputation::Suppressed;
         }
         let completion_policy =
             ClauseCompletionPolicy::for_phase(deep_ctx.phase, qualifier.is_some());
@@ -3208,6 +3339,9 @@ impl SqlEditorWidget {
                 );
             }
         }
+        if !include_locals {
+            local_suggestions = Vec::new();
+        }
         if let Some(expected_type) = effective_expected_operand_type {
             Self::filter_local_symbol_suggestions_by_expected_operand_type(
                 &mut local_suggestions,
@@ -3461,7 +3595,7 @@ impl SqlEditorWidget {
                 &snapshot.prefix,
                 deep_ctx,
                 Some(snapshot.preferred_db_type),
-            );
+            ) || Self::cursor_is_typing_dml_returning_keyword(deep_ctx, &snapshot.prefix);
         let statement_context_end = Self::expected_keyword_suggestion_context_end(
             deep_ctx.statement_tokens.as_ref(),
             deep_ctx.cursor_token_len,
@@ -3601,12 +3735,16 @@ impl SqlEditorWidget {
             || at_create_table_partition_column_slot
             || !expected_keyword_suggestions.is_empty()
             || !expected_object_suggestions.is_empty()
-            || !mysql_named_value_suggestions.is_empty();
+            || !mysql_named_value_suggestions.is_empty()
+            // A PL/SQL value-operand start (`v := |`, `IF |`, `RETURN |`, a call
+            // argument) always has grammatical material to offer — locals,
+            // SQLCODE/NULL/CASE, value-producing objects — even when none of the
+            // sources above fired (e.g. a block with no declarations yet).
+            || effective_expr_keyword_ctx.at_plsql_value_operand;
         if snapshot.prefix.is_empty() && !allow_empty_prefix {
             // Context no longer allows completion for empty prefix, so hide
             // stale popup state immediately.
-            Self::clear_intellisense_ui_state(intellisense_popup, runtime);
-            return;
+            return IntellisenseCompletionComputation::Suppressed;
         }
 
         let mut virtual_wildcard_dependencies: HashMap<String, Vec<String>> = HashMap::new();
@@ -3857,7 +3995,9 @@ impl SqlEditorWidget {
             )
         {
             Vec::new()
-        } else if ((at_keyword_only_identifier_slot && !at_column_target_list)
+        } else if ((at_keyword_only_identifier_slot
+            && !at_column_target_list
+            && !at_dedicated_column_slot)
             || at_column_property_argument_slot
             || (at_keyword_only_slot
                 && !at_dedicated_column_slot
@@ -4020,13 +4160,6 @@ impl SqlEditorWidget {
         };
 
         let should_refresh_when_columns_ready = include_columns && columns_loading;
-        if should_refresh_when_columns_ready {
-            runtime.set_pending_intellisense(Some(PendingIntellisense {
-                cursor_pos: snapshot.cursor_pos,
-            }));
-        } else {
-            runtime.clear_pending_intellisense();
-        }
 
         let select_modifier_column_scope = if !column_tables.is_empty() {
             Some(column_tables.clone())
@@ -4124,62 +4257,11 @@ impl SqlEditorWidget {
             suggestions
         };
 
-        if suggestions.is_empty() {
-            intellisense_popup
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .hide();
-            runtime.clear_completion_range();
-            return;
-        }
-
-        let popup_width = Self::INTELLISENSE_POPUP_WIDTH;
-        // Mirror IntellisensePopup's row height (font size + 6, min 20) so the
-        // vertical clamp keeps the actual popup on screen.
-        let row_h = (crate::ui::configured_ui_font_size() + 6).max(20);
-        let popup_height = (suggestions.len().min(10) as i32) * row_h + 10;
-        let (popup_x, popup_y) =
-            Self::popup_screen_position(editor, snapshot.cursor_pos, popup_width, popup_height);
-        struct PopupShowInProgressReset {
-            runtime: Arc<IntellisenseRuntimeState>,
-        }
-        impl Drop for PopupShowInProgressReset {
-            fn drop(&mut self) {
-                self.runtime
-                    .set_popup_transition_state(IntellisensePopupTransitionState::Idle);
-            }
-        }
-        runtime.set_popup_transition_state(IntellisensePopupTransitionState::Showing);
-        let _popup_show_reset = PopupShowInProgressReset {
-            runtime: runtime.clone(),
-        };
-        let descriptions = {
-            let data = intellisense_data
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            Self::build_suggestion_details(
-                &data,
-                &suggestions,
-                &column_tables,
-                qualifier,
-                Some(snapshot.preferred_db_type),
-            )
-        };
-        intellisense_popup
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .show_suggestions_with_descriptions(suggestions, descriptions, popup_x, popup_y);
-        let completion_start = if snapshot.prefix.is_empty() {
-            snapshot.cursor_pos_usize
-        } else {
-            snapshot.word_start
-        };
-        runtime.set_completion_range(Some(IntellisenseCompletionRange::new(
-            completion_start,
-            snapshot.cursor_pos_usize,
-        )));
-        let mut editor = editor.clone();
-        let _ = editor.take_focus();
+        IntellisenseCompletionComputation::Computed(IntellisenseComputedSuggestions {
+            suggestions,
+            column_tables,
+            should_refresh_when_columns_ready,
+        })
     }
 
     /// The completion merge pipeline: folds every already-computed source vector
@@ -7963,12 +8045,14 @@ impl SqlEditorWidget {
             "VAR_POP",
             "VAR_SAMP",
         ];
+        // `CONCAT` is deliberately absent: both Oracle and MySQL define implicit
+        // conversion of numeric/datetime arguments to strings there, so a typed
+        // non-character operand is NOT a provable mismatch.
         const CHARACTER_ARGUMENT_FUNCTIONS: &[&str] = &[
             "ASCII",
             "BIT_LENGTH",
             "CHAR_LENGTH",
             "CHARACTER_LENGTH",
-            "CONCAT",
             "INITCAP",
             "LENGTH",
             "LENGTH2",
@@ -11704,7 +11788,14 @@ impl SqlEditorWidget {
             return true;
         }
 
-        if Self::is_mysql_oracle_only_type_package_cluster_or_rollback_slot(&words) {
+        // MariaDB (sql_mode=ORACLE) supports `CREATE [OR REPLACE] PACKAGE
+        // [BODY] [IF NOT EXISTS]`, so PACKAGE DDL is not an "Oracle-only" slot
+        // there — mirroring the MariaDB sequence exemption above.
+        if Self::is_mysql_oracle_only_type_package_cluster_or_rollback_slot(&words)
+            && !(completion_db_type_is_mariadb(db_type)
+                && Self::leading_ddl_object_type(&words)
+                    .is_some_and(|(ty, _)| matches!(ty, "PACKAGE" | "PACKAGE BODY")))
+        {
             return true;
         }
 
@@ -16104,6 +16195,10 @@ impl SqlEditorWidget {
         if Self::cursor_is_at_symbol_tool_argument_slot(&toks) {
             return true;
         }
+        // The SET/SHOW SQL-vs-tool disambiguation must also see the identifier
+        // chain being typed at the cursor (`SET transaction|`), which `end`
+        // excludes; extend the view over the full token slice for that check.
+        let toks_with_current = Self::meaningful_tokens_before(tokens, tokens.len());
         toks.iter().enumerate().rev().any(|(idx, token)| {
             let SqlToken::Word(word) = token else {
                 return false;
@@ -16122,7 +16217,81 @@ impl SqlEditorWidget {
                     .iter()
                     .skip(idx + 1)
                     .any(|token| matches!(token, SqlToken::Symbol(sym) if sym == ";"))
+                && !Self::tool_command_argument_is_sql_slot(&toks_with_current, idx, word)
         })
+    }
+
+    /// `SET` and `SHOW` are ambiguous tool/SQL statement heads. A `SET` whose
+    /// first argument word is (a prefix of) the SQL `SET TRANSACTION` /
+    /// `SET CONSTRAINT[S]` / `SET ROLE` statements, and a `SHOW ERRORS
+    /// <object-kind> <name>` object-name slot, are SQL positions — completion
+    /// must not treat them as tool no-SQL-argument slots.
+    fn tool_command_argument_is_sql_slot(
+        toks: &[&SqlToken],
+        command_idx: usize,
+        command_word: &str,
+    ) -> bool {
+        let following_words: Vec<&str> = toks
+            .iter()
+            .skip(command_idx + 1)
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.as_str()),
+                _ => None,
+            })
+            .collect();
+        if command_word.eq_ignore_ascii_case("SET") {
+            const SQL_SET_STATEMENT_KEYWORDS: &[&str] =
+                &["TRANSACTION", "CONSTRAINT", "CONSTRAINTS", "ROLE"];
+            return following_words.first().is_some_and(|first| {
+                SQL_SET_STATEMENT_KEYWORDS.iter().any(|keyword| {
+                    keyword.eq_ignore_ascii_case(first)
+                        || crate::ui::intellisense::suggestion_matches_completion_prefix(
+                            keyword, first,
+                        )
+                })
+            });
+        }
+        if command_word.eq_ignore_ascii_case("SHOW") {
+            // `SHOW ERRORS PACKAGE [BODY] name` / `… PROCEDURE|FUNCTION|TRIGGER|
+            // VIEW|TYPE [BODY]|DIMENSION|JAVA SOURCE|CLASS name`: once an
+            // object-kind keyword AND a name word being typed are present, the
+            // argument names an SQL object. Without the name word the slot still
+            // belongs to the tool keyword provider (`BODY`, kind keywords).
+            const SHOW_ERRORS_OBJECT_KINDS: &[&str] = &[
+                "PACKAGE",
+                "PROCEDURE",
+                "FUNCTION",
+                "TRIGGER",
+                "VIEW",
+                "TYPE",
+                "DIMENSION",
+                "JAVA",
+                "BODY",
+                "SOURCE",
+                "CLASS",
+            ];
+            if !matches!(
+                following_words.first(),
+                Some(first) if first.eq_ignore_ascii_case("ERRORS") || first.eq_ignore_ascii_case("ERR")
+            ) {
+                return false;
+            }
+            let mut rest = &following_words[1..];
+            let mut saw_kind = false;
+            while let Some(word) = rest.first() {
+                if SHOW_ERRORS_OBJECT_KINDS
+                    .iter()
+                    .any(|candidate| candidate.eq_ignore_ascii_case(word))
+                {
+                    saw_kind = true;
+                    rest = &rest[1..];
+                } else {
+                    break;
+                }
+            }
+            return saw_kind && !rest.is_empty();
+        }
+        false
     }
 
     fn mysql_tool_command_has_no_sql_argument(command: &str) -> bool {
@@ -18059,6 +18228,12 @@ impl SqlEditorWidget {
         if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
             return false;
         }
+        // A `:=` inside the package body's executable region (a routine body or
+        // the body's initialization `BEGIN` section) is an assignment statement,
+        // not a declaration-item default. The frame model distinguishes the two.
+        if Self::cursor_in_plsql_executable_block(tokens, end) {
+            return false;
+        }
 
         let toks = Self::meaningful_tokens_before(tokens, end);
         let Some(package_idx) = toks.iter().position(
@@ -18563,14 +18738,28 @@ impl SqlEditorWidget {
             return false;
         }
 
-        matches!(
-            Self::meaningful_tokens_before(tokens, end).last(),
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        let last_is_declaration_keyword = matches!(
+            toks.last(),
             Some(SqlToken::Word(word))
                 if matches!(
                     word.to_ascii_uppercase().as_str(),
                     "TYPE" | "SUBTYPE" | "CURSOR" | "FUNCTION" | "PROCEDURE"
                 )
-        )
+        );
+        if !last_is_declaration_keyword {
+            return false;
+        }
+        // `TYPE t IS REF CURSOR |` — this CURSOR is part of the REF CURSOR type
+        // specifier, not a cursor declaration; the slot expects `RETURN`, not a
+        // new name.
+        !(matches!(
+            toks.last(),
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("CURSOR")
+        ) && matches!(
+            toks.len().checked_sub(2).and_then(|idx| toks.get(idx)),
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("REF")
+        ))
     }
 
     fn cursor_is_at_plsql_declaration_object_name_slot_for_context(
@@ -36916,6 +37105,37 @@ impl SqlEditorWidget {
         (!into_already).then_some(&["INTO"][..])
     }
 
+    /// True while the word at the cursor is itself the DML `RETURNING`/`RETURN`
+    /// keyword being typed out (`UPDATE … SET x = 1 returning|`). The phase
+    /// machine has already consumed the word (phase `DmlReturningList`), which
+    /// flips on the column restriction and would suppress the expected-keyword
+    /// source — hiding the very keyword being completed.
+    fn cursor_is_typing_dml_returning_keyword(
+        deep_ctx: &intellisense_context::CursorContext,
+        prefix: &str,
+    ) -> bool {
+        if prefix.is_empty()
+            || !matches!(
+                deep_ctx.phase,
+                intellisense_context::SqlPhase::DmlReturningList
+            )
+        {
+            return false;
+        }
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let end = Self::expected_keyword_suggestion_context_end(
+            tokens,
+            deep_ctx.cursor_token_len,
+            prefix,
+        );
+        end < deep_ctx.cursor_token_len
+            && matches!(
+                tokens.get(end),
+                Some(SqlToken::Word(word))
+                    if word.eq_ignore_ascii_case("RETURNING") || word.eq_ignore_ascii_case("RETURN")
+            )
+    }
+
     fn cursor_is_at_dml_returning_into_keyword_slot_for_context(
         prefix: &str,
         deep_ctx: &intellisense_context::CursorContext,
@@ -38477,6 +38697,15 @@ impl SqlEditorWidget {
         exclude_current_identifier_chain: bool,
         db_type: Option<crate::db::DatabaseType>,
     ) -> Option<DataTypePosition> {
+        // A `FOR UPDATE OF |` locking column list is always a column position,
+        // even when it sits inside a PL/SQL cursor declaration whose surrounding
+        // tokens would otherwise scan as a declaration type slot.
+        if matches!(
+            deep_ctx.phase,
+            intellisense_context::SqlPhase::LockingColumnList
+        ) {
+            return None;
+        }
         let tokens = Self::current_query_tokens(deep_ctx);
         let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
         let end = Self::expected_suggestion_context_end(
@@ -38484,6 +38713,13 @@ impl SqlEditorWidget {
             cursor_token_len,
             exclude_current_identifier_chain,
         );
+        // `v_name oqt_|.ename%TYPE` — the word being typed is the *owner* of a
+        // `.column%TYPE/%ROWTYPE` attribute (a relation qualifier head), never a
+        // type name, even though the surrounding declaration would otherwise
+        // scan as a type slot.
+        if Self::cursor_is_at_oracle_type_attribute_relation_owner_slot(tokens, end, db_type) {
+            return None;
+        }
         let current_context_blocks_type_fallback =
             Self::expected_create_type_object_member_keyword_candidates(tokens, end, db_type)
                 .or_else(|| {

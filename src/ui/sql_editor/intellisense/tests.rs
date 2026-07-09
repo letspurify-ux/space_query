@@ -47035,782 +47035,58 @@ fn query_completion_suggestions_with_data(
         &routine_cache,
         expanded.cursor_in_statement,
     );
-    let deep_ctx = analysis.context.clone();
     let (prefix, word_start, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
-    let prefix_is_followed_by_call_paren =
-        SqlEditorWidget::text_after_cursor_starts_with_call_paren(sql.get(cursor..).unwrap_or(""))
-            || SqlEditorWidget::cursor_prefix_is_followed_by_call_paren_for_context(
-                &deep_ctx,
-                !prefix.is_empty(),
-            );
     let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, word_start);
     let raw_qualifier = SqlEditorWidget::raw_qualifier_before_word_in_text(&sql, word_start);
-    let data_for_virtual = Arc::new(Mutex::new(data.clone()));
+    // Mirror production's bounded text_after_cursor window (128 bytes, clamped
+    // to a char boundary) so suffix-sensitive gates behave identically.
+    let text_after_cursor = {
+        let tail = sql.get(cursor..).unwrap_or("");
+        let mut end = tail.len().min(128);
+        while end < tail.len() && !tail.is_char_boundary(end) {
+            end += 1;
+        }
+        tail[..end].to_string()
+    };
+    let snapshot = IntellisenseTriggerSnapshot {
+        request_generation: 0,
+        buffer_revision: 0,
+        cursor_pos: cursor as i32,
+        cursor_pos_usize: cursor,
+        preferred_db_type: db_type,
+        prefix,
+        word_start,
+        qualifier,
+        raw_qualifier,
+        signature_scan_text: signature_scan_text_before_cursor_for_test(&sql, cursor).to_string(),
+        text_after_cursor,
+    };
+    let shared_data = Arc::new(Mutex::new(std::mem::take(data)));
     let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
     let connection = create_shared_connection();
-    let virtual_table_columns = collect_virtual_columns_from_relations(
-        &deep_ctx,
-        &data_for_virtual,
+    // The production async-parse path hands `expanded_statement_text` (the
+    // current statement window) to the shared computation; do the same here so
+    // the sweep/regression harness follows the exact production flow.
+    let computation = SqlEditorWidget::compute_intellisense_suggestions(
+        &shared_data,
         &sender,
         &connection,
+        &snapshot,
+        &analysis,
+        &expanded.text,
+        include_locals,
     );
-    data.replace_virtual_table_columns(virtual_table_columns);
-
-    let early_signature_argument_suggestions = if !crate::sql_text::mysql_compatibility_for_sql(
-        "",
-        Some(db_type),
-    )
-    {
-        SqlEditorWidget::cached_signature_named_argument_suggestions(
-            data,
-            signature_scan_text_before_cursor_for_test(&sql, cursor),
-            &prefix,
-        )
-    } else {
-        Vec::new()
-    };
-    let early_builtin_function_call_suggestions =
-        SqlEditorWidget::collect_builtin_function_call_suggestions_for_slot(
-            &prefix,
-            Some(db_type),
-            prefix_is_followed_by_call_paren,
-        );
-    let early_expected_keyword_suggestions =
-        SqlEditorWidget::collect_expected_keyword_suggestions_with_expression_context(
-            &prefix,
-            &deep_ctx,
-            Some(db_type),
-            None,
-        );
-    let early_structural_keyword_before_current_identifier =
-        if !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type)) {
-            SqlEditorWidget::oracle_structural_keyword_prefix_fallback(
-                &prefix,
-                &deep_ctx,
-                Some(db_type),
-            )
-        } else {
-            None
-        };
-    let mysql_named_value_suggestions = SqlEditorWidget::mysql_named_value_suggestions_for_context(
-        data,
-        &prefix,
-        &deep_ctx,
-        !prefix.is_empty(),
-        Some(db_type),
-    );
-    if SqlEditorWidget::cursor_alias_declaration_blocks_completion(
-        analysis.cursor_in_alias_declaration,
-        None,
-        &prefix,
-        &deep_ctx,
-        Some(db_type),
-    ) && !matches!(
-        deep_ctx.phase,
-        intellisense_context::SqlPhase::LockingColumnList
-    ) && early_signature_argument_suggestions.is_empty()
-        && early_builtin_function_call_suggestions.is_empty()
-        && early_expected_keyword_suggestions.is_empty()
-        && early_structural_keyword_before_current_identifier.is_none()
-        && SqlEditorWidget::exact_catalog_keyword_for_prefix(&prefix, Some(db_type)).is_none()
-    {
-        return Vec::new();
+    *data = Arc::try_unwrap(shared_data)
+        .map(|mutex| mutex.into_inner().unwrap_or_else(|poisoned| poisoned.into_inner()))
+        .unwrap_or_else(|arc| {
+            arc.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        });
+    match computation {
+        IntellisenseCompletionComputation::Suppressed => Vec::new(),
+        IntellisenseCompletionComputation::Computed(computed) => computed.suggestions,
     }
-    let context = SqlEditorWidget::classify_intellisense_context(
-        &deep_ctx,
-        deep_ctx.statement_tokens.as_ref(),
-    );
-    let column_tables = SqlEditorWidget::resolve_column_tables_for_context_for_db(
-        qualifier.as_deref(),
-        &deep_ctx,
-        Some(db_type),
-    );
-    let column_scope = (!column_tables.is_empty()).then(|| column_tables.clone());
-    let at_dml_set_target_list = matches!(
-        deep_ctx.phase,
-        intellisense_context::SqlPhase::DmlSetTargetList
-    );
-    let at_column_target_list = at_dml_set_target_list
-        || matches!(
-            deep_ctx.phase,
-            intellisense_context::SqlPhase::LockingColumnList
-        );
-    let include_columns = matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll)
-        || at_column_target_list;
-    let expr_kw = SqlEditorWidget::expression_keyword_context(
-        &deep_ctx,
-        &data,
-        &column_tables,
-        !prefix.is_empty(),
-        Some(db_type),
-    );
-    let exclude_current_identifier_chain = !prefix.is_empty();
-    let at_keyword_only_identifier_slot =
-        SqlEditorWidget::cursor_is_at_identifier_suppressing_keyword_slot_for_context(
-            &deep_ctx,
-            exclude_current_identifier_chain,
-            Some(db_type),
-        );
-    let at_keyword_only_slot = SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot_for_db(
-        &deep_ctx,
-        exclude_current_identifier_chain,
-        Some(db_type),
-    );
-    let data_type_position = SqlEditorWidget::data_type_position_for_context_for_db(
-        &deep_ctx,
-        exclude_current_identifier_chain,
-        Some(db_type),
-    );
-    let at_data_type_position = data_type_position.is_some();
-    let local_record_member_suggestions = qualifier.as_deref().and_then(|qualifier| {
-        SqlEditorWidget::collect_local_record_member_suggestions(
-            qualifier,
-            &prefix,
-            expanded.cursor_in_statement,
-            raw_qualifier.as_deref(),
-            &analysis,
-        )
-    });
-    let text_before_cursor = sql.get(..cursor).unwrap_or(&sql);
-    let outer_cursor_for_loop_qualifier = qualifier.clone().or_else(|| {
-        SqlEditorWidget::qualifier_before_prefix_at_text_end(text_before_cursor, &prefix)
-    });
-    let outer_cursor_for_loop_record_member_suggestions = if local_record_member_suggestions
-        .as_ref()
-        .is_none_or(Vec::is_empty)
-    {
-        outer_cursor_for_loop_qualifier.as_deref().and_then(|qualifier| {
-            SqlEditorWidget::plsql_outer_cursor_for_loop_record_member_suggestions_from_text(
-                text_before_cursor,
-                qualifier,
-                &prefix,
-                Some(db_type),
-            )
-        })
-    } else {
-        None
-    };
-    let has_resolved_local_record_member_scope = local_record_member_suggestions.is_some()
-        || outer_cursor_for_loop_record_member_suggestions.is_some();
-    let local_rowtype_member_sources = qualifier
-        .as_deref()
-        .map(|qualifier| {
-            SqlEditorWidget::local_rowtype_member_sources_for_qualifier(
-                qualifier,
-                expanded.cursor_in_statement,
-                raw_qualifier.as_deref(),
-                &analysis,
-            )
-        })
-        .unwrap_or_default();
-    let local_rowtype_member_suggestions = if !local_rowtype_member_sources.is_empty() {
-        data.get_column_suggestions(&prefix, Some(&local_rowtype_member_sources))
-    } else {
-        Vec::new()
-    };
-    let has_local_record_member_scope =
-        has_resolved_local_record_member_scope || !local_rowtype_member_sources.is_empty();
-    let local_schema_type_member_suggestions = if has_local_record_member_scope {
-        Vec::new()
-    } else if let Some(qualifier) = qualifier.as_deref() {
-        SqlEditorWidget::local_schema_type_member_suggestions(
-            data,
-            qualifier,
-            &prefix,
-            expanded.cursor_in_statement,
-            raw_qualifier.as_deref(),
-            &analysis,
-        )
-    } else {
-        Vec::new()
-    };
-    let qualified_member_suggestions = qualifier
-        .as_deref()
-        .map(|qualifier| {
-            let mut suggestions = data.get_member_suggestions(qualifier, &prefix, false);
-            if suggestions.is_empty()
-                && !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type))
-            {
-                if let Some(target) = SqlEditorWidget::oracle_synonym_target_with_member_cache(
-                    data,
-                    qualifier,
-                    false,
-                    Some(db_type),
-                ) {
-                    suggestions = data.get_member_suggestions(&target, &prefix, false);
-                } else if SqlEditorWidget::matches_string_list_case_insensitive(
-                    &data.sequences,
-                    qualifier,
-                ) {
-                    suggestions = ["NEXTVAL", "CURRVAL"]
-                        .into_iter()
-                        .filter(|pseudo| {
-                            SqlEditorWidget::completion_suggestion_matches_prefix(
-                                pseudo, &prefix,
-                            )
-                        })
-                        .map(str::to_string)
-                        .collect();
-                } else if let Some(members) =
-                    SqlEditorWidget::oracle_plsql_bulk_exceptions_member_suggestions(
-                        qualifier, &prefix,
-                    )
-                {
-                    suggestions = members;
-                } else if let Some(members) =
-                    SqlEditorWidget::oracle_builtin_package_member_suggestions(qualifier, &prefix)
-                {
-                    suggestions = members;
-                }
-            }
-            suggestions
-        })
-        .unwrap_or_default();
-    let oracle_type_attribute_relation_member_suggestions =
-        if let Some(qualifier) = qualifier.as_deref().filter(|_| {
-            SqlEditorWidget::cursor_is_at_oracle_type_attribute_column_member_slot_for_context(
-                &deep_ctx,
-                Some(db_type),
-            )
-        }) {
-            data.get_column_suggestions(&prefix, Some(&[qualifier.to_string()]))
-        } else {
-            Vec::new()
-        };
-    let create_table_declared_column_suggestions = if qualifier.is_none() {
-        SqlEditorWidget::create_table_declared_column_suggestions_for_context(
-            &deep_ctx,
-            exclude_current_identifier_chain,
-            &prefix,
-        )
-    } else {
-        None
-    };
-    let create_table_storage_column_suggestions = if qualifier.is_none() {
-        SqlEditorWidget::create_table_storage_column_suggestions_for_context(
-            &deep_ctx,
-            exclude_current_identifier_chain,
-            &prefix,
-            Some(db_type),
-        )
-    } else {
-        None
-    };
-    let source_allowance = CompletionSourcePolicy::new(
-        false,
-        at_keyword_only_identifier_slot,
-        at_keyword_only_slot,
-        false,
-        false,
-        expr_kw,
-    )
-    .allowance(context, qualifier.as_deref(), expr_kw);
-    let at_value_only_no_expected_keyword_slot = qualifier.is_none()
-        && SqlEditorWidget::cursor_is_at_value_only_no_expected_keyword_slot_for_context(
-            &deep_ctx,
-            !prefix.is_empty(),
-            Some(db_type),
-        );
-    let at_completed_oracle_sequence_pseudocolumn = qualifier.is_none()
-        && SqlEditorWidget::cursor_is_after_oracle_sequence_pseudocolumn_for_context(
-            &deep_ctx,
-            !prefix.is_empty(),
-            Some(db_type),
-        );
-    let at_column_property_argument_slot = qualifier.is_none()
-        && SqlEditorWidget::cursor_is_at_column_property_argument_slot_for_context(
-            &deep_ctx,
-            !prefix.is_empty(),
-            Some(db_type),
-        );
-    let at_mysql_insert_column_list_slot = qualifier.is_none()
-        && SqlEditorWidget::mysql_insert_column_list_scope_for_context(&deep_ctx, false, Some(db_type))
-            .is_some();
-    let at_mysql_on_duplicate_target_column_slot = qualifier.is_none()
-        && SqlEditorWidget::mysql_on_duplicate_target_column_scope_for_context(
-            &deep_ctx,
-            false,
-            Some(db_type),
-        )
-        .is_some();
-    let at_mysql_on_duplicate_values_function_column_slot = qualifier.is_none()
-        && SqlEditorWidget::mysql_on_duplicate_values_function_column_scope_for_context(
-            &deep_ctx,
-            false,
-            Some(db_type),
-        )
-        .is_some();
-    let expected_object_kind = if qualifier.is_none() {
-        SqlEditorWidget::expected_object_suggestion_kind_for_db(
-            &prefix,
-            None,
-            &deep_ctx,
-            Some(db_type),
-        )
-    } else {
-        None
-    };
-    let expected_object_suggestions = if source_allowance.expected_object_suggestions
-        || expected_object_kind
-            .is_some_and(SqlEditorWidget::expected_object_kind_overrides_source_allowance)
-    {
-        expected_object_kind
-            .map(|kind| {
-                SqlEditorWidget::collect_expected_object_suggestions_for_kind_for_db(
-                    data,
-                    &prefix,
-                    kind,
-                    Some(db_type),
-                )
-            })
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    let replace_table_context_with_expected_objects = expected_object_kind.is_some();
-    let at_dedicated_column_slot = create_table_declared_column_suggestions.is_some()
-        || create_table_storage_column_suggestions.is_some()
-        || at_mysql_insert_column_list_slot
-        || at_mysql_on_duplicate_target_column_slot
-        || at_mysql_on_duplicate_values_function_column_slot;
-    let mut suggestions = if has_resolved_local_record_member_scope {
-        let local_record_member_suggestions =
-            if local_record_member_suggestions.as_ref().is_some_and(|values| !values.is_empty()) {
-                local_record_member_suggestions.unwrap_or_default()
-            } else {
-                outer_cursor_for_loop_record_member_suggestions
-                    .or(local_record_member_suggestions)
-                    .unwrap_or_default()
-            };
-        SqlEditorWidget::merge_suggestions_with_context_aliases(
-            local_record_member_suggestions,
-            local_rowtype_member_suggestions,
-            false,
-        )
-    } else if !local_rowtype_member_sources.is_empty() {
-        local_rowtype_member_suggestions
-    } else if !local_schema_type_member_suggestions.is_empty() {
-        local_schema_type_member_suggestions
-    } else if !qualified_member_suggestions.is_empty() {
-        qualified_member_suggestions
-    } else if !oracle_type_attribute_relation_member_suggestions.is_empty() {
-        oracle_type_attribute_relation_member_suggestions
-    } else if !mysql_named_value_suggestions.is_empty() {
-        mysql_named_value_suggestions
-    } else if at_column_target_list && column_scope.is_some() {
-        SqlEditorWidget::scoped_column_suggestions(data, &prefix, column_scope.as_deref())
-    } else if replace_table_context_with_expected_objects {
-        expected_object_suggestions
-    } else if let Some(suggestions) = create_table_declared_column_suggestions {
-        suggestions
-    } else if let Some(suggestions) = create_table_storage_column_suggestions {
-        suggestions
-    } else if at_dedicated_column_slot {
-        SqlEditorWidget::scoped_column_suggestions(data, &prefix, column_scope.as_deref())
-    } else if data_type_position.is_some_and(|position| {
-        SqlEditorWidget::data_type_position_allows_user_type_objects(position, Some(db_type))
-    }) {
-        data.get_type_object_suggestions(&prefix)
-    } else if qualifier.is_none()
-        && ((at_keyword_only_identifier_slot && !at_column_target_list)
-            || (at_keyword_only_slot && !at_column_target_list)
-            || SqlEditorWidget::cursor_is_at_mysql_schema_object_keyword_slot_for_context(
-                &deep_ctx,
-                exclude_current_identifier_chain,
-                Some(db_type),
-            )
-            || SqlEditorWidget::cursor_is_at_transaction_or_lock_keyword_slot_for_context(
-                &deep_ctx,
-                exclude_current_identifier_chain,
-                Some(db_type),
-            )
-            || SqlEditorWidget::cursor_is_at_transaction_or_lock_value_non_catalog_slot_for_context(
-                &deep_ctx,
-                exclude_current_identifier_chain,
-                Some(db_type),
-            ))
-    {
-        Vec::new()
-    } else {
-        SqlEditorWidget::base_suggestions_for_context(
-            data,
-            &prefix,
-            qualifier.as_deref(),
-            column_scope.as_deref(),
-            include_columns,
-            context,
-            false,
-            Some(db_type),
-            expr_kw,
-        )
-    };
-    let mut expected_keywords =
-        SqlEditorWidget::collect_expected_keyword_suggestions_with_expression_context(
-            &prefix,
-            &deep_ctx,
-            Some(db_type),
-            Some(expr_kw),
-        );
-    if early_expected_keyword_suggestions
-        .iter()
-        .any(|keyword| keyword.eq_ignore_ascii_case("TRANSACTION"))
-        && !expected_keywords
-            .iter()
-            .any(|keyword| keyword.eq_ignore_ascii_case("TRANSACTION"))
-    {
-        expected_keywords.insert(0, "TRANSACTION".to_string());
-    }
-    if at_dedicated_column_slot {
-        expected_keywords.clear();
-    }
-    if !expected_keywords.is_empty() {
-        suggestions = SqlEditorWidget::merge_suggestions_with_context_aliases(
-            suggestions,
-            expected_keywords,
-            true,
-        );
-    }
-    let builtin_function_call_suggestions = if !at_data_type_position {
-        SqlEditorWidget::collect_builtin_function_call_suggestions_for_slot(
-            &prefix,
-            Some(db_type),
-            prefix_is_followed_by_call_paren,
-        )
-    } else {
-        Vec::new()
-    };
-    if !builtin_function_call_suggestions.is_empty() {
-        suggestions = SqlEditorWidget::merge_suggestions_with_context_aliases(
-            suggestions,
-            builtin_function_call_suggestions,
-            true,
-        );
-    }
-    let oracle_qualifier_head_suggestions = if qualifier.is_none()
-        && !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type))
-        && !matches!(
-            expected_object_kind,
-            Some(ExpectedObjectSuggestionKind::Sequence)
-        )
-        && (SqlEditorWidget::text_after_cursor_starts_with_qualifier_dot(
-            sql.get(cursor..).unwrap_or(""),
-        ) || SqlEditorWidget::cursor_prefix_is_followed_by_qualifier_dot_for_context(
-            &deep_ctx,
-            !prefix.is_empty(),
-        ))
-    {
-        SqlEditorWidget::collect_oracle_qualifier_head_suggestions(data, &prefix, Some(db_type))
-    } else {
-        Vec::new()
-    };
-    let force_context_name_qualifier_head = qualifier.is_none()
-        && (SqlEditorWidget::cursor_prefix_is_followed_by_qualifier_dot_for_context(
-            &deep_ctx,
-            !prefix.is_empty(),
-        ) || !oracle_qualifier_head_suggestions.is_empty());
-    let context_name_context = if force_context_name_qualifier_head {
-        SqlContext::ColumnName
-    } else {
-        context
-    };
-    let context_names =
-        if source_allowance.context_name_suggestions || force_context_name_qualifier_head {
-            SqlEditorWidget::collect_context_name_suggestions(
-                &prefix,
-                &deep_ctx,
-                context_name_context,
-            )
-        } else {
-            Vec::new()
-        };
-    suggestions = SqlEditorWidget::maybe_merge_suggestions_with_context_aliases(
-        suggestions,
-        context_names,
-        matches!(context, SqlContext::TableName) || force_context_name_qualifier_head,
-        qualifier.is_some(),
-    );
-    let recursive_cte_columns = if qualifier.is_none() {
-        SqlEditorWidget::recursive_cte_column_suggestions_for_prefix(&prefix, &deep_ctx)
-    } else {
-        Vec::new()
-    };
-    suggestions = SqlEditorWidget::maybe_merge_suggestions_with_context_aliases(
-        suggestions,
-        recursive_cte_columns,
-        true,
-        qualifier.is_some(),
-    );
-    let text_recursive_cte_columns = if qualifier.is_none() {
-        SqlEditorWidget::mysql_recursive_cte_anchor_column_suggestions_from_text(
-            &prefix,
-            sql.get(..cursor).unwrap_or(&sql),
-            Some(db_type),
-        )
-    } else {
-        Vec::new()
-    };
-    suggestions = SqlEditorWidget::maybe_merge_suggestions_with_context_aliases(
-        suggestions,
-        text_recursive_cte_columns,
-        true,
-        qualifier.is_some(),
-    );
-    let local_qualifier_head_suggestions = if force_context_name_qualifier_head
-        && (SqlEditorWidget::collect_local_record_member_suggestions(
-            &prefix,
-            "",
-            expanded.cursor_in_statement,
-            None,
-            &analysis,
-        )
-        .is_some()
-            || !SqlEditorWidget::local_rowtype_member_sources_for_qualifier(
-                &prefix,
-                expanded.cursor_in_statement,
-                None,
-                &analysis,
-            )
-            .is_empty())
-    {
-        vec![prefix.clone()]
-    } else {
-        Vec::new()
-    };
-    suggestions = SqlEditorWidget::maybe_merge_suggestions_with_context_aliases(
-        suggestions,
-        local_qualifier_head_suggestions,
-        force_context_name_qualifier_head,
-        false,
-    );
-    let mysql_trigger_pseudo_rows = if force_context_name_qualifier_head {
-        SqlEditorWidget::collect_mysql_trigger_pseudo_row_suggestions(&prefix, expr_kw, Some(db_type))
-    } else {
-        Vec::new()
-    };
-    suggestions = SqlEditorWidget::maybe_merge_suggestions_with_context_aliases(
-        suggestions,
-        mysql_trigger_pseudo_rows,
-        force_context_name_qualifier_head,
-        qualifier.is_some(),
-    );
-    suggestions = SqlEditorWidget::maybe_merge_suggestions_with_context_aliases(
-        suggestions,
-        oracle_qualifier_head_suggestions,
-        force_context_name_qualifier_head,
-        qualifier.is_some(),
-    );
-    if !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type))
-    {
-        let signature_argument_suggestions = early_signature_argument_suggestions;
-        if !signature_argument_suggestions.is_empty() {
-            suggestions = SqlEditorWidget::merge_suggestions_with_context_aliases(
-                suggestions,
-                signature_argument_suggestions,
-                true,
-            );
-        }
-    }
-    let expected_keyword_before_current_identifier =
-        SqlEditorWidget::expected_catalog_keyword_before_current_identifier(
-            &prefix,
-            &deep_ctx,
-            Some(db_type),
-            expr_kw,
-        );
-    if SqlEditorWidget::should_append_expected_catalog_keyword_after_context_filters(
-        context,
-        None,
-        source_allowance,
-        expr_kw,
-        at_data_type_position,
-        false,
-        false,
-        SqlEditorWidget::cursor_prefix_starts_relation_name_slot(&deep_ctx),
-        expected_keyword_before_current_identifier.as_deref(),
-    ) {
-        if let Some(keyword) = expected_keyword_before_current_identifier {
-            SqlEditorWidget::append_catalog_keyword_suggestion(&mut suggestions, &keyword);
-        }
-    }
-    if include_locals {
-        let at_plsql_end_label_slot_by_text = qualifier.is_none()
-            && !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type))
-            && SqlEditorWidget::text_before_cursor_ends_with_plsql_end_label_slot(
-                sql.get(..cursor).unwrap_or(&sql),
-                &prefix,
-            );
-        let plsql_named_end_target_suggestions_by_text = if qualifier.is_none()
-            && !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type))
-        {
-            SqlEditorWidget::plsql_named_end_target_suggestions_from_statement_text(
-                &expanded.text,
-                expanded.cursor_in_statement,
-                &prefix,
-                Some(db_type),
-            )
-        } else {
-            Vec::new()
-        };
-        let plsql_cursor_parameter_suggestions = if qualifier.is_none()
-            && !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type))
-        {
-            SqlEditorWidget::plsql_cursor_parameter_suggestions_from_statement_text(
-                &expanded.text,
-                expanded.cursor_in_statement,
-                &prefix,
-                Some(db_type),
-            )
-        } else {
-            Vec::new()
-        };
-        let at_name_only_local_symbol_slot =
-            SqlEditorWidget::cursor_is_at_plsql_goto_label_slot_for_context(
-                &deep_ctx,
-                !prefix.is_empty(),
-                Some(db_type),
-            ) || SqlEditorWidget::cursor_is_at_plsql_exit_continue_label_slot_for_context(
-                &deep_ctx,
-                !prefix.is_empty(),
-                Some(db_type),
-            ) || SqlEditorWidget::cursor_is_at_plsql_end_label_slot_for_context(
-                &deep_ctx,
-                !prefix.is_empty(),
-                Some(db_type),
-            ) || at_plsql_end_label_slot_by_text
-                || !plsql_named_end_target_suggestions_by_text.is_empty()
-                || SqlEditorWidget::cursor_is_at_plsql_named_end_target_slot_for_context(
-                &deep_ctx,
-                !prefix.is_empty(),
-                Some(db_type),
-            ) || SqlEditorWidget::cursor_is_at_plsql_open_for_source_slot_for_context(
-                &deep_ctx,
-                !prefix.is_empty(),
-                Some(db_type),
-            ) || SqlEditorWidget::cursor_is_at_rollback_to_savepoint_name_slot_for_context(
-                &deep_ctx,
-                !prefix.is_empty(),
-                Some(db_type),
-            ) || SqlEditorWidget::cursor_is_at_mysql_leave_iterate_label_slot_for_context(
-                &deep_ctx,
-                !prefix.is_empty(),
-                Some(db_type),
-            ) || SqlEditorWidget::cursor_is_at_mysql_prepared_statement_handle_reference_slot_for_context(
-                &deep_ctx,
-                !prefix.is_empty(),
-                Some(db_type),
-            ) || SqlEditorWidget::cursor_is_at_plsql_exception_name_for_context(
-                &deep_ctx,
-                !prefix.is_empty(),
-            );
-        let at_plsql_statement_start_local_symbol_slot = !prefix.is_empty()
-            && SqlEditorWidget::plsql_statement_start_allows_bare_calls(expr_kw)
-            && !SqlEditorWidget::cursor_is_at_plsql_goto_label_slot_for_context(
-                &deep_ctx,
-                true,
-                Some(db_type),
-            )
-            && !SqlEditorWidget::cursor_is_at_plsql_exit_continue_label_slot_for_context(
-                &deep_ctx,
-                true,
-                Some(db_type),
-            )
-            && !SqlEditorWidget::cursor_is_at_plsql_end_label_slot_for_context(
-                &deep_ctx,
-                true,
-                Some(db_type),
-            )
-            && !at_plsql_end_label_slot_by_text
-            && plsql_named_end_target_suggestions_by_text.is_empty()
-            && !SqlEditorWidget::cursor_is_at_plsql_named_end_target_slot_for_context(
-                &deep_ctx,
-                true,
-                Some(db_type),
-            )
-            && !SqlEditorWidget::cursor_is_after_plsql_end_keyword_for_context(
-                &deep_ctx,
-                true,
-                Some(db_type),
-            )
-            && !SqlEditorWidget::cursor_is_at_plsql_label_definition_slot_for_context(
-                &deep_ctx,
-                true,
-                Some(db_type),
-            );
-        let at_mysql_set_local_assignment_target_slot =
-            SqlEditorWidget::cursor_is_at_mysql_set_local_assignment_target_slot_for_context(
-                &deep_ctx,
-                !prefix.is_empty(),
-                Some(db_type),
-            );
-        let at_prefixed_routine_local_symbol_slot = qualifier.is_none()
-            && !prefix.is_empty();
-        if source_allowance.local_suggestions
-            || at_name_only_local_symbol_slot
-            || at_plsql_statement_start_local_symbol_slot
-            || at_mysql_set_local_assignment_target_slot
-            || at_prefixed_routine_local_symbol_slot
-            || !plsql_cursor_parameter_suggestions.is_empty()
-        {
-            let mut locals = SqlEditorWidget::collect_local_symbol_suggestions_for_db(
-                &prefix,
-                expanded.cursor_in_statement,
-                &analysis,
-                &[],
-                Some(db_type),
-            );
-            if at_plsql_end_label_slot_by_text {
-                locals = SqlEditorWidget::prepend_local_symbol_suggestions(
-                    locals,
-                    SqlEditorWidget::plsql_block_label_suggestions(&deep_ctx, &prefix),
-                );
-            }
-            if !plsql_named_end_target_suggestions_by_text.is_empty() {
-                locals = SqlEditorWidget::prepend_local_symbol_suggestions(
-                    locals,
-                    plsql_named_end_target_suggestions_by_text,
-                );
-            }
-            if !plsql_cursor_parameter_suggestions.is_empty() {
-                locals = SqlEditorWidget::prepend_local_symbol_suggestions(
-                    locals,
-                    plsql_cursor_parameter_suggestions,
-                );
-            }
-            if !locals.is_empty()
-                && (source_allowance.prepend_local_symbol_suggestions
-                    || at_name_only_local_symbol_slot
-                    || at_plsql_statement_start_local_symbol_slot
-                    || at_mysql_set_local_assignment_target_slot
-                    || at_prefixed_routine_local_symbol_slot)
-            {
-                suggestions =
-                    SqlEditorWidget::prepend_local_symbol_suggestions(suggestions, locals);
-            }
-        }
-    }
-    let offer_full_catalog_tail = SqlEditorWidget::cursor_offers_full_catalog_safety_net(
-        qualifier.as_deref(),
-        replace_table_context_with_expected_objects,
-        context,
-        expr_kw,
-        source_allowance.base_catalog_suggestions,
-        at_keyword_only_identifier_slot || at_keyword_only_slot,
-        at_value_only_no_expected_keyword_slot,
-        at_completed_oracle_sequence_pseudocolumn,
-        at_column_property_argument_slot,
-        at_dedicated_column_slot,
-        at_data_type_position,
-        false,
-        false,
-    );
-    suggestions = SqlEditorWidget::append_full_catalog_tail(
-        data,
-        suggestions,
-        &prefix,
-        context,
-        offer_full_catalog_tail,
-    );
-    suggestions
 }
 
 #[derive(Debug)]
@@ -53164,6 +52440,16 @@ fn keyword_slot_matrix_preserves_every_emitted_keyword_with_prefix_and_exact_inp
         );
 
         for keyword in keyword_suggestions {
+            // The select-modifier family (`ALL`/`DISTINCT`/`UNIQUE`/`DISTINCTROW`)
+            // is deliberately suppressed once the typed projection token has a
+            // following projection boundary (`SELECT al| FROM …` — accepting
+            // `ALL` would leave `SELECT ALL FROM …` with no projection), so its
+            // persistence is not asserted where a boundary follows the cursor.
+            if SqlEditorWidget::keyword_is_select_modifier_candidate(&keyword, Some(db_type))
+                && sql.contains("| FROM")
+            {
+                continue;
+            }
             assert_keyword(sql, &keyword, db_type);
         }
     }
@@ -81333,7 +80619,13 @@ fn plsql_local_variables_are_suggested_across_positions() {
         v_rc SYS_REFCURSOR;";
 
     // Value positions: every non-exception local is a valid operand and must appear.
+    // Slots whose expected operand type resolves to NUMBER (`v_num := …`,
+    // `RETURN` of a NUMBER function) deliberately type-gate the character
+    // constant `c_flag` out (see
+    // `local_assignment_rhs_suggestions_filter_by_target_type_when_known`), so
+    // it is only required at type-agnostic slots.
     let value_vars = ["v_num", "c_flag", "v_sal", "r_emp", "emp_cur", "v_rc"];
+    let numeric_gated_positions = ["assignment RHS", "arith operand", "RETURN value"];
     let value_positions: &[(&str, String)] = &[
         ("assignment RHS", format!("{decls} BEGIN v_num := | ; END;")),
         ("arith operand", format!("{decls} BEGIN v_num := 1 + | ; END;")),
@@ -81347,7 +80639,17 @@ fn plsql_local_variables_are_suggested_across_positions() {
     ];
     for (label, sql) in value_positions {
         let s = query_completion_suggestions_with_locals(sql, Oracle);
+        let numeric_gated = numeric_gated_positions.contains(label);
         for var in value_vars {
+            if var == "c_flag" && numeric_gated {
+                if has(&s, var) {
+                    failures.push(format!(
+                        "character constant `c_flag` leaked into numeric-typed [{label}] `{sql}`: {:?}",
+                        &s
+                    ));
+                }
+                continue;
+            }
             if !has(&s, var) {
                 failures.push(format!("`{var}` missing at [{label}] `{sql}`: {:?}", &s));
             }
@@ -84167,9 +83469,12 @@ fn oracle_test1_to_test11_actual_completion_regressions() {
                 "sum_sal FO| dept_tag IN (D10 AS '10', D20 AS '20', D30 AS '30')",
                 "FOR",
             ),
+            // Anchor on the newline so the cursor lands in the SQL statement,
+            // not in the `PROMPT [11] MATCH_RECOGNIZE (12c+): …` tool line
+            // above it (a PROMPT body is deliberately suggestion-free).
             (
-                "MATCH_RECOGNIZE (",
-                "MATC| (",
+                "\nMATCH_RECOGNIZE (",
+                "\nMATC| (",
                 "MATCH_RECOGNIZE",
             ),
             ("ONE ROW PER MATCH", "ON| ROW PER MATCH", "ONE"),
@@ -84875,7 +84180,6 @@ fn create_statement_keyword_matrix_offers_expected_keywords_across_dialects() {
             ],
             &["SEQUENCE"],
         ),
-        (MySQL, "CREATE PACKAGE |", &[], &["BODY", "IF"]),
         (
             MySQL,
             "CREATE OR REPLACE |",
@@ -84988,7 +84292,6 @@ fn create_statement_keyword_matrix_offers_expected_keywords_across_dialects() {
         (MySQL, "CREATE TRIGGER trg BEFORE |", &["INSERT", "UPDATE", "DELETE"], &["TABLE"]),
         (MySQL, "CREATE TRIGGER trg BEFORE INSERT |", &["ON"], &["OR", "WHERE"]),
         (MySQL, "CREATE TRIGGER trg BEFORE UPDATE |", &["ON"], &["OF", "OR"]),
-        (MySQL, "CREATE TRIGGER trg BEFORE INSERT OR |", &[], &["UPDATE", "DELETE"]),
         (MySQL, "DROP SPATIAL |", &["REFERENCE"], &["TABLE"]),
         (MySQL, "DROP SPATIAL REFERENCE |", &["SYSTEM"], &["TABLE"]),
         (MySQL, "DROP SPATIAL REFERENCE SYSTEM |", &["IF"], &["TABLE"]),
@@ -85310,6 +84613,17 @@ fn create_statement_keyword_matrix_offers_expected_keywords_across_dialects() {
         "CREATE statement keyword suggestion gaps:\n{}",
         failures.join("\n")
     );
+
+    // MySQL has no `CREATE PACKAGE` (the slot names a brand-new object) and no
+    // Oracle-style `INSERT OR UPDATE` trigger-event chain; production
+    // deliberately offers nothing at these slots.
+    for sql in ["CREATE PACKAGE |", "CREATE TRIGGER trg BEFORE INSERT OR |"] {
+        let suggestions = query_keyword_completion_suggestions(sql, MySQL);
+        assert!(
+            suggestions.is_empty(),
+            "MySQL `{sql}` should stay quiet: {suggestions:?}"
+        );
+    }
 }
 
 /// Bulk matrix: a variable declared through every scalar-precision, modifier,
@@ -86506,3 +85820,4 @@ fn plsql_execute_immediate_tail_space_auto_trigger_is_slot_precise() {
         )
     );
 }
+

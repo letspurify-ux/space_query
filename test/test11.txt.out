@@ -811,8 +811,8 @@ ORDER BY sale_id;
 /* 09-14. JSON_VALUE + quoted alias */
 
 SELECT e.emp_id AS "Emp#",
-    e.emp_name AS "Employee Name",
-    JSON_VALUE (e.profile_json, '$.level' RETURNING VARCHAR2 (20)) AS "Level"
+    e.emp_name [[AS]] "Employee Name",
+    JSON_VALUE (e.profile_json, '$.level' [[RETURNING]] VARCHAR2 (20)) AS "Level"
 FROM qt_employees e
 ORDER BY 1;
 /
@@ -837,7 +837,7 @@ MERGE INTO qt_sales dst
 USING (
         SELECT 2001 AS sale_id,
             5 AS emp_id,
-            DATE '2026-03-01' AS sale_date,
+            DATE '2026-03-01' [[AS]] sale_date,
             777.77 AS amount,
             'PAID' AS status,
             'merged row' AS note
@@ -845,7 +845,7 @@ USING (
         UNION ALL
         SELECT 100 AS sale_id,
             4 AS emp_id,
-            DATE '2026-03-02' AS sale_date,
+            DATE '2026-03-02' [[AS]] sale_date,
             999.99 AS amount,
             'PAID' AS status,
             'updated by merge' AS note
@@ -859,7 +859,7 @@ WHEN MATCHED THEN
     DELETE
     WHERE src.status = 'CANCELLED'
 WHEN NOT MATCHED THEN
-    INSERT (sale_id, emp_id, sale_date, amount, status, note) VALUES (src.sale_id, src.emp_id, src.sale_date, src.amount, src.status, src.note);
+    INSERT (sale_id, emp_id, sale_date, amount, status, note) [[VALUES]] (src.sale_id, src.emp_id, src.sale_date, src.amount, src.status, src.note);
 /
 
 /* 10-02. conditional multitable insert */
@@ -920,7 +920,7 @@ DECLARE
     l_emp_name VARCHAR2 (200);
     l_total NUMBER;
     l_sql VARCHAR2 (32767);
-BEGIN
+[[BEGIN]]
     l_sql := q'[
         SELECT
             e.emp_id,
@@ -944,7 +944,7 @@ BEGIN
         INTO l_emp_id,
             l_emp_name,
             l_total;
-        EXIT WHEN l_rc%NOTFOUND;
+        EXIT [[WHEN]] [[l_rc]]%NOTFOUND;
         DBMS_OUTPUT.PUT_LINE (l_emp_id || ':' || l_emp_name || ':' || l_total);
     END LOOP;
     CLOSE l_rc;
@@ -961,7 +961,7 @@ select ';' as semi, '/' as slash from dual;
 BEGIN
 END;
 ]';
-BEGIN
+[[BEGIN]]
     DBMS_OUTPUT.PUT_LINE (SUBSTR (l_txt, 1, 120));
 END;
 /
@@ -970,10 +970,10 @@ END;
 
 DECLARE
     l_val NUMBER := 10;
-BEGIN
+[[BEGIN]]
     DECLARE
         l_inner NUMBER := 0;
-    BEGIN
+    [[BEGIN]]
         l_inner := l_val / 2;
         BEGIN
             l_inner := l_inner + 1;
@@ -998,19 +998,19 @@ END;
    12. FINAL CHECK QUERIES
    --------------------------------------------------------------------- */
 
-SELECT COUNT(*) AS dept_cnt
+SELECT COUNT(*) [[AS]] dept_cnt
 FROM qt_departments;
 /
 
-SELECT COUNT(*) AS emp_cnt
+SELECT COUNT(*) [[AS]] emp_cnt
 FROM qt_employees;
 /
 
-SELECT COUNT(*) AS sale_cnt
+SELECT COUNT(*) [[AS]] sale_cnt
 FROM qt_sales;
 /
 
-SELECT COUNT(*) AS audit_cnt
+SELECT COUNT(*) [[AS]] audit_cnt
 FROM qt_audit_log;
 
 /
@@ -1021,13 +1021,28 @@ FROM qt_audit_log;
 -- db: Oracle
 -- metadata: test Oracle inferred catalog + Oracle built-ins
 -- checked: 445
--- missing: 6
+-- missing: 21
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens:
+--   814:16 word=AS prefix=A suggestions=[AND, AT] total=2 line=e.emp_name AS "Employee Name",
+--   815:43 word=RETURNING prefix=RETU suggestions=[] total=0 line=JSON_VALUE (e.profile_json, '$.level' RETURNING VARCHAR2 (20)) AS "Level"
+--   840:31 word=AS prefix=A suggestions=[AND, AT] total=2 line=DATE '2026-03-01' AS sale_date,
+--   848:31 word=AS prefix=A suggestions=[AND, AT] total=2 line=DATE '2026-03-02' AS sale_date,
 --   856:20 word=amount prefix=amou suggestions=[] total=0 line=UPDATE SET dst.amount = src.amount,
---   857:13 word=status prefix=stat suggestions=[STATEMENT] total=1 line=dst.status = src.status,
---   858:13 word=note prefix=not suggestions=[NOT] total=1 line=dst.note = src.note
+--   857:13 word=status prefix=stat suggestions=[] total=0 line=dst.status = src.status,
+--   858:13 word=note prefix=not suggestions=[] total=0 line=dst.note = src.note
+--   862:63 word=VALUES prefix=VALU suggestions=[VALUE()] total=1 line=INSERT (sale_id, emp_id, sale_date, amount, status, note) VALUES (src.sale_id, src.emp_id, src.sale_date, src.amount, src.status, src.note);
 --   868:10 word=amount prefix=amou suggestions=[] total=0 line=WHEN amount >= 500 THEN
 --   871:10 word=amount prefix=amou suggestions=[] total=0 line=WHEN amount < 500 THEN
 --   875:5 word=amount prefix=amou suggestions=[] total=0 line=amount
+--   923:1 word=BEGIN prefix=BEGI suggestions=[] total=0 line=BEGIN
+--   947:14 word=WHEN prefix=WHE suggestions=[] total=0 line=EXIT WHEN l_rc%NOTFOUND;
+--   947:19 word=l_rc prefix=l_r suggestions=[] total=0 line=EXIT WHEN l_rc%NOTFOUND;
+--   964:1 word=BEGIN prefix=BEGI suggestions=[] total=0 line=BEGIN
+--   973:1 word=BEGIN prefix=BEGI suggestions=[] total=0 line=BEGIN
+--   976:5 word=BEGIN prefix=BEGI suggestions=[] total=0 line=BEGIN
+--   1001:17 word=AS prefix=A suggestions=[AND, AT] total=2 line=SELECT COUNT(*) AS dept_cnt
+--   1005:17 word=AS prefix=A suggestions=[AND, AT] total=2 line=SELECT COUNT(*) AS emp_cnt
+--   1009:17 word=AS prefix=A suggestions=[AND, AT] total=2 line=SELECT COUNT(*) AS sale_cnt
+--   1013:17 word=AS prefix=A suggestions=[AND, AT] total=2 line=SELECT COUNT(*) AS audit_cnt
 -- =========================================================
