@@ -83,9 +83,24 @@ pub fn center_on_main(window: &mut Window) {
     window.set_pos(x, y);
 }
 
-fn dialog_prompt_height(text: &str) -> i32 {
-    let line_count = text.lines().count().max(1) as i32;
-    (line_count * 22 + 16).clamp(56, 140)
+fn dialog_text_columns(text: &str) -> i32 {
+    text.chars()
+        .map(|ch| if ch.is_ascii() { 1 } else { 2 })
+        .sum::<i32>()
+}
+
+fn dialog_prompt_height(text: &str, available_width: i32) -> i32 {
+    let columns_per_line = ((available_width - 16) / 8).max(1);
+    let line_count = text
+        .lines()
+        .map(|line| {
+            let columns = dialog_text_columns(line).max(1);
+            (columns + columns_per_line - 1) / columns_per_line
+        })
+        .sum::<i32>()
+        .max(1);
+
+    (line_count * 22 + 16).clamp(56, 420)
 }
 
 fn dialog_button_width(label: &str) -> i32 {
@@ -111,7 +126,8 @@ fn choice2_on_main_with_title(title: &str, txt: &str, b0: &str, b1: &str, b2: &s
     fltk::group::Group::set_current(None::<&fltk::group::Group>);
 
     let width = 520;
-    let prompt_height = dialog_prompt_height(txt);
+    let content_width = width - constants::DIALOG_MARGIN * 2;
+    let prompt_height = dialog_prompt_height(txt, content_width);
     let height = constants::DIALOG_MARGIN * 2
         + prompt_height
         + constants::DIALOG_SPACING
@@ -251,7 +267,8 @@ pub fn input_on_main(txt: &str, deflt: &str) -> Option<String> {
     fltk::group::Group::set_current(None::<&fltk::group::Group>);
 
     let width = 520;
-    let prompt_height = dialog_prompt_height(txt);
+    let content_width = width - constants::DIALOG_MARGIN * 2;
+    let prompt_height = dialog_prompt_height(txt, content_width);
     let height = constants::DIALOG_MARGIN * 2
         + prompt_height
         + constants::DIALOG_SPACING
@@ -423,5 +440,31 @@ impl PopupAnchorSnapshot {
         Self::capture(anchor)
             .filter(|current| current.shown && current.visible)
             .is_some_and(|current| current == self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dialog_prompt_height;
+
+    #[test]
+    fn dialog_prompt_height_keeps_short_text_compact() {
+        assert_eq!(dialog_prompt_height("Short message", 500), 56);
+    }
+
+    #[test]
+    fn dialog_prompt_height_grows_for_wrapped_long_text() {
+        let short_height = dialog_prompt_height("Short message", 500);
+        let long_message = "This alert message is intentionally long enough to wrap across several lines in the shared dialog window so the prompt area must grow instead of clipping the content.";
+
+        assert!(dialog_prompt_height(long_message, 500) > short_height);
+    }
+
+    #[test]
+    fn dialog_prompt_height_counts_non_ascii_text_wider() {
+        let ascii = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let korean = "가가가가가가가가가가가가가가가가가가가가";
+
+        assert!(dialog_prompt_height(korean, 120) >= dialog_prompt_height(ascii, 120));
     }
 }

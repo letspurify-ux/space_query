@@ -1033,6 +1033,7 @@ pub struct DbSessionLeaseEntry {
     pool_context_epoch: u64,
     lease: DbSessionLease,
     retained_state: RetainedSessionState,
+    current_scope: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1116,23 +1117,29 @@ pub struct TakenDbSessionLease {
     pool_context_epoch: u64,
     lease: Option<DbSessionLease>,
     retained_state: RetainedSessionState,
+    current_scope: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PooledSessionLeaseSnapshot {
     pub db_type: DatabaseType,
     pub pool_context_epoch: u64,
     pub transaction_state: TransactionSessionState,
     pub retained_state: RetainedSessionState,
+    pub current_scope: Option<String>,
 }
 
 impl PooledSessionLeaseSnapshot {
-    pub fn transaction_state(self) -> TransactionSessionState {
+    pub fn transaction_state(&self) -> TransactionSessionState {
         self.transaction_state
     }
 
-    pub fn retained_state(self) -> RetainedSessionState {
+    pub fn retained_state(&self) -> RetainedSessionState {
         self.retained_state
+    }
+
+    pub fn current_scope(&self) -> Option<&str> {
+        self.current_scope.as_deref()
     }
 }
 
@@ -1419,6 +1426,7 @@ impl TakenDbSessionLease {
         pool_context_epoch: u64,
         lease: DbSessionLease,
         retained_state: RetainedSessionState,
+        current_scope: Option<String>,
     ) -> Self {
         Self {
             owner,
@@ -1426,6 +1434,7 @@ impl TakenDbSessionLease {
             pool_context_epoch,
             lease: Some(lease),
             retained_state,
+            current_scope,
         }
     }
 
@@ -1435,6 +1444,10 @@ impl TakenDbSessionLease {
 
     pub fn pool_context_epoch(&self) -> u64 {
         self.pool_context_epoch
+    }
+
+    pub fn current_scope(&self) -> Option<&str> {
+        self.current_scope.as_deref()
     }
 
     pub fn lease_mut(&mut self) -> Option<&mut DbSessionLease> {
@@ -1487,12 +1500,13 @@ impl TakenDbSessionLease {
 
     pub fn restore_with_retained_state(mut self, retained_state: RetainedSessionState) -> bool {
         if let Some(lease) = self.lease.take() {
-            self.owner.apply_retained_session_disposition(
+            self.owner.apply_retained_session_disposition_with_scope(
                 self.connection_generation,
                 self.pool_context_epoch,
                 lease,
                 RetainedSessionDisposition::Retain(retained_state),
                 "db::session_lease",
+                self.current_scope.clone(),
             )
         } else {
             false
@@ -1505,12 +1519,33 @@ impl TakenDbSessionLease {
         retained_state: RetainedSessionState,
     ) -> bool {
         if let Some(lease) = self.lease.take() {
-            self.owner.apply_retained_session_disposition(
+            self.owner.apply_retained_session_disposition_with_scope(
                 self.connection_generation,
                 pool_context_epoch,
                 lease,
                 RetainedSessionDisposition::Retain(retained_state),
                 "db::session_lease",
+                self.current_scope.clone(),
+            )
+        } else {
+            false
+        }
+    }
+
+    pub fn restore_with_context_epoch_and_scope(
+        mut self,
+        pool_context_epoch: u64,
+        retained_state: RetainedSessionState,
+        current_scope: Option<String>,
+    ) -> bool {
+        if let Some(lease) = self.lease.take() {
+            self.owner.apply_retained_session_disposition_with_scope(
+                self.connection_generation,
+                pool_context_epoch,
+                lease,
+                RetainedSessionDisposition::Retain(retained_state),
+                "db::session_lease",
+                current_scope,
             )
         } else {
             false
@@ -1550,12 +1585,14 @@ impl DbSessionLeaseEntry {
         pool_context_epoch: u64,
         lease: DbSessionLease,
         retained_state: RetainedSessionState,
+        current_scope: Option<String>,
     ) -> Self {
         Self {
             connection_generation,
             pool_context_epoch,
             lease,
             retained_state,
+            current_scope,
         }
     }
 
@@ -1635,6 +1672,7 @@ impl SharedDbSessionLease {
                 pool_context_epoch: entry.pool_context_epoch,
                 transaction_state: entry.retained_state.summary_transaction_state(),
                 retained_state: entry.retained_state,
+                current_scope: entry.current_scope.clone(),
             })
     }
 
@@ -1660,6 +1698,7 @@ impl SharedDbSessionLease {
                         entry.pool_context_epoch,
                         entry.lease,
                         entry.retained_state,
+                        entry.current_scope,
                     )
                 })
             } else {
@@ -1726,6 +1765,7 @@ impl SharedDbSessionLease {
                         restore_epoch,
                         entry.lease,
                         entry.retained_state,
+                        entry.current_scope,
                     )
                 })
             } else {
@@ -1782,13 +1822,33 @@ impl SharedDbSessionLease {
         disposition: RetainedSessionDisposition,
         log_context: &str,
     ) -> bool {
+        self.apply_retained_session_disposition_with_scope(
+            connection_generation,
+            pool_context_epoch,
+            lease,
+            disposition,
+            log_context,
+            None,
+        )
+    }
+
+    pub fn apply_retained_session_disposition_with_scope(
+        &self,
+        connection_generation: u64,
+        pool_context_epoch: u64,
+        lease: DbSessionLease,
+        disposition: RetainedSessionDisposition,
+        log_context: &str,
+        current_scope: Option<String>,
+    ) -> bool {
         match disposition {
             RetainedSessionDisposition::Retain(retained_state) => self
-                .store_if_empty_with_retained_state(
+                .store_if_empty_with_retained_state_and_scope(
                     connection_generation,
                     pool_context_epoch,
                     lease,
                     retained_state,
+                    current_scope,
                 ),
             RetainedSessionDisposition::DiscardPhysical => {
                 lease.discard_physical(log_context);
@@ -1803,6 +1863,23 @@ impl SharedDbSessionLease {
         pool_context_epoch: u64,
         lease_to_store: DbSessionLease,
         retained_state: RetainedSessionState,
+    ) -> bool {
+        self.store_if_empty_with_retained_state_and_scope(
+            connection_generation,
+            pool_context_epoch,
+            lease_to_store,
+            retained_state,
+            None,
+        )
+    }
+
+    pub fn store_if_empty_with_retained_state_and_scope(
+        &self,
+        connection_generation: u64,
+        pool_context_epoch: u64,
+        lease_to_store: DbSessionLease,
+        retained_state: RetainedSessionState,
+        current_scope: Option<String>,
     ) -> bool {
         let lease_db_type = lease_to_store.db_type();
         let mut lease_to_store = Some(lease_to_store);
@@ -1847,6 +1924,7 @@ impl SharedDbSessionLease {
                         pool_context_epoch,
                         lease_to_store,
                         retained_state,
+                        current_scope,
                     ));
                 }
                 old_lease
@@ -2101,6 +2179,14 @@ fn scope_values_match_exact(left: Option<&str>, right: Option<&str>) -> bool {
         (None, None) => true,
         (Some(value), None) | (None, Some(value)) => value.trim().is_empty(),
     }
+}
+
+pub(crate) fn retained_scope_matches_target(
+    db_type: DatabaseType,
+    retained_scope: Option<&str>,
+    target_scope: &str,
+) -> bool {
+    retained_scope.is_some_and(|scope| db_type.scope_values_match(Some(scope), Some(target_scope)))
 }
 
 impl DbBackend for OracleBackend {
@@ -7932,6 +8018,41 @@ mod tests {
         let _ = conn.query_drop("ROLLBACK");
         let _ = conn.query_drop("SET SESSION TRANSACTION READ WRITE");
         let _ = conn.query_drop("DROP TABLE IF EXISTS qt_tx_mode_probe_mysql");
+    }
+
+    #[test]
+    fn retained_scope_matches_target_only_when_scope_is_known_and_equal() {
+        assert!(retained_scope_matches_target(
+            DatabaseType::MariaDB,
+            Some(" test "),
+            "test"
+        ));
+        assert!(retained_scope_matches_target(
+            DatabaseType::MySQL,
+            Some("test"),
+            "test"
+        ));
+        assert!(retained_scope_matches_target(
+            DatabaseType::Oracle,
+            Some("HR"),
+            "HR"
+        ));
+
+        assert!(!retained_scope_matches_target(
+            DatabaseType::MariaDB,
+            None,
+            "test"
+        ));
+        assert!(!retained_scope_matches_target(
+            DatabaseType::MySQL,
+            Some("test"),
+            "other"
+        ));
+        assert!(!retained_scope_matches_target(
+            DatabaseType::Oracle,
+            Some("HR"),
+            "SYS"
+        ));
     }
 
     #[test]

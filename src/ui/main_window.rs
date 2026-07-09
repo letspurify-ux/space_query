@@ -10428,6 +10428,7 @@ mod tests {
             retained_state: crate::db::RetainedSessionState::from_transaction_state(
                 crate::db::TransactionSessionState::DecisionRequired,
             ),
+            current_scope: None,
         };
 
         assert_eq!(
@@ -10574,6 +10575,7 @@ mod tests {
             retained_state: crate::db::RetainedSessionState::from_transaction_state(
                 crate::db::TransactionSessionState::Clean,
             ),
+            current_scope: None,
         };
 
         assert_eq!(

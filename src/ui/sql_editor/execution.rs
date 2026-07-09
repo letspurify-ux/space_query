@@ -558,12 +558,19 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
                             SqlEditorWidget::current_text_output_settings(&session);
                         let session_id = next_lazy_fetch_session_id
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let current_scope = SqlEditorWidget::current_scope_for_retained_session(
+                            shared_connection,
+                            connection_generation,
+                            crate::db::DatabaseType::Oracle,
+                            "oracle thin lazy fetch",
+                        );
                         match SqlEditorWidget::start_oracle_thin_lazy_select(
                             thin_conn,
                             pooled_db_session.clone(),
                             connection_generation,
                             pool_context_epoch,
                             prior_retained_state,
+                            current_scope,
                             sender.clone(),
                             session.clone(),
                             conn_name.clone(),
@@ -660,7 +667,13 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             final_auto_commit,
             health_check_ok,
         );
-        pooled_db_session.apply_retained_session_disposition(
+        let current_scope = SqlEditorWidget::current_scope_for_retained_session(
+            shared_connection,
+            connection_generation,
+            crate::db::DatabaseType::Oracle,
+            "oracle thin execution",
+        );
+        pooled_db_session.apply_retained_session_disposition_with_scope(
             connection_generation,
             batch_outcome
                 .refreshed_pool_context_epoch
@@ -668,6 +681,7 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             DbSessionLease::OracleThin(Box::new(thin_conn)),
             disposition,
             "oracle thin execution",
+            current_scope,
         );
         ExecutionWorkerOutcome::Handled
     }
@@ -832,6 +846,7 @@ struct OracleCleanupSessionDecisionApplier<'a> {
     pool_context_epoch: u64,
     conn: &'a Arc<Connection>,
     prior_retained_state: RetainedSessionState,
+    current_scope: Option<String>,
     session_state_delta: RetainedSessionState,
     session_state_delta_recorded: bool,
     reuse_state: TransactionSessionState,
@@ -898,13 +913,15 @@ impl OracleCleanupSessionDecisionApplier<'_> {
     }
 
     fn store_retained_state(&mut self, retained_state: RetainedSessionState) {
-        self.pooled_db_session.apply_retained_session_disposition(
-            self.connection_generation,
-            self.pool_context_epoch,
-            DbSessionLease::Oracle(Arc::clone(self.conn)),
-            crate::db::RetainedSessionDisposition::Retain(retained_state),
-            self.log_context,
-        );
+        self.pooled_db_session
+            .apply_retained_session_disposition_with_scope(
+                self.connection_generation,
+                self.pool_context_epoch,
+                DbSessionLease::Oracle(Arc::clone(self.conn)),
+                crate::db::RetainedSessionDisposition::Retain(retained_state),
+                self.log_context,
+                self.current_scope.clone(),
+            );
     }
 
     fn store_state(&mut self, transaction_state: TransactionSessionState) {
@@ -1678,12 +1695,24 @@ impl Drop for QueryExecutionCleanupGuard {
                     session_decision,
                     crate::db::session_policy::SessionDecision::RequireCommitOrRollback
                 );
+            let current_scope = self
+                .oracle_pooled_session_scope_connection
+                .as_ref()
+                .and_then(|shared_connection| {
+                    SqlEditorWidget::current_scope_for_retained_session(
+                        shared_connection,
+                        *connection_generation,
+                        crate::db::DatabaseType::Oracle,
+                        "sql_editor::cleanup",
+                    )
+                });
             let mut applier = OracleCleanupSessionDecisionApplier {
                 pooled_db_session,
                 connection_generation: *connection_generation,
                 pool_context_epoch: *pool_context_epoch,
                 conn,
                 prior_retained_state: *prior_retained_state,
+                current_scope,
                 session_state_delta: self.oracle_pooled_session_state_delta,
                 session_state_delta_recorded: self.oracle_pooled_session_state_delta_recorded,
                 reuse_state,
@@ -2658,15 +2687,21 @@ impl SqlEditorWidget {
                                 prior_retained_state,
                                 Self::oracle_error_message_allows_session_reuse(&message),
                             ) {
-                                let _ = pooled_db_session.apply_retained_session_disposition(
-                                    connection_generation,
-                                    pool_context_epoch,
-                                    DbSessionLease::Oracle(conn),
-                                    crate::db::RetainedSessionDisposition::Retain(
-                                        prior_retained_state,
-                                    ),
-                                    "oracle pool session",
-                                );
+                                let current_scope = conn_guard
+                                    .current_scope_name()
+                                    .map(|scope| scope.trim().to_string())
+                                    .filter(|scope| !scope.is_empty());
+                                let _ = pooled_db_session
+                                    .apply_retained_session_disposition_with_scope(
+                                        connection_generation,
+                                        pool_context_epoch,
+                                        DbSessionLease::Oracle(conn),
+                                        crate::db::RetainedSessionDisposition::Retain(
+                                            prior_retained_state,
+                                        ),
+                                        "oracle pool session",
+                                        current_scope,
+                                    );
                                 return (conn_guard, Err(message));
                             }
                             let _ = pooled_db_session.apply_retained_session_disposition(
@@ -4146,12 +4181,19 @@ impl SqlEditorWidget {
                             prior_retained_state,
                             may_have_uncommitted_work,
                         );
-                        pooled_db_session.apply_retained_session_disposition(
+                        let current_scope = Self::current_scope_for_retained_session(
+                            &shared_connection,
+                            connection_generation,
+                            crate::db::DatabaseType::Oracle,
+                            "oracle lazy fetch cleanup",
+                        );
+                        pooled_db_session.apply_retained_session_disposition_with_scope(
                             connection_generation,
                             pool_context_epoch,
                             DbSessionLease::Oracle(Arc::clone(&conn)),
                             crate::db::RetainedSessionDisposition::Retain(retained_state),
                             "oracle lazy fetch cleanup",
+                            current_scope,
                         );
                     } else {
                         Self::discard_oracle_lazy_fetch_session(
@@ -4236,6 +4278,7 @@ impl SqlEditorWidget {
         connection_generation: u64,
         pool_context_epoch: u64,
         prior_retained_state: RetainedSessionState,
+        current_scope: Option<String>,
         sender: mpsc::Sender<QueryProgress>,
         session: Arc<Mutex<SessionState>>,
         conn_name: String,
@@ -4928,12 +4971,13 @@ impl SqlEditorWidget {
                             prior_retained_state,
                             may_have_uncommitted_work.unwrap_or(false),
                         );
-                        if !pooled_db_session.apply_retained_session_disposition(
+                        if !pooled_db_session.apply_retained_session_disposition_with_scope(
                             connection_generation,
                             pool_context_epoch,
                             DbSessionLease::OracleThin(Box::new(lease_conn)),
                             crate::db::RetainedSessionDisposition::Retain(retained_state),
                             "oracle thin lazy fetch cleanup",
+                            current_scope.clone(),
                         ) {
                             cleanup_failed = true;
                             close_cancelled = true;
@@ -19269,14 +19313,16 @@ impl SqlEditorWidget {
         conn: mysql::PooledConn,
         db_type: crate::db::DatabaseType,
         retained_state: RetainedSessionState,
+        current_scope: Option<String>,
         log_context: &str,
     ) {
-        pooled_db_session.apply_retained_session_disposition(
+        pooled_db_session.apply_retained_session_disposition_with_scope(
             connection_generation,
             pool_context_epoch,
             DbSessionLease::MySQL { conn, db_type },
             crate::db::RetainedSessionDisposition::Retain(retained_state),
             log_context,
+            current_scope,
         );
     }
 
@@ -19291,6 +19337,7 @@ impl SqlEditorWidget {
         conn: mysql::PooledConn,
         db_type: crate::db::DatabaseType,
         disposition: crate::db::RetainedSessionOutcome,
+        current_scope: Option<String>,
         log_context: &str,
     ) {
         match disposition {
@@ -19302,6 +19349,7 @@ impl SqlEditorWidget {
                     conn,
                     db_type,
                     retained_state,
+                    current_scope,
                     log_context,
                 );
             }
@@ -19320,15 +19368,23 @@ impl SqlEditorWidget {
         disposition: crate::db::RetainedSessionOutcome,
         db_activity: &str,
     ) {
-        let db_type = {
+        let scope_context = {
             let conn_guard =
                 lock_connection_with_activity(shared_connection, db_activity.to_string());
             let db_type = conn_guard.db_type();
             conn_guard
                 .can_reuse_pool_session(connection_generation, db_type)
-                .then_some(db_type)
+                .then(|| {
+                    (
+                        db_type,
+                        conn_guard
+                            .current_scope_name()
+                            .map(|scope| scope.trim().to_string())
+                            .filter(|scope| !scope.is_empty()),
+                    )
+                })
         };
-        if let Some(db_type) = db_type {
+        if let Some((db_type, current_scope)) = scope_context {
             Self::apply_mysql_pooled_session_disposition(
                 pooled_db_session,
                 connection_generation,
@@ -19336,6 +19392,7 @@ impl SqlEditorWidget {
                 conn,
                 db_type,
                 disposition,
+                current_scope,
                 db_activity,
             );
         } else {
@@ -23214,6 +23271,7 @@ mod query_execution_cleanup_tests {
             retained_state: RetainedSessionState::from_transaction_state(
                 TransactionSessionState::Clean,
             ),
+            current_scope: None,
         };
         let dirty_snapshot = crate::db::PooledSessionLeaseSnapshot {
             db_type: crate::db::DatabaseType::MySQL,
@@ -23222,6 +23280,7 @@ mod query_execution_cleanup_tests {
             retained_state: RetainedSessionState::from_transaction_state(
                 TransactionSessionState::MaybeDirty,
             ),
+            current_scope: None,
         };
         let decision_snapshot = crate::db::PooledSessionLeaseSnapshot {
             db_type: crate::db::DatabaseType::Oracle,
@@ -23230,6 +23289,7 @@ mod query_execution_cleanup_tests {
             retained_state: RetainedSessionState::from_transaction_state(
                 TransactionSessionState::DecisionRequired,
             ),
+            current_scope: None,
         };
         let post_processor =
             crate::db::statement_session_post_processor_for(crate::db::DatabaseType::MySQL);
@@ -23247,6 +23307,7 @@ mod query_execution_cleanup_tests {
             pool_context_epoch: 0,
             transaction_state: TransactionSessionState::Clean,
             retained_state: transaction_mode_override_state,
+            current_scope: None,
         };
 
         assert!(
@@ -23255,7 +23316,7 @@ mod query_execution_cleanup_tests {
         assert!(
             !SqlEditorWidget::connection_transition_requires_transaction_resolution(
                 false,
-                Some(clean_snapshot)
+                Some(clean_snapshot.clone())
             )
         );
         assert!(
@@ -30611,6 +30672,7 @@ SELECT @qt_tab_marker AS marker;
         );
         assert!(
             snapshots[0]
+                .as_ref()
                 .unwrap()
                 .retained_state
                 .may_have_uncommitted_work(),
@@ -30618,6 +30680,7 @@ SELECT @qt_tab_marker AS marker;
         );
         assert!(
             snapshots[1]
+                .as_ref()
                 .unwrap()
                 .retained_state
                 .may_have_uncommitted_work(),
@@ -30625,6 +30688,7 @@ SELECT @qt_tab_marker AS marker;
         );
         assert!(
             !snapshots[2]
+                .as_ref()
                 .unwrap()
                 .retained_state
                 .may_have_uncommitted_work(),
@@ -30632,6 +30696,7 @@ SELECT @qt_tab_marker AS marker;
         );
         assert!(
             !snapshots[3]
+                .as_ref()
                 .unwrap()
                 .retained_state
                 .may_have_uncommitted_work(),
@@ -32155,6 +32220,7 @@ mod mysql_transaction_feedback_tests {
                     1,
                     1,
                     crate::db::RetainedSessionState::default(),
+                    None,
                     sender.clone(),
                     session.clone(),
                     "ORACLE_THIN_TEST".to_string(),
@@ -32372,6 +32438,7 @@ mod mysql_transaction_feedback_tests {
             1,
             1,
             crate::db::RetainedSessionState::default(),
+            None,
             sender.clone(),
             session,
             "ORACLE_THIN_CANCEL_TEST".to_string(),
@@ -32489,6 +32556,7 @@ mod mysql_transaction_feedback_tests {
             1,
             1,
             crate::db::RetainedSessionState::default(),
+            None,
             sender.clone(),
             session,
             "ORACLE_THIN_CANCEL_WAITING_TEST".to_string(),
@@ -34051,6 +34119,7 @@ mod mysql_transaction_feedback_tests {
             1,
             1,
             crate::db::RetainedSessionState::default(),
+            None,
             sender.clone(),
             session,
             "ORACLE_THIN_CLEANUP_FAILURE_TEST".to_string(),

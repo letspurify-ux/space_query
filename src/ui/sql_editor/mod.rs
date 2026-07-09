@@ -756,6 +756,7 @@ struct RetainedSessionRestore<'a> {
     connection_generation: u64,
     pool_context_epoch: u64,
     retained_state: RetainedSessionState,
+    current_scope: Option<String>,
 }
 
 impl RetainedSessionRestore<'_> {
@@ -766,6 +767,7 @@ impl RetainedSessionRestore<'_> {
             self.pool_context_epoch,
             lease,
             self.retained_state,
+            self.current_scope.clone(),
         );
     }
 }
@@ -882,6 +884,7 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
             return Err("No retained DB session for this tab.".to_string());
         };
         let pool_context_epoch = retained_session.pool_context_epoch();
+        let current_scope = retained_session.current_scope().map(str::to_string);
         let Some((lease, prior_retained_state)) = retained_session.into_lease_with_retained_state()
         else {
             drop(conn_guard);
@@ -901,6 +904,7 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
                         pool_context_epoch,
                         DbSessionLease::OracleThin(thin_conn),
                         prior_retained_state,
+                        current_scope,
                     );
                     return Err(message);
                 }
@@ -941,12 +945,13 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
                             prior_retained_state,
                             &result,
                         );
-                    let _ = pooled_db_session.apply_retained_session_disposition(
+                    let _ = pooled_db_session.apply_retained_session_disposition_with_scope(
                         connection_generation,
                         pool_context_epoch,
                         DbSessionLease::OracleThin(thin_conn),
                         disposition,
                         activity_label,
+                        current_scope.clone(),
                     );
                     SqlEditorWidget::set_current_oracle_thin_cancel_context(
                         current_oracle_thin_cancel_context,
@@ -983,12 +988,13 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
                     } else {
                         crate::db::RetainedSessionDisposition::Retain(retained_state_after_success)
                     };
-                    let _ = pooled_db_session.apply_retained_session_disposition(
+                    let _ = pooled_db_session.apply_retained_session_disposition_with_scope(
                         connection_generation,
                         pool_context_epoch,
                         DbSessionLease::OracleThin(thin_conn),
                         disposition,
                         activity_label,
+                        current_scope,
                     );
                 } else {
                     let _ = pooled_db_session.apply_retained_session_disposition(
@@ -1022,6 +1028,7 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
                 pool_context_epoch,
                 DbSessionLease::Oracle(db_conn),
                 prior_retained_state,
+                current_scope,
             );
             return Err(message);
         }
@@ -1054,12 +1061,13 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
                 prior_retained_state,
                 &result,
             );
-            let _ = pooled_db_session.apply_retained_session_disposition(
+            let _ = pooled_db_session.apply_retained_session_disposition_with_scope(
                 connection_generation,
                 pool_context_epoch,
                 DbSessionLease::Oracle(db_conn),
                 disposition,
                 activity_label,
+                current_scope.clone(),
             );
             return result;
         }
@@ -1093,12 +1101,13 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
             } else {
                 crate::db::RetainedSessionDisposition::Retain(retained_state_after_success)
             };
-            let _ = pooled_db_session.apply_retained_session_disposition(
+            let _ = pooled_db_session.apply_retained_session_disposition_with_scope(
                 connection_generation,
                 pool_context_epoch,
                 DbSessionLease::Oracle(db_conn),
                 disposition,
                 activity_label,
+                current_scope,
             );
         } else {
             let _ = pooled_db_session.apply_retained_session_disposition(
@@ -2500,6 +2509,22 @@ impl SqlEditorWidget {
         transaction_action_backend_for(db_type).retained_scope_error_allows_session_reuse(message)
     }
 
+    fn current_scope_for_retained_session(
+        shared_connection: &SharedConnection,
+        connection_generation: u64,
+        db_type: DatabaseType,
+        db_activity: &str,
+    ) -> Option<String> {
+        let conn_guard =
+            crate::db::lock_connection_with_activity(shared_connection, db_activity.to_string());
+        conn_guard
+            .can_reuse_pool_session(connection_generation, db_type)
+            .then(|| conn_guard.current_scope_name())
+            .flatten()
+            .map(|scope| scope.trim().to_string())
+            .filter(|scope| !scope.is_empty())
+    }
+
     fn retained_scope_change_block_message(retained_state: RetainedSessionState) -> Option<String> {
         if crate::db::retained_session_state_preflight_decision(
             RetainedSessionPreflightAction::ScopeChange,
@@ -2535,6 +2560,19 @@ impl SqlEditorWidget {
             return RetainedSessionMutationOutcome::NoSession;
         };
         let retained_state = retained_session.retained_state();
+        if crate::db::retained_scope_matches_target(
+            db_type,
+            retained_session.current_scope(),
+            target_scope,
+        ) {
+            retained_session.restore_with_context_epoch_and_scope(
+                pool_context_epoch,
+                retained_state,
+                Some(target_scope.to_string()),
+            );
+            return RetainedSessionMutationOutcome::Applied;
+        }
+
         if let Some(message) = Self::retained_scope_change_block_message(retained_state) {
             retained_session.restore();
             return RetainedSessionMutationOutcome::BlockedRequiresResolution(message);
@@ -2553,7 +2591,11 @@ impl SqlEditorWidget {
             });
         match result {
             Ok(()) => {
-                retained_session.restore_with_context_epoch(pool_context_epoch, retained_state);
+                retained_session.restore_with_context_epoch_and_scope(
+                    pool_context_epoch,
+                    retained_state,
+                    Some(target_scope.to_string()),
+                );
                 RetainedSessionMutationOutcome::Applied
             }
             Err(message) => {
@@ -2576,13 +2618,15 @@ impl SqlEditorWidget {
         pool_context_epoch: u64,
         lease: DbSessionLease,
         retained_state: RetainedSessionState,
+        current_scope: Option<String>,
     ) {
-        let _ = pooled_db_session.apply_retained_session_disposition(
+        let _ = pooled_db_session.apply_retained_session_disposition_with_scope(
             connection_generation,
             pool_context_epoch,
             lease,
             crate::db::RetainedSessionDisposition::Retain(retained_state),
             "sql_editor::restore_pooled_session",
+            current_scope,
         );
     }
 
@@ -2603,6 +2647,7 @@ impl SqlEditorWidget {
             return Ok(());
         };
         let retained_pool_context_epoch = retained_session.pool_context_epoch();
+        let current_scope = retained_session.current_scope().map(str::to_string);
         let Some((lease, retained_state)) = retained_session.into_lease_with_retained_state()
         else {
             return Ok(());
@@ -2617,6 +2662,7 @@ impl SqlEditorWidget {
                 retained_pool_context_epoch,
                 lease,
                 retained_state,
+                current_scope.clone(),
             );
             return Err(message);
         }
@@ -2631,6 +2677,7 @@ impl SqlEditorWidget {
                 connection_generation,
                 pool_context_epoch: retained_pool_context_epoch,
                 retained_state,
+                current_scope,
             },
         )
     }
