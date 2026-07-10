@@ -82262,6 +82262,16 @@ fn package_spec_resolution_is_bounded_on_large_buffers() {
     );
 }
 
+#[test]
+fn package_spec_header_scan_handles_package_keyword_at_eof() {
+    let incomplete = "CREATE PACKAGE";
+
+    assert_eq!(
+        SqlEditorWidget::find_package_spec_header(incomplete, "PKG", incomplete.len()),
+        None
+    );
+}
+
 /// A completion range that drifted to start *inside* the word under the cursor
 /// must not leave a dangling prefix character. Regression for "pr" + selecting
 /// "procedure" inserting "pprocedure": the replacement is re-anchored to the

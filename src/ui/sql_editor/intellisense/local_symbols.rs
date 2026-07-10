@@ -4009,7 +4009,9 @@ impl SqlEditorWidget {
             if (b == b'P' || b == b'p')
                 && bytes[i + 1..i + 7].eq_ignore_ascii_case(b"ACKAGE")
                 && (i == 0 || !Self::is_sql_identifier_byte(bytes[i - 1]))
-                && !Self::is_sql_identifier_byte(bytes[i + 7])
+                && bytes
+                    .get(i + 7)
+                    .is_none_or(|byte| !Self::is_sql_identifier_byte(*byte))
                 && Self::package_spec_candidate_matches(bytes, i, target_name_upper)
             {
                 return Some(i);

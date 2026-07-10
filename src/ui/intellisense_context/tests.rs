@@ -7238,6 +7238,21 @@ fn extract_table_function_columns_includes_nested_columns_clause() {
 }
 
 #[test]
+fn extract_table_function_columns_handles_deep_nesting_without_recursion() {
+    const DEPTH: usize = 2_048;
+
+    let mut sql = "COLUMNS (".repeat(DEPTH);
+    sql.push_str("deep_col NUMBER");
+    sql.push_str(&")".repeat(DEPTH));
+
+    let columns = extract_table_function_columns(&tokenize(&sql));
+    assert!(
+        columns.iter().any(|column| column == "deep_col"),
+        "deepest nested column was not reached: {columns:?}"
+    );
+}
+
+#[test]
 fn xmltable_arguments_can_resolve_left_relation_alias() {
     let ctx = analyze(
         "SELECT * \

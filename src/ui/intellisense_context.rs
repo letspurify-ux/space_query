@@ -11555,56 +11555,59 @@ fn collect_table_function_columns(
     seen: &mut HashSet<String>,
     allow_unparenthesized_marker: bool,
 ) {
-    let mut idx = 0usize;
-    while idx < tokens.len() {
-        let Some(SqlToken::Word(word)) = tokens.get(idx) else {
-            idx += 1;
-            continue;
-        };
-        let marker_upper = word.to_ascii_uppercase();
-        if marker_upper != "COLUMNS" && marker_upper != "WITH" {
-            idx += 1;
-            continue;
-        }
-
-        if marker_upper == "COLUMNS"
-            && matches!(prev_non_comment_token(tokens, idx), Some((SqlToken::Symbol(sym), _)) if sym == ",")
-        {
-            idx += 1;
-            continue;
-        }
-
-        let next_idx = next_non_comment_index(tokens, idx.saturating_add(1));
-        if marker_upper == "WITH"
-            && !matches!(tokens.get(next_idx), Some(SqlToken::Symbol(sym)) if sym == "(")
-        {
-            idx += 1;
-            continue;
-        }
-        if matches!(tokens.get(next_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
-            if let Some((range, after_paren)) = extract_parenthesized_range(tokens, next_idx) {
-                let range_tokens = token_range_slice(tokens, range);
-                append_table_function_column_items(range_tokens, columns, seen);
-                // Recurse to capture nested `... COLUMNS (...)` clauses.
-                collect_table_function_columns(range_tokens, columns, seen, false);
-                idx = after_paren;
+    // Keep nested `COLUMNS (...)` traversal off the call stack. Each suspended
+    // frame resumes after its child, preserving the previous depth-first order.
+    let mut pending = vec![(tokens, 0usize, allow_unparenthesized_marker)];
+    while let Some((tokens, mut idx, allow_unparenthesized_marker)) = pending.pop() {
+        while idx < tokens.len() {
+            let Some(SqlToken::Word(word)) = tokens.get(idx) else {
+                idx += 1;
+                continue;
+            };
+            let marker_upper = word.to_ascii_uppercase();
+            if marker_upper != "COLUMNS" && marker_upper != "WITH" {
+                idx += 1;
                 continue;
             }
-            idx += 1;
-            continue;
-        }
 
-        if !allow_unparenthesized_marker {
-            idx += 1;
-            continue;
-        }
+            if marker_upper == "COLUMNS"
+                && matches!(prev_non_comment_token(tokens, idx), Some((SqlToken::Symbol(sym), _)) if sym == ",")
+            {
+                idx += 1;
+                continue;
+            }
 
-        if next_idx < tokens.len() {
-            let tail = &tokens[next_idx..];
-            append_table_function_column_items(tail, columns, seen);
-            collect_table_function_columns(tail, columns, seen, false);
+            let next_idx = next_non_comment_index(tokens, idx.saturating_add(1));
+            if marker_upper == "WITH"
+                && !matches!(tokens.get(next_idx), Some(SqlToken::Symbol(sym)) if sym == "(")
+            {
+                idx += 1;
+                continue;
+            }
+            if matches!(tokens.get(next_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
+                if let Some((range, after_paren)) = extract_parenthesized_range(tokens, next_idx) {
+                    let range_tokens = token_range_slice(tokens, range);
+                    append_table_function_column_items(range_tokens, columns, seen);
+                    pending.push((tokens, after_paren, allow_unparenthesized_marker));
+                    pending.push((range_tokens, 0, false));
+                    break;
+                }
+                idx += 1;
+                continue;
+            }
+
+            if !allow_unparenthesized_marker {
+                idx += 1;
+                continue;
+            }
+
+            if next_idx < tokens.len() {
+                let tail = &tokens[next_idx..];
+                append_table_function_column_items(tail, columns, seen);
+                pending.push((tail, 0, false));
+            }
+            break;
         }
-        break;
     }
 }
 
