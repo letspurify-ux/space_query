@@ -1715,6 +1715,7 @@ pub struct SqlEditorWidget {
     highlighter: Arc<Mutex<SqlHighlighter>>,
     highlight_shadow: Arc<Mutex<HighlightShadowState>>,
     deferred_semantic_rehighlight_generation: Arc<AtomicU64>,
+    deferred_semantic_rehighlight_handle: Arc<Mutex<Option<crate::ui::ui_timeout::TimeoutHandle>>>,
     timeout_input: IntInput,
     status_callback: Arc<Mutex<Option<Box<dyn FnMut(&str)>>>>,
     find_callback: Arc<Mutex<Option<Box<dyn FnMut()>>>>,
@@ -2060,7 +2061,7 @@ impl SqlEditorWidget {
     }
 
     fn schedule_alert_pump(delay_seconds: f64) {
-        app::add_timeout3(delay_seconds, move |_| {
+        crate::ui::ui_timeout::schedule(delay_seconds, move || {
             SqlEditorWidget::drain_pending_alerts();
         });
     }
@@ -2400,6 +2401,7 @@ impl SqlEditorWidget {
         let highlighter = Arc::new(Mutex::new(SqlHighlighter::new()));
         let highlight_shadow = Arc::new(Mutex::new(HighlightShadowState::default()));
         let deferred_semantic_rehighlight_generation = Arc::new(AtomicU64::new(0));
+        let deferred_semantic_rehighlight_handle = Arc::new(Mutex::new(None));
         let status_callback: Arc<Mutex<Option<Box<dyn FnMut(&str)>>>> = Arc::new(Mutex::new(None));
         let find_callback: Arc<Mutex<Option<Box<dyn FnMut()>>>> = Arc::new(Mutex::new(None));
         let replace_callback: Arc<Mutex<Option<Box<dyn FnMut()>>>> = Arc::new(Mutex::new(None));
@@ -2462,6 +2464,7 @@ impl SqlEditorWidget {
             highlighter,
             highlight_shadow,
             deferred_semantic_rehighlight_generation,
+            deferred_semantic_rehighlight_handle,
             timeout_input,
             status_callback,
             find_callback,
@@ -3282,7 +3285,7 @@ impl SqlEditorWidget {
             } else {
                 PROGRESS_POLL_INTERVAL_SECONDS
             };
-            app::add_timeout3(delay, move |_| {
+            crate::ui::ui_timeout::schedule(delay, move || {
                 schedule_poll(
                     receiver.clone(),
                     progress_callback.clone(),
@@ -3495,7 +3498,7 @@ impl SqlEditorWidget {
                 return;
             }
 
-            app::add_timeout3(0.05, move |_| {
+            crate::ui::ui_timeout::schedule(0.05, move || {
                 schedule_poll(receiver.clone(), widget.clone());
             });
         }
@@ -5044,10 +5047,8 @@ mod execution_state_tests {
         IntellisenseRuntimeState, QueryProgress, SqlEditorWidget, UndoDelta, UndoSnapshot,
         WordUndoRedoState, MAX_WORD_UNDO_HISTORY, STYLE_DEFAULT,
     };
-    use fltk::app;
     use fltk::enums::Event;
     use fltk::text::TextBuffer;
-    use std::ptr::NonNull;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -5299,7 +5300,7 @@ mod execution_state_tests {
 
     #[test]
     fn take_keyup_debounce_timeout_handle_clears_slot() {
-        let fake_handle: app::TimeoutHandle = NonNull::<()>::dangling().as_ptr();
+        let fake_handle = crate::ui::ui_timeout::test_handle(1);
         let handle_slot = Arc::new(Mutex::new(Some(fake_handle)));
 
         let taken = SqlEditorWidget::take_keyup_debounce_timeout_handle(&handle_slot);

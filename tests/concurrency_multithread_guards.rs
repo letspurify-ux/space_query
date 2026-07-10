@@ -2015,13 +2015,127 @@ fn query_tab_selection_retries_when_app_state_is_temporarily_busy() {
         "retry helper should keep the non-blocking tab callback behavior"
     );
     assert!(
-        helper.contains("app::add_timeout3"),
+        helper.contains("crate::ui::ui_timeout::schedule"),
         "retry helper should reschedule selection when AppState is temporarily busy"
     );
     assert!(
         helper.contains("set_active_editor_tab(tab_id)"),
         "retry helper should still activate the selected tab through set_active_editor_tab"
     );
+}
+
+#[test]
+fn production_ui_avoids_leaking_fltk_timeout3_callbacks() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui");
+    for file in collect_rust_files(&root) {
+        let content = fs::read_to_string(&file)
+            .unwrap_or_else(|err| panic!("failed to read source file {}: {err}", file.display()));
+        assert!(
+            !content.contains("app::add_timeout3("),
+            "{} must use the lifecycle-managed UI timeout scheduler",
+            file.display()
+        );
+        assert!(
+            !content.contains("app::remove_timeout3(")
+                && !content.contains("app::repeat_timeout3("),
+            "{} must not manage leaking FLTK timeout3 handles directly",
+            file.display()
+        );
+    }
+
+    let scheduler = read_source("src/ui/ui_timeout.rs");
+    assert!(scheduler.contains("app::add_timeout2(delay, native_timeout_tick)"));
+    assert!(scheduler.contains("fn cancel(&mut self, handle: TimeoutHandle)"));
+}
+
+#[test]
+fn intellisense_pointer_paths_remain_debounced_and_nonblocking() {
+    let popup = read_source("src/ui/intellisense.rs");
+    let popup_callback_start = popup
+        .find("fn setup_callbacks(&mut self)")
+        .expect("IntelliSense popup callback setup should exist");
+    let popup_callback_end = popup[popup_callback_start..]
+        .find("pub fn show_suggestions(&mut self")
+        .map(|offset| popup_callback_start + offset)
+        .expect("popup suggestion display should follow callback setup");
+    let popup_callbacks = &popup[popup_callback_start..popup_callback_end];
+    assert!(popup_callbacks.contains("self.browser.super_handle_first(false)"));
+    assert!(popup_callbacks.contains("take_selection_allowed()"));
+
+    let runtime = read_source("src/ui/sql_editor/intellisense/runtime.rs");
+    let callback_start = runtime
+        .find("popup.set_selected_callback(move |selected|")
+        .expect("completion selection callback should exist");
+    let callback_end = runtime[callback_start..]
+        .find("// Handle keyboard events")
+        .map(|offset| callback_start + offset)
+        .expect("keyboard handler should follow selection callback");
+    let callback = &runtime[callback_start..callback_end];
+    assert!(callback.contains("db_type_without_blocking(&connection_for_insert)"));
+    assert!(!callback.contains("connection_for_insert.lock()"));
+
+    let pointer_start = runtime
+        .find("Event::Enter | Event::Move | Event::Drag | Event::Released =>")
+        .expect("editor pointer event handler should exist");
+    let pointer_end = runtime[pointer_start..]
+        .find("Event::MouseWheel =>")
+        .map(|offset| pointer_start + offset)
+        .expect("mouse wheel handler should follow pointer handler");
+    let pointer_handler = &runtime[pointer_start..pointer_end];
+    assert!(pointer_handler.contains("if ev == Event::Released"));
+    assert!(!pointer_handler.contains("matches!(ev, Event::Drag"));
+
+    let highlighting = read_source("src/ui/sql_editor/highlighting.rs");
+    let db_type_start = highlighting
+        .find("pub fn set_db_type(&self, db_type:")
+        .expect("SQL editor DB type setter should exist");
+    let db_type_end = highlighting[db_type_start..]
+        .find("fn handle_buffer_highlight_update")
+        .map(|offset| db_type_start + offset)
+        .expect("highlight update handler should follow DB type setter");
+    assert!(
+        highlighting[db_type_start..db_type_end]
+            .contains("self.intellisense_runtime.update_cached_db_type(db_type)"),
+        "DB type changes must update the nonblocking IntelliSense fallback cache"
+    );
+
+    let debounce_start = highlighting
+        .find("pub(crate) fn schedule_deferred_visible_semantic_rehighlight")
+        .expect("deferred semantic highlighting scheduler should exist");
+    let debounce_end = highlighting[debounce_start..]
+        .find("fn rehighlight_visible_semantic_window")
+        .map(|offset| debounce_start + offset)
+        .expect("visible highlighting implementation should follow its scheduler");
+    let debounce = &highlighting[debounce_start..debounce_end];
+    assert!(debounce.contains("crate::ui::ui_timeout::cancel(handle)"));
+}
+
+#[test]
+fn intellisense_popup_closes_on_outside_click_not_pointer_move() {
+    let main_window = read_source("src/ui/main_window.rs");
+    let handler_start = main_window
+        .find("window.handle(move |_w, ev|")
+        .expect("main window event handler should exist");
+    let keydown_start = main_window[handler_start..]
+        .find("fltk::enums::Event::KeyDown =>")
+        .map(|offset| handler_start + offset)
+        .expect("window keydown handler should follow lifecycle event handler");
+    let lifecycle_events = &main_window[handler_start..keydown_start];
+    assert!(lifecycle_events.contains("fltk::enums::Event::Resize"));
+    assert!(!lifecycle_events.contains("fltk::enums::Event::Move"));
+
+    let push_start = main_window[handler_start..]
+        .find("fltk::enums::Event::Push =>")
+        .map(|offset| handler_start + offset)
+        .expect("main window push handler should exist");
+    let push_end = main_window[push_start..]
+        .find("_ => false")
+        .map(|offset| push_start + offset)
+        .expect("fallback event handler should follow push handler");
+    let push_handler = &main_window[push_start..push_end];
+    assert!(push_handler.contains("hide_intellisense_on_outside_click"));
+    assert!(push_handler.contains("app::event_x_root()"));
+    assert!(push_handler.contains("app::event_y_root()"));
 }
 
 #[test]

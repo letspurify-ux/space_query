@@ -447,6 +447,7 @@ impl SqlEditorWidget {
     }
 
     pub fn set_db_type(&self, db_type: crate::db::connection::DatabaseType) {
+        self.intellisense_runtime.update_cached_db_type(db_type);
         match self.highlighter.lock() {
             Ok(mut h) => h.set_db_type(db_type),
             Err(poisoned) => poisoned.into_inner().set_db_type(db_type),
@@ -650,24 +651,44 @@ impl SqlEditorWidget {
     }
 
     pub(crate) fn schedule_deferred_visible_semantic_rehighlight(&self) {
+        if let Some(handle) = self
+            .deferred_semantic_rehighlight_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            crate::ui::ui_timeout::cancel(handle);
+        }
         let generation = self
             .deferred_semantic_rehighlight_generation
             .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1);
         let buffer_revision = self.intellisense_runtime.current_buffer_revision();
         let widget = self.clone();
-        app::add_timeout3(DEFERRED_REHIGHLIGHT_IDLE_DELAY_SECONDS, move |_| {
-            if widget.editor.was_deleted()
-                || generation
-                    != widget
-                        .deferred_semantic_rehighlight_generation
-                        .load(Ordering::Relaxed)
-                || buffer_revision != widget.intellisense_runtime.current_buffer_revision()
-            {
-                return;
-            }
-            widget.rehighlight_visible_semantic_window();
-        });
+        let handle = crate::ui::ui_timeout::schedule(
+            DEFERRED_REHIGHLIGHT_IDLE_DELAY_SECONDS,
+            move || {
+                widget
+                    .deferred_semantic_rehighlight_handle
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
+                if widget.editor.was_deleted()
+                    || generation
+                        != widget
+                            .deferred_semantic_rehighlight_generation
+                            .load(Ordering::Relaxed)
+                    || buffer_revision != widget.intellisense_runtime.current_buffer_revision()
+                {
+                    return;
+                }
+                widget.rehighlight_visible_semantic_window();
+            },
+        );
+        *self
+            .deferred_semantic_rehighlight_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(handle);
     }
 
     fn rehighlight_visible_semantic_window(&self) {

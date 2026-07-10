@@ -985,6 +985,7 @@ enum QualifiedCompletionMode {
     RelationColumns,
     RelationMembers,
     ObjectMembers,
+    SequencePseudocolumns,
 }
 
 /// Position kind where a SQL data type is expected. The keyword set differs by
@@ -1880,19 +1881,7 @@ impl SqlEditorWidget {
         // Avoid blocking the UI thread on the connection mutex (which the
         // schema refresh worker or a running query may be holding). Fall back
         // to the last observed db_type; it only changes on (re)connect.
-        let preferred_db_type = match connection.try_lock() {
-            Ok(conn_guard) => {
-                let db_type = conn_guard.db_type();
-                runtime.update_cached_db_type(db_type);
-                db_type
-            }
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                let db_type = poisoned.into_inner().db_type();
-                runtime.update_cached_db_type(db_type);
-                db_type
-            }
-            Err(std::sync::TryLockError::WouldBlock) => runtime.cached_db_type(),
-        };
+        let preferred_db_type = runtime.db_type_without_blocking(connection);
         let signature_scan_text =
             Self::signature_scan_text_before_cursor(buffer, cursor_pos_usize);
         if !preferred_db_type.is_mysql_or_mariadb() {
@@ -2090,7 +2079,7 @@ impl SqlEditorWidget {
         pointer_y: i32,
         retries_left: u8,
     ) {
-        app::add_timeout3(0.0, move |_| {
+        crate::ui::ui_timeout::schedule(0.0, move || {
             if editor.was_deleted() {
                 return;
             }
@@ -2136,7 +2125,7 @@ impl SqlEditorWidget {
         click_y: i32,
         retries_left: u8,
     ) {
-        app::add_timeout3(0.0, move |_| {
+        crate::ui::ui_timeout::schedule(0.0, move || {
             if matches!(
                 runtime.popup_transition_state(),
                 IntellisensePopupTransitionState::Showing
@@ -2334,7 +2323,7 @@ impl SqlEditorWidget {
         let column_sender_for_poll = column_sender.clone();
         let connection_for_poll = connection.clone();
         let runtime_for_poll = runtime.clone();
-        app::add_timeout3(0.0, move |_| {
+        crate::ui::ui_timeout::schedule(0.0, move || {
             Self::poll_async_intellisense_parse(
                 editor_for_poll.clone(),
                 intellisense_data_for_poll.clone(),
@@ -2410,7 +2399,7 @@ impl SqlEditorWidget {
                 }
             }
             Err(mpsc::TryRecvError::Empty) => {
-                app::add_timeout3(INTELLISENSE_PARSE_POLL_INTERVAL_SECONDS, move |_| {
+                crate::ui::ui_timeout::schedule(INTELLISENSE_PARSE_POLL_INTERVAL_SECONDS, move || {
                     Self::poll_async_intellisense_parse(
                         editor.clone(),
                         intellisense_data.clone(),
@@ -3385,7 +3374,11 @@ impl SqlEditorWidget {
         };
         let qualified_mode_uses_members = matches!(
             qualified_completion_mode,
-            Some(QualifiedCompletionMode::RelationMembers | QualifiedCompletionMode::ObjectMembers)
+            Some(
+                QualifiedCompletionMode::RelationMembers
+                    | QualifiedCompletionMode::ObjectMembers
+                    | QualifiedCompletionMode::SequencePseudocolumns
+            )
         );
         let mysql_compatible =
             crate::sql_text::mysql_compatibility_for_sql("", Some(snapshot.preferred_db_type));
@@ -3844,6 +3837,15 @@ impl SqlEditorWidget {
                 )
             };
         let qualified_member_suggestions = match (qualifier, qualified_completion_mode) {
+            (Some(_), Some(QualifiedCompletionMode::SequencePseudocolumns)) => {
+                ["NEXTVAL", "CURRVAL"]
+                    .into_iter()
+                    .filter(|pseudo| {
+                        Self::completion_suggestion_matches_prefix(pseudo, &snapshot.prefix)
+                    })
+                    .map(str::to_string)
+                    .collect()
+            }
             (Some(qualifier), Some(QualifiedCompletionMode::RelationMembers)) => {
                 let mut data = intellisense_data
                     .lock()
@@ -3873,15 +3875,7 @@ impl SqlEditorWidget {
                         Some(snapshot.preferred_db_type),
                     )
                 {
-                    if Self::matches_string_list_case_insensitive(&data.sequences, qualifier) {
-                        suggestions = ["NEXTVAL", "CURRVAL"]
-                            .into_iter()
-                            .filter(|pseudo| {
-                                Self::completion_suggestion_matches_prefix(pseudo, &snapshot.prefix)
-                            })
-                            .map(str::to_string)
-                            .collect();
-                    } else if let Some(members) =
+                    if let Some(members) =
                         Self::oracle_plsql_bulk_exceptions_member_suggestions(
                             qualifier,
                             &snapshot.prefix,
@@ -3897,33 +3891,16 @@ impl SqlEditorWidget {
                 }
                 suggestions
             }
-            // `<sequence>.|` — the only members of a sequence are the pseudocolumns
-            // `NEXTVAL`/`CURRVAL`. Gated on the qualifier resolving to a known sequence
-            // so `<table>.|`/`<package>.|` are unaffected. `<builtin pkg>.|`
-            // (`dbms_output.|`) and the package currently being edited
-            // (`my_pkg.<spec/body global>`) resolve their members likewise.
-            // Oracle-only.
+            // Other Oracle-only qualified member sources: SQL%BULK_EXCEPTIONS,
+            // built-in packages (`dbms_output.|`), and the package currently
+            // being edited (`my_pkg.<spec/body global>`).
             (Some(qualifier), _)
                 if !crate::sql_text::mysql_compatibility_for_sql(
                     "",
                     Some(snapshot.preferred_db_type),
                 ) =>
             {
-                let is_sequence = {
-                    let data = intellisense_data
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    Self::matches_string_list_case_insensitive(&data.sequences, qualifier)
-                };
-                if is_sequence {
-                    ["NEXTVAL", "CURRVAL"]
-                        .into_iter()
-                        .filter(|pseudo| {
-                            Self::completion_suggestion_matches_prefix(pseudo, &snapshot.prefix)
-                        })
-                        .map(str::to_string)
-                        .collect()
-                } else if let Some(members) =
+                if let Some(members) =
                     Self::oracle_plsql_bulk_exceptions_member_suggestions(
                         qualifier,
                         &snapshot.prefix,
@@ -15684,6 +15661,10 @@ impl SqlEditorWidget {
             return Some(QualifiedCompletionMode::RelationColumns);
         }
 
+        if Self::qualifier_resolves_to_oracle_sequence(data, qualifier, db_type) {
+            return Some(QualifiedCompletionMode::SequencePseudocolumns);
+        }
+
         let resolved_tables =
             Self::resolve_column_tables_for_context_for_db(Some(qualifier), deep_ctx, db_type);
         let resolved_is_direct_catalog_fallback = !qualifier_matches_visible_relation_scope
@@ -15702,6 +15683,19 @@ impl SqlEditorWidget {
         }
 
         None
+    }
+
+    fn qualifier_resolves_to_oracle_sequence(
+        data: &IntellisenseData,
+        qualifier: &str,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        !crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            && (Self::matches_string_list_case_insensitive(&data.sequences, qualifier)
+                || data.object_name_matches_qualifier_member_kind(
+                    qualifier,
+                    QualifiedMemberKind::Sequence,
+                ))
     }
 
     fn qualifier_has_members_or_oracle_synonym_target(

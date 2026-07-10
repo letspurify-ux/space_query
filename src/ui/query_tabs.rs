@@ -354,7 +354,7 @@ impl QueryTabsWidget {
             TabStripLeftAnchorResetMode::Deferred => {
                 let generation_ref = self.tab_strip_reset_generation.clone();
                 let mut tabs = self.tabs.clone();
-                app::add_timeout3(0.0, move |_| {
+                crate::ui::ui_timeout::schedule(0.0, move || {
                     if Self::current_tab_strip_reset_generation(&generation_ref) != generation {
                         return;
                     }

@@ -3724,7 +3724,11 @@ fn audit_final_suggestions_impl(
     });
     let qualified_mode_uses_members = matches!(
         qualified_completion_mode,
-        Some(QualifiedCompletionMode::RelationMembers | QualifiedCompletionMode::ObjectMembers)
+        Some(
+            QualifiedCompletionMode::RelationMembers
+                | QualifiedCompletionMode::ObjectMembers
+                | QualifiedCompletionMode::SequencePseudocolumns
+        )
     );
     let mysql_compatible = crate::sql_text::mysql_compatibility_for_sql("", Some(db));
     let mysql_table_structure_column_scope = if qualifier.is_none() && mysql_compatible {
@@ -4098,6 +4102,13 @@ fn audit_final_suggestions_impl(
             Some(db),
         );
     let qualified_member_suggestions = match (qualifier.as_deref(), qualified_completion_mode) {
+        (Some(_), Some(QualifiedCompletionMode::SequencePseudocolumns)) => ["NEXTVAL", "CURRVAL"]
+            .into_iter()
+            .filter(|pseudo| {
+                SqlEditorWidget::completion_suggestion_matches_prefix(pseudo, &prefix)
+            })
+            .map(str::to_string)
+            .collect(),
         (Some(qualifier), Some(QualifiedCompletionMode::RelationMembers)) => {
             SqlEditorWidget::expected_relation_member_suggestions_for_qualifier_for_db(
                 &mut data,
@@ -4117,22 +4128,12 @@ fn audit_final_suggestions_impl(
             )
         }
         (Some(qualifier), _) if !crate::sql_text::mysql_compatibility_for_sql("", Some(db)) => {
-            if SqlEditorWidget::matches_string_list_case_insensitive(&data.sequences, qualifier) {
-                ["NEXTVAL", "CURRVAL"]
-                    .into_iter()
-                    .filter(|pseudo| {
-                        SqlEditorWidget::completion_suggestion_matches_prefix(pseudo, &prefix)
-                    })
-                    .map(str::to_string)
-                    .collect()
-            } else {
-                // Mirrors the production builtin-package member branch; the
-                // own-package (same-buffer) member source needs the analysis
-                // pipeline this harness does not build, so it is covered by its
-                // own helper-level tests instead.
-                SqlEditorWidget::oracle_builtin_package_member_suggestions(qualifier, &prefix)
-                    .unwrap_or_default()
-            }
+            // Mirrors the production builtin-package member branch; the
+            // own-package (same-buffer) member source needs the analysis
+            // pipeline this harness does not build, so it is covered by its
+            // own helper-level tests instead.
+            SqlEditorWidget::oracle_builtin_package_member_suggestions(qualifier, &prefix)
+                .unwrap_or_default()
         }
         _ => Vec::new(),
     };
@@ -82927,10 +82928,37 @@ fn oracle_sequence_qualifier_offers_pseudocolumns() {
     use crate::db::DatabaseType::Oracle;
     let contains = |s: &[String], k: &str| s.iter().any(|x| x.eq_ignore_ascii_case(k));
 
-    for sql in ["SELECT emp_seq.| FROM dual", "INSERT INTO emp (empno) VALUES (emp_seq.|)"] {
+    for sql in [
+        "SELECT emp_seq.| FROM dual",
+        "SELECT emp_seq.| FROM emp",
+        "INSERT INTO emp (empno) VALUES (emp_seq.|)",
+    ] {
         let (_, _, fin) = audit_final_suggestions_for(sql, Oracle);
         assert!(contains(&fin, "NEXTVAL") && contains(&fin, "CURRVAL"),
             "sequence pseudocolumns missing at `{sql}`: {fin:?}");
+        for leaked_column in ["EMPNO", "ENAME", "SAL"] {
+            assert!(
+                !contains(&fin, leaked_column),
+                "column `{leaked_column}` leaked from another table at `{sql}`: {fin:?}"
+            );
+        }
+    }
+
+    for sql in [
+        "SELECT app.emp_seq.| FROM emp",
+        "INSERT INTO emp (empno) VALUES (app.emp_seq.|)",
+    ] {
+        let (_, _, fin) = audit_final_suggestions_for(sql, Oracle);
+        assert!(
+            contains(&fin, "NEXTVAL") && contains(&fin, "CURRVAL"),
+            "schema-qualified sequence pseudocolumns missing at `{sql}`: {fin:?}"
+        );
+        for leaked_column in ["EMPNO", "ENAME", "SAL"] {
+            assert!(
+                !contains(&fin, leaked_column),
+                "column `{leaked_column}` leaked after schema-qualified sequence at `{sql}`: {fin:?}"
+            );
+        }
     }
 
     // Prefix filter.
@@ -82939,10 +82967,24 @@ fn oracle_sequence_qualifier_offers_pseudocolumns() {
         && !fin.iter().any(|x| x.eq_ignore_ascii_case("NEXTVAL")),
         "prefix `CURR` should keep only CURRVAL: {fin:?}");
 
+    let (_, _, fin) =
+        audit_final_suggestions_for("SELECT app.emp_seq.NEXT| FROM emp", Oracle);
+    assert!(
+        contains(&fin, "NEXTVAL") && !contains(&fin, "CURRVAL"),
+        "schema-qualified prefix `NEXT` should keep only NEXTVAL: {fin:?}"
+    );
+
     // A non-sequence qualifier gets no pseudocolumns.
     let (_, _, fin) = audit_final_suggestions_for("SELECT emp.| FROM dual", Oracle);
     assert!(!fin.iter().any(|x| x.eq_ignore_ascii_case("NEXTVAL")),
         "NEXTVAL leaked onto a table qualifier: {fin:?}");
+
+    // A visible relation alias shadows a schema sequence with the same name.
+    let (_, _, fin) = audit_final_suggestions_for("SELECT emp_seq.| FROM emp emp_seq", Oracle);
+    assert!(
+        contains(&fin, "EMPNO") && !contains(&fin, "NEXTVAL") && !contains(&fin, "CURRVAL"),
+        "visible relation alias should win over a same-named sequence: {fin:?}"
+    );
 }
 
 /// Extended construct coverage: dynamic SQL binds, bulk/collection statements,

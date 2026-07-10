@@ -270,7 +270,7 @@ impl SqlEditorWidget {
         signature_popup: Arc<Mutex<SignaturePopup>>,
         remaining_retries: u8,
     ) {
-        app::add_timeout3(0.0, move |_| {
+        crate::ui::ui_timeout::schedule(0.0, move || {
             if Self::try_hide_signature_popup_now(&signature_popup) || remaining_retries == 0 {
                 return;
             }
@@ -470,7 +470,7 @@ impl SqlEditorWidget {
         // Explicitly destroy top-level dialog widgets to release native resources.
         Window::delete(dialog);
     }
-    pub fn hide_intellisense_if_outside(&self, x: i32, y: i32) {
+    pub fn hide_intellisense_on_outside_click(&self, x: i32, y: i32) {
         if matches!(
             self.intellisense_runtime.popup_transition_state(),
             IntellisensePopupTransitionState::Showing

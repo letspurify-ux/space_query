@@ -217,7 +217,7 @@ impl SqlEditorWidget {
                 COLUMN_POLL_IDLE_INTERVAL_SECONDS
             };
 
-            app::add_timeout3(delay, move |_| {
+            crate::ui::ui_timeout::schedule(delay, move || {
                 schedule_poll(
                     receiver.clone(),
                     intellisense_data.clone(),
@@ -312,6 +312,16 @@ impl SqlEditorWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 
         Self::invalidate_keyup_debounce(&self.intellisense_runtime);
+        self.deferred_semantic_rehighlight_generation
+            .fetch_add(1, Ordering::Relaxed);
+        if let Some(handle) = self
+            .deferred_semantic_rehighlight_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            crate::ui::ui_timeout::cancel(handle);
+        }
         self.intellisense_runtime.next_parse_generation();
         self.intellisense_runtime
             .set_popup_transition_state(IntellisensePopupTransitionState::Idle);

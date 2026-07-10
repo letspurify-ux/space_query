@@ -77,7 +77,7 @@ impl SqlEditorWidget {
         let Some(window) = editor.window() else {
             return;
         };
-        app::add_timeout3(0.0, move |_| {
+        crate::ui::ui_timeout::schedule(0.0, move || {
             if window.was_deleted() || !window.shown() {
                 return;
             }
@@ -340,7 +340,7 @@ impl SqlEditorWidget {
         action: SqlEditorContextAction,
     ) {
         let callback = callback.clone();
-        app::add_timeout3(0.0, move |_| {
+        crate::ui::ui_timeout::schedule(0.0, move || {
             Self::invoke_context_action_callback(&callback, action);
         });
     }
@@ -423,10 +423,10 @@ impl SqlEditorWidget {
             popup.set_selected_callback(move |selected| {
                 let (cursor_pos, cursor_pos_usize) =
                     Self::editor_cursor_position(&editor_for_insert, &buffer_for_insert);
-                let preferred_db_type = match connection_for_insert.lock() {
-                    Ok(conn_guard) => Some(conn_guard.db_type()),
-                    Err(poisoned) => Some(poisoned.into_inner().db_type()),
-                };
+                let preferred_db_type = Some(
+                    intellisense_runtime_for_insert
+                        .db_type_without_blocking(&connection_for_insert),
+                );
                 let context_text =
                     Self::normalize_intellisense_context_text(&Self::context_before_cursor(
                         &buffer_for_insert,
@@ -615,7 +615,7 @@ impl SqlEditorWidget {
                     true
                 }
                 Event::Enter | Event::Move | Event::Drag | Event::Released => {
-                    if matches!(ev, Event::Drag | Event::Released) {
+                    if ev == Event::Released {
                         widget_for_shortcuts.schedule_deferred_visible_semantic_rehighlight();
                     }
                     // Drag-and-drop only needs the eventual Paste payload.

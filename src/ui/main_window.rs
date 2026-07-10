@@ -2976,7 +2976,7 @@ fn execute_sql_request_with_session_pool_slot(
 ) {
     if cancel_oldest_lazy_fetch_if_session_pool_full(state) {
         let state_for_execute = Arc::clone(state);
-        app::add_timeout3(0.2, move |_| {
+        crate::ui::ui_timeout::schedule(0.2, move || {
             run_sql_execution_request(&state_for_execute, request);
         });
     } else {
@@ -3229,7 +3229,7 @@ impl MainWindow {
 
     fn sync_recent_sql_file_menu(recent_sql_files: &[PathBuf]) {
         let recent_sql_files = recent_sql_files.to_vec();
-        app::add_timeout3(0.0, move |_| {
+        crate::ui::ui_timeout::schedule(0.0, move || {
             if let Some(mut menu) = app::widget_from_id::<MenuBar>("main_menu") {
                 MenuBarBuilder::sync_recent_sql_file_items(&mut menu, &recent_sql_files);
             }
@@ -3612,7 +3612,7 @@ impl MainWindow {
 
     fn start_status_animation_timer(state: &Arc<Mutex<AppState>>) {
         let weak_state = Arc::downgrade(state);
-        app::add_timeout3(STATUS_ANIMATION_INTERVAL, move |_| {
+        crate::ui::ui_timeout::schedule(STATUS_ANIMATION_INTERVAL, move || {
             let Some(state_for_tick) = weak_state.upgrade() else {
                 return;
             };
@@ -5253,7 +5253,7 @@ impl MainWindow {
             }
             Err(_) if attempt < MAX_TAB_SELECT_RETRIES => {
                 let state_for_retry = Arc::clone(state);
-                app::add_timeout3(TAB_SELECT_RETRY_INTERVAL_SECONDS, move |_| {
+                crate::ui::ui_timeout::schedule(TAB_SELECT_RETRY_INTERVAL_SECONDS, move || {
                     MainWindow::select_query_editor_tab_or_retry_with_attempt(
                         &state_for_retry,
                         tab_id,
@@ -5606,7 +5606,7 @@ impl MainWindow {
 
     fn defer_close_query_editor_tab_until_idle(state: &Arc<Mutex<AppState>>, tab_id: QueryTabId) {
         let state_for_retry = Arc::clone(state);
-        app::add_timeout3(0.2, move |_| {
+        crate::ui::ui_timeout::schedule(0.2, move || {
             let should_wait = {
                 let s = state_for_retry
                     .lock()
@@ -5820,7 +5820,7 @@ impl MainWindow {
 
         if let Some(tab_id) = deferred_display_tab_id {
             let state_for_deferred_display = Arc::clone(state);
-            app::add_timeout3(0.0, move |_| {
+            crate::ui::ui_timeout::schedule(0.0, move || {
                 let editor = {
                     let s = state_for_deferred_display
                         .lock()
@@ -8588,8 +8588,7 @@ impl MainWindow {
                 return false;
             };
             match ev {
-                fltk::enums::Event::Move
-                | fltk::enums::Event::Resize
+                fltk::enums::Event::Resize
                 | fltk::enums::Event::Hide
                 | fltk::enums::Event::Deactivate
                 | fltk::enums::Event::Fullscreen => {
@@ -8634,8 +8633,10 @@ impl MainWindow {
                         app::event_x_root(),
                         app::event_y_root(),
                     );
-                    sql_editor
-                        .hide_intellisense_if_outside(app::event_x_root(), app::event_y_root());
+                    sql_editor.hide_intellisense_on_outside_click(
+                        app::event_x_root(),
+                        app::event_y_root(),
+                    );
                     false
                 }
                 _ => false,
@@ -9012,7 +9013,7 @@ impl MainWindow {
             }
 
             if deferred_by_borrow_conflict {
-                app::add_timeout3(CHANNEL_POLL_ACTIVE_INTERVAL_SECONDS, move |_| {
+                crate::ui::ui_timeout::schedule(CHANNEL_POLL_ACTIVE_INTERVAL_SECONDS, move || {
                     schedule_poll(
                         schema_receiver.clone(),
                         conn_receiver.clone(),
@@ -9046,7 +9047,7 @@ impl MainWindow {
             };
 
             // Reschedule for next poll
-            app::add_timeout3(delay, move |_| {
+            crate::ui::ui_timeout::schedule(delay, move || {
                 schedule_poll(
                     schema_receiver.clone(),
                     conn_receiver.clone(),
@@ -9121,7 +9122,7 @@ impl MainWindow {
                         let state = state_for_menu.clone();
                         let schema_sender = schema_sender_for_menu.clone();
                         let file_sender = file_sender_for_menu.clone();
-                        app::add_timeout3(0.0, move |_| {
+                        crate::ui::ui_timeout::schedule(0.0, move || {
                             MainWindow::open_recent_sql_file_path(
                                 &state,
                                 &schema_sender,
@@ -9176,7 +9177,7 @@ impl MainWindow {
     }
 
     fn defer_application_exit_until_idle(state: Arc<Mutex<AppState>>, window: Window) {
-        app::add_timeout3(0.2, move |_| {
+        crate::ui::ui_timeout::schedule(0.2, move || {
             let should_wait = {
                 let s = state
                     .lock()

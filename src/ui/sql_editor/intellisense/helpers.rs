@@ -1011,8 +1011,8 @@ impl SqlEditorWidget {
 
     #[cfg(test)]
     pub(super) fn take_keyup_debounce_timeout_handle(
-        keyup_debounce_handle: &Arc<Mutex<Option<app::TimeoutHandle>>>,
-    ) -> Option<app::TimeoutHandle> {
+        keyup_debounce_handle: &Arc<Mutex<Option<crate::ui::ui_timeout::TimeoutHandle>>>,
+    ) -> Option<crate::ui::ui_timeout::TimeoutHandle> {
         keyup_debounce_handle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1060,15 +1060,10 @@ impl SqlEditorWidget {
         let intellisense_popup_for_timeout = intellisense_popup.clone();
         let column_sender_for_timeout = column_sender.clone();
         let connection_for_timeout = connection.clone();
-        let handle = app::add_timeout3(
+        let handle = crate::ui::ui_timeout::schedule(
             Duration::from_millis(KEYUP_INTELLISENSE_DEBOUNCE_MS).as_secs_f64(),
-            move |timeout_handle| {
-                {
-                    let current_handle = runtime_for_timeout.take_keyup_timeout_handle();
-                    if current_handle != Some(timeout_handle) {
-                        runtime_for_timeout.set_keyup_timeout_handle(current_handle);
-                    }
-                }
+            move || {
+                runtime_for_timeout.take_keyup_timeout_handle();
 
                 if runtime_for_timeout.current_keyup_generation() != generation {
                     return;

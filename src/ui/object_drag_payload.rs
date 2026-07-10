@@ -57,7 +57,7 @@ pub(crate) fn start_drag(insert_text: &str) {
     let generation = store_active_drag(insert_text);
     app::copy2(BLANK_DRAG_PREVIEW_TEXT);
     start_platform_dnd();
-    app::add_timeout3(ACTIVE_DRAG_TIMEOUT_SECONDS, move |_| {
+    crate::ui::ui_timeout::schedule(ACTIVE_DRAG_TIMEOUT_SECONDS, move || {
         clear_active_drag_generation(generation);
     });
 }

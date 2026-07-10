@@ -2077,7 +2077,7 @@ impl ObjectBrowserWidget {
             }
 
             // Reschedule for next poll
-            app::add_timeout3(0.05, move |_| {
+            crate::ui::ui_timeout::schedule(0.05, move || {
                 schedule_poll(
                     receiver.clone(),
                     tree.clone(),
@@ -2529,7 +2529,7 @@ impl ObjectBrowserWidget {
                 return;
             }
 
-            app::add_timeout3(0.05, move |_| {
+            crate::ui::ui_timeout::schedule(0.05, move || {
                 schedule_poll(
                     receiver.clone(),
                     sql_callback.clone(),

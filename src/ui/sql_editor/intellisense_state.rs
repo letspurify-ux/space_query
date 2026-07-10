@@ -202,7 +202,7 @@ pub(crate) struct IntellisenseRuntimeState {
     popup_show_in_progress: Arc<AtomicU8>,
     signature_popup_show_in_progress: Arc<AtomicU8>,
     keyup_debounce_generation: Arc<Mutex<u64>>,
-    keyup_debounce_handle: Arc<Mutex<Option<app::TimeoutHandle>>>,
+    keyup_debounce_handle: Arc<Mutex<Option<crate::ui::ui_timeout::TimeoutHandle>>>,
     cached_db_type: Arc<AtomicU8>,
     parse_worker: Arc<LatestTaskWorker>,
 }
@@ -223,7 +223,7 @@ impl IntellisenseRuntimeState {
                 IntellisensePopupTransitionState::Idle as u8,
             )),
             keyup_debounce_generation: Arc::new(Mutex::new(0_u64)),
-            keyup_debounce_handle: Arc::new(Mutex::new(None::<app::TimeoutHandle>)),
+            keyup_debounce_handle: Arc::new(Mutex::new(None)),
             cached_db_type: Arc::new(AtomicU8::new(
                 crate::db::connection::DatabaseType::default().cache_key(),
             )),
@@ -474,14 +474,17 @@ impl IntellisenseRuntimeState {
         store_popup_transition_state(&self.signature_popup_show_in_progress, state);
     }
 
-    pub(crate) fn take_keyup_timeout_handle(&self) -> Option<app::TimeoutHandle> {
+    pub(crate) fn take_keyup_timeout_handle(&self) -> Option<crate::ui::ui_timeout::TimeoutHandle> {
         self.keyup_debounce_handle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
     }
 
-    pub(crate) fn set_keyup_timeout_handle(&self, handle: Option<app::TimeoutHandle>) {
+    pub(crate) fn set_keyup_timeout_handle(
+        &self,
+        handle: Option<crate::ui::ui_timeout::TimeoutHandle>,
+    ) {
         *self
             .keyup_debounce_handle
             .lock()
@@ -490,9 +493,7 @@ impl IntellisenseRuntimeState {
 
     fn cancel_keyup_timeout(&self) {
         if let Some(handle) = self.take_keyup_timeout_handle() {
-            if app::has_timeout3(handle) {
-                app::remove_timeout3(handle);
-            }
+            crate::ui::ui_timeout::cancel(handle);
         }
     }
 
@@ -526,6 +527,27 @@ impl IntellisenseRuntimeState {
             .store(db_type_to_u8(db_type), Ordering::Relaxed);
     }
 
+    /// Reads the live connection type when immediately available, but never
+    /// waits on the UI thread for a query or schema worker holding the mutex.
+    pub(crate) fn db_type_without_blocking(
+        &self,
+        connection: &SharedConnection,
+    ) -> crate::db::connection::DatabaseType {
+        match connection.try_lock() {
+            Ok(conn_guard) => {
+                let db_type = conn_guard.db_type();
+                self.update_cached_db_type(db_type);
+                db_type
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                let db_type = poisoned.into_inner().db_type();
+                self.update_cached_db_type(db_type);
+                db_type
+            }
+            Err(std::sync::TryLockError::WouldBlock) => self.cached_db_type(),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn set_keyup_generation_for_test(&self, generation: u64) {
         *self
@@ -537,5 +559,24 @@ impl IntellisenseRuntimeState {
     #[cfg(test)]
     pub(crate) fn set_parse_generation_for_test(&self, generation: u64) {
         self.parse_generation.store(generation, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn db_type_lookup_returns_cached_value_while_connection_is_locked() {
+        let connection = Arc::new(Mutex::new(crate::db::DatabaseConnection::new()));
+        let runtime = IntellisenseRuntimeState::new_for_db_type(crate::db::DatabaseType::MariaDB);
+        let _connection_guard = connection
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        assert_eq!(
+            runtime.db_type_without_blocking(&connection),
+            crate::db::DatabaseType::MariaDB
+        );
     }
 }

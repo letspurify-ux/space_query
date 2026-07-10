@@ -1335,7 +1335,7 @@ impl ResultTableWidget {
         target_row_position: i32,
         preserve_col_position: Option<i32>,
     ) {
-        app::add_timeout3(0.0, move |_| {
+        crate::ui::ui_timeout::schedule(0.0, move || {
             if table.was_deleted() {
                 return;
             }
@@ -3234,7 +3234,7 @@ impl ResultTableWidget {
         action: ResultTableContextAction,
     ) {
         let callback = callback.clone();
-        app::add_timeout3(0.0, move |_| {
+        crate::ui::ui_timeout::schedule(0.0, move || {
             Self::invoke_context_action_callback(&callback, action);
         });
     }
@@ -3393,7 +3393,7 @@ impl ResultTableWidget {
         in_flight: Arc<Mutex<HashSet<u64>>>,
         drag_state: Arc<Mutex<DragState>>,
     ) {
-        app::add_timeout3(LAZY_FETCH_SCROLLBAR_POLL_INTERVAL_SECONDS, move |_| {
+        crate::ui::ui_timeout::schedule(LAZY_FETCH_SCROLLBAR_POLL_INTERVAL_SECONDS, move || {
             let should_continue = {
                 let mut state = drag_state
                     .lock()

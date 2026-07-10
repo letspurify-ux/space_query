@@ -19,6 +19,7 @@ pub mod sql_editor;
 pub mod syntax_highlight;
 pub(crate) mod text_buffer_access;
 pub mod theme;
+pub(crate) mod ui_timeout;
 
 use fltk::{
     app,

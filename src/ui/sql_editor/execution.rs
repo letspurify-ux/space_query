@@ -7895,15 +7895,18 @@ impl SqlEditorWidget {
                         let widget = self.clone();
                         let sql = sql.to_string();
                         let initial_mysql_delimiter_for_retry = initial_mysql_delimiter.clone();
-                        app::add_timeout3(LAZY_FETCH_CANCEL_RETRY_DELAY_SECONDS, move |_| {
-                            widget.execute_sql_with_mysql_delimiter_after_lazy_cancel(
-                                &sql,
-                                script_mode,
-                                initial_mysql_delimiter_for_retry.clone(),
-                                Some(session_id),
-                                next_retry_attempt,
-                            );
-                        });
+                        crate::ui::ui_timeout::schedule(
+                            LAZY_FETCH_CANCEL_RETRY_DELAY_SECONDS,
+                            move || {
+                                widget.execute_sql_with_mysql_delimiter_after_lazy_cancel(
+                                    &sql,
+                                    script_mode,
+                                    initial_mysql_delimiter_for_retry.clone(),
+                                    Some(session_id),
+                                    next_retry_attempt,
+                                );
+                            },
+                        );
                         return;
                     }
                 }
@@ -7916,15 +7919,18 @@ impl SqlEditorWidget {
                     let widget = self.clone();
                     let sql = sql.to_string();
                     let initial_mysql_delimiter_for_retry = initial_mysql_delimiter.clone();
-                    app::add_timeout3(LAZY_FETCH_CANCEL_RETRY_DELAY_SECONDS, move |_| {
-                        widget.execute_sql_with_mysql_delimiter_after_lazy_cancel(
-                            &sql,
-                            script_mode,
-                            initial_mysql_delimiter_for_retry.clone(),
-                            Some(session_id),
-                            next_retry_attempt,
-                        );
-                    });
+                    crate::ui::ui_timeout::schedule(
+                        LAZY_FETCH_CANCEL_RETRY_DELAY_SECONDS,
+                        move || {
+                            widget.execute_sql_with_mysql_delimiter_after_lazy_cancel(
+                                &sql,
+                                script_mode,
+                                initial_mysql_delimiter_for_retry.clone(),
+                                Some(session_id),
+                                next_retry_attempt,
+                            );
+                        },
+                    );
                     return;
                 }
                 LazyFetchCancelBeforeExecutionDecision::GiveUp => {

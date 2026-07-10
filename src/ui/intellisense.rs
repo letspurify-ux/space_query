@@ -3,7 +3,7 @@ use crate::ui::theme;
 use fltk::{browser::HoldBrowser, frame::Frame, prelude::*, text::TextEditor, window::Window};
 use std::any::Any;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -823,6 +823,8 @@ pub struct ForeignKeyMeta {
     pub ref_columns: Vec<String>,
 }
 
+const MAX_SIGNATURE_CACHE_ENTRIES: usize = 256;
+
 #[derive(Clone)]
 pub struct IntellisenseData {
     pub tables: Vec<String>,
@@ -909,6 +911,7 @@ pub struct IntellisenseData {
     /// that a name was resolved but is not a callable routine, so it is not
     /// fetched again.
     signature_cache: HashMap<String, Option<SignatureLabel>>,
+    signature_cache_order: VecDeque<String>,
     /// Routine keys with an in-flight signature fetch, to avoid duplicate work.
     signature_pending: HashSet<String>,
 }
@@ -990,6 +993,7 @@ impl IntellisenseData {
             foreign_keys_by_table: HashMap::new(),
             foreign_keys_loading: HashSet::new(),
             signature_cache: HashMap::new(),
+            signature_cache_order: VecDeque::new(),
             signature_pending: HashSet::new(),
         }
     }
@@ -1775,6 +1779,29 @@ impl IntellisenseData {
         }
 
         false
+    }
+
+    /// Resolves either `object` in the active/default qualifier or an explicit
+    /// `qualifier.object` against loaded schema-member kind metadata.
+    pub fn object_name_matches_qualifier_member_kind(
+        &self,
+        object_name: &str,
+        expected_kind: QualifiedMemberKind,
+    ) -> bool {
+        let mut segments = Self::normalize_qualifier_lookup_segments(object_name);
+        let Some(candidate) = segments.pop() else {
+            return false;
+        };
+        let owner = if segments.is_empty() {
+            self.default_qualifier.clone()
+        } else {
+            Some(segments.join("."))
+        };
+        let Some(owner) = owner else {
+            return false;
+        };
+
+        self.qualifier_member_matches_kinds(&owner, &candidate, &[expected_kind]) == Some(true)
     }
 
     pub fn qualifier_relation_member_name(
@@ -2703,6 +2730,16 @@ impl IntellisenseData {
     /// Store a fetched signature result and clear its pending flag.
     pub fn set_signature(&mut self, key: String, label: Option<SignatureLabel>) {
         self.signature_pending.remove(&key);
+        if !self.signature_cache.contains_key(&key) {
+            if self.signature_cache.len() >= MAX_SIGNATURE_CACHE_ENTRIES {
+                while let Some(oldest) = self.signature_cache_order.pop_front() {
+                    if self.signature_cache.remove(&oldest).is_some() {
+                        break;
+                    }
+                }
+            }
+            self.signature_cache_order.push_back(key.clone());
+        }
         self.signature_cache.insert(key, label);
     }
 
@@ -3311,6 +3348,44 @@ enum PopupState {
     Visible,
 }
 
+#[derive(Debug, Default)]
+struct PopupPointerGesture {
+    pressed_at: Option<(i32, i32)>,
+    dragged: bool,
+    selection_allowed: bool,
+}
+
+impl PopupPointerGesture {
+    const DRAG_THRESHOLD: u32 = 4;
+
+    fn handle_event(&mut self, event: fltk::enums::Event, x: i32, y: i32, button: i32) {
+        let left_button = fltk::app::MouseButton::Left as i32;
+        match event {
+            fltk::enums::Event::Push => {
+                self.pressed_at = (button == left_button).then_some((x, y));
+                self.dragged = false;
+                self.selection_allowed = false;
+            }
+            fltk::enums::Event::Drag => {
+                if let Some((start_x, start_y)) = self.pressed_at {
+                    self.dragged |= x.abs_diff(start_x) > Self::DRAG_THRESHOLD
+                        || y.abs_diff(start_y) > Self::DRAG_THRESHOLD;
+                }
+            }
+            fltk::enums::Event::Released => {
+                self.selection_allowed = self.pressed_at.is_some() && !self.dragged;
+                self.pressed_at = None;
+                self.dragged = false;
+            }
+            _ => {}
+        }
+    }
+
+    fn take_selection_allowed(&mut self) -> bool {
+        std::mem::take(&mut self.selection_allowed)
+    }
+}
+
 impl PopupState {
     fn is_visible(self) -> bool {
         matches!(self, Self::Visible)
@@ -3449,8 +3524,34 @@ impl IntellisensePopup {
         let callback = self.selected_callback.clone();
         let mut window = self.window.clone();
         let state = self.state.clone();
+        let pointer_gesture = Arc::new(Mutex::new(PopupPointerGesture::default()));
+        let pointer_gesture_for_handle = pointer_gesture.clone();
+
+        // Record the gesture before FLTK's built-in browser release handling
+        // invokes the selection callback. A drag may move the highlighted row,
+        // but releasing it must not insert that row into the editor.
+        self.browser.super_handle_first(false);
+        self.browser.handle(move |_browser, event| {
+            pointer_gesture_for_handle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .handle_event(
+                    event,
+                    fltk::app::event_x(),
+                    fltk::app::event_y(),
+                    fltk::app::event_button(),
+                );
+            false
+        });
 
         self.browser.set_callback(move |b| {
+            if !pointer_gesture
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take_selection_allowed()
+            {
+                return;
+            }
             let selected = b.value();
             if selected > 0 {
                 // First, get the text with suggestions borrow, then release it
@@ -6213,6 +6314,52 @@ BEGIN
     }
 
     #[test]
+    fn popup_pointer_gesture_accepts_left_click_without_drag() {
+        let mut gesture = PopupPointerGesture::default();
+
+        gesture.handle_event(fltk::enums::Event::Push, 10, 10, 1);
+        gesture.handle_event(fltk::enums::Event::Released, 12, 11, 1);
+
+        assert!(gesture.take_selection_allowed());
+        assert!(!gesture.take_selection_allowed());
+    }
+
+    #[test]
+    fn popup_pointer_gesture_rejects_drag_and_non_left_release() {
+        let mut dragged = PopupPointerGesture::default();
+        dragged.handle_event(fltk::enums::Event::Push, 10, 10, 1);
+        dragged.handle_event(fltk::enums::Event::Drag, 20, 10, 1);
+        dragged.handle_event(fltk::enums::Event::Released, 20, 10, 1);
+        assert!(!dragged.take_selection_allowed());
+
+        let mut right_click = PopupPointerGesture::default();
+        right_click.handle_event(fltk::enums::Event::Push, 10, 10, 3);
+        right_click.handle_event(fltk::enums::Event::Released, 10, 10, 3);
+        assert!(!right_click.take_selection_allowed());
+    }
+
+    #[test]
+    fn signature_cache_is_bounded_and_keeps_latest_result() {
+        let mut data = IntellisenseData::new();
+        for index in 0..=MAX_SIGNATURE_CACHE_ENTRIES {
+            data.set_signature(
+                format!("PROC_{index}"),
+                Some(SignatureLabel {
+                    text: format!("PROC_{index}()"),
+                    arg_spans: Vec::new(),
+                }),
+            );
+        }
+
+        assert!(data.signature_cache.len() <= MAX_SIGNATURE_CACHE_ENTRIES);
+        assert!(data.cached_signature("PROC_0").is_none());
+        assert!(data.cached_signature("PROC_1").is_some());
+        assert!(data
+            .cached_signature(&format!("PROC_{MAX_SIGNATURE_CACHE_ENTRIES}"))
+            .is_some());
+    }
+
+    #[test]
     fn sql_keywords_has_no_duplicates() {
         let mut seen = std::collections::HashSet::new();
         for keyword in SQL_KEYWORDS {
@@ -7427,6 +7574,35 @@ BEGIN
             ),
             Some(true)
         );
+    }
+
+    #[test]
+    fn object_name_kind_lookup_supports_explicit_and_default_qualifiers() {
+        let mut data = IntellisenseData::new();
+        data.set_members_for_qualifier_with_kinds(
+            "APP",
+            vec![
+                (
+                    "ORDERS_SEQ".to_string(),
+                    Some(QualifiedMemberKind::Sequence),
+                ),
+                ("ORDERS".to_string(), Some(QualifiedMemberKind::Table)),
+            ],
+        );
+        data.set_default_qualifier(Some("APP".to_string()));
+
+        assert!(data.object_name_matches_qualifier_member_kind(
+            "ORDERS_SEQ",
+            QualifiedMemberKind::Sequence
+        ));
+        assert!(data.object_name_matches_qualifier_member_kind(
+            "APP.ORDERS_SEQ",
+            QualifiedMemberKind::Sequence
+        ));
+        assert!(!data.object_name_matches_qualifier_member_kind(
+            "APP.ORDERS",
+            QualifiedMemberKind::Sequence
+        ));
     }
 
     #[test]
