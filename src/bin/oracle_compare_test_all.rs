@@ -30,6 +30,7 @@ struct DriverRunSnapshot {
 }
 
 const CURRENT_SID_SQL: &str = "select sys_context('USERENV', 'SID') from dual";
+const MAX_COMPARE_INCLUDE_DEPTH: usize = 64;
 
 fn oracle_connection_info(mode: OracleDriverMode) -> ConnectionInfo {
     let host = env::var("ORACLE_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -569,6 +570,11 @@ fn expand_sql_includes_for_compare(
     base_dir: &Path,
     include_stack: &mut Vec<PathBuf>,
 ) -> Result<String, String> {
+    if include_stack.len() >= MAX_COMPARE_INCLUDE_DEPTH {
+        return Err(format!(
+            "maximum SQL include depth ({MAX_COMPARE_INCLUDE_DEPTH}) exceeded"
+        ));
+    }
     let mut expanded = String::with_capacity(sql_text.len());
     for line in sql_text.lines() {
         let Some((raw_path, relative_to_current_file)) = parse_sql_include_line(line) else {
@@ -767,6 +773,32 @@ mod tests {
             .expect_err("recursive include should be rejected");
 
         assert!(err.contains("recursive SQL include"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sql_include_expansion_rejects_excessive_depth() {
+        let dir = env::temp_dir().join(format!(
+            "oracle_compare_include_depth_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock before epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp include dir");
+        for index in 0..=MAX_COMPARE_INCLUDE_DEPTH {
+            let body = if index == MAX_COMPARE_INCLUDE_DEPTH {
+                "SELECT 1 FROM dual;\n".to_string()
+            } else {
+                format!("@@{}.sql;\n", index + 1)
+            };
+            std::fs::write(dir.join(format!("{index}.sql")), body).expect("write include");
+        }
+
+        let err = oracle_314_compare_script_body_for_path(&dir.join("main.sql"), "@@0.sql;\n")
+            .expect_err("deep include chain should be rejected");
+
+        assert!(err.contains("maximum SQL include depth"));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

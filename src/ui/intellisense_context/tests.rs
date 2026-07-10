@@ -7253,6 +7253,37 @@ fn extract_table_function_columns_handles_deep_nesting_without_recursion() {
 }
 
 #[test]
+fn flashback_operand_handles_many_unary_signs_without_recursion() {
+    let sql = format!("{}1", "-".repeat(2_048));
+    let tokens = tokenize(&sql);
+
+    assert_eq!(consume_flashback_operand(&tokens, 0), tokens.len());
+}
+
+#[test]
+fn relation_wrapper_parser_caps_excessive_nesting_without_overflow() {
+    let depth = MAX_INTELLISENSE_RECURSION_DEPTH * 4;
+    let sql = format!("{}t{}", "TABLE(".repeat(depth), ")".repeat(depth));
+    let tokens = tokenize(&sql);
+
+    assert_eq!(
+        parse_table_name_deep_with_options(&tokens, 0, false),
+        Some(("TABLE".to_string(), tokens.len()))
+    );
+}
+
+#[test]
+fn pivot_projection_inference_caps_deep_nested_sources() {
+    let mut sql = "SELECT base_col FROM base_table".to_string();
+    for _ in 0..MAX_INTELLISENSE_RECURSION_DEPTH * 2 {
+        sql = format!("({sql}) PIVOT (SUM(base_col) FOR base_col IN (1 AS p1))");
+    }
+    let tokens = tokenize(&sql);
+
+    let _ = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+}
+
+#[test]
 fn xmltable_arguments_can_resolve_left_relation_alias() {
     let ctx = analyze(
         "SELECT * \
@@ -7546,7 +7577,7 @@ fn infer_source_columns_uses_match_recognize_generated_columns_when_select_list_
         ) q",
     );
 
-    let cols = infer_source_columns_before_clause(&tokens, tokens.len());
+    let cols = infer_source_columns_before_clause(&tokens, tokens.len(), 0);
     assert!(
         cols.iter()
             .any(|col| col.eq_ignore_ascii_case("start_name")),

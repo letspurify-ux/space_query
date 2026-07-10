@@ -398,6 +398,7 @@ const TNS_JSON_FLAG_INLINE_LEAF: u16 = 0x02;
 const TNS_JSON_FLAG_NUM_FNAMES_UINT32: u16 = 0x08;
 const TNS_JSON_FLAG_IS_SCALAR: u16 = 0x10;
 const TNS_JSON_FLAG_SEC_FNAMES_SEG_UINT16: u16 = 0x0100;
+const MAX_ORACLE_VALUE_NESTING_DEPTH: usize = 128;
 const TNS_LOB_QLOCATOR_VERSION: u16 = 4;
 const TNS_LOB_LOC_FLAGS_BLOB: u8 = 0x01;
 const TNS_LOB_LOC_FLAGS_VALUE_BASED: u8 = 0x20;
@@ -2176,7 +2177,7 @@ impl OracleThinSession {
     ) -> Result<(), OracleThinError> {
         for row in rows {
             for (column, value) in columns.iter().zip(row.iter_mut()) {
-                self.resolve_xml_lob_value_for_column(column, value)?;
+                self.resolve_xml_lob_value_for_column(column, value, 0)?;
             }
         }
         Ok(())
@@ -2186,7 +2187,13 @@ impl OracleThinSession {
         &mut self,
         column: &ThinColumn,
         value: &mut OracleValue,
+        depth: usize,
     ) -> Result<(), OracleThinError> {
+        if depth > MAX_ORACLE_VALUE_NESTING_DEPTH {
+            return Err(OracleThinError::new(format!(
+                "Oracle object nesting exceeds {MAX_ORACLE_VALUE_NESTING_DEPTH} levels"
+            )));
+        }
         match value {
             OracleValue::Lob(locator) if column.column_type == OracleColumnType::Xml => {
                 let locator = locator.clone();
@@ -2204,7 +2211,11 @@ impl OracleThinSession {
                     return Ok(());
                 };
                 for (attr_column, (_, attr_value)) in attr_columns.iter().zip(attrs.iter_mut()) {
-                    self.resolve_xml_lob_value_for_column(attr_column, attr_value)?;
+                    self.resolve_xml_lob_value_for_column(
+                        attr_column,
+                        attr_value,
+                        depth.saturating_add(1),
+                    )?;
                 }
             }
             OracleValue::Array(values) => {
@@ -2214,7 +2225,11 @@ impl OracleThinSession {
                     return Ok(());
                 };
                 for element_value in values {
-                    self.resolve_xml_lob_value_for_column(&element_column, element_value)?;
+                    self.resolve_xml_lob_value_for_column(
+                        &element_column,
+                        element_value,
+                        depth.saturating_add(1),
+                    )?;
                 }
             }
             OracleValue::IndexedArray(values) => {
@@ -2224,7 +2239,11 @@ impl OracleThinSession {
                     return Ok(());
                 };
                 for (_, element_value) in values {
-                    self.resolve_xml_lob_value_for_column(&element_column, element_value)?;
+                    self.resolve_xml_lob_value_for_column(
+                        &element_column,
+                        element_value,
+                        depth.saturating_add(1),
+                    )?;
                 }
             }
             _ => {}
@@ -2506,8 +2525,9 @@ impl OracleThinSession {
         &mut self,
         columns: &[ThinColumn],
     ) -> Result<(), OracleThinError> {
+        let mut visiting = HashSet::new();
         for column in columns {
-            self.ensure_object_or_collection_metadata_for_column(column)?;
+            self.ensure_object_or_collection_metadata_for_column(column, &mut visiting)?;
         }
         Ok(())
     }
@@ -2515,6 +2535,7 @@ impl OracleThinSession {
     fn ensure_object_or_collection_metadata_for_column(
         &mut self,
         column: &ThinColumn,
+        visiting: &mut HashSet<(String, String)>,
     ) -> Result<(), OracleThinError> {
         if !is_decodable_object_column(column) {
             return Ok(());
@@ -2525,15 +2546,19 @@ impl OracleThinSession {
         {
             return Ok(());
         }
-        match self.load_named_typecode(&key.0, &key.1)?.as_deref() {
+        if !enter_named_type_metadata(&key, visiting)? {
+            return Ok(());
+        }
+
+        let result = (|| match self.load_named_typecode(&key.0, &key.1)?.as_deref() {
             Some("OBJECT") => {
-                let attrs = self.load_object_type_attrs(&key.0, &key.1)?;
-                self.object_attrs_by_type.insert(key, attrs);
+                let attrs = self.load_object_type_attrs(&key.0, &key.1, visiting)?;
+                self.object_attrs_by_type.insert(key.clone(), attrs);
                 Ok(())
             }
             Some("COLLECTION") => {
-                let element = self.load_collection_element_type(&key.0, &key.1)?;
-                self.collection_element_by_type.insert(key, element);
+                let element = self.load_collection_element_type(&key.0, &key.1, visiting)?;
+                self.collection_element_by_type.insert(key.clone(), element);
                 Ok(())
             }
             Some(typecode) => Err(OracleThinError::new(format!(
@@ -2544,7 +2569,9 @@ impl OracleThinSession {
                 "Oracle thin TTC cannot verify named type {}.{}",
                 key.0, key.1
             ))),
-        }
+        })();
+        visiting.remove(&key);
+        result
     }
 
     fn load_named_typecode(
@@ -2576,6 +2603,7 @@ impl OracleThinSession {
         &mut self,
         schema_name: &str,
         type_name: &str,
+        visiting: &mut HashSet<(String, String)>,
     ) -> Result<ThinColumn, OracleThinError> {
         let sql = format!(
             "SELECT c.elem_type_name, c.elem_type_owner, c.length, \
@@ -2643,7 +2671,7 @@ impl OracleThinSession {
             buffer_size,
             charset_form,
         )?;
-        self.ensure_object_or_collection_metadata_for_column(&element)?;
+        self.ensure_object_or_collection_metadata_for_column(&element, visiting)?;
         Ok(element)
     }
 
@@ -2651,6 +2679,7 @@ impl OracleThinSession {
         &mut self,
         schema_name: &str,
         type_name: &str,
+        visiting: &mut HashSet<(String, String)>,
     ) -> Result<Vec<ThinColumn>, OracleThinError> {
         let sql = format!(
             "SELECT a.attr_name, a.attr_type_name, a.attr_type_owner, a.length, \
@@ -2726,7 +2755,7 @@ impl OracleThinSession {
             )?);
         }
         for attr in &attrs {
-            self.ensure_object_or_collection_metadata_for_column(attr)?;
+            self.ensure_object_or_collection_metadata_for_column(attr, visiting)?;
         }
         Ok(attrs)
     }
@@ -3789,6 +3818,22 @@ fn object_type_key(schema_name: &str, type_name: &str) -> (String, String) {
         schema_name.trim_matches('"').to_string(),
         type_name.trim_matches('"').to_string(),
     )
+}
+
+fn enter_named_type_metadata(
+    key: &(String, String),
+    visiting: &mut HashSet<(String, String)>,
+) -> Result<bool, OracleThinError> {
+    if visiting.contains(key) {
+        return Ok(false);
+    }
+    if visiting.len() >= MAX_ORACLE_VALUE_NESTING_DEPTH {
+        return Err(OracleThinError::new(format!(
+            "Oracle named type nesting exceeds {MAX_ORACLE_VALUE_NESTING_DEPTH} levels"
+        )));
+    }
+    visiting.insert(key.clone());
+    Ok(true)
 }
 
 fn sql_string_literal(value: &str) -> String {
@@ -7513,6 +7558,7 @@ fn read_object_value(
             element,
             object_attrs_by_type,
             collection_element_by_type,
+            0,
         );
     }
     decode_object_payload(
@@ -7521,6 +7567,7 @@ fn read_object_value(
         column,
         object_attrs_by_type,
         collection_element_by_type,
+        0,
     )
 }
 
@@ -7530,7 +7577,13 @@ fn decode_object_payload(
     column: &ThinColumn,
     object_attrs_by_type: &HashMap<(String, String), Vec<ThinColumn>>,
     collection_element_by_type: &HashMap<(String, String), ThinColumn>,
+    depth: usize,
 ) -> Result<OracleValue, OracleThinError> {
+    if depth > MAX_ORACLE_VALUE_NESTING_DEPTH {
+        return Err(OracleThinError::new(format!(
+            "Oracle object nesting exceeds {MAX_ORACLE_VALUE_NESTING_DEPTH} levels"
+        )));
+    }
     let key = object_type_key(&column.schema_name, &column.type_name);
     let attrs = object_attrs_by_type.get(&key).ok_or_else(|| {
         OracleThinError::new(format!(
@@ -7557,6 +7610,7 @@ fn decode_object_payload(
         attrs,
         object_attrs_by_type,
         collection_element_by_type,
+        depth,
     )
 }
 
@@ -7566,6 +7620,7 @@ fn read_object_attrs(
     attrs: &[ThinColumn],
     object_attrs_by_type: &HashMap<(String, String), Vec<ThinColumn>>,
     collection_element_by_type: &HashMap<(String, String), ThinColumn>,
+    depth: usize,
 ) -> Result<OracleValue, OracleThinError> {
     let mut values = Vec::with_capacity(attrs.len());
     for attr in attrs {
@@ -7576,6 +7631,7 @@ fn read_object_attrs(
             object_attrs_by_type,
             collection_element_by_type,
             false,
+            depth,
         )?;
         values.push((attr.name.clone(), value));
     }
@@ -7589,6 +7645,7 @@ fn read_object_attr_value(
     object_attrs_by_type: &HashMap<(String, String), Vec<ThinColumn>>,
     collection_element_by_type: &HashMap<(String, String), ThinColumn>,
     object_values_are_wrapped: bool,
+    depth: usize,
 ) -> Result<OracleValue, OracleThinError> {
     match attr.ora_type_num {
         ORA_TYPE_NUM_NUMBER => read_object_pickle_bytes(cursor)?
@@ -7672,6 +7729,7 @@ fn read_object_attr_value(
                             element,
                             object_attrs_by_type,
                             collection_element_by_type,
+                            depth.saturating_add(1),
                         )
                     })
                     .transpose()
@@ -7686,6 +7744,7 @@ fn read_object_attr_value(
                             attr,
                             object_attrs_by_type,
                             collection_element_by_type,
+                            depth.saturating_add(1),
                         )
                     })
                     .transpose()
@@ -7710,6 +7769,7 @@ fn read_object_attr_value(
                 attrs,
                 object_attrs_by_type,
                 collection_element_by_type,
+                depth.saturating_add(1),
             )
         }
         other => Err(OracleThinError::new(format!(
@@ -7725,7 +7785,13 @@ fn decode_collection_payload(
     element: &ThinColumn,
     object_attrs_by_type: &HashMap<(String, String), Vec<ThinColumn>>,
     collection_element_by_type: &HashMap<(String, String), ThinColumn>,
+    depth: usize,
 ) -> Result<OracleValue, OracleThinError> {
+    if depth > MAX_ORACLE_VALUE_NESTING_DEPTH {
+        return Err(OracleThinError::new(format!(
+            "Oracle collection nesting exceeds {MAX_ORACLE_VALUE_NESTING_DEPTH} levels"
+        )));
+    }
     let mut cursor = PacketCursor::with_capabilities(bytes, capabilities);
     let image_flags = cursor.read_u8()?;
     let _image_version = cursor.read_u8()?;
@@ -7753,6 +7819,7 @@ fn decode_collection_payload(
                 object_attrs_by_type,
                 collection_element_by_type,
                 true,
+                depth,
             )?;
             values.push((index, value));
         }
@@ -7767,6 +7834,7 @@ fn decode_collection_payload(
                 object_attrs_by_type,
                 collection_element_by_type,
                 true,
+                depth,
             )?);
         }
         Ok(OracleValue::Array(values))
@@ -8028,7 +8096,7 @@ fn encode_oson_json(
 ) -> Result<Vec<u8>, OracleThinError> {
     let is_scalar = !matches!(value, JsonValue::Array(_) | JsonValue::Object(_));
     let mut field_names = Vec::new();
-    collect_oson_field_names(value, &mut field_names)?;
+    collect_oson_field_names(value, &mut field_names, 0)?;
     let mut short_field_names = Vec::new();
     let mut long_field_names = Vec::new();
     for field in field_names {
@@ -8067,7 +8135,7 @@ fn encode_oson_json(
     };
 
     let mut tree = Vec::new();
-    encode_oson_node(value, &mut tree, &field_names)?;
+    encode_oson_node(value, &mut tree, &field_names, 0)?;
 
     let mut flags = TNS_JSON_FLAG_INLINE_LEAF;
     if is_scalar {
@@ -8273,11 +8341,17 @@ fn sort_oson_field_names(fields: &mut [OsonFieldName]) {
 fn collect_oson_field_names(
     value: &JsonValue,
     fields: &mut Vec<OsonFieldName>,
+    depth: usize,
 ) -> Result<(), OracleThinError> {
+    if depth > MAX_ORACLE_VALUE_NESTING_DEPTH {
+        return Err(OracleThinError::new(format!(
+            "Oracle JSON bind nesting exceeds {MAX_ORACLE_VALUE_NESTING_DEPTH} levels"
+        )));
+    }
     match value {
         JsonValue::Array(values) => {
             for value in values {
-                collect_oson_field_names(value, fields)?;
+                collect_oson_field_names(value, fields, depth.saturating_add(1))?;
             }
         }
         JsonValue::Object(values) => {
@@ -8297,7 +8371,7 @@ fn collect_oson_field_names(
                         field_id: 0,
                     });
                 }
-                collect_oson_field_names(value, fields)?;
+                collect_oson_field_names(value, fields, depth.saturating_add(1))?;
             }
         }
         _ => {}
@@ -8352,7 +8426,13 @@ fn encode_oson_node(
     value: &JsonValue,
     out: &mut Vec<u8>,
     fields: &[OsonFieldName],
+    depth: usize,
 ) -> Result<(), OracleThinError> {
+    if depth > MAX_ORACLE_VALUE_NESTING_DEPTH {
+        return Err(OracleThinError::new(format!(
+            "Oracle JSON bind nesting exceeds {MAX_ORACLE_VALUE_NESTING_DEPTH} levels"
+        )));
+    }
     match value {
         JsonValue::Null => out.push(TNS_JSON_TYPE_NULL),
         JsonValue::Bool(true) => out.push(TNS_JSON_TYPE_TRUE),
@@ -8366,8 +8446,8 @@ fn encode_oson_node(
             out.extend_from_slice(&bytes);
         }
         JsonValue::String(value) => encode_oson_string(value, out)?,
-        JsonValue::Array(values) => encode_oson_array(values, out, fields)?,
-        JsonValue::Object(values) => encode_oson_object(values, out, fields)?,
+        JsonValue::Array(values) => encode_oson_array(values, out, fields, depth)?,
+        JsonValue::Object(values) => encode_oson_object(values, out, fields, depth)?,
     }
     Ok(())
 }
@@ -8376,6 +8456,7 @@ fn encode_oson_array(
     values: &[JsonValue],
     out: &mut Vec<u8>,
     fields: &[OsonFieldName],
+    depth: usize,
 ) -> Result<(), OracleThinError> {
     let node_type = oson_container_node_type(TNS_JSON_TYPE_ARRAY, values.len());
     out.push(node_type);
@@ -8387,7 +8468,7 @@ fn encode_oson_array(
             .map_err(|_| OracleThinError::new("Oracle JSON bind tree segment is too large"))?;
         out[offsets_pos + index * 4..offsets_pos + index * 4 + 4]
             .copy_from_slice(&offset.to_be_bytes());
-        encode_oson_node(value, out, fields)?;
+        encode_oson_node(value, out, fields, depth.saturating_add(1))?;
     }
     Ok(())
 }
@@ -8396,6 +8477,7 @@ fn encode_oson_object(
     values: &serde_json::Map<String, JsonValue>,
     out: &mut Vec<u8>,
     fields: &[OsonFieldName],
+    depth: usize,
 ) -> Result<(), OracleThinError> {
     let node_type = oson_container_node_type(TNS_JSON_TYPE_OBJECT, values.len());
     let field_id_size = oson_field_id_size(fields.len());
@@ -8420,7 +8502,7 @@ fn encode_oson_object(
             .map_err(|_| OracleThinError::new("Oracle JSON bind tree segment is too large"))?;
         out[offsets_pos + index * 4..offsets_pos + index * 4 + 4]
             .copy_from_slice(&offset.to_be_bytes());
-        encode_oson_node(value, out, fields)?;
+        encode_oson_node(value, out, fields, depth.saturating_add(1))?;
     }
     Ok(())
 }
@@ -8571,6 +8653,7 @@ struct OsonDecoder<'a> {
     field_id_length: usize,
     tree_seg_pos: usize,
     relative_offsets: bool,
+    active_container_offsets: HashSet<usize>,
 }
 
 impl<'a> OsonDecoder<'a> {
@@ -8582,6 +8665,7 @@ impl<'a> OsonDecoder<'a> {
             field_id_length: 1,
             tree_seg_pos: 0,
             relative_offsets: false,
+            active_container_offsets: HashSet::new(),
         }
     }
 
@@ -8614,7 +8698,7 @@ impl<'a> OsonDecoder<'a> {
         if primary_flags & TNS_JSON_FLAG_IS_SCALAR != 0 {
             self.skip_tree_segment_size(primary_flags)?;
             self.tree_seg_pos = self.pos;
-            return self.decode_node();
+            return self.decode_node(0);
         }
 
         let num_short_field_names = if primary_flags & TNS_JSON_FLAG_NUM_FNAMES_UINT32 != 0 {
@@ -8676,7 +8760,7 @@ impl<'a> OsonDecoder<'a> {
         }
 
         self.tree_seg_pos = self.pos;
-        self.decode_node()
+        self.decode_node(0)
     }
 
     fn skip_tree_segment_size(&mut self, primary_flags: u16) -> Result<(), OracleThinError> {
@@ -8737,10 +8821,15 @@ impl<'a> OsonDecoder<'a> {
         Ok(names)
     }
 
-    fn decode_node(&mut self) -> Result<String, OracleThinError> {
+    fn decode_node(&mut self, depth: usize) -> Result<String, OracleThinError> {
+        if depth > MAX_ORACLE_VALUE_NESTING_DEPTH {
+            return Err(OracleThinError::new(format!(
+                "Oracle OSON nesting exceeds {MAX_ORACLE_VALUE_NESTING_DEPTH} levels"
+            )));
+        }
         let node_type = self.read_u8()?;
         if node_type & 0x80 != 0 {
-            return self.decode_container_node(node_type);
+            return self.decode_container_node(node_type, depth);
         }
 
         match node_type {
@@ -8835,77 +8924,93 @@ impl<'a> OsonDecoder<'a> {
         )))
     }
 
-    fn decode_container_node(&mut self, node_type: u8) -> Result<String, OracleThinError> {
-        let is_object = node_type & 0x40 == 0;
+    fn decode_container_node(
+        &mut self,
+        node_type: u8,
+        depth: usize,
+    ) -> Result<String, OracleThinError> {
         let container_offset = self.pos - self.tree_seg_pos - 1;
-        let (mut num_children, is_shared) = self.read_num_children(node_type)?;
-        let mut field_ids_pos = 0usize;
-        let offsets_pos;
-        if is_shared {
-            let offset = self.read_offset(node_type)?;
-            offsets_pos = self.pos;
-            self.pos = self.tree_seg_pos + offset;
-            let shared_node_type = self.read_u8()?;
-            let (shared_children, _) = self.read_num_children(shared_node_type)?;
-            num_children = shared_children;
-            field_ids_pos = self.pos;
-        } else if is_object {
-            field_ids_pos = self.pos;
-            offsets_pos = self.pos + self.field_id_length * num_children;
-        } else {
-            offsets_pos = self.pos;
+        if !self.active_container_offsets.insert(container_offset) {
+            return Err(OracleThinError::new(format!(
+                "cyclic Oracle OSON container offset {container_offset}"
+            )));
         }
 
-        let mut next_field_ids_pos = field_ids_pos;
-        let mut next_offsets_pos = offsets_pos;
-        let mut values = Vec::with_capacity(num_children);
-        for index in 0..num_children {
-            let name = if is_object {
-                self.pos = next_field_ids_pos;
-                let field_id = match self.field_id_length {
-                    1 => usize::from(self.read_u8()?),
-                    2 => usize::from(self.read_u16_be()?),
-                    4 => self.read_u32_be()? as usize,
-                    other => {
-                        return Err(OracleThinError::new(format!(
-                            "invalid OSON field id length {other}"
-                        )))
-                    }
+        let result = (|| {
+            let is_object = node_type & 0x40 == 0;
+            let (mut num_children, is_shared) = self.read_num_children(node_type)?;
+            let mut field_ids_pos = 0usize;
+            let offsets_pos;
+            if is_shared {
+                let offset = self.read_offset(node_type)?;
+                offsets_pos = self.pos;
+                self.pos = self.tree_seg_pos + offset;
+                let shared_node_type = self.read_u8()?;
+                let (shared_children, _) = self.read_num_children(shared_node_type)?;
+                num_children = shared_children;
+                field_ids_pos = self.pos;
+            } else if is_object {
+                field_ids_pos = self.pos;
+                offsets_pos = self.pos + self.field_id_length * num_children;
+            } else {
+                offsets_pos = self.pos;
+            }
+
+            let mut next_field_ids_pos = field_ids_pos;
+            let mut next_offsets_pos = offsets_pos;
+            let mut values = Vec::with_capacity(num_children);
+            for index in 0..num_children {
+                let name = if is_object {
+                    self.pos = next_field_ids_pos;
+                    let field_id = match self.field_id_length {
+                        1 => usize::from(self.read_u8()?),
+                        2 => usize::from(self.read_u16_be()?),
+                        4 => self.read_u32_be()? as usize,
+                        other => {
+                            return Err(OracleThinError::new(format!(
+                                "invalid OSON field id length {other}"
+                            )))
+                        }
+                    };
+                    next_field_ids_pos = self.pos;
+                    Some(
+                        self.field_names
+                            .get(field_id.saturating_sub(1))
+                            .ok_or_else(|| {
+                                OracleThinError::new(format!(
+                                    "OSON field id {field_id} out of range"
+                                ))
+                            })?
+                            .clone(),
+                    )
+                } else {
+                    let _ = index;
+                    None
                 };
-                next_field_ids_pos = self.pos;
-                Some(
-                    self.field_names
-                        .get(field_id.saturating_sub(1))
-                        .ok_or_else(|| {
-                            OracleThinError::new(format!("OSON field id {field_id} out of range"))
-                        })?
-                        .clone(),
-                )
-            } else {
-                let _ = index;
-                None
-            };
 
-            self.pos = next_offsets_pos;
-            let mut offset = self.read_offset(node_type)?;
-            if self.relative_offsets {
-                offset += container_offset;
+                self.pos = next_offsets_pos;
+                let mut offset = self.read_offset(node_type)?;
+                if self.relative_offsets {
+                    offset += container_offset;
+                }
+                next_offsets_pos = self.pos;
+                self.pos = self.tree_seg_pos + offset;
+                let value = self.decode_node(depth.saturating_add(1))?;
+                if let Some(name) = name {
+                    values.push(format!("{}:{value}", json_quote(&name)));
+                } else {
+                    values.push(value);
+                }
             }
-            next_offsets_pos = self.pos;
-            self.pos = self.tree_seg_pos + offset;
-            let value = self.decode_node()?;
-            if let Some(name) = name {
-                values.push(format!("{}:{value}", json_quote(&name)));
-            } else {
-                values.push(value);
-            }
-        }
 
-        if is_object {
-            Ok(format!("{{{}}}", values.join(",")))
-        } else {
-            Ok(format!("[{}]", values.join(",")))
-        }
+            if is_object {
+                Ok(format!("{{{}}}", values.join(",")))
+            } else {
+                Ok(format!("[{}]", values.join(",")))
+            }
+        })();
+        self.active_container_offsets.remove(&container_offset);
+        result
     }
 
     fn read_num_children(&mut self, node_type: u8) -> Result<(usize, bool), OracleThinError> {
@@ -18706,6 +18811,42 @@ mod tests {
     }
 
     #[test]
+    fn oson_decoder_rejects_excessive_nesting_and_cyclic_offsets() {
+        let depth = super::MAX_ORACLE_VALUE_NESTING_DEPTH + 2;
+        let mut tree = Vec::with_capacity(depth * 6 + 1);
+        for level in 0..depth {
+            tree.push(0xe0);
+            tree.push(1);
+            tree.extend_from_slice(&((level + 1) as u32 * 6).to_be_bytes());
+        }
+        tree.push(super::TNS_JSON_TYPE_NULL);
+
+        let mut nested = vec![0xff, 0x4a, 0x5a, 0x01, 0x21, 0x02, 0, 0, 0];
+        nested.extend_from_slice(&(tree.len() as u16).to_be_bytes());
+        nested.extend_from_slice(&[0, 0]);
+        nested.extend_from_slice(&tree);
+        let err = decode_oson_to_json(&nested).expect_err("deep OSON must be rejected");
+        assert!(err.to_string().contains("nesting exceeds"));
+
+        let cyclic = vec![
+            0xff, 0x4a, 0x5a, 0x01, 0x21, 0x02, 0, 0, 0, 0, 7, 0, 0, 0xe0, 1, 0, 0, 0, 0,
+        ];
+        let err = decode_oson_to_json(&cyclic).expect_err("cyclic OSON must be rejected");
+        assert!(err.to_string().contains("cyclic Oracle OSON"));
+    }
+
+    #[test]
+    fn oson_encoder_rejects_excessive_nesting() {
+        let mut value = serde_json::Value::Null;
+        for _ in 0..=super::MAX_ORACLE_VALUE_NESTING_DEPTH {
+            value = serde_json::Value::Array(vec![value]);
+        }
+
+        let err = encode_oson_json(&value, false).expect_err("deep JSON bind must be rejected");
+        assert!(err.to_string().contains("nesting exceeds"));
+    }
+
+    #[test]
     fn encodes_json_bind_text_as_oson_payload() {
         let simple = serde_json::json!({"a": true});
         assert_eq!(
@@ -19278,12 +19419,28 @@ mod tests {
             &column,
             &object_attrs_by_type,
             &HashMap::new(),
+            0,
         )
         .expect_err("degenerate DbObject payload should not decode as Null");
 
         assert!(err
             .to_string()
             .contains("DbObject stored in a LOB is not supported"));
+    }
+
+    #[test]
+    fn named_type_metadata_guard_breaks_cycles_and_caps_depth() {
+        let key = ("APP".to_string(), "NODE_T".to_string());
+        let mut visiting = HashSet::new();
+        assert!(super::enter_named_type_metadata(&key, &mut visiting).unwrap());
+        assert!(!super::enter_named_type_metadata(&key, &mut visiting).unwrap());
+
+        let mut full = (0..super::MAX_ORACLE_VALUE_NESTING_DEPTH)
+            .map(|index| ("APP".to_string(), format!("TYPE_{index}")))
+            .collect::<HashSet<_>>();
+        let err = super::enter_named_type_metadata(&key, &mut full)
+            .expect_err("deep named type graph must be rejected");
+        assert!(err.to_string().contains("named type nesting exceeds"));
     }
 
     #[test]
@@ -19305,6 +19462,7 @@ mod tests {
             &element,
             &HashMap::new(),
             &HashMap::new(),
+            0,
         )
         .expect_err("degenerate collection payload should not decode as Null");
 
@@ -19335,6 +19493,7 @@ mod tests {
             &element,
             &HashMap::new(),
             &HashMap::new(),
+            0,
         )
         .unwrap();
 
@@ -19375,6 +19534,7 @@ mod tests {
             &column,
             &object_attrs_by_type,
             &HashMap::new(),
+            0,
         )
         .unwrap();
 
@@ -19431,6 +19591,7 @@ mod tests {
             &column,
             &object_attrs_by_type,
             &HashMap::new(),
+            0,
         )
         .unwrap();
 
@@ -19474,6 +19635,7 @@ mod tests {
             &column,
             &object_attrs_by_type,
             &HashMap::new(),
+            0,
         )
         .unwrap();
 
@@ -19517,6 +19679,7 @@ mod tests {
             &column,
             &object_attrs_by_type,
             &HashMap::new(),
+            0,
         )
         .unwrap();
 
@@ -19560,6 +19723,7 @@ mod tests {
             &column,
             &object_attrs_by_type,
             &HashMap::new(),
+            0,
         )
         .unwrap();
 
@@ -19618,6 +19782,7 @@ mod tests {
             &column,
             &object_attrs_by_type,
             &HashMap::new(),
+            0,
         )
         .unwrap();
 
@@ -19653,6 +19818,7 @@ mod tests {
             &element,
             &HashMap::new(),
             &HashMap::new(),
+            0,
         )
         .unwrap();
 

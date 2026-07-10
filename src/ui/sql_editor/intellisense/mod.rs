@@ -5,6 +5,7 @@ use fltk::{
     prelude::*,
     text::{PositionType, TextBuffer, TextEditor},
 };
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
@@ -36,6 +37,35 @@ const COLUMN_LOAD_WORKER_COUNT: usize = 4;
 const INTELLISENSE_PARSE_POLL_INTERVAL_SECONDS: f64 = 0.01;
 const INTELLISENSE_DEFERRED_HIDE_RETRIES: u8 = 3;
 const SIGNATURE_POPUP_DEFERRED_HIDE_RETRIES: u8 = 3;
+const MAX_INTELLISENSE_RECURSION_DEPTH: usize = 64;
+
+thread_local! {
+    static INTELLISENSE_RECURSION_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+struct IntellisenseRecursionGuard;
+
+impl IntellisenseRecursionGuard {
+    fn try_enter() -> Option<Self> {
+        INTELLISENSE_RECURSION_DEPTH.with(|depth| {
+            let current = depth.get();
+            if current >= MAX_INTELLISENSE_RECURSION_DEPTH {
+                None
+            } else {
+                depth.set(current + 1);
+                Some(Self)
+            }
+        })
+    }
+}
+
+impl Drop for IntellisenseRecursionGuard {
+    fn drop(&mut self) {
+        INTELLISENSE_RECURSION_DEPTH.with(|depth| {
+            depth.set(depth.get().saturating_sub(1));
+        });
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NavigationKeyupState {
@@ -193,7 +223,7 @@ mod intellisense_regression_tests {
     use super::*;
     use crate::db::create_shared_connection;
     use std::collections::HashMap;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     include!("tests.rs");

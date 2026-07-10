@@ -14396,30 +14396,29 @@ impl SqlEditorWidget {
     }
 
     fn oracle_thin_close_owned_cursor_value(conn: &mut OracleThinSession, value: OracleValue) {
-        match value {
-            OracleValue::Cursor(cursor) => conn.close_cursor_later(Some(cursor.cursor_id)),
-            OracleValue::Object(values) => {
-                for (_, value) in values {
-                    Self::oracle_thin_close_owned_cursor_value(conn, value);
+        let mut pending = vec![value];
+        while let Some(value) = pending.pop() {
+            match value {
+                OracleValue::Cursor(cursor) => conn.close_cursor_later(Some(cursor.cursor_id)),
+                OracleValue::Object(values) => {
+                    pending.extend(values.into_iter().rev().map(|(_, value)| value));
                 }
-            }
-            OracleValue::Array(values) => {
-                Self::oracle_thin_close_owned_cursor_values(conn, values);
-            }
-            OracleValue::IndexedArray(values) => {
-                for (_, value) in values {
-                    Self::oracle_thin_close_owned_cursor_value(conn, value);
+                OracleValue::Array(values) => {
+                    pending.extend(values.into_iter().rev());
                 }
+                OracleValue::IndexedArray(values) => {
+                    pending.extend(values.into_iter().rev().map(|(_, value)| value));
+                }
+                OracleValue::Null
+                | OracleValue::Number(_)
+                | OracleValue::Text(_)
+                | OracleValue::Boolean(_)
+                | OracleValue::DateTime(_)
+                | OracleValue::Timestamp(_)
+                | OracleValue::Bytes(_)
+                | OracleValue::JsonId(_)
+                | OracleValue::Lob(_) => {}
             }
-            OracleValue::Null
-            | OracleValue::Number(_)
-            | OracleValue::Text(_)
-            | OracleValue::Boolean(_)
-            | OracleValue::DateTime(_)
-            | OracleValue::Timestamp(_)
-            | OracleValue::Bytes(_)
-            | OracleValue::JsonId(_)
-            | OracleValue::Lob(_) => {}
         }
     }
 

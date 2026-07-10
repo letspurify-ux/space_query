@@ -9,6 +9,8 @@ use crate::ui::sql_depth::{
 };
 use crate::ui::sql_editor::SqlToken;
 
+const MAX_INTELLISENSE_RECURSION_DEPTH: usize = 64;
+
 /// SQL clause phase within a query at a specific depth level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SqlPhase {
@@ -5834,11 +5836,6 @@ fn normalize_table_name_part(value: &str) -> String {
     }
 }
 
-/// Parse a table name at the given position (handling schema.table format).
-fn parse_table_name_deep(tokens: &[SqlToken], start: usize) -> Option<(String, usize)> {
-    parse_table_name_deep_with_options(tokens, start, false)
-}
-
 fn parse_expected_table_name_deep(tokens: &[SqlToken], start: usize) -> Option<(String, usize)> {
     parse_table_name_deep_with_options(tokens, start, true)
 }
@@ -5848,11 +5845,28 @@ fn parse_table_name_deep_with_options(
     start: usize,
     allow_table_source_construct_keyword_name: bool,
 ) -> Option<(String, usize)> {
+    parse_table_name_deep_with_options_at_depth(
+        tokens,
+        start,
+        allow_table_source_construct_keyword_name,
+        0,
+    )
+}
+
+fn parse_table_name_deep_with_options_at_depth(
+    tokens: &[SqlToken],
+    start: usize,
+    allow_table_source_construct_keyword_name: bool,
+    depth: usize,
+) -> Option<(String, usize)> {
+    if depth >= MAX_INTELLISENSE_RECURSION_DEPTH {
+        return None;
+    }
     match tokens.get(start) {
         Some(SqlToken::Symbol(sym)) if sym == "(" => None,
         Some(SqlToken::Word(word)) => {
             if let Some((wrapped_name, next_idx)) =
-                parse_relation_wrapper_table_name(tokens, start, word)
+                parse_relation_wrapper_table_name(tokens, start, word, depth)
             {
                 return Some((wrapped_name, next_idx));
             }
@@ -5931,6 +5945,7 @@ fn parse_relation_wrapper_table_name(
     tokens: &[SqlToken],
     start: usize,
     relation_word: &str,
+    depth: usize,
 ) -> Option<(String, usize)> {
     let relation_upper = relation_word.to_ascii_uppercase();
     if relation_upper == "ROWS" {
@@ -5962,11 +5977,12 @@ fn parse_relation_wrapper_table_name(
         if matches!(tokens.get(open_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
             let (inner_range, next_idx) = extract_parenthesized_range(tokens, open_idx)?;
             let inner_tokens = token_range_slice(tokens, inner_range);
-            let (relation_name, _) = parse_table_name_deep(inner_tokens, 0)?;
+            let (relation_name, _) =
+                parse_table_name_deep_with_options_at_depth(inner_tokens, 0, false, depth + 1)?;
             return Some((relation_name, next_idx));
         }
 
-        return parse_table_name_deep(tokens, open_idx);
+        return parse_table_name_deep_with_options_at_depth(tokens, open_idx, false, depth + 1);
     }
 
     let Some(SqlToken::Symbol(sym)) = tokens.get(open_idx) else {
@@ -5983,7 +5999,9 @@ fn parse_relation_wrapper_table_name(
     // or scalar subqueries. For identifier-like forms
     // (`TABLE(schema.collection_col)`, `CONTAINERS(schema.table)`) keep the
     // underlying name so alias resolution can target stable relation keys.
-    if let Some((relation_name, _)) = parse_table_name_deep(inner_tokens, 0) {
+    if let Some((relation_name, _)) =
+        parse_table_name_deep_with_options_at_depth(inner_tokens, 0, false, depth + 1)
+    {
         Some((relation_name, next_idx))
     } else {
         Some((relation_upper, next_idx))
@@ -6569,17 +6587,12 @@ fn skip_flashback_bound_expression(tokens: &[SqlToken], start: usize) -> usize {
 }
 
 fn consume_flashback_operand(tokens: &[SqlToken], start: usize) -> usize {
-    let idx = skip_comment_tokens(tokens, start);
+    let mut idx = skip_comment_tokens(tokens, start);
+    while matches!(tokens.get(idx), Some(SqlToken::Symbol(sym)) if sym == "+" || sym == "-") {
+        idx = skip_comment_tokens(tokens, idx.saturating_add(1));
+    }
     match tokens.get(idx) {
         Some(SqlToken::Symbol(sym)) if sym == "(" => skip_parenthesized_clause(tokens, idx),
-        Some(SqlToken::Symbol(sym)) if sym == "+" || sym == "-" => {
-            let signed_operand_idx = consume_flashback_operand(tokens, idx + 1);
-            if signed_operand_idx == idx {
-                idx.saturating_add(1)
-            } else {
-                signed_operand_idx
-            }
-        }
         Some(SqlToken::Word(_)) => {
             let next_idx = skip_comment_tokens(tokens, idx + 1);
             if matches!(tokens.get(next_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
@@ -7381,13 +7394,24 @@ struct ModelClauseColumns {
 /// This is primarily used when the SELECT list contains `*` and normal
 /// select-list extraction cannot determine output columns.
 pub(crate) fn extract_oracle_pivot_unpivot_projection_columns(tokens: &[SqlToken]) -> Vec<String> {
+    extract_oracle_pivot_unpivot_projection_columns_at_depth(tokens, 0)
+}
+
+fn extract_oracle_pivot_unpivot_projection_columns_at_depth(
+    tokens: &[SqlToken],
+    depth: usize,
+) -> Vec<String> {
+    if depth >= MAX_INTELLISENSE_RECURSION_DEPTH {
+        return Vec::new();
+    }
     let pivot = parse_top_level_pivot_clause(tokens);
     let unpivot = parse_top_level_unpivot_clause(tokens);
     if pivot.is_none() && unpivot.is_none() {
         return Vec::new();
     }
 
-    let mut columns = extract_oracle_pivot_unpivot_source_projection_columns(tokens);
+    let mut columns =
+        extract_oracle_pivot_unpivot_source_projection_columns_at_depth(tokens, depth);
 
     if let Some(pivot_info) = pivot {
         remove_columns_case_insensitive(&mut columns, &pivot_info.for_columns);
@@ -7408,6 +7432,16 @@ pub(crate) fn extract_oracle_pivot_unpivot_projection_columns(tokens: &[SqlToken
 pub(crate) fn extract_oracle_pivot_unpivot_source_projection_columns(
     tokens: &[SqlToken],
 ) -> Vec<String> {
+    extract_oracle_pivot_unpivot_source_projection_columns_at_depth(tokens, 0)
+}
+
+fn extract_oracle_pivot_unpivot_source_projection_columns_at_depth(
+    tokens: &[SqlToken],
+    depth: usize,
+) -> Vec<String> {
+    if depth >= MAX_INTELLISENSE_RECURSION_DEPTH {
+        return Vec::new();
+    }
     let pivot = parse_top_level_pivot_clause(tokens);
     let unpivot = parse_top_level_unpivot_clause(tokens);
     let Some(clause_idx) = first_pivot_unpivot_clause_index(pivot.as_ref(), unpivot.as_ref())
@@ -7415,7 +7449,7 @@ pub(crate) fn extract_oracle_pivot_unpivot_source_projection_columns(
         return Vec::new();
     };
 
-    let mut columns = infer_source_columns_before_clause(tokens, clause_idx);
+    let mut columns = infer_source_columns_before_clause(tokens, clause_idx, depth);
     dedup_columns_case_insensitive(&mut columns);
     columns
 }
@@ -7814,11 +7848,19 @@ fn first_pivot_unpivot_clause_index(
     }
 }
 
-fn infer_source_columns_before_clause(tokens: &[SqlToken], clause_idx: usize) -> Vec<String> {
+fn infer_source_columns_before_clause(
+    tokens: &[SqlToken],
+    clause_idx: usize,
+    depth: usize,
+) -> Vec<String> {
+    if depth >= MAX_INTELLISENSE_RECURSION_DEPTH {
+        return Vec::new();
+    }
     if let Some(source_range) = extract_preceding_parenthesized_range(tokens, clause_idx) {
         let columns = infer_projection_columns_from_query_tokens_allowing_pivot(
             token_range_slice(tokens, source_range),
             true,
+            depth + 1,
         );
         if !columns.is_empty() {
             return columns;
@@ -7842,26 +7884,33 @@ fn infer_source_columns_before_clause(tokens: &[SqlToken], clause_idx: usize) ->
 
     if let Some(subq) = selected_subquery {
         let body_tokens = token_range_slice(tokens, subq.body_range);
-        return infer_projection_columns_from_query_tokens(body_tokens);
+        return infer_projection_columns_from_query_tokens_at_depth(body_tokens, depth + 1);
     }
 
-    infer_projection_columns_from_query_tokens_allowing_pivot(tokens, false)
+    infer_projection_columns_from_query_tokens_allowing_pivot(tokens, false, depth)
 }
 
-fn infer_projection_columns_from_query_tokens(tokens: &[SqlToken]) -> Vec<String> {
-    infer_projection_columns_from_query_tokens_allowing_pivot(tokens, true)
+fn infer_projection_columns_from_query_tokens_at_depth(
+    tokens: &[SqlToken],
+    depth: usize,
+) -> Vec<String> {
+    infer_projection_columns_from_query_tokens_allowing_pivot(tokens, true, depth)
 }
 
 fn infer_projection_columns_from_query_tokens_allowing_pivot(
     tokens: &[SqlToken],
     allow_pivot: bool,
+    depth: usize,
 ) -> Vec<String> {
+    if depth >= MAX_INTELLISENSE_RECURSION_DEPTH {
+        return Vec::new();
+    }
     let mut columns = extract_select_list_columns(tokens);
     if columns.is_empty() {
         columns = extract_table_function_columns(tokens);
     }
     if allow_pivot && columns.is_empty() {
-        columns = extract_oracle_pivot_unpivot_projection_columns(tokens);
+        columns = extract_oracle_pivot_unpivot_projection_columns_at_depth(tokens, depth);
     }
     if columns.is_empty() {
         columns = extract_oracle_model_generated_columns(tokens);

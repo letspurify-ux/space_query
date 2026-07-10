@@ -812,8 +812,7 @@ fn oracle_collect_script_signatures(script: &str, catalog: &mut MysqlFamilyScrip
                 if matches!(kind.as_str(), "PROCEDURE" | "FUNCTION") {
                     if let Some((name, after_name_idx)) = script_object_name_at(&tokens, name_idx) {
                         let params = if matches!(tokens.get(after_name_idx), Some(SqlToken::Symbol(symbol)) if symbol == "(") {
-                            let params = script_parameter_names_from_open_paren(&tokens, after_name_idx);
-                            params
+                            script_parameter_names_from_open_paren(&tokens, after_name_idx)
                         } else {
                             Vec::new()
                         };
@@ -832,8 +831,7 @@ fn oracle_collect_script_signatures(script: &str, catalog: &mut MysqlFamilyScrip
                 continue;
             };
             let params = if matches!(tokens.get(after_name_idx), Some(SqlToken::Symbol(symbol)) if symbol == "(") {
-                let params = script_parameter_names_from_open_paren(&tokens, after_name_idx);
-                params
+                script_parameter_names_from_open_paren(&tokens, after_name_idx)
             } else {
                 Vec::new()
             };
@@ -43952,6 +43950,39 @@ fn operand_type_operators_match_the_preceding_operand_type() {
 }
 
 #[test]
+fn operand_type_inference_caps_deep_call_nesting_and_resets_guard() {
+    let depth = MAX_INTELLISENSE_RECURSION_DEPTH * 4;
+    let sql = format!("{}1{}", "NVL(".repeat(depth), ", 0)".repeat(depth));
+    let tokens = SqlEditorWidget::tokenize_sql(&sql);
+    let data = IntellisenseData::new();
+
+    assert_eq!(
+        SqlEditorWidget::preceding_operand_type(&tokens, tokens.len(), &data, &[]),
+        PrecedingOperandType::Unknown
+    );
+
+    let shallow = SqlEditorWidget::tokenize_sql("1");
+    assert_eq!(
+        SqlEditorWidget::preceding_operand_type(&shallow, shallow.len(), &data, &[]),
+        PrecedingOperandType::Numeric
+    );
+}
+
+#[test]
+fn virtual_projection_inference_caps_deep_subqueries_and_resets_guard() {
+    let mut sql = "SELECT base_col FROM base_table".to_string();
+    for index in 0..MAX_INTELLISENSE_RECURSION_DEPTH * 2 {
+        sql = format!("SELECT * FROM ({sql}) q{index}");
+    }
+    let tokens = SqlEditorWidget::tokenize_sql(&sql);
+    let _ = SqlEditorWidget::extract_select_projection_members_and_source(&tokens);
+
+    let shallow = SqlEditorWidget::tokenize_sql("SELECT base_col FROM base_table");
+    let (columns, _) = SqlEditorWidget::extract_select_projection_members_and_source(&shallow);
+    assert_eq!(columns, vec!["base_col"]);
+}
+
+#[test]
 fn negated_and_collection_predicate_operators_are_position_aware() {
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
 
@@ -49236,11 +49267,9 @@ fn oracle_test_file_scoped_intellisense_data(file_name: &str) -> IntellisenseDat
 }
 
 fn oracle_intellisense_data_from_catalog(catalog: &MysqlFamilyScriptCatalog) -> IntellisenseData {
-    let mut data = intellisense_data_from_mysql_family_catalog(&catalog);
+    let mut data = intellisense_data_from_mysql_family_catalog(catalog);
 
-    for table in ["DUAL"] {
-        push_unique_case_insensitive(&mut data.tables, table);
-    }
+    push_unique_case_insensitive(&mut data.tables, "DUAL");
     data.set_columns_for_table("DUAL", vec!["DUMMY".to_string()]);
 
     for package in ["DBMS_OUTPUT", "DBMS_RANDOM"] {
@@ -49257,9 +49286,7 @@ fn oracle_intellisense_data_from_catalog(catalog: &MysqlFamilyScriptCatalog) -> 
         "DBMS_RANDOM",
         vec![("VALUE".to_string(), Some(QualifiedMemberKind::Function))],
     );
-    for type_name in ["SYS_REFCURSOR"] {
-        push_unique_case_insensitive(&mut data.types, type_name);
-    }
+    push_unique_case_insensitive(&mut data.types, "SYS_REFCURSOR");
 
     data.rebuild_indices();
     data
@@ -49527,9 +49554,7 @@ fn intellisense_sweep_line_prefix_after_last_separator(sql: &str, word_start: us
         .and_then(|text| text.rfind('\n'))
         .map_or(0, |idx| idx + 1);
     let prefix = sql.get(line_start..word_start).unwrap_or("");
-    let start = prefix
-        .rfind(|ch| matches!(ch, '(' | ','))
-        .map_or(0, |idx| idx + 1);
+    let start = prefix.rfind(['(', ',']).map_or(0, |idx| idx + 1);
     prefix.get(start..).unwrap_or("").trim().to_ascii_uppercase()
 }
 
@@ -49756,13 +49781,12 @@ fn intellisense_sweep_is_mysql_name_definition_by_previous_word(
     if !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type)) {
         return false;
     }
-    match intellisense_sweep_previous_meaningful_word(tokens, current_idx)
-        .map(|word| word.to_ascii_uppercase())
-        .as_deref()
-    {
-        Some("SAVEPOINT" | "PREPARE" | "DECLARE" | "AS" | "WITH" | "RECURSIVE") => true,
-        _ => false,
-    }
+    matches!(
+        intellisense_sweep_previous_meaningful_word(tokens, current_idx)
+            .map(|word| word.to_ascii_uppercase())
+            .as_deref(),
+        Some("SAVEPOINT" | "PREPARE" | "DECLARE" | "AS" | "WITH" | "RECURSIVE")
+    )
 }
 
 fn intellisense_sweep_is_cte_name_definition(
@@ -50823,7 +50847,7 @@ fn intellisense_sweep_data_from_config(
 ) -> (IntellisenseData, Option<String>) {
     let mut data = metadata_path
         .map(intellisense_sweep_data_from_metadata_path)
-        .unwrap_or_else(IntellisenseData::new);
+        .unwrap_or_default();
 
     let explicit_metadata_label = config
         .get("metadata_label")
@@ -50891,7 +50915,7 @@ fn intellisense_sweep_config_from_path(path: &PathBuf) -> serde_json::Value {
         .unwrap_or_else(|err| panic!("failed to parse sweep config `{}`: {err}", path.display()))
 }
 
-fn intellisense_sweep_out_path(input_path: &PathBuf) -> PathBuf {
+fn intellisense_sweep_out_path(input_path: &Path) -> PathBuf {
     let file_name = input_path
         .file_name()
         .and_then(|name| name.to_str())
@@ -50899,7 +50923,7 @@ fn intellisense_sweep_out_path(input_path: &PathBuf) -> PathBuf {
     input_path.with_file_name(format!("{file_name}.out"))
 }
 
-fn intellisense_sweep_source_label(input_path: &PathBuf) -> String {
+fn intellisense_sweep_source_label(input_path: &Path) -> String {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     input_path
         .strip_prefix(&manifest)
@@ -51222,7 +51246,7 @@ fn intellisense_words_generate_out_report_from_env() {
         let mut data = metadata_path
             .as_ref()
             .map(intellisense_sweep_data_from_metadata_path)
-            .unwrap_or_else(IntellisenseData::new);
+            .unwrap_or_default();
         data.rebuild_indices();
         (
             data,
@@ -51375,8 +51399,7 @@ fn query_completion_suggestions_from_context_with_data(
     } else if let Some(suggestions) = create_table_storage_column_suggestions {
         suggestions
     } else if qualifier.is_none()
-        && ((at_keyword_only_identifier_slot && !at_column_target_list)
-            || (at_keyword_only_slot && !at_column_target_list)
+        && ((at_keyword_only_identifier_slot || at_keyword_only_slot) && !at_column_target_list
             || SqlEditorWidget::cursor_is_at_mysql_schema_object_keyword_slot_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
@@ -62588,6 +62611,18 @@ fn post_table_modifier_completes_the_relation() {
 }
 
 #[test]
+fn deeply_stacked_post_table_modifiers_do_not_recurse() {
+    let sql = format!("t{}", " SAMPLE (1)".repeat(2_048));
+    let tokens = SqlEditorWidget::tokenize_sql(&sql);
+    let token_refs = tokens.iter().collect::<Vec<_>>();
+
+    assert!(SqlEditorWidget::paren_closes_post_table_modifier(
+        &token_refs,
+        token_refs.len() - 1,
+    ));
+}
+
+#[test]
 fn post_table_modifier_tail_slots_do_not_offer_catalog() {
     use crate::db::DatabaseType::Oracle;
 
@@ -63140,6 +63175,18 @@ fn parenthesised_predicate_completes_like_the_unparenthesised_form() {
             kw(sql, Oracle)
         );
     }
+}
+
+#[test]
+fn deeply_parenthesised_predicate_fails_closed_without_overflow() {
+    let depth = MAX_INTELLISENSE_RECURSION_DEPTH * 4;
+    let sql = format!("{}a = 1{}", "(".repeat(depth), ")".repeat(depth));
+    let tokens = SqlEditorWidget::tokenize_sql(&sql);
+    let token_refs = tokens.iter().collect::<Vec<_>>();
+
+    assert!(!SqlEditorWidget::token_slice_forms_complete_predicate(
+        &token_refs
+    ));
 }
 
 #[test]

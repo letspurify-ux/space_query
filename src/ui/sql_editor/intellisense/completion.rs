@@ -9158,6 +9158,9 @@ impl SqlEditorWidget {
         data: &IntellisenseData,
         column_scope: &[String],
     ) -> PrecedingOperandType {
+        let Some(_recursion_guard) = IntellisenseRecursionGuard::try_enter() else {
+            return PrecedingOperandType::Unknown;
+        };
         let before = Self::meaningful_tokens_before(tokens, end);
         if Self::completed_interval_operand_type(&before).is_some() {
             return PrecedingOperandType::Other;
@@ -25883,6 +25886,16 @@ impl SqlEditorWidget {
     }
 
     fn token_slice_forms_complete_predicate(toks: &[&SqlToken]) -> bool {
+        Self::token_slice_forms_complete_predicate_at_depth(toks, 0)
+    }
+
+    fn token_slice_forms_complete_predicate_at_depth(
+        toks: &[&SqlToken],
+        depth: usize,
+    ) -> bool {
+        if depth >= MAX_INTELLISENSE_RECURSION_DEPTH {
+            return false;
+        }
         // Isolate the current conjunct: walk back at paren depth 0 to the nearest
         // boundary (the clause keyword, a conjunction, or an enclosing paren). A
         // `BETWEEN … AND …` separator is not a conjunction boundary.
@@ -25892,19 +25905,21 @@ impl SqlEditorWidget {
                 "WHERE" | "HAVING" | "ON" | "START" | "CONNECT" | "BY" | "AND" | "OR"
             )
         };
-        let mut depth = 0i32;
+        let mut paren_depth = 0i32;
         let mut conjunct_start = 0usize;
         for idx in (0..toks.len()).rev() {
             match &toks[idx] {
-                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => depth += 1,
+                SqlToken::Symbol(sym) if sym == ")" || sym == "]" => paren_depth += 1,
                 SqlToken::Symbol(sym) if sym == "(" || sym == "[" => {
-                    if depth == 0 {
+                    if paren_depth == 0 {
                         conjunct_start = idx + 1;
                         break;
                     }
-                    depth -= 1;
+                    paren_depth -= 1;
                 }
-                SqlToken::Word(word) if depth == 0 && is_boundary(&word.to_ascii_uppercase()) => {
+                SqlToken::Word(word)
+                    if paren_depth == 0 && is_boundary(&word.to_ascii_uppercase()) =>
+                {
                     if word.eq_ignore_ascii_case("AND")
                         && Self::and_token_belongs_to_between(toks, idx)
                     {
@@ -25958,7 +25973,10 @@ impl SqlEditorWidget {
                         return false;
                     }
                     if expecting_operand
-                        && Self::token_slice_forms_complete_predicate(&conjunct[idx + 1..close - 1])
+                        && Self::token_slice_forms_complete_predicate_at_depth(
+                            &conjunct[idx + 1..close - 1],
+                            depth + 1,
+                        )
                     {
                         saw_predicate_operator = true;
                     }
@@ -40000,48 +40018,49 @@ impl SqlEditorWidget {
     /// or another stacked modifier). A table-function call (`FROM sample(10)`) has a
     /// FROM-list introducer there instead of a name, so it is not mistaken for one.
     fn paren_closes_post_table_modifier(toks: &[&SqlToken], close_idx: usize) -> bool {
-        if !matches!(toks.get(close_idx), Some(SqlToken::Symbol(sym)) if *sym == ")") {
-            return false;
-        }
-        // Match the trailing `)` to its `(`.
-        let mut depth = 0i32;
-        let mut open_idx = None;
-        for idx in (0..=close_idx).rev() {
-            match toks[idx] {
-                SqlToken::Symbol(sym) if sym == ")" => depth += 1,
-                SqlToken::Symbol(sym) if sym == "(" => {
-                    depth -= 1;
-                    if depth == 0 {
-                        open_idx = Some(idx);
-                        break;
+        let mut close_idx = close_idx;
+        loop {
+            if !matches!(toks.get(close_idx), Some(SqlToken::Symbol(sym)) if *sym == ")") {
+                return false;
+            }
+            // Match the trailing `)` to its `(`.
+            let mut depth = 0i32;
+            let mut open_idx = None;
+            for idx in (0..=close_idx).rev() {
+                match toks[idx] {
+                    SqlToken::Symbol(sym) if sym == ")" => depth += 1,
+                    SqlToken::Symbol(sym) if sym == "(" => {
+                        depth -= 1;
+                        if depth == 0 {
+                            open_idx = Some(idx);
+                            break;
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
-        let Some(open_idx) = open_idx else {
-            return false;
-        };
-        // Identify the modifier's lead keyword (the first token of the construct that
-        // owns this paren). `None` means the paren is not a post-table modifier.
-        let Some(lead_idx) = Self::post_table_modifier_lead(toks, open_idx) else {
-            return false;
-        };
-        // The modifier must attach to a table reference: the preceding token is an
-        // identifier word (the table name / its dotted tail) or another stacked
-        // post-table modifier — not a FROM-list introducer (which would make the
-        // paren a table-function argument list, e.g. `FROM sample(10)`).
-        let Some(name_idx) = lead_idx.checked_sub(1) else {
-            return false;
-        };
-        match toks.get(name_idx) {
-            Some(SqlToken::Word(w)) => {
-                !Self::word_breaks_from_relation_tail(&w.to_ascii_uppercase())
+            let Some(open_idx) = open_idx else {
+                return false;
+            };
+            // Identify the modifier's lead keyword (the first token of the construct that
+            // owns this paren). `None` means the paren is not a post-table modifier.
+            let Some(lead_idx) = Self::post_table_modifier_lead(toks, open_idx) else {
+                return false;
+            };
+            // The modifier must attach to a table reference: the preceding token is an
+            // identifier word (the table name / its dotted tail) or another stacked
+            // post-table modifier — not a FROM-list introducer (which would make the
+            // paren a table-function argument list, e.g. `FROM sample(10)`).
+            let Some(name_idx) = lead_idx.checked_sub(1) else {
+                return false;
+            };
+            match toks.get(name_idx) {
+                Some(SqlToken::Word(w)) => {
+                    return !Self::word_breaks_from_relation_tail(&w.to_ascii_uppercase())
+                }
+                Some(SqlToken::Symbol(sym)) if sym == ")" => close_idx = name_idx,
+                _ => return false,
             }
-            Some(SqlToken::Symbol(sym)) if sym == ")" => {
-                Self::paren_closes_post_table_modifier(toks, name_idx)
-            }
-            _ => false,
         }
     }
 
@@ -55734,6 +55753,9 @@ impl SqlEditorWidget {
         column_sender: &mpsc::Sender<ColumnLoadUpdate>,
         connection: &SharedConnection,
     ) -> HashMap<String, Vec<String>> {
+        let Some(_recursion_guard) = IntellisenseRecursionGuard::try_enter() else {
+            return seed_virtual_table_columns.clone();
+        };
         let body_ctx = intellisense_context::analyze_cursor_context(body_tokens, body_tokens.len());
         let mut virtual_table_columns = seed_virtual_table_columns.clone();
 

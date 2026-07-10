@@ -250,12 +250,12 @@ mod tests {
         let fired_pollers = Arc::new(Mutex::new(Vec::new()));
         let start = Instant::now();
 
-        for tab in 0..TAB_COUNT {
-            for poller in 0..POLLERS_PER_TAB {
+        for (tab, tab_pollers) in recurring.iter_mut().enumerate() {
+            for (poller, handle) in tab_pollers.iter_mut().enumerate() {
                 let probe = DropProbe(drops.clone());
                 let fired_pollers_for_callback = fired_pollers.clone();
                 scheduled += 1;
-                recurring[tab][poller] = Some(registry.schedule_at(
+                *handle = Some(registry.schedule_at(
                     start + Duration::from_millis(50),
                     Box::new(move || {
                         drop(probe);

@@ -3453,6 +3453,9 @@ impl SqlEditorWidget {
     fn extract_select_projection_members_and_source(
         body_tokens: &[SqlToken],
     ) -> (Vec<String>, Vec<String>) {
+        let Some(_recursion_guard) = IntellisenseRecursionGuard::try_enter() else {
+            return (Vec::new(), Vec::new());
+        };
         let mut columns = intellisense_context::extract_select_list_columns(body_tokens);
         Self::dedup_column_names_case_insensitive(&mut columns);
         if let Some(transformed_columns) =
@@ -3646,30 +3649,40 @@ impl SqlEditorWidget {
         rowtype_sources: &mut Vec<String>,
         visiting: &mut HashSet<String>,
     ) {
-        let key_upper = key.to_ascii_uppercase();
-        if !visiting.insert(key_upper.clone()) {
-            return;
+        enum PendingProjectionMember {
+            Key(String),
+            Source(String),
         }
 
-        if let Some(virtual_members) = virtual_members_by_name.get(&key_upper) {
-            columns.extend(virtual_members.columns.iter().cloned());
-            for source in &virtual_members.rowtype_sources {
-                let source_upper = source.to_ascii_uppercase();
-                if virtual_members_by_name.contains_key(&source_upper) {
-                    Self::append_virtual_projection_members_for_key(
-                        &source_upper,
-                        virtual_members_by_name,
-                        columns,
-                        rowtype_sources,
-                        visiting,
-                    );
-                } else {
-                    rowtype_sources.push(source.clone());
+        let mut pending = vec![PendingProjectionMember::Key(key.to_ascii_uppercase())];
+        while let Some(item) = pending.pop() {
+            match item {
+                PendingProjectionMember::Key(key_upper) => {
+                    if !visiting.insert(key_upper.clone()) {
+                        continue;
+                    }
+                    if let Some(virtual_members) = virtual_members_by_name.get(&key_upper) {
+                        columns.extend(virtual_members.columns.iter().cloned());
+                        pending.extend(
+                            virtual_members
+                                .rowtype_sources
+                                .iter()
+                                .rev()
+                                .cloned()
+                                .map(PendingProjectionMember::Source),
+                        );
+                    }
+                }
+                PendingProjectionMember::Source(source) => {
+                    let source_upper = source.to_ascii_uppercase();
+                    if virtual_members_by_name.contains_key(&source_upper) {
+                        pending.push(PendingProjectionMember::Key(source_upper));
+                    } else {
+                        rowtype_sources.push(source);
+                    }
                 }
             }
         }
-
-        visiting.remove(&key_upper);
     }
 
     fn extract_known_virtual_projection_members(body_tokens: &[SqlToken]) -> VirtualProjectionMembers {
