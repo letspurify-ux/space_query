@@ -5,13 +5,13 @@ use crate::ui::syntax_highlight::{
 };
 
 const DEFERRED_REHIGHLIGHT_IDLE_DELAY_SECONDS: f64 = 0.15;
+const SEMANTIC_REHIGHLIGHT_OVERSCAN_LINES: usize = 100;
 
 #[derive(Clone, Default)]
 pub(crate) struct HighlightShadowState {
-    text: String,
-    styles: Vec<u8>,
-    newline_positions: Vec<usize>,
-    line_exit_states: Vec<LexerState>,
+    text: ChunkedText,
+    styles: ChunkedValues<u8>,
+    line_exit_states: ChunkedValues<LexerState>,
 }
 
 impl HighlightShadowState {
@@ -21,106 +21,81 @@ impl HighlightShadowState {
         styles: &str,
         line_exit_states: Vec<LexerState>,
     ) {
-        self.text = text;
-        self.styles = styles.as_bytes().to_vec();
-        self.line_exit_states = line_exit_states;
-        self.rebuild_newline_positions();
+        self.text = ChunkedText::from_string(text);
+        self.styles = ChunkedValues::from_vec(styles.as_bytes().to_vec());
+        self.line_exit_states = ChunkedValues::from_vec(line_exit_states);
     }
 
     pub(crate) fn clear(&mut self) {
-        self.text.clear();
-        self.styles.clear();
-        self.newline_positions.clear();
-        self.line_exit_states.clear();
-    }
-
-    fn rebuild_newline_positions(&mut self) {
-        self.newline_positions.clear();
-        extend_line_break_positions(&mut self.newline_positions, &self.text, 0);
+        *self = Self::default();
     }
 
     pub(crate) fn len(&self) -> usize {
         self.text.len()
     }
 
-    fn lower_bound(&self, target: usize) -> usize {
-        self.newline_positions.partition_point(|&pos| pos < target)
+    pub(crate) fn styles_len(&self) -> usize {
+        self.styles.len()
+    }
+
+    pub(crate) fn text_snapshot(&self) -> ChunkedText {
+        self.text.clone()
+    }
+
+    pub(crate) fn bounded_text_around(
+        &self,
+        cursor: usize,
+        lookbehind: usize,
+        lookahead: usize,
+    ) -> (String, usize, usize) {
+        let cursor = self.text.clamp_boundary(cursor.min(self.text.len()));
+        let start = self
+            .text
+            .clamp_boundary(cursor.saturating_sub(lookbehind));
+        let end = self.text.clamp_boundary(
+            cursor
+                .saturating_add(lookahead)
+                .min(self.text.len()),
+        );
+        (
+            self.text.range_string(start, end).unwrap_or_default(),
+            start,
+            cursor.saturating_sub(start),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn text_chunk_count(&self) -> usize {
+        self.text.chunk_count()
     }
 
     pub(crate) fn line_count(&self) -> usize {
-        if self.text.is_empty() {
-            0
-        } else {
-            self.newline_positions.len().saturating_add(1)
-        }
+        self.text.line_count()
     }
 
     pub(crate) fn line_start(&self, pos: usize) -> usize {
-        if self.text.is_empty() {
-            return 0;
-        }
-
-        let pos = pos.min(self.text.len());
-        let idx = self.lower_bound(pos);
-        if idx == 0 {
-            0
-        } else {
-            self.newline_positions[idx - 1].saturating_add(1)
-        }
+        self.text.line_start(pos)
     }
 
     fn line_start_for_index(&self, line_index: usize) -> usize {
-        if line_index == 0 {
-            0
-        } else {
-            self.newline_positions
-                .get(line_index.saturating_sub(1))
-                .copied()
-                .map(|line_end| line_end.saturating_add(1))
-                .unwrap_or(self.text.len())
-        }
+        self.text.line_start_for_index(line_index)
     }
 
     fn inclusive_line_end(&self, pos: usize) -> usize {
-        let text_len = self.text.len();
-        if text_len == 0 {
-            return 0;
-        }
-
-        let pos = pos.min(text_len);
-        let idx = self.lower_bound(pos);
-        self.newline_positions
-            .get(idx)
-            .copied()
-            .map(|line_end| line_end.saturating_add(1).min(text_len))
-            .unwrap_or(text_len)
+        let line_index = self.line_index_for_position(pos);
+        self.inclusive_line_end_for_index(line_index)
     }
 
     fn inclusive_line_end_for_index(&self, line_index: usize) -> usize {
-        self.newline_positions
-            .get(line_index)
-            .copied()
-            .map(|line_end| line_end.saturating_add(1).min(self.text.len()))
-            .unwrap_or(self.text.len())
+        self.text.inclusive_line_end_for_index(line_index)
     }
 
     pub(crate) fn line_end(&self, pos: usize) -> usize {
-        let text_len = self.text.len();
-        if text_len == 0 {
-            return 0;
-        }
-
-        let pos = pos.min(text_len);
-        let idx = self.lower_bound(pos);
-        self.newline_positions.get(idx).copied().unwrap_or(text_len)
+        self.text.line_end(pos)
     }
 
     fn line_index_for_position(&self, pos: usize) -> usize {
-        if self.text.is_empty() {
-            0
-        } else {
-            self.lower_bound(pos.min(self.text.len()))
-        }
+        self.text.line_index_for_position(pos)
     }
 
     fn line_index_for_span_end(&self, start: usize, span_len: usize) -> usize {
@@ -160,18 +135,16 @@ impl HighlightShadowState {
             self.line_exit_states
                 .resize(line_index.saturating_add(1), LexerState::Normal);
         }
-        if let Some(slot) = self.line_exit_states.get_mut(line_index) {
-            *slot = state;
-        }
+        let _ = self.line_exit_states.set(line_index, state);
     }
 
     pub(crate) fn text_range_string(&self, start: usize, end: usize) -> Option<String> {
-        let start = Self::clamp_boundary(&self.text, start.min(self.text.len()));
-        let end = Self::clamp_boundary(&self.text, end.min(self.text.len()));
+        let start = self.text.clamp_boundary(start.min(self.text.len()));
+        let end = self.text.clamp_boundary(end.min(self.text.len()));
         if end < start {
             return Some(String::new());
         }
-        self.text.get(start..end).map(ToString::to_string)
+        self.text.range_string(start, end)
     }
 
     /// Like [`text_range_string`], but also returns the UTF-8 char boundary the
@@ -186,14 +159,12 @@ impl HighlightShadowState {
         start: usize,
         end: usize,
     ) -> Option<(String, usize)> {
-        let start = Self::clamp_boundary(&self.text, start.min(self.text.len()));
-        let end = Self::clamp_boundary(&self.text, end.min(self.text.len()));
+        let start = self.text.clamp_boundary(start.min(self.text.len()));
+        let end = self.text.clamp_boundary(end.min(self.text.len()));
         if end < start {
             return Some((String::new(), start));
         }
-        self.text
-            .get(start..end)
-            .map(|slice| (slice.to_string(), start))
+        self.text.range_string(start, end).map(|slice| (slice, start))
     }
 
     /// Returns true when `pos` (a cursor byte offset) sits inside a string
@@ -212,7 +183,7 @@ impl HighlightShadowState {
         if self.styles.len() != self.text.len() {
             return false;
         }
-        let idx = Self::clamp_boundary(&self.text, pos.min(self.text.len()));
+        let idx = self.text.clamp_boundary(pos.min(self.text.len()));
         // Classify by the character immediately before the cursor: when the
         // cursor is inside or at the trailing edge of a literal/comment, that
         // character carries the literal/comment style.
@@ -229,26 +200,40 @@ impl HighlightShadowState {
         )
     }
 
-    fn style_slice(&self, start: usize, end: usize) -> Option<&str> {
-        self.styles
-            .get(start..end)
-            .and_then(|slice| std::str::from_utf8(slice).ok())
+    fn style_range_string(&self, start: usize, end: usize) -> Option<String> {
+        let bytes = self.styles.range_vec(start, end)?;
+        String::from_utf8(bytes).ok()
     }
 
-    fn clamp_boundary(text: &str, pos: usize) -> usize {
-        let mut clamped = pos.min(text.len());
-        while clamped > 0 && !text.is_char_boundary(clamped) {
-            clamped -= 1;
+    #[cfg(test)]
+    fn all_styles_string(&self) -> Option<String> {
+        self.style_range_string(0, self.styles.len())
+    }
+
+    fn replace_style_range(&mut self, start: usize, end: usize, styles: &[u8]) {
+        self.styles.replace_range(start, end, styles.to_vec());
+    }
+
+    fn visible_semantic_range(
+        &self,
+        top_line: usize,
+        visible_line_count: usize,
+    ) -> Option<(usize, usize, LexerState)> {
+        if self.len() == 0 {
+            return None;
         }
-        clamped
-    }
-
-    fn shift_offset(pos: usize, delta: isize) -> usize {
-        if delta >= 0 {
-            pos.saturating_add(delta as usize)
+        let start_line = top_line.saturating_sub(SEMANTIC_REHIGHLIGHT_OVERSCAN_LINES);
+        let end_line = top_line
+            .saturating_add(visible_line_count)
+            .saturating_add(SEMANTIC_REHIGHLIGHT_OVERSCAN_LINES)
+            .min(self.line_count());
+        let start = self.line_start_for_index(start_line);
+        let end = if end_line >= self.line_count() {
+            self.len()
         } else {
-            pos.saturating_sub(delta.unsigned_abs())
-        }
+            self.line_start_for_index(end_line)
+        };
+        Some((start, end.max(start), self.entry_state_for_line(start_line)))
     }
 
     fn reconcile_line_exit_states_after_edit(
@@ -260,25 +245,24 @@ impl HighlightShadowState {
     ) {
         let old_line_count = self.line_exit_states.len();
         let tail_start = old_end_line_idx.saturating_add(1).min(old_line_count);
-        let trailing = self.line_exit_states.split_off(tail_start);
-        self.line_exit_states
-            .truncate(start_line_idx.min(self.line_exit_states.len()));
-
-        if !self.text.is_empty() {
+        let placeholder_count = if !self.text.is_empty() {
             let new_end_line_idx =
                 self.line_index_for_span_end(edit_start.min(self.text.len()), inserted_len);
-            let placeholder_count = if new_end_line_idx >= start_line_idx {
+            if new_end_line_idx >= start_line_idx {
                 new_end_line_idx
                     .saturating_sub(start_line_idx)
                     .saturating_add(1)
             } else {
                 0
-            };
-            self.line_exit_states
-                .extend(std::iter::repeat_n(LexerState::Normal, placeholder_count));
-        }
-
-        self.line_exit_states.extend(trailing);
+            }
+        } else {
+            0
+        };
+        self.line_exit_states.replace_range(
+            start_line_idx.min(old_line_count),
+            tail_start,
+            vec![LexerState::Normal; placeholder_count],
+        );
         self.line_exit_states.truncate(self.line_count());
         if self.line_exit_states.len() < self.line_count() {
             self.line_exit_states
@@ -287,8 +271,10 @@ impl HighlightShadowState {
     }
 
     fn apply_edit(&mut self, pos: usize, inserted_text: &str, deleted_len: usize) -> bool {
-        let start = Self::clamp_boundary(&self.text, pos);
-        let end = Self::clamp_boundary(&self.text, start.saturating_add(deleted_len));
+        let start = self.text.clamp_boundary(pos);
+        let end = self
+            .text
+            .clamp_boundary(start.saturating_add(deleted_len));
         if end < start {
             return false;
         }
@@ -297,26 +283,16 @@ impl HighlightShadowState {
         let start_line_idx = self.line_index_for_position(start);
         let old_end_line_idx = self.line_index_for_span_end(start, replaced_len);
 
-        let start_newline_idx = self.lower_bound(start);
-        let end_newline_idx = self.lower_bound(end);
-        let mut trailing_newlines = self.newline_positions.split_off(end_newline_idx);
-        self.newline_positions.truncate(start_newline_idx);
-
-        let delta = inserted_text.len() as isize - replaced_len as isize;
-        for pos in &mut trailing_newlines {
-            *pos = Self::shift_offset(*pos, delta);
-        }
-        self.newline_positions
-            .extend(line_break_positions_with_offset(inserted_text, start));
-        self.newline_positions.extend(trailing_newlines);
-
-        if self.text.get(start..end).is_none() {
+        if self.text.range_string(start, end).is_none() {
             return false;
         }
-        self.text.replace_range(start..end, inserted_text);
-        self.styles.splice(
-            start..end,
-            std::iter::repeat_n(STYLE_DEFAULT as u8, inserted_text.len()),
+        if !self.text.replace_range(start, end, inserted_text) {
+            return false;
+        }
+        self.styles.replace_range(
+            start,
+            end,
+            vec![STYLE_DEFAULT as u8; inserted_text.len()],
         );
         self.reconcile_line_exit_states_after_edit(
             start_line_idx,
@@ -326,33 +302,6 @@ impl HighlightShadowState {
         );
         true
     }
-}
-
-fn line_break_positions_with_offset(text: &str, offset: usize) -> impl Iterator<Item = usize> + '_ {
-    let bytes = text.as_bytes();
-    let mut idx = 0usize;
-    std::iter::from_fn(move || {
-        while idx < bytes.len() {
-            let current = idx;
-            idx += 1;
-            match bytes.get(current).copied() {
-                Some(b'\n') => return Some(offset.saturating_add(current)),
-                Some(b'\r') => {
-                    if bytes.get(idx) == Some(&b'\n') {
-                        idx += 1;
-                        return Some(offset.saturating_add(current.saturating_add(1)));
-                    }
-                    return Some(offset.saturating_add(current));
-                }
-                _ => {}
-            }
-        }
-        None
-    })
-}
-
-fn extend_line_break_positions(target: &mut Vec<usize>, text: &str, offset: usize) {
-    target.extend(line_break_positions_with_offset(text, offset));
 }
 
 fn text_ends_with_line_break(text: &str) -> bool {
@@ -400,7 +349,10 @@ fn inclusive_line_end_for_text(text: &str, pos: usize) -> usize {
         return 0;
     }
 
-    let mut idx = HighlightShadowState::clamp_boundary(text, pos.min(text_len));
+    let mut idx = pos.min(text_len);
+    while idx > 0 && !text.is_char_boundary(idx) {
+        idx -= 1;
+    }
     let bytes = text.as_bytes();
     while idx < text_len {
         match bytes.get(idx).copied() {
@@ -487,7 +439,7 @@ impl SqlEditorWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .set_highlight_data(data);
-        self.schedule_deferred_full_rehighlight();
+        self.schedule_deferred_visible_semantic_rehighlight();
     }
 
     pub fn get_highlighter(&self) -> Arc<Mutex<SqlHighlighter>> {
@@ -566,7 +518,7 @@ impl SqlEditorWidget {
                 .highlight_shadow
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if shadow.len() != expected_previous_len || shadow.styles.len() != expected_previous_len
+            if shadow.len() != expected_previous_len || shadow.styles_len() != expected_previous_len
             {
                 drop(shadow);
                 self.rehighlight_full_buffer();
@@ -645,29 +597,22 @@ impl SqlEditorWidget {
         while current_line_idx < shadow.line_count() {
             let current_start = shadow.line_start_for_index(current_line_idx);
             let current_end = shadow.inclusive_line_end_for_index(current_line_idx);
-            let range_text = shadow
-                .text
-                .get(current_start..current_end)
-                .unwrap_or_default();
-            let previous_styles = shadow.styles.get(current_start..current_end)?;
+            let range_text = shadow.text_range_string(current_start, current_end)?;
+            let previous_styles = shadow.style_range_string(current_start, current_end)?;
             let old_exit_state = shadow.line_exit_state(current_line_idx);
             let (new_styles, new_exit_state) =
-                highlighter.generate_styles_for_window(range_text, entry_state);
+                highlighter.generate_styles_for_window(&range_text, entry_state);
             if new_styles.len() != range_text.len() {
                 return None;
             }
 
-            let styles_changed = new_styles.as_bytes() != previous_styles;
+            let styles_changed = new_styles.as_bytes() != previous_styles.as_bytes();
             if styles_changed {
-                if let Some(style_slice) = shadow.styles.get_mut(current_start..current_end) {
-                    style_slice.copy_from_slice(new_styles.as_bytes());
-                    changed_range = Some(match changed_range {
-                        Some((start, end)) => (start.min(current_start), end.max(current_end)),
-                        None => (current_start, current_end),
-                    });
-                } else {
-                    return None;
-                }
+                shadow.replace_style_range(current_start, current_end, new_styles.as_bytes());
+                changed_range = Some(match changed_range {
+                    Some((start, end)) => (start.min(current_start), end.max(current_end)),
+                    None => (current_start, current_end),
+                });
             }
 
             shadow.set_line_exit_state(current_line_idx, new_exit_state);
@@ -686,15 +631,12 @@ impl SqlEditorWidget {
         let Some((changed_start, changed_end)) = changed_range else {
             return Some(false);
         };
-        let range_text = shadow
-            .text
-            .get(changed_start..changed_end)
-            .unwrap_or_default();
-        let style_text = shadow.style_slice(changed_start, changed_end)?;
+        let range_text = shadow.text_range_string(changed_start, changed_end)?;
+        let style_text = shadow.style_range_string(changed_start, changed_end)?;
         if !Self::replace_style_buffer_range_for_text(
             style_buffer,
-            range_text,
-            style_text,
+            &range_text,
+            &style_text,
             changed_start,
             changed_end,
         ) {
@@ -707,43 +649,74 @@ impl SqlEditorWidget {
         self.rehighlight_full_buffer_from_text(&self.buffer.text());
     }
 
-    fn schedule_deferred_full_rehighlight(&self) {
+    pub(crate) fn schedule_deferred_visible_semantic_rehighlight(&self) {
         let generation = self
-            .deferred_rehighlight_generation
+            .deferred_semantic_rehighlight_generation
             .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1);
         let buffer_revision = self.intellisense_runtime.current_buffer_revision();
-        self.schedule_deferred_full_rehighlight_for_generation(generation, buffer_revision);
-    }
-
-    fn schedule_deferred_full_rehighlight_for_generation(
-        &self,
-        generation: u64,
-        buffer_revision: u64,
-    ) {
         let widget = self.clone();
         app::add_timeout3(DEFERRED_REHIGHLIGHT_IDLE_DELAY_SECONDS, move |_| {
-            widget.run_deferred_full_rehighlight(generation, buffer_revision);
+            if widget.editor.was_deleted()
+                || generation
+                    != widget
+                        .deferred_semantic_rehighlight_generation
+                        .load(Ordering::Relaxed)
+                || buffer_revision != widget.intellisense_runtime.current_buffer_revision()
+            {
+                return;
+            }
+            widget.rehighlight_visible_semantic_window();
         });
     }
 
-    fn run_deferred_full_rehighlight(&self, generation: u64, buffer_revision: u64) {
+    fn rehighlight_visible_semantic_window(&self) {
         if self.editor.was_deleted() {
             return;
         }
+        let top_line = self.editor.scroll_row().max(0) as usize;
+        let row_height = (self.editor.text_size() + 6).max(1);
+        let visible_line_count = crate::utils::arithmetic::safe_div(
+            self.editor.h().max(row_height),
+            row_height,
+        )
+        .max(1) as usize;
 
-        let current_generation = self.deferred_rehighlight_generation.load(Ordering::Relaxed);
-        let current_buffer_revision = self.intellisense_runtime.current_buffer_revision();
-        match deferred_rehighlight_action(
-            generation,
-            current_generation,
-            buffer_revision,
-            current_buffer_revision,
+        let mut style_buffer = self.style_buffer.clone();
+        let updated_range = {
+            let mut shadow = self
+                .highlight_shadow
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some((start, end, entry_state)) =
+                shadow.visible_semantic_range(top_line, visible_line_count)
+            else {
+                return;
+            };
+            let Some(text) = shadow.text_range_string(start, end) else {
+                return;
+            };
+            let highlighter = self
+                .highlighter
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (styles, _) = highlighter.generate_styles_for_window(&text, entry_state);
+            if styles.len() != text.len() {
+                return;
+            }
+            shadow.replace_style_range(start, end, styles.as_bytes());
+            (start, end, text, styles)
+        };
+
+        let (start, end, text, styles) = updated_range;
+        if Self::replace_style_buffer_range_for_text(
+            &mut style_buffer,
+            &text,
+            &styles,
+            start,
+            end,
         ) {
-            DeferredRehighlightAction::Run => self.rehighlight_full_buffer(),
-            DeferredRehighlightAction::Reschedule => self
-                .schedule_deferred_full_rehighlight_for_generation(generation, current_buffer_revision),
-            DeferredRehighlightAction::Skip => {}
+            self.redraw_editor_if_live();
         }
     }
 
@@ -769,28 +742,6 @@ impl SqlEditorWidget {
 
 fn collect_highlight_columns_from_intellisense(data: &IntellisenseData) -> Vec<String> {
     data.get_all_columns_for_highlighting()
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DeferredRehighlightAction {
-    Run,
-    Reschedule,
-    Skip,
-}
-
-fn deferred_rehighlight_action(
-    scheduled_generation: u64,
-    current_generation: u64,
-    scheduled_buffer_revision: u64,
-    current_buffer_revision: u64,
-) -> DeferredRehighlightAction {
-    if scheduled_generation != current_generation {
-        DeferredRehighlightAction::Skip
-    } else if scheduled_buffer_revision != current_buffer_revision {
-        DeferredRehighlightAction::Reschedule
-    } else {
-        DeferredRehighlightAction::Run
-    }
 }
 
 fn is_continuation_style(style: char) -> bool {
@@ -964,25 +915,56 @@ mod tests {
     fn cursor_in_string_or_comment_is_inert_without_aligned_styles() {
         // No styles computed (styles empty, not aligned with text): must not suppress.
         let shadow = HighlightShadowState {
-            text: "SELECT 'AND'".to_string(),
+            text: "SELECT 'AND'".into(),
             ..Default::default()
         };
         assert!(!shadow.cursor_in_string_or_comment(shadow.text.len()));
     }
 
     #[test]
-    fn deferred_rehighlight_action_runs_only_for_current_idle_request() {
-        assert_eq!(
-            deferred_rehighlight_action(3, 3, 7, 7),
-            DeferredRehighlightAction::Run
+    fn million_line_production_shadow_edit_and_semantic_refresh_stay_bounded() {
+        const LINE: &str = "SELECT 1;\n";
+        const LINES: usize = 1_000_001;
+        let text = LINE.repeat(LINES);
+        let styles = std::iter::repeat_n(STYLE_DEFAULT, text.len()).collect::<String>();
+        let mut shadow = HighlightShadowState::default();
+        shadow.rebuild(
+            text,
+            &styles,
+            vec![LexerState::Normal; LINES.saturating_add(1)],
+        );
+
+        assert!(shadow.line_count() > 1_000_000);
+        assert!(shadow.text_chunk_count() > 1);
+
+        let top_line = 500_000;
+        let visible_lines = 60;
+        let (start, end, _) = shadow
+            .visible_semantic_range(top_line, visible_lines)
+            .expect("visible semantic range");
+        assert!(start > 0 && end < shadow.len());
+        assert!(
+            end.saturating_sub(start)
+                <= LINE
+                    .len()
+                    .saturating_mul(visible_lines + SEMANTIC_REHIGHLIGHT_OVERSCAN_LINES * 2),
+            "metadata refresh must only touch the visible range plus overscan"
         );
         assert_eq!(
-            deferred_rehighlight_action(3, 4, 7, 7),
-            DeferredRehighlightAction::Skip
+            shadow
+                .style_range_string(start, end)
+                .expect("visible production style slice")
+                .len(),
+            end.saturating_sub(start)
         );
-        assert_eq!(
-            deferred_rehighlight_action(3, 3, 7, 8),
-            DeferredRehighlightAction::Reschedule
-        );
+
+        let edit_at = top_line.saturating_mul(LINE.len());
+        assert!(shadow.apply_edit(edit_at, "-- edited\n", 0));
+        let local = shadow
+            .text_range_string(edit_at, edit_at.saturating_add("-- edited\n".len()))
+            .expect("edited range");
+        assert_eq!(local, "-- edited\n");
+        assert!(shadow.line_count() > 1_000_000);
     }
+
 }

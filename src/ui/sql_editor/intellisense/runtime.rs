@@ -615,6 +615,9 @@ impl SqlEditorWidget {
                     true
                 }
                 Event::Enter | Event::Move | Event::Drag | Event::Released => {
+                    if matches!(ev, Event::Drag | Event::Released) {
+                        widget_for_shortcuts.schedule_deferred_visible_semantic_rehighlight();
+                    }
                     // Drag-and-drop only needs the eventual Paste payload.
                     // Avoid cursor hit-testing while the editor is in FLTK's DnD
                     // sequence because that path is unrelated to payload handling
@@ -640,6 +643,10 @@ impl SqlEditorWidget {
                             &buffer_for_handle,
                         );
                     }
+                    false
+                }
+                Event::MouseWheel => {
+                    widget_for_shortcuts.schedule_deferred_visible_semantic_rehighlight();
                     false
                 }
                 Event::Push => {
@@ -1254,6 +1261,12 @@ impl SqlEditorWidget {
                         || state.contains(fltk::enums::Shortcut::Command);
                     let alt = state.contains(fltk::enums::Shortcut::Alt);
                     let shift = state.contains(fltk::enums::Shortcut::Shift);
+                    if matches!(
+                        key,
+                        Key::Up | Key::Down | Key::Home | Key::End | Key::PageUp | Key::PageDown
+                    ) {
+                        widget_for_shortcuts.schedule_deferred_visible_semantic_rehighlight();
+                    }
 
                     // Ctrl/Cmd+Space is handled on KeyDown for manual intellisense trigger.
                     // Ignore the matching KeyUp so the popup is not immediately dismissed.
@@ -1504,32 +1517,37 @@ impl SqlEditorWidget {
                             // the slot has a known completion (the enclosing
                             // object's name / the construct qualifier) — those
                             // never get a 2-char prefix to trigger on otherwise.
-                            let end_slot_auto_trigger = ch.is_whitespace()
+                            let bounded_auto_trigger_text = (ch.is_whitespace()
                                 && word.is_empty()
-                                && qualifier.is_none()
-                                && {
-                                    let guard = text_shadow_for_handle
+                                && qualifier.is_none())
+                                .then(|| {
+                                    text_shadow_for_handle
                                         .lock()
-                                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                        .bounded_text_around(
+                                            cursor_pos.max(0) as usize,
+                                            INTELLISENSE_STATEMENT_WINDOW as usize,
+                                            INTELLISENSE_STATEMENT_WINDOW as usize,
+                                        )
+                                });
+                            let end_slot_auto_trigger = bounded_auto_trigger_text
+                                .as_ref()
+                                .is_some_and(|(text, _, cursor)| {
                                     Self::plsql_end_auto_trigger_applies_in_text(
-                                        &guard.text,
-                                        cursor_pos.max(0) as usize,
+                                        text,
+                                        *cursor,
                                         Some(intellisense_runtime_for_handle.cached_db_type()),
                                     )
-                                };
-                            let execute_immediate_tail_auto_trigger = ch.is_whitespace()
-                                && word.is_empty()
-                                && qualifier.is_none()
-                                && {
-                                    let guard = text_shadow_for_handle
-                                        .lock()
-                                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                });
+                            let execute_immediate_tail_auto_trigger = bounded_auto_trigger_text
+                                .as_ref()
+                                .is_some_and(|(text, _, cursor)| {
                                     Self::plsql_execute_immediate_tail_auto_trigger_applies_in_text(
-                                        &guard.text,
-                                        cursor_pos.max(0) as usize,
+                                        text,
+                                        *cursor,
                                         Some(intellisense_runtime_for_handle.cached_db_type()),
                                     )
-                                };
+                                });
                             if end_slot_auto_trigger
                                 || execute_immediate_tail_auto_trigger
                                 || Self::should_auto_trigger_intellisense_for_forced_char(

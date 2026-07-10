@@ -142,7 +142,7 @@ impl SqlEditorWidget {
                 };
 
                 if highlight_data_changed {
-                    widget.schedule_deferred_full_rehighlight();
+                    widget.schedule_deferred_visible_semantic_rehighlight();
                 }
             }
 
@@ -259,10 +259,11 @@ impl SqlEditorWidget {
             if load_mutex_bool(&suppress_buffer_callbacks) {
                 return;
             }
-            intellisense_runtime.next_buffer_revision();
-            intellisense_runtime.next_parse_generation();
-            intellisense_runtime.clear_parse_cache();
-            intellisense_runtime.clear_routine_symbol_cache();
+            intellisense_runtime.apply_buffer_edit(
+                pos.max(0) as usize,
+                ins.max(0) as usize,
+                del.max(0) as usize,
+            );
             widget.handle_buffer_highlight_update(buf, pos, ins, del, deleted_text);
         });
     }

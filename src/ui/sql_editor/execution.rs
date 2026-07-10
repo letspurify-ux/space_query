@@ -2049,7 +2049,11 @@ impl SqlEditorWidget {
 
                 let _suppress_callbacks = self.suppress_buffer_callbacks();
                 buffer.replace(start, end, &formatted);
-                self.invalidate_intellisense_after_buffer_edit();
+                self.invalidate_intellisense_after_buffer_edit(
+                    start_usize,
+                    formatted.len(),
+                    deleted_len,
+                );
                 self.handle_buffer_highlight_update_with_known_inserted_text(
                     &buffer,
                     start,
@@ -2086,7 +2090,7 @@ impl SqlEditorWidget {
 
         let _suppress_callbacks = self.suppress_buffer_callbacks();
         buffer.set_text(&formatted);
-        self.invalidate_intellisense_after_buffer_edit();
+        self.invalidate_intellisense_after_buffer_edit(0, formatted.len(), full_text.len());
         self.handle_buffer_highlight_update_with_known_inserted_text(
             &buffer,
             0,

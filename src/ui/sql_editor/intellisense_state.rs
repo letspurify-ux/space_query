@@ -1,5 +1,140 @@
 use super::*;
-use std::sync::atomic::AtomicU8;
+use std::sync::atomic::{AtomicU8, AtomicUsize};
+use std::sync::Condvar;
+use std::thread::JoinHandle;
+
+pub(crate) type LatestIntellisenseTask = Box<dyn FnOnce() + Send + 'static>;
+
+#[derive(Default)]
+struct LatestTaskQueueState {
+    pending: Option<LatestIntellisenseTask>,
+    shutdown: bool,
+}
+
+#[derive(Default)]
+struct LatestTaskWorkerStats {
+    submitted: AtomicUsize,
+    replaced_pending: AtomicUsize,
+    completed: AtomicUsize,
+    active: AtomicUsize,
+    max_active: AtomicUsize,
+}
+
+struct LatestTaskWorker {
+    queue: Arc<(Mutex<LatestTaskQueueState>, Condvar)>,
+    stats: Arc<LatestTaskWorkerStats>,
+    handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl LatestTaskWorker {
+    fn new() -> Self {
+        let queue = Arc::new((Mutex::new(LatestTaskQueueState::default()), Condvar::new()));
+        let stats = Arc::new(LatestTaskWorkerStats::default());
+        let queue_for_thread = queue.clone();
+        let stats_for_thread = stats.clone();
+        let handle = thread::Builder::new()
+            .name("intellisense-latest-worker".to_string())
+            .spawn(move || loop {
+                let task = {
+                    let (lock, ready) = &*queue_for_thread;
+                    let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    while state.pending.is_none() && !state.shutdown {
+                        state = ready
+                            .wait(state)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                    if state.shutdown {
+                        return;
+                    }
+                    state.pending.take()
+                };
+                let Some(task) = task else {
+                    continue;
+                };
+                let active = stats_for_thread
+                    .active
+                    .fetch_add(1, Ordering::AcqRel)
+                    .saturating_add(1);
+                stats_for_thread
+                    .max_active
+                    .fetch_max(active, Ordering::AcqRel);
+                // A completion bug must fail that request, not permanently kill
+                // the sole worker and strand all later requests.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
+                stats_for_thread.active.fetch_sub(1, Ordering::AcqRel);
+                stats_for_thread.completed.fetch_add(1, Ordering::AcqRel);
+            })
+            .ok();
+        if handle.is_none() {
+            queue
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .shutdown = true;
+        }
+        Self {
+            queue,
+            stats,
+            handle: Mutex::new(handle),
+        }
+    }
+
+    fn submit(&self, task: LatestIntellisenseTask) -> bool {
+        self.stats.submitted.fetch_add(1, Ordering::Relaxed);
+        let (lock, ready) = &*self.queue;
+        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.shutdown {
+            return false;
+        }
+        if state.pending.replace(task).is_some() {
+            self.stats.replaced_pending.fetch_add(1, Ordering::Relaxed);
+        }
+        ready.notify_one();
+        true
+    }
+
+    #[cfg(test)]
+    fn stats(&self) -> (usize, usize, usize, usize) {
+        (
+            self.stats.submitted.load(Ordering::Acquire),
+            self.stats.replaced_pending.load(Ordering::Acquire),
+            self.stats.completed.load(Ordering::Acquire),
+            self.stats.max_active.load(Ordering::Acquire),
+        )
+    }
+}
+
+impl Drop for LatestTaskWorker {
+    fn drop(&mut self) {
+        let (lock, ready) = &*self.queue;
+        {
+            let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.shutdown = true;
+            state.pending = None;
+            ready.notify_all();
+        }
+        if let Some(handle) = self
+            .handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct IntellisenseCancellation {
+    generation: Arc<AtomicU64>,
+    expected: u64,
+}
+
+impl IntellisenseCancellation {
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.generation.load(Ordering::Acquire) != self.expected
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -69,6 +204,7 @@ pub(crate) struct IntellisenseRuntimeState {
     keyup_debounce_generation: Arc<Mutex<u64>>,
     keyup_debounce_handle: Arc<Mutex<Option<app::TimeoutHandle>>>,
     cached_db_type: Arc<AtomicU8>,
+    parse_worker: Arc<LatestTaskWorker>,
 }
 
 impl IntellisenseRuntimeState {
@@ -91,6 +227,7 @@ impl IntellisenseRuntimeState {
             cached_db_type: Arc::new(AtomicU8::new(
                 crate::db::connection::DatabaseType::default().cache_key(),
             )),
+            parse_worker: Arc::new(LatestTaskWorker::new()),
         }
     }
 
@@ -179,7 +316,7 @@ impl IntellisenseRuntimeState {
     }
 
     pub(crate) fn set_routine_symbol_cache(&self, entry: RoutineSymbolCacheEntry) {
-        const MAX_ROUTINE_SYMBOL_CACHE_ENTRIES: usize = 4;
+        const MAX_ROUTINE_SYMBOL_CACHE_ENTRIES: usize = 64;
 
         let mut cache = self
             .routine_symbol_cache
@@ -222,6 +359,66 @@ impl IntellisenseRuntimeState {
             .clear();
     }
 
+    /// Advance the editor revision and incrementally preserve every cached
+    /// statement whose bytes cannot have been affected by this edit. Tests call
+    /// this exact method as production does so cache-rebasing behavior cannot
+    /// drift into a test-only implementation.
+    pub(crate) fn apply_buffer_edit(
+        &self,
+        position: usize,
+        inserted_len: usize,
+        deleted_len: usize,
+    ) -> u64 {
+        let old_revision = self.current_buffer_revision();
+        let new_revision = self.next_buffer_revision();
+        self.next_parse_generation();
+        self.clear_parse_cache();
+
+        let deleted_end = position.saturating_add(deleted_len);
+        let delta = inserted_len as i128 - deleted_len as i128;
+        let mut cache = self
+            .routine_symbol_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.retain_mut(|entry| {
+            if entry.buffer_revision != old_revision {
+                return false;
+            }
+
+            let strictly_before_dependencies = if deleted_len == 0 {
+                position < entry.dependency_start
+            } else {
+                deleted_end < entry.dependency_start
+            };
+            let strictly_after = position > entry.statement_end;
+
+            if strictly_before_dependencies {
+                entry.dependency_start = Self::shift_position(entry.dependency_start, delta);
+                entry.statement_start = Self::shift_position(entry.statement_start, delta);
+                entry.statement_end = Self::shift_position(entry.statement_end, delta);
+                entry.buffer_revision = new_revision;
+                true
+            } else if strictly_after {
+                entry.buffer_revision = new_revision;
+                true
+            } else {
+                // The edit intersects the statement or touches one of its
+                // parsing boundaries. Dropping this one entry is conservative:
+                // a changed terminator can merge/split adjacent statements.
+                false
+            }
+        });
+        new_revision
+    }
+
+    fn shift_position(position: usize, delta: i128) -> usize {
+        if delta >= 0 {
+            position.saturating_add(delta.min(usize::MAX as i128) as usize)
+        } else {
+            position.saturating_sub((-delta).min(usize::MAX as i128) as usize)
+        }
+    }
+
     pub(crate) fn next_parse_generation(&self) -> u64 {
         self.parse_generation
             .fetch_add(1, Ordering::Relaxed)
@@ -230,6 +427,22 @@ impl IntellisenseRuntimeState {
 
     pub(crate) fn current_parse_generation(&self) -> u64 {
         self.parse_generation.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn cancellation_for(&self, expected: u64) -> IntellisenseCancellation {
+        IntellisenseCancellation {
+            generation: self.parse_generation.clone(),
+            expected,
+        }
+    }
+
+    pub(crate) fn submit_latest_parse_task(&self, task: LatestIntellisenseTask) -> bool {
+        self.parse_worker.submit(task)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parse_worker_stats(&self) -> (usize, usize, usize, usize) {
+        self.parse_worker.stats()
     }
 
     pub(crate) fn next_buffer_revision(&self) -> u64 {

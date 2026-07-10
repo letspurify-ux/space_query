@@ -97,19 +97,18 @@ fn apply_incremental_highlight_for_test(
     while current_line_idx < shadow.line_count() {
         let current_start = shadow.line_start_for_index(current_line_idx);
         let current_end = shadow.inclusive_line_end_for_index(current_line_idx);
-        let range_text = shadow.text.get(current_start..current_end)?;
-        let previous_styles = shadow.styles.get(current_start..current_end)?;
+        let range_text = shadow.text_range_string(current_start, current_end)?;
+        let previous_styles = shadow.style_range_string(current_start, current_end)?;
         let old_exit_state = shadow.line_exit_state(current_line_idx);
         let (new_styles, new_exit_state) =
-            highlighter.generate_styles_for_window(range_text, entry_state);
+            highlighter.generate_styles_for_window(&range_text, entry_state);
         if new_styles.len() != range_text.len() {
             return None;
         }
 
-        let styles_changed = new_styles.as_bytes() != previous_styles;
+        let styles_changed = new_styles.as_bytes() != previous_styles.as_bytes();
         if styles_changed {
-            let style_slice = shadow.styles.get_mut(current_start..current_end)?;
-            style_slice.copy_from_slice(new_styles.as_bytes());
+            shadow.replace_style_range(current_start, current_end, new_styles.as_bytes());
         }
         shadow.set_line_exit_state(current_line_idx, new_exit_state);
 
@@ -124,9 +123,7 @@ fn apply_incremental_highlight_for_test(
         entry_state = new_exit_state;
     }
 
-    std::str::from_utf8(&shadow.styles)
-        .ok()
-        .map(ToString::to_string)
+    shadow.all_styles_string()
 }
 
 fn line_start_for_text(text: &str, pos: usize) -> usize {

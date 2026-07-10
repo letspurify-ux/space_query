@@ -45,6 +45,7 @@ use crate::utils::{AppConfig, QueryHistoryEntry};
 use oracle::Connection;
 use tns_thin::OracleThinCancelHandle;
 
+mod chunked_text;
 mod execution;
 mod formatter;
 pub mod hangul_repair;
@@ -56,6 +57,7 @@ pub(crate) mod macos_ime;
 // 공통 파싱/토큰 유틸(실행, 인텔리센스, 포맷팅 공통 경로)
 pub(crate) mod query_text;
 
+use self::chunked_text::{ChunkedText, ChunkedValues};
 use self::intellisense_state::{
     IntellisenseCompletionRange, IntellisensePopupTransitionState, IntellisenseRuntimeState,
 };
@@ -534,6 +536,9 @@ pub(crate) struct IntellisenseAnalysis {
 #[derive(Clone)]
 pub(crate) struct RoutineSymbolCacheEntry {
     buffer_revision: u64,
+    /// Earliest absolute byte that contributed cross-statement bind/package
+    /// symbols to this entry. An edit in this dependency range invalidates it.
+    dependency_start: usize,
     statement_start: usize,
     statement_end: usize,
     statement_tokens: Arc<[SqlToken]>,
@@ -1709,7 +1714,7 @@ pub struct SqlEditorWidget {
     signature_popup: Arc<Mutex<SignaturePopup>>,
     highlighter: Arc<Mutex<SqlHighlighter>>,
     highlight_shadow: Arc<Mutex<HighlightShadowState>>,
-    deferred_rehighlight_generation: Arc<AtomicU64>,
+    deferred_semantic_rehighlight_generation: Arc<AtomicU64>,
     timeout_input: IntInput,
     status_callback: Arc<Mutex<Option<Box<dyn FnMut(&str)>>>>,
     find_callback: Arc<Mutex<Option<Box<dyn FnMut()>>>>,
@@ -2044,11 +2049,14 @@ impl SqlEditorWidget {
         }
     }
 
-    fn invalidate_intellisense_after_buffer_edit(&self) {
-        self.intellisense_runtime.next_buffer_revision();
-        self.intellisense_runtime.next_parse_generation();
-        self.intellisense_runtime.clear_parse_cache();
-        self.intellisense_runtime.clear_routine_symbol_cache();
+    fn invalidate_intellisense_after_buffer_edit(
+        &self,
+        position: usize,
+        inserted_len: usize,
+        deleted_len: usize,
+    ) {
+        self.intellisense_runtime
+            .apply_buffer_edit(position, inserted_len, deleted_len);
     }
 
     fn schedule_alert_pump(delay_seconds: f64) {
@@ -2391,7 +2399,7 @@ impl SqlEditorWidget {
         let signature_popup = Arc::new(Mutex::new(SignaturePopup::new()));
         let highlighter = Arc::new(Mutex::new(SqlHighlighter::new()));
         let highlight_shadow = Arc::new(Mutex::new(HighlightShadowState::default()));
-        let deferred_rehighlight_generation = Arc::new(AtomicU64::new(0));
+        let deferred_semantic_rehighlight_generation = Arc::new(AtomicU64::new(0));
         let status_callback: Arc<Mutex<Option<Box<dyn FnMut(&str)>>>> = Arc::new(Mutex::new(None));
         let find_callback: Arc<Mutex<Option<Box<dyn FnMut()>>>> = Arc::new(Mutex::new(None));
         let replace_callback: Arc<Mutex<Option<Box<dyn FnMut()>>>> = Arc::new(Mutex::new(None));
@@ -2453,7 +2461,7 @@ impl SqlEditorWidget {
             signature_popup,
             highlighter,
             highlight_shadow,
-            deferred_rehighlight_generation,
+            deferred_semantic_rehighlight_generation,
             timeout_input,
             status_callback,
             find_callback,
@@ -5435,6 +5443,45 @@ mod execution_state_tests {
         let snapshots = state.history_snapshots();
         assert_eq!(snapshots[2].cursor_pos, 2);
         assert_eq!(state.index, 2);
+    }
+
+    #[test]
+    fn million_line_production_undo_records_a_small_delta_and_shares_untouched_chunks() {
+        const LINE: &str = "SELECT 1;\n";
+        const LINES: usize = 1_000_001;
+        let initial = LINE.repeat(LINES);
+        let edit_at = 500_000usize.saturating_mul(LINE.len());
+        let mut state = WordUndoRedoState::new(initial);
+        let chunk_count = state.current.text.chunk_count();
+        assert!(chunk_count > 1);
+        assert_eq!(
+            state.anchor.text.shared_chunk_count(&state.current.text),
+            chunk_count
+        );
+
+        let inserted = "-- edited\n";
+        state.current.cursor_pos = edit_at;
+        let edit = build_edit(edit_at, "", inserted);
+        state.record_edit(
+            &edit,
+            classify_edit_group(inserted.len() as i32, 0, inserted, ""),
+        );
+
+        assert_eq!(state.deltas.len(), 1);
+        assert_eq!(state.history_total_bytes, inserted.len());
+        assert!(
+            state.anchor.text.shared_chunk_count(&state.current.text)
+                >= chunk_count.saturating_sub(2),
+            "an edit must retain all untouched persistent chunks"
+        );
+        assert_eq!(
+            state
+                .current
+                .text
+                .range_string(edit_at, edit_at.saturating_add(inserted.len()))
+                .as_deref(),
+            Some(inserted)
+        );
     }
 
     #[test]

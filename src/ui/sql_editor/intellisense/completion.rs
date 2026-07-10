@@ -1,8 +1,7 @@
-#[derive(Clone)]
 struct AsyncIntellisenseParseResult {
     analysis: IntellisenseAnalysis,
-    routine_cache: RoutineSymbolCacheEntry,
-    expanded_statement_text: String,
+    routine_cache: Option<RoutineSymbolCacheEntry>,
+    computation: IntellisenseCompletionComputation,
 }
 
 /// Grammatical placement of the unqualified select-list wildcard at the cursor.
@@ -261,7 +260,7 @@ struct CompletionSourceAllowance {
 
 /// Cursor/slot facts the completion merge stage needs that are independent of the
 /// computed source vectors. Bundled so `merge_completion_sources` (the single
-/// merge pipeline shared by the production `apply_intellisense_with_context` path
+/// merge pipeline shared by the production latest-worker path
 /// and the `audit_final_suggestions_for` test harness) takes a manageable
 /// argument list. Everything here is either `Copy` or a borrow, so the struct is
 /// cheap to build at each call site.
@@ -287,11 +286,13 @@ struct CompletionMergeContext<'a> {
 /// `Suppressed` maps to the production early-returns that clear the popup/UI
 /// state outright; `Computed` carries the final merged suggestion list plus the
 /// facts the UI layer still needs (description scope, pending-refresh flag).
+#[derive(Clone)]
 enum IntellisenseCompletionComputation {
     Suppressed,
     Computed(IntellisenseComputedSuggestions),
 }
 
+#[derive(Clone)]
 struct IntellisenseComputedSuggestions {
     suggestions: Vec<String>,
     column_tables: Vec<String>,
@@ -1948,59 +1949,18 @@ impl SqlEditorWidget {
                 .then_some(entry.analysis.clone())
         });
 
-        if let Some(analysis) = cached_context {
-            Self::apply_intellisense_with_context(
-                editor,
-                intellisense_data,
-                intellisense_popup,
-                column_sender,
-                connection,
-                runtime,
-                snapshot.as_ref(),
-                analysis.as_ref(),
-                &snapshot.signature_scan_text,
-            );
-            return;
-        }
-
-        if let Some(routine_cache) = runtime.routine_symbol_cache_covering_cursor(
-            snapshot.buffer_revision,
-            snapshot.cursor_pos_usize,
-        ) {
-            let cursor_in_statement = snapshot
-                .cursor_pos_usize
-                .saturating_sub(routine_cache.statement_start)
-                .min(
-                    routine_cache
-                        .statement_end
-                        .saturating_sub(routine_cache.statement_start),
-                );
-            let analysis = Arc::new(Self::build_intellisense_analysis_from_routine_cache(
-                &routine_cache,
-                cursor_in_statement,
-            ));
-            runtime.set_parse_cache(Some(IntellisenseParseCacheEntry {
-                buffer_revision: snapshot.buffer_revision,
-                cursor_pos: snapshot.cursor_pos,
-                analysis: analysis.clone(),
-            }));
-            Self::apply_intellisense_with_context(
-                editor,
-                intellisense_data,
-                intellisense_popup,
-                column_sender,
-                connection,
-                runtime,
-                snapshot.as_ref(),
-                analysis.as_ref(),
-                &snapshot.signature_scan_text,
-            );
-            return;
-        }
+        let cached_routine = cached_context.is_none().then(|| {
+            runtime.routine_symbol_cache_covering_cursor(
+                snapshot.buffer_revision,
+                snapshot.cursor_pos_usize,
+            )
+        }).flatten();
 
         // Cache miss means full parse is pending on a worker.
         // Hide stale popup/completion state to avoid applying outdated candidates.
-        Self::clear_intellisense_ui_state(intellisense_popup, runtime);
+        if cached_context.is_none() && cached_routine.is_none() {
+            Self::clear_intellisense_ui_state(intellisense_popup, runtime);
+        }
 
         Self::queue_async_intellisense_parse(
             editor,
@@ -2011,6 +1971,8 @@ impl SqlEditorWidget {
             connection,
             runtime,
             snapshot.clone(),
+            cached_context,
+            cached_routine,
         );
     }
 
@@ -2229,77 +2191,134 @@ impl SqlEditorWidget {
         connection: &SharedConnection,
         runtime: &Arc<IntellisenseRuntimeState>,
         snapshot: Arc<IntellisenseTriggerSnapshot>,
+        cached_analysis: Option<Arc<IntellisenseAnalysis>>,
+        cached_routine: Option<RoutineSymbolCacheEntry>,
     ) {
         let (parse_sender, parse_receiver) =
             mpsc::channel::<Result<AsyncIntellisenseParseResult, String>>();
         let parse_receiver = Arc::new(Mutex::new(parse_receiver));
         let snapshot_for_thread = snapshot.clone();
         let text_shadow_for_thread = text_shadow.clone();
+        let intellisense_data_for_thread = intellisense_data.clone();
+        let column_sender_for_thread = column_sender.clone();
+        let connection_for_thread = connection.clone();
         let routine_symbol_cache_for_thread = runtime.routine_symbol_cache_handle();
-        let spawn_result = thread::Builder::new()
-            .name("intellisense-parse-worker".to_string())
-            .spawn(move || {
-                let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                    let (expanded_statement, text_bind_names, package_spec_symbols) =
-                        Self::expanded_statement_window_and_text_binds_from_shadow(
-                            &text_shadow_for_thread,
-                            snapshot_for_thread.cursor_pos_usize,
-                            Some(snapshot_for_thread.preferred_db_type),
-                        );
-                    let routine_cache = {
-                        let cache = routine_symbol_cache_for_thread
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        cache
-                            .iter()
-                            .find(|entry| {
-                                entry.buffer_revision == snapshot_for_thread.buffer_revision
-                                    && entry.statement_start == expanded_statement.statement_start
-                                    && entry.statement_end == expanded_statement.statement_end
-                            })
-                            .cloned()
-                    }
-                    .unwrap_or_else(|| {
-                        Self::build_routine_symbol_cache_entry(
-                            snapshot_for_thread.buffer_revision,
-                            &expanded_statement,
-                            text_bind_names,
-                            &package_spec_symbols,
-                            Some(snapshot_for_thread.preferred_db_type),
+        let cancellation = runtime.cancellation_for(snapshot.request_generation);
+        let submitted = runtime.submit_latest_parse_task(Box::new(move || {
+            if cancellation.is_cancelled() {
+                return;
+            }
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                let (analysis, routine_cache, completion_scan_text) =
+                    if let Some(analysis) = cached_analysis {
+                        (
+                            (*analysis).clone(),
+                            None,
+                            snapshot_for_thread.signature_scan_text.clone(),
                         )
-                    });
-                    let analysis = Self::build_intellisense_analysis_from_routine_cache(
-                        &routine_cache,
-                        expanded_statement.cursor_in_statement,
-                    );
-
-                    AsyncIntellisenseParseResult {
-                        analysis,
-                        routine_cache,
-                        expanded_statement_text: expanded_statement.text.clone(),
-                    }
-                }));
-
-                match result {
-                    Ok(parsed) => {
-                        let _ = parse_sender.send(Ok(parsed));
-                    }
-                    Err(payload) => {
-                        let panic_msg = Self::panic_payload_to_string(payload.as_ref());
-                        crate::utils::logging::log_error(
-                            "sql_editor::intellisense::parse_worker",
-                            &format!("parse worker panicked: {panic_msg}"),
+                    } else if let Some(routine_cache) = cached_routine {
+                        let cursor_in_statement = snapshot_for_thread
+                            .cursor_pos_usize
+                            .saturating_sub(routine_cache.statement_start)
+                            .min(
+                                routine_cache
+                                    .statement_end
+                                    .saturating_sub(routine_cache.statement_start),
+                            );
+                        (
+                            Self::build_intellisense_analysis_from_routine_cache(
+                                &routine_cache,
+                                cursor_in_statement,
+                            ),
+                            Some(routine_cache),
+                            snapshot_for_thread.signature_scan_text.clone(),
+                        )
+                    } else {
+                        let (expanded_statement, text_bind_names, package_spec_symbols) =
+                            Self::expanded_statement_window_and_text_binds_from_shadow(
+                                &text_shadow_for_thread,
+                                snapshot_for_thread.cursor_pos_usize,
+                                Some(snapshot_for_thread.preferred_db_type),
+                            );
+                        if cancellation.is_cancelled() {
+                            return None;
+                        }
+                        let routine_cache = {
+                            let cache = routine_symbol_cache_for_thread
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            cache
+                                .iter()
+                                .find(|entry| {
+                                    entry.buffer_revision == snapshot_for_thread.buffer_revision
+                                        && entry.statement_start
+                                            == expanded_statement.statement_start
+                                        && entry.statement_end == expanded_statement.statement_end
+                                })
+                                .cloned()
+                        }
+                        .unwrap_or_else(|| {
+                            Self::build_routine_symbol_cache_entry(
+                                snapshot_for_thread.buffer_revision,
+                                &expanded_statement,
+                                text_bind_names,
+                                &package_spec_symbols,
+                                Some(snapshot_for_thread.preferred_db_type),
+                            )
+                        });
+                        if cancellation.is_cancelled() {
+                            return None;
+                        }
+                        let analysis = Self::build_intellisense_analysis_from_routine_cache(
+                            &routine_cache,
+                            expanded_statement.cursor_in_statement,
                         );
-                        let _ = parse_sender.send(Err(format!("Internal error: {panic_msg}")));
-                    }
-                }
-                app::awake();
-            });
+                        (analysis, Some(routine_cache), expanded_statement.text)
+                    };
 
-        if let Err(err) = spawn_result {
+                if cancellation.is_cancelled() {
+                    return None;
+                }
+                let computation = Self::compute_intellisense_suggestions(
+                    &intellisense_data_for_thread,
+                    &column_sender_for_thread,
+                    &connection_for_thread,
+                    snapshot_for_thread.as_ref(),
+                    &analysis,
+                    &completion_scan_text,
+                    true,
+                );
+                if cancellation.is_cancelled() {
+                    return None;
+                }
+                Some(AsyncIntellisenseParseResult {
+                    analysis,
+                    routine_cache,
+                    computation,
+                })
+            }));
+
+            match result {
+                Ok(Some(parsed)) if !cancellation.is_cancelled() => {
+                    let _ = parse_sender.send(Ok(parsed));
+                }
+                Ok(_) => {}
+                Err(payload) => {
+                    let panic_msg = Self::panic_payload_to_string(payload.as_ref());
+                    crate::utils::logging::log_error(
+                        "sql_editor::intellisense::parse_worker",
+                        &format!("parse worker panicked: {panic_msg}"),
+                    );
+                    let _ = parse_sender.send(Err(format!("Internal error: {panic_msg}")));
+                }
+            }
+            app::awake();
+        }));
+
+        if !submitted {
             crate::utils::logging::log_error(
                 "sql_editor::intellisense::parse_worker",
-                &format!("failed to spawn parse worker: {err}"),
+                "intellisense latest-worker is shutting down",
             );
             if Self::is_intellisense_parse_generation_current(runtime, snapshot.as_ref())
                 && Self::is_intellisense_snapshot_current(editor, runtime, snapshot.as_ref())
@@ -2360,8 +2379,9 @@ impl SqlEditorWidget {
                 {
                     return;
                 }
-                runtime.set_routine_symbol_cache(parsed.routine_cache.clone());
-                let expanded_statement_text = parsed.expanded_statement_text.clone();
+                if let Some(routine_cache) = parsed.routine_cache {
+                    runtime.set_routine_symbol_cache(routine_cache);
+                }
                 let parsed_analysis = Arc::new(parsed.analysis);
                 runtime.set_parse_cache(Some(IntellisenseParseCacheEntry {
                     buffer_revision: snapshot.buffer_revision,
@@ -2369,16 +2389,13 @@ impl SqlEditorWidget {
                     analysis: parsed_analysis.clone(),
                 }));
 
-                Self::apply_intellisense_with_context(
+                Self::apply_computed_intellisense(
                     &editor,
                     &intellisense_data,
                     &intellisense_popup,
-                    &column_sender,
-                    &connection,
                     &runtime,
                     snapshot.as_ref(),
-                    parsed_analysis.as_ref(),
-                    &expanded_statement_text,
+                    parsed.computation,
                 );
             }
             Ok(Err(message)) => {
@@ -2416,26 +2433,15 @@ impl SqlEditorWidget {
         }
     }
 
-    fn apply_intellisense_with_context(
+    fn apply_computed_intellisense(
         editor: &TextEditor,
         intellisense_data: &Arc<Mutex<IntellisenseData>>,
         intellisense_popup: &Arc<Mutex<IntellisensePopup>>,
-        column_sender: &mpsc::Sender<ColumnLoadUpdate>,
-        connection: &SharedConnection,
         runtime: &Arc<IntellisenseRuntimeState>,
         snapshot: &IntellisenseTriggerSnapshot,
-        analysis: &IntellisenseAnalysis,
-        expanded_statement_text: &str,
+        computation: IntellisenseCompletionComputation,
     ) {
-        let computed = match Self::compute_intellisense_suggestions(
-            intellisense_data,
-            column_sender,
-            connection,
-            snapshot,
-            analysis,
-            expanded_statement_text,
-            true,
-        ) {
+        let computed = match computation {
             IntellisenseCompletionComputation::Suppressed => {
                 Self::clear_intellisense_ui_state(intellisense_popup, runtime);
                 return;
@@ -2516,7 +2522,7 @@ impl SqlEditorWidget {
     /// The full production completion computation: every source, gate and the
     /// shared merge pipeline plus the full-catalog safety net, WITHOUT any UI
     /// side effects. This is the single source of truth for what the popup
-    /// offers, shared by `apply_intellisense_with_context` (production) and the
+    /// offers, shared by the latest worker (production) and the
     /// sweep/regression test harness (`query_completion_suggestions_with_data`)
     /// so the two cannot drift. `include_locals` is `true` in production; the
     /// keyword-only test harness passes `false` to keep local symbols out of
@@ -4755,7 +4761,7 @@ impl SqlEditorWidget {
     /// The completion merge pipeline: folds every already-computed source vector
     /// into the final, ordered, deduplicated, capped suggestion list. This is the
     /// single source of truth for merge ORDER and the per-source `prefer_aliases`
-    /// flags, shared by the production `apply_intellisense_with_context` path and
+    /// flags, shared by the production latest-worker path and
     /// the `audit_final_suggestions_for` test harness so the two cannot drift.
     ///
     /// Inputs that require IO or a data lock (the base catalog list, expected
@@ -5054,7 +5060,7 @@ impl SqlEditorWidget {
     /// variable/bind/generated-name contexts (`SELECT … INTO |`, `USING :b`, DDL
     /// new names), completed operands (`x AT TIME ZONE tz |`, `DEFAULT 1 |`), and
     /// every keyword/value-only, scoped-column, data-type and property slot. Single
-    /// source of truth shared by `apply_intellisense_with_context` (production) and
+    /// source of truth shared by the production latest-worker path and
     /// the safety-net test harness so the two cannot drift.
     #[allow(clippy::too_many_arguments)]
     fn cursor_offers_full_catalog_safety_net(

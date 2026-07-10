@@ -16176,6 +16176,38 @@ fn million_line_oracle_plsql_completion_window_stays_hard_capped() {
 }
 
 #[test]
+fn million_line_production_completion_index_uses_the_bounded_fast_path() {
+    use std::time::{Duration, Instant};
+
+    const LINE: &str = "SELECT 1;\n";
+    const LINES: usize = 1_000_001;
+    let sql = LINE.repeat(LINES);
+    let snapshot = ChunkedText::from_str(&sql);
+    let cursor = 500_000usize
+        .saturating_mul(LINE.len())
+        .saturating_add("SELECT ".len());
+
+    let started = Instant::now();
+    let (expanded, _, _) =
+        SqlEditorWidget::expanded_statement_window_and_text_binds_from_snapshot(
+            &snapshot,
+            cursor,
+            Some(crate::db::DatabaseType::Oracle),
+        );
+    let elapsed = started.elapsed();
+
+    assert!(expanded.dependency_start > 0);
+    assert!(
+        expanded.text.len() < SqlEditorWidget::BOUNDED_INTELLISENSE_PARSE_WINDOW_BYTES,
+        "a local statement in a million-line script must not promote to a full-document parse"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "bounded production completion path took {elapsed:?}"
+    );
+}
+
+#[test]
 fn prepend_local_symbol_suggestions_dedups_quoted_identifier_equivalents() {
     let merged = SqlEditorWidget::prepend_local_symbol_suggestions(
         vec!["v total".to_string(), "ENAME".to_string()],
@@ -16189,7 +16221,7 @@ fn prepend_local_symbol_suggestions_dedups_quoted_identifier_equivalents() {
 }
 
 #[test]
-fn large_routine_cache_analysis_stays_bounded() {
+fn large_routine_cache_promotes_to_full_active_statement_index() {
     let mut sql = String::from("CREATE OR REPLACE PROCEDURE demo_proc IS\n");
     sql.push_str("    v_far NUMBER := 1;\n");
     for idx in 0..10_000 {
@@ -16221,14 +16253,14 @@ fn large_routine_cache_analysis_stays_bounded() {
         "generated procedure should exceed the default statement window"
     );
     assert!(
-        expanded.text.len() <= SqlEditorWidget::BOUNDED_INTELLISENSE_PARSE_WINDOW_BYTES,
-        "routine analysis should stay inside the bounded intellisense window"
+        expanded.text.len() > SqlEditorWidget::BOUNDED_INTELLISENSE_PARSE_WINDOW_BYTES,
+        "a clipped routine should be promoted from the fast window to its full active statement"
     );
     assert!(
-        !suggestions
+        suggestions
             .iter()
             .any(|value| value.eq_ignore_ascii_case("v_far")),
-        "far declaration outside the bounded window should not be scanned: {suggestions:?}"
+        "the full active-statement index should retain a far declaration: {suggestions:?}"
     );
 }
 
@@ -16281,6 +16313,141 @@ fn routine_symbol_cache_reanalyzes_cursor_context_inside_cached_statement() {
             .routine_symbol_cache_covering_cursor(1, where_cursor)
             .is_none(),
         "routine cache must not be reused across buffer revisions"
+    );
+}
+
+#[test]
+fn production_buffer_edit_rebases_only_unaffected_statement_indexes() {
+    let mut sql = String::from("SELECT e.ename FROM emp e WHERE e.empno = 1;\n");
+    sql.push_str(&"SELECT pad FROM padding_table;\n".repeat(5_000));
+    sql.push_str("SELECT d.dname FROM dept d;");
+    let first_cursor = sql.find("e.ename").expect("first statement cursor");
+    let second_cursor = sql.find("d.dname").expect("second statement cursor");
+    let edit_at = sql.find("e.empno").expect("edit inside first statement");
+
+    let (first_cache, first_expanded) =
+        SqlEditorWidget::build_routine_symbol_cache_bundle_for_test(&sql, first_cursor);
+    let first_analysis = Arc::new(SqlEditorWidget::build_intellisense_analysis_from_routine_cache(
+        &first_cache,
+        first_expanded.cursor_in_statement,
+    ));
+    let (second_cache, _) =
+        SqlEditorWidget::build_routine_symbol_cache_bundle_for_test(&sql, second_cursor);
+    assert!(second_cache.dependency_start > edit_at);
+    let second_start_before = second_cache.statement_start;
+
+    let runtime = IntellisenseRuntimeState::new();
+    runtime.set_routine_symbol_cache(first_cache);
+    runtime.set_routine_symbol_cache(second_cache);
+    runtime.set_parse_cache(Some(IntellisenseParseCacheEntry {
+        buffer_revision: 0,
+        cursor_pos: first_cursor as i32,
+        analysis: first_analysis,
+    }));
+
+    let inserted_len = " /*x*/".len();
+    let revision = runtime.apply_buffer_edit(edit_at, inserted_len, 0);
+    assert_eq!(revision, 1);
+    assert!(runtime.parse_cache().is_none());
+    assert!(
+        runtime
+            .routine_symbol_cache_covering_cursor(revision, first_cursor)
+            .is_none(),
+        "the edited statement index must be invalidated"
+    );
+
+    let rebased_second_cursor = second_cursor.saturating_add(inserted_len);
+    let rebased = runtime
+        .routine_symbol_cache_covering_cursor(revision, rebased_second_cursor)
+        .expect("unaffected second statement index should survive the edit");
+    assert_eq!(
+        rebased.statement_start,
+        second_start_before.saturating_add(inserted_len)
+    );
+    assert_eq!(runtime.current_parse_generation(), 1);
+}
+
+#[test]
+fn production_latest_worker_runs_one_active_and_replaces_pending_request() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex};
+    use std::time::{Duration, Instant};
+
+    let runtime = IntellisenseRuntimeState::new();
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let release_first = release.clone();
+    assert!(runtime.submit_latest_parse_task(Box::new(move || {
+        let _ = started_tx.send(());
+        let (lock, ready) = &*release_first;
+        let mut released = lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !*released {
+            released = ready
+                .wait(released)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    })));
+    started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("first worker task should start");
+
+    let replaced_task_runs = Arc::new(AtomicUsize::new(0));
+    let replaced_task_runs_for_worker = replaced_task_runs.clone();
+    assert!(runtime.submit_latest_parse_task(Box::new(move || {
+        replaced_task_runs_for_worker.fetch_add(1, Ordering::AcqRel);
+    })));
+    let latest_task_runs = Arc::new(AtomicUsize::new(0));
+    let latest_task_runs_for_worker = latest_task_runs.clone();
+    assert!(runtime.submit_latest_parse_task(Box::new(move || {
+        latest_task_runs_for_worker.fetch_add(1, Ordering::AcqRel);
+    })));
+
+    let (lock, ready) = &*release;
+    *lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+    ready.notify_all();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while runtime.parse_worker_stats().2 < 2 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let (submitted, replaced, completed, max_active) = runtime.parse_worker_stats();
+    assert_eq!(submitted, 3);
+    assert!(replaced >= 1);
+    assert_eq!(completed, 2);
+    assert_eq!(max_active, 1);
+    assert_eq!(replaced_task_runs.load(Ordering::Acquire), 0);
+    assert_eq!(latest_task_runs.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn production_worker_cancellation_tracks_parse_generation() {
+    let runtime = IntellisenseRuntimeState::new();
+    let cancellation = runtime.cancellation_for(runtime.current_parse_generation());
+    assert!(!cancellation.is_cancelled());
+    runtime.next_parse_generation();
+    assert!(cancellation.is_cancelled());
+}
+
+#[test]
+fn production_buffer_edit_invalidates_cross_statement_symbol_dependency() {
+    let sql = "VAR old_bind NUMBER\nSELECT :old_bind FROM dual;";
+    let cursor = sql.find(":old_bind").expect("bind cursor");
+    let edit_at = sql.find("old_bind").expect("bind declaration");
+    let (cache, _) = SqlEditorWidget::build_routine_symbol_cache_bundle_for_test(sql, cursor);
+    assert!(cache.dependency_start <= edit_at && edit_at < cache.statement_start);
+
+    let runtime = IntellisenseRuntimeState::new();
+    runtime.set_routine_symbol_cache(cache);
+    let revision = runtime.apply_buffer_edit(edit_at, "new".len(), "old".len());
+    assert!(
+        runtime
+            .routine_symbol_cache_covering_cursor(revision, cursor)
+            .is_none(),
+        "editing a bind/package dependency before a statement must invalidate its symbol index"
     );
 }
 

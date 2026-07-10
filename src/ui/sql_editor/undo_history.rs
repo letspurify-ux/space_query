@@ -30,13 +30,16 @@ const REMOTE_EDIT_CURSOR_DISTANCE: usize = 5;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct UndoSnapshot {
-    text: String,
+    text: ChunkedText,
     cursor_pos: usize,
 }
 
 impl UndoSnapshot {
     fn new(text: String, cursor_pos: usize) -> Self {
-        Self { text, cursor_pos }
+        Self {
+            text: ChunkedText::from_string(text),
+            cursor_pos,
+        }
     }
 }
 
@@ -90,12 +93,12 @@ impl WordUndoRedoState {
             self.active_group = None;
         }
         self.current.cursor_pos =
-            Self::clamp_to_char_boundary(&self.current.text, self.current.cursor_pos);
+            Self::clamp_chunked_boundary(&self.current.text, self.current.cursor_pos);
     }
 
     #[cfg(test)]
     fn current_snapshot_matches(&self, current_text: &str) -> bool {
-        self.current.text == current_text
+        self.current.text.to_flat_string() == current_text
     }
 
     fn clamp_to_char_boundary(text: &str, idx: usize) -> usize {
@@ -106,24 +109,28 @@ impl WordUndoRedoState {
         idx
     }
 
-    fn normalized_replace_range(text: &str, edit: &BufferEdit) -> (usize, usize) {
-        let replace_start = Self::clamp_to_char_boundary(text, edit.start);
+    fn clamp_chunked_boundary(text: &ChunkedText, idx: usize) -> usize {
+        text.clamp_boundary(idx)
+    }
+
+    fn normalized_replace_range(text: &ChunkedText, edit: &BufferEdit) -> (usize, usize) {
+        let replace_start = Self::clamp_chunked_boundary(text, edit.start);
         let delete_end = replace_start
             .saturating_add(edit.deleted_len)
             .min(text.len());
-        let replace_end = Self::clamp_to_char_boundary(text, delete_end).max(replace_start);
+        let replace_end = Self::clamp_chunked_boundary(text, delete_end).max(replace_start);
         (replace_start, replace_end)
     }
 
     fn apply_edit_to_snapshot(snapshot: &mut UndoSnapshot, edit: &BufferEdit) {
         let (replace_start, replace_end) = Self::normalized_replace_range(&snapshot.text, edit);
-        snapshot
+        let _ = snapshot
             .text
-            .replace_range(replace_start..replace_end, &edit.inserted_text);
+            .replace_range(replace_start, replace_end, &edit.inserted_text);
         let cursor = replace_start
             .saturating_add(edit.inserted_text.len())
             .min(snapshot.text.len());
-        snapshot.cursor_pos = Self::clamp_to_char_boundary(&snapshot.text, cursor);
+        snapshot.cursor_pos = Self::clamp_chunked_boundary(&snapshot.text, cursor);
     }
 
     fn apply_delta_to_snapshot(snapshot: &mut UndoSnapshot, delta: &UndoDelta, reverse: bool) {
@@ -152,7 +159,7 @@ impl WordUndoRedoState {
         } else {
             delta.after_cursor
         };
-        snapshot.cursor_pos = Self::clamp_to_char_boundary(&snapshot.text, cursor);
+        snapshot.cursor_pos = Self::clamp_chunked_boundary(&snapshot.text, cursor);
     }
 
     fn should_merge_into_active_group(&self, edit_group: EditGroup, edit: &BufferEdit) -> bool {
@@ -175,10 +182,8 @@ impl WordUndoRedoState {
         }
 
         let current_cursor = self.current.cursor_pos;
-        let current_text = self.current.text.as_str();
-        let (edit_start, edit_end) = Self::normalized_replace_range(current_text, edit);
-
-        if Self::cursor_distance_chars(current_text, current_cursor, edit_start)
+        let (edit_start, edit_end) = Self::normalized_replace_range(&self.current.text, edit);
+        if Self::cursor_distance_chars_chunked(&self.current.text, current_cursor, edit_start)
             >= REMOTE_EDIT_CURSOR_DISTANCE
         {
             return false;
@@ -192,49 +197,72 @@ impl WordUndoRedoState {
             return false;
         }
 
-        if !Self::is_same_line(current_text, current_cursor, edit_start)
-            || !Self::is_same_line(current_text, current_cursor, edit_end)
+        if !Self::is_same_line_chunked(&self.current.text, current_cursor, edit_start)
+            || !Self::is_same_line_chunked(&self.current.text, current_cursor, edit_end)
         {
             return false;
         }
 
+        let window_start = self
+            .current
+            .text
+            .clamp_boundary(self.current.cursor_pos.saturating_sub(256));
+        let window_end = self
+            .current
+            .cursor_pos
+            .saturating_add(256)
+            .min(self.current.text.len());
+        let current_text = self
+            .current
+            .text
+            .range_string(window_start, window_end)
+            .unwrap_or_default();
+        let local_cursor = current_cursor.saturating_sub(window_start);
         let Some((word_start, word_end)) =
-            Self::word_span_touching_offset(current_text, current_cursor)
+            Self::word_span_touching_offset(&current_text, local_cursor)
         else {
             // IME composition can briefly remove the in-progress syllable,
             // leaving no identifier under the cursor for one callback.
             return edit_start == current_cursor;
         };
+        let word_start = window_start.saturating_add(word_start);
+        let word_end = window_start.saturating_add(word_end);
         if !Self::edit_touches_word_span(edit_start, edit_end, word_start, word_end) {
             return false;
         }
         true
     }
 
-    fn is_same_line(text: &str, left: usize, right: usize) -> bool {
-        if text.is_empty() {
-            return true;
-        }
-
-        let left = Self::clamp_to_char_boundary(text, left.min(text.len()));
-        let right = Self::clamp_to_char_boundary(text, right.min(text.len()));
+    fn is_same_line_chunked(text: &ChunkedText, left: usize, right: usize) -> bool {
+        let left = text.clamp_boundary(left.min(text.len()));
+        let right = text.clamp_boundary(right.min(text.len()));
         let (start, end) = if left <= right {
             (left, right)
         } else {
             (right, left)
         };
-        !text.as_bytes()[start..end].contains(&b'\n')
+        !text
+            .range_string(start, end)
+            .unwrap_or_default()
+            .as_bytes()
+            .contains(&b'\n')
     }
 
-    fn cursor_distance_chars(text: &str, left: usize, right: usize) -> usize {
-        let left = Self::clamp_to_char_boundary(text, left.min(text.len()));
-        let right = Self::clamp_to_char_boundary(text, right.min(text.len()));
+    fn cursor_distance_chars_chunked(text: &ChunkedText, left: usize, right: usize) -> usize {
+        let left = text.clamp_boundary(left.min(text.len()));
+        let right = text.clamp_boundary(right.min(text.len()));
         let (start, end) = if left <= right {
             (left, right)
         } else {
             (right, left)
         };
-        text.get(start..end)
+        // Callers only distinguish "nearer than the remote-edit threshold".
+        // UTF-8 uses at most four bytes per scalar, so a range this wide is
+        // certainly remote and never needs to be copied from the document.
+        if end.saturating_sub(start) >= REMOTE_EDIT_CURSOR_DISTANCE.saturating_mul(4) {
+            return REMOTE_EDIT_CURSOR_DISTANCE;
+        }
+        text.range_string(start, end)
             .map(|range| range.chars().count())
             .unwrap_or_else(|| end.saturating_sub(start))
     }
@@ -259,14 +287,14 @@ impl WordUndoRedoState {
             return;
         }
 
-        let current_cursor = Self::clamp_to_char_boundary(
+        let current_cursor = Self::clamp_chunked_boundary(
             &self.current.text,
             self.current.cursor_pos.min(self.current.text.len()),
         );
         let next_cursor =
-            Self::clamp_to_char_boundary(&self.current.text, replace_start.min(self.current.text.len()));
+            Self::clamp_chunked_boundary(&self.current.text, replace_start.min(self.current.text.len()));
         if current_cursor == next_cursor
-            || Self::cursor_distance_chars(&self.current.text, current_cursor, next_cursor)
+            || Self::cursor_distance_chars_chunked(&self.current.text, current_cursor, next_cursor)
                 < REMOTE_EDIT_CURSOR_DISTANCE
         {
             return;
@@ -418,7 +446,7 @@ impl WordUndoRedoState {
     }
 
     fn sync_current_cursor(&mut self, cursor_pos: usize) {
-        self.current.cursor_pos = Self::clamp_to_char_boundary(
+        self.current.cursor_pos = Self::clamp_chunked_boundary(
             &self.current.text,
             cursor_pos.min(self.current.text.len()),
         );
@@ -427,16 +455,16 @@ impl WordUndoRedoState {
     fn record_cursor_move_to_if_remote(&mut self, cursor_pos: usize) {
         self.normalize_index();
 
-        let current_cursor = Self::clamp_to_char_boundary(
+        let current_cursor = Self::clamp_chunked_boundary(
             &self.current.text,
             self.current.cursor_pos.min(self.current.text.len()),
         );
-        let next_cursor = Self::clamp_to_char_boundary(
+        let next_cursor = Self::clamp_chunked_boundary(
             &self.current.text,
             cursor_pos.min(self.current.text.len()),
         );
         if current_cursor == next_cursor
-            || Self::cursor_distance_chars(&self.current.text, current_cursor, next_cursor)
+            || Self::cursor_distance_chars_chunked(&self.current.text, current_cursor, next_cursor)
                 < REMOTE_EDIT_CURSOR_DISTANCE
         {
             return;
@@ -468,7 +496,7 @@ impl WordUndoRedoState {
     }
 
     fn finish_completion_edit_cursor(&mut self, cursor_pos: usize, changed_text: bool) {
-        let cursor = Self::clamp_to_char_boundary(
+        let cursor = Self::clamp_chunked_boundary(
             &self.current.text,
             cursor_pos.min(self.current.text.len()),
         );
@@ -492,9 +520,8 @@ impl WordUndoRedoState {
         let deleted_text = self
             .current
             .text
-            .get(replace_start..replace_end)
-            .map(|text| text.to_string())
-            .unwrap_or_else(String::new);
+            .range_string(replace_start, replace_end)
+            .unwrap_or_default();
         let normalized_edit = BufferEdit {
             start: replace_start,
             deleted_len: replace_end.saturating_sub(replace_start),
@@ -567,24 +594,25 @@ impl WordUndoRedoState {
         let deleted_text = self
             .current
             .text
-            .get(replace_start..replace_end)
-            .map(|text| text.to_string())
-            .unwrap_or_else(String::new);
+            .range_string(replace_start, replace_end)
+            .unwrap_or_default();
         let normalized_edit = BufferEdit {
             start: replace_start,
             deleted_len: replace_end.saturating_sub(replace_start),
             inserted_text: edit.inserted_text.clone(),
             deleted_text,
         };
-        let before_cursor = Self::clamp_to_char_boundary(
+        let before_cursor = Self::clamp_chunked_boundary(
             &self.current.text,
             before_cursor.min(self.current.text.len()),
         );
         let group_id = self.next_group_id();
 
         Self::apply_edit_to_snapshot(&mut self.current, &normalized_edit);
-        let after_cursor =
-            Self::clamp_to_char_boundary(&self.current.text, after_cursor.min(self.current.text.len()));
+        let after_cursor = Self::clamp_chunked_boundary(
+            &self.current.text,
+            after_cursor.min(self.current.text.len()),
+        );
         self.current.cursor_pos = after_cursor;
 
         let delta = UndoDelta {
@@ -623,13 +651,17 @@ impl WordUndoRedoState {
         self.normalize_index();
         self.truncate_redo_history();
 
-        let before_cursor =
-            Self::clamp_to_char_boundary(&self.current.text, before_cursor.min(self.current.text.len()));
+        let before_cursor = Self::clamp_chunked_boundary(
+            &self.current.text,
+            before_cursor.min(self.current.text.len()),
+        );
         let group_id = self.next_group_id();
 
-        self.current.text = inserted_text.clone();
-        let after_cursor =
-            Self::clamp_to_char_boundary(&self.current.text, after_cursor.min(self.current.text.len()));
+        self.current.text = ChunkedText::from_str(&inserted_text);
+        let after_cursor = Self::clamp_chunked_boundary(
+            &self.current.text,
+            after_cursor.min(self.current.text.len()),
+        );
         self.current.cursor_pos = after_cursor;
 
         let delta = UndoDelta {
@@ -665,7 +697,7 @@ impl WordUndoRedoState {
             return;
         }
         let deleted_len = self.current.text.len();
-        let deleted_text = self.current.text.clone();
+        let deleted_text = self.current.text.to_flat_string();
         let edit = BufferEdit {
             start: 0,
             deleted_len,
@@ -697,7 +729,7 @@ impl WordUndoRedoState {
     fn history_texts(&self) -> Vec<String> {
         self.history_snapshots()
             .iter()
-            .map(|snapshot| snapshot.text.clone())
+            .map(|snapshot| snapshot.text.to_flat_string())
             .collect()
     }
 
@@ -764,7 +796,7 @@ impl WordUndoRedoState {
             earliest_delta.before_cursor
         }
         .min(self.current.text.len());
-        Self::clamp_to_char_boundary(&self.current.text, cursor)
+        Self::clamp_chunked_boundary(&self.current.text, cursor)
     }
 
     fn take_redo_group(&mut self) -> Vec<UndoDelta> {

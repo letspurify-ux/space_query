@@ -7,6 +7,7 @@ const PLSQL_COLLECTION_METHODS: &[&str] = &[
 
 #[derive(Clone)]
 struct ExpandedStatementWindow {
+    dependency_start: usize,
     statement_start: usize,
     statement_end: usize,
     text: String,
@@ -127,14 +128,24 @@ impl SqlEditorWidget {
             || matches!((first_open, first_close), (Some(open), Some(close)) if close < open)
     }
 
-    fn bounded_intellisense_parse_text_from_shadow(
-        text_shadow: &Arc<Mutex<HighlightShadowState>>,
+    fn bounded_intellisense_parse_text_from_chunked(
+        text: &ChunkedText,
         cursor_pos: usize,
     ) -> BoundedIntellisenseParseText {
-        let guard = text_shadow
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        Self::bounded_intellisense_parse_text_from_text(&guard.text, cursor_pos)
+        let cursor_pos = text.clamp_boundary(cursor_pos.min(text.len()));
+        let start = text.clamp_boundary(
+            cursor_pos.saturating_sub(Self::BOUNDED_INTELLISENSE_PARSE_LOOKBEHIND_BYTES),
+        );
+        let end = text.clamp_boundary(
+            cursor_pos
+                .saturating_add(Self::BOUNDED_INTELLISENSE_PARSE_LOOKAHEAD_BYTES)
+                .min(text.len()),
+        );
+        BoundedIntellisenseParseText {
+            text: text.range_string(start, end).unwrap_or_default(),
+            start,
+            cursor_pos,
+        }
     }
 
     fn bounded_intellisense_parse_text_from_text(
@@ -168,6 +179,7 @@ impl SqlEditorWidget {
     ) -> ExpandedStatementWindow {
         if bounded.text.is_empty() {
             return ExpandedStatementWindow {
+                dependency_start: bounded.start,
                 statement_start: bounded.start,
                 statement_end: bounded.start,
                 text: String::new(),
@@ -206,6 +218,36 @@ impl SqlEditorWidget {
             bounded.cursor_pos,
             expanded,
         )
+    }
+
+    fn bounded_statement_needs_full_document_index(
+        bounded: &BoundedIntellisenseParseText,
+        expanded: &ExpandedStatementWindow,
+        document_len: usize,
+    ) -> bool {
+        let bounded_end = bounded.start.saturating_add(bounded.text.len());
+        if (bounded.start > 0 && expanded.statement_start <= bounded.start)
+            || (bounded_end < document_len && expanded.statement_end >= bounded_end)
+        {
+            return true;
+        }
+
+        // Inner semicolons make a clipped procedural unit look like a small
+        // standalone statement even when its declaration/root is before the
+        // bounded window. Promote only procedural-looking fragments; ordinary
+        // nearby statements in a huge script stay on the bounded fast path.
+        if bounded.start == 0 && bounded_end >= document_len {
+            return false;
+        }
+        let upper = expanded.text.to_ascii_uppercase();
+        let trimmed = upper.trim_start();
+        trimmed == "BEGIN"
+            || trimmed.starts_with("BEGIN\n")
+            || trimmed.starts_with("BEGIN ")
+            || trimmed.starts_with("DECLARE\n")
+            || trimmed.starts_with("DECLARE ")
+            || upper.contains("\nBEGIN\n")
+            || upper.contains("\nBEGIN ")
     }
 
     /// Recover the enclosing Oracle PL/SQL execution unit when the generic
@@ -338,6 +380,7 @@ impl SqlEditorWidget {
             .saturating_sub(absolute_statement_start)
             .min(statement_text.len());
         ExpandedStatementWindow {
+            dependency_start: text_start,
             statement_start: absolute_statement_start,
             statement_end: text_start.saturating_add(statement_end),
             text: statement_text,
@@ -435,9 +478,41 @@ impl SqlEditorWidget {
         cursor_pos: usize,
         preferred_db_type: Option<crate::db::connection::DatabaseType>,
     ) -> (ExpandedStatementWindow, Vec<String>, Vec<ParsedDeclarationSymbol>) {
-        let bounded = Self::bounded_intellisense_parse_text_from_shadow(text_shadow, cursor_pos);
-        let expanded =
+        let text_snapshot = text_shadow
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .text_snapshot();
+        Self::expanded_statement_window_and_text_binds_from_snapshot(
+            &text_snapshot,
+            cursor_pos,
+            preferred_db_type,
+        )
+    }
+
+    fn expanded_statement_window_and_text_binds_from_snapshot(
+        text_snapshot: &ChunkedText,
+        cursor_pos: usize,
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
+    ) -> (ExpandedStatementWindow, Vec<String>, Vec<ParsedDeclarationSymbol>) {
+        let mut bounded =
+            Self::bounded_intellisense_parse_text_from_chunked(text_snapshot, cursor_pos);
+        let mut expanded =
             Self::expanded_statement_window_in_bounded_text_for_db_type(&bounded, preferred_db_type);
+        if Self::bounded_statement_needs_full_document_index(
+            &bounded,
+            &expanded,
+            text_snapshot.len(),
+        ) {
+            bounded = BoundedIntellisenseParseText {
+                text: text_snapshot.to_flat_string(),
+                start: 0,
+                cursor_pos: text_snapshot.clamp_boundary(cursor_pos.min(text_snapshot.len())),
+            };
+            expanded = Self::expanded_statement_window_in_bounded_text_for_db_type(
+                &bounded,
+                preferred_db_type,
+            );
+        }
         let relative_statement_start = expanded
             .statement_start
             .saturating_sub(bounded.start)
@@ -526,6 +601,7 @@ impl SqlEditorWidget {
 
         RoutineSymbolCacheEntry {
             buffer_revision,
+            dependency_start: expanded_statement.dependency_start,
             statement_start: expanded_statement.statement_start,
             statement_end: expanded_statement.statement_end,
             statement_tokens: statement_tokens.into(),
@@ -4734,19 +4810,13 @@ impl SqlEditorWidget {
         cursor_pos: usize,
         db_type: Option<crate::db::connection::DatabaseType>,
     ) -> (RoutineSymbolCacheEntry, ExpandedStatementWindow) {
-        let bounded = Self::bounded_intellisense_parse_text_from_text(full_text, cursor_pos);
-        let expanded = Self::expanded_statement_window_in_bounded_text_for_db_type(
-            &bounded,
-            db_type,
-        );
-        let relative_statement_start = expanded
-            .statement_start
-            .saturating_sub(bounded.start)
-            .min(bounded.text.len());
-        let text_bind_names =
-            Self::collect_text_bind_names_before_statement(&bounded.text, relative_statement_start, db_type);
-        let package_spec_symbols =
-            Self::package_spec_symbols_for_body(&bounded.text, &expanded.text, relative_statement_start);
+        let snapshot = ChunkedText::from_str(full_text);
+        let (expanded, text_bind_names, package_spec_symbols) =
+            Self::expanded_statement_window_and_text_binds_from_snapshot(
+                &snapshot,
+                cursor_pos,
+                db_type,
+            );
         let routine_cache = Self::build_routine_symbol_cache_entry(
             0,
             &expanded,
