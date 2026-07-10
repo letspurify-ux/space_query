@@ -1330,7 +1330,7 @@ fn plsql_type_attribute_slot_offers_type_rowtype_and_suppresses_identifiers() {
 /// After a complete privilege list (`GRANT SELECT, INSERT |`) the only
 /// grammatical continuation is the object clause `ON`. Without an explicit
 /// privilege-list-tail arm the statement falls through to the query-continuation
-/// fallback, which misreads the leading `SELECT` privilege as a select list and
+/// coarse query inference, which misreads the leading `SELECT` privilege as a select list and
 /// leaks its `FROM` — pure noise. A MySQL `REVOKE` may also revoke globally
 /// (no `ON`), so it additionally admits `FROM`; an open column list defers to the
 /// catalog. The privilege-name slots (`GRANT |` / `GRANT SELECT, |`) keep
@@ -3395,9 +3395,45 @@ fn mysql_context_and_suggestions_for_inline_sql(
     (context, suggestions)
 }
 
-// Precision-core view: the shared `merge_completion_sources` output, WITHOUT the
-// production full-catalog safety net. Every precision/no-noise regression test
-// uses this so it keeps asserting the exact, un-widened result.
+// Production view: the shared context-resolved merge pipeline. There is no
+// catalog-wide widening layer after this result.
+#[test]
+fn production_sources_have_no_contextless_catalog_widening_hooks() {
+    let completion = include_str!("completion.rs");
+    let data = include_str!("../../intellisense.rs");
+
+    for removed in [
+        "append_full_catalog_tail",
+        "collect_full_catalog_tail_for_context",
+        "cursor_offers_full_catalog_safety_net",
+        "collect_all_completion_fallback_suggestions_for_db",
+        "expected_object_kind_allows_all_completion_fallback",
+        "expected_object_kind_allows_unknown_member_fallback",
+        "suggestion_matches_expected_object_kind_for_db",
+        "oracle_bounded_text_structural_keyword_prefix_fallback",
+    ] {
+        assert!(
+            !completion.contains(removed),
+            "removed completion widening hook reappeared: {removed}"
+        );
+    }
+    assert!(
+        !completion.contains("get_column_suggestions(prefix, None)"),
+        "production completion requested columns without a relation scope"
+    );
+
+    for removed in [
+        "all_columns_entries",
+        "ensure_all_columns_entries",
+        "relation_lookup_short_key",
+    ] {
+        assert!(
+            !data.contains(removed),
+            "removed global/short-key cache hook reappeared: {removed}"
+        );
+    }
+}
+
 fn audit_final_suggestions_for(
     sql: &str,
     db: crate::db::DatabaseType,
@@ -3406,27 +3442,12 @@ fn audit_final_suggestions_for(
     Vec<String>,
     Vec<String>,
 ) {
-    audit_final_suggestions_impl(sql, db, false)
-}
-
-// Production-equivalent view: precision core + the full-catalog safety net layered
-// on top exactly as `apply_intellisense_with_context` does. Used only by the
-// safety-net test to verify the gate fires/suppresses at the right slots.
-fn audit_final_suggestions_with_safety_net_for(
-    sql: &str,
-    db: crate::db::DatabaseType,
-) -> (
-    Option<ExpectedObjectSuggestionKind>,
-    Vec<String>,
-    Vec<String>,
-) {
-    audit_final_suggestions_impl(sql, db, true)
+    audit_final_suggestions_impl(sql, db)
 }
 
 fn audit_final_suggestions_impl(
     sql: &str,
     db: crate::db::DatabaseType,
-    apply_safety_net: bool,
 ) -> (
     Option<ExpectedObjectSuggestionKind>,
     Vec<String>,
@@ -3564,20 +3585,35 @@ fn audit_final_suggestions_impl(
             "EMP_PUB_SYN".to_string(),
         ],
     );
-    data.set_members_for_qualifier(
+    data.set_members_for_qualifier_with_kinds(
         "LEGACY",
         vec![
-            "EMP".to_string(),
-            "EMP_V".to_string(),
-            "MVIEW_SALES".to_string(),
-            "EMP_SEQ".to_string(),
-            "EMP_SYN".to_string(),
-            "PUBLIC_EMP".to_string(),
-            "LEGACY_TABLE".to_string(),
-            "RUN_JOB".to_string(),
-            "CALC_TOTAL".to_string(),
-            "HR_PKG".to_string(),
-            "ADDRESS_T".to_string(),
+            ("EMP".to_string(), Some(QualifiedMemberKind::Table)),
+            ("EMP_V".to_string(), Some(QualifiedMemberKind::View)),
+            (
+                "MVIEW_SALES".to_string(),
+                Some(QualifiedMemberKind::MaterializedView),
+            ),
+            ("EMP_SEQ".to_string(), Some(QualifiedMemberKind::Sequence)),
+            ("EMP_SYN".to_string(), Some(QualifiedMemberKind::Synonym)),
+            (
+                "PUBLIC_EMP".to_string(),
+                Some(QualifiedMemberKind::PublicSynonym),
+            ),
+            (
+                "LEGACY_TABLE".to_string(),
+                Some(QualifiedMemberKind::Table),
+            ),
+            (
+                "RUN_JOB".to_string(),
+                Some(QualifiedMemberKind::Procedure),
+            ),
+            (
+                "CALC_TOTAL".to_string(),
+                Some(QualifiedMemberKind::Function),
+            ),
+            ("HR_PKG".to_string(), Some(QualifiedMemberKind::Package)),
+            ("ADDRESS_T".to_string(), Some(QualifiedMemberKind::Type)),
         ],
     );
     data.set_relation_members_for_qualifier(
@@ -3822,25 +3858,11 @@ fn audit_final_suggestions_impl(
             Some(db),
         )
     };
-    let qualifier_matches_visible_relation_scope = qualifier.as_deref().is_some_and(|qualifier| {
-        SqlEditorWidget::qualifier_matches_visible_relation_scope(qualifier, &ctx)
-    });
     let at_comment_on_column_qualified_name_slot = has_qualifier
         && SqlEditorWidget::cursor_is_at_comment_on_column_qualified_name_slot_for_context(
             &ctx,
             trigger_has_identifier,
         );
-    let column_tables = if qualifier.as_deref().is_some_and(|qualifier| {
-        !at_comment_on_column_qualified_name_slot
-            && !qualifier_matches_visible_relation_scope
-            && qualified_completion_mode.is_none()
-            && column_tables.len() == 1
-            && SqlEditorWidget::completion_identifiers_match(&column_tables[0], qualifier)
-    }) {
-        Vec::new()
-    } else {
-        column_tables
-    };
     let column_scope = (!column_tables.is_empty()).then(|| column_tables.clone());
     let expr_keyword_ctx =
         SqlEditorWidget::expression_keyword_context(&ctx, &data, &column_tables, has, Some(db));
@@ -4439,14 +4461,6 @@ fn audit_final_suggestions_impl(
     } else {
         Vec::new()
     };
-    // This harness verifies the PRECISION CORE only — the shared
-    // `merge_completion_sources` output. The production full-catalog safety net
-    // (`widen_to_full_catalog_when_empty`) is a separate post-merge layer applied
-    // only in `apply_intellisense_with_context`; it is covered by its own unit
-    // test (`full_catalog_safety_net_widens_only_when_context_is_empty`) and is
-    // intentionally NOT folded in here, so these tests keep asserting the precise,
-    // un-widened result.
-    //
     // Fold every source through the SAME merge pipeline production uses, so this
     // harness can no longer drift from `apply_intellisense_with_context` on merge
     // order, the per-source `prefer_aliases` flags, or which sources participate.
@@ -4487,198 +4501,7 @@ fn audit_final_suggestions_impl(
             )
         },
     );
-    // Production layers the full-catalog safety net on top of the merge output;
-    // mirror that here only when explicitly requested, using the SAME shared gate
-    // predicate production uses so the two cannot drift.
-    let suggestions = if apply_safety_net {
-        let offer_full_catalog_tail = SqlEditorWidget::cursor_offers_full_catalog_safety_net(
-            qualifier.as_deref(),
-            replace_table_context_with_expected_objects,
-            context,
-            expr_keyword_ctx,
-            source_allowance.base_catalog_suggestions,
-            at_keyword_only,
-            at_value_only_no_expected_keyword_slot,
-            at_completed_oracle_sequence_pseudocolumn,
-            at_column_property_argument_slot,
-            at_dedicated_column_slot,
-            at_data_type,
-            at_package_declaration_default_value,
-            restrict_to_relation_columns,
-        );
-        SqlEditorWidget::append_full_catalog_tail(
-            &mut data,
-            suggestions,
-            &prefix,
-            context,
-            offer_full_catalog_tail,
-        )
-    } else {
-        suggestions
-    };
     (expected_object_kind, expected_keywords, suggestions)
-}
-
-/// Unit-level contract of the full-catalog tail helper: when the slot offers it,
-/// the prefix-matched catalog is appended *below* the context suggestions
-/// (context order preserved, deduped); a suppressed slot leaves the input as-is.
-#[test]
-fn full_catalog_tail_appends_below_context_suggestions() {
-    use crate::ui::SqlContext;
-    let mut data = IntellisenseData::new();
-    data.tables = vec!["EMP".to_string(), "EMPLOYEE".to_string()];
-    data.rebuild_indices();
-
-    // Offered: context match "EMP" stays on top, the rest of the catalog
-    // ("EMPLOYEE") is appended below, and the existing "EMP" is not duplicated.
-    let appended = SqlEditorWidget::append_full_catalog_tail(
-        &mut data,
-        vec!["EMP".to_string()],
-        "emp",
-        SqlContext::ColumnName,
-        true,
-    );
-    assert_eq!(appended.first().map(String::as_str), Some("EMP"));
-    assert!(appended.iter().any(|s| s == "EMPLOYEE"));
-    assert_eq!(appended.iter().filter(|s| s.as_str() == "EMP").count(), 1);
-
-    // Offered with an empty context → tail still surfaces the whole catalog.
-    let from_empty = SqlEditorWidget::append_full_catalog_tail(
-        &mut data,
-        Vec::new(),
-        "emp",
-        SqlContext::ColumnName,
-        true,
-    );
-    assert!(from_empty.iter().any(|s| s == "EMP") && from_empty.iter().any(|s| s == "EMPLOYEE"));
-
-    // Suppressed slot (`offer == false`) → input returned unchanged, no tail.
-    let suppressed = SqlEditorWidget::append_full_catalog_tail(
-        &mut data,
-        Vec::new(),
-        "emp",
-        SqlContext::ColumnName,
-        false,
-    );
-    assert!(suppressed.is_empty());
-}
-
-/// Commercial-grade type-appropriateness: the tail only offers items that are
-/// grammatically referenceable at the slot. A FROM/target slot gets relation
-/// sources only (no columns, triggers, indexes, keywords); an expression slot
-/// gets columns + relations + referenceable routines/types, but never
-/// non-referenceable objects like triggers or indexes.
-#[test]
-fn full_catalog_tail_is_type_appropriate_per_slot() {
-    use crate::ui::SqlContext;
-    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
-
-    let mut data = IntellisenseData::new();
-    data.tables = vec!["EMP".to_string()];
-    data.views = vec!["EMP_V".to_string()];
-    data.triggers = vec!["EMP_TRG".to_string()];
-    data.indexes = vec!["EMP_IDX".to_string()];
-    data.functions = vec!["EMP_FN".to_string()];
-    data.set_columns_for_table("EMP", vec!["EMP_COL".to_string()]);
-    data.rebuild_indices();
-
-    // FROM/target slot: relation sources only.
-    let from_tail =
-        SqlEditorWidget::collect_full_catalog_tail_for_context(&mut data, "emp", SqlContext::TableName);
-    assert!(has(&from_tail, "EMP") && has(&from_tail, "EMP_V"), "FROM tail keeps relations");
-    assert!(
-        !has(&from_tail, "EMP_COL")
-            && !has(&from_tail, "EMP_TRG")
-            && !has(&from_tail, "EMP_IDX")
-            && !has(&from_tail, "EMP_FN"),
-        "FROM tail must exclude columns/triggers/indexes/functions: {from_tail:?}"
-    );
-
-    // Expression slot: columns + relations + referenceable routines, but no
-    // triggers/indexes.
-    let expr_tail = SqlEditorWidget::collect_full_catalog_tail_for_context(
-        &mut data,
-        "emp",
-        SqlContext::ColumnName,
-    );
-    assert!(
-        has(&expr_tail, "EMP_COL") && has(&expr_tail, "EMP") && has(&expr_tail, "EMP_FN"),
-        "expression tail keeps columns/relations/routines: {expr_tail:?}"
-    );
-    assert!(
-        !has(&expr_tail, "EMP_TRG") && !has(&expr_tail, "EMP_IDX"),
-        "expression tail must exclude non-referenceable triggers/indexes: {expr_tail:?}"
-    );
-}
-
-/// Production-path coverage of the safety-net GATE. The full-catalog tail is
-/// offered at every identifier-bearing slot (free column/relation positions AND
-/// object/target slots like `FROM`/`UPDATE`), but must stay OUT of slots where a
-/// catalog item is grammatically nonsense (keyword-only, completed operand,
-/// variable/bind target, data-type, completed default). Uses
-/// `audit_final_suggestions_with_safety_net_for`, which applies the exact gate +
-/// tail production uses — the regression the precision audit no longer catches.
-#[test]
-fn full_catalog_safety_net_targets_identifier_slots_only() {
-    use crate::db::DatabaseType::Oracle;
-
-    let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
-
-    // Nonsense positions: a column (`EMPNO`) and a procedure (`RUN_JOB`) are never
-    // valid here, so their presence signals the catalog leaked through the tail.
-    for sql in [
-        "SELECT EXTRACT(| FROM hiredate) FROM emp",     // EXTRACT field → keyword-only
-        "SELECT * FROM emp e WHERE ename LIKE 'a%' |",  // completed predicate → keyword-only
-        "BEGIN SELECT empno INTO | FROM emp; END;",     // INTO target → variable slot
-        "CREATE PACKAGE pkg AS g NUMBER DEFAULT 1 |",   // completed default value
-    ] {
-        let (_kind, _keywords, final_suggestions) =
-            audit_final_suggestions_with_safety_net_for(sql, Oracle);
-        assert!(
-            !has(&final_suggestions, "EMPNO") && !has(&final_suggestions, "RUN_JOB"),
-            "full catalog leaked into a nonsense slot at `{sql}`: {final_suggestions:?}"
-        );
-    }
-
-    // Object-kind slots get their exact kind from the precision core, NOT the
-    // generic tail — so a COLUMN (`EMPNO`) must never leak into them (regression:
-    // columns appeared at `CALL |`/`GRANT ON |`/`DROP TRIGGER |`).
-    for sql in [
-        "CALL |",            // routine target
-        "GRANT SELECT ON |", // grantable object
-        "DROP TRIGGER |",    // trigger name
-    ] {
-        let (_kind, _keywords, final_suggestions) =
-            audit_final_suggestions_with_safety_net_for(sql, Oracle);
-        assert!(
-            !has(&final_suggestions, "EMPNO") && !has(&final_suggestions, "DEPTNO"),
-            "a column leaked into an object-kind slot at `{sql}`: {final_suggestions:?}"
-        );
-    }
-
-    // Identifier-bearing positions: the tail must surface the out-of-scope catalog
-    // below the context match (`DEPT`/its column `DEPTNO` is not in `emp`'s scope,
-    // `RUN_JOB` is a procedure not in the FROM/UPDATE target list).
-    for (sql, marker) in [
-        ("SELECT * FROM emp WHERE de|", "DEPT"),  // free column position
-        ("SELECT de| FROM emp", "DEPT"),          // select list
-        ("UPDATE emp SET x = de|", "DEPT"),       // SET value expression
-    ] {
-        let (_k, _kw, out) = audit_final_suggestions_with_safety_net_for(sql, Oracle);
-        assert!(
-            has(&out, marker) || has(&out, "DEPTNO"),
-            "full-catalog tail must surface out-of-scope catalog at `{sql}`: {out:?}"
-        );
-    }
-
-    // FROM/object target slots also get the tail (per the chosen scope): the
-    // relation match stays on top, but objects/columns appear below it.
-    let (_k, _kw, from_slot) =
-        audit_final_suggestions_with_safety_net_for("SELECT * FROM em| a JOIN dept b ON b.id = a.id", Oracle);
-    assert!(
-        has(&from_slot, "EMP"),
-        "relation suggestion must survive at a FROM slot with trailing alias+join: {from_slot:?}"
-    );
 }
 
 #[test]
@@ -9785,7 +9608,7 @@ fn request_table_columns_keeps_exact_dotted_relation_name() {
 }
 
 #[test]
-fn request_table_columns_falls_back_to_unqualified_name() {
+fn request_table_columns_requires_exact_qualified_relation_metadata() {
     let data = Arc::new(Mutex::new(IntellisenseData::new()));
     {
         let mut guard = lock_or_recover(&data);
@@ -9799,11 +9622,10 @@ fn request_table_columns_falls_back_to_unqualified_name() {
 
     SqlEditorWidget::request_table_columns("HR.EMP", &data, &sender, &connection);
 
-    let update = receiver
-        .recv_timeout(Duration::from_secs(1))
-        .expect("schema-qualified names should fall back to relation key when needed");
-    assert_eq!(update.table, "EMP");
-    assert!(!update.cache_columns);
+    assert!(
+        receiver.try_recv().is_err(),
+        "HR.EMP must not reuse the unrelated unqualified EMP catalog entry"
+    );
 }
 
 #[test]
@@ -9937,12 +9759,12 @@ fn column_loading_scope_detects_default_qualified_pending_refresh() {
 }
 
 #[test]
-fn column_loading_scope_detects_schema_qualified_pending_refresh() {
+fn column_loading_scope_does_not_reuse_unqualified_pending_refresh() {
     let mut data = IntellisenseData::new();
     data.columns_loading.insert("EMP".to_string());
     let column_tables = vec!["hr.emp".to_string()];
     let deps = HashMap::new();
-    assert!(SqlEditorWidget::has_column_loading_for_scope(
+    assert!(!SqlEditorWidget::has_column_loading_for_scope(
         true,
         &column_tables,
         &deps,
@@ -9951,7 +9773,7 @@ fn column_loading_scope_detects_schema_qualified_pending_refresh() {
 }
 
 #[test]
-fn request_table_columns_does_not_fallback_when_dot_is_inside_quoted_identifier() {
+fn request_table_columns_requires_exact_quoted_dotted_identifier() {
     let data = Arc::new(Mutex::new(IntellisenseData::new()));
     {
         let mut guard = lock_or_recover(&data);
@@ -9968,7 +9790,7 @@ fn request_table_columns_does_not_fallback_when_dot_is_inside_quoted_identifier(
     let update = receiver.try_recv();
     assert!(
         update.is_err(),
-        "quoted identifier with embedded dot should not fall back to unqualified key"
+        "quoted identifier with embedded dot should not use an unqualified key"
     );
 }
 
@@ -10055,7 +9877,7 @@ fn resolve_table_column_load_key_does_not_split_bracket_table_segment_for_qualif
 }
 
 #[test]
-fn request_table_columns_does_not_fallback_when_dot_is_inside_backtick_quoted_identifier() {
+fn request_table_columns_requires_exact_backtick_dotted_identifier() {
     let data = Arc::new(Mutex::new(IntellisenseData::new()));
     {
         let mut guard = lock_or_recover(&data);
@@ -10072,12 +9894,12 @@ fn request_table_columns_does_not_fallback_when_dot_is_inside_backtick_quoted_id
     let update = receiver.try_recv();
     assert!(
         update.is_err(),
-        "backtick-quoted identifier with embedded dot should not fall back to unqualified key"
+        "backtick-quoted identifier with embedded dot should not use an unqualified key"
     );
 }
 
 #[test]
-fn request_table_columns_does_not_fallback_for_invalid_qualified_identifier() {
+fn request_table_columns_rejects_invalid_qualified_identifier() {
     let data = Arc::new(Mutex::new(IntellisenseData::new()));
     {
         let mut guard = lock_or_recover(&data);
@@ -10094,7 +9916,7 @@ fn request_table_columns_does_not_fallback_for_invalid_qualified_identifier() {
     let update = receiver.try_recv();
     assert!(
         update.is_err(),
-        "invalid qualified identifier should not fall back to unrelated relation key"
+        "invalid qualified identifier should not use an unrelated relation key"
     );
 }
 
@@ -10116,7 +9938,7 @@ fn request_table_columns_ignores_unbalanced_quoted_identifier() {
     let update = receiver.try_recv();
     assert!(
         update.is_err(),
-        "unbalanced quoted identifier should not trigger fallback column loading"
+        "unbalanced quoted identifier should not trigger column loading"
     );
 }
 
@@ -14268,7 +14090,7 @@ END;"#,
 }
 
 #[test]
-fn local_rowtype_member_suggestions_fall_back_to_unqualified_table_columns() {
+fn qualified_local_rowtype_does_not_reuse_unqualified_table_columns() {
     let suggestions = SqlEditorWidget::collect_local_rowtype_member_suggestions_for_test(
         r#"DECLARE
     v_emp scott.emp%ROWTYPE;
@@ -14280,11 +14102,9 @@ END;"#,
         "EMP",
         &["EMPNO", "ENAME", "SAL"],
     )
-    .expect("qualified table %ROWTYPE should reuse an unqualified loaded cache key");
+    .expect("the local %ROWTYPE symbol should still resolve");
 
-    for expected in ["EMPNO", "ENAME", "SAL"] {
-        assert_has_case_insensitive(&suggestions, expected);
-    }
+    assert!(suggestions.is_empty());
 }
 
 #[test]
@@ -15213,7 +15033,7 @@ fn tool_command_keyword_slots_are_dialect_scoped() {
                     false,
                     Some(db),
                 ),
-                "{db:?} Oracle/SQL*Plus-only tool command `{sql}` should suppress SQL catalog fallback"
+                "{db:?} Oracle/SQL*Plus-only tool command `{sql}` should suppress the SQL catalog"
             );
 
             let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
@@ -21877,7 +21697,7 @@ PIVOT (
 }
 
 #[test]
-fn pivot_clause_alias_qualified_column_suggestions_json_default_expression_removes_fallback_column()
+fn pivot_clause_alias_qualified_column_suggestions_json_default_expression_removes_value_column()
 {
     let sql_with_cursor = r#"
 SELECT
@@ -26993,7 +26813,7 @@ fn qualified_value_and_keyword_only_slots_do_not_use_schema_members() {
 }
 
 #[test]
-fn schema_object_context_prefers_all_members_when_relation_cache_also_exists() {
+fn qualified_object_context_uses_the_narrowest_scoped_member_cache() {
     let grant_execute_ctx = analyze_inline_cursor_sql("GRANT EXECUTE ON scott.|");
     let grant_select_ctx = analyze_inline_cursor_sql("GRANT SELECT ON scott.|");
     let mut data = IntellisenseData::new();
@@ -27041,7 +26861,7 @@ fn schema_object_context_prefers_all_members_when_relation_cache_also_exists() {
         &grant_select_ctx,
         &data,
     );
-    assert_eq!(select_mode, Some(QualifiedCompletionMode::ObjectMembers));
+    assert_eq!(select_mode, Some(QualifiedCompletionMode::RelationMembers));
     let select_suggestions = SqlEditorWidget::expected_member_suggestions_for_qualifier(
         &mut data,
         "scott",
@@ -32970,7 +32790,7 @@ fn collect_expected_object_suggestions_filter_extended_oracle_object_types() {
 }
 
 #[test]
-fn expected_object_suggestions_fall_back_to_all_completions_when_kind_has_no_matches() {
+fn expected_object_suggestions_stay_empty_when_exact_kind_has_no_matches() {
     let mut data = IntellisenseData::new();
     data.tables = vec!["EMP".to_string()];
     data.procedures = vec!["RUN_JOB".to_string()];
@@ -32978,113 +32798,33 @@ fn expected_object_suggestions_fall_back_to_all_completions_when_kind_has_no_mat
     data.packages = vec!["HR_PKG".to_string()];
     data.rebuild_indices();
 
-    let ctx = analyze_inline_cursor_sql("DROP CONTEXT |");
-    let suggestions = SqlEditorWidget::collect_expected_object_suggestions(&mut data, "", &ctx);
-
-    for expected in ["EMP", "RUN_JOB", "CALC_TOTAL", "HR_PKG"] {
+    for (sql, prefix) in [
+        ("DROP CONTEXT |", ""),
+        ("DROP CONTEXT run|", "run"),
+        ("DROP CONTEXT sel|", "sel"),
+    ] {
+        let suggestions = SqlEditorWidget::collect_expected_object_suggestions(
+            &mut data,
+            prefix,
+            &analyze_inline_cursor_sql(sql),
+        );
         assert!(
-            suggestions.iter().any(|value| value == expected),
-            "{expected} missing from all-completion fallback: {suggestions:?}"
+            suggestions.is_empty(),
+            "exact CONTEXT slot widened to unrelated catalog families at `{sql}`: {suggestions:?}"
         );
     }
-    assert!(
-        !suggestions.iter().any(|value| value == "SELECT"),
-        "empty-prefix all-completion fallback must not dump keyword catalog entries: {suggestions:?}"
-    );
 
-    let prefixed_ctx = analyze_inline_cursor_sql("DROP CONTEXT run|");
-    let prefixed = SqlEditorWidget::collect_expected_object_suggestions(
-        &mut data,
-        "run",
-        &prefixed_ctx,
-    );
-    assert_eq!(prefixed, vec!["RUN_JOB".to_string()]);
-
-    let keyword_ctx = analyze_inline_cursor_sql("DROP CONTEXT sel|");
-    let keyword_suggestions = SqlEditorWidget::collect_expected_object_suggestions(
-        &mut data,
-        "sel",
-        &keyword_ctx,
-    );
-    assert!(
-        keyword_suggestions.iter().any(|value| value == "SELECT"),
-        "keyword missing from all-completion fallback: {keyword_suggestions:?}"
-    );
-
-    const CURSOR_MARKER: &str = "__CODEX_CURSOR__";
-    let script_with_cursor = format!(
-        "DECLARE\n  v_total NUMBER;\nBEGIN\n  DROP CONTEXT v{CURSOR_MARKER}\nEND;"
-    );
-    let cursor = script_with_cursor.find(CURSOR_MARKER).unwrap();
-    let script = script_with_cursor.replacen(CURSOR_MARKER, "", 1);
-    let (routine_cache, expanded) =
-        SqlEditorWidget::build_routine_symbol_cache_bundle_for_test(&script, cursor);
-    let analysis = SqlEditorWidget::build_intellisense_analysis_from_routine_cache(
-        &routine_cache,
-        expanded.cursor_in_statement,
-    );
-    let intellisense_data = Arc::new(Mutex::new(data));
-    let connection = create_shared_connection();
-    let (kind, with_locals) = SqlEditorWidget::resolve_expected_object_completion_suggestions(
-        &intellisense_data,
-        &connection,
-        "v",
-        None,
-        false,
-        analysis.context.as_ref(),
-        crate::db::DatabaseType::Oracle,
-        CompletionSourceAllowance {
-            session_bind_names: false,
-            local_suggestions: true,
-            expected_keyword_suggestions: true,
-            expected_object_suggestions: true,
-            prepend_local_symbol_suggestions: true,
-            base_catalog_suggestions: true,
-            wildcard_suggestions: true,
-            comparison_suggestions: false,
-            derived_column_suggestions: true,
-            context_name_suggestions: true,
-        },
-        &[],
-        expanded.cursor_in_statement,
-        &analysis,
-    );
-    assert_eq!(kind, Some(ExpectedObjectSuggestionKind::Context));
-    assert!(
-        with_locals.iter().any(|value| value == "v_total"),
-        "declared local symbol missing from production all-completion fallback: {with_locals:?}"
-    );
-}
-
-#[test]
-fn mysql_expected_object_fallback_uses_mysql_object_families() {
-    use crate::db::DatabaseType::MySQL;
-
-    let mut data = IntellisenseData::new();
-    data.procedures = vec!["RUN_JOB".to_string()];
-    data.functions = vec!["CALC_TOTAL".to_string()];
-    data.materialized_views = vec!["MVIEW_SALES".to_string()];
-    data.packages = vec!["HR_PKG".to_string()];
-    data.types = vec!["ADDRESS_T".to_string()];
-    data.sequences = vec!["EMP_SEQ".to_string()];
-    data.rebuild_indices();
-
-    let ctx = analyze_inline_cursor_sql("LOCK TABLES |");
-    let suggestions = SqlEditorWidget::collect_expected_object_suggestions_for_db(
+    let mysql = SqlEditorWidget::collect_expected_object_suggestions_for_db(
         &mut data,
         "",
-        &ctx,
-        Some(MySQL),
+        &analyze_inline_cursor_sql("LOCK TABLES |"),
+        Some(crate::db::DatabaseType::MySQL),
     );
-
-    assert!(suggestions.iter().any(|value| value == "RUN_JOB"));
-    assert!(suggestions.iter().any(|value| value == "CALC_TOTAL"));
-    for leaked in ["MVIEW_SALES", "HR_PKG", "ADDRESS_T", "EMP_SEQ"] {
-        assert!(
-            !suggestions.iter().any(|value| value == leaked),
-            "{leaked} leaked into MySQL all-completion fallback: {suggestions:?}"
-        );
-    }
+    assert_eq!(
+        mysql,
+        vec!["EMP".to_string()],
+        "exact MySQL table slot widened to unrelated catalog families"
+    );
 }
 
 #[test]
@@ -33180,13 +32920,19 @@ fn expected_member_suggestions_for_qualifier_filter_schema_members_by_context() 
     data.packages = vec!["UTIL_PKG".to_string()];
     data.sequences = vec!["SEQ_ORDER".to_string()];
     data.rebuild_indices();
-    data.set_members_for_qualifier(
+    data.set_members_for_qualifier_with_kinds(
         "SCOTT",
         vec![
-            "EMP".to_string(),
-            "RUN_JOB".to_string(),
-            "UTIL_PKG".to_string(),
-            "SEQ_ORDER".to_string(),
+            ("EMP".to_string(), Some(QualifiedMemberKind::Table)),
+            (
+                "RUN_JOB".to_string(),
+                Some(QualifiedMemberKind::Procedure),
+            ),
+            ("UTIL_PKG".to_string(), Some(QualifiedMemberKind::Package)),
+            (
+                "SEQ_ORDER".to_string(),
+                Some(QualifiedMemberKind::Sequence),
+            ),
         ],
     );
 
@@ -33228,7 +32974,7 @@ fn expected_schema_routine_suggestions_do_not_require_top_level_type_lists() {
 }
 
 #[test]
-fn expected_schema_object_suggestions_fallback_when_member_kinds_are_unknown() {
+fn qualified_routine_slots_require_scoped_member_kind_metadata() {
     let call_ctx = analyze_inline_cursor_sql("CALL scott.|");
     let grant_execute_ctx = analyze_inline_cursor_sql("GRANT EXECUTE ON scott.|");
     let mut data = IntellisenseData::new();
@@ -33244,14 +32990,8 @@ fn expected_schema_object_suggestions_fallback_when_member_kinds_are_unknown() {
         &grant_execute_ctx,
     );
 
-    assert_eq!(
-        call_suggestions,
-        vec!["RUN_JOB".to_string(), "UTIL_PKG".to_string()]
-    );
-    assert_eq!(
-        grant_execute_suggestions,
-        vec!["RUN_JOB".to_string(), "UTIL_PKG".to_string()]
-    );
+    assert!(call_suggestions.is_empty());
+    assert!(grant_execute_suggestions.is_empty());
 }
 
 #[test]
@@ -33294,56 +33034,7 @@ fn qualified_schema_object_slots_exclude_user_members() {
 }
 
 #[test]
-fn broad_schema_object_fallback_excludes_known_relations() {
-    let call_ctx = analyze_inline_cursor_sql("CALL scott.|");
-    let grant_execute_ctx = analyze_inline_cursor_sql("GRANT EXECUTE ON scott.|");
-    let mut data = IntellisenseData::new();
-    data.set_members_for_qualifier(
-        "SCOTT",
-        vec![
-            "EMP".to_string(),
-            "RUN_JOB".to_string(),
-            "UTIL_PKG".to_string(),
-        ],
-    );
-    data.set_relation_members_for_qualifier("SCOTT", vec!["EMP".to_string()]);
-
-    let call_suggestions = SqlEditorWidget::expected_member_suggestions_for_qualifier(
-        &mut data, "scott", "", &call_ctx,
-    );
-    let grant_execute_suggestions = SqlEditorWidget::expected_member_suggestions_for_qualifier(
-        &mut data,
-        "scott",
-        "",
-        &grant_execute_ctx,
-    );
-
-    assert_eq!(
-        call_suggestions,
-        vec!["RUN_JOB".to_string(), "UTIL_PKG".to_string()]
-    );
-    assert_eq!(
-        grant_execute_suggestions,
-        vec!["RUN_JOB".to_string(), "UTIL_PKG".to_string()]
-    );
-
-    let mut global_relation_data = IntellisenseData::new();
-    global_relation_data.tables = vec!["EMP".to_string()];
-    global_relation_data.rebuild_indices();
-    global_relation_data
-        .set_members_for_qualifier("SCOTT", vec!["EMP".to_string(), "RUN_JOB".to_string()]);
-    let global_relation_suggestions = SqlEditorWidget::expected_member_suggestions_for_qualifier(
-        &mut global_relation_data,
-        "scott",
-        "",
-        &call_ctx,
-    );
-
-    assert_eq!(global_relation_suggestions, vec!["RUN_JOB".to_string()]);
-}
-
-#[test]
-fn kind_specific_schema_object_slots_do_not_fallback_to_unknown_member_kinds() {
+fn kind_specific_schema_object_slots_require_scoped_member_kinds() {
     let mut data = IntellisenseData::new();
     data.set_members_for_qualifier(
         "SCOTT",
@@ -33378,7 +33069,7 @@ fn kind_specific_schema_object_slots_do_not_fallback_to_unknown_member_kinds() {
 }
 
 #[test]
-fn unknown_schema_member_kinds_use_global_object_kind_cache_when_available() {
+fn global_object_kind_caches_do_not_classify_qualified_members() {
     let mut data = IntellisenseData::new();
     data.tables = vec!["EMP".to_string()];
     data.procedures = vec!["RUN_JOB".to_string()];
@@ -33422,20 +33113,10 @@ fn unknown_schema_member_kinds_use_global_object_kind_cache_when_available() {
         &analyze_inline_cursor_sql("DROP INDEX scott.|"),
     );
 
-    assert_eq!(
-        call_suggestions,
-        vec!["RUN_JOB".to_string(), "UTIL_PKG".to_string()]
-    );
-    assert_eq!(
-        execute_suggestions,
-        vec![
-            "ADDRESS_T".to_string(),
-            "RUN_JOB".to_string(),
-            "UTIL_PKG".to_string()
-        ]
-    );
-    assert_eq!(type_suggestions, vec!["ADDRESS_T".to_string()]);
-    assert_eq!(index_suggestions, vec!["EMP_PK".to_string()]);
+    assert!(call_suggestions.is_empty());
+    assert!(execute_suggestions.is_empty());
+    assert!(type_suggestions.is_empty());
+    assert!(index_suggestions.is_empty());
 }
 
 #[test]
@@ -33599,10 +33280,15 @@ fn relation_member_cache_without_kind_metadata_only_satisfies_broad_relation_slo
             SqlEditorWidget::classify_intellisense_context(&ctx, ctx.statement_tokens.as_ref());
         let mode =
             SqlEditorWidget::resolve_qualified_completion_mode("scott", context, &ctx, &data);
+        let expected_kind = SqlEditorWidget::expected_object_suggestion_kind(
+            "",
+            Some("scott"),
+            &ctx,
+        );
         assert_ne!(
             mode,
             Some(QualifiedCompletionMode::RelationMembers),
-            "untyped relation cache leaked into a kind-specific object slot for `{sql}`"
+            "untyped relation cache leaked into a kind-specific object slot for `{sql}`; kind={expected_kind:?}"
         );
         assert!(
             SqlEditorWidget::expected_relation_member_suggestions_for_qualifier(
@@ -34732,8 +34418,8 @@ fn mysql_family_qualified_schema_member_slots_use_mysql_object_kinds() {
                 &data,
                 Some(db),
             ),
-            Some(QualifiedCompletionMode::ObjectMembers),
-            "`{sql}` should use schema object-member completion with relation-kind filtering for {db:?}"
+            Some(QualifiedCompletionMode::RelationMembers),
+            "`{sql}` should use the explicit scoped relation-member cache for {db:?}"
         );
 
             let suggestions = SqlEditorWidget::expected_member_suggestions_for_qualifier_for_db(
@@ -34766,7 +34452,7 @@ fn mysql_family_qualified_schema_member_slots_use_mysql_object_kinds() {
 }
 
 #[test]
-fn table_context_schema_member_cache_filters_to_relations_without_relation_cache() {
+fn table_context_scoped_member_kinds_filter_relations_without_relation_cache() {
     let mut data = IntellisenseData::new();
     data.set_members_for_qualifier_with_kinds(
         "SCOTT",
@@ -34791,7 +34477,7 @@ fn table_context_schema_member_cache_filters_to_relations_without_relation_cache
     assert_eq!(context, SqlContext::TableName);
     assert_eq!(
         SqlEditorWidget::resolve_qualified_completion_mode("scott", context, &ctx, &data),
-        Some(QualifiedCompletionMode::RelationMembers)
+        Some(QualifiedCompletionMode::ObjectMembers)
     );
 
     let suggestions = SqlEditorWidget::expected_relation_member_suggestions_for_qualifier(
@@ -34811,7 +34497,7 @@ fn table_context_schema_member_cache_filters_to_relations_without_relation_cache
 }
 
 #[test]
-fn table_context_unknown_schema_member_fallback_keeps_known_relations_only() {
+fn table_context_does_not_use_global_relation_cache_for_untyped_schema_members() {
     let mut data = IntellisenseData::new();
     data.tables = vec!["EMP".to_string()];
     data.rebuild_indices();
@@ -34829,10 +34515,9 @@ fn table_context_unknown_schema_member_fallback_keeps_known_relations_only() {
         &mut data, "scott", "emp", &ctx,
     );
 
-    assert_eq!(
-        suggestions,
-        vec!["EMP".to_string()],
-        "unknown schema member fallback must not dump non-relations into table-name completion"
+    assert!(
+        suggestions.is_empty(),
+        "untyped scoped members must not be classified from a same-named global relation: {suggestions:?}"
     );
 }
 
@@ -37419,6 +37104,7 @@ fn qualified_position_never_dumps_all_columns() {
 
     // Unknown qualifier: nothing (not every column).
     assert!(qualified_base_suggestions_for(&mut data, "SELECT zzz.| FROM emp e", "zzz").is_empty());
+    assert!(qualified_base_suggestions_for(&mut data, "SELECT ab.| FROM help", "ab").is_empty());
 
     // The regression: a cross-scope qualifier inside a focused DML target list
     // must not dump the whole catalog.
@@ -48763,7 +48449,7 @@ fn oracle_test11_sweep_report_advanced_query_regressions() {
 }
 
 #[test]
-fn oracle_model_bounded_text_sweep_fallbacks() {
+fn oracle_model_bounded_text_identifier_inference() {
     assert_eq!(
         SqlEditorWidget::oracle_model_bracket_completion_prefix(
             "[ FOR mont",
@@ -48771,22 +48457,6 @@ fn oracle_model_bounded_text_sweep_fallbacks() {
         ),
         Some("mont".to_string())
     );
-    for (text, prefix, expected) in [
-        ("MODEL RULES UPSERT (total_amt [ FO", "FO", "FOR"),
-        ("MODEL RULES UPSERT (total_amt [ FOR month_no FRO", "FRO", "FROM"),
-        ("MODEL RULES UPSERT (total_amt [ FOR month_no FROM 1 T", "T", "TO"),
-        (
-            "MODEL RULES UPSERT (total_amt [ FOR month_no FROM 1 TO 12 INCR",
-            "INCR",
-            "INCREMENT",
-        ),
-        ("MODEL RULES (total_amt [ C", "C", "CV"),
-    ] {
-        assert_eq!(
-            SqlEditorWidget::oracle_bounded_text_structural_keyword_prefix_fallback(prefix, text),
-            Some(expected.to_string())
-        );
-    }
     assert_eq!(
         SqlEditorWidget::oracle_model_dimension_suggestions_from_bounded_text(
             "mont",
@@ -48794,20 +48464,37 @@ fn oracle_model_bounded_text_sweep_fallbacks() {
         ),
         vec!["MONTH_NO".to_string()]
     );
+}
 
-    let script = load_intellisense_test_file("test11.txt");
-    let context = "RULES UPSERT (total_amt [ FOR month_no FROM 1 TO 12 INCREMENT 1 ]";
-    let context_start = script.find(context).expect("MODEL rule context");
-    let for_start = context_start + context.find("FOR").expect("MODEL FOR");
-    let before_for = format!("{}FO", script.get(..for_start).unwrap_or(""));
-    let signature = signature_scan_text_before_cursor_for_test(&before_for, before_for.len());
-    assert!(signature.contains("MODEL"), "MODEL fell outside bounded signature");
-    assert_eq!(
-        SqlEditorWidget::oracle_bounded_text_structural_keyword_prefix_fallback(
-            "FO", signature,
-        ),
-        Some("FOR".to_string())
+#[test]
+fn alias_as_keyword_requires_a_grammar_alias_slot() {
+    for sql in [
+        "SELECT * FROM emp e JOIN dept A| d ON d.deptno = e.deptno",
+        "SELECT * FROM emp PIVOT (SUM(sal) FOR deptno IN (10 A| 'D10'))",
+        "SELECT * FROM emp MATCH_RECOGNIZE (MEASURES FIRST(ename) A| start_name PATTERN (A) DEFINE A AS 1 = 1)",
+    ] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        let suggestions = SqlEditorWidget::collect_expected_keyword_suggestions_with_expression_context(
+            "A",
+            &ctx,
+            Some(crate::db::DatabaseType::Oracle),
+            None,
+        );
+        assert!(
+            suggestions.iter().any(|item| item == "AS"),
+            "alias slot lost AS at `{sql}` in phase {:?}: {suggestions:?}",
+            ctx.phase
+        );
+    }
+
+    let ctx = analyze_inline_cursor_sql("SELECT * FROM emp WHERE ename A|");
+    let suggestions = SqlEditorWidget::collect_expected_keyword_suggestions_with_expression_context(
+        "A",
+        &ctx,
+        Some(crate::db::DatabaseType::Oracle),
+        None,
     );
+    assert!(!suggestions.iter().any(|item| item == "AS"));
 }
 
 #[test]
@@ -48833,13 +48520,6 @@ fn oracle_remaining_actual_sweep_report_regressions() {
             "MATCH",
             "MATC",
             "MATCH",
-        ),
-        (
-            "test11.txt",
-            "e.emp_id\n                                AND sx.status",
-            "emp_id",
-            "emp_",
-            "emp_id",
         ),
         (
             "test11.txt",
@@ -73166,7 +72846,7 @@ fn mariadb_show_create_sequence_offers_sequences_without_enabling_mysql_sequence
 }
 
 #[test]
-fn mysql_family_untyped_qualified_members_exclude_oracle_only_fallback_families() {
+fn mysql_family_qualified_members_use_scoped_kind_metadata() {
     use crate::db::DatabaseType::{MariaDB, MySQL};
 
     let contains = |values: &[String], needle: &str| values.iter().any(|value| value == needle);
@@ -73194,7 +72874,7 @@ fn mysql_family_untyped_qualified_members_exclude_oracle_only_fallback_families(
             for leaked in ["MVIEW_SALES", "EMP_SEQ", "EMP_SYN", "PUBLIC_EMP"] {
                 assert!(
                     !contains(&final_suggestions, leaked),
-                    "{leaked} leaked through untyped qualified relation fallback at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+                    "{leaked} leaked through qualified relation metadata at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
                 );
             }
         }
@@ -73212,7 +72892,7 @@ fn mysql_family_untyped_qualified_members_exclude_oracle_only_fallback_families(
             assert!(
                 contains(&final_suggestions, "RUN_JOB")
                     && contains(&final_suggestions, "CALC_TOTAL"),
-                "MySQL-family executable fallback lost procedure/function candidates at `{sql}` {db:?}: {final_suggestions:?}"
+                "MySQL-family executable metadata lost procedure/function candidates at `{sql}` {db:?}: {final_suggestions:?}"
             );
             for leaked in [
                 "HR_PKG",
@@ -73224,7 +72904,7 @@ fn mysql_family_untyped_qualified_members_exclude_oracle_only_fallback_families(
             ] {
                 assert!(
                     !contains(&final_suggestions, leaked),
-                    "{leaked} leaked through MySQL-family untyped qualified executable fallback at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+                    "{leaked} leaked through MySQL-family qualified executable metadata at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
                 );
             }
         }
@@ -73237,18 +72917,12 @@ fn mysql_family_untyped_qualified_members_exclude_oracle_only_fallback_families(
             assert_eq!(
                 kind,
                 Some(ExpectedObjectSuggestionKind::Executable),
-                "MySQL-family untyped executable fallback resolved wrong kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+                "MySQL-family untyped executable slot resolved wrong kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
             );
             assert!(
-                contains(&final_suggestions, "CUSTOM_PROC"),
-                "MySQL-family untyped executable fallback should keep unknown routine-like members at `{sql}` {db:?}: {final_suggestions:?}"
+                final_suggestions.is_empty(),
+                "MySQL-family untyped executable members require scoped kind metadata at `{sql}` {db:?}: {final_suggestions:?}"
             );
-            for leaked in ["HR_PKG", "ADDRESS_T", "EMP"] {
-                assert!(
-                    !contains(&final_suggestions, leaked),
-                    "{leaked} leaked through MySQL-family untyped executable fallback at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
-                );
-            }
         }
     }
 }
@@ -81853,7 +81527,7 @@ fn schema_qualified_column_slot_yields_only_relation_columns() {
         data.users = vec!["SCOTT".to_string()];
         data.rebuild_indices();
         data.set_columns_for_table(
-            "EMP",
+            "SCOTT.EMP",
             vec!["EMPNO".to_string(), "ENAME".to_string(), "SAL".to_string()],
         );
         data.set_columns_for_table("DEPT", vec!["DNAME".to_string()]);
@@ -82354,7 +82028,7 @@ fn completion_replacement_range_anchors_to_word_when_range_drifts_inside_word() 
 
 /// The word-anchoring guard must not disturb the already-correct paths: a
 /// qualified member slot (`a.pr|`), the zero-length forward-identifier range, and
-/// the no-range fallback all keep their existing behavior.
+/// the no-range behavior all keep their existing semantics.
 #[test]
 fn completion_replacement_range_preserves_aligned_and_empty_cases() {
     // Qualified member: range already equals the word bounds → unchanged.
@@ -85523,9 +85197,49 @@ fn mysql_family_fixture_completion_case_failures(
         let mut data = mysql_test_intellisense_data(file_name);
         let suggestions = query_completion_suggestions_with_data(&marked, db_type, true, &mut data);
         if !has(&suggestions, expected) {
+            let debug_cursor = marked.find("__CODEX_CURSOR__").unwrap_or_default();
+            let debug_sql = marked.replacen("__CODEX_CURSOR__", "", 1);
+            let (routine_cache, expanded) =
+                SqlEditorWidget::build_routine_symbol_cache_bundle_for_test_for_db_type(
+                    &debug_sql,
+                    debug_cursor,
+                    Some(db_type),
+                );
+            let analysis = SqlEditorWidget::build_intellisense_analysis_from_routine_cache(
+                &routine_cache,
+                expanded.cursor_in_statement,
+            );
+            let deep_ctx = analysis.context.clone();
+            let (debug_prefix, _, _) =
+                crate::ui::intellisense::get_word_at_cursor(&debug_sql, debug_cursor);
+            let debug_keywords =
+                SqlEditorWidget::collect_expected_keyword_suggestions_with_expression_context(
+                    &debug_prefix,
+                    &deep_ctx,
+                    Some(db_type),
+                    None,
+                );
+            let debug_before = SqlEditorWidget::expected_catalog_keyword_before_current_identifier(
+                &debug_prefix,
+                &deep_ctx,
+                Some(db_type),
+                SqlEditorWidget::expression_keyword_context(
+                    &deep_ctx,
+                    &data,
+                    &[],
+                    !debug_prefix.is_empty(),
+                    Some(db_type),
+                ),
+            );
+            let debug_structural = SqlEditorWidget::mysql_family_structural_keyword_inference(
+                &debug_prefix,
+                &deep_ctx,
+                Some(db_type),
+            );
             failures.push(format!(
-                "`{expected}` missing for `{}` in {db_type:?} {file_name}: {suggestions:?}",
-                replacement.replace('\n', " ")
+                "`{expected}` missing for `{}` in {db_type:?} {file_name}: prefix={debug_prefix:?} phase={:?} keywords={debug_keywords:?} before={debug_before:?} structural={debug_structural:?} suggestions={suggestions:?}",
+                replacement.replace('\n', " "),
+                deep_ctx.phase,
             ));
         }
     }
@@ -88062,7 +87776,7 @@ END deep_pkg;"#;
 
 /// Schemas are valid qualifier heads inside expressions (`v := scott.pkg.fn`),
 /// so a schema/user name must surface at assignment/condition/call-argument
-/// operand slots and (via the full-catalog tail) in a select list — the
+/// operand slots and in a select list — the
 /// reported "변수 할당 뒤에 스키마 추천이 안 뜸" class.
 #[test]
 fn schemas_are_offered_as_expression_qualifier_heads() {
@@ -88099,17 +87813,18 @@ fn schemas_are_offered_as_expression_qualifier_heads() {
         "schemas missing from the empty-prefix operand pool: {operand:?}"
     );
 
-    // Select-list identifier slot reaches schemas through the catalog tail.
+    // Select-list expression start includes schema qualifier heads as a
+    // context-valid source, without widening to unrelated catalog families.
     let (_kind, _keywords, select_list) =
-        audit_final_suggestions_with_safety_net_for("SELECT sco| FROM emp", Oracle);
+        audit_final_suggestions_for("SELECT sco| FROM emp", Oracle);
     assert!(
         contains(&select_list, "SCOTT"),
-        "schema missing from the select-list catalog tail: {select_list:?}"
+        "schema missing from the select-list qualifier-head source: {select_list:?}"
     );
 
     // Schemas stay out where they are not grammatical: after a complete operand.
     let (_kind, _keywords, after_operand) =
-        audit_final_suggestions_with_safety_net_for("BEGIN v := 'x' sco| END;", Oracle);
+        audit_final_suggestions_for("BEGIN v := 'x' sco| END;", Oracle);
     assert!(
         !contains(&after_operand, "SCOTT"),
         "schema offered right after a complete operand: {after_operand:?}"

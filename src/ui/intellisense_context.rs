@@ -2917,7 +2917,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
         // A relation reference can consume its trailing alias in one step (`he a`
         // parsed together), advancing `idx` from before the cursor to past it; an
         // exact `idx == cursor_token_len` check would skip the snapshot there and
-        // fall through to the post-loop fallback, which reflects the phase at
+        // fall through to the post-loop phase resolution, which reflects the phase at
         // end-of-statement (e.g. `JoinCondition` for a trailing `… ON`) rather
         // than the cursor's `FromClause`. `>=` captures the phase as it stood
         // before the straddling token was processed.
@@ -7165,42 +7165,31 @@ fn filter_visible_scope_entries_declared_before_cursor_with_pos(
         .collect()
 }
 
-/// Resolve which tables are relevant for a given qualifier (alias or table name).
+/// Resolve a qualifier only against row sources visible in the current scope.
 pub fn resolve_qualifier_tables(
     qualifier: &str,
     tables_in_scope: &[ScopedTableRef],
 ) -> Vec<String> {
-    fn update_match_if_deeper(
-        slot: &mut Option<(usize, String)>,
-        candidate_depth: usize,
-        candidate_name: &str,
-    ) {
-        if slot
-            .as_ref()
-            .is_none_or(|(depth, _)| candidate_depth >= *depth)
-        {
-            *slot = Some((candidate_depth, candidate_name.to_string()));
-        }
-    }
-
-    fn push_first_unique(
-        seen: &mut HashSet<String>,
-        candidate: Option<(usize, String)>,
-    ) -> Option<Vec<String>> {
-        if let Some((_, name)) = candidate {
-            let normalized = name.to_ascii_uppercase();
-            if seen.insert(normalized) {
-                return Some(vec![name]);
-            }
-        }
-        None
+    fn unique_deepest_match(candidates: &[(usize, String)]) -> Vec<String> {
+        let Some(max_depth) = candidates.iter().map(|(depth, _)| *depth).max() else {
+            return Vec::new();
+        };
+        let mut deepest = candidates
+            .iter()
+            .filter(|(depth, _)| *depth == max_depth)
+            .map(|(_, name)| name.clone())
+            .collect::<Vec<_>>();
+        deepest.sort_by_key(|name| normalize_identifier_for_lookup(name));
+        deepest.dedup_by(|left, right| {
+            normalize_identifier_for_lookup(left) == normalize_identifier_for_lookup(right)
+        });
+        (deepest.len() == 1).then_some(deepest).unwrap_or_default()
     }
 
     let qualifier_upper = normalize_identifier_for_lookup(qualifier);
-    let mut alias_match: Option<(usize, String)> = None;
-    let mut name_match: Option<(usize, String)> = None;
-    let mut short_name_match: Option<(usize, String)> = None;
-    let mut seen = HashSet::new();
+    let mut alias_matches = Vec::new();
+    let mut name_matches = Vec::new();
+    let mut short_name_matches = Vec::new();
 
     for table_ref in tables_in_scope {
         let name_upper = normalize_identifier_for_lookup(&table_ref.name);
@@ -7210,43 +7199,32 @@ pub fn resolve_qualifier_tables(
             .map(|a| normalize_identifier_for_lookup(a));
 
         if alias_upper.as_deref() == Some(qualifier_upper.as_str()) {
-            update_match_if_deeper(&mut alias_match, table_ref.depth, &table_ref.name);
+            alias_matches.push((table_ref.depth, table_ref.name.clone()));
             continue;
         }
 
         if name_upper == qualifier_upper {
-            update_match_if_deeper(&mut name_match, table_ref.depth, &table_ref.name);
+            name_matches.push((table_ref.depth, table_ref.name.clone()));
             continue;
         }
 
         if last_identifier_part_for_lookup(&table_ref.name)
             .is_some_and(|short| short.eq_ignore_ascii_case(&qualifier_upper))
         {
-            update_match_if_deeper(&mut short_name_match, table_ref.depth, &table_ref.name);
+            short_name_matches.push((table_ref.depth, table_ref.name.clone()));
         }
     }
 
-    if let Some(result) = push_first_unique(&mut seen, alias_match) {
-        return result;
+    if !alias_matches.is_empty() {
+        return unique_deepest_match(&alias_matches);
     }
 
-    if let Some(result) = push_first_unique(&mut seen, name_match) {
-        return result;
+    if !name_matches.is_empty() {
+        return unique_deepest_match(&name_matches);
     }
 
-    if let Some(result) = push_first_unique(&mut seen, short_name_match) {
-        return result;
-    }
-
-    // If no match found, try the qualifier as a direct table name
-    let qualifier_parts = split_identifier_parts_for_lookup(qualifier);
-    let normalized = if qualifier_parts.is_empty() {
-        strip_identifier_quotes(qualifier)
-    } else {
-        qualifier_parts.join(".")
-    };
-    if seen.insert(normalized.to_ascii_uppercase()) {
-        return vec![normalized];
+    if !short_name_matches.is_empty() {
+        return unique_deepest_match(&short_name_matches);
     }
 
     Vec::new()
@@ -11697,7 +11675,7 @@ fn extract_incomplete_qualified_item_prefix(item_tokens: &[&SqlToken]) -> Option
     }
 
     // `qualifier.column` is a complete reference and should not be treated as
-    // an incomplete prefix for fallback inference.
+    // an incomplete prefix for structural inference.
     if let Some(SqlToken::Word(word)) = meaningful.get(2).copied() {
         if is_identifier_word_token(word) {
             return None;

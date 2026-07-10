@@ -3188,6 +3188,26 @@ fn resolve_qualifier_by_unqualified_name_for_schema_qualified_table() {
 }
 
 #[test]
+fn resolve_qualifier_rejects_ambiguous_same_depth_short_names() {
+    let tables = vec![
+        ScopedTableRef {
+            name: "hr.employees".to_string(),
+            alias: None,
+            depth: 0,
+            is_cte: false,
+        },
+        ScopedTableRef {
+            name: "sales.employees".to_string(),
+            alias: None,
+            depth: 0,
+            is_cte: false,
+        },
+    ];
+
+    assert!(resolve_qualifier_tables("employees", &tables).is_empty());
+}
+
+#[test]
 fn resolve_qualifier_case_insensitive() {
     let tables = vec![ScopedTableRef {
         name: "EMPLOYEES".to_string(),
@@ -3200,7 +3220,7 @@ fn resolve_qualifier_case_insensitive() {
 }
 
 #[test]
-fn resolve_qualifier_unknown_falls_back() {
+fn resolve_qualifier_unknown_stays_unresolved() {
     let tables = vec![ScopedTableRef {
         name: "employees".to_string(),
         alias: Some("e".to_string()),
@@ -3208,7 +3228,7 @@ fn resolve_qualifier_unknown_falls_back() {
         is_cte: false,
     }];
     let result = resolve_qualifier_tables("unknown", &tables);
-    assert_eq!(result, vec!["unknown"]);
+    assert!(result.is_empty());
 }
 
 #[test]

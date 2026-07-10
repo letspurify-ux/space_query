@@ -895,8 +895,6 @@ pub struct IntellisenseData {
     relation_member_entries_by_qualifier: HashMap<String, Vec<NameEntry>>,
     collection_element_type_by_type: HashMap<String, String>,
     synonym_target_by_synonym: HashMap<String, String>,
-    all_columns_entries: Vec<NameEntry>,
-    all_columns_dirty: bool,
     relations_upper: HashSet<String>,
     /// Names of virtual tables (CTEs, subquery aliases) whose columns were
     /// derived from SQL text rather than database metadata.
@@ -985,8 +983,6 @@ impl IntellisenseData {
             relation_member_entries_by_qualifier: HashMap::new(),
             collection_element_type_by_type: HashMap::new(),
             synonym_target_by_synonym: HashMap::new(),
-            all_columns_entries: Vec::new(),
-            all_columns_dirty: false,
             relations_upper: HashSet::new(),
             virtual_table_keys: HashSet::new(),
             column_meta_by_table: HashMap::new(),
@@ -1096,7 +1092,6 @@ impl IntellisenseData {
                 &prefix_upper,
                 prefix,
                 column_tables,
-                false,
                 &mut suggestions,
                 &mut seen,
             );
@@ -1174,8 +1169,11 @@ impl IntellisenseData {
             );
         }
 
-        // Add tables/views in non-table context after language items.
-        if !prefer_relations {
+        // A relation name is not a free expression operand. Visible relation
+        // names and aliases are supplied separately from the parsed query
+        // scope; adding the global relation catalog here would let unrelated
+        // schemas/tables leak into SELECT/WHERE/etc. expression completion.
+        if !prefer_relations && !prefer_columns {
             if Self::push_matching_entries(
                 &self.table_entries,
                 &prefix_upper,
@@ -1378,7 +1376,6 @@ impl IntellisenseData {
                 &prefix_upper,
                 prefix,
                 column_tables,
-                false,
                 &mut suggestions,
                 &mut seen,
             );
@@ -1661,7 +1658,6 @@ impl IntellisenseData {
             &prefix_upper,
             prefix,
             column_tables,
-            true,
             &mut suggestions,
             &mut seen,
         );
@@ -1762,8 +1758,14 @@ impl IntellisenseData {
     }
 
     pub fn has_members_for_qualifier(&self, qualifier: &str, relation_only: bool) -> bool {
-        self.member_entries_for_qualifier(qualifier, relation_only)
-            .is_some_and(|entries| !entries.is_empty())
+        let keys = Self::qualifier_lookup_keys(qualifier);
+        let source = if relation_only {
+            &self.relation_member_entries_by_qualifier
+        } else {
+            &self.member_entries_by_qualifier
+        };
+        keys.iter()
+            .any(|key| source.get(key).is_some_and(|entries| !entries.is_empty()))
     }
 
     pub fn qualifier_relation_member_matches(&self, qualifier: &str, candidate: &str) -> bool {
@@ -1889,6 +1891,14 @@ impl IntellisenseData {
         }
 
         false
+    }
+
+    pub fn qualifier_has_member_kind_metadata(&self, qualifier: &str) -> bool {
+        Self::qualifier_lookup_keys(qualifier).iter().any(|key| {
+            self.member_kinds_by_qualifier
+                .get(key)
+                .is_some_and(|members| !members.is_empty())
+        })
     }
 
     pub fn qualifier_member_name_matching_kinds(
@@ -2274,45 +2284,9 @@ impl IntellisenseData {
         }
     }
 
-    fn has_unquoted_relation_dot(table: &str) -> bool {
-        let mut active_quote = None;
-        let mut chars = table.trim().chars().peekable();
-
-        while let Some(ch) = chars.next() {
-            if let Some(delimiter) = active_quote {
-                if ch == delimiter {
-                    if chars.peek() == Some(&delimiter) {
-                        chars.next();
-                    } else {
-                        active_quote = None;
-                    }
-                }
-                continue;
-            }
-
-            match ch {
-                '"' | '`' => active_quote = Some(ch),
-                '[' => active_quote = Some(']'),
-                '.' => return true,
-                _ => {}
-            }
-        }
-
-        false
-    }
-
     fn relation_lookup_exact_key(table: &str) -> Option<String> {
         let segments = Self::relation_lookup_segments(table)?;
         Some(segments.join(".").to_ascii_uppercase())
-    }
-
-    fn relation_lookup_short_key(table: &str) -> Option<String> {
-        if !Self::has_unquoted_relation_dot(table) {
-            return None;
-        }
-        Self::relation_lookup_segments(table)?
-            .last()
-            .map(|segment| segment.to_ascii_uppercase())
     }
 
     fn default_qualified_relation_key(&self, table: &str) -> Option<String> {
@@ -2344,11 +2318,6 @@ impl IntellisenseData {
                 return Some(entries);
             }
         }
-        if let Some(short) = Self::relation_lookup_short_key(table) {
-            if short != key {
-                return self.column_entries_for_exact_key(&short);
-            }
-        }
         None
     }
 
@@ -2371,50 +2340,25 @@ impl IntellisenseData {
         prefix_upper: &str,
         raw_prefix: &str,
         column_tables: Option<&[String]>,
-        allow_empty_prefix_global: bool,
         suggestions: &mut Vec<String>,
         seen: &mut HashSet<String>,
     ) {
-        match column_tables {
-            Some(tables) if !tables.is_empty() => {
-                for table in tables {
-                    if let Some(cols) = self.column_entries_for_scope_table(table) {
-                        if Self::push_matching_entries(
-                            cols,
-                            prefix_upper,
-                            raw_prefix,
-                            suggestions,
-                            seen,
-                        ) {
-                            break;
-                        }
-                    }
-                }
-                let groups: Vec<&[NameEntry]> = tables
-                    .iter()
-                    .filter_map(|table| self.column_entries_for_scope_table(table))
-                    .collect();
-                Self::append_fuzzy_entries(&groups, prefix_upper, suggestions, seen);
-            }
-            _ => {
-                if allow_empty_prefix_global || !prefix_upper.is_empty() {
-                    self.ensure_all_columns_entries();
-                    let _ = Self::push_matching_entries(
-                        &self.all_columns_entries,
-                        prefix_upper,
-                        raw_prefix,
-                        suggestions,
-                        seen,
-                    );
-                    Self::append_fuzzy_entries(
-                        &[&self.all_columns_entries],
-                        prefix_upper,
-                        suggestions,
-                        seen,
-                    );
+        let Some(tables) = column_tables.filter(|tables| !tables.is_empty()) else {
+            return;
+        };
+
+        for table in tables {
+            if let Some(cols) = self.column_entries_for_scope_table(table) {
+                if Self::push_matching_entries(cols, prefix_upper, raw_prefix, suggestions, seen) {
+                    break;
                 }
             }
         }
+        let groups: Vec<&[NameEntry]> = tables
+            .iter()
+            .filter_map(|table| self.column_entries_for_scope_table(table))
+            .collect();
+        Self::append_fuzzy_entries(&groups, prefix_upper, suggestions, seen);
     }
 
     #[allow(dead_code)]
@@ -2433,13 +2377,6 @@ impl IntellisenseData {
         if let Some(default_key) = self.default_qualified_relation_key(table_name) {
             if let Some(columns) = self.column_names_for_exact_key(&default_key) {
                 return columns;
-            }
-        }
-        if let Some(short) = Self::relation_lookup_short_key(table_name) {
-            if short != key {
-                if let Some(columns) = self.column_names_for_exact_key(&short) {
-                    return columns;
-                }
             }
         }
         Vec::new()
@@ -2478,7 +2415,6 @@ impl IntellisenseData {
         let entries = Self::build_entries(&columns);
         self.columns.insert(key.clone(), columns);
         self.column_entries_by_table.insert(key, entries);
-        self.all_columns_dirty = true;
     }
 
     /// Store display metadata for a table's columns, keyed by normalized
@@ -2496,9 +2432,8 @@ impl IntellisenseData {
         self.column_meta_by_table.insert(key, meta);
     }
 
-    /// Look up display metadata for a single column, resolving the table key
-    /// the same way `get_columns_for_table` does (exact, default-qualified,
-    /// then unqualified short name).
+    /// Look up display metadata for a single column using an exact normalized
+    /// table key, or the verified default qualifier for an unqualified table.
     pub fn get_column_meta(&self, table_name: &str, column_name: &str) -> Option<&ColumnMeta> {
         let column_key = NameEntry::lookup_upper(column_name);
         let table_key = table_name.to_uppercase();
@@ -2529,17 +2464,6 @@ impl IntellisenseData {
                 return Some(meta);
             }
         }
-        if let Some(short) = Self::relation_lookup_short_key(table_name) {
-            if short != table_key {
-                if let Some(meta) = self
-                    .column_meta_by_table
-                    .get(&short)
-                    .and_then(|cols| cols.get(&column_key))
-                {
-                    return Some(meta);
-                }
-            }
-        }
         None
     }
 
@@ -2567,9 +2491,9 @@ impl IntellisenseData {
         self.foreign_keys_loading.remove(&table_key.to_uppercase());
     }
 
-    /// Resolve the stored foreign-key key for a table reference, matching the
-    /// fallbacks used by `get_columns_for_table` (exact, default-qualified,
-    /// then unqualified short name).
+    /// Resolve the stored foreign-key key for a table reference using an exact
+    /// normalized key, or the verified default qualifier for an unqualified
+    /// relation.
     fn resolve_foreign_keys_key(&self, table_name: &str) -> Option<String> {
         let key = table_name.to_uppercase();
         if self.foreign_keys_by_table.contains_key(&key) {
@@ -2583,11 +2507,6 @@ impl IntellisenseData {
         if let Some(default_key) = self.default_qualified_relation_key(table_name) {
             if self.foreign_keys_by_table.contains_key(&default_key) {
                 return Some(default_key);
-            }
-        }
-        if let Some(short) = Self::relation_lookup_short_key(table_name) {
-            if short != key && self.foreign_keys_by_table.contains_key(&short) {
-                return Some(short);
             }
         }
         None
@@ -2849,8 +2768,6 @@ impl IntellisenseData {
                 .insert(table.clone(), Self::build_entries(columns));
         }
         self.virtual_column_entries_by_table.clear();
-        self.all_columns_entries.clear();
-        self.all_columns_dirty = true;
         self.virtual_table_keys.clear();
     }
 
@@ -2861,7 +2778,6 @@ impl IntellisenseData {
         for key in self.virtual_table_keys.drain() {
             self.virtual_column_entries_by_table.remove(&key);
         }
-        self.all_columns_dirty = true;
     }
 
     /// Register columns for a virtual table (CTE or subquery alias).
@@ -2872,13 +2788,11 @@ impl IntellisenseData {
         self.virtual_column_entries_by_table
             .insert(key.clone(), Self::build_entries(&columns));
         self.virtual_table_keys.insert(key);
-        self.all_columns_dirty = true;
     }
 
-    /// Replace all inferred virtual table columns with the provided set.
-    /// Only marks derived indices dirty when an actual change is detected.
+    /// Replace all inferred virtual table columns with the provided set while
+    /// preserving entry vectors whose derived columns have not changed.
     pub fn replace_virtual_table_columns(&mut self, virtual_columns: HashMap<String, Vec<String>>) {
-        let mut changed = false;
         let next_keys: HashSet<String> = virtual_columns
             .keys()
             .map(|name| name.to_uppercase())
@@ -2892,9 +2806,7 @@ impl IntellisenseData {
             .collect();
         for key in stale_keys {
             self.virtual_table_keys.remove(&key);
-            if self.virtual_column_entries_by_table.remove(&key).is_some() {
-                changed = true;
-            }
+            self.virtual_column_entries_by_table.remove(&key);
         }
 
         for (name, columns) in virtual_columns {
@@ -2907,13 +2819,8 @@ impl IntellisenseData {
             if !is_same {
                 self.virtual_column_entries_by_table
                     .insert(key.clone(), entries);
-                changed = true;
             }
             self.virtual_table_keys.insert(key);
-        }
-
-        if changed {
-            self.all_columns_dirty = true;
         }
     }
 
@@ -2967,15 +2874,6 @@ impl IntellisenseData {
                 return Some(entries.as_slice());
             }
         }
-
-        if relation_only {
-            for key in &keys {
-                if let Some(entries) = self.member_entries_by_qualifier.get(key) {
-                    return Some(entries.as_slice());
-                }
-            }
-        }
-
         None
     }
 
@@ -2999,25 +2897,6 @@ impl IntellisenseData {
 
         suggestions.truncate(MAX_SUGGESTIONS);
         suggestions
-    }
-
-    fn ensure_all_columns_entries(&mut self) {
-        if !self.all_columns_dirty {
-            return;
-        }
-        let mut all = Vec::new();
-        for (table, entries) in &self.column_entries_by_table {
-            if !self.virtual_column_entries_by_table.contains_key(table) {
-                all.extend(entries.iter().cloned());
-            }
-        }
-        for entries in self.virtual_column_entries_by_table.values() {
-            all.extend(entries.iter().cloned());
-        }
-        all.sort_by(|a, b| a.upper.cmp(&b.upper).then_with(|| a.name.cmp(&b.name)));
-        all.dedup_by(|a, b| a.upper == b.upper && a.name == b.name);
-        self.all_columns_entries = all;
-        self.all_columns_dirty = false;
     }
 
     fn build_entries(names: &[String]) -> Vec<NameEntry> {
@@ -3114,20 +2993,11 @@ impl IntellisenseData {
     }
 
     fn qualifier_lookup_keys(qualifier: &str) -> Vec<String> {
-        let segments = Self::normalize_qualifier_lookup_segments(qualifier);
-        let normalized = segments.join(".");
+        let normalized = Self::normalize_qualifier_lookup_key(qualifier);
         if normalized.is_empty() {
             return Vec::new();
         }
-
-        let mut keys = vec![normalized];
-        for start in 1..segments.len() {
-            let suffix = segments[start..].join(".");
-            if !keys.iter().any(|key| key == &suffix) {
-                keys.push(suffix);
-            }
-        }
-        keys
+        vec![normalized]
     }
 
     fn push_matching_entries(
@@ -3141,7 +3011,7 @@ impl IntellisenseData {
             return suggestions.len() >= MAX_SUGGESTIONS;
         }
         let start = entries.partition_point(|entry| entry.upper.as_str() < prefix_upper);
-        let allow_plain_fallback_for_quoted_prefix = identifier_quote_delimiter(raw_prefix)
+        let allow_unquoted_candidate_for_quoted_prefix = identifier_quote_delimiter(raw_prefix)
             .is_some()
             && !raw_prefix.is_empty()
             && !entries
@@ -3155,7 +3025,7 @@ impl IntellisenseData {
             }
             let matches_prefix = raw_prefix.is_empty()
                 || suggestion_matches_completion_prefix(&entry.name, raw_prefix)
-                || (allow_plain_fallback_for_quoted_prefix
+                || (allow_unquoted_candidate_for_quoted_prefix
                     && identifier_quote_delimiter(&entry.name).is_none());
             if !matches_prefix {
                 continue;
@@ -5288,7 +5158,7 @@ mod intellisense_tests {
     }
 
     #[test]
-    fn get_suggestions_column_context_empty_prefix_returns_tables_when_columns_missing() {
+    fn get_suggestions_column_context_empty_prefix_stays_empty_when_columns_missing() {
         let mut data = IntellisenseData::new();
         data.tables = vec!["EMP".to_string()];
         data.rebuild_indices();
@@ -5296,10 +5166,7 @@ mod intellisense_tests {
 
         let suggestions = data.get_suggestions("", true, Some(&column_scope), false, true);
 
-        // No columns loaded for EMP and keywords are not added for empty
-        // prefix, but table names are still returned.
-        assert!(suggestions.contains(&"EMP".to_string()));
-        assert!(!suggestions.contains(&"SELECT".to_string()));
+        assert!(suggestions.is_empty());
     }
 
     #[test]
@@ -5347,6 +5214,19 @@ mod intellisense_tests {
             .get_column_suggestions("deptid", Some(&scope))
             .iter()
             .any(|s| s.eq_ignore_ascii_case("DEPARTMENT_ID")));
+    }
+
+    #[test]
+    fn column_suggestions_require_an_explicit_non_empty_scope() {
+        let mut data = IntellisenseData::new();
+        data.set_columns_for_table("EMP", vec!["EMPLOYEE_ID".into()]);
+
+        assert!(data.get_column_suggestions("emp", None).is_empty());
+        assert!(data.get_column_suggestions("emp", Some(&[])).is_empty());
+        assert_eq!(
+            data.get_column_suggestions("emp", Some(&["EMP".into()])),
+            vec!["EMPLOYEE_ID".to_string()]
+        );
     }
 
     #[test]
@@ -6508,12 +6388,12 @@ BEGIN
     }
 
     #[test]
-    fn get_columns_for_table_falls_back_to_unqualified_cache_key() {
+    fn qualified_table_does_not_reuse_unqualified_column_cache_key() {
         let mut data = IntellisenseData::new();
         data.set_columns_for_table("EMP", vec!["EMPNO".to_string()]);
 
         let columns = data.get_columns_for_table("SCOTT.EMP");
-        assert_eq!(columns, vec!["EMPNO".to_string()]);
+        assert!(columns.is_empty());
     }
 
     #[test]
@@ -6552,7 +6432,7 @@ BEGIN
     }
 
     #[test]
-    fn get_columns_for_table_does_not_default_fallback_for_quoted_dotted_name() {
+    fn quoted_dotted_table_does_not_use_default_qualifier() {
         let mut data = IntellisenseData::new();
         data.set_default_qualifier(Some("SCOTT".to_string()));
         data.set_relation_members_for_qualifier("SCOTT", vec!["B".to_string()]);
@@ -6564,7 +6444,7 @@ BEGIN
     }
 
     #[test]
-    fn get_columns_for_table_does_not_default_fallback_for_bracket_dotted_name() {
+    fn bracket_dotted_table_does_not_use_default_qualifier() {
         let mut data = IntellisenseData::new();
         data.set_default_qualifier(Some("SCOTT".to_string()));
         data.set_relation_members_for_qualifier("SCOTT", vec!["B".to_string()]);
@@ -6651,7 +6531,7 @@ BEGIN
     }
 
     #[test]
-    fn get_column_suggestions_scope_falls_back_to_unqualified_table_cache_key() {
+    fn qualified_column_scope_does_not_reuse_unqualified_table_cache_key() {
         let mut data = IntellisenseData::new();
         data.tables = vec!["HELP".to_string()];
         data.rebuild_indices();
@@ -6660,13 +6540,7 @@ BEGIN
         let scope = vec!["SCOTT.HELP".to_string()];
         let suggestions = data.get_column_suggestions("", Some(scope.as_slice()));
 
-        assert!(
-            suggestions
-                .iter()
-                .any(|name| name.eq_ignore_ascii_case("TOPIC")),
-            "expected schema-qualified scope to reuse unqualified cached columns, got: {:?}",
-            suggestions
-        );
+        assert!(suggestions.is_empty(), "suggestions: {suggestions:?}");
     }
 
     #[test]
@@ -7025,9 +6899,7 @@ BEGIN
             Some(crate::db::DatabaseType::Oracle),
         );
 
-        for expected in [
-            "EMP_TBL", "EMP_VIEW", "EMP_FUNC", "EMP_PKG", "EMP_SEQ", "EMP_TYP",
-        ] {
+        for expected in ["EMP_FUNC", "EMP_PKG", "EMP_SEQ", "EMP_TYP"] {
             assert!(
                 suggestions.iter().any(|name| name == expected),
                 "expression context should still offer `{expected}`, got {suggestions:?}"
@@ -7035,6 +6907,8 @@ BEGIN
         }
 
         for excluded in [
+            "EMP_TBL",
+            "EMP_VIEW",
             "EMP_TRG",
             "EMP_EVT",
             "EMP_IDX",
@@ -7218,7 +7092,7 @@ BEGIN
             !column.iter().any(|s| s == "EMP_PROC"),
             "expression context must not offer a standalone procedure: {column:?}"
         );
-        for kept in ["EMP", "EMP_FN", "EMP_PKG", "EMP_SEQ"] {
+        for kept in ["EMP_FN", "EMP_PKG", "EMP_SEQ"] {
             assert!(
                 column.iter().any(|s| s == kept),
                 "expression context should still offer `{kept}`: {column:?}"
@@ -7406,6 +7280,32 @@ BEGIN
     }
 
     #[test]
+    fn relation_member_suggestions_require_a_scoped_relation_cache() {
+        let mut data = IntellisenseData::new();
+        data.set_members_for_qualifier("SCOTT", vec!["EMP".to_string(), "RUN_JOB".to_string()]);
+
+        assert!(data.get_member_suggestions("SCOTT", "", true).is_empty());
+    }
+
+    #[test]
+    fn expression_suggestions_do_not_include_global_relations() {
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["EMP".to_string(), "HELP".to_string()];
+        data.set_columns_for_table("HELP", vec!["TOPIC".to_string()]);
+        data.rebuild_indices();
+
+        let scope = ["HELP".to_string()];
+        let suggestions = data.get_suggestions_for_db("emp", true, Some(&scope), false, true, None);
+
+        for leaked in ["EMP", "HELP", "TOPIC"] {
+            assert!(
+                !suggestions.iter().any(|item| item == leaked),
+                "global relation/column `{leaked}` leaked into HELP scope: {suggestions:?}"
+            );
+        }
+    }
+
+    #[test]
     fn get_member_suggestions_match_quoted_schema_qualifier() {
         let mut data = IntellisenseData::new();
         data.set_members_for_qualifier("SCOTT", vec!["EMP".to_string(), "EMP_API".to_string()]);
@@ -7483,7 +7383,7 @@ BEGIN
     }
 
     #[test]
-    fn get_member_suggestions_do_not_fallback_from_quoted_dotted_qualifier_suffix() {
+    fn quoted_dotted_qualifier_requires_an_exact_member_cache() {
         let mut data = IntellisenseData::new();
         data.set_members_for_qualifier("B", vec!["LEAK".to_string()]);
         data.set_relation_members_for_qualifier("B", vec!["LEAK_TABLE".to_string()]);
@@ -7541,7 +7441,7 @@ BEGIN
     }
 
     #[test]
-    fn get_member_suggestions_fallback_to_dotted_object_suffix() {
+    fn member_suggestions_require_the_exact_dotted_qualifier() {
         let mut data = IntellisenseData::new();
         data.set_members_for_qualifier(
             "ORDER.HEADER",
@@ -7550,11 +7450,11 @@ BEGIN
 
         let suggestions = data.get_member_suggestions("sales.Order.Header", "LINE", false);
 
-        assert_eq!(suggestions, vec!["LINE_ID".to_string()]);
+        assert!(suggestions.is_empty());
     }
 
     #[test]
-    fn get_relation_member_suggestions_fallback_to_dotted_object_suffix() {
+    fn relation_member_suggestions_require_the_exact_dotted_qualifier() {
         let mut data = IntellisenseData::new();
         data.set_relation_members_for_qualifier(
             "ORDER.HEADER",
@@ -7563,7 +7463,7 @@ BEGIN
 
         let suggestions = data.get_member_suggestions("sales.Order.Header", "LINE", true);
 
-        assert_eq!(suggestions, vec!["LINE_ITEMS".to_string()]);
+        assert!(suggestions.is_empty());
     }
 
     #[test]
