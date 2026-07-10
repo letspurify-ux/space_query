@@ -2740,6 +2740,47 @@ impl SqlEditorWidget {
         } else {
             Vec::new()
         };
+        let early_cte_relation_suggestions = if qualifier.is_none()
+            && deep_ctx.phase.is_table_context()
+        {
+            Self::collect_context_name_suggestions(
+                &snapshot.prefix,
+                deep_ctx,
+                SqlContext::TableName,
+            )
+        } else {
+            Vec::new()
+        };
+        let cursor_in_statement = snapshot
+            .cursor_pos_usize
+            .saturating_sub(analysis.statement_start)
+            .min(
+                analysis
+                    .statement_end
+                    .saturating_sub(analysis.statement_start),
+            );
+        let local_record_member_suggestions = qualifier.and_then(|qualifier| {
+            Self::collect_local_record_member_suggestions(
+                qualifier,
+                &snapshot.prefix,
+                cursor_in_statement,
+                snapshot.raw_qualifier.as_deref(),
+                analysis,
+            )
+        });
+        let early_own_type_body_member_suggestions = if qualifier.is_none() {
+            let mut data = intellisense_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Self::own_oracle_type_body_member_suggestions(
+                &mut data,
+                &snapshot.prefix,
+                deep_ctx,
+                Some(snapshot.preferred_db_type),
+            )
+        } else {
+            Vec::new()
+        };
         // An alias declaration (`t AS x` / `t x` / `[x]`) or a DDL new-name /
         // data-type slot (`ALTER TABLE t ADD col …`, `RENAME … TO new`) names a
         // brand-new identifier; offering keywords, columns or relations there is
@@ -2842,6 +2883,11 @@ impl SqlEditorWidget {
             && early_expected_keyword_suggestions.is_empty()
             && early_structural_keyword_before_current_identifier.is_none()
             && early_model_identifier_suggestions.is_empty()
+            && early_cte_relation_suggestions.is_empty()
+            && early_own_type_body_member_suggestions.is_empty()
+            && local_record_member_suggestions
+                .as_ref()
+                .is_none_or(Vec::is_empty)
             && mysql_named_value_suggestions.is_empty()
             && !at_mysql_user_variable_name_slot
             && Self::exact_catalog_keyword_for_prefix(
@@ -2934,23 +2980,6 @@ impl SqlEditorWidget {
         // identifier — a user-defined TYPE object (`CAST(x AS my_type)`,
         // `col my_type`). It is handled specially below so types survive while
         // every other identifier source is still suppressed.
-        let cursor_in_statement = snapshot
-            .cursor_pos_usize
-            .saturating_sub(analysis.statement_start)
-            .min(
-                analysis
-                    .statement_end
-                    .saturating_sub(analysis.statement_start),
-            );
-        let local_record_member_suggestions = qualifier.and_then(|qualifier| {
-            Self::collect_local_record_member_suggestions(
-                qualifier,
-                &snapshot.prefix,
-                cursor_in_statement,
-                snapshot.raw_qualifier.as_deref(),
-                analysis,
-            )
-        });
         let outer_cursor_for_loop_qualifier = qualifier.map(str::to_string).or_else(|| {
             Self::qualifier_before_prefix_at_text_end(&snapshot.signature_scan_text, &snapshot.prefix)
         });
@@ -4132,6 +4161,24 @@ impl SqlEditorWidget {
                 true,
             )
         };
+        let suggestions = if early_cte_relation_suggestions.is_empty() {
+            suggestions
+        } else {
+            Self::merge_suggestions_with_context_aliases(
+                suggestions,
+                early_cte_relation_suggestions,
+                true,
+            )
+        };
+        let suggestions = if early_own_type_body_member_suggestions.is_empty() {
+            suggestions
+        } else {
+            Self::merge_suggestions_with_context_aliases(
+                suggestions,
+                early_own_type_body_member_suggestions,
+                true,
+            )
+        };
         let suggestions = if signature_argument_suggestions.is_empty() {
             suggestions
         } else {
@@ -5177,8 +5224,10 @@ impl SqlEditorWidget {
                     upper.as_str(),
                     "AS" | "AND"
                         | "ANY"
+                        | "BETWEEN"
                         | "BEGIN"
                         | "BY"
+                        | "CASE"
                         | "COMPOUND"
                         | "CONNECT"
                         | "CONNECT BY"
@@ -5187,6 +5236,8 @@ impl SqlEditorWidget {
                         | "CV"
                         | "DAY"
                         | "DEFINE"
+                        | "DESC"
+                        | "ELSE"
                         | "END"
                         | "EXCEPTION"
                         | "EXIT"
@@ -5197,6 +5248,7 @@ impl SqlEditorWidget {
                         | "HAVING"
                         | "IN"
                         | "INDICES"
+                        | "IMMEDIATE"
                         | "INSERT"
                         | "INSERTING"
                         | "INTO"
@@ -5217,7 +5269,9 @@ impl SqlEditorWidget {
                         | "OF"
                         | "ON"
                         | "ONE"
+                        | "OR"
                         | "ORDER BY"
+                        | "OTHERS"
                         | "OUTER APPLY"
                         | "OVER"
                         | "OFFSET"
@@ -5227,6 +5281,7 @@ impl SqlEditorWidget {
                         | "PER"
                         | "PREV"
                         | "PROCEDURE"
+                        | "RAISE"
                         | "RETURN"
                         | "RETURNING"
                         | "ROW"
@@ -5235,11 +5290,15 @@ impl SqlEditorWidget {
                         | "SIBLINGS"
                         | "SQL"
                         | "SQLCODE"
+                        | "SQLERRM"
                         | "STATEMENT"
+                        | "STORE"
                         | "USING"
                         | "SYSTIMESTAMP"
                         | "TABLE"
+                        | "THEN"
                         | "TRANSACTION"
+                        | "TRUE"
                         | "UPDATE"
                         | "UPDATING"
                         | "VALUES"
@@ -5443,10 +5502,10 @@ impl SqlEditorWidget {
             crate::ui::intellisense::suggestion_matches_completion_prefix(keyword, prefix)
         };
         let statement_tokens = deep_ctx.statement_tokens.as_ref();
-        let full_end = Self::expected_suggestion_context_end(
+        let full_end = Self::expected_keyword_suggestion_context_end(
             statement_tokens,
             deep_ctx.cursor_token_len,
-            !prefix.is_empty(),
+            prefix,
         );
         let (tokens, end) = if let Some(range) = Self::current_routine_body_statement_range(deep_ctx)
         {
@@ -5464,6 +5523,14 @@ impl SqlEditorWidget {
         let words = Self::words_for_plsql_statement_slot(tokens, end);
         let last = words.last().map(String::as_str);
         let has = |keyword: &str| words.iter().any(|word| word == keyword);
+        let query_tokens = Self::current_query_tokens(deep_ctx);
+        let query_end = Self::expected_keyword_suggestion_context_end(
+            query_tokens,
+            Self::cursor_token_len_in_current_query(deep_ctx),
+            prefix,
+        );
+        let query_words = Self::words_for_keyword_slot(query_tokens, query_end);
+        let query_has = |keyword: &str| query_words.iter().any(|word| word == keyword);
         let full_words = Self::words_for_keyword_slot(statement_tokens, full_end);
         let segment_start = statement_tokens
             .get(..full_end)
@@ -5558,6 +5625,108 @@ impl SqlEditorWidget {
         {
             return Some("EXCEPTION".to_string());
         }
+        if matches_prefix("EXCEPTION")
+            && Self::current_meaningful_word_is_followed_by_word(
+                statement_tokens,
+                full_end,
+                &["WHEN"],
+            )
+            && full_words
+                .iter()
+                .any(|word| word == "CREATE" || word == "DECLARE")
+        {
+            return Some("EXCEPTION".to_string());
+        }
+
+        if matches_prefix("INSERTING")
+            && Self::current_meaningful_word_is_followed_by_word(
+                statement_tokens,
+                full_end,
+                &["THEN"],
+            )
+            && full_words.iter().any(|word| word == "TRIGGER")
+        {
+            return Some("INSERTING".to_string());
+        }
+        if matches_prefix("UPDATING")
+            && Self::current_meaningful_word_is_followed_by_word(
+                statement_tokens,
+                full_end,
+                &["THEN"],
+            )
+            && full_words.iter().any(|word| word == "TRIGGER")
+        {
+            return Some("UPDATING".to_string());
+        }
+        if matches_prefix("THEN")
+            && ((has("IF") || has("WHEN") || has("ELSIF"))
+                || (full_words.iter().any(|word| word == "CASE")
+                    && full_words.iter().any(|word| word == "WHEN")))
+        {
+            return Some("THEN".to_string());
+        }
+        if matches_prefix("ELSE")
+            && (has("CASE") || full_words.iter().any(|word| word == "CASE"))
+            && Self::current_meaningful_word_is_followed_by_word(
+                statement_tokens,
+                full_end,
+                &["END"],
+            )
+        {
+            return Some("ELSE".to_string());
+        }
+        if matches_prefix("CASE")
+            && Self::current_meaningful_word_is_followed_by_word(
+                statement_tokens,
+                full_end,
+                &["MOD", "WHEN"],
+            )
+        {
+            return Some("CASE".to_string());
+        }
+        if matches_prefix("WHEN")
+            && Self::current_meaningful_word_is_followed_by_word(
+                statement_tokens,
+                full_end,
+                &["MATCHED", "OTHERS"],
+            )
+        {
+            return Some("WHEN".to_string());
+        }
+        if matches_prefix("WHEN")
+            && Self::cursor_is_inside_unclosed_case(statement_tokens, full_end)
+        {
+            return Some("WHEN".to_string());
+        }
+        if matches_prefix("OTHERS") && full_previous_word.as_deref() == Some("WHEN") {
+            return Some("OTHERS".to_string());
+        }
+        if matches_prefix("RAISE")
+            && Self::current_meaningful_word_is_followed_by_symbol(
+                statement_tokens,
+                full_end,
+                ";",
+            )
+            && (Self::cursor_in_plsql_executable_block(tokens, end)
+                || Self::cursor_in_plsql_executable_block(statement_tokens, full_end))
+        {
+            return Some("RAISE".to_string());
+        }
+        if matches_prefix("IMMEDIATE")
+            && (full_previous_word.as_deref() == Some("EXECUTE") || has("EXECUTE"))
+            && matches!(
+                Self::next_meaningful_word_after(statement_tokens, full_end).as_deref(),
+                Some(_)
+            )
+        {
+            return Some("IMMEDIATE".to_string());
+        }
+        if matches_prefix("SQLERRM")
+            && (Self::cursor_in_plsql_executable_block(tokens, end)
+                || Self::cursor_in_plsql_executable_block(statement_tokens, full_end))
+        {
+            return Some("SQLERRM".to_string());
+        }
 
         if matches_prefix("WITH") && full_previous_word.as_deref() == Some("START") {
             return Some("WITH".to_string());
@@ -5628,11 +5797,15 @@ impl SqlEditorWidget {
         }
         if matches_prefix("UNPIVOT")
             && deep_ctx.phase.is_table_context()
-            && Self::current_meaningful_word_is_followed_by_symbol(
+            && (Self::current_meaningful_word_is_followed_by_symbol(
                 statement_tokens,
                 full_end,
                 "(",
-            )
+            ) || Self::current_meaningful_word_is_followed_by_word(
+                statement_tokens,
+                full_end,
+                &["EXCLUDE", "INCLUDE"],
+            ))
         {
             return Some("UNPIVOT".to_string());
         }
@@ -5740,7 +5913,10 @@ impl SqlEditorWidget {
             && (full_previous_word.as_deref() == Some("IS")
                 || (matches!(full_previous_token, Some(SqlToken::Symbol(symbol)) if symbol == "(")
                     && Self::innermost_open_paren_preceding_word(statement_tokens, full_end)
-                        .is_none_or(|word| word.eq_ignore_ascii_case("BY"))))
+                        .is_none_or(|word| {
+                            word.eq_ignore_ascii_case("BY")
+                                || word.eq_ignore_ascii_case("USING")
+                        })))
         {
             return Some("SELECT".to_string());
         }
@@ -5752,14 +5928,81 @@ impl SqlEditorWidget {
             return Some("LEVEL".to_string());
         }
         if matches_prefix("FROM")
-            && segment_has("SELECT")
-            && !segment_has("FROM")
+            && (matches!(deep_ctx.phase, intellisense_context::SqlPhase::SelectList)
+                || (segment_has("SELECT") && !segment_has("FROM")))
             && matches!(
                 Self::next_meaningful_word_after(statement_tokens, full_end).as_deref(),
                 Some(_)
             )
         {
             return Some("FROM".to_string());
+        }
+        if matches_prefix("DESC")
+            && Self::current_meaningful_word_is_followed_by_word(
+                statement_tokens,
+                full_end,
+                &["NULLS"],
+            )
+        {
+            return Some("DESC".to_string());
+        }
+        if matches_prefix("BETWEEN")
+            && deep_ctx.phase.is_column_context()
+            && Self::cursor_immediately_follows_complete_operand(statement_tokens, full_end)
+        {
+            return Some("BETWEEN".to_string());
+        }
+        if matches_prefix("WHERE")
+            && segment_contains("SELECT")
+            && segment_contains("FROM")
+            && !["FETCH", "FOR", "GROUP", "HAVING", "ORDER"]
+                .iter()
+                .any(|keyword| segment_contains(keyword))
+            && matches!(
+                Self::next_meaningful_word_after(statement_tokens, full_end).as_deref(),
+                Some(_)
+            )
+        {
+            return Some("WHERE".to_string());
+        }
+        if matches_prefix("OR")
+            && Self::cursor_is_inside_unclosed_case(statement_tokens, full_end)
+            && Self::cursor_immediately_follows_complete_operand(statement_tokens, full_end)
+        {
+            return Some("OR".to_string());
+        }
+        if matches_prefix("VALUES")
+            && (segment_contains("INSERT") || segment_contains("MERGE"))
+            && Self::current_meaningful_word_is_followed_by_symbol(
+                statement_tokens,
+                full_end,
+                "(",
+            )
+        {
+            return Some("VALUES".to_string());
+        }
+        if matches_prefix("STORE")
+            && full_words.iter().any(|word| word == "CREATE")
+            && full_words.iter().any(|word| word == "TABLE")
+            && full_words.iter().any(|word| word == "LOB")
+            && Self::current_meaningful_word_is_followed_by_word(
+                statement_tokens,
+                full_end,
+                &["AS"],
+            )
+        {
+            return Some("STORE".to_string());
+        }
+        if matches_prefix("TRUE")
+            && Self::current_meaningful_word_is_followed_by_symbol(
+                statement_tokens,
+                full_end,
+                ")",
+            )
+            && (Self::cursor_in_plsql_executable_block(tokens, end)
+                || Self::cursor_in_plsql_executable_block(statement_tokens, full_end))
+        {
+            return Some("TRUE".to_string());
         }
         if matches_prefix("SET")
             && matches!(deep_ctx.phase, intellisense_context::SqlPhase::UpdateTarget)
@@ -5865,14 +6108,20 @@ impl SqlEditorWidget {
         {
             return Some("BY".to_string());
         }
-        if matches_prefix("ON") && has("MERGE") && has("USING") && !has("ON") {
+        if matches_prefix("ON")
+            && ((has("MERGE") && has("USING") && !has("ON"))
+                || (query_has("MERGE") && query_has("USING") && !query_has("ON")))
+        {
             return Some("ON".to_string());
         }
-        if matches_prefix("ON") && has("JOIN") && !has("ON") {
+        if matches_prefix("ON")
+            && ((has("JOIN") && !has("ON")) || (query_has("JOIN") && !query_has("ON")))
+        {
             return Some("ON".to_string());
         }
         if matches_prefix("INTO")
             && (matches!(last, Some("INSERT"))
+                || full_previous_word.as_deref() == Some("MERGE")
                 || (has("SELECT") && !has("FROM"))
                 || has("RETURNING")
                 || (has("EXECUTE") && has("IMMEDIATE") && !has("INTO")))
@@ -26390,15 +26639,20 @@ impl SqlEditorWidget {
                 _ => {}
             }
         }
-        if crate::sql_text::mysql_compatibility_for_sql("", db_type)
-            && words.iter().any(|word| word == "GENERATED")
+        if words.iter().any(|word| word == "GENERATED")
             && words.iter().any(|word| word == "AS")
             && !words
                 .iter()
                 .any(|word| matches!(word.as_str(), "STORED" | "VIRTUAL"))
             && matches!(def.last(), Some(SqlToken::Symbol(symbol)) if symbol == ")")
         {
-            return Some(&["STORED", "VIRTUAL"]);
+            return Some(
+                if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+                    &["STORED", "VIRTUAL"]
+                } else {
+                    &["VIRTUAL"]
+                },
+            );
         }
         // A bare column name with no data type yet (`… (a INT, b |`) is not at a
         // property tail: the data type is expected next, served by the data-type
@@ -26806,8 +27060,8 @@ impl SqlEditorWidget {
         if !oracle_storage_completion_enabled_for_db_type(db_type) {
             return None;
         }
-        let tokens = Self::current_query_tokens(deep_ctx);
-        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let cursor_token_len = deep_ctx.cursor_token_len;
         let end = Self::expected_suggestion_context_end(
             tokens,
             cursor_token_len,
@@ -26816,8 +27070,7 @@ impl SqlEditorWidget {
         let visible_end = end.min(tokens.len());
         let words = Self::previous_meaningful_words_upper(tokens, visible_end, 16);
         let at_lob_column = Self::innermost_open_paren_preceding_word(tokens, visible_end)
-            .is_some_and(|word| word.eq_ignore_ascii_case("LOB"))
-            && !words.iter().any(|word| word == "STORE");
+            .is_some_and(|word| word.eq_ignore_ascii_case("LOB"));
         let at_xmltype_column = matches!(
             words.as_slice(),
             [.., xmltype, column]
@@ -33619,6 +33872,49 @@ impl SqlEditorWidget {
             );
         }
         suggestions
+    }
+
+    fn own_oracle_type_body_member_suggestions(
+        data: &mut crate::ui::intellisense::IntellisenseData,
+        prefix: &str,
+        deep_ctx: &intellisense_context::CursorContext,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Vec<String> {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return Vec::new();
+        }
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            deep_ctx.cursor_token_len,
+            !prefix.is_empty(),
+        );
+        let meaningful = Self::meaningful_tokens_before(tokens, end);
+        let type_name = meaningful.windows(3).find_map(|window| match window {
+            [SqlToken::Word(type_kw), SqlToken::Word(body), SqlToken::Word(name)]
+                if type_kw.eq_ignore_ascii_case("TYPE")
+                    && body.eq_ignore_ascii_case("BODY") =>
+            {
+                Some(name.trim_matches('"').to_string())
+            }
+            _ => None,
+        });
+        let Some(type_name) = type_name else {
+            return Vec::new();
+        };
+        let Some(routine_idx) = meaningful.iter().rposition(|token| {
+            matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("FUNCTION") || word.eq_ignore_ascii_case("PROCEDURE"))
+        }) else {
+            return Vec::new();
+        };
+        if !matches!(
+            meaningful.get(routine_idx.saturating_sub(1)),
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("MEMBER")
+        ) {
+            return Vec::new();
+        }
+
+        data.get_member_suggestions(&type_name, prefix, false)
     }
 
     fn plsql_cursor_parameter_suggestions_from_statement_text(

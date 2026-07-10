@@ -181,6 +181,56 @@ fn collect_create_table_columns(tokens: &[SqlToken], open_idx: usize) -> Vec<Str
     columns
 }
 
+fn collect_oracle_object_type_members(tokens: &[SqlToken], open_idx: usize) -> Vec<String> {
+    let Some(close_idx) = matching_paren_index(tokens, open_idx) else {
+        return Vec::new();
+    };
+    let mut members = Vec::new();
+    let mut item_start = open_idx + 1;
+    let mut depth = 0usize;
+    for idx in open_idx + 1..=close_idx {
+        match tokens.get(idx) {
+            Some(SqlToken::Symbol(symbol)) if symbol == "(" => {
+                depth = depth.saturating_add(1)
+            }
+            Some(SqlToken::Symbol(symbol)) if symbol == ")" && depth > 0 => {
+                depth = depth.saturating_sub(1)
+            }
+            Some(SqlToken::Symbol(symbol)) if (symbol == "," && depth == 0) || idx == close_idx => {
+                let item = &tokens[item_start..idx];
+                let words = item
+                    .iter()
+                    .filter_map(|token| token_word_text(Some(token)))
+                    .collect::<Vec<_>>();
+                let member = if words.first().is_some_and(|word| {
+                    matches!(
+                        word.to_ascii_uppercase().as_str(),
+                        "CONSTRUCTOR" | "MAP" | "MEMBER" | "ORDER" | "STATIC"
+                    )
+                }) {
+                    words
+                        .iter()
+                        .position(|word| {
+                            matches!(
+                                word.to_ascii_uppercase().as_str(),
+                                "FUNCTION" | "PROCEDURE"
+                            )
+                        })
+                        .and_then(|routine_idx| words.get(routine_idx + 1).copied())
+                } else {
+                    words.first().copied()
+                };
+                if let Some(member) = member {
+                    push_unique_case_insensitive(&mut members, member);
+                }
+                item_start = idx.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+    members
+}
+
 fn collect_mysql_create_routine_names_from_text(script: &str, keyword: &str) -> Vec<String> {
     let upper = script.to_ascii_uppercase();
     let marker = format!("CREATE {keyword}");
@@ -474,6 +524,7 @@ fn intellisense_data_from_mysql_family_catalog(
         .iter()
         .chain(catalog.views.iter())
         .chain(catalog.materialized_views.iter())
+        .chain(catalog.functions.iter())
     {
         if let Some(columns) = catalog.columns.get(&relation.to_ascii_uppercase()) {
             data.set_columns_for_table(relation, columns.clone());
@@ -734,9 +785,6 @@ fn oracle_insert_signature(
     routine_name: &str,
     parameter_names: &[String],
 ) {
-    if parameter_names.is_empty() {
-        return;
-    }
     catalog
         .signatures
         .entry(key.to_ascii_uppercase())
@@ -755,13 +803,18 @@ fn oracle_collect_script_signatures(script: &str, catalog: &mut MysqlFamilyScrip
                     if let Some((name, _)) = script_object_name_at(&tokens, name_idx) {
                         current_package = Some(name);
                     }
-                } else if matches!(kind.as_str(), "PROCEDURE" | "FUNCTION") {
+                } else {
+                    current_package = None;
+                }
+                if matches!(kind.as_str(), "PROCEDURE" | "FUNCTION") {
                     if let Some((name, after_name_idx)) = script_object_name_at(&tokens, name_idx) {
-                        if matches!(tokens.get(after_name_idx), Some(SqlToken::Symbol(symbol)) if symbol == "(")
-                        {
+                        let params = if matches!(tokens.get(after_name_idx), Some(SqlToken::Symbol(symbol)) if symbol == "(") {
                             let params = script_parameter_names_from_open_paren(&tokens, after_name_idx);
-                            oracle_insert_signature(catalog, name.to_ascii_uppercase(), &name, &params);
-                        }
+                            params
+                        } else {
+                            Vec::new()
+                        };
+                        oracle_insert_signature(catalog, name.to_ascii_uppercase(), &name, &params);
                     }
                 }
             }
@@ -775,18 +828,20 @@ fn oracle_collect_script_signatures(script: &str, catalog: &mut MysqlFamilyScrip
                 idx += 1;
                 continue;
             };
-            if matches!(tokens.get(after_name_idx), Some(SqlToken::Symbol(symbol)) if symbol == "(")
-            {
+            let params = if matches!(tokens.get(after_name_idx), Some(SqlToken::Symbol(symbol)) if symbol == "(") {
                 let params = script_parameter_names_from_open_paren(&tokens, after_name_idx);
-                oracle_insert_signature(catalog, name.to_ascii_uppercase(), &name, &params);
-                if let Some(package) = current_package.as_deref() {
-                    oracle_insert_signature(
-                        catalog,
-                        format!("{package}.{name}"),
-                        &name,
-                        &params,
-                    );
-                }
+                params
+            } else {
+                Vec::new()
+            };
+            oracle_insert_signature(catalog, name.to_ascii_uppercase(), &name, &params);
+            if let Some(package) = current_package.as_deref() {
+                oracle_insert_signature(
+                    catalog,
+                    format!("{package}.{name}"),
+                    &name,
+                    &params,
+                );
             }
         }
 
@@ -910,7 +965,7 @@ fn oracle_collect_script_catalog_entries(script: &str, catalog: &mut MysqlFamily
                     if token_word_eq(tokens.get(body_idx), "OBJECT")
                         && matches!(tokens.get(body_idx + 1), Some(SqlToken::Symbol(symbol)) if symbol == "(")
                     {
-                        let members = collect_create_table_columns(&tokens, body_idx + 1);
+                        let members = collect_oracle_object_type_members(&tokens, body_idx + 1);
                         if !members.is_empty() {
                             catalog
                                 .type_members
@@ -936,6 +991,53 @@ fn oracle_collect_script_catalog_entries(script: &str, catalog: &mut MysqlFamily
         }
 
         idx += 1;
+    }
+
+    let mut idx = 0usize;
+    while idx < tokens.len() {
+        if !token_word_eq(tokens.get(idx), "CREATE") {
+            idx += 1;
+            continue;
+        }
+        let Some((kind, name_idx)) = oracle_create_kind_and_name_idx(&tokens, idx) else {
+            idx += 1;
+            continue;
+        };
+        if kind != "FUNCTION" {
+            idx += 1;
+            continue;
+        }
+        let Some((name, after_name_idx)) = script_object_name_at(&tokens, name_idx) else {
+            idx += 1;
+            continue;
+        };
+        let mut header_idx = after_name_idx;
+        let mut return_type = None;
+        while header_idx < tokens.len() {
+            match tokens.get(header_idx) {
+                Some(SqlToken::Symbol(symbol)) if symbol == ";" => break,
+                Some(SqlToken::Word(word))
+                    if word.eq_ignore_ascii_case("IS") || word.eq_ignore_ascii_case("AS") =>
+                {
+                    break;
+                }
+                Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("RETURN") => {
+                    return_type = script_object_name_at(&tokens, header_idx + 1)
+                        .map(|(return_type, _)| return_type.to_ascii_uppercase());
+                }
+                _ => {}
+            }
+            header_idx += 1;
+        }
+        if let Some(element_type) = return_type
+            .as_deref()
+            .and_then(|return_type| catalog.collection_element_types.get(return_type))
+            .and_then(|element_type| catalog.type_members.get(element_type))
+            .cloned()
+        {
+            catalog.columns.insert(name.to_ascii_uppercase(), element_type);
+        }
+        idx = header_idx.saturating_add(1);
     }
 }
 
@@ -47745,6 +47847,345 @@ fn oracle_test7_production_completion_covers_model_and_derived_sweep_cases() {
     ]);
 }
 
+#[test]
+fn oracle_test18_production_completion_covers_plsql_sweep_cases() {
+    assert_oracle_sweep_fixture_completion_cases(&[
+        (
+            "test18.sql",
+            "IF INSERTING THEN\n        IF :NEW.emp_id",
+            "INSERTING",
+            "INSE",
+            "INSERTING",
+        ),
+        (
+            "test18.sql",
+            "IF INSERTING THEN\n        IF :NEW.emp_id",
+            "THEN",
+            "THE",
+            "THEN",
+        ),
+        (
+            "test18.sql",
+            "ELSIF UPDATING THEN",
+            "UPDATING",
+            "UPDA",
+            "UPDATING",
+        ),
+        (
+            "test18.sql",
+            "ELSIF UPDATING THEN",
+            "THEN",
+            "THE",
+            "THEN",
+        ),
+        (
+            "test18.sql",
+            "TYPE t_emp_tab IS TABLE OF t_emp_rec INDEX BY PLS_INTEGER;",
+            "t_emp_rec",
+            "t_em",
+            "t_emp_rec",
+        ),
+        (
+            "test18.sql",
+            "USING qt_seq_emp.NEXTVAL,\n            CASE MOD (v_idx, 3)",
+            "CASE",
+            "CAS",
+            "CASE",
+        ),
+        (
+            "test18.sql",
+            "WHEN 0 THEN\n                    30",
+            "THEN",
+            "THE",
+            "THEN",
+        ),
+        (
+            "test18.sql",
+            "CASE MOD (v_idx, 3)\n                WHEN 0 THEN",
+            "WHEN",
+            "WHE",
+            "WHEN",
+        ),
+        (
+            "test18.sql",
+            "WHEN 1 THEN\n                    40\n                ELSE",
+            "ELSE",
+            "ELS",
+            "ELSE",
+        ),
+        (
+            "test18.sql",
+            "END,\n            CASE\n                WHEN MOD (v_idx, 3)",
+            "CASE",
+            "CAS",
+            "CASE",
+        ),
+        (
+            "test18.sql",
+            "SET salary = ROUND (salary * (\n                    CASE",
+            "CASE",
+            "CAS",
+            "CASE",
+        ),
+        (
+            "test18.sql",
+            "    EXCEPTION\n        WHEN OTHERS THEN\n            IF p_commit THEN",
+            "EXCEPTION",
+            "EXCE",
+            "EXCEPTION",
+        ),
+        (
+            "test18.sql",
+            "EXCEPTION\n        WHEN OTHERS THEN\n            IF p_commit THEN",
+            "WHEN",
+            "WHE",
+            "WHEN",
+        ),
+        (
+            "test18.sql",
+            "EXCEPTION\n        WHEN OTHERS THEN\n            IF p_commit THEN",
+            "OTHERS",
+            "OTHE",
+            "OTHERS",
+        ),
+        (
+            "test18.sql",
+            "write_log ('ERROR', 'adjust_salary', SQLERRM, TO_CLOB (DBMS_UTILITY.FORMAT_ERROR_BACKTRACE));\n            RAISE;\n    END adjust_salary;",
+            "RAISE",
+            "RAIS",
+            "RAISE",
+        ),
+    ]);
+}
+
+#[test]
+fn oracle_test18_production_completion_covers_query_and_scope_sweep_cases() {
+    assert_oracle_sweep_fixture_completion_cases(&[
+        (
+            "test18.sql",
+            "SELECT NVL (SUM (s.sale_amount), 0)\n                    FROM qt_sales s",
+            "FROM",
+            "FRO",
+            "FROM",
+        ),
+        (
+            "test18.sql",
+            "ROW_NUMBER () OVER (ORDER BY e.salary DESC NULLS LAST, e.emp_id)",
+            "DESC",
+            "DES",
+            "DESC",
+        ),
+        (
+            "test18.sql",
+            "COUNT (*) OVER () AS total_cnt\n                FROM qt_emp e",
+            "FROM",
+            "FRO",
+            "FROM",
+        ),
+        (
+            "test18.sql",
+            "BEGIN\n    qt_pkg_extreme.run_all;\nEND;",
+            "run_all",
+            "run_",
+            "run_all",
+        ),
+        (
+            "test18.sql",
+            "FROM pivoted UNPIVOT INCLUDE NULLS (month_amt",
+            "pivoted",
+            "pivo",
+            "pivoted",
+        ),
+        (
+            "test18.sql",
+            "FROM pivoted UNPIVOT INCLUDE NULLS (month_amt",
+            "UNPIVOT",
+            "UNPI",
+            "UNPIVOT",
+        ),
+        (
+            "test18.sql",
+            "WHEN e.salary BETWEEN 100000 AND 160000 THEN e.salary + 1500",
+            "BETWEEN",
+            "BETW",
+            "BETWEEN",
+        ),
+        (
+            "test18.sql",
+            "WHEN MATCHED THEN\nUPDATE\nSET tgt.status_code",
+            "WHEN",
+            "WHE",
+            "WHEN",
+        ),
+        (
+            "test18.sql",
+            "WHERE module_name LIKE 'anonymous_block_1%'",
+            "WHERE",
+            "WHER",
+            "WHERE",
+        ),
+        (
+            "test18.sql",
+            "JOIN qt_dept d\n                    ON d.dept_id",
+            "ON",
+            "O",
+            "ON",
+        ),
+        (
+            "test18.sql",
+            "ON (tgt.emp_id = src.emp_id)\n    WHEN MATCHED",
+            "ON",
+            "O",
+            "ON",
+        ),
+    ]);
+}
+
+#[test]
+fn oracle_test22_production_completion_covers_sweep_cases() {
+    assert_oracle_sweep_fixture_completion_cases(&[
+        (
+            "test22.sql",
+            "v_local_note CLOB := p_note || CHR(10) || weird_text();\n        BEGIN\n            MERGE INTO qt_split_users t",
+            "INTO",
+            "INT",
+            "INTO",
+        ),
+        (
+            "test22.sql",
+            "SELECT p_user_id AS user_id,",
+            "SELECT",
+            "SELE",
+            "SELECT",
+        ),
+        (
+            "test22.sql",
+            "WHEN MATCHED THEN\n                UPDATE",
+            "WHEN",
+            "WHE",
+            "WHEN",
+        ),
+        (
+            "test22.sql",
+            "                VALUES\n                (\n                    s.user_id",
+            "VALUES",
+            "VALU",
+            "VALUES",
+        ),
+        (
+            "test22.sql",
+            "IF INSERTING THEN\n        IF :NEW.user_id",
+            "INSERTING",
+            "INSE",
+            "INSERTING",
+        ),
+        (
+            "test22.sql",
+            "IF INSERTING THEN\n        IF :NEW.user_id",
+            "THEN",
+            "THE",
+            "THEN",
+        ),
+    ]);
+}
+
+#[test]
+fn oracle_test23_and_test26_production_completion_covers_sweep_cases() {
+    assert_oracle_sweep_fixture_completion_cases(&[
+        (
+            "test23.sql",
+            "GENERATED ALWAYS AS(UPPER(tag)) VIRTUAL",
+            "VIRTUAL",
+            "VIRT",
+            "VIRTUAL",
+        ),
+        (
+            "test23.sql",
+            "OR er.note_text LIKE '%/%' THEN 'HAS_DELIM'",
+            "OR",
+            "O",
+            "OR",
+        ),
+        (
+            "test23.sql",
+            "RETURN key_txt || ' => ' || REPLACE",
+            "key_txt",
+            "key_",
+            "key_txt",
+        ),
+        (
+            "test23.sql",
+            "EXECUTE IMMEDIATE v_sql\n        USING p_new_salary",
+            "IMMEDIATE",
+            "IMME",
+            "IMMEDIATE",
+        ),
+        (
+            "test23.sql",
+            "USING r.emp_id;\n                IF MOD",
+            "emp_id",
+            "emp_",
+            "emp_id",
+        ),
+        (
+            "test23.sql",
+            "log_it (r.emp_id, 'ERR', SQLERRM || '; unit=run_extreme')",
+            "SQLERRM",
+            "SQLE",
+            "SQLERRM",
+        ),
+        (
+            "test23.sql",
+            "IF INSERTING THEN\n        :NEW.created_at",
+            "INSERTING",
+            "INSE",
+            "INSERTING",
+        ),
+        (
+            "test23.sql",
+            "IF INSERTING THEN\n        :NEW.created_at",
+            "THEN",
+            "THE",
+            "THEN",
+        ),
+        (
+            "test23.sql",
+            "p.render ())\n                FROM TABLE",
+            "render",
+            "rend",
+            "render",
+        ),
+        (
+            "test23.sql",
+            "FROM TABLE (qt_boss_pairs (v.dept_id)) p\n                WHERE p.key_txt = 'EMP:' || TO_CHAR",
+            "key_txt",
+            "key_",
+            "key_txt",
+        ),
+        (
+            "test26.sql",
+            "LOB (doc) STORE AS BASICFILE",
+            "STORE",
+            "STOR",
+            "STORE",
+        ),
+        (
+            "test26.sql",
+            "LOB (ndoc) STORE AS BASICFILE",
+            "ndoc",
+            "ndo",
+            "ndoc",
+        ),
+        (
+            "test26.sql",
+            "DBMS_LOB.CREATETEMPORARY(v, TRUE);",
+            "TRUE",
+            "TRU",
+            "TRUE",
+        ),
+    ]);
+}
+
 #[derive(Debug)]
 struct IntellisenseSweepMissing {
     start: usize,
@@ -49586,6 +50027,30 @@ fn oracle_test10_words_generate_out_report() {
 #[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
 fn oracle_test11_words_generate_out_report() {
     oracle_test_words_generate_out_report("test11.txt", false);
+}
+
+#[test]
+#[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
+fn oracle_test18_words_generate_out_report() {
+    oracle_test_words_generate_out_report("test18.sql", false);
+}
+
+#[test]
+#[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
+fn oracle_test22_words_generate_out_report() {
+    oracle_test_words_generate_out_report("test22.sql", false);
+}
+
+#[test]
+#[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
+fn oracle_test23_words_generate_out_report() {
+    oracle_test_words_generate_out_report("test23.sql", false);
+}
+
+#[test]
+#[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
+fn oracle_test26_words_generate_out_report() {
+    oracle_test_words_generate_out_report("test26.sql", false);
 }
 
 #[test]

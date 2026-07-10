@@ -1760,6 +1760,13 @@ impl SqlEditorWidget {
                             root_awaiting_body_begin = true;
                             idx = parsed.body_keyword_idx.saturating_add(1);
                             continue;
+                        } else if let Some(parsed) =
+                            Self::parse_package_spec_header(token_spans, idx)
+                        {
+                            scopes[0].scope.kind = LocalScopeKind::PackageBody;
+                            root_decl_start_idx = Some(parsed.decl_start_idx);
+                            idx = parsed.body_keyword_idx.saturating_add(1);
+                            continue;
                         }
                     }
 
@@ -3608,6 +3615,43 @@ impl SqlEditorWidget {
         while scan_idx < tokens.len() {
             let token = &tokens[scan_idx];
             match &token.token {
+                SqlToken::Comment(_) => {}
+                SqlToken::Symbol(sym) if sym == ";" => return None,
+                SqlToken::Word(word)
+                    if word.eq_ignore_ascii_case("AS") || word.eq_ignore_ascii_case("IS") =>
+                {
+                    return Some(ParsedPackageBodyHeader {
+                        body_keyword_idx: scan_idx,
+                        decl_start_idx: scan_idx.saturating_add(1),
+                    });
+                }
+                _ => {}
+            }
+            scan_idx += 1;
+        }
+
+        None
+    }
+
+    fn parse_package_spec_header(
+        tokens: &[SqlTokenSpan],
+        idx: usize,
+    ) -> Option<ParsedPackageBodyHeader> {
+        if !tokens.get(..idx).unwrap_or(&[]).iter().any(|span| {
+            matches!(&span.token, SqlToken::Word(word) if word.eq_ignore_ascii_case("CREATE"))
+        }) {
+            return None;
+        }
+        let next_idx = Self::next_meaningful_token_idx(tokens, idx + 1)?;
+        if Self::token_word(&tokens[next_idx].token)
+            .is_some_and(|word| word.eq_ignore_ascii_case("BODY"))
+        {
+            return None;
+        }
+
+        let mut scan_idx = next_idx;
+        while scan_idx < tokens.len() {
+            match &tokens[scan_idx].token {
                 SqlToken::Comment(_) => {}
                 SqlToken::Symbol(sym) if sym == ";" => return None,
                 SqlToken::Word(word)
