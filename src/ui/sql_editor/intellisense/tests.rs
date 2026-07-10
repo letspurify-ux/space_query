@@ -16033,6 +16033,44 @@ END;"#,
 }
 
 #[test]
+fn million_line_oracle_plsql_completion_window_stays_hard_capped() {
+    let padding = "\n".repeat(500_005);
+    let mut sql = padding.clone();
+    sql.push_str("DECLARE v_cnt NUMBER := 0;\nBEGIN\n  EXIT WHE");
+    let cursor = sql.len();
+    sql.push_str(";\nEND;\n/\n");
+    sql.push_str(&padding);
+
+    assert!(
+        sql.as_bytes().iter().filter(|byte| **byte == b'\n').count() > 1_000_000,
+        "test input must exceed one million lines"
+    );
+    let bounded = SqlEditorWidget::bounded_intellisense_parse_text_from_text(&sql, cursor);
+    assert!(
+        bounded.text.len() <= SqlEditorWidget::BOUNDED_INTELLISENSE_PARSE_WINDOW_BYTES,
+        "million-line input exceeded the bounded parse cap"
+    );
+    assert!(
+        bounded.start > 0 && bounded.start + bounded.text.len() < sql.len(),
+        "test setup must exclude both distant halves of the document"
+    );
+
+    let expanded = SqlEditorWidget::expanded_statement_window_in_bounded_text_for_db_type(
+        &bounded,
+        Some(crate::db::DatabaseType::Oracle),
+    );
+    assert!(
+        expanded.text.starts_with("DECLARE v_cnt"),
+        "partial PL/SQL keyword should retain its enclosing block: {:?}",
+        expanded.text
+    );
+    assert!(
+        expanded.text.len() <= SqlEditorWidget::BOUNDED_INTELLISENSE_PARSE_WINDOW_BYTES,
+        "recovered PL/SQL unit exceeded the bounded parse cap"
+    );
+}
+
+#[test]
 fn prepend_local_symbol_suggestions_dedups_quoted_identifier_equivalents() {
     let merged = SqlEditorWidget::prepend_local_symbol_suggestions(
         vec!["v total".to_string(), "ENAME".to_string()],
@@ -47087,6 +47125,274 @@ fn query_completion_suggestions_with_data(
         IntellisenseCompletionComputation::Suppressed => Vec::new(),
         IntellisenseCompletionComputation::Computed(computed) => computed.suggestions,
     }
+}
+
+fn assert_oracle_production_completion_contains(sql: &str, expected: &str) {
+    let suggestions =
+        query_completion_suggestions_with_locals(sql, crate::db::DatabaseType::Oracle);
+    assert!(
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case(expected)),
+        "`{expected}` missing at `{sql}`: {suggestions:?}"
+    );
+}
+
+#[test]
+fn oracle_production_completion_covers_plsql_embedded_sql_sweep_cases() {
+    for (sql, expected) in [
+        (
+            "CREATE PACKAGE BODY p AS PROCEDURE x IS BEGIN UPDATE emp SET sal = 1 WHER__CODEX_CURSOR__ empno = 1; END; END p;",
+            "WHERE",
+        ),
+        (
+            "CREATE PACKAGE BODY p AS PROCEDURE x IS rc SYS_REFCURSOR; BEGIN OPEN rc FOR SELECT empno FROM emp ORDE__CODEX_CURSOR__ BY empno; END; END p;",
+            "ORDER BY",
+        ),
+        (
+            "CREATE PACKAGE BODY p AS PROCEDURE x IS BEGIN FOR r IN (SELE__CODEX_CURSOR__ empno FROM emp) LOOP NULL; END LOOP; END; END p;",
+            "SELECT",
+        ),
+        (
+            "CREATE PACKAGE BODY p AS PROCEDURE x IS BEGIN FOR r IN (SELECT empno FROM emp ORDE__CODEX_CURSOR__ BY empno) LOOP NULL; END LOOP; END; END p;",
+            "ORDER BY",
+        ),
+        (
+            "CREATE PACKAGE BODY p AS PROCEDURE x IS BEGIN DELETE FRO__CODEX_CURSOR__ emp WHERE empno = 1; END; END p;",
+            "FROM",
+        ),
+        (
+            "CREATE PACKAGE BODY p AS PROCEDURE x IS TYPE nums IS TABLE OF NUMBER; ids nums; BEGIN SELECT empno BUL__CODEX_CURSOR__ COLLECT INTO ids FROM emp; END; END p;",
+            "BULK",
+        ),
+    ] {
+        assert_oracle_production_completion_contains(sql, expected);
+    }
+}
+
+#[test]
+fn oracle_production_completion_covers_package_structure_sweep_cases() {
+    for (sql, expected) in [
+        (
+            "CREATE PACKAGE p AS PROCEDURE x; EN__CODEX_CURSOR__ p;",
+            "END",
+        ),
+        (
+            "CREATE PACKAGE BODY p AS PROC__CODEX_CURSOR__ x IS BEGIN NULL; END; END p;",
+            "PROCEDURE",
+        ),
+        (
+            "CREATE PACKAGE BODY p AS PROCEDURE x(p I__CODEX_CURSOR__ NUMBER) IS BEGIN NULL; END; END p;",
+            "IN",
+        ),
+        (
+            "CREATE PACKAGE BODY p AS PROCEDURE x IS PROCEDURE nested IS BEGIN NULL; END; BEGI__CODEX_CURSOR__ NULL; END; END p;",
+            "BEGIN",
+        ),
+    ] {
+        assert_oracle_production_completion_contains(sql, expected);
+    }
+}
+
+#[test]
+fn oracle_production_completion_covers_local_cursor_and_label_sweep_cases() {
+    for (sql, expected) in [
+        (
+            "DECLARE rc SYS_REFCURSOR; BEGIN LOOP EXIT WHE__CODEX_CURSOR__ rc%NOTFOUND; END LOOP; END;",
+            "WHEN",
+        ),
+        (
+            "DECLARE rc SYS_REFCURSOR; BEGIN LOOP EXIT WHEN r__CODEX_CURSOR__%NOTFOUND; END LOOP; END;",
+            "rc",
+        ),
+        (
+            "DECLARE rc SYS_REFCURSOR; BEGIN LOOP EXIT WHEN rc%NOTF__CODEX_CURSOR__; END LOOP; END;",
+            "NOTFOUND",
+        ),
+        (
+            "DECLARE rc SYS_REFCURSOR; BEGIN r__CODEX_CURSOR__ := NULL; END;",
+            "rc",
+        ),
+        (
+            "BEGIN <<outer_loop>> LOOP EXIT oute__CODEX_CURSOR__; END LOOP outer_loop; END;",
+            "outer_loop",
+        ),
+    ] {
+        assert_oracle_production_completion_contains(sql, expected);
+    }
+}
+
+#[test]
+fn oracle_production_completion_covers_expression_and_member_sweep_cases() {
+    for (sql, expected) in [
+        (
+            "CREATE TABLE t (created_at DATE DEFAULT SYSD__CODEX_CURSOR__)",
+            "SYSDATE",
+        ),
+        (
+            "CREATE PACKAGE BODY p AS PROCEDURE x IS BEGIN DBMS_OUTPUT.PUT___CODEX_CURSOR__('x'); END; END p;",
+            "PUT_LINE",
+        ),
+        (
+            "DECLARE TYPE nums IS TABLE OF NUMBER; ids nums; BEGIN IF ids.COUN__CODEX_CURSOR__ > 0 THEN NULL; END IF; END;",
+            "COUNT",
+        ),
+    ] {
+        assert_oracle_production_completion_contains(sql, expected);
+    }
+
+    let mut data = oracle_test_file_scoped_intellisense_data("test2.txt");
+    let suggestions = query_completion_suggestions_with_data(
+        "BEGIN oqt___CODEX_CURSOR__.p_over('x'); END;",
+        crate::db::DatabaseType::Oracle,
+        true,
+        &mut data,
+    );
+    assert!(
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case("oqt_syn")),
+        "package synonym qualifier missing: {suggestions:?}"
+    );
+}
+
+fn oracle_fixture_word_completion_suggestions(
+    file_name: &str,
+    context: &str,
+    word: &str,
+    prefix: &str,
+) -> Vec<String> {
+    let script = load_intellisense_test_file(file_name);
+    assert_eq!(
+        script.matches(context).count(),
+        1,
+        "fixture context must be unique in {file_name}: `{context}`"
+    );
+    let context_start = script.find(context).expect("fixture context");
+    let word_in_context = context.find(word).expect("word in fixture context");
+    let word_start = context_start + word_in_context;
+    let marked = format!(
+        "{}{}__CODEX_CURSOR__{}",
+        script.get(..word_start).unwrap_or(""),
+        prefix,
+        script.get(word_start + word.len()..).unwrap_or("")
+    );
+    let mut data = oracle_test_file_scoped_intellisense_data(file_name);
+    query_completion_suggestions_with_data(
+        &marked,
+        crate::db::DatabaseType::Oracle,
+        true,
+        &mut data,
+    )
+}
+
+#[test]
+fn oracle_fixture_production_completion_covers_remaining_sweep_cases() {
+    let cases = [
+        (
+            "test1.txt",
+            "UPDATE oqt_emp\n       SET sal = p_new_sal\n     WHERE emp_id = p_emp_id;",
+            "WHERE",
+            "WHER",
+            "WHERE",
+        ),
+        (
+            "test1.txt",
+            "DELETE FROM oqt_tmp_result WHERE run_id = p_run_id;",
+            "FROM",
+            "FRO",
+            "FROM",
+        ),
+        (
+            "test2.txt",
+            "FUNCTION f_sum(p_a IN NUMBER, p_b IN NUMBER) RETURN NUMBER IS",
+            "FUNCTION",
+            "FUNC",
+            "FUNCTION",
+        ),
+        (
+            "test2.txt",
+            "FUNCTION f_echo(p_txt IN VARCHAR2) RETURN VARCHAR2 IS",
+            "IN",
+            "I",
+            "IN",
+        ),
+        (
+            "test2.txt",
+            "EXIT WHEN v_cnt >= 20; -- limit spam",
+            "WHEN",
+            "WHE",
+            "WHEN",
+        ),
+        (
+            "test3.txt",
+            "EXIT WHEN c%NOTFOUND;",
+            "c",
+            "c",
+            "c",
+        ),
+        (
+            "test3.txt",
+            "EXIT WHEN c%NOTFOUND;",
+            "NOTFOUND",
+            "NOTF",
+            "NOTFOUND",
+        ),
+        (
+            "test1.txt",
+            "rc := oqt_demo_pkg.func_refcursor(9000);",
+            "rc",
+            "r",
+            "rc",
+        ),
+        (
+            "test2.txt",
+            "EXIT WHEN v_cnt >= 20; -- limit spam",
+            "v_cnt",
+            "v_cn",
+            "v_cnt",
+        ),
+        (
+            "test4.txt",
+            "DBMS_OUTPUT.PUT_LINE('[p_raise] no error for code='||p_code);",
+            "PUT_LINE",
+            "PUT_",
+            "PUT_LINE",
+        ),
+        (
+            "test5.txt",
+            "EXIT outer_loop;\n        END CASE;",
+            "outer_loop",
+            "oute",
+            "outer_loop",
+        ),
+        (
+            "test5.txt",
+            "END p_inner;\n\n  BEGIN\n    log_msg('P_DEEP_RUN'",
+            "BEGIN",
+            "BEGI",
+            "BEGIN",
+        ),
+    ];
+
+    let mut failures = Vec::new();
+    for (file_name, context, word, prefix, expected) in cases {
+        let suggestions =
+            oracle_fixture_word_completion_suggestions(file_name, context, word, prefix);
+        if !suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case(expected))
+        {
+            failures.push(format!(
+                "{file_name} `{context}` lost `{expected}`: {suggestions:?}"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "Oracle fixture production-path gaps:\n{}",
+        failures.join("\n")
+    );
 }
 
 #[derive(Debug)]
@@ -85952,5 +86258,3 @@ fn plsql_execute_immediate_tail_space_auto_trigger_is_slot_precise() {
         )
     );
 }
-
-

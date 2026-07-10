@@ -2676,6 +2676,16 @@ impl SqlEditorWidget {
         } else {
             Vec::new()
         };
+        let has_early_oracle_builtin_package_members = qualifier.is_some_and(|qualifier| {
+            !crate::sql_text::mysql_compatibility_for_sql(
+                "",
+                Some(snapshot.preferred_db_type),
+            ) && Self::oracle_builtin_package_member_suggestions(
+                qualifier,
+                &snapshot.prefix,
+            )
+            .is_some_and(|members| !members.is_empty())
+        });
         let early_expected_keyword_suggestions =
             Self::collect_expected_keyword_suggestions_with_expression_context(
                 &snapshot.prefix,
@@ -2812,6 +2822,7 @@ impl SqlEditorWidget {
         if suppresses_existing_identifier_completion
             && early_signature_argument_suggestions.is_empty()
             && early_builtin_function_call_suggestions.is_empty()
+            && !has_early_oracle_builtin_package_members
             && early_expected_keyword_suggestions.is_empty()
             && early_structural_keyword_before_current_identifier.is_none()
             && mysql_named_value_suggestions.is_empty()
@@ -5151,10 +5162,12 @@ impl SqlEditorWidget {
                         | "CV"
                         | "DAY"
                         | "DEFINE"
+                        | "END"
                         | "EXCEPTION"
                         | "EXIT"
                         | "FIRST"
                         | "FROM"
+                        | "FUNCTION"
                         | "GROUP"
                         | "HAVING"
                         | "IN"
@@ -5180,6 +5193,7 @@ impl SqlEditorWidget {
                         | "PATH"
                         | "PER"
                         | "PREV"
+                        | "PROCEDURE"
                         | "RETURN"
                         | "RETURNING"
                         | "ROW"
@@ -5225,19 +5239,31 @@ impl SqlEditorWidget {
         if prefix.is_empty() {
             return None;
         }
-        if Self::cursor_is_at_plsql_declaration_object_name_slot_for_context(
+        let structural_keyword =
+            Self::structural_keyword_prefix_fallback(prefix, deep_ctx, db_type, expr_keyword_ctx);
+        let at_plsql_declaration_name =
+            Self::cursor_is_at_plsql_declaration_object_name_slot_for_context(
             deep_ctx, true, db_type,
         ) || Self::cursor_is_at_plsql_routine_parameter_name_slot_for_context(
-            deep_ctx, true, db_type,
-        ) || {
-            let tokens = Self::current_query_tokens(deep_ctx);
-            let end = Self::expected_suggestion_context_end(
-                tokens,
-                Self::cursor_token_len_in_current_query(deep_ctx),
-                true,
-            );
-            Self::cursor_is_at_plsql_declaration_start(tokens, end, db_type)
-        } {
+                deep_ctx, true, db_type,
+            ) || {
+                let tokens = Self::current_query_tokens(deep_ctx);
+                let end = Self::expected_suggestion_context_end(
+                    tokens,
+                    Self::cursor_token_len_in_current_query(deep_ctx),
+                    true,
+                );
+                Self::cursor_is_at_plsql_declaration_start(tokens, end, db_type)
+            };
+        let structural_overrides_declaration_name = structural_keyword
+            .as_deref()
+            .is_some_and(|keyword| {
+                matches!(
+                    keyword.to_ascii_uppercase().as_str(),
+                    "BEGIN" | "END" | "FUNCTION" | "IN" | "PROCEDURE"
+                )
+            });
+        if at_plsql_declaration_name && !structural_overrides_declaration_name {
             return None;
         }
         if Self::cursor_is_after_completed_grant_revoke_grantee_tail_for_context(
@@ -5264,9 +5290,7 @@ impl SqlEditorWidget {
                 .then_some(upper);
         }
 
-        if let Some(keyword) =
-            Self::structural_keyword_prefix_fallback(prefix, deep_ctx, db_type, expr_keyword_ctx)
-        {
+        if let Some(keyword) = structural_keyword {
             return Some(keyword);
         }
         let tokens = Self::current_query_tokens(deep_ctx);
@@ -5396,9 +5420,49 @@ impl SqlEditorWidget {
         let words = Self::words_for_plsql_statement_slot(tokens, end);
         let last = words.last().map(String::as_str);
         let has = |keyword: &str| words.iter().any(|word| word == keyword);
+        let full_words = Self::words_for_keyword_slot(statement_tokens, full_end);
+        let full_previous_is_semicolon = matches!(
+            Self::meaningful_tokens_before(statement_tokens, full_end).last(),
+            Some(SqlToken::Symbol(symbol)) if symbol == ";"
+        );
         let previous_is_percent = Self::meaningful_tokens_before(tokens, end)
             .last()
             .is_some_and(|token| matches!(token, SqlToken::Symbol(symbol) if symbol == "%"));
+
+        if matches_prefix("END")
+            && full_words.iter().any(|word| word == "CREATE")
+            && full_words.iter().any(|word| word == "PACKAGE")
+            && full_previous_is_semicolon
+        {
+            return Some("END".to_string());
+        }
+
+        if let Some(candidates) =
+            Self::expected_plsql_routine_parameter_mode_keyword_candidates(
+                statement_tokens,
+                full_end,
+                db_type,
+            )
+        {
+            if candidates.iter().any(|candidate| {
+                candidate.eq_ignore_ascii_case("IN") && matches_prefix(candidate)
+            }) {
+                return Some("IN".to_string());
+            }
+        }
+
+        let in_package = full_words.iter().any(|word| word == "CREATE")
+            && full_words.iter().any(|word| word == "PACKAGE");
+        if in_package && full_previous_is_semicolon {
+            for keyword in ["FUNCTION", "PROCEDURE"] {
+                if matches_prefix(keyword) {
+                    return Some(keyword.to_string());
+                }
+            }
+            if full_words.iter().any(|word| word == "BODY") && matches_prefix("BEGIN") {
+                return Some("BEGIN".to_string());
+            }
+        }
 
         if let Some(candidates) = Self::expected_plsql_end_qualifier_keywords(tokens, end, db_type) {
             let mut candidates = Self::filter_expected_candidates(prefix, candidates).into_iter();
@@ -5428,10 +5492,13 @@ impl SqlEditorWidget {
                 }
             }
         }
-        if matches_prefix("SYSTIMESTAMP")
-            && matches!(last, Some("DEFAULT") | Some(":=") | Some("RETURN"))
-        {
-            return Some("SYSTIMESTAMP".to_string());
+        if matches!(last, Some("DEFAULT") | Some(":=") | Some("RETURN")) {
+            if let Some(keyword) = DATETIME_VALUE_WORDS
+                .iter()
+                .find(|keyword| matches_prefix(keyword))
+            {
+                return Some((*keyword).to_string());
+            }
         }
         if matches_prefix("BY")
             && matches!(
@@ -5457,6 +5524,33 @@ impl SqlEditorWidget {
         }
         if matches_prefix("FROM") && has("SELECT") && !has("FROM") {
             return Some("FROM".to_string());
+        }
+        if matches_prefix("FROM") && matches!(last, Some("DELETE")) {
+            return Some("FROM".to_string());
+        }
+        if matches_prefix("WHERE")
+            && has("UPDATE")
+            && has("SET")
+            && !has("WHERE")
+            && Self::cursor_immediately_follows_complete_operand(tokens, end)
+        {
+            return Some("WHERE".to_string());
+        }
+        if matches_prefix("BULK")
+            && has("SELECT")
+            && !has("FROM")
+            && !has("BULK")
+            && Self::cursor_immediately_follows_complete_operand(tokens, end)
+        {
+            return Some("BULK".to_string());
+        }
+        if matches_prefix("ORDER BY")
+            && has("SELECT")
+            && has("FROM")
+            && !has("ORDER")
+            && Self::cursor_immediately_follows_complete_operand(tokens, end)
+        {
+            return Some("ORDER BY".to_string());
         }
         if matches_prefix("OVER")
             && (Self::next_meaningful_token_is_symbol(tokens, end, "(")
@@ -14622,7 +14716,16 @@ impl SqlEditorWidget {
             cursor_token_len,
             exclude_current_identifier_chain,
         );
-        Self::plsql_cursor_attribute_candidates(tokens, end, db_type).is_some()
+        if Self::plsql_cursor_attribute_candidates(tokens, end, db_type).is_some() {
+            return true;
+        }
+        let statement_tokens = deep_ctx.statement_tokens.as_ref();
+        let statement_end = Self::expected_suggestion_context_end(
+            statement_tokens,
+            deep_ctx.cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::plsql_cursor_attribute_candidates(statement_tokens, statement_end, db_type).is_some()
     }
 
     /// Privilege hints for the `GRANT |` / `REVOKE |` privilege list, before the
@@ -17812,6 +17915,7 @@ impl SqlEditorWidget {
                 "SUBTYPE",
                 "CURSOR",
                 "PRAGMA",
+                "END",
             ])
         } else {
             None
@@ -32396,6 +32500,20 @@ impl SqlEditorWidget {
         }
 
         match words.as_slice() {
+            // `FOR <index> IN (|` — a cursor-FOR loop query begins. Numeric
+            // loops do not parenthesize their bounds, so this shape is the
+            // embedded-query form.
+            [.., for_word, index, in_word]
+                if for_word == "FOR"
+                    && in_word == "IN"
+                    && !is_keyword(index)
+                    && matches!(
+                        Self::meaningful_tokens_before(tokens, end).last(),
+                        Some(SqlToken::Symbol(symbol)) if symbol == "("
+                    ) =>
+            {
+                Some(&["SELECT", "WITH"])
+            }
             // `OPEN <cur> |` — the query opener follows.
             [.., open, name] if open == "OPEN" && !is_keyword(name) => Some(&["FOR"]),
             // `OPEN <cur> FOR |` — a query expression follows.
@@ -47098,6 +47216,18 @@ impl SqlEditorWidget {
             deep_ctx.cursor_token_len,
             prefix,
         );
+        if let Some(candidates) =
+            Self::type_attribute_candidates(full_statement_tokens, full_statement_context_end, db_type)
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(candidates) = Self::plsql_cursor_attribute_candidates(
+            full_statement_tokens,
+            full_statement_context_end,
+            db_type,
+        ) {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
         if !prefix.is_empty()
             && (Self::cursor_is_at_plsql_declaration_start(tokens, context_end, db_type)
                 || Self::cursor_is_at_plsql_declaration_start(
@@ -47980,8 +48110,25 @@ impl SqlEditorWidget {
             return Self::filter_expected_candidates(prefix, candidates);
         }
 
-        if let Some(candidates) =
-            Self::plsql_cursor_attribute_candidates(tokens, context_end, db_type)
+        if let Some(candidates) = Self::plsql_cursor_attribute_candidates(
+            tokens,
+            context_end,
+            db_type,
+        )
+        .or_else(|| {
+            Self::plsql_cursor_attribute_candidates(
+                statement_tokens,
+                statement_context_end,
+                db_type,
+            )
+        })
+        .or_else(|| {
+            Self::plsql_cursor_attribute_candidates(
+                full_statement_tokens,
+                full_statement_context_end,
+                db_type,
+            )
+        })
         {
             return Self::filter_expected_candidates(prefix, candidates);
         }
@@ -53232,6 +53379,8 @@ impl SqlEditorWidget {
             .iter()
             .chain(data.sequences.iter())
             .chain(data.types.iter())
+            .chain(data.synonyms.iter())
+            .chain(data.public_synonyms.iter())
         {
             push(name);
         }

@@ -186,19 +186,131 @@ impl SqlEditorWidget {
                 preferred_db_type,
                 None,
             );
-        let expanded = Self::statement_window_from_bounded_text_bounds(
+        let mut expanded = Self::statement_window_from_bounded_text_bounds(
             &bounded.text,
             bounded.start,
             bounded.cursor_pos,
             stmt_start,
             stmt_end,
         );
+        if !sql_text::mysql_compatibility_for_sql("", preferred_db_type) {
+            if let Some(enclosing) =
+                Self::oracle_plsql_enclosing_window_in_bounded_text(bounded, &expanded)
+            {
+                expanded = enclosing;
+            }
+        }
         Self::trim_expanded_statement_leading_block_comment_fragment_in_bounded_text(
             &bounded.text,
             bounded.start,
             bounded.cursor_pos,
             expanded,
         )
+    }
+
+    /// Recover the enclosing Oracle PL/SQL execution unit when the generic
+    /// execution splitter sees a partially typed keyword inside it as a complete
+    /// standalone statement. The search is confined to the already-bounded
+    /// IntelliSense window and to the nearest SQL*Plus `/` delimiters, so its
+    /// cost stays independent of the editor's total line count.
+    fn oracle_plsql_enclosing_window_in_bounded_text(
+        bounded: &BoundedIntellisenseParseText,
+        expanded: &ExpandedStatementWindow,
+    ) -> Option<ExpandedStatementWindow> {
+        let text = bounded.text.as_str();
+        let cursor = bounded
+            .cursor_pos
+            .saturating_sub(bounded.start)
+            .min(text.len());
+        let current_start = expanded.statement_start.saturating_sub(bounded.start);
+        // Compact test/script text sometimes separates PL/SQL units with ` / `
+        // on one line. The execution splitter already resolves those units and
+        // the line-oriented recovery below cannot improve that selection; do
+        // not widen it back across the preceding package specification.
+        if text
+            .get(..cursor)
+            .is_some_and(|before_cursor| {
+                !before_cursor.contains('\n') && before_cursor.contains(" / ")
+            })
+        {
+            return None;
+        }
+        let is_plsql_root = |candidate: &str| {
+            let first_line = candidate.lines().next().unwrap_or(candidate).trim_start();
+            let upper = first_line.to_ascii_uppercase();
+            upper == "DECLARE"
+                || upper.starts_with("DECLARE ")
+                || upper == "BEGIN"
+                || upper.starts_with("BEGIN ")
+                || (upper.starts_with("CREATE ")
+                    && [
+                        " PACKAGE",
+                        " PROCEDURE",
+                        " FUNCTION",
+                        " TRIGGER",
+                        " TYPE BODY",
+                    ]
+                    .iter()
+                    .any(|kind| upper.contains(kind)))
+        };
+        if text
+            .get(current_start..)
+            .is_some_and(|candidate| is_plsql_root(candidate.trim_start()))
+        {
+            return None;
+        }
+        let mut region_start = 0usize;
+        let mut region_end = text.len();
+        let mut root_start = None;
+        let mut offset = 0usize;
+
+        for line_with_newline in text.split_inclusive('\n') {
+            let line_end = offset.saturating_add(line_with_newline.len()).min(text.len());
+            let line = line_with_newline.strip_suffix('\n').unwrap_or(line_with_newline);
+            let trimmed = line.trim();
+            if trimmed == "/" {
+                if line_end <= cursor {
+                    region_start = line_end;
+                    root_start = None;
+                } else if offset >= cursor {
+                    region_end = offset;
+                    break;
+                }
+                offset = line_end;
+                continue;
+            }
+
+            if offset >= region_start && offset < cursor && root_start.is_none() {
+                let leading = line.len().saturating_sub(line.trim_start().len());
+                let candidate = line.get(leading..).unwrap_or("");
+                if is_plsql_root(candidate) {
+                    root_start = Some(offset.saturating_add(leading));
+                }
+            }
+            offset = line_end;
+        }
+
+        let root_start = root_start?;
+        if root_start >= cursor || current_start <= root_start {
+            return None;
+        }
+        while region_end > root_start
+            && text
+                .as_bytes()
+                .get(region_end.saturating_sub(1))
+                .is_some_and(u8::is_ascii_whitespace)
+        {
+            region_end -= 1;
+        }
+        (region_end > cursor).then(|| {
+            Self::statement_window_from_bounded_text_bounds(
+                text,
+                bounded.start,
+                bounded.cursor_pos,
+                root_start,
+                region_end,
+            )
+        })
     }
 
     fn statement_window_from_bounded_text_bounds(
@@ -700,7 +812,7 @@ impl SqlEditorWidget {
             raw_qualifier,
             analysis,
         )?;
-        if scope.members.is_empty() {
+        if scope.members.is_empty() && !scope.member_source_is_collection_like {
             return None;
         }
 
@@ -3024,7 +3136,10 @@ impl SqlEditorWidget {
         for _ in 0..symbols.len() {
             let mut candidates_by_upper = HashMap::<String, Vec<usize>>::new();
             for (idx, symbol) in symbols.iter().enumerate() {
-                if symbol.members.is_empty() && !symbol.member_source_is_rowtype {
+                if symbol.members.is_empty()
+                    && !symbol.member_source_is_rowtype
+                    && !symbol.member_source_is_collection_like
+                {
                     continue;
                 }
                 candidates_by_upper
@@ -3096,7 +3211,9 @@ impl SqlEditorWidget {
                             symbol.member_source_allows_visible_members
                                 || candidate.member_source_allows_visible_members,
                         );
-                    } else if candidate.member_source_is_rowtype {
+                    } else if candidate.member_source_is_rowtype
+                        || candidate.member_source_is_collection_like
+                    {
                         resolved_rowtype_metadata[idx] = Some((
                             candidate.member_source_upper.clone(),
                             candidate.member_source_upper.is_some(),
