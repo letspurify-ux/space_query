@@ -47116,6 +47116,26 @@ fn oracle_test_all_intellisense_data() -> IntellisenseData {
     oracle_intellisense_data_from_catalog(&catalog)
 }
 
+/// The shared "all test scripts" catalog merges every fixture file; on table
+/// name collisions (several files re-create `qt_sales` with different columns)
+/// the file being swept must see ITS OWN column definitions, or the sweep
+/// reports misses that are metadata artifacts rather than completion bugs.
+/// Overlay the file-local catalog on top of the shared one.
+fn oracle_test_file_scoped_intellisense_data(file_name: &str) -> IntellisenseData {
+    let mut data = oracle_test_all_intellisense_data();
+    let own = mysql_family_catalog_from_script(load_intellisense_test_file(file_name));
+    for table in &own.tables {
+        push_unique_case_insensitive(&mut data.tables, table);
+    }
+    for (table, columns) in &own.columns {
+        if !columns.is_empty() {
+            data.set_columns_for_table(table, columns.clone());
+        }
+    }
+    data.rebuild_indices();
+    data
+}
+
 fn oracle_intellisense_data_from_catalog(catalog: &MysqlFamilyScriptCatalog) -> IntellisenseData {
     let mut data = intellisense_data_from_mysql_family_catalog(&catalog);
 
@@ -47323,6 +47343,38 @@ fn intellisense_sweep_word_is_literal_or_comment_body(script: &str, offset: usiz
                 in_block_comment = true;
                 idx += 2;
             }
+            // Oracle q-quoted literal `q'[ … ]'` (any delimiter): scan to its
+            // closer so internal apostrophes/semicolons don't derail the naive
+            // single-quote tracking. Only when the `q` starts a fresh word.
+            (b'q' | b'Q', Some(b'\''))
+                if idx == 0
+                    || (!bytes[idx - 1].is_ascii_alphanumeric()
+                        && !matches!(bytes[idx - 1], b'_' | b'$' | b'#')) =>
+            {
+                let Some(open) = bytes.get(idx + 2).copied() else {
+                    return true;
+                };
+                let close = match open {
+                    b'[' => b']',
+                    b'{' => b'}',
+                    b'(' => b')',
+                    b'<' => b'>',
+                    other => other,
+                };
+                let mut scan = idx + 3;
+                loop {
+                    if scan >= end {
+                        // The offset sits inside the (possibly unterminated)
+                        // q-quoted literal body.
+                        return true;
+                    }
+                    if bytes[scan] == close && bytes.get(scan + 1) == Some(&b'\'') {
+                        idx = scan + 2;
+                        break;
+                    }
+                    scan += 1;
+                }
+            }
             (b'\'', _) => {
                 in_single = true;
                 idx += 1;
@@ -47338,6 +47390,25 @@ fn intellisense_sweep_word_is_literal_or_comment_body(script: &str, offset: usiz
     }
 
     in_single || in_double || in_line_comment || in_block_comment
+}
+
+/// The sweep's literal/comment scanner must treat the body of an Oracle
+/// q-quoted literal as literal text (its internal apostrophes previously
+/// flipped the naive quote tracking and mis-marked following code).
+#[test]
+fn sweep_literal_scanner_understands_q_quoted_literals() {
+    let script =
+        "BEGIN l_sql := q'[ SELECT 'x' FROM t; EXIT WHEN l_rc%NOTFOUND; ]'; call_proc; END;";
+    let inside = script.find("NOTFOUND").unwrap();
+    assert!(
+        intellisense_sweep_word_is_literal_or_comment_body(script, inside),
+        "q-quote body must be treated as literal"
+    );
+    let after = script.find("call_proc").unwrap();
+    assert!(
+        !intellisense_sweep_word_is_literal_or_comment_body(script, after),
+        "code after a closed q-quote literal must not be treated as literal"
+    );
 }
 
 fn intellisense_sweep_word_starts_line(sql: &str, word_start: usize) -> bool {
@@ -48789,13 +48860,13 @@ fn oracle_test_words_generate_out_report(file_name: &str, fail_on_missing: bool)
 
     let relative_path = format!("test/{file_name}");
     let input_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(&relative_path);
-    let base_data = oracle_test_all_intellisense_data();
+    let base_data = oracle_test_file_scoped_intellisense_data(file_name);
     let out_path = intellisense_sweep_out_path(&input_path);
     intellisense_sweep_generate_report_for_file(
         &input_path,
         Oracle,
         &base_data,
-        Some("test Oracle inferred catalog + Oracle built-ins"),
+        Some("test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins"),
         &out_path,
         fail_on_missing,
     );
@@ -83258,7 +83329,7 @@ fn oracle_fixture_completion_case_failures(
             continue;
         }
 
-        let mut data = oracle_test_all_intellisense_data();
+        let mut data = oracle_test_file_scoped_intellisense_data(file_name);
         let suggestions = query_completion_suggestions_with_data(
             &marked,
             crate::db::DatabaseType::Oracle,
@@ -83611,6 +83682,67 @@ fn oracle_test1_to_test11_actual_completion_regressions() {
                 "log_msg ('qt_pkg_extreme', 'load_bonus_sales_error', SQLERRM);\n            END IF;\n            RAISE;",
                 "log_msg ('qt_pkg_extreme', 'load_bonus_sales_error', SQLERRM);\n            END I|;\n            RAISE;",
                 "IF",
+            ),
+        ],
+    );
+    // Recurring clusters from the test11.txt sweep report (production-flow
+    // harness): DDL column-definition tails, the select-list `AS` alias
+    // keyword, JSON_VALUE RETURNING, MERGE target-alias columns and the MERGE
+    // INSERT `VALUES` keyword, INSERT ALL condition/select columns, and the
+    // `BEGIN` block keyword.
+    assert_oracle_fixture_completion_cases(
+        "test11.txt",
+        &[
+            (
+                "created_at     TIMESTAMP      DEFAULT SYSTIMESTAMP NOT NULL,\n    CONSTRAINT qt_departments_fk_parent",
+                "created_at     TIMESTAMP      DEFA| SYSTIMESTAMP NOT NULL,\n    CONSTRAINT qt_departments_fk_parent",
+                "DEFAULT",
+            ),
+            (
+                "sale_date  DATE            NOT NULL,",
+                "sale_date  DATE            NO| NULL,",
+                "NOT",
+            ),
+            (
+                "e.emp_name AS \"Employee Name\",",
+                "e.emp_name A| \"Employee Name\",",
+                "AS",
+            ),
+            (
+                "'$.level' RETURNING VARCHAR2 (20)",
+                "'$.level' RETU| VARCHAR2 (20)",
+                "RETURNING",
+            ),
+            (
+                "UPDATE SET dst.amount = src.amount,",
+                "UPDATE SET dst.amou| = src.amount,",
+                "amount",
+            ),
+            ("dst.note = src.note", "dst.not| = src.note", "note"),
+            (
+                "note) VALUES (src.sale_id",
+                "note) VALU| (src.sale_id",
+                "VALUES",
+            ),
+            (
+                "WHEN amount >= 500 THEN",
+                "WHEN amou| >= 500 THEN",
+                "amount",
+            ),
+            (
+                "SELECT sale_id,\n    amount\nFROM qt_sales",
+                "SELECT sale_id,\n    amou|\nFROM qt_sales",
+                "amount",
+            ),
+            (
+                "BEGIN\n    l_sql := q'[",
+                "BEGI|\n    l_sql := q'[",
+                "BEGIN",
+            ),
+            (
+                "DECLARE\n    l_val NUMBER := 10;\nBEGIN\n    DECLARE",
+                "DECLARE\n    l_val NUMBER := 10;\nBEGI|\n    DECLARE",
+                "BEGIN",
             ),
         ],
     );
@@ -85820,4 +85952,5 @@ fn plsql_execute_immediate_tail_space_auto_trigger_is_slot_precise() {
         )
     );
 }
+
 

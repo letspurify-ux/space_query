@@ -14,15 +14,15 @@
 ------------------------------------------------------------------------
 
 DECLARE
-    [[PROCEDURE]] safe_drop (p_sql VARCHAR2) IS
-    [[BEGIN]]
+    PROCEDURE safe_drop (p_sql VARCHAR2) IS
+    BEGIN
         EXECUTE IMMEDIATE p_sql;
     EXCEPTION
         WHEN OTHERS THEN
             IF [[SQLCODE]] NOT IN (- 4043, - 4080, - 942, - 2289) THEN
                 RAISE;
             END IF;
-    [[END]] safe_drop;
+    END safe_drop;
 
 [[BEGIN]]
     safe_drop ('drop trigger qt_sales_ct');
@@ -88,11 +88,11 @@ CREATE TABLE qt_audit_log (
 
 ALTER TABLE qt_emp ADD CONSTRAINT qt_emp_email_uk UNIQUE (email);
 
-ALTER TABLE qt_sales ADD CONSTRAINT qt_sales_amt_ck CHECK ([[amount]] >= 0
-        AND [[tax]] >= 0);
+ALTER TABLE qt_sales ADD CONSTRAINT qt_sales_amt_ck CHECK (amount >= 0
+        AND tax >= 0);
 
 CREATE INDEX qt_sales_ix1
-    ON qt_sales (emp_id, [[sale_dt]] DESC);
+    ON qt_sales (emp_id, sale_dt DESC);
 
 CREATE INDEX qt_emp_ix_upper_name
     ON qt_emp (UPPER (emp_name));
@@ -101,7 +101,7 @@ COMMENT
     ON TABLE qt_emp IS '직원 마스터; 세미콜론 ; 슬래시 / 포함';
 
 COMMENT
-    ON COLUMN qt_emp.[[note]] IS '자유 메모: q-quote, --, / * pseudo-comment * / 테스트';
+    ON COLUMN qt_emp.note IS '자유 메모: q-quote, --, / * pseudo-comment * / 테스트';
 
 COMMENT
     ON TABLE qt_sales IS '매출 테이블; trigger, merge, analytic, pivot 테스트용';
@@ -200,9 +200,9 @@ WITH [[sale_base]] AS (
         s.amount,
         s.tax,
         s.status,
-        TRUNC (s.sale_dt, 'MM') [[AS]] sale_month,
-        SUM (s.amount) OVER (PARTITION BY e.emp_id) [[AS]] total_amount_by_emp,
-        ROW_NUMBER () OVER (PARTITION BY e.emp_id ORDER BY s.[[sale_dt]] DESC, s.[[amount]] DESC) [[AS]] rn
+        TRUNC (s.sale_dt, 'MM') AS sale_month,
+        SUM (s.amount) OVER (PARTITION BY e.emp_id) AS total_amount_by_emp,
+        ROW_NUMBER () OVER (PARTITION BY e.emp_id ORDER BY s.sale_dt DESC, s.amount DESC) AS [[rn]]
     FROM qt_emp e
     JOIN qt_dept d
         ON d.dept_id = e.dept_id
@@ -225,7 +225,7 @@ CREATE OR REPLACE TYPE qt_obj_emp_tab AS
 /
 
 CREATE OR REPLACE FUNCTION qt_pipe_emp (p_dept_id NUMBER DEFAULT NULL) RETURN qt_obj_emp_tab PIPELINED IS
-[[BEGIN]]
+BEGIN
     FOR r IN (
         [[SELECT]] e.emp_id,
             e.emp_name,
@@ -290,11 +290,11 @@ END [[qt_sales_ct]];
 ------------------------------------------------------------------------
 
 CREATE OR REPLACE PACKAGE qt_pkg_extreme IS
-    [[SUBTYPE]] t_vc4000 IS VARCHAR2 (4000);
-    [[TYPE]] t_emp_rec IS RECORD (emp_id qt_emp.emp_id%TYPE, emp_name qt_emp.emp_name%TYPE, dept_name qt_dept.dept_name%TYPE, salary qt_emp.salary%TYPE);
-    [[TYPE]] t_emp_tab IS TABLE OF [[t_emp_rec]] INDEX BY PLS_INTEGER;
-    [[TYPE]] t_num_ntt IS TABLE OF NUMBER;
-    [[TYPE]] t_refcur IS REF CURSOR;
+    SUBTYPE t_vc4000 IS VARCHAR2 (4000);
+    TYPE t_emp_rec IS RECORD (emp_id qt_emp.emp_id%TYPE, emp_name qt_emp.emp_name%TYPE, dept_name qt_dept.dept_name%TYPE, salary qt_emp.salary%TYPE);
+    TYPE t_emp_tab IS TABLE OF [[t_emp_rec]] INDEX BY PLS_INTEGER;
+    TYPE t_num_ntt IS TABLE OF NUMBER;
+    TYPE t_refcur IS REF CURSOR;
     g_default_status CONSTANT VARCHAR2 (20) := 'NEW';
     g_banner CONSTANT [[t_vc4000]] := q'[
 Parser torture test:
@@ -304,11 +304,11 @@ Parser torture test:
   - double quote "
   - pseudo comment text: / * ... * / and --
 ]';
-    FUNCTION normalize_name (p_name VARCHAR2) RETURN VARCHAR2 DETERMINISTIC;
-    FUNCTION json_like_report (p_emp_id NUMBER) RETURN CLOB;
-    PROCEDURE load_bonus_sales (p_year NUMBER, p_debug BOOLEAN DEFAULT FALSE);
+    FUNCTION normalize_name ([[p_name]] VARCHAR2) RETURN VARCHAR2 DETERMINISTIC;
+    FUNCTION json_like_report ([[p_emp_id]] NUMBER) RETURN CLOB;
+    PROCEDURE load_bonus_sales ([[p_year]] NUMBER, p_debug BOOLEAN DEFAULT FALSE);
     PROCEDURE open_emp_cursor (p_dept_id IN NUMBER, p_min_amount IN NUMBER DEFAULT 0, p_rc OUT SYS_REFCURSOR);
-END qt_pkg_extreme;
+[[END]] qt_pkg_extreme;
 /
 
 ------------------------------------------------------------------------
@@ -317,7 +317,7 @@ END qt_pkg_extreme;
 
 CREATE OR REPLACE PACKAGE BODY qt_pkg_extreme IS
     g_run_mode VARCHAR2 (30);
-    PROCEDURE log_msg (p_module VARCHAR2, p_action VARCHAR2, p_text CLOB) IS
+    PROCEDURE log_msg ([[p_module]] VARCHAR2, [[p_action]] VARCHAR2, [[p_text]] CLOB) IS
         PRAGMA AUTONOMOUS_TRANSACTION;
     BEGIN
         INSERT INTO qt_audit_log (module_name, action_name, log_text)
@@ -329,15 +329,15 @@ CREATE OR REPLACE PACKAGE BODY qt_pkg_extreme IS
             RAISE;
     END log_msg;
 
-    FUNCTION normalize_name (p_name VARCHAR2) RETURN VARCHAR2 DETERMINISTIC IS
+    FUNCTION normalize_name ([[p_name]] VARCHAR2) RETURN VARCHAR2 DETERMINISTIC IS
     BEGIN
         RETURN REGEXP_REPLACE (UPPER (TRIM (p_name)), '\s+', ' ');
     END normalize_name;
 
-    FUNCTION json_like_report (p_emp_id NUMBER) RETURN CLOB IS
+    FUNCTION json_like_report ([[p_emp_id]] NUMBER) RETURN CLOB IS
         v_report CLOB;
-        v_name qt_emp.emp_name%TYPE;
-        v_dept qt_dept.dept_name%TYPE;
+        v_name qt_emp.emp_name%[[TYPE]];
+        v_dept qt_dept.dept_name%[[TYPE]];
         v_total NUMBER;
     BEGIN
         SELECT e.emp_name,
@@ -349,10 +349,10 @@ CREATE OR REPLACE PACKAGE BODY qt_pkg_extreme IS
         FROM qt_emp e
         JOIN qt_dept d
             ON d.dept_id = e.dept_id
-        LEFT JOIN qt_sales s
-            ON s.emp_id = e.emp_id
+        [[LEFT]] JOIN qt_sales s
+            [[ON]] s.emp_id = e.emp_id
         WHERE e.emp_id = p_emp_id
-        GROUP BY e.emp_name,
+        [[GROUP]] BY e.emp_name,
             d.dept_name;
         v_report := '{' || '"empId":' || p_emp_id || ',"empName":"' || REPLACE (v_name, '"', '\"') || '"' || ',"deptName":"' || REPLACE (v_dept, '"', '\"') || '"' || ',"totalSales":' || TO_CHAR (v_total, 'FM9999990D00', 'NLS_NUMERIC_CHARACTERS=.,') || '}';
         RETURN v_report;
@@ -361,8 +361,8 @@ CREATE OR REPLACE PACKAGE BODY qt_pkg_extreme IS
             RETURN '{"empId":null,"error":"NO_DATA_FOUND"}';
     END json_like_report;
 
-    PROCEDURE load_bonus_sales (p_year NUMBER, p_debug BOOLEAN DEFAULT FALSE) IS
-        TYPE t_sales_src_rec IS RECORD (emp_id qt_emp.emp_id%TYPE, sale_dt DATE, amount NUMBER (12, 2), tax NUMBER (12, 2), 
+    PROCEDURE load_bonus_sales ([[p_year]] NUMBER, p_debug BOOLEAN DEFAULT FALSE) IS
+        TYPE t_sales_src_rec IS RECORD ([[emp_id]] qt_emp.emp_id%TYPE, sale_dt DATE, [[amount]] NUMBER (12, 2), [[tax]] NUMBER (12, 2), 
         remark   VARCHAR2(4000)
         );
         TYPE t_sales_src_tab IS TABLE OF t_sales_src_rec;
@@ -378,14 +378,14 @@ CREATE OR REPLACE PACKAGE BODY qt_pkg_extreme IS
         FROM qt_emp e
         WHERE EXTRACT (YEAR
         FROM e.hired_at) <= p_year
-            AND e.[[active_yn]] = 'Y';
-        [[PROCEDURE]] DEBUG ([[p_text]] VARCHAR2) IS
-        [[BEGIN]]
+            AND e.active_yn = 'Y';
+        PROCEDURE DEBUG ([[p_text]] VARCHAR2) IS
+        BEGIN
             IF p_debug THEN
                 DBMS_OUTPUT.PUT_LINE ('[DEBUG] ' || p_text);
             END IF;
-        [[END]] DEBUG;
-    [[BEGIN]]
+        END DEBUG;
+    BEGIN
         OPEN c_src;
         FETCH c_src BULK COLLECT
         INTO l_rows;
@@ -413,7 +413,7 @@ CREATE OR REPLACE PACKAGE BODY qt_pkg_extreme IS
 
     [[PROCEDURE]] open_emp_cursor (p_dept_id [[IN]] NUMBER, p_min_amount [[IN]] NUMBER DEFAULT 0, p_rc OUT SYS_REFCURSOR) IS
         v_sql CLOB;
-    [[BEGIN]]
+    BEGIN
         v_sql := q'[
             WITH sales_agg AS (
                 SELECT
@@ -471,7 +471,7 @@ MERGE INTO qt_sales dst USING (
     WITH [[bonus_src]] AS (
         SELECT
             e.emp_id,
-            TRUNC (SYSDATE, 'MM') [[AS]] sale_dt,
+            TRUNC (SYSDATE, 'MM') AS sale_dt,
             ROUND (NVL (e.salary, 0) *
                 CASE
                     WHEN e.dept_id = 20 THEN 0.15
@@ -480,26 +480,26 @@ MERGE INTO qt_sales dst USING (
             ROUND (NVL (e.salary, 0) * 0.01, 2) AS tax,
             'MERGE-UPSERT' AS REMARK
         FROM qt_emp e
-        WHERE e.[[active_yn]] = 'Y'
+        WHERE e.active_yn = 'Y'
     )
     SELECT *
     FROM bonus_src
 ) src
     ON (dst.emp_id = src.emp_id
-        AND dst.[[sale_dt]] = src.sale_dt
+        AND dst.sale_dt = src.sale_dt
         AND dst.[[REMARK]] = src.REMARK)
     [[WHEN]] MATCHED THEN
 UPDATE
-SET dst.[[amount]] = src.amount,
-    dst.[[tax]] = src.tax,
-    dst.[[status]] = 'PAID'
+SET dst.amount = src.amount,
+    dst.tax = src.tax,
+    dst.status = 'PAID'
 DELETE
-WHERE dst.[[amount]] = 0
+WHERE dst.amount = 0
     WHEN NOT MATCHED THEN
 INSERT (sale_id, emp_id, sale_dt, amount, tax, status, 
 remark
 )
-[[VALUES]] (NULL, src.emp_id, src.sale_dt, src.amount, src.tax, 'NEW', src.REMARK);
+VALUES (NULL, src.emp_id, src.sale_dt, src.amount, src.tax, 'NEW', src.REMARK);
 
 UPDATE qt_emp e
 SET e.salary = e.salary + (
@@ -507,23 +507,23 @@ SET e.salary = e.salary + (
     FROM qt_sales s
     WHERE s.emp_id = e.emp_id
 ),
-    e.[[note]] = NVL (e.note, EMPTY_CLOB ()) || CHR (10) || 'UPDATED@' || TO_CHAR (SYSTIMESTAMP, 'YYYY-MM-DD HH24:MI:SS.FF3')
-WHERE e.[[active_yn]] = 'Y'
+    e.note = NVL (e.note, EMPTY_CLOB ()) || CHR (10) || 'UPDATED@' || TO_CHAR (SYSTIMESTAMP, 'YYYY-MM-DD HH24:MI:SS.FF3')
+WHERE e.active_yn = 'Y'
     AND EXISTS (
         SELECT 1
         FROM qt_sales s
         WHERE s.emp_id = e.emp_id
-            AND s.[[status]] IN ('NEW', 'PAID')
+            AND s.status IN ('NEW', 'PAID')
     );
 
 DELETE
 FROM qt_sales s
-WHERE s.[[status]] = 'CANCEL'
+WHERE s.status = 'CANCEL'
     AND EXISTS (
         SELECT 1
         FROM qt_emp e
         WHERE e.emp_id = s.emp_id
-            AND e.[[active_yn]] = 'N'
+            AND e.active_yn = 'N'
     );
 
 ------------------------------------------------------------------------
@@ -532,7 +532,7 @@ WHERE s.[[status]] = 'CANCEL'
 
 DECLARE
     l_new_sale_id qt_sales.sale_id%TYPE;
-[[BEGIN]]
+BEGIN
     INSERT INTO qt_sales (sale_id, emp_id, sale_dt, amount, tax, status, 
     remark
     )
@@ -548,26 +548,26 @@ END;
 ------------------------------------------------------------------------
 
 DECLARE
-    [[CURSOR]] c_emp IS
+    CURSOR c_emp IS
     SELECT *
     FROM qt_emp
-    [[WHERE]] [[active_yn]] = 'Y'
+    [[WHERE]] active_yn = 'Y'
     [[ORDER]] BY emp_id;
-    [[TYPE]] t_emp_row_tab IS TABLE OF c_emp%ROWTYPE;
+    TYPE t_emp_row_tab IS TABLE OF c_emp%ROWTYPE;
     l_batch t_emp_row_tab;
-[[BEGIN]]
+BEGIN
     OPEN c_emp;
     LOOP
         FETCH c_emp BULK COLLECT
         INTO l_batch
             LIMIT 3;
-        EXIT [[WHEN]] [[l_batch]].[[COUNT]] = 0;
-        FOR i IN 1..l_batch.[[COUNT]] [[LOOP]]
-            DBMS_OUTPUT.PUT_LINE ('BATCH EMP=' || l_batch (i).emp_id || ':' || l_batch (i).emp_name);
-        END LOOP;
-    END LOOP;
-    CLOSE c_emp;
-END;
+        [[EXIT]] [[WHEN]] [[l_batch]].[[COUNT]] = 0;
+        [[FOR]] i IN 1..l_batch.[[COUNT]] [[LOOP]]
+            DBMS_OUTPUT.[[PUT_LINE]] ('BATCH EMP=' || l_batch (i).[[emp_id]] || ':' || l_batch (i).emp_name);
+        [[END]] [[LOOP]];
+    [[END]] [[LOOP]];
+    [[CLOSE]] c_emp;
+[[END]];
 /
 
 ------------------------------------------------------------------------
@@ -575,14 +575,14 @@ END;
 ------------------------------------------------------------------------
 
 WITH [[FUNCTION]] [[calc_bonus]] ([[p_amount]] NUMBER) RETURN NUMBER IS
-    [[BEGIN]]
+    BEGIN
         RETURN ROUND (p_amount * 0.10, 2);
     END;
 
 SELECT
     e.emp_id,
     e.emp_name,
-    [[calc_bonus]] (NVL (e.salary, 0)) [[AS]] calc_bonus
+    [[calc_bonus]] (NVL (e.salary, 0)) AS calc_bonus
 FROM qt_emp e
 ORDER BY e.emp_id;
 
@@ -605,7 +605,7 @@ WITH [[dept_tree]] (dept_id, dept_name, parent_dept_id, lvl, path_txt) AS (
         c.dept_name,
         c.parent_dept_id,
         p.lvl + 1 AS lvl,
-        p.path_txt || '>' || c.dept_id [[AS]] path_txt
+        p.path_txt || '>' || c.dept_id AS path_txt
     FROM qt_dept c
     [[JOIN]] dept_tree p
         ON p.dept_id = c.parent_dept_id
@@ -617,10 +617,10 @@ sales_ranked AS (
         d.dept_name,
         s.sale_dt,
         s.amount,
-        SUM (s.amount) OVER (PARTITION BY e.emp_id) [[AS]] total_by_emp,
-        DENSE_RANK () OVER (PARTITION BY d.dept_name ORDER BY s.[[amount]] DESC NULLS LAST) [[AS]] dept_rank,
-        LAG (s.amount) OVER (PARTITION BY e.emp_id ORDER BY s.sale_dt) [[AS]] prev_amount,
-        LEAD (s.amount) OVER (PARTITION BY e.emp_id ORDER BY s.sale_dt) [[AS]] next_amount
+        SUM (s.amount) OVER (PARTITION BY e.emp_id) AS total_by_emp,
+        DENSE_RANK () OVER (PARTITION BY d.dept_name ORDER BY s.amount DESC NULLS LAST) AS dept_rank,
+        LAG (s.amount) OVER (PARTITION BY e.emp_id ORDER BY s.sale_dt) AS prev_amount,
+        LEAD (s.amount) OVER (PARTITION BY e.emp_id ORDER BY s.sale_dt) AS next_amount
     FROM qt_emp e
     JOIN qt_dept d
         ON d.dept_id = e.dept_id
@@ -637,8 +637,8 @@ SELECT
     r.amount,
     r.total_by_emp,
     r.dept_rank,
-    NVL (r.amount - r.prev_amount, 0) [[AS]] diff_from_prev,
-    NVL (r.next_amount - r.amount, 0) [[AS]] diff_to_next
+    NVL (r.amount - r.prev_amount, 0) AS diff_from_prev,
+    NVL (r.next_amount - r.amount, 0) AS diff_to_next
 FROM dept_tree t
 JOIN sales_ranked r
     ON r.dept_name = t.dept_name
@@ -646,7 +646,7 @@ WHERE EXISTS (
         SELECT 1
         FROM qt_emp e2
         WHERE e2.emp_id = r.emp_id
-            AND e2.[[active_yn]] = 'Y'
+            AND e2.active_yn = 'Y'
     )
 ORDER BY t.path_txt,
     r.emp_name,
@@ -660,7 +660,7 @@ SELECT *
 FROM (
         SELECT TO_CHAR (sale_dt, 'YYYY-MM') AS sale_month,
             status,
-            [[amount]]
+            amount
         FROM qt_sales
     ) [[PIVOT]] (SUM (amount)
 FOR status IN ('NEW' AS new_amt, 'PAID' AS paid_amt, 'CANCEL' AS cancel_amt))
@@ -674,12 +674,12 @@ SELECT *
 FROM (
         SELECT emp_id,
             salary,
-            NVL (commission_pct, 0) [[AS]] commission_pct
+            NVL (commission_pct, 0) AS commission_pct
         FROM qt_emp
     ) [[UNPIVOT]] INCLUDE NULLS ([[metric_value]]
 FOR metric_name IN (salary [[AS]] 'SALARY', [[commission_pct]] [[AS]] 'COMMISSION'))
 [[ORDER]] BY emp_id,
-    [[metric_name]];
+    metric_name;
 
 ------------------------------------------------------------------------
 -- 15. CROSS APPLY
@@ -690,8 +690,8 @@ SELECT e.emp_id,
     x.max_amt,
     x.min_amt
 FROM qt_emp e CROSS APPLY (
-        SELECT MAX (s.amount) [[AS]] max_amt,
-            MIN (s.amount) [[AS]] min_amt
+        SELECT MAX (s.amount) AS max_amt,
+            MIN (s.amount) AS min_amt
         FROM qt_sales s
         WHERE s.emp_id = e.emp_id
     ) x
@@ -701,19 +701,19 @@ ORDER BY e.emp_id;
 -- 16. GROUPING SETS + LISTAGG
 ------------------------------------------------------------------------
 
-SELECT NVL (d.dept_name, 'ALL') [[AS]] dept_name,
-    NVL (e.active_yn, '*') [[AS]] active_yn,
+SELECT NVL (d.dept_name, 'ALL') AS dept_name,
+    NVL (e.active_yn, '*') AS active_yn,
     SUM (e.salary) AS total_salary
 FROM qt_emp e
 JOIN qt_dept d
     ON d.dept_id = e.dept_id
-GROUP BY GROUPING SETS ((d.dept_name, e.[[active_yn]]), (d.dept_name), ())
+GROUP BY GROUPING SETS ((d.dept_name, e.active_yn), (d.dept_name), ())
 ORDER BY dept_name,
-    [[active_yn]];
+    active_yn;
 
 SELECT d.dept_name,
     LISTAGG (e.emp_name, ', ') WITHIN
-    GROUP ([[ORDER]] BY e.emp_name) [[AS]] emp_list
+    GROUP ([[ORDER]] BY e.emp_name) AS emp_list
 FROM qt_dept d
 LEFT JOIN qt_emp e
     ON e.dept_id = d.dept_id
@@ -724,12 +724,12 @@ ORDER BY d.dept_name;
 -- 17. CONNECT BY
 ------------------------------------------------------------------------
 
-SELECT LEVEL [[AS]] lvl,
-    LPAD (' ', ([[LEVEL]] - 1) * 2) || dept_name [[AS]] tree_name,
-    SYS_CONNECT_BY_PATH (dept_name, ' > ') [[AS]] path_txt
+SELECT LEVEL AS lvl,
+    LPAD (' ', ([[LEVEL]] - 1) * 2) || dept_name AS tree_name,
+    SYS_CONNECT_BY_PATH (dept_name, ' > ') AS path_txt
 FROM qt_dept
 START [[WITH]] parent_dept_id IS NULL
-CONNECT BY PRIOR dept_id = parent_dept_id
+CONNECT [[BY]] PRIOR dept_id = parent_dept_id
 ORDER [[SIBLINGS]] BY dept_name;
 
 ------------------------------------------------------------------------
@@ -737,7 +737,7 @@ ORDER [[SIBLINGS]] BY dept_name;
 ------------------------------------------------------------------------
 
 DECLARE
-    [[TYPE]] t_varchar_tab IS TABLE OF VARCHAR2 (100);
+    TYPE t_varchar_tab IS TABLE OF VARCHAR2 (100);
     l_names t_varchar_tab := t_varchar_tab ('  Alice  ', 'Bob', q'[Carol / ; --]', 'D''Angelo');
     l_rc SYS_REFCURSOR;
     l_emp_id NUMBER;
@@ -749,13 +749,13 @@ DECLARE
     l_grade VARCHAR2 (20);
     l_sale_rows NUMBER;
     l_sale_sum NUMBER;
-    [[PROCEDURE]] print_line (p_txt VARCHAR2) IS
-    [[BEGIN]]
+    PROCEDURE print_line (p_txt VARCHAR2) IS
+    BEGIN
         DBMS_OUTPUT.PUT_LINE (p_txt);
     END print_line;
 
-    [[FUNCTION]] safe_div (p_num NUMBER, p_den NUMBER) RETURN NUMBER IS
-    [[BEGIN]]
+    FUNCTION safe_div (p_num NUMBER, p_den NUMBER) RETURN NUMBER IS
+    BEGIN
         RETURN
         CASE
             WHEN p_den = 0 THEN
@@ -763,7 +763,7 @@ DECLARE
             ELSE
                 p_num / p_den
         END;
-    [[END]] safe_div;
+    END safe_div;
 
 BEGIN
     SAVEPOINT [[before_bonus]];
@@ -778,7 +778,7 @@ BEGIN
             l_sale_count,
             l_last_sale_dt,
             l_grade;
-        EXIT [[WHEN]] [[l_rc]]%NOTFOUND;
+        EXIT [[WHEN]] [[l_rc]]%[[NOTFOUND]];
         print_line ('CURSOR => emp_id=' || l_emp_id || ', name=' || l_emp_name || ', grade=' || l_grade || ', avg=' || TO_CHAR (safe_div (l_total_amount, NULLIF (l_sale_count, 0)), 'FM9999990D00', 'NLS_NUMERIC_CHARACTERS=.,'));
     END LOOP;
     CLOSE l_rc;
@@ -826,13 +826,13 @@ COMMIT;
 -- 19. FINAL VALIDATION QUERIES
 ------------------------------------------------------------------------
 
-SELECT e.emp_id [[AS]] "Emp ID",
-    e.emp_name [[AS]] "Emp Name",
-    e.[[upper_name]] [[AS]] "UPPER_NAME"
+SELECT e.emp_id AS "Emp ID",
+    e.emp_name AS "Emp Name",
+    e.upper_name AS "UPPER_NAME"
 FROM qt_emp e
 ORDER BY e.emp_id;
 
-SELECT qt_pkg_extreme.json_like_report (1) [[AS]] emp_report
+SELECT qt_pkg_extreme.json_like_report (1) AS emp_report
 FROM DUAL;
 
 SELECT *
@@ -846,7 +846,7 @@ ORDER BY emp_id;
 
 SELECT log_id,
     module_name,
-    [[action_name]]
+    action_name
 FROM qt_audit_log
 ORDER BY log_id;
 
@@ -854,36 +854,24 @@ ORDER BY log_id;
 -- IntelliSense sweep report generated by intellisense sweep
 -- source: test/test10.txt
 -- db: Oracle
--- metadata: test Oracle inferred catalog + Oracle built-ins
--- checked: 1430
--- missing: 168
+-- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
+-- checked: 1588
+-- missing: 121
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens:
---   17:5 word=PROCEDURE prefix=PROC suggestions=[] total=0 line=PROCEDURE safe_drop (p_sql VARCHAR2) IS
---   18:5 word=BEGIN prefix=BEGI suggestions=[] total=0 line=BEGIN
 --   22:16 word=SQLCODE prefix=SQLC suggestions=[] total=0 line=IF SQLCODE NOT IN (- 4043, - 4080, - 942, - 2289) THEN
---   25:5 word=END prefix=EN suggestions=[] total=0 line=END safe_drop;
 --   27:1 word=BEGIN prefix=BEGI suggestions=[] total=0 line=BEGIN
 --   51:42 word=SYSDATE prefix=SYSD suggestions=[] total=0 line=created_at     DATE          DEFAULT SYSDATE NOT NULL,
 --   66:76 word=VIRTUAL prefix=VIRT suggestions=[] total=0 line=upper_name     VARCHAR2(1000)     GENERATED ALWAYS AS(UPPER(emp_name)) VIRTUAL
---   91:60 word=amount prefix=amou suggestions=[] total=0 line=ALTER TABLE qt_sales ADD CONSTRAINT qt_sales_amt_ck CHECK (amount >= 0
---   92:13 word=tax prefix=ta suggestions=[TAN(), TANH(), tag, status, status_cd, status_code, upper_tag, same_status_cnt, total_amt] total=9 line=AND tax >= 0);
---   95:26 word=sale_dt prefix=sale suggestions=[sale_amount, sale_id, sale_month, sale_type, sale_year, qt_sales, qt_sales_seq, qt_emp_sales_v, qt_seq_sales, qt_sale_obj, qt_sale_obj_tab, sales_rank] total=12 line=ON qt_sales (emp_id, sale_dt DESC);
---   104:22 word=note prefix=not suggestions=[] total=0 line=ON COLUMN qt_emp.note IS '자유 메모: q-quote, --, / * pseudo-comment * / 테스트';
 --   110:7 word=WITH prefix=WIT suggestions=[] total=0 line=START WITH 1 INCREMENT BY 1 NOCACHE;
 --   114:9 word=EACH prefix=EAC suggestions=[] total=0 line=FOR EACH ROW
 --   120:9 word=qt_bi_sales prefix=qt_b suggestions=[] total=0 line=END qt_bi_sales;
---   194:6 word=sale_base prefix=sale suggestions=[sale, qt_sales, qt_sales_seq, qt_emp_sales_v, qt_seq_sales, qt_sale_obj, qt_sale_obj_tab, sales_rank, sale_amount, sale_dt, sale_id, sale_month, sale_type, sale_year] total=14 line=WITH sale_base AS (
---   203:33 word=AS prefix=A suggestions=[AND, AT] total=2 line=TRUNC (s.sale_dt, 'MM') AS sale_month,
---   204:53 word=AS prefix=A suggestions=[AND, AT] total=2 line=SUM (s.amount) OVER (PARTITION BY e.emp_id) AS total_amount_by_emp,
---   205:62 word=sale_dt prefix=sale suggestions=[sale_amount, sale_id, sale_month, sale_type, sale_year] total=5 line=ROW_NUMBER () OVER (PARTITION BY e.emp_id ORDER BY s.sale_dt DESC, s.amount DESC) AS rn
---   205:78 word=amount prefix=amou suggestions=[] total=0 line=ROW_NUMBER () OVER (PARTITION BY e.emp_id ORDER BY s.sale_dt DESC, s.amount DESC) AS rn
---   205:91 word=AS prefix=A suggestions=[AND, AT] total=2 line=ROW_NUMBER () OVER (PARTITION BY e.emp_id ORDER BY s.sale_dt DESC, s.amount DESC) AS rn
+--   194:6 word=sale_base prefix=sale suggestions=[sale, qt_sales, qt_sales_seq, qt_emp_sales_v, qt_seq_sales, qt_sale_obj, qt_sale_obj_tab, sales_rank, sale_dt, sale_id, sale_year] total=11 line=WITH sale_base AS (
+--   205:94 word=rn prefix=r suggestions=[] total=0 line=ROW_NUMBER () OVER (PARTITION BY e.emp_id ORDER BY s.sale_dt DESC, s.amount DESC) AS rn
 --   220:13 word=emp_id prefix=emp_ suggestions=[] total=0 line=OBJECT (emp_id NUMBER, emp_name VARCHAR2 (100), dept_name VARCHAR2 (100), total_sales NUMBER);
 --   220:28 word=emp_name prefix=emp_ suggestions=[] total=0 line=OBJECT (emp_id NUMBER, emp_name VARCHAR2 (100), dept_name VARCHAR2 (100), total_sales NUMBER);
 --   220:53 word=dept_name prefix=dept suggestions=[] total=0 line=OBJECT (emp_id NUMBER, emp_name VARCHAR2 (100), dept_name VARCHAR2 (100), total_sales NUMBER);
 --   220:79 word=total_sales prefix=tota suggestions=[] total=0 line=OBJECT (emp_id NUMBER, emp_name VARCHAR2 (100), dept_name VARCHAR2 (100), total_sales NUMBER);
---   228:1 word=BEGIN prefix=BEGI suggestions=[] total=0 line=BEGIN
 --   230:9 word=SELECT prefix=SELE suggestions=[qt_seq_sales] total=1 line=SELECT e.emp_id,
 --   237:9 word=LEFT prefix=LEF suggestions=[] total=0 line=LEFT JOIN qt_sales s
 --   238:13 word=ON prefix=O suggestions=[] total=0 line=ON s.emp_id = e.emp_id
@@ -910,121 +898,86 @@ ORDER BY log_id;
 --   270:25 word=THEN prefix=THE suggestions=[] total=0 line=OR UPDATING THEN
 --   275:9 word=AFTER prefix=AFTE suggestions=[] total=0 line=END AFTER EACH ROW;
 --   275:15 word=EACH prefix=EAC suggestions=[] total=0 line=END AFTER EACH ROW;
---   275:20 word=ROW prefix=RO suggestions=[ROWID, ROWNUM, ROW_NUMBER, ROUND(), ROWIDTOCHAR(), oqt_run_log, DBMS_RANDOM, oqt_row, oqt_row_tab, SYS_REFCURSOR, row_no, profile_json, region, region_name] total=14 line=END AFTER EACH ROW;
+--   275:20 word=ROW prefix=RO suggestions=[ROWID, ROWNUM, ROW_NUMBER, ROUND(), ROWIDTOCHAR(), oqt_run_log, DBMS_RANDOM, oqt_row, oqt_row_tab, SYS_REFCURSOR, row_no, profile_json, region] total=13 line=END AFTER EACH ROW;
 --   277:5 word=AFTER prefix=AFTE suggestions=[] total=0 line=AFTER STATEMENT IS
 --   277:11 word=STATEMENT prefix=STAT suggestions=[status, status_cd, status_code, same_status_cnt] total=4 line=AFTER STATEMENT IS
 --   278:5 word=BEGIN prefix=BEGI suggestions=[] total=0 line=BEGIN
 --   283:9 word=AFTER prefix=AFTE suggestions=[] total=0 line=END AFTER STATEMENT;
 --   283:15 word=STATEMENT prefix=STAT suggestions=[status, status_cd, status_code, same_status_cnt] total=4 line=END AFTER STATEMENT;
 --   285:5 word=qt_sales_ct prefix=qt_s suggestions=[] total=0 line=END qt_sales_ct;
---   293:5 word=SUBTYPE prefix=SUBT suggestions=[] total=0 line=SUBTYPE t_vc4000 IS VARCHAR2 (4000);
---   294:5 word=TYPE prefix=TYP suggestions=[] total=0 line=TYPE t_emp_rec IS RECORD (emp_id qt_emp.emp_id%TYPE, emp_name qt_emp.emp_name%TYPE, dept_name qt_dept.dept_name%TYPE, salary qt_emp.salary%TYPE);
---   295:5 word=TYPE prefix=TYP suggestions=[] total=0 line=TYPE t_emp_tab IS TABLE OF t_emp_rec INDEX BY PLS_INTEGER;
 --   295:32 word=t_emp_rec prefix=t_em suggestions=[] total=0 line=TYPE t_emp_tab IS TABLE OF t_emp_rec INDEX BY PLS_INTEGER;
---   296:5 word=TYPE prefix=TYP suggestions=[] total=0 line=TYPE t_num_ntt IS TABLE OF NUMBER;
---   297:5 word=TYPE prefix=TYP suggestions=[] total=0 line=TYPE t_refcur IS REF CURSOR;
 --   299:23 word=t_vc4000 prefix=t_vc suggestions=[] total=0 line=g_banner CONSTANT t_vc4000 := q'[
---   381:19 word=active_yn prefix=acti suggestions=[] total=0 line=AND e.active_yn = 'Y';
---   382:9 word=PROCEDURE prefix=PROC suggestions=[] total=0 line=PROCEDURE DEBUG (p_text VARCHAR2) IS
+--   307:30 word=p_name prefix=p_na suggestions=[] total=0 line=FUNCTION normalize_name (p_name VARCHAR2) RETURN VARCHAR2 DETERMINISTIC;
+--   308:32 word=p_emp_id prefix=p_em suggestions=[] total=0 line=FUNCTION json_like_report (p_emp_id NUMBER) RETURN CLOB;
+--   309:33 word=p_year prefix=p_ye suggestions=[] total=0 line=PROCEDURE load_bonus_sales (p_year NUMBER, p_debug BOOLEAN DEFAULT FALSE);
+--   311:1 word=END prefix=EN suggestions=[] total=0 line=END qt_pkg_extreme;
+--   320:24 word=p_module prefix=p_mo suggestions=[] total=0 line=PROCEDURE log_msg (p_module VARCHAR2, p_action VARCHAR2, p_text CLOB) IS
+--   320:43 word=p_action prefix=p_ac suggestions=[] total=0 line=PROCEDURE log_msg (p_module VARCHAR2, p_action VARCHAR2, p_text CLOB) IS
+--   320:62 word=p_text prefix=p_te suggestions=[] total=0 line=PROCEDURE log_msg (p_module VARCHAR2, p_action VARCHAR2, p_text CLOB) IS
+--   332:30 word=p_name prefix=p_na suggestions=[] total=0 line=FUNCTION normalize_name (p_name VARCHAR2) RETURN VARCHAR2 DETERMINISTIC IS
+--   337:32 word=p_emp_id prefix=p_em suggestions=[] total=0 line=FUNCTION json_like_report (p_emp_id NUMBER) RETURN CLOB IS
+--   339:32 word=TYPE prefix=TYP suggestions=[] total=0 line=v_name qt_emp.emp_name%TYPE;
+--   340:34 word=TYPE prefix=TYP suggestions=[] total=0 line=v_dept qt_dept.dept_name%TYPE;
+--   352:9 word=LEFT prefix=LEF suggestions=[] total=0 line=LEFT JOIN qt_sales s
+--   353:13 word=ON prefix=O suggestions=[open_emp_cursor, oqt_call_log, OQT_CLOB_FIX_T, oqt_emp, oqt_exec_test, oqt_run_log, oqt_tmp_result, oqt_t_dept, oqt_t_depth, oqt_t_emp, oqt_t_json, oqt_t_log, oqt_t_order_hdr, oqt_t_order_item, oqt_t_test, oqt_t_tree] total=18 line=ON s.emp_id = e.emp_id
+--   355:9 word=GROUP prefix=GROU suggestions=[] total=0 line=GROUP BY e.emp_name,
+--   364:33 word=p_year prefix=p_ye suggestions=[] total=0 line=PROCEDURE load_bonus_sales (p_year NUMBER, p_debug BOOLEAN DEFAULT FALSE) IS
+--   365:41 word=emp_id prefix=emp_ suggestions=[] total=0 line=TYPE t_sales_src_rec IS RECORD (emp_id qt_emp.emp_id%TYPE, sale_dt DATE, amount NUMBER (12, 2), tax NUMBER (12, 2),
+--   365:82 word=amount prefix=amou suggestions=[] total=0 line=TYPE t_sales_src_rec IS RECORD (emp_id qt_emp.emp_id%TYPE, sale_dt DATE, amount NUMBER (12, 2), tax NUMBER (12, 2),
+--   365:105 word=tax prefix=ta suggestions=[TAN(), TANH()] total=2 line=TYPE t_sales_src_rec IS RECORD (emp_id qt_emp.emp_id%TYPE, sale_dt DATE, amount NUMBER (12, 2), tax NUMBER (12, 2),
 --   382:26 word=p_text prefix=p_te suggestions=[] total=0 line=PROCEDURE DEBUG (p_text VARCHAR2) IS
---   383:9 word=BEGIN prefix=BEGI suggestions=[] total=0 line=BEGIN
---   387:9 word=END prefix=EN suggestions=[] total=0 line=END DEBUG;
---   388:5 word=BEGIN prefix=BEGI suggestions=[] total=0 line=BEGIN
 --   394:16 word=i prefix=i suggestions=[IF, IN, INTERVAL, IS, INITCAP(), INSERTCHILDXML(), INSERTCHILDXMLAFTER(), INSERTCHILDXMLBEFORE(), INSERTXMLBEFORE(), INSTR(), id] total=11 line=FORALL i IN INDICES OF l_rows SAVE EXCEPTIONS
 --   394:21 word=INDICES prefix=INDI suggestions=[] total=0 line=FORALL i IN INDICES OF l_rows SAVE EXCEPTIONS
 --   403:16 word=SQLCODE prefix=SQLC suggestions=[] total=0 line=IF SQLCODE = - 24381 THEN
 --   405:40 word=LOOP prefix=LOO suggestions=[] total=0 line=FOR i IN 1..l_failures LOOP
 --   414:5 word=PROCEDURE prefix=PROC suggestions=[] total=0 line=PROCEDURE open_emp_cursor (p_dept_id IN NUMBER, p_min_amount IN NUMBER DEFAULT 0, p_rc OUT SYS_REFCURSOR) IS
---   414:42 word=IN prefix=I suggestions=[IF, IS] total=2 line=PROCEDURE open_emp_cursor (p_dept_id IN NUMBER, p_min_amount IN NUMBER DEFAULT 0, p_rc OUT SYS_REFCURSOR) IS
---   414:66 word=IN prefix=I suggestions=[IF, IS] total=2 line=PROCEDURE open_emp_cursor (p_dept_id IN NUMBER, p_min_amount IN NUMBER DEFAULT 0, p_rc OUT SYS_REFCURSOR) IS
---   416:5 word=BEGIN prefix=BEGI suggestions=[] total=0 line=BEGIN
+--   414:42 word=IN prefix=I suggestions=[IS, IF] total=2 line=PROCEDURE open_emp_cursor (p_dept_id IN NUMBER, p_min_amount IN NUMBER DEFAULT 0, p_rc OUT SYS_REFCURSOR) IS
+--   414:66 word=IN prefix=I suggestions=[IS, IF] total=2 line=PROCEDURE open_emp_cursor (p_dept_id IN NUMBER, p_min_amount IN NUMBER DEFAULT 0, p_rc OUT SYS_REFCURSOR) IS
 --   454:1 word=BEGIN prefix=BEGI suggestions=[] total=0 line=BEGIN
---   471:10 word=bonus_src prefix=bonu suggestions=[bonu, bonus, bonus_pct] total=3 line=WITH bonus_src AS (
---   474:35 word=AS prefix=A suggestions=[AND, AT] total=2 line=TRUNC (SYSDATE, 'MM') AS sale_dt,
---   483:17 word=active_yn prefix=acti suggestions=[] total=0 line=WHERE e.active_yn = 'Y'
---   489:17 word=sale_dt prefix=sale suggestions=[sale_amount, sale_id, sale_month, sale_type, sale_year] total=5 line=AND dst.sale_dt = src.sale_dt
+--   471:10 word=bonus_src prefix=bonu suggestions=[bonu, bonus_pct] total=2 line=WITH bonus_src AS (
 --   490:17 word=REMARK prefix=REMA suggestions=[] total=0 line=AND dst.REMARK = src.REMARK)
 --   491:5 word=WHEN prefix=WHE suggestions=[] total=0 line=WHEN MATCHED THEN
---   493:9 word=amount prefix=amou suggestions=[] total=0 line=SET dst.amount = src.amount,
---   494:9 word=tax prefix=ta suggestions=[] total=0 line=dst.tax = src.tax,
---   495:9 word=status prefix=stat suggestions=[] total=0 line=dst.status = 'PAID'
---   497:11 word=amount prefix=amou suggestions=[] total=0 line=WHERE dst.amount = 0
---   502:1 word=VALUES prefix=VALU suggestions=[VALUE()] total=1 line=VALUES (NULL, src.emp_id, src.sale_dt, src.amount, src.tax, 'NEW', src.REMARK);
---   510:7 word=note prefix=not suggestions=[] total=0 line=e.note = NVL (e.note, EMPTY_CLOB ()) || CHR (10) || 'UPDATED@' || TO_CHAR (SYSTIMESTAMP, 'YYYY-MM-DD HH24:MI:SS.FF3')
---   511:9 word=active_yn prefix=acti suggestions=[] total=0 line=WHERE e.active_yn = 'Y'
---   516:19 word=status prefix=stat suggestions=[] total=0 line=AND s.status IN ('NEW', 'PAID')
---   521:9 word=status prefix=stat suggestions=[] total=0 line=WHERE s.status = 'CANCEL'
---   526:19 word=active_yn prefix=acti suggestions=[] total=0 line=AND e.active_yn = 'N'
---   535:1 word=BEGIN prefix=BEGI suggestions=[] total=0 line=BEGIN
---   551:5 word=CURSOR prefix=CURS suggestions=[] total=0 line=CURSOR c_emp IS
 --   554:5 word=WHERE prefix=WHER suggestions=[] total=0 line=WHERE active_yn = 'Y'
---   554:11 word=active_yn prefix=acti suggestions=[] total=0 line=WHERE active_yn = 'Y'
 --   555:5 word=ORDER prefix=ORDE suggestions=[] total=0 line=ORDER BY emp_id;
---   556:5 word=TYPE prefix=TYP suggestions=[] total=0 line=TYPE t_emp_row_tab IS TABLE OF c_emp%ROWTYPE;
---   558:1 word=BEGIN prefix=BEGI suggestions=[] total=0 line=BEGIN
+--   564:9 word=EXIT prefix=EXI suggestions=[] total=0 line=EXIT WHEN l_batch.COUNT = 0;
 --   564:14 word=WHEN prefix=WHE suggestions=[] total=0 line=EXIT WHEN l_batch.COUNT = 0;
 --   564:19 word=l_batch prefix=l_ba suggestions=[] total=0 line=EXIT WHEN l_batch.COUNT = 0;
 --   564:27 word=COUNT prefix=COUN suggestions=[] total=0 line=EXIT WHEN l_batch.COUNT = 0;
+--   565:9 word=FOR prefix=FO suggestions=[] total=0 line=FOR i IN 1..l_batch.COUNT LOOP
 --   565:29 word=COUNT prefix=COUN suggestions=[] total=0 line=FOR i IN 1..l_batch.COUNT LOOP
 --   565:35 word=LOOP prefix=LOO suggestions=[] total=0 line=FOR i IN 1..l_batch.COUNT LOOP
+--   566:25 word=PUT_LINE prefix=PUT_ suggestions=[] total=0 line=DBMS_OUTPUT.PUT_LINE ('BATCH EMP=' || l_batch (i).emp_id || ':' || l_batch (i).emp_name);
+--   566:63 word=emp_id prefix=emp_ suggestions=[] total=0 line=DBMS_OUTPUT.PUT_LINE ('BATCH EMP=' || l_batch (i).emp_id || ':' || l_batch (i).emp_name);
+--   567:9 word=END prefix=EN suggestions=[] total=0 line=END LOOP;
+--   567:13 word=LOOP prefix=LOO suggestions=[] total=0 line=END LOOP;
+--   568:5 word=END prefix=EN suggestions=[] total=0 line=END LOOP;
+--   568:9 word=LOOP prefix=LOO suggestions=[] total=0 line=END LOOP;
+--   569:5 word=CLOSE prefix=CLOS suggestions=[] total=0 line=CLOSE c_emp;
+--   570:1 word=END prefix=EN suggestions=[] total=0 line=END;
 --   577:6 word=FUNCTION prefix=FUNC suggestions=[] total=0 line=WITH FUNCTION calc_bonus (p_amount NUMBER) RETURN NUMBER IS
---   577:15 word=calc_bonus prefix=calc suggestions=[channel_code] total=1 line=WITH FUNCTION calc_bonus (p_amount NUMBER) RETURN NUMBER IS
+--   577:15 word=calc_bonus prefix=calc suggestions=[] total=0 line=WITH FUNCTION calc_bonus (p_amount NUMBER) RETURN NUMBER IS
 --   577:27 word=p_amount prefix=p_am suggestions=[] total=0 line=WITH FUNCTION calc_bonus (p_amount NUMBER) RETURN NUMBER IS
---   578:5 word=BEGIN prefix=BEGI suggestions=[] total=0 line=BEGIN
---   585:5 word=calc_bonus prefix=calc suggestions=[channel_code] total=1 line=calc_bonus (NVL (e.salary, 0)) AS calc_bonus
---   585:36 word=AS prefix=A suggestions=[AND, AT] total=2 line=calc_bonus (NVL (e.salary, 0)) AS calc_bonus
+--   585:5 word=calc_bonus prefix=calc suggestions=[] total=0 line=calc_bonus (NVL (e.salary, 0)) AS calc_bonus
 --   593:6 word=dept_tree prefix=dept suggestions=[] total=0 line=WITH dept_tree (dept_id, dept_name, parent_dept_id, lvl, path_txt) AS (
---   608:40 word=AS prefix=A suggestions=[AND, AT] total=2 line=p.path_txt || '>' || c.dept_id AS path_txt
 --   610:5 word=JOIN prefix=JOI suggestions=[] total=0 line=JOIN dept_tree p
---   620:53 word=AS prefix=A suggestions=[AND, AT] total=2 line=SUM (s.amount) OVER (PARTITION BY e.emp_id) AS total_by_emp,
---   621:65 word=amount prefix=amou suggestions=[] total=0 line=DENSE_RANK () OVER (PARTITION BY d.dept_name ORDER BY s.amount DESC NULLS LAST) AS dept_rank,
---   621:89 word=AS prefix=A suggestions=[AND, AT] total=2 line=DENSE_RANK () OVER (PARTITION BY d.dept_name ORDER BY s.amount DESC NULLS LAST) AS dept_rank,
---   622:72 word=AS prefix=A suggestions=[AND, AT] total=2 line=LAG (s.amount) OVER (PARTITION BY e.emp_id ORDER BY s.sale_dt) AS prev_amount,
---   623:73 word=AS prefix=A suggestions=[AND, AT] total=2 line=LEAD (s.amount) OVER (PARTITION BY e.emp_id ORDER BY s.sale_dt) AS next_amount
---   640:39 word=AS prefix=A suggestions=[AND, AT] total=2 line=NVL (r.amount - r.prev_amount, 0) AS diff_from_prev,
---   641:39 word=AS prefix=A suggestions=[AND, AT] total=2 line=NVL (r.next_amount - r.amount, 0) AS diff_to_next
---   649:20 word=active_yn prefix=acti suggestions=[] total=0 line=AND e2.active_yn = 'Y'
---   663:13 word=amount prefix=amou suggestions=[] total=0 line=amount
 --   665:7 word=PIVOT prefix=PIVO suggestions=[] total=0 line=) PIVOT (SUM (amount)
---   677:37 word=AS prefix=A suggestions=[AND, AT] total=2 line=NVL (commission_pct, 0) AS commission_pct
 --   679:7 word=UNPIVOT prefix=UNPI suggestions=[] total=0 line=) UNPIVOT INCLUDE NULLS (metric_value
---   679:30 word=metric_value prefix=metr suggestions=[] total=0 line=) UNPIVOT INCLUDE NULLS (metric_value
+--   679:30 word=metric_value prefix=metr suggestions=[metr, metric_name] total=2 line=) UNPIVOT INCLUDE NULLS (metric_value
 --   680:28 word=AS prefix=A suggestions=[AND, AT] total=2 line=FOR metric_name IN (salary AS 'SALARY', commission_pct AS 'COMMISSION'))
 --   680:41 word=commission_pct prefix=comm suggestions=[] total=0 line=FOR metric_name IN (salary AS 'SALARY', commission_pct AS 'COMMISSION'))
 --   680:56 word=AS prefix=A suggestions=[AT, AND] total=2 line=FOR metric_name IN (salary AS 'SALARY', commission_pct AS 'COMMISSION'))
 --   681:1 word=ORDER prefix=ORDE suggestions=[oqt_t_order_hdr, oqt_t_order_item] total=2 line=ORDER BY emp_id,
---   682:5 word=metric_name prefix=metr suggestions=[] total=0 line=metric_name;
---   693:31 word=AS prefix=A suggestions=[AND, AT] total=2 line=SELECT MAX (s.amount) AS max_amt,
---   694:28 word=AS prefix=A suggestions=[AND, AT] total=2 line=MIN (s.amount) AS min_amt
---   704:33 word=AS prefix=A suggestions=[AND, AT] total=2 line=SELECT NVL (d.dept_name, 'ALL') AS dept_name,
---   705:28 word=AS prefix=A suggestions=[AND, AT] total=2 line=NVL (e.active_yn, '*') AS active_yn,
---   710:41 word=active_yn prefix=acti suggestions=[] total=0 line=GROUP BY GROUPING SETS ((d.dept_name, e.active_yn), (d.dept_name), ())
---   712:5 word=active_yn prefix=acti suggestions=[] total=0 line=active_yn;
 --   716:12 word=ORDER prefix=ORDE suggestions=[oqt_t_order_hdr, oqt_t_order_item, order_dt, order_id] total=4 line=GROUP (ORDER BY e.emp_name) AS emp_list
---   716:33 word=AS prefix=A suggestions=[AND, AT] total=2 line=GROUP (ORDER BY e.emp_name) AS emp_list
---   727:14 word=AS prefix=A suggestions=[AND, AT] total=2 line=SELECT LEVEL AS lvl,
 --   728:17 word=LEVEL prefix=LEVE suggestions=[] total=0 line=LPAD (' ', (LEVEL - 1) * 2) || dept_name AS tree_name,
---   728:46 word=AS prefix=A suggestions=[AND, AT] total=2 line=LPAD (' ', (LEVEL - 1) * 2) || dept_name AS tree_name,
---   729:44 word=AS prefix=A suggestions=[AND, AT] total=2 line=SYS_CONNECT_BY_PATH (dept_name, ' > ') AS path_txt
 --   731:7 word=WITH prefix=WIT suggestions=[] total=0 line=START WITH parent_dept_id IS NULL
+--   732:9 word=BY prefix=B suggestions=[] total=0 line=CONNECT BY PRIOR dept_id = parent_dept_id
 --   733:7 word=SIBLINGS prefix=SIBL suggestions=[] total=0 line=ORDER SIBLINGS BY dept_name;
---   740:5 word=TYPE prefix=TYP suggestions=[] total=0 line=TYPE t_varchar_tab IS TABLE OF VARCHAR2 (100);
---   752:5 word=PROCEDURE prefix=PROC suggestions=[] total=0 line=PROCEDURE print_line (p_txt VARCHAR2) IS
---   753:5 word=BEGIN prefix=BEGI suggestions=[] total=0 line=BEGIN
---   757:5 word=FUNCTION prefix=FUNC suggestions=[] total=0 line=FUNCTION safe_div (p_num NUMBER, p_den NUMBER) RETURN NUMBER IS
---   758:5 word=BEGIN prefix=BEGI suggestions=[] total=0 line=BEGIN
---   766:5 word=END prefix=EN suggestions=[] total=0 line=END safe_div;
 --   769:15 word=before_bonus prefix=befo suggestions=[] total=0 line=SAVEPOINT before_bonus;
 --   781:14 word=WHEN prefix=WHE suggestions=[] total=0 line=EXIT WHEN l_rc%NOTFOUND;
 --   781:19 word=l_rc prefix=l_r suggestions=[] total=0 line=EXIT WHEN l_rc%NOTFOUND;
+--   781:24 word=NOTFOUND prefix=NOTF suggestions=[] total=0 line=EXIT WHEN l_rc%NOTFOUND;
 --   791:18 word=outer_loop prefix=oute suggestions=[] total=0 line=EXIT outer_loop WHEN i = 4
 --   791:29 word=WHEN prefix=WHE suggestions=[] total=0 line=EXIT outer_loop WHEN i = 4
---   791:34 word=i prefix=i suggestions=[IS] total=1 line=EXIT outer_loop WHEN i = 4
+--   791:34 word=i prefix=i suggestions=[] total=0 line=EXIT outer_loop WHEN i = 4
 --   801:5 word=WHERE prefix=WHER suggestions=[] total=0 line=WHERE status IN ('NEW', 'PAID');
---   829:17 word=AS prefix=A suggestions=[AND, AT] total=2 line=SELECT e.emp_id AS "Emp ID",
---   830:16 word=AS prefix=A suggestions=[AND, AT] total=2 line=e.emp_name AS "Emp Name",
---   831:7 word=upper_name prefix=uppe suggestions=[] total=0 line=e.upper_name AS "UPPER_NAME"
---   831:18 word=AS prefix=A suggestions=[AND, AT] total=2 line=e.upper_name AS "UPPER_NAME"
---   835:44 word=AS prefix=A suggestions=[AND, AT] total=2 line=SELECT qt_pkg_extreme.json_like_report (1) AS emp_report
---   849:5 word=action_name prefix=acti suggestions=[] total=0 line=action_name
 -- =========================================================

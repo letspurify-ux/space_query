@@ -68,6 +68,10 @@ struct ExpressionKeywordContext {
     /// position, so the flat base keyword dump cannot admit `THEN` at
     /// `CASE WHEN |` or `ELSE` after a closed `CASE`.
     construct_continuation_keywords: &'static [&'static str],
+    /// Whether the cursor sits at a top-level select-list expression position
+    /// (paren depth 0 in the `SELECT` list), where a complete operand can take
+    /// the `AS <alias>` continuation.
+    at_select_list_alias_keyword_slot: bool,
     /// Cursor is in a query-level `ORDER BY` (admits `ASC`/`DESC`/`NULLS`).
     in_order_by: bool,
     /// Whether the cursor follows a complete operand: `Some(true)` after one
@@ -925,6 +929,7 @@ impl ExpressionKeywordContext {
     fn ambiguous() -> Self {
         Self {
             construct_continuation_keywords: &[],
+            at_select_list_alias_keyword_slot: false,
             in_order_by: false,
             follows_operand: None,
             follows_call: false,
@@ -6437,6 +6442,11 @@ impl SqlEditorWidget {
             return ctx.prev_operand_type == PrecedingOperandType::Collection
                 && !crate::sql_text::mysql_compatibility_for_sql("", db_type);
         }
+        // `AS`: the select-list alias introducer, grammatical right after a
+        // complete top-level select-list expression (`SELECT e.emp_name AS x`).
+        if upper == "AS" {
+            return ctx.follows_operand == Some(true) && ctx.at_select_list_alias_keyword_slot;
+        }
 
         let allow_start = ctx.follows_operand != Some(true);
         let allow_after = ctx.follows_operand != Some(false);
@@ -6968,8 +6978,13 @@ impl SqlEditorWidget {
         {
             at_plsql_value_operand = true;
         }
+        let at_select_list_alias_keyword_slot = matches!(
+            deep_ctx.phase,
+            intellisense_context::SqlPhase::SelectList
+        ) && Self::unclosed_paren_count(tokens, end) == 0;
         ExpressionKeywordContext {
             construct_continuation_keywords,
+            at_select_list_alias_keyword_slot,
             in_order_by,
             follows_operand,
             follows_call,
@@ -19598,6 +19613,17 @@ impl SqlEditorWidget {
         exclude_current_identifier_chain: bool,
         db_type: Option<crate::db::DatabaseType>,
     ) -> bool {
+        // Inside a CREATE TABLE element list, `DATE`/`TIMESTAMP` before the
+        // cursor is the column's data type (`created_at TIMESTAMP DEFA|`), not
+        // a temporal-literal introducer; that slot expects the column-property
+        // keywords (`DEFAULT`/`NOT NULL`/…).
+        if Self::cursor_is_at_create_table_element_keyword_slot_for_context(
+            deep_ctx,
+            exclude_current_identifier_chain,
+            db_type,
+        ) {
+            return false;
+        }
         let tokens = Self::current_query_tokens(deep_ctx);
         let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
         let end = Self::expected_suggestion_context_end(
@@ -23284,6 +23310,23 @@ impl SqlEditorWidget {
             });
             if matches!(lead.as_deref(), Some("INSERT") | Some("REPLACE")) {
                 return Some(&["VALUES", "SELECT"]);
+            }
+        }
+        // MERGE `WHEN NOT MATCHED THEN INSERT (cols) |`: only `VALUES` follows
+        // the closed column list (a MERGE insert has no `SELECT` source). The
+        // phase machine is past the INTO phase here, so match on the statement
+        // lead instead.
+        if Self::cursor_after_insert_column_list(tokens, end) {
+            let lead = toks.iter().find_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                _ => None,
+            });
+            if lead.as_deref() == Some("MERGE")
+                && toks.iter().any(|token| {
+                    matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("INSERT"))
+                })
+            {
+                return Some(&["VALUES"]);
             }
         }
         // The target (or its alias) must be complete: the last token is a plain
@@ -47063,7 +47106,16 @@ impl SqlEditorWidget {
                     db_type,
                 ))
         {
-            return Vec::new();
+            // A declaration-item start names a brand-new identifier, so the
+            // identifier catalog stays empty — but the item-head keywords and
+            // the section-closing `BEGIN` are grammatical there and are the
+            // slot's only valid completions.
+            return Self::filter_expected_candidates(
+                prefix,
+                &[
+                    "BEGIN", "CURSOR", "TYPE", "SUBTYPE", "PROCEDURE", "FUNCTION", "PRAGMA",
+                ],
+            );
         }
         if Self::oracle_trigger_update_of_column_slot_context(
             deep_ctx,
@@ -48794,6 +48846,22 @@ impl SqlEditorWidget {
             {
                 result.push(keyword);
             }
+        }
+        // `JSON_VALUE(col, '$.path' RETU|)` — a JSON scalar function accepts a
+        // `RETURNING <type>` clause after its path argument (JSON_TABLE uses
+        // `COLUMNS` instead and is excluded).
+        if !prefix.is_empty()
+            && expr_keyword_ctx.is_some_and(|ctx| ctx.follows_operand == Some(true))
+            && crate::ui::intellisense::suggestion_matches_completion_prefix("RETURNING", prefix)
+            && Self::innermost_open_paren_preceding_word(tokens, context_end).is_some_and(|word| {
+                let upper = word.to_ascii_uppercase();
+                upper.starts_with("JSON_") && upper != "JSON_TABLE"
+            })
+            && !result
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case("RETURNING"))
+        {
+            result.push("RETURNING".to_string());
         }
         result
     }
