@@ -8,7 +8,7 @@ use fltk::{
 use std::collections::{HashMap, HashSet};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, OnceLock};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -104,10 +104,14 @@ struct ColumnLoadWorkerPool {
     worker_senders: Vec<mpsc::Sender<ColumnLoadWorkerMessage>>,
     worker_handles: Mutex<Vec<JoinHandle<()>>>,
     next_worker: AtomicUsize,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl ColumnLoadWorkerPool {
     fn enqueue(&self, task: ColumnLoadTask) -> Result<(), ColumnLoadTask> {
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(task);
+        }
         let worker_count = self.worker_senders.len();
         if worker_count == 0 {
             return Err(task);
@@ -129,6 +133,9 @@ impl ColumnLoadWorkerPool {
     }
 
     fn shutdown(&self) {
+        if self.shutdown.swap(true, Ordering::AcqRel) {
+            return;
+        }
         for sender in &self.worker_senders {
             let _ = sender.send(ColumnLoadWorkerMessage::Shutdown);
         }
@@ -141,13 +148,27 @@ impl ColumnLoadWorkerPool {
             std::mem::take(&mut *guard)
         };
 
-        for handle in handles {
-            if let Err(err) = handle.join() {
-                crate::utils::logging::log_error(
-                    "sql_editor::intellisense::column_loader",
-                    &format!("column worker join failed: {:?}", err),
-                );
-            }
+        if handles.is_empty() {
+            return;
+        }
+
+        let spawn_result = thread::Builder::new()
+            .name("intellisense-column-worker-reaper".to_string())
+            .spawn(move || {
+                for handle in handles {
+                    if let Err(err) = handle.join() {
+                        crate::utils::logging::log_error(
+                            "sql_editor::intellisense::column_loader",
+                            &format!("column worker join failed: {:?}", err),
+                        );
+                    }
+                }
+            });
+        if let Err(err) = spawn_result {
+            crate::utils::logging::log_error(
+                "sql_editor::intellisense::column_loader",
+                &format!("failed to start column worker reaper: {err}"),
+            );
         }
     }
 }

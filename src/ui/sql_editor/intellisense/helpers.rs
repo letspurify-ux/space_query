@@ -329,15 +329,25 @@ impl SqlEditorWidget {
     fn build_column_load_worker_pool() -> ColumnLoadWorkerPool {
         let mut worker_senders = Vec::new();
         let mut worker_handles = Vec::new();
+        let shutdown = Arc::new(AtomicBool::new(false));
 
         for idx in 0..COLUMN_LOAD_WORKER_COUNT {
             let (sender, receiver) = mpsc::channel::<ColumnLoadWorkerMessage>();
+            let shutdown_for_worker = shutdown.clone();
             let spawn_result = thread::Builder::new()
                 .name(format!("intellisense-column-worker-{idx}"))
                 .spawn(move || {
                     while let Ok(message) = receiver.recv() {
                         match message {
                             ColumnLoadWorkerMessage::Task(task) => {
+                                if shutdown_for_worker.load(Ordering::Acquire) {
+                                    Self::send_empty_column_load_update(
+                                        &task.sender,
+                                        &task.table_key,
+                                        task.foreign_keys,
+                                    );
+                                    continue;
+                                }
                                 let task_sender = task.sender.clone();
                                 let task_table_key = task.table_key.clone();
                                 let task_is_foreign_keys = task.foreign_keys;
@@ -388,6 +398,7 @@ impl SqlEditorWidget {
             worker_senders,
             worker_handles: Mutex::new(worker_handles),
             next_worker: AtomicUsize::new(0),
+            shutdown,
         }
     }
 

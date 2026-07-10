@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use quote::ToTokens;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
-use syn::{Expr, ExprCall, ExprMacro, ExprMethodCall, ItemFn, ItemMod, Macro};
+use syn::{Expr, ExprCall, ExprMethodCall, ItemFn, ItemMod, Macro};
 
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -188,11 +188,11 @@ impl Visit<'_> for PanicSyntaxVisitor<'_> {
         visit::visit_item_fn(self, node);
     }
 
-    fn visit_expr_macro(&mut self, node: &ExprMacro) {
-        if let Some(syntax) = macro_panic_syntax(&node.mac) {
-            self.push_offender(node.mac.span().start().line, syntax);
+    fn visit_macro(&mut self, node: &Macro) {
+        if let Some(syntax) = macro_panic_syntax(node) {
+            self.push_offender(node.span().start().line, syntax);
         }
-        visit::visit_expr_macro(self, node);
+        visit::visit_macro(self, node);
     }
 
     fn visit_expr_method_call(&mut self, node: &ExprMethodCall) {
@@ -311,4 +311,29 @@ fn panic_syntax_detector_covers_common_panic_forms() {
         "panic syntax detector missed expected forms: {:?}",
         matched
     );
+}
+
+#[test]
+fn panic_ast_detector_covers_statement_and_expression_macros() {
+    let parsed = syn::parse_file(
+        r#"
+        fn sample() {
+            assert!(true);
+            let _ = assert_eq!(1, 1);
+        }
+        "#,
+    )
+    .expect("parse panic macro sample");
+    let mut visitor = PanicSyntaxVisitor::new("sample.rs");
+    visitor.visit_file(&parsed);
+
+    assert_eq!(visitor.offenders.len(), 2, "{:?}", visitor.offenders);
+    assert!(visitor
+        .offenders
+        .iter()
+        .any(|offender| offender.syntax == "assert!"));
+    assert!(visitor
+        .offenders
+        .iter()
+        .any(|offender| offender.syntax == "assert_eq!"));
 }

@@ -5728,6 +5728,7 @@ fn column_load_worker_pool_enqueue_returns_err_when_worker_pool_is_empty() {
         worker_senders: Vec::new(),
         worker_handles: Mutex::new(Vec::new()),
         next_worker: AtomicUsize::new(0),
+        shutdown: Arc::new(AtomicBool::new(false)),
     };
     let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
     let task = ColumnLoadTask {
@@ -5743,6 +5744,89 @@ fn column_load_worker_pool_enqueue_returns_err_when_worker_pool_is_empty() {
         result.err().map(|value| value.table_key),
         Some(task.table_key)
     );
+}
+
+#[test]
+fn column_load_worker_pool_shutdown_does_not_wait_for_active_worker() {
+    use std::sync::Condvar;
+    use std::time::Instant;
+
+    let (worker_sender, worker_receiver) = mpsc::channel::<ColumnLoadWorkerMessage>();
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let release_for_worker = release.clone();
+    let (started_sender, started_receiver) = mpsc::channel();
+    let (stopped_sender, stopped_receiver) = mpsc::channel();
+    let worker_handle = thread::spawn(move || {
+        if matches!(worker_receiver.recv(), Ok(ColumnLoadWorkerMessage::Task(_))) {
+            let _ = started_sender.send(());
+            let (lock, ready) = &*release_for_worker;
+            let mut released = lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            while !*released {
+                released = ready
+                    .wait(released)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        }
+        while let Ok(message) = worker_receiver.recv() {
+            if matches!(message, ColumnLoadWorkerMessage::Shutdown) {
+                break;
+            }
+        }
+        let _ = stopped_sender.send(());
+    });
+    let pool = ColumnLoadWorkerPool {
+        worker_senders: vec![worker_sender],
+        worker_handles: Mutex::new(vec![worker_handle]),
+        next_worker: AtomicUsize::new(0),
+        shutdown: Arc::new(AtomicBool::new(false)),
+    };
+    let (update_sender, _update_receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let task = ColumnLoadTask {
+        table_key: "EMP".to_string(),
+        connection: create_shared_connection(),
+        sender: update_sender,
+        foreign_keys: false,
+    };
+    assert!(pool.enqueue(task).is_ok());
+    started_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("worker should start the blocking task");
+
+    let release_on_regression = release.clone();
+    let (watchdog_cancel_sender, watchdog_cancel_receiver) = mpsc::channel();
+    thread::spawn(move || {
+        if watchdog_cancel_receiver
+            .recv_timeout(Duration::from_millis(750))
+            .is_err()
+        {
+            let (lock, ready) = &*release_on_regression;
+            *lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+            ready.notify_all();
+        }
+    });
+    let started_at = Instant::now();
+    pool.shutdown();
+    let shutdown_elapsed = started_at.elapsed();
+    let _ = watchdog_cancel_sender.send(());
+
+    let (lock, ready) = &*release;
+    *lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+    ready.notify_all();
+    stopped_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("worker should stop after release");
+
+    assert!(
+        shutdown_elapsed < Duration::from_millis(250),
+        "shutdown blocked for {shutdown_elapsed:?}"
+    );
+    assert!(pool.shutdown.load(Ordering::Acquire));
 }
 
 #[test]

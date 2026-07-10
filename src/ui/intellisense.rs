@@ -4828,17 +4828,19 @@ impl SignaturePopup {
     }
 
     fn display_text(label: &SignatureLabel, active_arg: usize) -> String {
-        match label.arg_spans.get(active_arg) {
-            Some(&(start, end)) if start <= label.text.len() && end <= label.text.len() => {
-                format!(
-                    "{}[ {} ]{}",
-                    &label.text[..start],
-                    &label.text[start..end],
-                    &label.text[end..]
-                )
-            }
-            _ => label.text.clone(),
-        }
+        let Some(&(start, end)) = label.arg_spans.get(active_arg) else {
+            return label.text.clone();
+        };
+        let Some(before) = label.text.get(..start) else {
+            return label.text.clone();
+        };
+        let Some(active) = label.text.get(start..end) else {
+            return label.text.clone();
+        };
+        let Some(after) = label.text.get(end..) else {
+            return label.text.clone();
+        };
+        format!("{before}[ {active} ]{after}")
     }
 
     /// Position inside the editor's parent window. Mirrors the completion
@@ -4961,6 +4963,23 @@ mod intellisense_tests {
         let cursor = text.find('|').expect("cursor marker");
         let text = text.replace('|', "");
         enclosing_call_at_cursor(&text, cursor)
+    }
+
+    #[test]
+    fn signature_popup_display_text_rejects_invalid_spans_without_panicking() {
+        let label = SignatureLabel {
+            text: "PROC(한글)".to_string(),
+            arg_spans: vec![(8, 6), (6, 7)],
+        };
+
+        assert_eq!(SignaturePopup::display_text(&label, 0), label.text);
+        assert_eq!(SignaturePopup::display_text(&label, 1), label.text);
+
+        let valid = SignatureLabel {
+            text: "PROC(한글)".to_string(),
+            arg_spans: vec![(5, 11)],
+        };
+        assert_eq!(SignaturePopup::display_text(&valid, 0), "PROC([ 한글 ])");
     }
 
     #[test]

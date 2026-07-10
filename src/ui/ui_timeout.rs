@@ -77,7 +77,13 @@ thread_local! {
 }
 
 pub(crate) fn schedule(delay_seconds: f64, callback: impl FnOnce() + 'static) -> TimeoutHandle {
-    assert!(app::is_ui_thread());
+    if !app::is_ui_thread() {
+        crate::utils::logging::log_error(
+            "UI timeout",
+            "ignored timeout scheduled outside the UI thread",
+        );
+        return TimeoutHandle(0);
+    }
     let delay_seconds = if delay_seconds.is_finite() {
         delay_seconds.max(0.0)
     } else {
@@ -96,7 +102,13 @@ pub(crate) fn schedule(delay_seconds: f64, callback: impl FnOnce() + 'static) ->
 
 /// Cancels a timeout and immediately drops everything captured by its callback.
 pub(crate) fn cancel(handle: TimeoutHandle) -> bool {
-    assert!(app::is_ui_thread());
+    if !app::is_ui_thread() {
+        crate::utils::logging::log_error(
+            "UI timeout",
+            "ignored timeout cancellation outside the UI thread",
+        );
+        return false;
+    }
     let callback = REGISTRY.with(|registry| {
         registry
             .lock()

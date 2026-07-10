@@ -119,7 +119,22 @@ impl Drop for LatestTaskWorker {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
         {
-            let _ = handle.join();
+            let spawn_result = thread::Builder::new()
+                .name("intellisense-latest-worker-reaper".to_string())
+                .spawn(move || {
+                    if let Err(err) = handle.join() {
+                        crate::utils::logging::log_error(
+                            "sql_editor::intellisense::parse_worker",
+                            &format!("latest worker join failed: {:?}", err),
+                        );
+                    }
+                });
+            if let Err(err) = spawn_result {
+                crate::utils::logging::log_error(
+                    "sql_editor::intellisense::parse_worker",
+                    &format!("failed to start latest worker reaper: {err}"),
+                );
+            }
         }
     }
 }
@@ -565,6 +580,7 @@ impl IntellisenseRuntimeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn db_type_lookup_returns_cached_value_while_connection_is_locked() {
@@ -578,5 +594,22 @@ mod tests {
             runtime.db_type_without_blocking(&connection),
             crate::db::DatabaseType::MariaDB
         );
+    }
+
+    #[test]
+    fn latest_worker_can_release_last_runtime_owner_from_its_own_task() {
+        let runtime = Arc::new(IntellisenseRuntimeState::new());
+        let runtime_for_worker = runtime.clone();
+        let (completed_sender, completed_receiver) = std::sync::mpsc::channel();
+        assert!(runtime.submit_latest_parse_task(Box::new(move || {
+            drop(runtime_for_worker);
+            let _ = completed_sender.send(());
+        })));
+
+        drop(runtime);
+
+        completed_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker-side runtime drop must not self-join");
     }
 }
