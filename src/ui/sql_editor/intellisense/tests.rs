@@ -47395,6 +47395,356 @@ fn oracle_fixture_production_completion_covers_remaining_sweep_cases() {
     );
 }
 
+fn assert_oracle_sweep_fixture_completion_cases(
+    cases: &[(&str, &str, &str, &str, &str)],
+) {
+    let mut failures = Vec::new();
+    for (file_name, context, word, prefix, expected) in cases {
+        let suggestions =
+            oracle_fixture_word_completion_suggestions(file_name, context, word, prefix);
+        if !suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case(expected))
+        {
+            failures.push(format!(
+                "{file_name} `{context}` lost `{expected}`: {suggestions:?}"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "Oracle fixture production-path gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn oracle_test6_to_test9_production_completion_covers_plsql_sweep_cases() {
+    assert_oracle_sweep_fixture_completion_cases(&[
+        ("test6.txt", "EXIT SQL.SQLCODE", "SQL", "SQ", "SQL"),
+        (
+            "test6.txt",
+            "EXIT SQL.SQLCODE",
+            "SQLCODE",
+            "SQLC",
+            "SQLCODE",
+        ),
+        (
+            "test6.txt",
+            "END;\n/\nSHOW ERRORS TYPE BODY oqt_obj",
+            "END",
+            "EN",
+            "END",
+        ),
+        (
+            "test6.txt",
+            "e_bad_input EXCEPTION;",
+            "EXCEPTION",
+            "EXCE",
+            "EXCEPTION",
+        ),
+        (
+            "test6.txt",
+            "FROM oqt_t_test t\n      WHERE t.grp = p_grp\n      ORDER BY t.id;",
+            "FROM",
+            "FRO",
+            "FROM",
+        ),
+        (
+            "test6.txt",
+            "FROM oqt_t_test t\n      WHERE t.grp = p_grp\n      ORDER BY t.id;",
+            "ORDER",
+            "ORDE",
+            "ORDER BY",
+        ),
+        (
+            "test6.txt",
+            "FOR EACH ROW\nDECLARE",
+            "EACH",
+            "EAC",
+            "EACH",
+        ),
+        (
+            "test9.txt",
+            "IF SQLCODE != - 4043 THEN",
+            "SQLCODE",
+            "SQLC",
+            "SQLCODE",
+        ),
+        (
+            "test9.txt",
+            "CREATE SEQUENCE fmtx_audit_seq\nSTART WITH 1 INCREMENT BY 1 NOCACHE;",
+            "WITH",
+            "WIT",
+            "WITH",
+        ),
+        (
+            "test9.txt",
+            "SELECT LEVEL AS lvl,\n                id,",
+            "LEVEL",
+            "LEVE",
+            "LEVEL",
+        ),
+        (
+            "test9.txt",
+            "LPAD (' ', (LEVEL - 1) * 2) || code AS tree_code",
+            "LEVEL",
+            "LEVE",
+            "LEVEL",
+        ),
+        (
+            "test9.txt",
+            "CURSOR c_units (cp_root_id NUMBER) IS\n        SELECT id,",
+            "SELECT",
+            "SELE",
+            "SELECT",
+        ),
+        (
+            "test9.txt",
+            "START WITH id = cp_root_id\n        CONNECT BY PRIOR id = parent_id\n        ORDER SIBLINGS BY id;",
+            "CONNECT",
+            "CONN",
+            "CONNECT BY",
+        ),
+        (
+            "test9.txt",
+            "START WITH id = cp_root_id\n        CONNECT BY PRIOR id = parent_id\n        ORDER SIBLINGS BY id;",
+            "SIBLINGS",
+            "SIBL",
+            "SIBLINGS",
+        ),
+        (
+            "test9.txt",
+            "e_bad_mode EXCEPTION;",
+            "EXCEPTION",
+            "EXCE",
+            "EXCEPTION",
+        ),
+        (
+            "test9.txt",
+            "WHILE l_idx IS NOT NULL LOOP",
+            "LOOP",
+            "LOO",
+            "LOOP",
+        ),
+        (
+            "test9.txt",
+            "FORALL i IN INDICES OF l_ids SAVE EXCEPTIONS",
+            "INDICES",
+            "INDI",
+            "INDICES",
+        ),
+        (
+            "test9.txt",
+            "UPDATE fmtx_unit\n                SET note =",
+            "SET",
+            "SE",
+            "SET",
+        ),
+        (
+            "test9.txt",
+            "SQL%BULK_EXCEPTIONS.COUNT LOOP",
+            "LOOP",
+            "LOO",
+            "LOOP",
+        ),
+        (
+            "test9.txt",
+            "FOR j IN 1..SQL%BULK_EXCEPTIONS.COUNT LOOP",
+            "SQL",
+            "SQ",
+            "SQL",
+        ),
+    ]);
+}
+
+#[test]
+fn oracle_test7_production_completion_covers_advanced_query_sweep_cases() {
+    assert_oracle_sweep_fixture_completion_cases(&[
+        (
+            "test7.txt",
+            "WITHIN GROUP (ORDER BY ename)",
+            "ORDER",
+            "ORDE",
+            "ORDER BY",
+        ),
+        ("test7.txt", "FROM s\nPIVOT (", "PIVOT", "PIVO", "PIVOT"),
+        ("test7.txt", "FROM p\nUNPIVOT (", "UNPIVOT", "UNPI", "UNPIVOT"),
+        (
+            "test7.txt",
+            "START WITH parent_id IS NULL\nCONNECT BY PRIOR node_id = parent_id\nORDER SIBLINGS BY node_id;",
+            "WITH",
+            "WIT",
+            "WITH",
+        ),
+        (
+            "test7.txt",
+            "START WITH parent_id IS NULL\nCONNECT BY PRIOR node_id = parent_id\nORDER SIBLINGS BY node_id;",
+            "BY",
+            "B",
+            "BY",
+        ),
+        (
+            "test7.txt",
+            "START WITH parent_id IS NULL\nCONNECT BY PRIOR node_id = parent_id\nORDER SIBLINGS BY node_id;",
+            "CONNECT",
+            "CONN",
+            "CONNECT",
+        ),
+        (
+            "test7.txt",
+            "ORDER SIBLINGS BY node_id;",
+            "SIBLINGS",
+            "SIBL",
+            "SIBLINGS",
+        ),
+        (
+            "test7.txt",
+            "FROM oqt_t_tree t\n  JOIN r ON t.parent_id = r.node_id",
+            "JOIN",
+            "JOI",
+            "JOIN",
+        ),
+        (
+            "test7.txt",
+            "FROM oqt_t_order_hdr oh\nOUTER APPLY (",
+            "OUTER",
+            "OUTE",
+            "OUTER APPLY",
+        ),
+        (
+            "test7.txt",
+            "sum_sal FOR dept_tag IN (D10 AS '10', D20 AS '20', D30 AS '30')",
+            "AS",
+            "A",
+            "AS",
+        ),
+        (
+            "test7.txt",
+            "sum_sal FOR dept_tag IN (D10 AS '10', D20 AS '20', D30 AS '30')",
+            "D20",
+            "D2",
+            "D20",
+        ),
+    ]);
+}
+
+#[test]
+fn oracle_test7_production_completion_covers_match_json_xml_sweep_cases() {
+    assert_oracle_sweep_fixture_completion_cases(&[
+        (
+            "test7.txt",
+            "MATCH_RECOGNIZE (\n  PARTITION BY deptno",
+            "PARTITION",
+            "PART",
+            "PARTITION BY",
+        ),
+        ("test7.txt", "  MEASURES\n    FIRST", "MEASURES", "MEAS", "MEASURES"),
+        ("test7.txt", "    FIRST(ename) AS start_name", "FIRST", "FIRS", "FIRST"),
+        ("test7.txt", "    LAST(ename)  AS end_name", "LAST", "LAS", "LAST"),
+        ("test7.txt", "    FIRST(ename) AS start_name", "AS", "A", "AS"),
+        ("test7.txt", "  ONE ROW PER MATCH", "ROW", "RO", "ROW"),
+        ("test7.txt", "  ONE ROW PER MATCH", "PER", "PE", "PER"),
+        ("test7.txt", "  PATTERN (a b+)", "PATTERN", "PATT", "PATTERN"),
+        ("test7.txt", "  DEFINE\n    b AS", "DEFINE", "DEFI", "DEFINE"),
+        ("test7.txt", "b AS b.sal > PREV(b.sal)", "PREV", "PRE", "PREV"),
+        (
+            "test7.txt",
+            "cust_name  VARCHAR2(50) PATH '$.customer.name'",
+            "PATH",
+            "PAT",
+            "PATH",
+        ),
+        ("test7.txt", "NESTED PATH '$.items[*]'", "NESTED", "NEST", "NESTED"),
+        ("test7.txt", "PASSING t.payload", "PASSING", "PASS", "PASSING"),
+        ("test7.txt", "PASSING t.payload", "payload", "payl", "payload"),
+        (
+            "test7.txt",
+            "name   VARCHAR2(30) PATH 'name/text()'",
+            "PATH",
+            "PAT",
+            "PATH",
+        ),
+    ]);
+}
+
+#[test]
+fn oracle_test7_production_completion_covers_model_and_derived_sweep_cases() {
+    assert_oracle_sweep_fixture_completion_cases(&[
+        ("test7.txt", "FROM m\nMODEL", "MODEL", "MODE", "MODEL"),
+        (
+            "test7.txt",
+            "avg_sal_calc[ANY] = ROUND(sum_sal[CV()] / NULLIF(cnt[CV()], 0), 2)",
+            "avg_sal_calc",
+            "avg_",
+            "avg_sal_calc",
+        ),
+        (
+            "test7.txt",
+            "avg_sal_calc[ANY] = ROUND(sum_sal[CV()] / NULLIF(cnt[CV()], 0), 2)",
+            "ANY",
+            "AN",
+            "ANY",
+        ),
+        (
+            "test7.txt",
+            "avg_sal_calc[ANY] = ROUND(sum_sal[CV()] / NULLIF(cnt[CV()], 0), 2)",
+            "sum_sal",
+            "sum_",
+            "sum_sal",
+        ),
+        (
+            "test7.txt",
+            "avg_sal_calc[ANY] = ROUND(sum_sal[CV()] / NULLIF(cnt[CV()], 0), 2)",
+            "cnt",
+            "cn",
+            "cnt",
+        ),
+        (
+            "test7.txt",
+            "sum_sal[CV()] / NULLIF(cnt[CV()]",
+            "CV",
+            "C",
+            "CV",
+        ),
+        (
+            "test7.txt",
+            "sum_plus_100[ANY] = sum_sal[CV()] + 100",
+            "ANY",
+            "AN",
+            "ANY",
+        ),
+        (
+            "test7.txt",
+            "sum_plus_100[ANY] = sum_sal[CV()] + 100",
+            "CV",
+            "C",
+            "CV",
+        ),
+        (
+            "test7.txt",
+            "(SELECT COUNT(*) FROM oqt_t_order_item oi WHERE oi.order_id = oh.order_id) DESC",
+            "SELECT",
+            "SELE",
+            "SELECT",
+        ),
+        (
+            "test7.txt",
+            ") DESC,\n  amt DESC NULLS LAST",
+            "amt",
+            "am",
+            "amt",
+        ),
+        (
+            "test7.txt",
+            "(it.qty * it.price) AS line_amt",
+            "qty",
+            "qt",
+            "qty",
+        ),
+    ]);
+}
+
 #[derive(Debug)]
 struct IntellisenseSweepMissing {
     start: usize,
