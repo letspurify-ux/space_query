@@ -733,7 +733,7 @@ unp AS (
         sale_year,
         month_code,
         month_amt
-    FROM pivoted UNPIVOT INCLUDE NULLS ([[month_amt]]
+    FROM pivoted UNPIVOT INCLUDE NULLS (month_amt
     FOR month_code IN (M01 AS 'M01', M02 AS 'M02', M03 AS 'M03', M04 AS 'M04', M05 AS 'M05', M06 AS 'M06'))
 )
 SELECT
@@ -836,7 +836,7 @@ SELECT LEVEL AS lvl,
                 SELECT e2.emp_no,
                     e2.emp_name
                 FROM qt_emp e2
-                WHERE e2.dept_id = [[d]].[[dept_id]]
+                WHERE e2.dept_id = d.dept_id
                     AND ROWNUM <= 5
             ) x
     ) AS sample_emps
@@ -1058,7 +1058,7 @@ ORDER BY sale_year,
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
 -- checked: 1867
--- missing: 11
+-- missing: 8
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens:
 --   19:16 word=object_name prefix=obje suggestions=[qt_obj_emp, qt_obj_emp_tab] total=2 line=SELECT object_name,
@@ -1066,10 +1066,7 @@ ORDER BY sale_year,
 --   21:14 word=user_objects prefix=user suggestions=[qt_split_users] total=1 line=FROM user_objects
 --   22:15 word=object_name prefix=obje suggestions=[qt_obj_emp, qt_obj_emp_tab] total=2 line=WHERE object_name IN ('QT_EMP', 'QT_DEPT', 'QT_SALES', 'QT_AUDIT_LOG', 'QT_EMP_BIUD', 'QT_EMP_SUMMARY_V', 'QT_PKG_EXTREME', 'QT_SEQ_EMP', 'QT_SEQ_SALES')
 --   233:6 word=base_sales prefix=base suggestions=[base, qt_boss_audit_seq] total=2 line=WITH base_sales AS (
---   487:20 word=i prefix=i suggestions=[IF, IN, INTERVAL, IS, INITCAP(), INSERTCHILDXML(), INSERTCHILDXMLAFTER(), INSERTCHILDXMLBEFORE(), INSERTXMLBEFORE(), INSTR(), id] total=11 line=FORALL i IN INDICES OF v_emp_ids SAVE EXCEPTIONS
+--   487:20 word=i prefix=i suggestions=[IF, INDEX, IN, INTERVAL, IS, INITCAP(), INSERTCHILDXML(), INSERTCHILDXMLAFTER(), INSERTCHILDXMLBEFORE(), INSERTXMLBEFORE(), INSTR(), id] total=12 line=FORALL i IN INDICES OF v_emp_ids SAVE EXCEPTIONS
 --   597:6 word=dept_tree prefix=dept suggestions=[] total=0 line=WITH dept_tree AS (
 --   716:6 word=src prefix=sr suggestions=[] total=0 line=WITH src AS (
---   736:41 word=month_amt prefix=mont suggestions=[sale_month, MONTHS_BETWEEN(), mont, month_code] total=4 line=FROM pivoted UNPIVOT INCLUDE NULLS (month_amt
---   839:36 word=d prefix=d suggestions=[DBMS_LOB, DBMS_SQL, DBMS_UTILITY, DBMS_METADATA, DBMS_STATS, DBMS_XPLAN, DBMS_APPLICATION_INFO, DBMS_SESSION, DBMS_SCHEDULER, DBMS_LOCK, DBMS_JOB, DBMS_CRYPTO, DBMS_ASSERT, DBMS_MVIEW, DBMS_ALERT, DBMS_PIPE] total=37 line=WHERE e2.dept_id = d.dept_id
---   839:38 word=dept_id prefix=dept suggestions=[] total=0 line=WHERE e2.dept_id = d.dept_id
 -- =========================================================

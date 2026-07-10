@@ -101,6 +101,7 @@ struct MysqlFamilyScriptCatalog {
     synonyms: Vec<String>,
     triggers: Vec<String>,
     indexes: Vec<String>,
+    schemas: Vec<String>,
     users: Vec<String>,
     columns: HashMap<String, Vec<String>>,
     type_members: HashMap<String, Vec<String>>,
@@ -477,6 +478,7 @@ fn mysql_family_catalog_from_script(script: &str) -> MysqlFamilyScriptCatalog {
                         schema_name_idx += 3;
                     }
                     if let Some(name) = token_word_text(tokens.get(schema_name_idx)) {
+                        push_unique_case_insensitive(&mut catalog.schemas, name);
                         push_unique_case_insensitive(&mut catalog.users, name);
                     }
                 }
@@ -518,6 +520,7 @@ fn intellisense_data_from_mysql_family_catalog(
     data.synonyms = catalog.synonyms.clone();
     data.triggers = catalog.triggers.clone();
     data.indexes = catalog.indexes.clone();
+    data.schemas = catalog.schemas.clone();
     data.users = catalog.users.clone();
     for relation in catalog
         .tables
@@ -47175,7 +47178,18 @@ fn query_completion_suggestions_with_data(
         &routine_cache,
         expanded.cursor_in_statement,
     );
-    let (prefix, word_start, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+    let (mut prefix, mut word_start, _) =
+        crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+    let signature_scan_text = signature_scan_text_before_cursor_for_test(&sql, cursor).to_string();
+    if db_type == crate::db::DatabaseType::Oracle {
+        if let Some(model_prefix) = SqlEditorWidget::oracle_model_bracket_completion_prefix(
+            &prefix,
+            &signature_scan_text,
+        ) {
+            prefix = model_prefix;
+            word_start = cursor.saturating_sub(prefix.len());
+        }
+    }
     let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, word_start);
     let raw_qualifier = SqlEditorWidget::raw_qualifier_before_word_in_text(&sql, word_start);
     // Mirror production's bounded text_after_cursor window (128 bytes, clamped
@@ -47198,7 +47212,7 @@ fn query_completion_suggestions_with_data(
         word_start,
         qualifier,
         raw_qualifier,
-        signature_scan_text: signature_scan_text_before_cursor_for_test(&sql, cursor).to_string(),
+        signature_scan_text,
         text_after_cursor,
     };
     let shared_data = Arc::new(Mutex::new(std::mem::take(data)));
@@ -47848,6 +47862,741 @@ fn oracle_test7_production_completion_covers_model_and_derived_sweep_cases() {
 }
 
 #[test]
+fn oracle_show_errors_and_pivot_source_sweep_report_regressions() {
+    assert_oracle_sweep_fixture_completion_cases(&[
+        (
+            "test2.txt",
+            "SHOW ERRORS PACKAGE oqt_pkg;",
+            "oqt_pkg",
+            "oqt_",
+            "oqt_pkg",
+        ),
+        (
+            "test2.txt",
+            "SHOW ERRORS PACKAGE BODY oqt_pkg;",
+            "oqt_pkg",
+            "oqt_",
+            "oqt_pkg",
+        ),
+        (
+            "test6.txt",
+            "SHOW ERRORS TYPE oqt_obj",
+            "oqt_obj",
+            "oqt_",
+            "oqt_obj",
+        ),
+        (
+            "test6.txt",
+            "SHOW ERRORS PACKAGE oqt_mega_pkg",
+            "oqt_mega_pkg",
+            "oqt_",
+            "oqt_mega_pkg",
+        ),
+        (
+            "test6.txt",
+            "SHOW ERRORS TRIGGER oqt_trg_test_bi",
+            "oqt_trg_test_bi",
+            "oqt_",
+            "oqt_trg_test_bi",
+        ),
+        (
+            "test8.txt",
+            "SHOW ERRORS TYPE BODY oqt_obj",
+            "oqt_obj",
+            "oqt_",
+            "oqt_obj",
+        ),
+        (
+            "test7.txt",
+            "PIVOT (\n  sum_sal FOR dept_tag IN",
+            "sum_sal",
+            "sum_",
+            "sum_sal",
+        ),
+    ]);
+}
+
+#[test]
+fn oracle_test10_sweep_report_structural_regressions() {
+    assert_oracle_sweep_fixture_completion_cases(&[
+        (
+            "test10.txt",
+            "END safe_drop;\n\nBEGIN\n    safe_drop ('drop trigger qt_sales_ct');",
+            "BEGIN",
+            "BEGI",
+            "BEGIN",
+        ),
+        (
+            "test10.txt",
+            "NVL (SUM (s.amount), 0) AS total_sales\n        FROM qt_emp e\n        JOIN qt_dept d\n            ON d.dept_id = e.dept_id\n        LEFT JOIN qt_sales s",
+            "LEFT",
+            "LEF",
+            "LEFT",
+        ),
+        (
+            "test10.txt",
+            "ON s.emp_id = e.emp_id\n        WHERE p_dept_id IS NULL",
+            "ON",
+            "O",
+            "ON",
+        ),
+        (
+            "test10.txt",
+            "WHERE p_dept_id IS NULL\n            OR e.dept_id = p_dept_id\n        GROUP BY e.emp_id",
+            "GROUP",
+            "GROU",
+            "GROUP",
+        ),
+        (
+            "test10.txt",
+            "ON qt_sales COMPOUND TRIGGER TYPE t_num_tab IS",
+            "COMPOUND",
+            "COMP",
+            "COMPOUND",
+        ),
+        (
+            "test10.txt",
+            "COMPOUND TRIGGER TYPE t_num_tab IS",
+            "TRIGGER",
+            "TRIG",
+            "TRIGGER",
+        ),
+        (
+            "test10.txt",
+            "TYPE t_num_tab IS\n    TABLE OF NUMBER INDEX BY PLS_INTEGER;",
+            "TABLE",
+            "TABL",
+            "TABLE",
+        ),
+        (
+            "test10.txt",
+            "TABLE OF NUMBER INDEX BY PLS_INTEGER;",
+            "NUMBER",
+            "NUMB",
+            "NUMBER",
+        ),
+        (
+            "test10.txt",
+            "TABLE OF NUMBER INDEX BY PLS_INTEGER;",
+            "INDEX",
+            "INDE",
+            "INDEX",
+        ),
+        (
+            "test10.txt",
+            "TABLE OF NUMBER INDEX BY PLS_INTEGER;",
+            "PLS_INTEGER",
+            "PLS_",
+            "PLS_INTEGER",
+        ),
+        (
+            "test10.txt",
+            "g_emp_ids t_num_tab;",
+            "t_num_tab",
+            "t_num",
+            "t_num_tab",
+        ),
+        (
+            "test10.txt",
+            "BEFORE STATEMENT IS\n    BEGIN",
+            "BEFORE",
+            "BEFO",
+            "BEFORE",
+        ),
+        (
+            "test10.txt",
+            "BEFORE STATEMENT IS\n    BEGIN",
+            "STATEMENT",
+            "STAT",
+            "STATEMENT",
+        ),
+        (
+            "test10.txt",
+            "AFTER EACH ROW IS\n    BEGIN",
+            "AFTER",
+            "AFTE",
+            "AFTER",
+        ),
+        (
+            "test10.txt",
+            "AFTER EACH ROW IS\n    BEGIN",
+            "EACH",
+            "EAC",
+            "EACH",
+        ),
+        (
+            "test10.txt",
+            "AFTER EACH ROW IS\n    BEGIN",
+            "ROW",
+            "RO",
+            "ROW",
+        ),
+        (
+            "test10.txt",
+            "AFTER EACH ROW IS\n    BEGIN\n        g_idx := g_idx + 1;",
+            "BEGIN",
+            "BEGI",
+            "BEGIN",
+        ),
+        (
+            "test10.txt",
+            "IF INSERTING\n            OR UPDATING THEN",
+            "INSERTING",
+            "INSE",
+            "INSERTING",
+        ),
+        (
+            "test10.txt",
+            "END qt_sales_ct;",
+            "qt_sales_ct",
+            "qt_s",
+            "qt_sales_ct",
+        ),
+    ]);
+}
+
+#[test]
+fn oracle_test10_sweep_report_query_and_plsql_regressions() {
+    assert_oracle_sweep_fixture_completion_cases(&[
+        (
+            "test10.txt",
+            "EXIT WHEN l_batch.COUNT = 0;",
+            "EXIT",
+            "EXI",
+            "EXIT",
+        ),
+        (
+            "test10.txt",
+            "EXIT WHEN l_batch.COUNT = 0;",
+            "WHEN",
+            "WHE",
+            "WHEN",
+        ),
+        (
+            "test10.txt",
+            "FOR i IN 1..l_batch.COUNT LOOP",
+            "FOR",
+            "F",
+            "FOR",
+        ),
+        (
+            "test10.txt",
+            "l_batch.COUNT LOOP",
+            "COUNT",
+            "COU",
+            "COUNT",
+        ),
+        (
+            "test10.txt",
+            "l_batch (i).emp_id || ':' || l_batch (i).emp_name",
+            "emp_id",
+            "emp_",
+            "emp_id",
+        ),
+        (
+            "test10.txt",
+            "CLOSE c_emp;",
+            "CLOSE",
+            "CLOS",
+            "CLOSE",
+        ),
+        (
+            "test10.txt",
+            "WITH FUNCTION calc_bonus (p_amount NUMBER) RETURN NUMBER IS",
+            "FUNCTION",
+            "FUNC",
+            "FUNCTION",
+        ),
+        (
+            "test10.txt",
+            "    calc_bonus (NVL (e.salary, 0)) AS calc_bonus",
+            "calc_bonus",
+            "calc",
+            "calc_bonus",
+        ),
+        (
+            "test10.txt",
+            "ON r.dept_name = t.dept_name\nWHERE EXISTS (",
+            "WHERE",
+            "WHER",
+            "WHERE",
+        ),
+        (
+            "test10.txt",
+            "salary AS 'SALARY', commission_pct AS 'COMMISSION'",
+            "commission_pct",
+            "comm",
+            "commission_pct",
+        ),
+        (
+            "test10.txt",
+            "FROM qt_emp e CROSS APPLY (",
+            "CROSS",
+            "CROS",
+            "CROSS",
+        ),
+        (
+            "test10.txt",
+            "GROUP BY GROUPING SETS",
+            "GROUP",
+            "GROU",
+            "GROUP",
+        ),
+        (
+            "test10.txt",
+            "LISTAGG (e.emp_name, ', ') WITHIN",
+            "WITHIN",
+            "WITH",
+            "WITHIN",
+        ),
+        (
+            "test10.txt",
+            "LEFT JOIN qt_emp e\n    ON e.dept_id = d.dept_id",
+            "LEFT",
+            "LEF",
+            "LEFT",
+        ),
+    ]);
+}
+
+#[test]
+fn oracle_test11_sweep_report_plsql_and_trigger_regressions() {
+    assert_oracle_sweep_fixture_completion_cases(&[
+        (
+            "test11.txt",
+            "RETURN t_refcur IS\n        l_rc t_refcur;",
+            "t_refcur",
+            "t_ref",
+            "t_refcur",
+        ),
+        (
+            "test11.txt",
+            ")\n            SELECT r.emp_id,",
+            "SELECT",
+            "SELE",
+            "SELECT",
+        ),
+        (
+            "test11.txt",
+            "WHERE p_emp_id IS NULL\n                OR s.emp_id = p_emp_id",
+            "NULL",
+            "NUL",
+            "NULL",
+        ),
+        (
+            "test11.txt",
+            "UPDATE OF salary SKIP LOCKED;",
+            "OF",
+            "O",
+            "OF",
+        ),
+        (
+            "test11.txt",
+            "UPDATE OF salary SKIP LOCKED;",
+            "SKIP",
+            "SKI",
+            "SKIP",
+        ),
+        (
+            "test11.txt",
+            "UPDATE OF salary SKIP LOCKED;",
+            "LOCKED",
+            "LOCK",
+            "LOCKED",
+        ),
+        (
+            "test11.txt",
+            "                    WHERE emp_id = l_ids (i);",
+            "WHERE",
+            "WHER",
+            "WHERE",
+        ),
+        (
+            "test11.txt",
+            "$IF DBMS_DB_VERSION.VERSION >= 12 $THEN",
+            "$IF",
+            "$I",
+            "$IF",
+        ),
+        (
+            "test11.txt",
+            "$IF DBMS_DB_VERSION.VERSION >= 12 $THEN",
+            "DBMS_DB_VERSION",
+            "DBMS_",
+            "DBMS_DB_VERSION",
+        ),
+        (
+            "test11.txt",
+            "VERSION >= 12 $THEN",
+            "VERSION",
+            "VERS",
+            "VERSION",
+        ),
+        (
+            "test11.txt",
+            "$IF DBMS_DB_VERSION.VERSION >= 12 $THEN",
+            "$THEN",
+            "$T",
+            "$THEN",
+        ),
+        (
+            "test11.txt",
+            "$ELSE AUDIT ('qt_torture_pkg'",
+            "$ELSE",
+            "$E",
+            "$ELSE",
+        ),
+        (
+            "test11.txt",
+            "$END AUDIT ('qt_torture_pkg'",
+            "$END",
+            "$E",
+            "$END",
+        ),
+        (
+            "test11.txt",
+            "END complex_block;",
+            "complex_block",
+            "comp",
+            "complex_block",
+        ),
+        (
+            "test11.txt",
+            "ON qt_sales COMPOUND TRIGGER g_rows PLS_INTEGER",
+            "COMPOUND",
+            "COMP",
+            "COMPOUND",
+        ),
+        (
+            "test11.txt",
+            "COMPOUND TRIGGER g_rows PLS_INTEGER",
+            "TRIGGER",
+            "TRIG",
+            "TRIGGER",
+        ),
+        (
+            "test11.txt",
+            "g_rows PLS_INTEGER := 0;",
+            "PLS_INTEGER",
+            "PLS_",
+            "PLS_INTEGER",
+        ),
+        (
+            "test11.txt",
+            "BEFORE STATEMENT IS\n    BEGIN",
+            "BEFORE",
+            "BEFO",
+            "BEFORE",
+        ),
+        (
+            "test11.txt",
+            "BEFORE EACH ROW IS\n    BEGIN",
+            "EACH",
+            "EAC",
+            "EACH",
+        ),
+        (
+            "test11.txt",
+            "AFTER EACH ROW IS\n    BEGIN\n        g_rows := g_rows + 1;",
+            "BEGIN",
+            "BEGI",
+            "BEGIN",
+        ),
+        (
+            "test11.txt",
+            "END qt_sales_ctrg;",
+            "qt_sales_ctrg",
+            "qt_s",
+            "qt_sales_ctrg",
+        ),
+    ]);
+}
+
+#[test]
+fn oracle_test11_sweep_report_advanced_query_regressions() {
+    assert_oracle_sweep_fixture_completion_cases(&[
+        (
+            "test11.txt",
+            "FUNCTION score_fn (p_salary NUMBER, p_bonus NUMBER) RETURN NUMBER IS",
+            "FUNCTION",
+            "FUNC",
+            "FUNCTION",
+        ),
+        (
+            "test11.txt",
+            "    score_fn (e.salary, e.bonus_pct) AS score",
+            "score_fn",
+            "scor",
+            "score_fn",
+        ),
+        (
+            "test11.txt",
+            "CYCLE dept_id SET is_cycle",
+            "dept_id",
+            "dept",
+            "dept_id",
+        ),
+        (
+            "test11.txt",
+            "DEFAULT 'N'\nSELECT\n    dept_id,",
+            "SELECT",
+            "SELE",
+            "SELECT",
+        ),
+        (
+            "test11.txt",
+            "e.emp_id,\n            e.emp_name,\n            d.dept_name,\n            x.total_amount,",
+            "e",
+            "e",
+            "e",
+        ),
+        (
+            "test11.txt",
+            "            x.total_amount,\n            x.avg_amount,",
+            "x",
+            "x",
+            "x",
+        ),
+        (
+            "test11.txt",
+            "WHEN x.sale_cnt = 0 THEN",
+            "sale_cnt",
+            "sale",
+            "sale_cnt",
+        ),
+        (
+            "test11.txt",
+            "GROUP BY e3.dept_id",
+            "GROUP",
+            "GROU",
+            "GROUP",
+        ),
+        (
+            "test11.txt",
+            "WHEN EXISTS (\n                            SELECT 1",
+            "EXISTS",
+            "EXIS",
+            "EXISTS",
+        ),
+        (
+            "test11.txt",
+            "CROSS APPLY (\n            SELECT NVL",
+            "APPLY",
+            "APPL",
+            "APPLY",
+        ),
+        (
+            "test11.txt",
+            ") q\nWHERE q.rn <= 3",
+            "WHERE",
+            "WHER",
+            "WHERE",
+        ),
+        (
+            "test11.txt",
+            "WHERE q.rn <= 3",
+            "rn",
+            "r",
+            "rn",
+        ),
+        (
+            "test11.txt",
+            "base_salary AS 'BASE_SALARY', bonus_amount AS 'BONUS_AMOUNT'",
+            "bonus_amount",
+            "bonu",
+            "bonus_amount",
+        ),
+        (
+            "test11.txt",
+            "MEASURES MATCH_NUMBER () AS match_no",
+            "MATCH_NUMBER",
+            "MATC",
+            "MATCH_NUMBER",
+        ),
+        (
+            "test11.txt",
+            "ALL ROWS PER MATCH",
+            "ALL",
+            "AL",
+            "ALL",
+        ),
+        (
+            "test11.txt",
+            "ALL ROWS PER MATCH",
+            "ROWS",
+            "ROW",
+            "ROWS",
+        ),
+        (
+            "test11.txt",
+            "ALL ROWS PER MATCH",
+            "PER",
+            "PE",
+            "PER",
+        ),
+        (
+            "test11.txt",
+            "RULES UPSERT (total_amt [ FOR month_no FROM 1 TO 12 INCREMENT 1 ]",
+            "FOR",
+            "FO",
+            "FOR",
+        ),
+        (
+            "test11.txt",
+            "FOR month_no FROM 1 TO 12 INCREMENT 1",
+            "month_no",
+            "mont",
+            "month_no",
+        ),
+        (
+            "test11.txt",
+            "FOR month_no FROM 1 TO 12 INCREMENT 1",
+            "FROM",
+            "FRO",
+            "FROM",
+        ),
+        (
+            "test11.txt",
+            "FOR month_no FROM 1 TO 12 INCREMENT 1",
+            "TO",
+            "T",
+            "TO",
+        ),
+        (
+            "test11.txt",
+            "FOR month_no FROM 1 TO 12 INCREMENT 1",
+            "INCREMENT",
+            "INCR",
+            "INCREMENT",
+        ),
+        (
+            "test11.txt",
+            "total_amt [ CV (month_no) ]",
+            "CV",
+            "C",
+            "CV",
+        ),
+    ]);
+}
+
+#[test]
+fn oracle_model_bounded_text_sweep_fallbacks() {
+    assert_eq!(
+        SqlEditorWidget::oracle_model_bracket_completion_prefix(
+            "[ FOR mont",
+            "MODEL RULES (total_amt [ FOR mont",
+        ),
+        Some("mont".to_string())
+    );
+    for (text, prefix, expected) in [
+        ("MODEL RULES UPSERT (total_amt [ FO", "FO", "FOR"),
+        ("MODEL RULES UPSERT (total_amt [ FOR month_no FRO", "FRO", "FROM"),
+        ("MODEL RULES UPSERT (total_amt [ FOR month_no FROM 1 T", "T", "TO"),
+        (
+            "MODEL RULES UPSERT (total_amt [ FOR month_no FROM 1 TO 12 INCR",
+            "INCR",
+            "INCREMENT",
+        ),
+        ("MODEL RULES (total_amt [ C", "C", "CV"),
+    ] {
+        assert_eq!(
+            SqlEditorWidget::oracle_bounded_text_structural_keyword_prefix_fallback(prefix, text),
+            Some(expected.to_string())
+        );
+    }
+    assert_eq!(
+        SqlEditorWidget::oracle_model_dimension_suggestions_from_bounded_text(
+            "mont",
+            "MODEL DIMENSION BY (month_no) MEASURES (total_amt) RULES (total_amt [ FOR mont",
+        ),
+        vec!["MONTH_NO".to_string()]
+    );
+
+    let script = load_intellisense_test_file("test11.txt");
+    let context = "RULES UPSERT (total_amt [ FOR month_no FROM 1 TO 12 INCREMENT 1 ]";
+    let context_start = script.find(context).expect("MODEL rule context");
+    let for_start = context_start + context.find("FOR").expect("MODEL FOR");
+    let before_for = format!("{}FO", script.get(..for_start).unwrap_or(""));
+    let signature = signature_scan_text_before_cursor_for_test(&before_for, before_for.len());
+    assert!(signature.contains("MODEL"), "MODEL fell outside bounded signature");
+    assert_eq!(
+        SqlEditorWidget::oracle_bounded_text_structural_keyword_prefix_fallback(
+            "FO", signature,
+        ),
+        Some("FOR".to_string())
+    );
+}
+
+#[test]
+fn oracle_remaining_actual_sweep_report_regressions() {
+    assert_oracle_sweep_fixture_completion_cases(&[
+        (
+            "test10.txt",
+            "WHEN MATCHED THEN\nUPDATE",
+            "WHEN",
+            "WHE",
+            "WHEN",
+        ),
+        (
+            "test11.txt",
+            "ON qt_sales COMPOUND TRIGGER",
+            "ON",
+            "O",
+            "ON",
+        ),
+        (
+            "test11.txt",
+            "ALL ROWS PER MATCH\n    PATTERN",
+            "MATCH",
+            "MATC",
+            "MATCH",
+        ),
+        (
+            "test11.txt",
+            "e.emp_id\n                                AND sx.status",
+            "emp_id",
+            "emp_",
+            "emp_id",
+        ),
+        (
+            "test11.txt",
+            "d.dept_id\n                ORDER BY x.total_amount",
+            "dept_id",
+            "dept",
+            "dept_id",
+        ),
+        (
+            "test18.sql",
+            "WHEN OTHERS THEN\n            IF p_commit THEN",
+            "WHEN",
+            "WHE",
+            "WHEN",
+        ),
+        (
+            "test18.sql",
+            "WHEN MATCHED THEN\nUPDATE",
+            "WHEN",
+            "WHE",
+            "WHEN",
+        ),
+        (
+            "test22.sql",
+            "WHEN MATCHED THEN\n                UPDATE",
+            "WHEN",
+            "WHE",
+            "WHEN",
+        ),
+        (
+            "test23.sql",
+            "OR er.note_text LIKE '%/%' THEN",
+            "OR",
+            "O",
+            "OR",
+        ),
+    ]);
+}
+
+#[test]
 fn oracle_test18_production_completion_covers_plsql_sweep_cases() {
     assert_oracle_sweep_fixture_completion_cases(&[
         (
@@ -48220,7 +48969,8 @@ fn oracle_test_all_intellisense_data() -> IntellisenseData {
 /// Overlay the file-local catalog on top of the shared one.
 fn oracle_test_file_scoped_intellisense_data(file_name: &str) -> IntellisenseData {
     let mut data = oracle_test_all_intellisense_data();
-    let own = mysql_family_catalog_from_script(load_intellisense_test_file(file_name));
+    let mut own = MysqlFamilyScriptCatalog::default();
+    oracle_collect_script_catalog_entries(load_intellisense_test_file(file_name), &mut own);
     for table in &own.tables {
         push_unique_case_insensitive(&mut data.tables, table);
     }
@@ -70047,7 +70797,14 @@ fn mysql_database_schema_name_slots_do_not_offer_general_catalog() {
         ] {
             let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
             assert!(
-                kind.is_none() || matches!(kind, Some(ExpectedObjectSuggestionKind::NoSuggestions)),
+                kind.is_none()
+                    || matches!(
+                        kind,
+                        Some(
+                            ExpectedObjectSuggestionKind::NoSuggestions
+                                | ExpectedObjectSuggestionKind::Database
+                        )
+                    ),
                 "MySQL/MariaDB database/schema name slot should not resolve unrelated object kind at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
             );
             for leaked in [
@@ -85190,6 +85947,208 @@ fn mariadb_test4_to_test8_actual_completion_regressions() {
     assert!(
         failures.is_empty(),
         "MariaDB test4-test8 completion gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn mysql_family_sweep_report_structural_keyword_regressions() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let fixture_cases: [
+        (&str, crate::db::DatabaseType, &[(&str, &str, &str)]);
+        6
+    ] = [
+        (
+            "test3.txt",
+            MySQL,
+            &[
+                (
+                    "status_code NOT IN ('DONE', 'RUNNING')",
+                    "status_code NO| IN ('DONE', 'RUNNING')",
+                    "NOT",
+                ),
+                (
+                    "CREATE TRIGGER trg_run_case_bu\nBEFORE UPDATE ON run_case\nFOR EACH ROW\nBEGIN",
+                    "CREATE TRIGGER trg_run_case_bu\nBEFORE UPDATE ON run_case\nFOR EACH ROW\nBEGI|",
+                    "BEGIN",
+                ),
+                ("FROM qa_summary", "FRO| qa_summary", "FROM"),
+                (
+                    "SELECT MAX(depth)\n      INTO v_tree_depth\n      FROM node_tree;",
+                    "SELECT MAX(depth)\n      INTO v_tree_depth\n      FRO| node_tree;",
+                    "FROM",
+                ),
+                ("nested_block: BEGIN", "nested_block: BEGI|", "BEGIN"),
+                ("even_loop: LOOP", "even_loop: LOO|", "LOOP"),
+                ("        WINDOW\n", "        WIND|\n", "WINDOW"),
+            ],
+        ),
+        (
+            "test4.txt",
+            MariaDB,
+            &[(
+                "ON DUPLICATE KEY UPDATE log_count",
+                "ON DUPL| KEY UPDATE log_count",
+                "DUPLICATE",
+            )],
+        ),
+        (
+            "test5.txt",
+            MariaDB,
+            &[
+                ("ORDER BY t.ym,", "ORDE| BY t.ym,", "ORDER BY"),
+                ("        SELECT COUNT(*)\n", "        SELE| COUNT(*)\n", "SELECT"),
+                ("label VARCHAR(40) PATH '$'", "label VARCHAR(40) PAT| '$'", "PATH"),
+                (
+                    "WITH RECURSIVE month_dim AS (\n    SELECT CAST('2025-01-01' AS DATE) AS month_start\n    UNION ALL",
+                    "WITH RECURSIVE month_dim AS (\n    SELECT CAST('2025-01-01' AS DATE) AS month_start\n    UNIO| ALL",
+                    "UNION",
+                ),
+                (
+                    "WHERE month_start < '2025-03-01'",
+                    "WHER| month_start < '2025-03-01'",
+                    "WHERE",
+                ),
+            ],
+        ),
+        (
+            "test6.txt",
+            MariaDB,
+            &[("    LEFT JOIN (\n", "    LEF| JOIN (\n", "LEFT")],
+        ),
+        (
+            "test7.txt",
+            MariaDB,
+            &[
+                (
+                    "ON UPDATE CURRENT_TIMESTAMP(6)",
+                    "ON UPDA| CURRENT_TIMESTAMP(6)",
+                    "UPDATE",
+                ),
+                ("RETURNS DECIMAL(18, 2)", "RETURNS DECI|(18, 2)", "DECIMAL"),
+                ("JOIN cat_tree t", "JOI| cat_tree t", "JOIN"),
+            ],
+        ),
+        (
+            "test8.txt",
+            MariaDB,
+            &[
+                ("IF v_exists = 0 THEN", "I| v_exists = 0 THEN", "IF"),
+                (
+                    "CALL cfb_fail(CONCAT('inactive or missing user: ', p_user_id));",
+                    "CAL| cfb_fail(CONCAT('inactive or missing user: ', p_user_id));",
+                    "CALL",
+                ),
+            ],
+        ),
+    ];
+
+    let mut failures = Vec::new();
+    for (file_name, db_type, cases) in fixture_cases {
+        failures.extend(mysql_family_fixture_completion_case_failures(
+            file_name, db_type, cases,
+        ));
+    }
+    assert!(
+        failures.is_empty(),
+        "MySQL-family sweep structural keyword gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn mysql_family_sweep_report_routine_symbol_regressions() {
+    use crate::db::DatabaseType::MariaDB;
+
+    let mut failures = mysql_family_fixture_completion_case_failures(
+        "test5.txt",
+        MariaDB,
+        &[(
+            "LPAD(v_seq, 3, '0')",
+            "LPAD(v_se|, 3, '0')",
+            "v_seq",
+        )],
+    );
+    failures.extend(mysql_family_fixture_completion_case_failures(
+        "test8.txt",
+        MariaDB,
+        &[
+            ("INTO v_exists", "INTO v_ex|", "v_exists"),
+            ("WHERE user_id = p_user_id", "WHERE user_id = p_us|", "p_user_id"),
+            (
+                "VALUES (p_order_id, p_user_id, p_order_no, 'PAID'",
+                "VALUES (p_or|, p_user_id, p_order_no, 'PAID'",
+                "p_order_id",
+            ),
+            (
+                "1, p_item_name, p_qty, p_unit_price",
+                "1, p_it|, p_qty, p_unit_price",
+                "p_item_name",
+            ),
+        ],
+    ));
+    assert!(
+        failures.is_empty(),
+        "MySQL-family sweep routine symbol gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn mysql_family_sweep_report_trigger_row_column_regressions() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let mut failures = mysql_family_fixture_completion_case_failures(
+        "test1.txt",
+        MySQL,
+        &[(
+            "SET NEW.currency_code = UPPER(TRIM(NEW.currency_code));",
+            "SET NEW.curr| = UPPER(TRIM(NEW.currency_code));",
+            "currency_code",
+        )],
+    );
+    failures.extend(mysql_family_fixture_completion_case_failures(
+        "test6.txt",
+        MariaDB,
+        &[(
+            "IF NEW.quantity IS NULL OR NEW.quantity < 1 THEN",
+            "IF NEW.quan| IS NULL OR NEW.quantity < 1 THEN",
+            "quantity",
+        )],
+    ));
+    assert!(
+        failures.is_empty(),
+        "MySQL-family sweep trigger row-column gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn mysql_family_sweep_report_drop_database_target_regressions() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let mut failures = mysql_family_fixture_completion_case_failures(
+        "test1.txt",
+        MySQL,
+        &[(
+            "DROP DATABASE IF EXISTS qt_mysql_final_boss;",
+            "DROP DATABASE IF EXISTS qt_m|;",
+            "qt_mysql_final_boss",
+        )],
+    );
+    failures.extend(mysql_family_fixture_completion_case_failures(
+        "test4.txt",
+        MariaDB,
+        &[(
+            "DROP DATABASE IF EXISTS mdb_finalboss;",
+            "DROP DATABASE IF EXISTS mdb_|;",
+            "mdb_finalboss",
+        )],
+    ));
+    assert!(
+        failures.is_empty(),
+        "MySQL-family sweep DROP DATABASE target gaps:\n{}",
         failures.join("\n")
     );
 }

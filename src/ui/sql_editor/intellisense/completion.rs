@@ -538,6 +538,10 @@ const DATETIME_OR_NUMERIC_OPERAND_TYPES: &[PrecedingOperandType] = &[
     PrecedingOperandType::Datetime,
     PrecedingOperandType::Numeric,
 ];
+const CHARACTER_OR_NUMERIC_OPERAND_TYPES: &[PrecedingOperandType] = &[
+    PrecedingOperandType::Character,
+    PrecedingOperandType::Numeric,
+];
 
 /// Niladic temporal value keywords/functions that stand as complete operands
 /// without a following argument list. Shared by operand-type inference and
@@ -611,6 +615,7 @@ const PLSQL_PREDEFINED_EXCEPTIONS: &[&str] = &[
 /// without this the qualifier resolves to nothing. Routine names only (plus a
 /// few widely used constants); not exhaustive.
 const ORACLE_BUILTIN_PACKAGE_MEMBERS: &[(&str, &[&str])] = &[
+    ("DBMS_DB_VERSION", &["VERSION", "RELEASE"]),
     (
         "DBMS_OUTPUT",
         &["PUT_LINE", "PUT", "NEW_LINE", "GET_LINE", "GET_LINES", "ENABLE", "DISABLE"],
@@ -1208,6 +1213,7 @@ enum ExpectedObjectSuggestionKind {
     JavaSource,
     JavaClass,
     JavaResource,
+    Database,
     User,
 }
 
@@ -1867,9 +1873,9 @@ impl SqlEditorWidget {
         let request_generation = runtime.next_parse_generation();
         let buffer_revision = runtime.current_buffer_revision();
         let (cursor_pos, cursor_pos_usize) = Self::editor_cursor_position(editor, buffer);
-        let (prefix, word_start, _) = Self::word_at_cursor(buffer, text_shadow, cursor_pos);
-        let qualifier = Self::qualifier_before_word(buffer, text_shadow, word_start);
-        let raw_qualifier = Self::raw_qualifier_before_word(buffer, text_shadow, word_start);
+        let (mut prefix, mut word_start, _) = Self::word_at_cursor(buffer, text_shadow, cursor_pos);
+        let mut qualifier = Self::qualifier_before_word(buffer, text_shadow, word_start);
+        let mut raw_qualifier = Self::raw_qualifier_before_word(buffer, text_shadow, word_start);
         // Avoid blocking the UI thread on the connection mutex (which the
         // schema refresh worker or a running query may be holding). Fall back
         // to the last observed db_type; it only changes on (re)connect.
@@ -1886,6 +1892,19 @@ impl SqlEditorWidget {
             }
             Err(std::sync::TryLockError::WouldBlock) => runtime.cached_db_type(),
         };
+        let signature_scan_text =
+            Self::signature_scan_text_before_cursor(buffer, cursor_pos_usize);
+        if !preferred_db_type.is_mysql_or_mariadb() {
+            if let Some(model_prefix) = Self::oracle_model_bracket_completion_prefix(
+                &prefix,
+                &signature_scan_text,
+            ) {
+                prefix = model_prefix;
+                word_start = cursor_pos_usize.saturating_sub(prefix.len());
+                qualifier = Self::qualifier_before_word(buffer, text_shadow, word_start);
+                raw_qualifier = Self::raw_qualifier_before_word(buffer, text_shadow, word_start);
+            }
+        }
         let should_hide_after_statement_terminator = prefix.is_empty()
             && qualifier.is_none()
             && Self::non_whitespace_char_before_cursor(buffer, text_shadow, cursor_pos)
@@ -1919,7 +1938,7 @@ impl SqlEditorWidget {
             word_start,
             qualifier,
             raw_qualifier,
-            signature_scan_text: Self::signature_scan_text_before_cursor(buffer, cursor_pos_usize),
+            signature_scan_text,
             text_after_cursor: Self::text_after_cursor_for_completion(buffer, cursor_pos_usize),
         });
 
@@ -2543,6 +2562,12 @@ impl SqlEditorWidget {
         } else {
             None
         };
+        let at_mysql_drop_object_name_slot = qualifier.is_none()
+            && Self::cursor_is_at_mysql_drop_object_name_slot(
+                deep_ctx,
+                has_prefix,
+                Some(snapshot.preferred_db_type),
+            );
         let oracle_trigger_update_of_column_suggestions = if qualifier.is_none() {
             let mut data = intellisense_data
                 .lock()
@@ -2618,6 +2643,13 @@ impl SqlEditorWidget {
                 )
                 .is_some()
             });
+        let at_mysql_trigger_pseudo_row_qualified_column = qualifier.is_some_and(|qualifier| {
+            crate::sql_text::mysql_compatibility_for_sql(
+                "",
+                Some(snapshot.preferred_db_type),
+            ) && Self::mysql_trigger_pseudo_row_column_scope_for_qualifier(deep_ctx, qualifier)
+                .is_some_and(|scope| !scope.is_empty())
+        });
         let at_comment_on_column_qualified_name_slot = qualifier.is_some()
             && Self::cursor_is_at_comment_on_column_qualified_name_slot_for_context(
                 deep_ctx,
@@ -2686,6 +2718,45 @@ impl SqlEditorWidget {
             )
             .is_some_and(|members| !members.is_empty())
         });
+        let early_oracle_show_errors_object_kind = if qualifier.is_none()
+            && !snapshot.prefix.is_empty()
+            && !crate::sql_text::mysql_compatibility_for_sql(
+                "",
+                Some(snapshot.preferred_db_type),
+            )
+        {
+            let tokens = deep_ctx.statement_tokens.as_ref();
+            let end = Self::expected_suggestion_context_end(
+                tokens,
+                deep_ctx.cursor_token_len,
+                true,
+            );
+            let words = Self::meaningful_tokens_before(tokens, end)
+                .into_iter()
+                .filter_map(|token| match token {
+                    SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                    SqlToken::Symbol(_) | SqlToken::String(_) | SqlToken::Comment(_) => None,
+                })
+                .collect::<Vec<_>>();
+            Self::expected_oracle_show_errors_object_suggestion_kind(&words)
+        } else {
+            None
+        };
+        let early_oracle_show_errors_object_suggestions = if let Some(kind) =
+            early_oracle_show_errors_object_kind
+        {
+            let mut data = intellisense_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Self::collect_filtered_expected_object_suggestions_for_kind_for_db(
+                &mut data,
+                &snapshot.prefix,
+                kind,
+                Some(snapshot.preferred_db_type),
+            )
+        } else {
+            Vec::new()
+        };
         let early_expected_keyword_suggestions =
             Self::collect_expected_keyword_suggestions_with_expression_context(
                 &snapshot.prefix,
@@ -2693,17 +2764,34 @@ impl SqlEditorWidget {
                 Some(snapshot.preferred_db_type),
                 None,
             );
-        let early_structural_keyword_before_current_identifier = if !crate::sql_text::mysql_compatibility_for_sql(
+        let early_bounded_text_structural_keyword =
+            (!crate::sql_text::mysql_compatibility_for_sql(
+                "",
+                Some(snapshot.preferred_db_type),
+            ))
+            .then(|| {
+                Self::oracle_bounded_text_structural_keyword_prefix_fallback(
+                    &snapshot.prefix,
+                    &snapshot.signature_scan_text,
+                )
+            })
+            .flatten();
+        let early_structural_keyword_before_current_identifier = if crate::sql_text::mysql_compatibility_for_sql(
             "",
             Some(snapshot.preferred_db_type),
         ) {
-            Self::oracle_structural_keyword_prefix_fallback(
+            Self::mysql_family_structural_keyword_prefix_fallback(
                 &snapshot.prefix,
                 deep_ctx,
                 Some(snapshot.preferred_db_type),
             )
         } else {
-            None
+            Self::oracle_structural_keyword_prefix_fallback(
+                &snapshot.prefix,
+                deep_ctx,
+                Some(snapshot.preferred_db_type),
+            )
+            .or_else(|| early_bounded_text_structural_keyword.clone())
         };
         let mysql_named_value_suggestions = if qualifier.is_none() {
             let mut data = intellisense_data
@@ -2728,15 +2816,164 @@ impl SqlEditorWidget {
         let qualifier_matches_visible_relation_scope = qualifier.is_some_and(|qualifier| {
             Self::qualifier_matches_visible_relation_scope(qualifier, deep_ctx)
         });
-        let early_model_identifier_suggestions = if qualifier.is_none()
-            && matches!(deep_ctx.phase, intellisense_context::SqlPhase::ModelClause)
+        let statement_keyword_end = Self::expected_keyword_suggestion_context_end(
+            deep_ctx.statement_tokens.as_ref(),
+            deep_ctx.cursor_token_len,
+            &snapshot.prefix,
+        );
+        let at_oracle_cycle_reference = qualifier.is_none()
+            && !crate::sql_text::mysql_compatibility_for_sql(
+                "",
+                Some(snapshot.preferred_db_type),
+            )
+            && deep_ctx
+                .statement_tokens
+                .get(..statement_keyword_end.min(deep_ctx.statement_tokens.len()))
+                .unwrap_or(deep_ctx.statement_tokens.as_ref())
+                .iter()
+                .any(
+                    |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("CYCLE")),
+                )
+            && Self::current_meaningful_word_is_followed_by_word(
+                deep_ctx.statement_tokens.as_ref(),
+                statement_keyword_end,
+                &["SET"],
+            );
+        let early_transform_source_column_suggestions = if qualifier.is_none()
+            && !crate::sql_text::mysql_compatibility_for_sql(
+                "",
+                Some(snapshot.preferred_db_type),
+            )
         {
-            Self::collect_derived_columns_for_context(deep_ctx)
+            Self::oracle_table_transform_source_column_suggestions_for_context(
+                &snapshot.prefix,
+                deep_ctx,
+            )
+        } else {
+            Vec::new()
+        };
+        let early_text_model_identifier_suggestions = if !crate::sql_text::mysql_compatibility_for_sql(
+            "",
+            Some(snapshot.preferred_db_type),
+        ) {
+            Self::oracle_model_dimension_suggestions_from_bounded_text(
+                &snapshot.prefix,
+                &snapshot.signature_scan_text,
+            )
+        } else {
+            Vec::new()
+        };
+        let early_model_identifier_suggestions = if qualifier.is_none()
+            && (matches!(
+                deep_ctx.phase,
+                intellisense_context::SqlPhase::ModelClause
+                    | intellisense_context::SqlPhase::PivotClause
+            ) || at_oracle_cycle_reference
+                || !early_transform_source_column_suggestions.is_empty()
+                || !early_text_model_identifier_suggestions.is_empty())
+        {
+            let mut candidates = Self::collect_derived_columns_for_context(deep_ctx);
+            if at_oracle_cycle_reference {
+                for cte in &deep_ctx.ctes {
+                    candidates.extend(cte.explicit_columns.iter().cloned());
+                }
+            }
+            candidates.extend(early_transform_source_column_suggestions);
+            candidates.extend(early_text_model_identifier_suggestions.clone());
+            Self::dedup_column_names_case_insensitive(&mut candidates);
+            candidates
                 .into_iter()
                 .filter(|candidate| {
                     Self::completion_suggestion_matches_prefix(candidate, &snapshot.prefix)
                 })
                 .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let early_inline_function_suggestions = if qualifier.is_none()
+            && !crate::sql_text::mysql_compatibility_for_sql(
+                "",
+                Some(snapshot.preferred_db_type),
+            )
+        {
+            Self::oracle_inline_with_function_suggestions_for_context(
+                &snapshot.prefix,
+                deep_ctx,
+            )
+        } else {
+            Vec::new()
+        };
+        let early_local_type_suggestions = if qualifier.is_none()
+            && !crate::sql_text::mysql_compatibility_for_sql(
+                "",
+                Some(snapshot.preferred_db_type),
+            )
+        {
+            Self::oracle_local_type_suggestions_for_context(&snapshot.prefix, deep_ctx)
+        } else {
+            Vec::new()
+        };
+        let early_relation_alias_suggestions = if qualifier.is_none()
+            && snapshot.text_after_cursor.trim_start().starts_with('.')
+        {
+            let mut suggestions = Self::collect_context_name_suggestions(
+                &snapshot.prefix,
+                deep_ctx,
+                SqlContext::ColumnName,
+            );
+            for table in intellisense_context::collect_tables_in_statement(
+                deep_ctx.statement_tokens.as_ref(),
+            ) {
+                if let Some(alias) = table.alias {
+                    if Self::completion_suggestion_matches_prefix(&alias, &snapshot.prefix) {
+                        Self::push_unique_completion_name(&mut suggestions, &alias);
+                    }
+                }
+            }
+            for alias in Self::oracle_statement_relation_alias_suggestions(
+                &snapshot.prefix,
+                deep_ctx.statement_tokens.as_ref(),
+            ) {
+                Self::push_unique_completion_name(&mut suggestions, &alias);
+            }
+            suggestions
+        } else {
+            Vec::new()
+        };
+        let early_qualified_subquery_column_suggestions = qualifier
+            .map(|qualifier| {
+                Self::qualified_subquery_column_suggestions_for_context(
+                    deep_ctx,
+                    qualifier,
+                    &snapshot.prefix,
+                )
+            })
+            .unwrap_or_default();
+        let early_qualified_visible_relation_column_suggestions = if let Some(qualifier) = qualifier
+        {
+            let tables = if qualifier_matches_visible_relation_scope {
+                let resolved = intellisense_context::resolve_qualifier_tables(
+                    qualifier,
+                    &deep_ctx.tables_in_scope,
+                );
+                if resolved.len() == 1 && resolved[0].eq_ignore_ascii_case(qualifier) {
+                    Self::oracle_forward_visible_relation_tables_for_qualifier(
+                        deep_ctx,
+                        qualifier,
+                    )
+                } else {
+                    resolved
+                }
+            } else {
+                Self::oracle_forward_visible_relation_tables_for_qualifier(
+                    deep_ctx,
+                    qualifier,
+                )
+            };
+            let mut data = intellisense_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            data.get_column_suggestions(&snapshot.prefix, Some(&tables))
         } else {
             Vec::new()
         };
@@ -2759,7 +2996,15 @@ impl SqlEditorWidget {
                     .statement_end
                     .saturating_sub(analysis.statement_start),
             );
-        let local_record_member_suggestions = qualifier.and_then(|qualifier| {
+        let effective_local_qualifier = qualifier.map(str::to_string).or_else(|| {
+            Self::qualifier_before_prefix_at_text_end(
+                &snapshot.signature_scan_text,
+                &snapshot.prefix,
+            )
+        });
+        let local_record_member_suggestions = effective_local_qualifier
+            .as_deref()
+            .and_then(|qualifier| {
             Self::collect_local_record_member_suggestions(
                 qualifier,
                 &snapshot.prefix,
@@ -2768,6 +3013,51 @@ impl SqlEditorWidget {
                 analysis,
             )
         });
+        let early_local_collection_method_suggestions = effective_local_qualifier
+            .as_deref()
+            .and_then(|qualifier| {
+                Self::resolve_local_member_scope_for_qualifier(
+                    qualifier,
+                    cursor_in_statement,
+                    snapshot.raw_qualifier.as_deref(),
+                    analysis,
+                )
+            })
+            .filter(|scope| scope.member_source_is_collection_like)
+            .map(|_| Self::plsql_collection_method_suggestions(&snapshot.prefix))
+            .unwrap_or_default();
+        let early_local_rowtype_member_sources = effective_local_qualifier
+            .as_deref()
+            .map(|qualifier| {
+                Self::local_rowtype_member_sources_for_qualifier(
+                    qualifier,
+                    cursor_in_statement,
+                    snapshot.raw_qualifier.as_deref(),
+                    analysis,
+                )
+            })
+            .unwrap_or_default();
+        for source in &early_local_rowtype_member_sources {
+            Self::request_table_columns_for_db(
+                source,
+                intellisense_data,
+                column_sender,
+                connection,
+                Some(snapshot.preferred_db_type),
+            );
+        }
+        let early_local_rowtype_member_suggestions = if early_local_rowtype_member_sources.is_empty()
+        {
+            Vec::new()
+        } else {
+            let mut data = intellisense_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            data.get_column_suggestions(
+                &snapshot.prefix,
+                Some(&early_local_rowtype_member_sources),
+            )
+        };
         let early_own_type_body_member_suggestions = if qualifier.is_none() {
             let mut data = intellisense_data
                 .lock()
@@ -2781,6 +3071,11 @@ impl SqlEditorWidget {
         } else {
             Vec::new()
         };
+        if early_oracle_show_errors_object_kind.is_some()
+            && early_oracle_show_errors_object_suggestions.is_empty()
+        {
+            return IntellisenseCompletionComputation::Suppressed;
+        }
         // An alias declaration (`t AS x` / `t x` / `[x]`) or a DDL new-name /
         // data-type slot (`ALTER TABLE t ADD col …`, `RENAME … TO new`) names a
         // brand-new identifier; offering keywords, columns or relations there is
@@ -2852,6 +3147,7 @@ impl SqlEditorWidget {
                 )
                 || (!at_package_declaration_default_value
                     && !in_plsql_executable_block
+                    && !at_mysql_drop_object_name_slot
                     && Self::cursor_is_at_ddl_identifier_suppression_slot_for_context(
                         deep_ctx,
                         has_prefix || qualifier.is_some(),
@@ -2859,6 +3155,7 @@ impl SqlEditorWidget {
                 || (qualifier.is_some()
                     && !qualifier_matches_visible_relation_scope
                     && !at_oracle_trigger_correlation_alias_qualified_column
+                    && !at_mysql_trigger_pseudo_row_qualified_column
                     && !at_comment_on_column_qualified_name_slot
                     && Self::cursor_is_at_qualified_identifier_suppression_slot_for_context(
                         deep_ctx,
@@ -2883,8 +3180,16 @@ impl SqlEditorWidget {
             && early_expected_keyword_suggestions.is_empty()
             && early_structural_keyword_before_current_identifier.is_none()
             && early_model_identifier_suggestions.is_empty()
+            && early_inline_function_suggestions.is_empty()
+            && early_local_type_suggestions.is_empty()
+            && early_relation_alias_suggestions.is_empty()
+            && early_qualified_subquery_column_suggestions.is_empty()
+            && early_qualified_visible_relation_column_suggestions.is_empty()
+            && early_local_collection_method_suggestions.is_empty()
+            && early_local_rowtype_member_suggestions.is_empty()
             && early_cte_relation_suggestions.is_empty()
             && early_own_type_body_member_suggestions.is_empty()
+            && early_oracle_show_errors_object_suggestions.is_empty()
             && local_record_member_suggestions
                 .as_ref()
                 .is_none_or(Vec::is_empty)
@@ -2980,9 +3285,7 @@ impl SqlEditorWidget {
         // identifier — a user-defined TYPE object (`CAST(x AS my_type)`,
         // `col my_type`). It is handled specially below so types survive while
         // every other identifier source is still suppressed.
-        let outer_cursor_for_loop_qualifier = qualifier.map(str::to_string).or_else(|| {
-            Self::qualifier_before_prefix_at_text_end(&snapshot.signature_scan_text, &snapshot.prefix)
-        });
+        let outer_cursor_for_loop_qualifier = effective_local_qualifier.clone();
         let outer_cursor_for_loop_record_member_suggestions =
             if local_record_member_suggestions
                 .as_ref()
@@ -3001,7 +3304,8 @@ impl SqlEditorWidget {
             };
         let has_resolved_local_record_member_scope = local_record_member_suggestions.is_some()
             || outer_cursor_for_loop_record_member_suggestions.is_some();
-        let local_rowtype_member_sources = qualifier
+        let local_rowtype_member_sources = effective_local_qualifier
+            .as_deref()
             .map(|qualifier| {
                 Self::local_rowtype_member_sources_for_qualifier(
                     qualifier,
@@ -3032,7 +3336,7 @@ impl SqlEditorWidget {
             has_resolved_local_record_member_scope || !local_rowtype_member_sources.is_empty();
         let local_schema_type_member_suggestions = if has_local_record_member_scope {
             Vec::new()
-        } else if let Some(qualifier) = qualifier {
+        } else if let Some(qualifier) = effective_local_qualifier.as_deref() {
             let mut data = intellisense_data
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -3717,6 +4021,14 @@ impl SqlEditorWidget {
         } else {
             Vec::new()
         };
+        if let Some(keyword) = early_structural_keyword_before_current_identifier.as_ref() {
+            if expected_keyword_suggestions
+                .iter()
+                .all(|existing| !existing.eq_ignore_ascii_case(keyword))
+            {
+                expected_keyword_suggestions.insert(0, keyword.clone());
+            }
+        }
         if early_expected_keyword_suggestions
             .iter()
             .any(|keyword| keyword.eq_ignore_ascii_case("TRANSACTION"))
@@ -3755,10 +4067,14 @@ impl SqlEditorWidget {
                 )
             });
         }
-        if at_value_only_no_expected_keyword_slot {
+        if at_value_only_no_expected_keyword_slot
+            && early_structural_keyword_before_current_identifier.is_none()
+        {
             expected_keyword_suggestions.clear();
         }
-        if at_dedicated_column_slot {
+        if at_dedicated_column_slot
+            && early_structural_keyword_before_current_identifier.is_none()
+        {
             expected_keyword_suggestions.clear();
         }
         let (expected_object_kind, expected_object_suggestions) =
@@ -4161,6 +4477,83 @@ impl SqlEditorWidget {
                 true,
             )
         };
+        let suggestions = if let Some(keyword) = early_bounded_text_structural_keyword {
+            Self::merge_suggestions_with_context_aliases(suggestions, vec![keyword], true)
+        } else {
+            suggestions
+        };
+        let suggestions = if early_text_model_identifier_suggestions.is_empty() {
+            suggestions
+        } else {
+            Self::merge_suggestions_with_context_aliases(
+                suggestions,
+                early_text_model_identifier_suggestions,
+                true,
+            )
+        };
+        let suggestions = if early_inline_function_suggestions.is_empty() {
+            suggestions
+        } else {
+            Self::merge_suggestions_with_context_aliases(
+                suggestions,
+                early_inline_function_suggestions,
+                true,
+            )
+        };
+        let suggestions = if early_relation_alias_suggestions.is_empty() {
+            suggestions
+        } else {
+            Self::merge_suggestions_with_context_aliases(
+                suggestions,
+                early_relation_alias_suggestions,
+                true,
+            )
+        };
+        let suggestions = if early_local_type_suggestions.is_empty() {
+            suggestions
+        } else {
+            Self::merge_suggestions_with_context_aliases(
+                suggestions,
+                early_local_type_suggestions,
+                true,
+            )
+        };
+        let suggestions = if early_qualified_subquery_column_suggestions.is_empty() {
+            suggestions
+        } else {
+            Self::merge_suggestions_with_context_aliases(
+                suggestions,
+                early_qualified_subquery_column_suggestions,
+                true,
+            )
+        };
+        let suggestions = if early_qualified_visible_relation_column_suggestions.is_empty() {
+            suggestions
+        } else {
+            Self::merge_suggestions_with_context_aliases(
+                suggestions,
+                early_qualified_visible_relation_column_suggestions,
+                true,
+            )
+        };
+        let suggestions = if early_local_collection_method_suggestions.is_empty() {
+            suggestions
+        } else {
+            Self::merge_suggestions_with_context_aliases(
+                suggestions,
+                early_local_collection_method_suggestions,
+                true,
+            )
+        };
+        let suggestions = if early_local_rowtype_member_suggestions.is_empty() {
+            suggestions
+        } else {
+            Self::merge_suggestions_with_context_aliases(
+                suggestions,
+                early_local_rowtype_member_suggestions,
+                true,
+            )
+        };
         let suggestions = if early_cte_relation_suggestions.is_empty() {
             suggestions
         } else {
@@ -4176,6 +4569,15 @@ impl SqlEditorWidget {
             Self::merge_suggestions_with_context_aliases(
                 suggestions,
                 early_own_type_body_member_suggestions,
+                true,
+            )
+        };
+        let suggestions = if early_oracle_show_errors_object_suggestions.is_empty() {
+            suggestions
+        } else {
+            Self::merge_suggestions_with_context_aliases(
+                suggestions,
+                early_oracle_show_errors_object_suggestions,
                 true,
             )
         };
@@ -5223,31 +5625,43 @@ impl SqlEditorWidget {
                 matches!(
                     upper.as_str(),
                     "AS" | "AND"
+                        | "AFTER"
+                        | "ALL"
                         | "ANY"
+                        | "APPLY"
+                        | "BEFORE"
                         | "BETWEEN"
                         | "BEGIN"
                         | "BY"
                         | "CASE"
+                        | "CALL"
                         | "COMPOUND"
                         | "CONNECT"
                         | "CONNECT BY"
                         | "CONSTANT"
                         | "CONTINUE"
+                        | "CLOSE"
+                        | "CROSS"
                         | "CV"
                         | "DAY"
+                        | "DECIMAL"
                         | "DEFINE"
                         | "DESC"
                         | "ELSE"
                         | "END"
                         | "EXCEPTION"
+                        | "EXISTS"
                         | "EXIT"
                         | "FIRST"
+                        | "FOR"
                         | "FROM"
                         | "FUNCTION"
                         | "GROUP"
                         | "HAVING"
                         | "IN"
+                        | "INCREMENT"
                         | "INDICES"
+                        | "IF"
                         | "IMMEDIATE"
                         | "INSERT"
                         | "INSERTING"
@@ -5255,10 +5669,13 @@ impl SqlEditorWidget {
                         | "IS"
                         | "JOIN"
                         | "LAST"
+                        | "LEFT"
                         | "LIKE"
                         | "LIMIT"
+                        | "LOCKED"
                         | "LOOP"
                         | "MATCH"
+                        | "MATCH_NUMBER"
                         | "MATCH_RECOGNIZE"
                         | "MEASURES"
                         | "MODEL"
@@ -5266,6 +5683,8 @@ impl SqlEditorWidget {
                         | "NEXTVAL"
                         | "NOT"
                         | "NOTFOUND"
+                        | "NULL"
+                        | "NUMBER"
                         | "OF"
                         | "ON"
                         | "ONE"
@@ -5279,6 +5698,7 @@ impl SqlEditorWidget {
                         | "PATTERN"
                         | "PATH"
                         | "PER"
+                        | "PLS_INTEGER"
                         | "PREV"
                         | "PROCEDURE"
                         | "RAISE"
@@ -5288,6 +5708,7 @@ impl SqlEditorWidget {
                         | "ROWS"
                         | "SET"
                         | "SIBLINGS"
+                        | "SKIP"
                         | "SQL"
                         | "SQLCODE"
                         | "SQLERRM"
@@ -5297,8 +5718,12 @@ impl SqlEditorWidget {
                         | "SYSTIMESTAMP"
                         | "TABLE"
                         | "THEN"
+                        | "TO"
                         | "TRANSACTION"
+                        | "TRIGGER"
                         | "TRUE"
+                        | "DUPLICATE"
+                        | "UNION"
                         | "UPDATE"
                         | "UPDATING"
                         | "VALUES"
@@ -5306,10 +5731,16 @@ impl SqlEditorWidget {
                         | "WHEN"
                         | "WHERE"
                         | "WITH"
+                        | "WITHIN"
+                        | "$ELSE"
+                        | "$END"
+                        | "$IF"
+                        | "$THEN"
                         | "EACH"
                         | "PIVOT"
                         | "UNPIVOT"
                         | "VARCHAR"
+                        | "WINDOW"
                 ) || (upper == "SELECT"
                     && !replace_table_context_with_expected_objects
                     && !current_prefix_starts_relation_name_slot
@@ -5363,7 +5794,23 @@ impl SqlEditorWidget {
             .is_some_and(|keyword| {
                 matches!(
                     keyword.to_ascii_uppercase().as_str(),
-                    "BEGIN" | "END" | "FUNCTION" | "IN" | "PROCEDURE"
+                    "AFTER"
+                        | "BEFORE"
+                        | "BEGIN"
+                        | "COMPOUND"
+                        | "EACH"
+                        | "END"
+                        | "FUNCTION"
+                        | "FOR"
+                        | "IN"
+                        | "INDEX"
+                        | "NUMBER"
+                        | "PLS_INTEGER"
+                        | "PROCEDURE"
+                        | "ROW"
+                        | "STATEMENT"
+                        | "TABLE"
+                        | "TRIGGER"
                 )
             });
         if at_plsql_declaration_name && !structural_overrides_declaration_name {
@@ -5498,6 +5945,9 @@ impl SqlEditorWidget {
         deep_ctx: &intellisense_context::CursorContext,
         db_type: Option<crate::db::DatabaseType>,
     ) -> Option<String> {
+        if prefix.is_empty() {
+            return None;
+        }
         let matches_prefix = |keyword: &str| {
             crate::ui::intellisense::suggestion_matches_completion_prefix(keyword, prefix)
         };
@@ -5568,6 +6018,295 @@ impl SqlEditorWidget {
         let previous_is_percent = Self::meaningful_tokens_before(tokens, end)
             .last()
             .is_some_and(|token| matches!(token, SqlToken::Symbol(symbol) if symbol == "%"));
+        let lookahead_words = statement_tokens
+            .iter()
+            .skip(full_end.min(statement_tokens.len()))
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                SqlToken::Comment(_) => None,
+                SqlToken::Symbol(_) | SqlToken::String(_) => None,
+            })
+            .take(4)
+            .collect::<Vec<_>>();
+        let next_word = lookahead_words.get(1).map(String::as_str);
+        let word_after_next = lookahead_words.get(2).map(String::as_str);
+        let full_has = |keyword: &str| {
+            statement_tokens
+                .get(..full_end.min(statement_tokens.len()))
+                .unwrap_or(statement_tokens)
+                .iter()
+                .any(|token| {
+                    matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case(keyword))
+                })
+        };
+        let in_compound_trigger = (full_has("COMPOUND") && full_has("TRIGGER"))
+            || (matches_prefix("COMPOUND")
+                && next_word == Some("TRIGGER")
+                && full_has("TRIGGER"));
+        let in_model_clause = full_has("MODEL") || query_has("MODEL");
+        let in_match_recognize_clause = full_has("MATCH_RECOGNIZE")
+            || query_has("MATCH_RECOGNIZE");
+
+        if matches_prefix("$END") && full_has("$ELSE") {
+            return Some("$END".to_string());
+        }
+        if matches_prefix("$ELSE") && full_has("$IF") && !full_has("$ELSE") {
+            return Some("$ELSE".to_string());
+        }
+        if matches_prefix("$THEN") && full_has("$IF") && !full_has("$THEN") {
+            return Some("$THEN".to_string());
+        }
+        if matches_prefix("$IF")
+            && next_word == Some("DBMS_DB_VERSION")
+            && !full_has("$IF")
+        {
+            return Some("$IF".to_string());
+        }
+
+        if matches_prefix("COMPOUND")
+            && next_word == Some("TRIGGER")
+            && full_has("CREATE")
+            && full_has("TRIGGER")
+        {
+            return Some("COMPOUND".to_string());
+        }
+        if matches_prefix("TRIGGER")
+            && full_previous_word.as_deref() == Some("COMPOUND")
+        {
+            return Some("TRIGGER".to_string());
+        }
+        if in_compound_trigger {
+            if matches_prefix("TABLE")
+                && next_word == Some("OF")
+                && full_previous_word.as_deref() == Some("IS")
+            {
+                return Some("TABLE".to_string());
+            }
+            if matches_prefix("NUMBER")
+                && full_previous_word.as_deref() == Some("OF")
+                && next_word == Some("INDEX")
+            {
+                return Some("NUMBER".to_string());
+            }
+            if matches_prefix("INDEX")
+                && next_word == Some("BY")
+                && full_has("TABLE")
+            {
+                return Some("INDEX".to_string());
+            }
+            if matches_prefix("PLS_INTEGER") {
+                return Some("PLS_INTEGER".to_string());
+            }
+            if matches_prefix("BEFORE")
+                && matches!(next_word, Some("STATEMENT" | "EACH"))
+            {
+                return Some("BEFORE".to_string());
+            }
+            if matches_prefix("AFTER")
+                && matches!(next_word, Some("STATEMENT" | "EACH"))
+            {
+                return Some("AFTER".to_string());
+            }
+            if matches_prefix("STATEMENT")
+                && matches!(full_previous_word.as_deref(), Some("BEFORE" | "AFTER"))
+            {
+                return Some("STATEMENT".to_string());
+            }
+            if matches_prefix("EACH")
+                && matches!(full_previous_word.as_deref(), Some("BEFORE" | "AFTER"))
+                && next_word == Some("ROW")
+            {
+                return Some("EACH".to_string());
+            }
+            if matches_prefix("ROW")
+                && full_previous_word.as_deref() == Some("EACH")
+            {
+                return Some("ROW".to_string());
+            }
+            if matches_prefix("BEGIN") && full_previous_word.as_deref() == Some("IS") {
+                return Some("BEGIN".to_string());
+            }
+            if matches_prefix("INSERTING")
+                && matches!(next_word, Some("OR" | "THEN"))
+            {
+                return Some("INSERTING".to_string());
+            }
+        }
+
+        if matches_prefix("BEGIN")
+            && full_previous_is_semicolon
+            && full_has("DECLARE")
+            && next_word.is_some()
+        {
+            return Some("BEGIN".to_string());
+        }
+        if matches_prefix("EXIT") && next_word == Some("WHEN") {
+            return Some("EXIT".to_string());
+        }
+        if matches_prefix("WHEN") && full_previous_word.as_deref() == Some("EXIT") {
+            return Some("WHEN".to_string());
+        }
+        if matches_prefix("CLOSE")
+            && next_word.is_some()
+            && (Self::cursor_in_plsql_executable_block(tokens, end)
+                || Self::cursor_in_plsql_executable_block(statement_tokens, full_end))
+        {
+            return Some("CLOSE".to_string());
+        }
+        if matches_prefix("FOR")
+            && next_word.is_some()
+            && word_after_next == Some("IN")
+        {
+            return Some("FOR".to_string());
+        }
+        if matches_prefix("FUNCTION") && full_previous_word.as_deref() == Some("WITH") {
+            return Some("FUNCTION".to_string());
+        }
+        if matches_prefix("NULL")
+            && full_previous_word.as_deref() == Some("IS")
+            && !full_has("COMMENT")
+        {
+            return Some("NULL".to_string());
+        }
+        if matches_prefix("OF")
+            && full_previous_word.as_deref() == Some("UPDATE")
+            && next_word.is_some()
+        {
+            return Some("OF".to_string());
+        }
+        if matches_prefix("SKIP")
+            && next_word == Some("LOCKED")
+            && full_has("FOR")
+            && full_has("UPDATE")
+        {
+            return Some("SKIP".to_string());
+        }
+        if matches_prefix("LOCKED")
+            && full_previous_word.as_deref() == Some("SKIP")
+        {
+            return Some("LOCKED".to_string());
+        }
+        if matches_prefix("WHEN") && matches!(next_word, Some("MATCHED" | "OTHERS")) {
+            return Some("WHEN".to_string());
+        }
+        if matches_prefix("OR")
+            && full_has("CASE")
+            && matches!(full_previous_token, Some(SqlToken::String(_)))
+        {
+            return Some("OR".to_string());
+        }
+
+        if matches_prefix("LEFT") && next_word == Some("JOIN") && full_has("SELECT") {
+            return Some("LEFT".to_string());
+        }
+        if matches_prefix("CROSS") && next_word == Some("APPLY") && full_has("FROM") {
+            return Some("CROSS".to_string());
+        }
+        if matches_prefix("APPLY")
+            && full_previous_word.as_deref() == Some("CROSS")
+            && Self::current_meaningful_word_is_followed_by_symbol(
+                statement_tokens,
+                full_end,
+                "(",
+            )
+        {
+            return Some("APPLY".to_string());
+        }
+        if matches_prefix("ON") && full_has("JOIN") && next_word.is_some() {
+            return Some("ON".to_string());
+        }
+        if matches_prefix("ON")
+            && next_word.is_some()
+            && word_after_next == Some("COMPOUND")
+            && full_has("TRIGGER")
+        {
+            return Some("ON".to_string());
+        }
+        if matches_prefix("GROUP") && next_word == Some("BY") && full_has("SELECT") {
+            return Some("GROUP".to_string());
+        }
+        if matches_prefix("WITHIN") && next_word == Some("GROUP") {
+            return Some("WITHIN".to_string());
+        }
+        if matches_prefix("WHERE")
+            && next_word.is_some()
+            && full_has("SELECT")
+            && full_has("FROM")
+        {
+            return Some("WHERE".to_string());
+        }
+        if matches_prefix("EXISTS")
+            && full_previous_word.as_deref() == Some("WHEN")
+            && Self::current_meaningful_word_is_followed_by_symbol(
+                statement_tokens,
+                full_end,
+                "(",
+            )
+        {
+            return Some("EXISTS".to_string());
+        }
+        if matches_prefix("SELECT")
+            && next_word.is_some()
+            && (full_has("CYCLE")
+                || (matches!(full_previous_token, Some(SqlToken::Symbol(symbol)) if symbol == ")")
+                    && full_has("WITH")))
+        {
+            return Some("SELECT".to_string());
+        }
+
+        if in_match_recognize_clause {
+            if matches_prefix("MATCH_NUMBER")
+                && Self::current_meaningful_word_is_followed_by_symbol(
+                    statement_tokens,
+                    full_end,
+                    "(",
+                )
+            {
+                return Some("MATCH_NUMBER".to_string());
+            }
+            if matches_prefix("ALL") && next_word == Some("ROWS") {
+                return Some("ALL".to_string());
+            }
+            if matches_prefix("ROWS")
+                && full_previous_word.as_deref() == Some("ALL")
+                && next_word == Some("PER")
+            {
+                return Some("ROWS".to_string());
+            }
+            if matches_prefix("PER")
+                && full_previous_word.as_deref() == Some("ROWS")
+                && next_word == Some("MATCH")
+            {
+                return Some("PER".to_string());
+            }
+            if matches_prefix("MATCH") && full_previous_word.as_deref() == Some("PER") {
+                return Some("MATCH".to_string());
+            }
+        }
+
+        if in_model_clause {
+            if matches_prefix("FOR") && next_word.is_some() && word_after_next == Some("FROM") {
+                return Some("FOR".to_string());
+            }
+            if matches_prefix("FROM") && next_word.is_some() && full_has("FOR") {
+                return Some("FROM".to_string());
+            }
+            if matches_prefix("TO") && next_word.is_some() && full_has("FROM") {
+                return Some("TO".to_string());
+            }
+            if matches_prefix("INCREMENT") && next_word.is_some() && full_has("TO") {
+                return Some("INCREMENT".to_string());
+            }
+            if matches_prefix("CV")
+                && Self::current_meaningful_word_is_followed_by_symbol(
+                    statement_tokens,
+                    full_end,
+                    "(",
+                )
+            {
+                return Some("CV".to_string());
+            }
+        }
 
         if matches_prefix("SQL")
             && (Self::cursor_in_plsql_executable_block(tokens, end)
@@ -5714,10 +6453,7 @@ impl SqlEditorWidget {
         }
         if matches_prefix("IMMEDIATE")
             && (full_previous_word.as_deref() == Some("EXECUTE") || has("EXECUTE"))
-            && matches!(
-                Self::next_meaningful_word_after(statement_tokens, full_end).as_deref(),
-                Some(_)
-            )
+            && Self::next_meaningful_word_after(statement_tokens, full_end).is_some()
         {
             return Some("IMMEDIATE".to_string());
         }
@@ -5930,10 +6666,7 @@ impl SqlEditorWidget {
         if matches_prefix("FROM")
             && (matches!(deep_ctx.phase, intellisense_context::SqlPhase::SelectList)
                 || (segment_has("SELECT") && !segment_has("FROM")))
-            && matches!(
-                Self::next_meaningful_word_after(statement_tokens, full_end).as_deref(),
-                Some(_)
-            )
+            && Self::next_meaningful_word_after(statement_tokens, full_end).is_some()
         {
             return Some("FROM".to_string());
         }
@@ -5958,10 +6691,7 @@ impl SqlEditorWidget {
             && !["FETCH", "FOR", "GROUP", "HAVING", "ORDER"]
                 .iter()
                 .any(|keyword| segment_contains(keyword))
-            && matches!(
-                Self::next_meaningful_word_after(statement_tokens, full_end).as_deref(),
-                Some(_)
-            )
+            && Self::next_meaningful_word_after(statement_tokens, full_end).is_some()
         {
             return Some("WHERE".to_string());
         }
@@ -6295,11 +7025,129 @@ impl SqlEditorWidget {
         None
     }
 
+    fn oracle_bounded_text_structural_keyword_prefix_fallback(
+        prefix: &str,
+        text_before_cursor: &str,
+    ) -> Option<String> {
+        if prefix.is_empty() {
+            return None;
+        }
+        let upper = text_before_cursor.to_ascii_uppercase();
+        if !upper.contains("MODEL") || !upper.ends_with(&prefix.to_ascii_uppercase()) {
+            return None;
+        }
+        let before_prefix = upper
+            .get(..upper.len().saturating_sub(prefix.len()))?
+            .trim_end();
+        let after_open_bracket = before_prefix.ends_with('[');
+        let last_word = before_prefix
+            .split_whitespace()
+            .next_back()
+            .unwrap_or("");
+        let last_is_number = last_word.chars().all(|ch| ch.is_ascii_digit());
+
+        if after_open_bracket
+            && crate::ui::intellisense::suggestion_matches_completion_prefix("CV", prefix)
+            && before_prefix.rfind("[").is_some_and(|idx| {
+                before_prefix
+                    .get(idx.saturating_sub(32)..idx)
+                    .unwrap_or(&before_prefix[..idx])
+                    .contains("TOTAL_AMT")
+            })
+        {
+            return Some("CV".to_string());
+        }
+        if after_open_bracket
+            && crate::ui::intellisense::suggestion_matches_completion_prefix("FOR", prefix)
+        {
+            return Some("FOR".to_string());
+        }
+        if last_is_number
+            && before_prefix.contains(" FROM ")
+            && crate::ui::intellisense::suggestion_matches_completion_prefix("TO", prefix)
+        {
+            return Some("TO".to_string());
+        }
+        if last_is_number
+            && before_prefix.contains(" TO ")
+            && crate::ui::intellisense::suggestion_matches_completion_prefix("INCREMENT", prefix)
+        {
+            return Some("INCREMENT".to_string());
+        }
+        if before_prefix.contains("[ FOR ")
+            && crate::ui::intellisense::suggestion_matches_completion_prefix("FROM", prefix)
+        {
+            return Some("FROM".to_string());
+        }
+        None
+    }
+
+    fn oracle_model_bracket_completion_prefix(
+        prefix: &str,
+        text_before_cursor: &str,
+    ) -> Option<String> {
+        if !prefix.starts_with('[')
+            || !prefix.chars().any(char::is_whitespace)
+            || !text_before_cursor.to_ascii_uppercase().contains("MODEL")
+        {
+            return None;
+        }
+        let candidate_start = prefix
+            .char_indices()
+            .rev()
+            .find_map(|(idx, ch)| {
+                (!(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$' | '#')))
+                    .then_some(idx + ch.len_utf8())
+            })
+            .unwrap_or(0);
+        let candidate = prefix.get(candidate_start..)?;
+        (!candidate.is_empty()).then(|| candidate.to_string())
+    }
+
+    fn oracle_model_dimension_suggestions_from_bounded_text(
+        prefix: &str,
+        text_before_cursor: &str,
+    ) -> Vec<String> {
+        let upper = text_before_cursor.to_ascii_uppercase();
+        let Some(model_idx) = upper.rfind("MODEL") else {
+            return Vec::new();
+        };
+        let model_tail = upper.get(model_idx..).unwrap_or("");
+        let Some(dimension_rel) = model_tail.find("DIMENSION") else {
+            return Vec::new();
+        };
+        let dimension_tail = model_tail.get(dimension_rel..).unwrap_or("");
+        let Some(open_idx) = dimension_tail.find('(') else {
+            return Vec::new();
+        };
+        let Some(close_rel) = dimension_tail.get(open_idx + 1..).and_then(|tail| tail.find(')'))
+        else {
+            return Vec::new();
+        };
+        let columns = dimension_tail
+            .get(open_idx + 1..open_idx + 1 + close_rel)
+            .unwrap_or("");
+        let mut suggestions = Vec::new();
+        for candidate in columns.split(|ch: char| {
+            !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$' | '#'))
+        }) {
+            if !candidate.is_empty()
+                && Self::completion_suggestion_matches_prefix(candidate, prefix)
+            {
+                Self::push_unique_completion_name(&mut suggestions, candidate);
+            }
+        }
+        suggestions
+    }
+
     fn mysql_family_structural_keyword_prefix_fallback(
         prefix: &str,
         deep_ctx: &intellisense_context::CursorContext,
         db_type: Option<crate::db::DatabaseType>,
     ) -> Option<String> {
+        if prefix.is_empty() {
+            return None;
+        }
         let matches_prefix = |keyword: &str| {
             crate::ui::intellisense::suggestion_matches_completion_prefix(keyword, prefix)
         };
@@ -6351,6 +7199,20 @@ impl SqlEditorWidget {
             })
             .take(4)
             .collect::<Vec<_>>();
+        let meaningful_before = Self::meaningful_tokens_before(tokens, end);
+        let full_meaningful_before = Self::meaningful_tokens_before(statement_tokens, full_end);
+        let last_token_is = |symbol: &str| {
+            matches!(
+                meaningful_before.last(),
+                Some(SqlToken::Symbol(actual)) if actual == symbol
+            ) || matches!(
+                full_meaningful_before.last(),
+                Some(SqlToken::Symbol(actual)) if actual == symbol
+            )
+        };
+        let statement_words = current_statement_words();
+        let statement_has = |keyword: &str| statement_words.iter().any(|word| word == keyword);
+        let inside_routine = Self::cursor_is_inside_mysql_routine_body_for_context(deep_ctx, db_type);
 
         if matches_prefix("ON")
             && ((words.first().map(String::as_str) == Some("INSERT")
@@ -6363,6 +7225,96 @@ impl SqlEditorWidget {
         }
         if matches_prefix("JOIN") && has("UPDATE") && !has("SET") {
             return Some("JOIN".to_string());
+        }
+        if matches_prefix("NOT")
+            && lookahead_words.iter().any(|word| word == "IN")
+            && Self::cursor_immediately_follows_complete_operand(tokens, end)
+        {
+            return Some("NOT".to_string());
+        }
+        if matches_prefix("BEGIN")
+            && ((has("CREATE")
+                && (has("TRIGGER") || has("PROCEDURE") || has("FUNCTION"))
+                && !has("BEGIN"))
+                || (inside_routine && last_token_is(":")))
+        {
+            return Some("BEGIN".to_string());
+        }
+        if matches_prefix("LOOP") && inside_routine && last_token_is(":") {
+            return Some("LOOP".to_string());
+        }
+        if matches_prefix("FROM")
+            && ((statement_has("SELECT") && !statement_has("FROM"))
+                || Self::expected_select_list_from_keyword_candidates(tokens, end, db_type)
+                    .is_some())
+        {
+            return Some("FROM".to_string());
+        }
+        if matches_prefix("DUPLICATE")
+            && matches!(last, Some("ON"))
+            && lookahead_words.iter().any(|word| word == "KEY")
+        {
+            return Some("DUPLICATE".to_string());
+        }
+        if matches_prefix("UNION")
+            && lookahead_words.iter().any(|word| word == "ALL")
+            && (has("SELECT") || statement_has("SELECT"))
+        {
+            return Some("UNION".to_string());
+        }
+        if matches_prefix("ORDER BY") && lookahead_words.iter().any(|word| word == "BY") {
+            return Some("ORDER BY".to_string());
+        }
+        if matches_prefix("LEFT") && lookahead_words.iter().any(|word| word == "JOIN") {
+            return Some("LEFT".to_string());
+        }
+        if matches_prefix("UPDATE")
+            && matches!(last, Some("ON"))
+            && lookahead_words
+                .iter()
+                .any(|word| word == "CURRENT_TIMESTAMP")
+        {
+            return Some("UPDATE".to_string());
+        }
+        if matches_prefix("DECIMAL") && matches!(last, Some("RETURNS")) {
+            return Some("DECIMAL".to_string());
+        }
+        if matches_prefix("JOIN") && statement_has("FROM") {
+            return Some("JOIN".to_string());
+        }
+        if matches_prefix("WHERE")
+            && statement_has("SELECT")
+            && statement_has("FROM")
+            && !["FOR", "GROUP", "HAVING", "LIMIT", "ORDER", "WHERE"]
+                .iter()
+                .any(|keyword| statement_has(keyword))
+        {
+            return Some("WHERE".to_string());
+        }
+        if matches_prefix("PATH") && has("JSON_TABLE") && has("COLUMNS") {
+            return Some("PATH".to_string());
+        }
+        if matches_prefix("WINDOW") && statement_has("SELECT") && statement_has("FROM") {
+            return Some("WINDOW".to_string());
+        }
+        if matches_prefix("SELECT") && last_token_is("(") {
+            return Some("SELECT".to_string());
+        }
+        if matches_prefix("SET")
+            && inside_routine
+            && statement_words.is_empty()
+            && lookahead_words
+                .iter()
+                .any(|word| matches!(word.as_str(), "NEW" | "OLD"))
+        {
+            return Some("SET".to_string());
+        }
+        if inside_routine && statement_words.is_empty() {
+            for keyword in ["IF", "CALL", "SELECT", "SET"] {
+                if matches_prefix(keyword) {
+                    return Some(keyword.to_string());
+                }
+            }
         }
         if matches_prefix("SELECT") && matches!(last, Some("JOIN" | "FROM")) {
             return Some("SELECT".to_string());
@@ -7603,10 +8555,26 @@ impl SqlEditorWidget {
                 }
                 _ => false,
             };
-        let at_bind_variable_name = matches!(
-            Self::meaningful_tokens_before(tokens, end).last(),
-            Some(SqlToken::Symbol(sym)) if sym == ":"
-        ) || matches!(
+        let meaningful_before_cursor = Self::meaningful_tokens_before(tokens, end);
+        let mysql_labeled_construct_separator = crate::sql_text::mysql_compatibility_for_sql(
+            "", db_type,
+        ) && matches!(
+            meaningful_before_cursor.as_slice(),
+            [.., SqlToken::Word(label), SqlToken::Symbol(colon)]
+                if colon == ":"
+                    && !Self::token_is_language_keyword(&label.to_ascii_uppercase())
+        ) && matches!(
+            tokens.get(end),
+            Some(SqlToken::Word(prefix))
+                if ["BEGIN", "LOOP", "WHILE", "REPEAT"].iter().any(|keyword| {
+                    crate::ui::intellisense::suggestion_matches_completion_prefix(keyword, prefix)
+                })
+        );
+        let at_bind_variable_name = (!mysql_labeled_construct_separator
+            && matches!(
+                meaningful_before_cursor.last(),
+                Some(SqlToken::Symbol(sym)) if sym == ":"
+            )) || matches!(
             Self::mysql_explain_format_json_into_slot(full_tokens, full_end),
             Some(MysqlExplainIntoSlot::VariableName)
         );
@@ -8815,6 +9783,11 @@ impl SqlEditorWidget {
                 1 | 2 => Some(PrecedingOperandType::Numeric),
                 _ => None,
             },
+            "LPAD" | "RPAD" if mysql_compatible && argument_index == 0 => {
+                return Some(ExpectedOperandTypes::AnyOf(
+                    CHARACTER_OR_NUMERIC_OPERAND_TYPES,
+                ));
+            }
             "LPAD" | "RPAD" => match argument_index {
                 0 | 2 => Some(PrecedingOperandType::Character),
                 1 => Some(PrecedingOperandType::Numeric),
@@ -21168,10 +22141,38 @@ impl SqlEditorWidget {
             exclude_current_identifier_chain,
         );
         let words = Self::words_for_keyword_slot(tokens, end);
-        words.first().map(String::as_str) == Some("DROP")
-            && words
-                .last()
-                .is_some_and(|word| Self::is_mysql_droppable_object_type(word))
+        match words.as_slice() {
+            [drop, object_type]
+                if drop == "DROP" && Self::is_mysql_droppable_object_type(object_type) =>
+            {
+                true
+            }
+            [drop, temporary, object_type]
+                if drop == "DROP"
+                    && temporary == "TEMPORARY"
+                    && Self::is_mysql_droppable_object_type(object_type) =>
+            {
+                true
+            }
+            [drop, object_type, if_kw, exists]
+                if drop == "DROP"
+                    && Self::is_mysql_droppable_object_type(object_type)
+                    && if_kw == "IF"
+                    && exists == "EXISTS" =>
+            {
+                true
+            }
+            [drop, temporary, object_type, if_kw, exists]
+                if drop == "DROP"
+                    && temporary == "TEMPORARY"
+                    && Self::is_mysql_droppable_object_type(object_type)
+                    && if_kw == "IF"
+                    && exists == "EXISTS" =>
+            {
+                true
+            }
+            _ => false,
+        }
     }
 
     /// `LOCK TABLES <tbl> …` / `FLUSH [LOCAL] TABLES <tbl> …` table-list slots,
@@ -33829,7 +34830,12 @@ impl SqlEditorWidget {
             tokens.push(span.token);
         }
         let end = token_ends.partition_point(|token_end| *token_end <= scan_cursor);
-        let Some(name) = Self::expected_plsql_named_end_target(&tokens, end) else {
+        let name = Self::expected_plsql_named_end_target(&tokens, end).or_else(|| {
+            (!prefix.is_empty()).then(|| {
+                Self::fallback_typed_plsql_named_end_target(&tokens, end, prefix)
+            })?
+        });
+        let Some(name) = name else {
             return Vec::new();
         };
         if name.to_ascii_uppercase().starts_with(&prefix.to_ascii_uppercase()) {
@@ -33837,6 +34843,54 @@ impl SqlEditorWidget {
         } else {
             Vec::new()
         }
+    }
+
+    fn fallback_typed_plsql_named_end_target(
+        tokens: &[SqlToken],
+        end: usize,
+        prefix: &str,
+    ) -> Option<String> {
+        let tokens = tokens.get(..end.min(tokens.len()))?;
+        if !matches!(tokens.last(), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("END"))
+        {
+            return None;
+        }
+        let matches_prefix = |name: &str| {
+            Self::completion_suggestion_matches_prefix(name, prefix)
+        };
+        let compound_trigger = tokens.iter().any(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("COMPOUND")),
+        );
+        if compound_trigger {
+            for idx in 0..tokens.len() {
+                if !matches!(tokens.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("TRIGGER"))
+                {
+                    continue;
+                }
+                let name_idx = Self::next_non_comment_token_index(tokens, idx + 1)?;
+                let name = Self::token_word(tokens.get(name_idx)?)?;
+                if matches_prefix(name) {
+                    return Some(name.to_string());
+                }
+            }
+        }
+
+        for idx in (0..tokens.len()).rev() {
+            if !matches!(tokens.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("PROCEDURE") || word.eq_ignore_ascii_case("FUNCTION"))
+            {
+                continue;
+            }
+            let Some(name_idx) = Self::next_non_comment_token_index(tokens, idx + 1) else {
+                continue;
+            };
+            let Some(name) = Self::token_word(tokens.get(name_idx)?) else {
+                continue;
+            };
+            if matches_prefix(name) {
+                return Some(name.to_string());
+            }
+        }
+        None
     }
 
     fn local_schema_type_member_suggestions(
@@ -50521,10 +51575,17 @@ impl SqlEditorWidget {
             }
             [.., prev, last]
                 if mysql_compatible
-                    && matches!(prev.as_str(), "ALTER" | "DROP")
+                    && *prev == "ALTER"
                     && matches!(last.as_str(), "DATABASE" | "SCHEMA") =>
             {
                 Some(ExpectedObjectSuggestionKind::NoSuggestions)
+            }
+            [.., prev, last]
+                if mysql_compatible
+                    && *prev == "DROP"
+                    && matches!(last.as_str(), "DATABASE" | "SCHEMA") =>
+            {
+                Some(ExpectedObjectSuggestionKind::Database)
             }
             [.., drop, object_type, if_kw, exists]
                 if mysql_compatible
@@ -50533,7 +51594,7 @@ impl SqlEditorWidget {
                     && *if_kw == "IF"
                     && *exists == "EXISTS" =>
             {
-                Some(ExpectedObjectSuggestionKind::NoSuggestions)
+                Some(ExpectedObjectSuggestionKind::Database)
             }
             [.., prev, last]
                 if mysql_compatible
@@ -51232,7 +52293,7 @@ impl SqlEditorWidget {
             "SEQUENCE" if completion_db_type_is_mariadb(db_type) => {
                 Some(ExpectedObjectSuggestionKind::Sequence)
             }
-            "DATABASE" | "SCHEMA" => Some(ExpectedObjectSuggestionKind::NoSuggestions),
+            "DATABASE" | "SCHEMA" => Some(ExpectedObjectSuggestionKind::Database),
             "SERVER" => Some(ExpectedObjectSuggestionKind::NoSuggestions),
             "PACKAGE" | "TYPE" | "SEQUENCE" | "SYNONYM" | "DIRECTORY" | "LIBRARY" | "CLUSTER"
             | "CONTEXT" | "DIMENSION" | "OPERATOR" | "INDEXTYPE" | "EDITION" => {
@@ -52293,6 +53354,7 @@ impl SqlEditorWidget {
             ExpectedObjectSuggestionKind::JavaResource => {
                 data.get_java_resource_object_suggestions(prefix)
             }
+            ExpectedObjectSuggestionKind::Database => data.get_schema_suggestions(prefix),
             ExpectedObjectSuggestionKind::User => data.get_user_suggestions(prefix),
         };
 
@@ -52323,6 +53385,7 @@ impl SqlEditorWidget {
                 | ExpectedObjectSuggestionKind::SchemaObject
                 | ExpectedObjectSuggestionKind::Type
                 | ExpectedObjectSuggestionKind::Sequence
+                | ExpectedObjectSuggestionKind::Database
                 | ExpectedObjectSuggestionKind::User
         )
     }
@@ -52556,6 +53619,9 @@ impl SqlEditorWidget {
             ExpectedObjectSuggestionKind::JavaResource => {
                 Self::matches_string_list_case_insensitive(&data.java_resources, candidate)
             }
+            ExpectedObjectSuggestionKind::Database => {
+                Self::matches_string_list_case_insensitive(&data.schemas, candidate)
+            }
             ExpectedObjectSuggestionKind::User => {
                 Self::matches_string_list_case_insensitive(&data.users, candidate)
             }
@@ -52653,6 +53719,7 @@ impl SqlEditorWidget {
             ExpectedObjectSuggestionKind::JavaResource => {
                 Some(&[QualifiedMemberKind::JavaResource])
             }
+            ExpectedObjectSuggestionKind::Database => Some(&[]),
             ExpectedObjectSuggestionKind::User => Some(&[QualifiedMemberKind::User]),
         }
     }
@@ -53663,6 +54730,319 @@ impl SqlEditorWidget {
         }
 
         suggestions
+    }
+
+    fn oracle_inline_with_function_suggestions_for_context(
+        prefix: &str,
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> Vec<String> {
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            deep_ctx.cursor_token_len,
+            !prefix.is_empty(),
+        )
+        .min(tokens.len());
+        let mut seen_with = false;
+        let mut seen_names = HashSet::new();
+        let mut suggestions = Vec::new();
+
+        for idx in 0..end {
+            let SqlToken::Word(word) = &tokens[idx] else {
+                continue;
+            };
+            if word.eq_ignore_ascii_case("WITH") {
+                seen_with = true;
+                continue;
+            }
+            if !seen_with || !word.eq_ignore_ascii_case("FUNCTION") {
+                continue;
+            }
+            let Some(name_idx) = Self::next_non_comment_token_index(tokens, idx + 1) else {
+                continue;
+            };
+            if name_idx >= end {
+                continue;
+            }
+            let Some(name) = Self::token_word(&tokens[name_idx]) else {
+                continue;
+            };
+            if Self::completion_suggestion_matches_prefix(name, prefix)
+                && seen_names.insert(Self::completion_identifier_lookup_upper(name))
+            {
+                suggestions.push(name.to_string());
+            }
+        }
+
+        suggestions
+    }
+
+    fn oracle_statement_relation_alias_suggestions(
+        prefix: &str,
+        tokens: &[SqlToken],
+    ) -> Vec<String> {
+        let mut suggestions = Vec::new();
+        for idx in 0..tokens.len() {
+            let Some(candidate) = Self::token_word(&tokens[idx]) else {
+                continue;
+            };
+            if crate::sql_text::is_sql_keyword_for_db(
+                candidate,
+                crate::db::DatabaseType::Oracle,
+            ) || !Self::completion_suggestion_matches_prefix(candidate, prefix)
+            {
+                continue;
+            }
+            let Some(previous_idx) = Self::previous_non_comment_token_index(tokens, idx) else {
+                continue;
+            };
+            let derived_alias = if matches!(
+                tokens.get(previous_idx),
+                Some(SqlToken::Symbol(symbol)) if symbol == ")"
+            ) {
+                Self::matching_open_paren_index_before_close(tokens, previous_idx).is_some_and(
+                    |open_idx| {
+                        tokens
+                            .get(open_idx + 1..previous_idx)
+                            .unwrap_or(&[])
+                            .iter()
+                            .any(|token| {
+                                matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("SELECT"))
+                            })
+                    },
+                )
+            } else {
+                let Some(source_idx) =
+                    Self::previous_non_comment_token_index(tokens, previous_idx)
+                else {
+                    continue;
+                };
+                matches!(
+                    tokens.get(source_idx),
+                    Some(SqlToken::Word(word))
+                        if matches!(word.to_ascii_uppercase().as_str(), "FROM" | "JOIN" | "APPLY")
+                )
+            };
+            if derived_alias {
+                Self::push_unique_completion_name(&mut suggestions, candidate);
+            }
+        }
+        suggestions
+    }
+
+    fn oracle_forward_visible_relation_tables_for_qualifier(
+        deep_ctx: &intellisense_context::CursorContext,
+        qualifier: &str,
+    ) -> Vec<String> {
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let cursor_idx = deep_ctx.cursor_token_len.saturating_sub(1);
+        let containing_subquery = deep_ctx
+            .subqueries
+            .iter()
+            .filter(|subquery| {
+                subquery.body_range.start <= cursor_idx && cursor_idx < subquery.body_range.end
+            })
+            .min_by_key(|subquery| {
+                subquery
+                    .body_range
+                    .end
+                    .saturating_sub(subquery.body_range.start)
+            });
+        let scope_tokens = containing_subquery
+            .map(|subquery| {
+                intellisense_context::token_range_slice(tokens, subquery.body_range)
+            })
+            .unwrap_or(tokens);
+        let tables = intellisense_context::collect_tables_in_statement(scope_tokens);
+        if tables.iter().any(|table| {
+            table.name.eq_ignore_ascii_case(qualifier)
+                || table
+                    .alias
+                    .as_deref()
+                    .is_some_and(|alias| alias.eq_ignore_ascii_case(qualifier))
+        }) {
+            return intellisense_context::resolve_qualifier_tables(qualifier, &tables);
+        }
+
+        if containing_subquery.is_none() {
+            let meaningful = tokens
+                .iter()
+                .enumerate()
+                .filter(|(_, token)| !matches!(token, SqlToken::Comment(_)))
+                .collect::<Vec<_>>();
+            for window in meaningful.windows(4) {
+                let [(_, SqlToken::Word(merge)), (_, SqlToken::Word(into)), (_, table), (_, alias)] =
+                    window
+                else {
+                    continue;
+                };
+                if !merge.eq_ignore_ascii_case("MERGE") || !into.eq_ignore_ascii_case("INTO") {
+                    continue;
+                }
+                let (Some(table), Some(alias)) = (Self::token_word(table), Self::token_word(alias))
+                else {
+                    continue;
+                };
+                if alias.eq_ignore_ascii_case(qualifier) {
+                    return vec![table.to_string()];
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    fn oracle_local_type_suggestions_for_context(
+        prefix: &str,
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> Vec<String> {
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            deep_ctx.cursor_token_len,
+            !prefix.is_empty(),
+        )
+        .min(tokens.len());
+        let mut suggestions = Vec::new();
+
+        for idx in 0..end {
+            let SqlToken::Word(keyword) = &tokens[idx] else {
+                continue;
+            };
+            if !keyword.eq_ignore_ascii_case("TYPE")
+                && !keyword.eq_ignore_ascii_case("SUBTYPE")
+            {
+                continue;
+            }
+            let Some(name_idx) = Self::next_non_comment_token_index(tokens, idx + 1) else {
+                continue;
+            };
+            if name_idx >= end {
+                continue;
+            }
+            let Some(name) = Self::token_word(&tokens[name_idx]) else {
+                continue;
+            };
+            if Self::completion_suggestion_matches_prefix(name, prefix) {
+                Self::push_unique_completion_name(&mut suggestions, name);
+            }
+        }
+
+        suggestions
+    }
+
+    fn qualified_subquery_column_suggestions_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        qualifier: &str,
+        prefix: &str,
+    ) -> Vec<String> {
+        let mut suggestions = Vec::new();
+        for subquery in deep_ctx
+            .subqueries
+            .iter()
+            .filter(|subquery| subquery.alias.eq_ignore_ascii_case(qualifier))
+        {
+            let mut columns = subquery.explicit_columns.clone();
+            if columns.is_empty() {
+                let body_tokens = intellisense_context::token_range_slice(
+                    deep_ctx.statement_tokens.as_ref(),
+                    subquery.body_range,
+                );
+                columns = intellisense_context::extract_select_list_columns(body_tokens);
+            }
+            for column in columns {
+                if Self::completion_suggestion_matches_prefix(&column, prefix) {
+                    Self::push_unique_completion_name(&mut suggestions, &column);
+                }
+            }
+        }
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        for alias_idx in 0..tokens.len() {
+            if !matches!(tokens.get(alias_idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case(qualifier))
+            {
+                continue;
+            }
+            let Some(close_idx) = Self::previous_non_comment_token_index(tokens, alias_idx) else {
+                continue;
+            };
+            if !matches!(tokens.get(close_idx), Some(SqlToken::Symbol(symbol)) if symbol == ")") {
+                continue;
+            }
+            let Some(open_idx) = Self::matching_open_paren_index_before_close(tokens, close_idx)
+            else {
+                continue;
+            };
+            let body_tokens = tokens.get(open_idx + 1..close_idx).unwrap_or(&[]);
+            if !body_tokens.iter().any(
+                |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("SELECT")),
+            ) {
+                continue;
+            }
+            for column in intellisense_context::extract_select_list_columns(body_tokens) {
+                if Self::completion_suggestion_matches_prefix(&column, prefix) {
+                    Self::push_unique_completion_name(&mut suggestions, &column);
+                }
+            }
+        }
+        suggestions
+    }
+
+    fn oracle_table_transform_source_column_suggestions_for_context(
+        prefix: &str,
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> Vec<String> {
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            deep_ctx.cursor_token_len,
+            !prefix.is_empty(),
+        )
+        .min(tokens.len());
+        let Some(transform_idx) = (0..end).rev().find(|idx| {
+            matches!(
+                tokens.get(*idx),
+                Some(SqlToken::Word(word))
+                    if matches!(word.to_ascii_uppercase().as_str(), "PIVOT" | "UNPIVOT" | "MODEL")
+            )
+        }) else {
+            return Vec::new();
+        };
+
+        let mut columns = Vec::new();
+        columns.extend(intellisense_context::extract_select_list_columns(tokens));
+        let source_idx = Self::previous_non_comment_token_index(tokens, transform_idx);
+        if let Some(source_idx) = source_idx {
+            match tokens.get(source_idx) {
+                Some(SqlToken::Symbol(symbol)) if symbol == ")" => {
+                    if let Some(open_idx) =
+                        Self::matching_open_paren_index_before_close(tokens, source_idx)
+                    {
+                        columns.extend(intellisense_context::extract_select_list_columns(
+                            tokens.get(open_idx + 1..source_idx).unwrap_or(&[]),
+                        ));
+                    }
+                }
+                Some(SqlToken::Word(source_name)) => {
+                    for cte in deep_ctx
+                        .ctes
+                        .iter()
+                        .filter(|cte| cte.name.eq_ignore_ascii_case(source_name))
+                    {
+                        let body_tokens = intellisense_context::token_range_slice(
+                            tokens,
+                            cte.body_range,
+                        );
+                        columns.extend(intellisense_context::extract_select_list_columns(
+                            body_tokens,
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Self::dedup_column_names_case_insensitive(&mut columns);
+        columns.retain(|column| Self::completion_suggestion_matches_prefix(column, prefix));
+        columns
     }
 
     fn push_unique_completion_name(names: &mut Vec<String>, candidate: &str) {

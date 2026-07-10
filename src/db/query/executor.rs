@@ -15,6 +15,7 @@ use crate::sql_parser_engine::{LineBoundaryAction, SqlParserEngine};
 use crate::sql_text;
 use crate::utils::logging;
 
+use super::script::MysqlDelimitedStatementState;
 use super::{
     result_messages, ColumnInfo, ProcedureArgument, QueryCell, QueryResult, ResolvedBind,
     ScriptItem, StatementResultKind, ToolCommand,
@@ -1785,6 +1786,7 @@ impl QueryExecutor {
             current_start: Option<usize>,
             current_end: usize,
             mysql_delimiter: String,
+            mysql_delimited_state: MysqlDelimitedStatementState,
         }
 
         impl StatementSpanCollector {
@@ -1814,17 +1816,6 @@ impl QueryExecutor {
                     .nth(char_index)
                     .map(|(idx, _)| idx)
                     .unwrap_or_else(|| line.len())
-            }
-
-            fn line_ends_with_mysql_delimiter(&self, line: &str) -> bool {
-                if self.mysql_delimiter == ";" {
-                    return false;
-                }
-
-                QueryExecutor::statement_ends_with_mysql_delimiter(
-                    line,
-                    self.mysql_delimiter.as_str(),
-                )
             }
 
             fn trim_span_for_bounds(
@@ -1965,6 +1956,7 @@ impl QueryExecutor {
                 .filter(|delimiter| !delimiter.is_empty())
                 .unwrap_or(";")
                 .to_string(),
+            mysql_delimited_state: MysqlDelimitedStatementState::default(),
         };
         collector
             .builder
@@ -2000,6 +1992,7 @@ impl QueryExecutor {
                     Self::parse_mysql_delimiter_command(trimmed)
                 {
                     collector.mysql_delimiter = delimiter;
+                    collector.mysql_delimited_state = MysqlDelimitedStatementState::default();
                     line_start = next_line_start;
                     continue;
                 }
@@ -2018,10 +2011,17 @@ impl QueryExecutor {
                 }
                 collector.current_end = next_line_start;
 
-                if collector.line_ends_with_mysql_delimiter(line)
-                    && !collector.emit_current_span(sql, &mut on_span)
+                if Self::mysql_line_trailing_delimiter_range_with_state(
+                    line,
+                    collector.mysql_delimiter.as_str(),
+                    &mut collector.mysql_delimited_state,
+                )
+                .is_some()
                 {
-                    return;
+                    if !collector.emit_current_span(sql, &mut on_span) {
+                        return;
+                    }
+                    collector.mysql_delimited_state = MysqlDelimitedStatementState::default();
                 }
 
                 line_start = next_line_start;

@@ -82,7 +82,7 @@ impl AutoFormatLineSemantic {
 }
 
 #[derive(Clone, Copy, Default)]
-enum MysqlDelimitedLexMode {
+pub(crate) enum MysqlDelimitedLexMode {
     #[default]
     Normal,
     SingleQuote,
@@ -92,7 +92,7 @@ enum MysqlDelimitedLexMode {
 }
 
 #[derive(Clone, Copy, Default)]
-struct MysqlDelimitedStatementState {
+pub(crate) struct MysqlDelimitedStatementState {
     lex_mode: MysqlDelimitedLexMode,
 }
 
@@ -9174,7 +9174,7 @@ impl QueryExecutor {
         bytes.len()
     }
 
-    fn mysql_line_trailing_delimiter_range_with_state(
+    pub(crate) fn mysql_line_trailing_delimiter_range_with_state(
         line: &str,
         delimiter: &str,
         state: &mut MysqlDelimitedStatementState,

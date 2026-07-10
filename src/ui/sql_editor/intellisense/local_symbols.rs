@@ -710,6 +710,17 @@ impl SqlEditorWidget {
             db_type,
         )
         .is_some()
+            || {
+                let tokens = analysis.context.statement_tokens.as_ref();
+                let end = Self::expected_suggestion_context_end(
+                    tokens,
+                    analysis.context.cursor_token_len,
+                    !prefix.is_empty(),
+                );
+                Self::meaningful_tokens_before(tokens, end).last().is_some_and(
+                    |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("RETURN")),
+                )
+            }
             || (!crate::sql_text::mysql_compatibility_for_sql("", db_type)
                 && Self::cursor_is_in_plsql_declaration_region(
                     analysis.context.statement_tokens.as_ref(),
@@ -2347,7 +2358,8 @@ impl SqlEditorWidget {
             }
             "TYPE" => {
                 return Self::extract_record_type_symbol_from_item(item, first_idx)
-                    .or_else(|| Self::extract_collection_type_symbol_from_item(item, first_idx));
+                    .or_else(|| Self::extract_collection_type_symbol_from_item(item, first_idx))
+                    .or_else(|| Self::extract_ref_cursor_type_symbol_from_item(item, first_idx));
             }
             "CURSOR" => {
                 let cursor_name = item[first_idx + 1..]
@@ -2561,6 +2573,45 @@ impl SqlEditorWidget {
             member_source_is_rowtype,
             member_source_is_collection_like: true,
             member_source_allows_visible_members: member_source_is_rowtype,
+            suggest_name: true,
+            is_type_symbol: true,
+        })
+    }
+
+    fn extract_ref_cursor_type_symbol_from_item(
+        item: &[SqlTokenSpan],
+        type_keyword_idx: usize,
+    ) -> Option<ParsedDeclarationSymbol> {
+        let name_idx = Self::next_meaningful_token_idx(item, type_keyword_idx + 1)?;
+        let name =
+            Self::token_word(&item[name_idx].token).and_then(Self::local_identifier_from_word)?;
+        let is_idx = (name_idx + 1..item.len()).find(|idx| {
+            matches!(
+                &item[*idx].token,
+                SqlToken::Word(word)
+                    if word.eq_ignore_ascii_case("IS") || word.eq_ignore_ascii_case("AS")
+            )
+        })?;
+        let ref_idx = Self::next_meaningful_token_idx(item, is_idx + 1)?;
+        let cursor_idx = Self::next_meaningful_token_idx(item, ref_idx + 1)?;
+        if !Self::token_word(&item[ref_idx].token)
+            .is_some_and(|word| word.eq_ignore_ascii_case("REF"))
+            || !Self::token_word(&item[cursor_idx].token)
+                .is_some_and(|word| word.eq_ignore_ascii_case("CURSOR"))
+        {
+            return None;
+        }
+
+        Some(ParsedDeclarationSymbol {
+            name,
+            type_display: None,
+            members: Vec::new(),
+            member_entries: Vec::new(),
+            member_source_upper: None,
+            member_source_uppers: Vec::new(),
+            member_source_is_rowtype: false,
+            member_source_is_collection_like: false,
+            member_source_allows_visible_members: false,
             suggest_name: true,
             is_type_symbol: true,
         })

@@ -9137,6 +9137,41 @@ END$$"#;
 }
 
 #[test]
+fn test_statement_bounds_at_cursor_mysql_custom_delimiter_ignores_comment_decoys() {
+    let sql = r#"DELIMITER //
+CREATE PROCEDURE p(IN p_id INT)
+BEGIN
+    DECLARE v_exists INT DEFAULT 0;
+    /* delimiter-looking text inside a comment must stay inert:
+       fake END//
+       fake DELIMITER ;
+    */
+    SELECT COUNT(*)
+      INTO v_exists
+      FROM items
+     WHERE id = p_id;
+END//
+DELIMITER ;"#;
+    let cursor = sql.find("INTO v_exists").expect("cursor");
+    let bounds = QueryExecutor::statement_bounds_at_cursor_for_db_type(
+        sql,
+        cursor,
+        Some(crate::db::connection::DatabaseType::MariaDB),
+    )
+    .expect("expected procedure bounds");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert!(
+        statement.starts_with("CREATE PROCEDURE p"),
+        "comment decoys must not detach the routine body from its header, got:\n{statement}"
+    );
+    assert!(
+        statement.contains("DECLARE v_exists") && statement.trim_end().ends_with("END"),
+        "the full routine should remain in the selected statement bounds, got:\n{statement}"
+    );
+}
+
+#[test]
 fn test_statement_bounds_at_cursor_mysql_use_command_isolated_from_following_statement() {
     let sql = "USE reporting\nSELECT 1;\n";
     let cursor = sql.find("SELECT 1").unwrap_or(0);

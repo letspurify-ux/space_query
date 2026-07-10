@@ -303,7 +303,7 @@ WITH [[p]] AS (
 SELECT job, dept_tag, sum_sal
 FROM p
 UNPIVOT (
-  [[sum_sal]] FOR dept_tag IN (D10 AS '10', D20 AS '20', D30 AS '30')
+  sum_sal FOR dept_tag IN (D10 AS '10', D20 AS '20', D30 AS '30')
 )
 ORDER BY job, dept_tag;
 
@@ -553,7 +553,7 @@ PROMPT [DONE] Hardcore SELECT tests finished.
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
 -- checked: 1224
--- missing: 23
+-- missing: 22
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens:
 --   50:3 word=dname prefix=dnam suggestions=[] total=0 line=dname      VARCHAR2(30)  NOT NULL,
@@ -562,7 +562,6 @@ PROMPT [DONE] Hardcore SELECT tests finished.
 --   282:6 word=s prefix=s suggestions=[] total=0 line=WITH s AS (
 --   289:15 word=sum_sal prefix=sum_ suggestions=[] total=0 line=SUM(sal) AS sum_sal
 --   294:6 word=p prefix=p suggestions=[] total=0 line=WITH p AS (
---   306:3 word=sum_sal prefix=sum_ suggestions=[] total=0 line=sum_sal FOR dept_tag IN (D10 AS '10', D20 AS '20', D30 AS '30')
 --   329:6 word=r prefix=r suggestions=[RANK, REF, REPLACE, REVERSE, ROW_NUMBER, RATIO_TO_REPORT(), RAWTOHEX(), REFTOHEX(), REGEXP_COUNT(), REGEXP_INSTR(), REGEXP_REPLACE(), REGEXP_SUBSTR(), REGR_AVGX(), REGR_AVGY(), REGR_COUNT(), REGR_INTERCEPT()] total=26 line=WITH r (node_id, parent_id, node_name, lvl, path) AS (
 --   375:21 word=run_len prefix=run_ suggestions=[run_, oqt_run_log, run_id, run_ts, final_running_amt] total=5 line=COUNT(*)     AS run_len
 --   399:5 word=order_id prefix=orde suggestions=[oqt_t_order_hdr, oqt_t_order_item] total=2 line=order_id   NUMBER       PATH '$.order_id',

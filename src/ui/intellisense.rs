@@ -853,6 +853,9 @@ pub struct IntellisenseData {
     pub java_sources: Vec<String>,
     pub java_classes: Vec<String>,
     pub java_resources: Vec<String>,
+    /// MySQL/MariaDB database (schema) names. Kept separate from `users` so
+    /// database-target DDL does not expose account/owner names.
+    pub schemas: Vec<String>,
     pub users: Vec<String>,
     default_qualifier: Option<String>,
     default_qualifier_name: Option<String>,
@@ -881,6 +884,7 @@ pub struct IntellisenseData {
     java_source_entries: Vec<NameEntry>,
     java_class_entries: Vec<NameEntry>,
     java_resource_entries: Vec<NameEntry>,
+    schema_entries: Vec<NameEntry>,
     user_entries: Vec<NameEntry>,
     column_entries_by_table: HashMap<String, Vec<NameEntry>>,
     virtual_column_entries_by_table: HashMap<String, Vec<NameEntry>>,
@@ -940,6 +944,7 @@ impl IntellisenseData {
             java_sources: Vec::new(),
             java_classes: Vec::new(),
             java_resources: Vec::new(),
+            schemas: Vec::new(),
             users: Vec::new(),
             default_qualifier: None,
             default_qualifier_name: None,
@@ -968,6 +973,7 @@ impl IntellisenseData {
             java_source_entries: Vec::new(),
             java_class_entries: Vec::new(),
             java_resource_entries: Vec::new(),
+            schema_entries: Vec::new(),
             user_entries: Vec::new(),
             column_entries_by_table: HashMap::new(),
             virtual_column_entries_by_table: HashMap::new(),
@@ -1629,6 +1635,11 @@ impl IntellisenseData {
     pub fn get_user_suggestions(&mut self, prefix: &str) -> Vec<String> {
         self.ensure_base_indices();
         Self::suggestions_from_entry_groups(prefix, &[&self.user_entries])
+    }
+
+    pub fn get_schema_suggestions(&mut self, prefix: &str) -> Vec<String> {
+        self.ensure_base_indices();
+        Self::suggestions_from_entry_groups(prefix, &[&self.schema_entries])
     }
 
     pub fn get_column_suggestions(
@@ -2782,6 +2793,7 @@ impl IntellisenseData {
         self.java_source_entries = Self::build_entries(&self.java_sources);
         self.java_class_entries = Self::build_entries(&self.java_classes);
         self.java_resource_entries = Self::build_entries(&self.java_resources);
+        self.schema_entries = Self::build_entries(&self.schemas);
         self.user_entries = Self::build_entries(&self.users);
         self.relations_upper = self
             .tables
@@ -2894,6 +2906,7 @@ impl IntellisenseData {
             || self.java_source_entries.len() != self.java_sources.len()
             || self.java_class_entries.len() != self.java_classes.len()
             || self.java_resource_entries.len() != self.java_resources.len()
+            || self.schema_entries.len() != self.schemas.len()
             || self.user_entries.len() != self.users.len()
         {
             self.rebuild_indices();

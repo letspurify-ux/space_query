@@ -670,6 +670,7 @@ impl SchemaMetadataLoader for MysqlSchemaMetadataLoader {
         };
 
         let mut data = IntellisenseData::new();
+        data.schemas = schemas.clone();
         data.users = schemas;
         let selected_schema =
             canonical_intellisense_scope(&data, selected_schema, expected_db_type);

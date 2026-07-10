@@ -142,7 +142,7 @@ BEGIN
     SELECT
         SUM(CASE WHEN status_code = 'DONE' THEN 1 ELSE 0 END),
         SUM(CASE WHEN status_code = 'RUNNING' THEN 1 ELSE 0 END),
-        SUM(CASE WHEN status_code [[NOT]] IN ('DONE', 'RUNNING') THEN 1 ELSE 0 END)
+        SUM(CASE WHEN status_code NOT IN ('DONE', 'RUNNING') THEN 1 ELSE 0 END)
     INTO
         p_done_cnt,
         p_running_cnt,
@@ -1142,8 +1142,7 @@ ORDER BY audit_id;
 -- db: MySQL
 -- metadata: test_mysql/test3.txt inferred catalog
 -- checked: 1078
--- missing: 1
+-- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
--- missing tokens:
---   145:35 word=NOT prefix=NO suggestions=[NO] total=1 line=SUM(CASE WHEN status_code NOT IN ('DONE', 'RUNNING') THEN 1 ELSE 0 END)
+-- missing tokens: none
 -- =========================================================

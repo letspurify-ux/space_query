@@ -66,7 +66,7 @@ CREATE OR REPLACE PACKAGE oqt_pkg AS
   FUNCTION f_dateadd(p_d IN DATE, p_days IN NUMBER DEFAULT 1) RETURN DATE;
 END oqt_pkg;
 /
-SHOW ERRORS PACKAGE [[oqt_pkg]];
+SHOW ERRORS PACKAGE oqt_pkg;
 
 CREATE OR REPLACE PACKAGE BODY oqt_pkg AS
   PROCEDURE log_msg(p_tag IN VARCHAR2, p_msg IN VARCHAR2, p_n1 IN NUMBER DEFAULT NULL) IS
@@ -140,7 +140,7 @@ CREATE OR REPLACE PACKAGE BODY oqt_pkg AS
   END;
 END oqt_pkg;
 /
-SHOW ERRORS PACKAGE BODY [[oqt_pkg]];
+SHOW ERRORS PACKAGE BODY oqt_pkg;
 
 PROMPT === [3] CREATE SYNONYM (OPTIONAL CALL FORM) ===
 
@@ -291,10 +291,8 @@ PROMPT === DONE ===
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
 -- checked: 449
--- missing: 3
+-- missing: 1
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens:
---   69:21 word=oqt_pkg prefix=oqt_ suggestions=[] total=0 line=SHOW ERRORS PACKAGE oqt_pkg;
 --   116:15 word=v prefix=v suggestions=[] total=0 line=DECLARE v NUMBER;
---   143:26 word=oqt_pkg prefix=oqt_ suggestions=[] total=0 line=SHOW ERRORS PACKAGE BODY oqt_pkg;
 -- =========================================================
